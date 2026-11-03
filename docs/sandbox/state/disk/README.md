@@ -103,6 +103,14 @@ M1 removes the wait for the store and the control plane from the pause, and the 
    - **The guest reporting its dirty ranges** (a dm-era in the guest, or the guest agent): it trusts the guest for its own checkpoint's content, needs a guest image change, and a guest root can bypass its own layer.
    - **Cut-while-running on `Async`:** deferred until it is GA (M2's decision).
 
+**Also in M3′'s scope** (from #138's review, 2026-11-03):
+- **The cut off the serial command executor.** M2's clone (and the M1 read its guard falls back to) runs inside the host's one command executor, so a long pause of one sandbox holds up every sandbox's commands on the host.
+  - The pause, the cut and the resume could run as a per-incarnation task, with the command answering once the VM is paused, or once it has resumed. Other sandboxes' commands would then run meanwhile.
+  - A suspend, archive or fork of the same sandbox already orders itself behind the cut through the commit lock.
+- **A bound on extent records,** so that no disk, fragmented on purpose or not, can make any pause unbounded. M2 has only its guard (clone or read, whichever is cheaper), which doesn't bound either.
+  - Option 3 above bounds records in the background.
+  - Option 1's FIEMAP walk is itself O(records): to be bounded, it would need option 3 or a cap where a cut falls back.
+
 **How to measure, with the same harness and its cleanup layers:** one `c8id.large`, about 40 minutes, about $0.08 on demand. It adds these phases to `dev/measure-cut/on-host.sh`, on the same fresh, churned and month-aged disks:
 - FIEMAP (with `FIEMAP_FLAG_SYNC`) time against the record count;
 - option 1 end to end: the pre-copy's time and range count, then the in-pause FIEMAP plus residue clone, after 2,000 scattered 4 KiB writes and after 1 GiB;
