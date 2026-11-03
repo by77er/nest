@@ -4,10 +4,10 @@
 
 - **Brain:** an unmodified Claude Code process running **on a [brain host](../compute/brain-hosts/), outside every VM and never on a sandbox host**, on my subscription. It's managed by the [agent runner](runner/), and its session state is portable. The [backend](backends/) is pluggable; `api-loop` (deferred) runs inside AgentDO, with no host at all.
 - **Hands (optional):** `nest` MCP tools that make calls into **one sandbox** (exec, read, write, edit, glob, grep), over the network through the sandbox's [gateway](../sandbox/gateway/), with a binding SandboxDO's `resolve` issues to an attached agent. See [hands/](hands/).
-- **Capabilities:** pluggable bundles of tools, the grants they need and prompt instructions (messaging, spawning, MCP servers, brokered actions, …). See [capabilities/](capabilities/).
+- **Capabilities:** pluggable bundles of tools, the grants they need and prompt instructions (spawning, MCP servers, brokered actions, memory, …). See [capabilities/](capabilities/).
 - **Grants:** what it may do, and to which resources. Capabilities expand into grants; extra grants can be added. See [tools/](tools/).
-- **Input:** turns and inbox messages queued in its AgentDO (`POST /v1/agents/<id>/turns` and `/inbox`, a spawner's task, an answered ask). Channels and their subscriptions left the platform ([principle 9](../README.md#principles)): coordination tools are external integrations reached over MCP.
-- **Owner and labels:** the agent that spawned it (or me), and free-form key/values for grouping.
+- **Input:** turns and inbox messages queued in its AgentDO (`POST /v1/agents/<id>/turns` and `/inbox`, a spawner's task, an answered ask). Coordination (messaging, shared logs, boards) is an external integration reached over MCP ([principle 9](../README.md#principles)).
+- **Owner and labels:** the agent that spawned it, the [API client](../control-plane/api/clients/) that created it, or me; and free-form key/values for grouping.
 
 ```
 brain host (no KVM)                          sandbox host (spot, KVM)
@@ -42,7 +42,7 @@ credential:    claude_oauth_token  # or a named one, e.g. claude_oauth_token:cap
 - **Interim limits, until budgets** (confirmed by the owner, 2026-11-02): spawn depth at most 3 (the operator's agents are 0) and at most 8 children that haven't ended, per spawner (`lib/lifetimes.ts`). The design's budgets replace them.
 - **Templates** are named specs stored in the control plane and edited by me, mostly a list of [capabilities](capabilities/). `captain` and `worker` are just the two I start with. See [../orchestration/](../orchestration/).
 - **Brain placement is by backend and capacity, never by sandbox:** a `claude-code` brain starts on any [brain host](../compute/brain-hosts/) with capacity, preferring the host that ran the agent last (a warm session file), a preference and not a rule; an `api-loop` brain needs no host. Hands are a binding to one sandbox, reached through its [gateway](../sandbox/gateway/) from wherever the brain runs.
-- **Ownership:** the spawner owns the new agent and holds every grant on it: post to its inbox, stop it, attach it, read its transcript. A child's events (a finished turn's text, its exit) are to reach it as agent events delivered to owners, part of the kernel but not built ([principle 9](../README.md#principles)): today a spawner isn't told when a child finishes. **Built:** recorded once, as the child's `owner` (the deciding record; the spawner's `children` table is an index of it), and transitive: an owner holds the same grants on what its children own. Today only `agent_stop` checks it (by walking the target's owner chain); the grants system takes it over as `(spawner, *, child)` grants derived from the spawner's own.
+- **Ownership:** the spawner owns the new agent and holds every grant on it: post to its inbox, stop it, attach it, read its transcript. **An owner agent hears nothing from its children automatically** (the `spawning` prompt tells it so, and to say in every task when the work counts as done); it reaches their results through whatever integration the task names, or their transcripts. An [API client](../control-plane/api/clients/#events-to-the-owner) owner hears its subtree's turns, exits, asks and errors by webhook. **Built:** recorded once, as the child's `owner` (the deciding record; the spawner's `children` table is an index of it), and transitive: an owner holds the same grants on what its children own. `agent_stop` and `read_transcript` check it by walking the target's owner chain; the grants system takes it over as `(spawner, *, child)` grants derived from the spawner's own.
 - **Budgets shrink like grants:** a child's budget is carved from its spawner's remaining budget and enforced per owner subtree. That bounds spawn depth, fan-out and quota, the runaway modes seen in practice ([Anthropic's research system](https://www.anthropic.com/engineering/multi-agent-research-system) once spawned 50 subagents for a simple query). An agent over budget is parked and escalates.
 - **Fencing:** AgentDO issues an **agent epoch** per brain start. Platform tool calls and brokered actions carry it, and a brain host whose lease lapses kills its brains, which AgentDO restarts on another brain host after 30 s with `--resume`. Hands calls carry the **sandbox epoch** inside the binding, checked by the gateway and again by the guest. Brokered actions don't carry it yet: see [the runner](runner/).
 
@@ -64,8 +64,8 @@ An agent lives until it **ends**: stopped for good, as opposed to an operator's 
 - **Agents without memory always resume** their session, since there's nothing else to restart from.
 - **Agents with memory pick resume or fresh at each wake.** A woken agent resumes its session (`--resume`) when that's cheap: the prompt cache is still warm (it lasts an hour on a subscription, [docs](https://code.claude.com/docs/en/prompt-caching)) or the session is small. The starting rule: **resume if the last turn was under an hour ago or the session is under about 50k tokens**; otherwise start a fresh session, seeded with its memory index and the input that woke it. A fresh session starts untainted unless the wake that starts it carries [taint](tools/#taint-and-sinks) or it then reads tainted content. A turn cut off by a crash always resumes, since its context is in the transcript. The first spike measures whether the rule is right.
 - **One memory system:** a keyed store the `memory` capability reaches (an external integration over MCP, [principle 9](../README.md#principles); the seeded `memory_read`/`memory_write` answer `not_implemented`). Claude Code's own auto memory is off for every agent (it's local to one host).
-- **The key index is bounded:** for agents with memory, a `SessionStart` hook injects at most 200 keys, most recently written first, plus a count of the rest, at startup and after compaction. The agent lists more through the store's tools. Claude Code's own memory index loads 200 lines the same way ([memory](https://code.claude.com/docs/en/memory)).
-- **Upkeep:** the template asks the agent to update and prune memory as it goes, and the `memory` capability schedules a weekly wake asking it to consolidate.
+- **The key index is bounded (designed):** for agents with memory, a `SessionStart` hook injects at most 200 keys, most recently written first, plus a count of the rest, at startup and after compaction. The agent lists more through the store's tools. Claude Code's own memory index loads 200 lines the same way ([memory](https://code.claude.com/docs/en/memory)).
+- **Upkeep:** the template asks the agent to update and prune memory as it goes, and the `memory` capability schedules a weekly [wake](capabilities/#schedules) asking it to consolidate.
 - **The session file is a cache** of a format Claude Code doesn't stabilize; the durable state is the R2 copy plus memory. See [sessions/](sessions/).
 
 ## Attach, share, fork
@@ -74,7 +74,7 @@ An agent lives until it **ends**: stopped for good, as opposed to an operator's 
 - **Several agents in one sandbox** are several RPC clients. They share files, services and ports, and conflicts are accepted. No worktrees, port blocks or per-agent uids.
 - **Isolation comes from forking the sandbox.**
 - **Per-agent grants provide attribution and prevent accidents.** Within one sandbox, they aren't a security boundary.
-- **Inspecting without hands** is left to agents. The platform offers read-only forks and report schemas, and no `delegate` tool or reader template, so how to inspect is the model's call.
+- **Inspecting without hands** is a pattern ([captains](../orchestration/captains/#conventions-in-its-prompt)): the platform offers read-only forks and report schemas, and how to inspect is the model's call.
 
 ## Removal
 
@@ -89,7 +89,7 @@ When an agent is removed for good, **what it owns is parked, then expires**:
 ## Components
 
 - [backends/](backends/): `claude-code` (current) and `api-loop` (deferred), chosen per agent
-- [capabilities/](capabilities/): pluggable bundles of tools, grants and prompt (messaging, spawning, MCP servers, brokered actions, …)
+- [capabilities/](capabilities/): pluggable bundles of tools, grants and prompt (spawning, MCP servers, brokered actions, memory, …)
 - [runner/](runner/): starts and drives Claude Code at a pinned version on brain hosts, keeps its environment clean, handles auth, and reaches hands through the gateway
 - [hands/](hands/): MCP tools modeled on Claude Code's built-ins, executed in the sandbox over RPC through its gateway
 - [sessions/](sessions/): the native session file, tailed on the host and stored in R2

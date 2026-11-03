@@ -110,7 +110,7 @@ Per channel direction and lineage `L` (between two resets): `sent(L)` the seqs t
 
 **B3 — a stale-instance batch can become the new lineage's baseline (suspected; low likelihood).** The attachment is read at arrival, outside the queue (`fleet.ts:634,661`), and `onEvents` never checks that the socket is current. If an old socket's batch `k` arrives after the new hello is queued but before `onHello` runs, it is processed after `rel.reset` as the baseline (`reliable.ts:59`); the new process's batches `1..k` are then duplicates, acked and dropped. Breaks S5, S4. AgentDO avoids this (`agent.ts:664,1004`). Confirm with two sockets and a `handleEvent` held on a deferred promise.
 
-**B4 — partial batch failure re-applies earlier events (suspected; medium).** A throw at event `j` closes the socket; the resend re-runs events `< j`. Not idempotent per event: `guest_cli` relay (`fleet.ts:1048-1058,1067-1082`, no request-id dedup seen; unverified in `AgentDO.guestCli`), `egress_audit` (new R2 key each time, `fleet.ts:1031-1035`), `task_exited`, `workstream` ingest (unverified). A permanent failure repeats them forever.
+**B4 — partial batch failure re-applies earlier events (suspected; medium).** A throw at event `j` closes the socket; the resend re-runs events `< j`. Not idempotent per event: `guest_cli` relay (`fleet.ts:1048-1058,1067-1082`, no request-id dedup seen; unverified in `AgentDO.guestCli`), `egress_audit` (new R2 key each time, `fleet.ts:1031-1035`), `task_exited`. A permanent failure repeats them forever.
 
 **B5 — mixed-version frames vanish (latent).** An old nestd or runner that cannot parse a frame drops it silently (`fleet.rs:436-448`, `session.rs` `connect_once`); with no gap check the next seq is accepted and the cumulative ack deletes the unknown batch, including known commands in it. `CommandBody` has no catch-all (`crates/nest-protocol/src/control.rs:291-292`). "Compatible one version back" (`docs/control-plane/README.md:34`) covers fields, not variants; `protocol_version` must match exactly (`fleet.ts:730`, `agent.ts:730`), so no bump is possible without stranding hosts. Branch 0c3a85c gated new commands on host capabilities (later removed in 65bf6ef).
 
@@ -134,10 +134,7 @@ Per channel direction and lineage `L` (between two resets): `sent(L)` the seqs t
 
 ## Runtime assertions and tests to add now
 
-- nestd: accept a command batch only if `seq = forwarded + 1` (or the first after hello); otherwise reconnect. Test: seq 2 then 1 never acks 1's loss.
-- FleetDO: one per-host send chain so wire order equals seq order (C1, C7); test with a deferred BrokerDO.
-- FleetDO `onEvents`: re-read the attachment inside the queue and require `socketFor(host) === ws`; test B3.
+The fleet ones (nestd's gap check, the send chain, `onEvents`' socket check, the synchronous capture) are built (#39). Left:
 - `ReliableChannels.markProcessed`: assert `seq = last_in + 1` or `last_in = ⊥`; `ack(up_to)`: log when `up_to ≥ next_out` (lineage confusion).
 - Runner: log and reconnect on an inbound gap.
-- Capture the new-process pending set synchronously in `onHello`, before the first await (B2).
 - Session channel: per-event quarantine like the fleet channel (B6).

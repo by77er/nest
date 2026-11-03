@@ -15,6 +15,13 @@ const CREDENTIAL = "claude_oauth_token";
 
 /** Claude Code's built-in tools for every role: its own task list and the web, as nest's worker gets. */
 const BUILTIN_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"];
+/**
+ * A worker may also run Claude Code's own subagents (`Agent`, through nest's `subagents` capability):
+ * they live in the worker's brain and reach the same sandbox through its hands, with the same grant and
+ * taint. No role gets nest-level spawning (`management`'s `spawn_agent`, `sandboxes`' `fork_sandbox`):
+ * the app starts every agent itself, one worker per task.
+ */
+const WORKER_EXTRA = { capabilities: ["subagents"], builtin_tools: ["Agent"] } as const;
 
 export const PROMPTS = {
   manager: [
@@ -31,6 +38,7 @@ export const PROMPTS = {
     "Clone the repo in your sandbox, work on the branch it names (task/<task-id>), commit, push that branch, and open exactly one PR from it to the default branch with `gh pr create`.",
     "Report as you go with report_progress, and once the PR is open call report_pr with its number.",
     "If you can't go on without the owner (a decision only they can make, or credentials or access you can't get), call report_blocked with the reason and your question; the answer arrives in your inbox. Never block for anything you could resolve yourself: read the code and docs, try it, or make the reasonable choice and say so in the PR. Clear it with clear_blocked if you resolve it another way.",
+    "You may split work across Claude Code subagents (the Agent tool): they share your sandbox and your task, nothing more. You can't start other nest agents or sandboxes.",
     "Meet the spec's acceptance criteria and run its test plan before you open the PR. Touch nothing outside your task.",
     "Your task may change while you work on it (its title, body or spec, or its block cleared): a message in your inbox says what changed. Then re-read it with get_task and adjust your work, and your PR if it's open, to the task as it is now.",
   ].join("\n"),
@@ -66,11 +74,11 @@ function mcpCapability(base: string, server: Server, prompt: string) {
  * (`repos`, the worker's) or only `read` (`read_repos`: the manager and the reviewer, which nest refuses
  * to push). Each spawn narrows it to its own project's (`overrides.repos` or `overrides.read_repos`).
  */
-const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read") => ({
+const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read", subagents = false) => ({
   // `nest` allows the nest tools without a prompt and `hands` gives the sandbox's tools: the operator's
   // capabilities, which a client's templates may name.
-  capabilities: ["nest", "hands", `${NAMESPACE}/${capability}`],
-  launch: { builtin_tools: BUILTIN_TOOLS, system_prompt: { mode: "append", text: prompt } },
+  capabilities: ["nest", "hands", ...(subagents ? WORKER_EXTRA.capabilities : []), `${NAMESPACE}/${capability}`],
+  launch: { builtin_tools: [...BUILTIN_TOOLS, ...(subagents ? WORKER_EXTRA.builtin_tools : [])], system_prompt: { mode: "append", text: prompt } },
   hands: "required",
   credential: CREDENTIAL,
   ...(repos.length ? { [access === "push" ? "repos" : "read_repos"]: [...repos] } : {}),
@@ -92,7 +100,7 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
     },
     templates: {
       [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read"),
-      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push"),
+      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push", true),
       [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, sorted, "read"),
     },
   };

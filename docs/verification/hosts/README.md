@@ -10,9 +10,12 @@ What a model of FleetDO ↔ nestd ↔ EC2 ↔ Cloudflare needs: state, transitio
 | `index.ts` | [control-plane/src/index.ts](../../../control-plane/src/index.ts) |
 | `fleet.rs`, `host.rs` | [crates/nestd/src/fleet.rs](../../../crates/nestd/src/fleet.rs), [crates/nestd/src/host.rs](../../../crates/nestd/src/host.rs) |
 
-> **Since** (checked on `main` at b63c0a3): B4 is fixed by #30: the tick expires any silent host, and one holding no lease at once (`expireSilent`), so a host terminated outside FleetDO stops counting toward `max_hosts`. #36 split hosts into two kinds (`sandbox` and `brain`, stored as `burst` and `controller` for one release); the `burst` rows below are today's sandbox hosts.
-
-> **Since** (refactor/all): every status write is one guarded transition, `hostStep` in `control-plane/src/lib/host-lifecycle.ts` (applied by `FleetDO.move`; deaths by `FleetDO.die` and `deathPlan`), with transitions named after H4-H12; nothing leaves `dead` (B3 fixed). A drain is kept in `hosts.drain_ms`, so H4 and H7 return a drained host to `draining` and H10 records a drain from any live status (B5 fixed). H7 never applies to a host whose instance FleetDO is terminating (EC2 and an instance id): only H8 ends its STONITH (owner decision 4). H6 applies to any kind. A launch is recorded before RunInstances and repeated with its client token until EC2 answers or `enroll_timeout_ms` passes; only demand plans a new one (B6 fixed). A token is rotated on every hello (B11 fixed). A launched host that enrolled but never said hello dies once `enroll_timeout_ms` has passed since its enrollment (H13). A heartbeat from a host that isn't `active`, `draining` or `stonith_pending` gets no ack, and H4 is written in the step that acks the hello.
+> **Status** (by reading `main`, 2026-11-02):
+> - **#30:** the tick expires any silent host, and one holding no lease at once (`expireSilent`): B4 fixed, and H6 applies to any kind.
+> - **#36:** two host kinds, `sandbox` and `brain` (stored as `burst` and `controller` for one release); the `burst` rows below are today's sandbox hosts.
+> - **#39:** one per-host send chain and nestd's in-order command check: B1 and B2 fixed ([nestd/](../nestd/)).
+> - **#62:** every status write is one guarded transition, `hostStep` in `control-plane/src/lib/host-lifecycle.ts` (applied by `FleetDO.move`; deaths by `FleetDO.die` and `deathPlan`), named after H4-H13; nothing leaves `dead` (B3 fixed). A drain is kept in `hosts.drain_ms`, so H4 and H7 return a drained host to `draining` and H10 records a drain from any live status (B5 fixed). H7 never applies to a host whose instance FleetDO is terminating (EC2 and an instance id): only H8 ends its STONITH (owner decision 4). A launch is recorded before RunInstances and repeated with its client token until EC2 answers or `enroll_timeout_ms` passes; only demand plans a new one (B6 fixed). A token is rotated on every hello (B11 fixed). An unparseable EC2 answer throws (B7 half fixed). Every FleetDO-written answer, a dead host's commands included, goes through `answerByFleet` (§2.4's "host dead" row). A launched host that enrolled but never said hello dies once `enroll_timeout_ms` has passed since its enrollment (H13). A heartbeat from a host that isn't `active`, `draining` or `stonith_pending` gets no ack, and H4 is written in the step that acks the hello.
+> - B8, B9 and B10 have not been re-checked.
 
 Design docs: [FleetDO](../../control-plane/durable-objects/fleet/), [autoscaling](../../compute/autoscaling/), [fleet channel](../../interfaces/control-host/fleet/), [enrollment](../../interfaces/control-host/enrollment/).
 
@@ -33,7 +36,7 @@ Design docs: [FleetDO](../../control-plane/durable-objects/fleet/), [autoscaling
 | `commands` | `cmd`, `host`, `type`, `sandbox`, `agent`, `epoch`, `purpose` ∈ {null, `stonith_fence`} (`:110`), `body`, `result`, `result_ms` | Answered rows pruned after 24 h (`:1323`); unanswered rows never pruned. |
 | `rel_out`, `rel_state` | per host: unacked command batches by `seq`; `next_out`, `last_in` | `reliable.ts:11-14`. |
 | `leases` | `sandbox` (PK), `host`, `epoch`, `expired`, `state` | Drives busy/idle and STONITH. |
-| `reassign_queue` | `sandbox` (**PK alone**), `host`, `epoch`, `host_dead`, `attempts` | `:195-196`. Replaced on refactor/fleet by `reassignments`, PK (`sandbox`, `host`, `epoch`); old rows are moved over at construction. |
+| `reassign_queue` | `sandbox` (**PK alone**), `host`, `epoch`, `host_dead`, `attempts` | `:195-196`. Replaced in #62 by `reassignments`, PK (`sandbox`, `host`, `epoch`); old rows are moved over at construction. |
 | `evictions` | (`sandbox`, `host`, `epoch`) | SandboxDO told `evicted`, retried (`:1580-1589`). |
 | `host_agents`, `stale_incarnations` | brains per host; incarnations awaiting `sandbox_destroy` | Busy check and dead-host cleanup. |
 
@@ -59,7 +62,7 @@ In memory only: `launching` (a RunInstances in flight, `:175`), `keysSent` (`:13
 | H10 | `active` → `draining` | `spot_notice` event | status `active` | evict suspended leases, `sandbox_suspend{disk_only}` to the rest | `fleet.ts:1042`, `:1544-1554` |
 | H11 | `active` → `dead` (idle) | tick → scaleDown | role `burst`, `instance_id` set, no lease with `state ≠ suspended`, no brain, `idle_since` ≥ `idle_grace_ms` (600 s) ago | endInstance(`idle`), release tunnel, close, evict | `:1496-1512` |
 | H12 | `draining` → `dead` (drained) | tick → scaleDown | role `burst`, `instance_id` set, no lease at all | endInstance(`drained`), release tunnel, close | `:1515-1523` |
-| H13 | `active`(never connected) → `dead` | tick → scaleDown | `instance_id` set ∧ `enrolled_ms` older than `enroll_timeout_ms` (added in refactor/all) | `die(enroll_timeout)`: endInstance, release tunnel, reassign leases | `scaleDown` |
+| H13 | `active`(never connected) → `dead` | tick → scaleDown | `instance_id` set ∧ `enrolled_ms` older than `enroll_timeout_ms` (#62) | `die(enroll_timeout)`: endInstance, release tunnel, reassign leases | `scaleDown` |
 
 Absent on purpose: no transition out of `dead` (fetch and hello refuse a dead host, `:624`, `:739`; H4/H7/H10 are guarded by prior status). Two unguarded writes break this (B3). A silent host with no unexpired lease and role `burst` has **no** transition until H11 fires (the 10-minute watch item, B4). H7 returns a `draining` host to `active`, losing the drain (B5).
 
@@ -109,7 +112,7 @@ Purpose `stonith_fence`: an error re-issues the fence (`:1109-1111`); ok drives 
 |---|---|---|
 | Forced (spot) | yes: nestd polls IMDS every 5 s and emits `spot_notice` once per process (`host.rs:1261-1277`); FleetDO H10 | A resident leaves when it reports `suspended` (`fleet.ts:1018`); nestd reports `suspended` only after its commit landed (`host.rs:1688-1707`). H12 when no lease is left; otherwise AWS kills the host and H5 → H8 reassigns with `host_dead`. |
 | Gentle (consolidation, upgrades) | no | Docs only ([autoscaling](../../compute/autoscaling/)). |
-| Drain gate ("terminate only when every resident's head is the host's last commit and the pending-upload list is empty, all or nothing") | **no** (no `isRestoreSource` or upload-list code anywhere) | H11/H12 terminate on lease state alone. The `drain` command exists in nestd (`host.rs:2012-2031`) but FleetDO never sends it. |
+| Drain gate ("terminate only when every resident's head is the host's last commit and the pending-upload list is empty, all or nothing") | **no** (no upload report) | H11/H12 terminate on lease state alone. The `drain` command exists in nestd (`host.rs:2012-2031`) but FleetDO never sends it. |
 
 ## 3. Messages, delivery, timing
 
@@ -186,7 +189,7 @@ Fairness assumed: the alarm fires; DO RPCs eventually succeed; EC2/Cloudflare ca
 | B4 | `fleet.ts:1443-1446`, `:1309` | A lease-less burst host terminated outside FleetDO stays `active` without a socket; scaleUp counts it toward `max_hosts` (1) until H11 after 600 s. Explains the docs watch item. | L1 | **Real**, high (matches the observed ~10 min). |
 | B5 | `fleet.ts:1829` | A `draining` host silent ≥ 30 s goes to `stonith_pending`; a fence success returns it to `active`, so it takes placements again. With EC2 the instance is already being terminated; without EC2 it is a live host that will be reclaimed. | drain is absorbing | Real, low impact. |
 | B6 | `fleet.ts:1458-1465` | RunInstances succeeds but the answer is lost (or the object resets) before the `launched` insert; the client token embeds `now`, so no retry reuses it. The instance can never enroll and nothing terminates it; nothing reconciles EC2 `nest=true` instances against `launched`. | L3, S10 | Real, low frequency, costs money. |
-| B7 | `ec2.ts:45`, `:65`, `:117` | `state()` maps `InvalidInstanceID.NotFound` and any unparseable 200 to `null`, and `isDead(null)` is true. A cell whose region or credentials change while hosts run (per-cell AWS since `d0c328f`) would confirm every silent host dead without terminating it. The host's own 20 s self-fence is the remaining guard; a hung nestd with running VMMs is not covered. | S2 | Suspected (fail-open assumption), medium. Half fixed on refactor/fleet: an unparseable answer throws; NotFound is still `null` (a wrong account or region answers NotFound). |
+| B7 | `ec2.ts:45`, `:65`, `:117` | `state()` maps `InvalidInstanceID.NotFound` and any unparseable 200 to `null`, and `isDead(null)` is true. A cell whose region or credentials change while hosts run (per-cell AWS since `d0c328f`) would confirm every silent host dead without terminating it. The host's own 20 s self-fence is the remaining guard; a hung nestd with running VMMs is not covered. | S2 | Suspected (fail-open assumption), medium. Half fixed (#62): an unparseable answer throws; NotFound is still `null` (a wrong account or region answers NotFound). |
 | B8 | `fleet.ts:1499` | `wake` sends `sandbox_resume` to a host whose lease says `suspended`; if the tick runs H11 before the host's `running` event arrives (idle grace already elapsed), the host is retired, the lease evicted and the resumed VM's work since its last commit is lost. | S4 | Suspected, medium-low (narrow window). Fix shape: an unanswered command on a lease counts as busy. |
 | B9 | `fleet.ts:1496-1523` | H11/H12 ignore `stale_incarnations` with `clean = 0`: a host whose fenced incarnation is still salvaging can be terminated before the salvage commit lands. | S9 | Suspected; salvage is best-effort by design, so this may be acceptable. |
 | B10 | `fleet.ts:783` vs `:789` | On a new nestd, `reconcileSandboxes` (and any concurrent caller during its SandboxDO awaits) issues commands to the new process before `pending` is captured; they are then failed as "restarted before running this command" although delivered, and their real result is ignored. The reconcile `fence` and `reapStale`'s `sandbox_destroy` get a fake failure every time; today their failure handling is a no-op (`fence` has no `sandbox` column, `commandFailed` acts only on `sandbox_create`, `sandbox.ts:437`). A `sandbox_create` from a concurrent placement gets a fake retryable failure and SandboxDO re-issues it. | S7 | Real (deterministic for the reconcile commands, harmless today); the concurrent create case is suspected, low impact. The comment at `:788` states the opposite intent. |
@@ -216,10 +219,6 @@ Doc/code disagreements: S8 (docs: gap closes the socket on both channels); the d
 
 **Worth a formal model (TLA+/P, small bounds):** command delivery (S7, S8, L6) and STONITH (S1-S3, L4, L5). Both are protocols with interleavings humans keep getting wrong; B1, B2 and B10 would fall out in seconds. **Property-based tests are enough for:** autoscaling counts (S10, L1-L3), tunnel bookkeeping (S6, L7) and enrollment (S5), which are mostly plumbing over SQL with one decision each.
 
-**Runtime assertions or tests now.**
-- nestd: refuse (close and reconnect) a `commands` batch with `seq ≠ last + 1`; FleetDO: never send a later batch while an earlier one for the same host is unsent (B1, B2).
-- Guard every status write with its expected prior status (`WHERE status IN (...)`), and assert no write leaves `dead` (B3).
-- A test: an unanswered `commands` row on a `dead` host is a failure (S7); merge the retention branch's fix.
-- A test: `place` with a disconnected `active` host at `max_hosts` launches within one tick (B4); count only hosts with a socket or a recent `last_rx`.
+**Runtime assertions or tests now** (B1-B4's are done, see Status):
 - `isDead`: treat `NotFound` as dead only for an instance older than a few minutes and seen running before (B7).
 - scaleDown: busy if any unanswered command names a lease on the host (B8).
