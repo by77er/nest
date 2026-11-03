@@ -1103,7 +1103,7 @@ export class ProjectDO extends DurableObject<Env> {
       : !m?.roles.includes(r.role as SecretRole)
         ? `The owner set up the secret ${r.name as string} you asked for, but not for your role (${r.role as string}): say so if you still need it.`
         : r.role === "reviewer"
-          ? `The owner set up the secret ${r.name as string} you asked for, as $${m.env}: a reviewer gets it at its next start.`
+          ? `The owner set up the secret ${r.name as string} you asked for. Your sandbox gets it as $${m.env} in a moment, in the commands you start from then on.`
           : `The owner set up the secret ${r.name as string} you asked for. Your sandbox gets it as $${m.env} in a moment, in the commands you start from then on.`;
     this.oweMessage(r.agent as string, text, false);
   }

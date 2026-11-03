@@ -34,9 +34,17 @@ export function MetaItem({ icon: Icon, children, title, mono = false }: { icon?:
  * A name typed as is, like an environment variable or a host: never broken mid-name (it breaks only
  * where it has a space), so a table's column is as wide as its longest. Mono and dimmed by default.
  */
-export function Token({ children, slot, mono = true, dimmed = true, size = "xs" }: { children: ReactNode; slot?: string; mono?: boolean; dimmed?: boolean; size?: "xs" | "sm" }) {
+export function Token({ children, slot, mono = true, dimmed = true, size = "xs", nowrap = false, title }: {
+  children: ReactNode; slot?: string; mono?: boolean; dimmed?: boolean; size?: "xs" | "sm";
+  /** One line even at its spaces, as a relative time ("2 minutes ago"). */
+  nowrap?: boolean;
+  title?: string;
+}) {
   return (
-    <Text component="span" size={size} c={dimmed ? "dimmed" : undefined} ff={mono ? "monospace" : undefined} data-slot={slot} style={{ overflowWrap: "normal", wordBreak: "keep-all" }}>
+    <Text
+      component="span" size={size} c={dimmed ? "dimmed" : undefined} ff={mono ? "monospace" : undefined} data-slot={slot} title={title}
+      style={{ overflowWrap: "normal", wordBreak: "keep-all", ...(nowrap ? { whiteSpace: "nowrap" } : {}) }}
+    >
       {children}
     </Text>
   );

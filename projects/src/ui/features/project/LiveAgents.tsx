@@ -2,6 +2,7 @@
 // carries both a role's network rules and its secrets, so the Network and Secrets pages show the same list.
 
 import { Badge, Text } from "@mantine/core";
+import type { ReactNode } from "react";
 import type { LayerStatus } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { Panel, Row, Stack } from "../../layout";
@@ -19,7 +20,7 @@ export interface LiveAgentsProps {
   /** Shown when no agent is live. */
   empty: string;
   /** A line about one agent's layer, under its role (what the page's part of it holds). */
-  detail?: (a: LayerStatus) => string | null;
+  detail?: (a: LayerStatus) => ReactNode;
 }
 
 export function LiveAgents({ agents, label, empty, detail }: LiveAgentsProps) {

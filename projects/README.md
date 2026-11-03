@@ -281,9 +281,10 @@ The owner's rule (2026-11-02): credentials never enter sandboxes. What an agent 
 - **The prompts:** never ask for a secret's value, nor write one into a file, a commit or a log. A placeholder isn't a secret. Ask with `request_secret`.
 - **"Workers may change CI workflows"** (Settings; off by default): when on, a worker's sandbox create carries `github_push: {workflows: true}`, so its push token may change `.github/workflows/`. The manager and reviewers never get it. It needs the grant's `github_push.workflows`: turning it on without that is refused, and the toggle says so. The security note says that a pushed workflow runs with the repo's Actions secrets before review, so CI secrets belong in an [environment with required reviewers](https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment). Turning it off strips it from starts in flight (a create whose answer was lost then fails, 409, rather than start a worker with it); live workers keep it until they end, and the toggle names them.
 - **The Secrets page** (between Reviews and Settings):
-  - a table of name and variable, description, hosts, how it's sent, roles, updated and last injected;
+  - under the title, that values are write-only and agents see only a placeholder;
+  - a table of name and variable, description, hosts, how it's sent, roles, updated and last injected; below `sm` a card per secret instead, its Edit and Delete in it;
   - adding and editing in a Sheet: a service preset (Cloudflare API, npm, PyPI upload, GitHub API with a note to prefer nest's brokered GitHub, or custom), the variable (the preset's, such as `CLOUDFLARE_API_TOKEN`, else the name upper-cased, until typed in; GitHub's has no preset variable, so `GH_TOKEN` doesn't take over the brokered token), the value masked and write-once (an edit replaces it only through "Set a new value"), the hosts, the format and the roles (workers by default);
-  - the live agents' layers, as on the Network page (one list, `LiveAgents`), with the variables each has;
+  - the live agents' layers (reviewers' too), as on the Network page (one list, `LiveAgents`), with the variables each has;
   - deleting is confirmed, naming who loses it and when.
 
 ## The UI

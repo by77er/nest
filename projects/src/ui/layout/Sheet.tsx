@@ -10,6 +10,7 @@
 
 import { Box, Drawer, ScrollArea, Tabs } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
+import { usePhone } from "./media";
 import { IconFileText, IconTimeline } from "@tabler/icons-react";
 import { createContext, type ReactNode, useContext } from "react";
 import { icon } from "../theme";
@@ -23,13 +24,16 @@ export const useFillColumn = () => useContext(Column);
 
 const FULL = { display: "flex", flexDirection: "column", flex: 1, minHeight: 0 } as const;
 
+/** The close button's name: Mantine's is an unlabeled icon. */
+const CLOSE = { "aria-label": "Close" };
+
 export function Sheet({ opened, onClose, title, children, beside, besideEmpty, split = false, labels = ["Details", "Trace"] }: {
   opened: boolean; onClose: () => void; title: string; children: ReactNode; beside?: ReactNode;
   /** What the wide sheet's second column shows when there's nothing beside (so its frame stays balanced). */
   besideEmpty?: ReactNode;
   split?: boolean; labels?: [string, string];
 }) {
-  const phone = useMediaQuery("(max-width: 48em)");
+  const phone = usePhone();
   const wide = useMediaQuery("(min-width: 88em)");
   const size = phone ? "100%" : split && wide ? "var(--nest-sheet-wide)" : "xl";
   if ((beside || besideEmpty) && wide && split) {
@@ -40,6 +44,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
         position="right"
         size={size}
         title={title}
+        closeButtonProps={CLOSE}
         styles={{
           content: { display: "flex", flexDirection: "column" },
           body: { flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: "var(--nest-sheet-details) minmax(0, 1fr)", gap: "var(--mantine-spacing-2xl)" },
@@ -62,6 +67,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
         position="right"
         size={size}
         title={title}
+        closeButtonProps={CLOSE}
         styles={{ content: { display: "flex", flexDirection: "column" }, body: { ...FULL } }}
       >
         {/* `display-none`, not Mantine's default `activity` (React's <Activity hidden>), which runs effects'
@@ -88,7 +94,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
     );
   }
   return (
-    <Drawer opened={opened} onClose={onClose} position="right" size={size} title={title}>
+    <Drawer opened={opened} onClose={onClose} position="right" size={size} title={title} closeButtonProps={CLOSE}>
       {split && wide ? <Box maw="var(--nest-measure)">{children}</Box> : children}
     </Drawer>
   );

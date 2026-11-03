@@ -10,6 +10,7 @@ import { ApiError } from "../../api/client";
 import { usePutSecret } from "../../api/queries";
 import type { SecretView } from "../../api/types";
 import { FieldGroup, Notice, Row, Stack } from "../../layout";
+import { fontWeights } from "../../theme";
 
 type Format = "authorization_bearer" | "authorization_basic_password" | "header";
 
@@ -138,7 +139,7 @@ export function SecretForm({ projectId, grant, editing, initial, takenEnv = [], 
           />
         ) : (
           <Stack gap="xs">
-            <Text fz="sm" fw="medium">
+            <Text fz="sm" fw={fontWeights.medium}>
               Value
             </Text>
             <Text fz="sm" c="dimmed">
@@ -165,7 +166,7 @@ export function SecretForm({ projectId, grant, editing, initial, takenEnv = [], 
         />
         <Select label="Sent as" data={FORMATS} value={format} onChange={(v) => v && setFormat(v as Format)} allowDeselect={false} />
         {format === "header" && <TextInput label="Header name" value={header} onChange={(e) => setHeader(e.currentTarget.value)} placeholder="X-Api-Key" error={shown("locations")} />}
-        <Checkbox.Group label="Given to" description="Live workers and the manager get it in a moment; reviewers at their next start." value={roles} onChange={(v) => setRoles(v as SecretRole[])} error={shown("roles")}>
+        <Checkbox.Group label="Given to" description="Live agents of these roles, reviewers included, get it in a moment; new ones when they start." value={roles} onChange={(v) => setRoles(v as SecretRole[])} error={shown("roles")}>
           <Stack gap="xs">
             {ROLES.map((r) => (
               <Checkbox key={r.value} value={r.value} label={r.label} />

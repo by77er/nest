@@ -164,6 +164,7 @@ export function data(variant = "demo", now = Date.now()) {
       { agent: "agt_w8x2m4", role: "worker", sandbox: "sbx_w1", state: "applied", error: null, rev: 3, at_ms: now - 110_000 },
       { agent: "agt_w3f9q1", role: "worker", sandbox: "sbx_w2", state: "pending", error: "nest answered 503: internal (retrying)", rev: 2, at_ms: now - 900_000 },
       { agent: "agt_w1k7c2", role: "worker", sandbox: "sbx_w3", state: "failed", error: "nest 403 forbidden: egress host downloads.gadgets.example.com is outside the grant", rev: 2, at_ms: now - 900_000 },
+      { agent: "agt_rv5n2p", role: "reviewer", sandbox: "sbx_r1", state: "applied", error: null, rev: 3, at_ms: now - 100_000 },
     ],
     egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org", "*.gadgets.example.com", "crates.io", "static.crates.io", "index.crates.io"],
     base: variant === "network-empty" ? null : [
@@ -180,7 +181,7 @@ export function data(variant = "demo", now = Date.now()) {
     secrets: variant === "secrets-empty" ? [] : [
       { name: "cloudflare_token", env: "CLOUDFLARE_API_TOKEN", description: "DNS for gadgets.example.com", hosts: ["api.cloudflare.com"], locations: bearer, roles: ["worker", "manager"], size: 40, created_ms: now - 5 * 86_400_000, updated_ms: now - 3_600_000, holders: [{ agent: "agt_mgr7k2", role: "manager" }, { agent: "agt_w8x2m4", role: "worker" }], last_injected_ms: now - 120_000, in_nest: true, outside_hosts: [] },
       { name: "npm_token", env: "NPM_TOKEN", description: "Publishing @gadgets packages", hosts: ["registry.npmjs.org"], locations: bearer, roles: ["worker"], size: 36, created_ms: now - 4 * 86_400_000, updated_ms: now - 4 * 86_400_000, holders: [{ agent: "agt_w8x2m4", role: "worker" }], last_injected_ms: now - 600_000, in_nest: true, outside_hosts: [] },
-      { name: "uploads_key", env: "GADGETS_UPLOAD_KEY", description: "", hosts: ["uploads.gadgets.example.com", "*.cdn.gadgets.example.com", "uploads.legacy-gadgets.example.net"], locations: [{ type: "header", name: "X-Upload-Key" }], roles: ["reviewer"], size: 64, created_ms: now - 2 * 86_400_000, updated_ms: now - 2 * 86_400_000, holders: [], last_injected_ms: null, in_nest: true, outside_hosts: ["uploads.legacy-gadgets.example.net"] },
+      { name: "uploads_key", env: "GADGETS_UPLOAD_KEY", description: "", hosts: ["uploads.gadgets.example.com", "*.cdn.gadgets.example.com", "uploads.legacy-gadgets.example.net"], locations: [{ type: "header", name: "X-Upload-Key" }], roles: ["reviewer"], size: 64, created_ms: now - 2 * 86_400_000, updated_ms: now - 2 * 86_400_000, holders: [{ agent: "agt_rv5n2p", role: "reviewer" }], last_injected_ms: now - 90_000, in_nest: true, outside_hosts: ["uploads.legacy-gadgets.example.net"] },
     ],
     grant: { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org", "upload.pypi.org", "*.gadgets.example.com"], max_count: 20, max_bytes: 4096, workflows: true, used: 3 },
     client: "cli_demo",

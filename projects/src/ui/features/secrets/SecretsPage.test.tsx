@@ -26,6 +26,32 @@ describe("the Secrets page", () => {
     expect(screen.getByText(/0 of 10 secrets used/)).toBeInTheDocument();
   });
 
+  it("says values are write-only, on the populated page too", async () => {
+    const api = new FakeApi();
+    api.secrets = [secret()];
+    renderApp("/projects/prj_one/secrets", api);
+    expect(await screen.findByText(/Values are write-only: they go to nest when saved and can't be read back/)).toBeInTheDocument();
+  });
+
+  it("on a phone, is a card per secret with its actions in it, not a table to scroll", async () => {
+    const real = window.matchMedia;
+    window.matchMedia = ((q: string) => ({ ...real(q), matches: q.includes("max-width: 48em") })) as typeof window.matchMedia;
+    try {
+      const api = new FakeApi();
+      api.secrets = [secret()];
+      const { user } = renderApp("/projects/prj_one/secrets", api);
+      const list = await screen.findByRole("list", { name: "Secrets" });
+      expect(screen.queryByRole("table")).toBeNull();
+      const card = within(list).getByText("npm_token").closest("[data-secret]") as HTMLElement;
+      for (const t of ["$NPM_TOKEN", "registry.npmjs.org", "Sent as Bearer", "Workers", "Updated 1 hour ago", "Last injected 1 minute ago"]) expect(card).toHaveTextContent(t);
+      await user.click(within(card).getByRole("button", { name: "Edit npm_token" }));
+      // The Sheet's close button has a name.
+      expect(within(sheet()).getByRole("button", { name: "Close" })).toBeInTheDocument();
+    } finally {
+      window.matchMedia = real;
+    }
+  });
+
   it("adds one from a preset: the value masked and sent once, with its hosts, format and roles", async () => {
     const api = new FakeApi();
     const { user } = renderApp("/projects/prj_one/secrets", api);
