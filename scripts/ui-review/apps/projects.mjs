@@ -101,24 +101,44 @@ async function sixColumns(page, { width }) {
 // end, a new message while reading back shows a pill, and sending goes to the end. Each state's `after`
 // acts like a reader (the wheel) and leaves what it measured for `check`.
 
-const bubbles = (p) => p.evaluate(() => [...document.querySelectorAll("[data-ds=bubble]")].map((b) => Math.round(b.getBoundingClientRect().top)));
-const bottoms = (p) => p.evaluate(() => [...document.querySelectorAll("[data-ds=bubble]")].map((b) => Math.round(b.getBoundingClientRect().bottom)));
-/** The room between the newest message and the docked composer (negative: under it). */
-const gapAbove = (p) => p.evaluate(() => {
-  const last = [...document.querySelectorAll("[data-ds=bubble]")].at(-1)?.getBoundingClientRect();
-  const f = document.querySelector("[data-ds=pinned-footer]")?.getBoundingClientRect();
-  return last && f ? Math.round(f.top - last.bottom) : null;
-});
+/** A chat message: a bubble on the page, or a row in a log that scrolls in itself. */
+const MESSAGE = "[data-ds=bubble], [data-ds=message]";
+const bubbles = (p) => p.evaluate((sel) => [...document.querySelectorAll(sel)].map((b) => Math.round(b.getBoundingClientRect().top)), MESSAGE);
+const bottoms = (p) => p.evaluate((sel) => [...document.querySelectorAll(sel)].map((b) => Math.round(b.getBoundingClientRect().bottom)), MESSAGE);
+/**
+ * The room below the newest message before what ends the view: the docked composer over the page, or
+ * the bottom of a log that scrolls in itself (negative: hidden under it).
+ */
+const gapAbove = (p) => p.evaluate((sel) => {
+  const last = [...document.querySelectorAll(sel)].at(-1)?.getBoundingClientRect();
+  const l = document.querySelector("[data-ds=chat-log]");
+  // A log that scrolls in itself ends at its bottom; else a docked composer (pinned at the bottom) does.
+  const own = l && l.scrollHeight > l.clientHeight + 1;
+  const f = document.querySelector("[data-ds=pinned-footer], [data-ds=composer-dock]")?.getBoundingClientRect();
+  const limit = own ? l.getBoundingClientRect().bottom : f?.top;
+  return last && limit !== undefined ? Math.round(limit - last.bottom) : null;
+}, MESSAGE);
 /** While following, the newest message is clear of the composer by at least `md` (12 px), not touching it. */
 const MIN_GAP = 12;
 const endProblems = (gap, when) => (gap === null ? [`${when}: no message or composer`] : gap < MIN_GAP ? [`${when}, the newest message is ${gap} px from the composer (at least ${MIN_GAP})`] : []);
 /**
- * Scroll up like a reader, and the first message in view, even if cut by the top: its index and top.
- * That's the message the browser anchors on (the first visible in order; only whole messages anchor), so
- * growth above it mustn't move it, while growth inside the view moves what's below, as it should.
+ * Scroll up like a reader (the wheel over the log, or the page), and the first message in view, even if
+ * cut by the top: its index and top. That's the message the browser anchors on (the first visible in
+ * order; only whole messages are anchors), so growth above it mustn't move it, while growth inside the
+ * view moves what's below, as it should.
  */
 async function readBack(p, width) {
-  await p.mouse.move(width / 2, 300);
+  // Over the chat's scroller (the log, or on a phone the page's column), and its view's top.
+  const log = await p.evaluate(() => {
+    const l = document.querySelector("[data-ds=chat-log]");
+    if (!l) return null;
+    const scroller = l.scrollHeight > l.clientHeight + 1 ? l : (l.closest("[data-ds=page]") ?? l);
+    const r = scroller.getBoundingClientRect();
+    const top = Math.max(r.top, 0, l.getBoundingClientRect().top);
+    const bottom = Math.min(r.bottom, window.innerHeight);
+    return { x: r.left + r.width / 2, y: (top + bottom) / 2, top };
+  });
+  await p.mouse.move(log?.x ?? width / 2, log?.y ?? 300);
   for (let i = 0; i < 6; i++) {
     await p.mouse.wheel(0, -300);
     await p.waitForTimeout(80);
@@ -126,9 +146,15 @@ async function readBack(p, width) {
   await p.waitForTimeout(300);
   const tops = await bubbles(p);
   const ends = await bottoms(p);
-  const i = ends.findIndex((b) => b > 0);
+  const i = ends.findIndex((b) => b > (log?.top ?? 0));
   return { i, top: tops[i] };
 }
+/** Scroll the chat's scroller (the log, or on a phone the page's column) by a function of it. */
+const scrollChat = (p, how) => p.locator("[data-ds=chat-log]").evaluate((l, how) => {
+  const el = l.scrollHeight > l.clientHeight + 1 ? l : (l.closest("[data-ds=page]") ?? l);
+  el.scrollTop = how === "top" ? 0 : el.scrollHeight / 3;
+  el.dispatchEvent(new Event("scroll"));
+}, how);
 /** The fixture's answer for a path, as `serve` gives it. */
 const fixed = (fixture, path) => data(fixture).answer("GET", path)[1];
 /** Serves the fixture's chat with `extra()` appended, and takes the owner's messages (POST) into it. */
@@ -296,6 +322,84 @@ const rhythm = (fixture, blocks, after) => async (p, { width }) => {
 
 
 
+/**
+ * The chat fits the viewport, at both ends of its scroll (the log, or on a phone the page's column):
+ * the document itself never scrolls; the composer is fully on screen and pinned at the viewport's
+ * bottom (within the page's bottom padding); and at the end, right under the log.
+ */
+export function inkChatFit() {
+  const out = [];
+  const doc = document.documentElement;
+  const log = document.querySelector("[data-ds=chat-log]");
+  const dock = document.querySelector("[data-ds=composer-dock]");
+  const field = dock?.querySelector("textarea");
+  if (!log || !dock || !field) return ["no chat log or composer on the page"];
+  // The log scrolls itself from `sm` up (overflow auto, even while it's short); on a phone the page's
+  // column does.
+  const ownScroll = /(auto|scroll)/.test(getComputedStyle(log).overflowY);
+  const scroller = ownScroll ? log : (log.closest("[data-ds=page]") ?? log);
+  const was = scroller.scrollTop;
+  const H = window.innerHeight;
+  window.scrollTo(0, 1e6);
+  if (window.scrollY > 0 || doc.scrollHeight > H + 1) out.push(`the document scrolls ${doc.scrollHeight - H} px (only the chat should)`);
+  window.scrollTo(0, 0);
+  for (const end of ["top", "end"]) {
+    scroller.scrollTop = end === "top" ? 0 : scroller.scrollHeight;
+    const f = field.getBoundingClientRect();
+    const d = dock.getBoundingClientRect();
+    if (f.top < 0 || f.bottom > H + 0.5) out.push(`at the ${end}, the composer is off screen (${Math.round(f.top)}..${Math.round(f.bottom)} of ${H})`);
+    // Pinned: flush on a phone (the page's column has no bottom padding), within the page's padding else.
+    const slack = ownScroll ? 64 : 4;
+    if (d.bottom < H - slack) out.push(`at the ${end}, the composer sits ${Math.round(H - d.bottom)} px above the viewport's bottom, not pinned there`);
+    if (end === "end") {
+      // The log's last line on screen: its own bottom when it scrolls itself, else its content's end.
+      const l = log.getBoundingClientRect();
+      const gap = Math.round(d.top - Math.min(l.bottom, H));
+      if (gap > 32) out.push(`at the end, the composer is ${gap} px below the log (right under it)`);
+    }
+  }
+  scroller.scrollTop = was;
+  return out;
+}
+
+/**
+ * The chat fits the viewport: the page itself doesn't scroll (only the log does, or on a phone the
+ * page's column), and the composer is on screen.
+ */
+async function chatFits(p) {
+  const problems = await p.evaluate(inkChatFit);
+  return problems;
+}/** The context column beside the chat: all of it shown when it fits the viewport, scrolling only when it doesn't. */
+async function contextShown(p) {
+  return p.evaluate(() => {
+    const c = document.querySelector("[data-slot=context]");
+    if (!c) return [];
+    const r = c.getBoundingClientRect();
+    const room = window.innerHeight - r.bottom;
+    return c.scrollHeight > c.clientHeight + 1 && room > 48 ? [`the context column scrolls ${c.scrollHeight - c.clientHeight} px inside itself with ${Math.round(room)} px of the viewport free below it`] : [];
+  });
+}
+/** An empty chat on a phone and below `sm` (390, 600 wide, a 768×1024 portrait tablet): the composer flush at the bottom. */
+async function chatFitsNarrow(p) {
+  const was = p.viewportSize();
+  const out = (await p.evaluate(inkChatFit)).map((x) => `${was.width} px: ${x}`);
+  for (const [width, height] of [[600, 960], [768, 1024]]) {
+    await p.setViewportSize({ width, height });
+    await p.waitForTimeout(600);
+    out.push(...(await p.evaluate(inkChatFit)).map((x) => `${width}×${height}: ${x}`));
+  }
+  await p.setViewportSize(was);
+  await p.waitForTimeout(300);
+  return out;
+}
+/** A two-line draft (Shift+Enter between), still in the composer, unsent; and the chat still fits. */
+async function draftKept(p) {
+  const problems = await chatFits(p);
+  const value = await p.locator("[data-ds=composer-dock] textarea").inputValue();
+  if (!value.includes("\n") || !value.endsWith("with prices and tags.")) problems.push(`the draft isn't both lines in the composer: ${JSON.stringify(value)}`);
+  return problems;
+}
+
 /** A task card's PR link opens the PR (a new tab on GitHub), not the task the whole card links to. */
 const cardPrLink = (p) => prLinkIn(p, "[data-slot=manager-context] [data-ds=task-card]", "a context card");
 const chatCardPrLink = (p) => prLinkIn(p, "[data-ds=rich] [data-ds=task-card]", "a chat card");
@@ -337,7 +441,7 @@ const scroll = {
     const problems = [];
     const shift = (await bubbles(p))[r0.i] - r0.top;
     if (Math.abs(shift) > 2) problems.push(`reading back, a new reply moved the line ${shift} px`);
-    const pill = p.getByRole("button", { name: /new message/i });
+    const pill = p.getByRole("button", { name: /new message|jump to latest/i });
     if (!(await pill.count())) problems.push("a reply arrived while reading back, with no cue");
     else {
       await pill.first().click();
@@ -351,9 +455,11 @@ const scroll = {
     await liveChat(p, fixture);
     await readBack(p, p.viewportSize().width);
     await p.getByPlaceholder("Write a message").fill("Sent while reading back");
-    await p.keyboard.press("Control+Enter");
+    // Send, as on a phone (where Enter is a new line).
+    await p.getByRole("button", { name: "Send" }).click();
     await p.waitForTimeout(1_000);
-    const last = await p.evaluate(() => [...document.querySelectorAll("[data-ds=bubble]")].at(-1)?.textContent ?? "");
+    // The last message the owner or the manager sent (a turn still streaming comes after it).
+    const last = await p.evaluate((sel) => [...document.querySelectorAll(sel)].filter((m) => m.getAttribute("data-sender") !== "stream").at(-1)?.textContent ?? "", MESSAGE);
     const problems = [];
     if (!last.includes("Sent while reading back")) problems.push("the sent message isn't the last one shown");
     problems.push(...endProblems(await gapAbove(p), "after sending"));
@@ -400,7 +506,7 @@ const app = {
         const p = history[url.searchParams.get("before") ?? ""];
         return route.fulfill({ status: p ? 200 : 400, contentType: "application/json", body: JSON.stringify(p ?? { error: "unknown cursor" }) });
       }
-      const [status, body] = answer(route.request().method(), new URL(route.request().url()).pathname.replace(/^\/api/, ""));
+      const [status, body] = answer(route.request().method(), url.pathname.replace(/^\/api/, ""), url.searchParams);
       return route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
     });
   },
@@ -460,6 +566,19 @@ const app = {
     { name: "rhythm-prs", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, widths: PHONE, after: drawerAt("Pull requests"), check: prProximity, checkName: "rhythm" },
     { name: "rhythm-trace", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, widths: PHONE, check: traceProximity, checkName: "rhythm" },
     { name: "rhythm-context", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click(), check: rhythm("demo", ["[data-slot=manager-context]"], (p) => p.getByRole("button", { name: "About the manager" }).click()), checkName: "rhythm" },
+    // The chat fits the viewport (checks: `chat-fit`): the page doesn't scroll, the composer is on screen.
+    { name: "chat-fit", section: "project", path: "/projects/prj_demo/manager", full: false, check: chatFits, checkName: "chat-fit" },
+    { name: "context-empty-chat", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, widths: DESKTOP, check: contextShown, checkName: "clipping" },
+    { name: "chat-fit-empty", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, widths: PHONE, check: chatFitsNarrow, checkName: "chat-fit" },
+    { name: "chat-fit-long", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, check: chatFits, checkName: "chat-fit" },
+    // The chat (README.md#the-manager-chat): a turn streaming with its activity line and Stop; the composer
+    // with a draft; the jump-to-latest pill; older history paged in; a message's actions; the unread dot.
+    { name: "chat-streaming", section: "project", path: "/projects/prj_demo/manager", full: false, ready: shown("[data-sender=stream]") },
+    { name: "chat-draft", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, after: async (p) => { await p.getByRole("button", { name: /^Spec a task for/ }).click(); await p.keyboard.type("exporting gadgets as CSV,"); await p.keyboard.press("Shift+Enter"); await p.keyboard.type("with prices and tags."); }, check: draftKept, checkName: "chat-fit" },
+    { name: "chat-jump", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-arriving", full: false, after: async (p) => { await scrollChat(p, "third"); await p.getByRole("button", { name: /Jump to latest/ }).waitFor({ timeout: 10_000 }); } },
+    { name: "chat-older", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-paged", full: false, after: async (p) => { await scrollChat(p, "top"); await p.getByText("Message 22: how is the search work going?").waitFor({ timeout: 10_000 }); } },
+    { name: "chat-actions", section: "project", path: "/projects/prj_demo/manager", full: false, after: async (p) => { await p.getByRole("button", { name: "Message actions" }).first().click(); await p.getByRole("menuitem", { name: /Quote in a reply/ }).waitFor(); } },
+    { name: "unread-dot", section: "project", path: "/projects/prj_demo/board", full: false, ready: shown("[data-marker=unread]") },
     // The chat's scrolling, acted out (checks: `chat-scroll`).
     { name: "chat-readback-growth", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, widths: [1440, 390], after: scroll.readbackGrowth("chat-long"), check: stashed, checkName: "chat-scroll" },
     { name: "chat-readback-new", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, widths: [1440, 390], after: scroll.readbackNew("chat-long"), check: stashed, checkName: "chat-scroll" },

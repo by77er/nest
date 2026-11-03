@@ -42,7 +42,13 @@ export const useTask = (id: string, task: string | undefined) =>
     placeholderData: keepPreviousData,
   });
 
-export const useChat = (id: string) => useQuery({ queryKey: keys.chat(id), queryFn: () => api.chat(id), refetchInterval: POLL.chat });
+/** The chat's latest page; `enabled: false` (or no id) asks nothing (the sidebar outside a project). */
+export const useChat = (id: string, enabled = true) => useQuery({ queryKey: keys.chat(id), queryFn: () => api.chat(id), refetchInterval: POLL.chat, enabled: enabled && id !== "" });
+
+/** Stop the manager's current turn (Stop, while one runs). */
+export function useInterruptManager(id: string) {
+  return useMutation({ mutationFn: () => api.interruptManager(id), meta: { failure: "The manager wasn't stopped" } });
+}
 
 export const useAsks = (id: string) => useQuery({ queryKey: keys.asks(id), queryFn: () => api.asks(id), refetchInterval: POLL.asks });
 
@@ -215,7 +221,8 @@ export function usePostChat(id: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (text: string) => api.postChat(id, { text }),
-    meta: { failure: "The message wasn't sent" },
+    // No toast: a message that isn't taken stays in the log, not delivered, with Retry.
+    meta: { inline: true },
     onMutate: async (text) => {
       await qc.cancelQueries({ queryKey: keys.chat(id) });
       const before = qc.getQueryData<ChatMessage[]>(keys.chat(id));
