@@ -33,6 +33,11 @@ class CiChanges(unittest.TestCase):
     def test_other_workflows_and_guards_run_nothing_extra(self):
         self.assertEqual(jobs(".github/workflows/deploy.yml", "scripts/check-fences.py", "scripts/tests/test_guards.py"), set())
 
+    def test_ui_review_tooling_runs_nothing(self):
+        # Run by hand and by the design reviewer, never in CI (Actions minutes).
+        self.assertEqual(jobs("scripts/ui-review/review.mjs", "scripts/ui-review/package-lock.json",
+                              "scripts/ui-review/fixtures/projects/demo.mjs"), set())
+
     def test_control_plane(self):
         self.assertEqual(jobs("control-plane/src/do/agent.ts"), {"control-plane", "e2e"})
         # The dashboard imports the admin view types.

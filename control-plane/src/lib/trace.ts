@@ -21,7 +21,8 @@ export const TRACE_PONG = "pong";
 
 /** What a trace event says, by `type`; every event also has `seq`, `ts_ms` and, within a turn, `turn`. */
 export type TraceBody =
-  | { type: "turn_started"; input_kind: TurnInputKind }
+  /** `unknown` only in history: the transcript doesn't say which of nest's inputs started a turn. */
+  | { type: "turn_started"; input_kind: TurnInputKind | "unknown" }
   | { type: "assistant_text"; text: string }
   | { type: "tool_call"; call_id: string; name: string; input: string }
   | { type: "tool_result"; call_id: string; is_error: boolean; summary?: string }
@@ -42,7 +43,14 @@ export type TraceEvent = { seq: number; ts_ms: number; turn?: string } & TraceBo
  * Messages that aren't events (no `seq`): older events are gone from the ring (`gap`, before the
  * backlog), the backlog is done and what follows is live (`live`), or (on a connect after it) the end.
  */
-export type TraceControl = { type: "gap"; from: number; to: number } | { type: "live" } | { type: "ended"; reason: string };
+export type TraceControl =
+  | { type: "gap"; from: number; to: number; before?: string }
+  | { type: "history"; before: string }
+  | { type: "live" }
+  | { type: "ended"; reason: string };
+
+/** The types the transcript records too: the ring's seam with the trace history is its oldest of these. */
+export const TRANSCRIPT_TYPES = new Set(["turn_started", "assistant_text", "tool_call", "tool_result", "turn_completed"]);
 
 // --- Redaction ---------------------------------------------------------------------------------------
 
@@ -180,6 +188,27 @@ export class TraceRing {
 
   prune(nowMs: number): void {
     this.sql.exec("DELETE FROM trace WHERE seq <= ? OR at_ms < ?", this.head() - this.max, nowMs - this.keepMs);
+  }
+
+  /** The ring's oldest event the transcript records too (the seam with the trace history), if any. */
+  seam(): { seq: number; ts_ms: number; type: string } | null {
+    for (const r of this.sql.exec<{ body: string }>("SELECT body FROM trace ORDER BY seq")) {
+      const ev = JSON.parse(r.body) as TraceEvent;
+      if (TRANSCRIPT_TYPES.has(ev.type)) return { seq: ev.seq, ts_ms: ev.ts_ms, type: ev.type };
+    }
+    return null;
+  }
+
+  /** What the ring holds that the transcript has too: tool calls and results by id, assistant texts. */
+  identity(): { calls: Set<string>; results: Set<string>; texts: Set<string> } {
+    const out = { calls: new Set<string>(), results: new Set<string>(), texts: new Set<string>() };
+    for (const r of this.sql.exec<{ body: string }>("SELECT body FROM trace")) {
+      const ev = JSON.parse(r.body) as TraceEvent;
+      if (ev.type === "tool_call") out.calls.add(ev.call_id);
+      else if (ev.type === "tool_result") out.results.add(ev.call_id);
+      else if (ev.type === "assistant_text") out.texts.add(ev.text);
+    }
+    return out;
   }
 
   /** Every event after `after` the ring holds, oldest first, and the gap before them if events after `after` are gone. */
