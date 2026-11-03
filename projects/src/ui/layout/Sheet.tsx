@@ -24,8 +24,10 @@ export const useFillColumn = () => useContext(Column);
 
 const FULL = { display: "flex", flexDirection: "column", flex: 1, minHeight: 0 } as const;
 
-export function Sheet({ opened, onClose, title, children, beside, besideEmpty, split = false, labels = ["Details", "Trace"] }: {
+export function Sheet({ opened, onClose, title, children, beside, besideEmpty, split = false, labels = ["Details", "Trace"], closeOnEscape = true }: {
   opened: boolean; onClose: () => void; title: string; children: ReactNode; beside?: ReactNode;
+  /** Off while what's in it handles Escape itself (a form, which leaves editing). */
+  closeOnEscape?: boolean;
   /** What the wide sheet's second column shows when there's nothing beside (so its frame stays balanced). */
   besideEmpty?: ReactNode;
   split?: boolean; labels?: [string, string];
@@ -38,6 +40,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
       <Drawer
         opened={opened}
         onClose={onClose}
+        closeOnEscape={closeOnEscape}
         position="right"
         size={size}
         title={title}
@@ -47,7 +50,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
         }}
       >
         <ScrollArea type="auto" offsetScrollbars style={{ height: "100%", minHeight: 0 }} data-column="details">
-          {children}
+          <Box pr="md">{children}</Box>
         </ScrollArea>
         <Box style={{ ...FULL, minWidth: 0, height: "100%" }} data-column="beside">
           <Column.Provider value={{ fill: true, untitled: false }}>{beside ?? besideEmpty}</Column.Provider>
@@ -60,6 +63,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
       <Drawer
         opened={opened}
         onClose={onClose}
+        closeOnEscape={closeOnEscape}
         position="right"
         size={size}
         title={title}
@@ -78,7 +82,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
           </Tabs.List>
           <Tabs.Panel value="details" pt="xl" style={{ flex: 1, minHeight: 0 }}>
             <ScrollArea type="auto" offsetScrollbars style={{ height: "100%" }} data-column="details">
-              {children}
+              <Box pr="md">{children}</Box>
             </ScrollArea>
           </Tabs.Panel>
           <Tabs.Panel value="beside" pt="xl" style={{ ...FULL }} data-column="beside">
@@ -89,7 +93,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
     );
   }
   return (
-    <Drawer opened={opened} onClose={onClose} position="right" size={size} title={title}>
+    <Drawer opened={opened} onClose={onClose} closeOnEscape={closeOnEscape} position="right" size={size} title={title}>
       {split && wide ? <Box maw="var(--nest-measure)">{children}</Box> : children}
     </Drawer>
   );

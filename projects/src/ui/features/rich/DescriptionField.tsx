@@ -5,7 +5,7 @@
 
 import { useEditor } from "@tiptap/react";
 import { type ReactNode, useEffect, useRef } from "react";
-import { EDITOR_EXTENSIONS, fromMarkdown, toMarkdown } from "../../rich/editor-markdown";
+import { editorExtensions, fromMarkdown, toMarkdown } from "../../rich/editor-markdown";
 // Its own module, not the layout index: the editor (Tiptap) loads only with the forms that use it.
 import { RichEditor, richEditorAttributes, useRichEditorLabel } from "../../layout/RichEditor";
 
@@ -17,7 +17,7 @@ export function DescriptionField({ value, onChange, label = "Details", descripti
   // move the cursor).
   const said = useRef(value);
   const editor = useEditor({
-    extensions: EDITOR_EXTENSIONS,
+    extensions: editorExtensions(),
     content: fromMarkdown(value),
     editable: !readOnly,
     autofocus: autoFocus ? "end" : false,

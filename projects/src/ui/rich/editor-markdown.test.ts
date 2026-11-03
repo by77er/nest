@@ -4,7 +4,7 @@
 
 import { Editor, type JSONContent } from "@tiptap/core";
 import { afterEach, describe, expect, it } from "vitest";
-import { EDITOR_EXTENSIONS, fromMarkdown, normalized, sameMeaning, toMarkdown } from "./editor-markdown";
+import { editorExtensions, fromMarkdown, normalized, sameMeaning, toMarkdown } from "./editor-markdown";
 
 /** What an agent might write: every block the editor has a node for. */
 const AGENT = `# Migrate the auth library
@@ -36,7 +36,91 @@ A line
 broken, and ~~struck~~ text with snake_case_names and 2 * 3 * 4.`;
 
 const kinds = (doc: JSONContent) => (doc.content ?? []).map((n) => n.type);
-const kept = (doc: JSONContent) => (doc.content ?? []).filter((n) => n.type === "markdownBlock").map((n) => n.attrs?.source);
+/** The renderer's block types for some Markdown. */
+const tree = (md: string) => (fromMarkdown(md).content ?? []).map((n) => n.type);
+
+/** A document as the editor holds it after a round trip: adjacent text with the same marks joined, marks in order. */
+function norm(n: JSONContent): JSONContent {
+  // An attribute at its default (null) is no attribute.
+  if (n.attrs) n = { ...n, attrs: Object.fromEntries(Object.entries(n.attrs).filter(([, v]) => v !== null)) };
+  if (n.marks) n = { ...n, marks: n.marks.map((m) => (m.attrs ? { ...m, attrs: Object.fromEntries(Object.entries(m.attrs).filter(([, v]) => v !== null)) } : m)) };
+  if (!n.content) return n;
+  const out: JSONContent[] = [];
+  for (const c of n.content.map(norm)) {
+    const last = out.at(-1);
+    const key = (t: JSONContent) => JSON.stringify((t.marks ?? []).map((m) => [m.type, m.attrs ?? null]).sort());
+    if (c.type === "text" && last?.type === "text" && key(c) === key(last)) out[out.length - 1] = { ...last, text: `${last.text}${c.text}` };
+    else out.push(c.type === "text" && c.marks ? { ...c, marks: [...c.marks].sort((a, b) => a.type.localeCompare(b.type)) } : c);
+  }
+  return { ...n, content: out };
+}
+
+/** A seeded PRNG (mulberry32), so a failing document can be found again. */
+function seeded(seed: number) {
+  let a = seed;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+/**
+ * A random document the editor can hold: paragraphs of words and Markdown's own characters (block markers
+ * at a line's start, `*`, `_`, `` ` ``, `[`, `<`, `&`, `|`, `\\`), marks on words,
+ * hard breaks, headings, bullet, ordered and task lists nested, quotes, rules and code blocks (fences in
+ * them). Not what Markdown has no way to write: empty paragraphs, spaces at a line's ends, a hard break
+ * at a paragraph's ends, a code block's final newline, two lists in a row inside one item or quote; nor
+ * a bare URL or address that isn't a link (GFM, the chat, links them; so does the editor as it's typed).
+ */
+function randomDoc(r: () => number): JSONContent {
+  const pick = <T,>(xs: readonly T[]) => xs[Math.floor(r() * xs.length)]!;
+  const WORDS = ["alpha", "beta", "x", "42", "snake_case", "2*3", "a_b_c", "[x]", "<b>", "&amp;", "a|b", "\\", "`tick`", "~~no~~", "1.", "2)", "-", "+", "*", "#", "##", "---", "===", ">", ":--", "|", "!", "#tag", "end #"];
+  const MARKS = [[], [], [], [{ type: "bold" }], [{ type: "italic" }], [{ type: "strike" }], [{ type: "code" }], [{ type: "bold" }, { type: "italic" }], [{ type: "link", attrs: { href: "https://example.com/l", title: null } }]] as const;
+  const line = (): JSONContent[] => {
+    const n = 1 + Math.floor(r() * 5);
+    const out: JSONContent[] = [];
+    for (let k = 0; k < n; k++) {
+      const marks = pick(MARKS);
+      const word = marks.length ? pick(["alpha", "beta", "x42", "word"]) : pick(WORDS);
+      if (k > 0) out.push({ type: "text", text: " " });
+      out.push({ type: "text", text: word, ...(marks.length ? { marks: [...marks] } : {}) });
+    }
+    return out;
+  };
+  const inlines = (): JSONContent[] => {
+    const out = line();
+    if (r() < 0.2) out.push({ type: "hardBreak" }, ...line());
+    return out;
+  };
+  const paragraph = (): JSONContent => ({ type: "paragraph", content: inlines() });
+  const list = (depth: number): JSONContent => {
+    const kind = pick(["bulletList", "orderedList", "taskList"] as const);
+    const items = Array.from({ length: 1 + Math.floor(r() * 3) }, () => {
+      const content: JSONContent[] = [paragraph()];
+      if (depth < 2 && r() < 0.3) content.push(list(depth + 1));
+      return kind === "taskList" ? { type: "taskItem", attrs: { checked: r() < 0.5 }, content } : { type: "listItem", content };
+    });
+    return kind === "orderedList" ? { type: kind, attrs: { start: pick([1, 3]) }, content: items } : { type: kind, content: items };
+  };
+  const code = (): JSONContent => {
+    const lines = Array.from({ length: 1 + Math.floor(r() * 3) }, () => pick(["const a = 1;", "```", "  indented", "~~~", "`x`", "- not a list", "#!/bin/sh"]));
+    return { type: "codeBlock", attrs: { language: pick([null, "ts", "sh"]) }, content: [{ type: "text", text: lines.join("\n") }] };
+  };
+  const blockOf = (): JSONContent => {
+    const k = r();
+    if (k < 0.4) return paragraph();
+    if (k < 0.55) return { type: "heading", attrs: { level: pick([1, 2, 3]) }, content: line() };
+    if (k < 0.75) return list(0);
+    if (k < 0.85) return code();
+    if (k < 0.93) return { type: "blockquote", content: [paragraph(), ...(r() < 0.3 ? [paragraph()] : [])] };
+    return { type: "horizontalRule" };
+  };
+  return { type: "doc", content: Array.from({ length: 1 + Math.floor(r() * 5) }, blockOf) };
+}
+
+const kept = (doc: JSONContent) => (doc.content ?? []).filter((n) => n.type === "markdownBlock").map((n) => (n.content ?? []).map((t) => t.text).join(""));
 
 describe("what an agent writes", () => {
   it("comes into the editor as its own nodes, and back out meaning the same", () => {
@@ -78,7 +162,6 @@ describe("what the editor has no node for", () => {
     ["a footnote", "Text[^1]\n\n[^1]: The note."],
     ["a reference link", "See [the doc][d].\n\n[d]: https://example.com/doc"],
     ["a link the renderer won't follow", "[click](javascript:alert(1))"],
-    ["a fence holding a fence", "````md\n```\ninner\n```\n````"],
     ["a fence's info string beyond its language", "```ts title=\"a.ts\"\nx\n```"],
   ];
   for (const [what, md] of cases) {
@@ -104,6 +187,81 @@ describe("what the editor has no node for", () => {
   });
 });
 
+describe("what the editor shows is what's saved", () => {
+  let editor: Editor | null = null;
+  afterEach(() => editor?.destroy());
+  const open = (doc: JSONContent = fromMarkdown("")) => (editor = new Editor({ extensions: editorExtensions(), content: doc }));
+  const para = (...texts: string[]): JSONContent => ({ type: "doc", content: texts.map((text) => ({ type: "paragraph", content: [{ type: "text", text }] })) });
+  /** Typed into the editor a character at a time, as a keyboard does: its input rules run. */
+  const type = (e: Editor, text: string) => {
+    for (const ch of text) {
+      const { from, to } = e.state.selection;
+      const handled = e.view.someProp("handleTextInput", (f) => f(e.view, from, to, ch, () => e.state.tr.insertText(ch, from, to)));
+      if (!handled) e.view.dispatch(e.state.tr.insertText(ch, from, to));
+    }
+  };
+
+  it("a paragraph that starts like a list, a heading or a rule is saved as that paragraph", () => {
+    for (const text of ["1. not typed as list", "3) not either", "- a", "+ b", "* c", "# not a heading", "---", "===", "> quoted?"]) {
+      const out = toMarkdown(para(text));
+      expect(tree(out), `${text} → ${out}`).toEqual(["paragraph"]);
+      expect(norm(fromMarkdown(out)), out).toEqual(para(text));
+    }
+  });
+
+  it("two paragraphs `- a` and `- b` stay two paragraphs, not two lists", () => {
+    const out = toMarkdown(para("- a", "- b"));
+    expect(out).toBe("\\- a\n\n\\- b");
+    expect(norm(fromMarkdown(out))).toEqual(para("- a", "- b"));
+  });
+
+  it("`2 * 3 * 4` typed stays text; `*x*` and `**x**` typed become italic and bold", () => {
+    const e = open();
+    e.commands.focus("end");
+    type(e, "2 * 3 * 4 and *x* and **y** ");
+    const marks = (e.getJSON().content![0]!.content ?? []).map((t: JSONContent) => [t.text, (t.marks ?? []).map((m) => m.type).join()]);
+    expect(marks).toEqual([["2 * 3 * 4 and ", ""], ["x", "italic"], [" and ", ""], ["y", "bold"], [" ", ""]]);
+    const out = toMarkdown(e.getJSON());
+    expect(fromMarkdown(out)).toEqual(fromMarkdown("2 \\* 3 \\* 4 and *x* and **y**"));
+  });
+
+  it("plain text pasted is read as Markdown, as an agent's is: it shows as it's saved", () => {
+    const e = open();
+    e.commands.focus("end");
+    // jsdom has no DataTransfer: the clipboard as ProseMirror reads it.
+    const text = "Line one\n\nLine *two* with `code`\n- a\n- b\n\n1. not typed as list";
+    const data = { getData: (type: string) => (type === "text/plain" ? text : "") };
+    e.view.someProp("handlePaste", (f) => f(e.view, Object.assign(new Event("paste"), { clipboardData: data }) as ClipboardEvent, null as never));
+    // (Less the empty line the editor keeps after a list at the end, for the cursor: Markdown has no empty paragraph.)
+    const shown = { ...e.getJSON(), content: e.getJSON().content!.filter((n) => n.type !== "paragraph" || n.content?.length) };
+    expect(kinds(shown)).toEqual(["paragraph", "paragraph", "bulletList", "orderedList"]);
+    expect(norm(fromMarkdown(toMarkdown(e.getJSON())))).toEqual(norm(shown));
+  });
+
+  it("a pasted web table keeps its cells apart, as a Markdown table kept as written", () => {
+    const e = open();
+    e.view.pasteHTML("<p>Before</p><table><tr><th>env</th><th>p95</th></tr><tr><td>staging</td><td>840 | ms</td></tr></table>");
+    const doc = e.getJSON();
+    expect(kept(doc)).toEqual(["| env | p95 |\n| --- | --- |\n| staging | 840 \\| ms |"]);
+    expect(doc.content!.find((n) => n.type === "markdownBlock")!.attrs!.kind).toBe("a table");
+  });
+
+  it("Word's list paragraphs come in as a list", () => {
+    const e = open();
+    e.view.pasteHTML(`<p class=MsoListParagraphCxSpFirst style='mso-list:l0 level1 lfo1'><span>·<span>&nbsp;&nbsp;</span></span>Bullet from Word</p><p class=MsoListParagraphCxSpLast style='mso-list:l0 level1 lfo1'><span>·<span>&nbsp;</span></span>Another</p>`);
+    expect(toMarkdown(e.getJSON())).toBe("- Bullet from Word\n- Another");
+  });
+
+  it("property: any document the editor can hold is saved as Markdown that reads back as the same document", () => {
+    const rand = seeded(20261103);
+    for (let i = 0; i < 400; i++) {
+      const doc = randomDoc(rand);
+      const out = toMarkdown(doc);
+      expect(norm(fromMarkdown(out)), `#${i}:\n${out}`).toEqual(norm(doc));
+    }
+  });
+});
+
 describe("lists in a row", () => {
   it("stay two lists: the second takes another marker", () => {
     for (const md of ["- a\n- b\n\n* c\n* d", "1. a\n2. b\n\n1) c\n2) d", "- a\n\n<!-- -->\n\n- b", "* one\n\n- [ ] two"]) {
@@ -122,7 +280,7 @@ describe("lists in a row", () => {
 describe("editing", () => {
   let editor: Editor | null = null;
   afterEach(() => editor?.destroy());
-  const open = (md: string) => (editor = new Editor({ extensions: EDITOR_EXTENSIONS, content: fromMarkdown(md) }));
+  const open = (md: string) => (editor = new Editor({ extensions: editorExtensions(), content: fromMarkdown(md) }));
 
   it("changes only what was edited: an untouched block, kept or not, is saved meaning the same", () => {
     const md = `${AGENT}\n\n| a | b |\n|---|---|\n| 1 | 2 |`;
@@ -156,7 +314,7 @@ describe("a paste", () => {
   afterEach(() => editor?.destroy());
 
   it("keeps only the editor's nodes: no script, no image, no unsafe link, a table as its text", () => {
-    editor = new Editor({ extensions: EDITOR_EXTENSIONS, content: fromMarkdown("") });
+    editor = new Editor({ extensions: editorExtensions(), content: fromMarkdown("") });
     editor.view.pasteHTML(
       `<h1 style="color:red">Title</h1><p onclick="x()">Text <script>alert(1)</script><img src="x" onerror="alert(1)"><a href="javascript:alert(1)">bad</a> <a href="https://ok.example">ok</a></p>` +
         `<table><tr><td>cell</td></tr></table><ul><li><p>item</p></li></ul><pre><code>code</code></pre>`,

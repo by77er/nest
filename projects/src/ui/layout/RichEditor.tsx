@@ -1,5 +1,6 @@
 // A field for Markdown, edited as it renders (README.md#descriptions): Mantine's RichTextEditor over a
-// Tiptap editor, its toolbar the blocks and marks a description may hold, its content drawn as a rich
+// Tiptap editor, its toolbar the blocks and marks a description may hold (the common ones first, one row
+// that scrolls sideways on a phone), its content drawn as a rich
 // message is (the same prose: headings at body size by weight, code on the subtle ground), so what's typed
 // looks like what's saved. A block the editor keeps as written shows as its source, labelled.
 //
@@ -8,7 +9,8 @@
 
 import { Input } from "@mantine/core";
 import "@mantine/tiptap/styles.css";
-import { RichTextEditor } from "@mantine/tiptap";
+import { RichTextEditor, useRichTextEditorContext } from "@mantine/tiptap";
+import { IconCode, IconHeading, IconSourceCode } from "@tabler/icons-react";
 import type { Editor } from "@tiptap/react";
 import { useId, type ReactNode } from "react";
 import rich from "./Rich.module.css";
@@ -22,23 +24,42 @@ export function richEditorAttributes(labelId: string): Record<string, string> {
 /** The label's id for a field's editable area: the same in `richEditorAttributes` and on the label. */
 export const useRichEditorLabel = () => `rte-${useId().replace(/:/g, "")}`;
 
+type IconProps = { style?: React.CSSProperties };
+// Inline code and a code block, told apart: `</>` for the mark, a framed `</>` for the block.
+const InlineCodeIcon = ({ style }: IconProps) => <IconCode style={style} stroke={1.5} aria-hidden />;
+const CodeBlockIcon = ({ style }: IconProps) => <IconSourceCode style={style} stroke={1.5} aria-hidden />;
+
+/**
+ * One heading control, not three levels: a description's headings are drawn at one size by weight (as
+ * a rich message's are), so levels would look the same. It makes a heading, or takes one back to text.
+ */
+function HeadingControl() {
+  const { editor } = useRichTextEditorContext();
+  const active = editor?.isActive("heading") ?? false;
+  return (
+    <RichTextEditor.Control
+      onClick={() => (active ? editor?.chain().focus().setParagraph().run() : editor?.chain().focus().setHeading({ level: 2 }).run())}
+      active={active}
+      aria-label="Heading"
+      title="Heading"
+    >
+      <IconHeading style={{ width: "var(--control-icon-size, 1rem)", height: "var(--control-icon-size, 1rem)" }} stroke={1.5} aria-hidden />
+    </RichTextEditor.Control>
+  );
+}
+
 export function RichEditor({ editor, labelId, label, description, error, required = false }: {
   editor: Editor | null; labelId: string; label: string; description?: ReactNode; error?: ReactNode; required?: boolean;
 }) {
   return (
     <Input.Wrapper label={label} labelProps={{ id: labelId, component: "div" }} description={description} error={error} withAsterisk={required} data-ds="rich-editor">
       <RichTextEditor editor={editor} variant="subtle" withTypographyStyles={false} classNames={{ root: classes.root, toolbar: classes.toolbar, content: classes.content, control: classes.control }} data-error={error ? true : undefined}>
+        {/* The common marks first: on a phone the row scrolls sideways, the rest past its edge. */}
         <RichTextEditor.Toolbar role="group" aria-label={`${label}: formatting`}>
-          <RichTextEditor.ControlsGroup>
-            <RichTextEditor.H1 />
-            <RichTextEditor.H2 />
-            <RichTextEditor.H3 />
-          </RichTextEditor.ControlsGroup>
           <RichTextEditor.ControlsGroup>
             <RichTextEditor.Bold />
             <RichTextEditor.Italic />
-            <RichTextEditor.Strikethrough />
-            <RichTextEditor.Code />
+            <RichTextEditor.Code icon={InlineCodeIcon} />
           </RichTextEditor.ControlsGroup>
           <RichTextEditor.ControlsGroup>
             <RichTextEditor.BulletList />
@@ -50,8 +71,10 @@ export function RichEditor({ editor, labelId, label, description, error, require
             <RichTextEditor.Unlink />
           </RichTextEditor.ControlsGroup>
           <RichTextEditor.ControlsGroup>
-            <RichTextEditor.CodeBlock />
+            <HeadingControl />
+            <RichTextEditor.CodeBlock icon={CodeBlockIcon} />
             <RichTextEditor.Blockquote />
+            <RichTextEditor.Strikethrough />
           </RichTextEditor.ControlsGroup>
         </RichTextEditor.Toolbar>
         <RichTextEditor.Content />

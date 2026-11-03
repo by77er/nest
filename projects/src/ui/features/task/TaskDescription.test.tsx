@@ -6,8 +6,10 @@ import { describe, expect, it } from "vitest";
 import { sameMeaning } from "../../rich/editor-markdown";
 import { FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+/** The task drawer (titled with its task's title). */
+const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
 
-const drawer = () => screen.getByRole("dialog", { name: "Task" });
+const drawer = () => screen.getByRole("dialog", SHEET);
 
 const AGENT = `## Plan
 
@@ -70,7 +72,12 @@ describe("a task's description", () => {
     // The table and the HTML have no node in the editor: shown as their source, labelled, not dropped.
     const kept = [...box.querySelectorAll("[data-markdown-block]")].map((k) => k.querySelector("pre")!.textContent);
     expect(kept).toEqual(["| env | driver |\n|---|---|\n| staging | 2.1 |", "<script>alert(1)</script> <img src=x onerror=alert(1)>"]);
-    expect(within(box).getAllByRole("group", { name: /Kept as written/ })).toHaveLength(2);
+    // Each says why, and that its Markdown is edited there.
+    expect(within(box).getAllByRole("group", { name: /Markdown the editor can't show/ })).toHaveLength(2);
+    expect([...box.querySelectorAll("[data-markdown-block-label]")].map((l) => l.textContent)).toEqual([
+      "The editor can't show this (a table); edit its Markdown here",
+      "The editor can't show this (HTML); edit its Markdown here",
+    ]);
     expect(within(d).getByRole("button", { name: "Save" })).toBeDisabled();
     await user.click(within(d).getByRole("button", { name: "Cancel" }));
     expect(api.writes).toEqual([]);
@@ -120,7 +127,9 @@ describe("a task's description", () => {
     const { d, user, api } = await open({ body: "" });
     await user.click(within(d).getByRole("button", { name: "Edit the title and description" }));
     const bar = await within(d).findByRole("group", { name: "Details: formatting" });
-    for (const name of ["Heading 1", "Heading 2", "Heading 3", "Bold", "Italic", "Strikethrough", "Code", "Bullet list", "Ordered list", "Task list", "Link", "Remove link", "Code block", "Blockquote"]) {
+    // The common marks first; one Heading (a description's headings are one size).
+    expect(within(bar).getAllByRole("button").map((b) => b.getAttribute("aria-label"))).toEqual(["Bold", "Italic", "Code", "Bullet list", "Ordered list", "Task list", "Link", "Remove link", "Heading", "Code block", "Blockquote", "Strikethrough"]);
+    for (const name of ["Bold", "Heading", "Code", "Code block"]) {
       expect(within(bar).getByRole("button", { name })).toBeInTheDocument();
     }
     const box = within(d).getByRole("textbox", { name: "Details" });
@@ -128,6 +137,58 @@ describe("a task's description", () => {
     await user.click(within(bar).getByRole("button", { name: "Bullet list" }));
     await user.click(within(d).getByRole("button", { name: "Save" }));
     await waitFor(() => expect(api.writes.at(-1)?.body).toEqual({ body: "- first" }));
+  });
+
+  it("the drawer's heading is the task's title; Cancel and Save are the section's, at its top right", async () => {
+    const { d, user } = await open();
+    expect(within(d).getByRole("heading", { name: "Migrate auth", level: 2 })).toBeInTheDocument();
+    await user.click(within(d).getByRole("button", { name: "Edit the title and description" }));
+    await within(d).findByRole("textbox", { name: "Details" });
+    const head = within(d).getByRole("heading", { name: "Description" }).closest('[data-slot="head"]') as HTMLElement;
+    expect(within(head).getAllByRole("button").map((b) => b.textContent)).toEqual(["Cancel", "Save"]);
+  });
+
+  it("Escape leaves a clean form, the drawer staying open; with changes it asks first, Keep editing the default", async () => {
+    const { d, user, api } = await open();
+    await user.click(within(d).getByRole("button", { name: "Edit the title and description" }));
+    const title = await within(d).findByLabelText(/Title/);
+    await user.keyboard("{Escape}");
+    expect(within(d).queryByRole("textbox", { name: "Details" })).toBeNull();
+    expect(drawer()).toBeInTheDocument();
+
+    await user.click(within(d).getByRole("button", { name: "Edit the title and description" }));
+    await user.type(await within(d).findByLabelText(/Title/), " now");
+    await user.keyboard("{Escape}");
+    const ask = await screen.findByRole("dialog", { name: "Discard changes?" });
+    expect(within(ask).getByRole("button", { name: "Keep editing" })).toHaveFocus();
+    await user.click(within(ask).getByRole("button", { name: "Keep editing" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Discard changes?" })).toBeNull());
+    expect(within(d).getByLabelText(/Title/)).toHaveValue("Migrate auth now");
+    void title;
+
+    // Closing the drawer with changes asks too; Discard drops them and closes it.
+    await user.click(within(d).getAllByRole("button").find((b) => b.classList.contains("mantine-Drawer-close"))!);
+    const again = await screen.findByRole("dialog", { name: "Discard changes?" });
+    await user.click(within(again).getByRole("button", { name: "Discard" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", SHEET)).toBeNull());
+    expect(api.writes).toEqual([]);
+  });
+
+  it("a kept block's Markdown is edited in place, and saved as edited", async () => {
+    const { d, user, api } = await open({ body: "Intro.\n\n| a |\n|---|\n| 1 |" });
+    await user.click(within(d).getByRole("button", { name: "Edit the title and description" }));
+    const box = await within(d).findByRole("textbox", { name: "Details" });
+    const pre = box.querySelector("[data-markdown-block] pre")!;
+    await user.click(box);
+    const at = document.createRange();
+    at.setStart(pre.firstChild!, pre.textContent!.length);
+    at.collapse(true);
+    document.getSelection()!.removeAllRanges();
+    document.getSelection()!.addRange(at);
+    document.dispatchEvent(new Event("selectionchange"));
+    await user.keyboard("{Enter}| 2 |");
+    await user.click(within(d).getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(api.writes.at(-1)?.body).toEqual({ body: "Intro.\n\n| a |\n|---|\n| 1 |\n| 2 |" }));
   });
 
   it("a finished task's description is read only: no Edit", async () => {

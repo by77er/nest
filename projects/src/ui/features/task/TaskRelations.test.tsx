@@ -8,8 +8,10 @@ import { describe, expect, it } from "vitest";
 import type { Job, TaskPr } from "../../api/types";
 import { FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+/** The task drawer (titled with its task's title). */
+const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
 
-const drawer = () => screen.getByRole("dialog", { name: "Task" });
+const drawer = () => screen.getByRole("dialog", SHEET);
 const now = Date.now();
 const job = (pr: number, o: Partial<Job> = {}): Job => ({
   pr, sha: "a".repeat(40), state: "done", title: null, base: "main", agent: "agt_r", check_run: 1, tainted: false, attempts: 0, runs: 1, error: null,

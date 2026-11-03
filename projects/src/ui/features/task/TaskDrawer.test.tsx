@@ -5,8 +5,10 @@ import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+/** The task drawer (titled with its task's title). */
+const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
 
-const drawer = () => screen.getByRole("dialog", { name: "Task" });
+const drawer = () => screen.getByRole("dialog", SHEET);
 
 describe("creating a task", () => {
   it("checks the title, sends it as a draft, and shows the card in Draft", async () => {
