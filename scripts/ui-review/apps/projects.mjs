@@ -293,6 +293,24 @@ export default {
     { name: "remove-dependency-confirm", section: "project", path: "/projects/prj_demo/board?task=tsk_demo4", full: false, after: async (p) => { await drawerAt("Dependencies")(p); await p.getByRole("button", { name: "Stop waiting on Cache gadget thumbnails" }).click(); } },
     { name: "task-picker-empty", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false, after: picker("Dependencies", "Add dependency", "zzz") },
     { name: "new-task", section: "project", path: "/projects/prj_demo/board", full: false, after: (p) => p.getByRole("button", { name: "New task" }).click() },
+    // A task's description (README.md#descriptions): edited in the rich editor, a table kept as written;
+    // typed into, with the toolbar showing what's on; the new task's editor focused.
+    { name: "drawer-edit", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: (p) => p.getByRole("button", { name: "Edit the title and description" }).click() },
+    { name: "drawer-edit-typing", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: async (p) => {
+      await p.getByRole("button", { name: "Edit the title and description" }).click();
+      await p.getByRole("textbox", { name: "Details" }).getByText("Suggestions in the filter bar as you type").click();
+      await p.keyboard.press("End");
+      await p.keyboard.press("Enter");
+      await p.getByRole("button", { name: "Bold" }).click();
+      await p.keyboard.type("Keyboard shortcuts");
+    } },
+    { name: "new-task-typing", section: "project", path: "/projects/prj_demo/board", full: false, after: async (p) => {
+      await p.getByRole("button", { name: "New task" }).click();
+      await p.getByLabel("Title").fill("Export gadgets as JSON");
+      await p.getByRole("textbox", { name: "Details" }).click();
+      await p.getByRole("button", { name: "Task list" }).click();
+      await p.keyboard.type("Same columns as the CSV");
+    } },
     { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false },
     { name: "manager-rich", section: "project", path: "/projects/prj_demo/manager", fixture: "rich" },
     { name: "manager-rich-view", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false },

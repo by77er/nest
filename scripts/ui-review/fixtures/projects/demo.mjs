@@ -21,6 +21,16 @@ export function data(variant = "demo", now = Date.now()) {
     files: ["src/thumbs/cache.ts", "src/routes/gadgets.ts"],
     test_plan: "Unit tests for the purge; a load test against staging.",
   };
+  // A description as the manager writes one (Markdown): a heading, nested and task lists, code, a link,
+  // and a table, which the editor keeps as written.
+  const SEARCH_BODY = [
+    "Owners filter the gadget list by tag today by scrolling. Add a tag search to the list's filter bar, backed by an index, so a search answers in under 100 ms on the staging data.",
+    "## Scope",
+    "1. An index of tags per gadget\n   - rebuilt on each gadget write\n   - backfilled once for existing gadgets\n2. The query parser: `tag:outdoor tag:waterproof`, with `-tag:` to exclude\n3. Suggestions in the filter bar as you type",
+    "- [x] Agree the query syntax with design\n- [ ] Load test against staging\n- [ ] Note the new endpoint in the [API docs](https://docs.example.com/api)",
+    "```ts\nGET /api/gadgets?tag=outdoor&tag=waterproof&limit=200\n```",
+    "| Endpoint | p95 now | Target |\n|---|---|---|\n| `/api/gadgets?tag=` | 840 ms | 100 ms |",
+  ].join("\n\n");
   let i = 0;
   const t = (title, state, o = {}) => ({ id: `tsk_demo${++i}`, title, body: "", spec: state === "draft" ? null : spec, state, ord: i, assignee: null, pr: null, start_error: null, tainted: false, blocked: null, prs: [], blocked_by: [], blocks: [], waiting_on: [], created_ms: now - 7_200_000, updated_ms: now - 600_000, ...o });
   const tasks = [
@@ -30,7 +40,7 @@ export function data(variant = "demo", now = Date.now()) {
     t("Export gadgets as CSV", "ready"),
     t(long ? "Fix the flaky upload test that fails only when the fixture bucket is in another region_and_named_without_any_spaces_at_all" : "Fix the flaky upload test", "in_progress", { assignee: "agt_w3f9q1" }),
     t("Paginate the gadget list", "assigned"),
-    t("Add search by tag", "in_review", { assignee: "agt_w8x2m4", pr: 118, tainted: true }),
+    t("Add search by tag", "in_review", { assignee: "agt_w8x2m4", pr: 118, tainted: true, body: SEARCH_BODY }),
     t("Migrate to the new auth library", "stalled", { assignee: "agt_w1k7c2", start_error: "nest refused the worker: max_agents reached (403)" }),
     t("Write the 0.5 changelog", "done", { pr: 112 }),
     t("Drop the legacy XML export", "cancelled"),

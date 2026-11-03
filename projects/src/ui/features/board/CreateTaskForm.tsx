@@ -1,15 +1,17 @@
-// A new task: a title and a body. It starts as a draft, and the manager specs it.
+// A new task: a title and a description (in the rich editor, saved as Markdown, README.md#descriptions).
+// It starts as a draft, and the manager specs it.
 
-import { Button, Textarea, TextInput } from "@mantine/core";
+import { Button, TextInput } from "@mantine/core";
 import { schemaResolver, useForm } from "@mantine/form";
 import { CreateTask } from "../../../requests";
 import { useCreateTask } from "../../api/queries";
 import type { Task } from "../../api/types";
 import { FieldGroup } from "../../layout";
+import { DescriptionField } from "../rich/DescriptionField";
 
 export function CreateTaskForm({ projectId, onCreated, onCancel }: { projectId: string; onCreated: (t: Task) => void; onCancel?: () => void }) {
   const create = useCreateTask(projectId);
-  const form = useForm({ mode: "uncontrolled", initialValues: { title: "", body: "" }, validate: schemaResolver(CreateTask, { sync: true }) });
+  const form = useForm({ initialValues: { title: "", body: "" }, validate: schemaResolver(CreateTask, { sync: true }) });
 
   return (
     <form onSubmit={form.onSubmit((v) => create.mutate({ title: v.title.trim(), body: v.body }, { onSuccess: onCreated }))}>
@@ -27,8 +29,13 @@ export function CreateTaskForm({ projectId, onCreated, onCancel }: { projectId: 
           </>
         }
       >
-        <TextInput label="Title" withAsterisk maxLength={200} data-autofocus key={form.key("title")} {...form.getInputProps("title")} />
-        <Textarea label="Details" description="What it's for and anything the manager should know to spec it." autosize minRows={4} maxRows={14} key={form.key("body")} {...form.getInputProps("body")} />
+        <TextInput label="Title" withAsterisk maxLength={200} data-autofocus {...form.getInputProps("title")} />
+        <DescriptionField
+          value={form.values.body}
+          onChange={(md) => form.setFieldValue("body", md)}
+          description="What it's for and anything the manager should know to spec it."
+          error={form.errors.body}
+        />
       </FieldGroup>
     </form>
   );

@@ -3,8 +3,9 @@
 //
 // `split` (a task's drawer, which may hold its worker's trace): one width whatever it holds, so its title
 // never moves between tasks. From `xl` on that's `--nest-sheet-wide`, and with `beside` two columns that
-// scroll on their own: the details in a third (`--nest-sheet-details`), what's beside them in the rest,
-// since that's the one read at length (a log's long lines). Below `xl`, where both don't fit at a readable
+// scroll on their own: the details first and the wider (`--nest-sheet-details`, a reading line), since the
+// task is what's read first, and what's beside them (a worker's trace, its companion) in the rest, still
+// about 80 columns of its mono. Below `xl`, where both don't fit at a readable
 // width (at 1200 px the wide sheet would cover the page), the two are tabs, each the sheet's full height,
 // kept mounted so switching keeps a trace's connection, scroll and what's expanded.
 

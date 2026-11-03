@@ -12,7 +12,7 @@ import { TERMINAL } from "../../../tasks";
 import { HistoryList } from "./HistoryList";
 import { SpecView } from "./SpecView";
 import { TaskActions } from "./TaskActions";
-import { TaskEditForm } from "./TaskEditForm";
+import { TaskDescription } from "./TaskDescription";
 import { TaskTraces } from "../trace/AgentTraces";
 import { TaskDependencies } from "./TaskDependencies";
 import { TaskPrs } from "./TaskPrs";
@@ -70,9 +70,7 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
             <TaskActions projectId={projectId} task={t} onDeleted={onClose} />
           </Stack>
 
-          <Section title="Description" region={false}>
-            <TaskEditForm key={t.id} projectId={projectId} task={t} readOnly={TERMINAL.has(t.state)} />
-          </Section>
+          <TaskDescription key={t.id} projectId={projectId} task={t} readOnly={TERMINAL.has(t.state)} />
 
           <Section title="Spec" region={false}>
             <SpecView spec={t.spec} />
