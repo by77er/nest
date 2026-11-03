@@ -28,7 +28,6 @@ export const mcpPrefix = (capability: string): string => capability.replace("/",
 
 export const HandsRule = z.enum(["required", "forbidden", "optional"]);
 
-
 export const Capability = z.object({
   /** Platform tools (from `platform-tools.json`). */
   tools: z.array(z.string()).default([]),

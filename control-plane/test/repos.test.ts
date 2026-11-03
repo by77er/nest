@@ -2,7 +2,7 @@
 // (pure, against the shared fixture nest-proxy evaluates), attenuation in specs, and SandboxDO turning an
 // allowlist into guards, a binding and a token BrokerDO mints for exactly those repos, refreshed before
 // it expires and never pushed once stale. A fake GitHub stands in for api.github.com.
-import { env, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github.json";
 import readFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github_read.json";
@@ -613,6 +613,39 @@ describe("workflows: write on a sandbox's push token", () => {
     const b2 = gh.mints.length;
     await nextCommands((await placed({ repos: [plain] })).ws, (c) => c.type === "secrets_update");
     expect(gh.mints.slice(b2).map((m) => m.permissions)).toEqual([SANDBOX_TOKEN_PERMISSIONS]);
+  });
+
+  it("a template asking for it reaches the token through the agent's spec and its attach (AgentDO, not a direct attach)", async () => {
+    const r = repo(9191);
+    const tpl = `ci-${rand()}`;
+    await adminJson(`/v1/admin/templates/${tpl}`, { method: "PUT", body: {
+      capabilities: ["nest", "hands"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "required",
+      credential: "claude_oauth_token", repos: [r], github_push: { workflows: true },
+    } });
+    const { sandbox, ws } = await placed({});
+    const before = gh.mints.length;
+    const a = await adminJson("/v1/agents", { body: { template: tpl, sandbox, start: false } }, 201);
+    expect(a.github_push).toEqual({ workflows: true });
+    while (!gh.mints.slice(before).length) await nextCommands(ws, (c) => c.type === "secrets_update");
+    expect(gh.mints.slice(before).map((m) => [m.repositories, m.permissions])).toEqual([[[r.split("/")[1]], WITH_WORKFLOWS]]);
+  });
+
+  it("a client gets it at sandbox create only within its grant's github_push", async () => {
+    const cell = uniqueCell();
+    const asClient = async (token: string, path: string, body: unknown, status: number) => {
+      const res = await SELF.fetch(`http://cp.test${path}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+      const text = await res.text();
+      expect(res.status, text).toBe(status);
+      return JSON.parse(text);
+    };
+    const mk = async (grant: Record<string, unknown>) => (await adminJson("/v1/admin/clients", { body: { name: `wf-${rand()}`, grant: { cells: [cell], max_sandboxes: 2, ...grant } } }, 201)).token as string;
+    const without = await mk({});
+    expect((await asClient(without, "/v1/sandboxes", { cell, github_push: { workflows: true } }, 403)).error.message).toContain("github_push.workflows");
+    const withIt = await mk({ github_push: { workflows: true } });
+    const sbx = await asClient(withIt, "/v1/sandboxes", { cell, github_push: { workflows: true } }, 202);
+    expect(await sandboxStub(sbx.sandbox).pushWorkflows()).toBe(true);
+    const plain = await asClient(withIt, "/v1/sandboxes", { cell }, 202);
+    expect(await sandboxStub(plain.sandbox).pushWorkflows()).toBe(false);
   });
 
   it("an attached agent's spec asking for it adds it while attached, and never reuses a token without it", async () => {

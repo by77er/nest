@@ -26,7 +26,7 @@ import { canonicalRepos, readOnlyRepos, Repos, unionRepos } from "../lib/repos";
 import type { Labels } from "../lib/clients";
 import { ClientOutbox } from "../lib/client-events";
 import { GITHUB_BINDING, GITHUB_READ_BINDING, githubEgress, GithubPush, readBindings } from "../lib/rules/github";
-import { type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
+import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import type { MintedInjection } from "./broker";
 import { cellIdleTtlMs, dormant, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 import {
@@ -59,7 +59,10 @@ export const Port = z.number().int().min(1).max(65535);
 export const SandboxPolicyLayer = z.object({
   allow: z.array(z.object({ host: z.string().min(1), ports: z.array(Port).optional() })).default([]),
   passthrough: z.array(z.string().min(1)).default([]),
-  inject: z.array(InjectionBinding).default([]),
+  // `client:` names are API clients' bindings' (docs/control-plane/api/clients/#injection): an operator binding
+  // under one would be pushed its client's secret.
+  inject: z.array(InjectionBinding.refine((b) => !b.name.startsWith(CLIENT_BINDING_PREFIX),
+    `a binding name starting ${CLIENT_BINDING_PREFIX} is an API client's`)).default([]),
   tcp: z.array(z.object({ host: z.string().min(1), port: Port })).default([]),
   repos: Repos.default([]),
   read_repos: Repos.default([]),
@@ -894,7 +897,7 @@ export class SandboxDO extends DurableObject<Env> {
     const gh = githubEgress(access.push, access.read, ws.inject);
     const built = [...ws.inject, ...gh.inject.filter((b) => !ws.inject.some((w) => w.name === b.name))];
     // Its client's bindings, under names of their own (`client:<name>`), never replacing another.
-    const inject = [...built, ...this.clientInjections().map(wireBinding).filter((b) => !built.some((w) => w.name === b.name))];
+    const inject = [...built, ...this.appliedClientInjections(built.map((b) => b.name)).map(wireBinding)];
     const allow: AllowRule[] = [
       ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const })),
       ...[...ws.allow, ...gh.allow].map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER })),
@@ -1056,7 +1059,9 @@ export class SandboxDO extends DurableObject<Env> {
     const own = (name: string) => ws.inject.some((b) => b.name === name);
     const mint = access.push.length > 0 && !own(GITHUB_BINDING);
     const mintRead = access.read.length > 0 && !own(GITHUB_READ_BINDING);
-    const clientBindings = before.client ? this.clientInjections() : [];
+    // Only those the policy carries: none under a name another binding has (its secret would go out under that one).
+    const built = [...ws.inject, ...githubEgress(access.push, access.read, ws.inject).inject].map((b) => b.name);
+    const clientBindings = before.client ? this.appliedClientInjections(built) : [];
     if (!before.host || (!ws.inject.length && !mint && !mintRead && !clientBindings.length && !force)) return;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
     const target = { sandbox: before.sandbox, epoch: before.epoch };
@@ -1105,9 +1110,13 @@ export class SandboxDO extends DurableObject<Env> {
       try {
         const scope = await this.env.CLIENT.get(this.env.CLIENT.idFromName(before.client)).scope();
         const within = clientBindings.filter((b) => !injectionsOutsideGrant([b], scope.grant.inject_hosts ?? []).length);
-        const refs = await broker.clientInjectionRefs(before.client, before.sandbox,
-          within.map((b) => ({ binding: injectionWireName(b.name), secret: b.secret, hosts: b.hosts })), "SandboxDO");
-        secrets.push(...refs);
+        // Each binding's secret is looked up under the client that declared it, never the sandbox's alone:
+        // a binding that reached another client's sandbox can't name that client's secret.
+        for (const client of new Set(within.map((b) => b.client))) {
+          const mine = within.filter((b) => b.client === client);
+          secrets.push(...await broker.clientInjectionRefs(client, before.sandbox,
+            mine.map((b) => ({ binding: injectionWireName(b.name), secret: b.secret, hosts: b.hosts })), "SandboxDO"));
+        }
         later(Date.now() + CLIENT_SECRET_REFRESH_MS);
       } catch (e) {
         console.warn(`sandbox ${before.sandbox}: its client's secrets couldn't be read; retrying`, e);
@@ -1121,7 +1130,7 @@ export class SandboxDO extends DurableObject<Env> {
     }
     const after = this.info_();
     if (after.epoch !== before.epoch || after.host !== before.host
-      || accessKey({ ...this.pushAccess(), inject: after.client ? this.clientInjections() : [] }) !== accessKey({ ...access, inject: clientBindings })) return;
+      || accessKey({ ...this.pushAccess(), inject: after.client ? this.appliedClientInjections(built) : [] }) !== accessKey({ ...access, inject: clientBindings })) return;
     if (secrets.length || force || mint || mintRead || clientBindings.length) await this.command({ type: "secrets_update", secrets });
     if (next !== null) await this.deadlines.set("inject_refresh", next);
     else await this.deadlines.clear("inject_refresh");
@@ -1138,9 +1147,12 @@ export class SandboxDO extends DurableObject<Env> {
   async attach(agent: string, cwd?: string, repos?: string[], readRepos?: string[], extra: AgentAccess = {}): Promise<SandboxInfo> {
     const cur = this.info_();
     if (lease.gone(cur.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${cur.state}`, 409);
-    const extras = this.setAgentExtras(agent, extra);
-    const widened = this.setAgentRepos(agent, repos ?? [], readRepos ?? []) || extras;
+    // What its client bindings and push opt-ins count is the attached agents': compared across the attach itself.
+    const extrasBefore = this.extrasKey();
+    this.setAgentExtras(agent, extra);
+    const repoChanged = this.setAgentRepos(agent, repos ?? [], readRepos ?? []);
     const [send, info] = this.decide((i) => slots.attach(i, agent, cwd ?? null, i.host !== null));
+    const widened = repoChanged || this.extrasKey() !== extrasBefore;
     if (send) await this.issueAttachCommands([agent]);
     if (widened) await this.policyChanged(true);
     return info;
@@ -1164,14 +1176,15 @@ export class SandboxDO extends DurableObject<Env> {
       if (mine) await this.afterDestroyed(before, `its agent ${agent} ended`);
       return { destroyed: mine };
     }
+    const extrasBefore = this.extrasKey();
     const [destroyed, info] = this.decide((i) => {
       slots.detach(i, agent);
       const d = mine && i.attached.length === 0;
       if (d) lease.destroyed(i);
       return d;
     });
-    const extras = this.setAgentExtras(agent, {});
-    const narrowed = this.setAgentRepos(agent, [], []) || extras;
+    this.setAgentExtras(agent, {});
+    const narrowed = this.setAgentRepos(agent, [], []) || this.extrasKey() !== extrasBefore;
     if (destroyed) {
       await this.afterDestroyed(before, `its agent ${agent} ended`);
       return { destroyed: true };
@@ -1299,10 +1312,9 @@ export class SandboxDO extends DurableObject<Env> {
 
   /**
    * Record an attached agent's client bindings (only those of the sandbox's own client: an agent's
-   * spec names whose they are) and whether it asks for `workflows`; whether the sandbox's changed.
+   * spec names whose they are) and whether it asks for `workflows`.
    */
-  private setAgentExtras(agent: string, extra: AgentAccess): boolean {
-    const before = accessKey({ ...this.pushAccess(), inject: this.clientInjections() });
+  private setAgentExtras(agent: string, extra: AgentAccess): void {
     const client = this.info_().client;
     const inject = client ? (extra.inject ?? []).filter((b) => b.client === client) : [];
     // Written only once something asks, so a sandbox without any stores what it did before.
@@ -1318,7 +1330,11 @@ export class SandboxDO extends DurableObject<Env> {
       else delete all[agent];
       this.put(AGENT_PUSH, all);
     }
-    return accessKey({ ...this.pushAccess(), inject: this.clientInjections() }) !== before;
+  }
+
+  /** The push opt-ins and client bindings the attached agents give, compared as one. */
+  private extrasKey(): string {
+    return accessKey({ ...this.pushAccess(), inject: this.clientInjections() });
   }
 
   /**
@@ -1327,12 +1343,20 @@ export class SandboxDO extends DurableObject<Env> {
    * one binding in the policy.
    */
   clientInjections(): HeldInjection[] {
-    const client = this.tryInfo()?.client;
+    const info = this.tryInfo();
+    const client = info?.client;
     if (!client) return [];
+    // Only agents attached now: a previous release's detach left its key behind.
+    const attached = new Set(info.attached);
     const agents = this.get<Record<string, HeldInjection[]>>(AGENT_INJECT) ?? {};
-    const all = [...(this.get<HeldInjection[]>(OWN_INJECT) ?? []), ...Object.keys(agents).sort().flatMap((a) => agents[a]!)];
+    const all = [...(this.get<HeldInjection[]>(OWN_INJECT) ?? []), ...Object.keys(agents).filter((a) => attached.has(a)).sort().flatMap((a) => agents[a]!)];
     const seen = new Set<string>();
     return all.filter((b) => b.client === client && !seen.has(b.name) && seen.add(b.name));
+  }
+
+  /** Its client's bindings the policy carries: none whose wire name another binding (`taken`) has. */
+  private appliedClientInjections(taken: readonly string[]): HeldInjection[] {
+    return this.clientInjections().filter((b) => !taken.includes(injectionWireName(b.name)));
   }
 
   /** The push allowlist: the operator's layer and every attached agent's spec (docs/sandbox/networking/egress/policy/#repo-allowlists). */
@@ -1352,8 +1376,10 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** Whether its push token carries `workflows: write`: the operator's layer, its own create or any attached agent's spec asks. */
   pushWorkflows(): boolean {
+    // Only agents attached now: a previous release's detach left its key behind.
+    const attached = new Set(this.tryInfo()?.attached ?? []);
     return !!this.operatorLayer().github_push?.workflows || !!this.get<{ workflows: true }>(OWN_PUSH)?.workflows
-      || Object.keys(this.get<Record<string, true>>(AGENT_PUSH) ?? {}).length > 0;
+      || Object.keys(this.get<Record<string, true>>(AGENT_PUSH) ?? {}).some((a) => attached.has(a));
   }
 
   /** Everything its secrets push depends on, compared as one (`accessKey`). */

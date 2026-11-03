@@ -12,7 +12,7 @@ import {
 } from "../src/lib/client-secrets";
 import { Grant } from "../src/lib/clients";
 import { GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER } from "../src/lib/rules/github";
-import { ADMIN, adminJson, BASE, connectHost, nextCommands, uniqueCell } from "./helpers";
+import { ADMIN, adminJson, BASE, connectHost, nextCommands, runDue, uniqueCell, type Ws } from "./helpers";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 
@@ -39,12 +39,17 @@ describe("client injection bindings (pure)", () => {
 
   it("validates hosts, wildcards and headers", () => {
     for (const ok of ["api.stripe.com", "*.example.com", "a-b.c.d"]) expect(InjectHost.safeParse(ok).success, ok).toBe(true);
-    for (const bad of ["*.com", "com", "API.stripe.com", "1.2.3.4", "a..b", "*.*.b.c", "api.stripe.com.", "http://x.y", "x.y:443"]) {
+    // Every numeric form a resolver reads as an address (inet_aton: hex, octal, short forms) is refused too.
+    for (const bad of ["*.com", "com", "API.stripe.com", "1.2.3.4", "127.0.0.0x1", "0x7f.0x1", "0177.0.0.1", "10.1", "a.0x1", "a..b", "*.*.b.c",
+      "api.stripe.com.", "http://x.y", "x.y:443"]) {
       expect(InjectHost.safeParse(bad).success, bad).toBe(false);
     }
     expect(ClientInjection.safeParse({ ...stripe, hosts: ["*.example.com"] }).success).toBe(false);
     expect(ClientInjection.safeParse({ ...stripe, hosts: ["*.example.com"], wildcard: true }).success).toBe(true);
-    for (const h of ["Host", "proxy-authorization", "Transfer-Encoding", "bad header"]) {
+    // The framing and routing headers, and the routing overrides nest-proxy strips (Fastly-Key authenticates, so it's allowed).
+    expect(ClientInjection.safeParse({ ...stripe, locations: [{ type: "header", name: "Fastly-Key" }] }).success).toBe(true);
+    for (const h of ["Host", "proxy-authorization", "Transfer-Encoding", "bad header", "Forwarded", "X-Forwarded-Host", "X-Host", "X-Original-URL",
+      "X-Rewrite-URL", "Fastly-Host", "fastly-anything"]) {
       expect(ClientInjection.safeParse({ ...stripe, locations: [{ type: "header", name: h }] }).success, h).toBe(false);
     }
     expect(ClientInjection.safeParse({ ...stripe, placeholder: "nest-ph-github" }).success).toBe(false);
@@ -61,6 +66,10 @@ describe("client injection bindings (pure)", () => {
     expect(injectHostAllowed(entries, "*.stripe.com")).toBe(false);
     expect(injectHostAllowed(entries, "api.stripe.com.evil.net")).toBe(false);
     expect(injectHostAllowed(["api.stripe.com"], "*.stripe.com")).toBe(false);
+    // A suffix is whole labels: a name that merely ends in the same letters isn't under it.
+    expect(injectHostAllowed(entries, "*.evilexample.com")).toBe(false);
+    expect(injectHostAllowed(entries, "x.evilexample.com")).toBe(false);
+    expect(injectHostAllowed(entries, "evilexample.com")).toBe(false);
     expect(injectionsOutsideGrant([{ name: "s", hosts: ["api.stripe.com", "evil.net"] }], entries)).toEqual(["inject host evil.net (binding s)"]);
     // A grant stored before inject_hosts reads as none (the default), and its entries are validated.
     expect(Grant.parse({}).inject_hosts).toEqual([]);
@@ -128,6 +137,17 @@ async function clientSandbox(c: Client, body: Record<string, unknown>) {
   const kind = body.inject ? "secrets_update" : "sandbox_create";
   const cmds = await nextCommands(host.ws, (x) => x.type === kind);
   return { sandbox: sbx.sandbox as string, ws: host.ws, secrets: (cmds.find((x) => x.type === "secrets_update")?.secrets ?? []) as { binding: string; value: string }[] };
+}
+
+/** Run a sandbox's `inject_refresh` deadline now (its 15-minute push) and answer the secrets it pushed. */
+async function refreshed(sandbox: string, ws: Ws): Promise<{ binding: string; value: string }[]> {
+  const stub = env.SANDBOX.get(env.SANDBOX.idFromName(sandbox));
+  await runInDurableObject(stub, (_i, st) => {
+    st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('inject_refresh', 0) ON CONFLICT(key) DO UPDATE SET at = 0");
+  });
+  const got = nextCommands(ws, (x) => x.type === "secrets_update");
+  await runDue(stub);
+  return (await got).find((x) => x.type === "secrets_update")!.secrets;
 }
 
 describe("client secrets", () => {
@@ -243,6 +263,104 @@ describe("client injection bindings", () => {
     expect(cmds.find((x) => x.type === "secrets_update")!.secrets).toContainEqual({ binding: "client:stripe", value });
     const policy = await asJson(c.token, `/v1/sandboxes/${s.sandbox}/policy`);
     expect(policy.inject.find((b: any) => b.name === "client:stripe").hosts).toEqual(["api.stripe.com"]);
+  });
+
+  it("an operator binding can't take a client binding's name; one stored under it anyway is never pushed the client's secret", async () => {
+    const c = await newClient();
+    const value = fakeValue("b1");
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    const evil = { name: "client:stripe", hosts: ["evil.net"], placeholder: `nest-ph.${c.id}.stripe.`, locations: BEARER };
+    expect((await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { inject: [evil] } }, 400)).error.message).toContain("client:");
+    // Planted past the API (a layer stored by a release before the check): the operator's binding is kept, the client's value isn't pushed.
+    await runInDurableObject(env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox)), (_i, st) => {
+      const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'ws_layer'").one();
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'ws_layer'", JSON.stringify({ ...JSON.parse(row.value), inject: [evil] }));
+    });
+    const secrets = await refreshed(s.sandbox, s.ws);
+    expect(JSON.stringify(secrets)).not.toContain(value);
+    const policy = await asJson(c.token, `/v1/sandboxes/${s.sandbox}/policy`);
+    expect(policy.inject.filter((b: any) => b.name === "client:stripe")).toEqual([evil]);
+  });
+
+  it("another client's template attached to a client's sandbox brings no binding, and never resolves to the sandbox client's secret", async () => {
+    const a = await newClient();
+    const b = await newClient();
+    const valueA = fakeValue("a-own");
+    const valueB = fakeValue("b-own");
+    await asJson(a.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: valueA } });
+    await asJson(b.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: valueB } });
+    await asJson(b.token, `/v1/catalog/templates/${b.name}/coder`, { method: "PUT",
+      body: { capabilities: ["nest", "hands"], launch: LAUNCH, hands: "required", credential: "claude_oauth_token", inject: [stripe()] } });
+    const s = await clientSandbox(a, {});
+    // The operator (who may attach anything anywhere) puts B's agent in A's sandbox.
+    const agent = await adminJson("/v1/agents", { body: { template: `${b.name}/coder`, sandbox: s.sandbox, start: false } }, 201);
+    expect(agent.inject).toEqual([expect.objectContaining({ client: b.id })]);
+    const secrets = await refreshed(s.sandbox, s.ws);
+    expect(JSON.stringify(secrets)).not.toContain(valueA);
+    expect(JSON.stringify(secrets)).not.toContain(valueB);
+    expect((await adminJson(`/v1/sandboxes/${s.sandbox}/policy`)).inject.map((x: any) => x.name)).not.toContain("client:stripe");
+    // BrokerDO too: a binding is looked up under the client that declared it, never the sandbox's.
+    const refs = await env.BROKER.get(env.BROKER.idFromName("broker")).clientInjectionRefs(b.id, s.sandbox, [{ binding: "client:stripe", secret: "stripe-key", hosts: ["api.stripe.com"] }], "test");
+    expect(refs).toEqual([{ binding: "client:stripe", value: `$nest-secret:client-secret:${b.id}:stripe-key` }]);
+  });
+
+  it("an attached agent's bindings go at detach; a stale agent key a previous release left counts for nothing", async () => {
+    const c = await newClient();
+    const value = fakeValue("x11");
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value } });
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/coder`, { method: "PUT",
+      body: { capabilities: ["nest", "hands"], launch: LAUNCH, hands: "required", credential: "claude_oauth_token", inject: [stripe()] } });
+    const s = await clientSandbox(c, {});
+    const ag = await asJson(c.token, "/v1/agents", { body: { template: `${c.name}/coder`, sandbox: s.sandbox, start: false } }, 201);
+    expect((await nextCommands(s.ws, (x) => x.type === "secrets_update")).find((x) => x.type === "secrets_update")!.secrets).toContainEqual({ binding: "client:stripe", value });
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    await stub.detach(ag.agent);
+    const after = (await nextCommands(s.ws, (x) => x.type === "secrets_update")).find((x) => x.type === "secrets_update")!.secrets;
+    expect(JSON.stringify(after)).not.toContain(value);
+    expect((await stub.policy()).inject.map((b) => b.name)).not.toContain("client:stripe");
+    // A previous release's detach left its agent's keys: they don't count once that agent isn't attached.
+    await runInDurableObject(stub, (_i, st) => {
+      const held = [{ ...stripe(), client: c.id, placeholder: `nest-ph.${c.id}.stripe.` }];
+      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('agent_inject', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ [ag.agent]: held }));
+      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('agent_github_push', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ [ag.agent]: true }));
+    });
+    expect(await stub.clientInjections()).toEqual([]);
+    expect(await stub.pushWorkflows()).toBe(false);
+  });
+
+  it("the refresh carries a replaced value, takes a deleted one away, and applies a narrowed grant, with no policy change", async () => {
+    const c = await newClient();
+    const first = fakeValue("v1");
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: first } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    expect(s.secrets).toContainEqual({ binding: "client:stripe", value: first });
+    // Its push armed the next one 15 minutes on: what reaches the proxy without anyone forcing it.
+    const at = await runInDurableObject(env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox)), (_i, st) =>
+      st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'inject_refresh'").toArray()[0]?.at ?? 0);
+    expect(at - Date.now()).toBeGreaterThan(14 * 60_000);
+    expect(at - Date.now()).toBeLessThanOrEqual(15 * 60_000);
+    const second = fakeValue("v2");
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: second } });
+    expect(await refreshed(s.sandbox, s.ws)).toContainEqual({ binding: "client:stripe", value: second });
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "DELETE" });
+    expect((await refreshed(s.sandbox, s.ws)).map((x) => x.binding)).not.toContain("client:stripe");
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: first } });
+    expect(await refreshed(s.sandbox, s.ws)).toContainEqual({ binding: "client:stripe", value: first });
+    await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { cells: [c.cell], credentials: ["claude_oauth_token"], max_sandboxes: 5, secrets: { max_count: 3 }, inject_hosts: [] } } });
+    expect((await refreshed(s.sandbox, s.ws)).map((x) => x.binding)).not.toContain("client:stripe");
+  });
+
+  it("a reference that resolves to nothing goes out as no secret, never an empty one", async () => {
+    const c = await newClient();
+    const s = await clientSandbox(c, {});
+    const cell = c.cell;
+    const host = (await runInDurableObject(env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox)), (_i, st) =>
+      JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value).host)) as string;
+    await env.FLEET.get(env.FLEET.idFromName(cell)).issueCommands(host, [{ type: "secrets_update", sandbox: s.sandbox, epoch: 1,
+      secrets: [{ binding: "gone", value: `$nest-secret:client-secret:${c.id}:never-stored` }, { binding: "also", value: "$nest-secret:inject:never-stored" }] } as any]);
+    const cmd = (await nextCommands(s.ws, (x) => x.type === "secrets_update")).find((x) => x.type === "secrets_update")!;
+    expect(cmd.secrets).toEqual([]);
   });
 
   it("a grant narrowed after the spawn takes the value away at the sandbox's next push", async () => {

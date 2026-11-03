@@ -28,8 +28,9 @@ const LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
 const HOSTNAME = new RegExp(`^${LABEL}(?:\\.${LABEL})+$`);
 const hostOk = (h: string) => {
   const name = h.startsWith("*.") ? h.slice(2) : h;
-  // Not an IPv4 address: its last label is never all digits.
-  return h.length <= 253 && HOSTNAME.test(name) && !/^[0-9]+$/.test(name.slice(name.lastIndexOf(".") + 1));
+  // Never a numeric host in any form a resolver parses as an address (`127.0.0.1`, `127.0.0.0x1`,
+  // `0x7f.0x1`, octal): a top-level label always starts with a letter, and every number form a digit.
+  return h.length <= 253 && HOSTNAME.test(name) && /^[a-z]/.test(name.slice(name.lastIndexOf(".") + 1));
 };
 
 /**
@@ -58,12 +59,15 @@ export const InjectionName = z.string().regex(/^[a-z][a-z0-9_]{0,31}$/, "a bindi
 
 /**
  * Headers a credential may never be substituted into (docs/sandbox/networking/egress/injection/#scope):
- * they would change routing or framing after the proxy checked it.
+ * they would change routing or framing after the proxy checked it, and the routing overrides nest-proxy
+ * strips (docs/sandbox/networking/egress/inspection/): `Fastly-*` except `Fastly-Key`, and the generic ones.
  */
 const RESERVED_HEADERS = new Set(["host", "connection", "content-length", "transfer-encoding", "te", "trailer", "upgrade", "keep-alive",
-  "proxy-authorization", "proxy-authenticate", "proxy-connection", "http2-settings"]);
+  "proxy-authorization", "proxy-authenticate", "proxy-connection", "http2-settings",
+  "forwarded", "x-forwarded-host", "x-host", "x-original-url", "x-rewrite-url"]);
+const reservedHeader = (h: string) => RESERVED_HEADERS.has(h) || (h.startsWith("fastly-") && h !== "fastly-key");
 const HeaderName = z.string().regex(/^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/, "a header name is an HTTP token of 1-64 characters")
-  .refine((h) => !RESERVED_HEADERS.has(h.toLowerCase()), "that header is reserved: a credential can't go there");
+  .refine((h) => !reservedHeader(h.toLowerCase()), "that header is reserved: a credential can't go there");
 
 /** Where the credential goes: the existing locations (`protocol/model.ts` `InjectionLocation`), a header's name checked. */
 export const ClientInjectionLocation = z.discriminatedUnion("type", [
@@ -110,7 +114,8 @@ export interface HeldInjection extends ClientInjection {
  */
 export const injectionPlaceholder = (client: string, name: string) => `nest-ph.${client}.${name}.`;
 /** Its name in the wire policy: apart from the operator's and the constructed ones (`github`, …). */
-export const injectionWireName = (name: string) => `client:${name}`;
+export const CLIENT_BINDING_PREFIX = "client:";
+export const injectionWireName = (name: string) => `${CLIENT_BINDING_PREFIX}${name}`;
 
 export const holdInjections = (client: string, list: readonly ClientInjection[]): HeldInjection[] =>
   list.map((b) => ({ ...b, hosts: [...b.hosts], locations: b.locations.map((l) => ({ ...l })), client, placeholder: injectionPlaceholder(client, b.name) }));
