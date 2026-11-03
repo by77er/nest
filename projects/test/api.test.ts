@@ -4,6 +4,7 @@
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
+import worker from "../src/worker";
 import { AccessTeam, api, APP, CELL, FakeNest, installFetch } from "./fake-nest";
 
 const fake = new FakeNest();
@@ -50,6 +51,20 @@ describe("the Access check", () => {
         expect(res.status, `${path} ${t}`).toBe(403);
       }
     }
+  });
+
+  it("serves the page with a strict Content-Security-Policy: only the app's own scripts, nothing framing it", async () => {
+    // The test pool has no assets: the Worker's handler, with a stand-in for them.
+    const assets = { fetch: async () => new Response("<!doctype html>", { headers: { "content-type": "text/html" } }) };
+    const req = new Request(`${APP}/`, { headers: { "cf-access-jwt-assertion": await team.token() } });
+    const res = await worker.fetch(req as Parameters<typeof worker.fetch>[0], { ...env, ASSETS: assets } as unknown as Parameters<typeof worker.fetch>[1]);
+    expect(res.status).toBe(200);
+    const csp = res.headers.get("content-security-policy") ?? "";
+    expect(csp).toContain("script-src 'self'");
+    expect(csp).not.toMatch(/script-src[^;]*'unsafe-(inline|eval)'/);
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(csp).toContain("default-src 'none'");
+    expect(res.headers.get("x-content-type-options")).toBe("nosniff");
   });
 
   it("isn't asked of /hooks/* and /mcp/*, which have their own proof", async () => {
