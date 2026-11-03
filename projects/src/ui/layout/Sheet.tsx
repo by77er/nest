@@ -23,13 +23,16 @@ export const useFillColumn = () => useContext(Column);
 
 const FULL = { display: "flex", flexDirection: "column", flex: 1, minHeight: 0 } as const;
 
-export function Sheet({ opened, onClose, title, children, beside, split = false, labels = ["Details", "Trace"] }: {
-  opened: boolean; onClose: () => void; title: string; children: ReactNode; beside?: ReactNode; split?: boolean; labels?: [string, string];
+export function Sheet({ opened, onClose, title, children, beside, besideEmpty, split = false, labels = ["Details", "Trace"] }: {
+  opened: boolean; onClose: () => void; title: string; children: ReactNode; beside?: ReactNode;
+  /** What the wide sheet's second column shows when there's nothing beside (so its frame stays balanced). */
+  besideEmpty?: ReactNode;
+  split?: boolean; labels?: [string, string];
 }) {
   const phone = useMediaQuery("(max-width: 48em)");
   const wide = useMediaQuery("(min-width: 88em)");
   const size = phone ? "100%" : split && wide ? "var(--nest-sheet-wide)" : "xl";
-  if (beside && wide && split) {
+  if ((beside || besideEmpty) && wide && split) {
     return (
       <Drawer
         opened={opened}
@@ -46,7 +49,7 @@ export function Sheet({ opened, onClose, title, children, beside, split = false,
           {children}
         </ScrollArea>
         <Box style={{ ...FULL, minWidth: 0, height: "100%" }} data-column="beside">
-          <Column.Provider value={{ fill: true, untitled: false }}>{beside}</Column.Provider>
+          <Column.Provider value={{ fill: true, untitled: false }}>{beside ?? besideEmpty}</Column.Provider>
         </Box>
       </Drawer>
     );
@@ -61,7 +64,9 @@ export function Sheet({ opened, onClose, title, children, beside, split = false,
         title={title}
         styles={{ content: { display: "flex", flexDirection: "column" }, body: { ...FULL } }}
       >
-        <Tabs defaultValue="details" keepMounted style={FULL}>
+        {/* `display-none`, not Mantine's default `activity` (React's <Activity hidden>), which runs effects'
+            cleanups: that would close the trace's socket and lose its scroll and expansion on every switch. */}
+        <Tabs defaultValue="details" keepMounted keepMountedMode="display-none" style={FULL}>
           <Tabs.List>
             <Tabs.Tab value="details" leftSection={<IconFileText size={icon.md} />}>
               {labels[0]}

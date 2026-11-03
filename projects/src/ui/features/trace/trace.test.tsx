@@ -382,8 +382,11 @@ describe("the terminal", () => {
     more.focus();
     await user.keyboard("{Enter}");
     expect(result.textContent).toBe("1\n2\n3\n4\n5\n6");
-    expect(screen.getByRole("button", { name: "(collapse)" })).toHaveAttribute("aria-expanded", "true");
-    await user.click(screen.getByRole("button", { name: "(collapse)" }));
+    // Expanded: "(collapse)" at the output's top as well as its end.
+    const collapse = screen.getAllByRole("button", { name: "(collapse)" });
+    expect(collapse.map((b) => b.getAttribute("data-at"))).toEqual(["top", "end"]);
+    for (const b of collapse) expect(b).toHaveAttribute("aria-expanded", "true");
+    await user.click(collapse[0]!);
     expect(result.textContent).toBe("1\n2\n3");
   });
 
@@ -526,6 +529,9 @@ describe("the task drawer's tabs and width", () => {
       const drawer = await screen.findByRole("dialog", { name: "Task" });
       await user.click(await within(drawer).findByRole("tab", { name: "Trace" }));
       const sock = await waitFor(() => FakeSocket.latest("agt_worker1")!);
+      // The connection's status is on the terminal's first line, in its muted tone.
+      const row = drawer.querySelector('[data-ds="terminal"] [data-slot="status-row"]') as HTMLElement;
+      expect(within(row).getByText("Connecting")).toBeInTheDocument();
       // The tab names it: its heading is for readers only.
       const heading = within(drawer).getByRole("heading", { name: "Worker's trace" });
       expect(heading.querySelector(".mantine-VisuallyHidden-root, [class*='VisuallyHidden']") ?? heading.closest("[class*='VisuallyHidden']")).not.toBeNull();
@@ -555,6 +561,28 @@ describe("the task drawer's tabs and width", () => {
       const [withWorker, without] = [await widthOf(a.id), await widthOf(b.id)];
       expect(withWorker).toContain("--nest-sheet-wide");
       expect(without).toBe(withWorker);
+      // A task without a worker: a quiet empty trace column, so the frame stays balanced.
+      renderApp(`/projects/prj_one?task=${b.id}`, api);
+      const drawer = await screen.findByRole("dialog", { name: "Task" });
+      await waitFor(() => expect(drawer.querySelector('[data-column="beside"]')).not.toBeNull());
+      expect(within(drawer.querySelector('[data-column="beside"]') as HTMLElement).getByText("No worker yet")).toBeInTheDocument();
+      expect(FakeSocket.opened.filter((x) => x.url.includes(b.id))).toEqual([]);
     });
+  });
+});
+
+describe("the terminal's quiet parts", () => {
+  it("connecting shows in the terminal's muted tone (AA on it), and a rule is a row of its own", () => {
+    renderAlone(<TraceLog title="T" state={{ ...initialTrace(), status: "connecting" }} />);
+    const loading = document.querySelector('[data-ds="terminal"] [data-ds="loading"]') as HTMLElement;
+    expect(loading).not.toBeNull();
+  });
+
+  it("a turn's rule is its label then a hairline, both in the terminal's tones", () => {
+    renderAlone(<TraceLog title="T" state={stateOf([ev(1, "turn_started", { turn: "t", input_kind: "user" }), ev(2, "assistant_text", { turn: "t", text: "x" })])} />);
+    const rule = document.querySelector('[data-ds="term-rule"]') as HTMLElement;
+    expect(rule.getAttribute("style")).toContain("var(--nest-term-muted)");
+    expect(rule.className).not.toBe("");
+    expect(rule.textContent).toMatch(/message · running$/);
   });
 });

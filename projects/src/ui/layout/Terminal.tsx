@@ -131,3 +131,17 @@ export function TermRule({ children }: { children: ReactNode }) {
     </Box>
   );
 }
+
+/** The terminal's first line when nothing above names it: a note (the agent's state) and a status, at the right. */
+export function TermStatus({ note, children }: { note?: string; children: ReactNode }) {
+  return (
+    <Box data-slot="status-row" pb="sm" style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: "var(--mantine-spacing-sm)" }}>
+      {note && (
+        <Box component="span" fz="xs" data-slot="agent-state" style={{ color: COLOR.muted }}>
+          {note}
+        </Box>
+      )}
+      {children}
+    </Box>
+  );
+}

@@ -21,13 +21,14 @@
 }
 
 /* ● and ○: a circle, filled or not, a little under the x-height's width, on the text's middle. */
+/* The font's x-height across (`1ex`), as its own letters are. */
 .dot::before,
 .ring::before {
-  left: 0.1ch;
+  left: 50%;
   top: 50%;
-  width: 0.8ch;
-  height: 0.8ch;
-  margin-top: -0.4ch;
+  width: 1ex;
+  height: 1ex;
+  margin: -0.5ex 0 0 -0.5ex;
   border-radius: 50%;
   border: 0.09em solid var(--glyph);
 }
@@ -71,14 +72,17 @@
   min-width: 0;
 }
 
+/* The hairline takes what the label leaves; a label that needs the whole row wraps, and the line goes
+   (no stub beside a wrapped label). */
 .rule::after {
   content: "";
-  flex: 1 1 var(--mantine-spacing-xl);
-  min-width: var(--mantine-spacing-xl);
-  border-top: 1px solid var(--nest-border-color);
+  flex: 1 1 0;
+  min-width: 0;
+  border-top: 1px solid var(--nest-term-rule);
 }
 
 .rule > span {
+  flex: 0 1 auto;
   min-width: 0;
   overflow-wrap: anywhere;
 }

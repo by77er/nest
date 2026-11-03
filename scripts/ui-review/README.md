@@ -38,6 +38,7 @@ node scripts/ui-review/selftest.mjs             # the checks fail their planted 
 | `page-error` | an uncaught error, a console error, the app's error page, or a capture that failed |
 | `board-columns` (projects) | at 1280 px and up, the board's six columns don't fit without scrolling |
 | `trace` (projects) | an agent trace's log scrolls sideways (its long lines must wrap), or one of its glyphs renders in an emoji font |
+| `trace-tabs` (projects, `trace-tabs.mjs`) | switching the task drawer's tabs away from the trace and back opens a second trace socket, fetches a history page again, or loses the log's scroll or what was expanded (a browser-only check: Mantine's test environment renders `keepMounted` tabs without React's `<Activity>`) |
 
 The apps' own `npm test` covers the code side (no inline styles, raw values or off-palette colors; tokens equal the skill's). Judgement (hierarchy, balance, placement) stays the reviewer's.
 

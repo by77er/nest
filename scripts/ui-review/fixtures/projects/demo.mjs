@@ -1,7 +1,7 @@
 // The projects app's API, served from fixtures: a demo project in every state only nest's events
 // produce (stalled, in review, asks, blocked tasks, the manager's replies, reviews, a live trace).
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
-// projects) or "error" (the API fails). Traces come from trace.mjs: history pages plus a live ring.
+// projects), "error" (the API fails) or "connecting" (a trace that sends nothing yet). Traces come from trace.mjs: history pages plus a live ring.
 
 import { trace } from "./trace.mjs";
 
@@ -77,7 +77,9 @@ export function data(variant = "demo", now = Date.now()) {
     job(114, "Write the 0.5 changelog", "superseded"),
   ];
   // Every trace (the manager's, a worker's, a reviewer's): history offered and paged, then the live ring (trace.mjs).
-  const { messages: traceMessages, pages: historyPages } = trace(now);
+  const { messages: allMessages, pages: historyPages } = trace(now);
+  // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
+  const traceMessages = variant === "connecting" ? [] : allMessages;
   const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length }, { ...other, needs_you: 0 }];
   const sync = { written: ["capabilities/projects/board", "capabilities/projects/task", "templates/projects/manager", "templates/projects/worker"], repos: ["by77er/gadgets", "by77er/widgets"], at_ms: now - 3_600_000 };
 

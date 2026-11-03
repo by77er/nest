@@ -4,7 +4,7 @@
 export { AppFrame } from "./AppFrame";
 export { Bubble, PinnedFooter, ScrollLog } from "./Chat";
 export { FadeIn } from "./FadeIn";
-export { Glyph, GLYPH, Terminal, TermLine, TermRule, type TermTone } from "./Terminal";
+export { Glyph, GLYPH, Terminal, TermLine, TermRule, TermStatus, type TermTone } from "./Terminal";
 export { FieldGroup } from "./FieldGroup";
 export { CardGrid, ColumnGrid } from "./Layouts";
 export { MetaItem, MetaRow } from "./Meta";

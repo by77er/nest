@@ -35,8 +35,8 @@ export const ROLES = ["primary", "danger", "warning", "success"] as const;
 
 /** The neutral roles, per scheme (the skill's color table). */
 export const neutrals = {
-  light: { page: "#fafafa", surface: "#ffffff", subtle: "#f1f3f5", border: "#e9ecef", text: "#212529", muted: "#666e76", terminal: "#e6ebf0", terminalMuted: "#5c636a" },
-  dark: { page: "#121314", surface: "#1a1b1e", subtle: "#222327", border: "#2c2e33", text: "#e9ecef", muted: "#9aa0a6", terminal: "#0d0e0f", terminalMuted: "#9aa0a6" },
+  light: { page: "#fafafa", surface: "#ffffff", subtle: "#f1f3f5", border: "#e9ecef", text: "#212529", muted: "#666e76", terminal: "#e6ebf0", terminalMuted: "#5c636a", terminalRule: "#c2c9d0" },
+  dark: { page: "#121314", surface: "#1a1b1e", subtle: "#222327", border: "#2c2e33", text: "#e9ecef", muted: "#9aa0a6", terminal: "#0d0e0f", terminalMuted: "#9aa0a6", terminalRule: "#2c2e33" },
 } as const;
 
 /** The filled shade of each role, per scheme, and the text on it (all AA, theme.test.ts). */
@@ -143,7 +143,9 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
     "--nest-border": `1px solid ${neutrals[s].border}`,
     "--nest-muted": neutrals[s].muted,
     "--nest-terminal": neutrals[s].terminal,
-    "--nest-terminal-border": `1px solid ${neutrals[s].border}`,
+    // The terminal's hairlines (its border, a turn's rule): `border` vanishes on the light terminal (1.01:1).
+    "--nest-term-rule": neutrals[s].terminalRule,
+    "--nest-terminal-border": `1px solid ${neutrals[s].terminalRule}`,
     // On the terminal: its own muted (the light terminal is darker than the page), and warning a shade
     // darker in light (shade 8 is under AA there), each checked by theme.test.ts.
     "--nest-term-muted": neutrals[s].terminalMuted,

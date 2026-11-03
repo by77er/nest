@@ -80,7 +80,7 @@ describe("the tokens match the skill", () => {
   it("colors: the neutral roles and each semantic role's filled shade, light and dark", () => {
     const hex = (cell: string) => /#[0-9a-f]{6}/i.exec(cell)![0].toLowerCase();
     const rows = table("Role");
-    const neutralRoles = ["page", "surface", "subtle", "border", "text", "muted", "terminal", "terminal-muted"] as const;
+    const neutralRoles = ["page", "surface", "subtle", "border", "text", "muted", "terminal", "terminal-muted", "terminal-rule"] as const;
     expect(rows.map((r) => r[0]).sort()).toEqual([...neutralRoles, ...ROLES].sort());
     for (const [role, light, dark] of rows) {
       if ((neutralRoles as readonly string[]).includes(role!)) {
@@ -143,7 +143,10 @@ describe("contrast, in both schemes", () => {
   it.each(schemes)("%s: on the terminal surface (a trace), text, muted text and each role's text", (s) => {
     const n = neutrals[s];
     expect(vars[s]["--nest-terminal"]).toBe(n.terminal);
-    expect(vars[s]["--nest-terminal-border"]).toBe(`1px solid ${n.border}`);
+    expect(vars[s]["--nest-terminal-border"]).toBe(`1px solid ${n.terminalRule}`);
+    expect(vars[s]["--nest-term-rule"]).toBe(n.terminalRule);
+    // Its hairlines show on it (about 1.4:1), in both schemes.
+    expect(contrast(n.terminalRule, n.terminal), "rule").toBeGreaterThanOrEqual(1.35);
     expect(contrast(n.text, n.terminal), "text").toBeGreaterThanOrEqual(AA);
     expect(vars[s]["--nest-term-muted"]).toBe(n.terminalMuted);
     expect(contrast(n.terminalMuted, n.terminal), "muted").toBeGreaterThanOrEqual(AA);

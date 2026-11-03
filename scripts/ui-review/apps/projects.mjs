@@ -1,6 +1,7 @@
 // The projects app (projects/): its pages and states, the fixtures that serve them, and where its
 // layout primitives mark the frame, the measures, the panels and the nav (data-ds attributes).
 import { data } from "../fixtures/projects/demo.mjs";
+import { countTraffic, tabKeepCheck } from "../trace-tabs.mjs";
 
 const menu = async (p) => p.getByRole("button", { name: "Open the menu" }).click();
 const DESKTOP = [1440, 1280];
@@ -92,7 +93,9 @@ export default {
   /** Installs the fixtures for a state before the page loads. */
   async serve(page, state) {
     const { answer, trace, history } = data(state.fixture ?? "demo");
+    const traffic = countTraffic(page);
     await page.routeWebSocket(/\/api\/agents\/[^/]+\/trace/, (ws) => {
+      traffic.socket();
       for (const e of trace) ws.send(JSON.stringify(e));
       ws.onMessage((m) => m === "ping" && ws.send("pong"));
     });
@@ -100,6 +103,7 @@ export default {
       const url = new URL(route.request().url());
       // The trace's history (older pages); a state may hold every page asked for after it sets `holdHistory`.
       if (/^\/api\/agents\/[^/]+\/trace\/history$/.test(url.pathname)) {
+        traffic.historyPage();
         if (page.holdHistory) return new Promise(() => {});
         const p = history[url.searchParams.get("before") ?? ""];
         return route.fulfill({ status: p ? 200 : 400, contentType: "application/json", body: JSON.stringify(p ?? { error: "unknown cursor" }) });
@@ -121,7 +125,9 @@ export default {
     { name: "board-needs-you-all", section: "project", path: "/projects/prj_demo/board", after: (p) => p.getByRole("button", { name: /Show all/ }).click() },
     // The task drawer: details and the worker's trace (history and live), side by side from `xl`, tabs below.
     { name: "drawer", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: traceCheck, checkName: "trace" },
-    { name: "drawer-trace-tab", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, widths: PHONE, after: traceTab, check: traceCheck, checkName: "trace" },
+    { name: "drawer-trace-tab", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, widths: [1280, 390], after: traceTab, check: traceCheck, checkName: "trace" },
+    // Switching the drawer's tabs away from the trace and back keeps it: no second socket, no refetch, scroll and expansion kept.
+    { name: "drawer-trace-tabs", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, widths: [1280, 390], check: tabKeepCheck, checkName: "trace-tabs" },
     { name: "drawer-trace-expanded", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: traceCheck, checkName: "trace", after: async (p) => { await traceTab(p); await expandResult(p); } },
     { name: "drawer-trace-loading", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: traceCheck, checkName: "trace", after: async (p) => { await traceTab(p); p.holdHistory = true; await toTop("loading earlier…")(p); } },
     { name: "drawer-trace-beginning", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: traceCheck, checkName: "trace", after: async (p) => { await traceTab(p); await toTop("the beginning of the trace")(p); } },
@@ -129,6 +135,7 @@ export default {
     { name: "new-task", section: "project", path: "/projects/prj_demo/board", full: false, after: (p) => p.getByRole("button", { name: "New task" }).click() },
     { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false },
     { name: "manager-trace", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, check: traceCheck, checkName: "trace" },
+    { name: "manager-trace-connecting", section: "project", path: "/projects/prj_demo/manager?view=trace", fixture: "connecting", full: false, check: traceCheck, checkName: "trace", ready: shown("[data-ds=terminal] [data-ds=loading] p, [data-ds=terminal] [data-ds=loading] .mantine-Text-root") },
     { name: "manager-trace-beginning", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, check: traceCheck, checkName: "trace", after: toTop("the beginning of the trace") },
     { name: "reviews", section: "project", path: "/projects/prj_demo/reviews" },
     { name: "reviews-trace", section: "project", path: "/projects/prj_demo/reviews", after: (p) => p.getByRole("button", { name: "Show the trace of #118" }).click(), check: traceCheck, checkName: "trace" },

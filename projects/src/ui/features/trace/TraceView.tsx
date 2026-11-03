@@ -5,11 +5,11 @@
 // history, loaded as the reader scrolls to the top; only what arrives live fades in. It follows the
 // newest line only while scrolled to the bottom; otherwise "Jump to live" takes it there.
 
-import { Badge, Button, Text, VisuallyHidden } from "@mantine/core";
+import { Badge, Button, Text, Title, VisuallyHidden } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { exact } from "../../common/time";
-import { FadeIn, Glyph, GLYPH, icon, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn } from "../../layout";
+import { FadeIn, Glyph, GLYPH, icon, TermStatus, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn } from "../../layout";
 import {
   groupTurns, type HistoryEvent, lastState, primaryArg, resultLines, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, toolName,
   type TurnGroup,
@@ -49,8 +49,14 @@ function ToolResult({ r }: { r: AnyEvent }) {
   const error = r.is_error === true;
   const shownLines = all ? lines : head;
   const text = shownLines.length ? shownLines.join("\n") : error ? "Error" : "(no output)";
+  const toggle = (where: string) => (
+    <TermLine indent={1} tone="muted" onClick={() => setAll((a) => !a)} expanded={all} data-slot="more" data-at={where}>
+      {all ? "(collapse)" : `… +${more} ${more === 1 ? "line" : "lines"} (expand)`}
+    </TermLine>
+  );
   return (
     <>
+      {more > 0 && all && toggle("top")}
       <TermLine indent={1} glyph={GLYPH.result} glyphTone="muted" tone={error ? "danger" : "muted"} data-kind="tool_result" data-error={error ? "true" : "false"}>
         {error && (
           <>
@@ -59,11 +65,7 @@ function ToolResult({ r }: { r: AnyEvent }) {
         )}
         {text}
       </TermLine>
-      {more > 0 && (
-        <TermLine indent={1} tone="muted" onClick={() => setAll((a) => !a)} expanded={all} data-slot="more">
-          {all ? "(collapse)" : `… +${more} ${more === 1 ? "line" : "lines"} (expand)`}
-        </TermLine>
-      )}
+      {more > 0 && toggle("end")}
     </>
   );
 }
@@ -223,7 +225,22 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
   useEffect(() => {
     const v = viewport.current;
     if (!v) return;
+    // Hidden (a tab switched away: `display: none`), the log has no height and the browser may drop its
+    // scroll position: what the reader had is kept, and put back when it shows again.
+    // Shown for the first time (it mounted hidden), it starts at the newest line, as it would have.
+    let hidden = false;
+    let lastTop: number | null = null;
+    const seen = new ResizeObserver(() => {
+      if (v.clientHeight === 0) hidden = true;
+      else if (hidden) {
+        hidden = false;
+        v.scrollTop = lastTop ?? (atBottomRef.current ? v.scrollHeight : 0);
+      }
+    });
+    seen.observe(v);
     const onScroll = () => {
+      if (v.clientHeight === 0 || hidden) return;
+      lastTop = v.scrollTop;
       const near = v.scrollHeight - v.scrollTop - v.clientHeight <= NEAR_BOTTOM;
       atBottomRef.current = near;
       setAtBottom(near);
@@ -232,7 +249,10 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
       if (v.scrollTop <= NEAR_TOP && !near && canLoadRef.current) older();
     };
     v.addEventListener("scroll", onScroll, { passive: true });
-    return () => v.removeEventListener("scroll", onScroll);
+    return () => {
+      v.removeEventListener("scroll", onScroll);
+      seen.disconnect();
+    };
   }, []);
 
   // Older events came in above: kept in place (what was being read stays where it was), or at the bottom if it was there.
@@ -294,65 +314,83 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     );
   }
 
-  return (
-    <Section
-      title={untitled ? <VisuallyHidden>{title}</VisuallyHidden> : title}
-      region={false}
-      fill={fill}
-      actions={
-        <>
-          {agentState && (
-            <Text fz="xs" c="dimmed" data-slot="agent-state">
-              {agentState.replace(/_/g, " ")}
-            </Text>
-          )}
-          <Badge variant="light" color={status.color} data-slot="trace-status" aria-live="polite">
-            {status.label}
-          </Badge>
-        </>
-      }
-    >
-      <Stack gap="md" fill={fill}>
-        {state.gap && (
-          <Notice tone="info" title="Earlier events aren't in the live trace">
-            <Text fz="xs">
-              Events {state.gap.from}–{state.gap.to} are older than nest keeps for the live trace.
-            </Text>
-          </Notice>
-        )}
-        {state.trimmed && (
-          <Text fz="xs" c="dimmed">
-            Older events are hidden to keep the page light.
+  const statusLine = (
+    <>
+      {agentState && (
+        <Text fz="xs" c="dimmed" data-slot="agent-state">
+          {agentState.replace(/_/g, " ")}
+        </Text>
+      )}
+      <Badge variant="light" color={status.color} data-slot="trace-status" aria-live="polite">
+        {status.label}
+      </Badge>
+    </>
+  );
+  const body = (
+    <Stack gap="md" fill={fill}>
+      {state.gap && (
+        <Notice tone="info" title="Earlier events aren't in the live trace">
+          <Text fz="xs">
+            Events {state.gap.from}–{state.gap.to} are older than nest keeps for the live trace.
           </Text>
+        </Notice>
+      )}
+      {state.trimmed && (
+        <Text fz="xs" c="dimmed">
+          Older events are hidden to keep the page light.
+        </Text>
+      )}
+      <Terminal fill={fill}>
+        {/* Under a tab that names it: the connection on the terminal's first line, not a row of its own. */}
+        {untitled && (
+          <TermStatus note={agentState?.replace(/_/g, " ")}>
+            <Badge variant="light" color={status.color} data-slot="trace-status" aria-live="polite">
+              {status.label}
+            </Badge>
+          </TermStatus>
         )}
-        <Terminal fill={fill}>
-          <ScrollLog viewportRef={viewport} fill={fill}>
-            {empty && state.olderState !== "loading" ? (
-              state.status === "connecting" ? (
-                <LoadingState label="Connecting to the trace" />
-              ) : (
-                <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" data-slot="empty">
-                  {state.status === "ended" ? "the agent ended with nothing in its trace" : "nothing yet: what the agent does shows here as it happens"}
-                </TermLine>
-              )
+        <ScrollLog viewportRef={viewport} fill={fill}>
+          {empty && state.olderState !== "loading" ? (
+            state.status === "connecting" ? (
+              <LoadingState label="Connecting to the trace" terminal />
             ) : (
-              <Stack gap="sm">
-                {top}
-                {groups.map((g) => (
-                  <Turn key={g.key} g={g} animateAfter={state.animateAfter} />
-                ))}
-              </Stack>
-            )}
-          </ScrollLog>
-        </Terminal>
-        {!atBottom && (
-          <Row justify="center">
-            <Button variant="light" size="compact-sm" leftSection={<IconArrowDown size={icon.sm} />} onClick={jump}>
-              {unseen > 0 ? `Jump to live (${unseen} new)` : "Jump to live"}
-            </Button>
-          </Row>
-        )}
+              <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" data-slot="empty">
+                {state.status === "ended" ? "the agent ended with nothing in its trace" : "nothing yet: what the agent does shows here as it happens"}
+              </TermLine>
+            )
+          ) : (
+            <Stack gap="sm">
+              {top}
+              {groups.map((g) => (
+                <Turn key={g.key} g={g} animateAfter={state.animateAfter} />
+              ))}
+            </Stack>
+          )}
+        </ScrollLog>
+      </Terminal>
+      {!atBottom && (
+        <Row justify="center">
+          <Button variant="light" size="compact-sm" leftSection={<IconArrowDown size={icon.sm} />} onClick={jump}>
+            {unseen > 0 ? `Jump to live (${unseen} new)` : "Jump to live"}
+          </Button>
+        </Row>
+      )}
+    </Stack>
+  );
+
+  if (untitled) {
+    return (
+      <Stack gap="md" fill={fill}>
+        <VisuallyHidden>
+          <Title order={3}>{title}</Title>
+        </VisuallyHidden>
+        {body}
       </Stack>
+    );
+  }
+  return (
+    <Section title={title} region={false} fill={fill} actions={statusLine}>
+      {body}
     </Section>
   );
 }
