@@ -29,6 +29,7 @@ fn main() -> anyhow::Result<()> {
     let text = std::fs::read_to_string(&args.config).with_context(|| format!("read {}", args.config.display()))?;
     let cfg: Config = serde_json::from_str(&text).with_context(|| format!("parse {}", args.config.display()))?;
     cfg.validate().with_context(|| format!("check {}", args.config.display()))?;
+    cfg.check_paths().with_context(|| format!("check {}", args.config.display()))?;
     // Into the delegated cgroup's leaf before the runtime starts any thread or child (a failure is
     // reported, never fatal: see `cgroup::delegate`).
     if cfg.delegated_cgroup

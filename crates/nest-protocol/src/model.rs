@@ -705,6 +705,9 @@ pub struct GenerationRecord {
     pub mem_manifest: Option<ManifestHash>,
     pub reason: CommitReason,
     pub created_ms: TimestampMs,
+    /// When its disk was cut, from the commit request (`cut_ms`); absent for a disk read in place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_ms: Option<TimestampMs>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
