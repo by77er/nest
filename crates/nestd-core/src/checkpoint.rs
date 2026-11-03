@@ -39,15 +39,23 @@ impl DiskStamp {
     }
 }
 
+/// A pass [`ScanMemo::begin`] started, to hand back to [`ScanMemo::scanned`]. Passes overlap with
+/// a reflink cut (M2): one is begun at each cut, while the VM is paused, and recorded when its cut
+/// has been read in the background, by which time a newer cut may have begun another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Pass(u64);
+
 /// The last pass over one incarnation's disk that a later commit may reuse.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ScanMemo<M> {
     last: Option<(DiskStamp, M)>,
+    /// How many passes have begun: only the newest may record.
+    begun: u64,
 }
 
 impl<M> Default for ScanMemo<M> {
     fn default() -> Self {
-        ScanMemo { last: None }
+        ScanMemo { last: None, begun: 0 }
     }
 }
 
@@ -56,11 +64,17 @@ impl<M> ScanMemo<M> {
         Self::default()
     }
 
-    /// A pass over the disk produced `manifest`. `stable`: nothing could write the disk from before
-    /// the pass until `stamp` was read. `stamp`: the file as read after nestd set the sentinel
-    /// (`None`: setting it or reading it back failed). Remembered only when the pass was stable and
-    /// the stamp shows the sentinel; otherwise whatever was remembered is forgotten.
-    pub fn scanned(&mut self, stable: bool, stamp: Option<DiskStamp>, manifest: M) {
+    /// Pass `pass` produced `manifest`: the disk's content when `stamp` was read. `stable`: nothing
+    /// could write the disk from before the pass's read (or cut) until `stamp` was read. `stamp`: the
+    /// file as read after nestd set the sentinel (`None`: setting it or reading it back failed).
+    /// Remembered only when this is the newest pass begun, it was stable, and the stamp shows the
+    /// sentinel; an older pass records nothing (the sentinel a newer cut set reads the same, over
+    /// content this manifest doesn't describe), and a newest pass that can't be vouched for leaves
+    /// nothing remembered.
+    pub fn scanned(&mut self, pass: Pass, stable: bool, stamp: Option<DiskStamp>, manifest: M) {
+        if pass.0 != self.begun {
+            return;
+        }
         self.last = match stamp {
             Some(s) if stable && s.is_sentinel() => Some((s, manifest)),
             _ => None,
@@ -71,10 +85,11 @@ impl<M> ScanMemo<M> {
     /// it left it, and forget it either way. A pass in progress has nothing to reuse, so whatever
     /// fails before [`ScanMemo::scanned`] records the new pass (a sentinel set over content the
     /// memo doesn't describe included) leaves nothing a later commit could wrongly reuse.
-    pub fn begin(&mut self, stable: bool, stamp: Option<&DiskStamp>) -> Option<M> {
+    pub fn begin(&mut self, stable: bool, stamp: Option<&DiskStamp>) -> (Option<M>, Pass) {
         let reuse = self.unchanged(stable, stamp).is_some();
         let last = self.last.take();
-        if reuse { last.map(|(_, m)| m) } else { None }
+        self.begun += 1;
+        (if reuse { last.map(|(_, m)| m) } else { None }, Pass(self.begun))
     }
 
     /// The remembered manifest, when the disk, read (`stamp`) while nothing can write it
@@ -105,14 +120,20 @@ mod tests {
         DiskStamp { dev: 1, ino: 2, size: 3, mtime_sec: mtime.0, mtime_nsec: mtime.1 }
     }
 
+    /// A whole pass: begun, then recorded.
+    fn pass<M>(m: &mut ScanMemo<M>, stable: bool, st: Option<DiskStamp>, man: M) {
+        let (_, p) = m.begin(stable, None);
+        m.scanned(p, stable, st, man);
+    }
+
     #[test]
     fn a_stable_pass_with_the_sentinel_is_reused_while_the_disk_reads_the_same() {
         let mut m = ScanMemo::new();
         let s = stamp(SENTINEL);
-        m.scanned(true, Some(s), "m1");
+        pass(&mut m, true, Some(s), "m1");
         assert!(m.remembers());
         assert_eq!(m.unchanged(true, Some(&s)), Some(&"m1"));
-        // Reading again doesn't consume it.
+        // Reading doesn't consume it.
         assert_eq!(m.unchanged(true, Some(&s)), Some(&"m1"));
     }
 
@@ -120,7 +141,7 @@ mod tests {
     fn nothing_is_reused_unless_the_disk_is_stable_now() {
         let mut m = ScanMemo::new();
         let s = stamp(SENTINEL);
-        m.scanned(true, Some(s), "m1");
+        pass(&mut m, true, Some(s), "m1");
         assert_eq!(m.unchanged(false, Some(&s)), None);
         assert_eq!(m.unchanged(true, None), None);
     }
@@ -129,7 +150,7 @@ mod tests {
     fn any_difference_in_the_stamp_defeats_reuse() {
         let mut m = ScanMemo::new();
         let s = stamp(SENTINEL);
-        m.scanned(true, Some(s), "m1");
+        pass(&mut m, true, Some(s), "m1");
         for other in [
             DiskStamp { dev: 9, ..s },
             DiskStamp { ino: 9, ..s },
@@ -146,8 +167,8 @@ mod tests {
         let s = stamp(SENTINEL);
         for (stable, st) in [(false, Some(s)), (true, None), (true, Some(stamp((1_800_000_000, 0)))), (true, Some(stamp((SENTINEL.0, 0)))), (true, Some(stamp((0, SENTINEL.1))))] {
             let mut m = ScanMemo::new();
-            m.scanned(true, Some(s), "m1");
-            m.scanned(stable, st, "m2");
+            pass(&mut m, true, Some(s), "m1");
+            pass(&mut m, stable, st, "m2");
             assert!(!m.remembers(), "{stable} {st:?}");
             assert_eq!(m.unchanged(true, Some(&s)), None);
             if let Some(st) = st {
@@ -162,7 +183,7 @@ mod tests {
         let mut m = ScanMemo::new();
         assert!(!m.remembers());
         assert_eq!(m.unchanged(true, Some(&s)), None);
-        m.scanned(true, Some(s), "m1");
+        pass(&mut m, true, Some(s), "m1");
         m.forget();
         assert!(!m.remembers());
         assert_eq!(m.unchanged(true, Some(&s)), None);
@@ -173,19 +194,36 @@ mod tests {
     fn a_pass_begun_forgets_the_memo_whether_or_not_it_reuses() {
         let s = stamp(SENTINEL);
         let mut m = ScanMemo::new();
-        m.scanned(true, Some(s), "m1");
-        assert_eq!(m.begin(true, Some(&s)), Some("m1"));
+        pass(&mut m, true, Some(s), "m1");
+        assert_eq!(m.begin(true, Some(&s)).0, Some("m1"));
         assert!(!m.remembers(), "a pass in progress has nothing to reuse");
-        assert_eq!(m.begin(true, Some(&s)), None);
-        m.scanned(true, Some(s), "m2");
-        assert_eq!(m.begin(false, Some(&s)), None, "not stable now");
+        assert_eq!(m.begin(true, Some(&s)).0, None);
+        pass(&mut m, true, Some(s), "m2");
+        assert_eq!(m.begin(false, Some(&s)).0, None, "not stable now");
         assert!(!m.remembers());
-        m.scanned(true, Some(s), "m3");
-        assert_eq!(m.begin(true, Some(&stamp((7, 7)))), None, "another stamp");
+        pass(&mut m, true, Some(s), "m3");
+        assert_eq!(m.begin(true, Some(&stamp((7, 7)))).0, None, "another stamp");
         assert!(!m.remembers());
-        m.scanned(true, Some(s), "m4");
-        assert_eq!(m.begin(true, None), None);
+        pass(&mut m, true, Some(s), "m4");
+        assert_eq!(m.begin(true, None).0, None);
         assert!(!m.remembers());
+    }
+
+    /// Two cuts' passes overlap: the older one, recorded after the newer began, records nothing,
+    /// though its stamp (the sentinel) reads the same as the newer cut's.
+    #[test]
+    fn only_the_newest_pass_begun_records() {
+        let s = stamp(SENTINEL);
+        let mut m = ScanMemo::new();
+        let (_, old) = m.begin(true, None);
+        let (_, new) = m.begin(true, None);
+        m.scanned(old, true, Some(s), "older cut");
+        assert!(!m.remembers(), "an older pass records nothing");
+        m.scanned(new, true, Some(s), "newer cut");
+        assert_eq!(m.unchanged(true, Some(&s)), Some(&"newer cut"));
+        m.scanned(old, true, Some(s), "older cut");
+        assert_eq!(m.unchanged(true, Some(&s)), Some(&"newer cut"), "nor overwrites the newer");
+        assert_ne!(old, new);
     }
 
     #[test]
@@ -217,38 +255,47 @@ mod proofs {
         if kani::any() { Some(any_stamp()) } else { None }
     }
 
-    /// Whatever the history, a reused manifest is the one a stable pass recorded with exactly the
-    /// stamp seen now, that stamp is the sentinel, and the disk is stable now.
+    /// Whatever the history (passes begun, recorded in any order, including passes no longer the
+    /// newest, or forgotten), a reused manifest is the one the newest pass begun recorded, from a
+    /// stable pass, with exactly the stamp seen now, which is the sentinel; and the disk is stable
+    /// now. `begin` reuses exactly what `unchanged` would and leaves nothing behind.
     #[kani::proof]
-    #[kani::unwind(4)]
-    fn reuse_only_of_a_stable_sentinel_pass_with_the_same_stamp() {
+    #[kani::unwind(5)]
+    fn reuse_only_of_the_newest_stable_sentinel_pass_with_the_same_stamp() {
         let mut m: ScanMemo<u8> = ScanMemo::new();
-        // The newest recording that wasn't forgotten: (stable, stamp, manifest).
+        // Passes begun (up to 2), newest last; and what the newest recorded, if it did.
+        let mut passes: [Option<Pass>; 2] = [None, None];
         let mut recorded: Option<(bool, Option<DiskStamp>, u8)> = None;
-        for _ in 0..3 {
+        for _ in 0..4 {
             match kani::any_where(|c: &u8| *c < 3) {
                 0 => {
-                    let (stable, stamp, man): (bool, Option<DiskStamp>, u8) = (kani::any(), any_opt_stamp(), kani::any());
-                    m.scanned(stable, stamp, man);
-                    recorded = Some((stable, stamp, man));
-                }
-                1 => {
-                    m.forget();
+                    let (stable, now) = (kani::any(), any_opt_stamp());
+                    let (_, p) = m.begin(stable, now.as_ref());
+                    assert!(!m.remembers(), "a pass begun leaves nothing to reuse");
+                    passes = [passes[1], Some(p)];
                     recorded = None;
                 }
+                1 => {
+                    // Record any pass begun so far: the newest, or an older one.
+                    let which: bool = kani::any();
+                    if let Some(p) = if which { passes[1] } else { passes[0] } {
+                        let (stable, stamp, man): (bool, Option<DiskStamp>, u8) = (kani::any(), any_opt_stamp(), kani::any());
+                        m.scanned(p, stable, stamp, man);
+                        if Some(p) == passes[1] {
+                            recorded = Some((stable, stamp, man));
+                        }
+                    }
+                }
                 _ => {
-                    // A pass begun and never recorded (it failed): nothing is left to reuse.
-                    let (stable, now) = (kani::any(), any_opt_stamp());
-                    let _ = m.begin(stable, now.as_ref());
-                    assert!(!m.remembers());
+                    m.forget();
                     recorded = None;
                 }
             }
         }
         let (stable, now) = (kani::any(), any_opt_stamp());
         let peeked = m.unchanged(stable, now.as_ref()).copied();
-        if let Some(got) = m.begin(stable, now.as_ref()) {
-            let (was_stable, was, man) = recorded.expect("a reuse names a recording");
+        if let Some(got) = m.begin(stable, now.as_ref()).0 {
+            let (was_stable, was, man) = recorded.expect("a reuse names the newest pass's recording");
             assert!(stable && was_stable);
             assert_eq!(was, now);
             assert!(now.expect("reused against a stamp").is_sentinel());
@@ -268,7 +315,8 @@ mod proofs {
         s.mtime_sec = SENTINEL.0;
         s.mtime_nsec = SENTINEL.1;
         let man: u8 = kani::any();
-        m.scanned(true, Some(s), man);
+        let (_, p) = m.begin(true, None);
+        m.scanned(p, true, Some(s), man);
         assert_eq!(m.unchanged(true, Some(&s)), Some(&man));
     }
 }

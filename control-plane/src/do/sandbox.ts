@@ -872,6 +872,7 @@ export class SandboxDO extends DurableObject<Env> {
       ...(ev.mem_manifest ? { mem_manifest: ev.mem_manifest } : {}),
       reason: ev.reason,
       created_ms: Date.now(),
+      ...(ev.cut_ms !== undefined ? { cut_ms: ev.cut_ms } : {}),
     });
     const d = lease.decideCommit(info, (e) => this.epochHost(e), host, ev);
     let outcome: CommitOutcome;

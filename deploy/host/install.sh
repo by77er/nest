@@ -15,7 +15,7 @@ CLAUDE_VERSION="2.1.301"
 # A GitHub release binary, pinned by version and checksum (never committed to the repo).
 CLOUDFLARED_VERSION="2026.10.3"
 CLOUDFLARED_SHA256="053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0"
-PACKAGES="nftables iproute util-linux bubblewrap e2fsprogs zstd"
+PACKAGES="nftables iproute util-linux bubblewrap e2fsprogs xfsprogs zstd"
 export HOME=/root
 
 # shellcheck disable=SC2086

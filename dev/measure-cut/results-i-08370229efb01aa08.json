@@ -1,0 +1,94 @@
+{
+ "kernel": "6.18.56-125.164.amzn2023.x86_64",
+ "instance_type": "c8id.large",
+ "instance_store": 118000000000,
+ "xfs_info": "meta-data=/dev/nvme1n1           isize=512    agcount=4, agsize=7202149 blks\n         =                       sectsz=512   attr=2, projid32bit=1\n         =                       crc=1        finobt=1, sparse=1, rmapbt=0\n         =                       reflink=1    bigtime=1 inobtcount=1 nrext64=0\n         =                       exchange=0  \ndata     =                       bsize=4096   blocks=28808593, imaxpct=25\n         =                       sunit=0      swidth=0 blks\nnaming   =version 2              bsize=4096   ascii-ci=0, ftype=1, parent=0\nlog      =internal log           bsize=4096   blocks=16384, version=2\n         =                       sectsz=512   sunit=0 blks, lazy-count=1\nrealtime =none                   extsz=4096   blocks=0, rtextents=0\n",
+ "clone_fresh": {
+  "extents": 44,
+  "ms": [
+   14,
+   14,
+   14,
+   13,
+   13
+  ]
+ },
+ "clone_churn_1gib": {
+  "extents": 157649,
+  "ms": [
+   1556,
+   2379,
+   2398,
+   2377,
+   2869
+  ]
+ },
+ "clone_month": {
+  "extents": 818954,
+  "ms": [
+   11005,
+   7988,
+   8116,
+   8113,
+   7996
+  ]
+ },
+ "read_cut": {
+  "bytes": 6690762752,
+  "ms": 36996
+ },
+ "cut_while_writing": {
+  "pauses_ms": [
+   [
+    1793691660422,
+    5128
+   ],
+   [
+    1793691670662,
+    5091
+   ],
+   [
+    1793691680819,
+    5144
+   ],
+   [
+    1793691691089,
+    5112
+   ],
+   [
+    1793691701335,
+    5074
+   ],
+   [
+    1793691711472,
+    5065
+   ],
+   [
+    1793691721738,
+    5060
+   ],
+   [
+    1793691731997,
+    5090
+   ],
+   [
+    1793691742151,
+    5082
+   ],
+   [
+    1793691752405,
+    5065
+   ],
+   [
+    1793691762634,
+    5117
+   ],
+   [
+    1793691772813,
+    5100
+   ]
+  ],
+  "guest": []
+ },
+ "done": true
+}

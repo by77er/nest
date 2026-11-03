@@ -10,6 +10,7 @@ import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
+import { SYSTEM_SENDER } from "../lib/senders";
 import { type Timer, TIMER_DEADLINE, TIMER_SENDER, timerDue, timerFiredText, TimerName, TimerSetArgs, TimerStore, TIMERS_MAX } from "../lib/timers";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX, sameConnector } from "../lib/mcp";
@@ -149,8 +150,6 @@ const TIMER_TOOLS = ["timer_set", "timer_cancel", "timer_list"];
 /** The tools an agent is offered: its spec's, and `exit`, which every agent has (it only gives up authority). */
 const offered = (info: Pick<AgentSpec, "tools">): string[] => (info.tools.includes("exit") ? info.tools : [...info.tools, "exit"]);
 
-/** The sender of the platform's own notes about an agent's work (not input: see `stop_quiet`). */
-const SYSTEM_SENDER = "system";
 /** What `info()` answers: the record plus the derived brain host and `state`. */
 export type AgentView = Omit<AgentInfo, "client" | "labels"> & { host: string | null; state: AgentState; client: string | null; labels: Labels };
 
@@ -1570,7 +1569,7 @@ export class AgentDO extends DurableObject<Env> {
         news = (i.told_sandbox_epoch ?? -1) < epoch;
         if (news) i.told_sandbox_epoch = epoch;
       });
-      if (news) await this.postInbox(SYSTEM_SENDER, note);
+      if (news) await this.systemNote(note);
     }
     // Never a start from here: this may run inside a start that placed the sandbox.
     await this.deadlines.set("wake", Date.now(), true);
@@ -2409,19 +2408,28 @@ export class AgentDO extends DurableObject<Env> {
    * Mid-turn: pushed to the runner and its hook cache (unconfirmed, it comes back as a turn:
    * `TurnQueue.complete`); between turns, the next turn. Once per `requestId`.
    */
+  /**
+   * A message from outside the agent: the API's (whose route names the sender), a spawner's task, a fired
+   * timer. Input, whatever it says it is from. An ended agent refuses it (404).
+   */
   async postInbox(from: string, text: string, interrupt = false, requestId?: string, tainted = false): Promise<string> {
     const prior = requestId ? this.queue.messageFor(requestId) : undefined;
     if (prior) return prior;
+    this.refuseEnded(this.load(), "messages");
+    return this.deliver(from, text, interrupt, requestId, tainted, true);
+  }
+
+  /** The platform's own note about the agent's work (a sandbox move, a task's exit): not input, and dropped once it has ended. */
+  private async systemNote(text: string): Promise<void> {
+    if (this.load().ended) return;
+    await this.deliver(SYSTEM_SENDER, text, false, undefined, false, false);
+  }
+
+  private async deliver(from: string, text: string, interrupt: boolean, requestId: string | undefined, tainted: boolean, external: boolean): Promise<string> {
     const info = this.load();
-    if (info.ended) {
-      // The platform's own notes about its work (a task's exit, a move) have nobody to tell any more.
-      if (from === SYSTEM_SENDER) return "";
-      this.refuseEnded(info, "messages");
-    }
     const message: InboxMessage = { id: newId("msg_"), from, text, interrupt, ts_ms: Date.now() };
     // Another agent's text reaches the model inline: when it may be tainted, so is the session.
     if (tainted) this.kvPut("read_tainted", true);
-    const external = from !== SYSTEM_SENDER;
     if (external) this.inputArrived();
     if (info.current_turn) {
       this.queue.mirror(message, info.current_turn, requestId);
@@ -3112,7 +3120,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!info.hands || info.hands.sandbox !== sandbox) return;
     const how = task.status === "exited" ? `exited with code ${task.exit_code ?? "?"}` : task.status.replace("_", " ");
     const what = task.description ? `${task.task_id} (${task.description})` : task.task_id;
-    if (info.current_turn) await this.postInbox(SYSTEM_SENDER, `Background task ${what} ${how}.`);
+    if (info.current_turn) await this.systemNote(`Background task ${what} ${how}.`);
   }
 
   /**
