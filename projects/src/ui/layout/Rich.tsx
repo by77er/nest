@@ -62,7 +62,8 @@ export function SvgFigure({ url, source, label }: { url: string; source: string;
 
 /** A task, inline: the router makes it a link (common/links). */
 export const TaskChipAnchor = forwardRef<HTMLAnchorElement, AnchorHTMLAttributes<HTMLAnchorElement>>(function TaskChipAnchor({ className: _c, ...rest }, ref) {
-  return <a ref={ref} className={classes.chip} data-ds="task-chip" {...rest} />;
+  // In a sentence: the inline exception keeps its line on touch (data-inline).
+  return <a ref={ref} className={classes.chip} data-ds="task-chip" data-inline {...rest} />;
 });
 
 /** A card's title, a link covering the whole card. */
