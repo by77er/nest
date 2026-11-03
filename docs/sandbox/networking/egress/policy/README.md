@@ -6,7 +6,7 @@ Policy is layered and pushed by SandboxDO through nestd to nest-proxy. Changes a
 base:        # image defaults
   allow: [registry.npmjs.org, pypi.org, files.pythonhosted.org, crates.io, static.crates.io,
           index.crates.io, github.com, "*.githubusercontent.com", deb.debian.org]
-sandbox:     # set by whoever holds egress_policy on the sandbox (its owner, or me); forks inherit it
+sandbox:     # the operator's (designed: also the sandbox's owner); forks inherit it
   allow: [api.stripe.com]
   inject: [stripe]   # needs a grant on the binding
   passthrough: []
@@ -18,7 +18,7 @@ grants:
 limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
 ```
 
-**Built:** the `sandbox` layer is the operator's (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), and its rules reach hosts tagged `layer: workstream`, the layer's historical wire name, which hosts parse as a closed enum ([pending contract changes](../../../../interfaces/README.md#pending-contract-changes)); grants are tagged `sandbox`.
+**Built:** the `sandbox` layer is the operator's (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), and its rules reach hosts tagged `layer: workstream`, the layer's wire name, which hosts parse as a closed enum ([pending contract changes](../../../../interfaces/README.md#pending-contract-changes)); grants are tagged `sandbox`.
 
 ## Hard deny
 
@@ -47,7 +47,7 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 
 ## Rules
 
-- **Agents can ask for more access.** A denial comes back as a 403 with a readable reason. The agent asks for it (`egress_policy`, a sink); I, or an untainted holder of `egress_policy` on the sandbox (its owner or a captain), can approve, and the rule is added live, optionally with an expiry.
+- **Agents can ask for more access.** A denial comes back as a 403 with a readable reason. The agent asks for it (`egress_policy`, a sink); I, or an untainted holder of `egress_policy` on the sandbox (its owner), can approve, and the rule is added live, optionally with an expiry.
 - **Built: `egress_policy` on the agent's own bound sandbox** (the `egress` capability). No arguments: the effective policy. `allow: [{host, ports?}]` with `ttl_s` (60 s to 24 h, default 1 h) adds expiring grants (the `grants` layer, one policy version per call, ids derived from the call key so a re-run adds nothing). Widening is a [sink](../../../../agents/tools/#taint-and-sinks): from a tainted session it waits for my approval of that exact request (always `approve`; any agent with hands is tainted, so in practice every widening). `revoke: [host]` drops that host's temporary grants and is never gated. Hosts are DNS names or `*.` and one, lowercased; no IP literals. Approving an untainted holder's answer, method and path rules, and the `sandbox` layer by an owner (only the operator's `PUT /v1/sandboxes/:id/policy` sets it) aren't built.
 - **Inspected hosts can carry method and path rules** (e.g. `GET` only, or `/repos/me/*`), since the proxy already decrypts them. Vercel's sandbox firewall offers the same matchers ([docs](https://vercel.com/docs/vercel-sandbox/concepts/firewall)); its plain allow rules match SNI only, while nest-proxy also requires Host to equal SNI.
 - **Passthrough is SNI-only.** The proxy can't see `Host` inside a spliced connection, so a passthrough host on a shared CDN allows fronting to anything on that CDN that accepts a `Host` different from the SNI. Use it only for pinned clients that need it.
@@ -82,7 +82,7 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 **Built.** A sandbox may push only to repos explicitly on its **push allowlist**, enforced by nest-proxy whatever credential a push carries, so a prompt-injected agent can't push to an attacker's repo with the attacker's own token.
 
 - **What it is:** exact `owner/name` names, compared without case (`control-plane/src/lib/repos.ts`). **No `owner/*`:** a wildcard covers repos created later, forks an agent made included, and can't narrow a token (GitHub's token request names repos). No name ending in `.git` (git's URL suffix). Default: none, so no push anywhere.
-- **Where it comes from:** the sandbox layer's `repos` (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), plus the `repos` of every agent attached to the sandbox while attached (its spec's: the template's, replaced by the operator's `overrides.repos`). Everything in a sandbox shares a trust domain, so its agents share the union. An agent spawning another may only narrow it (`SpawnerOverrides.repos`, a subset of the template's; the spawner's own once `spawn_agent` is built). An operator-approved [`github.fork`](../../../../agents/capabilities/brokered/#forks) adds the fork to the forking agent's part. Not keyed on workstreams. Forks of a sandbox inherit the layer (fork isn't built).
+- **Where it comes from:** the sandbox layer's `repos` (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), plus the `repos` of every agent attached to the sandbox while attached (its spec's: the template's, replaced by the operator's `overrides.repos`). Everything in a sandbox shares a trust domain, so its agents share the union. A spawner (`agent_spawn`, or an [API client](../../../../control-plane/api/clients/#clients-and-grants)) may only narrow it (`SpawnerOverrides.repos`): to a subset of the template's, not of its own, because the spawn grant on the template is the operator's authorization for what it gives. An operator-approved [`github.fork`](../../../../agents/capabilities/brokered/#forks) adds the fork to the forking agent's part. Forks of a sandbox inherit the layer (the control plane doesn't fork yet).
 - **Read access** to public repos is unchanged. Private repos are readable only with the sandbox's tokens, which cover only its allowed and [read-only](#read-only-repos) repos.
 - **What it builds,** through the GitHub constructor (`lib/rules/github.ts`, [below](#github)): the guards always, and with any repo `api.github.com` in the allow list and the `github` [injection binding](../injection/#github) whose token BrokerDO mints for exactly those repos ([BrokerDO](../../../../control-plane/durable-objects/broker/#injection-minting)).
 
@@ -122,7 +122,7 @@ The evaluator with made-up hosts (`guard.rs` unit tests, `tests/guards.rs` throu
 ## Audit
 
 - **Every connection or request is logged** with sandbox, agent (if known), entry point (`via`), SNI/host, method, path (no query string), status, bytes, the decision, and the *name* of any binding used (never its value). Records are batched through nestd to the control plane and written to R2.
-- **Deny and alert records are aggregated per sandbox,** so a guest can't flood nestd, the control plane or its subscribers:
+- **Deny and alert records are aggregated per sandbox,** so a guest can't flood nestd or the control plane:
   - one record per distinct `(host, port, reason)` per minute, at most 128 distinct ones per minute
   - one alert per distinct `(kind, host, binding)` per minute, at most 32 per minute
   - when a new minute starts, a summary record (host `*`, reason `suppressed: …`) reports what was dropped

@@ -7,20 +7,21 @@ nest is two systems with one seam between them:
 
 Neither system knows where the other runs. A brain reaches a sandbox only through the seam, by hostname and binding, over the network. Nothing durable lives on a host; hosts can vanish at any time.
 
-> **Microkernel (decided 2026-11-02):** coordination is not the platform's. Shared logs, boards, messaging and workstreams are external apps that agents reach over MCP and that drive agents through the public API ([principle 9](../README.md#principles)); the kernel keeps sandboxes, agents, the credential broker, egress policy, MCP tool attachment and approvals.
+> **Microkernel (decided 2026-11-02):** coordination is not the platform's. Shared logs, boards and messaging are external apps that agents reach over MCP and that drive agents through the public API as [API clients](../control-plane/api/clients/) ([principle 9](../README.md#principles)); the kernel keeps sandboxes, agents (spawning, ownership, lifecycle), the credential broker, egress policy, MCP tool attachment, approvals, and scoped API clients with labels and events to the owner.
 
-> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23, with Access in front on 2026-10-24: spike item 13); brain hosts, so every brain starts on a brain host, never on a sandbox host, and reaches the guest only through its gateway (on AWS since 2026-10-29); templates and capabilities as data in CatalogDO, with nothing deciding on an agent role. **Not built:** grants, taint beyond a conservative stand-in, `wake_at`, agent events delivered to owners, the Discord bot, memory snapshots, the hands journal's `call_status`, the 60 s dirty-disk commit and desired host versions. `control-plane/README.md` lists the gaps.
+> This is the design. **Built:** the gateway, bindings and per-host tunnels (verified on AWS on 2026-10-23, with Access in front on 2026-10-24: spike item 13); brain hosts, so every brain starts on a brain host, never on a sandbox host, and reaches the guest only through its gateway (on AWS since 2026-10-29); templates and capabilities as data in CatalogDO, with nothing deciding on an agent role; spawning and lifetimes; remote MCP and brokered capabilities; API clients with webhook events and live traces. **Not built:** grants, taint beyond a conservative stand-in, `wake_at`, memory snapshots, the hands journal's `call_status`, the 60 s dirty-disk commit and desired host versions. `control-plane/README.md` lists the gaps.
 
 ## At a glance
 
 ```
-         me: Discord · API · nest CLI              external integrations: MCP, API
+               me: API · nest CLI       external apps: API in · webhooks, MCP calls out
                      │                                          │
-                     ▼                                          ▼
+                     ▼                                          ↕
 ┌────────────────────── Cloudflare control plane (authoritative) ──────────────────────┐
-│ Worker: API · Discord interactions · signed blob URLs (stateless)                     │
-│ Durable Objects, one writer per entity:                                               │
-│  FleetDO (per cell) · SandboxDO · AgentDO · BrokerDO · CatalogDO · McpConnectorDO     │
+│ Worker: API · OAuth callback · signed blob URLs (stateless)                          │
+│ Durable Objects, one writer per entity:                                              │
+│  FleetDO (per cell) · SandboxDO · AgentDO · BrokerDO · CatalogDO ·                   │
+│  McpConnectorDO · ClientDO                                                           │
 │ R2: session transcripts · audit                                                      │
 └────────────▲──────────────────────────────────────────────────▲──────────────────────┘
              │ WebSockets that hosts dial out:                  │
@@ -30,7 +31,7 @@ Neither system knows where the other runs. A brain reaches a sandbox only throug
 │  nestd · agent runner · Claude Code        │    │  nestd ── Firecracker VMs (sandboxes)            │
 │   nest mcp → hands client ─────────────────┼────┼─► cloudflared → gateway ─ vsock ─► guest agent  │
 │   the subscription token lives only here   │    │  nest-proxy: every byte of sandbox egress        │
-│  Discord gateway client (one brain host)   │    │  (hands, PTY and ingress: one door, a binding)   │
+│                                            │    │  (hands, PTY and ingress: one door, a binding)   │
 └────────────────────────────────────────────┘    └──────────────────────────┬───────────────────────┘
       the seam: SandboxDO control API · hands over the tunnel
                                                                              ▼
@@ -41,12 +42,14 @@ Neither system knows where the other runs. A brain reaches a sandbox only throug
 
 | Component | Runs on | Does | Doc |
 |---|---|---|---|
-| **Worker** | Cloudflare | HTTP API, Discord interactions, signed blob URLs, tunnel and DNS records per sandbox host. Stateless; routes to DOs. | [control-plane/api/](../control-plane/api/) |
+| **Worker** | Cloudflare | HTTP API (operator and API clients), the MCP OAuth callback, signed blob URLs, tunnel and DNS records per sandbox host. Stateless; routes to DOs. | [control-plane/api/](../control-plane/api/) |
 | **FleetDO** | Cloudflare, one per cell | Hosts of both kinds, enrollment, leases, placement and autoscaling, STONITH, ordered command delivery, the binding public keys pushed to gateways; three desired versions per cell (designed) | [fleet/](../control-plane/durable-objects/fleet/) |
 | **SandboxDO** | Cloudflare, one per sandbox | Epoch, generation head (compare-and-set commits), egress policy, attached clients; issues bindings and answers `resolve` | [sandbox/](../control-plane/durable-objects/sandbox/) |
-| **AgentDO** | Cloudflare, one per agent | Spawn spec (capabilities, grants, budget), turn queue, session stream, taint, scheduled wakes, tool relay, the agent epoch, brain placement | [agent/](../control-plane/durable-objects/agent/) |
+| **AgentDO** | Cloudflare, one per agent | Spawn spec (capabilities, grants, budget), owner, turn queue and inbox, session stream, taint, open asks, scheduled wakes (designed), tool relay (MCP client, brokered actions), the agent epoch, brain placement, its client's event outbox | [agent/](../control-plane/durable-objects/agent/) |
 | **BrokerDO** | Cloudflare, one | The only DO that stores secret values: setup tokens, injection secrets, capability credentials, the Access service token. Platform keys (AWS, the host-token secret, operator-token hashes, the revocation counter, the Cloudflare Tunnel API token) are Worker secrets; the proxy root CA key is in AWS KMS | [broker/](../control-plane/durable-objects/broker/) |
 | **CatalogDO** | Cloudflare, one | Templates and capabilities, as data I edit; expands spawn specs | [catalog/](../control-plane/durable-objects/catalog/) |
+| **McpConnectorDO** | Cloudflare, one per remote MCP server, credential and API client namespace | The server's shared tool list, `list_changed`, admission | [mcp-connector/](../control-plane/durable-objects/mcp-connector/) |
+| **ClientDO** | Cloudflare, one per API client | Its record and grant, webhook and event backlog, idempotency keys (its catalog namespace's entries are CatalogDO's) | [client/](../control-plane/durable-objects/client/) |
 | **nestd** | Every host | Enrollment, the lease, command delivery, self-fencing. On sandbox hosts: runs sandboxes, builds their network namespaces, launches cloudflared and the gateway, commits sandbox state to S3. On brain hosts: supervises the runner | [compute/nestd/](../compute/nestd/) |
 | **nest-proxy** | Sandbox hosts | All sandbox egress: allowlist, TLS inspection, credential injection by placeholder, audit | [egress/](../sandbox/networking/egress/) |
 | **Gateway** | Sandbox hosts | The one door into a sandbox: checks the binding, pins `(sandbox, epoch)`, forwards hands, terminal and ingress connections to the guest over vsock | [sandbox/gateway/](../sandbox/gateway/) |
@@ -54,7 +57,6 @@ Neither system knows where the other runs. A brain reaches a sandbox only throug
 | **Agent runner** | Brain hosts | Starts and drives unmodified Claude Code, tails its session, answers hooks locally, bridges MCP, carries hands calls to the gateway | [agents/runner/](../agents/runner/) |
 | **Claude Code** | Brain hosts, one process per active agent | The brain. No local exec or file tools; everything goes through `nest` MCP tools | [agents/](../agents/) |
 | **`nest mcp`** | Spawned by Claude Code | Stdio MCP bridge from Claude Code to the runner | [agents/tools/](../agents/tools/) |
-| **Discord gateway client** | One brain host, placed by FleetDO | Free-form Discord messages | [control-plane/api/discord/](../control-plane/api/discord/) |
 | **Guest agent** | Inside each VM | The hands server (`Bash`, `Read`, `Write`, …), port watching, the in-sandbox `nest` CLI | [sandbox/guest-agent/](../sandbox/guest-agent/) |
 
 ## The seam
@@ -67,13 +69,13 @@ The contract is in [interfaces/gateway/](../interfaces/gateway/). Any runner can
 
 ## A turn, end to end
 
-1. **Something happens.** I send a turn or an inbox message, an owner or an integration posts to the agent's inbox over the API, or a scheduled `wake_at` comes due. It enters the agent's AgentDO queue.
+1. **Something happens.** I or an API client send a turn or an inbox message, an owner agent's spawn gives the first task, an integration posts to the agent's inbox, an ask is answered, or (designed) a scheduled `wake_at` comes due. It enters the agent's AgentDO queue.
 2. **Placing the brain.** AgentDO queues the turn and, if no brain is running, picks a runner by backend and capacity: for `claude-code`, a brain host with room, preferring the one that ran the agent last. FleetDO sends `agent_start`, and the runner rebuilds the session from R2 and starts Claude Code, resumed or fresh (see [continuity](../agents/#continuity)).
 3. **Reaching the hands.** If the agent has hands, AgentDO makes sure the sandbox is running (a suspended one is resumed, an archived one placed and restored by the [activator](../control-plane/activator/)), attaches the agent through SandboxDO, and gives the runner the sandbox host's hostname, the binding and the guest's version. The runner renews or re-resolves through AgentDO when a binding ages or a connection is refused.
 4. **The turn.** AgentDO sends the turn's input to the runner; messages that arrive mid-turn join it through the inbox mirror.
-5. **Hands.** `mcp__nest__Bash` goes Claude Code → `nest mcp` → runner → hands client → one WebSocket to the gateway (binding first) → vsock → guest agent, which runs it as the sandbox user and keeps a call record. Results come back the same way. Platform tools (`agent_spawn`, `wake_at`, brokered actions, MCP or API capability tools) go runner → AgentDO, which checks the grant and the session's [taint](../agents/tools/#taint-and-sinks).
+5. **Hands.** `mcp__nest__Bash` goes Claude Code → `nest mcp` → runner → hands client → one WebSocket to the gateway (binding first) → vsock → guest agent, which runs it as the sandbox user and keeps a call record. Results come back the same way. Platform tools (`agent_spawn`, `egress_policy`, brokered actions, remote MCP tools) go runner → AgentDO, which checks the grant and the session's [taint](../agents/tools/#taint-and-sinks), holds a sink call from a tainted session as an ask, and forwards remote MCP tools to their servers.
 6. **Egress and durability.** Processes in the VM reach the network only through nest-proxy, which allows listed hosts and injects credentials by placeholder. The session streams from the brain host to AgentDO and R2 (acked once in SQLite; flushed at 1 MiB, at turn end, after 30 s idle and before any start). nestd commits the sandbox disk to S3 from the sandbox host at turn ends (at most every 10 s), every 60 s while dirty, and on pause and suspend, each after the guest's `syncfs`; the head moves by compare-and-set in SandboxDO. The two never touch.
-7. **After.** The turn is recorded done, and the next queued one starts. An idle brain exits after 120 s. A sandbox with no agent mid-turn, no live ingress and no hold pauses after 1 minute and suspends after 10 more. An idle brain host and an idle sandbox host drain and terminate independently.
+7. **After.** The turn is recorded done (an API client owner gets `agent.turn_completed` by webhook), and the next queued one starts. An idle brain exits after 120 s. A sandbox with no agent mid-turn, no live ingress and no hold pauses after 1 minute and suspends after 10 more. An idle brain host and an idle sandbox host drain and terminate independently.
 
 ## When things fail
 
@@ -98,7 +100,7 @@ Details: [sandbox/fencing/](../sandbox/fencing/), [sandbox/gateway/](../sandbox/
 |---|---|---|
 | Entity metadata: leases, epochs, agent epochs, generation heads, spawn specs, grants, taint, turns, tunnel ids per sandbox host, the three desired versions per cell | DO SQLite | The entity's own DO |
 | Session transcripts | DO SQLite until flushed, then R2 | AgentDO |
-| Audit logs | R2 | FleetDO |
+| Audit logs | R2 | FleetDO (hosts'), BrokerDO (credential issuance) |
 | Sandbox disk and memory chunks, manifests | S3, per cell | nestd; the head moves only through SandboxDO |
 | Secrets | BrokerDO (platform keys: Worker secrets) | Me, or minted by BrokerDO |
 | The binding key | BrokerDO (private, per cell; it signs); FleetDO pushes the public keys to each sandbox host's gateway over the fleet channel | BrokerDO |
