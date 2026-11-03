@@ -291,6 +291,8 @@ const TASK_SELECT = "SELECT t.*, EXISTS (SELECT 1 FROM history h WHERE h.task = 
 export class ProjectDO extends DurableObject<Env> {
   private draining: Promise<void> | null = null;
   private again = false;
+  /** Whether this drain already went round again for a changed grant (`grantSeen`). */
+  private reowed = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -1123,9 +1125,7 @@ export class ProjectDO extends DurableObject<Env> {
       ? `The owner added the GitHub Actions secret ${r.name as string} you asked for.`
       : !m?.roles.includes(r.role as SecretRole)
         ? `The owner set up the secret ${r.name as string} you asked for, but not for your role (${r.role as string}): say so if you still need it.`
-        : r.role === "reviewer"
-          ? `The owner set up the secret ${r.name as string} you asked for. Your sandbox gets it as $${m.env} in a moment, in the commands you start from then on.`
-          : `The owner set up the secret ${r.name as string} you asked for. Your sandbox gets it as $${m.env} in a moment, in the commands you start from then on.`;
+        : `The owner set up the secret ${r.name as string} you asked for. Your sandbox gets it as $${m.env} in a moment, in the commands you start from then on.`;
     this.oweMessage(r.agent as string, text, false);
   }
 
@@ -1626,8 +1626,11 @@ export class ProjectDO extends DurableObject<Env> {
     this.sql.exec("UPDATE settings SET grant_seen = ?", seen);
     if (before !== null) {
       await this.oweLayers(LAYER_ROLES);
-      // Applied in this drain, not the next alarm's.
-      if (this.draining) this.again = true;
+      // Applied in this drain, not the next alarm's; once per drain, so a flapping grant can't loop it.
+      if (this.draining && !this.reowed) {
+        this.reowed = true;
+        this.again = true;
+      }
     }
   }
 
@@ -1656,8 +1659,9 @@ export class ProjectDO extends DurableObject<Env> {
       ]);
       for (const x of await nest.listSecrets()) {
         if (!x.name.startsWith(`${s.id}-`) || named.has(x.name)) continue;
-        const at = x.updated_ms ?? x.created_ms ?? 0;
-        if (now - at < SWEEP_GRACE_MS) continue;
+        // Of unknown age (a listing without times): never swept, rather than taken as new-made-long-ago.
+        const at = x.updated_ms ?? x.created_ms;
+        if (typeof at !== "number" || now - at < SWEEP_GRACE_MS) continue;
         try {
           await nest.deleteSecret(x.name);
         } catch (e) {
@@ -1837,6 +1841,7 @@ export class ProjectDO extends DurableObject<Env> {
       this.again = true;
       return this.draining;
     }
+    this.reowed = false;
     this.draining = (async () => {
       try {
         do {

@@ -143,7 +143,7 @@ export function SecretForm({ projectId, grant, editing, initial, takenEnv = [], 
               Value
             </Text>
             <Text fz="sm" c="dimmed">
-              Set{editing?.size ? `, ${editing.size} bytes` : ""}. It can't be read back, only replaced.
+              Set{editing?.size ? `, ${editing.size} bytes` : ""}. It can't be read back, only replaced. A new value reaches every agent that has the secret: to cut one off, take its role away first, wait for its layer to show Applied, then set the new value.
             </Text>
             <Row>
               <Button variant="default" size="xs" onClick={() => setReplacing(true)}>

@@ -339,6 +339,8 @@ describe("live agents", () => {
     fake.secrets.set(`${p.id}-ghost-aaaaaa`, ghost);
     fake.secrets.set(`${p.id}-young-aaaaaa`, { ...ghost, created_ms: Date.now(), updated_ms: Date.now() });
     fake.secrets.set(`${other.id}-ghost-aaaaaa`, ghost);
+    // A listing without times: of unknown age, so kept.
+    fake.secrets.set(`${p.id}-untimed-aaaaaa`, { ...ghost, created_ms: undefined, updated_ms: undefined } as unknown as typeof ghost);
     await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => {
       st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0");
     });
@@ -346,6 +348,7 @@ describe("live agents", () => {
     expect(fake.secrets.has(`${p.id}-ghost-aaaaaa`)).toBe(false);
     expect(fake.secrets.has(`${p.id}-young-aaaaaa`)).toBe(true);
     expect(fake.secrets.has(`${other.id}-ghost-aaaaaa`)).toBe(true);
+    expect(fake.secrets.has(`${p.id}-untimed-aaaaaa`)).toBe(true);
     expect(nestKey(p, "cf_token")).toBeDefined();
   });
 
