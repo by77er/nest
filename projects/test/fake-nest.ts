@@ -82,6 +82,8 @@ export class FakeNest {
   jwksFetches = 0;
   /** Failures to answer, in order, for calls whose `METHOD path` matches. */
   failures: { match: RegExp; status: number; retryable?: boolean; times: number }[] = [];
+  /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
+  holds: { match: RegExp; release: Promise<void>; reached: boolean }[] = [];
   /** Creates that are made but whose answer is lost (a 500 instead), as after a timeout. */
   lost: { match: RegExp; times: number }[] = [];
   /** Inbox posts that land but whose answer is lost (a 500), per agent. */
@@ -130,6 +132,11 @@ export class FakeNest {
     this.calls.push(call);
     if (call.auth !== `Bearer ${env.NEST_CLIENT_TOKEN}`) return nestErr(401, "unauthorized", "admin or client token required");
     const route = `${req.method} ${u.pathname}`;
+    const hold = this.holds.find((x) => !x.reached && x.match.test(route));
+    if (hold) {
+      hold.reached = true;
+      await hold.release;
+    }
     const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
     if (f) {
       f.times--;

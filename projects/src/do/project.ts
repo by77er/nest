@@ -1004,7 +1004,6 @@ export class ProjectDO extends DurableObject<Env> {
    * variables.
    */
   private async sandboxSpec(nest: Nest, role: SecretRole, key: string): Promise<StartSpec> {
-    const s = this.settings()!;
     const had = this.frozenSpec(key);
     let frozen: StartSpec;
     if (had) frozen = had;
@@ -1013,6 +1012,9 @@ export class ProjectDO extends DurableObject<Env> {
       const injectHosts = (await nest.self()).grant?.inject_hosts ?? [];
       const again = this.frozenSpec(key);
       if (again) return again;
+      // Everything else as it is now, after the await: a setting turned off meanwhile (workflows) must
+      // not freeze as it was before (`abandonWorkflowStarts` found nothing frozen to abandon).
+      const s = this.settings()!;
       const { inject, env, secrets: mine } = this.secretFeeds(role, injectHosts);
       const extras: SandboxExtras = {
         ...(inject.length ? { inject, env } : {}),
@@ -2062,13 +2064,13 @@ export class ProjectDO extends DurableObject<Env> {
         const spec = await this.sandboxSpec(nest, "worker", key);
         agent = await nest.startAgent(TEMPLATE.worker, labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
         await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
-        this.trackLayer(agent, "worker", frozen.rev);
-        this.recordHolder(agent, "worker", spec.names, spec.extras.github_push?.workflows === true);
         if (!current()) {
-          // Cancelled (or reassigned) while it was being made: it goes.
+          // Cancelled (or reassigned, or abandoned) while it was being made: it goes, with no layer or holdings kept for it.
           this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, ?, 'cancelled', ?)", agent, id, Date.now());
           return;
         }
+        this.trackLayer(agent, "worker", frozen.rev);
+        this.recordHolder(agent, "worker", spec.names, spec.extras.github_push?.workflows === true);
         this.sql.exec("UPDATE tasks SET assignee = ? WHERE id = ?", agent, id);
         this.record(id, { kind: "app", what: "assign" }, "worker", { agent });
       }
