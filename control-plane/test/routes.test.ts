@@ -3,6 +3,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import worker, { ROUTES } from "../src/index";
+import clientsDoc from "../../docs/control-plane/api/clients/README.md?raw";
 import { ADMIN, BASE, uniqueCell } from "./helpers";
 
 /** The only routes reachable without the admin token, and what proves the caller instead. */
@@ -59,6 +60,15 @@ describe("route authentication", () => {
   it("a host route refuses a missing token, and an unknown path is 404 only to the operator", async () => {
     expect((await SELF.fetch(`${BASE}/v1/hosts/gc/claim`, { method: "POST" })).status).toBe(401);
     expect((await SELF.fetch(`${BASE}/v1/nothing-here`)).status).toBe(401);
+  });
+
+  it("the clients doc's route table lists exactly the routes a client's token reaches", () => {
+    // Its rows are `| \`METHOD\` | \`/path/<param>\` | check |`, under "## Routes".
+    const section = clientsDoc.split(/^## Routes$/m)[1]!.split(/^## /m)[0]!;
+    const documented = [...section.matchAll(/^\| `([A-Z]+)` \| `([^`]+)` \|/gm)].map((m) => `${m[1]} ${m[2]}`);
+    const owner = ROUTES.filter((r) => r.auth === "owner").map((r) => `${r.method} ${r.path.replace(/:([a-z]+)/g, "<$1>")}`);
+    expect(documented.length, "a row twice").toBe(new Set(documented).size);
+    expect(new Set(documented)).toEqual(new Set(owner));
   });
 
   it("no two routes share a method and path", () => {

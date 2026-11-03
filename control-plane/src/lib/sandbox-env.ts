@@ -16,16 +16,25 @@ export const ENV_VALUE_MAX = 4096;
  * Names nest or the guest set for every process, or that change how every process runs: never a
  * spec's. `NEST_*` is nest's own (`NEST_AGENT_ID`, …); the proxy variables route egress through
  * nest-proxy; `GITHUB_TOKEN` carries the GitHub placeholder the image sets (images/guest/); the CA variables
- * say which roots a tool trusts.
+ * say which roots a tool trusts. `GIT_CONFIG*` (`GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>`,
+ * `_PARAMETERS`, `_GLOBAL`, `_SYSTEM`, `_NOSYSTEM`) is reserved whole: git reads config from it, an
+ * `http.extraHeader` or a credential helper of its own over the image's (`credential.helper nest`, in
+ * the system config).
  */
 const RESERVED = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "TERM", "HOSTNAME", "LD_PRELOAD", "LD_LIBRARY_PATH",
   "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "GITHUB_TOKEN",
+  // What git and `gh` would use over the sandbox's own GitHub credential (the placeholder nest-proxy swaps for
+  // the token minted for its push allowlist): `gh` prefers `GH_TOKEN` to `GITHUB_TOKEN`, the enterprise
+  // tokens are its others, and git asks `GIT_ASKPASS` where no helper answers. A client's value there (a
+  // literal, or its own secret's placeholder) would take the sandbox's GitHub access over.
+  "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GIT_ASKPASS",
   // Which CAs a tool trusts: the image points them at nest-proxy's root (`NODE_EXTRA_CA_CERTS`); set otherwise
   // they could only break TLS through the proxy.
   "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO"]);
 
 export const EnvName = z.string().regex(/^[A-Z_][A-Z0-9_]{0,63}$/, "an env name is 1-64 of A-Z, 0-9 and '_', not starting with a digit")
-  .refine((n) => !RESERVED.has(n) && !n.startsWith("NEST_"), "that env name is nest's or the guest's own (PATH, HOME, NEST_*, the proxy variables, GITHUB_TOKEN, …)");
+  .refine((n) => !RESERVED.has(n) && !n.startsWith("NEST_") && !n.startsWith("GIT_CONFIG"),
+    "that env name is nest's or the guest's own (PATH, HOME, NEST_*, the proxy variables, GITHUB_TOKEN, GH_TOKEN, GIT_CONFIG*, …)");
 export const EnvValue = z.string().refine((v) => new TextEncoder().encode(v).byteLength <= ENV_VALUE_MAX, `an env value is at most ${ENV_VALUE_MAX} bytes`)
   .refine((v) => !v.includes("\0"), "an env value has no NUL");
 export const SandboxEnv = z.record(EnvName, EnvValue).refine((e) => Object.keys(e).length <= ENV_MAX, `at most ${ENV_MAX} env variables`);

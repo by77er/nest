@@ -28,6 +28,24 @@ python3 -I dev/cloud-checks/brain_hosts_check.py
 
 **Leftovers after an interrupted run:** `GET /v1/admin/fleet?cell=use1` lists live sandboxes and each host's brains. Stop and destroy the ids from the last line (or the log) with the same two routes.
 
+## `new_host_check.py`
+
+A read-only look at the hosts launched since a deploy, for a change to how hosts boot (user data, the AMI, the launch template). Run it after the first launch.
+
+```bash
+CHECK_SINCE=2026-11-03T22:03:00Z python3 -I dev/cloud-checks/new_host_check.py
+```
+
+| | |
+|---|---|
+| **Settings** | `NEST_BASE_URL`, `NEST_CELL`, `AWS_REGION` (`us-east-1`), `CHECK_SINCE` (ISO 8601 UTC or epoch ms; default the last 24 h). AWS credentials that may describe instances and read their consoles |
+| **Reads** | `GET /v1/admin/fleet`; EC2 `DescribeInstances` and `GetConsoleOutput` for each launch in FleetDO's record since then |
+| **Reports** | per launch: its EC2 state, FleetDO's word (enrolled as which host, connected, or ended and why), and what its console says: the instance-store line, a user-data failure, cloud-init finishing. Then the live hosts |
+| **Passes when** | no launch ended with `enroll_timeout`, and no console shows the user data failing or unread. A launch still within its enroll window isn't judged |
+| **Creates, changes** | nothing |
+
+EC2 keeps a console's latest snapshot for a while after termination. A snapshot can lag by many minutes (`dev/measure-cut/run.sh`), so run it again when one looks empty.
+
 ## `stress.py`
 
 A stress test of a cell: many sandboxes and agents at once, timed phase by phase, with the fleet view sampled throughout so a cell's limits can be read afterwards.
