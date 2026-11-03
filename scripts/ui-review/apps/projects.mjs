@@ -139,6 +139,18 @@ export default {
     { name: "manager-trace-beginning", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, check: traceCheck, checkName: "trace", after: toTop("the beginning of the trace") },
     { name: "reviews", section: "project", path: "/projects/prj_demo/reviews" },
     { name: "reviews-trace", section: "project", path: "/projects/prj_demo/reviews", after: (p) => p.getByRole("button", { name: "Show the trace of #118" }).click(), check: traceCheck, checkName: "trace" },
+    // The Network page (README.md#network): rules per role, live agents applied, pending and failed; empty; a host refused.
+    { name: "network", section: "project", path: "/projects/prj_demo/network" },
+    { name: "network-empty", section: "project", path: "/projects/prj_demo/network", fixture: "network-empty" },
+    { name: "network-refused", section: "project", path: "/projects/prj_demo/network", full: false, after: async (p) => {
+      const role = p.locator("[data-role=manager]");
+      await role.getByLabel("Add hosts").first().click();
+      await p.getByRole("option", { name: "Custom host" }).click();
+      await role.getByLabel("Host", { exact: true }).fill("evil.example.org");
+      await role.getByRole("button", { name: "Add" }).click();
+      await role.getByRole("alert").waitFor();
+      await role.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    } },
     { name: "settings", section: "project", path: "/projects/prj_demo/settings" },
     { name: "switcher-open", section: "project", path: "/projects/prj_demo/reviews", full: false, widths: DESKTOP, after: async (p) => { await p.getByRole("button", { name: /Switch project/ }).click(); await p.keyboard.type("gad"); } },
     { name: "sidebar-drawer", section: "project", path: "/projects/prj_demo/board", full: false, widths: PHONE, after: menu },

@@ -35,9 +35,13 @@ export const Spec = z.strictObject({
 export const Chat = z.strictObject({ text: z.string().min(1).max(20000) });
 export const Answer = z.strictObject({ answer: z.string().max(20000) });
 export const Cancel = z.strictObject({ reason: Text(1000).optional() });
+/** A role's egress rules (src/network.ts checks hosts against the grant). */
+const Rule = z.strictObject({ host: z.string().min(1).max(253), ports: z.array(z.number().int().min(1).max(65_535)).min(1).max(16).optional() });
+export const Network = z.strictObject({ worker: z.array(Rule).max(64), manager: z.array(Rule).max(64) });
 
 export type CreateProjectBody = z.input<typeof CreateProject>;
 export type SettingsBody = z.input<typeof Settings>;
+export type NetworkBody = z.input<typeof Network>;
 export type CreateTaskBody = z.input<typeof CreateTask>;
 export type UpdateTaskBody = z.input<typeof UpdateTask>;
 export type ChatBody = z.input<typeof Chat>;

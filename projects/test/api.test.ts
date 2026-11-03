@@ -364,11 +364,14 @@ describe("the catalog sync", () => {
     await api(token, "POST", "/api/admin/sync");
     const cap = (n: string) => fake.catalog.get(`capabilities/projects/${n}`) as { mcp: { url: string; tools: string[]; read_only: string[] } };
     for (const n of ["board", "task", "review"]) expect(cap(n).mcp.url).toBe(`${APP}/mcp/${n}`);
-    expect(cap("board").mcp.read_only.sort()).toEqual(["get_task", "list_tasks"]);
+    expect(cap("board").mcp.read_only.sort()).toEqual(["get_task", "list_tasks", "list_waits"]);
     const tmpl = (n: string) => fake.catalog.get(`templates/projects/${n}`) as { capabilities: string[]; hands: string; credential: string };
     expect(tmpl("manager").capabilities).toContain("projects/board");
     expect(tmpl("worker").capabilities).toContain("projects/task");
     expect(tmpl("reviewer").capabilities).toContain("projects/review");
     expect(tmpl("worker").capabilities).not.toContain("projects/board");
+    // nest's timers are the manager's only (README.md#waiting).
+    expect(tmpl("manager").capabilities).toContain("timers");
+    for (const n of ["worker", "reviewer"]) expect(tmpl(n).capabilities).not.toContain("timers");
   });
 });

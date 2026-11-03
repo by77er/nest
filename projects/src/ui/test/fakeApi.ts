@@ -3,7 +3,7 @@
 // of every write the page made.
 
 import { type TaskEvent, transition } from "../../tasks";
-import type { Ask, Attention, ChatMessage, HistoryRow, Job, ManagerStatus, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
+import type { Ask, Attention, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
 
 export interface Write {
   method: string;
@@ -45,6 +45,8 @@ export class FakeApi {
   asks: Ask[] = [];
   sync: SyncState | null = null;
   reviews: Job[] = [];
+  waits: Waits = { pending: [], recent: [] };
+  network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443] }] };
   manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
   readonly writes: Write[] = [];
   /** Answers to give instead, by `METHOD path` pattern, once each. */
@@ -119,6 +121,13 @@ export class FakeApi {
       case "POST attach":
         this.manager = { ...this.manager, phase: "starting", error: null };
         return json(p.settings);
+      case "GET waits":
+        return json(this.waits);
+      case "GET network":
+        return json(this.network);
+      case "PUT network":
+        this.network = { ...this.network, rules: body, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
+        return json(this.network);
       case "GET reviews":
         return json(this.reviews);
       case "GET chat":

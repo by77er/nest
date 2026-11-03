@@ -56,7 +56,11 @@ export class FakeNest {
   githubApp: { app_id: number; app_slug: string } | null = { app_id: GH_APP_ID, app_slug: "nest-test" };
   readonly calls: Call[] = [];
   readonly agents = new Map<string, FakeAgent>();
-  readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean }>();
+  readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean; layer: { egress: { allow: unknown[] }; inject: unknown[]; env: Record<string, string> } }>();
+  /** The grant's `egress_hosts` (docs/control-plane/api/clients/#egress), as `GET /v1/clients/self` answers it. */
+  egressHosts: string[] = ["registry.npmjs.org", "nodejs.org", "*.pythonhosted.org", "pypi.org"];
+  /** The operator's base rules, as each sandbox's effective policy shows them. */
+  baseRules: { host: string; ports: number[] }[] = [{ host: "github.com", ports: [443] }];
   readonly inbox: { agent: string; text: string; from?: string; request_id?: string }[] = [];
   readonly catalog = new Map<string, unknown>();
   readonly answers: { agent: string; ask: string; answer: string }[] = [];
@@ -153,10 +157,32 @@ export class FakeNest {
     let m: RegExpMatchArray | null;
     const r = `${req.method} ${u.pathname}`;
     if (r === "POST /v1/sandboxes") {
-      const s = { sandbox: id("sbx_"), owner: CLIENT, labels: call.body.labels ?? {}, ended: false };
+      // Its client layer starts as its create's egress, bindings and env (docs/control-plane/api/clients/#the-client-layer).
+      const s = {
+        sandbox: id("sbx_"), owner: CLIENT, labels: call.body.labels ?? {}, ended: false,
+        layer: { egress: { allow: call.body.egress?.allow ?? [] }, inject: call.body.inject ?? [], env: call.body.env ?? {} },
+      };
       this.sandboxes.set(s.sandbox, s);
       return json(202, { sandbox: s.sandbox, cell: call.body.cell, labels: s.labels, host: null });
     }
+    if ((m = u.pathname.match(/^\/v1\/sandboxes\/(sbx_[A-Za-z0-9]+)\/(client-policy|policy)$/))) {
+      const sb = this.sandboxes.get(m[1]!);
+      if (!sb || sb.owner !== CLIENT) return nestErr(404, "unknown_sandbox", "unknown sandbox");
+      if (sb.ended) return nestErr(409, "forbidden", "sandbox is destroyed");
+      if (m[2] === "policy" && req.method === "GET") {
+        return json(200, { version: 1, allow: [...this.baseRules.map((b) => ({ ...b, layer: "base" })), ...(sb.layer.egress.allow as { host: string }[]).map((x) => ({ ...x, layer: "workstream" }))], passthrough: [] });
+      }
+      if (req.method === "GET") return json(200, sb.layer);
+      if (req.method === "PUT") {
+        // nest's checks: the whole layer replaced, its egress within the grant's egress_hosts.
+        const allow = (call.body?.egress?.allow ?? []) as { host: string }[];
+        const outside = allow.filter((x) => !this.egressHosts.some((h) => h === x.host || (h.startsWith("*.") && x.host.endsWith(h.slice(1)))));
+        if (outside.length) return nestErr(403, "forbidden", `egress host ${outside[0]!.host} is outside the grant`);
+        sb.layer = { egress: { allow }, inject: call.body?.inject ?? [], env: call.body?.env ?? {} };
+        return json(200, { version: 2 });
+      }
+    }
+    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, grant: { egress_hosts: this.egressHosts } });
     if (r === "GET /v1/sandboxes") {
       const rows = [...this.sandboxes.values()].filter((s) => !s.ended && labelsMatch(s.labels));
       return json(200, { sandboxes: rows.map((s) => ({ sandbox: s.sandbox, cell: CELL, client: CLIENT, owner: s.owner, labels: s.labels, created_ms: 1, ended_ms: null })), next_cursor: null });
@@ -249,6 +275,7 @@ export class FakeNest {
     return {
       agent: a.agent, owner: a.owner, client: a.client, labels: a.labels, state: a.ended ? "ended" : state, template: a.template,
       host: a.ended || state === "starting" ? null : "bh_1", capacity_waits: a.capacityWaits ?? 0,
+      hands: a.sandbox ? { sandbox: a.sandbox } : null,
       ...(a.ended ? { ended: { ms: 1, by: "client", reason: "stopped" } } : {}),
     };
   }

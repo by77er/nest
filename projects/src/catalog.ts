@@ -32,6 +32,7 @@ export const PROMPTS = {
     "You can't push to the repo or open PRs (nest refuses your sandbox's writes); workers do. Keep tasks small enough for one PR each.",
     "Block a task with block_task only when it waits on the owner: a decision only they can make, or credentials or access no agent can get. Say exactly what you need. Never block for anything you or a worker could resolve: research it, decide it from the repo's docs, or spec around it.",
     "You are told when a worker blocks its task, and when the owner answers. Unblock a task with unblock_task once it's resolved another way.",
+    "To wait for something, don't poll and don't keep a turn open: call await_task (a task reaching a state), await_pr (a PR merging, finishing its review, or closing) or await_reply (the owner answering), with a timeout, then end your turn. You are woken by whichever comes first: a message saying it happened, or that it timed out. Each answers at once if it holds already. To come back to something at a time of your own (\"check again in two hours\"), set a timer with timer_set and end your turn; it wakes you with its note.",
   ].join("\n"),
   worker: [
     "You are a worker on a task board. You have one task: read it with projects-task get_task.",
@@ -74,10 +75,11 @@ function mcpCapability(base: string, server: Server, prompt: string) {
  * (`repos`, the worker's) or only `read` (`read_repos`: the manager and the reviewer, which nest refuses
  * to push). Each spawn narrows it to its own project's (`overrides.repos` or `overrides.read_repos`).
  */
-const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read", subagents = false) => ({
+const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read", subagents = false, timers = false) => ({
   // `nest` allows the nest tools without a prompt and `hands` gives the sandbox's tools: the operator's
-  // capabilities, which a client's templates may name.
-  capabilities: ["nest", "hands", ...(subagents ? WORKER_EXTRA.capabilities : []), `${NAMESPACE}/${capability}`],
+  // capabilities, which a client's templates may name. `timers` (nest's timer_set, timer_cancel and
+  // timer_list) is the manager's only: workers have nothing to wait for that their task doesn't bring.
+  capabilities: ["nest", "hands", ...(subagents ? WORKER_EXTRA.capabilities : []), ...(timers ? ["timers"] : []), `${NAMESPACE}/${capability}`],
   launch: { builtin_tools: [...BUILTIN_TOOLS, ...(subagents ? WORKER_EXTRA.builtin_tools : [])], system_prompt: { mode: "append", text: prompt } },
   hands: "required",
   credential: CREDENTIAL,
@@ -99,7 +101,7 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
       [`${NAMESPACE}/review`]: mcpCapability(base, "review", "The projects-review tools read the PR you review and take your verdict."),
     },
     templates: {
-      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read"),
+      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read", false, true),
       [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push", true),
       [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, sorted, "read"),
     },

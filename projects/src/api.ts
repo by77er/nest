@@ -6,7 +6,8 @@ import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { NestError, nestFrom } from "./nest";
-import { Answer, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
+import { Answer, Cancel, Chat, CreateProject, CreateTask, Network, Settings, Spec, UpdateTask } from "./requests";
+import { NETWORK_ROLES, normalizeRules, rulesProblems } from "./network";
 import type { Result } from "./sql";
 import { proxyTrace, proxyTraceHistory } from "./trace";
 
@@ -181,9 +182,59 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const b = await body(req, Answer);
       return b.ok ? done(await p.answerAsk(ask, b.value.answer)) : b.res;
     }
+    case "GET waits":
+      return done(await p.waits());
+    case "GET network":
+      return networkView(env, p);
+    case "PUT network": {
+      const b = await body(req, Network);
+      if (!b.ok) return b.res;
+      const g = await egressHostsOf(env);
+      if (!g.ok) return err(g.status, g.error);
+      const problems = Object.fromEntries(NETWORK_ROLES.flatMap((role) => Object.entries(rulesProblems(normalizeRules(b.value[role]), g.value)).map(([k, v]) => [`${role}.${k}`, v])));
+      if (Object.keys(problems).length) {
+        const outside = Object.values(problems).some((v) => v.includes("must widen"));
+        return json({ error: Object.values(problems).join("; "), problems }, outside ? 403 : 400);
+      }
+      const r = await p.setNetwork(b.value);
+      return r.ok ? networkView(env, p, r.value) : done(r);
+    }
     case "GET errors":
       return done(await p.errors());
     default:
       return err(404, "unknown route");
   }
+}
+
+/** The grant's `egress_hosts` (`GET /v1/clients/self`): the ceiling of every network rule. */
+async function egressHostsOf(env: Env): Promise<Result<string[]>> {
+  const nest = nestFrom(env);
+  if (!nest) return { ok: false, status: 503, error: "NEST_CLIENT_TOKEN is not set" };
+  try {
+    return { ok: true, value: (await nest.self()).grant?.egress_hosts ?? [] };
+  } catch (e) {
+    return { ok: false, status: 502, error: `nest's grant couldn't be read: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/**
+ * The Network page's view: the rules and each live agent's layer (ProjectDO's), the grant's ceiling,
+ * and the operator's base rules as the manager's sandbox's effective policy shows them (a client may
+ * read its own sandboxes' policy; null until the manager runs, or when nest can't be read).
+ */
+async function networkView(env: Env, p: ReturnType<typeof project>, have?: Awaited<ReturnType<ReturnType<typeof project>["network"]>> extends Result<infer T> ? T : never): Promise<Response> {
+  const mine = have ? { ok: true as const, value: have } : await p.network();
+  if (!mine.ok) return err(mine.status, mine.error);
+  const [grant, sandbox] = await Promise.all([egressHostsOf(env), p.managerSandbox()]);
+  let base: { host: string; ports?: number[] }[] | null = null;
+  const nest = nestFrom(env);
+  if (nest && sandbox) {
+    try {
+      const policy = await nest.sandboxPolicy(sandbox);
+      base = (policy.allow ?? []).filter((r) => r.layer === "base").map((r) => ({ host: r.host, ...(r.ports ? { ports: r.ports } : {}) }));
+    } catch {
+      base = null;
+    }
+  }
+  return json({ ...mine.value, egress_hosts: grant.ok ? grant.value : null, base });
 }

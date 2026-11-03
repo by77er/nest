@@ -25,3 +25,21 @@ export interface SyncResult {
   written: string[];
   repos: string[];
 }
+
+export type { Wait, WaitKind, WaitOutcome } from "../../waits";
+export type { LayerStatus } from "../../do/project";
+export type { EgressRule, NetworkRole, RoleRules } from "../../network";
+export type { NetworkBody } from "../../requests";
+/** `GET /api/projects/<id>/waits`. */
+export interface Waits {
+  pending: import("../../waits").Wait[];
+  recent: import("../../waits").Wait[];
+}
+/** `GET /api/projects/<id>/network`: the rules, each live agent's layer, the grant's ceiling and the operator's base rules. */
+export interface NetworkView {
+  rules: import("../../network").RoleRules;
+  rev: number;
+  agents: import("../../do/project").LayerStatus[];
+  egress_hosts: string[] | null;
+  base: import("../../network").EgressRule[] | null;
+}

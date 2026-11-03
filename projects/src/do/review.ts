@@ -81,6 +81,11 @@ const MIGRATIONS = [
     "CREATE TABLE stops (agent TEXT PRIMARY KEY, reason TEXT NOT NULL, next_ms INTEGER NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, error TEXT)",
     "CREATE TABLE mcp_calls (key TEXT PRIMARY KEY, result TEXT NOT NULL, at_ms INTEGER NOT NULL)",
   ],
+  [
+    // Reviews that ended (a verdict, or failed), owed to ProjectDO for the manager's waits on them
+    // (README.md#waiting): each told once, retried from the alarm until it's taken.
+    "CREATE TABLE ended (pr INTEGER NOT NULL, sha TEXT NOT NULL, state TEXT NOT NULL, conclusion TEXT, next_ms INTEGER NOT NULL, PRIMARY KEY (pr, sha))",
+  ],
 ] as const;
 
 type Row = Record<string, SqlStorageValue>;
@@ -238,6 +243,10 @@ export class ReviewDO extends DurableObject<Env> {
     this.sql.exec("UPDATE jobs SET state = ?, next_ms = NULL, error = COALESCE(?, error), updated_ms = ? WHERE pr = ? AND sha = ?", state, error ?? null, Date.now(), j.pr, j.sha);
     if (j.check_run !== null) this.oweCheck(j.check_run as number, { status: "completed", conclusion, completed_at: new Date().toISOString(), output });
     if (j.agent !== null) this.oweStop(j.agent as string, state);
+    // A review that finished (or failed for good) is owed to the project's waits; superseded and closed aren't ends of the PR's review.
+    if (state === "done" || state === "failed") {
+      this.sql.exec("INSERT OR REPLACE INTO ended (pr, sha, state, conclusion, next_ms) VALUES (?, ?, ?, ?, ?)", j.pr, j.sha, state, conclusion, Date.now());
+    }
   }
 
   private oweCheck(checkRun: number, body: CheckRunUpdate): void {
@@ -343,7 +352,8 @@ export class ReviewDO extends DurableObject<Env> {
         SELECT next_ms AS t FROM jobs WHERE state = 'running' AND next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM jobs WHERE state = 'queued' AND next_ms IS NOT NULL AND ? = 1
         UNION ALL SELECT next_ms FROM check_updates
-        UNION ALL SELECT next_ms FROM stops)`,
+        UNION ALL SELECT next_ms FROM stops
+        UNION ALL SELECT next_ms FROM ended)`,
       this.underCap() ? 1 : 0,
     ).one().t;
     if (next === null) return;
@@ -376,6 +386,16 @@ export class ReviewDO extends DurableObject<Env> {
   }
 
   private async drainOnce(): Promise<void> {
+    // Ended reviews to the project (nothing of nest's or GitHub's needed): each until ProjectDO took it.
+    const project = this.setting("project");
+    for (const e of project ? this.sql.exec("SELECT * FROM ended WHERE next_ms <= ?", Date.now()).toArray() : []) {
+      try {
+        await projectStub(this.env, project!).onReviewEnded({ pr: e.pr as number, sha: e.sha as string, state: e.state as string, conclusion: (e.conclusion as string | null) ?? null });
+        this.sql.exec("DELETE FROM ended WHERE pr = ? AND sha = ? AND state = ?", e.pr, e.sha, e.state);
+      } catch {
+        this.sql.exec("UPDATE ended SET next_ms = ? WHERE pr = ? AND sha = ?", Date.now() + 30_000, e.pr, e.sha);
+      }
+    }
     const nest = nestFrom(this.env);
     const repo = this.setting("repo");
     if (!nest || !repo) return;
