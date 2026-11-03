@@ -53,7 +53,7 @@ describe("the board", () => {
   it("puts every state in its column, its badge in its semantic color, cancelled behind the switch", async () => {
     const api = new FakeApi();
     api.tasks = (Object.keys(EXPECTED) as TaskState[]).map((state) => task({ title: `a ${state} task`, state }));
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/board", api);
 
     await screen.findByRole("article", { name: "a draft task" });
     expect(screen.queryByRole("article", { name: "a cancelled task" })).toBeNull();
@@ -79,7 +79,7 @@ describe("the board", () => {
     const plain = task({ title: "plain", state: "in_review" });
     api.tasks = [t, plain];
     api.asks = [ask({ task: t.id, question: "May I?" }), ask({ task: plain.id, answered_ms: 1 })];
-    renderApp("/projects/prj_one", api);
+    renderApp("/projects/prj_one/board", api);
 
     const card = await screen.findByRole("article", { name: "with markers" });
     expect(within(card).getByText("Tainted")).toBeInTheDocument();
@@ -97,7 +97,7 @@ describe("the board", () => {
   it("shows an empty board's next step, and a failed load with a way to retry", async () => {
     const api = new FakeApi();
     api.fail(/^GET \/api\/projects\/prj_one\/tasks$/, 500, "ProjectDO is unavailable");
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/board", api);
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("The board couldn't be loaded");

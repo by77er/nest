@@ -5,16 +5,25 @@ import { Box, Group, Stack, Title } from "@mantine/core";
 import type { ReactNode } from "react";
 
 /**
- * `measure` keeps the content to a line length, centred in the content area (balance: no empty half):
- * `form` (forms, prose: 45rem) or `reading` (a conversation: about 70 characters). The header is inside
- * the column, so the h1 and the content share one left edge.
+ * The frame never moves: every page of a section has this one container (max width, gutters), so its
+ * header and edges stay put as you switch views; only the content changes. Narrow content goes in a
+ * `Measure`, left-aligned to the frame, with related context beside it (`WithContext`).
  */
-export function Page({ children, measure }: { children: ReactNode; measure?: "form" | "reading" }) {
+export function Page({ children }: { children: ReactNode }) {
   return (
     <Box maw="var(--nest-page-max)" mx="auto" px={{ base: "lg", sm: "xl", md: "2xl" }} py={{ base: "lg", sm: "xl", md: "2xl" }} data-ds="page">
-      <Stack gap="2xl" maw={measure === "form" ? "var(--nest-measure)" : measure === "reading" ? "var(--nest-reading-measure)" : undefined} mx={measure ? "auto" : undefined} data-measure={measure}>
+      <Stack gap="2xl" data-ds="page-content">
         {children}
       </Stack>
+    </Box>
+  );
+}
+
+/** Content kept to a line length (`reading`: a conversation; `form`: a form or prose), on the frame's left edge. */
+export function Measure({ children, type }: { children: ReactNode; type: "reading" | "form" }) {
+  return (
+    <Box maw={type === "form" ? "var(--nest-measure)" : "var(--nest-reading-measure)"} w="100%" data-ds="measure" data-measure={type}>
+      {children}
     </Box>
   );
 }

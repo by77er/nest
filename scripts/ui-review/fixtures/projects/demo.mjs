@@ -3,7 +3,9 @@
 // with tasks' attached PRs (open, merged, a fork's, one closed and detached) and their dependencies
 // (a task waiting on two of three, one waited on by two, one whose blockers are all done).
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
-// projects), "error" (the API fails) or "connecting" (a trace that sends nothing yet). Traces come from trace.mjs: history pages plus a live ring.
+// projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
+// message with every kind of rich content), "chat-empty" or "chat-long" (thirty messages). Traces come
+// from trace.mjs: history pages plus a live ring.
 
 import { trace } from "./trace.mjs";
 
@@ -111,6 +113,47 @@ export function data(variant = "demo", now = Date.now()) {
       { at_ms: now - 30_000, actor: "agt_mgr7k2", action: "blocked", detail: JSON.stringify({ reason: "Needs a product decision: which columns?" }), tainted: false },
     ],
   };
+  // Review-only variants: a manager message with every kind of rich content, an empty chat, a long chat.
+  const SVG = [
+    '```svg',
+    '<svg xmlns="http://www.w3.org/2000/svg" width="420" height="140" viewBox="0 0 420 140"><title>Search pipeline</title>',
+    '<rect x="10" y="40" width="110" height="50" rx="6" fill="none" stroke="#333"/><text x="65" y="70" text-anchor="middle" font-family="sans-serif" font-size="14">Query</text>',
+    '<line x1="120" y1="65" x2="160" y2="65" stroke="#333"/><polygon points="160,60 170,65 160,70" fill="#333"/>',
+    '<rect x="170" y="40" width="110" height="50" rx="6" fill="#e7f0ff" stroke="#3b6fc0"/><text x="225" y="70" text-anchor="middle" font-family="sans-serif" font-size="14">Tag index</text>',
+    '<line x1="280" y1="65" x2="300" y2="65" stroke="#333"/><polygon points="300,60 310,65 300,70" fill="#333"/>',
+    '<rect x="310" y="40" width="100" height="50" rx="6" fill="none" stroke="#333"/><text x="360" y="70" text-anchor="middle" font-family="sans-serif" font-size="14">Results</text>',
+    '</svg>',
+    '```',
+  ].join("\n");
+  const RICH = [
+    "## Search plan",
+    "I split the search work into three tasks. task:tsk_demo7 is in review; [the flaky test](task:tsk_demo5) blocks the next release, and task:tsk_demo99 isn't on this board.",
+    "### Where things stand",
+    "```tasks\ntsk_demo7 — the parser and index\ntsk_demo5: needs a fixture bucket\ntsk_demo6\n```",
+    "| Task | Estimate | Risk |\n|---|---:|---|\n| Tag index | 2 d | low |\n| Query parser | 3 d | medium |\n| Pagination | 1 d | low |",
+    "The ranking is $s(t) = \\sum_{i=1}^{n} w_i \\cdot \\mathrm{tf}(t_i)$, and the cut-off:",
+    "$$\nP(\\text{match}) = \\frac{e^{\\beta x}}{1 + e^{\\beta x}}, \\quad \\beta \\approx 0.8\n$$",
+    "```ts\nexport async function searchByTag(tag: string, page = 0): Promise<Gadget[]> {\n  return db.query(\"select * from gadgets where tags @> $1 limit 50 offset $2\", [[tag], page * 50]);\n}\n```",
+    SVG,
+    "- [x] Spec the tag index\n- [ ] Decide prefix vs whole-word matching\n- [ ] Load-test on staging",
+    "> The staging data has 40k gadgets; p95 is 180 ms today.",
+    "See the [Postgres GIN docs](https://www.postgresql.org/docs/current/gin.html) and the mock-up: ![search mock-up](https://example.com/mockup.png)",
+  ].join("\n\n");
+  const chatFor = () => {
+    if (variant === "chat-empty") return [];
+    if (variant === "rich") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: RICH, delivered: true, error: null }];
+    if (variant === "chat-long") {
+      const out = [];
+      for (let k = 0; k < 30; k++) {
+        const owner = k % 2 === 0;
+        out.push({ seq: k + 1, at_ms: now - (30 - k) * 600_000, sender: k === 13 ? "app" : owner ? "owner" : "manager",
+          text: k === 13 ? "The manager restarted (upgrade)." : owner ? `Message ${k + 1}: what is the status of the ${["search", "export", "auth", "cache"][k % 4]} work? Keep it short, please.` : `Reply ${k + 1}: **${["search", "export", "auth", "cache"][k % 4]}** is moving. task:tsk_demo${(k % 8) + 1} is the one to watch; I'll report back when it lands, with the PR and the review's verdict.`,
+          delivered: true, error: null });
+      }
+      return out;
+    }
+    return chat;
+  };
   const detail = (id) => byId[id] && { ...byId[id], history: history[id] ?? [{ at_ms: now - 7_200_000, actor: "owner", action: "created", detail: JSON.stringify({ title: byId[id].title }), tainted: false }] };
   const settings = {
     id: "prj_demo", name, repo, auto_assign: true, max_workers: 2, manager: "agt_mgr7k2", manager_error: null, created_ms: now - DAY * 3,
@@ -146,7 +189,7 @@ export function data(variant = "demo", now = Date.now()) {
     if (path === "/admin/sync" && method === "POST") return [200, { written: sync.written.slice(0, 2), repos: ["by77er/gadgets"] }];
     if (!path.startsWith("/projects/prj_demo")) return [404, { error: "unknown project" }];
     const q = path.slice("/projects/prj_demo".length);
-    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chat, "/reviews": reviews, "/prs/open": openPrs, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
+    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
     if (q in routes) return [200, routes[q]];
     // A task's detail: each task's own, with its history (tsk_demo3 has no worker).
     if (q.startsWith("/tasks/")) {

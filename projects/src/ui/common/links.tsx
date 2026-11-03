@@ -4,6 +4,7 @@
 import { Anchor, type AnchorProps, Button, type ButtonProps } from "@mantine/core";
 import { createLink, type LinkComponent } from "@tanstack/react-router";
 import { type AnchorHTMLAttributes, forwardRef } from "react";
+import { BadgeAnchor } from "../layout/Layouts";
 import { NavRow } from "../layout/Nav";
 import { TaskCardTitleAnchor, TaskChipAnchor } from "../layout/Rich";
 
@@ -16,6 +17,10 @@ type ButtonBaseProps = ButtonProps & Omit<AnchorHTMLAttributes<HTMLAnchorElement
 const ButtonBase = forwardRef<HTMLAnchorElement, ButtonBaseProps>((props, ref) => <Button component="a" ref={ref} {...props} />);
 const CreatedButtonLink = createLink(ButtonBase);
 export const ButtonLink: LinkComponent<typeof ButtonBase> = (props) => <CreatedButtonLink preload="intent" {...props} />;
+
+// A badge that goes somewhere (a project's "needs you", to its Board): the BadgeAnchor primitive.
+const CreatedBadgeLink = createLink(BadgeAnchor);
+export const BadgeLink: LinkComponent<typeof BadgeAnchor> = (props) => <CreatedBadgeLink preload="intent" {...props} />;
 
 // A sidebar place: the NavRow primitive as a router link, `aria-current="page"` while its route is active
 // (which is all the active style keys on).

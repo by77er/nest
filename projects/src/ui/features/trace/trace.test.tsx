@@ -262,7 +262,7 @@ describe("the mounts", () => {
     const api = new FakeApi();
     const t = task({ state: "in_progress", assignee: "agt_worker1" });
     api.tasks = [t];
-    const { user } = renderApp(`/projects/prj_one?task=${t.id}`, api);
+    const { user } = renderApp(`/projects/prj_one/board?task=${t.id}`, api);
     const drawer = await screen.findByRole("dialog", { name: "Task" });
     await user.click(await within(drawer).findByRole("tab", { name: "Trace" }));
     await within(drawer).findByRole("heading", { name: "Worker's trace" });
@@ -274,7 +274,7 @@ describe("the mounts", () => {
     const api = new FakeApi();
     const t = task({ state: "ready" });
     api.tasks = [t];
-    renderApp(`/projects/prj_one?task=${t.id}`, api);
+    renderApp(`/projects/prj_one/board?task=${t.id}`, api);
     const drawer = await screen.findByRole("dialog", { name: "Task" });
     await within(drawer).findByRole("heading", { name: "Description" });
     expect(within(drawer).queryByRole("tab")).toBeNull();

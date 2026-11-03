@@ -9,7 +9,8 @@ import type { Task } from "../../api/types";
 import { icon, Stack, TriggerBadge, weight } from "../../layout";
 import { STATE_LABEL } from "../../status";
 
-export function WaitingBadge({ task, size = "sm" }: { task: Task; size?: "sm" | "md" }) {
+/** `plainOnTouch` on a card: plain status on a phone (the card opens the drawer, which lists them). */
+export function WaitingBadge({ task, size = "sm", plainOnTouch = false }: { task: Task; size?: "sm" | "md"; plainOnTouch?: boolean }) {
   const waiting = task.blocked_by.filter((b) => task.waiting_on.includes(b.id));
   if (waiting.length === 0) return null;
   return (
@@ -32,7 +33,7 @@ export function WaitingBadge({ task, size = "sm" }: { task: Task; size?: "sm" | 
       maw="var(--nest-side-panel)"
       events={{ hover: true, focus: true, touch: true }}
     >
-      <TriggerBadge size={size} color="gray" variant="light" leftSection={<IconHourglass size={icon.sm} aria-hidden />} data-marker="waiting" aria-label={`Waiting on ${waiting.length}: ${waiting.map((b) => b.title).join(", ")}`}>
+      <TriggerBadge plainOnTouch={plainOnTouch} size={size} color="gray" variant="light" leftSection={<IconHourglass size={icon.sm} aria-hidden />} data-marker="waiting" aria-label={`Waiting on ${waiting.length}: ${waiting.map((b) => b.title).join(", ")}`}>
         Waiting on {waiting.length}
       </TriggerBadge>
     </Tooltip>

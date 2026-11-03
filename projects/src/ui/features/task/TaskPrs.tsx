@@ -11,7 +11,7 @@ import { prNumberOf } from "../../../prs";
 import { useAttachPr, useDetachPr, useOpenPrs, useReviews, useTasks } from "../../api/queries";
 import type { Job, Task, TaskPr } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { Grow, MetaItem, Picker, type PickerItem, Row, RowAction, Section, Stack, TriggerBadge, weight } from "../../layout";
+import { Grow, MetaItem, MetaRow, Picker, Row, RowAction, Section, Stack, TriggerBadge, type PickerItem, weight } from "../../layout";
 import { TERMINAL } from "../../../tasks";
 import { JobState } from "../reviews/ReviewsPage";
 
@@ -78,10 +78,13 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
             Fork
           </Badge>
         )}
+      </Row>
+      {/* Three lines: its number and title, its badges, who attached it. */}
+      <MetaRow>
         <MetaItem title={exact(pr.attached_ms)}>
           Attached by {pr.attached_by === "owner" ? "you" : pr.attached_by.startsWith("app:") ? "its branch" : pr.attached_by} {ago(pr.attached_ms)}
         </MetaItem>
-      </Row>
+      </MetaRow>
     </Stack>
   );
 }
@@ -133,7 +136,8 @@ export function TaskPrs({ projectId, repo, task }: { projectId: string; repo: st
   const focusAttach = () => requestAnimationFrame(() => attach.current?.focus());
   return (
     <Section title="Pull requests" count={task.prs.length} region={false} actions={!TERMINAL.has(task.state) && <AttachPr projectId={projectId} repo={repo} task={task} buttonRef={attach} />}>
-      <Stack gap="lg">
+      {/* Each PR's lines stay tight; PRs are 2xl apart, more than twice the gap within one, on touch too. */}
+      <Stack gap="2xl">
         {task.prs.length === 0 ? (
           <Text fz="sm" c="dimmed">
             None attached. Its worker's PR attaches itself; the task is done once all attached PRs have merged.

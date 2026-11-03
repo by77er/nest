@@ -45,7 +45,7 @@ describe("the drawer's history", () => {
     const t = task({ title: "Search", state: "in_review", pr: 118 });
     api.tasks = [t];
     api.history.set(t.id, [row("created", { title: "Search" }), row("pr_opened", { pr: 118 }, "agt_w1")]);
-    const { user } = renderApp(`/projects/prj_one?task=${t.id}`, api);
+    const { user } = renderApp(`/projects/prj_one/board?task=${t.id}`, api);
 
     const entry = (await screen.findByText("PR #118 opened")).closest(".mantine-Timeline-item") as HTMLElement;
     expect(entry).toHaveTextContent("agt_w1");

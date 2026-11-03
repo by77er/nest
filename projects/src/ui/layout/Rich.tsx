@@ -40,7 +40,7 @@ export function SvgFigure({ url, source, label }: { url: string; source: string;
   const [showSource, source_] = useDisclosure(false);
   return (
     <Stack gap="xs" align="flex-start" data-ds="svg-figure">
-      <button type="button" className={classes.figure} onClick={modal.open} aria-label={`${label}: open larger`}>
+      <button type="button" className={classes.figure} onClick={modal.open} data-ds="figure-canvas" aria-label={`${label}: open larger`}>
         <img className={classes.image} src={url} alt={label} />
       </button>
       <Button variant="subtle" color="gray" size="compact-xs" onClick={source_.toggle} aria-expanded={showSource}>
@@ -52,7 +52,7 @@ export function SvgFigure({ url, source, label }: { url: string; source: string;
         </Code>
       )}
       <Modal opened={opened} onClose={modal.close} title={label} size="min(94vw, 68rem)" centered>
-        <div className={classes.canvas}>
+        <div className={classes.canvas} data-ds="figure-canvas">
           <img className={classes.large} src={url} alt={label} />
         </div>
       </Modal>

@@ -71,6 +71,6 @@ describe("the Reviews page", () => {
     }
     // Tainted isn't a verdict: the neutral outline.
     const tainted = screen.getByText("Tainted").closest(".mantine-Badge-root")!;
-    expect(tainted.getAttribute("style")).toContain("--mantine-color-gray-");
+    expect(tainted.getAttribute("style")).toContain("--badge-color: var(--nest-muted)");
   });
 });

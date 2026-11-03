@@ -5,6 +5,7 @@
 //   node scripts/ui-review/selftest.mjs
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
+import { inkHeaderGap, inkPrs, inkTrace } from "./apps/projects.mjs";
 import { measure } from "./checks.mjs";
 import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
 
@@ -15,13 +16,16 @@ const sel = {
   containers: ["[data-ds=panel]"],
   nav: { rows: "[data-ds=nav-row]", brand: "#brand", active: "[aria-current=page]" },
   viewportOnly: false,
+  content: { root: "[data-ds=rich]", minHeading: 4, figures: "[data-ds=figure-canvas]" },
 };
 
 /** A small app page; each `bad` key plants one violation. */
 const html = (bad = {}) => `<!doctype html><html><head><style>
   body { margin: 0; font: 14px/20px sans-serif; background: #fafafa; color: #212529; display: flex; }
   nav { width: 200px; padding: 16px; } #brand { margin-left: 10px; font-size: 12px; }
-  a { display: flex; gap: 8px; padding: 0 8px; border-left: 2px solid transparent; color: #212529; text-decoration: none; }
+  a { display: flex; align-items: center; min-height: 44px; gap: 8px; padding: 0 8px; border-left: 2px solid transparent; color: #212529; text-decoration: none; }
+  p a { display: inline; min-height: 0; padding: 0; }
+  .prose { line-height: ${bad.tightLine ? "16px" : "24px"}; }
   a span:first-child { width: 20px; }
   a[aria-current=page] { background: ${bad.nav ? "#3b6fc0" : "#f1f3f5"}; border-left-color: #212529; }
   [data-ds=page] { flex: 1; padding: 32px; min-width: 0; }
@@ -29,7 +33,10 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
   [data-ds=panel] { border: 1px solid #e9ecef; padding: 16px; background: #fff; }
   .cut { width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .faint { color: ${bad.contrast ? "#c8c8c8" : "#666e76"}; }
-  .chip { position: relative; font: inherit; border: 1px solid #ced4da; background: #fff; color: #212529; padding: 2px 8px; }
+  [data-ds=rich] h4 { font-size: ${bad.small ? "11px" : "inherit"}; font-weight: 600; }
+  [data-ds=figure-canvas] { width: 120px; height: 40px; border: 1px solid #dee2e6; background: ${bad.figure ? "#1a1b1e" : "#ffffff"}; }
+  .chip { position: relative; font: inherit; min-height: 44px; min-width: 44px; border: 1px solid #ced4da; background: #fff; color: #212529; padding: 2px 8px; }
+  .tiny { font: inherit; padding: 0 4px; }
   .chip.reach { z-index: 1; }
   .chip.reach::before { content: ""; position: absolute; top: 0; bottom: 0; left: 0; right: -60px; }
 </style></head><body>
@@ -44,6 +51,11 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
       ${bad.clip ? '<p class="cut">A title far too long for its box</p>' : '<p class="cut">Short</p>'}
       ${bad.escape ? '<div style="width: 2000px">Wider than its panel</div>' : ""}
       <p><button class="chip ${bad.tap ? "reach" : ""}">Waiting</button> <button class="chip">Detach</button></p>
+      <p class="prose">A sentence with <a href="#">an inline link</a> in it, on a 24 px line: the inline exception.</p>
+      ${bad.tiny ? '<div><button class="tiny">Tiny</button></div>' : ""}
+      ${bad.crowded ? '<div><a href="#" style="display: block; min-height: 0; padding: 0">One</a><a href="#" style="display: block; min-height: 0; padding: 0">Two</a></div>' : ""}
+      ${bad.covered ? '<div style="position: relative"><button class="chip">Hidden</button><div style="position: absolute; inset: 0; background: rgba(255,255,255,0.01)"></div></div>' : ""}
+      <div data-ds="rich">${bad.heading ? "<h2>Plan</h2>" : "<h4>Plan</h4>"}<p>The message's text.</p><div data-ds="figure-canvas"></div></div>
     </div>
   </div></div>
 </body></html>`;
@@ -59,12 +71,31 @@ const failing = (problems) => Object.keys(problems).filter((k) => problems[k].le
 const clean = await run({});
 assert.deepEqual(failing(clean), [], `the clean page fails: ${JSON.stringify(clean)}`);
 // On touch: two neighbouring controls pass; one whose ::before reaches over the other takes its taps.
-assert.deepEqual(failing(await run({}, true)), [], "the clean page fails on touch");
+{ const t = await run({}, true); assert.deepEqual(failing(t), [], `the clean page fails on touch: ${JSON.stringify(t["hit-size"])}`); }
 const reach = await run({ tap: true }, true);
-assert.deepEqual(failing(reach), ["hit-overlap"], `a hit area over a neighbour: ${JSON.stringify(reach)}`);
+// (The neighbour is then covered at its centre too: hit-size says so.)
+assert.deepEqual(failing(reach), ["hit-overlap", "hit-size"], `a hit area over a neighbour: ${JSON.stringify(reach)}`);
 assert.match(reach["hit-overlap"][0], /a tap on <button> "Detach" at \d+,\d+ lands on <button> "Waiting"/);
 // Without touch, hit areas aren't checked.
 assert.deepEqual(failing(await run({ tap: true })), []);
+// On touch, a 20 px button standing on its own takes too few of the taps in its 44 px square; the
+// inline link in a sentence passes at 24 px.
+const tiny = await run({ tiny: true }, true);
+assert.deepEqual(failing(tiny), ["hit-size"], `a small target: ${JSON.stringify(tiny)}`);
+assert.match(tiny["hit-size"][0], /<button> "Tiny": \d+ of \d+ taps in its 44 px square/);
+assert.deepEqual(failing(await run({ tiny: true })), [], "without touch, sizes aren't checked");
+// Two links stacked 20 px apart: closer than 24 px (WCAG 2.5.8's spacing), each too small to tap.
+const crowded = await run({ crowded: true }, true);
+assert.deepEqual(failing(crowded), ["hit-size"], `crowded links: ${JSON.stringify(crowded)}`);
+assert.match(crowded["hit-size"][0], /<a> "One": 20 px from <a> "Two", closer than 24/);
+// A button covered at its centre by a plain element can't be tapped at all.
+const covered = await run({ covered: true }, true);
+assert.deepEqual(failing(covered), ["hit-size"], `a covered button: ${JSON.stringify(covered)}`);
+assert.match(covered["hit-size"][0], /<button> "Hidden": covered at its centre by <div>/);
+// An inline link on a line under 24 px fails too.
+const tight = await run({ tightLine: true }, true);
+assert.deepEqual(failing(tight), ["hit-size"], `a tight line: ${JSON.stringify(tight)}`);
+assert.match(tight["hit-size"][0], /an inline link on a 16 px line/);
 for (const [bad, checks] of [
   [{ contrast: true }, ["contrast"]],
   [{ clip: true }, ["clipping"]],
@@ -73,6 +104,9 @@ for (const [bad, checks] of [
   [{ h1: true }, ["frame"]],
   [{ nav: true }, ["contrast", "nav"]], // white-on-blue Board text is also under 4.5:1
   [{ edge: true }, ["nav"]],
+  [{ heading: true }, ["content"]],
+  [{ small: true }, ["content"]],
+  [{ figure: true }, ["content"]],
 ]) {
   const got = await run(bad);
   assert.deepEqual(failing(got), checks, `${JSON.stringify(bad)}: ${JSON.stringify(got)}`);
@@ -132,6 +166,96 @@ for (const remount of [false, true]) {
     assert.deepEqual(problems, [], "the kept tabs pass");
   }
   await p.close();
+}
+
+// hit-overlap ignores a control clipped away where the hit area meets it (a trace row scrolled out of
+// its log, under a button above the log): no tap there is meant for it. Unclipped, the same row counts.
+{
+  const clipPage = (clipped) => `<!doctype html><html><head><style>
+    body { margin: 0; font: 14px/20px sans-serif; }
+    .reach { position: absolute; top: 100px; left: 20px; min-height: 44px; min-width: 44px; z-index: 1; }
+    .reach::before { content: ""; position: absolute; top: -40px; left: 0; right: 0; bottom: 0; }
+    .log { position: absolute; top: 120px; left: 20px; width: 200px; height: 20px; ${clipped ? "overflow: hidden;" : ""} }
+    .log button { position: relative; top: -60px; min-height: 44px; }
+  </style></head><body><button class="reach">Reach</button><div class="log"><button>Row</button></div></body></html>`;
+  const overlap = async (clipped) => {
+    await page.setContent(clipPage(clipped));
+    return (await page.evaluate(measure, { ...sel, touch: true })).problems["hit-overlap"];
+  };
+  assert.deepEqual(await overlap(true), [], "a control clipped out of its scroller isn't a neighbour");
+  assert.equal((await overlap(false)).length, 1, "the same control, unclipped, is");
+  // A parent that clips only sideways (overflow-x: clip, overflow-y: visible) leaves a control sticking
+  // out below it painted and tappable: still a neighbour (the reviewer's plantclip2).
+  const xOnly = (style) => `<!doctype html><html><head><style>
+    body { margin: 0; font: 16px/20px sans-serif; }
+    .t::after { content: ""; position: absolute; inset: -30px 0; }
+  </style></head><body><div style="margin-top: 200px"><div style="${style}; height: 1px"><a href="/b" style="display: block; position: relative; width: 200px; height: 20px">B</a></div><div style="position: relative; margin-top: 24px"><a class="t" href="/a" style="position: relative; display: inline-block; width: 200px">A</a></div></div></body></html>`;
+  const overlapOf = async (style) => {
+    await page.setContent(xOnly(style));
+    return (await page.evaluate(measure, { ...sel, touch: true })).problems["hit-overlap"];
+  };
+  assert.equal((await overlapOf("overflow-x: clip; overflow-y: visible")).length, 1, "a control sticking out of a parent that clips only sideways is a neighbour");
+  assert.equal((await overlapOf("")).length, 1, "and so it is with no overflow at all");
+  // Inside a clip margin a control is still painted: a neighbour.
+  assert.equal((await overlapOf("overflow: clip; overflow-clip-margin: 40px")).length, 1, "a control within overflow-clip-margin is a neighbour");
+  assert.deepEqual(await overlapOf("overflow: clip"), [], "clipped on both axes, it isn't");
+  // Clipping follows the containing block, not the DOM parent: a control fixed, or absolute and escaping
+  // a non-positioned overflow: hidden parent, is painted and tappable (the reviewer's plantclip3).
+  const escape = (b) => `<!doctype html><html><head><style>
+    body { margin: 0; font: 16px/20px sans-serif; }
+    .t::after { content: ""; position: absolute; inset: -30px 0; }
+  </style></head><body><div style="margin-top: 200px; position: relative">${b}<div style="position: relative; margin-top: 24px"><a class="t" href="/a" style="position: relative; display: inline-block; width: 200px">A</a></div></div></body></html>`;
+  const escapes = async (b) => {
+    await page.setContent(escape(b));
+    return (await page.evaluate(measure, { ...sel, touch: true })).problems["hit-overlap"];
+  };
+  assert.equal((await escapes(`<div style="overflow: hidden; height: 1px"><a href="/b" style="position: fixed; top: 200px; left: 0; width: 200px; height: 20px; display: block">B</a></div>`)).length, 1, "a fixed control inside an overflow: hidden parent is a neighbour");
+  assert.equal((await escapes(`<div style="overflow: hidden; height: 1px"><a href="/b" style="position: absolute; top: 0; left: 0; width: 200px; height: 20px; display: block">B</a></div>`)).length, 1, "an absolute control escaping a non-positioned overflow: hidden parent is a neighbour");
+  // The probe sets aside everything inside the reaching control too: a child of it with
+  // pointer-events: auto, reaching over the neighbour, can't hide the overlap.
+  await page.setContent(`<!doctype html><html><head><style>
+    body { margin: 0; font: 16px/20px sans-serif; }
+    .t::after { content: ""; position: absolute; inset: -30px 0; }
+    .t span { position: absolute; inset: -30px 0 0; pointer-events: auto; }
+  </style></head><body><div style="margin-top: 200px; position: relative"><div style="height: 1px"><a href="/b" style="display: block; width: 200px; height: 20px">B</a></div><div style="position: relative; margin-top: 24px"><a class="t" href="/a" style="position: relative; display: inline-block; width: 200px">A<span></span></a></div></div></body></html>`);
+  assert.equal((await page.evaluate(measure, { ...sel, touch: true })).problems["hit-overlap"].length, 1, "a reaching child with pointer-events: auto doesn't hide the overlap");
+  assert.equal(await page.evaluate(() => document.querySelectorAll("[data-hit-probe]").length + [...document.head.querySelectorAll("style")].filter((x) => x.textContent.includes("data-hit-probe")).length), 0, "the probe leaves nothing behind");
+}
+
+// The projects app's rhythm measures (apps/projects.mjs), on planted pages: what's painted, not the
+// grown hit boxes. Each clean page passes; each plant (the reviewer's cases) fails.
+{
+  const base = `body { margin: 0; font: 14px/20px sans-serif; } .mantine-Badge-root { display: inline-block; height: 18px; line-height: 18px; padding: 0 6px; }`;
+  const page2 = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  const at = async (html, css, fn) => {
+    await page2.setContent(`<!doctype html><style>${base}${css}</style>${html}`);
+    return page2.evaluate(fn);
+  };
+  // A task's PRs: three lines each (number and title; badges; who attached it), 24 px apart.
+  const pr = (n) => `<div data-pr="${n}" style="display: flex; flex-direction: column; gap: 4px"><div><a href="#" style="padding-block: 12px; margin-block: -12px; display: inline-block">#${n}</a> A title</div><div style="display: flex; gap: 4px"><span class="mantine-Badge-root">Open</span></div><div>Attached by you</div></div>`;
+  const prs = `<div class="list" style="display: flex; flex-direction: column; gap: 32px">${pr(1)}${pr(2)}</div>`;
+  assert.deepEqual(await at(prs, "", inkPrs), [], "the clean PRs pass");
+  for (const [plant, css] of [
+    ["a 44 px badge line", "[data-pr] > :nth-child(2) { min-height: 44px; align-items: center; }"],
+    ["PRs 4 px apart", ".list { gap: 4px !important; }"],
+    ["the meta line pushed 40 px down", "[data-pr] > :nth-child(3) { margin-top: 40px; }"],
+  ]) assert.notDeepEqual(await at(prs, css, inkPrs), [], `PRs: ${plant} must fail`);
+  // A transcript: tool calls, each in a wrapper of its own (a FadeIn), call then result.
+  const tool = (n) => `<div class="fade"><div data-kind="tool" style="display: flex; flex-direction: column; gap: 2px; margin-block: 12px"><button data-ds="term-line" data-slot="call" style="all: unset; display: block; padding-block: 12px; margin-block: -12px"><span data-slot="text">Bash(step ${n})</span></button><div data-ds="term-line" data-kind="tool_result">⎿ done ${n}</div></div></div>`;
+  const term = `<div data-ds="terminal">${tool(1)}${tool(2)}${tool(3)}</div>`;
+  assert.deepEqual(await at(term, "", inkTrace), [], "the clean transcript passes");
+  for (const [plant, css] of [
+    ["a top-aligned 44 px call row", "[data-slot=call] { min-height: 44px !important; padding: 0 !important; margin: 0 !important; display: flex !important; align-items: flex-start; }"],
+    ["a result pushed 30 px down", "[data-kind=tool_result] { margin-top: 30px; }"],
+  ]) assert.notDeepEqual(await at(term, css, inkTrace), [], `trace: ${plant} must fail`);
+  // The header: its meta line's text under the h1's, the same on touch as with a mouse.
+  const header = `<div data-ds="page-header"><h1 style="margin: 0; font-size: 24px; line-height: 32px">Gadgets</h1><div data-slot="meta"><a href="#">by77er/gadgets</a> · Auto-assign on</div></div>`;
+  const mouse = await at(header, "", inkHeaderGap);
+  const grown = await at(header, "[data-slot=meta] a { padding-block: 12px; display: inline-block; }", inkHeaderGap);
+  const kept = await at(header, "[data-slot=meta] a { padding-block: 12px; margin-block: -12px; display: inline-block; }", inkHeaderGap);
+  assert.ok(Math.abs(kept - mouse) <= 4, `a hit box grown without its line passes (${kept} vs ${mouse})`);
+  assert.ok(Math.abs(grown - mouse) > 4, `a header link that grows its line must fail (${grown} vs ${mouse})`);
+  await page2.close();
 }
 
 await browser.close();

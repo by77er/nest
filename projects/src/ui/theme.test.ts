@@ -179,10 +179,34 @@ describe("contrast, in both schemes", () => {
   it.each(schemes)("%s: a light badge's text on its tint, roles and gray", (s) => {
     for (const r of [...ROLES, "gray"] as const) {
       const tuple = full.colors[r]!;
-      // Mantine 9's light variant: shade 9 on shade 1 in light; shade 0 on shade 9 darkened by half in dark.
-      const [fg, bg] = s === "light" ? [tuple[9]!, tuple[1]!] : [tuple[0]!, darken(tuple[9]!, 0.5)];
+      // The tint is Mantine 9's: shade 1 in light, shade 9 darkened by half in dark. A role's text is its
+      // text shade (the resolver below); gray keeps Mantine's (shade 9 in light, 0 in dark).
+      const bg = s === "light" ? tuple[1]! : darken(tuple[9]!, 0.5);
+      const fg = r === "gray" ? (s === "light" ? tuple[9]! : tuple[0]!) : palette[r][roleText[s][r]];
       expect(contrast(fg, bg), r).toBeGreaterThanOrEqual(AA);
     }
+  });
+
+  it.each(["subtle", "light"] as const)("a %s role (a subtle Delete, a light Failed) is the role's text shade, never shade 0 in dark", (variant) => {
+    for (const r of ROLES) {
+      const v = full.variantColorResolver({ color: r, theme: full, variant });
+      expect(v.color, `${variant} ${r}`).toBe(`var(--mantine-color-${r}-text)`);
+      for (const s of schemes) {
+        // That variable is the role's text shade in each scheme: 7 (8 for warning) in light, 3 in dark.
+        expect(vars[s][`--mantine-color-${r}-text`], `${s} ${r}`).toBe(palette[r][roleText[s][r]]);
+        expect(vars[s][`--mantine-color-${r}-text`]).not.toBe(palette[r][0]);
+      }
+    }
+  });
+
+  it.each(schemes)("%s: a neutral outline badge (Tainted) is the muted text, and Mantine's error color the danger text", (s) => {
+    const outline = full.variantColorResolver({ color: "gray", theme: full, variant: "outline" });
+    expect(outline.color).toBe("var(--nest-muted)");
+    expect(outline.border).toContain("var(--nest-border-color)");
+    for (const ground of [neutrals[s].surface, neutrals[s].page, neutrals[s].subtle]) expect(contrast(neutrals[s].muted, ground)).toBeGreaterThanOrEqual(AA);
+    const error = vars[s]["--mantine-color-error"]!;
+    expect(error).toBe(palette.danger[roleText[s].danger]);
+    for (const ground of [neutrals[s].surface, neutrals[s].page]) expect(contrast(error, ground), `error on ${ground}`).toBeGreaterThanOrEqual(AA);
   });
 
   it.each(schemes)("%s: a role's text (`c=\"warning\"`) on the surface, the page and the subtle ground", (s) => {
