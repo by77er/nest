@@ -199,6 +199,18 @@ for (const remount of [false, true]) {
   // Inside a clip margin a control is still painted: a neighbour.
   assert.equal((await overlapOf("overflow: clip; overflow-clip-margin: 40px")).length, 1, "a control within overflow-clip-margin is a neighbour");
   assert.deepEqual(await overlapOf("overflow: clip"), [], "clipped on both axes, it isn't");
+  // Clipping follows the containing block, not the DOM parent: a control fixed, or absolute and escaping
+  // a non-positioned overflow: hidden parent, is painted and tappable (the reviewer's plantclip3).
+  const escape = (b) => `<!doctype html><html><head><style>
+    body { margin: 0; font: 16px/20px sans-serif; }
+    .t::after { content: ""; position: absolute; inset: -30px 0; }
+  </style></head><body><div style="margin-top: 200px; position: relative">${b}<div style="position: relative; margin-top: 24px"><a class="t" href="/a" style="position: relative; display: inline-block; width: 200px">A</a></div></div></body></html>`;
+  const escapes = async (b) => {
+    await page.setContent(escape(b));
+    return (await page.evaluate(measure, { ...sel, touch: true })).problems["hit-overlap"];
+  };
+  assert.equal((await escapes(`<div style="overflow: hidden; height: 1px"><a href="/b" style="position: fixed; top: 200px; left: 0; width: 200px; height: 20px; display: block">B</a></div>`)).length, 1, "a fixed control inside an overflow: hidden parent is a neighbour");
+  assert.equal((await escapes(`<div style="overflow: hidden; height: 1px"><a href="/b" style="position: absolute; top: 0; left: 0; width: 200px; height: 20px; display: block">B</a></div>`)).length, 1, "an absolute control escaping a non-positioned overflow: hidden parent is a neighbour");
 }
 
 // The projects app's rhythm measures (apps/projects.mjs), on planted pages: what's painted, not the
