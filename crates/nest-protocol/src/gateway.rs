@@ -33,6 +33,21 @@ pub const ROUTE_HANDS: &str = "/hands";
 pub const ROUTE_PTY: &str = "/pty";
 pub const ROUTE_INGRESS_PREFIX: &str = "/ingress/";
 
+/// The bind timers, set together (`docs/interfaces/gateway/#timers`). The gateway waits at most
+/// [`GUEST_CONNECT_TIMEOUT_MS`] for the guest's vsock `CONNECT` answer and then refuses the bind
+/// as a retryable `busy`; a client waits [`CLIENT_BIND_TIMEOUT_MS`] from sending `bind`, which
+/// exceeds the gateway's timer by at least [`BIND_TIMEOUT_MARGIN_MS`] (the edge, the tunnel and
+/// the token check), so a slow or frozen guest reaches the client as that `busy`, not as a
+/// timeout of the client's own.
+pub const GUEST_CONNECT_TIMEOUT_MS: u64 = 5_000;
+pub const CLIENT_BIND_TIMEOUT_MS: u64 = 10_000;
+pub const BIND_TIMEOUT_MARGIN_MS: u64 = 5_000;
+const _: () = assert!(CLIENT_BIND_TIMEOUT_MS >= GUEST_CONNECT_TIMEOUT_MS + BIND_TIMEOUT_MARGIN_MS);
+
+/// The `retry_after_ms` of the `busy` a gateway answers while nestd has the sandbox's VM paused
+/// (a checkpoint's or suspend's commit): short, since a pause ends with its commit.
+pub const PAUSED_RETRY_AFTER_MS: u64 = 2_000;
+
 /// Everything a client needs to reach one sandbox's hands. Issued by SandboxDO (`resolve`) and
 /// carried to the runner only over the session channel (`hands_resolved`), never through
 /// FleetDO, nestd or any command at rest: a bearer token travels AgentDO → runner, nowhere else.
@@ -221,7 +236,25 @@ pub enum GatewayMessage {
         executed: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
+        /// Why, where a client acts on it (optional since 2026-11-02): `paused` on the `busy` for
+        /// a VM nestd has paused for a commit, which a client waits out within its long budget.
+        /// Absent (every other refusal, or a gateway of the previous release): the code alone.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<RefusalReason>,
     },
+}
+
+/// [`GatewayMessage::Error::reason`]. Open: a member this build doesn't know parses as `unknown`,
+/// which a client treats as no reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusalReason {
+    /// nestd has the VM paused with the sandbox still placed here (a checkpoint's, suspend's or
+    /// archive's commit); it runs again when the commit lands.
+    Paused,
+    /// Deserialize-only fallback; never sent by this build.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Refusal codes, in the order the gateway checks them: `bad_request` (shape, route, no `bind`

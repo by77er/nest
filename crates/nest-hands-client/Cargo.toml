@@ -17,6 +17,7 @@ tracing = "0.1.44"
 webpki-roots = "1.0.10"
 
 [dev-dependencies]
+nest-gateway = { path = "../nest-gateway", features = ["testing"] }
 tempfile = "3"
 tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "sync", "process", "io-util"] }
 

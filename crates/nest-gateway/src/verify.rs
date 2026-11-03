@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use nest_protocol::gateway::{
     BindingClaims, BindingParseError, BindingScope, GatewayMessage, GuestInfo, MIN_SUPPORTED_PROTOCOL_VERSION,
-    PROTOCOL_VERSION, error_code, parse_binding,
+    PAUSED_RETRY_AFTER_MS, PROTOCOL_VERSION, RefusalReason, error_code, parse_binding,
 };
 use nest_protocol::model::ErrorBody;
 use ring::signature::{ECDSA_P256_SHA256_FIXED, UnparsedPublicKey};
@@ -19,15 +19,28 @@ pub struct Refusal {
     pub message: String,
     pub retryable: bool,
     pub retry_after_ms: Option<u64>,
+    /// Sent as the error's `reason`: only a paused VM's `busy` has one.
+    pub reason: Option<RefusalReason>,
 }
 
 impl Refusal {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Refusal { code, message: message.into(), retryable: false, retry_after_ms: None }
+        Refusal { code, message: message.into(), retryable: false, retry_after_ms: None, reason: None }
     }
 
     pub fn busy(message: impl Into<String>) -> Self {
-        Refusal { code: error_code::BUSY, message: message.into(), retryable: true, retry_after_ms: Some(500) }
+        Refusal { code: error_code::BUSY, message: message.into(), retryable: true, retry_after_ms: Some(500), reason: None }
+    }
+
+    /// `busy` while nestd has the VM paused: reason `paused` (a client waits it out within its
+    /// long budget), the hint [`PAUSED_RETRY_AFTER_MS`], and the message names what the pause is
+    /// for (a client shows it if its budget runs out).
+    pub fn paused(why: &str) -> Self {
+        Refusal {
+            retry_after_ms: Some(PAUSED_RETRY_AFTER_MS),
+            reason: Some(RefusalReason::Paused),
+            ..Refusal::busy(format!("the sandbox is paused: {why}"))
+        }
     }
 
     pub fn moved(message: impl Into<String>) -> Self {
@@ -39,6 +52,7 @@ impl Refusal {
             error: ErrorBody { code: self.code.to_string(), message: self.message.clone(), retryable: self.retryable },
             executed: false,
             retry_after_ms: self.retry_after_ms,
+            reason: self.reason,
         }
     }
 }
@@ -89,7 +103,8 @@ pub fn verify_token(
 /// The state-dependent half, run under the lock that registers the connection
 /// ([`crate::state::State::admit_and_register`]): sandbox known (`moved`, or `busy` during a
 /// resync) → epoch older (`stale_epoch`) or newer (`busy`) → client attached (to that sandbox at
-/// that epoch) → guest known (`busy`) → guest version.
+/// that epoch) → guest known (`busy`) → guest version → VM running (`busy` with a hint while
+/// nestd has it paused).
 pub fn admit(entry: Option<&SandboxEntry>, resyncing: bool, claims: &BindingClaims, protocol_version: u32) -> Result<Admission, Refusal> {
     let Some(entry) = entry else {
         if resyncing {
@@ -115,6 +130,9 @@ pub fn admit(entry: Option<&SandboxEntry>, resyncing: bool, claims: &BindingClai
             error_code::UNSUPPORTED_VERSION,
             format!("guest speaks protocol version {}, not {protocol_version}", guest.protocol_version),
         ));
+    }
+    if let Some(p) = &entry.paused {
+        return Err(Refusal::paused(&p.reason));
     }
     Ok(Admission { vsock_uds_path: entry.vsock_uds_path.clone(), guest })
 }
@@ -154,6 +172,7 @@ pub fn verify_with_key(public_key: &[u8], token: &str) -> Option<BindingClaims> 
 mod tests {
     use super::*;
     use crate::state::State;
+    use nest_protocol::host::gateway_link::SandboxPause;
     use nest_protocol::model::{Epoch, SandboxId};
 
     /// One combination of everything [`admit`] reads.
@@ -166,12 +185,14 @@ mod tests {
         attached: bool,
         /// The guest's protocol version, `None` before its hello; the bind asks for 1.
         guest: Option<u32>,
+        /// nestd has the VM paused.
+        paused: bool,
     }
 
     /// A row of the table: its code, and when it applies.
     type Row = (&'static str, fn(&Case) -> bool);
 
-    /// The contract's error-code table (`docs/interfaces/gateway/#error-codes`), rows 5 to 9 in
+    /// The contract's error-code table (`docs/interfaces/gateway/#error-codes`), rows 5 to 10 in
     /// order: the first row whose condition holds is the answer.
     const TABLE: &[Row] = &[
         (error_code::MOVED, |c| !c.placed && !c.resyncing),
@@ -181,6 +202,7 @@ mod tests {
         (error_code::UNAUTHORIZED, |c| !c.attached),
         (error_code::BUSY, |c| c.guest.is_none()),
         (error_code::UNSUPPORTED_VERSION, |c| c.guest != Some(1)),
+        (error_code::BUSY, |c| c.paused),
     ];
 
     #[test]
@@ -190,14 +212,15 @@ mod tests {
             for resyncing in [false, true] {
                 for epoch in [-1, 0, 1] {
                     for attached in [false, true] {
-                        for guest in [None, Some(1), Some(2)] {
-                            let c = Case { placed, resyncing, epoch, attached, guest };
+                        for (guest, paused) in [None, Some(1), Some(2)].into_iter().flat_map(|g| [(g, false), (g, true)]) {
+                            let c = Case { placed, resyncing, epoch, attached, guest, paused };
                             let state = State::new();
                             let sandbox = SandboxId("sbx_1".into());
                             if placed {
                                 let clients: &[&str] = if attached { &["agt_a"] } else { &["agt_b"] };
                                 let guest = guest.map(|v| GuestInfo { protocol_version: v, capabilities: vec![] });
-                                state.upsert_sandbox(sandbox.clone(), Epoch(5), PathBuf::from("/v"), clients.iter().copied(), guest);
+                                let pause = paused.then(|| SandboxPause { reason: "a checkpoint (turn_end)".into() });
+                                state.upsert_sandbox_paused(sandbox.clone(), Epoch(5), PathBuf::from("/v"), clients.iter().copied(), guest, pause);
                             }
                             let claims = BindingClaims {
                                 v: 1,
@@ -215,6 +238,11 @@ mod tests {
                                 (Err(r), Some(code)) => {
                                     assert_eq!(r.code, code, "{c:?}");
                                     assert_eq!(r.retryable, code == error_code::BUSY, "only busy is retried with the same binding: {c:?}");
+                                    // Only the pause row's busy carries the pause hint and reason.
+                                    let pause_row = TABLE.iter().position(|(_, holds)| holds(&c)) == Some(TABLE.len() - 1);
+                                    assert_eq!(r.retry_after_ms == Some(PAUSED_RETRY_AFTER_MS), pause_row, "{c:?}: {r:?}");
+                                    assert_eq!(r.message.contains("checkpoint (turn_end)"), pause_row, "{c:?}: {r:?}");
+                                    assert_eq!(r.reason == Some(RefusalReason::Paused), pause_row, "only the pause row says paused: {c:?}");
                                 }
                                 (got, want) => panic!("{c:?}: got {got:?}, the table says {want:?}"),
                             }
@@ -224,6 +252,6 @@ mod tests {
                 }
             }
         }
-        assert_eq!(n, 72);
+        assert_eq!(n, 144);
     }
 }
