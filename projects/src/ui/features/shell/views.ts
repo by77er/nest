@@ -1,9 +1,9 @@
-// A project's views, flat, in the order the sidebar lists them; and which one the URL is on.
+// A project's views, flat, in the order the sidebar lists them (the manager first: the default view); and which one the URL is on.
 import { IconLayoutKanban, IconMessage, IconSettings, IconShieldCheck } from "@tabler/icons-react";
 
 export const VIEWS = [
-  { view: "board", to: "/projects/$projectId/board", label: "Board", icon: IconLayoutKanban },
   { view: "manager", to: "/projects/$projectId/manager", label: "Manager", icon: IconMessage },
+  { view: "board", to: "/projects/$projectId/board", label: "Board", icon: IconLayoutKanban },
   { view: "reviews", to: "/projects/$projectId/reviews", label: "Reviews", icon: IconShieldCheck },
   { view: "settings", to: "/projects/$projectId/settings", label: "Settings", icon: IconSettings },
 ] as const;

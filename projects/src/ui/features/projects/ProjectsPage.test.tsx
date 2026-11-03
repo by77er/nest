@@ -9,7 +9,7 @@ describe("projects", () => {
   it("lists each project with a link to its page and its repo", async () => {
     renderApp("/projects");
     const link = await screen.findByRole("link", { name: "Widgets" });
-    expect(link).toHaveAttribute("href", "/projects/prj_one/board");
+    expect(link).toHaveAttribute("href", "/projects/prj_one/manager");
     expect(screen.getByRole("link", { name: "owner/widgets" })).toHaveAttribute("href", "https://github.com/owner/widgets");
   });
 
@@ -34,7 +34,7 @@ describe("projects", () => {
     await user.click(within(d).getByRole("button", { name: "Create project" }));
 
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects", body: { name: "Gadgets", repo: "Owner/Gadgets", auto_assign: true, max_workers: 3 } }]));
-    await waitFor(() => expect(router.state.location.pathname).toMatch(/^\/projects\/prj_new[a-z0-9]+\/board$/));
+    await waitFor(() => expect(router.state.location.pathname).toMatch(/^\/projects\/prj_new[a-z0-9]+\/manager$/));
     expect(await screen.findByRole("heading", { level: 1, name: "Gadgets" })).toBeInTheDocument();
   });
 

@@ -14,7 +14,7 @@ describe("asks", () => {
     const api = new FakeApi();
     const a = ask({ approval: { name: "github.create_pr", tool: "brokered" }, question: "Open the PR?" });
     api.asks = [a];
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/board", api);
 
     const p = await panel();
     // Calm: the surface with a warning rule, not a warning-tinted fill.
@@ -35,7 +35,7 @@ describe("asks", () => {
     const api = new FakeApi();
     const a = ask({ approval: { name: "email.send", tool: "brokered" } });
     api.asks = [a];
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/board", api);
     await user.click(within(await panel()).getByRole("button", { name: "Deny" }));
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/asks/${a.ask}/answer`, body: { answer: "deny" } }]));
   });
@@ -45,7 +45,7 @@ describe("asks", () => {
     const a = ask({ question: "Which branch should I base on?", role: "manager", agent: "agt_manager" });
     api.asks = [a, ask({ question: "already answered", answered_ms: 5 })];
     api.fail(/\/answer$/, 502, "nest is unavailable");
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/board", api);
 
     const p = await panel();
     expect(p).not.toHaveTextContent("already answered");
@@ -70,7 +70,7 @@ describe("asks", () => {
       task({ title: "Middle", state: "in_progress", blocked: { at_ms: now - 60_000, by: "agt_w1", role: "worker", reason: "No staging credentials", question: "Add STAGING_DB_URL?", tainted: false } }),
       task({ title: "Oldest", state: "ready", blocked: { at_ms: now - 3_600_000, by: "agt_manager", role: "manager", reason: "Needs a product decision", question: null, tainted: false } }),
     ];
-    renderApp("/projects/prj_one", api);
+    renderApp("/projects/prj_one/board", api);
     const p = await panel();
     expect(within(p).getByText("3")).toBeInTheDocument();
     const order = [...p.querySelectorAll("[data-ask], [data-blocked]")].map((e) => e.textContent ?? "");
@@ -88,7 +88,7 @@ describe("asks", () => {
     const api = new FakeApi();
     const t = task({ title: "Stuck", state: "in_progress", blocked: { at_ms: Date.now() - 1000, by: "agt_w1", role: "worker", reason: "r", question: "q?", tainted: false } });
     api.tasks = [t];
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/board", api);
     const p = await panel();
     await user.type(within(p).getByLabelText(/Your answer/), "use eu-west-1");
     await user.click(within(p).getByRole("button", { name: "Answer" }));
@@ -100,7 +100,7 @@ describe("asks", () => {
     const api = new FakeApi();
     api.tasks = [task({ title: "Stuck", state: "in_progress", blocked: { at_ms: Date.now(), by: "agt_w1", role: "worker", reason: "r", question: null, tainted: false } })];
     api.asks = [ask({ question: "q" })];
-    renderApp("/projects/prj_one", api);
+    renderApp("/projects/prj_one/board", api);
     const card = await screen.findByRole("article", { name: "Stuck" });
     expect(within(card).getByText("Blocked").closest("[data-marker=blocked]")!.getAttribute("style") ?? "").toContain("--mantine-color-warning-");
     cleanup();
