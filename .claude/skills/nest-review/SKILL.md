@@ -7,7 +7,7 @@ description: Use when reviewing a nest pull request or diff, as the reviewer age
 
 Review from the diff, the task and the repo, never the author's transcript. Run the checks yourself (the `nest-validation` skill). Fail the review with specific reasons, or pass it. Don't approve "with nits"; list them as comments.
 
-1. **Invariants (`CLAUDE.md`):**
+1. **Invariants (`AGENTS.md`):**
    - the subscription token never enters a VM;
    - Claude Code runs unmodified with documented flags;
    - no proxy decrypts OAuth traffic;

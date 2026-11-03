@@ -1,5 +1,5 @@
 # Source fences: patterns that may appear only in the places listed, so the invariants in
-# CLAUDE.md fail a check instead of resting on prose. Checked by scripts/check-fences.py, with
+# AGENTS.md fail a check instead of resting on prose. Checked by scripts/check-fences.py, with
 # tests in scripts/tests/ proving each fence can fail. Loosening an `allow` list is invisible to
 # the check itself, which is why this file needs the owner's review (CODEOWNERS covers scripts/).
 #

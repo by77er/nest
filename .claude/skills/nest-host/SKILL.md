@@ -68,7 +68,7 @@ Bounds and results are recorded in the verification doc. Say which bound a claim
 - **A sandbox fence never touches brains.** Brains are fenced by the host lease and their agent epoch. A start never outlives a lease lapse.
 - **Dirty work ends as a head, an orphan, or a logged final refusal,** never a silent delete.
 - **A brain host runs no sandbox machinery** (`Config::validate`, `host_kind_refusal`).
-- **The `CLAUDE.md` invariants are fenced** (`scripts/fences.toml`):
+- **The `AGENTS.md` invariants are fenced** (`scripts/fences.toml`):
   - the guest and the gateway name no credential;
   - only the runner launches `claude`, never with permission bypass;
   - only nest-proxy terminates TLS.
