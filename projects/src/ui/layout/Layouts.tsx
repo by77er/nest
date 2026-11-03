@@ -1,10 +1,10 @@
 // Page layouts: a row of equal columns (the board), and a grid of cards (the projects). Their sizes are layout tokens (theme.ts), read in Layouts.module.css.
 
-import { Button, Collapse, SimpleGrid } from "@mantine/core";
+import { Badge, type BadgeProps, Button, Collapse, SimpleGrid } from "@mantine/core";
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { IconChevronDown, IconChevronUp } from "@tabler/icons-react";
 import { icon } from "../theme";
-import type { ReactNode } from "react";
+import { type AnchorHTMLAttributes, forwardRef, type ReactNode } from "react";
 import classes from "./Layouts.module.css";
 
 export function ColumnGrid({ children, columns }: { children: ReactNode; columns: number }) {
@@ -65,3 +65,23 @@ export function SectionGrid({ children }: { children: ReactNode }) {
     </SimpleGrid>
   );
 }
+
+export interface BadgeAnchorProps extends Pick<BadgeProps, "size" | "color" | "variant" | "leftSection" | "children"> {}
+
+/**
+ * A badge that goes somewhere (a project's "needs you", to its Board): the link wraps the badge, and on
+ * touch it's at least 44 px each way around it, its own box unchanged; the room is layout, never over
+ * a neighbour.
+ */
+export const BadgeAnchor = forwardRef<HTMLAnchorElement, BadgeAnchorProps & Omit<AnchorHTMLAttributes<HTMLAnchorElement>, "color">>(function BadgeAnchor(
+  { size, color, variant, leftSection, children, className, ...anchor },
+  ref,
+) {
+  return (
+    <a {...anchor} ref={ref} className={[classes.badgeAnchor, className].filter(Boolean).join(" ")} data-ds="badge-anchor">
+      <Badge size={size} color={color} variant={variant} leftSection={leftSection} component="span">
+        {children}
+      </Badge>
+    </a>
+  );
+});

@@ -27,3 +27,27 @@ body {
     min-height: var(--nest-hit-touch);
   }
 }
+
+/* On touch, every control outside running text is at least the 44 px target each way, as layout (never
+   an overlay over a neighbour): links, buttons, icon buttons, a transcript's rows. A link inside a
+   sentence keeps the line's height (WCAG 2.5.8's inline exception, the same thing reachable elsewhere). */
+@media (pointer: coarse) {
+  a[href]:not(:is(p, li, blockquote, dd, h1, h2, h3, h4, h5, h6) *),
+  button,
+  [role="button"],
+  button:is(.mantine-CloseButton-root, .mantine-ActionIcon-root) {
+    min-height: var(--nest-hit-touch);
+    min-width: var(--nest-hit-touch);
+  }
+
+  /* A field is the target's height too (a one-line answer, a select). */
+  .mantine-Input-input {
+    min-height: var(--nest-hit-touch);
+  }
+
+  /* A text link standing on its own (a title, a repo, a PR number) centres in its room. */
+  :is(a, button).mantine-Anchor-root:not(:is(p, li, blockquote, dd) *) {
+    display: inline-flex;
+    align-items: center;
+  }
+}

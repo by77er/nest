@@ -22,7 +22,9 @@ const sel = {
 const html = (bad = {}) => `<!doctype html><html><head><style>
   body { margin: 0; font: 14px/20px sans-serif; background: #fafafa; color: #212529; display: flex; }
   nav { width: 200px; padding: 16px; } #brand { margin-left: 10px; font-size: 12px; }
-  a { display: flex; gap: 8px; padding: 0 8px; border-left: 2px solid transparent; color: #212529; text-decoration: none; }
+  a { display: flex; align-items: center; min-height: 44px; gap: 8px; padding: 0 8px; border-left: 2px solid transparent; color: #212529; text-decoration: none; }
+  p a { display: inline; min-height: 0; padding: 0; }
+  .prose { line-height: ${bad.tightLine ? "16px" : "24px"}; }
   a span:first-child { width: 20px; }
   a[aria-current=page] { background: ${bad.nav ? "#3b6fc0" : "#f1f3f5"}; border-left-color: #212529; }
   [data-ds=page] { flex: 1; padding: 32px; min-width: 0; }
@@ -32,7 +34,8 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
   .faint { color: ${bad.contrast ? "#c8c8c8" : "#666e76"}; }
   [data-ds=rich] h4 { font-size: ${bad.small ? "11px" : "inherit"}; font-weight: 600; }
   [data-ds=figure-canvas] { width: 120px; height: 40px; border: 1px solid #dee2e6; background: ${bad.figure ? "#1a1b1e" : "#ffffff"}; }
-  .chip { position: relative; font: inherit; border: 1px solid #ced4da; background: #fff; color: #212529; padding: 2px 8px; }
+  .chip { position: relative; font: inherit; min-height: 44px; min-width: 44px; border: 1px solid #ced4da; background: #fff; color: #212529; padding: 2px 8px; }
+  .tiny { font: inherit; padding: 0 4px; }
   .chip.reach { z-index: 1; }
   .chip.reach::before { content: ""; position: absolute; top: 0; bottom: 0; left: 0; right: -60px; }
 </style></head><body>
@@ -47,6 +50,8 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
       ${bad.clip ? '<p class="cut">A title far too long for its box</p>' : '<p class="cut">Short</p>'}
       ${bad.escape ? '<div style="width: 2000px">Wider than its panel</div>' : ""}
       <p><button class="chip ${bad.tap ? "reach" : ""}">Waiting</button> <button class="chip">Detach</button></p>
+      <p class="prose">A sentence with <a href="#">an inline link</a> in it, on a 24 px line: the inline exception.</p>
+      ${bad.tiny ? '<div><button class="tiny">Tiny</button></div>' : ""}
       <div data-ds="rich">${bad.heading ? "<h2>Plan</h2>" : "<h4>Plan</h4>"}<p>The message's text.</p><div data-ds="figure-canvas"></div></div>
     </div>
   </div></div>
@@ -63,12 +68,22 @@ const failing = (problems) => Object.keys(problems).filter((k) => problems[k].le
 const clean = await run({});
 assert.deepEqual(failing(clean), [], `the clean page fails: ${JSON.stringify(clean)}`);
 // On touch: two neighbouring controls pass; one whose ::before reaches over the other takes its taps.
-assert.deepEqual(failing(await run({}, true)), [], "the clean page fails on touch");
+{ const t = await run({}, true); assert.deepEqual(failing(t), [], `the clean page fails on touch: ${JSON.stringify(t["hit-size"])}`); }
 const reach = await run({ tap: true }, true);
 assert.deepEqual(failing(reach), ["hit-overlap"], `a hit area over a neighbour: ${JSON.stringify(reach)}`);
 assert.match(reach["hit-overlap"][0], /a tap on <button> "Detach" at \d+,\d+ lands on <button> "Waiting"/);
 // Without touch, hit areas aren't checked.
 assert.deepEqual(failing(await run({ tap: true })), []);
+// On touch, a 20 px button standing on its own takes too few of the taps in its 44 px square; the
+// inline link in a sentence passes at 24 px.
+const tiny = await run({ tiny: true }, true);
+assert.deepEqual(failing(tiny), ["hit-size"], `a small target: ${JSON.stringify(tiny)}`);
+assert.match(tiny["hit-size"][0], /<button> "Tiny": \d+ of \d+ taps in its 44 px square/);
+assert.deepEqual(failing(await run({ tiny: true })), [], "without touch, sizes aren't checked");
+// An inline link on a line under 24 px fails too.
+const tight = await run({ tightLine: true }, true);
+assert.deepEqual(failing(tight), ["hit-size"], `a tight line: ${JSON.stringify(tight)}`);
+assert.match(tight["hit-size"][0], /an inline link on a 16 px line/);
 for (const [bad, checks] of [
   [{ contrast: true }, ["contrast"]],
   [{ clip: true }, ["clipping"]],

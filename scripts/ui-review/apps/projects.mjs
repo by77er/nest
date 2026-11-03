@@ -149,6 +149,19 @@ const longerTitles = (p, fixture) =>
     const tasks = fixed(fixture, "/projects/prj_demo/tasks").map((t) => ({ ...t, title: `${t.title}, now with a much longer title that wraps onto another line` }));
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(tasks) });
   });
+/** A task card's PR link opens the PR (a new tab on GitHub), not the task the whole card links to. */
+async function cardPrLink(p) {
+  await p.context().route(/^https:\/\/github\.com\//, (r) => r.fulfill({ status: 200, contentType: "text/html", body: "<title>PR</title>" }));
+  const card = p.locator("[data-slot=manager-context] [data-ds=task-card]", { hasText: "#118" }).first();
+  const link = card.getByRole("link", { name: "#118" });
+  const before = p.url();
+  const [tab] = await Promise.all([p.context().waitForEvent("page", { timeout: 5_000 }).catch(() => null), link.click()]);
+  const problems = [];
+  if (!tab || !/github\.com\/[^/]+\/[^/]+\/pull\/118/.test(tab.url())) problems.push(`clicking "#118" in a context card didn't open the PR (${tab?.url() ?? "no new tab"})`);
+  if (p.url() !== before) problems.push(`clicking "#118" in a context card navigated the page to ${p.url()}`);
+  await tab?.close();
+  return problems;
+}
 const stash = (p, problems) => p.evaluate((x) => { window.__reviewProblems = x; }, problems);
 const stashed = (p) => p.evaluate(() => window.__reviewProblems ?? ["the scenario didn't run"]);
 const reply = (seq, text) => ({ seq, at_ms: Date.now(), sender: "manager", text, delivered: true, error: null });
@@ -288,6 +301,7 @@ export default {
     { name: "manager-long-full", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long" },
     { name: "manager-context-open", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click() },
     { name: "svg-modal", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false, widths: DESKTOP, after: (p) => p.getByRole("button", { name: /Search pipeline: open larger/ }).click() },
+    { name: "card-pr-link", section: "project", path: "/projects/prj_demo/manager", full: false, widths: DESKTOP, check: cardPrLink, checkName: "card-links" },
     // The chat's scrolling, acted out (checks: `chat-scroll`).
     { name: "chat-readback-growth", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, widths: [1440, 390], after: scroll.readbackGrowth("chat-long"), check: stashed, checkName: "chat-scroll" },
     { name: "chat-readback-new", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, widths: [1440, 390], after: scroll.readbackNew("chat-long"), check: stashed, checkName: "chat-scroll" },

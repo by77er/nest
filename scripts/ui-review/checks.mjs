@@ -11,7 +11,7 @@
  */
 export function measure(sel) {
   // `sel.touch`: a touch screen's width, where hit areas must not overlap (hit-overlap).
-  const problems = { overflow: [], clipping: [], contrast: [], nav: [], measure: [], frame: [], content: [], "hit-overlap": [] };
+  const problems = { overflow: [], clipping: [], contrast: [], nav: [], measure: [], frame: [], content: [], "hit-overlap": [], "hit-size": [] };
   const doc = document.documentElement;
   const W = doc.clientWidth;
   const H = window.innerHeight;
@@ -270,6 +270,70 @@ export function measure(sel) {
           break;
         }
       }
+    }
+  }
+
+  // --- hit-size (touch widths): a tap anywhere in a 44 px square on a control lands on it ---
+  // Taps across the square centred on each control: at least 90% must reach it. A link inside running
+  // text (a block with text of its own around it) is the inline exception (WCAG 2.5.8): it keeps the
+  // text's line, which must be at least 24 px.
+  if (sel.touch) {
+    const CONTROL = 'a[href], button, [role="button"], [role="tab"], input:not([type="hidden"]), select, textarea, [tabindex]:not([tabindex="-1"])';
+    const modals = [...document.querySelectorAll('[aria-modal="true"]')].filter(visible);
+    const layer = modals.at(-1) ?? document.body;
+    const own = (el, hit) => !!hit && (hit === el || el.contains(hit) || hit.closest(CONTROL) === el);
+    const inline = (el) => {
+      if (!el.matches("a")) return false;
+      const block = el.parentElement?.closest("p, li, blockquote, dd");
+      if (!block) return false;
+      return (block.textContent ?? "").replace(el.textContent ?? "", "").trim().length > 0;
+    };
+    const label = (el) => `<${el.tagName.toLowerCase()}> "${short(el.getAttribute("aria-label") ?? el.textContent)}"`;
+    /** The hit is in a fixed or sticky layer that doesn't hold the control (it scrolled under it). */
+    const pinned = (hit, el) => {
+      for (let e = hit; e && e !== document.body; e = e.parentElement) {
+        if (e.contains(el)) return false;
+        if (/fixed|sticky/.test(getComputedStyle(e).position)) return true;
+      }
+      return false;
+    };
+    for (const el of layer.querySelectorAll(CONTROL)) {
+      if (!visible(el) || el.closest('[aria-hidden="true"], [inert]') || el.matches(":disabled")) continue;
+      const r = el.getBoundingClientRect();
+      const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      if (cx < 0 || cy < 0 || cx >= W || cy >= H) continue;
+      // Only what the reader can reach: not under another layer at its centre, and not cut by a scroller
+      // it sits in (a table scrolled sideways, a drawer's body): scrolled to, it's whole.
+      if (!own(el, document.elementFromPoint(cx, cy))) continue;
+      let cut = false;
+      for (let e = el.parentElement; e && e !== document.body; e = e.parentElement) {
+        const cs = getComputedStyle(e);
+        if (!/(auto|scroll|hidden|clip)/.test(cs.overflowX + cs.overflowY)) continue;
+        const c = e.getBoundingClientRect();
+        if (r.left < c.left - 0.5 || r.right > c.right + 0.5 || r.top < c.top - 0.5 || r.bottom > c.bottom + 0.5) cut = true;
+      }
+      if (cut) continue;
+      if (inline(el)) {
+        const cs = getComputedStyle(el);
+        const lh = cs.lineHeight === "normal" ? parseFloat(cs.fontSize) * 1.2 : parseFloat(cs.lineHeight);
+        if (lh < 23.5) problems["hit-size"].push(`${label(el)}: an inline link on a ${Math.round(lh)} px line (at least 24)`);
+        continue;
+      }
+      const size = 44;
+      let n = 0, hits = 0;
+      for (const fx of [-0.4, -0.2, 0, 0.2, 0.4]) {
+        for (const fy of [-0.4, -0.2, 0, 0.2, 0.4]) {
+          const x = cx + fx * size, y = cy + fy * size;
+          if (x < 0 || y < 0 || x >= W || y >= H) continue;
+          const hit = document.elementFromPoint(x, y);
+          // A tooltip open over it, or a fixed bar it has scrolled under (the app's header), is passing,
+          // not a neighbour: those taps don't count either way.
+          if (hit?.closest('[role="tooltip"]') || pinned(hit, el)) continue;
+          n++;
+          if (own(el, hit)) hits++;
+        }
+      }
+      if (n && hits / n < 0.9) problems["hit-size"].push(`${label(el)}: ${hits} of ${n} taps in its ${size} px square land on it (${Math.round(r.width)}×${Math.round(r.height)} px)`);
     }
   }
 

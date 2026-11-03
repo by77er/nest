@@ -78,3 +78,25 @@
 .contextInner {
   padding-top: var(--mantine-spacing-md);
 }
+
+/* A badge that's a link (BadgeAnchor): the theme's focus ring, and on touch a 44 px target around the
+   badge, reserved as layout. */
+.badgeAnchor {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  border-radius: var(--mantine-radius-sm);
+}
+
+.badgeAnchor:focus-visible {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  .badgeAnchor {
+    min-height: var(--nest-hit-touch);
+    min-width: var(--nest-hit-touch);
+  }
+}
