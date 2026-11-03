@@ -7,7 +7,7 @@
 **How the built parts read the grant** (each a choice the design left open):
 - **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
 - **Brokered actions:** only GitHub actions scoped to repos in `repos` are within a grant. An http profile (a URL and a credential no field covers), a fork (it widens the push allowlist) and an unscoped GitHub action are refused.
-- **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's (403).
+- **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's: a client's route that carries one refuses it (`policy` in `POST /v1/sandboxes`, `host` in `…/start`: 403), and their own routes (`PUT /v1/sandboxes/<id>/policy`, `PUT /v1/agents/<id>/rules`, `…/ports`) take only the admin token (401).
 - **Writes into a namespace are held to its client's grant, whoever writes them,** the operator included.
 - **An mcp capability's tools are named `<client>-<entry>_<tool>`** (tool names hold no `/`). A spec where two capabilities would give the same names is refused.
 - **Deleting a client is refused while anything in its subtree lives.** Then its token stops, and its namespace, name and record go.
@@ -34,9 +34,60 @@
 
 - **Owner** is a principal: `user` (the operator), `cli_…`, or `agt_…`. A client owns what it creates, and transitively what those agents create.
 - **A client sees and acts only on its subtree:** listing, reading, inbox and turns, approvals, stop and end, transcripts and live traces, its sandboxes. Anything else answers `404`, never `403`, so ids outside it reveal nothing.
-- **The routes are the operator's, under client auth:** the same paths and bodies (`POST /v1/agents`, `POST /v1/sandboxes`, `/v1/agents/<id>/inbox`, `…/stop`, `…/asks`, …), filtered to the subtree. No route exists for one client's use only.
+- **The routes are the operator's, under client auth:** the same paths and bodies, filtered to the subtree ([the list](#routes)). No route exists for one client's use only; the `/v1/clients/self/…` routes are every client's own (the operator has no `self`).
 - **No `?cell=`** on any of them but a listing's filter: a cell goes in a create's body, and everything else reaches its object by id ([which routes take a cell](../#which-routes-take-a-cell), 2026-11-02).
 - **Creates take an `Idempotency-Key`**, scoped to the client ([idempotency keys](../#idempotency-keys), 2026-11-02).
+
+## Routes
+
+Every route a client's token reaches: the `owner` routes of `control-plane/src/index.ts`. `test/routes.test.ts` checks this table against them both ways, so a route added for clients and not listed here fails it. Every other route takes the admin token (a client's is 401), a host's, or none: the public ones are `GET /v1/health`, `GET /.well-known/jwks.json`, [MCP OAuth](../../../agents/capabilities/mcp/#oauth)'s callback and client document, host enrollment and blobs (`NOT_ADMIN` in that test).
+
+The checks:
+- **Subtree:** the agent or sandbox is the caller's (its `client` is the caller's id). Any other id answers 404, as an unknown one does. The operator passes any.
+- **Namespace:** `<ns>` is the client's own name. Another name is 403 without a lookup, so it reveals nothing. The operator passes any client's namespace (404 for a name no client has).
+- **Self:** a client's token only; the operator's is 403.
+
+| Method | Path | Check |
+| --- | --- | --- |
+| `POST` | `/v1/agents` | Within the grant (`cells`, `credentials`, `repos`, `read_repos`, `mcp_urls`, `max_agents`, …): the [catalog](#the-clients-catalog) expands its template with it. A `sandbox` or `owner` agent it names is subtree (404). `overrides` only narrow; `launch` and `rules` are the operator's (400). |
+| `GET` | `/v1/agents` | Its own registry only (ClientDO), whatever `?client=` says. |
+| `GET` | `/v1/agents/<agent>` | Subtree. |
+| `GET` | `/v1/agents/<agent>/turns` | Subtree. |
+| `POST` | `/v1/agents/<agent>/turns` | Subtree. |
+| `GET` | `/v1/agents/<agent>/transcript` | Subtree. |
+| `GET` | `/v1/agents/<agent>/trace` | Subtree ([live trace](#live-trace)). |
+| `GET` | `/v1/agents/<agent>/trace/history` | Subtree. |
+| `POST` | `/v1/agents/<agent>/inbox` | Subtree. `from` defaults to the client's id; any other `from` marks the session tainted. |
+| `POST` | `/v1/agents/<agent>/interrupt` | Subtree. |
+| `POST` | `/v1/agents/<agent>/start` | Subtree. `host` is the operator's (403). |
+| `POST` | `/v1/agents/<agent>/stop` | Subtree. `destroy_sandbox` destroys only a sandbox that agent owns, and only once nothing else is attached. |
+| `GET` | `/v1/agents/<agent>/children` | Subtree. |
+| `GET` | `/v1/agents/<agent>/brokered` | Subtree. |
+| `GET` | `/v1/agents/<agent>/asks` | Subtree. |
+| `POST` | `/v1/agents/<agent>/asks/<ask>/answer` | Subtree. |
+| `GET` | `/v1/agents/<agent>/timers` | Subtree ([timers](#timers)). |
+| `DELETE` | `/v1/agents/<agent>/timers/<name>` | Subtree. |
+| `POST` | `/v1/sandboxes` | Within the grant (`cells`, `max_sandboxes`, `inject_hosts`, `egress_hosts`, `github_push`, its own secrets). `policy` is the operator's (403). |
+| `GET` | `/v1/sandboxes` | Its own registry only, as for agents. |
+| `GET` | `/v1/sandboxes/<sandbox>` | Subtree. |
+| `DELETE` | `/v1/sandboxes/<sandbox>` | Subtree. Destroys it whatever is attached. |
+| `PUT` | `/v1/sandboxes/<sandbox>/lifetime` | Subtree. `idle_ttl_ms` is at least a minute, with no ceiling: `max_sandboxes` bounds what a client keeps. |
+| `GET` | `/v1/sandboxes/<sandbox>/policy` | Subtree. The effective policy, the operator's layer included: hosts, rules and bindings' placeholders, never a secret's value. |
+| `GET` | `/v1/sandboxes/<sandbox>/client-policy` | Subtree ([the client layer](#the-client-layer)). |
+| `PUT` | `/v1/sandboxes/<sandbox>/client-policy` | Subtree. Within its client's grant as it is now. |
+| `GET` | `/v1/catalog` | The operator's entries and its own namespace's. |
+| `GET` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. |
+| `PUT` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. Within the grant, when written and again at spawn. |
+| `DELETE` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. |
+| `GET` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. |
+| `PUT` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. Within the grant (`mcp_urls`, `credentials`, brokered actions). |
+| `DELETE` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. |
+| `GET` | `/v1/clients/self` | Self. |
+| `PUT` | `/v1/clients/self/webhook` | Self ([events](#events-to-the-owner)). |
+| `POST` | `/v1/clients/self/github-token` | Self. Within `github` ([GitHub tokens](#github-tokens)). |
+| `GET` | `/v1/clients/self/secrets` | Self ([secrets](#secrets)). |
+| `PUT` | `/v1/clients/self/secrets/<name>` | Self. Within `secrets`. |
+| `DELETE` | `/v1/clients/self/secrets/<name>` | Self. |
 
 ## Labels
 
