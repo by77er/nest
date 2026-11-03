@@ -9,7 +9,8 @@
  * }} sel
  */
 export function measure(sel) {
-  const problems = { overflow: [], clipping: [], contrast: [], nav: [], measure: [], frame: [] };
+  // `sel.touch`: a touch screen's width, where hit areas must not overlap (hit-overlap).
+  const problems = { overflow: [], clipping: [], contrast: [], nav: [], measure: [], frame: [], "hit-overlap": [] };
   const doc = document.documentElement;
   const W = doc.clientWidth;
   const H = window.innerHeight;
@@ -186,6 +187,61 @@ export function measure(sel) {
           const c = rgba(css);
           if (c[3] > 0.1 && chroma(c) > 0.12) problems.nav.push(`the active row's ${what} is a role color (${hex(c)})`);
         }
+      }
+    }
+  }
+
+  // --- hit-overlap (touch widths): no control's hit area takes a tap meant for a neighbouring one ---
+  if (sel.touch) {
+    const CONTROL = 'a[href], button, [role="button"], input:not([type="hidden"]), select, textarea, [tabindex]:not([tabindex="-1"])';
+    // Behind an open modal (a drawer, a dialog) nothing takes taps: only the topmost one's controls count.
+    const modals = [...document.querySelectorAll('[aria-modal="true"]')].filter(visible);
+    const layer = modals.at(-1) ?? document.body;
+    const controls = [...layer.querySelectorAll(CONTROL)].filter((el) =>
+      visible(el) && !el.closest('[aria-hidden="true"], [inert]') && el.getAttribute("tabindex") !== "-1" && !el.matches(":disabled"));
+    const controlAt = (x, y) => document.elementFromPoint(x, y)?.closest(CONTROL) ?? null;
+    const label = (el) => `<${el.tagName.toLowerCase()}> "${short(el.getAttribute("aria-label") ?? el.textContent)}"`;
+    /** A control's hit box: its own box, grown by any absolutely positioned ::before or ::after. */
+    const hitBox = (el) => {
+      const r = el.getBoundingClientRect();
+      const box = { l: r.left, t: r.top, r: r.right, b: r.bottom };
+      for (const pe of ["::before", "::after"]) {
+        const cs = getComputedStyle(el, pe);
+        if (cs.content === "none" || cs.content === "normal" || cs.position !== "absolute") continue;
+        const [top, left, w, h] = [cs.top, cs.left, cs.width, cs.height].map(parseFloat);
+        if (![top, left, w, h].every(Number.isFinite)) continue;
+        box.l = Math.min(box.l, r.left + left);
+        box.t = Math.min(box.t, r.top + top);
+        box.r = Math.max(box.r, r.left + left + w);
+        box.b = Math.max(box.b, r.top + top + h);
+      }
+      return box;
+    };
+    const boxes = controls.map(hitBox);
+    for (let i = 0; i < controls.length; i++) {
+      const a = controls[i];
+      const ha = boxes[i];
+      // Only a hit area past the control's own box can reach a neighbour unseen (an open list or drawer
+      // over the page is the page's layout, and other checks' business).
+      const own = a.getBoundingClientRect();
+      if (ha.l >= own.left - 0.5 && ha.t >= own.top - 0.5 && ha.r <= own.right + 0.5 && ha.b <= own.bottom + 0.5) continue;
+      const inOwn = (x, y) => x >= own.left && x <= own.right && y >= own.top && y <= own.bottom;
+      for (const b of controls) {
+        if (a === b || a.contains(b) || b.contains(a)) continue;
+        const rb = b.getBoundingClientRect();
+        const l = Math.max(ha.l, rb.left), t = Math.max(ha.t, rb.top), r = Math.min(ha.r, rb.right), btm = Math.min(ha.b, rb.bottom);
+        if (r - l < 1 || btm - t < 1) continue;
+
+        // Taps across where a's hit area meets b's box: one landing on a was meant for b.
+        let found = null;
+        for (const fx of [0.2, 0.5, 0.8]) {
+          for (const fy of [0.2, 0.5, 0.8]) {
+            const x = l + (r - l) * fx, y = t + (btm - t) * fy;
+            if (x < 0 || y < 0 || x >= W || y >= H || inOwn(x, y)) continue;
+            if (controlAt(x, y) === a) found ??= [Math.round(x), Math.round(y)];
+          }
+        }
+        if (found) problems["hit-overlap"].push(`a tap on ${label(b)} at ${found[0]},${found[1]} lands on ${label(a)}`);
       }
     }
   }
