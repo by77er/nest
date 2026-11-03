@@ -168,6 +168,24 @@ for (const remount of [false, true]) {
   await p.close();
 }
 
+// hit-overlap ignores a control clipped away where the hit area meets it (a trace row scrolled out of
+// its log, under a button above the log): no tap there is meant for it. Unclipped, the same row counts.
+{
+  const clipPage = (clipped) => `<!doctype html><html><head><style>
+    body { margin: 0; font: 14px/20px sans-serif; }
+    .reach { position: absolute; top: 100px; left: 20px; min-height: 44px; min-width: 44px; z-index: 1; }
+    .reach::before { content: ""; position: absolute; top: -40px; left: 0; right: 0; bottom: 0; }
+    .log { position: absolute; top: 120px; left: 20px; width: 200px; height: 20px; ${clipped ? "overflow: hidden;" : ""} }
+    .log button { position: relative; top: -60px; min-height: 44px; }
+  </style></head><body><button class="reach">Reach</button><div class="log"><button>Row</button></div></body></html>`;
+  const overlap = async (clipped) => {
+    await page.setContent(clipPage(clipped));
+    return (await page.evaluate(measure, { ...sel, touch: true })).problems["hit-overlap"];
+  };
+  assert.deepEqual(await overlap(true), [], "a control clipped out of its scroller isn't a neighbour");
+  assert.equal((await overlap(false)).length, 1, "the same control, unclipped, is");
+}
+
 // The projects app's rhythm measures (apps/projects.mjs), on planted pages: what's painted, not the
 // grown hit boxes. Each clean page passes; each plant (the reviewer's cases) fails.
 {
