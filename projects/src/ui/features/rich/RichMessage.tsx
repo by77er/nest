@@ -5,6 +5,7 @@
 
 import { Anchor } from "@mantine/core";
 import { IconPhoto } from "@tabler/icons-react";
+import { memo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -64,19 +65,29 @@ function components(projectId: string): Components {
   };
 }
 
-export function Markdown({ text, projectId }: { text: string; projectId: string }) {
+// One set of overrides per project, built once: they are component types to React, so a new set on every
+// render would remount every chip, card and figure (losing focus, a click in flight, an open modal).
+const byProject = new Map<string, Components>();
+const componentsFor = (projectId: string) => {
+  let c = byProject.get(projectId);
+  if (!c) byProject.set(projectId, (c = components(projectId)));
+  return c;
+};
+
+/** The Markdown of a message, parsed again only when its text changes. */
+export const Markdown = memo(function Markdown({ text, projectId }: { text: string; projectId: string }) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkEscapeHtml, remarkGfm, remarkMath, remarkTaskRefs, remarkDemoteHeadings]}
       rehypePlugins={[[rehypeKatex, KATEX_OPTIONS]]}
       urlTransform={urlTransform}
       skipHtml={false}
-      components={components(projectId)}
+      components={componentsFor(projectId)}
     >
       {text}
     </ReactMarkdown>
   );
-}
+});
 
 export function RichMessage({ text, projectId }: { text: string; projectId: string }) {
   const segments = splitSvg(text);
