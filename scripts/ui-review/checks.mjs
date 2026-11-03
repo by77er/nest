@@ -218,6 +218,16 @@ export function measure(sel) {
       }
       return box;
     };
+    /** Whether (x, y) is outside a box that clips `el` (an ancestor scrolling or hiding its overflow). */
+    const clippedAt = (el, x, y) => {
+      for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+        const cs = getComputedStyle(p);
+        if (!/(auto|scroll|hidden|clip)/.test(`${cs.overflowX} ${cs.overflowY}`)) continue;
+        const r = p.getBoundingClientRect();
+        if (x < r.left || x > r.right || y < r.top || y > r.bottom) return true;
+      }
+      return false;
+    };
     const boxes = controls.map(hitBox);
     for (let i = 0; i < controls.length; i++) {
       const a = controls[i];
@@ -233,12 +243,13 @@ export function measure(sel) {
         const l = Math.max(ha.l, rb.left), t = Math.max(ha.t, rb.top), r = Math.min(ha.r, rb.right), btm = Math.min(ha.b, rb.bottom);
         if (r - l < 1 || btm - t < 1) continue;
 
-        // Taps across where a's hit area meets b's box: one landing on a was meant for b.
+        // Taps across where a's hit area meets b's box: one landing on a was meant for b. Not where b is
+        // clipped away (scrolled out of its log): no tap is meant for what can't be seen.
         let found = null;
         for (const fx of [0.2, 0.5, 0.8]) {
           for (const fy of [0.2, 0.5, 0.8]) {
             const x = l + (r - l) * fx, y = t + (btm - t) * fy;
-            if (x < 0 || y < 0 || x >= W || y >= H || inOwn(x, y)) continue;
+            if (x < 0 || y < 0 || x >= W || y >= H || inOwn(x, y) || clippedAt(b, x, y)) continue;
             if (controlAt(x, y) === a) found ??= [Math.round(x), Math.round(y)];
           }
         }
