@@ -188,6 +188,34 @@ describe("the ceiling a sandbox applies", () => {
     expect(allowed(policy)).toContain("x.npmjs.com");
   });
 
+  it("a client's wildcard rule covering a passthrough host is left out too", async () => {
+    const c = await newClient({ egress_hosts: ["*.example.com"] });
+    const s = await placed(c, { egress: { allow: [{ host: "*.d.example.com" }, { host: "e.example.com" }] } });
+    await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { passthrough: ["q.d.example.com"] } });
+    const hosts = allowed(await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`));
+    expect(hosts).not.toContain("*.d.example.com");
+    expect(hosts).toContain("e.example.com");
+  });
+
+  it("a client record that lost its grant revision starts a new epoch, and a sandbox takes its narrowing", async () => {
+    const c = await newClient();
+    const s = await placed(c, { egress: { allow: [{ host: "x.npmjs.com" }] } });
+    // Revisions climb past anything a restarted counter would reach soon.
+    for (let i = 0; i < 3; i++) await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: c.grant } });
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    expect(allowed(await stub.policy())).toContain("x.npmjs.com");
+    // The record loses its revision (and epoch), and the grant is narrowed in the same write: no fan-out.
+    await runInDurableObject(env.CLIENT.get(env.CLIENT.idFromName(c.id)), (_i, st) => {
+      const r = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'record'").one().value);
+      delete r.grant_rev;
+      delete r.grant_epoch;
+      r.grant = { ...r.grant, egress_hosts: [] };
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'record'", JSON.stringify(r));
+    });
+    expect(await stub.clientGrantChanged()).toBe(true);
+    expect(allowed(await stub.policy())).not.toContain("x.npmjs.com");
+  });
+
   it("only its owner reads a sandbox's client layer", async () => {
     const c = await newClient();
     const s = await placed(c, { egress: { allow: [{ host: "nodejs.org" }] } });

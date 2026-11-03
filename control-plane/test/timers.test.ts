@@ -196,6 +196,18 @@ describe("timers", () => {
     expect(armed).toBe(1);
   });
 
+  it("a timer left without its deadline is armed again when the object starts, before any alarm", async () => {
+    const s = await setup({ start: false });
+    const at = await runInDurableObject(agentStub(s.agent), async (_: AgentDO, st) => {
+      st.storage.sql.exec("INSERT INTO timers (name, id, at_ms, note, set_ms) VALUES ('fresh', 'k-f', ?, '', ?)", Date.now() + 600_000, Date.now());
+      st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'timer:fresh'");
+      new AgentDO(st, env);
+      await new Promise((r) => setTimeout(r, 0));
+      return st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'timer:fresh'").toArray()[0]?.at;
+    });
+    expect(at).toBeGreaterThan(Date.now() + 500_000);
+  });
+
   it("a timer left without its deadline (a rolled-back release dropped it) is armed again at the next alarm", async () => {
     const s = await setup({ start: false });
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO, st) => {

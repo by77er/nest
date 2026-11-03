@@ -179,10 +179,11 @@ const AGENT_ENV = "agent_env";
 const EGRESS_CEILING = "client_egress_hosts";
 /** A sandbox with client egress rules reads its client's `egress_hosts` again this often, so a missed grant change converges. */
 const EGRESS_CEILING_REFRESH_MS = 15 * 60_000;
-/** The ceiling as stored: the hosts and the grant revision they were read at (a list stored without one: revision -1). */
+/** The ceiling as stored: the hosts, and the grant revision and epoch they were read at (a list stored without them: revision -1). */
 interface Ceiling {
   hosts: string[];
   rev: number;
+  epoch?: string;
 }
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
@@ -1451,15 +1452,18 @@ export class SandboxDO extends DurableObject<Env> {
     let read: Ceiling;
     try {
       const scope = await this.env.CLIENT.get(this.env.CLIENT.idFromName(client)).scope();
-      read = { hosts: scope.grant.egress_hosts ?? [], rev: scope.grant_rev ?? 0 };
+      read = { hosts: scope.grant.egress_hosts ?? [], rev: scope.grant_rev ?? 0, ...(scope.grant_epoch ? { epoch: scope.grant_epoch } : {}) };
     } catch (e) {
       // A deleted client (403) has nothing, for good; anything else leaves the ceiling as it was.
       if (asNestError(e)?.code !== ErrorCodes.FORBIDDEN) throw e;
-      read = { hosts: [], rev: Number.MAX_SAFE_INTEGER };
+      read = { hosts: [], rev: Number.MAX_SAFE_INTEGER, epoch: "deleted" };
     }
     // Compared in the step it is written: a read that left before a newer grant was read (and written)
-    // never puts the older ceiling back, however the awaits interleave.
-    if (read.rev >= this.ceiling().rev) this.put(EGRESS_CEILING, read);
+    // never puts the older ceiling back, however the awaits interleave. Revisions compare within one epoch;
+    // another epoch (the record's counter was lost and restarted) is newer, so a narrowing is never ignored.
+    const stored = this.ceiling();
+    if (stored.epoch === "deleted") return;
+    if (read.epoch !== stored.epoch || read.rev >= stored.rev) this.put(EGRESS_CEILING, read);
     if (this.hasClientEgress() && !this.deadlines.has("egress_ceiling")) await this.deadlines.set("egress_ceiling", Date.now() + EGRESS_CEILING_REFRESH_MS);
   }
 
