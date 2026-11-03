@@ -87,6 +87,32 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Unconfirmed operator cleanups** (the owner to confirm they were done): the old SSM parameter `/nest/control-plane/vars/AWS_CELLS` if it was never imported into a cell stack; the legacy Worker secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `ROOT_CA_KMS_KEY_ID`, `ROOT_CA_CERT_PEM`) and the SSM parameter `/nest/control-plane/vars/ROOT_CA_KMS_KEY_ID`; the unattached reusable Access policies left by the edge stack's import; and respawning agents whose stored prompts still describe removed tools.
 - **Still needed by hosts:** `sandbox_create`, `sandbox_fork` and `agent_start` carry a `ws_` value (`compatWorkstream`), which hosts and runners from before workstreams left require (Rust's `WorkstreamId`, prefix-checked). Drop it from the control plane (and `SandboxInfo`/`AgentInfo`) once every host runs that release or later, then the Rust fields the release after. The policy layer's wire value `workstream` (the operator layer; hosts parse a closed enum) stays.
 
+**This release's rollout rule (checkpoint cuts, M2): not a one-way deploy, but it changes the cell's launch types: do not merge until the owner has reviewed the cost and `dev/measure-cut/run.sh` has run** (CI applies `use1` on merge). No Durable Object class is added; the wire gains one optional field, `commit_request.cut_ms` (and `GenerationRecord.cut_ms`), which either side of the previous release ignores (zod strips it; serde has no unknown-field refusal).
+- **Order:**
+  1. The cell stack applies first: `c8id.large` first in the launch types (`deploy/lean/Cell/Cells.lean`), and the launch template's user data (bootstrap.sh) puts sandbox state on the instance store.
+  2. Then the Worker deploys: SandboxDO records `cut_ms` when a host sends it.
+  3. Then the release is published, and hosts take the new nestd as they are replaced.
+
+  Any order is safe:
+  - a nestd of either release works with either state layout (`state_dir`, the kernel, images and jail paths are all in nestd.json);
+  - a previous-release Worker ignores `cut_ms`;
+  - an EBS-only host, or a previous-release nestd, pauses for whole reads as M1 does.
+- **Cost** (on-demand prices from third-party trackers, not AWS's price list: [c8id.large](https://calculator.holori.com/aws/ec2/c8id.large/us-east-1), [c8i-flex.large](https://calculator.holori.com/aws/ec2/c8i-flex.large), unverified):
+  - `c8id.large` is about $0.111 an hour against `c8i-flex.large`'s $0.089, about +$16 a month per always-on host;
+  - on spot, about $0.03 against $0.027–0.034 an hour, a few dollars a month per host.
+
+  Hosts scale to zero when idle, so the delta follows sandbox hours. `maxHosts` (4) bounds it at about +$64 a month on demand.
+- **Compatibility one release back:**
+  - a previous-release nestd on a new host finds sandbox state in `/var/lib/nest/data/state` and works there unchanged;
+  - a new nestd on an old host (root-volume state) probes reflink on the root XFS and uses it if present, else pauses for reads;
+  - a `cut-*.img` left in an incarnation's directory is removed by a new nestd at start, and deleted with the directory by an old one.
+- **What a rollback does:** reverting the stack puts the EBS-only types first again (hosts are replaced, never changed in place); `wrangler rollback` drops `cut_ms` from new records; a republished previous release pauses for whole reads.
+- **Cloud check after the hosts roll:**
+  - bootstrap's log says "sandbox state on the instance store at /var/lib/nest/data (XFS, reflink)", and nestd's says "checkpoints cut disks with a reflink";
+  - a turn-end checkpoint logs `checkpoint: disk cut ... paused_ms=` under the gate (200 ms) and `commit: cut read` after it;
+  - `GET /v1/sandboxes/<id>/generations` shows `cut_ms` on the new turn ends;
+  - a hands call made during a checkpoint returns.
+
 **This release's rollout rule (agent timers; API clients' egress rules, environment and live client layer): not a one-way deploy.** No Durable Object class is added (AgentDO gains a table, `timers`, and deadlines `timer:<name>`; SandboxDO kv keys; CatalogDO seed version 9 adds the capability `timers`). The host wire gains one optional field, `agent_attach.env`, which a nestd of the previous release ignores (no unknown-field refusal). Deploy the Worker, then hosts as they are replaced.
 - **The gap after the deploy:** a Durable Object still on the previous code for minutes lacks the new methods. These answer `503` (`internal`, retryable), never 500:
   - `GET` and `DELETE /v1/agents/<id>/timers…` (AgentDO);

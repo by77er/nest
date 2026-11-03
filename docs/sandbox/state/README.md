@@ -30,7 +30,7 @@ The cadence is the RPO: a lost host loses at most the work since its last commit
 
 ### One turn-end checkpoint at a time
 
-**Decided (2026-11-02).** Until the reflink cut ([disk](disk/)), a checkpoint pauses the VM while it reads a changed disk, so a second one queued right behind the first only doubles the pause (two back-to-back checkpoints of a 32 GiB disk held one VM paused 33–39 s each).
+**Decided (2026-11-02).** Without the reflink cut ([disk](disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background); built, not deployed), a checkpoint pauses the VM while it reads a changed disk, so a second one queued right behind the first only doubles the pause (two back-to-back checkpoints of a 32 GiB disk held one VM paused 33–39 s each).
 - **At most one in flight.** SandboxDO records the `turn_end` checkpoint it asked for (kv `turn_checkpoint_inflight`: epoch, when, turns that ended meanwhile) until it **lands**: its `sandbox_checkpoint` command's result, ok or not (FleetDO passes it on, keyed by the command, so a late result of an older checkpoint lands nothing), or, sooner, its `turn_end` commit decided (any outcome, a replay of a stored one included). The command's result covers a checkpoint that sent no new commit: nestd asked again for an unanswered commit of another reason and found nothing new, or found no disk. One out longer than 5 min (its pause plus nestd's 60 s commit timeout, with room for a large disk) no longer counts.
 - **Turns that end while one is in flight share one follow-up,** 10 s after it lands, instead of each queueing a checkpoint behind it. One that never lands gets them theirs when its 5 min window ends.
 - **The follow-up is never skipped.** The in-flight checkpoint's cut is the guest's `sync` (`prepare_snapshot`; the guest freezes nothing), not the pause, so a call answered between the two may have left writes in the guest's page cache that it lacks.
@@ -102,7 +102,7 @@ SandboxDO runs retention from its alarm, in the same single writer that admits f
 
 **Built:** the notice suspends every running sandbox, in no order ([autoscaling](../../compute/autoscaling/)). **Designed, not built:** the order below.
 
-1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then reflink-cut every disk ([disk](disk/#m2-cut-with-a-reflink-while-the-vm-runs-designed-not-built)) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot`).
+1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then reflink-cut every disk in a brief pause each ([disk](disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot`).
 2. Then, in order of recent activity: pause, write a full memory snapshot to NVMe (`sync_snapshot_files=false`), upload with zstd compression, commit.
 3. Anything that doesn't finish falls back to its disk-only generation, and the loss is recorded.
 
@@ -116,5 +116,5 @@ A **rebalance recommendation** can arrive with the notice rather than before it,
 ## Components
 
 - [memory/](memory/): hugepages, UFFD, prefetch, tiers, restore ABI, base generations
-- [disk/](disk/): pausing only to read, the unchanged-disk check, reflink cuts and extent diffs (designed), flush before commit, I/O limits, the ublk lazy disk (later)
+- [disk/](disk/): pausing only to read, the unchanged-disk check, reflink cuts in a brief pause (built, not deployed), extent diffs (designed), flush before commit, I/O limits, the ublk lazy disk (later)
 - [object-store/](object-store/): S3 per cell, costs, garbage collection
