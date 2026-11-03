@@ -48,6 +48,14 @@ export const BASE_ALLOW = [
 /** The compat `ws_` value hosts of the previous release require in `sandbox_create` (`SandboxInfo.workstream`). */
 const wireWorkstream = (info: { sandbox: string; workstream?: string }): string => info.workstream ?? compatWorkstream(info.sandbox);
 
+/**
+ * Where an allow rule came from, as the API shows it (never sent to a host): nest's built-in defaults
+ * (`base`), the operator's policy layer (`operator`), the push and read allowlists' constructed rules
+ * (`repos`), its API client's own layer and its agents' specs (`client`), and temporary grants (`grant`).
+ */
+export type AllowSource = "base" | "operator" | "repos" | "client" | "grant";
+export type SourcedAllowRule = AllowRule & { source: AllowSource };
+
 /** The ports an allow rule (or a grant) covers when it names none. */
 const WEB_PORTS = [80, 443];
 export const Port = z.number().int().min(1).max(65535);
@@ -923,7 +931,18 @@ export class SandboxDO extends DurableObject<Env> {
    * guards always, layered with the operator's own. An operator binding named `github` (or
    * `github_read`) wins over the constructed one.
    */
+  /**
+   * The policy nest-proxy gets (`policy_update`, `sandbox_create`): every allow rule tagged with the wire
+   * `layer` hosts parse as a closed enum (`base`, `workstream`, `sandbox`). Where each rule came from is
+   * `policyView`'s `source`, which never goes to a host.
+   */
   private effectivePolicy(now = Date.now()): EgressPolicy {
+    const p = this.sourcedPolicy(now);
+    return { ...p, allow: p.allow.map(({ source: _s, ...rule }) => rule) };
+  }
+
+  /** The effective policy with each allow rule's `source` (docs/sandbox/networking/egress/policy/#sources). */
+  private sourcedPolicy(now = Date.now()): Omit<EgressPolicy, "allow"> & { allow: SourcedAllowRule[] } {
     const info = this.info_();
     const ws = this.operatorLayer();
     const access = this.repoAccess();
@@ -931,18 +950,21 @@ export class SandboxDO extends DurableObject<Env> {
     const built = [...ws.inject, ...gh.inject.filter((b) => !ws.inject.some((w) => w.name === b.name))];
     // Its client's bindings, under names of their own (`client:<name>`), never replacing another.
     const inject = [...built, ...this.appliedClientInjections(built.map((b) => b.name)).map(wireBinding)];
-    const allow: AllowRule[] = [
-      ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const })),
-      ...[...ws.allow, ...gh.allow].map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER })),
+    const tag = (source: AllowSource) => (r: AllowRule): SourcedAllowRule => ({ ...r, source });
+    const allow: SourcedAllowRule[] = [
+      ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const, source: "base" as const })),
+      ...ws.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER, source: "operator" as const })),
+      ...gh.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER, source: "repos" as const })),
       // Its own and its agents' egress rules (docs/control-plane/api/clients/#egress): allow rules only, so the
       // guards and the hard deny still apply to what they open.
       // A host the operator lets through uninspected (passthrough) is never opened by a client's rule: no
       // guard could apply to it there.
-      ...compileEgress(this.clientEgress().filter((r) => !ws.passthrough.some((p) => p === r.host || hostPatternMatches(p, r.host) || hostPatternMatches(r.host, p)))),
+      ...compileEgress(this.clientEgress().filter((r) => !ws.passthrough.some((p) => p === r.host || hostPatternMatches(p, r.host) || hostPatternMatches(r.host, p))))
+        .map(tag("client")),
       ...this.sql
         .exec<{ host: string; ports: string; expires_ms: number }>("SELECT host, ports, expires_ms FROM grants WHERE expires_ms > ? ORDER BY expires_ms", now)
         .toArray()
-        .map((g) => ({ host: g.host, ports: JSON.parse(g.ports) as number[], layer: "sandbox" as const, expires_ms: g.expires_ms })),
+        .map((g) => ({ host: g.host, ports: JSON.parse(g.ports) as number[], layer: "sandbox" as const, expires_ms: g.expires_ms, source: "grant" as const })),
     ];
     return {
       version: info.policy_version,
@@ -961,15 +983,21 @@ export class SandboxDO extends DurableObject<Env> {
     return { ...EMPTY_LAYER, ...l, repos: l?.repos ?? [], read_repos: l?.read_repos ?? [], guards: l?.guards ?? [] };
   }
 
-  async policy(): Promise<EgressPolicy> {
-    return this.effectivePolicy();
+  /**
+   * The effective policy as the API shows it (`GET /v1/sandboxes/<id>/policy`): what the proxy gets, plus
+   * each allow rule's `source`. `layer` is kept for one release (it is the wire's, and `workstream` there
+   * means "not base and not a grant"); readers move to `source`.
+   */
+  async policy(): Promise<EgressPolicy & { allow: SourcedAllowRule[] }> {
+    return this.sourcedPolicy();
   }
 
   async setPolicy(input: SandboxPolicyInput): Promise<EgressPolicy> {
     this.info_();
     const layer = SandboxPolicyLayer.parse(input);
     this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos), read_repos: canonicalRepos(layer.read_repos) });
-    return this.policyChanged(true);
+    await this.policyChanged(true);
+    return this.policy();
   }
 
   /** Temporary sandbox-layer grant (e.g. approved through `ask`). Expires on its own. */
@@ -1499,9 +1527,9 @@ export class SandboxDO extends DurableObject<Env> {
     put(OWN_INJECT, inject, inject.length > 0);
     put(OWN_ENV, layer.env, Object.keys(layer.env).length > 0);
     if (this.hasClientEgress() && now.client && !this.deadlines.has("egress_ceiling")) await this.deadlines.set("egress_ceiling", Date.now() + EGRESS_CEILING_REFRESH_MS);
-    const policy = await this.policyChanged(true);
+    await this.policyChanged(true);
     if (JSON.stringify(layer.env) !== envBefore && now.attached.length) await this.issueAttachCommands(now.attached);
-    return policy;
+    return this.policy();
   }
 
   /** Its own client layer, as `PUT …/client-policy` set it (never a secret: bindings name theirs). */
