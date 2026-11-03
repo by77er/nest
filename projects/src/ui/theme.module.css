@@ -15,14 +15,14 @@
     min-height: var(--nest-hit-touch);
   }
 
-  /* The input as tall as the target and its steppers' section as wide: each stepper is half of it. */
-  .numberInput {
-    --input-height: var(--nest-hit-touch);
-    --input-right-section-width: var(--nest-hit-touch);
+  /* The input as tall as the target and its steppers' section as wide: each stepper is half of it.
+     (Mantine sets these on the input's own wrapper, so they're set there, over its values.) */
+  .numberWrapper {
+    --input-height: var(--nest-hit-touch) !important;
+    --input-right-section-width: var(--nest-hit-touch) !important;
   }
 
-  /* Each stepper fills its section's width, inside the input's border. */
-  .stepper {
-    width: 100%;
+  .steppers {
+    max-width: none;
   }
 }

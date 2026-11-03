@@ -245,7 +245,7 @@ export const theme = createTheme({
     CloseButton: CloseButton.extend({ defaultProps: { c: "danger", size: "lg" } }),
     ActionIcon: ActionIcon.extend({ defaultProps: { size: "lg" } }),
     Burger: Burger.extend({ classNames: { root: themeClasses.burger } }),
-    NumberInput: NumberInput.extend({ classNames: { root: themeClasses.numberInput, control: themeClasses.stepper } }),
+    NumberInput: NumberInput.extend({ classNames: { wrapper: themeClasses.numberWrapper, controls: themeClasses.steppers } }),
     Button: Button.extend({ defaultProps: { size: "sm", radius: "md" }, classNames: { root: themeClasses.button } }),
     // A badge is never cut short: its text keeps its width (a table column grows for it; a card wraps it).
     Badge: Badge.extend({ defaultProps: { radius: "sm" }, styles: { root: { fontVariantNumeric: "tabular-nums", maxWidth: "none", flexShrink: 0 }, label: { overflow: "visible", textOverflow: "clip" } } }),
