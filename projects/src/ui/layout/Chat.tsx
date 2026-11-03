@@ -1,10 +1,7 @@
-// A conversation's pieces: a message on the owner's side (end, on the subtle ground), the other's
-// (start, a hairline around it), or a note across the middle; the composer pinned below them; and a
-// scrolling log of a fixed height.
+// A scrolling log of a fixed height (a trace). The chat's own pieces are in ChatLog.tsx.
 
-import { Box, ScrollArea } from "@mantine/core";
-export { Bubble } from "./Rich";
-import { forwardRef, type ReactNode, type RefObject } from "react";
+import { ScrollArea } from "@mantine/core";
+import type { ReactNode, RefObject } from "react";
 
 /** A log's lines wrap to its width: never Mantine's `min-width: min-content`, which lets a long line scroll it sideways. */
 const WRAPPED = { content: { minWidth: 0 } };
@@ -25,21 +22,3 @@ export function ScrollLog({ children, viewportRef, fill = false }: { children: R
     </ScrollArea.Autosize>
   );
 }
-
-/**
- * What stays at the viewport's bottom while the page scrolls above it (a conversation's composer): on
- * the page's ground, with a hairline above, the page's width.
- */
-export const PinnedFooter = forwardRef<HTMLDivElement, { children: ReactNode }>(function PinnedFooter({ children }, ref) {
-  return (
-    <Box
-      ref={ref}
-      pt="md"
-      pb="lg"
-      data-ds="pinned-footer"
-      style={{ position: "sticky", bottom: 0, zIndex: 1, background: "var(--nest-page-bg)", borderTop: "var(--nest-border)" }}
-    >
-      {children}
-    </Box>
-  );
-});

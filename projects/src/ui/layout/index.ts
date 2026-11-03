@@ -2,7 +2,8 @@
 // these and Mantine's controls; only these files and the theme may use inline styles, raw sizes or CSS
 // (src/ui/design.test.ts).
 export { AppFrame } from "./AppFrame";
-export { Bubble, PinnedFooter, ScrollLog } from "./Chat";
+export { ScrollLog } from "./Chat";
+export { ActivityLine, ChatFrame, ChatLog, CodeFrame, ComposerDock, DaySeparator, JumpPill, MessageGroup, MessageRow, StreamText } from "./ChatLog";
 export { FadeIn } from "./FadeIn";
 export { Glyph, GLYPH, Terminal, TermLine, TermRule, TermStatus, type TermTone } from "./Terminal";
 export { FieldGroup } from "./FieldGroup";
@@ -17,7 +18,7 @@ export { Section } from "./Section";
 export { Sheet, useFillColumn } from "./Sheet";
 export { SortablePanel } from "./Sortable";
 export { Prose, Row, Stack } from "./Stack";
-export { RichImage, RichProse, RichTableFrame, ChatColumn, FooterPill, ScrollSentinel, SvgFigure, TaskCards, TaskCheck, TaskChipPending, TaskRefCard } from "./Rich";
+export { RichImage, RichProse, RichTableFrame, SvgFigure, TaskCards, TaskCheck, TaskChipPending, TaskRefCard } from "./Rich";
 export { EmptyState, ErrorState, LoadingState } from "./States";
 export { Toolbar } from "./Toolbar";
 export { icon, weight } from "../theme";

@@ -3,14 +3,14 @@
 // resolved live from the board. Raw HTML in the text is never rendered: remarkEscapeHtml turns it into
 // literal text first, and no rehype-raw is in the pipeline.
 
-import { Anchor } from "@mantine/core";
-import { IconPhoto } from "@tabler/icons-react";
-import { memo } from "react";
+import { Anchor, Button, CopyButton } from "@mantine/core";
+import { IconCheck, IconCopy, IconPhoto } from "@tabler/icons-react";
+import { isValidElement, memo } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import { icon, RichImage, RichProse, RichTableFrame, Stack, TaskCheck } from "../../layout";
+import { CodeFrame, icon, RichImage, RichProse, RichTableFrame, Stack, TaskCheck } from "../../layout";
 import { INLINE_IMAGE, LINK, urlTransform } from "../../rich/links";
 import { splitSvg } from "../../rich/svg";
 import { remarkDemoteHeadings, remarkEscapeHtml, remarkTaskRefs, TASK_HREF } from "../../rich/tasks";
@@ -55,6 +55,28 @@ function components(projectId: string): Components {
         );
       }
       return <span>{alt}</span>;
+    },
+    // A code block: its language and a copy button above it (math and SVG never reach here).
+    pre: ({ children }) => {
+      const code = isValidElement(children) ? (children.props as { className?: string; children?: unknown }) : null;
+      const lang = /language-([\w+-]+)/.exec(code?.className ?? "")?.[1] ?? "";
+      const source = String(code?.children ?? "").replace(/\n$/, "");
+      return (
+        <CodeFrame
+          lang={lang}
+          copy={
+            <CopyButton value={source}>
+              {({ copied, copy }) => (
+                <Button size="compact-xs" variant="subtle" color="gray" onClick={copy} leftSection={copied ? <IconCheck size={icon.sm} /> : <IconCopy size={icon.sm} />}>
+                  {copied ? "Copied" : "Copy"}
+                </Button>
+              )}
+            </CopyButton>
+          }
+        >
+          <pre>{children}</pre>
+        </CodeFrame>
+      );
     },
     table: ({ children }) => (
       <RichTableFrame>

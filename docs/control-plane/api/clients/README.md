@@ -35,6 +35,7 @@
 - **Owner** is a principal: `user` (the operator), `cli_…`, or `agt_…`. A client owns what it creates, and transitively what those agents create.
 - **A client sees and acts only on its subtree:** listing, reading, inbox and turns, approvals, stop and end, transcripts and live traces, its sandboxes. Anything else answers `404`, never `403`, so ids outside it reveal nothing.
 - **The routes are the operator's, under client auth:** the same paths and bodies (`POST /v1/agents`, `POST /v1/sandboxes`, `/v1/agents/<id>/inbox`, `…/stop`, `…/asks`, …), filtered to the subtree. No route exists for one client's use only.
+  - **Interrupt:** `POST /v1/agents/<id>/interrupt` stops an agent's current turn (it keeps running and takes its next input), for an agent in the client's subtree.
 - **No `?cell=`** on any of them but a listing's filter: a cell goes in a create's body, and everything else reaches its object by id ([which routes take a cell](../#which-routes-take-a-cell), 2026-11-02).
 - **Creates take an `Idempotency-Key`**, scoped to the client ([idempotency keys](../#idempotency-keys), 2026-11-02).
 
