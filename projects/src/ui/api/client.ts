@@ -3,7 +3,7 @@
 
 import type {
   AnswerBody, Ask, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
-  Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
+  Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
 } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
@@ -66,6 +66,10 @@ export const api = {
   attention: (id: string) => call<Attention[]>("GET", `${prj(id)}/attention`),
   answerBlocked: (id: string, task: string, b: AnswerBody) => call<Task>("POST", `${tsk(id, task)}/answer`, b),
   answerAsk: (id: string, ask: string, b: AnswerBody) => call<{ delivered: unknown }>("POST", `${prj(id)}/asks/${encodeURIComponent(ask)}/answer`, b),
+
+  manager: (id: string) => call<ManagerStatus>("GET", `${prj(id)}/manager`),
+  retryAttach: (id: string) => call<Settings>("POST", `${prj(id)}/attach`),
+  reviews: (id: string) => call<Job[]>("GET", `${prj(id)}/reviews`),
 
   syncState: () => call<SyncState | null>("GET", "/admin/sync-state"),
   sync: () => call<SyncResult>("POST", "/admin/sync"),

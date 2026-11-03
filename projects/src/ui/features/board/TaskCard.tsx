@@ -24,7 +24,7 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
     <SortablePanel id={task.id} disabled={!sortable} gripLabel={`Move ${task.title}`} dense component="article" aria-label={task.title} data-task={task.id}>
       {(grip) => (
         <Stack gap="sm">
-          <AnchorLink to="/projects/$projectId" params={{ projectId }} search={{ task: task.id }} c="bright" fw="medium" fz="sm">
+          <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: task.id }} c="bright" fw="medium" fz="sm">
             {task.title}
           </AnchorLink>
           <Row gap="xs" justify="space-between" align="flex-start">

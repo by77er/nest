@@ -2,7 +2,7 @@
 // agents' asks (approvals and questions, nest's) and blocked tasks (README.md#blocked), oldest first.
 // A warning rule and title mark it; the panel itself is the surface, so it leads without shouting.
 
-import { Button, Divider, Text, Textarea } from "@mantine/core";
+import { Button, Collapse, Divider, Text, Textarea } from "@mantine/core";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import { useState } from "react";
 import { useAnswerBlocked, useAttention } from "../../api/queries";
@@ -10,6 +10,7 @@ import type { Attention } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { MetaItem, MetaRow, Panel, Prose, Row, Section, Stack } from "../../layout";
+import { motion } from "../../theme";
 import { AskItem } from "./AskItem";
 
 type BlockedItem = Extract<Attention, { kind: "blocked" }>;
@@ -24,7 +25,7 @@ function BlockedTask({ projectId, item }: { projectId: string; item: BlockedItem
         <MetaItem mono>{item.by}</MetaItem>
         <MetaItem>
           blocked{" "}
-          <AnchorLink to="/projects/$projectId" params={{ projectId }} search={{ task: item.task }} inherit>
+          <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: item.task }} inherit>
             {item.title}
           </AnchorLink>
         </MetaItem>
@@ -63,20 +64,51 @@ function BlockedTask({ projectId, item }: { projectId: string; item: BlockedItem
   );
 }
 
+/** How many items show before "Show all": enough to act on, without pushing the board below the fold. */
+export const SHOWN = 3;
+
+function Item({ projectId, x, first }: { projectId: string; x: Attention; first: boolean }) {
+  return (
+    <Stack gap="lg">
+      {!first && <Divider />}
+      {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : <BlockedTask projectId={projectId} item={x} />}
+    </Stack>
+  );
+}
+
+const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : `blocked-${x.task}`);
+
 export function NeedsYou({ projectId }: { projectId: string }) {
   const attention = useAttention(projectId);
-  const items = attention.data ?? [];
+  const [all, setAll] = useState(false);
+  // Oldest first, as the Worker answers; the rest behind "Show all", collapsing in 180 ms.
+  const items = [...(attention.data ?? [])].sort((a, b) => a.at_ms - b.at_ms);
   if (items.length === 0) return null;
+  const shown = items.slice(0, SHOWN);
+  const rest = items.slice(SHOWN);
   return (
     <Panel tone="warning" component="section" aria-label="Needs you" aria-live="polite">
       <Section title="Needs you" count={items.length} icon={IconAlertTriangle} iconColor="warning" region={false}>
         <Stack gap="lg">
-          {items.map((x, i) => (
-            <Stack key={x.kind === "ask" ? x.ask : `blocked-${x.task}`} gap="lg">
-              {i > 0 && <Divider />}
-              {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : <BlockedTask projectId={projectId} item={x} />}
-            </Stack>
+          {shown.map((x, i) => (
+            <Item key={keyOf(x)} projectId={projectId} x={x} first={i === 0} />
           ))}
+          {rest.length > 0 && (
+            <>
+              <Collapse expanded={all} transitionDuration={motion.base} id={`needs-you-rest-${projectId}`}>
+                <Stack gap="lg">
+                  {rest.map((x) => (
+                    <Item key={keyOf(x)} projectId={projectId} x={x} first={false} />
+                  ))}
+                </Stack>
+              </Collapse>
+              <Row>
+                <Button variant="subtle" color="gray" onClick={() => setAll((a) => !a)} aria-expanded={all} aria-controls={`needs-you-rest-${projectId}`}>
+                  {all ? "Show fewer" : `Show all (${items.length})`}
+                </Button>
+              </Row>
+            </>
+          )}
         </Stack>
       </Section>
     </Panel>

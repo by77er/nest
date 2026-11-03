@@ -33,7 +33,7 @@ export function AskItem({ projectId, ask }: { projectId: string; ask: Ask }) {
         {ask.task && (
           <MetaItem>
             on{" "}
-            <AnchorLink to="/projects/$projectId" params={{ projectId }} search={{ task: ask.task }} inherit ff="monospace">
+            <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: ask.task }} inherit ff="monospace">
               {ask.task}
             </AnchorLink>
           </MetaItem>

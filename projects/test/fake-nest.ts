@@ -27,6 +27,9 @@ export interface FakeAgent {
   sandbox: string | null;
   overrides: unknown;
   ended: boolean;
+  /** nest's `state` to report (idle by default), and its start's capacity waits. */
+  state?: string;
+  capacityWaits?: number;
 }
 
 export interface Call {
@@ -235,7 +238,13 @@ export class FakeNest {
   }
 
   view(a: FakeAgent) {
-    return { agent: a.agent, owner: a.owner, client: a.client, labels: a.labels, state: a.ended ? "ended" : "idle", template: a.template };
+    // As nest's `info()` answers: `ended` once it ended; the brain's host while it has one.
+    const state = a.state ?? "idle";
+    return {
+      agent: a.agent, owner: a.owner, client: a.client, labels: a.labels, state: a.ended ? "ended" : state, template: a.template,
+      host: a.ended || state === "starting" ? null : "bh_1", capacity_waits: a.capacityWaits ?? 0,
+      ...(a.ended ? { ended: { ms: 1, by: "client", reason: "stopped" } } : {}),
+    };
   }
 
   /** An agent nest has but the app didn't record (another client's, or one an agent spawned). */

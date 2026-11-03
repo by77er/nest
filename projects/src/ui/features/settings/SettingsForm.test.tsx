@@ -6,10 +6,11 @@ import { describe, expect, it } from "vitest";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 
+/** The Settings page (it was a modal): its form, as `dialog` for the tests below. */
 async function openSettings(api: FakeApi) {
-  const r = renderApp("/projects/prj_one", api);
-  await r.user.click(await screen.findByRole("button", { name: "Settings" }));
-  return { ...r, dialog: screen.getByRole("dialog", { name: "Project settings" }) };
+  const r = renderApp("/projects/prj_one/settings", api);
+  await screen.findByRole("heading", { level: 1, name: "Settings" });
+  return { ...r, dialog: await screen.findByRole("main") };
 }
 
 describe("auto-merge in the settings", () => {

@@ -3,6 +3,7 @@
 // Worker refuses.
 
 import { type TaskEvent, type TaskState, transition } from "../tasks";
+import type { JobState } from "../do/review";
 import type { Role } from "./theme";
 
 export const STATE_LABEL: Record<TaskState, string> = {
@@ -47,3 +48,13 @@ export const CANCELLED_COLUMN: Column = { id: "cancelled", title: "Cancelled", s
 
 /** Whether the owner's `event` applies to a task in `state` (the Worker's own table). */
 export const can = (state: TaskState, event: TaskEvent) => transition(state, event).ok;
+
+/** A review job's state (src/do/review.ts) as the Reviews page shows it; a done job by its verdict. */
+export const REVIEW_STATE: Record<JobState, { label: string; color: Role }> = {
+  queued: { label: "Queued", color: "gray" },
+  running: { label: "Reviewing", color: "primary" },
+  done: { label: "Reviewed", color: "success" },
+  failed: { label: "Failed", color: "danger" },
+  superseded: { label: "Superseded", color: "gray" },
+  closed: { label: "Closed", color: "gray" },
+};

@@ -108,4 +108,27 @@ describe("asks", () => {
     const listed = await screen.findByRole("article", { name: "Widgets" });
     expect(within(listed).getByText("2 need you")).toBeInTheDocument();
   });
+
+  it("shows the oldest three, the rest behind \"Show all (n)\", so the board stays in view", async () => {
+    const api = new FakeApi();
+    const now = Date.now();
+    api.asks = [5, 4, 3, 2, 1].map((n) => ask({ question: `Ask ${n}`, at_ms: now - n * 60_000 }));
+    const { user } = renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    const shown = () => [...p.querySelectorAll("[data-ask]")].filter((e) => !e.closest("[aria-hidden=true]") && !e.closest('[style*="display: none"]')).map((e) => /Ask \d/.exec(e.textContent ?? "")![0]);
+    expect(shown()).toEqual(["Ask 5", "Ask 4", "Ask 3"]);
+    const toggle = within(p).getByRole("button", { name: "Show all (5)" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    await user.click(toggle);
+    await waitFor(() => expect(shown()).toEqual(["Ask 5", "Ask 4", "Ask 3", "Ask 2", "Ask 1"]));
+    expect(within(p).getByRole("button", { name: "Show fewer" })).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("has no toggle with three or fewer", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Only one" })];
+    renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    expect(within(p).queryByRole("button", { name: /Show all/ })).toBeNull();
+  });
 });
