@@ -245,6 +245,12 @@
   inset: 0;
 }
 
+/* The card's own controls (a PR's link, a badge with details) sit above the whole-card link. */
+.card :is(a, button, [tabindex]):not(.cardTitle) {
+  position: relative;
+  z-index: 1;
+}
+
 .cardBody {
   position: relative;
   display: flex;

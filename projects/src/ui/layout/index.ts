@@ -6,7 +6,7 @@ export { Bubble, PinnedFooter, ScrollLog } from "./Chat";
 export { FadeIn } from "./FadeIn";
 export { Glyph, GLYPH, Terminal, TermLine, TermRule, TermStatus, type TermTone } from "./Terminal";
 export { FieldGroup } from "./FieldGroup";
-export { CardGrid, ColumnGrid, SectionGrid, TouchTarget, WithContext } from "./Layouts";
+export { CardGrid, ColumnGrid, SectionGrid, TriggerBadge, WithContext } from "./Layouts";
 export { MetaItem, MetaRow } from "./Meta";
 export { NavGroup, NavGroups, NavRow, SwitcherTarget } from "./Nav";
 export { Switcher, type SwitcherItem } from "./Switcher";

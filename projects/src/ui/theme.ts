@@ -265,7 +265,7 @@ export const theme = createTheme({
     }),
     Modal: Modal.extend({ defaultProps: { radius: "md", padding: "xl", shadow: "overlay", transitionProps: transition(motion.slow) }, styles: { title: { fontSize: headings.h2.fontSize, lineHeight: headings.h2.lineHeight, fontWeight: 600 } } }),
     Drawer: Drawer.extend({ defaultProps: { padding: "xl", shadow: "overlay", transitionProps: transition(motion.slow) }, styles: { title: { fontSize: headings.h2.fontSize, lineHeight: headings.h2.lineHeight, fontWeight: 600 } } }),
-    Tooltip: Tooltip.extend({ defaultProps: { transitionProps: transition(motion.base) } }),
+    Tooltip: Tooltip.extend({ defaultProps: { transitionProps: transition(motion.base), events: { hover: true, focus: true, touch: true } } }),
     Popover: Popover.extend({ defaultProps: { shadow: "overlay", transitionProps: transition(motion.base) } }),
     Timeline: Timeline.extend({ defaultProps: { bulletSize: 12, lineWidth: 2 } }),
     Collapse: Collapse.extend({ defaultProps: { transitionDuration: motion.slow, transitionTimingFunction: motion.enter } }),
