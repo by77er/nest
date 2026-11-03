@@ -1012,8 +1012,8 @@ export class ProjectDO extends DurableObject<Env> {
       const injectHosts = (await nest.self()).grant?.inject_hosts ?? [];
       const again = this.frozenSpec(key);
       if (again) return again;
-      // Everything else as it is now, after the await: a setting turned off meanwhile (workflows) must
-      // not freeze as it was before (`abandonWorkflowStarts` found nothing frozen to abandon).
+      // Everything else as it is now, after the await: a setting changed meanwhile (workflows turned
+      // off, when nothing was frozen yet for that change to act on) must not freeze as it was before.
       const s = this.settings()!;
       const { inject, env, secrets: mine } = this.secretFeeds(role, injectHosts);
       const extras: SandboxExtras = {
