@@ -3,10 +3,43 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { RecordingSocket } from "../../test/sockets";
-import { FakeApi } from "../../test/fakeApi";
+import { ask, FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 
 describe("the Manager page", () => {
+  it("its context lists the tasks under way, newest change first, and the top things waiting on you", async () => {
+    const api = new FakeApi();
+    const states = ["assigned", "in_progress", "in_review", "stalled", "in_progress", "in_review", "assigned"] as const;
+    const active = states.map((state, i) => task({ title: `Active ${i}`, state, updated_ms: 1_000 + i }));
+    // Not under way, however new: a draft just written, a ready task, a done one.
+    api.tasks = [...active, task({ title: "Fresh draft", state: "draft", updated_ms: 9_999 }), task({ title: "Queued", state: "ready" }), task({ title: "Shipped", state: "done" })];
+    api.asks = [1, 2, 3, 4].map((n) => ask({ question: `Question ${n}?`, at_ms: n }));
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
+    const context = document.querySelector("[data-slot=manager-context]") as HTMLElement;
+    const working = (await within(context).findByRole("heading", { name: "Working on" })).closest("[data-ds=section]") as HTMLElement;
+    // The count is every active task, not the five shown; the rest are a link to the Board.
+    await waitFor(() => expect(working.querySelectorAll("[data-ds=task-card]")).toHaveLength(5));
+    expect(within(working).getByLabelText("7 items")).toBeInTheDocument();
+    expect([...working.querySelectorAll("[data-ds=task-card]")].map((c) => c.getAttribute("data-task-ref"))).toEqual(active.slice(2).reverse().map((t) => t.id));
+    expect(within(working).getByRole("link", { name: "2 more on the board" })).toHaveAttribute("href", "/projects/prj_one/board");
+    expect(working).not.toHaveTextContent("Fresh draft");
+    // What waits on you: the oldest three questions, each a link to the Board, no count; the rest a link.
+    const needs = within(context).getByRole("heading", { name: "Needs you" }).closest("[data-ds=section]") as HTMLElement;
+    await waitFor(() => expect(within(needs).getAllByRole("link", { name: /^Question/ }).map((a) => a.textContent)).toEqual(["Question 1?", "Question 2?", "Question 3?"]));
+    expect(needs.querySelector("[data-slot=count]")).toBeNull();
+    expect(within(needs).getByRole("link", { name: "1 more on the board" })).toBeInTheDocument();
+    // The status is the header's, not repeated here.
+    expect(within(context).queryByRole("heading", { name: "Status" })).toBeNull();
+  });
+
+  it("with nothing waiting, the context says so in a sentence", async () => {
+    const { user } = renderApp("/projects/prj_one/manager", new FakeApi());
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
+    expect(await screen.findByText("Nothing waits on you.")).toBeInTheDocument();
+    expect(screen.getByText("Nothing under way.")).toBeInTheDocument();
+  });
+
   it("shows the manager running, what it's doing and where, in the header", async () => {
     const api = new FakeApi();
     api.manager = { phase: "running", agent: "agt_manager", state: "waiting_input", host: "bh_7", error: null };

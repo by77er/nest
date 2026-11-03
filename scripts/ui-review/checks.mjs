@@ -6,10 +6,11 @@
  * @param {{
  *   frame: string, header: string, measure: string | null, containers: string[],
  *   nav: { rows: string, brand: string, active: string } | null, viewportOnly: boolean,
+ *   content?: { root: string, minHeading: number, figures: string } | null,
  * }} sel
  */
 export function measure(sel) {
-  const problems = { overflow: [], clipping: [], contrast: [], nav: [], measure: [], frame: [] };
+  const problems = { overflow: [], clipping: [], contrast: [], nav: [], measure: [], frame: [], content: [] };
   const doc = document.documentElement;
   const W = doc.clientWidth;
   const H = window.innerHeight;
@@ -183,6 +184,32 @@ export function measure(sel) {
         for (const [what, css] of [["ground", cs.backgroundColor], ["rule", cs.borderLeftColor], ["text", cs.color]]) {
           const c = rgba(css);
           if (c[3] > 0.1 && chroma(c) > 0.12) problems.nav.push(`the active row's ${what} is a role color (${hex(c)})`);
+        }
+      }
+    }
+  }
+
+  // --- user content (Markdown, SVG) can't change the page's outline, hierarchy or ground ---
+  if (sel.content) {
+    for (const root of document.querySelectorAll(sel.content.root)) {
+      if (!visible(root)) continue;
+      const body = parseFloat(getComputedStyle(root).fontSize);
+      for (const h of root.querySelectorAll("h1, h2, h3, h4, h5, h6")) {
+        if (!visible(h)) continue;
+        const level = Number(h.tagName[1]);
+        if (level < sel.content.minHeading) problems.content.push(`a heading in user content is an h${level}, above the h${sel.content.minHeading} it's demoted to: "${short(h.textContent)}"`);
+        const size = parseFloat(getComputedStyle(h).fontSize);
+        if (size < body - 0.5) problems.content.push(`a heading in user content is smaller than its text (${size} < ${body} px): "${short(h.textContent)}"`);
+      }
+    }
+    for (const fig of document.querySelectorAll(sel.content.figures)) {
+      if (!visible(fig)) continue;
+      const bg = ground(fig);
+      if (bg && lum(bg) < 0.85) problems.content.push(`a figure sits on a dark ground (${hex(bg)}), not a fixed light canvas`);
+      for (let e = fig.querySelector("img, svg") ?? fig; e; e = e.parentElement) {
+        if (/invert/.test(getComputedStyle(e).filter)) {
+          problems.content.push("a figure is inverted (filter: invert)");
+          break;
         }
       }
     }

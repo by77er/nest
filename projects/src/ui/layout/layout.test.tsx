@@ -183,7 +183,7 @@ describe("Page, Measure and PinnedFooter", () => {
 describe("WithContext and SectionGrid", () => {
   it("puts the content first and the context beside it, or above it in a disclosure when narrow", async () => {
     wrap(
-      <WithContext contextLabel="About it" context={<p>context</p>}>
+      <WithContext measure="reading" contextLabel="About it" context={<p>context</p>}>
         <p>content</p>
       </WithContext>,
     );

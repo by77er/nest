@@ -12,7 +12,7 @@ import { icon, MetaItem, MetaRow, Prose, Row, Stack, Toolbar } from "../../layou
 import { RichMessage } from "../rich/RichMessage";
 
 /** nest's approval: `{name, tool}` of the call it held (docs/agents/tools/#taint-and-sinks). */
-function approvalOf(a: Ask): { name: string; tool: string | null } | null {
+export function approvalOf(a: Ask): { name: string; tool: string | null } | null {
   const x = a.approval as { name?: unknown; tool?: unknown } | null;
   if (typeof x !== "object" || x === null || typeof x.name !== "string") return null;
   return { name: x.name, tool: typeof x.tool === "string" ? x.tool : null };

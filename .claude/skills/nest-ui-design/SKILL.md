@@ -68,7 +68,7 @@ Defined once in the theme (as Mantine values and CSS variables) and used by name
 - **Text on a filled role:** white in light (dark on warning); in dark, the dark `page` (`#121314`) on every role, since white on the dark values is only 3.3 to 3.6:1.
 - **A role's text on the ground** (an error line, a warning caption): shade 7 in light (8 for warning), shade 3 in dark. Shade 6 of warning is under 2:1 on white.
 - No pure RGB, and no color outside this table.
-- **Contrast:** all text, every filled role's text and every light badge meet WCAG AA (4.5:1) in both schemes. A failing value is fixed here and in the theme together. (Bootstrap's `#6c757d` is 4.49:1 on light `page`, hence `muted` `#666e76`.)
+- **Contrast:** all text, every filled role's text and every light badge meet WCAG AA (4.5:1) in both schemes. A failing value is fixed here and in the theme together. A neutral (gray) outline badge is `muted` text on a `border` hairline in both schemes, mapped once in the theme for every such badge; the framework's error color (a field's error, the required asterisk) is the danger role's text shade. (Bootstrap's `#6c757d` is 4.49:1 on light `page`, hence `muted` `#666e76`.)
 
 ## Layout primitives
 

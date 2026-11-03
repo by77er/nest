@@ -1,5 +1,7 @@
 // A project's settings: whether ready tasks are assigned automatically, how many workers may run, and
 // whether task PRs merge automatically once their review passes (with the repo's setting behind it).
+// The two Panels sit in one row with Save right under them at the bottom right; on a phone, one column,
+// so Save comes right after the last field.
 
 import { Badge, Button, NumberInput, Select, Switch, Text } from "@mantine/core";
 import { schemaResolver, useForm } from "@mantine/form";
@@ -15,8 +17,8 @@ const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", 
 
 const values = (s: Settings) => ({ auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method });
 
-/** The settings as sections in a grid (`before` and `after` add Panels of the page's own), saved together. */
-export function SettingsForm({ projectId, settings, onDone, before, after }: { projectId: string; settings: Settings; onDone?: () => void; before?: React.ReactNode; after?: React.ReactNode }) {
+/** The editable settings as Panels in a row, saved together by the one Save right under them. */
+export function SettingsForm({ projectId, settings, onDone }: { projectId: string; settings: Settings; onDone?: () => void }) {
   const update = useUpdateSettings(projectId);
   const form = useForm({
     initialValues: values(settings),
@@ -36,9 +38,8 @@ export function SettingsForm({ projectId, settings, onDone, before, after }: { p
     >
       <Stack gap="xl">
         <SectionGrid>
-          {before}
           <Panel>
-            <Section title="Workers" region={false}>
+            <Section title="Workers" order={4} region={false}>
               <FieldGroup>
                 <Switch
                   label="Assign ready tasks automatically"
@@ -58,7 +59,7 @@ export function SettingsForm({ projectId, settings, onDone, before, after }: { p
             </Section>
           </Panel>
           <Panel>
-            <Section title="Auto-merge" region={false}>
+            <Section title="Auto-merge" order={4} region={false}>
               <FieldGroup>
                 <Switch
                   label="Auto-merge when review passes"
@@ -76,7 +77,6 @@ export function SettingsForm({ projectId, settings, onDone, before, after }: { p
               </FieldGroup>
             </Section>
           </Panel>
-          {after}
         </SectionGrid>
         <Toolbar>
           {onDone && (

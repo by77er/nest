@@ -18,7 +18,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
 const WIDTHS = [1440, 1280, 390];
 const SCHEMES = ["light", "dark"];
-const CHECKS = ["overflow", "clipping", "frame", "nav", "contrast", "measure", "page-error"];
+const CHECKS = ["overflow", "clipping", "frame", "nav", "contrast", "measure", "content", "page-error"];
 
 const die = (msg) => {
   console.error(`ui-review: ${msg}`);

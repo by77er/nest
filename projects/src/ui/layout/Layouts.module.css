@@ -44,8 +44,10 @@
   }
 }
 
-/* Content and its context: the main column on the frame's left edge, the context column (a token's
-   width, sticky) at its right; below lg, the context is a disclosure above the content. */
+/* Content and its context: the main column at its measure on the frame's left edge, then one gap, then
+   the context column (sticky): at least 16rem, at most the token's width and never more than a third.
+   The gap is the same at every width; what's left over stays at the right. Below lg, the context is a
+   disclosure above the content. */
 .withContext {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -55,8 +57,17 @@
 
 @media (min-width: 75em) {
   .withContext {
-    grid-template-columns: minmax(0, 1fr) var(--nest-context-column);
+    grid-template-columns: minmax(0, var(--nest-with-context-main)) minmax(16rem, min(var(--nest-context-column), 33%));
+    justify-content: start;
     gap: var(--mantine-spacing-2xl);
+  }
+
+  .withContext[data-main="reading"] {
+    --nest-with-context-main: var(--nest-reading-measure);
+  }
+
+  .withContext[data-main="form"] {
+    --nest-with-context-main: var(--nest-measure);
   }
 
   .context {

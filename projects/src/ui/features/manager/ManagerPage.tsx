@@ -1,6 +1,6 @@
 // A project's manager, in the same frame as every view: the conversation at a reading measure on the
-// frame's left edge, the context column beside it (status, its tasks, what needs you); the conversation the composer pinned
-// to the bottom; its status in the header; and beside "Chat", its live trace (`?view=trace`).
+// frame's left edge, the context column beside it (its tasks, what needs you); the composer pinned to
+// the bottom; its status in the header; and beside "Chat", its live trace (`?view=trace`).
 
 import { Tabs } from "@mantine/core";
 import { IconMessage, IconTimeline } from "@tabler/icons-react";
@@ -20,7 +20,7 @@ export function ManagerPage() {
   return (
     <ProjectFrame projectId={projectId}>
       {(p) => (
-        <WithContext contextLabel="About the manager" context={<ManagerContext projectId={projectId} />}>
+        <WithContext measure="reading" contextLabel="About the manager" context={<ManagerContext projectId={projectId} />}>
         <Measure type="reading">
         <Section title="Manager" actions={<ManagerStatusLine projectId={projectId} />}>
         <Stack gap="xl">

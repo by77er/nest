@@ -14,6 +14,7 @@ const sel = {
   containers: ["[data-ds=panel]"],
   nav: { rows: "[data-ds=nav-row]", brand: "#brand", active: "[aria-current=page]" },
   viewportOnly: false,
+  content: { root: "[data-ds=rich]", minHeading: 4, figures: "[data-ds=figure-canvas]" },
 };
 
 /** A small app page; each `bad` key plants one violation. */
@@ -27,6 +28,8 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
   [data-measure] { max-width: 400px; ${bad.measure ? "margin: 0 auto;" : ""} }
   [data-ds=panel] { border: 1px solid #e9ecef; padding: 16px; background: #fff; }
   .cut { width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  [data-ds=rich] h4 { font-size: ${bad.small ? "11px" : "inherit"}; font-weight: 600; }
+  [data-ds=figure-canvas] { width: 120px; height: 40px; border: 1px solid #dee2e6; background: ${bad.figure ? "#1a1b1e" : "#ffffff"}; }
   .faint { color: ${bad.contrast ? "#c8c8c8" : "#666e76"}; }
 </style></head><body>
   <nav><div id="brand">nest</div>
@@ -38,6 +41,7 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
     <div data-ds="panel"><p class="faint">Updated 2 min ago</p>
       ${bad.clip ? '<p class="cut">A title far too long for its box</p>' : '<p class="cut">Short</p>'}
       ${bad.escape ? '<div style="width: 2000px">Wider than its panel</div>' : ""}
+      <div data-ds="rich">${bad.heading ? "<h2>Plan</h2>" : "<h4>Plan</h4>"}<p>The message's text.</p><div data-ds="figure-canvas"></div></div>
     </div>
   </div></div>
 </body></html>`;
@@ -60,6 +64,9 @@ for (const [bad, checks] of [
   [{ h1: true }, ["frame"]],
   [{ nav: true }, ["contrast", "nav"]], // white-on-blue Board text is also under 4.5:1
   [{ edge: true }, ["nav"]],
+  [{ heading: true }, ["content"]],
+  [{ small: true }, ["content"]],
+  [{ figure: true }, ["content"]],
 ]) {
   const got = await run(bad);
   assert.deepEqual(failing(got), checks, `${JSON.stringify(bad)}: ${JSON.stringify(got)}`);

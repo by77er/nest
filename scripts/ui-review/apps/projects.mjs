@@ -29,6 +29,8 @@ export default {
     measure: "[data-measure]",
     containers: ["[data-ds=panel]", "[data-ds=table-frame]"],
     nav: { rows: "[data-ds=nav-row], [data-ds=switcher]", brand: "#sidebar [aria-label='nest projects: all projects']", active: "[aria-current=page]" },
+    // A manager's message: its headings demoted below the page's (an h4 at most), its figures on a light canvas.
+    content: { root: "[data-ds=rich]", minHeading: 4, figures: "[data-ds=figure-canvas]" },
   },
   /** Installs the fixtures for a state before the page loads. */
   async serve(page, state) {
@@ -56,6 +58,13 @@ export default {
     { name: "drawer", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false },
     { name: "new-task", section: "project", path: "/projects/prj_demo/board", full: false, after: (p) => p.getByRole("button", { name: "New task" }).click() },
     { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false },
+    { name: "manager-rich", section: "project", path: "/projects/prj_demo/manager", fixture: "rich" },
+    { name: "manager-rich-view", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false },
+    { name: "manager-empty", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false },
+    { name: "manager-long", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false },
+    { name: "manager-long-full", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long" },
+    { name: "manager-context-open", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click() },
+    { name: "svg-modal", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false, widths: DESKTOP, after: (p) => p.getByRole("button", { name: /Search pipeline: open larger/ }).click() },
     { name: "manager-trace", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false },
     { name: "reviews", section: "project", path: "/projects/prj_demo/reviews" },
     { name: "reviews-trace", section: "project", path: "/projects/prj_demo/reviews", after: (p) => p.getByRole("button", { name: "Show the trace of #118" }).click() },

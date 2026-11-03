@@ -25,15 +25,16 @@ export function CardGrid({ children }: { children: ReactNode }) {
 }
 
 /**
- * A view whose content is narrow: the content on the frame's left edge, and beside it, from `lg` on,
- * a context column (sticky) using the width for related things, not empty margins. Below `lg` the
+ * A view whose content is narrow: the content at its measure on the frame's left edge, and beside it,
+ * from `lg` on, a context column (sticky, at most a third of the width) using the width for related
+ * things, not empty margins. Below `lg` the
  * context is a disclosure above the content (`contextLabel` names it).
  */
-export function WithContext({ children, context, contextLabel }: { children: ReactNode; context: ReactNode; contextLabel: string }) {
+export function WithContext({ children, context, contextLabel, measure }: { children: ReactNode; context: ReactNode; contextLabel: string; measure: "reading" | "form" }) {
   const wide = useMediaQuery("(min-width: 75em)") ?? true;
   const [open, { toggle }] = useDisclosure(false);
   return (
-    <div className={classes.withContext} data-ds="with-context">
+    <div className={classes.withContext} data-ds="with-context" data-main={measure}>
       {!wide && (
         <div data-slot="context-disclosure">
           <Button variant="default" fullWidth justify="space-between" onClick={toggle} aria-expanded={open} rightSection={open ? <IconChevronUp size={icon.sm} /> : <IconChevronDown size={icon.sm} />}>
@@ -56,10 +57,10 @@ export function WithContext({ children, context, contextLabel }: { children: Rea
   );
 }
 
-/** Sections of a page as Panels in a responsive grid: one column, two from `lg`. */
+/** Sections of a page as Panels in a responsive grid: one column, two from `lg`, each as tall as its content. */
 export function SectionGrid({ children }: { children: ReactNode }) {
   return (
-    <SimpleGrid cols={{ base: 1, lg: 2 }} spacing="xl" verticalSpacing="xl" data-ds="section-grid">
+    <SimpleGrid cols={{ base: 1, lg: 2 }} spacing="xl" verticalSpacing="xl" style={{ alignItems: "start" }} data-ds="section-grid">
       {children}
     </SimpleGrid>
   );
