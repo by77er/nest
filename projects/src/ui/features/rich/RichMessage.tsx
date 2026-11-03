@@ -4,14 +4,15 @@
 // literal text first, and no rehype-raw is in the pipeline.
 
 import { Anchor } from "@mantine/core";
+import { IconPhoto } from "@tabler/icons-react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import { RichImage, RichProse, RichTableFrame, Stack } from "../../layout";
+import { icon, RichImage, RichProse, RichTableFrame, Stack, TaskCheck } from "../../layout";
 import { INLINE_IMAGE, LINK, urlTransform } from "../../rich/links";
 import { splitSvg } from "../../rich/svg";
-import { remarkEscapeHtml, remarkTaskRefs, TASK_HREF } from "../../rich/tasks";
+import { remarkDemoteHeadings, remarkEscapeHtml, remarkTaskRefs, TASK_HREF } from "../../rich/tasks";
 import { SvgBlock } from "./SvgBlock";
 import { TaskBlock, TaskChip } from "./TaskRefs";
 
@@ -48,7 +49,7 @@ function components(projectId: string): Components {
       if (LINK.test(s)) {
         return (
           <Anchor href={s} target="_blank" rel="noopener noreferrer" inherit data-image-link>
-            {alt || s}
+            <IconPhoto size={icon.sm} aria-hidden /> {alt || s}
           </Anchor>
         );
       }
@@ -59,14 +60,14 @@ function components(projectId: string): Components {
         <table>{children}</table>
       </RichTableFrame>
     ),
-    input: ({ type, checked }) => (type === "checkbox" ? <input type="checkbox" checked={!!checked} disabled readOnly aria-label={checked ? "done" : "not done"} /> : null),
+    input: ({ type, checked }) => (type === "checkbox" ? <TaskCheck checked={!!checked} /> : null),
   };
 }
 
 export function Markdown({ text, projectId }: { text: string; projectId: string }) {
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkEscapeHtml, remarkGfm, remarkMath, remarkTaskRefs]}
+      remarkPlugins={[remarkEscapeHtml, remarkGfm, remarkMath, remarkTaskRefs, remarkDemoteHeadings]}
       rehypePlugins={[[rehypeKatex, KATEX_OPTIONS]]}
       urlTransform={urlTransform}
       skipHtml={false}

@@ -9,7 +9,7 @@ import { useChat, usePostChat } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { RichMessage } from "../rich/RichMessage";
-import { Bubble, ErrorState, icon, LoadingState, PinnedFooter, Prose, Row, Stack } from "../../layout";
+import { Bubble, ErrorState, icon, LoadingState, PinnedFooter, Prose, Row, ScrollSentinel, Stack } from "../../layout";
 
 const WHO: Record<string, string> = { owner: "You", manager: "Manager", app: "The app" };
 
@@ -57,12 +57,47 @@ export function ChatView({ projectId }: { projectId: string }) {
   const post = usePostChat(projectId);
   const [text, setText] = useState("");
   const end = useRef<HTMLDivElement>(null);
+  const footer = useRef<HTMLDivElement>(null);
+  const [footerHeight, setFooterHeight] = useState(0);
+  const atBottom = useRef(true);
   const count = chat.data?.length ?? 0;
 
   // Keep the newest message in view as messages arrive.
+  // The composer docks over the page's bottom: the newest message must clear it. Its height is measured,
+  // and the end sentinel keeps that much room when scrolled to.
   useEffect(() => {
-    if (count) end.current?.scrollIntoView({ block: "end" });
-  }, [count]);
+    const el = footer.current;
+    if (!el) return;
+    const ro = new ResizeObserver(() => setFooterHeight(el.offsetHeight));
+    ro.observe(el);
+    setFooterHeight(el.offsetHeight);
+    return () => ro.disconnect();
+  }, []);
+
+  // Follow the end only while the reader is already there.
+  useEffect(() => {
+    const onScroll = () => {
+      const s = document.scrollingElement ?? document.documentElement;
+      atBottom.current = s.scrollHeight - s.scrollTop - s.clientHeight < footerHeight + 32;
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, [footerHeight]);
+
+  // New messages, and content that grows after it renders (math, images, the SVG), keep the end in view
+  // while the reader is at it.
+  useEffect(() => {
+    if (count && atBottom.current) end.current?.scrollIntoView({ block: "end" });
+  }, [count, footerHeight]);
+  useEffect(() => {
+    const log = end.current?.parentElement;
+    if (!log) return;
+    const ro = new ResizeObserver(() => {
+      if (atBottom.current) end.current?.scrollIntoView({ block: "end" });
+    });
+    ro.observe(log);
+    return () => ro.disconnect();
+  }, []);
 
   const send = () => {
     const t = text.trim();
@@ -89,9 +124,9 @@ export function ChatView({ projectId }: { projectId: string }) {
           ))}
         </Stack>
       )}
-      <div ref={end} />
+      <ScrollSentinel ref={end} footer={footerHeight} />
 
-      <PinnedFooter>
+      <PinnedFooter ref={footer}>
         <form
           onSubmit={(e) => {
             e.preventDefault();

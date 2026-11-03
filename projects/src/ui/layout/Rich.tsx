@@ -3,6 +3,8 @@
 // and a task's chip and card. Styles in Rich.module.css, from the skill's tokens.
 
 import { Button, Code, Modal, Stack } from "@mantine/core";
+import { IconSquare, IconSquareCheck } from "@tabler/icons-react";
+import { icon } from "../theme";
 import { useDisclosure } from "@mantine/hooks";
 import { forwardRef, type AnchorHTMLAttributes, type ReactNode } from "react";
 import classes from "./Rich.module.css";
@@ -49,8 +51,10 @@ export function SvgFigure({ url, source, label }: { url: string; source: string;
           {source}
         </Code>
       )}
-      <Modal opened={opened} onClose={modal.close} title={label} size="auto" centered>
-        <img className={classes.large} src={url} alt={label} />
+      <Modal opened={opened} onClose={modal.close} title={label} size="min(94vw, 68rem)" centered>
+        <div className={classes.canvas}>
+          <img className={classes.large} src={url} alt={label} />
+        </div>
       </Modal>
     </Stack>
   );
@@ -82,3 +86,29 @@ export function TaskRefCard({ children, ...data }: { children: ReactNode; [k: `d
     </article>
   );
 }
+
+/** A task list's box, read-only: a check-square when done, an empty square when not. */
+export function TaskCheck({ checked }: { checked: boolean }) {
+  return (
+    <span className={classes.check} role="checkbox" aria-checked={checked} aria-disabled aria-label={checked ? "done" : "not done"} data-task-check>
+      {checked ? <IconSquareCheck size={icon.md} aria-hidden /> : <IconSquare size={icon.md} aria-hidden />}
+    </span>
+  );
+}
+
+/** A chat message's bubble: `end` the owner's, `start` the manager's, `note` the app's. */
+export function Bubble({ side, children, ...data }: { side: "start" | "end" | "note"; children: ReactNode; [k: `data-${string}`]: string | undefined }) {
+  return (
+    <div className={classes.bubble} data-side={side} data-ds="bubble" {...data}>
+      {children}
+    </div>
+  );
+}
+
+/**
+ * The end of a scrolling log: scrolled into view with room for what docks over the bottom (`footer`,
+ * its height in px, measured by the caller), so the newest message is never under the composer.
+ */
+export const ScrollSentinel = forwardRef<HTMLDivElement, { footer: number }>(function ScrollSentinel({ footer }, ref) {
+  return <div ref={ref} className={classes.sentinel} style={{ ["--nest-chat-footer" as string]: `${footer}px` }} data-ds="scroll-sentinel" />;
+});

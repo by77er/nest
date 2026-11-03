@@ -16,19 +16,13 @@
   margin: 0;
 }
 
+/* A message's headings (demoted to h4–h6 in the outline) are body-lg in weight 600: three sizes in a
+   message only (body-lg, small for tables, code and card meta, caption for its header line). */
 .prose :where(h1, h2, h3, h4, h5, h6) {
   margin: var(--mantine-spacing-md) 0 0;
+  font-size: inherit;
+  line-height: inherit;
   font-weight: 600;
-  line-height: var(--mantine-h4-line-height);
-}
-
-.prose :where(h1, h2) {
-  font-size: var(--mantine-h3-font-size);
-  line-height: var(--mantine-h3-line-height);
-}
-
-.prose :where(h3, h4, h5, h6) {
-  font-size: var(--mantine-h4-font-size);
 }
 
 .prose > :first-child {
@@ -44,16 +38,12 @@
 }
 
 /* A task list's items: their (read-only) box in the list's own indent. */
-.prose li:has(> input[type="checkbox"]) {
+.prose li:has(> [data-task-check]) {
   list-style: none;
   margin-left: calc(var(--mantine-spacing-xl) * -1);
 }
 
-.prose input[type="checkbox"] {
-  margin: 0 var(--mantine-spacing-sm) 0 0;
-  vertical-align: -0.125em;
-  pointer-events: none;
-}
+
 
 .prose blockquote {
   padding-left: var(--mantine-spacing-md);
@@ -81,8 +71,13 @@
   overflow-wrap: normal;
 }
 
-.prose a {
+/* Prose links in the anchor color; a chip or card title (its own class) keeps the text color. */
+:where(.prose) a {
   color: var(--mantine-color-anchor);
+}
+
+.prose code[data-task-ref="unresolved"] {
+  color: var(--nest-muted);
 }
 
 .prose hr {
@@ -119,14 +114,15 @@
 
 /* Display math scrolls inside its own frame when wide; a bad formula shows its source in the error shade. */
 .prose :global(.katex-display) {
+  text-align: left;
   overflow-x: auto;
   overflow-y: hidden;
   padding: var(--mantine-spacing-2xs) 0;
   margin: 0;
 }
 
-.prose :global(.katex) {
-  font-size: 1.05em;
+.prose :global(.katex-display) > :global(.katex) {
+  text-align: left;
 }
 
 /* An inline image (a data: raster) or an SVG figure: capped, on the subtle ground. */
@@ -138,14 +134,23 @@
   border-radius: var(--mantine-radius-md);
 }
 
+/* An SVG figure sits on a fixed light canvas in both schemes: user content can't change the page's
+   ground, and a diagram drawn for white stays legible (never inverted). */
 .figure {
   display: inline-block;
   max-width: 100%;
   padding: var(--mantine-spacing-sm);
-  border: var(--nest-border);
+  border: 1px solid #dee2e6;
   border-radius: var(--mantine-radius-md);
-  background: var(--nest-surface);
+  background: #ffffff;
   cursor: zoom-in;
+}
+
+.canvas {
+  padding: var(--mantine-spacing-md);
+  border: 1px solid #dee2e6;
+  border-radius: var(--mantine-radius-md);
+  background: #ffffff;
 }
 
 .figure:focus-visible {
@@ -153,11 +158,15 @@
   outline-offset: 2px;
 }
 
+/* Open larger: scaled to fit the screen, never smaller than in the message. */
 .large {
   display: block;
+  width: min(90vw, 64rem);
   max-width: 100%;
+  height: auto;
   max-height: 80vh;
   margin: 0 auto;
+  object-fit: contain;
 }
 
 /* A task in a message: inline, a chip; in a block, a compact card with a hairline, no second Panel. */
@@ -170,8 +179,8 @@
   border: var(--nest-border);
   border-radius: var(--mantine-radius-sm);
   color: var(--mantine-color-text);
-  font-size: var(--mantine-font-size-sm);
-  line-height: var(--mantine-line-height-sm);
+  font-size: inherit;
+  line-height: inherit;
   text-decoration: none;
   vertical-align: baseline;
 }
@@ -200,8 +209,8 @@
   border: var(--nest-border);
   border-radius: var(--mantine-radius-md);
   background: var(--nest-surface);
-  font-size: var(--mantine-font-size-md);
-  line-height: var(--mantine-line-height-md);
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
 }
 
 .cardTitle {
@@ -226,4 +235,52 @@
   display: flex;
   flex-direction: column;
   gap: var(--mantine-spacing-xs);
+}
+
+/* A task list's box: a theme icon, the text color when done, muted when not (the native one is 1.5:1). */
+.check {
+  display: inline-flex;
+  vertical-align: -0.15em;
+  margin-right: var(--mantine-spacing-sm);
+  color: var(--nest-muted);
+}
+
+.check[aria-checked="true"] {
+  color: var(--mantine-color-text);
+}
+
+/* A message bubble: the owner's on the subtle ground at the end, the manager's across the measure; on a
+   phone, a manager's message takes the full width. */
+.bubble {
+  max-width: 88%;
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  border-radius: var(--mantine-radius-md);
+}
+
+.bubble[data-side="end"] {
+  align-self: flex-end;
+  background: var(--nest-subtle);
+}
+
+.bubble[data-side="start"] {
+  align-self: flex-start;
+  border: var(--nest-border);
+}
+
+.bubble[data-side="note"] {
+  align-self: center;
+  max-width: 100%;
+  padding: var(--mantine-spacing-2xs) var(--mantine-spacing-sm);
+  text-align: center;
+}
+
+@media (max-width: 48em) {
+  .bubble[data-side="start"] {
+    max-width: 100%;
+  }
+}
+
+/* The sentinel at the log's end: scrolled to with room for the composer docked over the page's bottom. */
+.sentinel {
+  scroll-margin-bottom: var(--nest-chat-footer, 0px);
 }
