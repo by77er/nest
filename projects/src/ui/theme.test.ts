@@ -126,6 +126,13 @@ describe("the tokens match the skill", () => {
   });
 });
 
+describe("tooltips", () => {
+  it("open on hover, focus and touch, everywhere: details are reachable on a phone", () => {
+    const props = (theme.components?.Tooltip?.defaultProps ?? {}) as { events?: { hover?: boolean; focus?: boolean; touch?: boolean } };
+    expect(props.events).toEqual({ hover: true, focus: true, touch: true });
+  });
+});
+
 describe("contrast, in both schemes", () => {
   const vars = cssVariablesResolver(full);
   const schemes = ["light", "dark"] as const;

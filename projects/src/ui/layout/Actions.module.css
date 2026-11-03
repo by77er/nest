@@ -28,6 +28,8 @@
 @media (pointer: coarse) {
   .trigger {
     min-height: var(--nest-hit-touch);
+    min-width: var(--nest-hit-touch);
+    justify-content: center;
   }
 }
 

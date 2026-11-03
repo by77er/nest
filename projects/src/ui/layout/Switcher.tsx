@@ -5,7 +5,7 @@
 import { Combobox, Group, Text, useCombobox } from "@mantine/core";
 import { IconSelector } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useState } from "react";
-import { icon } from "../theme";
+import { icon, weight } from "../theme";
 import { SwitcherTarget } from "./Nav";
 import classes from "./Nav.module.css";
 
@@ -86,7 +86,7 @@ export function Switcher({ icon: Icon, current, items, active, searchLabel, empt
           {shown.map((i) => (
             <Combobox.Option key={i.value} value={i.value} active={i.value === active} aria-label={i.ariaLabel}>
               <Group gap="sm" justify="space-between" wrap="nowrap">
-                <Text component="span" fz="md" fw={i.value === active ? 600 : 400}>
+                <Text component="span" fz="md" fw={i.value === active ? weight.bold : weight.regular}>
                   {i.label}
                 </Text>
                 {i.end}

@@ -6,7 +6,7 @@
 import { Text, Tooltip } from "@mantine/core";
 import { IconHourglass } from "@tabler/icons-react";
 import type { Task } from "../../api/types";
-import { icon, Stack, TriggerBadge } from "../../layout";
+import { icon, Stack, TriggerBadge, weight } from "../../layout";
 import { STATE_LABEL } from "../../status";
 
 export function WaitingBadge({ task, size = "sm" }: { task: Task; size?: "sm" | "md" }) {
@@ -16,7 +16,7 @@ export function WaitingBadge({ task, size = "sm" }: { task: Task; size?: "sm" | 
     <Tooltip
       label={
         <Stack gap="2xs">
-          <Text fz="xs" fw="medium">
+          <Text fz="xs" fw={weight.medium}>
             Waiting on
           </Text>
           {waiting.map((b) => (

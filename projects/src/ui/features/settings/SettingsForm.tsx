@@ -8,7 +8,7 @@ import { Settings as SettingsSchema } from "../../../requests";
 import { useRetryRepoAutoMerge, useUpdateSettings } from "../../api/queries";
 import type { Settings } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { FieldGroup, MetaItem, Notice, Row, Stack } from "../../layout";
+import { FieldGroup, MetaItem, Notice, Row, Stack, weight } from "../../layout";
 import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
 
 const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", merge: "Merge commit", rebase: "Rebase and merge" };
@@ -102,7 +102,7 @@ export function RepoAutoMergeStatus({ projectId, status }: { projectId: string; 
   return (
     <Stack gap="sm" aria-live="polite">
       <Row gap="sm">
-        <Text size="sm" fw="medium">
+        <Text size="sm" fw={weight.medium}>
           Repo setting
         </Text>
         <Badge color={s.color} variant="light">

@@ -11,7 +11,7 @@ import { prNumberOf } from "../../../prs";
 import { useAttachPr, useDetachPr, useOpenPrs, useReviews, useTasks } from "../../api/queries";
 import type { Job, Task, TaskPr } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { Grow, MetaItem, Picker, type PickerItem, Row, RowAction, Section, Stack, TriggerBadge } from "../../layout";
+import { Grow, MetaItem, Picker, type PickerItem, Row, RowAction, Section, Stack, TriggerBadge, weight } from "../../layout";
 import { TERMINAL } from "../../../tasks";
 import { JobState } from "../reviews/ReviewsPage";
 
@@ -53,7 +53,7 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
   return (
     <Stack gap="xs" data-pr={pr.number}>
       <Row gap="sm" wrap="nowrap">
-        <Anchor href={`https://github.com/${repo}/pull/${pr.number}`} target="_blank" rel="noreferrer" fz="sm" fw="medium">
+        <Anchor href={`https://github.com/${repo}/pull/${pr.number}`} target="_blank" rel="noreferrer" fz="sm" fw={weight.medium}>
           #{pr.number}
         </Anchor>
         <Grow>

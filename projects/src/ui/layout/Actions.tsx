@@ -164,7 +164,7 @@ export const TriggerBadge = forwardRef<HTMLSpanElement, TriggerBadgeProps & Reac
 ) {
   return (
     // The Tooltip's own props (handlers, its className) first, then ours merged in: never replaced.
-    <Box component="span" {...target} ref={ref} tabIndex={0} aria-label={label} data-marker={marker} className={[classes.trigger, target.className].filter(Boolean).join(" ")}>
+    <Box component="span" {...target} ref={ref} tabIndex={0} aria-label={label} data-marker={marker} data-ds="trigger-badge" className={[classes.trigger, target.className].filter(Boolean).join(" ")}>
       <Badge size={size} color={color} variant={variant} leftSection={leftSection}>
         {children}
       </Badge>

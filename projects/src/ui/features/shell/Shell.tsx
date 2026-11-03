@@ -10,12 +10,13 @@ import { AppFrame } from "../../layout/AppFrame";
 import { Page } from "../../layout/Page";
 import { EmptyState, ErrorState } from "../../layout/States";
 import { SidebarFooter, SidebarNav } from "./Sidebar";
+import { weight } from "../../layout";
 
 export function Shell() {
   return (
     <AppFrame
       brand={
-        <AnchorLink to="/projects" underline="never" c="dimmed" fw="bold" fz="xs" tt="uppercase" aria-label="nest projects: all projects">
+        <AnchorLink to="/projects" underline="never" c="dimmed" fw={weight.bold} fz="xs" tt="uppercase" aria-label="nest projects: all projects">
           nest projects
         </AnchorLink>
       }

@@ -9,7 +9,7 @@ import { Badge, Button, Text, Title, VisuallyHidden } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { exact } from "../../common/time";
-import { FadeIn, Glyph, GLYPH, icon, TermStatus, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn } from "../../layout";
+import { FadeIn, Glyph, GLYPH, icon, TermStatus, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn, weight } from "../../layout";
 import {
   groupTurns, type HistoryEvent, lastState, primaryArg, resultLines, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, toolName,
   type TurnGroup,
@@ -89,7 +89,7 @@ function ToolCall({ item }: { item: ToolItem }) {
         title={name}
         data-slot="call"
       >
-        <Text component="span" ff="monospace" fz="sm" fw="bold" inherit>
+        <Text component="span" ff="monospace" fz="sm" fw={weight.bold} inherit>
           {toolName(name)}
         </Text>
         {`(${arg})`}
