@@ -69,6 +69,7 @@ export function Picker({ label, icon: Icon, items, searchLabel, empty, fromSearc
       width={320}
       withinPortal
       shadow="overlay"
+      classNames={{ option: classes.option }}
     >
       <Combobox.Target withAriaAttributes={false}>
         <Button
@@ -89,7 +90,7 @@ export function Picker({ label, icon: Icon, items, searchLabel, empty, fromSearc
           {shown.map((i) => (
             <Combobox.Option key={i.value} value={i.value} disabled={i.disabled} aria-label={i.label}>
               <Group gap="sm" justify="space-between" wrap="nowrap">
-                <Text component="span" fz="sm" truncate="end" className={classes.grow}>
+                <Text component="span" fz="sm" className={classes.grow}>
                   {i.label}
                 </Text>
                 {i.end}
@@ -138,7 +139,7 @@ export const TriggerBadge = forwardRef<HTMLDivElement, BadgeProps & { [k: `data-
   return <Badge ref={ref} tabIndex={0} {...props} className={classes.trigger} />;
 });
 
-/** What fills a row's free width and truncates before the row's actions give way. */
+/** What fills a row's free width, wrapping before the row's actions give way. */
 export function Grow({ children }: { children: ReactNode }) {
   return <Box className={classes.grow}>{children}</Box>;
 }

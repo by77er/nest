@@ -18,7 +18,7 @@ function Ref({ projectId, t, action }: { projectId: string; t: TaskRef; action?:
   return (
     <Row gap="sm" wrap="nowrap" data-dep={t.id}>
       <Grow>
-        <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: t.id }} fz="sm" truncate="end" display="block">
+        <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: t.id }} fz="sm">
           {t.title}
         </AnchorLink>
       </Grow>

@@ -56,7 +56,7 @@ function PrRow({ projectId, repo, task, pr, review }: { projectId: string; repo:
           #{pr.number}
         </Anchor>
         <Grow>
-          <Text fz="sm" truncate="end" title={pr.title ?? undefined}>
+          <Text fz="sm">
             {pr.title ?? ""}
           </Text>
         </Grow>

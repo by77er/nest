@@ -26,8 +26,24 @@
   }
 }
 
-/* What fills a row's free width, and gives way (truncates) before its actions do. */
+/* What fills a row's free width, and wraps before its actions give way (text wraps, never clips). */
 .grow {
   flex: 1;
   min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* A picker's list: the option under the keyboard is quiet, as the switcher's (Nav.module.css). */
+.option {
+  border-radius: var(--mantine-radius-md);
+  color: var(--mantine-color-text);
+}
+
+.option[data-combobox-selected] {
+  background: var(--nest-subtle);
+  color: var(--mantine-color-text);
+}
+
+.option[data-combobox-disabled] {
+  color: var(--nest-muted, var(--mantine-color-dimmed));
 }
