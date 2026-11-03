@@ -222,6 +222,7 @@ export function usePostChat(id: string) {
   return useMutation({
     mutationFn: (text: string) => api.postChat(id, { text }),
     // No toast: a message that isn't taken stays in the log, not delivered, with Retry.
+    meta: { inline: true },
     onMutate: async (text) => {
       await qc.cancelQueries({ queryKey: keys.chat(id) });
       const before = qc.getQueryData<ChatMessage[]>(keys.chat(id));

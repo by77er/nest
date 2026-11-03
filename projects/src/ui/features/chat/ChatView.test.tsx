@@ -197,6 +197,9 @@ describe("the chat", () => {
     // Kept where it was written, marked, and the composer is cleared for the next one.
     const row = (await within(c).findByText("Hello")).closest("[data-sender=owner]") as HTMLElement;
     expect(row).toHaveTextContent(/not delivered/i);
+    // Said there, once: no toast besides.
+    expect(screen.queryByText("That didn't work")).toBeNull();
+    expect(screen.queryByText("The message wasn't sent")).toBeNull();
     expect(box).toHaveValue("");
     // Retry sends it again (the failure was once); taken, it's an ordinary message.
     await user.click(within(row).getByRole("button", { name: "Retry" }));

@@ -72,15 +72,11 @@
     --nest-with-context-main: var(--nest-measure);
   }
 
-  /* The context never makes the page taller than its content beside it: it takes no height of its own
-     in the row, fills the content's, and scrolls in itself when it holds more (a chat fits the viewport). */
+  /* The context is capped by the viewport (WithContext sets its max-height to the viewport's bottom),
+     never by the content beside it, and scrolls in itself past that. */
   .context {
     position: sticky;
     top: var(--mantine-spacing-xl);
-    align-self: stretch;
-    height: 0;
-    min-height: 100%;
-    max-height: calc(100dvh - 2 * var(--mantine-spacing-xl));
     overflow-y: auto;
     overscroll-behavior: contain;
   }

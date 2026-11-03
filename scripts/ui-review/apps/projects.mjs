@@ -323,18 +323,55 @@ const rhythm = (fixture, blocks, after) => async (p, { width }) => {
 
 
 /**
+ * The chat fits the viewport, at both ends of its scroll (the log, or on a phone the page's column):
+ * the document itself never scrolls; the composer is fully on screen and pinned at the viewport's
+ * bottom (within the page's bottom padding); and at the end, right under the log.
+ */
+export function inkChatFit() {
+  const out = [];
+  const doc = document.documentElement;
+  const log = document.querySelector("[data-ds=chat-log]");
+  const dock = document.querySelector("[data-ds=composer-dock]");
+  const field = dock?.querySelector("textarea");
+  if (!log || !dock || !field) return ["no chat log or composer on the page"];
+  const scroller = log.scrollHeight > log.clientHeight + 1 ? log : (log.closest("[data-ds=page]") ?? log);
+  const was = scroller.scrollTop;
+  const H = window.innerHeight;
+  window.scrollTo(0, 1e6);
+  if (window.scrollY > 0 || doc.scrollHeight > H + 1) out.push(`the document scrolls ${doc.scrollHeight - H} px (only the chat should)`);
+  window.scrollTo(0, 0);
+  for (const end of ["top", "end"]) {
+    scroller.scrollTop = end === "top" ? 0 : scroller.scrollHeight;
+    const f = field.getBoundingClientRect();
+    const d = dock.getBoundingClientRect();
+    if (f.top < 0 || f.bottom > H + 0.5) out.push(`at the ${end}, the composer is off screen (${Math.round(f.top)}..${Math.round(f.bottom)} of ${H})`);
+    if (d.bottom < H - 64) out.push(`at the ${end}, the composer sits ${Math.round(H - d.bottom)} px above the viewport's bottom, not pinned there`);
+    if (end === "end") {
+      // The log's last line on screen: its own bottom when it scrolls itself, else its content's end.
+      const l = log.getBoundingClientRect();
+      const gap = Math.round(d.top - Math.min(l.bottom, H));
+      if (gap > 32) out.push(`at the end, the composer is ${gap} px below the log (right under it)`);
+    }
+  }
+  scroller.scrollTop = was;
+  return out;
+}
+
+/**
  * The chat fits the viewport: the page itself doesn't scroll (only the log does, or on a phone the
  * page's column), and the composer is on screen.
  */
 async function chatFits(p) {
+  const problems = await p.evaluate(inkChatFit);
+  return problems;
+}/** The context column beside the chat: all of it shown when it fits the viewport, scrolling only when it doesn't. */
+async function contextShown(p) {
   return p.evaluate(() => {
-    const out = [];
-    const doc = document.documentElement;
-    if (doc.scrollHeight > window.innerHeight + 1) out.push(`the page scrolls ${doc.scrollHeight - window.innerHeight} px (only the chat should)`);
-    const box = document.querySelector("[data-ds=composer-dock] textarea")?.getBoundingClientRect();
-    if (!box) out.push("no composer");
-    else if (box.bottom > window.innerHeight + 0.5 || box.top < 0) out.push(`the composer is off screen (${Math.round(box.top)}..${Math.round(box.bottom)} of ${window.innerHeight})`);
-    return out;
+    const c = document.querySelector("[data-slot=context]");
+    if (!c) return [];
+    const r = c.getBoundingClientRect();
+    const room = window.innerHeight - r.bottom;
+    return c.scrollHeight > c.clientHeight + 1 && room > 48 ? [`the context column scrolls ${c.scrollHeight - c.clientHeight} px inside itself with ${Math.round(room)} px of the viewport free below it`] : [];
   });
 }
 /** A two-line draft (Shift+Enter between), still in the composer, unsent; and the chat still fits. */
@@ -513,6 +550,7 @@ const app = {
     { name: "rhythm-context", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click(), check: rhythm("demo", ["[data-slot=manager-context]"], (p) => p.getByRole("button", { name: "About the manager" }).click()), checkName: "rhythm" },
     // The chat fits the viewport (checks: `chat-fit`): the page doesn't scroll, the composer is on screen.
     { name: "chat-fit", section: "project", path: "/projects/prj_demo/manager", full: false, check: chatFits, checkName: "chat-fit" },
+    { name: "context-empty-chat", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, widths: DESKTOP, check: contextShown, checkName: "clipping" },
     { name: "chat-fit-long", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, check: chatFits, checkName: "chat-fit" },
     // The chat (README.md#the-manager-chat): a turn streaming with its activity line and Stop; the composer
     // with a draft; the jump-to-latest pill; older history paged in; a message's actions; the unread dot.
