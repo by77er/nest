@@ -162,6 +162,117 @@ const longerTitles = (p, fixture) =>
     const tasks = fixed(fixture, "/projects/prj_demo/tasks").map((t) => ({ ...t, title: `${t.title}, now with a much longer title that wraps onto another line` }));
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(tasks) });
   });
+// --- rhythm: measured on what's painted (text and badges), never on the grown hit boxes ---------------
+// Each measure is self-contained (it runs in the page, and in the selftest on planted pages).
+
+/**
+ * A task's PRs keep their proximity: within one PR (its number and title, its badges, its meta line),
+ * each gap is at most half the gap to the next PR.
+ */
+export function inkPrs() {
+  const ink = (el) => {
+    let t = Infinity, b = -Infinity;
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = w.nextNode(); n; n = w.nextNode()) {
+      if (!n.textContent.trim()) continue;
+      const r = document.createRange();
+      r.selectNodeContents(n);
+      for (const q of r.getClientRects()) if (q.height > 0) [t, b] = [Math.min(t, q.top), Math.max(b, q.bottom)];
+    }
+    for (const bd of el.querySelectorAll(".mantine-Badge-root")) {
+      const q = bd.getBoundingClientRect();
+      if (q.height > 0) [t, b] = [Math.min(t, q.top), Math.max(b, q.bottom)];
+    }
+    return t === Infinity ? null : { top: t, bottom: b };
+  };
+  const out = [];
+  const prs = [...document.querySelectorAll("[data-pr]")].filter((e) => e.getBoundingClientRect().height > 0);
+  for (let i = 0; i < prs.length; i++) {
+    const lines = [...prs[i].children].map(ink).filter(Boolean);
+    const next = prs[i + 1] && ink(prs[i + 1].children[0]);
+    if (!next || lines.length < 2) continue;
+    const between = Math.round(next.top - lines.at(-1).bottom);
+    for (let k = 1; k < lines.length; k++) {
+      const within = Math.round(lines[k].top - lines[k - 1].bottom);
+      if (within > between / 2) out.push(`PR ${prs[i].getAttribute("data-pr")}: line ${k + 1} is ${within} px below line ${k}, the next PR ${between} px away (within a PR at most half)`);
+    }
+  }
+  return out;
+}
+
+/**
+ * A transcript keeps its proximity: a tool call's gap to its result is at most half its gap to the next
+ * call, consecutive calls taken in document order (each sits in a wrapper of its own).
+ */
+export function inkTrace() {
+  const ink = (el) => {
+    let t = Infinity, b = -Infinity;
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = w.nextNode(); n; n = w.nextNode()) {
+      if (!n.textContent.trim()) continue;
+      const r = document.createRange();
+      r.selectNodeContents(n);
+      for (const q of r.getClientRects()) if (q.height > 0) [t, b] = [Math.min(t, q.top), Math.max(b, q.bottom)];
+    }
+    return t === Infinity ? null : { top: t, bottom: b };
+  };
+  const out = [];
+  const groups = [...document.querySelectorAll("[data-ds=terminal] [data-kind=tool]")].filter((g) => g.getBoundingClientRect().height > 0);
+  let pairs = 0;
+  for (let i = 0; i + 1 < groups.length; i++) {
+    const call = groups[i].querySelector("[data-slot=call]");
+    const result = groups[i].querySelector("[data-kind=tool_result]");
+    const nextCall = groups[i + 1].querySelector("[data-slot=call]");
+    const [c, r, g, n] = [call && ink(call), result && ink(result), ink(groups[i]), nextCall && ink(nextCall)];
+    if (!c || !r || !g || !n) continue;
+    pairs++;
+    const within = Math.round(r.top - c.bottom);
+    const between = Math.round(n.top - g.bottom);
+    if (within > between / 2) out.push(`"${call.textContent.slice(0, 30)}": ${within} px to its result, ${between} px to the next call (within a call at most half)`);
+  }
+  if (pairs === 0 && groups.length > 1) out.push(`no consecutive tool calls with results measured among ${groups.length}`);
+  return out;
+}
+
+/** The page header's rhythm: from the h1's text to its meta line's text (the round-5 bug moved the text). */
+export function inkHeaderGap() {
+  const ink = (el) => {
+    let t = Infinity, b = -Infinity;
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+    for (let n = w.nextNode(); n; n = w.nextNode()) {
+      if (!n.textContent.trim()) continue;
+      const r = document.createRange();
+      r.selectNodeContents(n);
+      for (const q of r.getClientRects()) if (q.height > 0) [t, b] = [Math.min(t, q.top), Math.max(b, q.bottom)];
+    }
+    return t === Infinity ? null : { top: t, bottom: b };
+  };
+  const h1 = document.querySelector("[data-ds=page-header] h1");
+  const meta = document.querySelector("[data-ds=page-header] [data-slot=meta]");
+  const [a, b] = [h1 && ink(h1), meta && ink(meta)];
+  return a && b ? Math.round(b.top - a.bottom) : null;
+}
+
+const touchOnly = (fn) => async (p, { width }) => (width >= 600 ? [] : p.evaluate(fn));
+const prProximity = touchOnly(inkPrs);
+const traceProximity = touchOnly(inkTrace);
+
+/** The header's gap, touch against mouse, within 4 px. */
+const headerRhythm = async (p, { width }) => {
+  if (width >= 600) return [];
+  const touch = await p.evaluate(inkHeaderGap);
+  const ctx = await p.context().browser().newContext({ viewport: p.viewportSize(), reducedMotion: "reduce" });
+  const mouse = await ctx.newPage();
+  await app.serve(mouse, { fixture: "demo" });
+  await mouse.goto(p.url(), { waitUntil: "networkidle" });
+  await mouse.locator("h1").first().waitFor();
+  await mouse.waitForTimeout(800);
+  const m = await mouse.evaluate(inkHeaderGap);
+  await ctx.close();
+  if (touch === null || m === null) return ["the page header's h1 or meta line isn't on the page"];
+  return Math.abs(touch - m) > 4 ? [`the header's meta text is ${touch} px below the h1's on touch, ${m} px with a mouse: a touch target grew its line`] : [];
+};
+
 /**
  * Touch doesn't change the rhythm: the same page at the same width, without touch, lays out the same.
  * A touch target grows its hit box, never its line, so these blocks' heights (and so proximity: a call
@@ -196,56 +307,7 @@ const rhythm = (fixture, blocks, after) => async (p, { width }) => {
   return blocks.flatMap((b, i) => (touch[i] === null || m[i] === null ? [`${name(b)}: not on the page`] : Math.abs(touch[i] - m[i]) > 4 ? [`${name(b)} is ${touch[i]} px on touch, ${m[i]} px with a mouse: touch targets grew its lines`] : []));
 };
 
-/**
- * A transcript on touch keeps its proximity: within a tool call (its row, its result) the gap is at most
- * half the gap to the next call, measured on the text, not the rows' grown hit boxes.
- */
-async function traceProximity(p, { width }) {
-  if (width >= 600) return [];
-  return p.evaluate(() => {
-    const out = [];
-    const text = (row) => (row.querySelector("[data-slot=text]") ?? row).getBoundingClientRect();
-    const groups = [...document.querySelectorAll("[data-ds=terminal] [data-kind=tool]")].filter((g) => g.getBoundingClientRect().height > 0);
-    for (let i = 0; i + 1 < groups.length; i++) {
-      const rows = [...groups[i].querySelectorAll("[data-ds=term-line]")].filter((r) => r.getBoundingClientRect().height > 0);
-      const result = groups[i].querySelector("[data-kind=tool_result]");
-      const next = groups[i + 1].querySelector("[data-ds=term-line]");
-      if (!result || !next || groups[i].nextElementSibling !== groups[i + 1]) continue;
-      const within = Math.round(text(result).top - text(rows[0]).bottom);
-      const between = Math.round(text(next).top - text(rows.at(-1)).bottom);
-      if (within > between / 2) out.push(`"${rows[0].textContent.slice(0, 30)}": ${within} px to its result, ${between} px to the next call (within a group at most half)`);
-    }
-    return out;
-  });
-}
 
-/**
- * A task's PRs on touch keep their proximity: within one PR (its number and title, then its badges and
- * meta) the gap is at most half the gap to the next PR, measured on what's drawn (text and badges), not
- * the grown hit boxes.
- */
-async function prProximity(p, { width }) {
-  if (width >= 600) return [];
-  return p.evaluate(() => {
-    const drawn = (el) => {
-      const r = document.createRange();
-      r.selectNodeContents(el);
-      return r.getBoundingClientRect();
-    };
-    const out = [];
-    const prs = [...document.querySelectorAll("[data-pr]")].filter((e) => e.getBoundingClientRect().height > 0);
-    for (let i = 0; i < prs.length; i++) {
-      const [first, second] = [...prs[i].children];
-      if (!first || !second) continue;
-      const within = Math.round(drawn(second).top - drawn(first).bottom);
-      const next = prs[i + 1]?.children[0];
-      if (!next) continue;
-      const between = Math.round(drawn(next).top - drawn(prs[i]).bottom);
-      if (within > between / 2) out.push(`PR ${prs[i].getAttribute("data-pr")}: ${within} px between its lines, ${between} px to the next PR (within a PR at most half)`);
-    }
-    return out;
-  });
-}
 
 /**
  * The chat fits the viewport: the page itself doesn't scroll (only the log does, or on a phone the
@@ -431,7 +493,7 @@ const app = {
     // Touch keeps the rhythm (checks: `rhythm`): text beside a control lays out as with a mouse (the
     // header's meta under its h1, the Manager's context), and the trace keeps its proximity. (Rows of
     // controls, like a project card's title and repo, take a 44 px pitch instead: data-touch-pitch.)
-    { name: "rhythm-header", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, widths: PHONE, check: rhythm("demo", [["[data-ds=page-header] h1", "[data-ds=page-header] [data-slot=meta]"]]), checkName: "rhythm" },
+    { name: "rhythm-header", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, widths: PHONE, check: headerRhythm, checkName: "rhythm" },
     { name: "rhythm-prs", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, widths: PHONE, after: drawerAt("Pull requests"), check: prProximity, checkName: "rhythm" },
     { name: "rhythm-trace", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, widths: PHONE, check: traceProximity, checkName: "rhythm" },
     { name: "rhythm-context", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click(), check: rhythm("demo", ["[data-slot=manager-context]"], (p) => p.getByRole("button", { name: "About the manager" }).click()), checkName: "rhythm" },
