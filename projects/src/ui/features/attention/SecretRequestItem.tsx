@@ -2,7 +2,8 @@
 // owner adds to an approval-gated GitHub environment (never as a repository secret, which any workflow
 // in the repo reads, a worker's pushed one too) and marks done; or one for nest to inject, set up in the
 // Secrets form, prefilled. Never a value: the agent names what it needs and why. A tainted session's
-// request is marked, with a caution: its purpose may be an injected instruction.
+// request is marked, with a caution: its purpose may be an injected instruction. Cautions come before
+// the buttons, so they're read before acting.
 
 import { Anchor, Badge, Button, Text } from "@mantine/core";
 import { IconExternalLink, IconKey } from "@tabler/icons-react";
@@ -52,6 +53,13 @@ export function SecretRequestItem({ projectId, item }: { projectId: string; item
         {item.type === "injected" && item.hosts?.length ? ` for ${item.hosts.join(", ")}` : ""}.
       </Text>
       <Prose>{item.purpose}</Prose>
+      {item.type === "ci" && (
+        <Notice tone="warning" title="In an environment with required reviewers, not the repo">
+          <Text fz="sm">
+            Add {item.name} to an environment whose deployments need a reviewer, and have the job that uses it name that environment. A repository secret is readable by any workflow in the repo, including one a worker pushes. The value goes in GitHub's form, never in a chat.
+          </Text>
+        </Notice>
+      )}
       <Toolbar align="start">
         {item.type === "ci" ? (
           <Button
@@ -76,13 +84,6 @@ export function SecretRequestItem({ projectId, item }: { projectId: string; item
           {item.type === "ci" ? "Mark added" : "Dismiss"}
         </Button>
       </Toolbar>
-      {item.type === "ci" && (
-        <Notice tone="warning" title="In an environment with required reviewers, not the repo">
-          <Text fz="sm">
-            Add {item.name} to an environment whose deployments need a reviewer, and have the job that uses it name that environment. A repository secret is readable by any workflow in the repo, including one a worker pushes. The value goes in GitHub's form, never in a chat.
-          </Text>
-        </Notice>
-      )}
       {item.type === "ci" && (
         <Text fz="xs" c="dimmed">
           <Anchor href="https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment" target="_blank" rel="noreferrer" inherit>

@@ -74,9 +74,10 @@ function Roles({ s }: { s: Row_ }) {
   );
 }
 
-function SecretActions({ s, onEdit, onDelete }: { s: Row_; onEdit: () => void; onDelete: () => void }) {
+/** Edit and Delete; in a card (`apart`), Delete at the far edge, away from Edit. */
+function SecretActions({ s, onEdit, onDelete, apart = false }: { s: Row_; onEdit: () => void; onDelete: () => void; apart?: boolean }) {
   return (
-    <Row gap="xs" wrap="nowrap">
+    <Row gap="xs" wrap="nowrap" justify={apart ? "space-between" : undefined}>
       <Button size="xs" variant="default" onClick={onEdit} aria-label={`Edit ${s.name}`}>
         Edit
       </Button>
@@ -184,7 +185,7 @@ export function SecretsPage() {
                             {s.last_injected_ms ? `Last injected ${ago(s.last_injected_ms)}` : "Not injected yet"}
                           </MetaItem>
                         </MetaRow>
-                        <SecretActions s={s} onEdit={() => setEditing(s)} onDelete={() => confirmDelete(s)} />
+                        <SecretActions s={s} onEdit={() => setEditing(s)} onDelete={() => confirmDelete(s)} apart />
                       </Stack>
                     </Panel>
                   ))}
