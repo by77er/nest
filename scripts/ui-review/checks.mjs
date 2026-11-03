@@ -126,6 +126,8 @@ export function measure(sel) {
     const bg = ground(el);
     if (!bg) continue;
     const fg0 = rgba(cs.color);
+    // Transparent text isn't read: a character kept for copy whose look is drawn (the trace's ⎿ corner).
+    if (fg0[3] === 0) continue;
     const fg = over([fg0[0], fg0[1], fg0[2], fg0[3] * opacity(el)], bg);
     const size = parseFloat(cs.fontSize);
     const large = size >= 24 || (size >= 18.66 && Number(cs.fontWeight) >= 700);

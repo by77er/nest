@@ -1,17 +1,84 @@
-/* `⎿` (U+23BF), drawn: few fonts have it (not JetBrains Mono, DejaVu Sans Mono or Noto Sans Symbols 2), so
-   the character stays in the text and a hairline corner in muted is what shows, the same everywhere. */
-.corner {
+/* The terminal's glyphs, drawn: JetBrains Mono's subsets have none of `●` `○` `✗` `⎿`, and which font a
+   browser falls back to varies, so the character stays in the text (for readers and copy) and the shape
+   is drawn in its color, the same on every system. Strokes are the font's stem (about 0.09em). */
+.glyph {
   position: relative;
+  display: inline-block;
+  width: 1ch;
+  /* One line tall, at the top of its row: the shape sits on its line's middle, never a wrapped paragraph's. */
+  height: 1.5em;
+  height: 1lh;
+  align-self: start;
+  vertical-align: top;
   color: transparent !important;
 }
 
-.corner::before {
+.glyph::before,
+.glyph::after {
   content: "";
   position: absolute;
+  box-sizing: border-box;
+}
+
+/* ● and ○: a circle, filled or not, a little under the x-height's width, on the text's middle. */
+.dot::before,
+.ring::before {
+  left: 0.1ch;
+  top: 50%;
+  width: 0.8ch;
+  height: 0.8ch;
+  margin-top: -0.4ch;
+  border-radius: 50%;
+  border: 0.09em solid var(--glyph);
+}
+
+.dot::before {
+  background: var(--glyph);
+}
+
+/* ✗: two strokes. */
+.cross::before,
+.cross::after {
+  left: 50%;
+  top: 50%;
+  width: 0.09em;
+  height: 0.9em;
+  margin: -0.45em 0 0 -0.045em;
+  background: var(--glyph);
+  transform: rotate(45deg);
+}
+
+.cross::after {
+  transform: rotate(-45deg);
+}
+
+/* ⎿: a corner, under and right of a vertical. */
+.corner::before {
   left: 0.45ch;
   top: 0.05em;
   width: 0.8ch;
   height: 0.75em;
-  border-left: 1px solid var(--mantine-color-dimmed);
-  border-bottom: 1px solid var(--mantine-color-dimmed);
+  border-left: 0.09em solid var(--glyph);
+  border-bottom: 0.09em solid var(--glyph);
+}
+
+/* A rule between turns: its label (wrapping when narrow), then a hairline to the end. */
+.rule {
+  display: flex;
+  align-items: center;
+  gap: var(--mantine-spacing-sm);
+  margin: var(--mantine-spacing-sm) 0;
+  min-width: 0;
+}
+
+.rule::after {
+  content: "";
+  flex: 1 1 var(--mantine-spacing-xl);
+  min-width: var(--mantine-spacing-xl);
+  border-top: 1px solid var(--nest-border-color);
+}
+
+.rule > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }

@@ -143,6 +143,11 @@ describe("the trace view", () => {
     const call = (id: string) => group.querySelector(`[data-call="${id}"]`)!;
     expect(["toolu_1", "toolu_2", "toolu_3"].map((id) => call(id).getAttribute("data-state"))).toEqual(["done", "error", "running"]);
     expect(["toolu_1", "toolu_2", "toolu_3"].map((id) => glyphOf(call(id).querySelector('[data-ds="term-line"]')!))).toEqual([GLYPH.bullet, GLYPH.bullet, GLYPH.pending]);
+    // A finished call's bullet in the success role, a failed one's in danger, a running one's ring muted.
+    const tone = (id: string) => (call(id).querySelector('[data-slot="glyph"]') as HTMLElement).getAttribute("style");
+    expect(tone("toolu_1")).toContain("var(--mantine-color-success-text)");
+    expect(tone("toolu_2")).toContain("var(--mantine-color-danger-text)");
+    expect(tone("toolu_3")).toContain("var(--nest-term-muted)");
     // A running call has no result line yet.
     expect(call("toolu_3").querySelector('[data-kind="tool_result"]')).toBeNull();
     const result = call("toolu_1").querySelector('[data-kind="tool_result"]')!;
@@ -313,7 +318,7 @@ function stateOf(events: TraceEvent[], more: Partial<ReturnType<typeof initialTr
 describe("the terminal", () => {
   it("pins each glyph's codepoint: none with an emoji presentation (no U+23FA)", () => {
     const cps = Object.fromEntries(Object.entries(GLYPH).map(([k, v]) => [k, [...v].map((c) => c.codePointAt(0)!.toString(16))]));
-    expect(cps).toEqual({ bullet: ["25cf"], pending: ["25cb"], result: ["23bf"], error: ["2717"], note: ["b7"], ask: ["3f"] });
+    expect(cps).toEqual({ bullet: ["25cf"], pending: ["25cb"], result: ["23bf"], error: ["2717"], note: ["b7"], ask: ["3f"], warn: ["21"] });
     const sources = import.meta.glob<string>(["./*.tsx", "../../layout/Terminal.tsx"], { query: "?raw", import: "default", eager: true });
     for (const [f, text] of Object.entries(sources)) expect(text.includes("⏺"), f).toBe(false);
   });
@@ -347,10 +352,12 @@ describe("the terminal", () => {
     expect(glyphOf(line("error"))).toBe(GLYPH.error);
     expect(line("error")).toHaveTextContent("error_max_turns: too many");
     expect(line("rate_limited")).toHaveTextContent("rate limited: 429");
+    expect(glyphOf(line("rate_limited"))).toBe(GLYPH.warn);
+    expect((line("rate_limited").querySelector('[data-slot="glyph"]') as HTMLElement).getAttribute("style")).toContain("var(--nest-term-warning)");
     expect(line("task_exited")).toHaveTextContent("background task job1 exited (code 0)");
     expect(line("ended")).toHaveTextContent("the agent ended (done)");
     // Muted one-liners, by the dimmed color.
-    for (const k of ["state", "ask", "rate_limited", "task_exited", "ended"]) expect(line(k).getAttribute("style"), k).toContain("var(--mantine-color-dimmed)");
+    for (const k of ["state", "ask", "rate_limited", "task_exited", "ended"]) expect(line(k).getAttribute("style"), k).toContain("var(--nest-term-muted)");
   });
 
   it("shows an error by the danger role's text shade and the ✗ glyph, on the call and its result", () => {
@@ -367,9 +374,17 @@ describe("the terminal", () => {
   it("shows a result's first lines, then `… +N lines (expand)`, all of them on a click", async () => {
     const { user } = renderAlone(<TraceLog title="T" state={stateOf([ev(1, "tool_call", { call_id: "c", name: "Bash", input: "{}" }), ev(2, "tool_result", { call_id: "c", is_error: false, summary: "1\n2\n3\n4\n5\n6" })])} />);
     const result = document.querySelector('[data-kind="tool_result"] [data-slot="text"]') as HTMLElement;
-    expect(result.textContent).toBe("1\n2\n3\n… +3 lines (expand)");
-    await user.click(screen.getByText("… +3 lines (expand)"));
+    expect(result.textContent).toBe("1\n2\n3");
+    // A real button (reachable by keyboard), a disclosure that collapses again.
+    const more = screen.getByRole("button", { name: "… +3 lines (expand)" });
+    expect(more.tagName).toBe("BUTTON");
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    more.focus();
+    await user.keyboard("{Enter}");
     expect(result.textContent).toBe("1\n2\n3\n4\n5\n6");
+    expect(screen.getByRole("button", { name: "(collapse)" })).toHaveAttribute("aria-expanded", "true");
+    await user.click(screen.getByRole("button", { name: "(collapse)" }));
+    expect(result.textContent).toBe("1\n2\n3");
   });
 
   it("is text in the mono family on the terminal surface, wrapping long lines (no sideways scroll)", () => {
@@ -466,9 +481,9 @@ describe("backfill", () => {
 });
 
 describe("the task drawer's layout", () => {
-  it("from `lg` on, a task with a worker is two columns that scroll on their own: details, then the wider trace", async () => {
+  it("from `xl` on, a task with a worker is two columns that scroll on their own: details, then the wider trace", async () => {
     const real = window.matchMedia;
-    window.matchMedia = ((q: string) => ({ ...real(q), matches: q.includes("min-width: 75em") })) as typeof window.matchMedia;
+    window.matchMedia = ((q: string) => ({ ...real(q), matches: q.includes("min-width: 88em") })) as typeof window.matchMedia;
     try {
       vi.stubGlobal("WebSocket", FakeSocket);
       const api = new FakeApi();
@@ -487,5 +502,59 @@ describe("the task drawer's layout", () => {
     } finally {
       window.matchMedia = real;
     }
+  });
+});
+
+describe("the task drawer's tabs and width", () => {
+  const withWide = async (wide: boolean, fn: () => Promise<void>) => {
+    const real = window.matchMedia;
+    window.matchMedia = ((q: string) => ({ ...real(q), matches: wide && q.includes("min-width: 88em") })) as typeof window.matchMedia;
+    try {
+      await fn();
+    } finally {
+      window.matchMedia = real;
+    }
+  };
+
+  it("below `xl`, its tabs keep the trace mounted (no reconnect on a switch), with no second heading on screen", async () => {
+    await withWide(false, async () => {
+      vi.stubGlobal("WebSocket", FakeSocket);
+      const api = new FakeApi();
+      const t = task({ state: "in_progress", assignee: "agt_worker1" });
+      api.tasks = [t];
+      const { user } = renderApp(`/projects/prj_one?task=${t.id}`, api);
+      const drawer = await screen.findByRole("dialog", { name: "Task" });
+      await user.click(await within(drawer).findByRole("tab", { name: "Trace" }));
+      const sock = await waitFor(() => FakeSocket.latest("agt_worker1")!);
+      // The tab names it: its heading is for readers only.
+      const heading = within(drawer).getByRole("heading", { name: "Worker's trace" });
+      expect(heading.querySelector(".mantine-VisuallyHidden-root, [class*='VisuallyHidden']") ?? heading.closest("[class*='VisuallyHidden']")).not.toBeNull();
+      await user.click(within(drawer).getByRole("tab", { name: "Details" }));
+      await user.click(within(drawer).getByRole("tab", { name: "Trace" }));
+      expect(sock.closedByPage).toBeNull();
+      expect(FakeSocket.opened.filter((x) => x.url.includes("agt_worker1"))).toHaveLength(1);
+    });
+  });
+
+  it("from `xl` on, one sheet width whether the task has a worker or not", async () => {
+    await withWide(true, async () => {
+      vi.stubGlobal("WebSocket", FakeSocket);
+      const api = new FakeApi();
+      const a = task({ state: "in_progress", assignee: "agt_worker1" });
+      const b = task({ state: "ready" });
+      api.tasks = [a, b];
+      const widthOf = async (id: string) => {
+        const view = renderApp(`/projects/prj_one?task=${id}`, api);
+        await screen.findByRole("dialog", { name: "Task" });
+        await within(screen.getByRole("dialog", { name: "Task" })).findByRole("heading", { name: "Description" });
+        const content = document.querySelector(".mantine-Drawer-content") as HTMLElement;
+        const w = content.getAttribute("style") ?? "";
+        view.unmount();
+        return /--drawer-size:\s*([^;]+)/.exec(w)?.[1] ?? getComputedStyle(content).getPropertyValue("--drawer-size");
+      };
+      const [withWorker, without] = [await widthOf(a.id), await widthOf(b.id)];
+      expect(withWorker).toContain("--nest-sheet-wide");
+      expect(without).toBe(withWorker);
+    });
   });
 });

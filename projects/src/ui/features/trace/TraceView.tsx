@@ -5,11 +5,11 @@
 // history, loaded as the reader scrolls to the top; only what arrives live fades in. It follows the
 // newest line only while scrolled to the bottom; otherwise "Jump to live" takes it there.
 
-import { Badge, Button, Text, UnstyledButton } from "@mantine/core";
+import { Badge, Button, Text, VisuallyHidden } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { exact } from "../../common/time";
-import { FadeIn, GLYPH, icon, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn } from "../../layout";
+import { FadeIn, Glyph, GLYPH, icon, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn } from "../../layout";
 import {
   groupTurns, type HistoryEvent, lastState, primaryArg, resultLines, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, toolName,
   type TurnGroup,
@@ -50,18 +50,21 @@ function ToolResult({ r }: { r: AnyEvent }) {
   const shownLines = all ? lines : head;
   const text = shownLines.length ? shownLines.join("\n") : error ? "Error" : "(no output)";
   return (
-    <TermLine indent={1} glyph={GLYPH.result} glyphTone="muted" tone={error ? "danger" : "muted"} data-kind="tool_result" data-error={error ? "true" : "false"}>
-      {error ? `${GLYPH.error} ` : ""}
-      {text}
-      {more > 0 && !all && (
-        <>
-          {"\n"}
-          <UnstyledButton component="span" ff="monospace" fz="sm" c="dimmed" onClick={() => setAll(true)} data-slot="more">
-            {`… +${more} ${more === 1 ? "line" : "lines"} (expand)`}
-          </UnstyledButton>
-        </>
+    <>
+      <TermLine indent={1} glyph={GLYPH.result} glyphTone="muted" tone={error ? "danger" : "muted"} data-kind="tool_result" data-error={error ? "true" : "false"}>
+        {error && (
+          <>
+            <Glyph g={GLYPH.error} tone="danger" />{" "}
+          </>
+        )}
+        {text}
+      </TermLine>
+      {more > 0 && (
+        <TermLine indent={1} tone="muted" onClick={() => setAll((a) => !a)} expanded={all} data-slot="more">
+          {all ? "(collapse)" : `… +${more} ${more === 1 ? "line" : "lines"} (expand)`}
+        </TermLine>
       )}
-    </TermLine>
+    </>
   );
 }
 
@@ -74,17 +77,24 @@ function ToolCall({ item }: { item: ToolItem }) {
   const arg = primaryArg(item.call.input);
   return (
     <Stack gap="2xs" data-kind="tool" data-call={str(item.call.call_id)} data-state={!r ? "running" : error ? "error" : "done"}>
-      <TermLine glyph={r ? GLYPH.bullet : GLYPH.pending} glyphTone={!r ? "muted" : error ? "danger" : "text"}>
-        <UnstyledButton ff="monospace" fz="sm" aria-expanded={open} aria-controls={region} onClick={() => setOpen((o) => !o)} title={name} data-slot="call">
-          <Text component="span" ff="monospace" fz="sm" fw="bold" inherit>
-            {toolName(name)}
-          </Text>
-          {`(${arg})`}
-        </UnstyledButton>
+      <TermLine
+        glyph={r ? GLYPH.bullet : GLYPH.pending}
+        glyphTone={!r ? "muted" : error ? "danger" : "success"}
+        onClick={() => setOpen((o) => !o)}
+        expanded={open}
+        controls={region}
+        label={`${toolName(name)}(${arg})`}
+        title={name}
+        data-slot="call"
+      >
+        <Text component="span" ff="monospace" fz="sm" fw="bold" inherit>
+          {toolName(name)}
+        </Text>
+        {`(${arg})`}
       </TermLine>
       <div id={region} role="region" aria-label={`${toolName(name)} input`} hidden={!open}>
         {open && (
-          <TermLine indent={1} tone="muted" data-slot="input">
+          <TermLine indent={1} data-slot="input">
             {pretty(item.call.input)}
           </TermLine>
         )}
@@ -128,7 +138,7 @@ function EventItem({ ev }: { ev: AnyEvent }) {
       );
     case "rate_limited":
       return (
-        <TermLine glyph={GLYPH.note} glyphTone="warning" tone="muted" data-kind="rate_limited">
+        <TermLine glyph={GLYPH.warn} glyphTone="warning" tone="muted" data-kind="rate_limited">
           rate limited: {str(ev.detail)}
         </TermLine>
       );
@@ -173,7 +183,7 @@ function Turn({ g, animateAfter }: { g: TurnGroup; animateAfter: number }) {
     g.completed ? tokens(g.completed.usage) : null,
   ].filter(Boolean).join(" · ");
   return (
-    <Stack gap="xs" aria-label={g.turn ? "Turn" : "Between turns"} role="group" data-turn={g.turn ?? ""} data-status={g.completed ? "completed" : "running"}>
+    <Stack gap="md" aria-label={g.turn ? "Turn" : "Between turns"} role="group" data-turn={g.turn ?? ""} data-status={g.completed ? "completed" : "running"}>
       {g.turn && (
         <span title={at !== null ? exact(at) : undefined}>
           <TermRule>{rule}</TermRule>
@@ -190,7 +200,7 @@ function Turn({ g, animateAfter }: { g: TurnGroup; animateAfter: number }) {
 
 /** The trace of a state, presented (separate from the socket, so tests can give a state directly). */
 export function TraceLog({ title, state, loadOlder = () => {} }: { title: string; state: TraceState; loadOlder?: () => void }) {
-  const fill = useFillColumn();
+  const { fill, untitled } = useFillColumn();
   const groups = useMemo(() => groupTurns(state.events, state.older), [state.events, state.older]);
   const viewport = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
@@ -266,19 +276,14 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
     );
   } else if (state.olderState === "error") {
     top = (
-      <TermLine glyph={GLYPH.error} glyphTone="danger" tone="muted" data-slot="older">
-        earlier events couldn't be loaded.{" "}
-        <UnstyledButton component="span" ff="monospace" fz="sm" c="dimmed" onClick={older}>
-          retry
-        </UnstyledButton>
+      <TermLine glyph={GLYPH.error} glyphTone="danger" tone="muted" onClick={older} data-slot="older">
+        earlier events couldn't be loaded: retry
       </TermLine>
     );
   } else if (canLoad && state.older.length > 0) {
     top = (
-      <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" data-slot="older">
-        <UnstyledButton component="span" ff="monospace" fz="sm" c="dimmed" onClick={older}>
-          load earlier
-        </UnstyledButton>
+      <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" onClick={older} data-slot="older">
+        load earlier
       </TermLine>
     );
   } else if (state.olderCursor === null && state.older.length > 0) {
@@ -291,7 +296,7 @@ export function TraceLog({ title, state, loadOlder = () => {} }: { title: string
 
   return (
     <Section
-      title={title}
+      title={untitled ? <VisuallyHidden>{title}</VisuallyHidden> : title}
       region={false}
       fill={fill}
       actions={

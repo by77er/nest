@@ -33,10 +33,11 @@ node scripts/ui-review/selftest.mjs             # the checks fail their planted 
 | `clipping` | text is cut by its own `overflow` or ellipsis, or something runs past its Panel's edge |
 | `frame` | a screen hasn't exactly one visible h1; or across a section's views (same width and scheme), the h1's left edge, the header's width or the content's left edge differs by more than 1 px from the section's first view |
 | `nav` | the visible nav rows' icons or labels aren't on one left edge, the product's name is off it, or the active row's ground, rule or text is a role color (chromatic) |
-| `contrast` | visible text is under WCAG AA (4.5:1, or 3:1 for large text) against the composited background, in either scheme; text under an overlay or disabled is skipped |
+| `contrast` | visible text is under WCAG AA (4.5:1, or 3:1 for large text) against the composited background, in either scheme; text under an overlay, disabled, or transparent (a character drawn as something else) is skipped |
 | `measure` | a `form` or `reading` measure doesn't start on the frame's left edge |
 | `page-error` | an uncaught error, a console error, the app's error page, or a capture that failed |
 | `board-columns` (projects) | at 1280 px and up, the board's six columns don't fit without scrolling |
+| `trace` (projects) | an agent trace's log scrolls sideways (its long lines must wrap), or one of its glyphs renders in an emoji font |
 
 The apps' own `npm test` covers the code side (no inline styles, raw values or off-palette colors; tokens equal the skill's). Judgement (hierarchy, balance, placement) stays the reviewer's.
 

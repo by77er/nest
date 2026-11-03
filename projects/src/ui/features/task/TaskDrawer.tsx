@@ -42,8 +42,8 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
   const t = task.data;
 
   return (
-    // A task that has (or had) a worker: its trace beside the details (two columns from `lg`, tabs below).
-    <Sheet opened={taskId !== undefined} onClose={onClose} title="Task" beside={t?.assignee ? <TaskTraces task={t} /> : undefined}>
+    // A task that has (or had) a worker: its trace beside the details (two columns from `xl`, tabs below).
+    <Sheet opened={taskId !== undefined} onClose={onClose} title="Task" split beside={t?.assignee ? <TaskTraces task={t} /> : undefined}>
       {task.isPending ? (
         <LoadingState label="Loading the task" />
       ) : task.isError ? (

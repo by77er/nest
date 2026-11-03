@@ -36,6 +36,7 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
   <div data-ds="page"><div data-measure="form">
     <div data-ds="page-header"><h1>Gadgets</h1>${bad.h1 ? "<h1>Again</h1>" : ""}</div>
     <div data-ds="panel"><p class="faint">Updated 2 min ago</p>
+      <p><span style="color: transparent">⎿</span> a character kept for copy, drawn as something else: not read, so not checked</p>
       ${bad.clip ? '<p class="cut">A title far too long for its box</p>' : '<p class="cut">Short</p>'}
       ${bad.escape ? '<div style="width: 2000px">Wider than its panel</div>' : ""}
     </div>
