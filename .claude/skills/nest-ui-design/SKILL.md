@@ -71,7 +71,7 @@ Defined once in the theme (as Mantine values and CSS variables) and used by name
 - **Text on a filled role:** white in light (dark on warning); in dark, the dark `page` (`#121314`) on every role, since white on the dark values is only 3.3 to 3.6:1.
 - **A role's text on the ground** (an error line, a warning caption): shade 7 in light (8 for warning), shade 3 in dark. Shade 6 of warning is under 2:1 on white.
 - No pure RGB, and no color outside this table.
-- **Contrast:** all text, every filled role's text and every light badge meet WCAG AA (4.5:1) in both schemes. A failing value is fixed here and in the theme together. (Bootstrap's `#6c757d` is 4.49:1 on light `page`, hence `muted` `#666e76`.)
+- **Contrast:** all text, every filled role's text and every light badge meet WCAG AA (4.5:1) in both schemes. A failing value is fixed here and in the theme together. A neutral (gray) outline badge is `muted` text on a `border` hairline in both schemes, mapped once in the theme for every such badge; the framework's error color (a field's error, the required asterisk) is the danger role's text shade. (Bootstrap's `#6c757d` is 4.49:1 on light `page`, hence `muted` `#666e76`.)
 
 ## Layout primitives
 
@@ -81,7 +81,8 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 |---|---|
 | `AppFrame` | The sidebar (the product name small at its top, the places, a footer set apart by a hairline; a burger-toggled drawer on a phone) and the content area |
 | `NavRow` / `NavGroup` | One row style for every place: icon column, height, padding, left edge and the quiet active state ([Navigation](#navigation)) |
-| `Page` | Max content width 1440 px, centred. Gutters `2xl` desktop, `xl` tablet, `lg` phone; `2xl` between page-level blocks. A `form` or `reading` measure caps the width but stays on the frame's left edge, never centred |
+| `Page` | Max content width 1440 px, centred. Gutters `2xl` desktop, `xl` tablet, `lg` phone; `2xl` between page-level blocks. The frame never moves: every view of a section uses the same `Page`; narrow content goes in a left-aligned `Measure` |
+| `WithContext` / `SectionGrid` | A narrow view's content on the frame's left edge with a sticky context column beside it to the right edge, at most a third of the width (a disclosure above it when narrow); sections as Panels in a responsive two-column grid, aligned to the top |
 | `PageHeader` | The h1 (the thing the page is about) and a meta line; no breadcrumb. Actions right-aligned on the title's baseline, wrapping below it when narrow |
 | `Section` | A heading row (h3, optional count, actions right) over content, `lg` below the heading; sections `2xl` apart |
 | `Panel` | The bordered surface (`md` radius, `lg` padding, `md` when dense). Cards, side panels, banners and table frames are all Panels |
@@ -93,6 +94,8 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 
 **The frame is stable.** Across the views of a section, the h1's position and width, the content's left edge, the gutters, the header and the nav don't move or change shape. Shared things (task cards, badges, status colors) look identical wherever they appear.
 
+**The frame is stable.** Across the views of a section, the h1's position and width, the content's left edge, the gutters, the header and the nav don't move or change shape. Shared things (task cards, badges, status colors) look identical wherever they appear.
+
 ## Gestalt and negative space
 
 - **Proximity:** a gap inside a group is at most half the gap between groups (`sm` between a card's lines, `md` between cards, `2xl` between sections).
@@ -100,8 +103,10 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 - **Similarity:** one card style, one badge style per status, one button hierarchy (filled primary, default secondary, subtle tertiary).
 - **Alignment:** one shared left edge per container; column headers align with their cards' padding; numbers right-aligned, text left; centring only for empty states and single-purpose dialogs.
 - **Figure and ground:** one focal element per view (the board, the fleet table). Color marks only actions and status, so the eye goes where something needs doing.
+- **User content** (Markdown, SVG) can't change the page's outline, hierarchy or ground: its headings are demoted below the page's own and set at body size by weight; its figures sit on a fixed light canvas in both schemes, never inverted.
 - **Hierarchy:** one h1 per page, at most three text sizes in a component, weight before size.
 - **Negative space:** don't fill every pixel; leave room around the focal element; side panels take at most a third of the width; dense data gets dense rows (`xs`/`sm`) inside a frame that keeps the page's outer space.
+- **Continuity:** within a section of an app, switching views never moves the header or the page edges. A view whose content is narrow left-aligns it to the frame and uses the remaining width for related context, not empty margins.
 - **Balance:** no edge crowded, none empty. A layout heavy on one side is fixed in the grid, not with individual margins.
 
 ## Navigation
@@ -137,7 +142,7 @@ Motion explains a change; it never decorates.
 
 - A visible focus ring (2 px, primary, 2 px offset); AA contrast as in [Tokens](#tokens).
 - Everything reachable by keyboard, drag included (dnd-kit's keyboard sensor).
-- Hit targets at least 32 px on desktop and 44 px on touch.
+- Hit targets at least 32 px on desktop and 44 px on touch, except inline links in running text, at least 24 px (WCAG 2.5.8's inline exception), when the same thing is reachable through a large target.
 - Touch hit areas reserve layout space; they never overlap a neighbouring control.
 - A label on every control; `aria-live` for polled changes that matter.
 - Works from 390 px up with no horizontal page scroll; only a board or table may scroll, inside its own scroller.

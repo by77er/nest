@@ -41,5 +41,68 @@
   .grip {
     min-width: var(--nest-hit-touch);
     min-height: var(--nest-hit-touch);
+    /* Above the title's grown hit box, which reaches down beside it. */
+    position: relative;
+    z-index: 2;
+  }
+}
+
+/* Content and its context: the main column on the frame's left edge, then one gap, then the context
+   column (sticky) to the frame's right edge. The context takes what the main column's measure leaves,
+   at least 16rem and never more than a third; past a third, the main column takes the rest. The gap is
+   the same at every width. Below lg, the context is a disclosure above the content. */
+.withContext {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--mantine-spacing-xl);
+  align-items: start;
+}
+
+@media (min-width: 75em) {
+  .withContext {
+    grid-template-columns: minmax(0, 1fr) max(16rem, min(calc(100% - var(--nest-with-context-main) - var(--mantine-spacing-2xl)), 33.333%));
+    gap: var(--mantine-spacing-2xl);
+  }
+
+  .withContext[data-main="reading"] {
+    --nest-with-context-main: var(--nest-reading-measure);
+  }
+
+  .withContext[data-main="form"] {
+    --nest-with-context-main: var(--nest-measure);
+  }
+
+  .context {
+    position: sticky;
+    top: var(--mantine-spacing-xl);
+  }
+}
+
+.contextInner {
+  padding-top: var(--mantine-spacing-md);
+}
+
+/* A badge that's a link (BadgeAnchor): the theme's focus ring, and on touch a 44 px target around the
+   badge, reserved as layout. */
+.badgeAnchor {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  border-radius: var(--mantine-radius-sm);
+}
+
+.badgeAnchor:focus-visible {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  .badgeAnchor {
+    --nest-hit-pad: calc((var(--nest-hit-touch) - 1.25rem) / 2);
+    padding-block: var(--nest-hit-pad);
+    margin-block: calc(var(--nest-hit-pad) * -1);
+    position: relative;
+    z-index: 1;
   }
 }

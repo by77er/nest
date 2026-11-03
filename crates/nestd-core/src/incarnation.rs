@@ -197,6 +197,13 @@ pub fn meta_version(version: Option<u64>, current: u64) -> MetaVersion {
     }
 }
 
+/// Whether a file in an incarnation directory is a reflink cut (`cut-<n>.img`, M2): a frozen copy
+/// of the disk waiting for its background commit. A previous release ignores these (they go with
+/// the directory); a starting nestd removes them.
+pub fn is_cut_file(name: &str) -> bool {
+    name.strip_prefix("cut-").and_then(|r| r.strip_suffix(".img")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
 // A starting nestd and the incarnations it finds.
 
 /// Whether a starting nestd deletes an incarnation it found without a word: only when its disk is
@@ -245,6 +252,16 @@ pub fn nothing_to_salvage<M: PartialEq>(salvage: bool, head_disk: Option<&M>, di
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_cut_files_are_cut_files() {
+        for yes in ["cut-1.img", "cut-1234567890.img"] {
+            assert!(is_cut_file(yes), "{yes}");
+        }
+        for no in ["cut-.img", "cut-1.im", "cut-a.img", "disk.img", "meta.json", "xcut-1.img", "cut-1.img.tmp", "cut-1x.img", ""] {
+            assert!(!is_cut_file(no), "{no}");
+        }
+    }
 
     /// Characterization of `Tombstones` before the extraction (`fence`, `refuses`, `prune_up_to`,
     /// `prune_below`), as a table of (recorded, epoch) cases.

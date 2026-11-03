@@ -2,14 +2,15 @@
 // (wrangler.jsonc's single-page-application handling), after the Access check.
 //
 //   /projects                          every project
-//   /projects/$projectId/board         its board; `?task=` opens a task's drawer (the default page)
-//   /projects/$projectId/manager       the chat with its manager; `?view=trace` the manager's trace
+//   /projects/$projectId/board         its board; `?task=` opens a task's drawer
+//   /projects/$projectId/manager       the chat with its manager (the default page); `?view=trace` its trace
 //   /projects/$projectId/reviews       its review jobs
 //   /projects/$projectId/network       its agents' network rules
 //   /projects/$projectId/settings      its settings
 //   /admin                             the catalog sync
 //
-// Old links redirect: `/` to the list, `/projects/$projectId?task=…` to the board with the same task.
+// `/` redirects to the list, `/projects/$projectId` to its manager, and an old `/projects/$projectId?task=…`
+// to the board with the same task.
 
 import { createRootRoute, createRoute, createRouter, lazyRouteComponent, redirect, type RouterHistory } from "@tanstack/react-router";
 import { NotFound, RouteError, Shell } from "./features/shell/Shell";
@@ -46,7 +47,9 @@ const projectIndex = createRoute({
   path: "/",
   validateSearch: taskSearch,
   beforeLoad: ({ params, search }) => {
-    throw redirect({ to: "/projects/$projectId/board", params, search, replace: true });
+    // The manager is a project's default view; an old link to a task still opens it on the board.
+    if (search.task) throw redirect({ to: "/projects/$projectId/board", params, search, replace: true });
+    throw redirect({ to: "/projects/$projectId/manager", params, search: {}, replace: true });
   },
 });
 

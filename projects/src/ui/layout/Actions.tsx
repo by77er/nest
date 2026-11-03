@@ -3,6 +3,7 @@
 // on touch), a badge that opens its details on hover or focus, and what fills a row before its actions.
 
 import { Badge, type BadgeProps, Box, Button, type ButtonProps, Combobox, Group, Loader, Text, useCombobox } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import { forwardRef, type ReactNode, useEffect, useState } from "react";
 import { icon } from "../theme";
 import classes from "./Actions.module.css";
@@ -145,12 +146,17 @@ export function Picker({ label, icon: Icon, items, searchLabel, empty, fromSearc
 
 /** A row's own action (Detach, Remove): at least 36 px with a pointer, 44 px on touch. */
 export const RowAction = forwardRef<HTMLButtonElement, ButtonProps & { onClick?: () => void; "aria-label"?: string }>(function RowAction(props, ref) {
-  return <Button ref={ref} size="sm" {...props} className={classes.action} />;
+  return <Button ref={ref} size="sm" {...props} className={classes.action} data-ds="row-action" />;
 });
 
 export interface TriggerBadgeProps extends Pick<BadgeProps, "size" | "color" | "variant" | "leftSection" | "children"> {
   "data-marker"?: string;
   "aria-label"?: string;
+  /**
+   * On touch, plain status: no tap target and no tooltip (a card's title opens the drawer, which has
+   * the same details). It keeps its accessible name.
+   */
+  plainOnTouch?: boolean;
 }
 
 /**
@@ -159,12 +165,25 @@ export interface TriggerBadgeProps extends Pick<BadgeProps, "size" | "color" | "
  * handlers go on the wrapper, which is the target.
  */
 export const TriggerBadge = forwardRef<HTMLSpanElement, TriggerBadgeProps & React.HTMLAttributes<HTMLSpanElement>>(function TriggerBadge(
-  { size, color, variant, leftSection, children, "data-marker": marker, "aria-label": label, ...target },
+  { size, color, variant, leftSection, children, "data-marker": marker, "aria-label": label, plainOnTouch = false, ...target },
   ref,
 ) {
+  const coarse = useMediaQuery("(pointer: coarse)") ?? false;
+  if (plainOnTouch && coarse) {
+    // Neither the Tooltip's handlers nor its ref are taken (it listens on the element it's given), so it
+    // never opens.
+    const { "data-verdict": verdict } = target as { "data-verdict"?: string };
+    return (
+      <Box component="span" role="img" aria-label={label} data-marker={marker} data-verdict={verdict} data-ds="trigger-badge" data-plain className={classes.plain}>
+        <Badge size={size} color={color} variant={variant} leftSection={leftSection}>
+          {children}
+        </Badge>
+      </Box>
+    );
+  }
   return (
     // The Tooltip's own props (handlers, its className) first, then ours merged in: never replaced.
-    <Box component="span" {...target} ref={ref} tabIndex={0} aria-label={label} data-marker={marker} className={[classes.trigger, target.className].filter(Boolean).join(" ")}>
+    <Box component="span" {...target} ref={ref} tabIndex={0} aria-label={label} data-marker={marker} data-ds="trigger-badge" className={[classes.trigger, target.className].filter(Boolean).join(" ")}>
       <Badge size={size} color={color} variant={variant} leftSection={leftSection}>
         {children}
       </Badge>

@@ -1,0 +1,27 @@
+/* Theme-wide component styles that need a media query (the theme's `styles` can't carry one). */
+
+/* On touch, every Button is at least the 44 px target (Save, Send, the pills, compact ones too). */
+@media (pointer: coarse) {
+  .button {
+    min-height: var(--nest-hit-touch);
+  }
+}
+
+/* The phone's menu button keeps its look on touch and takes the 44 px target as its own room (a hit
+   area never reaches over a neighbour); a number input is the target's height. */
+@media (pointer: coarse) {
+  .burger {
+    min-width: var(--nest-hit-touch);
+    min-height: var(--nest-hit-touch);
+  }
+
+  /* A number input on touch: as tall as the target, and no steppers (two stacked 22 px halves mis-tap
+     the wrong way); the numeric keyboard does it. (Mantine sets the height on the input's own wrapper.) */
+  .numberWrapper {
+    --input-height: var(--nest-hit-touch) !important;
+  }
+
+  .steppers {
+    display: none;
+  }
+}

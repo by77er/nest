@@ -8,7 +8,7 @@ import { Fragment, useState } from "react";
 import { useReviews } from "../../api/queries";
 import type { Dimension, Job } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, icon, LoadingState, Panel, Row, Section, Stack, TableFrame } from "../../layout";
+import { EmptyState, ErrorState, icon, LoadingState, Panel, Row, Section, Stack, TableFrame, TriggerBadge, weight } from "../../layout";
 import { REVIEW_STATE } from "../../status";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ReviewTrace } from "../trace/AgentTraces";
@@ -39,17 +39,16 @@ function Verdicts({ job }: { job: Job }) {
         const pass = job.verdict![d].verdict === "pass";
         return (
           <Tooltip key={d} label={job.verdict![d].notes || label} multiline maw="var(--nest-side-panel)">
-            <Badge
+            <TriggerBadge
               size="sm"
               variant="light"
               color={pass ? "success" : "danger"}
               leftSection={pass ? <IconCheck size={icon.sm} aria-hidden /> : <IconX size={icon.sm} aria-hidden />}
               aria-label={`${label}: ${pass ? "passed" : "failed"}`}
               data-verdict={pass ? "pass" : "fail"}
-              tabIndex={0}
             >
               {label}
-            </Badge>
+            </TriggerBadge>
           </Tooltip>
         );
       })}
@@ -102,7 +101,7 @@ export function ReviewsPage() {
                     <Table.Tr data-job={key}>
                       <Table.Td>
                         <Stack gap="2xs">
-                          <Anchor href={`https://github.com/${p.repo}/pull/${j.pr}`} target="_blank" rel="noreferrer" fz="sm" fw="medium">
+                          <Anchor href={`https://github.com/${p.repo}/pull/${j.pr}`} target="_blank" rel="noreferrer" fz="sm" fw={weight.medium}>
                             #{j.pr} {j.title ?? ""}
                           </Anchor>
                           <Text fz="xs" c="dimmed" ff="monospace">

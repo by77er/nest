@@ -1,10 +1,12 @@
-// A project's manager: the conversation with it, full width at a reading measure, the composer pinned
-// to the bottom; its status in the header; and beside "Chat", its live trace (`?view=trace`).
+// A project's manager, in the same frame as every view: the conversation at a reading measure on the
+// frame's left edge, the context column beside it (its tasks, what needs you); the composer pinned to
+// the bottom; its status in the header; and beside "Chat", its live trace (`?view=trace`).
 
 import { Tabs } from "@mantine/core";
 import { IconMessage, IconTimeline } from "@tabler/icons-react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { icon, Section, Stack } from "../../layout";
+import { icon, Section, Stack, WithContext } from "../../layout";
+import { ManagerContext } from "./ManagerContext";
 import { ChatView } from "../chat/ChatView";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ManagerProblem, ManagerStatusLine } from "./ManagerStatus";
@@ -17,8 +19,9 @@ export function ManagerPage() {
   const navigate = useNavigate({ from: "/projects/$projectId/manager" });
   const tab = view ?? "chat";
   return (
-    <ProjectFrame projectId={projectId} measure="reading">
+    <ProjectFrame projectId={projectId}>
       {(p) => (
+        <WithContext measure="reading" contextLabel="About the manager" context={<ManagerContext projectId={projectId} />}>
         <Section title="Manager" actions={<ManagerStatusLine projectId={projectId} />}>
         <Stack gap="xl">
           <ManagerProblem projectId={projectId} />
@@ -41,6 +44,7 @@ export function ManagerPage() {
           </Tabs>
         </Stack>
         </Section>
+        </WithContext>
       )}
     </ProjectFrame>
   );

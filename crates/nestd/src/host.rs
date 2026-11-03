@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use nestd_core::checkpoint::{DiskStamp, SENTINEL, ScanMemo};
+use nestd_core::checkpoint::{DiskStamp, Pass, SENTINEL, ScanMemo};
 use nestd_core::incarnation;
 use nestd_core::results::ResultCache;
 use nest_protocol::control::{
@@ -43,7 +43,7 @@ use nest_protocol::model::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-use crate::config::{Config, DriverConfig, NetworkConfig, StorageConfig};
+use crate::config::{Config, DiskCut, DriverConfig, NetworkConfig, StorageConfig};
 use crate::s3::{CredentialSource, S3Options, S3Store};
 use crate::driver::{Driver, Pauser, Vm, VmSpec};
 use crate::enroll::Enrolled;
@@ -137,6 +137,12 @@ struct Sbx {
     /// The last pass over the disk a later commit may reuse unread (`nestd_core::checkpoint`). In
     /// memory only: a restarted nestd reads every disk it salvages.
     scan_memo: ScanMemo<Manifest>,
+    /// A cut taken and not yet picked up by its background commit (at most one: a newer cut
+    /// replaces it; a suspend, archive or salvage drops it, since what it reads is newer).
+    pending_cut: Option<PendingCut>,
+    /// How many times a VM has started or resumed on this disk: a commit marks the disk clean only
+    /// if none has since its read (a cut's VM resumes right after the cut).
+    runs: u64,
 }
 
 impl Sbx {
@@ -178,6 +184,8 @@ impl Sbx {
             guest_info: None,
             unanswered: None,
             scan_memo: ScanMemo::new(),
+            pending_cut: None,
+            runs: 0,
         }
     }
 
@@ -304,6 +312,13 @@ pub struct Inner {
     cli_inflight: Mutex<HashMap<SandboxId, u32>>,
     /// Latest port report per sandbox awaiting the coalescing window.
     latest_ports: Mutex<HashMap<SandboxId, Vec<nest_protocol::guest::ListeningPort>>>,
+    /// How a checkpoint cuts a running VM's disk, decided at start.
+    cut: CutMode,
+    /// One per incarnation, held across a whole commit (its unlocked wait for the answer
+    /// included), so commits leave an incarnation one at a time and in order. Taken before the
+    /// sandbox lock, never under it.
+    commit_locks: Mutex<HashMap<(SandboxId, Epoch), CommitLock>>,
+    next_cut: std::sync::atomic::AtomicU64,
 }
 
 /// The proxy intermediate CA: current key and expiry, and a renewal in flight.
@@ -580,6 +595,7 @@ impl Host {
             recovered.push(Arc::new(tokio::sync::Mutex::new(sbx)));
         }
 
+        let cut = if sandbox_host { decide_cut(&cfg) } else { CutMode::None };
         let inner = Arc::new(Inner {
             host_id: enrolled.host.clone(),
             driver,
@@ -610,6 +626,9 @@ impl Host {
             limiter: Limiter::default(),
             cli_inflight: Mutex::new(HashMap::new()),
             latest_ports: Mutex::new(HashMap::new()),
+            cut,
+            commit_locks: Mutex::new(HashMap::new()),
+            next_cut: std::sync::atomic::AtomicU64::new(1),
             cfg,
         });
 
@@ -1271,6 +1290,17 @@ impl Inner {
     }
 
     async fn retire_now(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>) {
+        // A queued cut goes first (the salvage reads the disk itself, newer than any cut); then the
+        // retire waits for any commit in flight.
+        let (id, epoch) = {
+            let mut s = entry.lock().await;
+            drop_pending_cut(&mut s, "the incarnation is retired: its salvage reads the disk");
+            (s.id.clone(), s.epoch)
+        };
+        // Its own handle on the lock: released across each backoff below, so a command waiting on
+        // it (one that began before the fence) gets it, finds the fence and returns.
+        let lock = self.commit_lock(&id, epoch);
+        let mut commit = Some(lock.clone().lock_owned().await);
         let mut s = entry.clone().lock_owned().await;
         if s.retiring {
             return;
@@ -1296,8 +1326,10 @@ impl Inner {
                 Err(e) => {
                     tracing::warn!(sandbox = %id, epoch = epoch.0, code = %e.code, message = %e.message, retry_in = ?backoff, "salvage failed: the disk is kept and the salvage retried");
                     drop(s);
+                    drop(commit.take());
                     tokio::time::sleep(backoff).await;
                     backoff = incarnation::retire_backoff(backoff);
+                    commit = Some(lock.clone().lock_owned().await);
                     s = entry.clone().lock_owned().await;
                 }
             }
@@ -1306,6 +1338,8 @@ impl Inner {
         recovery::remove_incarnation(&s.state_dir);
         recovery::remove_incarnation(&s.vm_dir);
         drop(s);
+        drop(commit);
+        self.commit_locks.lock().expect("commit locks").remove(&(id.clone(), epoch));
         if destroyed {
             return; // a destroy took it: nothing left to report
         }
@@ -1591,6 +1625,7 @@ impl Inner {
             Err(e) => {
                 self.set_state(&sandbox, epoch, SandboxState::Failed, None, Some(e.to_string()));
                 self.teardown(&sandbox, DropReason::Teardown).await;
+                self.forget_commit_locks(&sandbox, epoch);
                 // It never ran for an agent: nothing to keep, and a retry at this epoch starts clean.
                 recovery::remove_incarnation(&state_dir);
                 recovery::remove_incarnation(&vm_dir);
@@ -1662,6 +1697,7 @@ impl Inner {
         self.unless_fenced(s, "VM start")?;
         s.disk_clean = false;
         s.persist(None).context("write meta.json")?;
+        s.runs += 1;
         let vm = s.vm.as_mut().expect("created");
         vm.start().await.context("start VM")?;
         self.register_pauser(&s.id, s.epoch, vm.as_ref());
@@ -1708,6 +1744,7 @@ impl Inner {
     /// Run `s`'s VM again after [`Self::pause_vm`]. The gateway admits binds again only once the
     /// VM runs: a VM that fails to resume stays marked paused, which it is.
     async fn resume_vm(&self, s: &mut Sbx) -> std::io::Result<()> {
+        s.runs += 1;
         if let Some(vm) = s.vm.as_mut() {
             vm.resume().await?;
         }
@@ -1809,6 +1846,11 @@ impl Inner {
 
     /// Suspend `id@epoch`, waiting at most `commit_timeout` for its commit's answer.
     async fn suspend(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, mode: SuspendMode, commit_timeout: Duration) -> CmdResult {
+        // A queued cut goes first (the suspend reads a newer disk); then the suspend waits for any
+        // commit in flight, before the VM is paused. No new cut can queue meanwhile: commands run
+        // one at a time.
+        drop_pending_cut(&mut *self.lock_live(id, epoch).await?, "a suspend commits a newer read of the disk");
+        let _commit = self.commit_turn(id, epoch).await?;
         let s = self.lock_live(id, epoch).await?;
         let state = self.summary.lock().expect("summary").get(id).map(|x| x.state);
         if state == Some(SandboxState::Suspended) {
@@ -1897,6 +1939,7 @@ impl Inner {
             s.disk_clean = false;
             s.persist(None).map_err(internal)?;
             self.ensure_not_fenced(id, epoch)?;
+            s.runs += 1;
             s.vm.as_mut().expect("checked").resume().await.map_err(internal)?;
             s.paused = false;
             if let Some(g) = &s.guest {
@@ -1921,6 +1964,18 @@ impl Inner {
     /// control plane's answer come after it resumes. A checkpoint never marks the disk clean (a
     /// resumed VM writes it again), so resuming before the answer changes nothing a restart reads.
     async fn checkpoint(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: CommitReason) -> CmdResult {
+        if self.cut != CutMode::None {
+            return match self.cut_checkpoint(id, epoch, reason, false).await? {
+                CutOutcome::Committed(g) => Ok(g.map(|g| serde_json::json!({ "generation": g.id }))),
+                CutOutcome::Queued { cut, .. } => Ok(Some(serde_json::json!({ "cut": cut }))),
+            };
+        }
+        self.checkpoint_by_read(id, epoch, reason).await
+    }
+
+    /// A checkpoint without a cut (M1): the VM is paused while its disk is read.
+    async fn checkpoint_by_read(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: CommitReason) -> CmdResult {
+        let _commit = self.commit_turn(id, epoch).await?;
         let s = self.lock_live(id, epoch).await?;
         let timeout = self.cfg.commit_timeout();
         let (mut s, answered) = match self.reask(s, reason, timeout).await {
@@ -1928,8 +1983,6 @@ impl Inner {
             (_, Err(e)) => return Err(e),
         };
         let running = s.vm.is_some() && !s.paused;
-        // TODO(reflink): cut the disk with a reflink instead of pausing while it is read (M2,
-        // docs/sandbox/state/disk/).
         if let Some(g) = &s.guest {
             let _ = g.prepare_snapshot(false).await;
         }
@@ -1968,8 +2021,231 @@ impl Inner {
         Ok(g.map(|g| serde_json::json!({ "generation": g.id })))
     }
 
+    /// This incarnation's commit lock ([`Inner::commit_locks`]).
+    fn commit_lock(&self, id: &SandboxId, epoch: Epoch) -> CommitLock {
+        self.commit_locks.lock().expect("commit locks").entry((id.clone(), epoch)).or_default().clone()
+    }
+
+    /// The command executor's way to `id@epoch`'s commit lock: a stale or fenced epoch is refused
+    /// before the wait, so a fenced incarnation's salvage (which holds the lock through its retries)
+    /// never holds up the host's one executor, and again after it, for a fence that landed during
+    /// the wait. What waits is only a commit in flight of a live incarnation, or one salvage attempt
+    /// (the retire releases the lock across its backoff).
+    async fn commit_turn(&self, id: &SandboxId, epoch: Epoch) -> Result<tokio::sync::OwnedMutexGuard<()>, ErrorBody> {
+        self.check_epoch(id, epoch)?;
+        let guard = self.commit_lock(id, epoch).lock_owned().await;
+        self.check_epoch(id, epoch)?;
+        Ok(guard)
+    }
+
+    /// Forget the commit locks of `id`'s incarnations at or below `epoch` (destroyed, archived or
+    /// never started): a holder keeps its own handle, and nothing asks for one of these again.
+    fn forget_commit_locks(&self, id: &SandboxId, epoch: Epoch) {
+        self.commit_locks.lock().expect("commit locks").retain(|(sid, e), _| !(sid == id && *e <= epoch));
+    }
+
+    /// A checkpoint that cuts the disk (M2, `docs/sandbox/state/disk/`). The guest flushes and the
+    /// disk file is synced while the VM runs; the VM is paused only for the cut (a reflink clone,
+    /// or, for a disk unchanged since the last pass, the M1 check); then it resumes and the cut is
+    /// queued for a background commit, which replaces any cut still queued. The command returns
+    /// once the cut is taken: the host's command queue never waits for a read, an upload or the
+    /// control plane. `keep_local`: a same-host fork reads from this commit next.
+    async fn cut_checkpoint(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: CommitReason, keep_local: bool) -> Result<CutOutcome, ErrorBody> {
+        let mut s = self.lock_live(id, epoch).await?;
+        let disk = s.disk_path();
+        if !disk.exists() {
+            return Ok(CutOutcome::Committed(None));
+        }
+        let running = s.vm.is_some() && !s.paused;
+        if let Some(g) = &s.guest {
+            let _ = g.prepare_snapshot(false).await;
+        }
+        // While the VM runs: what the guest flushed reaches the disk, so the clone's own flush
+        // (inside the pause) has little left to write.
+        {
+            let d = disk.clone();
+            let _ = tokio::task::spawn_blocking(move || storage::sync_data(&d)).await;
+        }
+        // The guard against an unbounded pause (a disk fragmented, on purpose or not, until its
+        // clone would outlast a read of it): counted while the VM runs.
+        let counted = {
+            let d = disk.clone();
+            tokio::task::spawn_blocking(move || Some((storage::extent_count(&d).ok()?, std::os::unix::fs::MetadataExt::blocks(&std::fs::metadata(&d).ok()?) * 512)))
+                .await
+                .ok()
+                .flatten()
+        };
+        let extents = counted.map(|c| c.0);
+        let read_instead = match counted {
+            Some((extents, allocated)) => {
+                let slower = storage::clone_slower_than_read(extents, allocated, self.cfg.cut_clone_ns_per_extent, self.cfg.cut_read_bytes_per_s);
+                if slower {
+                    tracing::warn!(sandbox = %id, epoch = epoch.0, extents, allocated, "checkpoint: the disk's clone would outlast reading it: this cut reads it in the pause");
+                }
+                slower
+            }
+            None => false,
+        };
+        let paused_at = Instant::now();
+        if running {
+            self.pause_vm(&mut s, format!("checkpoint ({})", commit_reason_wire(reason))).await.map_err(internal)?;
+        }
+        // Paused, or no VM runs. A fork's pass reads every chunk (to keep them local): no reuse.
+        let stable = self.driver.pause_quiesces_disk();
+        let (reuse, pass) = s.scan_memo.begin(stable && !keep_local, disk_stamp(&disk).ok().as_ref());
+        let cut_id = self.next_cut.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cut_path = s.state_dir.join(format!("cut-{cut_id}.img"));
+        let (store, mode) = (self.store.clone(), self.cut);
+        let (d, c) = (disk.clone(), cut_path.clone());
+        let cut = tokio::task::spawn_blocking(move || -> std::io::Result<(CutSource, Option<DiskStamp>)> {
+            // An unchanged disk isn't cut: its manifest is checked as M1 does (reading only the
+            // chunks the 12 h rule doubts), inside this pause.
+            let reread = match &reuse {
+                Some(prev) => storage::rescan_unchanged(store.as_ref(), &d, prev, HOLD_BACK_BYTES)?,
+                None => None,
+            };
+            let source = match reread {
+                Some(read) => CutSource::Read(read),
+                None if read_instead => CutSource::Read(storage::scan_file_keeping(store.as_ref(), &d, ManifestKind::Disk, HOLD_BACK_BYTES, keep_local)?),
+                None => {
+                    match mode {
+                        CutMode::LockedCopy => storage::locked_copy(&d, &c)?,
+                        _ => storage::reflink(&d, &c)?,
+                    }
+                    CutSource::File(c)
+                }
+            };
+            // Last, still paused: a write from here on moves the mtime off the sentinel.
+            let stamp = if stable { set_sentinel(&d).ok() } else { None };
+            Ok((source, stamp))
+        })
+        .await
+        .map_err(internal)
+        .and_then(|r| r.map_err(internal));
+        let cut_ms = now_ms();
+        let runs_at_cut = s.runs;
+        let resumed = running && !self.fenced(id, epoch);
+        if resumed {
+            if let Err(e) = self.resume_vm(&mut s).await {
+                tracing::error!(sandbox = %id, epoch = epoch.0, error = %e, "a checkpoint's VM can't be resumed");
+            }
+            // A fence that landed between the check above and this resume is undone by it.
+            if self.fenced(id, epoch)
+                && let Some(vm) = s.vm.as_mut()
+            {
+                let _ = vm.pause().await;
+            }
+            if let Some(g) = &s.guest {
+                let _ = g.thaw().await;
+            }
+            self.with_row(id, epoch, |x| x.dirty = true);
+        }
+        let paused_ms = paused_at.elapsed().as_millis() as u64;
+        let (source, stamp) = match cut {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = std::fs::remove_file(&cut_path);
+                tracing::warn!(sandbox = %id, epoch = epoch.0, error = %e.message, "checkpoint: the cut failed");
+                return Err(e);
+            }
+        };
+        let reused = matches!(source, CutSource::Read(_));
+        tracing::info!(sandbox = %id, epoch = epoch.0, reason = ?reason, cut = cut_id, paused_ms, reused, extents, "checkpoint: disk cut");
+        let (tx, rx) = oneshot::channel();
+        drop_pending_cut(&mut s, "a newer cut replaces it");
+        s.pending_cut = Some(PendingCut { id: cut_id, source, pass, stable, stamp, cut_ms, runs_at_cut, reason, keep_local, done: Some(tx) });
+        let entry = tokio::sync::OwnedMutexGuard::mutex(&s).clone();
+        drop(s);
+        let this = self.clone();
+        let lock = self.commit_lock(id, epoch);
+        spawn_boxed(async move { this.commit_cut(entry, lock, cut_id).await });
+        Ok(CutOutcome::Queued { cut: cut_id, done: rx })
+    }
+
+    /// The background commit of cut `cut_id`, after any commit in flight: read the cut (outside the
+    /// sandbox lock), then commit it as any commit is (asking again for a lost answer first). A cut
+    /// replaced or dropped meanwhile, or an incarnation fenced meanwhile (its salvage reads the
+    /// disk), commits nothing.
+    async fn commit_cut(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, lock: CommitLock, cut_id: u64) {
+        let _commit = lock.lock_owned().await;
+        let mut s = entry.clone().lock_owned().await;
+        if s.pending_cut.as_ref().is_none_or(|p| p.id != cut_id) {
+            return;
+        }
+        let mut cut = s.pending_cut.take().expect("checked");
+        let done = cut.done.take();
+        let (id, epoch) = (s.id.clone(), s.epoch);
+        let finish = |cut: &PendingCut| {
+            if let CutSource::File(f) = &cut.source {
+                let _ = std::fs::remove_file(f);
+            }
+        };
+        if self.fenced(&id, epoch) {
+            finish(&cut);
+            if let Some(d) = done {
+                let _ = d.send(Err(error(error_codes::STALE_EPOCH, format!("{id}@{} was fenced", epoch.0), false)));
+            }
+            return;
+        }
+        let timeout = self.cfg.commit_timeout();
+        let (s2, answered) = self.reask(s, cut.reason, timeout).await;
+        s = s2;
+        let answered = match answered {
+            Ok(a) => a,
+            Err(e) => {
+                finish(&cut);
+                if let Some(d) = done {
+                    let _ = d.send(Err(e));
+                }
+                return;
+            }
+        };
+        // Read the cut with the sandbox unlocked: it is a frozen file no one else writes.
+        drop(s);
+        let started = Instant::now();
+        let read = match std::mem::replace(&mut cut.source, CutSource::File(PathBuf::new())) {
+            CutSource::Read(r) => Ok(r),
+            CutSource::File(f) => {
+                let (store, keep) = (self.store.clone(), cut.keep_local);
+                let f2 = f.clone();
+                cut.source = CutSource::File(f);
+                // The VM runs again: uploads go as the cut is read (nothing to hold back for).
+                tokio::task::spawn_blocking(move || storage::scan_file_keeping(store.as_ref(), &f2, ManifestKind::Disk, 0, keep)).await.map_err(internal).and_then(|r| r.map_err(internal))
+            }
+        };
+        finish(&cut);
+        let mut s = entry.lock_owned().await;
+        let read = match read {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(sandbox = %id, epoch = epoch.0, cut = cut_id, error = %e.message, "checkpoint: reading the cut failed");
+                if let Some(d) = done {
+                    let _ = d.send(Err(e));
+                }
+                return;
+            }
+        };
+        let st = read.stats;
+        tracing::info!(
+            sandbox = %id, epoch = epoch.0, reason = ?cut.reason, cut = cut_id, scan_ms = started.elapsed().as_millis() as u64, reused = st.reused,
+            chunks_read = st.chunks_read, bytes_read = st.bytes_read, chunks_put = st.chunks_put, "commit: cut read"
+        );
+        // The disk had this content when its stamp was read, in the cut's pause.
+        s.scan_memo.scanned(cut.pass, cut.stable, cut.stamp, read.manifest.clone());
+        let p = Prepared { disk: read, mem: None, reason: cut.reason, runs_at_read: cut.runs_at_cut, cut_ms: Some(cut.cut_ms) };
+        let (_s, r) = self.publish_and_send(s, p, answered, timeout).await;
+        if let Err(e) = &r {
+            tracing::warn!(sandbox = %id, epoch = epoch.0, cut = cut_id, code = %e.code, message = %e.message, "checkpoint: the cut's commit failed");
+        }
+        if let Some(d) = done {
+            let _ = d.send(r);
+        }
+    }
+
     async fn archive(self: &Arc<Self>, id: &SandboxId, epoch: Epoch) -> CmdResult {
         {
+            drop_pending_cut(&mut *self.lock_live(id, epoch).await?, "an archive commits a newer read of the disk");
+            let _commit = self.commit_turn(id, epoch).await?;
             let mut s = self.lock_live(id, epoch).await?;
             self.transition(id, epoch, SandboxState::Archiving, None, None)?;
             if s.may_hold_work() || s.head.is_none() {
@@ -1984,6 +2260,7 @@ impl Inner {
         }
         self.transition(id, epoch, SandboxState::Archived, None, None)?;
         self.teardown(id, DropReason::Teardown).await;
+        self.forget_commit_locks(id, epoch);
         Ok(None)
     }
 
@@ -2005,8 +2282,10 @@ impl Inner {
         // salvage stops once its directory is gone).
         recovery::remove_up_to(&self.cfg.sandboxes_dir(), id, epoch);
         recovery::remove_up_to(&self.cfg.vms_dir(), id, epoch);
-        // Nothing of the sandbox is left here at or below this epoch: neither is its tombstone.
+        // Nothing of the sandbox is left here at or below this epoch: neither is its tombstone, nor
+        // a commit lock (a retire still running holds its own).
         self.tombstones.prune_up_to(id, epoch);
+        self.forget_commit_locks(id, epoch);
         Ok(None)
     }
 
@@ -2025,12 +2304,21 @@ impl Inner {
             let s = self.lock_live(parent, parent_epoch).await?;
             (s.image.clone(), s.resources)
         };
-        let generation = self
-            .checkpoint(parent, parent_epoch, CommitReason::Fork)
-            .await?
-            .and_then(|v| v.get("generation").cloned())
-            .ok_or_else(|| error(error_codes::INTERNAL, "fork: parent commit produced no generation", true))?;
-        let gen_id: GenerationId = serde_json::from_value(generation).map_err(internal)?;
+        // The child restores from the parent's commit on this host: its chunks are kept local.
+        let committed: Option<GenerationId> = if self.cut != CutMode::None {
+            match self.cut_checkpoint(parent, parent_epoch, CommitReason::Fork, true).await? {
+                CutOutcome::Committed(g) => g.map(|g| g.id),
+                CutOutcome::Queued { done, .. } => done.await.map_err(|_| error(error_codes::INTERNAL, "fork: the parent's cut was dropped", true))??.map(|g| g.id),
+            }
+        } else {
+            self.checkpoint_by_read(parent, parent_epoch, CommitReason::Fork)
+                .await?
+                .and_then(|v| v.get("generation").cloned())
+                .map(serde_json::from_value::<GenerationId>)
+                .transpose()
+                .map_err(internal)?
+        };
+        let gen_id = committed.ok_or_else(|| error(error_codes::INTERNAL, "fork: parent commit produced no generation", true))?;
         let record = self.lock_live(parent, parent_epoch).await?.head.clone().filter(|h| h.id == gen_id).ok_or_else(|| error(error_codes::INTERNAL, "fork: head moved", true))?;
         let fork = ForkIdentity { new_sandbox_id: child.clone(), hostname: hostname(&child), machine_id: crate::guest::new_machine_id() };
         let mut r = self.create_sandbox(child, child_workstream, child_epoch, image, resources, policy, Some(record), Some(fork)).await?;
@@ -2237,7 +2525,8 @@ impl Inner {
     /// this commit to go on (a salvage after another kind of request).
     async fn reask(self: &Arc<Self>, s: SbxGuard, reason: CommitReason, timeout: Duration) -> (SbxGuard, Result<Option<(SentCommit, Option<GenerationRecord>)>, ErrorBody>) {
         let Some(prev) = s.unanswered.clone() else { return (s, Ok(None)) };
-        let (s, r) = self.send_commit(s, prev.clone(), timeout).await;
+        // Never marks the disk clean: what it was read from is unknown here.
+        let (s, r) = self.send_commit(s, prev.clone(), timeout, None).await;
         match r {
             Ok(g) => (s, Ok(Some((prev, g)))),
             Err(e) if incarnation::reask_failure_ends_commit(reason == CommitReason::Salvage, prev.reason == CommitReason::Salvage, !e.retryable) => (s, Err(e)),
@@ -2258,9 +2547,12 @@ impl Inner {
         }
         // The memo is trusted only where a pause or stop really stops every write to the file.
         let stable = stable && self.driver.pause_quiesces_disk();
+        // A fork's child restores from this commit here: every chunk is read and kept local.
+        let keep_local = reason == CommitReason::Fork;
         // Begun, the memo is forgotten: a pass that fails anywhere below (the sentinel set over
         // content it doesn't describe included) leaves nothing a later commit could reuse.
-        let reuse = s.scan_memo.begin(stable, disk_stamp(&disk).ok().as_ref());
+        let (reuse, pass) = s.scan_memo.begin(stable && !keep_local, disk_stamp(&disk).ok().as_ref());
+        let runs = s.runs;
         let store = self.store.clone();
         let started = Instant::now();
         let (disk_scan, mem_scan, stamp) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
@@ -2270,7 +2562,7 @@ impl Inner {
             };
             let d = match reused {
                 Some(d) => d,
-                None => storage::scan_file(store.as_ref(), &disk, ManifestKind::Disk, HOLD_BACK_BYTES)?,
+                None => storage::scan_file_keeping(store.as_ref(), &disk, ManifestKind::Disk, HOLD_BACK_BYTES, keep_local)?,
             };
             // A memory snapshot is taken only with the VM paused for a suspend: uploaded now.
             let m = match mem {
@@ -2285,7 +2577,7 @@ impl Inner {
         .await
         .map_err(internal)?
         .map_err(internal)?;
-        s.scan_memo.scanned(stable, stamp, disk_scan.manifest.clone());
+        s.scan_memo.scanned(pass, stable, stamp, disk_scan.manifest.clone());
         let st = disk_scan.stats;
         tracing::info!(
             sandbox = %s.id, epoch = s.epoch.0, reason = ?reason, scan_ms = started.elapsed().as_millis() as u64, reused = st.reused,
@@ -2297,7 +2589,7 @@ impl Inner {
         if incarnation::nothing_to_salvage(reason == CommitReason::Salvage, s.head.as_ref().map(|h| &h.disk_manifest), &disk_scan.hash) {
             return Ok(None);
         }
-        Ok(Some(Prepared { disk: disk_scan, mem: mem_scan, reason }))
+        Ok(Some(Prepared { disk: disk_scan, mem: mem_scan, reason, runs_at_read: runs, cut_ms: None }))
     }
 
     /// Upload what [`Inner::scan`] held back and the manifests, then send the `commit_request`
@@ -2311,7 +2603,7 @@ impl Inner {
     ) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
         let store = self.store.clone();
         let started = Instant::now();
-        let Prepared { disk, mem, reason } = p;
+        let Prepared { disk, mem, reason, runs_at_read, cut_ms } = p;
         let published = tokio::task::spawn_blocking(move || -> std::io::Result<(ManifestHash, Option<ManifestHash>)> {
             storage::publish(store.as_ref(), &disk)?;
             if let Some(m) = &mem {
@@ -2327,19 +2619,21 @@ impl Inner {
         };
         tracing::debug!(sandbox = %s.id, epoch = s.epoch.0, publish_ms = started.elapsed().as_millis() as u64, "commit: uploaded");
         let kind = if mem_manifest.is_some() { GenerationKind::Checkpoint } else { GenerationKind::DiskOnly };
-        let c = SentCommit { request: RequestId(new_id("req_")), parent: s.head.as_ref().map(|h| h.id.clone()), kind, disk_manifest, mem_manifest, reason };
+        let c = SentCommit { request: RequestId(new_id("req_")), parent: s.head.as_ref().map(|h| h.id.clone()), kind, disk_manifest, mem_manifest, reason, cut_ms };
         // Nothing changed since the commit just answered: its generation is this one.
         if let Some((prev, g)) = answered
             && (&prev.disk_manifest, &prev.mem_manifest) == (&c.disk_manifest, &c.mem_manifest)
         {
             return (s, Ok(g));
         }
-        self.send_commit(s, c, timeout).await
+        self.send_commit(s, c, timeout, Some(runs_at_read)).await
     }
 
     /// Send a `commit_request` and wait (unlocked) for its answer; a timeout keeps it as
     /// [`Sbx::unanswered`] for the next commit to ask again.
-    async fn send_commit(self: &Arc<Self>, s: SbxGuard, c: SentCommit, timeout: Duration) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
+    /// `read_at`: [`Sbx::runs`] when the committed disk was read or cut (`None`: unknown, as for a
+    /// request asked about again): the disk is marked clean only if no VM has run since.
+    async fn send_commit(self: &Arc<Self>, s: SbxGuard, c: SentCommit, timeout: Duration, read_at: Option<u64>) -> (SbxGuard, Result<Option<GenerationRecord>, ErrorBody>) {
         // Recorded before it goes out (or not sent): a restart asks again under this id.
         if let Err(e) = s.persist(Some(&c)) {
             return (s, Err(error(error_codes::INTERNAL, format!("recording commit {}: {e}", c.request), true)));
@@ -2355,6 +2649,7 @@ impl Inner {
             disk_manifest: c.disk_manifest.clone(),
             mem_manifest: c.mem_manifest.clone(),
             reason: c.reason,
+            cut_ms: c.cut_ms,
         });
         let id = s.id.clone();
         let entry = tokio::sync::OwnedMutexGuard::mutex(&s).clone();
@@ -2372,7 +2667,7 @@ impl Inner {
                 if s.unanswered.as_ref().is_some_and(|u| u.request == c.request) {
                     s.unanswered = None;
                 }
-                self.apply_commit(&mut s, &id, o)
+                self.apply_commit(&mut s, &id, o, read_at)
             }
             Err(e) => {
                 s.unanswered = Some(c);
@@ -2383,13 +2678,15 @@ impl Inner {
         (s, r)
     }
 
-    fn apply_commit(self: &Arc<Self>, s: &mut Sbx, id: &SandboxId, outcome: CommitOutcome) -> Result<Option<GenerationRecord>, ErrorBody> {
+    fn apply_commit(self: &Arc<Self>, s: &mut Sbx, id: &SandboxId, outcome: CommitOutcome, read_at: Option<u64>) -> Result<Option<GenerationRecord>, ErrorBody> {
         match outcome {
             CommitOutcome::Committed { generation } => {
                 s.head = Some(generation.clone());
-                // Clean only while no VM runs on the disk (a suspend); `send_commit` persists it. A
-                // checkpoint's VM resumed before the answer: its disk stays dirty.
-                let still = s.vm.is_none() || s.paused;
+                // Clean only if no VM has run on the disk since it was read, and none runs now (a
+                // suspend); `send_commit` persists it. A checkpoint's VM resumed before the answer
+                // (and may have been stopped by a fence while it was awaited): its disk stays
+                // dirty, so a retire salvages what it wrote.
+                let still = (s.vm.is_none() || s.paused) && read_at == Some(s.runs);
                 s.disk_clean = still;
                 self.with_row(id, s.epoch, |x| {
                     x.head = Some(generation.id.clone());
@@ -2430,6 +2727,89 @@ struct Prepared {
     disk: storage::Scanned,
     mem: Option<storage::Scanned>,
     reason: CommitReason,
+    /// [`Sbx::runs`] when the disk was read or cut.
+    runs_at_read: u64,
+    /// When the disk was cut (a reflink cut read in the background).
+    cut_ms: Option<i64>,
+}
+
+/// How this host cuts a running VM's disk for a checkpoint ([`decide_cut`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CutMode {
+    /// No cut: the VM is paused while its disk is read (M1).
+    None,
+    /// `FICLONE` inside a pause only as long as the clone; read in the background.
+    Reflink,
+    /// Tests and the e2e harness: a copy under an exclusive `flock` (`storage::locked_copy`).
+    LockedCopy,
+}
+
+/// The configured cut, probed on the sandboxes' filesystem at start: `auto` takes a reflink where
+/// it works and says so either way, since a host without one pauses its VMs for whole reads.
+fn decide_cut(cfg: &Config) -> CutMode {
+    let dir = cfg.sandboxes_dir();
+    match cfg.disk_cut {
+        DiskCut::Read => CutMode::None,
+        DiskCut::LockedCopy => CutMode::LockedCopy,
+        DiskCut::Auto => {
+            let _ = std::fs::create_dir_all(&dir);
+            if storage::reflink_works(&dir) {
+                tracing::info!(dir = %dir.display(), "checkpoints cut disks with a reflink");
+                CutMode::Reflink
+            } else {
+                tracing::warn!(dir = %dir.display(), "no reflink on the sandboxes' filesystem: checkpoints pause VMs while they read disks");
+                CutMode::None
+            }
+        }
+    }
+}
+
+/// An incarnation's commit lock ([`Inner::commit_locks`]).
+type CommitLock = Arc<tokio::sync::Mutex<()>>;
+
+/// A cut waiting for its background commit.
+struct PendingCut {
+    /// Unique on this host: the background task looks for its own.
+    id: u64,
+    /// The frozen copy to read, or a manifest already read (an unchanged disk, read in the pause).
+    source: CutSource,
+    pass: Pass,
+    /// Whether the memo may record this pass ([`nestd_core::checkpoint`]), and the disk's stamp
+    /// read right after the cut, while the VM was paused.
+    stable: bool,
+    stamp: Option<DiskStamp>,
+    cut_ms: i64,
+    runs_at_cut: u64,
+    reason: CommitReason,
+    keep_local: bool,
+    /// A fork waits for its generation.
+    done: Option<oneshot::Sender<Result<Option<GenerationRecord>, ErrorBody>>>,
+}
+
+enum CutSource {
+    File(PathBuf),
+    Read(storage::Scanned),
+}
+
+/// What a checkpoint with a cut returns: the generation at once (nothing to cut: no disk), or a
+/// cut queued for its background commit.
+enum CutOutcome {
+    Committed(Option<GenerationRecord>),
+    Queued { cut: u64, done: oneshot::Receiver<Result<Option<GenerationRecord>, ErrorBody>> },
+}
+
+/// Drop `s`'s queued cut, if any: a newer read of the disk replaces it. Its file goes, and a fork
+/// waiting for it hears why.
+fn drop_pending_cut(s: &mut Sbx, why: &str) {
+    if let Some(p) = s.pending_cut.take() {
+        tracing::info!(sandbox = %s.id, epoch = s.epoch.0, cut = p.id, why, "a queued cut is dropped");
+        if let CutSource::File(f) = &p.source {
+            let _ = std::fs::remove_file(f);
+        }
+        if let Some(done) = p.done {
+            let _ = done.send(Err(error(error_codes::INTERNAL, format!("cut dropped: {why}"), true)));
+        }
+    }
 }
 
 /// Chunks a commit holds back in memory for upload after a checkpoint's VM resumes; past this it

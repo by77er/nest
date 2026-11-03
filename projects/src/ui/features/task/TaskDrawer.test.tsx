@@ -11,7 +11,7 @@ const drawer = () => screen.getByRole("dialog", { name: "Task" });
 describe("creating a task", () => {
   it("checks the title, sends it as a draft, and shows the card in Draft", async () => {
     const api = new FakeApi();
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/board", api);
 
     await user.click(await screen.findByRole("button", { name: "Create a task" }));
     const dialog = screen.getByRole("dialog", { name: "New task" });
@@ -31,11 +31,23 @@ describe("creating a task", () => {
 });
 
 describe("the task drawer", () => {
+  it("its Tainted badge explains itself on hover, focus or a tap: a security signal, reachable on a phone", async () => {
+    const api = new FakeApi();
+    const t = task({ title: "Touched", state: "in_progress", tainted: true });
+    api.tasks = [t];
+    const { user } = renderApp(`/projects/prj_one/board?task=${t.id}`, api);
+    const d = await waitFor(drawer);
+    const tainted = await within(d).findByLabelText(/^Tainted: a tainted session wrote to this task/);
+    expect(tainted).toHaveAttribute("tabindex", "0");
+    await user.hover(tainted);
+    expect(await screen.findByText("A tainted session wrote to this task (it read untrusted content)")).toBeInTheDocument();
+  });
+
   it("opens from its card, and assigning a ready task sends assign and shows it assigned", async () => {
     const api = new FakeApi();
     const t = task({ title: "Specced", state: "ready", spec: { goal: "Ship it", acceptance_criteria: ["works", "tested"], files: ["src/a.ts"], test_plan: "npm test" } });
     api.tasks = [t];
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/board", api);
 
     await user.click(await screen.findByRole("link", { name: "Specced" }));
     const d = await waitFor(drawer);
@@ -56,7 +68,7 @@ describe("the task drawer", () => {
     const api = new FakeApi();
     const t = task({ title: "Unspecced", state: "draft" });
     api.tasks = [t];
-    renderApp(`/projects/prj_one?task=${t.id}`, api);
+    renderApp(`/projects/prj_one/board?task=${t.id}`, api);
     const d = await waitFor(drawer);
     expect(await within(d).findByText(/Not specced yet/)).toBeInTheDocument();
     expect(within(d).queryByRole("button", { name: "Assign" })).toBeNull();
@@ -67,7 +79,7 @@ describe("the task drawer", () => {
     const api = new FakeApi();
     const t = task({ title: "Running", state: "in_progress", assignee: "agt_w1" });
     api.tasks = [t];
-    const { user } = renderApp(`/projects/prj_one?task=${t.id}`, api);
+    const { user } = renderApp(`/projects/prj_one/board?task=${t.id}`, api);
     const d = await waitFor(drawer);
 
     await user.click(await within(d).findByRole("button", { name: "Cancel task" }));
@@ -96,7 +108,7 @@ describe("the task drawer", () => {
     const review = task({ title: "Reviewed", state: "in_review", pr: 7 });
     const running = task({ title: "Running", state: "in_progress", assignee: "agt_w1" });
     api.tasks = [review, running];
-    const { user } = renderApp(`/projects/prj_one?task=${review.id}`, api);
+    const { user } = renderApp(`/projects/prj_one/board?task=${review.id}`, api);
     const d = await waitFor(drawer);
     expect(await within(d).findByRole("button", { name: "Cancel task" })).toBeInTheDocument();
     expect(within(d).queryByRole("button", { name: "Mark done" })).toBeNull();
@@ -110,7 +122,7 @@ describe("the task drawer", () => {
     const api = new FakeApi();
     const t = task({ title: "Research", state: "ready" });
     api.tasks = [t];
-    const { user } = renderApp(`/projects/prj_one?task=${t.id}`, api);
+    const { user } = renderApp(`/projects/prj_one/board?task=${t.id}`, api);
     const d = await waitFor(drawer);
 
     const done = await within(d).findByRole("button", { name: "Mark done" });
@@ -127,7 +139,7 @@ describe("the task drawer", () => {
     const t = task({ title: "Stalled one", state: "stalled", start_error: "nest refused the worker: max_agents" });
     api.tasks = [t];
     api.fail(/\/assign$/, 409, "the project already has 2 live workers (max_workers)");
-    const { user } = renderApp(`/projects/prj_one?task=${t.id}`, api);
+    const { user } = renderApp(`/projects/prj_one/board?task=${t.id}`, api);
     const d = await waitFor(drawer);
 
     expect(await within(d).findByText("nest refused the worker: max_agents")).toBeInTheDocument();

@@ -51,13 +51,13 @@ describe("the switcher", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/projects"));
   });
 
-  it("from outside a project, picking one opens its board", async () => {
+  it("from outside a project, picking one opens its manager, the default view", async () => {
     const api = twoProjects();
     const { user, router } = renderApp("/admin", api);
     await screen.findByRole("heading", { level: 1, name: "Admin" });
     await user.click(switcher());
     await user.click(await screen.findByRole("option", { name: "Gadgets" }));
-    await waitFor(() => expect(router.state.location.pathname).toBe("/projects/prj_two/board"));
+    await waitFor(() => expect(router.state.location.pathname).toBe("/projects/prj_two/manager"));
   });
 
   it("shows the project's needs-you count once, on Board, and every project's in the list", async () => {
@@ -84,8 +84,9 @@ describe("the views", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Widgets" })).toBeInTheDocument();
     const views = within(sidebar()).getByRole("group", { name: "Views" });
     const rows = within(views).getAllByRole("link");
-    expect(rows.map((r) => r.textContent)).toEqual(["Board", "Manager", "Reviews", "Network", "Settings"]);
-    expect(rows.map((r) => r.getAttribute("href"))).toEqual(["board", "manager", "reviews", "network", "settings"].map((v) => `/projects/prj_one/${v}`));
+    // The manager first: the project's default view.
+    expect(rows.map((r) => r.textContent)).toEqual(["Manager", "Board", "Reviews", "Network", "Settings"]);
+    expect(rows.map((r) => r.getAttribute("href"))).toEqual(["manager", "board", "reviews", "network", "settings"].map((v) => `/projects/prj_one/${v}`));
     expect(rows.filter((r) => r.getAttribute("aria-current") === "page").map((r) => r.textContent)).toEqual(["Reviews"]);
     for (const r of rows) expect(r).toHaveAttribute("data-ds", "nav-row");
     expect(document.querySelector(".mantine-Breadcrumbs-root")).toBeNull();
@@ -133,13 +134,16 @@ describe("the phone drawer", () => {
 });
 
 describe("the routes", () => {
-  it("send / to the projects, and an old project link with a task to the board with that task", async () => {
+  it("send / to the projects, a project to its manager, and an old project link with a task to the board with that task", async () => {
     const api = new FakeApi();
     const first = renderApp("/", api);
     await waitFor(() => expect(first.router.state.location.pathname).toBe("/projects"));
     first.unmount();
     const t = task({ title: "Old link" });
     api.tasks = [t];
+    const bare = renderApp("/projects/prj_one", api);
+    await waitFor(() => expect(bare.router.state.location.pathname).toBe("/projects/prj_one/manager"));
+    bare.unmount();
     const second = renderApp(`/projects/prj_one?task=${t.id}`, api);
     await waitFor(() => expect(second.router.state.location.pathname).toBe("/projects/prj_one/board"));
     expect(second.router.state.location.search).toEqual({ task: t.id });
