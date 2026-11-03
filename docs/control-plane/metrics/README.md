@@ -8,7 +8,7 @@ One dataset, `nest_metrics`, bound to the Worker (and so to every DO). Each even
 
 | Field | Holds |
 |---|---|
-| `index1` | The entity: an `agt_`, `sbx_`, `hst_`, `chn_` id, or a route. Sampling groups by it. |
+| `index1` | The entity: an `agt_`, `sbx_` or `hst_` id, or a route. Sampling groups by it. |
 | `blob1…` | `metric` (e.g. `turn.done`), `cell`, `host`, the Worker version id (from the version metadata binding), host version, `outcome` or `kind` |
 | `double1…` | Value, count, and extra values per metric (bytes, tokens, cost) |
 
@@ -32,4 +32,4 @@ One dataset, `nest_metrics`, bound to the Worker (and so to every DO). Each even
 
 - **The `metrics` [capability](../../agents/capabilities/)** gives `metrics_query(sql)`. The control plane runs the query against the SQL API (`POST …/accounts/<id>/analytics_engine/sql`) with a token that has only Account Analytics Read, stored in BrokerDO as `cap:metrics`. It's a builtin rather than an `api` capability because the SQL API takes `POST`, which `mode: ro` refuses. Results don't taint (see above).
 - **Deploy checks** can run the same queries with their own read token.
-- **No dashboards or platform alerting.** Noticing a trend is a judgment, so a [monitor agent](../../orchestration/#example-structures) with the `metrics` capability polls with `wake_at` and reports what matters, since what is worth noticing is a judgment, and judgments belong to agents.
+- **No metrics dashboards or platform alerting.** What is worth noticing is a judgment, and judgments belong to agents: a [monitor](../../orchestration/#example-structures) agent with the `metrics` capability queries and reports what matters. (The [dashboard](../dashboard/) shows live state, not metrics.)

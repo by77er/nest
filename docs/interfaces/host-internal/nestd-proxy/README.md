@@ -79,27 +79,29 @@ FleetDO         nestd (root)                                      nest-proxy    
 
 ## Audit `reason` values
 
-`reason` is a string on the wire. nest-proxy emits:
+`reason` is a string on the wire. nest-proxy emits these; the ones marked **designed** come with the [pending](../../README.md#pending-contract-changes) proxy work and aren't emitted yet:
 
 | Reason | Verdict | Meaning |
 |---|---|---|
 | `not_allowed` | deny | Host not in the effective allowlist |
 | `not_tls` / `no_sni` | deny | `:443` traffic without a TLS ClientHello / without SNI |
+| `invalid_host` | deny | The SNI, CONNECT authority or `Host` isn't a valid hostname |
 | `no_ca` | deny | No intermediate CA installed yet, so inspection is impossible |
 | `dns_nxdomain` | deny | DNS name not allowlisted (`via: dns`, `port: 53`) |
-| `dns_non_public` | deny | Every address in the DNS answer was non-public, so it became SERVFAIL |
+| `dns_non_public` (designed) | deny | Every address in the DNS answer was non-public, so it became SERVFAIL |
 | `connection_limit` | deny | Sandbox at `limits.max_connections` (`host: ""`) |
-| `handshake_limit` | deny | TLS handshake or leaf signing over the proxy-wide or per-sandbox bound |
-| `policy_pending` | deny | No acknowledged policy within 30 s (designed, with the ack) |
-| `policy_changed` | deny | Closed by a re-check after a policy version or grant expiry, or failed the final check before the headers went upstream |
-| `invalid_headers` | deny | Smuggling-shaped request (`Connection` naming a protected field, a transfer coding other than `chunked`, a protected `Trailer`) or over the header limits |
+| `handshake_limit` (designed) | deny | TLS handshake or leaf signing over the proxy-wide or per-sandbox bound |
+| `policy_pending` (designed) | deny | No acknowledged policy within 30 s |
+| `policy_changed` (designed) | deny | Closed by a re-check after a policy version or grant expiry, or failed the final check before the headers went upstream |
+| `invalid_headers` (designed) | deny | Smuggling-shaped request (`Connection` naming a protected field, a transfer coding other than `chunked`, a protected `Trailer`) or over the header limits |
 | `host_sni_mismatch` | alert | Decrypted `Host` ≠ SNI (domain fronting) |
 | `sni_mismatch` | alert | CONNECT tunnel's SNI ≠ the CONNECT authority (domain fronting) |
 | `placeholder_wrong_host` | alert | A binding's placeholder sent to a host outside the binding |
 | `injection_unavailable` | deny | Placeholder present but its secret is missing, expired or fenced |
 | `injection_requires_tls` | deny | Placeholder over plain HTTP |
-| `injection_out_of_scope` | deny | Placeholder on a method or path outside the binding |
-| `injection_upgrade` | deny | Protocol upgrade on a request that had a placeholder substituted |
+| `trace_with_credential` | deny | `TRACE` or `TRACK` with a placeholder substituted (the upstream would echo the secret) |
+| `injection_out_of_scope` (designed) | deny | Placeholder on a method or path outside the binding |
+| `injection_upgrade` (designed) | deny | Protocol upgrade on a request that had a placeholder substituted |
 | `tcp_exception_not_in_policy` | deny | A TCP exception listener whose rule is no longer in policy |
 | `non_tls_tunnel` | deny | CONNECT tunnel to an inspected host that didn't start TLS |
 | `guard: <name>` | deny | A [request guard](../../../sandbox/networking/egress/policy/#request-guards) refused the request (403 `request_denied`, with `guard` and `reason`) |

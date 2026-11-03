@@ -62,6 +62,6 @@ A snapshot must be restored on identical hardware and software ([snapshot suppor
 
 ## Shrinking snapshots
 
-Before each snapshot, the guest agent runs `drop_caches`. It doesn't freeze filesystems: the unused `fsfreeze` path was removed until memory snapshots are built ([host-guest](../../../interfaces/host-guest/)). Because the guest kernel uses `init_on_free=1`, freed pages are zero. zstd then compresses them to nearly nothing. Keep guests at 2–4 GB.
+Before each snapshot, the guest agent runs `drop_caches`; it doesn't freeze filesystems ([host-guest](../../../interfaces/host-guest/)). With `init_on_free=1` in the guest kernel (turned on with memory snapshots: [driver](../../drivers/firecracker/)), freed pages are zero, and zstd compresses them to nearly nothing. Keep guests at 2–4 GB.
 
 Agents without hands have no sandbox, so they never need memory snapshots.

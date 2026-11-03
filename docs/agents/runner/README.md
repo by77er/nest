@@ -2,7 +2,7 @@
 
 A Rust component on every [brain host](../../compute/brain-hosts/) that runs brains, with or without hands. It never runs on a sandbox host. Hands reach the sandbox through the runner's **hands client**: one WebSocket per call to the sandbox's [gateway](../../sandbox/gateway/) over that host's tunnel, with the binding as the first frame ([gateway contract](../../interfaces/gateway/)).
 
-## Invocation (agent with hands)
+## Launch
 
 The canonical command line, environment and managed settings are in [../../interfaces/host-internal/runner-claude/](../../interfaces/host-internal/runner-claude/) (built by `nest_protocol::host::claude`). In short (the flags under [pending contract changes](../../interfaces/README.md#pending-contract-changes) aren't built yet):
 
@@ -63,7 +63,7 @@ The system prompt text comes from the control plane (`LaunchConfig.system_prompt
 - **Exit:** the last stdout lines are processed before the exit is handled; the session channel keeps flushing (and reconnecting) for up to 30 s until AgentDO has acked every event and the session bytes are durable.
 - **Unattended runs:** `--permission-prompts none` makes Claude Code deny without prompting and tell the model not to retry ([headless](https://code.claude.com/docs/en/headless)). Escalation comes from our own `PreToolUse` hook: a call no rule allows is held with `defer`, which ends the process; once approved, the brain resumes and the same call runs ([hooks](https://code.claude.com/docs/en/hooks)). `defer` handles one tool call per turn and works only under `-p` (verified with stream-json, [runner-claude](../../interfaces/host-internal/runner-claude/)).
 - **Hands tools** are listed and callable for any agent with a bound sandbox, whatever its template.
-- **Default rules** come from the template's capabilities: `nest` allows `mcp__nest__*`, and `subagents` (in the seeded `worker`, whose launch names `Task`) allows `Agent` (`Task` before Claude Code 2.1). Everything else escalates.
+- **Default rules** come from the template's capabilities: `nest` allows `mcp__nest__*`, and `subagents` allows `Agent` (`Task` before Claude Code 2.1; a new catalog's `worker` doesn't list it). Everything else escalates.
 - **Stream parsing:** `system/init` arrives only after the first user message, with `SessionStart` hook lines before it, so the runner writes the first turn without waiting for it.
 
 ## Process hygiene

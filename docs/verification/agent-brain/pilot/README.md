@@ -6,9 +6,9 @@ A TLC-checked model of how an agent's brain is started, killed, moved and releas
 - the single-record design chosen on 2026-10-25 ([design/](../design/)), with the amendments A1-A6 that this model's counterexamples led to;
 - the **current design** as built on `brain-record` 82396b3 / 36b60d5 and main@b2b9219. It has no same-host re-issue and never adopts, and the tick re-checks a host before expiring it. A host-loss notice releases only a record at or below its epoch, and only while FleetDO still reports the host lost (`AgentDO.onHostLost`). A previous-release host is closed off as described below.
 
-Spec, configs and expected outcomes: [verification/tla/agent-brain/](../../../../verification/tla/agent-brain/); `verification/run.sh` runs them. Tools: the TLC 2026.10.24 nightly for exploration, and TLC v1.7.4 for every `ci` config and every current-design run. Prose inventory: [../](../README.md). Conformance against the code: [../conformance/](../conformance/README.md). This version supersedes the copies merged in PRs #29 and #31.
+Spec, configs and expected outcomes: [verification/tla/agent-brain/](../../../../verification/tla/agent-brain/); `verification/run.sh` runs them. Tools: the TLC 2026.10.24 nightly for exploration, and TLC v1.7.4 for every `ci` config and every current-design run. Prose inventory: [../](../README.md). Conformance against the code: [../conformance/](../conformance/README.md).
 
-**Correction.** Earlier versions said the 6073da7 variant's "host-loss release ignores the epoch". That was wrong about the code, which had both guards; the claim described a relayed design choice. The `MC_built_*` runs model that weaker, unguarded release, so they are a model variant, not the code.
+The `MC_built_*` runs model a host-loss release that ignores the epoch, weaker than 6073da7's (which had both guards): a model variant, not the code.
 
 ## Verdict
 
@@ -127,7 +127,7 @@ Liveness properties are checked under the `Stable*` premise (lapses eventually s
 | AgentDO reset | 2,666,875 / 56 / 1m11s | 2,699,000 / 54 / 1m17s |
 | idle exit | 6,457,924 / 56 / 3m16s | 6,566,829 / 58 / 7m35s |
 
-All hold. Before the current sweep, three earlier partial runs found no violation: epochs ≤ 3 with no fault (31.1M states, depth 41); epochs ≤ 3 with idle exit + drain, before A5/A6 (67.1M states, depth 30); and A1-A3 with one host fault, before A4 (36M states).
+All hold. Earlier partial runs: epochs ≤ 3 with no fault (31.1M states, depth 41), no violation; the others are in the [design](../design/)'s amendments.
 
 ## Counterexamples
 
@@ -196,7 +196,7 @@ Code that diverges from these actions: the model encodes the design and a readin
 
 ## Effort
 
-About 1,060 spec lines, 61 configs, about 15 hours over four days. The design moved eight times during the pilot: 65bf6ef; the record design; A1-A3; A4 and D1; A5 and A6; the 6073da7 choices; 82396b3/36b60d5; and the host-loss guards. About 15 TLC iterations went to model artifacts: a terminated host counted as healthy, delayed acks exploding the state space, a silently dropped start, a dying process missing from the timer guard, and liveness without a stable environment. State space was the main cost, together with a shared box that ran out of memory: the epochs ≤ 3 runs and drain don't finish in 15 min.
+About 1,060 spec lines, 61 configs and 15 agent-hours, across eight design revisions. Model artifacts that cost TLC iterations: a terminated host counted as healthy, delayed acks exploding the state space, a silently dropped start, a dying process missing from the timer guard, and liveness without a stable environment. State space was the main cost: the epochs ≤ 3 runs and drain don't finish in 15 min on a shared box.
 
 ## Next steps
 
