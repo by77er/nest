@@ -112,7 +112,7 @@ describe("the states", () => {
 });
 
 describe("Panel", () => {
-  it("is the surface, or the warning tint for a banner, never a raw color", () => {
+  it("is the surface, and a warning panel the surface with a warning rule, not a tinted fill, never a raw color", () => {
     wrap(
       <>
         <Panel data-testid="plain" />
@@ -120,6 +120,9 @@ describe("Panel", () => {
       </>,
     );
     expect(style(screen.getByTestId("plain"))).toContain("var(--nest-surface)");
-    expect(style(screen.getByTestId("banner"))).toContain("var(--mantine-color-warning-light)");
+    const banner = style(screen.getByTestId("banner"));
+    expect(banner).toContain("var(--nest-surface)");
+    expect(banner).toContain("var(--mantine-color-warning-filled)");
+    expect(banner).not.toContain("var(--mantine-color-warning-light)");
   });
 });

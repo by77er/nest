@@ -4,7 +4,7 @@
 import { Anchor, Badge } from "@mantine/core";
 import { IconGitPullRequest, IconRobot } from "@tabler/icons-react";
 import { useTask } from "../../api/queries";
-import { ErrorState, LoadingState, MetaItem, MetaRow, Notice, Row, Section, Sheet, Stack } from "../../layout";
+import { ErrorState, LoadingState, MetaItem, MetaRow, Notice, Prose, Row, Section, Sheet, Stack } from "../../layout";
 import { ago, exact } from "../../common/time";
 import { StateBadge } from "../board/StateBadge";
 import { TERMINAL } from "../../../tasks";
@@ -75,6 +75,14 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
                 <MetaItem title={exact(t.updated_ms)}>Updated {ago(t.updated_ms)}</MetaItem>
               </MetaRow>
             </Stack>
+            {t.blocked && (
+              <Notice tone="warning" title={`Blocked by ${t.blocked.role === "manager" ? "the manager" : "its worker"}, ${ago(t.blocked.at_ms)}`}>
+                <Stack gap="xs">
+                  <Prose>{t.blocked.reason}</Prose>
+                  {t.blocked.question && <Prose>{t.blocked.question}</Prose>}
+                </Stack>
+              </Notice>
+            )}
             <AutoMerge task={t} />
             {t.start_error && (
               <Notice tone="warning" title={t.state === "stalled" ? "Its worker didn't start" : "Its worker is being retried"}>

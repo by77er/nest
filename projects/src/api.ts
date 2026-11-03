@@ -59,7 +59,11 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   if (parts[0] === "agents" && parts.length === 3 && parts[2] === "trace") return proxyTrace(req, env, parts[1]!, url);
   if (parts[0] !== "projects") return err(404, "unknown route");
   if (parts.length === 1) {
-    if (m === "GET") return json({ projects: await directory(env).projects() });
+    // Each with `needs_you`: how many asks and blocked tasks wait on the owner (README.md#blocked).
+    if (m === "GET") {
+      const rows = await directory(env).projects();
+      return json({ projects: await Promise.all(rows.map(async (r) => ({ ...r, needs_you: await project(env, r.id).attentionCount() }))) });
+    }
     if (m !== "POST") return err(405, "GET or POST");
     const b = await body(req, CreateProject);
     if (!b.ok) return b.res;
@@ -144,6 +148,12 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     case "POST chat": {
       const b = await body(req, Chat);
       return b.ok ? done(await p.postChat(b.value.text), 201) : b.res;
+    }
+    case "GET attention":
+      return done(await p.attention());
+    case "POST tasks/:task/answer": {
+      const b = await body(req, Answer);
+      return b.ok ? done(await p.answerBlocked(task, b.value.answer)) : b.res;
     }
     case "GET asks":
       return done(await p.asks());

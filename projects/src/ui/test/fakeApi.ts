@@ -3,7 +3,7 @@
 // of every write the page made.
 
 import { type TaskEvent, transition } from "../../tasks";
-import type { Ask, ChatMessage, HistoryRow, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
+import type { Ask, Attention, ChatMessage, HistoryRow, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
 
 export interface Write {
   method: string;
@@ -27,7 +27,7 @@ let seq = 0;
 export function task(over: Partial<Task> = {}): Task {
   seq += 1;
   return {
-    id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false, auto_merge: null,
+    id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false, auto_merge: null, blocked: null,
     created_ms: now - 3_600_000, updated_ms: now - 60_000, ...over,
   };
 }
@@ -66,6 +66,13 @@ export class FakeApi {
     return this.route(method, url.pathname.replace(/^\/api/, "").split("/").filter(Boolean), body);
   };
 
+  /** What the Worker's attention list answers: open asks and blocked tasks, oldest first. */
+  attention(): Attention[] {
+    const asks = this.asks.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
+    const blocked = this.tasks.filter((t) => t.blocked).map((t): Attention => ({ kind: "blocked", task: t.id, title: t.title, state: t.state, ...t.blocked! }));
+    return [...asks, ...blocked].sort((a, b) => a.at_ms - b.at_ms);
+  }
+
   private move(t: Task, event: TaskEvent): Response | null {
     const r = transition(t.state, event);
     if (!r.ok) return json({ error: r.error }, 409);
@@ -80,7 +87,7 @@ export class FakeApi {
       return json({ written: this.sync.written, repos: this.sync.repos });
     }
     if (parts.length === 1) {
-      if (m === "GET") return json({ projects: this.projects.map(({ settings: _s, ...row }) => row) });
+      if (m === "GET") return json({ projects: this.projects.map(({ settings: _s, ...row }) => ({ ...row, needs_you: row.id === "prj_one" ? this.attention().length : 0 })) });
       const p = project({ id: `prj_new${++seq}`, name: body.name, repo: body.repo.toLowerCase() });
       this.projects.push(p);
       return json({ ...p, catalog_synced: true }, 201);
@@ -114,6 +121,8 @@ export class FakeApi {
       }
       case "GET asks":
         return json(this.asks);
+      case "GET attention":
+        return json(this.attention());
       case "POST asks/:ask/answer": {
         const a = this.asks.find((x) => x.ask === parts[3]);
         if (!a) return json({ error: "unknown ask" }, 404);
@@ -127,6 +136,10 @@ export class FakeApi {
         return json({ ...t, history: this.history.get(t.id) ?? [] });
       case "PATCH tasks/:task":
         Object.assign(t, body);
+        return json(t);
+      case "POST tasks/:task/answer":
+        if (!t.blocked) return json({ error: "the task isn't blocked" }, 409);
+        t.blocked = null;
         return json(t);
       case "DELETE tasks/:task":
         if (t.state !== "draft") return json({ error: "only a draft is deleted; cancel it instead" }, 409);

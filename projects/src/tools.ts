@@ -50,11 +50,22 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
     { name: "update_task", description: "Change a task's title or body.", inputSchema: obj({ task: taskId, title: str("A short title.", 200), body: str("What is wanted and why.", 20000) }, ["task"]), idempotent: true },
     { name: "assign_task", description: "Assign a ready (or stalled) task: the app starts a worker for it.", inputSchema: obj({ task: taskId }, ["task"]), idempotent: true },
     { name: "cancel_task", description: "Cancel a task that isn't done; its worker, if any, is stopped.", inputSchema: obj({ task: taskId, reason: str("Why.", 1000) }, ["task"]), idempotent: true },
+    {
+      name: "block_task",
+      description: "Mark a task blocked on the owner: a decision only they can make, or credentials or access you can't get. It shows at the top of the owner's board until they answer or you clear it. Not for anything you could resolve yourself.",
+      inputSchema: obj({ task: taskId, reason: str("What blocks it, specifically.", 2000), question: str("What you need the owner to answer or do, if anything.", 2000) }, ["task", "reason"]),
+    },
+    { name: "unblock_task", description: "Clear a task's block (resolved another way).", inputSchema: obj({ task: taskId, note: str("How it was resolved.", 1000) }, ["task"]), idempotent: true },
   ],
   task: [
     { name: "get_task", description: "Your task: its title, body, spec, repo and the branch to push.", inputSchema: obj({}), readOnly: true, idempotent: true },
     { name: "report_progress", description: "Tell the board how your task is going.", inputSchema: obj({ text: str("What you did or found.") }, ["text"]) },
-    { name: "report_blocker", description: "Tell the board you are blocked, and on what.", inputSchema: obj({ text: str("What blocks you and what would unblock you.") }, ["text"]) },
+    {
+      name: "report_blocked",
+      description: "Mark your task blocked on the owner: a decision only they can make, or credentials or access you can't get. It reaches the owner and your manager; the owner's answer arrives in your inbox. Not for anything you could resolve yourself.",
+      inputSchema: obj({ reason: str("What blocks you, specifically.", 2000), question: str("What you need the owner to answer or do, if anything.", 2000) }, ["reason"]),
+    },
+    { name: "clear_blocked", description: "Clear your task's block (you resolved it another way).", inputSchema: obj({ note: str("How it was resolved.", 1000) }), idempotent: true },
     { name: "report_pr", description: "Tell the board you opened your task's PR (from its task branch).", inputSchema: obj({ number: { type: "integer", minimum: 1, description: "The PR's number." } }, ["number"]), idempotent: true },
   ],
   review: [

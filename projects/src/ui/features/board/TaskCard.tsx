@@ -30,6 +30,13 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
           <Row gap="xs" justify="space-between" align="flex-start">
             <Row gap="xs">
               <StateBadge state={task.state} size="sm" />
+              {task.blocked && (
+                <Tooltip label={`Blocked: ${task.blocked.reason}`} withArrow multiline maw="var(--nest-side-panel)">
+                  <Badge size="sm" color="warning" variant="filled" data-marker="blocked" tabIndex={0}>
+                    Blocked
+                  </Badge>
+                </Tooltip>
+              )}
               {pendingAsks > 0 && (
                 <Badge size="sm" color="warning" variant="filled" data-marker="ask">
                   Needs input

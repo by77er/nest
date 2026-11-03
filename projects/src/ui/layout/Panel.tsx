@@ -8,7 +8,10 @@ import { forwardRef, type ReactNode } from "react";
 export type PanelTone = "default" | "warning";
 
 export interface PanelProps extends Omit<PaperProps, "p" | "bg" | "withBorder" | "shadow" | "radius" | "style"> {
-  /** `default`: the surface; `warning`: a banner of things waiting on the owner. */
+  /**
+   * `default`: the surface; `warning`: things waiting on the owner. The surface with a warning rule
+   * down its left edge, not a tinted fill, so it draws the eye without shouting (in dark mode most).
+   */
   tone?: PanelTone;
   dense?: boolean;
   /** Lifted (`raised` shadow): while dragged. */
@@ -33,7 +36,7 @@ export const Panel = forwardRef<HTMLDivElement, PanelProps>(function Panel({ ton
       data-tone={tone}
       style={
         tone === "warning"
-          ? { background: "var(--mantine-color-warning-light)", borderColor: "var(--mantine-color-warning-outline)" }
+          ? { background: "var(--nest-surface)", borderColor: "var(--nest-border-color)", borderLeft: "3px solid var(--mantine-color-warning-filled)" }
           : { background: "var(--nest-surface)", borderColor: "var(--nest-border-color)" }
       }
       {...rest}
