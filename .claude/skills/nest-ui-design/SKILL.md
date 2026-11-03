@@ -116,7 +116,7 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 - **A switcher for the parent, flat rows for its views,** one level each. The switcher (the current parent's name, a button) opens a searchable, keyboard-first list: an "all" entry first, then every parent with its badge. Picking one keeps the view you're on when it has it. Below it, the current parent's views as flat rows; outside a parent, the switcher and the list's link only. Never a tree that repeats the same views under every parent.
 - **One left edge, one row style.** Every row (views, "all", Admin) has the same icon column, height, padding and left edge, drawn by one `NavRow` primitive. The product's name sits at the top on that edge, small and caption-weight, not a second heading.
 - **A quiet active state, no role color.** The active row is the `subtle` ground, full-weight text and a 2 px left rule in the `text` color. Hover is `subtle` at lower emphasis; focus is the focus ring. Role colors stay for actions and status, so the nav never outshouts the page's focal element.
-- **Badges on the thing that needs attention:** the parent's count on the switcher, and on the one view where it's handled (a project's Board). Nowhere else, and never beside a chevron.
+- **Badges on the thing that needs attention, once:** the current parent's count on the one view where it's handled (a project's Board row), not again on the switcher's button; the switcher's list shows every parent's. Never beside a chevron.
 - **Proximity:** rows `xs` apart, groups `xl` apart; the footer (Admin) set apart by space and a hairline.
 - **Phone:** a burger opens the same sidebar as a drawer, the switcher first; picking a place closes it.
 

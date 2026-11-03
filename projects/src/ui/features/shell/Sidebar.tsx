@@ -1,6 +1,6 @@
 // The sidebar (the nest-ui-design skill's Navigation): which project (the switcher), then that project's
 // views as flat rows, one row style; outside a project, the switcher and the projects list. The "needs
-// you" count is on the switcher and on Board, where "Needs you" lives. Admin is in the sidebar's foot.
+// you" count is on Board, where "Needs you" lives, once; the switcher's list shows every project's. Admin is in the sidebar's foot.
 
 import { Text } from "@mantine/core";
 import { IconFolders, IconTool } from "@tabler/icons-react";

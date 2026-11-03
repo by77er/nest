@@ -60,15 +60,17 @@ describe("the switcher", () => {
     await waitFor(() => expect(router.state.location.pathname).toBe("/projects/prj_two/board"));
   });
 
-  it("carries the project's needs-you count on the switcher, its option and Board only", async () => {
+  it("shows the project's needs-you count once, on Board, and every project's in the list", async () => {
     const api = twoProjects();
     api.asks = [ask({ question: "q1" }), ask({ question: "q2" })];
     const { user } = renderApp("/projects/prj_one/manager", api);
-    await waitFor(() => expect(switcher()).toHaveAccessibleName(/Widgets, 2 need you/));
+    await waitFor(() => expect(switcher()).toHaveAccessibleName("Project: Widgets. Switch project"));
     // The sidebar's own badges, not the switcher's list (in the DOM, closed).
     const badges = () => [...sidebar().querySelectorAll("[data-marker=needs-you]")].filter((b) => !b.closest(".mantine-Combobox-dropdown"));
-    expect(badges().map((b) => b.closest("[data-ds]")!.getAttribute("data-ds"))).toEqual(["switcher", "nav-row"]);
-    expect(badges()[1]!.closest("a")).toHaveAttribute("href", "/projects/prj_one/board");
+    // Once: on the Board row, not again on the switcher's button 50 px above it.
+    expect(badges().map((b) => b.closest("[data-ds]")!.getAttribute("data-ds"))).toEqual(["nav-row"]);
+    expect(badges()[0]!.closest("a")).toHaveAttribute("href", "/projects/prj_one/board");
+    expect(switcher().querySelector("[data-marker=needs-you]")).toBeNull();
     for (const b of badges()) expect(b.getAttribute("style")).toContain("--mantine-color-warning-");
     await user.click(switcher());
     expect(await screen.findByRole("option", { name: "Widgets, 2 need you" })).toBeInTheDocument();

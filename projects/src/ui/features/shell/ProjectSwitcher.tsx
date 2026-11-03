@@ -1,5 +1,5 @@
-// Which project: the sidebar's switcher (layout/Switcher). Its button is the current project's name with
-// its "needs you" badge, or "All projects" outside one. Picking a project keeps the view you're on (the
+// Which project: the sidebar's switcher (layout/Switcher). Its button is the current project's name, or
+// "All projects" outside one (its "needs you" count is on its Board row, and every project's in the list). Picking a project keeps the view you're on (the
 // board from outside a project); "All projects" goes to the list.
 
 import { Badge } from "@mantine/core";
@@ -47,7 +47,8 @@ export function ProjectSwitcher({ projectId, view, onNavigate }: { projectId: st
   return (
     <Switcher
       icon={IconFolders}
-      current={{ label: name, end: <NeedsYouBadge count={current?.needs_you} />, ariaLabel: `Project: ${name}${needs(current?.needs_you)}. Switch project` }}
+      // The current project's count is on its Board row, once; the list shows every project's.
+      current={{ label: name, ariaLabel: `Project: ${name}. Switch project` }}
       items={[
         { value: ALL, label: "All projects" },
         ...list.map((p) => ({ value: p.id, label: p.name, keywords: p.repo, end: <NeedsYouBadge count={p.needs_you} />, ariaLabel: `${p.name}${needs(p.needs_you)}` })),
