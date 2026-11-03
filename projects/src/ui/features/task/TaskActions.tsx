@@ -64,9 +64,23 @@ export function TaskActions({ projectId, task, onDeleted }: { projectId: string;
         }
       >
         {can(task.state, "assign") && (
-          <Button leftSection={<IconPlayerPlay size={icon.md} />} loading={assign.isPending} onClick={() => assign.mutate({ task: task.id })}>
-            {task.state === "stalled" ? "Reassign" : "Assign"}
-          </Button>
+          <>
+            {/* Waiting on unfinished tasks, the Worker refuses it (README.md#dependencies): said, not offered. */}
+            <Button
+              leftSection={<IconPlayerPlay size={icon.md} />}
+              loading={assign.isPending}
+              disabled={task.waiting_on.length > 0}
+              onClick={() => assign.mutate({ task: task.id })}
+              aria-describedby={task.waiting_on.length > 0 ? `assign-why-${task.id}` : undefined}
+            >
+              {task.state === "stalled" ? "Reassign" : "Assign"}
+            </Button>
+            {task.waiting_on.length > 0 && (
+              <Text fz="sm" c="dimmed" id={`assign-why-${task.id}`}>
+                Waits on {task.waiting_on.length} {task.waiting_on.length === 1 ? "task" : "tasks"}
+              </Text>
+            )}
+          </>
         )}
         {can(task.state, "done") && (
           <Button color="success" leftSection={<IconCheck size={icon.md} />} loading={done.isPending} onClick={confirmDone}>

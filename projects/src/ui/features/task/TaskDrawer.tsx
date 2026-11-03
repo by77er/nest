@@ -7,6 +7,7 @@ import { useTask } from "../../api/queries";
 import { ErrorState, LoadingState, MetaItem, MetaRow, Notice, Prose, Row, Section, Sheet, Stack } from "../../layout";
 import { ago, exact } from "../../common/time";
 import { StateBadge } from "../board/StateBadge";
+import { WaitingBadge } from "../board/WaitingBadge";
 import { TERMINAL } from "../../../tasks";
 import { HistoryList } from "./HistoryList";
 import { SpecView } from "./SpecView";
@@ -32,6 +33,7 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
             <Stack gap="sm">
               <Row gap="xs">
                 <StateBadge state={t.state} />
+                <WaitingBadge task={t} size="md" />
                 {t.tainted && (
                   <Badge color="gray" variant="outline">
                     Tainted

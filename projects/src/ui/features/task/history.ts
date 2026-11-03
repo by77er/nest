@@ -82,12 +82,13 @@ export function summarize(h: HistoryRow): string {
       return typeof o.pr === "number" ? `PR #${o.pr} merged` : "PR merged";
     case "pr_closed":
       return typeof o.pr === "number" ? `PR #${o.pr} closed without merging${o.detached ? ", detached" : ""}` : "PR closed";
+    // The task's title when recorded (older entries have only its id).
     case "dependency_added":
-      return str(o.blocked_by) ? `Waits on ${str(o.blocked_by)}` : "Dependency added";
+      return str(o.title) ? `Waits on "${clip(str(o.title)!)}"` : str(o.blocked_by) ? `Waits on ${str(o.blocked_by)}` : "Dependency added";
     case "dependency_removed":
-      return str(o.blocked_by) ? `No longer waits on ${str(o.blocked_by)}` : "Dependency removed";
+      return str(o.title) ? `No longer waits on "${clip(str(o.title)!)}"` : str(o.blocked_by) ? `No longer waits on ${str(o.blocked_by)}` : "Dependency removed";
     case "dependency_done":
-      return str(o.blocker) ? `${str(o.blocker)}, which it waits on, is done` : "A dependency is done";
+      return str(o.title) ? `"${clip(str(o.title)!)}", which it waits on, is done` : str(o.blocker) ? `${str(o.blocker)}, which it waits on, is done` : "A dependency is done";
     case "worker_notified":
       return Array.isArray(o.fields) && o.fields.length ? `Its worker was told of the change (${o.fields.join(", ")})` : "Its worker was told of the change";
     case "worker_not_notified":

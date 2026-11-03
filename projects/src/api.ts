@@ -6,6 +6,7 @@ import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { NestError, nestFrom } from "./nest";
+import { prNumberOf } from "./prs";
 import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
 import { proxyTrace } from "./trace";
@@ -201,14 +202,4 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     default:
       return err(404, "unknown route");
   }
-}
-
-/** A PR's number from what the owner gave: `12`, `#12`, or the PR's URL on this repo. */
-export function prNumberOf(v: number | string, repo: string): number | null {
-  if (typeof v === "number") return Number.isSafeInteger(v) && v > 0 ? v : null;
-  const t = v.trim();
-  const n = /^#?([1-9][0-9]{0,9})$/.exec(t)?.[1];
-  if (n) return Number(n);
-  const u = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]{0,9})\/?(?:[#?].*)?$/i.exec(t);
-  return u && u[1]!.toLowerCase() === repo.toLowerCase() ? Number(u[2]) : null;
 }

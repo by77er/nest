@@ -404,7 +404,7 @@ export class ProjectDO extends DurableObject<Env> {
     // Tasks waiting on it hear it's done; their live workers are told (README.md#task-changes).
     if (t.to === "done") {
       for (const d of this.sql.exec("SELECT task FROM task_deps WHERE blocker = ?", id).toArray()) {
-        this.record(d.task as string, { kind: "app", what: "board" }, "dependency_done", { blocker: id });
+        this.record(d.task as string, { kind: "app", what: "board" }, "dependency_done", { blocker: id, title: r.title as string });
         this.noteChange(d.task as string, "dependencies", `${id} (${from.replace("_", " ")})`, `${id} (done)`, { kind: "app", what: "board" });
       }
     }
@@ -689,7 +689,7 @@ export class ProjectDO extends DurableObject<Env> {
     const before = this.depList(id);
     const who = actor.kind === "owner" ? "owner" : actor.kind === "app" ? `app:${actor.what}` : actor.agent;
     this.sql.exec("INSERT INTO task_deps (task, blocker, by, at_ms) VALUES (?, ?, ?, ?)", id, blocker, who, Date.now());
-    this.record(id, actor, "dependency_added", { blocked_by: blocker });
+    this.record(id, actor, "dependency_added", { blocked_by: blocker, title: this.taskRow(blocker)!.title as string });
     this.noteChange(id, "dependencies", before, this.depList(id), actor);
     await this.arm();
     return ok(this.toTask(this.taskRow(id)!));
@@ -701,7 +701,7 @@ export class ProjectDO extends DurableObject<Env> {
     const before = this.depList(id);
     const gone = this.sql.exec("DELETE FROM task_deps WHERE task = ? AND blocker = ? RETURNING task", id, blocker).toArray().length;
     if (!gone) return fail(404, `${id} doesn't wait on ${blocker}`);
-    this.record(id, actor, "dependency_removed", { blocked_by: blocker });
+    this.record(id, actor, "dependency_removed", { blocked_by: blocker, title: (this.taskRow(blocker)?.title as string | undefined) ?? null });
     this.noteChange(id, "dependencies", before, this.depList(id), actor);
     // It may be assignable now.
     this.autoAssign();
