@@ -3150,40 +3150,56 @@ async fn a_salvage_waits_for_the_checkpoints_answer() {
     }
 }
 
+/// A cut checkpoint queued behind a commit whose answer is held: whether its cut file waits for its
+/// commit (cloned) or none does (read in the pause), and that the commit has what was written before
+/// the cut. `None`: the test filesystem can't count extents (FIEMAP), so the guard can't run.
+async fn second_cut_waits_as_a_file(extra: serde_json::Value) -> Option<bool> {
+    let h = start_host_configured(None, 5000, STEADY_LEASE, "locked_copy", extra).await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    guest_write(&disk, 0, b"first");
+    nestd::storage::extent_count(&disk).ok()?;
+    h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+    cut(&h.fleet, "cmd_ck1", "sbx_1").await;
+    wait_until("the first commit is out", || !commit_requests(&h.fleet, "sbx_1").is_empty()).await;
+    guest_write(&disk, 0, b"second, before its cut");
+    cut(&h.fleet, "cmd_ck2", "sbx_1").await;
+    let waiting = !cut_files(h.dir.path(), "sbx_1").is_empty();
+    guest_write(&disk, 0, b"after the second cut");
+    h.fleet.release_commit_answers();
+    wait_until("the second commit is out", || commit_requests(&h.fleet, "sbx_1").len() == 2).await;
+    let reqs = commit_requests(&h.fleet, "sbx_1");
+    assert!(first_chunk_of(&h, &reqs[1].2).starts_with(b"second, before its cut"));
+    Some(waiting)
+}
+
+/// Where a test filesystem can't count extents: a `NEST-TEST-SKIP:` line locally, a failure in CI
+/// (`NEST_CI_REQUIRE_USERNS`, CI's no-silent-skips switch; `dev/practices.md`).
+fn no_fiemap(test: &str) {
+    let msg = format!("{test}: the test filesystem has no FIEMAP ({})", std::env::temp_dir().display());
+    if std::env::var_os("NEST_CI_REQUIRE_USERNS").is_some() {
+        panic!("{msg}, and CI forbids skipping");
+    }
+    eprintln!("NEST-TEST-SKIP: {msg}");
+}
+
 /// The cut's guard: where the disk's clone would outlast reading it (here, a clone priced so high
-/// that any disk's would), the cut reads the disk in the pause instead. A second cut queued behind
-/// a commit whose answer is held shows it: no cut file waits for its commit, which still has what
-/// was written before it. Without the price, the same second cut leaves its cut file waiting.
+/// that any disk's would), the cut reads the disk in the pause instead: no cut file waits for its
+/// commit, which still has what was written before it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cut_whose_clone_would_outlast_a_read_reads_the_disk_instead() {
-    for guarded in [true, false] {
-        let extra = if guarded { serde_json::json!({"cut_clone_ns_per_extent": 1_000_000_000_000u64}) } else { serde_json::json!({}) };
-        let h = start_host_configured(None, 5000, STEADY_LEASE, "locked_copy", extra).await;
-        h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
-        assert!(is_ok(&h.fleet.result("cmd_create").await));
-        let disk = disk_path(h.dir.path(), "sbx_1", 1);
-        guest_write(&disk, 0, b"first");
-        // FIEMAP answers on ext4 and XFS (CI's and the hosts'), not on tmpfs: there the guard can't
-        // count, and cuts as before.
-        if nestd::storage::extent_count(&disk).is_err() {
-            eprintln!("skipped: no FIEMAP on {}", h.dir.path().display());
-            return;
-        }
-        h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
-        cut(&h.fleet, "cmd_ck1", "sbx_1").await;
-        wait_until("the first commit is out", || !commit_requests(&h.fleet, "sbx_1").is_empty()).await;
-        guest_write(&disk, 0, b"second, before its cut");
-        cut(&h.fleet, "cmd_ck2", "sbx_1").await;
-        let waiting = cut_files(h.dir.path(), "sbx_1");
-        guest_write(&disk, 0, b"after the second cut");
-        h.fleet.release_commit_answers();
-        wait_until("the second commit is out", || commit_requests(&h.fleet, "sbx_1").len() == 2).await;
-        if guarded {
-            assert!(waiting.is_empty(), "read in the pause, not cut: {waiting:?}");
-        } else {
-            assert_eq!(waiting.len(), 1, "cloned: the cut waits for its commit");
-        }
-        let reqs = commit_requests(&h.fleet, "sbx_1");
-        assert!(first_chunk_of(&h, &reqs[1].2).starts_with(b"second, before its cut"), "guarded={guarded}");
+    match second_cut_waits_as_a_file(serde_json::json!({"cut_clone_ns_per_extent": 1_000_000_000_000u64})).await {
+        Some(waiting) => assert!(!waiting, "read in the pause, not cut"),
+        None => no_fiemap("a_cut_whose_clone_would_outlast_a_read_reads_the_disk_instead"),
+    }
+}
+
+/// Without that price, the same cut is a clone: its cut file waits for its commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_whose_clone_is_cheaper_than_a_read_clones() {
+    match second_cut_waits_as_a_file(serde_json::json!({})).await {
+        Some(waiting) => assert!(waiting, "cloned: the cut waits for its commit"),
+        None => no_fiemap("a_cut_whose_clone_is_cheaper_than_a_read_clones"),
     }
 }

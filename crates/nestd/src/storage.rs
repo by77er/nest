@@ -390,9 +390,47 @@ pub fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// How many extent records `path` has now (`FS_IOC_FIEMAP` asking for none, which answers only the
-/// count): what a [`reflink`] of it costs, in metadata ([`clone_slower_than_read`]).
+/// `struct fsxattr` (linux/fs.h), what `FS_IOC_FSGETXATTR` fills.
+#[repr(C)]
+#[derive(Default)]
+struct FsXattr {
+    xflags: u32,
+    extsize: u32,
+    nextents: u32,
+    projid: u32,
+    cowextsize: u32,
+    pad: [u8; 8],
+}
+
+/// `statfs(2)`'s `f_type` for XFS (linux/magic.h).
+const XFS_SUPER_MAGIC: u64 = 0x5846_5342;
+
+/// `FS_IOC_FSGETXATTR`: `_IOR('X', 31, struct fsxattr)`.
+const FS_IOC_FSGETXATTR: libc::Ioctl = libc::_IOR::<FsXattr>(b'X' as u32, 31);
+
+/// How many extent records `path` has now: what a [`reflink`] of it costs, in metadata
+/// ([`clone_slower_than_read`]). On XFS, the inode's own count (`fsx_nextents`, O(1), no lock that
+/// a writer waits on); elsewhere, FIEMAP asking for no extents, which walks them all. Blocking: call
+/// it off the async runtime.
 pub fn extent_count(path: &Path) -> io::Result<u64> {
+    let f = File::open(path)?;
+    // XFS_SUPER_MAGIC by value: nix names it on glibc only, and `f_type`'s width differs by libc.
+    #[allow(clippy::unnecessary_cast)]
+    let xfs = nix::sys::statfs::fstatfs(&f).is_ok_and(|st| st.filesystem_type().0 as u64 == XFS_SUPER_MAGIC);
+    if xfs {
+        let mut x = FsXattr::default();
+        // SAFETY: FS_IOC_FSGETXATTR writes one `struct fsxattr` we own.
+        let r = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut FsXattr) };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(u64::from(x.nextents));
+    }
+    fiemap_extent_count(&f)
+}
+
+/// FIEMAP's count of `f`'s extents (`fm_extent_count` 0: the kernel answers only the count).
+fn fiemap_extent_count(f: &File) -> io::Result<u64> {
     /// `struct fiemap` (linux/fiemap.h) with no extent array.
     #[repr(C)]
     struct Fiemap {
@@ -403,7 +441,6 @@ pub fn extent_count(path: &Path) -> io::Result<u64> {
         extent_count: u32,
         reserved: u32,
     }
-    let f = File::open(path)?;
     let mut m = Fiemap { start: 0, length: u64::MAX, flags: 0, mapped_extents: 0, extent_count: 0, reserved: 0 };
     // SAFETY: FS_IOC_FIEMAP reads and writes a `struct fiemap` we own; with `extent_count` 0 the
     // kernel writes no extent array past it.
@@ -496,10 +533,28 @@ mod tests {
         f.write_all_at(&[2u8; 4096], 4 << 20).unwrap();
         f.sync_all().unwrap();
         match extent_count(&p) {
-            // Two writes with a hole between them: two records (tmpfs and some others can't say).
+            // Two writes with a hole between them: two records.
             Ok(n) => assert_eq!(n, 2),
-            Err(e) => assert!(matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY)), "{e}"),
+            // tmpfs and some others can't say: a skip locally, a failure in CI (no silent skips).
+            Err(e) => {
+                assert!(matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY)), "{e}");
+                assert!(std::env::var_os("NEST_CI_REQUIRE_USERNS").is_none(), "no FIEMAP on {}, and CI forbids skipping", dir.path().display());
+                eprintln!("NEST-TEST-SKIP: extent_count_counts_a_files_extent_records: no FIEMAP on {}", dir.path().display());
+            }
         }
+    }
+
+    /// The XFS path's ABI: the request number and layout the kernel's `FS_IOC_FSGETXATTR` has
+    /// (linux/fs.h: `_IOR('X', 31, struct fsxattr)`, 28 bytes). The count itself is checked on a host,
+    /// where the cut's log line carries it (CI has no XFS).
+    #[test]
+    fn the_xfs_extent_count_asks_the_kernels_fsgetxattr() {
+        assert_eq!(std::mem::size_of::<FsXattr>(), 28);
+        assert_eq!(std::mem::offset_of!(FsXattr, nextents), 8);
+        // `Ioctl` is `c_ulong` on glibc and `c_int` on musl (the hosts' build): the cast is needed there.
+        #[allow(clippy::unnecessary_cast)]
+        let request = FS_IOC_FSGETXATTR as u64 & 0xffff_ffff;
+        assert_eq!(request, 0x801c_581f);
     }
 
     #[test]
