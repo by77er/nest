@@ -1,17 +1,24 @@
-// An agent's live trace: its turns as groups (the assistant's text, each tool call with its result's
-// status, its input and result a click away), what it waits on, and whether the view is live. It follows
-// the newest event only while scrolled to the bottom; otherwise "Jump to live" takes it there.
+// An agent's trace as a terminal transcript, the way Claude Code prints one: each turn under a quiet rule
+// (its start time and how it ended), the assistant's text after `●`, each tool call as `● Name(argument)`
+// with its full input a click away and its result on the next line after `⎿` (the first lines, then
+// `… +N lines`), and states, asks and errors as dim one-liners. Older turns come from nest's trace
+// history, loaded as the reader scrolls to the top; only what arrives live fades in. It follows the
+// newest line only while scrolled to the bottom; otherwise "Jump to live" takes it there.
 
-import { Badge, Button, Code, Collapse, Divider, Text, UnstyledButton } from "@mantine/core";
-import { IconArrowDown, IconChevronDown, IconChevronRight } from "@tabler/icons-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ago, exact } from "../../common/time";
-import { FadeIn, icon, LoadingState, Notice, Prose, Row, ScrollLog, Section, Stack } from "../../layout";
-import { groupTurns, lastState, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, type TurnGroup } from "./model";
+import { Badge, Button, Text, UnstyledButton } from "@mantine/core";
+import { IconArrowDown } from "@tabler/icons-react";
+import { type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { exact } from "../../common/time";
+import { FadeIn, GLYPH, icon, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn } from "../../layout";
+import {
+  groupTurns, type HistoryEvent, lastState, primaryArg, resultLines, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, toolName,
+  type TurnGroup,
+} from "./model";
 import { useTrace } from "./useTrace";
 
-/** Within this many px of the bottom counts as at the bottom (a fraction of a line). */
+/** Within this many px of the bottom counts as at the bottom (a fraction of a line); of the top, as asking for more. */
 const NEAR_BOTTOM = 24;
+const NEAR_TOP = 80;
 
 const STATUS: Record<TraceStatus, { label: string; color: "success" | "gray" | "warning" }> = {
   live: { label: "Live", color: "success" },
@@ -20,9 +27,11 @@ const STATUS: Record<TraceStatus, { label: string; color: "success" | "gray" | "
   ended: { label: "Ended", color: "gray" },
 };
 
-const INPUT: Record<string, string> = { user: "Message", inbox: "Inbox", ask_answer: "Answer", recovery: "Recovery", event_batch: "Events" };
+const INPUT: Record<string, string> = { user: "message", inbox: "inbox", ask_answer: "answer", recovery: "recovery", event_batch: "events" };
 
+type AnyEvent = TraceEvent | HistoryEvent;
 const str = (v: unknown) => (typeof v === "string" ? v : v === undefined || v === null ? "" : String(v));
+const clock = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
 /** A tool's input as sent (compact JSON, perhaps cut short), indented when it parses. */
 function pretty(input: unknown): string {
@@ -34,105 +43,116 @@ function pretty(input: unknown): string {
   }
 }
 
+function ToolResult({ r }: { r: AnyEvent }) {
+  const [all, setAll] = useState(false);
+  const { head, more, all: lines } = resultLines(r.summary);
+  const error = r.is_error === true;
+  const shownLines = all ? lines : head;
+  const text = shownLines.length ? shownLines.join("\n") : error ? "Error" : "(no output)";
+  return (
+    <TermLine indent={1} glyph={GLYPH.result} glyphTone="muted" tone={error ? "danger" : "muted"} data-kind="tool_result" data-error={error ? "true" : "false"}>
+      {error ? `${GLYPH.error} ` : ""}
+      {text}
+      {more > 0 && !all && (
+        <>
+          {"\n"}
+          <UnstyledButton component="span" ff="monospace" fz="sm" c="dimmed" onClick={() => setAll(true)} data-slot="more">
+            {`… +${more} ${more === 1 ? "line" : "lines"} (expand)`}
+          </UnstyledButton>
+        </>
+      )}
+    </TermLine>
+  );
+}
+
 function ToolCall({ item }: { item: ToolItem }) {
   const [open, setOpen] = useState(false);
+  const region = useId();
   const r = item.result;
-  const status = !r ? { label: "Running", color: "gray" as const } : r.is_error ? { label: "Error", color: "danger" as const } : { label: "Done", color: "success" as const };
+  const error = r?.is_error === true;
+  const name = str(item.call.name);
+  const arg = primaryArg(item.call.input);
   return (
-    <Stack gap="xs" data-kind="tool" data-call={str(item.call.call_id)}>
-      <Row gap="sm" wrap="nowrap">
-        {/* On the log's left edge, like the text around it; a 32 px target. */}
-        <UnstyledButton aria-expanded={open} onClick={() => setOpen((o) => !o)} mih="var(--nest-hit)">
-          <Row gap="xs" wrap="nowrap">
-            {open ? <IconChevronDown size={icon.sm} aria-hidden /> : <IconChevronRight size={icon.sm} aria-hidden />}
-            <Text component="span" fz="sm" ff="monospace">
-              {str(item.call.name)}
-            </Text>
-          </Row>
-        </UnstyledButton>
-        <Badge size="sm" variant="light" color={status.color} data-slot="status">
-          {status.label}
-        </Badge>
-      </Row>
-      <Collapse expanded={open}>
-        <Stack gap="xs">
-          <Text fz="xs" c="dimmed">
-            Input
+    <Stack gap="2xs" data-kind="tool" data-call={str(item.call.call_id)} data-state={!r ? "running" : error ? "error" : "done"}>
+      <TermLine glyph={r ? GLYPH.bullet : GLYPH.pending} glyphTone={!r ? "muted" : error ? "danger" : "text"}>
+        <UnstyledButton ff="monospace" fz="sm" aria-expanded={open} aria-controls={region} onClick={() => setOpen((o) => !o)} title={name} data-slot="call">
+          <Text component="span" ff="monospace" fz="sm" fw="bold" inherit>
+            {toolName(name)}
           </Text>
-          <Code block>{pretty(item.call.input)}</Code>
-          {r && (
-            <>
-              <Text fz="xs" c="dimmed">
-                Result
-              </Text>
-              <Code block>{str(r.summary) || "No output"}</Code>
-            </>
-          )}
-        </Stack>
-      </Collapse>
+          {`(${arg})`}
+        </UnstyledButton>
+      </TermLine>
+      <div id={region} role="region" aria-label={`${toolName(name)} input`} hidden={!open}>
+        {open && (
+          <TermLine indent={1} tone="muted" data-slot="input">
+            {pretty(item.call.input)}
+          </TermLine>
+        )}
+      </div>
+      {r && <ToolResult r={r} />}
     </Stack>
   );
 }
 
-function Caption({ ev, children, tone }: { ev: TraceEvent; children: React.ReactNode; tone?: "warning" }) {
-  return (
-    <Text fz="xs" c={tone ?? "dimmed"} title={exact(ev.ts_ms)} data-kind={ev.type}>
-      {children}
-    </Text>
-  );
-}
-
-function EventItem({ ev }: { ev: TraceEvent }) {
+function EventItem({ ev }: { ev: AnyEvent }) {
   switch (ev.type) {
     case "assistant_text":
       return (
-        <div data-kind="text">
-          <Prose size="sm">{str(ev.text)}</Prose>
-        </div>
+        <TermLine glyph={GLYPH.bullet} data-kind="text">
+          {str(ev.text)}
+        </TermLine>
       );
     case "state":
-      return <Caption ev={ev}>Now {str(ev.state).replace(/_/g, " ")}</Caption>;
+      return (
+        <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" data-kind="state">
+          now {str(ev.state).replace(/_/g, " ")}
+        </TermLine>
+      );
     case "ask":
       return (
-        <Notice tone="warning" title="Waiting for an answer">
-          <Prose size="sm">{str(ev.question)}</Prose>
-        </Notice>
+        <TermLine glyph={GLYPH.ask} glyphTone="warning" tone="muted" data-kind="ask">
+          waiting for an answer: {str(ev.question)}
+        </TermLine>
       );
     case "ask_answered":
-      return <Caption ev={ev}>Answered</Caption>;
+      return (
+        <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" data-kind="ask_answered">
+          answered
+        </TermLine>
+      );
     case "error":
       return (
-        <Notice tone="danger" title={`Error: ${str(ev.code)}`}>
-          <Prose size="sm">{str(ev.message)}</Prose>
-        </Notice>
+        <TermLine glyph={GLYPH.error} glyphTone="danger" tone="danger" data-kind="error">
+          {str(ev.code)}: {str(ev.message)}
+        </TermLine>
       );
     case "rate_limited":
       return (
-        <Caption ev={ev} tone="warning">
-          Rate limited: {str(ev.detail)}
-        </Caption>
+        <TermLine glyph={GLYPH.note} glyphTone="warning" tone="muted" data-kind="rate_limited">
+          rate limited: {str(ev.detail)}
+        </TermLine>
       );
     case "task_exited":
       return (
-        <Caption ev={ev}>
-          Background task {str(ev.task_id)} {str(ev.status).replace(/_/g, " ")}
+        <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" data-kind="task_exited">
+          background task {str(ev.task_id)} {str(ev.status).replace(/_/g, " ")}
           {ev.exit_code !== undefined ? ` (code ${str(ev.exit_code)})` : ""}
-        </Caption>
+        </TermLine>
       );
     case "ended":
-      return <Caption ev={ev}>The agent ended ({str(ev.reason)})</Caption>;
+      return (
+        <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" data-kind="ended">
+          the agent ended ({str(ev.reason)})
+        </TermLine>
+      );
     default:
       return null; // a type this page doesn't know
   }
 }
 
-function Item({ item }: { item: TraceItem }) {
-  return item.kind === "tool" ? <ToolCall item={item} /> : <EventItem ev={item.event} />;
-}
-
+const SHOWN = new Set(["assistant_text", "state", "ask", "ask_answered", "error", "rate_limited", "task_exited", "ended"]);
 /** Visible items: an unknown event type renders nothing, so it gets no slot. */
-const shown = (i: TraceItem) =>
-  i.kind === "tool" || ["assistant_text", "state", "ask", "ask_answered", "error", "rate_limited", "task_exited", "ended"].includes(i.event.type);
+const visible = (i: TraceItem) => i.kind === "tool" || SHOWN.has(i.event.type);
 
 function tokens(u: unknown): string | null {
   const x = u as { input_tokens?: number; output_tokens?: number } | undefined;
@@ -142,45 +162,26 @@ function tokens(u: unknown): string | null {
 }
 
 function Turn({ g, animateAfter }: { g: TurnGroup; animateAfter: number }) {
-  const items = g.items.filter(shown);
+  const items = g.items.filter(visible);
   const head = g.items[0];
   const at = g.started?.ts_ms ?? (head ? (head.kind === "tool" ? head.call.ts_ms : head.event.ts_ms) : null);
-  const usage = g.completed ? tokens(g.completed.usage) : null;
+  const kind = g.started ? INPUT[str(g.started.input_kind)] : undefined;
+  const rule = [
+    at !== null ? clock.format(at) : null,
+    g.started ? kind : "started earlier",
+    g.completed ? str(g.completed.stop_reason) || "done" : "running",
+    g.completed ? tokens(g.completed.usage) : null,
+  ].filter(Boolean).join(" · ");
   return (
-    <Stack gap="sm" aria-label={g.turn ? "Turn" : "Between turns"} role="group" data-turn={g.turn ?? ""}>
+    <Stack gap="xs" aria-label={g.turn ? "Turn" : "Between turns"} role="group" data-turn={g.turn ?? ""} data-status={g.completed ? "completed" : "running"}>
       {g.turn && (
-        <Row gap="sm" justify="space-between">
-          <Row gap="sm">
-            <Text fz="xs" fw="medium">
-              {g.started ? `Turn · ${INPUT[str(g.started.input_kind)] ?? str(g.started.input_kind)}` : "Turn (started earlier)"}
-            </Text>
-            {at !== null && (
-              <Text fz="xs" c="dimmed" title={exact(at)}>
-                {ago(at)}
-              </Text>
-            )}
-          </Row>
-          <Row gap="sm">
-            {usage && (
-              <Text fz="xs" c="dimmed" ff="monospace">
-                {usage}
-              </Text>
-            )}
-            {g.completed ? (
-              <Badge size="sm" variant="light" color="gray" title={str(g.completed.stop_reason)} data-slot="turn-status">
-                Completed
-              </Badge>
-            ) : (
-              <Badge size="sm" variant="light" color="primary" data-slot="turn-status">
-                Working
-              </Badge>
-            )}
-          </Row>
-        </Row>
+        <span title={at !== null ? exact(at) : undefined}>
+          <TermRule>{rule}</TermRule>
+        </span>
       )}
       {items.map((i) => (
-        <FadeIn key={i.seq} animate={i.seq > animateAfter}>
-          <Item item={i} />
+        <FadeIn key={i.key} animate={i.seq !== null && i.seq > animateAfter}>
+          {i.kind === "tool" ? <ToolCall item={i} /> : <EventItem ev={i.event} />}
         </FadeIn>
       ))}
     </Stack>
@@ -188,13 +189,26 @@ function Turn({ g, animateAfter }: { g: TurnGroup; animateAfter: number }) {
 }
 
 /** The trace of a state, presented (separate from the socket, so tests can give a state directly). */
-export function TraceLog({ title, state }: { title: string; state: TraceState }) {
-  const groups = useMemo(() => groupTurns(state.events), [state.events]);
+export function TraceLog({ title, state, loadOlder = () => {} }: { title: string; state: TraceState; loadOlder?: () => void }) {
+  const fill = useFillColumn();
+  const groups = useMemo(() => groupTurns(state.events, state.older), [state.events, state.older]);
   const viewport = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
   const atBottomRef = useRef(true);
   const [unseen, setUnseen] = useState(0);
   const seen = useRef(state.last);
+  const heightBefore = useRef<number | null>(null);
+  const load = useRef(loadOlder);
+  load.current = loadOlder;
+  const canLoad = typeof state.olderCursor === "string" && state.olderState === "idle";
+  const canLoadRef = useRef(canLoad);
+  canLoadRef.current = canLoad;
+
+  const older = () => {
+    const v = viewport.current;
+    heightBefore.current = v ? v.scrollHeight : null;
+    load.current();
+  };
 
   useEffect(() => {
     const v = viewport.current;
@@ -204,10 +218,23 @@ export function TraceLog({ title, state }: { title: string; state: TraceState })
       atBottomRef.current = near;
       setAtBottom(near);
       if (near) setUnseen(0);
+      // Near the top: the page before, if there is one.
+      if (v.scrollTop <= NEAR_TOP && !near && canLoadRef.current) older();
     };
     v.addEventListener("scroll", onScroll, { passive: true });
     return () => v.removeEventListener("scroll", onScroll);
   }, []);
+
+  // Older events came in above: kept in place (what was being read stays where it was), or at the bottom if it was there.
+  useLayoutEffect(() => {
+    const v = viewport.current;
+    if (!v) return;
+    if (atBottomRef.current) v.scrollTo({ top: v.scrollHeight });
+    else if (heightBefore.current !== null) v.scrollTo({ top: v.scrollTop + v.scrollHeight - heightBefore.current });
+    heightBefore.current = null;
+    // Not enough yet to scroll (so no way to reach the top): the page before, too.
+    if (canLoadRef.current && v.clientHeight > 0 && v.scrollHeight <= v.clientHeight) older();
+  }, [state.older]);
 
   // New events: followed only while at the bottom; otherwise counted for "Jump to live".
   useLayoutEffect(() => {
@@ -229,10 +256,44 @@ export function TraceLog({ title, state }: { title: string; state: TraceState })
 
   const status = STATUS[state.status];
   const agentState = lastState(state.events);
+  const empty = state.events.length === 0 && state.older.length === 0;
+  let top: ReactNode = null;
+  if (state.olderState === "loading") {
+    top = (
+      <TermLine glyph={GLYPH.pending} glyphTone="muted" tone="muted" data-slot="older">
+        loading earlier…
+      </TermLine>
+    );
+  } else if (state.olderState === "error") {
+    top = (
+      <TermLine glyph={GLYPH.error} glyphTone="danger" tone="muted" data-slot="older">
+        earlier events couldn't be loaded.{" "}
+        <UnstyledButton component="span" ff="monospace" fz="sm" c="dimmed" onClick={older}>
+          retry
+        </UnstyledButton>
+      </TermLine>
+    );
+  } else if (canLoad && state.older.length > 0) {
+    top = (
+      <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" data-slot="older">
+        <UnstyledButton component="span" ff="monospace" fz="sm" c="dimmed" onClick={older}>
+          load earlier
+        </UnstyledButton>
+      </TermLine>
+    );
+  } else if (state.olderCursor === null && state.older.length > 0) {
+    top = (
+      <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" data-slot="older">
+        the beginning of the trace
+      </TermLine>
+    );
+  }
+
   return (
     <Section
       title={title}
       region={false}
+      fill={fill}
       actions={
         <>
           {agentState && (
@@ -246,11 +307,11 @@ export function TraceLog({ title, state }: { title: string; state: TraceState })
         </>
       }
     >
-      <Stack gap="md">
+      <Stack gap="md" fill={fill}>
         {state.gap && (
           <Notice tone="info" title="Earlier events aren't in the live trace">
             <Text fz="xs">
-              Events {state.gap.from}–{state.gap.to} are older than nest keeps for the live trace. This app has no transcript view yet.
+              Events {state.gap.from}–{state.gap.to} are older than nest keeps for the live trace.
             </Text>
           </Notice>
         )}
@@ -259,26 +320,26 @@ export function TraceLog({ title, state }: { title: string; state: TraceState })
             Older events are hidden to keep the page light.
           </Text>
         )}
-        <ScrollLog viewportRef={viewport}>
-          {state.events.length === 0 ? (
-            state.status === "connecting" ? (
-              <LoadingState label="Connecting to the trace" />
+        <Terminal fill={fill}>
+          <ScrollLog viewportRef={viewport} fill={fill}>
+            {empty && state.olderState !== "loading" ? (
+              state.status === "connecting" ? (
+                <LoadingState label="Connecting to the trace" />
+              ) : (
+                <TermLine glyph={GLYPH.note} glyphTone="muted" tone="muted" data-slot="empty">
+                  {state.status === "ended" ? "the agent ended with nothing in its trace" : "nothing yet: what the agent does shows here as it happens"}
+                </TermLine>
+              )
             ) : (
-              <Text fz="sm" c="dimmed" ta="center" py="lg">
-                {state.status === "ended" ? "The agent ended with nothing in its trace." : "Nothing yet. What the agent does shows here as it happens."}
-              </Text>
-            )
-          ) : (
-            <Stack gap="lg">
-              {groups.map((g, n) => (
-                <Stack key={g.key} gap="lg">
-                  {n > 0 && <Divider />}
-                  <Turn g={g} animateAfter={state.animateAfter} />
-                </Stack>
-              ))}
-            </Stack>
-          )}
-        </ScrollLog>
+              <Stack gap="sm">
+                {top}
+                {groups.map((g) => (
+                  <Turn key={g.key} g={g} animateAfter={state.animateAfter} />
+                ))}
+              </Stack>
+            )}
+          </ScrollLog>
+        </Terminal>
         {!atBottom && (
           <Row justify="center">
             <Button variant="light" size="compact-sm" leftSection={<IconArrowDown size={icon.sm} />} onClick={jump}>
@@ -293,7 +354,7 @@ export function TraceLog({ title, state }: { title: string; state: TraceState })
 
 /** An agent's live trace, connected while shown; `empty` says why there's no agent yet. */
 export function TraceView({ title, agent, empty = "No agent yet." }: { title: string; agent: string | null; empty?: string }) {
-  const state = useTrace(agent);
+  const { state, loadOlder } = useTrace(agent);
   if (!agent) {
     return (
       <Section title={title} region={false}>
@@ -303,5 +364,5 @@ export function TraceView({ title, agent, empty = "No agent yet." }: { title: st
       </Section>
     );
   }
-  return <TraceLog title={title} state={state} />;
+  return <TraceLog title={title} state={state} loadOlder={loadOlder} />;
 }

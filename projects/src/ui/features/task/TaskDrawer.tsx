@@ -42,7 +42,8 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
   const t = task.data;
 
   return (
-    <Sheet opened={taskId !== undefined} onClose={onClose} title="Task">
+    // A task that has (or had) a worker: its trace beside the details (two columns from `lg`, tabs below).
+    <Sheet opened={taskId !== undefined} onClose={onClose} title="Task" beside={t?.assignee ? <TaskTraces task={t} /> : undefined}>
       {task.isPending ? (
         <LoadingState label="Loading the task" />
       ) : task.isError ? (
@@ -103,8 +104,6 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
           <Section title="History" count={t.history.length} region={false}>
             <HistoryList history={t.history} />
           </Section>
-
-          <TaskTraces task={t} />
         </Stack>
       ) : null}
     </Sheet>

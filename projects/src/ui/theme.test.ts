@@ -80,7 +80,7 @@ describe("the tokens match the skill", () => {
   it("colors: the neutral roles and each semantic role's filled shade, light and dark", () => {
     const hex = (cell: string) => /#[0-9a-f]{6}/i.exec(cell)![0].toLowerCase();
     const rows = table("Role");
-    const neutralRoles = ["page", "surface", "subtle", "border", "text", "muted"] as const;
+    const neutralRoles = ["page", "surface", "subtle", "border", "text", "muted", "terminal"] as const;
     expect(rows.map((r) => r[0]).sort()).toEqual([...neutralRoles, ...ROLES].sort());
     for (const [role, light, dark] of rows) {
       if ((neutralRoles as readonly string[]).includes(role!)) {
@@ -137,6 +137,15 @@ describe("contrast, in both schemes", () => {
     }
     expect(vars[s]["--mantine-color-dimmed"]).toBe(n.muted);
     expect(vars[s]["--mantine-color-text"]).toBe(n.text);
+  });
+
+  it.each(schemes)("%s: on the terminal surface (a trace), text, muted text and each role's text", (s) => {
+    const n = neutrals[s];
+    expect(vars[s]["--nest-terminal"]).toBe(n.terminal);
+    expect(vars[s]["--nest-terminal-border"]).toBe(`1px solid ${n.border}`);
+    expect(contrast(n.text, n.terminal), "text").toBeGreaterThanOrEqual(AA);
+    expect(contrast(n.muted, n.terminal), "muted").toBeGreaterThanOrEqual(AA);
+    for (const r of ROLES) expect(contrast(palette[r][roleText[s][r]], n.terminal), r).toBeGreaterThanOrEqual(AA);
   });
 
   it.each(schemes)("%s: a filled button's label on each role", (s) => {

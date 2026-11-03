@@ -1,0 +1,17 @@
+/* `⎿` (U+23BF), drawn: few fonts have it (not JetBrains Mono, DejaVu Sans Mono or Noto Sans Symbols 2), so
+   the character stays in the text and a hairline corner in muted is what shows, the same everywhere. */
+.corner {
+  position: relative;
+  color: transparent !important;
+}
+
+.corner::before {
+  content: "";
+  position: absolute;
+  left: 0.45ch;
+  top: 0.05em;
+  width: 0.8ch;
+  height: 0.75em;
+  border-left: 1px solid var(--mantine-color-dimmed);
+  border-bottom: 1px solid var(--mantine-color-dimmed);
+}

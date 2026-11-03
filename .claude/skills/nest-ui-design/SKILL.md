@@ -63,6 +63,7 @@ Defined once in the theme (as Mantine values and CSS variables) and used by name
 | border | `#e9ecef` | `#2c2e33` | hairlines |
 | text | `#212529` | `#e9ecef` | body |
 | muted | `#666e76` | `#9aa0a6` | meta, captions |
+| terminal | `#f6f8fa` | `#0d0e0f` | an agent's trace: a terminal surface, mono throughout, with a 1 px hairline in `border` |
 | primary | `#3b6fc0` | `#5a8ad6` | primary actions; assigned, in progress, in review |
 | danger | `#c2414c` | `#d9606a` | close, cancel, delete, deny; cancelled, failed |
 | warning | `#dca71c` (dark text) | `#e3b341` (dark text) | stalled, needs input, undelivered, expiring |
@@ -91,6 +92,7 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 | `Stack` / `Row` | Gaps only from the spacing scale |
 | `FieldGroup` | Labels above fields, one column, `lg` between fields. Actions bottom-right |
 | `EmptyState` / `LoadingState` / `ErrorState` | Centred in their container, at most one action; errors offer a retry |
+| `Terminal` / `TermLine` / `TermRule` | An agent's trace as a terminal transcript: the `terminal` surface and hairline, the mono family, long lines wrapped (`pre-wrap`, breaking anywhere), a glyph column with hanging text, a quiet rule between turns. Glyphs without an emoji presentation only (`●` U+25CF, `⎿` U+23BF, drawn as a hairline corner since few fonts have it; never U+23FA) |
 
 ## Gestalt and negative space
 
