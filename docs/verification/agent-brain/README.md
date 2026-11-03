@@ -5,11 +5,11 @@ The agent/brain lifecycle, the one-brain rule and the turn queue, across AgentDO
 - **main** (`edf6829`): as built. Cited as `path:line`.
 - **AE**: `origin/deferred/agent-epoch` at `65bf6ef`, the redesign in flux. Cited as `AE:path:line` (`git show origin/deferred/agent-epoch:<path>`). Earlier AE commits are cited by hash.
 
-> **Since:** both versions predate the single-record design, which merged as #30 (with brain hosts in #36). The design is recorded in [design/](design/), the as-built model is in [pilot/](pilot/) and its check against the code in [conformance/](conformance/).
+> **Status:** both versions are superseded by the single-record design (#30, brain hosts in #36), written against the findings below: [design/](design/). The model of it as built is in [pilot/](pilot/) and its check against the code in [conformance/](conformance/); whether an item below still applies is answered there, not here. The turn queue (§2.4) cites today's code.
 
 The intended rule (owner): *AgentDO starts a brain at agent epoch N+1 on another host only once the previous brain is confirmed gone (its `agent_exited` with epoch >= N, or its host dead/expired; the host lease self-fences brains at 20 s, the DO expires the host at 30 s); kills carry an epoch tombstone, so a queued start at or below a killed epoch is refused.*
 
-**Note:** `65bf6ef` (after the brief's commit list) **removed the gateway floors** (`client_floor`, `floor_applied`, per-client floors, the `agent_epoch` binding claim) and host capabilities. One brain per agent now rests on the AgentDO rule alone. Floors are covered only as history (S6, section 7).
+`65bf6ef` has no gateway floors (`client_floor`, `floor_applied`, per-client floors, the `agent_epoch` binding claim) and no host capabilities: one brain per agent rests on the AgentDO rule alone. Floors appear only as S6 and in §7.
 
 Paths: `agent.ts`, `fleet.ts` and `sandbox.ts` are under `control-plane/src/do/`. `runner_link.rs` and `host.rs` are under `crates/nestd/src/`. `agent.rs`, `supervisor.rs`, `runtime.rs` and `session.rs` are under `crates/nest-runner/src/`.
 
@@ -85,7 +85,7 @@ Paths: `agent.ts`, `fleet.ts` and `sandbox.ts` are under `control-plane/src/do/`
 | Q5 | undeliverable | runner stdin closed (stopping) | an error event; the turn stays `active` until Q4 | `Actor::handle` (nest-runner `agent.rs`) |
 | Q6 | crash guard | 3 exit-restarts without a Q3 | `errored`; each new input gets exactly one more start (the counter isn't reset) | `AgentDO.wake`; lib/brain.ts `wakeDecision`, `RESTART_ON_EXIT`, `MAX_EXIT_RESTARTS` |
 
-There is no `failed` status: a turn ends as `done`, or as `interrupted` with a successor. `instance_id` is per brain session (`session.rs:409`), so every brain start is a new lineage. The AgentDO doc says "runner process" (`docs/control-plane/durable-objects/agent/README.md`).
+There is no `failed` status: a turn ends as `done`, or as `interrupted` with a successor. `instance_id` is per brain session (`session.rs:409`), so every brain start is a new lineage.
 
 ## 3. Messages and delivery
 
@@ -174,7 +174,7 @@ Workers' subrequest-depth limit for call chains is unverified.
 | ID | Status | What | Confidence |
 |---|---|---|---|
 | M-1 | Real (operator-triggered) | `start(hostHint)` for a live brain on another host sends no stop. The old socket stays `current` until the new hello, and the old brain's binding (same sandbox epoch, 1 h) stays valid, so both brains act (S1). `agent.ts:367-430` | High |
-| M-2 | Real | F3: the stop's ok drops the row. If the host then expires, `onHostLost` never comes and the captain is stuck (L1, L2). `fleet.ts:1123-1125` | High |
+| M-2 | Real | F3: the stop's ok drops the row. If the host then expires, `onHostLost` never comes and the agent is stuck (L1, L2). `fleet.ts:1123-1125` | High |
 | M-3 | Real | F8 and F5 delete rows before calling AgentDO and only log failures; one transient error strands the agent. `fleet.ts:1776-1783,932-937` | High |
 | M-4 | Suspected | A start that places an unplaced sandbox issues two `agent_start`s (L3 table). The runner answers `already_running`. Confirm with a test counting commands. `sandbox.ts:329,481-490`; `agent.ts:383,552` | Medium |
 | M-5 | Real (gap) | No watchdog for a brain that vanished without an exit or a host loss (L1, L2) | High |
@@ -196,7 +196,7 @@ Workers' subrequest-depth limit for call chains is unverified.
 Doc mismatches:
 
 - `docs/agents/runner/README.md:75` says nestd "stops every runner process"; the code fences brains via the runner (`host.rs:1086-1094`).
-- AgentDO's "runner lineage" is per brain session, not per runner process.
+- `docs/control-plane/durable-objects/agent/README.md` says "runner process"; the lineage is per brain session.
 
 ## 9. Modelling notes
 
