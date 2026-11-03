@@ -102,10 +102,10 @@ export function data(variant = "demo", now = Date.now()) {
     ],
     tsk_demo4: [
       { at_ms: now - 7_200_000, actor: "owner", action: "created", detail: JSON.stringify({ title: "Export gadgets as CSV" }), tainted: false },
-      { at_ms: now - 7_000_000, actor: "agt_mgr7k2", action: "dependency_added", detail: JSON.stringify({ blocked_by: "tsk_demo3" }), tainted: false },
-      { at_ms: now - 6_900_000, actor: "agt_mgr7k2", action: "dependency_added", detail: JSON.stringify({ blocked_by: "tsk_demo7" }), tainted: false },
-      { at_ms: now - 6_800_000, actor: "owner", action: "dependency_added", detail: JSON.stringify({ blocked_by: "tsk_demo9" }), tainted: false },
-      { at_ms: now - 3_000_000, actor: "app:github", action: "dependency_done", detail: JSON.stringify({ blocker: "tsk_demo9" }), tainted: false },
+      { at_ms: now - 7_000_000, actor: "agt_mgr7k2", action: "dependency_added", detail: JSON.stringify({ blocked_by: "tsk_demo3", title: byId.tsk_demo3.title }), tainted: false },
+      { at_ms: now - 6_900_000, actor: "agt_mgr7k2", action: "dependency_added", detail: JSON.stringify({ blocked_by: "tsk_demo7", title: byId.tsk_demo7.title }), tainted: false },
+      { at_ms: now - 6_800_000, actor: "owner", action: "dependency_added", detail: JSON.stringify({ blocked_by: "tsk_demo9", title: byId.tsk_demo9.title }), tainted: false },
+      { at_ms: now - 3_000_000, actor: "app:github", action: "dependency_done", detail: JSON.stringify({ blocker: "tsk_demo9", title: byId.tsk_demo9.title }), tainted: false },
       { at_ms: now - 30_000, actor: "agt_mgr7k2", action: "blocked", detail: JSON.stringify({ reason: "Needs a product decision: which columns?" }), tainted: false },
     ],
   };

@@ -42,10 +42,10 @@ describe("a task's PRs", () => {
     const review = await within(row(5)).findByText("Changes needed");
     expect(review.closest("[data-state]")!.getAttribute("data-size")).toBe("sm");
     expect(row(5)).toHaveTextContent("Auto-merge");
-    const failed = within(row(6)).getByText("Auto-merge failed").closest("[data-marker=auto-merge]") as HTMLElement;
+    const failed = within(row(6)).getByText("Auto-merge failed").closest(".mantine-Badge-root") as HTMLElement;
     expect(failed.getAttribute("style") ?? "").toContain("--mantine-color-warning");
-    // Its details on focus: GitHub's reason, keyboard-reachable.
-    failed.focus();
+    // Its details on focus: GitHub's reason, keyboard-reachable (the badge's wrapper is the target).
+    (failed.closest("[data-marker=auto-merge]") as HTMLElement).focus();
     expect(await screen.findByText("GitHub 422: Pull request is in clean status")).toBeInTheDocument();
   });
 
@@ -59,8 +59,11 @@ describe("a task's PRs", () => {
     expect(confirm).toHaveTextContent("Its auto-merge is turned off.");
     expect(within(confirm).getByRole("button", { name: "Cancel" })).toHaveFocus();
     expect(api.writes).toEqual([]);
+    expect(confirm).toHaveTextContent("It stays open on GitHub; this task no longer waits for it to merge.");
     await user.click(within(confirm).getByRole("button", { name: "Detach" }));
     await waitFor(() => expect(api.writes).toEqual([{ method: "DELETE", path: `/api/projects/prj_one/tasks/${t.id}/prs/5`, body: undefined }]));
+    // Its row is gone: focus is on "Attach PR", not lost.
+    await waitFor(() => expect(within(drawer()).getByRole("button", { name: "Attach PR" })).toHaveFocus());
   });
 
   it("the picker shows a PR on another task by its title but won't pick it, and its search takes a number", async () => {
@@ -77,7 +80,7 @@ describe("a task's PRs", () => {
     await user.click(await within(d).findByRole("button", { name: "Attach PR" }));
     const taken = await screen.findByRole("option", { name: "#9 Parser fix" });
     expect(taken).toHaveAttribute("data-combobox-disabled");
-    expect(taken).toHaveTextContent("On Fix the parser");
+    expect(taken).toHaveTextContent("Attached to Fix the parser");
     // Enter sends the first pickable option, never the refused one.
     await user.keyboard("{Enter}");
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/tasks/${t.id}/prs`, body: { pr: 10 } }]));
@@ -125,11 +128,14 @@ describe("a task's dependencies", () => {
     const d = await waitFor(drawer);
     expect(await within(d).findByText("1 of 1 not done: can't be assigned yet")).toBeInTheDocument();
     const waits = within(d).getByRole("group", { name: "Waits on" });
-    expect(waits).toHaveTextContent("Waits on (1)");
-    // Title, then its state.
+    // Its count in the section's count badge.
+    expect(within(waits).getByRole("heading", { name: "Waits on" }).parentElement).toHaveTextContent("Waits on1");
+    // Title, then its state, together; Remove apart at the right.
     const row = waits.querySelector("[data-dep]") as HTMLElement;
-    expect(row.textContent).toMatch(/^Design the schema.*In progress/);
-    expect(within(d).getByRole("group", { name: "Blocks" })).toHaveTextContent("Blocks (1)Build the UI");
+    const title = within(row).getByRole("link", { name: "Design the schema" });
+    expect(title.parentElement).toContainElement(within(row).getByText("In progress"));
+    expect(title.parentElement).not.toContainElement(within(row).getByRole("button", { name: /Stop waiting/ }));
+    expect(within(d).getByRole("group", { name: "Blocks" })).toHaveTextContent("Build the UI");
     // In the header, and Assign held with the reason.
     expect(within(d).getByText("Waiting on 1")).toBeInTheDocument();
     expect(within(d).getByRole("button", { name: "Assign" })).toBeDisabled();
@@ -154,14 +160,22 @@ describe("a task's dependencies", () => {
     await waitFor(() => expect(api.writes).toContainEqual({ method: "DELETE", path: `/api/projects/prj_one/tasks/${web.id}/dependencies/${schema.id}`, body: undefined }));
   });
 
-  it("with none, each group says Nothing", async () => {
+  it("with none at all, says No dependencies once", async () => {
     const api = new FakeApi();
     const t = task({ title: "Alone", state: "ready" });
     api.tasks = [t];
     renderApp(`/projects/prj_one/board?task=${t.id}`, api);
     const d = await waitFor(drawer);
-    expect(await within(d).findByRole("group", { name: "Waits on" })).toHaveTextContent("Waits on (0)Nothing");
-    expect(within(d).getByRole("group", { name: "Blocks" })).toHaveTextContent("Blocks (0)Nothing");
+    expect(await within(d).findByText("No dependencies")).toBeInTheDocument();
+    expect(within(d).queryByRole("group", { name: "Waits on" })).toBeNull();
+  });
+
+  it("with only one side, the other says Nothing", async () => {
+    const { api, schema } = board();
+    renderApp(`/projects/prj_one/board?task=${schema.id}`, api);
+    const d = await waitFor(drawer);
+    expect(await within(d).findByRole("group", { name: "Waits on" })).toHaveTextContent("Nothing");
+    expect(within(d).getByRole("group", { name: "Blocks" })).toHaveTextContent("Write the API");
   });
 
   it("the card says Waiting on N, neutral and with an hourglass, listing each blocker and its state", async () => {
@@ -172,12 +186,13 @@ describe("a task's dependencies", () => {
     api.tasks = [a, c, b];
     renderApp("/projects/prj_one/board", api);
     const card = await screen.findByRole("article", { name: "Second" });
-    const badge = within(card).getByText("Waiting on 2").closest("[data-marker=waiting]") as HTMLElement;
+    const badge = within(card).getByText("Waiting on 2").closest(".mantine-Badge-root") as HTMLElement;
+    expect(card.querySelectorAll("[data-marker=waiting]")).toHaveLength(1);
     expect(badge.getAttribute("style") ?? "").toContain("--mantine-color-gray");
     expect(badge.getAttribute("data-variant")).toBe("light");
     expect(badge.querySelector("svg")).not.toBeNull();
     expect(within(card).queryByText("Blocked")).toBeNull();
-    badge.focus();
+    (badge.closest("[data-marker=waiting]") as HTMLElement).focus();
     expect(await screen.findByText("First: In progress")).toBeInTheDocument();
     expect(screen.getByText("Second blocker: Ready")).toBeInTheDocument();
   });

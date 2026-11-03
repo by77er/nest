@@ -102,7 +102,7 @@ describe("asks", () => {
     api.asks = [ask({ question: "q" })];
     renderApp("/projects/prj_one", api);
     const card = await screen.findByRole("article", { name: "Stuck" });
-    expect(within(card).getByText("Blocked").closest("[data-marker=blocked]")!.getAttribute("style") ?? "").toContain("--mantine-color-warning-");
+    expect(within(card).getByText("Blocked").closest(".mantine-Badge-root")!.getAttribute("style") ?? "").toContain("--mantine-color-warning-");
     cleanup();
     renderApp("/", api);
     const listed = await screen.findByRole("article", { name: "Widgets" });

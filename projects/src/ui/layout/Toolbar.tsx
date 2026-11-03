@@ -19,13 +19,14 @@ export function Toolbar({ children, danger, align = "end", ...aria }: ToolbarPro
   return (
     <Group gap="sm" wrap="wrap" justify={align === "end" ? "flex-end" : "flex-start"} data-ds="toolbar" {...aria}>
       {children}
+      {/* The divider and the destructive actions wrap as one unit: never a divider left at a line's end. */}
       {danger && (
-        <>
+        <Group gap="sm" wrap="nowrap" data-slot="danger-unit">
           {any && <Divider orientation="vertical" data-slot="separator" />}
           <Group gap="sm" wrap="wrap" data-slot="danger">
             {danger}
           </Group>
-        </>
+        </Group>
       )}
     </Group>
   );

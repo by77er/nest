@@ -34,10 +34,12 @@ export interface PickerProps {
   error?: string | null;
   onRetry?: () => void;
   busy?: boolean;
+  /** The button, to move focus to it (after a row it added is gone). */
+  buttonRef?: React.Ref<HTMLButtonElement>;
 }
 
 /** A section's "add" action: a default Button with an icon, opening a searchable list. */
-export function Picker({ label, icon: Icon, items, searchLabel, empty, fromSearch, onPick, onOpen, loading, error, onRetry, busy }: PickerProps) {
+export function Picker({ label, icon: Icon, items, searchLabel, empty, fromSearch, onPick, onOpen, loading, error, onRetry, busy, buttonRef }: PickerProps) {
   const [search, setSearch] = useState("");
   const combobox = useCombobox({
     onDropdownClose: () => {
@@ -67,12 +69,15 @@ export function Picker({ label, icon: Icon, items, searchLabel, empty, fromSearc
       }}
       position="bottom-end"
       width={320}
-      withinPortal
+      // In place, as the switcher's: a list portaled out of a drawer was placed off screen on a phone.
+      withinPortal={false}
+      middlewares={{ flip: true, shift: { padding: 16 } }}
       shadow="overlay"
       classNames={{ option: classes.option }}
     >
       <Combobox.Target withAriaAttributes={false}>
         <Button
+          ref={buttonRef}
           variant="default"
           leftSection={<Icon size={icon.md} aria-hidden />}
           className={classes.action}
@@ -134,9 +139,27 @@ export const RowAction = forwardRef<HTMLButtonElement, ButtonProps & { onClick?:
   return <Button ref={ref} size="sm" {...props} className={classes.action} />;
 });
 
-/** A badge whose details open on hover or focus: focusable, with the theme's ring and a touch target. */
-export const TriggerBadge = forwardRef<HTMLDivElement, BadgeProps & { [k: `data-${string}`]: string | undefined }>(function TriggerBadge(props, ref) {
-  return <Badge ref={ref} tabIndex={0} {...props} className={classes.trigger} />;
+export interface TriggerBadgeProps extends Pick<BadgeProps, "size" | "color" | "variant" | "leftSection" | "children"> {
+  "data-marker"?: string;
+  "aria-label"?: string;
+}
+
+/**
+ * A badge whose details open on hover or focus (a Tooltip's child): focusable, with the theme's ring,
+ * and on touch a 44 px hit area around it that leaves the badge's own box as it is. The tooltip's
+ * handlers go on the wrapper, which is the target.
+ */
+export const TriggerBadge = forwardRef<HTMLSpanElement, TriggerBadgeProps & React.HTMLAttributes<HTMLSpanElement>>(function TriggerBadge(
+  { size, color, variant, leftSection, children, "data-marker": marker, "aria-label": label, ...target },
+  ref,
+) {
+  return (
+    <Box component="span" ref={ref} tabIndex={0} aria-label={label} data-marker={marker} className={classes.trigger} {...target}>
+      <Badge size={size} color={color} variant={variant} leftSection={leftSection}>
+        {children}
+      </Badge>
+    </Box>
+  );
 });
 
 /** What fills a row's free width, wrapping before the row's actions give way. */

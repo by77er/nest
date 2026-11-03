@@ -6,7 +6,7 @@
 import { Anchor, Badge, Text, Tooltip } from "@mantine/core";
 import { modals } from "@mantine/modals";
 import { IconGitPullRequest } from "@tabler/icons-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { prNumberOf } from "../../../prs";
 import { useAttachPr, useDetachPr, useOpenPrs, useReviews, useTasks } from "../../api/queries";
 import type { Job, Task, TaskPr } from "../../api/types";
@@ -34,20 +34,21 @@ function AutoMergeBadge({ pr }: { pr: TaskPr }) {
   );
 }
 
-function PrRow({ projectId, repo, task, pr, review }: { projectId: string; repo: string; task: Task; pr: TaskPr; review: Job | undefined }) {
+function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: string; repo: string; task: Task; pr: TaskPr; review: Job | undefined; onDetached: () => void }) {
   const detach = useDetachPr(projectId);
   const confirm = () =>
     modals.openConfirmModal({
       title: `Detach #${pr.number}?`,
       children: (
         <Text fz="md">
-          {pr.auto_merge?.state === "enabled" || pr.auto_merge?.state === "pending" ? "Its auto-merge is turned off. " : ""}It stays open on GitHub, no longer this task's.
+          {pr.auto_merge?.state === "enabled" || pr.auto_merge?.state === "pending" ? "Its auto-merge is turned off. " : ""}It stays open on GitHub; this task no longer waits for it to merge.
         </Text>
       ),
       labels: { confirm: "Detach", cancel: "Cancel" },
       confirmProps: { color: "danger" },
       cancelProps: { variant: "default", "data-autofocus": true },
-      onConfirm: () => detach.mutate({ task: task.id, pr: pr.number }),
+      // Its row goes: focus moves to "Attach PR", not to nowhere.
+      onConfirm: () => detach.mutate({ task: task.id, pr: pr.number }, { onSuccess: onDetached }),
     });
   return (
     <Stack gap="xs" data-pr={pr.number}>
@@ -86,7 +87,7 @@ function PrRow({ projectId, repo, task, pr, review }: { projectId: string; repo:
 }
 
 /** "Attach PR": the repo's open PRs (one on another task shown, not pickable), or a number or URL typed. */
-function AttachPr({ projectId, repo, task }: { projectId: string; repo: string; task: Task }) {
+function AttachPr({ projectId, repo, task, buttonRef }: { projectId: string; repo: string; task: Task; buttonRef: React.Ref<HTMLButtonElement> }) {
   const [opened, setOpened] = useState(false);
   const open = useOpenPrs(projectId, opened);
   const tasks = useTasks(projectId);
@@ -98,14 +99,15 @@ function AttachPr({ projectId, repo, task }: { projectId: string; repo: string; 
     label: `#${p.number} ${p.title}`,
     keywords: p.head,
     disabled: p.task !== null,
+    // Why it can't be picked, or what it is, as a quiet caption.
     end: p.task ? (
-      <Badge size="sm" color="gray" variant="outline">
-        On {titleOf(p.task)}
-      </Badge>
+      <Text component="span" fz="xs" c="dimmed">
+        Attached to {titleOf(p.task)}
+      </Text>
     ) : p.fork ? (
-      <Badge size="sm" color="gray" variant="outline">
-        Fork
-      </Badge>
+      <Text component="span" fz="xs" c="dimmed">
+        From a fork
+      </Text>
     ) : undefined,
   }));
   // A number, #n or the PR's URL, typed: the listed PR if it is one, else offered as "Attach #n".
@@ -116,6 +118,7 @@ function AttachPr({ projectId, repo, task }: { projectId: string; repo: string; 
   };
   return (
     <Picker
+      buttonRef={buttonRef}
       label="Attach PR"
       icon={IconGitPullRequest}
       items={items}
@@ -134,15 +137,17 @@ function AttachPr({ projectId, repo, task }: { projectId: string; repo: string; 
 
 export function TaskPrs({ projectId, repo, task }: { projectId: string; repo: string; task: Task }) {
   const reviews = useReviews(projectId);
+  const attach = useRef<HTMLButtonElement>(null);
+  const focusAttach = () => requestAnimationFrame(() => attach.current?.focus());
   return (
-    <Section title="Pull requests" count={task.prs.length} region={false} actions={!TERMINAL.has(task.state) && <AttachPr projectId={projectId} repo={repo} task={task} />}>
+    <Section title="Pull requests" count={task.prs.length} region={false} actions={!TERMINAL.has(task.state) && <AttachPr projectId={projectId} repo={repo} task={task} buttonRef={attach} />}>
       <Stack gap="lg">
         {task.prs.length === 0 ? (
           <Text fz="sm" c="dimmed">
             None attached. Its worker's PR attaches itself; the task is done once all attached PRs have merged.
           </Text>
         ) : (
-          task.prs.map((p) => <PrRow key={p.number} projectId={projectId} repo={repo} task={task} pr={p} review={latestReview(reviews.data, p.number)} />)
+          task.prs.map((p) => <PrRow key={p.number} projectId={projectId} repo={repo} task={task} pr={p} review={latestReview(reviews.data, p.number)} onDetached={focusAttach} />)
         )}
       </Stack>
     </Section>

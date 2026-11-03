@@ -18,11 +18,14 @@ function Ref({ projectId, t, action }: { projectId: string; t: TaskRef; action?:
   return (
     <Row gap="sm" wrap="nowrap" data-dep={t.id}>
       <Grow>
-        <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: t.id }} fz="sm">
-          {t.title}
-        </AnchorLink>
+        {/* Its title, then its state, together; only the row's action sits at the right. */}
+        <Row gap="xs">
+          <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: t.id }} fz="sm">
+            {t.title}
+          </AnchorLink>
+          <StateBadge state={t.state} size="sm" />
+        </Row>
       </Grow>
-      <StateBadge state={t.state} size="sm" />
       {action}
     </Row>
   );
@@ -31,16 +34,15 @@ function Ref({ projectId, t, action }: { projectId: string; t: TaskRef; action?:
 function RelationGroup({ label, count, children }: { label: string; count: number; children: React.ReactNode }) {
   return (
     <Stack gap="sm" role="group" aria-label={label}>
-      <Text fz="sm" fw="medium">
-        {label} ({count})
-      </Text>
-      {count === 0 ? (
-        <Text fz="sm" c="dimmed">
-          Nothing
-        </Text>
-      ) : (
-        children
-      )}
+      <Section title={label} count={count} dense region={false}>
+        {count === 0 ? (
+          <Text fz="sm" c="dimmed">
+            Nothing
+          </Text>
+        ) : (
+          <Stack gap="sm">{children}</Stack>
+        )}
+      </Section>
     </Stack>
   );
 }
@@ -50,7 +52,7 @@ function status(task: Task): string | null {
   const n = task.blocked_by.length;
   if (n === 0) return null;
   const w = task.waiting_on.length;
-  return w === 0 ? `All ${n} done: nothing holds it` : `${w} of ${n} not done: can't be assigned yet`;
+  return w === 0 ? (n === 1 ? "Its 1 dependency is done" : `Its ${n} dependencies are done`) : `${w} of ${n} not done: can't be assigned yet`;
 }
 
 export function TaskDependencies({ projectId, task }: { projectId: string; task: Task }) {
@@ -102,6 +104,12 @@ export function TaskDependencies({ projectId, task }: { projectId: string; task:
             {line}
           </Text>
         )}
+        {task.blocked_by.length === 0 && task.blocks.length === 0 ? (
+          <Text fz="sm" c="dimmed">
+            No dependencies
+          </Text>
+        ) : (
+          <>
         <RelationGroup label="Waits on" count={task.blocked_by.length}>
           {task.blocked_by.map((b) => (
             <Ref
@@ -123,6 +131,8 @@ export function TaskDependencies({ projectId, task }: { projectId: string; task:
             <Ref key={b.id} projectId={projectId} t={b} />
           ))}
         </RelationGroup>
+          </>
+        )}
       </Stack>
     </Section>
   );
