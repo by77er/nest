@@ -57,7 +57,7 @@ The checks:
 | `GET` | `/v1/agents/<agent>/transcript` | Subtree. |
 | `GET` | `/v1/agents/<agent>/trace` | Subtree ([live trace](#live-trace)). |
 | `GET` | `/v1/agents/<agent>/trace/history` | Subtree. |
-| `POST` | `/v1/agents/<agent>/inbox` | Subtree. `from` defaults to the client's id; any other `from` marks the session tainted. |
+| `POST` | `/v1/agents/<agent>/inbox` | Subtree. `from` defaults to the client's id. Any other is a label of its own ([inbox senders](#inbox-senders)): never one of nest's senders or a principal's id (403), shown with the client's id, and it taints the session. An ended agent refuses it (404). |
 | `POST` | `/v1/agents/<agent>/interrupt` | Subtree. |
 | `POST` | `/v1/agents/<agent>/start` | Subtree. `host` is the operator's (403). |
 | `POST` | `/v1/agents/<agent>/stop` | Subtree. `destroy_sandbox` destroys only a sandbox that agent owns, and only once nothing else is attached. |
@@ -88,6 +88,16 @@ The checks:
 | `GET` | `/v1/clients/self/secrets` | Self ([secrets](#secrets)). |
 | `PUT` | `/v1/clients/self/secrets/<name>` | Self. Within `secrets`. |
 | `DELETE` | `/v1/clients/self/secrets/<name>` | Self. |
+
+## Inbox senders
+
+**Decided (2026-11-02):** a message's `from` is who the model reads it as from (`Message from <from>: …` as a turn, `[message from <from>]` mid-turn), so a client names only a label of its own, and the message says which client sent it (`control-plane/src/lib/senders.ts`).
+- **A client's post** (`POST /v1/agents/<id>/inbox`) is from its own id when it names no `from`, or names its id. Any other `from` shows as `<from> (via client <cli>)` and taints the session, as a relay.
+- **A label** is 1-64 letters, digits, spaces and `. _ / @ + -`, starting with a letter or digit (400 otherwise). It has no `:`, brackets, parentheses or line breaks, so it can't forge a spawner's name, the `via` mark, or a new message in the runner's text.
+- **Refused (403):** nest's own senders, in any case: `system` (the platform's notes), `timer` (a fired timer) and `user` (the operator's default). Also any label holding a principal's id (`agt_`, `cli_`, `sbx_`, `hst_`), which covers a spawner's `<template>:<agent>` and another client's id.
+- **The operator and nest name any sender.**
+- **Every post through the API is input,** whatever its `from`: it clears a stop's `stop_quiet`. Only nest's own notes (a sandbox move, a background task's exit) aren't ([AgentDO](../../durable-objects/agent/)).
+- **An ended agent refuses every post** (404, `unknown_agent`), whatever its `from`. nest's own notes to it are dropped.
 
 ## Labels
 
