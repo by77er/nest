@@ -2,7 +2,7 @@
 // with every call and the page holds no credential of its own.
 
 import type {
-  AnswerBody, Ask, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
+  AddDependencyBody, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
   Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
 } from "./types";
 
@@ -64,6 +64,11 @@ export const api = {
   postChat: (id: string, b: ChatBody) => call<{ seq: number; delivered: boolean }>("POST", `${prj(id)}/chat`, b),
   asks: (id: string) => call<Ask[]>("GET", `${prj(id)}/asks`),
   attention: (id: string) => call<Attention[]>("GET", `${prj(id)}/attention`),
+  openPrs: (id: string) => call<OpenPr[]>("GET", `${prj(id)}/prs/open`),
+  attachPr: (id: string, task: string, b: AttachPrBody) => call<Task>("POST", `${tsk(id, task)}/prs`, b),
+  detachPr: (id: string, task: string, pr: number) => call<Task>("DELETE", `${tsk(id, task)}/prs/${pr}`),
+  addDependency: (id: string, task: string, b: AddDependencyBody) => call<Task>("POST", `${tsk(id, task)}/dependencies`, b),
+  removeDependency: (id: string, task: string, blocker: string) => call<Task>("DELETE", `${tsk(id, task)}/dependencies/${encodeURIComponent(blocker)}`),
   answerBlocked: (id: string, task: string, b: AnswerBody) => call<Task>("POST", `${tsk(id, task)}/answer`, b),
   answerAsk: (id: string, ask: string, b: AnswerBody) => call<{ delivered: unknown }>("POST", `${prj(id)}/asks/${encodeURIComponent(ask)}/answer`, b),
 

@@ -14,6 +14,7 @@ export const keys = {
   asks: (id: string) => ["projects", id, "asks"] as const,
   manager: (id: string) => ["projects", id, "manager"] as const,
   reviews: (id: string) => ["projects", id, "reviews"] as const,
+  openPrs: (id: string) => ["projects", id, "open-prs"] as const,
   attention: (id: string) => ["projects", id, "attention"] as const,
   syncState: ["admin", "sync-state"] as const,
 };
@@ -77,6 +78,29 @@ export function useAnswerBlocked(id: string) {
     },
   });
 }
+
+/** The repo's open PRs, read when the picker opens (not polled). */
+export const useOpenPrs = (id: string, enabled: boolean) => useQuery({ queryKey: keys.openPrs(id), queryFn: () => api.openPrs(id), enabled, staleTime: 30_000 });
+
+/** A write to a task's PRs or dependencies: its detail and the board read again. */
+function useRelationWrite<V extends { task: string }>(id: string, fn: (v: V) => Promise<Task>, failure: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: fn,
+    meta: { failure },
+    onSuccess: (t, v) => {
+      qc.setQueryData<Task[]>(keys.tasks(id), (old) => old?.map((x) => (x.id === t.id ? t : x)));
+      void qc.invalidateQueries({ queryKey: keys.task(id, v.task) });
+      void qc.invalidateQueries({ queryKey: keys.openPrs(id) });
+      return qc.invalidateQueries({ queryKey: keys.tasks(id) });
+    },
+  });
+}
+
+export const useAttachPr = (id: string) => useRelationWrite(id, (v: { task: string; pr: number | string }) => api.attachPr(id, v.task, { pr: v.pr }), "The PR wasn't attached");
+export const useDetachPr = (id: string) => useRelationWrite(id, (v: { task: string; pr: number }) => api.detachPr(id, v.task, v.pr), "The PR wasn't detached");
+export const useAddDependency = (id: string) => useRelationWrite(id, (v: { task: string; blocked_by: string }) => api.addDependency(id, v.task, { blocked_by: v.blocked_by }), "The dependency wasn't added");
+export const useRemoveDependency = (id: string) => useRelationWrite(id, (v: { task: string; blocker: string }) => api.removeDependency(id, v.task, v.blocker), "The dependency wasn't removed");
 
 export const useSyncState = () => useQuery({ queryKey: keys.syncState, queryFn: api.syncState });
 

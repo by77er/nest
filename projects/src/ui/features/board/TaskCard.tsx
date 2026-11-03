@@ -30,6 +30,19 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
           <Row gap="xs" justify="space-between" align="flex-start">
             <Row gap="xs">
               <StateBadge state={task.state} size="sm" />
+              {task.waiting_on.length > 0 && (
+                <Tooltip
+                  label={`Waiting on ${task.blocked_by.filter((b) => task.waiting_on.includes(b.id)).map((b) => `${b.title} (${b.state.replace("_", " ")})`).join(", ")}`}
+                  withArrow
+                  multiline
+                  maw="var(--nest-side-panel)"
+                  events={{ hover: true, focus: true, touch: true }}
+                >
+                  <Badge size="sm" color="gray" variant="outline" data-marker="waiting" tabIndex={0}>
+                    Waiting on {task.waiting_on.length}
+                  </Badge>
+                </Tooltip>
+              )}
               {task.blocked && (
                 <Tooltip label={`Blocked: ${task.blocked.reason}`} withArrow multiline maw="var(--nest-side-panel)">
                   <Badge size="sm" color="warning" variant="filled" data-marker="blocked" tabIndex={0}>

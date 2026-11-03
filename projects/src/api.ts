@@ -6,7 +6,7 @@ import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { NestError, nestFrom } from "./nest";
-import { Answer, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
+import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
 import { proxyTrace } from "./trace";
 
@@ -91,7 +91,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   if (!row) return err(404, "unknown project");
   const p = project(env, pid);
   const rest = parts.slice(2);
-  const route = `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : s)).join("/")}`;
+  const route = `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
   const task = rest[1] ?? "";
   const ask = rest[1] ?? "";
 
@@ -170,6 +170,22 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "GET attention":
       return done(await p.attention());
+    case "GET prs/open":
+      return done(await p.openPrs());
+    case "POST tasks/:task/prs": {
+      const b = await body(req, AttachPr);
+      if (!b.ok) return b.res;
+      const n = prNumberOf(b.value.pr, row.repo);
+      return n === null ? err(400, `pr: a PR number, #<n>, or https://github.com/${row.repo}/pull/<n>`) : done(await p.attachPrByNumber(task, n, { kind: "owner" }));
+    }
+    case "DELETE tasks/:task/prs/:n":
+      return done(await p.detachPr(task, Number(rest[3]), { kind: "owner" }));
+    case "POST tasks/:task/dependencies": {
+      const b = await body(req, AddDependency);
+      return b.ok ? done(await p.addDependency(task, b.value.blocked_by, { kind: "owner" })) : b.res;
+    }
+    case "DELETE tasks/:task/dependencies/:task":
+      return done(await p.removeDependency(task, rest[3]!, { kind: "owner" }));
     case "POST tasks/:task/answer": {
       const b = await body(req, Answer);
       return b.ok ? done(await p.answerBlocked(task, b.value.answer)) : b.res;
@@ -185,4 +201,14 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     default:
       return err(404, "unknown route");
   }
+}
+
+/** A PR's number from what the owner gave: `12`, `#12`, or the PR's URL on this repo. */
+export function prNumberOf(v: number | string, repo: string): number | null {
+  if (typeof v === "number") return Number.isSafeInteger(v) && v > 0 ? v : null;
+  const t = v.trim();
+  const n = /^#?([1-9][0-9]{0,9})$/.exec(t)?.[1];
+  if (n) return Number(n);
+  const u = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]{0,9})\/?(?:[#?].*)?$/i.exec(t);
+  return u && u[1]!.toLowerCase() === repo.toLowerCase() ? Number(u[2]) : null;
 }

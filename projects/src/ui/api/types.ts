@@ -5,7 +5,7 @@ import type { ProjectRow } from "../../do/directory";
 
 export type { Ask, ChatMessage, HistoryRow, Settings, Task } from "../../do/project";
 export type { ProjectRow, SyncState } from "../../do/directory";
-export type { AnswerBody, CancelBody, ChatBody, CreateProjectBody, CreateTaskBody, SettingsBody, UpdateTaskBody } from "../../requests";
+export type { AddDependencyBody, AttachPrBody, AnswerBody, CancelBody, ChatBody, CreateProjectBody, CreateTaskBody, SettingsBody, UpdateTaskBody } from "../../requests";
 export type { Spec, TaskState } from "../../tasks";
 export type { ManagerPhase, ManagerStatus } from "../../manager";
 export type { Job, JobState } from "../../do/review";
@@ -15,7 +15,15 @@ export type { Dimension, Verdict } from "../../github";
 export type Project = ProjectRow & { settings: Settings };
 /** A row of the projects list: with `needs_you`, how many asks and blocked tasks wait on the owner. */
 export type ListedProject = ProjectRow & { needs_you: number };
-export type { Attention, Blocked } from "../../do/project";
+export type { Attention, Blocked, TaskPr, TaskRef } from "../../do/project";
+/** One of the repo's open PRs, for attaching: the task it's attached to, if any. */
+export interface OpenPr {
+  number: number;
+  title: string;
+  head: string;
+  fork: boolean;
+  task: string | null;
+}
 /** `POST /api/projects`. */
 export type CreatedProject = ProjectRow & { settings: Settings | null; catalog_synced: boolean };
 /** `GET /api/projects/<id>/tasks/<task>`. */

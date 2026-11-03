@@ -39,6 +39,9 @@ export const PERMISSIONS = {
   // the merge it arms is Contents: write (`PUT …/pulls/{n}/merge`) and it changes the PR (Pull
   // requests: write). GitHub's GraphQL reference names no permission for the mutations (unverified).
   autoMerge: { pull_requests: "write", contents: "write" },
+  // Reading PRs to attach them (`GET /repos/{o}/{r}/pulls`, `…/pulls/{n}`): Pull requests: read, on
+  // the same permissions page (which also lists `…/pulls/{n}` under Contents: read, as one of a set).
+  pullsRead: { pull_requests: "read" },
 } as const satisfies Record<string, Record<string, "read" | "write">>;
 
 // --- the webhook's signature ---------------------------------------------------------------------------
@@ -149,6 +152,17 @@ export class GitHub {
     });
   }
 
+  /** One PR, as attaching needs it (https://docs.github.com/en/rest/pulls/pulls#get-a-pull-request). */
+  async pull(repo: string, n: number): Promise<Pull> {
+    return pullOf((await this.call<Record<string, unknown>>("GET", `/repos/${repo}/pulls/${n}`))!, repo);
+  }
+
+  /** The repo's open PRs, newest first, up to 100 (https://docs.github.com/en/rest/pulls/pulls#list-pull-requests). */
+  async openPulls(repo: string): Promise<Pull[]> {
+    const list = (await this.call<Record<string, unknown>[]>("GET", `/repos/${repo}/pulls?state=open&per_page=100`)) ?? [];
+    return list.map((p) => pullOf(p, repo));
+  }
+
   /** Set the repo's "Allow auto-merge"; answers the value GitHub reports after, when it does. */
   async setAllowAutoMerge(repo: string, allow: boolean): Promise<boolean | null> {
     const r = await this.call<{ allow_auto_merge?: unknown }>("PATCH", `/repos/${repo}`, { allow_auto_merge: allow });
@@ -217,6 +231,27 @@ export class GitHub {
   async putProtection(repo: string, branch: string, body: unknown): Promise<void> {
     await this.call("PUT", `/repos/${repo}/branches/${encodeURIComponent(branch)}/protection`, body);
   }
+}
+
+/** A PR as the app reads it. A head repo GitHub no longer names (a deleted fork) counts as a fork. */
+export interface Pull {
+  number: number;
+  state: "open" | "closed";
+  merged: boolean;
+  title: string;
+  node_id: string | null;
+  head_ref: string;
+  fork: boolean;
+}
+
+function pullOf(p: Record<string, unknown>, repo: string): Pull {
+  const head = (p.head ?? {}) as { ref?: unknown; repo?: { full_name?: unknown } | null };
+  const headRepo = typeof head.repo?.full_name === "string" ? head.repo.full_name.toLowerCase() : null;
+  return {
+    number: Number(p.number), state: p.state === "open" ? "open" : "closed", merged: p.merged === true || typeof p.merged_at === "string",
+    title: typeof p.title === "string" ? p.title.slice(0, 300) : "", node_id: typeof p.node_id === "string" ? p.node_id : null,
+    head_ref: typeof head.ref === "string" ? head.ref : "", fork: headRepo !== repo.toLowerCase(),
+  };
 }
 
 /** A client with a token for `repo` with exactly `permissions`, knowing the App it's from when nest says. */

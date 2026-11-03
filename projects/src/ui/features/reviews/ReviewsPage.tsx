@@ -19,7 +19,8 @@ const DIMENSIONS = [
   ["architecture", "Architecture"],
 ] as const satisfies readonly (readonly [Dimension, string])[];
 
-function JobState({ job }: { job: Job }) {
+/** A review job's state, or "Changes needed" for a verdict that failed a dimension (also on a task's PRs). */
+export function JobState({ job }: { job: Job }) {
   const failedVerdict = job.state === "done" && job.verdict && DIMENSIONS.some(([d]) => job.verdict![d].verdict !== "pass");
   const s = failedVerdict ? { label: "Changes needed", color: "danger" as const } : REVIEW_STATE[job.state];
   return (
