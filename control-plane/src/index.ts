@@ -18,9 +18,12 @@ import type { ClientScope } from "./do/catalog";
 import { CLIENT_DIRECTORY, CLIENT_OPERATOR } from "./do/client";
 import { idempotencyKey, type KeyClaim, requestDigest } from "./lib/idempotency";
 import {
-  CLIENT_SECRET_PREFIX, ClientInjections, ClientSecretName, ClientSecretPut, holdInjections, injectionsOutsideGrant, SECRET_MAX_BYTES_DEFAULT,
+  CLIENT_BINDING_PREFIX, CLIENT_SECRET_PREFIX, ClientInjections, ClientSecretName, ClientSecretPut, holdInjections, injectionsOutsideGrant, SECRET_MAX_BYTES_DEFAULT,
 } from "./lib/client-secrets";
 import { GithubPush } from "./lib/rules/github";
+import { ClientEgress, egressOutsideGrant } from "./lib/client-egress";
+import { SandboxEnv, unboundPlaceholders } from "./lib/sandbox-env";
+import { TimerName } from "./lib/timers";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { JWKS_MAX_AGE_S } from "./lib/identity";
 import { Port, SandboxPolicyLayer } from "./do/sandbox";
@@ -312,6 +315,46 @@ async function oauthCapability(env: Env, raw: string) {
 
 const escapeHtml = (t: string) => t.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
+/** `PUT /v1/sandboxes/<id>/client-policy`'s body: the whole client layer (an absent part is emptied). */
+const ClientLayer = z.strictObject({ egress: ClientEgress.optional(), inject: ClientInjections.optional(), env: SandboxEnv.optional() });
+
+/**
+ * An environment's values: no placeholder that none of `bound` is, and no value of a secret the caller
+ * may see (`refuseSecretValues`): env carries literals and placeholders only.
+ */
+async function checkEnv(env: Env, caller: Caller, vars: Readonly<Record<string, string>>, bound: readonly string[]): Promise<void> {
+  const unbound = unboundPlaceholders(vars, bound);
+  if (unbound.length) throw new NestError(ErrorCodes.INVALID_MESSAGE, unbound.join("; "));
+  await refuseSecretValues(env, caller, vars);
+}
+
+/**
+ * No env value holds a stored secret's value (a template's, a spawn's: their placeholders are checked at
+ * expansion). A best-effort check against accidents, never a guarantee: a client's values are compared
+ * with its own secrets only (anything wider would answer whether another tenant's or the operator's
+ * secret has a guessed value), the operator's with every stored secret.
+ */
+async function refuseSecretValues(env: Env, caller: Caller, vars: Readonly<Record<string, string>> | undefined): Promise<void> {
+  const values = Object.values(vars ?? {});
+  const client = caller.kind === "client" ? caller.client : null;
+  if (values.length && (await newMethod("BrokerDO.scanSecretValues", () => broker(env).scanSecretValues(values, client))).length) {
+    throw new NestError(ErrorCodes.INVALID_MESSAGE, "an env value holds a stored secret's value: store it as a secret, bind it, and put the binding's placeholder in env");
+  }
+}
+
+/** Tell every live sandbox of a client that its grant changed; how many didn't answer. */
+async function fanOutGrant(env: Env, client: string): Promise<number> {
+  let failed = 0;
+  let cursor: string | undefined;
+  do {
+    const page = await clientDO(env, client).list("sandbox", { state: "live", limit: 500, ...(cursor ? { cursor } : {}) });
+    const results = await Promise.allSettled(page.items.map((m) => newMethod("SandboxDO.clientGrantChanged", () => sandbox(env, m.id).clientGrantChanged())));
+    failed += results.filter((x) => x.status === "rejected").length;
+    cursor = page.next_cursor ?? undefined;
+  } while (cursor);
+  return failed;
+}
+
 /** A client secret's name from a path (400 for one outside `ClientSecretName`). */
 function clientSecretName(raw: string): string {
   const n = ClientSecretName.safeParse(raw);
@@ -521,7 +564,10 @@ export const ROUTES: Route[] = [
   // Templates and capabilities (docs/agents/capabilities/): data the operator edits.
   route({ method: "GET", path: "/v1/admin/catalog", auth: "admin", run: ({ env }) => catalog(env).catalog() }),
   route({ method: "PUT", path: "/v1/admin/capabilities/:name", auth: "admin", body: Capability, run: ({ env, p, body }) => catalog(env).putCapability(catalogName(p.name), body) }),
-  route({ method: "PUT", path: "/v1/admin/templates/:name", auth: "admin", body: Template, run: ({ env, p, body }) => catalog(env).putTemplate(catalogName(p.name), body) }),
+  route({ method: "PUT", path: "/v1/admin/templates/:name", auth: "admin", body: Template, run: async ({ env, p, body }) => {
+    await refuseSecretValues(env, { kind: "operator" }, body.env);
+    return catalog(env).putTemplate(catalogName(p.name), body);
+  } }),
   route({ method: "DELETE", path: "/v1/admin/capabilities/:name", auth: "admin", run: ({ env, p }) => catalog(env).deleteCapability(catalogName(p.name)) }),
 
   // OAuth for an mcp capability (docs/agents/capabilities/mcp/#oauth): the operator starts it here and
@@ -571,6 +617,10 @@ export const ROUTES: Route[] = [
       inject: ClientInjections.optional(),
       // `workflows: write` on its push token (docs/control-plane/api/clients/#workflow-files).
       github_push: GithubPush.optional(),
+      // Allow rules within a client's grant's `egress_hosts` (docs/control-plane/api/clients/#egress).
+      egress: ClientEgress.optional(),
+      // Its processes' environment: literals, or placeholders of `inject` (docs/control-plane/api/clients/#environment).
+      env: SandboxEnv.optional(),
     }),
     run: (c) => createOnce(c, "sandbox", async (id, begin) => {
       const { env, body: r, caller } = c;
@@ -584,10 +634,12 @@ export const ROUTES: Route[] = [
       const inject = caller.kind === "client" ? holdInjections(caller.client, r.inject ?? []) : [];
       if (caller.kind === "client") {
         const outside = [...injectionsOutsideGrant(inject, caller.grant.inject_hosts ?? []),
-          ...(r.github_push?.workflows && !caller.grant.github_push?.workflows ? ["github_push.workflows"] : [])];
+          ...(r.github_push?.workflows && !caller.grant.github_push?.workflows ? ["github_push.workflows"] : []),
+          ...egressOutsideGrant(r.egress?.allow ?? [], caller.grant.egress_hosts ?? [])];
         const refusal = grantRefusal(caller.client, outside);
         if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, refusal, 403);
       }
+      await checkEnv(env, caller, r.env ?? {}, inject.map((b) => b.placeholder));
       // A client's place first (its grant's cells and max_sandboxes, counted across its subtree).
       if (client) await clientDO(env, client).admit({ kind: "sandbox", id, cell, owner: client, labels });
       begin();
@@ -596,12 +648,40 @@ export const ROUTES: Route[] = [
         ...(r.image ? { image: r.image } : {}), ...(r.resources ? { resources: r.resources } : {}),
         ...(r.policy ? { policy: r.policy } : {}), ...(r.idle_ttl_ms !== undefined ? { idle_ttl_ms: r.idle_ttl_ms } : {}),
         ...(inject.length ? { inject } : {}), ...(r.github_push?.workflows ? { github_push: { workflows: true as const } } : {}),
+        ...(r.egress?.allow.length ? { egress: r.egress.allow } : {}), ...(r.env && Object.keys(r.env).length ? { env: r.env } : {}),
       }));
       // 202: accepted and waiting for a host (SandboxDO retries; an autoscaled cell launches one).
       return json(info, info.host ? 201 : 202);
     }, async (id, status) => json(await sandbox(c.env, id).info(), status, REPLAYED)),
   }),
   route({ method: "GET", path: "/v1/sandboxes", auth: "owner", run: (c) => listing(c, "sandbox") }),
+  // Its client layer (docs/control-plane/api/clients/#the-client-layer): egress rules, injection bindings and
+  // environment, replaced whole on a live sandbox within its client's grant, through the usual policy push.
+  route({ method: "GET", path: "/v1/sandboxes/:sandbox/client-policy", auth: "owner", run: async (c) =>
+    newMethod("SandboxDO.clientLayer", async () => (await ownSandbox(c, c.p.sandbox)).clientLayer()) }),
+  route({
+    method: "PUT", path: "/v1/sandboxes/:sandbox/client-policy", auth: "owner", body: ClientLayer,
+    run: async (c) => {
+      const stub = await ownSandbox(c, c.p.sandbox);
+      const { client } = await stub.subtree();
+      const r = c.body;
+      if (r.inject?.length && !client) throw new NestError(ErrorCodes.INVALID_MESSAGE, "inject names an API client's secrets: this sandbox is the operator's (its bindings go in policy.inject)");
+      const inject = client ? holdInjections(client, r.inject ?? []) : [];
+      if (client) {
+        // Its client's grant as it is now, whoever writes the layer (the operator too).
+        const scope = await clientDO(c.env, client).scope();
+        const refusal = grantRefusal(client, [...injectionsOutsideGrant(inject, scope.grant.inject_hosts ?? []),
+          ...egressOutsideGrant(r.egress?.allow ?? [], scope.grant.egress_hosts ?? [])]);
+        if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, refusal, 403);
+      }
+      // A placeholder of this layer's own bindings, or of a binding that isn't a client's (the operator's):
+      // never one of the layer this replaces, nor one only an attached agent's spec brings.
+      const bound = [...inject.map((b) => b.placeholder),
+        ...(await stub.policy()).inject.filter((b) => !b.name.startsWith(CLIENT_BINDING_PREFIX)).map((b) => b.placeholder)];
+      await checkEnv(c.env, c.caller, r.env ?? {}, bound);
+      return newMethod("SandboxDO.setClientLayer", () => stub.setClientLayer({ egress: r.egress?.allow ?? [], inject, env: r.env ?? {} }));
+    },
+  }),
   route({
     // Operator path: the only place public share links are minted.
     method: "POST", path: "/v1/sandboxes/:sandbox/ports", auth: "admin",
@@ -657,6 +737,9 @@ export const ROUTES: Route[] = [
     run: (c) => createOnce(c, "agent", async (id, begin) => {
       const { env, body: r, caller } = c;
       if (r.template && r.role && r.template !== r.role) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template and role differ");
+      // An override's env carries literals and placeholders only (its placeholders are checked at expansion).
+      const overEnv = (r.overrides as { env?: unknown } | undefined)?.env;
+      if (overEnv && typeof overEnv === "object") await refuseSecretValues(env, caller, overEnv as Record<string, string>);
       const template = r.template ?? r.role;
       if (!template) throw new NestError(ErrorCodes.INVALID_MESSAGE, "template is required");
       if (r.owner && r.captain && r.owner !== r.captain) throw new NestError(ErrorCodes.INVALID_MESSAGE, "owner and captain differ");
@@ -794,6 +877,14 @@ export const ROUTES: Route[] = [
       return a.end({ by, reason: "stopped", kill: true, destroy_sandbox: r.destroy_sandbox ?? false, ...(r.reason ? { note: r.reason } : {}) });
     },
   }),
+  // Its timers (docs/agents/capabilities/timers/): the owner sees and cancels them; only the agent sets them.
+  route({ method: "GET", path: "/v1/agents/:agent/timers", auth: "owner", run: async (c) => ({ timers: await newMethod("AgentDO.timers", async () => (await ownAgent(c, c.p.agent)).timers()) }) }),
+  route({ method: "DELETE", path: "/v1/agents/:agent/timers/:name", auth: "owner", run: async (c) => {
+    const n = TimerName.safeParse(c.p.name);
+    if (!n.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, n.error.issues[0]!.message);
+    const by = c.caller.kind === "client" ? c.caller.client : "user";
+    await newMethod("AgentDO.cancelTimerFor", async () => (await ownAgent(c, c.p.agent)).cancelTimerFor(n.data, by));
+  } }),
   route({ method: "GET", path: "/v1/agents/:agent/children", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).children() }),
   route({ method: "PUT", path: "/v1/agents/:agent/rules", auth: "admin", body: z.array(ToolRule), run: ({ env, p, body }) => agent(env, p.agent).setRules(body) }),
   // The agent's brokered-action journal, newest first; `before` pages by an earlier page's last created_ms.
@@ -839,9 +930,13 @@ export const ROUTES: Route[] = [
   route({ method: "GET", path: "/v1/admin/clients/:client", auth: "admin", run: ({ env, p }) => clientDO(env, p.client).info() }),
   route({
     method: "PATCH", path: "/v1/admin/clients/:client", auth: "admin", body: z.strictObject({ grant: Grant }),
-    run: ({ env, p, body: r }) => {
+    run: async ({ env, p, body: r }) => {
       for (const cell of r.grant.cells) checkCell(env, cell);
-      return clientDO(env, p.client).setGrant(r.grant);
+      const view = await clientDO(env, p.client).setGrant(r.grant);
+      // Its live sandboxes apply the new `egress_hosts` at once (a narrowed one takes rules away).
+      const failed = await fanOutGrant(env, p.client);
+      if (failed) throw new NestError(ErrorCodes.INTERNAL, `the grant is saved, but ${failed} of its sandboxes didn't take it yet: PATCH again`, 503, true);
+      return view;
     },
   }),
   route({ method: "POST", path: "/v1/admin/clients/:client/rotate", auth: "admin", run: async ({ env, p }) => {
@@ -920,6 +1015,7 @@ export const ROUTES: Route[] = [
       run: async (c) => {
         const scope = await namespaceScope(c, c.p.ns);
         const name = `${c.p.ns}/${c.p.entry}`;
+        if (kind === "templates") await refuseSecretValues(c.env, c.caller, (c.body as Template).env);
         return kind === "templates" ? catalog(c.env).putTemplate(name, c.body as Template, scope) : catalog(c.env).putCapability(name, c.body as Capability, scope);
       },
     }),

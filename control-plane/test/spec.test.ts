@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import {
   type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
-  SEED_CATALOG_V1, SEED_STEPS, SEED_VERSION, seedMigration, SpawnerOverrides, specFromRole, type Template, templatesUsing, CHANNEL_CAPABILITIES_REMOVED,
+  SEED_CATALOG_V1, SEED_STEPS, SEED_VERSION, seedMigration, TIMER_CAPABILITIES, SpawnerOverrides, specFromRole, type Template, templatesUsing, CHANNEL_CAPABILITIES_REMOVED,
   CHANNEL_TOOLS_REMOVED, EGRESS_CAPABILITIES, MESSAGING_CAPABILITIES_REMOVED, MESSAGING_TOOLS_REMOVED, pruneCapability, pruneTemplate, REMOVED_CAPABILITIES, rewritePrompt, SPAWNING_CAPABILITIES, SPAWNING_PROMPT_V5,
 } from "../src/lib/spec";
 import { Credential, type ToolRule } from "../src/protocol/control";
@@ -190,7 +190,7 @@ describe("the current seed: spawning added, the task ledger, the channels and th
 
   it("seed steps: versions strictly increase, the last is the seed version, and every step's entries are the current seed's", () => {
     const versions = SEED_STEPS.map((s) => s.version);
-    expect(versions).toEqual([2, 3, 4, 5, 6, 7, 8]);
+    expect(versions).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
     for (let i = 1; i < versions.length; i++) expect(versions[i]!, String(i)).toBeGreaterThan(versions[i - 1]!);
     expect(SEED_VERSION).toBe(versions.at(-1));
     // No two steps name the same entry (one would never be applied to a catalog the other already reached).
@@ -210,19 +210,21 @@ describe("the current seed: spawning added, the task ledger, the channels and th
     const removes = { ...channels, capabilities: ["tasks", "tasks-admin", ...channels.capabilities], params: ["ledger"] };
     const prompts = [{ capability: "spawning", was: SPAWNING_PROMPT_V5, now: SPAWNING_CAPABILITIES.spawning!.prompt }];
     const m = seedMigration(v2, 2);
-    expect(m).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES }, templates: {}, version: 8, removes, prompts });
+    expect(m).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES, ...TIMER_CAPABILITIES }, templates: {}, version: 9, removes, prompts });
     const v3 = [...v2.capabilities, "tasks", "tasks-admin"];
-    expect(seedMigration({ ...v2, capabilities: v3 }, 3)).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES }, templates: {}, version: 8, removes, prompts });
-    expect(seedMigration({ ...v2, capabilities: [...v3, "egress"] }, 4)).toEqual({ capabilities: SPAWNING_CAPABILITIES, templates: {}, version: 8, removes, prompts });
-    expect(seedMigration({ ...v2, capabilities: [...v3, "egress", "spawning"] }, 5)).toEqual({ capabilities: {}, templates: {}, version: 8, removes, prompts });
+    expect(seedMigration({ ...v2, capabilities: v3 }, 3)).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES, ...TIMER_CAPABILITIES }, templates: {}, version: 9, removes, prompts });
+    expect(seedMigration({ ...v2, capabilities: [...v3, "egress"] }, 4)).toEqual({ capabilities: { ...SPAWNING_CAPABILITIES, ...TIMER_CAPABILITIES }, templates: {}, version: 9, removes, prompts });
+    expect(seedMigration({ ...v2, capabilities: [...v3, "egress", "spawning"] }, 5)).toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 9, removes, prompts });
     expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "egress", "spawning"] }, 6))
-      .toEqual({ capabilities: {}, templates: {}, version: 8, removes: channels, prompts });
-    // The live catalog before this release: only the messaging capabilities and tools.
+      .toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 9, removes: channels, prompts });
     expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "egress", "spawning"] }, 7))
-      .toEqual({ capabilities: {}, templates: {}, version: 8, removes: messaging, prompts: [] });
+      .toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 9, removes: messaging, prompts: [] });
+    // The live catalog before this release: only `timers`, added.
+    expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "egress", "spawning"] }, 8))
+      .toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 9, removes: { capabilities: [], params: [], tools: [], fields: [] }, prompts: [] });
     // Version 2's step adds nothing now (its channels would only be removed again), and doesn't run twice.
-    expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 1).capabilities).sort()).toEqual(["egress", "spawning"]);
-    expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 2).capabilities).sort()).toEqual(["egress", "spawning"]);
+    expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 1).capabilities).sort()).toEqual(["egress", "spawning", "timers"]);
+    expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 2).capabilities).sort()).toEqual(["egress", "spawning", "timers"]);
     // Once it reached a version it adds and removes nothing, whatever is missing: deleted entries stay deleted.
     expect(seedMigration({ capabilities: [], templates: [] }, SEED_VERSION))
       .toEqual({ capabilities: {}, templates: {}, version: SEED_VERSION, removes: { capabilities: [], params: [], tools: [], fields: [] }, prompts: [] });
@@ -391,11 +393,11 @@ describe("seed migration (pure)", () => {
   it("a version-1 catalog gains each later step's entries whose names are free; a current one gains nothing", () => {
     const all = { capabilities: Object.keys(SEED_CATALOG_V1.capabilities), templates: Object.keys(SEED_CATALOG_V1.templates) };
     const m = seedMigration(all, 1);
-    expect(Object.keys(m.capabilities).sort()).toEqual([...Object.keys(EGRESS_CAPABILITIES), ...Object.keys(SPAWNING_CAPABILITIES)].sort());
+    expect(Object.keys(m.capabilities).sort()).toEqual([...Object.keys(EGRESS_CAPABILITIES), ...Object.keys(SPAWNING_CAPABILITIES), ...Object.keys(TIMER_CAPABILITIES)].sort());
     expect(m.templates).toEqual({});
     expect(m.version).toBe(SEED_VERSION);
     // A name the operator already uses is left alone (never overwritten).
-    expect(Object.keys(seedMigration({ ...all, capabilities: [...all.capabilities, "egress"] }, 1).capabilities)).toEqual(["spawning"]);
+    expect(Object.keys(seedMigration({ ...all, capabilities: [...all.capabilities, "egress"] }, 1).capabilities)).toEqual(["spawning", "timers"]);
     // Nothing for a catalog at the current version, so a deleted entry never comes back.
     expect(seedMigration({ capabilities: [], templates: [] }, SEED_VERSION).capabilities).toEqual({});
     // The version never goes back.

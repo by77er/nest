@@ -6,9 +6,6 @@ import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
 import { num, type Env } from "../env";
 import { commandRefSlots, REF_PURPOSES, type RefPurpose } from "./broker";
-
-/** A `secrets_update` entry whose reference resolved to nothing: removed before the batch goes out. */
-const DROPPED_SECRET = "\u0000nest:dropped";
 import { canonicalSpki, certificateSpki, createRootCertificate, generateDevRoot, kmsRoot, localRoot, signIntermediate, type RootCa } from "../lib/ca";
 import { AwsKms, type Kms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, type Ec2 } from "../lib/ec2";
@@ -47,6 +44,9 @@ import {
 import { AGENTS_CURSOR, agentCursorOf, type AgentRead, classifyAgent, classifySandbox, cursorOf, DEFAULT_QUIET_MS, mapBounded, parseCursor } from "../lib/abandoned";
 import { cellIdleTtlMs } from "../lib/lifetimes";
 import { labelWhere, type Labels } from "../lib/clients";
+
+/** A `secrets_update` entry whose reference resolved to nothing: removed before the batch goes out. */
+const DROPPED_SECRET = "\u0000nest:dropped";
 
 /** What an agent or sandbox registers beside its id: its API client and labels (fixed at creation). */
 export interface RegistryMeta {

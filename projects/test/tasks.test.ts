@@ -1,7 +1,7 @@
 // The task state machine (src/tasks.ts) against README.md#flows, which is the oracle: each row below is
 // a sentence of that flow, and every (state, event) pair not listed must be refused.
 import { describe, expect, it } from "vitest";
-import { canBlock, canUnblock, pickForAssignment, TASK_EVENTS, TASK_STATES, type TaskEvent, type TaskState, transition } from "../src/tasks";
+import { canBlock, canUnblock, dependencyError, pickForAssignment, prsDone, TASK_EVENTS, TASK_STATES, type TaskEvent, type TaskState, transition, waitingOn } from "../src/tasks";
 
 /** README.md#flows, as (from, event) → to. */
 const FLOW: [TaskState, TaskEvent, TaskState][] = [
@@ -20,6 +20,8 @@ const FLOW: [TaskState, TaskEvent, TaskState][] = [
   ["assigned", "worker_exited", "stalled"], // a worker that exits before opening a PR
   ["in_progress", "worker_exited", "stalled"],
   ["in_review", "merged", "done"], // 6. the PR is merged
+  // The last of a task's attached PRs merged: a PR may be attached to a task with no worker (README.md#prs).
+  ...(["draft", "ready", "assigned", "in_progress", "stalled"] as const).map((s): [TaskState, TaskEvent, TaskState] => [s, "merged", "done"]),
   // The owner marks it done: only a task with no PR and no live worker.
   ...(["draft", "ready", "stalled"] as const).map((s): [TaskState, TaskEvent, TaskState] => [s, "done", "done"]),
   // Cancelling: anything not over.
@@ -91,5 +93,49 @@ describe("blocking", () => {
       { id: "c", state: "ready" as const, ord: 3 },
     ];
     expect(pickForAssignment(tasks, 0, 1)).toEqual(["b"]);
+  });
+});
+
+// README.md#dependencies: a dependency is within the project, never on itself, and never closes a cycle
+// (refused with the cycle's path); only a done blocker releases the task waiting on it.
+describe("dependencies", () => {
+  const states = (o: Record<string, TaskState>) => new Map(Object.entries(o));
+  const all = states({ a: "ready", b: "ready", c: "ready", d: "ready", over: "done" });
+
+  it("refuses a self-reference, an unknown (another project's) task, and a task that's over", () => {
+    expect(dependencyError("a", "a", [], all)).toBe("a task can't wait on itself");
+    expect(dependencyError("a", "tsk_elsewhere", [], all)).toMatch(/unknown task tsk_elsewhere: a dependency is within the project/);
+    expect(dependencyError("over", "a", [], all)).toBe("a done task waits on nothing");
+    expect(dependencyError("a", "over", [], all)).toBeNull();
+  });
+
+  it("refuses a cycle with its path, however long, and allows a diamond", () => {
+    // a waits on b, b on c: c waiting on a closes a → b → c → a.
+    const chain = [["a", "b"], ["b", "c"]] as const;
+    expect(dependencyError("c", "a", chain, all)).toBe("it would make a cycle: c → a → b → c");
+    expect(dependencyError("b", "a", [["a", "b"]], all)).toBe("it would make a cycle: b → a → b");
+    // a on b and c, both on d: no cycle.
+    expect(dependencyError("c", "d", [["a", "b"], ["a", "c"], ["b", "d"]], all)).toBeNull();
+    expect(dependencyError("a", "b", [["a", "b"]], all)).toBe("a already waits on b");
+  });
+
+  it("waits until every blocker is done; a cancelled one still holds it", () => {
+    expect(waitingOn([{ id: "x", state: "done" }, { id: "y", state: "in_review" }, { id: "z", state: "cancelled" }])).toEqual(["y", "z"]);
+    expect(waitingOn([{ id: "x", state: "done" }])).toEqual([]);
+  });
+
+  it("auto-assign skips a waiting task", () => {
+    expect(pickForAssignment([{ id: "a", state: "ready", ord: 1, waiting: true }, { id: "b", state: "ready", ord: 2 }], 0, 1)).toEqual(["b"]);
+  });
+});
+
+// README.md#prs: done once at least one PR is attached and every attached one has merged.
+describe("a task's PRs", () => {
+  it("are done only when all attached ones merged, a detached one not counting", () => {
+    expect(prsDone([])).toBe(false);
+    expect(prsDone([{ state: "merged" }, { state: "open" }])).toBe(false);
+    expect(prsDone([{ state: "merged" }, { state: "merged" }])).toBe(true);
+    expect(prsDone([{ state: "merged" }, { state: "detached" }])).toBe(true);
+    expect(prsDone([{ state: "detached" }])).toBe(false);
   });
 });

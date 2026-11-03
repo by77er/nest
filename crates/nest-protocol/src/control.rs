@@ -366,6 +366,11 @@ pub enum CommandBody {
         agent: AgentId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
+        /// Environment for every process the slot runs (the guest's `AgentSlot.env`): the sandbox's and
+        /// the agent's `env`, checked by the control plane (names, no secret values). nestd of the
+        /// previous release ignores the field, so its slots get none.
+        #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        env: std::collections::BTreeMap<String, String>,
     },
     /// Remove the slot (an unknown agent is `ok`); with `kill_processes`, kill the agent's whole
     /// cgroup first. The gateway then refuses the agent's bindings (`unauthorized`).

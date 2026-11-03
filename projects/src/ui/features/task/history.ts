@@ -74,6 +74,21 @@ export function summarize(h: HistoryRow): string {
       return str(o.reason) ? `Blocked: ${clip(str(o.reason)!)}` : "Blocked";
     case "unblocked":
       return str(o.note) ? `Unblocked: ${clip(str(o.note)!)}` : o.why ? "Unblocked (the task ended)" : "Unblocked";
+    case "pr_attached":
+      return typeof o.pr === "number" ? `PR #${o.pr} attached` : "PR attached";
+    case "pr_detached":
+      return typeof o.pr === "number" ? `PR #${o.pr} detached` : "PR detached";
+    case "pr_merged":
+      return typeof o.pr === "number" ? `PR #${o.pr} merged` : "PR merged";
+    case "pr_closed":
+      return typeof o.pr === "number" ? `PR #${o.pr} closed without merging${o.detached ? ", detached" : ""}` : "PR closed";
+    // The task's title when recorded (older entries have only its id).
+    case "dependency_added":
+      return str(o.title) ? `Waits on "${clip(str(o.title)!)}"` : str(o.blocked_by) ? `Waits on ${str(o.blocked_by)}` : "Dependency added";
+    case "dependency_removed":
+      return str(o.title) ? `No longer waits on "${clip(str(o.title)!)}"` : str(o.blocked_by) ? `No longer waits on ${str(o.blocked_by)}` : "Dependency removed";
+    case "dependency_done":
+      return str(o.title) ? `"${clip(str(o.title)!)}", which it waits on, is done` : str(o.blocker) ? `${str(o.blocker)}, which it waits on, is done` : "A dependency is done";
     case "worker_notified":
       return Array.isArray(o.fields) && o.fields.length ? `Its worker was told of the change (${o.fields.join(", ")})` : "Its worker was told of the change";
     case "worker_not_notified":

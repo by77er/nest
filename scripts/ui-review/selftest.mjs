@@ -29,9 +29,12 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
   [data-measure] { max-width: 400px; ${bad.measure ? "margin: 0 auto;" : ""} }
   [data-ds=panel] { border: 1px solid #e9ecef; padding: 16px; background: #fff; }
   .cut { width: 80px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .faint { color: ${bad.contrast ? "#c8c8c8" : "#666e76"}; }
   [data-ds=rich] h4 { font-size: ${bad.small ? "11px" : "inherit"}; font-weight: 600; }
   [data-ds=figure-canvas] { width: 120px; height: 40px; border: 1px solid #dee2e6; background: ${bad.figure ? "#1a1b1e" : "#ffffff"}; }
-  .faint { color: ${bad.contrast ? "#c8c8c8" : "#666e76"}; }
+  .chip { position: relative; font: inherit; border: 1px solid #ced4da; background: #fff; color: #212529; padding: 2px 8px; }
+  .chip.reach { z-index: 1; }
+  .chip.reach::before { content: ""; position: absolute; top: 0; bottom: 0; left: 0; right: -60px; }
 </style></head><body>
   <nav><div id="brand">nest</div>
     <a data-ds="nav-row" href="#" aria-current="page"><span>*</span><span>Board</span></a>
@@ -43,6 +46,7 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
       <p><span style="color: transparent">⎿</span> a character kept for copy, drawn as something else: not read, so not checked</p>
       ${bad.clip ? '<p class="cut">A title far too long for its box</p>' : '<p class="cut">Short</p>'}
       ${bad.escape ? '<div style="width: 2000px">Wider than its panel</div>' : ""}
+      <p><button class="chip ${bad.tap ? "reach" : ""}">Waiting</button> <button class="chip">Detach</button></p>
       <div data-ds="rich">${bad.heading ? "<h2>Plan</h2>" : "<h4>Plan</h4>"}<p>The message's text.</p><div data-ds="figure-canvas"></div></div>
     </div>
   </div></div>
@@ -50,14 +54,21 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
 
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
-const run = async (bad) => {
+const run = async (bad, touch = false) => {
   await page.setContent(html(bad));
-  return (await page.evaluate(measure, sel)).problems;
+  return (await page.evaluate(measure, { ...sel, touch })).problems;
 };
 const failing = (problems) => Object.keys(problems).filter((k) => problems[k].length).sort();
 
 const clean = await run({});
 assert.deepEqual(failing(clean), [], `the clean page fails: ${JSON.stringify(clean)}`);
+// On touch: two neighbouring controls pass; one whose ::before reaches over the other takes its taps.
+assert.deepEqual(failing(await run({}, true)), [], "the clean page fails on touch");
+const reach = await run({ tap: true }, true);
+assert.deepEqual(failing(reach), ["hit-overlap"], `a hit area over a neighbour: ${JSON.stringify(reach)}`);
+assert.match(reach["hit-overlap"][0], /a tap on <button> "Detach" at \d+,\d+ lands on <button> "Waiting"/);
+// Without touch, hit areas aren't checked.
+assert.deepEqual(failing(await run({ tap: true })), []);
 for (const [bad, checks] of [
   [{ contrast: true }, ["contrast"]],
   [{ clip: true }, ["clipping"]],

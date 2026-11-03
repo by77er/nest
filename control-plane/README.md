@@ -48,7 +48,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `POST /v1/sandboxes {cell, policy?, idle_ttl_ms?}` (a `workstream` is accepted and ignored for one release): placed on a connected sandbox host (201), or accepted unplaced (202) and retried every 30 s while an autoscaled cell launches one. `policy` is the
      operator's layer: `{allow: [{host, ports?}], passthrough: [host], inject: [InjectionBinding], tcp: [{host, port}]}`. `idle_ttl_ms`: destroyed once dormant this long
      (no agent attached, no VM up; default the cell's, 1 day); `PUT /v1/sandboxes/<id>/lifetime {idle_ttl_ms | null}` changes it ([lifetime](../docs/control-plane/durable-objects/sandbox/#lifetime))
-   - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy)
+   - `PUT /v1/sandboxes/<id>/policy` (same layer) · `GET /v1/sandboxes/<id>/policy` (effective policy; each allow rule has `source`: `base`, `operator`, `repos`, `client`, `grant`)
    - `POST /v1/sandboxes/<id>/place`: place an unplaced sandbox, or re-place a `failed` one under a new epoch
      (409 if it's placed)
    - `POST /v1/sandboxes/<id>/ports {port, share?, host_header?}` · `DELETE /v1/sandboxes/<id>/ports/<port>`:
@@ -128,7 +128,9 @@ client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a G
 `GET /v1/clients/self/secrets` (names and metadata, never a value; the operator's `GET /v1/admin/clients/<cli>/secrets`),
 within `secrets {max_count, max_bytes}`; bindings naming them (`inject` in its templates, overrides and `POST /v1/sandboxes`,
 hosts within `inject_hosts`) are injected by nest-proxy; `github_push: {workflows: true}` (within `github_push`) adds
-`workflows: write` to a sandbox's push token.
+`workflows: write` to a sandbox's push token. Egress rules within `egress_hosts` (`egress {allow: [{host, ports?}]}` in its templates, overrides and
+`POST /v1/sandboxes`), env (`env {NAME: value}`), and the live sandbox's client layer, `GET|PUT /v1/sandboxes/<id>/client-policy {egress?, inject?, env?}`
+(`src/lib/client-egress.ts`, `src/lib/sandbox-env.ts`). An agent's timers (`src/lib/timers.ts`): `GET /v1/agents/<id>/timers`, `DELETE /v1/agents/<id>/timers/<name>`.
 Its events (`src/lib/client-events.ts`): `PUT /v1/clients/self/webhook {url}` (https; answers the signing secret once);
 its agents and sandboxes hand them to ClientDO from their alarms, and ClientDO POSTs each, signed (`Nest-Signature`), with
 retries; `GET /v1/clients/self` (the client) and `GET /v1/admin/clients/<cli>` show `events {webhook, backlog, dropped, failures, last_error}`.

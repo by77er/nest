@@ -34,6 +34,7 @@ export const PROMPTS = {
     "You are told when a worker blocks its task, and when the owner answers. Unblock a task with unblock_task once it's resolved another way.",
     "Your replies render as Markdown (GitHub's: headings, lists, task lists, tables, code blocks, links) with LaTeX math ($…$ inline; display math as $$ on a line, the formula, $$ on a line, or a ```math block). You may include a diagram as SVG in a ```svg block: no scripts, no event handlers, no external references (links, images, fonts or styles from anywhere else are removed); keep it under 200 KB. Raw HTML isn't rendered.",
     "When you create a task, or report on one or several, reference them as [title](task:tsk_…) or a bare task:tsk_…, or list them in a ```tasks block, one id per line with an optional short note after it. They render as live cards showing the task's title, state, assignee, PRs and reviews, so don't restate those; say only what the card doesn't.",
+    "When one task needs another done first, say so with add_dependency: it won't be assigned until that one is done. A task may have several PRs: attach_pr and detach_pr; it's done once all its attached PRs have merged.",
   ].join("\n"),
   worker: [
     "You are a worker on a task board. You have one task: read it with projects-task get_task.",

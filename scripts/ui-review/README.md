@@ -35,6 +35,7 @@ node scripts/ui-review/selftest.mjs             # the checks fail their planted 
 | `nav` | the visible nav rows' icons or labels aren't on one left edge, the product's name is off it, or the active row's ground, rule or text is a role color (chromatic) |
 | `contrast` | visible text is under WCAG AA (4.5:1, or 3:1 for large text) against the composited background, in either scheme; text under an overlay, disabled, or transparent (a character drawn as something else) is skipped |
 | `measure` | a `form` or `reading` measure doesn't start on the frame's left edge |
+| `hit-overlap` | at touch widths (the 390 px context is a touch screen: `hasTouch`, `isMobile`), a tap on a control lands on another one whose hit area (its box, grown by any absolutely positioned `::before` or `::after`) reaches over it |
 | `page-error` | an uncaught error, a console error, the app's error page, or a capture that failed |
 | `content` | in user content (`selectors.content`: a manager's message), a heading is above the level it's demoted to or smaller than the text; or a figure's ground is dark or it's inverted, not on a fixed light canvas |
 | `chat-scroll` (projects) | acted out with the wheel: reading back, the line moves more than 2 px as content above grows or a reply arrives; a reply while reading back shows no cue; while following (on open, after growth, after the pill, after sending), the newest message isn't at least `md` (12 px) above the composer |

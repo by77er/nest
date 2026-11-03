@@ -56,6 +56,10 @@ interface ClientRecord {
   token_hash: string;
   created_ms: number;
   rotated_ms?: number;
+  /** Bumped by every `setGrant` (absent: 0): what a copy of the grant elsewhere is compared by. */
+  grant_rev?: number;
+  /** What `grant_rev` counts within (random); given anew to a record without a revision. */
+  grant_epoch?: string;
   /** Deleted: no token works, nothing new is admitted; the operator's delete finishes the cleanup and purges it. */
   deleted_ms?: number;
 }
@@ -295,20 +299,36 @@ export class ClientDO extends DurableObject<Env> {
     if (!r || r.deleted_ms || !timingSafeEqual(enc.encode(tokenHashHex), enc.encode(r.token_hash))) {
       throw new NestError(ErrorCodes.UNAUTHORIZED, "admin or client token required", 401);
     }
-    return { client: r.client, name: r.name, grant: r.grant };
+    return { client: r.client, name: r.name, grant: r.grant, ...this.revisioned(r) };
   }
 
   /** Its name and grant, for a spawn in its subtree (403 once deleted: nothing more is created for it). */
   async scope(): Promise<ClientScope> {
     const r = this.record();
     if (!r || r.deleted_ms) throw new NestError(ErrorCodes.FORBIDDEN, "the client this agent belongs to was deleted", 403);
-    return { client: r.client, name: r.name, grant: r.grant };
+    return { client: r.client, name: r.name, grant: r.grant, ...this.revisioned(r) };
+  }
+
+  /**
+   * The record's grant revision and its epoch. A record without either (from before them, or one that lost
+   * its revision) gets a new epoch at revision 0, saved: a copy elsewhere then treats it as newer than
+   * anything of the old epoch, so a narrowing is never ignored while a lost counter catches up.
+   */
+  private revisioned(r: ClientRecord): { grant_rev: number; grant_epoch: string } {
+    if (r.grant_rev === undefined || r.grant_epoch === undefined) {
+      r.grant_rev = 0;
+      r.grant_epoch = crypto.randomUUID();
+      this.save(r);
+    }
+    return { grant_rev: r.grant_rev, grant_epoch: r.grant_epoch };
   }
 
   /** Replace the grant. What runs keeps running; every later create, spawn and expansion is held to the new one. */
   async setGrant(grant: Grant): Promise<ClientView> {
     const r = this.live();
     r.grant = grant;
+    this.revisioned(r);
+    r.grant_rev = r.grant_rev! + 1;
     this.save(r);
     return this.view(r);
   }

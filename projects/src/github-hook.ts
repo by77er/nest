@@ -72,7 +72,9 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
       // Its node id, for GraphQL's auto-merge on a task's PR.
       const node = str(pr.node_id);
       if (action !== "synchronize") {
-        await project(env, p.id).onPullRequest({ pr: number, task, action: "opened", merged: false, node: node && NODE.test(node) ? node : null });
+        await project(env, p.id).onPullRequest({
+          pr: number, task, action: "opened", merged: false, node: node && NODE.test(node) ? node : null, fork: !fromRepo, title: (str(pr.title) ?? "").slice(0, 300),
+        });
       }
     } else if (action === "closed") {
       await review(env, p.id).onClosed(of, { pr: number, updated_at });

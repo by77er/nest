@@ -1,6 +1,7 @@
 // The primitives' placement rules (the nest-ui-design skill's Placement and Layout primitives): where each
 // slot goes, that action rows wrap and stay right-aligned, destructive actions last behind a divider, and
 // the spinner's 300 ms delay.
+import { readFileSync } from "node:fs";
 import { MantineProvider } from "@mantine/core";
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -233,5 +234,34 @@ describe("the navigation primitives", () => {
     const group = screen.getByRole("group", { name: "Views" });
     expect(style(group)).toContain("var(--mantine-spacing-xs)");
     expect(style(group.parentElement!)).toContain("var(--mantine-spacing-xl)");
+  });
+});
+
+describe("TriggerBadge", () => {
+  it("keeps its own class inside a Tooltip (which clones its className in), and so the theme's focus ring and touch target", async () => {
+    const { Tooltip } = await import("@mantine/core");
+    const { TriggerBadge } = await import("./Actions");
+    const classes = (await import("./Actions.module.css")).default as Record<string, string>;
+    // From disk: vitest doesn't process CSS, so a `?raw` import of a module stylesheet isn't its text.
+    const css = readFileSync(`${process.cwd()}/src/ui/layout/Actions.module.css`, "utf8");
+    const user = userEvent.setup();
+    wrap(
+      <Tooltip label="Its details" events={{ hover: true, focus: true, touch: true }}>
+        <TriggerBadge data-marker="waiting" aria-label="Waiting on 2">
+          Waiting on 2
+        </TriggerBadge>
+      </Tooltip>,
+    );
+    const target = screen.getByLabelText("Waiting on 2");
+    expect(target.className.split(" ")).toContain(classes.trigger);
+    // The class's rules: the theme's 2 px primary ring, and on touch a reserved 44 px height (no
+    // pseudo-element reaching over a neighbour).
+    expect(css).toMatch(/\.trigger:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--mantine-primary-color-filled\)/);
+    expect(css).toMatch(/@media \(pointer: coarse\)\s*\{\s*\.trigger\s*\{\s*min-height:\s*var\(--nest-hit-touch\)/);
+    expect(css).not.toMatch(/\.trigger::(before|after)/);
+    // It's the tooltip's target: focus opens it.
+    await user.tab();
+    expect(target).toHaveFocus();
+    expect(await screen.findByText("Its details")).toBeInTheDocument();
   });
 });

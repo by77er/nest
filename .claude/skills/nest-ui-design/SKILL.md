@@ -143,6 +143,7 @@ Motion explains a change; it never decorates.
 - A visible focus ring (2 px, primary, 2 px offset); AA contrast as in [Tokens](#tokens).
 - Everything reachable by keyboard, drag included (dnd-kit's keyboard sensor).
 - Hit targets at least 32 px on desktop and 44 px on touch.
+- Touch hit areas reserve layout space; they never overlap a neighbouring control.
 - A label on every control; `aria-live` for polled changes that matter.
 - Works from 390 px up with no horizontal page scroll; only a board or table may scroll, inside its own scroller.
 

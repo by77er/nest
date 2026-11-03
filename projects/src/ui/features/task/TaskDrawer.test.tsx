@@ -136,18 +136,3 @@ describe("the task drawer", () => {
     expect(within(d).getByText("Stalled")).toBeInTheDocument();
   });
 });
-
-describe("the task drawer's auto-merge", () => {
-  it("shows it on with its method, or why GitHub refused it", async () => {
-    const api = new FakeApi();
-    const on = task({ title: "On", state: "in_review", pr: 4, auto_merge: { state: "enabled", method: "squash", error: null, at_ms: Date.now() } });
-    const failed = task({ title: "Failed", state: "in_review", pr: 5, auto_merge: { state: "failed", method: "squash", error: "GitHub 422: Pull request is in clean status", at_ms: Date.now() } });
-    api.tasks = [on, failed];
-    const { user } = renderApp("/projects/prj_one/board", api);
-    await user.click(await screen.findByRole("link", { name: "On" }));
-    expect(await within(await waitFor(drawer)).findByText("Auto-merge on (squash)")).toBeInTheDocument();
-    await user.click(screen.getByRole("link", { name: "Failed" }));
-    expect(await within(drawer()).findByText("GitHub 422: Pull request is in clean status")).toBeInTheDocument();
-    expect(within(drawer()).getByText("Auto-merge wasn't changed on its PR")).toBeInTheDocument();
-  });
-});

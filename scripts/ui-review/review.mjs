@@ -18,7 +18,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
 const WIDTHS = [1440, 1280, 390];
 const SCHEMES = ["light", "dark"];
-const CHECKS = ["overflow", "clipping", "frame", "nav", "contrast", "measure", "content", "page-error"];
+const CHECKS = ["overflow", "clipping", "frame", "nav", "contrast", "measure", "content", "hit-overlap", "hit-size", "page-error"];
 
 const die = (msg) => {
   console.error(`ui-review: ${msg}`);
@@ -113,9 +113,8 @@ for (const scheme of schemes) {
       const shot = { state: state.name, section: state.section, width, scheme, file: `${state.name}-${width}-${scheme}.png` };
       const context = await browser.newContext({
         viewport: { width, height: width < 600 ? 844 : 900 },
-        // A phone is a touch device: `pointer: coarse` applies (44 px targets), as on the real thing.
-        hasTouch: width < 600,
-        isMobile: width < 600,
+        // A phone is a touch screen: `pointer: coarse` applies, as do its larger hit targets.
+        ...(width < 600 ? { hasTouch: true, isMobile: true } : {}),
         colorScheme: scheme,
         reducedMotion: "reduce",
       });
@@ -135,7 +134,7 @@ for (const scheme of schemes) {
           await state.after(page);
           await page.waitForTimeout(500);
         }
-        const r = await page.evaluate(measure, { ...app.selectors, viewportOnly: state.full === false });
+        const r = await page.evaluate(measure, { ...app.selectors, viewportOnly: state.full === false, touch: width < 600 });
         shot.frame = r.frame;
         for (const [check, list] of Object.entries(r.problems)) for (const d of list) fail(check, shot, d);
         for (const d of (await state.check?.(page, { width, scheme })) ?? []) fail(state.checkName ?? "app", shot, d);
