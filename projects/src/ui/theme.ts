@@ -202,13 +202,19 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
 
 /**
  * A filled role takes its scheme's text color (`--nest-on-<role>`): white or dark in light, dark in dark,
- * whichever meets AA; a gray outline is the muted text on a hairline. Everything else is Mantine's.
+ * whichever meets AA; a subtle or light role is its text shade; a gray outline is the muted text on a
+ * hairline. Everything else is Mantine's.
  */
 const variantColorResolver: VariantColorsResolver = (input) => {
   const r = defaultVariantColorsResolver(input);
   const parsed = parseThemeColor({ color: input.color ?? input.theme.primaryColor, theme: input.theme });
   if (input.variant === "filled" && parsed.isThemeColor && (ROLES as readonly string[]).includes(parsed.color) && parsed.shade === undefined) {
     return { ...r, color: `var(--nest-on-${parsed.color})` };
+  }
+  // A subtle or light role (a subtle "Delete", a light "Failed"): the role's text shade, 7 in light and 3 in
+  // dark, never Mantine's shade 0 in dark, which is near-white and loses the role's cue.
+  if ((input.variant === "subtle" || input.variant === "light") && parsed.isThemeColor && (ROLES as readonly string[]).includes(parsed.color) && parsed.shade === undefined) {
+    return { ...r, color: `var(--mantine-color-${parsed.color}-text)`, hoverColor: `var(--mantine-color-${parsed.color}-text)` };
   }
   // A neutral outline (a "Tainted" badge): muted text on a hairline, not Mantine's gray 6 (3.3:1 on white).
   if (input.variant === "outline" && (input.color ?? "") === "gray") {
