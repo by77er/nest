@@ -168,6 +168,24 @@ for (const remount of [false, true]) {
   await p.close();
 }
 
+// hit-overlap ignores a control clipped away where the hit area meets it (a trace row scrolled out of
+// its log, under a button above the log): no tap there is meant for it. Unclipped, the same row counts.
+{
+  const clipPage = (clipped) => `<!doctype html><html><head><style>
+    body { margin: 0; font: 14px/20px sans-serif; }
+    .reach { position: absolute; top: 100px; left: 20px; min-height: 44px; min-width: 44px; z-index: 1; }
+    .reach::before { content: ""; position: absolute; top: -40px; left: 0; right: 0; bottom: 0; }
+    .log { position: absolute; top: 120px; left: 20px; width: 200px; height: 20px; ${clipped ? "overflow: hidden;" : ""} }
+    .log button { position: relative; top: -60px; min-height: 44px; }
+  </style></head><body><button class="reach">Reach</button><div class="log"><button>Row</button></div></body></html>`;
+  const overlap = async (clipped) => {
+    await page.setContent(clipPage(clipped));
+    return (await page.evaluate(measure, { ...sel, touch: true })).problems["hit-overlap"];
+  };
+  assert.deepEqual(await overlap(true), [], "a control clipped out of its scroller isn't a neighbour");
+  assert.equal((await overlap(false)).length, 1, "the same control, unclipped, is");
+}
+
 // The trace's Markdown (trace-prose.mjs): an assistant's answer on a terminal, clean, then with each of
 // the design review's (#141) planted failures: a serif span, a 20 px paragraph, a wide fence that doesn't
 // scroll in itself, and a line spilled past the trace.
@@ -178,8 +196,8 @@ for (const remount of [false, true]) {
     [data-ds=term-prose] { white-space: normal; min-width: 0; }
     [data-ds=term-prose] p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
     [data-ds=term-prose] :where(pre, table, code, strong) { font: inherit; }
-    [data-ds=term-prose] pre { margin: 0; white-space: pre; overflow-x: auto; }
-    [data-md=table] { overflow-x: auto; }
+    [data-ds=term-prose] pre { margin: 0; white-space: pre; overflow-x: auto; contain: inline-size; }
+    [data-md=table] { overflow-x: auto; contain: inline-size; }
     [data-md=table] td { white-space: pre; }
   </style></head><body><div data-ds="terminal"><div data-ds="term-prose">
     <p>The push was refused, so <strong>the broker</strong> opens it, after <code>npm run build</code>.</p>

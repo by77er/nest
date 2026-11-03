@@ -30,7 +30,8 @@ const COMPONENTS: Components = {
   h6: heading,
   a: ({ href, children }) =>
     href ? (
-      <a href={href} target="_blank" rel="noopener noreferrer">
+      // In a sentence: the inline exception on touch (data-inline), on its 24 px line (Terminal.module.css).
+      <a href={href} target="_blank" rel="noopener noreferrer" data-inline>
         {children}
       </a>
     ) : (

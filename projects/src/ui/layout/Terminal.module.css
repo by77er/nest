@@ -185,6 +185,13 @@
   overflow-x: auto;
 }
 
+/* A fence and a table frame take the line's width, whatever their content's: their widest line never
+   widens the trace (in a table cell, auto layout would grow the cell to it), it scrolls inside them. */
+.md pre,
+.md [data-md="table"] {
+  contain: inline-size;
+}
+
 .md table {
   border-collapse: collapse;
   font: inherit;
