@@ -58,3 +58,9 @@
 .option[data-combobox-disabled] {
   color: var(--nest-muted, var(--mantine-color-dimmed));
 }
+
+/* A TriggerBadge that's plain status on touch: just the badge, inline. */
+.plain {
+  display: inline-flex;
+  align-items: center;
+}

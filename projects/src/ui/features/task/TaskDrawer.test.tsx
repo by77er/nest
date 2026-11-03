@@ -31,6 +31,18 @@ describe("creating a task", () => {
 });
 
 describe("the task drawer", () => {
+  it("its Tainted badge explains itself on hover, focus or a tap: a security signal, reachable on a phone", async () => {
+    const api = new FakeApi();
+    const t = task({ title: "Touched", state: "in_progress", tainted: true });
+    api.tasks = [t];
+    const { user } = renderApp(`/projects/prj_one/board?task=${t.id}`, api);
+    const d = await waitFor(drawer);
+    const tainted = await within(d).findByLabelText(/^Tainted: a tainted session wrote to this task/);
+    expect(tainted).toHaveAttribute("tabindex", "0");
+    await user.hover(tainted);
+    expect(await screen.findByText("A tainted session wrote to this task (it read untrusted content)")).toBeInTheDocument();
+  });
+
   it("opens from its card, and assigning a ready task sends assign and shows it assigned", async () => {
     const api = new FakeApi();
     const t = task({ title: "Specced", state: "ready", spec: { goal: "Ship it", acceptance_criteria: ["works", "tested"], files: ["src/a.ts"], test_plan: "npm test" } });

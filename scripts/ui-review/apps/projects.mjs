@@ -206,6 +206,34 @@ async function traceProximity(p, { width }) {
   });
 }
 
+/**
+ * A task's PRs on touch keep their proximity: within one PR (its number and title, then its badges and
+ * meta) the gap is at most half the gap to the next PR, measured on what's drawn (text and badges), not
+ * the grown hit boxes.
+ */
+async function prProximity(p, { width }) {
+  if (width >= 600) return [];
+  return p.evaluate(() => {
+    const drawn = (el) => {
+      const r = document.createRange();
+      r.selectNodeContents(el);
+      return r.getBoundingClientRect();
+    };
+    const out = [];
+    const prs = [...document.querySelectorAll("[data-pr]")].filter((e) => e.getBoundingClientRect().height > 0);
+    for (let i = 0; i < prs.length; i++) {
+      const [first, second] = [...prs[i].children];
+      if (!first || !second) continue;
+      const within = Math.round(drawn(second).top - drawn(first).bottom);
+      const next = prs[i + 1]?.children[0];
+      if (!next) continue;
+      const between = Math.round(drawn(next).top - drawn(prs[i]).bottom);
+      if (within > between / 2) out.push(`PR ${prs[i].getAttribute("data-pr")}: ${within} px between its lines, ${between} px to the next PR (within a PR at most half)`);
+    }
+    return out;
+  });
+}
+
 /** A task card's PR link opens the PR (a new tab on GitHub), not the task the whole card links to. */
 const cardPrLink = (p) => prLinkIn(p, "[data-slot=manager-context] [data-ds=task-card]", "a context card");
 const chatCardPrLink = (p) => prLinkIn(p, "[data-ds=rich] [data-ds=task-card]", "a chat card");
@@ -367,6 +395,7 @@ const app = {
     // header's meta under its h1, the Manager's context), and the trace keeps its proximity. (Rows of
     // controls, like a project card's title and repo, take a 44 px pitch instead: data-touch-pitch.)
     { name: "rhythm-header", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, widths: PHONE, check: rhythm("demo", [["[data-ds=page-header] h1", "[data-ds=page-header] [data-slot=meta]"]]), checkName: "rhythm" },
+    { name: "rhythm-prs", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, widths: PHONE, after: drawerAt("Pull requests"), check: prProximity, checkName: "rhythm" },
     { name: "rhythm-trace", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, widths: PHONE, check: traceProximity, checkName: "rhythm" },
     { name: "rhythm-context", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click(), check: rhythm("demo", ["[data-slot=manager-context]"], (p) => p.getByRole("button", { name: "About the manager" }).click()), checkName: "rhythm" },
     // The chat's scrolling, acted out (checks: `chat-scroll`).

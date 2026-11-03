@@ -41,6 +41,9 @@
   .grip {
     min-width: var(--nest-hit-touch);
     min-height: var(--nest-hit-touch);
+    /* Above the title's grown hit box, which reaches down beside it. */
+    position: relative;
+    z-index: 2;
   }
 }
 

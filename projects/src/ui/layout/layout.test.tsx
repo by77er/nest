@@ -238,6 +238,35 @@ describe("the navigation primitives", () => {
 });
 
 describe("TriggerBadge", () => {
+  it("plainOnTouch: on a touch screen it's plain status, named, with no tap target and no tooltip; with a mouse a trigger", async () => {
+    const { Tooltip } = await import("@mantine/core");
+    const { TriggerBadge } = await import("./Actions");
+    const coarse = (on: boolean) =>
+      vi.stubGlobal("matchMedia", (query: string) => ({ matches: on && query === "(pointer: coarse)", media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => false }));
+    const card = () => (
+      <Tooltip label="Cache gadget thumbnails: Ready" events={{ hover: true, focus: true, touch: true }}>
+        <TriggerBadge plainOnTouch data-marker="waiting" aria-label="Waiting on 1: Cache gadget thumbnails">
+          Waiting on 1
+        </TriggerBadge>
+      </Tooltip>
+    );
+    coarse(true);
+    const user = userEvent.setup();
+    const view = wrap(card());
+    const plain = screen.getByRole("img", { name: "Waiting on 1: Cache gadget thumbnails" });
+    expect(plain).not.toHaveAttribute("tabindex");
+    await user.hover(plain);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByText("Cache gadget thumbnails: Ready")).toBeNull();
+    view.unmount();
+    coarse(false);
+    wrap(card());
+    const trigger = screen.getByLabelText("Waiting on 1: Cache gadget thumbnails");
+    expect(trigger).toHaveAttribute("tabindex", "0");
+    await user.hover(trigger);
+    expect(await screen.findByText("Cache gadget thumbnails: Ready")).toBeInTheDocument();
+  });
+
   it("keeps its own class inside a Tooltip (which clones its className in), and so the theme's focus ring and touch target", async () => {
     const { Tooltip } = await import("@mantine/core");
     const { TriggerBadge } = await import("./Actions");
