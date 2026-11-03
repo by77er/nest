@@ -1,5 +1,6 @@
 // A caption line of small facts (who, when, which PR) below the thing they're about: dimmed, wrapping
-// rather than clipping. Ids are set in the mono family.
+// rather than clipping. Ids are set in the mono family. A `Token` is a name typed as is (a variable):
+// kept whole, so its column is as wide as it, rather than split mid-name like prose.
 
 import { Group, Text } from "@mantine/core";
 import type { ReactNode } from "react";
@@ -26,5 +27,17 @@ export function MetaItem({ icon: Icon, children, title, mono = false }: { icon?:
         {children}
       </Text>
     </Group>
+  );
+}
+
+/**
+ * A name typed as is, like an environment variable or a host: never broken mid-name (it breaks only
+ * where it has a space), so a table's column is as wide as its longest. Mono and dimmed by default.
+ */
+export function Token({ children, slot, mono = true, dimmed = true, size = "xs" }: { children: ReactNode; slot?: string; mono?: boolean; dimmed?: boolean; size?: "xs" | "sm" }) {
+  return (
+    <Text component="span" size={size} c={dimmed ? "dimmed" : undefined} ff={mono ? "monospace" : undefined} data-slot={slot} style={{ overflowWrap: "normal", wordBreak: "keep-all" }}>
+      {children}
+    </Text>
   );
 }

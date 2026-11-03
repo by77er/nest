@@ -12,7 +12,7 @@ import { useState } from "react";
 import { useDeleteSecret, useSecrets } from "../../api/queries";
 import type { SecretLocation, SecretView } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Sheet, Stack, TableFrame } from "../../layout";
+import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Sheet, Stack, TableFrame, Token } from "../../layout";
 import { LiveAgents } from "../project/LiveAgents";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { SecretForm } from "./SecretForm";
@@ -124,9 +124,7 @@ export function SecretsPage() {
                           <Text fz="sm" ff="monospace" fw="medium">
                             {s.name}
                           </Text>
-                          <Text fz="xs" ff="monospace" c="dimmed" data-slot="env">
-                            ${s.env}
-                          </Text>
+                          <Token slot="env">${s.env}</Token>
                           {s.description && (
                             <Text fz="xs" c="dimmed">
                               {s.description}
@@ -135,7 +133,13 @@ export function SecretsPage() {
                         </Stack>
                       </Table.Td>
                       <Table.Td>
-                        <Text fz="sm">{s.hosts.join(", ")}</Text>
+                        <Stack gap="2xs">
+                          {s.hosts.map((h) => (
+                            <Token key={h} mono={false} dimmed={false} size="sm">
+                              {h}
+                            </Token>
+                          ))}
+                        </Stack>
                       </Table.Td>
                       <Table.Td>
                         <Text fz="sm">{s.locations.map(formatOf).join(", ")}</Text>

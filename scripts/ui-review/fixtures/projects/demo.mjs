@@ -3,7 +3,7 @@
 // with tasks' attached PRs (open, merged, a fork's, one closed and detached) and their dependencies
 // (a task waiting on two of three, one waited on by two, one whose blockers are all done).
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
-// projects), "error" (the API fails) or "connecting" (a trace that sends nothing yet). Traces come from trace.mjs: history pages plus a live ring.
+// projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "network-empty" or "secrets-empty" (no rules, secrets or live agents). Traces come from trace.mjs: history pages plus a live ring.
 
 import { trace } from "./trace.mjs";
 
@@ -168,6 +168,20 @@ export function data(variant = "demo", now = Date.now()) {
     ],
   };
 
+  // The Secrets page (README.md#secrets): what the app keeps of each (never a value), the grant, and the
+  // same live layers as the Network page, with the variables each agent has.
+  const bearer = [{ type: "authorization_bearer" }];
+  const secrets = {
+    secrets: variant === "secrets-empty" ? [] : [
+      { name: "cloudflare_token", env: "CLOUDFLARE_API_TOKEN", description: "DNS for gadgets.example.com", hosts: ["api.cloudflare.com"], locations: bearer, roles: ["worker", "manager"], size: 40, created_ms: now - 5 * 86_400_000, updated_ms: now - 3_600_000, holders: [{ agent: "agt_mgr7k2", role: "manager" }, { agent: "agt_w8x2m4", role: "worker" }], last_injected_ms: now - 120_000, in_nest: true },
+      { name: "npm_token", env: "NPM_TOKEN", description: "Publishing @gadgets packages", hosts: ["registry.npmjs.org"], locations: bearer, roles: ["worker"], size: 36, created_ms: now - 4 * 86_400_000, updated_ms: now - 4 * 86_400_000, holders: [{ agent: "agt_w8x2m4", role: "worker" }], last_injected_ms: now - 600_000, in_nest: true },
+      { name: "uploads_key", env: "GADGETS_UPLOAD_KEY", description: "", hosts: ["uploads.gadgets.example.com", "*.cdn.gadgets.example.com"], locations: [{ type: "header", name: "X-Upload-Key" }], roles: ["reviewer"], size: 64, created_ms: now - 2 * 86_400_000, updated_ms: now - 2 * 86_400_000, holders: [], last_injected_ms: null, in_nest: true },
+    ],
+    grant: { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org", "upload.pypi.org", "*.gadgets.example.com"], max_count: 20, max_bytes: 4096, workflows: true, used: 3 },
+    client: "cli_demo",
+    agents: variant === "secrets-empty" ? [] : network.agents,
+  };
+
   /** The answer to `GET|POST /api<path>`: [status, body]. */
   const answer = (method, path) => {
     if (variant === "error") return [500, { error: "internal error (fixture)" }];
@@ -176,7 +190,7 @@ export function data(variant = "demo", now = Date.now()) {
     if (path === "/admin/sync" && method === "POST") return [200, { written: sync.written.slice(0, 2), repos: ["by77er/gadgets"] }];
     if (!path.startsWith("/projects/prj_demo")) return [404, { error: "unknown project" }];
     const q = path.slice("/projects/prj_demo".length);
-    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chat, "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
+    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chat, "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
     if (q in routes) return [200, routes[q]];
     // A task's detail: each task's own, with its history (tsk_demo3 has no worker).
     if (q.startsWith("/tasks/")) {
