@@ -334,13 +334,14 @@ struct MockFleet {
     reject_next: Arc<Mutex<Option<String>>>,
 }
 
-/// A lease that lapses 500 ms after the last acknowledged heartbeat, so a partition fences quickly.
-/// A test whose subject isn't a lapse uses [`STEADY_LEASE`]: on a loaded machine (CI, a parallel
-/// build) 500 ms without a heartbeat answer happens, and the self-fence it causes retires (and
-/// deletes) what the test is still using.
-const LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, cp_expiry_ms: 800 };
-/// A lease no load lapses within a test.
+/// The lease every test's mock FleetDO grants unless the test is about a lapse: one no load lapses
+/// within a test. On a loaded runner (CI's 2 vCPUs running every test at once) heartbeat answers do
+/// stall past 500 ms, and the self-fence that follows fences, retires and deletes what a test is
+/// still using (seen as `stale_epoch`, a refused create or resume, or a missing `disk.img`).
 const STEADY_LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 60_000, cp_expiry_ms: 90_000 };
+/// For the tests about a lapse: it lapses 500 ms after the last acknowledged heartbeat, so a
+/// partition fences quickly.
+const LAPSING_LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, cp_expiry_ms: 800 };
 
 /// Mock FleetDO. Accepts reconnects. While `partition` is set it answers nothing on the open
 /// connection and refuses new ones (a network partition); clearing it lets the host reconnect.
@@ -348,7 +349,12 @@ const STEADY_LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms:
 /// resends those past the hello's `last_command_seq`: a batch sent on a connection the host was
 /// already dropping (after a retryable error) is not lost.
 async fn mock_fleet() -> MockFleet {
-    mock_fleet_with(LEASE).await
+    mock_fleet_with(STEADY_LEASE).await
+}
+
+/// [`mock_fleet`] for a test about a lease lapse ([`LAPSING_LEASE`]).
+async fn mock_fleet_lapsing() -> MockFleet {
+    mock_fleet_with(LAPSING_LEASE).await
 }
 
 /// [`mock_fleet`], granting `lease` in every hello_ack.
@@ -655,7 +661,7 @@ async fn wait_until(what: &str, f: impl Fn() -> bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_lifecycle_commit_and_self_fence() {
     let dir = tempfile::tempdir().unwrap();
-    let fleet = mock_fleet().await;
+    let fleet = mock_fleet_lapsing().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
         "role": "sandbox",
         "cell": "test-cell",
@@ -1007,8 +1013,17 @@ async fn start_host_with(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
 }
 
 async fn start_host_opts(proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>, commit_timeout_ms: u64) -> Started {
+    start_host_leased(proxy_ca, commit_timeout_ms, STEADY_LEASE).await
+}
+
+/// [`start_host`] for a test about a lease lapse ([`LAPSING_LEASE`]).
+async fn start_host_lapsing() -> Started {
+    start_host_leased(None, 5000, LAPSING_LEASE).await
+}
+
+async fn start_host_leased(proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>, commit_timeout_ms: u64, lease: LeaseTiming) -> Started {
     let dir = tempfile::tempdir().unwrap();
-    let fleet = mock_fleet().await;
+    let fleet = mock_fleet_with(lease).await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
         "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
@@ -1130,9 +1145,12 @@ async fn tunnel_child_runs_with_the_host_and_is_terminated_at_shutdown() {
     let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver::default()))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
-    wait_until("cloudflared spawned", || log.exists()).await;
+    // The fake writes its pid, then its metrics address: wait for both lines, not for the file.
+    let wrote = |what: &str| std::fs::read_to_string(&log).is_ok_and(|l| l.contains(what));
+    wait_until("cloudflared spawned", || wrote("pid=")).await;
     let pid: i32 = std::fs::read_to_string(&log).unwrap().lines().next().unwrap().strip_prefix("pid=").unwrap().parse().unwrap();
     assert!(alive(pid));
+    wait_until("cloudflared parsed its arguments", || wrote(&format!("metrics={metrics}\n"))).await;
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
     let hello = fleet.log.lock().unwrap().hellos[0].clone();
     assert_eq!(hello.gateway_url.as_deref(), Some("ws://127.0.0.1:18790"), "the hello keeps nestd's configured URL");
@@ -1306,7 +1324,7 @@ async fn failed_create_retried_at_the_same_epoch_reaches_the_gateway() {
 /// it to the proxy, and heartbeats must stop claiming it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fence_during_create_is_terminal() {
-    let h = start_host().await;
+    let h = start_host_lapsing().await;
     h.fleet.commands.send(vec![create("cmd_create", "sbx_slow")]).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     h.fleet.partition.store(true, Ordering::SeqCst); // lease lapses ~500 ms later, mid-boot
@@ -2147,7 +2165,7 @@ fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
 
     let rt1 = runtime();
     let heads: BTreeMap<String, GenerationId> = rt1.block_on(async {
-        let p = nestd_process(dir.path(), mock_fleet_with(STEADY_LEASE).await, 5000, Some(fake_driver())).await;
+        let p = nestd_process(dir.path(), mock_fleet().await, 5000, Some(fake_driver())).await;
         let f = &p.fleet;
         let suspend = |id: &str| cmd(id, CommandBody::SandboxSuspend { sandbox: SandboxId("sbx_clean".into()), epoch: Epoch(1), mode: SuspendMode::DiskOnly });
         f.commands.send(vec![create("cmd_c_clean", "sbx_clean")]).unwrap();
@@ -2198,7 +2216,7 @@ fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
 
     let rt2 = runtime();
     let lost: RequestId = rt2.block_on(async {
-        let fleet = mock_fleet_with(STEADY_LEASE).await;
+        let fleet = mock_fleet().await;
         fleet.lose_commit_answers.store(1, Ordering::SeqCst);
         let p = nestd_process(dir.path(), fleet, 5000, None).await;
         for gone in ["sbx_clean", "sbx_hang", "sbx_junk", "sbx_flat"] {
@@ -2235,7 +2253,7 @@ fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
 
     let rt3 = runtime();
     rt3.block_on(async {
-        let p = nestd_process(dir.path(), mock_fleet_with(STEADY_LEASE).await, 5000, None).await;
+        let p = nestd_process(dir.path(), mock_fleet().await, 5000, None).await;
         wait_until("the salvage asked again", || !salvage_requests(&p.fleet, "sbx_dirty", 1).is_empty()).await;
         assert_eq!(salvage_requests(&p.fleet, "sbx_dirty", 1)[0], lost, "asked again under the request id the last process sent");
         p.fleet.wait_event("reported clean", |b| matches!(b, HostEventBody::IncarnationRetired { sandbox, .. } if sandbox.0 == "sbx_dirty")).await;
@@ -2268,7 +2286,7 @@ fn a_newer_create_races_the_salvage_of_what_a_dead_nestd_left() {
     let state = dir.path().join("state/sandboxes/sbx_x");
     let rt1 = runtime();
     rt1.block_on(async {
-        let p = nestd_process(dir.path(), mock_fleet_with(STEADY_LEASE).await, 5000, Some(fake_driver())).await;
+        let p = nestd_process(dir.path(), mock_fleet().await, 5000, Some(fake_driver())).await;
         p.fleet.commands.send(vec![create("cmd_c1", "sbx_x")]).unwrap();
         assert!(is_ok(&p.fleet.result("cmd_c1").await));
         append_to_disk(dir.path(), "sbx_x", 1, b"work");
@@ -2278,7 +2296,7 @@ fn a_newer_create_races_the_salvage_of_what_a_dead_nestd_left() {
 
     let rt2 = runtime();
     rt2.block_on(async {
-        let fleet = mock_fleet_with(STEADY_LEASE).await;
+        let fleet = mock_fleet().await;
         fleet.lose_commit_answers.store(1, Ordering::SeqCst);
         *fleet.reject_salvage.lock().unwrap() = Some("parent_mismatch".into());
         // Commit answers time out after 300 ms; retries wait 1 s, then 2 s, 4 s (RETIRE_RETRY_FIRST).
@@ -2601,7 +2619,7 @@ async fn a_kill_overtaking_a_queued_start_means_it_never_runs() {
 /// (`fenced`, at its epoch) is reported and it never reaches the runner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_held_across_a_lease_lapse_never_runs() {
-    let h = start_host().await;
+    let h = start_host_lapsing().await;
     h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
     assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
     h.fleet.commands.send(vec![create("cmd_slow", "sbx_slow2"), cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_l", "sbx_a")))]).unwrap();
@@ -2623,7 +2641,7 @@ async fn a_start_held_across_a_lease_lapse_never_runs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_brain_host_runs_brains_and_refuses_sandboxes() {
     let dir = tempfile::tempdir().unwrap();
-    let fleet = mock_fleet().await;
+    let fleet = mock_fleet_lapsing().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
         "role": "brain", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
