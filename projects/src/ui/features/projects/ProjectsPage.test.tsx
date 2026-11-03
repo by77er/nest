@@ -35,8 +35,7 @@ describe("projects", () => {
 
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects", body: { name: "Gadgets", repo: "Owner/Gadgets", auto_assign: true, max_workers: 3 } }]));
     await waitFor(() => expect(router.state.location.pathname).toMatch(/^\/projects\/prj_new[a-z0-9]+\/board$/));
-    expect(await screen.findByRole("heading", { level: 1, name: "Board" })).toBeInTheDocument();
-    expect(screen.getByRole("main")).toHaveTextContent("Gadgets");
+    expect(await screen.findByRole("heading", { level: 1, name: "Gadgets" })).toBeInTheDocument();
   });
 
   it("says when the list can't be loaded", async () => {

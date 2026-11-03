@@ -2,7 +2,7 @@
 // verdict on each dimension once there is one. Read-only.
 
 import { Anchor, Badge, Button, Table, Text, Tooltip } from "@mantine/core";
-import { IconChevronDown, IconChevronRight, IconShieldCheck } from "@tabler/icons-react";
+import { IconCheck, IconChevronDown, IconChevronRight, IconShieldCheck, IconX } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
 import { Fragment, useState } from "react";
 import { useReviews } from "../../api/queries";
@@ -33,13 +33,25 @@ function Verdicts({ job }: { job: Job }) {
   if (!job.verdict) return <Text fz="sm" c="dimmed">{job.error ?? "No verdict yet"}</Text>;
   return (
     <Row gap="xs">
-      {DIMENSIONS.map(([d, label]) => (
-        <Tooltip key={d} label={job.verdict![d].notes || label} multiline maw="var(--nest-side-panel)">
-          <Badge size="sm" variant="outline" color={job.verdict![d].verdict === "pass" ? "success" : "danger"} tabIndex={0}>
-            {label}
-          </Badge>
-        </Tooltip>
-      ))}
+      {DIMENSIONS.map(([d, label]) => {
+        // Pass and fail are status: their roles, and an icon each, so color isn't the only cue.
+        const pass = job.verdict![d].verdict === "pass";
+        return (
+          <Tooltip key={d} label={job.verdict![d].notes || label} multiline maw="var(--nest-side-panel)">
+            <Badge
+              size="sm"
+              variant="light"
+              color={pass ? "success" : "danger"}
+              leftSection={pass ? <IconCheck size={icon.sm} aria-hidden /> : <IconX size={icon.sm} aria-hidden />}
+              aria-label={`${label}: ${pass ? "passed" : "failed"}`}
+              data-verdict={pass ? "pass" : "fail"}
+              tabIndex={0}
+            >
+              {label}
+            </Badge>
+          </Tooltip>
+        );
+      })}
       {job.tainted && (
         <Badge size="sm" variant="outline" color="gray">
           Tainted
@@ -55,9 +67,9 @@ export function ReviewsPage() {
   // The job whose reviewer's trace is open (one at a time: each open trace is a WebSocket).
   const [traced, setTraced] = useState<string | null>(null);
   return (
-    <ProjectFrame projectId={projectId} title="Reviews">
+    <ProjectFrame projectId={projectId}>
       {(p) => (
-        <Section title="Review jobs" count={reviews.data?.length}>
+        <Section title="Reviews" count={reviews.data?.length}>
           {reviews.isPending ? (
             <LoadingState label="Loading the reviews" />
           ) : reviews.isError ? (

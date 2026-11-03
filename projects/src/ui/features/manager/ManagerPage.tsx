@@ -4,7 +4,7 @@
 import { Tabs } from "@mantine/core";
 import { IconMessage, IconTimeline } from "@tabler/icons-react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { icon, Stack } from "../../layout";
+import { icon, Section, Stack } from "../../layout";
 import { ChatView } from "../chat/ChatView";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ManagerProblem, ManagerStatusLine } from "./ManagerStatus";
@@ -16,8 +16,9 @@ export function ManagerPage() {
   const navigate = useNavigate({ from: "/projects/$projectId/manager" });
   const tab = view ?? "chat";
   return (
-    <ProjectFrame projectId={projectId} title="Manager" measure="reading" meta={() => <ManagerStatusLine projectId={projectId} />}>
+    <ProjectFrame projectId={projectId} measure="reading">
       {(p) => (
+        <Section title="Manager" actions={<ManagerStatusLine projectId={projectId} />}>
         <Stack gap="xl">
           <ManagerProblem projectId={projectId} />
           <Tabs value={tab} onChange={(v) => void navigate({ search: v === "trace" ? { view: "trace" } : {} })} keepMounted={false}>
@@ -37,6 +38,7 @@ export function ManagerPage() {
             </Tabs.Panel>
           </Tabs>
         </Stack>
+        </Section>
       )}
     </ProjectFrame>
   );

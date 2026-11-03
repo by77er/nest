@@ -1,0 +1,100 @@
+/* The sidebar's one row style (the nest-ui-design skill's Navigation): one icon column, one height, one
+   padding, one left edge for every row. The active row is quiet: the subtle ground, full-weight text and
+   a 2 px rule in the text color; no role color. Hover is the subtle ground at lower emphasis. */
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--mantine-spacing-sm);
+  min-height: var(--nest-hit);
+  padding: 0 var(--mantine-spacing-sm);
+  border-left: 2px solid transparent;
+  border-radius: 0 var(--mantine-radius-md) var(--mantine-radius-md) 0;
+  color: var(--nest-muted);
+  font-size: var(--mantine-font-size-md);
+  font-weight: 500;
+  line-height: var(--mantine-line-height-md);
+  text-decoration: none;
+  transition: background-color var(--nest-motion-fast) var(--nest-ease-enter), color var(--nest-motion-fast) var(--nest-ease-enter);
+}
+
+.row:hover {
+  background: color-mix(in srgb, var(--nest-subtle) 60%, transparent);
+  color: var(--mantine-color-text);
+}
+
+.row:focus-visible {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: 2px;
+}
+
+.row[aria-current="page"] {
+  background: var(--nest-subtle);
+  border-left-color: var(--mantine-color-text);
+  color: var(--mantine-color-text);
+  font-weight: 600;
+}
+
+.icon {
+  display: inline-flex;
+  flex: 0 0 var(--nest-nav-icon);
+  justify-content: center;
+}
+
+.label {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.end {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+/* The switcher shares the rows' left edge and height, a step taller for its name. */
+.switcher {
+  composes: row;
+  width: 100%;
+  min-height: var(--nest-section-head);
+  border: 0;
+  border-left: 2px solid transparent;
+  background: transparent;
+  color: var(--mantine-color-text);
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+
+.switcher[aria-expanded="true"] {
+  background: var(--nest-subtle);
+}
+
+@media (pointer: coarse) {
+  .row {
+    min-height: var(--nest-hit-touch);
+  }
+}
+
+/* The product's name, on the rows' left edge (the rule's width and the rows' padding in). */
+.brand {
+  display: flex;
+  align-items: center;
+  height: var(--nest-header-height);
+  padding-left: calc(2px + var(--mantine-spacing-sm));
+}
+
+/* The switcher's list: the option under the keyboard and the current one are quiet too, like the rows. */
+.option {
+  border-radius: var(--mantine-radius-md);
+  font-size: var(--mantine-font-size-md);
+  color: var(--mantine-color-text);
+}
+
+.option[data-combobox-selected] {
+  background: var(--nest-subtle);
+  color: var(--mantine-color-text);
+}
+
+.option[data-combobox-active] {
+  font-weight: 600;
+}

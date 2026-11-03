@@ -1,4 +1,4 @@
-// The app's frame: the sidebar (projects and their pages, Admin at its foot) beside the page; and the
+// The app's frame: the sidebar (which project, its views, Admin at its foot) beside the page; and the
 // pages for a path that matches nothing and for a page that threw.
 
 import { IconCompass } from "@tabler/icons-react";
@@ -15,7 +15,7 @@ export function Shell() {
   return (
     <AppFrame
       brand={
-        <AnchorLink to="/projects" underline="never" c="bright" fw="bold" fz="lg" aria-label="nest projects: all projects">
+        <AnchorLink to="/projects" underline="never" c="dimmed" fw="bold" fz="xs" tt="uppercase" aria-label="nest projects: all projects">
           nest projects
         </AnchorLink>
       }

@@ -56,7 +56,7 @@ describe("the board", () => {
     const card = await screen.findByRole("article", { name: "with markers" });
     expect(within(card).getByText("Tainted")).toBeInTheDocument();
     const needs = await within(card).findByText("Needs input");
-    expect(needs.closest("[style]")?.getAttribute("style")).toContain("--mantine-color-warning-");
+    expect(needs.closest(".mantine-Badge-root")?.getAttribute("style")).toContain("--mantine-color-warning-");
     expect(within(card).getByRole("link", { name: /#42/ })).toHaveAttribute("href", "https://github.com/owner/widgets/pull/42");
     expect(within(card).getByText("agt_w1")).toBeInTheDocument();
 

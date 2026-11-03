@@ -105,6 +105,8 @@ export const layout = {
   headerHeight: "3.5rem",
   /** The persistent sidebar (projects and their pages), from `md` on; a drawer below. */
   sidebar: "16.5rem",
+  /** The sidebar rows' icon column: one width, so every label starts on one edge. */
+  navIcon: "1.25rem",
   /** A comfortable reading line for a conversation (the Manager page): about 70 characters. */
   readingMeasure: "42rem",
   /** A scrolling log's height (a trace): fixed below `lg`, the viewport's rest from `lg` on. */
@@ -149,6 +151,7 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
       "--nest-measure": layout.measure,
       "--nest-header-height": layout.headerHeight,
       "--nest-sidebar": layout.sidebar,
+      "--nest-nav-icon": layout.navIcon,
       "--nest-reading-measure": layout.readingMeasure,
       "--nest-log-max": layout.logMax,
       "--nest-log-max-beside": layout.logMaxBeside,
@@ -211,7 +214,8 @@ export const theme = createTheme({
     CloseButton: CloseButton.extend({ defaultProps: { c: "danger", size: "lg" } }),
     ActionIcon: ActionIcon.extend({ defaultProps: { size: "lg" } }),
     Button: Button.extend({ defaultProps: { size: "sm", radius: "md" } }),
-    Badge: Badge.extend({ defaultProps: { radius: "sm" }, styles: { root: { fontVariantNumeric: "tabular-nums" } } }),
+    // A badge is never cut short: its text keeps its width (a table column grows for it; a card wraps it).
+    Badge: Badge.extend({ defaultProps: { radius: "sm" }, styles: { root: { fontVariantNumeric: "tabular-nums", maxWidth: "none", flexShrink: 0 }, label: { overflow: "visible", textOverflow: "clip" } } }),
     Paper: Paper.extend({ defaultProps: { radius: "md" } }),
     Alert: Alert.extend({ defaultProps: { radius: "md" } }),
     Code: Code.extend({ styles: { root: { whiteSpace: "pre-wrap", overflowWrap: "anywhere", borderRadius: radius.sm } } }),

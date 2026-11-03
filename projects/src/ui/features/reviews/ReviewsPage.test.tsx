@@ -55,4 +55,21 @@ describe("the Reviews page", () => {
     renderApp("/projects/prj_one/reviews");
     expect(await screen.findByText("No reviews yet")).toBeInTheDocument();
   });
+
+  it("marks each dimension's verdict by its role and an icon: a failed one danger with a cross", async () => {
+    const api = new FakeApi();
+    api.reviews = [job(2, { state: "done", verdict: verdict("fail"), tainted: true })];
+    renderApp("/projects/prj_one/reviews", api);
+    const failed = await screen.findByLabelText("Quality: failed");
+    expect(failed.getAttribute("style")).toContain("--mantine-color-danger-");
+    expect(failed.querySelector(".tabler-icon-x")).not.toBeNull();
+    for (const name of ["Correctness: passed", "Architecture: passed"]) {
+      const passed = screen.getByLabelText(name);
+      expect(passed.getAttribute("style")).toContain("--mantine-color-success-");
+      expect(passed.querySelector(".tabler-icon-check")).not.toBeNull();
+    }
+    // Tainted isn't a verdict: the neutral outline.
+    const tainted = screen.getByText("Tainted").closest(".mantine-Badge-root")!;
+    expect(tainted.getAttribute("style")).toContain("--mantine-color-gray-");
+  });
 });

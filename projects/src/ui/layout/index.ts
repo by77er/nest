@@ -7,6 +7,8 @@ export { FadeIn } from "./FadeIn";
 export { FieldGroup } from "./FieldGroup";
 export { CardGrid, ColumnGrid } from "./Layouts";
 export { MetaItem, MetaRow } from "./Meta";
+export { NavGroup, NavGroups, NavRow, SwitcherTarget } from "./Nav";
+export { Switcher, type SwitcherItem } from "./Switcher";
 export { Notice, type NoticeTone } from "./Notice";
 export { Page, PageHeader } from "./Page";
 export { Panel, type PanelTone, TableFrame, Well } from "./Panel";
