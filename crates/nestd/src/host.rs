@@ -317,7 +317,7 @@ pub struct Inner {
     /// One per incarnation, held across a whole commit (its unlocked wait for the answer
     /// included), so commits leave an incarnation one at a time and in order. Taken before the
     /// sandbox lock, never under it.
-    commit_locks: Mutex<HashMap<(SandboxId, Epoch), Arc<tokio::sync::Mutex<()>>>>,
+    commit_locks: Mutex<HashMap<(SandboxId, Epoch), CommitLock>>,
     next_cut: std::sync::atomic::AtomicU64,
 }
 
@@ -2015,7 +2015,7 @@ impl Inner {
     }
 
     /// This incarnation's commit lock ([`Inner::commit_locks`]).
-    fn commit_lock(&self, id: &SandboxId, epoch: Epoch) -> Arc<tokio::sync::Mutex<()>> {
+    fn commit_lock(&self, id: &SandboxId, epoch: Epoch) -> CommitLock {
         self.commit_locks.lock().expect("commit locks").entry((id.clone(), epoch)).or_default().clone()
     }
 
@@ -2120,7 +2120,7 @@ impl Inner {
     /// sandbox lock), then commit it as any commit is (asking again for a lost answer first). A cut
     /// replaced or dropped meanwhile, or an incarnation fenced meanwhile (its salvage reads the
     /// disk), commits nothing.
-    async fn commit_cut(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, lock: Arc<tokio::sync::Mutex<()>>, cut_id: u64) {
+    async fn commit_cut(self: Arc<Self>, entry: Arc<tokio::sync::Mutex<Sbx>>, lock: CommitLock, cut_id: u64) {
         let _commit = lock.lock_owned().await;
         let mut s = entry.clone().lock_owned().await;
         if s.pending_cut.as_ref().is_none_or(|p| p.id != cut_id) {
@@ -2714,6 +2714,9 @@ fn decide_cut(cfg: &Config) -> CutMode {
         }
     }
 }
+
+/// An incarnation's commit lock ([`Inner::commit_locks`]).
+type CommitLock = Arc<tokio::sync::Mutex<()>>;
 
 /// A cut waiting for its background commit.
 struct PendingCut {
