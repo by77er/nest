@@ -213,11 +213,11 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 - **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the CSR shape isn't enforced; BrokerDO audits GitHub mints only (not secret pushes or binding mints).
 - **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, fork pins, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
 - **Built:** the autoscaler, per host kind (`AWS_CELLS`: `RunInstances` from the cell's launch template, or the `brain` section's for brain hosts; idle retirement, enroll timeouts).
-- **Not built:** Discord, Cloudflare Access applications from the control plane (the `edge` inframe stack manages
+- **Not built:** Cloudflare Access applications from the control plane (the `edge` inframe stack manages
   them; the control plane only stores the service token), the preview/share Worker routes, the api-loop backend (deferred), budgets. Preview and
   share URLs are already minted by the hostname rule (`sandbox.ts`), so nothing routes them yet.
 - **Host-side behavior is driven, not modeled.** The control plane issues create (including re-place
-  and reassign), destroy, fence, suspend (idle and spot drains) and resume (lazy wake); checkpoint,
+  and reassign), destroy, fence, suspend (idle and spot drains), resume (lazy wake) and turn-end checkpoints;
   fork, archive and drain are never sent.
 - **Commands aren't coalesced:** each `issueCommands` call is one `commands` batch, sent in seq order through the
   host's send chain.
