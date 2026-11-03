@@ -429,15 +429,25 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
                                 let _ = ws.send(send(FleetToHost::HeartbeatAck { sent_ms, server_ms: 0, revoked: vec![] })).await;
                             }
                             HostToFleet::Events { seq: es, events } => {
+                                // As FleetDO (`onEvents`): a failed batch, or one past a gap, is answered
+                                // with an error and the connection closed, so the host reconnects and
+                                // resends from `last_event_seq`. Read on, a batch the host had already
+                                // sent behind the failed one was taken as the next and acked the failed
+                                // one's events away (lost under load, when it came before the error).
                                 if fail.swap(false, Ordering::SeqCst) {
                                     log2.lock().unwrap().failed.push(events);
                                     let err = ErrorBody { code: "internal".into(), message: "handler failed".into(), retryable: true };
                                     let _ = ws.send(send(FleetToHost::Error { error: err })).await;
-                                    continue;
+                                    break;
                                 }
                                 if last_event_seq.is_some_and(|l| es.0 <= l) {
                                     let _ = ws.send(send(FleetToHost::Ack { up_to: es })).await;
                                     continue;
+                                }
+                                if last_event_seq.is_some_and(|l| es.0 > l + 1) {
+                                    let err = ErrorBody { code: "invalid_message".into(), message: format!("event batch {} out of order", es.0), retryable: true };
+                                    let _ = ws.send(send(FleetToHost::Error { error: err })).await;
+                                    break;
                                 }
                                 last_event_seq = Some(es.0);
                                 // Answer commit requests (CAS): committed, orphaned for salvage, or
@@ -1410,6 +1420,13 @@ async fn retryable_fleet_error_resends_the_failed_batch() {
     // The batch carrying cmd_a's events failed once; it still arrives, exactly once.
     assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
     wait_until("reconnect", || h.fleet.log.lock().unwrap().hellos.len() >= 2).await;
+    // Every event of the failed batch arrives again (on a loaded machine, later than any fixed
+    // delay); then a while for a duplicate to show, if the host were to send one.
+    wait_until("the failed batch resent", || {
+        let log = h.fleet.log.lock().unwrap();
+        log.failed.iter().flatten().all(|e| log.events.contains(e))
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let log = h.fleet.log.lock().unwrap();
     let [failed] = log.failed.as_slice() else { panic!("one failed batch: {:#?}", log.failed) };
