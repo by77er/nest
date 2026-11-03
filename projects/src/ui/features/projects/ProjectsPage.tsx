@@ -1,12 +1,12 @@
 // Every project, and a new one. The focal element is the list; its one action, top right.
 
-import { Anchor, Badge, Button, Modal, Text } from "@mantine/core";
+import { Anchor, Button, Modal, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { IconBrandGithub, IconFolders, IconPlus } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { useProjects } from "../../api/queries";
-import { AnchorLink } from "../../common/links";
+import { AnchorLink, BadgeLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { CardGrid, EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Page, PageHeader, Panel, Row, Stack, weight } from "../../layout";
 import { CreateProjectForm } from "./CreateProjectForm";
@@ -50,9 +50,18 @@ export function ProjectsPage() {
                     {p.name}
                   </AnchorLink>
                   {p.needs_you > 0 && (
-                    <Badge color="warning" variant="filled" data-marker="needs-you" aria-label={`${p.needs_you} ${p.needs_you === 1 ? "thing needs" : "things need"} you`}>
+                    // Asks are answered on the Board; the project itself opens on its Manager.
+                    <BadgeLink
+                      to="/projects/$projectId/board"
+                      params={{ projectId: p.id }}
+                      search={{}}
+                      color="warning"
+                      variant="filled"
+                      data-marker="needs-you"
+                      aria-label={`${p.needs_you} ${p.needs_you === 1 ? "thing needs" : "things need"} you: open the board`}
+                    >
                       {p.needs_you} {p.needs_you === 1 ? "needs" : "need"} you
-                    </Badge>
+                    </BadgeLink>
                   )}
                 </Row>
                 <MetaRow>

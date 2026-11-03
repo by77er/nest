@@ -79,7 +79,7 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 | `AppFrame` | The sidebar (the product name small at its top, the places, a footer set apart by a hairline; a burger-toggled drawer on a phone) and the content area |
 | `NavRow` / `NavGroup` | One row style for every place: icon column, height, padding, left edge and the quiet active state ([Navigation](#navigation)) |
 | `Page` | Max content width 1440 px, centred. Gutters `2xl` desktop, `xl` tablet, `lg` phone; `2xl` between page-level blocks. The frame never moves: every view of a section uses the same `Page`; narrow content goes in a left-aligned `Measure` |
-| `WithContext` / `SectionGrid` | A narrow view's content on the frame's left edge with a sticky context column beside it, at most a third of the width (a disclosure above it when narrow); sections as Panels in a responsive two-column grid, aligned to the top |
+| `WithContext` / `SectionGrid` | A narrow view's content on the frame's left edge with a sticky context column beside it to the right edge, at most a third of the width (a disclosure above it when narrow); sections as Panels in a responsive two-column grid, aligned to the top |
 | `PageHeader` | The h1 (the thing the page is about) and a meta line; no breadcrumb. Actions right-aligned on the title's baseline, wrapping below it when narrow |
 | `Section` | A heading row (h3, optional count, actions right) over content, `lg` below the heading; sections `2xl` apart |
 | `Panel` | The bordered surface (`md` radius, `lg` padding, `md` when dense). Cards, side panels, banners and table frames are all Panels |

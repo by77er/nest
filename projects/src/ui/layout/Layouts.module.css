@@ -44,10 +44,10 @@
   }
 }
 
-/* Content and its context: the main column at its measure on the frame's left edge, then one gap, then
-   the context column (sticky): at least 16rem, at most the token's width and never more than a third.
-   The gap is the same at every width; what's left over stays at the right. Below lg, the context is a
-   disclosure above the content. */
+/* Content and its context: the main column on the frame's left edge, then one gap, then the context
+   column (sticky) to the frame's right edge. The context takes what the main column's measure leaves,
+   at least 16rem and never more than a third; past a third, the main column takes the rest. The gap is
+   the same at every width. Below lg, the context is a disclosure above the content. */
 .withContext {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -57,8 +57,7 @@
 
 @media (min-width: 75em) {
   .withContext {
-    grid-template-columns: minmax(0, var(--nest-with-context-main)) minmax(16rem, min(var(--nest-context-column), 33%));
-    justify-content: start;
+    grid-template-columns: minmax(0, 1fr) max(16rem, min(calc(100% - var(--nest-with-context-main) - var(--mantine-spacing-2xl)), 33.333%));
     gap: var(--mantine-spacing-2xl);
   }
 

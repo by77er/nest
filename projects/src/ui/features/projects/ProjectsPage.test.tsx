@@ -2,7 +2,7 @@
 // and the new project's page opens.
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { FakeApi } from "../../test/fakeApi";
+import { ask, FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 
 describe("projects", () => {
@@ -11,6 +11,15 @@ describe("projects", () => {
     const link = await screen.findByRole("link", { name: "Widgets" });
     expect(link).toHaveAttribute("href", "/projects/prj_one/manager");
     expect(screen.getByRole("link", { name: "owner/widgets" })).toHaveAttribute("href", "https://github.com/owner/widgets");
+  });
+
+  it("a project's \"needs you\" goes to its Board, where asks are answered; the project opens on its Manager", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Which key?" })];
+    renderApp("/projects", api);
+    const badge = await screen.findByRole("link", { name: /1 thing needs you/ });
+    expect(badge).toHaveAttribute("href", "/projects/prj_one/board");
+    expect(screen.getByRole("link", { name: "Widgets" })).toHaveAttribute("href", "/projects/prj_one/manager");
   });
 
   it("creates one with its settings, refusing a malformed repo first, then opens it", async () => {

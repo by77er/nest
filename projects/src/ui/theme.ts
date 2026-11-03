@@ -115,8 +115,6 @@ export const layout = {
   navIcon: "1.25rem",
   /** A comfortable reading line for a conversation (the Manager page): about 70 characters. */
   readingMeasure: "42rem",
-  /** The context column beside a narrow view's content (the Manager's): 336 px. */
-  contextColumn: "21rem",
   /** An image in a message (a data: raster, an SVG figure): at most this tall. */
   richImageMax: "20rem",
   /** A scrolling log's height (a trace): fixed below `lg`, the viewport's rest from `lg` on. */
@@ -165,7 +163,6 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
       "--nest-sidebar": layout.sidebar,
       "--nest-nav-icon": layout.navIcon,
       "--nest-reading-measure": layout.readingMeasure,
-      "--nest-context-column": layout.contextColumn,
       "--nest-rich-image-max": layout.richImageMax,
       "--nest-log-max": layout.logMax,
       "--nest-log-max-beside": layout.logMaxBeside,

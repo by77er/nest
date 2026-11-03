@@ -5,7 +5,7 @@
 import { Tabs } from "@mantine/core";
 import { IconMessage, IconTimeline } from "@tabler/icons-react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { icon, Measure, Section, Stack, WithContext } from "../../layout";
+import { icon, Section, Stack, WithContext } from "../../layout";
 import { ManagerContext } from "./ManagerContext";
 import { ChatView } from "../chat/ChatView";
 import { ProjectFrame } from "../project/ProjectFrame";
@@ -21,7 +21,6 @@ export function ManagerPage() {
     <ProjectFrame projectId={projectId}>
       {(p) => (
         <WithContext measure="reading" contextLabel="About the manager" context={<ManagerContext projectId={projectId} />}>
-        <Measure type="reading">
         <Section title="Manager" actions={<ManagerStatusLine projectId={projectId} />}>
         <Stack gap="xl">
           <ManagerProblem projectId={projectId} />
@@ -43,7 +42,6 @@ export function ManagerPage() {
           </Tabs>
         </Stack>
         </Section>
-        </Measure>
         </WithContext>
       )}
     </ProjectFrame>
