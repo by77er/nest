@@ -6,7 +6,7 @@ import { Badge, Button, Code, Collapse, Divider, Text, UnstyledButton } from "@m
 import { IconArrowDown, IconChevronDown, IconChevronRight } from "@tabler/icons-react";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ago, exact } from "../../common/time";
-import { FadeIn, icon, LoadingState, Notice, Prose, Row, ScrollLog, Section, Stack } from "../../layout";
+import { FadeIn, icon, LoadingState, Notice, Prose, Row, ScrollLog, Section, Stack, weight } from "../../layout";
 import { groupTurns, lastState, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, type TurnGroup } from "./model";
 import { useTrace } from "./useTrace";
 
@@ -151,7 +151,7 @@ function Turn({ g, animateAfter }: { g: TurnGroup; animateAfter: number }) {
       {g.turn && (
         <Row gap="sm" justify="space-between">
           <Row gap="sm">
-            <Text fz="xs" fw="medium">
+            <Text fz="xs" fw={weight.medium}>
               {g.started ? `Turn · ${INPUT[str(g.started.input_kind)] ?? str(g.started.input_kind)}` : "Turn (started earlier)"}
             </Text>
             {at !== null && (

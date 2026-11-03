@@ -12,6 +12,7 @@ import {
   ActionIcon, Alert, Badge, Button, CloseButton, Code, Collapse, createTheme, type CSSVariablesResolver, defaultVariantColorsResolver, Drawer, InputWrapper,
   type MantineColorsTuple, Modal, Paper, parseThemeColor, Popover, Text, Timeline, Title, Tooltip, type VariantColorsResolver,
 } from "@mantine/core";
+import themeClasses from "./theme.module.css";
 
 export const palette = {
   /** Primary actions; assigned, in progress, in review. */
@@ -60,8 +61,13 @@ export type Space = keyof typeof spacing;
 /** The type scale (size/line height): caption 12/16 (xs), small 13/20 (sm), body 14/20 (md), body-lg 16/24 (lg). */
 export const fontSizes = { xs: "0.75rem", sm: "0.8125rem", md: "0.875rem", lg: "1rem", xl: "1.25rem" } as const;
 export const lineHeights = { xs: "1rem", sm: "1.25rem", md: "1.25rem", lg: "1.5rem", xl: "1.75rem" } as const;
-/** 400 body, 500 labels, 600 headings, by name (`fw="medium"`). */
+/** 400 body, 500 labels, 600 headings. */
 export const fontWeights = { regular: "400", medium: "500", bold: "600" } as const;
+/**
+ * The weights as style-prop values, by name: `fw={weight.medium}`. Mantine passes `fw` through as CSS,
+ * so a name string (`fw="medium"`) is no weight at all and `fw="bold"` is 700, not the scale's 600.
+ */
+export const weight = { regular: 400, medium: 500, bold: 600 } as const;
 export const headings = {
   h1: { fontSize: "1.5rem", lineHeight: "2rem", fontWeight: "600" },
   h2: { fontSize: "1.25rem", lineHeight: "1.75rem", fontWeight: "600" },
@@ -225,7 +231,7 @@ export const theme = createTheme({
     // Close is red: every close button (a modal's, a drawer's, a notification's), at a 32 px target.
     CloseButton: CloseButton.extend({ defaultProps: { c: "danger", size: "lg" } }),
     ActionIcon: ActionIcon.extend({ defaultProps: { size: "lg" } }),
-    Button: Button.extend({ defaultProps: { size: "sm", radius: "md" } }),
+    Button: Button.extend({ defaultProps: { size: "sm", radius: "md" }, classNames: { root: themeClasses.button } }),
     // A badge is never cut short: its text keeps its width (a table column grows for it; a card wraps it).
     Badge: Badge.extend({ defaultProps: { radius: "sm" }, styles: { root: { fontVariantNumeric: "tabular-nums", maxWidth: "none", flexShrink: 0 }, label: { overflow: "visible", textOverflow: "clip" } } }),
     Paper: Paper.extend({ defaultProps: { radius: "md" } }),

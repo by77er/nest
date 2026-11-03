@@ -3,13 +3,13 @@
 // pinned to the viewport's bottom.
 
 import { Badge, Button, Text, Textarea } from "@mantine/core";
-import { IconSend } from "@tabler/icons-react";
-import { useEffect, useRef, useState } from "react";
+import { IconArrowDown, IconSend } from "@tabler/icons-react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useChat, usePostChat } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { RichMessage } from "../rich/RichMessage";
-import { Bubble, ErrorState, icon, LoadingState, PinnedFooter, Prose, Row, ScrollSentinel, Stack } from "../../layout";
+import { Bubble, ChatColumn, ErrorState, FooterPill, icon, LoadingState, PinnedFooter, Prose, Row, ScrollSentinel, Stack, weight } from "../../layout";
 
 const WHO: Record<string, string> = { owner: "You", manager: "Manager", app: "The app" };
 
@@ -28,7 +28,7 @@ function Message({ m, projectId }: { m: ChatMessage; projectId: string }) {
     <Bubble side={mine ? "end" : "start"} data-sender={m.sender}>
       <Stack gap="xs">
         <Row gap="sm" justify={mine ? "flex-end" : "flex-start"}>
-          <Text fz="xs" fw="medium">
+          <Text fz="xs" fw={weight.medium}>
             {WHO[m.sender] ?? m.sender}
           </Text>
           <Text fz="xs" c="dimmed" title={exact(m.at_ms)}>
@@ -59,8 +59,19 @@ export function ChatView({ projectId }: { projectId: string }) {
   const end = useRef<HTMLDivElement>(null);
   const footer = useRef<HTMLDivElement>(null);
   const [footerHeight, setFooterHeight] = useState(0);
-  const atBottom = useRef(true);
+  // Following the end: the state marks the column (its scroll anchoring), the ref is read by observers.
+  const [following, setFollowingState] = useState(true);
+  const followingRef = useRef(true);
+  const setFollowing = useCallback((f: boolean) => {
+    followingRef.current = f;
+    setFollowingState(f);
+  }, []);
+  // Messages that arrived while reading back: the "New message" pill.
+  const [unseen, setUnseen] = useState(0);
+  const seenCount = useRef<number | null>(null);
   const count = chat.data?.length ?? 0;
+
+  const toEnd = useCallback(() => end.current?.scrollIntoView({ block: "end" }), []);
 
   // The composer docks over the page's bottom: the newest message must clear it. Its height is measured,
   // and the end sentinel keeps that much room when scrolled to.
@@ -73,47 +84,69 @@ export function ChatView({ projectId }: { projectId: string }) {
     return () => ro.disconnect();
   }, []);
 
-  // Follow the end only while the reader is there: scrolling up leaves it, reaching it (the sentinel
-  // within a line of the composer's top) rejoins it. Content growing doesn't move the page (no scroll
-  // anchoring while a chat is shown), so only the reader's scrolling changes this.
+  // Reaching the end (the sentinel within a line of the composer's top) follows it; scrolling up leaves it.
   useEffect(() => {
     let last = window.scrollY;
     const onScroll = () => {
       const el = end.current;
       const y = window.scrollY;
-      if (el && el.getBoundingClientRect().bottom <= window.innerHeight - footerHeight + 48) atBottom.current = true;
-      else if (y < last) atBottom.current = false;
+      if (el && el.getBoundingClientRect().bottom <= window.innerHeight - footerHeight + 48) {
+        if (!followingRef.current) setFollowing(true);
+        setUnseen(0);
+      } else if (y < last && followingRef.current) setFollowing(false);
       last = y;
     };
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
-  }, [footerHeight]);
+  }, [footerHeight, setFollowing]);
 
-  // New messages, and content that grows after it renders (math, images, the SVG), keep the end in view
-  // while the reader is at it.
+  // New messages: followed at the end, counted for the pill while reading back. On open, the end is
+  // scrolled to only if there's more than a line to scroll (else the header would just tuck under).
   useEffect(() => {
-    if (count && atBottom.current) end.current?.scrollIntoView({ block: "end" });
-  }, [count, footerHeight]);
+    if (!count || !footerHeight) return;
+    const before = seenCount.current;
+    seenCount.current = count;
+    if (before === null) {
+      if (document.documentElement.scrollHeight - window.innerHeight > 48) toEnd();
+      return;
+    }
+    if (count <= before) return;
+    if (followingRef.current) toEnd();
+    else setUnseen((n) => n + count - before);
+  }, [count, footerHeight, toEnd]);
+
+  // Content growing after it renders (a chip resolving, math, an image decoding) keeps the end in view
+  // while following; the sentinel anchors it, and this catches what anchoring can't.
   useEffect(() => {
     const log = end.current?.parentElement;
     if (!log) return;
     const ro = new ResizeObserver(() => {
-      if (atBottom.current) end.current?.scrollIntoView({ block: "end" });
+      if (followingRef.current && seenCount.current !== null) toEnd();
     });
     ro.observe(log);
     return () => ro.disconnect();
-  }, []);
+  }, [toEnd]);
+
+  const jump = () => {
+    setFollowing(true);
+    setUnseen(0);
+    toEnd();
+  };
 
   const send = () => {
     const t = text.trim();
     if (!t) return;
-    // Shown at once; if it isn't taken, the text comes back to the composer.
+    // Shown at once; if it isn't taken, the text comes back to the composer. Sending goes to the end,
+    // wherever you were reading: your message is there.
     post.mutate(t, { onError: () => setText((cur) => cur || t) });
     setText("");
+    setFollowing(true);
+    setUnseen(0);
+    requestAnimationFrame(toEnd);
   };
 
   return (
-    <Stack gap="xl" aria-live="polite">
+    <ChatColumn following={following}>
       {chat.isPending ? (
         <LoadingState label="Loading the chat" />
       ) : chat.isError ? (
@@ -123,7 +156,7 @@ export function ChatView({ projectId }: { projectId: string }) {
           No messages yet. Ask the manager to plan work, spec a task or explain the board.
         </Text>
       ) : (
-        <Stack gap="md">
+        <Stack gap="md" aria-live="polite">
           {chat.data.map((m) => (
             <Message key={m.seq} m={m} projectId={projectId} />
           ))}
@@ -132,6 +165,13 @@ export function ChatView({ projectId }: { projectId: string }) {
       <ScrollSentinel ref={end} footer={footerHeight} />
 
       <PinnedFooter ref={footer}>
+        {unseen > 0 && !following && (
+          <FooterPill>
+            <Button size="xs" radius="xl" leftSection={<IconArrowDown size={icon.sm} />} onClick={jump}>
+              {unseen === 1 ? "New message" : `${unseen} new messages`}
+            </Button>
+          </FooterPill>
+        )}
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -166,6 +206,6 @@ export function ChatView({ projectId }: { projectId: string }) {
           </Stack>
         </form>
       </PinnedFooter>
-    </Stack>
+    </ChatColumn>
   );
 }

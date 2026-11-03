@@ -206,7 +206,8 @@
   display: flex;
   flex-direction: column;
   gap: var(--mantine-spacing-xs);
-  padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  /* The Board card's padding (a dense Panel's `md`), all round: one card, wherever it shows. */
+  padding: var(--mantine-spacing-md);
   border: var(--nest-border);
   border-radius: var(--mantine-radius-md);
   background: var(--nest-surface);
@@ -281,13 +282,32 @@
   }
 }
 
-/* The sentinel at the log's end: scrolled to with room for the composer docked over the page's bottom. */
+/* A chat's column: messages, the sentinel, the composer. */
+.chatColumn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-xl);
+}
+
+/* Following the end: only the sentinel may anchor the scroll, so growth above (a chip resolving, math,
+   an image decoding) keeps the end where it is. Reading back, the browser anchors on what you read. */
+.chatColumn[data-following] > :not(.sentinel) {
+  overflow-anchor: none;
+}
+
+/* The sentinel at the log's end: scrolled to with room for the composer docked over the page's bottom.
+   A pixel tall, so the browser can take it as the anchor. */
 .sentinel {
+  height: 1px;
+  margin-top: calc(var(--mantine-spacing-xl) * -1);
   scroll-margin-bottom: var(--nest-chat-footer, 0px);
 }
 
-/* While a chat is shown, the browser doesn't anchor the scroll: content growing above (math, a figure
-   decoding) would move the page and read as the reader leaving the end. The chat follows the end itself. */
-:root:has(.sentinel) {
-  overflow-anchor: none;
+/* Just above the docked composer, centred. */
+.footerPill {
+  position: absolute;
+  bottom: calc(100% + var(--mantine-spacing-sm));
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2;
 }

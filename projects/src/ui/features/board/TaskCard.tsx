@@ -5,7 +5,7 @@
 import { Anchor } from "@mantine/core";
 import type { Task } from "../../api/types";
 import { AnchorLink } from "../../common/links";
-import { SortablePanel } from "../../layout";
+import { SortablePanel, weight } from "../../layout";
 import { TaskCardBody } from "./TaskCardBody";
 
 export interface TaskCardProps {
@@ -27,7 +27,7 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
           pendingAsks={pendingAsks}
           end={grip}
           title={
-            <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: task.id }} c="bright" fw="medium" fz="sm">
+            <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: task.id }} c="bright" fw={weight.medium} fz="sm">
               {task.title}
             </AnchorLink>
           }
