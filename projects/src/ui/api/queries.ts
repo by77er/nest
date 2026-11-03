@@ -3,6 +3,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
+import type { PutSecretBody } from "./types";
 import type { Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
 
 export const keys = {
@@ -15,6 +16,7 @@ export const keys = {
   manager: (id: string) => ["projects", id, "manager"] as const,
   reviews: (id: string) => ["projects", id, "reviews"] as const,
   openPrs: (id: string) => ["projects", id, "open-prs"] as const,
+  secrets: (id: string) => ["projects", id, "secrets"] as const,
   attention: (id: string) => ["projects", id, "attention"] as const,
   syncState: ["admin", "sync-state"] as const,
 };
@@ -101,6 +103,43 @@ export const useAttachPr = (id: string) => useRelationWrite(id, (v: { task: stri
 export const useDetachPr = (id: string) => useRelationWrite(id, (v: { task: string; pr: number }) => api.detachPr(id, v.task, v.pr), "The PR wasn't detached");
 export const useAddDependency = (id: string) => useRelationWrite(id, (v: { task: string; blocked_by: string }) => api.addDependency(id, v.task, { blocked_by: v.blocked_by }), "The dependency wasn't added");
 export const useRemoveDependency = (id: string) => useRelationWrite(id, (v: { task: string; blocker: string }) => api.removeDependency(id, v.task, v.blocker), "The dependency wasn't removed");
+
+export const useSecrets = (id: string) => useQuery({ queryKey: keys.secrets(id), queryFn: () => api.secrets(id), refetchInterval: POLL.reviews });
+
+/** Save a secret's settings, and its value when one is given (straight to nest; never kept by the page). */
+export function usePutSecret(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { name: string; body: PutSecretBody }) => api.putSecret(id, v.name, v.body),
+    meta: { failure: "The secret wasn't saved" },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: keys.attention(id) });
+      return qc.invalidateQueries({ queryKey: keys.secrets(id) });
+    },
+  });
+}
+
+export function useDeleteSecret(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) => api.deleteSecret(id, name),
+    meta: { failure: "The secret wasn't deleted" },
+    onSuccess: () => qc.invalidateQueries({ queryKey: keys.secrets(id) }),
+  });
+}
+
+export function useSecretRequestDone(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: string) => api.secretRequestDone(id, req),
+    meta: { failure: "It wasn't marked done" },
+    onSuccess: (_d, req) => {
+      qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "secret" && x.id === req)));
+      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
+      return qc.invalidateQueries({ queryKey: keys.attention(id) });
+    },
+  });
+}
 
 export const useSyncState = () => useQuery({ queryKey: keys.syncState, queryFn: api.syncState });
 

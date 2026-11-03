@@ -304,9 +304,11 @@ describe("the migration", () => {
     await runInDurableObject(env.PROJECT.get(id), (_o, st) => {
       const sql = st.storage.sql;
       // The shape before this step: no relation tables, a task with its one PR.
-      sql.exec("DROP TABLE task_prs");
-      sql.exec("DROP TABLE task_deps");
-      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 1);
+      // Back to before the step that made them, undoing it and every later step.
+      const step = MIGRATIONS.findIndex((m) => m.some((x) => x.includes("CREATE TABLE task_prs")));
+      for (const t of ["task_prs", "task_deps", "secrets", "secret_requests", "agent_secrets", "start_specs"]) sql.exec(`DROP TABLE IF EXISTS ${t}`);
+      if (step < MIGRATIONS.length - 1) sql.exec("ALTER TABLE settings DROP COLUMN workers_edit_workflows");
+      sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, pr_node, am_status, created_ms, updated_ms) VALUES ('tsk_old', 't', '', 'in_review', 1, 7, 'PR_x', '{"state":"enabled"}', 1, 2)`);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, created_ms, updated_ms) VALUES ('tsk_done', 't', '', 'done', 2, 8, 1, 2)`);
       migrate(st.storage, MIGRATIONS);

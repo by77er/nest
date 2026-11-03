@@ -436,8 +436,12 @@ export class ReviewDO extends DurableObject<Env> {
       let agent = (j0.agent as string | null) ?? null;
       if (!agent) {
         const labels = { project, role: "reviewer", pr: String(pr), sha, start: String(runs) };
-        agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, `${project}/review/${pr}/${sha}/${runs}`);
+        const key = `${project}/review/${pr}/${sha}/${runs}`;
+        // The project's secrets for reviewers, frozen per attempt (ProjectDO keeps them).
+        const spec = await projectStub(this.env, project).reviewerSpec(key);
+        agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, key, spec.extras);
         await directory(this.env).recordAgent({ agent, project, role: "reviewer", task: null, pr });
+        await projectStub(this.env, project).recordHolder(agent, "reviewer", spec.names);
         if (!current()) {
           this.oweStop(agent, "superseded");
           return;
@@ -446,7 +450,8 @@ export class ReviewDO extends DurableObject<Env> {
       }
       const j = current()!;
       if (j.briefed !== 1) {
-        await nest.postInbox(agent, reviewerBrief(repo, pr, sha, j.base as string | null), { requestId: `${project}/review/${pr}/${sha}/${runs}/brief` });
+        const spec = await projectStub(this.env, project).reviewerSpec(`${project}/review/${pr}/${sha}/${runs}`);
+        await nest.postInbox(agent, reviewerBrief(repo, pr, sha, j.base as string | null) + spec.brief, { requestId: `${project}/review/${pr}/${sha}/${runs}/brief` });
         if (!current()) return;
       }
       this.sql.exec("UPDATE jobs SET briefed = 1, next_ms = NULL, errors = 0, error = NULL, updated_ms = ? WHERE pr = ? AND sha = ?", Date.now(), pr, sha);

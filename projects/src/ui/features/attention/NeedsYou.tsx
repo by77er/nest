@@ -12,6 +12,7 @@ import { ago, exact } from "../../common/time";
 import { MetaItem, MetaRow, Panel, Prose, Row, Section, Stack } from "../../layout";
 import { motion } from "../../theme";
 import { AskItem } from "./AskItem";
+import { SecretRequestItem } from "./SecretRequestItem";
 
 type BlockedItem = Extract<Attention, { kind: "blocked" }>;
 
@@ -71,12 +72,12 @@ function Item({ projectId, x, first }: { projectId: string; x: Attention; first:
   return (
     <Stack gap="lg">
       {!first && <Divider />}
-      {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : <BlockedTask projectId={projectId} item={x} />}
+      {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : x.kind === "blocked" ? <BlockedTask projectId={projectId} item={x} /> : <SecretRequestItem projectId={projectId} item={x} />}
     </Stack>
   );
 }
 
-const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : `blocked-${x.task}`);
+const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.id);
 
 export function NeedsYou({ projectId }: { projectId: string }) {
   const attention = useAttention(projectId);

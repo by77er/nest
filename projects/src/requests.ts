@@ -19,6 +19,8 @@ export const CreateProject = z.strictObject({
   merge_method: z.enum(MERGE_METHODS).optional(),
 });
 export const Settings = z.strictObject({
+  // Workers' push tokens may change .github/workflows/ (README.md#secrets); needs the grant's github_push.workflows.
+  workers_edit_workflows: z.boolean().optional(),
   auto_assign: z.boolean().optional(),
   max_workers: z.number().int().min(0).max(20).optional(),
   // ReviewDO's: null (the default) for no cap on running reviews.
@@ -36,6 +38,19 @@ export const Spec = z.strictObject({
 export const AttachPr = z.strictObject({ pr: z.union([z.number().int().positive(), z.string().min(1).max(300)]) });
 /** A task this one waits on (README.md#dependencies). */
 export const AddDependency = z.strictObject({ blocked_by: z.string().regex(/^tsk_[a-z0-9]+$/, "a task id (tsk_…)") });
+/** A secret's settings, and its value when set (README.md#secrets): the value goes to nest, never stored here. */
+const Location = z.discriminatedUnion("type", [
+  z.strictObject({ type: z.literal("authorization_bearer") }),
+  z.strictObject({ type: z.literal("authorization_basic_password") }),
+  z.strictObject({ type: z.literal("header"), name: z.string().min(1).max(64) }),
+]);
+export const PutSecret = z.strictObject({
+  value: z.string().min(1).max(65536).optional(),
+  description: z.string().max(200).default(""),
+  hosts: z.array(z.string().min(1).max(253)).min(1).max(16),
+  locations: z.array(Location).min(1).max(3),
+  roles: z.array(z.enum(["worker", "manager", "reviewer"])).min(1).max(3),
+});
 export const Chat = z.strictObject({ text: z.string().min(1).max(20000) });
 export const Answer = z.strictObject({ answer: z.string().max(20000) });
 export const Cancel = z.strictObject({ reason: Text(1000).optional() });
@@ -46,6 +61,7 @@ export type CreateTaskBody = z.input<typeof CreateTask>;
 export type UpdateTaskBody = z.input<typeof UpdateTask>;
 export type AttachPrBody = z.input<typeof AttachPr>;
 export type AddDependencyBody = z.input<typeof AddDependency>;
+export type PutSecretBody = z.input<typeof PutSecret>;
 export type ChatBody = z.input<typeof Chat>;
 export type AnswerBody = z.input<typeof Answer>;
 export type CancelBody = z.input<typeof Cancel>;

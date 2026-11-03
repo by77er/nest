@@ -30,6 +30,19 @@ const dimension = (question: string) => ({
   description: question,
 });
 
+/** On /mcp/board and /mcp/task: asking the owner for a secret, never for its value (README.md#secrets). */
+const REQUEST_SECRET: ToolDef = {
+  name: "request_secret",
+  description:
+    "Ask the owner for a credential you need, never its value: `injected` for one your sandbox's requests to an API need (nest's proxy injects it; you get a placeholder), `ci` for a GitHub Actions secret the repo's CI needs (the owner adds it on GitHub). It shows in the owner's \"Needs you\".",
+  inputSchema: obj({
+    name: str("injected: lowercase, like cloudflare_api_token; ci: the Actions secret's name, like NPM_TOKEN.", 100),
+    purpose: str("What it's for, and why you can't do without it.", 1000),
+    kind: { type: "string", enum: ["injected", "ci"], description: "injected (for your sandbox's requests) or ci (for GitHub Actions)." },
+    hosts: { ...strs("injected: the API hosts it's for, like api.cloudflare.com."), maxItems: 16 },
+  }, ["name", "purpose", "kind"]),
+};
+
 export const TOOLS: Record<Server, readonly ToolDef[]> = {
   board: [
     { name: "list_tasks", description: "The project's board: every task in board order with its state, assignee and PR, and the project's settings.", inputSchema: obj({}), readOnly: true, idempotent: true },
@@ -63,6 +76,7 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
       inputSchema: obj({ task: taskId, blocked_by: str("The task it waits on (tsk_…).", 64) }, ["task", "blocked_by"]),
     },
     { name: "remove_dependency", description: "Stop a task waiting on another.", inputSchema: obj({ task: taskId, blocked_by: str("The task it waited on (tsk_…).", 64) }, ["task", "blocked_by"]), idempotent: true },
+    REQUEST_SECRET,
     {
       name: "block_task",
       description: "Mark a task blocked on the owner: a decision only they can make, or credentials or access you can't get. It shows at the top of the owner's board until they answer or you clear it. Not for anything you could resolve yourself.",
@@ -73,6 +87,7 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
   task: [
     { name: "get_task", description: "Your task: its title, body, spec, repo, the branch to push, its attached PRs, and the tasks it waits on (its dependencies) with their states.", inputSchema: obj({}), readOnly: true, idempotent: true },
     { name: "report_progress", description: "Tell the board how your task is going.", inputSchema: obj({ text: str("What you did or found.") }, ["text"]) },
+    REQUEST_SECRET,
     {
       name: "report_blocked",
       description: "Mark your task blocked on the owner: a decision only they can make, or credentials or access you can't get. It reaches the owner and your manager; the owner's answer arrives in your inbox. Not for anything you could resolve yourself.",

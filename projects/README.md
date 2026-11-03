@@ -30,7 +30,8 @@ Only the client interface. One client, `projects`, has this grant:
 - `repos` and `github.repos`: the attachable repos. Workers push to them; the manager and reviewers only read them, which `repos` covers (no `read_repos` needed);
 - `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch, the repo's "Allow auto-merge"), `pull_requests: write` and `contents: write` (auto-merge on task PRs, and reading the repo's merge settings; [below](#auto-merge)), which also cover reading PRs to attach them (`pull_requests: read`; [below](#prs)). Each call's token asks only for what that call needs. The app reads nothing else on GitHub: a PR's number, head, base, title and node id come in its webhook, and the reviewer reads the code in its sandbox;
 - `mcp_urls: [https://projects-nest.bitcru.sh/mcp/]`;
-- `max_agents` and `max_sandboxes`.
+- `max_agents` and `max_sandboxes`;
+- `secrets: {max_count, max_bytes}`, `inject_hosts` and `github_push: {workflows}`: what the owner may give its agents ([below](#secrets)).
 
 | Need | Interface |
 |---|---|
@@ -234,6 +235,27 @@ The owner's request (2026-11-03): "Tasks should be able to block other tasks."
 - **A live worker** on a task whose dependencies change (added or removed mid-flight, or one done) is told ([task changes](#task-changes)).
 - **On the board:** a card says "Waiting on N", neutral (gray, outline), since it's no one's to act on now. Hovering or focusing it lists the blockers. The drawer has a Dependencies section: what it waits on, each removable, a task picker (the switcher) to add one, and what waits on it.
 
+## Secrets
+
+The owner's rule (2026-11-02): credentials never enter sandboxes. What an agent sends itself gets its credential injected at nest's egress proxy; CI/CD secrets are the owner's to add, and agents ask for them. Built on nest's secrets and injection ([API clients](../docs/control-plane/api/clients/), its Secrets, Injection and Workflow files sections, from nest PR #125).
+
+- **Values go to nest at once:** the Worker sends a value straight to `PUT /v1/clients/self/secrets/<name>` and never hands it to a Durable Object. No table, log, answer or brief holds one; a test reads every object's tables and every answer the board reads to check. The app keeps only each secret's metadata in ProjectDO: name, description, hosts, how it's sent, roles, size, and times. Last injected comes from nest's listing.
+- **Names:** project-local, `[a-z][a-z0-9_]{0,30}`, which is also the binding's name. nest's name is project-scoped (`<project id>-<name>`), so two projects' `npm_token`s are two secrets.
+- **Injection:** each spawn's sandbox create carries `inject`, its role's bindings: the secrets given to that role, at most 16. That's where nest lets a client add bindings of its own, and every agent here has a sandbox of its own. So the role templates declare none, and no superset-and-narrow is needed. A start attempt's sandbox spec is frozen with its Idempotency-Key, so a retry sends the same request even after the secrets changed.
+- **The brief** names each placeholder (`nest-ph.<client id>.<name>.`), what it's for, its hosts and how it's sent, and suggests the variable to export it as (`NPM_TOKEN=…`). It gives names and hosts only. nest has no way for a client to set a sandbox's environment, so the placeholder is in the brief instead.
+- **When it applies:** to agents started after it's added, since bindings are fixed at a sandbox's create. A replaced value reaches sandboxes within nest's 15-minute refresh. A deleted one is gone from them then, and the delete's confirmation names the live agents that had it.
+- **Checked as nest will check:** the name, 1 to 16 hosts (a `*.` host needs two labels), 1 to 3 locations (a header must be a token, not a reserved one), at least one role, and the value's size. Also against the grant from `GET /v1/clients/self`: a host outside `inject_hosts` is refused with "the operator must widen the grant's inject_hosts", and `max_count` and `max_bytes` are shown and enforced. The page shows the grant's hosts and how many of its secrets the app's projects use.
+- **Requests:** `request_secret {name, purpose, kind, hosts?}` on `/mcp/task` and `/mcp/board` makes a "Needs you" item. It never carries a value.
+  - **`ci`** (a GitHub Actions secret) links to the repo's Actions secrets form, the name given, and the owner marks it added.
+  - **`injected`** opens the Secrets form, prefilled with its name and hosts. Saving a secret of that name finishes it.
+  - Either way, the requesting agent is told.
+- **The prompts:** never ask for a secret's value, nor write one into a file, a commit or a log. A placeholder isn't a secret. Ask with `request_secret`.
+- **"Workers may change CI workflows"** (Settings; off by default): when on, a worker's sandbox create carries `github_push: {workflows: true}`, so its push token may change `.github/workflows/`. The manager and reviewers never get it. It needs the grant's `github_push.workflows`: turning it on without that is refused, and the toggle says so. The security note says that a pushed workflow runs with the repo's Actions secrets before review, so CI secrets belong in an [environment with required reviewers](https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment).
+- **The Secrets page** (between Reviews and Settings):
+  - a table of name, description, hosts, how it's sent, roles, updated and last injected;
+  - adding and editing in a Sheet: a service preset (Cloudflare API, npm, PyPI upload, GitHub API with a note to prefer nest's brokered GitHub, or custom), the value masked and write-once (an edit replaces it only through "Set a new value"), the hosts, the format and the roles (workers by default);
+  - deleting is confirmed, naming who loses it.
+
 ## The UI
 
 **Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `attention`, `settings`, `admin`, `trace`), each component next to its test. `src/main.tsx` mounts it.
@@ -302,3 +324,4 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 4. `PUT /v1/clients/self/webhook {url: https://projects-nest.bitcru.sh/hooks/nest}` (the app does this at its first start), and store the secret as `NEST_WEBHOOK_SECRET`.
 5. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github` (content type `application/json`), with a new secret, stored as `GITHUB_WEBHOOK_SECRET` (`wrangler secret put`). Subscribe the App to the `pull_request` and `check_run` events. The App needs the repository permissions the grant names (Checks: read and write, Administration: read and write, Metadata: read) and Pull requests (read at least), without which GitHub doesn't offer the `pull_request` event. Its installation must cover each attached repo. For auto-merge, the App also needs Contents: read and write, and Pull requests: read and write.
 6. **Auto-merge's permissions (2026-11-02):** add `pull_requests: write` and `contents: write` to the live client's `github.permissions`. Use `PATCH /v1/admin/clients/<id>`, which takes the grant ([clients doc](../docs/control-plane/api/clients/)). Until then, turning auto-merge on writes the repo setting, but each PR's auto-merge fails with nest's 403, recorded on its task.
+7. **Secrets (2026-11-02, after nest #125):** give the live client's grant `secrets: {max_count, max_bytes}` and the `inject_hosts` its projects may need (e.g. `api.cloudflare.com`, `registry.npmjs.org`), and `github_push: {workflows: true}` only if workers may edit CI. Use `PATCH /v1/admin/clients/<id>`. Until then, the Secrets page shows no hosts and saving is refused.

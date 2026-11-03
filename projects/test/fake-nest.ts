@@ -56,7 +56,13 @@ export class FakeNest {
   githubApp: { app_id: number; app_slug: string } | null = { app_id: GH_APP_ID, app_slug: "nest-test" };
   readonly calls: Call[] = [];
   readonly agents = new Map<string, FakeAgent>();
-  readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean }>();
+  readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean; inject?: { name: string; secret: string; hosts: string[] }[]; github_push?: { workflows: boolean } | null }>();
+  /** The client's grant, in the parts the app reads (`GET /v1/clients/self`). */
+  grant: { inject_hosts: string[]; secrets: { max_count: number; max_bytes: number }; github_push?: { workflows: boolean } } = {
+    inject_hosts: ["api.cloudflare.com", "registry.npmjs.org", "*.example.com"], secrets: { max_count: 50, max_bytes: 4096 }, github_push: { workflows: true },
+  };
+  /** The client's secrets, values and all: nest's, the only place a value may be. */
+  readonly secrets = new Map<string, { value: string; description: string | null; created_ms: number; updated_ms: number; last_injected_ms: number | null }>();
   readonly inbox: { agent: string; text: string; from?: string; request_id?: string }[] = [];
   readonly catalog = new Map<string, unknown>();
   readonly answers: { agent: string; ask: string; answer: string }[] = [];
@@ -151,7 +157,15 @@ export class FakeNest {
     let m: RegExpMatchArray | null;
     const r = `${req.method} ${u.pathname}`;
     if (r === "POST /v1/sandboxes") {
-      const s = { sandbox: id("sbx_"), owner: CLIENT, labels: call.body.labels ?? {}, ended: false };
+      // A client's own bindings and workflows, within its grant (docs/control-plane/api/clients/#injection).
+      const inject = (call.body.inject ?? []) as { name: string; secret: string; hosts: string[] }[];
+      for (const b of inject) {
+        const outside = b.hosts.filter((h) => !this.grant.inject_hosts.includes(h) && !this.grant.inject_hosts.some((a) => a.startsWith("*.") && h.endsWith(a.slice(1))));
+        if (outside.length) return nestErr(403, "forbidden", `inject hosts ${outside.join(", ")} are outside the grant`);
+      }
+      if (inject.length > 16) return nestErr(400, "invalid", "at most 16 bindings");
+      if (call.body.github_push?.workflows && !this.grant.github_push?.workflows) return nestErr(403, "forbidden", "github_push.workflows is outside the grant");
+      const s = { sandbox: id("sbx_"), owner: CLIENT, labels: call.body.labels ?? {}, ended: false, inject, github_push: call.body.github_push ?? null };
       this.sandboxes.set(s.sandbox, s);
       return json(202, { sandbox: s.sandbox, cell: call.body.cell, labels: s.labels, host: null });
     }
@@ -221,6 +235,25 @@ export class FakeNest {
       if (m[2] !== "projects") return nestErr(403, "forbidden", `${m[2]} is not your namespace (projects)`);
       this.catalog.set(`${m[1]}/${m[2]}/${m[3]}`, call.body);
       return json(200, { ok: true });
+    }
+    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: this.grant, created_ms: 1 });
+    if (r === "GET /v1/clients/self/secrets") {
+      return json(200, { secrets: [...this.secrets].sort(([a], [b]) => a.localeCompare(b)).map(([name, x]) => ({ name, description: x.description, size: new TextEncoder().encode(x.value).length, created_ms: x.created_ms, updated_ms: x.updated_ms, last_injected_ms: x.last_injected_ms })) });
+    }
+    if ((m = u.pathname.match(/^\/v1\/clients\/self\/secrets\/([^/]+)$/))) {
+      const name = decodeURIComponent(m[1]!);
+      if (!/^[a-z][a-z0-9_-]{0,62}$/.test(name)) return nestErr(400, "invalid", "a secret's name is [a-z][a-z0-9_-]{0,62}");
+      if (req.method === "DELETE") return this.secrets.delete(name) ? json(200, { ok: true }) : nestErr(404, "not_found", "no such secret");
+      if (req.method === "PUT") {
+        const { value, description } = call.body as { value: string; description?: string };
+        const size = new TextEncoder().encode(value).length;
+        if (size > this.grant.secrets.max_bytes) return nestErr(403, "forbidden", "larger than the grant's secrets.max_bytes");
+        const had = this.secrets.get(name);
+        if (!had && this.secrets.size >= this.grant.secrets.max_count) return nestErr(403, "forbidden", "the grant's secrets.max_count is reached");
+        const now = Date.now();
+        this.secrets.set(name, { value, description: description ?? null, created_ms: had?.created_ms ?? now, updated_ms: now, last_injected_ms: had?.last_injected_ms ?? null });
+        return json(200, { name, description: description ?? null, size, created_ms: had?.created_ms ?? now, updated_ms: now, last_injected_ms: had?.last_injected_ms ?? null });
+      }
     }
     if (r === "POST /v1/clients/self/github-token") {
       // Within the grant (README.md#how-it-uses-nest), as nest checks it: the repo and each permission.
