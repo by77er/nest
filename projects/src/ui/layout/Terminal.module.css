@@ -96,10 +96,11 @@
   min-width: 0;
 }
 
-/* On touch, an assistant's text is on 24 px lines, so a link in it is an inline target of WCAG 2.5.8's
-   size (the touch rule's running-text exception keeps it on its line); the rows around it keep theirs. */
+/* On touch, a paragraph or item that holds a link is on 24 px lines, so the link is an inline target of
+   WCAG 2.5.8's size (the touch rule's running-text exception keeps it on its line). Everything else, a
+   fence and a table included, keeps the terminal's 20 px pitch. */
 @media (pointer: coarse) {
-  .md {
+  .md :is(p, li):has(a) {
     line-height: var(--mantine-line-height-lg);
   }
 }

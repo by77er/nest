@@ -2,6 +2,7 @@
 // layout primitives mark the frame, the measures, the panels and the nav (data-ds attributes).
 import { data } from "../fixtures/projects/demo.mjs";
 import { countTraffic, tabKeepCheck } from "../trace-tabs.mjs";
+import { proseProblems } from "../trace-prose.mjs";
 
 const menu = async (p) => p.getByRole("button", { name: "Open the menu" }).click();
 const DESKTOP = [1440, 1280];
@@ -73,26 +74,9 @@ async function traceCheck(page) {
       .filter((v) => v.clientWidth > 0 && v.scrollWidth > v.clientWidth + 1)
       .map((v) => `the trace's log scrolls sideways: ${v.scrollWidth} px of content in ${v.clientWidth} px`),
   );
-  // An assistant's Markdown (README.md#the-live-trace): mono at the terminal's one size throughout; only a fence
-  // or a table wider than the trace scrolls, inside itself; nothing else spills past its line.
-  problems.push(...(await page.evaluate(() => {
-    const out = [];
-    for (const prose of document.querySelectorAll("[data-ds=terminal] [data-ds=term-prose]")) {
-      const term = prose.closest("[data-ds=terminal]");
-      const size = getComputedStyle(term).fontSize;
-      const right = prose.getBoundingClientRect().right + 1;
-      for (const el of prose.querySelectorAll("*")) {
-        const cs = getComputedStyle(el);
-        if (!/JetBrains Mono/.test(cs.fontFamily)) out.push(`trace Markdown <${el.tagName.toLowerCase()}> isn't mono (${cs.fontFamily})`);
-        if (cs.fontSize !== size) out.push(`trace Markdown <${el.tagName.toLowerCase()}> is ${cs.fontSize}, not the terminal's ${size}`);
-        const frame = el.closest("pre, [data-md=table]");
-        if (frame && frame !== el) continue;
-        if (el.getBoundingClientRect().width > 0 && el.getBoundingClientRect().right > right) out.push(`trace Markdown <${el.tagName.toLowerCase()}> spills past the trace's line`);
-        if ((el.matches("pre, [data-md=table]")) && el.scrollWidth > el.clientWidth + 1 && !/auto|scroll/.test(cs.overflowX)) out.push(`a wide trace ${el.tagName === "PRE" ? "fence" : "table"} doesn't scroll in itself`);
-      }
-    }
-    return out;
-  })));
+  // An assistant's Markdown (README.md#the-live-trace): mono at the terminal's one size, nothing but a
+  // fence or a table scrolling sideways, inside itself (trace-prose.mjs; selftest.mjs plants each failure).
+  problems.push(...(await page.evaluate(proseProblems)));
   const cdp = await page.context().newCDPSession(page);
   await cdp.send("DOM.enable");
   await cdp.send("CSS.enable");
