@@ -277,6 +277,8 @@ npm run dev    # the page and the API in workerd; without NEST_CLIENT_TOKEN the 
 npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testing Library)
 ```
 
+**Spawning:** a worker may run Claude Code's own subagents (the `Agent` tool, through nest's `subagents` capability). They live in its brain and reach the same sandbox through its hands, with the same grant and taint. No role gets nest-level spawning (`spawn_agent`, `fork_sandbox`): the app starts every agent itself, one worker per task (`test/catalog-roles.test.ts`).
+
 ## Setup (the operator's)
 
 1. Create the client: `POST /v1/admin/clients {name: "projects", grant}`, and store its token as the Worker's secret `NEST_CLIENT_TOKEN`.
