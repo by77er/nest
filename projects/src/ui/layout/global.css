@@ -28,26 +28,77 @@ body {
   }
 }
 
-/* On touch, every control outside running text is at least the 44 px target each way, as layout (never
-   an overlay over a neighbour): links, buttons, icon buttons, a transcript's rows. A link inside a
-   sentence keeps the line's height (WCAG 2.5.8's inline exception, the same thing reachable elsewhere). */
+/* On touch, every control is the 44 px target (WCAG 2.5.8's inline exception aside: a link in a
+   sentence, marked data-inline by its component, keeps its line).
+   - A boxed control (a button, an icon or close button, a tab, a nav row, a field) is that size itself.
+   - A text control (a link, a link-styled button, a transcript's row) grows its hit box, not its line:
+     padding to 44 px around its line with an equal negative margin, so layout, rhythm and proximity
+     are as with a mouse; it's lifted over the text it reaches into (its own result, its caption).
+     `hit-overlap` guards it against reaching a neighbouring control. */
 @media (pointer: coarse) {
-  a[href]:not(:is(p, li, blockquote, dd, h1, h2, h3, h4, h5, h6) *),
-  button,
-  [role="button"],
-  button:is(.mantine-CloseButton-root, .mantine-ActionIcon-root) {
+  :is(button, [role="button"]):not(.mantine-Anchor-root, [data-ds="term-line"]),
+  a[href]:is(.mantine-Button-root, [data-ds="nav-row"]) {
     min-height: var(--nest-hit-touch);
     min-width: var(--nest-hit-touch);
   }
 
-  /* A field is the target's height too (a one-line answer, a select). */
   .mantine-Input-input {
     min-height: var(--nest-hit-touch);
   }
 
-  /* A text link standing on its own (a title, a repo, a PR number) centres in its room. */
-  :is(a, button).mantine-Anchor-root:not(:is(p, li, blockquote, dd) *) {
-    display: inline-flex;
-    align-items: center;
+  :is(a[href], button.mantine-Anchor-root):not([data-inline], .mantine-Button-root, [data-ds="nav-row"], [data-ds="badge-anchor"], [data-ds="card-title"]),
+  button[data-ds="term-line"] {
+    --nest-hit-pad: max(0px, calc((var(--nest-hit-touch) - 1lh) / 2));
+    padding-block: var(--nest-hit-pad);
+    margin-block: calc(var(--nest-hit-pad) * -1);
+    position: relative;
+    z-index: 1;
+  }
+
+  /* A short link (a PR's number) is the target's width too, the same way; one that wraps (a long repo
+     name) is one box, not ragged line fragments. */
+  :is(a[href], button.mantine-Anchor-root):not([data-inline], .mantine-Button-root, [data-ds="nav-row"], [data-ds="badge-anchor"], [data-ds="card-title"]) {
+    padding-inline: 0.625rem;
+    margin-inline: -0.625rem;
+    display: inline-block;
+  }
+}
+
+/* A data table (TableFrame): words wrap whole (never "thumbn|ails"), and the first column, the thing a
+   row is about, keeps room to read; the frame scrolls sideways instead. */
+[data-ds="table-frame"] :is(td, th),
+[data-ds="table-frame"] :is(td, th) * {
+  overflow-wrap: break-word;
+}
+
+[data-ds="table-frame"] :is(td, th):first-child {
+  min-width: 12rem;
+}
+
+/* A transcript on touch (Terminal): each tool call (its row, its result, its expand row) stays one tight
+   group, and the groups move apart instead, by the room their rows' 44 px hit boxes need; the rows'
+   hit boxes never reach out of the terminal. */
+@media (pointer: coarse) {
+  [data-ds="terminal"] [data-kind="tool"] {
+    margin-block: calc((var(--nest-hit-touch) - 1lh) / 2);
+  }
+
+  /* An expanded result's top "(collapse)" row sits right under its call: two rows to tap, a 44 px
+     pitch apart (the result itself stays bound to its call below). */
+  [data-ds="terminal"] [data-slot="more"][data-at="top"] {
+    margin-top: calc(var(--nest-hit-touch) - 1lh - var(--mantine-spacing-2xs));
+  }
+
+  [data-ds="terminal"] {
+    overflow: clip;
+    overflow-clip-margin: 4px;
+  }
+}
+
+/* Rows of controls stacked in a block (a project's title, then its repo): on touch, a 44 px pitch, so
+   each row's target is its own without overlapping the next. Text-only neighbours never need this. */
+@media (pointer: coarse) {
+  [data-touch-pitch] {
+    row-gap: calc(var(--nest-hit-touch) - 1.125rem) !important;
   }
 }

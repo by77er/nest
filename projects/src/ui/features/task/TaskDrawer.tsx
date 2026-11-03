@@ -1,10 +1,10 @@
 // A task, opened from the board (`?task=` in the URL): its text, its spec, its history and what the
 // owner can do to it.
 
-import { Badge } from "@mantine/core";
+import { Badge, Tooltip } from "@mantine/core";
 import { IconRobot, IconTimeline } from "@tabler/icons-react";
 import { useTask } from "../../api/queries";
-import { EmptyState, ErrorState, LoadingState, MetaItem, MetaRow, Notice, Prose, Row, Section, Sheet, Stack } from "../../layout";
+import { EmptyState, ErrorState, LoadingState, MetaItem, MetaRow, Notice, Prose, Row, Section, Sheet, Stack, TriggerBadge } from "../../layout";
 import { ago, exact } from "../../common/time";
 import { StateBadge } from "../board/StateBadge";
 import { WaitingBadge } from "../board/WaitingBadge";
@@ -39,10 +39,13 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
               <Row gap="xs">
                 <StateBadge state={t.state} />
                 <WaitingBadge task={t} size="md" />
+                {/* A security signal: its meaning is reachable everywhere, a phone included. */}
                 {t.tainted && (
-                  <Badge color="gray" variant="outline">
-                    Tainted
-                  </Badge>
+                  <Tooltip label="A tainted session wrote to this task (it read untrusted content)" withArrow multiline maw="var(--nest-side-panel)">
+                    <TriggerBadge color="gray" variant="outline" data-marker="tainted" aria-label="Tainted: a tainted session wrote to this task (it read untrusted content)">
+                      Tainted
+                    </TriggerBadge>
+                  </Tooltip>
                 )}
               </Row>
               <MetaRow>

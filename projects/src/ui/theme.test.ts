@@ -179,9 +179,23 @@ describe("contrast, in both schemes", () => {
   it.each(schemes)("%s: a light badge's text on its tint, roles and gray", (s) => {
     for (const r of [...ROLES, "gray"] as const) {
       const tuple = full.colors[r]!;
-      // Mantine 9's light variant: shade 9 on shade 1 in light; shade 0 on shade 9 darkened by half in dark.
-      const [fg, bg] = s === "light" ? [tuple[9]!, tuple[1]!] : [tuple[0]!, darken(tuple[9]!, 0.5)];
+      // The tint is Mantine 9's: shade 1 in light, shade 9 darkened by half in dark. A role's text is its
+      // text shade (the resolver below); gray keeps Mantine's (shade 9 in light, 0 in dark).
+      const bg = s === "light" ? tuple[1]! : darken(tuple[9]!, 0.5);
+      const fg = r === "gray" ? (s === "light" ? tuple[9]! : tuple[0]!) : palette[r][roleText[s][r]];
       expect(contrast(fg, bg), r).toBeGreaterThanOrEqual(AA);
+    }
+  });
+
+  it.each(["subtle", "light"] as const)("a %s role (a subtle Delete, a light Failed) is the role's text shade, never shade 0 in dark", (variant) => {
+    for (const r of ROLES) {
+      const v = full.variantColorResolver({ color: r, theme: full, variant });
+      expect(v.color, `${variant} ${r}`).toBe(`var(--mantine-color-${r}-text)`);
+      for (const s of schemes) {
+        // That variable is the role's text shade in each scheme: 7 (8 for warning) in light, 3 in dark.
+        expect(vars[s][`--mantine-color-${r}-text`], `${s} ${r}`).toBe(palette[r][roleText[s][r]]);
+        expect(vars[s][`--mantine-color-${r}-text`]).not.toBe(palette[r][0]);
+      }
     }
   });
 

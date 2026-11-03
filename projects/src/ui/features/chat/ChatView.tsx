@@ -71,8 +71,8 @@ export function ChatView({ projectId }: { projectId: string }) {
   const seenCount = useRef<number | null>(null);
   const count = chat.data?.length ?? 0;
 
-  // To the end, only if it isn't already in view above the composer: a short chat that fits never
-  // scrolls (its header stays clear of the top bar).
+  // To the end: exactly enough that the newest message clears the composer (the sentinel, the column's
+  // gap below it, meets the composer's top), and nothing when it already does.
   const footerRef = useRef(0);
   const toEnd = useCallback(() => {
     const el = end.current;
@@ -110,16 +110,14 @@ export function ChatView({ projectId }: { projectId: string }) {
     return () => window.removeEventListener("scroll", onScroll);
   }, [footerHeight, setFollowing]);
 
-  // New messages: followed at the end, counted for the pill while reading back. On open, the end is
-  // scrolled to only if there's more to scroll than the page's header and a line: a short chat stays
-  // put with its header in view, never tucked under the top bar.
+  // New messages: followed at the end, counted for the pill while reading back. On open, the same:
+  // scrolled exactly enough to clear the newest message above the composer, and no more.
   useEffect(() => {
     if (!count || !footerHeight) return;
     const before = seenCount.current;
     seenCount.current = count;
     if (before === null) {
-      const header = document.querySelector("[data-ds=page-header]")?.getBoundingClientRect().bottom ?? 0;
-      if (document.documentElement.scrollHeight - window.innerHeight > header + 48) toEnd();
+      toEnd();
       return;
     }
     if (count <= before) return;

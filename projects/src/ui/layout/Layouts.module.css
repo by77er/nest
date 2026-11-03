@@ -41,6 +41,9 @@
   .grip {
     min-width: var(--nest-hit-touch);
     min-height: var(--nest-hit-touch);
+    /* Above the title's grown hit box, which reaches down beside it. */
+    position: relative;
+    z-index: 2;
   }
 }
 
@@ -96,7 +99,10 @@
 
 @media (pointer: coarse) {
   .badgeAnchor {
-    min-height: var(--nest-hit-touch);
-    min-width: var(--nest-hit-touch);
+    --nest-hit-pad: calc((var(--nest-hit-touch) - 1.25rem) / 2);
+    padding-block: var(--nest-hit-pad);
+    margin-block: calc(var(--nest-hit-pad) * -1);
+    position: relative;
+    z-index: 1;
   }
 }

@@ -52,6 +52,8 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
       <p><button class="chip ${bad.tap ? "reach" : ""}">Waiting</button> <button class="chip">Detach</button></p>
       <p class="prose">A sentence with <a href="#">an inline link</a> in it, on a 24 px line: the inline exception.</p>
       ${bad.tiny ? '<div><button class="tiny">Tiny</button></div>' : ""}
+      ${bad.crowded ? '<div><a href="#" style="display: block; min-height: 0; padding: 0">One</a><a href="#" style="display: block; min-height: 0; padding: 0">Two</a></div>' : ""}
+      ${bad.covered ? '<div style="position: relative"><button class="chip">Hidden</button><div style="position: absolute; inset: 0; background: rgba(255,255,255,0.01)"></div></div>' : ""}
       <div data-ds="rich">${bad.heading ? "<h2>Plan</h2>" : "<h4>Plan</h4>"}<p>The message's text.</p><div data-ds="figure-canvas"></div></div>
     </div>
   </div></div>
@@ -70,7 +72,8 @@ assert.deepEqual(failing(clean), [], `the clean page fails: ${JSON.stringify(cle
 // On touch: two neighbouring controls pass; one whose ::before reaches over the other takes its taps.
 { const t = await run({}, true); assert.deepEqual(failing(t), [], `the clean page fails on touch: ${JSON.stringify(t["hit-size"])}`); }
 const reach = await run({ tap: true }, true);
-assert.deepEqual(failing(reach), ["hit-overlap"], `a hit area over a neighbour: ${JSON.stringify(reach)}`);
+// (The neighbour is then covered at its centre too: hit-size says so.)
+assert.deepEqual(failing(reach), ["hit-overlap", "hit-size"], `a hit area over a neighbour: ${JSON.stringify(reach)}`);
 assert.match(reach["hit-overlap"][0], /a tap on <button> "Detach" at \d+,\d+ lands on <button> "Waiting"/);
 // Without touch, hit areas aren't checked.
 assert.deepEqual(failing(await run({ tap: true })), []);
@@ -80,6 +83,14 @@ const tiny = await run({ tiny: true }, true);
 assert.deepEqual(failing(tiny), ["hit-size"], `a small target: ${JSON.stringify(tiny)}`);
 assert.match(tiny["hit-size"][0], /<button> "Tiny": \d+ of \d+ taps in its 44 px square/);
 assert.deepEqual(failing(await run({ tiny: true })), [], "without touch, sizes aren't checked");
+// Two links stacked 20 px apart: closer than 24 px (WCAG 2.5.8's spacing), each too small to tap.
+const crowded = await run({ crowded: true }, true);
+assert.deepEqual(failing(crowded), ["hit-size"], `crowded links: ${JSON.stringify(crowded)}`);
+assert.match(crowded["hit-size"][0], /<a> "One": 20 px from <a> "Two", closer than 24/);
+// A button covered at its centre by a plain element can't be tapped at all.
+const covered = await run({ covered: true }, true);
+assert.deepEqual(failing(covered), ["hit-size"], `a covered button: ${JSON.stringify(covered)}`);
+assert.match(covered["hit-size"][0], /<button> "Hidden": covered at its centre by <div>/);
 // An inline link on a line under 24 px fails too.
 const tight = await run({ tightLine: true }, true);
 assert.deepEqual(failing(tight), ["hit-size"], `a tight line: ${JSON.stringify(tight)}`);
