@@ -31,15 +31,16 @@ export const ChatLog = forwardRef<HTMLDivElement, { children: ReactNode; onScrol
     scroller.addEventListener("scroll", onScroll, { passive: true });
     return () => scroller.removeEventListener("scroll", onScroll);
   }, [phone, onScroll]);
-  // From `sm` up: as tall as fits, so the page itself never scrolls (at least 12rem): the viewport less
-  // everything else on the page (measured to the page's bottom, never by resetting the log, which would
-  // lose its scroll). Following, it stays at the end as it's resized.
+  // From `sm` up: exactly as tall as fits (at least 12rem), so the page itself never scrolls and the
+  // composer sits at the viewport's bottom even when the chat is short: the viewport less everything
+  // else on the page (measured to the page's bottom, never by resetting the log, which would lose its
+  // scroll). Following, it stays at the end as it's resized.
   const followingRef = useRef(following);
   followingRef.current = following;
   useLayoutEffect(() => {
     const d = el.current;
     if (!d || phone) {
-      if (d) d.style.maxHeight = "";
+      if (d) d.style.height = "";
       return;
     }
     const fit = () => {
@@ -47,8 +48,8 @@ export const ChatLog = forwardRef<HTMLDivElement, { children: ReactNode; onScrol
       if (!page) return;
       const others = page.getBoundingClientRect().bottom + window.scrollY - d.getBoundingClientRect().height;
       const max = `${Math.max(192, Math.floor(window.innerHeight - others))}px`;
-      if (d.style.maxHeight !== max) {
-        d.style.maxHeight = max;
+      if (d.style.height !== max) {
+        d.style.height = max;
         if (followingRef.current) d.scrollTop = d.scrollHeight;
       }
     };
