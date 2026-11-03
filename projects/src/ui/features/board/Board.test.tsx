@@ -22,6 +22,15 @@ const EXPECTED: Record<TaskState, { column: string; role: "gray" | "primary" | "
 const column = (name: string) => screen.getByRole("region", { name });
 
 describe("the board", () => {
+  it("a card's title is the label weight, 500: a weight by name renders, not dropped", async () => {
+    const api = new FakeApi();
+    api.tasks = [task({ title: "Weighed", state: "ready" })];
+    renderApp("/projects/prj_one/board", api);
+    const card = await screen.findByRole("article", { name: "Weighed" });
+    const title = within(card).getByRole("link", { name: "Weighed" });
+    expect(getComputedStyle(title).fontWeight).toBe("500");
+  });
+
   it("puts every state in its column, its badge in its semantic color, cancelled behind the switch", async () => {
     const api = new FakeApi();
     api.tasks = (Object.keys(EXPECTED) as TaskState[]).map((state) => task({ title: `a ${state} task`, state }));

@@ -6,12 +6,12 @@ import { IconRefresh } from "@tabler/icons-react";
 import { useSync, useSyncState } from "../../api/queries";
 import type { SyncState } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { ErrorState, icon, LoadingState, Notice, Page, PageHeader, Panel, Section, Stack } from "../../layout";
+import { ErrorState, icon, LoadingState, Notice, Page, PageHeader, Panel, Section, Stack, weight } from "../../layout";
 
 function Written({ s }: { s: Pick<SyncState, "written" | "repos"> }) {
   return (
     <Stack gap="sm">
-      <Text fz="md" fw="medium">
+      <Text fz="md" fw={weight.medium}>
         Wrote {s.written.length} {s.written.length === 1 ? "entry" : "entries"}
       </Text>
       <List fz="md" spacing="xs" listStyleType="none">

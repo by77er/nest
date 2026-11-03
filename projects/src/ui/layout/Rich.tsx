@@ -106,9 +106,31 @@ export function Bubble({ side, children, ...data }: { side: "start" | "end" | "n
 }
 
 /**
+ * A chat's column: its messages, then the end sentinel, then the composer, `xl` apart. While `following`
+ * (the reader is at the end), nothing in it but the sentinel can anchor the scroll, so content growing
+ * above keeps the end in place; otherwise the browser's own anchoring holds the reader's line.
+ */
+export function ChatColumn({ following, children }: { following: boolean; children: ReactNode }) {
+  return (
+    <div className={classes.chatColumn} data-following={following || undefined} data-ds="chat-column">
+      {children}
+    </div>
+  );
+}
+
+/**
  * The end of a scrolling log: scrolled into view with room for what docks over the bottom (`footer`,
  * its height in px, measured by the caller), so the newest message is never under the composer.
  */
 export const ScrollSentinel = forwardRef<HTMLDivElement, { footer: number }>(function ScrollSentinel({ footer }, ref) {
   return <div ref={ref} className={classes.sentinel} style={{ ["--nest-chat-footer" as string]: `${footer}px` }} data-ds="scroll-sentinel" />;
 });
+
+/** A pill floating just above a docked footer, centred: "New message", while reading back. */
+export function FooterPill({ children }: { children: ReactNode }) {
+  return (
+    <div className={classes.footerPill} data-ds="footer-pill">
+      {children}
+    </div>
+  );
+}

@@ -8,7 +8,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useProjects } from "../../api/queries";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
-import { CardGrid, EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Page, PageHeader, Panel, Row, Stack } from "../../layout";
+import { CardGrid, EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Page, PageHeader, Panel, Row, Stack, weight } from "../../layout";
 import { CreateProjectForm } from "./CreateProjectForm";
 
 export function ProjectsPage() {
@@ -46,7 +46,7 @@ export function ProjectsPage() {
             <Panel key={p.id} component="article" aria-label={p.name}>
               <Stack gap="sm">
                 <Row gap="sm" justify="space-between" wrap="nowrap">
-                  <AnchorLink to="/projects/$projectId/board" params={{ projectId: p.id }} search={{}} c="bright" fw="bold" fz="lg">
+                  <AnchorLink to="/projects/$projectId/board" params={{ projectId: p.id }} search={{}} c="bright" fw={weight.bold} fz="lg">
                     {p.name}
                   </AnchorLink>
                   {p.needs_you > 0 && (

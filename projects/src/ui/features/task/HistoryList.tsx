@@ -5,7 +5,7 @@ import { Anchor, Badge, Code, Text, Timeline } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import type { HistoryRow } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { MetaItem, MetaRow, Row, Stack } from "../../layout";
+import { MetaItem, MetaRow, Row, Stack, weight } from "../../layout";
 import { actorLabel, detailOf, summarize } from "./history";
 
 function Entry({ h }: { h: HistoryRow }) {
@@ -16,7 +16,7 @@ function Entry({ h }: { h: HistoryRow }) {
   return (
     <Stack gap="xs">
       <Row gap="sm">
-        <Text fz="md" fw="medium">
+        <Text fz="md" fw={weight.medium}>
           {summarize(h)}
         </Text>
         {h.tainted && (

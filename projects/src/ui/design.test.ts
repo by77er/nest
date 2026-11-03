@@ -4,7 +4,7 @@
 // - no raw lengths (px, rem, em, vh, vw, %) and no literal colors (hex, rgb, hsl);
 // - colors only by semantic role, gray, `dimmed` or `bright`, without a shade (a shade breaks dark mode);
 // - spacing only by the scale's names, and sizes only by token names or variables;
-// - weights only by name;
+// - weights only by the theme's names, as values (`fw={weight.medium}`);
 // - no layout containers of Mantine's own: those are the primitives' (Stack, Row, Panel, Page, …).
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
@@ -44,7 +44,11 @@ export function offences(file: string, text: string): string[] {
   for (const v of values(text, "c|color|bg|bd")) if (v.numeric || !COLORS.test(v.value)) at(`a color ${v.prop}="${v.value}"`);
   for (const v of values(text, SPACING_PROPS)) if (v.numeric || !SPACE.has(v.value)) at(`a spacing ${v.prop}="${v.value}"`);
   for (const v of values(text, SIZE_PROPS)) if (v.numeric || !(SIZE_NAMES.has(v.value) || /^var\(--[\w-]+\)$/.test(v.value) || /^h[1-6]$/.test(v.value))) at(`a size ${v.prop}="${v.value}"`);
-  for (const v of values(text, "fw")) if (v.numeric || !/^(regular|medium|bold)$/.test(v.value)) at(`a weight fw="${v.value}"`);
+  // Weights by the theme's names as values (`fw={weight.medium}`): Mantine passes a string through as CSS,
+  // so `fw="medium"` is no weight at all and `fw="bold"` is 700.
+  for (const m of text.matchAll(/\bfw=(\{[^}]*\}|"[^"]*"|'[^']*')/g)) {
+    if (!/^\{[^"'\d]*\}$/.test(m[1]!) || !/weight\.(regular|medium|bold)\b/.test(m[1]!)) at(`a weight fw=${m[1]}`);
+  }
   for (const m of text.matchAll(/import\s*\{([^}]*)\}\s*from\s*["']@mantine\/core["']/g)) {
     for (const name of m[1]!.split(",").map((s) => s.trim().split(/\s+as\s+/)[0]!.replace(/^type\s+/, ""))) if (LAYOUT.includes(name)) at(`Mantine's ${name} (use the layout primitives)`);
   }
@@ -73,13 +77,16 @@ describe("the design rule", () => {
       `<Text mt={{ base: "lg", sm: 4 }} />`,
       `<Icon size={14} />`,
       `<Text fw={600} />`,
+      `<Text fw="medium" />`,
+      `<Text fw="bold" />`,
       `import { Group, Text } from "@mantine/core";`,
     ];
     for (const b of bad) expect(offences("x.tsx", b), b).not.toEqual([]);
     const good = [
       `<Stack gap="2xl" />`,
       `<Row gap="xs" py="lg" mt={{ base: "sm", md: "xl" }} />`,
-      `<Text c="dimmed" fz="xs" fw="medium" />`,
+      `<Text c="dimmed" fz="xs" fw={weight.medium} />`,
+      `<Text fw={on ? weight.bold : weight.regular} />`,
       `<Badge color="warning" variant="light" size="sm" />`,
       `<IconX size={icon.md} />`,
       `<Tooltip maw="var(--nest-side-panel)" />`,

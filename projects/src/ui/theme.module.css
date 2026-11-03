@@ -1,0 +1,8 @@
+/* Theme-wide component styles that need a media query (the theme's `styles` can't carry one). */
+
+/* On touch, every Button is at least the 44 px target (Save, Send, the pills, compact ones too). */
+@media (pointer: coarse) {
+  .button {
+    min-height: var(--nest-hit-touch);
+  }
+}
