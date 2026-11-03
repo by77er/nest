@@ -32,6 +32,8 @@ const NOT_ADMIN = {
     ...["GET", "PUT", "DELETE"].flatMap((m) => ["templates", "capabilities"].map((k) => `${m} /v1/catalog/${k}/:ns/:entry`)),
     // A client's own (test/client-events.test.ts): the operator has no `self`.
     "GET /v1/clients/self", "PUT /v1/clients/self/webhook",
+    // Its own secrets (test/client-secrets.test.ts): write-only values, a listing of names.
+    "GET /v1/clients/self/secrets", "PUT /v1/clients/self/secrets/:name", "DELETE /v1/clients/self/secrets/:name",
   ].map((r) => [r, "owner"])),
   // A client's own: only a client token has a self, the operator's is refused (test/client-github-token.test.ts).
   "POST /v1/clients/self/github-token": "owner",

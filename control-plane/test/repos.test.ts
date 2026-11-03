@@ -12,6 +12,7 @@ import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { canonicalRepos, narrowRepos, Repo } from "../src/lib/repos";
 import { GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER, githubBinding, githubEgress, githubGuards } from "../src/lib/rules/github";
 import { BrokerDO } from "../src/do/broker";
+import { Grant, specOutsideGrant } from "../src/lib/clients";
 import { type Catalog, expandSpec, SEED_CATALOG } from "../src/lib/spec";
 import { bytesToB64 } from "../src/lib/util";
 import { adminJson, connectHost, nextCommands, runDue, type Ws, uniqueCell } from "./helpers";
@@ -564,5 +565,70 @@ describe("a sandbox's read-only repos", () => {
     await stub.attach(`agt_${rand()}${rand()}${rand()}`, undefined, [r]);
     const stored = await runInDurableObject(stub, async (_i, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM kv WHERE key = 'agent_read_repos'").one().n);
     expect(stored).toBe(0);
+  });
+});
+
+// --- workflows: write, opt-in (docs/control-plane/api/clients/#workflow-files) -----------------------------------
+
+describe("workflows: write on a sandbox's push token", () => {
+  const WITH_WORKFLOWS = { contents: "write", pull_requests: "write", workflows: "write" };
+  const catalog: Catalog = {
+    capabilities: SEED_CATALOG.capabilities,
+    templates: { ci: { ...SEED_CATALOG.templates.worker!, capabilities: ["nest", "hands"], repos: ["me/app"], github_push: { workflows: true } } },
+  };
+  const expand = (by: "operator" | "spawner", overrides: Record<string, unknown> = {}) =>
+    expandSpec(catalog, PLATFORM_TOOL_NAMES, { template: "ci", hands: true, by, overrides } as never);
+
+  it("comes from the template; a spawner may only turn it off, the operator either way, and a client's grant must allow it", () => {
+    expect((expand("operator") as any).value.github_push).toEqual({ workflows: true });
+    expect((expand("spawner") as any).value.github_push).toEqual({ workflows: true });
+    expect((expand("spawner", { github_push: { workflows: false } }) as any).value.github_push).toBeUndefined();
+    expect(expand("spawner", { github_push: { workflows: true } }).ok).toBe(false);
+    expect((expand("operator", { github_push: { workflows: false } }) as any).value.github_push).toBeUndefined();
+    const { github_push: _, ...plain } = catalog.templates.ci!;
+    const off = expandSpec({ ...catalog, templates: { ci: plain } }, PLATFORM_TOOL_NAMES, { template: "ci", hands: true, by: "operator" }) as any;
+    expect("github_push" in off.value).toBe(false);
+    const spec = (expand("operator") as any).value;
+    expect(specOutsideGrant(spec, Grant.parse({ credentials: [spec.credential], repos: ["me/app"] }))).toEqual(["github_push.workflows"]);
+    expect(specOutsideGrant(spec, Grant.parse({ credentials: [spec.credential], repos: ["me/app"], github_push: { workflows: true } }))).toEqual([]);
+  });
+
+  it("is minted exactly {contents, pull_requests, workflows: write} only when asked; the read-only token never has it", async () => {
+    const pushable = repo(7171);
+    const readable = repo(7171);
+    const before = gh.mints.length;
+    const { ws } = await placed({ repos: [pushable], read_repos: [readable], github_push: { workflows: true } });
+    while (gh.mints.length < before + 2) await nextCommands(ws, (c) => c.type === "secrets_update");
+    const mints = gh.mints.slice(before).map((m) => [m.repositories, m.permissions]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    const want = [[[pushable.split("/")[1]], WITH_WORKFLOWS], [[readable.split("/")[1]], SANDBOX_READ_TOKEN_PERMISSIONS]];
+    expect(mints).toEqual(want.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
+    // BrokerDO itself never puts it on a read-only token, whatever the source asks.
+    const ro = repo();
+    const b1 = gh.mints.length;
+    await env.BROKER.get(env.BROKER.idFromName("broker")).readInjectionSecret({ sandbox: `sbx_${rand()}${rand()}`, epoch: 1 },
+      { kind: "github_app", binding: "github_read", repos: [ro], workflows: true }, "test");
+    expect(gh.mints.slice(b1).map((m) => m.permissions)).toEqual([SANDBOX_READ_TOKEN_PERMISSIONS]);
+    // Without it: the push token as before.
+    const plain = repo();
+    const b2 = gh.mints.length;
+    await nextCommands((await placed({ repos: [plain] })).ws, (c) => c.type === "secrets_update");
+    expect(gh.mints.slice(b2).map((m) => m.permissions)).toEqual([SANDBOX_TOKEN_PERMISSIONS]);
+  });
+
+  it("an attached agent's spec asking for it adds it while attached, and never reuses a token without it", async () => {
+    const r = repo(8181);
+    const { sandbox, ws } = await placed({ repos: [r] });
+    await nextCommands(ws, (c) => c.type === "secrets_update");
+    expect(gh.mints.at(-1)!.permissions).toEqual(SANDBOX_TOKEN_PERMISSIONS);
+    const stub = sandboxStub(sandbox);
+    const agent = `agt_${rand()}${rand()}${rand()}`;
+    await stub.attach(agent, undefined, [], [], { workflows: true });
+    let cmds = await nextCommands(ws, (c) => c.type === "secrets_update");
+    expect(gh.mints.at(-1)!.permissions).toEqual(WITH_WORKFLOWS);
+    expect(ghSecret(cmds).value).toBe(gh.mints.at(-1)!.token);
+    await stub.detach(agent);
+    cmds = await nextCommands(ws, (c) => c.type === "secrets_update");
+    expect(gh.mints.at(-1)!.permissions).toEqual(SANDBOX_TOKEN_PERMISSIONS);
+    expect(ghSecret(cmds).value).toBe(gh.mints.at(-1)!.token);
   });
 });

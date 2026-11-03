@@ -6,9 +6,11 @@
 import { z } from "zod";
 import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protocol/control";
 import { capabilityNameClash, checkMcpUrl, grantOf, type McpGrant, McpSource } from "./mcp";
+import { ClientInjections, type HeldInjection, holdInjections, narrowInjections } from "./client-secrets";
 import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, type BrokeredGrant, checkBrokered, grantOfEntry, scopeToRepos } from "./brokered";
 import { canonicalRepos, narrowRepos, readOnlyRepos, Repos } from "./repos";
 import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
+import { GithubPush } from "./rules/github";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
@@ -25,6 +27,7 @@ export const EntryName = z.string().regex(/^(?:[a-z][a-z0-9-]{1,30}\/)?[a-z][a-z
 export const mcpPrefix = (capability: string): string => capability.replace("/", "-");
 
 export const HandsRule = z.enum(["required", "forbidden", "optional"]);
+
 
 export const Capability = z.object({
   /** Platform tools (from `platform-tools.json`). */
@@ -65,6 +68,13 @@ export const Template = z.object({
   sandbox_idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).optional(),
   /** A spawner may attach an agent of this template to the spawner's own sandbox (`agent_spawn{sandbox: share}`). */
   share_sandbox: z.boolean().optional(),
+  /**
+   * Injection bindings for its agents' sandboxes, naming its client's own secrets (docs/control-plane/api/clients/#injection):
+   * only a template in a client's namespace declares them. Joined to the sandbox's bindings while attached.
+   */
+  inject: ClientInjections.optional(),
+  /** What its agents' sandboxes' GitHub push token carries beyond the default (docs/control-plane/api/clients/#workflow-files). */
+  github_push: GithubPush.optional(),
 });
 export type Template = z.output<typeof Template>;
 
@@ -83,6 +93,10 @@ export const OperatorOverrides = z.object({
   read_repos: Repos.optional(),
   /** Replaces the template's. */
   ephemeral: z.boolean().optional(),
+  /** A narrowing of the template's injection bindings (see `narrowInjections`): the operator holds no client's secrets either. */
+  inject: ClientInjections.optional(),
+  /** Replaces the template's. */
+  github_push: GithubPush.optional(),
 });
 export type OperatorOverrides = z.output<typeof OperatorOverrides>;
 
@@ -109,6 +123,10 @@ export const SpawnerOverrides = z.strictObject({
   read_repos: Repos.optional(),
   ephemeral: z.literal(true).optional(),
   sandbox_idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).optional(),
+  /** A narrowing of the template's injection bindings: each one of its, with a subset of its hosts and locations. */
+  inject: ClientInjections.optional(),
+  /** Only off: a spawner can drop the template's `workflows`, never ask for it. */
+  github_push: z.strictObject({ workflows: z.literal(false) }).optional(),
 });
 export type SpawnerOverrides = z.output<typeof SpawnerOverrides>;
 
@@ -135,6 +153,10 @@ export interface AgentSpec {
   ephemeral?: true;
   /** The idle TTL of a sandbox created for it at spawn; absent: the cell default. */
   sandbox_idle_ttl_ms?: number;
+  /** Its client's injection bindings, joined to its sandbox's while attached; absent when none (as in every spec before them). */
+  inject?: HeldInjection[];
+  /** Its sandbox's push token also carries `workflows: write`; absent: it doesn't. */
+  github_push?: { workflows: true };
 }
 
 export interface Catalog {
@@ -516,6 +538,14 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
   // Kept whole here (a repo also in `repos` included), so an override that drops it from the
   // allowlist leaves it readable; `withRepos` subtracts the final allowlist.
   const readOnly = canonicalRepos(tpl.read_repos ?? []);
+  // A template's bindings name its own namespace's secrets, so only a client's template has them.
+  let inject: HeldInjection[] = [];
+  if (tpl.inject?.length) {
+    const ns = name.includes("/") ? name.slice(0, name.indexOf("/")) : null;
+    if (ns === null) return err(`template ${name}: only a template in a client's namespace declares inject (the operator's bindings go in a sandbox's policy)`);
+    if (!Object.hasOwn(clients, ns)) return err(`template ${name}: no client is named ${ns}`);
+    inject = holdInjections(clients[ns]!, tpl.inject);
+  }
   return ok({
     template: name,
     tools: registry.filter((t) => given.has(t)),
@@ -530,6 +560,8 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     ...(spawn.length ? { spawn } : {}),
     ...(tpl.ephemeral ? { ephemeral: true as const } : {}),
     ...(tpl.sandbox_idle_ttl_ms !== undefined ? { sandbox_idle_ttl_ms: tpl.sandbox_idle_ttl_ms } : {}),
+    ...(inject.length ? { inject } : {}),
+    ...(tpl.github_push?.workflows ? { github_push: { workflows: true as const } } : {}),
   });
 }
 
@@ -615,7 +647,11 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     const readable = [...(base.value.repos ?? []), ...(base.value.read_repos ?? [])];
     const readRepos = narrowRepos(readable, o.data.read_repos ?? base.value.read_repos ?? [], "the repos it may read");
     if (!readRepos.ok) return err(`template ${spec.template}: ${readRepos.error}`);
-    const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, ...rest } = base.value;
+    const inject = narrowInjections(base.value.inject ?? [], o.data.inject);
+    if (!inject.ok) return err(`template ${spec.template}: ${inject.error}`);
+    const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, inject: _i, github_push: _g, ...rest } = base.value;
+    const push = o.data.github_push?.workflows === false ? undefined : base.value.github_push;
+    const extras = { ...(inject.value.length ? { inject: inject.value } : {}), ...(push ? { github_push: push } : {}) };
     // Lifetimes only shorten: ephemeral once set stays, and the shorter TTL wins.
     const ephemeral = base.value.ephemeral || o.data.ephemeral;
     // The template's TTL (an operator's choice, longer than the cell's or not), else the cell default, bounds the spawn's.
@@ -623,16 +659,21 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     const tplTtl = base.value.sandbox_idle_ttl_ms;
     const ttl = asked !== undefined ? narrowTtl(tplTtl ?? spec.cell_idle_ttl_ms ?? Infinity, asked) : tplTtl;
     const lifetimes = { ...(ephemeral ? { ephemeral: true as const } : {}), ...(ttl !== undefined ? { sandbox_idle_ttl_ms: ttl } : {}) };
-    return ok(withRepos({ ...rest, ...tools.value, ...lifetimes, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]) }, repos.value, readRepos.value, true));
+    return ok(withRepos({ ...rest, ...tools.value, ...lifetimes, ...extras, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]) }, repos.value, readRepos.value, true));
   }
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value, o.tools);
   if (!tools.ok) return tools;
-  const { mcp: _mcp, brokered: _brokered, ephemeral: _ephemeral, ...rest } = base.value;
+  const inject = narrowInjections(base.value.inject ?? [], o.inject);
+  if (!inject.ok) return err(`template ${spec.template}: ${inject.error}`);
+  const { mcp: _mcp, brokered: _brokered, ephemeral: _ephemeral, inject: _i, github_push: _g, ...rest } = base.value;
   const ephemeral = o.ephemeral ?? base.value.ephemeral ?? false;
+  const workflows = o.github_push ? o.github_push.workflows : !!base.value.github_push?.workflows;
   return ok(withRepos({
     ...rest,
     ...tools.value,
+    ...(inject.value.length ? { inject: inject.value } : {}),
+    ...(workflows ? { github_push: { workflows: true as const } } : {}),
     ...(ephemeral ? { ephemeral: true as const } : {}),
     launch: o.launch ?? base.value.launch,
     rules: o.rules ?? base.value.rules,

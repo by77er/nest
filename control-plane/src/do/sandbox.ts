@@ -25,7 +25,8 @@ import {
 import { canonicalRepos, readOnlyRepos, Repos, unionRepos } from "../lib/repos";
 import type { Labels } from "../lib/clients";
 import { ClientOutbox } from "../lib/client-events";
-import { GITHUB_BINDING, GITHUB_READ_BINDING, githubEgress, readBindings } from "../lib/rules/github";
+import { GITHUB_BINDING, GITHUB_READ_BINDING, githubEgress, GithubPush, readBindings } from "../lib/rules/github";
+import { type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import type { MintedInjection } from "./broker";
 import { cellIdleTtlMs, dormant, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 import {
@@ -63,6 +64,8 @@ export const SandboxPolicyLayer = z.object({
   repos: Repos.default([]),
   read_repos: Repos.default([]),
   guards: z.array(RequestGuard).max(64).default([]),
+  /** Opt-ins on its push token (`workflows: write`; docs/control-plane/api/clients/#workflow-files). */
+  github_push: GithubPush.optional(),
 });
 export type SandboxPolicyLayer = z.output<typeof SandboxPolicyLayer>;
 /** What a caller may pass: the fields with defaults may be left out. */
@@ -77,10 +80,20 @@ const OPERATOR_LAYER = "workstream" as const;
 const LAYER_KEY = "ws_layer";
 /** Each attached agent's read-only repos, by agent (`agent_repos` holds their push allowlists). */
 const AGENT_READ_REPOS = "agent_read_repos";
+/** Its client's own injection bindings, from its create (docs/control-plane/api/clients/#injection). */
+const OWN_INJECT = "client_inject";
+/** Its own push-token opt-ins, from its create (`{workflows: true}`). */
+const OWN_PUSH = "github_push";
+/** Each attached agent's client injection bindings, and the agents whose specs ask for `workflows`. */
+const AGENT_INJECT = "agent_inject";
+const AGENT_PUSH = "agent_github_push";
+/** A sandbox with client bindings pushes their secrets again this often, so a changed or deleted value reaches its proxy. */
+const CLIENT_SECRET_REFRESH_MS = 15 * 60_000;
 /** Set once a read-only token was asked for, so a sandbox without any never asks BrokerDO to forget one. */
 const READ_MINTED = "read_token";
-/** A push allowlist and read-only repos, compared as one. */
-const accessKey = (a: { push: string[]; read: string[] }): string => `${a.push.join()}|${a.read.join()}`;
+/** A push allowlist, read-only repos, the push token's opt-ins and the client bindings, compared as one. */
+const accessKey = (a: { push: string[]; read: string[]; workflows?: boolean; inject?: HeldInjection[] }): string =>
+  `${a.push.join()}|${a.read.join()}${a.workflows ? "|workflows" : ""}${a.inject?.length ? `|${JSON.stringify(a.inject)}` : ""}`;
 
 /** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
 export interface SandboxInfo extends lease.Lease, slots.Slots {
@@ -116,6 +129,12 @@ export interface SandboxInfo extends lease.Lease, slots.Slots {
   restore_pin?: Pin | null;
 }
 
+/** What an attached agent's spec adds to its sandbox beyond its repos (`AgentSpec.inject`, `github_push`). */
+export interface AgentAccess {
+  inject?: HeldInjection[];
+  workflows?: boolean;
+}
+
 export interface CreateSandbox {
   sandbox: string;
   cell: string;
@@ -129,6 +148,10 @@ export interface CreateSandbox {
   /** The client whose subtree it joins (it was admitted there first). */
   client?: string;
   labels?: Labels;
+  /** Its client's injection bindings (only a client's sandbox has them; checked against its grant by the caller). */
+  inject?: HeldInjection[];
+  /** Its push token also carries `workflows: write`. */
+  github_push?: { workflows: true };
 }
 
 const ACTIVE_STATES: SandboxState[] = ["creating", "restoring", "running", "suspending", "suspended"];
@@ -365,6 +388,10 @@ export class SandboxDO extends DurableObject<Env> {
     await this.deadlines.set("expiry", Date.now() + 60_000, true);
     const layer = SandboxPolicyLayer.parse(req.policy ?? {});
     this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos), read_repos: canonicalRepos(layer.read_repos) });
+    // Bindings only a client's own sandbox holds: whose they are must be its client.
+    const own = (req.inject ?? []).filter((b) => b.client === req.client);
+    if (own.length) this.put(OWN_INJECT, own);
+    if (req.github_push?.workflows) this.put(OWN_PUSH, { workflows: true });
     try {
       await this.placeCurrentEpoch();
     } catch (e) {
@@ -865,7 +892,9 @@ export class SandboxDO extends DurableObject<Env> {
     const ws = this.operatorLayer();
     const access = this.repoAccess();
     const gh = githubEgress(access.push, access.read, ws.inject);
-    const inject = [...ws.inject, ...gh.inject.filter((b) => !ws.inject.some((w) => w.name === b.name))];
+    const built = [...ws.inject, ...gh.inject.filter((b) => !ws.inject.some((w) => w.name === b.name))];
+    // Its client's bindings, under names of their own (`client:<name>`), never replacing another.
+    const inject = [...built, ...this.clientInjections().map(wireBinding).filter((b) => !built.some((w) => w.name === b.name))];
     const allow: AllowRule[] = [
       ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const })),
       ...[...ws.allow, ...gh.allow].map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER })),
@@ -1023,11 +1052,12 @@ export class SandboxDO extends DurableObject<Env> {
   private async pushSecrets(force = false): Promise<void> {
     const before = this.info_();
     const ws = this.operatorLayer();
-    const access = this.repoAccess();
+    const access = this.pushAccess();
     const own = (name: string) => ws.inject.some((b) => b.name === name);
     const mint = access.push.length > 0 && !own(GITHUB_BINDING);
     const mintRead = access.read.length > 0 && !own(GITHUB_READ_BINDING);
-    if (!before.host || (!ws.inject.length && !mint && !mintRead && !force)) return;
+    const clientBindings = before.client ? this.clientInjections() : [];
+    if (!before.host || (!ws.inject.length && !mint && !mintRead && !clientBindings.length && !force)) return;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
     const target = { sandbox: before.sandbox, epoch: before.epoch };
     // No push token minted (none wanted, or the operator's own `github`): every minted token goes, as
@@ -1066,7 +1096,23 @@ export class SandboxDO extends DurableObject<Env> {
       }
     };
     if (mint) {
-      await minted("GitHub token", () => broker.injectionSecret(target, { kind: "github_app", binding: GITHUB_BINDING, repos: access.push }, "SandboxDO"), [GITHUB_BINDING]);
+      const source = { kind: "github_app" as const, binding: GITHUB_BINDING, repos: access.push, ...(access.workflows ? { workflows: true } : {}) };
+      await minted("GitHub token", () => broker.injectionSecret(target, source, "SandboxDO"), [GITHUB_BINDING]);
+    }
+    // Its client's secrets (docs/control-plane/api/clients/#injection): only for bindings still inside its
+    // grant's `inject_hosts` (narrowing it takes the value away at the next push), and only that client's.
+    if (clientBindings.length && before.client) {
+      try {
+        const scope = await this.env.CLIENT.get(this.env.CLIENT.idFromName(before.client)).scope();
+        const within = clientBindings.filter((b) => !injectionsOutsideGrant([b], scope.grant.inject_hosts ?? []).length);
+        const refs = await broker.clientInjectionRefs(before.client, before.sandbox,
+          within.map((b) => ({ binding: injectionWireName(b.name), secret: b.secret, hosts: b.hosts })), "SandboxDO");
+        secrets.push(...refs);
+        later(Date.now() + CLIENT_SECRET_REFRESH_MS);
+      } catch (e) {
+        console.warn(`sandbox ${before.sandbox}: its client's secrets couldn't be read; retrying`, e);
+        later(Date.now() + INJECT_RETRY_MS);
+      }
     }
     if (mintRead) {
       this.put(READ_MINTED, (this.get<number>(READ_MINTED) ?? 0) + 1);
@@ -1074,8 +1120,9 @@ export class SandboxDO extends DurableObject<Env> {
       await minted("read-only GitHub token", () => broker.readInjectionSecret(target, { kind: "github_app", binding: GITHUB_READ_BINDING, repos: access.read }, "SandboxDO"), bindings);
     }
     const after = this.info_();
-    if (after.epoch !== before.epoch || after.host !== before.host || accessKey(this.repoAccess()) !== accessKey(access)) return;
-    if (secrets.length || force || mint || mintRead) await this.command({ type: "secrets_update", secrets });
+    if (after.epoch !== before.epoch || after.host !== before.host
+      || accessKey({ ...this.pushAccess(), inject: after.client ? this.clientInjections() : [] }) !== accessKey({ ...access, inject: clientBindings })) return;
+    if (secrets.length || force || mint || mintRead || clientBindings.length) await this.command({ type: "secrets_update", secrets });
     if (next !== null) await this.deadlines.set("inject_refresh", next);
     else await this.deadlines.clear("inject_refresh");
   }
@@ -1088,10 +1135,11 @@ export class SandboxDO extends DurableObject<Env> {
    * one sandbox shares a trust domain); `readRepos`: its spec's read-only repos, which join the sandbox's
    * the same way (absent from a caller of the previous release: none).
    */
-  async attach(agent: string, cwd?: string, repos?: string[], readRepos?: string[]): Promise<SandboxInfo> {
+  async attach(agent: string, cwd?: string, repos?: string[], readRepos?: string[], extra: AgentAccess = {}): Promise<SandboxInfo> {
     const cur = this.info_();
     if (lease.gone(cur.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${cur.state}`, 409);
-    const widened = this.setAgentRepos(agent, repos ?? [], readRepos ?? []);
+    const extras = this.setAgentExtras(agent, extra);
+    const widened = this.setAgentRepos(agent, repos ?? [], readRepos ?? []) || extras;
     const [send, info] = this.decide((i) => slots.attach(i, agent, cwd ?? null, i.host !== null));
     if (send) await this.issueAttachCommands([agent]);
     if (widened) await this.policyChanged(true);
@@ -1122,7 +1170,8 @@ export class SandboxDO extends DurableObject<Env> {
       if (d) lease.destroyed(i);
       return d;
     });
-    const narrowed = this.setAgentRepos(agent, [], []);
+    const extras = this.setAgentExtras(agent, {});
+    const narrowed = this.setAgentRepos(agent, [], []) || extras;
     if (destroyed) {
       await this.afterDestroyed(before, `its agent ${agent} ended`);
       return { destroyed: true };
@@ -1248,6 +1297,44 @@ export class SandboxDO extends DurableObject<Env> {
     return accessKey(this.repoAccess()) !== before;
   }
 
+  /**
+   * Record an attached agent's client bindings (only those of the sandbox's own client: an agent's
+   * spec names whose they are) and whether it asks for `workflows`; whether the sandbox's changed.
+   */
+  private setAgentExtras(agent: string, extra: AgentAccess): boolean {
+    const before = accessKey({ ...this.pushAccess(), inject: this.clientInjections() });
+    const client = this.info_().client;
+    const inject = client ? (extra.inject ?? []).filter((b) => b.client === client) : [];
+    // Written only once something asks, so a sandbox without any stores what it did before.
+    if (inject.length || this.get(AGENT_INJECT)) {
+      const all = { ...(this.get<Record<string, HeldInjection[]>>(AGENT_INJECT) ?? {}) };
+      if (inject.length) all[agent] = inject;
+      else delete all[agent];
+      this.put(AGENT_INJECT, all);
+    }
+    if (extra.workflows || this.get(AGENT_PUSH)) {
+      const all = { ...(this.get<Record<string, true>>(AGENT_PUSH) ?? {}) };
+      if (extra.workflows) all[agent] = true;
+      else delete all[agent];
+      this.put(AGENT_PUSH, all);
+    }
+    return accessKey({ ...this.pushAccess(), inject: this.clientInjections() }) !== before;
+  }
+
+  /**
+   * Its client's bindings: its own (from its create), then each attached agent's in agent order. A name
+   * declared twice keeps the first (the sandbox's own, else the earliest agent id's), so a name means
+   * one binding in the policy.
+   */
+  clientInjections(): HeldInjection[] {
+    const client = this.tryInfo()?.client;
+    if (!client) return [];
+    const agents = this.get<Record<string, HeldInjection[]>>(AGENT_INJECT) ?? {};
+    const all = [...(this.get<HeldInjection[]>(OWN_INJECT) ?? []), ...Object.keys(agents).sort().flatMap((a) => agents[a]!)];
+    const seen = new Set<string>();
+    return all.filter((b) => b.client === client && !seen.has(b.name) && seen.add(b.name));
+  }
+
   /** The push allowlist: the operator's layer and every attached agent's spec (docs/sandbox/networking/egress/policy/#repo-allowlists). */
   pushRepos(): string[] {
     return unionRepos(this.operatorLayer().repos, ...Object.values(this.get<Record<string, string[]>>("agent_repos") ?? {}));
@@ -1261,6 +1348,17 @@ export class SandboxDO extends DurableObject<Env> {
     const push = this.pushRepos();
     const read = unionRepos(this.operatorLayer().read_repos, ...Object.values(this.get<Record<string, string[]>>(AGENT_READ_REPOS) ?? {}));
     return { push, read: readOnlyRepos(push, read) };
+  }
+
+  /** Whether its push token carries `workflows: write`: the operator's layer, its own create or any attached agent's spec asks. */
+  pushWorkflows(): boolean {
+    return !!this.operatorLayer().github_push?.workflows || !!this.get<{ workflows: true }>(OWN_PUSH)?.workflows
+      || Object.keys(this.get<Record<string, true>>(AGENT_PUSH) ?? {}).length > 0;
+  }
+
+  /** Everything its secrets push depends on, compared as one (`accessKey`). */
+  private pushAccess(): { push: string[]; read: string[]; workflows: boolean } {
+    return { ...this.repoAccess(), workflows: this.pushWorkflows() };
   }
 
   /** Send `agent_attach` for these agents, each as the agent's one in flight. */
