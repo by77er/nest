@@ -38,7 +38,7 @@ function components(projectId: string): Components {
       if (task) return <TaskChip projectId={projectId} id={task[1]!} fallback={children} />;
       if (!href || !LINK.test(href)) return <span>{children}</span>;
       return (
-        <Anchor href={href} target="_blank" rel="noopener noreferrer" inherit>
+        <Anchor href={href} target="_blank" rel="noopener noreferrer" inherit data-inline>
           {children}
         </Anchor>
       );
@@ -49,7 +49,7 @@ function components(projectId: string): Components {
       // No remote image (no tracking pixel): a link labelled with its alt text instead.
       if (LINK.test(s)) {
         return (
-          <Anchor href={s} target="_blank" rel="noopener noreferrer" inherit data-image-link>
+          <Anchor href={s} target="_blank" rel="noopener noreferrer" inherit data-image-link data-inline>
             <IconPhoto size={icon.sm} aria-hidden /> {alt || s}
           </Anchor>
         );

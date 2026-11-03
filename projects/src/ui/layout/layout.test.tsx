@@ -238,6 +238,35 @@ describe("the navigation primitives", () => {
 });
 
 describe("TriggerBadge", () => {
+  it("plainOnTouch: on a touch screen it's plain status, named, with no tap target and no tooltip; with a mouse a trigger", async () => {
+    const { Tooltip } = await import("@mantine/core");
+    const { TriggerBadge } = await import("./Actions");
+    const coarse = (on: boolean) =>
+      vi.stubGlobal("matchMedia", (query: string) => ({ matches: on && query === "(pointer: coarse)", media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => false }));
+    const card = () => (
+      <Tooltip label="Cache gadget thumbnails: Ready" events={{ hover: true, focus: true, touch: true }}>
+        <TriggerBadge plainOnTouch data-marker="waiting" aria-label="Waiting on 1: Cache gadget thumbnails">
+          Waiting on 1
+        </TriggerBadge>
+      </Tooltip>
+    );
+    coarse(true);
+    const user = userEvent.setup();
+    const view = wrap(card());
+    const plain = screen.getByRole("img", { name: "Waiting on 1: Cache gadget thumbnails" });
+    expect(plain).not.toHaveAttribute("tabindex");
+    await user.hover(plain);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByText("Cache gadget thumbnails: Ready")).toBeNull();
+    view.unmount();
+    coarse(false);
+    wrap(card());
+    const trigger = screen.getByLabelText("Waiting on 1: Cache gadget thumbnails");
+    expect(trigger).toHaveAttribute("tabindex", "0");
+    await user.hover(trigger);
+    expect(await screen.findByText("Cache gadget thumbnails: Ready")).toBeInTheDocument();
+  });
+
   it("keeps its own class inside a Tooltip (which clones its className in), and so the theme's focus ring and touch target", async () => {
     const { Tooltip } = await import("@mantine/core");
     const { TriggerBadge } = await import("./Actions");
@@ -257,7 +286,9 @@ describe("TriggerBadge", () => {
     // The class's rules: the theme's 2 px primary ring, and on touch a reserved 44 px height (no
     // pseudo-element reaching over a neighbour).
     expect(css).toMatch(/\.trigger:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--mantine-primary-color-filled\)/);
-    expect(css).toMatch(/@media \(pointer: coarse\)\s*\{\s*\.trigger\s*\{\s*min-height:\s*var\(--nest-hit-touch\)/);
+    // On touch its hit box is the 44 px target around the badge, without growing the line: padding with
+    // an equal negative margin.
+    expect(css).toMatch(/@media \(pointer: coarse\)\s*\{[^}]*\.trigger\s*\{[^}]*--nest-hit-pad:\s*calc\(\(var\(--nest-hit-touch\)[^}]*padding-block:\s*var\(--nest-hit-pad\);\s*margin-block:\s*calc\(var\(--nest-hit-pad\) \* -1\)/);
     expect(css).not.toMatch(/\.trigger::(before|after)/);
     // It's the tooltip's target: focus opens it.
     await user.tab();

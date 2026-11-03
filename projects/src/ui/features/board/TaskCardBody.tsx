@@ -1,7 +1,8 @@
 // A task's card body, the one look a task has everywhere (similarity): the Board's cards, a message's
 // task cards and the Manager's context column. Its title (a link the caller gives), its badges in one
 // size (state, waiting on, Blocked, Needs input, Tainted), who works on it and its PRs, its start error, and an
-// optional note. The Board adds its grip; nothing else differs.
+// optional note. The Board adds its grip; nothing else differs. On touch its badges are plain status
+// (plainOnTouch): the card's title opens the drawer, where each badge's details are reachable.
 
 import { Badge, Text, Tooltip } from "@mantine/core";
 import { IconGitPullRequest, IconHandStop, IconMessageQuestion, IconRobot } from "@tabler/icons-react";
@@ -32,10 +33,10 @@ export function TaskCardBody({ task, title, pendingAsks, pr, end, note }: TaskCa
       <Row gap="xs" justify="space-between" align="flex-start">
         <Row gap="xs">
           <StateBadge state={task.state} size="sm" />
-          <WaitingBadge task={task} />
+          <WaitingBadge task={task} plainOnTouch />
           {task.blocked && (
             <Tooltip label={`Blocked: ${task.blocked.reason}`} withArrow multiline maw="var(--nest-side-panel)">
-              <TriggerBadge size="sm" color="warning" variant="filled" data-marker="blocked" leftSection={<IconHandStop size={icon.sm} aria-hidden />}>
+              <TriggerBadge plainOnTouch size="sm" color="warning" variant="filled" data-marker="blocked" aria-label={`Blocked: ${task.blocked.reason}`} leftSection={<IconHandStop size={icon.sm} aria-hidden />}>
                 Blocked
               </TriggerBadge>
             </Tooltip>
@@ -47,7 +48,7 @@ export function TaskCardBody({ task, title, pendingAsks, pr, end, note }: TaskCa
           )}
           {task.tainted && (
             <Tooltip label="A tainted session wrote to this task (it read untrusted content)" withArrow multiline maw="var(--nest-side-panel)">
-              <TriggerBadge size="sm" color="gray" variant="outline" data-marker="tainted">
+              <TriggerBadge plainOnTouch size="sm" color="gray" variant="outline" data-marker="tainted" aria-label="Tainted: a tainted session wrote to this task">
                 Tainted
               </TriggerBadge>
             </Tooltip>

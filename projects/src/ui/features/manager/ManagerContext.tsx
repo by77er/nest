@@ -30,10 +30,11 @@ export function gist(x: Attention): string {
 }
 
 function More({ projectId, n }: { projectId: string; n: number }) {
+  // A sentence with a link: on a 24 px line (the inline exception on touch).
   return (
-    <Text fz="sm" c="dimmed">
+    <Text fz="sm" lh="lg" c="dimmed">
       and{" "}
-      <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{}} inherit>
+      <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{}} inherit data-inline>
         {n} more on the board
       </AnchorLink>
     </Text>

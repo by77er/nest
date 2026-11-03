@@ -25,11 +25,15 @@
   outline-offset: 2px;
 }
 
+/* On touch its hit box grows to 44 px around the badge (at most 20 px tall), its line doesn't: padding
+   with an equal negative margin, lifted over the text it reaches into. */
 @media (pointer: coarse) {
   .trigger {
-    min-height: var(--nest-hit-touch);
-    min-width: var(--nest-hit-touch);
-    justify-content: center;
+    --nest-hit-pad: calc((var(--nest-hit-touch) - 1.25rem) / 2);
+    padding-block: var(--nest-hit-pad);
+    margin-block: calc(var(--nest-hit-pad) * -1);
+    position: relative;
+    z-index: 1;
   }
 }
 
@@ -53,4 +57,10 @@
 
 .option[data-combobox-disabled] {
   color: var(--nest-muted, var(--mantine-color-dimmed));
+}
+
+/* A TriggerBadge that's plain status on touch: just the badge, inline. */
+.plain {
+  display: inline-flex;
+  align-items: center;
 }

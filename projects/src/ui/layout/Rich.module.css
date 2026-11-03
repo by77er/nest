@@ -18,6 +18,11 @@
 
 /* A message's headings (demoted to h4–h6 in the outline) are body-lg in weight 600: three sizes in a
    message only (body-lg, small for tables, code and card meta, caption for its header line). */
+/* A link keeps its sentence's line (the inline exception on touch: a 24 px line). */
+.prose a {
+  line-height: inherit;
+}
+
 .prose :where(h1, h2, h3, h4, h5, h6) {
   margin: var(--mantine-spacing-md) 0 0;
   font-size: inherit;
