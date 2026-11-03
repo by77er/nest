@@ -6,6 +6,9 @@ import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
 import { num, type Env } from "../env";
 import { commandRefSlots, REF_PURPOSES, type RefPurpose } from "./broker";
+
+/** A `secrets_update` entry whose reference resolved to nothing: removed before the batch goes out. */
+const DROPPED_SECRET = "\u0000nest:dropped";
 import { canonicalSpki, certificateSpki, createRootCertificate, generateDevRoot, kmsRoot, localRoot, signIntermediate, type RootCa } from "../lib/ca";
 import { AwsKms, type Kms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, type Ec2 } from "../lib/ec2";
@@ -946,7 +949,12 @@ export class FleetDO extends DurableObject<Env> {
       for (const s of slots) {
         const value = values.get(s.purpose)?.[s.ref];
         if (value === null || value === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
-        s.set(value ?? "");
+        // A missing injection secret goes out as no secret at all, never an empty one: nest-proxy then
+        // refuses its binding's placeholder (`injection_unavailable`) instead of substituting "".
+        s.set(value ?? (s.purpose === "secrets_update" ? DROPPED_SECRET : ""));
+      }
+      for (const c of (m.commands as Record<string, unknown>[] | undefined) ?? []) {
+        if (c.type === "secrets_update" && Array.isArray(c.secrets)) c.secrets = (c.secrets as { value?: unknown }[]).filter((x) => x.value !== DROPPED_SECRET);
       }
       this.send(ws, m as FleetToHost);
       ws.serializeAttachment({ host, helloed: true, sent: m.seq } satisfies Attachment);

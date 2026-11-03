@@ -124,7 +124,11 @@ External systems (docs/control-plane/api/clients/): `POST /v1/admin/clients {nam
 brokered journal, asks and answers; sandbox create, list, read, destroy, lifetime and effective policy) on its own subtree only
 (anything else answers as an unknown id, 404), with `SpawnerOverrides`, and writes its catalog namespace:
 `GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…`. Its own, with a
-client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a GitHub App token within `github`; BrokerDO mints it).
+client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a GitHub App token within `github`; BrokerDO mints it). Its secrets (`src/lib/client-secrets.ts`): `PUT|DELETE /v1/clients/self/secrets/<name> {value, description?}` and
+`GET /v1/clients/self/secrets` (names and metadata, never a value; the operator's `GET /v1/admin/clients/<cli>/secrets`),
+within `secrets {max_count, max_bytes}`; bindings naming them (`inject` in its templates, overrides and `POST /v1/sandboxes`,
+hosts within `inject_hosts`) are injected by nest-proxy; `github_push: {workflows: true}` (within `github_push`) adds
+`workflows: write` to a sandbox's push token.
 Its events (`src/lib/client-events.ts`): `PUT /v1/clients/self/webhook {url}` (https; answers the signing secret once);
 its agents and sandboxes hand them to ClientDO from their alarms, and ClientDO POSTs each, signed (`Nest-Signature`), with
 retries; `GET /v1/clients/self` (the client) and `GET /v1/admin/clients/<cli>` show `events {webhook, backlog, dropped, failures, last_error}`.
