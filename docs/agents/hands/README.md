@@ -22,7 +22,7 @@ MCP tools that act on the agent's bound sandbox. `nest mcp` (a stdio shim Claude
 - **Agents without hands** (never bound, or detached) get a clear error.
 - **Schemas and descriptions are copied closely** from Claude Code's built-ins to keep them familiar to the model. Tools appear as `mcp__nest__<Name>`.
 - **Input drift:** the guest ignores input fields it doesn't know, since models trained on newer built-ins add some. A field that would change a call's meaning and that nest doesn't implement is listed for its tool in `hands-tools.json`, and the runner rejects it with an error naming it: ignoring it would mislead the model. Each new [Claude Code baseline](../runner/) sorts the built-ins' new fields into implemented, ignored or rejected.
-- **Fidelity risk:** the built-ins are heavily tuned. **Spike:** run the same tasks with native tools (Claude Code inside a VM) and with hands over RPC, and compare success rate, number of turns and token use. The same eval gates each new Claude Code baseline.
+- **Fidelity risk:** the built-ins are heavily tuned, so the [hands fidelity eval](../../README.md#first-spike) (spike item 10) compares hands with native tools, and gates each new Claude Code baseline.
 - **Rejected alternative:** native tools redirected with `CLAUDE_CODE_SHELL_PREFIX` plus a filesystem mount. The prefix also wraps hooks and MCP server startup, the command it receives includes setup that refers to local files, Firecracker has no virtiofs, and pointing the working directory at the repo would let the repo's config load on the host.
 
 ## Journal

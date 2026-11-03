@@ -2,7 +2,7 @@
 
 A sandbox's disk is a raw sparse file (`disk.img`, a copy of `nest-base` or a restored generation) attached to Firecracker as its root drive. A commit turns it into a manifest of 4 MB content-addressed chunks ([object store](../object-store/)).
 
-**Decided (2026-11-02): a commit's cost follows what changed, not the disk's size, and the VM never waits for an upload or the control plane.** A turn-end checkpoint of a 32 GiB disk paused its VM for 33–39 s in production, re-reading allocated but unchanged data from the gp3 root volume at its 125 MiB/s baseline, while every hands call failed ([gp3](https://docs.aws.amazon.com/ebs/latest/userguide/general-purpose.html); the allocated size is inferred, not recorded). It ships in three milestones, each measured before the next.
+**Decided (2026-11-02): a commit's cost follows what changed, not the disk's size, and the VM never waits for an upload or the control plane.** Reading a 32 GiB disk whole, allocated but unchanged data included, from the gp3 root volume at its 125 MiB/s baseline paused its VM for 33–39 s per turn-end checkpoint in production ([gp3](https://docs.aws.amazon.com/ebs/latest/userguide/general-purpose.html); the allocated size is inferred, not recorded). It ships in three milestones, each measured before the next.
 
 ## M1: pause only to read, and never read an unchanged disk
 
@@ -40,15 +40,13 @@ M1 removes the wait for the store and the control plane from the pause, and the 
 
 ## Later
 
-- **ublk** (designed, not next): lazy reads for restore and fork on another host, fetching 4 MB chunks into a local NVMe cache and prefetching the working set recorded during the previous run. It is no longer the cut mechanism.
+- **ublk** (designed, not next): lazy reads for restore and fork on another host, fetching 4 MB chunks into a local NVMe cache and prefetching the working set recorded during the previous run. It is not the cut mechanism.
 - **`nest diff <a> <b> [path]`:** mounts both generations read-only on the host and diffs the files.
 - **Rejected:** a Firecracker block dirty bitmap (dirty tracking is for memory only); vhost-user-blk (developer preview, no snapshots, no rate limiter: [block-vhost-user.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/block-vhost-user.md)); qcow2 (Firecracker drives are raw); dm-era alone (no cut); NBD (ublk is the better userspace block device). dm-thin is the fallback if neither M2 nor M3′ meets the gate: a pool that fills fails every sandbox on its host.
 
 ## Flush before commit
 
-Writes still in the guest's page cache aren't in a cut, and writes the guest has flushed may not be either: Firecracker's default `Unsafe` cache mode doesn't offer the guest a flush, so a guest `syncfs` ends once the data reaches the host, without an `fsync` ([block caching](https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/block-caching.md)). So every commit, pause and suspend:
-
-**Designed, not built** (guest protocol v2): today nestd asks the guest to `sync` through `prepare_snapshot`, ignores a failure, and pauses the VM while it reads the disk (M1, above; [nestd](../../../compute/nestd/)).
+Writes still in the guest's page cache aren't in a cut, and writes the guest has flushed may not be either: Firecracker's default `Unsafe` cache mode doesn't offer the guest a flush, so a guest `syncfs` ends once the data reaches the host, without an `fsync` ([block caching](https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/block-caching.md)). So every commit, pause and suspend (**designed, not built**, guest protocol v2; today nestd asks the guest to `sync` through `prepare_snapshot`, ignores a failure, and reads the disk while the VM is paused, as in M1):
 
 1. asks the guest agent to `syncfs` every filesystem (its `flush` request; [host-guest](../../../interfaces/host-guest/)), within a **30 s** budget (SPACE uses the same budget; [guest-io.md](https://github.com/perplexityai/space/blob/main/docs/space/design/guest-io.md));
 2. `fdatasync`s the disk file on the host, so the clone's own flush is short (M2);

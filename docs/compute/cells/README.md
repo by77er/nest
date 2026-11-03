@@ -8,7 +8,7 @@ A cell is compute plus its object store in one provider and region (AWS today). 
 | Region and autoscaler settings, per host kind | The cell's stack spec | `AWS_CELLS.<cell>` (sandbox hosts) and `AWS_CELLS.<cell>.brain` (brain hosts; optional for one release: a cell without it launches none) |
 | Proxy root CA key (`alias/nest-<cell>-proxy-root`) | The cell's stack | `AWS_CELLS.<cell>.proxy_root_key_arn` |
 | Root CA certificate | FleetDO, from the key ([tls](../../sandbox/networking/egress/tls/)) | FleetDO's storage; `GET /v1/admin/root-ca?cell=<cell>` |
-| IAM user `nest-<cell>-control-plane`; its policy names only this cell's template, host role, AMI parameter and key | The cell's stack; its access key by hand | `AWS_CELL_CREDENTIALS.<cell>` (a Worker secret) |
+| IAM user `nest-<cell>-control-plane`; its policy names only this cell's launch templates, host roles, AMI parameter and key | The cell's stack; its access key by hand | `AWS_CELL_CREDENTIALS.<cell>` (a Worker secret) |
 
 - **`AWS_CELLS`** (a Worker var): one entry per cell, `{"<cell>": {...}}`, which each cell's stack produces from its own outputs; the deploy merges them. The control plane refuses a key outside the cell's region.
 - **`AWS_CELL_CREDENTIALS`** (a Worker secret): `{"<cell>": {"access_key_id": "…", "secret_access_key": "…"}}`. Validation errors name fields, never values.
