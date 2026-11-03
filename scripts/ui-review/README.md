@@ -1,6 +1,6 @@
 # ui-review
 
-The design review's tooling ([nest-design-review](../../.claude/skills/nest-design-review/SKILL.md)): it captures an app's pages and states at 1440, 1280 and 390 px in light and dark, runs the automated checks on each screen, and exits non-zero on any failure. The rules it checks are [nest-ui-design](../../.claude/skills/nest-ui-design/SKILL.md)'s.
+The design review's tooling ([nest-design-review](../../.claude/skills/nest-design-review/SKILL.md)): it captures an app's pages and states at 1440, 1280 and 390 px (as a touch device) in light and dark, runs the automated checks on each screen, and exits non-zero on any failure. The rules it checks are [nest-ui-design](../../.claude/skills/nest-ui-design/SKILL.md)'s.
 
 It has its own pinned Playwright and is never a dependency of an app. CI doesn't run it (Actions minutes); the author runs it before review, and the design reviewer runs it again on the PR's head.
 

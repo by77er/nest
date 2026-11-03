@@ -113,6 +113,9 @@ for (const scheme of schemes) {
       const shot = { state: state.name, section: state.section, width, scheme, file: `${state.name}-${width}-${scheme}.png` };
       const context = await browser.newContext({
         viewport: { width, height: width < 600 ? 844 : 900 },
+        // A phone is a touch device: `pointer: coarse` applies (44 px targets), as on the real thing.
+        hasTouch: width < 600,
+        isMobile: width < 600,
         colorScheme: scheme,
         reducedMotion: "reduce",
       });
