@@ -1,18 +1,18 @@
 ---
 name: nest-infra
-description: Use when changing nest's cloud infrastructure or delivery: the inframe Lean stacks in deploy/ (cell use1, edge; IAM theorems, graph policies), host user data (deploy/host/bootstrap.sh, install.sh), .github/workflows, the deploy pipeline (deploy.yml, dev/deploy-use1.sh, scripts/publish-release.sh), rollout rules and rollback, and when checking the live cell after a deploy. Never apply infrastructure from a workstation.
+description: Use when changing nest's cloud infrastructure or delivery: the inframe Lean stacks in deploy/ (cell use1, edge; IAM theorems, graph policies) and projects/deploy/, host user data (deploy/host/bootstrap.sh, install.sh), .github/workflows, the deploy pipeline (deploy.yml, dev/deploy-use1.sh, scripts/publish-release.sh), rollout rules and rollback, and when checking the live cell after a deploy. Never apply infrastructure from a workstation.
 ---
 
 # Changing infrastructure and delivery
 
 **Where things are:**
-- **Stacks:** [deploy/README.md](../../../deploy/README.md). `deploy/lean/Cell/` holds the cell stack, its IAM statements (`Iam.lean`) and its theorems and policies (`Test.lean`); `deploy/lean/Edge/` holds the Cloudflare Access stack.
+- **Stacks:** [deploy/README.md](../../../deploy/README.md). `deploy/lean/Cell/` holds the cell stack, its IAM statements (`Iam.lean`) and its theorems and policies (`Test.lean`); `deploy/lean/Edge/` holds the Cloudflare Access stack; `projects/deploy/` holds the projects app's Access stack.
 - **Host user data:** `deploy/host/`.
 - **Pipeline and rollout rules:** [dev/deploy.md](../../../dev/deploy.md).
 - **CI:** [dev/ci.md](../../../dev/ci.md).
 - **Cloud checks:** [dev/cloud-checks/](../../../dev/cloud-checks/README.md).
 
-All of `deploy/`, `.github/`, `dev/` and `scripts/` are `CODEOWNERS` paths.
+`deploy/`, `.github/`, `dev/` and `scripts/` are `CODEOWNERS` paths.
 
 **Never run `inframe apply` (or `plan` against the real account), `wrangler deploy`, `wrangler rollback` or `wrangler secret put` from a workstation.** The deploy applies on merge, with the deploy role over OIDC. Applying is the owner's call.
 
@@ -26,6 +26,9 @@ All of `deploy/`, `.github/`, `dev/` and `scripts/` are `CODEOWNERS` paths.
   inframe provider generate cloudflare --frontend lean --schema-json cloudflare-schema.json
   inframe test --stack use1
   inframe test --stack edge
+  cd ../projects/deploy
+  inframe provider generate cloudflare --frontend lean --schema-json cloudflare-schema.json
+  inframe test --stack projects
   ```
 
   The CLI is pinned in `scripts/infra-tools.sh` (`INFRAME_REV`); a local shim may be a different build. Lean is pinned in `deploy/lean/lean-toolchain`.
@@ -61,7 +64,7 @@ All of `deploy/`, `.github/`, `dev/` and `scripts/` are `CODEOWNERS` paths.
   3. **`release`:** `scripts/publish-release.sh` builds static musl host binaries into `releases/current/`; when they changed, it starts a host AMI build.
 - **Not in the pipeline:**
   - the guest image is rebuilt by hand (`images/guest/build-on-ec2.sh`) when `nest-guest` changes;
-  - the dashboard deploys from `deploy-dashboard.yml`;
+  - the apps deploy from their own workflows, `deploy-dashboard.yml` and `deploy-projects.yml`;
   - the projects app's Access stack (`projects/deploy/`) applies from `deploy-projects-infra.yml`, only on its own changes;
   - the health window, the deploy pause and `rollback.yml` aren't built.
 - **A release with ordering constraints gets a rollout rule** in `dev/deploy.md`. It says what must already be true before the Worker deploys, what runs in each gap (apply → Worker → release), and what an automatic `wrangler rollback` does with what this release wrote. A DO class change or a raised gateway `min_supported` is one-way and ships alone.
@@ -72,12 +75,9 @@ All of `deploy/`, `.github/`, `dev/` and `scripts/` are `CODEOWNERS` paths.
 
 ## After the merge
 
-- **Watch the runs:**
-  - main's CI: `gh run list --workflow ci.yml --branch main --limit 3`;
-  - then the deploy: `gh run list --workflow deploy.yml --branch main --limit 3` and `gh run watch <id> --exit-status`;
-  - read the plan summary in the run before trusting the apply.
+Watch main's CI and the deploy as `nest-change-flow` says, reading the plan summary in the run before trusting the apply. Then:
 - **Smoke:** `curl -fsS https://nest.bitcru.sh/v1/health`.
-- **Cloud check what only the cloud can show,** with the scripts in [dev/cloud-checks/](../../../dev/cloud-checks/README.md). For brain hosts or placement: `python3 -I dev/cloud-checks/brain_hosts_check.py`. It needs `NEST_ADMIN_TOKEN` exported (never printed), launches spot hosts in a cold cell and spends a little subscription quota, and cleans up the agents and sandboxes it creates.
+- **Cloud check what only the cloud can show,** with the scripts in [dev/cloud-checks/](../../../dev/cloud-checks/README.md). For brain hosts or placement: `python3 -I dev/cloud-checks/brain_hosts_check.py`. It needs `NEST_ADMIN_TOKEN` exported (never printed), launches spot hosts in a cold cell, spends a little subscription quota, and cleans up the agents and sandboxes it creates.
   - A new check goes in the same directory, cleans up on every exit path, never prints credentials, and gets a row in its README.
   - Don't touch the owner's other tunnels or resources.
 - **EC2 facts** (a launch, an instance profile, `systemctl is-enabled` on a host) need AWS access. Say which you checked and which you couldn't.
