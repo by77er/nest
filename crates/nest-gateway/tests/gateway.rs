@@ -153,7 +153,7 @@ async fn bind(ws: &mut Ws, token: &str, protocol_version: u32, gateway_version: 
 
 async fn refusal(ws: &mut Ws, token: &str, pv: u32, gv: u32) -> (String, bool, Option<u64>) {
     match bind(ws, token, pv, gv).await {
-        GatewayMessage::Error { error, executed, retry_after_ms } => {
+        GatewayMessage::Error { error, executed, retry_after_ms, .. } => {
             assert!(!executed);
             (error.code, error.retryable, retry_after_ms)
         }
@@ -739,13 +739,14 @@ async fn a_paused_sandbox_is_busy_at_once_with_the_pause_hint_and_bound_calls_su
     wait_until("pause applied", || state.sandbox(&sbx()).is_some_and(|e| e.paused.is_some())).await;
     let started = std::time::Instant::now();
     let mut ws = connect(&addr, "/hands").await;
-    let GatewayMessage::Error { error, executed, retry_after_ms } = bind(&mut ws, &signer.sign(&claims(&signer)), 1, PROTOCOL_VERSION).await else {
+    let GatewayMessage::Error { error, executed, retry_after_ms, reason } = bind(&mut ws, &signer.sign(&claims(&signer)), 1, PROTOCOL_VERSION).await else {
         panic!("bound a paused sandbox")
     };
     // Well under the gateway's 5 s vsock timeout: no connect was tried.
     assert!(started.elapsed() < Duration::from_secs(2), "refused after {:?}", started.elapsed());
     assert_eq!((error.code.as_str(), error.retryable, executed), (error_code::BUSY, true, false));
     assert_eq!(retry_after_ms, Some(nest_protocol::gateway::PAUSED_RETRY_AFTER_MS));
+    assert_eq!(reason, Some(nest_protocol::gateway::RefusalReason::Paused));
     assert!(error.message.contains("checkpoint (turn_end)"), "{}", error.message);
 
     // The call bound before the pause is still open and still pipes frames.

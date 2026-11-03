@@ -2,7 +2,7 @@
 // The control plane never speaks this boundary itself in this step; it signs the bindings the
 // gateway verifies and hands clients the target. Fixtures: protocol/fixtures/gateway/.
 import { z } from "zod";
-import { Epoch, ErrorBody, SandboxId, TimestampMs } from "./model";
+import { Epoch, ErrorBody, openEnum, SandboxId, TimestampMs } from "./model";
 
 export const GATEWAY_PROTOCOL_VERSION = 1;
 export const BINDING_VERSION = 1;
@@ -64,11 +64,16 @@ export const ClientMessageVariants = [
 export const ClientMessage = z.discriminatedUnion("type", ClientMessageVariants);
 export type ClientMessage = z.output<typeof ClientMessage>;
 
+/** Why a refusal, where a client acts on it: `paused` on the `busy` for a VM nestd has paused (open). */
+export const GATEWAY_REFUSAL_REASONS = ["paused", "unknown"] as const;
+export const GatewayRefusalReason = openEnum(GATEWAY_REFUSAL_REASONS, "unknown");
+
 export const GatewayMessageVariants = [
   z.object({ type: z.literal("bound"), guest: GuestInfo, gateway_version: z.number().int() }),
   z.object({
     type: z.literal("error"), error: ErrorBody, executed: z.boolean().default(false),
     retry_after_ms: z.number().int().nonnegative().optional(),
+    reason: GatewayRefusalReason.optional(),
   }),
 ] as const;
 export const GatewayMessage = z.discriminatedUnion("type", GatewayMessageVariants);

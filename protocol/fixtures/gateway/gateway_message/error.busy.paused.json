@@ -1,0 +1,11 @@
+{
+  "type": "error",
+  "error": {
+    "code": "busy",
+    "message": "the sandbox is paused: checkpoint (turn_end)",
+    "retryable": true
+  },
+  "executed": false,
+  "retry_after_ms": 2000,
+  "reason": "paused"
+}

@@ -13,6 +13,7 @@
   "EgressVerdict": ["allow", "passthrough", "deny", "alert"],
   "EgressVia": ["dns", "http_transparent", "https_transparent", "explicit", "tcp_exception"],
   "ForkMode": ["disk_only", "live"],
+  "GatewayRefusalReason": ["paused", "unknown"],
   "GenerationKind": ["disk_only", "checkpoint"],
   "HostRole": ["burst", "controller"],
   "ManifestKind": ["disk", "memory"],
