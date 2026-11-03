@@ -88,6 +88,12 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Still needed by hosts:** `sandbox_create`, `sandbox_fork` and `agent_start` carry a `ws_` value (`compatWorkstream`), which hosts and runners from before workstreams left require (Rust's `WorkstreamId`, prefix-checked). Drop it from the control plane (and `SandboxInfo`/`AgentInfo`) once every host runs that release or later, then the Rust fields the release after. The policy layer's wire value `workstream` (the operator layer; hosts parse a closed enum) stays.
 
 **This release's rollout rule (checkpoint cuts, M2): not a one-way deploy, and nothing by hand.** The merge's own `deploy.yml` run does all of it. No Durable Object class is added, and the guest image doesn't change. The wire gains one optional field, `commit_request.cut_ms` (and `GenerationRecord.cut_ms`), which either side of the previous release ignores (zod strips it, and serde has no unknown-field refusal).
+- **The first run failed at `infra` (2026-11-03, run 41714276937), and nothing reached production.**
+  - EC2 refused both launch templates' new versions: `InvalidUserData.Malformed: User data is limited to 16384 bytes`. The new `bootstrap.sh` with `install.sh` inside is 18.5 KB.
+  - Image Builder's component, recipe and pipeline had already applied (`install.sh` with `xfsprogs`); they matter only at the next AMI build.
+  - The templates, `AWS_CELLS`, the Worker and the release stayed the previous release's, and every later deploy would fail the same way.
+  - Fixed by gzipping both templates' user data (`base64gzip`; cloud-init unpacks it), now about 6.7 KB. `test_the_user_data_fits_ec2s_limit_gzipped` keeps it under half the limit.
+  - The next merge's run applies M2 as the order below says.
 - **What production does, in order** (the pipeline's order, all automatic):
   1. **`infra`** applies the `use1` cell stack through inframe:
      - The launch template's user data becomes the new `bootstrap.sh`: sandbox state goes on the instance store when there is one.

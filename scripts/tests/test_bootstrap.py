@@ -8,6 +8,7 @@ reads, and that no unit of the other kind is reachable from what is enabled (Wan
 followed transitively). shellcheck runs on both scripts; on CI (`CI=true`) a missing shellcheck is a
 failure, not a skip."""
 
+import gzip
 import json
 import os
 import re
@@ -53,13 +54,36 @@ ENABLED = {
 }
 
 
-def render(role: str, fake: Path) -> str:
-    """bootstrap.sh as `Cell.bootstrap` renders it (deploy/lean/Cell/Stack.lean), paths moved to `fake`."""
+def rendered(role: str) -> str:
+    """bootstrap.sh as `Cell.bootstrap` renders it (deploy/lean/Cell/Stack.lean)."""
     install = (HOST / "install.sh").read_text().replace("@BUCKET@", "nest-test-1").replace("@REGION@", "us-east-1")
     text = (HOST / "bootstrap.sh").read_text().replace("@BUCKET@", "nest-test-1").replace("@CELL@", "test")
     text = text.replace("@INSTALL@\n", install).replace("@REGION@", "us-east-1").replace("@CONTROL_URL@", "https://cp.test")
-    text = text.replace("@ROLE@", role)
-    return re.sub(PREFIXES, lambda m: f"{fake}/{m.group(1)}", text)
+    return text.replace("@ROLE@", role)
+
+
+def render(role: str, fake: Path) -> str:
+    """[`rendered`], paths moved to `fake`."""
+    return re.sub(PREFIXES, lambda m: f"{fake}/{m.group(1)}", rendered(role))
+
+
+# EC2 refuses a launch template whose user data is over 16 KB before its base64 encoding
+# (`InvalidUserData.Malformed: User data is limited to 16384 bytes`, the deploy of #138).
+USER_DATA_MAX = 16384
+
+
+class UserDataSize(unittest.TestCase):
+    def test_the_user_data_fits_ec2s_limit_gzipped(self):
+        """The stack gzips each template's user data (cloud-init unpacks it), and what EC2 counts is
+        the gzipped bytes. Kept to half the limit, so the scripts can grow without the next deploy
+        failing at its launch templates."""
+        stack = (ROOT / "deploy/lean/Cell/Stack.lean").read_text()
+        uses = re.findall(r'userData := some \(unsafeCall "(\w+)" \[unsafeArgument \(lit \(bootstrap spec \.(\w+)\)\)\]', stack)
+        self.assertEqual(sorted(uses), [("base64gzip", "brain"), ("base64gzip", "sandbox")], "both templates gzip their user data")
+        for role in ("burst", "controller"):
+            raw = rendered(role).encode()
+            packed = len(gzip.compress(raw, 6))  # Go's default level, as tofu's base64gzip
+            self.assertLessEqual(packed, USER_DATA_MAX // 2, f"{role}: {packed} bytes gzipped ({len(raw)} raw)")
 
 
 def stub(bin_dir: Path, name: str, body: str) -> None:
