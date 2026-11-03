@@ -1,0 +1,78 @@
+{
+ "now": 1793538952229,
+ "cells": {
+  "cells": [
+   "use1"
+  ],
+  "control_plane": "https://nest.example"
+ },
+ "fleet": {
+  "hosts": [],
+  "launches": [],
+  "sandboxes": [],
+  "aws": {
+   "cell": "use1",
+   "region": "us-east-1",
+   "credentials": true,
+   "kms_key": true
+  }
+ },
+ "images": {
+  "current": "ami-0a1b2c3d4e5f60718",
+  "current_since_ms": 1761213600000,
+  "images": [
+   {
+    "image_id": "ami-0a1b2c3d4e5f60718",
+    "name": "nest-use1-host-2026-10-23",
+    "created": "2026-10-23T10:00:00.000Z",
+    "state": "available",
+    "size_gib": 30,
+    "tags": {
+     "nest": "true"
+    }
+   }
+  ],
+  "templates": [
+   {
+    "name": "nest-base:latest",
+    "default": true,
+    "source": "release (nest-base.ext4.zst)",
+    "in_use": 0
+   }
+  ]
+ },
+ "agents": {
+  "agents": [],
+  "omitted": 0
+ },
+ "lifetimes": {
+  "cell": "use1",
+  "now_ms": 1793538892229,
+  "quiet_ms": 86400000,
+  "cell_idle_ttl_ms": 86400000,
+  "sandboxes": [],
+  "agents": [],
+  "counts": {
+   "sandboxes": {
+    "dormant": 0,
+    "held": 0,
+    "unknown": 0,
+    "in_use": 0,
+    "destroyed": 0,
+    "unreadable": 0
+   },
+   "agents": {
+    "quiet": 0,
+    "ending": 0,
+    "gone": 0,
+    "unreadable": 0,
+    "active": 0,
+    "recent": 0,
+    "ended": 0
+   }
+  },
+  "agents_omitted": 0,
+  "pages": 1,
+  "truncated": false
+ }
+}
