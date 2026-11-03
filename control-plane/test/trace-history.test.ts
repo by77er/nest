@@ -83,6 +83,91 @@ function segmented(text: string, size: number) {
   return { segments, read, reads, end: bytes.length, store };
 }
 
+/**
+ * A transcript of the shape a real worker's has (2.1.3xx): besides `user` and `assistant`, the line types
+ * Claude Code writes now (`attachment`, `api-request`, `api-request-blob`, `atis-latch`, `last-prompt`,
+ * `queue-operation`, `api-request-shape`, `system`, `cost-state`), tool results in `user` lines, `tool_use`
+ * stops mid-turn and one `end_turn`, and subagent lines (`isSidechain: true`). The content is made up;
+ * the request lines hold what a real one may (whole request bodies, a credential among them).
+ */
+function realShape(T: number) {
+  const secret = ["ghp", "R".repeat(36)].join("_");
+  const at = (n: number) => iso(T + n);
+  const lines = [
+    line({ type: "queue-operation", operation: "enqueue", content: "the brief", timestamp: at(0) }),
+    line({ type: "user", isSidechain: false, message: { role: "user", content: "Implement the widget" }, uuid: "u1", timestamp: at(1) }),
+    line({ type: "attachment", attachment: { type: "file", content: `file text ${secret}` }, timestamp: at(2) }),
+    line({ type: "api-request-shape", shape: { tools: 12 }, timestamp: at(3) }),
+    line({ type: "api-request", request: { model: "m", messages: [{ role: "user", content: [{ type: "text", text: `prompt ${secret}` }] }] }, message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_req", name: "Bash", input: {} }] }, timestamp: at(4) }),
+    line({ type: "api-request-blob", blob: { system: `sys ${secret}` }, message: { role: "user", content: [{ type: "text", text: `blob ${secret}` }, { type: "tool_result", tool_use_id: "toolu_blob", content: "x" }] }, timestamp: at(5) }),
+    line({ type: "atis-latch", latch: true, timestamp: at(6) }),
+    line({ type: "assistant", isSidechain: false, message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_1", name: "Read", input: { file_path: "src/a.ts" } }], stop_reason: "tool_use" }, timestamp: at(7) }),
+    line({ type: "user", isSidechain: false, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content: "export const a = 1;" }] }, timestamp: at(8) }),
+    line({ type: "assistant", isSidechain: false, message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_task", name: "Agent", input: { description: "look around" } }], stop_reason: "tool_use" }, timestamp: at(9) }),
+    // A subagent's own messages: in the parent's file only as sidechain lines.
+    line({ type: "user", isSidechain: true, message: { role: "user", content: "look around" }, timestamp: at(10) }),
+    line({ type: "assistant", isSidechain: true, message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_sub", name: "Grep", input: { pattern: "a" } }], stop_reason: "tool_use" }, timestamp: at(11) }),
+    line({ type: "user", isSidechain: true, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_sub", content: "src/a.ts" }] }, timestamp: at(12) }),
+    line({ type: "user", isSidechain: false, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_task", content: [{ type: "text", text: "found a.ts" }] }] }, timestamp: at(13) }),
+    line({ type: "system", subtype: "info", content: "compacting", timestamp: at(14) }),
+    line({ type: "cost-state", cost: { usd: 0.1 }, timestamp: at(15) }),
+    line({ type: "assistant", isSidechain: false, message: { role: "assistant", content: [{ type: "text", text: "Done: a.ts exports a." }], stop_reason: "end_turn" }, timestamp: at(16) }),
+    line({ type: "last-prompt", lastPrompt: `Implement the widget ${secret}`, timestamp: at(17) }),
+    line({ type: "user", isSidechain: false, message: { role: "user", content: [{ type: "text", text: "Now the tests" }] }, timestamp: at(18) }),
+    line({ type: "attachment", attachment: { type: "hook", content: "context" }, timestamp: at(19) }),
+    line({ type: "assistant", isSidechain: false, message: { role: "assistant", content: [{ type: "tool_use", id: "toolu_2", name: "Bash", input: { command: "npm test" } }], stop_reason: "tool_use" }, timestamp: at(20) }),
+  ];
+  return { text: lines.join(""), secret };
+}
+
+describe("a transcript of the real shape (pure)", () => {
+  const T = 1_800_000_000_000;
+  const NON_MESSAGE = ["attachment", "api-request-blob", "api-request", "atis-latch", "last-prompt", "queue-operation", "api-request-shape", "system", "cost-state"];
+
+  it("gives nothing for every line type but user and assistant, whatever it holds", () => {
+    const { text } = realShape(T);
+    const lines = text.split("\n").filter(Boolean);
+    const types = new Set(lines.map((l) => JSON.parse(l).type as string));
+    for (const t of NON_MESSAGE) expect(types.has(t), t).toBe(true);
+    for (const l of lines) {
+      const ty = JSON.parse(l).type as string;
+      if (NON_MESSAGE.includes(ty)) expect(normalizeEntry(l, 0)!.bodies, ty).toEqual([]);
+    }
+  });
+
+  it("reads it as two turns: prompts start them, tool results stay results, end_turn (never tool_use) ends one, subagent lines give nothing", async () => {
+    const { text, secret } = realShape(T);
+    const s = segmented(text, 4096);
+    const none = { calls: new Set<string>(), results: new Set<string>(), texts: new Set<string>() };
+    const { events } = await historyPage(s.segments, s.end, { b: 0, o: null, t: T + 60_000, c: true }, 500, none, s.read);
+    expect(events.map(key)).toEqual([
+      "turn_started:unknown",
+      "tool_call:toolu_1", "tool_result:toolu_1",
+      "tool_call:toolu_task", "tool_result:toolu_task",
+      "assistant_text:Done: a.ts exports a.",
+      "turn_completed:end_turn",
+      "turn_started:unknown",
+      "tool_call:toolu_2",
+      // Cut off after a tool_use stop: closed at the seam, its stop reason unknown (tool_use ends no turn).
+      "turn_completed:unknown",
+    ]);
+    // Only the two prompts start turns; every `user` line of tool results is a result.
+    expect(events.filter((e) => e.type === "turn_started")).toHaveLength(2);
+    // Nothing of the request lines, attachments or the last prompt: neither their calls nor their credential.
+    const all = JSON.stringify(events);
+    expect(all).not.toContain(secret);
+    expect(all).not.toMatch(/toolu_req|toolu_blob|toolu_sub|blob |sys /);
+    expect(events.find((e) => e.type === "tool_result" && e.call_id === "toolu_task")).toMatchObject({ summary: "found a.ts" });
+  });
+
+  it("a page that starts inside a turn and ends on a tool_use stop doesn't claim the turn ended normally", async () => {
+    const s = segmented(use(T, "toolu_x", "Bash", { command: "ls" }), 4096);
+    const none = { calls: new Set<string>(), results: new Set<string>(), texts: new Set<string>() };
+    const p = await historyPage(s.segments, s.end, { b: 0, o: null, t: T + 1000, c: true }, 50, none, s.read);
+    expect(p.events.map(key)).toEqual(["tool_call:toolu_x", "turn_completed:unknown"]);
+  });
+});
+
 describe("reading backwards (pure)", () => {
   it("gives every line newest first with its offset, whole across segment cuts, and stops at the budget at a line start", async () => {
     const text = `${"a".repeat(10)}\n${"é".repeat(7)}\n${"c".repeat(30)}\n\nd\n`;

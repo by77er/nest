@@ -74,8 +74,12 @@ const as = (e: Record<string, unknown>) => ({ agent: "agt_x", epoch: 0, seq: 0, 
 
 /**
  * One JSONL line of Claude Code's session: a prompt starts a turn; an assistant message gives text and
- * tool calls; a user message of tool results gives results. Subagent sidechains, meta and compaction
- * entries, thinking and everything else give nothing.
+ * tool calls; a user message of tool results gives results. Only `user` and `assistant` lines are read:
+ * every other type (`attachment`, `api-request`, `api-request-blob`, `system`, `cost-state`, …) gives
+ * nothing, so what a request line holds (whole request bodies) never reaches the trace. Subagent
+ * messages (`isSidechain: true`) give nothing either: the parent's own `Agent` (Task) call and its
+ * result show the subagent's work, as in the live trace. Meta and compaction entries and thinking give
+ * nothing.
  */
 export function normalizeEntry(line: string, offset: number): Entry | null {
   let e: { type?: unknown; timestamp?: unknown; isSidechain?: unknown; isMeta?: unknown; isCompactSummary?: unknown; message?: { content?: unknown; stop_reason?: unknown } };
@@ -244,7 +248,9 @@ export async function historyPage(
   const entries = taken.reverse();
   const events: HistoryEvent[] = [];
   let open = false;
-  let stop = "end_turn";
+  // A turn's stop reason is its last assistant message's that ended it (`end_turn`, `max_tokens`, …); one
+  // that stopped only for tool use (cut off) is `unknown`.
+  let stop = "unknown";
   let at = 0;
   const near = (ts: number) => ts >= cur.t - SEAM_WINDOW_MS;
   for (const en of entries) {
@@ -262,7 +268,7 @@ export async function historyPage(
     }
     if (en.prompt) {
       open = true;
-      stop = "end_turn";
+      stop = "unknown";
     } else if (en.bodies.length || en.stop) open = true;
     if (en.stop && en.stop !== "tool_use") stop = en.stop;
     at = ts;
