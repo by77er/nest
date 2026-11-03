@@ -230,7 +230,7 @@ export const theme = createTheme({
     ActionIcon: ActionIcon.extend({ defaultProps: { size: "lg" } }),
     Button: Button.extend({ defaultProps: { size: "sm", radius: "md" }, classNames: { root: themeClasses.button } }),
     // A badge is never cut short: its text keeps its width (a table column grows for it; a card wraps it).
-    Badge: Badge.extend({ defaultProps: { radius: "sm" }, styles: { root: { fontVariantNumeric: "tabular-nums", maxWidth: "none", flexShrink: 0 }, label: { overflow: "visible", textOverflow: "clip" } } }),
+    Badge: Badge.extend({ defaultProps: { radius: "sm" }, classNames: { root: themeClasses.badge }, styles: { root: { fontVariantNumeric: "tabular-nums", maxWidth: "none", flexShrink: 0 }, label: { overflow: "visible", textOverflow: "clip" } } }),
     Paper: Paper.extend({ defaultProps: { radius: "md" } }),
     Alert: Alert.extend({ defaultProps: { radius: "md" } }),
     Code: Code.extend({ styles: { root: { whiteSpace: "pre-wrap", overflowWrap: "anywhere", borderRadius: radius.sm } } }),

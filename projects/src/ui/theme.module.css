@@ -6,3 +6,17 @@
     min-height: var(--nest-hit-touch);
   }
 }
+
+/* A small inline trigger (a badge with a tooltip, focusable) keeps its box on touch, and a hit area
+   reaching the 44 px target around it. */
+.badge[tabindex] {
+  position: relative;
+}
+
+@media (pointer: coarse) {
+  .badge[tabindex]::before {
+    content: "";
+    position: absolute;
+    inset: calc((var(--nest-hit-touch) - 100%) / -2) 0;
+  }
+}
