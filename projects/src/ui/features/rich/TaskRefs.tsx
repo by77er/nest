@@ -8,16 +8,17 @@ import type { ReactNode } from "react";
 import { useAsks, useProject, useReviews, useTasks } from "../../api/queries";
 import type { Job, Task } from "../../api/types";
 import { TaskCardTitleLink, TaskChipLink } from "../../common/links";
-import { Row, TaskCards, TaskRefCard } from "../../layout";
+import { Row, TaskCards, TaskChipPending, TaskRefCard } from "../../layout";
 import { REVIEW_STATE } from "../../status";
 import { taskLine } from "../../rich/tasks";
 import { StateBadge } from "../board/StateBadge";
 import { TaskCardBody } from "../board/TaskCardBody";
 
-const useTask = (projectId: string, id: string) => useTasks(projectId).data?.find((t) => t.id === id);
-
 export function TaskChip({ projectId, id, fallback }: { projectId: string; id: string; fallback: ReactNode }) {
-  const t = useTask(projectId, id);
+  const tasks = useTasks(projectId);
+  // While the board loads: a chip's box with its state's room, so nothing in view grows when it lands.
+  if (tasks.isPending) return <TaskChipPending>{fallback}</TaskChipPending>;
+  const t = tasks.data?.find((x) => x.id === id);
   // An unknown or foreign id: muted inline code, never a link.
   if (!t) return <code data-task-ref="unresolved">{fallback}</code>;
   // The title first, then its state; all phrasing content (it sits inside a paragraph).

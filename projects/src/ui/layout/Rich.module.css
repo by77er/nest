@@ -184,16 +184,19 @@
   line-height: inherit;
   text-decoration: none;
   vertical-align: baseline;
-  position: relative;
 }
 
-/* On touch the chip keeps its inline box; its hit area reaches the 44 px target. */
-@media (pointer: coarse) {
-  .chip::before {
-    content: "";
-    position: absolute;
-    inset: calc((var(--nest-hit-touch) - 100%) / -2) 0;
-  }
+/* A chip while the board loads: muted text and a badge-sized blank, the same box a chip will be. */
+.chipPendingText {
+  color: var(--nest-muted);
+}
+
+.chipPendingBadge {
+  display: inline-block;
+  width: 3.5rem;
+  height: var(--badge-height-sm, 1.125rem);
+  border-radius: var(--mantine-radius-sm);
+  background: var(--nest-subtle);
 }
 
 .chip:hover {
@@ -305,11 +308,11 @@
   overflow-anchor: none;
 }
 
-/* The sentinel at the log's end: scrolled to with room for the composer docked over the page's bottom.
+/* The sentinel at the log's end, the column's gap below the newest message: scrolled to with room for
+   the composer docked over the page's bottom, so that gap stays between the message and the composer.
    A pixel tall, so the browser can take it as the anchor. */
 .sentinel {
   height: 1px;
-  margin-top: calc(var(--mantine-spacing-xl) * -1);
   scroll-margin-bottom: var(--nest-chat-footer, 0px);
 }
 

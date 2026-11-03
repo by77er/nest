@@ -8,7 +8,7 @@ import { Fragment, useState } from "react";
 import { useReviews } from "../../api/queries";
 import type { Dimension, Job } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, icon, LoadingState, Panel, Row, Section, Stack, TableFrame, weight } from "../../layout";
+import { EmptyState, ErrorState, icon, LoadingState, Panel, Row, Section, Stack, TableFrame, TouchTarget, weight } from "../../layout";
 import { REVIEW_STATE } from "../../status";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ReviewTrace } from "../trace/AgentTraces";
@@ -37,19 +37,21 @@ function Verdicts({ job }: { job: Job }) {
         // Pass and fail are status: their roles, and an icon each, so color isn't the only cue.
         const pass = job.verdict![d].verdict === "pass";
         return (
-          <Tooltip key={d} label={job.verdict![d].notes || label} multiline maw="var(--nest-side-panel)">
-            <Badge
-              size="sm"
-              variant="light"
-              color={pass ? "success" : "danger"}
-              leftSection={pass ? <IconCheck size={icon.sm} aria-hidden /> : <IconX size={icon.sm} aria-hidden />}
-              aria-label={`${label}: ${pass ? "passed" : "failed"}`}
-              data-verdict={pass ? "pass" : "fail"}
-              tabIndex={0}
-            >
-              {label}
-            </Badge>
-          </Tooltip>
+          <TouchTarget key={d}>
+            <Tooltip label={job.verdict![d].notes || label} multiline maw="var(--nest-side-panel)">
+              <Badge
+                size="sm"
+                variant="light"
+                color={pass ? "success" : "danger"}
+                leftSection={pass ? <IconCheck size={icon.sm} aria-hidden /> : <IconX size={icon.sm} aria-hidden />}
+                aria-label={`${label}: ${pass ? "passed" : "failed"}`}
+                data-verdict={pass ? "pass" : "fail"}
+                tabIndex={0}
+              >
+                {label}
+              </Badge>
+            </Tooltip>
+          </TouchTarget>
         );
       })}
       {job.tainted && (

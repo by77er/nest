@@ -78,3 +78,15 @@
 .contextInner {
   padding-top: var(--mantine-spacing-md);
 }
+
+/* A small trigger's room: on touch, the 44 px target as layout space around its visual box. */
+.touchTarget {
+  display: inline-flex;
+  align-items: center;
+}
+
+@media (pointer: coarse) {
+  .touchTarget {
+    min-height: var(--nest-hit-touch);
+  }
+}

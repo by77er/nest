@@ -9,8 +9,8 @@
 // tuple: shade 6 is the filled one in light, shade 5 in dark. The scheme follows the system.
 
 import {
-  ActionIcon, Alert, Badge, Button, CloseButton, Code, Collapse, createTheme, type CSSVariablesResolver, defaultVariantColorsResolver, Drawer, InputWrapper,
-  type MantineColorsTuple, Modal, Paper, parseThemeColor, Popover, Text, Timeline, Title, Tooltip, type VariantColorsResolver,
+  ActionIcon, Alert, Badge, Burger, Button, CloseButton, Code, Collapse, createTheme, type CSSVariablesResolver, defaultVariantColorsResolver, Drawer, InputWrapper,
+  type MantineColorsTuple, Modal, NumberInput, Paper, parseThemeColor, Popover, Text, Timeline, Title, Tooltip, type VariantColorsResolver,
 } from "@mantine/core";
 import themeClasses from "./theme.module.css";
 
@@ -244,9 +244,11 @@ export const theme = createTheme({
     // Close is red: every close button (a modal's, a drawer's, a notification's), at a 32 px target.
     CloseButton: CloseButton.extend({ defaultProps: { c: "danger", size: "lg" } }),
     ActionIcon: ActionIcon.extend({ defaultProps: { size: "lg" } }),
+    Burger: Burger.extend({ classNames: { root: themeClasses.burger } }),
+    NumberInput: NumberInput.extend({ classNames: { root: themeClasses.numberInput, control: themeClasses.stepper } }),
     Button: Button.extend({ defaultProps: { size: "sm", radius: "md" }, classNames: { root: themeClasses.button } }),
     // A badge is never cut short: its text keeps its width (a table column grows for it; a card wraps it).
-    Badge: Badge.extend({ defaultProps: { radius: "sm" }, classNames: { root: themeClasses.badge }, styles: { root: { fontVariantNumeric: "tabular-nums", maxWidth: "none", flexShrink: 0 }, label: { overflow: "visible", textOverflow: "clip" } } }),
+    Badge: Badge.extend({ defaultProps: { radius: "sm" }, styles: { root: { fontVariantNumeric: "tabular-nums", maxWidth: "none", flexShrink: 0 }, label: { overflow: "visible", textOverflow: "clip" } } }),
     Paper: Paper.extend({ defaultProps: { radius: "md" } }),
     Alert: Alert.extend({ defaultProps: { radius: "md" } }),
     Code: Code.extend({ styles: { root: { whiteSpace: "pre-wrap", overflowWrap: "anywhere", borderRadius: radius.sm } } }),

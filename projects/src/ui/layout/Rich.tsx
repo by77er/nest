@@ -66,6 +66,16 @@ export const TaskChipAnchor = forwardRef<HTMLAnchorElement, AnchorHTMLAttributes
 });
 
 /** A card's title, a link covering the whole card. */
+/** A task chip while the board loads: the chip's box, the reference's text muted, room for the badge. */
+export function TaskChipPending({ children }: { children: ReactNode }) {
+  return (
+    <span className={classes.chip} data-ds="task-chip" data-pending aria-busy>
+      <span className={classes.chipPendingText}>{children}</span>
+      <span className={classes.chipPendingBadge} aria-hidden />
+    </span>
+  );
+}
+
 export const TaskCardTitleAnchor = forwardRef<HTMLAnchorElement, AnchorHTMLAttributes<HTMLAnchorElement>>(function TaskCardTitleAnchor({ className: _c, ...rest }, ref) {
   return <a ref={ref} className={classes.cardTitle} {...rest} />;
 });

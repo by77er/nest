@@ -65,3 +65,15 @@ export function SectionGrid({ children }: { children: ReactNode }) {
     </SimpleGrid>
   );
 }
+
+/**
+ * A small trigger (a badge with a tooltip) on touch: its own room grows to the 44 px target, centred
+ * around the unchanged visual box, so the hit area never reaches over a neighbour.
+ */
+export function TouchTarget({ children }: { children: ReactNode }) {
+  return (
+    <span className={classes.touchTarget} data-ds="touch-target">
+      {children}
+    </span>
+  );
+}
