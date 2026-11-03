@@ -50,13 +50,13 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 | G1 | upsert | gateway | `epoch ≥ held` (else refuse, log) | replace; a changed epoch cuts the old epoch's conns (4409) | `crates/nest-gateway/src/state.rs` `upsert_sandbox` |
 | G2 | remove / link loss | gateway | — | forget sandbox (all, on loss); cut conns (4409); keys kept | `state.rs` `remove_sandbox`, `clear`; `crates/nest-gateway/src/link.rs:38` |
 | G3 | resync | gateway | `hello_ack` … `resync_done` | unknown sandbox → `busy`; at end drop entries not re-sent | `state.rs` `begin_resync`, `end_resync` |
-| G4 | bind | gateway | version → shape → kid listed → signature → `exp_ms > now`, scope (no lock) → under the write lock: sandbox known → `claims.epoch` = held (older `stale_epoch`, newer `busy`) → client ∈ clients → guest known → guest version | the conn registered (G5) or one refusal, `executed: false` | `crates/nest-gateway/src/verify.rs` `verify_token`, `admit` |
+| G4 | bind | gateway | version → shape → kid listed → signature → `exp_ms > now`, scope (no lock) → under the write lock: sandbox known → `claims.epoch` = held (older `stale_epoch`, newer `busy`) → client ∈ clients → guest known → guest version → not paused (nestd's `sandbox_upsert.paused`, `busy` with a 2 s hint; added 2026-11-02) | the conn registered (G5) or one refusal, `executed: false` | `crates/nest-gateway/src/verify.rs` `verify_token`, `admit` |
 | G5 | register | gateway | G4's state-dependent checks pass, under the same write lock | conn registered | `state.rs` `admit_and_register`; `server.rs` `connection` |
 | G6 | first frame | gateway | `agent_id`, `epoch`, `protocol_version`, where present, equal the binding's | forward; else close 4401 | `verify.rs` `first_frame_mismatch`; `server.rs` `connection` |
 | Q1 | configure | guest | `epoch ≥ identity.epoch` | set identity; else `stale_epoch` | `control.rs:57-77` |
 | Q2 | validate | guest | version; identity set (else `busy`); not frozen (else `busy`); `req.epoch = identity.epoch`; agent attached | run the tool; hangup or `cancel` cancels | `hands/mod.rs:41-111,116-131` |
 
-**Client (runner).** `ensure_target` (cached until 60 s before `exp_ms`: `crates/nest-hands-client/src/lib.rs` `refresh_due`) → `open` → on refusal `Next::{RetrySame (busy, ≤30 s), Resolve (stale_epoch, moved, unknown_key, unauthorized, unsupported_version; once per call), Final}` (`lib.rs` `Refusal::next`, `guest_error_next`, `OpenError::next`; `hands.rs` `connect`) → send `HandsRequest` (**point of no return**) → `exchange`: result, guest error (`busy` → retry in the same budget; others final), close 4409 or EOF → `outcome_unknown` (`hands.rs` `call_with`, `exchange`).
+**Client (runner).** `ensure_target` (cached until 60 s before `exp_ms`: `crates/nest-hands-client/src/lib.rs` `refresh_due`) → `open` → on refusal `Next::{RetrySame (busy or a bind timeout, ≤30 s; ≤120 s once a `busy` with reason `paused` came, since 2026-11-02), Resolve (stale_epoch, moved, unknown_key, unauthorized, unsupported_version; once per call), Final}` (`lib.rs` `Refusal::next`, `guest_error_next`, `OpenError::next`; `hands.rs` `connect`) → send `HandsRequest` (**point of no return**) → `exchange`: result, guest error (`busy` → retry in the same budget; others final), close 4409 or EOF → `outcome_unknown` (`hands.rs` `call_with`, `exchange`).
 
 ## Delivery and timing assumptions
 
@@ -84,7 +84,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 
 | Id | Property | Holds on main? |
 |---|---|---|
-| L1 | sandbox `running` at `e` on `h`, client confirmed, gateway linked with keys, tunnel connected ⇒ a call is admitted after at most one re-resolve plus `busy` waits (≤ 30 s), per call | yes (`hands.rs` `connect`); a call that runs out returns an error and the next call starts afresh |
+| L1 | sandbox `running` at `e` on `h`, client confirmed, gateway linked with keys, tunnel connected ⇒ a call is admitted after at most one re-resolve plus `busy` waits (≤ 30 s, or ≤ 120 s once the VM is reported paused, since 2026-11-02), per call | yes (`hands.rs` `connect`); a call that runs out returns an error and the next call starts afresh |
 | L2 | an attach is eventually confirmed while the sandbox stays placed | retryable errors retry (P3); **a lost `agent_attach` never resolves**: `inflight` stays set and `due` skips it (`lib/slots.ts`) until a new placement or attach |
 | L3 | a host eventually holds the cell's keys | yes: resent on heartbeat while `keysSent` lacks it (`fleet.ts:951-954`) |
 | L4 | a detach eventually takes effect at the gateway | only if `agent_detach` is delivered (see S6) |

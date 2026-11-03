@@ -34,6 +34,7 @@ use nest_protocol::host::proxy::{DropReason, ListenerPurpose, ListenerSpec, Prox
 use nest_protocol::gateway::GuestInfo;
 use nest_protocol::host::runner::{AgentStart as RunnerAgentStart, ExitReason, RunnerEvent, StopMode};
 use nest_protocol::host::Secret;
+use nest_protocol::host::gateway_link::SandboxPause;
 use nest_protocol::model::{
     error_codes, AgentId, CommitReason, EgressPolicy, Epoch, ErrorBody, ForkMode, GenerationId, GenerationKind,
     GenerationRecord, HostId, HostRole, ManifestHash, ManifestKind, RequestId, Resources, SandboxId, SandboxState, Seq, SuspendMode, SandboxEvent,
@@ -1671,7 +1672,33 @@ impl Inner {
         if let Some(mut vm) = s.vm.take() {
             let _ = vm.stop().await;
         }
+        // A pause mark stays: the VM is gone, and the caller's `forget` (teardown, suspend,
+        // fence) drops the mark with the entry; lifting it first would let binds at a stopped VM.
         s.paused = false;
+    }
+
+    /// Freeze `s`'s vCPUs with the sandbox still placed here (a commit's pause), telling the
+    /// gateway first: until [`Self::resume_vm`], its binds get `busy` with a short hint instead of
+    /// a vsock connect that hangs. Connections already bound stall and continue with the VM. A
+    /// failed pause lifts the mark again. No VM: nothing to pause.
+    async fn pause_vm(&self, s: &mut Sbx, reason: String) -> std::io::Result<()> {
+        let Some(vm) = s.vm.as_mut() else { return Ok(()) };
+        self.gateway.set_paused(&s.id, s.epoch, Some(SandboxPause { reason }));
+        let r = vm.pause().await;
+        if r.is_err() {
+            self.gateway.set_paused(&s.id, s.epoch, None);
+        }
+        r
+    }
+
+    /// Run `s`'s VM again after [`Self::pause_vm`]. The gateway admits binds again only once the
+    /// VM runs: a VM that fails to resume stays marked paused, which it is.
+    async fn resume_vm(&self, s: &mut Sbx) -> std::io::Result<()> {
+        if let Some(vm) = s.vm.as_mut() {
+            vm.resume().await?;
+        }
+        self.gateway.set_paused(&s.id, s.epoch, None);
+        Ok(())
     }
 
     fn register_pauser(&self, id: &SandboxId, epoch: Epoch, vm: &dyn Vm) {
@@ -1798,9 +1825,7 @@ impl Inner {
         if let Some(g) = &s.guest {
             let _ = g.prepare_snapshot(matches!(mode, SuspendMode::Memory)).await;
         }
-        if let Some(vm) = s.vm.as_mut()
-            && let Err(e) = vm.pause().await
-        {
+        if let Err(e) = self.pause_vm(&mut s, "suspend".into()).await {
             return (s, Err(internal(e)));
         }
         s.paused = true;
@@ -1831,9 +1856,7 @@ impl Inner {
             return;
         }
         if s.paused {
-            if let Some(vm) = s.vm.as_mut()
-                && let Err(e) = vm.resume().await
-            {
+            if let Err(e) = self.resume_vm(s).await {
                 tracing::error!(sandbox = %id, epoch = epoch.0, error = %e, "a failed suspend's VM can't be resumed");
                 return;
             }
@@ -1886,13 +1909,14 @@ impl Inner {
             let _ = g.prepare_snapshot(false).await;
         }
         if running {
-            s.vm.as_mut().expect("checked").pause().await.map_err(internal)?;
+            self.pause_vm(&mut s, format!("checkpoint ({})", commit_reason_wire(reason))).await.map_err(internal)?;
         }
         let (mut s, r) = self.commit(s, reason, None, self.cfg.commit_timeout()).await;
-        // Never resume a VM fenced during the commit, or whose rejection fences it.
+        // Never resume a VM fenced during the commit, or whose rejection fences it (the fence
+        // forgets the sandbox at the gateway, pause and all).
         if running && !self.fenced(id, epoch) && !r.as_ref().is_err_and(|e| rejection_fences(&e.code)) {
-            if let Some(vm) = s.vm.as_mut() {
-                let _ = vm.resume().await;
+            if let Err(e) = self.resume_vm(&mut s).await {
+                tracing::error!(sandbox = %id, epoch = epoch.0, error = %e, "a checkpoint's VM can't be resumed");
             }
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
@@ -1908,9 +1932,7 @@ impl Inner {
             let mut s = self.lock_live(id, epoch).await?;
             self.transition(id, epoch, SandboxState::Archiving, None, None)?;
             if s.may_hold_work() || s.head.is_none() {
-                if let Some(vm) = s.vm.as_mut() {
-                    let _ = vm.pause().await;
-                }
+                let _ = self.pause_vm(&mut s, "archive".into()).await;
                 let (s2, r) = self.commit(s, CommitReason::Archive, None, self.cfg.commit_timeout()).await;
                 s = s2;
                 r?;
@@ -2279,6 +2301,11 @@ impl Inner {
             }
         }
     }
+}
+
+/// A commit reason as the wire spells it (`turn_end`), for the gateway's pause reason.
+fn commit_reason_wire(reason: CommitReason) -> String {
+    serde_json::to_value(reason).ok().and_then(|v| v.as_str().map(str::to_owned)).unwrap_or_else(|| format!("{reason:?}"))
 }
 
 /// Whether SandboxDO's rejection of a commit fences the incarnation. The fence runs from a spawned

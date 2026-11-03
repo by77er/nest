@@ -78,6 +78,7 @@ fn enum_members_match_enums_json() {
     check_enum::<EgressVerdict>(&enums, "EgressVerdict", s);
     check_enum::<EgressVia>(&enums, "EgressVia", s);
     check_enum::<ForkMode>(&enums, "ForkMode", s);
+    check_enum::<nest_protocol::gateway::RefusalReason>(&enums, "GatewayRefusalReason", s);
     check_enum::<GenerationKind>(&enums, "GenerationKind", s);
     check_enum::<HostRole>(&enums, "HostRole", s);
     check_enum::<ManifestKind>(&enums, "ManifestKind", s);

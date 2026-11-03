@@ -158,6 +158,7 @@ describe("shared lists (the Rust crate asserts the same files)", () => {
     BindingScope: [G.BindingScope, G.BindingScope.options],
     CommitReason: [M.CommitReason, M.CommitReason.options],
     EgressAlertReason: [M.EgressAlertReason, M.EGRESS_ALERT_REASONS],
+    GatewayRefusalReason: [G.GatewayRefusalReason, G.GATEWAY_REFUSAL_REASONS],
     EgressVerdict: [C.EgressVerdict, C.EgressVerdict.options],
     EgressVia: [C.EgressVia, C.EgressVia.options],
     ForkMode: [M.ForkMode, M.ForkMode.options],

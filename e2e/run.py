@@ -682,13 +682,22 @@ def gateway_log():
     return re.sub(r"\x1b\[[0-9;]*m", "", read(os.path.join(WORK, "logs", "gateway.log")))
 
 
-def gateway_probe(url, binding, version):
-    """Open /hands on the gateway as a brain would and return the first reply (see gateway_probe.mjs)."""
-    p = subprocess.run(["node", os.path.join(E2E, "gateway_probe.mjs"), url, binding, str(version)], capture_output=True, text=True, timeout=30)
-    try:
-        return json.loads(p.stdout.strip().splitlines()[-1])
-    except (IndexError, json.JSONDecodeError):
-        return {"error": (p.stdout + p.stderr).strip()[:200]}
+def gateway_probe(url, binding, version, busy_budget_s=30):
+    """Open /hands on the gateway as a brain would and return the first reply (see gateway_probe.mjs). A retryable
+    `busy` is retried after its `retry_after_ms`, as every client does, within `busy_budget_s`: a turn-end checkpoint
+    may hold the VM paused when the probe runs, and the gateway then answers `busy` at once."""
+    deadline = time.time() + busy_budget_s
+    while True:
+        p = subprocess.run(["node", os.path.join(E2E, "gateway_probe.mjs"), url, binding, str(version)], capture_output=True, text=True, timeout=30)
+        try:
+            r = json.loads(p.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError):
+            return {"error": (p.stdout + p.stderr).strip()[:200]}
+        m = r.get("message") or {}
+        busy = m.get("type") == "error" and (m.get("error") or {}).get("code") == "busy"
+        if not busy or time.time() >= deadline:
+            return r
+        time.sleep(min((m.get("retry_after_ms") or 500) / 1000, 2))
 
 
 def tamper_signature(binding):
@@ -1330,6 +1339,129 @@ def run_retention(ids):
     check("retention: no placement refused its head", "is not a restore source" not in read(os.path.join(WORK, "logs", "wrangler.log")))
 
 
+def checkpoint_turn(agid, name, steps):
+    """Enqueue one scripted fake-brain turn; returns its results path (read with results_by_label)."""
+    path = os.path.join(WORK, f"ckpt-{name}.json")
+    out = os.path.join(WORK, f"ckpt-{name}.jsonl")
+    with open(path, "w") as fh:
+        json.dump({"results": out, "steps": steps}, fh, indent=2)
+    st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {path}"})
+    check(f"checkpoint pause: turn {name} enqueued", st == 201, json.dumps(t)[:200])
+    return out
+
+
+def write_disk(path, mib):
+    """Fill the first `mib` MiB of the sandbox's (sparse) disk image with data no chunk store has seen,
+    so the next commit's chunking pass, which holds the VM paused, stores new chunks and takes a while."""
+    salt = uuid.uuid4().bytes
+    with open(path, "r+b") as f:
+        for i in range(mib // 4):
+            pattern = salt + i.to_bytes(8, "little")
+            f.write((pattern * ((4 << 20) // len(pattern) + 1))[: 4 << 20])
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def run_checkpoint_pause(ids):
+    """2026-11-02, cell use1: hands calls failed at once ("hands unavailable: bind timed out") while a turn-end
+    checkpoint held the VM paused for its chunking pass. Here a turn-end checkpoint's pause is held (the control
+    plane is stopped with SIGSTOP while nestd waits for the commit's answer) while the next turn makes a hands call:
+    the gateway answers `busy` at once (nestd marked the sandbox paused), the runner waits it out, and the call
+    runs once the VM does."""
+    if REAL:
+        skip("hands during a checkpoint's pause", "fake mode only: the turns are scripted around the pause")
+        return
+    sbx, agid = ids["sandbox"], ids["agent"]
+    # The incarnation's directory, `<state_dir>/sandboxes/<sandbox>/<epoch>/` (the newest epoch).
+    base = os.path.join(WORK, "state", "sandboxes", sbx)
+    epochs = sorted((d for d in os.listdir(base) if d.isdigit()), key=int) if os.path.isdir(base) else []
+    disks = [p for p in (os.path.join(base, e, "disk.img") for e in epochs) if os.path.exists(p)]
+    if not check("checkpoint pause: the sandbox's disk image is on the host", disks, str(disks)):
+        return
+    disk = disks[-1]
+
+    def generations():
+        st, g = api("GET", f"/v1/sandboxes/{sbx}/generations")
+        return len(g) if st == 200 and isinstance(g, list) else None
+
+    # A first turn's checkpoint lands; the next turn ends within 10 s of that landing (SandboxDO's
+    # TURN_CHECKPOINT_MIN_MS), so its checkpoint is deferred until the interval is up, by which time the turn
+    # after it is running and blocked on the cue. 1 GiB of fresh data first, so the first pass stores it.
+    write_disk(disk, 1024)
+    before = generations() or 0
+    out = checkpoint_turn(agid, "p", [{"label": "p", "tool": "Bash", "args": {"command": "echo p"}}])
+    try:
+        wait_for(lambda: results_by_label(out).get("p") or None, 60, 0.25, "turn p's result")
+        wait_for(lambda: (generations() or 0) > before or None, 60, 0.25, "turn p's checkpoint landed")
+    except TimeoutError as e:
+        check("checkpoint pause: a first turn-end checkpoint lands", False, str(e)[:200])
+        return
+    cue = os.path.join(WORK, "ckpt-cue")
+    paused_marker = "sandbox paused: binds get busy"
+    paused_before = gateway_log().count(paused_marker)
+    out_a = checkpoint_turn(agid, "a", [{"label": "a", "tool": "Bash", "args": {"command": "echo a"}}])
+    out_b = checkpoint_turn(agid, "b", [{"label": "cue", "await_file": cue, "timeout_s": 90},
+                                         {"label": "during", "tool": "Bash", "args": {"command": "echo during-checkpoint"}}])
+    try:
+        wait_for(lambda: os.path.exists(cue + ".waiting") or None, 30, 0.05, "turn b blocked on the cue")
+    except TimeoutError as e:
+        check("checkpoint pause: the next turn is waiting before the checkpoint", False, str(e)[:200])
+        open(cue, "w").close()
+        return
+    if not check("checkpoint pause: the next turn is waiting before the checkpoint", gateway_log().count(paused_marker) == paused_before,
+                 "no pause before it (a pause here means turn a's checkpoint wasn't deferred: turn p landed over 10 s before turn a ended)"):
+        open(cue, "w").close()
+        return
+    # 512 MiB more no store has seen, so the deferred checkpoint's pass (the pause) takes a while.
+    write_disk(disk, 512)
+    try:
+        # Outlasts the 10 s interval from turn p's landing, the deferred checkpoint's deadline.
+        wait_for(lambda: gateway_log().count(paused_marker) > paused_before or None, 30, 0.02, "the deferred turn-end checkpoint pauses the VM")
+    except TimeoutError as e:
+        check("checkpoint pause: a turn-end checkpoint pauses the VM and nestd tells the gateway", False, str(e)[:200])
+        open(cue, "w").close()
+        return
+    # Hold the pause: nestd waits (unlocked, VM paused) for SandboxDO's answer to its commit_request.
+    wrangler = PROCS["wrangler"]
+    os.killpg(wrangler.pid, signal.SIGSTOP)
+    held_at = time.time()
+    try:
+        open(cue, "w").close()
+
+        def refused_busy():
+            gl = gateway_log()
+            i = -1
+            for _ in range(paused_before + 1):
+                i = gl.find(paused_marker, i + 1)
+            return re.search(r"bind refused.*busy", gl[i:]) if i >= 0 else None
+        try:
+            # The hold stays well under the sandbox host's 20 s lease (self-fence): at most 5 s here and 3 s below.
+            wait_for(refused_busy, 5, 0.05, "a bind refused busy while paused")
+            busy = True
+        except TimeoutError:
+            busy = False
+        time.sleep(3)  # the runner keeps waiting: a call that gave up would have returned by now
+        early = results_by_label(out_b).get("during")
+    finally:
+        os.killpg(wrangler.pid, signal.SIGCONT)
+    held = time.time() - held_at
+    gl = gateway_log()
+    check("checkpoint pause: the gateway refused the call's bind busy at once while the VM was paused", busy,
+          " | ".join(re.findall(r"[^\n]*(?:sandbox paused|bind refused)[^\n]*", gl)[-3:])[-400:])
+    check("checkpoint pause: the call waited while the VM was paused", early is None, json.dumps(early)[:200])
+    try:
+        during = wait_for(lambda: results_by_label(out_b).get("during"), 90, 0.25, "the call after the pause")
+    except TimeoutError as e:
+        check("checkpoint pause: the call ran once the VM ran again", False, str(e)[:200])
+        return
+    check("checkpoint pause: the call ran once the VM ran again",
+          not during.get("is_error") and "during-checkpoint" in (during.get("text") or ""),
+          f"held {held:.1f}s: {json.dumps(during)[:200]}")
+    a = results_by_label(out_a).get("a") or {}
+    check("checkpoint pause: the turn before it ran", not a.get("is_error") and "a" in (a.get("text") or ""), json.dumps(a)[:200])
+    check("checkpoint pause: the gateway heard the VM run again", "sandbox running again" in gateway_log().split(paused_marker)[-1])
+
+
 def run_fencing(ids):
     brains = real_brains() if REAL else children_named(FAKE_CLAUDE)
     guests = children_named(os.path.join(BIN, "nest-guest"))
@@ -1401,6 +1533,7 @@ def main():
             check("gateway listening + synced with nestd", False, str(e))
         check_gateway_unprivileged()
         ids = run_scenario()
+        run_checkpoint_pause(ids)
         run_mcp(ids)
         run_mcp_oauth(ids)
         run_brokered(ids)

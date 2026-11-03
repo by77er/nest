@@ -114,9 +114,9 @@ pub async fn session(
                 tracing::info!(keys = decoded.len(), "binding keys updated");
                 state.set_keys(decoded);
             }
-            GatewayCommand::SandboxUpsert { sandbox, epoch, vsock_uds_path, clients, guest } => {
-                tracing::debug!(sandbox = %sandbox.0, epoch = epoch.0, clients = clients.len(), guest = guest.is_some(), "sandbox upsert");
-                state.upsert_sandbox(sandbox, epoch, PathBuf::from(vsock_uds_path), clients, guest);
+            GatewayCommand::SandboxUpsert { sandbox, epoch, vsock_uds_path, clients, guest, paused } => {
+                tracing::debug!(sandbox = %sandbox.0, epoch = epoch.0, clients = clients.len(), guest = guest.is_some(), paused = paused.is_some(), "sandbox upsert");
+                state.upsert_sandbox_paused(sandbox, epoch, PathBuf::from(vsock_uds_path), clients, guest, paused);
             }
             GatewayCommand::SandboxRemove { sandbox } => {
                 tracing::debug!(sandbox = %sandbox.0, "sandbox removed");
