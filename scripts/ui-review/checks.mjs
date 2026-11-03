@@ -218,25 +218,18 @@ export function measure(sel) {
       }
       return box;
     };
-    /**
-     * Whether (x, y) is outside a box that clips `el`: an ancestor scrolling or hiding its overflow, on
-     * the axis it clips (overflow-x: clip leaves what sticks out below painted and tappable), its box
-     * widened by overflow-clip-margin where that applies.
-     */
-    const clips = (v) => /(auto|scroll|hidden|clip)/.test(v);
-    const clippedAt = (el, x, y) => {
-      for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
-        const cs = getComputedStyle(p);
-        const [cx, cy] = [clips(cs.overflowX), clips(cs.overflowY)];
-        if (!cx && !cy) continue;
-        const r = p.getBoundingClientRect();
-        // overflow-clip-margin widens a clip box (it applies to `clip`, not to scrollers).
-        const m = (v) => (v === "clip" ? parseFloat(cs.overflowClipMargin) || 0 : 0);
-        const [mx, my] = [m(cs.overflowX), m(cs.overflowY)];
-        if (cx && (x < r.left - mx || x > r.right + mx)) return true;
-        if (cy && (y < r.top - my || y > r.bottom + my)) return true;
-      }
-      return false;
+    // Whether, under a, the browser would hand (x, y) to b: a set aside (it and its pseudo-elements take
+    // no pointer events for the probe), what's there is b or inside it. The browser's own answer covers
+    // every way b can be clipped or not (per axis, a clip margin, a fixed or absolute escape, clip-path,
+    // contain), so no CSS is reasoned about here.
+    const probe = document.createElement("style");
+    probe.textContent = "[data-hit-probe], [data-hit-probe]::before, [data-hit-probe]::after { pointer-events: none !important; }";
+    document.head.append(probe);
+    const underIs = (a, b, x, y) => {
+      a.setAttribute("data-hit-probe", "");
+      const under = document.elementFromPoint(x, y);
+      a.removeAttribute("data-hit-probe");
+      return !!under && (under === b || b.contains(under));
     };
     const boxes = controls.map(hitBox);
     for (let i = 0; i < controls.length; i++) {
@@ -253,19 +246,20 @@ export function measure(sel) {
         const l = Math.max(ha.l, rb.left), t = Math.max(ha.t, rb.top), r = Math.min(ha.r, rb.right), btm = Math.min(ha.b, rb.bottom);
         if (r - l < 1 || btm - t < 1) continue;
 
-        // Taps across where a's hit area meets b's box: one landing on a was meant for b. Not where b is
-        // clipped away (scrolled out of its log): no tap is meant for what can't be seen.
+        // Taps across where a's hit area meets b's box: one landing on a was meant for b, where b is really
+        // there under a (not clipped away, scrolled out of its log): no tap is meant for what can't be seen.
         let found = null;
         for (const fx of [0.2, 0.5, 0.8]) {
           for (const fy of [0.2, 0.5, 0.8]) {
             const x = l + (r - l) * fx, y = t + (btm - t) * fy;
-            if (x < 0 || y < 0 || x >= W || y >= H || inOwn(x, y) || clippedAt(b, x, y)) continue;
-            if (controlAt(x, y) === a) found ??= [Math.round(x), Math.round(y)];
+            if (x < 0 || y < 0 || x >= W || y >= H || inOwn(x, y)) continue;
+            if (controlAt(x, y) === a && underIs(a, b, x, y)) found ??= [Math.round(x), Math.round(y)];
           }
         }
         if (found) problems["hit-overlap"].push(`a tap on ${label(b)} at ${found[0]},${found[1]} lands on ${label(a)}`);
       }
     }
+    probe.remove();
   }
 
   // --- user content (Markdown, SVG) can't change the page's outline, hierarchy or ground ---
