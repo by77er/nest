@@ -14,8 +14,10 @@ export interface PickerItem {
   keywords?: string;
   /** At the option's end: its state. */
   end?: ReactNode;
-  /** Shown, but not pickable (and never preselected): why, in `end`. */
+  /** Shown, but not pickable (and never preselected): why, in `caption`. */
   disabled?: boolean;
+  /** A muted line under the label: why it can't be picked, or what it is. */
+  caption?: ReactNode;
 }
 
 export interface PickerProps {
@@ -95,9 +97,16 @@ export function Picker({ label, icon: Icon, items, searchLabel, empty, fromSearc
           {shown.map((i) => (
             <Combobox.Option key={i.value} value={i.value} disabled={i.disabled} aria-label={i.label}>
               <Group gap="sm" justify="space-between" wrap="nowrap">
-                <Text component="span" fz="sm" className={classes.grow}>
-                  {i.label}
-                </Text>
+                <Box className={classes.grow}>
+                  <Text component="span" fz="sm" display="block">
+                    {i.label}
+                  </Text>
+                  {i.caption && (
+                    <Text component="span" fz="xs" c="dimmed" display="block">
+                      {i.caption}
+                    </Text>
+                  )}
+                </Box>
                 {i.end}
               </Group>
             </Combobox.Option>
@@ -154,7 +163,8 @@ export const TriggerBadge = forwardRef<HTMLSpanElement, TriggerBadgeProps & Reac
   ref,
 ) {
   return (
-    <Box component="span" ref={ref} tabIndex={0} aria-label={label} data-marker={marker} className={classes.trigger} {...target}>
+    // The Tooltip's own props (handlers, its className) first, then ours merged in: never replaced.
+    <Box component="span" {...target} ref={ref} tabIndex={0} aria-label={label} data-marker={marker} className={[classes.trigger, target.className].filter(Boolean).join(" ")}>
       <Badge size={size} color={color} variant={variant} leftSection={leftSection}>
         {children}
       </Badge>

@@ -134,7 +134,7 @@ for (const scheme of schemes) {
           await state.after(page);
           await page.waitForTimeout(500);
         }
-        const r = await page.evaluate(measure, { ...app.selectors, viewportOnly: state.full === false });
+        const r = await page.evaluate(measure, { ...app.selectors, viewportOnly: state.full === false, touch: width < 600 });
         shot.frame = r.frame;
         for (const [check, list] of Object.entries(r.problems)) for (const d of list) fail(check, shot, d);
         for (const d of (await state.check?.(page, { width, scheme })) ?? []) fail(state.checkName ?? "app", shot, d);

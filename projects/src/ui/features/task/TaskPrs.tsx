@@ -99,16 +99,8 @@ function AttachPr({ projectId, repo, task, buttonRef }: { projectId: string; rep
     label: `#${p.number} ${p.title}`,
     keywords: p.head,
     disabled: p.task !== null,
-    // Why it can't be picked, or what it is, as a quiet caption.
-    end: p.task ? (
-      <Text component="span" fz="xs" c="dimmed">
-        Attached to {titleOf(p.task)}
-      </Text>
-    ) : p.fork ? (
-      <Text component="span" fz="xs" c="dimmed">
-        From a fork
-      </Text>
-    ) : undefined,
+    // Why it can't be picked, or what it is, as a quiet line under its label.
+    caption: p.task ? `Attached to ${titleOf(p.task)}` : p.fork ? "From a fork" : undefined,
   }));
   // A number, #n or the PR's URL, typed: the listed PR if it is one, else offered as "Attach #n".
   const fromSearch = (s: string): PickerItem | null => {
