@@ -93,8 +93,11 @@ describe("the manager's waits", () => {
       ],
       recent: [],
     };
-    renderApp("/projects/prj_one/manager", api);
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    // In the context column (a disclosure above the chat below `lg`, as jsdom's width is).
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
     const list = await screen.findByRole("list", { name: "The manager's waits" });
+    expect(list.closest('[data-slot="manager-context"]')).not.toBeNull();
     const items = within(list).getAllByRole("listitem").map((li) => li.textContent);
     expect(items).toEqual(["Waiting for #12 to merge · 20 min left", "Waiting for tsk_a to be in_review · 2 h left"]);
   });

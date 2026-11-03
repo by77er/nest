@@ -1,5 +1,6 @@
 // The Manager page's context column: the tasks under way (as the task cards a message shows, newest
-// change first) and the top things waiting on the owner, each linking to the Board's "Needs you", where
+// change first), what the manager waits for (its awaits, soonest deadline first; README.md#waiting) and
+// the top things waiting on the owner, each linking to the Board's "Needs you", where
 // it's answered. The manager's
 // status is in the page's header, not here.
 
@@ -12,6 +13,7 @@ import { MetaItem, MetaRow, Section, Stack } from "../../layout";
 import { approvalOf } from "../attention/AskItem";
 import { SHOWN as ASKS_SHOWN } from "../attention/NeedsYou";
 import { TaskCardList } from "../rich/TaskRefs";
+import { ManagerWaits } from "./ManagerWaits";
 
 /** The states a task is under way in: someone holds it. Drafts, ready and done aren't. */
 export const ACTIVE = new Set(["assigned", "in_progress", "in_review", "stalled"]);
@@ -61,6 +63,7 @@ export function ManagerContext({ projectId }: { projectId: string }) {
           </Text>
         )}
       </Section>
+      <ManagerWaits projectId={projectId} />
       <Section title="Needs you" dense region={false}>
         {asks.length ? (
           <Stack gap="md" data-slot="top-asks">

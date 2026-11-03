@@ -12,7 +12,7 @@ import { NETWORK_PRESETS, NETWORK_ROLES, type NetworkRole, normalizeRules, type 
 import { useNetwork, useSetNetwork } from "../../api/queries";
 import type { EgressRule, LayerStatus, NetworkView, RoleRules } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Stack, Toolbar } from "../../layout";
+import { ErrorState, icon, LoadingState, Measure, MetaItem, MetaRow, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
 import { ProjectFrame } from "../project/ProjectFrame";
 
 const ROLE: Record<NetworkRole, { title: string; description: string }> = {
@@ -71,7 +71,7 @@ function RoleRulesEditor({ role, rules, egressHosts, onChange }: { role: Network
   const custom = preset === "custom";
   return (
     <Panel data-role={role}>
-      <Section title={ROLE[role].title} dense count={rules.length} region={false}>
+      <Section title={ROLE[role].title} order={4} count={rules.length} region={false}>
         <Stack gap="md">
           <Text fz="sm" c="dimmed">
             {ROLE[role].description}
@@ -142,9 +142,8 @@ function LiveAgents({ agents }: { agents: LayerStatus[] }) {
     );
   }
   return (
-    <Panel dense>
-      <Stack gap="md" role="list" aria-label="Live agents' network">
-        {agents.map((a) => (
+    <Stack gap="md" role="list" aria-label="Live agents' network">
+      {agents.map((a) => (
           <Row key={a.agent} role="listitem" justify="space-between" align="flex-start" wrap="nowrap" data-agent={a.agent}>
             <Stack gap="2xs">
               <Text fz="sm" ff="monospace">
@@ -164,9 +163,8 @@ function LiveAgents({ agents }: { agents: LayerStatus[] }) {
               {STATE[a.state].label}
             </Badge>
           </Row>
-        ))}
-      </Stack>
-    </Panel>
+      ))}
+    </Stack>
   );
 }
 
@@ -181,10 +179,12 @@ function NetworkForm({ projectId, view }: { projectId: string; view: NetworkView
   const dirty = JSON.stringify(draft) !== JSON.stringify(view.rules);
   const invalid = useMemo(() => NETWORK_ROLES.some((r) => Object.keys(rulesProblems(draft[r], view.egress_hosts)).length > 0), [draft, view.egress_hosts]);
   return (
-    <Stack gap="2xl">
-      {NETWORK_ROLES.map((role) => (
-        <RoleRulesEditor key={role} role={role} rules={draft[role]} egressHosts={view.egress_hosts} onChange={(r) => setDraft((d) => ({ ...d, [role]: r }))} />
-      ))}
+    <Stack gap="xl">
+      <SectionGrid>
+        {NETWORK_ROLES.map((role) => (
+          <RoleRulesEditor key={role} role={role} rules={draft[role]} egressHosts={view.egress_hosts} onChange={(r) => setDraft((d) => ({ ...d, [role]: r }))} />
+        ))}
+      </SectionGrid>
       <Toolbar>
         <Button variant="default" disabled={!dirty || save.isPending} onClick={() => setDraft(view.rules)}>
           Discard changes
@@ -202,7 +202,7 @@ function PolicyLine({ label, slot, rules }: { label: string; slot: string; rules
   const text = rules.map((r) => (r.ports.every((p) => p === 80 || p === 443) ? r.host : `${r.host}:${r.ports.join(",")}`)).join(", ");
   return (
     <Stack gap="2xs">
-      <Text fz="xs" fw="medium">
+      <Text fz="xs" fw={weight.medium}>
         {label}
       </Text>
       <Text fz="sm" ff="monospace" data-slot={slot}>
@@ -216,7 +216,7 @@ export function NetworkPage() {
   const { projectId } = useParams({ from: "/projects/$projectId/network" });
   const net = useNetwork(projectId);
   return (
-    <ProjectFrame projectId={projectId} measure="form">
+    <ProjectFrame projectId={projectId}>
       {() => (
         <Section title="Network">
           {net.isPending ? (
@@ -225,45 +225,51 @@ export function NetworkPage() {
             <ErrorState title="The network rules couldn't be loaded" error={net.error} onRetry={() => void net.refetch()} />
           ) : (
             <Stack gap="2xl">
-              <Stack gap="md">
-                <Text fz="md">
-                  Agents&apos; sandboxes reach only what the operator&apos;s policy allows. Add hosts a role needs (a package registry, a download site) on top
-                  of it, within the hosts the operator lets this app open.
-                </Text>
-                <MetaRow>
-                  <MetaItem icon={IconWorld}>
-                    {net.data.egress_hosts === null
-                      ? "The grant couldn't be read"
-                      : net.data.egress_hosts.length
-                        ? `This app may open ${net.data.egress_hosts.join(", ")}`
-                        : "This app may open no hosts yet: the operator sets the grant's egress_hosts"}
-                  </MetaItem>
-                </MetaRow>
-              </Stack>
-              <NetworkForm projectId={projectId} view={net.data} />
-              <Section title="The operator's policy" dense region={false}>
-                {net.data.base === null ? (
-                  <Text fz="sm" c="dimmed">
-                    Shown once the manager&apos;s sandbox runs.
+              <Measure type="reading">
+                <Stack gap="md">
+                  <Text fz="md">
+                    Agents&apos; sandboxes reach only what the operator&apos;s policy allows. Add hosts a role needs (a package registry, a download site) on top
+                    of it, within the hosts the operator lets this app open.
                   </Text>
-                ) : (
-                  <Panel dense>
-                    <Stack gap="sm">
+                  <MetaRow>
+                    <MetaItem icon={IconWorld}>
+                      {net.data.egress_hosts === null
+                        ? "The grant couldn't be read"
+                        : net.data.egress_hosts.length
+                          ? `This app may open ${net.data.egress_hosts.join(", ")}`
+                          : "This app may open no hosts yet: the operator sets the grant's egress_hosts"}
+                    </MetaItem>
+                  </MetaRow>
+                </Stack>
+              </Measure>
+              <NetworkForm projectId={projectId} view={net.data} />
+              <SectionGrid>
+                <Panel data-slot="policy">
+                  <Section title="The operator's policy" order={4} region={false}>
+                    {net.data.base === null ? (
                       <Text fz="sm" c="dimmed">
-                        Always allowed, for every role.
+                        Shown once the manager&apos;s sandbox runs.
                       </Text>
-                      <PolicyLine label="nest's defaults" slot="base" rules={net.data.base.filter((r) => r.source === "base")} />
-                      <PolicyLine label="The operator's rules" slot="operator" rules={net.data.base.filter((r) => r.source === "operator")} />
-                      {net.data.base.some((r) => r.source === "repos") && (
-                        <PolicyLine label="The operator's rules, from its repo allowlists" slot="repos" rules={net.data.base.filter((r) => r.source === "repos")} />
-                      )}
-                    </Stack>
-                  </Panel>
-                )}
-              </Section>
-              <Section title="Live agents" dense count={net.data.agents.length} region={false}>
-                <LiveAgents agents={net.data.agents} />
-              </Section>
+                    ) : (
+                      <Stack gap="sm">
+                        <Text fz="sm" c="dimmed">
+                          Always allowed, for every role.
+                        </Text>
+                        <PolicyLine label="nest's defaults" slot="base" rules={net.data.base.filter((r) => r.source === "base")} />
+                        <PolicyLine label="The operator's rules" slot="operator" rules={net.data.base.filter((r) => r.source === "operator")} />
+                        {net.data.base.some((r) => r.source === "repos") && (
+                          <PolicyLine label="The operator's rules, from its repo allowlists" slot="repos" rules={net.data.base.filter((r) => r.source === "repos")} />
+                        )}
+                      </Stack>
+                    )}
+                  </Section>
+                </Panel>
+                <Panel data-slot="live-agents">
+                  <Section title="Live agents" order={4} count={net.data.agents.length} region={false}>
+                    <LiveAgents agents={net.data.agents} />
+                  </Section>
+                </Panel>
+              </SectionGrid>
             </Stack>
           )}
         </Section>

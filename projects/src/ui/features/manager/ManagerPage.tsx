@@ -10,7 +10,6 @@ import { ManagerContext } from "./ManagerContext";
 import { ChatView } from "../chat/ChatView";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ManagerProblem, ManagerStatusLine } from "./ManagerStatus";
-import { ManagerWaits } from "./ManagerWaits";
 import { ManagerTrace } from "../trace/AgentTraces";
 
 export function ManagerPage() {
@@ -25,7 +24,6 @@ export function ManagerPage() {
         <Section title="Manager" actions={<ManagerStatusLine projectId={projectId} />}>
         <Stack gap="xl">
           <ManagerProblem projectId={projectId} />
-          <ManagerWaits projectId={projectId} />
           <Tabs value={tab} onChange={(v) => void navigate({ search: v === "trace" ? { view: "trace" } : {} })} keepMounted={false}>
             <Tabs.List>
               <Tabs.Tab value="chat" leftSection={<IconMessage size={icon.md} />}>
