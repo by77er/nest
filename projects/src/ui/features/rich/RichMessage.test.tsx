@@ -210,6 +210,19 @@ describe("task references", () => {
     expect(root.querySelector("[data-state=in_progress]")).not.toBeNull();
   });
 
+  it("a chip survives the chat re-rendering around it: the same node, not a remount", async () => {
+    const api = new FakeApi();
+    const t = task({ title: "Stay put", state: "ready" });
+    api.tasks = [t];
+    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: `See task:${t.id}.`, delivered: true, error: null }];
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    const chip = await screen.findByRole("link", { name: "Task Stay put" });
+    // Typing re-renders the chat (its state), and so every message in it.
+    await user.type(screen.getByLabelText("Message to the manager"), "abc");
+    expect(chip.isConnected).toBe(true);
+    expect(screen.getByRole("link", { name: "Task Stay put" })).toBe(chip);
+  });
+
   it("clicking a chip in the chat opens the task in the board's drawer", async () => {
     const api = new FakeApi();
     const t = task({ title: "Click me", state: "ready" });
