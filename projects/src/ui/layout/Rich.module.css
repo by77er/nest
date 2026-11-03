@@ -295,6 +295,12 @@
   }
 }
 
+/* Only a whole message anchors the scroll, never something inside one: a chip re-wrapping its line
+   would move an inner anchor, and the page with it. */
+.bubble * {
+  overflow-anchor: none;
+}
+
 /* A chat's column: messages, the sentinel, the composer. */
 .chatColumn {
   display: flex;

@@ -21,7 +21,8 @@
     --input-right-section-width: var(--nest-hit-touch);
   }
 
+  /* Each stepper fills its section's width, inside the input's border. */
   .stepper {
-    min-width: var(--nest-hit-touch);
+    width: 100%;
   }
 }
