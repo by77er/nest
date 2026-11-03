@@ -31,7 +31,7 @@ export function groupLog(messages: ChatMessage[], now = Date.now()): LogItem[] {
     const d = dayKey(m.at_ms);
     if (d !== day) {
       day = d;
-      out.push({ kind: "day", key: `day:${d}`, label: dayLabel(m.at_ms, now) });
+      out.push({ kind: "day", key: `day:${d}:${m.seq}`, label: dayLabel(m.at_ms, now) });
       cur = null;
     }
     const last = cur?.messages.at(-1);

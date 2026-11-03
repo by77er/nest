@@ -5,7 +5,7 @@
 // and a code block's header.
 
 import { useMediaQuery } from "@mantine/hooks";
-import { forwardRef, type ReactNode, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
+import { forwardRef, type ReactNode, useEffect, useImperativeHandle, useLayoutEffect, useRef } from "react";
 import classes from "./ChatLog.module.css";
 
 /**
@@ -19,18 +19,23 @@ import classes from "./ChatLog.module.css";
 export const ChatLog = forwardRef<HTMLDivElement, { children: ReactNode; onScroll?: () => void; label: string; following: boolean }>(function ChatLog({ children, onScroll, label, following }, ref) {
   const el = useRef<HTMLDivElement>(null);
   const phone = useMediaQuery("(max-width: 48em)") ?? false;
-  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
-  useLayoutEffect(() => {
+  // The scroller, resolved when the ref is set (before the feature's effects run, which read it).
+  const scrollerOf = () => {
     const d = el.current;
-    if (d) setScroller(phone ? (d.closest<HTMLDivElement>("[data-ds=page]") ?? d) : d);
-  }, [phone]);
-  useImperativeHandle(ref, () => scroller as HTMLDivElement, [scroller]);
+    return d && phone ? (d.closest<HTMLDivElement>("[data-ds=page]") ?? d) : d;
+  };
+  useImperativeHandle(ref, () => scrollerOf() as HTMLDivElement, [phone]);
   useEffect(() => {
+    const scroller = scrollerOf();
     if (!scroller || !onScroll) return;
     scroller.addEventListener("scroll", onScroll, { passive: true });
     return () => scroller.removeEventListener("scroll", onScroll);
-  }, [scroller, onScroll]);
-  // From `sm` up: as tall as fits, so the page itself never scrolls (at least 12rem).
+  }, [phone, onScroll]);
+  // From `sm` up: as tall as fits, so the page itself never scrolls (at least 12rem): the viewport less
+  // everything else on the page (measured to the page's bottom, never by resetting the log, which would
+  // lose its scroll). Following, it stays at the end as it's resized.
+  const followingRef = useRef(following);
+  followingRef.current = following;
   useLayoutEffect(() => {
     const d = el.current;
     if (!d || phone) {
@@ -38,9 +43,14 @@ export const ChatLog = forwardRef<HTMLDivElement, { children: ReactNode; onScrol
       return;
     }
     const fit = () => {
-      d.style.maxHeight = "";
-      const over = document.documentElement.scrollHeight - window.innerHeight;
-      if (over > 0) d.style.maxHeight = `${Math.max(192, d.getBoundingClientRect().height - over)}px`;
+      const page = d.closest("[data-ds=page]");
+      if (!page) return;
+      const others = page.getBoundingClientRect().bottom + window.scrollY - d.getBoundingClientRect().height;
+      const max = `${Math.max(192, Math.floor(window.innerHeight - others))}px`;
+      if (d.style.maxHeight !== max) {
+        d.style.maxHeight = max;
+        if (followingRef.current) d.scrollTop = d.scrollHeight;
+      }
     };
     fit();
     const ro = new ResizeObserver(fit);
