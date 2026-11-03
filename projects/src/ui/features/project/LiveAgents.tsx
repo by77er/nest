@@ -42,7 +42,7 @@ export function LiveAgents({ agents, label, empty, detail }: LiveAgentsProps) {
                   {a.agent}
                 </Text>
                 <Text fz="xs" c="dimmed" title={a.at_ms ? exact(a.at_ms) : undefined}>
-                  {a.role === "worker" ? "Worker" : "Manager"}
+                  {a.role === "worker" ? "Worker" : a.role === "manager" ? "Manager" : "Reviewer"}
                   {a.at_ms ? ` · updated ${ago(a.at_ms)}` : ""}
                 </Text>
                 {more && (

@@ -9,7 +9,7 @@ import { renderApp } from "../../test/render";
 
 const now = Date.now();
 const secret = (o: Record<string, unknown> = {}) => ({
-  name: "npm_token", description: "npm publish", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" as const }], roles: ["worker" as const], env: "NPM_TOKEN",
+  name: "npm_token", description: "npm publish", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" as const }], roles: ["worker" as const], env: "NPM_TOKEN", nest_name: "prj_one-npm_token-abc123", outside_hosts: [] as string[],
   size: 36, created_ms: now - 86_400_000, updated_ms: now - 3_600_000, holders: [{ agent: "agt_w1", role: "worker" }], last_injected_ms: now - 60_000, in_nest: true, ...o,
 });
 /** Mantine's Select labels its input and its hidden value field: the input is the one shown. */
@@ -37,6 +37,9 @@ describe("the Secrets page", () => {
     expect(within(d).getByLabelText(/^Variable/)).toHaveValue("CLOUDFLARE_API_TOKEN");
     const value = within(d).getByLabelText(/^Value/);
     expect(value).toHaveAttribute("type", "password");
+    // Not offered to a browser's or a password manager's autofill.
+    expect(value).toHaveAttribute("autocomplete", "new-password");
+    expect(value).toHaveAttribute("data-1p-ignore");
     await user.type(value, "s3cr3t-value");
     await user.click(within(d).getByRole("button", { name: "Add the secret" }));
     await waitFor(() => expect(api.writes).toHaveLength(1));
@@ -152,14 +155,26 @@ describe("the Secrets page", () => {
 describe("a request for a secret", () => {
   const req = (o: Record<string, unknown>) => ({ id: "srq_1", type: "ci" as const, name: "NPM_TOKEN", purpose: "publish from CI", hosts: null, agent: "agt_w1", role: "worker", task: null, tainted: false, at_ms: now - 60_000, ...o });
 
-  it("for CI links to the repo's Actions secrets form, and is marked added", async () => {
+  it("for CI links to the repo's environments, never its repository secrets, warns why, and is marked added", async () => {
     const api = new FakeApi();
     api.secretRequests = [req({})];
     const { user } = renderApp("/projects/prj_one/board", api);
     const item = (await screen.findByText("publish from CI")).closest("[data-secret-request]") as HTMLElement;
-    expect(within(item).getByRole("link", { name: "Add NPM_TOKEN on GitHub" })).toHaveAttribute("href", "https://github.com/owner/widgets/settings/secrets/actions/new");
+    expect(within(item).getByRole("link", { name: "Add NPM_TOKEN on GitHub" })).toHaveAttribute("href", "https://github.com/owner/widgets/settings/environments");
+    expect(item).toHaveTextContent("In an environment with required reviewers, not the repo");
+    expect(item).toHaveTextContent("A repository secret is readable by any workflow in the repo, including one a worker pushes.");
+    expect(item).not.toHaveTextContent("Tainted");
     await user.click(within(item).getByRole("button", { name: "Mark added" }));
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/secret-requests/srq_1/done", body: undefined }]));
+  });
+
+  it("from a tainted session is marked, with a caution", async () => {
+    const api = new FakeApi();
+    api.secretRequests = [req({ type: "injected", name: "cf_token", tainted: true })];
+    renderApp("/projects/prj_one/board", api);
+    const item = (await screen.findByText("publish from CI")).closest("[data-secret-request]") as HTMLElement;
+    expect(within(item).getByText("Tainted")).toBeInTheDocument();
+    expect(item).toHaveTextContent("From a tainted session");
   });
 
   it("to inject opens the Secrets form with its name and hosts", async () => {
@@ -170,6 +185,17 @@ describe("a request for a secret", () => {
     const d = await waitFor(sheet);
     expect(within(d).getByLabelText(/^Name/)).toHaveValue("cf_token");
     expect(within(d).getByText("api.cloudflare.com")).toBeInTheDocument();
+  });
+});
+
+describe("a secret outside the grant", () => {
+  it("is marked in the table and named in a notice", async () => {
+    const api = new FakeApi();
+    api.secrets = [secret({ outside_hosts: ["registry.npmjs.org"] })];
+    renderApp("/projects/prj_one/secrets", api);
+    const row = (await screen.findByText("npm_token")).closest("[data-secret]") as HTMLElement;
+    expect(row.querySelector("[data-slot=outside]")).toHaveTextContent("Outside the grant");
+    expect(screen.getByText(/nest won't inject npm_token on registry\.npmjs\.org, so no sandbox gets it/)).toBeInTheDocument();
   });
 });
 
@@ -188,5 +214,13 @@ describe("workers changing CI workflows", () => {
     renderApp("/projects/prj_one/settings", denied);
     await waitFor(() => expect(screen.getAllByRole("switch", { name: /Workers may change CI workflows/ }).at(-1)).toBeDisabled());
     expect(screen.getByText(/The app's grant doesn't allow it/)).toBeInTheDocument();
+  });
+
+  it("off, names the live workers that keep it until they end", async () => {
+    const api = new FakeApi();
+    api.workflowWorkers = ["agt_w1", "agt_w2"];
+    renderApp("/projects/prj_one/settings", api);
+    expect(await screen.findByText("2 live workers keep it until it ends")).toBeInTheDocument();
+    expect(screen.getByText(/these keep it until they end: agt_w1, agt_w2/)).toBeInTheDocument();
   });
 });

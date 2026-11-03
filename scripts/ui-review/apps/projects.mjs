@@ -192,6 +192,7 @@ export default {
     { name: "secrets-empty", section: "project", path: "/projects/prj_demo/secrets", fixture: "secrets-empty" },
     { name: "secret-form", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Add a secret" }).click() },
     { name: "secret-edit", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Edit uploads_key" }).click() },
+    { name: "board-secret-requests", section: "project", path: "/projects/prj_demo/board", fixture: "secret-requests" },
     { name: "secret-delete", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Delete cloudflare_token" }).click() },
     { name: "settings", section: "project", path: "/projects/prj_demo/settings" },
     { name: "switcher-open", section: "project", path: "/projects/prj_demo/reviews", full: false, widths: DESKTOP, after: async (p) => { await p.getByRole("button", { name: /Switch project/ }).click(); await p.keyboard.type("gad"); } },

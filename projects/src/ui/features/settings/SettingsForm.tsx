@@ -146,11 +146,12 @@ export function RepoAutoMergeStatus({ projectId, status }: { projectId: string; 
 function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: string; checked?: boolean; onChange?: (e: React.ChangeEvent<HTMLInputElement>) => void; error?: React.ReactNode }) {
   const secrets = useSecrets(projectId);
   const allowed = secrets.data?.grant?.workflows;
+  const keeping = secrets.data?.workflow_workers ?? [];
   return (
     <Stack gap="sm">
       <Switch
         label="Workers may change CI workflows"
-        description="Their pushes may add or change files under .github/workflows/. Off, GitHub refuses those pushes."
+        description="Their pushes may add or change files under .github/workflows/. Off, GitHub refuses those pushes from workers started from then on; live ones keep it until they end."
         checked={checked}
         onChange={onChange}
         error={error}
@@ -160,6 +161,13 @@ function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: 
         <Text fz="xs" c="dimmed">
           The app's grant doesn't allow it: the operator sets github_push.workflows in its grant first.
         </Text>
+      )}
+      {!checked && keeping.length > 0 && (
+        <Notice tone="warning" title={`${keeping.length === 1 ? "A live worker keeps" : `${keeping.length} live workers keep`} it until it ends`}>
+          <Text fz="sm">
+            Turning it off reaches workers started from now on. A worker's push token is made with its sandbox, so these keep it until they end: {keeping.join(", ")}.
+          </Text>
+        </Notice>
       )}
       {checked && (
         <Notice tone="warning" title="A pushed workflow runs before anyone reviews it">

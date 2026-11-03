@@ -18,6 +18,8 @@ export interface SecretMeta {
   roles: SecretRole[];
   /** The environment variable that holds its placeholder in the sandboxes of its roles. */
   env: string;
+  /** nest's name for it: new at each creation (`nestSecretName`), so a binding from before a delete never names a later one. */
+  nest_name: string;
   /** Its value's size in bytes, as last set (nest's `size`). */
   size: number | null;
   created_ms: number;
@@ -42,8 +44,13 @@ export const MAX_HOSTS = 16;
 export const MAX_LOCATIONS = 3;
 export const MAX_BINDINGS = 16;
 
-/** The nest secret's name: project-scoped, so two projects' `npm_token`s don't collide. */
-export const nestSecretName = (project: string, name: string) => `${project}-${name}`;
+/**
+ * The nest secret's name: project-scoped, so two projects' `npm_token`s don't collide, and with a
+ * generation of its own, made at each creation. A binding names a secret by nest name, and a sandbox
+ * started before a delete may still hold one: a secret made again under the same name must not be the
+ * one it reaches. `prj_<16>-<31>-<6>` is 59 characters, inside nest's 63.
+ */
+export const nestSecretName = (project: string, name: string, generation: string) => `${project}-${name}-${generation}`;
 
 /** The placeholder nest assigns a binding (`nest-ph.<client id>.<name>.`, with its trailing dot). */
 export const placeholder = (client: string, name: string) => `nest-ph.${client}.${name}.`;
@@ -59,9 +66,13 @@ const RESERVED_ENV = new Set([
   "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO",
 ]);
 
+/** Not nest's, but read by gh and other GitHub tools ahead of GITHUB_TOKEN: one set here would take over the brokered token. */
+const GITHUB_ENV = new Set(["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]);
+
 /** Why `name` can't be a secret's variable, or null. `taken`: the variables of the project's other secrets. */
 export function envProblem(name: string, taken: readonly string[] = []): string | null {
   if (!ENV_NAME.test(name)) return "Capital letters, digits and _, not starting with a digit, at most 64";
+  if (GITHUB_ENV.has(name)) return `${name} would take over the sandbox's brokered GitHub token`;
   if (RESERVED_ENV.has(name) || name.startsWith("NEST_")) return `${name} is set by nest or the sandbox`;
   if (taken.includes(name)) return `Another secret uses ${name}`;
   return null;
@@ -120,9 +131,9 @@ export function valueProblem(value: string, grant: SecretGrant | null): string |
 }
 
 /** The binding a secret makes on a sandbox (`ClientInjection`). */
-export function bindingOf(project: string, m: Pick<SecretMeta, "name" | "hosts" | "locations">) {
+export function bindingOf(m: Pick<SecretMeta, "name" | "nest_name" | "hosts" | "locations">) {
   return {
-    name: m.name, secret: nestSecretName(project, m.name), hosts: [...m.hosts], locations: m.locations.map((l) => ({ ...l })),
+    name: m.name, secret: m.nest_name, hosts: [...m.hosts], locations: m.locations.map((l) => ({ ...l })),
     ...(m.hosts.some((h) => h.startsWith("*.")) ? { wildcard: true } : {}),
   };
 }
@@ -132,14 +143,26 @@ export type Binding = ReturnType<typeof bindingOf>;
 const LOCATION_LABEL = (l: SecretLocation) =>
   l.type === "authorization_bearer" ? "a bearer token" : l.type === "authorization_basic_password" ? "a Basic auth password" : `the ${l.name} header`;
 
+/** A secret's hosts outside the grant's `inject_hosts` (none when the grant is unknown: the caller decides). */
+export const outsideGrant = (m: Pick<SecretMeta, "hosts">, injectHosts: readonly string[] | null) =>
+  injectHosts === null ? [] : m.hosts.filter((h) => !hostAllowed(h, injectHosts));
+
 /**
  * What a role's secrets make of a sandbox's client layer: a binding each, and its variable holding the
  * binding's placeholder (nest's limit of bindings: the first by name). Fed to `clientLayerFor`, and sent
- * the same at a sandbox's create.
+ * the same at a sandbox's create. Given the grant's `inject_hosts`, only what's inside it: a host outside
+ * is left out, and a secret with none left is too (`outside`), so nest never refuses the layer for it,
+ * and a refusal of one secret never holds back another's removal.
  */
-export function secretFeeds(client: string, project: string, secrets: readonly SecretMeta[]): { inject: Binding[]; env: Record<string, string>; secrets: SecretMeta[] } {
-  const mine = secrets.slice(0, MAX_BINDINGS);
-  return { inject: mine.map((m) => bindingOf(project, m)), env: Object.fromEntries(mine.map((m) => [m.env, placeholder(client, m.name)])), secrets: mine };
+export function secretFeeds(
+  client: string, secrets: readonly SecretMeta[], injectHosts: readonly string[] | null = null,
+): { inject: Binding[]; env: Record<string, string>; secrets: SecretMeta[]; outside: string[] } {
+  const inside = secrets.map((m) => ({ ...m, hosts: m.hosts.filter((h) => !outsideGrant({ hosts: [h] }, injectHosts).length) }));
+  const mine = inside.filter((m) => m.hosts.length).slice(0, MAX_BINDINGS);
+  return {
+    inject: mine.map(bindingOf), env: Object.fromEntries(mine.map((m) => [m.env, placeholder(client, m.name)])), secrets: mine,
+    outside: inside.filter((m) => !m.hosts.length).map((m) => m.name),
+  };
 }
 
 /**

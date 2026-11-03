@@ -8,7 +8,7 @@ import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { clientIdOf, NestError, nestFrom } from "./nest";
 import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
-import { nestSecretName, type SecretGrant, secretProblems, valueProblem } from "./secrets";
+import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
 import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Network, PutSecret, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
 import { proxyTrace, proxyTraceHistory } from "./trace";
@@ -139,13 +139,17 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       }
       return json({
         secrets: mine.value.map((x) => {
-          const n = theirs.get(nestSecretName(pid, x.name));
-          return { ...x, size: n?.size ?? x.size, last_injected_ms: n?.last_injected_ms ?? null, in_nest: theirs.size ? n !== undefined : null };
+          const n = theirs.get(x.nest_name);
+          // Hosts the grant no longer covers: left out of every layer until the operator widens it.
+          const outside = g.ok ? outsideGrant(x, g.value.inject_hosts) : [];
+          return { ...x, size: n?.size ?? x.size, last_injected_ms: n?.last_injected_ms ?? null, in_nest: theirs.size ? n !== undefined : null, outside_hosts: outside };
         }),
         grant: g.ok ? { ...g.value, used: theirs.size } : null,
         client: clientIdOf(env.NEST_CLIENT_TOKEN),
         // Each live agent's client layer, which carries its bindings and variables (shared with the Network page).
         agents: layers.ok ? layers.value.agents : [],
+        // Live workers whose push token may change workflows (README.md#secrets): theirs until they end.
+        workflow_workers: await p.workflowWorkers(),
       });
     }
     case "PUT secrets/:name": {
@@ -154,33 +158,43 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       if (!b.ok) return b.res;
       const { value, ...meta } = b.value;
       const g = await grantOf(env);
+      // Fail closed: without the grant, nothing here can tell a host nest will refuse.
+      if (!g.ok) return err(503, `the grant couldn't be read, so the secret can't be checked: ${g.error}`);
       const others = await p.secrets();
       const taken = others.ok ? others.value.filter((x) => x.name !== name).map((x) => x.env) : [];
-      const problems = secretProblems({ name, ...meta }, g.ok ? g.value : null, taken);
+      const problems = secretProblems({ name, ...meta }, g.value, taken);
       if (value !== undefined) {
-        const v = valueProblem(value, g.ok ? g.value : null);
+        const v = valueProblem(value, g.value);
         if (v) problems.value = v;
       }
       if (Object.keys(problems).length) return json({ error: Object.values(problems).join("; "), problems }, 400);
       const nest = nestFrom(env);
       if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
       let size: number | null = null;
+      const nestName = await p.nestNameFor(name);
       if (value !== undefined) {
         // Straight to nest, write-only: the value never reaches the app's objects, logs or answers.
         try {
-          size = (await nest.putSecret(nestSecretName(pid, name), value, meta.description)).size;
+          size = (await nest.putSecret(nestName, value, meta.description)).size;
         } catch (e) {
           return err(e instanceof NestError ? e.status : 502, e instanceof NestError && e.status === 403 ? `nest refused it: ${e.message} (the grant's secrets.max_count or max_bytes)` : String(e));
         }
       }
-      return done(await p.saveSecretMeta({ name, ...meta }, size));
+      const saved = await p.saveSecretMeta({ name, ...meta, nest_name: nestName }, size);
+      // Not recorded (a new one refused, or the name made again meanwhile): its value mustn't stay in nest unnamed.
+      if (!saved.ok && value !== undefined && !(await secretRows(p)).some((x) => x.nest_name === nestName)) {
+        await nest.deleteSecret(nestName).catch(() => {});
+      }
+      return done(saved);
     }
     case "DELETE secrets/:name": {
       const name = rest[1]!;
       const nest = nestFrom(env);
       if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
+      const row = (await secretRows(p)).find((x) => x.name === name);
+      if (!row) return err(404, `no secret ${name}`);
       try {
-        await nest.deleteSecret(nestSecretName(pid, name));
+        await nest.deleteSecret(row.nest_name);
       } catch (e) {
         if (!(e instanceof NestError && e.status === 404)) return err(502, String(e));
       }
@@ -345,4 +359,10 @@ async function grantOf(env: Env): Promise<Result<SecretGrant>> {
   } catch (e) {
     return { ok: false, status: 502, error: e instanceof Error ? e.message : String(e) };
   }
+}
+
+/** A project's secrets' metadata, or none when it can't be read. */
+async function secretRows(p: { secrets(): Promise<{ ok: true; value: { name: string; nest_name: string }[] } | { ok: false }> }) {
+  const r = await p.secrets();
+  return r.ok ? r.value : [];
 }

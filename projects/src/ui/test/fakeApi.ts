@@ -48,6 +48,7 @@ export class FakeApi {
   sync: SyncState | null = null;
   reviews: Job[] = [];
   waits: Waits = { pending: [], recent: [] };
+  workflowWorkers: string[] = [];
   network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }] };
   openPrs: OpenPr[] = [];
   secrets: SecretsAnswer["secrets"] = [];
@@ -115,7 +116,7 @@ export class FakeApi {
       if (m === "PUT") {
         const { value: _v, ...meta } = body;
         const had = this.secrets.find((x) => x.name === name);
-        const row = { name, size: _v ? new TextEncoder().encode(_v).length : had?.size ?? null, created_ms: had?.created_ms ?? now, updated_ms: now, holders: had?.holders ?? [], last_injected_ms: null, in_nest: true, ...meta };
+        const row = { name, nest_name: had?.nest_name ?? `prj_one-${name}-abc123`, outside_hosts: [] as string[], size: _v ? new TextEncoder().encode(_v).length : had?.size ?? null, created_ms: had?.created_ms ?? now, updated_ms: now, holders: had?.holders ?? [], last_injected_ms: null, in_nest: true, ...meta };
         this.secrets = [...this.secrets.filter((x) => x.name !== name), row];
         this.layersOwed();
         return json(row);
@@ -164,7 +165,7 @@ export class FakeApi {
       case "GET reviews":
         return json(this.reviews);
       case "GET secrets":
-        return json({ secrets: this.secrets, grant: this.grant, client: "cli_app", agents: this.network.agents });
+        return json({ secrets: this.secrets, grant: this.grant, client: "cli_app", agents: this.network.agents, workflow_workers: this.workflowWorkers });
       case "GET prs/open":
         return json(this.openPrs);
       case "GET chat":

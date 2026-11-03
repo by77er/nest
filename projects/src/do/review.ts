@@ -461,7 +461,8 @@ export class ReviewDO extends DurableObject<Env> {
         const spec = await projectStub(this.env, project).reviewerSpec(key);
         agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, key, spec.extras);
         await directory(this.env).recordAgent({ agent, project, role: "reviewer", task: null, pr });
-        await projectStub(this.env, project).recordHolder(agent, "reviewer", spec.names);
+        // Its holdings and live layer: a secret changed or removed later reaches it too.
+        await projectStub(this.env, project).reviewerStarted(agent, key);
         if (!current()) {
           this.oweStop(agent, "superseded");
           return;
@@ -518,6 +519,9 @@ export class ReviewDO extends DurableObject<Env> {
       }
     }
     this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
+    // Stopped with its sandbox: no layer left to keep up.
+    const project = this.setting("project");
+    if (project) await projectStub(this.env, project).agentEnded(agent);
   }
 }
 

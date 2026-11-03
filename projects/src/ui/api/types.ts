@@ -20,11 +20,13 @@ export type { Attention, Blocked, SecretRequest, SecretView, TaskPr, TaskRef } f
 export type { SecretGrant, SecretLocation, SecretRole } from "../../secrets";
 /** `GET /api/projects/:id/secrets`: the project's secrets with nest's facts, and the grant's limits. */
 export interface SecretsAnswer {
-  secrets: (import("../../do/project").SecretView & { last_injected_ms: number | null; in_nest: boolean | null })[];
+  secrets: (import("../../do/project").SecretView & { last_injected_ms: number | null; in_nest: boolean | null; outside_hosts: string[] })[];
   grant: (import("../../secrets").SecretGrant & { used: number }) | null;
   client: string | null;
   /** Each live agent's client layer, which carries its bindings and variables (as the Network page shows it). */
   agents: import("../../do/project").LayerStatus[];
+  /** Live workers whose push token may change workflows: theirs until they end, whatever the setting says now. */
+  workflow_workers: string[];
 }
 /** One of the repo's open PRs, for attaching: the task it's attached to, if any. */
 export interface OpenPr {

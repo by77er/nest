@@ -133,6 +133,8 @@ export function usePutSecret(id: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (v: { name: string; body: PutSecretBody }) => api.putSecret(id, v.name, v.body),
+    // The variables hold the value: dropped once the save settles, not kept in the mutation cache.
+    gcTime: 0,
     meta: { failure: "The secret wasn't saved" },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: keys.attention(id) });

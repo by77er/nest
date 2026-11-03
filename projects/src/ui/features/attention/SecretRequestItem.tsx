@@ -1,14 +1,16 @@
 // An agent asking for a secret, in "Needs you" (README.md#secrets): one for the repo's CI, which the
-// owner adds on GitHub and marks done; or one for nest to inject, set up in the Secrets form, prefilled.
-// Never a value: the agent names what it needs and why.
+// owner adds to an approval-gated GitHub environment (never as a repository secret, which any workflow
+// in the repo reads, a worker's pushed one too) and marks done; or one for nest to inject, set up in the
+// Secrets form, prefilled. Never a value: the agent names what it needs and why. A tainted session's
+// request is marked, with a caution: its purpose may be an injected instruction.
 
-import { Anchor, Button, Text } from "@mantine/core";
+import { Anchor, Badge, Button, Text } from "@mantine/core";
 import { IconExternalLink, IconKey } from "@tabler/icons-react";
 import { useProject, useSecretRequestDone } from "../../api/queries";
 import type { Attention } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
-import { icon, MetaItem, MetaRow, Prose, Stack, Toolbar } from "../../layout";
+import { icon, MetaItem, MetaRow, Notice, Prose, Stack, Toolbar } from "../../layout";
 
 type Item = Extract<Attention, { kind: "secret" }>;
 
@@ -30,7 +32,17 @@ export function SecretRequestItem({ projectId, item }: { projectId: string; item
           </MetaItem>
         )}
         <MetaItem title={exact(item.at_ms)}>{ago(item.at_ms)}</MetaItem>
+        {item.tainted && (
+          <Badge size="xs" color="gray" variant="outline">
+            Tainted
+          </Badge>
+        )}
       </MetaRow>
+      {item.tainted && (
+        <Notice tone="warning" title="From a tainted session">
+          <Text fz="sm">This agent read text from outside the project (a PR, an issue, a web page). The request may be an instruction planted there: be sure the task needs it before you give it a credential.</Text>
+        </Notice>
+      )}
       <Text fz="md">
         {item.type === "ci" ? "Asks for the GitHub Actions secret " : "Asks for a credential to inject, "}
         <Text component="span" ff="monospace" fw="medium">
@@ -43,7 +55,7 @@ export function SecretRequestItem({ projectId, item }: { projectId: string; item
         {item.type === "ci" ? (
           <Button
             component="a"
-            href={repo ? `https://github.com/${repo}/settings/secrets/actions/new` : undefined}
+            href={repo ? `https://github.com/${repo}/settings/environments` : undefined}
             target="_blank"
             rel="noreferrer"
             leftSection={<IconExternalLink size={icon.md} />}
@@ -64,10 +76,16 @@ export function SecretRequestItem({ projectId, item }: { projectId: string; item
         </Button>
       </Toolbar>
       {item.type === "ci" && (
+        <Notice tone="warning" title="In an environment with required reviewers, not the repo">
+          <Text fz="sm">
+            Add {item.name} to an environment whose deployments need a reviewer, and have the job that uses it name that environment. A repository secret is readable by any workflow in the repo, including one a worker pushes. The value goes in GitHub's form, never in a chat.
+          </Text>
+        </Notice>
+      )}
+      {item.type === "ci" && (
         <Text fz="xs" c="dimmed">
-          GitHub's form: name it {item.name}. The value goes in there, never in a chat.{" "}
-          <Anchor href="https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions" target="_blank" rel="noreferrer" inherit>
-            About Actions secrets
+          <Anchor href="https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment" target="_blank" rel="noreferrer" inherit>
+            GitHub: environments with required reviewers
           </Anchor>
         </Text>
       )}

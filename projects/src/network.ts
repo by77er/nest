@@ -6,6 +6,9 @@
 
 export const NETWORK_ROLES = ["worker", "manager"] as const;
 export type NetworkRole = (typeof NETWORK_ROLES)[number];
+/** The roles with a live client layer: the network's, and reviewers (no rules of their own; secrets only). */
+export const LAYER_ROLES = ["worker", "manager", "reviewer"] as const;
+export type LayerRole = (typeof LAYER_ROLES)[number];
 
 /** One allow rule, nest's shape: a host, and its ports (absent: 80 and 443). */
 export interface EgressRule {
@@ -130,9 +133,9 @@ export interface LayerFeeds {
  * network change never drops a secret's binding, and a secrets change never drops a host. A kept
  * binding goes back in the PUT's shape, its placeholder (nest's, and unchanged) left for nest to assign.
  */
-export function clientLayerFor(rules: RoleRules, role: NetworkRole, feeds: LayerFeeds, current: HeldClientLayer | null): ClientLayer {
+export function clientLayerFor(rules: RoleRules, role: LayerRole, feeds: LayerFeeds, current: HeldClientLayer | null): ClientLayer {
   return {
-    egress: { allow: normalizeRules(rules[role]) },
+    egress: { allow: role === "reviewer" ? [] : normalizeRules(rules[role]) },
     inject: (feeds.inject ?? current?.inject ?? []).map(asBinding),
     env: feeds.env ?? current?.env ?? {},
   };
@@ -192,4 +195,32 @@ export function operatorRules(allow: readonly PolicyAllow[], own: readonly Egres
     }
   }
   return out;
+}
+
+/** A layer's egress rules inside the grant's `egress_hosts` only (all of them when the grant is unknown). */
+export function egressWithinGrant(layer: ClientLayer, egressHosts: readonly string[] | null): ClientLayer {
+  return egressHosts === null ? layer : { ...layer, egress: { allow: layer.egress.allow.filter((r) => hostAllowed(r.host, egressHosts)) } };
+}
+
+/**
+ * The part of `current` that `desired` keeps: what applies every removal and adds nothing. Sent when
+ * nest refuses `desired` (or the grant can't be read), since what it removes is the safe half: nest
+ * checks a layer against the grant as it is now, and less of a layer that passed passes, so a refusal
+ * of something new never holds back a revocation. A binding keeps only the hosts and locations both have.
+ */
+export function shrinkLayer(current: HeldClientLayer | null, desired: ClientLayer): ClientLayer {
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
+  const allow = normalizeRules(current?.egress.allow ?? []).filter((r) => desired.egress.allow.some((d) => same(normalizeRules([d])[0], r)));
+  const inject = (current?.inject ?? []).map(asBinding).flatMap((b): Binding[] => {
+    const d = desired.inject.find((x) => x.name === b.name && x.secret === b.secret);
+    if (!d) return [];
+    const hosts = b.hosts.filter((h) => d.hosts.includes(h));
+    const locations = b.locations.filter((l) => d.locations.some((x) => same(x, l)));
+    if (!hosts.length || !locations.length) return [];
+    return [{ name: b.name, secret: b.secret, hosts, locations, ...(hosts.some((h) => h.startsWith("*.")) ? { wildcard: true } : {}) }];
+  });
+  // A variable holding a placeholder goes with its binding (nest refuses one that names none in the layer).
+  const env = Object.fromEntries(Object.entries(current?.env ?? {}).filter(([k, v]) =>
+    desired.env[k] === v && (!v.includes("nest-ph.") || inject.some((x) => v.endsWith(`.${x.name}.`)))));
+  return { egress: { allow }, inject, env };
 }

@@ -12,7 +12,7 @@ import { useState } from "react";
 import { useDeleteSecret, useSecrets } from "../../api/queries";
 import type { SecretLocation, SecretView } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Sheet, Stack, TableFrame, Token } from "../../layout";
+import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Row, Section, Sheet, Stack, TableFrame, Token } from "../../layout";
 import { LiveAgents } from "../project/LiveAgents";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { SecretForm } from "./SecretForm";
@@ -86,6 +86,18 @@ export function SecretsPage() {
                 <MetaItem>Each up to {secrets.data.grant.max_bytes} bytes</MetaItem>
               </MetaRow>
             )}
+            {(secrets.data?.secrets.filter((x) => x.outside_hosts.length).length ?? 0) > 0 && (
+              <Notice tone="warning" title="Some hosts are outside the grant">
+                <Stack gap="2xs">
+                  {secrets.data!.secrets.filter((x) => x.outside_hosts.length).map((x) => (
+                    <Text key={x.name} fz="sm">
+                      nest won't inject {x.name} on {x.outside_hosts.join(", ")}
+                      {x.outside_hosts.length === x.hosts.length ? ", so no sandbox gets it" : ""}. The operator must widen the grant's inject_hosts, or you can remove those hosts.
+                    </Text>
+                  ))}
+                </Stack>
+              </Notice>
+            )}
             {secrets.isPending ? (
               <LoadingState label="Loading the secrets" />
             ) : secrets.isError ? (
@@ -139,6 +151,13 @@ export function SecretsPage() {
                               {h}
                             </Token>
                           ))}
+                          {s.outside_hosts.length > 0 && (
+                            <Row>
+                              <Badge size="sm" color="warning" variant="light" data-slot="outside">
+                                Outside the grant
+                              </Badge>
+                            </Row>
+                          )}
                         </Stack>
                       </Table.Td>
                       <Table.Td>

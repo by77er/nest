@@ -131,7 +131,8 @@ export function SecretForm({ projectId, grant, editing, initial, takenEnv = [], 
             description="Sent to nest when you save; never stored by the app, and never shown again."
             value={value}
             onChange={(e) => setValue(e.currentTarget.value)}
-            autoComplete="off"
+            autoComplete="new-password"
+            data-1p-ignore
             error={shown("value")}
             required
           />
