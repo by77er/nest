@@ -1297,7 +1297,10 @@ impl Inner {
             drop_pending_cut(&mut s, "the incarnation is retired: its salvage reads the disk");
             (s.id.clone(), s.epoch)
         };
-        let _commit = self.commit_lock(&id, epoch).lock_owned().await;
+        // Its own handle on the lock: released across each backoff below, so a command waiting on
+        // it (one that began before the fence) gets it, finds the fence and returns.
+        let lock = self.commit_lock(&id, epoch);
+        let mut commit = Some(lock.clone().lock_owned().await);
         let mut s = entry.clone().lock_owned().await;
         if s.retiring {
             return;
@@ -1323,8 +1326,10 @@ impl Inner {
                 Err(e) => {
                     tracing::warn!(sandbox = %id, epoch = epoch.0, code = %e.code, message = %e.message, retry_in = ?backoff, "salvage failed: the disk is kept and the salvage retried");
                     drop(s);
+                    drop(commit.take());
                     tokio::time::sleep(backoff).await;
                     backoff = incarnation::retire_backoff(backoff);
+                    commit = Some(lock.clone().lock_owned().await);
                     s = entry.clone().lock_owned().await;
                 }
             }
@@ -1333,6 +1338,7 @@ impl Inner {
         recovery::remove_incarnation(&s.state_dir);
         recovery::remove_incarnation(&s.vm_dir);
         drop(s);
+        drop(commit);
         self.commit_locks.lock().expect("commit locks").remove(&(id.clone(), epoch));
         if destroyed {
             return; // a destroy took it: nothing left to report
@@ -1619,6 +1625,7 @@ impl Inner {
             Err(e) => {
                 self.set_state(&sandbox, epoch, SandboxState::Failed, None, Some(e.to_string()));
                 self.teardown(&sandbox, DropReason::Teardown).await;
+                self.forget_commit_locks(&sandbox, epoch);
                 // It never ran for an agent: nothing to keep, and a retry at this epoch starts clean.
                 recovery::remove_incarnation(&state_dir);
                 recovery::remove_incarnation(&vm_dir);
@@ -1843,7 +1850,7 @@ impl Inner {
         // commit in flight, before the VM is paused. No new cut can queue meanwhile: commands run
         // one at a time.
         drop_pending_cut(&mut *self.lock_live(id, epoch).await?, "a suspend commits a newer read of the disk");
-        let _commit = self.commit_lock(id, epoch).lock_owned().await;
+        let _commit = self.commit_turn(id, epoch).await?;
         let s = self.lock_live(id, epoch).await?;
         let state = self.summary.lock().expect("summary").get(id).map(|x| x.state);
         if state == Some(SandboxState::Suspended) {
@@ -1968,7 +1975,7 @@ impl Inner {
 
     /// A checkpoint without a cut (M1): the VM is paused while its disk is read.
     async fn checkpoint_by_read(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: CommitReason) -> CmdResult {
-        let _commit = self.commit_lock(id, epoch).lock_owned().await;
+        let _commit = self.commit_turn(id, epoch).await?;
         let s = self.lock_live(id, epoch).await?;
         let timeout = self.cfg.commit_timeout();
         let (mut s, answered) = match self.reask(s, reason, timeout).await {
@@ -2019,6 +2026,24 @@ impl Inner {
         self.commit_locks.lock().expect("commit locks").entry((id.clone(), epoch)).or_default().clone()
     }
 
+    /// The command executor's way to `id@epoch`'s commit lock: a stale or fenced epoch is refused
+    /// before the wait, so a fenced incarnation's salvage (which holds the lock through its retries)
+    /// never holds up the host's one executor, and again after it, for a fence that landed during
+    /// the wait. What waits is only a commit in flight of a live incarnation, or one salvage attempt
+    /// (the retire releases the lock across its backoff).
+    async fn commit_turn(&self, id: &SandboxId, epoch: Epoch) -> Result<tokio::sync::OwnedMutexGuard<()>, ErrorBody> {
+        self.check_epoch(id, epoch)?;
+        let guard = self.commit_lock(id, epoch).lock_owned().await;
+        self.check_epoch(id, epoch)?;
+        Ok(guard)
+    }
+
+    /// Forget the commit locks of `id`'s incarnations at or below `epoch` (destroyed, archived or
+    /// never started): a holder keeps its own handle, and nothing asks for one of these again.
+    fn forget_commit_locks(&self, id: &SandboxId, epoch: Epoch) {
+        self.commit_locks.lock().expect("commit locks").retain(|(sid, e), _| !(sid == id && *e <= epoch));
+    }
+
     /// A checkpoint that cuts the disk (M2, `docs/sandbox/state/disk/`). The guest flushes and the
     /// disk file is synced while the VM runs; the VM is paused only for the cut (a reflink clone,
     /// or, for a disk unchanged since the last pass, the M1 check); then it resumes and the cut is
@@ -2041,6 +2066,19 @@ impl Inner {
             let d = disk.clone();
             let _ = tokio::task::spawn_blocking(move || storage::sync_data(&d)).await;
         }
+        // The guard against an unbounded pause (a disk fragmented, on purpose or not, until its
+        // clone would outlast a read of it): counted while the VM runs.
+        let read_instead = match (storage::extent_count(&disk), std::fs::metadata(&disk)) {
+            (Ok(extents), Ok(meta)) => {
+                let allocated = std::os::unix::fs::MetadataExt::blocks(&meta) * 512;
+                let slower = storage::clone_slower_than_read(extents, allocated, self.cfg.cut_clone_ns_per_extent, self.cfg.cut_read_bytes_per_s);
+                if slower {
+                    tracing::warn!(sandbox = %id, epoch = epoch.0, extents, allocated, "checkpoint: the disk's clone would outlast reading it: this cut reads it in the pause");
+                }
+                slower
+            }
+            _ => false,
+        };
         let paused_at = Instant::now();
         if running {
             self.pause_vm(&mut s, format!("checkpoint ({})", commit_reason_wire(reason))).await.map_err(internal)?;
@@ -2061,6 +2099,7 @@ impl Inner {
             };
             let source = match reread {
                 Some(read) => CutSource::Read(read),
+                None if read_instead => CutSource::Read(storage::scan_file_keeping(store.as_ref(), &d, ManifestKind::Disk, HOLD_BACK_BYTES, keep_local)?),
                 None => {
                     match mode {
                         CutMode::LockedCopy => storage::locked_copy(&d, &c)?,
@@ -2199,7 +2238,7 @@ impl Inner {
     async fn archive(self: &Arc<Self>, id: &SandboxId, epoch: Epoch) -> CmdResult {
         {
             drop_pending_cut(&mut *self.lock_live(id, epoch).await?, "an archive commits a newer read of the disk");
-            let _commit = self.commit_lock(id, epoch).lock_owned().await;
+            let _commit = self.commit_turn(id, epoch).await?;
             let mut s = self.lock_live(id, epoch).await?;
             self.transition(id, epoch, SandboxState::Archiving, None, None)?;
             if s.may_hold_work() || s.head.is_none() {
@@ -2214,6 +2253,7 @@ impl Inner {
         }
         self.transition(id, epoch, SandboxState::Archived, None, None)?;
         self.teardown(id, DropReason::Teardown).await;
+        self.forget_commit_locks(id, epoch);
         Ok(None)
     }
 
@@ -2235,8 +2275,10 @@ impl Inner {
         // salvage stops once its directory is gone).
         recovery::remove_up_to(&self.cfg.sandboxes_dir(), id, epoch);
         recovery::remove_up_to(&self.cfg.vms_dir(), id, epoch);
-        // Nothing of the sandbox is left here at or below this epoch: neither is its tombstone.
+        // Nothing of the sandbox is left here at or below this epoch: neither is its tombstone, nor
+        // a commit lock (a retire still running holds its own).
         self.tombstones.prune_up_to(id, epoch);
+        self.forget_commit_locks(id, epoch);
         Ok(None)
     }
 

@@ -1067,17 +1067,27 @@ async fn start_host_lapsing() -> Started {
 }
 
 async fn start_host_leased(proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>, commit_timeout_ms: u64, lease: LeaseTiming, disk_cut: &str) -> Started {
+    start_host_configured(proxy_ca, commit_timeout_ms, lease, disk_cut, serde_json::json!({})).await
+}
+
+/// [`start_host_leased`] with more of nestd.json (`extra`'s keys over the test's).
+async fn start_host_configured(
+    proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>, commit_timeout_ms: u64, lease: LeaseTiming, disk_cut: &str, extra: serde_json::Value,
+) -> Started {
     let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet_with(lease).await;
-    let cfg: Config = serde_json::from_value(serde_json::json!({
+    let mut cfg = serde_json::json!({
         "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
         "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
         "driver": {"type": "process", "guest_command": ["unused"]},
         "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": commit_timeout_ms,
         "guest_ready_timeout_ms": GUEST_READY_TIMEOUT_MS, "disk_cut": disk_cut,
-    }))
-    .unwrap();
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        cfg[k] = v.clone();
+    }
+    let cfg: Config = serde_json::from_value(cfg).unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca, tunnel_token: None, gateway_url: None };
     let driver = FakeDriver::default();
     let host = Host::start(cfg, enrolled, Some(Arc::new(driver.clone()))).await.unwrap();
@@ -3080,4 +3090,100 @@ async fn a_commit_answered_after_a_fence_leaves_the_written_disk_dirty() {
     let salvaged: Vec<_> = commit_requests(&h.fleet, "sbx_1").into_iter().filter(|r| r.0 == CommitReason::Salvage).collect();
     assert_eq!(salvaged.len(), 1, "the work after the checkpoint's read is salvaged");
     assert!(first_chunk_of(&h, &salvaged[0].2).starts_with(b"written after the checkpoint's read"));
+}
+
+/// A checkpoint of an incarnation that was fenced, and whose salvage holds the commit lock (its
+/// answer held back here), fails at once with `stale_epoch`, as on main: it never waits on that
+/// lock, which would stall the host's one command executor and every sandbox's commands behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_of_a_fenced_incarnation_fails_at_once_while_its_salvage_holds_the_commit_lock() {
+    for cutting in [false, true] {
+        let h = if cutting { start_host_cutting().await } else { start_host().await };
+        let sbx = SandboxId("sbx_1".into());
+        h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+        assert!(is_ok(&h.fleet.result("cmd_create").await));
+        h.fleet.commands.send(vec![create("cmd_create2", "sbx_2")]).unwrap();
+        assert!(is_ok(&h.fleet.result("cmd_create2").await));
+        guest_write(&disk_path(h.dir.path(), "sbx_1", 1), 0, b"work");
+        h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+        h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
+        wait_until("the salvage is out", || commit_requests(&h.fleet, "sbx_1").iter().any(|r| r.0 == CommitReason::Salvage)).await;
+        // The other sandbox's command is behind it in the one executor.
+        h.fleet.commands.send(vec![ck("cmd_ck_stale", "sbx_1")]).unwrap();
+        h.fleet.commands.send(vec![cmd("cmd_ck_other", CommandBody::PortUnexpose { sandbox: SandboxId("sbx_2".into()), epoch: Epoch(1), port: 8080 })]).unwrap();
+        let stale = tokio::time::timeout(Duration::from_secs(2), h.fleet.result("cmd_ck_stale")).await;
+        let other = tokio::time::timeout(Duration::from_secs(2), h.fleet.result("cmd_ck_other")).await;
+        h.fleet.release_commit_answers();
+        match stale {
+            Ok(CommandOutcome::Error { error }) => assert_eq!(error.code, "stale_epoch", "cutting={cutting}"),
+            other => panic!("cutting={cutting}: the stale checkpoint waited on the salvage's commit lock: {other:?}"),
+        }
+        assert!(other.is_ok(), "cutting={cutting}: another sandbox's command waited behind it");
+    }
+}
+
+/// A retire waits for the commit in flight: the salvage's `commit_request` goes out only once the
+/// checkpoint's commit has its answer, so two commits of one incarnation never overlap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_salvage_waits_for_the_checkpoints_answer() {
+    for cutting in [false, true] {
+        let h = if cutting { start_host_cutting().await } else { start_host().await };
+        let sbx = SandboxId("sbx_1".into());
+        h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+        assert!(is_ok(&h.fleet.result("cmd_create").await));
+        let disk = disk_path(h.dir.path(), "sbx_1", 1);
+        guest_write(&disk, 0, b"the checkpoint's");
+        h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+        h.fleet.commands.send(vec![ck("cmd_ck", "sbx_1")]).unwrap();
+        wait_until("the checkpoint's commit is out", || !commit_requests(&h.fleet, "sbx_1").is_empty()).await;
+        guest_write(&disk, 0, b"after the checkpoint");
+        h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
+        h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+        wait_until("the VM stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let before: Vec<_> = commit_requests(&h.fleet, "sbx_1").into_iter().map(|r| r.0).collect();
+        assert_eq!(before, vec![CommitReason::TurnEnd], "cutting={cutting}: no salvage while the checkpoint's commit waits for its answer");
+        h.fleet.release_commit_answers();
+        h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
+        let after: Vec<_> = commit_requests(&h.fleet, "sbx_1").into_iter().map(|r| r.0).collect();
+        assert_eq!(after, vec![CommitReason::TurnEnd, CommitReason::Salvage], "cutting={cutting}");
+    }
+}
+
+/// The cut's guard: where the disk's clone would outlast reading it (here, a clone priced so high
+/// that any disk's would), the cut reads the disk in the pause instead. A second cut queued behind
+/// a commit whose answer is held shows it: no cut file waits for its commit, which still has what
+/// was written before it. Without the price, the same second cut leaves its cut file waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_whose_clone_would_outlast_a_read_reads_the_disk_instead() {
+    for guarded in [true, false] {
+        let extra = if guarded { serde_json::json!({"cut_clone_ns_per_extent": 1_000_000_000_000u64}) } else { serde_json::json!({}) };
+        let h = start_host_configured(None, 5000, STEADY_LEASE, "locked_copy", extra).await;
+        h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+        assert!(is_ok(&h.fleet.result("cmd_create").await));
+        let disk = disk_path(h.dir.path(), "sbx_1", 1);
+        guest_write(&disk, 0, b"first");
+        // FIEMAP answers on ext4 and XFS (CI's and the hosts'), not on tmpfs: there the guard can't
+        // count, and cuts as before.
+        if nestd::storage::extent_count(&disk).is_err() {
+            eprintln!("skipped: no FIEMAP on {}", h.dir.path().display());
+            return;
+        }
+        h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+        cut(&h.fleet, "cmd_ck1", "sbx_1").await;
+        wait_until("the first commit is out", || !commit_requests(&h.fleet, "sbx_1").is_empty()).await;
+        guest_write(&disk, 0, b"second, before its cut");
+        cut(&h.fleet, "cmd_ck2", "sbx_1").await;
+        let waiting = cut_files(h.dir.path(), "sbx_1");
+        guest_write(&disk, 0, b"after the second cut");
+        h.fleet.release_commit_answers();
+        wait_until("the second commit is out", || commit_requests(&h.fleet, "sbx_1").len() == 2).await;
+        if guarded {
+            assert!(waiting.is_empty(), "read in the pause, not cut: {waiting:?}");
+        } else {
+            assert_eq!(waiting.len(), 1, "cloned: the cut waits for its commit");
+        }
+        let reqs = commit_requests(&h.fleet, "sbx_1");
+        assert!(first_chunk_of(&h, &reqs[1].2).starts_with(b"second, before its cut"), "guarded={guarded}");
+    }
 }

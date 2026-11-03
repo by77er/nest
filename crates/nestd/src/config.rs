@@ -75,6 +75,22 @@ pub struct Config {
     /// How a checkpoint cuts a running sandbox's disk (`docs/sandbox/state/disk/`).
     #[serde(default)]
     pub disk_cut: DiskCut,
+    /// The cut's guard against a clone that would pause a VM longer than reading its disk: a cut
+    /// whose disk's extent records, at this many ns each, would take longer than reading its
+    /// allocated bytes at `cut_read_bytes_per_s` reads the disk in the pause instead, as M1 does.
+    /// Defaults from M2's measurement on a `c8id.large` (`docs/sandbox/state/disk/`).
+    #[serde(default = "default_cut_clone_ns_per_extent")]
+    pub cut_clone_ns_per_extent: u64,
+    #[serde(default = "default_cut_read_bytes_per_s")]
+    pub cut_read_bytes_per_s: u64,
+}
+
+fn default_cut_clone_ns_per_extent() -> u64 {
+    15_000
+}
+
+fn default_cut_read_bytes_per_s() -> u64 {
+    180_000_000
 }
 
 /// How a checkpoint takes a running sandbox's disk.
@@ -281,6 +297,17 @@ impl Config {
         Ok(())
     }
 
+    /// What must exist before nestd starts: a Firecracker driver's kernel and images directory. On
+    /// an instance store left blank by a stop and start (user data doesn't run again), they are
+    /// gone, and a host that started anyway would enroll and fail every sandbox it was given.
+    pub fn check_paths(&self) -> anyhow::Result<()> {
+        if let Some(DriverConfig::Firecracker(fc)) = &self.driver {
+            anyhow::ensure!(fc.kernel_image.is_file(), "the guest kernel {} is missing", fc.kernel_image.display());
+            anyhow::ensure!(fc.images_dir.is_dir(), "the images directory {} is missing", fc.images_dir.display());
+        }
+        Ok(())
+    }
+
     pub fn flush_interval(&self) -> Duration {
         Duration::from_millis(self.flush_interval_ms)
     }
@@ -383,6 +410,31 @@ mod tests {
 
     /// Each host kind configures only what it runs: a sandbox host needs a driver; a brain host may
     /// name nothing a sandbox needs. The previous release's role names still parse.
+    #[test]
+    fn refuses_to_start_without_the_kernel_or_the_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let (k, i) = (dir.path().join("vmlinux"), dir.path().join("images"));
+        let cfg = |k: &std::path::Path, i: &std::path::Path| {
+            serde_json::from_value::<Config>(serde_json::json!({
+                "role": "sandbox", "cell": "c", "enrollment": {"type": "aws_imds"},
+                "driver": {"type": "firecracker", "firecracker_bin": "/fc", "kernel_image": k, "images_dir": i},
+            }))
+            .unwrap()
+        };
+        assert!(cfg(&k, &i).check_paths().unwrap_err().to_string().contains("guest kernel"));
+        std::fs::write(&k, b"k").unwrap();
+        assert!(cfg(&k, &i).check_paths().unwrap_err().to_string().contains("images directory"));
+        std::fs::create_dir(&i).unwrap();
+        cfg(&k, &i).check_paths().unwrap();
+        // The process driver needs neither.
+        serde_json::from_value::<Config>(serde_json::json!({
+            "role": "sandbox", "cell": "c", "enrollment": {"type": "aws_imds"}, "driver": {"type": "process", "guest_command": ["g"]},
+        }))
+        .unwrap()
+        .check_paths()
+        .unwrap();
+    }
+
     #[test]
     fn validates_what_each_host_kind_configures() {
         let parse = |v: serde_json::Value| serde_json::from_value::<Config>(v).unwrap();

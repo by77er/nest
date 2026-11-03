@@ -63,7 +63,9 @@ instance_store() {
   if ! command -v mkfs.xfs >/dev/null || ! command -v xfs_info >/dev/null; then echo "no mkfs.xfs or xfs_info"; return 1; fi
   blkid -o value -s TYPE "$NVME" 2>/dev/null | grep -qx xfs || mkfs.xfs -q -f -m reflink=1 -L nest-data "$NVME" || return 1
   install -d -m 0755 "$DATA" || return 1
-  grep -q '^LABEL=nest-data ' /etc/fstab 2>/dev/null || echo "LABEL=nest-data $DATA xfs defaults,noatime,nofail 0 2" >> /etc/fstab || return 1
+  # `nofail` so a boot without it still comes up, and a short device timeout: a store left blank by
+  # a stop and start never shows its label. The units that use it require it (below).
+  grep -q '^LABEL=nest-data ' /etc/fstab 2>/dev/null || echo "LABEL=nest-data $DATA xfs defaults,noatime,nofail,x-systemd.device-timeout=10s 0 2" >> /etc/fstab || return 1
   mountpoint -q "$DATA" || mount "$DATA" || return 1
   xfs_info "$DATA" 2>/dev/null | grep -q 'reflink=1' || { echo "the instance store at $DATA has no reflink"; return 1; }
 }
@@ -72,6 +74,15 @@ if [ -n "$NVME" ]; then
     STATE_DIR=$DATA/state KERNEL_DIR=$DATA/kernel IMAGES_DIR=$DATA/images JAILER_BASE=$DATA/jailer
     install -d -m 0755 "$STATE_DIR" "$KERNEL_DIR" "$IMAGES_DIR" "$JAILER_BASE"
     if [ -f /var/lib/nest/kernel/vmlinux ] && [ ! -f "$KERNEL_DIR/vmlinux" ]; then cp /var/lib/nest/kernel/vmlinux "$KERNEL_DIR/vmlinux"; fi
+    # After a reboot nestd must not start before the store is mounted (it would write into the bare
+    # directory the mount then hides), and after a stop and start (the store comes back blank, and
+    # user data doesn't run again) it must not start at all: the host fails loudly and never
+    # enrolls, and nestd refuses to start without its kernel and images besides.
+    for unit in nestd.service nest-proxy.service nest-gateway.service; do
+      install -d -m 0755 "/etc/systemd/system/$unit.d"
+      printf '[Unit]\nRequiresMountsFor=%s\n' "$DATA" > "/etc/systemd/system/$unit.d/instance-store.conf"
+    done
+    systemctl daemon-reload
     echo "sandbox state on the instance store at $DATA (XFS, reflink)"
   else
     echo "the instance store isn't usable: sandbox state stays on the root volume, and checkpoints pause VMs for whole reads"
