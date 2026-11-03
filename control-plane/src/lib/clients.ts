@@ -3,6 +3,7 @@
 // ceiling, checked the same way for every client.
 import { z } from "zod";
 import { GithubRepoPermissions, levelWithin } from "./github";
+import { InjectHost, injectionsOutsideGrant, SECRET_MAX_BYTES_DEFAULT } from "./client-secrets";
 import { canonicalRepos, Repo } from "./repos";
 import type { AgentSpec, Capability } from "./spec";
 import { hex, sha256 } from "./util";
@@ -55,6 +56,24 @@ export const Grant = z.strictObject({
     repos: z.array(Repo).max(256).default([]),
     permissions: GithubRepoPermissions.default({}),
   }).optional(),
+  /**
+   * The secrets it may store (`PUT /v1/clients/self/secrets/<name>`, docs/control-plane/api/clients/#secrets):
+   * at most `max_count` of them, each value at most `max_bytes` (UTF-8). A grant stored before this field reads as none.
+   */
+  secrets: z.strictObject({
+    max_count: z.number().int().min(0).max(1000).default(0),
+    max_bytes: z.number().int().min(1).max(65_536).default(SECRET_MAX_BYTES_DEFAULT),
+  }).default({ max_count: 0, max_bytes: SECRET_MAX_BYTES_DEFAULT }),
+  /**
+   * The hosts its secrets may be injected into (docs/control-plane/api/clients/#injection): exact names,
+   * or `*.` suffixes of two or more labels. A grant stored before this field reads as none.
+   */
+  inject_hosts: z.array(InjectHost).max(64).default([]),
+  /**
+   * What its sandboxes' GitHub push tokens may carry beyond `contents` and `pull_requests` (docs/control-plane/api/clients/#workflow-files):
+   * `workflows: true` lets its specs ask for `workflows: write`. Absent (as in every grant stored before it): nothing more.
+   */
+  github_push: z.strictObject({ workflows: z.boolean().default(false) }).optional(),
   /** Live (not ended, not destroyed) at once, across its whole subtree. */
   max_agents: z.number().int().min(0).max(100_000).default(0),
   max_sandboxes: z.number().int().min(0).max(100_000).default(0),
@@ -91,7 +110,7 @@ function brokeredOutside(action: string, repos: readonly string[] | null, capabi
  * Everything an expanded spec reaches outside the grant: its credential, each mcp server and the
  * secrets it authenticates with, its push allowlist, its read-only repos and its brokered actions. Empty: within it.
  */
-export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "brokered" | "repos" | "read_repos">, grant: Grant): string[] {
+export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "brokered" | "repos" | "read_repos" | "inject" | "github_push">, grant: Grant): string[] {
   const out: string[] = [];
   const creds = new Set(grant.credentials);
   if (!creds.has(spec.credential)) out.push(`credential ${spec.credential}`);
@@ -112,6 +131,8 @@ export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "b
     const o = brokeredOutside(b.action, "repos" in b ? b.repos : null, b.capability, grant);
     if (o) out.push(o);
   }
+  out.push(...injectionsOutsideGrant(spec.inject ?? [], grant.inject_hosts ?? []));
+  if (spec.github_push?.workflows && !grant.github_push?.workflows) out.push("github_push.workflows");
   return out;
 }
 
