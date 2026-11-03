@@ -40,6 +40,6 @@ credential: claude_oauth_token:captain   # revocable separately from workers
 ## Safeguards
 
 - A captain acts only through tool calls bounded by its grants, its budget and its taint; all three are bounded by mine.
-- Its workers get only grants and budget it holds; the `worker` template gives agents with hands no management capabilities (no `spawning`, `sandboxes` or `authority`).
+- Its workers get only grants and budget it holds; the `worker` template gives agents with hands no management capabilities (no `spawning`, `management` or `authority`); its interim `sandboxes` lists only `fork_sandbox`, which answers `not_implemented`.
 - It can use a separate setup token from workers (`credential` above).
 - `priority: high` reserves subscription headroom for it.

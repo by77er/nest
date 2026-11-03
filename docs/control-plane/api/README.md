@@ -13,7 +13,7 @@
   - **Cells:** must be well-formed names, and must be in `CELLS` when that's set. See [which routes take a cell](#which-routes-take-a-cell).
   - **Agents:** `POST /v1/agents` takes an agent's cell from its sandbox when it has one; a cell that differs from the sandbox's is refused (409).
   - **Creates take an [`Idempotency-Key`](#idempotency-keys).**
-  - **Compat (one release):** `POST /v1/sandboxes` and `POST /v1/agents` accept a `workstream` field and ignore it (old clients and scripts send it).
+  - **Compat (one release):** `POST /v1/sandboxes` and `POST /v1/agents` accept a `workstream` field and ignore it (old clients and scripts send it); the operator's `POST /v1/agents` refuses `overrides.params` with a 400 rather than drop it silently.
 
 ## Live trace
 

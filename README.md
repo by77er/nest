@@ -6,7 +6,7 @@ nest runs many long-lived Claude Code agents at once. Each agent's brain is an u
 
 ## What it does
 
-- **Parallel agents in isolated VMs.** Fork a sandbox to give an agent its own copy of the work.
+- **Parallel agents in isolated VMs,** each with its own sandbox.
 - **Durable by default.** Sessions and workspaces outlive hosts; idle agents cost nothing and wake on their next input.
 - **A microkernel.** The platform keeps sandboxes, agents, credentials, egress policy and MCP attachment, behind a generic API for clients. Captains, task boards and review pipelines are built on that interface by agents and external apps, such as the [projects](projects/README.md) task board.
 - **Safe by construction.**
