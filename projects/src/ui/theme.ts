@@ -146,6 +146,8 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
     "--mantine-color-dimmed": neutrals[s].muted,
     "--mantine-color-default-border": neutrals[s].border,
     ...Object.fromEntries(ROLES.map((r) => [`--nest-on-${r}`, filled[s].text[r]])),
+    // Mantine's error color (a field's error, the required asterisk) is the danger role's text shade.
+    "--mantine-color-error": palette.danger[roleText[s].danger],
     // A role's text on the surface (`c="warning"`): dark enough in light, light enough in dark, for AA.
     ...Object.fromEntries(ROLES.map((r) => [`--mantine-color-${r}-text`, palette[r][roleText[s][r]]])),
   });
@@ -181,13 +183,17 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
 
 /**
  * A filled role takes its scheme's text color (`--nest-on-<role>`): white or dark in light, dark in dark,
- * whichever meets AA. Everything else is Mantine's.
+ * whichever meets AA; a gray outline is the muted text on a hairline. Everything else is Mantine's.
  */
 const variantColorResolver: VariantColorsResolver = (input) => {
   const r = defaultVariantColorsResolver(input);
   const parsed = parseThemeColor({ color: input.color ?? input.theme.primaryColor, theme: input.theme });
   if (input.variant === "filled" && parsed.isThemeColor && (ROLES as readonly string[]).includes(parsed.color) && parsed.shade === undefined) {
     return { ...r, color: `var(--nest-on-${parsed.color})` };
+  }
+  // A neutral outline (a "Tainted" badge): muted text on a hairline, not Mantine's gray 6 (3.3:1 on white).
+  if (input.variant === "outline" && (input.color ?? "") === "gray") {
+    return { ...r, color: "var(--nest-muted)", border: "1px solid var(--nest-border-color)", hover: "var(--nest-subtle)" };
   }
   return r;
 };

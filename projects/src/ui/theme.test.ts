@@ -158,6 +158,16 @@ describe("contrast, in both schemes", () => {
     }
   });
 
+  it.each(schemes)("%s: a neutral outline badge (Tainted) is the muted text, and Mantine's error color the danger text", (s) => {
+    const outline = full.variantColorResolver({ color: "gray", theme: full, variant: "outline" });
+    expect(outline.color).toBe("var(--nest-muted)");
+    expect(outline.border).toContain("var(--nest-border-color)");
+    for (const ground of [neutrals[s].surface, neutrals[s].page, neutrals[s].subtle]) expect(contrast(neutrals[s].muted, ground)).toBeGreaterThanOrEqual(AA);
+    const error = vars[s]["--mantine-color-error"]!;
+    expect(error).toBe(palette.danger[roleText[s].danger]);
+    for (const ground of [neutrals[s].surface, neutrals[s].page]) expect(contrast(error, ground), `error on ${ground}`).toBeGreaterThanOrEqual(AA);
+  });
+
   it.each(schemes)("%s: a role's text (`c=\"warning\"`) on the surface, the page and the subtle ground", (s) => {
     for (const r of ROLES) {
       const fg = palette[r][roleText[s][r]];
