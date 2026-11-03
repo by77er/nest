@@ -32,6 +32,10 @@ export const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).opt
 export const Spec = z.strictObject({
   goal: Text(4000), acceptance_criteria: z.array(Text(1000)).max(50), files: z.array(Text(1000)).max(50), test_plan: Text(4000),
 });
+/** A PR to attach: its number, `#<n>`, or its URL on github.com (README.md#prs). */
+export const AttachPr = z.strictObject({ pr: z.union([z.number().int().positive(), z.string().min(1).max(300)]) });
+/** A task this one waits on (README.md#dependencies). */
+export const AddDependency = z.strictObject({ blocked_by: z.string().regex(/^tsk_[a-z0-9]+$/, "a task id (tsk_…)") });
 export const Chat = z.strictObject({ text: z.string().min(1).max(20000) });
 export const Answer = z.strictObject({ answer: z.string().max(20000) });
 export const Cancel = z.strictObject({ reason: Text(1000).optional() });
@@ -44,6 +48,8 @@ export type SettingsBody = z.input<typeof Settings>;
 export type NetworkBody = z.input<typeof Network>;
 export type CreateTaskBody = z.input<typeof CreateTask>;
 export type UpdateTaskBody = z.input<typeof UpdateTask>;
+export type AttachPrBody = z.input<typeof AttachPr>;
+export type AddDependencyBody = z.input<typeof AddDependency>;
 export type ChatBody = z.input<typeof Chat>;
 export type AnswerBody = z.input<typeof Answer>;
 export type CancelBody = z.input<typeof Cancel>;

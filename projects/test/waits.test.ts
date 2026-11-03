@@ -172,6 +172,18 @@ describe("await_pr", () => {
     ].sort());
   });
 
+  it("answers at once for a PR already recorded merged on a task (README.md#prs)", async () => {
+    const s = await setup();
+    const t = await s.task("t");
+    // Two PRs on one task, one merged: the task stays in review, but that PR has merged.
+    await stub(s).onPullRequest({ pr: 31, task: t, action: "opened", merged: false, node: "PR_31", fork: false, title: "t" });
+    await stub(s).onPullRequest({ pr: 32, task: t, action: "opened", merged: false, node: "PR_32", fork: false, title: "t" });
+    await stub(s).onPullRequest({ pr: 31, task: t, action: "closed", merged: true });
+    expect(ok(await board(s, "await_pr", { pr: 31, until: "merged", timeout_s: 600 })).status).toBe("met");
+    // The one still open is waited on.
+    expect(ok(await board(s, "await_pr", { pr: 32, until: "merged", timeout_s: 600 })).status).toBe("waiting");
+  });
+
   it("a review that ends in the queue reaches the wait through ReviewDO's outbox", async () => {
     const s = await setup();
     const w = ok(await board(s, "await_pr", { pr: 31, until: "review_done", timeout_s: 600 }));

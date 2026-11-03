@@ -11,6 +11,7 @@ export type ClientEvent =
   | { type: "agent.exited"; agent: string; reason: string; text: string }
   | { type: "agent.ask"; agent: string; ask: string; question: string; approval?: { name: string; tool: string } }
   | { type: "agent.error"; agent: string; code: string; message: string }
+  | { type: "agent.timer_fired"; agent: string; timer: string; note: string }
   | { type: "sandbox.destroyed"; sandbox: string };
 export type StampedEvent = ClientEvent & { id: string };
 

@@ -55,6 +55,19 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
     { name: "assign_task", description: "Assign a ready (or stalled) task: the app starts a worker for it.", inputSchema: obj({ task: taskId }, ["task"]), idempotent: true },
     { name: "cancel_task", description: "Cancel a task that isn't done; its worker, if any, is stopped.", inputSchema: obj({ task: taskId, reason: str("Why.", 1000) }, ["task"]), idempotent: true },
     {
+      name: "attach_pr",
+      description: "Attach an open PR of the repo to a task (a task may have several). The task is done once all its attached PRs have merged. Refused if the PR is attached to another task: detach it there first.",
+      inputSchema: obj({ task: taskId, pr: { type: "integer", minimum: 1, description: "The PR's number." } }, ["task", "pr"]),
+      idempotent: true,
+    },
+    { name: "detach_pr", description: "Detach a PR from a task (one that hasn't merged).", inputSchema: obj({ task: taskId, pr: { type: "integer", minimum: 1, description: "The PR's number." } }, ["task", "pr"]), idempotent: true },
+    {
+      name: "add_dependency",
+      description: "Make a task wait on another (blocked_by): it can't be assigned until that one is done. Refused if it would make a cycle.",
+      inputSchema: obj({ task: taskId, blocked_by: str("The task it waits on (tsk_…).", 64) }, ["task", "blocked_by"]),
+    },
+    { name: "remove_dependency", description: "Stop a task waiting on another.", inputSchema: obj({ task: taskId, blocked_by: str("The task it waited on (tsk_…).", 64) }, ["task", "blocked_by"]), idempotent: true },
+    {
       name: "block_task",
       description: "Mark a task blocked on the owner: a decision only they can make, or credentials or access you can't get. It shows at the top of the owner's board until they answer or you clear it. Not for anything you could resolve yourself.",
       inputSchema: obj({ task: taskId, reason: str("What blocks it, specifically.", 2000), question: str("What you need the owner to answer or do, if anything.", 2000) }, ["task", "reason"]),
@@ -90,7 +103,7 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
     { name: "list_waits", description: "Your pending waits, each with its deadline.", inputSchema: obj({}), readOnly: true, idempotent: true },
   ],
   task: [
-    { name: "get_task", description: "Your task: its title, body, spec, repo and the branch to push.", inputSchema: obj({}), readOnly: true, idempotent: true },
+    { name: "get_task", description: "Your task: its title, body, spec, repo, the branch to push, its attached PRs, and the tasks it waits on (its dependencies) with their states.", inputSchema: obj({}), readOnly: true, idempotent: true },
     { name: "report_progress", description: "Tell the board how your task is going.", inputSchema: obj({ text: str("What you did or found.") }, ["text"]) },
     {
       name: "report_blocked",

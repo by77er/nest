@@ -120,6 +120,8 @@ struct Sbx {
     slots: BTreeMap<AgentId, (u16, Option<u32>)>,
     /// agent → initial Bash cwd (`agent_attach.cwd`, default `/workspace`)
     slot_cwds: BTreeMap<AgentId, String>,
+    /// agent → its slot's environment (`agent_attach.env`)
+    slot_envs: BTreeMap<AgentId, BTreeMap<String, String>>,
     /// tcp exception rule (`host:port`) → (listener id, port)
     tcp_listeners: BTreeMap<String, (u32, u16)>,
     known_ports: BTreeSet<u16>,
@@ -167,6 +169,7 @@ impl Sbx {
             next_listener: 1,
             slots: BTreeMap::new(),
             slot_cwds: BTreeMap::new(),
+            slot_envs: BTreeMap::new(),
             tcp_listeners: BTreeMap::new(),
             known_ports: BTreeSet::new(),
             exposed: BTreeMap::new(),
@@ -203,7 +206,12 @@ impl Sbx {
 
     /// The attached agents' slots, as the guest's `configure` carries them.
     fn agent_slots(&self) -> Vec<AgentSlot> {
-        self.slots.iter().map(|(agent, (slot, _))| slot_for(agent, *slot, self.slot_cwds.get(agent).cloned().unwrap_or_else(|| DEFAULT_CWD.into()))).collect()
+        self.slots
+            .iter()
+            .map(|(agent, (slot, _))| {
+                slot_for(agent, *slot, self.slot_cwds.get(agent).cloned().unwrap_or_else(|| DEFAULT_CWD.into()), self.slot_envs.get(agent).cloned().unwrap_or_default())
+            })
+            .collect()
     }
 
     /// What `meta.json` records about this incarnation (see `recovery.rs`), with `inflight` as the
@@ -1483,7 +1491,7 @@ impl Inner {
             // Resolved on receipt (see `on_fleet_notice`).
             CommandBody::CommitResult { .. } | CommandBody::GuestCliResult { .. } => Ok(None),
             CommandBody::AgentStart(start) => self.agent_start(start).await,
-            CommandBody::AgentAttach { sandbox, epoch, agent, cwd } => self.agent_attach(&sandbox, epoch, &agent, cwd).await,
+            CommandBody::AgentAttach { sandbox, epoch, agent, cwd, env } => self.agent_attach(&sandbox, epoch, &agent, cwd, env).await,
             CommandBody::AgentDetach { sandbox, epoch, agent, kill_processes } => self.agent_detach(&sandbox, epoch, &agent, kill_processes).await,
             // A kill was applied on arrival; a graceful stop (or one from the previous release) goes in order.
             CommandBody::AgentStop { mode: Some(StopMode::Kill), .. } => Ok(None),
@@ -2094,7 +2102,7 @@ impl Inner {
 
     /// The sandbox side of `attach`: a slot (explicit proxy listener + guest `agent_attach`) for
     /// the agent, then the gateway learns the client. Idempotent: an existing slot keeps its port.
-    async fn agent_attach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, cwd: Option<String>) -> CmdResult {
+    async fn agent_attach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, cwd: Option<String>, env: BTreeMap<String, String>) -> CmdResult {
         let mut s = self.lock_live(sandbox, epoch).await?;
         let slot = match s.slots.get(agent) {
             Some((slot, _)) => *slot,
@@ -2118,12 +2126,13 @@ impl Inner {
         let cwd = cwd.unwrap_or_else(|| DEFAULT_CWD.into());
         let fresh = s.slots.insert(agent.clone(), (slot, listener_id)).is_none();
         s.slot_cwds.insert(agent.clone(), cwd.clone());
+        s.slot_envs.insert(agent.clone(), env.clone());
         self.gateway_sync(&s);
         // The guest round trip (up to 30 s) runs without the sandbox lock, so a fence, suspend or
         // checkpoint is never queued behind it.
         let entry = tokio::sync::OwnedMutexGuard::mutex(&s).clone();
         drop(s);
-        let attached = guest.attach(slot_for(agent, slot, cwd)).await;
+        let attached = guest.attach(slot_for(agent, slot, cwd, env)).await;
         // Fenced meanwhile: the slot is moot and the answer is `stale_epoch`, whatever the guest said.
         if let Err(e) = self.ensure_not_fenced(sandbox, epoch) {
             if fresh {
@@ -2148,6 +2157,7 @@ impl Inner {
             self.proxy.apply(ProxyOp::RemoveListeners { sandbox: sandbox.clone(), epoch, ids: vec![id] });
         }
         s.slot_cwds.remove(agent);
+        s.slot_envs.remove(agent);
         if let Some(g) = &s.guest {
             g.forget_slot(agent);
         }
@@ -2166,6 +2176,7 @@ impl Inner {
             return Ok(Some(serde_json::json!({ "note": "not attached" })));
         };
         s.slot_cwds.remove(agent);
+        s.slot_envs.remove(agent);
         if let Some(id) = listener {
             self.proxy.apply(ProxyOp::RemoveListeners { sandbox: sandbox.clone(), epoch, ids: vec![id] });
         }
@@ -2463,12 +2474,12 @@ fn is_request_denial(r: &EgressAuditRecord) -> bool {
     r.verdict == EgressVerdict::Deny && r.count.is_none() && r.port != 0
 }
 
-fn slot_for(agent: &AgentId, slot: u16, cwd: String) -> AgentSlot {
+fn slot_for(agent: &AgentId, slot: u16, cwd: String, env: BTreeMap<String, String>) -> AgentSlot {
     AgentSlot {
         agent_id: agent.clone(),
         proxy_port: EXPLICIT_BASE_PORT + slot,
         cwd,
-        env: Default::default(),
+        env,
         memory_max_bytes: None,
     }
 }

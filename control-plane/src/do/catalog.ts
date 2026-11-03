@@ -33,6 +33,16 @@ export interface ClientScope {
   /** Its name: its namespace. */
   name: string;
   grant: Grant;
+  /**
+   * The grant's revision: higher for every later `setGrant` (absent in a record from before it: 0). A
+   * copy of the grant kept elsewhere (a sandbox's egress ceiling) is never replaced by an older one.
+   */
+  grant_rev?: number;
+  /**
+   * The identity the revision counts within: random, fixed for the record, and new whenever the record
+   * has no revision (it was lost, or never set), so a copy compares revisions only within one epoch.
+   */
+  grant_epoch?: string;
 }
 
 /** The entries `scope` sees (all of them for the operator, `undefined`). */

@@ -15,7 +15,7 @@ import type { AgentCaller } from "../identity";
 import { backoff, NestError, nestFrom, type Nest } from "../nest";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
-import { canBlock, canUnblock, pickForAssignment, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition, WORKER_STATES } from "../tasks";
+import { canBlock, canUnblock, dependencyError, pickForAssignment, type PrState, prsDone, waitingOn, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition, WORKER_STATES } from "../tasks";
 import { type Server, toolOf } from "../tools";
 import type { NestEvent } from "../webhook";
 import { clientLayerFor, type EgressRule, type NetworkRole, NO_RULES, normalizeRules, type RoleRules } from "../network";
@@ -64,12 +64,37 @@ export interface Task {
   start_error: string | null;
   /** Whether any write to it came from a tainted session (README.md#the-mcp-server-agents-see-only-their-own-work). */
   tainted: boolean;
-  /** GitHub's auto-merge on its PR, while the project's `auto_merge` is on; null when never asked. */
-  auto_merge: TaskAutoMerge | null;
+  /** Its attached PRs, first attached first (README.md#prs); `pr` is the first of them. */
+  prs: TaskPr[];
+  /** The tasks it waits on (README.md#dependencies), and those that wait on it. */
+  blocked_by: TaskRef[];
+  blocks: TaskRef[];
+  /** Of `blocked_by`, the ones not done yet: while any is, it can't be assigned. */
+  waiting_on: string[];
   /** Set while an agent has the task waiting on the owner (README.md#blocked). */
   blocked: Blocked | null;
   created_ms: number;
   updated_ms: number;
+}
+
+/** A PR attached to a task: open or merged (a closed one is detached). */
+export interface TaskPr {
+  number: number;
+  state: "open" | "merged";
+  title: string | null;
+  /** From a fork (never auto-merged); null until GitHub has said. */
+  fork: boolean | null;
+  attached_by: string;
+  attached_ms: number;
+  /** GitHub's auto-merge on it, while the project's `auto_merge` is on; null when never asked. */
+  auto_merge: TaskAutoMerge | null;
+}
+
+/** Another task, as a dependency names it. */
+export interface TaskRef {
+  id: string;
+  title: string;
+  state: TaskState;
 }
 
 /** Who blocked a task, when, why, and what they ask the owner. */
@@ -123,7 +148,7 @@ const MAX_WORKERS_LIMIT = 20;
 /** How long a deduplicated MCP call's answer is kept (nest retries a lost answer within minutes). */
 const CALLS_KEEP_MS = 24 * 3600 * 1000;
 
-const MIGRATIONS = [
+export const MIGRATIONS = [
   [
     `CREATE TABLE settings (id TEXT PRIMARY KEY, name TEXT NOT NULL, repo TEXT NOT NULL, auto_assign INTEGER NOT NULL, max_workers INTEGER NOT NULL,
       manager TEXT, manager_starts INTEGER NOT NULL DEFAULT 0, manager_next_ms INTEGER, manager_attempts INTEGER NOT NULL DEFAULT 0,
@@ -190,6 +215,20 @@ const MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN notify_next_ms INTEGER",
     "ALTER TABLE tasks ADD COLUMN notify_upto INTEGER",
     "ALTER TABLE tasks ADD COLUMN notify_attempts INTEGER NOT NULL DEFAULT 0",
+  ],
+  [
+    // A task's PRs (README.md#prs): a relation, a PR attached to one task at a time; `detached` keeps a
+    // PR's auto-merge to undo. The single `pr` becomes the first attached, its auto-merge with it.
+    `CREATE TABLE task_prs (pr INTEGER PRIMARY KEY, task TEXT NOT NULL, state TEXT NOT NULL, node TEXT, fork INTEGER, title TEXT,
+      attached_by TEXT NOT NULL, attached_ms INTEGER NOT NULL, ended_ms INTEGER,
+      am_owed TEXT, am_next_ms INTEGER, am_attempts INTEGER NOT NULL DEFAULT 0, am_status TEXT)`,
+    "CREATE INDEX task_prs_task ON task_prs (task, attached_ms)",
+    `INSERT OR IGNORE INTO task_prs (pr, task, state, node, fork, attached_by, attached_ms, am_owed, am_next_ms, am_attempts, am_status)
+      SELECT pr, id, CASE WHEN state = 'done' THEN 'merged' ELSE 'open' END, pr_node, CASE WHEN pr_node IS NULL THEN NULL ELSE 0 END,
+        'app:migration', updated_ms, am_owed, am_next_ms, am_attempts, am_status FROM tasks WHERE pr IS NOT NULL`,
+    // Dependencies (README.md#dependencies): `task` waits on `blocker`.
+    "CREATE TABLE task_deps (task TEXT NOT NULL, blocker TEXT NOT NULL, by TEXT NOT NULL, at_ms INTEGER NOT NULL, PRIMARY KEY (task, blocker))",
+    "CREATE INDEX task_deps_blocker ON task_deps (blocker)",
   ],
   [
     // The manager's waits (README.md#waiting): each the app's whole, with its deadline; one pending per key.
@@ -288,10 +327,23 @@ export class ProjectDO extends DurableObject<Env> {
   private toTask(r: Row): Task {
     return {
       id: r.id as string, title: r.title as string, body: r.body as string, spec: r.spec ? (JSON.parse(r.spec as string) as Spec) : null,
-      state: r.state as TaskState, ord: r.ord as number, assignee: (r.assignee as string | null) ?? null, pr: (r.pr as number | null) ?? null,
-      start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, auto_merge: taskAutoMerge(r), blocked: blockedOf(r),
+      state: r.state as TaskState, ord: r.ord as number, assignee: (r.assignee as string | null) ?? null,
+      start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, blocked: blockedOf(r),
+      ...this.relations(r.id as string),
       created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     };
+  }
+
+  /** A task's PRs and dependencies, as Task carries them. */
+  private relations(id: string): Pick<Task, "pr" | "prs" | "blocked_by" | "blocks" | "waiting_on"> {
+    const prs = this.sql.exec("SELECT * FROM task_prs WHERE task = ? AND state != 'detached' ORDER BY attached_ms, pr", id).toArray().map((p): TaskPr => ({
+      number: p.pr as number, state: p.state as "open" | "merged", title: (p.title as string | null) ?? null, fork: p.fork === null ? null : p.fork === 1,
+      attached_by: p.attached_by as string, attached_ms: p.attached_ms as number, auto_merge: prAutoMerge(p),
+    }));
+    const ref = (r: Row): TaskRef => ({ id: r.id as string, title: r.title as string, state: r.state as TaskState });
+    const blocked_by = this.sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.blocker WHERE d.task = ? ORDER BY d.at_ms", id).toArray().map(ref);
+    const blocks = this.sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.task WHERE d.blocker = ? ORDER BY d.at_ms", id).toArray().map(ref);
+    return { pr: prs[0]?.number ?? null, prs, blocked_by, blocks, waiting_on: waitingOn(blocked_by) };
   }
 
   async listTasks(): Promise<Result<Task[]>> {
@@ -368,6 +420,13 @@ export class ProjectDO extends DurableObject<Env> {
     this.record(id, actor, event, detail);
     // The manager's waits on this task see the move in this step.
     this.taskWaitsOn(id, t.to);
+    // Tasks waiting on it hear it's done; their live workers are told (README.md#task-changes).
+    if (t.to === "done") {
+      for (const d of this.sql.exec("SELECT task FROM task_deps WHERE blocker = ?", id).toArray()) {
+        this.record(d.task as string, { kind: "app", what: "board" }, "dependency_done", { blocker: id, title: r.title as string });
+        this.noteChange(d.task as string, "dependencies", `${id} (${from.replace("_", " ")})`, `${id} (done)`, { kind: "app", what: "board" });
+      }
+    }
     // A task that ends has nothing left to wait on the owner for.
     if (TERMINAL.has(t.to) && r.blocked_ms !== null) {
       this.clearBlock(id);
@@ -411,6 +470,9 @@ export class ProjectDO extends DurableObject<Env> {
     const s = this.settings();
     if (!s) return fail(404, "unknown project");
     if (actor.kind === "agent" && this.liveWorkers() >= s.max_workers) return fail(409, `the project already has ${s.max_workers} live workers (max_workers)`);
+    // Its dependencies first, whoever assigns it: there is no override (remove the dependency instead).
+    const waiting = this.taskRow(id) ? this.relations(id).blocked_by.filter((b) => b.state !== "done") : [];
+    if (waiting.length) return fail(409, `it waits on ${waiting.map((b) => `${b.id} (${b.state.replace("_", " ")})`).join(", ")}: they must be done first`);
     const r = this.assignNow(id, actor);
     if (!r.ok) return r;
     await this.arm();
@@ -423,7 +485,7 @@ export class ProjectDO extends DurableObject<Env> {
     const s = this.settings();
     if (!s?.auto_assign) return;
     const tasks = this.sql.exec("SELECT id, state, ord, blocked_ms FROM tasks WHERE state = 'ready'").toArray()
-      .map((r) => ({ id: r.id as string, state: r.state as TaskState, ord: r.ord as number, blocked: r.blocked_ms !== null }));
+      .map((r) => ({ id: r.id as string, state: r.state as TaskState, ord: r.ord as number, blocked: r.blocked_ms !== null, waiting: this.relations(r.id as string).waiting_on.length > 0 }));
     for (const id of pickForAssignment(tasks, this.liveWorkers(), s.max_workers)) this.assignNow(id, { kind: "app", what: "auto-assign" });
   }
 
@@ -481,52 +543,198 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
-   * A PR on the repo opened or closed (GitHub's `pull_request`, routed here by the Worker). `task` is the
-   * task its branch names (`task/<id>`, from the repo itself, not a fork), when it does:
-   * - opened: the PR is linked to its task (`pr_opened`), if the worker hadn't reported it;
-   * - merged: its task is done, and its worker ended;
-   * - closed without merging: noted in the task's history; the task stays as it is.
+   * A PR on the repo opened, reopened or closed (GitHub's `pull_request`, routed here by the Worker).
+   * `task` is the task its branch names (`task/<id>`, from the repo itself, not a fork), when it does:
+   * - opened: a PR not attached anywhere is attached to that task (README.md#prs); an attached one's
+   *   facts (node id, fork, title) are learned. A branch never moves a PR attached to another task;
+   * - merged: the PR is marked merged, and its task done once all its PRs are;
+   * - closed without merging: detached from its task, noted in its history.
    */
-  async onPullRequest(e: { pr: number; task: string | null; action: "opened" | "closed"; merged: boolean; node?: string | null }): Promise<void> {
+  async onPullRequest(e: { pr: number; task: string | null; action: "opened" | "closed"; merged: boolean; node?: string | null; fork?: boolean; title?: string | null }): Promise<void> {
     if (!this.settings()) return;
     // Any PR of the repo, a task's or not: the manager's waits on it.
     if (e.action === "closed") {
       for (const w of this.pendingWaits("pr", String(e.pr))) this.prWaitOn(w, e.merged ? { kind: "merged" } : { kind: "closed" });
-      await this.arm();
     }
-    const byBranch = e.task ? this.taskRow(e.task) : undefined;
-    const r = byBranch ?? this.sql.exec("SELECT id FROM tasks WHERE pr = ?", e.pr).toArray()[0];
-    if (!r) return;
-    const id = r.id as string;
     const github: Actor = { kind: "app", what: "github" };
-    const link = () => {
-      const t = this.taskRow(id)!;
-      if (t.pr === e.pr && t.state === "in_review") return;
-      if (this.move(id, "pr_opened", github, { pr: e.pr }).ok) this.sql.exec("UPDATE tasks SET pr = ? WHERE id = ?", e.pr, id);
-      else this.record(id, github, "pr_seen", { pr: e.pr, state: t.state });
-    };
+    const had = this.prRow(e.pr);
     if (e.action === "opened") {
-      link();
-      // A task's own PR (its branch, from the repo itself) gets auto-merge while the setting is on.
-      const t = this.taskRow(id)!;
-      if (e.task === id && t.pr === e.pr && t.state === "in_review" && e.node) {
-        this.sql.exec("UPDATE tasks SET pr_node = ? WHERE id = ?", e.node, id);
-        if (this.settings()!.auto_merge) this.oweTaskAutoMerge(id, "enable");
+      if (had && had.state !== "detached") {
+        this.sql.exec("UPDATE task_prs SET state = 'open', node = COALESCE(?, node), fork = COALESCE(?, fork), title = COALESCE(?, title) WHERE pr = ?",
+          e.node ?? null, e.fork === undefined ? null : e.fork ? 1 : 0, e.title ?? null, e.pr);
+        this.oweEnableIfDue(e.pr);
+      } else if (e.task && this.taskRow(e.task)) {
+        const r = this.attachPr(e.task, { pr: e.pr, node: e.node ?? null, fork: e.fork ?? null, title: e.title ?? null }, github);
+        if (!r.ok) this.record(e.task, github, "pr_seen", { pr: e.pr, why: r.error });
       }
-    } else if (e.merged) {
-      if (this.taskRow(id)!.state === "in_progress") link();
-      if (this.move(id, "merged", github, { pr: e.pr }).ok) {
-        this.stopWorkerOf(id, "merged");
-        this.autoAssign();
+    } else if (had && had.state !== "detached") {
+      const id = had.task as string;
+      // A closed PR's auto-merge is GitHub's to drop: nothing more is owed for it.
+      this.sql.exec("UPDATE task_prs SET am_owed = NULL, am_next_ms = NULL WHERE pr = ?", e.pr);
+      if (e.merged) {
+        this.sql.exec("UPDATE task_prs SET state = 'merged', ended_ms = ? WHERE pr = ?", Date.now(), e.pr);
+        this.record(id, github, "pr_merged", { pr: e.pr });
+        this.finishIfMerged(id, github);
       } else {
-        this.record(id, github, "pr_merged", { pr: e.pr, state: this.taskRow(id)!.state });
+        this.detach(id, e.pr, github, "pr_closed", { pr: e.pr, detached: true });
       }
-    } else {
-      this.record(id, github, "pr_closed", { pr: e.pr });
     }
-    // A closed PR's auto-merge is GitHub's to drop: nothing more is owed for it.
-    if (e.action === "closed") this.sql.exec("UPDATE tasks SET am_owed = NULL, am_next_ms = NULL WHERE id = ? AND pr = ?", id, e.pr);
     await this.arm();
+  }
+
+  // --- PRs (README.md#prs) ----------------------------------------------------------------------------
+
+  private prRow(pr: number): Row | undefined {
+    return this.sql.exec("SELECT * FROM task_prs WHERE pr = ?", pr).toArray()[0];
+  }
+
+  private prList(id: string): string {
+    return this.relations(id).prs.map((p) => `#${p.number}${p.state === "merged" ? " (merged)" : ""}`).join(", ") || "none";
+  }
+
+  /**
+   * Attach a PR to a task (one step): refused when it's attached to another task (detach it there
+   * first), or the task is over. A task in progress goes to review; its live worker is told; the PR gets
+   * auto-merge when it's due.
+   */
+  private attachPr(id: string, p: { pr: number; node: string | null; fork: boolean | null; title: string | null }, actor: Actor): Result<Task> {
+    const t = this.taskRow(id);
+    if (!t) return fail(404, "unknown task");
+    if (TERMINAL.has(t.state as TaskState)) return fail(409, `a ${t.state} task takes no PR`);
+    const had = this.prRow(p.pr);
+    if (had && had.state !== "detached") {
+      if (had.task === id) return ok(this.toTask(t));
+      return fail(409, `PR #${p.pr} is attached to ${had.task as string}: detach it there first`);
+    }
+    const before = this.prList(id);
+    const who = actor.kind === "owner" ? "owner" : actor.kind === "app" ? `app:${actor.what}` : actor.agent;
+    this.sql.exec(
+      `INSERT INTO task_prs (pr, task, state, node, fork, title, attached_by, attached_ms) VALUES (?, ?, 'open', ?, ?, ?, ?, ?)
+        ON CONFLICT (pr) DO UPDATE SET task = excluded.task, state = 'open', node = COALESCE(excluded.node, node), fork = COALESCE(excluded.fork, fork),
+          title = COALESCE(excluded.title, title), attached_by = excluded.attached_by, attached_ms = excluded.attached_ms, ended_ms = NULL`,
+      p.pr, id, p.node, p.fork === null ? null : p.fork ? 1 : 0, p.title, who, Date.now(),
+    );
+    if (t.state === "in_progress") this.move(id, "pr_opened", actor, { pr: p.pr });
+    else this.record(id, actor, "pr_attached", { pr: p.pr });
+    this.syncPr(id);
+    this.noteChange(id, "prs", before, this.prList(id), actor);
+    this.oweEnableIfDue(p.pr);
+    return ok(this.toTask(this.taskRow(id)!));
+  }
+
+  /** Detach a PR from its task: its auto-merge is undone if it had one; the task is done if the rest merged. */
+  private detach(id: string, pr: number, actor: Actor, action: string, detail: unknown): void {
+    const before = this.prList(id);
+    const row = this.prRow(pr)!;
+    this.sql.exec("UPDATE task_prs SET state = 'detached', ended_ms = ? WHERE pr = ?", Date.now(), pr);
+    const am = row.am_status ? (JSON.parse(row.am_status as string) as TaskAutoMerge) : null;
+    if (action !== "pr_closed" && (am?.state === "enabled" || row.am_owed === "enable")) this.owePrAutoMerge(pr, "disable");
+    this.record(id, actor, action, detail);
+    this.syncPr(id);
+    this.noteChange(id, "prs", before, this.prList(id), actor);
+    this.finishIfMerged(id, actor);
+  }
+
+  /** The task's `pr` column (kept for older readers): its first attached PR. */
+  private syncPr(id: string): void {
+    this.sql.exec("UPDATE tasks SET pr = ? WHERE id = ?", this.relations(id).pr, id);
+  }
+
+  /** A task whose attached PRs have all merged is done, and its worker ended. */
+  private finishIfMerged(id: string, actor: Actor): void {
+    const t = this.taskRow(id);
+    if (!t || TERMINAL.has(t.state as TaskState)) return;
+    const prs = this.sql.exec("SELECT state FROM task_prs WHERE task = ?", id).toArray().map((p) => ({ state: p.state as PrState }));
+    if (!prsDone(prs)) return;
+    if (this.move(id, "merged", actor).ok) {
+      this.stopWorkerOf(id, "merged");
+      this.autoAssign();
+    }
+  }
+
+  /** The owner or the manager attaches a PR by its number, checked on GitHub: in the repo, and open. */
+  async attachPrByNumber(id: string, pr: number, actor: Actor): Promise<Result<Task>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    if (!this.taskRow(id)) return fail(404, "unknown task");
+    const s = this.settings()!;
+    const nest = nestFrom(this.env);
+    if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
+    let p;
+    try {
+      p = await (await githubFor(nest, s.repo, PERMISSIONS.pullsRead)).pull(s.repo, pr);
+    } catch (e) {
+      return fail(e instanceof GitHubError && e.status === 404 ? 404 : 502, e instanceof GitHubError && e.status === 404 ? `no PR #${pr} on ${s.repo}` : message(e));
+    }
+    if (p.state !== "open") return fail(409, `PR #${pr} is ${p.merged ? "merged" : "closed"}: attach an open one`);
+    const r = this.attachPr(id, { pr, node: p.node_id, fork: p.fork, title: p.title }, actor);
+    await this.arm();
+    if (actor.kind === "owner") await this.drain();
+    return r;
+  }
+
+  async detachPr(id: string, pr: number, actor: Actor): Promise<Result<Task>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    if (!this.taskRow(id)) return fail(404, "unknown task");
+    const row = this.prRow(pr);
+    if (!row || row.task !== id || row.state === "detached") return fail(404, `PR #${pr} isn't attached to ${id}`);
+    if (row.state === "merged") return fail(409, `PR #${pr} has merged: it stays attached`);
+    this.detach(id, pr, actor, "pr_detached", { pr });
+    await this.arm();
+    if (actor.kind === "owner") await this.drain();
+    return ok(this.toTask(this.taskRow(id)!));
+  }
+
+  /** The repo's open PRs, for the owner's picker, each with the task it's attached to, if any. */
+  async openPrs(): Promise<Result<{ number: number; title: string; head: string; fork: boolean; task: string | null }[]>> {
+    const s = this.settings();
+    if (!s) return fail(404, "unknown project");
+    const nest = nestFrom(this.env);
+    if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
+    try {
+      const list = await (await githubFor(nest, s.repo, PERMISSIONS.pullsRead)).openPulls(s.repo);
+      return ok(list.map((p) => {
+        const row = this.prRow(p.number);
+        return { number: p.number, title: p.title, head: p.head_ref, fork: p.fork, task: row && row.state !== "detached" ? (row.task as string) : null };
+      }));
+    } catch (e) {
+      return fail(502, message(e));
+    }
+  }
+
+  // --- dependencies (README.md#dependencies) --------------------------------------------------------------
+
+  async addDependency(id: string, blocker: string, actor: Actor): Promise<Result<Task>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const states = new Map(this.sql.exec("SELECT id, state FROM tasks").toArray().map((r) => [r.id as string, r.state as TaskState]));
+    const edges = this.sql.exec("SELECT task, blocker FROM task_deps").toArray().map((r) => [r.task as string, r.blocker as string] as const);
+    const err = dependencyError(id, blocker, edges, states);
+    if (err) return fail(err.startsWith("unknown task") ? 404 : 409, err);
+    const before = this.depList(id);
+    const who = actor.kind === "owner" ? "owner" : actor.kind === "app" ? `app:${actor.what}` : actor.agent;
+    this.sql.exec("INSERT INTO task_deps (task, blocker, by, at_ms) VALUES (?, ?, ?, ?)", id, blocker, who, Date.now());
+    this.record(id, actor, "dependency_added", { blocked_by: blocker, title: this.taskRow(blocker)!.title as string });
+    this.noteChange(id, "dependencies", before, this.depList(id), actor);
+    await this.arm();
+    return ok(this.toTask(this.taskRow(id)!));
+  }
+
+  async removeDependency(id: string, blocker: string, actor: Actor): Promise<Result<Task>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    if (!this.taskRow(id)) return fail(404, "unknown task");
+    const before = this.depList(id);
+    const gone = this.sql.exec("DELETE FROM task_deps WHERE task = ? AND blocker = ? RETURNING task", id, blocker).toArray().length;
+    if (!gone) return fail(404, `${id} doesn't wait on ${blocker}`);
+    this.record(id, actor, "dependency_removed", { blocked_by: blocker, title: (this.taskRow(blocker)?.title as string | undefined) ?? null });
+    this.noteChange(id, "dependencies", before, this.depList(id), actor);
+    // It may be assignable now.
+    this.autoAssign();
+    await this.arm();
+    if (actor.kind === "owner") await this.drain();
+    return ok(this.toTask(this.taskRow(id)!));
+  }
+
+  private depList(id: string): string {
+    return this.relations(id).blocked_by.map((b) => `${b.id} (${b.state.replace("_", " ")})`).join(", ") || "none";
   }
 
   // --- auto-merge ------------------------------------------------------------------------------------
@@ -534,15 +742,29 @@ export class ProjectDO extends DurableObject<Env> {
   /** Turn auto-merge on or off: the repo's setting is owed its write, and each open task PR its change. */
   private setAutoMerge(on: boolean): void {
     this.sql.exec("UPDATE settings SET auto_merge = ?, am_write_next_ms = ?, am_write_attempts = 0, am_write_error = NULL", on ? 1 : 0, Date.now());
-    for (const t of this.sql.exec("SELECT id, am_status, am_owed FROM tasks WHERE state = 'in_review' AND pr_node IS NOT NULL").toArray()) {
-      const status = t.am_status ? (JSON.parse(t.am_status as string) as TaskAutoMerge) : null;
-      if (on) this.oweTaskAutoMerge(t.id as string, "enable");
-      else if (status?.state === "enabled" || t.am_owed === "enable") this.oweTaskAutoMerge(t.id as string, "disable");
+    for (const p of this.sql.exec("SELECT pr, am_status, am_owed FROM task_prs WHERE state = 'open'").toArray()) {
+      const status = p.am_status ? (JSON.parse(p.am_status as string) as TaskAutoMerge) : null;
+      if (on) this.oweEnableIfDue(p.pr as number);
+      else if (status?.state === "enabled" || p.am_owed === "enable") this.owePrAutoMerge(p.pr as number, "disable");
     }
   }
 
-  private oweTaskAutoMerge(id: string, what: "enable" | "disable"): void {
-    this.sql.exec("UPDATE tasks SET am_owed = ?, am_next_ms = ?, am_attempts = 0 WHERE id = ?", what, Date.now(), id);
+  /**
+   * Owe auto-merge on an attached PR when it's due: the setting on, the PR open, its task not over, and
+   * known to be from the repo itself (never a fork's) with its node id, and not already on.
+   */
+  private oweEnableIfDue(pr: number): void {
+    const p = this.prRow(pr);
+    if (!p || p.state !== "open" || p.fork !== 0 || !p.node || !this.settings()!.auto_merge) return;
+    const t = this.taskRow(p.task as string);
+    if (!t || TERMINAL.has(t.state as TaskState)) return;
+    const status = p.am_status ? (JSON.parse(p.am_status as string) as TaskAutoMerge) : null;
+    if (status?.state === "enabled" && !p.am_owed) return;
+    this.owePrAutoMerge(pr, "enable");
+  }
+
+  private owePrAutoMerge(pr: number, what: "enable" | "disable"): void {
+    this.sql.exec("UPDATE task_prs SET am_owed = ?, am_next_ms = ?, am_attempts = 0 WHERE pr = ?", what, Date.now(), pr);
   }
 
   /** Write the repo's setting again now: after a refusal, or to undo a drift. */
@@ -574,7 +796,7 @@ export class ProjectDO extends DurableObject<Env> {
    * lives): told within NOTIFY_WINDOW_MS, coalesced with the changes after it. A task without one has
    * nobody to tell; a worker started later gets the current task in its brief.
    */
-  private noteChange(id: string, field: "title" | "body" | "spec" | "blocked", before: string | null, after: string | null, actor: Actor): void {
+  private noteChange(id: string, field: "title" | "body" | "spec" | "blocked" | "prs" | "dependencies", before: string | null, after: string | null, actor: Actor): void {
     const r = this.taskRow(id);
     if (!r || !r.assignee || r.worker_live !== 1 || !WORKER_STATES.has(r.state as TaskState)) return;
     const who = actor.kind === "owner" ? "owner" : actor.kind === "app" ? `app:${actor.what}` : actor.agent;
@@ -893,9 +1115,10 @@ export class ProjectDO extends DurableObject<Env> {
     if (kind === "pr") {
       const pr = Number(target);
       const jobs = (await review(this.env, this.settings()!.id).jobs()).filter((j) => j.pr === pr);
-      const linked = this.sql.exec("SELECT state FROM tasks WHERE pr = ?", pr).toArray()[0];
+      // A PR attached to a task is recorded merged once it is (README.md#prs).
+      const merged = this.sql.exec("SELECT 1 FROM task_prs WHERE pr = ? AND state = 'merged'", pr).toArray().length > 0;
       const latest = jobs[0];
-      if (linked?.state === "done") this.prWaitOn(this.waitRow(id)!, { kind: "merged" });
+      if (merged) this.prWaitOn(this.waitRow(id)!, { kind: "merged" });
       // Closed before its review finished, merged or not (the queue doesn't say): a wait to merge stays.
       else if (latest?.state === "closed" && want !== "merged") this.prWaitOn(this.waitRow(id)!, { kind: "closed" });
       else if (latest && (latest.state === "done" || latest.state === "failed")) this.prWaitOn(this.waitRow(id)!, { kind: "review", conclusion: reviewConclusion(latest) });
@@ -1099,6 +1322,14 @@ export class ProjectDO extends DurableObject<Env> {
           return this.assign(a.task as string, actor, { wait: false });
         case "cancel_task":
           return this.cancel(a.task as string, actor, a.reason as string | undefined);
+        case "attach_pr":
+          return this.attachPrByNumber(a.task as string, a.pr as number, actor);
+        case "detach_pr":
+          return this.detachPr(a.task as string, a.pr as number, actor);
+        case "add_dependency":
+          return this.addDependency(a.task as string, a.blocked_by as string, actor);
+        case "remove_dependency":
+          return this.removeDependency(a.task as string, a.blocked_by as string, actor);
         case "block_task":
           return this.block(a.task as string, caller, "manager", a.reason as string, (a.question as string | undefined) ?? null);
         case "unblock_task":
@@ -1129,7 +1360,11 @@ export class ProjectDO extends DurableObject<Env> {
       switch (tool) {
         case "get_task": {
           const t = this.toTask(r);
-          return ok({ id: t.id, title: t.title, body: t.body, spec: t.spec, state: t.state, pr: t.pr, repo: this.settings()!.repo, branch: taskBranch(t.id) });
+          return ok({
+            id: t.id, title: t.title, body: t.body, spec: t.spec, state: t.state, pr: t.pr, prs: t.prs.map((p) => ({ number: p.number, state: p.state })),
+            // What it waits on, and each one's state: it shouldn't build on a dependency that isn't done.
+            dependencies: t.blocked_by, repo: this.settings()!.repo, branch: taskBranch(t.id),
+          });
         }
         case "report_progress":
           if (TERMINAL.has(r.state as TaskState)) return fail(409, `the task is ${r.state}`);
@@ -1141,10 +1376,12 @@ export class ProjectDO extends DurableObject<Env> {
         case "clear_blocked":
           return this.unblock(id, caller, (a.note as string | undefined) ?? null);
         case "report_pr": {
-          const m = this.move(id, "pr_opened", actor, { pr: a.number });
-          if (!m.ok) return m;
-          this.sql.exec("UPDATE tasks SET pr = ? WHERE id = ?", a.number as number, id);
-          return ok({ task: id, state: m.value.to, pr: a.number });
+          const may = transition(r.state as TaskState, "pr_opened");
+          if (!may.ok) return fail(409, may.error);
+          const at = this.attachPr(id, { pr: a.number as number, node: null, fork: null, title: null }, actor);
+          if (!at.ok) return at;
+          await this.arm();
+          return ok({ task: id, state: at.value.state, pr: a.number, prs: at.value.prs.map((p) => p.number) });
         }
       }
     }
@@ -1175,8 +1412,8 @@ export class ProjectDO extends DurableObject<Env> {
         UNION ALL SELECT am_read_next_ms FROM settings WHERE am_read_next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM messages WHERE next_ms IS NOT NULL
         UNION ALL SELECT notify_next_ms FROM tasks WHERE notify_next_ms IS NOT NULL
-        UNION ALL SELECT t.am_next_ms FROM tasks t, settings s WHERE t.am_next_ms IS NOT NULL
-          AND (t.am_owed = 'disable' OR (s.am_write_next_ms IS NULL AND s.am_write_error IS NULL)))`),
+        UNION ALL SELECT p.am_next_ms FROM task_prs p, settings s WHERE p.am_next_ms IS NOT NULL
+          AND (p.am_owed = 'disable' OR (s.am_write_next_ms IS NULL AND s.am_write_error IS NULL)))`),
     ].filter((t): t is number => t !== null);
     const next = times.length ? Math.min(...times) : null;
     if (next === null) return;
@@ -1224,8 +1461,8 @@ export class ProjectDO extends DurableObject<Env> {
     // A PR's auto-merge is enabled only once the repo allows it; disabling needn't wait.
     const w = this.settingsRow()!;
     const repoReady = w.am_write_next_ms === null && w.am_write_error === null;
-    for (const r of this.sql.exec("SELECT id, am_owed FROM tasks WHERE am_next_ms IS NOT NULL AND am_next_ms <= ?", now).toArray()) {
-      if (r.am_owed === "disable" || repoReady) await this.taskAutoMerge(nest, r.id as string);
+    for (const r of this.sql.exec("SELECT pr, am_owed FROM task_prs WHERE am_next_ms IS NOT NULL AND am_next_ms <= ?", now).toArray()) {
+      if (r.am_owed === "disable" || repoReady) await this.prAutoMerge(nest, r.pr as number);
     }
     // The manager starts once the repo is attached (README.md#flows).
     const a = this.settingsRow()!;
@@ -1279,35 +1516,36 @@ export class ProjectDO extends DurableObject<Env> {
     }
   }
 
-  /** Enable or disable GitHub's auto-merge on a task's PR, as owed, recording the result on the task. */
-  private async taskAutoMerge(nest: Nest, id: string): Promise<void> {
-    const before = this.taskRow(id);
-    if (!before?.am_owed || !before.pr_node) return;
+  /** Enable or disable GitHub's auto-merge on a PR, as owed, recording the result on its task. */
+  private async prAutoMerge(nest: Nest, pr: number): Promise<void> {
+    const before = this.prRow(pr);
+    if (!before?.am_owed || !before.node) return;
+    const id = before.task as string;
     const what = before.am_owed as "enable" | "disable";
     const s = this.settings()!;
     const method = s.merge_method;
     const github: Actor = { kind: "app", what: "github" };
-    const still = () => this.taskRow(id)?.am_owed === what;
+    const still = () => this.prRow(pr)?.am_owed === what;
     try {
       const gh = await githubFor(nest, s.repo, PERMISSIONS.autoMerge);
-      if (what === "enable") await gh.enableAutoMerge(before.pr_node as string, GRAPHQL_METHOD[method]);
-      else await gh.disableAutoMerge(before.pr_node as string);
+      if (what === "enable") await gh.enableAutoMerge(before.node as string, GRAPHQL_METHOD[method]);
+      else await gh.disableAutoMerge(before.node as string);
       const status: TaskAutoMerge = { state: what === "enable" ? "enabled" : "disabled", method: what === "enable" ? method : null, error: null, at_ms: Date.now() };
-      this.sql.exec("UPDATE tasks SET am_status = ? WHERE id = ?", JSON.stringify(status), id);
-      this.record(id, github, what === "enable" ? "auto_merge_enabled" : "auto_merge_disabled", { pr: before.pr, ...(what === "enable" ? { method } : {}) });
-      if (still()) this.sql.exec("UPDATE tasks SET am_owed = NULL, am_next_ms = NULL, am_attempts = 0 WHERE id = ?", id);
+      this.sql.exec("UPDATE task_prs SET am_status = ? WHERE pr = ?", JSON.stringify(status), pr);
+      this.record(id, github, what === "enable" ? "auto_merge_enabled" : "auto_merge_disabled", { pr, ...(what === "enable" ? { method } : {}) });
+      if (still()) this.sql.exec("UPDATE task_prs SET am_owed = NULL, am_next_ms = NULL, am_attempts = 0 WHERE pr = ?", pr);
     } catch (e) {
       if (!still()) return;
       const attempts = (before.am_attempts as number) + 1;
       if ((e instanceof NestError || e instanceof GitHubError) && e.permanent) {
         const status: TaskAutoMerge = { state: "failed", method: what === "enable" ? method : null, error: message(e), at_ms: Date.now() };
-        this.sql.exec("UPDATE tasks SET am_status = ?, am_owed = NULL, am_next_ms = NULL, am_attempts = ? WHERE id = ?", JSON.stringify(status), attempts, id);
-        this.record(id, github, "auto_merge_failed", { pr: before.pr, action: what, error: message(e) });
+        this.sql.exec("UPDATE task_prs SET am_status = ?, am_owed = NULL, am_next_ms = NULL, am_attempts = ? WHERE pr = ?", JSON.stringify(status), attempts, pr);
+        this.record(id, github, "auto_merge_failed", { pr, action: what, error: message(e) });
         return;
       }
       const prior = before.am_status ? (JSON.parse(before.am_status as string) as TaskAutoMerge) : null;
       const status: TaskAutoMerge = { state: "pending", method: prior?.method ?? null, error: message(e), at_ms: Date.now() };
-      this.sql.exec("UPDATE tasks SET am_status = ?, am_attempts = ?, am_next_ms = ? WHERE id = ?", JSON.stringify(status), attempts, Date.now() + backoff(attempts), id);
+      this.sql.exec("UPDATE task_prs SET am_status = ?, am_attempts = ?, am_next_ms = ? WHERE pr = ?", JSON.stringify(status), attempts, Date.now() + backoff(attempts), pr);
     }
   }
 
@@ -1482,6 +1720,11 @@ export function changeMessage(t: Task, changes: Record<string, SqlStorageValue>[
       `Files likely touched: ${t.spec.files.join(", ") || "(not given)"}`, `Test plan: ${t.spec.test_plan}`);
   }
   if (fields.includes("blocked")) lines.push("", "Its block was cleared: carry on.");
+  if (fields.includes("prs")) lines.push("", `Attached PRs, before: ${first("prs").before as string}`, `Attached PRs, now: ${last("prs").after as string}`);
+  if (fields.includes("dependencies")) {
+    lines.push("", `It waits on, before: ${first("dependencies").before as string}`, `It waits on, now: ${last("dependencies").after as string}`);
+    if (t.waiting_on.length === 0) lines.push("Nothing it waits on is unfinished now.");
+  }
   return lines.join("\n");
 }
 
@@ -1497,10 +1740,10 @@ function blockedOf(r: Row): Blocked | null {
   };
 }
 
-/** A task's auto-merge for the board: pending while owed, else the last result. */
-function taskAutoMerge(r: Row): TaskAutoMerge | null {
+/** A PR's auto-merge for the board: pending while owed, else the last result. */
+function prAutoMerge(r: Row): TaskAutoMerge | null {
   const status = r.am_status ? (JSON.parse(r.am_status as string) as TaskAutoMerge) : null;
-  if (r.am_owed) return { state: "pending", method: status?.method ?? null, error: status?.error ?? null, at_ms: status?.at_ms ?? (r.updated_ms as number) };
+  if (r.am_owed) return { state: "pending", method: status?.method ?? null, error: status?.error ?? null, at_ms: status?.at_ms ?? (r.attached_ms as number) };
   return status;
 }
 

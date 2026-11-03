@@ -28,7 +28,7 @@ All state is the app's. nest holds the agents, their sandboxes and their transcr
 Only the client interface. One client, `projects`, has this grant:
 - `cells`, and `credentials: [claude_oauth_token]`;
 - `repos` and `github.repos`: the attachable repos. Workers push to them; the manager and reviewers only read them, which `repos` covers (no `read_repos` needed);
-- `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch, the repo's "Allow auto-merge"), `pull_requests: write` and `contents: write` (auto-merge on task PRs, and reading the repo's merge settings; [below](#auto-merge)). Each call's token asks only for what that call needs. The app reads nothing else on GitHub: a PR's number, head, base, title and node id come in its webhook, and the reviewer reads the code in its sandbox;
+- `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch, the repo's "Allow auto-merge"), `pull_requests: write` and `contents: write` (auto-merge on task PRs, and reading the repo's merge settings; [below](#auto-merge)), which also cover reading PRs to attach them (`pull_requests: read`; [below](#prs)). Each call's token asks only for what that call needs. The app reads nothing else on GitHub: a PR's number, head, base, title and node id come in its webhook, and the reviewer reads the code in its sandbox;
 - `mcp_urls: [https://projects-nest.bitcru.sh/mcp/]`;
 - `egress_hosts`: the hosts the [Network page](#network) may open for its agents (nest's `egress_hosts`, needs nest PR #134);
 - `max_agents` and `max_sandboxes`.
@@ -76,8 +76,8 @@ Only the client interface. One client, `projects`, has this grant:
   2. The manager specs it (`ready`).
   3. It's assigned (`assigned`), by the owner from the board, by the manager, or automatically. Automatic assignment takes `ready` tasks in board order while the project's live workers are fewer than its `max_workers`.
   4. The app starts a worker labelled with the task (`in_progress`).
-  5. The worker pushes a branch `task/<task-id>` and opens a PR (`in_review`). The PR's branch maps it to the task.
-  6. The PR is merged (`done`), and the worker is ended.
+  5. The worker pushes a branch `task/<task-id>` and opens a PR (`in_review`). The PR's branch maps it to the task. The owner or the manager may attach more ([below](#prs)).
+  6. All its attached PRs merged (`done`), and the worker is ended.
   
   A worker that exits before opening a PR leaves the task `stalled`, shown on the board, to be reassigned. Cancelling a task stops its worker.
 - **Review:**
@@ -86,7 +86,7 @@ Only the client interface. One client, `projects`, has this grant:
   3. Each job creates a check run (`in_progress`) and starts a reviewer.
   4. The reviewer's verdict completes the check: `success` only if all three dimensions pass, else `failure`, with the summary as the check's output.
   5. A reviewer that exits without a verdict is started again, twice, then the check completes as `action_required`. Not `neutral`: a required check accepts `success`, `skipped` and `neutral` ([GitHub](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging)), so `neutral` would let the PR merge unreviewed. A `check_run` `rerequested` queues the job again.
-- **Merging** is GitHub's, gated by the required check. With the project's auto-merge on, the app enables GitHub's auto-merge on each task PR ([below](#auto-merge)); it never merges itself. A `pull_request` `closed` event with `merged: true` marks the PR's task `done` and ends its worker; closed without merging, it's noted in the task's history and the task stays. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
+- **Merging** is GitHub's, gated by the required check. With the project's auto-merge on, the app enables GitHub's auto-merge on each task PR ([below](#auto-merge)); it never merges itself. A `pull_request` `closed` event with `merged: true` marks the PR merged, and its task `done` once every attached PR has, ending its worker; closed without merging, the PR is detached, noted in the task's history, and the task stays. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
 
 ## Not decided here
 
@@ -195,7 +195,7 @@ The owner's request (2026-11-02): "Agents might mark their tasks as blocked, whi
 
 The owner's request (2026-11-02): "Workers should be notified when their assigned task is modified."
 
-- **What's told:** a new title, body or spec, and its block cleared by the owner (answering it) or the manager. It doesn't matter whether the owner made the change (the API), the manager (`/mcp/board`) or the app.
+- **What's told:** a new title, body or spec, its block cleared by the owner (answering it) or the manager, PRs attached or detached ([PRs](#prs)), and its dependencies added, removed or done ([dependencies](#dependencies)). It doesn't matter whether the owner made the change (the API), the manager (`/mcp/board`) or the app.
   - The worker's own changes aren't told back, nor is a block it raised and the owner answered: that answer reached it already.
   - Cancelling stops the worker, as before.
   - A task with a live worker (`assigned`, `in_progress`, or `in_review` while its worker lives) may now be re-specced, so the spec can change under a worker (`spec` loops on those states in `src/tasks.ts`).
@@ -207,6 +207,35 @@ The owner's request (2026-11-02): "Workers should be notified when their assigne
   - A set is frozen on its first try and posted with the request id `<task>/changes/<last change>`, so a retry after a lost answer posts once. A change after that try is the next message.
   - A set with any change from a tainted session is posted as relayed text (`from: "projects/board"`), as the brief is.
   - Each set is recorded in the task's history (`worker_notified`, or `worker_not_notified` when the worker had gone or nest refused).
+
+## PRs
+
+The owner's request (2026-11-03): "PRs should be attachable to tasks."
+
+- **A relation, not one field.** A task has any number of PRs (ProjectDO's `task_prs`), and a PR belongs to one task at a time. The migration made each task's single `pr` its first attached PR, with its auto-merge. `Task.pr` (and the old column) is still the first attached; `Task.prs` lists them all.
+- **Attaching:**
+  - **the owner**, from the task's drawer: one of the repo's open PRs (`GET /api/projects/:id/prs/open`), or a number, `#n`, or the PR's URL (`POST /api/projects/:id/tasks/:task/prs`);
+  - **the manager**, with `attach_pr` on `/mcp/board`;
+  - **its worker's own PR** still attaches itself, by `report_pr` or by its branch `task/<id>`.
+
+  The owner's and the manager's are checked on GitHub with a `pull_requests: read` token: the PR is in the repo and open, and GitHub says whether it's from a fork. A task in progress goes to review; a task that's over takes no PR.
+- **One task per PR:** attaching a PR that's attached to another task is refused, naming that task: detach it there first. A branch `task/<id>` never moves a PR attached elsewhere; it's noted on the task it names. Moving it silently would take a PR from a task someone chose.
+- **Detaching** (`DELETE …/prs/<n>`, or `detach_pr`) works on an open PR only, since a merged one stays as the record. A detached PR's auto-merge is turned off.
+- **Done:** a task is done once at least one PR is attached and every attached one has merged (`prsDone` in `src/tasks.ts`). Merging one of several leaves it in review. A PR closed without merging is detached with a note, and the task is done if the rest have merged. `merged` now moves any task that isn't over, since a PR may be attached to a task with no worker.
+- **Review and auto-merge:** every PR is reviewed already. With auto-merge on, every attached PR gets it: the owner's, the manager's, the worker's or the branch's, but only once GitHub has said it's from the repo itself and given its node id. A fork's PR never gets it, and neither does one whose head repo GitHub no longer names.
+- **The live worker is told** when PRs are attached or detached ([task changes](#task-changes)).
+
+## Dependencies
+
+The owner's request (2026-11-03): "Tasks should be able to block other tasks."
+
+- **"Waiting on", a relation** (ProjectDO's `task_deps`): a task waits on others (`blocked_by`), and is waited on by others (`blocks`). This is distinct from "Blocked" ([above](#blocked)), the flag an agent raises for the owner, which is a "Needs you" item. A dependency is the board's own ordering, and nothing waits on the owner.
+- **Valid** (`dependencyError` in `src/tasks.ts`, pure): within the project only, never on itself, never on a task that's over, never twice, and never closing a cycle, which is refused with the cycle's path (`tsk_a → tsk_b → tsk_a`).
+- **Assignment:** a task waiting on any task not `done` can't be assigned, whether automatically, by the manager or by the owner. The refusal names the blockers and their states. **There is no override:** the owner removes the dependency instead, which says what changed and keeps the board's record honest.
+- **Becoming assignable:** when its last blocker is done, the task can be assigned, and auto-assign takes it. **A cancelled blocker still holds it:** the work it waited on won't happen, so whether to go on without it is the owner's or the manager's call, made by removing the dependency.
+- **Who:** the owner from the drawer (`POST /api/projects/:id/tasks/:task/dependencies {blocked_by}`, `DELETE …/dependencies/<task>`), and the manager with `add_dependency` and `remove_dependency`. A worker's `get_task` lists what its task waits on, with each one's state.
+- **A live worker** on a task whose dependencies change (added or removed mid-flight, or one done) is told ([task changes](#task-changes)).
+- **On the board:** a card says "Waiting on N", neutral (gray, outline), since it's no one's to act on now. Hovering or focusing it lists the blockers. The drawer has a Dependencies section: what it waits on, each removable, a task picker (the switcher) to add one, and what waits on it.
 
 ## Waiting
 
@@ -227,7 +256,7 @@ The owner's request (2026-11-02): the manager "should be able to set timers and 
 The owner's request (2026-11-02): "I should be able to modify the default network policy of workers and the manager."
 
 - **The Network page** (between Secrets and Settings in the sidebar): per role (workers, the manager), the hosts its sandboxes may reach on top of the operator's policy, each with optional ports (default 80 and 443). Presets: npm, Node downloads, PyPI, crates.io, Go modules, Docker Hub, GitHub releases; or a custom host. Reviewers get none: they read the repo, which the operator's policy already reaches.
-- **Within the grant:** each host must be inside the client's `egress_hosts` (`GET /v1/clients/self`), checked as it's added and again by the API (`PUT /api/projects/:id/network`: 403 outside it, "the operator must widen the grant's egress_hosts"; 400 malformed). nest checks once more on every write. The page shows the ceiling, and the operator's rules read-only, from the manager's sandbox's effective policy (`GET /v1/sandboxes/<id>/policy`, which a client may read for its own sandboxes), by each rule's [`source`](../docs/sandbox/networking/egress/policy/): nest's defaults (`base`), the operator's (`operator`) and those from its repo allowlists (`repos`). The app's own (`client`) are the role editors', and grants (`grant`) are left out. A control plane without `source` falls back to `layer` less the app's own rules (`GET …/client-policy`); that goes once every control plane answers `source`.
+- **Within the grant:** each host must be inside the client's `egress_hosts` (`GET /v1/clients/self`), checked as it's added and again by the API (`PUT /api/projects/:id/network`: 403 outside it, "the operator must widen the grant's egress_hosts"; 400 malformed). nest checks once more on every write. The page shows the ceiling, and the operator's rules read-only, from the manager's sandbox's effective policy (`GET /v1/sandboxes/<id>/policy`, which a client may read for its own sandboxes), by each rule's [`source`](../docs/sandbox/networking/egress/policy/#sources): nest's defaults (`base`), the operator's (`operator`) and those from its repo allowlists (`repos`). The app's own (`client`) are the role editors', and grants (`grant`) are left out. A control plane without `source` falls back to `layer` less the app's own rules (`GET …/client-policy`); that goes once every control plane answers `source`.
 - **New agents** get their role's rules in their sandbox's create (`POST /v1/sandboxes {egress}`). A start attempt's rules are frozen at its first try (`frozen_egress`), since its sandbox's `Idempotency-Key` binds the request; a sandbox made with older rules is brought up to date at once.
 - **Live agents** (the manager, each live worker) get them through their sandbox's client layer, which nest replaces whole. **`clientLayerFor(rules, role, feeds, current)`** (`src/network.ts`) is the one place that builds it: this role's rules, and each other part (injection bindings, env) from its feed, else as the sandbox has it now (read first; a binding nest answers as held, with its `client` and `placeholder`, goes back in the PUT's strict shape, `name`, `secret`, `hosts`, `locations`, `wildcard`). So a network change never drops a secret's binding, and the Secrets page (PR #133) feeds its bindings and env into the same function. Each live agent's layer shows as applied, pending (retried from the alarm) or failed (a refusal that will repeat: shown, not retried), polled while any is pending.
 

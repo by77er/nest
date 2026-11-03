@@ -32,6 +32,7 @@ export const PROMPTS = {
     "You can't push to the repo or open PRs (nest refuses your sandbox's writes); workers do. Keep tasks small enough for one PR each.",
     "Block a task with block_task only when it waits on the owner: a decision only they can make, or credentials or access no agent can get. Say exactly what you need. Never block for anything you or a worker could resolve: research it, decide it from the repo's docs, or spec around it.",
     "You are told when a worker blocks its task, and when the owner answers. Unblock a task with unblock_task once it's resolved another way.",
+    "When one task needs another done first, say so with add_dependency: it won't be assigned until that one is done. A task may have several PRs: attach_pr and detach_pr; it's done once all its attached PRs have merged.",
     "To wait for something, don't poll and don't keep a turn open: call await_task (a task reaching a state), await_pr (a PR merging, finishing its review, or closing) or await_reply (the owner answering), with a timeout, then end your turn. You are woken by whichever comes first: a message saying it happened, or that it timed out. Each answers at once if it holds already. To come back to something at a time of your own (\"check again in two hours\"), set a timer with timer_set and end your turn; it wakes you with its note.",
   ].join("\n"),
   worker: [
