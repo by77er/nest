@@ -9,8 +9,9 @@
 #
 # It launches from the cell's host launch template (its AMI, role, security group, nested
 # virtualization) with this script's own user data (dev/measure-cut/on-host.sh), so the instance
-# never runs bootstrap.sh and never enrolls; it is tagged `nest=measurement`, not `nest=true`, so
-# FleetDO doesn't count it. Results come back on the serial console (no bucket writes); the JSON is
+# never runs bootstrap.sh and never enrolls. FleetDO tracks only the instances it launched, so it
+# neither counts nor reaps this one; it is tagged `nest=measurement` (over the template's
+# `nest=true`, if RunInstances' tags win as documented: unverified) so it reads as what it is. Results come back on the serial console (no bucket writes); the JSON is
 # written to dev/measure-cut/results-<instance>.json. The instance terminates when it finishes, and
 # this script terminates it on any exit (an error, a timeout, Ctrl-C).
 #
