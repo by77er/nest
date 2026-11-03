@@ -116,6 +116,40 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - Option 3 above bounds records in the background.
   - Option 1's FIEMAP walk is itself O(records): to be bounded, it would need option 3 or a cap where a cut falls back.
 
+**Measured (2026-11-03, one `c8id.large` in us-east-1c, `i-04d122795c13dafcf`: kernel 6.18.56, xfsprogs 6.12.0; results in `dev/measure-cut/results-m3-i-04d122795c13dafcf.json`):**
+
+| 32 GiB disk | XFS extent records | `FICLONE` | FIEMAP walk, kernel time | `fsx_nextents` |
+|---|---|---|---|---|
+| fresh | 60 | 13 ms | 0.03 ms | 0.01 ms |
+| after 1 GiB of churn | 304,586 | 1.6–3.0 s | 495 ms cold, 222 ms warm | 0.01 ms |
+| month-aged | 897,569 | 8.1–11.1 s | 1,675 ms cold, 690–860 ms warm | 0.01 ms |
+
+`filefrag` counts merged extents (186 k and 827 k for these disks); XFS's own records are what the clone and the walk pay for.
+
+- **Option 1 works, and its pause is O(records):**
+  - On the month-aged disk, the shadow equalled the disk afterwards (20,000 random 4 KiB blocks compared, both runs).
+  - After a turn (2,000 scattered writes) the pre-copy ran 3.0 s while the VM ran.
+  - The in-pause step took 1.6 s. Of that, the FIEMAP walk was 1,065 ms (688 ms in the kernel) and the Python diff 534 ms. Cloning the residue (298 ranges, 3 MB) took 1.7 ms, and the sync 8 ms.
+  - After 1 GiB of writes, the in-pause step took 2.2 s (820 ms walking in the kernel). The pre-copy took 15.7 s, 9.7 s of it the sync.
+  - In Rust, the diff would cost little beside the walk (unverified). The pause would then be about the kernel's walk, roughly 0.8 µs a record warm: about 0.7–0.9 s at a month's ~1 M records. That is about 10× better than M2's 8.1 s, but still about 4× the 200 ms gate. Fewer records shrink it in proportion.
+- **The diff must treat an unwritten extent as a hole.** A clone maps it as one, so the first version re-cloned 8,978 ranges (421 MB, about 10 ms) at every pre-copy. Fixed in `m3.py`.
+- **Option 3's extent size hint doesn't help:** after 1 GiB of churn the records were 179 k with no hint, 173 k at 1 MiB and 190 k at 4 MiB, and the clone took 2.2–2.7 s in each case. Dropped.
+- **Exchange-range works:** `mkfs.xfs -i exchange=1` is accepted (xfsprogs 6.12.0), and `XFS_IOC_EXCHANGE_RANGE` swapped 16 MiB in 0.18 ms while a writer ran on the same file (verified by content). Background defragmentation is possible on the hosts' stack. Its throughput, and how far it brings records down, are unmeasured.
+- **Other numbers:**
+  - Reading a cut cold: 7.33 GB in 37.6 s, about 195 MB/s.
+  - M2's pause on the month-aged disk with no guest writing: 6.5–6.6 s.
+- **Guest write stalls are still unmeasured.** The scattered writes had wrecked the aged disk's ext4, so its guest kernel couldn't mount root and panicked. The harness now boots a fresh root and writes the aged disk raw, as `/dev/vdb`.
+- **Capacity:** `c8id.large` had none in us-east-1a, 1b or 1c for about 20 minutes (three attempts, 20:48–21:11 UTC). FleetDO falls back to the EBS-only types meanwhile ([M2](#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)).
+
+**Recommendation:** option 1 plus a record budget kept by background defragmentation (option 3's exchange-range).
+- The walk is the pause, and it is linear in records. Defragmentation keeps records low while the VM runs, a range at a time, each exchange atomic. At about 100–200 k records the walk would be about 80–160 ms (in Rust, unverified), inside the gate.
+- Both are XFS alone: no device layer, no guest change.
+- Option 2 (dm-era) is the fallback, if a record budget can't be held under a guest that fragments on purpose. Its pause doesn't depend on records at all.
+- Taking the cut off the serial executor is needed either way.
+- **Before building:**
+  - one more run, with the same harness and its layers (about 40 minutes, about $0.08): the guest write stalls, the exchange-range defragmentation's throughput and the records it leaves, and a compiled diff;
+  - then a prototype in nestd behind `disk_cut`.
+
 **How to measure, with the same harness and its cleanup layers:** one `c8id.large`, about 40 minutes, about $0.08 on demand. It adds these phases to `dev/measure-cut/on-host.sh`, on the same fresh, churned and month-aged disks:
 - FIEMAP (with `FIEMAP_FLAG_SYNC`) time against the record count;
 - option 1 end to end: the pre-copy's time and range count, then the in-pause FIEMAP plus residue clone, after 2,000 scattered 4 KiB writes and after 1 GiB;
