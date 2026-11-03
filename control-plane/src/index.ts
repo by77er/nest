@@ -741,6 +741,16 @@ export const ROUTES: Route[] = [
     // An AgentDO still on the previous release (minutes after a deploy) has no trace: it answers its session route's 400.
     throw new NestError(ErrorCodes.INTERNAL, "the live trace isn't running yet after a deploy: try again in a few minutes", 503, true);
   } }),
+  // The trace's older events, from the stored transcript (docs/control-plane/api/#trace-history).
+  route({ method: "GET", path: "/v1/agents/:agent/trace/history", auth: "owner", run: async (c) => {
+    const q = c.url.searchParams;
+    const before = q.get("before") ?? undefined;
+    if (before !== undefined && !/^[A-Za-z0-9_-]{1,512}$/.test(before)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "before is not a cursor the trace gave");
+    const raw = q.get("limit");
+    if (raw !== null && !/^\d{1,4}$/.test(raw)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "limit must be a positive integer");
+    const stub = await ownAgent(c, c.p.agent);
+    return newMethod("AgentDO.traceHistory", () => stub.traceHistory(before, raw === null ? undefined : Math.max(1, Number(raw))));
+  } }),
   route({
     method: "POST", path: "/v1/agents/:agent/turns", auth: "owner", status: 201,
     body: z.object({ text: z.string(), kind: z.enum(["user", "recovery"]).default("user"), request_id: RequestIdField }),

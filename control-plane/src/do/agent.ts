@@ -25,6 +25,7 @@ import { isAgentId, Labels } from "../lib/clients";
 import type { MemberFacts } from "./client";
 import { type ClientEvent, ClientOutbox, EVENT_TEXT_MAX } from "../lib/client-events";
 import { field, TRACE_PING, TRACE_PONG, TRACE_SOCKETS_MAX, type TraceBody, type TraceControl, TraceRing, traceOf } from "../lib/trace";
+import { decodeCursor, encodeCursor, HISTORY_DEFAULT_LIMIT, type HistoryCursor, type HistoryPage, historyPage } from "../lib/trace-history";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
 import {
@@ -1831,7 +1832,11 @@ export class AgentDO extends DurableObject<Env> {
     for (const old of open.slice(0, Math.max(0, open.length - TRACE_SOCKETS_MAX))) this.closeTraceSocket(old, 4008, "too many trace sockets");
     const { gap, events } = this.traceRing.after(after, Date.now());
     const control = (m: TraceControl) => this.traceSendTo(ws, JSON.stringify(m));
-    let ok = gap ? control({ type: "gap", ...gap }) : true;
+    // Older than the ring (pruned, or from before it began): the trace history, from its seam back.
+    const seam = this.traceRing.seam();
+    const before = info.durable_bytes > 0 && after < (seam?.seq ?? this.traceRing.head() + 1) ? encodeCursor(this.historyCursor(info, seam)) : null;
+    let ok = gap ? control({ type: "gap", ...gap, ...(before ? { before } : {}) }) : true;
+    if (ok && before) ok = control({ type: "history", before });
     for (const ev of events) {
       if (!ok) break;
       ok = this.traceSendTo(ws, JSON.stringify(ev));
@@ -1845,6 +1850,35 @@ export class AgentDO extends DurableObject<Env> {
       control({ type: "live" });
     }
     return new Response(null, { status: 101, webSocket: pair[0], headers: { [TRACE_HEADER]: "1" } });
+  }
+
+  /**
+   * Where the trace history ends: before the ring's seam (its oldest event the transcript has too), or
+   * now when the ring has none. `c`: the seam starts a turn (or none runs), so the last turn before it
+   * is complete.
+   */
+  private historyCursor(info: AgentInfo, seam = this.traceRing.seam()): HistoryCursor {
+    return { b: info.base_gen, o: null, t: seam?.ts_ms ?? Date.now(), c: seam ? seam.type === "turn_started" : info.current_turn === null };
+  }
+
+  /**
+   * `GET /v1/agents/<id>/trace/history?before=<cursor>&limit=<n>` (docs/control-plane/api/#trace-history):
+   * the older events, from the committed transcript in R2, newest page first. Reads only: no brain, no
+   * sandbox. A cursor from another base (the transcript was rewritten since) starts over (`reset`).
+   */
+  async traceHistory(before?: string, limit = HISTORY_DEFAULT_LIMIT): Promise<HistoryPage & { reset?: true }> {
+    const info = this.load();
+    const cur = before === undefined ? this.historyCursor(info) : decodeCursor(before);
+    if (!cur) throw new NestError(ErrorCodes.INVALID_MESSAGE, "before is not a cursor the trace gave", 400);
+    if (cur.b !== info.base_gen) return { events: [], next_before: encodeCursor({ ...cur, b: info.base_gen, o: null }), reset: true };
+    const segments = this.sql
+      .exec<{ offset: number; len: number; key: string }>("SELECT offset, len, key FROM segments WHERE base = ? AND offset < ? ORDER BY offset", info.base_gen, info.durable_bytes)
+      .toArray();
+    const read = async (key: string) => {
+      const obj = await this.env.BUCKET.get(key);
+      return obj ? new Uint8Array(await obj.arrayBuffer()) : null;
+    };
+    return historyPage(segments, info.durable_bytes, cur, limit, this.traceRing.identity(), read);
   }
 
   private send(ws: WebSocket, msg: AgentToRunner): void {

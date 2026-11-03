@@ -1,6 +1,6 @@
 ---
 name: nest-host
-description: Use when changing nest's host-side Rust code: nestd and nestd-core, nest-runner, nest-proxy, nest-gateway, nest-guest, nest-hands-client or nest-cli, including fencing, incarnations, the runner, proxy and gateway links, drivers and host tests. Covers the sans-IO core / thin shell rule and its checks (no-std build, manifest check, Stateright, Kani, cargo-mutants, fuzzing), the fencing invariants, and test timing.
+description: Use when changing nest's host-side Rust code: nestd and nestd-core, nest-runner, nest-proxy, nest-gateway, nest-guest, nest-hands-client or nest-cli, including fencing, incarnations, the runner, proxy and gateway links, drivers and host tests. Covers the sans-IO core / thin shell rule and its checks (no-std build, manifest check, Stateright, Kani, cargo-mutants, fuzzing), and the fencing invariants.
 ---
 
 # Changing host code
@@ -45,7 +45,7 @@ Bounds and results are recorded in the verification doc. Say which bound a claim
   - CBMC stalls on `BTreeMap` and `VecDeque`, so make the code generic over its map and prove it over a fixed-array stand-in (`ResultCache`, `TombstoneMap`).
   - Mutate the property to show the harness can fail.
 - **cargo-mutants:**
-  - `cargo mutants -p nestd-core --in-place --timeout 60` (233 mutants, about 2-4 min); 0 missed is required.
+  - `cargo mutants -p nestd-core --in-place --timeout 60` (a few minutes); 0 missed is required.
   - `--in-place` edits your sources while it runs: build nothing else, and check `git status` afterwards.
   - An equivalent mutant is excluded in `.cargo/mutants.toml` by function and mutation (never by line), with a reason. Otherwise write the missing test.
 - **Fuzzing:** new parsers at a trust boundary get a target in `verification/nestd/fuzz` (its README). Seeds come from `protocol/fixtures/`.
@@ -68,25 +68,15 @@ Bounds and results are recorded in the verification doc. Say which bound a claim
 - **A sandbox fence never touches brains.** Brains are fenced by the host lease and their agent epoch. A start never outlives a lease lapse.
 - **Dirty work ends as a head, an orphan, or a logged final refusal,** never a silent delete.
 - **A brain host runs no sandbox machinery** (`Config::validate`, `host_kind_refusal`).
-- **The `CLAUDE.md` invariants are fenced** (`scripts/fences.toml`):
-  - the guest and the gateway name no credential;
-  - only the runner launches `claude`, never with permission bypass;
-  - only nest-proxy terminates TLS.
-  
-  Never widen an `allow` list.
-- **Hosts lag the Worker by a release, and a brain host and a sandbox host may be a release apart** (the `nest-wire` skill).
+- **The `AGENTS.md` invariants are fenced** (`scripts/fences.toml`): the guest and the gateway name no credential; only the runner launches `claude`, never with permission bypass; only nest-proxy terminates TLS. Never widen an `allow` list.
+- **Hosts lag the Worker by a release, and a brain host and a sandbox host may be a release apart** (`nest-wire`).
 
-## Tests and timing
+## Tests
 
-- **Commands:**
-  - `cargo clippy --workspace --all-targets --locked -- -D warnings`;
-  - `cargo test -p <crate>`;
-  - for nestd, run with `NEST_CI_REQUIRE_USERNS=1` so a netns test can't skip (it needs `ip`, `nft` and unprivileged user namespaces).
-- **Waits use wall-clock budgets,** never iteration counts sized for an idle machine. Outlast the timer the wait covers, with margin, and name that timer. A wait across a retry backoff needs the backoff in its margin.
-- **Tests run in parallel in one process:** no shared globals, no fixed ports (bind `:0`), and no `std::env::set_var` (clippy denies it; set the environment on the child `Command`).
-- **A flaky test gets a root cause.** Reproduce it under load (loop it while another build runs), then fix the wait or the assertion. Don't just raise a timeout.
-- **Cross-component changes** (runner, nestd, proxy, gateway, guest, control plane): `NEST_E2E_WORK=/var/tmp/nest-e2e-<tag> e2e/run.sh`. Use a short path: unix-socket paths are limited to 108 bytes, and a worktree's `e2e/.work` can exceed that. The directory is deleted at the start of each run.
-- **Evidence tiers:** the process driver proves no Firecracker, snapshot, real vsock or tunnel behaviour (the `nest-validation` skill). `nest-guest` changes need a hand rebuild of the guest image (`images/guest/build-on-ec2.sh`, [dev/deploy.md](../../../dev/deploy.md)); say so in the PR.
+- **Commands:** `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test -p <crate>`. Run nestd's with `NEST_CI_REQUIRE_USERNS=1` so a netns test can't skip (it needs `ip`, `nft` and unprivileged user namespaces).
+- **Waits, parallel safety and flakes** follow `nest-tests`.
+- **Cross-component changes** (runner, nestd, proxy, gateway, guest, control plane) run e2e (`nest-validation`).
+- **Evidence tiers:** the process driver proves no Firecracker, snapshot, real vsock or tunnel behaviour. `nest-guest` changes need a hand rebuild of the guest image (`images/guest/build-on-ec2.sh`, [dev/deploy.md](../../../dev/deploy.md)); say so in the PR.
 
 ## Done
 

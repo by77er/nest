@@ -1,0 +1,10 @@
+{
+  "name": "nest-ui-review",
+  "private": true,
+  "description": "Screenshots and automated design checks for nest's apps (README.md). Not a dependency of any app.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "dependencies": {
+    "playwright": "1.63.0"
+  }
+}

@@ -99,6 +99,7 @@
 - **Who:** the client's token, on its own subtree; any other agent answers 404, as an unknown one does. An agent's caller identity and host tokens are refused (401).
 - **From a browser:** the client's own Worker checks its user, connects with the client token (`fetch` with `Upgrade: websocket` and `Authorization`), and returns the socket. The token never reaches the browser, and the app holds no state for it.
 - **Never in an agent's way:** sends are fire-and-forget after the event is recorded, a failed send closes that socket, and at most 8 trace sockets per agent are open (the oldest closes). A client that falls behind reconnects with `after`.
+- **History:** `GET /v1/agents/<id>/trace/history?before=<cursor>` gives the older events from the stored transcript, in the same shape, for what the ring doesn't hold; the trace's `history` and `gap` messages carry the cursor to start from ([trace history](../#trace-history)). Same auth.
 - **Events vs. trace:** [events to the owner](#events-to-the-owner) are durable and delivered at least once, for acting on; the trace is for watching, and a client that wasn't connected reads what it missed from the ring or the transcript.
 
 ## GitHub tokens

@@ -22,7 +22,7 @@ const NOT_ADMIN = {
   "GET /.well-known/jwks.json": "none",
   // An API client's token is accepted too, on its own subtree (docs/control-plane/api/clients/; test/clients.test.ts).
   ...Object.fromEntries([
-    "POST /v1/agents", "GET /v1/agents", "GET /v1/agents/:agent", "GET /v1/agents/:agent/turns", "GET /v1/agents/:agent/transcript", "GET /v1/agents/:agent/trace",
+    "POST /v1/agents", "GET /v1/agents", "GET /v1/agents/:agent", "GET /v1/agents/:agent/turns", "GET /v1/agents/:agent/transcript", "GET /v1/agents/:agent/trace", "GET /v1/agents/:agent/trace/history",
     "POST /v1/agents/:agent/turns", "POST /v1/agents/:agent/inbox", "POST /v1/agents/:agent/interrupt", "POST /v1/agents/:agent/start",
     "POST /v1/agents/:agent/stop", "GET /v1/agents/:agent/children", "GET /v1/agents/:agent/brokered", "GET /v1/agents/:agent/asks",
     "POST /v1/agents/:agent/asks/:ask/answer",
