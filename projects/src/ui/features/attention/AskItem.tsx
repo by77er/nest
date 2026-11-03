@@ -1,14 +1,14 @@
-// What the project's agents are waiting on the owner for (nest's asks): an approval of a held call,
-// answered approve or deny, or a question, answered in words. Shown above the board while any is open.
+// One of nest's asks in "Needs you" (NeedsYou.tsx): an approval of a held call, answered approve or
+// deny, or a question, answered in words.
 
-import { Button, Divider, Text, Textarea } from "@mantine/core";
-import { IconAlertTriangle, IconCheck, IconX } from "@tabler/icons-react";
+import { Button, Text, Textarea } from "@mantine/core";
+import { IconCheck, IconX } from "@tabler/icons-react";
 import { useState } from "react";
-import { useAnswerAsk, useAsks } from "../../api/queries";
+import { useAnswerAsk } from "../../api/queries";
 import type { Ask } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
-import { icon, MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, Toolbar } from "../../layout";
+import { icon, MetaItem, MetaRow, Prose, Row, Stack, Toolbar } from "../../layout";
 
 /** nest's approval: `{name, tool}` of the call it held (docs/agents/tools/#taint-and-sinks). */
 function approvalOf(a: Ask): { name: string; tool: string | null } | null {
@@ -17,7 +17,7 @@ function approvalOf(a: Ask): { name: string; tool: string | null } | null {
   return { name: x.name, tool: typeof x.tool === "string" ? x.tool : null };
 }
 
-function AskItem({ projectId, ask }: { projectId: string; ask: Ask }) {
+export function AskItem({ projectId, ask }: { projectId: string; ask: Ask }) {
   const answer = useAnswerAsk(projectId);
   const [text, setText] = useState("");
   const approval = approvalOf(ask);
@@ -72,26 +72,5 @@ function AskItem({ projectId, ask }: { projectId: string; ask: Ask }) {
         </form>
       )}
     </Stack>
-  );
-}
-
-export function AsksPanel({ projectId }: { projectId: string }) {
-  const asks = useAsks(projectId);
-  const open = (asks.data ?? []).filter((a) => a.answered_ms === null);
-  if (open.length === 0) return null;
-  const title = open.length === 1 ? "An agent is waiting for you" : `${open.length} agents' asks are waiting for you`;
-  return (
-    <Panel tone="warning" role="alert" aria-label={title} aria-live="polite">
-      <Section title={title} icon={IconAlertTriangle} iconColor="warning" region={false}>
-        <Stack gap="lg">
-          {open.map((a, i) => (
-            <Stack key={a.ask} gap="lg">
-              {i > 0 && <Divider />}
-              <AskItem projectId={projectId} ask={a} />
-            </Stack>
-          ))}
-        </Stack>
-      </Section>
-    </Panel>
   );
 }

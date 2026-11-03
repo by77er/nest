@@ -3,7 +3,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { Ask, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
+import type { Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
 
 export const keys = {
   projects: ["projects"] as const,
@@ -14,6 +14,7 @@ export const keys = {
   asks: (id: string) => ["projects", id, "asks"] as const,
   manager: (id: string) => ["projects", id, "manager"] as const,
   reviews: (id: string) => ["projects", id, "reviews"] as const,
+  attention: (id: string) => ["projects", id, "attention"] as const,
   syncState: ["admin", "sync-state"] as const,
 };
 
@@ -22,7 +23,8 @@ export const POLL = { board: 5_000, chat: 3_000, asks: 5_000, project: 10_000, t
 
 // --- reads ------------------------------------------------------------------------------------------
 
-export const useProjects = () => useQuery({ queryKey: keys.projects, queryFn: api.projects });
+/** The projects, with each one's "needs you" count (the sidebar's badges): polled like a project. */
+export const useProjects = () => useQuery({ queryKey: keys.projects, queryFn: api.projects, refetchInterval: POLL.project });
 
 export const useProject = (id: string) => useQuery({ queryKey: keys.project(id), queryFn: () => api.project(id), refetchInterval: POLL.project });
 
@@ -55,6 +57,24 @@ export function useRetryAttach(id: string) {
     mutationFn: () => api.retryAttach(id),
     meta: { failure: "The repo wasn't attached" },
     onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: keys.manager(id) }), qc.invalidateQueries({ queryKey: keys.project(id), exact: true })]),
+  });
+}
+
+/** What waits on the owner: open asks and blocked tasks, oldest first (README.md#blocked). */
+export const useAttention = (id: string) => useQuery({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks });
+
+/** The owner answers a blocked task: its block clears, and the answer reaches the agents' inboxes. */
+export function useAnswerBlocked(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { task: string; answer: string }) => api.answerBlocked(id, v.task, { answer: v.answer }),
+    meta: { failure: "The answer wasn't sent" },
+    onSuccess: (t) => {
+      qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "blocked" && x.task === t.id)));
+      qc.setQueryData<Task[]>(keys.tasks(id), (old) => old?.map((x) => (x.id === t.id ? t : x)));
+      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
+      return qc.invalidateQueries({ queryKey: keys.attention(id) });
+    },
   });
 }
 
@@ -197,6 +217,9 @@ export function useAnswerAsk(id: string) {
     meta: { failure: "The answer wasn't sent" },
     onSuccess: (_d, v) => {
       qc.setQueryData<Ask[]>(keys.asks(id), (old) => old?.map((a) => (a.ask === v.ask ? { ...a, answered_ms: Date.now() } : a)));
+      qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "ask" && x.ask === v.ask)));
+      void qc.invalidateQueries({ queryKey: keys.attention(id) });
+      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
       return qc.invalidateQueries({ queryKey: keys.asks(id) });
     },
   });

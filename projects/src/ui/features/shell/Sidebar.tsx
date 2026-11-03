@@ -10,7 +10,7 @@ import type { ProjectRow } from "../../api/types";
 import { NavItemLink } from "../../common/links";
 import { Stack } from "../../layout/Stack";
 import { icon } from "../../theme";
-import { useAttention } from "./attention";
+import { useNeedsYou } from "./attention";
 
 /** A project's pages, in the order the sidebar lists them. */
 export const PROJECT_PAGES = [
@@ -58,7 +58,7 @@ function ProjectGroup({ project, current, onNavigate, attention }: { project: Pr
 
 /** A project group with its attention count (a hook per project, so the count can update on its own). */
 function ProjectEntry(props: { project: ProjectRow; current: boolean; onNavigate: () => void }) {
-  return <ProjectGroup {...props} attention={useAttention(props.project.id)} />;
+  return <ProjectGroup {...props} attention={useNeedsYou(props.project.id)} />;
 }
 
 export function SidebarNav({ onNavigate }: { onNavigate: () => void }) {

@@ -60,6 +60,21 @@ describe("the attention badge", () => {
   });
 });
 
+describe("the sidebar's badge", () => {
+  it("carries each project's needs-you count from the projects list, and none at zero", async () => {
+    const api = new FakeApi();
+    api.projects = [project(), project({ id: "prj_two", name: "Gadgets", repo: "owner/gadgets" })];
+    api.asks = [(await import("../../test/fakeApi")).ask({ question: "q1" }), (await import("../../test/fakeApi")).ask({ question: "q2" })];
+    renderApp("/projects", api);
+    const nav = await waitFor(sidebar);
+    const one = await within(nav).findByRole("button", { name: /Widgets, 2 need you/ });
+    const badge = one.querySelector("[data-marker=needs-you]")!;
+    expect(badge).toHaveTextContent("2");
+    expect(badge.getAttribute("style")).toContain("--mantine-color-warning-");
+    expect(within(nav).getByRole("button", { name: /Gadgets/ }).querySelector("[data-marker=needs-you]")).toBeNull();
+  });
+});
+
 describe("the routes", () => {
   it("send / to the projects, and an old project link with a task to the board with that task", async () => {
     const api = new FakeApi();

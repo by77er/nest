@@ -1,9 +1,9 @@
 // A project's board page, its focal element the board at the content's full width: what its agents are
-// waiting on above it, and the drawer of the task named in the URL (`?task=`).
+// waiting on ("Needs you") above it, and the drawer of the task named in the URL (`?task=`).
 
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
 import { MetaItem } from "../../layout";
-import { AsksPanel } from "../asks/AsksPanel";
+import { NeedsYou } from "../attention/NeedsYou";
 import { Board } from "../board/Board";
 import { TaskDrawer } from "../task/TaskDrawer";
 import { ProjectFrame } from "./ProjectFrame";
@@ -27,7 +27,7 @@ export function BoardPage() {
     >
       {(p) => (
         <>
-          <AsksPanel projectId={projectId} />
+          <NeedsYou projectId={projectId} />
           <Board projectId={projectId} repo={p.repo} />
           <TaskDrawer projectId={projectId} repo={p.repo} taskId={task} onClose={() => void navigate({ search: {} })} />
         </>

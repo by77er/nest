@@ -1,5 +1,7 @@
-// How many things in a project need the owner (blocked tasks, open asks): the badge on its sidebar group.
-// A slot: the "needs you" feature fills it in; until then nothing is counted and no badge shows.
-export function useAttention(_projectId: string): number | undefined {
-  return undefined;
+// How many things in a project need the owner (open asks and blocked tasks): the badge on its sidebar
+// group, from the projects list's `needs_you` (GET /api/projects), which the list's query keeps fresh.
+import { useProjects } from "../../api/queries";
+
+export function useNeedsYou(projectId: string): number | undefined {
+  return useProjects().data?.find((p) => p.id === projectId)?.needs_you;
 }
