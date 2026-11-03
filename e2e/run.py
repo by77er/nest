@@ -1494,7 +1494,7 @@ def run_checkpoint_pause(ids):
     try:
         caught = "sandbox running again" not in gateway_log().split(paused_marker)[-1]
         if not check("checkpoint pause: nestd stopped while the checkpoint's read still held the VM paused", caught,
-                     "the read ended before the stop: the VM ran again first"):
+                     "" if caught else "the read ended before the stop: the VM ran again first"):
             return
         open(cue, "w").close()
 
