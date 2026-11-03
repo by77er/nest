@@ -44,7 +44,7 @@ STRESS_AGENTS=50 python3 -I dev/cloud-checks/stress.py      # STRESS_HANDS=0: br
 | **Cleans up** | stops every agent and destroys every sandbox on every exit path (interrupt it with SIGINT, not SIGTERM); the last line is the JSON of the ids it made |
 | **Costs** | at 50 agents on `use1`: about $0.20 of spot EC2 for a run, plus one short Haiku turn per agent on the subscription |
 
-**First run (2026-10-31, `use1`, caps raised by #54; with the channel phases since removed):** the findings are in [the stress test notes](stress-2026-10-31.md).
+**First run (2026-10-31, `use1`, caps raised by #54):** the findings are in [the stress test notes](stress-2026-10-31.md), a dated record.
 
 ## `mcp_check.py`
 
@@ -69,7 +69,7 @@ python3 -I dev/cloud-checks/mcp_check.py      # MCP_DRAIN_S=2700: also watch the
 
 **Leftovers after an interrupted run:** stop the agent ids from the last line with `POST /v1/agents/<id>/stop`; `GET /calls?since=0` on the server shows what reached it.
 
-**Sanity-checked locally (2026-10-31)** against `wrangler dev` control plane (`ALLOW_LOOPBACK_MCP=1`, no hosts, `NEST_CELL=local`) and a local `mcp-test`: the reset, secret, capability, template, agent, turn and events calls answer as the script expected then (it created a workstream and read approvals from its events; it now reads `GET /v1/agents/<id>/asks`, not yet run locally), and the timeout, SIGINT and SIGTERM paths stopped the agents and printed the ids. The log checks were run over the local server's real log after calls sent with crafted `_meta`: a well-behaved agent passed every check, and a repeated non-idempotent key, an older epoch after a newer one, an untainted call and a counter of 3 each failed. No brain ran (no hosts, no Claude), so that is no evidence for the cloud run.
+**Sanity-checked locally (2026-10-31)** against `wrangler dev` control plane (`ALLOW_LOOPBACK_MCP=1`, no hosts, `NEST_CELL=local`) and a local `mcp-test`: the reset, secret, capability, template, agent, turn and events calls answer as the script expected then (approvals, read from `GET /v1/agents/<id>/asks`, are not yet run locally), and the timeout, SIGINT and SIGTERM paths stopped the agents and printed the ids. The log checks were run over the local server's real log after calls sent with crafted `_meta`: a well-behaved agent passed every check, and a repeated non-idempotent key, an older epoch after a newer one, an untainted call and a counter of 3 each failed. No brain ran (no hosts, no Claude), so that is no evidence for the cloud run.
 
 
 ## `list_changed_check.py`
