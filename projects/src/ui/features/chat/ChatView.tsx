@@ -62,7 +62,6 @@ export function ChatView({ projectId }: { projectId: string }) {
   const atBottom = useRef(true);
   const count = chat.data?.length ?? 0;
 
-  // Keep the newest message in view as messages arrive.
   // The composer docks over the page's bottom: the newest message must clear it. Its height is measured,
   // and the end sentinel keeps that much room when scrolled to.
   useEffect(() => {
@@ -74,11 +73,17 @@ export function ChatView({ projectId }: { projectId: string }) {
     return () => ro.disconnect();
   }, []);
 
-  // Follow the end only while the reader is already there.
+  // Follow the end only while the reader is there: scrolling up leaves it, reaching it (the sentinel
+  // within a line of the composer's top) rejoins it. Content growing doesn't move the page (no scroll
+  // anchoring while a chat is shown), so only the reader's scrolling changes this.
   useEffect(() => {
+    let last = window.scrollY;
     const onScroll = () => {
-      const s = document.scrollingElement ?? document.documentElement;
-      atBottom.current = s.scrollHeight - s.scrollTop - s.clientHeight < footerHeight + 32;
+      const el = end.current;
+      const y = window.scrollY;
+      if (el && el.getBoundingClientRect().bottom <= window.innerHeight - footerHeight + 48) atBottom.current = true;
+      else if (y < last) atBottom.current = false;
+      last = y;
     };
     window.addEventListener("scroll", onScroll, { passive: true });
     return () => window.removeEventListener("scroll", onScroll);
