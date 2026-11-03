@@ -91,6 +91,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
   - **`fence_applies_on_arrival_behind_slow_commands`** (review #8)
   - **`retryable_fleet_error_resends_the_failed_batch`** (review #7)
   - **`an_unchanged_disk_is_committed_without_reading_it`** and **`a_reused_manifest_still_stores_every_chunk_it_names`** (M1): a checkpoint leaves the sentinel on the disk; bytes changed with the time put back show the next one didn't read; a write is always read; a chunk gone from the store is read back and stored again
+  - **`a_commit_answered_after_a_fence_leaves_the_written_disk_dirty`**: a checkpoint's VM resumes past its read; a fence stops it while the answer is awaited; the `committed` answer leaves the disk dirty (no VM may have run since the read: `Sbx::runs`), and the retire salvages what it wrote
   - **`a_failed_pass_leaves_nothing_to_reuse`** (review of #122: a memory suspend whose snapshot can't be read, then an unwritten disk, is read again), **`a_leaky_pause_never_reuses_a_manifest`** (a driver whose pause doesn't stop every write), **`a_replaced_disk_file_is_read`** (same size and sentinel time, another inode), **`a_fence_during_a_checkpoints_resume_freezes_the_vm_again`**
   - **`a_rejected_commit_never_resumes_its_vm`**: a rejected suspend never resumes; a rejected checkpoint's VM (resumed before the answer) is frozen through its pause handle and stopped
   - **`proxy_ca_is_renewed_before_expiry`** (review #10)

@@ -314,6 +314,8 @@ struct FleetLog {
     ca_renews: Vec<String>,
     /// Command batches resent after a hello (their seq): the host hadn't reported them done.
     redelivered: Vec<u64>,
+    /// `commit_result`s held back while `hold_commit_answers` is set, for the test to send.
+    held: Vec<Command>,
 }
 
 struct MockFleet {
@@ -327,6 +329,8 @@ struct MockFleet {
     fail_next_events: Arc<AtomicBool>,
     /// Lose this many `commit_result` answers (the commit itself is applied, as SandboxDO would).
     lose_commit_answers: Arc<std::sync::atomic::AtomicUsize>,
+    /// Hold `commit_result`s back (in the log's `held`) instead of answering.
+    hold_commit_answers: Arc<AtomicBool>,
     /// Answer new salvage requests `rejected` with this reason (`parent_mismatch`: transient;
     /// `stale_epoch`: SandboxDO's final word).
     reject_salvage: Arc<Mutex<Option<String>>>,
@@ -367,6 +371,8 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
     let partition = Arc::new(AtomicBool::new(false));
     let fail_next_events = Arc::new(AtomicBool::new(false));
     let lose_commit_answers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hold_commit_answers = Arc::new(AtomicBool::new(false));
+    let hold = hold_commit_answers.clone();
     let (reject_salvage, commit_salvage) = (Arc::new(Mutex::new(None::<String>)), Arc::new(AtomicBool::new(false)));
     let reject_next = Arc::new(Mutex::new(None::<String>));
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<Command>>();
@@ -489,6 +495,9 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
                                 }
                                 log2.lock().unwrap().events.extend(events);
                                 let _ = ws.send(send(FleetToHost::Ack { up_to: es })).await;
+                                if !answers.is_empty() && hold.load(Ordering::SeqCst) {
+                                    log2.lock().unwrap().held.append(&mut answers);
+                                }
                                 if !answers.is_empty() {
                                     seq += 1;
                                     unacked.insert(seq, answers.clone());
@@ -510,10 +519,19 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
             }
         }
     });
-    MockFleet { url, log, commands: tx, frames: ftx, partition, fail_next_events, lose_commit_answers, reject_salvage, commit_salvage, reject_next }
+    MockFleet { url, log, commands: tx, frames: ftx, partition, fail_next_events, lose_commit_answers, hold_commit_answers, reject_salvage, commit_salvage, reject_next }
 }
 
 impl MockFleet {
+    /// Answer the commits held back so far (`hold_commit_answers`), and stop holding them.
+    fn release_commit_answers(&self) {
+        self.hold_commit_answers.store(false, Ordering::SeqCst);
+        let held = std::mem::take(&mut self.log.lock().unwrap().held);
+        if !held.is_empty() {
+            self.commands.send(held).unwrap();
+        }
+    }
+
     /// Wait until `pred` matches some logged event; returns it.
     async fn wait_event(&self, what: &str, pred: impl Fn(&HostEventBody) -> bool) -> HostEventBody {
         let deadline = std::time::Instant::now() + WAIT;
@@ -2806,4 +2824,66 @@ async fn a_failed_pause_lifts_its_mark() {
         since == vec![Some("checkpoint (turn_end)".to_string()), None]
     })
     .await;
+}
+
+/// Every `commit_request` for `sandbox`: (reason, disk manifest), in order.
+fn commit_requests(fleet: &MockFleet, sandbox: &str) -> Vec<(CommitReason, ManifestHash)> {
+    fleet
+        .log
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter_map(|e| match &e.body {
+            HostEventBody::CommitRequest { sandbox: s, reason, disk_manifest, .. } if s.0 == sandbox => Some((*reason, disk_manifest.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The first chunk of the disk a manifest names, from the harness's local store.
+fn first_chunk_of(h: &Started, manifest: &ManifestHash) -> Vec<u8> {
+    let store = LocalFsStore::new(h.dir.path().join("state/store/test-cell")).unwrap();
+    let m: Manifest = serde_json::from_slice(&store.get_manifest(manifest.0.strip_prefix("blake3:").unwrap()).unwrap()).unwrap();
+    store.get_chunk(m.chunks[0].as_deref().unwrap().strip_prefix("blake3:").unwrap()).unwrap()
+}
+
+/// A checkpoint resumes its VM after its read and before its commit's answer. If a fence stops
+/// that VM while the answer is awaited and the answer is `committed`, the disk must not be marked
+/// clean: the VM wrote after the read. It was (no VM ran at the answer), and `clean` lets a
+/// restarted nestd delete the incarnation unreported, and a retire that starts after the answer
+/// skip the salvage: the work written after the read was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_answered_after_a_fence_leaves_the_written_disk_dirty() {
+    let h = start_host().await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+    wait_until("the checkpoint's commit is out", || !commit_requests(&h.fleet, "sbx_1").is_empty()).await;
+    guest_write(&disk, 0, b"written after the checkpoint's read");
+    h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    wait_until("the VM stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
+    // The retire's salvage is out too (its answer held): answer only the checkpoint's commit.
+    wait_until("the salvage is out", || commit_requests(&h.fleet, "sbx_1").iter().any(|r| r.0 == CommitReason::Salvage)).await;
+    let checkpoint_answer: Vec<Command> = {
+        let mut log = h.fleet.log.lock().unwrap();
+        let (mine, rest): (Vec<Command>, Vec<Command>) = std::mem::take(&mut log.held)
+            .into_iter()
+            .partition(|c| matches!(&c.body, CommandBody::CommitResult { outcome: CommitOutcome::Committed { generation }, .. } if generation.reason == CommitReason::TurnEnd));
+        log.held = rest;
+        mine
+    };
+    assert_eq!(checkpoint_answer.len(), 1);
+    h.fleet.commands.send(checkpoint_answer).unwrap();
+    wait_until("the checkpoint's commit applied", || sandbox_meta(h.dir.path(), "sbx_1", 1).head.is_some()).await;
+    assert!(!sandbox_meta(h.dir.path(), "sbx_1", 1).clean, "the disk holds writes its head lacks");
+    h.fleet.release_commit_answers();
+    h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
+    let salvaged: Vec<_> = commit_requests(&h.fleet, "sbx_1").into_iter().filter(|r| r.0 == CommitReason::Salvage).collect();
+    assert_eq!(salvaged.len(), 1, "the work after the checkpoint's read is salvaged");
+    assert!(first_chunk_of(&h, &salvaged[0].1).starts_with(b"written after the checkpoint's read"));
 }
