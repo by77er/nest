@@ -146,7 +146,7 @@ export function Picker({ label, icon: Icon, items, searchLabel, empty, fromSearc
 
 /** A row's own action (Detach, Remove): at least 36 px with a pointer, 44 px on touch. */
 export const RowAction = forwardRef<HTMLButtonElement, ButtonProps & { onClick?: () => void; "aria-label"?: string }>(function RowAction(props, ref) {
-  return <Button ref={ref} size="sm" {...props} className={classes.action} />;
+  return <Button ref={ref} size="sm" {...props} className={classes.action} data-ds="row-action" />;
 });
 
 export interface TriggerBadgeProps extends Pick<BadgeProps, "size" | "color" | "variant" | "leftSection" | "children"> {

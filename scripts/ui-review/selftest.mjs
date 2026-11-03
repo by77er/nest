@@ -5,6 +5,7 @@
 //   node scripts/ui-review/selftest.mjs
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
+import { inkHeaderGap, inkPrs, inkTrace } from "./apps/projects.mjs";
 import { measure } from "./checks.mjs";
 import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
 import { proseProblems } from "./trace-prose.mjs";
@@ -223,6 +224,42 @@ for (const remount of [false, true]) {
     for (const pr of problems) assert.match(pr, kind[name], `${name}: only its own kind: ${JSON.stringify(problems)}`);
   }
   await p.close();
+}
+
+// The projects app's rhythm measures (apps/projects.mjs), on planted pages: what's painted, not the
+// grown hit boxes. Each clean page passes; each plant (the reviewer's cases) fails.
+{
+  const base = `body { margin: 0; font: 14px/20px sans-serif; } .mantine-Badge-root { display: inline-block; height: 18px; line-height: 18px; padding: 0 6px; }`;
+  const page2 = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  const at = async (html, css, fn) => {
+    await page2.setContent(`<!doctype html><style>${base}${css}</style>${html}`);
+    return page2.evaluate(fn);
+  };
+  // A task's PRs: three lines each (number and title; badges; who attached it), 24 px apart.
+  const pr = (n) => `<div data-pr="${n}" style="display: flex; flex-direction: column; gap: 4px"><div><a href="#" style="padding-block: 12px; margin-block: -12px; display: inline-block">#${n}</a> A title</div><div style="display: flex; gap: 4px"><span class="mantine-Badge-root">Open</span></div><div>Attached by you</div></div>`;
+  const prs = `<div class="list" style="display: flex; flex-direction: column; gap: 32px">${pr(1)}${pr(2)}</div>`;
+  assert.deepEqual(await at(prs, "", inkPrs), [], "the clean PRs pass");
+  for (const [plant, css] of [
+    ["a 44 px badge line", "[data-pr] > :nth-child(2) { min-height: 44px; align-items: center; }"],
+    ["PRs 4 px apart", ".list { gap: 4px !important; }"],
+    ["the meta line pushed 40 px down", "[data-pr] > :nth-child(3) { margin-top: 40px; }"],
+  ]) assert.notDeepEqual(await at(prs, css, inkPrs), [], `PRs: ${plant} must fail`);
+  // A transcript: tool calls, each in a wrapper of its own (a FadeIn), call then result.
+  const tool = (n) => `<div class="fade"><div data-kind="tool" style="display: flex; flex-direction: column; gap: 2px; margin-block: 12px"><button data-ds="term-line" data-slot="call" style="all: unset; display: block; padding-block: 12px; margin-block: -12px"><span data-slot="text">Bash(step ${n})</span></button><div data-ds="term-line" data-kind="tool_result">⎿ done ${n}</div></div></div>`;
+  const term = `<div data-ds="terminal">${tool(1)}${tool(2)}${tool(3)}</div>`;
+  assert.deepEqual(await at(term, "", inkTrace), [], "the clean transcript passes");
+  for (const [plant, css] of [
+    ["a top-aligned 44 px call row", "[data-slot=call] { min-height: 44px !important; padding: 0 !important; margin: 0 !important; display: flex !important; align-items: flex-start; }"],
+    ["a result pushed 30 px down", "[data-kind=tool_result] { margin-top: 30px; }"],
+  ]) assert.notDeepEqual(await at(term, css, inkTrace), [], `trace: ${plant} must fail`);
+  // The header: its meta line's text under the h1's, the same on touch as with a mouse.
+  const header = `<div data-ds="page-header"><h1 style="margin: 0; font-size: 24px; line-height: 32px">Gadgets</h1><div data-slot="meta"><a href="#">by77er/gadgets</a> · Auto-assign on</div></div>`;
+  const mouse = await at(header, "", inkHeaderGap);
+  const grown = await at(header, "[data-slot=meta] a { padding-block: 12px; display: inline-block; }", inkHeaderGap);
+  const kept = await at(header, "[data-slot=meta] a { padding-block: 12px; margin-block: -12px; display: inline-block; }", inkHeaderGap);
+  assert.ok(Math.abs(kept - mouse) <= 4, `a hit box grown without its line passes (${kept} vs ${mouse})`);
+  assert.ok(Math.abs(grown - mouse) > 4, `a header link that grows its line must fail (${grown} vs ${mouse})`);
+  await page2.close();
 }
 
 await browser.close();
