@@ -49,7 +49,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - reading a cut cold;
   - a guest's write stalls during the pause.
 
-  If a month-old 32 GiB disk's p99 clone exceeds 200 ms, M3′ comes first: an incremental shadow that clones only the ranges FIEMAP shows changed (`FICLONERANGE`). A clone's cost grows with the number of extent records: 50–100 M of them locked a file for over 30 minutes (xfs 14a53798).
+  If a month-old 32 GiB disk's p99 clone exceeds 200 ms, [M3′](#m3-the-pause-follows-what-a-turn-changed-designed-not-built-the-owner-to-choose) comes first: the pause follows what changed (options below). A clone's cost grows with the number of extent records: 50–100 M of them locked a file for over 30 minutes (xfs 14a53798).
 - **Measured (2026-11-03, one `c8id.large` in us-east-1c, kernel 6.18.56, XFS `reflink=1` on the 118 GB instance store):** the gate fails. The owner shipped M2 anyway, with M3′ next (above).
 
   | 32 GiB disk | Extent records | `FICLONE`, 5 runs |
@@ -65,6 +65,52 @@ M1 removes the wait for the store and the control plane from the pause, and the 
 - **Checked:** `verification/nestd/check` `sentinel` drives reads and cuts together (a cut recorded behind a newer one included), and fails for a cut recorded under the newest pass instead of its own. Tests:
   - host tests use a test cut (`disk_cut: locked_copy`): a copy under an exclusive `flock`, since the test filesystems have no reflink;
   - the e2e harness cuts that way during sustained writes, restores the generation from the store, and finds an exact prefix of the writes.
+
+## M3′: the pause follows what a turn changed (designed, not built; the owner to choose)
+
+**The problem M2's measurement found:** `FICLONE` costs about 10–15 µs per extent record of the whole file: 2.4 s at 158 k records, 8.1 s at 819 k ([measured](#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)). A turn changes tens of MB, but a used disk carries every record its past writes split it into. M3′ makes the in-pause work follow what changed since the last cut.
+
+**What the `Sync` io_engine allows** (the constraints on every option below):
+- **Only a paused VM is safe to cut.** With `Sync`, a guest write runs on the VMM thread and completes before the guest sees it complete. While the VM is paused, nothing lands; while it runs, a write can land at any moment, and one that hits a file locked by a clone blocks the thread, and the vsock and the network with it ([design.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md)).
+- **A clone of a range is atomic against concurrent writes** ([ioctl_ficlonerange(2)](https://man7.org/linux/man-pages/man2/ioctl_ficlonerange.2.html)). So small range clones may run while the VM runs, each blocking a write that arrives meanwhile only for its own length.
+- **The drive is a raw file,** with no backing chain. `PATCH /drives` changes the path only with a cooperative guest that doesn't touch the device meanwhile, and it isn't atomic ([patch-block.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/patch-block.md)), so a cut can't swap the VM onto a new file. Firecracker has no block dirty tracking (rejected below). Whether `path_on_host` may be a host block device isn't stated there (unverified).
+- **Buffered writes:** `Sync` writes go through the host page cache, so a range written but not yet written back is delayed allocation. Its FIEMAP mapping isn't final until a sync (`FIEMAP_FLAG_SYNC`, [fiemap](https://docs.kernel.org/filesystems/fiemap.html)), and M2 already `fdatasync`s before the pause.
+
+**Options:**
+1. **Two persistent shadows, by FIEMAP diff (recommended to measure first).**
+   - `shadow-a.img` and `shadow-b.img` are reflink copies of the disk, made once when a fresh disk has few records. Cuts alternate between them, so the one a background commit reads is never written.
+   - **While the VM runs,** nestd syncs the disk and FIEMAPs it and the shadow. Every range whose physical mapping differs is cloned into the shadow (`FICLONERANGE`, range by range). Two frozen files that map an offset to the same block hold the same bytes there, which is M3's rule.
+   - **In the pause:** sync the residue, FIEMAP again, clone the ranges that changed since the pre-copy, resume. The shadow then equals the disk at the pause, and is the cut.
+   - **The commit** reads only the chunks the diff showed changed (M3's diff, done here), and takes every other entry from the previous manifest.
+   - **The pause scales with** one full FIEMAP walk (O(records), but reading the extent map writes no metadata, so its constant should be far below the clone's: unverified), plus the clones of what changed since the pre-copy. A turn's last seconds of writes are usually a few ranges.
+   - **Cost:** the shadows hold at most the blocks of the last two cuts' changes. No new kernel feature, device or dependency.
+   - **Risk:** if a FIEMAP walk at 819 k records is itself above the gate, this only lowers the constant.
+2. **A host dm-era layer tracking writes.**
+   - The drive is `/dev/mapper/era-<sbx>`, over a loop device on `disk.img`. dm-era records which blocks were written in each era ([dm-era](https://docs.kernel.org/admin-guide/device-mapper/era.html): `checkpoint` starts a new era, and `take_metadata_snap` lets userspace read each block's era).
+   - **In the pause:** `checkpoint`, read the blocks written since the shadow's era, clone those ranges into the shadow, resume. Nothing walks the whole file, so **the pause scales with the blocks written** since that shadow's last cut, at dm-era's block size.
+   - **Cost:**
+     - a loop device, a dm target and a metadata device per sandbox;
+     - block device nodes in the jail (Firecracker and jailer support unverified);
+     - reading dm-era's metadata (thin-provisioning-tools, or a parser of our own);
+     - a device layer on every write, whose overhead is unmeasured.
+
+   The doc rejects "dm-era alone (no cut)": here it is only the tracker, and the reflink is still the cut.
+3. **Fewer extent records** (bounds M2's pause; doesn't make it follow the turn). Combinable with 1.
+   - A larger CoW extent size hint on `disk.img` (`xfs_io -c cowextsize`, [xfs_io(8)](https://man7.org/linux/man-pages/man8/xfs_io.8.html)), so the copies a cut forces are allocated in larger runs. Its effect on records after scattered writes is unmeasured.
+   - **Background defragmentation** with `XFS_IOC_EXCHANGE_RANGE` ([ioctl_xfs_exchange_range(2)](https://man7.org/linux/man-pages/man2/ioctl_xfs_exchange_range.2.html): atomic, even across a crash). A fragmented range is rewritten contiguously into a scratch file, then swapped in while the VM runs, a range at a time. It needs the filesystem's exchange feature: the measured host's `xfs_info` showed `exchange=0`, so bootstrap's `mkfs.xfs` would add `-i exchange=1` (unverified on AL2023's xfsprogs). It also unshares those blocks from the cuts' shadows.
+   - **Already true:** a restore or a move writes a fresh disk with few records, so fragmentation resets when a sandbox moves.
+4. **Not recommended:**
+   - **The guest reporting its dirty ranges** (a dm-era in the guest, or the guest agent): it trusts the guest for its own checkpoint's content, needs a guest image change, and a guest root can bypass its own layer.
+   - **Cut-while-running on `Async`:** deferred until it is GA (M2's decision).
+
+**How to measure, with the same harness and its cleanup layers:** one `c8id.large`, about 40 minutes, about $0.08 on demand. It adds these phases to `dev/measure-cut/on-host.sh`, on the same fresh, churned and month-aged disks:
+- FIEMAP (with `FIEMAP_FLAG_SYNC`) time against the record count;
+- option 1 end to end: the pre-copy's time and range count, then the in-pause FIEMAP plus residue clone, after 2,000 scattered 4 KiB writes and after 1 GiB;
+- option 3's hint at 1 and 4 MiB: records after the same churn, and M2's clone time;
+- `mkfs.xfs -i exchange=1` accepted, and one range exchanged while a writer runs;
+- the guest write-stall phase, now that it records whether the VM is up.
+
+Option 2 gets its own run only if option 1's FIEMAP walk misses the gate: dm-era's write overhead (4 KiB `O_DSYNC` latency, with and without it) and its era read time. **The gate stays M2's:** p99 pause under 200 ms on the month-aged disk.
 
 ## M3: read only what changed (designed, not built)
 
