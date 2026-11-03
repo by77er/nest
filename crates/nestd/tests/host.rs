@@ -312,6 +312,8 @@ struct FleetLog {
     acks: Vec<u64>,
     claims: Vec<Vec<LeaseClaim>>,
     ca_renews: Vec<String>,
+    /// Command batches resent after a hello (their seq): the host hadn't reported them done.
+    redelivered: Vec<u64>,
 }
 
 struct MockFleet {
@@ -334,7 +336,14 @@ struct MockFleet {
     reject_next: Arc<Mutex<Option<String>>>,
 }
 
-const LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, cp_expiry_ms: 800 };
+/// The lease every test's mock FleetDO grants unless the test is about a lapse: one no load lapses
+/// within a test. On a loaded runner (CI's 2 vCPUs running every test at once) heartbeat answers do
+/// stall past 500 ms, and the self-fence that follows fences, retires and deletes what a test is
+/// still using (seen as `stale_epoch`, a refused create or resume, or a missing `disk.img`).
+const STEADY_LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 60_000, cp_expiry_ms: 90_000 };
+/// For the tests about a lapse: it lapses 500 ms after the last acknowledged heartbeat, so a
+/// partition fences quickly.
+const LAPSING_LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, cp_expiry_ms: 800 };
 
 /// Mock FleetDO. Accepts reconnects. While `partition` is set it answers nothing on the open
 /// connection and refuses new ones (a network partition); clearing it lets the host reconnect.
@@ -342,6 +351,16 @@ const LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, c
 /// resends those past the hello's `last_command_seq`: a batch sent on a connection the host was
 /// already dropping (after a retryable error) is not lost.
 async fn mock_fleet() -> MockFleet {
+    mock_fleet_with(STEADY_LEASE).await
+}
+
+/// [`mock_fleet`] for a test about a lease lapse ([`LAPSING_LEASE`]).
+async fn mock_fleet_lapsing() -> MockFleet {
+    mock_fleet_with(LAPSING_LEASE).await
+}
+
+/// [`mock_fleet`], granting `lease` in every hello_ack.
+async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/v1/fleet", l.local_addr().unwrap());
     let log = Arc::new(Mutex::new(FleetLog::default()));
@@ -401,9 +420,10 @@ async fn mock_fleet() -> MockFleet {
                                     unacked.retain(|s, _| *s > done.0);
                                 }
                                 log2.lock().unwrap().hellos.push(*h);
-                                let ack = HelloAck { protocol_version: 1, server_ms: 0, last_event_seq: last_event_seq.map(Seq), lease: LEASE, host_token_expires_ms: 0, next_command_seq: None };
+                                let ack = HelloAck { protocol_version: 1, server_ms: 0, last_event_seq: last_event_seq.map(Seq), lease, host_token_expires_ms: 0, next_command_seq: None };
                                 if ws.send(send(FleetToHost::HelloAck(ack))).await.is_err() { break; }
                                 for (s, cmds) in &unacked {
+                                    log2.lock().unwrap().redelivered.push(*s);
                                     let _ = ws.send(send(FleetToHost::Commands { seq: Seq(*s), commands: cmds.clone() })).await;
                                 }
                             }
@@ -412,15 +432,25 @@ async fn mock_fleet() -> MockFleet {
                                 let _ = ws.send(send(FleetToHost::HeartbeatAck { sent_ms, server_ms: 0, revoked: vec![] })).await;
                             }
                             HostToFleet::Events { seq: es, events } => {
+                                // As FleetDO (`onEvents`): a failed batch, or one past a gap, is answered
+                                // with an error and the connection closed, so the host reconnects and
+                                // resends from `last_event_seq`. Read on, a batch the host had already
+                                // sent behind the failed one was taken as the next and acked the failed
+                                // one's events away (lost under load, when it came before the error).
                                 if fail.swap(false, Ordering::SeqCst) {
                                     log2.lock().unwrap().failed.push(events);
                                     let err = ErrorBody { code: "internal".into(), message: "handler failed".into(), retryable: true };
                                     let _ = ws.send(send(FleetToHost::Error { error: err })).await;
-                                    continue;
+                                    break;
                                 }
                                 if last_event_seq.is_some_and(|l| es.0 <= l) {
                                     let _ = ws.send(send(FleetToHost::Ack { up_to: es })).await;
                                     continue;
+                                }
+                                if last_event_seq.is_some_and(|l| es.0 > l + 1) {
+                                    let err = ErrorBody { code: "invalid_message".into(), message: format!("event batch {} out of order", es.0), retryable: true };
+                                    let _ = ws.send(send(FleetToHost::Error { error: err })).await;
+                                    break;
                                 }
                                 last_event_seq = Some(es.0);
                                 // Answer commit requests (CAS): committed, orphaned for salvage, or
@@ -644,7 +674,7 @@ async fn wait_until(what: &str, f: impl Fn() -> bool) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn host_lifecycle_commit_and_self_fence() {
     let dir = tempfile::tempdir().unwrap();
-    let fleet = mock_fleet().await;
+    let fleet = mock_fleet_lapsing().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
         "role": "sandbox",
         "cell": "test-cell",
@@ -1001,8 +1031,17 @@ async fn start_host_with(proxy_ca: Option<(CaCertificate, nest_protocol::host::S
 }
 
 async fn start_host_opts(proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>, commit_timeout_ms: u64) -> Started {
+    start_host_leased(proxy_ca, commit_timeout_ms, STEADY_LEASE).await
+}
+
+/// [`start_host`] for a test about a lease lapse ([`LAPSING_LEASE`]).
+async fn start_host_lapsing() -> Started {
+    start_host_leased(None, 5000, LAPSING_LEASE).await
+}
+
+async fn start_host_leased(proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>, commit_timeout_ms: u64, lease: LeaseTiming) -> Started {
     let dir = tempfile::tempdir().unwrap();
-    let fleet = mock_fleet().await;
+    let fleet = mock_fleet_with(lease).await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
         "role": "sandbox", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
@@ -1124,9 +1163,12 @@ async fn tunnel_child_runs_with_the_host_and_is_terminated_at_shutdown() {
     let host = Host::start(cfg, tunnel_enrolled(&fleet.url), Some(Arc::new(FakeDriver::default()))).await.unwrap();
     let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
-    wait_until("cloudflared spawned", || log.exists()).await;
+    // The fake writes its pid, then its metrics address: wait for both lines, not for the file.
+    let wrote = |what: &str| std::fs::read_to_string(&log).is_ok_and(|l| l.contains(what));
+    wait_until("cloudflared spawned", || wrote("pid=")).await;
     let pid: i32 = std::fs::read_to_string(&log).unwrap().lines().next().unwrap().strip_prefix("pid=").unwrap().parse().unwrap();
     assert!(alive(pid));
+    wait_until("cloudflared parsed its arguments", || wrote(&format!("metrics={metrics}\n"))).await;
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
     let hello = fleet.log.lock().unwrap().hellos[0].clone();
     assert_eq!(hello.gateway_url.as_deref(), Some("ws://127.0.0.1:18790"), "the hello keeps nestd's configured URL");
@@ -1300,7 +1342,7 @@ async fn failed_create_retried_at_the_same_epoch_reaches_the_gateway() {
 /// it to the proxy, and heartbeats must stop claiming it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fence_during_create_is_terminal() {
-    let h = start_host().await;
+    let h = start_host_lapsing().await;
     h.fleet.commands.send(vec![create("cmd_create", "sbx_slow")]).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
     h.fleet.partition.store(true, Ordering::SeqCst); // lease lapses ~500 ms later, mid-boot
@@ -1386,6 +1428,13 @@ async fn retryable_fleet_error_resends_the_failed_batch() {
     // The batch carrying cmd_a's events failed once; it still arrives, exactly once.
     assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
     wait_until("reconnect", || h.fleet.log.lock().unwrap().hellos.len() >= 2).await;
+    // Every event of the failed batch arrives again (on a loaded machine, later than any fixed
+    // delay); then a while for a duplicate to show, if the host were to send one.
+    wait_until("the failed batch resent", || {
+        let log = h.fleet.log.lock().unwrap();
+        log.failed.iter().flatten().all(|e| log.events.contains(e))
+    })
+    .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let log = h.fleet.log.lock().unwrap();
     let [failed] = log.failed.as_slice() else { panic!("one failed batch: {:#?}", log.failed) };
@@ -1395,8 +1444,12 @@ async fn retryable_fleet_error_resends_the_failed_batch() {
         let (sent, logged) = (failed.iter().filter(|f| *f == e).count(), log.events.iter().filter(|f| *f == e).count());
         assert_eq!(logged, sent, "resent exactly once: {e:#?}");
     }
-    let n = log.events.iter().filter(|e| matches!(&e.body, HostEventBody::CommandResult { cmd, .. } if cmd.0 == "cmd_a")).count();
-    assert_eq!(n, 1);
+    // One result, and at most one more per redelivery of cmd_a's batch: a reconnect before the host
+    // reported it done (on a loaded machine) resends it, and a host that had already finished it
+    // answers it again from its result cache (one still running it doesn't forward it twice).
+    let results: Vec<&CommandOutcome> = log.events.iter().filter_map(|e| match &e.body { HostEventBody::CommandResult { cmd, outcome } if cmd.0 == "cmd_a" => Some(outcome), _ => None }).collect();
+    assert!((1..=1 + log.redelivered.len()).contains(&results.len()), "{} results, redelivered: {:?}", results.len(), log.redelivered);
+    assert!(results.windows(2).all(|w| w[0] == w[1]), "a redelivered command is answered with its first outcome: {results:?}");
 }
 
 /// Review #10: the proxy intermediate CA is renewed (new key + CSR) before it expires, and the
@@ -1724,6 +1777,8 @@ async fn a_rejected_commit_never_resumes_its_vm() {
     assert!(!is_ok(&h.fleet.result("cmd_1").await));
     assert!(!h.vm.resume_latch.reached.load(Ordering::SeqCst), "a rejected suspend resumed its VM");
     h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { sandbox, state: SandboxState::Fenced, .. } if sandbox.0 == "sbx_1")).await;
+    // Its salvage is a new request too: once it is done, the next rejection can only be sbx_2's.
+    h.fleet.wait_event("sbx_1 retired", |b| matches!(b, HostEventBody::IncarnationRetired { sandbox, .. } if sandbox.0 == "sbx_1")).await;
     h.vm.resume_latch.held.store(false, Ordering::SeqCst);
 
     h.fleet.commands.send(vec![create("cmd_create_sbx_2", "sbx_2")]).unwrap();
@@ -2044,6 +2099,22 @@ fn sandbox_meta(dir: &Path, sandbox: &str, epoch: u64) -> nestd::recovery::Sandb
     nestd::recovery::read_meta(&dir.join("state/sandboxes").join(sandbox).join(epoch.to_string())).expect("meta.json")
 }
 
+/// No sandbox was fenced so far: a test that expects none says so before it relies on it.
+fn assert_no_fence(fleet: &MockFleet) {
+    let fenced: Vec<String> = fleet
+        .log
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter_map(|e| match &e.body {
+            HostEventBody::SandboxState { sandbox, state: SandboxState::Fenced, detail, .. } => Some(format!("{} ({})", sandbox.0, detail.clone().unwrap_or_default())),
+            _ => None,
+        })
+        .collect();
+    assert!(fenced.is_empty(), "fenced unexpectedly (a lapsed lease?): {fenced:?}");
+}
+
 fn append_to_disk(dir: &Path, sandbox: &str, epoch: u64, what: &[u8]) {
     let path = dir.join("state/sandboxes").join(sandbox).join(epoch.to_string()).join("disk.img");
     let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
@@ -2151,6 +2222,8 @@ fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
             assert_eq!(sandbox_meta(dir.path(), sbx, 1).head.map(|h| h.id), Some(g.clone()), "meta.json follows the head");
             heads.insert(sbx.to_string(), g);
         }
+        // Nothing here may have been fenced (a lapse would retire, and delete, what is used below).
+        assert_no_fence(f);
         append_to_disk(dir.path(), "sbx_dirty", 1, b"uncommitted work");
         // A create that dies before its VM starts: the disk is still the untouched base.
         f.commands.send(vec![create("cmd_c_hang", "sbx_hang")]).unwrap();
@@ -2577,7 +2650,7 @@ async fn a_kill_overtaking_a_queued_start_means_it_never_runs() {
 /// (`fenced`, at its epoch) is reported and it never reaches the runner.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_start_held_across_a_lease_lapse_never_runs() {
-    let h = start_host().await;
+    let h = start_host_lapsing().await;
     h.fleet.commands.send(vec![create("cmd_a", "sbx_a")]).unwrap();
     assert!(matches!(h.fleet.result("cmd_a").await, CommandOutcome::Ok { .. }));
     h.fleet.commands.send(vec![create("cmd_slow", "sbx_slow2"), cmd("cmd_agent", CommandBody::AgentStart(bound_start("agt_l", "sbx_a")))]).unwrap();
@@ -2599,7 +2672,7 @@ async fn a_start_held_across_a_lease_lapse_never_runs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_brain_host_runs_brains_and_refuses_sandboxes() {
     let dir = tempfile::tempdir().unwrap();
-    let fleet = mock_fleet().await;
+    let fleet = mock_fleet_lapsing().await;
     let cfg: Config = serde_json::from_value(serde_json::json!({
         "role": "brain", "cell": "test-cell",
         "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
@@ -2697,6 +2770,8 @@ async fn a_commits_pause_is_marked_at_the_gateway_until_the_vm_runs_or_leaves() 
     // A suspend that lands: marked until the sandbox leaves the gateway.
     h.fleet.commands.send(vec![suspend_cmd("cmd_suspend_2", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
     assert!(is_ok(&h.fleet.result("cmd_suspend_2").await));
+    // The gateway hears the removal over its own link, after the command's result.
+    wait_until("the sandbox removed at the gateway", || matches!(last_gateway_word(&h.gateway, "sbx_1"), Some(GatewayCommand::SandboxRemove { .. }))).await;
     let got = h.gateway.got.lock().unwrap().clone();
     let words: Vec<&GatewayCommand> = got
         .iter()
