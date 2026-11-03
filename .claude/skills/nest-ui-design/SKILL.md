@@ -81,9 +81,10 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 
 | Primitive | What it fixes |
 |---|---|
-| `AppFrame` | The header (product name left, nav right) and the content area |
+| `AppFrame` | The sidebar (the product name small at its top, the places, a footer apart by a hairline; a burger-toggled drawer on a phone) and the content area |
+| `NavRow` / `NavGroup` | One row style for every place (icon column, height, padding, left edge; the quiet active state), rows `xs` apart, groups `xl` apart ([Navigation](#navigation)) |
 | `Page` | Max content width 1440 px, centred. Gutters: `2xl` on desktop, `xl` on tablet, `lg` on phone. Vertical rhythm `2xl` between page-level blocks |
-| `PageHeader` | Breadcrumb, then the h1 and a meta line. Actions go right-aligned on the title's baseline and wrap below it on narrow screens |
+| `PageHeader` | The h1 (the thing the page is about) and a meta line; no breadcrumb. Actions go right-aligned on the title's baseline and wrap below it on narrow screens |
 | `Section` | A heading row (h3, optional count, actions right) over content, `lg` below the heading. Sections are `2xl` apart |
 | `Panel` | The bordered surface (`md` radius, `lg` padding; `md` when dense). Cards, side panels, banners and table frames are all Panels |
 | `Toolbar` | Filters and actions in one row: `sm` gaps, wrapping |
@@ -108,6 +109,16 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
   - side panels take at most a third of the width;
   - dense data (tables) gets dense spacing (`xs`/`sm` rows), but its frame keeps the page's outer space.
 - **Balance:** the visual weight is spread so no edge is crowded and none is empty. When a layout looks heavy on one side, fix the grid, not individual margins.
+
+## Navigation
+
+- **One location system.** Where you are is said once: the sidebar's active row (and the switcher for the parent). No breadcrumb repeating it, and no h1 naming the view: the h1 is the thing (a project's name, or the page's own name off any thing: "Projects", "Admin"). A view needing a heading gets a quiet h3 section title ("Tasks").
+- **A switcher for the parent, flat rows for its views,** one level each. The switcher (the current parent's name, a button) opens a searchable, keyboard-first list: an "all" entry first, then every parent with its badge. Picking one keeps the view you're on when it has it. Below it, the current parent's views as flat rows; outside a parent, the switcher and the list's link only. Never a tree that repeats the same views under every parent.
+- **One left edge, one row style.** Every row (views, "all", Admin) has the same icon column, height, padding and left edge, drawn by one `NavRow` primitive. The product's name sits at the top on that edge, small and caption-weight, not a second heading.
+- **A quiet active state, no role color.** The active row is the `subtle` ground, full-weight text and a 2 px left rule in the `text` color. Hover is `subtle` at lower emphasis; focus is the focus ring. Role colors stay for actions and status, so the nav never outshouts the page's focal element.
+- **Badges on the thing that needs attention:** the parent's count on the switcher, and on the one view where it's handled (a project's Board). Nowhere else, and never beside a chevron.
+- **Proximity:** rows `xs` apart, groups `xl` apart; the footer (Admin) set apart by space and a hairline.
+- **Phone:** a burger opens the same sidebar as a drawer, the switcher first; picking a place closes it.
 
 ## Placement
 
@@ -155,6 +166,7 @@ Subtle and functional. Motion explains a change; it never decorates.
   - a spacing prop outside the scale names.
   
   Only the theme and the primitives may define values.
+- **The navigation:** sidebar places render through `NavRow` (Mantine's `NavLink` and `Breadcrumbs` refused in feature code), and the nav primitives' styles name no role color except the focus ring.
 - **The theme tests:**
   - check every token against the tables here;
   - check AA contrast in light and dark;

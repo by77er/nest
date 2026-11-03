@@ -9,7 +9,7 @@ import { renderApp } from "../../test/render";
 /** The Settings page (it was a modal): its form, as `dialog` for the tests below. */
 async function openSettings(api: FakeApi) {
   const r = renderApp("/projects/prj_one/settings", api);
-  await screen.findByRole("heading", { level: 1, name: "Settings" });
+  await screen.findByRole("heading", { level: 3, name: "Settings" });
   return { ...r, dialog: await screen.findByRole("main") };
 }
 

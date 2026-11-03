@@ -55,9 +55,9 @@ export function ReviewsPage() {
   // The job whose reviewer's trace is open (one at a time: each open trace is a WebSocket).
   const [traced, setTraced] = useState<string | null>(null);
   return (
-    <ProjectFrame projectId={projectId} title="Reviews">
+    <ProjectFrame projectId={projectId}>
       {(p) => (
-        <Section title="Review jobs" count={reviews.data?.length}>
+        <Section title="Reviews" count={reviews.data?.length}>
           {reviews.isPending ? (
             <LoadingState label="Loading the reviews" />
           ) : reviews.isError ? (

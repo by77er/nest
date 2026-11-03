@@ -1,7 +1,9 @@
-// A project page's frame: the page, its header (the breadcrumb to the project, the page's h1, the repo
-// on the caption line), and the project's loading and error states, the same on every project page.
+// A project page's frame: the page, its header (the project's name is the one h1, with the repo,
+// auto-assign and the worker cap on its caption line), and the project's loading and error states, the
+// same on every view. The view itself is named by the sidebar's active row, not a second h1; the switcher
+// says which project, so there is no breadcrumb.
 
-import { Anchor, Text } from "@mantine/core";
+import { Anchor } from "@mantine/core";
 import { IconBrandGithub } from "@tabler/icons-react";
 import type { ReactNode } from "react";
 import { useProject } from "../../api/queries";
@@ -11,17 +13,13 @@ import { ErrorState, LoadingState, MetaItem, MetaRow, Page, PageHeader } from ".
 
 export interface ProjectFrameProps {
   projectId: string;
-  /** The page's name, its h1 ("Board", "Manager"). */
-  title: string;
-  /** More of the caption line, after the repo. */
-  meta?: (p: Project) => ReactNode;
   actions?: (p: Project) => ReactNode;
   /** Keep the content to a measure: `reading` for a conversation, `form` for settings. */
   measure?: "reading" | "form";
   children: (p: Project) => ReactNode;
 }
 
-export function ProjectFrame({ projectId, title, meta, actions, measure, children }: ProjectFrameProps) {
+export function ProjectFrame({ projectId, actions, measure, children }: ProjectFrameProps) {
   const project = useProject(projectId);
   if (project.isPending) {
     return (
@@ -42,15 +40,7 @@ export function ProjectFrame({ projectId, title, meta, actions, measure, childre
   return (
     <Page measure={measure}>
       <PageHeader
-        breadcrumbs={[
-          <AnchorLink key="projects" to="/projects" c="dimmed">
-            Projects
-          </AnchorLink>,
-          <Text key="this" fz="sm">
-            {p.name}
-          </Text>,
-        ]}
-        title={title}
+        title={p.name}
         meta={
           <MetaRow>
             <MetaItem icon={IconBrandGithub}>
@@ -58,7 +48,10 @@ export function ProjectFrame({ projectId, title, meta, actions, measure, childre
                 {p.repo}
               </Anchor>
             </MetaItem>
-            {meta?.(p)}
+            <MetaItem>Auto-assign {p.settings.auto_assign ? "on" : "off"}</MetaItem>
+            <MetaItem>
+              Up to {p.settings.max_workers} {p.settings.max_workers === 1 ? "worker" : "workers"}
+            </MetaItem>
           </MetaRow>
         }
         actions={actions?.(p)}

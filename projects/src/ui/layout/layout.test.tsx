@@ -7,7 +7,7 @@ import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { cssVariablesResolver, motion, theme } from "../theme";
-import { AppFrame, ErrorState, FieldGroup, LoadingState, Page, PageHeader, Panel, PinnedFooter, Section, Toolbar } from ".";
+import { AppFrame, ErrorState, FieldGroup, LoadingState, NavGroup, NavGroups, NavRow, Page, PageHeader, Panel, PinnedFooter, Section, Toolbar } from ".";
 
 const wrap = (ui: ReactNode) => render(<MantineProvider theme={theme} cssVariablesResolver={cssVariablesResolver} env="test">{ui}</MantineProvider>);
 /** Whether `a` comes before `b` in the document. */
@@ -15,11 +15,11 @@ const before = (a: Element, b: Element) => (a.compareDocumentPosition(b) & Node.
 const style = (el: Element) => el.getAttribute("style") ?? "";
 
 describe("PageHeader", () => {
-  it("puts the breadcrumbs, then the one h1 with its actions on its row, then the meta line", () => {
-    wrap(<PageHeader breadcrumbs={[<a key="a" href="/">Projects</a>]} title="Widgets" meta={<span>owner/widgets</span>} actions={<button>Settings</button>} />);
+  it("puts the one h1 with its actions on its row, then the meta line, and no breadcrumb", () => {
+    wrap(<PageHeader title="Widgets" meta={<span>owner/widgets</span>} actions={<button>Settings</button>} />);
     const h1 = screen.getByRole("heading", { level: 1, name: "Widgets" });
     const actions = screen.getByRole("button", { name: "Settings" }).closest("[data-slot=actions]")!;
-    expect(before(screen.getByRole("link", { name: "Projects" }), h1)).toBe(true);
+    expect(document.querySelector(".mantine-Breadcrumbs-root")).toBeNull();
     expect(before(h1, actions)).toBe(true);
     // The actions share the title's row, wrap under it when narrow, and stay at the right edge.
     expect(actions.parentElement).toBe(h1.parentElement);
@@ -172,5 +172,34 @@ describe("Page and PinnedFooter", () => {
     expect(style(footer.parentElement!)).toContain("var(--nest-reading-measure)");
     // Centred in the content area, and the header inside the same column.
     expect(style(footer.parentElement!)).toMatch(/margin-inline:\s*auto|margin-left:\s*auto/);
+  });
+});
+
+describe("the navigation primitives", () => {
+  it("draw every row the same way: an icon column, then the label, then its end", () => {
+    const Icon = () => <svg data-testid="icon" />;
+    wrap(
+      <NavGroups>
+        <NavGroup label="Views">
+          <NavRow href="/a" icon={Icon} label="Board" end={<span>3</span>} />
+          <NavRow href="/b" icon={Icon} label="Manager" aria-current="page" />
+        </NavGroup>
+        <NavGroup label="More">
+          <NavRow href="/c" icon={Icon} label="Admin" />
+        </NavGroup>
+      </NavGroups>,
+    );
+    const rows = document.querySelectorAll("[data-ds=nav-row]");
+    expect(rows).toHaveLength(3);
+    for (const r of rows) {
+      // The same structure: the icon's column first, the label second.
+      expect(r.children[0]!.querySelector("[data-testid=icon]")).not.toBeNull();
+      expect(r.className).toBe(rows[0]!.className);
+    }
+    expect(screen.getByRole("link", { name: /Manager/ })).toHaveAttribute("aria-current", "page");
+    // Rows are `xs` apart within a group; groups `xl` apart.
+    const group = screen.getByRole("group", { name: "Views" });
+    expect(style(group)).toContain("var(--mantine-spacing-xs)");
+    expect(style(group.parentElement!)).toContain("var(--mantine-spacing-xl)");
   });
 });

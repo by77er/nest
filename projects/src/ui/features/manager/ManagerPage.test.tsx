@@ -1,4 +1,4 @@
-// The Manager page: its status in the header, as nest's record says (src/manager.ts), with a retry when
+// The Manager page: its status beside its heading, as nest's record says (src/manager.ts), with a retry when
 // the repo couldn't be attached; and the Trace tab beside Chat, kept in the URL for the trace viewer.
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
@@ -11,7 +11,8 @@ describe("the Manager page", () => {
     const api = new FakeApi();
     api.manager = { phase: "running", agent: "agt_manager", state: "waiting_input", host: "bh_7", error: null };
     renderApp("/projects/prj_one/manager", api);
-    expect(await screen.findByRole("heading", { level: 1, name: "Manager" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { level: 1, name: "Widgets" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 3, name: "Manager" })).toBeInTheDocument();
     const badge = await screen.findByText("Running");
     expect(badge.closest("[data-phase]")!.getAttribute("style")).toContain("--mantine-color-success-");
     expect(screen.getByText("waiting for input")).toBeInTheDocument();

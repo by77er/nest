@@ -2,7 +2,6 @@
 // waiting on ("Needs you") above it, and the drawer of the task named in the URL (`?task=`).
 
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { MetaItem } from "../../layout";
 import { NeedsYou } from "../attention/NeedsYou";
 import { Board } from "../board/Board";
 import { TaskDrawer } from "../task/TaskDrawer";
@@ -13,18 +12,7 @@ export function BoardPage() {
   const { task } = useSearch({ from: "/projects/$projectId/board" });
   const navigate = useNavigate({ from: "/projects/$projectId/board" });
   return (
-    <ProjectFrame
-      projectId={projectId}
-      title="Board"
-      meta={(p) => (
-        <>
-          <MetaItem>Auto-assign {p.settings.auto_assign ? "on" : "off"}</MetaItem>
-          <MetaItem>
-            Up to {p.settings.max_workers} {p.settings.max_workers === 1 ? "worker" : "workers"}
-          </MetaItem>
-        </>
-      )}
-    >
+    <ProjectFrame projectId={projectId}>
       {(p) => (
         <>
           <NeedsYou projectId={projectId} />

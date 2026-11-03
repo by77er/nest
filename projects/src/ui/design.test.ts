@@ -6,6 +6,7 @@
 // - spacing only by the scale's names, and sizes only by token names or variables;
 // - weights only by name;
 // - no layout containers of Mantine's own: those are the primitives' (Stack, Row, Panel, Page, …).
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { spacing } from "./theme";
 
@@ -14,11 +15,11 @@ const sources = import.meta.glob<string>("./**/*.{ts,tsx}", { query: "?raw", imp
 const exempt = (f: string) => f === "./theme.ts" || f.startsWith("./layout/") || f.startsWith("./test/") || /\.test\.tsx?$/.test(f);
 
 const SPACE = new Set(Object.keys(spacing));
-const SIZE_NAMES = new Set(["xs", "sm", "md", "lg", "xl", "compact-xs", "compact-sm", "compact-md", "auto"]);
+const SIZE_NAMES = new Set(["xs", "sm", "md", "lg", "xl", "compact-xs", "compact-sm", "compact-md", "auto", "target"]);
 const COLORS = /^(primary|danger|warning|success|gray|dimmed|bright)$/;
 const SPACING_PROPS = "m|mt|mb|ml|mr|mx|my|p|pt|pb|pl|pr|px|py|gap|rowGap|columnGap|spacing|verticalSpacing|separatorMargin";
 const SIZE_PROPS = "w|h|miw|maw|mih|mah|fz|lh|size|radius|top|left|right|bottom|bulletSize|lineWidth|iconSize|width|height|offset";
-const LAYOUT = ["Group", "Stack", "Flex", "Grid", "SimpleGrid", "Container", "Paper", "Card", "Box", "Center", "AppShell", "Space", "ScrollArea"];
+const LAYOUT = ["Group", "Stack", "Flex", "Grid", "SimpleGrid", "Container", "Paper", "Card", "Box", "Center", "AppShell", "Space", "ScrollArea", "NavLink", "Breadcrumbs"];
 
 /** Each JSX attribute value of `prop`: a string literal, or every string inside a `{…}` object literal. */
 function values(text: string, props: string): { prop: string; value: string; numeric: boolean }[] {
@@ -86,5 +87,28 @@ describe("the design rule", () => {
       `import { Badge, Button, Text } from "@mantine/core";`,
     ];
     for (const g of good) expect(offences("x.tsx", g), g).toEqual([]);
+  });
+});
+
+describe("the navigation rule", () => {
+  // Every sidebar place is a NavRow (Mantine's NavLink and Breadcrumbs are refused above), and the nav
+  // primitives' styles name no role color: the active row is quiet. Only the skill's focus ring is primary.
+  // Read from disk: vitest doesn't process CSS, so a `?raw` import of a module stylesheet isn't its text.
+  const navCss = readFileSync(`${process.cwd()}/src/ui/layout/Nav.module.css`, "utf8");
+  const roleColors = (css: string) => {
+    const withoutFocus = css.replace(/[^{}]*:focus-visible[^{]*\{[^}]*\}/g, "");
+    return [...withoutFocus.matchAll(/--mantine-(?:color-(?:primary|danger|warning|success)|primary-color)[\w-]*/g)].map((m) => m[0]);
+  };
+
+  it("the nav rows' styles use no role color, only the neutrals", () => {
+    const css = navCss;
+    expect(css).toContain("[aria-current=\"page\"]");
+    expect(roleColors(css)).toEqual([]);
+  });
+
+  it("the check sees a role color in an active row, and lets the focus ring be primary", () => {
+    expect(roleColors(`.row[aria-current="page"] { background: var(--mantine-color-primary-light); }`)).toHaveLength(1);
+    expect(roleColors(`.row:focus-visible { outline: 2px solid var(--mantine-primary-color-filled); }`)).toEqual([]);
+    expect(offences("x.tsx", `import { NavLink } from "@mantine/core";`)).toHaveLength(1);
   });
 });
