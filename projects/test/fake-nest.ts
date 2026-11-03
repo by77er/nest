@@ -74,6 +74,8 @@ export class FakeNest {
   readonly keys = new Map<string, { digest: string; status: number; body: string }>();
   /** Each agent's trace events, as nest's ring holds them (docs/control-plane/api/, "Live trace"). */
   readonly traces = new Map<string, Record<string, unknown>[]>();
+  /** Each agent's trace history pages, by the `before` that asks for them ("" for none). */
+  readonly histories = new Map<string, Map<string, { events: unknown[]; next_before: string | null }>>();
   /** What a trace upgrade answers instead of a socket, once each (a deploy's 503, say). */
   traceRefusals: { status: number; code: string; retryable: boolean }[] = [];
 
@@ -176,6 +178,10 @@ export class FakeNest {
       if (!a || a.client !== CLIENT) return nestErr(404, "unknown_agent", "unknown agent");
       const sub = m[2] ?? "";
       if (req.method === "GET" && sub === "") return json(200, this.view(a));
+      if (req.method === "GET" && sub === "/trace/history") {
+        const page = this.histories.get(a.agent)?.get(u.searchParams.get("before") ?? "");
+        return page ? json(200, page) : nestErr(400, "invalid_message", "before is not a cursor the trace gave");
+      }
       if (req.method === "GET" && sub === "/trace") {
         if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") return nestErr(426, "invalid_message", "expected a WebSocket upgrade");
         const refusal = this.traceRefusals.shift();
