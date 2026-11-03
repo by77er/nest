@@ -1,6 +1,6 @@
 # The single-record design (2026-10-25)
 
-The design of the one-brain rule that the [pilot model](../pilot/) checked and the [conformance check](../conformance/) compared against the code, with the amendments TLC counterexamples led to. It is a dated record: it was kept outside the repo, lost, and restored on 2026-10-30 from the session that wrote it. The behaviour as built is stated in [the AgentDO doc](../../../control-plane/durable-objects/agent/); where they differ, that doc and the code win. "Remove" lines name fields of the earlier `deferred/agent-epoch` design, since removed.
+The design of the one-brain rule that the [pilot model](../pilot/) checked and the [conformance check](../conformance/) compared against the code, with the amendments TLC counterexamples led to. A dated record: the behaviour as built is stated in [the AgentDO doc](../../../control-plane/durable-objects/agent/), and where they differ, that doc and the code win. "Remove" lines name fields of the earlier `deferred/agent-epoch` design that this one drops.
 
 Invariant S: at most one brain per agent can act (on AgentDO or through a hands binding).
 Liveness L: a queued turn eventually runs or fails; an agent never wedges; a healthy host is never wedged.

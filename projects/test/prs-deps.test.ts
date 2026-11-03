@@ -303,11 +303,13 @@ describe("the migration", () => {
     const id = env.PROJECT.idFromName(`prj_migrate${rand()}`);
     await runInDurableObject(env.PROJECT.get(id), (_o, st) => {
       const sql = st.storage.sql;
-      // The shape before this step: no relation tables, a task with its one PR.
-      // Back to before the step that made them, undoing it and every later step.
-      const step = MIGRATIONS.findIndex((m) => m.some((x) => x.includes("CREATE TABLE task_prs")));
-      for (const t of ["task_prs", "task_deps", "secrets", "secret_requests", "agent_secrets", "start_specs"]) sql.exec(`DROP TABLE IF EXISTS ${t}`);
-      if (step < MIGRATIONS.length - 1) sql.exec("ALTER TABLE settings DROP COLUMN workers_edit_workflows");
+      // The shape before this step: no relation tables, a task with its one PR; and none of the steps after it.
+      const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("CREATE TABLE task_prs")));
+      sql.exec("DROP TABLE task_prs");
+      sql.exec("DROP TABLE task_deps");
+      for (const t of ["waits", "layers", "frozen_egress", "secrets", "secret_requests", "agent_secrets", "start_specs"]) sql.exec(`DROP TABLE ${t}`);
+      for (const c of ["network", "network_rev", "workers_edit_workflows"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      expect(step).toBe(MIGRATIONS.length - 3);
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, pr_node, am_status, created_ms, updated_ms) VALUES ('tsk_old', 't', '', 'in_review', 1, 7, 'PR_x', '{"state":"enabled"}', 1, 2)`);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, created_ms, updated_ms) VALUES ('tsk_done', 't', '', 'done', 2, 8, 1, 2)`);

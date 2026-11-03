@@ -251,7 +251,7 @@ export const CommandBodyVariants = [
   z.object({ type: z.literal("commit_result"), request: RequestId, sandbox: SandboxId, outcome: CommitOutcome }),
   z.object({ type: z.literal("guest_cli_result"), request: RequestId, result: CliResult }),
   z.object({ type: z.literal("agent_start"), ...AgentStartFields }),
-  z.object({ type: z.literal("agent_attach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, cwd: z.string().optional() }),
+  z.object({ type: z.literal("agent_attach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, cwd: z.string().optional(), env: z.record(z.string(), z.string()).optional() }),
   z.object({ type: z.literal("agent_detach"), sandbox: SandboxId, epoch: Epoch, agent: AgentId, kill_processes: z.boolean().default(false) }),
   /**
    * `mode`: absent = graceful (all the previous release's nestd does); `kill` is applied on arrival.

@@ -20,7 +20,7 @@ cd /var/lib/nest/empty && exec claude -p --input-format stream-json --output-for
   (--session-id <uuid> | --resume <transcript path> [--fork-session])
 ```
 
-Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). The seeded worker's built-ins: `TaskCreate, TaskGet, TaskUpdate, TaskList, WebSearch, WebFetch`; the probes below also name `Agent` and `TodoWrite`. **Observed on 2.1.301** (`e2e/claude-verify`, with a real turn): `system/init.tools` lists `Task` (for `Agent`), the four task tools, `WebSearch` and `WebFetch`; `TodoWrite` is missing even when named, which is why the designed invocation leaves it out. A captain's `--tools ""` gives no built-ins. The runner logs `system/init.tools`.
+Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). The seeded worker's built-ins: `TaskCreate, TaskGet, TaskUpdate, TaskList, WebSearch, WebFetch`; the probes below also name `Agent` and `TodoWrite`. **Observed on 2.1.301** (`e2e/claude-verify`, with a real turn): `system/init.tools` lists `Task` (for `Agent`), the four task tools, `WebSearch` and `WebFetch`; `TodoWrite` is missing even when named, which is why the seeded worker leaves it out. A captain's `--tools ""` gives no built-ins. The runner logs `system/init.tools`.
 
 **Built-ins are an allowlist** (`nest_runner::agent::HOST_SAFE_BUILTINS`): `Agent`, `Task`, `TaskCreate`, `TaskGet`, `TaskUpdate`, `TaskList`, `TodoWrite`, `WebSearch`, `WebFetch`, `ListMcpResourcesTool`, `ReadMcpResourceTool`. A `launch.builtin_tools` naming anything else fails the start, and if `system/init.tools` reports anything else besides `mcp__*` tools the brain is killed (`--restricted` re-enables tools named individually in `--tools`), so a built-in Claude Code adds later is refused until reviewed.
 
@@ -37,7 +37,7 @@ Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). The seeded 
 **Observed on 2.1.300:**
 - The scrub keeps `NEST_*` for hooks and the MCP server; it strips the token and `CLAUDE_CONFIG_DIR` from hooks.
 - **The scrub needs bubblewrap on Linux:** with `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=1` and no `bwrap`, Claude Code won't start, not even `claude auth status`. Hosts install `bubblewrap`, or managed settings set `sandbox.bwrapPath`.
-- **The scrub forces `--permission-mode default`** (instead of `dontAsk`, with a warning on stderr). Whether nest's allow rules and hooks still behave the same is to be verified with a real token.
+- **The scrub forces `--permission-mode default`** (instead of `dontAsk`, with a warning on stderr); nest's allow rules and hooks still behave the same (checked on 2.1.301, [below](#stream-json-subset)).
 - **`system/init` arrives only after the first user message.** Before it, stdout carries only the `SessionStart` hook lines, so the runner never waits for `system/init` before writing the first turn.
 - **Transcript path:** every character that isn't an ASCII letter or digit becomes `-`, and a name over 200 characters is cut and suffixed with a hash (`claude::project_dir`).
 
@@ -81,7 +81,7 @@ Shapes checked against `@anthropic-ai/claude-agent-sdk` 0.3.296 type definitions
 
 **Also checked on 2.1.301** (`e2e/claude-verify`):
 - **Permissions:** under the `default` permission mode the env scrub forces, nest's allow rules and `PreToolUse` hooks let `mcp__nest__*` calls run without prompts.
-- **Resume:** with `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`, `--resume` after a SIGKILL mid tool call continues the turn without input.
+- **Resume:** with `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=1`, `--resume` after a SIGKILL mid tool call continues the turn without input. The runner never sets it: AgentDO's recovery turn is the one way a turn continues ([sessions](../../../agents/sessions/)).
 - **`defer`:** a `defer` answer ends the run with `stop_reason: "tool_deferred"`, and `--resume` fires `PreToolUse` again for the same `tool_use_id`.
 - **Compaction:** `SessionStart` fires with `source: "compact"` after `/compact`, which needs slash commands enabled.
 
@@ -89,9 +89,9 @@ Shapes checked against `@anthropic-ai/claude-agent-sdk` 0.3.296 type definitions
 
 `e2e/claude-verify` items 11 and 12, haiku, 2026-10-31, one user message per turn on stdin; evidence in [`e2e/claude-verify/observed/2.1.316-hooks.json`](../../../../e2e/claude-verify/observed/2.1.316-hooks.json).
 
-- **`PostToolUse` `additionalContext` reaches the model mid-turn** (sync hook, as managed settings wire it). The context after a call carried a random token and an order to pass it to `mcp__nest__echo`. After `mcp__nest__echo` and after the built-in `TaskList`, the main loop made that call with the token in the same turn (one `result` per turn). A control turn without context made one echo call and never produced its token. The context isn't on stdout: the transcript holds it as a `hook_additional_context` attachment.
-- **In a subagent,** `PostToolUse` fires for the subagent's own call (input has `agent_id` and `agent_type`) and its context goes to the subagent, not the main loop: the subagent's transcript holds the attachment, and the haiku subagent replied that the tool result "included an instruction to call the echo tool … so I ignored it" (twice in two runs). The main loop never saw it. The runner therefore hands out nothing to a `PostToolUse` whose input has `agent_id`.
-- **`Stop` `block`:** a `{"decision":"block","reason":…}` answer gives **no intermediate `result`**. The reason arrives as a `user` line (`Stop hook feedback:` plus the reason); the model acted on it (called echo with the token, then replied with the word it asked for); `Stop` fired again at the continuation's end with `stop_hook_active: true`, and the turn's one `result` came after that. The next turn had one `Stop` and one `result`.
+- **`PostToolUse` `additionalContext` reaches the model mid-turn** (sync hook, as managed settings wire it), after `mcp__nest__*` and built-in tools alike: the model acted on a token in it within the same turn (one `result` per turn); a control turn without context never produced the token. The context isn't on stdout: the transcript holds it as a `hook_additional_context` attachment.
+- **In a subagent,** `PostToolUse` fires for the subagent's own call (input has `agent_id` and `agent_type`) and its context goes to the subagent, not the main loop; the haiku subagent ignored it as an injected instruction (two runs of two). The runner therefore hands out nothing to a `PostToolUse` whose input has `agent_id`.
+- **`Stop` `block`:** a `{"decision":"block","reason":…}` answer gives **no intermediate `result`**. The reason arrives as a `user` line (`Stop hook feedback:` plus the reason) and the model acts on it; `Stop` fires again at the continuation's end with `stop_hook_active: true`, and the turn's one `result` comes after that.
 - **`system/init` comes once per turn,** before the turn's first assistant line (three turns, three `init` lines), not once per process. The runner treats a repeat as a no-op (the auth check reports once).
 
 ## Sources

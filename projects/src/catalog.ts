@@ -15,10 +15,17 @@ const CREDENTIAL = "claude_oauth_token";
 
 /** Claude Code's built-in tools for every role: its own task list and the web, as nest's worker gets. */
 const BUILTIN_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"];
+/**
+ * A worker may also run Claude Code's own subagents (`Agent`, through nest's `subagents` capability):
+ * they live in the worker's brain and reach the same sandbox through its hands, with the same grant and
+ * taint. No role gets nest-level spawning (`management`'s `spawn_agent`, `sandboxes`' `fork_sandbox`):
+ * the app starts every agent itself, one worker per task.
+ */
+const WORKER_EXTRA = { capabilities: ["subagents"], builtin_tools: ["Agent"] } as const;
 
 /** The manager's and the worker's rule for credentials (README.md#secrets). */
 const SECRETS_RULE =
-  "Credentials never enter your sandbox: nest's proxy injects them, and your brief lists the placeholders you have (a placeholder isn't a secret: it works only through the proxy, on its hosts). Never ask anyone for a secret's value, in chat or anywhere, and never write one into a file, a commit or a log. If you need a credential you don't have, call request_secret: kind injected for your own API calls, kind ci for a secret GitHub Actions needs, which the owner adds on GitHub.";
+  "Credentials never enter your sandbox: nest's proxy injects them, and the ones you have are environment variables holding placeholders, named in your brief (a placeholder isn't a secret: it works only through the proxy, on its hosts). Never ask anyone for a secret's value, in chat or anywhere, and never write one into a file, a commit or a log. If you need a credential you don't have, call request_secret: kind injected for your own API calls, kind ci for a secret GitHub Actions needs, which the owner adds on GitHub.";
 
 export const PROMPTS = {
   manager: [
@@ -31,12 +38,14 @@ export const PROMPTS = {
     "You are told when a worker blocks its task, and when the owner answers. Unblock a task with unblock_task once it's resolved another way.",
     SECRETS_RULE,
     "When one task needs another done first, say so with add_dependency: it won't be assigned until that one is done. A task may have several PRs: attach_pr and detach_pr; it's done once all its attached PRs have merged.",
+    "To wait for something, don't poll and don't keep a turn open: call await_task (a task reaching a state), await_pr (a PR merging, finishing its review, or closing) or await_reply (the owner answering), with a timeout, then end your turn. You are woken by whichever comes first: a message saying it happened, or that it timed out. Each answers at once if it holds already. To come back to something at a time of your own (\"check again in two hours\"), set a timer with timer_set and end your turn; it wakes you with its note.",
   ].join("\n"),
   worker: [
     "You are a worker on a task board. You have one task: read it with projects-task get_task.",
     "Clone the repo in your sandbox, work on the branch it names (task/<task-id>), commit, push that branch, and open exactly one PR from it to the default branch with `gh pr create`.",
     "Report as you go with report_progress, and once the PR is open call report_pr with its number.",
     "If you can't go on without the owner (a decision only they can make, or credentials or access you can't get), call report_blocked with the reason and your question; the answer arrives in your inbox. Never block for anything you could resolve yourself: read the code and docs, try it, or make the reasonable choice and say so in the PR. Clear it with clear_blocked if you resolve it another way.",
+    "You may split work across Claude Code subagents (the Agent tool): they share your sandbox and your task, nothing more. You can't start other nest agents or sandboxes.",
     "Meet the spec's acceptance criteria and run its test plan before you open the PR. Touch nothing outside your task.",
     SECRETS_RULE,
     "Your task may change while you work on it (its title, body or spec, or its block cleared): a message in your inbox says what changed. Then re-read it with get_task and adjust your work, and your PR if it's open, to the task as it is now.",
@@ -73,11 +82,12 @@ function mcpCapability(base: string, server: Server, prompt: string) {
  * (`repos`, the worker's) or only `read` (`read_repos`: the manager and the reviewer, which nest refuses
  * to push). Each spawn narrows it to its own project's (`overrides.repos` or `overrides.read_repos`).
  */
-const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read") => ({
+const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read", subagents = false, timers = false) => ({
   // `nest` allows the nest tools without a prompt and `hands` gives the sandbox's tools: the operator's
-  // capabilities, which a client's templates may name.
-  capabilities: ["nest", "hands", `${NAMESPACE}/${capability}`],
-  launch: { builtin_tools: BUILTIN_TOOLS, system_prompt: { mode: "append", text: prompt } },
+  // capabilities, which a client's templates may name. `timers` (nest's timer_set, timer_cancel and
+  // timer_list) is the manager's only: workers have nothing to wait for that their task doesn't bring.
+  capabilities: ["nest", "hands", ...(subagents ? WORKER_EXTRA.capabilities : []), ...(timers ? ["timers"] : []), `${NAMESPACE}/${capability}`],
+  launch: { builtin_tools: [...BUILTIN_TOOLS, ...(subagents ? WORKER_EXTRA.builtin_tools : [])], system_prompt: { mode: "append", text: prompt } },
   hands: "required",
   credential: CREDENTIAL,
   ...(repos.length ? { [access === "push" ? "repos" : "read_repos"]: [...repos] } : {}),
@@ -98,8 +108,8 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
       [`${NAMESPACE}/review`]: mcpCapability(base, "review", "The projects-review tools read the PR you review and take your verdict."),
     },
     templates: {
-      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read"),
-      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push"),
+      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read", false, true),
+      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push", true),
       [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, sorted, "read"),
     },
   };

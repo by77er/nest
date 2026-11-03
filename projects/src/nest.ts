@@ -59,13 +59,20 @@ export interface Ask {
 }
 
 /**
- * What a client may add to its own sandbox's spec (docs/control-plane/api/clients/#injection,
- * #workflow-files): its secrets' bindings, and `workflows: write` on the push token, within its grant.
+ * What a client may add to its own sandbox's spec: its egress rules (docs/control-plane/api/clients/#egress),
+ * its secrets' bindings and the environment that names their placeholders (#injection, #environment),
+ * and `workflows: write` on the push token (#workflow-files), each within its grant.
  */
 export interface SandboxExtras {
+  egress?: { allow: { host: string; ports?: number[] }[] };
   inject?: { name: string; secret: string; hosts: string[]; locations: ({ type: "authorization_bearer" } | { type: "authorization_basic_password" } | { type: "header"; name: string })[]; wildcard?: boolean }[];
+  env?: Record<string, string>;
   github_push?: { workflows: boolean };
 }
+
+/** A sandbox's client layer (docs/control-plane/api/clients/#the-client-layer), as `GET …/client-policy` answers it. */
+import type { ClientLayer as ClientPolicy, HeldClientLayer, PolicyAllow } from "./network";
+export type { ClientPolicy, HeldClientLayer };
 
 /** The overrides a client may give a spawn (nest only narrows: `SpawnerOverrides`). */
 export interface SpawnOverrides {
@@ -174,6 +181,26 @@ export class Nest {
     });
   }
 
+  /** The trace's older events (nest's trace history), before `before` (its seam when absent), newest page first. */
+  traceHistory(agent: string, q: { before?: string; limit?: string } = {}): Promise<{ events: unknown[]; next_before: string | null; reset?: true }> {
+    return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}/trace/history`, undefined, { query: q });
+  }
+
+  /** A sandbox's client layer: its own egress rules, bindings and env. */
+  getClientPolicy(sandbox: string): Promise<HeldClientLayer> {
+    return this.call("GET", `/v1/sandboxes/${encodeURIComponent(sandbox)}/client-policy`);
+  }
+
+  /** Replace a sandbox's client layer whole (an absent part is emptied: send every part). */
+  async putClientPolicy(sandbox: string, layer: ClientPolicy): Promise<void> {
+    await this.call("PUT", `/v1/sandboxes/${encodeURIComponent(sandbox)}/client-policy`, layer);
+  }
+
+  /** A sandbox's effective egress policy (the operator's layers and its own), as nest compiles it. */
+  sandboxPolicy(sandbox: string): Promise<{ allow?: PolicyAllow[]; passthrough?: string[] }> {
+    return this.call("GET", `/v1/sandboxes/${encodeURIComponent(sandbox)}/policy`);
+  }
+
   listAsks(agent: string): Promise<unknown> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}/asks`);
   }
@@ -189,7 +216,10 @@ export class Nest {
   }
 
   /** The client's own record (`GET /v1/clients/self`): its grant, among the rest. */
-  self(): Promise<{ client?: string; grant?: { inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean } } }> {
+  self(): Promise<{
+    client?: string;
+    grant?: { egress_hosts?: string[]; inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean } };
+  }> {
     return this.call("GET", "/v1/clients/self");
   }
 

@@ -4,7 +4,7 @@
 
 import { type TaskEvent, transition } from "../../tasks";
 import type { SecretRequest, SecretsAnswer } from "../api/types";
-import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
+import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
 
 export interface Write {
   method: string;
@@ -47,6 +47,8 @@ export class FakeApi {
   asks: Ask[] = [];
   sync: SyncState | null = null;
   reviews: Job[] = [];
+  waits: Waits = { pending: [], recent: [] };
+  network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }] };
   openPrs: OpenPr[] = [];
   secrets: SecretsAnswer["secrets"] = [];
   grant: SecretsAnswer["grant"] = { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org"], max_count: 10, max_bytes: 4096, workflows: true, used: 0 };
@@ -75,6 +77,11 @@ export class FakeApi {
   };
 
   /** What the Worker's attention list answers: open asks and blocked tasks, oldest first. */
+  /** A secrets change, like a network one, is owed to every live agent's layer (one revision for both). */
+  layersOwed(): void {
+    this.network = { ...this.network, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
+  }
+
   attention(): Attention[] {
     const asks = this.asks.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
     const blocked = this.tasks.filter((t) => t.blocked).map((t): Attention => ({ kind: "blocked", task: t.id, title: t.title, state: t.state, ...t.blocked! }));
@@ -110,11 +117,13 @@ export class FakeApi {
         const had = this.secrets.find((x) => x.name === name);
         const row = { name, size: _v ? new TextEncoder().encode(_v).length : had?.size ?? null, created_ms: had?.created_ms ?? now, updated_ms: now, holders: had?.holders ?? [], last_injected_ms: null, in_nest: true, ...meta };
         this.secrets = [...this.secrets.filter((x) => x.name !== name), row];
+        this.layersOwed();
         return json(row);
       }
       if (m === "DELETE") {
         const had = this.secrets.find((x) => x.name === name);
         this.secrets = this.secrets.filter((x) => x.name !== name);
+        this.layersOwed();
         return json({ deleted: name, holders: had?.holders ?? [] });
       }
     }
@@ -145,10 +154,17 @@ export class FakeApi {
       case "POST attach":
         this.manager = { ...this.manager, phase: "starting", error: null };
         return json(p.settings);
+      case "GET waits":
+        return json(this.waits);
+      case "GET network":
+        return json(this.network);
+      case "PUT network":
+        this.network = { ...this.network, rules: body, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
+        return json(this.network);
       case "GET reviews":
         return json(this.reviews);
       case "GET secrets":
-        return json({ secrets: this.secrets, grant: this.grant, client: "cli_app" });
+        return json({ secrets: this.secrets, grant: this.grant, client: "cli_app", agents: this.network.agents });
       case "GET prs/open":
         return json(this.openPrs);
       case "GET chat":

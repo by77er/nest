@@ -10,6 +10,7 @@ import {
   appJwt, type GitHubApi, githubApiOf, GithubRepoPermissions, importAppKey, parseAppSecret, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
 } from "../lib/github";
 import { isClientId } from "../lib/clients";
+import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
 import { canonicalRepos, Repo } from "../lib/repos";
 import type { GithubPermissions } from "../lib/brokered";
 import { canonicalJson } from "../lib/sinks";
@@ -52,7 +53,30 @@ export interface InjectionTarget {
 }
 
 /** How a minted injection secret is made: today one source, the GitHub App narrowed to repos. */
-export type InjectionSource = { kind: "github_app"; binding: string; repos: string[] };
+/**
+ * What to mint an injection secret from. `workflows` (a push token only) adds `workflows: write`; a
+ * BrokerDO of the previous release ignores it and mints without, which is narrower.
+ */
+export type InjectionSource = { kind: "github_app"; binding: string; repos: string[]; workflows?: boolean };
+
+/** A client's secret as anyone may see it (docs/control-plane/api/clients/#secrets): never its value. */
+export interface ClientSecretView {
+  name: string;
+  description: string | null;
+  /** The value's size in bytes (UTF-8). */
+  size: number;
+  created_ms: number;
+  updated_ms: number;
+  /** When it was last handed to a sandbox's proxy (`clientInjectionRefs`), or null. */
+  last_injected_ms: number | null;
+}
+
+/** A client binding whose secret a sandbox's proxy should hold: its wire name, its secret's name, and its hosts (audited). */
+export interface ClientInjectionRequest {
+  binding: string;
+  secret: string;
+  hosts: string[];
+}
 
 /** A minted injection secret, as a reference FleetDO resolves when it sends `secrets_update`. */
 export interface MintedInjection extends InjectionSecret {
@@ -106,6 +130,10 @@ export class BrokerDO extends DurableObject<Env> {
     // with the same source reuses it. The value is the secret `inject:<binding>:<sandbox>`.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS injections (sandbox TEXT NOT NULL, binding TEXT NOT NULL, source TEXT NOT NULL,
       covers TEXT NOT NULL, expires_ms INTEGER NOT NULL, minted_ms INTEGER NOT NULL, PRIMARY KEY (sandbox, binding))`);
+    // API clients' secrets (docs/control-plane/api/clients/#secrets): what anyone may see of each. The
+    // value is the secret `client-secret:<client>:<name>`, which only `secrets_update` resolves.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS client_secrets (client TEXT NOT NULL, name TEXT NOT NULL, description TEXT, size INTEGER NOT NULL,
+      created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, injected_ms INTEGER, PRIMARY KEY (client, name))`);
     // Caller-identity signing keys (lib/identity.ts): the private JWK rests here and nowhere else.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS identity_keys (kid TEXT PRIMARY KEY, private_jwk TEXT NOT NULL, public_jwk TEXT NOT NULL,
       signs_from_ms INTEGER NOT NULL, created_ms INTEGER NOT NULL)`);
@@ -231,7 +259,10 @@ export class BrokerDO extends DurableObject<Env> {
   }
 
   private async mintInjection(target: InjectionTarget, source: InjectionSource, access: "write" | "read", caller: string): Promise<MintedInjection | null> {
-    const permissions = access === "read" ? SANDBOX_READ_TOKEN_PERMISSIONS : SANDBOX_TOKEN_PERMISSIONS;
+    // `workflows` only on a push token, and only when asked (docs/control-plane/api/clients/#workflow-files).
+    const workflows = access === "write" && source.workflows === true;
+    const permissions: GithubPermissions = access === "read" ? SANDBOX_READ_TOKEN_PERMISSIONS
+      : workflows ? { ...SANDBOX_TOKEN_PERMISSIONS, workflows: "write" } : SANDBOX_TOKEN_PERMISSIONS;
     const repos = canonicalRepos(source.repos);
     const name = `inject:${source.binding}:${target.sandbox}`;
     const slot = `${target.sandbox}|${source.binding}`;
@@ -240,7 +271,8 @@ export class BrokerDO extends DurableObject<Env> {
     const overtaken = () => this.injectionRequests.get(slot) !== seq;
     // A push token's key is the previous release's, so its tokens are reused across the deploy; a read
     // token's names its access, so neither is ever reused for the other.
-    const key = JSON.stringify(access === "read" ? { kind: source.kind, repos, access } : { kind: source.kind, repos });
+    // With `workflows`, its own key: never reused for a token without it, nor the other way round.
+    const key = JSON.stringify(access === "read" ? { kind: source.kind, repos, access } : workflows ? { kind: source.kind, repos, workflows } : { kind: source.kind, repos });
     const now = Date.now();
     this.sql.exec("DELETE FROM secrets WHERE name LIKE 'inject:%:sbx\\_%' ESCAPE '\\' AND expires_ms IS NOT NULL AND expires_ms <= ?", now);
     const held = this.sql.exec<{ source: string; covers: string; expires_ms: number }>(
@@ -461,6 +493,95 @@ export class BrokerDO extends DurableObject<Env> {
     return this.secret(ref)?.value ?? null;
   }
 
+  // --- API clients' secrets (docs/control-plane/api/clients/#secrets) ---------------------------------
+
+  /**
+   * Store (or replace) client `client`'s secret `name`, within its grant's `secrets` (at most `max_count`
+   * of them, each at most `max_bytes`): checked and written in one synchronous step, so two writes can't
+   * both take the last place. Audited (never the value). Answers what anyone may see of it.
+   */
+  async putClientSecret(client: string, name: string, value: string, description: string | null, limit: { max_count: number; max_bytes: number }): Promise<ClientSecretView> {
+    if (!isClientId(client)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${client} is not a client`, 400);
+    const size = new TextEncoder().encode(value).byteLength;
+    if (size > limit.max_bytes) throw new NestError(ErrorCodes.FORBIDDEN, `outside ${client}'s grant: a secret of ${size} bytes (secrets.max_bytes is ${limit.max_bytes})`, 403);
+    const now = Date.now();
+    const cur = this.sql.exec<{ created_ms: number }>("SELECT created_ms FROM client_secrets WHERE client = ? AND name = ?", client, name).toArray()[0];
+    if (!cur) {
+      const n = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM client_secrets WHERE client = ?", client).one().n;
+      if (n >= limit.max_count) throw new NestError(ErrorCodes.FORBIDDEN, `outside ${client}'s grant: it has ${n} secrets (secrets.max_count is ${limit.max_count})`, 403);
+    }
+    this.sql.exec(`INSERT INTO client_secrets (client, name, description, size, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(client, name) DO UPDATE SET description = excluded.description, size = excluded.size, updated_ms = excluded.updated_ms`,
+    client, name, description, size, cur?.created_ms ?? now, now);
+    await this.putSecret(clientSecretKey(client, name), value);
+    this.auditInBackground({ event: "client_secret_put", client, secret: name, size, replaced: !!cur });
+    return this.clientSecretView(client, name)!;
+  }
+
+  /** Delete client `client`'s secret `name` (404 when it has none). A sandbox holding it loses it at its next push. */
+  async deleteClientSecret(client: string, name: string): Promise<void> {
+    const n = this.sql.exec("DELETE FROM client_secrets WHERE client = ? AND name = ?", client, name).rowsWritten;
+    this.sql.exec("DELETE FROM secrets WHERE name = ?", clientSecretKey(client, name));
+    if (!n) throw new NestError(ErrorCodes.NOT_FOUND, `no secret ${name}`, 404);
+    this.auditInBackground({ event: "client_secret_deleted", client, secret: name });
+  }
+
+  /** Every secret of client `client`, by name: never a value. */
+  async clientSecrets(client: string): Promise<ClientSecretView[]> {
+    return this.sql.exec<{ name: string }>("SELECT name FROM client_secrets WHERE client = ? ORDER BY name", client).toArray()
+      .map((r) => this.clientSecretView(client, r.name)!);
+  }
+
+  /** A deleted client's secrets, all of them. */
+  async deleteClientSecrets(client: string): Promise<number> {
+    const names = this.sql.exec<{ name: string }>("SELECT name FROM client_secrets WHERE client = ?", client).toArray().map((r) => r.name);
+    for (const name of names) this.sql.exec("DELETE FROM secrets WHERE name = ?", clientSecretKey(client, name));
+    this.sql.exec("DELETE FROM client_secrets WHERE client = ?", client);
+    if (names.length) this.auditInBackground({ event: "client_secrets_deleted", client, secrets: names });
+    return names.length;
+  }
+
+  /**
+   * References to client `client`'s secrets for sandbox `sandbox`'s proxy (SandboxDO's push), one per
+   * binding whose secret it has (a binding naming one it doesn't have gets none, and nest-proxy refuses
+   * its placeholder). Only that client's own secrets: the name is looked up under its id alone. Each
+   * push is audited (the bindings, secrets and hosts, never a value) before any reference is answered,
+   * and marks each secret's `last_injected_ms`.
+   */
+  async clientInjectionRefs(client: string, sandbox: string, bindings: ClientInjectionRequest[], caller: string): Promise<InjectionSecret[]> {
+    if (!isClientId(client)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${client} is not a client`, 400);
+    const held = bindings.filter((b) => this.clientSecretView(client, b.secret) && this.secret(clientSecretKey(client, b.secret)));
+    if (!held.length) return [];
+    await this.auditMint({ event: "client_secret_injected", client, sandbox, caller, bindings: held.map((b) => ({ binding: b.binding, secret: b.secret, hosts: b.hosts })) });
+    const now = Date.now();
+    for (const b of held) this.sql.exec("UPDATE client_secrets SET injected_ms = ? WHERE client = ? AND name = ?", now, client, b.secret);
+    return held.map((b) => ({ binding: b.binding, value: secretRef(clientSecretKey(client, b.secret)) }));
+  }
+
+  private clientSecretView(client: string, name: string): ClientSecretView | undefined {
+    const r = this.sql.exec<{ name: string; description: string | null; size: number; created_ms: number; updated_ms: number; injected_ms: number | null }>(
+      "SELECT name, description, size, created_ms, updated_ms, injected_ms FROM client_secrets WHERE client = ? AND name = ?", client, name).toArray()[0];
+    return r && { name: r.name, description: r.description, size: r.size, created_ms: r.created_ms, updated_ms: r.updated_ms, last_injected_ms: r.injected_ms };
+  }
+
+  /** An audit record written in the background: its failure is logged, and doesn't fail what it records. */
+  private auditInBackground(record: Record<string, unknown>): void {
+    this.ctx.waitUntil(this.auditMint(record).catch((e: unknown) => console.error(`BrokerDO: audit write failed (${String(record.event)})`, e)));
+  }
+
+  /**
+   * As `scanSecrets`, for an environment's values (index.ts `refuseSecretValues`): with `client`, only that
+   * client's own secrets are compared, so the answer reveals nothing of another tenant's or the
+   * operator's; without, every stored secret (the operator's caller). Names only.
+   */
+  async scanSecretValues(strings: string[], client: string | null): Promise<string[]> {
+    const rows = client === null
+      ? this.sql.exec<{ name: string; value: string }>("SELECT name, value FROM secrets").toArray()
+      : this.sql.exec<{ name: string; value: string }>("SELECT name, value FROM secrets WHERE substr(name, 1, ?) = ?",
+        clientSecretKey(client, "").length, clientSecretKey(client, "")).toArray();
+    return rows.filter(({ value }) => secretNeedles(value).some((n) => strings.some((s) => s.includes(n)))).map((r) => r.name);
+  }
+
   /**
    * The names of stored secrets whose value appears in any of `strings` (a brokered action's
    * arguments): the value itself, its base64, or (for a JSON value) any string in it of 16 characters
@@ -672,8 +793,8 @@ export const isSecretRef = (v: unknown): v is string => typeof v === "string" &&
 export const REF_PURPOSES = {
   /** `agent_start.oauth_token`: the Claude setup token (`claude_oauth_token`, `claude_oauth_token:<name>`). */
   agent_start: ["claude_oauth_token"],
-  /** `secrets_update.secrets[].value`: injection secrets for nest-proxy. */
-  secrets_update: ["inject:"],
+  /** `secrets_update.secrets[].value`: injection secrets for nest-proxy, the operator's and API clients'. */
+  secrets_update: ["inject:", CLIENT_SECRET_PREFIX],
 } as const satisfies Record<string, readonly string[]>;
 
 export type RefPurpose = keyof typeof REF_PURPOSES;

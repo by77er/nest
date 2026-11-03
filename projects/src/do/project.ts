@@ -8,17 +8,19 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { TEMPLATE } from "../catalog";
-import { directory, type Env } from "../env";
+import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
 import type { AgentCaller } from "../identity";
 import { backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras } from "../nest";
-import { bindingOf, MAX_BINDINGS, SECRET_NAME, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
+import { envName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { canBlock, canUnblock, dependencyError, pickForAssignment, type PrState, prsDone, waitingOn, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition, WORKER_STATES } from "../tasks";
 import { type Server, toolOf } from "../tools";
 import type { NestEvent } from "../webhook";
+import { clientLayerFor, type EgressRule, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules } from "../network";
+import { MAX_WAITS, type PrUntil, prVerdict, taskVerdict, timeoutProblem, type Wait, type WaitKind, waitKey, waitMessage, type WaitOutcome } from "../waits";
 import { randomId } from "./directory";
 
 export interface Settings {
@@ -249,11 +251,24 @@ export const MIGRATIONS = [
     "CREATE INDEX task_deps_blocker ON task_deps (blocker)",
   ],
   [
+    // The manager's waits (README.md#waiting): each the app's whole, with its deadline; one pending per key.
+    `CREATE TABLE waits (id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT, want TEXT, key TEXT NOT NULL, created_ms INTEGER NOT NULL,
+      deadline_ms INTEGER NOT NULL, resolved_ms INTEGER, outcome TEXT, detail TEXT)`,
+    "CREATE UNIQUE INDEX waits_pending ON waits (key) WHERE resolved_ms IS NULL",
+    // The network rules per role (README.md#network), their revision, each live agent's client layer as
+    // applied, and the rules a start attempt was made with (its sandbox's Idempotency-Key binds them).
+    "ALTER TABLE settings ADD COLUMN network TEXT",
+    "ALTER TABLE settings ADD COLUMN network_rev INTEGER NOT NULL DEFAULT 0",
+    `CREATE TABLE layers (agent TEXT PRIMARY KEY, role TEXT NOT NULL, sandbox TEXT, rev INTEGER, want_rev INTEGER NOT NULL,
+      next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, at_ms INTEGER)`,
+    "CREATE TABLE frozen_egress (key TEXT PRIMARY KEY, rev INTEGER NOT NULL, egress TEXT NOT NULL)",
+  ],
+  [
     // Secrets (README.md#secrets): what the app keeps of each (never a value), agents' requests for
     // them, which live agent got which (so a delete names them), each start attempt's sandbox spec
     // (frozen, so a retry sends the request its idempotency key was bound to), and the workflows setting.
     `CREATE TABLE secrets (name TEXT PRIMARY KEY, description TEXT NOT NULL, hosts TEXT NOT NULL, locations TEXT NOT NULL, roles TEXT NOT NULL,
-      size INTEGER, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL)`,
+      env TEXT NOT NULL DEFAULT '', size INTEGER, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL)`,
     `CREATE TABLE secret_requests (id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, purpose TEXT NOT NULL, hosts TEXT,
       agent TEXT NOT NULL, role TEXT NOT NULL, task TEXT, tainted INTEGER NOT NULL, at_ms INTEGER NOT NULL, done_ms INTEGER)`,
     "CREATE TABLE agent_secrets (agent TEXT PRIMARY KEY, role TEXT NOT NULL, names TEXT NOT NULL, at_ms INTEGER NOT NULL)",
@@ -422,6 +437,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (r.state !== "draft") return fail(409, "only a draft is deleted; cancel it instead");
     this.sql.exec("DELETE FROM tasks WHERE id = ?", id);
     this.sql.exec("DELETE FROM history WHERE task = ?", id);
+    for (const w of this.pendingWaits("task", id)) this.resolveWait(w.id, "ended", "deleted");
+    await this.arm();
     return ok({ deleted: id });
   }
 
@@ -434,10 +451,12 @@ export class ProjectDO extends DurableObject<Env> {
     if (!t.ok) return fail(409, t.error);
     this.sql.exec("UPDATE tasks SET state = ?, updated_ms = ? WHERE id = ?", t.to, Date.now(), id);
     this.record(id, actor, event, detail);
+    // The manager's waits on this task see the move in this step.
+    this.taskWaitsOn(id, t.to);
     // Tasks waiting on it hear it's done; their live workers are told (README.md#task-changes).
     if (t.to === "done") {
       for (const d of this.sql.exec("SELECT task FROM task_deps WHERE blocker = ?", id).toArray()) {
-        this.record(d.task as string, { kind: "app", what: "board" }, "dependency_done", { blocker: id });
+        this.record(d.task as string, { kind: "app", what: "board" }, "dependency_done", { blocker: id, title: r.title as string });
         this.noteChange(d.task as string, "dependencies", `${id} (${from.replace("_", " ")})`, `${id} (done)`, { kind: "app", what: "board" });
       }
     }
@@ -566,6 +585,10 @@ export class ProjectDO extends DurableObject<Env> {
    */
   async onPullRequest(e: { pr: number; task: string | null; action: "opened" | "closed"; merged: boolean; node?: string | null; fork?: boolean; title?: string | null }): Promise<void> {
     if (!this.settings()) return;
+    // Any PR of the repo, a task's or not: the manager's waits on it.
+    if (e.action === "closed") {
+      for (const w of this.pendingWaits("pr", String(e.pr))) this.prWaitOn(w, e.merged ? { kind: "merged" } : { kind: "closed" });
+    }
     const github: Actor = { kind: "app", what: "github" };
     const had = this.prRow(e.pr);
     if (e.action === "opened") {
@@ -722,7 +745,7 @@ export class ProjectDO extends DurableObject<Env> {
     const before = this.depList(id);
     const who = actor.kind === "owner" ? "owner" : actor.kind === "app" ? `app:${actor.what}` : actor.agent;
     this.sql.exec("INSERT INTO task_deps (task, blocker, by, at_ms) VALUES (?, ?, ?, ?)", id, blocker, who, Date.now());
-    this.record(id, actor, "dependency_added", { blocked_by: blocker });
+    this.record(id, actor, "dependency_added", { blocked_by: blocker, title: this.taskRow(blocker)!.title as string });
     this.noteChange(id, "dependencies", before, this.depList(id), actor);
     await this.arm();
     return ok(this.toTask(this.taskRow(id)!));
@@ -734,7 +757,7 @@ export class ProjectDO extends DurableObject<Env> {
     const before = this.depList(id);
     const gone = this.sql.exec("DELETE FROM task_deps WHERE task = ? AND blocker = ? RETURNING task", id, blocker).toArray().length;
     if (!gone) return fail(404, `${id} doesn't wait on ${blocker}`);
-    this.record(id, actor, "dependency_removed", { blocked_by: blocker });
+    this.record(id, actor, "dependency_removed", { blocked_by: blocker, title: (this.taskRow(blocker)?.title as string | undefined) ?? null });
     this.noteChange(id, "dependencies", before, this.depList(id), actor);
     // It may be assignable now.
     this.autoAssign();
@@ -865,11 +888,21 @@ export class ProjectDO extends DurableObject<Env> {
     return this.sql.exec("SELECT * FROM secrets ORDER BY name").toArray().map((r) => ({
       name: r.name as string, description: r.description as string, hosts: JSON.parse(r.hosts as string) as string[],
       locations: JSON.parse(r.locations as string) as SecretLocation[], roles: JSON.parse(r.roles as string) as SecretRole[],
+      env: (r.env as string) || envName(r.name as string),
       size: (r.size as number | null) ?? null, created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     }));
   }
 
-  /** The live agents holding a secret: those started with it, until they exit or are stopped. */
+  /** A role's secrets as its sandboxes' bindings and variables (README.md#secrets). */
+  private secretFeeds(role: SecretRole): ReturnType<typeof secretFeeds> {
+    return secretFeeds(this.clientId(), this.settings()!.id, this.secretRows().filter((m) => m.roles.includes(role)));
+  }
+
+  private clientId(): string {
+    return clientIdOf(this.env.NEST_CLIENT_TOKEN) ?? "cli_unknown";
+  }
+
+  /** The live agents holding a secret: in their sandbox's layer as last applied, until they exit or are stopped. */
   private holdersOf(name: string): { agent: string; role: string }[] {
     return this.sql.exec("SELECT agent, role, names FROM agent_secrets ORDER BY at_ms").toArray()
       .filter((r) => (JSON.parse(r.names as string) as string[]).includes(name)).map((r) => ({ agent: r.agent as string, role: r.role as string }));
@@ -884,37 +917,49 @@ export class ProjectDO extends DurableObject<Env> {
    * Record a secret's metadata, after the Worker stored its value in nest (when it set one): the value
    * never reaches this object. Open requests to inject one by that name are done, and their agents told.
    */
-  async saveSecretMeta(m: Pick<SecretMeta, "name" | "description" | "hosts" | "locations" | "roles">, size: number | null): Promise<Result<SecretView>> {
+  async saveSecretMeta(m: Pick<SecretMeta, "name" | "description" | "hosts" | "locations" | "roles" | "env">, size: number | null): Promise<Result<SecretView>> {
     if (!this.settings()) return fail(404, "unknown project");
-    const had = this.sql.exec("SELECT created_ms FROM secrets WHERE name = ?", m.name).toArray()[0];
-    if (!had && size === null) return fail(400, "a new secret needs a value");
+    const before = this.secretRows().find((x) => x.name === m.name);
+    if (!before && size === null) return fail(400, "a new secret needs a value");
+    const clash = this.secretRows().find((x) => x.name !== m.name && x.env === m.env);
+    if (clash) return fail(409, `${clash.name} uses ${m.env} already`);
     const now = Date.now();
     this.sql.exec(
-      `INSERT INTO secrets (name, description, hosts, locations, roles, size, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO secrets (name, description, hosts, locations, roles, env, size, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (name) DO UPDATE SET description = excluded.description, hosts = excluded.hosts, locations = excluded.locations, roles = excluded.roles,
-          size = COALESCE(excluded.size, size), updated_ms = excluded.updated_ms`,
-      m.name, m.description, JSON.stringify(m.hosts), JSON.stringify(m.locations), JSON.stringify(m.roles), size, now, now,
+          env = excluded.env, size = COALESCE(excluded.size, size), updated_ms = excluded.updated_ms`,
+      m.name, m.description, JSON.stringify(m.hosts), JSON.stringify(m.locations), JSON.stringify(m.roles), m.env, size, now, now,
     );
+    // A binding or variable changed: owed to the live agents of each role it was or is for. A new value
+    // alone changes no layer (nest pushes it to the proxies).
+    const after = this.secretRows().find((x) => x.name === m.name)!;
+    const shape = (x: SecretMeta | undefined) => x && JSON.stringify([x.hosts, x.locations, x.env]);
+    const roles = new Set<SecretRole>([...(before?.roles ?? []), ...after.roles]);
+    await this.oweLayers(NETWORK_ROLES.filter((r) => roles.has(r) && (shape(before) !== shape(after) || before?.roles.includes(r) !== after.roles.includes(r))));
     for (const r of this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL AND kind = 'injected' AND name = ?", m.name).toArray()) {
       this.finishRequest(r);
     }
     await this.arm();
-    return ok({ ...this.secretRows().find((x) => x.name === m.name)!, holders: this.holdersOf(m.name) });
+    return ok({ ...after, holders: this.holdersOf(m.name) });
   }
 
-  /** Forget a secret's metadata (the Worker deleted its value in nest first); answers who had it. */
+  /** Forget a secret's metadata (the Worker deleted its value in nest first), and take it out of live layers. */
   async deleteSecretMeta(name: string): Promise<Result<{ deleted: string; holders: { agent: string; role: string }[] }>> {
     if (!this.settings()) return fail(404, "unknown project");
     const holders = this.holdersOf(name);
-    const gone = this.sql.exec("DELETE FROM secrets WHERE name = ? RETURNING name", name).toArray().length;
+    const gone = this.sql.exec<{ roles: string }>("DELETE FROM secrets WHERE name = ? RETURNING roles", name).toArray()[0];
     if (!gone) return fail(404, `no secret ${name}`);
+    const roles = JSON.parse(gone.roles) as SecretRole[];
+    await this.oweLayers(NETWORK_ROLES.filter((r) => roles.includes(r)));
     return ok({ deleted: name, holders });
   }
 
   /**
-   * A start attempt's sandbox spec: its role's bindings, and `workflows: write` for a worker when the
-   * setting is on. Frozen per attempt (`key`), so a retry after a lost answer sends the same request its
-   * Idempotency-Key is bound to, however the secrets changed since. The brief names the placeholders.
+   * A start attempt's sandbox spec: its role's bindings and variables, and `workflows: write` for a worker
+   * when the setting is on. Frozen per attempt (`key`), so a retry after a lost answer sends the same
+   * request its Idempotency-Key is bound to, however the secrets changed since: a change after the
+   * attempt's first try is owed to the agent's layer once it's live (`trackLayer`). The brief names the
+   * variables.
    */
   private sandboxSpec(role: SecretRole, key: string): { extras: SandboxExtras; names: string[]; brief: string } {
     const s = this.settings()!;
@@ -922,12 +967,12 @@ export class ProjectDO extends DurableObject<Env> {
     let frozen: { extras: SandboxExtras; names: string[]; brief: string };
     if (had) frozen = JSON.parse(had.spec);
     else {
-      const mine = this.secretRows().filter((m) => m.roles.includes(role)).slice(0, MAX_BINDINGS);
+      const { inject, env, secrets: mine } = this.secretFeeds(role);
       const extras: SandboxExtras = {
-        ...(mine.length ? { inject: mine.map((m) => bindingOf(s.id, m)) } : {}),
+        ...(inject.length ? { inject, env } : {}),
         ...(role === "worker" && s.workers_edit_workflows ? { github_push: { workflows: true } } : {}),
       };
-      frozen = { extras, names: mine.map((m) => m.name), brief: secretsBrief(clientIdOf(this.env.NEST_CLIENT_TOKEN) ?? "cli_unknown", mine) };
+      frozen = { extras, names: mine.map((m) => m.name), brief: secretsBrief(mine) };
       this.sql.exec("INSERT INTO start_specs (key, spec, at_ms) VALUES (?, ?, ?)", key, JSON.stringify(frozen), Date.now());
       this.sql.exec("DELETE FROM start_specs WHERE at_ms < ?", Date.now() - 7 * 24 * 3600 * 1000);
     }
@@ -940,9 +985,10 @@ export class ProjectDO extends DurableObject<Env> {
     return this.sandboxSpec("reviewer", key);
   }
 
-  /** Which secrets an agent got at its start (so deleting one names it). */
+  /** Which secrets an agent's sandbox has: at its start, then as each layer is applied (so deleting one names it). */
   async recordHolder(agent: string, role: string, names: string[]): Promise<void> {
-    if (names.length) this.sql.exec("INSERT OR REPLACE INTO agent_secrets (agent, role, names, at_ms) VALUES (?, ?, ?, ?)", agent, role, JSON.stringify(names), Date.now());
+    if (!names.length) this.sql.exec("DELETE FROM agent_secrets WHERE agent = ?", agent);
+    else this.sql.exec("INSERT OR REPLACE INTO agent_secrets (agent, role, names, at_ms) VALUES (?, ?, ?, ?)", agent, role, JSON.stringify(names), Date.now());
   }
 
   /**
@@ -957,7 +1003,8 @@ export class ProjectDO extends DurableObject<Env> {
     const open = this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL AND kind = ? AND name = ?", kind, name).toArray()[0];
     if (open) return ok(requestOf(open));
     if (kind === "injected" && this.sql.exec("SELECT 1 FROM secrets WHERE name = ?", name).toArray().length) {
-      return fail(409, `${name} exists already: it's injected into sandboxes started since it was added`);
+      const m = this.secretRows().find((x) => x.name === name)!;
+      return fail(409, `${name} exists already, as $${m.env} in the sandboxes of ${m.roles.join(", ")}: ask the owner to add your role if it isn't one`);
     }
     const id = `srq_${randomId()}`;
     const hosts = Array.isArray(a.hosts) ? (a.hosts as string[]) : null;
@@ -984,9 +1031,14 @@ export class ProjectDO extends DurableObject<Env> {
   private finishRequest(r: Row): void {
     this.sql.exec("UPDATE secret_requests SET done_ms = ? WHERE id = ?", Date.now(), r.id);
     // Names only, the owner's act: nothing an agent wrote, so nothing relayed.
+    const m = r.kind === "injected" ? this.secretRows().find((x) => x.name === r.name) : undefined;
     const text = r.kind === "ci"
       ? `The owner added the GitHub Actions secret ${r.name as string} you asked for.`
-      : `The owner set up the secret ${r.name as string} you asked for. It's injected into sandboxes started from now on, not into yours if it was started before: say so if you need it now.`;
+      : !m?.roles.includes(r.role as SecretRole)
+        ? `The owner set up the secret ${r.name as string} you asked for, but not for your role (${r.role as string}): say so if you still need it.`
+        : r.role === "reviewer"
+          ? `The owner set up the secret ${r.name as string} you asked for, as $${m.env}: a reviewer gets it at its next start.`
+          : `The owner set up the secret ${r.name as string} you asked for. Your sandbox gets it as $${m.env} in a moment, in the commands you start from then on.`;
     this.oweMessage(r.agent as string, text, false);
   }
 
@@ -1061,6 +1113,7 @@ export class ProjectDO extends DurableObject<Env> {
     }
     this.clearBlock(id);
     this.record(id, { kind: "owner" }, "block_answered", { answer, to: by });
+    this.replyWaits(`answered the block on task ${id}`);
     // The worker that blocked it has the answer already; another live worker on it hears it's clear.
     if (by !== r.assignee) this.noteChange(id, "blocked", r.blocked_reason as string, null, { kind: "owner" });
     await this.arm();
@@ -1104,6 +1157,7 @@ export class ProjectDO extends DurableObject<Env> {
     const s = this.settings();
     if (!s) return fail(404, "unknown project");
     const seq = this.sql.exec<{ seq: number }>("INSERT INTO chat (at_ms, sender, text, next_ms) VALUES (?, 'owner', ?, ?) RETURNING seq", Date.now(), text, Date.now()).one().seq;
+    this.replyWaits("replied in chat");
     await this.arm();
     await this.drain();
     const r = this.sql.exec("SELECT next_ms, error FROM chat WHERE seq = ?", seq).one();
@@ -1129,6 +1183,8 @@ export class ProjectDO extends DurableObject<Env> {
     try {
       const out = await nest.answerAsk(r.agent as string, ask, answer);
       this.sql.exec("UPDATE asks SET answered_ms = ?, answer = ? WHERE ask = ?", Date.now(), answer, ask);
+      this.replyWaits(`answered ask ${ask}`);
+      await this.arm();
       return ok(out);
     } catch (e) {
       return e instanceof NestError ? fail(e.status === 404 ? 404 : 502, e.message) : fail(502, String(e));
@@ -1171,6 +1227,7 @@ export class ProjectDO extends DurableObject<Env> {
   /** A worker ended: its task stalls unless its PR is open or it's over; its place frees. */
   private workerExited(agent: string, reason?: string, text?: string): void {
     this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
+    this.sql.exec("DELETE FROM layers WHERE agent = ?", agent);
     const r = this.sql.exec("SELECT id, state FROM tasks WHERE assignee = ?", agent).toArray()[0];
     if (!r) return;
     const id = r.id as string;
@@ -1184,6 +1241,241 @@ export class ProjectDO extends DurableObject<Env> {
   async errors(): Promise<Result<unknown[]>> {
     if (!this.settings()) return fail(404, "unknown project");
     return ok(this.sql.exec("SELECT at_ms, agent, role, task, code, message FROM errors ORDER BY seq DESC LIMIT 100").toArray());
+  }
+
+  // --- waits (README.md#waiting) ------------------------------------------------------------------------
+
+  private waitRow(id: string): Wait | undefined {
+    const r = this.sql.exec("SELECT * FROM waits WHERE id = ?", id).toArray()[0];
+    return r ? toWait(r) : undefined;
+  }
+
+  /** Pending waits, oldest first; of one kind and target when given. */
+  private pendingWaits(kind?: WaitKind, target?: string): Wait[] {
+    const rows = kind
+      ? this.sql.exec("SELECT * FROM waits WHERE resolved_ms IS NULL AND kind = ? AND target IS ? ORDER BY created_ms", kind, target ?? null).toArray()
+      : this.sql.exec("SELECT * FROM waits WHERE resolved_ms IS NULL ORDER BY created_ms").toArray();
+    return rows.map(toWait);
+  }
+
+  /** The Manager page's view: what's pending, and the last few that ended. */
+  async waits(): Promise<Result<{ pending: Wait[]; recent: Wait[] }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const recent = this.sql.exec("SELECT * FROM waits WHERE resolved_ms IS NOT NULL ORDER BY resolved_ms DESC LIMIT 10").toArray().map(toWait);
+    return ok({ pending: this.pendingWaits(), recent });
+  }
+
+  /**
+   * Resolve a pending wait, once: the row changes only while it's pending, in one step, and only then is
+   * the manager told (`notify`). A condition and a deadline racing each other resolve it exactly once.
+   */
+  private resolveWait(id: string, outcome: WaitOutcome, detail: string, notify = true): boolean {
+    const w = this.waitRow(id);
+    if (!w || w.resolved_ms !== null) return false;
+    const now = Date.now();
+    const done = this.sql.exec("UPDATE waits SET resolved_ms = ?, outcome = ?, detail = ? WHERE id = ? AND resolved_ms IS NULL", now, outcome, detail, id).rowsWritten;
+    if (!done) return false;
+    const manager = this.settings()?.manager;
+    if (notify && manager) this.oweMessage(manager, waitMessage(w, outcome, detail, now), false);
+    return true;
+  }
+
+  /**
+   * The manager waits (`await_task`, `await_pr`, `await_reply`): the same condition pending already is
+   * the same wait. A condition that holds already answers at once, with no wait left behind. Otherwise
+   * the wait is recorded with its deadline and the manager is told when it resolves.
+   */
+  private async registerWait(kind: WaitKind, target: string | null, want: Wait["want"], timeout: unknown): Promise<Result<unknown>> {
+    const bad = timeoutProblem(timeout);
+    if (bad) return fail(400, bad);
+    if (kind === "task") {
+      const t = this.taskRow(target!);
+      if (!t) return fail(404, "unknown task");
+      const v = taskVerdict(want as TaskState[], t.state as TaskState, TERMINAL);
+      if (v) return ok({ status: v.outcome, detail: `task ${target}: ${v.detail}` });
+    }
+    const key = waitKey(kind, target, want);
+    const prior = this.sql.exec("SELECT * FROM waits WHERE key = ? AND resolved_ms IS NULL", key).toArray()[0];
+    if (prior) return ok({ status: "waiting", wait: toWait(prior), note: "already waiting for this: the same wait" });
+    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM waits WHERE resolved_ms IS NULL").one().n >= MAX_WAITS) {
+      return fail(409, `at most ${MAX_WAITS} waits at once: cancel one with cancel_wait`);
+    }
+    const id = `aw_${randomId()}`;
+    const now = Date.now();
+    this.sql.exec("INSERT INTO waits (id, kind, target, want, key, created_ms, deadline_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      id, kind, target, want === null ? null : JSON.stringify(want), key, now, now + (timeout as number) * 1000);
+    await this.arm();
+    // A PR's state is the review queue's: read after the wait is recorded, so an end that lands meanwhile
+    // resolves it either way (each resolves it at most once).
+    if (kind === "pr") {
+      const pr = Number(target);
+      const jobs = (await review(this.env, this.settings()!.id).jobs()).filter((j) => j.pr === pr);
+      // A PR attached to a task is recorded merged once it is (README.md#prs).
+      const merged = this.sql.exec("SELECT 1 FROM task_prs WHERE pr = ? AND state = 'merged'", pr).toArray().length > 0;
+      const latest = jobs[0];
+      if (merged) this.prWaitOn(this.waitRow(id)!, { kind: "merged" });
+      // Closed before its review finished, merged or not (the queue doesn't say): a wait to merge stays.
+      else if (latest?.state === "closed" && want !== "merged") this.prWaitOn(this.waitRow(id)!, { kind: "closed" });
+      else if (latest && (latest.state === "done" || latest.state === "failed")) this.prWaitOn(this.waitRow(id)!, { kind: "review", conclusion: reviewConclusion(latest) });
+      const w = this.waitRow(id)!;
+      if (w.resolved_ms !== null) return ok({ status: w.outcome, detail: `PR #${pr}: ${w.detail}` });
+    }
+    return ok({ status: "waiting", wait: this.waitRow(id), note: "end your turn: a message in your inbox says when it resolves or times out" });
+  }
+
+  /** A task's waits on its new state. */
+  private taskWaitsOn(id: string, state: TaskState): void {
+    for (const w of this.pendingWaits("task", id)) {
+      const v = taskVerdict(w.want as TaskState[], state, TERMINAL);
+      if (v) this.resolveWait(w.id, v.outcome, v.detail);
+    }
+  }
+
+  private prWaitOn(w: Wait, e: Parameters<typeof prVerdict>[1]): void {
+    const v = prVerdict(w.want as PrUntil, e);
+    if (v) this.resolveWait(w.id, v.outcome, v.detail);
+  }
+
+  /** The owner replied (in chat, or to something in "Needs you"): every reply wait is met. */
+  private replyWaits(how: string): void {
+    for (const w of this.pendingWaits("reply")) this.resolveWait(w.id, "met", how);
+  }
+
+  /** The review queue ended a PR's review (ReviewDO's outbox): `done` with a verdict, or `failed`. */
+  async onReviewEnded(e: { pr: number; sha: string; state: string; conclusion: string | null }): Promise<void> {
+    if (!this.settings()) return;
+    for (const w of this.pendingWaits("pr", String(e.pr))) this.prWaitOn(w, { kind: "review", conclusion: e.conclusion ?? e.state });
+    await this.arm();
+  }
+
+  // --- network (README.md#network) ----------------------------------------------------------------------
+
+  /** The rules per role, as stored (normalized), and their revision. */
+  private rules(): { rules: RoleRules; rev: number } {
+    const r = this.settingsRow();
+    return { rules: r?.network ? { ...NO_RULES, ...(JSON.parse(r.network as string) as RoleRules) } : NO_RULES, rev: (r?.network_rev as number | undefined) ?? 0 };
+  }
+
+  /** The app's live agents of the network's roles: the manager, and each live worker. */
+  private liveAgents(): { agent: string; role: NetworkRole }[] {
+    const s = this.settings();
+    const workers = this.sql.exec<{ assignee: string }>("SELECT assignee FROM tasks WHERE worker_live = 1 AND assignee IS NOT NULL").toArray();
+    return [...(s?.manager ? [{ agent: s.manager, role: "manager" as const }] : []), ...workers.map((w) => ({ agent: w.assignee, role: "worker" as const }))];
+  }
+
+  /** The page's view: the rules, and each live agent's layer (applied, pending or failed). */
+  async network(): Promise<Result<{ rules: RoleRules; rev: number; agents: LayerStatus[] }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const { rules, rev } = this.rules();
+    const live = new Set(this.liveAgents().map((a) => a.agent));
+    const agents = this.sql.exec("SELECT * FROM layers ORDER BY role, agent").toArray().filter((r) => live.has(r.agent as string)).map((r): LayerStatus => ({
+      agent: r.agent as string, role: r.role as NetworkRole, sandbox: (r.sandbox as string | null) ?? null,
+      state: r.error !== null && r.next_ms === null ? "failed" : r.rev === r.want_rev && r.next_ms === null ? "applied" : "pending",
+      error: (r.error as string | null) ?? null, rev: (r.rev as number | null) ?? null, at_ms: (r.at_ms as number | null) ?? null,
+    }));
+    return ok({ rules, rev, agents });
+  }
+
+  /** The manager's sandbox, if known (the operator's base policy is read from it). */
+  async managerSandbox(): Promise<string | null> {
+    const m = this.settings()?.manager;
+    if (!m) return null;
+    return (this.sql.exec<{ sandbox: string | null }>("SELECT sandbox FROM layers WHERE agent = ?", m).toArray()[0]?.sandbox) ?? null;
+  }
+
+  /**
+   * New rules (the caller checked them against the grant): stored with a new revision, and owed to
+   * every live agent of a role whose rules changed, through its sandbox's client layer.
+   */
+  async setNetwork(next: RoleRules): Promise<Result<{ rules: RoleRules; rev: number; agents: LayerStatus[] }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const before = this.rules();
+    const rules: RoleRules = { worker: normalizeRules(next.worker), manager: normalizeRules(next.manager) };
+    const changed = NETWORK_ROLES.filter((r) => JSON.stringify(rules[r]) !== JSON.stringify(before.rules[r]));
+    if (changed.length) {
+      this.sql.exec("UPDATE settings SET network = ?", JSON.stringify(rules));
+      await this.oweLayers(changed);
+      await this.drain();
+    }
+    return this.network();
+  }
+
+  /**
+   * Something a client layer is built from changed for `roles` (their rules, or their secrets): a new
+   * revision, owed to each live agent of those roles. One revision for both, so each agent has one status.
+   */
+  private async oweLayers(roles: readonly NetworkRole[]): Promise<void> {
+    if (!roles.length) return;
+    const rev = this.rules().rev + 1;
+    this.sql.exec("UPDATE settings SET network_rev = ?", rev);
+    for (const a of this.liveAgents()) {
+      if (!roles.includes(a.role)) continue;
+      this.sql.exec(
+        `INSERT INTO layers (agent, role, want_rev, next_ms) VALUES (?, ?, ?, ?)
+          ON CONFLICT (agent) DO UPDATE SET want_rev = excluded.want_rev, next_ms = excluded.next_ms, attempts = 0, error = NULL`,
+        a.agent, a.role, rev, Date.now(),
+      );
+    }
+    await this.arm();
+  }
+
+  /** The rules a start attempt uses, fixed at its first try: its sandbox's Idempotency-Key binds the request. */
+  private frozenEgress(key: string, role: NetworkRole): { rev: number; egress: EgressRule[] } {
+    const r = this.sql.exec<{ rev: number; egress: string }>("SELECT rev, egress FROM frozen_egress WHERE key = ?", key).toArray()[0];
+    if (r) return { rev: r.rev, egress: JSON.parse(r.egress) as EgressRule[] };
+    const { rules, rev } = this.rules();
+    this.sql.exec("INSERT INTO frozen_egress (key, rev, egress) VALUES (?, ?, ?)", key, rev, JSON.stringify(rules[role]));
+    return { rev, egress: rules[role] };
+  }
+
+  /** A new agent's layer: applied as of its start's rules; owed again if the rules moved on since. */
+  private trackLayer(agent: string, role: NetworkRole, rev: number): void {
+    const want = this.rules().rev;
+    this.sql.exec(
+      `INSERT INTO layers (agent, role, rev, want_rev, next_ms, at_ms) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT (agent) DO NOTHING`,
+      agent, role, rev, want, rev === want ? null : Date.now(), Date.now(),
+    );
+  }
+
+  /**
+   * Bring a live agent's sandbox's client layer to the current rules: read the layer (so the parts other
+   * pages own stay as they are), build it with `clientLayerFor`, and replace it. A refusal that will repeat
+   * (the grant narrowed, the sandbox gone) is shown, not retried; anything else is retried from the alarm.
+   */
+  private async applyLayer(nest: Nest, agent: string): Promise<void> {
+    const row = this.sql.exec("SELECT * FROM layers WHERE agent = ?", agent).toArray()[0];
+    if (!row) return;
+    const role = row.role as NetworkRole;
+    const want = row.want_rev as number;
+    try {
+      let sandbox = (row.sandbox as string | null) ?? null;
+      if (!sandbox) {
+        const view = await nest.getAgent(agent);
+        sandbox = (view.hands as { sandbox?: string } | null | undefined)?.sandbox ?? null;
+        if (!sandbox) throw new NestError(409, "no_sandbox", "the agent has no sandbox", false);
+        this.sql.exec("UPDATE layers SET sandbox = ? WHERE agent = ?", sandbox, agent);
+      }
+      const current = await nest.getClientPolicy(sandbox);
+      const feeds = this.secretFeeds(role);
+      const layer = clientLayerFor(this.rules().rules, role, { inject: feeds.inject, env: feeds.env }, current);
+      await nest.putClientPolicy(sandbox, layer);
+      await this.recordHolder(agent, role, feeds.secrets.map((m) => m.name));
+      // Applied as of `want`; a newer change meanwhile stays owed.
+      this.sql.exec(
+        "UPDATE layers SET rev = ?, attempts = 0, error = NULL, at_ms = ?, next_ms = CASE WHEN want_rev = ? THEN NULL ELSE ? END WHERE agent = ?",
+        want, Date.now(), want, Date.now(), agent,
+      );
+    } catch (e) {
+      const attempts = (row.attempts as number) + 1;
+      if (e instanceof NestError && e.status === 404) {
+        this.sql.exec("DELETE FROM layers WHERE agent = ?", agent);
+        return;
+      }
+      const permanent = e instanceof NestError && e.permanent;
+      this.sql.exec("UPDATE layers SET attempts = ?, error = ?, next_ms = ? WHERE agent = ? AND want_rev = ?",
+        attempts, message(e), permanent ? null : Date.now() + backoff(attempts), agent, want);
+    }
   }
 
   // --- the MCP tools ---------------------------------------------------------------------------------
@@ -1251,6 +1543,22 @@ export class ProjectDO extends DurableObject<Env> {
           return this.block(a.task as string, caller, "manager", a.reason as string, (a.question as string | undefined) ?? null);
         case "unblock_task":
           return this.unblock(a.task as string, caller, (a.note as string | undefined) ?? null);
+        case "await_task":
+          return this.registerWait("task", a.task as string, a.states as TaskState[], a.timeout_s);
+        case "await_pr":
+          return this.registerWait("pr", String(a.pr), a.until as PrUntil, a.timeout_s);
+        case "await_reply":
+          return this.registerWait("reply", null, null, a.timeout_s);
+        case "cancel_wait": {
+          const w = this.waitRow(a.wait as string);
+          if (!w) return fail(404, "unknown wait");
+          if (w.resolved_ms !== null) return ok({ wait: w.id, outcome: w.outcome, detail: w.detail });
+          this.resolveWait(w.id, "cancelled", "by the manager", false);
+          await this.arm();
+          return ok({ wait: w.id, outcome: "cancelled" });
+        }
+        case "list_waits":
+          return ok({ waits: this.pendingWaits() });
       }
     }
     if (server === "task") {
@@ -1304,6 +1612,10 @@ export class ProjectDO extends DurableObject<Env> {
         UNION ALL SELECT start_next_ms FROM tasks WHERE state = 'assigned' AND start_next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM stops
         UNION ALL SELECT next_ms FROM chat WHERE next_ms IS NOT NULL)`),
+      // The manager's waits' deadlines, and client layers owed to live sandboxes.
+      min(`SELECT MIN(t) AS t FROM (
+        SELECT deadline_ms AS t FROM waits WHERE resolved_ms IS NULL
+        UNION ALL SELECT next_ms FROM layers WHERE next_ms IS NOT NULL)`),
       // Auto-merge: the repo's setting to write or read, and each task PR's change (an enable only once
       // the repo allows it).
       min(`SELECT MIN(t) AS t FROM (
@@ -1347,6 +1659,10 @@ export class ProjectDO extends DurableObject<Env> {
   private async drainOnce(): Promise<void> {
     const s = this.settingsRow();
     if (!s) return;
+    // A wait whose deadline passed times out here, in one step, unless its condition resolved it first.
+    for (const r of this.sql.exec("SELECT id FROM waits WHERE resolved_ms IS NULL AND deadline_ms <= ?", Date.now()).toArray()) {
+      this.resolveWait(r.id as string, "timed_out", "timed out");
+    }
     const nest = nestFrom(this.env);
     if (!nest) return;
     const now = Date.now();
@@ -1369,6 +1685,7 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT seq FROM messages WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverMessage(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT id FROM tasks WHERE notify_next_ms IS NOT NULL AND notify_next_ms <= ?", now).toArray()) await this.notifyWorker(nest, r.id as string);
+    for (const r of this.sql.exec("SELECT agent FROM layers WHERE next_ms IS NOT NULL AND next_ms <= ?", now).toArray()) await this.applyLayer(nest, r.agent as string);
     await this.arm();
   }
 
@@ -1474,10 +1791,13 @@ export class ProjectDO extends DurableObject<Env> {
     const labels = { project: s.id, role: "manager", start: String(n) };
     try {
       const key = `${s.id}/manager/${n}`;
+      const frozen = this.frozenEgress(key, "manager");
+      // Its bindings, env and workflows, frozen with the same key (README.md#secrets).
       const spec = this.sandboxSpec("manager", key);
-      const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, { read: s.repo }, key, spec.extras));
+      const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       this.sql.exec("UPDATE settings SET manager = ?", agent);
+      this.trackLayer(agent, "manager", frozen.rev);
       this.recordHolder(agent, "manager", spec.names);
       await nest.postInbox(agent, managerBrief(s) + spec.brief, { requestId: `${s.id}/manager/${n}/brief` });
       this.sql.exec("UPDATE settings SET manager_next_ms = NULL, manager_attempts = 0, manager_error = NULL, manager_starts = ?", n);
@@ -1501,9 +1821,13 @@ export class ProjectDO extends DurableObject<Env> {
     try {
       let agent = before.assignee as string | null;
       if (!agent) {
-        agent = await nest.startAgent(TEMPLATE.worker, labels, { push: s.repo }, `${s.id}/${id}/${n}`, this.sandboxSpec("worker", `${s.id}/${id}/${n}`).extras);
+        const key = `${s.id}/${id}/${n}`;
+        const frozen = this.frozenEgress(key, "worker");
+        const spec = this.sandboxSpec("worker", key);
+        agent = await nest.startAgent(TEMPLATE.worker, labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
         await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
-        this.recordHolder(agent, "worker", this.sandboxSpec("worker", `${s.id}/${id}/${n}`).names);
+        this.trackLayer(agent, "worker", frozen.rev);
+        this.recordHolder(agent, "worker", spec.names);
         if (!current()) {
           // Cancelled (or reassigned) while it was being made: it goes.
           this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, ?, 'cancelled', ?)", agent, id, Date.now());
@@ -1547,6 +1871,8 @@ export class ProjectDO extends DurableObject<Env> {
       }
     }
     this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
+    // Its sandbox goes with it: nothing more is owed to its client layer.
+    this.sql.exec("DELETE FROM layers WHERE agent = ?", agent);
     this.sql.exec("UPDATE tasks SET worker_live = 0 WHERE assignee = ? AND state NOT IN ('assigned', 'in_progress', 'in_review')", agent);
     this.autoAssign();
   }
@@ -1670,4 +1996,35 @@ function workerBrief(s: Settings, t: Task): string {
       `Test plan: ${spec.test_plan}`,
     ] : []),
   ].join("\n");
+}
+
+/** A live agent's client layer, as the Network page shows it. */
+export interface LayerStatus {
+  agent: string;
+  role: NetworkRole;
+  sandbox: string | null;
+  state: "applied" | "pending" | "failed";
+  error: string | null;
+  rev: number | null;
+  at_ms: number | null;
+}
+
+function toWait(r: Row): Wait {
+  return {
+    id: r.id as string, kind: r.kind as WaitKind, target: (r.target as string | null) ?? null,
+    want: r.want === null ? null : (JSON.parse(r.want as string) as Wait["want"]),
+    created_ms: r.created_ms as number, deadline_ms: r.deadline_ms as number, resolved_ms: (r.resolved_ms as number | null) ?? null,
+    outcome: (r.outcome as WaitOutcome | null) ?? null, detail: (r.detail as string | null) ?? null,
+  };
+}
+
+/** A start's sandbox extras for its frozen rules: none when there are none (the request as before). */
+const egressExtras = (egress: EgressRule[]) => (egress.length ? { egress: { allow: egress } } : {});
+
+/** A review job's end, in a word: its verdict's conclusion, or that it failed. */
+function reviewConclusion(j: { state: string; verdict: unknown }): string {
+  if (j.state === "failed") return "failed without a verdict";
+  const v = j.verdict as { correctness?: { verdict: string }; quality?: { verdict: string }; architecture?: { verdict: string } } | null;
+  const all = v && [v.correctness, v.quality, v.architecture].every((d) => d?.verdict === "pass");
+  return all ? "passed" : "failed";
 }

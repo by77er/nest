@@ -134,3 +134,36 @@ describe("the trace route", () => {
     expect((await upgrade(p.manager)).status).toBe(404);
   });
 });
+
+describe("the trace history route", () => {
+  const history = (agent: string, q = "", access: string | null = token) =>
+    SELF.fetch(`${APP}/api/agents/${agent}/trace/history${q}`, { headers: access ? { "cf-access-jwt-assertion": access, cookie: "CF_Authorization=browser-cookie" } : {} });
+
+  it("proxies nest's trace history for an agent of the app's projects, with the client token and the query", async () => {
+    const p = await newProject();
+    const page = { events: [{ ts_ms: 1, entry: 0, type: "turn_started", input_kind: "unknown" }], next_before: "cur2" };
+    fake.histories.set(p.manager, new Map([["cur1", page]]));
+    const before = fake.calls.length;
+    const res = await history(p.manager, "?before=cur1&limit=50");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual(page);
+    const call = fake.calls.slice(before).find((c) => c.path === `/v1/agents/${p.manager}/trace/history`)!;
+    expect(call.auth).toBe(`Bearer nest_cli_app_${"0".repeat(64)}`);
+    expect(Object.fromEntries(call.query)).toEqual({ before: "cur1", limit: "50" });
+  });
+
+  it("refuses an agent the app didn't record, before asking nest; is behind Access; checks its query", async () => {
+    const p = await newProject();
+    const stray = fake.plant({ labels: { project: "prj_nope", role: "worker" } });
+    const before = fake.calls.length;
+    for (const id of [stray.agent, "agt_unknown2", "nope"]) expect((await history(id)).status, id).toBe(404);
+    expect(fake.calls.slice(before).filter((c) => c.path.endsWith("/history"))).toEqual([]);
+    expect((await history(p.manager, "", null)).status).toBe(403);
+    for (const q of ["?before=%21", "?limit=x", `?before=${"a".repeat(600)}`]) expect((await history(p.manager, q)).status, q).toBe(400);
+    // nest's own refusal of a cursor stays a 400; its retryable 503 a 503.
+    fake.histories.set(p.manager, new Map());
+    expect((await history(p.manager, "?before=gone")).status).toBe(400);
+    fake.fail(/trace\/history/, 503, { retryable: true, times: 3 });
+    expect((await history(p.manager)).status).toBe(503);
+  });
+});

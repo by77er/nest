@@ -16,6 +16,8 @@ export interface SecretMeta {
   hosts: string[];
   locations: SecretLocation[];
   roles: SecretRole[];
+  /** The environment variable that holds its placeholder in the sandboxes of its roles. */
+  env: string;
   /** Its value's size in bytes, as last set (nest's `size`). */
   size: number | null;
   created_ms: number;
@@ -46,8 +48,24 @@ export const nestSecretName = (project: string, name: string) => `${project}-${n
 /** The placeholder nest assigns a binding (`nest-ph.<client id>.<name>.`, with its trailing dot). */
 export const placeholder = (client: string, name: string) => `nest-ph.${client}.${name}.`;
 
-/** The environment variable the brief suggests for it: `npm_token` → `NPM_TOKEN`. */
+/** The environment variable the form suggests for a name: `npm_token` → `NPM_TOKEN`. */
 export const envName = (name: string) => name.toUpperCase();
+
+/** nest's environment names (docs/control-plane/api/clients/#environment), and the ones nest or the guest sets. */
+export const ENV_NAME = /^[A-Z_][A-Z0-9_]{0,63}$/;
+const RESERVED_ENV = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OLDPWD", "TERM", "HOSTNAME", "LD_PRELOAD", "LD_LIBRARY_PATH",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "FTP_PROXY", "GITHUB_TOKEN",
+  "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO",
+]);
+
+/** Why `name` can't be a secret's variable, or null. `taken`: the variables of the project's other secrets. */
+export function envProblem(name: string, taken: readonly string[] = []): string | null {
+  if (!ENV_NAME.test(name)) return "Capital letters, digits and _, not starting with a digit, at most 64";
+  if (RESERVED_ENV.has(name) || name.startsWith("NEST_")) return `${name} is set by nest or the sandbox`;
+  if (taken.includes(name)) return `Another secret uses ${name}`;
+  return null;
+}
 
 const HOST = /^(?:\*\.)?(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$/;
 const IP = /^\d+(?:\.\d+){3}$/;
@@ -66,9 +84,13 @@ export function hostAllowed(host: string, allowed: readonly string[]): boolean {
 }
 
 /** Each problem with a secret's settings, by field, against nest's rules and the grant; empty when none. */
-export function secretProblems(m: Pick<SecretMeta, "name" | "hosts" | "locations" | "roles">, grant: SecretGrant | null): Record<string, string> {
+export function secretProblems(
+  m: Pick<SecretMeta, "name" | "hosts" | "locations" | "roles" | "env">, grant: SecretGrant | null, takenEnv: readonly string[] = [],
+): Record<string, string> {
   const out: Record<string, string> = {};
   if (!SECRET_NAME.test(m.name)) out.name = "Lowercase letters, digits and _, starting with a letter, at most 31";
+  const env = envProblem(m.env, takenEnv);
+  if (env) out.env = env;
   if (m.hosts.length < 1 || m.hosts.length > MAX_HOSTS) out.hosts = `1 to ${MAX_HOSTS} hosts`;
   else {
     const bad = m.hosts.find((h) => !HOST.test(h) || IP.test(h) || (h.startsWith("*.") && h.split(".").length < 3));
@@ -108,30 +130,43 @@ export function bindingOf(project: string, m: Pick<SecretMeta, "name" | "hosts" 
 export type Binding = ReturnType<typeof bindingOf>;
 
 const LOCATION_LABEL = (l: SecretLocation) =>
-  l.type === "authorization_bearer" ? "Authorization: Bearer <placeholder>" : l.type === "authorization_basic_password" ? "the password of Basic auth" : `the ${l.name} header`;
+  l.type === "authorization_bearer" ? "a bearer token" : l.type === "authorization_basic_password" ? "a Basic auth password" : `the ${l.name} header`;
 
 /**
- * The part of an agent's brief that names its credentials: each placeholder, what it's for, and where it
- * works. Names and hosts only: values never reach the app, let alone a brief.
+ * What a role's secrets make of a sandbox's client layer: a binding each, and its variable holding the
+ * binding's placeholder (nest's limit of bindings: the first by name). Fed to `clientLayerFor`, and sent
+ * the same at a sandbox's create.
  */
-export function secretsBrief(client: string, secrets: readonly Pick<SecretMeta, "name" | "description" | "hosts" | "locations">[]): string {
+export function secretFeeds(client: string, project: string, secrets: readonly SecretMeta[]): { inject: Binding[]; env: Record<string, string>; secrets: SecretMeta[] } {
+  const mine = secrets.slice(0, MAX_BINDINGS);
+  return { inject: mine.map((m) => bindingOf(project, m)), env: Object.fromEntries(mine.map((m) => [m.env, placeholder(client, m.name)])), secrets: mine };
+}
+
+/**
+ * The brief's note on credentials: which variables exist and where each works. Names and hosts only: the
+ * variables hold placeholders (in the sandbox, not here), and values never reach the app.
+ */
+export function secretsBrief(secrets: readonly Pick<SecretMeta, "description" | "hosts" | "locations" | "env">[]): string {
   if (secrets.length === 0) return "";
   return [
     "",
-    "Credentials: nest's egress proxy injects these; your sandbox holds placeholders, never values. Use a placeholder exactly where its value would go; it works only against its hosts.",
-    ...secrets.map((s) => `- ${envName(s.name)}=${placeholder(client, s.name)}${s.description ? ` (${s.description})` : ""}: on ${s.hosts.join(", ")}, as ${s.locations.map(LOCATION_LABEL).join(" or ")}.`),
-    "Export them as those variables if a tool reads one. Never ask anyone for a secret's value; if you need a credential you don't have, call request_secret.",
+    "Credentials: your sandbox's commands have these variables. Each holds a placeholder that nest's egress proxy swaps for the real value, only on its hosts; use it where the value would go.",
+    ...secrets.map((s) => `- $${s.env}${s.description ? ` (${s.description})` : ""}: ${s.hosts.join(", ")}, as ${s.locations.map(LOCATION_LABEL).join(" or ")}.`),
+    "The owner may add or remove secrets while you run, which changes these variables. Never ask anyone for a secret's value; if you need a credential you don't have, call request_secret.",
   ].join("\n");
 }
 
-/** Presets for the form's host picker (README.md#secrets). */
+/**
+ * Presets for the form's host picker (README.md#secrets), with the variable their tools read (`null`: the
+ * name's, upper-cased; for GitHub, so `GH_TOKEN` doesn't take over the brokered token).
+ */
 export const SECRET_PRESETS = [
-  { value: "cloudflare", label: "Cloudflare API", hosts: ["api.cloudflare.com"], location: { type: "authorization_bearer" } as SecretLocation, note: null },
-  { value: "npm", label: "npm registry", hosts: ["registry.npmjs.org"], location: { type: "authorization_bearer" } as SecretLocation, note: null },
-  { value: "pypi", label: "PyPI upload", hosts: ["upload.pypi.org"], location: { type: "authorization_basic_password" } as SecretLocation, note: "PyPI takes a token as the password, with the user name __token__." },
+  { value: "cloudflare", label: "Cloudflare API", hosts: ["api.cloudflare.com"], location: { type: "authorization_bearer" } as SecretLocation, env: "CLOUDFLARE_API_TOKEN", note: null },
+  { value: "npm", label: "npm registry", hosts: ["registry.npmjs.org"], location: { type: "authorization_bearer" } as SecretLocation, env: "NPM_TOKEN", note: null },
+  { value: "pypi", label: "PyPI upload", hosts: ["upload.pypi.org"], location: { type: "authorization_basic_password" } as SecretLocation, env: "TWINE_PASSWORD", note: "PyPI takes a token as the password, with the user name __token__ (TWINE_USERNAME)." },
   {
-    value: "github", label: "GitHub API", hosts: ["api.github.com"], location: { type: "authorization_bearer" } as SecretLocation,
+    value: "github", label: "GitHub API", hosts: ["api.github.com"], location: { type: "authorization_bearer" } as SecretLocation, env: null,
     note: "nest already brokers GitHub for the project's repo: its sandboxes push and read through it with a token of their own. Add one only for another account's API, and prefer the brokered one.",
   },
-  { value: "custom", label: "Custom", hosts: [], location: { type: "authorization_bearer" } as SecretLocation, note: null },
+  { value: "custom", label: "Custom", hosts: [], location: { type: "authorization_bearer" } as SecretLocation, env: null, note: null },
 ] as const;

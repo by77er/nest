@@ -17,10 +17,10 @@ prompt:  |                                  # added to the system prompt
 
 - **Data, not code:** capabilities are stored in the control plane ([CatalogDO](../../control-plane/durable-objects/catalog/)) and edited by me, like templates. Adding an MCP server or an API is data too; only a new *platform* tool needs code (the tool registry).
 - **Attenuation:** a spawn spec can enable a capability only if the spawner holds every grant it expands to, with parameters no wider than its own.
-- **Parameters (designed, not built):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them. The only one built, the task ledger's `ledger`, left with it ([principle 9](../../README.md#principles)).
+- **Parameters (designed, not built):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them.
 - **Always present, not capabilities:** an agent's own input queue and inbox, and `exit`.
 - **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).
-- **Built so far:** `builtin` tools ([CatalogDO](../../control-plane/durable-objects/catalog/)), the `mcp` source ([mcp/](mcp/): a bearer token or none, the allowlist, idempotency overrides, the trust flag and per-server caps; AgentDO is the MCP client, and a connector per server shares the tool list and admits calls) and the `brokered` source ([brokered/](brokered/): GitHub actions scoped to repos, `http.request` profiles). `api` isn't built. Beyond the first seed it has `egress` and `spawning`; no parameter is built.
+- **Built so far:** `builtin` tools ([CatalogDO](../../control-plane/durable-objects/catalog/)), the `mcp` source ([mcp/](mcp/): a bearer token or none, the allowlist, idempotency overrides, the trust flag and per-server caps; AgentDO is the MCP client, and a connector per server shares the tool list and admits calls) and the `brokered` source ([brokered/](brokered/): GitHub actions scoped to repos, `http.request` profiles). `api` isn't built. The seed catalog's capabilities: `nest`, `hands`, `subagents`, `transcripts`, `sandboxes`, `brokered`, `management` (`attach`, `approve`, `deny`, all `not_implemented`), `memory`, `egress`, `spawning` and [`timers`](timers/) (named timers that wake the agent) (`control-plane/src/lib/spec.ts`).
 
 ## Sources
 
@@ -75,11 +75,11 @@ assistant: [spawning{budget}, memory, schedules, web]  # long-lived
 
 ## Messaging
 
-Messaging between agents is an external integration ([principle 9](../../README.md#principles)): an MCP server the agents share, which delivers to an agent through its inbox (`POST /v1/agents/<id>/inbox`, carrying the sender's taint). Reach, threading, loop guards and rate limits are the integration's.
+Messaging between agents is an external integration ([principle 9](../../README.md#principles)): an MCP server the agents share, attached as an `mcp` capability, which delivers to an agent through its inbox (`POST /v1/agents/<id>/inbox`, carrying the sender's taint). Reach, threading, loop guards and rate limits are the integration's; nest ships none.
 
 ## Schedules
 
-`wake_at(at | every, note)` queues a turn on the agent itself: once at a time, or repeating at an interval. It's how monitors keep their own cadence and how assistants remind me of things. `wake_cancel(id)` stops one.
+**Designed, not built.** `wake_at(at | every, note)` queues a turn on the agent itself: once at a time, or repeating at an interval. It's how monitors keep their own cadence and how assistants remind me of things. `wake_cancel(id)` stops one.
 
 - **Durable:** wakes are AgentDO alarms, so they survive restarts and moves, and cost nothing while waiting.
 - **A due wake is a turn** carrying the note, and it starts a brain like any other input (see [continuity](../#continuity)).

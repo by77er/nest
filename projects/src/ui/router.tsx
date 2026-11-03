@@ -5,6 +5,7 @@
 //   /projects/$projectId/board         its board; `?task=` opens a task's drawer (the default page)
 //   /projects/$projectId/manager       the chat with its manager; `?view=trace` the manager's trace
 //   /projects/$projectId/reviews       its review jobs
+//   /projects/$projectId/network       its agents' network rules
 //   /projects/$projectId/settings      its settings
 //   /admin                             the catalog sync
 //
@@ -19,6 +20,7 @@ const BoardPage = lazyRouteComponent(() => import("./features/project/BoardPage"
 const ManagerPage = lazyRouteComponent(() => import("./features/manager/ManagerPage"), "ManagerPage");
 const ReviewsPage = lazyRouteComponent(() => import("./features/reviews/ReviewsPage"), "ReviewsPage");
 const SettingsPage = lazyRouteComponent(() => import("./features/settings/SettingsPage"), "SettingsPage");
+const NetworkPage = lazyRouteComponent(() => import("./features/network/NetworkPage"), "NetworkPage");
 const SecretsPage = lazyRouteComponent(() => import("./features/secrets/SecretsPage"), "SecretsPage");
 const AdminPage = lazyRouteComponent(() => import("./features/admin/AdminPage"), "AdminPage");
 
@@ -60,6 +62,7 @@ const manager = createRoute({
 
 const reviews = createRoute({ getParentRoute: () => project, path: "reviews", component: ReviewsPage });
 const settings = createRoute({ getParentRoute: () => project, path: "settings", component: SettingsPage });
+const network = createRoute({ getParentRoute: () => project, path: "network", component: NetworkPage });
 /** `?add=<name>&hosts=<a,b>` opens the form prefilled: an agent's request, from "Needs you". */
 const secrets = createRoute({
   getParentRoute: () => project,
@@ -73,7 +76,7 @@ const secrets = createRoute({
 
 const admin = createRoute({ getParentRoute: () => root, path: "/admin", component: AdminPage });
 
-export const routeTree = root.addChildren([home, projects, project.addChildren([projectIndex, board, manager, reviews, secrets, settings]), admin]);
+export const routeTree = root.addChildren([home, projects, project.addChildren([projectIndex, board, manager, reviews, secrets, network, settings]), admin]);
 
 export function createAppRouter(o: { history?: RouterHistory } = {}) {
   return createRouter({ routeTree, ...(o.history ? { history: o.history } : {}), defaultPreload: "intent", scrollRestoration: true });

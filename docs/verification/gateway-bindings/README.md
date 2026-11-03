@@ -2,7 +2,7 @@
 
 > **Study, not a decision.** Code on `main` (edf6829); every claim cites `file:line`. Contracts: [gateway](../../interfaces/gateway/), [nestd-gateway](../../interfaces/host-internal/nestd-gateway/), [host-guest](../../interfaces/host-guest/); design: [sandbox gateway](../../sandbox/gateway/), [hands](../../agents/hands/), [SandboxDO attach and bindings](../../control-plane/durable-objects/sandbox/#attach-and-bindings). Channel delivery underneath: [reliable-channels](../reliable-channels/).
 
-> **Since:** not re-checked after `edf6829`. #30 changed the hands path: the agent epoch fences the brain, `hands_resolved` is a tagged union, and the hands client takes sandbox and epoch from the binding's claims.
+> **Since** (not a full re-check): #30 changed the hands path: the agent epoch fences the brain, `hands_resolved` is a tagged union, and the hands client takes sandbox and epoch from the binding's claims. #62 moved the gateway's state-dependent checks under the lock that registers (G5); #63 dropped the guest's freeze gate. #119 added the pause mark (G4) and the 120 s busy budget; its `send_upsert` also closes B1 by reading. Rows that cite functions are current; `file:line` rows are at `edf6829`.
 
 ## Scope and actors
 
@@ -16,7 +16,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 | Binding | `nbd_<claims>.<sig>`, claims `{v, kid, sandbox, epoch, client, scope, exp_ms}`, ECDSA P-256, lifetime 1 h | `control-plane/src/lib/binding.ts:41-50`, `control-plane/src/protocol/gateway.ts:13` |
 | nestd | per sandbox `Sbx{epoch, slots, guest_info, vm}` behind an async mutex; `summary{epoch, state}`; gateway mirror `{keys, sandboxes: id→{epoch, vsock, clients, guest}, conn}`; `Tombstones: id→max fenced epoch` | `crates/nestd/src/gateway_link.rs:55-73`, `crates/nestd/src/tombstones.rs:17-55` |
 | gateway | `keys: kid→point`; `sandboxes: id→{epoch, vsock, clients, guest, generation}`; `resyncing`; `conns: id→{sandbox, epoch, close}` | `crates/nest-gateway/src/state.rs` `SandboxEntry`, `Inner` |
-| guest | `identity{sandbox, epoch}?`, `agents` (slots), `frozen` | `crates/nest-guest/src/hands/mod.rs:116-131`, `crates/nest-guest/src/control.rs:57-77` |
+| guest | `identity{sandbox, epoch}?`, `agents` (slots) | `crates/nest-guest/src/state.rs` `Inner`, `crates/nest-guest/src/control.rs` |
 | runner | cached target `{url, sandbox, epoch, binding, guest, edge?}` + generation; per-call `Retries{re_resolved, busy_since}` | `crates/nest-runner/src/hands.rs` `call_with`, `connect`, `ensure_target` |
 
 ## Transitions
@@ -53,8 +53,8 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 | G4 | bind | gateway | version → shape → kid listed → signature → `exp_ms > now`, scope (no lock) → under the write lock: sandbox known → `claims.epoch` = held (older `stale_epoch`, newer `busy`) → client ∈ clients → guest known → guest version → not paused (nestd's `sandbox_upsert.paused`, `busy` with a 2 s hint; added 2026-11-02) | the conn registered (G5) or one refusal, `executed: false` | `crates/nest-gateway/src/verify.rs` `verify_token`, `admit` |
 | G5 | register | gateway | G4's state-dependent checks pass, under the same write lock | conn registered | `state.rs` `admit_and_register`; `server.rs` `connection` |
 | G6 | first frame | gateway | `agent_id`, `epoch`, `protocol_version`, where present, equal the binding's | forward; else close 4401 | `verify.rs` `first_frame_mismatch`; `server.rs` `connection` |
-| Q1 | configure | guest | `epoch ≥ identity.epoch` | set identity; else `stale_epoch` | `control.rs:57-77` |
-| Q2 | validate | guest | version; identity set (else `busy`); not frozen (else `busy`); `req.epoch = identity.epoch`; agent attached | run the tool; hangup or `cancel` cancels | `hands/mod.rs:41-111,116-131` |
+| Q1 | configure | guest | same sandbox id: `epoch ≥ identity.epoch`; another sandbox id (a fork child) is accepted | set identity; else `stale_epoch` | `Identity::admit_configure` (`state.rs`), `control.rs` |
+| Q2 | validate | guest | version; identity set (else `busy`); `req.epoch = identity.epoch`; agent attached | run the tool; hangup or `cancel` cancels | `validate` (`hands/mod.rs`), `Inner::admit` (`state.rs`) |
 
 **Client (runner).** `ensure_target` (cached until 60 s before `exp_ms`: `crates/nest-hands-client/src/lib.rs` `refresh_due`) → `open` → on refusal `Next::{RetrySame (busy or a bind timeout, ≤30 s; ≤120 s once a `busy` with reason `paused` came, since 2026-11-02), Resolve (stale_epoch, moved, unknown_key, unauthorized, unsupported_version; once per call), Final}` (`lib.rs` `Refusal::next`, `guest_error_next`, `OpenError::next`; `hands.rs` `connect`) → send `HandsRequest` (**point of no return**) → `exchange`: result, guest error (`busy` → retry in the same budget; others final), close 4409 or EOF → `outcome_unknown` (`hands.rs` `call_with`, `exchange`).
 
@@ -69,11 +69,11 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 
 | Id | Predicate | Holds on main? |
 |---|---|---|
-| S1 admission | a `HandsRequest` runs in the guest only if: at bind, the token verifies under a listed key, `exp_ms > now_gw`, scope `hands`; at register, atomically, `claims.epoch = gw.epoch(sandbox)`, `client ∈ gw.clients(sandbox)`, guest known with equal version; first frame `epoch = claims.epoch`, `agent_id = client`; at the guest, `req.epoch = identity.epoch`, agent attached, not frozen | yes (G4–G6, Q2). Since refactor/runner the state-dependent checks run under the lock that registers (G5), so a detach or guest change between check and register is refused; before, only the epoch was re-checked and a detach there admitted one call |
-| S2 epoch monotonic | between removes, `gw.epoch(s)` never decreases; `guest.identity.epoch` never decreases; nestd never sends an upsert at or below a tombstone | gateway: yes (`state.rs` `upsert_sandbox`); guest: yes (`control.rs:60`); nestd: **no** under B1 |
-| S3 fenced stays out | after `fence(s, e)` on a host, the gateway never again holds `(s, e' ≤ e)` | **no** under B1 |
-| S4 no retry past the point of no return | a `HandsRequest` for a call id is resent only after a pre-`bound` refusal or a guest `busy` | yes by inspection: the guest's `busy` comes only from `validate` (`hands/mod.rs:121-124`), before `run_tool`. Not structural: no `executed` flag on guest errors, no duplicate-call check. Send failure: B2 (fixed) |
-| S5 crash outcome from guest records | after a runner crash, the outcome of an in-flight call comes from the guest's call record (`call_status`) | **not built**: no records, `call_status` or `duplicate_call` in `crates/nest-guest/src/hands/`; `docs/agents/hands/README.md:33` says so, while `docs/README.md:144` lists it as settled |
+| S1 admission | a `HandsRequest` runs in the guest only if: at bind, the token verifies under a listed key, `exp_ms > now_gw`, scope `hands`; at register, atomically, `claims.epoch = gw.epoch(sandbox)`, `client ∈ gw.clients(sandbox)`, guest known with equal version; first frame `epoch = claims.epoch`, `agent_id = client`; at the guest, `req.epoch = identity.epoch`, agent attached | yes (G4–G6, Q2). Since #62 the state-dependent checks run under the lock that registers (G5), so a detach or guest change between check and register is refused; at `edf6829` only the epoch was re-checked and a detach there admitted one call |
+| S2 epoch monotonic | between removes, `gw.epoch(s)` never decreases; `guest.identity.epoch` never decreases; nestd never sends an upsert at or below a tombstone | gateway: yes (`state.rs` `upsert_sandbox`); guest: yes within one sandbox id (`admit_configure`); nestd: **no** under B1 at `edf6829` |
+| S3 fenced stays out | after `fence(s, e)` on a host, the gateway never again holds `(s, e' ≤ e)` | **no** under B1 at `edf6829` |
+| S4 no retry past the point of no return | a `HandsRequest` for a call id is resent only after a pre-`bound` refusal or a guest `busy` | yes by inspection: the guest's `busy` comes only from `validate` (`Inner::admit`), before `run_tool`. Not structural: no `executed` flag on guest errors, no duplicate-call check. Send failure: B2 (fixed) |
+| S5 crash outcome from guest records | after a runner crash, the outcome of an in-flight call comes from the guest's call record (`call_status`) | **not built**: no records, `call_status` or `duplicate_call` in `crates/nest-guest/src/hands/`; the [hands](../../agents/hands/) doc says so, while `docs/README.md` lists it as settled |
 | S6 detach voids | once nestd has processed `agent_detach(a)` and the gateway applied its upsert, no new call by `a` is admitted, and `a`'s running processes are killed | yes (N2, G4 client check, Q2 `unknown_agent`). Before that, a binding minted earlier stays admissible until `exp_ms` (≤ 1 h): the end-to-end bound is command delivery, which the reliable-channel bug B1 can make unbounded |
 | S7 mint only current | `resolve` returns a binding only for an attached, confirmed client of a `running` sandbox at the epoch current after its awaits | yes (`unbindable`, checked before and after `resolve`'s awaits) |
 | S8 keys | only bindings under a `kid` in the gateway's set verify; a `key_update` replaces the set | yes (`state.rs` `set_keys`, `verify.rs` `verify_token`). Rotation and validity windows are **not built** (one key per cell, `broker.ts:124-127`); a leaked binding is revoked only by detach or an epoch bump |
@@ -105,7 +105,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 
 ## Bugs found
 
-**B1 — a fenced epoch re-added to the gateway as a ghost (real from code; low likelihood).** `upsert` checks the tombstone and inserts under the mirror lock, releases it, then sends under a second acquisition (`gateway_link.rs:147-158`); the fence path runs without the sandbox lock (`host.rs:1110-1134`). Interleaving: `gateway_sync` passes its running check (`host.rs:698`) and M1's tombstone check, inserts, releases; N5 tombstones, `forget` removes the entry and sends `sandbox_remove`; M1 then sends its `sandbox_upsert`. The gateway re-adds `(s, e)` after the remove; nestd's mirror lacks it, so a later destroy's `forget` returns early (`gateway_link.rs:166`) and sends nothing. The ghost lasts until a gateway reconnect or a newer epoch. Breaks S2 (nestd clause) and S3; the guest-side epoch check and the stopped VM still prevent execution. Confirm with shuttle (two tasks: `upsert` vs `fence`), asserting the gateway's final table equals the mirror.
+**B1 — a fenced epoch re-added to the gateway as a ghost (real from code at `edf6829`; low likelihood; closed by reading since #119, untested).** `upsert` checks the tombstone and inserts under the mirror lock, releases it, then sends under a second acquisition (`gateway_link.rs:147-158`); the fence path runs without the sandbox lock (`host.rs:1110-1134`). Interleaving: `gateway_sync` passes its running check (`host.rs:698`) and M1's tombstone check, inserts, releases; N5 tombstones, `forget` removes the entry and sends `sandbox_remove`; M1 then sends its `sandbox_upsert`. The gateway re-adds `(s, e)` after the remove; nestd's mirror lacks it, so a later destroy's `forget` returns early (`gateway_link.rs:166`) and sends nothing. The ghost lasts until a gateway reconnect or a newer epoch. Breaks S2 (nestd clause) and S3; the guest-side epoch check and the stopped VM still prevent execution. Since #119, `upsert` sends through `send_upsert`, which re-reads the mirror's entry under the lock and sends nothing when a fence's `forget` removed it. A shuttle test (two tasks: `upsert` vs `fence`, asserting the gateway's final table equals the mirror) would confirm it.
 
 **B2 — a failed request send reported as a plain error (confirmed, fixed).** `conn.send_json(&req)` failing returned `"hands request failed"`, not `outcome_unknown`; a WebSocket send can fail after part of the frame left, so the guest may run a call the model was told failed. Now only a request refused before any byte left (`InvalidInput`: it does not fit a frame) is a plain error; any other send failure is `outcome_unknown` (`hands.rs` `call_with`). Test: `a_request_send_that_fails_part_way_is_an_unknown_outcome` (a gateway that binds, reads nothing and resets while the client writes a 15 MiB request).
 
@@ -113,7 +113,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 
 **B4 — no re-check after resolving (low).** AgentDO checks the runner is current before `await resolve` and not after (`agent.ts:651-658`); a superseded socket is closed, so the send usually fails. Branch 0c3a85c (L2) adds the re-check.
 
-**Docs vs code.** `docs/README.md:144` (settled) states journaling, `executed: false`, duplicate refusal and crash lookup; none is built (S5). The fleet doc says the gateway refuses a detached client's bindings (`docs/interfaces/control-host/fleet/README.md:61`): true only once the command lands.
+**Docs vs code.** `docs/README.md` (settled) states journaling, `executed: false`, duplicate refusal and crash lookup; none is built (S5). The fleet doc says the gateway refuses a detached client's bindings (`docs/interfaces/control-host/fleet/README.md:61`): true only once the command lands.
 
 ## Modelling notes
 
@@ -133,8 +133,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 
 ## Runtime assertions and tests to add now
 
-- nestd: send mirror deltas under the same lock as the mirror change (or tag them with a seq, as the proxy link does) and test `upsert` racing `fence`: the gateway must end without the fenced epoch (B1).
-- Gateway: re-check `client ∈ clients` at register. **Done** (refactor/runner): every state-dependent check runs in `admit_and_register`.
+- nestd: test `upsert` racing `fence`: the gateway must end without the fenced epoch (B1).
 - Guest: make pre-execution refusals a distinct type that `run_tool` cannot return, so "`busy` only before the point of no return" is enforced by the compiler (S4).
 - SandboxDO: a test that detach then attach leaves the host with the slot (B3); log when the gateway's `unauthorized` follows a fresh mint (needs the runner to report it).
 - e2e: after `detach`, a call with the previously minted binding is refused within command latency (S6).

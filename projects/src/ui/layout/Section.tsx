@@ -17,13 +17,15 @@ export interface SectionProps {
   iconColor?: Role;
   /** A landmark (`region`) named by its title; off for a section that isn't a place of its own. */
   region?: boolean;
+  /** Takes a column's whole height, its content the rest below the heading (a trace beside a task). */
+  fill?: boolean;
   children?: ReactNode;
 }
 
-export function Section({ title, count, actions, dense = false, region = true, icon: Icon, iconColor = "gray", children }: SectionProps) {
+export function Section({ title, count, actions, dense = false, region = true, icon: Icon, iconColor = "gray", fill = false, children }: SectionProps) {
   const id = useId();
   return (
-    <Stack gap={dense ? "sm" : "lg"} component={region ? "section" : "div"} aria-labelledby={region ? id : undefined} data-ds="section" miw={0}>
+    <Stack gap={dense ? "sm" : "lg"} component={region ? "section" : "div"} aria-labelledby={region ? id : undefined} data-ds="section" miw={0} style={fill ? { height: "100%", minHeight: 0 } : undefined}>
       <Group justify="space-between" align="center" wrap="wrap" gap="sm" mih={dense ? "var(--nest-dense-head)" : "var(--nest-section-head)"} data-slot="head">
         <Group gap="sm" wrap="nowrap" align="center" miw={0}>
           {Icon && (

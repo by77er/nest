@@ -40,6 +40,7 @@ nestd's cores are checked as shipped ([docs/verification/nestd/](../docs/verific
 | Fuzzing | the seeds decode, and every target replays the seeds and the cached corpus once (`run.sh <target> replay`) | weekly (Sunday) in `fuzz.yml`: 10 min for the guest targets, 3 min for the rest; it saves the corpus the PR job replays |
 
 - **Bumps:** stateright is pinned exactly (`=0.31.0`), cargo-mutants, kani-verifier and cargo-fuzz by version, the fuzz nightly by date.
+- **Open:** should the checker's every-fault run gate merges? It would take about a minute on CI hardware (unmeasured); today it runs only by hand with `--include-ignored`.
 - **When a check fails:** a model check names the property and prints the shortest counterexample with `cargo run --release -- <spec>`; replay it as a step test in `crates/nestd-core/tests/`. A fuzz crash is uploaded as the `fuzz-artifacts` artifact; reproduce with `cargo fuzz run --fuzz-dir verification/nestd/fuzz <target> <file>`.
 
 ## Not in CI

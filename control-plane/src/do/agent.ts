@@ -10,6 +10,7 @@ import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { inboxTurnText, moveNoteDue, TurnQueue, type TurnStatus } from "../lib/turns";
+import { type Timer, TIMER_DEADLINE, TIMER_SENDER, timerDue, timerFiredText, TimerName, TimerSetArgs, TimerStore, TIMERS_MAX } from "../lib/timers";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX, sameConnector } from "../lib/mcp";
 import { approves, argsDigest, gated, sessionTaint, type SinkCall } from "../lib/sinks";
@@ -25,6 +26,7 @@ import { isAgentId, Labels } from "../lib/clients";
 import type { MemberFacts } from "./client";
 import { type ClientEvent, ClientOutbox, EVENT_TEXT_MAX } from "../lib/client-events";
 import { field, TRACE_PING, TRACE_PONG, TRACE_SOCKETS_MAX, type TraceBody, type TraceControl, TraceRing, traceOf } from "../lib/trace";
+import { decodeCursor, encodeCursor, HISTORY_DEFAULT_LIMIT, type HistoryCursor, type HistoryPage, historyPage } from "../lib/trace-history";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { type AgentSpec, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
 import {
@@ -142,6 +144,8 @@ export interface AgentInfo extends AgentSpec, BrainFields {
 
 /** Tools that spawn or end agents: never from a sandbox. */
 const LIFECYCLE_TOOLS = ["agent_spawn", "agent_stop", "exit"];
+/** Timers wake the brain: set from it, never from inside a sandbox. */
+const TIMER_TOOLS = ["timer_set", "timer_cancel", "timer_list"];
 /** The tools an agent is offered: its spec's, and `exit`, which every agent has (it only gives up authority). */
 const offered = (info: Pick<AgentSpec, "tools">): string[] => (info.tools.includes("exit") ? info.tools : [...info.tools, "exit"]);
 
@@ -175,6 +179,8 @@ const APPROVAL_TTL_MS = 60 * 60_000;
 /** How much of a sink call's arguments the approval question shows. */
 const APPROVAL_ARGS_SHOWN = 2000;
 type AskDeadline = `${typeof ASK_DEADLINE}${string}`;
+/** A timer's deadline (lib/timers.ts), `timer:<name>`. */
+type TimerDeadline = `${typeof TIMER_DEADLINE}${string}`;
 
 /** Points where a test can force an interleaving (`testHooks`). */
 export type HookPoint =
@@ -289,7 +295,7 @@ export class AgentDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   // `!`: set in the constructor, except on the health instance, which serves only `health()`.
   private readonly rel!: ReliableChannels;
-  private readonly deadlines!: Deadlines<AgentDeadline | AskDeadline>;
+  private readonly deadlines!: Deadlines<AgentDeadline | AskDeadline | TimerDeadline>;
   private readonly inbound = new SerialQueue();
   /** The run of the intent in flight (single-flight, in memory only: the intent itself is stored). */
   private intentRun: Promise<StartResult | null> | null = null;
@@ -338,6 +344,9 @@ export class AgentDO extends DurableObject<Env> {
       allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
     });
     this.journal = new BrokeredJournal(this.sql);
+    this.timerStore = new TimerStore(this.sql);
+    // Timers a rolled-back release left without their deadline are armed again at once (the alarm does too).
+    if (this.timerStore.names().length) void ctx.blockConcurrencyWhile(() => this.rearmTimers());
     this.outbox = new ClientOutbox(this.sql);
     this.traceRing = new TraceRing(this.sql);
     // A trace client's keepalive, answered by the runtime without waking this object. The runner sends only JSON objects, never this.
@@ -368,6 +377,8 @@ export class AgentDO extends DurableObject<Env> {
   }
   /** Every brokered action it ran or was refused (docs/agents/tools/#taint-and-sinks). */
   private readonly journal!: BrokeredJournal;
+  /** Its timers (lib/timers.ts): each row has its deadline, `timer:<name>`. */
+  private readonly timerStore!: TimerStore;
   /** Events for its client, until ClientDO has them (docs/control-plane/api/clients/#events-to-the-owner). */
   private readonly outbox!: ClientOutbox;
   /** Its live trace's recent events (docs/control-plane/api/#live-trace). */
@@ -497,7 +508,13 @@ export class AgentDO extends DurableObject<Env> {
       if (cur.cell !== req.cell) {
         throw new NestError(ErrorCodes.INVALID_MESSAGE, `${req.sandbox} is in cell ${cur.cell}; the agent must be too`, 409);
       }
-      await stub.attach(req.agent, undefined, req.spec.repos ?? [], req.spec.read_repos ?? []);
+      // Its client's bindings, push-token opt-ins and egress rules join the sandbox's while attached
+      // (docs/control-plane/api/clients/#injection, #egress).
+      await stub.attach(req.agent, undefined, req.spec.repos ?? [], req.spec.read_repos ?? [], {
+        ...(req.spec.inject?.length ? { inject: req.spec.inject } : {}), ...(req.spec.github_push?.workflows ? { workflows: true } : {}),
+        ...(req.spec.egress?.allow.length ? { egress: req.spec.egress.allow } : {}),
+        ...(req.spec.env && Object.keys(req.spec.env).length ? { env: req.spec.env } : {}),
+      });
       hands = { sandbox: req.sandbox };
     }
     if (this.exists()) return this.load();
@@ -1027,7 +1044,7 @@ export class AgentDO extends DurableObject<Env> {
    * (404), which every sender already reads as "drop it"; a start or a spawn it
    * would make is refused (409).
    */
-  private refuseEnded(info: AgentInfo, what: "turns" | "messages" | "starts" | "spawns"): void {
+  private refuseEnded(info: AgentInfo, what: "turns" | "messages" | "starts" | "spawns" | "timers"): void {
     if (!info.ended) return;
     const message = `${info.agent} has ended (${info.ended.reason}); it takes no more ${what}`;
     if (what === "turns" || what === "messages") throw new NestError(ErrorCodes.UNKNOWN_AGENT, message, 404);
@@ -1055,6 +1072,7 @@ export class AgentDO extends DurableObject<Env> {
       if (!i.brain) i.current_turn = null;
     });
     await Promise.all([this.deadlines.clear("intent"), this.deadlines.clear("wake"), this.deadlines.clear("wake_after_exit"), this.deadlines.set("end", now)]);
+    await this.dropTimers();
     console.log(`agent ${info.agent}: ended (${o.reason}) by ${o.by}${dropped ? `; ${dropped} turns dropped` : ""}`);
     if (before.intent !== null) await this.brainWaitEnded(info);
     await this.endBrain();
@@ -1829,7 +1847,11 @@ export class AgentDO extends DurableObject<Env> {
     for (const old of open.slice(0, Math.max(0, open.length - TRACE_SOCKETS_MAX))) this.closeTraceSocket(old, 4008, "too many trace sockets");
     const { gap, events } = this.traceRing.after(after, Date.now());
     const control = (m: TraceControl) => this.traceSendTo(ws, JSON.stringify(m));
-    let ok = gap ? control({ type: "gap", ...gap }) : true;
+    // Older than the ring (pruned, or from before it began): the trace history, from its seam back.
+    const seam = this.traceRing.seam();
+    const before = info.durable_bytes > 0 && after < (seam?.seq ?? this.traceRing.head() + 1) ? encodeCursor(this.historyCursor(info, seam)) : null;
+    let ok = gap ? control({ type: "gap", ...gap, ...(before ? { before } : {}) }) : true;
+    if (ok && before) ok = control({ type: "history", before });
     for (const ev of events) {
       if (!ok) break;
       ok = this.traceSendTo(ws, JSON.stringify(ev));
@@ -1843,6 +1865,35 @@ export class AgentDO extends DurableObject<Env> {
       control({ type: "live" });
     }
     return new Response(null, { status: 101, webSocket: pair[0], headers: { [TRACE_HEADER]: "1" } });
+  }
+
+  /**
+   * Where the trace history ends: before the ring's seam (its oldest event the transcript has too), or
+   * now when the ring has none. `c`: the seam starts a turn (or none runs), so the last turn before it
+   * is complete.
+   */
+  private historyCursor(info: AgentInfo, seam = this.traceRing.seam()): HistoryCursor {
+    return { b: info.base_gen, o: null, t: seam?.ts_ms ?? Date.now(), c: seam ? seam.type === "turn_started" : info.current_turn === null };
+  }
+
+  /**
+   * `GET /v1/agents/<id>/trace/history?before=<cursor>&limit=<n>` (docs/control-plane/api/#trace-history):
+   * the older events, from the committed transcript in R2, newest page first. Reads only: no brain, no
+   * sandbox. A cursor from another base (the transcript was rewritten since) starts over (`reset`).
+   */
+  async traceHistory(before?: string, limit = HISTORY_DEFAULT_LIMIT): Promise<HistoryPage & { reset?: true }> {
+    const info = this.load();
+    const cur = before === undefined ? this.historyCursor(info) : decodeCursor(before);
+    if (!cur) throw new NestError(ErrorCodes.INVALID_MESSAGE, "before is not a cursor the trace gave", 400);
+    if (cur.b !== info.base_gen) return { events: [], next_before: encodeCursor({ ...cur, b: info.base_gen, o: null }), reset: true };
+    const segments = this.sql
+      .exec<{ offset: number; len: number; key: string }>("SELECT offset, len, key FROM segments WHERE base = ? AND offset < ? ORDER BY offset", info.base_gen, info.durable_bytes)
+      .toArray();
+    const read = async (key: string) => {
+      const obj = await this.env.BUCKET.get(key);
+      return obj ? new Uint8Array(await obj.arrayBuffer()) : null;
+    };
+    return historyPage(segments, info.durable_bytes, cur, limit, this.traceRing.identity(), read);
   }
 
   private send(ws: WebSocket, msg: AgentToRunner): void {
@@ -2269,6 +2320,87 @@ export class AgentDO extends DurableObject<Env> {
     await this.syncActivity();
   }
 
+  // --- timers (docs/agents/capabilities/timers/) -------------------------------------------------
+
+  /**
+   * Set (or replace) a timer: its row and its deadline in one synchronous step, so a timer that is
+   * stored is always armed. A new name past `TIMERS_MAX` is refused.
+   */
+  private async setTimer(t: Timer, id: string): Promise<Timer> {
+    const info = this.load();
+    this.refuseEnded(info, "timers");
+    const row = this.timerStore.set(t, id);
+    if (!row) throw new NestError(ErrorCodes.FORBIDDEN, `at most ${TIMERS_MAX} timers: cancel one first (timer_list)`, 409);
+    const armed = this.deadlines.set(`${TIMER_DEADLINE}${t.name}`, t.at_ms);
+    this.traceEmit({ type: "timer_set", name: t.name, at_ms: t.at_ms, note: t.note });
+    await armed;
+    return t;
+  }
+
+  /** Cancel a timer (the agent's own, or its owner's route); whether there was one. */
+  private async cancelTimer(name: string, by: string): Promise<boolean> {
+    const gone = this.timerStore.delete(name);
+    const cleared = this.deadlines.clear(`${TIMER_DEADLINE}${name}`);
+    if (gone) this.traceEmit({ type: "timer_cancelled", name, by });
+    await cleared;
+    return gone;
+  }
+
+  /** Its timers, soonest first (`GET /v1/agents/<id>/timers`). */
+  async timers(): Promise<Timer[]> {
+    this.load();
+    return this.timerStore.list();
+  }
+
+  /** The owner cancels one (`DELETE /v1/agents/<id>/timers/<name>`): 404 when there is none. */
+  async cancelTimerFor(name: string, by: string): Promise<void> {
+    this.load();
+    if (!(await this.cancelTimer(name, by))) throw new NestError(ErrorCodes.NOT_FOUND, `no timer ${name}`, 404);
+  }
+
+  /** Arm every timer that has no deadline (a release without the handler dropped it): late, never lost. */
+  private async rearmTimers(): Promise<void> {
+    for (const t of this.timerStore.list()) {
+      const key = `${TIMER_DEADLINE}${t.name}` as const;
+      if (!this.deadlines.has(key)) await this.deadlines.set(key, t.at_ms);
+    }
+  }
+
+  /** An end drops every timer: nobody would hear it. */
+  private async dropTimers(): Promise<void> {
+    for (const name of this.timerStore.names()) {
+      this.timerStore.delete(name);
+      await this.deadlines.clear(`${TIMER_DEADLINE}${name}`);
+    }
+  }
+
+  /**
+   * A timer's deadline came: its input goes to the agent as an inbox message does (mid-turn, into the
+   * running turn; otherwise a turn of its own, which wakes a brain), keyed by the timer's id so a retried
+   * alarm posts it once, and only then is its row deleted. One cancelled or ended is dropped; one set
+   * again for later (its row's time ahead) is armed for that time.
+   */
+  private async timerFired(name: string): Promise<void> {
+    if (!this.exists()) return;
+    const row = this.timerStore.get(name);
+    if (!row) return;
+    if (row.at_ms > Date.now()) {
+      await this.deadlines.set(`${TIMER_DEADLINE}${name}`, row.at_ms);
+      return;
+    }
+    const info = this.load();
+    if (info.ended) {
+      this.timerStore.delete(name, row.id);
+      return;
+    }
+    await this.postInbox(TIMER_SENDER, timerFiredText(name, row.note), false, `timer/${row.id}`);
+    // Re-read: only this timer goes (one set again during the post keeps its row and deadline).
+    if (!this.timerStore.delete(name, row.id)) return;
+    const after = this.load();
+    this.traceEmit({ type: "timer_fired", name, note: row.note });
+    this.emit(after, `${after.agent}/timer/${row.id}`, { type: "agent.timer_fired", agent: after.agent, timer: name, note: row.note });
+  }
+
   async turns(): Promise<{ turn: string; status: TurnStatus; input: TurnInput }[]> {
     return this.queue.list();
   }
@@ -2488,7 +2620,7 @@ export class AgentDO extends DurableObject<Env> {
       throw new NestError(ErrorCodes.FORBIDDEN, `${name} is not granted to this agent`, 403);
     }
     // Spawning and ending need a brain: nothing inside a sandbox may ask for them.
-    if (guest && LIFECYCLE_TOOLS.includes(name)) throw new NestError(ErrorCodes.FORBIDDEN, `${name} isn't callable from a sandbox`, 403);
+    if (guest && (LIFECYCLE_TOOLS.includes(name) || TIMER_TOOLS.includes(name))) throw new NestError(ErrorCodes.FORBIDDEN, `${name} isn't callable from a sandbox`, 403);
     const a = validateArgs(def.input_schema, args);
     const text = (t: string): ToolOutcome => ({ status: "ok", content: [{ type: "text", text: t }] });
     // A guest call is keyed by the sandbox lease it was relayed under.
@@ -2555,6 +2687,32 @@ export class AgentDO extends DurableObject<Env> {
         return await this.brokeredTool(info, epoch, call, String(a.action), a.args, guest, fence);
       case "egress_policy":
         return await this.egressTool(info, epoch, call, a, guest, fence, live);
+      case "timer_set": {
+        const p = TimerSetArgs.safeParse(a);
+        if (!p.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, p.error.issues.map((i) => i.message).join("; "));
+        const due = timerDue(p.data, Date.now());
+        if (!due.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, due.error);
+        await live();
+        const t = await this.setTimer({ name: p.data.name, at_ms: due.at_ms, note: p.data.note ?? "", set_ms: Date.now() }, key);
+        return { status: "ok", content: [
+          { type: "text", text: `Timer ${t.name} fires at ${new Date(t.at_ms).toISOString()} (in ${Math.round((t.at_ms - Date.now()) / 1000)} s), as an inbox message. End your turn to wait for it; an inbox message may wake you first.` },
+          { type: "json", value: t },
+        ] };
+      }
+      case "timer_cancel": {
+        const n = TimerName.safeParse(a.name);
+        if (!n.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, n.error.issues[0]!.message);
+        await live();
+        const gone = await this.cancelTimer(n.data, info.agent);
+        return text(gone ? `Timer ${n.data} cancelled.` : `No timer ${n.data}.`);
+      }
+      case "timer_list": {
+        const timers = this.timerStore.list();
+        return { status: "ok", content: [
+          { type: "text", text: timers.length ? timers.map((t) => `${t.name}: ${new Date(t.at_ms).toISOString()}${t.note ? ` (${t.note})` : ""}`).join("\n") : "No timers." },
+          { type: "json", value: { timers } },
+        ] };
+      }
       default:
         throw new NestError(ErrorCodes.NOT_IMPLEMENTED, `${name} is not implemented yet`, 501);
     }
@@ -3033,11 +3191,14 @@ export class AgentDO extends DurableObject<Env> {
       if (e?.done_ms && !this.deadlines.has("reap")) await this.deadlines.set("reap", e.ms + AGENT_RECORD_RETENTION_MS);
       // An agent from before the registry (or whose registration failed) registers at its next alarm.
       if (this.kvGet<string>("registry") !== this.registryWanted() && !this.deadlines.has("registry")) await this.deadlines.set("registry", Date.now());
+      // Timers whose deadline a rolled-back release dropped (no handler for `timer:`): armed again.
+      await this.rearmTimers();
       // Events whose hand-off a rolled-back release dropped (no handler for `client_events`).
       if (this.outbox.waiting() && !this.deadlines.has("client_events")) await this.deadlines.set("client_events", Date.now());
     }
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key.startsWith(ASK_DEADLINE)) return this.askWindowLapsed(key.slice(ASK_DEADLINE.length));
+      if (key.startsWith(TIMER_DEADLINE)) return this.timerFired(key.slice(TIMER_DEADLINE.length));
       const run = handlers[key as AgentDeadline] as (() => Promise<void>) | undefined;
       if (run) await run();
       else console.error(`agent ${this.load().agent}: no handler for deadline ${key}; dropped`);

@@ -26,7 +26,7 @@ suspended → archived (S3 only) → restore in the cell: disk on any host, memo
 | Live (designed, not built) | Pause, write a full memory snapshot, resume the parent; the child restores from the same chunks | 1–2 s pause for 2–4 GB |
 | Same host (designed, not built) | The child reads the parent's snapshot from page cache | Near-instant |
 
-**Built:** disk-only forks, which restore on any host in the cell. Live and same-host forks wait with [memory snapshots](state/memory/).
+**Built in nestd only:** disk-only forks (`sandbox_fork`), which restore on any host in the cell; the control plane doesn't send them yet, so `fork_sandbox` answers `not_implemented`. Live and same-host forks wait with [memory snapshots](state/memory/).
 
 After a fork, the guest agent reseeds randomness (VMGenID), resyncs the clock (VMClock where the guest kernel supports it), and sets a new machine-id and hostname. Firecracker calls resuming one snapshot more than once insecure, so a live fork treats userspace RNG state and other process state as duplicated. Forking an agent's conversation is a separate step (`--fork-session`).
 

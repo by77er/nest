@@ -16,7 +16,7 @@
 - **No proxy decrypts, injects or rewrites OAuth traffic.**
 - The token never enters a VM.
 - Usage stays within ordinary personal use; the [scheduler](../../orchestration/scheduling/) caps concurrency. The terms give no number for "ordinary".
-- **Single owner only.** Products built for others should use API keys ([Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)). Anything multi-user, other people's agents on my token, or others reaching the Discord bot needs written clearance from Anthropic first.
+- **Single owner only.** Products built for others should use API keys ([Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)). Anything multi-user, or other people's agents on my token, needs written clearance from Anthropic first.
 
 **Platform-owned API usage:** only the [api-loop backend](../../agents/backends/api-loop/), deferred until the API credits are picked up, with a key the control plane holds.
 

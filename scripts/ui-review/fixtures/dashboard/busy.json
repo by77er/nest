@@ -1,0 +1,455 @@
+{
+ "now": 1793538952229,
+ "cells": {
+  "cells": [
+   "use1"
+  ],
+  "control_plane": "https://nest.example"
+ },
+ "fleet": {
+  "hosts": [
+   {
+    "host": "hst_01m6busyx9q8w7e6r5kkk63z",
+    "role": "sandbox",
+    "instance_id": "i-0busy1",
+    "status": "active",
+    "idle_since": null,
+    "enrolled_ms": 1793535252229,
+    "last_rx": 1793538950229,
+    "tunnel_hostname": "h1-sbx-nest.example",
+    "tunnel_state": "connected",
+    "capacity": {
+     "vcpus_free": 2,
+     "memory_mib_free": 4096,
+     "hugepages_mib_free": 8192,
+     "hugepages_mib_total": 8192,
+     "sandboxes": 0,
+     "agents": 0,
+     "warm": []
+    },
+    "leases": 1,
+    "connected": true,
+    "sandboxes": [
+     {
+      "sandbox": "sbx_01m6busyx9q8w7e6r5kkk63z",
+      "epoch": 1,
+      "state": "running",
+      "vcpus": 2,
+      "memory_mib": 4096
+     },
+     {
+      "sandbox": "sbx_01m6busyx9q8w7e6r5kkkc7y",
+      "epoch": 1,
+      "state": "running",
+      "vcpus": 2,
+      "memory_mib": 4096
+     },
+     {
+      "sandbox": "sbx_01m6busyx9q8w7e6r5kkkibx",
+      "epoch": 1,
+      "state": "failed",
+      "vcpus": 2,
+      "memory_mib": 4096
+     }
+    ],
+    "agents": [],
+    "wedged_ms": null,
+    "lost": false,
+    "brain_epochs": true,
+    "max_brains": null
+   },
+   {
+    "host": "hst_01m6busyx9q8w7e6r5kkkc7y",
+    "role": "sandbox",
+    "instance_id": "i-0busy2",
+    "status": "active",
+    "idle_since": null,
+    "enrolled_ms": 1793531552229,
+    "last_rx": 1793538950229,
+    "tunnel_hostname": "h2-sbx-nest.example",
+    "tunnel_state": "connecting",
+    "capacity": {
+     "vcpus_free": 8,
+     "memory_mib_free": 16384,
+     "hugepages_mib_free": 8192,
+     "hugepages_mib_total": 8192,
+     "sandboxes": 0,
+     "agents": 0,
+     "warm": []
+    },
+    "leases": 1,
+    "connected": true,
+    "sandboxes": [
+     {
+      "sandbox": "sbx_01m6busyx9q8w7e6r5kkkofw",
+      "epoch": 1,
+      "state": null,
+      "vcpus": 2,
+      "memory_mib": 4096
+     },
+     {
+      "sandbox": "sbx_01m6busyx9q8w7e6r5kkkujv",
+      "epoch": 1,
+      "state": "suspending",
+      "vcpus": 2,
+      "memory_mib": 4096
+     }
+    ],
+    "agents": [],
+    "wedged_ms": null,
+    "lost": false,
+    "brain_epochs": true,
+    "max_brains": null
+   },
+   {
+    "host": "hst_01m6busyx9q8w7e6r5kkkibx",
+    "role": "brain",
+    "instance_id": "i-0busy3",
+    "status": "active",
+    "idle_since": null,
+    "enrolled_ms": 1793527852229,
+    "last_rx": 1793538950229,
+    "tunnel_hostname": null,
+    "tunnel_state": "none",
+    "capacity": {
+     "vcpus_free": 8,
+     "memory_mib_free": 16384,
+     "hugepages_mib_free": 8192,
+     "hugepages_mib_total": 8192,
+     "sandboxes": 0,
+     "agents": 0,
+     "warm": []
+    },
+    "leases": 1,
+    "connected": true,
+    "sandboxes": [],
+    "agents": [
+     "agt_01m6busyx9q8w7e6r5kkk63z",
+     "agt_01m6busyx9q8w7e6r5kkkc7y",
+     "agt_01m6busyx9q8w7e6r5kkkibx",
+     "agt_01m6busyx9q8w7e6r5kkkofw"
+    ],
+    "wedged_ms": 1793538532229,
+    "lost": false,
+    "brain_epochs": true,
+    "max_brains": 8
+   }
+  ],
+  "launches": [
+   {
+    "instance_id": "i-0f1e2d3c4b5a69788",
+    "launched_ms": 1792841591472,
+    "host": "hst_01m5pv156anzgr2gqs5stpewgt",
+    "reason": null,
+    "ended_ms": null
+   }
+  ],
+  "sandboxes": [
+   {
+    "sandbox": "sbx_01m6busyx9q8w7e6r5kkk63z",
+    "registered_ms": 1793537052229,
+    "host": "hst_01m6busyx9q8w7e6r5kkk63z",
+    "epoch": 1,
+    "lease_state": "running",
+    "sandbox_state": "running",
+    "image": "nest-base:latest",
+    "info_error": false
+   },
+   {
+    "sandbox": "sbx_01m6busyx9q8w7e6r5kkkc7y",
+    "registered_ms": 1793535152229,
+    "host": "hst_01m6busyx9q8w7e6r5kkk63z",
+    "epoch": 1,
+    "lease_state": "running",
+    "sandbox_state": "running",
+    "image": "nest-rust:2026-10",
+    "info_error": false
+   },
+   {
+    "sandbox": "sbx_01m6busyx9q8w7e6r5kkkibx",
+    "registered_ms": 1793533252229,
+    "host": "hst_01m6busyx9q8w7e6r5kkk63z",
+    "epoch": 1,
+    "lease_state": "failed",
+    "sandbox_state": "failed",
+    "image": "nest-base:latest",
+    "info_error": false
+   },
+   {
+    "sandbox": "sbx_01m6busyx9q8w7e6r5kkkofw",
+    "registered_ms": 1793531352229,
+    "host": "hst_01m6busyx9q8w7e6r5kkkc7y",
+    "epoch": 1,
+    "lease_state": null,
+    "sandbox_state": "creating",
+    "image": "nest-base:latest",
+    "info_error": false
+   },
+   {
+    "sandbox": "sbx_01m6busyx9q8w7e6r5kkkujv",
+    "registered_ms": 1793529452229,
+    "host": "hst_01m6busyx9q8w7e6r5kkkc7y",
+    "epoch": 1,
+    "lease_state": "suspending",
+    "sandbox_state": "suspending",
+    "image": "nest-rust:2026-10",
+    "info_error": false
+   },
+   {
+    "sandbox": "sbx_01m6busyx9q8w7e6r5kk10nu",
+    "registered_ms": 1793527552229,
+    "host": null,
+    "epoch": 1,
+    "lease_state": null,
+    "sandbox_state": "suspended",
+    "image": "nest-base:latest",
+    "info_error": false
+   },
+   {
+    "sandbox": "sbx_01m6busyx9q8w7e6r5kk16rt",
+    "registered_ms": 1793525652229,
+    "host": null,
+    "epoch": 1,
+    "lease_state": null,
+    "sandbox_state": "archived",
+    "image": "nest-base:latest",
+    "info_error": false
+   },
+   {
+    "sandbox": "sbx_01m6busyx9q8w7e6r5kk1cvs",
+    "registered_ms": 1793523752229,
+    "host": null,
+    "epoch": 1,
+    "lease_state": null,
+    "sandbox_state": "restoring",
+    "image": "nest-base:latest",
+    "info_error": false
+   }
+  ],
+  "aws": {
+   "cell": "use1",
+   "region": "us-east-1",
+   "credentials": true,
+   "kms_key": true
+  }
+ },
+ "images": {
+  "current": "ami-0a1b2c3d4e5f60718",
+  "current_since_ms": 1761213600000,
+  "images": [
+   {
+    "image_id": "ami-0a1b2c3d4e5f60718",
+    "name": "nest-use1-host-2026-10-23",
+    "created": "2026-10-23T10:00:00.000Z",
+    "state": "available",
+    "size_gib": 30,
+    "tags": {
+     "nest": "true"
+    }
+   }
+  ],
+  "templates": [
+   {
+    "name": "nest-base:latest",
+    "default": true,
+    "source": "release (nest-base.ext4.zst)",
+    "in_use": 1
+   },
+   {
+    "name": "nest-rust:2026-10",
+    "default": false,
+    "source": "release (nest-rust.ext4.zst)",
+    "in_use": 2
+   }
+  ]
+ },
+ "agents": {
+  "agents": [
+   {
+    "agent": "agt_01m6busyx9q8w7e6r5kkk63z",
+    "info": {
+     "agent": "agt_01m6busyx9q8w7e6r5kkk63z",
+     "template": "worker",
+     "lifecycle": "ready",
+     "activity": "working",
+     "state": "working",
+     "current_turn": "trn_01m690rb2873zsf1n88qp8neer",
+     "brain": {
+      "host": "hst_01m6busyx9q8w7e6r5kkkibx",
+      "phase": "live",
+      "since_ms": 1793538352229
+     },
+     "sandbox": "sbx_01m6busyx9q8w7e6r5kkk63z"
+    },
+    "error": null
+   },
+   {
+    "agent": "agt_01m6busyx9q8w7e6r5kkkc7y",
+    "info": {
+     "agent": "agt_01m6busyx9q8w7e6r5kkkc7y",
+     "template": "reviewer",
+     "lifecycle": "ready",
+     "activity": "waiting_input",
+     "state": "waiting_input",
+     "current_turn": null,
+     "brain": {
+      "host": "hst_01m6busyx9q8w7e6r5kkkibx",
+      "phase": "live",
+      "since_ms": 1793537752229
+     },
+     "sandbox": "sbx_01m6busyx9q8w7e6r5kkkc7y"
+    },
+    "error": null
+   },
+   {
+    "agent": "agt_01m6busyx9q8w7e6r5kkkibx",
+    "info": {
+     "agent": "agt_01m6busyx9q8w7e6r5kkkibx",
+     "template": "lead",
+     "lifecycle": "errored",
+     "activity": null,
+     "state": "errored",
+     "current_turn": null,
+     "brain": {
+      "host": "hst_01m6busyx9q8w7e6r5kkkibx",
+      "phase": "condemned",
+      "since_ms": 1793538052229
+     },
+     "sandbox": null
+    },
+    "error": null
+   },
+   {
+    "agent": "agt_01m6busyx9q8w7e6r5kkkofw",
+    "info": {
+     "agent": "agt_01m6busyx9q8w7e6r5kkkofw",
+     "template": "worker",
+     "lifecycle": "ready",
+     "activity": "idle",
+     "state": "ready",
+     "current_turn": null,
+     "brain": {
+      "host": "hst_01m6busyx9q8w7e6r5kkkibx",
+      "phase": "live",
+      "since_ms": 1793536552229
+     },
+     "sandbox": "sbx_01m6busyx9q8w7e6r5kkkc7y"
+    },
+    "error": null
+   }
+  ],
+  "omitted": 0
+ },
+ "lifetimes": {
+  "cell": "use1",
+  "now_ms": 1793538952229,
+  "quiet_ms": 86400000,
+  "cell_idle_ttl_ms": 86400000,
+  "sandboxes": [
+   {
+    "sandbox": "sbx_01m6bkz8bcy73g7rrvgfggpgfh",
+    "kind": "dormant",
+    "registered_ms": 1793538892144,
+    "state": "suspended",
+    "host": "hst_01m6bkz8aaap56a16tbgjd63n9",
+    "owner": null,
+    "attached": [],
+    "idle_ttl_ms": 86400000,
+    "own_ttl": false,
+    "dormant_since_ms": 1793538892157,
+    "expiry_notice_ms": null,
+    "destroy_at_ms": 1793625292157,
+    "generations": 0,
+    "memory_generations": 0,
+    "error": null
+   },
+   {
+    "sandbox": "sbx_01m6bkz8c36t7knvgd3k2zcjys",
+    "kind": "held",
+    "registered_ms": 1793538892169,
+    "state": "suspended",
+    "host": "hst_01m6bkz8aaap56a16tbgjd63n9",
+    "owner": null,
+    "attached": [
+     "agt_01m6bkz8dcfjdhvb67rwrty02t"
+    ],
+    "idle_ttl_ms": 86400000,
+    "own_ttl": false,
+    "dormant_since_ms": null,
+    "expiry_notice_ms": null,
+    "destroy_at_ms": null,
+    "generations": 0,
+    "memory_generations": 0,
+    "error": null
+   }
+  ],
+  "agents": [
+   {
+    "agent": "agt_01m6bkz8dcfjdhvb67rwrty02t",
+    "kind": "quiet",
+    "template": "worker",
+    "owner": "agt_01m6bkz8d14e57s4kkhjxhvm9s",
+    "sandbox": "sbx_01m6bkz8c36t7knvgd3k2zcjys",
+    "last_turn_ms": 1793279692222,
+    "stopped_by_operator": true,
+    "live_children": [],
+    "ended_ms": null,
+    "ended_reason": null,
+    "found_via": "registry",
+    "error": null
+   },
+   {
+    "agent": "agt_01m6bkz8d14e57s4kkhjxhvm9s",
+    "kind": "quiet",
+    "template": "lead",
+    "owner": null,
+    "sandbox": null,
+    "last_turn_ms": null,
+    "stopped_by_operator": false,
+    "live_children": [
+     "agt_01m6bkz8dcfjdhvb67rwrty02t"
+    ],
+    "ended_ms": null,
+    "ended_reason": null,
+    "found_via": "registry",
+    "error": null
+   },
+   {
+    "agent": "agt_01m6busyx9q8w7e6r5kk1izr",
+    "kind": "ending",
+    "template": "worker",
+    "owner": null,
+    "sandbox": null,
+    "last_turn_ms": 1793106952229,
+    "stopped_by_operator": false,
+    "live_children": [],
+    "ended_ms": 1793531752229,
+    "ended_reason": "done",
+    "found_via": "registry",
+    "error": null
+   }
+  ],
+  "counts": {
+   "sandboxes": {
+    "dormant": 1,
+    "held": 1,
+    "unknown": 0,
+    "in_use": 5,
+    "destroyed": 0,
+    "unreadable": 0
+   },
+   "agents": {
+    "quiet": 2,
+    "ending": 1,
+    "gone": 0,
+    "unreadable": 0,
+    "active": 4,
+    "recent": 0,
+    "ended": 0
+   }
+  },
+  "agents_omitted": 0,
+  "pages": 1,
+  "truncated": false
+ }
+}

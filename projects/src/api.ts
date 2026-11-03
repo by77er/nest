@@ -6,10 +6,12 @@ import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { clientIdOf, NestError, nestFrom } from "./nest";
+import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, rulesProblems } from "./network";
+import { prNumberOf } from "./prs";
 import { nestSecretName, type SecretGrant, secretProblems, valueProblem } from "./secrets";
-import { AddDependency, PutSecret, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
+import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Network, PutSecret, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
-import { proxyTrace } from "./trace";
+import { proxyTrace, proxyTraceHistory } from "./trace";
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
@@ -59,6 +61,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
 
   // An agent's live trace, a WebSocket proxied to nest (src/trace.ts).
   if (parts[0] === "agents" && parts.length === 3 && parts[2] === "trace") return proxyTrace(req, env, parts[1]!, url);
+  if (parts[0] === "agents" && parts.length === 4 && parts[2] === "trace" && parts[3] === "history") return proxyTraceHistory(req, env, parts[1]!, url);
   if (parts[0] !== "projects") return err(404, "unknown route");
   if (parts.length === 1) {
     // Each with `needs_you`: how many asks and blocked tasks wait on the owner (README.md#blocked).
@@ -123,7 +126,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "GET secrets": {
       // Metadata only: the app's, with nest's last injection and size; never a value.
-      const [mine, g] = await Promise.all([p.secrets(), grantOf(env)]);
+      const [mine, g, layers] = await Promise.all([p.secrets(), grantOf(env), p.network()]);
       if (!mine.ok) return done(mine);
       const nest = nestFrom(env);
       let theirs: Map<string, { size: number; last_injected_ms: number | null }> = new Map();
@@ -141,6 +144,8 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
         }),
         grant: g.ok ? { ...g.value, used: theirs.size } : null,
         client: clientIdOf(env.NEST_CLIENT_TOKEN),
+        // Each live agent's client layer, which carries its bindings and variables (shared with the Network page).
+        agents: layers.ok ? layers.value.agents : [],
       });
     }
     case "PUT secrets/:name": {
@@ -149,7 +154,9 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       if (!b.ok) return b.res;
       const { value, ...meta } = b.value;
       const g = await grantOf(env);
-      const problems = secretProblems({ name, ...meta }, g.ok ? g.value : null);
+      const others = await p.secrets();
+      const taken = others.ok ? others.value.filter((x) => x.name !== name).map((x) => x.env) : [];
+      const problems = secretProblems({ name, ...meta }, g.ok ? g.value : null, taken);
       if (value !== undefined) {
         const v = valueProblem(value, g.ok ? g.value : null);
         if (v) problems.value = v;
@@ -265,6 +272,23 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const b = await body(req, Answer);
       return b.ok ? done(await p.answerAsk(ask, b.value.answer)) : b.res;
     }
+    case "GET waits":
+      return done(await p.waits());
+    case "GET network":
+      return networkView(env, p);
+    case "PUT network": {
+      const b = await body(req, Network);
+      if (!b.ok) return b.res;
+      const g = await egressHostsOf(env);
+      if (!g.ok) return err(g.status, g.error);
+      const problems = Object.fromEntries(NETWORK_ROLES.flatMap((role) => Object.entries(rulesProblems(normalizeRules(b.value[role]), g.value)).map(([k, v]) => [`${role}.${k}`, v])));
+      if (Object.keys(problems).length) {
+        const outside = Object.values(problems).some((v) => v.includes("must widen"));
+        return json({ error: Object.values(problems).join("; "), problems }, outside ? 403 : 400);
+      }
+      const r = await p.setNetwork(b.value);
+      return r.ok ? networkView(env, p, r.value) : done(r);
+    }
     case "GET errors":
       return done(await p.errors());
     default:
@@ -272,14 +296,40 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   }
 }
 
-/** A PR's number from what the owner gave: `12`, `#12`, or the PR's URL on this repo. */
-export function prNumberOf(v: number | string, repo: string): number | null {
-  if (typeof v === "number") return Number.isSafeInteger(v) && v > 0 ? v : null;
-  const t = v.trim();
-  const n = /^#?([1-9][0-9]{0,9})$/.exec(t)?.[1];
-  if (n) return Number(n);
-  const u = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/pull\/([1-9][0-9]{0,9})\/?(?:[#?].*)?$/i.exec(t);
-  return u && u[1]!.toLowerCase() === repo.toLowerCase() ? Number(u[2]) : null;
+/** The grant's `egress_hosts` (`GET /v1/clients/self`): the ceiling of every network rule. */
+async function egressHostsOf(env: Env): Promise<Result<string[]>> {
+  const nest = nestFrom(env);
+  if (!nest) return { ok: false, status: 503, error: "NEST_CLIENT_TOKEN is not set" };
+  try {
+    return { ok: true, value: (await nest.self()).grant?.egress_hosts ?? [] };
+  } catch (e) {
+    return { ok: false, status: 502, error: `nest's grant couldn't be read: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/**
+ * The Network page's view: the rules and each live agent's layer (ProjectDO's), the grant's ceiling,
+ * and the operator's rules (nest's defaults, the operator's layer and the repo allowlists', `operatorRules`) as the manager's
+ * sandbox's effective policy shows them (a client may read its own sandboxes' policy; null until the
+ * manager runs, or when nest can't be read).
+ */
+async function networkView(env: Env, p: ReturnType<typeof project>, have?: Awaited<ReturnType<ReturnType<typeof project>["network"]>> extends Result<infer T> ? T : never): Promise<Response> {
+  const mine = have ? { ok: true as const, value: have } : await p.network();
+  if (!mine.ok) return err(mine.status, mine.error);
+  const [grant, sandbox] = await Promise.all([egressHostsOf(env), p.managerSandbox()]);
+  let base: OperatorRule[] | null = null;
+  const nest = nestFrom(env);
+  if (nest && sandbox) {
+    try {
+      const allow = (await nest.sandboxPolicy(sandbox)).allow ?? [];
+      // The client's own layer is needed only by the fallback for a control plane without `source`.
+      const own = allow.some((r) => r.source !== undefined) ? [] : ((await nest.getClientPolicy(sandbox)).egress?.allow ?? []);
+      base = operatorRules(allow, own);
+    } catch {
+      base = null;
+    }
+  }
+  return json({ ...mine.value, egress_hosts: grant.ok ? grant.value : null, base });
 }
 
 /** The parts of the app's grant secrets need, from `GET /v1/clients/self` (docs/control-plane/api/clients/#clients-and-grants). */
