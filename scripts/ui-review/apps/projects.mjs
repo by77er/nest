@@ -7,6 +7,24 @@ const DESKTOP = [1440, 1280];
 /** Waits for an element TanStack Query shows only after its retries (about 7 s for an error). */
 const shown = (selector) => (p) => p.locator(selector).first().waitFor({ timeout: 30_000 });
 const PHONE = [390];
+/** Waits for the drawer's task, then scrolls the drawer to a section (by its heading) or an element. */
+const drawerAt = (target) => async (p) => {
+  const el = target.startsWith("[") ? p.locator(target).first() : p.getByRole("heading", { name: target, exact: true });
+  await el.waitFor({ timeout: 15_000 });
+  // Scrolled to the top, then down from under the drawer's sticky header.
+  await el.evaluate((e) => {
+    e.scrollIntoView({ block: "start" });
+    let s = e.parentElement;
+    while (s && !(s.scrollHeight > s.clientHeight && /auto|scroll/.test(getComputedStyle(s).overflowY))) s = s.parentElement;
+    s?.scrollBy(0, -96);
+  });
+};
+/** Opens a drawer picker (scrolled into view first, so its list opens on screen), optionally typing a search. */
+const picker = (heading, button, search) => async (p) => {
+  await drawerAt(heading)(p);
+  await p.getByRole("button", { name: button }).click();
+  if (search) await p.keyboard.type(search);
+};
 
 /** At 1280 px and up, the board's six columns fit beside the sidebar without scrolling. */
 async function sixColumns(page, { width }) {
@@ -54,6 +72,20 @@ export default {
     { name: "board-long", section: "project", path: "/projects/prj_demo/board", fixture: "long" },
     { name: "board-needs-you-all", section: "project", path: "/projects/prj_demo/board", after: (p) => p.getByRole("button", { name: /Show all/ }).click() },
     { name: "drawer", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false },
+    // A task's PRs and dependencies (PR #127): several PRs in mixed states, a task waiting on others,
+    // one that others wait on, one that's over; both pickers, open and with no match; the card's tooltip.
+    { name: "board-waiting-tooltip", section: "project", path: "/projects/prj_demo/board", full: false, after: async (p) => { const b = p.locator("[data-task=tsk_demo4] [data-marker=waiting]"); await b.scrollIntoViewIfNeeded(); await b.focus(); } },
+    { name: "drawer-prs", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: drawerAt("Pull requests") },
+    { name: "drawer-prs-deps", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: drawerAt("Dependencies") },
+    { name: "drawer-waiting", section: "project", path: "/projects/prj_demo/board?task=tsk_demo4", full: false },
+    { name: "drawer-waiting-deps", section: "project", path: "/projects/prj_demo/board?task=tsk_demo4", full: false, after: drawerAt("Pull requests") },
+    { name: "drawer-blocks-deps", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false, after: drawerAt("Pull requests") },
+    { name: "drawer-deps-done", section: "project", path: "/projects/prj_demo/board?task=tsk_demo6", full: false, after: drawerAt("Dependencies") },
+    { name: "drawer-over", section: "project", path: "/projects/prj_demo/board?task=tsk_demo9", full: false, after: drawerAt("Pull requests") },
+    { name: "attach-picker-open", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: picker("[data-pr='124']", "Attach PR") },
+    { name: "attach-picker-empty", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: picker("[data-pr='124']", "Attach PR", "zzz") },
+    { name: "task-picker-open", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false, after: picker("Dependencies", "Add dependency") },
+    { name: "task-picker-empty", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false, after: picker("Dependencies", "Add dependency", "zzz") },
     { name: "new-task", section: "project", path: "/projects/prj_demo/board", full: false, after: (p) => p.getByRole("button", { name: "New task" }).click() },
     { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false },
     { name: "manager-trace", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false },
