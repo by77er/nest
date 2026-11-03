@@ -84,6 +84,7 @@ async function sixColumns(page, { width }) {
 // acts like a reader (the wheel) and leaves what it measured for `check`.
 
 const bubbles = (p) => p.evaluate(() => [...document.querySelectorAll("[data-ds=bubble]")].map((b) => Math.round(b.getBoundingClientRect().top)));
+const bottoms = (p) => p.evaluate(() => [...document.querySelectorAll("[data-ds=bubble]")].map((b) => Math.round(b.getBoundingClientRect().bottom)));
 /** The room between the newest message and the docked composer (negative: under it). */
 const gapAbove = (p) => p.evaluate(() => {
   const last = [...document.querySelectorAll("[data-ds=bubble]")].at(-1)?.getBoundingClientRect();
@@ -94,9 +95,9 @@ const gapAbove = (p) => p.evaluate(() => {
 const MIN_GAP = 12;
 const endProblems = (gap, when) => (gap === null ? [`${when}: no message or composer`] : gap < MIN_GAP ? [`${when}, the newest message is ${gap} px from the composer (at least ${MIN_GAP})`] : []);
 /**
- * Scroll up like a reader, and the first message whose top is in view: its index and top. That's the line
- * the browser anchors on (the first visible in order), so growth above it mustn't move it; growth inside
- * the view moves what's below, as it should.
+ * Scroll up like a reader, and the first message in view, even if cut by the top: its index and top.
+ * That's the message the browser anchors on (the first visible in order; only whole messages anchor), so
+ * growth above it mustn't move it, while growth inside the view moves what's below, as it should.
  */
 async function readBack(p, width) {
   await p.mouse.move(width / 2, 300);
@@ -106,7 +107,8 @@ async function readBack(p, width) {
   }
   await p.waitForTimeout(300);
   const tops = await bubbles(p);
-  const i = tops.findIndex((t) => t >= 0);
+  const ends = await bottoms(p);
+  const i = ends.findIndex((b) => b > 0);
   return { i, top: tops[i] };
 }
 /** The fixture's answer for a path, as `serve` gives it. */
