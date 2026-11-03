@@ -334,7 +334,13 @@ struct MockFleet {
     reject_next: Arc<Mutex<Option<String>>>,
 }
 
+/// A lease that lapses 500 ms after the last acknowledged heartbeat, so a partition fences quickly.
+/// A test whose subject isn't a lapse uses [`STEADY_LEASE`]: on a loaded machine (CI, a parallel
+/// build) 500 ms without a heartbeat answer happens, and the self-fence it causes retires (and
+/// deletes) what the test is still using.
 const LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, cp_expiry_ms: 800 };
+/// A lease no load lapses within a test.
+const STEADY_LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 60_000, cp_expiry_ms: 90_000 };
 
 /// Mock FleetDO. Accepts reconnects. While `partition` is set it answers nothing on the open
 /// connection and refuses new ones (a network partition); clearing it lets the host reconnect.
@@ -342,6 +348,11 @@ const LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, c
 /// resends those past the hello's `last_command_seq`: a batch sent on a connection the host was
 /// already dropping (after a retryable error) is not lost.
 async fn mock_fleet() -> MockFleet {
+    mock_fleet_with(LEASE).await
+}
+
+/// [`mock_fleet`], granting `lease` in every hello_ack.
+async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
     let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/v1/fleet", l.local_addr().unwrap());
     let log = Arc::new(Mutex::new(FleetLog::default()));
@@ -401,7 +412,7 @@ async fn mock_fleet() -> MockFleet {
                                     unacked.retain(|s, _| *s > done.0);
                                 }
                                 log2.lock().unwrap().hellos.push(*h);
-                                let ack = HelloAck { protocol_version: 1, server_ms: 0, last_event_seq: last_event_seq.map(Seq), lease: LEASE, host_token_expires_ms: 0, next_command_seq: None };
+                                let ack = HelloAck { protocol_version: 1, server_ms: 0, last_event_seq: last_event_seq.map(Seq), lease, host_token_expires_ms: 0, next_command_seq: None };
                                 if ws.send(send(FleetToHost::HelloAck(ack))).await.is_err() { break; }
                                 for (s, cmds) in &unacked {
                                     let _ = ws.send(send(FleetToHost::Commands { seq: Seq(*s), commands: cmds.clone() })).await;
@@ -2039,6 +2050,22 @@ fn sandbox_meta(dir: &Path, sandbox: &str, epoch: u64) -> nestd::recovery::Sandb
     nestd::recovery::read_meta(&dir.join("state/sandboxes").join(sandbox).join(epoch.to_string())).expect("meta.json")
 }
 
+/// No sandbox was fenced so far: a test that expects none says so before it relies on it.
+fn assert_no_fence(fleet: &MockFleet) {
+    let fenced: Vec<String> = fleet
+        .log
+        .lock()
+        .unwrap()
+        .events
+        .iter()
+        .filter_map(|e| match &e.body {
+            HostEventBody::SandboxState { sandbox, state: SandboxState::Fenced, detail, .. } => Some(format!("{} ({})", sandbox.0, detail.clone().unwrap_or_default())),
+            _ => None,
+        })
+        .collect();
+    assert!(fenced.is_empty(), "fenced unexpectedly (a lapsed lease?): {fenced:?}");
+}
+
 fn append_to_disk(dir: &Path, sandbox: &str, epoch: u64, what: &[u8]) {
     let path = dir.join("state/sandboxes").join(sandbox).join(epoch.to_string()).join("disk.img");
     let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
@@ -2120,7 +2147,7 @@ fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
 
     let rt1 = runtime();
     let heads: BTreeMap<String, GenerationId> = rt1.block_on(async {
-        let p = nestd_process(dir.path(), mock_fleet().await, 5000, Some(fake_driver())).await;
+        let p = nestd_process(dir.path(), mock_fleet_with(STEADY_LEASE).await, 5000, Some(fake_driver())).await;
         let f = &p.fleet;
         let suspend = |id: &str| cmd(id, CommandBody::SandboxSuspend { sandbox: SandboxId("sbx_clean".into()), epoch: Epoch(1), mode: SuspendMode::DiskOnly });
         f.commands.send(vec![create("cmd_c_clean", "sbx_clean")]).unwrap();
@@ -2146,6 +2173,8 @@ fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
             assert_eq!(sandbox_meta(dir.path(), sbx, 1).head.map(|h| h.id), Some(g.clone()), "meta.json follows the head");
             heads.insert(sbx.to_string(), g);
         }
+        // Nothing here may have been fenced (a lapse would retire, and delete, what is used below).
+        assert_no_fence(f);
         append_to_disk(dir.path(), "sbx_dirty", 1, b"uncommitted work");
         // A create that dies before its VM starts: the disk is still the untouched base.
         f.commands.send(vec![create("cmd_c_hang", "sbx_hang")]).unwrap();
@@ -2169,7 +2198,7 @@ fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
 
     let rt2 = runtime();
     let lost: RequestId = rt2.block_on(async {
-        let fleet = mock_fleet().await;
+        let fleet = mock_fleet_with(STEADY_LEASE).await;
         fleet.lose_commit_answers.store(1, Ordering::SeqCst);
         let p = nestd_process(dir.path(), fleet, 5000, None).await;
         for gone in ["sbx_clean", "sbx_hang", "sbx_junk", "sbx_flat"] {
@@ -2206,7 +2235,7 @@ fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
 
     let rt3 = runtime();
     rt3.block_on(async {
-        let p = nestd_process(dir.path(), mock_fleet().await, 5000, None).await;
+        let p = nestd_process(dir.path(), mock_fleet_with(STEADY_LEASE).await, 5000, None).await;
         wait_until("the salvage asked again", || !salvage_requests(&p.fleet, "sbx_dirty", 1).is_empty()).await;
         assert_eq!(salvage_requests(&p.fleet, "sbx_dirty", 1)[0], lost, "asked again under the request id the last process sent");
         p.fleet.wait_event("reported clean", |b| matches!(b, HostEventBody::IncarnationRetired { sandbox, .. } if sandbox.0 == "sbx_dirty")).await;
@@ -2239,7 +2268,7 @@ fn a_newer_create_races_the_salvage_of_what_a_dead_nestd_left() {
     let state = dir.path().join("state/sandboxes/sbx_x");
     let rt1 = runtime();
     rt1.block_on(async {
-        let p = nestd_process(dir.path(), mock_fleet().await, 5000, Some(fake_driver())).await;
+        let p = nestd_process(dir.path(), mock_fleet_with(STEADY_LEASE).await, 5000, Some(fake_driver())).await;
         p.fleet.commands.send(vec![create("cmd_c1", "sbx_x")]).unwrap();
         assert!(is_ok(&p.fleet.result("cmd_c1").await));
         append_to_disk(dir.path(), "sbx_x", 1, b"work");
@@ -2249,7 +2278,7 @@ fn a_newer_create_races_the_salvage_of_what_a_dead_nestd_left() {
 
     let rt2 = runtime();
     rt2.block_on(async {
-        let fleet = mock_fleet().await;
+        let fleet = mock_fleet_with(STEADY_LEASE).await;
         fleet.lose_commit_answers.store(1, Ordering::SeqCst);
         *fleet.reject_salvage.lock().unwrap() = Some("parent_mismatch".into());
         // Commit answers time out after 300 ms; retries wait 1 s, then 2 s, 4 s (RETIRE_RETRY_FIRST).
