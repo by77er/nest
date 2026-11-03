@@ -39,7 +39,7 @@ const easing = /`(cubic-bezier\([^)]*\))` on entering and `(cubic-bezier\([^)]*\
 
 describe("the skill's tables, as read", () => {
   it("are all there", () => {
-    expect(Object.keys(colorRows).sort()).toEqual(["border", "danger", "muted", "page", "primary", "subtle", "success", "surface", "text", "warning"]);
+    expect(Object.keys(colorRows).sort()).toEqual(["border", "danger", "muted", "page", "primary", "subtle", "success", "surface", "terminal", "text", "warning"]);
     expect(Object.keys(typeRows).sort()).toEqual(["body", "body-lg", "caption", "h1", "h2", "h3", "h4", "small"]);
     expect(Object.keys(spacing)).toEqual(["2xs", "xs", "sm", "md", "lg", "xl", "2xl", "3xl", "4xl"]);
     expect(radii).toEqual({ sm: 4, md: 8 });

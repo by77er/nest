@@ -10,8 +10,8 @@ import {
 
 /** The neutral roles, per scheme (the skill's color table). */
 export const neutrals = {
-  light: { page: "#fafafa", surface: "#ffffff", subtle: "#f1f3f5", border: "#e9ecef", text: "#212529", muted: "#666e76" },
-  dark: { page: "#121314", surface: "#1a1b1e", subtle: "#222327", border: "#2c2e33", text: "#e9ecef", muted: "#9aa0a6" },
+  light: { page: "#fafafa", surface: "#ffffff", subtle: "#f1f3f5", border: "#e9ecef", text: "#212529", muted: "#666e76", terminal: "#f6f8fa" },
+  dark: { page: "#121314", surface: "#1a1b1e", subtle: "#222327", border: "#2c2e33", text: "#e9ecef", muted: "#9aa0a6", terminal: "#0d0e0f" },
 } as const;
 
 /**
@@ -160,6 +160,8 @@ const schemeVariables = (scheme: "light" | "dark") => {
     "--nest-border": n.border,
     "--nest-text": n.text,
     "--nest-muted": n.muted,
+    // The skill's terminal surface (the projects app's traces); defined here so the two themes stay one.
+    "--nest-terminal": n.terminal,
     "--mantine-color-body": n.surface,
     "--mantine-color-text": n.text,
     "--mantine-color-dimmed": n.muted,
