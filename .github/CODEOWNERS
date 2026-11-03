@@ -5,7 +5,7 @@
 
 # The gates themselves: CI and its configs, deploys, this file, agent instructions and skills.
 /.github/                                   @by77er
-/CLAUDE.md                                  @by77er
+/AGENTS.md                                  @by77er
 /.claude/                                   @by77er
 /scripts/                                   @by77er
 /rust-toolchain.toml                        @by77er

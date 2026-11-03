@@ -4,7 +4,7 @@ What makes this repo safe for agents to change and to review. The checks are the
 
 ## Guards
 
-- **Source fences** (`scripts/fences.toml`, checked by `scripts/check-fences.py`) turn `CLAUDE.md`'s invariants from prose into checks. Each fence lists patterns that may appear only in the files it allows:
+- **Source fences** (`scripts/fences.toml`, checked by `scripts/check-fences.py`) turn `AGENTS.md`'s invariants from prose into checks. Each fence lists patterns that may appear only in the files it allows:
   - the subscription token's names;
   - the guest's credential-free code;
   - the gateway's and the hands client's credential-free code;
@@ -41,7 +41,7 @@ What each kind of run can prove (the `nest-validation` skill). Claims in PRs and
 ## Review
 
 - **The reviewer agent applies the `nest-review` skill:**
-  - the invariants and doc rules in `CLAUDE.md`;
+  - the invariants and doc rules in `AGENTS.md`;
   - test economy;
   - the evidence tiers;
   - the [review lessons](review-lessons.md).

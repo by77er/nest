@@ -46,7 +46,7 @@ One App, owned by me and installed only on `by77er/nest`.
 
 - **Low-risk** means no `CODEOWNERS` path changed. Such a PR merges when CI and `nest/review` pass.
 - **`CODEOWNERS` paths** need my approval as well:
-  - the gates: `.github/`, `scripts/`, `CLAUDE.md`, `.claude/`, and the toolchain, lint, dependency and secret-scanning configs;
+  - the gates: `.github/`, `scripts/`, `AGENTS.md`, `.claude/`, and the toolchain, lint, dependency and secret-scanning configs;
   - dependency manifests and lockfiles;
   - deploy config and DO migrations;
   - API auth, BrokerDO, host identity, the root CA and EC2 access;
