@@ -27,7 +27,7 @@ nestd --features                             # what install scripts check for, o
 | `guest` | Guest control connection (vsock 1024): hello (the guest's version and capabilities are kept and reported with `running`), configure (complete slot set), resume after restores, prepare_snapshot/thaw, attach/detach; relays ports, CLI and task events |
 | `vsock` | Hybrid-vsock `CONNECT` client and the unix-socket emulator (test transport) |
 | `driver` | `Driver`/`Vm`/`Pauser` traits; `supervise` forks every VM process from one long-lived thread with a death signal, records a pidfile, and kills leftovers at start; every VM has a pause handle that works without the sandbox lock. `process` runs the guest agent as a child (in the netns, SIGSTOP/SIGCONT pause). `firecracker` uses the API over its unix socket (regular pages unless `huge_pages` is set, tap0, vsock CID 3, pause/snapshot); the jailer path takes uid/gid/chroot and uses jail-relative paths; `access` gives the gateway's group each VM's vsock socket (`0660`) and, jailed, search on the jail root (`0710`) once the VM has started, through `O_PATH \| O_NOFOLLOW` descriptors checked for kind and owner (a jailed VMM owns its chroot); the API socket is `0600` and the jailed disk `0600` |
-| `storage` | Content-addressed chunks and manifests. Hole-aware disk chunking (`SEEK_DATA`), `LocalFsStore` backend. On restore, chunk names and every chunk's and manifest's hash are verified |
+| `storage` | Content-addressed chunks and manifests. Hole-aware disk chunking (`SEEK_DATA`) in two phases: `scan_file` (or `rescan_unchanged` for a disk known unchanged) while the disk is stable, holding back uploads, then `publish` after the VM resumes. `LocalFsStore` backend. On restore, chunk names and every chunk's and manifest's hash are verified |
 | `s3` | The cell's S3 store: SigV4 with the instance role, a capped write-through cache, parallel transfers, retries, multipart, and the 12 h reuse rule (`REUSE_MS`) |
 | `gc` | One object-store GC pass for FleetDO: mark from the roots it snapshots, sweep unmarked versions past the 24 h grace, fail closed |
 | `credentials` | What enrollment gave the host (host id, token, fleet URL, proxy intermediate, tunnel token), kept root-only so a restart reconnects without re-enrolling |
@@ -63,6 +63,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 - **Unit tests:**
   - config parsing, rate limiter, vsock emulator handshake
   - sparse chunk/restore round trip; **untrusted manifests rejected** (path traversal, tampered chunk or manifest, inconsistent sizes)
+  - a pass holds back its uploads until `publish` (and uploads at once past its budget); an unchanged file is read only where the store is in doubt, and a doubted chunk that no longer matches defeats the reuse; an S3 pass asks S3 nothing
   - proxy link:
     - resync and live fd handoff, including reconnect
     - **a stalled proxy never blocks `apply`**
@@ -89,6 +90,9 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
   - **`fence_during_create_is_terminal`** (review #3): the lease lapses mid-boot. The create fails with `stale_epoch`, there's no `running` after `fenced`, nothing re-arms the proxy, and heartbeats stop claiming the sandbox.
   - **`fence_applies_on_arrival_behind_slow_commands`** (review #8)
   - **`retryable_fleet_error_resends_the_failed_batch`** (review #7)
+  - **`an_unchanged_disk_is_committed_without_reading_it`** and **`a_reused_manifest_still_stores_every_chunk_it_names`** (M1): a checkpoint leaves the sentinel on the disk; bytes changed with the time put back show the next one didn't read; a write is always read; a chunk gone from the store is read back and stored again
+  - **`a_failed_pass_leaves_nothing_to_reuse`** (review of #122: a memory suspend whose snapshot can't be read, then an unwritten disk, is read again), **`a_leaky_pause_never_reuses_a_manifest`** (a driver whose pause doesn't stop every write), **`a_replaced_disk_file_is_read`** (same size and sentinel time, another inode), **`a_fence_during_a_checkpoints_resume_freezes_the_vm_again`**
+  - **`a_rejected_commit_never_resumes_its_vm`**: a rejected suspend never resumes; a rejected checkpoint's VM (resumed before the answer) is frozen through its pause handle and stopped
   - **`proxy_ca_is_renewed_before_expiry`** (review #10)
   - **`newer_epoch_create_salvages_old_work_first`** (review #17)
   - **`a_restarted_nestd_reports_salvages_and_deletes_what_it_left`** (nestd review #7): three processes on one state directory, each dying with its runtime. The second deletes a suspended (clean) incarnation unreported, removes an incarnation without `meta.json` and the old flat layout, reports the rest `fenced`, skips the salvage of a disk equal to its head (whose head has memory), and dies with a salvage answer lost; the third asks again under the persisted request id. The later processes run the process driver and boot nothing.
@@ -99,7 +103,7 @@ Development without a control plane: `"enrollment": {"type": "static", "host": "
 
 ## Not implemented yet (TODO)
 
-- **ublk lazy disk and the copy-on-write epoch flip.** Checkpoints currently pause the VM while chunking.
+- **The reflink cut and the extent diff** (M2, M3 in [disk](../../docs/sandbox/state/disk/)). A checkpoint pauses the VM while it reads a changed disk (uploads and the answer come after the resume; an unchanged disk isn't read). The ublk lazy disk is for restores only, later.
 - **UFFD memory restore.** Restores from `checkpoint` generations cold-boot from the disk.
 - **S3 Inventory** for the GC sweep (it lists object versions), and generation retention (every generation is a GC root).
 - **Gateway features** beyond hands (`docs/sandbox/gateway/`): `port_expose` is recorded only; nothing on the host uses ingress port 10000 yet: no terminal attach, no `nest port-forward`. (Built: the gateway and `gateway.sock`, and cloudflared as nestd's child when configured, with its `/ready` polled so the fleet hello and `tunnel_state` events say whether the tunnel is `none`, `connecting` or `connected`.)

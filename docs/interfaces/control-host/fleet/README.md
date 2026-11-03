@@ -127,7 +127,7 @@ Memory mode is the design (memory snapshots aren't built: [memory](../../../sand
 ```
 FleetDO                                   host
  │ commands[sandbox_suspend{sbx, e4, memory}] ─►│ wait for brains idle (refcount) → drop_caches
- │                                             │ pause VM → full hugepage snapshot → disk epoch flip
+ │                                             │ pause VM → full hugepage snapshot → disk read (or reflink cut)
  │◄ events[sandbox_state suspending]           │ upload → commit_request{reason: suspend, kind: checkpoint}
  │ commands[commit_result committed] ─────────►│
  │◄ events[sandbox_state suspended{memory}, command_result ok]

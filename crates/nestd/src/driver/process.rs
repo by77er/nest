@@ -66,6 +66,12 @@ fn ensure_ext4(path: &Path) -> io::Result<()> {
 
 #[async_trait]
 impl Driver for ProcessDriver {
+    /// Without `mount_disk` the guest never touches its disk file. With it, the image is
+    /// loop-mounted by the host kernel, whose writeback can still reach the file after the guest
+    /// is stopped.
+    fn pause_quiesces_disk(&self) -> bool {
+        !self.mount_disk
+    }
     async fn create(&self, spec: VmSpec) -> io::Result<Box<dyn Vm>> {
         if self.guest_command.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "process driver: empty guest_command"));

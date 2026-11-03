@@ -51,7 +51,7 @@ The control plane is TypeScript (Cloudflare Workers). Everything on hosts and in
 | `projects/` | An app on nest, not part of it: a task board with agents for its GitHub repos, built only on the [API clients](control-plane/api/clients/) interface |
 | `dev/` | Developing this repo: CI, deploys, repo settings (outside the design docs) |
 
-UFFD memory snapshots and the ublk lazy disk are designed but not built (see `crates/nestd/README.md`); memory snapshots are deferred by decision until cold boot proves too slow ([memory](sandbox/state/memory/)).
+UFFD memory snapshots, the reflink disk cut and the ublk lazy disk are designed but not built (see `crates/nestd/README.md`); memory snapshots are deferred by decision until cold boot proves too slow ([memory](sandbox/state/memory/)).
 
 ## Primitives
 
@@ -156,6 +156,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Turn-end generations: the newest 20 always, up to 200 while under 7 days old; periodic ones thin by tier | [sandbox/state/](sandbox/state/#retention) |
 | Drains are gentle (consolidation) or forced (spot notices); a host terminates only after it reports, all or nothing, that its uploads are done (designed; today a spot notice suspends every running sandbox, and no host reports pending uploads) | [control-plane/durable-objects/fleet/](control-plane/durable-objects/fleet/) |
 | A sandbox pauses, then suspends, only with no agent mid-turn, no live ingress and no hold (`nest hold`) | [control-plane/durable-objects/sandbox/](control-plane/durable-objects/sandbox/#activity-and-idle) |
+| A commit's cost follows what changed: the VM pauses only to read its disk (built), then is cut with a reflink while it runs, on instance-store XFS, and only chunks whose extents changed are read (designed, M2 and M3); uploads and the control plane's answer never hold the VM | [sandbox/state/disk/](sandbox/state/disk/) |
 | Every commit, pause and suspend requires a guest `syncfs` (designed for guest protocol v2; today nestd asks the v1 guest to `sync()` and goes on if that fails) | [sandbox/state/disk/](sandbox/state/disk/#flush-before-commit) |
 | Per-sandbox disk I/O is limited (10,000 ops/s, 100 MiB/s, 30 s burst; designed, not built) | [sandbox/state/disk/](sandbox/state/disk/#io-limits) |
 | AWS sandbox hosts are the 8i family only; brain hosts are cheap x86 types (`t3a`/`t3`) on the same AMI | [compute/](compute/), [brain hosts](compute/brain-hosts/) |
@@ -205,8 +206,10 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 - **Checked against the real binary** (Claude Code 2.1.301, `e2e/claude-verify` with a real token, 2026-10-16): the token works under `forceLoginMethod: "claudeai"`, and the stdin shape, the MCP tool-use id, cancellation, the env scrub, the transcript path, interrupted-turn resume, `defer` and `SessionStart` after `/compact` all behave as nest assumes. Two don't: `system/init` arrives only after the first user message, and `--restricted` drops `TodoWrite` even when it's named. The designs already account for both. Details: [interfaces/host-internal/runner-claude/](interfaces/host-internal/runner-claude/).
 
 - **Verify:** that Amazon Linux 2023 ships ublk, which the lazy disk needs. See [compute/provisioning/](compute/provisioning/).
-- **Verify:** that every 8i variant reports the same CPU model (it's part of the restore ABI); that Firecracker's writes pass through the host page cache before ublk; and whether S3 Inventory and lifecycle rules work on S3 Express One Zone directory buckets. See [sandbox/state/](sandbox/state/).
-- **Not built:** the 60 s dirty-disk timer and the 256 MB dirty threshold. Disks commit at turn end, suspend, drain and spot notice only; a timer needs dirty tracking and a cut that doesn't pause the VM for the whole chunking pass (ublk). See [sandbox/state/](sandbox/state/#writeback-cadence).
+- **Verify:** that every 8i variant reports the same CPU model (it's part of the restore ABI); and whether S3 Inventory and lifecycle rules work on S3 Express One Zone directory buckets. See [sandbox/state/](sandbox/state/).
+- **Verify on a host:** the unchanged-disk check's trust assumption: every write to a sandbox's disk file (Firecracker's `Sync` engine, on the host's kernel and XFS) moves its modification time before the data lands, and nothing but nestd sets it to the sentinel. Tested only on ext4 and tmpfs off EC2; the rollout's cloud check looks for a reused manifest that didn't match. See [sandbox/state/disk/](sandbox/state/disk/#m1-pause-only-to-read-and-never-read-an-unchanged-disk), [verification/nestd/](verification/nestd/#unchanged-disk-m1).
+- **Measure before M2 ships:** on a real host (not production), `FICLONE` time on an aged 32 GiB image (the 200 ms p99 gate for the incremental shadow), and whether Firecracker's `Async` io_engine is fit for production (the reflink cut needs it). Which instance-store types carry sandbox state, and their sizes, is the cell stack's to settle with it. See [sandbox/state/disk/](sandbox/state/disk/#m2-cut-with-a-reflink-while-the-vm-runs-designed-not-built).
+- **Not built:** the 60 s dirty-disk timer and the 256 MB dirty threshold. Disks commit at turn end, suspend, drain and spot notice only; a timer needs the reflink cut and the extent diff (M2, M3), so a periodic commit costs only what changed. See [sandbox/state/](sandbox/state/#writeback-cadence).
 - **Not built:** retrying a failed turn-end commit. One that times out leaves the head where it was, with nothing surfaced until the next turn ends (seen on EC2 with a cold-snapshot AMI). See [sandbox/state/](sandbox/state/).
 - **Open:** guest `init_on_free=1` (for compressible memory snapshots) stalled 1-vCPU guest boots past a minute on a nested 8i host, so it's off until snapshots exist; whether nested hosts can afford it then is unmeasured. See [sandbox/drivers/firecracker/](sandbox/drivers/firecracker/).
 - **Open:** per-sandbox I/O limits don't make a dense host fair when many sandboxes spend their burst at once. See [sandbox/state/disk/](sandbox/state/disk/#io-limits).
@@ -234,7 +237,7 @@ On a c8id with nested virtualization and a hugepage pool:
 4. Time to write a full snapshot at 2 and 4 GB.
 5. A dev server's first response after resume.
 6. ublk lazy-disk throughput.
-7. Commit latency under write load, including the guest flush and the epoch flip.
+7. Commit latency under write load, including the guest flush and the reflink cut.
 8. Forced-partition test: self-fence, then STONITH, then restore.
 9. **First real Claude Code run** through the runner (the verification list above). It needs no KVM, so it runs in the cloud dev environment through the e2e harness, with the token as `NEST_CLAUDE_OAUTH_TOKEN`. **Done** (2026-10-16, Claude Code 2.1.301, `NEST_E2E_CLAUDE=real e2e/run.sh`): a real turn ran entirely through `mcp__nest__` hands (Bash, Write, Read, Edit), with no host-side built-ins and the token absent from the sandbox. All 21 checks passed, including self-fencing 20 s after the control plane was cut.
 10. **Hands fidelity eval:** the same tasks with native tools (Claude Code inside a VM), with RPC hands from a brain on the same machine, and with hands from a remote brain through the gateway and the tunnel; compare success rate, turns and tokens, and record the per-call round trip of the remote arm. The same eval gates every upgrade of the pinned Claude Code version ([runner](agents/runner/)).

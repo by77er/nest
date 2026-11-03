@@ -11,7 +11,7 @@ chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
 
 - **Chunks are immutable.** Any host can upload them at any time without harm.
 - **Manifests are content-addressed in S3.** SandboxDO stores only `head = manifest hash`.
-- **Commit:** flush the guest ([disk](disk/#flush-before-commit)), upload the chunks, verify them, upload the manifest, then `commit(epoch, parent, hash)` as a compare-and-set in the DO.
+- **Commit:** flush the guest ([disk](disk/#flush-before-commit)), read the disk while nothing writes it (today the VM is paused for the read only; designed, a reflink cut while it runs), upload the chunks, verify them, upload the manifest, then `commit(epoch, parent, hash)` as a compare-and-set in the DO. The upload and the answer come after the VM resumes, and a disk nothing wrote since the last commit isn't read again ([disk](disk/#m1-pause-only-to-read-and-never-read-an-unchanged-disk)). Designed: only changed chunks are read, and the request carries `cut_ms` ([disk](disk/)).
 - **Verified before commit:** every chunk a generation adds over its parent must have been uploaded less than 12 h before the commit, by this commit's PUT or as a HEAD shows, with the manifest's length; anything older is uploaded again ([GC](object-store/#garbage-collection)). The rule is applied to every non-zero chunk of the file, not only to those that differ from the parent (`storage.rs` `commit_file`, `s3.rs` `recent`), so a commit never relies on its parent still being a GC root: retention may have dropped it (a salvage's parent may even be pruned). A committed generation is therefore `ready`: every chunk is present.
 - **`reason`:** `turn_end`, `periodic`, `pressure`, `pause`, `suspend`, `drain`, `spot`, `fork` or `salvage`. Retention and rollback notices read it.
 - **`deleting` is one-way.** A generation is marked `deleting` before any of its bytes can go, and never returns to `ready`, because a previous pass may already have removed some of them.
@@ -23,21 +23,21 @@ chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
 |---|---|---|
 | Disk | At each agent's `Stop` (rate-limited to about one per 10 s); every 60 s if dirty; immediately if dirty data exceeds 256 MB; on pause, suspend, drain or spot notice | ≤60 s, usually at a turn boundary |
 
-**Built:** turn-end commits (SandboxDO asks for a `turn_end` checkpoint when an agent's turn completes, one at a time; one sooner than 10 s after the last landed is deferred, not dropped; turns that end while a checkpoint is in flight [share one follow-up after it](#one-turn-end-checkpoint-at-a-time)), and suspend, drain and spot notice. **Not built:** the 60 s timer and the 256 MB threshold, so for now the recovery point is the last turn end. A sandbox's first commit uploads its base image's chunks (about 700 MB for `nest-base`, roughly 30 s), until base generations exist.
+**Built:** turn-end commits (SandboxDO asks for a `turn_end` checkpoint when an agent's turn completes, one at a time; one sooner than 10 s after the last landed is deferred, not dropped; turns that end while a checkpoint is in flight [share one follow-up after it](#one-turn-end-checkpoint-at-a-time)), and suspend, drain and spot notice. A commit pauses the VM only while it reads the disk, and a turn that wrote nothing reads nothing ([disk](disk/)); a disk that changed is still read whole until M3. **Not built:** the 60 s timer and the 256 MB threshold, so for now the recovery point is the last turn end. A sandbox's first commit uploads its base image's chunks (about 700 MB for `nest-base`, roughly 30 s), until base generations exist.
 | Memory | **Only** on suspend, drain or spot notice. Never on a timer (a hugepage snapshot is always full and pauses the VM). | Last suspend |
 
 The cadence is the RPO: a lost host loses at most the work since its last commit, and the loss is recorded ([SandboxDO](../../control-plane/durable-objects/sandbox/#losses)).
 
 ### One turn-end checkpoint at a time
 
-Decided 2026-11-02, after two back-to-back turn-end checkpoints of an unchanged 32 GiB disk held one VM paused 33-39 s each, 14 ms apart (cell use1). Until the CoW cut ([disk](disk/)), a checkpoint pauses the VM for its whole chunking pass, so a second one queued right behind the first only doubles the pause.
+Decided 2026-11-02, after two back-to-back turn-end checkpoints of an unchanged 32 GiB disk held one VM paused 33-39 s each, 14 ms apart (cell use1). Until the reflink cut ([disk](disk/)), a checkpoint pauses the VM while it reads a changed disk, so a second one queued right behind the first only doubles the pause.
 - **At most one in flight.** SandboxDO records the `turn_end` checkpoint it asked for (kv `turn_checkpoint_inflight`: epoch, when, turns that ended meanwhile) until it **lands**: its `sandbox_checkpoint` command's result, ok or not (FleetDO passes it on, keyed by the command, so a late result of an older checkpoint lands nothing), or, sooner, its `turn_end` commit decided (any outcome, a replay of a stored one included). The command's result covers a checkpoint that sent no new commit: nestd asked again for an unanswered commit of another reason and found nothing new, or found no disk. One out longer than 5 min (its pause plus nestd's 60 s commit timeout, with room for a large disk) no longer counts.
 - **Turns that end while one is in flight share one follow-up,** 10 s after it lands, instead of each queueing a checkpoint behind it. One that never lands gets them theirs when its 5 min window ends.
 - **The follow-up is never skipped.** The in-flight checkpoint's cut is the guest's `sync` (`prepare_snapshot`; the guest freezes nothing), not the pause, so a call answered between the two may have left writes in the guest's page cache that it lacks.
-- **Residual: a replay can land one early.** A replayed stored `turn_end` commit (nestd asking again for an earlier one before chunking the current one) lands the checkpoint in flight while its VM is still paused, so a turn ending after that can queue a checkpoint right behind it: a back-to-back pause, rarer than before, which the runner's 120 s paused budget still covers.
+- **Residual: a replay can land one early.** A replayed stored `turn_end` commit (nestd asking again for an earlier one before chunking the current one) lands the checkpoint in flight before that checkpoint's own pause (nestd asks again first, with the VM running), so a turn ending after that can queue a checkpoint right behind it: a back-to-back pause, rarer than before and short since M1, which the runner's 120 s paused budget still covers.
 - **The 10 s interval counts from the landing,** not the request, so the VM runs at least 10 s between two turn-end pauses.
 - **Retention is unchanged:** it reads only reasons and ages, and every checkpoint is still a `turn_end` generation ([retention](#retention)); fewer of them are made.
-- **Not done: skipping a checkpoint of an unchanged disk.** nestd has no guest write tracking: its `dirty` flag means "a VM ran since the last commit", and the incident's VM ran (14 ms) between the two, so a check on it would not have skipped either. Cheap change detection (and a short pause with chunking proportional to the changed data) belongs to the checkpoint redesign that replaces the chunking pass; until then a checkpoint of an unchanged disk still pauses for a full pass, and the [gateway](../gateway/) answers binds `busy` during it, which the runner waits out.
+- **An unchanged disk isn't read again** (nestd, M1): a commit finds the disk file's modification time still at the sentinel it set after the last read, so the incident's second checkpoint would have read nothing and paused for about no time ([disk](disk/#m1-pause-only-to-read-and-never-read-an-unchanged-disk)). The `dirty` flag alone couldn't tell: it means "a VM ran since the last commit", and the incident's VM ran 14 ms between the two. A changed disk is still read whole while paused until M2 and M3, and the [gateway](../gateway/) answers binds `busy` during it, which the runner waits out.
 
 ## Restore sources
 
@@ -102,7 +102,7 @@ SandboxDO runs retention from its alarm, in the same single writer that admits f
 
 **Built:** the notice suspends every running sandbox, in no order ([autoscaling](../../compute/autoscaling/)). **Designed, not built:** the order below.
 
-1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then flip every disk epoch (milliseconds each) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot`).
+1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then reflink-cut every disk ([disk](disk/#m2-cut-with-a-reflink-while-the-vm-runs-designed-not-built)) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot`).
 2. Then, in order of recent activity: pause, write a full memory snapshot to NVMe (`sync_snapshot_files=false`), upload with zstd compression, commit.
 3. Anything that doesn't finish falls back to its disk-only generation, and the loss is recorded.
 
@@ -116,5 +116,5 @@ A **rebalance recommendation** can arrive with the notice rather than before it,
 ## Components
 
 - [memory/](memory/): hugepages, UFFD, prefetch, tiers, restore ABI, base generations
-- [disk/](disk/): ublk lazy disk, copy-on-write epoch flips, flush before commit, I/O limits
+- [disk/](disk/): pausing only to read, the unchanged-disk check, reflink cuts and extent diffs (designed), flush before commit, I/O limits, the ublk lazy disk (later)
 - [object-store/](object-store/): S3 per cell, costs, garbage collection

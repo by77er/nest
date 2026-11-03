@@ -38,6 +38,12 @@ pub trait Driver: Send + Sync {
     fn supports_memory_snapshots(&self) -> bool {
         false
     }
+    /// Whether a paused or stopped VM writes nothing more to its disk file: every write it began
+    /// has landed, and none starts until it resumes. A commit trusts its unchanged-disk check
+    /// (`nestd_core::checkpoint`) only then.
+    fn pause_quiesces_disk(&self) -> bool {
+        false
+    }
     async fn create(&self, spec: VmSpec) -> io::Result<Box<dyn Vm>>;
 }
 

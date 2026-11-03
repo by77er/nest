@@ -307,13 +307,20 @@ impl S3Store {
         })
     }
 
+    /// Whether this process uploaded `key`, or saw it with a HEAD, under [`REUSE_MS`] ago: what
+    /// [`S3Store::recent`] answers without a request.
+    fn remembered(&self, key: &str) -> bool {
+        let now = now_ms();
+        self.uploaded.lock().unwrap().get(key).is_some_and(|t| now - t < REUSE_MS)
+    }
+
     /// Whether `key` is in S3 and was last uploaded under [`REUSE_MS`] ago, so a commit may
     /// reuse it. The local cache doesn't count: it says nothing about the object's age.
     fn recent(&self, key: &str) -> io::Result<bool> {
-        let now = now_ms();
-        if self.uploaded.lock().unwrap().get(key).is_some_and(|t| now - t < REUSE_MS) {
+        if self.remembered(key) {
             return Ok(true);
         }
+        let now = now_ms();
         let Some(r) = self.request(reqwest::Method::HEAD, key, &[], None)? else { return Ok(false) };
         // No usable Last-Modified: treat it as old and upload again.
         let Some(t) = r.last_modified_ms else { return Ok(false) };
@@ -455,6 +462,9 @@ impl ObjectStore for S3Store {
     }
     fn has_chunk(&self, hex: &str) -> io::Result<bool> {
         self.recent(&format!("chunks/{hex}"))
+    }
+    fn known_recent(&self, hex: &str) -> bool {
+        self.remembered(&format!("chunks/{hex}"))
     }
     fn put_chunk(&self, hex: &str, data: &[u8]) -> io::Result<()> {
         let key = format!("chunks/{hex}");
@@ -1061,6 +1071,41 @@ pub(crate) mod tests {
         assert!(keys.iter().any(|k| k.ends_with(hash.0.strip_prefix("blake3:").unwrap())));
         // One data chunk and one manifest, each uploaded once: the re-commit hit the cache.
         assert_eq!(calls.lock().unwrap().get("PUT"), Some(&2));
+    }
+
+    /// A pass made while the VM is paused asks S3 nothing: what this process uploaded is vouched
+    /// for from memory, and whatever else (another host's chunk) is held back and asked about
+    /// (HEAD) only at publish, after the VM resumes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pass_asks_s3_nothing_and_publish_asks_the_rest() {
+        let fake = fake_s3().await;
+        let (url, calls) = (fake.url.clone(), fake.calls.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("disk.img");
+        image(&img, 3);
+        let (a, b, img2) = (dir.path().join("a"), dir.path().join("b"), img.clone());
+        let calls2 = calls.clone();
+        tokio::task::spawn_blocking(move || {
+            let host_a = store(&url, &a);
+            storage::commit_file(&host_a, &img2, ManifestKind::Disk).unwrap();
+            // The same host again: nothing asked, nothing held back.
+            let before = calls2.lock().unwrap().clone();
+            let s = storage::scan_file(&host_a, &img2, ManifestKind::Disk, 64 << 20).unwrap();
+            assert_eq!(*calls2.lock().unwrap(), before);
+            assert_eq!(s.stats.chunks_deferred, 0);
+            // Another host (a restored disk): its pass asks nothing either, and holds all three back.
+            let host_b = store(&url, &b);
+            let s = storage::scan_file(&host_b, &img2, ManifestKind::Disk, 64 << 20).unwrap();
+            assert_eq!(*calls2.lock().unwrap(), before);
+            assert_eq!(s.stats.chunks_deferred, 3);
+            storage::publish(&host_b, &s).unwrap();
+            let after = calls2.lock().unwrap().clone();
+            // Three chunk HEADs and the manifest's, all young: nothing uploaded again.
+            assert_eq!(after.get("HEAD").copied().unwrap_or(0) - before.get("HEAD").copied().unwrap_or(0), 4);
+            assert_eq!(after.get("PUT"), before.get("PUT"));
+        })
+        .await
+        .unwrap();
     }
 
     /// AWS's published SigV4 examples with a query string ("GET Bucket Lifecycle" and "Get Bucket

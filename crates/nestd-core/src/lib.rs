@@ -21,6 +21,7 @@
 
 extern crate alloc;
 
+pub mod checkpoint;
 pub mod fleet;
 pub mod incarnation;
 pub mod invariant;

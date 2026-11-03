@@ -10,7 +10,7 @@ NEST_E2E_CLAUDE=fake (default): brains are crates/nest-cli/tests/fake_claude.py 
 `claude` binary is never invoked. NEST_E2E_CLAUDE=real: brains are the real `claude` with the token
 from NEST_CLAUDE_OAUTH_TOKEN, given a short natural-language turn that uses the hands tools.
 """
-import json, os, pwd, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request, uuid
+import glob, json, os, pwd, re, shutil, signal, subprocess, sys, time, urllib.error, urllib.request, uuid
 
 E2E = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(E2E)
@@ -1199,6 +1199,70 @@ def run_repos(ids):
         check("repos: the refusal is in the egress audit (reason guard: github-push)", False, str(e)[:200])
 
 
+# ---------------------------------------------------------------------------------- checkpoints
+# docs/sandbox/state/disk/ (M1): a checkpoint pauses the VM only while it reads the disk, and a disk
+# nothing wrote since the last commit isn't read again (its mtime still holds nestd's sentinel).
+
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def commit_reads(sbx, since=0):
+    """nestd's `commit: disk read` lines for `sbx` after byte `since` of its log: (end offset, fields)."""
+    text = ANSI.sub("", read(os.path.join(WORK, "logs", "nestd.log")))
+    out = []
+    for m in re.finditer(r"commit: disk read(.*)", text):
+        if m.start() < since:
+            continue
+        fields = dict(re.findall(r"(\w+)=(\S+)", m.group(1)))
+        if fields.get("sandbox") == sbx:
+            out.append((m.end(), fields))
+    return out
+
+
+def log_size():
+    return len(ANSI.sub("", read(os.path.join(WORK, "logs", "nestd.log"))))
+
+
+def run_checkpoints(ids):
+    if REAL:
+        skip("checkpoints", "fake mode only: the calls are scripted")
+        return
+    agid, sbx = ids["agent"], ids["sandbox"]
+    disks = glob.glob(os.path.join(WORK, "state", "sandboxes", sbx, "*", "disk.img"))
+    if not check("checkpoints: the sandbox's disk image is found", len(disks) == 1, str(disks)):
+        return
+    # The process driver's guest never writes the image: write 32 MiB into it as a guest would.
+    with open(disks[0], "r+b") as f:
+        f.seek(1 << 30)
+        f.write(os.urandom(32 << 20))
+    since = log_size()
+    text, err = sink_turn(agid, "ckpt-written", [("a", "Bash", {"command": "echo a"})])
+    check("checkpoints: a turn after a disk write runs", text("a").strip() == "a" and not err("a"), text("a")[:200])
+    try:
+        end, f = wait_for(lambda: next(((e, f) for e, f in commit_reads(sbx, since) if int(f.get("bytes_read", 0)) >= 32 << 20), None),
+                          60, 0.5, "a turn-end commit that reads the write")
+        check("checkpoints: the commit after a write reads it", f.get("reused") == "false", json.dumps(f)[:300])
+    except TimeoutError as e:
+        check("checkpoints: the commit after a write reads it", False, str(e)[:200])
+        return
+    # A turn that writes nothing: its turn-end commit reuses the manifest, reading nothing, and
+    # the VM is paused for about no time. A turn right behind it has working hands.
+    text, err = sink_turn(agid, "ckpt-unchanged", [("b", "Bash", {"command": "echo b"})])
+    check("checkpoints: a turn that writes nothing runs", text("b").strip() == "b" and not err("b"), text("b")[:200])
+    try:
+        _, f = wait_for(lambda: next(((e, f) for e, f in commit_reads(sbx, end) if f.get("reused") == "true"), None),
+                        60, 0.5, "a turn-end commit of the unchanged disk")
+        check("checkpoints: an unchanged disk is committed without reading it",
+              f.get("bytes_read") == "0" and int(f.get("scan_ms", 99999)) < 1000, json.dumps(f)[:300])
+    except TimeoutError as e:
+        check("checkpoints: an unchanged disk is committed without reading it", False, str(e)[:200])
+    text, err = sink_turn(agid, "ckpt-after", [(f"c{i}", "Bash", {"command": f"echo c{i}"}) for i in range(3)])
+    check("checkpoints: hands work right after a turn-end checkpoint",
+          all(text(f"c{i}").strip() == f"c{i}" and not err(f"c{i}") for i in range(3)), " | ".join(text(f"c{i}")[:40] for i in range(3)))
+    pauses = [int(m.group(1)) for m in re.finditer(r"checkpoint: VM resumed.*?paused_ms=(\d+)", ANSI.sub("", read(os.path.join(WORK, "logs", "nestd.log")))[end:])]
+    check("checkpoints: each checkpoint since paused its VM under a second", pauses and max(pauses) < 1000, str(pauses))
+
+
 # ---------------------------------------------------------------------------------- agent lifetimes
 # docs/agents/#lifetimes: a parent agent spawns children that own new sandboxes; one exits itself, the
 # parent stops the other; each sandbox is destroyed through SandboxDO's destroy, so FleetDO's GC
@@ -1364,8 +1428,9 @@ def write_disk(path, mib):
 
 def run_checkpoint_pause(ids):
     """2026-11-02, cell use1: hands calls failed at once ("hands unavailable: bind timed out") while a turn-end
-    checkpoint held the VM paused for its chunking pass. Here a turn-end checkpoint's pause is held (the control
-    plane is stopped with SIGSTOP while nestd waits for the commit's answer) while the next turn makes a hands call:
+    checkpoint held the VM paused for its chunking pass. Here a turn-end checkpoint's pause is held (the sandbox
+    host's nestd is stopped with SIGSTOP while it reads the disk, the only part of a commit the VM is paused for since
+    M1: docs/sandbox/state/disk/) while the next turn makes a hands call:
     the gateway answers `busy` at once (nestd marked the sandbox paused), the runner waits it out, and the call
     runs once the VM does."""
     if REAL:
@@ -1412,8 +1477,8 @@ def run_checkpoint_pause(ids):
                  "no pause before it (a pause here means turn a's checkpoint wasn't deferred: turn p landed over 10 s before turn a ended)"):
         open(cue, "w").close()
         return
-    # 512 MiB more no store has seen, so the deferred checkpoint's pass (the pause) takes a while.
-    write_disk(disk, 512)
+    # 1 GiB more no store has seen, so the deferred checkpoint's read (the pause) takes long enough to catch.
+    write_disk(disk, 1024)
     try:
         # Outlasts the 10 s interval from turn p's landing, the deferred checkpoint's deadline.
         wait_for(lambda: gateway_log().count(paused_marker) > paused_before or None, 30, 0.02, "the deferred turn-end checkpoint pauses the VM")
@@ -1421,11 +1486,16 @@ def run_checkpoint_pause(ids):
         check("checkpoint pause: a turn-end checkpoint pauses the VM and nestd tells the gateway", False, str(e)[:200])
         open(cue, "w").close()
         return
-    # Hold the pause: nestd waits (unlocked, VM paused) for SandboxDO's answer to its commit_request.
-    wrangler = PROCS["wrangler"]
-    os.killpg(wrangler.pid, signal.SIGSTOP)
+    # Hold the pause: stop nestd mid-read (the VM stays paused, the gateway keeps its mark). The VM must not
+    # have run again before the stop landed.
+    nestd = pid_of("nestd")
+    os.kill(nestd, signal.SIGSTOP)
     held_at = time.time()
     try:
+        caught = "sandbox running again" not in gateway_log().split(paused_marker)[-1]
+        if not check("checkpoint pause: nestd stopped while the checkpoint's read still held the VM paused", caught,
+                     "" if caught else "the read ended before the stop: the VM ran again first"):
+            return
         open(cue, "w").close()
 
         def refused_busy():
@@ -1443,7 +1513,9 @@ def run_checkpoint_pause(ids):
         time.sleep(3)  # the runner keeps waiting: a call that gave up would have returned by now
         early = results_by_label(out_b).get("during")
     finally:
-        os.killpg(wrangler.pid, signal.SIGCONT)
+        os.kill(nestd, signal.SIGCONT)
+        if not os.path.exists(cue):
+            open(cue, "w").close()
     held = time.time() - held_at
     gl = gateway_log()
     check("checkpoint pause: the gateway refused the call's bind busy at once while the VM was paused", busy,
@@ -1538,6 +1610,7 @@ def main():
         run_mcp_oauth(ids)
         run_brokered(ids)
         run_repos(ids)
+        run_checkpoints(ids)
         run_lifecycle(ids)
         run_retention(ids)
         # After the turns: the token has been handed to the brains by now.
