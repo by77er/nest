@@ -79,28 +79,11 @@ Inductive invariant (five clauses): LM never in the future; S1; each eligible pe
 | `b1_unsafe` | **B1**, with `R = 12`, `G = 24` (hours). Place at epoch 1 on host 7. Hour 0: prepare uploads chunk 5 and the request is lost. Hour 25: a pass with no roots deletes chunk 5 (`0 + 24 < 25`). The re-sent request is evaluated and becomes **head**, naming a deleted chunk. `¬ Safe` and the final state are checked by `decide` |
 | `b1_pending_lost` | the same trace: the pending request's chunk is gone before evaluation, and A1 would have refused it (`25 + 12 < 24` is false) |
 
-## Effort
+## Effort and verdict
 
-| Item | Measure |
-|---|---|
-| Lean | 822 lines: `CommitChain` 390 (model ~115 with the header, proofs ~240, negatives ~35), `Gc` 414 (model ~110, proofs ~220, traces ~85), `Nest.lean` 18 |
-| Time | ~1.5 h of agent time in all: reading the code ~20 min, writing the model and proofs ~40 min, report ~30 min |
-| Build iterations | 9 `lake build` runs. Failures, in order: wrong toolchain picked up by elan (`lake -d` resolves from the cwd); `cases` on an `Effect` whose index was a function application (fixed with `generalize`); `omega` not seeing through `abbrev GenId := Nat`; an unreduced `match some t` after `rw`; nested structure-literal syntax; one name lost after `cases`. No failure was a wrong invariant |
-| Where the effort went | Proof engineering (Lean tactics) far more than invariant discovery. The key step was an `Effect` inductive that names `commit`'s four outcomes with their guards: every later proof is a case split on it. The GC invariant went through first time, because the inventory's lemma had already done the thinking |
-| Build | ~2.7 s wall from clean (`lake build`) |
+822 lines of Lean (`CommitChain` 390, `Gc` 414), about 1.5 agent-hours, a clean build in about 3 s. The effort went to proof engineering (tactics), not invariant discovery: the key step was an `Effect` inductive naming `commit`'s four outcomes with their guards, and the GC invariant went through first time because the inventory's lemma had done the thinking.
 
-## Comparison with model checking
-
-| | Lean (this pilot) | TLC (the parallel pilots) |
-|---|---|---|
-| Coverage | Unbounded: any number of keys, generations, requests, passes, re-sends; any `R`, `G`, times | Bounded: the inventory suggests 2 sandboxes, 3 generations, 4 keys |
-| Results | Theorems; plus findings no bounded run states, such as "safety needs no `G > R`" and "concurrent passes are safe" | Pass or fail within the bounds |
-| Counterexamples | Hand-written: I constructed the B1 trace and checked it by `decide` (kernel evaluation). No automatic search: Plausible is not in the core toolchain, and I did not use `#eval` random testing. A failed proof obligation only names the step that breaks the invariant (here: `evaluate` without A1), not a trace | Automatic and minimal; finds B1 without being told |
-| Cost | Needs an inductive invariant (handed over by the inventory here) and tactic skill | Needs bounds and a state-space budget; cheap to start |
-| Fit with nest | Same language and toolchain as `deploy/lean`; no new tool | New tool and language |
-| Shared weakness | Hand-translated model; nothing links it to the TypeScript or Rust, so the code can drift | Same |
-
-**Verdict for this target:** Lean is viable and cheap here, because the inventory had already found the invariant and the state is small. A sensible workflow is TLC first, to search for bugs and validate the invariant on small bounds, then Lean to prove that invariant unbounded. On a target with no known invariant, expect proof iterations to dominate, with no counterexample search to fall back on.
+Lean is viable and cheap here because the invariant was known and the state is small; it proves unbounded results (any keys, passes, `R`, `G`) and findings no bounded run states, but its counterexamples are hand-built (checked by `decide`), with no search. So: TLC first, to find bugs and validate the invariant on small bounds; then Lean to prove it unbounded. Both are hand translations, so the code can drift from either.
 
 ## Not proved
 

@@ -26,7 +26,7 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
     - a `lib.rs` without the `no_std` line;
     - in any source file, an `extern crate` other than `alloc`, a `#[path]` module, `include!`, or a `cfg`, `cfg_attr` or `cfg!` predicate on any `target_*` key.
 
-    It checks the sources with comments stripped and string, byte-string, raw-string and char literals emptied, so neither a commented-out line nor a comment marker inside a literal changes what it sees. Tests prove each case fails, the reviewer's two repros among them.
+    It checks the sources with comments stripped and string, byte-string, raw-string and char literals emptied, so neither a commented-out line nor a comment marker inside a literal changes what it sees. Tests prove each case fails.
   - **A text fence**, `nestd-core-purity` ([scripts/fences.toml](../../../scripts/fences.toml)): a line-based third layer over the same names.
   - **Not enforced:** a core could still loop forever, or allocate without bound. Model checking and tests find those, not the build.
 - **The shell makes no decisions.** It only does five things:
@@ -245,7 +245,7 @@ Time is abstract: 5 s steps, 70 s explored. Frames are delayed any number of ste
 - **It holds by the shell's three rules, and the check pins each:**
   - a write that lands after its time moved, as Firecracker's `Async` io_engine allows across a pause, fails in 7 steps (`Write, Pause, Commit, Land, Sentinel, Record, Commit`);
   - a shell that calls a running VM's disk stable fails in 5;
-  - a shell that peeks at the memo (`unchanged`) instead of taking it (`begin`) fails in 11: a pass that fails after its sentinel leaves the previous memo, whose stamp the sentinel matches again (`… Pause, Commit, Sentinel, Fail, Commit`). **Found by the review of #122:** `Inner::scan` set the sentinel before reading a memory snapshot and updated the memo only after, so a memory suspend whose snapshot couldn't be read left exactly that state. Fixed twice over: the memo is taken when a pass begins, and the sentinel is the pass's last step (`a_failed_pass_leaves_nothing_to_reuse` in `crates/nestd/tests/host.rs`).
+  - a shell that peeks at the memo (`unchanged`) instead of taking it (`begin`) fails in 11: a pass that fails after its sentinel leaves the previous memo, whose stamp the sentinel matches again (`… Pause, Commit, Sentinel, Fail, Commit`). A memory suspend whose snapshot couldn't be read reached exactly that state (found in review of #122), so the memo is taken when a pass begins and the sentinel is the pass's last step (`a_failed_pass_leaves_nothing_to_reuse` in `crates/nestd/tests/host.rs`).
 - **Assumed:** every write moves the modification time before its data lands, and only nestd sets the sentinel (the kernel's write path; unverified on a host beyond the tests in `crates/nestd`).
 
 ### Residuals
@@ -328,35 +328,17 @@ The seeds are built from `protocol/fixtures/` at every run and never committed, 
 ## Mutation testing
 
 `cargo mutants -p nestd-core` (cargo-mutants 27.1.0; exclusions with reasons in [`.cargo/mutants.toml`](../../../.cargo/mutants.toml)).
-- **First run:** 160 mutants; 44 missed.
-- **Missed mutants:** 31 were real test gaps, each now caught by a test that names the behaviour it pins. The other 15 are excluded:
-  - invariant conditions weakened where no input reaches the difference;
-  - a field only the checker's trace printer reads;
-  - a release-only hook;
-  - an `is_empty` nothing calls;
-  - a mutant that only hangs.
-- **Final run:** 145 mutants, **0 missed** (140 caught, 5 unviable).
-- **The checkpoint module (M1):** 18 mutants, 16 caught, 2 unviable; nestd-core with it (before `begin`): 255 mutants, **0 missed** (241 caught, 14 unviable), about 2 min.
-- **After the incarnation module joined** (exclusions also cover the `#[cfg(kani)]` proof code, which `cargo test` never compiles): 192 mutants, **0 missed** (181 caught, 11 unviable), about 2 min.
-- **Round 2** (no_std core, the moved decisions, the tombstone map, the expected-seq fix): 233 mutants, **0 missed** (220 caught, 13 unviable), about 4 min at `-j 1`.
+- **Now:** 255 mutants, **0 missed** (241 caught, 14 unviable), about 2 min.
+- **The first run missed 44 of 160:** 31 were real test gaps, each now caught by a test that names the behaviour it pins. The rest are excluded: invariant conditions weakened where no input reaches the difference, a field only the checker's trace printer reads, a release-only hook, an `is_empty` nothing calls, a mutant that only hangs, and the `#[cfg(kani)]` proof code, which `cargo test` never compiles.
 - **Exclusions name a function and a mutation, never a line.** Where a function held both a killable mutant and an equivalent one of the same shape, the equivalent one's expression moved into a function of its own (the invariants' predicates, the heartbeat bookkeeping).
 
 ## CI
 
-- **Every PR that touches their inputs** ([dev/ci.md](../../../dev/ci.md#what-runs)), **existing jobs:**
-  - `rust` runs nestd-core's tests and clippy, and builds it for `x86_64-unknown-none` (no `std`).
-  - `plan` runs the purity fence, the manifest and source check, and their tests.
-  - `rust` also runs cargo-deny over the checker's and the fuzz crate's lockfiles.
-- **New jobs on every PR** (times on a runner not yet measured). None of them fuzzes for a time. Two of their inputs do change from run to run: the fuzz replay's corpus comes from the latest weekly run, and cargo-mutants kills a mutant after a 60 s wall-clock timeout.
-  - `verify-nestd`: the checker's tests (`verification/nestd/check`, `cargo test --release`), then cargo-mutants on nestd-core in place.
-  - `kani-nestd`: the Kani proofs.
-  - `fuzz-nestd`: the seeds still decode, and every target replays the seeds and the cached corpus once.
-- **Timed fuzzing** runs weekly in `fuzz.yml`, which grows the corpus the PR job replays.
-- **Longer runs** (the every-fault check) are in [dev/ci.md](../../../dev/ci.md#verification).
+On every PR that touches their inputs: nestd-core's tests, its no-`std` build and the purity checks; the checker's tests then cargo-mutants (`verify-nestd`); the Kani proofs (`kani-nestd`); a replay of the fuzz seeds and corpus (`fuzz-nestd`). Timed fuzzing runs weekly. Jobs and longer runs: [dev/ci.md](../../../dev/ci.md#verification).
 
 ## Phase 2 design
 
-Phase 2 waits for the proxy link's rework (PR #28, still open on 2026-10-29) to merge. Each machine moves out of `host.rs` the way the fleet link did:
+Phase 2 waits for the proxy link's rework (PR #28, open) to merge. Each machine moves out of `host.rs` the way the fleet link did:
 1. characterization tests first;
 2. the core with its invariants;
 3. a shell that only performs effects;
@@ -401,7 +383,7 @@ Phase 2 waits for the proxy link's rework (PR #28, still open on 2026-10-29) to 
     - an older epoch never touches a newer one's row, pause handle or directory;
     - tombstones are pruned only when a newer epoch runs here or a destroy covers them.
   - **Liveness:** every found or fenced dirty incarnation is retired.
-- **Expected finding:** the study's incarnation B1 is expected to reproduce: a re-asked non-salvage request answered `stale_epoch` ends the retire without a salvage.
+- **Expected finding:** the study's incarnation B1 (fixed in #62) should reproduce with `reask_failure_ends_commit` reverted: a re-asked non-salvage request answered `stale_epoch` ends the retire without a salvage.
 - **Bounds:** one sandbox, epochs 1 to 3, two commits, one crash at each point, one store failure.
 
 ### Proxy link
@@ -435,4 +417,3 @@ Phase 2 waits for the proxy link's rework (PR #28, still open on 2026-10-29) to 
 ## Open questions
 
 - **Capability gating for new command variants:** the study's B5. An old nestd can't parse a new variant. Since phase 1 it no longer loses the batch silently: it skips it as unparseable, the next batch's gap makes it reconnect, and the resend brings the same batch back, so the host takes no further commands until it is upgraded (by code reading). Gating new variants on the hello's capabilities would avoid that. It belongs to the [fleet contract](../../interfaces/control-host/fleet/).
-- **Should the checker's every-fault run gate merges?** It does at about a minute on CI hardware, unmeasured; today it runs only with `--include-ignored`.

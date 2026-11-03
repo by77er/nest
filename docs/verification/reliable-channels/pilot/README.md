@@ -1,6 +1,6 @@
 # Reliable channels pilot: Stateright model of command delivery
 
-> **Study, not a decision.** Code on `main` (edf6829). Model: [verification/stateright/](../../../../verification/stateright/) (Stateright `=0.31.0`, `cargo test --release`). Inventory: [../README.md](../README.md) (finding B1).
+> **Study, not a decision.** Code on `main` (edf6829). Model: [verification/stateright/](../../../../verification/stateright/) (Stateright `=0.31.0`, `cargo test --release`). Inventory: [../README.md](../README.md) (finding B1). **Superseded:** #39 shipped both fixes below, with the capture at reset, and they are checked over nestd's real core in [nestd/](../../nestd/#fleet-link-phase-1).
 
 ## Verdict
 
@@ -106,32 +106,8 @@ Times are single-threaded on a shared WSL2 box and vary by up to 2x.
 ## Bug write-up (B1)
 
 - **Where:** `fleet.ts:762` with 772-778 (the hello window), `fleet.ts:1169-1171` with 706-716 (await or failure between push and send), and `fleet.rs:394-404` (no gap check, cumulative ack at 341).
-- **Trigger:** a higher seq reaches nestd before a lower one on the same connection. Ways that happen:
-  - (i) an `issueCommands` RPC from AgentDO or SandboxDO (`agent.ts:420,434`, `sandbox.ts:345,443,524,760`) lands during onHello's BrokerDO await while unacked batches exist;
-  - (ii) two batches to one host, the first carrying a secret ref (`agent_start` on brain hosts, `secrets_update` on sandbox hosts);
-  - (iii) a BrokerDO failure followed by any later command.
-  - Event-driven issues (`commit_result`) share onHello's queue, so they can't cause (i).
-- **Consequence:** the lower batch is dropped as "still processing", then deleted by the cumulative ack. It is never executed or answered (its result stays NULL). By command:
-  - `agent_start`: healed by AgentDO's `starting` deadline (inventory, not rechecked).
-  - `agent_attach`: SandboxDO keeps `attach_inflight`, so no binding until the next placement (inventory).
-  - `agent_detach`: the binding stays usable until it expires (inventory).
-  - `fence`: the sandbox keeps running. A lost STONITH fence is re-issued on the next hello by `ensureStonithFence` (`fleet.ts:795`), but this wasn't checked further.
-  - `sandbox_destroy`: the VM and disk leak until something else reaps them (unverified).
-  - `commit_result`: nestd times out and asks again under the same id (`crates/nestd/tests/host.rs:1526`).
-  - A nestd restart later fails anything still NULL, which masks some losses.
-- **Likelihood (unverified estimates):**
-  - (i) is the most likely: a deploy reconnects every host at once, and commands keep being issued during the BrokerDO round trip.
-  - (ii) needs concurrent secret-bearing commands, for example a captain starting several agents on one brain host.
-  - (iii) is rare, but once it happens the next command loses the batch deterministically.
-- **Reproduction:**
-  - **vitest** (workers pool, `control-plane/test/fleet.test.ts` style):
-    1. Connect a fake host and close it.
-    2. Call `issueCommands(h, [fence])` while it's down (seq N).
-    3. Reconnect with `hello{last_command_seq: N-1}`, with BrokerDO `bindingPublicKeys` stubbed to a deferred promise. This needs a seam like `ec2Override`.
-    4. Call `issueCommands(h, [sandbox_destroy])`, then resolve the promise.
-    5. Assert that the wire order is N+1 before N. Send `ack{up_to: N+1}`, then assert `rel_out` is empty and command N's `result` is NULL.
-    6. Variant: make `resolveRefs` reject for an `agent_start`.
-  - **cargo test** (`crates/nestd/tests/host.rs`, using `mock_fleet` at :274): send `commands{seq 2}` then `commands{seq 1}`. Assert `ack{up_to: 2}` and that seq 1's `command_result` never arrives. After the fix, assert that nestd reconnects instead.
+- **Trigger:** a higher seq reaches nestd before a lower one on the same connection: (i) an `issueCommands` RPC from AgentDO or SandboxDO lands during onHello's BrokerDO await while unacked batches exist (most likely: a deploy reconnects every host at once); (ii) two batches to one host, the first carrying a secret ref; (iii) a BrokerDO failure followed by any later command (then deterministic). Event-driven issues (`commit_result`) share onHello's queue, so they can't cause (i).
+- **Consequence:** the lower batch is dropped as "still processing", then deleted by the cumulative ack: never executed or answered (its result stays NULL until a nestd restart fails it). A lost `agent_start` is healed by AgentDO's `starting` deadline; a lost `agent_attach` leaves no binding until the next placement; a lost `agent_detach` leaves the binding usable until it expires; a lost `fence` leaves the sandbox running (a STONITH fence is re-issued at the next hello); a lost `sandbox_destroy` leaks the VM and disk (unverified); a lost `commit_result` makes nestd ask again under the same id.
 
 ## Fix options
 
@@ -142,37 +118,8 @@ Times are single-threaded on a shared WSL2 box and vary by up to 2x.
 | **Receiver gap check (b)** | nestd accepts only `forwarded ∨ last + 1`; a gap closes the socket. A fresh lineage takes its baseline from a new `hello_ack` field (the lowest seq FleetDO will send). Offline `last := max` (`fleet.rs:190`). FleetDO still closes on a BrokerDO failure | holds | protocol and fixture change, ~40 Rust + ~15 TS lines; reconnect churn under races |
 | **Capture at reset** | at `fleet.ts:755`, select the old lineage's NULL results and write their failures synchronously with `rel.reset`; run the follow-ups (`onCommandResult` DO calls) afterwards | required by both | ~15 TS lines |
 
-**Recommendation:** (c) plus capture at reset. Add (b)'s gap check later as a tripwire (log and reconnect), but only with the baseline and the offline `max`. The inventory's "or the first after hello" baseline is unsound (`b-firstbase`).
+**Recommendation:** (c) plus capture at reset, with (b)'s gap check as a tripwire, only with the baseline and the offline `max`. The inventory's "or the first after hello" baseline is unsound (`b-firstbase`). #39 shipped all three.
 
 ## Effort
 
-- **Model:** ~450 lines of model and ~280 of harness (`check`, `counterexample`, `describe`), plus a 45-line `main` and 105 lines of tests.
-- **Time:** about 4 agent-hours, roughly:
-  - 1 h reading code;
-  - 1.5 h modelling;
-  - 1.5 h on Stateright quirks, bounds and runs.
-
-## Stateright, frankly
-
-- **Ergonomics:**
-  - The `Model` trait (`init_states`, `actions`, `next_state`, `properties`) is plain Rust over `#[derive(Hash)]` structs. Debugging uses ordinary tests and prints.
-  - Property closures are `fn` pointers: they can't capture anything and need explicit parameter types, so configuration goes through `&M`.
-- **Gotchas:**
-  - A BFS overwrites a discovery at every later violating state, so a full run reports an arbitrary long trace. I added a depth-bounded binary search to get shortest traces.
-  - `eventually` ignores cycles and DAG joins (documented false negatives). The model is shaped to avoid both: a monotone predicate, bounded faults, and a boundary on closes.
-  - A liveness trace must exhaust the fault budgets before a state counts as terminal, which adds noise.
-  - Memory use wasn't measured. Stateright keeps every fingerprint in memory, and 46M states ran fine.
-- **Sharing nest-protocol types:**
-  - Possible as a path dependency, but `Command` and `FleetToHost` carry ids and bodies, which would blow up the state. Bitmasks over seqs are the right abstraction.
-  - The real win would be to extract nestd's accept decision (`fleet.rs:394-404`) and FleetDO-side ordering rules into pure functions that the model calls. Stateright would then check the shipped receiver logic, which TLA+ can't do.
-- **Versus TLA+:**
-  - Stateright wins on:
-    - same language and CI (`cargo test`);
-    - reuse of real Rust functions;
-    - IDE and debugger;
-    - ~200-400k states/s single-threaded.
-  - It loses on:
-    - no fairness, leads-to or cycle detection (only always, eventually and sometimes);
-    - rougher traces (I wrote the printer);
-    - no proof or refinement path (TLAPS, Apalache);
-    - more boilerplate than a TLA+ spec (unverified until the TLA+ pilots report).
+About 450 lines of model, 280 of harness and 105 of tests; about 4 agent-hours. Stateright's strengths and gaps as found here are in [methods](../../methods/).

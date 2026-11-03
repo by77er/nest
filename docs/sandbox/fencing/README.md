@@ -35,7 +35,7 @@ Every STONITH records each sandbox's loss explicitly ("work since generation G a
 
 ## 5. Salvage
 
-If a host that was fenced off comes back with uncommitted work, it commits that work as a **sibling branch** off its last parent. SandboxDO logs it; owners hear of it once agent events reach them as webhooks (not built). No agent work is silently lost.
+If a host that was fenced off comes back with uncommitted work, it commits that work as a **sibling branch** off its last parent, which SandboxDO keeps as an orphan and logs (no [owner event](../../control-plane/api/clients/#events-to-the-owner) carries it). No agent work is silently lost.
 
 The same happens when a newer epoch of a sandbox is created on a host that still has an older, dirty incarnation: the old work is salvaged in the background from its own directory (incarnations never share a disk), and the new one doesn't wait. A salvage that fails transiently is retried with backoff until it lands or the incarnation is destroyed; one refused for good is dropped and logged. A commit rejected for a stale epoch fences the sandbox and offers its work as salvage too. Salvage holds the sandbox lock only while chunking, never while waiting for the control plane. Salvage can't flush the guest (a fenced VM never runs again), so its cut is crash-consistent ([disk](../state/disk/#flush-before-commit)).
 

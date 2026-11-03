@@ -5,14 +5,14 @@ A capability's `brokered` source grants **actions the control plane runs for the
 ## Catalog
 
 ```yaml
-capability: gh-nest
+capability: gh-app
 brokered:
-  - {action: github.create_pr, repos: [by77er/nest]}          # scoped: allow when tainted (the default)
-  - {action: github.comment, repos: [by77er/nest]}
+  - {action: github.create_pr, repos: [me/app]}               # scoped: allow when tainted (the default)
+  - {action: github.comment, repos: [me/app]}
   - {action: github.create_issue}                              # unscoped: any repo the App is installed on; approve when tainted
   - {action: http.request, profile: status, base_url: https://api.example.com/v1, methods: [GET, POST], paths: [/incidents],
      auth: {secret: "http:status", header: authorization, scheme: Bearer}, trusted: false, idempotency_header: Idempotency-Key}
-prompt: Open PRs and comment on by77er/nest; file issues anywhere the App is installed (the operator approves those from a tainted session).
+prompt: Open PRs and comment on me/app; file issues anywhere the App is installed (the operator approves those from a tainted session).
 ```
 
 - **Actions:** `github.comment`, `github.create_issue`, `github.create_pr`, `github.review_comment`, `github.fork` ([forks](#forks)), `http.request`. `email.send` is reserved: no email provider exists, so the catalog refuses it and a call answers `not_implemented`. The design's `github.review_check`, `github.dispatch_workflow` and `github.create_webhook` aren't built.
@@ -62,7 +62,7 @@ Each action's installation token is minted for its one repo and only: `github.co
 - **The App can't fork it.** GitHub's fork endpoint works for a GitHub App only when "the GitHub App [is] installed on the destination account with access to all repositories and on the source account with access to the source repository" ([create a fork](https://docs.github.com/en/rest/repos/forks#create-a-fork), read 2026-11-01), and the App isn't installed upstream. So the fork is made with **the operator's own token**, `github_user` in BrokerDO: a fine-grained PAT needs Administration (write) and Contents (read) for `POST /repos/{owner}/{repo}/forks` ([fine-grained permissions](https://docs.github.com/en/rest/authentication/permissions-required-for-fine-grained-personal-access-tokens); unverified that it suffices to fork another account's public repo). The answer is 202 and the fork's git objects can take a moment.
 - **`github.fork{repo}`** (an entry `{action: github.fork, repos?: [upstreams]}`; default 5 an hour): always the operator's approval; then `POST /repos/{upstream}/forks {default_branch_only: true}` with `github_user`, and the fork joins the agent's part of its sandbox's push allowlist while attached. A lost answer or a redelivery asks GitHub again (that GitHub answers the existing fork for a repeat is unverified). The result is ids and URLs: `fork`, `url`, and `compare`, `https://github.com/<upstream>/compare/<base>...<fork-owner>:<fork-name>:<branch>`.
 - **The fork needs the App to push to it:** a new fork isn't in an installation with "Only select repositories" until the operator adds it; "All repositories" includes repos created later (GitHub's settings page; unverified in GitHub's docs). Without it, the mint leaves the fork out (audited) and pushes fail at GitHub.
-- **The upstream pull request is the operator's:** the agent pushes its branch to the fork and hands over the compare link (in its final text, or through a coordination integration); the operator opens it. **Why not an action:** the App can't open a PR upstream, and a fine-grained PAT can't write to public repos the user doesn't own or belong to through an org: "Only personal access tokens (classic) have write access for public repositories that are not owned by you or an organization that you are not a member of" ([managing tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens), read 2026-11-01). A classic PAT with `public_repo` would reach every public repo the owner can, far beyond one PR. An action through one, always `approve`, is an open question.
+- **The upstream pull request is the operator's:** the agent pushes its branch to the fork and hands over the compare link (in its final text, or through a coordination integration); the operator opens it. **Why not an action:** the App can't open a PR upstream, and a fine-grained PAT can't write to public repos the user doesn't own or belong to through an org: "Only personal access tokens (classic) have write access for public repositories that are not owned by you or an organization that you are not a member of" ([managing tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens), read 2026-11-01). A classic PAT with `public_repo` would reach every public repo the owner can, far beyond one PR.
 
 ## Journal
 
@@ -70,7 +70,7 @@ AgentDO's `brokered_journal`, one row per call key: action, target (repo or prof
 
 ## Not built
 
-`email.send` (no provider), an upstream pull request through the operator's token ([forks](#forks)), `github.review_check`, `github.dispatch_workflow`, `github.create_webhook`, the `api` source, a secret scan of mcp tool arguments, and a per-server or global cap (the cap is per agent).
+`email.send` (no provider), `github.review_check`, `github.dispatch_workflow`, `github.create_webhook`, the `api` source, a secret scan of mcp tool arguments, and a per-server or global cap (the cap is per agent).
 
 ## Open questions
 
