@@ -78,7 +78,8 @@ export function TaskChipPending({ children }: { children: ReactNode }) {
 }
 
 export const TaskCardTitleAnchor = forwardRef<HTMLAnchorElement, AnchorHTMLAttributes<HTMLAnchorElement>>(function TaskCardTitleAnchor({ className: _c, ...rest }, ref) {
-  return <a ref={ref} className={classes.cardTitle} {...rest} />;
+  // The whole card's link (its ::after covers the card): never a positioned box of its own.
+  return <a ref={ref} className={classes.cardTitle} data-ds="card-title" {...rest} />;
 });
 
 export function TaskCards({ children }: { children: ReactNode }) {
