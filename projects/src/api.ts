@@ -126,7 +126,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "GET secrets": {
       // Metadata only: the app's, with nest's last injection and size; never a value.
-      const [mine, g] = await Promise.all([p.secrets(), grantOf(env)]);
+      const [mine, g, layers] = await Promise.all([p.secrets(), grantOf(env), p.network()]);
       if (!mine.ok) return done(mine);
       const nest = nestFrom(env);
       let theirs: Map<string, { size: number; last_injected_ms: number | null }> = new Map();
@@ -144,6 +144,8 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
         }),
         grant: g.ok ? { ...g.value, used: theirs.size } : null,
         client: clientIdOf(env.NEST_CLIENT_TOKEN),
+        // Each live agent's client layer, which carries its bindings and variables (shared with the Network page).
+        agents: layers.ok ? layers.value.agents : [],
       });
     }
     case "PUT secrets/:name": {
@@ -152,7 +154,9 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       if (!b.ok) return b.res;
       const { value, ...meta } = b.value;
       const g = await grantOf(env);
-      const problems = secretProblems({ name, ...meta }, g.ok ? g.value : null);
+      const others = await p.secrets();
+      const taken = others.ok ? others.value.filter((x) => x.name !== name).map((x) => x.env) : [];
+      const problems = secretProblems({ name, ...meta }, g.ok ? g.value : null, taken);
       if (value !== undefined) {
         const v = valueProblem(value, g.ok ? g.value : null);
         if (v) problems.value = v;

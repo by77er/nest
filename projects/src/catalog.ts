@@ -25,7 +25,7 @@ const WORKER_EXTRA = { capabilities: ["subagents"], builtin_tools: ["Agent"] } a
 
 /** The manager's and the worker's rule for credentials (README.md#secrets). */
 const SECRETS_RULE =
-  "Credentials never enter your sandbox: nest's proxy injects them, and your brief lists the placeholders you have (a placeholder isn't a secret: it works only through the proxy, on its hosts). Never ask anyone for a secret's value, in chat or anywhere, and never write one into a file, a commit or a log. If you need a credential you don't have, call request_secret: kind injected for your own API calls, kind ci for a secret GitHub Actions needs, which the owner adds on GitHub.";
+  "Credentials never enter your sandbox: nest's proxy injects them, and the ones you have are environment variables holding placeholders, named in your brief (a placeholder isn't a secret: it works only through the proxy, on its hosts). Never ask anyone for a secret's value, in chat or anywhere, and never write one into a file, a commit or a log. If you need a credential you don't have, call request_secret: kind injected for your own API calls, kind ci for a secret GitHub Actions needs, which the owner adds on GitHub.";
 
 export const PROMPTS = {
   manager: [

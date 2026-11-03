@@ -77,6 +77,11 @@ export class FakeApi {
   };
 
   /** What the Worker's attention list answers: open asks and blocked tasks, oldest first. */
+  /** A secrets change, like a network one, is owed to every live agent's layer (one revision for both). */
+  layersOwed(): void {
+    this.network = { ...this.network, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
+  }
+
   attention(): Attention[] {
     const asks = this.asks.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
     const blocked = this.tasks.filter((t) => t.blocked).map((t): Attention => ({ kind: "blocked", task: t.id, title: t.title, state: t.state, ...t.blocked! }));
@@ -112,11 +117,13 @@ export class FakeApi {
         const had = this.secrets.find((x) => x.name === name);
         const row = { name, size: _v ? new TextEncoder().encode(_v).length : had?.size ?? null, created_ms: had?.created_ms ?? now, updated_ms: now, holders: had?.holders ?? [], last_injected_ms: null, in_nest: true, ...meta };
         this.secrets = [...this.secrets.filter((x) => x.name !== name), row];
+        this.layersOwed();
         return json(row);
       }
       if (m === "DELETE") {
         const had = this.secrets.find((x) => x.name === name);
         this.secrets = this.secrets.filter((x) => x.name !== name);
+        this.layersOwed();
         return json({ deleted: name, holders: had?.holders ?? [] });
       }
     }
@@ -157,7 +164,7 @@ export class FakeApi {
       case "GET reviews":
         return json(this.reviews);
       case "GET secrets":
-        return json({ secrets: this.secrets, grant: this.grant, client: "cli_app" });
+        return json({ secrets: this.secrets, grant: this.grant, client: "cli_app", agents: this.network.agents });
       case "GET prs/open":
         return json(this.openPrs);
       case "GET chat":

@@ -76,7 +76,11 @@ export function useSetNetwork(id: string) {
   return useMutation({
     mutationFn: (b: NetworkBody) => api.setNetwork(id, b),
     meta: { failure: "The network rules weren't saved" },
-    onSuccess: (v) => qc.setQueryData(["projects", id, "network"], v),
+    onSuccess: (v) => {
+      // The same layers carry the secrets: their statuses on the Secrets page move too.
+      void qc.invalidateQueries({ queryKey: keys.secrets(id) });
+      qc.setQueryData(["projects", id, "network"], v);
+    },
   });
 }
 
@@ -120,7 +124,9 @@ export const useDetachPr = (id: string) => useRelationWrite(id, (v: { task: stri
 export const useAddDependency = (id: string) => useRelationWrite(id, (v: { task: string; blocked_by: string }) => api.addDependency(id, v.task, { blocked_by: v.blocked_by }), "The dependency wasn't added");
 export const useRemoveDependency = (id: string) => useRelationWrite(id, (v: { task: string; blocker: string }) => api.removeDependency(id, v.task, v.blocker), "The dependency wasn't removed");
 
-export const useSecrets = (id: string) => useQuery({ queryKey: keys.secrets(id), queryFn: () => api.secrets(id), refetchInterval: POLL.reviews });
+/** The Secrets page: polled faster while a change reaches the live agents. */
+export const useSecrets = (id: string) =>
+  useQuery({ queryKey: keys.secrets(id), queryFn: () => api.secrets(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.reviews) });
 
 /** Save a secret's settings, and its value when one is given (straight to nest; never kept by the page). */
 export function usePutSecret(id: string) {
@@ -130,6 +136,7 @@ export function usePutSecret(id: string) {
     meta: { failure: "The secret wasn't saved" },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: keys.attention(id) });
+      void qc.invalidateQueries({ queryKey: ["projects", id, "network"] });
       return qc.invalidateQueries({ queryKey: keys.secrets(id) });
     },
   });
@@ -140,7 +147,10 @@ export function useDeleteSecret(id: string) {
   return useMutation({
     mutationFn: (name: string) => api.deleteSecret(id, name),
     meta: { failure: "The secret wasn't deleted" },
-    onSuccess: () => qc.invalidateQueries({ queryKey: keys.secrets(id) }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["projects", id, "network"] });
+      return qc.invalidateQueries({ queryKey: keys.secrets(id) });
+    },
   });
 }
 

@@ -170,6 +170,17 @@ export class FakeNest {
     });
     let m: RegExpMatchArray | null;
     const r = `${req.method} ${u.pathname}`;
+    // nest's env rules (docs/control-plane/api/clients/#environment): names, and a placeholder value only
+    // as exactly the placeholder of a binding declared beside it.
+    const envProblem = (vars: Record<string, string> | undefined, inject: { name: string }[]) => {
+      const entries = Object.entries(vars ?? {});
+      if (entries.length > 64) return "at most 64 variables";
+      for (const [k, v] of entries) {
+        if (!/^[A-Z_][A-Z0-9_]{0,63}$/.test(k) || ["PATH", "HOME", "GITHUB_TOKEN"].includes(k) || k.startsWith("NEST_")) return `env: ${k} isn't allowed`;
+        if (v.includes("nest-ph.") && !inject.some((b) => v === `nest-ph.${CLIENT}.${b.name}.`)) return `env: ${k} holds a placeholder of no binding beside it`;
+      }
+      return null;
+    };
     if (r === "POST /v1/sandboxes") {
       // A client's own bindings and workflows, within its grant (docs/control-plane/api/clients/#injection).
       const inject = (call.body.inject ?? []) as { name: string; secret: string; hosts: string[] }[];
@@ -178,6 +189,8 @@ export class FakeNest {
         if (outside.length) return nestErr(403, "forbidden", `inject hosts ${outside.join(", ")} are outside the grant`);
       }
       if (inject.length > 16) return nestErr(400, "invalid", "at most 16 bindings");
+      const bad = envProblem(call.body.env, inject);
+      if (bad) return nestErr(400, "invalid_message", bad);
       if (call.body.github_push?.workflows && !this.grant.github_push?.workflows) return nestErr(403, "forbidden", "github_push.workflows is outside the grant");
       // Its client layer starts as its create's egress, bindings and env (docs/control-plane/api/clients/#the-client-layer).
       const s = {
@@ -222,11 +235,15 @@ export class FakeNest {
         const allow = (call.body?.egress?.allow ?? []) as { host: string }[];
         const outside = allow.filter((x) => !this.egressHosts.some((h) => h === x.host || (h.startsWith("*.") && x.host.endsWith(h.slice(1)))));
         if (outside.length) return nestErr(403, "forbidden", `egress host ${outside[0]!.host} is outside the grant`);
+        const inject = (call.body?.inject ?? []) as { name: string; hosts: string[] }[];
+        const injectOutside = inject.flatMap((b) => b.hosts).filter((h) => !this.grant.inject_hosts.includes(h) && !this.grant.inject_hosts.some((a) => a.startsWith("*.") && h.endsWith(a.slice(1))));
+        if (injectOutside.length) return nestErr(403, "forbidden", `inject host ${injectOutside[0]} is outside the grant`);
+        const bad = envProblem(call.body?.env, inject);
+        if (bad) return nestErr(400, "invalid_message", bad);
         sb.layer = { egress: { allow }, inject: call.body?.inject ?? [], env: call.body?.env ?? {} };
         return json(200, { version: 2 });
       }
     }
-    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, grant: { egress_hosts: this.egressHosts } });
     if (r === "GET /v1/sandboxes") {
       const rows = [...this.sandboxes.values()].filter((s) => !s.ended && labelsMatch(s.labels));
       return json(200, { sandboxes: rows.map((s) => ({ sandbox: s.sandbox, cell: CELL, client: CLIENT, owner: s.owner, labels: s.labels, created_ms: 1, ended_ms: null })), next_cursor: null });
@@ -298,7 +315,7 @@ export class FakeNest {
       this.catalog.set(`${m[1]}/${m[2]}/${m[3]}`, call.body);
       return json(200, { ok: true });
     }
-    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: this.grant, created_ms: 1 });
+    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts }, created_ms: 1 });
     if (r === "GET /v1/clients/self/secrets") {
       return json(200, { secrets: [...this.secrets].sort(([a], [b]) => a.localeCompare(b)).map(([name, x]) => ({ name, description: x.description, size: new TextEncoder().encode(x.value).length, created_ms: x.created_ms, updated_ms: x.updated_ms, last_injected_ms: x.last_injected_ms })) });
     }

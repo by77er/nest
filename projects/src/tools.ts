@@ -38,7 +38,7 @@ const dimension = (question: string) => ({
 const REQUEST_SECRET: ToolDef = {
   name: "request_secret",
   description:
-    "Ask the owner for a credential you need, never its value: `injected` for one your sandbox's requests to an API need (nest's proxy injects it; you get a placeholder), `ci` for a GitHub Actions secret the repo's CI needs (the owner adds it on GitHub). It shows in the owner's \"Needs you\".",
+    "Ask the owner for a credential you need, never its value: `injected` for one your sandbox's requests to an API need (nest's proxy injects it; your sandbox gets a variable holding a placeholder), `ci` for a GitHub Actions secret the repo's CI needs (the owner adds it on GitHub). It shows in the owner's \"Needs you\".",
   inputSchema: obj({
     name: str("injected: lowercase, like cloudflare_api_token; ci: the Actions secret's name, like NPM_TOKEN.", 100),
     purpose: str("What it's for, and why you can't do without it.", 1000),

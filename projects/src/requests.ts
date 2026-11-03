@@ -50,6 +50,8 @@ export const PutSecret = z.strictObject({
   hosts: z.array(z.string().min(1).max(253)).min(1).max(16),
   locations: z.array(Location).min(1).max(3),
   roles: z.array(z.enum(["worker", "manager", "reviewer"])).min(1).max(3),
+  /** The variable holding its placeholder (src/secrets.ts checks it). */
+  env: z.string().min(1).max(64),
 });
 export const Chat = z.strictObject({ text: z.string().min(1).max(20000) });
 export const Answer = z.strictObject({ answer: z.string().max(20000) });

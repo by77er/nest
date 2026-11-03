@@ -4,25 +4,20 @@
 // sandbox's create and live ones through their sandbox's client layer, each shown applied, pending or
 // failed. The operator's base rules are shown read-only.
 
-import { ActionIcon, Badge, Button, Select, Text, TextInput } from "@mantine/core";
+import { ActionIcon, Button, Select, Text, TextInput } from "@mantine/core";
 import { IconPlus, IconWorld, IconX } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
 import { useEffect, useMemo, useState } from "react";
 import { NETWORK_PRESETS, NETWORK_ROLES, type NetworkRole, normalizeRules, type OperatorRule, rulesProblems } from "../../../network";
 import { useNetwork, useSetNetwork } from "../../api/queries";
-import type { EgressRule, LayerStatus, NetworkView, RoleRules } from "../../api/types";
-import { ago, exact } from "../../common/time";
+import type { EgressRule, NetworkView, RoleRules } from "../../api/types";
 import { ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Stack, Toolbar } from "../../layout";
+import { LiveAgents } from "../project/LiveAgents";
 import { ProjectFrame } from "../project/ProjectFrame";
 
 const ROLE: Record<NetworkRole, { title: string; description: string }> = {
   worker: { title: "Workers", description: "Every task's worker: what it installs and downloads while it builds and tests." },
   manager: { title: "Manager", description: "The project's manager, which reads the repo and specs tasks." },
-};
-const STATE: Record<LayerStatus["state"], { label: string; color: "success" | "warning" | "danger" }> = {
-  applied: { label: "Applied", color: "success" },
-  pending: { label: "Pending", color: "warning" },
-  failed: { label: "Failed", color: "danger" },
 };
 
 const portsText = (r: EgressRule) => (r.ports ? `ports ${r.ports.join(", ")}` : "ports 80, 443");
@@ -133,43 +128,6 @@ function RoleRulesEditor({ role, rules, egressHosts, onChange }: { role: Network
   );
 }
 
-function LiveAgents({ agents }: { agents: LayerStatus[] }) {
-  if (agents.length === 0) {
-    return (
-      <Text fz="sm" c="dimmed">
-        No live agents. New ones get these rules when their sandbox is made.
-      </Text>
-    );
-  }
-  return (
-    <Panel dense>
-      <Stack gap="md" role="list" aria-label="Live agents' network">
-        {agents.map((a) => (
-          <Row key={a.agent} role="listitem" justify="space-between" align="flex-start" wrap="nowrap" data-agent={a.agent}>
-            <Stack gap="2xs">
-              <Text fz="sm" ff="monospace">
-                {a.agent}
-              </Text>
-              <Text fz="xs" c="dimmed" title={a.at_ms ? exact(a.at_ms) : undefined}>
-                {a.role === "worker" ? "Worker" : "Manager"}
-                {a.at_ms ? ` · updated ${ago(a.at_ms)}` : ""}
-              </Text>
-              {a.error && (
-                <Text fz="xs" c={a.state === "failed" ? "danger" : "dimmed"}>
-                  {a.error}
-                </Text>
-              )}
-            </Stack>
-            <Badge variant="light" color={STATE[a.state].color} data-slot="state">
-              {STATE[a.state].label}
-            </Badge>
-          </Row>
-        ))}
-      </Stack>
-    </Panel>
-  );
-}
-
 function NetworkForm({ projectId, view }: { projectId: string; view: NetworkView }) {
   const save = useSetNetwork(projectId);
   const [draft, setDraft] = useState<RoleRules>(view.rules);
@@ -262,7 +220,7 @@ export function NetworkPage() {
                 )}
               </Section>
               <Section title="Live agents" dense count={net.data.agents.length} region={false}>
-                <LiveAgents agents={net.data.agents} />
+                <LiveAgents agents={net.data.agents} label="Live agents' network" empty="No live agents. New ones get these rules when their sandbox is made." />
               </Section>
             </Stack>
           )}

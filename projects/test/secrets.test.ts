@@ -1,7 +1,8 @@
 // A project's secrets (README.md#secrets): values go to nest at once and nowhere else in the app; nest's
-// names are project-scoped; each role's sandboxes get the bindings for it, frozen per start attempt; the
-// brief names placeholders and hosts, never values; agents request secrets as "Needs you" items; the
-// workflows setting reaches worker sandboxes only; the grant's limits are checked and shown.
+// names are project-scoped; each role's sandboxes get the bindings and variables for it, at the create
+// (frozen per start attempt) and live through their client layer, which keeps the network's rules; the
+// brief names variables and hosts, never placeholders or values; agents request secrets as "Needs you"
+// items; the workflows setting reaches worker sandboxes only; the grant's limits are checked and shown.
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
@@ -36,7 +37,12 @@ async function newProject() {
 }
 type P = Awaited<ReturnType<typeof newProject>>;
 const put = (p: P, name: string, body: Record<string, unknown>) => api(token, "PUT", `/api/projects/${p.id}/secrets/${name}`, body);
-const npm = (value?: string, roles = ["worker"]) => ({ ...(value ? { value } : {}), description: "npm publish", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }], roles });
+const npm = (value?: string, roles = ["worker"], env = "NPM_TOKEN") =>
+  ({ ...(value ? { value } : {}), description: "npm publish", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }], roles, env });
+const cf = (value?: string, roles = ["manager"]) =>
+  ({ ...(value ? { value } : {}), description: "DNS", hosts: ["api.cloudflare.com"], locations: [{ type: "authorization_bearer" }], roles, env: "CLOUDFLARE_API_TOKEN" });
+const drain = (p: P) => env.PROJECT.get(env.PROJECT.idFromName(p.id)).drain();
+const layerPuts = (agent: string) => fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${fake.agents.get(agent)!.sandbox!}/client-policy$`));
 async function assignedWorker(p: P) {
   const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "t" })).body;
   await api(token, "PUT", `/api/projects/${p.id}/tasks/${t.id}/spec`, spec);
@@ -86,6 +92,7 @@ describe("a secret's value", () => {
     const b = await newProject();
     await put(a, "npm_token", npm(valueOf("a")));
     await put(b, "npm_token", npm(valueOf("b")));
+    expect((await put(a, "other_npm", npm(valueOf("a2")))).body.problems).toEqual({ env: "Another secret uses NPM_TOKEN" });
     expect(fake.secrets.get(`${a.id}-npm_token`)?.value).toBe(valueOf("a"));
     expect(fake.secrets.get(`${b.id}-npm_token`)?.value).toBe(valueOf("b"));
     expect((await api(token, "DELETE", `/api/projects/${a.id}/secrets/npm_token`)).status).toBe(200);
@@ -96,24 +103,26 @@ describe("a secret's value", () => {
 });
 
 describe("injection", () => {
-  it("binds a secret on the sandboxes of its roles only, and names its placeholder and hosts in the brief", async () => {
+  it("binds a secret on the sandboxes of its roles only, its variable holding the placeholder; the brief names the variable", async () => {
     const p = await newProject();
     await put(p, "npm_token", npm(valueOf("w"), ["worker"]));
-    await put(p, "cf_token", { value: valueOf("r"), description: "", hosts: ["api.cloudflare.com"], locations: [{ type: "header", name: "X-Auth-Key" }], roles: ["reviewer"] });
+    await put(p, "cf_token", { value: valueOf("r"), description: "", hosts: ["api.cloudflare.com"], locations: [{ type: "header", name: "X-Auth-Key" }], roles: ["reviewer"], env: "CF_AUTH_KEY" });
     const w = await assignedWorker(p);
-    expect(sandboxOf(w.worker).inject).toEqual([{ name: "npm_token", secret: `${p.id}-npm_token`, hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] }]);
+    expect(sandboxOf(w.worker).layer.inject).toEqual([{ name: "npm_token", secret: `${p.id}-npm_token`, hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] }]);
+    expect(sandboxOf(w.worker).layer.env).toEqual({ NPM_TOKEN: `nest-ph.${CLIENT}.npm_token.` });
     const brief = fake.inbox.find((m) => m.agent === w.worker)!.text;
-    expect(brief).toContain(`NPM_TOKEN=nest-ph.${CLIENT}.npm_token.`);
-    expect(brief).toContain("on registry.npmjs.org, as Authorization: Bearer <placeholder>");
-    expect(brief).not.toContain("cf_token");
+    expect(brief).toContain("- $NPM_TOKEN (npm publish): registry.npmjs.org, as a bearer token.");
+    expect(brief).not.toContain("nest-ph.");
+    expect(brief).not.toContain("CF_AUTH_KEY");
     // A reviewer gets its own.
     await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 1, sha: sha(), action: "opened" }));
     await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
     const reviewer = [...fake.agents.values()].find((a) => a.labels.project === p.id && a.labels.role === "reviewer")!;
-    expect(sandboxOf(reviewer.agent).inject!.map((b) => b.name)).toEqual(["cf_token"]);
-    expect(fake.inbox.find((m) => m.agent === reviewer.agent)!.text).toContain(`CF_TOKEN=nest-ph.${CLIENT}.cf_token.`);
+    expect((sandboxOf(reviewer.agent).layer.inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
+    expect(sandboxOf(reviewer.agent).layer.env).toEqual({ CF_AUTH_KEY: `nest-ph.${CLIENT}.cf_token.` });
+    expect(fake.inbox.find((m) => m.agent === reviewer.agent)!.text).toContain("- $CF_AUTH_KEY: api.cloudflare.com, as the X-Auth-Key header.");
     // The manager, started before either, has none.
-    expect(sandboxOf(p.manager).inject).toEqual([]);
+    expect(sandboxOf(p.manager).layer.inject).toEqual([]);
   });
 
   it("a start attempt's sandbox is the same request on a retry, though the secrets changed meanwhile", async () => {
@@ -129,14 +138,93 @@ describe("injection", () => {
     const task = (await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body;
     expect(task.state, JSON.stringify(task)).toBe("in_progress");
     expect([...fake.sandboxes.values()].filter((x) => x.labels.task === t.id)).toHaveLength(1);
+    // Created as first asked, with the binding; the change since is owed to its layer once it's live.
+    const worker = task.assignee as string;
+    expect(fake.callsTo("POST", /^\/v1\/sandboxes$/).filter((c) => c.body.labels?.task === t.id).every((c) => c.body.inject?.length === 1)).toBe(true);
+    await drain(p);
+    expect(sandboxOf(worker).layer).toMatchObject({ inject: [], env: {} });
   });
 
-  it("deleting a secret names the live agents that had it", async () => {
+  it("deleting a secret names the live agents that had it, and takes it out of their layers", async () => {
     const p = await newProject();
     await put(p, "npm_token", npm(valueOf("d")));
     const w = await assignedWorker(p);
     expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.secrets[0].holders).toEqual([{ agent: w.worker, role: "worker" }]);
     expect((await api(token, "DELETE", `/api/projects/${p.id}/secrets/npm_token`)).body).toEqual({ deleted: "npm_token", holders: [{ agent: w.worker, role: "worker" }] });
+    await drain(p);
+    expect(sandboxOf(w.worker).layer).toMatchObject({ inject: [], env: {} });
+    const view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
+    expect(view.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: w.worker, state: "applied" })]));
+  });
+});
+
+describe("live agents", () => {
+  it("a secret added, re-roled or edited reaches live layers at once, keeping each role's network rules", async () => {
+    const p = await newProject();
+    expect((await api(token, "PUT", `/api/projects/${p.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }] })).status).toBe(200);
+    const w = await assignedWorker(p);
+    const workerPuts = layerPuts(w.worker).length;
+    // Added for the manager: its live layer gets the binding and its variable, beside its rules.
+    expect((await put(p, "cf_token", cf(valueOf("c")))).status).toBe(200);
+    await drain(p);
+    const binding = { name: "cf_token", secret: `${p.id}-cf_token`, hosts: ["api.cloudflare.com"], locations: [{ type: "authorization_bearer" }] };
+    expect(sandboxOf(p.manager).layer).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [binding], env: { CLOUDFLARE_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` } });
+    // Not for workers: nothing written to theirs.
+    expect(layerPuts(w.worker).length).toBe(workerPuts);
+    let view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
+    expect(view.secrets[0].holders).toEqual([{ agent: p.manager, role: "manager" }]);
+    expect(view.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: p.manager, role: "manager", state: "applied" })]));
+    // Moved to workers: it leaves the manager's layer (its rules kept) and joins the worker's.
+    await put(p, "cf_token", cf(undefined, ["worker"]));
+    await drain(p);
+    expect(sandboxOf(p.manager).layer).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [], env: {} });
+    expect(sandboxOf(w.worker).layer).toMatchObject({ inject: [binding], env: { CLOUDFLARE_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` } });
+    view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
+    expect(view.secrets[0].holders).toEqual([{ agent: w.worker, role: "worker" }]);
+    // A new variable name reaches it too.
+    await put(p, "cf_token", { ...cf(undefined, ["worker"]), env: "CF_API_TOKEN" });
+    await drain(p);
+    expect(sandboxOf(w.worker).layer.env).toEqual({ CF_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` });
+    // A new value, or a new description, changes no layer: nest pushes the value to the proxies itself.
+    const before = fake.callsTo("PUT", /\/client-policy$/).length;
+    await put(p, "cf_token", { ...cf(valueOf("c2"), ["worker"]), env: "CF_API_TOKEN", description: "renamed" });
+    await drain(p);
+    expect(fake.callsTo("PUT", /\/client-policy$/).length).toBe(before);
+    // And a network change afterwards keeps the secrets in the layer (one feed each, one layer).
+    await api(token, "PUT", `/api/projects/${p.id}/network`, { worker: [{ host: "pypi.org" }], manager: [{ host: "nodejs.org" }] });
+    expect(sandboxOf(w.worker).layer).toEqual({ egress: { allow: [{ host: "pypi.org" }] }, inject: [binding], env: { CF_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` } });
+  });
+
+  it("a layer nest refuses shows as failed on the Secrets page; a retry after a transient one applies it", async () => {
+    const p = await newProject();
+    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403);
+    await put(p, "cf_token", cf(valueOf("f")));
+    await drain(p);
+    let agents = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.agents;
+    expect(agents).toEqual([expect.objectContaining({ agent: p.manager, state: "failed", error: expect.stringContaining("403") })]);
+    expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.secrets[0].holders).toEqual([]);
+    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 503);
+    await put(p, "cf_token", { ...cf(undefined), env: "CF_TOKEN" });
+    await drain(p);
+    agents = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.agents;
+    expect(agents[0].state).toBe("pending");
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE layers SET next_ms = 0 WHERE next_ms IS NOT NULL");
+    });
+    await drain(p);
+    agents = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.agents;
+    expect(agents[0]).toMatchObject({ state: "applied", error: null });
+    expect(sandboxOf(p.manager).layer.env).toEqual({ CF_TOKEN: `nest-ph.${CLIENT}.cf_token.` });
+  });
+
+  it("refuses a variable nest sets, a malformed one, or one another secret uses", async () => {
+    const p = await newProject();
+    for (const [v, re] of [["PATH", /set by nest/], ["NEST_AGENT", /set by nest/], ["HTTPS_PROXY", /set by nest/], ["lower", /Capital letters/], ["1X", /Capital letters/]] as const) {
+      const r = await put(p, "x_token", { ...npm(valueOf("v")), env: v });
+      expect(r.status, v).toBe(400);
+      expect(r.body.problems.env).toMatch(re);
+    }
+    expect(fake.secrets.has(`${p.id}-x_token`)).toBe(false);
   });
 });
 
@@ -144,16 +232,17 @@ describe("the grant", () => {
   it("refuses a host outside inject_hosts, a value too large, and past max_count, and shows its limits", async () => {
     const p = await newProject();
     const outside = await put(p, "x_token", { ...npm(valueOf("o")), hosts: ["api.stripe.com"] });
+    expect(Object.keys(outside.body.problems)).toEqual(["hosts"]);
     expect(outside.status).toBe(400);
     expect(outside.body.problems.hosts).toMatch(/api\.stripe\.com is outside the hosts this app may inject into \(api\.cloudflare\.com, registry\.npmjs\.org, \*\.example\.com\): the operator must widen the grant's inject_hosts/);
     // A wildcard within the grant's.
     expect((await put(p, "wild", { ...npm(valueOf("w")), hosts: ["*.api.example.com"] })).status).toBe(200);
-    expect((await put(p, "big", npm("y".repeat(5000)))).body.problems.value).toMatch(/at most 4096/);
-    expect((await put(p, "Bad-Name", npm(valueOf("n")))).body.problems.name).toBeDefined();
+    expect((await put(p, "big", npm("y".repeat(5000), ["worker"], "BIG"))).body.problems.value).toMatch(/at most 4096/);
+    expect((await put(p, "Bad-Name", npm(valueOf("n"), ["worker"], "BAD"))).body.problems.name).toBeDefined();
     const saved = fake.grant.secrets.max_count;
     fake.grant.secrets.max_count = fake.secrets.size;
     try {
-      const full = await put(p, "one_more", npm(valueOf("m")));
+      const full = await put(p, "one_more", npm(valueOf("m"), ["worker"], "ONE_MORE"));
       expect(full.status).toBe(403);
       expect(full.body.error).toMatch(/max_count/);
     } finally {
@@ -193,10 +282,13 @@ describe("requesting a secret", () => {
     expect((await callTool("board", m, "request_secret", { name: "GITHUB_TOKEN", purpose: "p", kind: "ci" })).result.isError).toBe(true);
     ok(await callTool("board", m, "request_secret", { name: "cf_token", purpose: "manage DNS", kind: "injected", hosts: ["api.cloudflare.com"] }));
     expect((await api(token, "GET", `/api/projects/${p.id}/attention`)).body[0]).toMatchObject({ kind: "secret", type: "injected", name: "cf_token", hosts: ["api.cloudflare.com"] });
-    await put(p, "cf_token", { value: valueOf("c"), description: "", hosts: ["api.cloudflare.com"], locations: [{ type: "authorization_bearer" }], roles: ["manager"] });
+    await put(p, "cf_token", cf(valueOf("c")));
     expect((await api(token, "GET", `/api/projects/${p.id}/attention`)).body).toEqual([]);
     await env.PROJECT.get(env.PROJECT.idFromName(p.id)).drain();
-    expect(fake.inbox.some((m) => m.agent === p.manager && m.text.includes("set up the secret cf_token"))).toBe(true);
+    expect(fake.inbox.some((m) => m.agent === p.manager && m.text.includes("Your sandbox gets it as $CLOUDFLARE_API_TOKEN in a moment"))).toBe(true);
+    // Asked for again once it exists: refused, naming its variable and roles.
+    const again = await callTool("board", m, "request_secret", { name: "cf_token", purpose: "p", kind: "injected" });
+    expect(JSON.stringify(again.result)).toContain("exists already, as $CLOUDFLARE_API_TOKEN in the sandboxes of manager");
   });
 });
 

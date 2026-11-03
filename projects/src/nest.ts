@@ -201,11 +201,6 @@ export class Nest {
     return this.call("GET", `/v1/sandboxes/${encodeURIComponent(sandbox)}/policy`);
   }
 
-  /** The client's own record (`GET /v1/clients/self`): its grant, among the rest. */
-  self(): Promise<{ client?: string; grant?: { egress_hosts?: string[]; [k: string]: unknown } }> {
-    return this.call("GET", "/v1/clients/self");
-  }
-
   listAsks(agent: string): Promise<unknown> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}/asks`);
   }
@@ -221,7 +216,10 @@ export class Nest {
   }
 
   /** The client's own record (`GET /v1/clients/self`): its grant, among the rest. */
-  self(): Promise<{ client?: string; grant?: { inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean } } }> {
+  self(): Promise<{
+    client?: string;
+    grant?: { egress_hosts?: string[]; inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean } };
+  }> {
     return this.call("GET", "/v1/clients/self");
   }
 

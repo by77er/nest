@@ -23,6 +23,8 @@ export interface SecretsAnswer {
   secrets: (import("../../do/project").SecretView & { last_injected_ms: number | null; in_nest: boolean | null })[];
   grant: (import("../../secrets").SecretGrant & { used: number }) | null;
   client: string | null;
+  /** Each live agent's client layer, which carries its bindings and variables (as the Network page shows it). */
+  agents: import("../../do/project").LayerStatus[];
 }
 /** One of the repo's open PRs, for attaching: the task it's attached to, if any. */
 export interface OpenPr {
