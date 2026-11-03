@@ -570,6 +570,19 @@ export class BrokerDO extends DurableObject<Env> {
   }
 
   /**
+   * As `scanSecrets`, for an environment's values (index.ts `refuseSecretValues`): with `client`, only that
+   * client's own secrets are compared, so the answer reveals nothing of another tenant's or the
+   * operator's; without, every stored secret (the operator's caller). Names only.
+   */
+  async scanSecretValues(strings: string[], client: string | null): Promise<string[]> {
+    const rows = client === null
+      ? this.sql.exec<{ name: string; value: string }>("SELECT name, value FROM secrets").toArray()
+      : this.sql.exec<{ name: string; value: string }>("SELECT name, value FROM secrets WHERE substr(name, 1, ?) = ?",
+        clientSecretKey(client, "").length, clientSecretKey(client, "")).toArray();
+    return rows.filter(({ value }) => secretNeedles(value).some((n) => strings.some((s) => s.includes(n)))).map((r) => r.name);
+  }
+
+  /**
    * The names of stored secrets whose value appears in any of `strings` (a brokered action's
    * arguments): the value itself, its base64, or (for a JSON value) any string in it of 16 characters
    * or more. Names only: no value leaves here. Values under 8 characters aren't looked for.

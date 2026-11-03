@@ -18,7 +18,7 @@ grants:
 limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
 ```
 
-**Built:** the `sandbox` layer is the operator's (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), and its rules reach hosts tagged `layer: workstream`, the layer's wire name, which hosts parse as a closed enum ([pending contract changes](../../../../interfaces/README.md#pending-contract-changes)); grants are tagged `sandbox`.
+**Built:** the `sandbox` layer is the operator's (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), and its rules reach hosts tagged `layer: workstream`, the layer's wire name, which hosts parse as a closed enum ([pending contract changes](../../../../interfaces/README.md#pending-contract-changes)); grants are tagged `sandbox`. **API clients' rules** (built 2026-11-02, [egress](../../../../control-plane/api/clients/#egress)) join the same layer on the wire: allow rules only, within the client's grant's `egress_hosts`, from its templates (while their agents are attached), its sandbox specs and the sandbox's client layer. Allow rules only add, so the guards below and the hard deny apply to whatever they open, and no client rule allows what the operator's policy refuses.
 
 ## Hard deny
 
