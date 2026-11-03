@@ -16,7 +16,7 @@ Boundaries between the processes on one host. Rust types: `nest_protocol::host`.
 | Process | Control-plane connections | Holds |
 |---|---|---|
 | **nestd** (privileged) | enrollment, **fleet channel** (FleetDO) | host token, proxy CA key, leases, fencing authority |
-| **agent runner** (unprivileged, brain hosts) | one **session channel** per active agent (AgentDO), per `docs/interfaces/control-host/session/` | host token (memory, pushed by nestd), OAuth tokens (memory), each agent's binding and gateway hostname (memory, from AgentDO) |
+| **agent runner** (unprivileged, brain hosts) | one **session channel** per active agent (AgentDO; [session](../control-host/session/)) | host token (memory, pushed by nestd), OAuth tokens (memory), each agent's binding and gateway hostname (memory, from AgentDO) |
 | **nest-proxy** (unprivileged, sandbox hosts) | none | injection secrets, CA key (memory, pushed by nestd) |
 | **gateway** (unprivileged, sandbox hosts) | none: it serves connections arriving through the host's tunnel (on the harness, a loopback port) | the binding verification keys and the sandbox table (memory, pushed by nestd); no token, no private key |
 
