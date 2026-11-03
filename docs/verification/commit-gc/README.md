@@ -2,7 +2,7 @@
 
 Inventory for modelling: the generation chain in SandboxDO, FleetDO's GC registry and runs, and nestd's chunk upload and mark/sweep. Code is cited at main `edf6829`; design at [sandbox/state](../../sandbox/state/README.md) and [object-store](../../sandbox/state/object-store/README.md).
 
-> **Since** (checked on `main` at b63c0a3): the retention branch in the table below merged as #32. The GC-root registry is written at `create`, a destroyed sandbox is never re-registered, salvage is authorized against SandboxDO's full `epochs` table, and commit records are pruned by age unless their generation is still in the chain. B1 and B2 are still open.
+> **Status** (by reading `main`, 2026-11-02): the retention-enums branch in the table below merged as #32: the GC-root registry is written at `create`, a destroyed sandbox is never re-registered, salvage is authorized against SandboxDO's full `epochs` table (B4 fixed), and commit records are pruned by age unless their generation is still in the chain. Generation retention (`isRestoreSource`, `deleting` generations, the placement pin) is built (#85) and modelled in [Retention](#retention) below. B1 and B3 are open.
 
 ## Scope and actors
 
@@ -16,9 +16,7 @@ Inventory for modelling: the generation chain in SandboxDO, FleetDO's GC registr
 
 Constants: `R = REUSE_MS = 12 h` (`s3.rs:54`), `G = GC_GRACE_MS = 24 h`, `W = GC_WINDOW_MS = 12 h`, interval 24 h, cap 10k, `GC_MARK_VERSION = 1` (`fleet.ts:128-134`). A test pins `G > R` (`s3.rs:690-704`).
 
-> **Since** (branch `build/retention`, 2026-11-01): `isRestoreSource`, `deleting` generations, the placement pin and retention are built; see [Retention](#retention) below for the model and the conformance map. B2 is closed. The paragraph below describes main before it.
-
-**Not in code (docs only):** the `isRestoreSource` predicate (no match for `isRestoreSource`/`is_restore_source` anywhere), `deleting` generations, retention, pins, base generations, forks in SandboxDO (nestd has `fork`, `host.rs:1849`, but the control plane never issues `sandbox_fork`). Today resume loads `head` (`sandbox.ts:282`, `:442`), GC keeps every recorded generation (`sandbox.ts:496-505`) and the drain gate is "suspended then evicted" (`fleet.ts:1017-1018`). The single-predicate rule is a docs claim with nothing to drift yet; it becomes load-bearing when retention lands.
+At `edf6829` there was no retention: resume loaded `head` (`sandbox.ts:282`, `:442`), GC kept every recorded generation (`sandbox.ts:496-505`), and the drain gate was "suspended then evicted" (`fleet.ts:1017-1018`).
 
 ## State machines
 
@@ -67,7 +65,7 @@ No state guard: an orphan is accepted after `destroy` (`state = destroyed`), and
 - **S3:** strong read-after-write for PUT, HEAD and LIST ([AWS](https://aws.amazon.com/s3/consistency/)); versioning makes delete-by-version exact, so a version uploaded after the listing survives. `Last-Modified` of a multipart object is the initiation time (unverified; only manifests > 8 MiB go multipart).
 - **Clocks:** `T` is FleetDO's clock, `LM` S3's, reuse and deadline checks the host's. Skew ≪ 1 h assumed (unverified).
 - **A1 (commit latency):** every `commit_request` is first evaluated by SandboxDO less than `G − R = 12 h` after its `prepare`. Not enforced anywhere (see B1).
-- Generations are never deleted on main (no retention).
+- Generations are never deleted at `edf6829` (no retention).
 
 ## Safety
 
@@ -76,7 +74,7 @@ Let `cl(m)` = `{manifests/m} ∪ {chunks/c | c ∈ m}`; `Live` = generations of 
 - **S1 (no reachable object deleted):** for all `g ∈ Live`, every key in `cl(g)` has a current version in S3. Includes orphans: `gcRoots` reads all rows (`sandbox.ts:499`).
 - **S2 (pending protected):** for all `q ∈ Pend` that will commit, every key in `cl(q)` survives until evaluation. Holds only under A1.
 - **S3 (tree):** `head = null ∨ head ∈ generations`; for every non-orphan `g`, `g.parent = null ∨ g.parent ∈ generations`. Holds by construction (`:587-596`). Orphan parents are not checked (`:579-581`); they hold only because nestd sends a head it got from SandboxDO.
-- **S4 (idempotent):** two evaluations of one `request` return equal outcomes and create at most one generation. Holds on main because `commits` is never pruned.
+- **S4 (idempotent):** two evaluations of one `request` return equal outcomes and create at most one generation. Holds at `edf6829` because `commits` is never pruned; with pruning (#32) a main-chain re-ask after pruning meets the CAS ([Retention](#retention)).
 - **S5 (complete roots or no run):** a non-dry pass deletes only if `gcRoots` succeeded for every registry-live sandbox and every root manifest parsed. Holds (`fleet.ts:1639-1646`, `gc.rs:76-89`). **Gap:** "registry ⊇ sandboxes with generations" holds only for sandboxes placed since the registry shipped; older ones need `registerSandboxes` (`fleet.ts:1603`).
 - **S6 (destroyed):** a sandbox's objects are unprotected only after `state = destroyed` (`gcRoots` returns `[]`, `:497`); a destroyed sandbox is never re-placed (`:262`) or re-registered live (`INSERT OR IGNORE`, `fleet.ts:1197`), and `create` of an existing id is a no-op (`:177-178`).
 - **S7 (dry first):** a non-dry pass needs a finished, non-error, non-abandoned run of the same `GC_MARK_VERSION`.
@@ -95,17 +93,17 @@ Let `cl(m)` = `{manifests/m} ∪ {chunks/c | c ∈ m}`; `Live` = generations of 
 | A timed-out commit re-sent with a stale parent → `parent_mismatch` → fence | `6d1586f`: re-ask under the same id | S4 plus the client model |
 | Reuse window could exceed the grace | `6d1586f`: test `G > R` | lemma (`G − R > 0`) |
 | A commit whose `kind` disagrees with `mem_manifest` | `e76fe31` (`sandbox.ts:568-571`) | restore well-formedness |
-| `commits` and the registry grow forever; a destroyed sandbox re-registered by `create`; salvage authorized against a 50-entry history | branch `origin/deferred/retention-enums` (`fdf121d`, `dede063` L3, L6, M3), not on main | S4 with pruning; S6; salvage acceptance |
+| `commits` and the registry grow forever; a destroyed sandbox re-registered by `create`; salvage authorized against a 50-entry history | `origin/deferred/retention-enums` (`fdf121d`, `dede063` L3, L6, M3), merged as #32 | S4 with pruning; S6; salvage acceptance |
 
 ## Bugs
 
 **B1 (real, by code reading; medium confidence it triggers): no age bound between chunk verification and a commit's first evaluation.** `unanswered` is persisted before the send (`host.rs:2084`), survives restarts (`recovery.rs` `SentCommit`) and is re-sent with its original manifest, unbounded in time, before every later commit and every salvage retry (`host.rs:2052-2058`, `:1184-1203`); the outbox resends unacked events whenever it reconnects. SandboxDO checks no age (`sandbox.ts:552-598`). Interleaving: prepare at `v` reusing a chunk last uploaded at `v − 11 h`; the request is lost (crash, or a partition while STONITH is unconfirmed, so `info.epoch/host` don't move); a GC mark lands at `T > v + 12 h` and deletes the chunk (`LM < T − 24 h`); the re-sent request is then evaluated: committed as **head** (same epoch and host) or as an **orphan** (salvage). Broken: S1 and S2; the generation's restore fails, and as a root it makes every later pass fail closed (L1). Repro: unit test with the fake S3 (`s3.rs` tests, `age_all`): prepare, age the objects 25 h, run `gc::run` with no roots, then evaluate the saved request in a SandboxDO test and mark again; expect a missing root. Fix direction (not applied): carry `prepared_ms` and refuse a commit older than `G − R` minus a margin, or have nestd drop an `unanswered` older than that and prepare afresh. The retention branch makes it reachable more often: once an orphan's `commits` row is pruned, a late re-ask creates a second orphan from an old manifest.
 
-**B2 (closed by retention, 2026-11-01):** docs name one `isRestoreSource` predicate, `deleting` generations, retention and pins. None exist. Nothing deletes a generation today, so nothing is wrong yet.
+**B2 (docs ahead of code at `edf6829`; closed by #85):** docs named one `isRestoreSource` predicate, `deleting` generations, retention and pins before any existed.
 
 **B3 (low):** orphans accepted after destroy and with an unchecked parent (`sandbox.ts:575-584`). Harmless to GC. It does break S3 if nestd ever sends a foreign parent, for example a fork's head from another sandbox (`host.rs:1849-1872`).
 
-**B4 (low, fixed on branch):** a salvage from an epoch older than the last 50 placements is refused `stale_epoch` (`sandbox.ts:94`, `:576-578`), which nestd takes as final (`host.rs:2216-2218`), so the work is dropped and only logged.
+**B4 (low, fixed in #32 by the full `epochs` table):** a salvage from an epoch older than the last 50 placements is refused `stale_epoch` (`sandbox.ts:94`, `:576-578`), which nestd takes as final (`host.rs:2216-2218`), so the work is dropped and only logged.
 
 ## Modelling notes
 
@@ -138,7 +136,7 @@ Let `cl(m)` = `{manifests/m} ∪ {chunks/c | c ∈ m}`; `Live` = generations of 
 
 ## Retention
 
-Checked on branch `build/retention` (2026-11-01, on main `180f46a`). Code: `control-plane/src/lib/retention.ts` (pure) and `src/do/sandbox.ts`. Model: [`verification/lean/Nest/Retention.lean`](../../../verification/lean/Nest/Retention.lean), the GC model above with `deleting`, pins and a guarded `retire`.
+Checked on branch `build/retention` (2026-11-01, on main `180f46a`; merged as #85). Code: `control-plane/src/lib/retention.ts` (pure) and `src/do/sandbox.ts`. Model: [`verification/lean/Nest/Retention.lean`](../../../verification/lean/Nest/Retention.lean), the GC model above with `deleting`, pins and a guarded `retire`.
 
 **Proved (Lean, unbounded, under A1):**
 

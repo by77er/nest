@@ -165,6 +165,11 @@ export class Nest {
     });
   }
 
+  /** The trace's older events (nest's trace history), before `before` (its seam when absent), newest page first. */
+  traceHistory(agent: string, q: { before?: string; limit?: string } = {}): Promise<{ events: unknown[]; next_before: string | null; reset?: true }> {
+    return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}/trace/history`, undefined, { query: q });
+  }
+
   listAsks(agent: string): Promise<unknown> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}/asks`);
   }

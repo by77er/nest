@@ -22,7 +22,7 @@ const NOT_ADMIN = {
   "GET /.well-known/jwks.json": "none",
   // An API client's token is accepted too, on its own subtree (docs/control-plane/api/clients/; test/clients.test.ts).
   ...Object.fromEntries([
-    "POST /v1/agents", "GET /v1/agents", "GET /v1/agents/:agent", "GET /v1/agents/:agent/turns", "GET /v1/agents/:agent/transcript", "GET /v1/agents/:agent/trace",
+    "POST /v1/agents", "GET /v1/agents", "GET /v1/agents/:agent", "GET /v1/agents/:agent/turns", "GET /v1/agents/:agent/transcript", "GET /v1/agents/:agent/trace", "GET /v1/agents/:agent/trace/history",
     "POST /v1/agents/:agent/turns", "POST /v1/agents/:agent/inbox", "POST /v1/agents/:agent/interrupt", "POST /v1/agents/:agent/start",
     "POST /v1/agents/:agent/stop", "GET /v1/agents/:agent/children", "GET /v1/agents/:agent/brokered", "GET /v1/agents/:agent/asks",
     "POST /v1/agents/:agent/asks/:ask/answer",
@@ -32,6 +32,8 @@ const NOT_ADMIN = {
     ...["GET", "PUT", "DELETE"].flatMap((m) => ["templates", "capabilities"].map((k) => `${m} /v1/catalog/${k}/:ns/:entry`)),
     // A client's own (test/client-events.test.ts): the operator has no `self`.
     "GET /v1/clients/self", "PUT /v1/clients/self/webhook",
+    // Its own secrets (test/client-secrets.test.ts): write-only values, a listing of names.
+    "GET /v1/clients/self/secrets", "PUT /v1/clients/self/secrets/:name", "DELETE /v1/clients/self/secrets/:name",
   ].map((r) => [r, "owner"])),
   // A client's own: only a client token has a self, the operator's is refused (test/client-github-token.test.ts).
   "POST /v1/clients/self/github-token": "owner",

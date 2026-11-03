@@ -84,6 +84,8 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `GET /v1/agents/<id>/trace?after=<seq>`: a WebSocket of the agent's live trace (turns, assistant text, tool calls
      and results, state, asks, `ended`), resumed after a seq, with a `gap` first when the ring no longer reaches back
      (`src/lib/trace.ts`; docs/control-plane/api/#live-trace)
+   - `GET /v1/agents/<id>/trace/history?before=<cursor>&limit=<n>`: the trace's older events from the stored transcript,
+     `{events, next_before}`, meeting the ring at its seam (`src/lib/trace-history.ts`; docs/control-plane/api/#trace-history)
    - `POST /v1/admin/hosts/<id>/confirm-dead`: manual STONITH (also releases the host's tunnel and record; a host
      still running cloudflared keeps its tunnel undeletable until the instance is gone, and the sweep finishes it)
    - `POST /v1/admin/tunnels/sweep?cell=<cell>`: run the daily tunnel sweep now; returns what it deleted, retried,
@@ -118,11 +120,15 @@ External systems (docs/control-plane/api/clients/): `POST /v1/admin/clients {nam
 `nest_cli_<id>_<secret>`) · `GET /v1/admin/clients` · `GET|PATCH /v1/admin/clients/<cli> {grant}` ·
 `POST /v1/admin/clients/<cli>/rotate` · `DELETE /v1/admin/clients/<cli>` (409 while its subtree lives). A grant is
 `{cells, credentials, repos, mcp_urls, github?, max_agents, max_sandboxes}`. With its token a client calls the owner routes
-(`auth: "owner"` in `src/index.ts`: create, list, read, turns, inbox, interrupt, start, stop and end, children, transcript, live trace,
+(`auth: "owner"` in `src/index.ts`: create, list, read, turns, inbox, interrupt, start, stop and end, children, transcript, live trace and its history,
 brokered journal, asks and answers; sandbox create, list, read, destroy, lifetime and effective policy) on its own subtree only
 (anything else answers as an unknown id, 404), with `SpawnerOverrides`, and writes its catalog namespace:
 `GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…`. Its own, with a
-client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a GitHub App token within `github`; BrokerDO mints it).
+client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a GitHub App token within `github`; BrokerDO mints it). Its secrets (`src/lib/client-secrets.ts`): `PUT|DELETE /v1/clients/self/secrets/<name> {value, description?}` and
+`GET /v1/clients/self/secrets` (names and metadata, never a value; the operator's `GET /v1/admin/clients/<cli>/secrets`),
+within `secrets {max_count, max_bytes}`; bindings naming them (`inject` in its templates, overrides and `POST /v1/sandboxes`,
+hosts within `inject_hosts`) are injected by nest-proxy; `github_push: {workflows: true}` (within `github_push`) adds
+`workflows: write` to a sandbox's push token.
 Its events (`src/lib/client-events.ts`): `PUT /v1/clients/self/webhook {url}` (https; answers the signing secret once);
 its agents and sandboxes hand them to ClientDO from their alarms, and ClientDO POSTs each, signed (`Nest-Signature`), with
 retries; `GET /v1/clients/self` (the client) and `GET /v1/admin/clients/<cli>` show `events {webhook, backlog, dropped, failures, last_error}`.
@@ -213,11 +219,11 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 - **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the CSR shape isn't enforced; BrokerDO audits GitHub mints only (not secret pushes or binding mints).
 - **Lifecycle design** (`docs/control-plane/durable-objects/sandbox/`): typed placement claims, loss records, fork pins, the pause tier and restore-ABI sets aren't built. Built: idle suspend (`SANDBOX_SUSPEND_IDLE_MS`), lazy wake, eviction, the spot drain and dropping leases a restarted nestd doesn't report.
 - **Built:** the autoscaler, per host kind (`AWS_CELLS`: `RunInstances` from the cell's launch template, or the `brain` section's for brain hosts; idle retirement, enroll timeouts).
-- **Not built:** Discord, Cloudflare Access applications from the control plane (the `edge` inframe stack manages
+- **Not built:** Cloudflare Access applications from the control plane (the `edge` inframe stack manages
   them; the control plane only stores the service token), the preview/share Worker routes, the api-loop backend (deferred), budgets. Preview and
   share URLs are already minted by the hostname rule (`sandbox.ts`), so nothing routes them yet.
 - **Host-side behavior is driven, not modeled.** The control plane issues create (including re-place
-  and reassign), destroy, fence, suspend (idle and spot drains) and resume (lazy wake); checkpoint,
+  and reassign), destroy, fence, suspend (idle and spot drains), resume (lazy wake) and turn-end checkpoints;
   fork, archive and drain are never sent.
 - **Commands aren't coalesced:** each `issueCommands` call is one `commands` batch, sent in seq order through the
   host's send chain.

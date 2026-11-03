@@ -59,6 +59,9 @@ Defined once in the theme (as Mantine values and CSS variables) and used by name
 | border | `#e9ecef` | `#2c2e33` | hairlines |
 | text | `#212529` | `#e9ecef` | body |
 | muted | `#666e76` | `#9aa0a6` | meta, captions |
+| terminal | `#e6ebf0` | `#0d0e0f` | an agent's trace: a terminal surface, mono throughout, with a 1 px hairline in `terminal-rule`; set apart from `subtle` and the surface |
+| terminal-muted | `#5c636a` | `#9aa0a6` | muted text on the terminal (AA there; warning on it is shade 9 in light, 3 in dark) |
+| terminal-rule | `#c2c9d0` | `#2c2e33` | the terminal's hairlines (its border, a turn's rule), about 1.4:1 on it |
 | primary | `#3b6fc0` | `#5a8ad6` | primary actions; assigned, in progress, in review |
 | danger | `#c2414c` | `#d9606a` | close, cancel, delete, deny; cancelled, failed |
 | warning | `#dca71c` (dark text) | `#e3b341` (dark text) | stalled, needs input, undelivered, expiring |
@@ -87,6 +90,9 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 | `Stack` / `Row` | Gaps only from the spacing scale |
 | `FieldGroup` | Labels above fields, one column, `lg` between fields; actions bottom-right |
 | `EmptyState` / `LoadingState` / `ErrorState` | Centred in their container, at most one action; errors offer a retry |
+| `Terminal` / `TermLine` / `TermRule` | An agent's trace as a terminal transcript: the `terminal` surface and hairline, the mono family, long lines wrapped (`pre-wrap`, breaking anywhere), a glyph column with hanging text, a quiet rule between turns. Glyphs without an emoji presentation only (`●` U+25CF, `○` U+25CB, `✗` U+2717, `⎿` U+23BF; never U+23FA), drawn in CSS at the font's stem weight since few fonts have them. **Rows are text-line targets**, an exception to the 32 px rule that keeps a transcript's density: a row that acts (a tool call, `… +N lines`) is a real button as wide as its row |
+
+**The frame is stable.** Across the views of a section, the h1's position and width, the content's left edge, the gutters, the header and the nav don't move or change shape. Shared things (task cards, badges, status colors) look identical wherever they appear.
 
 **The frame is stable.** Across the views of a section, the h1's position and width, the content's left edge, the gutters, the header and the nav don't move or change shape. Shared things (task cards, badges, status colors) look identical wherever they appear.
 

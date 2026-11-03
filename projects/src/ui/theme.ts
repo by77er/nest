@@ -36,8 +36,8 @@ export const ROLES = ["primary", "danger", "warning", "success"] as const;
 
 /** The neutral roles, per scheme (the skill's color table). */
 export const neutrals = {
-  light: { page: "#fafafa", surface: "#ffffff", subtle: "#f1f3f5", border: "#e9ecef", text: "#212529", muted: "#666e76" },
-  dark: { page: "#121314", surface: "#1a1b1e", subtle: "#222327", border: "#2c2e33", text: "#e9ecef", muted: "#9aa0a6" },
+  light: { page: "#fafafa", surface: "#ffffff", subtle: "#f1f3f5", border: "#e9ecef", text: "#212529", muted: "#666e76", terminal: "#e6ebf0", terminalMuted: "#5c636a", terminalRule: "#c2c9d0" },
+  dark: { page: "#121314", surface: "#1a1b1e", subtle: "#222327", border: "#2c2e33", text: "#e9ecef", muted: "#9aa0a6", terminal: "#0d0e0f", terminalMuted: "#9aa0a6", terminalRule: "#2c2e33" },
 } as const;
 
 /** The filled shade of each role, per scheme, and the text on it (all AA, theme.test.ts). */
@@ -51,6 +51,9 @@ export const roleText = {
   light: { primary: 7, danger: 7, warning: 8, success: 7 },
   dark: { primary: 3, danger: 3, warning: 3, success: 3 },
 } as const;
+
+/** The warning role's text shade on the terminal surface, per scheme. */
+export const terminalWarning = { light: 9, dark: 3 } as const;
 
 /** The spacing scale, 4 px based. Nothing else. */
 export const spacing = {
@@ -127,6 +130,9 @@ export const layout = {
   /** A section heading row's height (a small button's), so heading rows line up; a column's. */
   sectionHead: "2.25rem",
   denseHead: "1.75rem",
+  /** The sheet when it holds two columns (a task with its worker's trace), and its details column: a third. */
+  sheetWide: "72rem",
+  sheetDetails: "24rem",
   /** Hit targets: 32 px with a pointer, 44 px on touch. */
   hit: "2rem",
   hitTouch: "2.75rem",
@@ -144,6 +150,14 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
     "--nest-border-color": neutrals[s].border,
     "--nest-border": `1px solid ${neutrals[s].border}`,
     "--nest-muted": neutrals[s].muted,
+    "--nest-terminal": neutrals[s].terminal,
+    // The terminal's hairlines (its border, a turn's rule): `border` vanishes on the light terminal (1.01:1).
+    "--nest-term-rule": neutrals[s].terminalRule,
+    "--nest-terminal-border": `1px solid ${neutrals[s].terminalRule}`,
+    // On the terminal: its own muted (the light terminal is darker than the page), and warning a shade
+    // darker in light (shade 8 is under AA there), each checked by theme.test.ts.
+    "--nest-term-muted": neutrals[s].terminalMuted,
+    "--nest-term-warning": palette.warning[terminalWarning[s]],
     "--mantine-color-body": neutrals[s].surface,
     "--mantine-color-text": neutrals[s].text,
     "--mantine-color-bright": neutrals[s].text,
@@ -171,6 +185,8 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
       "--nest-column-min-narrow": layout.column.minNarrow,
       "--nest-section-head": layout.sectionHead,
       "--nest-dense-head": layout.denseHead,
+      "--nest-sheet-wide": layout.sheetWide,
+      "--nest-sheet-details": layout.sheetDetails,
       "--nest-hit": layout.hit,
       "--nest-hit-touch": layout.hitTouch,
       "--nest-motion-fast": `${motion.fast}ms`,

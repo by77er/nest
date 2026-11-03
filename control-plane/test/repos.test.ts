@@ -2,7 +2,7 @@
 // (pure, against the shared fixture nest-proxy evaluates), attenuation in specs, and SandboxDO turning an
 // allowlist into guards, a binding and a token BrokerDO mints for exactly those repos, refreshed before
 // it expires and never pushed once stale. A fake GitHub stands in for api.github.com.
-import { env, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github.json";
 import readFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github_read.json";
@@ -12,6 +12,7 @@ import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { canonicalRepos, narrowRepos, Repo } from "../src/lib/repos";
 import { GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER, githubBinding, githubEgress, githubGuards } from "../src/lib/rules/github";
 import { BrokerDO } from "../src/do/broker";
+import { Grant, specOutsideGrant } from "../src/lib/clients";
 import { type Catalog, expandSpec, SEED_CATALOG } from "../src/lib/spec";
 import { bytesToB64 } from "../src/lib/util";
 import { adminJson, connectHost, nextCommands, runDue, type Ws, uniqueCell } from "./helpers";
@@ -564,5 +565,103 @@ describe("a sandbox's read-only repos", () => {
     await stub.attach(`agt_${rand()}${rand()}${rand()}`, undefined, [r]);
     const stored = await runInDurableObject(stub, async (_i, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM kv WHERE key = 'agent_read_repos'").one().n);
     expect(stored).toBe(0);
+  });
+});
+
+// --- workflows: write, opt-in (docs/control-plane/api/clients/#workflow-files) -----------------------------------
+
+describe("workflows: write on a sandbox's push token", () => {
+  const WITH_WORKFLOWS = { contents: "write", pull_requests: "write", workflows: "write" };
+  const catalog: Catalog = {
+    capabilities: SEED_CATALOG.capabilities,
+    templates: { ci: { ...SEED_CATALOG.templates.worker!, capabilities: ["nest", "hands"], repos: ["me/app"], github_push: { workflows: true } } },
+  };
+  const expand = (by: "operator" | "spawner", overrides: Record<string, unknown> = {}) =>
+    expandSpec(catalog, PLATFORM_TOOL_NAMES, { template: "ci", hands: true, by, overrides } as never);
+
+  it("comes from the template; a spawner may only turn it off, the operator either way, and a client's grant must allow it", () => {
+    expect((expand("operator") as any).value.github_push).toEqual({ workflows: true });
+    expect((expand("spawner") as any).value.github_push).toEqual({ workflows: true });
+    expect((expand("spawner", { github_push: { workflows: false } }) as any).value.github_push).toBeUndefined();
+    expect(expand("spawner", { github_push: { workflows: true } }).ok).toBe(false);
+    expect((expand("operator", { github_push: { workflows: false } }) as any).value.github_push).toBeUndefined();
+    const { github_push: _, ...plain } = catalog.templates.ci!;
+    const off = expandSpec({ ...catalog, templates: { ci: plain } }, PLATFORM_TOOL_NAMES, { template: "ci", hands: true, by: "operator" }) as any;
+    expect("github_push" in off.value).toBe(false);
+    const spec = (expand("operator") as any).value;
+    expect(specOutsideGrant(spec, Grant.parse({ credentials: [spec.credential], repos: ["me/app"] }))).toEqual(["github_push.workflows"]);
+    expect(specOutsideGrant(spec, Grant.parse({ credentials: [spec.credential], repos: ["me/app"], github_push: { workflows: true } }))).toEqual([]);
+  });
+
+  it("is minted exactly {contents, pull_requests, workflows: write} only when asked; the read-only token never has it", async () => {
+    const pushable = repo(7171);
+    const readable = repo(7171);
+    const before = gh.mints.length;
+    const { ws } = await placed({ repos: [pushable], read_repos: [readable], github_push: { workflows: true } });
+    while (gh.mints.length < before + 2) await nextCommands(ws, (c) => c.type === "secrets_update");
+    const mints = gh.mints.slice(before).map((m) => [m.repositories, m.permissions]).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+    const want = [[[pushable.split("/")[1]], WITH_WORKFLOWS], [[readable.split("/")[1]], SANDBOX_READ_TOKEN_PERMISSIONS]];
+    expect(mints).toEqual(want.sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))));
+    // BrokerDO itself never puts it on a read-only token, whatever the source asks.
+    const ro = repo();
+    const b1 = gh.mints.length;
+    await env.BROKER.get(env.BROKER.idFromName("broker")).readInjectionSecret({ sandbox: `sbx_${rand()}${rand()}`, epoch: 1 },
+      { kind: "github_app", binding: "github_read", repos: [ro], workflows: true }, "test");
+    expect(gh.mints.slice(b1).map((m) => m.permissions)).toEqual([SANDBOX_READ_TOKEN_PERMISSIONS]);
+    // Without it: the push token as before.
+    const plain = repo();
+    const b2 = gh.mints.length;
+    await nextCommands((await placed({ repos: [plain] })).ws, (c) => c.type === "secrets_update");
+    expect(gh.mints.slice(b2).map((m) => m.permissions)).toEqual([SANDBOX_TOKEN_PERMISSIONS]);
+  });
+
+  it("a template asking for it reaches the token through the agent's spec and its attach (AgentDO, not a direct attach)", async () => {
+    const r = repo(9191);
+    const tpl = `ci-${rand()}`;
+    await adminJson(`/v1/admin/templates/${tpl}`, { method: "PUT", body: {
+      capabilities: ["nest", "hands"], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "required",
+      credential: "claude_oauth_token", repos: [r], github_push: { workflows: true },
+    } });
+    const { sandbox, ws } = await placed({});
+    const before = gh.mints.length;
+    const a = await adminJson("/v1/agents", { body: { template: tpl, sandbox, start: false } }, 201);
+    expect(a.github_push).toEqual({ workflows: true });
+    while (!gh.mints.slice(before).length) await nextCommands(ws, (c) => c.type === "secrets_update");
+    expect(gh.mints.slice(before).map((m) => [m.repositories, m.permissions])).toEqual([[[r.split("/")[1]], WITH_WORKFLOWS]]);
+  });
+
+  it("a client gets it at sandbox create only within its grant's github_push", async () => {
+    const cell = uniqueCell();
+    const asClient = async (token: string, path: string, body: unknown, status: number) => {
+      const res = await SELF.fetch(`http://cp.test${path}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+      const text = await res.text();
+      expect(res.status, text).toBe(status);
+      return JSON.parse(text);
+    };
+    const mk = async (grant: Record<string, unknown>) => (await adminJson("/v1/admin/clients", { body: { name: `wf-${rand()}`, grant: { cells: [cell], max_sandboxes: 2, ...grant } } }, 201)).token as string;
+    const without = await mk({});
+    expect((await asClient(without, "/v1/sandboxes", { cell, github_push: { workflows: true } }, 403)).error.message).toContain("github_push.workflows");
+    const withIt = await mk({ github_push: { workflows: true } });
+    const sbx = await asClient(withIt, "/v1/sandboxes", { cell, github_push: { workflows: true } }, 202);
+    expect(await sandboxStub(sbx.sandbox).pushWorkflows()).toBe(true);
+    const plain = await asClient(withIt, "/v1/sandboxes", { cell }, 202);
+    expect(await sandboxStub(plain.sandbox).pushWorkflows()).toBe(false);
+  });
+
+  it("an attached agent's spec asking for it adds it while attached, and never reuses a token without it", async () => {
+    const r = repo(8181);
+    const { sandbox, ws } = await placed({ repos: [r] });
+    await nextCommands(ws, (c) => c.type === "secrets_update");
+    expect(gh.mints.at(-1)!.permissions).toEqual(SANDBOX_TOKEN_PERMISSIONS);
+    const stub = sandboxStub(sandbox);
+    const agent = `agt_${rand()}${rand()}${rand()}`;
+    await stub.attach(agent, undefined, [], [], { workflows: true });
+    let cmds = await nextCommands(ws, (c) => c.type === "secrets_update");
+    expect(gh.mints.at(-1)!.permissions).toEqual(WITH_WORKFLOWS);
+    expect(ghSecret(cmds).value).toBe(gh.mints.at(-1)!.token);
+    await stub.detach(agent);
+    cmds = await nextCommands(ws, (c) => c.type === "secrets_update");
+    expect(gh.mints.at(-1)!.permissions).toEqual(SANDBOX_TOKEN_PERMISSIONS);
+    expect(ghSecret(cmds).value).toBe(gh.mints.at(-1)!.token);
   });
 });

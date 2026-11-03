@@ -1,0 +1,79 @@
+{
+  "version": 3,
+  "allow": [
+    {
+      "host": "github.com",
+      "ports": [
+        443
+      ],
+      "layer": "base"
+    },
+    {
+      "host": "api.stripe.com",
+      "ports": [
+        443
+      ],
+      "layer": "workstream"
+    },
+    {
+      "host": "search.example.com",
+      "ports": [
+        443
+      ],
+      "layer": "workstream"
+    }
+  ],
+  "passthrough": [],
+  "inject": [
+    {
+      "name": "github",
+      "hosts": [
+        "github.com",
+        "api.github.com"
+      ],
+      "placeholder": "nest-ph-github",
+      "locations": [
+        {
+          "type": "authorization_bearer"
+        },
+        {
+          "type": "authorization_basic_password"
+        }
+      ]
+    },
+    {
+      "name": "client:stripe",
+      "hosts": [
+        "api.stripe.com"
+      ],
+      "placeholder": "nest-ph.cli_01JTESTCLIENT.stripe.",
+      "locations": [
+        {
+          "type": "authorization_bearer"
+        }
+      ]
+    },
+    {
+      "name": "client:search",
+      "hosts": [
+        "*.example.com"
+      ],
+      "placeholder": "nest-ph.cli_01JTESTCLIENT.search.",
+      "locations": [
+        {
+          "type": "header",
+          "name": "X-Api-Key"
+        },
+        {
+          "type": "authorization_basic_password"
+        }
+      ]
+    }
+  ],
+  "tcp": [],
+  "limits": {
+    "max_connections": 256,
+    "bandwidth_mbps": 200,
+    "max_inspected_body_bytes": 536870912
+  }
+}

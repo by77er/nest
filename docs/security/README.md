@@ -1,6 +1,6 @@
 # Security
 
-**Threat model:** the adversary is **one of my own agents after a prompt injection**, not me. Injected instructions act through hands, which run inside a sandbox, and through platform tools, which are bounded by the agent's grants. Messages carry untrusted content between agents (inbox posts, transcripts, integrations), and injections spread from agent to agent. External events (webhooks, email) are attacker-reachable: anyone who can open a PR or send an email shapes their content, so they're always tainted. A compromised agent acts only where it holds grants, and what it sends another agent carries its taint. Model robustness lowers the odds but isn't a boundary; grants, taint and sinks are.
+**Threat model:** the adversary is **one of my own agents after a prompt injection**, not me. Injected instructions act through hands, which run inside a sandbox, and through platform tools, which are bounded by the agent's grants. Messages carry untrusted content between agents (inbox posts, transcripts, MCP tool results), and injections spread from agent to agent. Content from outside (a PR, an email, a web page) is attacker-reachable: anyone who can open a PR or send an email shapes it, so it's tainted, including when an app relays it into an inbox under its source's name (`from`). A compromised agent acts only where it holds grants, and what it sends another agent carries its taint. Model robustness lowers the odds but isn't a boundary; grants, taint and sinks are.
 
 ## Trust boundaries
 
@@ -12,7 +12,7 @@
 | Gateway (on each sandbox host) | The only way into a sandbox's hands, terminals and ports. Admits a connection only with a binding SandboxDO signed for that sandbox, epoch, client and scope, behind an Access service token at the edge; the guest checks the epoch again. |
 | Sandbox hosts (nestd, proxy, gateway, cloudflared) | Trusted, but fenced by lease and STONITH. S3 for their whole cell through the instance role; no R2 credentials; no subscription token; no brain. nest-proxy can't reach IMDS or other non-public addresses (kernel rule on its uid). The gateway, which parses input from the internet, runs as its own user with no capabilities and no IP beyond loopback (so not IMDS); beyond what any local user reaches (loopback services, world-connectable unix sockets, world-readable files) it gets only nestd's gateway socket and the guests' vsock sockets ([gateway](../sandbox/gateway/)); cloudflared runs as its own user too. |
 | Brain hosts (nestd, runner) | Trusted, but fenced by lease and the agent epoch. No KVM, no sandbox state; in S3 it may read the release (`releases/*`) only. |
-| Control plane | Authoritative. No S3 credentials; AWS permissions scoped to EC2 and to KMS `Sign` with the proxy root key. Operator access is by scoped token (built: one admin token). |
+| Control plane | Authoritative. No S3 credentials; AWS permissions scoped to EC2 and to KMS `Sign` with the proxy root key. Operator access is by scoped token (built: one admin token); an [API client](../control-plane/api/clients/) acts by its own token, only on its subtree and within its grant. |
 
 ## Defense layers
 

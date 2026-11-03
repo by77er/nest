@@ -1,11 +1,43 @@
 // The socket behind a trace view: connect to the app's trace route, fold what comes into the state, keep
 // it alive, and after a drop reconnect with a backoff from the last seq received, until the agent ends.
+// And the history before the ring: its first page as soon as nest offers it (a `history` or `gap` cursor),
+// each older one when the view asks (`loadOlder`, as its reader scrolls to the top).
 
-import { useEffect, useReducer } from "react";
-import { initialTrace, PING_EVERY_MS, reconnectDelay, type TraceState, traceReducer, traceUrl } from "./model";
+import { useCallback, useEffect, useReducer, useRef } from "react";
+import { type HistoryPage, historyUrl, initialTrace, PING_EVERY_MS, reconnectDelay, type TraceState, traceReducer, traceUrl } from "./model";
 
-export function useTrace(agent: string | null): TraceState {
+export function useTrace(agent: string | null): { state: TraceState; loadOlder: () => void } {
   const [state, dispatch] = useReducer(traceReducer, undefined, initialTrace);
+  const current = useRef(state);
+  current.current = state;
+  const agentRef = useRef(agent);
+  agentRef.current = agent;
+
+  const loadOlder = useCallback(() => {
+    const s = current.current;
+    const a = agentRef.current;
+    if (!a || typeof s.olderCursor !== "string" || s.olderState === "loading") return;
+    const cursor = s.olderCursor;
+    dispatch({ kind: "older_loading" });
+    current.current = { ...s, olderState: "loading" };
+    void (async () => {
+      try {
+        const res = await fetch(historyUrl(a, cursor), { credentials: "same-origin", headers: { accept: "application/json" } });
+        if (!res.ok) throw new Error(String(res.status));
+        const page = (await res.json()) as HistoryPage;
+        // The page is for the cursor asked with: one from before a reset (a gap since) is dropped.
+        if (agentRef.current !== a || current.current.olderCursor !== cursor) return;
+        dispatch({ kind: "older_loaded", page });
+      } catch {
+        if (agentRef.current === a) dispatch({ kind: "older_failed" });
+      }
+    })();
+  }, []);
+
+  // The first page as soon as there's a cursor and nothing older is shown yet (on open, and after a gap).
+  useEffect(() => {
+    if (typeof state.olderCursor === "string" && state.older.length === 0 && state.olderState === "idle") loadOlder();
+  }, [state.olderCursor, state.older.length, state.olderState, loadOlder]);
 
   useEffect(() => {
     dispatch({ kind: "reset" });
@@ -65,5 +97,5 @@ export function useTrace(agent: string | null): TraceState {
     };
   }, [agent]);
 
-  return state;
+  return { state, loadOlder };
 }

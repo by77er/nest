@@ -4,6 +4,7 @@
 export { AppFrame } from "./AppFrame";
 export { Bubble, PinnedFooter, ScrollLog } from "./Chat";
 export { FadeIn } from "./FadeIn";
+export { Glyph, GLYPH, Terminal, TermLine, TermRule, TermStatus, type TermTone } from "./Terminal";
 export { FieldGroup } from "./FieldGroup";
 export { CardGrid, ColumnGrid, SectionGrid, WithContext } from "./Layouts";
 export { MetaItem, MetaRow } from "./Meta";
@@ -13,7 +14,7 @@ export { Notice, type NoticeTone } from "./Notice";
 export { Measure, Page, PageHeader } from "./Page";
 export { Panel, type PanelTone, TableFrame, Well } from "./Panel";
 export { Section } from "./Section";
-export { Sheet } from "./Sheet";
+export { Sheet, useFillColumn } from "./Sheet";
 export { SortablePanel } from "./Sortable";
 export { Prose, Row, Stack } from "./Stack";
 export { RichImage, RichProse, RichTableFrame, ChatColumn, FooterPill, ScrollSentinel, SvgFigure, TaskCards, TaskCheck, TaskRefCard } from "./Rich";

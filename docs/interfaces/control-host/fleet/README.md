@@ -1,11 +1,10 @@
 # Fleet channel (host ↔ FleetDO)
 
-> **Implemented contract.** The workstream compat fields (below) and `role` go; see [pending contract changes](../../README.md#pending-contract-changes).
-
+> **Implemented contract.** Its compat fields (`workstream?`, `child_workstream?`, `role?`, the `workstream` event tag) are listed under [pending contract changes](../../README.md#pending-contract-changes).
 
 One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycle, leases, commands and host-level events. Per-agent traffic goes over the [session channel](../session/).
 
-> **Host kinds:** `hello.role` names the kind (`burst` or `controller` written this release, `sandbox` or `brain` read too; [models](../models/)). A brain host refuses every sandbox command (`forbidden`), FleetDO sends it only brain commands and counts its capacity in brains, and a sandbox host gets no brain. **Designed:** FleetDO holds three desired versions per cell (brain host, sandbox host, guest image); see [pending contract changes](../../README.md#pending-contract-changes).
+> **Host kinds:** `hello.role` names the kind (`burst` or `controller` written this release, `sandbox` or `brain` read too; [models](../models/)). A brain host refuses every sandbox command (`forbidden`), FleetDO sends it only brain commands and counts its capacity in brains, and a sandbox host gets no brain.
 
 ## Messages
 
@@ -13,7 +12,7 @@ One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycl
 
 | `type` | Reliable | Purpose |
 |---|---|---|
-| `hello` | first frame | `protocol_version`, host, **`instance_id`** (random per nestd process), role, cell, component versions, `gateway_url?` (where clients reach this host's sandbox gateway, from nestd's configuration), `tunnel` (`none` | `connecting` | `connected`; absent from a nestd that predates it, read as `none`), `last_command_seq`, `cgroup_delegation_error?` (nestd was configured to keep its VMMs in its delegated unit cgroup and that setup failed; FleetDO logs it), and **a full report** of local sandboxes (epoch, state, head, dirty, and `guest{protocol_version, capabilities}` for a running one), agents (state) and capacity. FleetDO reconciles against it: unknown or stale sandboxes are fenced or destroyed. |
+| `hello` | first frame | `protocol_version`, host, **`instance_id`** (random per nestd process), role, cell, component versions, `gateway_url?` (where clients reach this host's sandbox gateway, from nestd's configuration), `tunnel` (`none` | `connecting` | `connected`; absent from a nestd that predates it, read as `none`), `last_command_seq`, `brain_epochs?` (this nestd keys brains by agent epoch, reports every exit with its epoch, answers kills on arrival and refuses starts across a lease lapse; see below), `cgroup_delegation_error?` (nestd was configured to keep its VMMs in its delegated unit cgroup and that setup failed; FleetDO logs it), and **a full report** of local sandboxes (epoch, state, head, dirty, and `guest{protocol_version, capabilities}` for a running one), agents (state) and capacity. FleetDO reconciles against it: unknown or stale sandboxes are fenced or destroyed. |
 | `heartbeat` | no | Every 5 s: `sent_ms` and `leases[(sandbox, epoch)]`. **Renews every listed lease.** |
 | `events` | seq | A batch of `HostEvent`s (below) |
 | `ack` | — | Cumulative ack of `commands` |
@@ -31,6 +30,8 @@ One WebSocket per host, sandbox hosts and brain hosts alike. It carries lifecycl
 | `binding_key` | no | `keys[{kid, public_key}]`: every binding verification key still valid for the cell (ECDSA P-256, the uncompressed point, base64url); sent after `hello_ack` and on rotation; nestd forwards it to the gateway ([gateway](../../gateway/)) |
 | `proxy_ca` | no | Renewed intermediate |
 | `error` | — | `ErrorBody`. `unauthorized` and `unsupported_version` close the socket (nestd also reads the older name `unsupported_protocol_version`) |
+
+**Hosts without `brain_epochs`** (nestd of the previous release; one-release window) never receive a brain: FleetDO refuses an `agent_start` to one, drains it of brains on sight, and releases a brain still on it only by its confirmed death or lease expiry (never by its exits or an unindexed kill), its host wedged at the 15-minute cap like any other. The window ends with the last such host; the next release drops the field's absence.
 
 **Process lineage.** Both seq lineages (host events, commands) belong to one nestd process. When `hello.instance_id` differs from the previous connection's, FleetDO **resets both**: it forgets `last_event_seq` (the new process starts its events at 1), drops unacked commands and fails the ones still unanswered at the reset retryably (`command_result` error, `retryable: true`; a command issued after the reset belongs to the new process), and reconciles from the hello report instead of replaying. A reconnect of the same process resumes as usual.
 
@@ -59,7 +60,7 @@ Every command yields **exactly one** `command_result{cmd, outcome: ok|error}` ev
 | `port_expose` / `port_unexpose` | sandbox, epoch, port, `host_header{mode}` | The gateway's preview mapping |
 | `commit_result` | request, sandbox, outcome | Answer to `commit_request` (see the CAS sequence below) |
 | `guest_cli_result` | request, result (`guest::CliResult`) | Answer to a `guest_cli` event; nestd relays it to the guest's pending `cli` request. Like `commit_result`, hosts resolve it **on arrival**, not in command order |
-| `agent_start` | agent, `role?` (deprecated: no longer sent; nothing reads it), `workstream?` (compat: previous runners require it; nothing reads it), `epoch`, `resume?`, `hands?{sandbox}`, launch, **oauth_token**, session_ws_url | Rebuild the session file from `resume.segments` (Worker-signed URLs, see the [session channel](../session/)), start Claude Code with the launch config, open the session channel. The token goes **only** into the process env. `epoch` is the agent epoch of this start. `hands` names the sandbox only; the runner fetches the gateway target over its session channel. Sent only to a brain host |
+| `agent_start` | agent, `role?` (deprecated: not sent; nothing reads it), `workstream?` (compat: previous runners require it; nothing reads it), `epoch`, `resume?`, `hands?{sandbox}`, launch, **oauth_token**, session_ws_url | Rebuild the session file from `resume.segments` (Worker-signed URLs, see the [session channel](../session/)), start Claude Code with the launch config, open the session channel. The token goes **only** into the process env. `epoch` is the agent epoch of this start. `hands` names the sandbox only; the runner fetches the gateway target over its session channel. Sent only to a brain host |
 | `agent_attach` | sandbox, epoch, agent, `cwd?` | Configure the agent's slot in the guest (cwd, proxy port, cgroup) on the sandbox's host; idempotent (an existing slot is replaced), `cwd` defaults to `/workspace`. SandboxDO waits for its `ok` before it hands out a binding. Stale epoch → `stale_epoch` |
 | `agent_detach` | sandbox, epoch, agent, `kill_processes` | Remove the slot (an unknown agent is `ok`); with `kill_processes`, kill the agent's cgroup first. The gateway then refuses the agent's bindings |
 | `agent_stop` | agent, reason, `mode?`, `epoch?` | `graceful` (absent: the previous release's nestd always does this) ends the turn cleanly if possible, then stops the process, in order; `kill` ends it at once, applied on arrival like `fence`, for a start elsewhere. `epoch`: the newest agent epoch the stop ends; nestd remembers the highest killed one per agent and refuses a later `agent_start` at or below it (a kill overtaking a queued start; the refused start's `agent_exited{fenced}` is reported). A kill for a brain nestd isn't running is answered with its `agent_exited` at once. The `ok` doesn't mean the brain is gone: its `agent_exited` does |

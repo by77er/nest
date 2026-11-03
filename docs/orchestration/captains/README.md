@@ -1,6 +1,6 @@
 # Captains (pattern)
 
-A captain is a long-lived agent without hands, a brain on a [brain host](../../compute/brain-hosts/) with no sandbox, that manages other agents and asks me when it must. **It isn't a platform concept:** it's an agent spawned from the `captain` template, and everything that makes it a captain is in that template's prompt, grants and budget.
+A captain is a long-lived agent without hands, a brain on a [brain host](../../compute/brain-hosts/) with no sandbox, that manages other agents and escalates to me when it must. **It isn't a platform concept:** it's an agent spawned from the `captain` template, and everything that makes it a captain is in that template's prompt, grants and budget.
 
 ## The `captain` template
 
@@ -30,17 +30,16 @@ credential: claude_oauth_token:captain   # revocable separately from workers
 - **One writer per sandbox.** Parallel writers still fail; what works is single-threaded writes plus forks ([Cognition, 2026-04](https://cognition.com/blog/multi-agents-working)).
 - **A reviewer with a clean context** checks finished work. Agents grade their own work too kindly ([Anthropic, 2026-03](https://www.anthropic.com/engineering/harness-design-long-running-apps)), and missing verification is the largest failure class in [MAST](https://arxiv.org/abs/2503.13657).
 - **Every spawn prompt says when the work counts as done,** since not knowing when to stop is a top failure mode (MAST).
-- **Grouping its work:** per piece of work, a shared log in its coordination app, plus the sandboxes and workers it owns; workers report there (blocked, PR open, done), and the app delivers what needs the captain to its inbox, batched. Stopping the work means stopping the agents it owns for it and destroying their sandboxes.
+- **Grouping its work:** per piece of work, a shared log in its coordination app, plus the sandboxes and workers it owns; workers report there (blocked, PR open, done), and the app delivers what needs the captain to its inbox, batched. Nothing else tells it a worker finished, so every task names where to report; it can also read its workers' transcripts. Stopping the work means stopping the agents it owns for it and destroying their sandboxes.
 - **Attach or fork is its call:** the same sandbox for a reviewer watching an implementer or a tester hitting a live dev server (a captain reading their output becomes tainted); a fork for independent attempts and anything that might be thrown away.
-- **Staying clean:** a captain that reads worker output becomes [tainted](../../agents/tools/#taint-and-sinks), and its sink calls then need my approval. It can stay clean on **quarantined reports** (a `report_schema` of enums, numbers and ids). How it gets details beyond those is its own call: nothing ships for it, though read-only forks and report schemas exist.
+- **Staying clean:** a captain that reads worker output becomes [tainted](../../agents/tools/#taint-and-sinks), and its sink calls then need my approval. It can stay clean on **quarantined reports** (a `report_schema` of enums, numbers and ids).
+- **Inspection without hands is a pure pattern:** no inspection tool or reader template ships. Read-only forks and report schemas are the primitives; how it gets details is its own call.
 - **Continuity:** its memory, read by key at each wake. The Claude Code session is a cache, so a fresh session or a backend switch loses nothing.
-- **Escalation:** it answers its workers' questions itself when it holds the grant they ask for and is untainted, and asks me otherwise.
+- **Escalation:** it answers its workers' questions (through the coordination app) itself when it can, and leaves the rest to me. A sink approval a worker waits on is mine (or the API client's whose subtree it is in): no agent can answer an ask yet, though the design lets an untainted holder of the grant approve ([taint and sinks](../../agents/tools/#taint-and-sinks)).
 
 ## Safeguards
 
 - A captain acts only through tool calls bounded by its grants, its budget and its taint; all three are bounded by mine.
-- Its workers get only grants and budget it holds; the `worker` template gives agents with hands no management capabilities (no `spawning`, `sandboxes` or `authority`).
+- Its workers get only grants and budget it holds; the `worker` template gives agents with hands no management capabilities (no `spawning`, `management` or `authority`); its interim `sandboxes` lists only `fork_sandbox`, which answers `not_implemented`.
 - It can use a separate setup token from workers (`credential` above).
 - `priority: high` reserves subscription headroom for it.
-
-Its backend is per agent. See [../../agents/backends/](../../agents/backends/).

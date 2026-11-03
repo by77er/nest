@@ -1,0 +1,88 @@
+/* The terminal's glyphs, drawn: JetBrains Mono's subsets have none of `●` `○` `✗` `⎿`, and which font a
+   browser falls back to varies, so the character stays in the text (for readers and copy) and the shape
+   is drawn in its color, the same on every system. Strokes are the font's stem (about 0.09em). */
+.glyph {
+  position: relative;
+  display: inline-block;
+  width: 1ch;
+  /* One line tall, at the top of its row: the shape sits on its line's middle, never a wrapped paragraph's. */
+  height: 1.5em;
+  height: 1lh;
+  align-self: start;
+  vertical-align: top;
+  color: transparent !important;
+}
+
+.glyph::before,
+.glyph::after {
+  content: "";
+  position: absolute;
+  box-sizing: border-box;
+}
+
+/* ● and ○: a circle, filled or not, a little under the x-height's width, on the text's middle. */
+/* The font's x-height across (`1ex`), as its own letters are. */
+.dot::before,
+.ring::before {
+  left: 50%;
+  top: 50%;
+  width: 1ex;
+  height: 1ex;
+  margin: -0.5ex 0 0 -0.5ex;
+  border-radius: 50%;
+  border: 0.09em solid var(--glyph);
+}
+
+.dot::before {
+  background: var(--glyph);
+}
+
+/* ✗: two strokes. */
+.cross::before,
+.cross::after {
+  left: 50%;
+  top: 50%;
+  width: 0.09em;
+  height: 0.9em;
+  margin: -0.45em 0 0 -0.045em;
+  background: var(--glyph);
+  transform: rotate(45deg);
+}
+
+.cross::after {
+  transform: rotate(-45deg);
+}
+
+/* ⎿: a corner, under and right of a vertical. */
+.corner::before {
+  left: 0.45ch;
+  top: 0.05em;
+  width: 0.8ch;
+  height: 0.75em;
+  border-left: 0.09em solid var(--glyph);
+  border-bottom: 0.09em solid var(--glyph);
+}
+
+/* A rule between turns: its label (wrapping when narrow), then a hairline to the end. */
+.rule {
+  display: flex;
+  align-items: center;
+  gap: var(--mantine-spacing-sm);
+  margin: var(--mantine-spacing-sm) 0;
+  min-width: 0;
+}
+
+/* The hairline takes what the label leaves; a label that needs the whole row wraps, and the line goes
+   (no stub beside a wrapped label). */
+.rule::after {
+  content: "";
+  flex: 1 1 0;
+  min-width: 0;
+  border-top: 1px solid var(--nest-term-rule);
+}
+
+.rule > span {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}

@@ -3,12 +3,13 @@
 import { Group, type GroupProps, Stack as MantineStack, type StackProps as MantineStackProps, Text } from "@mantine/core";
 import type { Space } from "../theme";
 
-export type StackProps = Omit<MantineStackProps, "gap" | "style"> & { gap?: Space };
+export type StackProps = Omit<MantineStackProps, "gap" | "style"> & { gap?: Space; fill?: boolean };
 export type RowProps = Omit<GroupProps, "gap" | "style"> & { gap?: Space };
 
 /** Blocks one above the other, `gap` apart (`md` by default). */
-export function Stack({ gap = "md", ...rest }: StackProps) {
-  return <MantineStack gap={gap} {...rest} />;
+export function Stack({ gap = "md", fill = false, ...rest }: StackProps) {
+  // `fill`: takes the rest of a column with a height (its last child may then fill it too).
+  return <MantineStack gap={gap} {...rest} style={fill ? { flex: 1, minHeight: 0 } : undefined} />;
 }
 
 /** Things side by side, `gap` apart (`sm` by default), wrapping, vertically centred. */

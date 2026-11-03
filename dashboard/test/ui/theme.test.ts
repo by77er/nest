@@ -23,9 +23,12 @@ const px = (v: string) => {
   throw new Error(`not a size: ${v}`);
 };
 
+/** A token's name as the skill's table and the CSS variables spell it (`terminalMuted` is `terminal-muted`). */
+const kebab = (n: string) => n.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+
 // --- the skill's tables ---
 const colorRows = Object.fromEntries(
-  [...skill.matchAll(/^\| (\w+) \| `(#[0-9a-f]{6})`[^|]*\| `(#[0-9a-f]{6})`[^|]*\|/gm)].map((m) => [m[1]!, { light: m[2]!, dark: m[3]! }]),
+  [...skill.matchAll(/^\| ([\w-]+) \| `(#[0-9a-f]{6})`[^|]*\| `(#[0-9a-f]{6})`[^|]*\|/gm)].map((m) => [m[1]!, { light: m[2]!, dark: m[3]! }]),
 );
 const typeRows = Object.fromEntries(
   [...skill.matchAll(/^\| ([\w-]+) \| (\d+)\/(\d+)(?:, (\d+))? \|/gm)].map((m) => [m[1]!, { size: Number(m[2]), lh: Number(m[3]), weight: m[4] }]),
@@ -39,7 +42,7 @@ const easing = /`(cubic-bezier\([^)]*\))` on entering and `(cubic-bezier\([^)]*\
 
 describe("the skill's tables, as read", () => {
   it("are all there", () => {
-    expect(Object.keys(colorRows).sort()).toEqual(["border", "danger", "muted", "page", "primary", "subtle", "success", "surface", "text", "warning"]);
+    expect(Object.keys(colorRows).sort()).toEqual(["border", "danger", "muted", "page", "primary", "subtle", "success", "surface", "terminal", "terminal-muted", "terminal-rule", "text", "warning"]);
     expect(Object.keys(typeRows).sort()).toEqual(["body", "body-lg", "caption", "h1", "h2", "h3", "h4", "small"]);
     expect(Object.keys(spacing)).toEqual(["2xs", "xs", "sm", "md", "lg", "xl", "2xl", "3xl", "4xl"]);
     expect(radii).toEqual({ sm: 4, md: 8 });
@@ -50,8 +53,8 @@ describe("the skill's tables, as read", () => {
 
 describe("the theme's tokens equal the skill's", () => {
   it.each(Object.keys(neutrals.light) as (keyof typeof neutrals.light)[])("neutral %s, light and dark", (name) => {
-    expect({ light: neutrals.light[name], dark: neutrals.dark[name] }).toEqual(colorRows[name]);
-    for (const s of SCHEMES) expect(vars[s][`--nest-${name}`]).toBe(neutrals[s][name]);
+    expect({ light: neutrals.light[name], dark: neutrals.dark[name] }).toEqual(colorRows[kebab(name)]);
+    for (const s of SCHEMES) expect(vars[s][`--nest-${kebab(name)}`]).toBe(neutrals[s][name]);
   });
 
   it("Mantine's own neutrals are the skill's: body (panels) the surface, text, dimmed the muted, default border", () => {
