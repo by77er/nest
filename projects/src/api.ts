@@ -9,7 +9,7 @@ import { NestError, nestFrom } from "./nest";
 import { prNumberOf } from "./prs";
 import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
-import { proxyTrace } from "./trace";
+import { proxyTrace, proxyTraceHistory } from "./trace";
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
@@ -59,6 +59,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
 
   // An agent's live trace, a WebSocket proxied to nest (src/trace.ts).
   if (parts[0] === "agents" && parts.length === 3 && parts[2] === "trace") return proxyTrace(req, env, parts[1]!, url);
+  if (parts[0] === "agents" && parts.length === 4 && parts[2] === "trace" && parts[3] === "history") return proxyTraceHistory(req, env, parts[1]!, url);
   if (parts[0] !== "projects") return err(404, "unknown route");
   if (parts.length === 1) {
     // Each with `needs_you`: how many asks and blocked tasks wait on the owner (README.md#blocked).

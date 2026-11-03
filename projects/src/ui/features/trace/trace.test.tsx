@@ -12,7 +12,12 @@ import { FakeSocket } from "../../test/fakeSocket";
 import { renderApp } from "../../test/render";
 import { cssVariablesResolver, theme } from "../../theme";
 import { ManagerTrace, ReviewTrace } from "./AgentTraces";
+import { TraceLog } from "./TraceView";
+import { GLYPH } from "../../layout";
 import { groupTurns, initialTrace, MAX_EVENTS, reconnectDelay, type TraceEvent, traceReducer, traceUrl } from "./model";
+
+/** A terminal line's glyph. */
+const glyphOf = (line: Element) => line.querySelector('[data-slot="glyph"]')!.textContent;
 
 const ev = (seq: number, type: string, more: Record<string, unknown> = {}): TraceEvent => ({ seq, ts_ms: 1_000 + seq, type, ...more });
 const fold = (msgs: unknown[], s = initialTrace()) => msgs.reduce<ReturnType<typeof initialTrace>>((st, m) => traceReducer(st, { kind: "message", data: m }), s);
@@ -126,27 +131,43 @@ async function managerTrace(msgs: unknown[] = [...turn, { type: "live" }]) {
 const statusOf = (panel: HTMLElement) => panel.querySelector('[data-slot="trace-status"]')!.textContent;
 
 describe("the trace view", () => {
-  it("shows a turn as a group: its text, each tool call with its result's status, input and result on demand", async () => {
+  it("renders a turn as a terminal transcript: a rule, `●` text, `● Name(arg)` calls with `⎿` results, input on demand", async () => {
     const { panel, user, sock } = await managerTrace();
     expect(sock.url).toBe(`ws://${window.location.host}/api/agents/agt_manager/trace`);
     expect(statusOf(panel)).toBe("Live");
     const group = within(panel).getByRole("group", { name: "Turn" });
-    expect(group).toHaveTextContent("Turn · Message");
-    expect(within(group).getByText("Looking at the repo")).toBeInTheDocument();
-    const status = (call: string) => group.querySelector(`[data-call="${call}"] [data-slot="status"]`)!.textContent;
-    expect([status("toolu_1"), status("toolu_2"), status("toolu_3")]).toEqual(["Done", "Error", "Running"]);
-    expect(group.querySelector('[data-slot="turn-status"]')).toHaveTextContent("Working");
-    // Collapsed until asked for.
-    const bash = within(group).getByRole("button", { name: "Bash" });
+    expect(group.querySelector('[data-ds="term-rule"]')).toHaveTextContent(/message · running$/);
+    const text = group.querySelector('[data-kind="text"]')!;
+    expect(glyphOf(text)).toBe(GLYPH.bullet);
+    expect(text).toHaveTextContent("Looking at the repo");
+    const call = (id: string) => group.querySelector(`[data-call="${id}"]`)!;
+    expect(["toolu_1", "toolu_2", "toolu_3"].map((id) => call(id).getAttribute("data-state"))).toEqual(["done", "error", "running"]);
+    expect(["toolu_1", "toolu_2", "toolu_3"].map((id) => glyphOf(call(id).querySelector('[data-ds="term-line"]')!))).toEqual([GLYPH.bullet, GLYPH.bullet, GLYPH.pending]);
+    // A finished call's bullet in the success role, a failed one's in danger, a running one's ring muted.
+    const tone = (id: string) => (call(id).querySelector('[data-slot="glyph"]') as HTMLElement).getAttribute("style");
+    expect(tone("toolu_1")).toContain("var(--mantine-color-success-text)");
+    expect(tone("toolu_2")).toContain("var(--mantine-color-danger-text)");
+    expect(tone("toolu_3")).toContain("var(--nest-term-muted)");
+    // A running call has no result line yet.
+    expect(call("toolu_3").querySelector('[data-kind="tool_result"]')).toBeNull();
+    const result = call("toolu_1").querySelector('[data-kind="tool_result"]')!;
+    expect(glyphOf(result)).toBe(GLYPH.result);
+    expect(result).toHaveTextContent("README.md");
+    // A disclosure: its input region is hidden until asked for.
+    const bash = within(group).getByRole("button", { name: "Bash(ls)" });
     expect(bash).toHaveAttribute("aria-expanded", "false");
+    const region = document.getElementById(bash.getAttribute("aria-controls")!)!;
+    expect(region).toHaveAttribute("hidden");
     await user.click(bash);
     expect(bash).toHaveAttribute("aria-expanded", "true");
-    expect(within(group).getByText(/"command": "ls"/)).toBeInTheDocument();
-    expect(within(group).getByText("README.md")).toBeInTheDocument();
+    expect(region).not.toHaveAttribute("hidden");
+    expect(region).toHaveTextContent(/"command": "ls"/);
+    expect(within(group).getByRole("button", { name: "Read(x)" })).toBeInTheDocument();
+    expect(within(group).getByRole("button", { name: "Grep()" })).toBeInTheDocument();
 
     act(() => sock.message(ev(9, "turn_completed", { turn: "trn_1", stop_reason: "end_turn", usage: { input_tokens: 1500, output_tokens: 20 } })));
-    expect(group.querySelector('[data-slot="turn-status"]')).toHaveTextContent("Completed");
-    expect(group).toHaveTextContent("1.5k in · 20 out");
+    expect(group).toHaveAttribute("data-status", "completed");
+    expect(group.querySelector('[data-ds="term-rule"]')).toHaveTextContent(/message · end_turn · 1\.5k in · 20 out$/);
   });
 
   it("fades in only what arrives after the backlog", async () => {
@@ -175,7 +196,7 @@ describe("the trace view", () => {
       next.message({ type: "live" });
     });
     expect(statusOf(panel)).toBe("Live");
-    expect(within(panel).getAllByRole("button", { name: "Grep" })).toHaveLength(1);
+    expect(within(panel).getAllByRole("button", { name: "Grep()" })).toHaveLength(1);
     const missed = within(panel).getByText("missed while away").closest('[data-ds="fade-in"]')!;
     expect(missed.getAttribute("data-animated")).toBe("false");
     // A second drop right after: the backoff started over at the good connect.
@@ -220,7 +241,7 @@ describe("the trace view", () => {
   it("stops at the agent's end: no reconnect", async () => {
     const { panel, sock } = await managerTrace([ev(1, "ended", { reason: "stopped" })]);
     expect(statusOf(panel)).toBe("Ended");
-    expect(within(panel).getByText("The agent ended (stopped)")).toBeInTheDocument();
+    expect(panel.querySelector('[data-kind="ended"]')).toHaveTextContent("the agent ended (stopped)");
     vi.useFakeTimers({ shouldAdvanceTime: true });
     act(() => sock.drop(1000));
     act(() => vi.advanceTimersByTime(60_000));
@@ -236,25 +257,28 @@ describe("the trace view", () => {
 });
 
 describe("the mounts", () => {
-  it("a task's drawer shows its worker's trace", async () => {
+  it("a task's drawer shows its worker's trace (in its Trace tab below `lg`)", async () => {
     vi.stubGlobal("WebSocket", FakeSocket);
     const api = new FakeApi();
     const t = task({ state: "in_progress", assignee: "agt_worker1" });
     api.tasks = [t];
-    renderApp(`/projects/prj_one?task=${t.id}`, api);
+    const { user } = renderApp(`/projects/prj_one?task=${t.id}`, api);
     const drawer = await screen.findByRole("dialog", { name: "Task" });
+    await user.click(await within(drawer).findByRole("tab", { name: "Trace" }));
     await within(drawer).findByRole("heading", { name: "Worker's trace" });
     await waitFor(() => expect(FakeSocket.latest("/api/agents/agt_worker1/trace")).toBeDefined());
   });
 
-  it("a task without a worker says so and opens nothing", async () => {
+  it("a task without a worker keeps one column and opens nothing", async () => {
     vi.stubGlobal("WebSocket", FakeSocket);
     const api = new FakeApi();
     const t = task({ state: "ready" });
     api.tasks = [t];
     renderApp(`/projects/prj_one?task=${t.id}`, api);
     const drawer = await screen.findByRole("dialog", { name: "Task" });
-    expect(await within(drawer).findByText("No worker has started on this task yet.")).toBeInTheDocument();
+    await within(drawer).findByRole("heading", { name: "Description" });
+    expect(within(drawer).queryByRole("tab")).toBeNull();
+    expect(drawer.querySelector("[data-column]")).toBeNull();
     expect(FakeSocket.opened).toEqual([]);
   });
 
@@ -281,5 +305,284 @@ describe("the mounts", () => {
     expect(screen.getByText("The manager hasn't started yet.")).toBeInTheDocument();
     expect(screen.getByText("No reviewer has started on this review yet.")).toBeInTheDocument();
     expect(FakeSocket.opened).toEqual([]);
+  });
+});
+
+// --- The terminal ------------------------------------------------------------------------------------------
+
+/** A trace state with these ring events (and history), as the view is given it. */
+function stateOf(events: TraceEvent[], more: Partial<ReturnType<typeof initialTrace>> = {}) {
+  return { ...initialTrace(), events, last: events.at(-1)?.seq ?? 0, status: "live" as const, animateAfter: events.at(-1)?.seq ?? 0, ...more };
+}
+
+describe("the terminal", () => {
+  it("pins each glyph's codepoint: none with an emoji presentation (no U+23FA)", () => {
+    const cps = Object.fromEntries(Object.entries(GLYPH).map(([k, v]) => [k, [...v].map((c) => c.codePointAt(0)!.toString(16))]));
+    expect(cps).toEqual({ bullet: ["25cf"], pending: ["25cb"], result: ["23bf"], error: ["2717"], note: ["b7"], ask: ["3f"], warn: ["21"] });
+    const sources = import.meta.glob<string>(["./*.tsx", "../../layout/Terminal.tsx"], { query: "?raw", import: "default", eager: true });
+    for (const [f, text] of Object.entries(sources)) expect(text.includes("⏺"), f).toBe(false);
+  });
+
+  it("gives each event type its line: glyph, tone and text", () => {
+    renderAlone(
+      <TraceLog
+        title="T"
+        state={stateOf([
+          ev(1, "state", { state: "waiting_input" }),
+          ev(2, "turn_started", { turn: "t", input_kind: "inbox" }),
+          ev(3, "assistant_text", { turn: "t", text: "Hi" }),
+          ev(4, "tool_call", { turn: "t", call_id: "c1", name: "mcp__nest__Bash", input: '{"command":"npm run build\\nnpm test","description":"Build"}' }),
+          ev(5, "tool_result", { turn: "t", call_id: "c1", is_error: true, summary: "exit 1" }),
+          ev(6, "ask", { turn: "t", ask: "ask_1", question: "Allow push?" }),
+          ev(7, "error", { turn: "t", code: "error_max_turns", message: "too many" }),
+          ev(8, "rate_limited", { turn: "t", detail: "429" }),
+          ev(9, "task_exited", { turn: "t", task_id: "job1", status: "exited", exit_code: 0 }),
+          ev(10, "ended", { reason: "done" }),
+        ])}
+      />,
+    );
+    const line = (kind: string) => document.querySelector(`[data-kind="${kind}"]`) as HTMLElement;
+    expect(glyphOf(line("state"))).toBe(GLYPH.note);
+    expect(line("state")).toHaveTextContent("now waiting input");
+    expect(glyphOf(line("text"))).toBe(GLYPH.bullet);
+    // An MCP tool by its own name, its main argument's first line.
+    expect(screen.getByRole("button", { name: "Bash(npm run build)" })).toHaveAttribute("title", "mcp__nest__Bash");
+    expect(glyphOf(line("ask"))).toBe(GLYPH.ask);
+    expect(line("ask")).toHaveTextContent("waiting for an answer: Allow push?");
+    expect(glyphOf(line("error"))).toBe(GLYPH.error);
+    expect(line("error")).toHaveTextContent("error_max_turns: too many");
+    expect(line("rate_limited")).toHaveTextContent("rate limited: 429");
+    expect(glyphOf(line("rate_limited"))).toBe(GLYPH.warn);
+    expect((line("rate_limited").querySelector('[data-slot="glyph"]') as HTMLElement).getAttribute("style")).toContain("var(--nest-term-warning)");
+    expect(line("task_exited")).toHaveTextContent("background task job1 exited (code 0)");
+    expect(line("ended")).toHaveTextContent("the agent ended (done)");
+    // Muted one-liners, by the dimmed color.
+    for (const k of ["state", "ask", "rate_limited", "task_exited", "ended"]) expect(line(k).getAttribute("style"), k).toContain("var(--nest-term-muted)");
+  });
+
+  it("shows an error by the danger role's text shade and the ✗ glyph, on the call and its result", () => {
+    renderAlone(<TraceLog title="T" state={stateOf([ev(1, "tool_call", { call_id: "c", name: "Read", input: '{"file_path":"src/a.ts"}' }), ev(2, "tool_result", { call_id: "c", is_error: true, summary: "File does not exist." })])} />);
+    const result = document.querySelector('[data-kind="tool_result"]') as HTMLElement;
+    expect(result).toHaveAttribute("data-error", "true");
+    expect(result.getAttribute("style")).toContain("var(--mantine-color-danger-text)");
+    expect(result).toHaveTextContent(`${GLYPH.error} File does not exist.`);
+    const callGlyph = document.querySelector('[data-call="c"] [data-slot="glyph"]') as HTMLElement;
+    expect(callGlyph.getAttribute("style")).toContain("var(--mantine-color-danger-text)");
+    expect(screen.getByRole("button", { name: "Read(src/a.ts)" })).toBeInTheDocument();
+  });
+
+  it("shows a result's first lines, then `… +N lines (expand)`, all of them on a click", async () => {
+    const { user } = renderAlone(<TraceLog title="T" state={stateOf([ev(1, "tool_call", { call_id: "c", name: "Bash", input: "{}" }), ev(2, "tool_result", { call_id: "c", is_error: false, summary: "1\n2\n3\n4\n5\n6" })])} />);
+    const result = document.querySelector('[data-kind="tool_result"] [data-slot="text"]') as HTMLElement;
+    expect(result.textContent).toBe("1\n2\n3");
+    // A real button (reachable by keyboard), a disclosure that collapses again.
+    const more = screen.getByRole("button", { name: "… +3 lines (expand)" });
+    expect(more.tagName).toBe("BUTTON");
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    more.focus();
+    await user.keyboard("{Enter}");
+    expect(result.textContent).toBe("1\n2\n3\n4\n5\n6");
+    // Expanded: "(collapse)" at the output's top as well as its end.
+    const collapse = screen.getAllByRole("button", { name: "(collapse)" });
+    expect(collapse.map((b) => b.getAttribute("data-at"))).toEqual(["top", "end"]);
+    for (const b of collapse) expect(b).toHaveAttribute("aria-expanded", "true");
+    await user.click(collapse[0]!);
+    expect(result.textContent).toBe("1\n2\n3");
+  });
+
+  it("is text in the mono family on the terminal surface, wrapping long lines (no sideways scroll)", () => {
+    const long = `x${"y".repeat(500)}`;
+    renderAlone(<TraceLog title="T" state={stateOf([ev(1, "assistant_text", { text: long })])} />);
+    const term = document.querySelector('[data-ds="terminal"]') as HTMLElement;
+    const style = term.getAttribute("style")!;
+    expect(style).toContain("var(--nest-terminal)");
+    expect(style).toContain("var(--nest-terminal-border)");
+    expect(style).toMatch(/white-space: pre-wrap/);
+    expect(style).toMatch(/overflow-wrap: anywhere/);
+    expect(style).toContain("var(--mantine-font-family-monospace)");
+    // Each line wraps under its own text (a 2ch glyph column, then a shrinkable one); the text is selectable text.
+    const line = document.querySelector('[data-kind="text"]') as HTMLElement;
+    expect(line.getAttribute("style")).toContain("grid-template-columns: 2ch minmax(0, 1fr)");
+    expect(line.querySelector('[data-slot="text"]')!.textContent).toBe(long);
+  });
+});
+
+// --- Backfill ----------------------------------------------------------------------------------------------
+
+/** The app's history route, answered from `pages` by `before`; a page may be held back until `release`. */
+function historyFetch(pages: Record<string, { events: unknown[]; next_before: string | null }>) {
+  const asked: string[] = [];
+  const held = new Map<string, () => void>();
+  const hold = new Set<string>();
+  vi.stubGlobal("fetch", async (input: RequestInfo | URL) => {
+    const u = new URL(String(input), "https://projects.test");
+    const before = u.searchParams.get("before") ?? "";
+    asked.push(before);
+    if (hold.has(before)) await new Promise<void>((r) => held.set(before, r));
+    const page = pages[before];
+    return page ? new Response(JSON.stringify(page), { headers: { "content-type": "application/json" } }) : new Response('{"error":"no"}', { status: 400 });
+  });
+  return { asked, hold, release: (b: string) => held.get(b)?.() };
+}
+
+const h = (entry: number, type: string, more: Record<string, unknown> = {}) => ({ ts_ms: 500 + entry, entry, type, ...more });
+const histTurn = (base: number, n: number) => [
+  h(base, "turn_started", { input_kind: "unknown" }),
+  h(base + 1, "assistant_text", { text: `older ${n}` }),
+  h(base + 2, "tool_call", { call_id: `toolu_h${n}`, name: "Bash", input: `{"command":"ls ${n}"}` }),
+  h(base + 3, "tool_result", { call_id: `toolu_h${n}`, is_error: false, summary: `out ${n}` }),
+  h(base + 3, "turn_completed", { stop_reason: "end_turn" }),
+];
+
+describe("backfill", () => {
+  it("loads history when nest offers it, shows it before the ring, never animated, and pages back from the top", async () => {
+    const f = historyFetch({ c1: { events: histTurn(10, 1), next_before: "c2" }, c2: { events: histTurn(0, 0), next_before: null } });
+    f.hold.add("c2");
+    const { panel } = await managerTrace([{ type: "history", before: "c1" }, ...turn, { type: "live" }]);
+    await waitFor(() => expect(panel).toHaveTextContent("older 1"));
+    expect(f.asked).toEqual(["c1"]);
+    const texts = [...panel.querySelectorAll('[data-kind="text"] [data-slot="text"]')].map((n) => n.textContent);
+    expect(texts).toEqual(["older 1", "Looking at the repo"]);
+    // History's lines don't fade in, and its turns have their own rules.
+    for (const n of panel.querySelectorAll('[data-ds="fade-in"]')) expect(n.getAttribute("data-animated")).toBe("false");
+    expect(within(panel).getAllByRole("group", { name: "Turn" })).toHaveLength(2);
+    expect(panel.querySelector('[data-turn^="h"] [data-ds="term-rule"]')).toHaveTextContent("end_turn");
+    // At the top: the page before, "loading earlier" meanwhile, then the beginning.
+    const viewport = panel.querySelector(".mantine-ScrollArea-viewport") as HTMLElement;
+    Object.defineProperty(viewport, "scrollHeight", { configurable: true, value: 1000 });
+    Object.defineProperty(viewport, "clientHeight", { configurable: true, value: 200 });
+    Object.defineProperty(viewport, "scrollTop", { configurable: true, value: 0 });
+    act(() => viewport.dispatchEvent(new Event("scroll")));
+    await waitFor(() => expect(panel.querySelector('[data-slot="older"]')).toHaveTextContent("loading earlier…"));
+    act(() => f.release("c2"));
+    await waitFor(() => expect(panel).toHaveTextContent("older 0"));
+    expect([...panel.querySelectorAll('[data-kind="text"] [data-slot="text"]')].map((n) => n.textContent)).toEqual(["older 0", "older 1", "Looking at the repo"]);
+    expect(panel.querySelector('[data-slot="older"]')).toHaveTextContent("the beginning of the trace");
+    expect(f.asked).toEqual(["c1", "c2"]);
+  });
+
+  it("after a gap with a cursor, drops what it held and backfills from there: each event once", async () => {
+    const f = historyFetch({ g1: { events: [...histTurn(0, 0), h(20, "turn_started", { input_kind: "unknown" }), h(21, "assistant_text", { text: "Looking at the repo" })], next_before: null } });
+    const { panel, sock } = await managerTrace();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    act(() => sock.drop());
+    act(() => vi.advanceTimersByTime(1000));
+    const next = FakeSocket.opened[1]!;
+    vi.useRealTimers();
+    act(() => {
+      next.open();
+      next.message({ type: "gap", from: 9, to: 30, before: "g1" });
+      next.message(ev(31, "assistant_text", { turn: "trn_2", text: "after the gap" }));
+      next.message({ type: "live" });
+    });
+    await waitFor(() => expect(panel).toHaveTextContent("older 0"));
+    expect(f.asked).toEqual(["g1"]);
+    expect([...panel.querySelectorAll('[data-kind="text"] [data-slot="text"]')].map((n) => n.textContent)).toEqual(["older 0", "Looking at the repo", "after the gap"]);
+    // The notice is for a gap nothing covers.
+    expect(within(panel).queryByText("Earlier events aren't in the live trace")).toBeNull();
+  });
+});
+
+describe("the task drawer's layout", () => {
+  it("from `xl` on, a task with a worker is two columns that scroll on their own: details, then the wider trace", async () => {
+    const real = window.matchMedia;
+    window.matchMedia = ((q: string) => ({ ...real(q), matches: q.includes("min-width: 88em") })) as typeof window.matchMedia;
+    try {
+      vi.stubGlobal("WebSocket", FakeSocket);
+      const api = new FakeApi();
+      const t = task({ state: "in_progress", assignee: "agt_worker1" });
+      api.tasks = [t];
+      renderApp(`/projects/prj_one?task=${t.id}`, api);
+      const drawer = await screen.findByRole("dialog", { name: "Task" });
+      await waitFor(() => expect(drawer.querySelector('[data-column="details"]')).not.toBeNull());
+      const details = drawer.querySelector('[data-column="details"]') as HTMLElement;
+      const beside = drawer.querySelector('[data-column="beside"]') as HTMLElement;
+      expect(within(details).getByRole("heading", { name: "Description" })).toBeInTheDocument();
+      expect(within(beside).getByRole("heading", { name: "Worker's trace" })).toBeInTheDocument();
+      expect(within(drawer).queryByRole("tab")).toBeNull();
+      // The trace fills its column and scrolls in itself.
+      expect(beside.querySelector('[data-fill="true"]')).not.toBeNull();
+    } finally {
+      window.matchMedia = real;
+    }
+  });
+});
+
+describe("the task drawer's tabs and width", () => {
+  const withWide = async (wide: boolean, fn: () => Promise<void>) => {
+    const real = window.matchMedia;
+    window.matchMedia = ((q: string) => ({ ...real(q), matches: wide && q.includes("min-width: 88em") })) as typeof window.matchMedia;
+    try {
+      await fn();
+    } finally {
+      window.matchMedia = real;
+    }
+  };
+
+  it("below `xl`, its tabs keep the trace mounted (no reconnect on a switch), with no second heading on screen", async () => {
+    await withWide(false, async () => {
+      vi.stubGlobal("WebSocket", FakeSocket);
+      const api = new FakeApi();
+      const t = task({ state: "in_progress", assignee: "agt_worker1" });
+      api.tasks = [t];
+      const { user } = renderApp(`/projects/prj_one?task=${t.id}`, api);
+      const drawer = await screen.findByRole("dialog", { name: "Task" });
+      await user.click(await within(drawer).findByRole("tab", { name: "Trace" }));
+      const sock = await waitFor(() => FakeSocket.latest("agt_worker1")!);
+      // The connection's status is on the terminal's first line, in its muted tone.
+      const row = drawer.querySelector('[data-ds="terminal"] [data-slot="status-row"]') as HTMLElement;
+      expect(within(row).getByText("Connecting")).toBeInTheDocument();
+      // The tab names it: its heading is for readers only.
+      const heading = within(drawer).getByRole("heading", { name: "Worker's trace" });
+      expect(heading.querySelector(".mantine-VisuallyHidden-root, [class*='VisuallyHidden']") ?? heading.closest("[class*='VisuallyHidden']")).not.toBeNull();
+      await user.click(within(drawer).getByRole("tab", { name: "Details" }));
+      await user.click(within(drawer).getByRole("tab", { name: "Trace" }));
+      expect(sock.closedByPage).toBeNull();
+      expect(FakeSocket.opened.filter((x) => x.url.includes("agt_worker1"))).toHaveLength(1);
+    });
+  });
+
+  it("from `xl` on, one sheet width whether the task has a worker or not", async () => {
+    await withWide(true, async () => {
+      vi.stubGlobal("WebSocket", FakeSocket);
+      const api = new FakeApi();
+      const a = task({ state: "in_progress", assignee: "agt_worker1" });
+      const b = task({ state: "ready" });
+      api.tasks = [a, b];
+      const widthOf = async (id: string) => {
+        const view = renderApp(`/projects/prj_one?task=${id}`, api);
+        await screen.findByRole("dialog", { name: "Task" });
+        await within(screen.getByRole("dialog", { name: "Task" })).findByRole("heading", { name: "Description" });
+        const content = document.querySelector(".mantine-Drawer-content") as HTMLElement;
+        const w = content.getAttribute("style") ?? "";
+        view.unmount();
+        return /--drawer-size:\s*([^;]+)/.exec(w)?.[1] ?? getComputedStyle(content).getPropertyValue("--drawer-size");
+      };
+      const [withWorker, without] = [await widthOf(a.id), await widthOf(b.id)];
+      expect(withWorker).toContain("--nest-sheet-wide");
+      expect(without).toBe(withWorker);
+      // A task without a worker: a quiet empty trace column, so the frame stays balanced.
+      renderApp(`/projects/prj_one?task=${b.id}`, api);
+      const drawer = await screen.findByRole("dialog", { name: "Task" });
+      await waitFor(() => expect(drawer.querySelector('[data-column="beside"]')).not.toBeNull());
+      expect(within(drawer.querySelector('[data-column="beside"]') as HTMLElement).getByText("No worker yet")).toBeInTheDocument();
+      expect(FakeSocket.opened.filter((x) => x.url.includes(b.id))).toEqual([]);
+    });
+  });
+});
+
+describe("the terminal's quiet parts", () => {
+  it("connecting shows in the terminal's muted tone (AA on it), and a rule is a row of its own", () => {
+    renderAlone(<TraceLog title="T" state={{ ...initialTrace(), status: "connecting" }} />);
+    const loading = document.querySelector('[data-ds="terminal"] [data-ds="loading"]') as HTMLElement;
+    expect(loading).not.toBeNull();
+  });
+
+  it("a turn's rule is its label then a hairline, both in the terminal's tones", () => {
+    renderAlone(<TraceLog title="T" state={stateOf([ev(1, "turn_started", { turn: "t", input_kind: "user" }), ev(2, "assistant_text", { turn: "t", text: "x" })])} />);
+    const rule = document.querySelector('[data-ds="term-rule"]') as HTMLElement;
+    expect(rule.getAttribute("style")).toContain("var(--nest-term-muted)");
+    expect(rule.className).not.toBe("");
+    expect(rule.textContent).toMatch(/message · running$/);
   });
 });

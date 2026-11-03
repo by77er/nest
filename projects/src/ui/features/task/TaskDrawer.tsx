@@ -2,9 +2,9 @@
 // owner can do to it.
 
 import { Badge } from "@mantine/core";
-import { IconRobot } from "@tabler/icons-react";
+import { IconRobot, IconTimeline } from "@tabler/icons-react";
 import { useTask } from "../../api/queries";
-import { ErrorState, LoadingState, MetaItem, MetaRow, Notice, Prose, Row, Section, Sheet, Stack } from "../../layout";
+import { EmptyState, ErrorState, LoadingState, MetaItem, MetaRow, Notice, Prose, Row, Section, Sheet, Stack } from "../../layout";
 import { ago, exact } from "../../common/time";
 import { StateBadge } from "../board/StateBadge";
 import { WaitingBadge } from "../board/WaitingBadge";
@@ -22,7 +22,12 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
   const t = task.data;
 
   return (
-    <Sheet opened={taskId !== undefined} onClose={onClose} title="Task">
+    // A task that has (or had) a worker: its trace beside the details (two columns from `xl`, tabs below).
+    <Sheet opened={taskId !== undefined} onClose={onClose} title="Task"
+      split
+      beside={t?.assignee ? <TaskTraces task={t} /> : undefined}
+      besideEmpty={t ? <EmptyState icon={IconTimeline} title="No worker yet" description="Its worker's trace shows here once the task is assigned and its worker starts." /> : undefined}
+    >
       {task.isPending ? (
         <LoadingState label="Loading the task" />
       ) : task.isError ? (
@@ -80,8 +85,6 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
           <Section title="History" count={t.history.length} region={false}>
             <HistoryList history={t.history} />
           </Section>
-
-          <TaskTraces task={t} />
         </Stack>
       ) : null}
     </Sheet>

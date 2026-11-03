@@ -3,7 +3,9 @@
 // with tasks' attached PRs (open, merged, a fork's, one closed and detached) and their dependencies
 // (a task waiting on two of three, one waited on by two, one whose blockers are all done).
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
-// projects) or "error" (the API fails).
+// projects), "error" (the API fails) or "connecting" (a trace that sends nothing yet). Traces come from trace.mjs: history pages plus a live ring.
+
+import { trace } from "./trace.mjs";
 
 const DAY = 86_400_000;
 
@@ -129,19 +131,10 @@ export function data(variant = "demo", now = Date.now()) {
     job(115, "Rate-limit the public API", "failed", { error: "The reviewer exited three times without a verdict.", runs: 3 }),
     job(114, "Write the 0.5 changelog", "superseded"),
   ];
-  let seq = 0;
-  const ev = (type, more = {}) => ({ seq: ++seq, ts_ms: now - 600_000 + seq * 9000, type, ...more });
-  const trace = [
-    ev("state", { state: "working", turn: "trn_1" }),
-    ev("turn_started", { turn: "trn_1", input_kind: "user" }),
-    ev("assistant_text", { turn: "trn_1", text: "Looking at how the gadget list is queried before I spec pagination." }),
-    ev("tool_call", { turn: "trn_1", call_id: "toolu_1", name: "Bash", input: JSON.stringify({ command: "rg -n 'listGadgets' src" }) }),
-    ev("tool_result", { turn: "trn_1", call_id: "toolu_1", is_error: false, summary: "src/routes/gadgets.ts:42: export async function listGadgets(" }),
-    ev("tool_call", { turn: "trn_1", call_id: "toolu_2", name: "mcp__projects-board__write_spec", input: JSON.stringify({ task: "tsk_demo6" }) }),
-    ev("tool_result", { turn: "trn_1", call_id: "toolu_2", is_error: false, summary: "ready" }),
-    ev("turn_completed", { turn: "trn_1", stop_reason: "end_turn" }),
-    { type: "live" },
-  ];
+  // Every trace (the manager's, a worker's, a reviewer's): history offered and paged, then the live ring (trace.mjs).
+  const { messages: allMessages, pages: historyPages } = trace(now);
+  // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
+  const traceMessages = variant === "connecting" ? [] : allMessages;
   const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length }, { ...other, needs_you: 0 }];
   const sync = { written: ["capabilities/projects/board", "capabilities/projects/task", "templates/projects/manager", "templates/projects/worker"], repos: ["by77er/gadgets", "by77er/widgets"], at_ms: now - 3_600_000 };
 
@@ -155,11 +148,12 @@ export function data(variant = "demo", now = Date.now()) {
     const q = path.slice("/projects/prj_demo".length);
     const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chat, "/reviews": reviews, "/prs/open": openPrs, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
     if (q in routes) return [200, routes[q]];
+    // A task's detail: each task's own, with its history (tsk_demo3 has no worker).
     if (q.startsWith("/tasks/")) {
       const d = detail(q.split("/")[2]);
       return d ? [200, d] : [404, { error: "unknown task" }];
     }
     return [404, { error: "unknown route" }];
   };
-  return { answer, trace };
+  return { answer, trace: traceMessages, history: historyPages };
 }

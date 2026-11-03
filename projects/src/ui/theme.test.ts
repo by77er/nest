@@ -7,7 +7,7 @@ import { darken, DEFAULT_THEME, mergeMantineTheme } from "@mantine/core";
 import { describe, expect, it } from "vitest";
 import { TASK_STATES } from "../tasks";
 import { STATE_COLOR, STATE_LABEL } from "./status";
-import { cssVariablesResolver, filled, fontSizes, headings, layout, lineHeights, motion, neutrals, palette, radius, ROLES, roleText, spacing, theme } from "./theme";
+import { cssVariablesResolver, terminalWarning, filled, fontSizes, headings, layout, lineHeights, motion, neutrals, palette, radius, ROLES, roleText, spacing, theme } from "./theme";
 
 // vitest runs from projects/; the skill is the repo's.
 const SKILL = readFileSync(`${process.cwd()}/../.claude/skills/nest-ui-design/SKILL.md`, "utf8");
@@ -80,11 +80,12 @@ describe("the tokens match the skill", () => {
   it("colors: the neutral roles and each semantic role's filled shade, light and dark", () => {
     const hex = (cell: string) => /#[0-9a-f]{6}/i.exec(cell)![0].toLowerCase();
     const rows = table("Role");
-    const neutralRoles = ["page", "surface", "subtle", "border", "text", "muted"] as const;
+    const neutralRoles = ["page", "surface", "subtle", "border", "text", "muted", "terminal", "terminal-muted", "terminal-rule"] as const;
     expect(rows.map((r) => r[0]).sort()).toEqual([...neutralRoles, ...ROLES].sort());
     for (const [role, light, dark] of rows) {
       if ((neutralRoles as readonly string[]).includes(role!)) {
-        expect([neutrals.light[role as "page"], neutrals.dark[role as "page"]], role).toEqual([hex(light!), hex(dark!)]);
+        const key = role!.replace(/-(\w)/g, (_m, c: string) => c.toUpperCase()) as "page";
+        expect([neutrals.light[key], neutrals.dark[key]], role).toEqual([hex(light!), hex(dark!)]);
       } else {
         const tuple = palette[role as "primary"];
         expect([tuple[filled.light.shade], tuple[filled.dark.shade]], role).toEqual([hex(light!), hex(dark!)]);
@@ -137,6 +138,25 @@ describe("contrast, in both schemes", () => {
     }
     expect(vars[s]["--mantine-color-dimmed"]).toBe(n.muted);
     expect(vars[s]["--mantine-color-text"]).toBe(n.text);
+  });
+
+  it.each(schemes)("%s: on the terminal surface (a trace), text, muted text and each role's text", (s) => {
+    const n = neutrals[s];
+    expect(vars[s]["--nest-terminal"]).toBe(n.terminal);
+    expect(vars[s]["--nest-terminal-border"]).toBe(`1px solid ${n.terminalRule}`);
+    expect(vars[s]["--nest-term-rule"]).toBe(n.terminalRule);
+    // Its hairlines show on it (about 1.4:1), in both schemes.
+    expect(contrast(n.terminalRule, n.terminal), "rule").toBeGreaterThanOrEqual(1.35);
+    expect(contrast(n.text, n.terminal), "text").toBeGreaterThanOrEqual(AA);
+    expect(vars[s]["--nest-term-muted"]).toBe(n.terminalMuted);
+    expect(contrast(n.terminalMuted, n.terminal), "muted").toBeGreaterThanOrEqual(AA);
+    for (const r of ["primary", "danger", "success"] as const) expect(contrast(palette[r][roleText[s][r]], n.terminal), r).toBeGreaterThanOrEqual(AA);
+    const warning = palette.warning[terminalWarning[s]];
+    expect(vars[s]["--nest-term-warning"]).toBe(warning);
+    expect(contrast(warning, n.terminal), "warning").toBeGreaterThanOrEqual(AA);
+    // Distinguishable from the subtle ground (a code block, a hover) and the surface it sits on.
+    expect(contrast(n.terminal, n.subtle), "terminal vs subtle").toBeGreaterThanOrEqual(1.07);
+    expect(contrast(n.terminal, n.surface), "terminal vs surface").toBeGreaterThanOrEqual(1.07);
   });
 
   it.each(schemes)("%s: a filled button's label on each role", (s) => {

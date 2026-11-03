@@ -6,6 +6,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 import { measure } from "./checks.mjs";
+import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
 
 const sel = {
   frame: "[data-ds=page]",
@@ -39,6 +40,7 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
   <div data-ds="page"><div data-measure="form">
     <div data-ds="page-header"><h1>Gadgets</h1>${bad.h1 ? "<h1>Again</h1>" : ""}</div>
     <div data-ds="panel"><p class="faint">Updated 2 min ago</p>
+      <p><span style="color: transparent">⎿</span> a character kept for copy, drawn as something else: not read, so not checked</p>
       ${bad.clip ? '<p class="cut">A title far too long for its box</p>' : '<p class="cut">Short</p>'}
       ${bad.escape ? '<div style="width: 2000px">Wider than its panel</div>' : ""}
       <p><button class="chip ${bad.tap ? "reach" : ""}">Waiting</button> <button class="chip">Detach</button></p>
@@ -81,6 +83,56 @@ const left = (await page.evaluate(measure, sel)).frame;
 await page.setContent(html({ measure: true }));
 const centred = (await page.evaluate(measure, sel)).frame;
 assert.ok(centred.h1Left - left.h1Left > 100 && centred.contentLeft === left.contentLeft, JSON.stringify({ left, centred }));
+
+// The trace's tabs: a sheet whose Trace tab is kept (hidden, `display: none`) passes; one that mounts the
+// trace again on each switch (a new socket, its history fetched again, scroll and expansion lost) fails.
+const tabsPage = (remount) => `<!doctype html><html><body>
+  <div role="tablist"><button role="tab" id="d">Details</button><button role="tab" id="t">Trace</button></div>
+  <div id="details">details</div><div id="trace" style="display: none"></div>
+  <script>
+    const make = () => {
+      const box = document.getElementById("trace");
+      box.innerHTML = '<div data-ds="terminal"><div class="mantine-ScrollArea-viewport" style="height: 100px; overflow: auto">' +
+        Array.from({ length: 60 }, (_, i) => "<p>line " + i + "</p>").join("") +
+        '<button data-slot="more" aria-expanded="false">more</button></div></div>';
+      const more = box.querySelector("[data-slot=more]");
+      more.onclick = () => more.setAttribute("aria-expanded", more.getAttribute("aria-expanded") === "true" ? "false" : "true");
+      new WebSocket("ws://selftest.local/api/agents/agt_x/trace");
+      fetch("/api/agents/agt_x/trace/history?before=c1");
+    };
+    let made = false;
+    document.getElementById("t").onclick = () => {
+      if (${remount} || !made) { make(); made = true; }
+      document.getElementById("trace").style.display = "block";
+      document.getElementById("details").style.display = "none";
+    };
+    document.getElementById("d").onclick = () => {
+      document.getElementById("trace").style.display = "none";
+      document.getElementById("details").style.display = "block";
+      if (${remount}) document.getElementById("trace").innerHTML = "";
+    };
+  </script></body></html>`;
+for (const remount of [false, true]) {
+  const p = await browser.newPage({ viewport: { width: 390, height: 844 } });
+  const traffic = countTraffic(p);
+  await p.routeWebSocket(/\/trace$/, () => traffic.socket());
+  await p.route("http://selftest.local/**", (route) => {
+    const u = new URL(route.request().url());
+    if (u.pathname.endsWith("/trace/history")) {
+      traffic.historyPage();
+      return route.fulfill({ contentType: "application/json", body: "{}" });
+    }
+    return route.fulfill({ contentType: "text/html", body: tabsPage(remount) });
+  });
+  await p.goto("http://selftest.local/");
+  const problems = await tabKeepCheck(p);
+  if (remount) {
+    assert.equal(problems.length, 4, `the remounting tabs must fail all four: ${JSON.stringify(problems)}`);
+  } else {
+    assert.deepEqual(problems, [], "the kept tabs pass");
+  }
+  await p.close();
+}
 
 await browser.close();
 console.log("selftest: every check fails its planted violation and passes the clean page");
