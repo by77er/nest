@@ -29,6 +29,11 @@
   .trigger {
     min-height: var(--nest-hit-touch);
   }
+
+  /* A badge line that may hold a trigger: the same pitch with or without one (BadgeLine). */
+  .badgeLine {
+    min-height: var(--nest-hit-touch);
+  }
 }
 
 /* What fills a row's free width, and wraps before its actions give way (text wraps, never clips). */

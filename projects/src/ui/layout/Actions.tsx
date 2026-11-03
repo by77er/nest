@@ -3,6 +3,7 @@
 // on touch), a badge that opens its details on hover or focus, and what fills a row before its actions.
 
 import { Badge, type BadgeProps, Box, Button, type ButtonProps, Combobox, Group, Loader, Text, useCombobox } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import { forwardRef, type ReactNode, useEffect, useState } from "react";
 import { icon } from "../theme";
 import classes from "./Actions.module.css";
@@ -151,17 +152,31 @@ export const RowAction = forwardRef<HTMLButtonElement, ButtonProps & { onClick?:
 export interface TriggerBadgeProps extends Pick<BadgeProps, "size" | "color" | "variant" | "leftSection" | "children"> {
   "data-marker"?: string;
   "aria-label"?: string;
+  /**
+   * On touch, a plain badge: no target, no tooltip. For a board card, whose title opens the drawer with
+   * the same details, so the card keeps one rhythm on a phone instead of growing 44 px lines.
+   */
+  plainOnTouch?: boolean;
 }
 
 /**
  * A badge whose details open on hover or focus (a Tooltip's child): focusable, with the theme's ring,
- * and on touch a 44 px hit area around it that leaves the badge's own box as it is. The tooltip's
- * handlers go on the wrapper, which is the target.
+ * and on touch a 44 px target that reserves its space. The tooltip's handlers go on the wrapper, which
+ * is the target.
  */
 export const TriggerBadge = forwardRef<HTMLSpanElement, TriggerBadgeProps & React.HTMLAttributes<HTMLSpanElement>>(function TriggerBadge(
-  { size, color, variant, leftSection, children, "data-marker": marker, "aria-label": label, ...target },
+  { size, color, variant, leftSection, children, "data-marker": marker, "aria-label": label, plainOnTouch = false, ...target },
   ref,
 ) {
+  const touch = useMediaQuery("(pointer: coarse)");
+  if (plainOnTouch && touch) {
+    // The Tooltip's handlers are dropped: on a phone the card's title is the way to its details.
+    return (
+      <Badge ref={ref as React.Ref<HTMLDivElement>} size={size} color={color} variant={variant} leftSection={leftSection} data-marker={marker}>
+        {children}
+      </Badge>
+    );
+  }
   return (
     // The Tooltip's own props (handlers, its className) first, then ours merged in: never replaced.
     <Box component="span" {...target} ref={ref} tabIndex={0} aria-label={label} data-marker={marker} className={[classes.trigger, target.className].filter(Boolean).join(" ")}>
@@ -171,6 +186,30 @@ export const TriggerBadge = forwardRef<HTMLSpanElement, TriggerBadgeProps & Reac
     </Box>
   );
 });
+
+/**
+ * A line of badges that may hold a TriggerBadge: on touch it reserves the trigger's 44 px pitch whether
+ * or not it has one, so every row of a list (a task's PRs) keeps one rhythm.
+ */
+export function BadgeLine({ children }: { children: ReactNode }) {
+  return (
+    <Group gap="xs" wrap="wrap" className={classes.badgeLine}>
+      {children}
+    </Group>
+  );
+}
+
+/**
+ * A list row's head that may end in a RowAction: one line, the action kept at the right; on touch it
+ * reserves the action's 44 px whether or not this row has one, so rows with and without align.
+ */
+export function ActionLine({ children }: { children: ReactNode }) {
+  return (
+    <Group gap="sm" wrap="nowrap" className={classes.badgeLine}>
+      {children}
+    </Group>
+  );
+}
 
 /** What fills a row's free width, wrapping before the row's actions give way. */
 export function Grow({ children }: { children: ReactNode }) {

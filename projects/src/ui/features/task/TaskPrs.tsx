@@ -11,7 +11,7 @@ import { prNumberOf } from "../../../prs";
 import { useAttachPr, useDetachPr, useOpenPrs, useReviews, useTasks } from "../../api/queries";
 import type { Job, Task, TaskPr } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { Grow, MetaItem, Picker, type PickerItem, Row, RowAction, Section, Stack, TriggerBadge } from "../../layout";
+import { ActionLine, BadgeLine, Grow, MetaItem, Picker, type PickerItem, RowAction, Section, Stack, TriggerBadge } from "../../layout";
 import { TERMINAL } from "../../../tasks";
 import { JobState } from "../reviews/ReviewsPage";
 
@@ -52,7 +52,7 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
     });
   return (
     <Stack gap="xs" data-pr={pr.number}>
-      <Row gap="sm" wrap="nowrap">
+      <ActionLine>
         <Anchor href={`https://github.com/${repo}/pull/${pr.number}`} target="_blank" rel="noreferrer" fz="sm" fw="medium">
           #{pr.number}
         </Anchor>
@@ -66,8 +66,8 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
             Detach
           </RowAction>
         )}
-      </Row>
-      <Row gap="xs">
+      </ActionLine>
+      <BadgeLine>
         <Badge size="sm" variant="light" color={pr.state === "merged" ? "success" : "primary"}>
           {pr.state === "merged" ? "Merged" : "Open"}
         </Badge>
@@ -78,10 +78,11 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
             Fork
           </Badge>
         )}
-        <MetaItem title={exact(pr.attached_ms)}>
-          Attached by {pr.attached_by === "owner" ? "you" : pr.attached_by.startsWith("app:") ? "its branch" : pr.attached_by} {ago(pr.attached_ms)}
-        </MetaItem>
-      </Row>
+      </BadgeLine>
+      {/* Its own line under the badges, so every PR's badge line has one pitch on touch. */}
+      <MetaItem title={exact(pr.attached_ms)}>
+        Attached by {pr.attached_by === "owner" ? "you" : pr.attached_by.startsWith("app:") ? "its branch" : pr.attached_by} {ago(pr.attached_ms)}
+      </MetaItem>
     </Stack>
   );
 }

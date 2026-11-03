@@ -233,3 +233,43 @@ describe("TriggerBadge", () => {
     expect(await screen.findByText("Its details")).toBeInTheDocument();
   });
 });
+
+describe("on touch", () => {
+  const coarse = () =>
+    vi.stubGlobal("matchMedia", (query: string) => ({
+      matches: query.includes("pointer: coarse"), media: query, onchange: null,
+      addListener: () => {}, removeListener: () => {}, addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => false,
+    }));
+
+  it("a card's badge is plain (no target, no tooltip), and a drawer's stays a 44 px trigger", async () => {
+    coarse();
+    const { Tooltip } = await import("@mantine/core");
+    const { TriggerBadge } = await import("./Actions");
+    const classes = (await import("./Actions.module.css")).default as Record<string, string>;
+    wrap(
+      <>
+        <Tooltip label="Card details" events={{ hover: true, focus: true, touch: true }}>
+          <TriggerBadge plainOnTouch data-marker="card">On a card</TriggerBadge>
+        </Tooltip>
+        <Tooltip label="Drawer details" events={{ hover: true, focus: true, touch: true }}>
+          <TriggerBadge data-marker="drawer">In the drawer</TriggerBadge>
+        </Tooltip>
+      </>,
+    );
+    const card = document.querySelector("[data-marker=card]") as HTMLElement;
+    expect(card).not.toHaveAttribute("tabindex");
+    expect(card.className.split(" ")).not.toContain(classes.trigger);
+    const drawer = document.querySelector("[data-marker=drawer]") as HTMLElement;
+    expect(drawer).toHaveAttribute("tabindex", "0");
+    expect(drawer.className.split(" ")).toContain(classes.trigger);
+  });
+
+  it("a badge line reserves the trigger's pitch whether or not it holds one", async () => {
+    const { BadgeLine } = await import("./Actions");
+    const classes = (await import("./Actions.module.css")).default as Record<string, string>;
+    const css = readFileSync(`${process.cwd()}/src/ui/layout/Actions.module.css`, "utf8");
+    wrap(<BadgeLine><span>Open</span></BadgeLine>);
+    expect(screen.getByText("Open").parentElement!.className.split(" ")).toContain(classes.badgeLine);
+    expect(css).toMatch(/@media \(pointer: coarse\)\s*\{[^@]*\.badgeLine\s*\{\s*min-height:\s*var\(--nest-hit-touch\)/);
+  });
+});

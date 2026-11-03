@@ -9,8 +9,7 @@
  * }} sel
  */
 export function measure(sel) {
-  // `sel.touch`: a touch screen's width, where hit areas must not overlap (hit-overlap).
-  const problems = { overflow: [], clipping: [], contrast: [], nav: [], measure: [], frame: [], "hit-overlap": [] };
+  const problems = { overflow: [], clipping: [], contrast: [], nav: [], measure: [], frame: [] };
   const doc = document.documentElement;
   const W = doc.clientWidth;
   const H = window.innerHeight;
@@ -191,8 +190,28 @@ export function measure(sel) {
     }
   }
 
+  // hit-overlap (touch widths) is `hitOverlap`, run by `scanHitOverlap` at every scroll position.
+  for (const k of Object.keys(problems)) problems[k] = [...new Set(problems[k])];
+  return { problems, frame };
+}
+
+/**
+ * hit-overlap, in the page, for what's in the viewport now: no control's hit area (its box grown by an
+ * absolutely positioned ::before or ::after) takes a tap meant for a neighbouring control. Like
+ * `measure`, it closes over nothing. Answers the problems found.
+ */
+export function hitOverlap() {
+  const problems = { "hit-overlap": [] };
+  const W = document.documentElement.clientWidth;
+  const H = window.innerHeight;
+  const short = (s) => (s ?? "").replace(/\s+/g, " ").trim().slice(0, 50);
+  const visible = (el) => {
+    if (!el.checkVisibility({ opacityProperty: true, visibilityProperty: true })) return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 1 && r.height > 1;
+  };
   // --- hit-overlap (touch widths): no control's hit area takes a tap meant for a neighbouring one ---
-  if (sel.touch) {
+  {
     const CONTROL = 'a[href], button, [role="button"], input:not([type="hidden"]), select, textarea, [tabindex]:not([tabindex="-1"])';
     // Behind an open modal (a drawer, a dialog) nothing takes taps: only the topmost one's controls count.
     const modals = [...document.querySelectorAll('[aria-modal="true"]')].filter(visible);
@@ -246,6 +265,37 @@ export function measure(sel) {
     }
   }
 
-  for (const k of Object.keys(problems)) problems[k] = [...new Set(problems[k])];
-  return { problems, frame };
+  return [...new Set(problems["hit-overlap"])];
+}
+
+/**
+ * hit-overlap across the whole state (node side): at each window scroll position, a viewport apart, and
+ * through each sideways scroller (the board's columns), so controls below the fold or off a scroller
+ * are checked too. An overlay (`full: false`) is checked where it is, unscrolled.
+ */
+export async function scanHitOverlap(page, { full = true } = {}) {
+  const found = new Set(await page.evaluate(hitOverlap));
+  if (!full) return [...found];
+  const { height, view, scrollers } = await page.evaluate(() => {
+    document.querySelectorAll("[data-hit-scroller]").forEach((e) => e.removeAttribute("data-hit-scroller"));
+    const list = [...document.querySelectorAll("*")].filter((e) => {
+      const cs = getComputedStyle(e);
+      return (cs.overflowX === "auto" || cs.overflowX === "scroll") && e.scrollWidth > e.clientWidth + 1;
+    });
+    list.forEach((e, i) => e.setAttribute("data-hit-scroller", String(i)));
+    return { height: document.documentElement.scrollHeight, view: window.innerHeight, scrollers: list.map((e) => ({ width: e.scrollWidth, step: e.clientWidth })) };
+  });
+  for (let y = 0; y < height; y += Math.max(1, view - 40)) {
+    await page.evaluate((top) => window.scrollTo(0, top), y);
+    for (const d of await page.evaluate(hitOverlap)) found.add(d);
+    for (const [i, s] of scrollers.entries()) {
+      for (let x = s.step; x < s.width; x += Math.max(1, s.step - 40)) {
+        await page.evaluate(([n, left]) => document.querySelector(`[data-hit-scroller="${n}"]`)?.scrollTo(left, 0), [i, x]);
+        for (const d of await page.evaluate(hitOverlap)) found.add(d);
+      }
+      await page.evaluate((n) => document.querySelector(`[data-hit-scroller="${n}"]`)?.scrollTo(0, 0), i);
+    }
+  }
+  await page.evaluate(() => window.scrollTo(0, 0));
+  return [...found];
 }

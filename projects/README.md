@@ -248,6 +248,7 @@ The owner's request (2026-11-03): "Tasks should be able to block other tasks."
 - **The Manager page:** the conversation full width at a reading measure (42rem), the composer pinned to the viewport's bottom, and the manager's status in the header from `GET /api/projects/<id>/manager` (`src/manager.ts`): attaching, attach failed (with a retry, `POST …/attach`), starting, waiting for a host, running (and what it's doing), errored, ended, from the project's record and nest's agent record.
 - **History** reads as sentences ("PR #118 opened", "Assigned to agt_…", "Spec written, 3 acceptance criteria"), with who and when; the raw detail is behind "Details".
 - **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list returns, a "Blocked" badge (warning) while the task is blocked, and a "needs input" marker from the project's open asks.
+- **On touch** (`pointer: coarse`), a card's badges are plain status, not tooltip triggers: the card's title opens the drawer, which has the same details, so cards keep one rhythm instead of growing 44 px badge lines. In the drawer, a badge with details is a 44 px trigger that reserves its space (never a hit area reaching over a neighbour), and a list row's badge line and head reserve that pitch whether or not they hold one, so a task's PRs line up.
 
 ### The live trace
 

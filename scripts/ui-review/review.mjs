@@ -12,13 +12,13 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { chromium } from "playwright";
-import { measure } from "./checks.mjs";
+import { measure, scanHitOverlap } from "./checks.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
 const WIDTHS = [1440, 1280, 390];
 const SCHEMES = ["light", "dark"];
-const CHECKS = ["overflow", "clipping", "frame", "nav", "contrast", "measure", "page-error"];
+const CHECKS = ["overflow", "clipping", "frame", "nav", "contrast", "measure", "hit-overlap", "page-error"];
 
 const die = (msg) => {
   console.error(`ui-review: ${msg}`);
@@ -134,9 +134,11 @@ for (const scheme of schemes) {
           await state.after(page);
           await page.waitForTimeout(500);
         }
-        const r = await page.evaluate(measure, { ...app.selectors, viewportOnly: state.full === false, touch: width < 600 });
+        const r = await page.evaluate(measure, { ...app.selectors, viewportOnly: state.full === false });
         shot.frame = r.frame;
         for (const [check, list] of Object.entries(r.problems)) for (const d of list) fail(check, shot, d);
+        // On a touch screen's width: through the whole page and its scrollers, then back to the top.
+        if (width < 600) for (const d of await scanHitOverlap(page, { full: state.full !== false })) fail("hit-overlap", shot, d);
         for (const d of (await state.check?.(page, { width, scheme })) ?? []) fail(state.checkName ?? "app", shot, d);
         if (app.errorText && (await page.getByText(app.errorText).count())) fail("page-error", shot, `the page shows "${app.errorText}"`);
         await page.screenshot({ path: join(out, shot.file), fullPage: state.full !== false });

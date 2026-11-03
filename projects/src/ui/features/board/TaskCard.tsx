@@ -31,10 +31,10 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
           <Row gap="xs" justify="space-between" align="flex-start">
             <Row gap="xs">
               <StateBadge state={task.state} size="sm" />
-              <WaitingBadge task={task} />
+              <WaitingBadge task={task} plainOnTouch />
               {task.blocked && (
                 <Tooltip label={`Blocked: ${task.blocked.reason}`} withArrow multiline maw="var(--nest-side-panel)">
-                  <TriggerBadge size="sm" color="warning" variant="filled" data-marker="blocked" leftSection={<IconHandStop size={icon.sm} aria-hidden />}>
+                  <TriggerBadge plainOnTouch size="sm" color="warning" variant="filled" data-marker="blocked" leftSection={<IconHandStop size={icon.sm} aria-hidden />}>
                     Blocked
                   </TriggerBadge>
                 </Tooltip>
@@ -46,7 +46,7 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
               )}
               {task.tainted && (
                 <Tooltip label="A tainted session wrote to this task (it read untrusted content)" withArrow multiline maw="var(--nest-side-panel)">
-                  <TriggerBadge size="sm" color="gray" variant="outline" data-marker="tainted">
+                  <TriggerBadge plainOnTouch size="sm" color="gray" variant="outline" data-marker="tainted">
                     Tainted
                   </TriggerBadge>
                 </Tooltip>

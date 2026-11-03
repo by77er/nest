@@ -5,7 +5,7 @@
 //   node scripts/ui-review/selftest.mjs
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
-import { measure } from "./checks.mjs";
+import { hitOverlap, measure, scanHitOverlap } from "./checks.mjs";
 import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
 
 const sel = {
@@ -43,6 +43,7 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
       <p><span style="color: transparent">⎿</span> a character kept for copy, drawn as something else: not read, so not checked</p>
       ${bad.clip ? '<p class="cut">A title far too long for its box</p>' : '<p class="cut">Short</p>'}
       ${bad.escape ? '<div style="width: 2000px">Wider than its panel</div>' : ""}
+      ${bad.fold ? '<div style="height: 2400px">A long page</div>' : ""}
       <p><button class="chip ${bad.tap ? "reach" : ""}">Waiting</button> <button class="chip">Detach</button></p>
     </div>
   </div></div>
@@ -50,9 +51,11 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
 
 const browser = await chromium.launch();
 const page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+/** The page's problems; on touch, with hit-overlap scanned through the whole page as review.mjs does. */
 const run = async (bad, touch = false) => {
   await page.setContent(html(bad));
-  return (await page.evaluate(measure, { ...sel, touch })).problems;
+  const problems = (await page.evaluate(measure, sel)).problems;
+  return touch ? { ...problems, "hit-overlap": await scanHitOverlap(page) } : problems;
 };
 const failing = (problems) => Object.keys(problems).filter((k) => problems[k].length).sort();
 
@@ -65,6 +68,11 @@ assert.deepEqual(failing(reach), ["hit-overlap"], `a hit area over a neighbour: 
 assert.match(reach["hit-overlap"][0], /a tap on <button> "Detach" at \d+,\d+ lands on <button> "Waiting"/);
 // Without touch, hit areas aren't checked.
 assert.deepEqual(failing(await run({ tap: true })), []);
+// Below the fold: unseen in the first viewport, found by the scan's scrolling.
+await page.setContent(html({ tap: true, fold: true }));
+assert.deepEqual(await page.evaluate(hitOverlap), [], "below the fold, the first viewport alone sees nothing");
+const folded = await run({ tap: true, fold: true }, true);
+assert.equal(folded["hit-overlap"].length, 1, `below the fold: ${JSON.stringify(folded)}`);
 for (const [bad, checks] of [
   [{ contrast: true }, ["contrast"]],
   [{ clip: true }, ["clipping"]],
