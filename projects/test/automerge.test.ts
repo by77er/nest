@@ -95,13 +95,13 @@ describe("the repo's setting", () => {
     expect(gh.repo(p.repo).allow_auto_merge).toBe(false);
     // A task PR opened meanwhile waits for the repo to allow auto-merge.
     await pr(p, 3, { ref: `task/${id}` });
-    expect((await task(p, id)).auto_merge).toMatchObject({ state: "pending" });
+    expect((await task(p, id)).prs[0]?.auto_merge ?? null).toMatchObject({ state: "pending" });
     expect(gh.autoMerge.has(prNode(p.repo, 3))).toBe(false);
     const r = await api(token, "POST", `/api/projects/${p.id}/auto-merge/retry`);
     expect(r.body.repo_auto_merge).toMatchObject({ state: "applied", error: null });
     expect(gh.repo(p.repo).allow_auto_merge).toBe(true);
     expect(gh.autoMerge.get(prNode(p.repo, 3))).toEqual({ method: "SQUASH" });
-    expect((await task(p, id)).auto_merge).toMatchObject({ state: "enabled", method: "squash" });
+    expect((await task(p, id)).prs[0]?.auto_merge ?? null).toMatchObject({ state: "enabled", method: "squash" });
   });
 
   it("a failure for now is retried from the alarm, twice", async () => {
@@ -142,7 +142,7 @@ describe("a PR's auto-merge", () => {
     await pr(p, 7, { ref: `task/${id}` });
     expect(gh.autoMerge.get(prNode(p.repo, 7))).toEqual({ method: "REBASE" });
     const t = await task(p, id);
-    expect(t.auto_merge).toMatchObject({ state: "enabled", method: "rebase", error: null });
+    expect(t.prs[0]?.auto_merge ?? null).toMatchObject({ state: "enabled", method: "rebase", error: null });
     expect(t.history.at(-1)).toMatchObject({ action: "auto_merge_enabled", actor: "app:github" });
     expect(mintsFor(p).at(-1)).toEqual({ pull_requests: "write", contents: "write" });
     // Not a task's PR; a fork's branch named like the task's.
@@ -151,13 +151,13 @@ describe("a PR's auto-merge", () => {
     await pr(p, 9, { ref: `task/${other}`, headRepo: `stranger/${rand()}` });
     expect(gh.autoMerge.has(prNode(p.repo, 8))).toBe(false);
     expect(gh.autoMerge.has(prNode(p.repo, 9))).toBe(false);
-    expect((await task(p, other)).auto_merge).toBeNull();
+    expect((await task(p, other)).prs[0]?.auto_merge ?? null).toBeNull();
     // A PR a worker reported by number, from a branch that isn't its task's, isn't the task's own.
     const third = await taskWithWorker(p);
     await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE tasks SET state = 'in_review', pr = 10 WHERE id = ?", third); });
     await pr(p, 10, { ref: "elsewhere" });
     expect(gh.autoMerge.has(prNode(p.repo, 10))).toBe(false);
-    expect((await task(p, third)).auto_merge).toBeNull();
+    expect((await task(p, third)).prs[0]?.auto_merge ?? null).toBeNull();
   });
 
   it("isn't enabled while the setting is off; turning it on enables open task PRs, and off disables them", async () => {
@@ -165,13 +165,13 @@ describe("a PR's auto-merge", () => {
     const id = await taskWithWorker(p);
     await pr(p, 4, { ref: `task/${id}` });
     expect(gh.autoMerge.has(prNode(p.repo, 4))).toBe(false);
-    expect((await task(p, id)).auto_merge).toBeNull();
+    expect((await task(p, id)).prs[0]?.auto_merge ?? null).toBeNull();
     await patch(p, { auto_merge: true });
     expect(gh.autoMerge.get(prNode(p.repo, 4))).toEqual({ method: "SQUASH" });
     await patch(p, { auto_merge: false });
     expect(gh.autoMerge.get(prNode(p.repo, 4))).toBeNull();
     const t = await task(p, id);
-    expect(t.auto_merge).toMatchObject({ state: "disabled" });
+    expect(t.prs[0]?.auto_merge ?? null).toMatchObject({ state: "disabled" });
     expect(t.history.at(-1)).toMatchObject({ action: "auto_merge_disabled" });
     expect(gh.repo(p.repo).allow_auto_merge).toBe(false);
   });
@@ -182,13 +182,13 @@ describe("a PR's auto-merge", () => {
     gh.gqlErrors.push({ match: /enablePullRequestAutoMerge/, message: "Pull request is in clean status", times: 1 });
     await pr(p, 5, { ref: `task/${id}` });
     const t = await task(p, id);
-    expect(t.auto_merge).toMatchObject({ state: "failed", error: "GitHub 422: Pull request is in clean status" });
+    expect(t.prs[0]?.auto_merge ?? null).toMatchObject({ state: "failed", error: "GitHub 422: Pull request is in clean status" });
     expect(t.history.at(-1)).toMatchObject({ action: "auto_merge_failed" });
     expect(gh.autoMerge.has(prNode(p.repo, 5))).toBe(false);
     // Reopening the PR asks again.
     await pr(p, 5, { ref: `task/${id}`, action: "closed" });
     await pr(p, 5, { ref: `task/${id}`, action: "reopened" });
-    expect((await task(p, id)).auto_merge).toMatchObject({ state: "enabled" });
+    expect((await task(p, id)).prs[0]?.auto_merge ?? null).toMatchObject({ state: "enabled" });
   });
 
   it("a failure for now is retried from the alarm", async () => {
@@ -196,11 +196,11 @@ describe("a PR's auto-merge", () => {
     const id = await taskWithWorker(p);
     gh.fail(/^POST \/graphql$/, 502, { times: 2 });
     await pr(p, 6, { ref: `task/${id}` });
-    expect((await task(p, id)).auto_merge).toMatchObject({ state: "pending", error: "GitHub 502: injected" });
+    expect((await task(p, id)).prs[0]?.auto_merge ?? null).toMatchObject({ state: "pending", error: "GitHub 502: injected" });
     for (let i = 0; i < 2; i++) {
-      await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE tasks SET am_next_ms = 0 WHERE am_next_ms IS NOT NULL"); });
+      await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE task_prs SET am_next_ms = 0 WHERE am_next_ms IS NOT NULL"); });
       await stub(p).drain();
     }
-    expect((await task(p, id)).auto_merge).toMatchObject({ state: "enabled", error: null });
+    expect((await task(p, id)).prs[0]?.auto_merge ?? null).toMatchObject({ state: "enabled", error: null });
   });
 });

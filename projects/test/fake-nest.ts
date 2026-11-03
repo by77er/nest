@@ -395,6 +395,16 @@ export const GRANT_PERMISSIONS: Record<string, string> = { checks: "write", admi
 const RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
 const levelWithin = (want: string, have: string | undefined) => !!have && !!RANK[want] && RANK[want]! <= RANK[have]!;
 
+export interface FakePull {
+  number: number;
+  title: string;
+  state: "open" | "closed";
+  merged: boolean;
+  ref: string;
+  /** The head's repo; null: a fork GitHub no longer names. */
+  headRepo: string | null;
+}
+
 export interface FakeCheckRun {
   id: number;
   repo: string;
@@ -421,6 +431,8 @@ export class FakeGitHub {
   readonly repos = new Map<string, { default_branch: string; protection: Record<string, any> | null; allow_auto_merge: boolean }>();
   /** Each PR's auto-merge, by node id, as GraphQL's mutations leave it. */
   readonly autoMerge = new Map<string, { method: string } | null>();
+  /** Each repo's PRs, by number. */
+  readonly pulls = new Map<string, Map<number, FakePull>>();
   /** GraphQL errors to answer (a 200 with `errors`), for mutations whose name matches. */
   gqlErrors: { match: RegExp; message: string; times: number }[] = [];
   readonly checkRuns = new Map<number, FakeCheckRun>();
@@ -434,6 +446,15 @@ export class FakeGitHub {
     const token = `ghs_fake${(++this.nextId).toString().padStart(8, "0")}`;
     this.tokens.set(token, { repo: repo.toLowerCase(), permissions });
     return token;
+  }
+
+  /** A PR on `repo` (open, from the repo itself, unless `o` says otherwise). */
+  pull(repo: string, number: number, o: Partial<Omit<FakePull, "number">> = {}): FakePull {
+    const k = repo.toLowerCase();
+    if (!this.pulls.has(k)) this.pulls.set(k, new Map());
+    const p: FakePull = { number, title: `PR ${number}`, state: "open", merged: false, ref: `feature-${number}`, headRepo: k, ...o };
+    this.pulls.get(k)!.set(number, p);
+    return p;
   }
 
   fail(match: RegExp, status: number, o: { times?: number; message?: string } = {}): void {
@@ -523,6 +544,18 @@ export class FakeGitHub {
           return json(200, p.required_status_checks);
         }
       }
+    }
+    // PRs (https://docs.github.com/en/rest/pulls/pulls): Pull requests: read.
+    if (req.method === "GET" && (sub === "/pulls" || (s = sub.match(/^\/pulls\/(\d+)$/)))) {
+      if (!need("pull_requests", "read")) return denied();
+      const view = (p: FakePull) => ({
+        number: p.number, title: p.title, state: p.state, merged: p.merged, merged_at: p.merged ? "2026-11-02T00:00:00Z" : null, node_id: prNode(repoName, p.number),
+        head: { ref: p.ref, repo: p.headRepo === null ? null : { full_name: p.headRepo } }, html_url: `https://github.com/${repoName}/pull/${p.number}`,
+      });
+      const mine = [...(this.pulls.get(repoName)?.values() ?? [])];
+      if (sub === "/pulls") return json(200, mine.filter((p) => p.state === "open").map(view));
+      const p = this.pulls.get(repoName)?.get(Number(s![1]));
+      return p ? json(200, view(p)) : json(404, { message: "Not Found" });
     }
     if (sub === "/check-runs" && req.method === "POST") {
       if (!need("checks", "write")) return denied();

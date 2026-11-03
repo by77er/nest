@@ -13,7 +13,8 @@ export type TaskState = (typeof TASK_STATES)[number];
  * - `start_failed`: nest refused the worker for good (a stalled task is reassigned by hand);
  * - `pr_opened`: its worker reported its PR;
  * - `worker_exited`: its worker ended (nest's `agent.exited`);
- * - `merged`: its PR was merged (GitHub's event; the review PR);
+ * - `merged`: the last of its attached PRs merged (GitHub's event; README.md#prs), from any state not
+ *   over: a PR may be attached to a task with no worker;
  * - `done`: the owner marked it done: only a task with no PR and no live worker (a draft, a ready task,
  *   a stalled one). A task with an open PR is done when it merges (`merged`); one with a worker is
  *   cancelled instead;
@@ -33,7 +34,7 @@ const MOVES: Record<TaskEvent, Partial<Record<TaskState, TaskState>>> = {
   start_failed: { assigned: "stalled" },
   pr_opened: { in_progress: "in_review", in_review: "in_review" },
   worker_exited: { assigned: "stalled", in_progress: "stalled" },
-  merged: { in_review: "done" },
+  merged: { draft: "done", ready: "done", assigned: "done", in_progress: "done", in_review: "done", stalled: "done" },
   done: { draft: "done", ready: "done", stalled: "done" },
   cancel: { draft: "cancelled", ready: "cancelled", assigned: "cancelled", in_progress: "cancelled", in_review: "cancelled", stalled: "cancelled" },
 };
@@ -60,11 +61,73 @@ export const WORKER_STATES: ReadonlySet<TaskState> = new Set(["assigned", "in_pr
 
 /**
  * Auto-assign (README.md#flows): the `ready` tasks to assign now, in board order, while the project's
- * live workers stay under `maxWorkers`. A blocked task waits for its block to clear.
+ * live workers stay under `maxWorkers`. A blocked task waits for its block to clear, and one waiting on
+ * other tasks (its dependencies, README.md#dependencies) until they're done.
  */
-export function pickForAssignment(tasks: readonly { id: string; state: TaskState; ord: number; blocked?: boolean }[], liveWorkers: number, maxWorkers: number): string[] {
+export function pickForAssignment(tasks: readonly { id: string; state: TaskState; ord: number; blocked?: boolean; waiting?: boolean }[], liveWorkers: number, maxWorkers: number): string[] {
   const room = Math.max(0, maxWorkers - liveWorkers);
-  return tasks.filter((t) => t.state === "ready" && !t.blocked).sort((a, b) => a.ord - b.ord).slice(0, room).map((t) => t.id);
+  return tasks.filter((t) => t.state === "ready" && !t.blocked && !t.waiting).sort((a, b) => a.ord - b.ord).slice(0, room).map((t) => t.id);
+}
+
+// --- dependencies (README.md#dependencies) -------------------------------------------------------------
+
+/** A dependency: `task` is blocked by (waits on) `blocker`. */
+export type Dependency = readonly [task: string, blocker: string];
+
+/**
+ * Why `task` can't be made to wait on `blocker`, or null when it can. `tasks` is the project's own tasks
+ * and their states, so another project's task (or a made-up id) is unknown here. A task that's over
+ * waits on nothing. A dependency that would close a cycle is refused with the cycle's path, e.g.
+ * `tsk_a → tsk_b → tsk_c → tsk_a`.
+ */
+export function dependencyError(task: string, blocker: string, edges: readonly Dependency[], tasks: ReadonlyMap<string, TaskState>): string | null {
+  if (task === blocker) return "a task can't wait on itself";
+  if (!tasks.has(task)) return `unknown task ${task}`;
+  if (!tasks.has(blocker)) return `unknown task ${blocker}: a dependency is within the project`;
+  if (TERMINAL.has(tasks.get(task)!)) return `a ${tasks.get(task)} task waits on nothing`;
+  if (edges.some(([t, b]) => t === task && b === blocker)) return `${task} already waits on ${blocker}`;
+  // A path blocker → … → task over "waits on" would make task wait on itself.
+  const waitsOn = new Map<string, string[]>();
+  for (const [t, b] of edges) waitsOn.set(t, [...(waitsOn.get(t) ?? []), b]);
+  const path = findPath(blocker, task, waitsOn);
+  return path ? `it would make a cycle: ${[task, ...path].join(" → ")}` : null;
+}
+
+/** A path from `from` to `to` over `next`, depth first, or null. */
+function findPath(from: string, to: string, next: ReadonlyMap<string, readonly string[]>): string[] | null {
+  const seen = new Set<string>();
+  const walk = (at: string): string[] | null => {
+    if (at === to) return [at];
+    if (seen.has(at)) return null;
+    seen.add(at);
+    for (const n of next.get(at) ?? []) {
+      const rest = walk(n);
+      if (rest) return [at, ...rest];
+    }
+    return null;
+  };
+  return walk(from);
+}
+
+/**
+ * The blockers a task still waits on: every one not `done`. A cancelled blocker still holds it, since
+ * the work it waited for won't happen; the owner or the manager decides, by removing the dependency.
+ */
+export function waitingOn(blockers: readonly { id: string; state: TaskState }[]): string[] {
+  return blockers.filter((b) => b.state !== "done").map((b) => b.id);
+}
+
+// --- PRs (README.md#prs) ---------------------------------------------------------------------------
+
+export type PrState = "open" | "merged" | "detached";
+
+/**
+ * Whether a task's PRs make it done: at least one attached, and every attached one merged. A PR closed
+ * without merging is detached, so it neither holds the task nor counts.
+ */
+export function prsDone(prs: readonly { state: PrState }[]): boolean {
+  const attached = prs.filter((p) => p.state !== "detached");
+  return attached.length > 0 && attached.every((p) => p.state === "merged");
 }
 
 /**

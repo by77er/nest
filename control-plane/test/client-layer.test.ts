@@ -79,8 +79,8 @@ describe("client egress", () => {
     expect((await as(c.token, "/v1/sandboxes", { body: { cell: c.cell, egress: { allow: [{ host: "evil.net" }] } } })).status).toBe(403);
     const s = await placed(c, { egress: { allow: [{ host: "nodejs.org" }, { host: "registry.npmjs.com", ports: [443] }] } });
     const policy = await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`);
-    expect(policy.allow).toContainEqual({ host: "nodejs.org", ports: [80, 443], layer: "workstream" });
-    expect(policy.allow).toContainEqual({ host: "registry.npmjs.com", ports: [443], layer: "workstream" });
+    expect(policy.allow).toContainEqual({ host: "nodejs.org", ports: [80, 443], layer: "workstream", source: "client" });
+    expect(policy.allow).toContainEqual({ host: "registry.npmjs.com", ports: [443], layer: "workstream", source: "client" });
   });
 
   it("never takes away a guard: a client allowing api.github.com still gets the operator's GitHub write guards", async () => {
@@ -127,6 +127,35 @@ describe("client egress", () => {
     // Another client's token: as for any id outside its subtree.
     const other = await newClient();
     expect((await as(other.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: {} })).status).toBe(404);
+  });
+});
+
+describe("where each allow rule came from", () => {
+  it("the API's policy marks each rule's source (base, operator, repos, client, grant); the host's policy carries none", async () => {
+    const c = await newClient();
+    const value = `value-src-${rand()}`;
+    await ok(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value } });
+    const s = await placed(c, { egress: { allow: [{ host: "nodejs.org" }] }, inject: [{ name: "stripe", secret: "stripe-key", hosts: ["api.stripe.com"], locations: BEARER }] });
+    await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { allow: [{ host: "api.stripe.com" }], repos: ["o/r"] } });
+    const wire = await nextPolicy(s.ws);
+    await adminJson(`/v1/sandboxes/${s.sandbox}/grants`, { body: { host: "example.org", ttl_ms: 600_000 } });
+    const view = await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`);
+    const source = (host: string) => (view.allow as { host: string; source: string }[]).filter((a) => a.host === host).map((a) => a.source);
+    expect(source("registry.npmjs.org")).toEqual(["base"]);
+    expect(source("api.stripe.com")).toEqual(["operator"]);
+    expect(source("api.github.com")).toEqual(["repos"]);
+    expect(source("nodejs.org")).toEqual(["client"]);
+    expect(source("example.org")).toEqual(["grant"]);
+    // `layer` stays as the wire has it, for one release.
+    expect(view.allow.find((a: any) => a.host === "nodejs.org").layer).toBe("workstream");
+    // Never to a host: the proxy's policy has `layer` and no `source`.
+    expect(wire.allow.every((a: any) => !("source" in a))).toBe(true);
+    expect(wire.allow.find((a: any) => a.host === "nodejs.org")).toEqual({ host: "nodejs.org", ports: [80, 443], layer: "workstream" });
+    // What the client reads holds no secret, no secret reference, and no other client.
+    const text = JSON.stringify(view);
+    expect(text).not.toContain(value);
+    expect(text).not.toContain("$nest-secret");
+    expect((text.match(/cli_[A-Za-z0-9]+/g) ?? []).every((id) => id === c.id)).toBe(true);
   });
 });
 

@@ -1,0 +1,54 @@
+/* Row actions and pickers (Actions.tsx): at least 36 px with a pointer, 44 px on touch. */
+.action {
+  min-height: 2.25rem;
+  flex-shrink: 0;
+}
+
+@media (pointer: coarse) {
+  .action {
+    min-height: var(--nest-hit-touch);
+  }
+}
+
+/* A badge that opens a tooltip (its details): the theme's focus ring, and on touch a 44 px target that
+   reserves its space (the wrapper is 44 px tall, the badge centred in it, its own box unchanged), so
+   it never overlaps a neighbouring control. */
+.trigger {
+  display: inline-flex;
+  align-items: center;
+  cursor: default;
+  border-radius: var(--mantine-radius-sm);
+}
+
+.trigger:focus-visible {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: 2px;
+}
+
+@media (pointer: coarse) {
+  .trigger {
+    min-height: var(--nest-hit-touch);
+  }
+}
+
+/* What fills a row's free width, and wraps before its actions give way (text wraps, never clips). */
+.grow {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* A picker's list: the option under the keyboard is quiet, as the switcher's (Nav.module.css). */
+.option {
+  border-radius: var(--mantine-radius-md);
+  color: var(--mantine-color-text);
+}
+
+.option[data-combobox-selected] {
+  background: var(--nest-subtle);
+  color: var(--mantine-color-text);
+}
+
+.option[data-combobox-disabled] {
+  color: var(--nest-muted, var(--mantine-color-dimmed));
+}

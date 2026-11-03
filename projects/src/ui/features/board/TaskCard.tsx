@@ -3,11 +3,12 @@
 // (space, arrows).
 
 import { Anchor, Badge, Text, Tooltip } from "@mantine/core";
-import { IconGitPullRequest, IconRobot } from "@tabler/icons-react";
+import { IconGitPullRequest, IconHandStop, IconMessageQuestion, IconRobot } from "@tabler/icons-react";
 import type { Task } from "../../api/types";
 import { AnchorLink } from "../../common/links";
-import { MetaItem, MetaRow, Row, SortablePanel, Stack } from "../../layout";
+import { icon, MetaItem, MetaRow, Row, SortablePanel, Stack, TriggerBadge } from "../../layout";
 import { StateBadge } from "./StateBadge";
+import { WaitingBadge } from "./WaitingBadge";
 
 export interface TaskCardProps {
   task: Task;
@@ -30,23 +31,24 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
           <Row gap="xs" justify="space-between" align="flex-start">
             <Row gap="xs">
               <StateBadge state={task.state} size="sm" />
+              <WaitingBadge task={task} />
               {task.blocked && (
                 <Tooltip label={`Blocked: ${task.blocked.reason}`} withArrow multiline maw="var(--nest-side-panel)">
-                  <Badge size="sm" color="warning" variant="filled" data-marker="blocked" tabIndex={0}>
+                  <TriggerBadge size="sm" color="warning" variant="filled" data-marker="blocked" leftSection={<IconHandStop size={icon.sm} aria-hidden />}>
                     Blocked
-                  </Badge>
+                  </TriggerBadge>
                 </Tooltip>
               )}
               {pendingAsks > 0 && (
-                <Badge size="sm" color="warning" variant="filled" data-marker="ask">
+                <Badge size="sm" color="warning" variant="filled" data-marker="ask" leftSection={<IconMessageQuestion size={icon.sm} aria-hidden />}>
                   Needs input
                 </Badge>
               )}
               {task.tainted && (
                 <Tooltip label="A tainted session wrote to this task (it read untrusted content)" withArrow multiline maw="var(--nest-side-panel)">
-                  <Badge size="sm" color="gray" variant="outline" data-marker="tainted" tabIndex={0}>
+                  <TriggerBadge size="sm" color="gray" variant="outline" data-marker="tainted">
                     Tainted
-                  </Badge>
+                  </TriggerBadge>
                 </Tooltip>
               )}
             </Row>
@@ -64,6 +66,7 @@ export function TaskCard({ task, projectId, repo, pendingAsks, sortable }: TaskC
                   <Anchor href={`https://github.com/${repo}/pull/${task.pr}`} target="_blank" rel="noreferrer" inherit>
                     #{task.pr}
                   </Anchor>
+                  {task.prs.length > 1 ? ` +${task.prs.length - 1}` : ""}
                 </MetaItem>
               )}
             </MetaRow>

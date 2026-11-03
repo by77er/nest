@@ -3040,3 +3040,44 @@ async fn a_fork_waits_for_its_cut_and_the_child_has_the_disk_as_cut() {
 fn now_ms_test() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64
 }
+
+/// A checkpoint resumes its VM after its read and before its commit's answer. If a fence stops
+/// that VM while the answer is awaited and the answer is `committed`, the disk must not be marked
+/// clean: the VM wrote after the read. It was (no VM ran at the answer), and `clean` lets a
+/// restarted nestd delete the incarnation unreported, and a retire that starts after the answer
+/// skip the salvage: the work written after the read was lost.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_answered_after_a_fence_leaves_the_written_disk_dirty() {
+    let h = start_host().await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+    wait_until("the checkpoint's commit is out", || !commit_requests(&h.fleet, "sbx_1").is_empty()).await;
+    guest_write(&disk, 0, b"written after the checkpoint's read");
+    h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    wait_until("the VM stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
+    // Answer only the checkpoint's commit. (The retire waits for the incarnation's commit lock, which
+    // the checkpoint holds through its answer, so its salvage goes out after this; its answer stays
+    // held, and the directory with it, while the flag is read.)
+    let checkpoint_answer: Vec<Command> = {
+        let mut log = h.fleet.log.lock().unwrap();
+        let (mine, rest): (Vec<Command>, Vec<Command>) = std::mem::take(&mut log.held)
+            .into_iter()
+            .partition(|c| matches!(&c.body, CommandBody::CommitResult { outcome: CommitOutcome::Committed { generation }, .. } if generation.reason == CommitReason::TurnEnd));
+        log.held = rest;
+        mine
+    };
+    assert_eq!(checkpoint_answer.len(), 1);
+    h.fleet.commands.send(checkpoint_answer).unwrap();
+    wait_until("the checkpoint's commit applied", || sandbox_meta(h.dir.path(), "sbx_1", 1).head.is_some()).await;
+    assert!(!sandbox_meta(h.dir.path(), "sbx_1", 1).clean, "the disk holds writes its head lacks");
+    h.fleet.release_commit_answers();
+    h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
+    let salvaged: Vec<_> = commit_requests(&h.fleet, "sbx_1").into_iter().filter(|r| r.0 == CommitReason::Salvage).collect();
+    assert_eq!(salvaged.len(), 1, "the work after the checkpoint's read is salvaged");
+    assert!(first_chunk_of(&h, &salvaged[0].2).starts_with(b"written after the checkpoint's read"));
+}

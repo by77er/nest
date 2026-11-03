@@ -20,6 +20,22 @@ limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
 
 **Built:** the `sandbox` layer is the operator's (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), and its rules reach hosts tagged `layer: workstream`, the layer's wire name, which hosts parse as a closed enum ([pending contract changes](../../../../interfaces/README.md#pending-contract-changes)); grants are tagged `sandbox`. **API clients' rules** (built 2026-11-02, [egress](../../../../control-plane/api/clients/#egress)) join the same layer on the wire: allow rules only, within the client's grant's `egress_hosts`, from its templates (while their agents are attached), its sandbox specs and the sandbox's client layer. Allow rules only add, so the guards below and the hard deny apply to whatever they open, and no client rule allows what the operator's policy refuses.
 
+## Sources
+
+**Decided (2026-11-03):** the effective policy the API shows (`GET /v1/sandboxes/<id>/policy`, and the answers of `PUT …/policy` and `PUT …/client-policy`) marks each allow rule with its `source`. A reader no longer has to subtract one layer from another to tell them apart.
+
+| `source` | What it is |
+|---|---|
+| `base` | nest's built-in defaults (the image's allowlist) |
+| `operator` | the operator's policy layer |
+| `repos` | rules the GitHub constructor derives from the push and read allowlists |
+| `client` | the sandbox's API client's own rules: its client layer, its sandbox spec, and its attached agents' specs |
+| `grant` | temporary grants (an approved `egress_policy`, or `POST …/grants`), with `expires_ms` |
+
+- **`layer` stays beside it for one release:** the wire's value (`base`, `workstream` for every rule that is neither base nor a grant, `sandbox` for grants). Readers move to `source`; `layer` leaves the API view in the release after.
+- **`source` never reaches a host:** the policy nest-proxy gets (`policy_update`, `sandbox_create`) is unchanged, its rules tagged only with the closed `layer` enum hosts parse. So there is no wire change and no fixture.
+- **What a client reads** of its sandbox: the operator's rules, the constructed ones, its own marked `client`, and its own bindings with their placeholders. Never a secret, a secret reference, or another client's binding.
+
 ## Hard deny
 
 **Non-public addresses are refused before policy is consulted.** No allow rule, grant, TCP exception or IP-literal host can override this:

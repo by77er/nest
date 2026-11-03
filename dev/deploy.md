@@ -113,6 +113,11 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
   - `GET /v1/sandboxes/<id>/generations` shows `cut_ms` on the new turn ends;
   - a hands call made during a checkpoint returns.
 
+**This release's rollout rule (policy sources): not a one-way deploy, and no ordering constraint.** Only the API view of a sandbox's effective policy changes: each allow rule gains `source` (`base`, `operator`, `repos`, `client`, `grant`; [sources](../docs/sandbox/networking/egress/policy/#sources)), and `layer` stays beside it. The policy sent to hosts is unchanged.
+- **Readers:** keep reading `layer` for this release if they must; drop it next release, when `layer` leaves the API view. The dashboard and the e2e harness read neither.
+- **What a rollback does:** the API view loses `source` (the previous release answers the wire policy). Nothing is stored.
+- **Cloud check:** `GET /v1/sandboxes/<id>/policy` on a `use1` sandbox lists `registry.npmjs.org` as `source: base`, and a client sandbox's own rule as `source: client`.
+
 **This release's rollout rule (agent timers; API clients' egress rules, environment and live client layer): not a one-way deploy.** No Durable Object class is added (AgentDO gains a table, `timers`, and deadlines `timer:<name>`; SandboxDO kv keys; CatalogDO seed version 9 adds the capability `timers`). The host wire gains one optional field, `agent_attach.env`, which a nestd of the previous release ignores (no unknown-field refusal). Deploy the Worker, then hosts as they are replaced.
 - **The gap after the deploy:** a Durable Object still on the previous code for minutes lacks the new methods. These answer `503` (`internal`, retryable), never 500:
   - `GET` and `DELETE /v1/agents/<id>/timers…` (AgentDO);
