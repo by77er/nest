@@ -2,13 +2,13 @@
 // the current project's group open, and a badge of how many things in it need the owner.
 
 import { Badge, NavLink, Text } from "@mantine/core";
-import { IconFolders, IconLayoutKanban, IconMessage, IconSettings, IconShieldCheck, IconTool } from "@tabler/icons-react";
+import { IconChevronDown, IconChevronRight, IconFolders, IconLayoutKanban, IconMessage, IconSettings, IconShieldCheck, IconTool } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { useProjects } from "../../api/queries";
 import type { ProjectRow } from "../../api/types";
 import { NavItemLink } from "../../common/links";
-import { Stack } from "../../layout/Stack";
+import { Row, Stack } from "../../layout/Stack";
 import { icon } from "../../theme";
 import { useNeedsYou } from "./attention";
 
@@ -43,7 +43,14 @@ function ProjectGroup({ project, current, onNavigate, attention }: { project: Pr
       description={project.repo}
       opened={opened}
       onChange={setOpened}
-      rightSection={<NeedsYouBadge count={attention} />}
+      // Mantine turns a group's right section as it opens (for a chevron): not for a badge.
+      disableRightSectionRotation
+      rightSection={
+        <Row gap="xs" wrap="nowrap">
+          <NeedsYouBadge count={attention} />
+          {opened ? <IconChevronDown size={icon.sm} aria-hidden /> : <IconChevronRight size={icon.sm} aria-hidden />}
+        </Row>
+      }
       childrenOffset="lg"
       aria-label={`${project.name}${attention ? `, ${attention} need you` : ""}`}
       data-project={project.id}
