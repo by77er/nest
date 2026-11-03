@@ -2247,7 +2247,9 @@ impl Inner {
         }
         // The memo is trusted only where a pause or stop really stops every write to the file.
         let stable = stable && self.driver.pause_quiesces_disk();
-        let reuse = if stable { disk_stamp(&disk).ok().and_then(|st| s.scan_memo.unchanged(true, Some(&st)).cloned()) } else { None };
+        // Begun, the memo is forgotten: a pass that fails anywhere below (the sentinel set over
+        // content it doesn't describe included) leaves nothing a later commit could reuse.
+        let reuse = s.scan_memo.begin(stable, disk_stamp(&disk).ok().as_ref());
         let store = self.store.clone();
         let started = Instant::now();
         let (disk_scan, mem_scan, stamp) = tokio::task::spawn_blocking(move || -> std::io::Result<_> {
@@ -2259,13 +2261,14 @@ impl Inner {
                 Some(d) => d,
                 None => storage::scan_file(store.as_ref(), &disk, ManifestKind::Disk, HOLD_BACK_BYTES)?,
             };
-            // Still stable: a write from here on moves the mtime off the sentinel.
-            let stamp = if stable { set_sentinel(&disk).ok() } else { None };
             // A memory snapshot is taken only with the VM paused for a suspend: uploaded now.
             let m = match mem {
                 Some(p) => Some(storage::scan_file(store.as_ref(), &p, ManifestKind::Memory, 0)?),
                 None => None,
             };
+            // Last, once every read succeeded, while still stable: a write from here on moves
+            // the mtime off the sentinel.
+            let stamp = if stable { set_sentinel(&disk).ok() } else { None };
             Ok((d, m, stamp))
         })
         .await

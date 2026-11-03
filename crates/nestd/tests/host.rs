@@ -75,13 +75,22 @@ struct FakeDriver {
     /// VMs started and not yet stopped.
     live: Arc<AtomicUsize>,
     resume_latch: Arc<ResumeLatch>,
+    /// The driver says a pause doesn't stop every write to the disk (`pause_quiesces_disk`).
+    leaky_pause: Arc<AtomicBool>,
+    /// Memory snapshots are offered, and each one's file can't be read (a failed snapshot).
+    failing_memory_snapshots: Arc<AtomicBool>,
+    /// `Vm::pause` and `Vm::resume` calls, as "pause <sandbox>" or "resume <sandbox>", in order.
+    vm_ops: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait]
 impl Driver for FakeDriver {
     /// The fake VM writes its disk only from `start` (and tests from outside, as a guest would).
     fn pause_quiesces_disk(&self) -> bool {
-        true
+        !self.leaky_pause.load(Ordering::SeqCst)
+    }
+    fn supports_memory_snapshots(&self) -> bool {
+        self.failing_memory_snapshots.load(Ordering::SeqCst)
     }
     async fn create(&self, spec: VmSpec) -> std::io::Result<Box<dyn Vm>> {
         std::fs::create_dir_all(&spec.vm_dir)?;
@@ -99,6 +108,8 @@ impl Driver for FakeDriver {
             stopped: self.stopped.clone(),
             live: self.live.clone(),
             resume_latch: self.resume_latch.clone(),
+            failing_memory_snapshots: self.failing_memory_snapshots.clone(),
+            vm_ops: self.vm_ops.clone(),
             running: false,
             emu: None,
             guest: None,
@@ -116,6 +127,8 @@ struct FakeVm {
     stopped: Arc<Mutex<Vec<String>>>,
     live: Arc<AtomicUsize>,
     resume_latch: Arc<ResumeLatch>,
+    failing_memory_snapshots: Arc<AtomicBool>,
+    vm_ops: Arc<Mutex<Vec<String>>>,
     running: bool,
     emu: Option<Emulator>,
     guest: Option<tokio::task::JoinHandle<()>>,
@@ -162,6 +175,7 @@ impl Vm for FakeVm {
         Ok(())
     }
     async fn pause(&mut self) -> std::io::Result<()> {
+        self.vm_ops.lock().unwrap().push(format!("pause {}", self.spec.sandbox.0));
         Ok(())
     }
     async fn resume(&mut self) -> std::io::Result<()> {
@@ -170,7 +184,15 @@ impl Vm for FakeVm {
             self.resume_latch.reached.store(true, Ordering::SeqCst);
             released.await;
         }
+        self.vm_ops.lock().unwrap().push(format!("resume {}", self.spec.sandbox.0));
         Ok(())
+    }
+    async fn snapshot_memory(&mut self, dir: &Path) -> std::io::Result<Option<PathBuf>> {
+        if self.failing_memory_snapshots.load(Ordering::SeqCst) {
+            // A memory file named but never written: reading it fails the commit.
+            return Ok(Some(dir.join("mem-that-was-never-written")));
+        }
+        Ok(None)
     }
     async fn stop(&mut self) -> std::io::Result<()> {
         self.stopped.lock().unwrap().push(self.spec.sandbox.0.clone());
@@ -1780,6 +1802,103 @@ async fn a_reused_manifest_still_stores_every_chunk_it_names() {
     for n in &named {
         assert!(chunks.join(n).exists(), "{n:?} stored again");
     }
+}
+
+/// Write `what` into the disk at `at`, as a guest would (the modification time moves).
+fn guest_write(path: &Path, at: u64, what: &[u8]) {
+    let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&f, what, at).unwrap();
+}
+
+/// The disk's first chunk in the store, as the newest `commit_request` for `sandbox` names it.
+fn first_chunk_of_last_commit(h: &Started, sandbox: &str) -> Vec<u8> {
+    let store = LocalFsStore::new(h.dir.path().join("state/store/test-cell")).unwrap();
+    let m = disk_manifests(&h.fleet, sandbox);
+    let manifest: Manifest = serde_json::from_slice(&store.get_manifest(m.last().unwrap().0.strip_prefix("blake3:").unwrap()).unwrap()).unwrap();
+    store.get_chunk(manifest.chunks[0].as_deref().unwrap().strip_prefix("blake3:").unwrap()).unwrap()
+}
+
+/// Review of #122: a pass that fails after reading the disk (here a memory snapshot that can't be
+/// read, in a memory suspend) must leave nothing to reuse. It used to set the sentinel over the new
+/// content before the memory read, keeping the previous pass's memo, whose stamp the sentinel then
+/// matched: the next commit of the unwritten disk reused a manifest the disk no longer had.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_pass_leaves_nothing_to_reuse() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    checkpoint(&h.fleet, "cmd_ck1", "sbx_1", 1).await;
+    // A guest write of the same size, then a memory suspend whose snapshot can't be read.
+    guest_write(&disk, 0, b"written before the suspend");
+    h.vm.failing_memory_snapshots.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![suspend_cmd("cmd_suspend", "sbx_1", SuspendMode::Memory)]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_suspend").await), "the snapshot can't be read");
+    h.vm.failing_memory_snapshots.store(false, Ordering::SeqCst);
+    wait_until("rolled back to running", || last_state(&h.fleet, "sbx_1") == Some(SandboxState::Running)).await;
+    // Nothing written since: the commit must still read the disk, and see the write.
+    checkpoint(&h.fleet, "cmd_ck2", "sbx_1", 1).await;
+    assert!(first_chunk_of_last_commit(&h, "sbx_1").starts_with(b"written before the suspend"));
+}
+
+/// Review of #122: the memo is trusted only where the driver says a pause stops every write, and
+/// the core's own `stable` check decides it: a pass recorded while the driver vouched for its pause
+/// isn't reused once it no longer does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leaky_pause_never_reuses_a_manifest() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    checkpoint(&h.fleet, "cmd_ck1", "sbx_1", 1).await;
+    h.vm.leaky_pause.store(true, Ordering::SeqCst);
+    rewrite_keeping_mtime(&disk, 0, b"unseen");
+    checkpoint(&h.fleet, "cmd_ck2", "sbx_1", 1).await;
+    let m = disk_manifests(&h.fleet, "sbx_1");
+    assert_ne!(m[1], m[0], "read again");
+    assert!(first_chunk_of_last_commit(&h, "sbx_1").starts_with(b"unseen"));
+}
+
+/// Review of #122: the stamp names the file, not only its size and time. A disk replaced by another
+/// file of the same size with the sentinel's time (as a restore writes one) is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replaced_disk_file_is_read() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    checkpoint(&h.fleet, "cmd_ck1", "sbx_1", 1).await;
+    let mtime = std::fs::metadata(&disk).unwrap().modified().unwrap();
+    let other = disk.with_file_name("replacement.img");
+    std::fs::copy(&disk, &other).unwrap();
+    guest_write(&other, 0, b"another file");
+    std::fs::File::open(&other).unwrap().set_modified(mtime).unwrap();
+    std::fs::rename(&other, &disk).unwrap();
+    checkpoint(&h.fleet, "cmd_ck2", "sbx_1", 1).await;
+    assert!(first_chunk_of_last_commit(&h, "sbx_1").starts_with(b"another file"));
+}
+
+/// Review of #122: a fence that lands between a checkpoint's "not fenced" check and its resume is
+/// undone by the resume, so the checkpoint freezes the VM again. (The fence's own lock-free pause
+/// may run before the resume, as here: the resume is held until the fence has marked the row.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_during_a_checkpoints_resume_freezes_the_vm_again() {
+    let h = start_host().await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    h.vm.resume_latch.held.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+    wait_until("the checkpoint resumes its VM", || h.vm.resume_latch.reached.load(Ordering::SeqCst)).await;
+    h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    wait_until("the fence's lock-free pause ran", || h.vm.paused.lock().unwrap().contains(&("sbx_1".to_string(), 1))).await;
+    h.vm.resume_latch.held.store(false, Ordering::SeqCst);
+    h.vm.resume_latch.release.notify_waiters();
+    wait_until("the VM is stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
+    let ops = h.vm.vm_ops.lock().unwrap().clone();
+    let resumed = ops.iter().rposition(|o| o == "resume sbx_1").expect("resumed");
+    assert!(ops[resumed + 1..].iter().any(|o| o == "pause sbx_1"), "frozen again after the resume: {ops:?}");
 }
 
 /// A drain whose deadline passes while a suspend waits for its commit's answer gives the suspend

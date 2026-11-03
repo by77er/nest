@@ -239,12 +239,13 @@ Time is abstract: 5 s steps, 70 s explored. Frames are delayed any number of ste
 
 ### Unchanged disk (M1)
 
-[`verification/nestd/check/src/sentinel.rs`](../../../verification/nestd/check/src/sentinel.rs) drives the real `ScanMemo` as `host.rs` `Inner::scan` does. A disk has two one-bit chunks and a modification time that every write moves to a clock tick. The VM runs, is paused, or is gone (a nestd restart, which also empties the memo). A commit, made only with the VM paused or gone, reads the stamp and reuses or reads; then, as its own step, sets the sentinel and records the pass ([disk](../../sandbox/state/disk/#m1-pause-only-to-read-and-never-read-an-unchanged-disk)).
+[`verification/nestd/check/src/sentinel.rs`](../../../verification/nestd/check/src/sentinel.rs) drives the real `ScanMemo` as `host.rs` `Inner::scan` does. A disk has two one-bit chunks and a modification time that every write moves to a clock tick. The VM runs, is paused, or is gone (a nestd restart, which also empties the memo). A commit, made only with the VM paused or gone, takes the memo (`begin`) and reuses or reads; then, as separate steps, sets the sentinel and records the pass, and may fail after either without recording ([disk](../../sandbox/state/disk/#m1-pause-only-to-read-and-never-read-an-unchanged-disk)).
 
-- **`a_reused_manifest_is_the_disk` (always):** a reused manifest is the disk's content. **Holds** (5 writes, 5 commits, 1 restart: under a millisecond; 2,649 states at 6, 6 and 2). `a_commit_reused_a_manifest` (sometimes) shows the reuse is reached.
-- **It holds by the shell's two rules, and the check pins both:**
-  - a write that lands after its time moved, as Firecracker's `Async` io_engine allows across a pause, fails in 6 steps (`Write, Pause, Commit, Land, Sentinel, Commit`);
-  - a shell that calls a running VM's disk stable fails in 4.
+- **`a_reused_manifest_is_the_disk` (always):** a reused manifest is the disk's content. **Holds** (5 writes, 5 commits, 1 restart: 2,032 states, about a millisecond; 3,825 at 6, 6 and 2). `a_commit_reused_a_manifest` (sometimes) shows the reuse is reached.
+- **It holds by the shell's three rules, and the check pins each:**
+  - a write that lands after its time moved, as Firecracker's `Async` io_engine allows across a pause, fails in 7 steps (`Write, Pause, Commit, Land, Sentinel, Record, Commit`);
+  - a shell that calls a running VM's disk stable fails in 5;
+  - a shell that peeks at the memo (`unchanged`) instead of taking it (`begin`) fails in 11: a pass that fails after its sentinel leaves the previous memo, whose stamp the sentinel matches again (`… Pause, Commit, Sentinel, Fail, Commit`). **Found by the review of #122:** `Inner::scan` set the sentinel before reading a memory snapshot and updated the memo only after, so a memory suspend whose snapshot couldn't be read left exactly that state. Fixed twice over: the memo is taken when a pass begins, and the sentinel is the pass's last step (`a_failed_pass_leaves_nothing_to_reuse` in `crates/nestd/tests/host.rs`).
 - **Assumed:** every write moves the modification time before its data lands, and only nestd sets the sentinel (the kernel's write path; unverified on a host beyond the tests in `crates/nestd`).
 
 ### Residuals
@@ -274,7 +275,7 @@ Functions of one expression have table tests and no harness of their own; the to
 | `the_tombstone_map_refuses_a_fenced_epoch_until_a_destroy_or_newer_run_reaches_it` | `TombstoneMap` as `Tombstones` drives it. After a fence of `k@e` and any 4 calls (fence, destroy or run of either sandbox, at any epoch), `k@e` stays refused until a destroy at or above `e` or a run above `e`. A fence keeps the higher epoch; a destroy keeps exactly a tombstone above it, and a run exactly one that refuses it. Other sandboxes are untouched, and `refuses` and `len` agree with the map | 2 sandboxes, 5 calls | 19 s | 0.3 GB |
 | `a_deleting_entry_is_always_removed` | a name ending `.del` is a deletion whatever its type; only a directory is an incarnation | names ≤ 6 ASCII bytes | 46 s | 1.0 GB |
 | `the_retire_backoff_grows_to_the_max_and_stays` | from any wait in [1 s, 300 s]: never shrinks or passes 300 s, doubles unless capped, reaches 300 s within 9 steps | any ns in range | 4 s | 0.2 GB |
-| `reuse_only_of_a_stable_sentinel_pass_with_the_same_stamp` | after any 3 calls (a pass, stable or not, with any or no stamp, or a forget), a reused manifest is the newest recorded, from a stable pass, with exactly the stamp seen now, which is the sentinel, and the disk is stable now | stamps of 2 values per field | 1 s | — |
+| `reuse_only_of_a_stable_sentinel_pass_with_the_same_stamp` | after any 3 calls (a pass recorded, stable or not, with any or no stamp; a forget; or a pass begun and never recorded, which leaves nothing), a reused manifest is the newest recorded, from a stable pass, with exactly the stamp seen now, which is the sentinel, and the disk is stable now; `begin` reuses exactly what `unchanged` would and leaves nothing behind | stamps of 2 values per field | 1 s | — |
 | `a_stable_sentinel_pass_is_reused` | right after a stable sentinel pass, the same stamp reuses it (the first isn't vacuous) | any stamp with the sentinel time | 1 s | — |
 | `the_cache_is_bounded_and_keeps_recent_outcomes` | after every insert: size ≤ cap; map and order hold the same keys once; a never-inserted key has no value; a value is the latest for its key; a key stays while fewer than cap other keys entered since | cap 1-3, 6 inserts, keys 0-3 | 60 s | 1.5 GB |
 
@@ -335,7 +336,7 @@ The seeds are built from `protocol/fixtures/` at every run and never committed, 
   - an `is_empty` nothing calls;
   - a mutant that only hangs.
 - **Final run:** 145 mutants, **0 missed** (140 caught, 5 unviable).
-- **The checkpoint module (M1):** 16 mutants, 15 caught, 1 unviable; nestd-core with it: 255 mutants, **0 missed** (241 caught, 14 unviable), about 2 min.
+- **The checkpoint module (M1):** 18 mutants, 16 caught, 2 unviable; nestd-core with it (before `begin`): 255 mutants, **0 missed** (241 caught, 14 unviable), about 2 min.
 - **After the incarnation module joined** (exclusions also cover the `#[cfg(kani)]` proof code, which `cargo test` never compiles): 192 mutants, **0 missed** (181 caught, 11 unviable), about 2 min.
 - **Round 2** (no_std core, the moved decisions, the tombstone map, the expected-seq fix): 233 mutants, **0 missed** (220 caught, 13 unviable), about 4 min at `-j 1`.
 - **Exclusions name a function and a mutation, never a line.** Where a function held both a killable mutant and an equivalent one of the same shape, the equivalent one's expression moved into a function of its own (the invariants' predicates, the heartbeat bookkeeping).

@@ -67,6 +67,16 @@ impl<M> ScanMemo<M> {
         };
     }
 
+    /// Start a pass: the remembered manifest if [`ScanMemo::unchanged`] says the disk still is as
+    /// it left it, and forget it either way. A pass in progress has nothing to reuse, so whatever
+    /// fails before [`ScanMemo::scanned`] records the new pass (a sentinel set over content the
+    /// memo doesn't describe included) leaves nothing a later commit could wrongly reuse.
+    pub fn begin(&mut self, stable: bool, stamp: Option<&DiskStamp>) -> Option<M> {
+        let reuse = self.unchanged(stable, stamp).is_some();
+        let last = self.last.take();
+        if reuse { last.map(|(_, m)| m) } else { None }
+    }
+
     /// The remembered manifest, when the disk, read (`stamp`) while nothing can write it
     /// (`stable`), is still exactly as the remembered pass left it.
     pub fn unchanged(&self, stable: bool, stamp: Option<&DiskStamp>) -> Option<&M> {
@@ -160,6 +170,25 @@ mod tests {
     }
 
     #[test]
+    fn a_pass_begun_forgets_the_memo_whether_or_not_it_reuses() {
+        let s = stamp(SENTINEL);
+        let mut m = ScanMemo::new();
+        m.scanned(true, Some(s), "m1");
+        assert_eq!(m.begin(true, Some(&s)), Some("m1"));
+        assert!(!m.remembers(), "a pass in progress has nothing to reuse");
+        assert_eq!(m.begin(true, Some(&s)), None);
+        m.scanned(true, Some(s), "m2");
+        assert_eq!(m.begin(false, Some(&s)), None, "not stable now");
+        assert!(!m.remembers());
+        m.scanned(true, Some(s), "m3");
+        assert_eq!(m.begin(true, Some(&stamp((7, 7)))), None, "another stamp");
+        assert!(!m.remembers());
+        m.scanned(true, Some(s), "m4");
+        assert_eq!(m.begin(true, None), None);
+        assert!(!m.remembers());
+    }
+
+    #[test]
     fn the_sentinel_is_only_the_sentinel() {
         assert!(stamp(SENTINEL).is_sentinel());
         assert!(!stamp((SENTINEL.0, SENTINEL.1 + 1)).is_sentinel());
@@ -197,23 +226,38 @@ mod proofs {
         // The newest recording that wasn't forgotten: (stable, stamp, manifest).
         let mut recorded: Option<(bool, Option<DiskStamp>, u8)> = None;
         for _ in 0..3 {
-            if kani::any() {
-                let (stable, stamp, man): (bool, Option<DiskStamp>, u8) = (kani::any(), any_opt_stamp(), kani::any());
-                m.scanned(stable, stamp, man);
-                recorded = Some((stable, stamp, man));
-            } else {
-                m.forget();
-                recorded = None;
+            match kani::any_where(|c: &u8| *c < 3) {
+                0 => {
+                    let (stable, stamp, man): (bool, Option<DiskStamp>, u8) = (kani::any(), any_opt_stamp(), kani::any());
+                    m.scanned(stable, stamp, man);
+                    recorded = Some((stable, stamp, man));
+                }
+                1 => {
+                    m.forget();
+                    recorded = None;
+                }
+                _ => {
+                    // A pass begun and never recorded (it failed): nothing is left to reuse.
+                    let (stable, now) = (kani::any(), any_opt_stamp());
+                    let _ = m.begin(stable, now.as_ref());
+                    assert!(!m.remembers());
+                    recorded = None;
+                }
             }
         }
         let (stable, now) = (kani::any(), any_opt_stamp());
-        if let Some(got) = m.unchanged(stable, now.as_ref()) {
+        let peeked = m.unchanged(stable, now.as_ref()).copied();
+        if let Some(got) = m.begin(stable, now.as_ref()) {
             let (was_stable, was, man) = recorded.expect("a reuse names a recording");
             assert!(stable && was_stable);
             assert_eq!(was, now);
             assert!(now.expect("reused against a stamp").is_sentinel());
-            assert_eq!(*got, man);
+            assert_eq!(got, man);
+            assert_eq!(peeked, Some(man));
+        } else {
+            assert_eq!(peeked, None);
         }
+        assert!(!m.remembers());
     }
 
     /// Reuse isn't vacuous: right after a stable sentinel pass, the same stamp reuses it.

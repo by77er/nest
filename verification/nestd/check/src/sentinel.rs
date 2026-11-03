@@ -5,7 +5,9 @@
 //! current time (a tick of an abstract clock) and that nestd sets to the sentinel after a pass. The
 //! VM runs, is paused, or is gone (after a nestd restart, which also forgets the memo). A commit,
 //! while the VM is paused or gone, reads the file's stamp and either reuses the memo's manifest or
-//! reads the disk; then, as a separate step, sets the sentinel and records the pass.
+//! reads the disk; then, as separate steps, sets the sentinel and records the pass. A pass may fail
+//! after its read or after its sentinel, recording nothing (a memory snapshot that can't be read, in
+//! a suspend that then rolls back and runs the VM again).
 //!
 //! Property: a reused manifest is the disk's content at that moment.
 //!
@@ -13,6 +15,9 @@
 //! - `async_engine`: a write whose time moved at submission can land after the VM is paused (as
 //!   Firecracker's `Async` io_engine allows), between the read and the sentinel.
 //! - `trust_running`: the shell calls the memo `stable` while the VM runs.
+//! - `keep_on_begin`: the shell peeks at the memo (`unchanged`) instead of taking it (`begin`), so a
+//!   pass that fails after its sentinel leaves the previous pass's memo, whose stamp the sentinel
+//!   matches again (the bug the review of #122 found).
 
 use nestd_core::checkpoint::{DiskStamp, SENTINEL, ScanMemo};
 use stateright::{Model, Property};
@@ -26,11 +31,13 @@ pub struct Config {
     pub async_engine: bool,
     /// The shell passes `stable` for a running VM too (a bug).
     pub trust_running: bool,
+    /// The shell peeks at the memo instead of taking it (a bug).
+    pub keep_on_begin: bool,
 }
 
 impl Config {
     pub fn fixed() -> Self {
-        Config { max_writes: 5, max_commits: 5, max_restarts: 1, async_engine: false, trust_running: false }
+        Config { max_writes: 5, max_commits: 5, max_restarts: 1, async_engine: false, trust_running: false, keep_on_begin: false }
     }
 }
 
@@ -57,8 +64,8 @@ pub struct State {
     /// A write submitted (its time moved) whose data hasn't landed (`async_engine` only).
     inflight: Option<(usize, bool)>,
     memo: ScanMemo<[bool; 2]>,
-    /// A pass's manifest, read, before the sentinel is set: (manifest, stable).
-    read: Option<([bool; 2], bool)>,
+    /// A pass in progress: (manifest, stable, sentinel set).
+    read: Option<([bool; 2], bool, bool)>,
     writes: u8,
     commits: u8,
     restarts: u8,
@@ -75,8 +82,12 @@ pub enum Action {
     Resume,
     /// Read the stamp; reuse, or read the disk.
     Commit,
-    /// Set the sentinel and record the pass.
+    /// Set the sentinel.
     Sentinel,
+    /// Record the pass.
+    Record,
+    /// The pass fails: nothing recorded.
+    Fail,
     Restart,
 }
 
@@ -133,8 +144,9 @@ impl Model for SentinelModel {
         if s.read.is_none() && may_commit && s.commits < self.cfg.max_commits {
             out.push(Action::Commit);
         }
-        if s.read.is_some() {
-            out.push(Action::Sentinel);
+        if let Some((_, _, sentinel)) = s.read {
+            out.push(if sentinel { Action::Record } else { Action::Sentinel });
+            out.push(Action::Fail);
         }
         if s.restarts < self.cfg.max_restarts {
             out.push(Action::Restart);
@@ -164,23 +176,29 @@ impl Model for SentinelModel {
                 // `Inner::scan`: what the shell calls stable, then the memo's answer.
                 let stable = s.vm != Vm::Running || self.cfg.trust_running;
                 n.commits += 1;
-                let manifest = match s.memo.unchanged(stable, Some(&stamp(s.mtime))) {
+                let now = stamp(s.mtime);
+                let reused = if self.cfg.keep_on_begin { n.memo.unchanged(stable, Some(&now)).copied() } else { n.memo.begin(stable, Some(&now)) };
+                let manifest = match reused {
                     Some(m) => {
                         n.reused = true;
-                        if *m != s.disk {
+                        if m != s.disk {
                             n.wrong = true;
                         }
-                        *m
+                        m
                     }
                     None => s.disk,
                 };
-                n.read = Some((manifest, stable));
+                n.read = Some((manifest, stable, false));
             }
             Action::Sentinel => {
-                let (manifest, stable) = n.read.take().expect("enabled");
                 n.mtime = Mtime::Sentinel;
+                n.read.as_mut().expect("enabled").2 = true;
+            }
+            Action::Record => {
+                let (manifest, stable, _) = n.read.take().expect("enabled");
                 n.memo.scanned(stable, Some(stamp(n.mtime)), manifest);
             }
+            Action::Fail => n.read = None,
             Action::Restart => {
                 // The restart kills the VM; the new nestd's memo is empty. A write in flight is
                 // lost with the VMM or lands; either way nothing writes after.
