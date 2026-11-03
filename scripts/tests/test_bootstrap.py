@@ -70,7 +70,7 @@ def stub(bin_dir: Path, name: str, body: str) -> None:
 
 @unittest.skipUnless(SYSTEMCTL, "needs systemctl (for `systemctl --root`)")
 class Bootstrap(unittest.TestCase):
-    def run_role(self, role: str, nestd: str = "current", nvme: bool = False):
+    def run_role(self, role: str, nestd: str = "current", nvme: bool | str = False):
         """`nestd`: the installed release's nestd, `current` (`--features` lists `gateway-user`) or
         `previous` (doesn't: a host launched before the release is published). `nvme`: the instance
         has an instance-store disk (lsblk lists one; mkfs, mount and xfs_info are stubs)."""
@@ -112,7 +112,7 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         if nvme:
             stub(bin_dir, "lsblk", 'echo "/dev/nvme0n1 Amazon Elastic Block Store"; echo "/dev/nvme1n1 Amazon EC2 NVMe Instance Storage"\n')
             stub(bin_dir, "blkid", "exit 2\n")
-            stub(bin_dir, "mkfs.xfs", f'echo "mkfs.xfs $*" >> {disk}\n')
+            stub(bin_dir, "mkfs.xfs", f'echo "mkfs.xfs $*" >> {disk}\n' + ("exit 1\n" if nvme == "broken" else ""))
             stub(bin_dir, "mountpoint", "exit 1\n")
             stub(bin_dir, "mount", f'echo "mount $*" >> {disk}\n')
             stub(bin_dir, "xfs_info", 'echo "         =                       reflink=1    bigtime=1 inobtcount=1"\n')
@@ -124,7 +124,7 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env, timeout=60)
         return fake, proc, calls.read_text() if calls.exists() else ""
 
-    def check(self, role: str, nestd: str = "current", nvme: bool = False):
+    def check(self, role: str, nestd: str = "current", nvme: bool | str = False):
         fake, proc, calls = self.run_role(role, nestd, nvme)
         self.assertEqual(proc.returncode, 0, f"{role}: {proc.stdout[-2000:]}{proc.stderr[-2000:]}\nsystemctl: {calls}")
         wants = fake / "etc/systemd/system/multi-user.target.wants"
@@ -167,6 +167,12 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         self.assertIn("mount", log)
         self.assertIn("LABEL=nest-data", (fake / "etc/fstab").read_text())
         self.assertTrue(cfg["state_dir"].endswith("/var/lib/nest/data/state"), cfg["state_dir"])
+
+    def test_sandbox_host_whose_instance_store_wont_format(self):
+        """mkfs.xfs fails (or an AMI lacks xfsprogs): the host still comes up, with state on the root volume."""
+        cfg, fake = self.check("burst", nvme="broken")
+        self.assertTrue(cfg["state_dir"].endswith("/var/lib/nest"), cfg["state_dir"])
+        self.assertNotIn("mount", (fake / "disk.log").read_text())
 
     def test_sandbox_host_on_the_previous_release(self):
         """A nestd that can't give the gateway its sockets: the gateway keeps root's file access

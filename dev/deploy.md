@@ -87,29 +87,39 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Unconfirmed operator cleanups** (the owner to confirm they were done): the old SSM parameter `/nest/control-plane/vars/AWS_CELLS` if it was never imported into a cell stack; the legacy Worker secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `ROOT_CA_KMS_KEY_ID`, `ROOT_CA_CERT_PEM`) and the SSM parameter `/nest/control-plane/vars/ROOT_CA_KMS_KEY_ID`; the unattached reusable Access policies left by the edge stack's import; and respawning agents whose stored prompts still describe removed tools.
 - **Still needed by hosts:** `sandbox_create`, `sandbox_fork` and `agent_start` carry a `ws_` value (`compatWorkstream`), which hosts and runners from before workstreams left require (Rust's `WorkstreamId`, prefix-checked). Drop it from the control plane (and `SandboxInfo`/`AgentInfo`) once every host runs that release or later, then the Rust fields the release after. The policy layer's wire value `workstream` (the operator layer; hosts parse a closed enum) stays.
 
-**This release's rollout rule (checkpoint cuts, M2): not a one-way deploy, but it changes the cell's launch types: do not merge until the owner has reviewed the cost and `dev/measure-cut/run.sh` has run** (CI applies `use1` on merge). No Durable Object class is added; the wire gains one optional field, `commit_request.cut_ms` (and `GenerationRecord.cut_ms`), which either side of the previous release ignores (zod strips it; serde has no unknown-field refusal).
-- **Order:**
-  1. The cell stack applies first: `c8id.large` first in the launch types (`deploy/lean/Cell/Cells.lean`), and the launch template's user data (bootstrap.sh) puts sandbox state on the instance store.
-  2. Then the Worker deploys: SandboxDO records `cut_ms` when a host sends it.
-  3. Then the release is published, and hosts take the new nestd as they are replaced.
-
-  Any order is safe:
-  - a nestd of either release works with either state layout (`state_dir`, the kernel, images and jail paths are all in nestd.json);
-  - a previous-release Worker ignores `cut_ms`;
-  - an EBS-only host, or a previous-release nestd, pauses for whole reads as M1 does.
-- **Cost** (us-east-1, Linux, from AWS's own APIs, verified 2026-11-02: the Price List API's `get-products` for [on demand](https://aws.amazon.com/ec2/pricing/on-demand/), `describe-spot-price-history` for [spot](https://aws.amazon.com/ec2/spot/pricing/)):
+**This release's rollout rule (checkpoint cuts, M2): not a one-way deploy, and nothing by hand.** The merge's own `deploy.yml` run does all of it. No Durable Object class is added, and the guest image doesn't change. The wire gains one optional field, `commit_request.cut_ms` (and `GenerationRecord.cut_ms`), which either side of the previous release ignores (zod strips it, and serde has no unknown-field refusal).
+- **What production does, in order** (the pipeline's order, all automatic):
+  1. **`infra`** applies the `use1` cell stack through inframe:
+     - The launch template's user data becomes the new `bootstrap.sh`: sandbox state goes on the instance store when there is one.
+     - The cell's `AWS_CELLS` entry gets the new `launchTypes`: `c8id.large` first, then `c8i-flex.large`, `c8i.large` and `m8i.large` for capacity. `launch_types_within_iam` keeps them inside IAM's `EightIOnly` patterns.
+     - Running hosts don't change.
+  2. **`worker`** deploys. `dev/deploy-use1.sh` reads the new `AWS_CELLS`, so FleetDO launches `c8id.large` first once it restarts on the new config (minutes, as for any deploy). SandboxDO records `cut_ms` from hosts that send it.
+  3. **`release`** publishes the new nestd to `releases/current/` and starts a host AMI build. That AMI carries `xfsprogs` from `install.sh`.
+  4. **Hosts take it as they are replaced** (scale-down, spot loss): a host installs `releases/current/` at boot.
+     - A new `c8id` host formats its instance store and cuts disks with a reflink.
+     - A host on an EBS-only type (no `c8id` capacity) keeps state on the root volume and pauses for whole reads, as M1 does.
+- **Existing hosts, on the root volume,** keep running the previous nestd with M1's checkpoints until they are replaced. Nothing moves them sooner: there is no drain route. A spot loss or the autoscaler's scale-down replaces them, and sandboxes cold-boot elsewhere from their generations. That is safe and costs nothing extra.
+- **Any order is safe,** so a partial run or a re-run is too:
+  - Either release's nestd works with either layout (`state_dir`, the kernel, images and jail paths are all in nestd.json).
+  - A host booted between steps 1 and 3 runs the previous nestd on the new layout. It finds state in `/var/lib/nest/data/state` and pauses for reads.
+  - A previous-release Worker ignores `cut_ms`.
+  - `bootstrap.sh` falls back to the root volume when any instance-store step fails: no `mkfs.xfs` (an AMI built before step 3, should one lack it), a format or a mount failing, or no reflink. The host still enrolls (`test_sandbox_host_whose_instance_store_wont_format`).
+- **What the owner sees** (measured 2026-11-03, [disk](../docs/sandbox/state/disk/)): a checkpoint on a `c8id` host pauses its VM for the clone. That is about 14 ms on a fresh disk, and grows with the disk's extent records: about 2.4 s after 1 GiB of churn, about 8 s after a simulated month. An M1 checkpoint of a changed disk pauses for reading it whole: 33–39 s in production. M3′ is to remove the growth.
+- **Cost** (us-east-1, Linux, from AWS's own APIs, verified 2026-11-02: the Price List API's `get-products` for [on demand](https://aws.amazon.com/ec2/pricing/on-demand/), `describe-spot-price-history` for [spot](https://aws.amazon.com/ec2/spot/pricing/); the owner approved it 2026-11-03):
   - On demand, `c8id.large` (1 × 118 GB NVMe instance store) is $0.11088 an hour, and `c8i-flex.large` (EBS only) $0.08902: +$0.02186 an hour, about +$16 a month per always-on host.
   - On spot, `c8id.large` was $0.029–0.058 an hour and `c8i-flex.large` $0.026–0.043, by AZ (spot prices move). In the cell's AZs (1a, 1b, 1c), `c8id` was $0.029, $0.031 and $0.058 against flex's $0.032, $0.043 and $0.038. So on spot the difference is a few dollars a month per host either way, and `c8id` was the cheaper of the two in 1b and 1c.
 
   Hosts scale to zero when idle, so the delta follows sandbox hours. `maxHosts` (4) bounds it at about +$64 a month on demand.
 - **Compatibility one release back:**
-  - a previous-release nestd on a new host finds sandbox state in `/var/lib/nest/data/state` and works there unchanged;
-  - a new nestd on an old host (root-volume state) probes reflink on the root XFS and uses it if present, else pauses for reads;
-  - a `cut-*.img` left in an incarnation's directory is removed by a new nestd at start, and deleted with the directory by an old one.
-- **What a rollback does:** reverting the stack puts the EBS-only types first again (hosts are replaced, never changed in place); `wrangler rollback` drops `cut_ms` from new records; a republished previous release pauses for whole reads.
-- **Cloud check after the hosts roll:**
+  - A new nestd on an old host (root-volume state) probes reflink on the root XFS and uses it if present, else pauses for reads.
+  - A `cut-*.img` left in an incarnation's directory is removed by a new nestd at start, and deleted with the directory by an old one.
+- **What a rollback does:**
+  - Reverting the merge and letting `deploy.yml` run puts the EBS-only types first again and the previous `bootstrap.sh` in the template. Hosts are replaced, never changed in place.
+  - `wrangler rollback` drops `cut_ms` from new records.
+  - A republished previous release pauses for whole reads, on either layout.
+- **Cloud check after a `c8id` host comes up** (anyone with the admin token; host logs need a shell on the host):
   - bootstrap's log says "sandbox state on the instance store at /var/lib/nest/data (XFS, reflink)", and nestd's says "checkpoints cut disks with a reflink";
-  - a turn-end checkpoint logs `checkpoint: disk cut ... paused_ms=` under the gate (200 ms) and `commit: cut read` after it;
+  - a turn-end checkpoint logs `checkpoint: disk cut ... paused_ms=`, then `commit: cut read`;
   - `GET /v1/sandboxes/<id>/generations` shows `cut_ms` on the new turn ends;
   - a hands call made during a checkpoint returns.
 

@@ -21,7 +21,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
 
 ## M2: a reflink cut in a brief pause, committed in the background
 
-**Built, not deployed:** it waits for the owner's review of the instance-type cost and for the measurement below (`crates/nestd/src/host.rs` `cut_checkpoint`, `commit_cut`; `storage.rs` `reflink`).
+**Built; deploys on merge** (`crates/nestd/src/host.rs` `cut_checkpoint`, `commit_cut`; `storage.rs` `reflink`). **Decided (2026-11-03, the owner's): ship M2, cost approved, though it failed its gate (below), then build M3′ (the gate's fallback, below).** On a used disk its pause is seconds, but M1 reads a changed disk whole in the pause (33–39 s).
 
 **Decided (2026-11-03): pause the VM only for the clone, on the `Sync` io_engine.** A cut taken while the VM runs needs Firecracker's `Async` engine: with `Sync`, a guest write that arrives during the clone blocks the VMM thread, and the vsock and the network with it ([design.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md): one event loop for all device emulation). Firecracker's own docs say `Async` "is not yet suitable for production use" ([v1.17.0 block-io-engine.md](https://raw.githubusercontent.com/firecracker-microvm/firecracker/v1.17.0/docs/api_requests/block-io-engine.md), the line nest pins). **Cut-while-running is deferred until `Async` is GA**; under it the M1 memo would have to go, since a write can land after the pause.
 
@@ -50,7 +50,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - a guest's write stalls during the pause.
 
   If a month-old 32 GiB disk's p99 clone exceeds 200 ms, M3′ comes first: an incremental shadow that clones only the ranges FIEMAP shows changed (`FICLONERANGE`). A clone's cost grows with the number of extent records: 50–100 M of them locked a file for over 30 minutes (xfs 14a53798).
-- **Measured (2026-11-03, one `c8id.large` in us-east-1c, kernel 6.18.56, XFS `reflink=1` on the 118 GB instance store):** the gate fails, so M3′ comes first.
+- **Measured (2026-11-03, one `c8id.large` in us-east-1c, kernel 6.18.56, XFS `reflink=1` on the 118 GB instance store):** the gate fails. The owner shipped M2 anyway, with M3′ next (above).
 
   | 32 GiB disk | Extent records | `FICLONE`, 5 runs |
   |---|---|---|

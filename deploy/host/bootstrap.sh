@@ -57,18 +57,24 @@ KERNEL_DIR=/var/lib/nest/kernel
 IMAGES_DIR=/var/lib/nest/images
 JAILER_BASE=/srv/jailer
 NVME=$(lsblk -dpno NAME,MODEL 2>/dev/null | awk '/Amazon EC2 NVMe Instance Storage/ {print $1; exit}')
+# Any step failing (an AMI without xfsprogs, a disk that won't format or mount) leaves the state on the
+# root volume: the host still comes up.
+instance_store() {
+  if ! command -v mkfs.xfs >/dev/null || ! command -v xfs_info >/dev/null; then echo "no mkfs.xfs or xfs_info"; return 1; fi
+  blkid -o value -s TYPE "$NVME" 2>/dev/null | grep -qx xfs || mkfs.xfs -q -f -m reflink=1 -L nest-data "$NVME" || return 1
+  install -d -m 0755 "$DATA" || return 1
+  grep -q '^LABEL=nest-data ' /etc/fstab 2>/dev/null || echo "LABEL=nest-data $DATA xfs defaults,noatime,nofail 0 2" >> /etc/fstab || return 1
+  mountpoint -q "$DATA" || mount "$DATA" || return 1
+  xfs_info "$DATA" 2>/dev/null | grep -q 'reflink=1' || { echo "the instance store at $DATA has no reflink"; return 1; }
+}
 if [ -n "$NVME" ]; then
-  blkid -o value -s TYPE "$NVME" 2>/dev/null | grep -qx xfs || mkfs.xfs -q -f -m reflink=1 -L nest-data "$NVME"
-  install -d -m 0755 "$DATA"
-  grep -q '^LABEL=nest-data ' /etc/fstab 2>/dev/null || echo "LABEL=nest-data $DATA xfs defaults,noatime,nofail 0 2" >> /etc/fstab
-  mountpoint -q "$DATA" || mount "$DATA"
-  if xfs_info "$DATA" 2>/dev/null | grep -q 'reflink=1'; then
+  if instance_store; then
     STATE_DIR=$DATA/state KERNEL_DIR=$DATA/kernel IMAGES_DIR=$DATA/images JAILER_BASE=$DATA/jailer
     install -d -m 0755 "$STATE_DIR" "$KERNEL_DIR" "$IMAGES_DIR" "$JAILER_BASE"
     if [ -f /var/lib/nest/kernel/vmlinux ] && [ ! -f "$KERNEL_DIR/vmlinux" ]; then cp /var/lib/nest/kernel/vmlinux "$KERNEL_DIR/vmlinux"; fi
     echo "sandbox state on the instance store at $DATA (XFS, reflink)"
   else
-    echo "the instance store at $DATA has no reflink: sandbox state stays on the root volume"
+    echo "the instance store isn't usable: sandbox state stays on the root volume, and checkpoints pause VMs for whole reads"
   fi
 else
   echo "no instance store: sandbox state stays on the root volume, and checkpoints pause VMs for whole reads"
