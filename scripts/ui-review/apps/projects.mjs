@@ -345,7 +345,9 @@ export function inkChatFit() {
     const f = field.getBoundingClientRect();
     const d = dock.getBoundingClientRect();
     if (f.top < 0 || f.bottom > H + 0.5) out.push(`at the ${end}, the composer is off screen (${Math.round(f.top)}..${Math.round(f.bottom)} of ${H})`);
-    if (d.bottom < H - 64) out.push(`at the ${end}, the composer sits ${Math.round(H - d.bottom)} px above the viewport's bottom, not pinned there`);
+    // Pinned: flush on a phone (the page's column has no bottom padding), within the page's padding else.
+    const slack = scroller === log ? 64 : 4;
+    if (d.bottom < H - slack) out.push(`at the ${end}, the composer sits ${Math.round(H - d.bottom)} px above the viewport's bottom, not pinned there`);
     if (end === "end") {
       // The log's last line on screen: its own bottom when it scrolls itself, else its content's end.
       const l = log.getBoundingClientRect();
@@ -373,6 +375,19 @@ async function contextShown(p) {
     const room = window.innerHeight - r.bottom;
     return c.scrollHeight > c.clientHeight + 1 && room > 48 ? [`the context column scrolls ${c.scrollHeight - c.clientHeight} px inside itself with ${Math.round(room)} px of the viewport free below it`] : [];
   });
+}
+/** An empty chat on a phone and below `sm` (390, 600 wide, a 768×1024 portrait tablet): the composer flush at the bottom. */
+async function chatFitsNarrow(p) {
+  const was = p.viewportSize();
+  const out = (await p.evaluate(inkChatFit)).map((x) => `${was.width} px: ${x}`);
+  for (const [width, height] of [[600, 960], [768, 1024]]) {
+    await p.setViewportSize({ width, height });
+    await p.waitForTimeout(600);
+    out.push(...(await p.evaluate(inkChatFit)).map((x) => `${width}×${height}: ${x}`));
+  }
+  await p.setViewportSize(was);
+  await p.waitForTimeout(300);
+  return out;
 }
 /** A two-line draft (Shift+Enter between), still in the composer, unsent; and the chat still fits. */
 async function draftKept(p) {
@@ -551,6 +566,7 @@ const app = {
     // The chat fits the viewport (checks: `chat-fit`): the page doesn't scroll, the composer is on screen.
     { name: "chat-fit", section: "project", path: "/projects/prj_demo/manager", full: false, check: chatFits, checkName: "chat-fit" },
     { name: "context-empty-chat", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, widths: DESKTOP, check: contextShown, checkName: "clipping" },
+    { name: "chat-fit-empty", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, widths: PHONE, check: chatFitsNarrow, checkName: "chat-fit" },
     { name: "chat-fit-long", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, check: chatFits, checkName: "chat-fit" },
     // The chat (README.md#the-manager-chat): a turn streaming with its activity line and Stop; the composer
     // with a draft; the jump-to-latest pill; older history paged in; a message's actions; the unread dot.

@@ -248,6 +248,7 @@ for (const remount of [false, true]) {
     ["the page 200 px taller", "[data-ds=page] { padding-bottom: 200px !important; }"],
     ["the composer pushed 400 px down", "[data-ds=composer-dock] { margin-top: 400px !important; }"],
     ["the document scrolling", "[data-ds=page] { height: 1200px !important; }"],
+    ["a short chat's composer floating above the bottom", "[data-ds=chat-log] p:nth-child(n+3) { display: none; } [data-ds=composer-dock] { position: static; }"],
   ]) assert.notDeepEqual(await fit(css), [], `chat-fit: ${plant} must fail`);
   await page2.close();
 }

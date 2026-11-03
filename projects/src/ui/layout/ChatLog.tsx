@@ -37,6 +37,32 @@ export const ChatLog = forwardRef<HTMLDivElement, { children: ReactNode; onScrol
   // scroll). Following, it stays at the end as it's resized.
   const followingRef = useRef(following);
   followingRef.current = following;
+  // On a phone: at least as tall as the page's column leaves it (its min-height), so a short chat still
+  // has the composer flush at the bottom; a long one flows in the column, which scrolls.
+  useLayoutEffect(() => {
+    const d = el.current;
+    if (!d || !phone) {
+      if (d) d.style.minHeight = "";
+      return;
+    }
+    const page = d.closest<HTMLElement>("[data-ds=page]");
+    const content = page?.firstElementChild;
+    if (!page || !content) return;
+    const fit = () => {
+      const others = content.getBoundingClientRect().height - d.getBoundingClientRect().height;
+      const pad = (parseFloat(getComputedStyle(page).paddingTop) || 0) + (parseFloat(getComputedStyle(page).paddingBottom) || 0);
+      const min = `${Math.max(0, Math.floor(page.clientHeight - pad - others))}px`;
+      if (d.style.minHeight !== min) d.style.minHeight = min;
+    };
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(content);
+    window.addEventListener("resize", fit);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", fit);
+    };
+  }, [phone]);
   useLayoutEffect(() => {
     const d = el.current;
     if (!d || phone) {
