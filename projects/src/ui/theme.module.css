@@ -11,6 +11,8 @@
    reaching the 44 px target around it. */
 .badge[tabindex] {
   position: relative;
+  /* Mantine's badge clips its overflow; the hit area must reach past the box. */
+  overflow: visible;
 }
 
 @media (pointer: coarse) {
