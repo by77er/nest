@@ -133,15 +133,21 @@ fn the_lease_never_outlives_fleetdos_view() {
 
 /// The unchanged-disk short-circuit holds as `host.rs` drives the memo, and the reuse is reached
 /// (not vacuous); a write that lands after a pause (an `Async` io_engine), or a shell that trusts
-/// a running VM, or one that peeks at the memo instead of taking it before a pass that may fail,
-/// breaks it.
+/// a running VM, one that peeks at the memo instead of taking it before a pass that may fail, or
+/// one that records an older cut under a newer cut's pass (M2) breaks it.
 #[test]
 fn the_sentinel_holds_with_a_sync_engine_and_fails_without_its_assumptions() {
-    use nestd_check::sentinel::{Config, REUSED, SAFETY, SentinelModel};
+    use nestd_check::sentinel::{Config, OVERLAPPED, REUSED, SAFETY, SentinelModel};
     let o = check(SentinelModel { cfg: Config::fixed() });
     assert!(o.violations.is_empty(), "violated {:?} ({} states)", o.violations, o.unique_states);
     assert!(o.examples.contains(&REUSED), "the reuse is never reached");
-    for cfg in [Config { async_engine: true, ..Config::fixed() }, Config { trust_running: true, ..Config::fixed() }, Config { keep_on_begin: true, ..Config::fixed() }] {
+    assert!(o.examples.contains(&OVERLAPPED), "no cut is ever recorded behind a newer one");
+    for cfg in [
+        Config { async_engine: true, ..Config::fixed() },
+        Config { trust_running: true, ..Config::fixed() },
+        Config { keep_on_begin: true, ..Config::fixed() },
+        Config { stale_records: true, ..Config::fixed() },
+    ] {
         let o = check(SentinelModel { cfg });
         assert!(o.violated(SAFETY), "{cfg:?}: expected {SAFETY} to fail");
     }

@@ -211,6 +211,15 @@ for (const remount of [false, true]) {
   };
   assert.equal((await escapes(`<div style="overflow: hidden; height: 1px"><a href="/b" style="position: fixed; top: 200px; left: 0; width: 200px; height: 20px; display: block">B</a></div>`)).length, 1, "a fixed control inside an overflow: hidden parent is a neighbour");
   assert.equal((await escapes(`<div style="overflow: hidden; height: 1px"><a href="/b" style="position: absolute; top: 0; left: 0; width: 200px; height: 20px; display: block">B</a></div>`)).length, 1, "an absolute control escaping a non-positioned overflow: hidden parent is a neighbour");
+  // The probe sets aside everything inside the reaching control too: a child of it with
+  // pointer-events: auto, reaching over the neighbour, can't hide the overlap.
+  await page.setContent(`<!doctype html><html><head><style>
+    body { margin: 0; font: 16px/20px sans-serif; }
+    .t::after { content: ""; position: absolute; inset: -30px 0; }
+    .t span { position: absolute; inset: -30px 0 0; pointer-events: auto; }
+  </style></head><body><div style="margin-top: 200px; position: relative"><div style="height: 1px"><a href="/b" style="display: block; width: 200px; height: 20px">B</a></div><div style="position: relative; margin-top: 24px"><a class="t" href="/a" style="position: relative; display: inline-block; width: 200px">A<span></span></a></div></div></body></html>`);
+  assert.equal((await page.evaluate(measure, { ...sel, touch: true })).problems["hit-overlap"].length, 1, "a reaching child with pointer-events: auto doesn't hide the overlap");
+  assert.equal(await page.evaluate(() => document.querySelectorAll("[data-hit-probe]").length + [...document.head.querySelectorAll("style")].filter((x) => x.textContent.includes("data-hit-probe")).length), 0, "the probe leaves nothing behind");
 }
 
 // The projects app's rhythm measures (apps/projects.mjs), on planted pages: what's painted, not the

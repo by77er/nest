@@ -266,6 +266,8 @@ def configure_host():
         # each guest's vsock socket.
         "sockets": {"gateway_gid": GW_UID, "gateway_uids": [GW_UID]},
         "flush_interval_ms": 500,
+        # No reflink on the harness's filesystem: checkpoints cut with a copy under a flock (M2).
+        "disk_cut": "locked_copy",
         "versions": {"nest_proxy": "e2e", "agent_runner": "e2e", "claude_code": REAL_ENV.get("version", "real") if REAL else "fake"},
     }
     with open(os.path.join(WORK, "nestd.json"), "w") as f:
@@ -1207,10 +1209,11 @@ ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def commit_reads(sbx, since=0):
-    """nestd's `commit: disk read` lines for `sbx` after byte `since` of its log: (end offset, fields)."""
+    """nestd's `commit: disk read` (a read in place) and `commit: cut read` (a cut read in the background, M2)
+    lines for `sbx` after byte `since` of its log: (end offset, fields)."""
     text = ANSI.sub("", read(os.path.join(WORK, "logs", "nestd.log")))
     out = []
-    for m in re.finditer(r"commit: disk read(.*)", text):
+    for m in re.finditer(r"commit: (?:disk|cut) read(.*)", text):
         if m.start() < since:
             continue
         fields = dict(re.findall(r"(\w+)=(\S+)", m.group(1)))
@@ -1259,8 +1262,99 @@ def run_checkpoints(ids):
     text, err = sink_turn(agid, "ckpt-after", [(f"c{i}", "Bash", {"command": f"echo c{i}"}) for i in range(3)])
     check("checkpoints: hands work right after a turn-end checkpoint",
           all(text(f"c{i}").strip() == f"c{i}" and not err(f"c{i}") for i in range(3)), " | ".join(text(f"c{i}")[:40] for i in range(3)))
-    pauses = [int(m.group(1)) for m in re.finditer(r"checkpoint: VM resumed.*?paused_ms=(\d+)", ANSI.sub("", read(os.path.join(WORK, "logs", "nestd.log")))[end:])]
-    check("checkpoints: each checkpoint since paused its VM under a second", pauses and max(pauses) < 1000, str(pauses))
+    # The harness cuts with a copy (no reflink here), whose pause grows with the data; the unchanged
+    # disk's cut copies nothing.
+    unchanged = [int(m.group(1)) for m in re.finditer(r"checkpoint: disk cut.*?paused_ms=(\d+) reused=true", ANSI.sub("", read(os.path.join(WORK, "logs", "nestd.log")))[end:])]
+    check("checkpoints: the unchanged disk's checkpoint paused its VM under a second", unchanged and max(unchanged) < 1000, str(unchanged))
+
+
+# docs/sandbox/state/disk/ (M2): a cut taken while the guest keeps writing is a crash-consistent
+# image of the instant it was cut. The harness has no reflink, so nestd cuts with a copy under an
+# exclusive flock (`disk_cut: locked_copy`) and the writer holds a shared one per write, as a clone
+# serializes with each write.
+
+REC = 4096
+REC_BASE = 3 << 30
+
+
+def record(i):
+    head = f"nest-e2e-rec:{i:08d}\n".encode()
+    return head + b"\xa5" * (REC - len(head))
+
+
+def records_in(manifest_hex, n):
+    """Records 0..n of the region at REC_BASE, read from the generation's chunks in the local store (a restore)."""
+    store = os.path.join(WORK, "state", "store", "local")
+    m = json.load(open(os.path.join(store, "manifests", manifest_hex)))
+    cs = m["chunk_size"]
+    out = []
+    cache = {}
+    for i in range(n):
+        off = REC_BASE + i * REC
+        idx = off // cs
+        if idx not in cache:
+            name = m["chunks"][idx]
+            cache[idx] = open(os.path.join(store, "chunks", name.split(":", 1)[1]), "rb").read() if name else b""
+        data = cache[idx][off - idx * cs: off - idx * cs + REC]
+        out.append(data.ljust(REC, b"\0"))
+    return out
+
+
+def run_cut_under_writes(ids):
+    if REAL:
+        skip("a cut under sustained writes", "fake mode only: the turns are scripted")
+        return
+    import fcntl
+    import threading
+    agid, sbx = ids["agent"], ids["sandbox"]
+    disks = glob.glob(os.path.join(WORK, "state", "sandboxes", sbx, "*", "disk.img"))
+    if not check("cut under writes: the sandbox's disk image is found", len(disks) == 1, str(disks)):
+        return
+    # About 40 s of writes at most (a turn end's checkpoint may wait out SandboxDO's 10 s interval).
+    limit, written, stop = 16384, [0], threading.Event()
+
+    def writer():
+        with open(disks[0], "r+b") as f:
+            for i in range(limit):
+                if stop.is_set():
+                    break
+                fcntl.flock(f, fcntl.LOCK_SH)
+                try:
+                    os.pwrite(f.fileno(), record(i), REC_BASE + i * REC)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+                written[0] = i + 1
+                time.sleep(0.0025)
+    t = threading.Thread(target=writer, daemon=True)
+    t.start()
+    wait_for(lambda: written[0] >= 100 or None, 10, 0.01, "the writer under way")
+    started_ms = int(time.time() * 1000)
+    text, err = sink_turn(agid, "cut-writes", [("w", "Bash", {"command": "echo w"})])
+
+    def cut_after_start():
+        # The turn end's cut: one taken after the writer was under way (an earlier turn's may still
+        # be committing), recorded on its generation as `cut_ms`.
+        st, gens = api("GET", f"/v1/sandboxes/{sbx}/generations")
+        ends = [g["record"] for g in (gens if st == 200 and isinstance(gens, list) else []) if g["record"]["reason"] == "turn_end" and (g["record"].get("cut_ms") or 0) > started_ms]
+        return min(ends, key=lambda r: r["cut_ms"]) if ends else None
+    try:
+        gen = wait_for(cut_after_start, 60, 0.25, "a generation cut while the writer ran, with cut_ms")
+    except TimeoutError as e:
+        stop.set()
+        check("cut under writes: a turn-end cut taken during the writes commits, with cut_ms", False, str(e)[:200])
+        return
+    stop.set()
+    t.join(10)
+    check("cut under writes: a turn-end cut taken during the writes commits, with cut_ms", True, json.dumps({k: gen.get(k) for k in ("id", "cut_ms", "created_ms")}))
+    check("cut under writes: the cut precedes its commit", gen["cut_ms"] <= gen["created_ms"], json.dumps(gen)[:300])
+    recs = records_in(gen["disk_manifest"].split(":", 1)[1], written[0])
+    k = 0
+    while k < len(recs) and recs[k] == record(k):
+        k += 1
+    rest_zero = all(r == b"\0" * REC for r in recs[k:])
+    check("cut under writes: the restored disk holds a prefix of the writes and nothing after it (one instant)",
+          rest_zero and 100 <= k <= written[0], f"{k} of {written[0]} records, then {'zeros' if rest_zero else 'a later record after a gap'}")
+    check("cut under writes: the guest went on writing after the cut", k < written[0], f"{k} at the cut, {written[0]} in all")
 
 
 # ---------------------------------------------------------------------------------- agent lifetimes
@@ -1611,6 +1705,7 @@ def main():
         run_brokered(ids)
         run_repos(ids)
         run_checkpoints(ids)
+        run_cut_under_writes(ids)
         run_lifecycle(ids)
         run_retention(ids)
         # After the turns: the token has been handed to the brains by now.

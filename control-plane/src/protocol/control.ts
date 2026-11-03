@@ -326,6 +326,8 @@ export const HostEventVariants = [
     ...hostEventBase, type: z.literal("commit_request"), request: RequestId, sandbox: SandboxId, epoch: Epoch,
     parent: GenerationId.optional(), kind: GenerationKind, disk_manifest: ManifestHash,
     mem_manifest: ManifestHash.optional(), reason: CommitReason,
+    /** When the disk was cut (a reflink cut read in the background); absent for a disk read in place. */
+    cut_ms: TimestampMs.optional(),
   }),
   /** What a host saw about a sandbox it holds; the tag `workstream` is historical (a rename is two releases). */
   z.object({ ...hostEventBase, type: z.literal("workstream"), event: SandboxEvent }),
