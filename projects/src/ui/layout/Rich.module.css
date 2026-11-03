@@ -53,7 +53,7 @@
 
 .prose :not(pre) > code {
   font-family: var(--mantine-font-family-monospace);
-  font-size: 0.875em;
+  font-size: var(--mantine-font-size-sm);
   padding: 0 var(--mantine-spacing-2xs);
   border-radius: var(--mantine-radius-sm);
   background: var(--nest-subtle);
@@ -117,7 +117,8 @@
   text-align: left;
   overflow-x: auto;
   overflow-y: hidden;
-  padding: var(--mantine-spacing-2xs) 0;
+  /* Room for the ink KaTeX draws past its boxes (a fraction's bar and limbs), so none is clipped. */
+  padding: var(--mantine-spacing-sm) 0;
   margin: 0;
 }
 
@@ -283,4 +284,10 @@
 /* The sentinel at the log's end: scrolled to with room for the composer docked over the page's bottom. */
 .sentinel {
   scroll-margin-bottom: var(--nest-chat-footer, 0px);
+}
+
+/* While a chat is shown, the browser doesn't anchor the scroll: content growing above (math, a figure
+   decoding) would move the page and read as the reader leaving the end. The chat follows the end itself. */
+:root:has(.sentinel) {
+  overflow-anchor: none;
 }
