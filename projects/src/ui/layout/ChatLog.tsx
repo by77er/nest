@@ -4,16 +4,55 @@
 // composer; an arriving message's 4 px fade-and-slide (180 ms, never on load, never under reduced motion);
 // and a code block's header.
 
-import { forwardRef, type ReactNode } from "react";
+import { useMediaQuery } from "@mantine/hooks";
+import { forwardRef, type ReactNode, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState } from "react";
 import classes from "./ChatLog.module.css";
 
 /**
- * The conversation, scrolling in itself. `following`: the reader is at the end, and the chat keeps it
- * there; otherwise the browser's scroll anchoring holds the reader's line.
+ * The conversation. The page never scrolls; one thing does, and the ref is it (its scroll, its content):
+ * - from `sm` up, the log itself, filling down to the viewport's bottom above the composer;
+ * - on a phone, the page's column (`[data-ds=page]`, the viewport less the top bar), with the header
+ *   and its context scrolling away above the log and the composer pinned at the bottom.
+ * `following`: the reader is at the end, and the chat keeps it there; otherwise the browser's scroll
+ * anchoring holds the reader's line.
  */
 export const ChatLog = forwardRef<HTMLDivElement, { children: ReactNode; onScroll?: () => void; label: string; following: boolean }>(function ChatLog({ children, onScroll, label, following }, ref) {
+  const el = useRef<HTMLDivElement>(null);
+  const phone = useMediaQuery("(max-width: 48em)") ?? false;
+  const [scroller, setScroller] = useState<HTMLDivElement | null>(null);
+  useLayoutEffect(() => {
+    const d = el.current;
+    if (d) setScroller(phone ? (d.closest<HTMLDivElement>("[data-ds=page]") ?? d) : d);
+  }, [phone]);
+  useImperativeHandle(ref, () => scroller as HTMLDivElement, [scroller]);
+  useEffect(() => {
+    if (!scroller || !onScroll) return;
+    scroller.addEventListener("scroll", onScroll, { passive: true });
+    return () => scroller.removeEventListener("scroll", onScroll);
+  }, [scroller, onScroll]);
+  // From `sm` up: as tall as fits, so the page itself never scrolls (at least 12rem).
+  useLayoutEffect(() => {
+    const d = el.current;
+    if (!d || phone) {
+      if (d) d.style.maxHeight = "";
+      return;
+    }
+    const fit = () => {
+      d.style.maxHeight = "";
+      const over = document.documentElement.scrollHeight - window.innerHeight;
+      if (over > 0) d.style.maxHeight = `${Math.max(192, d.getBoundingClientRect().height - over)}px`;
+    };
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(document.body);
+    window.addEventListener("resize", fit);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener("resize", fit);
+    };
+  }, [phone]);
   return (
-    <div ref={ref} className={classes.log} onScroll={onScroll} role="log" aria-label={label} tabIndex={0} data-following={following || undefined} data-ds="chat-log">
+    <div ref={el} className={classes.log} role="log" aria-label={label} tabIndex={0} data-following={following || undefined} data-ds="chat-log">
       {/* The content in a box of its own, so its growth (math, a figure decoding) can be observed. */}
       <div className={classes.logContent} data-slot="log-content">
         {children}
@@ -65,11 +104,16 @@ export function MessageRow({ side, children, meta, appear = false, pinned = fals
   );
 }
 
-export function JumpPill({ children }: { children: ReactNode }) {
-  return <div className={classes.jump}>{children}</div>;
+/** Floats just above the composer, centred ("Jump to latest · n new"): ComposerDock's `pill`. */
+function JumpPill({ children }: { children: ReactNode }) {
+  return (
+    <div className={classes.jump} data-ds="jump-pill">
+      {children}
+    </div>
+  );
 }
 
-/** The turn's text so far ends in a static cursor (no blink). */
+/** The turn's text so far; its last character is a static cursor (no blink), set inline by the feature. */
 export function StreamText({ children }: { children: ReactNode }) {
   return (
     <div className={classes.cursor} data-ds="stream">
@@ -88,9 +132,11 @@ export function ActivityLine({ children }: { children: ReactNode }) {
   );
 }
 
-export function ComposerDock({ children }: { children: ReactNode }) {
+/** The composer under the log (pinned at the viewport's bottom on a phone), its pill floating above it. */
+export function ComposerDock({ children, pill }: { children: ReactNode; pill?: ReactNode }) {
   return (
     <div className={classes.dock} data-ds="composer-dock">
+      {pill && <JumpPill>{pill}</JumpPill>}
       {children}
     </div>
   );

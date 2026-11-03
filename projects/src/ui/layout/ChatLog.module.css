@@ -7,7 +7,6 @@
 }
 
 .log {
-  max-height: calc(100dvh - var(--nest-chat-chrome));
   min-height: 12rem;
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -107,6 +106,14 @@
 
 .group[data-side="owner"] .meta {
   justify-content: flex-end;
+  /* One line (its time, its state, Retry, its actions), never wrapped under itself. */
+  flex-wrap: nowrap;
+}
+
+@media (max-width: 48em) {
+  .group[data-side="owner"] .row {
+    max-width: 92%;
+  }
 }
 
 .row:hover .meta,
@@ -124,16 +131,15 @@
 .jump {
   position: absolute;
   left: 50%;
-  bottom: var(--mantine-spacing-md);
+  bottom: calc(100% + var(--mantine-spacing-sm));
   transform: translateX(-50%);
   z-index: 2;
 }
 
-/* The turn in progress: the text so far, a static cursor at its end, and the running tool's line. */
-.cursor::after {
-  content: "▍";
-  margin-left: 1px;
-  color: var(--nest-muted);
+/* The turn in progress: the text so far (its last character the cursor, inline after the last word:
+   the feature appends it), and the running tool's line. */
+.cursor {
+  min-width: 0;
 }
 
 .activity {
@@ -150,9 +156,37 @@
 }
 
 .dock {
+  position: relative;
   padding: var(--mantine-spacing-md) 0 calc(var(--mantine-spacing-md) + env(safe-area-inset-bottom));
   border-top: var(--nest-border);
   background: var(--nest-page-bg);
+}
+
+/* On a phone the page's column is the one scroller (the viewport less the top bar): the header and the
+   context scroll away above the log, which flows in it, and the composer is pinned at its bottom. */
+@media (max-width: 48em) {
+  :global([data-ds="page"]):has(.log) {
+    height: calc(100dvh - var(--nest-header-height));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-bottom: 0;
+  }
+
+  :global([data-ds="page"]):has(.log[data-following]) {
+    overflow-anchor: none;
+  }
+
+  .log {
+    min-height: 0;
+    overflow: visible;
+    padding-right: 0;
+  }
+
+  .dock {
+    position: sticky;
+    bottom: 0;
+    z-index: 3;
+  }
 }
 
 .appear {

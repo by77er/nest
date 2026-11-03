@@ -1,7 +1,7 @@
 // The chat with the manager, on its own page (/projects/:id/manager): the log as the Worker keeps it,
 // undelivered messages flagged with why, and the composer posting the owner's words.
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { exact } from "../../common/time";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
@@ -34,6 +34,8 @@ const ev = (type: string, more: Record<string, unknown> = {}) => ({ seq: ++seq, 
 const msgs = (n: number, from = 1) => Array.from({ length: n }, (_, k) => ({ seq: from + k, at_ms: Date.now() - (n - k) * 1000, sender: k % 2 ? "manager" : "owner", text: `Message ${from + k}`, delivered: true, error: null }));
 
 afterEach(() => vi.unstubAllGlobals());
+// Drafts are kept per project in the browser: each test starts with none.
+beforeEach(() => window.localStorage.clear());
 
 describe("the chat", () => {
   it("streams the manager's turn as it runs, with what it's doing, and Stop interrupts it", async () => {
@@ -41,7 +43,8 @@ describe("the chat", () => {
     const api = new FakeApi();
     const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
-    const stream = await within(c).findByText("Checking the migration first.");
+    // The cursor is inline: the paragraph's last character, right after the last word.
+    const stream = await within(c).findByText("Checking the migration first.\u258C");
     expect(stream.closest("[data-sender=stream]")).not.toBeNull();
     expect(within(c).getByText("Running rg sslmode")).toBeInTheDocument();
     await user.click(within(c).getByRole("button", { name: "Stop" }));
@@ -68,6 +71,45 @@ describe("the chat", () => {
     expect(c.querySelector("time")).not.toHaveAttribute("tabindex");
     await user.click(within(c).getByRole("button", { name: "Message actions" }));
     expect(await screen.findByText(exact(at))).toBeInTheDocument();
+  });
+
+  it("\"Quote in a reply\" quotes into the composer and puts focus there, the caret at the end", async () => {
+    const api = new FakeApi();
+    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: "Line one\nLine two", delivered: true, error: null }];
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await within(c).findByText(/Line one/);
+    await user.click(within(c).getByRole("button", { name: "Message actions" }));
+    await user.click(await screen.findByRole("menuitem", { name: /Quote in a reply/ }));
+    const box = within(c).getByLabelText("Message to the manager") as HTMLTextAreaElement;
+    await waitFor(() => expect(box).toHaveFocus());
+    expect(box.value).toBe("> Line one\n> Line two\n\n");
+    expect(box.selectionStart).toBe(box.value.length);
+  });
+
+  it("on touch, Enter is a new line and Send sends; the Enter hint isn't shown", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(pointer: coarse)", media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => false }));
+    const api = new FakeApi();
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    const box = within(c).getByLabelText("Message to the manager");
+    await user.type(box, "First line{Enter}second line");
+    expect(box).toHaveValue("First line\nsecond line");
+    expect(api.writes).toEqual([]);
+    expect(within(c).queryByText(/Enter to send/)).toBeNull();
+    await user.click(within(c).getByRole("button", { name: "Send" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/chat", body: { text: "First line\nsecond line" } }]));
+  });
+
+  it("a chat that can't be loaded shows why, and no turn streaming under it", async () => {
+    vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Still going." })]));
+    const api = new FakeApi();
+    // Every answer fails (a poll asks again).
+    for (let i = 0; i < 10; i++) api.fail(/^GET .*\/chat$/, 500, "ProjectDO is unavailable");
+    renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    expect(await within(c).findByText("The chat couldn't be loaded")).toBeInTheDocument();
+    expect(c.querySelector("[data-sender=stream]")).toBeNull();
   });
 
   it("an empty chat offers starters that fill the composer, never send", async () => {

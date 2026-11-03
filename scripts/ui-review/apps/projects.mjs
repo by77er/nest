@@ -247,6 +247,29 @@ async function prProximity(p, { width }) {
   });
 }
 
+/**
+ * The chat fits the viewport: the page itself doesn't scroll (only the log does, or on a phone the
+ * page's column), and the composer is on screen.
+ */
+async function chatFits(p) {
+  return p.evaluate(() => {
+    const out = [];
+    const doc = document.documentElement;
+    if (doc.scrollHeight > window.innerHeight + 1) out.push(`the page scrolls ${doc.scrollHeight - window.innerHeight} px (only the chat should)`);
+    const box = document.querySelector("[data-ds=composer-dock] textarea")?.getBoundingClientRect();
+    if (!box) out.push("no composer");
+    else if (box.bottom > window.innerHeight + 0.5 || box.top < 0) out.push(`the composer is off screen (${Math.round(box.top)}..${Math.round(box.bottom)} of ${window.innerHeight})`);
+    return out;
+  });
+}
+/** A two-line draft (Shift+Enter between), still in the composer, unsent; and the chat still fits. */
+async function draftKept(p) {
+  const problems = await chatFits(p);
+  const value = await p.locator("[data-ds=composer-dock] textarea").inputValue();
+  if (!value.includes("\n") || !value.endsWith("with prices and tags.")) problems.push(`the draft isn't both lines in the composer: ${JSON.stringify(value)}`);
+  return problems;
+}
+
 /** A task card's PR link opens the PR (a new tab on GitHub), not the task the whole card links to. */
 const cardPrLink = (p) => prLinkIn(p, "[data-slot=manager-context] [data-ds=task-card]", "a context card");
 const chatCardPrLink = (p) => prLinkIn(p, "[data-ds=rich] [data-ds=task-card]", "a chat card");
@@ -412,10 +435,13 @@ const app = {
     { name: "rhythm-prs", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, widths: PHONE, after: drawerAt("Pull requests"), check: prProximity, checkName: "rhythm" },
     { name: "rhythm-trace", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, widths: PHONE, check: traceProximity, checkName: "rhythm" },
     { name: "rhythm-context", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click(), check: rhythm("demo", ["[data-slot=manager-context]"], (p) => p.getByRole("button", { name: "About the manager" }).click()), checkName: "rhythm" },
+    // The chat fits the viewport (checks: `chat-fit`): the page doesn't scroll, the composer is on screen.
+    { name: "chat-fit", section: "project", path: "/projects/prj_demo/manager", full: false, check: chatFits, checkName: "chat-fit" },
+    { name: "chat-fit-long", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, check: chatFits, checkName: "chat-fit" },
     // The chat (README.md#the-manager-chat): a turn streaming with its activity line and Stop; the composer
     // with a draft; the jump-to-latest pill; older history paged in; a message's actions; the unread dot.
     { name: "chat-streaming", section: "project", path: "/projects/prj_demo/manager", full: false, ready: shown("[data-sender=stream]") },
-    { name: "chat-draft", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, after: async (p) => { await p.getByRole("button", { name: /^Spec a task for/ }).click(); await p.keyboard.type("exporting gadgets as CSV,\nwith prices and tags."); } },
+    { name: "chat-draft", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, after: async (p) => { await p.getByRole("button", { name: /^Spec a task for/ }).click(); await p.keyboard.type("exporting gadgets as CSV,"); await p.keyboard.press("Shift+Enter"); await p.keyboard.type("with prices and tags."); }, check: draftKept, checkName: "chat-fit" },
     { name: "chat-jump", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-arriving", full: false, after: async (p) => { await p.locator("[data-ds=chat-log]").evaluate((el) => { el.scrollTop = el.scrollHeight / 3; }); await p.getByRole("button", { name: /Jump to latest/ }).waitFor({ timeout: 10_000 }); } },
     { name: "chat-older", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-paged", full: false, after: async (p) => { await p.locator("[data-ds=chat-log]").evaluate((el) => { el.scrollTop = 0; }); await p.getByText("Message 22: how is the search work going?").waitFor({ timeout: 10_000 }); } },
     { name: "chat-actions", section: "project", path: "/projects/prj_demo/manager", full: false, after: async (p) => { await p.getByRole("button", { name: "Message actions" }).first().click(); await p.getByRole("menuitem", { name: /Quote in a reply/ }).waitFor(); } },

@@ -6,6 +6,7 @@
 // messages as you scroll up without losing your place.
 
 import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Textarea, Tooltip, VisuallyHidden } from "@mantine/core";
+import { useMediaQuery } from "@mantine/hooks";
 import { IconArrowDown, IconCopy, IconDots, IconPlayerStop, IconQuote, IconRefresh, IconSend } from "@tabler/icons-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api } from "../../api/client";
@@ -13,7 +14,7 @@ import { useChat, useInterruptManager, usePostChat } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import {
-  ActivityLine, ChatFrame, ChatLog, ComposerDock, DaySeparator, ErrorState, icon, JumpPill, LoadingState, MessageGroup, MessageRow, Prose, Row, Stack, StreamText,
+  ActivityLine, ChatFrame, ChatLog, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, Stack, StreamText,
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
 import { useTrace } from "../trace/useTrace";
@@ -26,6 +27,8 @@ export const STARTERS = ["Spec a task for ", "What's blocked right now?", "Summa
 const NEAR = 24;
 const OLDER_AT = 80;
 const PAGE = 50;
+/** The streaming turn's cursor: its text's last character, so it sits right after the last word. */
+const STREAM_CURSOR = "\u258C";
 
 function MessageActions({ m, onQuote, onRetry }: { m: ChatMessage; onQuote: (text: string) => void; onRetry?: () => void }) {
   return (
@@ -113,6 +116,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const post = usePostChat(projectId);
   const interrupt = useInterruptManager(projectId);
   const trace = useTrace(agent);
+  const coarse = useMediaQuery("(pointer: coarse)") ?? false;
   const live = useMemo(() => liveTurn(trace.state.events), [trace.state.events]);
 
   const [older, setOlder] = useState<ChatMessage[]>([]);
@@ -257,9 +261,17 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     });
   };
   const retry = (m: ChatMessage) => send(m.text, m.seq < 0 ? m : undefined);
+  // Quoting puts the quote at the composer's start and the caret at its end, once the menu has closed
+  // (it returns focus to its button first).
   const quoteReply = (t: string) => {
-    setText((cur) => quote(t) + cur);
-    composer.current?.focus();
+    const next = quote(t) + text;
+    setText(next);
+    setTimeout(() => {
+      const c = composer.current;
+      if (!c) return;
+      c.focus();
+      c.setSelectionRange(next.length, next.length);
+    }, 0);
   };
 
   const items = groupLog(messages);
@@ -306,14 +318,15 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
               ),
             )
           )}
-          {stream && (
+          {stream && !chat.isError && (
             <MessageGroup side="manager" name="Manager">
               <MessageRow side="manager" data-sender="stream">
                 <Stack gap="xs">
                   {stream.text &&
                     (running ? (
+                      // The cursor is the text's last character, inline after it.
                       <StreamText>
-                        <RichMessage text={stream.text} projectId={projectId} />
+                        <RichMessage text={`${stream.text}${STREAM_CURSOR}`} projectId={projectId} />
                       </StreamText>
                     ) : (
                       <RichMessage text={stream.text} projectId={projectId} />
@@ -324,19 +337,21 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
             </MessageGroup>
           )}
         </ChatLog>
-        {unseen > 0 && !atBottom && (
-          <JumpPill>
-            <Button size="xs" radius="xl" leftSection={<IconArrowDown size={icon.sm} />} onClick={scrollToBottom}>
-              Jump to latest · {unseen} new
-            </Button>
-          </JumpPill>
-        )}
       </ChatFrame>
       <VisuallyHidden aria-live="polite" role="status" data-slot="announce">
         {announce}
       </VisuallyHidden>
 
-      <ComposerDock>
+      <ComposerDock
+        pill={
+          unseen > 0 &&
+          !atBottom && (
+            <Button size="xs" radius="xl" leftSection={<IconArrowDown size={icon.sm} />} onClick={scrollToBottom}>
+              Jump to latest · {unseen} new
+            </Button>
+          )
+        }
+      >
         <form
           onSubmit={(e) => {
             e.preventDefault();
@@ -355,16 +370,19 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
               value={text}
               onChange={(e) => setText(e.currentTarget.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                // On touch, Enter is a new line (a phone's keyboard has no Shift+Enter); Send sends.
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && !coarse) {
                   e.preventDefault();
                   send();
                 }
               }}
             />
-            <Row justify="space-between">
-              <Text fz="xs" c="dimmed">
-                Enter to send · Shift+Enter for a new line
-              </Text>
+            <Row justify={coarse ? "flex-end" : "space-between"}>
+              {!coarse && (
+                <Text fz="xs" c="dimmed">
+                  Enter to send · Shift+Enter for a new line
+                </Text>
+              )}
               <Row gap="sm">
                 {running && (
                   <Button variant="default" leftSection={<IconPlayerStop size={icon.sm} />} loading={interrupt.isPending} onClick={() => interrupt.mutate()}>
