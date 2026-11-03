@@ -29,7 +29,7 @@ RULES = [
     # The UI design skill: both apps' theme tests read its token tables.
     (".claude/skills/nest-ui-design/", {"dashboard", "projects"}),
     ("README.md", set()),
-    ("CLAUDE.md", set()),
+    ("AGENTS.md", set()),
     ("images/", set()),
     ("verification/", set()),
     (".github/", set()),

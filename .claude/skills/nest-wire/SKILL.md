@@ -42,7 +42,7 @@ cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --w
 
 - **If a fuzzed parser's types changed** (guest frames, proxy/gateway/runner events, `fleet_to_host`, `meta.json`): `cd verification/nestd/fuzz && python3 -I gen_seeds.py && cargo test --locked`, then `./run.sh <target> replay`.
 - **If the admin views changed:** `cd dashboard && npm ci && npm run typecheck && npm test && npm run build`.
-- **If components interact:** `e2e/run.sh` (see the `nest-host` skill for `NEST_E2E_WORK`).
+- **If components interact:** `e2e/run.sh` (`nest-validation`).
 - **Old peer:** the new reader must parse a fixture without the new field (keep the old fixture, or add a `<tag>.<case>.json` without it). The old reader must parse the new message, so check that nothing old rejects it.
 - **Mutation check:** drop the field from one side and watch the round trip fail; delete the new fixture and watch the coverage test fail.
 
