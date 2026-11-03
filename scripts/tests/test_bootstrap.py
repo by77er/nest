@@ -157,6 +157,7 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         cfg, fake = self.check("burst")
         self.assertTrue(cfg["state_dir"].endswith("/var/lib/nest"), cfg["state_dir"])
         self.assertFalse((fake / "disk.log").exists(), "nothing formatted")
+        self.assertFalse((fake / "etc/systemd/system/nestd.service.d/instance-store.conf").exists(), "no mount to require")
 
     def test_sandbox_host_with_an_instance_store(self):
         """The instance-store disk is formatted XFS with reflink, in fstab, mounted, and holds the
@@ -165,14 +166,22 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         log = (fake / "disk.log").read_text()
         self.assertIn("mkfs.xfs -q -f -m reflink=1 -L nest-data /dev/nvme1n1", log)
         self.assertIn("mount", log)
-        self.assertIn("LABEL=nest-data", (fake / "etc/fstab").read_text())
+        fstab = (fake / "etc/fstab").read_text()
+        self.assertIn("LABEL=nest-data", fstab)
+        self.assertIn("nofail,x-systemd.device-timeout=10s", fstab)
         self.assertTrue(cfg["state_dir"].endswith("/var/lib/nest/data/state"), cfg["state_dir"])
+        # Every unit that uses the store requires its mount: none starts before it after a
+        # reboot, or at all on a store a stop and start left blank.
+        for unit in ("nestd.service", "nest-proxy.service", "nest-gateway.service"):
+            drop_in = fake / f"etc/systemd/system/{unit}.d/instance-store.conf"
+            self.assertEqual(drop_in.read_text(), f"[Unit]\nRequiresMountsFor={fake}/var/lib/nest/data\n", unit)
 
     def test_sandbox_host_whose_instance_store_wont_format(self):
         """mkfs.xfs fails (or an AMI lacks xfsprogs): the host still comes up, with state on the root volume."""
         cfg, fake = self.check("burst", nvme="broken")
         self.assertTrue(cfg["state_dir"].endswith("/var/lib/nest"), cfg["state_dir"])
         self.assertNotIn("mount", (fake / "disk.log").read_text())
+        self.assertFalse((fake / "etc/systemd/system/nestd.service.d/instance-store.conf").exists(), "no mount to require")
 
     def test_sandbox_host_on_the_previous_release(self):
         """A nestd that can't give the gateway its sockets: the gateway keeps root's file access

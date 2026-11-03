@@ -390,6 +390,41 @@ pub fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// How many extent records `path` has now (`FS_IOC_FIEMAP` asking for none, which answers only the
+/// count): what a [`reflink`] of it costs, in metadata ([`clone_slower_than_read`]).
+pub fn extent_count(path: &Path) -> io::Result<u64> {
+    /// `struct fiemap` (linux/fiemap.h) with no extent array.
+    #[repr(C)]
+    struct Fiemap {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped_extents: u32,
+        extent_count: u32,
+        reserved: u32,
+    }
+    let f = File::open(path)?;
+    let mut m = Fiemap { start: 0, length: u64::MAX, flags: 0, mapped_extents: 0, extent_count: 0, reserved: 0 };
+    // SAFETY: FS_IOC_FIEMAP reads and writes a `struct fiemap` we own; with `extent_count` 0 the
+    // kernel writes no extent array past it.
+    let r = unsafe { libc::ioctl(f.as_raw_fd(), libc::_IOWR::<Fiemap>(b'f' as u32, 11), &mut m as *mut Fiemap) };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(m.mapped_extents))
+}
+
+/// Whether cloning a file of `extents` records (at `clone_ns_per_extent` each) would pause a VM
+/// longer than reading its `allocated` bytes (at `read_bytes_per_s`) would. M2's measurement put a
+/// clone at 10-15 us a record and a cold read at about 180 MB/s on a `c8id.large`
+/// (`docs/sandbox/state/disk/`), so a file has to average under about 2.7 KB a record for this to
+/// hold there: a guard against a slower clone, not the bound M3' is for.
+pub fn clone_slower_than_read(extents: u64, allocated: u64, clone_ns_per_extent: u64, read_bytes_per_s: u64) -> bool {
+    let clone_ns = u128::from(extents) * u128::from(clone_ns_per_extent);
+    let read_ns = u128::from(allocated) * 1_000_000_000 / u128::from(read_bytes_per_s.max(1));
+    clone_ns > read_ns
+}
+
 /// Whether files in `dir` can be reflinked (two scratch files, removed again).
 pub fn reflink_works(dir: &Path) -> bool {
     let probe = dir.join(format!(".reflink-probe-{}", crate::util::random_hex(8)));
@@ -451,6 +486,33 @@ pub fn create_sparse(path: &Path, bytes: u64) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extent_count_counts_a_files_extent_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        let f = OpenOptions::new().write(true).create_new(true).open(&p).unwrap();
+        f.set_len(8 << 20).unwrap();
+        f.write_all_at(&[1u8; 4096], 0).unwrap();
+        f.write_all_at(&[2u8; 4096], 4 << 20).unwrap();
+        f.sync_all().unwrap();
+        match extent_count(&p) {
+            // Two writes with a hole between them: two records (tmpfs and some others can't say).
+            Ok(n) => assert_eq!(n, 2),
+            Err(e) => assert!(matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY)), "{e}"),
+        }
+    }
+
+    #[test]
+    fn a_clone_is_slower_than_a_read_only_past_the_measured_ratio() {
+        // 819 k records of a 6.7 GB disk at 15 us and 180 MB/s: 12 s against 37 s, so clone.
+        assert!(!clone_slower_than_read(818_954, 6_690_762_752, 15_000, 180_000_000));
+        // A disk of 4 KiB records the clone still wins; past 2.7 KB a record on average it loses.
+        assert!(!clone_slower_than_read(1_000, 4_096_000, 15_000, 180_000_000));
+        assert!(clone_slower_than_read(1_000, 2_000_000, 15_000, 180_000_000));
+        // A slower clone (another kernel, a busier disk) turns it.
+        assert!(clone_slower_than_read(818_954, 6_690_762_752, 60_000, 180_000_000));
+    }
+
     use std::io::Write;
 
     use super::*;
