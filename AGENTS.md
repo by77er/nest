@@ -8,7 +8,7 @@ A Cloudflare control plane holds the state.
 
 **nest is a microkernel.** The kernel keeps sandboxes, agents, the broker (credentials, injection, the GitHub App), egress policy and MCP attachment. It exposes a generic client interface: API clients and grants, labels, caller identity, webhooks, live traces. Everything else is built outside it on that interface, such as the projects app in `projects/`. If something outside seems to need a special case inside, the interface is wrong: fix it generically ([principle 9](docs/README.md#principles)).
 
-**Status:** early implementation. Test with `cargo test --workspace`, `cd control-plane && npm test`, and `e2e/run.sh`. **Stack:** TypeScript for the control plane (Workers and Durable Objects); Rust on hosts and in guests. **Scope:** Claude Code is the only harness.
+**Status:** early implementation. Test with `cargo test --workspace`, `npm test` in `control-plane/` and each app, and `e2e/run.sh`. **Stack:** TypeScript for the control plane (Workers and Durable Objects); Rust on hosts and in guests. **Scope:** Claude Code is the only harness.
 
 ## Invariants
 
@@ -31,6 +31,7 @@ A Cloudflare control plane holds the state.
 - `deploy/` holds the cells' infrastructure;
 - `e2e/` and `verification/` hold the end-to-end harness and the models;
 - `dashboard/` and `projects/` are apps on nest;
+- `scripts/` holds the repo guards, CI's path rules and the design-review tooling;
 - `dev/` covers developing this repo.
 
 ## Docs
@@ -46,7 +47,7 @@ Start at [docs/README.md](docs/README.md) for the goals, principles, glossary, d
 
 ## Skills
 
-Skills live in [.claude/skills/](.claude/skills/). Use the ones that fit the change:
+Skills live in [.claude/skills/](.claude/skills/); `nest-change-flow` routes between them. Use the ones that fit the change:
 
 | Change | Skills |
 |---|---|
@@ -59,4 +60,4 @@ Skills live in [.claude/skills/](.claude/skills/). Use the ones that fit the cha
 | Frontend (`dashboard/`, `projects/src/ui/`) | `nest-ui-design` |
 | Review | `nest-review` (code), `nest-design-review` (frontend) |
 
-**Every frontend change needs a design review.** A PR touching `dashboard/**`, `projects/src/ui/**` or the `nest-ui-design` skill merges only after an independent design review (`nest-design-review`) passes, in addition to the code review. Its tooling is in [scripts/ui-review/](scripts/ui-review/).
+**Every frontend change needs a design review.** A PR touching `dashboard/**`, `projects/src/ui/**` or the `nest-ui-design` skill merges only after an independent design review (`nest-design-review`) passes, in addition to the code review. Its tooling is [scripts/ui-review/](scripts/ui-review/README.md).

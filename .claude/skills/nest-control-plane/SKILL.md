@@ -1,6 +1,6 @@
 ---
 name: nest-control-plane
-description: Use when changing nest's control plane in control-plane/ (the Worker and its API routes in src/index.ts; FleetDO, SandboxDO, AgentDO, BrokerDO, CatalogDO or WorkstreamDO; src/lib; a Durable Object's SQLite schema; wrangler.jsonc) or its vitest suite, even for a one-line fix. Covers await interleaving, alarms, rollback-safe schema changes, the model-checked one-brain rule, and how to prove the change.
+description: Use when changing nest's control plane in control-plane/ (the Worker and its API routes in src/index.ts; FleetDO, SandboxDO, AgentDO, BrokerDO, CatalogDO, ClientDO or McpConnectorDO; src/lib; a Durable Object's SQLite schema; wrangler.jsonc) or its vitest suite, even for a one-line fix. Covers await interleaving, alarms, rollback-safe schema changes, the model-checked one-brain rule, and how to prove the change.
 ---
 
 # Changing the control plane
@@ -44,7 +44,7 @@ Changes to any of these need a conformance check against [the model](../../../ve
 - **Trust the exit code, not the counts.** A DO RPC rejection asserted as `await expect(stub.x()).rejects…` can be reported as an unhandled rejection: every test passes, the summary shows `Errors 1 error`, and the run exits 1. Wrap it: `await expect(Promise.resolve().then(() => stub.x())).rejects.toThrow(…)`. Dozens of `uncaught exception` lines in a passing run are workerd's own logging, not failures.
 - **Isolation:** tests share the DO namespaces, so each test makes its own cell (`uniqueCell()`) and ids and never reads another test's objects.
 - **Real alarms run in the pool.** Assert eventual outcomes, and tolerate an alarm that fires early. To fire one now, use `runDurableObjectAlarm`; to read or plant rows, use `runInDurableObject`.
-- **A test that passes alone and fails under load** usually asserts an intermediate state or waits too briefly. Find the root cause; don't just raise the timeout.
+- **Flakes** get a root cause (`nest-tests`). The patterns here:
   - A fixed `sleep` before asserting what a socket or another DO delivers (a segment received, a close code, a deadline `webSocketClose` arms) is the usual culprit: wait for the thing itself. `test/helpers.ts` has `eventually` (poll for a truthy value, 10 s), `received` (segment bytes at AgentDO), `sessionGone` (a runner's close landed), `inboundSettled` (FleetDO finished a hello's work, which goes on after `hello_ack`) and `Ws.whenClosed`.
   - To run a deadline a test made due (`at = 0`), use `runDue(stub)`, not `runDurableObjectAlarm`. The latter runs only an alarm that is scheduled and not already running, and a row a test wrote arms none.
   - A sleep before acting can also make a test pass without testing anything: the interleaving it set up never happened. A held call reports when it is held (`holdFleet`'s `reached`), and a hook sets a flag the test waits for. A sleep stays only to give something that must *not* happen room to happen.
@@ -52,7 +52,6 @@ Changes to any of these need a conformance check against [the model](../../../ve
   - When two DOs write in turn (SandboxDO destroys, then AgentDO records it), wait on the later write.
   - The pool's per-test timeout is 15 s (`vitest.config.ts`): CI's first ~30 s overlap the other workers' module imports. A test whose deliberate waits (batch windows, call timeouts) approach it sets its own, naming the timer.
 - **A fake collaborator hides binding errors** ([review lesson 8](../../../dev/review-lessons.md)): one test per injected global runs the real default.
-- **Mutation-check fixes:** revert the guard, run its file, watch the named test fail, restore.
 - A change to an admin view (`protocol/admin/view.ts`) also needs the dashboard: `cd dashboard && npm ci && npm run typecheck && npm test && npm run build`.
 
 ## Done
@@ -61,5 +60,5 @@ Changes to any of these need a conformance check against [the model](../../../ve
 - Any migration has a test on the old shape, and the release still runs under the previous Worker.
 - Conformance is updated if a brain-rule path changed.
 - The owning doc under `docs/control-plane/` records the decision, and `dev/deploy.md` has the rollout rule if there is one.
-- `e2e/run.sh` passed if hosts are involved (the `nest-host` skill).
-- After the merge, the deploy is watched and the cloud checked (the `nest-infra` skill).
+- `e2e/run.sh` passed if hosts are involved (`nest-validation`).
+- After the merge, the deploy is watched (`nest-change-flow`).
