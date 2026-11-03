@@ -11,6 +11,7 @@ import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { MetaItem, MetaRow, Panel, Prose, Row, Section, Stack } from "../../layout";
 import { motion } from "../../theme";
+import { RichMessage } from "../rich/RichMessage";
 import { AskItem } from "./AskItem";
 
 type BlockedItem = Extract<Attention, { kind: "blocked" }>;
@@ -31,7 +32,7 @@ function BlockedTask({ projectId, item }: { projectId: string; item: BlockedItem
         </MetaItem>
         <MetaItem title={exact(item.at_ms)}>{ago(item.at_ms)}</MetaItem>
       </MetaRow>
-      <Prose>{item.reason}</Prose>
+      {item.role === "manager" ? <RichMessage text={item.reason} projectId={projectId} /> : <Prose>{item.reason}</Prose>}
       {item.question && (
         <Text fz="md" fw="medium">
           {item.question}

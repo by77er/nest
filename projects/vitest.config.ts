@@ -26,6 +26,11 @@ export default defineConfig({
                 NEST_WEBHOOK_SECRET: `whsec_${"1".repeat(64)}`,
                 GITHUB_WEBHOOK_SECRET: `ghsec_${"2".repeat(40)}`,
               },
+              // The page's assets (vite builds them; tests have none): a stand-in index.html, so the
+              // Worker's own handling of a page (the Access check, the CSP) runs.
+              serviceBindings: {
+                ASSETS: () => new Response("<!doctype html><title>nest projects</title>", { headers: { "content-type": "text/html; charset=utf-8" } }),
+              },
             },
           }),
         ],

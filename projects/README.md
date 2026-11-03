@@ -234,6 +234,17 @@ The owner's request (2026-11-02): "Workers should be notified when their assigne
   - At most 2,000 events are kept per view; older ones are dropped from it, and it says so.
 - **Where it's mounted:** the task drawer (the worker's). `ManagerTrace` is for the Manager page's "Trace" tab beside "Chat", and `ReviewTrace` for each job on the Reviews page; those pages come with the sidebar.
 
+### Rich messages
+
+The manager's messages (in the chat, and its asks and blocks in "Needs you") render; the owner's stay plain text with their line breaks. `src/ui/features/rich/`, `src/ui/rich/`, styled by `layout/Rich.tsx`.
+
+- **Markdown:** `react-markdown` with `remark-gfm` (headings, lists, task lists read-only, tables in a scroll frame, quotes, code in the mono family, links). **Raw HTML is never rendered:** it becomes literal text before parsing (`remarkEscapeHtml`), and no `rehype-raw` is in the pipeline.
+- **Links** only `http:`, `https:` and `mailto:` (new tab, `noopener noreferrer`); anything else is plain text. **No remote image** (no tracking pixel): `![alt](url)` is a link labelled with the alt text; only a `data:image/png|jpeg|gif|webp` image shows inline, capped.
+- **Math:** `remark-math` and `rehype-katex` (inline `$…$`, display `$$` blocks and ```math blocks), with `trust: false` (no `\href`, `\url`, `\includegraphics`, `\htmlClass`, `\htmlId`), `strict: "warn"`, `throwOnError: false` (a bad formula shows its source in the error shade), and `maxSize`/`maxExpand` caps. KaTeX's CSS and fonts come from the package. Display math scrolls in its own frame.
+- **SVG, in depth:** found before Markdown (a ```svg block, or an inline `<svg>…</svg>`); sanitized with DOMPurify's SVG profile plus stricter rules (no `foreignObject`, `script`, `on*`, non-fragment `href`/`xlink:href`, outside `<use>`, fetching `<style>`), checked again after, refused above 200 KB; and **shown only as an `<img>`** from a `data:image/svg+xml` URL, never inline, so a sanitizer bug still can't run anything. A click opens it larger (still an image); "View source" shows the sanitized SVG.
+- **Task references:** `[text](task:tsk_…)` or a bare `task:tsk_…` is a chip (state badge and the live title); a ```tasks block (an id per line, optionally a note) is a card per task (title, state, assignee, PRs with their review, "Needs you", the note). Always resolved live from the project's board (one query, polled with it); an id the board doesn't have is plain text. A chip or card opens the task in the Board's drawer.
+- **CSP** (`src/csp.ts`), on every page the built Worker serves: `default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'` (Mantine's CSS variables and style props, KaTeX's sizes); `img-src 'self' data:`; `font-src 'self' data:`; `connect-src 'self' wss://<host>` (the trace); `frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'`. The scheme's pre-paint script is a file (`public/color-scheme.js`), not inline. `vite dev` sends none (its own inline scripts).
+
 ### Design system
 
 The values and rules are the [nest-ui-design skill](../.claude/skills/nest-ui-design/SKILL.md)'s; this app implements them.

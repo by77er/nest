@@ -1,0 +1,229 @@
+/* A rich message's Markdown (the nest-ui-design skill's type scale and spacing): headings a step under the
+   page's, paragraphs and lists `sm` apart, code in the mono family on the subtle ground, a quote with a
+   hairline rule, tables and display math scrolling inside their own frame, never the page. */
+.prose {
+  font-size: var(--mantine-font-size-lg);
+  line-height: var(--mantine-line-height-lg);
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.prose > * + * {
+  margin-top: var(--mantine-spacing-sm);
+}
+
+.prose :where(p, ul, ol, blockquote, pre, table) {
+  margin: 0;
+}
+
+.prose :where(h1, h2, h3, h4, h5, h6) {
+  margin: var(--mantine-spacing-md) 0 0;
+  font-weight: 600;
+  line-height: var(--mantine-h4-line-height);
+}
+
+.prose :where(h1, h2) {
+  font-size: var(--mantine-h3-font-size);
+  line-height: var(--mantine-h3-line-height);
+}
+
+.prose :where(h3, h4, h5, h6) {
+  font-size: var(--mantine-h4-font-size);
+}
+
+.prose > :first-child {
+  margin-top: 0;
+}
+
+.prose :where(ul, ol) {
+  padding-left: var(--mantine-spacing-xl);
+}
+
+.prose li + li {
+  margin-top: var(--mantine-spacing-2xs);
+}
+
+/* A task list's items: their (read-only) box in the list's own indent. */
+.prose li:has(> input[type="checkbox"]) {
+  list-style: none;
+  margin-left: calc(var(--mantine-spacing-xl) * -1);
+}
+
+.prose input[type="checkbox"] {
+  margin: 0 var(--mantine-spacing-sm) 0 0;
+  vertical-align: -0.125em;
+  pointer-events: none;
+}
+
+.prose blockquote {
+  padding-left: var(--mantine-spacing-md);
+  border-left: 2px solid var(--nest-border-color);
+  color: var(--nest-muted);
+}
+
+.prose :not(pre) > code {
+  font-family: var(--mantine-font-family-monospace);
+  font-size: 0.875em;
+  padding: 0 var(--mantine-spacing-2xs);
+  border-radius: var(--mantine-radius-sm);
+  background: var(--nest-subtle);
+}
+
+.prose pre {
+  font-family: var(--mantine-font-family-monospace);
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  border-radius: var(--mantine-radius-md);
+  background: var(--nest-subtle);
+  overflow-x: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.prose a {
+  color: var(--mantine-color-anchor);
+}
+
+.prose hr {
+  border: 0;
+  border-top: var(--nest-border);
+  margin: var(--mantine-spacing-lg) 0;
+}
+
+.tableFrame {
+  overflow-x: auto;
+  border: var(--nest-border);
+  border-radius: var(--mantine-radius-md);
+}
+
+.tableFrame table {
+  border-collapse: collapse;
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  font-variant-numeric: tabular-nums;
+  min-width: 100%;
+}
+
+.tableFrame :where(th, td) {
+  padding: var(--mantine-spacing-xs) var(--mantine-spacing-md);
+  text-align: left;
+  border-top: var(--nest-border);
+  overflow-wrap: normal;
+}
+
+.tableFrame th {
+  font-weight: 600;
+  border-top: 0;
+}
+
+/* Display math scrolls inside its own frame when wide; a bad formula shows its source in the error shade. */
+.prose :global(.katex-display) {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: var(--mantine-spacing-2xs) 0;
+  margin: 0;
+}
+
+.prose :global(.katex) {
+  font-size: 1.05em;
+}
+
+/* An inline image (a data: raster) or an SVG figure: capped, on the subtle ground. */
+.image {
+  display: block;
+  max-width: 100%;
+  max-height: var(--nest-rich-image-max);
+  height: auto;
+  border-radius: var(--mantine-radius-md);
+}
+
+.figure {
+  display: inline-block;
+  max-width: 100%;
+  padding: var(--mantine-spacing-sm);
+  border: var(--nest-border);
+  border-radius: var(--mantine-radius-md);
+  background: var(--nest-surface);
+  cursor: zoom-in;
+}
+
+.figure:focus-visible {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: 2px;
+}
+
+.large {
+  display: block;
+  max-width: 100%;
+  max-height: 80vh;
+  margin: 0 auto;
+}
+
+/* A task in a message: inline, a chip; in a block, a compact card with a hairline, no second Panel. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--mantine-spacing-xs);
+  max-width: 100%;
+  padding: 0 var(--mantine-spacing-xs);
+  border: var(--nest-border);
+  border-radius: var(--mantine-radius-sm);
+  color: var(--mantine-color-text);
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  text-decoration: none;
+  vertical-align: baseline;
+}
+
+.chip:hover {
+  background: color-mix(in srgb, var(--nest-subtle) 60%, transparent);
+}
+
+.chip:focus-visible,
+.card:focus-within {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: 2px;
+}
+
+.cards {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-sm);
+}
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-xs);
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  border: var(--nest-border);
+  border-radius: var(--mantine-radius-md);
+  background: var(--nest-surface);
+  font-size: var(--mantine-font-size-md);
+  line-height: var(--mantine-line-height-md);
+}
+
+.cardTitle {
+  color: var(--mantine-color-text);
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.cardTitle:hover {
+  text-decoration: underline;
+}
+
+.cardTitle::after {
+  /* The whole card opens the task. */
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.cardBody {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-xs);
+}

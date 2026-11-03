@@ -5,6 +5,7 @@
 // (test/deps.test.ts).
 
 import { verifyAccessJwt } from "./access";
+import { withCsp } from "./csp";
 import { handleApi } from "./api";
 import { directory, type Env, project, review } from "./env";
 import { githubHook } from "./github-hook";
@@ -99,6 +100,9 @@ export default {
 
     if (!(await admitted(request, env))) return json({ error: "a Cloudflare Access login for this app is required" }, 403);
     if (path.startsWith("/api/")) return handleApi(request, env, url);
-    return env.ASSETS.fetch(request);
+    // `vite dev` serves its own inline module scripts (React refresh), which the policy would refuse; the
+    // built Worker always sends it (import.meta.env.DEV is false there).
+    const page = await env.ASSETS.fetch(request);
+    return import.meta.env.DEV ? page : withCsp(page, url);
   },
 } satisfies ExportedHandler<Env>;

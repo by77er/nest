@@ -8,11 +8,12 @@ import { useEffect, useRef, useState } from "react";
 import { useChat, usePostChat } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
+import { RichMessage } from "../rich/RichMessage";
 import { Bubble, ErrorState, icon, LoadingState, PinnedFooter, Prose, Row, Stack } from "../../layout";
 
 const WHO: Record<string, string> = { owner: "You", manager: "Manager", app: "The app" };
 
-function Message({ m }: { m: ChatMessage }) {
+function Message({ m, projectId }: { m: ChatMessage; projectId: string }) {
   const mine = m.sender === "owner";
   if (m.sender === "app") {
     return (
@@ -39,7 +40,8 @@ function Message({ m }: { m: ChatMessage }) {
             </Badge>
           )}
         </Row>
-        <Prose size="lg">{m.text}</Prose>
+        {/* The manager's messages render (Markdown, math, SVG, task links); the owner's stay plain text. */}
+        {m.sender === "manager" ? <RichMessage text={m.text} projectId={projectId} /> : <Prose size="lg">{m.text}</Prose>}
         {mine && m.error && (
           <Text fz="xs" c="warning">
             {m.error}
@@ -83,7 +85,7 @@ export function ChatView({ projectId }: { projectId: string }) {
       ) : (
         <Stack gap="md">
           {chat.data.map((m) => (
-            <Message key={m.seq} m={m} />
+            <Message key={m.seq} m={m} projectId={projectId} />
           ))}
         </Stack>
       )}

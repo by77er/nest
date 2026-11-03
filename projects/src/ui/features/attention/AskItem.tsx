@@ -9,6 +9,7 @@ import type { Ask } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { icon, MetaItem, MetaRow, Prose, Row, Stack, Toolbar } from "../../layout";
+import { RichMessage } from "../rich/RichMessage";
 
 /** nest's approval: `{name, tool}` of the call it held (docs/agents/tools/#taint-and-sinks). */
 function approvalOf(a: Ask): { name: string; tool: string | null } | null {
@@ -46,7 +47,7 @@ export function AskItem({ projectId, ask }: { projectId: string; ask: Ask }) {
           {approval.tool && approval.tool !== approval.name ? ` (${approval.tool})` : ""}.
         </Text>
       )}
-      {ask.question && <Prose>{ask.question}</Prose>}
+      {ask.question && (ask.role === "manager" ? <RichMessage text={ask.question} projectId={projectId} /> : <Prose>{ask.question}</Prose>)}
       {approval ? (
         <Toolbar align="start">
           <Button color="success" leftSection={<IconCheck size={icon.md} />} loading={answer.isPending && answer.variables?.answer === "approve"} disabled={answer.isPending} onClick={() => send("approve")}>
