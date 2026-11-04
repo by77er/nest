@@ -16,6 +16,10 @@ export default defineConfig({
           output: {
             codeSplitting: {
               groups: [
+                // The description editor (Tiptap, ProseMirror, its Markdown), loaded only when a task is
+                // created or edited.
+                // Its own modules only (not their dependencies, which the page's other chunks share).
+                { name: "editor", includeDependenciesRecursively: false, test: /node_modules[\\/](@tiptap[\\/]|@mantine[\\/]tiptap[\\/]|prosemirror-|marked[\\/]|linkifyjs[\\/]|orderedmap[\\/]|rope-sequence[\\/]|w3c-keyname[\\/])/ },
                 { name: "mantine", test: /node_modules[\\/]@mantine[\\/]/ },
                 { name: "react", test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ },
                 { name: "vendor", test: /node_modules[\\/]/ },

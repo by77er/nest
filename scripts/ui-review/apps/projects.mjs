@@ -90,6 +90,48 @@ async function traceCheck(page) {
   return [...new Set(problems)];
 }
 
+/**
+ * The description editor (README.md#descriptions), entered from a fresh page, the editor's code not yet
+ * loaded: what's below the description (the Spec heading) is sampled every frame from the click until the
+ * editor shows, so `editorCheck` can tell a jump through a loading placeholder from the one move into the
+ * form.
+ */
+async function enterEdit(page) {
+  const edit = page.getByRole("button", { name: "Edit the title and description" });
+  await edit.waitFor();
+  await page.evaluate(() => {
+    window.__specTops = [];
+    const t0 = performance.now();
+    const tick = () => {
+      const spec = [...document.querySelectorAll("h3")].find((h) => h.textContent === "Spec");
+      if (spec) window.__specTops.push(Math.round(spec.getBoundingClientRect().top));
+      if (performance.now() - t0 < 2500) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+  await edit.click();
+  await page.locator("[data-ds=rich-editor] [contenteditable=true]").waitFor();
+  await page.waitForTimeout(2600);
+}
+
+/**
+ * The editor's layout: entering it moves what's below the description at most once (no loading
+ * placeholder in between); its toolbar is one row on a phone (scrolling sideways), never stacked.
+ */
+async function editorCheck(page, { width }) {
+  const problems = [];
+  const tops = await page.evaluate(() => window.__specTops ?? null);
+  if (tops) {
+    const moves = tops.filter((t, i) => i > 0 && Math.abs(t - tops[i - 1]) > 1).length;
+    if (moves > 1) problems.push(`entering Edit moves the page ${moves} times (the Spec heading at ${[...new Set(tops)].join(" → ")} px)`);
+  }
+  if (width < 768) {
+    const rows = await page.evaluate(() => new Set([...document.querySelectorAll("[data-ds=rich-editor] [role=group] button")].map((b) => Math.round(b.getBoundingClientRect().top))).size);
+    if (rows > 1) problems.push(`the editor's toolbar wraps into ${rows} rows on a phone`);
+  }
+  return problems;
+}
+
 /** At 1280 px and up, the board's six columns fit beside the sidebar without scrolling. */
 async function sixColumns(page, { width }) {
   if (width < 1280) return [];
@@ -552,7 +594,42 @@ const app = {
     { name: "detach-confirm", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: async (p) => { await drawerAt("Pull requests")(p); await p.getByRole("button", { name: "Detach PR #121" }).click(); } },
     { name: "remove-dependency-confirm", section: "project", path: "/projects/prj_demo/board?task=tsk_demo4", full: false, after: async (p) => { await drawerAt("Dependencies")(p); await p.getByRole("button", { name: "Stop waiting on Cache gadget thumbnails" }).click(); } },
     { name: "task-picker-empty", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false, after: picker("Dependencies", "Add dependency", "zzz") },
-    { name: "new-task", section: "project", path: "/projects/prj_demo/board", full: false, after: (p) => p.getByRole("button", { name: "New task" }).click() },
+    { name: "new-task", section: "project", path: "/projects/prj_demo/board", full: false, check: editorCheck, checkName: "editor", after: async (p) => { await p.getByRole("button", { name: "New task" }).click(); await p.locator("[data-ds=rich-editor] [contenteditable=true]").waitFor(); } },
+    // A task's description (README.md#descriptions): edited in the rich editor, a table kept as written;
+    // typed into, with the toolbar showing what's on; the new task's editor focused.
+    { name: "drawer-edit", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: enterEdit, check: editorCheck, checkName: "editor" },
+    // Escape in the description's text, with a change: the form's own Escape, so it asks before
+    // discarding (the editor's keymap would take it; jsdom can't tell, a browser can).
+    { name: "drawer-edit-escape", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, checkName: "editor", after: async (p) => {
+      await p.getByRole("button", { name: "Edit the title and description" }).click();
+      await p.getByRole("textbox", { name: "Details" }).getByText(/^Owners filter/).click();
+      await p.keyboard.type("x");
+      await p.keyboard.press("Escape");
+      await p.getByRole("dialog", { name: "Discard changes?" }).waitFor({ timeout: 3000 }).catch(() => {});
+    }, check: async (p) => ((await p.getByRole("dialog", { name: "Discard changes?" }).count()) === 1 ? [] : ["Escape in the description's text with a change doesn't ask to discard it"]) },
+    { name: "drawer-edit-typing", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: editorCheck, checkName: "editor", after: async (p) => {
+      await p.getByRole("button", { name: "Edit the title and description" }).click();
+      // The caret at the end of the scope's last item, as a click past its text puts it.
+      const item = p.getByRole("textbox", { name: "Details" }).getByText("Suggestions in the filter bar as you type");
+      await item.click();
+      await item.evaluate((el) => {
+        const r = document.createRange();
+        r.selectNodeContents(el);
+        r.collapse(false);
+        getSelection().removeAllRanges();
+        getSelection().addRange(r);
+      });
+      await p.keyboard.press("Enter");
+      await p.getByRole("button", { name: "Bold" }).click();
+      await p.keyboard.type("Keyboard shortcuts");
+    } },
+    { name: "new-task-typing", section: "project", path: "/projects/prj_demo/board", full: false, check: editorCheck, checkName: "editor", after: async (p) => {
+      await p.getByRole("button", { name: "New task" }).click();
+      await p.getByLabel("Title").fill("Export gadgets as JSON");
+      await p.getByRole("textbox", { name: "Details" }).click();
+      await p.getByRole("button", { name: "Task list" }).click();
+      await p.keyboard.type("Same columns as the CSV");
+    } },
     { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false },
     { name: "manager-rich", section: "project", path: "/projects/prj_demo/manager", fixture: "rich" },
     { name: "manager-rich-view", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false },
