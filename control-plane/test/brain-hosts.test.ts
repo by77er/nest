@@ -7,7 +7,7 @@ import type { FleetDO } from "../src/do/fleet";
 import type { AwsCellConfig } from "../src/lib/cells";
 import { awsCell } from "../src/lib/cells";
 import { CapacityError, type Ec2, type ImageInfo, type InstanceState, type LaunchSpec } from "../src/lib/ec2";
-import { BRAINS_PER_VCPU, brainHostNeeded, idleStep, maxBrains, NO_ROOM_BACKOFF_MAX_MS, noRoomBackoffMs, pickBrainHost, scaleUpPlan, type BrainHostFacts } from "../src/lib/placement";
+import { BRAINS_PER_VCPU, brainHostNeeded, idleStep, maxBrains, NO_ROOM_BACKOFF_BRAIN_MAX_MS, NO_ROOM_BACKOFF_MAX_MS, NO_ROOM_RESET_MS, noRoomBackoffMs, pickBrainHost, scaleUpPlan, type BrainHostFacts } from "../src/lib/placement";
 import { capacityRetryMs, type AgentDO } from "../src/do/agent";
 import { NestError } from "../src/lib/util";
 import { ErrorCodes } from "../src/protocol/model";
@@ -107,11 +107,18 @@ describe("maxBrains, scaleUpPlan and idleStep (pure)", () => {
     ] });
   });
 
-  it("noRoomBackoffMs: 60 s, doubling, capped at 15 min", () => {
-    expect(noRoomBackoffMs(null)).toBe(60_000);
-    expect(noRoomBackoffMs(60_000)).toBe(120_000);
-    expect(noRoomBackoffMs(480_000)).toBe(NO_ROOM_BACKOFF_MAX_MS);
-    expect(noRoomBackoffMs(NO_ROOM_BACKOFF_MAX_MS)).toBe(NO_ROOM_BACKOFF_MAX_MS);
+  it("noRoomBackoffMs: 60 s, doubling to the cap (15 min, brains 5 min), and from 60 s again once the last lapsed long ago", () => {
+    const now = 10_000_000;
+    const lapsed = (wait_ms: number, agoMs = 0) => ({ until_ms: now - agoMs, wait_ms });
+    expect(noRoomBackoffMs(null, now)).toBe(60_000);
+    expect(noRoomBackoffMs(lapsed(60_000), now)).toBe(120_000);
+    expect(noRoomBackoffMs(lapsed(480_000), now)).toBe(NO_ROOM_BACKOFF_MAX_MS);
+    expect(noRoomBackoffMs(lapsed(NO_ROOM_BACKOFF_MAX_MS), now)).toBe(NO_ROOM_BACKOFF_MAX_MS);
+    expect(noRoomBackoffMs(lapsed(240_000), now, NO_ROOM_BACKOFF_BRAIN_MAX_MS)).toBe(NO_ROOM_BACKOFF_BRAIN_MAX_MS);
+    expect(NO_ROOM_BACKOFF_BRAIN_MAX_MS).toBeLessThan(12 * 60_000);
+    // It decays: a backoff that lapsed more than the reset window ago starts over.
+    expect(noRoomBackoffMs(lapsed(NO_ROOM_BACKOFF_MAX_MS, NO_ROOM_RESET_MS), now)).toBe(NO_ROOM_BACKOFF_MAX_MS);
+    expect(noRoomBackoffMs(lapsed(NO_ROOM_BACKOFF_MAX_MS, NO_ROOM_RESET_MS + 1), now)).toBe(60_000);
   });
 
   it("property: scaleUpPlan launches only below the cap with nothing in flight: spot types in order, then every type on demand in order, in the cell's subnets", () => {
@@ -633,6 +640,18 @@ describe("brain hosts scale with brains", () => {
     });
     await tickAt(cell, ec2);
     expect(ec2.asked).toBe(4);
+    // Brains back off at most 5 min (under the waiters' 12 min TTL): from 4 min, the next is 5, not 8.
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE kv SET value = json_object('until_ms', 0, 'wait_ms', 240000) WHERE key = 'noroom:brain'");
+      st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.until_ms', ?) WHERE key = 'noroom:brain'", Date.now());
+    });
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.until_ms', ?) WHERE key = 'noroom:brain'", Date.now() - 1);
+    });
+    await tickAt(cell, ec2);
+    const wait = await runInDurableObject(fleetStub(cell), (_i, st) =>
+      (JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'noroom:brain'").one().value) as { wait_ms: number }).wait_ms);
+    expect(wait).toBe(5 * 60_000);
   });
 
   it("while agents wait, the tick launches the next brain host itself (after an enroll timeout ended the last)", async () => {

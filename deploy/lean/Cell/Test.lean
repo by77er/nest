@@ -139,7 +139,7 @@ example : use1.allowsSandboxType "c8id.large" ∧ !use1.allowsSandboxType "c8id.
 /-- On every instance-store type, the per-host cap leaves each sandbox its share of the store:
 placement packs by memory, which on `m8id` and `r8id` would fit 2-4× `c8id`'s sandboxes on the same
 118 GB. -/
-theorem sandboxes_fit_the_instance_store : use1.sandboxesFitStore = true := by decide
+theorem sandboxes_fit_their_disk : use1.sandboxesFitStore = true := by decide
 
 /-- `AWS_CELLS` is JSON keyed by the cell, carrying the stack's template, subnets and proxy root CA
 key and the spec's instance types (the shape control-plane/src/lib/cells.ts parses). -/

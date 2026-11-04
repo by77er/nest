@@ -16,7 +16,7 @@ import {
   tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
 import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type CellAws } from "../lib/cells";
-import { brainHostNeeded, idleStep, maxBrains, noRoomBackoffMs, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
+import { brainHostNeeded, idleStep, maxBrains, NO_ROOM_BACKOFF_BRAIN_MAX_MS, NO_ROOM_BACKOFF_MAX_MS, noRoomBackoffMs, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
 import { deathPlan, expiryVerdict, hostStep, type DeathCause, type HostTransition } from "../lib/host-lifecycle";
 import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
@@ -2033,7 +2033,10 @@ export class FleetDO extends DurableObject<Env> {
     const noRoom = this.noRoom(role);
     if (noRoom && now < noRoom.until_ms) return;
     const cell = this.cellName();
+    // A spent spot quota skips the rest of spot; a spent on-demand quota ends the pass.
+    let spotQuota = false;
     for (const [i, a] of plan.launch.entries()) {
+      if (a.spot && spotQuota) continue;
       const intent = { token: `${cell ?? "cell"}-${role}-${now}-${i}`, type: a.type, subnet: a.subnet, spot: a.spot, at: now };
       const r = await this.launchAttempt(ec2, cfg, s.launch_template_id, role, intent);
       if (r === "launched") {
@@ -2042,9 +2045,10 @@ export class FleetDO extends DurableObject<Env> {
       }
       // Kept to repeat (the tick does): no later type until EC2 answers it.
       if (r === "failed") return;
-      if (r === "quota") break;
+      if (r === "quota" && a.spot) spotQuota = true;
+      else if (r === "quota") break;
     }
-    const wait = noRoomBackoffMs(noRoom?.wait_ms ?? null);
+    const wait = noRoomBackoffMs(noRoom, now, role === BRAIN_ROLE ? NO_ROOM_BACKOFF_BRAIN_MAX_MS : NO_ROOM_BACKOFF_MAX_MS);
     this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", noRoomKey(role), JSON.stringify({ until_ms: now + wait, wait_ms: wait }));
     console.warn(`FleetDO: no room for a ${role} host anywhere; the next launch pass waits ${wait / 1000} s`);
   }

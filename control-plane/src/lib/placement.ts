@@ -151,13 +151,21 @@ export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, now
   };
 }
 
-/** The first wait after a pass where nothing had room, and its cap. */
+/** The first wait after a pass where nothing had room; the cap for sandbox hosts and for brain hosts. */
 export const NO_ROOM_BACKOFF_FIRST_MS = 60_000;
 export const NO_ROOM_BACKOFF_MAX_MS = 15 * 60_000;
+/** Brain hosts: under FleetDO's brain-waiter TTL (12 min), so a waiting brain sees a pass before it lapses. */
+export const NO_ROOM_BACKOFF_BRAIN_MAX_MS = 5 * 60_000;
+/** A backoff that lapsed this long ago is forgotten: the next pass with no room waits the first again. */
+export const NO_ROOM_RESET_MS = 30 * 60_000;
 
-/** The wait after another pass with no room: the first, then doubling to the cap. */
-export function noRoomBackoffMs(previousMs: number | null): number {
-  return previousMs === null ? NO_ROOM_BACKOFF_FIRST_MS : Math.min(NO_ROOM_BACKOFF_MAX_MS, previousMs * 2);
+/**
+ * The wait after a pass with no room: the first, then doubling to `maxMs`, from the previous backoff
+ * (`{until_ms, wait_ms}`), which counts only if it lapsed within `NO_ROOM_RESET_MS` of `nowMs`.
+ */
+export function noRoomBackoffMs(previous: { until_ms: number; wait_ms: number } | null, nowMs: number, maxMs = NO_ROOM_BACKOFF_MAX_MS): number {
+  if (!previous || nowMs - previous.until_ms > NO_ROOM_RESET_MS) return Math.min(NO_ROOM_BACKOFF_FIRST_MS, maxMs);
+  return Math.min(maxMs, previous.wait_ms * 2);
 }
 
 /** `busy` clears the clock, `start` starts it, `retire`: idle for the whole grace. */

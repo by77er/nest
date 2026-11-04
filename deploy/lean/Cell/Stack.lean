@@ -79,12 +79,16 @@ structure CellSpec where
   enrollTimeoutMs : Nat := 600000
   /-- What a sandbox on regular pages is expected to use, reserved until the host counts it. -/
   sandboxReserveMib : Nat := 768
+  /-- The sandbox hosts' root volume, GB (gp3). An EBS-only host, or one whose bootstrap fell back
+  from its instance store, keeps every sandbox's state there, so it must hold `maxSandboxesPerHost`
+  sandboxes besides the OS, the base images and the chunk cache (`sandboxes_fit_their_disk`). -/
+  hostRootGb : Nat := 30
   /-- On-demand prices in the cell's region, micro-USD an hour (Linux, AWS's Price List API), for
   every type it may launch: FleetDO tries on demand cheapest first (`CellSpec.onDemandTypes`). -/
   onDemandPrices : List (String × Nat) := []
   /-- At most this many sandboxes per host on regular pages; 0 is no cap. Placement packs by
   memory, so on a type with more memory per GB of instance store this is what keeps the store from
-  filling (`sandboxes_fit_the_instance_store`). -/
+  filling (`sandboxes_fit_their_disk`). -/
   maxSandboxesPerHost : Nat := 0
   /-- Brain hosts (docs/compute/brain-hosts/): the instance families the control plane may launch
   from the brain template (IAM allows `<family>*.*`). Cheap x86 types, since both kinds boot the
@@ -197,10 +201,17 @@ def CellSpec.launchTypesSound (spec : CellSpec) : Bool :=
     && spec.launchTypes.all (fun t => firecrackerFamilies.any (·.toList == familyOf t))
     && (spec.launchTypes.dropWhile hasInstanceStore).all (fun t => !hasInstanceStore t)
 
-/-- On every instance-store type, the per-host sandbox cap leaves each sandbox its budget of the store. -/
+/-- What a sandbox host's root volume holds besides sandboxes, GB: the OS and nest's install, the
+base images (compressed and unpacked) and the store's local chunk cache (an assumption, unmeasured). -/
+def hostRootReserveGb : Nat := 24
+
+/-- Every host's sandbox state fits its disk at the per-host cap: an instance-store type's on its
+store, and every host's on its root volume, since an EBS-only type keeps it there and an
+instance-store host whose bootstrap fell back from its store does too. -/
 def CellSpec.sandboxesFitStore (spec : CellSpec) : Bool :=
   spec.maxSandboxesPerHost > 0
     && (spec.launchTypes.filter hasInstanceStore).all (fun t => spec.maxSandboxesPerHost * sandboxStoreBudgetGb ≤ instanceStoreGb t)
+    && spec.maxSandboxesPerHost * sandboxStoreBudgetGb + hostRootReserveGb ≤ spec.hostRootGb
 
 /-- Every type the autoscaler may pick is one IAM lets it launch. -/
 def CellSpec.launchTypesAllowed (spec : CellSpec) : Bool :=
@@ -549,7 +560,7 @@ def cell (spec : CellSpec) : Infra Unit := do
                                 instanceMetadataTags := "disabled" }
       instanceInitiatedShutdownBehavior := "terminate"
       blockDeviceMappings := [{ deviceName := "/dev/xvda"
-                                ebs := some { volumeSize := 30, volumeType := "gp3", encrypted := "true", deleteOnTermination := "true" } }]
+                                ebs := some { volumeSize := spec.hostRootGb, volumeType := "gp3", encrypted := "true", deleteOnTermination := "true" } }]
       tagSpecifications := [{ resourceType := "instance", tags := some (nestTags spec) },
                             { resourceType := "volume", tags := some (nestTags spec) }]
       -- Gzipped: EC2 allows 16 KB of user data before base64, and the script with install.sh inside is

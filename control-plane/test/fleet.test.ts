@@ -475,8 +475,9 @@ describe("autoscaling", () => {
   /** The kind's no-room backoff as FleetDO keeps it, and a way to let it lapse. */
   const noRoom = (cell: string) => runInDurableObject(fleetStub(cell), (_i, st) =>
     st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'noroom:sandbox'").toArray().map((r) => JSON.parse(r.value) as { until_ms: number; wait_ms: number })[0] ?? null);
+  /** The backoff lapses just now (not long ago: that would reset it). */
   const lapse = (cell: string) => runInDurableObject(fleetStub(cell), (_i, st) => {
-    st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.until_ms', 0) WHERE key = 'noroom:sandbox'");
+    st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.until_ms', ?) WHERE key = 'noroom:sandbox'", Date.now() - 1);
   });
 
   it("with no capacity anywhere, one pass tries each type once each way, then the kind backs off, 60 s doubling", async () => {
@@ -521,18 +522,41 @@ describe("autoscaling", () => {
     expect(ec2.launched).toEqual([expect.objectContaining({ instanceType: "c8i-flex.large", spot: false })]);
   });
 
-  it("a spent vCPU quota ends the pass at once and backs off: no other type is tried, and nothing is kept to repeat", async () => {
+  it("a spent quota on spot skips to on demand; one on demand ends the pass and backs off, keeping nothing to repeat", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("running");
     ec2.quota.add("c8i-flex.large/spot");
     await autoscaled(cell, ec2);
     await createSandbox(cell, 202);
-    expect(ec2.asked).toEqual(["c8i-flex.large/spot"]);
-    expect((await noRoom(cell))!.wait_ms).toBe(60_000);
-    const kept = await runInDurableObject(fleetStub(cell), (_i, st) => st.storage.sql.exec("SELECT 1 FROM kv WHERE key LIKE 'launch:%'").toArray().length);
+    // No other spot type after a spot quota; on demand launches.
+    expect(ec2.asked).toEqual(["c8i-flex.large/spot", "c8i-flex.large/od"]);
+    expect(ec2.launched).toEqual([expect.objectContaining({ instanceType: "c8i-flex.large", spot: false })]);
+
+    const cell2 = uniqueCell();
+    const ec2b = new MockEc2("running");
+    for (const t of config.instance_types) ec2b.noCapacity.add(`${t}/spot`);
+    ec2b.quota.add("c8i-flex.large/od");
+    await autoscaled(cell2, ec2b);
+    await createSandbox(cell2, 202);
+    expect(ec2b.asked).toEqual(["c8i-flex.large/spot", "c8i.large/spot", "c8i-flex.large/od"]);
+    expect((await noRoom(cell2))!.wait_ms).toBe(60_000);
+    const kept = await runInDurableObject(fleetStub(cell2), (_i, st) => st.storage.sql.exec("SELECT 1 FROM kv WHERE key LIKE 'launch:%'").toArray().length);
     expect(kept).toBe(0);
-    await tickAt(cell, ec2);
-    expect(ec2.asked).toHaveLength(1);
+    await tickAt(cell2, ec2b);
+    expect(ec2b.asked).toHaveLength(3);
+  });
+
+  it("the backoff decays: once the last lapsed more than the reset window ago, a pass with no room waits 60 s again", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running");
+    for (const t of config.instance_types) for (const w of ["spot", "od"]) ec2.noCapacity.add(`${t}/${w}`);
+    await autoscaled(cell, ec2);
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES ('noroom:sandbox', ?)", JSON.stringify({ until_ms: Date.now() - 31 * 60_000, wait_ms: 900_000 }));
+    });
+    await createSandbox(cell, 202);
+    expect(ec2.asked).toHaveLength(4);
+    expect((await noRoom(cell))!.wait_ms).toBe(60_000);
   });
 
   it("an error that isn't EC2 having no room ends the pass: no type after it is tried, and the attempt is kept to repeat", async () => {

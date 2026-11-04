@@ -23,9 +23,9 @@ export interface LaunchSpec {
 export class CapacityError extends Error {}
 
 /**
- * The account's on-demand vCPU or instance quota is spent: no other type or zone will do better until
- * a host goes, so a launch pass ends here. (A spot quota, `MaxSpotInstanceCountExceeded`, leaves on
- * demand to try: it stays a plain `CapacityError`.)
+ * A vCPU or instance quota is spent: no other type or zone in that market will do better until a host
+ * goes. On spot, a launch pass skips to on demand; on demand, it ends. (`MaxSpotInstanceCountExceeded`
+ * stays a plain `CapacityError`: the pass goes on.)
  */
 export class QuotaError extends CapacityError {}
 

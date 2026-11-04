@@ -17,8 +17,12 @@ def use1 : CellSpec :=
     instanceFamilies := ["c8id", "m8id", "r8id", "c8i-flex", "c8i", "m8i"]
     launchTypes := ["c8id.large", "m8id.large", "r8id.large", "c8i-flex.large", "c8i.large", "m8i.large"]
     -- 14 × 8 GB fits the 118 GB store of every listed instance-store type
-    -- (`sandboxes_fit_the_instance_store`); a c8i-flex.large held 14 by memory in the stress test.
+    -- (`sandboxes_fit_their_disk`); a c8i-flex.large held 14 by memory in the stress test.
     maxSandboxesPerHost := 14
+    -- 14 × 8 GB + 24 GB for the OS, images and cache: an EBS-only host (the on-demand fallback's
+    -- cheapest types) or one whose store couldn't be used holds its sandboxes on the root volume.
+    -- gp3 at $0.08/GB-month: +$8.80 a month per always-on host over the old 30 GB.
+    hostRootGb := 140
     -- us-east-1 Linux on demand, micro-USD an hour (Price List API `get-products`, 2026-11-03 and
     -- -04): FleetDO tries on demand cheapest first.
     onDemandPrices := [("c8i-flex.large", 89020), ("c8i.large", 93710), ("m8i.large", 105840), ("c8id.large", 110880),
