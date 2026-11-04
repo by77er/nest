@@ -51,6 +51,32 @@ describe("the Reviews page", () => {
     await waitFor(() => expect(RecordingSocket.opened.map((u) => new URL(u).pathname)).toEqual(["/api/agents/agt_rev3/trace", "/api/agents/agt_rev2/trace"]));
   });
 
+  it("on a phone, a card per review, newest first, top to bottom: its PR, state, verdicts, when and its trace", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(max-width: 48em)", media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => false }));
+    RecordingSocket.opened = [];
+    vi.stubGlobal("WebSocket", RecordingSocket);
+    const api = new FakeApi();
+    api.reviews = [job(1, { state: "done", verdict: verdict("fail"), runs: 2, tainted: true }), job(3, { state: "running", agent: "agt_rev3" })];
+    const { user } = renderApp("/projects/prj_one/reviews", api);
+    const list = await screen.findByRole("list", { name: "Review jobs" });
+    expect(screen.queryByRole("table")).toBeNull();
+    const cards = within(list).getAllByRole("listitem");
+    expect(cards.map((c) => within(c).getAllByRole("link")[0]!.textContent)).toEqual(["#3 PR 3", "#1 PR 1"]);
+    const done = cards[1]!;
+    // Everything the table's row has, in one column: the sha, the verdicts, the runs and when.
+    expect(done).toHaveTextContent("1000000 → main");
+    expect(within(done).getByLabelText("Quality: failed")).toBeInTheDocument();
+    expect(done).toHaveTextContent("2 runs");
+    // Tainted sits on its state row, beside the state, not after the verdicts.
+    const stateRow = within(done).getByText("Tainted").parentElement!.parentElement!;
+    expect(stateRow).toHaveTextContent(/Changes needed\s*Tainted/);
+    expect(within(cards[0]!).getByRole("button", { name: "Show the trace of #3" })).toHaveTextContent("Show trace");
+    // Its trace opens under it.
+    await user.click(within(cards[0]!).getByRole("button", { name: "Show the trace of #3" }));
+    await waitFor(() => expect(cards[0]!.querySelector("[data-trace]")).not.toBeNull());
+    await waitFor(() => expect(RecordingSocket.opened.map((u) => new URL(u).pathname)).toEqual(["/api/agents/agt_rev3/trace"]));
+  });
+
   it("says when there are none yet", async () => {
     renderApp("/projects/prj_one/reviews");
     expect(await screen.findByText("No reviews yet")).toBeInTheDocument();
