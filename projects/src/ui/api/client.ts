@@ -9,7 +9,8 @@ import type {
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
 export class ApiError extends Error {
-  constructor(readonly status: number, message: string) {
+  /** `body`: the answer's JSON, when it had any (a refusal's `problems`, say). */
+  constructor(readonly status: number, message: string, readonly body?: unknown) {
     super(message);
     this.name = "ApiError";
   }
@@ -37,7 +38,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   }
   if (!res.ok) {
     const error = typeof data === "object" && data !== null && typeof (data as { error?: unknown }).error === "string" ? (data as { error: string }).error : null;
-    throw new ApiError(res.status, error ?? `${res.status} ${res.statusText}`.trim());
+    throw new ApiError(res.status, error ?? `${res.status} ${res.statusText}`.trim(), data);
   }
   return data as T;
 }

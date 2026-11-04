@@ -86,6 +86,12 @@ async function traceCheck(page) {
   return [...new Set(problems)];
 }
 
+/** The manager's waits (README.md#waiting) read as words: no raw task id, no snake_case state. */
+async function waitsCheck(page) {
+  const texts = await page.evaluate(() => [...document.querySelectorAll("[data-slot=waits], [data-slot=recent-waits]")].map((el) => el.textContent ?? ""));
+  return texts.flatMap((t) => (/tsk_[a-z0-9]|\b[a-z]+_[a-z]+\b/.test(t) ? [`the manager's waits show a raw id or state: ${t.slice(0, 120)}`] : []));
+}
+
 /** At 1280 px and up, the board's six columns fit beside the sidebar without scrolling. */
 async function sixColumns(page, { width }) {
   if (width < 1280) return [];
@@ -443,7 +449,7 @@ const app = {
     { name: "remove-dependency-confirm", section: "project", path: "/projects/prj_demo/board?task=tsk_demo4", full: false, after: async (p) => { await drawerAt("Dependencies")(p); await p.getByRole("button", { name: "Stop waiting on Cache gadget thumbnails" }).click(); } },
     { name: "task-picker-empty", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false, after: picker("Dependencies", "Add dependency", "zzz") },
     { name: "new-task", section: "project", path: "/projects/prj_demo/board", full: false, after: (p) => p.getByRole("button", { name: "New task" }).click() },
-    { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false },
+    { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false, check: waitsCheck, checkName: "waits" },
     { name: "manager-rich", section: "project", path: "/projects/prj_demo/manager", fixture: "rich" },
     { name: "manager-rich-view", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false },
     { name: "manager-empty", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false },
@@ -481,6 +487,29 @@ const app = {
       await role.getByRole("button", { name: "Add" }).click();
       await role.getByRole("alert").waitFor();
       await role.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    } },
+    // Removing a host by keyboard leaves focus on a Remove button (the next row's), never <body>.
+    { name: "network-remove-keyboard", section: "project", path: "/projects/prj_demo/network", full: false, checkName: "network", after: async (p) => {
+      await p.locator("[data-role=worker]").getByRole("button", { name: /^Remove / }).first().focus();
+      await p.keyboard.press("Enter");
+      await p.waitForTimeout(200);
+    }, check: async (p) => {
+      const at = await p.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? document.activeElement?.tagName);
+      return /^Remove /.test(at ?? "") ? [] : [`after removing a host by keyboard, focus is on ${at}, not the next Remove`];
+    } },
+    // A refused save: the reason under Save and the named host's row in the danger shade, no toast.
+    { name: "network-save-refused", section: "project", path: "/projects/prj_demo/network", fixture: "network-save-refused", httpErrors: true, full: false, checkName: "network", after: async (p) => {
+      await p.locator("[data-role=worker]").getByRole("button", { name: "Remove nodejs.org" }).click();
+      await p.getByRole("button", { name: "Save" }).click();
+      await p.locator("[data-slot=save-error]").waitFor({ timeout: 3000 }).catch(() => {});
+      await p.locator("[data-slot=save-error]").evaluate((el) => el.scrollIntoView({ block: "center" })).catch(() => {});
+    }, check: async (p) => {
+      const r = await p.evaluate(() => ({
+        error: !!document.querySelector("[data-slot=save-error]")?.textContent?.includes("isn't in this app's grant"),
+        row: !!document.querySelector('[data-host="downloads.gadgets.example.com"][data-problem="true"]'),
+        toast: !!document.querySelector(".mantine-Notification-root"),
+      }));
+      return [...(r.error ? [] : ["a refused save shows no reason under Save"]), ...(r.row ? [] : ["a refused save doesn't mark the host it names"]), ...(r.toast ? ["a refused save shows a toast"] : [])];
     } },
     { name: "settings", section: "project", path: "/projects/prj_demo/settings" },
     { name: "switcher-open", section: "project", path: "/projects/prj_demo/reviews", full: false, widths: DESKTOP, after: async (p) => { await p.getByRole("button", { name: /Switch project/ }).click(); await p.keyboard.type("gad"); } },

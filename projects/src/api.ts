@@ -6,7 +6,7 @@ import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { NestError, nestFrom } from "./nest";
-import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, rulesProblems } from "./network";
+import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSIDE, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
 import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Network, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
@@ -208,9 +208,19 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       if (!b.ok) return b.res;
       const g = await egressHostsOf(env);
       if (!g.ok) return err(g.status, g.error);
-      const problems = Object.fromEntries(NETWORK_ROLES.flatMap((role) => Object.entries(rulesProblems(normalizeRules(b.value[role]), g.value)).map(([k, v]) => [`${role}.${k}`, v])));
+      // A host already in a role's rules may stay though the operator has since narrowed the grant: it's
+      // kept, shown "outside the grant", and not applied. So a save that only removes (or keeps) rules
+      // always goes through; only a host newly added outside the grant is refused.
+      const stored = await p.network();
+      if (!stored.ok) return err(stored.status, stored.error);
+      const problems = Object.fromEntries(NETWORK_ROLES.flatMap((role) => {
+        const had = new Set(stored.value.rules[role].map((r) => r.host));
+        return Object.entries(rulesProblems(normalizeRules(b.value[role]), g.value))
+          .filter(([host, v]) => !(v.endsWith(OUTSIDE) && had.has(host)))
+          .map(([k, v]) => [`${role}.${k}`, v]);
+      }));
       if (Object.keys(problems).length) {
-        const outside = Object.values(problems).some((v) => v.includes("must widen"));
+        const outside = Object.values(problems).some((v) => v.endsWith(OUTSIDE));
         return json({ error: Object.values(problems).join("; "), problems }, outside ? 403 : 400);
       }
       const r = await p.setNetwork(b.value);

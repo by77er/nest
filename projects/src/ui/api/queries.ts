@@ -73,7 +73,8 @@ export function useSetNetwork(id: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (b: NetworkBody) => api.setNetwork(id, b),
-    meta: { failure: "The network rules weren't saved" },
+    // The page says why under Save, and marks the hosts it names: no notification.
+    meta: { inline: true },
     onSuccess: (v) => qc.setQueryData(["projects", id, "network"], v),
   });
 }

@@ -189,7 +189,11 @@ export function data(variant = "demo", now = Date.now()) {
       { id: "aw_q7d3n5", kind: "task", target: "tsk_demo4", want: ["in_review", "done"], created_ms: now - 300_000, deadline_ms: now + 45 * 60_000, resolved_ms: null, outcome: null, detail: null },
       { id: "aw_r1c9v6", kind: "reply", target: null, want: null, created_ms: now - 120_000, deadline_ms: now + 26 * 3_600_000, resolved_ms: null, outcome: null, detail: null },
     ],
-    recent: [],
+    // Lately resolved: a PR met, the owner's reply timed out (the warning tone).
+    recent: variant === "no-waits" ? [] : [
+      { id: "aw_p4h2z8", kind: "pr", target: "119", want: "merged", created_ms: now - 3_600_000, deadline_ms: now + 3_600_000, resolved_ms: now - 3 * 60_000, outcome: "met", detail: "merged" },
+      { id: "aw_t6w1b3", kind: "reply", target: null, want: null, created_ms: now - 7_200_000, deadline_ms: now - 10 * 60_000, resolved_ms: now - 10 * 60_000, outcome: "timed_out", detail: "timed out" },
+    ],
   };
   const network = {
     rules: variant === "network-empty" ? { worker: [], manager: [] } : {
@@ -219,6 +223,11 @@ export function data(variant = "demo", now = Date.now()) {
     if (path === "/admin/sync" && method === "POST") return [200, { written: sync.written.slice(0, 2), repos: ["by77er/gadgets"] }];
     if (!path.startsWith("/projects/prj_demo")) return [404, { error: "unknown project" }];
     const q = path.slice("/projects/prj_demo".length);
+    // A save the API refuses (README.md#network): a host newly added outside the grant, named.
+    if (variant === "network-save-refused" && method === "PUT" && q === "/network") {
+      const why = "downloads.gadgets.example.com isn't in this app's grant; the operator must add it";
+      return [403, { error: why, problems: { "worker.downloads.gadgets.example.com": why } }];
+    }
     const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
     if (q in routes) return [200, routes[q]];
     // A task's detail: each task's own, with its history (tsk_demo3 has no worker).

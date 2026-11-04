@@ -47,6 +47,8 @@ export class FakeApi {
   sync: SyncState | null = null;
   reviews: Job[] = [];
   waits: Waits = { pending: [], recent: [] };
+  /** `PUT network`'s answer instead of saving: a refusal (403 with `problems`, say). */
+  networkRefusal: { status: number; body: unknown } | null = null;
   network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }] };
   openPrs: OpenPr[] = [];
   manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
@@ -132,6 +134,7 @@ export class FakeApi {
       case "GET network":
         return json(this.network);
       case "PUT network":
+        if (this.networkRefusal) return json(this.networkRefusal.body, this.networkRefusal.status);
         this.network = { ...this.network, rules: body, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
         return json(this.network);
       case "GET reviews":

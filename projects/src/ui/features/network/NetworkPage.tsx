@@ -1,30 +1,31 @@
 // A project's network (README.md#network): per role, the hosts its agents' sandboxes may reach on top
 // of the operator's policy, from presets or typed in, each checked against the grant's egress_hosts as
-// it's added (outside it: the operator must widen the grant). Saved, the rules reach new agents at their
+// it's added (outside it: the operator must add it). Saved, the rules reach new agents at their
 // sandbox's create and live ones through their sandbox's client layer, each shown applied, pending or
 // failed. The operator's base rules are shown read-only.
+//
+// A host the operator has since taken out of the grant stays in the rules, marked "outside the grant"
+// and not applied, so the owner can still save other changes. A rule nest's defaults already cover says
+// so. Removing a host by keyboard leaves focus on the next row's Remove (or the Add select). A refused
+// save says why under Save, the named host's row in the danger shade.
 
-import { ActionIcon, Badge, Button, Select, Text, TextInput } from "@mantine/core";
+import { ActionIcon, Anchor, Button, Select, Text, TextInput, useMantineTheme } from "@mantine/core";
 import { IconPlus, IconWorld, IconX } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
-import { useEffect, useMemo, useState } from "react";
-import { NETWORK_PRESETS, NETWORK_ROLES, type NetworkRole, normalizeRules, type OperatorRule, rulesProblems } from "../../../network";
+import { useMediaQuery } from "@mantine/hooks";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { hostAllowed, NETWORK_PRESETS, NETWORK_ROLES, type NetworkRole, normalizeRules, type OperatorRule, OUTSIDE, rulesProblems } from "../../../network";
+import { ApiError } from "../../api/client";
 import { useNetwork, useSetNetwork } from "../../api/queries";
 import type { EgressRule, LayerStatus, NetworkView, RoleRules } from "../../api/types";
-import { ago, exact } from "../../common/time";
 import { ErrorState, icon, LoadingState, Measure, MetaItem, MetaRow, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
+import { LiveAgents } from "../project/LiveAgents";
 import { ProjectFrame } from "../project/ProjectFrame";
 
 const ROLE: Record<NetworkRole, { title: string; description: string }> = {
   worker: { title: "Workers", description: "Every task's worker: what it installs and downloads while it builds and tests." },
   manager: { title: "Manager", description: "The project's manager, which reads the repo and specs tasks." },
 };
-const STATE: Record<LayerStatus["state"], { label: string; color: "success" | "warning" | "danger" }> = {
-  applied: { label: "Applied", color: "success" },
-  pending: { label: "Pending", color: "warning" },
-  failed: { label: "Failed", color: "danger" },
-};
-
 const portsText = (r: EgressRule) => (r.ports ? `ports ${r.ports.join(", ")}` : "ports 80, 443");
 
 /** "443, 8443" as ports, or the reason it isn't. Empty: the web ports. */
@@ -37,12 +38,43 @@ function parsePorts(s: string): { ok: true; ports?: number[] } | { ok: false; er
   return { ok: true, ports };
 }
 
-function RoleRulesEditor({ role, rules, egressHosts, onChange }: { role: NetworkRole; rules: EgressRule[]; egressHosts: string[] | null; onChange: (r: EgressRule[]) => void }) {
+/** Whether nest's defaults (or the operator's rules) already let a rule's host through on its ports. */
+function coveredBy(r: EgressRule, base: OperatorRule[] | null): boolean {
+  const ports = r.ports ?? [80, 443];
+  return !!base?.some((b) => hostAllowed(r.host, [b.host]) && ports.every((p) => b.ports.includes(p)));
+}
+
+function RoleRulesEditor({ role, rules, stored, egressHosts, base, refused, onChange }: {
+  role: NetworkRole; rules: EgressRule[];
+  /** The role's rules as saved: a host among them that's since gone from the grant is kept, not refused. */
+  stored: EgressRule[];
+  egressHosts: string[] | null; base: OperatorRule[] | null;
+  /** The last save's refusals, by host. */
+  refused: Record<string, string>;
+  onChange: (r: EgressRule[]) => void;
+}) {
   const [preset, setPreset] = useState<string | null>(null);
   const [host, setHost] = useState("");
   const [ports, setPorts] = useState("");
   const [error, setError] = useState<string | null>(null);
   const problems = rulesProblems(rules, egressHosts);
+  const kept = new Set(stored.map((r) => r.host));
+  // Host, Ports and Add on one row from `sm` up.
+  const wide = useMediaQuery(`(min-width: ${useMantineTheme().breakpoints.sm})`);
+  // Focus after a Remove: the next row's Remove, else the previous one's, else the Add select.
+  const removeButtons = useRef(new Map<string, HTMLButtonElement>());
+  const addSelect = useRef<HTMLInputElement>(null);
+  const [focusAfter, setFocusAfter] = useState<{ host: string | null } | null>(null);
+  useEffect(() => {
+    if (!focusAfter) return;
+    (focusAfter.host ? removeButtons.current.get(focusAfter.host) : addSelect.current)?.focus();
+    setFocusAfter(null);
+  }, [focusAfter]);
+  const remove = (i: number) => {
+    const next = rules.filter((_, k) => k !== i);
+    onChange(next);
+    setFocusAfter({ host: (next[i] ?? next[i - 1])?.host ?? null });
+  };
   const add = (next: EgressRule[]) => {
     const have = new Set(rules.map((r) => r.host));
     const fresh = normalizeRules(next).filter((r) => !have.has(r.host));
@@ -82,25 +114,45 @@ function RoleRulesEditor({ role, rules, egressHosts, onChange }: { role: Network
             </Text>
           ) : (
             <Stack gap="xs" role="list" aria-label={`${ROLE[role].title}' hosts`} data-slot="rules">
-              {rules.map((r) => (
-                <Row key={r.host} role="listitem" justify="space-between" wrap="nowrap" data-host={r.host}>
-                  <Stack gap="2xs">
-                    <Text fz="sm" ff="monospace">
-                      {r.host}
-                    </Text>
-                    <Text fz="xs" c={problems[r.host] ? "danger" : "dimmed"}>
-                      {problems[r.host] ?? portsText(r)}
-                    </Text>
-                  </Stack>
-                  <ActionIcon variant="subtle" color="gray" aria-label={`Remove ${r.host}`} onClick={() => onChange(rules.filter((x) => x.host !== r.host))}>
-                    <IconX size={icon.md} />
-                  </ActionIcon>
-                </Row>
-              ))}
+              {rules.map((r, i) => {
+                const why = refused[r.host] ?? problems[r.host];
+                // Saved before the operator narrowed the grant: kept, not applied (not an error to fix first).
+                const revoked = !refused[r.host] && why?.endsWith(OUTSIDE) && kept.has(r.host);
+                const note = revoked
+                  ? "Outside the grant now: kept, not applied until the operator adds it again"
+                  : why ?? (coveredBy(r, base) ? `${portsText(r)} · already allowed by the operator's policy` : portsText(r));
+                return (
+                  <Row key={r.host} role="listitem" justify="space-between" wrap="nowrap" data-host={r.host} data-problem={why && !revoked ? "true" : undefined}>
+                    <Stack gap="2xs">
+                      <Text fz="sm" ff="monospace" c={why && !revoked ? "danger" : undefined}>
+                        {r.host}
+                      </Text>
+                      <Text fz="xs" c={why && !revoked ? "danger" : revoked ? "warning" : "dimmed"}>
+                        {note}
+                      </Text>
+                    </Stack>
+                    <ActionIcon
+                      variant="subtle"
+                      color="gray"
+                      aria-label={`Remove ${r.host}`}
+                      ref={(el) => {
+                        if (el) removeButtons.current.set(r.host, el);
+                        else removeButtons.current.delete(r.host);
+                      }}
+                      onClick={() => remove(i)}
+                    >
+                      <IconX size={icon.md} />
+                    </ActionIcon>
+                  </Row>
+                );
+              })}
             </Stack>
           )}
-          <Row gap="sm" align="flex-end">
+          {/* The picker on its row (with Add, for a preset); a custom host's Host, Ports and Add on one row
+              from `sm` up. */}
+          <Row gap="sm" align="flex-end" wrap="nowrap">
             <Select
+              ref={addSelect}
               label="Add hosts"
               placeholder="A preset, or custom"
               data={[...NETWORK_PRESETS.map((p) => ({ value: p.value, label: `${p.label} (${p.hosts.join(", ")})` })), { value: "custom", label: "Custom host" }]}
@@ -111,17 +163,23 @@ function RoleRulesEditor({ role, rules, egressHosts, onChange }: { role: Network
               }}
               allowDeselect
               comboboxProps={{ withinPortal: true }}
+              flex={1}
             />
-            {custom && (
-              <>
-                <TextInput label="Host" placeholder="downloads.example.com" value={host} onChange={(e) => setHost(e.currentTarget.value)} />
-                <TextInput label="Ports" description="Blank: 80 and 443" placeholder="443" value={ports} onChange={(e) => setPorts(e.currentTarget.value)} />
-              </>
+            {!custom && (
+              <Button variant="default" leftSection={<IconPlus size={icon.sm} />} disabled={!preset || (custom && !host.trim())} onClick={addPicked}>
+                Add
+              </Button>
             )}
-            <Button variant="default" leftSection={<IconPlus size={icon.sm} />} disabled={!preset || (custom && !host.trim())} onClick={addPicked}>
-              Add
-            </Button>
           </Row>
+          {custom && (
+            <Row gap="sm" align="flex-end" wrap={wide ? "nowrap" : "wrap"}>
+              <TextInput label="Host" placeholder="downloads.example.com" value={host} onChange={(e) => setHost(e.currentTarget.value)} flex={1} />
+              <TextInput label="Ports" description="Blank: 80 and 443" placeholder="443" value={ports} onChange={(e) => setPorts(e.currentTarget.value)} />
+              <Button variant="default" leftSection={<IconPlus size={icon.sm} />} disabled={!preset || (custom && !host.trim())} onClick={addPicked}>
+                Add
+              </Button>
+            </Row>
+          )}
           {error && (
             <Text fz="xs" c="danger" role="alert" data-slot="add-error">
               {error}
@@ -133,39 +191,50 @@ function RoleRulesEditor({ role, rules, egressHosts, onChange }: { role: Network
   );
 }
 
-function LiveAgents({ agents }: { agents: LayerStatus[] }) {
-  if (agents.length === 0) {
-    return (
-      <Text fz="sm" c="dimmed">
-        No live agents. New ones get these rules when their sandbox is made.
-      </Text>
-    );
-  }
+/**
+ * After a failed layer's error, a way to the rule it names: the host's row in its role's list, focused
+ * (its Remove), where it can be fixed.
+ */
+function RuleLink({ error, rules }: { error: string | null; rules: RoleRules }) {
+  const host = error ? NETWORK_ROLES.flatMap((role) => rules[role].map((r) => r.host)).find((h) => error.includes(h)) : undefined;
+  if (!host) return null;
   return (
-    <Stack gap="md" role="list" aria-label="Live agents' network">
-      {agents.map((a) => (
-          <Row key={a.agent} role="listitem" justify="space-between" align="flex-start" wrap="nowrap" data-agent={a.agent}>
-            <Stack gap="2xs">
-              <Text fz="sm" ff="monospace">
-                {a.agent}
-              </Text>
-              <Text fz="xs" c="dimmed" title={a.at_ms ? exact(a.at_ms) : undefined}>
-                {a.role === "worker" ? "Worker" : "Manager"}
-                {a.at_ms ? ` · updated ${ago(a.at_ms)}` : ""}
-              </Text>
-              {a.error && (
-                <Text fz="xs" c={a.state === "failed" ? "danger" : "dimmed"}>
-                  {a.error}
-                </Text>
-              )}
-            </Stack>
-            <Badge variant="light" color={STATE[a.state].color} data-slot="state">
-              {STATE[a.state].label}
-            </Badge>
-          </Row>
-      ))}
-    </Stack>
+    <>
+      {" "}
+      <Anchor
+        component="button"
+        type="button"
+        inherit
+        data-inline
+        onClick={() => {
+          const row = document.querySelector<HTMLElement>(`[data-host="${CSS.escape(host)}"]`);
+          row?.scrollIntoView({ block: "center" });
+          row?.querySelector<HTMLButtonElement>("button")?.focus();
+        }}
+      >
+        Go to its rule
+      </Anchor>
+    </>
   );
+}
+
+/** What nest's defaults and the operator let every sandbox reach, in a line. */
+function defaultsSummary(base: OperatorRule[]): string {
+  const n = new Set(base.map((b) => b.host)).size;
+  const named = [...new Set(base.filter((b) => b.source === "base").map((b) => b.host))].slice(0, 3);
+  return n === 0 ? "Nothing is allowed by default" : `Allowed by default: ${named.join(", ")}${n > named.length ? ` and ${n - named.length} more` : ""} (the operator's policy, below)`;
+}
+
+/** A refused save's problems, by role then host (the API's `problems`: `role.host` keys). */
+function refusals(e: unknown): Record<NetworkRole, Record<string, string>> {
+  const out: Record<NetworkRole, Record<string, string>> = { worker: {}, manager: {} };
+  const problems = e instanceof ApiError ? (e.body as { problems?: Record<string, string> } | undefined)?.problems : undefined;
+  for (const [k, v] of Object.entries(problems ?? {})) {
+    const dot = k.indexOf(".");
+    const role = k.slice(0, dot) as NetworkRole;
+    if (role in out) out[role][k.slice(dot + 1)] = v;
+  }
+  return out;
 }
 
 function NetworkForm({ projectId, view }: { projectId: string; view: NetworkView }) {
@@ -177,22 +246,54 @@ function NetworkForm({ projectId, view }: { projectId: string; view: NetworkView
   const stored = view.rules;
   useEffect(() => setDraft(stored), [rev]);
   const dirty = JSON.stringify(draft) !== JSON.stringify(view.rules);
-  const invalid = useMemo(() => NETWORK_ROLES.some((r) => Object.keys(rulesProblems(draft[r], view.egress_hosts)).length > 0), [draft, view.egress_hosts]);
+  // Only what the owner adds can be refused: a saved host since gone from the grant is kept.
+  const invalid = useMemo(
+    () => NETWORK_ROLES.some((r) => {
+      const had = new Set(view.rules[r].map((x) => x.host));
+      return Object.entries(rulesProblems(draft[r], view.egress_hosts)).some(([host, why]) => !(why.endsWith(OUTSIDE) && had.has(host)));
+    }),
+    [draft, view.rules, view.egress_hosts],
+  );
+  const refused = refusals(save.error);
+  const pending = view.agents.some((a) => a.state === "pending");
   return (
     <Stack gap="xl">
       <SectionGrid>
         {NETWORK_ROLES.map((role) => (
-          <RoleRulesEditor key={role} role={role} rules={draft[role]} egressHosts={view.egress_hosts} onChange={(r) => setDraft((d) => ({ ...d, [role]: r }))} />
+          <RoleRulesEditor
+            key={role}
+            role={role}
+            rules={draft[role]}
+            stored={view.rules[role]}
+            egressHosts={view.egress_hosts}
+            base={view.base}
+            refused={save.isError ? refused[role] : {}}
+            onChange={(r) => {
+              save.reset();
+              setDraft((d) => ({ ...d, [role]: r }));
+            }}
+          />
         ))}
       </SectionGrid>
-      <Toolbar>
-        <Button variant="default" disabled={!dirty || save.isPending} onClick={() => setDraft(view.rules)}>
-          Discard changes
-        </Button>
-        <Button disabled={!dirty || invalid} loading={save.isPending} onClick={() => save.mutate(draft)}>
-          Save
-        </Button>
-      </Toolbar>
+      <Stack gap="xs" align="flex-end">
+        <Toolbar>
+          <Button variant="default" disabled={!dirty || save.isPending} onClick={() => { save.reset(); setDraft(view.rules); }}>
+            Discard changes
+          </Button>
+          <Button disabled={!dirty || invalid} loading={save.isPending} onClick={() => save.mutate(draft)}>
+            Save
+          </Button>
+        </Toolbar>
+        {save.isError ? (
+          <Text fz="sm" c="danger" role="alert" data-slot="save-error">
+            The rules weren&apos;t saved: {save.error.message}
+          </Text>
+        ) : save.isSuccess && !dirty ? (
+          <Text fz="sm" c="dimmed" role="status" data-slot="saved">
+            {pending ? "Saved · reaching live agents" : "Saved · every live agent has them"}
+          </Text>
+        ) : null}
+      </Stack>
     </Stack>
   );
 }
@@ -232,6 +333,11 @@ export function NetworkPage() {
                     of it, within the hosts the operator lets this app open.
                   </Text>
                   <MetaRow>
+                    {net.data.base && (
+                      <MetaItem icon={IconWorld} title={net.data.base.map((b) => b.host).join(", ")}>
+                        {defaultsSummary(net.data.base)}
+                      </MetaItem>
+                    )}
                     <MetaItem icon={IconWorld}>
                       {net.data.egress_hosts === null
                         ? "The grant couldn't be read"
@@ -266,7 +372,13 @@ export function NetworkPage() {
                 </Panel>
                 <Panel data-slot="live-agents">
                   <Section title="Live agents" order={4} count={net.data.agents.length} region={false}>
-                    <LiveAgents agents={net.data.agents} />
+                    <LiveAgents
+                      framed={false}
+                      agents={net.data.agents}
+                      label="Live agents' network"
+                      empty="No live agents. New ones get these rules when their sandbox is made."
+                      onError={(a) => <RuleLink error={a.error} rules={net.data.rules} />}
+                    />
                   </Section>
                 </Panel>
               </SectionGrid>
