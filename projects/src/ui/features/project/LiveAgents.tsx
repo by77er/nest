@@ -57,9 +57,9 @@ export function LiveAgents({ agents, label, empty, detail, onError, framed = tru
                 {a.error && (
                   <Text fz="xs" c={a.state === "failed" ? "danger" : "dimmed"}>
                     {a.error}
-                    {onError?.(a)}
                   </Text>
                 )}
+                {a.error && onError?.(a)}
               </Stack>
               <Badge variant="light" color={STATE[a.state].color} data-slot="state">
                 {STATE[a.state].label}

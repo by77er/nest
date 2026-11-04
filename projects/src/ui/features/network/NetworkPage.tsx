@@ -9,7 +9,7 @@
 // so. Removing a host by keyboard leaves focus on the next row's Remove (or the Add select). A refused
 // save says why under Save, the named host's row in the danger shade.
 
-import { ActionIcon, Anchor, Button, Select, Text, TextInput, useMantineTheme } from "@mantine/core";
+import { ActionIcon, Button, Select, Text, TextInput, useMantineTheme } from "@mantine/core";
 import { IconPlus, IconWorld, IconX } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
 import { useMediaQuery } from "@mantine/hooks";
@@ -198,14 +198,12 @@ function RoleRulesEditor({ role, rules, stored, egressHosts, base, refused, onCh
 function RuleLink({ error, rules }: { error: string | null; rules: RoleRules }) {
   const host = error ? NETWORK_ROLES.flatMap((role) => rules[role].map((r) => r.host)).find((h) => error.includes(h)) : undefined;
   if (!host) return null;
+  // Its own line, a button (a 44 px target on touch), under the error it follows.
   return (
-    <>
-      {" "}
-      <Anchor
-        component="button"
-        type="button"
-        inherit
-        data-inline
+    <div>
+      <Button
+        variant="subtle"
+        size="compact-xs"
         onClick={() => {
           // The row itself (focusable, not in the tab order), its tint flashed once (global.css).
           const row = document.querySelector<HTMLElement>(`[data-host="${CSS.escape(host)}"]`);
@@ -219,8 +217,8 @@ function RuleLink({ error, rules }: { error: string | null; rules: RoleRules }) 
         }}
       >
         Go to its rule
-      </Anchor>
-    </>
+      </Button>
+    </div>
   );
 }
 
