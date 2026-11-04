@@ -255,6 +255,8 @@ const TASK_SELECT = "SELECT t.*, EXISTS (SELECT 1 FROM history h WHERE h.task = 
 
 export class ProjectDO extends DurableObject<Env> {
   private draining: Promise<void> | null = null;
+  /** Waits another `await_*` caller was handed while their first caller was still checking (in memory: only across those awaits). */
+  private readonly sharedWaits = new Set<string>();
   private again = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -1106,7 +1108,11 @@ export class ProjectDO extends DurableObject<Env> {
     }
     const key = waitKey(kind, target, want);
     const prior = this.sql.exec("SELECT * FROM waits WHERE key = ? AND resolved_ms IS NULL", key).toArray()[0];
-    if (prior) return ok({ status: "waiting", wait: toWait(prior), note: "already waiting for this: the same wait" });
+    if (prior) {
+      // Another caller now holds it too: an answer at once (below) must tell them, not drop the row.
+      this.sharedWaits.add(prior.id as string);
+      return ok({ status: "waiting", wait: toWait(prior), note: "already waiting for this: the same wait" });
+    }
     if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM waits WHERE resolved_ms IS NULL").one().n >= MAX_WAITS) {
       return fail(409, `at most ${MAX_WAITS} waits at once: cancel one with cancel_wait`);
     }
@@ -1132,6 +1138,12 @@ export class ProjectDO extends DurableObject<Env> {
       // Holding already: answered here, as `await_task` is, with no wait left behind and no message (a
       // message would wake the manager, which might ask again). Unless an event resolved it meanwhile:
       // then that told the manager, once.
+      // A caller that found this wait pending meanwhile (the review read awaited) was told "waiting": then
+      // it's resolved with the message that caller waits for.
+      if (v && this.sharedWaits.delete(id)) {
+        this.resolveWait(id, v.outcome, v.detail);
+        return ok({ status: v.outcome, detail: `PR #${pr}: ${v.detail}` });
+      }
       if (v && this.sql.exec("DELETE FROM waits WHERE id = ? AND resolved_ms IS NULL", id).rowsWritten) {
         return ok({ status: v.outcome, detail: `PR #${pr}: ${v.detail}` });
       }

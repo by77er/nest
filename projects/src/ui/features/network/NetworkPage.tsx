@@ -122,7 +122,7 @@ function RoleRulesEditor({ role, rules, stored, egressHosts, base, refused, onCh
                   ? "Outside the grant now: kept, not applied until the operator adds it again"
                   : why ?? (coveredBy(r, base) ? `${portsText(r)} · already allowed by the operator's policy` : portsText(r));
                 return (
-                  <Row key={r.host} role="listitem" justify="space-between" wrap="nowrap" data-host={r.host} data-problem={why && !revoked ? "true" : undefined}>
+                  <Row key={r.host} role="listitem" justify="space-between" wrap="nowrap" tabIndex={-1} data-host={r.host} data-problem={why && !revoked ? "true" : undefined}>
                     <Stack gap="2xs">
                       <Text fz="sm" ff="monospace" c={why && !revoked ? "danger" : undefined}>
                         {r.host}
@@ -174,7 +174,7 @@ function RoleRulesEditor({ role, rules, stored, egressHosts, base, refused, onCh
           {custom && (
             <Row gap="sm" align="flex-end" wrap={wide ? "nowrap" : "wrap"}>
               <TextInput label="Host" placeholder="downloads.example.com" value={host} onChange={(e) => setHost(e.currentTarget.value)} flex={1} />
-              <TextInput label="Ports" description="Blank: 80 and 443" placeholder="443" value={ports} onChange={(e) => setPorts(e.currentTarget.value)} />
+              <TextInput label="Ports" placeholder="Blank: 80, 443" value={ports} onChange={(e) => setPorts(e.currentTarget.value)} />
               <Button variant="default" leftSection={<IconPlus size={icon.sm} />} disabled={!preset || (custom && !host.trim())} onClick={addPicked}>
                 Add
               </Button>
@@ -192,8 +192,8 @@ function RoleRulesEditor({ role, rules, stored, egressHosts, base, refused, onCh
 }
 
 /**
- * After a failed layer's error, a way to the rule it names: the host's row in its role's list, focused
- * (its Remove), where it can be fixed.
+ * After a failed layer's error, a way to the rule it names: the host's row in its role's list, focused,
+ * its tint flashed once, where it can be fixed.
  */
 function RuleLink({ error, rules }: { error: string | null; rules: RoleRules }) {
   const host = error ? NETWORK_ROLES.flatMap((role) => rules[role].map((r) => r.host)).find((h) => error.includes(h)) : undefined;
@@ -207,9 +207,15 @@ function RuleLink({ error, rules }: { error: string | null; rules: RoleRules }) 
         inherit
         data-inline
         onClick={() => {
+          // The row itself (focusable, not in the tab order), its tint flashed once (global.css).
           const row = document.querySelector<HTMLElement>(`[data-host="${CSS.escape(host)}"]`);
-          row?.scrollIntoView({ block: "center" });
-          row?.querySelector<HTMLButtonElement>("button")?.focus();
+          if (!row) return;
+          row.scrollIntoView({ block: "center" });
+          row.focus();
+          row.removeAttribute("data-flash");
+          void row.offsetWidth;
+          row.setAttribute("data-flash", "");
+          window.setTimeout(() => row.removeAttribute("data-flash"), 1000);
         }}
       >
         Go to its rule

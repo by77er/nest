@@ -102,3 +102,25 @@ body {
     row-gap: calc(var(--nest-hit-touch) - 1.125rem) !important;
   }
 }
+
+/* A row pointed at from elsewhere ("Go to its rule"): its tint flashes once (the slow duration, easing out), as the skill lets a
+   changed value; focused, it shows the focus ring. No flash with reduced motion. */
+@keyframes nest-flash {
+  from {
+    background-color: var(--mantine-primary-color-light);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+[data-flash] {
+  animation: nest-flash var(--nest-motion-slow) var(--nest-ease-exit);
+  border-radius: var(--mantine-radius-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-flash] {
+    animation: none;
+  }
+}

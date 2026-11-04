@@ -5,7 +5,7 @@
 //   node scripts/ui-review/selftest.mjs
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
-import { inkHeaderGap, inkPrs, inkTrace } from "./apps/projects.mjs";
+import { inkHeaderGap, inkPrs, inkTrace, removeFocusCheck, waitsCheck } from "./apps/projects.mjs";
 import { measure } from "./checks.mjs";
 import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
 
@@ -256,6 +256,47 @@ for (const remount of [false, true]) {
   assert.ok(Math.abs(kept - mouse) <= 4, `a hit box grown without its line passes (${kept} vs ${mouse})`);
   assert.ok(Math.abs(grown - mouse) > 4, `a header link that grows its line must fail (${grown} vs ${mouse})`);
   await page2.close();
+}
+
+// #135's state checks, on planted pages (the design review's cases that once passed): the manager's waits
+// (no raw ids; the section there when the column shows; task and PR lines linked), and focus after a
+// keyboard Remove (the next row's, in the same role's panel).
+{
+  const p = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const waitsPage = `<!doctype html><div data-slot="manager-context"><section><h4>Waiting for</h4>
+    <div role="list" data-slot="waits">
+      <div role="listitem"><p><a href="/b?task=t1">Export gadgets as CSV</a> to be In review or Done · 45 min left</p></div>
+      <div role="listitem"><p><a href="https://github.com/o/r/pull/118">#118</a> to merge · 2 h left</p></div>
+      <div role="listitem"><p>The owner's reply · 26 h left</p></div>
+    </div></section></div>`;
+  const waitsPlants = {
+    "raw id and snake_case": () => document.querySelector("[data-slot=waits]").append(" tsk_demo4 in_review"),
+    "the section missing": () => document.querySelectorAll("[data-slot=waits]").forEach((e) => e.remove()),
+    "links removed": () => document.querySelectorAll("[data-slot=waits] a").forEach((a) => a.replaceWith(document.createTextNode(a.textContent))),
+  };
+  await p.setContent(waitsPage);
+  assert.deepEqual(await waitsCheck(p), [], "the clean waits pass");
+  for (const [name, plant] of Object.entries(waitsPlants)) {
+    await p.setContent(waitsPage);
+    await p.evaluate(plant);
+    assert.notDeepEqual(await waitsCheck(p), [], `waits: ${name} must fail`);
+  }
+  const panels = `<!doctype html><div data-role="worker"><button aria-label="Remove b">x</button><button aria-label="Remove c">x</button></div><div data-role="manager"><button aria-label="Remove b">x</button></div>`;
+  p.removedNext = { role: "worker", host: "b" };
+  const focusPlants = {
+    clean: () => document.querySelector("[data-role=worker] [aria-label='Remove b']").focus(),
+    "focus lost to body": () => document.activeElement?.blur(),
+    "another panel's Remove": () => document.querySelector("[data-role=manager] [aria-label='Remove b']").focus(),
+    "another row's Remove": () => document.querySelector("[data-role=worker] [aria-label='Remove c']").focus(),
+  };
+  for (const [name, plant] of Object.entries(focusPlants)) {
+    await p.setContent(panels);
+    await p.evaluate(plant);
+    const problems = await removeFocusCheck(p);
+    if (name === "clean") assert.deepEqual(problems, [], "focus on the next row's Remove passes");
+    else assert.notDeepEqual(problems, [], `focus after Remove: ${name} must fail`);
+  }
+  await p.close();
 }
 
 await browser.close();

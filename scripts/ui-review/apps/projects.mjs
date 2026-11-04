@@ -86,10 +86,40 @@ async function traceCheck(page) {
   return [...new Set(problems)];
 }
 
-/** The manager's waits (README.md#waiting) read as words: no raw task id, no snake_case state. */
-async function waitsCheck(page) {
-  const texts = await page.evaluate(() => [...document.querySelectorAll("[data-slot=waits], [data-slot=recent-waits]")].map((el) => el.textContent ?? ""));
-  return texts.flatMap((t) => (/tsk_[a-z0-9]|\b[a-z]+_[a-z]+\b/.test(t) ? [`the manager's waits show a raw id or state: ${t.slice(0, 120)}`] : []));
+/**
+ * The manager's waits (README.md#waiting) read as words: no raw task id, no snake_case state; where the
+ * context column shows (from `lg`; a closed disclosure below), the section is there when the fixture has
+ * waits, and each task's and PR's line links to it (only the owner's reply is plain text).
+ */
+export async function waitsCheck(page) {
+  return page.evaluate(() => {
+    const out = [];
+    const context = document.querySelector("[data-slot=manager-context]");
+    const shown = !!context && context.getBoundingClientRect().height > 0 && getComputedStyle(context).visibility !== "hidden";
+    const lists = [...document.querySelectorAll("[data-slot=waits], [data-slot=recent-waits]")];
+    if (shown && !lists.length) out.push("the manager's context column has no waits, though the fixture has some");
+    for (const list of lists) {
+      const t = list.textContent ?? "";
+      if (/tsk_[a-z0-9]|\b[a-z]+_[a-z]+\b/.test(t)) out.push(`the manager's waits show a raw id or state: ${t.slice(0, 120)}`);
+      for (const item of list.querySelectorAll("[role=listitem]")) {
+        if (!/^The owner's reply/.test((item.textContent ?? "").trim()) && !item.querySelector("a[href]")) out.push(`a wait's task or PR isn't a link: ${(item.textContent ?? "").slice(0, 80)}`);
+      }
+    }
+    return out;
+  });
+}
+
+/**
+ * After a host is removed by keyboard (`page.removedNext`: the host whose row followed it), focus is on
+ * that row's Remove, in the same role's panel: never <body>, nor another panel's.
+ */
+export async function removeFocusCheck(page) {
+  const want = page.removedNext;
+  const at = await page.evaluate(() => {
+    const el = document.activeElement;
+    return { label: el?.getAttribute("aria-label") ?? el?.tagName ?? null, role: el?.closest("[data-role]")?.getAttribute("data-role") ?? null };
+  });
+  return at.label === `Remove ${want.host}` && at.role === want.role ? [] : [`after removing a host by keyboard, focus is on ${at.label} (${at.role ?? "no panel"}), not ${want.role}'s Remove ${want.host}`];
 }
 
 /** At 1280 px and up, the board's six columns fit beside the sidebar without scrolling. */
@@ -490,12 +520,18 @@ const app = {
     } },
     // Removing a host by keyboard leaves focus on a Remove button (the next row's), never <body>.
     { name: "network-remove-keyboard", section: "project", path: "/projects/prj_demo/network", full: false, checkName: "network", after: async (p) => {
-      await p.locator("[data-role=worker]").getByRole("button", { name: /^Remove / }).first().focus();
+      const removes = p.locator("[data-role=worker]").getByRole("button", { name: /^Remove / });
+      p.removedNext = { role: "worker", host: (await removes.nth(1).getAttribute("aria-label")).replace(/^Remove /, "") };
+      await removes.first().focus();
       await p.keyboard.press("Enter");
       await p.waitForTimeout(200);
+    }, check: removeFocusCheck },
+    // A host saved before the operator narrowed the grant: kept, marked, not applied.
+    { name: "network-narrowed", section: "project", path: "/projects/prj_demo/network", fixture: "network-narrowed", full: false, checkName: "network", after: async (p) => {
+      await p.locator('[data-host="downloads.gadgets.example.com"]').evaluate((el) => el.scrollIntoView({ block: "center" }));
     }, check: async (p) => {
-      const at = await p.evaluate(() => document.activeElement?.getAttribute("aria-label") ?? document.activeElement?.tagName);
-      return /^Remove /.test(at ?? "") ? [] : [`after removing a host by keyboard, focus is on ${at}, not the next Remove`];
+      const t = await p.locator('[data-role=worker] [data-host="downloads.gadgets.example.com"]').textContent();
+      return /Outside the grant now: kept, not applied/.test(t ?? "") ? [] : [`the narrowed grant's kept host isn't marked: ${t}`];
     } },
     // A refused save: the reason under Save and the named host's row in the danger shade, no toast.
     { name: "network-save-refused", section: "project", path: "/projects/prj_demo/network", fixture: "network-save-refused", httpErrors: true, full: false, checkName: "network", after: async (p) => {
