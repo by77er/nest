@@ -2,9 +2,20 @@
 // the ring's events, `live`) and the history route's pages, oldest page last. Made-up ids only.
 //
 // The ring holds the current turn: a progress report, a long test run (collapsed to its first lines),
-// a failing command (an error result) and a build still running. History holds two older turns in two
+// a failing command (an error result), an answer in Markdown and a build still running. History holds two older turns in two
 // pages: `c2` (the page before the ring, a long wrapped command and an unbroken URL) and `c1` (the
 // first turn: a long file read and a failing test), whose `next_before: null` is the trace's beginning.
+
+const MARKDOWN = [
+  "The push was refused (`403`), so I'll open the PR **through the broker** instead. Building *first* to be sure.",
+  "## Before the PR",
+  "1. Build: `npm run build`\n2. Re-run the search suites\n   - `test/search.test.ts`\n   - `test/tags.test.ts`",
+  "> The sandbox's grant covers the broker, not a direct push.",
+  "```sh\nnpm run build && npx vitest run test/search.test.ts test/tags.test.ts --reporter=verbose --maxWorkers=2 --coverage.enabled=false\n```",
+  "| suite | before | after |\n|---|---|---|\n| search | 12 failing | 0 failing |\n| tags | none | 9 passing |\n| the-integration-suite-for-the-whole-gadgets-api-and-its-search-endpoints | 3 failing | 0 failing |",
+  "See [the broker's docs](https://docs.example.com/broker).",
+  "---",
+].join("\n\n");
 
 const lines = (n, f) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n");
 
@@ -56,7 +67,9 @@ export function trace(now = Date.now()) {
     ev("tool_call", { call_id: "toolu_2", name: "Bash", input: input({ command: "git push origin search-by-tag" }) }),
     ev("tool_result", { call_id: "toolu_2", is_error: true, summary: "fatal: unable to access 'https://github.com/by77er/gadgets.git/': The requested URL returned error: 403\nhint: the sandbox's grant doesn't include a push to this repository" }),
     ev("rate_limited", { detail: "5-hour window at 80%; resets in 41 min" }),
-    ev("assistant_text", { text: "The push was refused, so I'll open the PR through the broker instead. Building first to be sure." }),
+    // Markdown, as an assistant writes it (README.md#the-live-trace): a heading, bold, italic, inline code, a
+    // nested list, a quote, a fence with a line too long for the trace, a table wider than it, a link, a rule.
+    ev("assistant_text", { text: MARKDOWN }),
     ev("tool_call", { call_id: "toolu_3", name: "Bash", input: input({ command: "npm run build" }) }),
   ];
   const messages = [{ type: "history", before: "c2" }, ...ring, { type: "live" }];

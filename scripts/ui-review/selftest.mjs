@@ -8,6 +8,7 @@ import { chromium } from "playwright";
 import { inkChatFit, inkHeaderGap, inkPrs, inkTrace } from "./apps/projects.mjs";
 import { measure, restoreTouch, scanHits } from "./checks.mjs";
 import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
+import { proseProblems } from "./trace-prose.mjs";
 
 const sel = {
   frame: "[data-ds=page]",
@@ -220,6 +221,45 @@ for (const remount of [false, true]) {
   </style></head><body><div style="margin-top: 200px; position: relative"><div style="height: 1px"><a href="/b" style="display: block; width: 200px; height: 20px">B</a></div><div style="position: relative; margin-top: 24px"><a class="t" href="/a" style="position: relative; display: inline-block; width: 200px">A<span></span></a></div></div></body></html>`);
   assert.equal((await page.evaluate(measure, { ...sel, touch: true })).problems["hit-overlap"].length, 1, "a reaching child with pointer-events: auto doesn't hide the overlap");
   assert.equal(await page.evaluate(() => document.querySelectorAll("[data-hit-probe]").length + [...document.head.querySelectorAll("style")].filter((x) => x.textContent.includes("data-hit-probe")).length), 0, "the probe leaves nothing behind");
+}
+
+// The trace's Markdown (trace-prose.mjs): an assistant's answer on a terminal, clean, then with each of
+// the design review's (#141) planted failures: a serif span, a 20 px paragraph, a wide fence that doesn't
+// scroll in itself, and a line spilled past the trace.
+{
+  const prosePage = (plant = "") => `<!doctype html><html><head><style>
+    body { margin: 0; font: 14px/20px sans-serif; }
+    [data-ds=terminal] { width: 400px; padding: 12px; font-family: "JetBrains Mono Variable", monospace; font-size: 13px; line-height: 20px; white-space: pre-wrap; }
+    [data-ds=term-prose] { white-space: normal; min-width: 0; }
+    [data-ds=term-prose] p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    [data-ds=term-prose] :where(pre, table, code, strong) { font: inherit; }
+    [data-ds=term-prose] pre { margin: 0; white-space: pre; overflow-x: auto; contain: inline-size; }
+    [data-md=table] { overflow-x: auto; contain: inline-size; }
+    [data-md=table] td { white-space: pre; }
+  </style></head><body><div data-ds="terminal"><div data-ds="term-prose">
+    <p>The push was refused, so <strong>the broker</strong> opens it, after <code>npm run build</code>.</p>
+    <pre><code>${"npm run build && npx vitest run --reporter=verbose ".repeat(4)}</code></pre>
+    <div data-md="table"><table><tr><td>${"the-integration-suite-".repeat(6)}</td></tr></table></div>
+  </div></div><script>(${plant || "() => {}"})()</script></body></html>`;
+  const plants = {
+    serif: () => { const s = document.createElement("span"); s.style.fontFamily = "serif"; s.textContent = "x"; document.querySelector("[data-ds=term-prose] p").append(s); },
+    bigger: () => { document.querySelector("[data-ds=term-prose] p").style.fontSize = "20px"; },
+    noScrollPre: () => { document.querySelector("[data-ds=term-prose] pre").style.overflowX = "visible"; },
+    spill: () => { const p = document.querySelector("[data-ds=term-prose] p"); p.style.whiteSpace = "pre"; p.textContent = "x".repeat(400); },
+  };
+  // Each plant's problem, and only its kind (a 20 px paragraph's children inherit its size).
+  const expected = { serif: /<span> isn't mono \(serif\)/, bigger: /<p> is 20px, not the terminal's 13px/, noScrollPre: /a wide trace fence doesn't scroll in itself/, spill: /<p> spills past the trace's line/ };
+  const kind = { serif: /isn't mono/, bigger: /is 20px, not the terminal's 13px/, noScrollPre: /doesn't scroll in itself/, spill: /spills past/ };
+  const p = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  await p.setContent(prosePage());
+  assert.deepEqual(await p.evaluate(proseProblems), [], "the clean trace Markdown passes");
+  for (const [name, fn] of Object.entries(plants)) {
+    await p.setContent(prosePage(fn.toString()));
+    const problems = await p.evaluate(proseProblems);
+    assert.match(problems[0] ?? "", expected[name], `${name}: ${JSON.stringify(problems)}`);
+    for (const pr of problems) assert.match(pr, kind[name], `${name}: only its own kind: ${JSON.stringify(problems)}`);
+  }
+  await p.close();
 }
 
 // The projects app's rhythm measures (apps/projects.mjs), on planted pages: what's painted, not the

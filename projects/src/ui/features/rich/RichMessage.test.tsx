@@ -14,6 +14,8 @@ import { renderApp } from "../../test/render";
 import { cssVariablesResolver, theme } from "../../theme";
 import { sanitizeSvg, SVG_MAX_BYTES } from "../../rich/svg";
 import { RichMessage } from "./RichMessage";
+/** The task drawer (titled with its task's title). */
+const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
 
 /** The message alone, over a board of `tasks`. */
 async function show(text: string, tasks = [task({ title: "Live title", state: "in_review", pr: 9 })], asks: Ask[] = []) {
@@ -249,6 +251,6 @@ describe("task references", () => {
     await user.click(chip);
     await waitFor(() => expect(router.state.location.pathname).toBe("/projects/prj_one/board"));
     expect(router.state.location.search).toEqual({ task: t.id });
-    expect(await screen.findByRole("dialog", { name: "Task" })).toBeInTheDocument();
+    expect(await screen.findByRole("dialog", SHEET)).toBeInTheDocument();
   });
 });

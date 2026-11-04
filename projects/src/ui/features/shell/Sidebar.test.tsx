@@ -5,6 +5,8 @@ import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { ask, FakeApi, project, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+/** The task drawer (titled with its task's title). */
+const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
 
 const sidebar = () => screen.getByRole("navigation", { name: "Main" });
 const switcher = () => within(sidebar()).getByRole("button", { name: /Switch project/ });
@@ -155,6 +157,6 @@ describe("the routes", () => {
     const second = renderApp(`/projects/prj_one?task=${t.id}`, api);
     await waitFor(() => expect(second.router.state.location.pathname).toBe("/projects/prj_one/board"));
     expect(second.router.state.location.search).toEqual({ task: t.id });
-    expect(await screen.findByRole("dialog", { name: "Task" })).toBeInTheDocument();
+    expect(await screen.findByRole("dialog", SHEET)).toBeInTheDocument();
   });
 });
