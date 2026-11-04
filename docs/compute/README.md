@@ -16,8 +16,11 @@ Both kinds boot one host AMI; a host's kind is its nestd config's `role`, writte
 ## Choice of provider
 
 - **DigitalOcean and most cheap VMs don't expose `/dev/kvm`.** That rules out Firecracker there, leaving gVisor as the only option for sandboxes. Brain hosts need no KVM, so any provider can run them.
-- **AWS has supported nested virtualization since February 16, 2026,** launched on C8i, M8i and R8i ([what's new](https://aws.amazon.com/about-aws/whats-new/2026/02/amazon-ec2-nested-virtualization-on-virtual)); the user guide now also lists the 7i families, I7i/I7ie and X8i. The only `d` (local NVMe) variants are C8id, M8id and R8id. It costs nothing extra and is enabled with `--cpu-options NestedVirtualization=enabled`.
-- **The AWS sandbox fleet is the 8i family only** (C8i, M8i, R8i, with their `d` and flex variants): memory snapshots restore only on the same CPU model (see [restore ABI](../sandbox/state/memory/#restore-abi)), and Firecracker supports 8i hosts. That every 8i variant has the same CPU model, so the fleet shares one ABI, is unverified.
+- **AWS has supported nested virtualization since February 16, 2026,** launched on C8i, M8i and R8i ([what's new](https://aws.amazon.com/about-aws/whats-new/2026/02/amazon-ec2-nested-virtualization-on-virtual)); the user guide now also lists the 7i families, I7i/I7ie and X8i. The families with local NVMe among them are C8id, M8id, R8id, I7i and I7ie (`describe-instance-types`, 2026-11-03). It costs nothing extra and is enabled with `--cpu-options NestedVirtualization=enabled`.
+- **The AWS sandbox fleet is listed types in the 8i family** (`use1`: `c8id`, `m8id`, `r8id`, `c8i-flex`, `c8i` and `m8i`, all `.large`; IAM allows exactly those). Two reasons:
+  - **KVM:** they have nested virtualization.
+  - **Firecracker support:** Firecracker supports their CPU, Granite Rapids, on a 6.1 or 6.18 host kernel only ([tested platforms](https://github.com/firecracker-microvm/firecracker#tested-platforms), 2026-11-04). I7i and I7ie (Emerald Rapids) and X8i aren't on that list, so nest doesn't launch them, though they have nested virtualization.
+  - **Not a reason any more: one CPU model.** A fleet of several types may run several CPU models or CPUID sets, which is unverified for these. Disk restores don't care. Memory snapshots, when built, restore only where the [restore ABI](../sandbox/state/memory/#restore-abi) matches, CPU model included. So placement, and the autoscaler choosing a type to launch, will need to know each host's ABI.
 - **GCP:** Intel series and N4D only. GCP quotes 10% or more overhead.
 - **Cost:**
   - On-demand AWS costs about 1.5× DigitalOcean.
