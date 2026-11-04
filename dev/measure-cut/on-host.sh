@@ -1,17 +1,19 @@
 #!/bin/bash
 # Runs as the user data of one disposable test instance launched by dev/measure-cut/run.sh (never
 # on a cell's sandbox hosts): measures what a checkpoint's reflink cut costs on the instance store
-# (docs/sandbox/state/disk/, M2 with the owner's option 1: a brief pause for the clone). Prints one
+# (docs/sandbox/state/disk/: M2's clone, and M3''s options with m3.py beside this script). Prints one
 # JSON document to the serial console between NEST-MEASURE-BEGIN and NEST-MEASURE-END, then powers
 # off (the instance terminates on shutdown). Needs the host AMI: Firecracker, the guest kernel and
 # nest-base are baked in.
 # First of all: the instance powers off (and so terminates) by this deadline, whatever hangs below.
 shutdown -h +@DEADLINE_MIN@ || shutdown -P +@DEADLINE_MIN@
 set -uo pipefail
-exec > >(tee /dev/console) 2>&1
+# Output reaches the console once, through cloud-init (a second copy written to /dev/console
+# interleaved with it, 2026-11-03, and broke the results line).
 J=/root/results.json
-# Whatever happens, what was measured goes to the console, then the instance powers off.
-trap 'echo NEST-MEASURE-BEGIN; cat "$J"; echo; echo NEST-MEASURE-END; sync; shutdown -h now' EXIT
+# Whatever happens, what was measured goes to the console in short `NEST-R` lines (a long line gets
+# kernel timestamps spliced into it), then the instance powers off.
+trap 'echo NEST-MEASURE-BEGIN; python3 -c "import sys; t=open(sys.argv[1]).read(); [print(\"NEST-R \" + t[i:i+400]) for i in range(0, len(t), 400)]" "$J"; echo NEST-MEASURE-END; sync; sleep 5; shutdown -h now' EXIT
 log() { echo "measure: $*"; }
 echo '{}' > "$J"
 put() { python3 - "$J" "$1" "$2" <<'PY'
@@ -23,15 +25,49 @@ json.dump(d, open(p, "w"))
 PY
 }
 now_us() { python3 -c 'import time; print(int(time.time()*1e6))'; }
+H=$(dirname "$(realpath "$0")")
+# `m3 <key> <args>`: m3.py's JSON under `key`, or its error under `<key>_error`.
+m3() {
+  local key=$1 out
+  shift
+  if out=$(python3 "$H/m3.py" "$@" 2>/root/m3.err); then
+    put "$key" "$out"
+    log "$key: $out"
+  else
+    put "${key}_error" "$(tail -c 1500 /root/m3.err | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+    log "$key failed"
+  fi
+}
 
-dnf install -y -q xfsprogs e2fsprogs zstd python3 util-linux >/dev/null 2>&1 || true
+dnf install -y -q xfsprogs e2fsprogs zstd python3 util-linux gcc >/dev/null 2>&1 || true
+# The compiled diff and defragmenter (fdiff.c beside this script).
+if gcc -O2 -o /root/fdiff "$H/fdiff.c" 2>/root/gcc.err; then put fdiff_built true; else put fdiff_built "$(tail -c 800 /root/gcc.err | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"; fi
+# `fdx <key> <args>`: fdiff's JSON under `key`, or its error under `<key>_error`.
+fdx() {
+  local key=$1 out
+  shift
+  if out=$(/root/fdiff "$@" 2>/root/fdiff.err); then
+    put "$key" "$out"
+    log "$key: $out"
+  else
+    put "${key}_error" "$(tail -c 800 /root/fdiff.err | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+    log "$key failed"
+  fi
+}
 put kernel "\"$(uname -r)\""
 put instance_type "\"$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)" http://169.254.169.254/latest/meta-data/instance-type)\""
 
 # 1. The instance store, formatted as bootstrap.sh formats it.
 NVME=$(lsblk -dpno NAME,MODEL | awk '/Amazon EC2 NVMe Instance Storage/ {print $1; exit}')
 [ -n "$NVME" ] || { put error '"no instance store"'; exit 1; }
-mkfs.xfs -q -f -m reflink=1 -L nest-measure "$NVME"
+# With the exchange-range feature if this xfsprogs has it (M3' option 3 needs it).
+if mkfs.xfs -q -f -m reflink=1 -i exchange=1 -L nest-measure "$NVME" 2>/root/mkfs.err; then
+  put mkfs_exchange true
+else
+  put mkfs_exchange "$(python3 -c 'import json,sys; print(json.dumps(open("/root/mkfs.err").read()[-500:]))')"
+  mkfs.xfs -q -f -m reflink=1 -L nest-measure "$NVME"
+fi
+put xfsprogs "\"$(mkfs.xfs -V 2>&1 | head -1)\""
 M=/mnt/measure
 mkdir -p $M && mount "$NVME" $M
 put instance_store "$(lsblk -bdno SIZE "$NVME")"
@@ -58,11 +94,14 @@ clones() {
   extents=$(filefrag $M/disk.img | awk '{print $2}')
   put "clone_$tag" "{\"extents\": $extents, \"ms\": [$(IFS=,; echo "${out[*]}")]}"
   log "clone $tag: $extents extents, ${out[*]} ms"
+  # M3' option 1's in-pause cost: one FIEMAP walk of the whole map; and XFS's O(1) count.
+  fdx "walk_$tag" walk $M/disk.img
 }
 
 # Random 4 KiB writes over the first `span` GiB of the disk, as a guest's churn: `n` writes.
-churn() {
-  python3 - "$M/disk.img" "$1" "$2" <<'PY'
+churn() { churn_file "$M/disk.img" "$1" "$2"; }
+churn_file() {
+  python3 - "$1" "$2" "$3" <<'PY'
 import os, random, sys
 path, span, n = sys.argv[1], int(sys.argv[2]) << 30, int(sys.argv[3])
 fd = os.open(path, os.O_WRONLY)
@@ -88,6 +127,13 @@ done
 rm -f $M/cut-*.img
 clones month
 
+# M3' option 1 with no VM, on the month-aged disk: a shadow cut once (an M2 clone), then a turn's
+# writes and the pre-copy, then the last writes and the in-pause step; again after 1 GiB.
+cp --reflink=always $M/disk.img $M/shadow.img
+fdx opt1_turn opt1 $M/disk.img $M/shadow.img 2000 50
+fdx opt1_1gib opt1 $M/disk.img $M/shadow.img 262144 50
+
+
 # Chunking throughput: reading a cut cold (the store's read of it; hashing is ~4 GiB/s per core).
 cp --reflink=always $M/disk.img $M/cut.img
 sync; echo 3 > /proc/sys/vm/drop_caches
@@ -111,40 +157,50 @@ PY
 put read_cut "{\"bytes\": $bytes, \"ms\": $(( (b - a) / 1000 ))}"
 rm -f $M/cut.img
 
-# 3. Guest write stalls during the pause: a VM on the disk whose init writes 4 KiB O_DSYNC records
-# and prints, every second, its slowest write; the host cuts every 5 s (pause, clone, resume).
-cat > /root/writer.py <<'PY'
-import os, time
-fd = os.open("/stall", os.O_WRONLY | os.O_CREAT | os.O_DSYNC, 0o644)
-buf, i, t0, worst = b"\xa5" * 4096, 0, time.time(), 0.0
-while True:
-    a = time.time()
-    os.pwrite(fd, buf, (i % 65536) * 4096)
-    worst = max(worst, time.time() - a)
-    i += 1
-    if time.time() - t0 >= 1:
-        print(f"NEST-STALL {int(time.time() * 1000)} {int(worst * 1e6)} {i}", flush=True)
-        t0, worst = time.time(), 0.0
-PY
-printf '#!/bin/sh\nmount -o remount,rw /\nexec python3 /writer.py\n' > /root/init.sh
-debugfs -w -R "write /root/writer.py /writer.py" $M/disk.img >/dev/null 2>&1
-debugfs -w -R "write /root/init.sh /nest-measure-init" $M/disk.img >/dev/null 2>&1
-debugfs -w -R "sif /nest-measure-init mode 0100755" $M/disk.img >/dev/null 2>&1
+# 3. Guest write stalls during the pause: a VM on the month-aged disk whose init writes 4 KiB
+# O_DSYNC records (dd) and prints, every second, its slowest write. The host pauses it every 5 s:
+# six M2 cuts (pause, whole clone, resume), then six M3' option 1 cuts (pre-copy while it runs,
+# then pause, residue, resume). A shell writer: the guest needs no python.
+cat > /root/init.sh <<'SH'
+#!/bin/sh
+mount -o remount,rw /
+i=0; w=0; t0=$(date +%s)
+while :; do
+  s=$(date +%s%N)
+  dd if=/dev/zero of=/dev/vdb bs=4096 count=1 seek=$(( (i * 7919) % 4194304 )) oflag=direct,dsync conv=notrunc 2>/dev/null
+  e=$(date +%s%N)
+  d=$(( (e - s) / 1000 ))
+  [ "$d" -gt "$w" ] && w=$d
+  i=$((i + 1))
+  t=$(date +%s)
+  if [ "$t" != "$t0" ]; then echo "NEST-STALL $((e / 1000000)) $w $i"; w=0; t0=$t; fi
+done
+SH
+# The aged disk's filesystem is wrecked by the scattered writes (its guest can't mount it: the
+# 2026-11-03 run's kernel panicked), so the VM boots a fresh base copy and writes the aged disk raw,
+# as its second drive: that file is the one cut.
+cp --reflink=always $M/base.ext4 $M/root.img
+debugfs -w -R "write /root/init.sh /nest-measure-init" $M/root.img >/dev/null 2>&1
+debugfs -w -R "sif /nest-measure-init mode 0100755" $M/root.img >/dev/null 2>&1
+put vm_files "$(ls -l /opt/nest/bin/firecracker /var/lib/nest/kernel/vmlinux /dev/kvm 2>&1 | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
 API=/run/fc-measure.sock
 rm -f $API
 /opt/nest/bin/firecracker --api-sock $API > /root/vm.log 2>&1 &
 FC=$!
 sleep 1
 call() { curl -s --unix-socket $API -X "$1" "http://localhost$2" -H 'Content-Type: application/json' -d "$3"; }
-call PUT /machine-config '{"vcpu_count": 2, "mem_size_mib": 1024, "smt": false}'
-call PUT /boot-source '{"kernel_image_path": "/var/lib/nest/kernel/vmlinux", "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/nest-measure-init"}'
-call PUT /drives/rootfs "{\"drive_id\": \"rootfs\", \"path_on_host\": \"$M/disk.img\", \"is_root_device\": true, \"is_read_only\": false}"
-call PUT /actions '{"action_type": "InstanceStart"}'
+R=()
+R+=("$(call PUT /machine-config '{"vcpu_count": 2, "mem_size_mib": 1024, "smt": false}')")
+R+=("$(call PUT /boot-source '{"kernel_image_path": "/var/lib/nest/kernel/vmlinux", "boot_args": "console=ttyS0 reboot=k panic=1 pci=off init=/nest-measure-init"}')")
+R+=("$(call PUT /drives/rootfs "{\"drive_id\": \"rootfs\", \"path_on_host\": \"$M/root.img\", \"is_root_device\": true, \"is_read_only\": false}")")
+R+=("$(call PUT /drives/aged "{\"drive_id\": \"aged\", \"path_on_host\": \"$M/disk.img\", \"is_root_device\": false, \"is_read_only\": false}")")
+R+=("$(call PUT /actions '{"action_type": "InstanceStart"}')")
+put fc_api "$(printf '%s\n' "${R[@]}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
 sleep 20
 # Whether the VM is up, and its console's tail either way (2026-11-03's run had no guest lines).
 if kill -0 $FC 2>/dev/null; then put vm_running true; else put vm_running false; fi
 PAUSES=()
-for k in $(seq 12); do
+for k in $(seq 6); do
   sync -f $M/disk.img 2>/dev/null || sync
   a=$(now_us)
   call PATCH /vm '{"state": "Paused"}'
@@ -155,7 +211,17 @@ for k in $(seq 12); do
   rm -f $M/cut.img
   sleep 5
 done
+put cut_while_writing_m2 "{\"pauses_ms\": [$(IFS=,; echo "${PAUSES[*]}")]}"
+fdx cut_while_writing_opt1 vm $M/disk.img $M/shadow.img $API 6
+sleep 2
 kill $FC
-put vm_log "$(tail -c 4000 /root/vm.log | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
-put cut_while_writing "{\"pauses_ms\": [$(IFS=,; echo "${PAUSES[*]}")], \"guest\": [$(grep -o 'NEST-STALL [0-9]* [0-9]* [0-9]*' /root/vm.log | awk '{printf "%s[%s, %s, %s]", (n++ ? "," : ""), $2, $3, $4}')]}"
+put vm_log "$(tail -c 3000 /root/vm.log | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+put guest_stalls "[$(grep -o 'NEST-STALL [0-9]* [0-9]* [0-9]*' /root/vm.log | awk '{printf "%s[%s, %s, %s]", (n++ ? "," : ""), $2, $3, $4}')]"
+# M3' option 3: defragment the aged disk with exchange-range, 64 MiB at a time where a chunk has
+# more than 16 records; then what a clone, a walk and option 1's pause cost on it.
+rm -f $M/cut.img
+fdx defrag defrag $M/disk.img $M/defrag.tmp 64 16
+rm -f $M/defrag.tmp
+clones defragged
+fdx opt1_defragged opt1 $M/disk.img $M/shadow.img 2000 50
 put done true
