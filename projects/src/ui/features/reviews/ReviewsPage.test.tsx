@@ -56,7 +56,7 @@ describe("the Reviews page", () => {
     RecordingSocket.opened = [];
     vi.stubGlobal("WebSocket", RecordingSocket);
     const api = new FakeApi();
-    api.reviews = [job(1, { state: "done", verdict: verdict("fail"), runs: 2 }), job(3, { state: "running", agent: "agt_rev3" })];
+    api.reviews = [job(1, { state: "done", verdict: verdict("fail"), runs: 2, tainted: true }), job(3, { state: "running", agent: "agt_rev3" })];
     const { user } = renderApp("/projects/prj_one/reviews", api);
     const list = await screen.findByRole("list", { name: "Review jobs" });
     expect(screen.queryByRole("table")).toBeNull();
@@ -67,6 +67,10 @@ describe("the Reviews page", () => {
     expect(done).toHaveTextContent("1000000 → main");
     expect(within(done).getByLabelText("Quality: failed")).toBeInTheDocument();
     expect(done).toHaveTextContent("2 runs");
+    // Tainted sits on its state row, beside the state, not after the verdicts.
+    const stateRow = within(done).getByText("Tainted").parentElement!.parentElement!;
+    expect(stateRow).toHaveTextContent(/Changes needed\s*Tainted/);
+    expect(within(cards[0]!).getByRole("button", { name: "Show the trace of #3" })).toHaveTextContent("Show trace");
     // Its trace opens under it.
     await user.click(within(cards[0]!).getByRole("button", { name: "Show the trace of #3" }));
     await waitFor(() => expect(cards[0]!.querySelector("[data-trace]")).not.toBeNull());

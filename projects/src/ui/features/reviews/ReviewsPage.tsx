@@ -31,7 +31,16 @@ export function JobState({ job, size = "md" }: { job: Job; size?: "sm" | "md" })
   );
 }
 
-function Verdicts({ job }: { job: Job }) {
+function TaintedBadge() {
+  return (
+    <Badge size="sm" variant="outline" color="gray">
+      Tainted
+    </Badge>
+  );
+}
+
+/** The verdict badges; `tainted` (the table's) puts Tainted after them, a card puts it on its state row. */
+function Verdicts({ job, tainted = true }: { job: Job; tainted?: boolean }) {
   if (!job.verdict) return <Text fz="sm" c="dimmed">{job.error ?? "No verdict yet"}</Text>;
   return (
     // Badges that open their notes, wrapping into rows: a 44 px pitch between rows on touch.
@@ -54,11 +63,7 @@ function Verdicts({ job }: { job: Job }) {
           </Tooltip>
         );
       })}
-      {job.tainted && (
-        <Badge size="sm" variant="outline" color="gray">
-          Tainted
-        </Badge>
-      )}
+      {tainted && job.tainted && <TaintedBadge />}
     </Row>
   );
 }
@@ -77,7 +82,8 @@ function PrTitle({ repo, j }: { repo: string; j: Job }) {
   );
 }
 
-function TraceToggle({ j, open, onToggle }: { j: Job; open: boolean; onToggle: () => void }) {
+/** Show or Hide its trace; in a card, where no column heading says what, "Show trace" / "Hide trace". */
+function TraceToggle({ j, open, onToggle, long = false }: { j: Job; open: boolean; onToggle: () => void; long?: boolean }) {
   return (
     <Button
       variant="subtle"
@@ -89,6 +95,7 @@ function TraceToggle({ j, open, onToggle }: { j: Job; open: boolean; onToggle: (
       onClick={onToggle}
     >
       {open ? "Hide" : "Show"}
+      {long ? " trace" : ""}
     </Button>
   );
 }
@@ -102,8 +109,9 @@ function ReviewCard({ repo, j, open, onToggle }: { repo: string; j: Job; open: b
         <PrTitle repo={repo} j={j} />
         <Row gap="sm">
           <JobState job={j} />
+          {j.tainted && <TaintedBadge />}
         </Row>
-        <Verdicts job={j} />
+        <Verdicts job={j} tainted={false} />
         <Row justify="space-between" wrap="nowrap">
           <MetaRow>
             <MetaItem>
@@ -111,7 +119,7 @@ function ReviewCard({ repo, j, open, onToggle }: { repo: string; j: Job; open: b
             </MetaItem>
             <MetaItem title={exact(j.updated_ms)}>Updated {ago(j.updated_ms)}</MetaItem>
           </MetaRow>
-          <TraceToggle j={j} open={open} onToggle={onToggle} />
+          <TraceToggle j={j} open={open} onToggle={onToggle} long />
         </Row>
         {open && (
           <div data-trace={key}>
