@@ -191,6 +191,8 @@ describe("read-only repos in specs", () => {
 class FakeGitHub {
   readonly installs = new Map<string, number>();
   readonly mints: { installation: number; repositories: string[]; permissions: Record<string, string>; token: string }[] = [];
+  /** Tokens revoked (`DELETE /installation/token`, authorized by the token itself). */
+  readonly revoked: string[] = [];
   /** Lifetime of the next tokens. */
   ttlMs = 3_600_000;
   /** Holds the next mint until released. */
@@ -216,6 +218,12 @@ class FakeGitHub {
       const token = `ghs_sbx${String(++this.n).padStart(30, "0")}`;
       this.mints.push({ installation, ...body, token });
       return json(201, { token, expires_at: new Date(Date.now() + this.ttlMs).toISOString() });
+    }
+    if (u.pathname === "/installation/token" && req.method === "DELETE") {
+      const token = (req.headers.get("authorization") ?? "").replace(/^Bearer /, "");
+      if (!this.mints.some((m) => m.token === token) || this.revoked.includes(token)) return json(401, { message: "Bad credentials" });
+      this.revoked.push(token);
+      return new Response(null, { status: 204 });
     }
     return json(404, { message: "Not Found" });
   }
@@ -646,6 +654,58 @@ describe("workflows: write on a sandbox's push token", () => {
     expect(await sandboxStub(sbx.sandbox).pushWorkflows()).toBe(true);
     const plain = await asClient(withIt, "/v1/sandboxes", { cell }, 202);
     expect(await sandboxStub(plain.sandbox).pushWorkflows()).toBe(false);
+  });
+
+  it("a client's live layer turns it on and off: the next mint has it or not, the one with it revoked; within the grant only", async () => {
+    const cell = uniqueCell();
+    const h = await connectHost(cell);
+    const call = async (token: string, method: string, path: string, body: unknown, status: number) => {
+      const res = await SELF.fetch(`http://cp.test${path}`, { method, headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+      const text = await res.text();
+      expect(res.status, text).toBe(status);
+      return text ? JSON.parse(text) : null;
+    };
+    const mk = async (grant: Record<string, unknown>) => (await adminJson("/v1/admin/clients", { body: { name: `wf-${rand()}`, grant: { cells: [cell], max_sandboxes: 2, ...grant } } }, 201)).token as string;
+    const token = await mk({ github_push: { workflows: true } });
+    const sbx = await call(token, "POST", "/v1/sandboxes", { cell }, 201);
+    const layer = `/v1/sandboxes/${sbx.sandbox}/client-policy`;
+    expect((await call(token, "GET", layer, undefined, 200)).github_push).toEqual({ workflows: false });
+    // A push allowlist to mint for (an attached agent's repos).
+    const r = repo(6161);
+    const stub = sandboxStub(sbx.sandbox);
+    await stub.attach(`agt_${rand()}${rand()}${rand()}`, undefined, [r]);
+    while (gh.mints.at(-1)?.repositories[0] !== r.split("/")[1]) await nextCommands(h.ws, (c) => c.type === "secrets_update");
+    const plain = gh.mints.at(-1)!;
+    expect(plain.permissions).toEqual(SANDBOX_TOKEN_PERMISSIONS);
+    // On, live: the next push carries a token with workflows: write.
+    // The proxy's next set carrying the latest token (an earlier push may still be in the queue).
+    const pushed = async () => {
+      for (;;) {
+        const cmds = await nextCommands(h.ws, (c) => c.type === "secrets_update");
+        if (ghSecret(cmds)?.value === gh.mints.at(-1)!.token) return gh.mints.at(-1)!;
+      }
+    };
+    await call(token, "PUT", layer, { github_push: { workflows: true } }, 200);
+    const on = await pushed();
+    expect(on.permissions).toEqual(WITH_WORKFLOWS);
+    expect(await stub.pushWorkflows()).toBe(true);
+    expect((await call(token, "GET", layer, undefined, 200)).github_push).toEqual({ workflows: true });
+    expect(gh.revoked).not.toContain(on.token);
+    // Off (here by leaving it out: the layer is replaced whole): the next token is without it, and the
+    // one with it is revoked at GitHub, not left valid for its hour.
+    await call(token, "PUT", layer, { env: { CI: "1" } }, 200);
+    const off = await pushed();
+    expect(off.permissions).toEqual(SANDBOX_TOKEN_PERMISSIONS);
+    expect(off.token).not.toBe(on.token);
+    expect(gh.revoked).toContain(on.token);
+    expect(await stub.pushWorkflows()).toBe(false);
+    // A client whose grant lacks it: refused (403) live, as at create; off still goes through.
+    const without = await mk({});
+    const other = await call(without, "POST", "/v1/sandboxes", { cell }, 201);
+    const refused = await call(without, "PUT", `/v1/sandboxes/${other.sandbox}/client-policy`, { github_push: { workflows: true } }, 403);
+    expect(refused.error.message).toContain("github_push.workflows");
+    expect(await sandboxStub(other.sandbox).pushWorkflows()).toBe(false);
+    await call(without, "PUT", `/v1/sandboxes/${other.sandbox}/client-policy`, { github_push: { workflows: false } }, 200);
   });
 
   it("an attached agent's spec asking for it adds it while attached, and never reuses a token without it", async () => {

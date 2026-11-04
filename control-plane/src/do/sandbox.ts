@@ -95,7 +95,7 @@ const LAYER_KEY = "ws_layer";
 const AGENT_READ_REPOS = "agent_read_repos";
 /** Its client's own injection bindings, from its create (docs/control-plane/api/clients/#injection). */
 const OWN_INJECT = "client_inject";
-/** Its own push-token opt-ins, from its create (`{workflows: true}`). */
+/** Its own push-token opt-ins (`{workflows: true}`), from its create or its client layer. */
 const OWN_PUSH = "github_push";
 /** Each attached agent's client injection bindings, and the agents whose specs ask for `workflows`. */
 const AGENT_INJECT = "agent_inject";
@@ -1511,11 +1511,14 @@ export class SandboxDO extends DurableObject<Env> {
 
   /**
    * Replace its own client layer (`PUT /v1/sandboxes/<id>/client-policy`; the caller checked it against
-   * the client's grant): egress rules, injection bindings (whose they are must be its client) and
-   * environment, each replaced whole. The policy and its secrets go out as a new version through the
-   * usual path, and the attached agents' slots get the new environment. Answers the effective policy.
+   * the client's grant): egress rules, injection bindings (whose they are must be its client),
+   * environment and its own push opt-in (`workflows`), each replaced whole. The policy and its secrets go
+   * out as a new version through the usual path (a push token minted for the new opt-in: BrokerDO never
+   * reuses one minted without it, nor the other way round), and the attached agents' slots get the new
+   * environment. `workflows` absent (a caller of the previous release): its own opt-in as it was.
+   * Answers the effective policy.
    */
-  async setClientLayer(layer: { egress: EgressRule[]; inject: HeldInjection[]; env: Record<string, string> }): Promise<EgressPolicy> {
+  async setClientLayer(layer: { egress: EgressRule[]; inject: HeldInjection[]; env: Record<string, string>; workflows?: boolean }): Promise<EgressPolicy> {
     const info = this.info_();
     if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
     if (info.client) await this.readEgressCeiling();
@@ -1527,16 +1530,20 @@ export class SandboxDO extends DurableObject<Env> {
     const inject = layer.inject.filter((b) => b.client === now.client);
     put(OWN_INJECT, inject, inject.length > 0);
     put(OWN_ENV, layer.env, Object.keys(layer.env).length > 0);
+    if (layer.workflows !== undefined) put(OWN_PUSH, { workflows: true }, layer.workflows);
     if (this.hasClientEgress() && now.client && !this.deadlines.has("egress_ceiling")) await this.deadlines.set("egress_ceiling", Date.now() + EGRESS_CEILING_REFRESH_MS);
     await this.policyChanged(true);
     if (JSON.stringify(layer.env) !== envBefore && now.attached.length) await this.issueAttachCommands(now.attached);
     return this.policy();
   }
 
-  /** Its own client layer, as `PUT …/client-policy` set it (never a secret: bindings name theirs). */
-  async clientLayer(): Promise<{ egress: { allow: EgressRule[] }; inject: HeldInjection[]; env: Record<string, string> }> {
+  /** Its own client layer, as its create or `PUT …/client-policy` set it (never a secret: bindings name theirs). */
+  async clientLayer(): Promise<{ egress: { allow: EgressRule[] }; inject: HeldInjection[]; env: Record<string, string>; github_push: { workflows: boolean } }> {
     this.info_();
-    return { egress: { allow: this.get<EgressRule[]>(OWN_EGRESS) ?? [] }, inject: this.get<HeldInjection[]>(OWN_INJECT) ?? [], env: this.get<Record<string, string>>(OWN_ENV) ?? {} };
+    return {
+      egress: { allow: this.get<EgressRule[]>(OWN_EGRESS) ?? [] }, inject: this.get<HeldInjection[]>(OWN_INJECT) ?? [], env: this.get<Record<string, string>>(OWN_ENV) ?? {},
+      github_push: { workflows: !!this.get<{ workflows: true }>(OWN_PUSH)?.workflows },
+    };
   }
 
   /** Its client's grant changed: read `egress_hosts` again, and send a new policy if what applies changed. */
