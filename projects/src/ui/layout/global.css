@@ -109,11 +109,12 @@ body {
   [data-touch-pitch] {
     row-gap: calc(var(--nest-hit-touch) - 1.125rem) !important;
   }
+}
 
-  /* Groups whose lines take that pitch (a task's PRs): twice its gap between them, and room above the
-     first for a control in the heading over them (Attach PR), so each group stays one. */
-  [data-touch-group-gap] {
-    row-gap: calc((var(--nest-hit-touch) - 1.125rem) * 2 + var(--mantine-spacing-xs)) !important;
-    padding-top: var(--mantine-spacing-sm);
+/* On touch, a section whose heading has an action (Attach PR, Add dependency) keeps its first row's
+   controls clear of it: a little more room under the heading. */
+@media (pointer: coarse) {
+  [data-ds="section"]:has(> [data-slot="head"] [data-slot="actions"] :is(button, a[href])) {
+    row-gap: calc(var(--mantine-spacing-lg) + var(--mantine-spacing-sm)) !important;
   }
 }
