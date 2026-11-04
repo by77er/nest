@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
 import { inkChatFit, inkHeaderGap, inkPrs, inkTrace } from "./apps/projects.mjs";
-import { measure } from "./checks.mjs";
+import { measure, restoreTouch, scanHits } from "./checks.mjs";
 import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
 
 const sel = {
@@ -272,6 +272,60 @@ for (const remount of [false, true]) {
     ["a short chat's composer floating above the bottom", "[data-ds=chat-log] p:nth-child(n+3) { display: none; } [data-ds=composer-dock] { position: static; }"],
   ]) assert.notDeepEqual(await fit(css), [], `chat-fit: ${plant} must fail`);
   await page2.close();
+}
+
+// The scroll scan (scanHits): hit-overlap and hit-size wherever the reader can scroll, not the first
+// viewport only. Each plant is out of the first viewport but one (the reviewer's cases, plantscan.mjs):
+// below the fold, in a sideways scroller, in a vertical inner scroller (a drawer's body), below the fold
+// and sideways at once, and in the topmost modal's body. The first viewport alone misses each; the scan
+// finds each. A clean page with the same scrollers finds nothing.
+{
+  const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  const p3 = await ctx.newPage();
+  const css = "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body { margin: 0; font: 16px/24px sans-serif; } .big { display: block; min-width: 48px; min-height: 48px; } .t::after { content: ''; position: absolute; inset: -30px 0; }</style>";
+  // A reaches 30 px above and below itself, over B.
+  const pair = '<div style="position: relative; padding: 40px 0"><a class="t big" href="/a" style="position: relative">A</a><a class="big" href="/b">B</a></div>';
+  const tiny = '<button style="width: 16px; height: 16px; padding: 0; margin: 60px">x</button>';
+  const sideways = (inner) => `<div style="overflow-x: auto; width: 390px"><div style="width: 1600px; position: relative; height: 300px"><div style="position: absolute; left: 1200px; top: 0">${inner}</div></div></div>`;
+  const down = (inner) => `<div style="overflow-y: auto; height: 300px"><div style="height: 1200px"></div>${inner}</div>`;
+  const modal = (inner) => `<div role="dialog" aria-modal="true" style="position: fixed; inset: 0; background: #fff; display: flex; flex-direction: column"><h2 style="margin: 0">Sheet</h2><div style="overflow-y: auto; flex: 1"><div style="height: 1500px"></div>${inner}</div></div>`;
+  const fold = (inner) => `<div style="height: 2000px"></div>${inner}`;
+  const cases = {
+    "below the fold": fold,
+    "in a sideways scroller": sideways,
+    "in a vertical inner scroller": down,
+    "below the fold, sideways": (x) => fold(sideways(x)),
+    "in the topmost modal's body": (x) => `<a class="big" href="/under">Under</a>${modal(x)}`,
+  };
+  const first = async () => {
+    const p = (await p3.evaluate(measure, { ...sel, touch: true, viewportOnly: true })).problems;
+    return { "hit-overlap": p["hit-overlap"], "hit-size": p["hit-size"] };
+  };
+  for (const [name, wrap] of Object.entries(cases)) {
+    await p3.setContent(`<!doctype html><html><head>${css}</head><body><h1>Page</h1>${wrap('<a class="big" href="/c">C</a>')}</body></html>`);
+    const quiet = await scanHits(p3, sel);
+    assert.deepEqual(quiet, { "hit-overlap": [], "hit-size": [] }, `${name}, clean: ${JSON.stringify(quiet)}`);
+    for (const [plant, inner, check] of [["an overlap", pair, "hit-overlap"], ["a small target", tiny, "hit-size"]]) {
+      await p3.setContent(`<!doctype html><html><head>${css}</head><body><h1>Page</h1>${wrap(inner)}</body></html>`);
+      assert.deepEqual((await first())[check], [], `${name}: ${plant} isn't in the first viewport`);
+      const y0 = await p3.evaluate(() => window.scrollY);
+      const got = await scanHits(p3, sel);
+      assert.ok(got[check].length >= 1, `${name}: the scan finds ${plant}: ${JSON.stringify(got)}`);
+      assert.equal(await p3.evaluate(() => window.scrollY), y0, `${name}: the scan puts the page's scroll back`);
+      assert.equal(await p3.evaluate(() => document.querySelectorAll("[data-hit-scan]").length), 0, `${name}: the scan leaves no marks`);
+    }
+  }
+  // In view, the scan finds it too (its first step is the first viewport).
+  await p3.setContent(`<!doctype html><html><head>${css}</head><body><h1>Page</h1>${pair}</body></html>`);
+  assert.ok((await scanHits(p3, sel))["hit-overlap"].length >= 1, "in view: the scan finds an overlap");
+  // A full-page screenshot ends the touch emulation; restoreTouch brings it back before a scan.
+  await p3.setContent(`<!doctype html><html><head>${css}</head><body><h1>Page</h1>${fold("")}</body></html>`);
+  assert.ok(await p3.evaluate(() => matchMedia("(pointer: coarse)").matches), "a touch context is coarse");
+  await p3.screenshot({ fullPage: true });
+  const lost = !(await p3.evaluate(() => matchMedia("(pointer: coarse)").matches));
+  await restoreTouch(p3);
+  assert.ok(await p3.evaluate(() => matchMedia("(pointer: coarse)").matches), `restoreTouch makes it coarse again (the screenshot ${lost ? "had ended it" : "kept it"})`);
+  await ctx.close();
 }
 
 await browser.close();
