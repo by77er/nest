@@ -2,6 +2,7 @@
 // layout primitives mark the frame, the measures, the panels and the nav (data-ds attributes).
 import { data } from "../fixtures/projects/demo.mjs";
 import { countTraffic, tabKeepCheck } from "../trace-tabs.mjs";
+import { proseProblems } from "../trace-prose.mjs";
 
 const menu = async (p) => p.getByRole("button", { name: "Open the menu" }).click();
 const DESKTOP = [1440, 1280];
@@ -73,6 +74,9 @@ async function traceCheck(page) {
       .filter((v) => v.clientWidth > 0 && v.scrollWidth > v.clientWidth + 1)
       .map((v) => `the trace's log scrolls sideways: ${v.scrollWidth} px of content in ${v.clientWidth} px`),
   );
+  // An assistant's Markdown (README.md#the-live-trace): mono at the terminal's one size, nothing but a
+  // fence or a table scrolling sideways, inside itself (trace-prose.mjs; selftest.mjs plants each failure).
+  problems.push(...(await page.evaluate(proseProblems)));
   const cdp = await page.context().newCDPSession(page);
   await cdp.send("DOM.enable");
   await cdp.send("CSS.enable");
