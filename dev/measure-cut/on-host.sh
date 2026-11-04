@@ -39,7 +39,21 @@ m3() {
   fi
 }
 
-dnf install -y -q xfsprogs e2fsprogs zstd python3 util-linux >/dev/null 2>&1 || true
+dnf install -y -q xfsprogs e2fsprogs zstd python3 util-linux gcc >/dev/null 2>&1 || true
+# The compiled diff and defragmenter (fdiff.c beside this script).
+if gcc -O2 -o /root/fdiff "$H/fdiff.c" 2>/root/gcc.err; then put fdiff_built true; else put fdiff_built "$(tail -c 800 /root/gcc.err | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"; fi
+# `fdx <key> <args>`: fdiff's JSON under `key`, or its error under `<key>_error`.
+fdx() {
+  local key=$1 out
+  shift
+  if out=$(/root/fdiff "$@" 2>/root/fdiff.err); then
+    put "$key" "$out"
+    log "$key: $out"
+  else
+    put "${key}_error" "$(tail -c 800 /root/fdiff.err | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
+    log "$key failed"
+  fi
+}
 put kernel "\"$(uname -r)\""
 put instance_type "\"$(curl -s -H "X-aws-ec2-metadata-token: $(curl -s -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token)" http://169.254.169.254/latest/meta-data/instance-type)\""
 
@@ -81,7 +95,7 @@ clones() {
   put "clone_$tag" "{\"extents\": $extents, \"ms\": [$(IFS=,; echo "${out[*]}")]}"
   log "clone $tag: $extents extents, ${out[*]} ms"
   # M3' option 1's in-pause cost: one FIEMAP walk of the whole map; and XFS's O(1) count.
-  m3 "walk_$tag" walk $M/disk.img
+  fdx "walk_$tag" walk $M/disk.img
 }
 
 # Random 4 KiB writes over the first `span` GiB of the disk, as a guest's churn: `n` writes.
@@ -116,34 +130,9 @@ clones month
 # M3' option 1 with no VM, on the month-aged disk: a shadow cut once (an M2 clone), then a turn's
 # writes and the pre-copy, then the last writes and the in-pause step; again after 1 GiB.
 cp --reflink=always $M/disk.img $M/shadow.img
-m3 opt1_turn opt1 $M/disk.img $M/shadow.img 2000 50 16
-m3 opt1_1gib opt1 $M/disk.img $M/shadow.img 262144 50 16
+fdx opt1_turn opt1 $M/disk.img $M/shadow.img 2000 50
+fdx opt1_1gib opt1 $M/disk.img $M/shadow.img 262144 50
 
-# M3' option 3: a CoW extent size hint, on fresh disks with the same 1 GiB of churn after a cut.
-for hint in 0 1m 4m; do
-  cp --reflink=always $M/base.ext4 $M/h.img
-  truncate -s 32G $M/h.img
-  resize2fs -f $M/h.img >/dev/null 2>&1
-  [ "$hint" = 0 ] || xfs_io -c "cowextsize $hint" $M/h.img
-  hinted=$(xfs_io -c cowextsize $M/h.img 2>&1 | tr -d '[]\n ')
-  cp --reflink=always $M/h.img $M/h-cut.img
-  churn_file $M/h.img 16 262144
-  sync
-  hms=()
-  for i in 1 2 3; do
-    rm -f $M/h-c.img
-    a=$(now_us); cp --reflink=always $M/h.img $M/h-c.img; b=$(now_us)
-    hms+=($(( (b - a) / 1000 )))
-  done
-  ext=$(filefrag $M/h.img | awk '{print $2}')
-  put "hint_$hint" "{\"set\": \"$hinted\", \"extents\": $ext, \"ms\": [$(IFS=,; echo "${hms[*]}")]}"
-  log "hint $hint ($hinted): $ext extents, ${hms[*]} ms"
-  rm -f $M/h.img $M/h-cut.img $M/h-c.img
-done
-
-# M3' option 3's defragmentation needs exchange-range: one exchange while a writer runs.
-mkdir -p $M/x && m3 exchange exchange $M/x
-rm -rf $M/x
 
 # Chunking throughput: reading a cut cold (the store's read of it; hashing is ~4 GiB/s per core).
 cp --reflink=always $M/disk.img $M/cut.img
@@ -223,9 +212,16 @@ for k in $(seq 6); do
   sleep 5
 done
 put cut_while_writing_m2 "{\"pauses_ms\": [$(IFS=,; echo "${PAUSES[*]}")]}"
-m3 cut_while_writing_opt1 opt1vm $M/disk.img $M/shadow.img $API 6
+fdx cut_while_writing_opt1 vm $M/disk.img $M/shadow.img $API 6
 sleep 2
 kill $FC
 put vm_log "$(tail -c 3000 /root/vm.log | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')"
 put guest_stalls "[$(grep -o 'NEST-STALL [0-9]* [0-9]* [0-9]*' /root/vm.log | awk '{printf "%s[%s, %s, %s]", (n++ ? "," : ""), $2, $3, $4}')]"
+# M3' option 3: defragment the aged disk with exchange-range, 64 MiB at a time where a chunk has
+# more than 16 records; then what a clone, a walk and option 1's pause cost on it.
+rm -f $M/cut.img
+fdx defrag defrag $M/disk.img $M/defrag.tmp 64 16
+rm -f $M/defrag.tmp
+clones defragged
+fdx opt1_defragged opt1 $M/disk.img $M/shadow.img 2000 50
 put done true

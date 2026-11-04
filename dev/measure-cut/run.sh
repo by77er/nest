@@ -72,13 +72,13 @@ trap 'exit 130' INT TERM HUP
 DEADLINE=${MEASURE_DEADLINE_MIN:-90}
 PACK=$(mktemp -d)
 sed "s/@DEADLINE_MIN@/$DEADLINE/" "$HERE/on-host.sh" > "$PACK/on-host.sh"
-cp "$HERE/m3.py" "$PACK/m3.py"
+cp "$HERE/fdiff.c" "$PACK/"
 USER_DATA=$(mktemp)
 {
   echo '#!/bin/bash'
   echo "shutdown -h +$DEADLINE || shutdown -P +$DEADLINE"
   echo "mkdir -p /root/measure && base64 -d <<'NEST_PACK' | tar -xz -C /root/measure"
-  tar -czf - -C "$PACK" on-host.sh m3.py | base64
+  tar -czf - -C "$PACK" on-host.sh fdiff.c | base64
   echo 'NEST_PACK'
   echo 'exec bash /root/measure/on-host.sh'
 } > "$USER_DATA"
