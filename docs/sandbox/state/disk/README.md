@@ -54,7 +54,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - reading a cut cold;
   - a guest's write stalls during the pause.
 
-  If a month-old 32 GiB disk's p99 clone exceeds 200 ms, [M3′](#m3-the-pause-follows-what-a-turn-changed-designed-not-built-the-owner-to-choose) comes first: the pause follows what changed (options below). A clone's cost grows with the number of extent records: 50–100 M of them locked a file for over 30 minutes (xfs 14a53798).
+  If a month-old 32 GiB disk's p99 clone exceeds 200 ms, [M3′](#m3-the-pause-follows-what-a-turn-changed-option-1-built-not-deployed) comes first: the pause follows what changed (options below). A clone's cost grows with the number of extent records: 50–100 M of them locked a file for over 30 minutes (xfs 14a53798).
 - **Measured (2026-11-03, one `c8id.large` in us-east-1c, kernel 6.18.56, XFS `reflink=1` on the 118 GB instance store):** the gate fails. The owner shipped M2 anyway, with M3′ next (above).
 
   | 32 GiB disk | Extent records | `FICLONE`, 5 runs |
@@ -71,7 +71,29 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - host tests use a test cut (`disk_cut: locked_copy`): a copy under an exclusive `flock`, since the test filesystems have no reflink;
   - the e2e harness cuts that way during sustained writes, restores the generation from the store, and finds an exact prefix of the writes.
 
-## M3′: the pause follows what a turn changed (designed, not built; the owner to choose)
+## M3′: the pause follows what a turn changed (option 1 built, not deployed)
+
+**Built (2026-11-04, the owner's choice of option 1; draft, not merged):** `nestd_core::shadow` (the comparison and the shadows' slots), and `Inner::cut_checkpoint`, `pre_copy` and `cut_shadow` in `crates/nestd/src/host.rs`.
+- **Two shadows per incarnation,** `shadow-a.img` and `shadow-b.img` beside `disk.img`. A cut writes the newest shadow that no commit is reading (`Shadows::target`), and the commit reads it in place. So the next cut usually clones only what changed since the last one, and a shadow being read is never written.
+- **While the VM runs (the pre-copy):** write back the disk (`fdatasync`), read the disk's map and the shadow's (`FS_IOC_FIEMAP`), and compare them (`changed`). If 4,096 ranges or more differ, clone them (`FICLONERANGE`) and read the shadow's map again.
+- **In the pause:**
+  - write back the disk, walk its map, and compare it with the shadow's map **as it is now**, never with one read before a clone (the model's counterexample: a freed block reused at the same offset);
+  - clone what differs, set M1's sentinel, resume.
+  - The pause is the walk plus the residue's clones: about 0.7–0.9 s at a month's ~0.9 M records, 0.03 ms fresh (measured on `m8id`, below).
+- **Fallbacks:**
+  - a shadow not made yet, or a comparison that fails (no FIEMAP), is cloned whole in the pause, as M2 does;
+  - a filesystem without `FICLONERANGE` and FIEMAP takes M2 (`auto` probes both at start, `storage::shadow_cut_works`), and one without reflink takes M1.
+  - An unchanged disk isn't cut (M1's memo), and the clone-versus-read guard applies to a whole clone only.
+- **Unchanged from M2:** fences, suspend, archive and salvage (they read the disk itself and drop a queued cut), the commit lock and its executor rules, a fork waiting for its own cut, and coalescing. A restart removes shadows with the cuts (`incarnation::is_cut_file`).
+- **Logged per cut:** `records` (the disk's extents), `walk_ms`, the residue's `ranges` and `bytes`, `whole`, the pre-copy's ranges, bytes and ms, and `paused_ms`, in "checkpoint: disk cut into a shadow". This is how to measure real disks' counts on `c8id` and `m8id` hosts.
+- **Checked:**
+  - `verification/nestd/check` `shadow`: the real comparison over a copy-on-write filesystem with block reuse and a guest writing throughout the pre-copy. It holds, and the stale-map variant fails in 8 steps.
+  - Kani proves that `changed` covers every differing offset, and that a cut never targets the shadow being read.
+  - Host tests run M2's cut tests again with shadows (`*_with_shadows`), over a content-hash stand-in for FIEMAP (`disk_cut: sim_shadow`), every cut compared byte for byte with its disk (`disk_cut_verify`). `E2E_DISK_CUT=sim_shadow` runs the e2e harness the same way.
+  - The real FIEMAP and `FICLONERANGE` run only on XFS: on a host, and in the measurement run (not in CI).
+- **Disk space:** two shadows share every block with the disk except what changed since each one's cut (at most the last two turns' writes), and M2's transient cut file goes. `sandboxes_fit_their_disk`'s 8 GB a sandbox is meant to cover that (unverified on a used host).
+- **The command executor:** the pre-copy and the pause still run in the host's one executor, as M2's clone does, and a cut takes about two walks (pre-copy) plus one (pause). Moving a cut off the executor means answering `sandbox_checkpoint` after the batch's ack, which the fleet link doesn't allow today (results precede the ack). It is bounded instead: every step is O(records) at about 0.8 µs a record, off the async runtime (`spawn_blocking`), and a disk's count is in the log. **Open:** the off-executor cut.
+
 
 **The problem M2's measurement found:** `FICLONE` costs about 10–15 µs per extent record of the whole file: 2.4 s at 158 k records, 8.1 s at 819 k ([measured](#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)). A turn changes tens of MB, but a used disk carries every record its past writes split it into. M3′ makes the in-pause work follow what changed since the last cut.
 
