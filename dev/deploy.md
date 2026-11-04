@@ -87,11 +87,16 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Unconfirmed operator cleanups** (the owner to confirm they were done): the old SSM parameter `/nest/control-plane/vars/AWS_CELLS` if it was never imported into a cell stack; the legacy Worker secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `ROOT_CA_KMS_KEY_ID`, `ROOT_CA_CERT_PEM`) and the SSM parameter `/nest/control-plane/vars/ROOT_CA_KMS_KEY_ID`; the unattached reusable Access policies left by the edge stack's import; and respawning agents whose stored prompts still describe removed tools.
 - **Still needed by hosts:** `sandbox_create`, `sandbox_fork` and `agent_start` carry a `ws_` value (`compatWorkstream`), which hosts and runners from before workstreams left require (Rust's `WorkstreamId`, prefix-checked). Drop it from the control plane (and `SandboxInfo`/`AgentInfo`) once every host runs that release or later, then the Rust fields the release after. The policy layer's wire value `workstream` (the operator layer; hosts parse a closed enum) stays.
 
-**This release's rollout rule (on-demand fallback): not a one-way deploy, and nothing by hand.** When spot has no room for any instance type, FleetDO now tries each type on demand, in `launchTypes` order, stopping at the first launch. Before, it tried only the first type on demand.
-- **Why:** on 2026-11-03 the first type, `c8id.large`, had no on-demand capacity in any of the cell's zones, so a pass with no spot room launched nothing at all.
-- **Bounded:** one pass per demand, as before, with at most two RunInstances calls per type. An error that isn't a lack of room still ends the pass, and that attempt is repeated ([autoscaling](../docs/compute/autoscaling/)).
-- **Cost:** an on-demand host can now be any listed type. The dearest on-demand type in `use1`'s list bounds it; `maxHosts` caps the count, as before.
-- **Worker only:** FleetDO reads `instance_types` from `AWS_CELLS` as before. A rollback returns to first-type-only on demand.
+**This release's rollout rule (on-demand fallback): not a one-way deploy, and nothing by hand.**
+- **What changes:** when spot has no room for any instance type, FleetDO tries each type on demand, cheapest first. Before, it tried only the first type. The cell stack writes the order, `on_demand_types`, from its price table (Price List API, 2026-11-03/04). `use1` gets `c8i-flex.large, c8i.large, m8i.large, c8id.large`, and the brains `t3a.medium, t3.medium`.
+- **Why:** on 2026-11-03 the first type, `c8id.large`, had no on-demand capacity in any of the cell's zones, so a pass with no spot room launched nothing.
+- **Cost:** an on-demand sandbox host is `c8i-flex.large` ($0.08902/h) when it has room. That is cheaper than today's `c8id.large` fallback ($0.11088/h), and never dearer than the cheapest type with room.
+- **Bounded** ([autoscaling](../docs/compute/autoscaling/)):
+  - A pass makes at most two calls per type.
+  - A pass with no room anywhere, or a spent vCPU quota, starts a per-kind backoff: 60 s, doubling to 15 min, cleared by a launch.
+  - An error that isn't a lack of room still ends the pass, and that attempt is repeated.
+- **Order:** inframe writes `on_demand_types` into `AWS_CELLS`; then the Worker reads it. A Worker of the previous release ignores the field (zod strips it). A new Worker with an `AWS_CELLS` that lacks it tries `instance_types` in order.
+- **What a rollback does:** first-type-only on demand, and no backoff.
 
 **This release's rollout rule (checkpoint cuts, M2): not a one-way deploy, and nothing by hand.** The merge's own `deploy.yml` run does all of it. No Durable Object class is added, and the guest image doesn't change. The wire gains one optional field, `commit_request.cut_ms` (and `GenerationRecord.cut_ms`), which either side of the previous release ignores (zod strips it, and serde has no unknown-field refusal).
 - **The first run failed at `infra` (2026-11-03, run 41714276937), and nothing reached production.**

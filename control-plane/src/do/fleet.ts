@@ -8,7 +8,7 @@ import { num, type Env } from "../env";
 import { commandRefSlots, REF_PURPOSES, type RefPurpose } from "./broker";
 import { canonicalSpki, certificateSpki, createRootCertificate, generateDevRoot, kmsRoot, localRoot, signIntermediate, type RootCa } from "../lib/ca";
 import { AwsKms, type Kms } from "../lib/kms";
-import { AwsEc2, CapacityError, isDead, type Ec2 } from "../lib/ec2";
+import { AwsEc2, CapacityError, isDead, QuotaError, type Ec2 } from "../lib/ec2";
 import { AwsSsm, type Ssm } from "../lib/ssm";
 import { DEFAULT_IMAGE } from "./sandbox";
 import {
@@ -16,7 +16,7 @@ import {
   tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
 import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type CellAws } from "../lib/cells";
-import { brainHostNeeded, idleStep, maxBrains, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
+import { brainHostNeeded, idleStep, maxBrains, noRoomBackoffMs, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
 import { deathPlan, expiryVerdict, hostStep, type DeathCause, type HostTransition } from "../lib/host-lifecycle";
 import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
@@ -180,6 +180,8 @@ const orphansKey = (host: string) => `orphaned_commands:${host}`;
 /** A RunInstances attempt FleetDO hasn't seen the end of (`scaleUp`), kept in `kv` under `launchKey`. */
 interface LaunchIntent { token: string; type: string; subnet: string; spot: boolean; at: number }
 const launchKey = (role: HostKind) => `launch:${role}`;
+/** A kind's backoff after a launch pass where nothing had room: `{until_ms, wait_ms}`. */
+const noRoomKey = (role: HostKind) => `noroom:${role}`;
 /**
  * The old process's unanswered commands, and (until `dropUnreported` has run) the leases it held
  * that the new process doesn't report. An older shape is the bare array of commands.
@@ -2027,17 +2029,36 @@ export class FleetDO extends DurableObject<Env> {
     const now = Date.now();
     const plan = scaleUpPlan(s, live, pending, now);
     if (!plan.launch) return;
+    // A pass with no room anywhere waits before the next (each waiting sandbox and brain is demand).
+    const noRoom = this.noRoom(role);
+    if (noRoom && now < noRoom.until_ms) return;
     const cell = this.cellName();
     for (const [i, a] of plan.launch.entries()) {
       const intent = { token: `${cell ?? "cell"}-${role}-${now}-${i}`, type: a.type, subnet: a.subnet, spot: a.spot, at: now };
-      if ((await this.launchAttempt(ec2, cfg, s.launch_template_id, role, intent)) !== "capacity") return;
+      const r = await this.launchAttempt(ec2, cfg, s.launch_template_id, role, intent);
+      if (r === "launched") {
+        this.sql.exec("DELETE FROM kv WHERE key = ?", noRoomKey(role));
+        return;
+      }
+      // Kept to repeat (the tick does): no later type until EC2 answers it.
+      if (r === "failed") return;
+      if (r === "quota") break;
     }
+    const wait = noRoomBackoffMs(noRoom?.wait_ms ?? null);
+    this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", noRoomKey(role), JSON.stringify({ until_ms: now + wait, wait_ms: wait }));
+    console.warn(`FleetDO: no room for a ${role} host anywhere; the next launch pass waits ${wait / 1000} s`);
+  }
+
+  /** The kind's backoff after a pass where nothing had room (`noRoomBackoffMs`). */
+  private noRoom(role: HostKind): { until_ms: number; wait_ms: number } | null {
+    const v = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", noRoomKey(role)).toArray()[0]?.value;
+    return v === undefined ? null : (JSON.parse(v) as { until_ms: number; wait_ms: number });
   }
 
   /** One RunInstances attempt, recorded first; the record ends once it launched or EC2 had no room. */
   private async launchAttempt(
     ec2: Ec2, cfg: AwsCellConfig, template: string, role: HostKind, a: LaunchIntent,
-  ): Promise<"launched" | "capacity" | "failed"> {
+  ): Promise<"launched" | "capacity" | "quota" | "failed"> {
     this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", launchKey(role), JSON.stringify(a));
     this.launching.add(role);
     try {
@@ -2061,6 +2082,10 @@ export class FleetDO extends DurableObject<Env> {
         return "failed";
       }
       this.endLaunchIntent(role, a.token);
+      if (e instanceof QuotaError) {
+        console.warn(`FleetDO: quota spent launching ${a.type} (${a.spot ? "spot" : "on-demand"}): ${e.message}`);
+        return "quota";
+      }
       console.warn(`FleetDO: no capacity for ${a.type} (${a.spot ? "spot" : "on-demand"}): ${e.message}`);
       return "capacity";
     } finally {

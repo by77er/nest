@@ -76,6 +76,9 @@ structure CellSpec where
   enrollTimeoutMs : Nat := 600000
   /-- What a sandbox on regular pages is expected to use, reserved until the host counts it. -/
   sandboxReserveMib : Nat := 768
+  /-- On-demand prices in the cell's region, micro-USD an hour (Linux, AWS's Price List API), for
+  every type it may launch: FleetDO tries on demand cheapest first (`CellSpec.onDemandTypes`). -/
+  onDemandPrices : List (String × Nat) := []
   /-- At most this many sandboxes per host on regular pages; 0 is no cap. -/
   maxSandboxesPerHost : Nat := 0
   /-- Brain hosts (docs/compute/brain-hosts/): the instance families the control plane may launch
@@ -116,6 +119,31 @@ has a `.` after it. (`*` matches any run of characters, including none.) -/
 def matchesFamily (family type : String) : Bool :=
   family.toList.isPrefixOf type.toList && (type.toList.drop family.length).contains '.'
 
+/-- A type's on-demand price in `spec`'s table, if it has one. -/
+def CellSpec.priceOf (spec : CellSpec) (type : String) : Option Nat :=
+  (spec.onDemandPrices.find? (·.1.toList == type.toList)).map (·.2)
+
+/-- `t` into `sorted` (cheapest first) after every type no dearer: equal prices keep their order. -/
+def CellSpec.insertByPrice (spec : CellSpec) (t : String) : List String → List String
+  | [] => [t]
+  | u :: rest => if (spec.priceOf t).getD 0 < (spec.priceOf u).getD 0 then t :: u :: rest else u :: spec.insertByPrice t rest
+
+/-- `types` cheapest first on demand; equal prices keep their preference order (an insertion sort:
+structural, so `decide` reduces it). -/
+def CellSpec.cheapestFirst (spec : CellSpec) (types : List String) : List String :=
+  types.foldl (fun acc t => spec.insertByPrice t acc) []
+
+/-- The order FleetDO tries sandbox types on demand in, once spot had no room for any (`AWS_CELLS`
+`on_demand_types`): cheapest first, so an on-demand host is the cheapest that has room. -/
+def CellSpec.onDemandTypes (spec : CellSpec) : List String := spec.cheapestFirst spec.launchTypes
+
+/-- The same for brain hosts. -/
+def CellSpec.brainOnDemandTypes (spec : CellSpec) : List String := spec.cheapestFirst spec.brainLaunchTypes
+
+/-- Every type either kind may launch has a price in the table (so the order means something). -/
+def CellSpec.onDemandPriced (spec : CellSpec) : Bool :=
+  (spec.launchTypes ++ spec.brainLaunchTypes).all (fun t => (spec.priceOf t).isSome)
+
 /-- Every type the autoscaler may pick is one IAM lets it launch. -/
 def CellSpec.launchTypesAllowed (spec : CellSpec) : Bool :=
   spec.launchTypes.all fun t => spec.instanceFamilies.any (matchesFamily · t)
@@ -152,6 +180,7 @@ def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : Ce
     , field "launch_template_id" (quote launchTemplateId)
     , field "subnet_ids" (strings subnetIds)
     , field "instance_types" (strings (spec.launchTypes.map str))
+    , field "on_demand_types" (strings (spec.onDemandTypes.map str))
     , field "spot" (str (if spec.spot then "true" else "false"))
     , field "max_hosts" (number spec.maxHosts)
     , field "idle_grace_ms" (number spec.idleGraceMs)
@@ -162,6 +191,7 @@ def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : Ce
     , field "brain" (str "{" ++ join
         [ field "launch_template_id" (quote brainTemplateId)
         , field "instance_types" (strings (spec.brainLaunchTypes.map str))
+        , field "on_demand_types" (strings (spec.brainOnDemandTypes.map str))
         , field "spot" (str (if spec.brainSpot then "true" else "false"))
         , field "max_hosts" (number spec.brainMaxHosts)
         , field "idle_grace_ms" (number spec.brainIdleGraceMs)

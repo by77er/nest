@@ -22,9 +22,17 @@ export interface LaunchSpec {
 /** EC2 refused for lack of capacity or quota in this pool; another type, zone or market may work. */
 export class CapacityError extends Error {}
 
+/**
+ * The account's on-demand vCPU or instance quota is spent: no other type or zone will do better until
+ * a host goes, so a launch pass ends here. (A spot quota, `MaxSpotInstanceCountExceeded`, leaves on
+ * demand to try: it stays a plain `CapacityError`.)
+ */
+export class QuotaError extends CapacityError {}
+
+const QUOTA_CODES = ["VcpuLimitExceeded", "InstanceLimitExceeded"];
 const CAPACITY_CODES = [
   "InsufficientInstanceCapacity", "InsufficientCapacity", "SpotMaxPriceTooLow", "MaxSpotInstanceCountExceeded",
-  "VcpuLimitExceeded", "InstanceLimitExceeded", "Unsupported", "InsufficientFreeAddressesInSubnet",
+  ...QUOTA_CODES, "Unsupported", "InsufficientFreeAddressesInSubnet",
 ];
 
 export interface Ec2 {
@@ -65,6 +73,7 @@ export class AwsEc2 implements Ec2 {
     if (!ok) {
       if (text.includes("InvalidInstanceID.NotFound")) return "";
       const code = /<Code>([A-Za-z.]+)<\/Code>/.exec(text)?.[1] ?? "";
+      if (QUOTA_CODES.includes(code)) throw new QuotaError(`EC2 ${params.Action}: ${code}`);
       if (CAPACITY_CODES.includes(code)) throw new CapacityError(`EC2 ${params.Action}: ${code}`);
       throw new Error(`EC2 ${params.Action} failed: ${status} ${text.slice(0, 300)}`);
     }

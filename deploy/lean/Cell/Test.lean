@@ -111,6 +111,13 @@ example : matchesFamily "c8i" "c8i-flex.large" ∧ !matchesFamily "c8i" "c7i.lar
 launch never fails on `EightIOnly`. -/
 theorem launch_types_within_iam : use1.launchTypesAllowed = true := by decide
 
+/-- Every type has an on-demand price, and the on-demand order is cheapest first: an on-demand
+sandbox host is `c8i-flex.large` when it has room, never dearer than one that does. -/
+theorem on_demand_types_priced : use1.onDemandPriced = true := by decide
+
+example : use1.onDemandTypes.map (·.toList) = ["c8i-flex.large", "c8i.large", "m8i.large", "c8id.large"].map (·.toList)
+    ∧ use1.brainOnDemandTypes.map (·.toList) = ["t3a.medium", "t3.medium"].map (·.toList) := by decide
+
 /-- The same for its brain hosts and `BrainTypesOnly`. -/
 theorem brain_launch_types_within_iam : use1.brainLaunchTypesAllowed = true := by decide
 
@@ -131,6 +138,7 @@ def awsCellsHolds (spec : CellSpec) : Bool :=
         && cell.getObjValAs? String "launch_template_id" == .ok "lt-0abc"
         && cell.getObjValAs? (List String) "subnet_ids" == .ok ["subnet-0a", "subnet-0b"]
         && cell.getObjValAs? (List String) "instance_types" == .ok spec.launchTypes
+        && cell.getObjValAs? (List String) "on_demand_types" == .ok spec.onDemandTypes
         && cell.getObjValAs? Bool "spot" == .ok spec.spot
         && cell.getObjValAs? Nat "max_hosts" == .ok spec.maxHosts
         && cell.getObjValAs? Nat "idle_grace_ms" == .ok spec.idleGraceMs

@@ -1,7 +1,7 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { FleetDO } from "../src/do/fleet";
-import { CapacityError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
+import { CapacityError, QuotaError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
 import type { AwsCellConfig } from "../src/lib/cells";
 import { adminJson, connectHost, hostHello, manifest, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
 
@@ -227,6 +227,8 @@ class MockEc2 implements Ec2 {
   noCapacity = new Set<string>();
   /** Instance types that fail otherwise (IAM refusing them, say). */
   refused = new Set<string>();
+  /** Instance types whose launch finds the account's vCPU quota spent. */
+  quota = new Set<string>();
   states: (InstanceState | null)[];
   constructor(...states: (InstanceState | null)[]) {
     this.states = states;
@@ -235,6 +237,7 @@ class MockEc2 implements Ec2 {
     const key = `${spec.instanceType}/${spec.spot ? "spot" : "od"}`;
     this.asked.push(key);
     if (this.refused.has(key)) throw new Error("EC2 RunInstances: UnauthorizedOperation: You are not authorized to perform this operation.");
+    if (this.quota.has(key)) throw new QuotaError("EC2 RunInstances: VcpuLimitExceeded");
     if (this.noCapacity.has(key)) throw new CapacityError("InsufficientInstanceCapacity");
     this.launched.push(spec);
     return `i-0${this.launched.length.toString(16).padStart(8, "0")}`;
@@ -469,26 +472,67 @@ describe("autoscaling", () => {
     expect(ec2.launched).toEqual([expect.objectContaining({ instanceType: "c8i.large", spot: false })]);
   });
 
-  it("with no capacity anywhere, one pass tries each type once each way, and the next waits for the next demand", async () => {
+  /** The kind's no-room backoff as FleetDO keeps it, and a way to let it lapse. */
+  const noRoom = (cell: string) => runInDurableObject(fleetStub(cell), (_i, st) =>
+    st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'noroom:sandbox'").toArray().map((r) => JSON.parse(r.value) as { until_ms: number; wait_ms: number })[0] ?? null);
+  const lapse = (cell: string) => runInDurableObject(fleetStub(cell), (_i, st) => {
+    st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.until_ms', 0) WHERE key = 'noroom:sandbox'");
+  });
+
+  it("with no capacity anywhere, one pass tries each type once each way, then the kind backs off, 60 s doubling", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("running");
     for (const t of config.instance_types) for (const w of ["spot", "od"]) ec2.noCapacity.add(`${t}/${w}`);
     await autoscaled(cell, ec2);
-    const sbx = await createSandbox(cell, 202);
+    const before = Date.now();
+    await createSandbox(cell, 202);
     expect(ec2.asked).toEqual(["c8i-flex.large/spot", "c8i.large/spot", "c8i-flex.large/od", "c8i.large/od"]);
     expect(ec2.launched).toEqual([]);
-    // FleetDO's tick only repeats an unfinished attempt: a pass that ended on no capacity left none.
+    const first = await noRoom(cell);
+    expect(first!.wait_ms).toBe(60_000);
+    expect(first!.until_ms).toBeGreaterThanOrEqual(before + 60_000);
+    // Within the backoff, more demand (another sandbox, the tick) makes no RunInstances call at all.
+    await createSandbox(cell, 202);
     await tickAt(cell, ec2);
     expect(ec2.asked).toHaveLength(4);
-    // The sandbox's own placement retry, after its backoff, is the next demand: one more pass.
-    const place = await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) =>
-      st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'place'").toArray()[0]?.at);
-    expect(place).toBeGreaterThan(Date.now());
-    await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
-      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'place'");
-    });
-    await runDue(sandboxStub(sbx.sandbox));
+    // Once it lapses, the next demand makes one more pass, and the next wait doubles.
+    await lapse(cell);
+    await createSandbox(cell, 202);
     expect(ec2.asked).toHaveLength(8);
+    expect((await noRoom(cell))!.wait_ms).toBe(120_000);
+    // A launch ends the backoff.
+    ec2.noCapacity.delete("c8i.large/od");
+    await lapse(cell);
+    await createSandbox(cell, 202);
+    expect(ec2.launched).toEqual([expect.objectContaining({ instanceType: "c8i.large", spot: false })]);
+    expect(await noRoom(cell)).toBeNull();
+  });
+
+  it("on demand, the types go in the cell's on-demand order (cheapest first), not their spot order", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running");
+    for (const k of ["c8i-flex.large/spot", "c8i.large/spot", "c8i.large/od"]) ec2.noCapacity.add(k);
+    await runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+      inst.ec2Override = ec2;
+      inst.cellConfigOverride = { ...config, on_demand_types: ["c8i.large", "c8i-flex.large"] };
+    });
+    await createSandbox(cell, 202);
+    expect(ec2.asked).toEqual(["c8i-flex.large/spot", "c8i.large/spot", "c8i.large/od", "c8i-flex.large/od"]);
+    expect(ec2.launched).toEqual([expect.objectContaining({ instanceType: "c8i-flex.large", spot: false })]);
+  });
+
+  it("a spent vCPU quota ends the pass at once and backs off: no other type is tried, and nothing is kept to repeat", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running");
+    ec2.quota.add("c8i-flex.large/spot");
+    await autoscaled(cell, ec2);
+    await createSandbox(cell, 202);
+    expect(ec2.asked).toEqual(["c8i-flex.large/spot"]);
+    expect((await noRoom(cell))!.wait_ms).toBe(60_000);
+    const kept = await runInDurableObject(fleetStub(cell), (_i, st) => st.storage.sql.exec("SELECT 1 FROM kv WHERE key LIKE 'launch:%'").toArray().length);
+    expect(kept).toBe(0);
+    await tickAt(cell, ec2);
+    expect(ec2.asked).toHaveLength(1);
   });
 
   it("an error that isn't EC2 having no room ends the pass: no type after it is tried, and the attempt is kept to repeat", async () => {

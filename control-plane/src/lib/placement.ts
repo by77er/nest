@@ -113,6 +113,8 @@ export function maxBrains(configured: number | undefined, vcpus: number | null |
 /** One host kind's autoscaler settings (a cell's `AWS_CELLS` entry, or its `brain` section). */
 export interface ScaleSettings {
   instance_types: readonly string[];
+  /** The on-demand order (cheapest first); absent: `instance_types`. */
+  on_demand_types?: readonly string[];
   subnet_ids: readonly string[];
   spot: boolean;
   max_hosts: number;
@@ -132,9 +134,10 @@ export type ScaleUp =
  * A host of one kind is needed and none can take the work: launch one, unless one of that kind was
  * launched and hasn't enrolled (`pending`; one still in flight is the caller's to skip), or the kind
  * is at `max_hosts` (`live`: its active and STONITH-pending hosts; a draining one doesn't count). The
- * attempts, one pass: each instance type on spot, then each on demand, in `instance_types` order
- * (zones rotating with the second; the caller stops at the first launch, or at an error that isn't
- * EC2 having no room). The next pass is the next demand's, after its own backoff.
+ * attempts, one pass: each instance type on spot in `instance_types` order, then each on demand in
+ * `on_demand_types` order, cheapest first (zones rotating with the second). The caller stops at the
+ * first launch, at a spent quota, or at an error that isn't EC2 having no room; a pass where nothing
+ * had room starts FleetDO's backoff for the kind (`noRoomBackoffMs`).
  */
 export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, nowMs: number): ScaleUp {
   if (pending > 0) return { launch: null, why: "pending" };
@@ -143,9 +146,18 @@ export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, now
   return {
     launch: [
       ...(s.spot ? s.instance_types.map((type, i) => ({ type, subnet: zone(i), spot: true })) : []),
-      ...s.instance_types.map((type, i) => ({ type, subnet: zone(i), spot: false })),
+      ...(s.on_demand_types ?? s.instance_types).map((type, i) => ({ type, subnet: zone(i), spot: false })),
     ],
   };
+}
+
+/** The first wait after a pass where nothing had room, and its cap. */
+export const NO_ROOM_BACKOFF_FIRST_MS = 60_000;
+export const NO_ROOM_BACKOFF_MAX_MS = 15 * 60_000;
+
+/** The wait after another pass with no room: the first, then doubling to the cap. */
+export function noRoomBackoffMs(previousMs: number | null): number {
+  return previousMs === null ? NO_ROOM_BACKOFF_FIRST_MS : Math.min(NO_ROOM_BACKOFF_MAX_MS, previousMs * 2);
 }
 
 /** `busy` clears the clock, `start` starts it, `retire`: idle for the whole grace. */
