@@ -85,6 +85,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
               </FieldGroup>
             </Section>
           </Panel>
+          <LiveWorkers projectId={projectId} saved={settings.workers_edit_workflows === true} />
         </SectionGrid>
         <Toolbar>
           {onDone && (
@@ -166,9 +167,6 @@ export function RepoAutoMergeStatus({ projectId, status }: { projectId: string; 
 function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: string; checked?: boolean; onChange?: (e: React.ChangeEvent<HTMLInputElement>) => void; error?: React.ReactNode }) {
   const secrets = useSecrets(projectId);
   const allowed = secrets.data?.grant?.workflows;
-  // Each live worker's layer (applied, pending or failed), and whether its push token may change workflows as last applied.
-  const workers = (secrets.data?.agents ?? []).filter((a) => a.role === "worker");
-  const can = new Set(secrets.data?.workflow_workers ?? []);
   return (
     <Stack gap="sm">
       <Switch
@@ -184,15 +182,6 @@ function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: 
           The app's grant doesn't allow it: the operator sets github_push.workflows in its grant first.
         </Text>
       )}
-      {workers.length > 0 && (
-        <LiveAgents
-          framed={false}
-          agents={workers}
-          label="Live workers' push tokens"
-          empty=""
-          detail={(a) => (can.has(a.agent) ? "Its pushes may change workflows" : "Its pushes may not change workflows")}
-        />
-      )}
       {checked && (
         <Notice tone="warning" title="A pushed workflow runs before anyone reviews it">
           <Text fz="sm">
@@ -204,5 +193,40 @@ function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: 
         </Notice>
       )}
     </Stack>
+  );
+}
+
+/**
+ * The live workers' push tokens, against the saved setting: each worker's layer (applied, pending or
+ * failed) and, as last applied, whether its pushes may change workflows. One that differs from the
+ * setting says so, until its layer applies (or, applied, why: the grant doesn't allow it).
+ */
+function LiveWorkers({ projectId, saved }: { projectId: string; saved: boolean }) {
+  const secrets = useSecrets(projectId);
+  const workers = (secrets.data?.agents ?? []).filter((a) => a.role === "worker");
+  const can = new Set(secrets.data?.workflow_workers ?? []);
+  const allowed = secrets.data?.grant?.workflows !== false;
+  if (!workers.length) return null;
+  return (
+    <Panel data-slot="live-workers">
+      <Section title="Live workers" order={4} count={workers.length} region={false}>
+        <LiveAgents
+          framed={false}
+          agents={workers}
+          label="Live workers' push tokens"
+          empty=""
+          detail={(a) => {
+            const has = can.has(a.agent);
+            if (has === saved) return <span data-slot="workflows" data-matches="true">{has ? "Its pushes may change workflows" : "Its pushes may not change workflows"}</span>;
+            const why = a.state !== "applied" ? "until its layer applies" : saved && !allowed ? "the grant doesn't allow it" : "until its layer applies again";
+            return (
+              <Text component="span" fz="xs" c="warning" data-slot="workflows" data-matches="false">
+                {has ? "Still may change workflows" : "Can't change workflows yet"} · {why}
+              </Text>
+            );
+          }}
+        />
+      </Section>
+    </Panel>
   );
 }

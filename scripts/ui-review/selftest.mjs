@@ -5,7 +5,7 @@
 //   node scripts/ui-review/selftest.mjs
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
-import { inkChatFit, inkHeaderGap, inkPrs, inkTrace, removeFocusCheck, waitsCheck } from "./apps/projects.mjs";
+import { inkChatFit, inkHeaderGap, inkPrs, inkTrace, removeFocusCheck, waitsCheck, workflowsAgree } from "./apps/projects.mjs";
 import { measure, restoreTouch, scanHits } from "./checks.mjs";
 import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
 import { proseProblems } from "./trace-prose.mjs";
@@ -311,6 +311,16 @@ for (const remount of [false, true]) {
     ["the document scrolling", "[data-ds=page] { height: 1200px !important; }"],
     ["a short chat's composer floating above the bottom", "[data-ds=chat-log] p:nth-child(n+3) { display: none; } [data-ds=composer-dock] { position: static; }"],
   ]) assert.notDeepEqual(await fit(css), [], `chat-fit: ${plant} must fail`);
+  // Settings' live workers against the saved toggle (workflowsAgree): clean passes; an Applied row that
+  // contradicts it, and a differing one that doesn't say so, fail.
+  const workers = (on, rows) => `<label class="mantine-Switch-root"><input type="checkbox" role="switch" ${on ? "checked" : ""}> Workers may change CI workflows</label>
+    <div role="list" aria-label="Live workers' push tokens">${rows.map(([agent, state, text, matches]) => `<div data-agent="${agent}"><span data-slot="state">${state}</span><span data-slot="workflows" data-matches="${matches}">${text}</span></div>`).join("")}</div>`;
+  assert.deepEqual(await at(workers(false, [["agt_1", "Applied", "Its pushes may not change workflows", true], ["agt_2", "Pending", "Still may change workflows · until its layer applies", false]]), "", workflowsAgree), [], "agreeing workers pass");
+  for (const [plant, html] of [
+    ["an Applied row that contradicts the toggle", workers(false, [["agt_1", "Applied", "Still may change workflows · until its layer applies", false]])],
+    ["a differing row that doesn't say so", workers(true, [["agt_1", "Pending", "Its pushes may not change workflows", true]])],
+    ["an agreeing row that says it differs", workers(false, [["agt_1", "Applied", "Can't change workflows yet · until its layer applies again", false]])],
+  ]) assert.notDeepEqual(await at(html, "", workflowsAgree), [], `workflows: ${plant} must fail`);
   await page2.close();
 }
 

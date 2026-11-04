@@ -257,6 +257,31 @@ const longerTitles = (p, fixture) =>
     const tasks = fixed(fixture, "/projects/prj_demo/tasks").map((t) => ({ ...t, title: `${t.title}, now with a much longer title that wraps onto another line` }));
     return route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(tasks) });
   });
+// --- the live workers' push tokens agree with the saved setting ----------------------------------------
+
+/**
+ * Settings' live workers (README.md#secrets): an Applied row never contradicts the saved "Workers may
+ * change CI workflows" toggle (the form not edited, its switch is what's saved); one that differs is
+ * marked as such, and isn't Applied unless it names why. Self-contained (it runs in the selftest too).
+ */
+export function workflowsAgree() {
+  const sw = [...document.querySelectorAll('input[role="switch"], input[type="checkbox"]')].find((i) => i.closest("label, .mantine-Switch-root")?.textContent?.includes("Workers may change CI workflows"));
+  if (!sw) return [];
+  const saved = sw.checked;
+  const out = [];
+  for (const row of document.querySelectorAll('[aria-label="Live workers\' push tokens"] [data-agent]')) {
+    const state = row.querySelector("[data-slot=state]")?.textContent?.trim().toLowerCase();
+    const line = row.querySelector("[data-slot=workflows]");
+    const text = line?.textContent ?? "";
+    const has = /^Still may|^Its pushes may change/.test(text);
+    if (!line) out.push(`${row.getAttribute("data-agent")}: no line on its workflows`);
+    else if (state === "applied" && has !== saved && !/grant doesn't allow/.test(text)) out.push(`${row.getAttribute("data-agent")}: Applied, "${text}", with the toggle saved ${saved ? "on" : "off"}`);
+    else if (has !== saved && line.getAttribute("data-matches") !== "false") out.push(`${row.getAttribute("data-agent")}: "${text}" differs from the saved toggle without saying so`);
+    else if (has === saved && line.getAttribute("data-matches") === "false") out.push(`${row.getAttribute("data-agent")}: "${text}" says it differs from the saved toggle, which it agrees with`);
+  }
+  return out;
+}
+
 // --- rhythm: measured on what's painted (text and badges), never on the grown hit boxes ---------------
 // Each measure is self-contained (it runs in the page, and in the selftest on planted pages).
 
@@ -754,7 +779,7 @@ const app = {
       }));
       return [...(r.error ? [] : ["a refused save shows no reason under Save"]), ...(r.row ? [] : ["a refused save doesn't mark the host it names"]), ...(r.toast ? ["a refused save shows a toast"] : [])];
     } },
-    { name: "settings", section: "project", path: "/projects/prj_demo/settings" },
+    { name: "settings", section: "project", path: "/projects/prj_demo/settings", checkName: "workflows", check: (p) => p.evaluate(workflowsAgree) },
     { name: "switcher-open", section: "project", path: "/projects/prj_demo/reviews", full: false, widths: DESKTOP, after: async (p) => { await p.getByRole("button", { name: /Switch project/ }).click(); await p.keyboard.type("gad"); } },
     { name: "sidebar-drawer", section: "project", path: "/projects/prj_demo/board", full: false, widths: PHONE, after: menu },
     { name: "sidebar-drawer-switcher", section: "project", path: "/projects/prj_demo/board", full: false, widths: PHONE, after: async (p) => { await menu(p); await p.getByRole("button", { name: /Switch project/ }).click(); } },
