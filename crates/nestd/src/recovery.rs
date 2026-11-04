@@ -65,6 +65,9 @@ pub struct SentCommit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_manifest: Option<ManifestHash>,
     pub reason: CommitReason,
+    /// When the disk was cut (`commit_request.cut_ms`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cut_ms: Option<i64>,
 }
 
 /// Write `meta.json` into `dir` atomically: a temporary file, synced, renamed over the old one,
@@ -149,7 +152,10 @@ pub fn scan(sandboxes_dir: &Path) -> Vec<Found> {
                 Err(_) => MetaRead::Unreadable,
             };
             match (incarnation::disposition(read), meta) {
-                (Disposition::Found, Ok(meta)) => found.push(Found { meta, state_dir: path }),
+                (Disposition::Found, Ok(meta)) => {
+                    remove_cuts(&path);
+                    found.push(Found { meta, state_dir: path })
+                }
                 (Disposition::Remove, Ok(meta)) => {
                     tracing::warn!(path = %path.display(), names = %meta.sandbox, epoch = meta.epoch.0, "removing an incarnation directory whose meta.json names another incarnation");
                     remove(&path);
@@ -171,6 +177,17 @@ pub fn scan(sandboxes_dir: &Path) -> Vec<Found> {
     found
 }
 
+
+/// Remove the reflink cuts (`cut-<n>.img`) a dead process left in an incarnation directory: their
+/// background commits died with it, and its salvage reads the disk itself, which is newer.
+fn remove_cuts(dir: &Path) {
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        if incarnation::is_cut_file(&e.file_name().to_string_lossy()) {
+            tracing::info!(path = %e.path().display(), "removing a cut a previous nestd left");
+            remove(&e.path());
+        }
+    }
+}
 
 /// Remove the incarnation directories `<root>/<sandbox>/<epoch>` at or below `up_to` (a destroy),
 /// and `<root>/<sandbox>` once empty.
@@ -253,6 +270,7 @@ mod tests {
                 mem_manifest: None,
                 reason: CommitReason::TurnEnd,
                 created_ms: 1,
+                cut_ms: None,
             }),
             clean: false,
             unanswered: Some(SentCommit {
@@ -262,6 +280,7 @@ mod tests {
                 disk_manifest: ManifestHash(format!("blake3:{}", "1".repeat(64))),
                 mem_manifest: None,
                 reason: CommitReason::Salvage,
+                cut_ms: Some(2),
             }),
         }
     }
@@ -333,6 +352,23 @@ mod tests {
     }
 
     /// A destroy at an epoch removes that incarnation and older ones, never a newer one.
+    /// Cuts a dead process left are removed from the incarnations kept for salvage; the disk and
+    /// meta.json stay.
+    #[test]
+    fn a_scan_removes_the_cuts_a_dead_process_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let inc = dir.path().join("sbx_a/1");
+        std::fs::create_dir_all(&inc).unwrap();
+        write_meta(&inc, &meta("sbx_a", 1)).unwrap();
+        for f in ["disk.img", "cut-7.img", "cut-8.img"] {
+            std::fs::write(inc.join(f), b"x").unwrap();
+        }
+        let found = scan(dir.path());
+        assert_eq!(found.len(), 1);
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(&inc).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(left, ["disk.img", "meta.json"].into_iter().map(String::from).collect());
+    }
+
     #[test]
     fn remove_up_to_spares_newer_epochs() {
         let dir = tempfile::tempdir().unwrap();

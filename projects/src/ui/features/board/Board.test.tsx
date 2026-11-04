@@ -1,7 +1,7 @@
 // The board, rendered from the API: every state in its column and its semantic color (the owner's
 // direction: blue in progress, yellow stalled, green done, red cancelled, neutral before work starts),
 // cancelled hidden until asked for, and the markers that need the owner's eye.
-import { screen, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { TaskState } from "../../api/types";
 import { ask, FakeApi, task } from "../../test/fakeApi";
@@ -22,10 +22,38 @@ const EXPECTED: Record<TaskState, { column: string; role: "gray" | "primary" | "
 const column = (name: string) => screen.getByRole("region", { name });
 
 describe("the board", () => {
+  it("a badge with details is its tooltip's target, focusable, and its tooltip opens on hover, focus or a tap", async () => {
+    const api = new FakeApi();
+    api.tasks = [task({ title: "Held up", state: "in_progress", blocked: { at_ms: 1, by: "agt_w", role: "worker", reason: "needs a key", question: null, tainted: false } })];
+    const { user } = renderApp("/projects/prj_one/board", api);
+    const card = await screen.findByRole("article", { name: "Held up" });
+    // The trigger wraps the badge and keeps the Tooltip's props: it's what's focused and what opens it.
+    const trigger = card.querySelector("[data-marker=blocked]") as HTMLElement;
+    expect(trigger).toHaveAttribute("data-ds", "trigger-badge");
+    expect(trigger).toHaveAttribute("tabindex", "0");
+    expect(trigger.querySelector(".mantine-Badge-root")).toHaveTextContent("Blocked");
+    await user.hover(trigger);
+    expect(await screen.findByText("Blocked: needs a key")).toBeInTheDocument();
+    await user.unhover(trigger);
+    await waitFor(() => expect(screen.queryByText("Blocked: needs a key")).toBeNull());
+    // Focus opens it (the keyboard, and a tap, which focuses the trigger); touch is on in the theme.
+    act(() => trigger.focus());
+    expect(await screen.findByText("Blocked: needs a key")).toBeInTheDocument();
+  });
+
+  it("a card's title is the label weight, 500: a weight by name renders, not dropped", async () => {
+    const api = new FakeApi();
+    api.tasks = [task({ title: "Weighed", state: "ready" })];
+    renderApp("/projects/prj_one/board", api);
+    const card = await screen.findByRole("article", { name: "Weighed" });
+    const title = within(card).getByRole("link", { name: "Weighed" });
+    expect(getComputedStyle(title).fontWeight).toBe("500");
+  });
+
   it("puts every state in its column, its badge in its semantic color, cancelled behind the switch", async () => {
     const api = new FakeApi();
     api.tasks = (Object.keys(EXPECTED) as TaskState[]).map((state) => task({ title: `a ${state} task`, state }));
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/board", api);
 
     await screen.findByRole("article", { name: "a draft task" });
     expect(screen.queryByRole("article", { name: "a cancelled task" })).toBeNull();
@@ -51,7 +79,7 @@ describe("the board", () => {
     const plain = task({ title: "plain", state: "in_review" });
     api.tasks = [t, plain];
     api.asks = [ask({ task: t.id, question: "May I?" }), ask({ task: plain.id, answered_ms: 1 })];
-    renderApp("/projects/prj_one", api);
+    renderApp("/projects/prj_one/board", api);
 
     const card = await screen.findByRole("article", { name: "with markers" });
     expect(within(card).getByText("Tainted")).toBeInTheDocument();
@@ -69,7 +97,7 @@ describe("the board", () => {
   it("shows an empty board's next step, and a failed load with a way to retry", async () => {
     const api = new FakeApi();
     api.fail(/^GET \/api\/projects\/prj_one\/tasks$/, 500, "ProjectDO is unavailable");
-    const { user } = renderApp("/projects/prj_one", api);
+    const { user } = renderApp("/projects/prj_one/board", api);
 
     const alert = await screen.findByRole("alert");
     expect(alert).toHaveTextContent("The board couldn't be loaded");

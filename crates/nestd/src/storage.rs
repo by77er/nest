@@ -34,6 +34,10 @@ pub trait ObjectStore: Send + Sync {
     fn known_recent(&self, _hex: &str) -> bool {
         false
     }
+    /// Keep a copy of `hex` on this host, if the store keeps one at all: a pass for a same-host fork
+    /// asks for every chunk it reads, since the child restores from them next. Other commits keep
+    /// nothing local (the store's cache holds what was fetched).
+    fn keep_local(&self, _hex: &str, _data: &[u8]) {}
     fn put_chunk(&self, hex: &str, data: &[u8]) -> io::Result<()>;
     fn get_chunk(&self, hex: &str) -> io::Result<Vec<u8>>;
     fn put_manifest(&self, hex: &str, data: &[u8]) -> io::Result<()>;
@@ -200,6 +204,12 @@ fn finish(manifest: Manifest, deferred: Vec<(String, Vec<u8>)>, stats: ScanStats
 /// `store.parallelism()` workers. Non-zero chunks the store isn't known to hold are held back up to
 /// `hold_back` bytes, for [`publish`]; past that they are stored now.
 pub fn scan_file(store: &dyn ObjectStore, path: &Path, kind: ManifestKind, hold_back: usize) -> io::Result<Scanned> {
+    scan_file_keeping(store, path, kind, hold_back, false)
+}
+
+/// [`scan_file`], also keeping every non-zero chunk on this host when `keep_local` (a same-host
+/// fork's pass: [`ObjectStore::keep_local`]).
+pub fn scan_file_keeping(store: &dyn ObjectStore, path: &Path, kind: ManifestKind, hold_back: usize, keep_local: bool) -> io::Result<Scanned> {
     let chunk_size = match kind {
         ManifestKind::Disk => DISK_CHUNK,
         ManifestKind::Memory => MEMORY_CHUNK,
@@ -244,6 +254,9 @@ pub fn scan_file(store: &dyn ObjectStore, path: &Path, kind: ManifestKind, hold_
             return Ok(());
         }
         let hex = blake3::hash(&bytes).to_hex().to_string();
+        if keep_local {
+            store.keep_local(&hex, &bytes);
+        }
         let hex = place(store, hex, bytes, &budget, &deferred, &stats)?;
         chunks.lock().expect("chunks")[idx] = Some(format!("blake3:{hex}"));
         Ok(())
@@ -356,6 +369,149 @@ pub fn restore_file(store: &dyn ObjectStore, manifest_hash: &ManifestHash, dest:
     Ok(manifest)
 }
 
+/// Cut `src` into a new file `dst` with a reflink (`FICLONE`): `dst` shares every block `src` has
+/// now, and later writes to `src` copy-on-write. The clone takes `src`'s inode lock, so it is atomic
+/// against writes, and flushes `src`'s dirty pages first (`fs/remap_range.c`); its cost grows with
+/// `src`'s extent records, not its size. `ErrorKind::Unsupported`: the filesystem can't reflink
+/// (ext4, tmpfs, another filesystem): never a fallback to copying.
+pub fn reflink(src: &Path, dst: &Path) -> io::Result<()> {
+    let from = File::open(src)?;
+    let to = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    // SAFETY: FICLONE takes the source fd as its argument; both fds are ours and open.
+    let r = unsafe { libc::ioctl(to.as_raw_fd(), libc::FICLONE, from.as_raw_fd()) };
+    if r < 0 {
+        let e = io::Error::last_os_error();
+        let _ = fs::remove_file(dst);
+        return Err(match e.raw_os_error() {
+            Some(libc::EOPNOTSUPP) | Some(libc::EXDEV) | Some(libc::EINVAL) | Some(libc::ENOTTY) => io::Error::new(io::ErrorKind::Unsupported, format!("reflink: {e}")),
+            _ => e,
+        });
+    }
+    Ok(())
+}
+
+/// `struct fsxattr` (linux/fs.h), what `FS_IOC_FSGETXATTR` fills.
+#[repr(C)]
+#[derive(Default)]
+struct FsXattr {
+    xflags: u32,
+    extsize: u32,
+    nextents: u32,
+    projid: u32,
+    cowextsize: u32,
+    pad: [u8; 8],
+}
+
+/// `statfs(2)`'s `f_type` for XFS (linux/magic.h).
+const XFS_SUPER_MAGIC: u64 = 0x5846_5342;
+
+/// `FS_IOC_FSGETXATTR`: `_IOR('X', 31, struct fsxattr)`.
+const FS_IOC_FSGETXATTR: libc::Ioctl = libc::_IOR::<FsXattr>(b'X' as u32, 31);
+
+/// How many extent records `path` has now: what a [`reflink`] of it costs, in metadata
+/// ([`clone_slower_than_read`]). On XFS, the inode's own count (`fsx_nextents`, O(1), no lock that
+/// a writer waits on); elsewhere, FIEMAP asking for no extents, which walks them all. Blocking: call
+/// it off the async runtime.
+pub fn extent_count(path: &Path) -> io::Result<u64> {
+    let f = File::open(path)?;
+    // XFS_SUPER_MAGIC by value: nix names it on glibc only, and `f_type`'s width differs by libc.
+    #[allow(clippy::unnecessary_cast)]
+    let xfs = nix::sys::statfs::fstatfs(&f).is_ok_and(|st| st.filesystem_type().0 as u64 == XFS_SUPER_MAGIC);
+    if xfs {
+        let mut x = FsXattr::default();
+        // SAFETY: FS_IOC_FSGETXATTR writes one `struct fsxattr` we own.
+        let r = unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut FsXattr) };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(u64::from(x.nextents));
+    }
+    fiemap_extent_count(&f)
+}
+
+/// FIEMAP's count of `f`'s extents (`fm_extent_count` 0: the kernel answers only the count).
+fn fiemap_extent_count(f: &File) -> io::Result<u64> {
+    /// `struct fiemap` (linux/fiemap.h) with no extent array.
+    #[repr(C)]
+    struct Fiemap {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped_extents: u32,
+        extent_count: u32,
+        reserved: u32,
+    }
+    let mut m = Fiemap { start: 0, length: u64::MAX, flags: 0, mapped_extents: 0, extent_count: 0, reserved: 0 };
+    // SAFETY: FS_IOC_FIEMAP reads and writes a `struct fiemap` we own; with `extent_count` 0 the
+    // kernel writes no extent array past it.
+    let r = unsafe { libc::ioctl(f.as_raw_fd(), libc::_IOWR::<Fiemap>(b'f' as u32, 11), &mut m as *mut Fiemap) };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::from(m.mapped_extents))
+}
+
+/// Whether cloning a file of `extents` records (at `clone_ns_per_extent` each) would pause a VM
+/// longer than reading its `allocated` bytes (at `read_bytes_per_s`) would. M2's measurement put a
+/// clone at 10-15 us a record and a cold read at about 180 MB/s on a `c8id.large`
+/// (`docs/sandbox/state/disk/`), so a file has to average under about 2.7 KB a record for this to
+/// hold there: a guard against a slower clone, not the bound M3' is for.
+pub fn clone_slower_than_read(extents: u64, allocated: u64, clone_ns_per_extent: u64, read_bytes_per_s: u64) -> bool {
+    let clone_ns = u128::from(extents) * u128::from(clone_ns_per_extent);
+    let read_ns = u128::from(allocated) * 1_000_000_000 / u128::from(read_bytes_per_s.max(1));
+    clone_ns > read_ns
+}
+
+/// Whether files in `dir` can be reflinked (two scratch files, removed again).
+pub fn reflink_works(dir: &Path) -> bool {
+    let probe = dir.join(format!(".reflink-probe-{}", crate::util::random_hex(8)));
+    let clone = probe.with_extension("clone");
+    let ok = fs::write(&probe, b"nest reflink probe").is_ok() && reflink(&probe, &clone).is_ok();
+    let _ = fs::remove_file(&probe);
+    let _ = fs::remove_file(&clone);
+    ok
+}
+
+/// A stand-in for [`reflink`] where the filesystem has none, for tests and the e2e harness only: a
+/// hole-preserving copy of `src` taken under an exclusive `flock` on it, which a cooperating writer
+/// (holding a shared one per write) can't interleave with, as no write can with a real clone.
+pub fn locked_copy(src: &Path, dst: &Path) -> io::Result<()> {
+    let from = File::open(src)?;
+    // SAFETY: flock on an fd we own; released when `from` closes.
+    if unsafe { libc::flock(from.as_raw_fd(), libc::LOCK_EX) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let size = from.metadata()?.len();
+    let to = OpenOptions::new().write(true).create_new(true).open(dst)?;
+    to.set_len(size)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut pos = 0u64;
+    while pos < size {
+        let Some(data) = next_data(&from, pos)? else { break };
+        if data >= size {
+            break;
+        }
+        // SAFETY: lseek on an fd we own.
+        let hole = unsafe { libc::lseek(from.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
+        let end = if hole < 0 { size } else { (hole as u64).min(size) };
+        let mut at = data;
+        while at < end {
+            let n = (end - at).min(buf.len() as u64) as usize;
+            from.read_exact_at(&mut buf[..n], at)?;
+            to.write_all_at(&buf[..n], at)?;
+            at += n as u64;
+        }
+        pos = end;
+    }
+    to.sync_all()
+}
+
+/// `fdatasync` the file at `path`: what the guest flushed to the host's page cache reaches the
+/// disk, so a clone's own flush of `path` (inside a commit's pause) has little left to write.
+pub fn sync_data(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_data()
+}
+
 /// Create an empty sparse disk image of `gib` GiB.
 pub fn create_sparse(path: &Path, bytes: u64) -> io::Result<()> {
     if let Some(parent) = path.parent() {
@@ -367,6 +523,51 @@ pub fn create_sparse(path: &Path, bytes: u64) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn extent_count_counts_a_files_extent_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        let f = OpenOptions::new().write(true).create_new(true).open(&p).unwrap();
+        f.set_len(8 << 20).unwrap();
+        f.write_all_at(&[1u8; 4096], 0).unwrap();
+        f.write_all_at(&[2u8; 4096], 4 << 20).unwrap();
+        f.sync_all().unwrap();
+        match extent_count(&p) {
+            // Two writes with a hole between them: two records.
+            Ok(n) => assert_eq!(n, 2),
+            // tmpfs and some others can't say: a skip locally, a failure in CI (no silent skips).
+            Err(e) => {
+                assert!(matches!(e.raw_os_error(), Some(libc::EOPNOTSUPP) | Some(libc::ENOTTY)), "{e}");
+                assert!(std::env::var_os("NEST_CI_REQUIRE_USERNS").is_none(), "no FIEMAP on {}, and CI forbids skipping", dir.path().display());
+                eprintln!("NEST-TEST-SKIP: extent_count_counts_a_files_extent_records: no FIEMAP on {}", dir.path().display());
+            }
+        }
+    }
+
+    /// The XFS path's ABI: the request number and layout the kernel's `FS_IOC_FSGETXATTR` has
+    /// (linux/fs.h: `_IOR('X', 31, struct fsxattr)`, 28 bytes). The count itself is checked on a host,
+    /// where the cut's log line carries it (CI has no XFS).
+    #[test]
+    fn the_xfs_extent_count_asks_the_kernels_fsgetxattr() {
+        assert_eq!(std::mem::size_of::<FsXattr>(), 28);
+        assert_eq!(std::mem::offset_of!(FsXattr, nextents), 8);
+        // `Ioctl` is `c_ulong` on glibc and `c_int` on musl (the hosts' build): the cast is needed there.
+        #[allow(clippy::unnecessary_cast)]
+        let request = FS_IOC_FSGETXATTR as u64 & 0xffff_ffff;
+        assert_eq!(request, 0x801c_581f);
+    }
+
+    #[test]
+    fn a_clone_is_slower_than_a_read_only_past_the_measured_ratio() {
+        // 819 k records of a 6.7 GB disk at 15 us and 180 MB/s: 12 s against 37 s, so clone.
+        assert!(!clone_slower_than_read(818_954, 6_690_762_752, 15_000, 180_000_000));
+        // A disk of 4 KiB records the clone still wins; past 2.7 KB a record on average it loses.
+        assert!(!clone_slower_than_read(1_000, 4_096_000, 15_000, 180_000_000));
+        assert!(clone_slower_than_read(1_000, 2_000_000, 15_000, 180_000_000));
+        // A slower clone (another kernel, a busier disk) turns it.
+        assert!(clone_slower_than_read(818_954, 6_690_762_752, 60_000, 180_000_000));
+    }
+
     use std::io::Write;
 
     use super::*;
@@ -513,6 +714,50 @@ mod tests {
         // Another size: not reused, nothing read.
         OpenOptions::new().write(true).open(&img).unwrap().set_len(17 * DISK_CHUNK as u64).unwrap();
         assert!(rescan_unchanged(&local, &img, &prev, 64 << 20).unwrap().is_none());
+    }
+
+    /// Where the filesystem can't reflink (the test machine's ext4 or tmpfs), a cut says so and
+    /// leaves nothing behind; it never copies instead. Where it can, the clone has the source's bytes.
+    #[test]
+    fn a_reflink_is_a_clone_or_unsupported_never_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = image(dir.path());
+        let dst = dir.path().join("cut-1.img");
+        match reflink(&img, &dst) {
+            Ok(()) => {
+                assert!(reflink_works(dir.path()));
+                assert_eq!(fs::read(&img).unwrap(), fs::read(&dst).unwrap());
+            }
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::Unsupported, "{e}");
+                assert!(!dst.exists(), "a failed cut leaves no file");
+                assert!(!reflink_works(dir.path()));
+            }
+        }
+        assert!(!fs::read_dir(dir.path()).unwrap().any(|e| e.unwrap().file_name().to_string_lossy().starts_with(".reflink-probe")), "the probe cleans up");
+    }
+
+    /// The test cut copies the data and keeps the holes (a 64 MiB image of four data chunks stays
+    /// sparse), and a writer holding a shared `flock` waits for it.
+    #[test]
+    fn the_locked_copy_keeps_holes_and_excludes_a_locking_writer() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let img = image(dir.path());
+        let dst = dir.path().join("cut-1.img");
+        locked_copy(&img, &dst).unwrap();
+        assert_eq!(fs::read(&img).unwrap(), fs::read(&dst).unwrap());
+        assert!(fs::metadata(&dst).unwrap().blocks() * 512 < 8 * DISK_CHUNK as u64, "holes kept");
+        // A shared lock held elsewhere makes the copy wait.
+        let held = File::open(&img).unwrap();
+        // SAFETY: flock on an fd we own.
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_SH) }, 0);
+        let (img2, dst2) = (img.clone(), dir.path().join("cut-2.img"));
+        let t = std::thread::spawn(move || locked_copy(&img2, &dst2));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!t.is_finished(), "the copy waits for the writer's lock");
+        drop(held);
+        t.join().unwrap().unwrap();
     }
 
     #[test]

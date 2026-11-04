@@ -27,3 +27,116 @@ body {
     min-height: var(--nest-hit-touch);
   }
 }
+
+/* On touch, every control is the 44 px target (WCAG 2.5.8's inline exception aside: a link in a
+   sentence, marked data-inline by its component, keeps its line).
+   - A boxed control (a button, an icon or close button, a tab, a nav row, a field) is that size itself.
+   - A text control (a link, a link-styled button, a transcript's row) grows its hit box, not its line:
+     padding to 44 px around its line with an equal negative margin, so layout, rhythm and proximity
+     are as with a mouse; it's lifted over the text it reaches into (its own result, its caption).
+     `hit-overlap` guards it against reaching a neighbouring control. */
+@media (pointer: coarse) {
+  :is(button, [role="button"]):not(.mantine-Anchor-root, [data-ds="term-line"], [data-ds="row-action"]),
+  a[href]:is(.mantine-Button-root, [data-ds="nav-row"]) {
+    min-height: var(--nest-hit-touch);
+    min-width: var(--nest-hit-touch);
+  }
+
+  .mantine-Input-input {
+    min-height: var(--nest-hit-touch);
+  }
+
+  :is(a[href], button.mantine-Anchor-root):not([data-inline], .mantine-Button-root, [data-ds="nav-row"], [data-ds="badge-anchor"], [data-ds="card-title"]),
+  button[data-ds="term-line"] {
+    --nest-hit-pad: max(0px, calc((var(--nest-hit-touch) - 1lh) / 2));
+    padding-block: var(--nest-hit-pad);
+    margin-block: calc(var(--nest-hit-pad) * -1);
+    position: relative;
+    z-index: 1;
+  }
+
+  /* A short link (a PR's number) is the target's width too, the same way; one that wraps (a long repo
+     name) is one box, not ragged line fragments. */
+  :is(a[href], button.mantine-Anchor-root):not([data-inline], .mantine-Button-root, [data-ds="nav-row"], [data-ds="badge-anchor"], [data-ds="card-title"]) {
+    padding-inline: 0.625rem;
+    margin-inline: -0.625rem;
+    display: inline-block;
+  }
+}
+
+/* A data table (TableFrame): words wrap whole (never "thumbn|ails"), and the first column, the thing a
+   row is about, keeps room to read; the frame scrolls sideways instead. */
+[data-ds="table-frame"] :is(td, th),
+[data-ds="table-frame"] :is(td, th) * {
+  overflow-wrap: break-word;
+}
+
+[data-ds="table-frame"] :is(td, th):first-child {
+  min-width: 12rem;
+}
+
+/* On touch, a table's rows of controls (a review's verdict badges, its trace button) are a 44 px pitch
+   apart across rows too: each cell has the room. */
+@media (pointer: coarse) {
+  [data-ds="table-frame"] td {
+    padding-block: calc(var(--mantine-spacing-sm) + 0.375rem);
+  }
+}
+
+/* A transcript on touch (Terminal): each tool call (its row, its result, its expand row) stays one tight
+   group, and the groups move apart instead, by the room their rows' 44 px hit boxes need; the rows'
+   hit boxes never reach out of the terminal. */
+@media (pointer: coarse) {
+  [data-ds="terminal"] [data-kind="tool"] {
+    margin-block: calc((var(--nest-hit-touch) - 1lh) / 2);
+  }
+
+  /* An expanded result's top "(collapse)" row sits right under its call: two rows to tap, a 44 px
+     pitch apart (the result itself stays bound to its call below). */
+  [data-ds="terminal"] [data-slot="more"][data-at="top"] {
+    margin-top: calc(var(--nest-hit-touch) - 1lh - var(--mantine-spacing-2xs));
+  }
+
+  [data-ds="terminal"] {
+    overflow: clip;
+    overflow-clip-margin: 4px;
+  }
+}
+
+/* Rows of controls stacked in a block (a project's title, then its repo): on touch, a 44 px pitch, so
+   each row's target is its own without overlapping the next. Text-only neighbours never need this. */
+@media (pointer: coarse) {
+  [data-touch-pitch] {
+    row-gap: calc(var(--nest-hit-touch) - 1.125rem) !important;
+  }
+}
+
+/* A row pointed at from elsewhere ("Go to its rule"): its tint flashes once (the slow duration, easing out), as the skill lets a
+   changed value; focused, it shows the focus ring. No flash with reduced motion. */
+@keyframes nest-flash {
+  from {
+    background-color: var(--mantine-primary-color-light);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+
+[data-flash] {
+  animation: nest-flash var(--nest-motion-slow) var(--nest-ease-exit);
+  border-radius: var(--mantine-radius-sm);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-flash] {
+    animation: none;
+  }
+}
+
+/* On touch, a section whose heading has an action (Attach PR, Add dependency) keeps its first row's
+   controls clear of it: a little more room under the heading. */
+@media (pointer: coarse) {
+  [data-ds="section"]:has(> [data-slot="head"] [data-slot="actions"] :is(button, a[href])) {
+    row-gap: calc(var(--mantine-spacing-lg) + var(--mantine-spacing-sm)) !important;
+  }
+}

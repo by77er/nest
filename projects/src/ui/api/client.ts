@@ -9,7 +9,8 @@ import type {
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
 export class ApiError extends Error {
-  constructor(readonly status: number, message: string, readonly body: unknown = null) {
+  /** `body`: the answer's JSON, when it had any (a refusal's `problems`, say). */
+  constructor(readonly status: number, message: string, readonly body?: unknown) {
     super(message);
     this.name = "ApiError";
   }
@@ -61,7 +62,9 @@ export const api = {
   cancelTask: (id: string, task: string, b: CancelBody) => call<Task>("POST", `${tsk(id, task)}/cancel`, b),
   markDone: (id: string, task: string) => call<Task>("POST", `${tsk(id, task)}/done`),
 
-  chat: (id: string) => call<ChatMessage[]>("GET", `${prj(id)}/chat`),
+  /** The latest page, or the page before `before` (a seq): oldest first. */
+  chat: (id: string, before?: number) => call<ChatMessage[]>("GET", `${prj(id)}/chat${before === undefined ? "" : `?before=${before}`}`),
+  interruptManager: (id: string) => call<unknown>("POST", `${prj(id)}/manager/interrupt`),
   postChat: (id: string, b: ChatBody) => call<{ seq: number; delivered: boolean }>("POST", `${prj(id)}/chat`, b),
   asks: (id: string) => call<Ask[]>("GET", `${prj(id)}/asks`),
   attention: (id: string) => call<Attention[]>("GET", `${prj(id)}/attention`),

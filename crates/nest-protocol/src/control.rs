@@ -570,6 +570,11 @@ pub enum HostEventBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mem_manifest: Option<ManifestHash>,
         reason: CommitReason,
+        /// When the disk was cut (a reflink cut, then read in the background): the instant the
+        /// generation's disk describes, which a commit made from its own read omits (it is then
+        /// about when SandboxDO decides).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut_ms: Option<i64>,
     },
     /// What a host saw about a sandbox it holds (port opened, egress denied, egress alert). Its wire
     /// tag stays `workstream` (historical) so a control plane of the previous release parses it.

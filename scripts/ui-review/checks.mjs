@@ -6,11 +6,12 @@
  * @param {{
  *   frame: string, header: string, measure: string | null, containers: string[],
  *   nav: { rows: string, brand: string, active: string } | null, viewportOnly: boolean,
+ *   content?: { root: string, minHeading: number, figures: string } | null,
  * }} sel
  */
 export function measure(sel) {
   // `sel.touch`: a touch screen's width, where hit areas must not overlap (hit-overlap).
-  const problems = { overflow: [], clipping: [], contrast: [], nav: [], measure: [], frame: [], "hit-overlap": [] };
+  const problems = { overflow: [], clipping: [], contrast: [], nav: [], measure: [], frame: [], content: [], "hit-overlap": [], "hit-size": [] };
   const doc = document.documentElement;
   const W = doc.clientWidth;
   const H = window.innerHeight;
@@ -34,7 +35,8 @@ export function measure(sel) {
   // --- overflow: no horizontal page scroll, nothing partly outside the viewport ---
   if (doc.scrollWidth > W + 1) problems.overflow.push(`the page scrolls sideways: ${doc.scrollWidth} > ${W} px`);
   // --- clipping: nothing past its container's edge, nothing cut off by its own overflow ---
-  for (const el of document.body.querySelectorAll("*")) {
+  // `sel.hitsOnly`: a scroll scan's step (`scanHits`), which wants hit-overlap and hit-size only.
+  for (const el of sel.hitsOnly ? [] : document.body.querySelectorAll("*")) {
     if (!visible(el)) continue;
     const r = el.getBoundingClientRect();
     // Fully off screen is a closed drawer, not clipped content; partly off screen is clipped.
@@ -47,7 +49,7 @@ export function measure(sel) {
     if (cutsX && el.scrollWidth > el.clientWidth + 1) problems.clipping.push(`"${short(el.textContent)}" is cut off sideways (${el.scrollWidth} > ${el.clientWidth} px)`);
     else if (cutsY && el.clientHeight > 0 && el.scrollHeight > el.clientHeight + 2) problems.clipping.push(`"${short(el.textContent)}" is cut off below (${el.scrollHeight} > ${el.clientHeight} px)`);
   }
-  for (const card of document.querySelectorAll(sel.containers.join(", "))) {
+  for (const card of sel.hitsOnly ? [] : document.querySelectorAll(sel.containers.join(", "))) {
     if (!visible(card)) continue;
     const box = card.getBoundingClientRect();
     const name = card.getAttribute("aria-label") ?? card.getAttribute("data-ds") ?? card.tagName.toLowerCase();
@@ -105,7 +107,7 @@ export function measure(sel) {
   };
   const seen = new Set();
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+  for (let n = sel.hitsOnly ? null : walker.nextNode(); n; n = walker.nextNode()) {
     const el = n.parentElement;
     if (!el || seen.has(el) || !n.textContent.trim()) continue;
     seen.add(el);
@@ -217,6 +219,25 @@ export function measure(sel) {
       }
       return box;
     };
+    // Whether, under a, the browser would hand (x, y) to b: a set aside (it and its pseudo-elements take
+    // no pointer events for the probe), what's there is b or inside it. The browser's own answer covers
+    // every way b can be clipped or not (per axis, a clip margin, a fixed or absolute escape, clip-path,
+    // contain), so no CSS is reasoned about here.
+    const probe = document.createElement("style");
+    // a, its pseudo-elements, and everything inside it (a child with pointer-events: auto would still
+    // catch the probe).
+    probe.textContent = "[data-hit-probe], [data-hit-probe]::before, [data-hit-probe]::after, [data-hit-probe] *, [data-hit-probe] *::before, [data-hit-probe] *::after { pointer-events: none !important; }";
+    document.head.append(probe);
+    const underIs = (a, b, x, y) => {
+      a.setAttribute("data-hit-probe", "");
+      try {
+        const under = document.elementFromPoint(x, y);
+        return !!under && (under === b || b.contains(under));
+      } finally {
+        a.removeAttribute("data-hit-probe");
+      }
+    };
+    try {
     const boxes = controls.map(hitBox);
     for (let i = 0; i < controls.length; i++) {
       const a = controls[i];
@@ -232,20 +253,255 @@ export function measure(sel) {
         const l = Math.max(ha.l, rb.left), t = Math.max(ha.t, rb.top), r = Math.min(ha.r, rb.right), btm = Math.min(ha.b, rb.bottom);
         if (r - l < 1 || btm - t < 1) continue;
 
-        // Taps across where a's hit area meets b's box: one landing on a was meant for b.
+        // Taps across where a's hit area meets b's box: one landing on a was meant for b, where b is really
+        // there under a (not clipped away, scrolled out of its log): no tap is meant for what can't be seen.
         let found = null;
         for (const fx of [0.2, 0.5, 0.8]) {
           for (const fy of [0.2, 0.5, 0.8]) {
             const x = l + (r - l) * fx, y = t + (btm - t) * fy;
             if (x < 0 || y < 0 || x >= W || y >= H || inOwn(x, y)) continue;
-            if (controlAt(x, y) === a) found ??= [Math.round(x), Math.round(y)];
+            if (controlAt(x, y) === a && underIs(a, b, x, y)) found ??= [Math.round(x), Math.round(y)];
           }
         }
         if (found) problems["hit-overlap"].push(`a tap on ${label(b)} at ${found[0]},${found[1]} lands on ${label(a)}`);
       }
     }
+    } finally {
+      probe.remove();
+    }
+  }
+
+  // --- user content (Markdown, SVG) can't change the page's outline, hierarchy or ground ---
+  if (sel.content && !sel.hitsOnly) {
+    for (const root of document.querySelectorAll(sel.content.root)) {
+      if (!visible(root)) continue;
+      const body = parseFloat(getComputedStyle(root).fontSize);
+      for (const h of root.querySelectorAll("h1, h2, h3, h4, h5, h6")) {
+        if (!visible(h)) continue;
+        const level = Number(h.tagName[1]);
+        if (level < sel.content.minHeading) problems.content.push(`a heading in user content is an h${level}, above the h${sel.content.minHeading} it's demoted to: "${short(h.textContent)}"`);
+        const size = parseFloat(getComputedStyle(h).fontSize);
+        if (size < body - 0.5) problems.content.push(`a heading in user content is smaller than its text (${size} < ${body} px): "${short(h.textContent)}"`);
+      }
+    }
+    for (const fig of document.querySelectorAll(sel.content.figures)) {
+      if (!visible(fig)) continue;
+      const bg = ground(fig);
+      if (bg && lum(bg) < 0.85) problems.content.push(`a figure sits on a dark ground (${hex(bg)}), not a fixed light canvas`);
+      for (let e = fig.querySelector("img, svg") ?? fig; e; e = e.parentElement) {
+        if (/invert/.test(getComputedStyle(e).filter)) {
+          problems.content.push("a figure is inverted (filter: invert)");
+          break;
+        }
+      }
+    }
+  }
+
+  // --- hit-size (touch widths): a tap anywhere in a control's target square lands on it ---
+  // The square is 44 px, or, where another control's centre is nearer, that distance (each keeps its
+  // own share, never less than 24 px: WCAG 2.5.8's spacing); at least 90% of 25 taps across it must
+  // reach the control. A link inside running text (a block with text of its own around it) is the
+  // inline exception: it keeps the text's line, which must be at least 24 px. A whole-card link (its
+  // ::after stretched over the card) is that card: at least half of it must land on the link, the rest
+  // being the card's own controls.
+  if (sel.touch) {
+    const CONTROL = 'a[href], button, [role="button"], [role="tab"], input:not([type="hidden"]), select, textarea, [tabindex]:not([tabindex="-1"])';
+    const modals = [...document.querySelectorAll('[aria-modal="true"]')].filter(visible);
+    const layer = modals.at(-1) ?? document.body;
+    const own = (el, hit) => !!hit && (hit === el || el.contains(hit) || hit.closest(CONTROL) === el);
+    const inline = (el) => {
+      if (!el.matches("a")) return false;
+      const block = el.parentElement?.closest("p, li, blockquote, dd");
+      if (!block) return false;
+      return (block.textContent ?? "").replace(el.textContent ?? "", "").trim().length > 0;
+    };
+    const label = (el) => `<${el.tagName.toLowerCase()}> "${short(el.getAttribute("aria-label") ?? el.textContent)}"`;
+    /** What's open over the page for a moment: a tooltip, a dialog or drawer, a menu, a picker's list. */
+    const LAYER = '[role="tooltip"], [aria-modal="true"], [role="dialog"], [role="menu"], [role="listbox"], .mantine-Popover-dropdown, .mantine-Combobox-dropdown, .mantine-Menu-dropdown';
+    /** The hit is in a layer open over the control (a tooltip, a list), not one the control is in (its drawer). */
+    const openOver = (hit, el) => {
+      const l = hit?.closest(LAYER);
+      return !!l && !l.contains(el);
+    };
+    /** The hit is in a fixed or sticky layer that doesn't hold the control (it scrolled under it). */
+    const pinned = (hit, el) => {
+      for (let e = hit; e && e !== document.body; e = e.parentElement) {
+        if (e.contains(el)) return false;
+        if (/fixed|sticky/.test(getComputedStyle(e).position)) return true;
+      }
+      return false;
+    };
+    /** A link stretched over its card by an absolutely positioned ::after (or ::before): that box. */
+    const stretched = (el) => {
+      const r = el.getBoundingClientRect();
+      for (const pe of ["::after", "::before"]) {
+        const cs = getComputedStyle(el, pe);
+        if (cs.content === "none" || cs.content === "normal" || cs.position !== "absolute") continue;
+        const w = parseFloat(cs.width), h = parseFloat(cs.height);
+        if (w > r.width + 8 || h > r.height + 8) {
+          let box = el.offsetParent?.getBoundingClientRect();
+          if (box) return box;
+        }
+      }
+      return null;
+    };
+    const controls = [...layer.querySelectorAll(CONTROL)].filter((el) => visible(el) && !el.closest('[aria-hidden="true"], [inert]') && !el.matches(":disabled"));
+    const centre = (el) => {
+      const r = el.getBoundingClientRect();
+      return [r.left + r.width / 2, r.top + r.height / 2];
+    };
+    for (const el of controls) {
+      const r = el.getBoundingClientRect();
+      const [cx, cy] = centre(el);
+      if (cx < 0 || cy < 0 || cx >= W || cy >= H) continue;
+      // Not cut by a scroller it sits in (a table scrolled sideways, a drawer's body): scrolled to, it's whole.
+      let cut = false;
+      for (let e = el.parentElement; e && e !== document.body; e = e.parentElement) {
+        const cs = getComputedStyle(e);
+        if (!/(auto|scroll|hidden|clip)/.test(cs.overflowX + cs.overflowY)) continue;
+        const c = e.getBoundingClientRect();
+        if (r.left < c.left - 0.5 || r.right > c.right + 0.5 || r.top < c.top - 0.5 || r.bottom > c.bottom + 0.5) cut = true;
+      }
+      if (cut) continue;
+      // Covered at its centre: by a pinned bar it scrolled under or a layer over the page (a tooltip, a
+      // drawer, a menu), it's out of reach for now; by anything else, it can't be tapped at all.
+      const top = document.elementFromPoint(cx, cy);
+      if (!own(el, top)) {
+        const passing = !top || pinned(top, el) || openOver(top, el);
+        if (!passing) problems["hit-size"].push(`${label(el)}: covered at its centre by <${top.tagName.toLowerCase()}>${top.getAttribute("data-ds") ? ` (${top.getAttribute("data-ds")})` : ""}`);
+        continue;
+      }
+      if (inline(el)) {
+        const cs = getComputedStyle(el);
+        const lh = cs.lineHeight === "normal" ? parseFloat(cs.fontSize) * 1.2 : parseFloat(cs.lineHeight);
+        if (lh < 23.5) problems["hit-size"].push(`${label(el)}: an inline link on a ${Math.round(lh)} px line (at least 24)`);
+        continue;
+      }
+      const sample = (x0, y0, w, h, need, what) => {
+        let n = 0, hits = 0;
+        for (const fx of [-0.4, -0.2, 0, 0.2, 0.4]) {
+          for (const fy of [-0.4, -0.2, 0, 0.2, 0.4]) {
+            const x = x0 + fx * w, y = y0 + fy * h;
+            if (x < 0 || y < 0 || x >= W || y >= H) continue;
+            const hit = document.elementFromPoint(x, y);
+            // A layer open over it (a tooltip, a picker's list), or a fixed bar it has scrolled under (the
+            // app's header), is passing, not a neighbour: those taps don't count either way.
+            if ((hit && !el.contains(hit) && openOver(hit, el)) || pinned(hit, el)) continue;
+            n++;
+            if (own(el, hit)) hits++;
+          }
+        }
+        if (n && hits / n < need) problems["hit-size"].push(`${label(el)}: ${hits} of ${n} taps in ${what} land on it (${Math.round(r.width)}×${Math.round(r.height)} px)`);
+      };
+      const card = stretched(el);
+      if (card) {
+        sample(card.left + card.width / 2, card.top + card.height / 2, card.width, card.height, 0.5, "its card");
+        continue;
+      }
+      // Its share: the nearest other control's centre (one beside it, not inside it or around it).
+      let near = Infinity, who = null;
+      const layerOf = (x) => x.closest(LAYER);
+      for (const o of controls) {
+        // A neighbour the reader can reach: one under a floating control (a "Jump to live" pill over
+        // the rows) is covered, not beside it.
+        const [ox0, oy0] = centre(o);
+        if (!own(o, document.elementFromPoint(ox0, oy0))) continue;
+        // A neighbour shares its layer: a list open over the page has its own.
+        if (o === el || o.contains(el) || el.contains(o) || stretched(o) || layerOf(o) !== layerOf(el)) continue;
+        const [ox, oy] = centre(o);
+        const d = Math.max(Math.abs(ox - cx), Math.abs(oy - cy));
+        if (d < near) [near, who] = [d, o];
+      }
+      if (near < 23.5) {
+        problems["hit-size"].push(`${label(el)}: ${Math.round(near)} px from ${label(who)}, closer than 24`);
+        continue;
+      }
+      const size = Math.min(44, near);
+      sample(cx, cy, size, size, 0.9, `its ${Math.round(size)} px square`);
+    }
   }
 
   for (const k of Object.keys(problems)) problems[k] = [...new Set(problems[k])];
   return { problems, frame };
+}
+
+/**
+ * Touch emulation back on (`pointer: coarse`), as the context was made: a full-page screenshot ends it
+ * (Chromium resets its device metrics with it), and hit areas measured then wouldn't be touch's.
+ * Refuses to go on without it.
+ */
+export async function restoreTouch(page) {
+  if (await page.evaluate(() => matchMedia("(pointer: coarse)").matches)) return;
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 5 });
+  await cdp.send("Emulation.setEmitTouchEventsForMouse", { enabled: true, configuration: "mobile" });
+  await page.waitForTimeout(100);
+  if (!(await page.evaluate(() => matchMedia("(pointer: coarse)").matches))) throw new Error("touch emulation couldn't be restored after the screenshot");
+}
+
+/**
+ * hit-overlap and hit-size over everything a reader can scroll to, not the first viewport only: the
+ * page in viewport steps, then each scroller in the topmost layer (the topmost modal's, else the
+ * page's), sideways or down (a board's columns, a drawer's body, a table), brought into view and
+ * stepped through, each step measured (`measure` with `hitsOnly`). Scroll positions are put back.
+ * Answers each check's problems, once each.
+ */
+export async function scanHits(page, sel) {
+  const KEYS = ["hit-overlap", "hit-size"];
+  const found = Object.fromEntries(KEYS.map((k) => [k, new Set()]));
+  const take = async () => {
+    const p = (await page.evaluate(measure, { ...sel, touch: true, hitsOnly: true, viewportOnly: true })).problems;
+    for (const k of KEYS) for (const d of p[k]) found[k].add(d);
+  };
+  const steps = (max, step) => {
+    const out = [0];
+    for (let v = step; v < max; v += step) out.push(v);
+    if (max > 0) out.push(max);
+    return out;
+  };
+  // Mark the scrollers, outermost first, and note where everything is.
+  const { H, W, maxY, y0, n } = await page.evaluate(() => {
+    const visible = (el) => el.checkVisibility({ opacityProperty: true, visibilityProperty: true }) && el.getBoundingClientRect().width > 1 && el.getBoundingClientRect().height > 1;
+    const modals = [...document.querySelectorAll('[aria-modal="true"]')].filter(visible);
+    const layer = modals.at(-1) ?? document.body;
+    const scrolls = (v) => v === "auto" || v === "scroll";
+    let i = 0;
+    for (const el of [layer, ...layer.querySelectorAll("*")]) {
+      if (el === document.body || !visible(el)) continue;
+      const cs = getComputedStyle(el);
+      const x = scrolls(cs.overflowX) && el.scrollWidth > el.clientWidth + 1;
+      const y = scrolls(cs.overflowY) && el.scrollHeight > el.clientHeight + 1;
+      if (x || y) el.setAttribute("data-hit-scan", String(i++));
+    }
+    const d = document.documentElement;
+    return { H: window.innerHeight, W: d.clientWidth, maxY: d.scrollHeight - window.innerHeight, y0: window.scrollY, n: i };
+  });
+  try {
+    for (const y of steps(maxY, Math.round(H * 0.8))) {
+      await page.evaluate((v) => window.scrollTo(0, v), y);
+      await take();
+    }
+    for (let i = 0; i < n; i++) {
+      const box = await page.evaluate((i) => {
+        const el = document.querySelector(`[data-hit-scan="${i}"]`);
+        if (!el) return null;
+        el.scrollIntoView({ block: "nearest", inline: "nearest" });
+        return { mx: el.scrollWidth - el.clientWidth, my: el.scrollHeight - el.clientHeight, cw: el.clientWidth, ch: el.clientHeight, sl: el.scrollLeft, st: el.scrollTop };
+      }, i);
+      if (!box) continue;
+      for (const x of steps(Math.max(0, box.mx), Math.max(1, Math.round(Math.min(box.cw, W) * 0.8)))) {
+        for (const y of steps(Math.max(0, box.my), Math.max(1, Math.round(Math.min(box.ch, H) * 0.8)))) {
+          await page.evaluate(([i, x, y]) => document.querySelector(`[data-hit-scan="${i}"]`)?.scrollTo(x, y), [i, x, y]);
+          await take();
+        }
+      }
+      await page.evaluate(([i, x, y]) => document.querySelector(`[data-hit-scan="${i}"]`)?.scrollTo(x, y), [i, box.sl, box.st]);
+    }
+  } finally {
+    await page.evaluate((v) => {
+      for (const el of document.querySelectorAll("[data-hit-scan]")) el.removeAttribute("data-hit-scan");
+      window.scrollTo(0, v);
+    }, y0);
+  }
+  return Object.fromEntries(KEYS.map((k) => [k, [...found[k]]]));
 }

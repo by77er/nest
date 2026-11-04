@@ -123,6 +123,18 @@ export function TermLine({ glyph, glyphTone = "text", tone = "text", indent = 0,
   );
 }
 
+/**
+ * An assistant's Markdown in the terminal (the trace's TraceMarkdown renders into it): mono at the
+ * terminal's one size, styled as Claude Code prints Markdown (Terminal.module.css, `.md`).
+ */
+export function TermProse({ children }: { children: ReactNode }) {
+  return (
+    <div className={classes.md} data-ds="term-prose">
+      {children}
+    </div>
+  );
+}
+
 /** A quiet rule between turns: its label (a time, a stop reason, wrapping when narrow), then a hairline. */
 export function TermRule({ children }: { children: ReactNode }) {
   return (

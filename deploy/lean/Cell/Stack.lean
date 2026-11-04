@@ -464,7 +464,9 @@ def cell (spec : CellSpec) : Infra Unit := do
                                 ebs := some { volumeSize := 30, volumeType := "gp3", encrypted := "true", deleteOnTermination := "true" } }]
       tagSpecifications := [{ resourceType := "instance", tags := some (nestTags spec) },
                             { resourceType := "volume", tags := some (nestTags spec) }]
-      userData := some (unsafeCall "base64encode" [unsafeArgument (lit (bootstrap spec .sandbox))] : Input String)
+      -- Gzipped: EC2 allows 16 KB of user data before base64, and the script with install.sh inside is
+      -- over it; cloud-init unpacks gzip (scripts/tests/test_bootstrap.py checks the size).
+      userData := some (unsafeCall "base64gzip" [unsafeArgument (lit (bootstrap spec .sandbox))] : Input String)
       updateDefaultVersion := true }
 
   -- The brain launch template: the same AMI, cheap instances without nested virtualization, the
@@ -484,7 +486,8 @@ def cell (spec : CellSpec) : Infra Unit := do
                                 ebs := some { volumeSize := 30, volumeType := "gp3", encrypted := "true", deleteOnTermination := "true" } }]
       tagSpecifications := [{ resourceType := "instance", tags := some (nestTags spec) },
                             { resourceType := "volume", tags := some (nestTags spec) }]
-      userData := some (unsafeCall "base64encode" [unsafeArgument (lit (bootstrap spec .brain))] : Input String)
+      -- Gzipped, as the sandbox template's.
+      userData := some (unsafeCall "base64gzip" [unsafeArgument (lit (bootstrap spec .brain))] : Input String)
       updateDefaultVersion := true }
 
   -- The proxy root CA: a non-exportable P-256 signing key. FleetDO signs each host's intermediate

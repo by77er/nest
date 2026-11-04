@@ -8,7 +8,7 @@ import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { cssVariablesResolver, motion, theme } from "../theme";
-import { AppFrame, ErrorState, FieldGroup, LoadingState, NavGroup, NavGroups, NavRow, Page, PageHeader, Panel, PinnedFooter, Section, Toolbar } from ".";
+import { AppFrame, ErrorState, FieldGroup, LoadingState, Measure, NavGroup, NavGroups, NavRow, Page, PageHeader, Panel, Section, SectionGrid, Toolbar, WithContext } from ".";
 
 const wrap = (ui: ReactNode) => render(<MantineProvider theme={theme} cssVariablesResolver={cssVariablesResolver} env="test">{ui}</MantineProvider>);
 /** Whether `a` comes before `b` in the document. */
@@ -158,21 +158,48 @@ describe("AppFrame", () => {
   });
 });
 
-describe("Page and PinnedFooter", () => {
-  it("a reading page keeps its content to the reading measure, centred; a pinned footer sticks to the bottom", () => {
+describe("Page and Measure", () => {
+  it("the page has one frame, no measure of its own; a Measure is left-aligned in it", () => {
     wrap(
-      <Page measure="reading">
-        <PinnedFooter>
+      <Page>
+        <Measure type="reading">
           <button>Send</button>
-        </PinnedFooter>
+        </Measure>
       </Page>,
     );
-    const footer = screen.getByRole("button", { name: "Send" }).closest("[data-ds=pinned-footer]")!;
-    expect(style(footer)).toMatch(/position:\s*sticky/);
-    expect(style(footer)).toMatch(/bottom:\s*0/);
-    expect(style(footer.parentElement!)).toContain("var(--nest-reading-measure)");
-    // Centred in the content area, and the header inside the same column.
-    expect(style(footer.parentElement!)).toMatch(/margin-inline:\s*auto|margin-left:\s*auto/);
+    const content = document.querySelector("[data-ds=page-content]")!;
+    expect(style(content)).not.toMatch(/max-width/);
+    const measure = document.querySelector("[data-ds=measure]")!;
+    expect(style(measure)).toContain("var(--nest-reading-measure)");
+    // On the frame's left edge: never centred, so switching views never moves an edge.
+    expect(style(measure)).not.toMatch(/margin-(inline|left|right):\s*auto/);
+  });
+});
+
+describe("WithContext and SectionGrid", () => {
+  it("puts the content first and the context beside it, or above it in a disclosure when narrow", async () => {
+    wrap(
+      <WithContext measure="reading" contextLabel="About it" context={<p>context</p>}>
+        <p>content</p>
+      </WithContext>,
+    );
+    // jsdom matches no media query: the narrow layout, its context behind a disclosure above the content.
+    const toggle = await screen.findByRole("button", { name: "About it" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(before(toggle, screen.getByText("content"))).toBe(true);
+    await userEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("lays sections out in one column, two from lg", () => {
+    wrap(
+      <SectionGrid>
+        <p>a</p>
+        <p>b</p>
+      </SectionGrid>,
+    );
+    const grid = document.querySelector("[data-ds=section-grid]")!;
+    expect(grid.className).toMatch(/SimpleGrid/);
   });
 });
 
@@ -206,6 +233,35 @@ describe("the navigation primitives", () => {
 });
 
 describe("TriggerBadge", () => {
+  it("plainOnTouch: on a touch screen it's plain status, named, with no tap target and no tooltip; with a mouse a trigger", async () => {
+    const { Tooltip } = await import("@mantine/core");
+    const { TriggerBadge } = await import("./Actions");
+    const coarse = (on: boolean) =>
+      vi.stubGlobal("matchMedia", (query: string) => ({ matches: on && query === "(pointer: coarse)", media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => false }));
+    const card = () => (
+      <Tooltip label="Cache gadget thumbnails: Ready" events={{ hover: true, focus: true, touch: true }}>
+        <TriggerBadge plainOnTouch data-marker="waiting" aria-label="Waiting on 1: Cache gadget thumbnails">
+          Waiting on 1
+        </TriggerBadge>
+      </Tooltip>
+    );
+    coarse(true);
+    const user = userEvent.setup();
+    const view = wrap(card());
+    const plain = screen.getByRole("img", { name: "Waiting on 1: Cache gadget thumbnails" });
+    expect(plain).not.toHaveAttribute("tabindex");
+    await user.hover(plain);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.queryByText("Cache gadget thumbnails: Ready")).toBeNull();
+    view.unmount();
+    coarse(false);
+    wrap(card());
+    const trigger = screen.getByLabelText("Waiting on 1: Cache gadget thumbnails");
+    expect(trigger).toHaveAttribute("tabindex", "0");
+    await user.hover(trigger);
+    expect(await screen.findByText("Cache gadget thumbnails: Ready")).toBeInTheDocument();
+  });
+
   it("keeps its own class inside a Tooltip (which clones its className in), and so the theme's focus ring and touch target", async () => {
     const { Tooltip } = await import("@mantine/core");
     const { TriggerBadge } = await import("./Actions");
@@ -225,7 +281,9 @@ describe("TriggerBadge", () => {
     // The class's rules: the theme's 2 px primary ring, and on touch a reserved 44 px height (no
     // pseudo-element reaching over a neighbour).
     expect(css).toMatch(/\.trigger:focus-visible\s*\{[^}]*outline:\s*2px solid var\(--mantine-primary-color-filled\)/);
-    expect(css).toMatch(/@media \(pointer: coarse\)\s*\{\s*\.trigger\s*\{\s*min-height:\s*var\(--nest-hit-touch\)/);
+    // On touch its hit box is the 44 px target around the badge, without growing the line: padding with
+    // an equal negative margin.
+    expect(css).toMatch(/@media \(pointer: coarse\)\s*\{[^}]*\.trigger\s*\{[^}]*--nest-hit-pad:\s*calc\(\(var\(--nest-hit-touch\)[^}]*padding-block:\s*var\(--nest-hit-pad\);\s*margin-block:\s*calc\(var\(--nest-hit-pad\) \* -1\)/);
     expect(css).not.toMatch(/\.trigger::(before|after)/);
     // It's the tooltip's target: focus opens it.
     await user.tab();

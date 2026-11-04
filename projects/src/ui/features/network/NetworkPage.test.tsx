@@ -3,7 +3,7 @@
 // Manager page's pending waits.
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { FakeApi } from "../../test/fakeApi";
+import { FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 
 const page = () => screen.findByRole("heading", { name: "Network", level: 3 });
@@ -44,7 +44,7 @@ describe("the Network page", () => {
     await user.click(await screen.findByRole("option", { name: "Custom host" }));
     await user.type(within(m).getByRole("textbox", { name: "Host" }), "evil.example.com");
     await user.click(within(m).getByRole("button", { name: "Add" }));
-    expect(within(m).getByRole("alert")).toHaveTextContent(/the operator must widen the grant's egress_hosts/);
+    expect(within(m).getByRole("alert")).toHaveTextContent(/isn't in this app's grant; the operator must add it/);
     expect(within(m).queryByText("evil.example.com", { selector: "[data-host] *" })).toBeNull();
     // One inside it, on a port of its own.
     await user.clear(within(m).getByRole("textbox", { name: "Host" }));
@@ -82,6 +82,69 @@ describe("the Network page", () => {
   });
 });
 
+describe("the Network page's edits", () => {
+  it("removing a host by keyboard keeps focus: on the next row's Remove, the previous one's, then the Add select", async () => {
+    const api = new FakeApi();
+    api.network.rules = { worker: [{ host: "registry.npmjs.org" }, { host: "nodejs.org" }, { host: "pypi.org" }], manager: [] };
+    const { user } = renderApp("/projects/prj_one/network", api);
+    await page();
+    const w = role("worker");
+    within(w).getByRole("button", { name: "Remove registry.npmjs.org" }).focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(within(w).getByRole("button", { name: "Remove nodejs.org" })).toHaveFocus());
+    within(w).getByRole("button", { name: "Remove pypi.org" }).focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(within(w).getByRole("button", { name: "Remove nodejs.org" })).toHaveFocus());
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(picker(w)).toHaveFocus());
+  });
+
+  it("a refused save says why under Save and marks the host it names; no notification", async () => {
+    const api = new FakeApi();
+    api.network.rules = { worker: [{ host: "registry.npmjs.org" }], manager: [] };
+    api.networkRefusal = { status: 403, body: { error: "nodejs.org isn't in this app's grant; the operator must add it", problems: { "worker.nodejs.org": "nodejs.org isn't in this app's grant; the operator must add it" } } };
+    const { user } = renderApp("/projects/prj_one/network", api);
+    await page();
+    const w = role("worker");
+    await user.click(picker(w));
+    await user.click(await screen.findByRole("option", { name: /^Node downloads/ }));
+    await user.click(within(w).getByRole("button", { name: "Add" }));
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(document.querySelector('[data-slot="save-error"]')).toHaveTextContent(/The rules weren't saved: nodejs\.org isn't in this app's grant/));
+    const row = w.querySelector('[data-host="nodejs.org"]')!;
+    expect(row).toHaveAttribute("data-problem", "true");
+    expect(row).toHaveTextContent(/nodejs\.org isn't in this app's grant; the operator must add it/);
+    expect(document.querySelector(".mantine-Notification-root")).toBeNull();
+  });
+
+  it("a saved host since gone from the grant is kept, marked, and doesn't stop a save", async () => {
+    const api = new FakeApi();
+    api.network.rules = { worker: [{ host: "evil.example.com" }, { host: "pypi.org" }], manager: [] };
+    const { user } = renderApp("/projects/prj_one/network", api);
+    await page();
+    const w = role("worker");
+    expect(w.querySelector('[data-host="evil.example.com"]')).toHaveTextContent(/Outside the grant now: kept, not applied/);
+    await user.click(within(w).getByRole("button", { name: "Remove pypi.org" }));
+    const save = screen.getByRole("button", { name: "Save" });
+    expect(save).toBeEnabled();
+    await user.click(save);
+    await waitFor(() => expect(api.writes.at(-1)).toEqual({ method: "PUT", path: "/api/projects/prj_one/network", body: { worker: [{ host: "evil.example.com" }], manager: [] } }));
+    expect(await screen.findByText(/^Saved · /)).toBeInTheDocument();
+  });
+
+  it("marks a rule nest's defaults already allow", async () => {
+    const api = new FakeApi();
+    api.network.base = [{ host: "registry.npmjs.org", ports: [80, 443], source: "base" }];
+    api.network.rules = { worker: [{ host: "registry.npmjs.org" }, { host: "pypi.org", ports: [8443] }], manager: [] };
+    renderApp("/projects/prj_one/network", api);
+    await page();
+    expect(role("worker").querySelector('[data-host="registry.npmjs.org"]')).toHaveTextContent(/already allowed by the operator's policy/);
+    expect(role("worker").querySelector('[data-host="pypi.org"]')).not.toHaveTextContent(/already allowed/);
+    // And a line near the top says what the default allows.
+    expect(screen.getByText(/^Allowed by default: registry\.npmjs\.org/)).toBeInTheDocument();
+  });
+});
+
 describe("the manager's waits", () => {
   it("lists each pending wait with the time it has left, soonest first", async () => {
     const api = new FakeApi();
@@ -93,10 +156,40 @@ describe("the manager's waits", () => {
       ],
       recent: [],
     };
-    renderApp("/projects/prj_one/manager", api);
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    // In the context column (a disclosure above the chat below `lg`, as jsdom's width is).
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
     const list = await screen.findByRole("list", { name: "The manager's waits" });
+    expect(list.closest('[data-slot="manager-context"]')).not.toBeNull();
     const items = within(list).getAllByRole("listitem").map((li) => li.textContent);
-    expect(items).toEqual(["Waiting for #12 to merge · 20 min left", "Waiting for tsk_a to be in_review · 2 h left"]);
+    expect(items).toEqual(["#12 to merge · 20 min left", "a task to be In review · 2 h left"]);
+  });
+
+  it("names a task by its title (a link to its drawer) and a PR by its number (a link to GitHub); shows what resolved lately", async () => {
+    const api = new FakeApi();
+    const now = Date.now();
+    const t = task({ title: "Add search by tag", state: "in_progress" });
+    api.tasks = [t];
+    const w = (o: Partial<import("../../../waits").Wait>) => ({ id: `aw_${Math.random()}`, kind: "pr" as const, target: "118", want: "merged" as const, created_ms: now - 3_600_000, deadline_ms: now + 3_600_000, resolved_ms: null, outcome: null, detail: null, ...o });
+    api.waits = {
+      pending: [w({ kind: "task", target: t.id, want: ["in_review", "done"] })],
+      recent: [
+        w({ resolved_ms: now - 3 * 60_000, outcome: "met", detail: "merged" }),
+        w({ kind: "reply", target: null, want: null, resolved_ms: now - 10 * 60_000, outcome: "timed_out", detail: "timed out" }),
+        w({ target: "90", resolved_ms: now - 2 * 3_600_000, outcome: "met", detail: "merged" }),
+      ],
+    };
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
+    const list = await screen.findByRole("list", { name: "The manager's waits" });
+    expect(list).toHaveTextContent(/^Add search by tag to be In review or Done · (59|60) min left$/);
+    expect(within(list).getByRole("link", { name: "Add search by tag" })).toHaveAttribute("href", expect.stringContaining(`task=${t.id}`));
+    const done = screen.getByRole("list", { name: "The manager's resolved waits" });
+    expect(within(done).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["#118 merged · met 3 minutes ago", "The owner's reply · timed out 10 minutes ago"]);
+    expect(within(done).getByRole("link", { name: "#118" })).toHaveAttribute("href", expect.stringMatching(/github\.com\/.+\/pull\/118$/));
+    expect(done.querySelector('[data-tone="warning"]')).toHaveTextContent("timed out");
+    // No raw ids or snake_case states anywhere in it.
+    expect(screen.getByRole("heading", { name: "Waiting for" }).closest('[data-ds="section"]')!.textContent).not.toMatch(/tsk_|[a-z]_[a-z]/);
   });
 
   it("shows nothing when the manager waits for nothing", async () => {

@@ -1,6 +1,6 @@
 // Which project: the sidebar's switcher (layout/Switcher). Its button is the current project's name, or
 // "All projects" outside one (its "needs you" count is on its Board row, and every project's in the list). Picking a project keeps the view you're on (the
-// board from outside a project); "All projects" goes to the list.
+// manager, its default, from outside a project); "All projects" goes to the list.
 
 import { Badge } from "@mantine/core";
 import { IconFolders } from "@tabler/icons-react";
@@ -32,15 +32,15 @@ export function ProjectSwitcher({ projectId, view, onNavigate }: { projectId: st
     onNavigate();
     if (value === ALL) return void navigate({ to: "/projects" });
     const params = { projectId: value };
-    switch (view ?? "board") {
-      case "manager":
-        return void navigate({ to: "/projects/$projectId/manager", params, search: {} });
+    switch (view ?? "manager") {
+      case "board":
+        return void navigate({ to: "/projects/$projectId/board", params, search: {} });
       case "reviews":
         return void navigate({ to: "/projects/$projectId/reviews", params });
       case "settings":
         return void navigate({ to: "/projects/$projectId/settings", params });
       default:
-        return void navigate({ to: "/projects/$projectId/board", params, search: {} });
+        return void navigate({ to: "/projects/$projectId/manager", params, search: {} });
     }
   };
 

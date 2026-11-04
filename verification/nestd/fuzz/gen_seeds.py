@@ -85,6 +85,10 @@ def main():
         "reason": "turn_end",
     })
     write("meta_json", "unanswered", json.dumps(meta2, indent=2).encode())
+    # M2's cut: the head records when its disk was cut, and so does a commit left unanswered.
+    cut_head = json.loads((FIXTURES / "control/generation_record/generation_record.cut.json").read_text())
+    write("meta_json", "head_cut", json.dumps(dict(meta, head=cut_head), indent=2).encode())
+    write("meta_json", "unanswered_cut", json.dumps(dict(meta2, unanswered=dict(meta2["unanswered"], cut_ms=cut_head["cut_ms"])), indent=2).encode())
     minimal = {k: meta[k] for k in ("version", "sandbox", "epoch", "image", "resources")}  # `workstream` is optional
     write("meta_json", "minimal", json.dumps(minimal).encode())
 

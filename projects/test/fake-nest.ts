@@ -78,6 +78,7 @@ export class FakeNest {
   readonly inbox: { agent: string; text: string; from?: string; request_id?: string }[] = [];
   readonly catalog = new Map<string, unknown>();
   readonly answers: { agent: string; ask: string; answer: string }[] = [];
+  readonly interrupts: string[] = [];
   jwks: { keys: unknown[] } = { keys: [] };
   jwksFetches = 0;
   /** Failures to answer, in order, for calls whose `METHOD path` matches. */
@@ -314,6 +315,10 @@ export class FakeNest {
           return nestErr(500, "internal", "the answer was lost", true);
         }
         return json(201, { message: { seq: this.inbox.length } });
+      }
+      if (req.method === "POST" && sub === "/interrupt") {
+        this.interrupts.push(a.agent);
+        return json(200, { interrupted: a.ended ? "none" : "turn" });
       }
       if (req.method === "POST" && sub === "/stop") {
         a.ended = !!call.body?.end;

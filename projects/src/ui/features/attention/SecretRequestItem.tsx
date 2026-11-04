@@ -11,8 +11,7 @@ import { useProject, useSecretRequestDone } from "../../api/queries";
 import type { Attention } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
-import { icon, MetaItem, MetaRow, Notice, Prose, Stack, Toolbar } from "../../layout";
-import { fontWeights } from "../../theme";
+import { icon, MetaItem, MetaRow, Notice, Prose, Stack, Toolbar, weight } from "../../layout";
 
 type Item = Extract<Attention, { kind: "secret" }>;
 
@@ -47,7 +46,7 @@ export function SecretRequestItem({ projectId, item }: { projectId: string; item
       )}
       <Text fz="md">
         {item.type === "ci" ? "Asks for the GitHub Actions secret " : "Asks for a credential to inject, "}
-        <Text component="span" ff="monospace" fw={fontWeights.medium}>
+        <Text component="span" ff="monospace" fw={weight.medium}>
           {item.name}
         </Text>
         {item.type === "injected" && item.hosts?.length ? ` for ${item.hosts.join(", ")}` : ""}.
