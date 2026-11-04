@@ -141,14 +141,36 @@ M1 removes the wait for the store and the control plane from the pause, and the 
 - **Guest write stalls are still unmeasured.** The scattered writes had wrecked the aged disk's ext4, so its guest kernel couldn't mount root and panicked. The harness now boots a fresh root and writes the aged disk raw, as `/dev/vdb`.
 - **Capacity:** `c8id.large` had none in us-east-1a, 1b or 1c for about 20 minutes (three attempts, 20:48–21:11 UTC). FleetDO falls back to the EBS-only types meanwhile ([M2](#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)).
 
-**Recommendation:** option 1 plus a record budget kept by background defragmentation (option 3's exchange-range).
-- The walk is the pause, and it is linear in records. Defragmentation keeps records low while the VM runs, a range at a time, each exchange atomic. At about 100–200 k records the walk would be about 80–160 ms (in Rust, unverified), inside the gate.
-- Both are XFS alone: no device layer, no guest change.
-- Option 2 (dm-era) is the fallback, if a record budget can't be held under a guest that fragments on purpose. Its pause doesn't depend on records at all.
-- Taking the cut off the serial executor is needed either way.
-- **Before building:**
-  - one more run, with the same harness and its layers (about 40 minutes, about $0.08): the guest write stalls, the exchange-range defragmentation's throughput and the records it leaves, and a compiled diff;
-  - then a prototype in nestd behind `disk_cut`.
+**Measured again (2026-11-04, one `m8id.large` in us-east-1c, `i-0fd14be72de7081ed`, the same 118 GB NVMe and kernel; `c8id.large` had no capacity; results in `dev/measure-cut/results-m3-i-0fd14be72de7081ed.json`), with a compiled diff (`fdiff.c`), defragmentation, and a VM writing:**
+
+| 32 GiB disk | XFS records | `FICLONE` (M2) | FIEMAP walk, kernel, cold / warm | compiled diff |
+|---|---|---|---|---|
+| fresh | 60 | 14 ms | 0.03 ms | 0 ms |
+| after 1 GiB churn | 301,039 | 1.6–2.7 s | 584 / 223 ms | 1.5 ms |
+| month-aged | 895,121 | 8.0–10.8 s | 1,942 / 829 ms | 4.5 ms |
+| month-aged, defragmented | 551,763 | 3.1–5.1 s | 1,059 / 403 ms | 2.6 ms |
+
+- **Option 1, compiled, is the walk and little else:**
+  - On the month-aged disk the in-pause step took 686 ms after a turn: walk 674 ms, diff 4 ms, residue clone 1.2 ms (262 ranges), sync 7 ms. After 1 GiB it took 868 ms.
+  - The shadow equalled the disk in every run.
+  - The diff is now about 0.005 µs a record; the walk is about 0.75–0.9 µs warm, about 2 µs cold.
+- **Guest write stalls, with a VM writing 4 KiB `O_DSYNC` records to the aged disk:**
+  - The guest's worst write in a second is the pause: 6.6–6.7 s under M2 (pauses 6,586–6,744 ms), and 0.88–0.90 s under option 1 (pauses 872–904 ms).
+  - Between pauses its worst write in a second was 17 ms (median).
+  - So the pause is the stall, and option 1 cuts it about 7.5×.
+- **Defragmentation by exchange-range works, but only halves the records here:**
+  - It rewrote all 256 churned 64 MiB chunks (7.7 GB copied in 101 s, of which 10.4 s were the exchanges).
+  - Records went from 1.11 M to 552 k. Copying keeps holes, and this disk's churn left about that many separate written islands in a sparse file.
+  - Defragmenting further would mean filling holes: space, and a disk that is no longer sparse.
+  - After it, M2's clone took about 4.9 s and option 1's pause 428 ms. The next pre-copy re-cloned everything (17 s while the VM ran), since defragmentation unshares every block it moves.
+  - Whether a real guest's ext4 fragments its image this way is unmeasured: the harness's random 4 KiB writes over 16 GiB of a raw image are a worst case.
+- **Cost:** about 38 minutes of `m8id.large` on demand ($0.13052/h), about $0.085.
+
+**Recommendation (revised):**
+- **Build option 1, compiled.** It cuts the pause, and with it the guest's stall, about 7.5–10× on an aged disk (8 s to 0.7–0.9 s), with no new layer.
+- **Meanwhile, measure real disks' records:** nestd's cut log line carries the count on every `c8id`/`m8id` host. At about 0.8 µs a record, the 200 ms gate holds up to about 250 k records.
+- **Decide on option 2 (dm-era) from those numbers.** Its pause doesn't depend on records at all, so it is the path if real disks exceed about 250 k.
+- **Defragmentation isn't worth building on these numbers:** it halves the records at the cost of unsharing everything and a full re-clone.
 
 **How to measure, with the same harness and its cleanup layers:** one `c8id.large`, about 40 minutes, about $0.08 on demand. It adds these phases to `dev/measure-cut/on-host.sh`, on the same fresh, churned and month-aged disks:
 - FIEMAP (with `FIEMAP_FLAG_SYNC`) time against the record count;

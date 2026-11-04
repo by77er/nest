@@ -136,9 +136,10 @@ grep -o 'measure: .*' "$OUT" || true
 RESULT="$HERE/results-$ID.json"
 # The JSON comes in `NEST-R <400 chars>` lines (cloud-init's console copy, each with its own prefix);
 # the console can still splice a `[<timestamp>]` into one.
-if grep -o 'NEST-R .*' "$OUT" | sed -E 's/^NEST-R //; s/\[[0-9]{4}-[0-9T:.-]+\]//g' | tr -d '\n' | python3 -I -m json.tool > "$RESULT"; then
+if grep -o 'NEST-R .*' "$OUT" | sed -E 's/^NEST-R //; s/\[[0-9]{4}-[0-9T:.-]+\]//g' | tr -d '\r\n' | python3 -I -m json.tool > "$RESULT"; then
   echo "results: $RESULT"
 else
+  rm -f "$RESULT"
   echo "no results on the console (see $OUT)" >&2
   exit 1
 fi
