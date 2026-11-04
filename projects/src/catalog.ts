@@ -35,6 +35,7 @@ export const PROMPTS = {
     "Your replies render as Markdown (GitHub's: headings, lists, task lists, tables, code blocks, links) with LaTeX math ($…$ inline; display math as $$ on a line, the formula, $$ on a line, or a ```math block). You may include a diagram as SVG in a ```svg block: no scripts, no event handlers, no external references (links, images, fonts or styles from anywhere else are removed); keep it under 200 KB. Raw HTML isn't rendered.",
     "When you create a task, or report on one or several, reference them as [title](task:tsk_…) or a bare task:tsk_…, or list them in a ```tasks block, one id per line with an optional short note after it. They render as live cards showing the task's title, state, assignee, PRs and reviews, so don't restate those; say only what the card doesn't.",
     "When one task needs another done first, say so with add_dependency: it won't be assigned until that one is done. A task may have several PRs: attach_pr and detach_pr; it's done once all its attached PRs have merged.",
+    "To wait for something, don't poll and don't keep a turn open: call await_task (a task reaching a state), await_pr (a PR merging, finishing its review, or closing) or await_reply (the owner answering), with a timeout, then end your turn. You are woken by whichever comes first: a message saying it happened, or that it timed out. Each answers at once if it holds already. To come back to something at a time of your own (\"check again in two hours\"), set a timer with timer_set and end your turn; it wakes you with its note.",
   ].join("\n"),
   worker: [
     "You are a worker on a task board. You have one task: read it with projects-task get_task.",
@@ -77,10 +78,11 @@ function mcpCapability(base: string, server: Server, prompt: string) {
  * (`repos`, the worker's) or only `read` (`read_repos`: the manager and the reviewer, which nest refuses
  * to push). Each spawn narrows it to its own project's (`overrides.repos` or `overrides.read_repos`).
  */
-const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read", subagents = false) => ({
+const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read", subagents = false, timers = false) => ({
   // `nest` allows the nest tools without a prompt and `hands` gives the sandbox's tools: the operator's
-  // capabilities, which a client's templates may name.
-  capabilities: ["nest", "hands", ...(subagents ? WORKER_EXTRA.capabilities : []), `${NAMESPACE}/${capability}`],
+  // capabilities, which a client's templates may name. `timers` (nest's timer_set, timer_cancel and
+  // timer_list) is the manager's only: workers have nothing to wait for that their task doesn't bring.
+  capabilities: ["nest", "hands", ...(subagents ? WORKER_EXTRA.capabilities : []), ...(timers ? ["timers"] : []), `${NAMESPACE}/${capability}`],
   launch: { builtin_tools: [...BUILTIN_TOOLS, ...(subagents ? WORKER_EXTRA.builtin_tools : [])], system_prompt: { mode: "append", text: prompt } },
   hands: "required",
   credential: CREDENTIAL,
@@ -102,7 +104,7 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
       [`${NAMESPACE}/review`]: mcpCapability(base, "review", "The projects-review tools read the PR you review and take your verdict."),
     },
     templates: {
-      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read"),
+      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read", false, true),
       [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push", true),
       [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, sorted, "read"),
     },

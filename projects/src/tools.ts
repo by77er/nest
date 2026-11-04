@@ -2,6 +2,8 @@
 // role, so a role's tool list is its URL's. The catalog (src/catalog.ts) names the same tools, and their
 // read-only and idempotent marks, so nest's connector and retries agree with what the server does.
 
+import { TASK_STATES } from "./tasks";
+
 export const SERVERS = ["board", "task", "review"] as const;
 export type Server = (typeof SERVERS)[number];
 export type Role = "manager" | "worker" | "reviewer";
@@ -25,6 +27,8 @@ const obj = (properties: Record<string, unknown>, required: string[] = []) => ({
 const str = (description: string, maxLength = 4000) => ({ type: "string", description, maxLength });
 const strs = (description: string) => ({ type: "array", items: { type: "string", maxLength: 1000 }, maxItems: 50, description });
 const taskId = str("The task's id (tsk_…).", 64);
+/** A wait's timeout: 10 s to 30 days (src/waits.ts). */
+const timeout = { type: "integer", minimum: 10, maximum: 30 * 24 * 3600, description: "How long to wait at most, in seconds (10 s to 30 days)." };
 const dimension = (question: string) => ({
   ...obj({ verdict: { type: "string", enum: ["pass", "fail"], description: question }, notes: str("Why: specific files, lines and reasons.", 20000) }, ["verdict", "notes"]),
   description: question,
@@ -69,6 +73,34 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
       inputSchema: obj({ task: taskId, reason: str("What blocks it, specifically.", 2000), question: str("What you need the owner to answer or do, if anything.", 2000) }, ["task", "reason"]),
     },
     { name: "unblock_task", description: "Clear a task's block (resolved another way).", inputSchema: obj({ task: taskId, note: str("How it was resolved.", 1000) }, ["task"]), idempotent: true },
+    {
+      name: "await_task",
+      description: "Wait for a task to reach one of `states`, for at most timeout_s. Answers at once if it's there already; otherwise end your turn: your inbox gets one message when it gets there, when the task ends first, or when the timeout passes.",
+      inputSchema: obj({
+        task: taskId,
+        states: { type: "array", items: { type: "string", enum: [...TASK_STATES] }, minItems: 1, maxItems: 8, description: "The states that end the wait." },
+        timeout_s: timeout,
+      }, ["task", "states", "timeout_s"]),
+      idempotent: true,
+    },
+    {
+      name: "await_pr",
+      description: "Wait for a PR of the project's repo to merge, to finish its review (a verdict, or the review failing), or to close, for at most timeout_s. End your turn: your inbox gets one message when it does, when the PR closes first, or when the timeout passes.",
+      inputSchema: obj({
+        pr: { type: "integer", minimum: 1, description: "The PR's number." },
+        until: { type: "string", enum: ["merged", "review_done", "closed"], description: "What ends the wait." },
+        timeout_s: timeout,
+      }, ["pr", "until", "timeout_s"]),
+      idempotent: true,
+    },
+    {
+      name: "await_reply",
+      description: "Wait for the owner's reply (a chat message, or an answer in Needs you) for at most timeout_s. End your turn: your inbox gets one message when they reply or when the timeout passes; the reply itself arrives as usual.",
+      inputSchema: obj({ timeout_s: timeout }, ["timeout_s"]),
+      idempotent: true,
+    },
+    { name: "cancel_wait", description: "Drop a pending wait (aw_…): no message comes for it.", inputSchema: obj({ wait: str("The wait's id.", 64) }, ["wait"]), idempotent: true },
+    { name: "list_waits", description: "Your pending waits, each with its deadline.", inputSchema: obj({}), readOnly: true, idempotent: true },
   ],
   task: [
     { name: "get_task", description: "Your task: its title, body, spec, repo, the branch to push, its attached PRs, and the tasks it waits on (its dependencies) with their states.", inputSchema: obj({}), readOnly: true, idempotent: true },

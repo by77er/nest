@@ -2,13 +2,15 @@
 // with every call and the page holds no credential of its own.
 
 import type {
+  NetworkBody, NetworkView, Waits,
   AddDependencyBody, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
   Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
 } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
 export class ApiError extends Error {
-  constructor(readonly status: number, message: string) {
+  /** `body`: the answer's JSON, when it had any (a refusal's `problems`, say). */
+  constructor(readonly status: number, message: string, readonly body?: unknown) {
     super(message);
     this.name = "ApiError";
   }
@@ -36,7 +38,7 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
   }
   if (!res.ok) {
     const error = typeof data === "object" && data !== null && typeof (data as { error?: unknown }).error === "string" ? (data as { error: string }).error : null;
-    throw new ApiError(res.status, error ?? `${res.status} ${res.statusText}`.trim());
+    throw new ApiError(res.status, error ?? `${res.status} ${res.statusText}`.trim(), data);
   }
   return data as T;
 }
@@ -75,6 +77,9 @@ export const api = {
   answerAsk: (id: string, ask: string, b: AnswerBody) => call<{ delivered: unknown }>("POST", `${prj(id)}/asks/${encodeURIComponent(ask)}/answer`, b),
 
   manager: (id: string) => call<ManagerStatus>("GET", `${prj(id)}/manager`),
+  waits: (id: string) => call<Waits>("GET", `${prj(id)}/waits`),
+  network: (id: string) => call<NetworkView>("GET", `${prj(id)}/network`),
+  setNetwork: (id: string, b: NetworkBody) => call<NetworkView>("PUT", `${prj(id)}/network`, b),
   retryAttach: (id: string) => call<Settings>("POST", `${prj(id)}/attach`),
   reviews: (id: string) => call<Job[]>("GET", `${prj(id)}/reviews`),
 

@@ -3,7 +3,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
+import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
 
 export const keys = {
   projects: ["projects"] as const,
@@ -68,6 +68,23 @@ export function useRetryAttach(id: string) {
 }
 
 /** What waits on the owner: open asks and blocked tasks, oldest first (README.md#blocked). */
+/** The manager's pending waits (and the last few that ended): polled, since their deadlines run down. */
+export const useWaits = (id: string) => useQuery({ queryKey: ["projects", id, "waits"], queryFn: () => api.waits(id), refetchInterval: POLL.manager });
+
+/** The Network page: polled while changes reach the live agents. */
+export const useNetwork = (id: string) =>
+  useQuery({ queryKey: ["projects", id, "network"], queryFn: () => api.network(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.manager) });
+
+export function useSetNetwork(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (b: NetworkBody) => api.setNetwork(id, b),
+    // The page says why under Save, and marks the hosts it names: no notification.
+    meta: { inline: true },
+    onSuccess: (v) => qc.setQueryData(["projects", id, "network"], v),
+  });
+}
+
 export const useAttention = (id: string) => useQuery({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks });
 
 /** The owner answers a blocked task: its block clears, and the answer reaches the agents' inboxes. */

@@ -6,8 +6,9 @@ import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { NestError, nestFrom } from "./nest";
+import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSIDE, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
-import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Settings, Spec, UpdateTask } from "./requests";
+import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Network, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
 import { proxyTrace, proxyTraceHistory } from "./trace";
 
@@ -217,9 +218,72 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const b = await body(req, Answer);
       return b.ok ? done(await p.answerAsk(ask, b.value.answer)) : b.res;
     }
+    case "GET waits":
+      return done(await p.waits());
+    case "GET network":
+      return networkView(env, p);
+    case "PUT network": {
+      const b = await body(req, Network);
+      if (!b.ok) return b.res;
+      const g = await egressHostsOf(env);
+      if (!g.ok) return err(g.status, g.error);
+      // A host already in a role's rules may stay though the operator has since narrowed the grant: it's
+      // kept, shown "outside the grant", and not applied. So a save that only removes (or keeps) rules
+      // always goes through; only a host newly added outside the grant is refused.
+      const stored = await p.network();
+      if (!stored.ok) return err(stored.status, stored.error);
+      const problems = Object.fromEntries(NETWORK_ROLES.flatMap((role) => {
+        const had = new Set(stored.value.rules[role].map((r) => r.host));
+        return Object.entries(rulesProblems(normalizeRules(b.value[role]), g.value))
+          .filter(([host, v]) => !(v.endsWith(OUTSIDE) && had.has(host)))
+          .map(([k, v]) => [`${role}.${k}`, v]);
+      }));
+      if (Object.keys(problems).length) {
+        const outside = Object.values(problems).some((v) => v.endsWith(OUTSIDE));
+        return json({ error: Object.values(problems).join("; "), problems }, outside ? 403 : 400);
+      }
+      const r = await p.setNetwork(b.value);
+      return r.ok ? networkView(env, p, r.value) : done(r);
+    }
     case "GET errors":
       return done(await p.errors());
     default:
       return err(404, "unknown route");
   }
+}
+
+/** The grant's `egress_hosts` (`GET /v1/clients/self`): the ceiling of every network rule. */
+async function egressHostsOf(env: Env): Promise<Result<string[]>> {
+  const nest = nestFrom(env);
+  if (!nest) return { ok: false, status: 503, error: "NEST_CLIENT_TOKEN is not set" };
+  try {
+    return { ok: true, value: (await nest.self()).grant?.egress_hosts ?? [] };
+  } catch (e) {
+    return { ok: false, status: 502, error: `nest's grant couldn't be read: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/**
+ * The Network page's view: the rules and each live agent's layer (ProjectDO's), the grant's ceiling,
+ * and the operator's rules (nest's defaults, the operator's layer and the repo allowlists', `operatorRules`) as the manager's
+ * sandbox's effective policy shows them (a client may read its own sandboxes' policy; null until the
+ * manager runs, or when nest can't be read).
+ */
+async function networkView(env: Env, p: ReturnType<typeof project>, have?: Awaited<ReturnType<ReturnType<typeof project>["network"]>> extends Result<infer T> ? T : never): Promise<Response> {
+  const mine = have ? { ok: true as const, value: have } : await p.network();
+  if (!mine.ok) return err(mine.status, mine.error);
+  const [grant, sandbox] = await Promise.all([egressHostsOf(env), p.managerSandbox()]);
+  let base: OperatorRule[] | null = null;
+  const nest = nestFrom(env);
+  if (nest && sandbox) {
+    try {
+      const allow = (await nest.sandboxPolicy(sandbox)).allow ?? [];
+      // The client's own layer is needed only by the fallback for a control plane without `source`.
+      const own = allow.some((r) => r.source !== undefined) ? [] : ((await nest.getClientPolicy(sandbox)).egress?.allow ?? []);
+      base = operatorRules(allow, own);
+    } catch {
+      base = null;
+    }
+  }
+  return json({ ...mine.value, egress_hosts: grant.ok ? grant.value : null, base });
 }

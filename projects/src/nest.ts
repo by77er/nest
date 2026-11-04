@@ -58,6 +58,18 @@ export interface Ask {
   [k: string]: unknown;
 }
 
+/**
+ * What a client may add to its own sandbox's spec: its egress rules (docs/control-plane/api/clients/#egress),
+ * within its grant's `egress_hosts`.
+ */
+export interface SandboxExtras {
+  egress?: { allow: { host: string; ports?: number[] }[] };
+}
+
+/** A sandbox's client layer (docs/control-plane/api/clients/#the-client-layer), as `GET …/client-policy` answers it. */
+import type { ClientLayer as ClientPolicy, HeldClientLayer, PolicyAllow } from "./network";
+export type { ClientPolicy, HeldClientLayer };
+
 /** The overrides a client may give a spawn (nest only narrows: `SpawnerOverrides`). */
 export interface SpawnOverrides {
   tools?: string[];
@@ -114,7 +126,7 @@ export class Nest {
   }
 
   /** Create a sandbox in the app's cell. The same `idempotencyKey` with the same request answers the same sandbox. */
-  createSandbox(r: { labels: Labels; idle_ttl_ms?: number }, idempotencyKey: string): Promise<{ sandbox: string }> {
+  createSandbox(r: { labels: Labels; idle_ttl_ms?: number } & SandboxExtras, idempotencyKey: string): Promise<{ sandbox: string }> {
     return this.call("POST", "/v1/sandboxes", { ...r, cell: this.config.cell }, { idempotencyKey });
   }
 
@@ -129,8 +141,8 @@ export class Nest {
    * `key` names this start attempt: a retry after a lost answer sends the same Idempotency-Keys
    * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back.
    */
-  async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string): Promise<string> {
-    const sandbox = (await this.createSandbox({ labels }, `${key}/sandbox`)).sandbox;
+  async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string, extras: SandboxExtras = {}): Promise<string> {
+    const sandbox = (await this.createSandbox({ labels, ...extras }, `${key}/sandbox`)).sandbox;
     const overrides: SpawnOverrides = "push" in repo ? { repos: [repo.push] } : { read_repos: [repo.read] };
     return (await this.createAgent({ template, sandbox, labels, overrides, start: true }, `${key}/agent`)).agent;
   }
@@ -173,6 +185,26 @@ export class Nest {
   /** The trace's older events (nest's trace history), before `before` (its seam when absent), newest page first. */
   traceHistory(agent: string, q: { before?: string; limit?: string } = {}): Promise<{ events: unknown[]; next_before: string | null; reset?: true }> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}/trace/history`, undefined, { query: q });
+  }
+
+  /** A sandbox's client layer: its own egress rules, bindings and env. */
+  getClientPolicy(sandbox: string): Promise<HeldClientLayer> {
+    return this.call("GET", `/v1/sandboxes/${encodeURIComponent(sandbox)}/client-policy`);
+  }
+
+  /** Replace a sandbox's client layer whole (an absent part is emptied: send every part). */
+  async putClientPolicy(sandbox: string, layer: ClientPolicy): Promise<void> {
+    await this.call("PUT", `/v1/sandboxes/${encodeURIComponent(sandbox)}/client-policy`, layer);
+  }
+
+  /** A sandbox's effective egress policy (the operator's layers and its own), as nest compiles it. */
+  sandboxPolicy(sandbox: string): Promise<{ allow?: PolicyAllow[]; passthrough?: string[] }> {
+    return this.call("GET", `/v1/sandboxes/${encodeURIComponent(sandbox)}/policy`);
+  }
+
+  /** The client's own record (`GET /v1/clients/self`): its grant, among the rest. */
+  self(): Promise<{ client?: string; grant?: { egress_hosts?: string[]; [k: string]: unknown } }> {
+    return this.call("GET", "/v1/clients/self");
   }
 
   listAsks(agent: string): Promise<unknown> {

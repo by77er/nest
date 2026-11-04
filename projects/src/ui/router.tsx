@@ -5,6 +5,7 @@
 //   /projects/$projectId/board         its board; `?task=` opens a task's drawer
 //   /projects/$projectId/manager       the chat with its manager (the default page); `?view=trace` its trace
 //   /projects/$projectId/reviews       its review jobs
+//   /projects/$projectId/network       its agents' network rules
 //   /projects/$projectId/settings      its settings
 //   /admin                             the catalog sync
 //
@@ -20,6 +21,7 @@ const BoardPage = lazyRouteComponent(() => import("./features/project/BoardPage"
 const ManagerPage = lazyRouteComponent(() => import("./features/manager/ManagerPage"), "ManagerPage");
 const ReviewsPage = lazyRouteComponent(() => import("./features/reviews/ReviewsPage"), "ReviewsPage");
 const SettingsPage = lazyRouteComponent(() => import("./features/settings/SettingsPage"), "SettingsPage");
+const NetworkPage = lazyRouteComponent(() => import("./features/network/NetworkPage"), "NetworkPage");
 const AdminPage = lazyRouteComponent(() => import("./features/admin/AdminPage"), "AdminPage");
 
 const TASK_ID = /^tsk_[a-z0-9]+$/;
@@ -62,10 +64,11 @@ const manager = createRoute({
 
 const reviews = createRoute({ getParentRoute: () => project, path: "reviews", component: ReviewsPage });
 const settings = createRoute({ getParentRoute: () => project, path: "settings", component: SettingsPage });
+const network = createRoute({ getParentRoute: () => project, path: "network", component: NetworkPage });
 
 const admin = createRoute({ getParentRoute: () => root, path: "/admin", component: AdminPage });
 
-export const routeTree = root.addChildren([home, projects, project.addChildren([projectIndex, board, manager, reviews, settings]), admin]);
+export const routeTree = root.addChildren([home, projects, project.addChildren([projectIndex, board, manager, reviews, network, settings]), admin]);
 
 export function createAppRouter(o: { history?: RouterHistory } = {}) {
   return createRouter({ routeTree, ...(o.history ? { history: o.history } : {}), defaultPreload: "intent", scrollRestoration: true });

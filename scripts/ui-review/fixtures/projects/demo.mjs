@@ -212,6 +212,41 @@ export function data(variant = "demo", now = Date.now()) {
   const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length }, { ...other, needs_you: 0 }];
   const sync = { written: ["capabilities/projects/board", "capabilities/projects/task", "templates/projects/manager", "templates/projects/worker"], repos: ["by77er/gadgets", "by77er/widgets"], at_ms: now - 3_600_000 };
 
+  // The manager's waits (README.md#waiting), and the Network page (README.md#network): rules per role,
+  // the grant's ceiling, the operator's base rules, and live agents in each state.
+  const waits = {
+    pending: variant === "no-waits" ? [] : [
+      { id: "aw_m2k8x1", kind: "pr", target: "118", want: "merged", created_ms: now - 600_000, deadline_ms: now + 2 * 3_600_000, resolved_ms: null, outcome: null, detail: null },
+      { id: "aw_q7d3n5", kind: "task", target: "tsk_demo4", want: ["in_review", "done"], created_ms: now - 300_000, deadline_ms: now + 45 * 60_000, resolved_ms: null, outcome: null, detail: null },
+      { id: "aw_r1c9v6", kind: "reply", target: null, want: null, created_ms: now - 120_000, deadline_ms: now + 26 * 3_600_000, resolved_ms: null, outcome: null, detail: null },
+    ],
+    // Lately resolved: a PR met, the owner's reply timed out (the warning tone).
+    recent: variant === "no-waits" ? [] : [
+      { id: "aw_p4h2z8", kind: "pr", target: "119", want: "merged", created_ms: now - 3_600_000, deadline_ms: now + 3_600_000, resolved_ms: now - 3 * 60_000, outcome: "met", detail: "merged" },
+      { id: "aw_t6w1b3", kind: "reply", target: null, want: null, created_ms: now - 7_200_000, deadline_ms: now - 10 * 60_000, resolved_ms: now - 10 * 60_000, outcome: "timed_out", detail: "timed out" },
+    ],
+  };
+  const network = {
+    rules: variant === "network-empty" ? { worker: [], manager: [] } : {
+      worker: [{ host: "registry.npmjs.org" }, { host: "nodejs.org" }, { host: "pypi.org" }, { host: "files.pythonhosted.org" }, { host: "downloads.gadgets.example.com", ports: [443, 8443] }],
+      manager: [{ host: "registry.npmjs.org" }],
+    },
+    rev: 3,
+    agents: variant === "network-empty" ? [] : [
+      { agent: "agt_mgr7k2", role: "manager", sandbox: "sbx_m1", state: "applied", error: null, rev: 3, at_ms: now - 120_000 },
+      { agent: "agt_w8x2m4", role: "worker", sandbox: "sbx_w1", state: "applied", error: null, rev: 3, at_ms: now - 110_000 },
+      { agent: "agt_w3f9q1", role: "worker", sandbox: "sbx_w2", state: "pending", error: "nest answered 503: internal (retrying)", rev: 2, at_ms: now - 900_000 },
+      { agent: "agt_w1k7c2", role: "worker", sandbox: "sbx_w3", state: "failed", error: "nest 403 forbidden: egress host downloads.gadgets.example.com is outside the grant", rev: 2, at_ms: now - 900_000 },
+    ],
+    // Narrowed (network-narrowed): the operator took *.gadgets.example.com out of the grant after a worker rule was saved for it.
+    egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org", ...(variant === "network-narrowed" ? [] : ["*.gadgets.example.com"]), "crates.io", "static.crates.io", "index.crates.io"],
+    base: variant === "network-empty" ? null : [
+      ...["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "crates.io", "static.crates.io", "index.crates.io", "github.com", "*.githubusercontent.com", "deb.debian.org"].map((host) => ({ host, ports: [80, 443], source: "base" })),
+      { host: "mirror.internal.example", ports: [8443], source: "operator" },
+      ...["api.github.com", "codeload.github.com"].map((host) => ({ host, ports: [443], source: "repos" })),
+    ],
+  };
+
   /** The answer to `GET|POST /api<path>?<search>`: [status, body]. */
   const answer = (method, path, search = new URLSearchParams()) => {
     if (variant === "error") return [500, { error: "internal error (fixture)" }];
@@ -220,7 +255,12 @@ export function data(variant = "demo", now = Date.now()) {
     if (path === "/admin/sync" && method === "POST") return [200, { written: sync.written.slice(0, 2), repos: ["by77er/gadgets"] }];
     if (!path.startsWith("/projects/prj_demo")) return [404, { error: "unknown project" }];
     const q = path.slice("/projects/prj_demo".length);
-    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
+    // A save the API refuses (README.md#network): a host newly added outside the grant, named.
+    if (variant === "network-save-refused" && method === "PUT" && q === "/network") {
+      const why = "downloads.gadgets.example.com isn't in this app's grant; the operator must add it";
+      return [403, { error: why, problems: { "worker.downloads.gadgets.example.com": why } }];
+    }
+    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
     if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
     if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];
     if (q in routes) return [200, routes[q]];

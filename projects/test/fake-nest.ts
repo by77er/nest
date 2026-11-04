@@ -56,7 +56,19 @@ export class FakeNest {
   githubApp: { app_id: number; app_slug: string } | null = { app_id: GH_APP_ID, app_slug: "nest-test" };
   readonly calls: Call[] = [];
   readonly agents = new Map<string, FakeAgent>();
-  readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean }>();
+  readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean; layer: { egress: { allow: unknown[] }; inject: unknown[]; env: Record<string, string> } }>();
+  /** The grant's `egress_hosts` (docs/control-plane/api/clients/#egress), as `GET /v1/clients/self` answers it. */
+  egressHosts: string[] = ["registry.npmjs.org", "nodejs.org", "*.pythonhosted.org", "pypi.org"];
+  /** nest's defaults, as each sandbox's effective policy shows them (layer `base`). */
+  baseRules: { host: string; ports: number[] }[] = [{ host: "github.com", ports: [443] }];
+  /** The operator's own layer, which the effective policy labels `workstream`, as it does the client's own rules. */
+  operatorRules: { host: string; ports?: number[] }[] = [{ host: "mirror.internal.example", ports: [8443] }];
+  /** The rules nest builds from the repo allowlists (source `repos`, layer `workstream`). */
+  reposRules: { host: string; ports?: number[] }[] = [{ host: "api.github.com", ports: [443] }];
+  /** Answer the policy as a control plane before nest's `source` did: `layer` only. */
+  legacyPolicy = false;
+  /** Temporary grants (layer `sandbox`), in every sandbox's effective policy. */
+  grantRules: { host: string; ports: number[]; expires_ms: number }[] = [{ host: "approved.example.com", ports: [443], expires_ms: Date.now() + 3_600_000 }];
   readonly inbox: { agent: string; text: string; from?: string; request_id?: string }[] = [];
   readonly catalog = new Map<string, unknown>();
   readonly answers: { agent: string; ask: string; answer: string }[] = [];
@@ -154,10 +166,54 @@ export class FakeNest {
     let m: RegExpMatchArray | null;
     const r = `${req.method} ${u.pathname}`;
     if (r === "POST /v1/sandboxes") {
-      const s = { sandbox: id("sbx_"), owner: CLIENT, labels: call.body.labels ?? {}, ended: false };
+      // Its client layer starts as its create's egress, bindings and env (docs/control-plane/api/clients/#the-client-layer).
+      const s = {
+        sandbox: id("sbx_"), owner: CLIENT, labels: call.body.labels ?? {}, ended: false,
+        layer: { egress: { allow: call.body.egress?.allow ?? [] }, inject: call.body.inject ?? [], env: call.body.env ?? {} },
+      };
       this.sandboxes.set(s.sandbox, s);
       return json(202, { sandbox: s.sandbox, cell: call.body.cell, labels: s.labels, host: null });
     }
+    if ((m = u.pathname.match(/^\/v1\/sandboxes\/(sbx_[A-Za-z0-9]+)\/(client-policy|policy)$/))) {
+      const sb = this.sandboxes.get(m[1]!);
+      if (!sb || sb.owner !== CLIENT) return nestErr(404, "unknown_sandbox", "unknown sandbox");
+      if (sb.ended) return nestErr(409, "forbidden", "sandbox is destroyed");
+      if (m[2] === "policy" && req.method === "GET") {
+        // As nest's policy view (docs/sandbox/networking/egress/policy/#sources): each rule's `source`, and
+        // its `layer` (`base`; `workstream` for the operator's, the repo allowlists' and the client's own,
+        // no ports being 80 and 443; `sandbox` for grants). An older control plane answers `layer` only.
+        const rule = (r: { host: string; ports?: number[]; expires_ms?: number }, layer: string, source: string) =>
+          ({ ...r, host: r.host, ports: r.ports ?? [80, 443], layer, ...(this.legacyPolicy ? {} : { source }) });
+        return json(200, {
+          version: 1,
+          allow: [
+            ...this.baseRules.map((b) => rule(b, "base", "base")),
+            ...this.operatorRules.map((b) => rule(b, "workstream", "operator")),
+            ...this.reposRules.map((b) => rule(b, "workstream", "repos")),
+            ...(sb.layer.egress.allow as { host: string; ports?: number[] }[]).map((x) => rule(x, "workstream", "client")),
+            ...this.grantRules.map((g) => rule(g, "sandbox", "grant")),
+          ],
+          passthrough: [],
+        });
+      }
+      // nest answers its bindings as held: whose they are and the placeholder it assigned (`HeldInjection`).
+      if (req.method === "GET") {
+        return json(200, { ...sb.layer, inject: (sb.layer.inject as { name: string }[]).map((b) => ({ ...b, client: CLIENT, placeholder: `nest-ph.${CLIENT}.${b.name}.` })) });
+      }
+      if (req.method === "PUT") {
+        // nest's checks: the whole layer replaced, each binding a strict `ClientInjection`, its egress within
+        // the grant's egress_hosts.
+        const BINDING_KEYS = ["name", "secret", "hosts", "locations", "wildcard"];
+        const extra = ((call.body?.inject ?? []) as Record<string, unknown>[]).flatMap((b) => Object.keys(b).filter((k) => !BINDING_KEYS.includes(k)));
+        if (extra.length) return nestErr(400, "invalid_message", `inject: unrecognized key "${extra[0]}"`);
+        const allow = (call.body?.egress?.allow ?? []) as { host: string }[];
+        const outside = allow.filter((x) => !this.egressHosts.some((h) => h === x.host || (h.startsWith("*.") && x.host.endsWith(h.slice(1)))));
+        if (outside.length) return nestErr(403, "forbidden", `egress host ${outside[0]!.host} is outside the grant`);
+        sb.layer = { egress: { allow }, inject: call.body?.inject ?? [], env: call.body?.env ?? {} };
+        return json(200, { version: 2 });
+      }
+    }
+    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, grant: { egress_hosts: this.egressHosts } });
     if (r === "GET /v1/sandboxes") {
       const rows = [...this.sandboxes.values()].filter((s) => !s.ended && labelsMatch(s.labels));
       return json(200, { sandboxes: rows.map((s) => ({ sandbox: s.sandbox, cell: CELL, client: CLIENT, owner: s.owner, labels: s.labels, created_ms: 1, ended_ms: null })), next_cursor: null });
@@ -254,6 +310,7 @@ export class FakeNest {
     return {
       agent: a.agent, owner: a.owner, client: a.client, labels: a.labels, state: a.ended ? "ended" : state, template: a.template,
       host: a.ended || state === "starting" ? null : "bh_1", capacity_waits: a.capacityWaits ?? 0,
+      hands: a.sandbox ? { sandbox: a.sandbox } : null,
       ...(a.ended ? { ended: { ms: 1, by: "client", reason: "stopped" } } : {}),
     };
   }

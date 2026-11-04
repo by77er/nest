@@ -3,7 +3,7 @@
 // of every write the page made.
 
 import { type TaskEvent, transition } from "../../tasks";
-import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
+import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
 
 export interface Write {
   method: string;
@@ -46,6 +46,10 @@ export class FakeApi {
   asks: Ask[] = [];
   sync: SyncState | null = null;
   reviews: Job[] = [];
+  waits: Waits = { pending: [], recent: [] };
+  /** `PUT network`'s answer instead of saving: a refusal (403 with `problems`, say). */
+  networkRefusal: { status: number; body: unknown } | null = null;
+  network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }] };
   openPrs: OpenPr[] = [];
   manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
   readonly writes: Write[] = [];
@@ -132,6 +136,14 @@ export class FakeApi {
       case "POST attach":
         this.manager = { ...this.manager, phase: "starting", error: null };
         return json(p.settings);
+      case "GET waits":
+        return json(this.waits);
+      case "GET network":
+        return json(this.network);
+      case "PUT network":
+        if (this.networkRefusal) return json(this.networkRefusal.body, this.networkRefusal.status);
+        this.network = { ...this.network, rules: body, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
+        return json(this.network);
       case "GET reviews":
         return json(this.reviews);
       case "GET prs/open":

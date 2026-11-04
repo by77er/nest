@@ -30,6 +30,7 @@ Only the client interface. One client, `projects`, has this grant:
 - `repos` and `github.repos`: the attachable repos. Workers push to them; the manager and reviewers only read them, which `repos` covers (no `read_repos` needed);
 - `github.permissions`: `checks: write` (check runs), `administration: write` and `metadata: read` (branch protection, the default branch, the repo's "Allow auto-merge"), `pull_requests: write` and `contents: write` (auto-merge on task PRs, and reading the repo's merge settings; [below](#auto-merge)), which also cover reading PRs to attach them (`pull_requests: read`; [below](#prs)). Each call's token asks only for what that call needs. The app reads nothing else on GitHub: a PR's number, head, base, title and node id come in its webhook, and the reviewer reads the code in its sandbox;
 - `mcp_urls: [https://projects-nest.bitcru.sh/mcp/]`;
+- `egress_hosts`: the hosts the [Network page](#network) may open for its agents (nest's `egress_hosts`, needs nest PR #134);
 - `max_agents` and `max_sandboxes`.
 
 | Need | Interface |
@@ -43,6 +44,8 @@ Only the client interface. One client, `projects`, has this grant:
 | Check runs and branch protection | `POST /v1/clients/self/github-token {repo, permissions}`, then GitHub's API with that token |
 | GitHub's events | The GitHub App's webhook, pointed at `/hooks/github` by the operator (nest consumes none of it) |
 | Telling which agent calls the MCP server | The `Nest-Identity` JWT on every request, checked against nest's JWKS |
+| The manager's own wake-ups | nest's `timers` capability, in the manager's template only ([waiting](#waiting)) |
+| Its agents' network | `egress` in `POST /v1/sandboxes` for a new agent; `GET`/`PUT /v1/sandboxes/<id>/client-policy` for a live one; `GET /v1/sandboxes/<id>/policy` (the operator's rules) and `GET /v1/clients/self` (the grant's `egress_hosts`) for the page ([network](#network)) |
 | Watching an agent work | `GET /v1/agents/<id>/trace?after=<seq>`, nest's live trace (a WebSocket), proxied for the page by `GET /api/agents/<id>/trace` ([below](#the-live-trace)) |
 
 ## The MCP server: agents see only their own work
@@ -234,6 +237,43 @@ The owner's request (2026-11-03): "Tasks should be able to block other tasks."
 - **A live worker** on a task whose dependencies change (added or removed mid-flight, or one done) is told ([task changes](#task-changes)).
 - **On the board:** a card says "Waiting on N", neutral (gray, outline), since it's no one's to act on now. Hovering or focusing it lists the blockers. The drawer has a Dependencies section: what it waits on, each removable, a task picker (the switcher) to add one, and what waits on it.
 
+## Waiting
+
+The owner's request (2026-11-02): the manager "should be able to set timers and await things with a timeout".
+
+- **Waits are the app's** (`src/waits.ts`, ProjectDO's `waits`): `await_task {task, states, timeout_s}`, `await_pr {pr, until: merged | review_done | closed, timeout_s}` and `await_reply {timeout_s}` on `/mcp/board`, with `list_waits` and `cancel_wait`.
+  - **Why the app owns the timeout** (an alarm on the wait's deadline) rather than a nest timer: the condition and the timeout are then decided in one place, ProjectDO, in one synchronous step each, so a wait resolves exactly once and a timeout can never fire after its condition (or the other way round). A nest timer would race the app's message across two systems, and nest gives a client no way to set one (only to list and cancel); the manager setting it would mean two tool calls and a timer name to keep straight.
+  - **The condition is watched where it changes:** a task's state (every move goes through one place), a PR's `closed` event (any PR of the repo, a task's or not), a review's end (ReviewDO's outbox of finished reviews, told to ProjectDO from its alarm, retried until taken), and the owner's chat message or answer in "Needs you".
+  - **Resolving:** in the step that saw it, the wait's row changes only while it's pending (`rowsWritten`), and only then is the manager owed one inbox message (`await aw_…: task tsk_…: now in_review.`; `… ended without its condition …`; `… timed out after 2 h, still waiting for #12 to merge.`). App-authored, with ids and states only, so nothing relayed.
+  - **At once:** a task already in a wanted state answers `met` (no wait left behind); a PR whose review already ended, or which a task records as merged, resolves right after it's recorded.
+  - **Durable and deduplicated:** a pending wait for the same condition is the same wait (a partial unique index on its key). At most 32 pending. A wait on a task ends when the task ends (or is deleted) without reaching its states.
+  - Timeouts are 10 s to 30 days, as nest's timers.
+- **The manager's own timers:** its template names nest's `timers` capability (`timer_set`, `timer_cancel`, `timer_list`), for a wake-up at a time of its own ("check again in two hours"); a fired timer is an inbox message. Workers and reviewers don't get it: a worker's whole job is its task, which brings everything it waits on, and a reviewer reviews once. The prompt says how to wait: call an await (or set a timer), end the turn, and be woken by whichever comes first.
+- **The Manager page's context column** lists the pending waits under "Waiting for", between "Working on" and "Needs you", soonest deadline first (`ManagerWaits`):
+  - "Add search by tag to be In review or Done · 45 min left", "#118 to merge · 2 h left", "The owner's reply · 26 h left".
+  - A task shows by its title, as a link to its drawer; its states use the board's labels; a PR shows by its number, as a link to it on GitHub.
+  - What resolved in the last half hour follows: "#119 merged · met 3 minutes ago", and a timeout ("The owner's reply · timed out 10 minutes ago") in the warning tone.
+  - Nothing shows when there's neither. ui-review's `waits` check fails on a raw task id or snake_case state in it, on the section missing where the column shows and the fixture has waits, and on a task or PR line that isn't a link.
+- **A condition that holds already** answers at once with no wait left behind and no message, for `await_pr` as for `await_task`: a message would wake the manager, which might ask again. If a second identical call found that wait pending meanwhile (while the first read the review queue) and was told "waiting", the wait is resolved instead, with the one message that caller waits for.
+- **Resolved waits** beyond the 10 the API's `recent` returns are pruned as new ones resolve.
+
+## Network
+
+The owner's request (2026-11-02): "I should be able to modify the default network policy of workers and the manager."
+
+- **The Network page** (before Settings in the sidebar; after Secrets once that view is in), on the frame like Settings: its intro at the reading measure, the two roles' Panels side by side (one column below `lg`) with Save under them, then the operator's policy and the live agents in a row of their own: per role (workers, the manager), the hosts its sandboxes may reach on top of the operator's policy, each with optional ports (default 80 and 443). Presets: npm, Node downloads, PyPI, crates.io, Go modules, Docker Hub, GitHub releases; or a custom host. Reviewers get none: they read the repo, which the operator's policy already reaches.
+- **Within the grant:** each host must be inside the client's `egress_hosts` (`GET /v1/clients/self`). It's checked as it's added and again by the API (`PUT /api/projects/:id/network`): a 403 for a host newly added outside it ("isn't in this app's grant; the operator must add it"), a 400 for a malformed one.
+  - **Narrowing:** a host saved before the operator narrowed the grant isn't refused. It stays in the rules, marked "Outside the grant now: kept, not applied", and it's left out of what's applied: the sandbox create, and each live layer, filtered by the grant read then. So a save that only removes or keeps rules always goes through, and a narrowing reaches the sandboxes (nest refuses a layer with any host outside the grant).
+  - **The editor:**
+    - A refused save shows why under Save and marks the host's row in the danger shade, with no notification; after a save, "Saved · reaching live agents".
+    - A rule nest's defaults already cover says so, and a line near the top says what the default allows.
+    - Removing a host by keyboard leaves focus on the next row's Remove (or the previous one's, then the Add select).
+    - A failed live layer's error links to the rule it names: the row is focused, its tint flashed once.
+    - The picker has its own row; a custom host's Host, Ports (its placeholder "Blank: 80, 443") and Add share one from `sm` up, their labels level.
+    - ui-review's `network` checks fail on focus that isn't the next row's Remove in the same panel, on a refused save without its inline reason or marked row, and on a narrowed grant's kept host unmarked (`network-narrowed`); the selftest plants each case. nest checks once more on every write. The page shows the ceiling, and the operator's rules read-only, from the manager's sandbox's effective policy (`GET /v1/sandboxes/<id>/policy`, which a client may read for its own sandboxes), by each rule's [`source`](../docs/sandbox/networking/egress/policy/#sources): nest's defaults (`base`), the operator's (`operator`) and those from its repo allowlists (`repos`). The app's own (`client`) are the role editors', and grants (`grant`) are left out. A control plane without `source` falls back to `layer` less the app's own rules (`GET …/client-policy`); that goes once every control plane answers `source`.
+- **New agents** get their role's rules in their sandbox's create (`POST /v1/sandboxes {egress}`). A start attempt's rules are frozen at its first try (`frozen_egress`), since its sandbox's `Idempotency-Key` binds the request; a sandbox made with older rules is brought up to date at once.
+- **Live agents** (the manager, each live worker) get them through their sandbox's client layer, which nest replaces whole. **`clientLayerFor(rules, role, feeds, current)`** (`src/network.ts`) is the one place that builds it: this role's rules, and each other part (injection bindings, env) from its feed, else as the sandbox has it now (read first; a binding nest answers as held, with its `client` and `placeholder`, goes back in the PUT's strict shape, `name`, `secret`, `hosts`, `locations`, `wildcard`). So a network change never drops a secret's binding, and the Secrets page (PR #133) feeds its bindings and env into the same function. Each live agent's layer shows as applied, pending (retried from the alarm) or failed (a refusal that will repeat: shown, not retried), polled while any is pending.
+
 ## The UI
 
 **Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `attention`, `settings`, `admin`, `trace`), each component next to its test. `src/main.tsx` mounts it.
@@ -360,3 +400,4 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 4. `PUT /v1/clients/self/webhook {url: https://projects-nest.bitcru.sh/hooks/nest}` (the app does this at its first start), and store the secret as `NEST_WEBHOOK_SECRET`.
 5. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github` (content type `application/json`), with a new secret, stored as `GITHUB_WEBHOOK_SECRET` (`wrangler secret put`). Subscribe the App to the `pull_request` and `check_run` events. The App needs the repository permissions the grant names (Checks: read and write, Administration: read and write, Metadata: read) and Pull requests (read at least), without which GitHub doesn't offer the `pull_request` event. Its installation must cover each attached repo. For auto-merge, the App also needs Contents: read and write, and Pull requests: read and write.
 6. **Auto-merge's permissions (2026-11-02):** add `pull_requests: write` and `contents: write` to the live client's `github.permissions`. Use `PATCH /v1/admin/clients/<id>`, which takes the grant ([clients doc](../docs/control-plane/api/clients/)). Until then, turning auto-merge on writes the repo setting, but each PR's auto-merge fails with nest's 403, recorded on its task.
+7. **The Network page's ceiling (2026-11-02):** add `egress_hosts` to the client's grant (`PATCH /v1/admin/clients/<id>`, which takes the whole grant): the hosts the owner may open for agents on the Network page, e.g. `registry.npmjs.org`, `nodejs.org`, `pypi.org`, `files.pythonhosted.org`. Until then the page refuses every host.
