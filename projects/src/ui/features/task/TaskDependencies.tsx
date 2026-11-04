@@ -40,7 +40,10 @@ function RelationGroup({ label, count, children }: { label: string; count: numbe
             Nothing
           </Text>
         ) : (
-          <Stack gap="sm">{children}</Stack>
+          // Rows of controls (a link, its Remove): a 44 px pitch on touch.
+          <Stack gap="sm" data-touch-pitch>
+            {children}
+          </Stack>
         )}
       </Section>
     </Stack>

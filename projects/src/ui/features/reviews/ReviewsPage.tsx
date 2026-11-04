@@ -33,7 +33,8 @@ export function JobState({ job, size = "md" }: { job: Job; size?: "sm" | "md" })
 function Verdicts({ job }: { job: Job }) {
   if (!job.verdict) return <Text fz="sm" c="dimmed">{job.error ?? "No verdict yet"}</Text>;
   return (
-    <Row gap="xs">
+    // Badges that open their notes, wrapping into rows: a 44 px pitch between rows on touch.
+    <Row gap="xs" data-touch-pitch>
       {DIMENSIONS.map(([d, label]) => {
         // Pass and fail are status: their roles, and an icon each, so color isn't the only cue.
         const pass = job.verdict![d].verdict === "pass";
