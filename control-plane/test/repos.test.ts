@@ -193,6 +193,8 @@ class FakeGitHub {
   readonly mints: { installation: number; repositories: string[]; permissions: Record<string, string>; token: string }[] = [];
   /** Tokens revoked (`DELETE /installation/token`, authorized by the token itself). */
   readonly revoked: string[] = [];
+  /** The next revokes that fail (GitHub's answer lost). */
+  failRevokes = 0;
   /** Lifetime of the next tokens. */
   ttlMs = 3_600_000;
   /** Holds the next mint until released. */
@@ -218,6 +220,10 @@ class FakeGitHub {
       const token = `ghs_sbx${String(++this.n).padStart(30, "0")}`;
       this.mints.push({ installation, ...body, token });
       return json(201, { token, expires_at: new Date(Date.now() + this.ttlMs).toISOString() });
+    }
+    if (u.pathname === "/installation/token" && req.method === "DELETE" && this.failRevokes > 0) {
+      this.failRevokes--;
+      return json(502, { message: "Bad Gateway" });
     }
     if (u.pathname === "/installation/token" && req.method === "DELETE") {
       const token = (req.headers.get("authorization") ?? "").replace(/^Bearer /, "");
@@ -693,6 +699,8 @@ describe("workflows: write on a sandbox's push token", () => {
     expect(gh.revoked).not.toContain(on.token);
     // Off (here by leaving it out: the layer is replaced whole): the next token is without it, and the
     // one with it is revoked at GitHub, not left valid for its hour.
+    // (GitHub's first answer to the revoke is lost: it's tried again.)
+    gh.failRevokes = 1;
     await call(token, "PUT", layer, { env: { CI: "1" } }, 200);
     const off = await pushed();
     expect(off.permissions).toEqual(SANDBOX_TOKEN_PERMISSIONS);

@@ -1515,10 +1515,9 @@ export class SandboxDO extends DurableObject<Env> {
    * environment and its own push opt-in (`workflows`), each replaced whole. The policy and its secrets go
    * out as a new version through the usual path (a push token minted for the new opt-in: BrokerDO never
    * reuses one minted without it, nor the other way round), and the attached agents' slots get the new
-   * environment. `workflows` absent (a caller of the previous release): its own opt-in as it was.
-   * Answers the effective policy.
+   * environment. Answers the effective policy.
    */
-  async setClientLayer(layer: { egress: EgressRule[]; inject: HeldInjection[]; env: Record<string, string>; workflows?: boolean }): Promise<EgressPolicy> {
+  async setClientLayer(layer: { egress: EgressRule[]; inject: HeldInjection[]; env: Record<string, string>; workflows: boolean }): Promise<EgressPolicy> {
     const info = this.info_();
     if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
     if (info.client) await this.readEgressCeiling();
@@ -1530,7 +1529,7 @@ export class SandboxDO extends DurableObject<Env> {
     const inject = layer.inject.filter((b) => b.client === now.client);
     put(OWN_INJECT, inject, inject.length > 0);
     put(OWN_ENV, layer.env, Object.keys(layer.env).length > 0);
-    if (layer.workflows !== undefined) put(OWN_PUSH, { workflows: true }, layer.workflows);
+    put(OWN_PUSH, { workflows: true }, layer.workflows);
     if (this.hasClientEgress() && now.client && !this.deadlines.has("egress_ceiling")) await this.deadlines.set("egress_ceiling", Date.now() + EGRESS_CEILING_REFRESH_MS);
     await this.policyChanged(true);
     if (JSON.stringify(layer.env) !== envBefore && now.attached.length) await this.issueAttachCommands(now.attached);

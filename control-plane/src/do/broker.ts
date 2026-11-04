@@ -287,13 +287,20 @@ export class BrokerDO extends DurableObject<Env> {
     const wider = !workflows && held && (JSON.parse(held.source) as { workflows?: boolean }).workflows === true ? this.secret(name)?.value ?? null : null;
     const retire = async () => {
       if (!wider) return;
-      try {
-        await revokeInstallationToken(githubApiOf(this.env), wider);
-        await this.auditMint({ event: "github_installation_token_revoked", target, binding: source.binding, caller, why: "workflows: write no longer asked" });
-      } catch (e) {
-        // It expires within the hour anyway, and no sandbox holds it any more: logged, not retried.
-        console.warn(`sandbox ${target.sandbox}: revoking its previous token (with workflows) failed`, e);
+      // Tried twice: a revoke that fails, with a host that also missed the push replacing it, would leave
+      // the token usable for the rest of its hour. Either way audited, never the token.
+      let last: unknown = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          await revokeInstallationToken(githubApiOf(this.env), wider);
+          await this.auditMint({ event: "github_installation_token_revoked", target, binding: source.binding, caller, why: "workflows: write no longer asked", attempt });
+          return;
+        } catch (e) {
+          last = e;
+        }
       }
+      console.warn(`sandbox ${target.sandbox}: revoking its previous token (with workflows) failed twice; it expires within the hour`, last);
+      await this.auditMint({ event: "github_installation_token_revoke_failed", target, binding: source.binding, caller, why: last instanceof Error ? last.message.slice(0, 300) : String(last) });
     };
     const forget = async () => {
       if (overtaken()) return;
