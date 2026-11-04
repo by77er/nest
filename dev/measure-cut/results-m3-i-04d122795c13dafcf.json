@@ -1,0 +1,390 @@
+{
+ "kernel": "6.18.56-125.164.amzn2023.x86_64",
+ "instance_type": "c8id.large",
+ "mkfs_exchange": true,
+ "xfsprogs": "mkfs.xfs version 6.12.0",
+ "instance_store": 118000000000,
+ "clone_fresh": {
+  "extents": 44,
+  "ms": [
+   13,
+   13,
+   13,
+   13,
+   13
+  ]
+ },
+ "walk_fresh": {
+  "extents": 60,
+  "fiemap_kernel_ms": 0.03,
+  "fiemap_total_ms": 0.46,
+  "calls": 1,
+  "fiemap_sync_kernel_ms": 0.03,
+  "fiemap_sync_total_ms": 0.43,
+  "nextents": 60,
+  "nextents_ms": 0.0
+ },
+ "clone_churn_1gib": {
+  "extents": 186256,
+  "ms": [
+   1585,
+   2462,
+   2465,
+   2442,
+   2979
+  ]
+ },
+ "walk_churn_1gib": {
+  "extents": 304586,
+  "fiemap_kernel_ms": 495.35,
+  "fiemap_total_ms": 654.05,
+  "calls": 19,
+  "fiemap_sync_kernel_ms": 222.4,
+  "fiemap_sync_total_ms": 347.86,
+  "nextents": 304586,
+  "nextents_ms": 0.01
+ },
+ "clone_month": {
+  "extents": 826859,
+  "ms": [
+   11105,
+   8192,
+   8134,
+   8128,
+   8179
+  ]
+ },
+ "walk_month": {
+  "extents": 897569,
+  "fiemap_kernel_ms": 1674.7,
+  "fiemap_total_ms": 2153.58,
+  "calls": 55,
+  "fiemap_sync_kernel_ms": 834.47,
+  "fiemap_sync_total_ms": 1215.53,
+  "nextents": 897569,
+  "nextents_ms": 0.01
+ },
+ "opt1_turn": {
+  "turn_writes": 2000,
+  "residue_writes": 50,
+  "precopy": {
+   "sync_ms": 65.68,
+   "fiemap_disk_ms": 1069.66,
+   "fiemap_disk_kernel_ms": 679.45,
+   "fiemap_shadow_ms": 1054.64,
+   "fiemap_shadow_kernel_ms": 673.3,
+   "diff_ms": 727.21,
+   "ranges": 9629,
+   "bytes": 453505024,
+   "clone_ms": 46.79,
+   "total_ms": 2963.98,
+   "extents": 899466
+  },
+  "pause": {
+   "sync_ms": 7.6,
+   "fiemap_ms": 1064.85,
+   "fiemap_kernel_ms": 687.62,
+   "diff_ms": 533.69,
+   "ranges": 298,
+   "bytes": 3145728,
+   "clone_ms": 1.69,
+   "total_ms": 1607.84,
+   "extents": 899247
+  },
+  "shadow_equals_disk": true
+ },
+ "opt1_1gib": {
+  "turn_writes": 262144,
+  "residue_writes": 50,
+  "precopy": {
+   "sync_ms": 9655.67,
+   "fiemap_disk_ms": 1356.66,
+   "fiemap_disk_kernel_ms": 859.74,
+   "fiemap_shadow_ms": 1059.29,
+   "fiemap_shadow_kernel_ms": 682.45,
+   "diff_ms": 1229.65,
+   "ranges": 231394,
+   "bytes": 2692472832,
+   "clone_ms": 2376.89,
+   "total_ms": 15678.15,
+   "extents": 1130264
+  },
+  "pause": {
+   "sync_ms": 35.01,
+   "fiemap_ms": 1261.1,
+   "fiemap_kernel_ms": 819.78,
+   "diff_ms": 874.3,
+   "ranges": 26013,
+   "bytes": 246763520,
+   "clone_ms": 45.21,
+   "total_ms": 2215.62,
+   "extents": 1101639
+  },
+  "shadow_equals_disk": true
+ },
+ "hint_0": {
+  "set": "0/mnt/measure/h.img",
+  "extents": 179077,
+  "ms": [
+   1663,
+   2668,
+   2586
+  ]
+ },
+ "hint_1m": {
+  "set": "1048576/mnt/measure/h.img",
+  "extents": 172946,
+  "ms": [
+   1611,
+   2281,
+   2240
+  ]
+ },
+ "hint_4m": {
+  "set": "4194304/mnt/measure/h.img",
+  "extents": 189552,
+  "ms": [
+   1619,
+   2267,
+   2281
+  ]
+ },
+ "exchange": {
+  "error": null,
+  "ms": 0.18,
+  "swapped": true,
+  "concurrent_writes": 131517
+ },
+ "read_cut": {
+  "bytes": 7327563776,
+  "ms": 37564
+ },
+ "vm_files": "crw-rw-rw-. 1 root kvm   10, 232 Nov  3 21:11 /dev/kvm\n-rwxr-xr-x. 1 root root  3676680 Nov  3 05:19 /opt/nest/bin/firecracker\n-rw-r--r--. 1 root root 27893008 Nov  3 05:19 /var/lib/nest/kernel/vmlinux\n",
+ "fc_api": "\n\n\n\n",
+ "vm_running": false,
+ "cut_while_writing_m2": {
+  "pauses_ms": [
+   [
+    1793742380538,
+    6493
+   ],
+   [
+    1793742392263,
+    6549
+   ],
+   [
+    1793742403889,
+    6627
+   ],
+   [
+    1793742415644,
+    6509
+   ],
+   [
+    1793742427194,
+    6542
+   ],
+   [
+    1793742438775,
+    6525
+   ]
+  ]
+ },
+ "cut_while_writing_opt1": [
+  {
+   "at_ms": 1793742454086,
+   "pause_ms": 1885.99,
+   "precopy": {
+    "sync_ms": 0.0,
+    "fiemap_disk_ms": 1288.5,
+    "fiemap_disk_kernel_ms": 812.97,
+    "fiemap_shadow_ms": 1568.71,
+    "fiemap_shadow_kernel_ms": 1106.19,
+    "diff_ms": 833.34,
+    "ranges": 8978,
+    "bytes": 421281792,
+    "clone_ms": 10.41,
+    "total_ms": 3700.96,
+    "extents": 1101631
+   },
+   "residue": {
+    "sync_ms": 0.01,
+    "fiemap_ms": 1277.75,
+    "fiemap_kernel_ms": 819.19,
+    "diff_ms": 553.26,
+    "ranges": 0,
+    "bytes": 0,
+    "clone_ms": 0.01,
+    "total_ms": 1831.03,
+    "extents": 1101631
+   },
+   "api": [
+    "",
+    ""
+   ]
+  },
+  {
+   "at_ms": 1793742464481,
+   "pause_ms": 1890.85,
+   "precopy": {
+    "sync_ms": 0.01,
+    "fiemap_disk_ms": 1279.07,
+    "fiemap_disk_kernel_ms": 817.81,
+    "fiemap_shadow_ms": 1265.51,
+    "fiemap_shadow_kernel_ms": 812.0,
+    "diff_ms": 860.91,
+    "ranges": 8978,
+    "bytes": 421281792,
+    "clone_ms": 10.41,
+    "total_ms": 3415.9,
+    "extents": 1101631
+   },
+   "residue": {
+    "sync_ms": 0.01,
+    "fiemap_ms": 1275.62,
+    "fiemap_kernel_ms": 822.21,
+    "diff_ms": 565.03,
+    "ranges": 0,
+    "bytes": 0,
+    "clone_ms": 0.01,
+    "total_ms": 1840.66,
+    "extents": 1101631
+   },
+   "api": [
+    "",
+    ""
+   ]
+  },
+  {
+   "at_ms": 1793742474870,
+   "pause_ms": 1903.87,
+   "precopy": {
+    "sync_ms": 0.01,
+    "fiemap_disk_ms": 1274.09,
+    "fiemap_disk_kernel_ms": 819.61,
+    "fiemap_shadow_ms": 1270.21,
+    "fiemap_shadow_kernel_ms": 814.89,
+    "diff_ms": 848.31,
+    "ranges": 8978,
+    "bytes": 421281792,
+    "clone_ms": 10.41,
+    "total_ms": 3403.03,
+    "extents": 1101631
+   },
+   "residue": {
+    "sync_ms": 0.01,
+    "fiemap_ms": 1282.75,
+    "fiemap_kernel_ms": 818.44,
+    "diff_ms": 562.95,
+    "ranges": 0,
+    "bytes": 0,
+    "clone_ms": 0.01,
+    "total_ms": 1845.71,
+    "extents": 1101631
+   },
+   "api": [
+    "",
+    ""
+   ]
+  },
+  {
+   "at_ms": 1793742485160,
+   "pause_ms": 1885.27,
+   "precopy": {
+    "sync_ms": 0.01,
+    "fiemap_disk_ms": 1286.06,
+    "fiemap_disk_kernel_ms": 819.87,
+    "fiemap_shadow_ms": 1270.47,
+    "fiemap_shadow_kernel_ms": 815.65,
+    "diff_ms": 726.36,
+    "ranges": 8978,
+    "bytes": 421281792,
+    "clone_ms": 10.35,
+    "total_ms": 3293.26,
+    "extents": 1101631
+   },
+   "residue": {
+    "sync_ms": 0.01,
+    "fiemap_ms": 1274.36,
+    "fiemap_kernel_ms": 819.37,
+    "diff_ms": 558.86,
+    "ranges": 0,
+    "bytes": 0,
+    "clone_ms": 0.01,
+    "total_ms": 1833.24,
+    "extents": 1101631
+   },
+   "api": [
+    "",
+    ""
+   ]
+  },
+  {
+   "at_ms": 1793742495541,
+   "pause_ms": 1891.66,
+   "precopy": {
+    "sync_ms": 0.01,
+    "fiemap_disk_ms": 1270.62,
+    "fiemap_disk_kernel_ms": 817.85,
+    "fiemap_shadow_ms": 1270.57,
+    "fiemap_shadow_kernel_ms": 813.1,
+    "diff_ms": 847.31,
+    "ranges": 8978,
+    "bytes": 421281792,
+    "clone_ms": 10.45,
+    "total_ms": 3398.97,
+    "extents": 1101631
+   },
+   "residue": {
+    "sync_ms": 0.01,
+    "fiemap_ms": 1279.0,
+    "fiemap_kernel_ms": 818.34,
+    "diff_ms": 563.32,
+    "ranges": 0,
+    "bytes": 0,
+    "clone_ms": 0.01,
+    "total_ms": 1842.34,
+    "extents": 1101631
+   },
+   "api": [
+    "",
+    ""
+   ]
+  },
+  {
+   "at_ms": 1793742505809,
+   "pause_ms": 1902.96,
+   "precopy": {
+    "sync_ms": 0.01,
+    "fiemap_disk_ms": 1281.39,
+    "fiemap_disk_kernel_ms": 818.9,
+    "fiemap_shadow_ms": 1273.7,
+    "fiemap_shadow_kernel_ms": 818.5,
+    "diff_ms": 718.16,
+    "ranges": 8978,
+    "bytes": 421281792,
+    "clone_ms": 10.39,
+    "total_ms": 3283.66,
+    "extents": 1101631
+   },
+   "residue": {
+    "sync_ms": 0.01,
+    "fiemap_ms": 1294.41,
+    "fiemap_kernel_ms": 819.45,
+    "diff_ms": 557.08,
+    "ranges": 0,
+    "bytes": 0,
+    "clone_ms": 0.0,
+    "total_ms": 1851.51,
+    "extents": 1101631
+   },
+   "api": [
+    "",
+    ""
+   ]
+  }
+ ],
+ "guest_stalls": [],
+ "done": true,
+ "_note": "Recovered field by field from the console (the results line was interleaved with its echo); vm_log and xfs_info dropped."
+}
