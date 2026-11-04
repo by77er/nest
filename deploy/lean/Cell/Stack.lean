@@ -64,8 +64,8 @@ structure CellSpec where
   controlUrl : String
   /-- Instance families the control plane may launch, the 8i family only: IAM allows `<family>*.*`. -/
   instanceFamilies : List String := ["c8i", "m8i", "r8i"]
-  /-- The instance types FleetDO launches, in preference order; the first is also the on-demand
-  fallback. Each must fall within `instanceFamilies` (`launch_types_within_iam` in `Cell.Test`). -/
+  /-- The instance types FleetDO launches, in preference order: each on spot, then each on demand
+  (`scaleUpPlan`). Each must fall within `instanceFamilies` (`launch_types_within_iam` in `Cell.Test`). -/
   launchTypes : List String
   /-- The autoscaler's settings (control-plane/src/lib/cells.ts, `AWS_CELLS`); the defaults are its own. -/
   spot : Bool := true
@@ -82,8 +82,8 @@ structure CellSpec where
   from the brain template (IAM allows `<family>*.*`). Cheap x86 types, since both kinds boot the
   one host AMI (x86_64). -/
   brainInstanceFamilies : List String := ["t3a", "t3"]
-  /-- The brain instance types FleetDO launches, in preference order; the first is also the
-  on-demand fallback. About 2 vCPU / 4 GiB. Each must fall within `brainInstanceFamilies`. -/
+  /-- The brain instance types FleetDO launches, in preference order: each on spot, then each on
+  demand. About 2 vCPU / 4 GiB. Each must fall within `brainInstanceFamilies`. -/
   brainLaunchTypes : List String := ["t3a.medium", "t3.medium"]
   brainSpot : Bool := true
   /-- At most this many brain hosts: 3 `t3a.medium`s hold about 12 brains at the default 2 per

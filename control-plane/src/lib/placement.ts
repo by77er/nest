@@ -132,8 +132,9 @@ export type ScaleUp =
  * A host of one kind is needed and none can take the work: launch one, unless one of that kind was
  * launched and hasn't enrolled (`pending`; one still in flight is the caller's to skip), or the kind
  * is at `max_hosts` (`live`: its active and STONITH-pending hosts; a draining one doesn't count). The
- * attempts: each instance type on spot (zones rotating with the second), then the first type on
- * demand.
+ * attempts, one pass: each instance type on spot, then each on demand, in `instance_types` order
+ * (zones rotating with the second; the caller stops at the first launch, or at an error that isn't
+ * EC2 having no room). The next pass is the next demand's, after its own backoff.
  */
 export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, nowMs: number): ScaleUp {
   if (pending > 0) return { launch: null, why: "pending" };
@@ -142,7 +143,7 @@ export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, now
   return {
     launch: [
       ...(s.spot ? s.instance_types.map((type, i) => ({ type, subnet: zone(i), spot: true })) : []),
-      { type: s.instance_types[0]!, subnet: zone(0), spot: false },
+      ...s.instance_types.map((type, i) => ({ type, subnet: zone(i), spot: false })),
     ],
   };
 }

@@ -86,7 +86,7 @@ describe("maxBrains, scaleUpPlan and idleStep (pure)", () => {
     expect(maxBrains(undefined, -3)).toBe(1);
   });
 
-  it("scaleUpPlan: nothing while pending or at the cap; else each type on spot, then the first on demand", () => {
+  it("scaleUpPlan: nothing while pending or at the cap; else each type on spot, then each on demand, in order", () => {
     const s = { instance_types: ["t3a.medium", "t3.medium"], subnet_ids: ["subnet-0a", "subnet-0b"], spot: true, max_hosts: 2 };
     expect(scaleUpPlan(s, 0, 1, 0)).toEqual({ launch: null, why: "pending" });
     expect(scaleUpPlan(s, 2, 0, 0)).toEqual({ launch: null, why: "at_max" });
@@ -94,11 +94,15 @@ describe("maxBrains, scaleUpPlan and idleStep (pure)", () => {
       { type: "t3a.medium", subnet: "subnet-0b", spot: true },
       { type: "t3.medium", subnet: "subnet-0a", spot: true },
       { type: "t3a.medium", subnet: "subnet-0b", spot: false },
+      { type: "t3.medium", subnet: "subnet-0a", spot: false },
     ] });
-    expect(scaleUpPlan({ ...s, spot: false }, 0, 0, 0)).toEqual({ launch: [{ type: "t3a.medium", subnet: "subnet-0a", spot: false }] });
+    expect(scaleUpPlan({ ...s, spot: false }, 0, 0, 0)).toEqual({ launch: [
+      { type: "t3a.medium", subnet: "subnet-0a", spot: false },
+      { type: "t3.medium", subnet: "subnet-0b", spot: false },
+    ] });
   });
 
-  it("property: scaleUpPlan launches only below the cap with nothing in flight, always ending on demand, in the cell's subnets", () => {
+  it("property: scaleUpPlan launches only below the cap with nothing in flight: spot types in order, then every type on demand in order, in the cell's subnets", () => {
     for (let seed = 1; seed <= 500; seed++) {
       const r = rng(seed);
       const types = Array.from({ length: 1 + Math.floor(r() * 3) }, (_, i) => `t${i}.medium`);
@@ -110,8 +114,8 @@ describe("maxBrains, scaleUpPlan and idleStep (pure)", () => {
       const ok = !pending && live < s.max_hosts;
       expect(p.launch !== null, `seed ${seed}`).toBe(ok);
       if (!p.launch) continue;
-      expect(p.launch.at(-1), `seed ${seed}`).toMatchObject({ type: types[0], spot: false });
-      expect(p.launch.length, `seed ${seed}`).toBe(s.spot ? types.length + 1 : 1);
+      const want = [...(s.spot ? types.map((type) => ({ type, spot: true })) : []), ...types.map((type) => ({ type, spot: false }))];
+      expect(p.launch.map((a) => ({ type: a.type, spot: a.spot })), `seed ${seed}`).toEqual(want);
       for (const a of p.launch) expect(subnets, `seed ${seed}`).toContain(a.subnet);
     }
   });
