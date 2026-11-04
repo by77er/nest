@@ -61,7 +61,8 @@ NVME=$(lsblk -dpno NAME,MODEL 2>/dev/null | awk '/Amazon EC2 NVMe Instance Stora
 # root volume: the host still comes up.
 instance_store() {
   if ! command -v mkfs.xfs >/dev/null || ! command -v xfs_info >/dev/null; then echo "no mkfs.xfs or xfs_info"; return 1; fi
-  blkid -o value -s TYPE "$NVME" 2>/dev/null | grep -qx xfs || mkfs.xfs -q -f -m reflink=1 -L nest-data "$NVME" || return 1
+  # -K: no discard of the whole device first (a large store would stretch boot); a fresh instance store reads as zeros.
+  blkid -o value -s TYPE "$NVME" 2>/dev/null | grep -qx xfs || mkfs.xfs -q -f -K -m reflink=1 -L nest-data "$NVME" || return 1
   install -d -m 0755 "$DATA" || return 1
   # `nofail` so a boot without it still comes up, and a short device timeout: a store left blank by
   # a stop and start never shows its label. The units that use it require it (below).

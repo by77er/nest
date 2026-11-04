@@ -62,9 +62,10 @@ structure CellSpec where
   accountId : String
   /-- The control plane's public URL, which hosts enroll with. -/
   controlUrl : String
-  /-- Instance families the control plane may launch: only families with nested virtualization
-  (Firecracker needs `/dev/kvm`; AWS lists C/M/R 7i and 8i, I7i, I7ie and X8i), IAM allowing
-  `<family>*.*`. A cell adds a family by name. -/
+  /-- Instance families the control plane may launch, each in size `.large` only: IAM allows
+  exactly `<family>.large` (`SandboxTypesOnly`). Only families with nested virtualization
+  (Firecracker needs `/dev/kvm`) that Firecracker supports (`launch_types_sound`). A cell lists
+  each family by name, `-flex` and `d` variants included. -/
   instanceFamilies : List String := ["c8i", "m8i", "r8i"]
   /-- The instance types FleetDO launches, in preference order; the first is also the on-demand
   fallback. Each must fall within `instanceFamilies` (`launch_types_within_iam` in `Cell.Test`). -/
@@ -78,7 +79,9 @@ structure CellSpec where
   enrollTimeoutMs : Nat := 600000
   /-- What a sandbox on regular pages is expected to use, reserved until the host counts it. -/
   sandboxReserveMib : Nat := 768
-  /-- At most this many sandboxes per host on regular pages; 0 is no cap. -/
+  /-- At most this many sandboxes per host on regular pages; 0 is no cap. Placement packs by
+  memory, so on a type with more memory per GB of instance store this is what keeps the store from
+  filling (`sandboxes_fit_the_instance_store`). -/
   maxSandboxesPerHost : Nat := 0
   /-- Brain hosts (docs/compute/brain-hosts/): the instance families the control plane may launch
   from the brain template (IAM allows `<family>*.*`). Cheap x86 types, since both kinds boot the
@@ -110,8 +113,17 @@ def brainEgress : List (String × Nat) := [("tcp", 443)]
 
 def bucketName (spec : CellSpec) : String := s!"nest-{spec.name}-{spec.accountId}"
 
-/-- The `ec2:InstanceType` patterns IAM allows (`EightIOnly`). -/
-def instancePatterns (spec : CellSpec) : List String := spec.instanceFamilies.map (· ++ "*.*")
+/-- The only size sandbox hosts launch in. -/
+def sandboxSize : String := ".large"
+
+/-- The `ec2:InstanceType` patterns IAM allows from the sandbox template (`SandboxTypesOnly`):
+exactly `<family>.large`, no wildcard, so neither a bigger size nor a look-alike family (`i7ie` for
+`i7i`) passes. -/
+def instancePatterns (spec : CellSpec) : List String := spec.instanceFamilies.map (· ++ sandboxSize)
+
+/-- Whether `type` is one of `spec`'s sandbox patterns (character lists, so `decide` reduces it). -/
+def CellSpec.allowsSandboxType (spec : CellSpec) (type : String) : Bool :=
+  (instancePatterns spec).any (·.toList == type.toList)
 
 /-- Whether `type` matches IAM's `StringLike` pattern `<family>*.*`: it starts with the family and
 has a `.` after it. (`*` matches any run of characters, including none.) -/
@@ -124,6 +136,25 @@ def nestedVirtualizationFamilies : List String :=
   ["m7i", "m7i-flex", "m8i", "m8id", "m8i-flex", "c7i", "c7i-flex", "c8i", "c8id", "c8i-flex",
    "r7i", "r7iz", "r8i", "r8id", "r8i-flex", "x8i", "i7i", "i7ie"]
 
+/-- The families on CPUs Firecracker tests and supports (its README's tested platforms, 2026-11-04:
+Cascade Lake, Ice Lake, Sapphire Rapids, Granite Rapids, AMD Milan and Genoa, Graviton 2-5;
+https://github.com/firecracker-microvm/firecracker#tested-platforms). Of the nested-virtualization
+families: 7i (Sapphire Rapids) and 8i (Granite Rapids, on a 6.1 or 6.18 host kernel only; AL2023's
+is 6.18). Not I7i/I7ie (Emerald Rapids) or X8i: not listed. -/
+def firecrackerFamilies : List String :=
+  ["m7i", "m7i-flex", "c7i", "c7i-flex", "r7i", "m8i", "m8id", "m8i-flex", "c8i", "c8id", "c8i-flex", "r8i", "r8id", "r8i-flex"]
+
+/-- Instance store per listed type, in GB (`describe-instance-types`, 2026-11-03). -/
+def instanceStoreGb (type : String) : Nat :=
+  if type.toList == "c8id.large".toList || type.toList == "m8id.large".toList || type.toList == "r8id.large".toList then 118
+  else if type.toList == "i7i.large".toList then 468
+  else 0
+
+/-- What one sandbox is allowed of an instance store, in GB: its sparse 32 GiB disk shares
+`nest-base`'s blocks by reflink, so it holds what the guest wrote plus a cut's copies (an
+assumption, unmeasured on a used host). -/
+def sandboxStoreBudgetGb : Nat := 8
+
 /-- An instance type's family, as characters: what comes before its `.` (lists, so `decide` reduces it). -/
 def familyOf (type : String) : List Char := type.toList.takeWhile (· ≠ '.')
 
@@ -132,15 +163,21 @@ def hasInstanceStore (type : String) : Bool :=
   let f := familyOf type
   f.getLast? == some 'd' || f == "i7i".toList || f == "i7ie".toList
 
-/-- Every type the autoscaler may pick has nested virtualization, and the instance-store types come
-before every EBS-only one (FleetDO tries them in order). -/
+/-- Every type the autoscaler may pick has nested virtualization on a CPU Firecracker supports, and
+the instance-store types come before every EBS-only one (FleetDO tries them in order). -/
 def CellSpec.launchTypesSound (spec : CellSpec) : Bool :=
   spec.launchTypes.all (fun t => nestedVirtualizationFamilies.any (·.toList == familyOf t))
+    && spec.launchTypes.all (fun t => firecrackerFamilies.any (·.toList == familyOf t))
     && (spec.launchTypes.dropWhile hasInstanceStore).all (fun t => !hasInstanceStore t)
+
+/-- On every instance-store type, the per-host sandbox cap leaves each sandbox its budget of the store. -/
+def CellSpec.sandboxesFitStore (spec : CellSpec) : Bool :=
+  spec.maxSandboxesPerHost > 0
+    && (spec.launchTypes.filter hasInstanceStore).all (fun t => spec.maxSandboxesPerHost * sandboxStoreBudgetGb ≤ instanceStoreGb t)
 
 /-- Every type the autoscaler may pick is one IAM lets it launch. -/
 def CellSpec.launchTypesAllowed (spec : CellSpec) : Bool :=
-  spec.launchTypes.all fun t => spec.instanceFamilies.any (matchesFamily · t)
+  spec.launchTypes.all spec.allowsSandboxType
 
 /-- The `ec2:InstanceType` patterns IAM allows from the brain template (`BrainTypesOnly`). -/
 def brainInstancePatterns (spec : CellSpec) : List String := spec.brainInstanceFamilies.map (· ++ "*.*")
@@ -285,7 +322,7 @@ def controlPlaneStatements (spec : CellSpec) (template brainTemplate hostRole br
       conditions := [fromTemplate] }
   , { sid := "SecurityGroupFromTemplate", actions := ["ec2:RunInstances"], resources := [ec2 "security-group/*"]
       conditions := [fromTemplate, { op := "Bool", entries := [("ec2:IsLaunchTemplateResource", ["true"])] }] }
-  , { sid := "EightIOnly", actions := ["ec2:RunInstances"], resources := [ec2 "instance/*"]
+  , { sid := "SandboxTypesOnly", actions := ["ec2:RunInstances"], resources := [ec2 "instance/*"]
       conditions := [fromSandboxTemplate, { op := "StringLike", entries := [("ec2:InstanceType", (instancePatterns spec).map lit)] },
         { op := "ArnEqualsIfExists", entries := [("ec2:InstanceProfile", [hostProfile])] }] }
   , { sid := "BrainTypesOnly", actions := ["ec2:RunInstances"], resources := [ec2 "instance/*"]

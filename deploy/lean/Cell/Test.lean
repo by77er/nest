@@ -37,12 +37,12 @@ theorem launch_only_from_the_templates (spec : CellSpec) (template brainTemplate
   simp [controlPlaneStatements, Statement.Grants, Statement.Requires]
 
 /-- An instance's type is tied to the template it is launched from: the sandbox template only
-launches the cell's 8i families, the brain template only the brain families. These are the only
+launches the cell's sandbox types, the brain template only the brain families. These are the only
 statements that grant `RunInstances` on `instance/*`. -/
 theorem instance_types_follow_their_template (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
     ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key,
-      s.Grants "ec2:RunInstances" → (s.sid = "EightIOnly" ∨ s.sid = "BrainTypesOnly") →
-        (s.sid = "EightIOnly" ∧ s.Requires "ArnLike" "ec2:LaunchTemplate" [template]
+      s.Grants "ec2:RunInstances" → (s.sid = "SandboxTypesOnly" ∨ s.sid = "BrainTypesOnly") →
+        (s.sid = "SandboxTypesOnly" ∧ s.Requires "ArnLike" "ec2:LaunchTemplate" [template]
             ∧ s.Requires "StringLike" "ec2:InstanceType" ((instancePatterns spec).map lit))
           ∨ (s.sid = "BrainTypesOnly" ∧ s.Requires "ArnLike" "ec2:LaunchTemplate" [brainTemplate]
             ∧ s.Requires "StringLike" "ec2:InstanceType" ((brainInstancePatterns spec).map lit)) := by
@@ -77,10 +77,10 @@ theorem control_plane_actions (spec : CellSpec) (template brainTemplate role bra
        "ssm:GetParameters", "kms:Sign", "kms:GetPublicKey"] := by
   simp [controlPlaneStatements]
 
-/-- The instance-type condition is the cell's families as `<family>*.*`, and nothing else. -/
+/-- The instance-type condition is the cell's families as `<family>.large`, and nothing else. -/
 theorem launch_only_listed_families (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
     ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key,
-      s.Grants "ec2:RunInstances" → s.sid = "EightIOnly" →
+      s.Grants "ec2:RunInstances" → s.sid = "SandboxTypesOnly" →
         s.Requires "StringLike" "ec2:InstanceType" ((instancePatterns spec).map lit) := by
   simp [controlPlaneStatements, Statement.Grants, Statement.Requires]
 
@@ -88,7 +88,7 @@ theorem launch_only_listed_families (spec : CellSpec) (template brainTemplate ro
 require it (when IAM sees one), so the brain template can't launch with the sandbox hosts' role. -/
 theorem instance_profile_follows_its_template (spec : CellSpec) (template brainTemplate role brainRole hp bp key : Input String) :
     ∀ s ∈ controlPlaneStatements spec template brainTemplate role brainRole hp bp key,
-      (s.sid = "EightIOnly" → s.Requires "ArnEqualsIfExists" "ec2:InstanceProfile" [hp])
+      (s.sid = "SandboxTypesOnly" → s.Requires "ArnEqualsIfExists" "ec2:InstanceProfile" [hp])
         ∧ (s.sid = "BrainTypesOnly" → s.Requires "ArnEqualsIfExists" "ec2:InstanceProfile" [bp]) := by
   simp [controlPlaneStatements, Statement.Requires]
 
@@ -108,7 +108,7 @@ example : matchesFamily "c8i" "c8i-flex.large" ∧ !matchesFamily "c8i" "c7i.lar
     ∧ !matchesFamily "c8i" "m8i.large" := by decide
 
 /-- Every instance type `use1`'s autoscaler may pick (`AWS_CELLS`) is one IAM lets it launch, so a
-launch never fails on `EightIOnly`. -/
+launch never fails on `SandboxTypesOnly`. -/
 theorem launch_types_within_iam : use1.launchTypesAllowed = true := by decide
 
 /-- Every sandbox type has nested virtualization (Firecracker needs KVM), and the instance-store
@@ -123,8 +123,17 @@ theorem brain_launch_types_within_iam : use1.brainLaunchTypesAllowed = true := b
 
 /-- The brain families are not the sandbox families: a brain template can never launch an 8i
 instance and the sandbox template never a brain type. -/
-example : use1.brainLaunchTypes.all (fun t => !use1.instanceFamilies.any (matchesFamily · t))
+example : use1.brainLaunchTypes.all (fun t => !use1.allowsSandboxType t)
     ∧ use1.launchTypes.all (fun t => !use1.brainInstanceFamilies.any (matchesFamily · t)) := by decide
+
+/-- IAM allows exactly the listed `.large` types: no bigger size, no look-alike family. -/
+example : use1.allowsSandboxType "c8id.large" ∧ !use1.allowsSandboxType "c8id.xlarge"
+    ∧ !use1.allowsSandboxType "i7ie.large" ∧ !use1.allowsSandboxType "i7i.large" := by decide
+
+/-- On every instance-store type, the per-host cap leaves each sandbox its share of the store:
+placement packs by memory, which on `m8id` and `r8id` would fit 2-4× `c8id`'s sandboxes on the same
+118 GB. -/
+theorem sandboxes_fit_the_instance_store : use1.sandboxesFitStore = true := by decide
 
 /-- `AWS_CELLS` is JSON keyed by the cell, carrying the stack's template, subnets and proxy root CA
 key and the spec's instance types (the shape control-plane/src/lib/cells.ts parses). -/
