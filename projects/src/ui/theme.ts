@@ -130,9 +130,14 @@ export const layout = {
   /** A section heading row's height (a small button's), so heading rows line up; a column's. */
   sectionHead: "2.25rem",
   denseHead: "1.75rem",
-  /** The sheet when it holds two columns (a task with its worker's trace), and its details column: a third. */
-  sheetWide: "72rem",
-  sheetDetails: "24rem",
+  /**
+   * The sheet when it holds two columns (a task with its worker's trace), and its details column. The task
+   * is what's read first, so it gets the wider column, at a reading line (body-lg prose at 40rem is about 70
+   * characters, inside the reading measure); the trace gets the rest, about 80 columns of its mono from
+   * `xl` up. The sheet leaves a sliver of the board beside it, so it still reads as a sheet over the page.
+   */
+  sheetWide: "min(84rem, 100vw - 6rem)",
+  sheetDetails: "40rem",
   /** Hit targets: 32 px with a pointer, 44 px on touch. */
   hit: "2rem",
   hitTouch: "2.75rem",

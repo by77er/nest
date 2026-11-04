@@ -3,6 +3,7 @@
 
 import { Badge, Tooltip } from "@mantine/core";
 import { IconRobot, IconTimeline } from "@tabler/icons-react";
+import { useEffect, useRef, useState } from "react";
 import { useTask } from "../../api/queries";
 import { EmptyState, ErrorState, LoadingState, MetaItem, MetaRow, Notice, Prose, Row, Section, Sheet, Stack, TriggerBadge } from "../../layout";
 import { ago, exact } from "../../common/time";
@@ -12,7 +13,7 @@ import { TERMINAL } from "../../../tasks";
 import { HistoryList } from "./HistoryList";
 import { SpecView } from "./SpecView";
 import { TaskActions } from "./TaskActions";
-import { TaskEditForm } from "./TaskEditForm";
+import { confirmDiscard, TaskDescription } from "./TaskDescription";
 import { TaskTraces } from "../trace/AgentTraces";
 import { TaskDependencies } from "./TaskDependencies";
 import { TaskPrs } from "./TaskPrs";
@@ -20,10 +21,26 @@ import { TaskPrs } from "./TaskPrs";
 export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: string; repo: string; taskId: string | undefined; onClose: () => void }) {
   const task = useTask(projectId, taskId);
   const t = task.data;
+  // Its description being edited: Escape is the form's then (it leaves the form), and closing with
+  // unsaved changes asks first (README.md#descriptions).
+  const [editing, setEditing] = useState(false);
+  const dirty = useRef(false);
+  useEffect(() => {
+    setEditing(false);
+    dirty.current = false;
+  }, [taskId]);
+  const close = () => {
+    if (editing && dirty.current) return confirmDiscard(() => {
+      setEditing(false);
+      onClose();
+    });
+    setEditing(false);
+    onClose();
+  };
 
   return (
     // A task that has (or had) a worker: its trace beside the details (two columns from `xl`, tabs below).
-    <Sheet opened={taskId !== undefined} onClose={onClose} title="Task"
+    <Sheet opened={taskId !== undefined} onClose={close} title={t?.title ?? "Task"} closeOnEscape={!editing}
       split
       beside={t?.assignee ? <TaskTraces task={t} /> : undefined}
       besideEmpty={t ? <EmptyState icon={IconTimeline} title="No worker yet" description="Its worker's trace shows here once the task is assigned and its worker starts." /> : undefined}
@@ -73,9 +90,7 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
             <TaskActions projectId={projectId} task={t} onDeleted={onClose} />
           </Stack>
 
-          <Section title="Description" region={false}>
-            <TaskEditForm key={t.id} projectId={projectId} task={t} readOnly={TERMINAL.has(t.state)} />
-          </Section>
+          <TaskDescription key={t.id} projectId={projectId} task={t} readOnly={TERMINAL.has(t.state)} editing={editing} onEditing={setEditing} dirty={dirty} />
 
           <Section title="Spec" region={false}>
             <SpecView spec={t.spec} />

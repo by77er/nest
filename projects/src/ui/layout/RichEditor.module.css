@@ -1,0 +1,170 @@
+/* A Markdown field edited as it renders (RichEditor.tsx): bordered as an input is (`sm` radius, the
+   border hairline, the danger role's text shade on an error), its toolbar on the surface over a hairline,
+   its content in the rich message's prose. The focus ring is the field's while its text has focus; the
+   toolbar's controls keep their own. */
+.root {
+  border: var(--nest-border);
+  border-radius: var(--mantine-radius-sm);
+  background: var(--mantine-color-body);
+}
+
+.root:has(.editable:focus) {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: 2px;
+}
+
+.root[data-error] {
+  border-color: var(--mantine-color-danger-text);
+}
+
+/* Below `sm`, one row that scrolls sideways (the common marks first), never a stack of rows. */
+@media (max-width: 48em) {
+  .toolbar {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .toolbar > * {
+    flex: none;
+  }
+}
+
+.toolbar {
+  gap: var(--mantine-spacing-xs);
+  padding: var(--mantine-spacing-xs);
+  border-bottom: var(--nest-border);
+  background: var(--mantine-color-body);
+  border-top-left-radius: var(--mantine-radius-sm);
+  border-top-right-radius: var(--mantine-radius-sm);
+}
+
+/* A hit target: 32 px with a pointer, 44 px on touch. */
+.control {
+  min-width: var(--nest-hit);
+  min-height: var(--nest-hit);
+}
+
+@media (pointer: coarse) {
+  .control {
+    min-width: var(--nest-hit-touch);
+    min-height: var(--nest-hit-touch);
+  }
+}
+
+.content {
+  background: transparent;
+  border-radius: 0 0 var(--mantine-radius-sm) var(--mantine-radius-sm);
+}
+
+.editable {
+  min-height: 8rem;
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  outline: none;
+}
+
+.editable:focus {
+  outline: none;
+}
+
+/* A task list as the editor draws it: its box in the list's indent, the item's text beside it. The box
+   is a hit target (32 px, 44 px on touch) as layout: the checkbox fills its label, invisible, over the
+   box drawn on the label, so the whole square toggles it. */
+.editable ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0;
+}
+
+.editable ul[data-type="taskList"] li {
+  display: flex;
+  gap: var(--mantine-spacing-xs);
+  align-items: flex-start;
+}
+
+.editable ul[data-type="taskList"] li > label {
+  position: relative;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--nest-hit);
+  height: var(--nest-hit);
+  margin-top: calc((var(--mantine-line-height-lg) - var(--nest-hit)) / 2);
+}
+
+@media (pointer: coarse) {
+  .editable ul[data-type="taskList"] li > label {
+    width: var(--nest-hit-touch);
+    height: var(--nest-hit-touch);
+    margin-top: calc((var(--mantine-line-height-lg) - var(--nest-hit-touch)) / 2);
+  }
+}
+
+.editable ul[data-type="taskList"] li > label > input {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+/* The box, drawn on the label as the rich message draws it (TaskCheck): the theme's square and
+   check-square icons (Tabler's, as masks), muted when not done and the text color when done. Tiptap's
+   span in the label is the checkbox's visually hidden name. */
+.editable ul[data-type="taskList"] li > label::before {
+  content: "";
+  width: 1rem;
+  height: 1rem;
+  background: var(--nest-muted);
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 5a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-14'/%3E%3C/svg%3E") center / contain no-repeat;
+  pointer-events: none;
+}
+
+.editable ul[data-type="taskList"] li > label:has(> input:checked)::before {
+  background: var(--mantine-color-text);
+  mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 5a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2v-14'/%3E%3Cpath d='M9 12l2 2l4 -4'/%3E%3C/svg%3E");
+}
+
+.editable ul[data-type="taskList"] li > label:has(> input:focus-visible) {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: -2px;
+  border-radius: var(--mantine-radius-sm);
+}
+
+.editable ul[data-type="taskList"] li > div {
+  flex: 1;
+  min-width: 0;
+}
+
+/* A block the editor keeps as written: its source on the subtle ground, under a caption naming it. */
+.editable [data-markdown-block] {
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  border-radius: var(--mantine-radius-md);
+  background: var(--nest-subtle);
+}
+
+.editable [data-markdown-block-label] {
+  font-size: var(--mantine-font-size-xs);
+  line-height: var(--mantine-line-height-xs);
+  color: var(--nest-muted);
+  margin-bottom: var(--mantine-spacing-2xs);
+}
+
+.editable [data-markdown-block] pre {
+  padding: 0;
+  background: transparent;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  min-height: 1lh;
+}
+
+.editable [data-markdown-block-label] {
+  user-select: none;
+}
+
+.editable :global(.ProseMirror-selectednode) {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: 2px;
+}

@@ -1,13 +1,13 @@
 // A project's settings: whether ready tasks are assigned automatically, how many workers may run, and
-// whether task PRs merge automatically once their review passes (with the repo's setting behind it).
-// The two Panels sit in one row with Save right under them at the bottom right; on a phone, one column,
+// whether task PRs merge automatically once their review passes (with the repo's setting behind it),
+// and whether workers may change CI workflows (README.md#secrets). The Panels sit in one row with Save right under them at the bottom right; on a phone, one column,
 // so Save comes right after the last field.
 
-import { Badge, Button, NumberInput, Select, Switch, Text } from "@mantine/core";
+import { Anchor, Badge, Button, NumberInput, Select, Switch, Text } from "@mantine/core";
 import { schemaResolver, useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
 import { Settings as SettingsSchema } from "../../../requests";
-import { useRetryRepoAutoMerge, useUpdateSettings } from "../../api/queries";
+import { useRetryRepoAutoMerge, useSecrets, useUpdateSettings } from "../../api/queries";
 import type { Settings } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
@@ -15,7 +15,7 @@ import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../au
 
 const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", merge: "Merge commit", rebase: "Rebase and merge" };
 
-const values = (s: Settings) => ({ auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method });
+const values = (s: Settings) => ({ auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method, workers_edit_workflows: s.workers_edit_workflows });
 
 /** The editable settings as Panels in a row, saved together by the one Save right under them. */
 export function SettingsForm({ projectId, settings, onDone }: { projectId: string; settings: Settings; onDone?: () => void }) {
@@ -74,6 +74,13 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                   {...form.getInputProps("merge_method")}
                 />
                 <RepoAutoMergeStatus projectId={projectId} status={settings.repo_auto_merge} />
+              </FieldGroup>
+            </Section>
+          </Panel>
+          <Panel>
+            <Section title="CI workflows" order={4} region={false}>
+              <FieldGroup>
+                <WorkflowsSetting projectId={projectId} {...form.getInputProps("workers_edit_workflows", { type: "checkbox" })} />
               </FieldGroup>
             </Section>
           </Panel>
@@ -145,6 +152,51 @@ export function RepoAutoMergeStatus({ projectId, status }: { projectId: string; 
         </Notice>
       )}
       {status.state === "pending" && status.error && <MetaItem>Retrying: {status.error}</MetaItem>}
+    </Stack>
+  );
+}
+
+/**
+ * "Workers may change CI workflows" (README.md#secrets): off by default; on, workers' push tokens get
+ * `workflows: write`, which the grant must allow. With the security note: a pushed workflow runs with
+ * the repo's Actions secrets before anyone reviews it.
+ */
+function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: string; checked?: boolean; onChange?: (e: React.ChangeEvent<HTMLInputElement>) => void; error?: React.ReactNode }) {
+  const secrets = useSecrets(projectId);
+  const allowed = secrets.data?.grant?.workflows;
+  const keeping = secrets.data?.workflow_workers ?? [];
+  return (
+    <Stack gap="sm">
+      <Switch
+        label="Workers may change CI workflows"
+        description="Their pushes may add or change files under .github/workflows/. Off, GitHub refuses those pushes from workers started from then on; live ones keep it until they end."
+        checked={checked}
+        onChange={onChange}
+        error={error}
+        disabled={allowed === false && !checked}
+      />
+      {allowed === false && (
+        <Text fz="xs" c="dimmed">
+          The app's grant doesn't allow it: the operator sets github_push.workflows in its grant first.
+        </Text>
+      )}
+      {!checked && keeping.length > 0 && (
+        <Notice tone="warning" title={`${keeping.length === 1 ? "A live worker keeps" : `${keeping.length} live workers keep`} it until it ends`}>
+          <Text fz="sm">
+            Turning it off reaches workers started from now on. A worker's push token is made with its sandbox, so these keep it until they end: {keeping.join(", ")}.
+          </Text>
+        </Notice>
+      )}
+      {checked && (
+        <Notice tone="warning" title="A pushed workflow runs before anyone reviews it">
+          <Text fz="sm">
+            It runs with the repo's Actions secrets as soon as it's pushed. Keep CI secrets in an environment with required reviewers, so a job that reads them waits for a person.{" "}
+            <Anchor href="https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment" target="_blank" rel="noreferrer" inherit>
+              GitHub: environments
+            </Anchor>
+          </Text>
+        </Notice>
+      )}
     </Stack>
   );
 }

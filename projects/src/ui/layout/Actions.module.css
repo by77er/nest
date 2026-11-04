@@ -8,11 +8,11 @@
    an equal negative margin, as a text link does, so the row's lines keep their rhythm. */
 @media (pointer: coarse) {
   .action.action {
-    --nest-hit-pad: calc((var(--nest-hit-touch) - 1.25rem) / 2);
-    height: auto;
+    /* The box the target's height, its line its own: the margin takes back what the box adds. */
+    height: var(--nest-hit-touch);
     min-height: 0;
-    padding-block: var(--nest-hit-pad);
-    margin-block: calc(var(--nest-hit-pad) * -1);
+    padding-block: 0;
+    margin-block: calc((1lh - var(--nest-hit-touch)) / 2);
     position: relative;
     z-index: 1;
   }

@@ -15,6 +15,8 @@ import { ManagerTrace, ReviewTrace } from "./AgentTraces";
 import { TraceLog } from "./TraceView";
 import { GLYPH } from "../../layout";
 import { groupTurns, initialTrace, MAX_EVENTS, reconnectDelay, type TraceEvent, traceReducer, traceUrl } from "./model";
+/** The task drawer (titled with its task's title). */
+const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
 
 /** A terminal line's glyph. */
 const glyphOf = (line: Element) => line.querySelector('[data-slot="glyph"]')!.textContent;
@@ -263,7 +265,7 @@ describe("the mounts", () => {
     const t = task({ state: "in_progress", assignee: "agt_worker1" });
     api.tasks = [t];
     const { user } = renderApp(`/projects/prj_one/board?task=${t.id}`, api);
-    const drawer = await screen.findByRole("dialog", { name: "Task" });
+    const drawer = await screen.findByRole("dialog", SHEET);
     await user.click(await within(drawer).findByRole("tab", { name: "Trace" }));
     await within(drawer).findByRole("heading", { name: "Worker's trace" });
     await waitFor(() => expect(FakeSocket.latest("/api/agents/agt_worker1/trace")).toBeDefined());
@@ -275,7 +277,7 @@ describe("the mounts", () => {
     const t = task({ state: "ready" });
     api.tasks = [t];
     renderApp(`/projects/prj_one/board?task=${t.id}`, api);
-    const drawer = await screen.findByRole("dialog", { name: "Task" });
+    const drawer = await screen.findByRole("dialog", SHEET);
     await within(drawer).findByRole("heading", { name: "Description" });
     expect(within(drawer).queryByRole("tab")).toBeNull();
     expect(drawer.querySelector("[data-column]")).toBeNull();
@@ -493,7 +495,7 @@ describe("the task drawer's layout", () => {
       const t = task({ state: "in_progress", assignee: "agt_worker1" });
       api.tasks = [t];
       renderApp(`/projects/prj_one?task=${t.id}`, api);
-      const drawer = await screen.findByRole("dialog", { name: "Task" });
+      const drawer = await screen.findByRole("dialog", SHEET);
       await waitFor(() => expect(drawer.querySelector('[data-column="details"]')).not.toBeNull());
       const details = drawer.querySelector('[data-column="details"]') as HTMLElement;
       const beside = drawer.querySelector('[data-column="beside"]') as HTMLElement;
@@ -526,7 +528,7 @@ describe("the task drawer's tabs and width", () => {
       const t = task({ state: "in_progress", assignee: "agt_worker1" });
       api.tasks = [t];
       const { user } = renderApp(`/projects/prj_one?task=${t.id}`, api);
-      const drawer = await screen.findByRole("dialog", { name: "Task" });
+      const drawer = await screen.findByRole("dialog", SHEET);
       await user.click(await within(drawer).findByRole("tab", { name: "Trace" }));
       const sock = await waitFor(() => FakeSocket.latest("agt_worker1")!);
       // The connection's status is on the terminal's first line, in its muted tone.
@@ -551,8 +553,8 @@ describe("the task drawer's tabs and width", () => {
       api.tasks = [a, b];
       const widthOf = async (id: string) => {
         const view = renderApp(`/projects/prj_one?task=${id}`, api);
-        await screen.findByRole("dialog", { name: "Task" });
-        await within(screen.getByRole("dialog", { name: "Task" })).findByRole("heading", { name: "Description" });
+        await screen.findByRole("dialog", SHEET);
+        await within(screen.getByRole("dialog", SHEET)).findByRole("heading", { name: "Description" });
         const content = document.querySelector(".mantine-Drawer-content") as HTMLElement;
         const w = content.getAttribute("style") ?? "";
         view.unmount();
@@ -563,7 +565,7 @@ describe("the task drawer's tabs and width", () => {
       expect(without).toBe(withWorker);
       // A task without a worker: a quiet empty trace column, so the frame stays balanced.
       renderApp(`/projects/prj_one?task=${b.id}`, api);
-      const drawer = await screen.findByRole("dialog", { name: "Task" });
+      const drawer = await screen.findByRole("dialog", SHEET);
       await waitFor(() => expect(drawer.querySelector('[data-column="beside"]')).not.toBeNull());
       expect(within(drawer.querySelector('[data-column="beside"]') as HTMLElement).getByText("No worker yet")).toBeInTheDocument();
       expect(FakeSocket.opened.filter((x) => x.url.includes(b.id))).toEqual([]);

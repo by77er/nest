@@ -58,6 +58,22 @@ export interface Ask {
   [k: string]: unknown;
 }
 
+/**
+ * What a client may add to its own sandbox's spec: its egress rules (docs/control-plane/api/clients/#egress),
+ * its secrets' bindings and the environment that names their placeholders (#injection, #environment),
+ * and `workflows: write` on the push token (#workflow-files), each within its grant.
+ */
+export interface SandboxExtras {
+  egress?: { allow: { host: string; ports?: number[] }[] };
+  inject?: { name: string; secret: string; hosts: string[]; locations: ({ type: "authorization_bearer" } | { type: "authorization_basic_password" } | { type: "header"; name: string })[]; wildcard?: boolean }[];
+  env?: Record<string, string>;
+  github_push?: { workflows: boolean };
+}
+
+/** A sandbox's client layer (docs/control-plane/api/clients/#the-client-layer), as `GET …/client-policy` answers it. */
+import type { ClientLayer as ClientPolicy, HeldClientLayer, PolicyAllow } from "./network";
+export type { ClientPolicy, HeldClientLayer };
+
 /** The overrides a client may give a spawn (nest only narrows: `SpawnerOverrides`). */
 export interface SpawnOverrides {
   tools?: string[];
@@ -114,7 +130,7 @@ export class Nest {
   }
 
   /** Create a sandbox in the app's cell. The same `idempotencyKey` with the same request answers the same sandbox. */
-  createSandbox(r: { labels: Labels; idle_ttl_ms?: number }, idempotencyKey: string): Promise<{ sandbox: string }> {
+  createSandbox(r: { labels: Labels; idle_ttl_ms?: number } & SandboxExtras, idempotencyKey: string): Promise<{ sandbox: string }> {
     return this.call("POST", "/v1/sandboxes", { ...r, cell: this.config.cell }, { idempotencyKey });
   }
 
@@ -129,10 +145,15 @@ export class Nest {
    * `key` names this start attempt: a retry after a lost answer sends the same Idempotency-Keys
    * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back.
    */
-  async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string): Promise<string> {
-    const sandbox = (await this.createSandbox({ labels }, `${key}/sandbox`)).sandbox;
+  async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string, extras: SandboxExtras = {}): Promise<string> {
+    const sandbox = (await this.createSandbox({ labels, ...extras }, `${key}/sandbox`)).sandbox;
     const overrides: SpawnOverrides = "push" in repo ? { repos: [repo.push] } : { read_repos: [repo.read] };
     return (await this.createAgent({ template, sandbox, labels, overrides, start: true }, `${key}/agent`)).agent;
+  }
+
+  /** Destroy one of the app's sandboxes (`DELETE /v1/sandboxes/<id>`, owner auth). */
+  async destroySandbox(sandbox: string): Promise<void> {
+    await this.call("DELETE", `/v1/sandboxes/${encodeURIComponent(sandbox)}`);
   }
 
   getAgent(agent: string): Promise<AgentView> {
@@ -175,6 +196,21 @@ export class Nest {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}/trace/history`, undefined, { query: q });
   }
 
+  /** A sandbox's client layer: its own egress rules, bindings and env. */
+  getClientPolicy(sandbox: string): Promise<HeldClientLayer> {
+    return this.call("GET", `/v1/sandboxes/${encodeURIComponent(sandbox)}/client-policy`);
+  }
+
+  /** Replace a sandbox's client layer whole (an absent part is emptied: send every part). */
+  async putClientPolicy(sandbox: string, layer: ClientPolicy): Promise<void> {
+    await this.call("PUT", `/v1/sandboxes/${encodeURIComponent(sandbox)}/client-policy`, layer);
+  }
+
+  /** A sandbox's effective egress policy (the operator's layers and its own), as nest compiles it. */
+  sandboxPolicy(sandbox: string): Promise<{ allow?: PolicyAllow[]; passthrough?: string[] }> {
+    return this.call("GET", `/v1/sandboxes/${encodeURIComponent(sandbox)}/policy`);
+  }
+
   listAsks(agent: string): Promise<unknown> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}/asks`);
   }
@@ -187,6 +223,27 @@ export class Nest {
   putCatalog(kind: "templates" | "capabilities", name: string, body: unknown): Promise<unknown> {
     const [ns, entry] = name.split("/");
     return this.call("PUT", `/v1/catalog/${kind}/${encodeURIComponent(ns!)}/${encodeURIComponent(entry!)}`, body);
+  }
+
+  /** The client's own record (`GET /v1/clients/self`): its grant, among the rest. */
+  self(): Promise<{
+    client?: string;
+    grant?: { egress_hosts?: string[]; inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean } };
+  }> {
+    return this.call("GET", "/v1/clients/self");
+  }
+
+  /** Store or replace a write-only secret (docs/control-plane/api/clients/#secrets); answers its metadata, never the value. */
+  putSecret(name: string, value: string, description: string): Promise<{ name: string; size: number; created_ms: number; updated_ms: number; last_injected_ms: number | null }> {
+    return this.call("PUT", `/v1/clients/self/secrets/${encodeURIComponent(name)}`, { value, ...(description ? { description } : {}) });
+  }
+
+  async deleteSecret(name: string): Promise<void> {
+    await this.call("DELETE", `/v1/clients/self/secrets/${encodeURIComponent(name)}`);
+  }
+
+  async listSecrets(): Promise<{ name: string; size: number; created_ms?: number; updated_ms?: number; last_injected_ms: number | null }[]> {
+    return (await this.call<{ secrets?: { name: string; size: number; created_ms?: number; updated_ms?: number; last_injected_ms: number | null }[] }>("GET", "/v1/clients/self/secrets")).secrets ?? [];
   }
 
   /**

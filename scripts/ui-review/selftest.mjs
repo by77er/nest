@@ -5,9 +5,10 @@
 //   node scripts/ui-review/selftest.mjs
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
-import { inkChatFit, inkHeaderGap, inkPrs, inkTrace } from "./apps/projects.mjs";
-import { measure } from "./checks.mjs";
+import { inkChatFit, inkHeaderGap, inkPrs, inkTrace, removeFocusCheck, waitsCheck } from "./apps/projects.mjs";
+import { measure, restoreTouch, scanHits } from "./checks.mjs";
 import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
+import { proseProblems } from "./trace-prose.mjs";
 
 const sel = {
   frame: "[data-ds=page]",
@@ -222,6 +223,45 @@ for (const remount of [false, true]) {
   assert.equal(await page.evaluate(() => document.querySelectorAll("[data-hit-probe]").length + [...document.head.querySelectorAll("style")].filter((x) => x.textContent.includes("data-hit-probe")).length), 0, "the probe leaves nothing behind");
 }
 
+// The trace's Markdown (trace-prose.mjs): an assistant's answer on a terminal, clean, then with each of
+// the design review's (#141) planted failures: a serif span, a 20 px paragraph, a wide fence that doesn't
+// scroll in itself, and a line spilled past the trace.
+{
+  const prosePage = (plant = "") => `<!doctype html><html><head><style>
+    body { margin: 0; font: 14px/20px sans-serif; }
+    [data-ds=terminal] { width: 400px; padding: 12px; font-family: "JetBrains Mono Variable", monospace; font-size: 13px; line-height: 20px; white-space: pre-wrap; }
+    [data-ds=term-prose] { white-space: normal; min-width: 0; }
+    [data-ds=term-prose] p { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+    [data-ds=term-prose] :where(pre, table, code, strong) { font: inherit; }
+    [data-ds=term-prose] pre { margin: 0; white-space: pre; overflow-x: auto; contain: inline-size; }
+    [data-md=table] { overflow-x: auto; contain: inline-size; }
+    [data-md=table] td { white-space: pre; }
+  </style></head><body><div data-ds="terminal"><div data-ds="term-prose">
+    <p>The push was refused, so <strong>the broker</strong> opens it, after <code>npm run build</code>.</p>
+    <pre><code>${"npm run build && npx vitest run --reporter=verbose ".repeat(4)}</code></pre>
+    <div data-md="table"><table><tr><td>${"the-integration-suite-".repeat(6)}</td></tr></table></div>
+  </div></div><script>(${plant || "() => {}"})()</script></body></html>`;
+  const plants = {
+    serif: () => { const s = document.createElement("span"); s.style.fontFamily = "serif"; s.textContent = "x"; document.querySelector("[data-ds=term-prose] p").append(s); },
+    bigger: () => { document.querySelector("[data-ds=term-prose] p").style.fontSize = "20px"; },
+    noScrollPre: () => { document.querySelector("[data-ds=term-prose] pre").style.overflowX = "visible"; },
+    spill: () => { const p = document.querySelector("[data-ds=term-prose] p"); p.style.whiteSpace = "pre"; p.textContent = "x".repeat(400); },
+  };
+  // Each plant's problem, and only its kind (a 20 px paragraph's children inherit its size).
+  const expected = { serif: /<span> isn't mono \(serif\)/, bigger: /<p> is 20px, not the terminal's 13px/, noScrollPre: /a wide trace fence doesn't scroll in itself/, spill: /<p> spills past the trace's line/ };
+  const kind = { serif: /isn't mono/, bigger: /is 20px, not the terminal's 13px/, noScrollPre: /doesn't scroll in itself/, spill: /spills past/ };
+  const p = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  await p.setContent(prosePage());
+  assert.deepEqual(await p.evaluate(proseProblems), [], "the clean trace Markdown passes");
+  for (const [name, fn] of Object.entries(plants)) {
+    await p.setContent(prosePage(fn.toString()));
+    const problems = await p.evaluate(proseProblems);
+    assert.match(problems[0] ?? "", expected[name], `${name}: ${JSON.stringify(problems)}`);
+    for (const pr of problems) assert.match(pr, kind[name], `${name}: only its own kind: ${JSON.stringify(problems)}`);
+  }
+  await p.close();
+}
+
 // The projects app's rhythm measures (apps/projects.mjs), on planted pages: what's painted, not the
 // grown hit boxes. Each clean page passes; each plant (the reviewer's cases) fails.
 {
@@ -272,6 +312,101 @@ for (const remount of [false, true]) {
     ["a short chat's composer floating above the bottom", "[data-ds=chat-log] p:nth-child(n+3) { display: none; } [data-ds=composer-dock] { position: static; }"],
   ]) assert.notDeepEqual(await fit(css), [], `chat-fit: ${plant} must fail`);
   await page2.close();
+}
+
+// #135's state checks, on planted pages (the design review's cases that once passed): the manager's waits
+// (no raw ids; the section there when the column shows; task and PR lines linked), and focus after a
+// keyboard Remove (the next row's, in the same role's panel).
+{
+  const p = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const waitsPage = `<!doctype html><div data-slot="manager-context"><section><h4>Waiting for</h4>
+    <div role="list" data-slot="waits">
+      <div role="listitem"><p><a href="/b?task=t1">Export gadgets as CSV</a> to be In review or Done · 45 min left</p></div>
+      <div role="listitem"><p><a href="https://github.com/o/r/pull/118">#118</a> to merge · 2 h left</p></div>
+      <div role="listitem"><p>The owner's reply · 26 h left</p></div>
+    </div></section></div>`;
+  const waitsPlants = {
+    "raw id and snake_case": () => document.querySelector("[data-slot=waits]").append(" tsk_demo4 in_review"),
+    "the section missing": () => document.querySelectorAll("[data-slot=waits]").forEach((e) => e.remove()),
+    "links removed": () => document.querySelectorAll("[data-slot=waits] a").forEach((a) => a.replaceWith(document.createTextNode(a.textContent))),
+  };
+  await p.setContent(waitsPage);
+  assert.deepEqual(await waitsCheck(p), [], "the clean waits pass");
+  for (const [name, plant] of Object.entries(waitsPlants)) {
+    await p.setContent(waitsPage);
+    await p.evaluate(plant);
+    assert.notDeepEqual(await waitsCheck(p), [], `waits: ${name} must fail`);
+  }
+  const panels = `<!doctype html><div data-role="worker"><button aria-label="Remove b">x</button><button aria-label="Remove c">x</button></div><div data-role="manager"><button aria-label="Remove b">x</button></div>`;
+  p.removedNext = { role: "worker", host: "b" };
+  const focusPlants = {
+    clean: () => document.querySelector("[data-role=worker] [aria-label='Remove b']").focus(),
+    "focus lost to body": () => document.activeElement?.blur(),
+    "another panel's Remove": () => document.querySelector("[data-role=manager] [aria-label='Remove b']").focus(),
+    "another row's Remove": () => document.querySelector("[data-role=worker] [aria-label='Remove c']").focus(),
+  };
+  for (const [name, plant] of Object.entries(focusPlants)) {
+    await p.setContent(panels);
+    await p.evaluate(plant);
+    const problems = await removeFocusCheck(p);
+    if (name === "clean") assert.deepEqual(problems, [], "focus on the next row's Remove passes");
+    else assert.notDeepEqual(problems, [], `focus after Remove: ${name} must fail`);
+  }
+  await p.close();
+}
+
+// The scroll scan (scanHits): hit-overlap and hit-size wherever the reader can scroll, not the first
+// viewport only. Each plant is out of the first viewport but one (the reviewer's cases, plantscan.mjs):
+// below the fold, in a sideways scroller, in a vertical inner scroller (a drawer's body), below the fold
+// and sideways at once, and in the topmost modal's body. The first viewport alone misses each; the scan
+// finds each. A clean page with the same scrollers finds nothing.
+{
+  const ctx = await browser.newContext({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+  const p3 = await ctx.newPage();
+  const css = "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body { margin: 0; font: 16px/24px sans-serif; } .big { display: block; min-width: 48px; min-height: 48px; } .t::after { content: ''; position: absolute; inset: -30px 0; }</style>";
+  // A reaches 30 px above and below itself, over B.
+  const pair = '<div style="position: relative; padding: 40px 0"><a class="t big" href="/a" style="position: relative">A</a><a class="big" href="/b">B</a></div>';
+  const tiny = '<button style="width: 16px; height: 16px; padding: 0; margin: 60px">x</button>';
+  const sideways = (inner) => `<div style="overflow-x: auto; width: 390px"><div style="width: 1600px; position: relative; height: 300px"><div style="position: absolute; left: 1200px; top: 0">${inner}</div></div></div>`;
+  const down = (inner) => `<div style="overflow-y: auto; height: 300px"><div style="height: 1200px"></div>${inner}</div>`;
+  const modal = (inner) => `<div role="dialog" aria-modal="true" style="position: fixed; inset: 0; background: #fff; display: flex; flex-direction: column"><h2 style="margin: 0">Sheet</h2><div style="overflow-y: auto; flex: 1"><div style="height: 1500px"></div>${inner}</div></div>`;
+  const fold = (inner) => `<div style="height: 2000px"></div>${inner}`;
+  const cases = {
+    "below the fold": fold,
+    "in a sideways scroller": sideways,
+    "in a vertical inner scroller": down,
+    "below the fold, sideways": (x) => fold(sideways(x)),
+    "in the topmost modal's body": (x) => `<a class="big" href="/under">Under</a>${modal(x)}`,
+  };
+  const first = async () => {
+    const p = (await p3.evaluate(measure, { ...sel, touch: true, viewportOnly: true })).problems;
+    return { "hit-overlap": p["hit-overlap"], "hit-size": p["hit-size"] };
+  };
+  for (const [name, wrap] of Object.entries(cases)) {
+    await p3.setContent(`<!doctype html><html><head>${css}</head><body><h1>Page</h1>${wrap('<a class="big" href="/c">C</a>')}</body></html>`);
+    const quiet = await scanHits(p3, sel);
+    assert.deepEqual(quiet, { "hit-overlap": [], "hit-size": [] }, `${name}, clean: ${JSON.stringify(quiet)}`);
+    for (const [plant, inner, check] of [["an overlap", pair, "hit-overlap"], ["a small target", tiny, "hit-size"]]) {
+      await p3.setContent(`<!doctype html><html><head>${css}</head><body><h1>Page</h1>${wrap(inner)}</body></html>`);
+      assert.deepEqual((await first())[check], [], `${name}: ${plant} isn't in the first viewport`);
+      const y0 = await p3.evaluate(() => window.scrollY);
+      const got = await scanHits(p3, sel);
+      assert.ok(got[check].length >= 1, `${name}: the scan finds ${plant}: ${JSON.stringify(got)}`);
+      assert.equal(await p3.evaluate(() => window.scrollY), y0, `${name}: the scan puts the page's scroll back`);
+      assert.equal(await p3.evaluate(() => document.querySelectorAll("[data-hit-scan]").length), 0, `${name}: the scan leaves no marks`);
+    }
+  }
+  // In view, the scan finds it too (its first step is the first viewport).
+  await p3.setContent(`<!doctype html><html><head>${css}</head><body><h1>Page</h1>${pair}</body></html>`);
+  assert.ok((await scanHits(p3, sel))["hit-overlap"].length >= 1, "in view: the scan finds an overlap");
+  // A full-page screenshot ends the touch emulation; restoreTouch brings it back before a scan.
+  await p3.setContent(`<!doctype html><html><head>${css}</head><body><h1>Page</h1>${fold("")}</body></html>`);
+  assert.ok(await p3.evaluate(() => matchMedia("(pointer: coarse)").matches), "a touch context is coarse");
+  await p3.screenshot({ fullPage: true });
+  const lost = !(await p3.evaluate(() => matchMedia("(pointer: coarse)").matches));
+  await restoreTouch(p3);
+  assert.ok(await p3.evaluate(() => matchMedia("(pointer: coarse)").matches), `restoreTouch makes it coarse again (the screenshot ${lost ? "had ended it" : "kept it"})`);
+  await ctx.close();
 }
 
 await browser.close();
