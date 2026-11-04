@@ -307,7 +307,7 @@ describe("the migration", () => {
       const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("CREATE TABLE task_prs")));
       sql.exec("DROP TABLE task_prs");
       sql.exec("DROP TABLE task_deps");
-      for (const t of ["waits", "layers", "frozen_egress", "secrets", "secret_requests", "agent_secrets", "start_specs", "minted"]) sql.exec(`DROP TABLE ${t}`);
+      for (const t of ["waits", "layers", "frozen_egress", "secrets", "secret_requests", "agent_secrets", "start_specs", "minted", "abandoned"]) sql.exec(`DROP TABLE ${t}`);
       for (const c of ["network", "network_rev", "workers_edit_workflows", "grant_seen", "secrets_next_ms"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       expect(step).toBe(MIGRATIONS.length - 3);
       sql.exec("UPDATE schema_version SET v = ?", step);

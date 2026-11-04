@@ -252,6 +252,14 @@ export class FakeNest {
         return json(200, { version: 2 });
       }
     }
+    if (req.method === "DELETE" && (m = u.pathname.match(/^\/v1\/sandboxes\/(sbx_[A-Za-z0-9]+)$/))) {
+      // Destroy a sandbox (owner auth): ended, its attached agents with it.
+      const sb = this.sandboxes.get(m[1]!);
+      if (!sb || sb.owner !== CLIENT) return nestErr(404, "unknown_sandbox", "unknown sandbox");
+      sb.ended = true;
+      for (const a of this.agents.values()) if (a.sandbox === sb.sandbox) a.ended = true;
+      return json(200, { sandbox: sb.sandbox, state: "destroyed" });
+    }
     if (r === "GET /v1/sandboxes") {
       const rows = [...this.sandboxes.values()].filter((s) => !s.ended && labelsMatch(s.labels));
       return json(200, { sandboxes: rows.map((s) => ({ sandbox: s.sandbox, cell: CELL, client: CLIENT, owner: s.owner, labels: s.labels, created_ms: 1, ended_ms: null })), next_cursor: null });
