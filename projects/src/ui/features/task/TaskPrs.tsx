@@ -51,7 +51,9 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
       onConfirm: () => detach.mutate({ task: task.id, pr: pr.number }, { onSuccess: onDetached }),
     });
   return (
-    <Stack gap="xs" data-pr={pr.number}>
+    // Its title row (the PR's link, Detach) and its badges row (auto-merge's details) are controls a
+    // 44 px pitch apart on touch; the PRs themselves move apart to keep each one's lines a group.
+    <Stack gap="xs" data-pr={pr.number} data-touch-pitch>
       <Row gap="sm" wrap="nowrap">
         <Anchor href={`https://github.com/${repo}/pull/${pr.number}`} target="_blank" rel="noreferrer" fz="sm" fw={weight.medium}>
           #{pr.number}
@@ -137,7 +139,7 @@ export function TaskPrs({ projectId, repo, task }: { projectId: string; repo: st
   return (
     <Section title="Pull requests" count={task.prs.length} region={false} actions={!TERMINAL.has(task.state) && <AttachPr projectId={projectId} repo={repo} task={task} buttonRef={attach} />}>
       {/* Each PR's lines stay tight; PRs are 2xl apart, more than twice the gap within one, on touch too. */}
-      <Stack gap="2xl">
+      <Stack gap="2xl" data-touch-group-gap>
         {task.prs.length === 0 ? (
           <Text fz="sm" c="dimmed">
             None attached. Its worker's PR attaches itself; the task is done once all attached PRs have merged.

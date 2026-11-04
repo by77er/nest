@@ -34,7 +34,7 @@ function More({ projectId, n }: { projectId: string; n: number }) {
   return (
     <Text fz="sm" lh="lg" c="dimmed">
       and{" "}
-      <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{}} inherit data-inline>
+      <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{}} inherit lh="lg" data-inline>
         {n} more on the board
       </AnchorLink>
     </Text>
