@@ -75,6 +75,14 @@ body {
   min-width: 12rem;
 }
 
+/* On touch, a table's rows of controls (a review's verdict badges, its trace button) are a 44 px pitch
+   apart across rows too: each cell has the room. */
+@media (pointer: coarse) {
+  [data-ds="table-frame"] td {
+    padding-block: calc(var(--mantine-spacing-sm) + 0.375rem);
+  }
+}
+
 /* A transcript on touch (Terminal): each tool call (its row, its result, its expand row) stays one tight
    group, and the groups move apart instead, by the room their rows' 44 px hit boxes need; the rows'
    hit boxes never reach out of the terminal. */
@@ -100,5 +108,13 @@ body {
 @media (pointer: coarse) {
   [data-touch-pitch] {
     row-gap: calc(var(--nest-hit-touch) - 1.125rem) !important;
+  }
+}
+
+/* On touch, a section whose heading has an action (Attach PR, Add dependency) keeps its first row's
+   controls clear of it: a little more room under the heading. */
+@media (pointer: coarse) {
+  [data-ds="section"]:has(> [data-slot="head"] [data-slot="actions"] :is(button, a[href])) {
+    row-gap: calc(var(--mantine-spacing-lg) + var(--mantine-spacing-sm)) !important;
   }
 }

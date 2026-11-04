@@ -51,7 +51,7 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
       onConfirm: () => detach.mutate({ task: task.id, pr: pr.number }, { onSuccess: onDetached }),
     });
   return (
-    <Stack gap="xs" data-pr={pr.number}>
+    <Stack gap="sm" data-pr={pr.number}>
       <Row gap="sm" wrap="nowrap">
         <Anchor href={`https://github.com/${repo}/pull/${pr.number}`} target="_blank" rel="noreferrer" fz="sm" fw={weight.medium}>
           #{pr.number}
@@ -67,6 +67,13 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
           </RowAction>
         )}
       </Row>
+      {/* Three lines: its number and title, who attached it, its badges: the text line between the two
+          rows of controls gives them their 44 px pitch on touch without a gap of its own. */}
+      <MetaRow>
+        <MetaItem title={exact(pr.attached_ms)}>
+          Attached by {pr.attached_by === "owner" ? "you" : pr.attached_by.startsWith("app:") ? "its branch" : pr.attached_by} {ago(pr.attached_ms)}
+        </MetaItem>
+      </MetaRow>
       <Row gap="xs">
         <Badge size="sm" variant="light" color={pr.state === "merged" ? "success" : "primary"}>
           {pr.state === "merged" ? "Merged" : "Open"}
@@ -79,12 +86,6 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
           </Badge>
         )}
       </Row>
-      {/* Three lines: its number and title, its badges, who attached it. */}
-      <MetaRow>
-        <MetaItem title={exact(pr.attached_ms)}>
-          Attached by {pr.attached_by === "owner" ? "you" : pr.attached_by.startsWith("app:") ? "its branch" : pr.attached_by} {ago(pr.attached_ms)}
-        </MetaItem>
-      </MetaRow>
     </Stack>
   );
 }
