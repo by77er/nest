@@ -12,7 +12,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { chromium } from "playwright";
-import { measure } from "./checks.mjs";
+import { measure, restoreTouch, scanHits } from "./checks.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO = resolve(HERE, "../..");
@@ -134,12 +134,20 @@ for (const scheme of schemes) {
           await state.after(page);
           await page.waitForTimeout(500);
         }
-        const r = await page.evaluate(measure, { ...app.selectors, viewportOnly: state.full === false, touch: width < 600 });
+        // Hit areas are checked by the scroll scan below, over everything the reader can scroll to.
+        const r = await page.evaluate(measure, { ...app.selectors, viewportOnly: state.full === false, touch: false });
         shot.frame = r.frame;
         for (const [check, list] of Object.entries(r.problems)) for (const d of list) fail(check, shot, d);
         for (const d of (await state.check?.(page, { width, scheme })) ?? []) fail(state.checkName ?? "app", shot, d);
         if (app.errorText && (await page.getByText(app.errorText).count())) fail("page-error", shot, `the page shows "${app.errorText}"`);
         await page.screenshot({ path: join(out, shot.file), fullPage: state.full !== false });
+        // After the screenshot: scrolling can change what's shown (a trace loads older events at its top).
+        if (width < 600) {
+          // A full-page screenshot ends the touch emulation (Chromium's device metrics are reset with it):
+          // `pointer: coarse` must hold again before the scan, or the hit areas it measures aren't touch's.
+          await restoreTouch(page);
+          for (const [check, list] of Object.entries(await scanHits(page, app.selectors))) for (const d of list) fail(check, shot, d);
+        }
       } catch (e) {
         fail("page-error", shot, `capture failed: ${e.message.split("\n")[0]}`);
       }
