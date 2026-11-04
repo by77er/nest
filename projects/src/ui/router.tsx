@@ -22,6 +22,7 @@ const ManagerPage = lazyRouteComponent(() => import("./features/manager/ManagerP
 const ReviewsPage = lazyRouteComponent(() => import("./features/reviews/ReviewsPage"), "ReviewsPage");
 const SettingsPage = lazyRouteComponent(() => import("./features/settings/SettingsPage"), "SettingsPage");
 const NetworkPage = lazyRouteComponent(() => import("./features/network/NetworkPage"), "NetworkPage");
+const SecretsPage = lazyRouteComponent(() => import("./features/secrets/SecretsPage"), "SecretsPage");
 const AdminPage = lazyRouteComponent(() => import("./features/admin/AdminPage"), "AdminPage");
 
 const TASK_ID = /^tsk_[a-z0-9]+$/;
@@ -65,10 +66,20 @@ const manager = createRoute({
 const reviews = createRoute({ getParentRoute: () => project, path: "reviews", component: ReviewsPage });
 const settings = createRoute({ getParentRoute: () => project, path: "settings", component: SettingsPage });
 const network = createRoute({ getParentRoute: () => project, path: "network", component: NetworkPage });
+/** `?add=<name>&hosts=<a,b>` opens the form prefilled: an agent's request, from "Needs you". */
+const secrets = createRoute({
+  getParentRoute: () => project,
+  path: "secrets",
+  validateSearch: (s: Record<string, unknown>): { add?: string; hosts?: string } => ({
+    ...(typeof s.add === "string" ? { add: s.add.slice(0, 64) } : {}),
+    ...(typeof s.hosts === "string" ? { hosts: s.hosts.slice(0, 2000) } : {}),
+  }),
+  component: SecretsPage,
+});
 
 const admin = createRoute({ getParentRoute: () => root, path: "/admin", component: AdminPage });
 
-export const routeTree = root.addChildren([home, projects, project.addChildren([projectIndex, board, manager, reviews, network, settings]), admin]);
+export const routeTree = root.addChildren([home, projects, project.addChildren([projectIndex, board, manager, reviews, secrets, network, settings]), admin]);
 
 export function createAppRouter(o: { history?: RouterHistory } = {}) {
   return createRouter({ routeTree, ...(o.history ? { history: o.history } : {}), defaultPreload: "intent", scrollRestoration: true });

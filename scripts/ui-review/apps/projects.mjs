@@ -718,6 +718,13 @@ const app = {
       await role.getByRole("alert").waitFor();
       await role.evaluate((el) => el.scrollIntoView({ block: "center" }));
     } },
+    // The Secrets page (README.md#secrets): the table and the live agents' layers; empty; the form; deleting.
+    { name: "secrets", section: "project", path: "/projects/prj_demo/secrets" },
+    { name: "secrets-empty", section: "project", path: "/projects/prj_demo/secrets", fixture: "secrets-empty" },
+    { name: "secret-form", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Add a secret" }).click() },
+    { name: "secret-edit", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Edit uploads_key" }).click() },
+    { name: "board-secret-requests", section: "project", path: "/projects/prj_demo/board", fixture: "secret-requests" },
+    { name: "secret-delete", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Delete cloudflare_token" }).click() },
     // Removing a host by keyboard leaves focus on a Remove button (the next row's), never <body>.
     { name: "network-remove-keyboard", section: "project", path: "/projects/prj_demo/network", full: false, checkName: "network", after: async (p) => {
       const removes = p.locator("[data-role=worker]").getByRole("button", { name: /^Remove / });

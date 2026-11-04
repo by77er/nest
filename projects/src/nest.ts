@@ -60,10 +60,14 @@ export interface Ask {
 
 /**
  * What a client may add to its own sandbox's spec: its egress rules (docs/control-plane/api/clients/#egress),
- * within its grant's `egress_hosts`.
+ * its secrets' bindings and the environment that names their placeholders (#injection, #environment),
+ * and `workflows: write` on the push token (#workflow-files), each within its grant.
  */
 export interface SandboxExtras {
   egress?: { allow: { host: string; ports?: number[] }[] };
+  inject?: { name: string; secret: string; hosts: string[]; locations: ({ type: "authorization_bearer" } | { type: "authorization_basic_password" } | { type: "header"; name: string })[]; wildcard?: boolean }[];
+  env?: Record<string, string>;
+  github_push?: { workflows: boolean };
 }
 
 /** A sandbox's client layer (docs/control-plane/api/clients/#the-client-layer), as `GET …/client-policy` answers it. */
@@ -202,11 +206,6 @@ export class Nest {
     return this.call("GET", `/v1/sandboxes/${encodeURIComponent(sandbox)}/policy`);
   }
 
-  /** The client's own record (`GET /v1/clients/self`): its grant, among the rest. */
-  self(): Promise<{ client?: string; grant?: { egress_hosts?: string[]; [k: string]: unknown } }> {
-    return this.call("GET", "/v1/clients/self");
-  }
-
   listAsks(agent: string): Promise<unknown> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}/asks`);
   }
@@ -219,6 +218,27 @@ export class Nest {
   putCatalog(kind: "templates" | "capabilities", name: string, body: unknown): Promise<unknown> {
     const [ns, entry] = name.split("/");
     return this.call("PUT", `/v1/catalog/${kind}/${encodeURIComponent(ns!)}/${encodeURIComponent(entry!)}`, body);
+  }
+
+  /** The client's own record (`GET /v1/clients/self`): its grant, among the rest. */
+  self(): Promise<{
+    client?: string;
+    grant?: { egress_hosts?: string[]; inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean } };
+  }> {
+    return this.call("GET", "/v1/clients/self");
+  }
+
+  /** Store or replace a write-only secret (docs/control-plane/api/clients/#secrets); answers its metadata, never the value. */
+  putSecret(name: string, value: string, description: string): Promise<{ name: string; size: number; created_ms: number; updated_ms: number; last_injected_ms: number | null }> {
+    return this.call("PUT", `/v1/clients/self/secrets/${encodeURIComponent(name)}`, { value, ...(description ? { description } : {}) });
+  }
+
+  async deleteSecret(name: string): Promise<void> {
+    await this.call("DELETE", `/v1/clients/self/secrets/${encodeURIComponent(name)}`);
+  }
+
+  async listSecrets(): Promise<{ name: string; size: number; created_ms?: number; updated_ms?: number; last_injected_ms: number | null }[]> {
+    return (await this.call<{ secrets?: { name: string; size: number; created_ms?: number; updated_ms?: number; last_injected_ms: number | null }[] }>("GET", "/v1/clients/self/secrets")).secrets ?? [];
   }
 
   /**

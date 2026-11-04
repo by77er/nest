@@ -5,10 +5,11 @@ import type { z } from "zod";
 import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
-import { NestError, nestFrom } from "./nest";
+import { clientIdOf, NestError, nestFrom } from "./nest";
 import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSIDE, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
-import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Network, Settings, Spec, UpdateTask } from "./requests";
+import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
+import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Network, PutSecret, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
 import { proxyTrace, proxyTraceHistory } from "./trace";
 
@@ -94,7 +95,9 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   if (!row) return err(404, "unknown project");
   const p = project(env, pid);
   const rest = parts.slice(2);
-  const route = `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
+  const route = rest[0] === "secrets" && rest.length === 2 ? `${m} secrets/:name`
+    : rest[0] === "secret-requests" && rest.length === 3 ? `${m} secret-requests/:id/${rest[2]}`
+    : `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
   const task = rest[1] ?? "";
   const ask = rest[1] ?? "";
 
@@ -112,9 +115,95 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const b = await body(req, Settings);
       if (!b.ok) return b.res;
       const { max_concurrent_reviews, ...rest } = b.value;
+      // Workers editing CI workflows needs the grant to allow it: refused here rather than at every spawn.
+      if (rest.workers_edit_workflows === true) {
+        const g = await grantOf(env);
+        if (!g.ok) return err(g.status, g.error);
+        if (!g.value.workflows) return err(409, "the app's grant doesn't allow workflows on push tokens: the operator must set github_push.workflows in its grant");
+      }
       if (max_concurrent_reviews !== undefined) await review(env, pid).setMaxConcurrent(max_concurrent_reviews);
       return done(await withReviews(env, pid, await p.updateSettings(rest)));
     }
+    case "GET secrets": {
+      // Metadata only: the app's, with nest's last injection and size; never a value.
+      const [mine, g, layers] = await Promise.all([p.secrets(), grantOf(env), p.network()]);
+      if (!mine.ok) return done(mine);
+      const nest = nestFrom(env);
+      let theirs: Map<string, { size: number; last_injected_ms: number | null }> = new Map();
+      if (nest) {
+        try {
+          theirs = new Map((await nest.listSecrets()).map((x) => [x.name, x]));
+        } catch {
+          // shown without nest's facts
+        }
+      }
+      return json({
+        secrets: mine.value.map((x) => {
+          const n = theirs.get(x.nest_name);
+          // Hosts the grant no longer covers: left out of every layer until the operator widens it.
+          const outside = g.ok ? outsideGrant(x, g.value.inject_hosts) : [];
+          return { ...x, size: n?.size ?? x.size, last_injected_ms: n?.last_injected_ms ?? null, in_nest: theirs.size ? n !== undefined : null, outside_hosts: outside };
+        }),
+        grant: g.ok ? { ...g.value, used: theirs.size } : null,
+        client: clientIdOf(env.NEST_CLIENT_TOKEN),
+        // Each live agent's client layer, which carries its bindings and variables (shared with the Network page).
+        agents: layers.ok ? layers.value.agents : [],
+        // Live workers whose push token may change workflows (README.md#secrets): theirs until they end.
+        workflow_workers: await p.workflowWorkers(),
+      });
+    }
+    case "PUT secrets/:name": {
+      const name = rest[1]!;
+      const b = await body(req, PutSecret);
+      if (!b.ok) return b.res;
+      const { value, ...meta } = b.value;
+      const g = await grantOf(env);
+      // Fail closed: without the grant, nothing here can tell a host nest will refuse.
+      if (!g.ok) return err(503, `the grant couldn't be read, so the secret can't be checked: ${g.error}`);
+      const others = await p.secrets();
+      const taken = others.ok ? others.value.filter((x) => x.name !== name).map((x) => x.env) : [];
+      const problems = secretProblems({ name, ...meta }, g.value, taken);
+      if (value !== undefined) {
+        const v = valueProblem(value, g.value);
+        if (v) problems.value = v;
+      }
+      if (Object.keys(problems).length) return json({ error: Object.values(problems).join("; "), problems }, 400);
+      const nest = nestFrom(env);
+      if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
+      let size: number | null = null;
+      const nestName = await p.nestNameFor(name, value !== undefined);
+      if (nestName === null) return err(400, "a new secret needs a value");
+      if (value !== undefined) {
+        // Straight to nest, write-only: the value never reaches the app's objects, logs or answers.
+        try {
+          size = (await nest.putSecret(nestName, value, meta.description)).size;
+        } catch (e) {
+          return err(e instanceof NestError ? e.status : 502, e instanceof NestError && e.status === 403 ? `nest refused it: ${e.message} (the grant's secrets.max_count or max_bytes)` : String(e));
+        }
+      }
+      const saved = await p.saveSecretMeta({ name, ...meta, nest_name: nestName }, size);
+      // Not recorded (a new one refused, or the name made again meanwhile): its value mustn't stay in nest unnamed.
+      if (!saved.ok && value !== undefined && !(await secretRows(p)).some((x) => x.nest_name === nestName)) {
+        // Failing that, ProjectDO's sweep deletes it once the grace has passed (it counts against max_count).
+        await nest.deleteSecret(nestName).catch((e) => console.error(`secret ${nestName} not recorded and not deleted (the sweep retries): ${String(e).slice(0, 200)}`));
+      }
+      return done(saved);
+    }
+    case "DELETE secrets/:name": {
+      const name = rest[1]!;
+      const nest = nestFrom(env);
+      if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
+      const row = (await secretRows(p)).find((x) => x.name === name);
+      if (!row) return err(404, `no secret ${name}`);
+      try {
+        await nest.deleteSecret(row.nest_name);
+      } catch (e) {
+        if (!(e instanceof NestError && e.status === 404)) return err(502, String(e));
+      }
+      return done(await p.deleteSecretMeta(name));
+    }
+    case "POST secret-requests/:id/done":
+      return done(await p.secretRequestDone(rest[1]!));
     case "POST auto-merge/retry":
       return done(await withReviews(env, pid, await p.retryRepoAutoMerge()));
     case "POST attach":
@@ -286,4 +375,25 @@ async function networkView(env: Env, p: ReturnType<typeof project>, have?: Await
     }
   }
   return json({ ...mine.value, egress_hosts: grant.ok ? grant.value : null, base });
+}
+
+/** The parts of the app's grant secrets need, from `GET /v1/clients/self` (docs/control-plane/api/clients/#clients-and-grants). */
+async function grantOf(env: Env): Promise<Result<SecretGrant>> {
+  const nest = nestFrom(env);
+  if (!nest) return { ok: false, status: 503, error: "NEST_CLIENT_TOKEN is not set" };
+  try {
+    const g = (await nest.self()).grant ?? {};
+    return { ok: true, value: {
+      inject_hosts: Array.isArray(g.inject_hosts) ? g.inject_hosts : [],
+      max_count: g.secrets?.max_count ?? 0, max_bytes: g.secrets?.max_bytes ?? 4096, workflows: g.github_push?.workflows === true,
+    } };
+  } catch (e) {
+    return { ok: false, status: 502, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** A project's secrets' metadata, or none when it can't be read. */
+async function secretRows(p: { secrets(): Promise<{ ok: true; value: { name: string; nest_name: string }[] } | { ok: false }> }) {
+  const r = await p.secrets();
+  return r.ok ? r.value : [];
 }

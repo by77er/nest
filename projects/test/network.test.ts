@@ -61,6 +61,8 @@ async function setup() {
   const p = (await api(token, "POST", "/api/projects", { name: repo, repo })).body;
   return { id: p.id as string, manager: p.settings.manager as string };
 }
+/** nest's name for a project's secret: `<project>-<name>-<generation>`, the generation new at each creation. */
+const nestKey = (p: { id: string }, name: string) => [...fake.secrets.keys()].find((k) => new RegExp(`^${p.id}-${name}-[a-z0-9]{6}$`).test(k));
 const sandboxOf = (agent: string) => fake.sandboxes.get(fake.agents.get(agent)!.sandbox!)!;
 const drain = (id: string) => env.PROJECT.get(env.PROJECT.idFromName(id)).drain();
 
@@ -158,13 +160,19 @@ describe("applying the rules", () => {
   it("live agents get them through their sandbox's client layer, which keeps its bindings and env", async () => {
     const s = await setup();
     const sb = sandboxOf(s.manager);
-    sb.layer = { egress: { allow: [] }, inject: [{ name: "npm_token", secret: "x", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] }], env: { NPM_TOKEN: "nest-ph.cli_app.npm_token." } };
+    // A secret of the manager's on the Secrets page: its binding and variable are in the layer.
+    const secret = { value: "v-0123456789abcdef", description: "", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }], roles: ["manager"], env: "NPM_TOKEN" };
+    expect((await api(token, "PUT", `/api/projects/${s.id}/secrets/npm_token`, secret)).status).toBe(200);
+    await drain(s.id);
+    const binding = { name: "npm_token", secret: nestKey(s, "npm_token")!, hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] };
+    const vars = { NPM_TOKEN: `nest-ph.${CLIENT}.npm_token.` };
     const r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }] });
     expect(r.status).toBe(200);
     const put = fake.callsTo("PUT", /\/client-policy$/).at(-1)!;
     expect(put.path).toBe(`/v1/sandboxes/${sb.sandbox}/client-policy`);
-    expect(put.body).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: sb.layer.inject, env: { NPM_TOKEN: "nest-ph.cli_app.npm_token." } });
-    expect(sb.layer.egress.allow).toEqual([{ host: "nodejs.org" }]);
+    // Sent in the PUT's strict shape (nest refuses a held binding's `client` and `placeholder`), so it applied.
+    expect(put.body).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [binding], env: vars });
+    expect(sb.layer).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [binding], env: vars });
     expect(r.body.agents).toEqual([expect.objectContaining({ agent: s.manager, role: "manager", state: "applied", sandbox: sb.sandbox })]);
     // A change to the other role's rules writes nothing to this one's sandbox.
     const before = fake.callsTo("PUT", /\/client-policy$/).length;
@@ -174,22 +182,23 @@ describe("applying the rules", () => {
 
   it("a network change on a live sandbox keeps the Secrets page's bindings and env, change after change", async () => {
     const s = await setup();
+    // Two of the workers' secrets: one a header, one on a `*.` host (so `wildcard`).
+    const put = (name: string, b: Record<string, unknown>) => api(token, "PUT", `/api/projects/${s.id}/secrets/${name}`, { value: `v-${name}-0123456789`, description: "", roles: ["worker"], ...b });
+    expect((await put("npm_token", { hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }], env: "NPM_TOKEN" })).status).toBe(200);
+    expect((await put("upload", { hosts: ["*.uploads.example.com"], locations: [{ type: "header", name: "X-Upload-Token" }, { type: "authorization_basic_password" }], env: "UPLOAD_TOKEN" })).status).toBe(200);
     const t = (await api(token, "POST", `/api/projects/${s.id}/tasks`, { title: "t" })).body.id;
     await api(token, "PUT", `/api/projects/${s.id}/tasks/${t}/spec`, spec);
     const worker = (await api(token, "POST", `/api/projects/${s.id}/tasks/${t}/assign`)).body.assignee as string;
     const sb = sandboxOf(worker);
-    // What the Secrets page (#133) puts in a worker's layer: bindings `{name, secret, hosts, locations}` (one
-    // a header, one `*.` with wildcard) and env carrying their placeholders, `nest-ph.<client>.<name>.`.
     const bindings = [
-      { name: "npm_token", secret: "npm", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] },
-      { name: "pypi", secret: "pypi_upload", hosts: ["*.pythonhosted.org"], locations: [{ type: "header", name: "X-Upload-Token" }, { type: "authorization_basic_password" }], wildcard: true },
+      { name: "npm_token", secret: nestKey(s, "npm_token")!, hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] },
+      { name: "upload", secret: nestKey(s, "upload")!, hosts: ["*.uploads.example.com"], locations: [{ type: "header", name: "X-Upload-Token" }, { type: "authorization_basic_password" }], wildcard: true },
     ];
-    const vars = { NPM_TOKEN: `nest-ph.${CLIENT}.npm_token.`, PYPI_TOKEN: `nest-ph.${CLIENT}.pypi.`, CI: "1" };
-    sb.layer = { egress: { allow: [{ host: "registry.npmjs.org" }] }, inject: structuredClone(bindings), env: { ...vars } };
+    const vars = { NPM_TOKEN: `nest-ph.${CLIENT}.npm_token.`, UPLOAD_TOKEN: `nest-ph.${CLIENT}.upload.` };
+    expect(sb.layer).toEqual({ egress: { allow: [] }, inject: bindings, env: vars });
     for (const worker_rules of [[{ host: "pypi.org" }], [{ host: "nodejs.org", ports: [443] }], []]) {
       const r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: worker_rules, manager: [] });
       expect(r.status).toBe(200);
-      // Sent in the PUT's strict shape (nest refuses a held binding's `client` and `placeholder`), so it applied.
       expect(fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${sb.sandbox}/client-policy$`)).at(-1)!.body).toEqual({ egress: { allow: worker_rules }, inject: bindings, env: vars });
       expect(sb.layer).toEqual({ egress: { allow: worker_rules }, inject: bindings, env: vars });
       expect(r.body.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: worker, state: "applied", error: null })]));
@@ -209,7 +218,7 @@ describe("applying the rules", () => {
       fake.egressHosts = grant;
     }
     // Accepted by the app, refused by nest (the fake's grant narrowed only for the write).
-    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403);
+    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403, { times: 2 });
     let r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }] });
     expect(r.body.agents).toEqual([expect.objectContaining({ agent: s.manager, state: "failed", error: expect.stringContaining("403") })]);
     // A transient failure: pending, then applied on the next try.

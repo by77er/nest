@@ -11,6 +11,7 @@
 
 import { Box, Drawer, ScrollArea, Tabs } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
+import { usePhone } from "./media";
 import { IconFileText, IconTimeline } from "@tabler/icons-react";
 import { createContext, type ReactNode, useContext } from "react";
 import { icon } from "../theme";
@@ -32,7 +33,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
   besideEmpty?: ReactNode;
   split?: boolean; labels?: [string, string];
 }) {
-  const phone = useMediaQuery("(max-width: 48em)");
+  const phone = usePhone();
   const wide = useMediaQuery("(min-width: 88em)");
   const size = phone ? "100%" : split && wide ? "var(--nest-sheet-wide)" : "xl";
   if ((beside || besideEmpty) && wide && split) {

@@ -3,7 +3,7 @@
 
 import type {
   NetworkBody, NetworkView, Waits,
-  AddDependencyBody, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
+  AddDependencyBody, PutSecretBody, SecretsAnswer, SecretView, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
   Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
 } from "./types";
 
@@ -73,6 +73,10 @@ export const api = {
   detachPr: (id: string, task: string, pr: number) => call<Task>("DELETE", `${tsk(id, task)}/prs/${pr}`),
   addDependency: (id: string, task: string, b: AddDependencyBody) => call<Task>("POST", `${tsk(id, task)}/dependencies`, b),
   removeDependency: (id: string, task: string, blocker: string) => call<Task>("DELETE", `${tsk(id, task)}/dependencies/${encodeURIComponent(blocker)}`),
+  secrets: (id: string) => call<SecretsAnswer>("GET", `${prj(id)}/secrets`),
+  putSecret: (id: string, name: string, b: PutSecretBody) => call<SecretView>("PUT", `${prj(id)}/secrets/${encodeURIComponent(name)}`, b),
+  deleteSecret: (id: string, name: string) => call<{ deleted: string; holders: { agent: string; role: string }[] }>("DELETE", `${prj(id)}/secrets/${encodeURIComponent(name)}`),
+  secretRequestDone: (id: string, req: string) => call<{ done: string }>("POST", `${prj(id)}/secret-requests/${encodeURIComponent(req)}/done`),
   answerBlocked: (id: string, task: string, b: AnswerBody) => call<Task>("POST", `${tsk(id, task)}/answer`, b),
   answerAsk: (id: string, ask: string, b: AnswerBody) => call<{ delivered: unknown }>("POST", `${prj(id)}/asks/${encodeURIComponent(ask)}/answer`, b),
 
