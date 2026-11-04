@@ -19,8 +19,10 @@ const KMS_KEY_ARN = /^arn:aws[a-z-]*:kms:([a-z0-9-]+):\d{12}:key\/(?:mrk-)?[0-9a
  */
 const BrainHosts = z.object({
   launch_template_id: z.string().regex(/^lt-[0-9a-f]+$/),
-  /** In preference order; the first is also the on-demand fallback. */
+  /** In preference order, on spot and then on demand (`scaleUpPlan`). */
   instance_types: z.array(z.string().min(1)).min(1),
+  /** The on-demand order, cheapest first (the cell stack sorts it by price); absent: `instance_types`. */
+  on_demand_types: z.array(z.string().min(1)).min(1).optional(),
   spot: z.boolean().default(true),
   /** 3 two-vCPU hosts hold about 12 brains at the default capacity (the cell stack writes its own value). */
   max_hosts: z.number().int().positive().default(3),
@@ -34,8 +36,10 @@ const AwsCell = z.object({
   region: z.string().min(1),
   launch_template_id: z.string().regex(/^lt-[0-9a-f]+$/),
   subnet_ids: z.array(z.string().regex(/^subnet-[0-9a-f]+$/)).min(1),
-  /** In preference order; the first is also the on-demand fallback. */
+  /** In preference order, on spot and then on demand (`scaleUpPlan`). */
   instance_types: z.array(z.string().min(1)).min(1),
+  /** The on-demand order, cheapest first (the cell stack sorts it by price); absent: `instance_types`. */
+  on_demand_types: z.array(z.string().min(1)).min(1).optional(),
   spot: z.boolean().default(true),
   max_hosts: z.number().int().positive().default(1),
   /** How long a sandbox host holding no running sandbox stays before it's terminated. */

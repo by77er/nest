@@ -7,7 +7,7 @@ import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken }
 import { type OAuthAudit, type OAuthStatus, OAuthStore, type StartAnswer, type StartInput } from "../lib/mcp-auth";
 import { b64url, bytesToB64, NestError, newId } from "../lib/util";
 import {
-  appJwt, type GitHubApi, githubApiOf, GithubRepoPermissions, importAppKey, parseAppSecret, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
+  appJwt, type GitHubApi, githubApiOf, GithubRepoPermissions, importAppKey, parseAppSecret, revokeInstallationToken, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
 } from "../lib/github";
 import { isClientId } from "../lib/clients";
 import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
@@ -275,21 +275,43 @@ export class BrokerDO extends DurableObject<Env> {
     const key = JSON.stringify(access === "read" ? { kind: source.kind, repos, access } : workflows ? { kind: source.kind, repos, workflows } : { kind: source.kind, repos });
     const now = Date.now();
     this.sql.exec("DELETE FROM secrets WHERE name LIKE 'inject:%:sbx\\_%' ESCAPE '\\' AND expires_ms IS NOT NULL AND expires_ms <= ?", now);
+    const audit = { event: "github_installation_token", permissions, target, binding: source.binding, caller };
     const held = this.sql.exec<{ source: string; covers: string; expires_ms: number }>(
       "SELECT source, covers, expires_ms FROM injections WHERE sandbox = ? AND binding = ?", target.sandbox, source.binding).toArray()[0];
     if (held?.source === key && held.expires_ms - now > SANDBOX_TOKEN_REUSE_MS && this.secret(name)) {
       return { binding: source.binding, value: secretRef(name), expires_ms: held.expires_ms, covers: JSON.parse(held.covers) as string[] };
     }
-    const forget = () => {
+    // A held token with `workflows: write` that this one doesn't replace in kind (the opt-in turned off,
+    // or nothing mintable now): it goes from the proxy at the next push, but stays valid at GitHub for
+    // its hour, so it's revoked there once it's no longer held (`retire`).
+    const wider = !workflows && held && (JSON.parse(held.source) as { workflows?: boolean }).workflows === true ? this.secret(name)?.value ?? null : null;
+    const retire = async () => {
+      if (!wider) return;
+      // Tried twice: a revoke that fails, with a host that also missed the push replacing it, would leave
+      // the token usable for the rest of its hour. Either way audited, never the token.
+      let last: unknown = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          await revokeInstallationToken(githubApiOf(this.env), wider);
+          await this.auditMint({ event: "github_installation_token_revoked", target, binding: source.binding, caller, why: "workflows: write no longer asked", attempt });
+          return;
+        } catch (e) {
+          last = e;
+        }
+      }
+      console.warn(`sandbox ${target.sandbox}: revoking its previous token (with workflows) failed twice; it expires within the hour`, last);
+      await this.auditMint({ event: "github_installation_token_revoke_failed", target, binding: source.binding, caller, why: last instanceof Error ? last.message.slice(0, 300) : String(last) });
+    };
+    const forget = async () => {
       if (overtaken()) return;
       this.sql.exec("DELETE FROM secrets WHERE name = ?", name);
       this.sql.exec("DELETE FROM injections WHERE sandbox = ? AND binding = ?", target.sandbox, source.binding);
+      await retire();
     };
-    const audit = { event: "github_installation_token", permissions, target, binding: source.binding, caller };
     const app = this.secret("github_app");
     const creds = app ? parseAppSecret(app.value) : null;
     if (!creds || !repos.length) {
-      forget();
+      await forget();
       if (repos.length) await this.auditMint({ ...audit, repos, refused: app ? "github_app isn't {\"app_id\", \"private_key\"} JSON" : "no GitHub App is configured (github_app)" });
       return null;
     }
@@ -298,7 +320,7 @@ export class BrokerDO extends DurableObject<Env> {
     try {
       jwt = await appJwt(creds.app_id, await importAppKey(creds.private_key));
     } catch {
-      forget();
+      await forget();
       await this.auditMint({ ...audit, repos, refused: "github_app's private_key isn't an RSA private key (PKCS#1 or PKCS#8 PEM)" });
       return null;
     }
@@ -319,7 +341,7 @@ export class BrokerDO extends DurableObject<Env> {
         : "these repos aren't in the one installation the token is minted for (or the App isn't installed on them)" });
     }
     if (installation === null) {
-      forget();
+      await forget();
       return null;
     }
     let t: { token: string; expires_ms: number };
@@ -327,7 +349,7 @@ export class BrokerDO extends DurableObject<Env> {
       t = await api.mint(jwt, installation, covers.map((r) => r.split("/")[1]!), permissions);
     } catch (e) {
       if (e instanceof NestError && !e.retryable) {
-        forget();
+        await forget();
         await this.auditMint({ ...audit, repos: covers, installation, refused: e.detail });
       }
       throw e;
@@ -339,6 +361,7 @@ export class BrokerDO extends DurableObject<Env> {
     this.sql.exec(`INSERT INTO injections (sandbox, binding, source, covers, expires_ms, minted_ms) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(sandbox, binding) DO UPDATE SET source = excluded.source, covers = excluded.covers, expires_ms = excluded.expires_ms, minted_ms = excluded.minted_ms`,
     target.sandbox, source.binding, key, JSON.stringify(covers), t.expires_ms, Date.now());
+    await retire();
     return { binding: source.binding, value: secretRef(name), expires_ms: t.expires_ms, covers };
   }
 

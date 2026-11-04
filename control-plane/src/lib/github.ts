@@ -225,6 +225,16 @@ export class GitHubApi {
   }
 }
 
+/**
+ * Revoke an installation token (`DELETE /installation/token`, authorized by the token itself). A token
+ * already expired or revoked answers 401: that's revoked too.
+ */
+export async function revokeInstallationToken(api: GitHubApi, token: string): Promise<void> {
+  const r = await api.request(token, "DELETE", "/installation/token");
+  if (r.kind === "ok" || (r.kind === "refused" && r.status === 401)) return;
+  throw ghError(r, "revoking an installation token");
+}
+
 /** The client for this Worker: `GITHUB_API_URL` (a loopback fake only with `ALLOW_LOOPBACK_BROKERED=1`), else GitHub's. */
 export function githubApiOf(env: { GITHUB_API_URL?: string; ALLOW_LOOPBACK_BROKERED?: string }, timeoutMs?: number): GitHubApi {
   const base = env.GITHUB_API_URL;

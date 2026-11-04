@@ -74,7 +74,7 @@ The checks:
 | `PUT` | `/v1/sandboxes/<sandbox>/lifetime` | Subtree. `idle_ttl_ms` is at least a minute, with no ceiling: `max_sandboxes` bounds what a client keeps. |
 | `GET` | `/v1/sandboxes/<sandbox>/policy` | Subtree. The effective policy, the operator's layer included: hosts, rules and bindings' placeholders, never a secret's value. |
 | `GET` | `/v1/sandboxes/<sandbox>/client-policy` | Subtree ([the client layer](#the-client-layer)). |
-| `PUT` | `/v1/sandboxes/<sandbox>/client-policy` | Subtree. Within its client's grant as it is now. |
+| `PUT` | `/v1/sandboxes/<sandbox>/client-policy` | Subtree. Within its client's grant as it is now (`github_push.workflows` too). |
 | `GET` | `/v1/catalog` | The operator's entries and its own namespace's. |
 | `GET` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. |
 | `PUT` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. Within the grant, when written and again at spawn. |
@@ -230,10 +230,12 @@ A client's bindings put its secrets into its own sandboxes' requests at nest-pro
   - The operator's spawn overrides (they replace the template's).
   - A spawner's or client's overrides, where `{"workflows": false}` only turns it off; asking for it is refused.
   - A sandbox spec (`POST /v1/sandboxes`).
+  - The live sandbox's [client layer](#the-client-layer) (`PUT /v1/sandboxes/<id>/client-policy {"github_push": {"workflows": true}}`), which replaces the create's: turned on or off while its agents run.
   - The operator's policy layer.
   The sandbox's push token carries `workflows: write` when any of these, or any attached agent's spec, asks.
-- **A client's grant** must have `github_push.workflows: true` (403 otherwise, at the template's write, the spawn and the sandbox's create). Revoking it applies to later writes, spawns and creates: a running sandbox that has it keeps minting with it until the agents that asked detach, or (its own create's) until it is destroyed.
+- **A client's grant** must have `github_push.workflows: true` (403 otherwise, at the template's write, the spawn, the sandbox's create and a client-layer write asking for it; turning it off always goes through). Revoking it applies to later writes, spawns and creates: a running sandbox that has it keeps minting with it until the agents that asked detach, or (its own create's) until it is destroyed.
 - **Minted exactly** `{contents: write, pull_requests: write, workflows: write}`, only then. Without it, the token is as before. The read-only token never has it, whatever is asked. A token minted with it is never reused for one without, nor the other way round.
+- **On and off live:** a change reaches the sandbox at once, through the usual secrets push: the next token is minted with or without it, and `secrets_update` replaces the proxy's. A token never enters the sandbox (the proxy holds it), so the old one is out of the sandbox's reach then. It would stay valid at GitHub for the rest of its hour, so BrokerDO revokes the one with `workflows: write` (`DELETE /installation/token`) once a token without it replaces it, or none does: tried twice, then logged and audited `github_installation_token_revoke_failed` (the token expires within the hour). A revoke is audited `github_installation_token_revoked`.
 - **Security note:** a pushed workflow runs on GitHub with the repo's own Actions secrets as soon as it's pushed, before anyone reviews it (`push` and `pull_request` triggers from the same repo). Keep CI secrets in an [environment](https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment) with required reviewers, so a job that reads them waits for a person, and grant `workflows` only where agents should edit CI.
 
 ## Timers
@@ -292,9 +294,10 @@ An agent with the [`timers`](../../../agents/capabilities/timers/) capability se
 
 ## The client layer
 
-A live sandbox's own egress rules, injection bindings and environment, in one place:
-- **`PUT /v1/sandboxes/<id>/client-policy {"egress"?: {"allow": […]}, "inject"?: […], "env"?: {…}}`** (owner auth: the operator, or the API client of the sandbox's subtree) replaces the whole layer; a part left out is emptied. It is checked against the sandbox's client's grant as it is now (`egress_hosts`, `inject_hosts`, its own secrets only), whoever writes it.
+A live sandbox's own egress rules, injection bindings, environment and push opt-in, in one place:
+- **`PUT /v1/sandboxes/<id>/client-policy {"egress"?: {"allow": […]}, "inject"?: […], "env"?: {…}, "github_push"?: {"workflows": bool}}`** (owner auth: the operator, or the API client of the sandbox's subtree) replaces the whole layer; a part left out is emptied (`github_push` left out is `workflows: false`). It is checked against the sandbox's client's grant as it is now (`egress_hosts`, `inject_hosts`, `github_push.workflows`, its own secrets only), whoever writes it.
+- **Compatibility:** a client of the previous release, which sends no `github_push`, turns off a create's `workflows` at its next layer write (the safe direction). One that sends it to a control plane of the previous release gets a 400 (an unrecognized key): read the layer first, and send `github_push` only when `GET` answers it.
 - **The operator's sandboxes** have no client: their layer takes egress and env, never bindings (400; the operator's go in `policy.inject`).
 - **It goes out through the usual path:** a new policy version, its secrets pushed first, and (for an env change) every attached agent's slot configured again. So a binding added live reaches the proxy, and one removed live goes.
-- **`GET /v1/sandboxes/<id>/client-policy`** answers the layer as set: rules, bindings (with their placeholders, never a secret) and env.
+- **`GET /v1/sandboxes/<id>/client-policy`** answers the layer as set: rules, bindings (with their placeholders, never a secret), env and `github_push` (`{"workflows": bool}`: its create's or the last write's).
 - **It doesn't include** what the sandbox's attached agents' specs add, which comes and goes with them, nor the operator's layer (`/policy`, `GET` shows the effective result).

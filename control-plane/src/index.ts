@@ -316,8 +316,11 @@ async function oauthCapability(env: Env, raw: string) {
 
 const escapeHtml = (t: string) => t.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
 
-/** `PUT /v1/sandboxes/<id>/client-policy`'s body: the whole client layer (an absent part is emptied). */
-const ClientLayer = z.strictObject({ egress: ClientEgress.optional(), inject: ClientInjections.optional(), env: SandboxEnv.optional() });
+/**
+ * `PUT /v1/sandboxes/<id>/client-policy`'s body: the whole client layer (an absent part is emptied):
+ * egress rules, injection bindings, environment, and the push token's opt-ins (`github_push`).
+ */
+const ClientLayer = z.strictObject({ egress: ClientEgress.optional(), inject: ClientInjections.optional(), env: SandboxEnv.optional(), github_push: GithubPush.optional() });
 
 /**
  * An environment's values: no placeholder that none of `bound` is, and no value of a secret the caller
@@ -656,8 +659,9 @@ export const ROUTES: Route[] = [
     }, async (id, status) => json(await sandbox(c.env, id).info(), status, REPLAYED)),
   }),
   route({ method: "GET", path: "/v1/sandboxes", auth: "owner", run: (c) => listing(c, "sandbox") }),
-  // Its client layer (docs/control-plane/api/clients/#the-client-layer): egress rules, injection bindings and
-  // environment, replaced whole on a live sandbox within its client's grant, through the usual policy push.
+  // Its client layer (docs/control-plane/api/clients/#the-client-layer): egress rules, injection bindings,
+  // environment and the push token's opt-ins, replaced whole on a live sandbox within its client's grant,
+  // through the usual policy and secrets push.
   route({ method: "GET", path: "/v1/sandboxes/:sandbox/client-policy", auth: "owner", run: async (c) =>
     newMethod("SandboxDO.clientLayer", async () => (await ownSandbox(c, c.p.sandbox)).clientLayer()) }),
   route({
@@ -672,6 +676,7 @@ export const ROUTES: Route[] = [
         // Its client's grant as it is now, whoever writes the layer (the operator too).
         const scope = await clientDO(c.env, client).scope();
         const refusal = grantRefusal(client, [...injectionsOutsideGrant(inject, scope.grant.inject_hosts ?? []),
+          ...(r.github_push?.workflows && !scope.grant.github_push?.workflows ? ["github_push.workflows"] : []),
           ...egressOutsideGrant(r.egress?.allow ?? [], scope.grant.egress_hosts ?? [])]);
         if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, refusal, 403);
       }
@@ -680,7 +685,7 @@ export const ROUTES: Route[] = [
       const bound = [...inject.map((b) => b.placeholder),
         ...(await stub.policy()).inject.filter((b) => !b.name.startsWith(CLIENT_BINDING_PREFIX)).map((b) => b.placeholder)];
       await checkEnv(c.env, c.caller, r.env ?? {}, bound);
-      return newMethod("SandboxDO.setClientLayer", () => stub.setClientLayer({ egress: r.egress?.allow ?? [], inject, env: r.env ?? {} }));
+      return newMethod("SandboxDO.setClientLayer", () => stub.setClientLayer({ egress: r.egress?.allow ?? [], inject, env: r.env ?? {}, workflows: r.github_push?.workflows === true }));
     },
   }),
   route({

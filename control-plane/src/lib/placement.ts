@@ -113,6 +113,8 @@ export function maxBrains(configured: number | undefined, vcpus: number | null |
 /** One host kind's autoscaler settings (a cell's `AWS_CELLS` entry, or its `brain` section). */
 export interface ScaleSettings {
   instance_types: readonly string[];
+  /** The on-demand order (cheapest first); absent: `instance_types`. */
+  on_demand_types?: readonly string[];
   subnet_ids: readonly string[];
   spot: boolean;
   max_hosts: number;
@@ -132,8 +134,10 @@ export type ScaleUp =
  * A host of one kind is needed and none can take the work: launch one, unless one of that kind was
  * launched and hasn't enrolled (`pending`; one still in flight is the caller's to skip), or the kind
  * is at `max_hosts` (`live`: its active and STONITH-pending hosts; a draining one doesn't count). The
- * attempts: each instance type on spot (zones rotating with the second), then the first type on
- * demand.
+ * attempts, one pass: each instance type on spot in `instance_types` order, then each on demand in
+ * `on_demand_types` order, cheapest first (zones rotating with the second). The caller stops at the
+ * first launch, at a spent quota, or at an error that isn't EC2 having no room; a pass where nothing
+ * had room starts FleetDO's backoff for the kind (`noRoomBackoffMs`).
  */
 export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, nowMs: number): ScaleUp {
   if (pending > 0) return { launch: null, why: "pending" };
@@ -142,9 +146,26 @@ export function scaleUpPlan(s: ScaleSettings, live: number, pending: number, now
   return {
     launch: [
       ...(s.spot ? s.instance_types.map((type, i) => ({ type, subnet: zone(i), spot: true })) : []),
-      { type: s.instance_types[0]!, subnet: zone(0), spot: false },
+      ...(s.on_demand_types ?? s.instance_types).map((type, i) => ({ type, subnet: zone(i), spot: false })),
     ],
   };
+}
+
+/** The first wait after a pass where nothing had room; the cap for sandbox hosts and for brain hosts. */
+export const NO_ROOM_BACKOFF_FIRST_MS = 60_000;
+export const NO_ROOM_BACKOFF_MAX_MS = 15 * 60_000;
+/** Brain hosts: under FleetDO's brain-waiter TTL (12 min), so a waiting brain sees a pass before it lapses. */
+export const NO_ROOM_BACKOFF_BRAIN_MAX_MS = 5 * 60_000;
+/** A backoff that lapsed this long ago is forgotten: the next pass with no room waits the first again. */
+export const NO_ROOM_RESET_MS = 30 * 60_000;
+
+/**
+ * The wait after a pass with no room: the first, then doubling to `maxMs`, from the previous backoff
+ * (`{until_ms, wait_ms}`), which counts only if it lapsed within `NO_ROOM_RESET_MS` of `nowMs`.
+ */
+export function noRoomBackoffMs(previous: { until_ms: number; wait_ms: number } | null, nowMs: number, maxMs = NO_ROOM_BACKOFF_MAX_MS): number {
+  if (!previous || nowMs - previous.until_ms > NO_ROOM_RESET_MS) return Math.min(NO_ROOM_BACKOFF_FIRST_MS, maxMs);
+  return Math.min(maxMs, previous.wait_ms * 2);
 }
 
 /** `busy` clears the clock, `start` starts it, `retire`: idle for the whole grace. */

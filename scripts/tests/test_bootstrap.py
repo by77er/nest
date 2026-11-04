@@ -188,7 +188,7 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         sandbox state (M2's reflink cuts)."""
         cfg, fake = self.check("burst", nvme=True)
         log = (fake / "disk.log").read_text()
-        self.assertIn("mkfs.xfs -q -f -m reflink=1 -L nest-data /dev/nvme1n1", log)
+        self.assertIn("mkfs.xfs -q -f -K -m reflink=1 -L nest-data /dev/nvme1n1", log)
         self.assertIn("mount", log)
         fstab = (fake / "etc/fstab").read_text()
         self.assertIn("LABEL=nest-data", fstab)
