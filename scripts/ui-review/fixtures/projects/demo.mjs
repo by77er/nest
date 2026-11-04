@@ -5,7 +5,8 @@
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-long" (thirty messages), "chat-paged"
-// (120, paged by `before`) or "chat-arriving" (a reply lands a few seconds in). Traces come from
+// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents) or
+// "secret-requests" (agents asking for credentials, one tainted). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
 import { trace } from "./trace.mjs";
@@ -23,6 +24,16 @@ export function data(variant = "demo", now = Date.now()) {
     files: ["src/thumbs/cache.ts", "src/routes/gadgets.ts"],
     test_plan: "Unit tests for the purge; a load test against staging.",
   };
+  // A description as the manager writes one (Markdown): a heading, nested and task lists, code, a link,
+  // and a table, which the editor keeps as written.
+  const SEARCH_BODY = [
+    "Owners filter the gadget list by tag today by scrolling. Add a tag search to the list's filter bar, backed by an index, so a search answers in under 100 ms on the staging data.",
+    "## Scope",
+    "1. An index of tags per gadget\n   - rebuilt on each gadget write\n   - backfilled once for existing gadgets\n2. The query parser: `tag:outdoor tag:waterproof`, with `-tag:` to exclude\n3. Suggestions in the filter bar as you type",
+    "- [x] Agree the query syntax with design\n- [ ] Load test against staging\n- [ ] Note the new endpoint in the [API docs](https://docs.example.com/api)",
+    "```ts\nGET /api/gadgets?tag=outdoor&tag=waterproof&limit=200\n```",
+    "| Endpoint | p95 now | Target |\n|---|---|---|\n| `/api/gadgets?tag=` | 840 ms | 100 ms |",
+  ].join("\n\n");
   let i = 0;
   const t = (title, state, o = {}) => ({ id: `tsk_demo${++i}`, title, body: "", spec: state === "draft" ? null : spec, state, ord: i, assignee: null, pr: null, start_error: null, tainted: false, blocked: null, prs: [], blocked_by: [], blocks: [], waiting_on: [], created_ms: now - 7_200_000, updated_ms: now - 600_000, ...o });
   const tasks = [
@@ -32,7 +43,7 @@ export function data(variant = "demo", now = Date.now()) {
     t("Export gadgets as CSV", "ready"),
     t(long ? "Fix the flaky upload test that fails only when the fixture bucket is in another region_and_named_without_any_spaces_at_all" : "Fix the flaky upload test", "in_progress", { assignee: "agt_w3f9q1" }),
     t("Paginate the gadget list", "assigned"),
-    t("Add search by tag", "in_review", { assignee: "agt_w8x2m4", pr: 118, tainted: true }),
+    t("Add search by tag", "in_review", { assignee: "agt_w8x2m4", pr: 118, tainted: true, body: SEARCH_BODY }),
     t("Migrate to the new auth library", "stalled", { assignee: "agt_w1k7c2", start_error: "nest refused the worker: max_agents reached (403)" }),
     t("Write the 0.5 changelog", "done", { pr: 112 }),
     t("Drop the legacy XML export", "cancelled"),
@@ -84,6 +95,11 @@ export function data(variant = "demo", now = Date.now()) {
     { kind: "ask", ...asks[0] },
     { kind: "ask", ...asks[1] },
     blocked("tsk_demo4", "Export gadgets as CSV", "agt_mgr7k2", "manager", 0.5, "Needs a product decision: which columns?", "Include prices?"),
+    // Agents asking for credentials (README.md#secrets): one for CI, one to inject from a tainted session.
+    ...(variant === "secret-requests" ? [
+      { kind: "secret", id: "srq_c1", type: "ci", name: "NPM_TOKEN", purpose: "The release workflow publishes @gadgets/core on a tag.", hosts: null, agent: "agt_w8x2m4", role: "worker", task: "tsk_demo2", tainted: false, at_ms: now - 1_800_000 },
+      { kind: "secret", id: "srq_i1", type: "injected", name: "sentry_token", purpose: "The issue says to upload source maps to Sentry from the sandbox.", hosts: ["sentry.io"], agent: "agt_w3f9q1", role: "worker", task: "tsk_demo5", tainted: true, at_ms: now - 600_000 },
+    ] : []),
   ].sort((a, b) => a.at_ms - b.at_ms);
   const chat = [
     { seq: 1, at_ms: now - 3_600_000, sender: "owner", text: "Plan the search work and split it into tasks.", delivered: true, error: null },
@@ -202,6 +218,57 @@ export function data(variant = "demo", now = Date.now()) {
   const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length }, { ...other, needs_you: 0 }];
   const sync = { written: ["capabilities/projects/board", "capabilities/projects/task", "templates/projects/manager", "templates/projects/worker"], repos: ["by77er/gadgets", "by77er/widgets"], at_ms: now - 3_600_000 };
 
+  // The manager's waits (README.md#waiting), and the Network page (README.md#network): rules per role,
+  // the grant's ceiling, the operator's base rules, and live agents in each state.
+  const waits = {
+    pending: variant === "no-waits" ? [] : [
+      { id: "aw_m2k8x1", kind: "pr", target: "118", want: "merged", created_ms: now - 600_000, deadline_ms: now + 2 * 3_600_000, resolved_ms: null, outcome: null, detail: null },
+      { id: "aw_q7d3n5", kind: "task", target: "tsk_demo4", want: ["in_review", "done"], created_ms: now - 300_000, deadline_ms: now + 45 * 60_000, resolved_ms: null, outcome: null, detail: null },
+      { id: "aw_r1c9v6", kind: "reply", target: null, want: null, created_ms: now - 120_000, deadline_ms: now + 26 * 3_600_000, resolved_ms: null, outcome: null, detail: null },
+    ],
+    // Lately resolved: a PR met, the owner's reply timed out (the warning tone).
+    recent: variant === "no-waits" ? [] : [
+      { id: "aw_p4h2z8", kind: "pr", target: "119", want: "merged", created_ms: now - 3_600_000, deadline_ms: now + 3_600_000, resolved_ms: now - 3 * 60_000, outcome: "met", detail: "merged" },
+      { id: "aw_t6w1b3", kind: "reply", target: null, want: null, created_ms: now - 7_200_000, deadline_ms: now - 10 * 60_000, resolved_ms: now - 10 * 60_000, outcome: "timed_out", detail: "timed out" },
+    ],
+  };
+  const network = {
+    rules: variant === "network-empty" ? { worker: [], manager: [] } : {
+      worker: [{ host: "registry.npmjs.org" }, { host: "nodejs.org" }, { host: "pypi.org" }, { host: "files.pythonhosted.org" }, { host: "downloads.gadgets.example.com", ports: [443, 8443] }],
+      manager: [{ host: "registry.npmjs.org" }],
+    },
+    rev: 3,
+    agents: variant === "network-empty" ? [] : [
+      { agent: "agt_mgr7k2", role: "manager", sandbox: "sbx_m1", state: "applied", error: null, rev: 3, at_ms: now - 120_000 },
+      { agent: "agt_w8x2m4", role: "worker", sandbox: "sbx_w1", state: "applied", error: null, rev: 3, at_ms: now - 110_000 },
+      { agent: "agt_w3f9q1", role: "worker", sandbox: "sbx_w2", state: "pending", error: "nest answered 503: internal (retrying)", rev: 2, at_ms: now - 900_000 },
+      { agent: "agt_w1k7c2", role: "worker", sandbox: "sbx_w3", state: "failed", error: "nest 403 forbidden: egress host downloads.gadgets.example.com is outside the grant", rev: 2, at_ms: now - 900_000 },
+      { agent: "agt_rv5n2p", role: "reviewer", sandbox: "sbx_r1", state: "applied", error: null, rev: 3, at_ms: now - 100_000 },
+    ],
+    // Narrowed (network-narrowed): the operator took *.gadgets.example.com out of the grant after a worker rule was saved for it.
+    egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org", ...(variant === "network-narrowed" ? [] : ["*.gadgets.example.com"]), "crates.io", "static.crates.io", "index.crates.io"],
+    base: variant === "network-empty" ? null : [
+      ...["registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "crates.io", "static.crates.io", "index.crates.io", "github.com", "*.githubusercontent.com", "deb.debian.org"].map((host) => ({ host, ports: [80, 443], source: "base" })),
+      { host: "mirror.internal.example", ports: [8443], source: "operator" },
+      ...["api.github.com", "codeload.github.com"].map((host) => ({ host, ports: [443], source: "repos" })),
+    ],
+  };
+
+  // The Secrets page (README.md#secrets): what the app keeps of each (never a value), the grant, and the
+  // same live layers as the Network page, with the variables each agent has.
+  const bearer = [{ type: "authorization_bearer" }];
+  const secrets = {
+    secrets: variant === "secrets-empty" ? [] : [
+      { name: "cloudflare_token", env: "CLOUDFLARE_API_TOKEN", description: "DNS for gadgets.example.com", hosts: ["api.cloudflare.com"], locations: bearer, roles: ["worker", "manager"], size: 40, created_ms: now - 5 * 86_400_000, updated_ms: now - 3_600_000, holders: [{ agent: "agt_mgr7k2", role: "manager" }, { agent: "agt_w8x2m4", role: "worker" }], last_injected_ms: now - 120_000, in_nest: true, outside_hosts: [] },
+      { name: "npm_token", env: "NPM_TOKEN", description: "Publishing @gadgets packages", hosts: ["registry.npmjs.org"], locations: bearer, roles: ["worker"], size: 36, created_ms: now - 4 * 86_400_000, updated_ms: now - 4 * 86_400_000, holders: [{ agent: "agt_w8x2m4", role: "worker" }], last_injected_ms: now - 600_000, in_nest: true, outside_hosts: [] },
+      { name: "uploads_key", env: "GADGETS_UPLOAD_KEY", description: "", hosts: ["uploads.gadgets.example.com", "*.cdn.gadgets.example.com", "uploads.legacy-gadgets.example.net"], locations: [{ type: "header", name: "X-Upload-Key" }], roles: ["reviewer"], size: 64, created_ms: now - 2 * 86_400_000, updated_ms: now - 2 * 86_400_000, holders: [{ agent: "agt_rv5n2p", role: "reviewer" }], last_injected_ms: now - 90_000, in_nest: true, outside_hosts: ["uploads.legacy-gadgets.example.net"] },
+    ],
+    grant: { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org", "upload.pypi.org", "*.gadgets.example.com"], max_count: 20, max_bytes: 4096, workflows: true, used: 3 },
+    client: "cli_demo",
+    agents: variant === "secrets-empty" ? [] : network.agents,
+    workflow_workers: ["agt_w8x2m4"],
+  };
+
   /** The answer to `GET|POST /api<path>?<search>`: [status, body]. */
   const answer = (method, path, search = new URLSearchParams()) => {
     if (variant === "error") return [500, { error: "internal error (fixture)" }];
@@ -210,7 +277,12 @@ export function data(variant = "demo", now = Date.now()) {
     if (path === "/admin/sync" && method === "POST") return [200, { written: sync.written.slice(0, 2), repos: ["by77er/gadgets"] }];
     if (!path.startsWith("/projects/prj_demo")) return [404, { error: "unknown project" }];
     const q = path.slice("/projects/prj_demo".length);
-    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
+    // A save the API refuses (README.md#network): a host newly added outside the grant, named.
+    if (variant === "network-save-refused" && method === "PUT" && q === "/network") {
+      const why = "downloads.gadgets.example.com isn't in this app's grant; the operator must add it";
+      return [403, { error: why, problems: { "worker.downloads.gadgets.example.com": why } }];
+    }
+    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
     if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
     if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];
     if (q in routes) return [200, routes[q]];

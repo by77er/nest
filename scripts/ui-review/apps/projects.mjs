@@ -2,6 +2,7 @@
 // layout primitives mark the frame, the measures, the panels and the nav (data-ds attributes).
 import { data } from "../fixtures/projects/demo.mjs";
 import { countTraffic, tabKeepCheck } from "../trace-tabs.mjs";
+import { proseProblems } from "../trace-prose.mjs";
 
 const menu = async (p) => p.getByRole("button", { name: "Open the menu" }).click();
 const DESKTOP = [1440, 1280];
@@ -73,6 +74,9 @@ async function traceCheck(page) {
       .filter((v) => v.clientWidth > 0 && v.scrollWidth > v.clientWidth + 1)
       .map((v) => `the trace's log scrolls sideways: ${v.scrollWidth} px of content in ${v.clientWidth} px`),
   );
+  // An assistant's Markdown (README.md#the-live-trace): mono at the terminal's one size, nothing but a
+  // fence or a table scrolling sideways, inside itself (trace-prose.mjs; selftest.mjs plants each failure).
+  problems.push(...(await page.evaluate(proseProblems)));
   const cdp = await page.context().newCDPSession(page);
   await cdp.send("DOM.enable");
   await cdp.send("CSS.enable");
@@ -84,6 +88,84 @@ async function traceCheck(page) {
   }
   await cdp.detach();
   return [...new Set(problems)];
+}
+
+/**
+ * The manager's waits (README.md#waiting) read as words: no raw task id, no snake_case state; where the
+ * context column shows (from `lg`; a closed disclosure below), the section is there when the fixture has
+ * waits, and each task's and PR's line links to it (only the owner's reply is plain text).
+ */
+export async function waitsCheck(page) {
+  return page.evaluate(() => {
+    const out = [];
+    const context = document.querySelector("[data-slot=manager-context]");
+    const shown = !!context && context.getBoundingClientRect().height > 0 && getComputedStyle(context).visibility !== "hidden";
+    const lists = [...document.querySelectorAll("[data-slot=waits], [data-slot=recent-waits]")];
+    if (shown && !lists.length) out.push("the manager's context column has no waits, though the fixture has some");
+    for (const list of lists) {
+      const t = list.textContent ?? "";
+      if (/tsk_[a-z0-9]|\b[a-z]+_[a-z]+\b/.test(t)) out.push(`the manager's waits show a raw id or state: ${t.slice(0, 120)}`);
+      for (const item of list.querySelectorAll("[role=listitem]")) {
+        if (!/^The owner's reply/.test((item.textContent ?? "").trim()) && !item.querySelector("a[href]")) out.push(`a wait's task or PR isn't a link: ${(item.textContent ?? "").slice(0, 80)}`);
+      }
+    }
+    return out;
+  });
+}
+
+/**
+ * After a host is removed by keyboard (`page.removedNext`: the host whose row followed it), focus is on
+ * that row's Remove, in the same role's panel: never <body>, nor another panel's.
+ */
+export async function removeFocusCheck(page) {
+  const want = page.removedNext;
+  const at = await page.evaluate(() => {
+    const el = document.activeElement;
+    return { label: el?.getAttribute("aria-label") ?? el?.tagName ?? null, role: el?.closest("[data-role]")?.getAttribute("data-role") ?? null };
+  });
+  return at.label === `Remove ${want.host}` && at.role === want.role ? [] : [`after removing a host by keyboard, focus is on ${at.label} (${at.role ?? "no panel"}), not ${want.role}'s Remove ${want.host}`];
+}
+
+/**
+ * The description editor (README.md#descriptions), entered from a fresh page, the editor's code not yet
+ * loaded: what's below the description (the Spec heading) is sampled every frame from the click until the
+ * editor shows, so `editorCheck` can tell a jump through a loading placeholder from the one move into the
+ * form.
+ */
+async function enterEdit(page) {
+  const edit = page.getByRole("button", { name: "Edit the title and description" });
+  await edit.waitFor();
+  await page.evaluate(() => {
+    window.__specTops = [];
+    const t0 = performance.now();
+    const tick = () => {
+      const spec = [...document.querySelectorAll("h3")].find((h) => h.textContent === "Spec");
+      if (spec) window.__specTops.push(Math.round(spec.getBoundingClientRect().top));
+      if (performance.now() - t0 < 2500) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+  await edit.click();
+  await page.locator("[data-ds=rich-editor] [contenteditable=true]").waitFor();
+  await page.waitForTimeout(2600);
+}
+
+/**
+ * The editor's layout: entering it moves what's below the description at most once (no loading
+ * placeholder in between); its toolbar is one row on a phone (scrolling sideways), never stacked.
+ */
+async function editorCheck(page, { width }) {
+  const problems = [];
+  const tops = await page.evaluate(() => window.__specTops ?? null);
+  if (tops) {
+    const moves = tops.filter((t, i) => i > 0 && Math.abs(t - tops[i - 1]) > 1).length;
+    if (moves > 1) problems.push(`entering Edit moves the page ${moves} times (the Spec heading at ${[...new Set(tops)].join(" → ")} px)`);
+  }
+  if (width < 768) {
+    const rows = await page.evaluate(() => new Set([...document.querySelectorAll("[data-ds=rich-editor] [role=group] button")].map((b) => Math.round(b.getBoundingClientRect().top))).size);
+    if (rows > 1) problems.push(`the editor's toolbar wraps into ${rows} rows on a phone`);
+  }
+  return problems;
 }
 
 /** At 1280 px and up, the board's six columns fit beside the sidebar without scrolling. */
@@ -548,8 +630,43 @@ const app = {
     { name: "detach-confirm", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: async (p) => { await drawerAt("Pull requests")(p); await p.getByRole("button", { name: "Detach PR #121" }).click(); } },
     { name: "remove-dependency-confirm", section: "project", path: "/projects/prj_demo/board?task=tsk_demo4", full: false, after: async (p) => { await drawerAt("Dependencies")(p); await p.getByRole("button", { name: "Stop waiting on Cache gadget thumbnails" }).click(); } },
     { name: "task-picker-empty", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false, after: picker("Dependencies", "Add dependency", "zzz") },
-    { name: "new-task", section: "project", path: "/projects/prj_demo/board", full: false, after: (p) => p.getByRole("button", { name: "New task" }).click() },
-    { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false },
+    { name: "new-task", section: "project", path: "/projects/prj_demo/board", full: false, check: editorCheck, checkName: "editor", after: async (p) => { await p.getByRole("button", { name: "New task" }).click(); await p.locator("[data-ds=rich-editor] [contenteditable=true]").waitFor(); } },
+    // A task's description (README.md#descriptions): edited in the rich editor, a table kept as written;
+    // typed into, with the toolbar showing what's on; the new task's editor focused.
+    { name: "drawer-edit", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: enterEdit, check: editorCheck, checkName: "editor" },
+    // Escape in the description's text, with a change: the form's own Escape, so it asks before
+    // discarding (the editor's keymap would take it; jsdom can't tell, a browser can).
+    { name: "drawer-edit-escape", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, checkName: "editor", after: async (p) => {
+      await p.getByRole("button", { name: "Edit the title and description" }).click();
+      await p.getByRole("textbox", { name: "Details" }).getByText(/^Owners filter/).click();
+      await p.keyboard.type("x");
+      await p.keyboard.press("Escape");
+      await p.getByRole("dialog", { name: "Discard changes?" }).waitFor({ timeout: 3000 }).catch(() => {});
+    }, check: async (p) => ((await p.getByRole("dialog", { name: "Discard changes?" }).count()) === 1 ? [] : ["Escape in the description's text with a change doesn't ask to discard it"]) },
+    { name: "drawer-edit-typing", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: editorCheck, checkName: "editor", after: async (p) => {
+      await p.getByRole("button", { name: "Edit the title and description" }).click();
+      // The caret at the end of the scope's last item, as a click past its text puts it.
+      const item = p.getByRole("textbox", { name: "Details" }).getByText("Suggestions in the filter bar as you type");
+      await item.click();
+      await item.evaluate((el) => {
+        const r = document.createRange();
+        r.selectNodeContents(el);
+        r.collapse(false);
+        getSelection().removeAllRanges();
+        getSelection().addRange(r);
+      });
+      await p.keyboard.press("Enter");
+      await p.getByRole("button", { name: "Bold" }).click();
+      await p.keyboard.type("Keyboard shortcuts");
+    } },
+    { name: "new-task-typing", section: "project", path: "/projects/prj_demo/board", full: false, check: editorCheck, checkName: "editor", after: async (p) => {
+      await p.getByRole("button", { name: "New task" }).click();
+      await p.getByLabel("Title").fill("Export gadgets as JSON");
+      await p.getByRole("textbox", { name: "Details" }).click();
+      await p.getByRole("button", { name: "Task list" }).click();
+      await p.keyboard.type("Same columns as the CSV");
+    } },
+    { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false, check: waitsCheck, checkName: "waits" },
     { name: "manager-rich", section: "project", path: "/projects/prj_demo/manager", fixture: "rich" },
     { name: "manager-rich-view", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false },
     { name: "manager-empty", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false },
@@ -589,6 +706,54 @@ const app = {
     { name: "manager-trace-beginning", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, check: traceCheck, checkName: "trace", after: toTop("the beginning of the trace") },
     { name: "reviews", section: "project", path: "/projects/prj_demo/reviews" },
     { name: "reviews-trace", section: "project", path: "/projects/prj_demo/reviews", after: (p) => p.getByRole("button", { name: "Show the trace of #118" }).click(), check: traceCheck, checkName: "trace" },
+    // The Network page (README.md#network): rules per role, live agents applied, pending and failed; empty; a host refused.
+    { name: "network", section: "project", path: "/projects/prj_demo/network" },
+    { name: "network-empty", section: "project", path: "/projects/prj_demo/network", fixture: "network-empty" },
+    { name: "network-refused", section: "project", path: "/projects/prj_demo/network", full: false, after: async (p) => {
+      const role = p.locator("[data-role=manager]");
+      await role.getByLabel("Add hosts").first().click();
+      await p.getByRole("option", { name: "Custom host" }).click();
+      await role.getByLabel("Host", { exact: true }).fill("evil.example.org");
+      await role.getByRole("button", { name: "Add" }).click();
+      await role.getByRole("alert").waitFor();
+      await role.evaluate((el) => el.scrollIntoView({ block: "center" }));
+    } },
+    // The Secrets page (README.md#secrets): the table and the live agents' layers; empty; the form; deleting.
+    { name: "secrets", section: "project", path: "/projects/prj_demo/secrets" },
+    { name: "secrets-empty", section: "project", path: "/projects/prj_demo/secrets", fixture: "secrets-empty" },
+    { name: "secret-form", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Add a secret" }).click() },
+    { name: "secret-edit", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Edit uploads_key" }).click() },
+    { name: "board-secret-requests", section: "project", path: "/projects/prj_demo/board", fixture: "secret-requests" },
+    { name: "secret-delete", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Delete cloudflare_token" }).click() },
+    // Removing a host by keyboard leaves focus on a Remove button (the next row's), never <body>.
+    { name: "network-remove-keyboard", section: "project", path: "/projects/prj_demo/network", full: false, checkName: "network", after: async (p) => {
+      const removes = p.locator("[data-role=worker]").getByRole("button", { name: /^Remove / });
+      p.removedNext = { role: "worker", host: (await removes.nth(1).getAttribute("aria-label")).replace(/^Remove /, "") };
+      await removes.first().focus();
+      await p.keyboard.press("Enter");
+      await p.waitForTimeout(200);
+    }, check: removeFocusCheck },
+    // A host saved before the operator narrowed the grant: kept, marked, not applied.
+    { name: "network-narrowed", section: "project", path: "/projects/prj_demo/network", fixture: "network-narrowed", full: false, checkName: "network", after: async (p) => {
+      await p.locator('[data-host="downloads.gadgets.example.com"]').evaluate((el) => el.scrollIntoView({ block: "center" }));
+    }, check: async (p) => {
+      const t = await p.locator('[data-role=worker] [data-host="downloads.gadgets.example.com"]').textContent();
+      return /Outside the grant now: kept, not applied/.test(t ?? "") ? [] : [`the narrowed grant's kept host isn't marked: ${t}`];
+    } },
+    // A refused save: the reason under Save and the named host's row in the danger shade, no toast.
+    { name: "network-save-refused", section: "project", path: "/projects/prj_demo/network", fixture: "network-save-refused", httpErrors: true, full: false, checkName: "network", after: async (p) => {
+      await p.locator("[data-role=worker]").getByRole("button", { name: "Remove nodejs.org" }).click();
+      await p.getByRole("button", { name: "Save" }).click();
+      await p.locator("[data-slot=save-error]").waitFor({ timeout: 3000 }).catch(() => {});
+      await p.locator("[data-slot=save-error]").evaluate((el) => el.scrollIntoView({ block: "center" })).catch(() => {});
+    }, check: async (p) => {
+      const r = await p.evaluate(() => ({
+        error: !!document.querySelector("[data-slot=save-error]")?.textContent?.includes("isn't in this app's grant"),
+        row: !!document.querySelector('[data-host="downloads.gadgets.example.com"][data-problem="true"]'),
+        toast: !!document.querySelector(".mantine-Notification-root"),
+      }));
+      return [...(r.error ? [] : ["a refused save shows no reason under Save"]), ...(r.row ? [] : ["a refused save doesn't mark the host it names"]), ...(r.toast ? ["a refused save shows a toast"] : [])];
+    } },
     { name: "settings", section: "project", path: "/projects/prj_demo/settings" },
     { name: "switcher-open", section: "project", path: "/projects/prj_demo/reviews", full: false, widths: DESKTOP, after: async (p) => { await p.getByRole("button", { name: /Switch project/ }).click(); await p.keyboard.type("gad"); } },
     { name: "sidebar-drawer", section: "project", path: "/projects/prj_demo/board", full: false, widths: PHONE, after: menu },

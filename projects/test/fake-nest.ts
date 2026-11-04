@@ -56,7 +56,25 @@ export class FakeNest {
   githubApp: { app_id: number; app_slug: string } | null = { app_id: GH_APP_ID, app_slug: "nest-test" };
   readonly calls: Call[] = [];
   readonly agents = new Map<string, FakeAgent>();
-  readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean }>();
+  readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean; github_push?: { workflows: boolean } | null; layer: { egress: { allow: unknown[] }; inject: unknown[]; env: Record<string, string> } }>();
+  /** The grant's `egress_hosts` (docs/control-plane/api/clients/#egress), as `GET /v1/clients/self` answers it. */
+  egressHosts: string[] = ["registry.npmjs.org", "nodejs.org", "*.pythonhosted.org", "pypi.org"];
+  /** nest's defaults, as each sandbox's effective policy shows them (layer `base`). */
+  baseRules: { host: string; ports: number[] }[] = [{ host: "github.com", ports: [443] }];
+  /** The operator's own layer, which the effective policy labels `workstream`, as it does the client's own rules. */
+  operatorRules: { host: string; ports?: number[] }[] = [{ host: "mirror.internal.example", ports: [8443] }];
+  /** The rules nest builds from the repo allowlists (source `repos`, layer `workstream`). */
+  reposRules: { host: string; ports?: number[] }[] = [{ host: "api.github.com", ports: [443] }];
+  /** Answer the policy as a control plane before nest's `source` did: `layer` only. */
+  legacyPolicy = false;
+  /** Temporary grants (layer `sandbox`), in every sandbox's effective policy. */
+  grantRules: { host: string; ports: number[]; expires_ms: number }[] = [{ host: "approved.example.com", ports: [443], expires_ms: Date.now() + 3_600_000 }];
+  /** The client's grant, in the parts the app reads (`GET /v1/clients/self`). */
+  grant: { inject_hosts: string[]; secrets: { max_count: number; max_bytes: number }; github_push?: { workflows: boolean } } = {
+    inject_hosts: ["api.cloudflare.com", "registry.npmjs.org", "*.example.com"], secrets: { max_count: 50, max_bytes: 4096 }, github_push: { workflows: true },
+  };
+  /** The client's secrets, values and all: nest's, the only place a value may be. */
+  readonly secrets = new Map<string, { value: string; description: string | null; created_ms: number; updated_ms: number; last_injected_ms: number | null }>();
   readonly inbox: { agent: string; text: string; from?: string; request_id?: string }[] = [];
   readonly catalog = new Map<string, unknown>();
   readonly answers: { agent: string; ask: string; answer: string }[] = [];
@@ -65,6 +83,8 @@ export class FakeNest {
   jwksFetches = 0;
   /** Failures to answer, in order, for calls whose `METHOD path` matches. */
   failures: { match: RegExp; status: number; retryable?: boolean; times: number }[] = [];
+  /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
+  holds: { match: RegExp; release: Promise<void>; reached: boolean }[] = [];
   /** Creates that are made but whose answer is lost (a 500 instead), as after a timeout. */
   lost: { match: RegExp; times: number }[] = [];
   /** Inbox posts that land but whose answer is lost (a 500), per agent. */
@@ -113,6 +133,11 @@ export class FakeNest {
     this.calls.push(call);
     if (call.auth !== `Bearer ${env.NEST_CLIENT_TOKEN}`) return nestErr(401, "unauthorized", "admin or client token required");
     const route = `${req.method} ${u.pathname}`;
+    const hold = this.holds.find((x) => !x.reached && x.match.test(route));
+    if (hold) {
+      hold.reached = true;
+      await hold.release;
+    }
     const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
     if (f) {
       f.times--;
@@ -153,10 +178,87 @@ export class FakeNest {
     });
     let m: RegExpMatchArray | null;
     const r = `${req.method} ${u.pathname}`;
+    // nest's env rules (docs/control-plane/api/clients/#environment): names, and a placeholder value only
+    // as exactly the placeholder of a binding declared beside it.
+    const envProblem = (vars: Record<string, string> | undefined, inject: { name: string }[]) => {
+      const entries = Object.entries(vars ?? {});
+      if (entries.length > 64) return "at most 64 variables";
+      for (const [k, v] of entries) {
+        if (!/^[A-Z_][A-Z0-9_]{0,63}$/.test(k) || ["PATH", "HOME", "GITHUB_TOKEN"].includes(k) || k.startsWith("NEST_")) return `env: ${k} isn't allowed`;
+        if (v.includes("nest-ph.") && !inject.some((b) => v === `nest-ph.${CLIENT}.${b.name}.`)) return `env: ${k} holds a placeholder of no binding beside it`;
+      }
+      return null;
+    };
     if (r === "POST /v1/sandboxes") {
-      const s = { sandbox: id("sbx_"), owner: CLIENT, labels: call.body.labels ?? {}, ended: false };
+      // A client's own bindings and workflows, within its grant (docs/control-plane/api/clients/#injection).
+      const inject = (call.body.inject ?? []) as { name: string; secret: string; hosts: string[] }[];
+      for (const b of inject) {
+        const outside = b.hosts.filter((h) => !this.grant.inject_hosts.includes(h) && !this.grant.inject_hosts.some((a) => a.startsWith("*.") && h.endsWith(a.slice(1))));
+        if (outside.length) return nestErr(403, "forbidden", `inject hosts ${outside.join(", ")} are outside the grant`);
+      }
+      if (inject.length > 16) return nestErr(400, "invalid", "at most 16 bindings");
+      const bad = envProblem(call.body.env, inject);
+      if (bad) return nestErr(400, "invalid_message", bad);
+      if (call.body.github_push?.workflows && !this.grant.github_push?.workflows) return nestErr(403, "forbidden", "github_push.workflows is outside the grant");
+      // Its client layer starts as its create's egress, bindings and env (docs/control-plane/api/clients/#the-client-layer).
+      const s = {
+        sandbox: id("sbx_"), owner: CLIENT, labels: call.body.labels ?? {}, ended: false, github_push: call.body.github_push ?? null,
+        layer: { egress: { allow: call.body.egress?.allow ?? [] }, inject, env: call.body.env ?? {} },
+      };
       this.sandboxes.set(s.sandbox, s);
       return json(202, { sandbox: s.sandbox, cell: call.body.cell, labels: s.labels, host: null });
+    }
+    if ((m = u.pathname.match(/^\/v1\/sandboxes\/(sbx_[A-Za-z0-9]+)\/(client-policy|policy)$/))) {
+      const sb = this.sandboxes.get(m[1]!);
+      if (!sb || sb.owner !== CLIENT) return nestErr(404, "unknown_sandbox", "unknown sandbox");
+      if (sb.ended) return nestErr(409, "forbidden", "sandbox is destroyed");
+      if (m[2] === "policy" && req.method === "GET") {
+        // As nest's policy view (docs/sandbox/networking/egress/policy/#sources): each rule's `source`, and
+        // its `layer` (`base`; `workstream` for the operator's, the repo allowlists' and the client's own,
+        // no ports being 80 and 443; `sandbox` for grants). An older control plane answers `layer` only.
+        const rule = (r: { host: string; ports?: number[]; expires_ms?: number }, layer: string, source: string) =>
+          ({ ...r, host: r.host, ports: r.ports ?? [80, 443], layer, ...(this.legacyPolicy ? {} : { source }) });
+        return json(200, {
+          version: 1,
+          allow: [
+            ...this.baseRules.map((b) => rule(b, "base", "base")),
+            ...this.operatorRules.map((b) => rule(b, "workstream", "operator")),
+            ...this.reposRules.map((b) => rule(b, "workstream", "repos")),
+            ...(sb.layer.egress.allow as { host: string; ports?: number[] }[]).map((x) => rule(x, "workstream", "client")),
+            ...this.grantRules.map((g) => rule(g, "sandbox", "grant")),
+          ],
+          passthrough: [],
+        });
+      }
+      // nest answers its bindings as held: whose they are and the placeholder it assigned (`HeldInjection`).
+      if (req.method === "GET") {
+        return json(200, { ...sb.layer, inject: (sb.layer.inject as { name: string }[]).map((b) => ({ ...b, client: CLIENT, placeholder: `nest-ph.${CLIENT}.${b.name}.` })) });
+      }
+      if (req.method === "PUT") {
+        // nest's checks: the whole layer replaced, each binding a strict `ClientInjection`, its egress within
+        // the grant's egress_hosts.
+        const BINDING_KEYS = ["name", "secret", "hosts", "locations", "wildcard"];
+        const extra = ((call.body?.inject ?? []) as Record<string, unknown>[]).flatMap((b) => Object.keys(b).filter((k) => !BINDING_KEYS.includes(k)));
+        if (extra.length) return nestErr(400, "invalid_message", `inject: unrecognized key "${extra[0]}"`);
+        const allow = (call.body?.egress?.allow ?? []) as { host: string }[];
+        const outside = allow.filter((x) => !this.egressHosts.some((h) => h === x.host || (h.startsWith("*.") && x.host.endsWith(h.slice(1)))));
+        if (outside.length) return nestErr(403, "forbidden", `egress host ${outside[0]!.host} is outside the grant`);
+        const inject = (call.body?.inject ?? []) as { name: string; hosts: string[] }[];
+        const injectOutside = inject.flatMap((b) => b.hosts).filter((h) => !this.grant.inject_hosts.includes(h) && !this.grant.inject_hosts.some((a) => a.startsWith("*.") && h.endsWith(a.slice(1))));
+        if (injectOutside.length) return nestErr(403, "forbidden", `inject host ${injectOutside[0]} is outside the grant`);
+        const bad = envProblem(call.body?.env, inject);
+        if (bad) return nestErr(400, "invalid_message", bad);
+        sb.layer = { egress: { allow }, inject: call.body?.inject ?? [], env: call.body?.env ?? {} };
+        return json(200, { version: 2 });
+      }
+    }
+    if (req.method === "DELETE" && (m = u.pathname.match(/^\/v1\/sandboxes\/(sbx_[A-Za-z0-9]+)$/))) {
+      // Destroy a sandbox (owner auth): ended, its attached agents with it.
+      const sb = this.sandboxes.get(m[1]!);
+      if (!sb || sb.owner !== CLIENT) return nestErr(404, "unknown_sandbox", "unknown sandbox");
+      sb.ended = true;
+      for (const a of this.agents.values()) if (a.sandbox === sb.sandbox) a.ended = true;
+      return json(200, { sandbox: sb.sandbox, state: "destroyed" });
     }
     if (r === "GET /v1/sandboxes") {
       const rows = [...this.sandboxes.values()].filter((s) => !s.ended && labelsMatch(s.labels));
@@ -233,6 +335,25 @@ export class FakeNest {
       this.catalog.set(`${m[1]}/${m[2]}/${m[3]}`, call.body);
       return json(200, { ok: true });
     }
+    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts }, created_ms: 1 });
+    if (r === "GET /v1/clients/self/secrets") {
+      return json(200, { secrets: [...this.secrets].sort(([a], [b]) => a.localeCompare(b)).map(([name, x]) => ({ name, description: x.description, size: new TextEncoder().encode(x.value).length, created_ms: x.created_ms, updated_ms: x.updated_ms, last_injected_ms: x.last_injected_ms })) });
+    }
+    if ((m = u.pathname.match(/^\/v1\/clients\/self\/secrets\/([^/]+)$/))) {
+      const name = decodeURIComponent(m[1]!);
+      if (!/^[a-z][a-z0-9_-]{0,62}$/.test(name)) return nestErr(400, "invalid", "a secret's name is [a-z][a-z0-9_-]{0,62}");
+      if (req.method === "DELETE") return this.secrets.delete(name) ? json(200, { ok: true }) : nestErr(404, "not_found", "no such secret");
+      if (req.method === "PUT") {
+        const { value, description } = call.body as { value: string; description?: string };
+        const size = new TextEncoder().encode(value).length;
+        if (size > this.grant.secrets.max_bytes) return nestErr(403, "forbidden", "larger than the grant's secrets.max_bytes");
+        const had = this.secrets.get(name);
+        if (!had && this.secrets.size >= this.grant.secrets.max_count) return nestErr(403, "forbidden", "the grant's secrets.max_count is reached");
+        const now = Date.now();
+        this.secrets.set(name, { value, description: description ?? null, created_ms: had?.created_ms ?? now, updated_ms: now, last_injected_ms: had?.last_injected_ms ?? null });
+        return json(200, { name, description: description ?? null, size, created_ms: had?.created_ms ?? now, updated_ms: now, last_injected_ms: had?.last_injected_ms ?? null });
+      }
+    }
     if (r === "POST /v1/clients/self/github-token") {
       // Within the grant (README.md#how-it-uses-nest), as nest checks it: the repo and each permission.
       const { repo, permissions } = call.body as { repo: string; permissions: Record<string, string> };
@@ -254,6 +375,7 @@ export class FakeNest {
     return {
       agent: a.agent, owner: a.owner, client: a.client, labels: a.labels, state: a.ended ? "ended" : state, template: a.template,
       host: a.ended || state === "starting" ? null : "bh_1", capacity_waits: a.capacityWaits ?? 0,
+      hands: a.sandbox ? { sandbox: a.sandbox } : null,
       ...(a.ended ? { ended: { ms: 1, by: "client", reason: "stopped" } } : {}),
     };
   }

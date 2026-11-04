@@ -4,13 +4,16 @@
 import { Button, Modal, Switch } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconLayoutKanban, IconPlus } from "@tabler/icons-react";
-import { useMemo, useState } from "react";
+import { lazy, Suspense, useMemo, useState } from "react";
 import { useAsks, useReorderTask, useTasks } from "../../api/queries";
 import type { Task } from "../../api/types";
 import { ColumnGrid, EmptyState, ErrorState, icon, LoadingState, Panel, Section, Toolbar } from "../../layout";
 import { CANCELLED_COLUMN, COLUMNS } from "../../status";
 import { BoardColumn } from "./BoardColumn";
-import { CreateTaskForm } from "./CreateTaskForm";
+// The editor (Tiptap) is loaded only when a task is created: fetched ahead when the pointer or focus
+// reaches "New task".
+const loadCreateForm = () => import("./CreateTaskForm");
+const CreateTaskForm = lazy(() => loadCreateForm().then((m) => ({ default: m.CreateTaskForm })));
 
 export function Board({ projectId, repo }: { projectId: string; repo: string }) {
   const [dragging, setDragging] = useState(false);
@@ -36,7 +39,7 @@ export function Board({ projectId, repo }: { projectId: string; repo: string }) 
       actions={
         <Toolbar>
           <Switch label="Show cancelled" checked={showCancelled} onChange={(e) => setShowCancelled(e.currentTarget.checked)} />
-          <Button leftSection={<IconPlus size={icon.md} />} onClick={open}>
+          <Button leftSection={<IconPlus size={icon.md} />} onClick={open} onPointerEnter={() => void loadCreateForm()} onFocus={() => void loadCreateForm()}>
             New task
           </Button>
         </Toolbar>
@@ -48,7 +51,7 @@ export function Board({ projectId, repo }: { projectId: string; repo: string }) 
         <ErrorState title="The board couldn't be loaded" error={tasks.error} onRetry={() => void tasks.refetch()} />
       ) : tasks.data.length === 0 ? (
         <Panel>
-          <EmptyState icon={IconLayoutKanban} title="No tasks yet" description="Create one, or ask the manager in the chat to plan some." action={<Button onClick={open}>Create a task</Button>} />
+          <EmptyState icon={IconLayoutKanban} title="No tasks yet" description="Create one, or ask the manager in the chat to plan some." action={<Button onClick={open} onPointerEnter={() => void loadCreateForm()} onFocus={() => void loadCreateForm()}>Create a task</Button>} />
         </Panel>
       ) : (
         <ColumnGrid columns={columns.length}>
@@ -68,7 +71,9 @@ export function Board({ projectId, repo }: { projectId: string; repo: string }) 
       )}
 
       <Modal opened={creating} onClose={close} title="New task" size="lg">
-        <CreateTaskForm projectId={projectId} onCancel={close} onCreated={close} />
+        <Suspense fallback={<LoadingState label="Loading the editor" />}>
+          <CreateTaskForm projectId={projectId} onCancel={close} onCreated={close} />
+        </Suspense>
       </Modal>
     </Section>
   );

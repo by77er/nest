@@ -5,6 +5,8 @@ import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { ask, FakeApi, project, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+/** The task drawer (titled with its task's title). */
+const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
 
 const sidebar = () => screen.getByRole("navigation", { name: "Main" });
 const switcher = () => within(sidebar()).getByRole("button", { name: /Switch project/ });
@@ -93,8 +95,8 @@ describe("the views", () => {
     const views = within(sidebar()).getByRole("group", { name: "Views" });
     const rows = within(views).getAllByRole("link");
     // The manager first: the project's default view.
-    expect(rows.map((r) => r.textContent)).toEqual(["Manager", "Board", "Reviews", "Settings"]);
-    expect(rows.map((r) => r.getAttribute("href"))).toEqual(["manager", "board", "reviews", "settings"].map((v) => `/projects/prj_one/${v}`));
+    expect(rows.map((r) => r.textContent)).toEqual(["Manager", "Board", "Reviews", "Secrets", "Network", "Settings"]);
+    expect(rows.map((r) => r.getAttribute("href"))).toEqual(["manager", "board", "reviews", "secrets", "network", "settings"].map((v) => `/projects/prj_one/${v}`));
     expect(rows.filter((r) => r.getAttribute("aria-current") === "page").map((r) => r.textContent)).toEqual(["Reviews"]);
     for (const r of rows) expect(r).toHaveAttribute("data-ds", "nav-row");
     expect(document.querySelector(".mantine-Breadcrumbs-root")).toBeNull();
@@ -155,6 +157,6 @@ describe("the routes", () => {
     const second = renderApp(`/projects/prj_one?task=${t.id}`, api);
     await waitFor(() => expect(second.router.state.location.pathname).toBe("/projects/prj_one/board"));
     expect(second.router.state.location.search).toEqual({ task: t.id });
-    expect(await screen.findByRole("dialog", { name: "Task" })).toBeInTheDocument();
+    expect(await screen.findByRole("dialog", SHEET)).toBeInTheDocument();
   });
 });

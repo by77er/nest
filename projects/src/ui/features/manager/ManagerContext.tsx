@@ -1,5 +1,6 @@
 // The Manager page's context column: the tasks under way (as the task cards a message shows, newest
-// change first) and the top things waiting on the owner, each linking to the Board's "Needs you", where
+// change first), what the manager waits for (its awaits, soonest deadline first; README.md#waiting) and
+// the top things waiting on the owner, each linking to the Board's "Needs you", where
 // it's answered. The manager's
 // status is in the page's header, not here.
 
@@ -12,19 +13,21 @@ import { MetaItem, MetaRow, Section, Stack } from "../../layout";
 import { approvalOf } from "../attention/AskItem";
 import { SHOWN as ASKS_SHOWN } from "../attention/NeedsYou";
 import { TaskCardList } from "../rich/TaskRefs";
+import { ManagerWaits } from "./ManagerWaits";
 
 /** The states a task is under way in: someone holds it. Drafts, ready and done aren't. */
 export const ACTIVE = new Set(["assigned", "in_progress", "in_review", "stalled"]);
 const SHOWN = 5;
 const GIST = 120;
 
-/** A line of what an ask or a block wants: its question, the call it holds, or the reason. */
+/** A line of what an ask, a block or a secret request wants: its question, the call it holds, the reason, or the credential. */
 export function gist(x: Attention): string {
   let text: string;
   if (x.kind === "ask") {
     const a = approvalOf(x);
     text = x.question ?? (a ? `Approve a call to ${a.name}` : "A question");
-  } else text = x.question ?? x.reason;
+  } else if (x.kind === "secret") text = `Asks for ${x.type === "ci" ? "the Actions secret" : "a credential"} ${x.name}: ${x.purpose}`;
+  else text = x.question ?? x.reason;
   const line = text.replace(/\s+/g, " ").trim();
   return line.length > GIST ? `${line.slice(0, GIST - 1).trimEnd()}…` : line;
 }
@@ -34,7 +37,7 @@ function More({ projectId, n }: { projectId: string; n: number }) {
   return (
     <Text fz="sm" lh="lg" c="dimmed">
       and{" "}
-      <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{}} inherit data-inline>
+      <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{}} inherit lh="lg" data-inline>
         {n} more on the board
       </AnchorLink>
     </Text>
@@ -61,11 +64,12 @@ export function ManagerContext({ projectId }: { projectId: string }) {
           </Text>
         )}
       </Section>
+      <ManagerWaits projectId={projectId} />
       <Section title="Needs you" dense region={false}>
         {asks.length ? (
           <Stack gap="md" data-slot="top-asks">
             {asks.map((x) => (
-              <Stack key={x.kind === "ask" ? x.ask : `blocked-${x.task}`} gap="xs">
+              <Stack key={x.kind === "ask" ? x.ask : x.kind === "secret" ? x.id : `blocked-${x.task}`} gap="xs">
                 <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{}} fz="sm">
                   {gist(x)}
                 </AnchorLink>

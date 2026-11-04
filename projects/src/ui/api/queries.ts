@@ -3,7 +3,8 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
+import type { PutSecretBody } from "./types";
+import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
 
 export const keys = {
   projects: ["projects"] as const,
@@ -15,6 +16,7 @@ export const keys = {
   manager: (id: string) => ["projects", id, "manager"] as const,
   reviews: (id: string) => ["projects", id, "reviews"] as const,
   openPrs: (id: string) => ["projects", id, "open-prs"] as const,
+  secrets: (id: string) => ["projects", id, "secrets"] as const,
   attention: (id: string) => ["projects", id, "attention"] as const,
   syncState: ["admin", "sync-state"] as const,
 };
@@ -68,6 +70,27 @@ export function useRetryAttach(id: string) {
 }
 
 /** What waits on the owner: open asks and blocked tasks, oldest first (README.md#blocked). */
+/** The manager's pending waits (and the last few that ended): polled, since their deadlines run down. */
+export const useWaits = (id: string) => useQuery({ queryKey: ["projects", id, "waits"], queryFn: () => api.waits(id), refetchInterval: POLL.manager });
+
+/** The Network page: polled while changes reach the live agents. */
+export const useNetwork = (id: string) =>
+  useQuery({ queryKey: ["projects", id, "network"], queryFn: () => api.network(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.manager) });
+
+export function useSetNetwork(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (b: NetworkBody) => api.setNetwork(id, b),
+    // The page says why under Save, and marks the hosts it names: no notification.
+    meta: { inline: true },
+    onSuccess: (v) => {
+      // The same layers carry the secrets: their statuses on the Secrets page move too.
+      void qc.invalidateQueries({ queryKey: keys.secrets(id) });
+      qc.setQueryData(["projects", id, "network"], v);
+    },
+  });
+}
+
 export const useAttention = (id: string) => useQuery({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks });
 
 /** The owner answers a blocked task: its block clears, and the answer reaches the agents' inboxes. */
@@ -107,6 +130,51 @@ export const useAttachPr = (id: string) => useRelationWrite(id, (v: { task: stri
 export const useDetachPr = (id: string) => useRelationWrite(id, (v: { task: string; pr: number }) => api.detachPr(id, v.task, v.pr), "The PR wasn't detached");
 export const useAddDependency = (id: string) => useRelationWrite(id, (v: { task: string; blocked_by: string }) => api.addDependency(id, v.task, { blocked_by: v.blocked_by }), "The dependency wasn't added");
 export const useRemoveDependency = (id: string) => useRelationWrite(id, (v: { task: string; blocker: string }) => api.removeDependency(id, v.task, v.blocker), "The dependency wasn't removed");
+
+/** The Secrets page: polled faster while a change reaches the live agents. */
+export const useSecrets = (id: string) =>
+  useQuery({ queryKey: keys.secrets(id), queryFn: () => api.secrets(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.reviews) });
+
+/** Save a secret's settings, and its value when one is given (straight to nest; never kept by the page). */
+export function usePutSecret(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { name: string; body: PutSecretBody }) => api.putSecret(id, v.name, v.body),
+    // The variables hold the value: dropped once the save settles, not kept in the mutation cache.
+    gcTime: 0,
+    meta: { failure: "The secret wasn't saved" },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: keys.attention(id) });
+      void qc.invalidateQueries({ queryKey: ["projects", id, "network"] });
+      return qc.invalidateQueries({ queryKey: keys.secrets(id) });
+    },
+  });
+}
+
+export function useDeleteSecret(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) => api.deleteSecret(id, name),
+    meta: { failure: "The secret wasn't deleted" },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["projects", id, "network"] });
+      return qc.invalidateQueries({ queryKey: keys.secrets(id) });
+    },
+  });
+}
+
+export function useSecretRequestDone(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (req: string) => api.secretRequestDone(id, req),
+    meta: { failure: "It wasn't marked done" },
+    onSuccess: (_d, req) => {
+      qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "secret" && x.id === req)));
+      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
+      return qc.invalidateQueries({ queryKey: keys.attention(id) });
+    },
+  });
+}
 
 export const useSyncState = () => useQuery({ queryKey: keys.syncState, queryFn: api.syncState });
 

@@ -3,7 +3,8 @@
 // of every write the page made.
 
 import { type TaskEvent, transition } from "../../tasks";
-import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, Project, ProjectRow, Settings, SyncState, Task } from "../api/types";
+import type { SecretRequest, SecretsAnswer } from "../api/types";
+import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
 
 export interface Write {
   method: string;
@@ -18,7 +19,7 @@ export function project(over: Partial<ProjectRow> = {}): Project {
   const settings: Settings = {
     id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null,
     attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: row.created_ms },
-    auto_merge: false, merge_method: "squash", repo_auto_merge: { state: "none", want: false, repo: null, error: null, at_ms: null }, created_ms: row.created_ms,
+    auto_merge: false, merge_method: "squash", workers_edit_workflows: false, repo_auto_merge: { state: "none", want: false, repo: null, error: null, at_ms: null }, created_ms: row.created_ms,
   };
   return { ...row, settings };
 }
@@ -46,7 +47,15 @@ export class FakeApi {
   asks: Ask[] = [];
   sync: SyncState | null = null;
   reviews: Job[] = [];
+  waits: Waits = { pending: [], recent: [] };
+  workflowWorkers: string[] = [];
+  /** `PUT network`'s answer instead of saving: a refusal (403 with `problems`, say). */
+  networkRefusal: { status: number; body: unknown } | null = null;
+  network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }] };
   openPrs: OpenPr[] = [];
+  secrets: SecretsAnswer["secrets"] = [];
+  grant: SecretsAnswer["grant"] = { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org"], max_count: 10, max_bytes: 4096, workflows: true, used: 0 };
+  secretRequests: SecretRequest[] = [];
   manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
   readonly writes: Write[] = [];
   /** Every GET's path, in order. */
@@ -82,10 +91,16 @@ export class FakeApi {
   };
 
   /** What the Worker's attention list answers: open asks and blocked tasks, oldest first. */
+  /** A secrets change, like a network one, is owed to every live agent's layer (one revision for both). */
+  layersOwed(): void {
+    this.network = { ...this.network, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
+  }
+
   attention(): Attention[] {
     const asks = this.asks.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
     const blocked = this.tasks.filter((t) => t.blocked).map((t): Attention => ({ kind: "blocked", task: t.id, title: t.title, state: t.state, ...t.blocked! }));
-    return [...asks, ...blocked].sort((a, b) => a.at_ms - b.at_ms);
+    const secrets = this.secretRequests.map((r): Attention => ({ kind: "secret", ...r }));
+    return [...asks, ...blocked, ...secrets].sort((a, b) => a.at_ms - b.at_ms);
   }
 
   private move(t: Task, event: TaskEvent): Response | null {
@@ -109,6 +124,27 @@ export class FakeApi {
     }
     const p = this.projects.find((x) => x.id === parts[1]);
     if (!p) return json({ error: "unknown project" }, 404);
+    if (parts[2] === "secrets" && parts[3]) {
+      const name = decodeURIComponent(parts[3]);
+      if (m === "PUT") {
+        const { value: _v, ...meta } = body;
+        const had = this.secrets.find((x) => x.name === name);
+        const row = { name, nest_name: had?.nest_name ?? `prj_one-${name}-abc123`, outside_hosts: [] as string[], size: _v ? new TextEncoder().encode(_v).length : had?.size ?? null, created_ms: had?.created_ms ?? now, updated_ms: now, holders: had?.holders ?? [], last_injected_ms: null, in_nest: true, ...meta };
+        this.secrets = [...this.secrets.filter((x) => x.name !== name), row];
+        this.layersOwed();
+        return json(row);
+      }
+      if (m === "DELETE") {
+        const had = this.secrets.find((x) => x.name === name);
+        this.secrets = this.secrets.filter((x) => x.name !== name);
+        this.layersOwed();
+        return json({ deleted: name, holders: had?.holders ?? [] });
+      }
+    }
+    if (parts[2] === "secret-requests" && parts[4] === "done") {
+      this.secretRequests = this.secretRequests.filter((r) => r.id !== parts[3]);
+      return json({ done: parts[3] });
+    }
     const route = `${m} ${parts.slice(2).map((s) => (/^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : /^\d+$/.test(s) ? ":n" : s)).join("/")}`;
     const t = this.tasks.find((x) => x.id === parts[3]);
     switch (route) {
@@ -132,8 +168,18 @@ export class FakeApi {
       case "POST attach":
         this.manager = { ...this.manager, phase: "starting", error: null };
         return json(p.settings);
+      case "GET waits":
+        return json(this.waits);
+      case "GET network":
+        return json(this.network);
+      case "PUT network":
+        if (this.networkRefusal) return json(this.networkRefusal.body, this.networkRefusal.status);
+        this.network = { ...this.network, rules: body, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
+        return json(this.network);
       case "GET reviews":
         return json(this.reviews);
+      case "GET secrets":
+        return json({ secrets: this.secrets, grant: this.grant, client: "cli_app", agents: this.network.agents, workflow_workers: this.workflowWorkers });
       case "GET prs/open":
         return json(this.openPrs);
       case "GET chat": {
