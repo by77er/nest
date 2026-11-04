@@ -87,6 +87,23 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Unconfirmed operator cleanups** (the owner to confirm they were done): the old SSM parameter `/nest/control-plane/vars/AWS_CELLS` if it was never imported into a cell stack; the legacy Worker secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `ROOT_CA_KMS_KEY_ID`, `ROOT_CA_CERT_PEM`) and the SSM parameter `/nest/control-plane/vars/ROOT_CA_KMS_KEY_ID`; the unattached reusable Access policies left by the edge stack's import; and respawning agents whose stored prompts still describe removed tools.
 - **Still needed by hosts:** `sandbox_create`, `sandbox_fork` and `agent_start` carry a `ws_` value (`compatWorkstream`), which hosts and runners from before workstreams left require (Rust's `WorkstreamId`, prefix-checked). Drop it from the control plane (and `SandboxInfo`/`AgentInfo`) once every host runs that release or later, then the Rust fields the release after. The policy layer's wire value `workstream` (the operator layer; hosts parse a closed enum) stays.
 
+**This release's rollout rule (on-demand fallback): not a one-way deploy, and nothing by hand.**
+- **What changes:** when spot has no room for any instance type, FleetDO tries each type on demand, cheapest first. Before, it tried only the first type. The cell stack writes the order, `on_demand_types`, from its price table (Price List API, 2026-11-03/04). `use1` gets `c8i-flex.large, c8i.large, m8i.large, c8id.large, m8id.large, r8id.large`, and the brains `t3a.medium, t3.medium`.
+- **Why:** on 2026-11-03 the first type, `c8id.large`, had no on-demand capacity in any of the cell's zones, so a pass with no spot room launched nothing.
+- **Cost:** an on-demand sandbox host is `c8i-flex.large` ($0.08902/h) when it has room. That is cheaper than today's `c8id.large` fallback ($0.11088/h), and never dearer than the cheapest type with room.
+- **An on-demand fallback host is usually EBS-only:** `c8i-flex`, `c8i` and `m8i` come before every instance-store type on demand. So its checkpoints pause the VM for whole reads (M1), not for a clone ([disk](../docs/sandbox/state/disk/)). That is the price of the cheaper host; spot still tries the instance-store types first.
+- **Its disk:** the sandbox hosts' root volume grows from 30 to 140 GB (gp3), so an EBS-only host holds `maxSandboxesPerHost` (14) at 8 GB each, plus 24 GB for the OS, images and cache. A host whose bootstrap fell back from its instance store keeps its state there too. `sandboxes_fit_their_disk` now covers the root volume as well as each instance store.
+  - **Why raise the volume, not cap per type:** placement doesn't know a host's type or whether its store was used. A per-type cap would need nestd to report it, and would leave an EBS host at 2 sandboxes. The bigger volume needs neither.
+  - **Cost:** +110 GB × $0.08/GB-month = +$8.80 a month per always-on sandbox host, or about $0.012 an hour while a host runs. It is paid on instance-store hosts too, since the volume is one template's. The brain hosts' 30 GB is unchanged.
+  - AL2023 grows the root filesystem to the volume at first boot (cloud-init `growpart`; unverified on a nest host until one launches).
+- **Price drift:** `onDemandPrices` is a table in the cell stack, verified on 2026-11-03/04. Nothing checks it against AWS since. A scheduled check of it against the Price List API's `get-products` is an open item ([open questions](../docs/README.md)), not built.
+- **Bounded** ([autoscaling](../docs/compute/autoscaling/)):
+  - A pass makes at most two calls per type.
+  - A pass with no room anywhere, or a spent on-demand quota, starts a per-kind backoff: 60 s, doubling to 15 min (brains 5 min), cleared by a launch, and forgotten 30 min after it lapses. A spent spot quota skips to on demand.
+  - An error that isn't a lack of room still ends the pass, and that attempt is repeated.
+- **Order:** inframe writes `on_demand_types` into `AWS_CELLS`; then the Worker reads it. A Worker of the previous release ignores the field (zod strips it). A new Worker with an `AWS_CELLS` that lacks it tries `instance_types` in order.
+- **What a rollback does:** first-type-only on demand, and no backoff.
+
 **This release's rollout rule (instance types): not a one-way deploy, and nothing by hand.**
 - **What changes:**
   - `use1`'s `launchTypes` become `c8id.large, m8id.large, r8id.large`, then the EBS-only `c8i-flex.large, c8i.large, m8i.large`.
@@ -102,7 +119,7 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
   - **Nothing per type in nestd:** nest uses no Firecracker CPU template, and disk-only restores carry no CPU state across hosts. Memory snapshots, when built, will need placement that knows each host's CPU model ([restore ABI](../docs/sandbox/state/memory/#restore-abi)).
 - **The guards** (`deploy/lean/Cell/Test.lean`):
   - `launch_types_sound`: every type has nested virtualization on a CPU Firecracker supports, and every instance-store type comes before every EBS-only one.
-  - `sandboxes_fit_the_instance_store`: 14 sandboxes × 8 GB fits each instance-store type's 118 GB.
+  - `sandboxes_fit_their_disk`: 14 sandboxes × 8 GB fits each instance-store type's 118 GB.
     - Placement packs by memory, so without the cap an `m8id` (8 GiB) or `r8id` (16 GiB) would take 2–4× a `c8id`'s sandboxes on the same disk. That would fill it.
     - The 8 GB per sandbox is an assumption: its 32 GiB sparse disk shares `nest-base` by reflink. It is unmeasured on a used host.
   - Better later: nestd reports free space on its state filesystem, for placement to use.
@@ -123,7 +140,7 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **What it costs:**
   - On spot, a host is an 8id at $0.029–0.071 an hour (`r8id`'s $0.161 in 1c is the outlier), when one has room, against `c8i-flex.large`'s $0.032–0.043. That is up to about +$0.03 an hour per host, about +$22 a month per always-on host, at most about +$88 a month at `maxHosts` 4.
   - With the 8id types' scores at 1, most launches may still end on `c8i-flex.large`.
-  - The on-demand fallback is `c8id.large` ($0.11088) until the on-demand pass changes (#156).
+  - On demand, a host is the cheapest listed type with room, `c8i-flex.large` ($0.08902) first (the on-demand fallback rule above). So `r8id.large`'s $0.16632 is paid only when every cheaper type has no room.
   - Spot prices move; the scores are one evening's.
 - **What differs per type:** the instance store's size (all 118 GB here, formatted by `bootstrap.sh` whatever its size) and memory. Placement packs memory, and the cap bounds the count. Nothing else in nestd or Firecracker differs.
 - **Rollout:**

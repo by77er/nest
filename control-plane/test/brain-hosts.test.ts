@@ -7,7 +7,7 @@ import type { FleetDO } from "../src/do/fleet";
 import type { AwsCellConfig } from "../src/lib/cells";
 import { awsCell } from "../src/lib/cells";
 import { CapacityError, type Ec2, type ImageInfo, type InstanceState, type LaunchSpec } from "../src/lib/ec2";
-import { BRAINS_PER_VCPU, brainHostNeeded, idleStep, maxBrains, pickBrainHost, scaleUpPlan, type BrainHostFacts } from "../src/lib/placement";
+import { BRAINS_PER_VCPU, brainHostNeeded, idleStep, maxBrains, NO_ROOM_BACKOFF_BRAIN_MAX_MS, NO_ROOM_BACKOFF_MAX_MS, NO_ROOM_RESET_MS, noRoomBackoffMs, pickBrainHost, scaleUpPlan, type BrainHostFacts } from "../src/lib/placement";
 import { capacityRetryMs, type AgentDO } from "../src/do/agent";
 import { NestError } from "../src/lib/util";
 import { ErrorCodes } from "../src/protocol/model";
@@ -86,7 +86,7 @@ describe("maxBrains, scaleUpPlan and idleStep (pure)", () => {
     expect(maxBrains(undefined, -3)).toBe(1);
   });
 
-  it("scaleUpPlan: nothing while pending or at the cap; else each type on spot, then the first on demand", () => {
+  it("scaleUpPlan: nothing while pending or at the cap; else each type on spot, then each on demand, in order", () => {
     const s = { instance_types: ["t3a.medium", "t3.medium"], subnet_ids: ["subnet-0a", "subnet-0b"], spot: true, max_hosts: 2 };
     expect(scaleUpPlan(s, 0, 1, 0)).toEqual({ launch: null, why: "pending" });
     expect(scaleUpPlan(s, 2, 0, 0)).toEqual({ launch: null, why: "at_max" });
@@ -94,24 +94,48 @@ describe("maxBrains, scaleUpPlan and idleStep (pure)", () => {
       { type: "t3a.medium", subnet: "subnet-0b", spot: true },
       { type: "t3.medium", subnet: "subnet-0a", spot: true },
       { type: "t3a.medium", subnet: "subnet-0b", spot: false },
+      { type: "t3.medium", subnet: "subnet-0a", spot: false },
     ] });
-    expect(scaleUpPlan({ ...s, spot: false }, 0, 0, 0)).toEqual({ launch: [{ type: "t3a.medium", subnet: "subnet-0a", spot: false }] });
+    expect(scaleUpPlan({ ...s, spot: false }, 0, 0, 0)).toEqual({ launch: [
+      { type: "t3a.medium", subnet: "subnet-0a", spot: false },
+      { type: "t3.medium", subnet: "subnet-0b", spot: false },
+    ] });
+    // The on-demand order is the cell's own when it gives one (cheapest first).
+    expect(scaleUpPlan({ ...s, spot: false, on_demand_types: ["t3.medium", "t3a.medium"] }, 0, 0, 0)).toEqual({ launch: [
+      { type: "t3.medium", subnet: "subnet-0a", spot: false },
+      { type: "t3a.medium", subnet: "subnet-0b", spot: false },
+    ] });
   });
 
-  it("property: scaleUpPlan launches only below the cap with nothing in flight, always ending on demand, in the cell's subnets", () => {
+  it("noRoomBackoffMs: 60 s, doubling to the cap (15 min, brains 5 min), and from 60 s again once the last lapsed long ago", () => {
+    const now = 10_000_000;
+    const lapsed = (wait_ms: number, agoMs = 0) => ({ until_ms: now - agoMs, wait_ms });
+    expect(noRoomBackoffMs(null, now)).toBe(60_000);
+    expect(noRoomBackoffMs(lapsed(60_000), now)).toBe(120_000);
+    expect(noRoomBackoffMs(lapsed(480_000), now)).toBe(NO_ROOM_BACKOFF_MAX_MS);
+    expect(noRoomBackoffMs(lapsed(NO_ROOM_BACKOFF_MAX_MS), now)).toBe(NO_ROOM_BACKOFF_MAX_MS);
+    expect(noRoomBackoffMs(lapsed(240_000), now, NO_ROOM_BACKOFF_BRAIN_MAX_MS)).toBe(NO_ROOM_BACKOFF_BRAIN_MAX_MS);
+    expect(NO_ROOM_BACKOFF_BRAIN_MAX_MS).toBeLessThan(12 * 60_000);
+    // It decays: a backoff that lapsed more than the reset window ago starts over.
+    expect(noRoomBackoffMs(lapsed(NO_ROOM_BACKOFF_MAX_MS, NO_ROOM_RESET_MS), now)).toBe(NO_ROOM_BACKOFF_MAX_MS);
+    expect(noRoomBackoffMs(lapsed(NO_ROOM_BACKOFF_MAX_MS, NO_ROOM_RESET_MS + 1), now)).toBe(60_000);
+  });
+
+  it("property: scaleUpPlan launches only below the cap with nothing in flight: spot types in order, then every type on demand in order, in the cell's subnets", () => {
     for (let seed = 1; seed <= 500; seed++) {
       const r = rng(seed);
       const types = Array.from({ length: 1 + Math.floor(r() * 3) }, (_, i) => `t${i}.medium`);
       const subnets = Array.from({ length: 1 + Math.floor(r() * 3) }, (_, i) => `subnet-0${i}`);
-      const s = { instance_types: types, subnet_ids: subnets, spot: r() < 0.5, max_hosts: 1 + Math.floor(r() * 3) };
+      const od = r() < 0.5 ? [...types].reverse() : undefined;
+      const s = { instance_types: types, ...(od ? { on_demand_types: od } : {}), subnet_ids: subnets, spot: r() < 0.5, max_hosts: 1 + Math.floor(r() * 3) };
       const live = Math.floor(r() * 4);
       const pending = r() < 0.3 ? 1 : 0;
       const p = scaleUpPlan(s, live, pending, Math.floor(r() * 1e9));
       const ok = !pending && live < s.max_hosts;
       expect(p.launch !== null, `seed ${seed}`).toBe(ok);
       if (!p.launch) continue;
-      expect(p.launch.at(-1), `seed ${seed}`).toMatchObject({ type: types[0], spot: false });
-      expect(p.launch.length, `seed ${seed}`).toBe(s.spot ? types.length + 1 : 1);
+      const want = [...(s.spot ? types.map((type) => ({ type, spot: true })) : []), ...(od ?? types).map((type) => ({ type, spot: false }))];
+      expect(p.launch.map((a) => ({ type: a.type, spot: a.spot })), `seed ${seed}`).toEqual(want);
       for (const a of p.launch) expect(subnets, `seed ${seed}`).toContain(a.subnet);
     }
   });
@@ -166,9 +190,14 @@ describe("the cell's brain section", () => {
 class MockEc2 implements Ec2 {
   terminated: string[] = [];
   launched: LaunchSpec[] = [];
+  /** Every RunInstances asked for, whatever it answered. */
+  asked = 0;
+  /** No room for any type, either way. */
+  full = false;
   constructor(private readonly st: InstanceState = "running") {}
   async launch(spec: LaunchSpec) {
-    if (spec.instanceType === "none") throw new CapacityError("InsufficientInstanceCapacity");
+    this.asked++;
+    if (this.full || spec.instanceType === "none") throw new CapacityError("InsufficientInstanceCapacity");
     this.launched.push(spec);
     return `i-0b${this.launched.length.toString(16).padStart(7, "0")}`;
   }
@@ -592,6 +621,37 @@ describe("brain hosts scale with brains", () => {
     await a.ws.next("ack", (m) => m.up_to >= seq);
     const [s2] = await nextCommands(a.ws, isStartOf(second));
     expect(s2).toMatchObject({ agent: second, epoch: 1 });
+  });
+
+  it("brain waiters share one launch pass while nothing has room: the agents' starts and the tick make no more calls until the backoff lapses", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2();
+    ec2.full = true;
+    await configure(cell, ec2);
+    await captain(cell);
+    // One pass: t3a.medium on spot, then on demand.
+    expect(ec2.asked).toBe(2);
+    await captain(cell);
+    await captain(cell);
+    await tickAt(cell, ec2);
+    expect(ec2.asked).toBe(2);
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.until_ms', 0) WHERE key = 'noroom:brain'");
+    });
+    await tickAt(cell, ec2);
+    expect(ec2.asked).toBe(4);
+    // Brains back off at most 5 min (under the waiters' 12 min TTL): from 4 min, the next is 5, not 8.
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE kv SET value = json_object('until_ms', 0, 'wait_ms', 240000) WHERE key = 'noroom:brain'");
+      st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.until_ms', ?) WHERE key = 'noroom:brain'", Date.now());
+    });
+    await runInDurableObject(fleetStub(cell), (_i, st) => {
+      st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.until_ms', ?) WHERE key = 'noroom:brain'", Date.now() - 1);
+    });
+    await tickAt(cell, ec2);
+    const wait = await runInDurableObject(fleetStub(cell), (_i, st) =>
+      (JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'noroom:brain'").one().value) as { wait_ms: number }).wait_ms);
+    expect(wait).toBe(5 * 60_000);
   });
 
   it("while agents wait, the tick launches the next brain host itself (after an enroll timeout ended the last)", async () => {

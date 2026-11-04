@@ -67,8 +67,8 @@ structure CellSpec where
   (Firecracker needs `/dev/kvm`) that Firecracker supports (`launch_types_sound`). A cell lists
   each family by name, `-flex` and `d` variants included. -/
   instanceFamilies : List String := ["c8i", "m8i", "r8i"]
-  /-- The instance types FleetDO launches, in preference order; the first is also the on-demand
-  fallback. Each must fall within `instanceFamilies` (`launch_types_within_iam` in `Cell.Test`). -/
+  /-- The instance types FleetDO launches, in preference order: each on spot, then each on demand
+  (`scaleUpPlan`). Each must fall within `instanceFamilies` (`launch_types_within_iam` in `Cell.Test`). -/
   launchTypes : List String
   /-- The autoscaler's settings (control-plane/src/lib/cells.ts, `AWS_CELLS`); the defaults are its own. -/
   spot : Bool := true
@@ -79,16 +79,23 @@ structure CellSpec where
   enrollTimeoutMs : Nat := 600000
   /-- What a sandbox on regular pages is expected to use, reserved until the host counts it. -/
   sandboxReserveMib : Nat := 768
+  /-- The sandbox hosts' root volume, GB (gp3). An EBS-only host, or one whose bootstrap fell back
+  from its instance store, keeps every sandbox's state there, so it must hold `maxSandboxesPerHost`
+  sandboxes besides the OS, the base images and the chunk cache (`sandboxes_fit_their_disk`). -/
+  hostRootGb : Nat := 30
+  /-- On-demand prices in the cell's region, micro-USD an hour (Linux, AWS's Price List API), for
+  every type it may launch: FleetDO tries on demand cheapest first (`CellSpec.onDemandTypes`). -/
+  onDemandPrices : List (String × Nat) := []
   /-- At most this many sandboxes per host on regular pages; 0 is no cap. Placement packs by
   memory, so on a type with more memory per GB of instance store this is what keeps the store from
-  filling (`sandboxes_fit_the_instance_store`). -/
+  filling (`sandboxes_fit_their_disk`). -/
   maxSandboxesPerHost : Nat := 0
   /-- Brain hosts (docs/compute/brain-hosts/): the instance families the control plane may launch
   from the brain template (IAM allows `<family>*.*`). Cheap x86 types, since both kinds boot the
   one host AMI (x86_64). -/
   brainInstanceFamilies : List String := ["t3a", "t3"]
-  /-- The brain instance types FleetDO launches, in preference order; the first is also the
-  on-demand fallback. About 2 vCPU / 4 GiB. Each must fall within `brainInstanceFamilies`. -/
+  /-- The brain instance types FleetDO launches, in preference order: each on spot, then each on
+  demand. About 2 vCPU / 4 GiB. Each must fall within `brainInstanceFamilies`. -/
   brainLaunchTypes : List String := ["t3a.medium", "t3.medium"]
   brainSpot : Bool := true
   /-- At most this many brain hosts: 3 `t3a.medium`s hold about 12 brains at the default 2 per
@@ -130,6 +137,30 @@ has a `.` after it. (`*` matches any run of characters, including none.) -/
 def matchesFamily (family type : String) : Bool :=
   family.toList.isPrefixOf type.toList && (type.toList.drop family.length).contains '.'
 
+/-- A type's on-demand price in `spec`'s table, if it has one. -/
+def CellSpec.priceOf (spec : CellSpec) (type : String) : Option Nat :=
+  (spec.onDemandPrices.find? (·.1.toList == type.toList)).map (·.2)
+
+/-- `t` into `sorted` (cheapest first) after every type no dearer: equal prices keep their order. -/
+def CellSpec.insertByPrice (spec : CellSpec) (t : String) : List String → List String
+  | [] => [t]
+  | u :: rest => if (spec.priceOf t).getD 0 < (spec.priceOf u).getD 0 then t :: u :: rest else u :: spec.insertByPrice t rest
+
+/-- `types` cheapest first on demand; equal prices keep their preference order (an insertion sort:
+structural, so `decide` reduces it). -/
+def CellSpec.cheapestFirst (spec : CellSpec) (types : List String) : List String :=
+  types.foldl (fun acc t => spec.insertByPrice t acc) []
+
+/-- The order FleetDO tries sandbox types on demand in, once spot had no room for any (`AWS_CELLS`
+`on_demand_types`): cheapest first, so an on-demand host is the cheapest that has room. -/
+def CellSpec.onDemandTypes (spec : CellSpec) : List String := spec.cheapestFirst spec.launchTypes
+
+/-- The same for brain hosts. -/
+def CellSpec.brainOnDemandTypes (spec : CellSpec) : List String := spec.cheapestFirst spec.brainLaunchTypes
+
+/-- Every type either kind may launch has a price in the table (so the order means something). -/
+def CellSpec.onDemandPriced (spec : CellSpec) : Bool :=
+  (spec.launchTypes ++ spec.brainLaunchTypes).all (fun t => (spec.priceOf t).isSome)
 /-- The families AWS offers nested virtualization on (and so `/dev/kvm` for Firecracker), from the
 EC2 user guide's list (2026-11-03): https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html -/
 def nestedVirtualizationFamilies : List String :=
@@ -170,10 +201,17 @@ def CellSpec.launchTypesSound (spec : CellSpec) : Bool :=
     && spec.launchTypes.all (fun t => firecrackerFamilies.any (·.toList == familyOf t))
     && (spec.launchTypes.dropWhile hasInstanceStore).all (fun t => !hasInstanceStore t)
 
-/-- On every instance-store type, the per-host sandbox cap leaves each sandbox its budget of the store. -/
+/-- What a sandbox host's root volume holds besides sandboxes, GB: the OS and nest's install, the
+base images (compressed and unpacked) and the store's local chunk cache (an assumption, unmeasured). -/
+def hostRootReserveGb : Nat := 24
+
+/-- Every host's sandbox state fits its disk at the per-host cap: an instance-store type's on its
+store, and every host's on its root volume, since an EBS-only type keeps it there and an
+instance-store host whose bootstrap fell back from its store does too. -/
 def CellSpec.sandboxesFitStore (spec : CellSpec) : Bool :=
   spec.maxSandboxesPerHost > 0
     && (spec.launchTypes.filter hasInstanceStore).all (fun t => spec.maxSandboxesPerHost * sandboxStoreBudgetGb ≤ instanceStoreGb t)
+    && spec.maxSandboxesPerHost * sandboxStoreBudgetGb + hostRootReserveGb ≤ spec.hostRootGb
 
 /-- Every type the autoscaler may pick is one IAM lets it launch. -/
 def CellSpec.launchTypesAllowed (spec : CellSpec) : Bool :=
@@ -211,6 +249,7 @@ def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : Ce
     , field "launch_template_id" (quote launchTemplateId)
     , field "subnet_ids" (strings subnetIds)
     , field "instance_types" (strings (spec.launchTypes.map str))
+    , field "on_demand_types" (strings (spec.onDemandTypes.map str))
     , field "spot" (str (if spec.spot then "true" else "false"))
     , field "max_hosts" (number spec.maxHosts)
     , field "idle_grace_ms" (number spec.idleGraceMs)
@@ -221,6 +260,7 @@ def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : Ce
     , field "brain" (str "{" ++ join
         [ field "launch_template_id" (quote brainTemplateId)
         , field "instance_types" (strings (spec.brainLaunchTypes.map str))
+        , field "on_demand_types" (strings (spec.brainOnDemandTypes.map str))
         , field "spot" (str (if spec.brainSpot then "true" else "false"))
         , field "max_hosts" (number spec.brainMaxHosts)
         , field "idle_grace_ms" (number spec.brainIdleGraceMs)
@@ -520,7 +560,7 @@ def cell (spec : CellSpec) : Infra Unit := do
                                 instanceMetadataTags := "disabled" }
       instanceInitiatedShutdownBehavior := "terminate"
       blockDeviceMappings := [{ deviceName := "/dev/xvda"
-                                ebs := some { volumeSize := 30, volumeType := "gp3", encrypted := "true", deleteOnTermination := "true" } }]
+                                ebs := some { volumeSize := spec.hostRootGb, volumeType := "gp3", encrypted := "true", deleteOnTermination := "true" } }]
       tagSpecifications := [{ resourceType := "instance", tags := some (nestTags spec) },
                             { resourceType := "volume", tags := some (nestTags spec) }]
       -- Gzipped: EC2 allows 16 KB of user data before base64, and the script with install.sh inside is

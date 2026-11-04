@@ -111,6 +111,12 @@ example : matchesFamily "c8i" "c8i-flex.large" ∧ !matchesFamily "c8i" "c7i.lar
 launch never fails on `SandboxTypesOnly`. -/
 theorem launch_types_within_iam : use1.launchTypesAllowed = true := by decide
 
+/-- Every type has an on-demand price, and the on-demand order is cheapest first: an on-demand
+sandbox host is `c8i-flex.large` when it has room, never dearer than one that does. -/
+theorem on_demand_types_priced : use1.onDemandPriced = true := by decide
+
+example : use1.onDemandTypes.map (·.toList) = ["c8i-flex.large", "c8i.large", "m8i.large", "c8id.large", "m8id.large", "r8id.large"].map (·.toList)
+    ∧ use1.brainOnDemandTypes.map (·.toList) = ["t3a.medium", "t3.medium"].map (·.toList) := by decide
 /-- Every sandbox type has nested virtualization (Firecracker needs KVM), and the instance-store
 types come first, so FleetDO tries every one of them before an EBS-only type. -/
 theorem launch_types_sound : use1.launchTypesSound = true := by decide
@@ -133,7 +139,7 @@ example : use1.allowsSandboxType "c8id.large" ∧ !use1.allowsSandboxType "c8id.
 /-- On every instance-store type, the per-host cap leaves each sandbox its share of the store:
 placement packs by memory, which on `m8id` and `r8id` would fit 2-4× `c8id`'s sandboxes on the same
 118 GB. -/
-theorem sandboxes_fit_the_instance_store : use1.sandboxesFitStore = true := by decide
+theorem sandboxes_fit_their_disk : use1.sandboxesFitStore = true := by decide
 
 /-- `AWS_CELLS` is JSON keyed by the cell, carrying the stack's template, subnets and proxy root CA
 key and the spec's instance types (the shape control-plane/src/lib/cells.ts parses). -/
@@ -147,6 +153,7 @@ def awsCellsHolds (spec : CellSpec) : Bool :=
         && cell.getObjValAs? String "launch_template_id" == .ok "lt-0abc"
         && cell.getObjValAs? (List String) "subnet_ids" == .ok ["subnet-0a", "subnet-0b"]
         && cell.getObjValAs? (List String) "instance_types" == .ok spec.launchTypes
+        && cell.getObjValAs? (List String) "on_demand_types" == .ok spec.onDemandTypes
         && cell.getObjValAs? Bool "spot" == .ok spec.spot
         && cell.getObjValAs? Nat "max_hosts" == .ok spec.maxHosts
         && cell.getObjValAs? Nat "idle_grace_ms" == .ok spec.idleGraceMs
