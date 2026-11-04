@@ -54,8 +54,12 @@ export function SecretRequestItem({ projectId, item }: { projectId: string; item
       <Prose>{item.purpose}</Prose>
       {item.type === "ci" && (
         <Notice tone="warning" title="In an environment with required reviewers, not the repo">
-          <Text fz="sm">
-            Add {item.name} to an environment whose deployments need a reviewer, and have the job that uses it name that environment. A repository secret is readable by any workflow in the repo, including one a worker pushes. The value goes in GitHub's form, never in a chat.
+          <Text fz="sm" lh="lg">
+            Add {item.name} to an environment whose deployments need a reviewer, and have the job that uses it name that environment. A repository secret is readable by any workflow in the repo, including one a worker pushes. The value goes in GitHub's form, never in a chat.{" "}
+            {/* In the notice's own ink: the theme's link blue fails contrast on its tint. */}
+            <Anchor href="https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment" target="_blank" rel="noreferrer" inherit c="bright" underline="always" lh="lg" data-inline>
+              GitHub: environments
+            </Anchor>
           </Text>
         </Notice>
       )}
@@ -83,13 +87,6 @@ export function SecretRequestItem({ projectId, item }: { projectId: string; item
           {item.type === "ci" ? "Mark added" : "Dismiss"}
         </Button>
       </Toolbar>
-      {item.type === "ci" && (
-        <Text fz="xs" c="dimmed">
-          <Anchor href="https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment" target="_blank" rel="noreferrer" inherit>
-            GitHub: environments with required reviewers
-          </Anchor>
-        </Text>
-      )}
     </Stack>
   );
 }

@@ -46,6 +46,12 @@ body {
     min-height: var(--nest-hit-touch);
   }
 
+  /* A pills field (TagsInput) types in an input of its own inside the field's box: it fills the box's
+     row, so a tap beside its text still lands on it. */
+  .mantine-PillsInputField-field {
+    min-height: calc(var(--nest-hit-touch) - 2px);
+  }
+
   :is(a[href], button.mantine-Anchor-root):not([data-inline], .mantine-Button-root, [data-ds="nav-row"], [data-ds="badge-anchor"], [data-ds="card-title"]),
   button[data-ds="term-line"] {
     --nest-hit-pad: max(0px, calc((var(--nest-hit-touch) - 1lh) / 2));

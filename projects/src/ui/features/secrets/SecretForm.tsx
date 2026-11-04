@@ -3,7 +3,7 @@
 // write-once: it goes to nest when saved and is never shown again; an edit replaces it only through "Set
 // a new value"), the hosts, the format and the roles. Checked as nest and the grant will, before it's sent.
 
-import { Button, Checkbox, PasswordInput, Select, TagsInput, Text, TextInput } from "@mantine/core";
+import { Button, PasswordInput, Select, Switch, TagsInput, Text, TextInput } from "@mantine/core";
 import { useState } from "react";
 import { envName, SECRET_PRESETS, type SecretGrant, type SecretLocation, secretProblems, type SecretRole, valueProblem } from "../../../secrets";
 import { ApiError } from "../../api/client";
@@ -165,13 +165,13 @@ export function SecretForm({ projectId, grant, editing, initial, takenEnv = [], 
         />
         <Select label="Sent as" data={FORMATS} value={format} onChange={(v) => v && setFormat(v as Format)} allowDeselect={false} />
         {format === "header" && <TextInput label="Header name" value={header} onChange={(e) => setHeader(e.currentTarget.value)} placeholder="X-Api-Key" error={shown("locations")} />}
-        <Checkbox.Group label="Given to" description="Live agents of these roles, reviewers included, get it in a moment; new ones when they start." value={roles} onChange={(v) => setRoles(v as SecretRole[])} error={shown("roles")}>
+        <Switch.Group label="Given to" description="Live agents of these roles, reviewers included, get it in a moment; new ones when they start." value={roles} onChange={(v) => setRoles(v as SecretRole[])} error={shown("roles")}>
           <Stack gap="xs">
             {ROLES.map((r) => (
-              <Checkbox key={r.value} value={r.value} label={r.label} />
+              <Switch key={r.value} value={r.value} label={r.label} />
             ))}
           </Stack>
-        </Checkbox.Group>
+        </Switch.Group>
         {save.isError && !Object.keys(server).length && (
           <Notice tone="danger" title="It wasn't saved">
             {save.error.message}
