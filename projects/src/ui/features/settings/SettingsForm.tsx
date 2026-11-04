@@ -85,7 +85,6 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
               </FieldGroup>
             </Section>
           </Panel>
-          <LiveWorkers projectId={projectId} saved={settings.workers_edit_workflows === true} />
         </SectionGrid>
         <Toolbar>
           {onDone && (
@@ -97,6 +96,8 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
             Save settings
           </Button>
         </Toolbar>
+        {/* After Save: what's live, not part of what's edited. */}
+        <LiveWorkers projectId={projectId} saved={settings.workers_edit_workflows === true} />
       </Stack>
     </form>
   );
@@ -207,18 +208,20 @@ function LiveWorkers({ projectId, saved }: { projectId: string; saved: boolean }
   const can = new Set(secrets.data?.workflow_workers ?? []);
   const allowed = secrets.data?.grant?.workflows !== false;
   if (!workers.length) return null;
+  // A token that disagrees with the saved setting is out of date, whatever its layer's last state: never Applied.
+  const shown = workers.map((a) => (can.has(a.agent) !== saved && a.state === "applied" ? { ...a, state: "pending" as const } : a));
   return (
     <Panel data-slot="live-workers">
       <Section title="Live workers" order={4} count={workers.length} region={false}>
         <LiveAgents
           framed={false}
-          agents={workers}
+          agents={shown}
           label="Live workers' push tokens"
           empty=""
           detail={(a) => {
             const has = can.has(a.agent);
             if (has === saved) return <span data-slot="workflows" data-matches="true">{has ? "Its pushes may change workflows" : "Its pushes may not change workflows"}</span>;
-            const why = a.state !== "applied" ? "until its layer applies" : saved && !allowed ? "the grant doesn't allow it" : "until its layer applies again";
+            const why = saved && !allowed ? "the grant doesn't allow it" : "until its layer applies";
             return (
               <Text component="span" fz="xs" c="warning" data-slot="workflows" data-matches="false">
                 {has ? "Still may change workflows" : "Can't change workflows yet"} · {why}

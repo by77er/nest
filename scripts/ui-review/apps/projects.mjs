@@ -262,11 +262,11 @@ const longerTitles = (p, fixture) =>
 /**
  * Settings' live workers (README.md#secrets): an Applied row never contradicts the saved "Workers may
  * change CI workflows" toggle (the form not edited, its switch is what's saved); one that differs is
- * marked as such, and isn't Applied unless it names why. Self-contained (it runs in the selftest too).
+ * marked as such, and shown Pending. Fails without the toggle on the page. Self-contained (it runs in the selftest too).
  */
 export function workflowsAgree() {
   const sw = [...document.querySelectorAll('input[role="switch"], input[type="checkbox"]')].find((i) => i.closest("label, .mantine-Switch-root")?.textContent?.includes("Workers may change CI workflows"));
-  if (!sw) return [];
+  if (!sw) return ["the \"Workers may change CI workflows\" toggle isn't on the page"];
   const saved = sw.checked;
   const out = [];
   for (const row of document.querySelectorAll('[aria-label="Live workers\' push tokens"] [data-agent]')) {
@@ -275,7 +275,7 @@ export function workflowsAgree() {
     const text = line?.textContent ?? "";
     const has = /^Still may|^Its pushes may change/.test(text);
     if (!line) out.push(`${row.getAttribute("data-agent")}: no line on its workflows`);
-    else if (state === "applied" && has !== saved && !/grant doesn't allow/.test(text)) out.push(`${row.getAttribute("data-agent")}: Applied, "${text}", with the toggle saved ${saved ? "on" : "off"}`);
+    else if (state === "applied" && has !== saved) out.push(`${row.getAttribute("data-agent")}: Applied, "${text}", with the toggle saved ${saved ? "on" : "off"}`);
     else if (has !== saved && line.getAttribute("data-matches") !== "false") out.push(`${row.getAttribute("data-agent")}: "${text}" differs from the saved toggle without saying so`);
     else if (has === saved && line.getAttribute("data-matches") === "false") out.push(`${row.getAttribute("data-agent")}: "${text}" says it differs from the saved toggle, which it agrees with`);
   }

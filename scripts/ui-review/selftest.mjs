@@ -319,6 +319,7 @@ for (const remount of [false, true]) {
   for (const [plant, html] of [
     ["an Applied row that contradicts the toggle", workers(false, [["agt_1", "Applied", "Still may change workflows · until its layer applies", false]])],
     ["a differing row that doesn't say so", workers(true, [["agt_1", "Pending", "Its pushes may not change workflows", true]])],
+    ["no toggle on the page", `<div role="list" aria-label="Live workers' push tokens"></div>`],
     ["an agreeing row that says it differs", workers(false, [["agt_1", "Applied", "Can't change workflows yet · until its layer applies again", false]])],
   ]) assert.notDeepEqual(await at(html, "", workflowsAgree), [], `workflows: ${plant} must fail`);
   await page2.close();
