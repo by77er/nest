@@ -2,7 +2,7 @@
 //! every violated property. A spec is a FleetDO variant with optional bounds:
 //! `fixed`, `main`, `no-baseline`, `late-capture`, `volatile-capture`, `broker-quiet`, then any of
 //! `,cmds=N`, `,drops=N`, `,restarts=N`, `,resets=N`, `,broker=N`, `,secrets=0`.
-//! Example: `fixed,cmds=2,drops=1`. `lease[,...]` and `sentinel[,async][,trust-running][,keep-on-begin][,writes=N]
+//! Example: `fixed,cmds=2,drops=1`. `lease[,...]` and `sentinel[,async][,trust-running][,keep-on-begin][,stale-records][,writes=N]
 //! [,commits=N][,restarts=N]` check the lease and the unchanged-disk short-circuit.
 
 use nestd_check::fleet::{Config, FleetModel, describe};
@@ -52,6 +52,7 @@ fn main() {
                     None if p == "async" => cfg.async_engine = true,
                     None if p == "trust-running" => cfg.trust_running = true,
                     None if p == "keep-on-begin" => cfg.keep_on_begin = true,
+                    None if p == "stale-records" => cfg.stale_records = true,
                     Some(("writes", v)) => cfg.max_writes = v.parse().expect("a number"),
                     Some(("commits", v)) => cfg.max_commits = v.parse().expect("a number"),
                     Some(("restarts", v)) => cfg.max_restarts = v.parse().expect("a number"),

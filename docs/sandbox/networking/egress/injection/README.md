@@ -68,3 +68,4 @@ stripe-read:
   - `GITHUB_TOKEN=nest-ph-github` (in `/etc/environment`, which init exports into nest-guest's environment), and `gh`
 
   So `git push` over HTTPS and `gh` work without a real token in the sandbox. The placeholder is fixed in the image, not per sandbox: it is worthless outside nest-proxy, which refuses it to any other host. A test keeps it in step with the constructor's.
+- **Nothing in a sandbox's or agent's `env` may take that over:** the names `gh` and git would prefer to the image's (`GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GIT_ASKPASS`, every `GIT_CONFIG*`) are reserved with `GITHUB_TOKEN`, for every client ([environment](../../../../control-plane/api/clients/#environment)).

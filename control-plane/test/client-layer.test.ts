@@ -28,13 +28,17 @@ describe("client egress rules and env (pure)", () => {
   it("env names are uppercase and never nest's or the guest's own; a placeholder must be one bound beside it", () => {
     for (const ok of ["API_TOKEN", "_X", "A1"]) expect(EnvName.safeParse(ok).success, ok).toBe(true);
     for (const bad of ["PATH", "HOME", "NEST_AGENT_ID", "NEST_ANYTHING", "HTTPS_PROXY", "GITHUB_TOKEN", "LD_PRELOAD", "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE",
-      "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", "lower", "1A", "A-B", ""]) {
+      "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", ...GITHUB_TAKEOVER, "lower", "1A", "A-B", ""]) {
       expect(EnvName.safeParse(bad).success, bad).toBe(false);
     }
     expect(unboundPlaceholders({ A: "nest-ph.cli_x.api.", B: "literal" }, ["nest-ph.cli_x.api."])).toEqual([]);
     expect(unboundPlaceholders({ A: "Bearer nest-ph.cli_y.api." }, ["nest-ph.cli_x.api."])).toEqual(["env A: a placeholder no binding here has"]);
   });
 });
+
+/** Env names that would take a sandbox's GitHub access over (`gh` prefers `GH_TOKEN`; git config from the env). */
+const GITHUB_TAKEOVER = ["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GIT_ASKPASS", "GIT_CONFIG", "GIT_CONFIG_COUNT",
+  "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"];
 
 async function as(token: string, path: string, init: { method?: string; body?: unknown } = {}) {
   const res = await SELF.fetch(`${BASE}${path}`, {
@@ -271,6 +275,20 @@ describe("the live client layer: bindings and environment", () => {
     expect(JSON.stringify(cmds.find((x) => x.type === "secrets_update")!.secrets)).not.toContain(value);
     expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`)).inject.map((b: any) => b.name)).not.toContain("client:stripe");
     expect((await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { inject: [{ ...stripe, hosts: ["evil.net"] }] } })).status).toBe(403);
+  });
+
+  it("no client env takes the sandbox's GitHub access over: GH_TOKEN and its kin are refused on create and on the live client policy", async () => {
+    const c = await newClient();
+    const s = await placed(c);
+    for (const name of GITHUB_TAKEOVER) {
+      const create = await as(c.token, "/v1/sandboxes", { body: { cell: c.cell, env: { [name]: "anything" } } });
+      expect(create.status, `create ${name}`).toBe(400);
+      expect(create.body.error.message, name).toContain("nest's or the guest's own");
+      const live = await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { [name]: "anything" } } });
+      expect(live.status, `client-policy ${name}`).toBe(400);
+    }
+    // A name beside them still goes through.
+    await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { GH_REPO: "by77er/nest" } } });
   });
 
   it("env reaches each attached agent's slot: the sandbox's and the agent's, placeholders bound beside it, never a secret's value", async () => {

@@ -4,7 +4,7 @@ import { Badge, type BadgeProps, Button, Collapse, SimpleGrid } from "@mantine/c
 import { useDisclosure, useMediaQuery } from "@mantine/hooks";
 import { IconChevronDown, IconChevronUp } from "@tabler/icons-react";
 import { icon } from "../theme";
-import { type AnchorHTMLAttributes, forwardRef, type ReactNode } from "react";
+import { type AnchorHTMLAttributes, forwardRef, type ReactNode, useLayoutEffect, useRef } from "react";
 import classes from "./Layouts.module.css";
 
 export function ColumnGrid({ children, columns }: { children: ReactNode; columns: number }) {
@@ -33,6 +33,22 @@ export function CardGrid({ children }: { children: ReactNode }) {
 export function WithContext({ children, context, contextLabel, measure }: { children: ReactNode; context: ReactNode; contextLabel: string; measure: "reading" | "form" }) {
   const wide = useMediaQuery("(min-width: 75em)") ?? true;
   const [open, { toggle }] = useDisclosure(false);
+  // The context column is capped by the viewport, never by its content's neighbour: as tall as it is up
+  // to the viewport's bottom (less the page's bottom padding), then it scrolls in itself.
+  const aside = useRef<HTMLElement>(null);
+  useLayoutEffect(() => {
+    const el = aside.current;
+    if (!el) return;
+    const fit = () => {
+      const top = el.getBoundingClientRect().top + window.scrollY;
+      const page = el.closest("[data-ds=page]");
+      const pad = page ? parseFloat(getComputedStyle(page).paddingBottom) || 0 : 0;
+      el.style.maxHeight = `${Math.max(192, Math.floor(window.innerHeight - top - pad))}px`;
+    };
+    fit();
+    window.addEventListener("resize", fit);
+    return () => window.removeEventListener("resize", fit);
+  }, [wide]);
   return (
     <div className={classes.withContext} data-ds="with-context" data-main={measure}>
       {!wide && (
@@ -49,7 +65,7 @@ export function WithContext({ children, context, contextLabel, measure }: { chil
         {children}
       </div>
       {wide && (
-        <aside className={classes.context} aria-label={contextLabel} data-slot="context">
+        <aside ref={aside} className={classes.context} aria-label={contextLabel} data-slot="context">
           {context}
         </aside>
       )}

@@ -467,12 +467,18 @@ impl ObjectStore for S3Store {
         self.remembered(&format!("chunks/{hex}"))
     }
     fn put_chunk(&self, hex: &str, data: &[u8]) -> io::Result<()> {
+        // Not cached: a committed chunk is still on this host's disk (and, after a reflink cut, in
+        // its cut), so caching it only doubled the commit's local writes. A same-host fork's pass
+        // keeps its chunks (`keep_local`); restores cache what they fetch.
         let key = format!("chunks/{hex}");
         self.put(&key, data)?;
         self.uploaded_now(&key);
-        self.cache.put_chunk(hex, data)?;
-        self.cached(data.len());
         Ok(())
+    }
+    fn keep_local(&self, hex: &str, data: &[u8]) {
+        if self.cache.put_chunk(hex, data).is_ok() {
+            self.cached(data.len());
+        }
     }
     fn get_chunk(&self, hex: &str) -> io::Result<Vec<u8>> {
         if let Ok(d) = self.cache.get_chunk(hex) {
@@ -1018,14 +1024,19 @@ pub(crate) mod tests {
             let s = store_with(&url, &cache2, S3Options { parallelism: 1, cache_max_bytes: 1000, ..S3Options::default() });
             let chunk = |i: u32| vec![i as u8 + 1; 300];
             let hex = |i: u32| blake3::hash(&chunk(i)).to_hex().to_string();
+            // Committed and kept (a same-host fork's pass): a plain commit no longer caches.
+            s.put_chunk(&hex(9), &chunk(9)).unwrap();
+            assert!(!cache2.join("chunks").join(hex(9)).exists(), "a committed chunk isn't cached");
             for i in 0..3 {
                 s.put_chunk(&hex(i), &chunk(i)).unwrap();
+                s.keep_local(&hex(i), &chunk(i));
                 std::thread::sleep(Duration::from_millis(15));
             }
             // Use chunk 0 again, so chunk 1 is now the least recently used.
             s.get_chunk(&hex(0)).unwrap();
             std::thread::sleep(Duration::from_millis(15));
-            s.put_chunk(&hex(3), &chunk(3)).unwrap(); // 1200 bytes > 1000: trim to <= 800
+            s.put_chunk(&hex(3), &chunk(3)).unwrap();
+            s.keep_local(&hex(3), &chunk(3)); // 1200 bytes > 1000: trim to <= 800
             let cached = |i: u32| cache2.join("chunks").join(hex(i)).exists();
             assert!(!cached(1), "the least recently used chunk goes first");
             assert!(cached(3), "the newest chunk stays");

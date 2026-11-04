@@ -18,6 +18,14 @@ function twoProjects() {
 }
 
 describe("the switcher", () => {
+  it("outside a project, asks for no chat (the unread count is a project's)", async () => {
+    const api = new FakeApi();
+    renderApp("/projects", api);
+    await screen.findByRole("heading", { level: 1 });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(api.reads.filter((p) => p.includes("/chat"))).toEqual([]);
+  });
+
   it("names the current project, and reads All projects on the list", async () => {
     const api = twoProjects();
     const first = renderApp("/projects/prj_one/reviews", api);

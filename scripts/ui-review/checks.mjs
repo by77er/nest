@@ -223,14 +223,20 @@ export function measure(sel) {
     // every way b can be clipped or not (per axis, a clip margin, a fixed or absolute escape, clip-path,
     // contain), so no CSS is reasoned about here.
     const probe = document.createElement("style");
-    probe.textContent = "[data-hit-probe], [data-hit-probe]::before, [data-hit-probe]::after { pointer-events: none !important; }";
+    // a, its pseudo-elements, and everything inside it (a child with pointer-events: auto would still
+    // catch the probe).
+    probe.textContent = "[data-hit-probe], [data-hit-probe]::before, [data-hit-probe]::after, [data-hit-probe] *, [data-hit-probe] *::before, [data-hit-probe] *::after { pointer-events: none !important; }";
     document.head.append(probe);
     const underIs = (a, b, x, y) => {
       a.setAttribute("data-hit-probe", "");
-      const under = document.elementFromPoint(x, y);
-      a.removeAttribute("data-hit-probe");
-      return !!under && (under === b || b.contains(under));
+      try {
+        const under = document.elementFromPoint(x, y);
+        return !!under && (under === b || b.contains(under));
+      } finally {
+        a.removeAttribute("data-hit-probe");
+      }
     };
+    try {
     const boxes = controls.map(hitBox);
     for (let i = 0; i < controls.length; i++) {
       const a = controls[i];
@@ -259,7 +265,9 @@ export function measure(sel) {
         if (found) problems["hit-overlap"].push(`a tap on ${label(b)} at ${found[0]},${found[1]} lands on ${label(a)}`);
       }
     }
-    probe.remove();
+    } finally {
+      probe.remove();
+    }
   }
 
   // --- user content (Markdown, SVG) can't change the page's outline, hierarchy or ground ---

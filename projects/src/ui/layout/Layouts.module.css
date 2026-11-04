@@ -72,9 +72,13 @@
     --nest-with-context-main: var(--nest-measure);
   }
 
+  /* The context is capped by the viewport (WithContext sets its max-height to the viewport's bottom),
+     never by the content beside it, and scrolls in itself past that. */
   .context {
     position: sticky;
     top: var(--mantine-spacing-xl);
+    overflow-y: auto;
+    overscroll-behavior: contain;
   }
 }
 

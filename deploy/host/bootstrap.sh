@@ -45,10 +45,56 @@ EOF
   exit 0
 fi
 
+# Sandbox state on the instance-store NVMe, where the instance type has one (c8id): formatted XFS
+# with reflink at first boot (fstab mounts it again after a reboot; a stop wipes it, as the root
+# volume's sandbox state dies with a spot host anyway). A checkpoint then cuts a disk with a reflink
+# in a brief pause; without one, nestd says so at start and pauses VMs for whole reads
+# (docs/sandbox/state/disk/). The kernel, base images and the jailer's chroots go there too: the
+# jailer hard-links them next to each disk, which only works within one filesystem.
+DATA=/var/lib/nest/data
+STATE_DIR=/var/lib/nest
+KERNEL_DIR=/var/lib/nest/kernel
+IMAGES_DIR=/var/lib/nest/images
+JAILER_BASE=/srv/jailer
+NVME=$(lsblk -dpno NAME,MODEL 2>/dev/null | awk '/Amazon EC2 NVMe Instance Storage/ {print $1; exit}')
+# Any step failing (an AMI without xfsprogs, a disk that won't format or mount) leaves the state on the
+# root volume: the host still comes up.
+instance_store() {
+  if ! command -v mkfs.xfs >/dev/null || ! command -v xfs_info >/dev/null; then echo "no mkfs.xfs or xfs_info"; return 1; fi
+  blkid -o value -s TYPE "$NVME" 2>/dev/null | grep -qx xfs || mkfs.xfs -q -f -m reflink=1 -L nest-data "$NVME" || return 1
+  install -d -m 0755 "$DATA" || return 1
+  # `nofail` so a boot without it still comes up, and a short device timeout: a store left blank by
+  # a stop and start never shows its label. The units that use it require it (below).
+  grep -q '^LABEL=nest-data ' /etc/fstab 2>/dev/null || echo "LABEL=nest-data $DATA xfs defaults,noatime,nofail,x-systemd.device-timeout=10s 0 2" >> /etc/fstab || return 1
+  mountpoint -q "$DATA" || mount "$DATA" || return 1
+  xfs_info "$DATA" 2>/dev/null | grep -q 'reflink=1' || { echo "the instance store at $DATA has no reflink"; return 1; }
+}
+if [ -n "$NVME" ]; then
+  if instance_store; then
+    STATE_DIR=$DATA/state KERNEL_DIR=$DATA/kernel IMAGES_DIR=$DATA/images JAILER_BASE=$DATA/jailer
+    install -d -m 0755 "$STATE_DIR" "$KERNEL_DIR" "$IMAGES_DIR" "$JAILER_BASE"
+    if [ -f /var/lib/nest/kernel/vmlinux ] && [ ! -f "$KERNEL_DIR/vmlinux" ]; then cp /var/lib/nest/kernel/vmlinux "$KERNEL_DIR/vmlinux"; fi
+    # After a reboot nestd must not start before the store is mounted (it would write into the bare
+    # directory the mount then hides), and after a stop and start (the store comes back blank, and
+    # user data doesn't run again) it must not start at all: the host fails loudly and never
+    # enrolls, and nestd refuses to start without its kernel and images besides.
+    for unit in nestd.service nest-proxy.service nest-gateway.service; do
+      install -d -m 0755 "/etc/systemd/system/$unit.d"
+      printf '[Unit]\nRequiresMountsFor=%s\n' "$DATA" > "/etc/systemd/system/$unit.d/instance-store.conf"
+    done
+    systemctl daemon-reload
+    echo "sandbox state on the instance store at $DATA (XFS, reflink)"
+  else
+    echo "the instance store isn't usable: sandbox state stays on the root volume, and checkpoints pause VMs for whole reads"
+  fi
+else
+  echo "no instance store: sandbox state stays on the root volume, and checkpoints pause VMs for whole reads"
+fi
+
 # Sandboxes run in Firecracker when the instance has KVM (nested virtualization, set in the launch
 # template); otherwise in the process driver, so a host never comes up unusable.
 if [ -e /dev/kvm ] && [ -x /opt/nest/bin/firecracker ]; then
-  BASE=/var/lib/nest/images/nest-base:latest.ext4
+  BASE=$IMAGES_DIR/nest-base:latest.ext4
   [ -f "$BASE" ] || { zstd -q -d -f /var/lib/nest/images/nest-base.ext4.zst -o "$BASE.tmp" && mv "$BASE.tmp" "$BASE"; }
   # Guest memory is regular pages, demand-paged and overcommitted: a guest costs what it touches,
   # and the control plane packs by MemAvailable (docs/sandbox/state/memory/). No hugepage pool:
@@ -58,8 +104,8 @@ if [ -e /dev/kvm ] && [ -x /opt/nest/bin/firecracker ]; then
   rm -f /etc/sysctl.d/90-nest-hugepages.conf
   sysctl -q -w vm.nr_hugepages=0 || true
   DRIVER='{"type": "firecracker", "firecracker_bin": "/opt/nest/bin/firecracker", "jailer_bin": "/opt/nest/bin/jailer",
-    "jailer": {"uid": 900, "gid": 900, "chroot_base_dir": "/srv/jailer"},
-    "kernel_image": "/var/lib/nest/kernel/vmlinux", "images_dir": "/var/lib/nest/images", "huge_pages": false}'
+    "jailer": {"uid": 900, "gid": 900, "chroot_base_dir": "'"$JAILER_BASE"'"},
+    "kernel_image": "'"$KERNEL_DIR"'/vmlinux", "images_dir": "'"$IMAGES_DIR"'", "huge_pages": false}'
 else
   echo "no /dev/kvm (or no firecracker in the release): using the process driver"
   DRIVER='{"type": "process", "guest_command": ["/opt/nest/bin/nest-guest", "--state-dir", "/var/lib/nest/guest",
@@ -84,6 +130,7 @@ cat >/etc/nest/nestd.json <<EOF
   "cell": "$CELL",
   "control_url": "$CONTROL_URL",
   "enrollment": {"type": "aws_imds"},
+  "state_dir": "$STATE_DIR",
   "driver": $DRIVER,
   "sockets": $SOCKETS,
   "network": {"type": "netns", "persist_dir": "/run/nest/netns"},

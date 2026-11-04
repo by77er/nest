@@ -86,3 +86,130 @@
   min-width: 0;
   overflow-wrap: anywhere;
 }
+
+/* An assistant's Markdown on the terminal (TermProse), as Claude Code prints it: one mono size; headings
+   and bold by weight; inline code in the primary role's text shade; a fence verbatim behind a left rule,
+   scrolling sideways in itself; lists with hanging indents; a quote behind a rule, muted; a table as a
+   mono grid in hairlines, scrolling in its own frame; a rule as a hairline. Blocks a half-line apart. */
+.md {
+  white-space: normal;
+  min-width: 0;
+}
+
+/* On touch, a paragraph or item that holds a link is on 24 px lines, so the link is an inline target of
+   WCAG 2.5.8's size (the touch rule's running-text exception keeps it on its line). Everything else, a
+   fence and a table included, keeps the terminal's 20 px pitch. */
+@media (pointer: coarse) {
+  .md :is(p, li):has(a) {
+    line-height: var(--mantine-line-height-lg);
+  }
+}
+
+.md :where(p, ul, ol, blockquote, pre, table, hr) {
+  margin: 0;
+}
+
+/* After the reset (same specificity): blocks a half-line apart, a list item's blocks too. */
+.md > * + *,
+.md li > * + * {
+  margin-top: var(--mantine-spacing-sm);
+}
+
+/* A paragraph keeps its line breaks, as the terminal does; long words break anywhere. */
+.md :where(p, [data-md="heading"]) {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.md [data-md="heading"] {
+  font-weight: 700;
+}
+
+.md :where(strong) {
+  font-weight: 700;
+}
+
+.md :where(ul, ol) {
+  padding-left: 3ch;
+}
+
+.md li + li,
+.md li > :where(ul, ol) {
+  margin-top: var(--mantine-spacing-2xs);
+}
+
+.md li::marker {
+  color: var(--nest-term-muted);
+}
+
+/* A task list's box is text (`[x]`, `[ ]`), in the item's own indent. */
+.md li:has(> [data-md="check"]) {
+  list-style: none;
+}
+
+.md [data-md="check"] {
+  color: var(--nest-term-muted);
+}
+
+.md :not(pre) > code {
+  font: inherit;
+  color: var(--mantine-color-primary-text);
+}
+
+.md pre {
+  font: inherit;
+  padding-left: 2ch;
+  border-left: 1px solid var(--nest-term-rule);
+  white-space: pre;
+  overflow-wrap: normal;
+  overflow-x: auto;
+}
+
+.md pre code {
+  font: inherit;
+}
+
+.md blockquote {
+  padding-left: 2ch;
+  border-left: 2px solid var(--nest-term-rule);
+  color: var(--nest-term-muted);
+}
+
+.md a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
+
+.md [data-md="table"] {
+  overflow-x: auto;
+}
+
+/* A fence and a table frame take the line's width, whatever their content's: their widest line never
+   widens the trace (in a table cell, auto layout would grow the cell to it), it scrolls inside them. */
+.md pre,
+.md [data-md="table"] {
+  contain: inline-size;
+}
+
+.md table {
+  border-collapse: collapse;
+  font: inherit;
+}
+
+.md :where(th, td) {
+  padding: 0 1ch;
+  border: 1px solid var(--nest-term-rule);
+  text-align: left;
+  white-space: pre;
+  overflow-wrap: normal;
+}
+
+.md th {
+  font-weight: 700;
+}
+
+.md hr {
+  border: 0;
+  border-top: 1px solid var(--nest-term-rule);
+}
