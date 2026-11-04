@@ -165,8 +165,27 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "POST tasks/:task/done":
       return done(await p.markDone(task));
-    case "GET chat":
-      return done(await p.chat());
+    case "GET chat": {
+      // `before=<seq>`: the page before it (older messages, as the owner scrolls up); `limit` is capped.
+      const before = url.searchParams.get("before");
+      const limit = url.searchParams.get("limit");
+      if (before !== null && !/^\d{1,15}$/.test(before)) return err(400, "before is a message's seq");
+      if (limit !== null && !/^\d{1,4}$/.test(limit)) return err(400, "limit is a number");
+      return done(await p.chat(limit === null ? undefined : Number(limit), before === null ? undefined : Number(before)));
+    }
+    case "POST manager/interrupt": {
+      // Stop the manager's current turn (nest's owner route; the app owns the agent).
+      const s = await p.getSettings();
+      if (!s.ok) return done(s);
+      if (!s.value.manager) return err(409, "the manager isn't started");
+      const nest = nestFrom(env);
+      if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
+      try {
+        return json(await nest.interrupt(s.value.manager));
+      } catch (e) {
+        return e instanceof NestError ? err(e.status === 404 ? 404 : 502, e.message) : err(502, String(e));
+      }
+    }
     case "POST chat": {
       const b = await body(req, Chat);
       return b.ok ? done(await p.postChat(b.value.text), 201) : b.res;

@@ -39,3 +39,15 @@ window.scrollTo = () => {};
 if (!("fonts" in document)) {
   Object.defineProperty(document, "fonts", { value: { addEventListener: () => {}, removeEventListener: () => {}, ready: Promise.resolve() } });
 }
+
+// ProseMirror (the description editor) measures the selection to scroll it into view and to place the
+// cursor: jsdom lays nothing out, so every rect is empty.
+const noRects = () => Object.assign([] as DOMRect[], { item: () => null }) as unknown as DOMRectList;
+Range.prototype.getClientRects ??= noRects;
+Range.prototype.getBoundingClientRect ??= () => new DOMRect();
+(Text.prototype as unknown as { getClientRects?: () => DOMRectList }).getClientRects ??= noRects;
+document.elementFromPoint ??= () => null;
+// jsdom has no ClipboardEvent, which ProseMirror's paste makes.
+globalThis.ClipboardEvent ??= class extends Event {
+  clipboardData = null;
+} as unknown as typeof ClipboardEvent;

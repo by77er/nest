@@ -62,7 +62,9 @@ export const api = {
   cancelTask: (id: string, task: string, b: CancelBody) => call<Task>("POST", `${tsk(id, task)}/cancel`, b),
   markDone: (id: string, task: string) => call<Task>("POST", `${tsk(id, task)}/done`),
 
-  chat: (id: string) => call<ChatMessage[]>("GET", `${prj(id)}/chat`),
+  /** The latest page, or the page before `before` (a seq): oldest first. */
+  chat: (id: string, before?: number) => call<ChatMessage[]>("GET", `${prj(id)}/chat${before === undefined ? "" : `?before=${before}`}`),
+  interruptManager: (id: string) => call<unknown>("POST", `${prj(id)}/manager/interrupt`),
   postChat: (id: string, b: ChatBody) => call<{ seq: number; delivered: boolean }>("POST", `${prj(id)}/chat`, b),
   asks: (id: string) => call<Ask[]>("GET", `${prj(id)}/asks`),
   attention: (id: string) => call<Attention[]>("GET", `${prj(id)}/attention`),

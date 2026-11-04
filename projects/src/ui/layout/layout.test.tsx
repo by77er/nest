@@ -8,7 +8,7 @@ import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { cssVariablesResolver, motion, theme } from "../theme";
-import { AppFrame, ErrorState, FieldGroup, LoadingState, Measure, NavGroup, NavGroups, NavRow, Page, PageHeader, Panel, PinnedFooter, Section, SectionGrid, Toolbar, WithContext } from ".";
+import { AppFrame, ErrorState, FieldGroup, LoadingState, Measure, NavGroup, NavGroups, NavRow, Page, PageHeader, Panel, Section, SectionGrid, Toolbar, WithContext } from ".";
 
 const wrap = (ui: ReactNode) => render(<MantineProvider theme={theme} cssVariablesResolver={cssVariablesResolver} env="test">{ui}</MantineProvider>);
 /** Whether `a` comes before `b` in the document. */
@@ -158,14 +158,12 @@ describe("AppFrame", () => {
   });
 });
 
-describe("Page, Measure and PinnedFooter", () => {
-  it("the page has one frame, no measure of its own; a Measure is left-aligned in it; a pinned footer sticks", () => {
+describe("Page and Measure", () => {
+  it("the page has one frame, no measure of its own; a Measure is left-aligned in it", () => {
     wrap(
       <Page>
         <Measure type="reading">
-          <PinnedFooter>
-            <button>Send</button>
-          </PinnedFooter>
+          <button>Send</button>
         </Measure>
       </Page>,
     );
@@ -175,9 +173,6 @@ describe("Page, Measure and PinnedFooter", () => {
     expect(style(measure)).toContain("var(--nest-reading-measure)");
     // On the frame's left edge: never centred, so switching views never moves an edge.
     expect(style(measure)).not.toMatch(/margin-(inline|left|right):\s*auto/);
-    const footer = screen.getByRole("button", { name: "Send" }).closest("[data-ds=pinned-footer]")!;
-    expect(style(footer)).toMatch(/position:\s*sticky/);
-    expect(style(footer)).toMatch(/bottom:\s*0/);
   });
 });
 

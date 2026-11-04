@@ -5,8 +5,10 @@ import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+/** The task drawer (titled with its task's title). */
+const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
 
-const drawer = () => screen.getByRole("dialog", { name: "Task" });
+const drawer = () => screen.getByRole("dialog", SHEET);
 
 describe("creating a task", () => {
   it("checks the title, sends it as a draft, and shows the card in Draft", async () => {
@@ -15,13 +17,13 @@ describe("creating a task", () => {
 
     await user.click(await screen.findByRole("button", { name: "Create a task" }));
     const dialog = screen.getByRole("dialog", { name: "New task" });
-    await user.click(within(dialog).getByRole("button", { name: "Create task" }));
+    await user.click(await within(dialog).findByRole("button", { name: "Create task" }));
     // The Worker's own schema refuses an empty title: nothing is sent.
     expect(within(dialog).getByLabelText(/Title/)).toHaveAttribute("aria-invalid", "true");
     expect(api.writes).toEqual([]);
 
     await user.type(within(dialog).getByLabelText(/Title/), "  Add a widget  ");
-    await user.type(within(dialog).getByLabelText(/Details/), "Make it blue");
+    await user.type(within(dialog).getByRole("textbox", { name: "Details" }), "Make it blue");
     await user.click(within(dialog).getByRole("button", { name: "Create task" }));
 
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "New task" })).toBeNull());
@@ -100,7 +102,7 @@ describe("the task drawer", () => {
     await waitFor(() => expect(within(d).getByText("Cancelled")).toBeInTheDocument());
     // A cancelled task is finished: no more actions, and its text is read-only.
     expect(within(d).queryByRole("button", { name: "Cancel task" })).toBeNull();
-    expect(within(d).getByLabelText(/Title/)).toHaveAttribute("readonly");
+    expect(within(d).queryByRole("button", { name: /^Edit/ })).toBeNull();
   });
 
   it("offers no Mark done for a task with an open PR or a running worker: those wait for the merge, or are cancelled", async () => {

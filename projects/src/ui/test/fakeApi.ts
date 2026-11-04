@@ -53,6 +53,11 @@ export class FakeApi {
   openPrs: OpenPr[] = [];
   manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
   readonly writes: Write[] = [];
+  /** Every GET's path, in order. */
+  readonly reads: string[] = [];
+  /** The request being answered (its query string). */
+  private url: URL | null = null;
+  interrupted = 0;
   /** Answers to give instead, by `METHOD path` pattern, once each. */
   readonly failures: { match: RegExp; status: number; error: string }[] = [];
 
@@ -69,12 +74,14 @@ export class FakeApi {
     const method = (init?.method ?? "GET").toUpperCase();
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     if (method !== "GET") this.writes.push({ method, path: url.pathname, body });
+    else this.reads.push(url.pathname);
     for (const h of this.holds) if (h.match.test(`${method} ${url.pathname}`)) await h.until;
     const f = this.failures.findIndex((x) => x.match.test(`${method} ${url.pathname}`));
     if (f >= 0) {
       const [x] = this.failures.splice(f, 1);
       return json({ error: x!.error }, x!.status);
     }
+    this.url = url;
     return this.route(method, url.pathname.replace(/^\/api/, "").split("/").filter(Boolean), body);
   };
 
@@ -141,8 +148,15 @@ export class FakeApi {
         return json(this.reviews);
       case "GET prs/open":
         return json(this.openPrs);
-      case "GET chat":
-        return json(this.chat);
+      case "GET chat": {
+        // Pages as the Worker answers them: the latest 50, or the 50 before `before`.
+        const before = this.url?.searchParams.get("before");
+        const rows = before ? this.chat.filter((m) => m.seq < Number(before)) : this.chat;
+        return json(rows.slice(-50));
+      }
+      case "POST manager/interrupt":
+        this.interrupted += 1;
+        return json({ interrupted: "turn" });
       case "POST chat": {
         const c: ChatMessage = { seq: this.chat.length + 1, at_ms: now, sender: "owner", text: body.text, delivered: true, error: null };
         this.chat.push(c);

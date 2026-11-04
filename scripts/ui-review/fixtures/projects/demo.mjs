@@ -4,14 +4,16 @@
 // (a task waiting on two of three, one waited on by two, one whose blockers are all done).
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
-// message with every kind of rich content), "chat-empty" or "chat-long" (thirty messages). Traces come
-// from trace.mjs: history pages plus a live ring.
+// message with every kind of rich content), "chat-empty", "chat-long" (thirty messages), "chat-paged"
+// (120, paged by `before`) or "chat-arriving" (a reply lands a few seconds in). Traces come from
+// trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
 import { trace } from "./trace.mjs";
 
 const DAY = 86_400_000;
 
 export function data(variant = "demo", now = Date.now()) {
+  const born = Date.now();
   const long = variant === "long";
   const name = long ? "Gadgets platform: the customer-facing catalogue, its search and the export pipeline" : "Gadgets";
   const repo = long ? "by77er/gadgets-platform-customer-facing-catalogue-and-search" : "by77er/gadgets";
@@ -21,6 +23,16 @@ export function data(variant = "demo", now = Date.now()) {
     files: ["src/thumbs/cache.ts", "src/routes/gadgets.ts"],
     test_plan: "Unit tests for the purge; a load test against staging.",
   };
+  // A description as the manager writes one (Markdown): a heading, nested and task lists, code, a link,
+  // and a table, which the editor keeps as written.
+  const SEARCH_BODY = [
+    "Owners filter the gadget list by tag today by scrolling. Add a tag search to the list's filter bar, backed by an index, so a search answers in under 100 ms on the staging data.",
+    "## Scope",
+    "1. An index of tags per gadget\n   - rebuilt on each gadget write\n   - backfilled once for existing gadgets\n2. The query parser: `tag:outdoor tag:waterproof`, with `-tag:` to exclude\n3. Suggestions in the filter bar as you type",
+    "- [x] Agree the query syntax with design\n- [ ] Load test against staging\n- [ ] Note the new endpoint in the [API docs](https://docs.example.com/api)",
+    "```ts\nGET /api/gadgets?tag=outdoor&tag=waterproof&limit=200\n```",
+    "| Endpoint | p95 now | Target |\n|---|---|---|\n| `/api/gadgets?tag=` | 840 ms | 100 ms |",
+  ].join("\n\n");
   let i = 0;
   const t = (title, state, o = {}) => ({ id: `tsk_demo${++i}`, title, body: "", spec: state === "draft" ? null : spec, state, ord: i, assignee: null, pr: null, start_error: null, tainted: false, blocked: null, prs: [], blocked_by: [], blocks: [], waiting_on: [], created_ms: now - 7_200_000, updated_ms: now - 600_000, ...o });
   const tasks = [
@@ -30,7 +42,7 @@ export function data(variant = "demo", now = Date.now()) {
     t("Export gadgets as CSV", "ready"),
     t(long ? "Fix the flaky upload test that fails only when the fixture bucket is in another region_and_named_without_any_spaces_at_all" : "Fix the flaky upload test", "in_progress", { assignee: "agt_w3f9q1" }),
     t("Paginate the gadget list", "assigned"),
-    t("Add search by tag", "in_review", { assignee: "agt_w8x2m4", pr: 118, tainted: true }),
+    t("Add search by tag", "in_review", { assignee: "agt_w8x2m4", pr: 118, tainted: true, body: SEARCH_BODY }),
     t("Migrate to the new auth library", "stalled", { assignee: "agt_w1k7c2", start_error: "nest refused the worker: max_agents reached (403)" }),
     t("Write the 0.5 changelog", "done", { pr: 112 }),
     t("Drop the legacy XML export", "cancelled"),
@@ -139,19 +151,37 @@ export function data(variant = "demo", now = Date.now()) {
     "> The staging data has 40k gadgets; p95 is 180 ms today.",
     "See the [Postgres GIN docs](https://www.postgresql.org/docs/current/gin.html) and the mock-up: ![search mock-up](https://example.com/mockup.png)",
   ].join("\n\n");
+  function chatLong() {
+    const out = [];
+    for (let k = 0; k < 30; k++) {
+      const owner = k % 2 === 0;
+      out.push({ seq: k + 1, at_ms: now - (30 - k) * 600_000, sender: k === 13 ? "app" : owner ? "owner" : "manager",
+        text: k === 13 ? "The manager restarted (upgrade)." : owner ? `Message ${k + 1}: what is the status of the ${["search", "export", "auth", "cache"][k % 4]} work? Keep it short, please.` : `Reply ${k + 1}: **${["search", "export", "auth", "cache"][k % 4]}** is moving. task:tsk_demo${(k % 8) + 1} is the one to watch; I'll report back when it lands, with the PR and the review's verdict.`,
+        delivered: true, error: null });
+    }
+    return out;
+  }
+  // A long history, paged as the Worker pages it: the latest 50, then 50 before a seq.
+  const chatHistory = Array.from({ length: 120 }, (_, k) => ({
+    seq: k + 1, at_ms: now - (120 - k) * 900_000, sender: k % 3 === 0 ? "owner" : "manager",
+    text: k % 3 === 0 ? `Message ${k + 1}: how is the ${["search", "export", "auth"][k % 3]} work going?` : `Reply ${k + 1}: on track; task:tsk_demo${(k % 8) + 1} next.`,
+    delivered: true, error: null,
+  }));
+  const page = (before, limit = 50) => {
+    const older = before === null ? chatHistory : chatHistory.filter((m) => m.seq < before);
+    return older.slice(-limit);
+  };
+  const paged = page(null);
   const chatFor = () => {
     if (variant === "chat-empty") return [];
     if (variant === "rich") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: RICH, delivered: true, error: null }];
-    if (variant === "chat-long") {
-      const out = [];
-      for (let k = 0; k < 30; k++) {
-        const owner = k % 2 === 0;
-        out.push({ seq: k + 1, at_ms: now - (30 - k) * 600_000, sender: k === 13 ? "app" : owner ? "owner" : "manager",
-          text: k === 13 ? "The manager restarted (upgrade)." : owner ? `Message ${k + 1}: what is the status of the ${["search", "export", "auth", "cache"][k % 4]} work? Keep it short, please.` : `Reply ${k + 1}: **${["search", "export", "auth", "cache"][k % 4]}** is moving. task:tsk_demo${(k % 8) + 1} is the one to watch; I'll report back when it lands, with the PR and the review's verdict.`,
-          delivered: true, error: null });
-      }
-      return out;
+    if (variant === "chat-paged") return paged;
+    if (variant === "chat-arriving") {
+      // A reply lands a few seconds in (after the reader has scrolled up): the jump-to-latest pill.
+      const base = chatLong();
+      return Date.now() - born > 3_000 ? [...base, { seq: 31, at_ms: now, sender: "manager", text: "New: task:tsk_demo7 passed review.", delivered: true, error: null }] : base;
     }
+    if (variant === "chat-long") return chatLong();
     return chat;
   };
   const detail = (id) => byId[id] && { ...byId[id], history: history[id] ?? [{ at_ms: now - 7_200_000, actor: "owner", action: "created", detail: JSON.stringify({ title: byId[id].title }), tainted: false }] };
@@ -177,7 +207,8 @@ export function data(variant = "demo", now = Date.now()) {
   // Every trace (the manager's, a worker's, a reviewer's): history offered and paged, then the live ring (trace.mjs).
   const { messages: allMessages, pages: historyPages } = trace(now);
   // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
-  const traceMessages = variant === "connecting" ? [] : allMessages;
+  // "chat-empty" is a new conversation: no turn running either (its starters show).
+  const traceMessages = variant === "connecting" || variant === "chat-empty" ? [] : allMessages;
   const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length }, { ...other, needs_you: 0 }];
   const sync = { written: ["capabilities/projects/board", "capabilities/projects/task", "templates/projects/manager", "templates/projects/worker"], repos: ["by77er/gadgets", "by77er/widgets"], at_ms: now - 3_600_000 };
 
@@ -216,8 +247,8 @@ export function data(variant = "demo", now = Date.now()) {
     ],
   };
 
-  /** The answer to `GET|POST /api<path>`: [status, body]. */
-  const answer = (method, path) => {
+  /** The answer to `GET|POST /api<path>?<search>`: [status, body]. */
+  const answer = (method, path, search = new URLSearchParams()) => {
     if (variant === "error") return [500, { error: "internal error (fixture)" }];
     if (path === "/projects") return [200, { projects }];
     if (path === "/admin/sync-state") return [200, sync];
@@ -230,6 +261,8 @@ export function data(variant = "demo", now = Date.now()) {
       return [403, { error: why, problems: { "worker.downloads.gadgets.example.com": why } }];
     }
     const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
+    if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
+    if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];
     if (q in routes) return [200, routes[q]];
     // A task's detail: each task's own, with its history (tsk_demo3 has no worker).
     if (q.startsWith("/tasks/")) {
