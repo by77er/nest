@@ -1,5 +1,5 @@
 // An agent's trace as a terminal transcript, the way Claude Code prints one: each turn under a quiet rule
-// (its start time and how it ended), the assistant's text after `●`, each tool call as `● Name(argument)`
+// (its start time and how it ended), the assistant's text after `●` as Markdown (TraceMarkdown), each tool call as `● Name(argument)`
 // with its full input a click away and its result on the next line after `⎿` (the first lines, then
 // `… +N lines`), and states, asks and errors as dim one-liners. Older turns come from nest's trace
 // history, loaded as the reader scrolls to the top; only what arrives live fades in. It follows the
@@ -9,11 +9,12 @@ import { Badge, Button, Text, Title, VisuallyHidden } from "@mantine/core";
 import { IconArrowDown } from "@tabler/icons-react";
 import { type ReactNode, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { exact } from "../../common/time";
-import { FadeIn, Glyph, GLYPH, icon, TermStatus, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn } from "../../layout";
+import { FadeIn, Glyph, GLYPH, icon, TermStatus, LoadingState, Notice, Row, ScrollLog, Section, Stack, Terminal, TermLine, TermRule, useFillColumn, weight } from "../../layout";
 import {
   groupTurns, type HistoryEvent, lastState, primaryArg, resultLines, type ToolItem, type TraceEvent, type TraceItem, type TraceState, type TraceStatus, toolName,
   type TurnGroup,
 } from "./model";
+import { TraceMarkdown } from "./TraceMarkdown";
 import { useTrace } from "./useTrace";
 
 /** Within this many px of the bottom counts as at the bottom (a fraction of a line); of the top, as asking for more. */
@@ -89,7 +90,7 @@ function ToolCall({ item }: { item: ToolItem }) {
         title={name}
         data-slot="call"
       >
-        <Text component="span" ff="monospace" fz="sm" fw="bold" inherit>
+        <Text component="span" ff="monospace" fz="sm" fw={weight.bold} inherit>
           {toolName(name)}
         </Text>
         {`(${arg})`}
@@ -111,7 +112,7 @@ function EventItem({ ev }: { ev: AnyEvent }) {
     case "assistant_text":
       return (
         <TermLine glyph={GLYPH.bullet} data-kind="text">
-          {str(ev.text)}
+          <TraceMarkdown text={str(ev.text)} />
         </TermLine>
       );
     case "state":

@@ -1,14 +1,15 @@
-// A project's manager: the conversation with it, full width at a reading measure, the composer pinned
-// to the bottom; its status in the header; and beside "Chat", its live trace (`?view=trace`).
+// A project's manager, in the same frame as every view: the conversation at a reading measure on the
+// frame's left edge, the context column beside it (its tasks, what needs you); the composer pinned to
+// the bottom; its status in the header; and beside "Chat", its live trace (`?view=trace`).
 
 import { Tabs } from "@mantine/core";
 import { IconMessage, IconTimeline } from "@tabler/icons-react";
 import { useNavigate, useParams, useSearch } from "@tanstack/react-router";
-import { icon, Section, Stack } from "../../layout";
+import { icon, Section, Stack, WithContext } from "../../layout";
+import { ManagerContext } from "./ManagerContext";
 import { ChatView } from "../chat/ChatView";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ManagerProblem, ManagerStatusLine } from "./ManagerStatus";
-import { ManagerWaits } from "./ManagerWaits";
 import { ManagerTrace } from "../trace/AgentTraces";
 
 export function ManagerPage() {
@@ -17,12 +18,12 @@ export function ManagerPage() {
   const navigate = useNavigate({ from: "/projects/$projectId/manager" });
   const tab = view ?? "chat";
   return (
-    <ProjectFrame projectId={projectId} measure="reading">
+    <ProjectFrame projectId={projectId}>
       {(p) => (
+        <WithContext measure="reading" contextLabel="About the manager" context={<ManagerContext projectId={projectId} />}>
         <Section title="Manager" actions={<ManagerStatusLine projectId={projectId} />}>
         <Stack gap="xl">
           <ManagerProblem projectId={projectId} />
-          <ManagerWaits projectId={projectId} />
           <Tabs value={tab} onChange={(v) => void navigate({ search: v === "trace" ? { view: "trace" } : {} })} keepMounted={false}>
             <Tabs.List>
               <Tabs.Tab value="chat" leftSection={<IconMessage size={icon.md} />}>
@@ -33,7 +34,7 @@ export function ManagerPage() {
               </Tabs.Tab>
             </Tabs.List>
             <Tabs.Panel value="chat" pt="xl">
-              <ChatView projectId={projectId} />
+              <ChatView projectId={projectId} agent={p.settings.manager} />
             </Tabs.Panel>
             <Tabs.Panel value="trace" pt="xl">
               <ManagerTrace settings={p.settings} />
@@ -41,6 +42,7 @@ export function ManagerPage() {
           </Tabs>
         </Stack>
         </Section>
+        </WithContext>
       )}
     </ProjectFrame>
   );

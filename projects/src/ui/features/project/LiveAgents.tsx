@@ -21,9 +21,13 @@ export interface LiveAgentsProps {
   empty: string;
   /** A line about one agent's layer, under its role (what the page's part of it holds). */
   detail?: (a: LayerStatus) => ReactNode;
+  /** What follows a failed layer's error (a way to the rule it names). */
+  onError?: (a: LayerStatus) => ReactNode;
+  /** Its own dense Panel (default); off where it already sits in one. */
+  framed?: boolean;
 }
 
-export function LiveAgents({ agents, label, empty, detail }: LiveAgentsProps) {
+export function LiveAgents({ agents, label, empty, detail, onError, framed = true }: LiveAgentsProps) {
   if (agents.length === 0) {
     return (
       <Text fz="sm" c="dimmed">
@@ -31,8 +35,7 @@ export function LiveAgents({ agents, label, empty, detail }: LiveAgentsProps) {
       </Text>
     );
   }
-  return (
-    <Panel dense>
+  const list = (
       <Stack gap="md" role="list" aria-label={label}>
         {agents.map((a) => {
           const more = detail?.(a);
@@ -56,6 +59,7 @@ export function LiveAgents({ agents, label, empty, detail }: LiveAgentsProps) {
                     {a.error}
                   </Text>
                 )}
+                {a.error && onError?.(a)}
               </Stack>
               <Badge variant="light" color={STATE[a.state].color} data-slot="state">
                 {STATE[a.state].label}
@@ -64,6 +68,6 @@ export function LiveAgents({ agents, label, empty, detail }: LiveAgentsProps) {
           );
         })}
       </Stack>
-    </Panel>
   );
+  return framed ? <Panel dense>{list}</Panel> : list;
 }

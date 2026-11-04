@@ -50,6 +50,9 @@ export const NETWORK_PRESETS = [
  * Each problem with a role's rules, against nest's rules and the grant (`egress_hosts`, null when it
  * couldn't be read: nest checks it again). Keyed by host (or `rules` for the list).
  */
+/** A host outside the grant's `egress_hosts`, as the page and the API say it. */
+export const OUTSIDE = "isn't in this app's grant; the operator must add it";
+
 export function rulesProblems(rules: readonly EgressRule[], egressHosts: readonly string[] | null): Record<string, string> {
   const out: Record<string, string> = {};
   if (rules.length > MAX_RULES) out.rules = `At most ${MAX_RULES} hosts`;
@@ -62,7 +65,7 @@ export function rulesProblems(rules: readonly EgressRule[], egressHosts: readonl
     else if (r.ports !== undefined && (r.ports.length < 1 || r.ports.length > MAX_PORTS || r.ports.some((p) => !Number.isInteger(p) || p < 1 || p > 65_535))) {
       out[h] = `${h}: 1 to ${MAX_PORTS} ports, each 1 to 65535`;
     } else if (egressHosts && !hostAllowed(h, egressHosts)) {
-      out[h] = `${h} is outside the hosts this app may open (${egressHosts.join(", ") || "none"}): the operator must widen the grant's egress_hosts`;
+      out[h] = `${h} ${OUTSIDE}`;
     }
   }
   return out;

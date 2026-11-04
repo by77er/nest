@@ -175,6 +175,11 @@ export class Nest {
   }
 
   /** Stop an agent; with `end`, for good (its sandbox destroyed with `destroySandbox`). */
+  /** Interrupt the agent's current turn (`POST /v1/agents/:agent/interrupt`, the owner's). */
+  interrupt(agent: string): Promise<unknown> {
+    return this.call("POST", `/v1/agents/${encodeURIComponent(agent)}/interrupt`);
+  }
+
   stopAgent(agent: string, o: { end?: boolean; destroySandbox?: boolean; reason?: string } = {}): Promise<unknown> {
     return this.call("POST", `/v1/agents/${encodeURIComponent(agent)}/stop`, {
       ...(o.end ? { end: true } : {}), ...(o.destroySandbox ? { destroy_sandbox: true } : {}), ...(o.reason ? { reason: o.reason } : {}),

@@ -19,7 +19,7 @@ import { fail, migrate, ok, type Result } from "../sql";
 import { canBlock, canUnblock, dependencyError, pickForAssignment, type PrState, prsDone, waitingOn, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition, WORKER_STATES } from "../tasks";
 import { type Server, toolOf } from "../tools";
 import type { NestEvent } from "../webhook";
-import { asBinding, type ClientLayer, clientLayerFor, type EgressRule, egressWithinGrant, LAYER_ROLES, type LayerRole, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules, shrinkLayer } from "../network";
+import { asBinding, type ClientLayer, clientLayerFor, type EgressRule, egressWithinGrant, hostAllowed, LAYER_ROLES, type LayerRole, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules, shrinkLayer } from "../network";
 import { MAX_WAITS, type PrUntil, prVerdict, taskVerdict, timeoutProblem, type Wait, type WaitKind, waitKey, waitMessage, type WaitOutcome } from "../waits";
 import { randomId } from "./directory";
 
@@ -165,6 +165,9 @@ export interface Ask {
 export type Actor = { kind: "owner" } | { kind: "app"; what: string } | { kind: "agent"; agent: string; tainted: boolean };
 
 const MAX_WORKERS_LIMIT = 20;
+/** A chat page's size by default, and at most: older pages load as the owner scrolls up. */
+export const CHAT_PAGE = 50;
+export const CHAT_PAGE_MAX = 200;
 /** How long a deduplicated MCP call's answer is kept (nest retries a lost answer within minutes). */
 const CALLS_KEEP_MS = 24 * 3600 * 1000;
 
@@ -283,6 +286,9 @@ export const MIGRATIONS = [
   ],
 ] as const;
 
+/** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
+const RECENT_WAITS = 10;
+
 type Row = Record<string, SqlStorageValue>;
 
 /** A task's row with `tainted`: whether any write in its history came from a tainted session. */
@@ -290,6 +296,8 @@ const TASK_SELECT = "SELECT t.*, EXISTS (SELECT 1 FROM history h WHERE h.task = 
 
 export class ProjectDO extends DurableObject<Env> {
   private draining: Promise<void> | null = null;
+  /** Waits another `await_*` caller was handed while their first caller was still checking (in memory: only across those awaits). */
+  private readonly sharedWaits = new Set<string>();
   private again = false;
   /** Whether this drain already went round again for a changed grant (`grantSeen`). */
   private reowed = false;
@@ -1232,9 +1240,13 @@ export class ProjectDO extends DurableObject<Env> {
 
   // --- chat and approvals ----------------------------------------------------------------------------
 
-  async chat(limit = 200): Promise<Result<ChatMessage[]>> {
+  /** The chat's latest `limit` messages, or those before `before` (a seq): oldest first. */
+  async chat(limit = CHAT_PAGE, before?: number): Promise<Result<ChatMessage[]>> {
     if (!this.settings()) return fail(404, "unknown project");
-    const rows = this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, error FROM chat ORDER BY seq DESC LIMIT ?", limit).toArray().reverse();
+    const n = Math.max(1, Math.min(CHAT_PAGE_MAX, Math.floor(limit)));
+    const rows = (before === undefined
+      ? this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, error FROM chat ORDER BY seq DESC LIMIT ?", n)
+      : this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, error FROM chat WHERE seq < ? ORDER BY seq DESC LIMIT ?", before, n)).toArray().reverse();
     return ok(rows.map((r) => ({
       seq: r.seq as number, at_ms: r.at_ms as number, sender: r.sender as string, text: r.text as string,
       delivered: r.next_ms === null && r.error === null, error: (r.error as string | null) ?? null,
@@ -1350,7 +1362,7 @@ export class ProjectDO extends DurableObject<Env> {
   /** The Manager page's view: what's pending, and the last few that ended. */
   async waits(): Promise<Result<{ pending: Wait[]; recent: Wait[] }>> {
     if (!this.settings()) return fail(404, "unknown project");
-    const recent = this.sql.exec("SELECT * FROM waits WHERE resolved_ms IS NOT NULL ORDER BY resolved_ms DESC LIMIT 10").toArray().map(toWait);
+    const recent = this.sql.exec("SELECT * FROM waits WHERE resolved_ms IS NOT NULL ORDER BY resolved_ms DESC, rowid DESC LIMIT ?", RECENT_WAITS).toArray().map(toWait);
     return ok({ pending: this.pendingWaits(), recent });
   }
 
@@ -1366,6 +1378,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (!done) return false;
     const manager = this.settings()?.manager;
     if (notify && manager) this.oweMessage(manager, waitMessage(w, outcome, detail, now), false);
+    // Resolved waits beyond the RECENT_WAITS the page shows go.
+    this.sql.exec("DELETE FROM waits WHERE resolved_ms IS NOT NULL AND id NOT IN (SELECT id FROM waits WHERE resolved_ms IS NOT NULL ORDER BY resolved_ms DESC, rowid DESC LIMIT ?)", RECENT_WAITS);
     return true;
   }
 
@@ -1385,7 +1399,11 @@ export class ProjectDO extends DurableObject<Env> {
     }
     const key = waitKey(kind, target, want);
     const prior = this.sql.exec("SELECT * FROM waits WHERE key = ? AND resolved_ms IS NULL", key).toArray()[0];
-    if (prior) return ok({ status: "waiting", wait: toWait(prior), note: "already waiting for this: the same wait" });
+    if (prior) {
+      // Another caller now holds it too: an answer at once (below) must tell them, not drop the row.
+      this.sharedWaits.add(prior.id as string);
+      return ok({ status: "waiting", wait: toWait(prior), note: "already waiting for this: the same wait" });
+    }
     if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM waits WHERE resolved_ms IS NULL").one().n >= MAX_WAITS) {
       return fail(409, `at most ${MAX_WAITS} waits at once: cancel one with cancel_wait`);
     }
@@ -1402,10 +1420,24 @@ export class ProjectDO extends DurableObject<Env> {
       // A PR attached to a task is recorded merged once it is (README.md#prs).
       const merged = this.sql.exec("SELECT 1 FROM task_prs WHERE pr = ? AND state = 'merged'", pr).toArray().length > 0;
       const latest = jobs[0];
-      if (merged) this.prWaitOn(this.waitRow(id)!, { kind: "merged" });
-      // Closed before its review finished, merged or not (the queue doesn't say): a wait to merge stays.
-      else if (latest?.state === "closed" && want !== "merged") this.prWaitOn(this.waitRow(id)!, { kind: "closed" });
-      else if (latest && (latest.state === "done" || latest.state === "failed")) this.prWaitOn(this.waitRow(id)!, { kind: "review", conclusion: reviewConclusion(latest) });
+      const now: Parameters<typeof prVerdict>[1] | null = merged ? { kind: "merged" }
+        // Closed before its review finished, merged or not (the queue doesn't say): a wait to merge stays.
+        : latest?.state === "closed" && want !== "merged" ? { kind: "closed" }
+        : latest && (latest.state === "done" || latest.state === "failed") ? { kind: "review", conclusion: reviewConclusion(latest) }
+        : null;
+      const v = now && prVerdict(want as PrUntil, now);
+      // Holding already: answered here, as `await_task` is, with no wait left behind and no message (a
+      // message would wake the manager, which might ask again). Unless an event resolved it meanwhile:
+      // then that told the manager, once.
+      // A caller that found this wait pending meanwhile (the review read awaited) was told "waiting": then
+      // it's resolved with the message that caller waits for.
+      if (v && this.sharedWaits.delete(id)) {
+        this.resolveWait(id, v.outcome, v.detail);
+        return ok({ status: v.outcome, detail: `PR #${pr}: ${v.detail}` });
+      }
+      if (v && this.sql.exec("DELETE FROM waits WHERE id = ? AND resolved_ms IS NULL", id).rowsWritten) {
+        return ok({ status: v.outcome, detail: `PR #${pr}: ${v.detail}` });
+      }
       const w = this.waitRow(id)!;
       if (w.resolved_ms !== null) return ok({ status: w.outcome, detail: `PR #${pr}: ${w.detail}` });
     }
@@ -1512,13 +1544,26 @@ export class ProjectDO extends DurableObject<Env> {
     await this.arm();
   }
 
+  /**
+   * A role's rules as applied: those inside the grant's `egress_hosts` now. One the operator has since
+   * taken out of the grant stays stored (the page shows it "outside the grant") but isn't sent, so the
+   * rest still applies and a narrowing goes through (nest refuses a layer with any host outside it).
+   */
+  private async granted(nest: Nest, role: NetworkRole): Promise<EgressRule[]> {
+    const ceiling = (await nest.self()).grant?.egress_hosts ?? [];
+    return this.rules().rules[role].filter((r) => hostAllowed(r.host, ceiling));
+  }
+
   /** The rules a start attempt uses, fixed at its first try: its sandbox's Idempotency-Key binds the request. */
-  private frozenEgress(key: string, role: NetworkRole): { rev: number; egress: EgressRule[] } {
+  private async frozenEgress(nest: Nest, key: string, role: NetworkRole): Promise<{ rev: number; egress: EgressRule[] }> {
     const r = this.sql.exec<{ rev: number; egress: string }>("SELECT rev, egress FROM frozen_egress WHERE key = ?", key).toArray()[0];
     if (r) return { rev: r.rev, egress: JSON.parse(r.egress) as EgressRule[] };
-    const { rules, rev } = this.rules();
-    this.sql.exec("INSERT INTO frozen_egress (key, rev, egress) VALUES (?, ?, ?)", key, rev, JSON.stringify(rules[role]));
-    return { rev, egress: rules[role] };
+    const { rev } = this.rules();
+    const egress = await this.granted(nest, role);
+    // Another start may have frozen it meanwhile (the grant read awaited): the first one stands.
+    this.sql.exec("INSERT INTO frozen_egress (key, rev, egress) VALUES (?, ?, ?) ON CONFLICT (key) DO NOTHING", key, rev, JSON.stringify(egress));
+    const kept = this.sql.exec<{ rev: number; egress: string }>("SELECT rev, egress FROM frozen_egress WHERE key = ?", key).one();
+    return { rev: kept.rev, egress: JSON.parse(kept.egress) as EgressRule[] };
   }
 
   /** A new agent's layer: applied as of its start's rules; owed again if the rules moved on since. */
@@ -1549,7 +1594,7 @@ export class ProjectDO extends DurableObject<Env> {
     // The layer for a grant: inside it; for none (unread), everything, as the target a removal is cut from.
     const build = (g: Grant | null) => {
       const feeds = this.secretFeeds(role, g ? (g.inject_hosts ?? []) : null);
-      const layer = egressWithinGrant(clientLayerFor(this.rules().rules, role, { inject: feeds.inject, env: feeds.env }, current), g ? (g.egress_hosts ?? null) : null);
+      const layer = egressWithinGrant(clientLayerFor(this.rules().rules, role, { inject: feeds.inject, env: feeds.env }, current), g ? (g.egress_hosts ?? []) : null);
       return { layer, names: feeds.secrets.map((m) => m.name) };
     };
     try {
@@ -1993,7 +2038,7 @@ export class ProjectDO extends DurableObject<Env> {
     const labels = { project: s.id, role: "manager", start: String(n) };
     try {
       const key = `${s.id}/manager/${n}`;
-      const frozen = this.frozenEgress(key, "manager");
+      const frozen = await this.frozenEgress(nest, key, "manager");
       // Its bindings, env and workflows, frozen with the same key (README.md#secrets).
       const spec = await this.sandboxSpec(nest, "manager", key);
       const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
@@ -2024,7 +2069,7 @@ export class ProjectDO extends DurableObject<Env> {
       let agent = before.assignee as string | null;
       if (!agent) {
         const key = `${s.id}/${id}/${n}`;
-        const frozen = this.frozenEgress(key, "worker");
+        const frozen = await this.frozenEgress(nest, key, "worker");
         const spec = await this.sandboxSpec(nest, "worker", key);
         agent = await nest.startAgent(TEMPLATE.worker, labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
         await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });

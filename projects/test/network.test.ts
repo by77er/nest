@@ -8,10 +8,10 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { AccessTeam, api, CLIENT, FakeNest, installFetch } from "./fake-nest";
 
 describe("the rules (pure)", () => {
-  it("refuses hosts outside the grant, saying the operator must widen it; and malformed rules", () => {
+  it("refuses hosts outside the grant, saying the operator must add them; and malformed rules", () => {
     const grant = ["registry.npmjs.org", "*.pythonhosted.org"];
     expect(rulesProblems([{ host: "registry.npmjs.org" }, { host: "files.pythonhosted.org", ports: [443] }], grant)).toEqual({});
-    expect(rulesProblems([{ host: "nodejs.org" }], grant)["nodejs.org"]).toMatch(/outside the hosts this app may open.*the operator must widen the grant's egress_hosts/);
+    expect(rulesProblems([{ host: "nodejs.org" }], grant)["nodejs.org"]).toMatch(/^nodejs.org isn't in this app's grant; the operator must add it$/);
     expect(Object.keys(rulesProblems([{ host: "a.b.example" }, { host: "a.b.example" }], null))).toEqual(["a.b.example"]);
     for (const bad of ["1.2.3.4", "*.com", "Bad Host", ""]) expect(Object.keys(rulesProblems([{ host: bad }], null)), bad).toHaveLength(1);
     expect(rulesProblems([{ host: "x.example.com", ports: [] }], null)["x.example.com"]).toMatch(/1 to 16 ports/);
@@ -71,12 +71,38 @@ describe("the network page's API", () => {
     const s = await setup();
     const out = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [{ host: "evil.example.com" }], manager: [] });
     expect(out.status).toBe(403);
-    expect(out.body.error).toMatch(/the operator must widen the grant/);
+    expect(out.body.error).toMatch(/isn't in this app's grant; the operator must add it/);
     expect(out.body.problems).toHaveProperty("worker.evil.example.com");
     expect((await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [{ host: "not a host" }], manager: [] })).status).toBe(400);
     const view = (await api(token, "GET", `/api/projects/${s.id}/network`)).body;
     expect(view.rules).toEqual({ worker: [], manager: [] });
     expect(view.egress_hosts).toEqual(fake.egressHosts);
+  });
+
+  it("after the operator narrows the grant, a save that removes or keeps rules goes through; the revoked host is kept but not applied", async () => {
+    const s = await setup();
+    const sb = sandboxOf(s.manager);
+    expect((await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [{ host: "pypi.org" }], manager: [{ host: "nodejs.org" }, { host: "pypi.org" }] })).status).toBe(200);
+    const was = [...fake.egressHosts];
+    fake.egressHosts = was.filter((h) => h !== "nodejs.org");
+    try {
+      // Dropping pypi.org while the revoked nodejs.org stays: not refused (it was there already).
+      const r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }] });
+      expect(r.status).toBe(200);
+      expect(r.body.rules).toEqual({ worker: [], manager: [{ host: "nodejs.org" }] });
+      // The narrowing reached the live layer: what's still in the grant (here nothing), never the revoked host.
+      await drain(s.id);
+      expect(sb.layer.egress.allow).toEqual([]);
+      expect(fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${sb.sandbox}/client-policy$`)).at(-1)!.body.egress).toEqual({ allow: [] });
+      // A host newly added outside the grant is still refused, whole.
+      const added = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [{ host: "nodejs.org" }], manager: [{ host: "nodejs.org" }] });
+      expect(added.status).toBe(403);
+      expect(added.body.problems).toEqual({ "worker.nodejs.org": "nodejs.org isn't in this app's grant; the operator must add it" });
+      // A new worker's sandbox is made with the granted rules only.
+      expect((await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }, { host: "pypi.org" }] })).status).toBe(200);
+    } finally {
+      fake.egressHosts = was;
+    }
   });
 
   it("shows the operator's rules from the manager's sandbox by nest's source: defaults, the operator's, the repo allowlists'; not the app's own or grants", async () => {

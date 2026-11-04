@@ -12,10 +12,9 @@ import { Fragment, useState } from "react";
 import { useDeleteSecret, useSecrets } from "../../api/queries";
 import type { SecretLocation, SecretsAnswer, SecretView } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Row, Section, Sheet, Stack, TableFrame, Token, usePhone } from "../../layout";
+import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Row, Section, Sheet, Stack, TableFrame, Token, usePhone, weight } from "../../layout";
 import { LiveAgents } from "../project/LiveAgents";
 import { ProjectFrame } from "../project/ProjectFrame";
-import { fontWeights } from "../../theme";
 import { SecretForm } from "./SecretForm";
 
 const ROLE_LABEL: Record<string, string> = { worker: "Workers", manager: "Manager", reviewer: "Reviewers" };
@@ -30,7 +29,7 @@ type Row_ = SecretsAnswer["secrets"][number];
 function SecretName({ s }: { s: Row_ }) {
   return (
     <Stack gap="2xs">
-      <Text fz="sm" ff="monospace" fw={fontWeights.medium}>
+      <Text fz="sm" ff="monospace" fw={weight.medium}>
         {s.name}
       </Text>
       <Token slot="env">${s.env}</Token>

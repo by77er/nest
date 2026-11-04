@@ -14,12 +14,10 @@ import { ErrorState, LoadingState, MetaItem, MetaRow, Page, PageHeader } from ".
 export interface ProjectFrameProps {
   projectId: string;
   actions?: (p: Project) => ReactNode;
-  /** Keep the content to a measure: `reading` for a conversation, `form` for settings. */
-  measure?: "reading" | "form";
   children: (p: Project) => ReactNode;
 }
 
-export function ProjectFrame({ projectId, actions, measure, children }: ProjectFrameProps) {
+export function ProjectFrame({ projectId, actions, children }: ProjectFrameProps) {
   const project = useProject(projectId);
   if (project.isPending) {
     return (
@@ -38,7 +36,7 @@ export function ProjectFrame({ projectId, actions, measure, children }: ProjectF
   }
   const p = project.data;
   return (
-    <Page measure={measure}>
+    <Page>
       <PageHeader
         title={p.name}
         meta={

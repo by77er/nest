@@ -9,8 +9,7 @@ import { envName, SECRET_PRESETS, type SecretGrant, type SecretLocation, secretP
 import { ApiError } from "../../api/client";
 import { usePutSecret } from "../../api/queries";
 import type { SecretView } from "../../api/types";
-import { FieldGroup, Notice, Row, Stack } from "../../layout";
-import { fontWeights } from "../../theme";
+import { FieldGroup, Notice, Row, Stack, weight } from "../../layout";
 
 type Format = "authorization_bearer" | "authorization_basic_password" | "header";
 
@@ -139,7 +138,7 @@ export function SecretForm({ projectId, grant, editing, initial, takenEnv = [], 
           />
         ) : (
           <Stack gap="xs">
-            <Text fz="sm" fw={fontWeights.medium}>
+            <Text fz="sm" fw={weight.medium}>
               Value
             </Text>
             <Text fz="sm" c="dimmed">

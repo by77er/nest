@@ -3,8 +3,9 @@
 //
 // `split` (a task's drawer, which may hold its worker's trace): one width whatever it holds, so its title
 // never moves between tasks. From `xl` on that's `--nest-sheet-wide`, and with `beside` two columns that
-// scroll on their own: the details in a third (`--nest-sheet-details`), what's beside them in the rest,
-// since that's the one read at length (a log's long lines). Below `xl`, where both don't fit at a readable
+// scroll on their own: the details first and the wider (`--nest-sheet-details`, a reading line), since the
+// task is what's read first, and what's beside them (a worker's trace, its companion) in the rest, still
+// about 80 columns of its mono. Below `xl`, where both don't fit at a readable
 // width (at 1200 px the wide sheet would cover the page), the two are tabs, each the sheet's full height,
 // kept mounted so switching keeps a trace's connection, scroll and what's expanded.
 
@@ -24,11 +25,10 @@ export const useFillColumn = () => useContext(Column);
 
 const FULL = { display: "flex", flexDirection: "column", flex: 1, minHeight: 0 } as const;
 
-/** The close button's name: Mantine's is an unlabeled icon. */
-const CLOSE = { "aria-label": "Close" };
-
-export function Sheet({ opened, onClose, title, children, beside, besideEmpty, split = false, labels = ["Details", "Trace"] }: {
+export function Sheet({ opened, onClose, title, children, beside, besideEmpty, split = false, labels = ["Details", "Trace"], closeOnEscape = true }: {
   opened: boolean; onClose: () => void; title: string; children: ReactNode; beside?: ReactNode;
+  /** Off while what's in it handles Escape itself (a form, which leaves editing). */
+  closeOnEscape?: boolean;
   /** What the wide sheet's second column shows when there's nothing beside (so its frame stays balanced). */
   besideEmpty?: ReactNode;
   split?: boolean; labels?: [string, string];
@@ -41,17 +41,18 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
       <Drawer
         opened={opened}
         onClose={onClose}
+        closeOnEscape={closeOnEscape}
         position="right"
+        closeButtonProps={{ "aria-label": "Close" }}
         size={size}
         title={title}
-        closeButtonProps={CLOSE}
         styles={{
           content: { display: "flex", flexDirection: "column" },
           body: { flex: 1, minHeight: 0, display: "grid", gridTemplateColumns: "var(--nest-sheet-details) minmax(0, 1fr)", gap: "var(--mantine-spacing-2xl)" },
         }}
       >
         <ScrollArea type="auto" offsetScrollbars style={{ height: "100%", minHeight: 0 }} data-column="details">
-          {children}
+          <Box pr="md">{children}</Box>
         </ScrollArea>
         <Box style={{ ...FULL, minWidth: 0, height: "100%" }} data-column="beside">
           <Column.Provider value={{ fill: true, untitled: false }}>{beside ?? besideEmpty}</Column.Provider>
@@ -64,10 +65,11 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
       <Drawer
         opened={opened}
         onClose={onClose}
+        closeOnEscape={closeOnEscape}
         position="right"
+        closeButtonProps={{ "aria-label": "Close" }}
         size={size}
         title={title}
-        closeButtonProps={CLOSE}
         styles={{ content: { display: "flex", flexDirection: "column" }, body: { ...FULL } }}
       >
         {/* `display-none`, not Mantine's default `activity` (React's <Activity hidden>), which runs effects'
@@ -83,7 +85,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
           </Tabs.List>
           <Tabs.Panel value="details" pt="xl" style={{ flex: 1, minHeight: 0 }}>
             <ScrollArea type="auto" offsetScrollbars style={{ height: "100%" }} data-column="details">
-              {children}
+              <Box pr="md">{children}</Box>
             </ScrollArea>
           </Tabs.Panel>
           <Tabs.Panel value="beside" pt="xl" style={{ ...FULL }} data-column="beside">
@@ -94,7 +96,7 @@ export function Sheet({ opened, onClose, title, children, beside, besideEmpty, s
     );
   }
   return (
-    <Drawer opened={opened} onClose={onClose} position="right" size={size} title={title} closeButtonProps={CLOSE}>
+    <Drawer opened={opened} onClose={onClose} closeOnEscape={closeOnEscape} position="right" closeButtonProps={{ "aria-label": "Close" }} size={size} title={title}>
       {split && wide ? <Box maw="var(--nest-measure)">{children}</Box> : children}
     </Drawer>
   );

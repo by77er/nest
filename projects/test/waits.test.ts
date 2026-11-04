@@ -184,6 +184,48 @@ describe("await_pr", () => {
     expect(ok(await board(s, "await_pr", { pr: 32, until: "merged", timeout_s: 600 })).status).toBe("waiting");
   });
 
+  it("a PR merged already answers each call at once: no wait left behind, no message (which would wake the manager to ask again)", async () => {
+    const s = await setup();
+    const t = await s.task("t");
+    await stub(s).onPullRequest({ pr: 41, task: t, action: "opened", merged: false, node: "PR_41", fork: false, title: "t" });
+    await stub(s).onPullRequest({ pr: 41, task: t, action: "closed", merged: true });
+    for (let i = 0; i < 3; i++) expect(ok(await board(s, "await_pr", { pr: 41, until: "merged", timeout_s: 600 })).status).toBe("met");
+    await settle(s);
+    expect(told(s)).toEqual([]);
+    const rows = await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM waits").one().n);
+    expect(rows).toBe(0);
+  });
+
+  it("two calls at once on a merged PR: one met at once, the other told by message, none left waiting", async () => {
+    const s = await setup();
+    const t = await s.task("t");
+    await stub(s).onPullRequest({ pr: 42, task: t, action: "opened", merged: false, node: "PR_42", fork: false, title: "t" });
+    await stub(s).onPullRequest({ pr: 42, task: t, action: "closed", merged: true });
+    const answers = await Promise.all([1, 2].map(() => board(s, "await_pr", { pr: 42, until: "merged", timeout_s: 600 }).then(ok)));
+    const statuses = answers.map((a) => a.status).sort();
+    await settle(s);
+    const pending = await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM waits WHERE resolved_ms IS NULL").one().n);
+    expect(pending).toBe(0);
+    // The second call finds the first's row while the first reads the review queue: it's told
+    // "waiting", and the first's answer at once resolves that wait with the one message it waits for.
+    expect(statuses).toEqual(["met", "waiting"]);
+    const waiter = answers.find((a) => a.status === "waiting")!;
+    expect(told(s).map((m) => m.text)).toEqual([`await ${waiter.wait.id}: PR #42: merged.`]);
+  });
+
+  it("keeps the 10 most recent resolved waits, the page's, and prunes the rest", async () => {
+    const s = await setup();
+    for (let i = 0; i < 13; i++) {
+      const w = ok(await board(s, "await_pr", { pr: 500 + i, until: "merged", timeout_s: 600 }));
+      ok(await board(s, "cancel_wait", { wait: w.wait.id }));
+    }
+    const kept = await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM waits").one().n);
+    expect(kept).toBe(10);
+    const recent = (await stub(s).waits()) as { ok: true; value: { recent: { target: string }[] } };
+    // The three oldest went (resolved in that order, a few might share a millisecond: compared as a set).
+    expect(recent.value.recent.map((w) => w.target).sort()).toEqual(Array.from({ length: 10 }, (_, k) => String(503 + k)).sort());
+  });
+
   it("a review that ends in the queue reaches the wait through ReviewDO's outbox", async () => {
     const s = await setup();
     const w = ok(await board(s, "await_pr", { pr: 31, until: "review_done", timeout_s: 600 }));

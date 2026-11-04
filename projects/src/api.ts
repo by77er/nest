@@ -6,7 +6,7 @@ import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { clientIdOf, NestError, nestFrom } from "./nest";
-import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, rulesProblems } from "./network";
+import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSIDE, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
 import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Network, PutSecret, Settings, Spec, UpdateTask } from "./requests";
@@ -254,8 +254,27 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "POST tasks/:task/done":
       return done(await p.markDone(task));
-    case "GET chat":
-      return done(await p.chat());
+    case "GET chat": {
+      // `before=<seq>`: the page before it (older messages, as the owner scrolls up); `limit` is capped.
+      const before = url.searchParams.get("before");
+      const limit = url.searchParams.get("limit");
+      if (before !== null && !/^\d{1,15}$/.test(before)) return err(400, "before is a message's seq");
+      if (limit !== null && !/^\d{1,4}$/.test(limit)) return err(400, "limit is a number");
+      return done(await p.chat(limit === null ? undefined : Number(limit), before === null ? undefined : Number(before)));
+    }
+    case "POST manager/interrupt": {
+      // Stop the manager's current turn (nest's owner route; the app owns the agent).
+      const s = await p.getSettings();
+      if (!s.ok) return done(s);
+      if (!s.value.manager) return err(409, "the manager isn't started");
+      const nest = nestFrom(env);
+      if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
+      try {
+        return json(await nest.interrupt(s.value.manager));
+      } catch (e) {
+        return e instanceof NestError ? err(e.status === 404 ? 404 : 502, e.message) : err(502, String(e));
+      }
+    }
     case "POST chat": {
       const b = await body(req, Chat);
       return b.ok ? done(await p.postChat(b.value.text), 201) : b.res;
@@ -297,9 +316,19 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       if (!b.ok) return b.res;
       const g = await egressHostsOf(env);
       if (!g.ok) return err(g.status, g.error);
-      const problems = Object.fromEntries(NETWORK_ROLES.flatMap((role) => Object.entries(rulesProblems(normalizeRules(b.value[role]), g.value)).map(([k, v]) => [`${role}.${k}`, v])));
+      // A host already in a role's rules may stay though the operator has since narrowed the grant: it's
+      // kept, shown "outside the grant", and not applied. So a save that only removes (or keeps) rules
+      // always goes through; only a host newly added outside the grant is refused.
+      const stored = await p.network();
+      if (!stored.ok) return err(stored.status, stored.error);
+      const problems = Object.fromEntries(NETWORK_ROLES.flatMap((role) => {
+        const had = new Set(stored.value.rules[role].map((r) => r.host));
+        return Object.entries(rulesProblems(normalizeRules(b.value[role]), g.value))
+          .filter(([host, v]) => !(v.endsWith(OUTSIDE) && had.has(host)))
+          .map(([k, v]) => [`${role}.${k}`, v]);
+      }));
       if (Object.keys(problems).length) {
-        const outside = Object.values(problems).some((v) => v.includes("must widen"));
+        const outside = Object.values(problems).some((v) => v.endsWith(OUTSIDE));
         return json({ error: Object.values(problems).join("; "), problems }, outside ? 403 : 400);
       }
       const r = await p.setNetwork(b.value);

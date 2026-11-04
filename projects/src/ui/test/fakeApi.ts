@@ -49,6 +49,8 @@ export class FakeApi {
   reviews: Job[] = [];
   waits: Waits = { pending: [], recent: [] };
   workflowWorkers: string[] = [];
+  /** `PUT network`'s answer instead of saving: a refusal (403 with `problems`, say). */
+  networkRefusal: { status: number; body: unknown } | null = null;
   network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }] };
   openPrs: OpenPr[] = [];
   secrets: SecretsAnswer["secrets"] = [];
@@ -56,8 +58,16 @@ export class FakeApi {
   secretRequests: SecretRequest[] = [];
   manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
   readonly writes: Write[] = [];
+  /** Every GET's path, in order. */
+  readonly reads: string[] = [];
+  /** The request being answered (its query string). */
+  private url: URL | null = null;
+  interrupted = 0;
   /** Answers to give instead, by `METHOD path` pattern, once each. */
   readonly failures: { match: RegExp; status: number; error: string }[] = [];
+
+  /** Answers held until `until` settles, by `METHOD path` pattern (a slow board, say). */
+  readonly holds: { match: RegExp; until: Promise<unknown> }[] = [];
 
   fail(match: RegExp, status: number, error: string): void {
     this.failures.push({ match, status, error });
@@ -69,11 +79,14 @@ export class FakeApi {
     const method = (init?.method ?? "GET").toUpperCase();
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     if (method !== "GET") this.writes.push({ method, path: url.pathname, body });
+    else this.reads.push(url.pathname);
+    for (const h of this.holds) if (h.match.test(`${method} ${url.pathname}`)) await h.until;
     const f = this.failures.findIndex((x) => x.match.test(`${method} ${url.pathname}`));
     if (f >= 0) {
       const [x] = this.failures.splice(f, 1);
       return json({ error: x!.error }, x!.status);
     }
+    this.url = url;
     return this.route(method, url.pathname.replace(/^\/api/, "").split("/").filter(Boolean), body);
   };
 
@@ -160,6 +173,7 @@ export class FakeApi {
       case "GET network":
         return json(this.network);
       case "PUT network":
+        if (this.networkRefusal) return json(this.networkRefusal.body, this.networkRefusal.status);
         this.network = { ...this.network, rules: body, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
         return json(this.network);
       case "GET reviews":
@@ -168,8 +182,15 @@ export class FakeApi {
         return json({ secrets: this.secrets, grant: this.grant, client: "cli_app", agents: this.network.agents, workflow_workers: this.workflowWorkers });
       case "GET prs/open":
         return json(this.openPrs);
-      case "GET chat":
-        return json(this.chat);
+      case "GET chat": {
+        // Pages as the Worker answers them: the latest 50, or the 50 before `before`.
+        const before = this.url?.searchParams.get("before");
+        const rows = before ? this.chat.filter((m) => m.seq < Number(before)) : this.chat;
+        return json(rows.slice(-50));
+      }
+      case "POST manager/interrupt":
+        this.interrupted += 1;
+        return json({ interrupted: "turn" });
       case "POST chat": {
         const c: ChatMessage = { seq: this.chat.length + 1, at_ms: now, sender: "owner", text: body.text, delivered: true, error: null };
         this.chat.push(c);

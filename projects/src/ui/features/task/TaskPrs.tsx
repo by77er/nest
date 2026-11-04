@@ -11,7 +11,7 @@ import { prNumberOf } from "../../../prs";
 import { useAttachPr, useDetachPr, useOpenPrs, useReviews, useTasks } from "../../api/queries";
 import type { Job, Task, TaskPr } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { Grow, MetaItem, Picker, type PickerItem, Row, RowAction, Section, Stack, TriggerBadge } from "../../layout";
+import { Grow, MetaItem, MetaRow, Picker, Row, RowAction, Section, Stack, TriggerBadge, type PickerItem, weight } from "../../layout";
 import { TERMINAL } from "../../../tasks";
 import { JobState } from "../reviews/ReviewsPage";
 
@@ -51,9 +51,9 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
       onConfirm: () => detach.mutate({ task: task.id, pr: pr.number }, { onSuccess: onDetached }),
     });
   return (
-    <Stack gap="xs" data-pr={pr.number}>
+    <Stack gap="sm" data-pr={pr.number}>
       <Row gap="sm" wrap="nowrap">
-        <Anchor href={`https://github.com/${repo}/pull/${pr.number}`} target="_blank" rel="noreferrer" fz="sm" fw="medium">
+        <Anchor href={`https://github.com/${repo}/pull/${pr.number}`} target="_blank" rel="noreferrer" fz="sm" fw={weight.medium}>
           #{pr.number}
         </Anchor>
         <Grow>
@@ -67,6 +67,13 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
           </RowAction>
         )}
       </Row>
+      {/* Three lines: its number and title, who attached it, its badges: the text line between the two
+          rows of controls gives them their 44 px pitch on touch without a gap of its own. */}
+      <MetaRow>
+        <MetaItem title={exact(pr.attached_ms)}>
+          Attached by {pr.attached_by === "owner" ? "you" : pr.attached_by.startsWith("app:") ? "its branch" : pr.attached_by} {ago(pr.attached_ms)}
+        </MetaItem>
+      </MetaRow>
       <Row gap="xs">
         <Badge size="sm" variant="light" color={pr.state === "merged" ? "success" : "primary"}>
           {pr.state === "merged" ? "Merged" : "Open"}
@@ -78,9 +85,6 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
             Fork
           </Badge>
         )}
-        <MetaItem title={exact(pr.attached_ms)}>
-          Attached by {pr.attached_by === "owner" ? "you" : pr.attached_by.startsWith("app:") ? "its branch" : pr.attached_by} {ago(pr.attached_ms)}
-        </MetaItem>
       </Row>
     </Stack>
   );
@@ -133,7 +137,8 @@ export function TaskPrs({ projectId, repo, task }: { projectId: string; repo: st
   const focusAttach = () => requestAnimationFrame(() => attach.current?.focus());
   return (
     <Section title="Pull requests" count={task.prs.length} region={false} actions={!TERMINAL.has(task.state) && <AttachPr projectId={projectId} repo={repo} task={task} buttonRef={attach} />}>
-      <Stack gap="lg">
+      {/* Each PR's lines stay tight; PRs are 2xl apart, more than twice the gap within one, on touch too. */}
+      <Stack gap="2xl">
         {task.prs.length === 0 ? (
           <Text fz="sm" c="dimmed">
             None attached. Its worker's PR attaches itself; the task is done once all attached PRs have merged.
