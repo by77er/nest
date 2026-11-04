@@ -83,6 +83,10 @@ pub struct Config {
     pub cut_clone_ns_per_extent: u64,
     #[serde(default = "default_cut_read_bytes_per_s")]
     pub cut_read_bytes_per_s: u64,
+    /// Compare each shadow cut with its disk, byte for byte, in the pause (tests; it reads both
+    /// whole): a shadow that differs fails the cut.
+    #[serde(default)]
+    pub disk_cut_verify: bool,
 }
 
 fn default_cut_clone_ns_per_extent() -> u64 {
@@ -105,6 +109,9 @@ pub enum DiskCut {
     /// Tests and the e2e harness only: a cut taken by copying the disk under an exclusive `flock`
     /// (`storage::locked_copy`), where the filesystem has no reflink.
     LockedCopy,
+    /// Tests and the e2e harness only: the shadow cut (M3′) over a content-hash stand-in for FIEMAP
+    /// and a byte copy for the range clone (`storage::sim_fiemap`), where the filesystem has no reflink.
+    SimShadow,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

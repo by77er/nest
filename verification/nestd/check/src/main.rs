@@ -6,7 +6,7 @@
 //! [,commits=N][,restarts=N]` check the lease and the unchanged-disk short-circuit.
 
 use nestd_check::fleet::{Config, FleetModel, describe};
-use nestd_check::{lease, sentinel};
+use nestd_check::{lease, sentinel, shadow};
 use nestd_check::{check, counterexample};
 
 fn parse(spec: &str) -> Result<Config, String> {
@@ -63,6 +63,26 @@ fn main() {
             println!("{spec}: {} states in {:.1?}; violated {:?}; examples {:?}", o.unique_states, o.elapsed, o.violations, o.examples);
             for v in &o.violations {
                 if let Some(path) = counterexample(&|| sentinel::SentinelModel { cfg }, v) {
+                    println!("  {v} ({} steps): {:?}", path.len() - 1, path.iter().filter_map(|(_, a)| a.clone()).collect::<Vec<_>>());
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = spec.strip_prefix("shadow") {
+            let mut cfg = shadow::Config::fixed();
+            for p in rest.split(',').filter(|p| !p.is_empty()) {
+                match p.split_once('=') {
+                    None if p == "live-base" => cfg.live_base = true,
+                    None if p == "stale-shadow-map" => cfg.stale_shadow_map = true,
+                    Some(("writes", v)) => cfg.max_writes = v.parse().expect("a number"),
+                    Some(("cuts", v)) => cfg.max_cuts = v.parse().expect("a number"),
+                    _ => panic!("unknown shadow option {p}"),
+                }
+            }
+            let o = check(shadow::ShadowModel { cfg });
+            println!("{spec}: {} states in {:.1?}; violated {:?}; examples {:?}", o.unique_states, o.elapsed, o.violations, o.examples);
+            for v in &o.violations {
+                if let Some(path) = counterexample(&|| shadow::ShadowModel { cfg }, v) {
                     println!("  {v} ({} steps): {:?}", path.len() - 1, path.iter().filter_map(|(_, a)| a.clone()).collect::<Vec<_>>());
                 }
             }

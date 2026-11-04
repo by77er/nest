@@ -4,6 +4,7 @@
 pub mod fleet;
 pub mod lease;
 pub mod sentinel;
+pub mod shadow;
 
 use std::time::{Duration, Instant};
 
