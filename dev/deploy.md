@@ -87,6 +87,31 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Unconfirmed operator cleanups** (the owner to confirm they were done): the old SSM parameter `/nest/control-plane/vars/AWS_CELLS` if it was never imported into a cell stack; the legacy Worker secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `ROOT_CA_KMS_KEY_ID`, `ROOT_CA_CERT_PEM`) and the SSM parameter `/nest/control-plane/vars/ROOT_CA_KMS_KEY_ID`; the unattached reusable Access policies left by the edge stack's import; and respawning agents whose stored prompts still describe removed tools.
 - **Still needed by hosts:** `sandbox_create`, `sandbox_fork` and `agent_start` carry a `ws_` value (`compatWorkstream`), which hosts and runners from before workstreams left require (Rust's `WorkstreamId`, prefix-checked). Drop it from the control plane (and `SandboxInfo`/`AgentInfo`) once every host runs that release or later, then the Rust fields the release after. The policy layer's wire value `workstream` (the operator layer; hosts parse a closed enum) stays.
 
+**This release's rollout rule (instance types): not a one-way deploy, and nothing by hand.** The `use1` cell's `launchTypes` become `c8id.large, m8id.large, i7i.large, r8id.large`, then the EBS-only `c8i-flex.large, c8i.large, m8i.large`. Its `instanceFamilies` gain `i7i`, so IAM's `EightIOnly` also allows `i7i*.*`.
+- **Why:** `c8id.large` is scarce in the cell's zones. Its spot placement score was 1 of 10 in us-east-1a, 1b and 1c (`get-spot-placement-scores`, 2026-11-03), and on-demand launches found no capacity in any of them that evening. The first real launch after M2 fell back to `c8i-flex.large`, which has no instance store.
+- **Only nested-virtualization types can serve:** Firecracker needs `/dev/kvm`, which a virtual EC2 instance has only with nested virtualization. AWS offers it on C/M/R 7i and 8i, X8i, I7i and I7ie ([user guide](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html)). Of those, only the 8id families and I7i/I7ie have local NVMe (`describe-instance-types`, `processor-info.supported-features=nested-virtualization`, `instance-storage-supported=true`). So `c6id`, `m6id`, `r6id` and `c7id` are out: they have no nested virtualization. All of these are Intel. nest uses no Firecracker CPU template, and disk-only restores carry no CPU state across hosts.
+- **The guard:** `launch_types_sound` proves every type is in that list, and that every instance-store type comes before every EBS-only one, since FleetDO tries spot in list order and then the first type on demand.
+- **Prices** (us-east-1, Linux, verified 2026-11-03: Price List API `get-products` for [on demand](https://aws.amazon.com/ec2/pricing/on-demand/), `describe-spot-price-history` for [spot](https://aws.amazon.com/ec2/spot/pricing/), `get-spot-placement-scores` for one instance in one zone; all offered in every us-east-1 zone):
+
+  | Type | vCPU, RAM | Instance store | On demand | Spot 1a / 1b / 1c | Placement score 1a / 1b / 1c |
+  |---|---|---|---|---|---|
+  | `c8id.large` | 2, 4 GiB | 118 GB | $0.11088 | $0.0555 / 0.0288 / 0.0316 | 1 / 1 / 1 |
+  | `m8id.large` | 2, 8 GiB | 118 GB | $0.13052 | $0.0371 / 0.0400 / 0.0335 | 1 / 1 / 1 |
+  | `i7i.large` | 2, 16 GiB | 468 GB | $0.18880 | $0.0460 / 0.0517 / 0.0443 | 3 / 3 / 3 |
+  | `r8id.large` | 2, 16 GiB | 118 GB | $0.16632 | $0.0489 / 0.0705 / 0.1610 | 1 / 1 / 1 |
+  | `i7ie.large` (not listed) | 2, 16 GiB | 1,250 GB | $0.25990 | $0.0526 / 0.0654 / 0.0466 | 3 / 3 / 2 |
+  | `c8i-flex.large` | 2, 4 GiB | none | $0.08902 | $0.0319 / 0.0434 / 0.0390 | 3 / 1 / 3 |
+  | `c8i.large` | 2, 4 GiB | none | $0.09371 | $0.0376 / 0.0438 / 0.0385 | 1 / 3 / 3 |
+  | `m8i.large` | 2, 8 GiB | none | $0.10584 | $0.0367 / 0.0402 / 0.0427 | 3 / 1 / 2 |
+
+- **What it costs:** on spot, a host is now most likely an `m8id` or `i7i` at $0.033–0.052 an hour, against `c8i-flex.large`'s $0.032–0.043: up to about +$0.01 an hour, or about +$7 a month per always-on host.
+  - `i7i.large` has 4× `c8id`'s memory, so a host packs more sandboxes (placement packs memory).
+  - The on-demand fallback stays `c8id.large` ($0.11088).
+  - `maxHosts` (4) bounds the spot side at about +$30 a month.
+  - Spot prices move; the placement scores are one evening's.
+- **Rollout:** inframe applies the cell stack (the IAM policy and `AWS_CELLS`), then the Worker reads the new `AWS_CELLS`. Running hosts don't change. Nothing else differs per type: `bootstrap.sh` formats whatever instance-store NVMe it finds (468 GB on `i7i`).
+- **What a rollback does:** reverting puts the previous four types back. A host of a type no longer listed keeps running until it retires.
+
 **This release's rollout rule (checkpoint cuts, M2): not a one-way deploy, and nothing by hand.** The merge's own `deploy.yml` run does all of it. No Durable Object class is added, and the guest image doesn't change. The wire gains one optional field, `commit_request.cut_ms` (and `GenerationRecord.cut_ms`), which either side of the previous release ignores (zod strips it, and serde has no unknown-field refusal).
 - **The first run failed at `infra` (2026-11-03, run 41714276937), and nothing reached production.**
   - EC2 refused both launch templates' new versions: `InvalidUserData.Malformed: User data is limited to 16384 bytes`. The new `bootstrap.sh` with `install.sh` inside is 18.5 KB.

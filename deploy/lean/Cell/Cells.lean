@@ -8,11 +8,14 @@ namespace Cell
 def use1 : CellSpec :=
   { name := "use1", region := "us-east-1", accountId := "589531222691"
     controlUrl := "https://nest.bitcru.sh"
-    -- An instance store first (c8id: sandbox state on XFS with reflink, so a checkpoint pauses a VM
-    -- only for a clone; docs/sandbox/state/disk/), the EBS-only types behind it for capacity (their
-    -- checkpoints pause for whole reads). c8id.large is about 25% dearer on demand than
-    -- c8i-flex.large and about the same on spot (dev/deploy.md, "checkpoint cuts").
-    launchTypes := ["c8id.large", "c8i-flex.large", "c8i.large", "m8i.large"]
+    -- Instance-store types first (sandbox state on XFS with reflink, so a checkpoint pauses a VM only
+    -- for a clone; docs/sandbox/state/disk/), cheapest first, then the EBS-only types for capacity
+    -- (their checkpoints pause for whole reads). Only types with nested virtualization and local
+    -- NVMe: the 8id families and I7i (I7ie costs more for space nest doesn't use). c8id.large is
+    -- scarce in the cell's zones (spot placement score 1 of 10 on 2026-11-03), so m8id and i7i
+    -- stand behind it (dev/deploy.md, "instance types").
+    instanceFamilies := ["c8i", "m8i", "r8i", "i7i"]
+    launchTypes := ["c8id.large", "m8id.large", "i7i.large", "r8id.large", "c8i-flex.large", "c8i.large", "m8i.large"]
     -- From the stress test (dev/cloud-checks/stress-2026-10-31.md): a c8i-flex.large held 14 idle
     -- sandboxes, so 4 hosts take about 50; 16 Haiku brains ran on a t3a.medium (about 105 MB each,
     -- CPU peaking near 60%), so 12 leaves room for heavier sessions, and 3 hosts hold 36. 14 vCPU in

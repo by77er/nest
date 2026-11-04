@@ -62,7 +62,9 @@ structure CellSpec where
   accountId : String
   /-- The control plane's public URL, which hosts enroll with. -/
   controlUrl : String
-  /-- Instance families the control plane may launch, the 8i family only: IAM allows `<family>*.*`. -/
+  /-- Instance families the control plane may launch: only families with nested virtualization
+  (Firecracker needs `/dev/kvm`; AWS lists C/M/R 7i and 8i, I7i, I7ie and X8i), IAM allowing
+  `<family>*.*`. A cell adds a family by name. -/
   instanceFamilies : List String := ["c8i", "m8i", "r8i"]
   /-- The instance types FleetDO launches, in preference order; the first is also the on-demand
   fallback. Each must fall within `instanceFamilies` (`launch_types_within_iam` in `Cell.Test`). -/
@@ -115,6 +117,26 @@ def instancePatterns (spec : CellSpec) : List String := spec.instanceFamilies.ma
 has a `.` after it. (`*` matches any run of characters, including none.) -/
 def matchesFamily (family type : String) : Bool :=
   family.toList.isPrefixOf type.toList && (type.toList.drop family.length).contains '.'
+
+/-- The families AWS offers nested virtualization on (and so `/dev/kvm` for Firecracker), from the
+EC2 user guide's list (2026-11-03): https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amazon-ec2-nested-virtualization.html -/
+def nestedVirtualizationFamilies : List String :=
+  ["m7i", "m7i-flex", "m8i", "m8id", "m8i-flex", "c7i", "c7i-flex", "c8i", "c8id", "c8i-flex",
+   "r7i", "r7iz", "r8i", "r8id", "r8i-flex", "x8i", "i7i", "i7ie"]
+
+/-- An instance type's family, as characters: what comes before its `.` (lists, so `decide` reduces it). -/
+def familyOf (type : String) : List Char := type.toList.takeWhile (· ≠ '.')
+
+/-- Whether a type has local NVMe instance store, by nest's families: the `d` variants and I7i/I7ie. -/
+def hasInstanceStore (type : String) : Bool :=
+  let f := familyOf type
+  f.getLast? == some 'd' || f == "i7i".toList || f == "i7ie".toList
+
+/-- Every type the autoscaler may pick has nested virtualization, and the instance-store types come
+before every EBS-only one (FleetDO tries them in order). -/
+def CellSpec.launchTypesSound (spec : CellSpec) : Bool :=
+  spec.launchTypes.all (fun t => nestedVirtualizationFamilies.any (·.toList == familyOf t))
+    && (spec.launchTypes.dropWhile hasInstanceStore).all (fun t => !hasInstanceStore t)
 
 /-- Every type the autoscaler may pick is one IAM lets it launch. -/
 def CellSpec.launchTypesAllowed (spec : CellSpec) : Bool :=

@@ -111,6 +111,13 @@ example : matchesFamily "c8i" "c8i-flex.large" ∧ !matchesFamily "c8i" "c7i.lar
 launch never fails on `EightIOnly`. -/
 theorem launch_types_within_iam : use1.launchTypesAllowed = true := by decide
 
+/-- Every sandbox type has nested virtualization (Firecracker needs KVM), and the instance-store
+types come first, so FleetDO tries every one of them before an EBS-only type. -/
+theorem launch_types_sound : use1.launchTypesSound = true := by decide
+
+example : hasInstanceStore "c8id.large" ∧ hasInstanceStore "i7i.large" ∧ !hasInstanceStore "c8i-flex.large"
+    ∧ !hasInstanceStore "m8i.large" := by decide
+
 /-- The same for its brain hosts and `BrainTypesOnly`. -/
 theorem brain_launch_types_within_iam : use1.brainLaunchTypesAllowed = true := by decide
 
