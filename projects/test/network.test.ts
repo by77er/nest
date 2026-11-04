@@ -171,7 +171,7 @@ describe("applying the rules", () => {
     const put = fake.callsTo("PUT", /\/client-policy$/).at(-1)!;
     expect(put.path).toBe(`/v1/sandboxes/${sb.sandbox}/client-policy`);
     // Sent in the PUT's strict shape (nest refuses a held binding's `client` and `placeholder`), so it applied.
-    expect(put.body).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [binding], env: vars });
+    expect(put.body).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [binding], env: vars, github_push: { workflows: false } });
     expect(sb.layer).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [binding], env: vars });
     expect(r.body.agents).toEqual([expect.objectContaining({ agent: s.manager, role: "manager", state: "applied", sandbox: sb.sandbox })]);
     // A change to the other role's rules writes nothing to this one's sandbox.
@@ -199,7 +199,7 @@ describe("applying the rules", () => {
     for (const worker_rules of [[{ host: "pypi.org" }], [{ host: "nodejs.org", ports: [443] }], []]) {
       const r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: worker_rules, manager: [] });
       expect(r.status).toBe(200);
-      expect(fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${sb.sandbox}/client-policy$`)).at(-1)!.body).toEqual({ egress: { allow: worker_rules }, inject: bindings, env: vars });
+      expect(fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${sb.sandbox}/client-policy$`)).at(-1)!.body).toEqual({ egress: { allow: worker_rules }, inject: bindings, env: vars, github_push: { workflows: false } });
       expect(sb.layer).toEqual({ egress: { allow: worker_rules }, inject: bindings, env: vars });
       expect(r.body.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: worker, state: "applied", error: null })]));
     }

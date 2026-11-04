@@ -101,18 +101,29 @@ export interface HeldBinding extends Binding {
   placeholder?: string;
 }
 
-/** A sandbox's client layer, nest's `PUT …/client-policy` body (every part present: an absent one is emptied). */
+/** The push token's opt-ins, as a client layer carries them (`workflows: write` on a sandbox's push token). */
+export interface GithubPush {
+  workflows: boolean;
+}
+
+/**
+ * A sandbox's client layer, nest's `PUT …/client-policy` body (every part present: an absent one is
+ * emptied). `github_push` only to a control plane that answers it (`GET` has it): an older one refuses
+ * the key.
+ */
 export interface ClientLayer {
   egress: { allow: EgressRule[] };
   inject: Binding[];
   env: Record<string, string>;
+  github_push?: GithubPush;
 }
 
-/** A sandbox's client layer as `GET …/client-policy` answers it. */
+/** A sandbox's client layer as `GET …/client-policy` answers it (`github_push`: absent from an older control plane). */
 export interface HeldClientLayer {
   egress: { allow: EgressRule[] };
   inject: HeldBinding[];
   env: Record<string, string>;
+  github_push?: GithubPush;
 }
 
 /** A held binding back in the PUT's shape: nest's strict schema refuses `client` and `placeholder`. */
@@ -128,6 +139,8 @@ export function asBinding(b: HeldBinding): Binding {
 export interface LayerFeeds {
   inject?: Binding[];
   env?: Record<string, string>;
+  /** The push token's opt-ins (Settings' workflows toggle, for workers). */
+  github_push?: GithubPush;
 }
 
 /**
@@ -141,6 +154,8 @@ export function clientLayerFor(rules: RoleRules, role: LayerRole, feeds: LayerFe
     egress: { allow: role === "reviewer" ? [] : normalizeRules(rules[role]) },
     inject: (feeds.inject ?? current?.inject ?? []).map(asBinding),
     env: feeds.env ?? current?.env ?? {},
+    // Only where nest answers it (an older control plane refuses the key): the feed's, else as it is.
+    ...(current?.github_push ? { github_push: { ...(feeds.github_push ?? current.github_push) } } : {}),
   };
 }
 
@@ -225,5 +240,7 @@ export function shrinkLayer(current: HeldClientLayer | null, desired: ClientLaye
   // A variable holding a placeholder goes with its binding (nest refuses one that names none in the layer).
   const env = Object.fromEntries(Object.entries(current?.env ?? {}).filter(([k, v]) =>
     desired.env[k] === v && (!v.includes("nest-ph.") || inject.some((x) => v.endsWith(`.${x.name}.`)))));
-  return { egress: { allow }, inject, env };
+  // An opt-in stays only if both have it: turning it off is a removal, and goes through.
+  const push = current?.github_push ? { github_push: { workflows: current.github_push.workflows && desired.github_push?.workflows === true } } : {};
+  return { egress: { allow }, inject, env, ...push };
 }

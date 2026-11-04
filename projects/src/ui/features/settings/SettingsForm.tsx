@@ -8,6 +8,7 @@ import { schemaResolver, useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
 import { Settings as SettingsSchema } from "../../../requests";
 import { useRetryRepoAutoMerge, useSecrets, useUpdateSettings } from "../../api/queries";
+import { LiveAgents } from "../project/LiveAgents";
 import type { Settings } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
@@ -158,18 +159,21 @@ export function RepoAutoMergeStatus({ projectId, status }: { projectId: string; 
 
 /**
  * "Workers may change CI workflows" (README.md#secrets): off by default; on, workers' push tokens get
- * `workflows: write`, which the grant must allow. With the security note: a pushed workflow runs with
- * the repo's Actions secrets before anyone reviews it.
+ * `workflows: write`, which the grant must allow, live workers' too (through their sandbox's client
+ * layer), each shown applied, pending or failed with whether it has it. With the security note: a
+ * pushed workflow runs with the repo's Actions secrets before anyone reviews it.
  */
 function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: string; checked?: boolean; onChange?: (e: React.ChangeEvent<HTMLInputElement>) => void; error?: React.ReactNode }) {
   const secrets = useSecrets(projectId);
   const allowed = secrets.data?.grant?.workflows;
-  const keeping = secrets.data?.workflow_workers ?? [];
+  // Each live worker's layer (applied, pending or failed), and whether its push token may change workflows as last applied.
+  const workers = (secrets.data?.agents ?? []).filter((a) => a.role === "worker");
+  const can = new Set(secrets.data?.workflow_workers ?? []);
   return (
     <Stack gap="sm">
       <Switch
         label="Workers may change CI workflows"
-        description="Their pushes may add or change files under .github/workflows/. Off, GitHub refuses those pushes from workers started from then on; live ones keep it until they end."
+        description="Their pushes may add or change files under .github/workflows/; off, GitHub refuses those pushes. Saved, it reaches live workers in a moment too, through their sandbox."
         checked={checked}
         onChange={onChange}
         error={error}
@@ -180,12 +184,14 @@ function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: 
           The app's grant doesn't allow it: the operator sets github_push.workflows in its grant first.
         </Text>
       )}
-      {!checked && keeping.length > 0 && (
-        <Notice tone="warning" title={`${keeping.length === 1 ? "A live worker keeps" : `${keeping.length} live workers keep`} it until it ends`}>
-          <Text fz="sm">
-            Turning it off reaches workers started from now on. A worker's push token is made with its sandbox, so these keep it until they end: {keeping.join(", ")}.
-          </Text>
-        </Notice>
+      {workers.length > 0 && (
+        <LiveAgents
+          framed={false}
+          agents={workers}
+          label="Live workers' push tokens"
+          empty=""
+          detail={(a) => (can.has(a.agent) ? "Its pushes may change workflows" : "Its pushes may not change workflows")}
+        />
       )}
       {checked && (
         <Notice tone="warning" title="A pushed workflow runs before anyone reviews it">
