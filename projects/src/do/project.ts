@@ -143,6 +143,9 @@ export interface Ask {
 export type Actor = { kind: "owner" } | { kind: "app"; what: string } | { kind: "agent"; agent: string; tainted: boolean };
 
 const MAX_WORKERS_LIMIT = 20;
+/** A chat page's size by default, and at most: older pages load as the owner scrolls up. */
+export const CHAT_PAGE = 50;
+export const CHAT_PAGE_MAX = 200;
 /** How long a deduplicated MCP call's answer is kept (nest retries a lost answer within minutes). */
 const CALLS_KEEP_MS = 24 * 3600 * 1000;
 
@@ -925,9 +928,13 @@ export class ProjectDO extends DurableObject<Env> {
 
   // --- chat and approvals ----------------------------------------------------------------------------
 
-  async chat(limit = 200): Promise<Result<ChatMessage[]>> {
+  /** The chat's latest `limit` messages, or those before `before` (a seq): oldest first. */
+  async chat(limit = CHAT_PAGE, before?: number): Promise<Result<ChatMessage[]>> {
     if (!this.settings()) return fail(404, "unknown project");
-    const rows = this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, error FROM chat ORDER BY seq DESC LIMIT ?", limit).toArray().reverse();
+    const n = Math.max(1, Math.min(CHAT_PAGE_MAX, Math.floor(limit)));
+    const rows = (before === undefined
+      ? this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, error FROM chat ORDER BY seq DESC LIMIT ?", n)
+      : this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, error FROM chat WHERE seq < ? ORDER BY seq DESC LIMIT ?", before, n)).toArray().reverse();
     return ok(rows.map((r) => ({
       seq: r.seq as number, at_ms: r.at_ms as number, sender: r.sender as string, text: r.text as string,
       delivered: r.next_ms === null && r.error === null, error: (r.error as string | null) ?? null,

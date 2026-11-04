@@ -1,0 +1,228 @@
+/* The manager chat (the nest-ui-design skill; Claude.ai and Linear as the bar): the log scrolls in itself,
+   never the page; the owner's messages a quiet bubble on the right, the manager's unboxed prose across
+   the measure; groups by author, day separators, meta revealed on hover and focus. */
+.frame {
+  position: relative;
+  min-width: 0;
+}
+
+.log {
+  min-height: 12rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* Reading back, the browser's scroll anchoring holds your line as content above grows. */
+  overflow-anchor: auto;
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-xs) var(--mantine-spacing-lg) 0;
+}
+
+/* Following the end, the log doesn't anchor: the chat keeps the end in view itself as content grows. */
+.log[data-following] {
+  overflow-anchor: none;
+}
+
+/* Only a whole message anchors the scroll, never something inside one: a chip re-wrapping its line
+   would move an inner anchor, and the whole log with it. */
+.row *,
+.note * {
+  overflow-anchor: none;
+}
+
+.logContent {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-xl);
+}
+
+.day {
+  display: flex;
+  align-items: center;
+  gap: var(--mantine-spacing-md);
+  color: var(--nest-muted);
+  font-size: var(--mantine-font-size-xs);
+  font-weight: 500;
+}
+
+.day::before,
+.day::after {
+  content: "";
+  flex: 1 1 auto;
+  border-top: var(--nest-border);
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-sm);
+}
+
+.group[data-side="owner"] {
+  align-items: flex-end;
+}
+
+.name {
+  font-size: var(--mantine-font-size-xs);
+  font-weight: 600;
+  color: var(--mantine-color-text);
+}
+
+.row {
+  position: relative;
+  max-width: 100%;
+  border-radius: var(--mantine-radius-md);
+}
+
+.group[data-side="owner"] .row {
+  max-width: 75%;
+}
+
+.bubble {
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  border-radius: var(--mantine-radius-md);
+  background: var(--nest-subtle);
+}
+
+.note {
+  align-self: center;
+  color: var(--nest-muted);
+  font-size: var(--mantine-font-size-xs);
+  text-align: center;
+}
+
+/* A message's time and actions: shown on hover and focus (and while a menu of it is open). */
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--mantine-spacing-xs);
+  min-height: var(--nest-hit);
+  opacity: 0;
+  transition: opacity var(--nest-motion-fast) var(--nest-ease-enter);
+}
+
+/* Its items keep their size (a narrow row wraps them instead of squeezing "Retry"). */
+.meta > * {
+  flex-shrink: 0;
+}
+
+.group[data-side="owner"] .meta {
+  justify-content: flex-end;
+  /* One line (its time, its state, Retry, its actions), never wrapped under itself. */
+  flex-wrap: nowrap;
+}
+
+@media (max-width: 48em) {
+  .group[data-side="owner"] .row {
+    max-width: 92%;
+  }
+}
+
+.row:hover .meta,
+.row:focus-within .meta,
+.meta[data-pinned] {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .meta {
+    opacity: 1;
+  }
+}
+
+.jump {
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + var(--mantine-spacing-sm));
+  transform: translateX(-50%);
+  z-index: 2;
+}
+
+/* The turn in progress: the text so far (its last character the cursor, inline after the last word:
+   the feature appends it), and the running tool's line. */
+.cursor {
+  min-width: 0;
+}
+
+.activity {
+  display: flex;
+  align-items: baseline;
+  gap: var(--mantine-spacing-xs);
+  font-family: var(--mantine-font-family-monospace);
+  font-size: var(--mantine-font-size-xs);
+  color: var(--nest-muted);
+}
+
+.dot {
+  color: var(--mantine-color-success-text);
+}
+
+.dock {
+  position: relative;
+  padding: var(--mantine-spacing-md) 0 calc(var(--mantine-spacing-md) + env(safe-area-inset-bottom));
+  border-top: var(--nest-border);
+  background: var(--nest-page-bg);
+}
+
+/* On a phone the page's column is the one scroller (the viewport less the top bar): the header and the
+   context scroll away above the log, which flows in it, and the composer is pinned at its bottom. */
+@media (max-width: 48em) {
+  :global([data-ds="page"]):has(.log) {
+    height: calc(100dvh - var(--nest-header-height));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding-bottom: 0;
+  }
+
+  :global([data-ds="page"]):has(.log[data-following]) {
+    overflow-anchor: none;
+  }
+
+  .log {
+    min-height: 0;
+    overflow: visible;
+    padding-right: 0;
+  }
+
+  .dock {
+    position: sticky;
+    bottom: 0;
+    z-index: 3;
+  }
+}
+
+.appear {
+  animation: appear var(--nest-motion-base) var(--nest-ease-enter);
+}
+
+@keyframes appear {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .appear {
+    animation: none;
+  }
+}
+
+/* A code block's header: its language and a copy button. */
+.codeHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--mantine-spacing-sm);
+  padding: var(--mantine-spacing-2xs) var(--mantine-spacing-sm) 0 var(--mantine-spacing-md);
+  font-family: var(--mantine-font-family-monospace);
+  font-size: var(--mantine-font-size-xs);
+  color: var(--nest-muted);
+}
+
+.code {
+  border-radius: var(--mantine-radius-md);
+  background: var(--nest-subtle);
+}
+
+.code pre {
+  background: transparent;
+}

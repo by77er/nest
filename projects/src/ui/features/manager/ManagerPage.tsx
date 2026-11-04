@@ -34,7 +34,7 @@ export function ManagerPage() {
               </Tabs.Tab>
             </Tabs.List>
             <Tabs.Panel value="chat" pt="xl">
-              <ChatView projectId={projectId} />
+              <ChatView projectId={projectId} agent={p.settings.manager} />
             </Tabs.Panel>
             <Tabs.Panel value="trace" pt="xl">
               <ManagerTrace settings={p.settings} />

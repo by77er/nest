@@ -4,14 +4,16 @@
 // (a task waiting on two of three, one waited on by two, one whose blockers are all done).
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
-// message with every kind of rich content), "chat-empty" or "chat-long" (thirty messages). Traces come
-// from trace.mjs: history pages plus a live ring.
+// message with every kind of rich content), "chat-empty", "chat-long" (thirty messages), "chat-paged"
+// (120, paged by `before`) or "chat-arriving" (a reply lands a few seconds in). Traces come from
+// trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
 import { trace } from "./trace.mjs";
 
 const DAY = 86_400_000;
 
 export function data(variant = "demo", now = Date.now()) {
+  const born = Date.now();
   const long = variant === "long";
   const name = long ? "Gadgets platform: the customer-facing catalogue, its search and the export pipeline" : "Gadgets";
   const repo = long ? "by77er/gadgets-platform-customer-facing-catalogue-and-search" : "by77er/gadgets";
@@ -139,19 +141,37 @@ export function data(variant = "demo", now = Date.now()) {
     "> The staging data has 40k gadgets; p95 is 180 ms today.",
     "See the [Postgres GIN docs](https://www.postgresql.org/docs/current/gin.html) and the mock-up: ![search mock-up](https://example.com/mockup.png)",
   ].join("\n\n");
+  function chatLong() {
+    const out = [];
+    for (let k = 0; k < 30; k++) {
+      const owner = k % 2 === 0;
+      out.push({ seq: k + 1, at_ms: now - (30 - k) * 600_000, sender: k === 13 ? "app" : owner ? "owner" : "manager",
+        text: k === 13 ? "The manager restarted (upgrade)." : owner ? `Message ${k + 1}: what is the status of the ${["search", "export", "auth", "cache"][k % 4]} work? Keep it short, please.` : `Reply ${k + 1}: **${["search", "export", "auth", "cache"][k % 4]}** is moving. task:tsk_demo${(k % 8) + 1} is the one to watch; I'll report back when it lands, with the PR and the review's verdict.`,
+        delivered: true, error: null });
+    }
+    return out;
+  }
+  // A long history, paged as the Worker pages it: the latest 50, then 50 before a seq.
+  const chatHistory = Array.from({ length: 120 }, (_, k) => ({
+    seq: k + 1, at_ms: now - (120 - k) * 900_000, sender: k % 3 === 0 ? "owner" : "manager",
+    text: k % 3 === 0 ? `Message ${k + 1}: how is the ${["search", "export", "auth"][k % 3]} work going?` : `Reply ${k + 1}: on track; task:tsk_demo${(k % 8) + 1} next.`,
+    delivered: true, error: null,
+  }));
+  const page = (before, limit = 50) => {
+    const older = before === null ? chatHistory : chatHistory.filter((m) => m.seq < before);
+    return older.slice(-limit);
+  };
+  const paged = page(null);
   const chatFor = () => {
     if (variant === "chat-empty") return [];
     if (variant === "rich") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: RICH, delivered: true, error: null }];
-    if (variant === "chat-long") {
-      const out = [];
-      for (let k = 0; k < 30; k++) {
-        const owner = k % 2 === 0;
-        out.push({ seq: k + 1, at_ms: now - (30 - k) * 600_000, sender: k === 13 ? "app" : owner ? "owner" : "manager",
-          text: k === 13 ? "The manager restarted (upgrade)." : owner ? `Message ${k + 1}: what is the status of the ${["search", "export", "auth", "cache"][k % 4]} work? Keep it short, please.` : `Reply ${k + 1}: **${["search", "export", "auth", "cache"][k % 4]}** is moving. task:tsk_demo${(k % 8) + 1} is the one to watch; I'll report back when it lands, with the PR and the review's verdict.`,
-          delivered: true, error: null });
-      }
-      return out;
+    if (variant === "chat-paged") return paged;
+    if (variant === "chat-arriving") {
+      // A reply lands a few seconds in (after the reader has scrolled up): the jump-to-latest pill.
+      const base = chatLong();
+      return Date.now() - born > 3_000 ? [...base, { seq: 31, at_ms: now, sender: "manager", text: "New: task:tsk_demo7 passed review.", delivered: true, error: null }] : base;
     }
+    if (variant === "chat-long") return chatLong();
     return chat;
   };
   const detail = (id) => byId[id] && { ...byId[id], history: history[id] ?? [{ at_ms: now - 7_200_000, actor: "owner", action: "created", detail: JSON.stringify({ title: byId[id].title }), tainted: false }] };
@@ -177,12 +197,13 @@ export function data(variant = "demo", now = Date.now()) {
   // Every trace (the manager's, a worker's, a reviewer's): history offered and paged, then the live ring (trace.mjs).
   const { messages: allMessages, pages: historyPages } = trace(now);
   // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
-  const traceMessages = variant === "connecting" ? [] : allMessages;
+  // "chat-empty" is a new conversation: no turn running either (its starters show).
+  const traceMessages = variant === "connecting" || variant === "chat-empty" ? [] : allMessages;
   const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length }, { ...other, needs_you: 0 }];
   const sync = { written: ["capabilities/projects/board", "capabilities/projects/task", "templates/projects/manager", "templates/projects/worker"], repos: ["by77er/gadgets", "by77er/widgets"], at_ms: now - 3_600_000 };
 
-  /** The answer to `GET|POST /api<path>`: [status, body]. */
-  const answer = (method, path) => {
+  /** The answer to `GET|POST /api<path>?<search>`: [status, body]. */
+  const answer = (method, path, search = new URLSearchParams()) => {
     if (variant === "error") return [500, { error: "internal error (fixture)" }];
     if (path === "/projects") return [200, { projects }];
     if (path === "/admin/sync-state") return [200, sync];
@@ -190,6 +211,8 @@ export function data(variant = "demo", now = Date.now()) {
     if (!path.startsWith("/projects/prj_demo")) return [404, { error: "unknown project" }];
     const q = path.slice("/projects/prj_demo".length);
     const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
+    if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
+    if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];
     if (q in routes) return [200, routes[q]];
     // A task's detail: each task's own, with its history (tsk_demo3 has no worker).
     if (q.startsWith("/tasks/")) {

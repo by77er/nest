@@ -5,7 +5,7 @@
 //   node scripts/ui-review/selftest.mjs
 import assert from "node:assert/strict";
 import { chromium } from "playwright";
-import { inkHeaderGap, inkPrs, inkTrace } from "./apps/projects.mjs";
+import { inkChatFit, inkHeaderGap, inkPrs, inkTrace } from "./apps/projects.mjs";
 import { measure } from "./checks.mjs";
 import { countTraffic, tabKeepCheck } from "./trace-tabs.mjs";
 import { proseProblems } from "./trace-prose.mjs";
@@ -295,6 +295,22 @@ for (const remount of [false, true]) {
   const kept = await at(header, "[data-slot=meta] a { padding-block: 12px; margin-block: -12px; display: inline-block; }", inkHeaderGap);
   assert.ok(Math.abs(kept - mouse) <= 4, `a hit box grown without its line passes (${kept} vs ${mouse})`);
   assert.ok(Math.abs(grown - mouse) > 4, `a header link that grows its line must fail (${grown} vs ${mouse})`);
+  // The chat fits the viewport (chat-fit): a phone's layout, the page's column the one scroller, the
+  // composer pinned at its bottom. Clean, it passes; the reviewer's plants fail.
+  const chat = `<div data-ds="page" style="height: 788px; margin-top: 56px; overflow-y: auto; box-sizing: border-box; padding: 16px 16px 0">
+    <h1 style="margin: 0">Gadgets</h1>
+    <div style="display: flex; flex-direction: column; gap: 12px">
+      <div data-ds="chat-log">${Array.from({ length: 40 }, (_, k) => `<p style="margin: 0 0 12px">Message ${k + 1}</p>`).join("")}</div>
+      <div data-ds="composer-dock" style="position: sticky; bottom: 0; background: #fff; padding: 12px 0"><textarea style="width: 100%; height: 60px"></textarea></div>
+    </div></div>`;
+  const fit = (css) => at(chat, `body { margin: 0; } ${css}`, inkChatFit);
+  assert.deepEqual(await fit(""), [], `the clean chat fits: ${JSON.stringify(await fit(""))}`);
+  for (const [plant, css] of [
+    ["the page 200 px taller", "[data-ds=page] { padding-bottom: 200px !important; }"],
+    ["the composer pushed 400 px down", "[data-ds=composer-dock] { margin-top: 400px !important; }"],
+    ["the document scrolling", "[data-ds=page] { height: 1200px !important; }"],
+    ["a short chat's composer floating above the bottom", "[data-ds=chat-log] p:nth-child(n+3) { display: none; } [data-ds=composer-dock] { position: static; }"],
+  ]) assert.notDeepEqual(await fit(css), [], `chat-fit: ${plant} must fail`);
   await page2.close();
 }
 
