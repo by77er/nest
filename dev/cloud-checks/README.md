@@ -46,6 +46,22 @@ CHECK_SINCE=2026-11-03T22:03:00Z python3 -I dev/cloud-checks/new_host_check.py
 
 EC2 keeps a console's latest snapshot for a while after termination. A snapshot can lag by many minutes (`dev/measure-cut/run.sh`), so run it again when one looks empty.
 
+## `hands_probe_check.py`
+
+Proves a sandbox host's gateway reaches its VMs, which `new_host_check.py` can't see: on 2026-11-04 a host enrolled fine, and every hands call to it failed because its gateway couldn't open the VM's vsock socket.
+
+```bash
+uv run --with 'websockets>=13' python3 -I dev/cloud-checks/hands_probe_check.py
+```
+
+| | |
+|---|---|
+| **Settings** | `NEST_ADMIN_TOKEN`, `NEST_ACCESS_CLIENT_ID` and `NEST_ACCESS_CLIENT_SECRET` (Access in front of the gateways), `NEST_BASE_URL`, `NEST_CELL`, `CHECK_TIMEOUT_S` (900) |
+| **Creates** | one sandbox (label `check=hands-probe`). In a cold cell, the autoscaler launches a sandbox host |
+| **Passes when** | the gateway answers `bound` to a brain's `bind`. It does so only after connecting to the guest's vsock socket; `busy` is retried for 2 minutes, as a brain does |
+| **Reports** | the sandbox, its host, the instance and its type |
+| **Cleans up** | destroys the sandbox on every exit path, SIGTERM included, retrying the `DELETE` five times. The check fails unless it answers 2xx (or 404: already gone), and a leak is printed with the id to destroy by hand |
+
 ## `stress.py`
 
 A stress test of a cell: many sandboxes and agents at once, timed phase by phase, with the fleet view sampled throughout so a cell's limits can be read afterwards.

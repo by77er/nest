@@ -51,7 +51,12 @@ fi
 # in a brief pause; without one, nestd says so at start and pauses VMs for whole reads
 # (docs/sandbox/state/disk/). The kernel, base images and the jailer's chroots go there too: the
 # jailer hard-links them next to each disk, which only works within one filesystem.
-DATA=/var/lib/nest/data
+# Mounted outside /var/lib/nest: the gateway's unit hides /var/lib/nest, and it must reach each VM's
+# vsock socket inside its chroot (2026-11-04: a host with the store under /var/lib/nest/data failed
+# every hands call). Kernel and images are root's alone (0700); the state is traversable but not
+# listable (0711), since nestd runs cloudflared as nest-cf with its home in it; the gateway's drop-in
+# hides all three. The gateway sees only the chroots, as on the root volume's /srv/jailer.
+DATA=/srv/nest
 STATE_DIR=/var/lib/nest
 KERNEL_DIR=/var/lib/nest/kernel
 IMAGES_DIR=/var/lib/nest/images
@@ -73,7 +78,9 @@ instance_store() {
 if [ -n "$NVME" ]; then
   if instance_store; then
     STATE_DIR=$DATA/state KERNEL_DIR=$DATA/kernel IMAGES_DIR=$DATA/images JAILER_BASE=$DATA/jailer
-    install -d -m 0755 "$STATE_DIR" "$KERNEL_DIR" "$IMAGES_DIR" "$JAILER_BASE"
+    install -d -m 0711 "$STATE_DIR"
+    install -d -m 0700 "$KERNEL_DIR" "$IMAGES_DIR"
+    install -d -m 0755 "$JAILER_BASE"
     if [ -f /var/lib/nest/kernel/vmlinux ] && [ ! -f "$KERNEL_DIR/vmlinux" ]; then cp /var/lib/nest/kernel/vmlinux "$KERNEL_DIR/vmlinux"; fi
     # After a reboot nestd must not start before the store is mounted (it would write into the bare
     # directory the mount then hides), and after a stop and start (the store comes back blank, and
@@ -83,6 +90,9 @@ if [ -n "$NVME" ]; then
       install -d -m 0755 "/etc/systemd/system/$unit.d"
       printf '[Unit]\nRequiresMountsFor=%s\n' "$DATA" > "/etc/systemd/system/$unit.d/instance-store.conf"
     done
+    # The gateway sees the store's chroots and nothing else of it, as it sees /srv/jailer and not
+    # /var/lib/nest on the root volume.
+    printf '[Service]\nInaccessiblePaths=-%s -%s -%s\n' "$STATE_DIR" "$KERNEL_DIR" "$IMAGES_DIR" >> /etc/systemd/system/nest-gateway.service.d/instance-store.conf
     systemctl daemon-reload
     echo "sandbox state on the instance store at $DATA (XFS, reflink)"
   else
