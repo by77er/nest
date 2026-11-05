@@ -33,6 +33,10 @@ exclude_re = [
   'crates/nestd-core/src/[a-z_]+\.rs:\d+:\d+: replace [A-Za-z<>, ]+::is_empty -> bool',
   'crates/nestd-core/src/[a-z_]+\.rs:\d+:\d+: replace == with != in [A-Za-z<>, ]+::is_empty',
 
+  # The shadow cut's merge walk on a tie: both extents are pushed at the same start, so either order
+  # merges into the same range.
+  'crates/nestd-core/src/shadow\.rs:\d+:\d+: replace < with <= in shadows_first',
+
   # Kani harnesses and their stand-ins (`#[cfg(kani)] mod proofs`): cargo test never compiles them,
   # so a mutant there can't fail a test; `cargo kani` is what runs them.
   'crates/nestd-core/src/[a-z_]+\.rs:\d+:\d+: .*\bproofs::',

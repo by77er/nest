@@ -59,10 +59,12 @@ pub struct Range {
     pub end: u64,
 }
 
-/// Flags that say nothing about which bytes an extent holds.
-const IGNORED: u32 = flags::LAST | flags::SHARED | flags::MERGED;
+/// Flags that say nothing about which bytes an extent holds: `LAST | SHARED | MERGED`, written out
+/// (a test checks it) because `|` and `^` of distinct bits can't be told apart.
+const IGNORED: u32 = 0x3001;
 /// Flags under which the mapping can't vouch for the bytes: such an extent always counts as changed.
-const UNTRUSTED: u32 = flags::UNKNOWN | flags::DELALLOC | flags::ENCODED | flags::DATA_ENCRYPTED | flags::NOT_ALIGNED | flags::DATA_INLINE | flags::DATA_TAIL;
+/// `UNKNOWN | DELALLOC | ENCODED | DATA_ENCRYPTED | NOT_ALIGNED | DATA_INLINE | DATA_TAIL`.
+const UNTRUSTED: u32 = 0x078e;
 
 /// A map as the comparison reads it: unwritten extents dropped (holes), the flags that say nothing
 /// about the bytes cleared, in logical order.
@@ -84,12 +86,17 @@ fn push(out: &mut Vec<Range>, start: u64, end: u64) {
     if let Some(last) = out.last_mut()
         && start <= last.end
     {
-        if end > last.end {
-            last.end = end;
-        }
+        last.end = last.end.max(end);
         return;
     }
     out.push(Range { start, end });
+}
+
+/// Whether the walk takes the shadow's extent next, of two that differ: the one that starts first.
+/// On a tie both are pushed at the same start, so either order merges into the same range: `<` and
+/// `<=` can't be told apart here (`.cargo/mutants.toml`).
+fn shadows_first(disk: &Extent, shadow: &Extent) -> bool {
+    shadow.logical < disk.logical
 }
 
 /// The logical ranges where the `disk`'s and the `shadow`'s normalized maps differ, merged and in
@@ -97,36 +104,24 @@ fn push(out: &mut Vec<Range>, start: u64, end: u64) {
 /// length, flags) and nothing about it is untrusted. Extents split differently in the two maps count
 /// as changed: that clones some bytes again, never fewer.
 pub fn changed(disk: &[Extent], shadow: &[Extent]) -> Vec<Range> {
-    let (mut i, mut j) = (0, 0);
+    let (mut d, mut s) = (disk.iter().peekable(), shadow.iter().peekable());
     let mut out = Vec::new();
-    while i < disk.len() || j < shadow.len() {
-        match (disk.get(i), shadow.get(j)) {
+    loop {
+        let next = match (d.peek(), s.peek()) {
+            (None, None) => return out,
             (Some(x), Some(y)) if trusted_same(x, y) => {
-                i += 1;
-                j += 1;
+                d.next();
+                s.next();
+                continue;
             }
-            (Some(x), Some(y)) if y.logical < x.logical => {
-                push(&mut out, y.logical, y.logical + y.length);
-                j += 1;
-            }
-            (Some(x), y) => {
-                push(&mut out, x.logical, x.logical + x.length);
-                if let Some(y) = y
-                    && y.logical == x.logical
-                {
-                    push(&mut out, y.logical, y.logical + y.length);
-                    j += 1;
-                }
-                i += 1;
-            }
-            (None, Some(y)) => {
-                push(&mut out, y.logical, y.logical + y.length);
-                j += 1;
-            }
-            (None, None) => break,
+            (Some(x), Some(y)) if shadows_first(x, y) => s.next(),
+            (Some(_), _) => d.next(),
+            (None, Some(_)) => s.next(),
+        };
+        if let Some(e) = next {
+            push(&mut out, e.logical, e.logical + e.length);
         }
     }
-    out
 }
 
 /// One of an incarnation's two shadow files.
@@ -220,6 +215,22 @@ mod tests {
     }
 
     #[test]
+    fn the_flag_sets_are_the_named_flags() {
+        assert_eq!(IGNORED, flags::LAST | flags::SHARED | flags::MERGED);
+        assert_eq!(
+            UNTRUSTED,
+            flags::UNKNOWN | flags::DELALLOC | flags::ENCODED | flags::DATA_ENCRYPTED | flags::NOT_ALIGNED | flags::DATA_INLINE | flags::DATA_TAIL
+        );
+    }
+
+    #[test]
+    fn an_empty_extent_is_dropped() {
+        let e = Extent { logical: 4096, physical: 8192, length: 0, flags: 0 };
+        assert!(normalize([e]).is_empty());
+        assert!(changed(&normalize([e]), &[]).is_empty());
+    }
+
+    #[test]
     fn equal_maps_differ_nowhere() {
         let m = [e(0, 100, 10), e(10, 200, 10)];
         assert!(changed(&m, &m).is_empty());
@@ -266,9 +277,20 @@ mod tests {
         s.release(Slot::A); // A's commit is done
         s.cut(Slot::B);
         assert_eq!(s.target(), Some(Slot::A), "they alternate");
-        s.cut_failed(Slot::B);
+        assert!(s.held(Slot::B) && !s.held(Slot::A));
         s.release(Slot::B);
-        assert_eq!(s.target(), Some(Slot::A), "with no newest, A");
+        assert!(!s.held(Slot::B));
+        // A failed cut into the other shadow leaves the newest as it was; one into the newest
+        // leaves none (it no longer holds the newest cut).
+        s.cut_failed(Slot::A);
+        assert_eq!(s.last(), Some(Slot::B));
+        s.cut_failed(Slot::B);
+        assert_eq!(s.last(), None);
+        assert_eq!(s.target(), Some(Slot::A), "with no newest, A first");
+        s.cut(Slot::A);
+        s.release(Slot::A);
+        s.cut_failed(Slot::A);
+        assert_eq!(s.target(), Some(Slot::A), "with no newest, A first, though A just failed");
     }
 
     /// Exhaustive over a small domain, in place of a Kani harness (CBMC on the growing `Vec` ran
