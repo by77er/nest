@@ -169,7 +169,7 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Existing hosts, on the root volume,** keep running the previous nestd with M1's checkpoints until they are replaced. Nothing moves them sooner: there is no drain route. A spot loss or the autoscaler's scale-down replaces them, and sandboxes cold-boot elsewhere from their generations. That is safe and costs nothing extra.
 - **Any order is safe,** so a partial run or a re-run is too:
   - Either release's nestd works with either layout (`state_dir`, the kernel, images and jail paths are all in nestd.json).
-  - A host booted between steps 1 and 3 runs the previous nestd on the new layout. It finds state in `/var/lib/nest/data/state` and pauses for reads.
+  - A host booted between steps 1 and 3 runs the previous nestd on the new layout. It finds state in the instance store's `state` directory and pauses for reads.
   - A previous-release Worker ignores `cut_ms`.
   - `bootstrap.sh` falls back to the root volume when any instance-store step fails: no `mkfs.xfs` (an AMI built before step 3, should one lack it), a format or a mount failing, or no reflink. The host still enrolls (`test_sandbox_host_whose_instance_store_wont_format`).
   - Where the store is used, nestd, nest-proxy and the gateway require its mount (`RequiresMountsFor` drop-ins). A host whose store comes back blank after a stop and start fails to start them, and nestd refuses to start without its kernel and images, so it never enrolls broken. Nest only terminates hosts, so only a hand-made stop does this.
@@ -187,7 +187,7 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
   - `wrangler rollback` drops `cut_ms` from new records.
   - A republished previous release pauses for whole reads, on either layout.
 - **Cloud check after a `c8id` host comes up** (anyone with the admin token; host logs need a shell on the host):
-  - bootstrap's log says "sandbox state on the instance store at /var/lib/nest/data (XFS, reflink)", and nestd's says "checkpoints cut disks with a reflink";
+  - bootstrap's log says "sandbox state on the instance store at /srv/nest (XFS, reflink)", and nestd's says "checkpoints cut disks with a reflink";
   - a turn-end checkpoint logs `checkpoint: disk cut ... paused_ms=`, then `commit: cut read`;
   - `GET /v1/sandboxes/<id>/generations` shows `cut_ms` on the new turn ends;
   - a hands call made during a checkpoint returns.

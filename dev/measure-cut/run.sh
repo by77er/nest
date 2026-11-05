@@ -68,7 +68,8 @@ trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
 USER_DATA=$(mktemp)
-sed "s/@DEADLINE_MIN@/${MEASURE_DEADLINE_MIN:-90}/" "$HERE/on-host.sh" > "$USER_DATA"
+# MEASURE_SCRIPT: another on-host script of this directory (a probe), with the same layers.
+sed "s/@DEADLINE_MIN@/${MEASURE_DEADLINE_MIN:-90}/" "$HERE/${MEASURE_SCRIPT:-on-host.sh}" > "$USER_DATA"
 # The template names the cell's security group but no subnet: a subnet of that group's VPC, each AZ in
 # turn until one has the capacity (or MEASURE_SUBNET).
 SG=$(aws ec2 describe-launch-template-versions --region "$REGION" --launch-template-name "$TEMPLATE" --versions '$Default' \
