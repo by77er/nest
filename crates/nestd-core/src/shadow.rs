@@ -145,15 +145,20 @@ impl Slot {
     }
 }
 
-/// Which shadow a cut writes and which one a commit reads, for one incarnation.
+/// Which shadow a cut writes, for one incarnation.
+///
+/// A shadow is **held** from the moment a cut into it is queued until its commit is done with it
+/// (read, failed, or dropped): a queued cut, and one a commit has taken, both name their shadow and
+/// will read it later, so nothing may write it meanwhile (#159's review: a commit re-asking an
+/// earlier request, the sandbox unlocked, read a newer cut written into its shadow). Cuts alternate
+/// between the two shadows, so each one is at most two cuts behind the disk and pins only what the
+/// disk rewrote since then.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Shadows {
     /// The shadow the newest cut left equal to the disk, if a cut has been taken.
     last: Option<Slot>,
-    /// The shadow a commit is reading: never written until it is done.
-    reading: Option<Slot>,
-    /// Which shadow files exist (a missing one is made by a whole clone first).
-    made: [bool; 2],
+    /// Which shadows a queued or taken cut names.
+    held: [bool; 2],
 }
 
 fn idx(s: Slot) -> usize {
@@ -163,67 +168,42 @@ fn idx(s: Slot) -> usize {
     }
 }
 
-/// Where a cut goes: the shadow, and whether it must first be made (a whole clone of the disk).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Target {
-    pub slot: Slot,
-    pub make: bool,
-}
-
 impl Shadows {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// The shadow the next cut writes: the newest one (the least to clone), unless a commit is
-    /// reading it, then the other. Never the one being read.
-    pub fn target(&self) -> Target {
-        let slot = match (self.last, self.reading) {
-            (Some(l), Some(r)) if l == r => l.other(),
-            (Some(l), _) => l,
-            (None, Some(r)) => r.other(),
-            (None, None) => Slot::A,
-        };
-        Target { slot, make: !self.made[idx(slot)] }
+    /// The shadow the next cut writes: the one the newest cut didn't (they alternate), or failing
+    /// that the newest, whichever no cut holds. `None` when both are held (one cut queued, one taken
+    /// by its commit): the caller drops the queued cut, which releases its shadow, and asks again.
+    pub fn target(&self) -> Option<Slot> {
+        let prefer = self.last.map_or(Slot::A, Slot::other);
+        [prefer, prefer.other()].into_iter().find(|s| !self.held[idx(*s)])
     }
 
-    /// A cut left `slot` equal to the disk (made if it wasn't).
+    /// A cut left `slot` equal to the disk and is queued: `slot` is held until [`Self::release`].
     pub fn cut(&mut self, slot: Slot) {
-        debug_assert_ne!(self.reading, Some(slot), "a cut never writes the shadow being read");
-        self.made[idx(slot)] = true;
+        debug_assert!(!self.held[idx(slot)], "a cut never writes a held shadow");
+        self.held[idx(slot)] = true;
         self.last = Some(slot);
     }
 
-    /// A cut into `slot` failed part way: its content is unknown, but its map still says what it
-    /// holds, so the next cut's comparison stays sound. It is no longer the newest cut.
+    /// A cut into `slot` failed part way (it wasn't held, so no commit names it): its content is
+    /// unknown, but its map still says what it holds, so the next comparison stays sound. (A shadow
+    /// file that doesn't exist yet is made by the cut that targets it: the caller checks the file.)
     pub fn cut_failed(&mut self, slot: Slot) {
         if self.last == Some(slot) {
             self.last = None;
         }
     }
 
-    /// A commit begins reading `slot` (the cut it was queued with).
-    pub fn read_begins(&mut self, slot: Slot) {
-        self.reading = Some(slot);
+    /// The cut naming `slot` is done with it: committed, failed, or dropped.
+    pub fn release(&mut self, slot: Slot) {
+        self.held[idx(slot)] = false;
     }
 
-    /// The commit reading `slot` is done with it.
-    pub fn read_ends(&mut self, slot: Slot) {
-        if self.reading == Some(slot) {
-            self.reading = None;
-        }
-    }
-
-    /// The shadow file of `slot` is gone (removed, or never made): the next cut into it makes it.
-    pub fn forget(&mut self, slot: Slot) {
-        self.made[idx(slot)] = false;
-        if self.last == Some(slot) {
-            self.last = None;
-        }
-    }
-
-    pub fn reading(&self) -> Option<Slot> {
-        self.reading
+    pub fn held(&self, slot: Slot) -> bool {
+        self.held[idx(slot)]
     }
 
     pub fn last(&self) -> Option<Slot> {
@@ -272,22 +252,23 @@ mod tests {
     }
 
     #[test]
-    fn a_cut_never_writes_the_shadow_being_read_and_prefers_the_newest() {
+    fn cuts_alternate_and_never_write_a_held_shadow() {
         let mut s = Shadows::new();
-        assert_eq!(s.target(), Target { slot: Slot::A, make: true });
-        s.cut(Slot::A);
-        // Nothing reads A: the next cut overwrites it (the least to clone).
-        assert_eq!(s.target(), Target { slot: Slot::A, make: false });
-        s.read_begins(Slot::A);
-        assert_eq!(s.target(), Target { slot: Slot::B, make: true });
+        assert_eq!(s.target(), Some(Slot::A));
+        s.cut(Slot::A); // queued: A held
+        assert_eq!(s.target(), Some(Slot::B));
+        // The commit takes cut A and waits (A still held); a newer cut goes to B.
         s.cut(Slot::B);
-        // A queued cut in B is replaced in B while A is read.
-        assert_eq!(s.target().slot, Slot::B);
-        s.read_ends(Slot::A);
-        s.read_begins(Slot::B);
-        assert_eq!(s.target(), Target { slot: Slot::A, make: false });
-        s.forget(Slot::A);
-        assert_eq!(s.target(), Target { slot: Slot::A, make: true });
+        // Both held (A taken, B queued): no target until the queued cut is dropped.
+        assert_eq!(s.target(), None);
+        s.release(Slot::B); // the queued cut is dropped for a newer one
+        assert_eq!(s.target(), Some(Slot::B));
+        s.release(Slot::A); // A's commit is done
+        s.cut(Slot::B);
+        assert_eq!(s.target(), Some(Slot::A), "they alternate");
+        s.cut_failed(Slot::B);
+        s.release(Slot::B);
+        assert_eq!(s.target(), Some(Slot::A), "with no newest, A");
     }
 
     /// Exhaustive over a small domain, in place of a Kani harness (CBMC on the growing `Vec` ran
@@ -391,25 +372,60 @@ mod tests {
 mod proofs {
     use super::*;
 
-    /// The shadow being read is never a cut's target, whatever happened before.
+    /// Driven as `host.rs` drives it (a cut queues, replacing a queued one; a commit takes the queued
+    /// cut, reads its shadow later, then releases it; cuts fail), over any six
+    /// steps: a shadow a queued or taken cut names is always held, and never a cut's target.
     #[kani::proof]
-    #[kani::unwind(6)]
-    fn a_cut_never_targets_the_shadow_being_read() {
+    #[kani::unwind(8)]
+    fn a_cut_never_targets_a_shadow_a_queued_or_taken_cut_names() {
         let mut s = Shadows::new();
-        for _ in 0..4 {
-            let slot = if kani::any() { Slot::A } else { Slot::B };
-            match kani::any::<u8>() % 5 {
+        let mut queued: Option<Slot> = None;
+        let mut taken: Option<Slot> = None;
+        for _ in 0..6 {
+            match kani::any::<u8>() % 4 {
+                // A cut: if both shadows are held, the queued cut is dropped first (its shadow
+                // released); the newer cut replaces any queued one.
                 0 => {
-                    let t = s.target();
-                    s.cut(t.slot);
+                    if s.target().is_none() {
+                        if let Some(q) = queued.take() {
+                            s.release(q);
+                        }
+                    }
+                    // A cut always finds a shadow (one commit takes at most one).
+                    let t = s.target().expect("a free shadow");
+                    assert!(Some(t) != queued && Some(t) != taken);
+                    if kani::any() {
+                        s.cut_failed(t);
+                    } else {
+                        if let Some(q) = queued.take() {
+                            s.release(q);
+                        }
+                        s.cut(t);
+                        queued = Some(t);
+                    }
                 }
-                1 => s.read_begins(slot),
-                2 => s.read_ends(slot),
-                3 => s.cut_failed(slot),
-                _ => s.forget(slot),
+                // The commit takes the queued cut (one commit at a time).
+                1 => {
+                    if taken.is_none() {
+                        taken = queued.take();
+                    }
+                }
+                // The taken cut's commit ends (read, failed, fenced).
+                2 => {
+                    if let Some(t) = taken.take() {
+                        s.release(t);
+                    }
+                }
+                // The queued cut is dropped (a suspend, an archive, a salvage).
+                _ => {
+                    if let Some(q) = queued.take() {
+                        s.release(q);
+                    }
+                }
             }
-            if let Some(r) = s.reading() {
-                assert!(s.target().slot != r);
+            for r in [queued, taken].into_iter().flatten() {
+                assert!(s.held(r));
+                assert!(s.target() != Some(r));
             }
         }
     }

@@ -3,11 +3,12 @@
 //! `fixed`, `main`, `no-baseline`, `late-capture`, `volatile-capture`, `broker-quiet`, then any of
 //! `,cmds=N`, `,drops=N`, `,restarts=N`, `,resets=N`, `,broker=N`, `,secrets=0`.
 //! Example: `fixed,cmds=2,drops=1`. `lease[,...]` and `sentinel[,async][,trust-running][,keep-on-begin][,stale-records][,writes=N]
-//! [,commits=N][,restarts=N]` check the lease and the unchanged-disk short-circuit.
+//! [,commits=N][,restarts=N]` check the lease and the unchanged-disk short-circuit; `shadow[,...]` and
+//! `slots[,unheld-queue][,writes=N][,cuts=N]` M3′'s shadow cut and its two shadows.
 
 use nestd_check::fleet::{Config, FleetModel, describe};
-use nestd_check::{lease, sentinel, shadow};
 use nestd_check::{check, counterexample};
+use nestd_check::{lease, sentinel, shadow, shadow_slots};
 
 fn parse(spec: &str) -> Result<Config, String> {
     let mut parts = spec.split(',');
@@ -64,6 +65,25 @@ fn main() {
             for v in &o.violations {
                 if let Some(path) = counterexample(&|| sentinel::SentinelModel { cfg }, v) {
                     println!("  {v} ({} steps): {:?}", path.len() - 1, path.iter().filter_map(|(_, a)| a.clone()).collect::<Vec<_>>());
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = spec.strip_prefix("slots") {
+            let mut cfg = shadow_slots::Config::fixed();
+            for p in rest.split(',').filter(|p| !p.is_empty()) {
+                match p.split_once('=') {
+                    None if p == "unheld-queue" => cfg.unheld_queue = true,
+                    Some(("writes", v)) => cfg.max_writes = v.parse().expect("a number"),
+                    Some(("cuts", v)) => cfg.max_cuts = v.parse().expect("a number"),
+                    _ => panic!("unknown slots option {p}"),
+                }
+            }
+            let o = check(shadow_slots::SlotsModel { cfg });
+            println!("{spec}: {} states in {:.1?}; violated {:?}; examples {:?}", o.unique_states, o.elapsed, o.violations, o.examples);
+            for v in &o.violations {
+                if let Some(path) = counterexample(&|| shadow_slots::SlotsModel { cfg }, v) {
+                    println!("  {v} ({} steps): {:?}", path.len() - 1, path.iter().filter_map(|(_, a)| *a).collect::<Vec<_>>());
                 }
             }
             continue;

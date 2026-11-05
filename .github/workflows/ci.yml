@@ -153,13 +153,20 @@ jobs:
           # v2: built with line tables only; never restore the older, fuller target.
           key: rust-v2-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
           restore-keys: rust-v2-${{ runner.os }}-
-      # nestd's netns tests need iproute2, nftables and unprivileged user namespaces.
+      # nestd's netns tests need iproute2, nftables and unprivileged user namespaces; its shadow-cut
+      # tests a real XFS with reflink (NEST_TEST_XFS_DIR), loop-mounted here.
       - name: Host tools
         run: |
-          sudo apt-get update -q && sudo apt-get install -yq nftables
+          sudo apt-get update -q && sudo apt-get install -yq nftables xfsprogs
           if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
+          truncate -s 2G "$RUNNER_TEMP/xfs.img"
+          mkfs.xfs -q -m reflink=1 "$RUNNER_TEMP/xfs.img"
+          sudo mkdir -p /mnt/nest-xfs
+          sudo mount -o loop "$RUNNER_TEMP/xfs.img" /mnt/nest-xfs
+          sudo chown "$(id -u):$(id -g)" /mnt/nest-xfs
+          echo "NEST_TEST_XFS_DIR=/mnt/nest-xfs" >> "$GITHUB_ENV"
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # nestd-core's purity: on a target with no std, code that uses std fails to build.

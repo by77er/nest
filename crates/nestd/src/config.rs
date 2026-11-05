@@ -87,6 +87,15 @@ pub struct Config {
     /// whole): a shadow that differs fails the cut.
     #[serde(default)]
     pub disk_cut_verify: bool,
+    /// A shadow cut's pre-copy clones what differs while the VM runs only from this many ranges;
+    /// fewer are left to the pause (cloning them costs less than reading the shadow's map again).
+    /// Tests set 0, so every pre-copy writes its shadow.
+    #[serde(default = "default_shadow_pre_copy_min_ranges")]
+    pub shadow_pre_copy_min_ranges: usize,
+}
+
+fn default_shadow_pre_copy_min_ranges() -> usize {
+    4096
 }
 
 fn default_cut_clone_ns_per_extent() -> u64 {

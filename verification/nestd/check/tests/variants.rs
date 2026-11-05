@@ -170,6 +170,22 @@ fn comparing_with_the_shadows_map_from_before_its_clones_misses_a_reused_block()
 }
 
 #[test]
+fn a_shadow_a_queued_or_taken_cut_names_holds_that_cut() {
+    let o = check(nestd_check::shadow_slots::SlotsModel { cfg: nestd_check::shadow_slots::Config::fixed() });
+    assert!(o.violations.is_empty(), "violated {:?} ({} states)", o.violations, o.unique_states);
+    for e in ["a_cut_dropped_the_queued_cut_for_room", "a_cut_failed_beside_a_queued_cut"] {
+        assert!(o.examples.contains(&e), "no example of {e}: {:?}", o.examples);
+    }
+}
+
+#[test]
+fn a_queued_cuts_shadow_left_unheld_is_written_by_a_newer_cut() {
+    let cfg = nestd_check::shadow_slots::Config { unheld_queue: true, ..nestd_check::shadow_slots::Config::fixed() };
+    let o = check(nestd_check::shadow_slots::SlotsModel { cfg });
+    assert!(o.violated("a_named_shadow_holds_its_cut"), "{:?}", o.violations);
+}
+
+#[test]
 fn comparing_with_the_disks_map_from_the_pre_copy_also_holds() {
     let cfg = nestd_check::shadow::Config { live_base: true, ..nestd_check::shadow::Config::fixed() };
     let o = check(nestd_check::shadow::ShadowModel { cfg });
