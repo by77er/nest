@@ -232,6 +232,12 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
             covered = any(state == p or p in state.parents for p in hidden)
             private = state.exists() and state.stat().st_mode & 0o077 == 0
             self.assertTrue(covered or private, f"nvme={nvme}: the gateway could read {state}")
+            # nestd runs cloudflared as nest-cf with HOME=<state>/cloudflared: every directory down
+            # to the state, under the fake root, lets others through.
+            for d in [state, *state.parents]:
+                if d == fake:
+                    break
+                self.assertTrue(d.stat().st_mode & 0o001, f"nvme={nvme}: nest-cf can't pass {d} ({oct(d.stat().st_mode)}) to reach its home")
 
     def test_sandbox_host_whose_instance_store_wont_format(self):
         """mkfs.xfs fails (or an AMI lacks xfsprogs): the host still comes up, with state on the root volume."""

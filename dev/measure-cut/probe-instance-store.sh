@@ -7,7 +7,8 @@
 # properties are read from the AMI's /etc/systemd/system/nest-gateway.service. No nestd, no
 # enrollment, nothing of the control plane. Prints one JSON document to the console, then powers off.
 shutdown -h +@DEADLINE_MIN@ || shutdown -P +@DEADLINE_MIN@
-set -uo pipefail
+# -e: a step that fails ends the probe (the EXIT trap still prints what was measured).
+set -euo pipefail
 exec > >(tee /dev/console) 2>&1
 J=/root/results.json
 trap 'echo NEST-MEASURE-BEGIN; cat "$J"; echo; echo NEST-MEASURE-END; sync; sleep 5; shutdown -h now' EXIT
@@ -31,8 +32,11 @@ GW_GID=$(id -g nest-gw)
 # The instance store, as bootstrap formats and mounts it.
 NVME=$(lsblk -dpno NAME,MODEL | awk '/Amazon EC2 NVMe Instance Storage/ {print $1; exit}')
 [ -n "$NVME" ] || { put error '"no instance store"'; exit 1; }
-mkfs.xfs -q -f -K -m reflink=1 -L nest-data "$NVME"
-install -d -m 0755 /srv/nest && mount "$NVME" /srv/nest
+mkfs.xfs -q -f -K -m reflink=1 -L nest-data "$NVME" || { put error '"mkfs.xfs failed"'; exit 1; }
+install -d -m 0755 /srv/nest
+mount "$NVME" /srv/nest || { put error '"mounting the instance store failed"'; exit 1; }
+# Never measure the root disk by mistake: /srv/nest must be the store itself.
+[ "$(findmnt -no SOURCE /srv/nest)" = "$NVME" ] || { put error '"/srv/nest is not the instance store"'; exit 1; }
 put mounted "\"$(findmnt -no SOURCE,FSTYPE /srv/nest | tr -s ' ')\""
 
 # A jail as nestd makes one (each directory 0711, the root 0710 to the gateway's group) with a listening
@@ -60,16 +64,21 @@ try:
     s.connect(sys.argv[1]); print('connected', s.recv(5).decode())
 except OSError as e:
     print('failed', e)
-" "$root/vsock.sock" 2>&1)
+" "$root/vsock.sock" 2>&1 || true)
   put "$key" "\"$(echo "$out" | tr -d '"\n')\""
-  kill %1 2>/dev/null
+  kill %1 2>/dev/null || true
 }
 # The fix: the store at /srv/nest, the gateway's unit plus bootstrap's drop-in (state, kernel, images hidden).
-install -d -m 0700 /srv/nest/state /srv/nest/kernel /srv/nest/images
+install -d -m 0711 /srv/nest/state
+install -d -m 0700 /srv/nest/kernel /srv/nest/images
 probe new_layout /srv/nest/jailer "$UNIT_HIDDEN -/srv/nest/state -/srv/nest/kernel -/srv/nest/images"
 # The old layout: the chroots under /var/lib/nest/data (expected to fail: the unit hides /var/lib/nest).
 probe old_layout /var/lib/nest/data/jailer "$UNIT_HIDDEN"
 # And the state stays hidden from the gateway under the fix.
-out=$(systemd-run --wait --pipe --quiet -p User=nest-gw -p ProtectSystem=strict -p "InaccessiblePaths=$UNIT_HIDDEN -/srv/nest/state -/srv/nest/kernel -/srv/nest/images" ls /srv/nest/state 2>&1)
+out=$(systemd-run --wait --pipe --quiet -p User=nest-gw -p ProtectSystem=strict -p "InaccessiblePaths=$UNIT_HIDDEN -/srv/nest/state -/srv/nest/kernel -/srv/nest/images" ls /srv/nest/state 2>&1 || true)
 put state_from_gateway "\"$(echo "$out" | tr -d '"\n')\""
+# nestd runs cloudflared as nest-cf with HOME=<state>/cloudflared (a directory it makes, root's, 0755).
+install -d -m 0755 /srv/nest/state/cloudflared
+out=$(systemd-run --wait --pipe --quiet -p User=nest-cf -E HOME=/srv/nest/state/cloudflared /bin/sh -c 'cd "$HOME" && /opt/nest/bin/cloudflared --version' 2>&1 || true)
+put cloudflared_as_nest_cf "\"$(echo "$out" | tr -d '"\n')\""
 put done true

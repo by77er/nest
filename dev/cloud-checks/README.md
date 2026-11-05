@@ -60,7 +60,7 @@ uv run --with 'websockets>=13' python3 -I dev/cloud-checks/hands_probe_check.py
 | **Creates** | one sandbox (label `check=hands-probe`). In a cold cell, the autoscaler launches a sandbox host |
 | **Passes when** | the gateway answers `bound` to a brain's `bind`. It does so only after connecting to the guest's vsock socket; `busy` is retried for 2 minutes, as a brain does |
 | **Reports** | the sandbox, its host, the instance and its type |
-| **Cleans up** | destroys the sandbox on every exit path |
+| **Cleans up** | destroys the sandbox on every exit path, SIGTERM included, retrying the `DELETE` five times. The check fails unless it answers 2xx (or 404: already gone), and a leak is printed with the id to destroy by hand |
 
 ## `stress.py`
 

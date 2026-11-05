@@ -53,8 +53,9 @@ fi
 # jailer hard-links them next to each disk, which only works within one filesystem.
 # Mounted outside /var/lib/nest: the gateway's unit hides /var/lib/nest, and it must reach each VM's
 # vsock socket inside its chroot (2026-11-04: a host with the store under /var/lib/nest/data failed
-# every hands call). State, kernel and images are root's alone (0700); the gateway sees only the
-# chroots, as on the root volume's /srv/jailer.
+# every hands call). Kernel and images are root's alone (0700); the state is traversable but not
+# listable (0711), since nestd runs cloudflared as nest-cf with its home in it; the gateway's drop-in
+# hides all three. The gateway sees only the chroots, as on the root volume's /srv/jailer.
 DATA=/srv/nest
 STATE_DIR=/var/lib/nest
 KERNEL_DIR=/var/lib/nest/kernel
@@ -77,7 +78,8 @@ instance_store() {
 if [ -n "$NVME" ]; then
   if instance_store; then
     STATE_DIR=$DATA/state KERNEL_DIR=$DATA/kernel IMAGES_DIR=$DATA/images JAILER_BASE=$DATA/jailer
-    install -d -m 0700 "$STATE_DIR" "$KERNEL_DIR" "$IMAGES_DIR"
+    install -d -m 0711 "$STATE_DIR"
+    install -d -m 0700 "$KERNEL_DIR" "$IMAGES_DIR"
     install -d -m 0755 "$JAILER_BASE"
     if [ -f /var/lib/nest/kernel/vmlinux ] && [ ! -f "$KERNEL_DIR/vmlinux" ]; then cp /var/lib/nest/kernel/vmlinux "$KERNEL_DIR/vmlinux"; fi
     # After a reboot nestd must not start before the store is mounted (it would write into the bare

@@ -16,6 +16,7 @@ use1), CHECK_TIMEOUT_S (default 900). Never prints a token, a binding or a heade
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -57,15 +58,37 @@ async def bind(url, binding, version):
         await asyncio.sleep(min((reply.get("retry_after_ms") or 1000) / 1000, 5))
 
 
+def destroy(sid):
+    """Destroy the sandbox, retried: True once the API answers 2xx (or 404, already gone). A leaked
+    sandbox keeps a host (and its cost) alive, so a cleanup that fails fails the check."""
+    for attempt in range(5):
+        try:
+            st, body = api("DELETE", f"/v1/sandboxes/{sid}")
+        except (urllib.error.URLError, OSError) as e:
+            st, body = None, str(e)
+        print(f"destroy {sid}: {st}")
+        if st is not None and (200 <= st < 300 or st == 404):
+            return True
+        time.sleep(2 * (attempt + 1))
+    print(f"LEAKED: {sid} wasn't destroyed ({str(body)[:200]}): destroy it by hand (DELETE /v1/sandboxes/{sid})")
+    return False
+
+
+def on_sigterm(_signum, _frame):
+    # Unwind through main's `finally`, which destroys the sandbox.
+    raise KeyboardInterrupt
+
+
 def main():
+    signal.signal(signal.SIGTERM, on_sigterm)
     if not ADMIN or not all(ACCESS.values()):
         sys.exit("NEST_ADMIN_TOKEN, NEST_ACCESS_CLIENT_ID and NEST_ACCESS_CLIENT_SECRET are required")
     st, sbx = api("POST", "/v1/sandboxes", {"cell": CELL, "labels": {"check": "hands-probe"}})
     if st not in (201, 202):
         sys.exit(f"FAIL: create: {st} {sbx}")
     sid = sbx["sandbox"]
-    print(f"created {sid}")
-    ok = False
+    print(f"created {sid} (destroyed on exit; if this process dies, DELETE /v1/sandboxes/{sid} by hand)")
+    result = 1
     try:
         deadline = time.time() + TIMEOUT_S
         info = sbx
@@ -75,7 +98,7 @@ def main():
             info = info if isinstance(info, dict) else {}
         if info.get("state") != "running":
             print(f"FAIL: {sid} never ran: {json.dumps(info)[:300]}")
-            return 1
+            return result
         host = info["host"]
         _, view = api("GET", "/v1/admin/fleet")
         instance = next((h.get("instance_id") for h in (view or {}).get("hosts", []) if h.get("host") == host), None)
@@ -87,16 +110,20 @@ def main():
         st, target = api("POST", f"/v1/sandboxes/{sid}/resolve", {"client": "hands-probe-check"})
         if st != 200 or not isinstance(target, dict):
             print(f"FAIL: resolve: {st} {str(target)[:200]}")
-            return 1
+            return result
         reply = asyncio.run(bind(target["url"], target["binding"], target["guest"]["protocol_version"]))
         ok = reply.get("type") == "bound"
         shown = {"type": reply.get("type"), "error": reply.get("error"), "guest": reply.get("guest")}
         print(json.dumps({"sandbox": sid, "host": host, "instance": instance, "instance_type": itype, "reply": shown}))
-        print("PASS: the gateway reached the VM (bound)" if ok else "FAIL: the gateway didn't bind to the VM")
-        return 0 if ok else 1
+        print("the gateway reached the VM (bound)" if ok else "FAIL: the gateway didn't bind to the VM")
+        result = 0 if ok else 1
+        return result
     finally:
-        st, _ = api("DELETE", f"/v1/sandboxes/{sid}")
-        print(f"destroyed {sid} ({st})")
+        # The check's own verdict is printed above; a failed cleanup fails the check besides.
+        if not destroy(sid):
+            result = 1
+        print("PASS" if result == 0 else "FAIL")
+        sys.exit(result)
 
 
 if __name__ == "__main__":

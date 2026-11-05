@@ -88,7 +88,7 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Still needed by hosts:** `sandbox_create`, `sandbox_fork` and `agent_start` carry a `ws_` value (`compatWorkstream`), which hosts and runners from before workstreams left require (Rust's `WorkstreamId`, prefix-checked). Drop it from the control plane (and `SandboxInfo`/`AgentInfo`) once every host runs that release or later, then the Rust fields the release after. The policy layer's wire value `workstream` (the operator layer; hosts parse a closed enum) stays.
 
 **This release's rollout rule (instance store at `/srv/nest`): not a one-way deploy, and nothing by hand.**
-- **What changes:** bootstrap mounts the instance store at `/srv/nest` instead of `/var/lib/nest/data`. State, kernel and images go there root-only (0700), and the gateway's drop-in hides them; the jailer's chroots stay visible to the gateway.
+- **What changes:** bootstrap mounts the instance store at `/srv/nest` instead of `/var/lib/nest/data`. Kernel and images go there root-only (0700), and the state traversable but not listable (0711, for cloudflared's home as `nest-cf`). The gateway's drop-in hides all three; the jailer's chroots stay visible to it.
 - **Who it affects:** only new hosts, and only instance-store ones. The launch types stay EBS-only (the mitigation below), so none launch until the follow-up.
 - **The follow-up:** the instance-store order comes back once a real instance-store host passes `dev/measure-cut/probe-instance-store.sh`, which needs the owner's go-ahead for one launch. After that, `dev/cloud-checks/hands_probe_check.py` proves the first one in the cell.
 
