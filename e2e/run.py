@@ -267,9 +267,11 @@ def configure_host():
         "sockets": {"gateway_gid": GW_UID, "gateway_uids": [GW_UID]},
         "flush_interval_ms": 500,
         # No reflink on the harness's filesystem: checkpoints cut with a copy under a flock (M2), or,
-        # with E2E_DISK_CUT=sim_shadow, M3′'s shadow cut over its stand-in, every cut checked.
+        # with E2E_DISK_CUT=sim_shadow, M3′'s shadow cut over its stand-in. Not byte-checked here
+        # (E2E_DISK_CUT_VERIFY=1 does, in the pause: 17 s a cut on these disks, too long for the
+        # cut-under-writes check); the restored prefix checks the cut end to end instead.
         "disk_cut": os.environ.get("E2E_DISK_CUT", "locked_copy"),
-        "disk_cut_verify": os.environ.get("E2E_DISK_CUT") == "sim_shadow",
+        "disk_cut_verify": os.environ.get("E2E_DISK_CUT_VERIFY") == "1",
         "versions": {"nest_proxy": "e2e", "agent_runner": "e2e", "claude_code": REAL_ENV.get("version", "real") if REAL else "fake"},
     }
     with open(os.path.join(WORK, "nestd.json"), "w") as f:
