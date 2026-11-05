@@ -266,7 +266,8 @@ export function data(variant = "demo", now = Date.now()) {
     grant: { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org", "upload.pypi.org", "*.gadgets.example.com"], max_count: 20, max_bytes: 4096, workflows: true, used: 3 },
     client: "cli_demo",
     agents: variant === "secrets-empty" ? [] : network.agents,
-    workflow_workers: ["agt_w8x2m4"],
+    // Saved off: the applied layers match it; agt_w3f9q1, its layer pending, still has it.
+    workflow_workers: ["agt_w3f9q1"],
   };
 
   /** The answer to `GET|POST /api<path>?<search>`: [status, body]. */

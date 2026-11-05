@@ -83,6 +83,8 @@ export class FakeNest {
   jwksFetches = 0;
   /** Failures to answer, in order, for calls whose `METHOD path` matches. */
   failures: { match: RegExp; status: number; retryable?: boolean; times: number }[] = [];
+  /** Play a control plane from before the push opt-in was in the client layer (nest #157). */
+  layerWithoutPush = false;
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
   holds: { match: RegExp; release: Promise<void>; reached: boolean }[] = [];
   /** Creates that are made but whose answer is lost (a 500 instead), as after a timeout. */
@@ -232,7 +234,11 @@ export class FakeNest {
       }
       // nest answers its bindings as held: whose they are and the placeholder it assigned (`HeldInjection`).
       if (req.method === "GET") {
-        return json(200, { ...sb.layer, inject: (sb.layer.inject as { name: string }[]).map((b) => ({ ...b, client: CLIENT, placeholder: `nest-ph.${CLIENT}.${b.name}.` })) });
+        return json(200, {
+          ...sb.layer, inject: (sb.layer.inject as { name: string }[]).map((b) => ({ ...b, client: CLIENT, placeholder: `nest-ph.${CLIENT}.${b.name}.` })),
+          // The push opt-in (nest #157), unless this fake plays a control plane from before it.
+          ...(this.layerWithoutPush ? {} : { github_push: { workflows: !!sb.github_push?.workflows } }),
+        });
       }
       if (req.method === "PUT") {
         // nest's checks: the whole layer replaced, each binding a strict `ClientInjection`, its egress within
@@ -248,7 +254,11 @@ export class FakeNest {
         if (injectOutside.length) return nestErr(403, "forbidden", `inject host ${injectOutside[0]} is outside the grant`);
         const bad = envProblem(call.body?.env, inject);
         if (bad) return nestErr(400, "invalid_message", bad);
+        if (call.body?.github_push !== undefined && this.layerWithoutPush) return nestErr(400, "invalid_message", 'unrecognized key "github_push"');
+        if (call.body?.github_push?.workflows && !this.grant.github_push?.workflows) return nestErr(403, "forbidden", "github_push.workflows is outside the grant");
         sb.layer = { egress: { allow }, inject: call.body?.inject ?? [], env: call.body?.env ?? {} };
+        // Replaced whole: left out, it's off (an older control plane: as it was).
+        if (!this.layerWithoutPush) sb.github_push = call.body?.github_push?.workflows ? { workflows: true } : null;
         return json(200, { version: 2 });
       }
     }

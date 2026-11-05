@@ -8,6 +8,7 @@ import { schemaResolver, useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
 import { Settings as SettingsSchema } from "../../../requests";
 import { useRetryRepoAutoMerge, useSecrets, useUpdateSettings } from "../../api/queries";
+import { LiveAgents } from "../project/LiveAgents";
 import type { Settings } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
@@ -95,6 +96,8 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
             Save settings
           </Button>
         </Toolbar>
+        {/* After Save: what's live, not part of what's edited. */}
+        <LiveWorkers projectId={projectId} saved={settings.workers_edit_workflows === true} />
       </Stack>
     </form>
   );
@@ -158,18 +161,18 @@ export function RepoAutoMergeStatus({ projectId, status }: { projectId: string; 
 
 /**
  * "Workers may change CI workflows" (README.md#secrets): off by default; on, workers' push tokens get
- * `workflows: write`, which the grant must allow. With the security note: a pushed workflow runs with
- * the repo's Actions secrets before anyone reviews it.
+ * `workflows: write`, which the grant must allow, live workers' too (through their sandbox's client
+ * layer), each shown applied, pending or failed with whether it has it. With the security note: a
+ * pushed workflow runs with the repo's Actions secrets before anyone reviews it.
  */
 function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: string; checked?: boolean; onChange?: (e: React.ChangeEvent<HTMLInputElement>) => void; error?: React.ReactNode }) {
   const secrets = useSecrets(projectId);
   const allowed = secrets.data?.grant?.workflows;
-  const keeping = secrets.data?.workflow_workers ?? [];
   return (
     <Stack gap="sm">
       <Switch
         label="Workers may change CI workflows"
-        description="Their pushes may add or change files under .github/workflows/. Off, GitHub refuses those pushes from workers started from then on; live ones keep it until they end."
+        description="Their pushes may add or change files under .github/workflows/; off, GitHub refuses those pushes. Saved, it reaches live workers in a moment too, through their sandbox."
         checked={checked}
         onChange={onChange}
         error={error}
@@ -179,13 +182,6 @@ function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: 
         <Text fz="xs" c="dimmed">
           The app's grant doesn't allow it: the operator sets github_push.workflows in its grant first.
         </Text>
-      )}
-      {!checked && keeping.length > 0 && (
-        <Notice tone="warning" title={`${keeping.length === 1 ? "A live worker keeps" : `${keeping.length} live workers keep`} it until it ends`}>
-          <Text fz="sm">
-            Turning it off reaches workers started from now on. A worker's push token is made with its sandbox, so these keep it until they end: {keeping.join(", ")}.
-          </Text>
-        </Notice>
       )}
       {checked && (
         <Notice tone="warning" title="A pushed workflow runs before anyone reviews it">
@@ -198,5 +194,42 @@ function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: 
         </Notice>
       )}
     </Stack>
+  );
+}
+
+/**
+ * The live workers' push tokens, against the saved setting: each worker's layer (applied, pending or
+ * failed) and, as last applied, whether its pushes may change workflows. One that differs from the
+ * setting says so, until its layer applies (or, applied, why: the grant doesn't allow it).
+ */
+function LiveWorkers({ projectId, saved }: { projectId: string; saved: boolean }) {
+  const secrets = useSecrets(projectId);
+  const workers = (secrets.data?.agents ?? []).filter((a) => a.role === "worker");
+  const can = new Set(secrets.data?.workflow_workers ?? []);
+  const allowed = secrets.data?.grant?.workflows !== false;
+  if (!workers.length) return null;
+  // A token that disagrees with the saved setting is out of date, whatever its layer's last state: never Applied.
+  const shown = workers.map((a) => (can.has(a.agent) !== saved && a.state === "applied" ? { ...a, state: "pending" as const } : a));
+  return (
+    <Panel data-slot="live-workers">
+      <Section title="Live workers" order={4} count={workers.length} region={false}>
+        <LiveAgents
+          framed={false}
+          agents={shown}
+          label="Live workers' push tokens"
+          empty=""
+          detail={(a) => {
+            const has = can.has(a.agent);
+            if (has === saved) return <span data-slot="workflows" data-matches="true">{has ? "Its pushes may change workflows" : "Its pushes may not change workflows"}</span>;
+            const why = saved && !allowed ? "the grant doesn't allow it" : "until its layer applies";
+            return (
+              <Text component="span" fz="xs" c="warning" data-slot="workflows" data-matches="false">
+                {has ? "Still may change workflows" : "Can't change workflows yet"} · {why}
+              </Text>
+            );
+          }}
+        />
+      </Section>
+    </Panel>
   );
 }
