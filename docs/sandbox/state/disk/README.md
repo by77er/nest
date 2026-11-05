@@ -88,7 +88,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
 - **Logged per cut:** `records` (the disk's extents), `walk_ms`, the residue's `ranges` and `bytes`, `whole`, the pre-copy's ranges, bytes and ms, and `paused_ms`, in "checkpoint: disk cut into a shadow". This is how to measure real disks' counts on `c8id` and `m8id` hosts.
 - **Checked:**
   - `verification/nestd/check` `shadow`: the real comparison over a copy-on-write filesystem with block reuse and a guest writing throughout the pre-copy. It holds, and the stale-map variant fails in 8 steps.
-  - Kani proves that `changed` covers every differing offset, and that a cut never targets the shadow being read.
+  - Kani proves that a cut never targets the shadow being read, and an exhaustive test over a small domain (524,288 map pairs) that `changed` covers every differing offset.
   - Host tests run M2's cut tests again with shadows (`*_with_shadows`), over a content-hash stand-in for FIEMAP (`disk_cut: sim_shadow`), every cut compared byte for byte with its disk (`disk_cut_verify`). `E2E_DISK_CUT=sim_shadow` runs the e2e harness the same way.
   - The real FIEMAP and `FICLONERANGE` run only on XFS: on a host, and in the measurement run (not in CI).
 - **Disk space:** two shadows share every block with the disk except what changed since each one's cut (at most the last two turns' writes), and M2's transient cut file goes. `sandboxes_fit_their_disk`'s 8 GB a sandbox is meant to cover that (unverified on a used host).

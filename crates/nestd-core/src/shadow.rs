@@ -290,6 +290,54 @@ mod tests {
         assert_eq!(s.target(), Target { slot: Slot::A, make: true });
     }
 
+    /// Exhaustive over a small domain, in place of a Kani harness (CBMC on the growing `Vec` ran
+    /// past 40 minutes and 20 GB): every pair of two-extent maps over offsets 0..8, each extent 1 or
+    /// 2 blocks on one of four physical blocks, trusted or not, the first at 0 (or 1 for the shadow)
+    /// and the second right after or a block later. `changed` covers every offset where they name
+    /// different blocks or one is untrusted.
+    #[test]
+    fn exhaustive_changed_covers_every_differing_offset() {
+        let mut all = Vec::new();
+        for len in [1u64, 2] {
+            for physical in 0..4u64 {
+                for f in [0, flags::DELALLOC] {
+                    all.push((len, physical, f));
+                }
+            }
+        }
+        let maps = |starts: &[u64]| {
+            let mut out = Vec::new();
+            for &s0 in starts {
+                for &(l0, p0, f0) in &all {
+                    for gap in [0u64, 1] {
+                        for &(l1, p1, f1) in &all {
+                            let a0 = Extent { logical: s0, physical: p0, length: l0, flags: f0 };
+                            let a1 = Extent { logical: s0 + l0 + gap, physical: p1, length: l1, flags: f1 };
+                            out.push([a0, a1]);
+                        }
+                    }
+                }
+            }
+            out
+        };
+        let (disks, shadows) = (maps(&[0]), maps(&[0, 1]));
+        let block = |m: &[Extent; 2], o: u64| m.iter().find(|x| x.logical <= o && o < x.logical + x.length).map(|x| (x.physical + (o - x.logical), x.flags));
+        let mut pairs = 0u64;
+        for a in &disks {
+            for b in &shadows {
+                let r = changed(a, b);
+                for o in 0..8 {
+                    let (x, y) = (block(a, o), block(b, o));
+                    if x != y || x.is_some_and(|x| x.1 & UNTRUSTED != 0) {
+                        assert!(r.iter().any(|g| g.start <= o && o < g.end), "offset {o}: {a:?} {b:?} {r:?}");
+                    }
+                }
+                pairs += 1;
+            }
+        }
+        assert_eq!(pairs, 512 * 1024);
+    }
+
     /// Property, over small random maps: `changed` covers every offset where the two maps name
     /// different blocks (or either is untrusted), and only offsets one of them maps.
     #[test]
@@ -342,45 +390,6 @@ mod tests {
 #[cfg(kani)]
 mod proofs {
     use super::*;
-
-    fn any_extent(at: u64) -> Extent {
-        let length: u64 = kani::any();
-        kani::assume(length >= 1 && length <= 3);
-        let physical: u64 = kani::any();
-        kani::assume(physical < 8);
-        let flags: u32 = if kani::any() { 0 } else { flags::DELALLOC };
-        Extent { logical: at, physical, length, flags }
-    }
-
-    /// Two maps of up to two extents each over offsets 0..8: every offset where they name different
-    /// blocks, or where one is untrusted, is in a changed range.
-    #[kani::proof]
-    #[kani::unwind(8)]
-    fn changed_covers_every_differing_offset() {
-        let a0 = any_extent(0);
-        let a1 = any_extent(a0.length + if kani::any() { 0 } else { 1 });
-        let b0 = any_extent(if kani::any() { 0 } else { 1 });
-        let b1 = any_extent(b0.logical + b0.length);
-        let a = [a0, a1];
-        let b = [b0, b1];
-        let r = changed(&a, &b);
-        let o: u64 = kani::any();
-        kani::assume(o < 8);
-        let block = |m: &[Extent; 2]| {
-            let mut out = None;
-            for x in m {
-                if x.logical <= o && o < x.logical + x.length {
-                    out = Some((x.physical + (o - x.logical), x.flags));
-                }
-            }
-            out
-        };
-        let (x, y) = (block(&a), block(&b));
-        let differs = x != y || x.is_some_and(|x| x.1 & UNTRUSTED != 0);
-        if differs {
-            assert!(r.iter().any(|g| g.start <= o && o < g.end));
-        }
-    }
 
     /// The shadow being read is never a cut's target, whatever happened before.
     #[kani::proof]

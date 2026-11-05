@@ -277,7 +277,7 @@ The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them one at a t
 - `recovery.rs`'s `meta.json` version verdict and the scan's per-entry decisions;
 - `host.rs`'s clean-at-start check, retire backoff, "nothing to salvage" check and `salvage_retryable` (single expressions, plus two constants).
 
-Since then, new decisions land there as they are made: `reask_failure_ends_commit` (whether a salvage goes on past a refused re-ask, the fix of the inventory's B1), and `nestd_core::checkpoint`'s memo (M1, new code, not an extraction). M3′ adds `nestd_core::shadow`, also new code: `shadow::proofs::changed_covers_every_differing_offset` (two maps of up to two extents each, every offset of 0..8) and `shadow::proofs::a_cut_never_targets_the_shadow_being_read` (any four steps of cuts, reads, failures and forgets).
+Since then, new decisions land there as they are made: `reask_failure_ends_commit` (whether a salvage goes on past a refused re-ask, the fix of the inventory's B1), and `nestd_core::checkpoint`'s memo (M1, new code, not an extraction). M3′ adds `nestd_core::shadow`, also new code: `shadow::proofs::a_cut_never_targets_the_shadow_being_read` (any four steps of cuts, reads, failures and forgets). The comparison itself, `changed`, is checked exhaustively by a unit test over the same small domain a harness would take (`exhaustive_changed_covers_every_differing_offset`: 524,288 map pairs, every offset). A Kani harness of it ran past 40 minutes and 20 GB of CBMC on its growing `Vec`, and was dropped.
 
 Functions of one expression have table tests and no harness of their own; the tombstone harness proves them in use.
 
