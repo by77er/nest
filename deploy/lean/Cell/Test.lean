@@ -115,7 +115,7 @@ theorem launch_types_within_iam : use1.launchTypesAllowed = true := by decide
 sandbox host is `c8i-flex.large` when it has room, never dearer than one that does. -/
 theorem on_demand_types_priced : use1.onDemandPriced = true := by decide
 
-example : use1.onDemandTypes.map (·.toList) = ["c8i-flex.large", "c8i.large", "m8i.large", "c8id.large", "m8id.large", "r8id.large"].map (·.toList)
+example : use1.onDemandTypes.map (·.toList) = ["c8i-flex.large", "c8i.large", "m8i.large"].map (·.toList)
     ∧ use1.brainOnDemandTypes.map (·.toList) = ["t3a.medium", "t3.medium"].map (·.toList) := by decide
 /-- Every sandbox type has nested virtualization (Firecracker needs KVM), and the instance-store
 types come first, so FleetDO tries every one of them before an EBS-only type. -/

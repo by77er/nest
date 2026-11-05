@@ -242,11 +242,30 @@ describe("workers changing CI workflows", () => {
     expect(screen.getByText(/The app's grant doesn't allow it/)).toBeInTheDocument();
   });
 
-  it("off, names the live workers that keep it until they end", async () => {
+  it("lists the live workers under a heading, each against the saved setting: one that differs says so until its layer applies", async () => {
     const api = new FakeApi();
-    api.workflowWorkers = ["agt_w1", "agt_w2"];
+    // Saved off: agt_w1's applied layer matches; agt_w2 still has it, its layer pending.
+    api.workflowWorkers = ["agt_w2", "agt_w3"];
+    api.network = { ...api.network, agents: [
+      { agent: "agt_w1", role: "worker", sandbox: "sbx_1", state: "applied", error: null, rev: 2, at_ms: now - 60_000 },
+      { agent: "agt_w2", role: "worker", sandbox: "sbx_2", state: "pending", error: null, rev: 1, at_ms: now - 60_000 },
+      { agent: "agt_m", role: "manager", sandbox: "sbx_3", state: "applied", error: null, rev: 2, at_ms: now - 60_000 },
+      // Its layer last applied, but its token disagrees with the saved setting: out of date, never Applied.
+      { agent: "agt_w3", role: "worker", sandbox: "sbx_4", state: "applied", error: null, rev: 1, at_ms: now - 60_000 },
+    ] };
     renderApp("/projects/prj_one/settings", api);
-    expect(await screen.findByText("2 live workers keep it until it ends")).toBeInTheDocument();
-    expect(screen.getByText(/these keep it until they end: agt_w1, agt_w2/)).toBeInTheDocument();
+    const list = await screen.findByRole("list", { name: "Live workers' push tokens" });
+    expect(screen.getByRole("heading", { name: /Live workers/ })).toBeInTheDocument();
+    const w1 = within(list).getByText("agt_w1").closest("[data-agent]") as HTMLElement;
+    expect(w1).toHaveTextContent("Its pushes may not change workflows");
+    expect(w1.querySelector("[data-slot=state]")).toHaveTextContent("Applied");
+    const w2 = within(list).getByText("agt_w2").closest("[data-agent]") as HTMLElement;
+    expect(w2).toHaveTextContent("Still may change workflows · until its layer applies");
+    expect(w2.querySelector("[data-slot=state]")).toHaveTextContent("Pending");
+    const w3 = within(list).getByText("agt_w3").closest("[data-agent]") as HTMLElement;
+    expect(w3).toHaveTextContent("Still may change workflows · until its layer applies");
+    expect(w3.querySelector("[data-slot=state]")).toHaveTextContent("Pending");
+    expect(within(list).queryByText("agt_m")).toBeNull();
+    expect(screen.queryByText(/keep it until/)).toBeNull();
   });
 });

@@ -481,6 +481,58 @@ describe("workers editing CI workflows", () => {
     expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body.state).toBe("in_progress");
   });
 
+  it("reaches live workers both ways through their layer, each shown applied; within the grant; off goes through a refusal", async () => {
+    const p = await newProject();
+    const w = await assignedWorker(p);
+    expect(sandboxOf(w.worker).github_push).toBeNull();
+    // On: the live worker's push token may change workflows now, not only workers started from now on.
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
+    await drain(p);
+    expect(sandboxOf(w.worker).github_push).toEqual({ workflows: true });
+    let view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
+    expect(view.workflow_workers).toEqual([w.worker]);
+    expect(view.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: w.worker, state: "applied" })]));
+    // The manager's never gets it.
+    expect(sandboxOf(p.manager).github_push).toBeNull();
+    // The grant narrowed: it goes from the live worker at the next upkeep, without anyone saving.
+    const saved = fake.grant.github_push;
+    fake.grant.github_push = { workflows: false };
+    try {
+      await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => { st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0"); });
+      await drain(p);
+      expect(sandboxOf(w.worker).github_push).toBeNull();
+    } finally {
+      fake.grant.github_push = saved;
+    }
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => { st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0"); });
+    await drain(p);
+    expect(sandboxOf(w.worker).github_push).toEqual({ workflows: true });
+    // Off, with nest refusing the whole layer (twice: the retry against the grant read again too): the
+    // removal goes through on its own.
+    fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403, { times: 2 });
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: false });
+    await drain(p);
+    expect(sandboxOf(w.worker).github_push).toBeNull();
+    view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
+    expect(view.workflow_workers).toEqual([]);
+    expect(view.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: w.worker, state: "failed", error: expect.stringContaining("what it removes is applied") })]));
+  });
+
+  it("to a control plane from before the push opt-in, the layer goes without it, and still applies", async () => {
+    const p = await newProject();
+    const w = await assignedWorker(p);
+    fake.layerWithoutPush = true;
+    try {
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
+      await drain(p);
+      const put = fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${fake.agents.get(w.worker)!.sandbox!}/client-policy$`)).at(-1)!;
+      expect(put.body).not.toHaveProperty("github_push");
+      expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: w.worker, state: "applied" })]));
+    } finally {
+      fake.layerWithoutPush = false;
+    }
+  });
+
   it("off mid-start: the attempt is abandoned for a new one without it, and what the old one made is destroyed", async () => {
     const p = await newProject();
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
@@ -508,7 +560,9 @@ describe("workers editing CI workflows", () => {
     expect(task.history.some((h: { action: string }) => h.action === "start_abandoned")).toBe(true);
     // Nothing of the old attempt's was resent with its key: no 409.
     expect(fake.calls.filter((c) => c.path === "/v1/sandboxes" && c.method === "POST" && c.body.labels?.task === t.id && c.body.labels?.start === first)).toHaveLength(1);
-    expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.workflow_workers).toEqual([live.worker]);
+    // The live worker that had it loses it too, through its layer.
+    expect(sandboxOf(live.worker).github_push).toBeNull();
+    expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.workflow_workers).toEqual([]);
     // Looked for once more after the lease (a create still in flight may land late), then forgotten.
     const late = { ...made[0]!, sandbox: "sbx_late1", ended: false };
     fake.sandboxes.set(late.sandbox, late);

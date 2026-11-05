@@ -71,7 +71,8 @@ trap 'exit 130' INT TERM HUP
 # gzipped tarball it unpacks and runs (EC2 allows 16 KB of user data).
 DEADLINE=${MEASURE_DEADLINE_MIN:-90}
 PACK=$(mktemp -d)
-sed "s/@DEADLINE_MIN@/$DEADLINE/" "$HERE/on-host.sh" > "$PACK/on-host.sh"
+# MEASURE_SCRIPT: another on-host script of this directory (a probe), with the same layers.
+sed "s/@DEADLINE_MIN@/$DEADLINE/" "$HERE/${MEASURE_SCRIPT:-on-host.sh}" > "$PACK/on-host.sh"
 cp "$HERE/fdiff.c" "$PACK/"
 USER_DATA=$(mktemp)
 {

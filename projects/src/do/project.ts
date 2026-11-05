@@ -365,6 +365,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (u.merge_method !== undefined) this.sql.exec("UPDATE settings SET merge_method = ?", u.merge_method);
     if (u.workers_edit_workflows !== undefined) this.sql.exec("UPDATE settings SET workers_edit_workflows = ?", u.workers_edit_workflows ? 1 : 0);
     if (u.workers_edit_workflows === false && before.workers_edit_workflows) this.abandonWorkflowStarts();
+    // Live workers too, both ways, through their sandbox's client layer (README.md#secrets).
+    if (u.workers_edit_workflows !== undefined && u.workers_edit_workflows !== before.workers_edit_workflows) await this.oweLayers(["worker"]);
     if (u.auto_merge !== undefined && u.auto_merge !== before.auto_merge) this.setAutoMerge(u.auto_merge);
     this.autoAssign();
     await this.arm();
@@ -1075,7 +1077,7 @@ export class ProjectDO extends DurableObject<Env> {
     );
   }
 
-  /** The live workers whose push token may change workflows: kept until they end, whatever the setting says now. */
+  /** The live workers whose push token may change workflows, as their layer was last applied (or their start made it). */
   workflowWorkers(): string[] {
     const live = new Set(this.liveAgents().filter((a) => a.role === "worker").map((a) => a.agent));
     return this.sql.exec<{ agent: string }>("SELECT agent FROM agent_secrets WHERE workflows = 1 ORDER BY at_ms").toArray().map((r) => r.agent).filter((a) => live.has(a));
@@ -1588,7 +1590,10 @@ export class ProjectDO extends DurableObject<Env> {
     // The layer for a grant: inside it; for none (unread), everything, as the target a removal is cut from.
     const build = (g: Grant | null) => {
       const feeds = this.secretFeeds(role, g ? (g.inject_hosts ?? []) : null);
-      const layer = egressWithinGrant(clientLayerFor(this.rules().rules, role, { inject: feeds.inject, env: feeds.env }, current), g ? (g.egress_hosts ?? []) : null);
+      // A worker's push token may change workflows while Settings says so, within the grant (unread: the
+      // setting alone, as the target a removal is cut from, so turning it off goes through regardless).
+      const push = role === "worker" ? { github_push: { workflows: this.settings()!.workers_edit_workflows && (g ? g.github_push?.workflows === true : true) } } : {};
+      const layer = egressWithinGrant(clientLayerFor(this.rules().rules, role, { inject: feeds.inject, env: feeds.env, ...push }, current), g ? (g.egress_hosts ?? []) : null);
       return { layer, names: feeds.secrets.map((m) => m.name) };
     };
     try {
@@ -1615,6 +1620,7 @@ export class ProjectDO extends DurableObject<Env> {
         await nest.putClientPolicy(sandbox, desired);
       }
       this.recordHolder(agent, role, built.names);
+      if (desired.github_push) this.sql.exec("UPDATE agent_secrets SET workflows = ? WHERE agent = ?", desired.github_push.workflows ? 1 : 0, agent);
       // Applied as of `want`; a newer change meanwhile stays owed.
       this.sql.exec(
         "UPDATE layers SET rev = ?, attempts = 0, error = NULL, at_ms = ?, next_ms = CASE WHEN want_rev = ? THEN NULL ELSE ? END WHERE agent = ?",
@@ -1629,13 +1635,17 @@ export class ProjectDO extends DurableObject<Env> {
       let note = "";
       if (sandbox && current && desired) {
         const safe = shrinkLayer(current, desired);
-        const asIs: ClientLayer = { egress: { allow: normalizeRules(current.egress.allow) }, inject: current.inject.map(asBinding), env: current.env };
+        const asIs: ClientLayer = {
+          egress: { allow: normalizeRules(current.egress.allow) }, inject: current.inject.map(asBinding), env: current.env,
+          ...(current.github_push ? { github_push: { workflows: current.github_push.workflows } } : {}),
+        };
         if (JSON.stringify(safe) !== JSON.stringify(asIs)) {
           try {
             await nest.putClientPolicy(sandbox, safe);
             const kept = new Set(safe.inject.map((b) => b.name));
             const held = this.sql.exec<{ names: string }>("SELECT names FROM agent_secrets WHERE agent = ?", agent).toArray()[0];
             if (held) this.recordHolder(agent, role, (JSON.parse(held.names) as string[]).filter((n) => kept.has(n)));
+            if (safe.github_push && !safe.github_push.workflows) this.sql.exec("UPDATE agent_secrets SET workflows = 0 WHERE agent = ?", agent);
             note = " (what it removes is applied)";
           } catch (e2) {
             note = ` (its removals failed too: ${message(e2)})`;
@@ -1661,7 +1671,7 @@ export class ProjectDO extends DurableObject<Env> {
    * once it's narrowed, without anyone saving anything.
    */
   async grantSeen(g: Grant): Promise<void> {
-    const seen = JSON.stringify({ inject: [...(g.inject_hosts ?? [])].sort(), egress: g.egress_hosts ? [...g.egress_hosts].sort() : null });
+    const seen = JSON.stringify({ inject: [...(g.inject_hosts ?? [])].sort(), egress: g.egress_hosts ? [...g.egress_hosts].sort() : null, workflows: g.github_push?.workflows === true });
     const before = this.settingsRow()?.grant_seen as string | null | undefined;
     if (before === undefined || before === seen) return;
     this.sql.exec("UPDATE settings SET grant_seen = ?", seen);

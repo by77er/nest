@@ -143,7 +143,11 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         else:
             stub(bin_dir, "lsblk", 'echo "/dev/nvme0n1 Amazon Elastic Block Store"\n')
         script = fake / "user-data.sh"
-        script.write_text(render(role, fake))
+        # A host with KVM and Firecracker, so nestd.json names the jailer's chroots (what the gateway
+        # must reach): /dev isn't moved under the fake root, so its KVM node is a stand-in file.
+        (fake / "dev-kvm").write_text("")
+        stub(fake / "opt/nest/bin", "firecracker", "exit 0\n")
+        script.write_text(render(role, fake).replace("/dev/kvm", f"{fake}/dev-kvm"))
         env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(fake / "root")}
         proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env, timeout=60)
         return fake, proc, calls.read_text() if calls.exists() else ""
@@ -193,12 +197,47 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         fstab = (fake / "etc/fstab").read_text()
         self.assertIn("LABEL=nest-data", fstab)
         self.assertIn("nofail,x-systemd.device-timeout=10s", fstab)
-        self.assertTrue(cfg["state_dir"].endswith("/var/lib/nest/data/state"), cfg["state_dir"])
+        self.assertTrue(cfg["state_dir"].endswith("/srv/nest/state"), cfg["state_dir"])
         # Every unit that uses the store requires its mount: none starts before it after a
         # reboot, or at all on a store a stop and start left blank.
         for unit in ("nestd.service", "nest-proxy.service", "nest-gateway.service"):
             drop_in = fake / f"etc/systemd/system/{unit}.d/instance-store.conf"
-            self.assertEqual(drop_in.read_text(), f"[Unit]\nRequiresMountsFor={fake}/var/lib/nest/data\n", unit)
+            self.assertTrue(drop_in.read_text().startswith(f"[Unit]\nRequiresMountsFor={fake}/srv/nest\n"), unit)
+
+    def inaccessible(self, fake: Path) -> dict:
+        """Each unit's `InaccessiblePaths`, its own and its drop-ins', as paths."""
+        out = {}
+        units = fake / "etc/systemd/system"
+        for f in list(units.glob("*.service")) + list(units.glob("*.service.d/*.conf")):
+            unit = f.name if f.suffix == ".service" else f.parent.name[: -len(".d")]
+            for line in f.read_text().splitlines():
+                if line.startswith("InaccessiblePaths="):
+                    # A `-` before a path keeps render() from moving it under the fake root: move it here.
+                    paths = [Path(p.lstrip("-+")) for p in line.split("=", 1)[1].split()]
+                    out.setdefault(unit, []).extend(p if fake in p.parents else fake / p.relative_to("/") for p in paths)
+        return out
+
+    def test_the_gateway_reaches_every_vms_vsock_socket_and_nothing_of_the_state(self):
+        """Wherever the state goes, the jailer's chroots (each VM's vsock socket is in its own) are
+        under none of the gateway's `InaccessiblePaths` (2026-11-04: a store under /var/lib/nest
+        failed every hands call), and the state is hidden from it or root's alone."""
+        for nvme in (False, True, "broken"):
+            cfg, fake = self.check("burst", nvme=nvme)
+            jail = Path(cfg["driver"]["jailer"]["chroot_base_dir"])
+            hidden = self.inaccessible(fake).get("nest-gateway.service", [])
+            self.assertTrue(hidden, "the gateway hides something")
+            for p in hidden:
+                self.assertFalse(jail == p or p in jail.parents, f"nvme={nvme}: the chroots {jail} are under the gateway's hidden {p}")
+            state = Path(cfg["state_dir"])
+            covered = any(state == p or p in state.parents for p in hidden)
+            private = state.exists() and state.stat().st_mode & 0o077 == 0
+            self.assertTrue(covered or private, f"nvme={nvme}: the gateway could read {state}")
+            # nestd runs cloudflared as nest-cf with HOME=<state>/cloudflared: every directory down
+            # to the state, under the fake root, lets others through.
+            for d in [state, *state.parents]:
+                if d == fake:
+                    break
+                self.assertTrue(d.stat().st_mode & 0o001, f"nvme={nvme}: nest-cf can't pass {d} ({oct(d.stat().st_mode)}) to reach its home")
 
     def test_sandbox_host_whose_instance_store_wont_format(self):
         """mkfs.xfs fails (or an AMI lacks xfsprogs): the host still comes up, with state on the root volume."""
