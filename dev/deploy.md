@@ -87,6 +87,14 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
 - **Unconfirmed operator cleanups** (the owner to confirm they were done): the old SSM parameter `/nest/control-plane/vars/AWS_CELLS` if it was never imported into a cell stack; the legacy Worker secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `ROOT_CA_KMS_KEY_ID`, `ROOT_CA_CERT_PEM`) and the SSM parameter `/nest/control-plane/vars/ROOT_CA_KMS_KEY_ID`; the unattached reusable Access policies left by the edge stack's import; and respawning agents whose stored prompts still describe removed tools.
 - **Still needed by hosts:** `sandbox_create`, `sandbox_fork` and `agent_start` carry a `ws_` value (`compatWorkstream`), which hosts and runners from before workstreams left require (Rust's `WorkstreamId`, prefix-checked). Drop it from the control plane (and `SandboxInfo`/`AgentInfo`) once every host runs that release or later, then the Rust fields the release after. The policy layer's wire value `workstream` (the operator layer; hosts parse a closed enum) stays.
 
+**This release's rollout rule (mitigation, instance-store hosts): not a one-way deploy, and nothing by hand.** `use1`'s `launchTypes` become the EBS-only `c8i-flex.large, c8i.large, m8i.large` until the instance-store path is fixed.
+- **Why:** on the first instance-store host in production (`i-0515bad00a5794f0b`, launched 2026-11-04 09:27Z from template v18), every hands call to its sandbox failed with "the sandbox stayed busy for 30s (last: guest not reachable)".
+  - The gateway logged `guest vsock connect failed … Permission denied (os error 13)` 184 times.
+  - On an instance-store host, bootstrap puts the jailer's chroots, and with them each VM's vsock socket, under `/var/lib/nest/data/jailer`. The gateway's unit hides `/var/lib/nest` (`InaccessiblePaths=-/var/lib/nest`).
+  - The same host's M2 cut worked: `paused_ms=4`, 113 extents.
+- **Effect:** hosts are `c8i-flex`, `c8i` or `m8i`, as before #152, with M1 checkpoints on the 140 GB root. Running hosts don't change. A running instance-store host stays broken for hands until it retires.
+- **What a rollback does:** the instance-store types come back, and with them the bug.
+
 **This release's rollout rule (on-demand fallback): not a one-way deploy, and nothing by hand.**
 - **What changes:** when spot has no room for any instance type, FleetDO tries each type on demand, cheapest first. Before, it tried only the first type. The cell stack writes the order, `on_demand_types`, from its price table (Price List API, 2026-11-03/04). `use1` gets `c8i-flex.large, c8i.large, m8i.large, c8id.large, m8id.large, r8id.large`, and the brains `t3a.medium, t3.medium`.
 - **Why:** on 2026-11-03 the first type, `c8id.large`, had no on-demand capacity in any of the cell's zones, so a pass with no spot room launched nothing.
