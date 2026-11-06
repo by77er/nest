@@ -366,11 +366,11 @@ describe("the catalog sync", () => {
     const puts = fake.callsTo("PUT", /^\/v1\/catalog\//).length;
     const second = await api(token, "POST", "/api/admin/sync");
     expect(second.body.written).toEqual(first.body.written);
-    expect(fake.callsTo("PUT", /^\/v1\/catalog\//).length - puts).toBe(8);
+    expect(fake.callsTo("PUT", /^\/v1\/catalog\//).length - puts).toBe(9);
     expect(new Map(fake.catalog)).toEqual(snapshot);
     expect([...fake.catalog.keys()].sort()).toEqual([
       "capabilities/projects/board", "capabilities/projects/review", "capabilities/projects/routine", "capabilities/projects/task",
-      "templates/projects/manager", "templates/projects/reviewer", "templates/projects/routine", "templates/projects/worker",
+      "templates/projects/dreaming", "templates/projects/manager", "templates/projects/reviewer", "templates/projects/routine", "templates/projects/worker",
     ]);
     expect((await api(token, "GET", "/api/admin/sync")).status).toBe(405);
   });

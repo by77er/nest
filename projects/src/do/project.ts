@@ -394,6 +394,8 @@ export const MIGRATIONS = [
       started_ms INTEGER, ended_ms INTEGER, spawn TEXT)`,
     "CREATE INDEX routine_runs_routine ON routine_runs (routine, queued_ms)",
     "CREATE INDEX routine_runs_agent ON routine_runs (agent)",
+    // Each turn counted once per run, by its event id (a redelivered event isn't a second turn).
+    "CREATE TABLE run_turns (run TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY (run, event))",
     "CREATE TABLE memory (key TEXT PRIMARY KEY, text TEXT NOT NULL, source TEXT NOT NULL, tainted INTEGER NOT NULL, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL)",
     `CREATE TABLE proposals (id TEXT PRIMARY KEY, routine TEXT NOT NULL, routine_name TEXT NOT NULL, run TEXT NOT NULL, agent TEXT NOT NULL, title TEXT NOT NULL,
       body TEXT NOT NULL, state TEXT NOT NULL, task TEXT, reason TEXT, tainted INTEGER NOT NULL, created_ms INTEGER NOT NULL, triaged_ms INTEGER)`,
@@ -2239,6 +2241,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (!r || r.state === "ended") return;
     const id = r.id as string;
     if (e.type === "agent.turn_completed") {
+      // Counted once per event: a redelivery (nest's retry, a concurrent copy) is the same turn.
+      if (this.sql.exec("INSERT OR IGNORE INTO run_turns (run, event) VALUES (?, ?)", id, e.id).rowsWritten === 0) return;
       const turns = (r.turns as number) + 1;
       // The run's report: its latest turn's last text, kept short (an agent wrote it: shown as text, never followed).
       this.sql.exec("UPDATE routine_runs SET turns = ?, summary = COALESCE(?, summary) WHERE id = ?", turns, e.text ? e.text.slice(0, RUN_SUMMARY_MAX) : null, id);
@@ -2283,7 +2287,10 @@ export class ProjectDO extends DurableObject<Env> {
       let agent = (before.agent as string | null) ?? null;
       if (!agent) {
         // No secrets and no egress beyond nest's own and the repo's: a routine reads the repo and the board.
-        agent = await nest.startAgent(TEMPLATE.routine, labels, { read: s.repo }, `${s.id}/routine/${id}`, {}, spawn);
+        // A dreaming run has no hands (no sandbox, no repo): the board, recent work, memory and transcripts are all it reads.
+        agent = routine.kind === "dreaming"
+          ? (await nest.createAgent({ ...spawn, template: TEMPLATE.dreaming, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent
+          : await nest.startAgent(TEMPLATE.routine, labels, { read: s.repo }, `${s.id}/routine/${id}`, {}, spawn);
         await directory(this.env).recordAgent({ agent, project: s.id, role: "routine", task: null, pr: null });
         this.sql.exec("UPDATE routine_runs SET agent = ? WHERE id = ? AND agent IS NULL", agent, id);
         if (!current()) {
@@ -2339,6 +2346,11 @@ export class ProjectDO extends DurableObject<Env> {
     if (!routine) return fail(409, "the routine was deleted");
     const from = `Proposed by the routine "${routine.name as string}" (run ${runId}).`;
     if (routine.proposals === "draft") {
+      // As many pending as triage holds: drafts a routine proposed that nobody has specced, cancelled or deleted yet.
+      const pending = this.sql.exec<{ n: number }>(
+        "SELECT COUNT(DISTINCT h.task) AS n FROM history h JOIN tasks t ON t.id = h.task WHERE h.action = 'proposed' AND t.state = 'draft'",
+      ).one().n;
+      if (pending >= MAX_UNTRIAGED_PROPOSALS) return fail(429, `the board has ${MAX_UNTRIAGED_PROPOSALS} drafts routines proposed already: propose nothing more for now`);
       // Recorded as the run's agent, tainted whatever the session says: it read the repo and others' text.
       const t = await this.createTask({ title, body: `${body.trim()}\n\n${from}` }, { kind: "agent", agent: caller.agent, tainted: true });
       if (!t.ok) return t;
@@ -2445,6 +2457,12 @@ export class ProjectDO extends DurableObject<Env> {
         if (!mayWriteMemory(caller.role)) return fail(403, "only the manager and routines write the project's memory");
         const source = run ? `routine:${(this.routineRow(run.routine as string)?.name as string | undefined) ?? run.routine as string} (${run.id as string})` : caller.role;
         const tainted = run !== null || caller.tainted ? 1 : 0;
+        // Provenance: a tainted session never changes or removes what an untainted one wrote (refused, the
+        // note kept as it is); it may write a note of its own beside it.
+        const had = this.sql.exec("SELECT source, tainted FROM memory WHERE key = ?", key!).toArray()[0];
+        if (had && had.tainted === 0 && tainted === 1) {
+          return fail(403, `the note ${key} was written by an untainted session (${had.source as string}): a tainted one can't ${tool === "memory_delete" ? "delete" : "change"} it; write a note of your own under another key`);
+        }
         if (tool === "memory_delete") {
           if (this.sql.exec("DELETE FROM memory WHERE key = ?", key!).rowsWritten === 0) return fail(404, `no note ${key}`);
           if (run) this.noteCreated(run.id as string, { kind: "memory_delete", key: key! });

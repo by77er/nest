@@ -151,7 +151,7 @@ describe("who is set", () => {
       const sql = st.storage.sql;
       // The shape before the step: none of its columns or table, the attach long done.
       const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("CREATE TABLE pr_inputs")));
-      for (const t of ["pr_inputs", "routines", "routine_runs", "memory", "proposals"]) sql.exec(`DROP TABLE ${t}`);
+      for (const t of ["pr_inputs", "routines", "routine_runs", "run_turns", "memory", "proposals"]) sql.exec(`DROP TABLE ${t}`);
       for (const c of ["comments_from_id", "comments_from_login", "comments_decided", "repo_owner_id", "repo_owner_login", "routine_cap", "tasks_done_total", "prs_merged_total"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE settings SET attach_next_ms = NULL");
       sql.exec("UPDATE schema_version SET v = ?", step);
