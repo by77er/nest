@@ -8,8 +8,11 @@
 //   `pull_request` leaves the head without the required check, which blocks merging until the next push.
 // - Events (https://docs.github.com/en/webhooks/webhook-events-and-payloads): `pull_request`
 //   (`opened`, `reopened`, `synchronize`, `closed`) and `check_run` `rerequested` for the app's own
-//   check; `ping` and anything else is acknowledged and ignored, as is a repo no project is attached to.
+//   check; the owner's comments on a PR (README.md#pr-comments): `issue_comment` `created` on a PR,
+//   `pull_request_review` `submitted` (with text, or requesting changes) and `pull_request_review_comment`
+//   `created`; `ping` and anything else is acknowledged and ignored, as is a repo no project is attached to.
 
+import type { PrComment } from "./do/project";
 import { directory, type Env, project, review } from "./env";
 import { CHECK_NAME, verifyGithubSignature } from "./github";
 
@@ -26,6 +29,68 @@ const obj = (v: unknown): Obj => (typeof v === "object" && v !== null && !Array.
 const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
 const prNumber = (v: unknown): number | null => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null);
 
+const COMMENT_EVENTS = new Set(["issue_comment", "pull_request_review", "pull_request_review_comment"]);
+/** A comment's text kept from the event; the message cuts it further (PR_COMMENT_MAX). */
+const BODY_MAX = 20_000;
+
+/**
+ * Whether a comment is the owner's: GitHub's `author_association` (computed by GitHub, inside the
+ * signed payload) is `OWNER`, the account that owns the repo, and the author is a person, not an App or
+ * a bot (the app's own reviewer posts as its App). MEMBER and COLLABORATOR are left out: either may be
+ * someone with read access only, and the app has no way to tell from the event.
+ */
+export function ownerComment(by: unknown, association: unknown): string | null {
+  const u = obj(by);
+  const login = str(u.login);
+  return association === "OWNER" && u.type === "User" && login ? login : null;
+}
+
+/**
+ * The owner's comment on a PR from one of the comment events, or null: another author, an action it
+ * doesn't act on (an edit, a delete, a review with no text that isn't requesting changes), a comment
+ * on an issue that isn't a PR, or a malformed payload.
+ */
+export function prCommentOf(event: string, payload: Obj, repo: string): PrComment | null {
+  const action = str(payload.action);
+  const headOf = (pr: Obj) => {
+    const head = obj(pr.head);
+    const fork = str(obj(head.repo).full_name)?.toLowerCase() !== repo;
+    return { fork, headTask: fork ? null : (TASK_BRANCH.exec(str(head.ref) ?? "")?.[1] ?? null) };
+  };
+  const text = (v: unknown) => (str(v) ?? "").slice(0, BODY_MAX);
+  if (event === "issue_comment") {
+    const issue = obj(payload.issue);
+    if (action !== "created" || !issue.pull_request) return null;
+    const c = obj(payload.comment);
+    const author = ownerComment(c.user, c.author_association);
+    const pr = prNumber(issue.number);
+    const url = str(c.html_url);
+    if (!author || pr === null || !url) return null;
+    // The event doesn't name the head: the PR's task is the one it's attached to.
+    return { pr, fork: null, headTask: null, kind: "comment", author, url, body: text(c.body) };
+  }
+  const pr = obj(payload.pull_request);
+  const number = prNumber(pr.number);
+  if (number === null) return null;
+  if (event === "pull_request_review") {
+    const r = obj(payload.review);
+    const state = str(r.state)?.toLowerCase() ?? null;
+    const body = text(r.body);
+    if (action !== "submitted" || (!body.trim() && state !== "changes_requested")) return null;
+    const author = ownerComment(r.user, r.author_association);
+    const url = str(r.html_url);
+    if (!author || !url) return null;
+    return { pr: number, ...headOf(pr), kind: "review", author, url, body, review_state: state };
+  }
+  const c = obj(payload.comment);
+  if (action !== "created") return null;
+  const author = ownerComment(c.user, c.author_association);
+  const url = str(c.html_url);
+  if (!author || !url) return null;
+  const line = prNumber(c.line) ?? prNumber(c.original_line);
+  return { pr: number, ...headOf(pr), kind: "review_comment", author, url, body: text(c.body), path: (str(c.path) ?? "").slice(0, 500) || null, line };
+}
+
 export async function githubHook(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return new Response(null, { status: 405 });
   if (!env.GITHUB_WEBHOOK_SECRET) return new Response(null, { status: 503 });
@@ -41,7 +106,7 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
   } catch {
     return new Response(null, { status: 400 });
   }
-  if (event !== "pull_request" && event !== "check_run") return json({ ignored: event ?? "no event" });
+  if (event !== "pull_request" && event !== "check_run" && !COMMENT_EVENTS.has(event ?? "")) return json({ ignored: event ?? "no event" });
 
   const dir = directory(env);
   const seenId = `github:${delivery}`;
@@ -80,6 +145,9 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
       await review(env, p.id).onClosed(of, { pr: number, updated_at });
       await project(env, p.id).onPullRequest({ pr: number, task, action: "closed", merged: pr.merged === true });
     }
+  } else if (COMMENT_EVENTS.has(event!)) {
+    const c = prCommentOf(event!, payload, p.repo);
+    if (c) await project(env, p.id).onPrComment(c);
   } else if (action === "rerequested") {
     const run = obj(payload.check_run);
     const id = prNumber(run.id);
