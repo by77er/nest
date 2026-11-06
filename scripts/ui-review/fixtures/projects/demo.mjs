@@ -226,8 +226,8 @@ const RICH = [
   // Every trace (the manager's, a worker's, a reviewer's): history offered and paged, then the live ring (trace.mjs).
   const { messages: allMessages, pages: historyPages } = trace(now, { busy: variant === "turn-busy" });
   // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
-  // "chat-empty" is a new conversation: no turn running either (its starters show).
-  const traceMessages = variant === "connecting" || variant === "chat-empty" ? [] : allMessages;
+  // "chat-empty" is a new conversation: no turn running either (its starters show); "chat-heavy" ends on its reply.
+  const traceMessages = variant === "connecting" || variant === "chat-empty" || variant === "chat-heavy" ? [] : allMessages;
   const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length }, { ...other, needs_you: 0 }];
   const sync = { written: ["capabilities/projects/board", "capabilities/projects/task", "templates/projects/manager", "templates/projects/worker"], repos: ["by77er/gadgets", "by77er/widgets"], at_ms: now - 3_600_000 };
 
