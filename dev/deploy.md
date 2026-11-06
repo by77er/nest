@@ -95,7 +95,7 @@ The deploy order is the pipeline's: the cell stack applies, then the Worker depl
   - cloudflared, as `nest-cf`, entered its home under the state directory and ran `--version`.
 - **Not yet proven:** the real unit and drop-in file, Firecracker's own sockets and the jailer's hard links on XFS, the tunnel running from that home, and a reboot of an instance-store host.
 - **Who it affects:** only new hosts. Running hosts don't change. On-demand still tries the EBS-only types first (cheapest first).
-- **After the deploy:** as soon as the first instance-store host enrolls, run `dev/cloud-checks/hands_probe_check.py` on a sandbox placed on it. FleetDO places real sandboxes there from enrollment, so don't wait.
+- **After the deploy:** as soon as the first instance-store host enrolls, run `dev/cloud-checks/hands_probe_check.py`. It can't pick a host, so the run counts only when its `instance_type` is `c8id`, `m8id` or `r8id`; otherwise run it again. FleetDO places real sandboxes on the host from enrollment, so don't wait.
 - **What a rollback does:** the launch types go back to EBS-only, so no new instance-store host launches. A running one stays in service, since there's no drain route. If its hands calls fail, save its console and logs, then terminate it (the owner's call). Its sandboxes cold-boot elsewhere from their generations.
 
 **This release's rollout rule (on-demand fallback): not a one-way deploy, and nothing by hand.**
