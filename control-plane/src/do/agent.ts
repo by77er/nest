@@ -24,6 +24,10 @@ import { type McpConnector, McpProxy, mcpToken } from "../lib/mcp-proxy";
 import { type IdentitySubject, IdentityTokens } from "../lib/identity";
 import { Repo } from "../lib/repos";
 import { isAgentId, Labels } from "../lib/clients";
+import {
+  AGENT_ID, attenuates, entryWithin, type HeldGrant, inScope, parseGrantRequests, reaches, type Resource, type ResolvedGrant, resolveChain, storedGrant,
+  type Target,
+} from "../lib/grants";
 import type { MemberFacts } from "./client";
 import { type ClientEvent, ClientOutbox, EVENT_TEXT_MAX } from "../lib/client-events";
 import { field, TRACE_PING, TRACE_PONG, TRACE_SOCKETS_MAX, type TraceBody, type TraceControl, TraceRing, traceOf } from "../lib/trace";
@@ -86,6 +90,9 @@ const PRUNE_EVERY_MS = 3_600_000;
 const TRANSCRIPT_DEFAULT_LIMIT = 200;
 const TRANSCRIPT_MAX_LIMIT = 500;
 const TRANSCRIPT_MAX_BYTES = 256 * 1024;
+/** `list`: rows per page by default / at most. */
+const LIST_DEFAULT_LIMIT = 100;
+const LIST_MAX_LIMIT = 200;
 const iso = (ms: number) => new Date(ms).toISOString();
 
 /** An agent, as AgentDO stores it, with its expanded spec copied in at spawn. */
@@ -149,9 +156,22 @@ const LIFECYCLE_TOOLS = ["agent_spawn", "agent_stop", "exit"];
 const TIMER_TOOLS = ["timer_set", "timer_cancel", "timer_list"];
 /** The tools an agent is offered: its spec's, and `exit`, which every agent has (it only gives up authority). */
 const offered = (info: Pick<AgentSpec, "tools">): string[] => (info.tools.includes("exit") ? info.tools : [...info.tools, "exit"]);
+/**
+ * Tools a grant offers whatever the spec says (docs/agents/tools/#grants): `read_transcript` with a
+ * `read_transcript` grant, and `list` with any grant. Only grants unexpired now count; the call checks
+ * the whole chain again.
+ */
+const GRANT_TOOLS: Readonly<Record<string, (g: HeldGrant) => boolean>> = {
+  read_transcript: (g) => g.action === "read_transcript",
+  list: () => true,
+};
 
 /** What `info()` answers: the record plus the derived brain host and `state`. */
-export type AgentView = Omit<AgentInfo, "client" | "labels"> & { host: string | null; state: AgentState; client: string | null; labels: Labels };
+export type AgentView = Omit<AgentInfo, "client" | "labels"> & {
+  host: string | null; state: AgentState; client: string | null; labels: Labels;
+  /** The grants it holds (docs/agents/tools/#grants), as conferred; absent when none. */
+  grants?: HeldGrant[];
+};
 
 /** Fields of records stored by the previous release, which `load()` migrates. */
 interface PreviousReleaseFields {
@@ -203,6 +223,11 @@ export interface CreateAgent {
   /** The client whose subtree it joins (it was admitted there first). */
   client?: string | null;
   labels?: Labels;
+  /**
+   * Grants its creator conferred on it (docs/agents/tools/#grants), checked by the creator: each scoped
+   * to `client` (null: the operator's). Stored with the record, in its step.
+   */
+  grants?: Omit<HeldGrant, "id" | "conferred_ms">[];
 }
 
 /** How an agent is ended (`Ended` without the steps it records later). */
@@ -327,6 +352,8 @@ export class AgentDO extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS children (agent TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, ended INTEGER NOT NULL DEFAULT 0)");
     // Its end was asked for (`ended` comes with the child's `childEnded`, once its end is done).
     addColumn(this.sql, "children", "asked", "INTEGER NOT NULL DEFAULT 0");
+    // The grants it holds (docs/agents/tools/#grants): one JSON row each (`HeldGrant`), fixed once conferred.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, body TEXT NOT NULL)");
     this.mcp = new McpProxy({
       sql: this.sql,
       agent: () => this.load().agent,
@@ -496,6 +523,10 @@ export class AgentDO extends DurableObject<Env> {
 
   async create(req: CreateAgent): Promise<AgentInfo> {
     if (this.exists()) return this.load();
+    // A grant never leaves the subtree it is conferred in (its creator checked the rest).
+    for (const g of req.grants ?? []) {
+      if (g.scope !== (req.client ?? null)) throw new NestError(ErrorCodes.FORBIDDEN, "a grant is confined to its agent's subtree", 403);
+    }
     // An agent owner must exist (`info()` refuses one never created); a client owner was checked by its caller.
     const owner = req.owner ?? null;
     if (isAgentId(owner) && !req.owner_is_caller) await this.env.AGENT.get(this.env.AGENT.idFromName(owner)).info();
@@ -545,6 +576,11 @@ export class AgentDO extends DurableObject<Env> {
       ...(req.labels && Object.keys(req.labels).length ? { labels: req.labels } : {}),
     };
     this.save(info);
+    const conferred = Date.now();
+    for (const g of req.grants ?? []) {
+      const held: HeldGrant = { ...g, id: newId("grt_"), conferred_ms: conferred };
+      this.sql.exec("INSERT INTO grants (id, body) VALUES (?, ?)", held.id, JSON.stringify(held));
+    }
     if (req.tainted) this.kvPut("read_tainted", true);
     await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS, true);
     await this.deadlines.set("registry", Date.now(), true);
@@ -554,7 +590,70 @@ export class AgentDO extends DurableObject<Env> {
   /** The record as the API shows it (without the compat `workstream`), plus its brain host and state. */
   async info(): Promise<AgentView> {
     const { workstream: _, ...info } = this.load();
-    return { ...info, client: info.client ?? null, labels: info.labels ?? {}, host: info.brain?.host ?? null, state: agentState(info) };
+    const grants = this.heldGrants();
+    return {
+      ...info, client: info.client ?? null, labels: info.labels ?? {}, host: info.brain?.host ?? null, state: agentState(info),
+      ...(grants.length ? { grants } : {}),
+    };
+  }
+
+  /** The grants it holds, in the order conferred; a row this release can't read fully is left out (it authorizes nothing). */
+  private heldGrants(): HeldGrant[] {
+    // Inserted in the order conferred (one spawn's share a `conferred_ms`, and ids aren't ordered within a millisecond).
+    return this.sql.exec<{ body: string }>("SELECT body FROM grants ORDER BY rowid").toArray()
+      .map((r) => storedGrant(r.body)).filter((g): g is HeldGrant => g !== null);
+  }
+
+  /**
+   * Its grant `id`, for a grant derived from it (`resolveChain`): null once gone, and whether this agent
+   * has ended, from the moment its end is asked for, so what it conferred lapses with it.
+   */
+  async grantFor(id: string): Promise<{ grant: HeldGrant | null; ended: boolean; client: string | null }> {
+    const info = this.load();
+    const row = this.sql.exec<{ body: string }>("SELECT body FROM grants WHERE id = ?", id).toArray()[0];
+    return { grant: row ? storedGrant(row.body) : null, ended: !!info.ended, client: info.client ?? null };
+  }
+
+  /** The tools it is offered now: its spec's, `exit`, and those its unexpired grants offer (`GRANT_TOOLS`). */
+  private offeredNow(info: AgentInfo, now = Date.now()): string[] {
+    const tools = offered(info);
+    const live = this.heldGrants().filter((g) => g.expires_ms === undefined || g.expires_ms > now);
+    const extra = Object.entries(GRANT_TOOLS).filter(([t, by]) => !tools.includes(t) && live.some(by)).map(([t]) => t);
+    return extra.length ? [...tools, ...extra] : tools;
+  }
+
+  /** `g` if its whole chain holds now (docs/agents/tools/#grants). */
+  private resolveGrant(info: AgentInfo, g: HeldGrant): Promise<ResolvedGrant | null> {
+    return resolveChain(g, info.client ?? null, Date.now(), {
+      agentGrant: async (agent, grant) => {
+        try {
+          return await this.agentStub(agent).grantFor(grant);
+        } catch {
+          // Gone (pruned), or a release without grants: nothing derived from it holds.
+          return null;
+        }
+      },
+      clientLive: async (client) => {
+        try {
+          await this.clientStub(client).scope();
+          return true;
+        } catch {
+          return false;
+        }
+      },
+    });
+  }
+
+  /** Its grants of `action` whose chains hold now. */
+  private async resolvedGrants(info: AgentInfo, action: HeldGrant["action"]): Promise<ResolvedGrant[]> {
+    const now = Date.now();
+    const out: ResolvedGrant[] = [];
+    for (const g of this.heldGrants()) {
+      if (g.action !== action || (g.expires_ms !== undefined && g.expires_ms <= now)) continue;
+      const r = await this.resolveGrant(info, g);
+      if (r) out.push(r);
+    }
+    return out;
   }
 
   /** Whose subtree it is in, and whether its end is done (a client's routes answer 404 outside its own). */
@@ -1253,6 +1352,111 @@ export class AgentDO extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
   }
 
+  /**
+   * Whether it may read `target`'s transcript, and within which limits: an agent it owns (transitively),
+   * none; else the first of its `read_transcript` grants (in the order conferred) whose chain holds and
+   * reaches the target. Forbidden otherwise.
+   */
+  private async transcriptAuthority(info: AgentInfo, target: string): Promise<{ max_age_ms?: number; max_entries?: number }> {
+    if (ownsVia(info.agent, await this.ownerChain(target))) return {};
+    const now = Date.now();
+    const held = this.heldGrants().filter((g) => g.action === "read_transcript" && (g.expires_ms === undefined || g.expires_ms > now));
+    if (held.length) {
+      const t = await this.targetOf(target);
+      for (const g of held) {
+        const r = await this.resolveGrant(info, g);
+        if (r && reaches(r, t)) return r.limits;
+      }
+    }
+    throw new NestError(ErrorCodes.FORBIDDEN, `${target} isn't an agent you own or one a grant of yours covers`, 403);
+  }
+
+  /** What a grant is checked against, from the target's own record. */
+  private async targetOf(agent: string): Promise<Target> {
+    const v = await this.agentStub(agent).info();
+    return { agent, client: v.client, labels: v.labels };
+  }
+
+  /**
+   * `list {kind: agent, labels?, state?, limit?, cursor?}`: the agents its grants cover, one grant per
+   * page, in the order conferred (an agent two grants cover is listed under each). From its client's
+   * registry, or for the operator's own agents this cell's; every row checked against the grant again.
+   */
+  private async listTool(info: AgentInfo, a: Record<string, unknown>): Promise<ToolOutcome> {
+    const filter = Labels.safeParse(a.labels ?? {});
+    if (!filter.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `labels: ${filter.error.issues.map((i) => i.message).join("; ")}`);
+    const state = a.state === "ended" || a.state === "all" ? a.state : "live";
+    const limit = typeof a.limit === "number" ? Math.min(Math.max(1, a.limit), LIST_MAX_LIMIT) : LIST_DEFAULT_LIMIT;
+    const cursor = typeof a.cursor === "string" ? /^(\d+):(.*)$/s.exec(a.cursor) : null;
+    if (typeof a.cursor === "string" && !cursor) throw new NestError(ErrorCodes.INVALID_MESSAGE, "bad cursor");
+    const now = Date.now();
+    const grants: ResolvedGrant[] = [];
+    for (const g of this.heldGrants()) {
+      if (g.expires_ms !== undefined && g.expires_ms <= now) continue;
+      const r = await this.resolveGrant(info, g);
+      if (r) grants.push(r);
+    }
+    const i = cursor ? Number(cursor[1]) : 0;
+    const inner = cursor && cursor[2] ? cursor[2] : undefined;
+    type Row = { agent: string; client: string | null; labels: Labels; created_ms: number | null; ended_ms: number | null; by_agent: boolean };
+    let rows: Row[] = [];
+    let next: string | null = null;
+    const r = grants[i];
+    if (r) {
+      const want = Object.entries(filter.data);
+      const ids = r.resources.filter((x): x is Extract<Resource, { id: string }> => "id" in x);
+      if (ids.length) {
+        // An id: that agent alone, when every link names it.
+        const id = ids[0]!.id;
+        try {
+          const v = await this.agentStub(id).info();
+          const ended = !!v.ended;
+          if (state === "all" || (state === "ended") === ended) {
+            rows = [{ agent: id, client: v.client, labels: v.labels, created_ms: null, ended_ms: v.ended?.ms ?? null, by_agent: isAgentId(v.owner) }];
+          }
+        } catch (e) {
+          if (asNestError(e)?.code !== ErrorCodes.UNKNOWN_AGENT) throw e;
+        }
+      } else {
+        // Every link's labels, and the caller's filter: a key asked for twice with two values matches nothing.
+        const asks = [...r.resources.flatMap((x) => ("labels" in x ? x.labels : [])), ...want];
+        const labels = new Map<string, string>();
+        let none = false;
+        for (const [k, v] of asks) {
+          if (labels.has(k) && labels.get(k) !== v) none = true;
+          labels.set(k, v);
+        }
+        if (!none) {
+          const q: { labels: [string, string][]; state: "live" | "ended" | "all"; limit: number; cursor?: string } = {
+            labels: [...labels], state, limit, ...(inner ? { cursor: inner } : {}),
+          };
+          if (r.scope) {
+            const page = await this.clientStub(r.scope).list("agent", q);
+            rows = page.items.map((m) => ({ agent: m.id, client: r.scope, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms, by_agent: isAgentId(m.owner) }));
+            next = page.next_cursor;
+          } else {
+            // The operator's own agents: this cell's registry, without any client's.
+            const page = await this.fleet(info.cell).listRegistry("agent", q);
+            rows = page.items.filter((m) => m.client === null)
+              .map((m) => ({ agent: m.id, client: m.client, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms, by_agent: true }));
+            next = page.next_cursor;
+          }
+        }
+      }
+      // The grant again, on each row's own client and labels: an index that disagrees reveals nothing.
+      rows = rows.filter((x) => reaches(r, { agent: x.agent, client: x.client, labels: x.labels }) && want.every(([k, v]) => x.labels[k] === v));
+    }
+    const cont = next !== null ? `${i}:${next}` : i + 1 < grants.length ? `${i + 1}:` : null;
+    // Labels an agent wrote (agent_spawn's) are another agent's text: they taint, as its transcript would.
+    if (rows.some((x) => x.by_agent && Object.keys(x.labels).length)) this.kvPut("read_tainted", true);
+    const action = r?.grant.action;
+    const agents = rows.map((x) => ({ agent: x.agent, labels: x.labels, created_ms: x.created_ms, ended_ms: x.ended_ms, actions: action ? [action] : [] }));
+    const text = agents.length
+      ? agents.map((x) => `${x.agent} ${JSON.stringify(x.labels)}${x.ended_ms !== null ? " (ended)" : ""}`).join("\n")
+      : grants.length ? "No agents on this page." : "No grants: nothing to list.";
+    return { status: "ok", content: [{ type: "text", text }, { type: "json", value: { agents, next_cursor: cont } }] };
+  }
+
   /** `agent`'s owner, that owner's owner, and so on (`MAX_OWNER_HOPS` at most), stopping at this agent. */
   private async ownerChain(agent: string): Promise<(string | null)[]> {
     const me = this.load().agent;
@@ -1315,6 +1519,8 @@ export class AgentDO extends DurableObject<Env> {
     const parsedLabels = Labels.safeParse(a.labels ?? {});
     if (!parsedLabels.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `labels: ${parsedLabels.error.issues.map((i) => i.message).join("; ")}`);
     const labels = parsedLabels.data;
+    // Grants for the child: each attenuating one it holds (docs/agents/tools/#grants).
+    const grants = await this.conferGrants(info, a.grants);
     // In a client's subtree, the client's grant bounds the child whatever the template gives
     // (docs/control-plane/api/clients/): only what the client sees expands, and within its grant.
     const scope = info.client ? await this.clientStub(info.client).scope() : undefined;
@@ -1341,7 +1547,7 @@ export class AgentDO extends DurableObject<Env> {
         if (sandbox && mode === "new") await client.admit({ kind: "sandbox", id: sandbox, cell: info.cell, owner: child, labels });
         await live();
       }
-      return await this.spawnChild(info, child, sandbox, mode === "new", template, spec, String(a.task), key, tainted, live, labels);
+      return await this.spawnChild(info, child, sandbox, mode === "new", template, spec, String(a.task), key, tainted, live, labels, grants);
     } catch (e) {
       if (!asNestError(e)?.retryable && !(await this.agentExists(child))) {
         this.sql.exec("DELETE FROM children WHERE agent = ? AND ended = 0", child);
@@ -1359,6 +1565,37 @@ export class AgentDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * `agent_spawn`'s `grants`: each must attenuate a grant this agent holds whose chain holds now (the
+   * same action, a resource within it, limits and expiry no wider), and is derived from it, so it
+   * lapses with it. An id must name an agent in this agent's subtree.
+   */
+  private async conferGrants(info: AgentInfo, raw: unknown): Promise<NonNullable<CreateAgent["grants"]>> {
+    const parsed = parseGrantRequests(raw, Date.now());
+    if (!parsed.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, parsed.error);
+    const scope = info.client ?? null;
+    const out: NonNullable<CreateAgent["grants"]> = [];
+    for (const { req, resource } of parsed.value) {
+      let target: Target | null = null;
+      if ("id" in resource) {
+        try {
+          target = await this.targetOf(resource.id);
+        } catch (e) {
+          if (asNestError(e)?.code !== ErrorCodes.UNKNOWN_AGENT) throw e;
+        }
+        if (!target || !inScope(scope, target)) throw new NestError(ErrorCodes.FORBIDDEN, `${resource.id} isn't an agent in your subtree`, 403);
+      }
+      const held = await this.resolvedGrants(info, req.action);
+      const parent = held.find((r) => attenuates(req, resource, r, target));
+      if (!parent) throw new NestError(ErrorCodes.FORBIDDEN, `you hold no ${req.action} grant that covers ${req.resource} with these limits and expiry`, 403);
+      out.push({
+        action: req.action, resource: req.resource, ...(req.limits ? { limits: req.limits } : {}), ...(req.expires_ms !== undefined ? { expires_ms: req.expires_ms } : {}),
+        scope, parent: { kind: "agent", agent: info.agent, grant: parent.grant.id },
+      });
+    }
+    return out;
+  }
+
   /** Whether `agent` was created (its `info()` answers); a failure to ask counts as yes, so nothing is forgotten. */
   private async agentExists(agent: string): Promise<boolean> {
     try {
@@ -1372,7 +1609,7 @@ export class AgentDO extends DurableObject<Env> {
   /** `agent_spawn`'s writes, each behind the epoch fence: the sandbox (owned by the child), the child, its task. */
   private async spawnChild(
     info: AgentInfo, child: string, sandbox: string | null, fresh: boolean, template: string, spec: AgentSpec, task: string, key: string, tainted: boolean,
-    live: () => Promise<void>, labels: Labels,
+    live: () => Promise<void>, labels: Labels, grants: NonNullable<CreateAgent["grants"]>,
   ): Promise<ToolOutcome> {
     // Its client's subtree, whatever it spawns: the child and a sandbox created for it.
     const client = info.client ? { client: info.client } : {};
@@ -1386,7 +1623,7 @@ export class AgentDO extends DurableObject<Env> {
     const stub = this.agentStub(child);
     await stub.create({
       agent: child, cell: info.cell, spec, owner: info.agent, sandbox, owner_is_caller: true,
-      depth: (info.depth ?? 0) + 1, tainted, ...client, labels,
+      depth: (info.depth ?? 0) + 1, tainted, ...client, labels, ...(grants.length ? { grants } : {}),
     });
     // Ended meanwhile (its owner's end may have looked for this child before it existed): the child ends too.
     if (this.load().ended) {
@@ -1684,7 +1921,7 @@ export class AgentDO extends DurableObject<Env> {
       const info = this.load();
       const start = Date.now();
       const remote = await this.mcpToolDefs(info);
-      this.send(ws, { type: "tools_list", request: msg.request, tools: [...toolDefs(offered(info)), ...brokeredToolDefs(info.brokered ?? []), ...remote] });
+      this.send(ws, { type: "tools_list", request: msg.request, tools: [...toolDefs(this.offeredNow(info)), ...brokeredToolDefs(info.brokered ?? []), ...remote] });
       const att = ws.deserializeAttachment() as Attachment;
       if (this.current(att)) {
         this.kvPut("tools_listed", { epoch: att.epoch, ms: start } satisfies ToolsListed);
@@ -2130,7 +2367,11 @@ export class AgentDO extends DurableObject<Env> {
    * Entries (1-based JSONL lines of the committed base) after `since`, streamed segment by segment:
    * never more than `limit` entries or about 256 KiB.
    */
-  async readTranscript(since = 0, limit = TRANSCRIPT_DEFAULT_LIMIT, base?: number): Promise<TranscriptPage> {
+  /**
+   * Entries after `since` (1-based), at most `limit` and `TRANSCRIPT_MAX_BYTES`. `notBefore`: only entries
+   * whose `timestamp` is at or after it (an entry with none is skipped), counted all the same.
+   */
+  async readTranscript(since = 0, limit = TRANSCRIPT_DEFAULT_LIMIT, base?: number, notBefore?: number): Promise<TranscriptPage> {
     const info = this.load();
     // A cursor from another base would skip or repeat entries: start the new base from the top.
     const reset = base !== undefined && base !== info.base_gen && since > 0;
@@ -2149,7 +2390,7 @@ export class AgentDO extends DurableObject<Env> {
     const take = (line: string): boolean => {
       if (!line) return false;
       n += 1;
-      if (n <= since) return false;
+      if (n <= since || !entryWithin(line, notBefore)) return false;
       lines.push(line);
       bytes += line.length;
       return lines.length >= max || bytes >= TRANSCRIPT_MAX_BYTES;
@@ -2162,7 +2403,8 @@ export class AgentDO extends DurableObject<Env> {
       for (const p of parts) if (take(p)) return page(lines, n, true);
     }
     take(carry + decoder.decode());
-    return page(lines, lines.length ? n : since, false);
+    // Past what it skipped too (entries outside the window), never back before `since`.
+    return page(lines, Math.max(n, since), false);
   }
 
   // --- events ---------------------------------------------------------------------------------------
@@ -2624,7 +2866,8 @@ export class AgentDO extends DurableObject<Env> {
       if (action && (info.brokered ?? []).some((g) => g.action === action)) return await this.brokeredTool(info, epoch, call, action, args, guest, fence);
       return await this.mcpTool(info, epoch, call, name, args, guest, fence);
     }
-    if (!offered(info).includes(name)) {
+    // Checked again here (docs/agents/tools/#grants): the list the brain holds may predate a grant's expiry.
+    if (!this.offeredNow(info).includes(name)) {
       throw new NestError(ErrorCodes.FORBIDDEN, `${name} is not granted to this agent`, 403);
     }
     // Spawning and ending need a brain: nothing inside a sandbox may ask for them.
@@ -2642,18 +2885,26 @@ export class AgentDO extends DurableObject<Env> {
     switch (name) {
       case "read_transcript": {
         const target = String(a.agent);
-        if (!/^agt_[a-z0-9]+$/.test(target)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${target} is not an agent id`);
+        if (!AGENT_ID.test(target)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${target} is not an agent id`);
         const since = typeof a.since_seq === "number" ? Math.max(0, a.since_seq) : 0;
-        const limit = typeof a.limit === "number" ? a.limit : TRANSCRIPT_DEFAULT_LIMIT;
+        const asked = typeof a.limit === "number" ? a.limit : TRANSCRIPT_DEFAULT_LIMIT;
         const base = typeof a.base === "number" ? a.base : undefined;
+        // Its own and those it owns: no limits. Any other only through a grant, within the grant's limits.
+        const limits = target === info.agent ? {} : await this.transcriptAuthority(info, target);
+        const ages = [
+          ...(typeof a.since_ms === "number" ? [a.since_ms] : []),
+          ...(limits.max_age_ms !== undefined ? [Date.now() - limits.max_age_ms] : []),
+        ];
+        const notBefore = ages.length ? Math.max(...ages) : undefined;
+        const limit = limits.max_entries !== undefined ? Math.min(asked, limits.max_entries) : asked;
         let page: TranscriptPage;
         if (target === info.agent) {
-          page = await this.readTranscript(since, limit, base);
+          page = await this.readTranscript(since, limit, base, notBefore);
         } else {
-          // Only an agent it owns (transitively), as for `agent_stop`.
-          if (!ownsVia(info.agent, await this.ownerChain(target))) throw new NestError(ErrorCodes.FORBIDDEN, `${target} isn't an agent you own`, 403);
           const stub = this.env.AGENT.get(this.env.AGENT.idFromName(target));
-          page = await stub.readTranscript(since, limit, base);
+          page = await stub.readTranscript(since, limit, base, notBefore);
+          // The window again here: a target of the previous release ignores it.
+          if (notBefore !== undefined) page = { ...page, lines: page.lines.filter((l) => entryWithin(l, notBefore)) };
           // Another agent's transcript (its taint unknown here): this session is tainted from now on.
           this.kvPut("read_tainted", true);
         }
@@ -2665,6 +2916,8 @@ export class AgentDO extends DurableObject<Env> {
           ],
         };
       }
+      case "list":
+        return await this.listTool(info, a);
       case "expose_port": {
         if (!info.hands) throw new NestError(ErrorCodes.NOT_BOUND, "agent has no sandbox", 409);
         if (a.share === true) {

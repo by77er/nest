@@ -10,12 +10,13 @@
 
 | Tool | Seed capability (templates) | Behaviour beyond the schema |
 |---|---|---|
-| `agent_spawn` | `spawning` (captain) | A child the caller owns, from a template its capabilities' `spawn` lists; overrides only narrow (`SpawnerOverrides`); `labels` go on the child and a sandbox made for it ([labels](../../../control-plane/api/clients/#labels)); in an API client's subtree the child joins it, held to its grant. The result's JSON part: `{agent, template, sandbox?, ephemeral?}`. See [lifetimes](../../../agents/#lifetimes) |
+| `agent_spawn` | `spawning` (captain) | A child the caller owns, from a template its capabilities' `spawn` lists; overrides only narrow (`SpawnerOverrides`); `labels` go on the child and a sandbox made for it ([labels](../../../control-plane/api/clients/#labels)); `grants` each attenuate one the caller holds, `forbidden` otherwise ([transcript grants](../../../agents/tools/#built-transcript-grants-2026-11-06)); in an API client's subtree the child joins it, held to its grant. The result's JSON part: `{agent, template, sandbox?, ephemeral?}`. See [lifetimes](../../../agents/#lifetimes) |
 | `agent_stop` | `spawning` (captain) | Ownership is transitive. On itself it is `exit`; `forbidden` for an agent the caller doesn't own, `unknown_agent` for an id naming nobody; an agent already ended answers ok, saying so |
 | `exit` | every agent | Ends the caller once its turn is done |
 | `fork_sandbox` | `sandboxes` (worker, captain) | `not_implemented` |
 | `attach` | `management` (captain) | `not_implemented` |
-| `read_transcript` | `transcripts` (worker, captain) | Its own or an agent's it owns, transitively (`forbidden` otherwise); read from R2, never wakes anything |
+| `read_transcript` | `transcripts` (worker, captain), or a `read_transcript` grant | Its own or an agent's it owns, transitively; any other only through a grant whose chain holds, within its limits (`forbidden` otherwise). `since_ms` keeps entries at or after a time. Read from R2, never wakes anything; another agent's taints the reader |
+| `list` | any grant | The agents its grants cover, one grant per page (`next_cursor`), filtered by labels: `{agents: [{agent, labels, created_ms, ended_ms, actions}], next_cursor}`. Only `kind: agent` |
 | `checkpoint` | `hands` (worker) | `not_implemented` |
 | `expose_port` | `hands` (worker) | `share: true` is `forbidden` for agents: a public link bypasses Access, so only the operator mints one |
 | `egress_policy` | `egress` (no seed template) | Widening is a sink: `pending` from a tainted session until approved; `revoke` is never gated |
@@ -26,8 +27,8 @@
 The seed column is a new catalog's; an existing catalog's `worker` and `captain` get `spawning` only by the operator's edit ([CatalogDO](../../../control-plane/durable-objects/catalog/)). A stored capability or spec that names a tool the file doesn't have lists a tool its agent is never offered, and a call to it answers `unknown_tool`.
 
 **Grants:**
-- AgentDO lists exactly the tools in the agent's expanded spec, and checks every `tool_call` against it again.
-- A spawning agent can only give the agents it spawns what it holds itself. Grants aren't built: today its overrides can only narrow the template, and the template must be one its capabilities' `spawn` names.
+- AgentDO lists the tools in the agent's expanded spec, plus those its unexpired grants offer (`read_transcript`, `list`), and checks every `tool_call` against that list again, then against the grant's chain.
+- A spawning agent can only give the agents it spawns what it holds itself: its overrides only narrow the template, the template must be one its capabilities' `spawn` names, and each grant attenuates one it holds.
 - `agent_spawn`, `agent_stop` and `exit` are refused from inside a sandbox (the guest `nest` CLI).
 - `requires_approval` tools always go through the approval gate.
 
