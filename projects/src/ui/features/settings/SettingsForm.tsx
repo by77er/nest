@@ -3,10 +3,11 @@
 // and whether workers may change CI workflows (README.md#secrets). The Panels sit in one row with Save right under them at the bottom right; on a phone, one column,
 // so Save comes right after the last field.
 
-import { Anchor, Badge, Button, NumberInput, Select, Switch, Text } from "@mantine/core";
+import { Anchor, Badge, Button, NumberInput, Select, Switch, Text, TextInput } from "@mantine/core";
 import { schemaResolver, useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
 import { Settings as SettingsSchema } from "../../../requests";
+import { ApiError } from "../../api/client";
 import { useRetryRepoAutoMerge, useSecrets, useUpdateSettings } from "../../api/queries";
 import { LiveAgents } from "../project/LiveAgents";
 import type { Settings } from "../../api/types";
@@ -18,7 +19,7 @@ const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", 
 
 const values = (s: Settings) => ({
   auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method, workers_edit_workflows: s.workers_edit_workflows,
-  comments_from_id: s.comments_from?.id ?? null,
+  comments_from_login: s.comments_from?.login ?? null,
 });
 
 /** The editable settings as Panels in a row, saved together by the one Save right under them. */
@@ -31,8 +32,9 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
 
   return (
     <form
-      onSubmit={form.onSubmit((v) =>
-        update.mutate(v, {
+      onSubmit={form.onSubmit(({ comments_from_login, ...v }) =>
+        // Whose comments count is sent only when changed: an id with no login known shows as an empty field.
+        update.mutate({ ...v, ...(form.isDirty("comments_from_login") ? { comments_from_login: comments_from_login?.trim() || null } : {}) }, {
           onSuccess: (s) => {
             form.setInitialValues(values(s));
             notifications.show({ color: "success", message: "Settings saved" });
@@ -90,22 +92,17 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
           </Panel>
           <Panel>
             <Section title="PR comments" order={4} region={false}>
-              <FieldGroup>
-                <NumberInput
-                  label="From GitHub user (id)"
-                  description={
-                    settings.comments_from
-                      ? `${settings.comments_from.login ?? `User ${settings.comments_from.id}`}'s comments on a task's PR reach its worker. Anything that holds this account's GitHub credentials (a token in an agent or CI) can comment as it.`
-                      : "Nobody's yet: an organization's repo needs the user set. That user's comments on a task's PR will reach its worker."
-                  }
-                  min={1}
-                  allowDecimal={false}
-                  allowNegative={false}
-                  hideControls
-                  value={form.getValues().comments_from_id ?? ""}
-                  onChange={(v) => form.setFieldValue("comments_from_id", typeof v === "number" ? v : null)}
+              <CommentsFrom settings={settings} draft={form.getValues().comments_from_login} dirty={form.isDirty("comments_from_login")} onUse={(login) => form.setFieldValue("comments_from_login", login)}>
+                <TextInput
+                  label="GitHub user"
+                  description="Their login. It's kept as the account's id, which a rename doesn't change. Empty: nobody."
+                  value={form.getValues().comments_from_login ?? ""}
+                  onChange={(e) => form.setFieldValue("comments_from_login", e.currentTarget.value || null)}
+                  error={update.error instanceof ApiError && /GitHub|organization|a bot/.test(update.error.message) ? update.error.message : undefined}
+                  autoComplete="off"
+                  spellCheck={false}
                 />
-              </FieldGroup>
+              </CommentsFrom>
             </Section>
           </Panel>
         </SectionGrid>
@@ -254,5 +251,61 @@ function LiveWorkers({ projectId, saved }: { projectId: string; saved: boolean }
         />
       </Section>
     </Panel>
+  );
+}
+
+/**
+ * Whose PR comments reach workers (README.md#pr-comments): what's saved, in a status line; the field;
+ * what the draft would change, if it differs; "Use the repo owner" when the owner is a user and isn't
+ * the one saved; and, with someone set, the warning that their credentials can comment as them.
+ */
+function CommentsFrom({ settings, draft, dirty, onUse, children }: { settings: Settings; draft: string | null; dirty: boolean; onUse: (login: string) => void; children: React.ReactNode }) {
+  const saved = settings.comments_from;
+  const owner = settings.repo_owner;
+  return (
+    <FieldGroup>
+      {saved ? (
+        <Text fz="sm" data-slot="comments-status">
+          Comments from GitHub user id {saved.id}
+          {saved.login ? (
+            <>
+              , last seen as{" "}
+              <Text component="span" fz="sm" fw={weight.medium}>
+                {saved.login}
+              </Text>
+              ,
+            </>
+          ) : null}{" "}
+          reach a task's worker{saved.login ? "." : " (its login shows once it comments)."}
+        </Text>
+      ) : (
+        <Stack gap="2xs" data-slot="comments-status">
+          <Text fz="sm" fw={weight.medium}>
+            No one's PR comments reach workers yet.
+          </Text>
+          <Text fz="sm" c="dimmed">
+            Set the GitHub user whose comments on a task's PR should reach its worker. It's unset on an organization's repo, and until you set it.
+          </Text>
+        </Stack>
+      )}
+      {children}
+      {dirty && (
+        <Text fz="sm" c="dimmed" data-slot="comments-draft">
+          Not saved yet: {draft?.trim() ? `comments from ${draft.trim()} (looked up on GitHub when you save)` : "no one's comments"}.
+        </Text>
+      )}
+      {owner && owner.id !== saved?.id && owner.login !== draft?.trim() && (
+        <Row>
+          <Button variant="default" size="xs" onClick={() => onUse(owner.login)}>
+            Use the repo owner ({owner.login})
+          </Button>
+        </Row>
+      )}
+      {saved && (
+        <Notice tone="warning" title="Their credentials can comment as them">
+          <Text fz="sm">Anything holding this account's GitHub credentials (a token in an agent's sandbox, a CI secret) can comment as it, and those comments count. Keep its tokens out of agents and CI.</Text>
+        </Notice>
+      )}
+    </FieldGroup>
   );
 }

@@ -30,6 +30,8 @@ export const Settings = z.strictObject({
   merge_method: z.enum(MERGE_METHODS).optional(),
   // Whose PR comments reach workers (README.md#pr-comments): a GitHub user's id; null for nobody's.
   comments_from_id: z.number().int().min(1).max(2 ** 53 - 1).nullable().optional(),
+  // Or by login, looked up on GitHub and kept as its id; null for nobody's.
+  comments_from_login: z.string().trim().min(1).max(39).nullable().optional(),
 });
 export const CreateTask = z.strictObject({ title: z.string().min(1).max(200), body: Text(20000).optional() });
 export const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).optional(), body: Text(20000).optional(), ord: z.number().finite().optional() });

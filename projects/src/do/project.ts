@@ -49,6 +49,8 @@ export interface Settings {
    * repo's owner when it's a user, recorded at attach; an org's repo needs it set. Null: nobody's do.
    */
   comments_from: { id: number; login: string | null } | null;
+  /** The repo's owner, when it's a user (the "Use the repo owner" shortcut); null for an org's repo, or before attach. */
+  repo_owner: { id: number; login: string } | null;
   created_ms: number;
 }
 
@@ -300,6 +302,13 @@ export const MIGRATIONS = [
     // Whose PR comments reach workers: a GitHub user, by its id (immutable) and its login as last seen.
     "ALTER TABLE settings ADD COLUMN comments_from_id INTEGER",
     "ALTER TABLE settings ADD COLUMN comments_from_login TEXT",
+    // Whether whose comments count was decided (the default applied, or the owner's choice, nobody
+    // included): the default applies once. The repo's owner, when a user, for "Use the repo owner".
+    "ALTER TABLE settings ADD COLUMN comments_decided INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE settings ADD COLUMN repo_owner_id INTEGER",
+    "ALTER TABLE settings ADD COLUMN repo_owner_login TEXT",
+    // Projects attached before: attach again, so the default (and the repo's owner) is recorded.
+    "UPDATE settings SET attach_next_ms = 0 WHERE attached_ms IS NOT NULL",
   ],
 ] as const;
 
@@ -358,6 +367,7 @@ export class ProjectDO extends DurableObject<Env> {
       attach: r.attach_detail ? (JSON.parse(r.attach_detail as string) as AttachDetail) : null,
       auto_merge: r.auto_merge === 1, merge_method: r.merge_method as MergeMethod, workers_edit_workflows: r.workers_edit_workflows === 1,
       comments_from: r.comments_from_id === null || r.comments_from_id === undefined ? null : { id: r.comments_from_id as number, login: (r.comments_from_login as string | null) ?? null },
+      repo_owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: r.repo_owner_login as string },
       repo_auto_merge: repoAutoMerge({
         want: r.auto_merge === 1, owed: r.am_write_next_ms !== null, error: (r.am_write_error as string | null) ?? null,
         applied: r.am_applied ? (JSON.parse(r.am_applied as string) as Seen) : null, observed: r.am_observed ? (JSON.parse(r.am_observed as string) as Seen) : null,
@@ -372,13 +382,32 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   async updateSettings(u: {
-    auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean; comments_from_id?: number | null;
+    auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean;
+    comments_from_id?: number | null; comments_from_login?: string | null;
   }): Promise<Result<Settings>> {
     const before = this.settings();
     if (!before) return fail(404, "unknown project");
-    if (u.comments_from_id !== undefined && u.comments_from_id !== before.comments_from?.id) {
-      // A new id: its login is learned from the next comment it makes (a login can be renamed; the id can't).
-      this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = NULL", u.comments_from_id);
+    // Whose PR comments count (README.md#pr-comments): a login is looked up on GitHub and kept as its id.
+    let who: { id: number; login: string | null } | null | undefined = u.comments_from_id === undefined ? undefined : u.comments_from_id === null ? null : { id: u.comments_from_id, login: null };
+    if (u.comments_from_login !== undefined) {
+      if (u.comments_from_login === null) who = null;
+      else {
+        const nest = nestFrom(this.env);
+        if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
+        try {
+          const found = await (await githubFor(nest, before.repo, PERMISSIONS.metadata)).user(u.comments_from_login);
+          if (!found) return fail(400, `GitHub has no user ${u.comments_from_login}`);
+          if (found.type !== "User") return fail(400, `${found.login} is ${found.type === "Organization" ? "an organization" : "a bot"}, not a person: its comments can't be the owner's`);
+          who = { id: found.id, login: found.login };
+        } catch (e) {
+          return fail(502, `GitHub couldn't look ${u.comments_from_login} up: ${message(e)}`);
+        }
+      }
+    }
+    if (who !== undefined) {
+      // Decided: the attach's default never applies after this, nobody (null) included.
+      const login = who?.login ?? (who && who.id === before.comments_from?.id ? before.comments_from.login : null);
+      this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1", who?.id ?? null, login);
     }
     if (u.auto_assign !== undefined) this.sql.exec("UPDATE settings SET auto_assign = ?", u.auto_assign ? 1 : 0);
     if (u.max_workers !== undefined) this.sql.exec("UPDATE settings SET max_workers = ?", clampWorkers(u.max_workers));
@@ -669,9 +698,6 @@ export class ProjectDO extends DurableObject<Env> {
   async onPrComment(c: PrComment): Promise<{ delivered: "worker" | "pending" | "restarted" | "dropped"; task: string | null }> {
     const s = this.settings();
     if (!s) return { delivered: "dropped", task: null };
-    // Only the project's configured GitHub user, by id: a login can be renamed and re-registered, the id can't.
-    if (!s.comments_from || s.comments_from.id !== c.author_id) return { delivered: "dropped", task: null };
-    if (s.comments_from.login !== c.author) this.sql.exec("UPDATE settings SET comments_from_login = ?", c.author);
     const github: Actor = { kind: "app", what: "github" };
     const had = this.prRow(c.pr);
     // The task: the one the PR is attached to (from its branch or the owner's attach), never a fork's.
@@ -682,6 +708,15 @@ export class ProjectDO extends DurableObject<Env> {
       else if (!had && c.fork === false && c.headTask && this.taskRow(c.headTask)) [task, state] = [c.headTask, "open"];
     }
     if (!task) return { delivered: "dropped", task: null };
+    // Only the project's configured GitHub user, by id: a login can be renamed and re-registered, the id can't.
+    if (!s.comments_from) {
+      // Nobody's set: said on the task (once an hour, since anyone may comment), so the owner's comment isn't lost silently.
+      const said = this.sql.exec("SELECT 1 FROM history WHERE task = ? AND action = 'pr_comment_dropped' AND detail LIKE '%no GitHub user%' AND at_ms > ?", task, Date.now() - 3_600_000).toArray().length;
+      if (!said) this.record(task, github, "pr_comment_dropped", { pr: c.pr, url: c.url, why: "no GitHub user is set for PR comments (Settings)" });
+      return { delivered: "dropped", task };
+    }
+    if (s.comments_from.id !== c.author_id) return { delivered: "dropped", task: null };
+    if (s.comments_from.login !== c.author) this.sql.exec("UPDATE settings SET comments_from_login = ?", c.author);
     const t = this.taskRow(task)!;
     const note = { pr: c.pr, url: c.url, author: c.author };
     const drop = (why: string) => {
@@ -2152,8 +2187,11 @@ export class ProjectDO extends DurableObject<Env> {
       if (gh.appId !== null) await directory(this.env).recordGithubAppId(gh.appId);
       const r = await requireReviewCheck(gh, s.repo, appId);
       // Whose PR comments count (README.md#pr-comments): the repo's owner, when it's a user; never changed once set.
+      // Once only: after that (the owner's choice, nobody included), an attach never changes it.
       const owner = await gh.repoOwner(s.repo);
-      if (owner.type === "User") this.sql.exec("UPDATE settings SET comments_from_id = COALESCE(comments_from_id, ?), comments_from_login = COALESCE(comments_from_login, ?)", owner.id, owner.login);
+      const user = owner.type === "User";
+      this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", user ? owner.id : null, user ? owner.login : null);
+      if (user) this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1 WHERE comments_decided = 0", owner.id, owner.login);
       const detail: AttachDetail = { ...r, at_ms: Date.now() };
       this.sql.exec(
         "UPDATE settings SET attached_ms = COALESCE(attached_ms, ?), attach_next_ms = NULL, attach_attempts = 0, attach_error = NULL, attach_detail = ?",

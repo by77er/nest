@@ -14,18 +14,39 @@ async function openSettings(api: FakeApi) {
 }
 
 describe("PR comments in the settings", () => {
-  it("names whose comments reach workers, warns what else can comment as them, and sets another user's id", async () => {
+  it("says whose comments count, warns, and sends a new login only when changed, saying so before it's saved", async () => {
     const api = new FakeApi();
+    api.projects[0]!.settings.repo_owner = { id: 7, login: "repo-owner" };
     const { user, dialog } = await openSettings(api);
-    expect(dialog).toHaveTextContent("owner's comments on a task's PR reach its worker");
-    expect(dialog).toHaveTextContent("Anything that holds this account's GitHub credentials");
-    const field = within(dialog).getByLabelText("From GitHub user (id)");
-    expect(field).toHaveValue("1001");
+    const status = dialog.querySelector("[data-slot=comments-status]")!;
+    expect(status).toHaveTextContent("Comments from GitHub user id 1001, last seen as owner, reach a task's worker.");
+    expect(dialog).toHaveTextContent("Their credentials can comment as them");
+    const field = within(dialog).getByLabelText("GitHub user");
+    expect(field).toHaveValue("owner");
+    expect(dialog.querySelector("[data-slot=comments-draft]")).toBeNull();
     await user.clear(field);
-    await user.type(field, "4242");
+    await user.type(field, "the-maintainer");
+    // The draft is said; the status still says what's saved.
+    expect(dialog.querySelector("[data-slot=comments-draft]")).toHaveTextContent("Not saved yet: comments from the-maintainer");
+    expect(status).toHaveTextContent("last seen as owner");
+    await user.click(within(dialog).getByRole("button", { name: "Use the repo owner (repo-owner)" }));
+    expect(field).toHaveValue("repo-owner");
     await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
     await waitFor(() => expect(api.writes).toHaveLength(1));
-    expect(api.writes[0]!.body).toMatchObject({ comments_from_id: 4242 });
+    expect(api.writes[0]!.body).toMatchObject({ comments_from_login: "repo-owner" });
+  });
+
+  it("unset: says no one's comments reach workers, and why it can be unset; an untouched field sends nothing", async () => {
+    const api = new FakeApi();
+    api.projects[0]!.settings.comments_from = null;
+    const { user, dialog } = await openSettings(api);
+    expect(dialog.querySelector("[data-slot=comments-status]")).toHaveTextContent("No one's PR comments reach workers yet.");
+    expect(dialog).toHaveTextContent("It's unset on an organization's repo, and until you set it.");
+    expect(dialog).not.toHaveTextContent("Their credentials can comment as them");
+    await user.click(within(dialog).getByRole("switch", { name: /Assign ready tasks automatically/ }));
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(api.writes).toHaveLength(1));
+    expect(api.writes[0]!.body).not.toHaveProperty("comments_from_login");
   });
 });
 

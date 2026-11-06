@@ -114,7 +114,10 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
   // Claimed before it's handled, in one step: a concurrent copy of the delivery is a duplicate.
   if (!(await dir.claim(seenId))) return json({ duplicate: true });
   try {
-    return await handle(env, event!, payload, seenId);
+    const res = await handle(env, event!, payload, seenId);
+    // Handled: the claim is confirmed (it no longer lapses).
+    if (res.status < 300) await dir.markSeen(seenId);
+    return res;
   } catch (e) {
     // Failed: the claim goes, so a redelivery is handled.
     await dir.release(seenId);

@@ -231,14 +231,16 @@ The owner's request (2026-11-03): "PRs should be attachable to tasks."
 
 The owner's request (2026-11-06): their comments on a task's PR reach that task's worker.
 
-- **Events** (`/hooks/github`, the same signature check; each delivery claimed by its `X-GitHub-Delivery` before it's handled, in one step, so concurrent copies act once):
+- **Events** (`/hooks/github`, the same signature check). Each delivery is claimed by its `X-GitHub-Delivery` before it's handled, in one step, so concurrent copies act once. The claim is confirmed when handling succeeds; one never confirmed (its handler died) lapses after 5 minutes, so a redelivery is handled:
   - `issue_comment` `created` on a PR (`issue.pull_request` present);
   - `pull_request_review` `submitted`, with text or requesting changes;
   - `pull_request_review_comment` `created`.
 
   An edit, a delete, an approval with no text, or a comment on an issue that isn't a PR is ignored.
 - **Only the project's GitHub user** (Settings, "PR comments"), matched by GitHub user **id**, which is immutable. A login can be renamed and then registered by someone else; an id can't.
-  - **The default** is the repo's owner, recorded when the repo is attached, if that owner is a user. An organization's repo has nobody until the owner sets the id.
+  - **The default** is the repo's owner, if a user, applied once at attach (projects attached before this release attach again once, for it). After that, the owner's choice stands, nobody included, however often the repo is attached again.
+  - **Settings** shows whose comments count ("last seen as" its login), takes a GitHub login (looked up with `GET /users/{login}`, kept as its id; an organization or a bot is refused), offers "Use the repo owner", and warns about the account's credentials. An organization's repo has nobody until it's set.
+  - With nobody set, a comment on a task's PR is noted on the task (at most once an hour), so the owner's comment isn't lost silently.
   - **The author must be a person writing as themself:** `user.type` is `User`, and `performed_via_github_app` is unset. An App acting with the user's token is refused, even though GitHub calls its comments the user's.
   - Everyone else is ignored, bots included, and so is the app's own reviewer, which posts as its App.
   - **Anything that holds a credential of that GitHub account** (a token in an agent's sandbox, a CI secret) can comment as it, and those comments count. So keep the account's tokens out of agents and CI, and use the App's brokered tokens there.

@@ -5,7 +5,8 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
-import { PR_COMMENT_MAX, REVISE_MAX } from "../src/do/project";
+import { MIGRATIONS, PR_COMMENT_MAX, REVISE_MAX } from "../src/do/project";
+import { migrate } from "../src/sql";
 import { personAuthor } from "../src/github-hook";
 import { AccessTeam, api, deliver, deliverGithub, FakeNest, installFetch, ownerIdOf, prEvent, shaOf } from "./fake-nest";
 
@@ -106,6 +107,68 @@ describe("whose comments count", () => {
     expect(said(s.worker)).toHaveLength(1);
     // Its login, learned from the comment.
     expect((await api(token, "GET", `/api/projects/${s.project}`)).body.settings.comments_from).toEqual({ id: 4242, login: "the-maintainer" });
+  });
+});
+
+describe("who is set", () => {
+  it("is set by login, kept as the account's id; never an organization, a bot, or a login GitHub doesn't have", async () => {
+    const s = await setup();
+    const patch = (b: object) => api(token, "PATCH", `/api/projects/${s.project}/settings`, b);
+    const r = await patch({ comments_from_login: "the-maintainer" });
+    expect(r.body.comments_from).toEqual({ id: ownerIdOf("the-maintainer"), login: "the-maintainer" });
+    fake.github.orgs.add("an-org");
+    expect((await patch({ comments_from_login: "an-org" })).body.error).toContain("an organization");
+    expect((await patch({ comments_from_login: "ci[bot]" })).status).toBe(400);
+    expect((await patch({ comments_from_login: "ghost-nobody" })).body.error).toContain("GitHub has no user ghost-nobody");
+    // The repo's owner, for "Use the repo owner".
+    expect((await api(token, "GET", `/api/projects/${s.project}`)).body.settings.repo_owner).toEqual({ id: s.owner.id, login: s.owner.login });
+  });
+
+  it("defaults once: nobody, once chosen, stays nobody however often the repo is attached again", async () => {
+    const s = await setup();
+    expect((await api(token, "PATCH", `/api/projects/${s.project}/settings`, { comments_from_login: null })).body.comments_from).toBeNull();
+    expect((await api(token, "POST", `/api/projects/${s.project}/attach`)).status).toBe(200);
+    await drain(s);
+    expect((await api(token, "GET", `/api/projects/${s.project}`)).body.settings.comments_from).toBeNull();
+  });
+
+  it("a project attached before this release gets the default once, at the attach its migration owes", async () => {
+    const s = await setup();
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(s.project)), (_o, st) => {
+      const sql = st.storage.sql;
+      // The shape before the step: none of its columns or table, the attach long done.
+      const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("CREATE TABLE pr_inputs")));
+      sql.exec("DROP TABLE pr_inputs");
+      for (const c of ["comments_from_id", "comments_from_login", "comments_decided", "repo_owner_id", "repo_owner_login"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      sql.exec("UPDATE settings SET attach_next_ms = NULL");
+      sql.exec("UPDATE schema_version SET v = ?", step);
+      migrate(st.storage, MIGRATIONS);
+      expect(sql.exec("SELECT attach_next_ms FROM settings").one().attach_next_ms).toBe(0);
+    });
+    await drain(s);
+    expect((await api(token, "GET", `/api/projects/${s.project}`)).body.settings.comments_from).toEqual({ id: s.owner.id, login: s.owner.login });
+  });
+
+  it("with nobody set, a comment on a task's PR is noted on the task, once an hour", async () => {
+    const s = await setup({ org: true });
+    await deliverGithub("issue_comment", issueComment(s));
+    await deliverGithub("issue_comment", issueComment(s));
+    const notes = (await taskOf(s)).history.filter((h: { action: string; detail: string }) => h.action === "pr_comment_dropped" && h.detail.includes("no GitHub user"));
+    expect(notes).toHaveLength(1);
+  });
+});
+
+describe("the delivery claim", () => {
+  it("lapses when its handler never confirmed it, so a redelivery is handled; a confirmed one never does", async () => {
+    const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
+    const id = `github:${crypto.randomUUID()}`;
+    expect(await dir.claim(id)).toBe(true);
+    expect(await dir.claim(id)).toBe(false);
+    await runInDurableObject(dir, (_o, st) => { st.storage.sql.exec("UPDATE seen SET at_ms = ? WHERE id = ?", Date.now() - 6 * 60_000, id); });
+    expect(await dir.claim(id)).toBe(true);
+    await dir.markSeen(id);
+    await runInDurableObject(dir, (_o, st) => { st.storage.sql.exec("UPDATE seen SET at_ms = ? WHERE id = ?", Date.now() - 6 * 60_000, id); });
+    expect(await dir.claim(id)).toBe(false);
   });
 });
 
@@ -219,6 +282,19 @@ describe("delivery", () => {
     const theirs = fake.inbox.filter((m) => m.agent === t.assignee).map((m) => m.text);
     expect(theirs).toHaveLength(2);
     expect(theirs[1]).toContain("queued one");
+  });
+
+  it("a comment queued for a worker that's starting goes when the task is cancelled", async () => {
+    const s = await setup();
+    await exited(s.worker);
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(s.project)), (_o, st) => {
+      st.storage.sql.exec("UPDATE tasks SET state = 'assigned', assignee = NULL, worker_live = 1, assignments = assignments + 1, start_next_ms = ? WHERE id = ?", Date.now() + 3_600_000, s.task);
+    });
+    await deliverGithub("issue_comment", issueComment(s, { body: "queued" }));
+    const queued = () => runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(s.project)), (_o, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM pr_inputs WHERE task = ?", s.task).one().n);
+    expect(await queued()).toBe(1);
+    expect((await api(token, "POST", `/api/projects/${s.project}/tasks/${s.task}/cancel`, {})).status).toBe(200);
+    expect(await queued()).toBe(0);
   });
 
   it("starts again at most a few times an hour, and never ahead of the task's dependencies", async () => {

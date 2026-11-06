@@ -633,6 +633,14 @@ export class FakeGitHub {
       }
       return this.graphql(call.body, token, json);
     }
+    // A public account by login: anyone's token reads it ("ghost-" logins don't exist).
+    const um = u.pathname.match(/^\/users\/([^/]+)$/);
+    if (um && req.method === "GET") {
+      if (!token || !this.tokens.has(token)) return json(401, { message: "Bad credentials" });
+      const login = um[1]!;
+      if (login.startsWith("ghost-")) return json(404, { message: "Not Found" });
+      return json(200, { login, id: ownerIdOf(login.toLowerCase()), type: login.endsWith("[bot]") ? "Bot" : this.orgs.has(login.toLowerCase()) ? "Organization" : "User" });
+    }
     const m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)?$/);
     if (!m) return json(404, { message: "Not Found" });
     const repoName = m[1]!.toLowerCase();
