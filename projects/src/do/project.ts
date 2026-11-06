@@ -383,13 +383,25 @@ export class ProjectDO extends DurableObject<Env> {
 
   async updateSettings(u: {
     auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean;
-    comments_from_id?: number | null; comments_from_login?: string | null;
+    comments_from_id?: number | null; comments_from_login?: string | null; comments_from_repo_owner?: boolean;
   }): Promise<Result<Settings>> {
     const before = this.settings();
     if (!before) return fail(404, "unknown project");
     // Whose PR comments count (README.md#pr-comments): a login is looked up on GitHub and kept as its id.
     let who: { id: number; login: string | null } | null | undefined = u.comments_from_id === undefined ? undefined : u.comments_from_id === null ? null : { id: u.comments_from_id, login: null };
-    if (u.comments_from_login !== undefined) {
+    if (u.comments_from_repo_owner) {
+      // The repo's owner as GitHub has it now, by id: a login it had may since be another account's.
+      const nest = nestFrom(this.env);
+      if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
+      try {
+        const owner = await (await githubFor(nest, before.repo, PERMISSIONS.metadata)).repoOwner(before.repo);
+        if (owner.type !== "User") return fail(400, `the repo's owner, ${owner.login}, is an organization: set a person's login`);
+        this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", owner.id, owner.login);
+        who = { id: owner.id, login: owner.login };
+      } catch (e) {
+        return fail(502, `GitHub couldn't name the repo's owner: ${message(e)}`);
+      }
+    } else if (u.comments_from_login !== undefined) {
       if (u.comments_from_login === null) who = null;
       else {
         const nest = nestFrom(this.env);

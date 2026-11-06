@@ -19,7 +19,8 @@ describe("PR comments in the settings", () => {
     api.projects[0]!.settings.repo_owner = { id: 7, login: "repo-owner" };
     const { user, dialog } = await openSettings(api);
     const status = dialog.querySelector("[data-slot=comments-status]")!;
-    expect(status).toHaveTextContent("Comments from GitHub user id 1001, last seen as owner, reach a task's worker.");
+    expect(status).toHaveTextContent("Comments from owner (user id 1001) reach a task's worker.");
+    expect(within(status as HTMLElement).getByRole("link", { name: "owner" })).toHaveAttribute("href", "https://github.com/owner");
     expect(dialog).toHaveTextContent("Their credentials can comment as them");
     const field = within(dialog).getByLabelText("GitHub user");
     expect(field).toHaveValue("owner");
@@ -28,12 +29,27 @@ describe("PR comments in the settings", () => {
     await user.type(field, "the-maintainer");
     // The draft is said; the status still says what's saved.
     expect(dialog.querySelector("[data-slot=comments-draft]")).toHaveTextContent("Not saved yet: comments from the-maintainer");
-    expect(status).toHaveTextContent("last seen as owner");
+    expect(status).toHaveTextContent("Comments from owner (user id 1001)");
     await user.click(within(dialog).getByRole("button", { name: "Use the repo owner (repo-owner)" }));
     expect(field).toHaveValue("repo-owner");
+    expect(dialog.querySelector("[data-slot=comments-draft]")).toHaveTextContent("comments from the repo's owner, as GitHub names it when you save");
     await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
     await waitFor(() => expect(api.writes).toHaveLength(1));
-    expect(api.writes[0]!.body).toMatchObject({ comments_from_login: "repo-owner" });
+    // The repo's owner, by id on the server: never its login.
+    expect(api.writes[0]!.body).toMatchObject({ comments_from_repo_owner: true });
+    expect(api.writes[0]!.body).not.toHaveProperty("comments_from_login");
+  });
+
+  it("set by id only: the status and the field's placeholder name the id, and an empty field isn't nobody", async () => {
+    const api = new FakeApi();
+    api.projects[0]!.settings.comments_from = { id: 5839471, login: null };
+    const { dialog } = await openSettings(api);
+    expect(dialog.querySelector("[data-slot=comments-status]")).toHaveTextContent("Comments from user id 5839471 (login not seen yet) reach a task's worker.");
+    const field = within(dialog).getByLabelText("GitHub user");
+    expect(field).toHaveValue("");
+    expect(field).toHaveAttribute("placeholder", "User id 5839471 (login not seen yet)");
+    expect(dialog).not.toHaveTextContent("Empty: nobody");
+    expect(dialog.querySelector("[data-slot=comments-draft]")).toBeNull();
   });
 
   it("unset: says no one's comments reach workers, and why it can be unset; an untouched field sends nothing", async () => {

@@ -124,6 +124,19 @@ describe("who is set", () => {
     expect((await api(token, "GET", `/api/projects/${s.project}`)).body.settings.repo_owner).toEqual({ id: s.owner.id, login: s.owner.login });
   });
 
+  it("\"Use the repo owner\" takes the owner GitHub names now, by id: never the login recorded for it, which may be another account's by now", async () => {
+    const s = await setup();
+    await api(token, "PATCH", `/api/projects/${s.project}/settings`, { comments_from_login: null });
+    // The owner renamed; someone registered its old login: the recorded login now names another id.
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(s.project)), (_o, st) => { st.storage.sql.exec("UPDATE settings SET repo_owner_login = 'squatter'"); });
+    const r = await api(token, "PATCH", `/api/projects/${s.project}/settings`, { comments_from_repo_owner: true });
+    expect(r.body.comments_from).toEqual({ id: s.owner.id, login: s.owner.login });
+    expect(r.body.comments_from.id).not.toBe(ownerIdOf("squatter"));
+    // An organization's repo has no person to take.
+    const o = await setup({ org: true });
+    expect((await api(token, "PATCH", `/api/projects/${o.project}/settings`, { comments_from_repo_owner: true })).body.error).toContain("is an organization");
+  });
+
   it("defaults once: nobody, once chosen, stays nobody however often the repo is attached again", async () => {
     const s = await setup();
     expect((await api(token, "PATCH", `/api/projects/${s.project}/settings`, { comments_from_login: null })).body.comments_from).toBeNull();

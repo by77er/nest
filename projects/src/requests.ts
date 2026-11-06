@@ -32,6 +32,8 @@ export const Settings = z.strictObject({
   comments_from_id: z.number().int().min(1).max(2 ** 53 - 1).nullable().optional(),
   // Or by login, looked up on GitHub and kept as its id; null for nobody's.
   comments_from_login: z.string().trim().min(1).max(39).nullable().optional(),
+  // Or the repo's owner, as GitHub names the repo's owner now (by its id: never looked up by login).
+  comments_from_repo_owner: z.boolean().optional(),
 });
 export const CreateTask = z.strictObject({ title: z.string().min(1).max(200), body: Text(20000).optional() });
 export const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).optional(), body: Text(20000).optional(), ord: z.number().finite().optional() });
