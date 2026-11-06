@@ -2274,7 +2274,6 @@ export class ProjectDO extends DurableObject<Env> {
       const deadline = now + (routine.max_minutes as number) * 60_000;
       const extras = routineSpawnExtras({
         kind: routine.kind as RoutineKind, project: s.id, deadline_ms: deadline, last_start_ms: (routine.prev_start_ms as number | null) ?? null, now,
-        enabled: this.env.ROUTINE_TRANSCRIPT_GRANT === "on",
       });
       this.sql.exec("UPDATE routine_runs SET spawn = ?, deadline_ms = ? WHERE id = ? AND spawn IS NULL", JSON.stringify(extras), deadline, id);
     }
