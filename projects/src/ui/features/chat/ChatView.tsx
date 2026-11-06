@@ -10,7 +10,7 @@
 import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Textarea, Tooltip, VisuallyHidden } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { IconAlertTriangle, IconArrowDown, IconArrowUp, IconCalendarEvent, IconCopy, IconDots, IconHourglass, IconListCheck, IconMessage, IconPlayerStop, IconQuote, IconRefresh, IconWritingSign } from "@tabler/icons-react";
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { human } from "../../../waits";
 import { api } from "../../api/client";
 import { useChat, useInterruptManager, usePostChat, useWaits } from "../../api/queries";
@@ -21,17 +21,36 @@ import {
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
 import { useTrace } from "../trace/useTrace";
-import { groupLog, liveTurn, loadDraft, markRead, quote, saveDraft, type Step, stepsByReply, type ToolStep } from "./model";
+import { finishedTurns, groupLog, liveTurn, loadDraft, markRead, quote, saveDraft, type Step, stepsBySeq, type ToolStep } from "./model";
 
 /** What a new conversation can start with: they fill the composer, they don't send. */
 export const STARTERS = ["Spec a task for ", "What's blocked right now?", "Summarize progress this week", "Plan the next milestone"];
 const STARTER_ICONS = [IconWritingSign, IconAlertTriangle, IconListCheck, IconCalendarEvent];
 
+/**
+ * Told when the reader opens a row or a reply's steps: what they opened grows the log under where they
+ * are reading, so the chat stops following the end (it would scroll what they asked for away).
+ */
+const OpenedContext = createContext<() => void>(() => {});
+
+/** A row's open state, telling the chat when it opens. */
+function useOpen(): [boolean, () => void] {
+  const [open, setOpen] = useState(false);
+  const opened = useContext(OpenedContext);
+  return [
+    open,
+    () => {
+      if (!open) opened();
+      setOpen(!open);
+    },
+  ];
+}
+
 /** One tool call: its row, and behind it each input field and the result. */
 function ToolStepView({ s }: { s: ToolStep }) {
-  const [open, setOpen] = useState(false);
+  const [open, toggle] = useOpen();
   return (
-    <StepRow name={s.name} summary={s.summary} status={s.status} open={open} onToggle={() => setOpen((o) => !o)}>
+    <StepRow name={s.name} summary={s.summary} status={s.status} open={open} onToggle={toggle}>
       {s.input.map((f) => (
         <StepField key={f.key} label={f.key}>
           {f.value}
@@ -82,10 +101,10 @@ function Steps({ steps, projectId, quiet = false }: { steps: Step[]; projectId: 
 
 /** A reply's steps, closed until asked for: "Used 3 tools". */
 function ReplySteps({ steps, projectId }: { steps: Step[]; projectId: string }) {
-  const [open, setOpen] = useState(false);
+  const [open, toggle] = useOpen();
   const n = steps.filter((s) => s.kind === "tool").length;
   return (
-    <StepsDisclosure label={`Used ${n} ${n === 1 ? "tool" : "tools"}`} open={open} onToggle={() => setOpen((o) => !o)}>
+    <StepsDisclosure label={`Used ${n} ${n === 1 ? "tool" : "tools"}`} open={open} onToggle={toggle}>
       <Steps steps={steps} projectId={projectId} quiet />
     </StepsDisclosure>
   );
@@ -98,6 +117,8 @@ const MANAGER_MARK = <IconMessage size={icon.sm} />;
 const NEAR = 24;
 const OLDER_AT = 80;
 const PAGE = 50;
+/** The longest a finished turn's stream is held waiting for its message. */
+const HOLD_MAX_MS = 30_000;
 
 function MessageActions({ m, onQuote, onRetry }: { m: ChatMessage; onQuote: (text: string) => void; onRetry?: () => void }) {
   return (
@@ -194,9 +215,17 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const trace = useTrace(agent);
   const coarse = useMediaQuery("(pointer: coarse)") ?? false;
   const live = useMemo(() => liveTurn(trace.state.events), [trace.state.events]);
-  const replies = useMemo(() => stepsByReply(trace.state.events), [trace.state.events]);
+  const finished = useMemo(() => finishedTurns(trace.state.events), [trace.state.events]);
   const waits = useWaits(projectId);
   const replyWait = waits.data?.pending.find((w) => w.kind === "reply");
+  // The time left on the owner's reply counts down by the minute.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!replyWait) return;
+    setNow(Date.now());
+    const t = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(t);
+  }, [replyWait?.id]);
 
   const [older, setOlder] = useState<ChatMessage[]>([]);
   const [hasOlder, setHasOlder] = useState(true);
@@ -218,7 +247,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const seen = useRef<Set<number> | null>(null);
   const anchor = useRef<number | null>(null);
   // The last stream, kept until the turn's message lands, so the swap doesn't jump.
-  const [held, setHeld] = useState<{ steps: Step[]; sinceSeq: number } | null>(null);
+  const [held, setHeld] = useState<{ turn: string; steps: Step[]; sinceSeq: number } | null>(null);
 
   const latest = useMemo(() => chat.data ?? [], [chat.data]);
   const messages = useMemo(() => {
@@ -237,11 +266,27 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
 
   // Hold the stream until its message lands (a manager message newer than when it began).
   useEffect(() => {
-    if (live && live.steps.length) setHeld((h) => ({ steps: live.steps, sinceSeq: h?.sinceSeq ?? lastManagerSeq }));
-  }, [live]); // `lastManagerSeq` is read at the stream's start only
+    if (live && live.steps.length) setHeld((h) => ({ turn: live.turn, steps: live.steps, sinceSeq: h?.turn === live.turn ? h.sinceSeq : lastManagerSeq }));
+  }, [live]); // `lastManagerSeq` is read at each turn's start only
+  // The held turn as it ended (a call it never answered reads stopped), while the ring has it.
+  const heldEnd = !live && held ? (finished.find((t) => t.turn === held.turn) ?? null) : null;
+  // Let go once its message is in the log (by what it says; by seq if the ring has lost the turn), at
+  // once if it ended without a reply (stopped), and after HOLD_MAX_MS whatever happens.
   useEffect(() => {
-    if (held && !live && lastManagerSeq > held.sinceSeq) setHeld(null);
-  }, [held, live, lastManagerSeq]);
+    if (!held || live) return;
+    const landed = heldEnd ? !heldEnd.reply || messages.some((m) => m.sender === "manager" && m.text.trim() === heldEnd.reply) : lastManagerSeq > held.sinceSeq;
+    if (landed) {
+      setHeld(null);
+      return;
+    }
+    const t = setTimeout(() => setHeld(null), HOLD_MAX_MS);
+    return () => clearTimeout(t);
+  }, [held, live, heldEnd, messages, lastManagerSeq]);
+
+  // The reader opened something: the end is no longer followed (scroll anchoring holds their line).
+  const stopFollowing = useCallback(() => {
+    if (atBottomRef.current) setAtBottom(false);
+  }, [setAtBottom]);
 
   const scrollToBottom = useCallback(() => {
     // The log scrolls, never the page (no scrollIntoView, which scrolls every ancestor).
@@ -359,7 +404,8 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
 
   const items = groupLog(messages);
   const running = !!live;
-  const streamSteps = live?.steps ?? held?.steps ?? [];
+  const streamSteps = live?.steps ?? (held ? (heldEnd?.steps ?? held.steps) : []);
+  const replySteps = stepsBySeq(messages, finished);
   const stream = running || streamSteps.length > 0;
   // A tool running shows itself; otherwise the turn is between steps (thinking, writing): a working line.
   const toolRunning = streamSteps.some((st) => st.kind === "tool" && st.status === "running");
@@ -374,137 +420,139 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   };
 
   return (
-    <Stack gap="md">
-      <ChatFrame>
-        <ChatLog ref={log} onScroll={onScroll} label="Conversation with the manager" following={atBottom}>
-          {loadingOlder && <LoadingState label="Loading older messages" />}
-          {chat.isPending ? (
-            <LoadingState label="Loading the chat" />
-          ) : chat.isError ? (
-            <ErrorState title="The chat couldn't be loaded" error={chat.error} onRetry={() => void chat.refetch()} />
-          ) : messages.length === 0 && !stream ? (
-            <ChatWelcome
-              title="What should we work on?"
-              starters={STARTERS.map((st, i) => {
-                const Icon = STARTER_ICONS[i] ?? IconMessage;
-                return (
-                  <Starter key={st} leftSection={<Icon size={icon.md} aria-hidden />} onClick={() => fillStarter(st)}>
-                    {st.endsWith(" ") ? `${st}…` : st}
-                  </Starter>
-                );
-              })}
-            >
-              The manager keeps this project's board: it specs tasks, assigns them, and tells you what's blocked.
-            </ChatWelcome>
-          ) : (
-            items.map((it) =>
-              it.kind === "day" ? (
-                <DaySeparator key={it.key} label={it.label} />
-              ) : (
-                <MessageGroup key={it.key} side={it.sender === "owner" ? "owner" : it.sender === "manager" ? "manager" : "note"} name={it.sender === "manager" ? "Manager" : undefined} avatar={MANAGER_MARK}>
-                  {it.messages.map((m) => (
-                    <Message
-                      key={m.seq}
-                      m={m}
-                      projectId={projectId}
-                      appear={!!seen.current && m.seq > 0 && !seen.current.has(m.seq)}
-                      steps={m.sender === "manager" ? replies.get(m.text.trim()) : undefined}
-                      onQuote={quoteReply}
-                      onRetry={retry}
-                    />
-                  ))}
-                </MessageGroup>
-              ),
-            )
-          )}
-          {stream && !chat.isError && (
-            <MessageGroup side="manager" name="Manager" avatar={MANAGER_MARK}>
-              <MessageRow side="manager" data-sender="stream">
-                <Stack gap="sm">
-                  {streamSteps.length > 0 && <Steps steps={streamSteps} projectId={projectId} />}
-                  {running && !toolRunning && <WorkingLine>Working…</WorkingLine>}
-                </Stack>
-              </MessageRow>
-            </MessageGroup>
-          )}
-        </ChatLog>
-      </ChatFrame>
-      <VisuallyHidden aria-live="polite" role="status" data-slot="announce">
-        {announce}
-      </VisuallyHidden>
-
-      <ComposerDock
-        pill={
-          !atBottom &&
-          messages.length > 0 && (
-            <Button size="xs" radius="xl" variant="default" leftSection={<IconArrowDown size={icon.sm} />} onClick={jumpToLatest}>
-              {unseen > 0 ? `Jump to latest · ${unseen} new` : "Jump to latest"}
-            </Button>
-          )
-        }
-      >
-        <form
-          onSubmit={(e) => {
-            e.preventDefault();
-            send();
-          }}
-        >
-          <ComposerBox
-            bar={
-              <>
-                {replyWait ? (
-                  <Row gap="xs" wrap="nowrap" data-slot="reply-wait">
-                    <Text component="span" c="dimmed" display="inline-flex">
-                      <IconHourglass size={icon.sm} aria-hidden />
-                    </Text>
-                    <Text fz="xs" c="dimmed" title={`Times out ${exact(replyWait.deadline_ms)}`}>
-                      Waiting for your reply · {replyWait.deadline_ms > Date.now() ? `${human(replyWait.deadline_ms - Date.now())} left` : "timing out"}
-                    </Text>
-                  </Row>
+    <OpenedContext.Provider value={stopFollowing}>
+      <Stack gap="md">
+        <ChatFrame>
+          <ChatLog ref={log} onScroll={onScroll} label="Conversation with the manager" following={atBottom}>
+            {loadingOlder && <LoadingState label="Loading older messages" />}
+            {chat.isPending ? (
+              <LoadingState label="Loading the chat" />
+            ) : chat.isError ? (
+              <ErrorState title="The chat couldn't be loaded" error={chat.error} onRetry={() => void chat.refetch()} />
+            ) : messages.length === 0 && !stream ? (
+              <ChatWelcome
+                title="What should we work on?"
+                starters={STARTERS.map((st, i) => {
+                  const Icon = STARTER_ICONS[i] ?? IconMessage;
+                  return (
+                    <Starter key={st} leftSection={<Icon size={icon.md} aria-hidden />} onClick={() => fillStarter(st)}>
+                      {st.endsWith(" ") ? `${st}…` : st}
+                    </Starter>
+                  );
+                })}
+              >
+                The manager keeps this project's board: it specs tasks, assigns them, and tells you what's blocked.
+              </ChatWelcome>
+            ) : (
+              items.map((it) =>
+                it.kind === "day" ? (
+                  <DaySeparator key={it.key} label={it.label} />
                 ) : (
-                  !coarse && (
-                    <Text fz="xs" c="dimmed">
-                      Enter to send · Shift+Enter for a new line
-                    </Text>
-                  )
-                )}
-                <Row gap="sm" wrap="nowrap">
-                  {running && (
-                    <Button variant="default" size="compact-sm" leftSection={<IconPlayerStop size={icon.sm} />} loading={interrupt.isPending} onClick={() => interrupt.mutate()}>
-                      Stop
-                    </Button>
-                  )}
-                  <Tooltip label="Send" withArrow disabled={coarse}>
-                    <ActionIcon type="submit" size="lg" aria-label="Send" disabled={!text.trim() || post.isPending}>
-                      <IconArrowUp size={icon.md} />
-                    </ActionIcon>
-                  </Tooltip>
-                </Row>
-              </>
-            }
+                  <MessageGroup key={it.key} side={it.sender === "owner" ? "owner" : it.sender === "manager" ? "manager" : "note"} name={it.sender === "manager" ? "Manager" : undefined} avatar={MANAGER_MARK}>
+                    {it.messages.map((m) => (
+                      <Message
+                        key={m.seq}
+                        m={m}
+                        projectId={projectId}
+                        appear={!!seen.current && m.seq > 0 && !seen.current.has(m.seq)}
+                        steps={replySteps.get(m.seq)}
+                        onQuote={quoteReply}
+                        onRetry={retry}
+                      />
+                    ))}
+                  </MessageGroup>
+                ),
+              )
+            )}
+            {stream && !chat.isError && (
+              <MessageGroup side="manager" name="Manager" avatar={MANAGER_MARK}>
+                <MessageRow side="manager" quiet data-sender="stream">
+                  <Stack gap="sm">
+                    {streamSteps.length > 0 && <Steps steps={streamSteps} projectId={projectId} />}
+                    {running && !toolRunning && <WorkingLine>Working…</WorkingLine>}
+                  </Stack>
+                </MessageRow>
+              </MessageGroup>
+            )}
+          </ChatLog>
+        </ChatFrame>
+        <VisuallyHidden aria-live="polite" role="status" data-slot="announce">
+          {announce}
+        </VisuallyHidden>
+
+        <ComposerDock
+          pill={
+            !atBottom &&
+            messages.length > 0 && (
+              <Button size="xs" radius="xl" variant="default" leftSection={<IconArrowDown size={icon.sm} />} onClick={jumpToLatest}>
+                {unseen > 0 ? `Jump to latest · ${unseen} new` : "Jump to latest"}
+              </Button>
+            )
+          }
+        >
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              send();
+            }}
           >
-            <Textarea
-              ref={composer}
-              aria-label="Message to the manager"
-              placeholder="Message the manager"
-              variant="unstyled"
-              autosize
-              minRows={1}
-              maxRows={10}
-              maxLength={20000}
-              value={text}
-              onChange={(e) => setText(e.currentTarget.value)}
-              onKeyDown={(e) => {
-                // On touch, Enter is a new line (a phone's keyboard has no Shift+Enter); Send sends.
-                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && !coarse) {
-                  e.preventDefault();
-                  send();
-                }
-              }}
-            />
-          </ComposerBox>
-        </form>
-      </ComposerDock>
-    </Stack>
+            <ComposerBox
+              bar={
+                <>
+                  {replyWait ? (
+                    <Row gap="xs" wrap="nowrap" data-slot="reply-wait">
+                      <Text component="span" c="dimmed" display="inline-flex">
+                        <IconHourglass size={icon.sm} aria-hidden />
+                      </Text>
+                      <Text fz="xs" c="dimmed" title={`Times out ${exact(replyWait.deadline_ms)}`}>
+                        Waiting for your reply · {replyWait.deadline_ms > now ? `${human(replyWait.deadline_ms - now)} left` : "timing out"}
+                      </Text>
+                    </Row>
+                  ) : (
+                    !coarse && (
+                      <Text fz="xs" c="dimmed">
+                        Enter to send · Shift+Enter for a new line
+                      </Text>
+                    )
+                  )}
+                  <Row gap="sm" wrap="nowrap">
+                    {running && (
+                      <Button variant="default" size="compact-sm" leftSection={<IconPlayerStop size={icon.sm} />} loading={interrupt.isPending} onClick={() => interrupt.mutate()}>
+                        Stop
+                      </Button>
+                    )}
+                    <Tooltip label="Send" withArrow disabled={coarse}>
+                      <ActionIcon type="submit" size="lg" aria-label="Send" disabled={!text.trim() || post.isPending}>
+                        <IconArrowUp size={icon.md} />
+                      </ActionIcon>
+                    </Tooltip>
+                  </Row>
+                </>
+              }
+            >
+              <Textarea
+                ref={composer}
+                aria-label="Message to the manager"
+                placeholder="Message the manager"
+                variant="unstyled"
+                autosize
+                minRows={1}
+                maxRows={10}
+                maxLength={20000}
+                value={text}
+                onChange={(e) => setText(e.currentTarget.value)}
+                onKeyDown={(e) => {
+                  // On touch, Enter is a new line (a phone's keyboard has no Shift+Enter); Send sends.
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && !coarse) {
+                    e.preventDefault();
+                    send();
+                  }
+                }}
+              />
+            </ComposerBox>
+          </form>
+        </ComposerDock>
+      </Stack>
+    </OpenedContext.Provider>
   );
 }

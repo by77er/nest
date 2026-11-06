@@ -132,8 +132,11 @@ export function MessageGroup({ side, name, avatar, children }: { side: "owner" |
   );
 }
 
-/** One message: its body, then its meta (time and actions) revealed on hover or focus. */
-export function MessageRow({ side, children, meta, appear = false, pinned = false, ...data }: { side: "owner" | "manager" | "note"; children: ReactNode; meta?: ReactNode; appear?: boolean; pinned?: boolean; [k: `data-${string}`]: string | undefined }) {
+/**
+ * One message: its body, then its meta (time and actions) revealed on hover or focus. `quiet`: not read
+ * out as it changes (a turn streaming in; its reply is announced once when it lands).
+ */
+export function MessageRow({ side, children, meta, appear = false, pinned = false, quiet = false, ...data }: { side: "owner" | "manager" | "note"; children: ReactNode; meta?: ReactNode; appear?: boolean; pinned?: boolean; quiet?: boolean; [k: `data-${string}`]: string | undefined }) {
   const cls = [classes.row, appear ? classes.appear : ""].join(" ");
   if (side === "note") {
     return (
@@ -143,7 +146,7 @@ export function MessageRow({ side, children, meta, appear = false, pinned = fals
     );
   }
   return (
-    <div className={cls} data-ds="message" {...data}>
+    <div className={cls} data-ds="message" aria-live={quiet ? "off" : undefined} {...data}>
       {side === "owner" ? <div className={classes.bubble}>{children}</div> : children}
       {meta && (
         <div className={classes.meta} data-pinned={pinned || undefined} data-slot="meta">
@@ -167,7 +170,7 @@ function JumpPill({ children }: { children: ReactNode }) {
 /** The manager is at work and has nothing new to show yet: a quiet loading line. */
 export function WorkingLine({ children }: { children: ReactNode }) {
   return (
-    <div className={classes.working} data-ds="working" role="status">
+    <div className={classes.working} data-ds="working">
       <Loader type="dots" size="xs" color="gray" aria-hidden />
       <span>{children}</span>
     </div>

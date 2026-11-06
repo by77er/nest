@@ -29,6 +29,26 @@ function traceSocket(events: object[]) {
     close() {}
   };
 }
+/** The same, but each message in a tick of its own (React renders between them), as a real socket's backlog. */
+function slowTraceSocket(events: object[], gapMs = 15) {
+  return class {
+    private listeners: Record<string, ((e: { data?: string }) => void)[]> = {};
+    constructor(readonly url: string) {
+      const all = [...events, { type: "live" }];
+      setTimeout(() => this.emit("open", {}), 0);
+      all.forEach((e, i) => setTimeout(() => this.emit("message", { data: JSON.stringify(e) }), (i + 1) * gapMs));
+    }
+    private emit(type: string, e: { data?: string }) {
+      for (const l of this.listeners[type] ?? []) l(e);
+    }
+    addEventListener(type: string, l: (e: { data?: string }) => void) {
+      (this.listeners[type] ??= []).push(l);
+    }
+    removeEventListener() {}
+    send() {}
+    close() {}
+  };
+}
 let seq = 0;
 const ev = (type: string, more: Record<string, unknown> = {}) => ({ seq: ++seq, ts_ms: Date.now(), type, turn: "trn_9", ...more });
 const msgs = (n: number, from = 1) => Array.from({ length: n }, (_, k) => ({ seq: from + k, at_ms: Date.now() - (n - k) * 1000, sender: k % 2 ? "manager" : "owner", text: `Message ${from + k}`, delivered: true, error: null }));
@@ -118,6 +138,69 @@ describe("the chat", () => {
     renderApp("/projects/prj_one/manager", api);
     c = await chat();
     expect(await within(c).findByText(/^Waiting for your reply · 2 h/)).toBeInTheDocument();
+  });
+
+  it("a turn that ends without a reply (stopped) leaves no stream behind, its calls never left spinning", async () => {
+    vi.stubGlobal("WebSocket", slowTraceSocket([ev("turn_started", { turn: "trn_s" }), ev("tool_call", { turn: "trn_s", call_id: "c1", name: "Bash", input: { command: "sleep 100" } }), ev("turn_completed", { turn: "trn_s", stop_reason: "interrupted" })], 60));
+    renderApp("/projects/prj_one/manager", new FakeApi());
+    const c = await chat();
+    // Seen running first (its own tick), then gone once the turn ends with nothing to say.
+    expect(await within(c).findByRole("button", { name: "Bash sleep 100, running" })).toBeInTheDocument();
+    await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
+  });
+
+  it("reopening the chat, a replayed backlog doesn't leave the last turn's stream under its own reply", async () => {
+    vi.stubGlobal("WebSocket", slowTraceSocket([
+      ev("turn_started", { turn: "trn_r" }),
+      ev("tool_call", { turn: "trn_r", call_id: "c1", name: "Read", input: { file_path: "a.ts" } }),
+      ev("tool_result", { turn: "trn_r", call_id: "c1", is_error: false, summary: "ok" }),
+      ev("assistant_text", { turn: "trn_r", text: "Read it." }),
+      ev("turn_completed", { turn: "trn_r", stop_reason: "end_turn" }),
+    ], 60));
+    const api = new FakeApi();
+    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: "Read it.", delivered: true, error: null }];
+    renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await within(c).findByText("Read it.");
+    // The replay looks live for a moment (its own ticks)…
+    await waitFor(() => expect(c.querySelector("[data-sender=stream]")).not.toBeNull());
+    // …then the turn is the reply's, behind it, once.
+    expect(await within(c).findByRole("button", { name: "Used 1 tool" })).toBeInTheDocument();
+    await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
+    expect(within(c).getAllByText("Read it.")).toHaveLength(1);
+  });
+
+  it("opening a reply's steps at the end stops following: what opened isn't scrolled away", async () => {
+    vi.stubGlobal("WebSocket", traceSocket([
+      ev("turn_started", { turn: "trn_o" }),
+      ev("tool_call", { turn: "trn_o", call_id: "c1", name: "Read", input: { file_path: "a.ts" } }),
+      ev("tool_result", { turn: "trn_o", call_id: "c1", is_error: false, summary: "ok" }),
+      ev("assistant_text", { turn: "trn_o", text: "Message 4" }),
+      ev("turn_completed", { turn: "trn_o", stop_reason: "end_turn" }),
+    ]));
+    let total = 1000;
+    const height = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockImplementation(() => total);
+    const client = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(200);
+    try {
+      const api = new FakeApi();
+      api.chat = msgs(4);
+      const { user, queryClient } = renderApp("/projects/prj_one/manager", api);
+      const c = await chat();
+      const toggle = await within(c).findByRole("button", { name: "Used 1 tool" });
+      const log = within(c).getByRole("log", { name: "Conversation with the manager" });
+      expect(log.scrollTop).toBe(1000);
+      await user.click(toggle);
+      // The steps grow the log; a message arriving now doesn't pull the reader to the end.
+      total = 1400;
+      api.chat = msgs(5);
+      await queryClient.refetchQueries();
+      await within(c).findByText("Message 5");
+      expect(log.scrollTop).toBe(1000);
+      expect(await within(c).findByRole("button", { name: "Jump to latest · 1 new" })).toBeInTheDocument();
+    } finally {
+      height.mockRestore();
+      client.mockRestore();
+    }
   });
 
   it("on a desktop, Enter sends and Shift+Enter is a new line", async () => {

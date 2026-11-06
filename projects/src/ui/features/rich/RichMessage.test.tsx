@@ -14,6 +14,7 @@ import { ask, FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 import { cssVariablesResolver, theme } from "../../theme";
 import { sanitizeSvg, SVG_MAX_BYTES } from "../../rich/svg";
+import { HIGHLIGHT_MAX } from "../../rich/highlight";
 import { RichMessage } from "./RichMessage";
 /** The task drawer (titled with its task's title). */
 const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
@@ -74,8 +75,8 @@ describe("Markdown", () => {
   });
 
   it("highlights a fence in a language it knows, under its language and a Copy that copies the code itself", async () => {
-    const writeText = vi.fn(async () => {});
-    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    // user-event's clipboard stands in for the browser's (set up per test, restored after it).
+    const user = userEvent.setup();
     const { root } = await show(["```ts\nconst x = \"a\"; // why\n```", "```klingon\nqapla'\n```", "```\nplain <b>\n```"].join("\n\n"));
     const [ts, unknown, bare] = [...root.querySelectorAll<HTMLElement>("[data-ds=code-block]")];
     // Tokens as elements (never markup from a string), coloured by the theme through their classes.
@@ -90,10 +91,18 @@ describe("Markdown", () => {
     expect(unknown!.querySelector("[class^=hljs]")).toBeNull();
     expect(bare!.querySelector("code")!.innerHTML).toBe("plain &lt;b&gt;\n");
     // Copy takes the code's text, not its token spans.
-    await userEvent.click(within(ts!).getByRole("button", { name: "Copy" }));
-    expect(writeText).toHaveBeenCalledWith('const x = "a"; // why');
+    await user.click(within(ts!).getByRole("button", { name: "Copy" }));
+    expect(await navigator.clipboard.readText()).toBe('const x = "a"; // why');
     expect(await within(ts!).findByRole("button", { name: "Copied" })).toBeInTheDocument();
-    vi.unstubAllGlobals();
+  });
+
+  it("leaves a fence longer than the cap plain, and highlights console sessions as sessions, scripts as scripts", async () => {
+    const big = "const x = 1;\n".repeat(Math.ceil(HIGHLIGHT_MAX / 13) + 1);
+    const { root } = await show(["```ts\n" + big + "```", "```console\n$ npm test\nok\n```"].join("\n\n"));
+    const [long, session] = [...root.querySelectorAll<HTMLElement>("[data-ds=code-block] code")];
+    expect(long).not.toHaveAttribute("data-highlighted");
+    expect(session).toHaveAttribute("data-highlighted");
+    expect(session!.querySelector(".hljs-meta")).toHaveTextContent("$");
   });
 
   it("escapes raw HTML: it shows as text, never as markup", async () => {

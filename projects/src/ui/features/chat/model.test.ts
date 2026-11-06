@@ -3,7 +3,7 @@
 import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "../../api/types";
 import type { TraceEvent } from "../trace/model";
-import { GROUP_GAP_MS, groupLog, liveTurn, quote, stepsByReply } from "./model";
+import { finishedTurns, GROUP_GAP_MS, groupLog, liveTurn, quote, stepsBySeq } from "./model";
 
 const NOW = new Date(2026, 10, 2, 15, 0).getTime();
 const msg = (seq: number, sender: string, at_ms: number): ChatMessage => ({ seq, at_ms, sender, text: `m${seq}`, delivered: true, error: null });
@@ -59,31 +59,53 @@ describe("liveTurn", () => {
   });
 });
 
-describe("stepsByReply", () => {
+describe("finishedTurns and stepsBySeq", () => {
   let seq = 100;
-  const ev = (type: string, turn: string, more: Record<string, unknown> = {}) => ({ seq: ++seq, ts_ms: NOW, type, turn, ...more }) as unknown as TraceEvent;
+  const ev = (type: string, turn: string | undefined, more: Record<string, unknown> = {}) => ({ seq: ++seq, ts_ms: NOW, type, turn, ...more }) as unknown as TraceEvent;
+  const reply = (s: number, text: string): ChatMessage => ({ seq: s, at_ms: NOW, sender: "manager", text, delivered: true, error: null });
 
-  it("finds a finished turn's steps by its reply (its last text), and a call the turn never answered reads stopped", () => {
-    const steps = stepsByReply([
+  it("pairs a finished turn with the message saying its reply (its last text); everything else it did is behind it, a call it never answered stopped", () => {
+    const turns = finishedTurns([
       ev("turn_started", "t1"),
       ev("assistant_text", "t1", { text: "Checking." }),
       ev("tool_call", "t1", { call_id: "c1", name: "Read", input: { file_path: "a.ts" } }),
+      // A timer set mid-turn has no turn: it doesn't split the turn, and the result still finds its call.
+      ev("timer_set", undefined, { timer: "tm_1" }),
       ev("tool_call", "t1", { call_id: "c2", name: "Bash", input: { command: "npm test" } }),
       ev("tool_result", "t1", { call_id: "c1", is_error: false, summary: "ok" }),
       ev("assistant_text", "t1", { text: "  All good.  " }),
+      // A call after the reply is still one of its steps.
+      ev("tool_call", "t1", { call_id: "c3", name: "mcp__projects-board__list_waits", input: {} }),
+      ev("tool_result", "t1", { call_id: "c3", is_error: false, summary: "none" }),
       ev("turn_completed", "t1"),
       // A turn that called no tool has nothing to show behind its reply.
       ev("turn_started", "t2"),
       ev("assistant_text", "t2", { text: "Hello." }),
       ev("turn_completed", "t2"),
-      // A turn still running isn't a reply yet.
+      // A turn still running isn't finished.
       ev("turn_started", "t3"),
-      ev("tool_call", "t3", { call_id: "c3", name: "Bash", input: { command: "ls" } }),
-      ev("assistant_text", "t3", { text: "Partial." }),
+      ev("tool_call", "t3", { call_id: "c4", name: "Bash", input: { command: "ls" } }),
     ]);
-    expect([...steps.keys()]).toEqual(["All good."]);
-    const s = steps.get("All good.")!;
-    expect(s.map((x) => (x.kind === "tool" ? `${x.name}:${x.status}` : x.text))).toEqual(["Checking.", "Read:done", "Bash:stopped"]);
+    expect(turns.map((t) => [t.turn, t.reply])).toEqual([["t1", "All good."], ["t2", "Hello."]]);
+    const steps = stepsBySeq([reply(1, "Hello."), reply(2, "All good.")], turns);
+    expect([...steps.keys()]).toEqual([2]);
+    expect(steps.get(2)!.map((x) => (x.kind === "tool" ? `${x.name}:${x.status}` : x.text))).toEqual(["Checking.", "Read:done", "Bash:stopped", "list_waits:done"]);
+  });
+
+  it("gives a repeated reply's steps only to the newest message saying it, the turn's own", () => {
+    const turn = (id: string, cmd: string) => [ev("turn_started", id), ev("tool_call", id, { call_id: `c_${id}`, name: "Bash", input: { command: cmd } }), ev("assistant_text", id, { text: "Done." }), ev("turn_completed", id)];
+    const turns = finishedTurns([...turn("a", "first"), ...turn("b", "second")]);
+    const steps = stepsBySeq([reply(1, "Done."), reply(5, "Something else"), reply(7, "Done."), reply(9, "Done.")], turns);
+    // Two turns said it: the newest to the newest message, the older to the one before; the oldest has none.
+    expect([...steps.entries()].map(([k, v]) => [k, v[0]!.kind === "tool" && v[0]!.summary])).toEqual([[9, "second"], [7, "first"]]);
+  });
+
+  it("shows an input nest cut short (mid-JSON) as it came, marked, with its main argument read from its start", () => {
+    const cut = '{"file_path":"src/search/tags.ts","content":"export function indexTags(gadgets) {\\n  const index = new Map();';
+    const t = liveTurn([ev("turn_started", "t9"), ev("tool_call", "t9", { call_id: "c1", name: "Write", input: cut })]);
+    const tool = t!.steps[0]!;
+    expect(tool).toMatchObject({ kind: "tool", name: "Write", summary: "src/search/tags.ts" });
+    expect(tool.kind === "tool" && tool.input).toEqual([{ key: "input (cut short)", value: cut }]);
   });
 });
 
