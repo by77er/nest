@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Cloud check that a sandbox host's gateway reaches its VMs (README.md in this directory).
 
-Creates one sandbox, waits for it to run, resolves it as a brain would, and binds to its gateway over
-the tunnel: the gateway answers `bound` only after it has connected to the guest's vsock socket, so
+Creates one sandbox, waits for it to run, attaches an agent that never starts (`start: false`, so no
+brain and no turn) to it, resolves the sandbox for that agent as a brain would, and binds to its gateway
+over the tunnel: resolve answers only for an attached agent. Then the gateway answers `bound` only after it has connected to the guest's vsock socket, so
 `bound` proves a hands call can reach the VM (2026-11-04: a host whose gateway couldn't open the
 vsock socket answered `busy` "guest not reachable" to every bind). Reports the host, its instance
-and, when the AWS CLI can see it, its type. Destroys the sandbox on every exit path.
+and, when the AWS CLI can see it, its type. Stops the agent, deletes its template and destroys the
+sandbox on every exit path.
 
 Reads NEST_ADMIN_TOKEN (required), NEST_ACCESS_CLIENT_ID and NEST_ACCESS_CLIENT_SECRET (Cloudflare
 Access in front of the gateways), NEST_BASE_URL (default https://nest.bitcru.sh), NEST_CELL (default
@@ -74,6 +76,14 @@ def destroy(sid):
     return False
 
 
+TEMPLATE_NAME = "hands-probe-check"
+# Never started, so the credential and model are never used; the API requires both.
+TEMPLATE = {
+    "capabilities": [], "hands": "required", "credential": "claude_oauth_token:worker",
+    "launch": {"model": "haiku", "builtin_tools": [], "system_prompt": {"mode": "append", "text": "A hands probe; never started."}},
+}
+
+
 def on_sigterm(_signum, _frame):
     # Unwind through main's `finally`, which destroys the sandbox.
     raise KeyboardInterrupt
@@ -89,7 +99,18 @@ def main():
     sid = sbx["sandbox"]
     print(f"created {sid} (destroyed on exit; if this process dies, DELETE /v1/sandboxes/{sid} by hand)")
     result = 1
+    agent = None
     try:
+        st, v = api("PUT", f"/v1/admin/templates/{TEMPLATE_NAME}", TEMPLATE)
+        if not 200 <= st < 300:
+            print(f"FAIL: template: {st} {str(v)[:200]}")
+            return result
+        st, v = api("POST", "/v1/agents", {"template": TEMPLATE_NAME, "cell": CELL, "sandbox": sid, "start": False})
+        if st != 201 or not isinstance(v, dict):
+            print(f"FAIL: agent: {st} {str(v)[:200]}")
+            return result
+        agent = v["agent"]
+        print(f"attached {agent} (never started)")
         deadline = time.time() + TIMEOUT_S
         info = sbx
         while time.time() < deadline and not (info.get("host") and info.get("state") == "running"):
@@ -107,7 +128,7 @@ def main():
             r = subprocess.run(["aws", "--region", os.environ.get("AWS_REGION", "us-east-1"), "ec2", "describe-instances", "--instance-ids", instance,
                                 "--query", "Reservations[0].Instances[0].InstanceType", "--output", "text"], capture_output=True, text=True)
             itype = r.stdout.strip() or None
-        st, target = api("POST", f"/v1/sandboxes/{sid}/resolve", {"client": "hands-probe-check"})
+        st, target = api("POST", f"/v1/sandboxes/{sid}/resolve", {"client": agent})
         if st != 200 or not isinstance(target, dict):
             print(f"FAIL: resolve: {st} {str(target)[:200]}")
             return result
@@ -120,6 +141,12 @@ def main():
         return result
     finally:
         # The check's own verdict is printed above; a failed cleanup fails the check besides.
+        if agent:
+            st, _ = api("POST", f"/v1/agents/{agent}/stop")
+            print(f"stop {agent}: {st}")
+            if not 200 <= st < 300:
+                result = 1
+        print(f"delete template {TEMPLATE_NAME}: {api('DELETE', f'/v1/admin/templates/{TEMPLATE_NAME}')[0]}")
         if not destroy(sid):
             result = 1
         print("PASS" if result == 0 else "FAIL")

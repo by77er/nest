@@ -57,10 +57,10 @@ uv run --with 'websockets>=13' python3 -I dev/cloud-checks/hands_probe_check.py
 | | |
 |---|---|
 | **Settings** | `NEST_ADMIN_TOKEN`, `NEST_ACCESS_CLIENT_ID` and `NEST_ACCESS_CLIENT_SECRET` (Access in front of the gateways), `NEST_BASE_URL`, `NEST_CELL`, `CHECK_TIMEOUT_S` (900) |
-| **Creates** | one sandbox (label `check=hands-probe`). In a cold cell, the autoscaler launches a sandbox host |
+| **Creates** | one sandbox (label `check=hands-probe`). In a cold cell, the autoscaler launches a sandbox host. Also the template `hands-probe-check` and one agent of it on that sandbox, created with `start: false`, so no brain runs and no turn is spent: `resolve` answers only for an attached agent |
 | **Passes when** | the gateway answers `bound` to a brain's `bind`. It does so only after connecting to the guest's vsock socket; `busy` is retried for 2 minutes, as a brain does |
 | **Reports** | the sandbox, its host, the instance and its type |
-| **Cleans up** | destroys the sandbox on every exit path, SIGTERM included, retrying the `DELETE` five times. The check fails unless it answers 2xx (or 404: already gone), and a leak is printed with the id to destroy by hand |
+| **Cleans up** | stops the agent and deletes the template, then destroys the sandbox on every exit path, SIGTERM included, retrying the `DELETE` five times. The check fails unless it answers 2xx (or 404: already gone), and a leak is printed with the id to destroy by hand |
 
 ## `stress.py`
 
