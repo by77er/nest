@@ -49,7 +49,7 @@ The checks:
 
 | Method | Path | Check |
 | --- | --- | --- |
-| `POST` | `/v1/agents` | Within the grant (`cells`, `credentials`, `repos`, `read_repos`, `mcp_urls`, `max_agents`, …): the [catalog](#the-clients-catalog) expands its template with it. A `sandbox` or `owner` agent it names is subtree (404). `overrides` only narrow; `launch` and `rules` are the operator's (400). |
+| `POST` | `/v1/agents` | Within the grant (`cells`, `credentials`, `repos`, `read_repos`, `mcp_urls`, `max_agents`, …): the [catalog](#the-clients-catalog) expands its template with it. A `sandbox` or `owner` agent it names is subtree (404). `overrides` only narrow; `launch` and `rules` are the operator's (400). `grants` are confined to the subtree; an agent id in one is subtree (404) ([grants to its agents](#grants-to-its-agents)). |
 | `GET` | `/v1/agents` | Its own registry only (ClientDO), whatever `?client=` says. |
 | `GET` | `/v1/agents/<agent>` | Subtree. |
 | `GET` | `/v1/agents/<agent>/turns` | Subtree. |
@@ -88,6 +88,22 @@ The checks:
 | `GET` | `/v1/clients/self/secrets` | Self ([secrets](#secrets)). |
 | `PUT` | `/v1/clients/self/secrets/<name>` | Self. Within `secrets`. |
 | `DELETE` | `/v1/clients/self/secrets/<name>` | Self. |
+
+## Grants to its agents
+
+**Built (2026-11-06):** a client confers [transcript grants](../../../agents/tools/#built-transcript-grants-2026-11-06) on an agent it creates, so that agent can read agents it doesn't own: its siblings in the client's subtree. A client holds read on its whole subtree (its owner auth), so it may confer any such grant, and only over its subtree.
+
+```json
+POST /v1/agents
+{"template": "<ns>/<entry>", "labels": {"project": "prj_x", "role": "dreaming"},
+ "grants": [{"action": "read_transcript", "resource": "agent{project=prj_x}",
+             "limits": {"max_age_ms": 604800000, "max_entries": 200}, "expires_ms": 1794000000000}]}
+```
+
+- `grants` takes up to 16 entries of `{action, resource, limits?, expires_ms?}`. Any other field, an unknown limit, an unparsable resource or a past `expires_ms` is 400; a list of tool names (the field's meaning before grants) is 400 too. An agent id that isn't in the subtree is 404.
+- **Confined to the subtree:** the grant reaches only agents of this client, whatever their labels. The client's other agents with matching labels are covered, including ones created later.
+- **The agent sees them** as `grants` in `GET /v1/agents/<id>` (each with its `id`, `scope` and `parent`), and gets `read_transcript` and `list` as tools whatever its template gives. It may pass a narrower one to an agent it spawns (`agent_spawn{grants}`).
+- **They can't be revoked one by one yet:** no route or tool revokes a single grant. One ends only at its `expires_ms`, when its holder ends, when the client is deleted, or, for a grant an agent passed on, when that agent ends. To take one back early, end the agent holding it.
 
 ## Inbox senders
 

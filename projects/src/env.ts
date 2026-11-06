@@ -22,11 +22,6 @@ export interface Env {
   NEST_CLIENT_TOKEN?: string;
   /** Secret: signs nest's webhooks to /hooks/nest. */
   NEST_WEBHOOK_SECRET?: string;
-  /**
-   * "on": dreaming runs are spawned with nest's transcript grant (README.md#routines; nest PR #166).
-   * Off until the nest that takes `grants` at spawn is deployed.
-   */
-  ROUTINE_TRANSCRIPT_GRANT?: string;
   /** Secret: signs the GitHub App's webhooks to /hooks/github. */
   GITHUB_WEBHOOK_SECRET?: string;
 }

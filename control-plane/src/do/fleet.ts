@@ -2448,7 +2448,8 @@ export class FleetDO extends DurableObject<Env> {
     const t = kind === "agent"
       ? { table: "agent_registry", id: "agent", ended: "ended_ms" }
       : { table: "sandboxes", id: "sandbox", ended: "destroyed_ms" };
-    const limit = Math.min(Math.max(q.limit ?? 100, 1), 500);
+    // An integer, whoever calls (it reaches SQL LIMIT): anything else is the default.
+    const limit = Number.isSafeInteger(q.limit) ? Math.min(Math.max(q.limit!, 1), 500) : 100;
     const where: string[] = [];
     const args: (string | number)[] = [];
     const state = q.state ?? "live";

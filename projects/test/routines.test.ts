@@ -76,9 +76,9 @@ describe("the transcript grant (pure)", () => {
     expect((routineSpawnExtras({ ...o, last_start_ms: 0 }).grants as any)[0].limits.max_age_ms).toBe(MAX_DREAM_WINDOW_MS);
   });
 
-  it("nothing for another kind, or while the grant is off", () => {
+  it("nothing for another kind", () => {
     expect(routineSpawnExtras({ ...o, kind: "review" })).toEqual({});
-    expect(routineSpawnExtras({ ...o, enabled: false })).toEqual({});
+    expect(routineSpawnExtras({ ...o, kind: "custom" })).toEqual({});
   });
 });
 
@@ -167,7 +167,7 @@ describe("firing", () => {
     expect(a.template).toBe("projects/routine");
     expect(a.labels).toEqual({ project: s.id, role: "routine", routine: id, run: run.id });
     expect(a.overrides).toEqual({ read_repos: [s.repo] });
-    // No grants while ROUTINE_TRANSCRIPT_GRANT is off (wrangler.jsonc), whatever the kind.
+    // A custom routine reads no transcripts.
     expect(fake.calls.find((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id)!.body.grants).toBeUndefined();
     const brief = fake.inbox.filter((m) => m.agent === run.agent);
     expect(brief).toHaveLength(1);
@@ -432,18 +432,37 @@ describe("memory: the manager and routines write it, workers read it", () => {
   });
 });
 
+describe("the transcript grant at a dreaming run's spawn", () => {
+  it("over its project's agents until its deadline, the same request on a retried create, and named in its brief", async () => {
+    const s = await setup();
+    const r = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
+    // The agent's create lands but its answer is lost: the retry must send the request its key was bound to.
+    fake.lost.push({ match: /^POST \/v1\/agents$/, times: 1 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${r.id}/run`);
+    const first = (await runs(s, r.id))[0];
+    expect(first.state).toBe("starting");
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE id = ?", first.id);
+    });
+    await settle(s);
+    const run = await liveRun(s, r.id);
+    expect(run.state).toBe("running");
+    const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id);
+    expect(creates).toHaveLength(2);
+    expect(creates[1]!.body).toEqual(creates[0]!.body);
+    expect(creates[0]!.body.grants).toEqual([{
+      action: "read_transcript", resource: `agent{project=${s.id}}`, limits: { max_age_ms: FIRST_DREAM_WINDOW_MS, max_entries: DREAM_MAX_ENTRIES }, expires_ms: run.deadline_ms,
+    }]);
+    expect(fake.inbox.find((m) => m.agent === run.agent)!.text).toContain("read_transcript");
+  });
+});
+
 describe("presets", () => {
   it("a preset is created with one call, enabled, and editable after", async () => {
     const s = await setup();
     const r = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
     expect(r).toMatchObject({ name: PRESETS.dreaming.name, kind: "dreaming", preset: "dreaming", enabled: true, triggers: PRESETS.dreaming.triggers });
     expect(r.next_timer_ms).not.toBeNull();
-    // A dreaming run gets no transcript grant while ROUTINE_TRANSCRIPT_GRANT is off (wrangler.jsonc).
-    await api(token, "POST", `/api/projects/${s.id}/routines/${r.id}/run`);
-    const run = await liveRun(s, r.id);
-    const create = fake.calls.find((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id)!;
-    expect(create.body.grants).toBeUndefined();
-    expect(fake.inbox.find((m) => m.agent === run.agent)!.text).not.toContain("read_transcript");
     const u = (await api(token, "PATCH", `/api/projects/${s.id}/routines/${r.id}`, { triggers: { timer: null, tasks_done: 4, prs_merged: null } })).body;
     expect(u).toMatchObject({ triggers: { timer: null, tasks_done: 4 }, next_timer_ms: null });
   });
