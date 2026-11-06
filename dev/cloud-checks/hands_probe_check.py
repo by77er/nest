@@ -150,8 +150,9 @@ def main():
         return result
     finally:
         # The check's own verdict is printed above; a failed cleanup fails the check besides. A second
-        # SIGTERM must not cut the cleanup short.
+        # SIGTERM or a Ctrl-C must not cut the cleanup short.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         # End the agent (not the operator's stop, which its next input lifts): it detaches, and its
         # records go 30 days later. It never started, so nothing is killed.
         if agent and not cleanup_step(f"end {agent}", "POST", f"/v1/agents/{agent}/stop", {"end": True}):
