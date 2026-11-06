@@ -65,7 +65,7 @@ async function nestHook(request: Request, env: Env): Promise<Response> {
     try {
       const a = await nest.getAgent(event.agent);
       const l = a.labels ?? {};
-      const role = l.role === "manager" || l.role === "worker" || l.role === "reviewer" ? l.role : null;
+      const role = l.role === "manager" || l.role === "worker" || l.role === "reviewer" || l.role === "routine" ? l.role : null;
       const ours = a.owner === me && a.client === me && role !== null && typeof l.project === "string" && (await dir.getProject(l.project)) !== null;
       route = ours
         ? { agent: event.agent, project: l.project!, role, task: l.task ?? null, pr: l.pr ? Number(l.pr) : null }

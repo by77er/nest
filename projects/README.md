@@ -2,7 +2,7 @@
 
 A task board for GitHub repos, run by agents on nest: an app with its own Worker and Durable Objects, built only on nest's [API clients](../docs/control-plane/api/clients/) interface. nest knows nothing of projects, tasks or reviews. A feature here that seems to need one of nest's internals means that interface is wrong: fix it there, generically, and build this on the result.
 
-**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), the UI ([below](#the-ui)), attaching a repo and the review pipeline ([below](#built-the-review-pipeline)), and auto-merge ([below](#auto-merge)). **Not built:** setting nest's webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
+**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), the UI ([below](#the-ui)), attaching a repo and the review pipeline ([below](#built-the-review-pipeline)), auto-merge ([below](#auto-merge)), and routines and memory ([below](#routines)). **Not built:** setting nest's webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
 
 ## What it does
 
@@ -18,7 +18,7 @@ A task board for GitHub repos, run by agents on nest: an app with its own Worker
 |---|---|
 | Worker `projects` | The UI (Vite + React), the JSON API behind it, the MCP server agents call (`/mcp/<role>`), and two webhook endpoints: nest's (`/hooks/nest`) and GitHub's (`/hooks/github`) |
 | `DirectoryDO` (one) | Projects, repo → project, agent → project and role, the events and deliveries already handled, the app's catalog sync state, the GitHub App's id |
-| `ProjectDO` (one per project) | The project's settings and its repo's attachment, the board (tasks, specs, assignments, the history of each), the chat with the manager, PR → task |
+| `ProjectDO` (one per project) | The project's settings and its repo's attachment, the board (tasks, specs, assignments, the history of each), the chat with the manager, PR → task, the routines and their runs, the memory notes |
 | `ReviewDO` (one per project) | The review queue: one job per PR head, its reviewer agent, its check run, its verdict. It's an asynchronous process of its own, with its own alarm and an optional concurrency cap (none by default) |
 
 All state is the app's. nest holds the agents, their sandboxes and their transcripts, and labels each agent with `project`, `role` and, for a worker, `task`, or for a reviewer, `pr` and `sha`. The app finds its agents by those labels after losing track of one.
@@ -36,7 +36,7 @@ Only the client interface. One client, `projects`, has this grant:
 
 | Need | Interface |
 |---|---|
-| Templates for the three roles | `PUT /v1/catalog/templates/projects/{manager,worker,reviewer}` and capabilities `projects/{board,task,review}` (the MCP URLs), synced from this directory at deploy |
+| Templates for the four roles | `PUT /v1/catalog/templates/projects/{manager,worker,reviewer,routine}` and capabilities `projects/{board,task,review,routine}` (the MCP URLs), synced from this directory at deploy |
 | Starting an agent | `POST /v1/sandboxes {cell, labels}`, then `POST /v1/agents {template: "projects/<role>", cell, sandbox, labels, overrides}`, each with an `Idempotency-Key`. `overrides` is `{repos: [<repo>]}` for a worker, whose sandbox pushes only to that repo, and `{read_repos: [<repo>]}` for the manager and a reviewer, whose sandboxes only read it ([read-only repos](../docs/sandbox/networking/egress/policy/#read-only-repos)). The agent clones it |
 | Talking to the manager | `POST /v1/agents/<id>/inbox`. Replies arrive as `agent.turn_completed` events |
 | Approvals | `agent.ask` events, shown in "Needs you" with blocked tasks ([below](#blocked)), answered by `POST /v1/agents/<id>/asks/…` |
@@ -51,7 +51,7 @@ Only the client interface. One client, `projects`, has this grant:
 
 ## The MCP server: agents see only their own work
 
-- **One URL per role:** `/mcp/board` for the manager, `/mcp/task` for a worker, `/mcp/review` for a reviewer. nest lists a server's tools over one session shared by every agent on it, so a role's tool list is its URL's. Which data a call may touch is decided per call, from the caller's identity.
+- **One URL per role:** `/mcp/board` for the manager, `/mcp/task` for a worker, `/mcp/review` for a reviewer, `/mcp/routine` for a routine run ([routines](#routines)). nest lists a server's tools over one session shared by every agent on it, so a role's tool list is its URL's. Which data a call may touch is decided per call, from the caller's identity.
 - **Every request** must carry a valid `Nest-Identity`:
   - signed by a key from nest's JWKS;
   - `aud` is that URL, and `iss` is nest;
@@ -62,6 +62,7 @@ Only the client interface. One client, `projects`, has this grant:
   - The manager reads and writes the board of its `project`.
   - A worker reads its `task`, posts progress on it, marks it blocked or clears that, and says when its PR is open. It sees no other task.
   - A reviewer reads its `pr` at its `sha`, and submits one verdict per dimension (correctness, quality, architectural cohesiveness) with a summary.
+  - A routine run acts only while its `run` is live and is this very agent's (its `routine` and `run` labels): it reads the board and recent work, proposes tasks and keeps memory ([routines](#routines)).
 - **`tainted`** is recorded with each write and shown on the board. It gates nothing: a worker and a reviewer read repo content by design.
 
 ## Flows
@@ -261,6 +262,39 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
   - Comments still queued for a task that ends are dropped with it.
 - Each delivery is recorded on the task (`pr_comment`, `revise`).
 - **Open:** route GitHub's events by `repository.id` and the installation id recorded at attach, not by `full_name`, so a renamed namespace that someone registers again can't reach the project (a follow-up).
+
+## Routines
+
+The owner's request (2026-11-06): "schedule periodic background tasks for things like spontaneous reviews and memory consolidation (dreaming)… on a timer or on some other condition, like 'n tasks completed', and have the ability to create tasks."
+
+- **A routine** (`src/routines.ts`, pure; ProjectDO's `routines` and `routine_runs`): a name, a kind (`review`, `dreaming`, `custom`), the owner's prompt, enabled, its triggers, a cooldown, a time and turn budget, and where its proposals go. Nothing of it is in nest: nest sees only the agents it starts.
+- **Triggers,** any of which fires it:
+  - a timer: an interval of 15 minutes to 7 days, or a daily or weekly time in an IANA time zone (DST handled; a time skipped forward lands after the skip). Missed fires aren't caught up;
+  - counters: N tasks reached `done`, or N task PRs merged (a task's own PR only), since its last run. The board keeps two totals (`tasks_done_total`, `prs_merged_total`, moved where a task becomes done and where a task PR merges); a routine keeps the totals at its last run, or at its enabling, so a long pause doesn't fire it at once.
+  - "Run now", the owner's.
+- **Starting** (`startVerdict`), decided in one synchronous step in ProjectDO (its alarm, or the step that moved a counter): a fired trigger makes the routine due (a second trigger while it's due is the same run). A due routine starts a run only if none of its own runs is live (one at a time), past its cooldown from its last start ("Run now" skips the cooldown, not the rest), and while the project's live runs are fewer than `max_routine_runs` (Settings, 1 to 3, default 1). Otherwise it waits, shown as `running`, `cooldown` or `cap`, and a run's end ticks again.
+- **A run** is one agent, started as workers are (`Nest.startAgent`, `Idempotency-Key: <project>/routine/<run>/{sandbox,agent}`), labelled `project`, `role=routine`, `routine`, `run`:
+  - the `projects/routine` template: ephemeral (nest ends it once its turn is done), `read_repos` (it reads the repo, never pushes), no secrets, no egress beyond nest's and the repo's, no timers, no spawning;
+  - its brief: why it runs (the trigger and count), when the last run started, where its proposals go, and the owner's prompt. App-authored and the owner's, so not relayed;
+  - **cost guards:** stopped (`stop {end, destroy_sandbox}`) when its time budget (`max_minutes`, 5 to 120) runs out (`timed_out`), or once its turns reach `max_turns` (1 to 20). A start retried 8 times, or refused for good, fails the run;
+  - **its record:** the trigger, its state and outcome (`done`, `failed`, `timed_out`, `stopped`), its agent (its trace is viewable, as any agent's), its turns, its last turn's text as its report, and what it made (proposals, draft tasks, memory notes written or deleted).
+- **Its tools** (`/mcp/routine`): `list_tasks`, `get_task`, `recent_activity` (task PRs merged, tasks done, reviews and their verdicts, the owner's PR comments relayed, for up to 30 days), `manager_chat`, `propose_task`, and the memory tools. Nothing that assigns, starts or changes a task.
+- **Proposals:** `propose_task` puts a task into the triage queue (`proposals`, `GET /api/projects/:id/proposals`), marked with its routine and run; the owner accepts it (a draft task, recorded tainted: `proposal_accepted`) or declines it. A routine may instead be set to put them on the board as drafts (unassigned; a draft is never auto-assigned). At most 5 per run and 50 waiting.
+- **Taint:** a run has hands, so nest taints its session; the app records every write of a run as tainted whatever the session says (its proposals, its tasks, its notes), since it reads anyone's text (the repo, PRs, comments, reviews).
+- **The API:** `GET`/`POST /api/projects/:id/routines` (a body of every field, or `{preset}`), `GET`/`PATCH`/`DELETE …/routines/:routine` (a routine with a live run isn't deleted), `POST …/routines/:routine/run`, `GET …/routines/:routine/runs`, `GET …/routine-runs`, `POST …/routine-runs/:run/stop`, `POST …/proposals/:proposal/{accept,decline}`.
+- **Transcripts:** dreaming is to read the project's agents' transcripts through nest's own grant (`read_transcript` over agents labelled with the project, in the app's subtree), conferred at the run's spawn: `routineSpawnExtras` is the one place it goes, empty until nest's spawn takes it. The app never proxies a transcript.
+
+### Presets
+
+Enabled with one click (`POST …/routines {preset}`), then edited like any routine (times in UTC until edited):
+- **Spontaneous review:** every 5 task PRs merged, or weekly (Monday 09:00); 6 h cooldown, 30 min. Reviews what merged to the default branch since its last run for bugs, risks and smells, and proposes tasks.
+- **Dreaming:** nightly (03:00), or every 10 tasks done; 12 h cooldown, 20 min. Consolidates memory: merges duplicates, rewrites stale notes, prunes, and folds in lessons from recent tasks, reviews, PR comments and the manager chat; may propose tasks.
+
+## Memory
+
+- **Notes** (`src/memory.ts`; ProjectDO's `memory`): a key (lowercase words joined by `-`, `.` or `_`), text (at most 2,000 characters), when it was last written, its source (`manager`, or `routine:<name> (<run>)`) and that write's taint. At most 100 per project: a write past that is refused until notes are merged or deleted.
+- **Who:** the manager reads and writes it (`memory_list`, `memory_get`, `memory_write`, `memory_delete` on `/mcp/board`; its prompt says to read it at the start and before it specs); a worker reads it (`memory_list`, `memory_get`); routine runs read and write it; a reviewer gets none. The owner reads it and deletes notes (`GET /api/projects/:id/memory`, `DELETE …/memory/:key`).
+- **Why the app's own store:** nest's `memory` capability is per agent and not built (its tools answer `not_implemented`), and nest has no channel primitive yet. A project's memory is shared by its agents and outlives each one, so it's the project's state, like the board. If nest gains a shared keyed store an app can grant its agents, this moves there.
 
 ## Dependencies
 
