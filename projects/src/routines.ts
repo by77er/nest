@@ -140,8 +140,8 @@ const REVIEW_PROMPT = [
 const DREAMING_PROMPT = [
   "Consolidate the project's memory: the notes the manager and the routines keep about this project (memory_list, memory_get).",
   "1. Merge notes that say the same thing into one; delete the duplicates.",
-  "2. Rewrite notes that are stale or wrong against the repo and the board as they are now; delete ones that no longer apply.",
-  "3. Fold in lessons from recent work: recent_activity (tasks done, merged PRs, reviews and their verdicts, the owner's PR comments) and manager_chat (what the owner asked for and corrected). Keep what will help the manager and workers next time: the owner's preferences, the repo's conventions, traps, decisions and why.",
+  "2. Rewrite notes that are stale or wrong against the board and recent work as they are now; delete ones that no longer apply. A note an untainted session wrote can't be changed or deleted by you: write a new note beside it instead, and say why in your report.",
+  "3. Fold in lessons from recent work: recent_activity (tasks done, merged PRs, reviews and their verdicts, the owner's PR comments), manager_chat (what the owner asked for and corrected), and the project's agents' transcripts if your brief says you may read them. Keep what will help the manager and workers next time: the owner's preferences, the repo's conventions, traps, decisions and why.",
   "Keep each note short and specific, keyed by topic (like conventions-testing or owner-prefers-small-prs). Prefer fewer, better notes; stay well under the limit.",
   "If something you find needs work done, propose it with propose_task (at most 5).",
   "End with a short report of what you merged, rewrote, deleted and added.",
@@ -197,6 +197,10 @@ export const ROUTINE_PROMPT = [
   "The project's memory is a small set of notes the manager and workers read: memory_list, memory_get, memory_write and memory_delete. Keep notes short, specific and true.",
   "When you're done, end your turn with a short report of what you did and found: that ends the run. You have a time and turn budget; work efficiently.",
 ].join("\n");
+
+/** The dreaming template's system prompt: a routine with no sandbox (src/catalog.ts). */
+export const DREAMING_ROLE_PROMPT = ROUTINE_PROMPT
+  .replace("Your sandbox can read the project's GitHub repo but not push to it (nest refuses your writes). Clone it to read code and history.", "You have no sandbox and no repo: you work from the board, recent work, the project's memory and, when your brief says so, its agents' transcripts.");
 
 const TRIGGER_TEXT: Record<TriggerKind, (n: number | null) => string> = {
   timer: () => "its timer fired",
