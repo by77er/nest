@@ -391,7 +391,7 @@ export const MIGRATIONS = [
     `CREATE TABLE routine_runs (id TEXT PRIMARY KEY, routine TEXT NOT NULL, n INTEGER NOT NULL, trigger TEXT NOT NULL, count INTEGER, state TEXT NOT NULL,
       outcome TEXT, agent TEXT, next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, note TEXT, deadline_ms INTEGER,
       turns INTEGER NOT NULL DEFAULT 0, max_turns INTEGER NOT NULL, summary TEXT, created TEXT NOT NULL, queued_ms INTEGER NOT NULL,
-      started_ms INTEGER, ended_ms INTEGER)`,
+      started_ms INTEGER, ended_ms INTEGER, spawn TEXT)`,
     "CREATE INDEX routine_runs_routine ON routine_runs (routine, queued_ms)",
     "CREATE INDEX routine_runs_agent ON routine_runs (agent)",
     "CREATE TABLE memory (key TEXT PRIMARY KEY, text TEXT NOT NULL, source TEXT NOT NULL, tainted INTEGER NOT NULL, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL)",
@@ -2267,11 +2267,24 @@ export class ProjectDO extends DurableObject<Env> {
     }
     const labels = { project: s.id, role: "routine", routine: routine.id as string, run: id };
     const current = () => this.runRow(id)?.state === "starting";
+    // Its deadline and its spawn's extra fields (a dreaming run's transcript grant, which expires at that
+    // deadline), decided at its first attempt and kept: a retried create sends the request its key was bound to.
+    if (before.spawn === null) {
+      const now = Date.now();
+      const deadline = now + (routine.max_minutes as number) * 60_000;
+      const extras = routineSpawnExtras({
+        kind: routine.kind as RoutineKind, project: s.id, deadline_ms: deadline, last_start_ms: (routine.prev_start_ms as number | null) ?? null, now,
+        enabled: this.env.ROUTINE_TRANSCRIPT_GRANT === "on",
+      });
+      this.sql.exec("UPDATE routine_runs SET spawn = ?, deadline_ms = ? WHERE id = ? AND spawn IS NULL", JSON.stringify(extras), deadline, id);
+    }
+    const frozen = this.runRow(id)!;
+    const spawn = JSON.parse(frozen.spawn as string) as Record<string, unknown>;
     try {
       let agent = (before.agent as string | null) ?? null;
       if (!agent) {
         // No secrets and no egress beyond nest's own and the repo's: a routine reads the repo and the board.
-        agent = await nest.startAgent(TEMPLATE.routine, labels, { read: s.repo }, `${s.id}/routine/${id}`, {}, routineSpawnExtras(routine.kind as RoutineKind, s.id));
+        agent = await nest.startAgent(TEMPLATE.routine, labels, { read: s.repo }, `${s.id}/routine/${id}`, {}, spawn);
         await directory(this.env).recordAgent({ agent, project: s.id, role: "routine", task: null, pr: null });
         this.sql.exec("UPDATE routine_runs SET agent = ? WHERE id = ? AND agent IS NULL", agent, id);
         if (!current()) {
@@ -2284,12 +2297,12 @@ export class ProjectDO extends DurableObject<Env> {
         routine: { id: routine.id as string, name: routine.name as string, kind: routine.kind as RoutineKind, prompt: routine.prompt as string, max_minutes: routine.max_minutes as number, proposals: routine.proposals as "triage" | "draft" },
         run: { id, trigger: before.trigger as TriggerKind, count: (before.count as number | null) ?? null },
         last_start_ms: (routine.prev_start_ms as number | null) ?? null,
+        transcripts: Array.isArray(spawn.grants) && spawn.grants.length > 0,
       });
       await nest.postInbox(agent, brief, { requestId: `${id}/brief` });
       if (!current()) return;
-      const now = Date.now();
-      this.sql.exec("UPDATE routine_runs SET state = 'running', started_ms = ?, deadline_ms = ?, next_ms = NULL, error = NULL WHERE id = ?",
-        now, now + (routine.max_minutes as number) * 60_000, id);
+      // Its time budget counts from its first attempt (the deadline its grant expires at).
+      this.sql.exec("UPDATE routine_runs SET state = 'running', started_ms = ?, next_ms = NULL, error = NULL WHERE id = ?", Date.now(), id);
     } catch (e) {
       if (!current()) return;
       const attempts = (this.runRow(id)!.attempts as number) + 1;

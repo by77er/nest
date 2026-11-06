@@ -6,7 +6,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
-import { firedTrigger, MAX_PROPOSALS_PER_RUN, nextTimerFire, PRESETS, startVerdict, type Triggers, wallToUtc } from "../src/routines";
+import { DREAM_MAX_ENTRIES, FIRST_DREAM_WINDOW_MS, firedTrigger, MAX_DREAM_WINDOW_MS, MAX_PROPOSALS_PER_RUN, nextTimerFire, PRESETS, routineSpawnExtras, startVerdict, type Triggers, wallToUtc } from "../src/routines";
 import { AccessTeam, agentClaims, api, callTool, deliver, deliverGithub, FakeNest, installFetch, prEvent, shaOf, Signer } from "./fake-nest";
 
 const MIN = 60_000;
@@ -62,6 +62,23 @@ describe("deciding a run (pure)", () => {
     expect(startVerdict({ ...base, now: 1_000 + 10 * MIN - 1, manual: true })).toEqual({ start: true });
     expect(startVerdict({ ...base, live_total: 1 })).toEqual({ start: false, why: "cap", until: null });
     expect(startVerdict({ ...base, live_total: 1, cap: 2 })).toEqual({ start: true });
+  });
+});
+
+describe("the transcript grant (pure)", () => {
+  const o = { kind: "dreaming" as const, project: "prj_x", deadline_ms: 5_000_000_000, last_start_ms: 4_000_000_000, now: 4_100_000_000, enabled: true };
+  it("a dreaming run reads its project's agents since its last run, until its deadline", () => {
+    expect(routineSpawnExtras(o)).toEqual({
+      grants: [{ action: "read_transcript", resource: "agent{project=prj_x}", limits: { max_age_ms: 100_000_000, max_entries: DREAM_MAX_ENTRIES }, expires_ms: 5_000_000_000 }],
+    });
+    // The first run reads a week; a long gap at most 30 days.
+    expect((routineSpawnExtras({ ...o, last_start_ms: null }).grants as any)[0].limits.max_age_ms).toBe(FIRST_DREAM_WINDOW_MS);
+    expect((routineSpawnExtras({ ...o, last_start_ms: 0 }).grants as any)[0].limits.max_age_ms).toBe(MAX_DREAM_WINDOW_MS);
+  });
+
+  it("nothing for another kind, or while the grant is off", () => {
+    expect(routineSpawnExtras({ ...o, kind: "review" })).toEqual({});
+    expect(routineSpawnExtras({ ...o, enabled: false })).toEqual({});
   });
 });
 
@@ -150,6 +167,8 @@ describe("firing", () => {
     expect(a.template).toBe("projects/routine");
     expect(a.labels).toEqual({ project: s.id, role: "routine", routine: id, run: run.id });
     expect(a.overrides).toEqual({ read_repos: [s.repo] });
+    // No grants while ROUTINE_TRANSCRIPT_GRANT is off (wrangler.jsonc), whatever the kind.
+    expect(fake.calls.find((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id)!.body.grants).toBeUndefined();
     const brief = fake.inbox.filter((m) => m.agent === run.agent);
     expect(brief).toHaveLength(1);
     expect(brief[0]!.text).toContain("Check the docs.");
@@ -419,6 +438,12 @@ describe("presets", () => {
     const r = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
     expect(r).toMatchObject({ name: PRESETS.dreaming.name, kind: "dreaming", preset: "dreaming", enabled: true, triggers: PRESETS.dreaming.triggers });
     expect(r.next_timer_ms).not.toBeNull();
+    // A dreaming run gets no transcript grant while ROUTINE_TRANSCRIPT_GRANT is off (wrangler.jsonc).
+    await api(token, "POST", `/api/projects/${s.id}/routines/${r.id}/run`);
+    const run = await liveRun(s, r.id);
+    const create = fake.calls.find((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id)!;
+    expect(create.body.grants).toBeUndefined();
+    expect(fake.inbox.find((m) => m.agent === run.agent)!.text).not.toContain("read_transcript");
     const u = (await api(token, "PATCH", `/api/projects/${s.id}/routines/${r.id}`, { triggers: { timer: null, tasks_done: 4, prs_merged: null } })).body;
     expect(u).toMatchObject({ triggers: { timer: null, tasks_done: 4 }, next_timer_ms: null });
   });
