@@ -409,14 +409,11 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const stream = running || streamSteps.length > 0;
   // A tool running shows itself; otherwise the turn is between steps (thinking, writing): a working line.
   const toolRunning = streamSteps.some((st) => st.kind === "tool" && st.status === "running");
+  // A starter fills the composer and focuses it at once (setting the value puts the caret at its end),
+  // so typing straight after the click continues it.
   const fillStarter = (st: string) => {
     setText(st);
-    setTimeout(() => {
-      const c = composer.current;
-      if (!c) return;
-      c.focus();
-      c.setSelectionRange(st.length, st.length);
-    }, 0);
+    composer.current?.focus();
   };
 
   return (
