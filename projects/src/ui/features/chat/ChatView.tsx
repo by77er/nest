@@ -99,12 +99,26 @@ function Steps({ steps, projectId, quiet = false }: { steps: Step[]; projectId: 
   );
 }
 
-/** A reply's steps, closed until asked for: "Used 3 tools". */
-function ReplySteps({ steps, projectId }: { steps: Step[]; projectId: string }) {
+/** A running turn shows its last `LIVE_SHOWN` steps; the earlier ones fold away above them. */
+const LIVE_SHOWN = 4;
+
+function LiveSteps({ steps, projectId }: { steps: Step[]; projectId: string }) {
+  if (steps.length <= LIVE_SHOWN) return <Steps steps={steps} projectId={projectId} />;
+  const earlier = steps.slice(0, -LIVE_SHOWN);
+  return (
+    <Stack gap="xs">
+      <ReplySteps steps={earlier} projectId={projectId} label={`+${earlier.length} earlier ${earlier.length === 1 ? "step" : "steps"}`} />
+      <Steps steps={steps.slice(-LIVE_SHOWN)} projectId={projectId} />
+    </Stack>
+  );
+}
+
+/** Steps closed until asked for: a reply's ("Used 3 tools"), or a running turn's earlier ones ("+4 earlier steps"). */
+function ReplySteps({ steps, projectId, label }: { steps: Step[]; projectId: string; label?: string }) {
   const [open, toggle] = useOpen();
   const n = steps.filter((s) => s.kind === "tool").length;
   return (
-    <StepsDisclosure label={`Used ${n} ${n === 1 ? "tool" : "tools"}`} open={open} onToggle={toggle}>
+    <StepsDisclosure label={label ?? `Used ${n} ${n === 1 ? "tool" : "tools"}`} open={open} onToggle={toggle}>
       <Steps steps={steps} projectId={projectId} quiet />
     </StepsDisclosure>
   );
@@ -246,6 +260,8 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const composer = useRef<HTMLTextAreaElement>(null);
   const seen = useRef<Set<number> | null>(null);
   const anchor = useRef<number | null>(null);
+  // Nothing said yet and no turn running: nothing to follow (its welcome is read from the top).
+  const emptyRef = useRef(true);
   // The last stream, kept until the turn's message lands, so the swap doesn't jump.
   const [held, setHeld] = useState<{ turn: string; steps: Step[]; sinceSeq: number } | null>(null);
 
@@ -303,7 +319,8 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     const fresh = messages.filter((m) => m.seq > 0 && known && !known.has(m.seq));
     seen.current = new Set(messages.filter((m) => m.seq > 0).map((m) => m.seq));
     if (!known) {
-      scrollToBottom();
+      // An empty chat opens at its top (on a phone, the page's column with its header).
+      if (messages.length) scrollToBottom();
       return;
     }
     const lastManager = fresh.filter((m) => m.sender === "manager").at(-1);
@@ -313,7 +330,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   }, [messages]); // follows the log, reading the scroll state as it is now
 
   useLayoutEffect(() => {
-    if (atBottomRef.current) scrollToBottom();
+    if (atBottomRef.current && !emptyRef.current) scrollToBottom();
   }, [held?.steps, live?.turn]); // the stream growing, while at the bottom
 
   // Content that grows after it renders (math, an image or figure decoding) keeps the end in view while
@@ -322,7 +339,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     const content = log.current?.firstElementChild;
     if (!content) return;
     const ro = new ResizeObserver(() => {
-      if (atBottomRef.current && anchor.current === null) {
+      if (atBottomRef.current && anchor.current === null && !emptyRef.current) {
         const el = log.current;
         if (el) el.scrollTop = el.scrollHeight;
       }
@@ -408,6 +425,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const replySteps = stepsBySeq(messages, finished);
   const stream = running || streamSteps.length > 0;
   // A tool running shows itself; otherwise the turn is between steps (thinking, writing): a working line.
+  emptyRef.current = messages.length === 0 && !stream;
   const toolRunning = streamSteps.some((st) => st.kind === "tool" && st.status === "running");
   // A starter fills the composer and focuses it at once (setting the value puts the caret at its end),
   // so typing straight after the click continues it.
@@ -420,7 +438,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     <OpenedContext.Provider value={stopFollowing}>
       <Stack gap="md">
         <ChatFrame>
-          <ChatLog ref={log} onScroll={onScroll} label="Conversation with the manager" following={atBottom}>
+          <ChatLog ref={log} onScroll={onScroll} label="Conversation with the manager" following={atBottom && !emptyRef.current}>
             {loadingOlder && <LoadingState label="Loading older messages" />}
             {chat.isPending ? (
               <LoadingState label="Loading the chat" />
@@ -465,7 +483,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
               <MessageGroup side="manager" name="Manager" avatar={MANAGER_MARK}>
                 <MessageRow side="manager" quiet data-sender="stream">
                   <Stack gap="sm">
-                    {streamSteps.length > 0 && <Steps steps={streamSteps} projectId={projectId} />}
+                    {streamSteps.length > 0 && <LiveSteps steps={streamSteps} projectId={projectId} />}
                     {running && !toolRunning && <WorkingLine>Working…</WorkingLine>}
                   </Stack>
                 </MessageRow>

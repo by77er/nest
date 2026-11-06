@@ -23,7 +23,8 @@ export const PLAN_REPLY = 'Done: "Add search by tag" is specced and assigned. I 
 
 const lines = (n, f) => Array.from({ length: n }, (_, i) => f(i + 1)).join("\n");
 
-export function trace(now = Date.now()) {
+/** `busy`: the live turn has called a dozen tools (the chat folds its earlier steps). */
+export function trace(now = Date.now(), { busy = false } = {}) {
   const t0 = now - 3_600_000;
   let entry = 0;
   const h = (type, more = {}) => ({ ts_ms: t0 + entry * 20_000, entry: entry++, type, ...more });
@@ -89,6 +90,19 @@ export function trace(now = Date.now()) {
     ev("assistant_text", { text: MARKDOWN }),
     ev("tool_call", { call_id: "toolu_3", name: "Bash", input: input({ command: "npm run build" }) }),
   ];
+  if (busy) {
+    // The build answered, then a run of reads, searches and edits, the last still running.
+    ring.push(ev("tool_result", { call_id: "toolu_3", is_error: false, summary: "built in 4.2 s" }));
+    const files = ["src/search/tags.ts", "src/search/parse.ts", "src/routes/gadgets.ts", "test/search.test.ts", "test/tags.test.ts", "src/search/index.ts"];
+    files.forEach((f, i) => {
+      ring.push(ev("tool_call", { call_id: `toolu_b${i}r`, name: "Read", input: input({ file_path: f }) }));
+      ring.push(ev("tool_result", { call_id: `toolu_b${i}r`, is_error: false, summary: `${40 + i * 7} lines` }));
+      ring.push(ev("tool_call", { call_id: `toolu_b${i}g`, name: "Grep", input: input({ pattern: `tag${i}`, path: f }) }));
+      ring.push(ev("tool_result", { call_id: `toolu_b${i}g`, is_error: false, summary: `${i} matches` }));
+    });
+    ring.push(ev("assistant_text", { text: "Found every caller. Updating the parser now." }));
+    ring.push(ev("tool_call", { call_id: "toolu_b9e", name: "Edit", input: input({ file_path: "src/search/parse.ts", old_string: "split(',')", new_string: "split(/\\s*,\\s*/)" }) }));
+  }
   const messages = [{ type: "history", before: "c2" }, ...ring, { type: "live" }];
   return { messages, pages };
 }

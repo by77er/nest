@@ -89,11 +89,36 @@ describe("Markdown", () => {
     // A language it doesn't know, or none, stays plain text: nothing guessed.
     expect(unknown!.querySelector("code")).not.toHaveAttribute("data-highlighted");
     expect(unknown!.querySelector("[class^=hljs]")).toBeNull();
-    expect(bare!.querySelector("code")!.innerHTML).toBe("plain &lt;b&gt;\n");
+    expect(bare!.querySelector("code")!.innerHTML).toBe('<span data-line="">plain &lt;b&gt;\n</span>');
     // Copy takes the code's text, not its token spans.
     await user.click(within(ts!).getByRole("button", { name: "Copy" }));
     expect(await navigator.clipboard.readText()).toBe('const x = "a"; // why');
     expect(await within(ts!).findByRole("button", { name: "Copied" })).toBeInTheDocument();
+  });
+
+  it("shows a long fence's first 20 lines, then all of it on asking; Copy copies all of it either way", async () => {
+    const user = userEvent.setup();
+    // A comment spanning lines 1-3: cut into a token per line, each still a comment.
+    const lines = ["/* one", "   two", "   three */", ...Array.from({ length: 27 }, (_, i) => `const v${i + 4} = ${i + 4};`)];
+    const { root } = await show("```ts\n" + lines.join("\n") + "\n```");
+    const block = root.querySelector<HTMLElement>("[data-ds=code-block]")!;
+    const shown = () => [...block.querySelectorAll("code [data-line]")].map((l) => l.textContent!.replace(/\n$/, ""));
+    expect(shown()).toEqual(lines.slice(0, 20));
+    expect([...block.querySelectorAll("code [data-line]")].slice(0, 3).map((l) => l.querySelector(".hljs-comment")?.textContent)).toEqual(["/* one", "   two", "   three */"]);
+    await user.click(within(block).getByRole("button", { name: "Copy" }));
+    expect(await navigator.clipboard.readText()).toBe(lines.join("\n"));
+    const more = within(block).getByRole("button", { name: "Show all 30 lines" });
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    await user.click(more);
+    expect(shown()).toEqual(lines);
+    await user.click(within(block).getByRole("button", { name: "Show fewer lines" }));
+    expect(shown()).toHaveLength(20);
+  });
+
+  it("shows a fence of 25 lines whole, with no Show all", async () => {
+    const { root } = await show("```\n" + Array.from({ length: 25 }, (_, i) => `line ${i}`).join("\n") + "\n```");
+    expect(root.querySelectorAll("code [data-line]")).toHaveLength(25);
+    expect(within(root).queryByRole("button", { name: /Show all/ })).toBeNull();
   });
 
   it("leaves a fence longer than the cap plain, and highlights console sessions as sessions, scripts as scripts", async () => {

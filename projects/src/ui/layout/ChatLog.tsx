@@ -292,13 +292,20 @@ export function Starter({ children, onClick, leftSection }: { children: ReactNod
 export function ComposerDock({ children, pill }: { children: ReactNode; pill?: ReactNode }) {
   return (
     <div className={classes.dock} data-ds="composer-dock">
-      {pill && <JumpPill>{pill}</JumpPill>}
+      {pill && (
+        <>
+          {/* The log fades out under the pill, so it never sits on a line cut in half. */}
+          <div className={classes.fade} aria-hidden />
+          <JumpPill>{pill}</JumpPill>
+        </>
+      )}
       {children}
     </div>
   );
 }
 
-export function CodeFrame({ lang, copy, children }: { lang: string; copy: ReactNode; children: ReactNode }) {
+/** A code block's frame: its language and Copy above the code, and a footer (Show all N lines) under it. */
+export function CodeFrame({ lang, copy, footer, children }: { lang: string; copy: ReactNode; footer?: ReactNode; children: ReactNode }) {
   return (
     <div className={classes.code} data-ds="code-block">
       <div className={classes.codeHead}>
@@ -306,6 +313,7 @@ export function CodeFrame({ lang, copy, children }: { lang: string; copy: ReactN
         {copy}
       </div>
       {children}
+      {footer && <div className={classes.codeFoot}>{footer}</div>}
     </div>
   );
 }

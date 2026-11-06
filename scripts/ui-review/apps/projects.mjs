@@ -500,6 +500,13 @@ async function chatFitsNarrow(p) {
   return out;
 }
 /** A two-line draft (Shift+Enter between), still in the composer, unsent; and the chat still fits. */
+/** Focus inside a message (its steps' button) shows its meta row (time, actions), as hover does. */
+async function metaOnFocus(p) {
+  const row = p.locator("[data-sender=manager]", { has: p.getByRole("button", { name: "Used 4 tools" }) });
+  const opacity = await row.locator("[data-slot=meta]").evaluate((e) => getComputedStyle(e).opacity);
+  return opacity === "1" ? [] : [`focus inside a message leaves its time and actions hidden (opacity ${opacity})`];
+}
+
 async function draftKept(p) {
   const problems = await chatFits(p);
   const value = await p.locator("[data-ds=composer-dock] textarea").inputValue();
@@ -719,6 +726,13 @@ const app = {
     // A reply's steps behind "Used 4 tools", opened, with one call's input and result; a call of the
     // running turn opened in place.
     { name: "chat-steps", section: "project", path: "/projects/prj_demo/manager", full: false, ready: shown("[data-ds=steps-disclosure]"), after: async (p) => { await p.getByRole("button", { name: "Used 4 tools" }).click(); await p.getByRole("button", { name: /^write_spec tsk_demo7/ }).click(); await p.waitForTimeout(400); } },
+    // A heavy reply: a 60-line code block showing its first 20 (then all of it), a table wider than the measure.
+    { name: "chat-heavy", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-heavy", full: false, ready: shown("[data-ds=code-block]") },
+    { name: "chat-heavy-all", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-heavy", full: false, ready: shown("[data-ds=code-block]"), after: async (p) => { await p.getByRole("button", { name: "Show all 60 lines" }).click(); await p.waitForTimeout(300); } },
+    // A running turn a dozen calls in: its last steps, the earlier ones folded above them.
+    { name: "chat-busy", section: "project", path: "/projects/prj_demo/manager", fixture: "turn-busy", full: false, ready: shown("[data-sender=stream] [data-ds=steps-disclosure]") },
+    // The keyboard reaches a message's time and actions: focus inside it reveals them, as hover does.
+    { name: "chat-keyboard", section: "project", path: "/projects/prj_demo/manager", full: false, widths: DESKTOP, ready: shown("[data-ds=steps-disclosure]"), after: async (p) => { await p.getByRole("button", { name: "Used 4 tools" }).focus(); await p.waitForTimeout(300); }, check: metaOnFocus, checkName: "chat-fit" },
     { name: "chat-tool-open", section: "project", path: "/projects/prj_demo/manager", full: false, ready: shown("[data-sender=stream] [data-ds=step]"), after: async (p) => { await p.getByRole("button", { name: /^Bash git push origin search-by-tag, failed/ }).click(); await p.waitForTimeout(400); } },
     { name: "chat-draft", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, after: async (p) => { await p.getByRole("button", { name: /^Spec a task for/ }).click(); await p.keyboard.type("exporting gadgets as CSV,"); await p.keyboard.press("Shift+Enter"); await p.keyboard.type("with prices and tags."); }, check: draftKept, checkName: "chat-fit" },
     { name: "chat-jump", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-arriving", full: false, after: async (p) => { await scrollChat(p, "third"); await p.getByRole("button", { name: /Jump to latest/ }).waitFor({ timeout: 10_000 }); } },

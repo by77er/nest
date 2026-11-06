@@ -146,6 +146,18 @@
   }
 }
 
+/* Under the jump pill, the log's last lines fade into the page's ground. */
+.fade {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  height: calc(var(--nest-hit) + var(--mantine-spacing-lg));
+  background: linear-gradient(to bottom, transparent, var(--nest-page-bg) 75%);
+  pointer-events: none;
+  z-index: 1;
+}
+
 .jump {
   position: absolute;
   left: 50%;
@@ -469,4 +481,9 @@
 
 .code pre {
   background: transparent;
+}
+
+/* Under a long code block's first lines: "Show all N lines", on the block's left edge. */
+.codeFoot {
+  padding: 0 var(--mantine-spacing-sm) var(--mantine-spacing-xs);
 }

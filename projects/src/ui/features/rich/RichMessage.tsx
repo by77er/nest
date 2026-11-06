@@ -5,8 +5,8 @@
 // literal text first, and no rehype-raw is in the pipeline.
 
 import { Anchor, Button, CopyButton } from "@mantine/core";
-import { IconCheck, IconCopy, IconPhoto } from "@tabler/icons-react";
-import { isValidElement, memo, type ReactNode } from "react";
+import { IconCheck, IconChevronDown, IconChevronUp, IconCopy, IconPhoto } from "@tabler/icons-react";
+import { Children, cloneElement, isValidElement, memo, type ReactElement, type ReactNode, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
@@ -42,6 +42,46 @@ function textOf(node: ReactNode): string {
   return "";
 }
 
+/** A fence longer than this many lines shows its first `CODE_SHOWN` until asked for the rest. */
+export const CODE_MAX_LINES = 25;
+export const CODE_SHOWN = 20;
+
+/**
+ * A code block: its language and Copy (all of it) above; past `CODE_MAX_LINES`, its first lines and
+ * "Show all N lines" under them, opening in place. Its lines are the rehype step's `span[data-line]`s.
+ */
+function CodeBlock({ children }: { children?: ReactNode }) {
+  const [all, setAll] = useState(false);
+  const code = isValidElement(children) ? (children as ReactElement<{ className?: string; children?: ReactNode }>) : null;
+  const lang = /language-([\w+-]+)/.exec(code?.props.className ?? "")?.[1] ?? "";
+  const source = textOf(code?.props.children).replace(/\n$/, "");
+  const lines = Children.toArray(code?.props.children);
+  const long = !!code && lines.length > CODE_MAX_LINES;
+  return (
+    <CodeFrame
+      lang={lang}
+      copy={
+        <CopyButton value={source}>
+          {({ copied, copy }) => (
+            <Button size="compact-xs" variant="subtle" color="gray" onClick={copy} leftSection={copied ? <IconCheck size={icon.sm} /> : <IconCopy size={icon.sm} />}>
+              {copied ? "Copied" : "Copy"}
+            </Button>
+          )}
+        </CopyButton>
+      }
+      footer={
+        long && (
+          <Button size="compact-sm" variant="subtle" color="gray" onClick={() => setAll(!all)} leftSection={all ? <IconChevronUp size={icon.sm} /> : <IconChevronDown size={icon.sm} />} aria-expanded={all}>
+            {all ? "Show fewer lines" : `Show all ${lines.length} lines`}
+          </Button>
+        )
+      }
+    >
+      <pre data-lines={lines.length}>{long && !all ? cloneElement(code!, {}, lines.slice(0, CODE_SHOWN)) : children}</pre>
+    </CodeFrame>
+  );
+}
+
 function components(projectId: string): Components {
   return {
     a: ({ href, children }) => {
@@ -68,27 +108,7 @@ function components(projectId: string): Components {
       return <span>{alt}</span>;
     },
     // A code block: its language and a copy button above it (math and SVG never reach here).
-    pre: ({ children }) => {
-      const code = isValidElement(children) ? (children.props as { className?: string; children?: ReactNode }) : null;
-      const lang = /language-([\w+-]+)/.exec(code?.className ?? "")?.[1] ?? "";
-      const source = textOf(code?.children).replace(/\n$/, "");
-      return (
-        <CodeFrame
-          lang={lang}
-          copy={
-            <CopyButton value={source}>
-              {({ copied, copy }) => (
-                <Button size="compact-xs" variant="subtle" color="gray" onClick={copy} leftSection={copied ? <IconCheck size={icon.sm} /> : <IconCopy size={icon.sm} />}>
-                  {copied ? "Copied" : "Copy"}
-                </Button>
-              )}
-            </CopyButton>
-          }
-        >
-          <pre>{children}</pre>
-        </CodeFrame>
-      );
-    },
+    pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
     table: ({ children }) => (
       <RichTableFrame>
         <table>{children}</table>

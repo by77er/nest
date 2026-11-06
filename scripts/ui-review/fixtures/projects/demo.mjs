@@ -6,7 +6,8 @@
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-long" (thirty messages), "chat-paged"
 // (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents),
-// "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
+// "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
+// a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
@@ -144,7 +145,14 @@ export function data(variant = "demo", now = Date.now()) {
     '</svg>',
     '```',
   ].join("\n");
-  const RICH = [
+  /** A heavy reply: a long code block (capped at its first lines) and a table wider than the measure. */
+const HEAVY = [
+  "Here's the parser as it stands, and the suites before and after.",
+  "```ts\n" + Array.from({ length: 60 }, (_, i) => (i === 0 ? "export function parseTags(query: string): string[] {" : i === 59 ? "}" : `  const part${i} = query.split(",")[${i}]?.trim() ?? ""; // field ${i}`)).join("\n") + "\n```",
+  "| suite | files | tests | before | after | slowest | flaky | owner | since | notes |\n|---|---|---|---|---|---|---|---|---|---|\n| search | 4 | 38 | 12 failing | 0 failing | 1.8 s | 0 | agt_w8x2m4 | Monday | whole-word matching |\n| tags | 2 | 9 | none | 9 passing | 0.4 s | 0 | agt_w8x2m4 | today | new |\n| gadgets-api-integration | 11 | 140 | 3 failing | 0 failing | 12.6 s | 1 | agt_w3f9q1 | last week | one flaky upload test |",
+].join("\n\n");
+
+const RICH = [
     "## Search plan",
     "I split the search work into three tasks. task:tsk_demo7 is in review; [the flaky test](task:tsk_demo5) blocks the next release, and task:tsk_demo99 isn't on this board.",
     "### Where things stand",
@@ -189,6 +197,7 @@ export function data(variant = "demo", now = Date.now()) {
       return Date.now() - born > 3_000 ? [...base, { seq: 31, at_ms: now, sender: "manager", text: "New: task:tsk_demo7 passed review.", delivered: true, error: null }] : base;
     }
     if (variant === "chat-long") return chatLong();
+    if (variant === "chat-heavy") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: HEAVY, delivered: true, error: null }];
     return chat;
   };
   const detail = (id) => byId[id] && { ...byId[id], history: history[id] ?? [{ at_ms: now - 7_200_000, actor: "owner", action: "created", detail: JSON.stringify({ title: byId[id].title }), tainted: false }] };
@@ -215,7 +224,7 @@ export function data(variant = "demo", now = Date.now()) {
     job(114, "Write the 0.5 changelog", "superseded"),
   ];
   // Every trace (the manager's, a worker's, a reviewer's): history offered and paged, then the live ring (trace.mjs).
-  const { messages: allMessages, pages: historyPages } = trace(now);
+  const { messages: allMessages, pages: historyPages } = trace(now, { busy: variant === "turn-busy" });
   // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
   // "chat-empty" is a new conversation: no turn running either (its starters show).
   const traceMessages = variant === "connecting" || variant === "chat-empty" ? [] : allMessages;

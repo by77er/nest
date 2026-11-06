@@ -5,6 +5,10 @@
 // in any other language, or with none, stays plain text, as does one over `HIGHLIGHT_MAX` (the grammars
 // run on the main thread over untrusted text). Nothing is guessed. The tokens are hast nodes, so React
 // renders them like any other element (no innerHTML).
+//
+// Every fence, highlighted or not, is then split into lines (`span[data-line]`, each ending in its
+// newline, a token spanning lines cut into one per line), so a long one can show its first lines and
+// the rest on asking.
 
 import type { Element, ElementContent, Root, RootContent } from "hast";
 import bash from "highlight.js/lib/languages/bash";
@@ -40,17 +44,43 @@ const languageOf = (code: Element): string | null => {
 
 const textOf = (n: ElementContent): string => (n.type === "text" ? n.value : n.type === "element" ? n.children.map(textOf).join("") : "");
 
+/** `nodes` as lines: text split at its newlines, an element cut into a copy per line it spans. */
+function linesOf(nodes: ElementContent[]): ElementContent[][] {
+  const out: ElementContent[][] = [[]];
+  for (const n of nodes) {
+    const parts: ElementContent[][] =
+      n.type === "text" ? n.value.split("\n").map((v) => (v ? [{ type: "text", value: v }] : [])) : n.type === "element" ? linesOf(n.children).map((l) => (l.length ? [{ ...n, children: l }] : [])) : [[n]];
+    parts.forEach((p, i) => {
+      if (i > 0) out.push([]);
+      out[out.length - 1]!.push(...p);
+    });
+  }
+  return out;
+}
+
+/** A fence's content as one `span[data-line]` per line, each ending in its newline (as the fence's text does). */
+function splitLines(code: Element) {
+  const lines = linesOf(code.children);
+  if (lines.length > 1 && lines[lines.length - 1]!.length === 0) lines.pop();
+  code.children = lines.map((l): Element => ({ type: "element", tagName: "span", properties: { dataLine: "" }, children: [...l, { type: "text", value: "\n" }] }));
+}
+
 function visit(node: Root | Element) {
   for (const child of node.children as RootContent[]) {
     if (child.type !== "element") continue;
     const code = child.tagName === "pre" ? child.children.find((c): c is Element => c.type === "element" && c.tagName === "code") : undefined;
-    const lang = code ? languageOf(code) : null;
-    const source = code ? code.children.map(textOf).join("") : "";
-    if (code && lang && lowlight.registered(lang) && source.length <= HIGHLIGHT_MAX) {
+    if (!code) {
+      visit(child);
+      continue;
+    }
+    const lang = languageOf(code);
+    const source = code.children.map(textOf).join("");
+    if (lang && lowlight.registered(lang) && source.length <= HIGHLIGHT_MAX) {
       const tree = lowlight.highlight(lang, source);
       code.children = tree.children as ElementContent[];
       code.properties = { ...code.properties, dataHighlighted: "" };
-    } else visit(child);
+    }
+    splitLines(code);
   }
 }
 

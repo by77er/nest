@@ -203,6 +203,43 @@ describe("the chat", () => {
     }
   });
 
+  it("a running turn shows its last four steps, the earlier ones folded above them, opening on asking", async () => {
+    // In seq order, as nest sends them.
+    const head = [ev("turn_started", { turn: "trn_b" }), ev("assistant_text", { turn: "trn_b", text: "Reading them all." })];
+    const calls = Array.from({ length: 7 }, (_, i) => [
+      ev("tool_call", { turn: "trn_b", call_id: `b${i}`, name: "Read", input: { file_path: `f${i}.ts` } }),
+      ev("tool_result", { turn: "trn_b", call_id: `b${i}`, is_error: false, summary: "ok" }),
+    ]).flat();
+    vi.stubGlobal("WebSocket", traceSocket([...head, ...calls]));
+    const { user } = renderApp("/projects/prj_one/manager", new FakeApi());
+    const c = await chat();
+    const fold = await within(c).findByRole("button", { name: "+4 earlier steps" });
+    const stream = fold.closest("[data-sender=stream]") as HTMLElement;
+    // The last four calls show; the text and the first three are behind the fold.
+    const shown = () => within(stream).queryAllByRole("button", { name: /^Read f\d\.ts, done$/ }).map((b) => /^Read (\S+),/.exec(b.getAttribute("aria-label")!)![1]);
+    expect(shown()).toEqual(["f3.ts", "f4.ts", "f5.ts", "f6.ts"]);
+    expect(fold).toHaveAttribute("aria-expanded", "false");
+    await user.click(fold);
+    expect(await within(stream).findByRole("button", { name: "Read f0.ts, done" })).toBeVisible();
+    expect(within(stream).getByText("Reading them all.")).toBeVisible();
+  });
+
+  it("an empty chat opens at its top, not following an end there's nothing at", async () => {
+    const height = vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(1000);
+    const client = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(200);
+    try {
+      renderApp("/projects/prj_one/manager", new FakeApi());
+      const c = await chat();
+      await within(c).findByRole("button", { name: "What's blocked right now?" });
+      const log = within(c).getByRole("log", { name: "Conversation with the manager" });
+      await new Promise((r) => setTimeout(r, 50));
+      expect(log.scrollTop).toBe(0);
+    } finally {
+      height.mockRestore();
+      client.mockRestore();
+    }
+  });
+
   it("on a desktop, Enter sends and Shift+Enter is a new line", async () => {
     const api = new FakeApi();
     const { user } = renderApp("/projects/prj_one/manager", api);
