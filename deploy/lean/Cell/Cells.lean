@@ -15,12 +15,7 @@ def use1 : CellSpec :=
     -- Firecracker doesn't list). c8id.large is scarce in the cell's zones (spot placement score 1 of
     -- 10 on 2026-11-03), so m8id and r8id stand behind it (dev/deploy.md, "instance types").
     instanceFamilies := ["c8id", "m8id", "r8id", "c8i-flex", "c8i", "m8i"]
-    -- MITIGATION (2026-11-05): EBS-only types only, until the instance-store path is fixed. On an
-    -- instance-store host bootstrap puts the jailer's chroots under /var/lib/nest/data, and the
-    -- gateway's unit hides /var/lib/nest (InaccessiblePaths), so it can't reach a VM's vsock socket:
-    -- every hands call failed on the first such host (i-0515bad00a5794f0b, 2026-11-04). The
-    -- instance-store types come back with the fix (dev/deploy.md, "instance-store hosts").
-    launchTypes := ["c8i-flex.large", "c8i.large", "m8i.large"]
+    launchTypes := ["c8id.large", "m8id.large", "r8id.large", "c8i-flex.large", "c8i.large", "m8i.large"]
     -- 14 × 8 GB fits the 118 GB store of every listed instance-store type
     -- (`sandboxes_fit_their_disk`); a c8i-flex.large held 14 by memory in the stress test.
     maxSandboxesPerHost := 14
