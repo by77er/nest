@@ -73,13 +73,19 @@ DEADLINE=${MEASURE_DEADLINE_MIN:-90}
 PACK=$(mktemp -d)
 # MEASURE_SCRIPT: another on-host script of this directory (a probe), with the same layers.
 sed "s/@DEADLINE_MIN@/$DEADLINE/" "$HERE/${MEASURE_SCRIPT:-on-host.sh}" > "$PACK/on-host.sh"
-cp "$HERE/fdiff.c" "$PACK/"
+# MEASURE_FILES: what the script needs beside it (default fdiff.c, for on-host.sh), from this
+# directory or as paths.
+FILES=()
+for f in ${MEASURE_FILES:-fdiff.c}; do
+  case $f in /*) cp "$f" "$PACK/" ;; *) cp "$HERE/$f" "$PACK/" ;; esac
+  FILES+=("$(basename "$f")")
+done
 USER_DATA=$(mktemp)
 {
   echo '#!/bin/bash'
   echo "shutdown -h +$DEADLINE || shutdown -P +$DEADLINE"
   echo "mkdir -p /root/measure && base64 -d <<'NEST_PACK' | tar -xz -C /root/measure"
-  tar -czf - -C "$PACK" on-host.sh fdiff.c | base64
+  tar -czf - -C "$PACK" on-host.sh "${FILES[@]}" | base64
   echo 'NEST_PACK'
   echo 'exec bash /root/measure/on-host.sh'
 } > "$USER_DATA"

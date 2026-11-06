@@ -1,0 +1,11 @@
+{
+    "kernel": "6.18.56-125.164.amzn2023.x86_64",
+    "instance_type": "c8id.large",
+    "unit_inaccessible": "-/var/lib/nest -/etc/nest ",
+    "mounted": "/dev/nvme1n1 xfs",
+    "new_layout": "connected hello",
+    "old_layout": "failed [Errno 13] Permission denied",
+    "state_from_gateway": "/usr/bin/ls: cannot open directory '/srv/nest/state': Permission denied",
+    "cloudflared_as_nest_cf": "cloudflared version 2026.10.3 (built 2026-10-21-13:11 UTC)",
+    "done": true
+}

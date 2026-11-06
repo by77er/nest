@@ -58,7 +58,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - reading a cut cold;
   - a guest's write stalls during the pause.
 
-  If a month-old 32 GiB disk's p99 clone exceeds 200 ms, [M3′](#m3-the-pause-follows-what-a-turn-changed-option-1-built-not-deployed) comes first: the pause follows what changed (options below). A clone's cost grows with the number of extent records: 50–100 M of them locked a file for over 30 minutes (xfs 14a53798).
+  If a month-old 32 GiB disk's p99 clone exceeds 200 ms, [M3′](#m3-the-pause-follows-what-a-turn-changed-option-1-built-and-measured-not-deployed) comes first: the pause follows what changed (options below). A clone's cost grows with the number of extent records: 50–100 M of them locked a file for over 30 minutes (xfs 14a53798).
 - **Measured (2026-11-03, one `c8id.large` in us-east-1c, kernel 6.18.56, XFS `reflink=1` on the 118 GB instance store):** the gate fails. The owner shipped M2 anyway, with M3′ next (above).
 
   | 32 GiB disk | Extent records | `FICLONE`, 5 runs |
@@ -75,7 +75,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - host tests use a test cut (`disk_cut: locked_copy`): a copy under an exclusive `flock`, since the test filesystems have no reflink;
   - the e2e harness cuts that way during sustained writes, restores the generation from the store, and finds an exact prefix of the writes.
 
-## M3′: the pause follows what a turn changed (option 1 built, not deployed)
+## M3′: the pause follows what a turn changed (option 1 built and measured, not deployed)
 
 **Built (2026-11-04, the owner's choice of option 1; draft, not merged):** `nestd_core::shadow` (the comparison and the shadows' slots), and `Inner::cut_checkpoint`, `pre_copy` and `cut_shadow` in `crates/nestd/src/host.rs`.
 - **Two shadows per incarnation,** `shadow-a.img` and `shadow-b.img` beside `disk.img`. Cuts alternate between them (`Shadows::target`), and a commit reads its cut's shadow in place.
@@ -100,6 +100,13 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - Kani proves the same over any six steps (`a_cut_never_targets_a_shadow_a_queued_or_taken_cut_names`), and an exhaustive test over a small domain (524,288 map pairs) that `changed` covers every differing offset.
   - Host tests run M2's cut tests again with shadows (`*_with_shadows`), over a content-hash stand-in for FIEMAP (`disk_cut: sim_shadow`), every cut compared byte for byte with its disk (`disk_cut_verify`). Others: a commit re-asking reads its own shadow; both shadows held; a cut failing after its pre-copy beside a queued cut; a new shadow made before the pause. `E2E_DISK_CUT=sim_shadow` runs the e2e harness the same way.
   - **On a real XFS** (CI loop-mounts one, `NEST_TEST_XFS_DIR`; locally they skip): `real_xfs_shadow_cuts_under_a_concurrent_writer` (`auto` picks the shadow cut; every cut verified byte for byte with a guest writing throughout), and `the_pauses_write_back_catches_a_write_after_the_pre_copy`, which fails without the in-pause `fdatasync` (a buffered write over a shared block doesn't move the map until write-back) and shows the same comparison without it missing the write.
+- **Measured (2026-11-06, the code at e77f9677 on one `c8id.large`, kernel 6.18.56, a VM writing 4 KiB `O_DSYNC` records throughout):** `dev/measure-cut/on-host-m3-nestd.sh` builds `pre_copy` and `cut_shadow` from that revision's source (`extract-cut.py`) and drives them as `cut_checkpoint` does, alternating the shadows with the real `Shadows`, on a 32 GiB disk aged to 825–863 k extent records. Results: `dev/measure-cut/results-i-0d9df429072b40932.json`.
+  - **The pause** over 28 cuts into existing shadows: p50 662 ms, max 678 ms (the walk is about 600 ms of it). Where the guest's once-a-second record covers the pause (19 of 28 cuts), its slowest write matched it (651–686 ms), against a 2.6 ms median otherwise.
+  - **The residue:** p50 36.6 MB, max 39.9 MB, in about 2,960 ranges. Each shadow is two cuts behind, so it carries two intervals' writes. About 2,900 ranges differed at the pre-copy, under its 4,096 threshold, so the pre-copy cloned nothing and the pause cloned them all, in about 50 ms.
+  - **Executor time per cut** (write-back, pre-copy, pause): p50 2.25 s, max 2.32 s. It reached 6.9–7.2 s for the two cuts that made a shadow.
+  - **Making a shadow while the VM runs** isn't free on an aged disk: the whole `FICLONE` holds the disk's inode lock, so the guest's writes stalled 4.6–4.8 s, about as long as M2's pause. A new incarnation's first cut usually finds a restored disk with few records, where it costs milliseconds (`clone_fresh`: 14 ms), but an aged disk's first cut stalls the guest as long as M2.
+  - **M2 on the same disk:** a pause of 5.01–5.05 s (5 cuts). **M1:** 31.1 s (one cold read of 9.7 GB of data, without hashing or uploads).
+  - **Checked:** the last cut, compared byte for byte with the paused disk, was equal.
 - **Disk space:** a shadow pins only the blocks the disk rewrote since that shadow's cut. Cuts alternate, so neither is more than two cuts behind the disk while cuts continue, and between cuts each pins at most what the guest rewrote since (never more than the disk's own size). A cut queued while one is taken holds both, and a third drops the queued one, so no shadow is left behind indefinitely. M2's transient cut file goes. `sandboxes_fit_their_disk`'s 8 GB a sandbox covers two cut intervals of rewrites under 4 GB each (unverified on a used host; a guest rewriting more between two checkpoints exceeds it, as it would M2's cut file).
 - **The command executor:** the pre-copy and the pause still run in the host's one executor, as M2's clone does, and a cut takes about two walks (pre-copy) plus one (pause), with a fourth when the pre-copy clones. Moving a cut off the executor means answering `sandbox_checkpoint` after the batch's ack, which the fleet link doesn't allow today (results precede the ack). It is bounded instead: every step is O(records) at about 0.8 µs a record, off the async runtime (`spawn_blocking`), and a disk's count is in the log. **Open:** the off-executor cut.
 
