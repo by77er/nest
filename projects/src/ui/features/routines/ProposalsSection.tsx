@@ -3,7 +3,7 @@
 // in it is rendered as markup or followed). Accept makes a draft task on the board; Decline drops it, with
 // an optional reason (as an issue in triage is declined).
 
-import { Badge, Button, Text, TextInput, Title } from "@mantine/core";
+import { Button, Text, TextInput, Title } from "@mantine/core";
 import { modals } from "@mantine/modals";
 import { IconInbox } from "@tabler/icons-react";
 import { useRef } from "react";
@@ -11,6 +11,7 @@ import { useProposals, useTriageProposal } from "../../api/queries";
 import type { Proposal } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { EmptyState, ErrorState, LoadingState, MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, Toolbar } from "../../layout";
+import { UntrustedBadge } from "./Untrusted";
 
 /** A proposal's body shown at most this long; the rest is in the task once accepted. */
 const BODY_SHOWN = 1500;
@@ -40,12 +41,10 @@ function ProposalCard({ projectId, p }: { projectId: string; p: Proposal }) {
       <Stack gap="sm">
         <Row gap="sm">
           <Title order={4}>{p.title}</Title>
-          <Badge size="sm" variant="outline" color="gray">
-            Tainted
-          </Badge>
+          <UntrustedBadge what={`The proposed task “${p.title}”`} />
         </Row>
         <MetaRow>
-          <MetaItem>From {p.routine_name}</MetaItem>
+          <MetaItem>From the routine {p.routine_name} (run {p.run})</MetaItem>
           <MetaItem title={exact(p.created_ms)}>{ago(p.created_ms)}</MetaItem>
         </MetaRow>
         {p.body.trim() && <Prose size="sm">{p.body.length > BODY_SHOWN ? `${p.body.slice(0, BODY_SHOWN)}…` : p.body}</Prose>}

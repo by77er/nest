@@ -1,7 +1,8 @@
 // The project's memory (README.md#memory): the notes the manager and routines keep, which the manager and
-// workers read. Read-only here but for deleting a note. Each note's text is an agent's, shown as plain text.
+// workers read. Read-only here but for deleting a note. Each note's text is an agent's, shown as plain text,
+// with who wrote it; one a tainted session wrote is marked as from an untrusted source.
 
-import { ActionIcon, Badge, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Text, Tooltip } from "@mantine/core";
 import { modals } from "@mantine/modals";
 import { IconNotebook, IconTrash } from "@tabler/icons-react";
 import { MAX_NOTES } from "../../../memory";
@@ -9,6 +10,7 @@ import { useDeleteNote, useMemory } from "../../api/queries";
 import type { Note } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, Token } from "../../layout";
+import { sourceText, UntrustedBadge } from "./Untrusted";
 
 function NoteRow({ projectId, n }: { projectId: string; n: Note }) {
   const del = useDeleteNote(projectId);
@@ -27,16 +29,12 @@ function NoteRow({ projectId, n }: { projectId: string; n: Note }) {
         <Token size="sm" dimmed={false}>
           {n.key}
         </Token>
-        {n.tainted && (
-          <Badge size="sm" variant="outline" color="gray">
-            Tainted
-          </Badge>
-        )}
+        {n.tainted && <UntrustedBadge what={`The note ${n.key}`} />}
       </Row>
       <Prose size="sm">{n.text}</Prose>
       <Row justify="space-between" wrap="nowrap">
         <MetaRow>
-          <MetaItem>By {n.source}</MetaItem>
+          <MetaItem>By {sourceText(n.source)}</MetaItem>
           <MetaItem title={exact(n.updated_ms)}>{ago(n.updated_ms)}</MetaItem>
         </MetaRow>
         <Tooltip label="Delete">

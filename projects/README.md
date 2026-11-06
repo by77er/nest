@@ -288,9 +288,9 @@ The owner's request (2026-11-06): "schedule periodic background tasks for things
 - **The Routines page** (`src/ui/features/routines/`, after Reviews in the sidebar), top to bottom:
   - **Routines,** as Panels: the name, a status badge only when there's something to say (Running, Queued, Cooling down, Off), the triggers in words ("Mondays at 09:00 (Europe/London) · Every 5 task PRs merged"), the next timer, the counters' progress ("3 of 5 PRs merged"), the last run and its outcome, and why a queued one waits. Edit and Run now at the top right. "Add routine" offers the two presets (one click, each once) and a custom one.
   - **The editor,** a Sheet: name, kind, instructions; when it runs (a timer, the two counters; empty is off); limits; where proposed tasks go. Checked with the Worker's schema before it's sent; its refusal is shown in the form. Delete is last, set apart, confirmed, and refused while a run is going.
-  - **Proposed tasks** waiting for the owner: title, Tainted, its routine and when, the body as plain text (never rendered: an agent wrote it after reading anyone's text), Decline (with an optional reason, confirmed) and "Accept as draft".
+  - **Proposed tasks** waiting for the owner: title, "Untrusted source" (with why, on hover or focus), its routine and run and when, the body as plain text (never rendered: an agent wrote it after reading anyone's text), Decline (with an optional reason, confirmed) and "Accept as draft".
   - **Runs,** newest first: routine, why, state, what it made, started, took; opened, why it ended, its report (plain text), what it made, Stop while live (confirmed), and its agent's trace (`RunTrace`, the shared viewer). A card per run below `sm`.
-  - **Memory:** each note's key, text, source, when, Tainted; Delete, confirmed. Read-only otherwise for now.
+  - **Memory:** each note's key, text, who wrote it ("the manager", "the routine Dreaming (run …)") and when, and "Untrusted source" on one a tainted session wrote; Delete, confirmed. Read-only otherwise for now.
 - **Not yet:** proposals in "Needs you" and its count, and on the issues Triage page beside the issues once that lands; editing a note.
 
 ### Presets

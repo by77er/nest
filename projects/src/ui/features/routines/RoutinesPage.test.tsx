@@ -93,6 +93,9 @@ describe("the Routines page", () => {
     const card = await screen.findByText("Fix the race").then((h) => h.closest("[data-proposal]") as HTMLElement);
     expect(card).toHaveTextContent("<b>bold</b> and [a link](javascript:alert(1))");
     expect(card.querySelector("b, a")).toBeNull();
+    // Marked as from an untrusted source, with its routine and run.
+    expect(within(card).getByLabelText(/is from an untrusted source/)).toHaveTextContent("Untrusted source");
+    expect(card).toHaveTextContent("From the routine Spontaneous review (run run_a)");
     await user.click(within(card).getByRole("button", { name: "Accept as draft" }));
     await waitFor(() => expect(api.writes).toContainEqual({ method: "POST", path: "/api/projects/prj_one/proposals/prp_a/accept", body: undefined }));
     const other = (await screen.findByText("Meh")).closest("[data-proposal]") as HTMLElement;
@@ -120,10 +123,19 @@ describe("the Routines page", () => {
     await waitFor(() => expect(RecordingSocket.opened.map((u) => new URL(u).pathname)).toEqual(["/api/agents/agt_dream/trace"]));
   });
 
-  it("a memory note is deleted only after confirming", async () => {
+  it("a memory note shows who wrote it, an untrusted one marked; it's deleted only after confirming", async () => {
     const api = new FakeApi();
-    api.notes = [{ key: "owner-prefers-small-prs", text: "Keep PRs small.", source: "manager", tainted: false, created_ms: 1, updated_ms: 1 }];
+    api.notes = [
+      { key: "owner-prefers-small-prs", text: "Keep PRs small.", source: "manager", tainted: false, created_ms: 1, updated_ms: 1 },
+      { key: "pr-size", text: "Under 300 lines.", source: "routine:Dreaming (run_d1)", tainted: true, created_ms: 1, updated_ms: 1 },
+    ];
     const { user } = renderApp("/projects/prj_one/routines", api);
+    const clean = (await screen.findByText("Keep PRs small.")).closest("[data-note]") as HTMLElement;
+    const tainted = screen.getByText("Under 300 lines.").closest("[data-note]") as HTMLElement;
+    expect(clean).toHaveTextContent("By the manager");
+    expect(clean.querySelector("[data-marker=untrusted]")).toBeNull();
+    expect(tainted).toHaveTextContent("By the routine Dreaming (run run_d1)");
+    expect(within(tainted).getByLabelText(/The note pr-size is from an untrusted source/)).toBeInTheDocument();
     await user.click(await screen.findByRole("button", { name: "Delete the note owner-prefers-small-prs" }));
     const confirm = await screen.findByRole("dialog", { name: "Delete the note owner-prefers-small-prs?" });
     expect(api.writes).toEqual([]);
