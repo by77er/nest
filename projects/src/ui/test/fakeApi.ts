@@ -3,7 +3,7 @@
 // of every write the page made.
 
 import { type TaskEvent, transition } from "../../tasks";
-import type { SecretRequest, SecretsAnswer } from "../api/types";
+import type { Issue, SecretRequest, SecretsAnswer } from "../api/types";
 import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
 
 export interface Write {
@@ -29,7 +29,7 @@ export function task(over: Partial<Task> = {}): Task {
   seq += 1;
   return {
     id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false, blocked: null,
-    prs: [], blocked_by: [], blocks: [], waiting_on: [],
+    prs: [], blocked_by: [], blocks: [], waiting_on: [], issue: null,
     created_ms: now - 3_600_000, updated_ms: now - 60_000, ...over,
   };
 }
@@ -90,6 +90,8 @@ export class FakeApi {
     return this.route(method, url.pathname.replace(/^\/api/, "").split("/").filter(Boolean), body);
   };
 
+  /** The repo's issues waiting for triage. */
+  issues: Issue[] = [];
   /** What the Worker's attention list answers: open asks and blocked tasks, oldest first. */
   /** A secrets change, like a network one, is owed to every live agent's layer (one revision for both). */
   layersOwed(): void {
@@ -100,7 +102,8 @@ export class FakeApi {
     const asks = this.asks.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
     const blocked = this.tasks.filter((t) => t.blocked).map((t): Attention => ({ kind: "blocked", task: t.id, title: t.title, state: t.state, ...t.blocked! }));
     const secrets = this.secretRequests.map((r): Attention => ({ kind: "secret", ...r }));
-    return [...asks, ...blocked, ...secrets].sort((a, b) => a.at_ms - b.at_ms);
+    const triage: Attention[] = this.issues.length ? [{ kind: "triage", count: this.issues.length, at_ms: Math.min(...this.issues.map((i) => i.opened_ms)) }] : [];
+    return [...asks, ...blocked, ...secrets, ...triage].sort((a, b) => a.at_ms - b.at_ms);
   }
 
   private move(t: Task, event: TaskEvent): Response | null {
@@ -200,6 +203,26 @@ export class FakeApi {
         return json(this.asks);
       case "GET attention":
         return json(this.attention());
+      // Triage (README.md#triage).
+      case "GET issues":
+        return json(this.issues);
+      case "POST issues/:n/accept": {
+        const n = Number(parts[3]);
+        const i = this.issues.find((x) => x.number === n);
+        if (!i) return json({ error: `no issue #${n} in triage` }, 404);
+        if (body?.updated_ms !== i.updated_ms) return json({ error: `issue #${n} changed since it was read: read it again` }, 409);
+        this.issues = this.issues.filter((x) => x.number !== n);
+        const t = { ...task(), id: `tsk_from${n}`, title: i.title, body: `${i.body}\n\nFrom issue #${n}: ${i.url}`, state: "draft" as const, tainted: true, issue: { number: n, close: null, error: null } };
+        this.tasks = [...this.tasks, t];
+        return json(t);
+      }
+      case "POST issues/:n/decline": {
+        const n = Number(parts[3]);
+        this.issues = this.issues.filter((x) => x.number !== n);
+        return json({ declined: n });
+      }
+      case "POST issues/import":
+        return json({ imported: 0, known: this.issues.length });
       case "POST asks/:ask/answer": {
         const a = this.asks.find((x) => x.ask === parts[3]);
         if (!a) return json({ error: "unknown ask" }, 404);
@@ -250,6 +273,10 @@ export class FakeApi {
         return this.move(t, "cancel") ?? json(t);
       case "POST tasks/:task/done":
         return this.move(t, "done") ?? json(t);
+      case "POST tasks/:task/issue/close":
+        if (t.issue?.close !== "failed") return json({ error: "nothing to retry" }, 409);
+        t.issue = { ...t.issue, close: "owed", error: null };
+        return json(t);
       default:
         return json({ error: "unknown route" }, 404);
     }

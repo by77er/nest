@@ -42,6 +42,10 @@ export const PERMISSIONS = {
   // Reading PRs to attach them (`GET /repos/{o}/{r}/pulls`, `…/pulls/{n}`): Pull requests: read, on
   // the same permissions page (which also lists `…/pulls/{n}` under Contents: read, as one of a set).
   pullsRead: { pull_requests: "read" },
+  // Triage (README.md#triage): listing the repo's open issues, and closing a done task's with a comment
+  // (https://docs.github.com/en/rest/issues: Issues: read, and write to comment and close).
+  issuesRead: { issues: "read" },
+  issuesWrite: { issues: "write" },
   // A public account by login (`GET /users/{login}`): no permission of its own; metadata, the least one.
   metadata: { metadata: "read" },
 } as const satisfies Record<string, Record<string, "read" | "write">>;
@@ -179,6 +183,37 @@ export class GitHub {
   async openPulls(repo: string): Promise<Pull[]> {
     const list = (await this.call<Record<string, unknown>[]>("GET", `/repos/${repo}/pulls?state=open&per_page=100`)) ?? [];
     return list.map((p) => pullOf(p, repo));
+  }
+
+  /** The repo's open issues, PRs among them (GitHub lists both), oldest first, up to 300 (https://docs.github.com/en/rest/issues/issues#list-repository-issues). */
+  async openIssues(repo: string): Promise<Record<string, unknown>[]> {
+    const out: Record<string, unknown>[] = [];
+    for (let page = 1; page <= 3; page++) {
+      const list = (await this.call<Record<string, unknown>[]>("GET", `/repos/${repo}/issues?state=open&sort=created&direction=asc&per_page=100&page=${page}`)) ?? [];
+      out.push(...list);
+      if (list.length < 100) break;
+    }
+    return out;
+  }
+
+  /**
+   * The bodies of an issue's comments updated since a time, the first 100
+   * (https://docs.github.com/en/rest/issues/comments#list-issue-comments).
+   */
+  async issueCommentsSince(repo: string, n: number, sinceMs: number): Promise<string[]> {
+    const since = new Date(sinceMs).toISOString();
+    const list = (await this.call<{ body?: unknown }[]>("GET", `/repos/${repo}/issues/${n}/comments?since=${encodeURIComponent(since)}&per_page=100`)) ?? [];
+    return list.map((c) => (typeof c.body === "string" ? c.body : ""));
+  }
+
+  /** Comment on an issue (https://docs.github.com/en/rest/issues/comments#create-an-issue-comment). */
+  async commentIssue(repo: string, n: number, body: string): Promise<void> {
+    await this.call("POST", `/repos/${repo}/issues/${n}/comments`, { body });
+  }
+
+  /** Close an issue as completed (https://docs.github.com/en/rest/issues/issues#update-an-issue). */
+  async closeIssue(repo: string, n: number): Promise<void> {
+    await this.call("PATCH", `/repos/${repo}/issues/${n}`, { state: "closed", state_reason: "completed" });
   }
 
   /** Set the repo's "Allow auto-merge"; answers the value GitHub reports after, when it does. */

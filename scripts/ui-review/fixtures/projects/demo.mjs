@@ -7,7 +7,8 @@
 // message with every kind of rich content), "chat-empty", "chat-long" (thirty messages), "chat-paged"
 // (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents),
 // "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
-// PR comments reach workers: a user with a login, or by id only; nobody otherwise). Traces come from
+// PR comments reach workers: a user with a login, or by id only; nobody otherwise), or "triage-empty" (no
+// issues waiting) / "triage-long" (24 issues, long titles, bodies and logins). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
 import { trace } from "./trace.mjs";
@@ -36,7 +37,7 @@ export function data(variant = "demo", now = Date.now()) {
     "| Endpoint | p95 now | Target |\n|---|---|---|\n| `/api/gadgets?tag=` | 840 ms | 100 ms |",
   ].join("\n\n");
   let i = 0;
-  const t = (title, state, o = {}) => ({ id: `tsk_demo${++i}`, title, body: "", spec: state === "draft" ? null : spec, state, ord: i, assignee: null, pr: null, start_error: null, tainted: false, blocked: null, prs: [], blocked_by: [], blocks: [], waiting_on: [], created_ms: now - 7_200_000, updated_ms: now - 600_000, ...o });
+  const t = (title, state, o = {}) => ({ id: `tsk_demo${++i}`, title, body: "", spec: state === "draft" ? null : spec, state, ord: i, assignee: null, pr: null, start_error: null, tainted: false, blocked: null, prs: [], blocked_by: [], blocks: [], waiting_on: [], issue: null, created_ms: now - 7_200_000, updated_ms: now - 600_000, ...o });
   const tasks = [
     t("Support dark gadget skins", "draft"),
     t("Rate-limit the public API", "draft", { tainted: true }),
@@ -46,7 +47,8 @@ export function data(variant = "demo", now = Date.now()) {
     t("Paginate the gadget list", "assigned"),
     t("Add search by tag", "in_review", { assignee: "agt_w8x2m4", pr: 118, tainted: true, body: SEARCH_BODY }),
     t("Migrate to the new auth library", "stalled", { assignee: "agt_w1k7c2", start_error: "nest refused the worker: max_agents reached (403)" }),
-    t("Write the 0.5 changelog", "done", { pr: 112 }),
+    // Made of an issue whose close GitHub refused (README.md#triage).
+    t("Write the 0.5 changelog", "done", { pr: 112, issue: { number: 38, close: "failed", error: "nest 403: issues: write is outside the grant" } }),
     t("Drop the legacy XML export", "cancelled"),
   ];
   const byId = Object.fromEntries(tasks.map((x) => [x.id, x]));
@@ -90,6 +92,13 @@ export function data(variant = "demo", now = Date.now()) {
     { ask: "ask_A2", agent: "agt_mgr7k2", role: "manager", task: null, question: "Should search match tags by prefix or whole words only?", approval: null, at_ms: now - 60_000, answered_ms: null },
   ];
   const blocked = (task, title, by, role, mins, reason, question) => ({ kind: "blocked", task, title, state: "in_progress", at_ms: now - mins * 60_000, by, role, reason, question, tainted: false });
+  // The repo's issues waiting for triage (README.md#triage): anyone's text, one with markup that must show as text.
+  const longBody = Array.from({ length: 40 }, (_, k) => `Paragraph ${k + 1}: when the gadget list has more than 10000 items the search box stalls; https://example.com/a/very/long/url/without/any/breaks/at/all/${"x".repeat(80)} and more words to wrap.`).join("\n\n");
+  const issues = variant === "triage-empty" ? [] : variant === "triage-long" ? Array.from({ length: 24 }, (_, k) => ({ number: 100 + k, title: k === 0 ? "A_very_long_title_without_any_spaces_that_must_wrap_somewhere_or_it_will_overflow_the_card_and_the_page_" + "z".repeat(60) : k % 3 === 0 ? `A long but ordinary title about the export pipeline and the search index and the thumbnails cache number ${k}, which wraps over several lines on a phone` : `Issue ${k}`, body: k % 2 === 0 ? longBody : "Short body.", author: k % 4 === 0 ? "a-contributor-with-a-really-long-github-login-name" : "someone", url: `https://github.com/by77er/gadgets/issues/${100 + k}`, state: "untriaged", task: null, reason: null, opened_ms: now - (30 - k) * DAY, updated_ms: now - DAY })) : [
+    { number: 41, title: "Thumbnails are blank on Safari 17", body: "Steps:\n1. Open a gadget in Safari 17.\n2. The thumbnail is a grey box.\n\nChrome is fine.", author: "safari-fan", url: "https://github.com/by77er/gadgets/issues/41", state: "untriaged", task: null, reason: null, opened_ms: now - 2 * DAY, updated_ms: now - 2 * DAY },
+    { number: 44, title: "<script>alert('x')</script> in a gadget name breaks the list", body: "Name a gadget `<img src=x onerror=alert(1)>` and the **list** shows [this](javascript:alert(1)).", author: "tester", url: "https://github.com/by77er/gadgets/issues/44", state: "untriaged", task: null, reason: null, opened_ms: now - 5 * 3_600_000, updated_ms: now - 5 * 3_600_000 },
+    { number: 47, title: "Export to CSV", body: "", author: "customer-co", url: "https://github.com/by77er/gadgets/issues/47", state: "untriaged", task: null, reason: null, opened_ms: now - 600_000, updated_ms: now - 600_000 },
+  ];
   const attention = [
     blocked("tsk_demo8", "Migrate to the new auth library", "agt_w1k7c2", "worker", 95, "The staging database rejects the new driver's TLS settings.", "Should I pin the old driver for staging?"),
     blocked("tsk_demo5", "Fix the flaky upload test", "agt_w3f9q1", "worker", 40, "The test needs a fixture bucket I can't create.", null),
@@ -101,6 +110,7 @@ export function data(variant = "demo", now = Date.now()) {
       { kind: "secret", id: "srq_c1", type: "ci", name: "NPM_TOKEN", purpose: "The release workflow publishes @gadgets/core on a tag.", hosts: null, agent: "agt_w8x2m4", role: "worker", task: "tsk_demo2", tainted: false, at_ms: now - 1_800_000 },
       { kind: "secret", id: "srq_i1", type: "injected", name: "sentry_token", purpose: "The issue says to upload source maps to Sentry from the sandbox.", hosts: ["sentry.io"], agent: "agt_w3f9q1", role: "worker", task: "tsk_demo5", tainted: true, at_ms: now - 600_000 },
     ] : []),
+    ...(issues.length ? [{ kind: "triage", count: issues.length, at_ms: Math.min(...issues.map((i) => i.opened_ms)) }] : []),
   ].sort((a, b) => a.at_ms - b.at_ms);
   const chat = [
     { seq: 1, at_ms: now - 3_600_000, sender: "owner", text: "Plan the search work and split it into tasks.", delivered: true, error: null },
@@ -287,7 +297,7 @@ export function data(variant = "demo", now = Date.now()) {
       const why = "downloads.gadgets.example.com isn't in this app's grant; the operator must add it";
       return [403, { error: why, problems: { "worker.downloads.gadgets.example.com": why } }];
     }
-    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
+    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/issues": issues, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
     if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
     if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];
     if (q in routes) return [200, routes[q]];
