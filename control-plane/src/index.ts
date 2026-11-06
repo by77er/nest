@@ -28,7 +28,8 @@ import { TimerName } from "./lib/timers";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { JWKS_MAX_AGE_S } from "./lib/identity";
 import { Port, SandboxPolicyLayer } from "./do/sandbox";
-import { TRACE_HEADER } from "./do/agent";
+import { type CreateAgent, TRACE_HEADER } from "./do/agent";
+import { type GrantParent, inScope, parseGrantRequests } from "./lib/grants";
 import { parseAppSecret } from "./lib/github";
 import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
@@ -471,6 +472,35 @@ async function listing(c: Ctx<string, unknown>, kind: "agent" | "sandbox"): Prom
   };
 }
 
+/**
+ * A spawn's `grants` from the API (docs/agents/tools/#grants): the operator confers any (it holds the
+ * root), a client only over its own subtree (its owner auth reads every agent in it). Either way a grant
+ * is confined to the new agent's subtree (`client`), and an id must name an agent in it: outside, it
+ * answers 404, as any id outside a client's subtree does.
+ */
+async function conferGrants(c: Ctx<string, unknown>, raw: unknown, client: string | null): Promise<NonNullable<CreateAgent["grants"]>> {
+  const parsed = parseGrantRequests(raw, Date.now());
+  if (!parsed.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, parsed.error);
+  const parent: GrantParent = c.caller.kind === "client" ? { kind: "client", client: c.caller.client } : { kind: "operator" };
+  const out: NonNullable<CreateAgent["grants"]> = [];
+  for (const { req, resource } of parsed.value) {
+    if ("id" in resource) {
+      let target: string | null | undefined;
+      try {
+        target = (await agent(c.env, resource.id).subtree()).client;
+      } catch (e) {
+        if (asNestError(e)?.code !== ErrorCodes.UNKNOWN_AGENT) throw e;
+      }
+      if (target === undefined || !inScope(client, { client: target })) throw new NestError(ErrorCodes.NOT_FOUND, `no agent ${resource.id} in this subtree`, 404);
+    }
+    out.push({
+      action: req.action, resource: req.resource, ...(req.limits ? { limits: req.limits } : {}), ...(req.expires_ms !== undefined ? { expires_ms: req.expires_ms } : {}),
+      scope: client, parent,
+    });
+  }
+  return out;
+}
+
 export const ROUTES: Route[] = [
   // Unauthenticated: one read-only round trip to each DO class's own health instance, nothing else,
   // shared by this isolate's requests for a few seconds so a flood can't multiply it.
@@ -733,8 +763,9 @@ export const ROUTES: Route[] = [
       overrides: z.unknown().optional(),
       launch: LaunchConfig.optional(),
       rules: z.array(ToolRule).optional(),
-      // Gone: a client still sending it must not silently get the template's wider tool set.
-      grants: z.never({ error: "grants is no longer accepted: narrow the tools with overrides.tools" }).optional(),
+      // Grants for the agent (docs/agents/tools/#grants), checked below. The previous meaning, a list of
+      // tool names, is refused, so a client still sending one never silently gets the template's wider tool set.
+      grants: z.unknown().optional(),
       cell: z.string().optional(),
       start: z.boolean().default(true),
       labels: Labels.optional(),
@@ -781,13 +812,14 @@ export const ROUTES: Route[] = [
         const overrides: OperatorOverrides = { ...(r.launch ? { launch: r.launch } : {}), ...(r.rules ? { rules: r.rules } : {}), ...o.data };
         spec = await catalog(env).expand({ template, hands: !!r.sandbox, by: "operator", overrides }, scope);
       }
+      const grants = await conferGrants(c, r.grants, client);
       const labels = r.labels ?? {};
       const owner = ownerAgent ?? (caller.kind === "client" ? caller.client : null);
       if (client) await clientDO(env, client).admit({ kind: "agent", id, cell: cellName, owner, labels });
       begin();
       const a = agent(env, id);
       await createOrRelease(env, client, id, () => a.create({
-        agent: id, cell: cellName, spec, owner, sandbox: r.sandbox ?? null, labels, ...(client ? { client } : {}),
+        agent: id, cell: cellName, spec, owner, sandbox: r.sandbox ?? null, labels, ...(client ? { client } : {}), ...(grants.length ? { grants } : {}),
       }));
       // The agent exists now: a start that can't run yet (no brain host, a cold cell) keeps its intent and
       // runs when room appears, so the create still answers 201 with the agent and why its start waits.
