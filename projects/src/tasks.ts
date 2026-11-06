@@ -18,9 +18,11 @@ export type TaskState = (typeof TASK_STATES)[number];
  * - `done`: the owner marked it done: only a task with no PR and no live worker (a draft, a ready task,
  *   a stalled one). A task with an open PR is done when it merges (`merged`); one with a worker is
  *   cancelled instead;
- * - `cancel`: the owner or the manager cancelled it; its worker is stopped.
+ * - `cancel`: the owner or the manager cancelled it; its worker is stopped;
+ * - `revise`: the owner commented on its open PR while no worker runs for it (README.md#pr-comments): a
+ *   worker is started again, the comment its first input after its brief.
  */
-export const TASK_EVENTS = ["spec", "assign", "started", "start_failed", "pr_opened", "worker_exited", "merged", "done", "cancel"] as const;
+export const TASK_EVENTS = ["spec", "assign", "started", "start_failed", "pr_opened", "worker_exited", "merged", "done", "cancel", "revise"] as const;
 export type TaskEvent = (typeof TASK_EVENTS)[number];
 
 export const TERMINAL: ReadonlySet<TaskState> = new Set(["done", "cancelled"]);
@@ -37,6 +39,7 @@ const MOVES: Record<TaskEvent, Partial<Record<TaskState, TaskState>>> = {
   merged: { draft: "done", ready: "done", assigned: "done", in_progress: "done", in_review: "done", stalled: "done" },
   done: { draft: "done", ready: "done", stalled: "done" },
   cancel: { draft: "cancelled", ready: "cancelled", assigned: "cancelled", in_progress: "cancelled", in_review: "cancelled", stalled: "cancelled" },
+  revise: { ready: "assigned", in_review: "assigned", stalled: "assigned" },
 };
 
 export type Transition = { ok: true; to: TaskState } | { ok: false; error: string };

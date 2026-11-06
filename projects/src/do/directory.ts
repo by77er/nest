@@ -42,7 +42,15 @@ const MIGRATIONS = [
     "CREATE INDEX seen_at ON seen (at_ms)",
     "CREATE TABLE sync (k TEXT PRIMARY KEY, v TEXT NOT NULL)",
   ],
+  [
+    // A delivery claimed before it's handled (`claim`) and not yet confirmed done (`markSeen`): a claim
+    // whose handler died lapses after CLAIM_LAPSE_MS, so a redelivery is handled.
+    "ALTER TABLE seen ADD COLUMN pending INTEGER NOT NULL DEFAULT 0",
+  ],
 ] as const;
+
+/** How long a claim stays taken without its handler confirming it (`markSeen`). */
+export const CLAIM_LAPSE_MS = 5 * 60_000;
 
 export class DirectoryDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -111,10 +119,29 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.sql.exec("SELECT 1 FROM seen WHERE id = ?", id).toArray().length > 0;
   }
 
+  /**
+   * Claim an event before handling it, in one step: true the first time, false for a copy (so two
+   * concurrent deliveries of one id never both act). `release` undoes a claim whose handling failed.
+   */
+  async claim(id: string): Promise<boolean> {
+    const now = Date.now();
+    this.sql.exec("DELETE FROM seen WHERE at_ms < ?", now - SEEN_KEEP_MS);
+    // New, or a claim that lapsed (its handler never confirmed it): taken now.
+    return this.sql.exec(
+      `INSERT INTO seen (id, at_ms, pending) VALUES (?, ?, 1)
+        ON CONFLICT (id) DO UPDATE SET at_ms = excluded.at_ms WHERE pending = 1 AND at_ms < ? RETURNING id`,
+      id, now, now - CLAIM_LAPSE_MS,
+    ).toArray().length > 0;
+  }
+
+  async release(id: string): Promise<void> {
+    this.sql.exec("DELETE FROM seen WHERE id = ?", id);
+  }
+
   /** Mark an event handled (after it was), and forget the ones older than the window. */
   async markSeen(id: string): Promise<void> {
     const now = Date.now();
-    this.sql.exec("INSERT OR IGNORE INTO seen (id, at_ms) VALUES (?, ?)", id, now);
+    this.sql.exec("INSERT INTO seen (id, at_ms) VALUES (?, ?) ON CONFLICT (id) DO UPDATE SET pending = 0", id, now);
     this.sql.exec("DELETE FROM seen WHERE at_ms < ?", now - SEEN_KEEP_MS);
   }
 
