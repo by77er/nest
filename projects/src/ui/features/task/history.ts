@@ -103,6 +103,15 @@ export function summarize(h: HistoryRow): string {
       return "Its worker couldn't be told of the change";
     case "block_answered":
       return str(o.answer) ? `You answered: ${clip(str(o.answer)!)}` : "You answered";
+    // Triage (README.md#triage): a task made of an issue, and closing that issue once it's done.
+    case "issue_accepted":
+      return typeof o.issue === "number" ? `Made from issue #${o.issue}` : "Made from an issue";
+    case "issue_closed":
+      return typeof o.issue === "number" ? `Issue #${o.issue} closed on GitHub${typeof o.pr === "number" ? `, done in #${o.pr}` : ""}` : "Its issue closed on GitHub";
+    case "issue_close_failed":
+      return `${typeof o.issue === "number" ? `Issue #${o.issue}` : "Its issue"} wasn't closed on GitHub${str(o.error) ? `: ${clip(str(o.error)!)}` : ""}`;
+    case "issue_close_retried":
+      return typeof o.issue === "number" ? `Closing issue #${o.issue} tried again` : "Closing its issue tried again";
     default:
       return h.action.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
   }

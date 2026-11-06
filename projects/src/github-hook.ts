@@ -167,7 +167,9 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
     // The repo's own issues only (an event names its repo: a fork's goes to no project). Anyone may file;
     // the text is kept as data, shown escaped, and reaches no agent before the owner accepts it.
     const e = issueEventOf(payload.issue);
-    if (e && action && ISSUE_ACTIONS.has(action)) await project(env, p.id).onIssue({ action, ...e });
+    // The sender (who acted) by id: a declined issue comes back only when someone the owner trusts reopens it.
+    const sender = obj(payload.sender).id;
+    if (e && action && ISSUE_ACTIONS.has(action)) await project(env, p.id).onIssue({ action, ...e, sender: typeof sender === "number" ? sender : null });
   } else if (COMMENT_EVENTS.has(event!)) {
     const c = prCommentOf(event!, payload, p.repo);
     if (c) await project(env, p.id).onPrComment(c);

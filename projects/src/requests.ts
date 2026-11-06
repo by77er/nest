@@ -59,6 +59,9 @@ export const PutSecret = z.strictObject({
   /** The variable holding its placeholder (src/secrets.ts checks it). */
   env: z.string().min(1).max(64),
 });
+/** Accepting an issue in triage (README.md#triage): its `updated_ms` as the owner read it. */
+export const AcceptIssue = z.strictObject({ updated_ms: z.number().int().nonnegative() });
+export type AcceptIssueBody = z.input<typeof AcceptIssue>;
 /** Declining an issue in triage (README.md#triage): an optional reason, kept on it. */
 export const DeclineIssue = z.strictObject({ reason: z.string().max(500).optional() });
 export type DeclineIssueBody = z.input<typeof DeclineIssue>;

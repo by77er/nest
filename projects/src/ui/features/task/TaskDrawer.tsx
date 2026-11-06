@@ -11,6 +11,7 @@ import { StateBadge } from "../board/StateBadge";
 import { WaitingBadge } from "../board/WaitingBadge";
 import { TERMINAL } from "../../../tasks";
 import { HistoryList } from "./HistoryList";
+import { IssueCloseFailed } from "./IssueCloseFailed";
 import { SpecView } from "./SpecView";
 import { TaskActions } from "./TaskActions";
 import { confirmDiscard, TaskDescription } from "./TaskDescription";
@@ -87,6 +88,7 @@ export function TaskDrawer({ projectId, repo, taskId, onClose }: { projectId: st
                 {t.start_error}
               </Notice>
             )}
+            <IssueCloseFailed projectId={projectId} task={t} />
             <TaskActions projectId={projectId} task={t} onDeleted={onClose} />
           </Stack>
 

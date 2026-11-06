@@ -83,8 +83,20 @@ export interface Task {
   waiting_on: string[];
   /** Set while an agent has the task waiting on the owner (README.md#blocked). */
   blocked: Blocked | null;
+  /** The issue it was made of (README.md#triage), if any. */
+  issue: TaskIssue | null;
   created_ms: number;
   updated_ms: number;
+}
+
+/**
+ * A task's issue, and closing it on GitHub once the task is done: not yet owed (null), owed (being
+ * tried), closed, or failed (GitHub refused for good: `error` says why, and the owner may retry).
+ */
+export interface TaskIssue {
+  number: number;
+  close: "owed" | "closed" | "failed" | null;
+  error: string | null;
 }
 
 /** A PR attached to a task: open or merged (a closed one is detached). */
@@ -338,7 +350,7 @@ export const MIGRATIONS = [
       task TEXT, reason TEXT, opened_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, triaged_ms INTEGER)`,
     "ALTER TABLE tasks ADD COLUMN issue INTEGER",
     `CREATE TABLE issue_closes (task TEXT PRIMARY KEY, issue INTEGER NOT NULL, pr INTEGER, next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
-      error TEXT, commented INTEGER NOT NULL DEFAULT 0, closed_ms INTEGER)`,
+      error TEXT, commented INTEGER NOT NULL DEFAULT 0, closed_ms INTEGER, owed_ms INTEGER NOT NULL)`,
   ],
 ] as const;
 
@@ -476,9 +488,17 @@ export class ProjectDO extends DurableObject<Env> {
       id: r.id as string, title: r.title as string, body: r.body as string, spec: r.spec ? (JSON.parse(r.spec as string) as Spec) : null,
       state: r.state as TaskState, ord: r.ord as number, assignee: (r.assignee as string | null) ?? null,
       start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, blocked: blockedOf(r),
-      ...this.relations(r.id as string),
+      ...this.relations(r.id as string), issue: this.taskIssue(r),
       created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     };
+  }
+
+  /** A task's issue, as Task carries it. */
+  private taskIssue(r: Row): TaskIssue | null {
+    if (r.issue === null || r.issue === undefined) return null;
+    const c = this.sql.exec("SELECT next_ms, closed_ms, error FROM issue_closes WHERE task = ?", r.id).toArray()[0];
+    const close = !c ? null : c.closed_ms !== null ? "closed" : c.next_ms !== null ? "owed" : "failed";
+    return { number: r.issue as number, close, error: close === "failed" ? ((c!.error as string | null) ?? null) : null };
   }
 
   /** A task's PRs and dependencies, as Task carries them. */
@@ -803,13 +823,17 @@ export class ProjectDO extends DurableObject<Env> {
   // --- triage (README.md#triage) ---------------------------------------------------------------------
 
   /**
-   * An `issues` event on the repo (the Worker checked its signature; never a PR). Opened or reopened adds
-   * the issue to triage, or restores one that went (or was declined); edited updates one still
-   * untriaged (or adds it, open, if its opening was missed); closed, deleted or transferred takes an
-   * untriaged one out. An accepted issue is the task's from then on: nothing here changes it.
+   * An `issues` event on the repo (the Worker checked its signature; never a PR). Opened or reopened (and
+   * open: a late delivery of an issue closed since changes nothing) adds the issue to triage, or restores
+   * one that went; a declined one comes back only when reopened by whoever the owner trusts on GitHub
+   * (the comments user, or the repo's owner), so its author can't undo a decline by closing and
+   * reopening it. Edited updates one still untriaged (or adds it, open, if its opening was missed);
+   * closed, deleted or transferred takes an untriaged one out. An accepted issue is the task's from then
+   * on: nothing here changes it. `sender` is the GitHub user id the event names as its actor.
    */
-  async onIssue(e: { action: string; number: number; title: string; body: string; author: string | null; url: string; open: boolean }): Promise<void> {
-    if (!this.settings()) return;
+  async onIssue(e: { action: string; number: number; title: string; body: string; author: string | null; url: string; open: boolean; sender?: number | null }): Promise<void> {
+    const s = this.settingsRow();
+    if (!s) return;
     const had = this.sql.exec("SELECT state FROM issues WHERE number = ?", e.number).toArray()[0];
     const now = Date.now();
     const title = e.title.slice(0, ISSUE_TITLE_MAX);
@@ -821,7 +845,8 @@ export class ProjectDO extends DurableObject<Env> {
       e.number, title, body, e.author, e.url, now, now,
     );
     if (e.action === "opened" || e.action === "reopened") {
-      if (!had || had.state === "gone" || (e.action === "reopened" && had.state === "declined")) put();
+      const trusted = typeof e.sender === "number" && (e.sender === s.comments_from_id || e.sender === s.repo_owner_id);
+      if (e.open && (!had || had.state === "gone" || (e.action === "reopened" && had.state === "declined" && trusted))) put();
     } else if (e.action === "edited") {
       if (had?.state === "untriaged") this.sql.exec("UPDATE issues SET title = ?, body = ?, updated_ms = ? WHERE number = ?", title, body, now, e.number);
       else if (!had && e.open) put();
@@ -839,13 +864,16 @@ export class ProjectDO extends DurableObject<Env> {
   /**
    * Accept an issue: a draft task of its title and body, with a link back, for the owner or the manager
    * to spec as any draft. Its text is anyone's, so the task is marked tainted: a session that reads it
-   * through the app (the manager's, its worker's) is tainted as nest's rule has it.
+   * through the app (the manager's, its worker's) is tainted as nest's rule has it. `seen` is the
+   * `updated_ms` of the issue as the owner read it: edited since, it's refused, so what becomes the
+   * task is what the owner read.
    */
-  async acceptIssue(n: number): Promise<Result<Task>> {
+  async acceptIssue(n: number, seen: number): Promise<Result<Task>> {
     if (!this.settings()) return fail(404, "unknown project");
     const i = this.sql.exec("SELECT * FROM issues WHERE number = ?", n).toArray()[0];
     if (!i) return fail(404, `no issue #${n} in triage`);
     if (i.state !== "untriaged") return fail(409, `issue #${n} is ${i.state as string}`);
+    if (i.updated_ms !== seen) return fail(409, `issue #${n} changed since it was read: read it again`);
     const body = [(i.body as string).trim(), `From issue #${n}: ${i.url as string}${i.author ? ` (opened by ${i.author as string})` : ""}`].filter(Boolean).join("\n\n");
     const t = await this.createTask({ title: (i.title as string).slice(0, 200) || `Issue #${n}`, body });
     if (!t.ok) return t;
@@ -870,7 +898,8 @@ export class ProjectDO extends DurableObject<Env> {
 
   /**
    * Bring the repo's open issues into triage (a one-off, the owner's): each not known yet. Read from
-   * GitHub (Issues: read), up to 300, oldest first; PRs (which GitHub lists as issues) are left out.
+   * GitHub (Issues: read), the oldest 300 open items, PRs among them (GitHub lists PRs as issues): the
+   * PRs are left out, so fewer than 300 issues come in when PRs are open.
    */
   async importIssues(): Promise<Result<{ imported: number; known: number }>> {
     const s = this.settings();
@@ -902,7 +931,8 @@ export class ProjectDO extends DurableObject<Env> {
   /**
    * Close a done task's issue on GitHub (Issues: write): a comment naming the PR, then closed as
    * completed. A refusal that will repeat (the grant lacks `issues: write`, the issue is gone) is
-   * recorded on the task and not retried; anything else is retried from the alarm.
+   * recorded on the task and waits: for the grant to change (`grantSeen`), or the owner's retry
+   * (`retryIssueClose`). Anything else is retried from the alarm.
    */
   private async closeIssue(nest: Nest, task: string): Promise<void> {
     const s = this.settings()!;
@@ -910,11 +940,14 @@ export class ProjectDO extends DurableObject<Env> {
     if (!row) return;
     const app: Actor = { kind: "app", what: "github" };
     const n = row.issue as number;
+    const line = row.pr !== null ? `Done in #${row.pr as number}.` : "Done.";
     try {
       const gh = await githubFor(nest, s.repo, PERMISSIONS.issuesWrite);
-      // The comment once: a retry after it landed (the close failed) doesn't post it again.
+      // The comment once: not again on a retry after it landed (the close failed), nor when it landed but
+      // its answer was lost (it's among the issue's comments since the close was owed).
       if (row.commented !== 1) {
-        await gh.commentIssue(s.repo, n, row.pr !== null ? `Done in #${row.pr as number}.` : "Done.");
+        const since = await gh.issueCommentsSince(s.repo, n, row.owed_ms as number);
+        if (!since.some((c) => c.trim() === line)) await gh.commentIssue(s.repo, n, line);
         this.sql.exec("UPDATE issue_closes SET commented = 1 WHERE task = ?", task);
       }
       await gh.closeIssue(s.repo, n);
@@ -924,8 +957,28 @@ export class ProjectDO extends DurableObject<Env> {
       const attempts = (row.attempts as number) + 1;
       const permanent = (e instanceof GitHubError || e instanceof NestError) && e.permanent;
       this.sql.exec("UPDATE issue_closes SET attempts = ?, error = ?, next_ms = ? WHERE task = ?", attempts, message(e), permanent ? null : Date.now() + backoff(attempts), task);
-      if (permanent) this.record(task, app, "issue_close_failed", { issue: n, error: message(e) });
+      if (permanent) {
+        this.record(task, app, "issue_close_failed", { issue: n, error: message(e) });
+        // The grant as it is now, so its widening later is seen as a change, and the close tried again.
+        await this.readGrant(nest);
+      }
     }
+  }
+
+  /** The owner's retry of a done task's issue close that GitHub refused for good. */
+  async retryIssueClose(task: string): Promise<Result<Task>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const t = this.taskRow(task);
+    if (!t) return fail(404, "unknown task");
+    const row = this.sql.exec("SELECT * FROM issue_closes WHERE task = ?", task).toArray()[0];
+    if (!row) return fail(409, "the task has no issue to close");
+    if (row.closed_ms !== null) return fail(409, `issue #${row.issue as number} is closed`);
+    if (row.next_ms === null) {
+      this.sql.exec("UPDATE issue_closes SET next_ms = ?, attempts = 0 WHERE task = ?", Date.now(), task);
+      this.record(task, { kind: "owner" }, "issue_close_retried", { issue: row.issue });
+    }
+    await this.arm();
+    return ok(this.toTask(this.taskRow(task)!));
   }
 
   // --- PRs (README.md#prs) ----------------------------------------------------------------------------
@@ -998,7 +1051,7 @@ export class ProjectDO extends DurableObject<Env> {
       // A task made of an issue: the issue is closed on GitHub, with a line naming the PR (README.md#triage).
       if (t.issue !== null && t.issue !== undefined) {
         const pr = this.sql.exec<{ pr: number }>("SELECT pr FROM task_prs WHERE task = ? AND state = 'merged' ORDER BY ended_ms DESC LIMIT 1", id).toArray()[0]?.pr ?? null;
-        this.sql.exec("INSERT OR IGNORE INTO issue_closes (task, issue, pr, next_ms) VALUES (?, ?, ?, ?)", id, t.issue, pr, Date.now());
+        this.sql.exec("INSERT OR IGNORE INTO issue_closes (task, issue, pr, next_ms, owed_ms) VALUES (?, ?, ?, ?, ?)", id, t.issue, pr, Date.now(), Date.now());
       }
     }
   }
@@ -1186,9 +1239,11 @@ export class ProjectDO extends DurableObject<Env> {
       done({ agent, dropped: changes.length }, "worker_not_notified");
       return;
     }
-    const tainted = changes.some((c) => c.tainted === 1);
+    // Relayed when a tainted session made one of these changes, or ever wrote the task (an issue's text).
+    const task = this.toTask(r);
+    const tainted = task.tainted || changes.some((c) => c.tainted === 1);
     try {
-      await nest.postInbox(agent, changeMessage(this.toTask(r), changes), { requestId: `${id}/changes/${upto}`, ...(tainted ? { from: "projects/board" } : {}) });
+      await nest.postInbox(agent, changeMessage(task, changes), { requestId: `${id}/changes/${upto}`, ...(tainted ? { from: "projects/board" } : {}) });
       done({ agent, fields: [...new Set(changes.map((c) => c.field as string))], changes: changes.length }, "worker_notified");
     } catch (e) {
       const attempts = (r.notify_attempts as number) + 1;
@@ -1966,21 +2021,35 @@ export class ProjectDO extends DurableObject<Env> {
   /**
    * The grant as read (here, or by the Worker): when its hosts changed since last seen, every live layer
    * is owed again, so a secret left out for a narrowed grant comes back once it's widened, and goes
-   * once it's narrowed, without anyone saving anything.
+   * once it's narrowed, without anyone saving anything. When its `issues` permission changed to one
+   * that can close an issue, each issue close GitHub refused for good is tried again.
    */
   async grantSeen(g: Grant): Promise<void> {
-    const seen = JSON.stringify({ inject: [...(g.inject_hosts ?? [])].sort(), egress: g.egress_hosts ? [...g.egress_hosts].sort() : null, workflows: g.github_push?.workflows === true });
+    const layers = { inject: [...(g.inject_hosts ?? [])].sort(), egress: g.egress_hosts ? [...g.egress_hosts].sort() : null, workflows: g.github_push?.workflows === true };
+    const issues = typeof g.github?.permissions?.issues === "string" ? g.github.permissions.issues : null;
+    const seen = JSON.stringify({ ...layers, issues });
     const before = this.settingsRow()?.grant_seen as string | null | undefined;
     if (before === undefined || before === seen) return;
     this.sql.exec("UPDATE settings SET grant_seen = ?", seen);
-    if (before !== null) {
+    if (before === null) return;
+    // Seen before `issues` was kept (an earlier release): its layers part compares as it was.
+    const was = JSON.parse(before) as typeof layers & { issues?: string | null };
+    let owed = false;
+    if (JSON.stringify({ inject: was.inject, egress: was.egress, workflows: was.workflows }) !== JSON.stringify(layers)) {
       await this.oweLayers(LAYER_ROLES);
-      // Applied in this drain, not the next alarm's; once per drain, so a flapping grant can't loop it.
-      if (this.draining && !this.reowed) {
-        this.reowed = true;
-        this.again = true;
-      }
+      owed = true;
     }
+    if ((was.issues ?? null) !== issues && (issues === "write" || issues === "admin")) {
+      this.sql.exec("UPDATE issue_closes SET next_ms = ?, attempts = 0 WHERE next_ms IS NULL AND closed_ms IS NULL", Date.now());
+      owed = true;
+    }
+    if (!owed) return;
+    // Applied in this drain, not the next alarm's; once per drain, so a flapping grant can't loop it.
+    if (this.draining && !this.reowed) {
+      this.reowed = true;
+      this.again = true;
+    }
+    await this.arm();
   }
 
   /**

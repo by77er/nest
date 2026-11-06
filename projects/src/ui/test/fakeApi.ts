@@ -29,7 +29,7 @@ export function task(over: Partial<Task> = {}): Task {
   seq += 1;
   return {
     id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false, blocked: null,
-    prs: [], blocked_by: [], blocks: [], waiting_on: [],
+    prs: [], blocked_by: [], blocks: [], waiting_on: [], issue: null,
     created_ms: now - 3_600_000, updated_ms: now - 60_000, ...over,
   };
 }
@@ -210,8 +210,9 @@ export class FakeApi {
         const n = Number(parts[3]);
         const i = this.issues.find((x) => x.number === n);
         if (!i) return json({ error: `no issue #${n} in triage` }, 404);
+        if (body?.updated_ms !== i.updated_ms) return json({ error: `issue #${n} changed since it was read: read it again` }, 409);
         this.issues = this.issues.filter((x) => x.number !== n);
-        const t = { ...this.tasks[0]!, id: `tsk_from${n}`, title: i.title, body: `${i.body}\n\nFrom issue #${n}: ${i.url}`, state: "draft" as const, tainted: true };
+        const t = { ...task(), id: `tsk_from${n}`, title: i.title, body: `${i.body}\n\nFrom issue #${n}: ${i.url}`, state: "draft" as const, tainted: true, issue: { number: n, close: null, error: null } };
         this.tasks = [...this.tasks, t];
         return json(t);
       }
@@ -272,6 +273,10 @@ export class FakeApi {
         return this.move(t, "cancel") ?? json(t);
       case "POST tasks/:task/done":
         return this.move(t, "done") ?? json(t);
+      case "POST tasks/:task/issue/close":
+        if (t.issue?.close !== "failed") return json({ error: "nothing to retry" }, 409);
+        t.issue = { ...t.issue, close: "owed", error: null };
+        return json(t);
       default:
         return json({ error: "unknown route" }, 404);
     }

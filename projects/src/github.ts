@@ -196,6 +196,16 @@ export class GitHub {
     return out;
   }
 
+  /**
+   * The bodies of an issue's comments updated since a time, the first 100
+   * (https://docs.github.com/en/rest/issues/comments#list-issue-comments).
+   */
+  async issueCommentsSince(repo: string, n: number, sinceMs: number): Promise<string[]> {
+    const since = new Date(sinceMs).toISOString();
+    const list = (await this.call<{ body?: unknown }[]>("GET", `/repos/${repo}/issues/${n}/comments?since=${encodeURIComponent(since)}&per_page=100`)) ?? [];
+    return list.map((c) => (typeof c.body === "string" ? c.body : ""));
+  }
+
   /** Comment on an issue (https://docs.github.com/en/rest/issues/comments#create-an-issue-comment). */
   async commentIssue(repo: string, n: number, body: string): Promise<void> {
     await this.call("POST", `/repos/${repo}/issues/${n}/comments`, { body });

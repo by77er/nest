@@ -71,9 +71,16 @@ export function ManagerContext({ projectId }: { projectId: string }) {
           <Stack gap="md" data-slot="top-asks">
             {asks.map((x) => (
               <Stack key={x.kind === "ask" ? x.ask : x.kind === "secret" ? x.id : x.kind === "triage" ? "triage" : `blocked-${x.task}`} gap="xs">
-                <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{}} fz="sm">
-                  {gist(x)}
-                </AnchorLink>
+                {/* Triage's item opens the queue; everything else waits on the board's "Needs you". */}
+                {x.kind === "triage" ? (
+                  <AnchorLink to="/projects/$projectId/triage" params={{ projectId }} fz="sm">
+                    {gist(x)}
+                  </AnchorLink>
+                ) : (
+                  <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{}} fz="sm">
+                    {gist(x)}
+                  </AnchorLink>
+                )}
                 <MetaRow>
                   <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.kind === "triage" ? "The repo's issues" : x.role === "manager" ? "The manager asks" : "A worker asks"}</MetaItem>
                   <MetaItem title={exact(x.at_ms)}>{ago(x.at_ms)}</MetaItem>

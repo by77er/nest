@@ -345,7 +345,7 @@ export class FakeNest {
       this.catalog.set(`${m[1]}/${m[2]}/${m[3]}`, call.body);
       return json(200, { ok: true });
     }
-    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts }, created_ms: 1 });
+    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts, github: { repos: [], permissions: { ...GRANT_PERMISSIONS } } }, created_ms: 1 });
     if (r === "GET /v1/clients/self/secrets") {
       return json(200, { secrets: [...this.secrets].sort(([a], [b]) => a.localeCompare(b)).map(([name, x]) => ({ name, description: x.description, size: new TextEncoder().encode(x.value).length, created_ms: x.created_ms, updated_ms: x.updated_ms, last_injected_ms: x.last_injected_ms })) });
     }
@@ -581,7 +581,7 @@ export class FakeGitHub {
   gqlErrors: { match: RegExp; message: string; times: number }[] = [];
   readonly checkRuns = new Map<number, FakeCheckRun>();
   failures: { match: RegExp; status: number; times: number; message?: string }[] = [];
-  /** Check-run creates that are made but whose answer is lost (a 502), as after a timeout. */
+  /** Check-run creates and issue comments that are made but whose answer is lost (a 502), as after a timeout. */
   lost: { match: RegExp; times: number }[] = [];
   private nextId = 1000;
 
@@ -713,12 +713,24 @@ export class FakeGitHub {
         ...(i.pr ? { pull_request: { url: `https://api.github.com/repos/${repoName}/pulls/${n}` } } : {}),
       })));
     }
+    if (req.method === "GET" && (s = sub.match(/^\/issues\/(\d+)\/comments$/))) {
+      // Every comment: the fake keeps no times, so `since` (a filter) is answered as if all were newer.
+      if (!need("issues", "read")) return denied();
+      const i = this.issues.get(repoName)?.get(Number(s[1]));
+      if (!i) return json(404, { message: "Not Found" });
+      return json(200, i.comments.slice(0, Number(u.searchParams.get("per_page") ?? "30")).map((body, k) => ({ id: k + 1, body })));
+    }
     if ((s = sub.match(/^\/issues\/(\d+)(\/comments)?$/)) && (req.method === "POST" || req.method === "PATCH")) {
       if (!need("issues", "write")) return denied();
       const i = this.issues.get(repoName)?.get(Number(s[1]));
       if (!i) return json(404, { message: "Not Found" });
       if (s[2] && req.method === "POST") {
         i.comments.push(call.body.body);
+        const lose = this.lost.find((x) => x.times > 0 && x.match.test(route));
+        if (lose) {
+          lose.times--;
+          return json(502, { message: "Server Error" });
+        }
         return json(201, { id: ++this.nextId });
       }
       if (!s[2] && req.method === "PATCH") {
