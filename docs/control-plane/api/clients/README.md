@@ -103,7 +103,7 @@ POST /v1/agents
 - `grants` takes up to 16 entries of `{action, resource, limits?, expires_ms?}`. Any other field, an unknown limit, an unparsable resource or a past `expires_ms` is 400; a list of tool names (the field's meaning before grants) is 400 too. An agent id that isn't in the subtree is 404.
 - **Confined to the subtree:** the grant reaches only agents of this client, whatever their labels. The client's other agents with matching labels are covered, including ones created later.
 - **The agent sees them** as `grants` in `GET /v1/agents/<id>` (each with its `id`, `scope` and `parent`), and gets `read_transcript` and `list` as tools whatever its template gives. It may pass a narrower one to an agent it spawns (`agent_spawn{grants}`).
-- **They end** at `expires_ms`, when the client is deleted, or, for a grant an agent passed on, when that agent ends. No route revokes one yet.
+- **They can't be revoked one by one yet:** no route or tool revokes a single grant. One ends only at its `expires_ms`, when its holder ends, when the client is deleted, or, for a grant an agent passed on, when that agent ends. To take one back early, end the agent holding it.
 
 ## Inbox senders
 

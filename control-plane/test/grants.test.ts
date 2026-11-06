@@ -8,7 +8,7 @@ import {
   attenuates, type ChainLookups, covers, entryWithin, expiresWithin, formatResource, type HeldGrant, inScope, intersectLimits, limitsWithin, narrows,
   parseGrantRequests, parseResource, reaches, type Resource, resolveChain, storedGrant,
 } from "../src/lib/grants";
-import { adminJson, BASE, connectHost, nextCommands, Ws } from "./helpers";
+import { adminJson, BASE, connectHost, eventually, nextCommands, Ws } from "./helpers";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -282,6 +282,12 @@ describe("read_transcript through a grant", () => {
 
     // Outside the selector, another client's agent with the same labels, the operator's: refused.
     for (const a of [elsewhere, foreign, ops]) expect(await s.call("read_transcript", { agent: a }), a).toMatchObject({ status: "error", error: { code: "forbidden" } });
+    // An id naming nobody answers exactly as one it may not read: no probing which ids exist.
+    const refusedForeign = await s.call("read_transcript", { agent: foreign });
+    const missing = await s.call("read_transcript", { agent: "agt_nobody0" });
+    expect(missing).toMatchObject({ status: "error", error: { code: "forbidden" } });
+    expect({ ...missing.error, message: missing.error.message.replace("agt_nobody0", "X") })
+      .toEqual({ ...refusedForeign.error, message: refusedForeign.error.message.replace(foreign, "X") });
 
     // Discovery: only what the grant covers (itself included), filtered by labels.
     const all = await s.call("list", { kind: "agent" });
@@ -296,6 +302,7 @@ describe("read_transcript through a grant", () => {
     const next = await s.call("list", { kind: "agent", limit: 1, cursor: json(paged).next_cursor });
     expect(json(next).agents).toHaveLength(1);
     expect(json(next).agents[0].agent).not.toBe(json(paged).agents[0].agent);
+    expect(await s.call("list", { kind: "agent", limit: 1.5 })).toMatchObject({ status: "error", error: { code: "invalid_message" } });
     s.ws.close();
   });
 
@@ -398,6 +405,52 @@ describe("read_transcript through a grant", () => {
     expect(tools).not.toContain("read_transcript");
     expect(tools).not.toContain("list");
     s.ws.close();
+  });
+});
+
+describe("list and taint", () => {
+  it("rows whose labels an agent wrote taint the lister; rows a client labelled don't", async () => {
+    const w = await world();
+    const c = await w.mk();
+    // A client-labelled agent: listing it leaves the lister clean.
+    const plain = (await create(w, c, { labels: { project: "p2" } })).agent as string;
+    const clean = await create(w, c, { start: true, grants: [readGrant("agent{project=p2}")] });
+    const cs = await session(w, clean.agent);
+    expect(json(await cs.call("list", { kind: "agent" })).agents.map((x: any) => x.agent)).toEqual([plain]);
+    expect(await tainted(clean.agent)).toBe(false);
+    cs.ws.close();
+
+    // An agent spawns a child it labels: a sibling whose grant covers the child lists it and is tainted.
+    const p = await create(w, c, { template: c.dreamer, start: true });
+    const ps = await session(w, p.agent);
+    const spawned = await ps.call("agent_spawn", { template: c.tpl, task: "t", labels: { project: "p1" } });
+    expect(spawned.status, JSON.stringify(spawned)).toBe("ok");
+    const kid = json(spawned).agent as string;
+    const d = await create(w, c, { start: true, grants: [readGrant("agent{project=p1}")] });
+    const ds = await session(w, d.agent);
+    expect(await tainted(d.agent)).toBe(false);
+    expect(json(await ds.call("list", { kind: "agent" })).agents.map((x: any) => x.agent)).toEqual([kid]);
+    expect(await tainted(d.agent)).toBe(true);
+    ds.ws.close();
+    ps.ws.close();
+  });
+
+  it("rows the operator labelled don't taint the operator's own lister", async () => {
+    const w = await world();
+    const label = `p-${rand()}`;
+    const target = (await adminJson("/v1/agents", { body: { template: "captain", cell: w.cell, start: false, labels: { project: label } } }, 201)).agent as string;
+    const o = await adminJson("/v1/agents", { body: { template: "captain", cell: w.cell, grants: [readGrant(`agent{project=${label}}`)] } }, 201);
+    expect(o.grants).toEqual([expect.objectContaining({ scope: null, parent: { kind: "operator" } })]);
+    const os = await session(w, o.agent);
+    expect(await tainted(o.agent)).toBe(false);
+    // The cell's registry learns of the target from its own deadline.
+    const listed = await eventually("the target listed", async () => {
+      const r = json(await os.call("list", { kind: "agent" })).agents as any[];
+      return r.length ? r : null;
+    });
+    expect(listed.map((x: any) => x.agent)).toEqual([target]);
+    expect(await tainted(o.agent)).toBe(false);
+    os.ws.close();
   });
 });
 

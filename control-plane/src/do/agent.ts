@@ -1355,20 +1355,27 @@ export class AgentDO extends DurableObject<Env> {
   /**
    * Whether it may read `target`'s transcript, and within which limits: an agent it owns (transitively),
    * none; else the first of its `read_transcript` grants (in the order conferred) whose chain holds and
-   * reaches the target. Forbidden otherwise.
+   * reaches the target. Forbidden otherwise, and for an id naming nobody too: an agent that doesn't
+   * exist and one it may not read answer the same, so a grant's holder can't probe ids.
    */
   private async transcriptAuthority(info: AgentInfo, target: string): Promise<{ max_age_ms?: number; max_entries?: number }> {
-    if (ownsVia(info.agent, await this.ownerChain(target))) return {};
-    const now = Date.now();
-    const held = this.heldGrants().filter((g) => g.action === "read_transcript" && (g.expires_ms === undefined || g.expires_ms > now));
-    if (held.length) {
-      const t = await this.targetOf(target);
-      for (const g of held) {
-        const r = await this.resolveGrant(info, g);
-        if (r && reaches(r, t)) return r.limits;
+    const refused = () => new NestError(ErrorCodes.FORBIDDEN, `${target} isn't an agent you own or one a grant of yours covers`, 403);
+    try {
+      if (ownsVia(info.agent, await this.ownerChain(target))) return {};
+      const now = Date.now();
+      const held = this.heldGrants().filter((g) => g.action === "read_transcript" && (g.expires_ms === undefined || g.expires_ms > now));
+      if (held.length) {
+        const t = await this.targetOf(target);
+        for (const g of held) {
+          const r = await this.resolveGrant(info, g);
+          if (r && reaches(r, t)) return r.limits;
+        }
       }
+    } catch (e) {
+      if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) throw refused();
+      throw e;
     }
-    throw new NestError(ErrorCodes.FORBIDDEN, `${target} isn't an agent you own or one a grant of yours covers`, 403);
+    throw refused();
   }
 
   /** What a grant is checked against, from the target's own record. */
@@ -1386,6 +1393,8 @@ export class AgentDO extends DurableObject<Env> {
     const filter = Labels.safeParse(a.labels ?? {});
     if (!filter.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `labels: ${filter.error.issues.map((i) => i.message).join("; ")}`);
     const state = a.state === "ended" || a.state === "all" ? a.state : "live";
+    // An integer before it reaches a registry's SQL LIMIT (the schema says so; checked here too).
+    if (a.limit !== undefined && !Number.isSafeInteger(a.limit)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "limit must be an integer");
     const limit = typeof a.limit === "number" ? Math.min(Math.max(1, a.limit), LIST_MAX_LIMIT) : LIST_DEFAULT_LIMIT;
     const cursor = typeof a.cursor === "string" ? /^(\d+):(.*)$/s.exec(a.cursor) : null;
     if (typeof a.cursor === "string" && !cursor) throw new NestError(ErrorCodes.INVALID_MESSAGE, "bad cursor");
@@ -1435,10 +1444,20 @@ export class AgentDO extends DurableObject<Env> {
             rows = page.items.map((m) => ({ agent: m.id, client: r.scope, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms, by_agent: isAgentId(m.owner) }));
             next = page.next_cursor;
           } else {
-            // The operator's own agents: this cell's registry, without any client's.
+            // The operator's own agents: this cell's registry, without any client's. The registry has no
+            // owner, so each row's comes from its record (who wrote its labels decides the taint), and its
+            // client and labels too; one gone meanwhile is left out.
             const page = await this.fleet(info.cell).listRegistry("agent", q);
-            rows = page.items.filter((m) => m.client === null)
-              .map((m) => ({ agent: m.id, client: m.client, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms, by_agent: true }));
+            const found = await Promise.all(page.items.filter((m) => m.client === null).map(async (m): Promise<Row | null> => {
+              try {
+                const v = await this.agentStub(m.id).info();
+                return { agent: m.id, client: v.client, labels: v.labels, created_ms: m.created_ms, ended_ms: m.ended_ms, by_agent: isAgentId(v.owner) };
+              } catch (e) {
+                if (asNestError(e)?.code !== ErrorCodes.UNKNOWN_AGENT) throw e;
+                return null;
+              }
+            }));
+            rows = found.filter((x): x is Row => x !== null);
             next = page.next_cursor;
           }
         }

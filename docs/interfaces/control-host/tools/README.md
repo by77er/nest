@@ -15,7 +15,7 @@
 | `exit` | every agent | Ends the caller once its turn is done |
 | `fork_sandbox` | `sandboxes` (worker, captain) | `not_implemented` |
 | `attach` | `management` (captain) | `not_implemented` |
-| `read_transcript` | `transcripts` (worker, captain), or a `read_transcript` grant | Its own or an agent's it owns, transitively; any other only through a grant whose chain holds, within its limits (`forbidden` otherwise). `since_ms` keeps entries at or after a time. Read from R2, never wakes anything; another agent's taints the reader |
+| `read_transcript` | `transcripts` (worker, captain), or a `read_transcript` grant | Its own or an agent's it owns, transitively; any other only through a grant whose chain holds, within its limits (`forbidden` otherwise, and for an id naming no agent). `since_ms` keeps entries at or after a time. Read from R2, never wakes anything; another agent's taints the reader |
 | `list` | any grant | The agents its grants cover, one grant per page (`next_cursor`), filtered by labels: `{agents: [{agent, labels, created_ms, ended_ms, actions}], next_cursor}`. Only `kind: agent` |
 | `checkpoint` | `hands` (worker) | `not_implemented` |
 | `expose_port` | `hands` (worker) | `share: true` is `forbidden` for agents: a public link bypasses Access, so only the operator mints one |
