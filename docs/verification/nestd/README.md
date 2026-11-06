@@ -253,6 +253,18 @@ Time is abstract: 5 s steps, 70 s explored. Frames are delayed any number of ste
   - a cut recorded under the newest pass instead of its own fails in 8 (`Pause, Cut, Resume, Write, Pause, Cut, RecordCut, Read`): the older cut's manifest lands over the sentinel a newer cut set. So the memo hands out passes, and only the newest begun records.
 - **Assumed:** every write moves the modification time before its data lands, and only nestd sets the sentinel (the kernel's write path; unverified on a host beyond the tests in `crates/nestd`).
 
+### Shadow cut (M3′)
+
+[`verification/nestd/check/src/shadow.rs`](../../../verification/nestd/check/src/shadow.rs) drives the real `nestd_core::shadow::{normalize, changed}` as `host.rs` does, against a copy-on-write filesystem: five physical blocks with values and reference counts, a two-block disk and its shadow. A write to a block only the disk references overwrites it in place; any other write takes the lowest free block (so freed numbers are reused). A clone makes the shadow reference the disk's blocks over a range.
+- **The cut:** read the disk's map, read the shadow's and compare, clone the ranges one at a time (the guest may write between any two steps), read the shadow's map again; then pause, compare the disk's map with that, clone, and check.
+- **Property:** when a cut ends, the shadow holds the disk's bytes. It holds: 11,339 states, and 82,984 at `writes=6,cuts=3`.
+- **Variant:** `stale-shadow-map` compares with the shadow's map from before its clones, and fails in 8 steps (`Write, ReadDisk, ReadShadowAndCompare, CloneNext, Write, ReadShadowAgain, PauseAndClone, CheckAndResume`). The clone freed the shadow's old block, and the next copy-on-write reused it at the same offset.
+- **Also checked:** `live-base`, comparing with the disk's own map from the pre-copy, holds. Every block that map names is shared with the shadow or cloned into it, so it can't be reused.
+
+[`verification/nestd/check/src/shadow_slots.rs`](../../../verification/nestd/check/src/shadow_slots.rs) (`slots`) drives the real `nestd_core::shadow::Shadows` as `host.rs` does: a cut (locked) takes `target()`, dropping the queued cut when both shadows are held, writes its shadow (torn) and then fails or is queued, replacing any queued cut; a commit takes the queued cut and later ends; a suspend drops the queued cut; the guest writes throughout.
+- **Property:** a shadow a queued or taken cut names holds that cut's generation in every state (the commit reads it at any moment while it holds it). It holds: 3,862 states, reaching both the drop for room and a cut failing beside a queued cut.
+- **Variant:** `unheld-queue`, a queued cut's shadow held only from its read on (#159's first version, where the commit's re-ask came first), fails in 6 steps (`CutBegins, CutEnds, CommitTakes, CutBegins, CutEnds, CutBegins`).
+
 ### Residuals
 
 - A silently half-open socket reads `OPEN`, so the stale-hello guard misses it until the edge notices; one extra reconnect, not a loop.
@@ -269,7 +281,7 @@ The proofs are in `crates/nestd-core` behind `#[cfg(kani)]`. Run them one at a t
 - `recovery.rs`'s `meta.json` version verdict and the scan's per-entry decisions;
 - `host.rs`'s clean-at-start check, retire backoff, "nothing to salvage" check and `salvage_retryable` (single expressions, plus two constants).
 
-Since then, new decisions land there as they are made: `reask_failure_ends_commit` (whether a salvage goes on past a refused re-ask, the fix of the inventory's B1), and `nestd_core::checkpoint`'s memo (M1, new code, not an extraction).
+Since then, new decisions land there as they are made: `reask_failure_ends_commit` (whether a salvage goes on past a refused re-ask, the fix of the inventory's B1), and `nestd_core::checkpoint`'s memo (M1, new code, not an extraction). M3′ adds `nestd_core::shadow`, also new code: `shadow::proofs::a_cut_never_targets_a_shadow_a_queued_or_taken_cut_names` (any six steps of cuts that queue, fail or drop the queued cut for room, commits that take and end, and drops; about 3 minutes). The comparison itself, `changed`, is checked exhaustively by a unit test over the same small domain a harness would take (`exhaustive_changed_covers_every_differing_offset`: 524,288 map pairs, every offset). A Kani harness of it ran past 40 minutes and 20 GB of CBMC on its growing `Vec`, and was dropped.
 
 Functions of one expression have table tests and no harness of their own; the tombstone harness proves them in use.
 

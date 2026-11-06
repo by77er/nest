@@ -152,3 +152,42 @@ fn the_sentinel_holds_with_a_sync_engine_and_fails_without_its_assumptions() {
         assert!(o.violated(SAFETY), "{cfg:?}: expected {SAFETY} to fail");
     }
 }
+
+// --- M3′ option 1: the shadow cut ---------------------------------------------------------------
+
+#[test]
+fn the_shadow_cut_leaves_the_shadow_equal_to_the_disk() {
+    let o = check(nestd_check::shadow::ShadowModel { cfg: nestd_check::shadow::Config::fixed() });
+    assert!(o.violations.is_empty(), "violated {:?} ({} states)", o.violations, o.unique_states);
+    assert!(o.examples.contains(&"a_cut_cloned_what_a_write_changed_during_the_pre_copy"), "{:?}", o.examples);
+}
+
+#[test]
+fn comparing_with_the_shadows_map_from_before_its_clones_misses_a_reused_block() {
+    let cfg = nestd_check::shadow::Config { stale_shadow_map: true, ..nestd_check::shadow::Config::fixed() };
+    let o = check(nestd_check::shadow::ShadowModel { cfg });
+    assert!(o.violated("a_cut_leaves_the_shadow_equal_to_the_disk"), "{:?}", o.violations);
+}
+
+#[test]
+fn a_shadow_a_queued_or_taken_cut_names_holds_that_cut() {
+    let o = check(nestd_check::shadow_slots::SlotsModel { cfg: nestd_check::shadow_slots::Config::fixed() });
+    assert!(o.violations.is_empty(), "violated {:?} ({} states)", o.violations, o.unique_states);
+    for e in ["a_cut_dropped_the_queued_cut_for_room", "a_cut_failed_beside_a_queued_cut"] {
+        assert!(o.examples.contains(&e), "no example of {e}: {:?}", o.examples);
+    }
+}
+
+#[test]
+fn a_queued_cuts_shadow_left_unheld_is_written_by_a_newer_cut() {
+    let cfg = nestd_check::shadow_slots::Config { unheld_queue: true, ..nestd_check::shadow_slots::Config::fixed() };
+    let o = check(nestd_check::shadow_slots::SlotsModel { cfg });
+    assert!(o.violated("a_named_shadow_holds_its_cut"), "{:?}", o.violations);
+}
+
+#[test]
+fn comparing_with_the_disks_map_from_the_pre_copy_also_holds() {
+    let cfg = nestd_check::shadow::Config { live_base: true, ..nestd_check::shadow::Config::fixed() };
+    let o = check(nestd_check::shadow::ShadowModel { cfg });
+    assert!(o.violations.is_empty(), "{:?}", o.violations);
+}

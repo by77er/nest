@@ -67,9 +67,31 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 130' INT TERM HUP
 
-USER_DATA=$(mktemp)
+# The user data: the power-off deadline first, in plain text, then on-host.sh and m3.py as a
+# gzipped tarball it unpacks and runs (EC2 allows 16 KB of user data).
+DEADLINE=${MEASURE_DEADLINE_MIN:-90}
+PACK=$(mktemp -d)
 # MEASURE_SCRIPT: another on-host script of this directory (a probe), with the same layers.
-sed "s/@DEADLINE_MIN@/${MEASURE_DEADLINE_MIN:-90}/" "$HERE/${MEASURE_SCRIPT:-on-host.sh}" > "$USER_DATA"
+sed "s/@DEADLINE_MIN@/$DEADLINE/" "$HERE/${MEASURE_SCRIPT:-on-host.sh}" > "$PACK/on-host.sh"
+# MEASURE_FILES: what the script needs beside it (default fdiff.c, for on-host.sh), from this
+# directory or as paths.
+FILES=()
+for f in ${MEASURE_FILES:-fdiff.c}; do
+  case $f in /*) cp "$f" "$PACK/" ;; *) cp "$HERE/$f" "$PACK/" ;; esac
+  FILES+=("$(basename "$f")")
+done
+USER_DATA=$(mktemp)
+{
+  echo '#!/bin/bash'
+  echo "shutdown -h +$DEADLINE || shutdown -P +$DEADLINE"
+  echo "mkdir -p /root/measure && base64 -d <<'NEST_PACK' | tar -xz -C /root/measure"
+  tar -czf - -C "$PACK" on-host.sh "${FILES[@]}" | base64
+  echo 'NEST_PACK'
+  echo 'exec bash /root/measure/on-host.sh'
+} > "$USER_DATA"
+size=$(wc -c < "$USER_DATA")
+[ "$size" -le 16384 ] || { echo "user data is $size bytes, over EC2's 16384" >&2; exit 1; }
+echo "user data: $size bytes"
 # The template names the cell's security group but no subnet: a subnet of that group's VPC, each AZ in
 # turn until one has the capacity (or MEASURE_SUBNET).
 SG=$(aws ec2 describe-launch-template-versions --region "$REGION" --launch-template-name "$TEMPLATE" --versions '$Default' \
@@ -117,13 +139,14 @@ if ! grep -q NEST-MEASURE-END "$OUT"; then
     sleep 60
   done
 fi
-grep '^measure:' "$OUT" || true
+grep -o 'measure: .*' "$OUT" || true
 RESULT="$HERE/results-$ID.json"
-# The JSON is the first line starting `{"kernel"` (cloud-init echoes it again); the console can splice a
-# `[<timestamp>]` into a long line.
-if grep -m1 '^{"kernel"' "$OUT" | sed -E 's/\[[0-9]{4}-[0-9T:.-]+\]//g' | python3 -I -m json.tool > "$RESULT"; then
+# The JSON comes in `NEST-R <400 chars>` lines (cloud-init's console copy, each with its own prefix);
+# the console can still splice a `[<timestamp>]` into one.
+if grep -o 'NEST-R .*' "$OUT" | sed -E 's/^NEST-R //; s/\[[0-9]{4}-[0-9T:.-]+\]//g' | tr -d '\r\n' | python3 -I -m json.tool > "$RESULT"; then
   echo "results: $RESULT"
 else
+  rm -f "$RESULT"
   echo "no results on the console (see $OUT)" >&2
   exit 1
 fi

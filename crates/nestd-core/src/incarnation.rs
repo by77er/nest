@@ -201,6 +201,11 @@ pub fn meta_version(version: Option<u64>, current: u64) -> MetaVersion {
 /// of the disk waiting for its background commit. A previous release ignores these (they go with
 /// the directory); a starting nestd removes them.
 pub fn is_cut_file(name: &str) -> bool {
+    // M3′'s shadows (and a whole cut of one being written) too: a new process keeps no record of
+    // them, and the next cut makes them again.
+    if matches!(name, "shadow-a.img" | "shadow-b.img" | "shadow-a.img.tmp" | "shadow-b.img.tmp") {
+        return true;
+    }
     name.strip_prefix("cut-").and_then(|r| r.strip_suffix(".img")).is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
@@ -258,7 +263,10 @@ mod tests {
         for yes in ["cut-1.img", "cut-1234567890.img"] {
             assert!(is_cut_file(yes), "{yes}");
         }
-        for no in ["cut-.img", "cut-1.im", "cut-a.img", "disk.img", "meta.json", "xcut-1.img", "cut-1.img.tmp", "cut-1x.img", ""] {
+        for yes in ["shadow-a.img", "shadow-b.img", "shadow-a.img.tmp"] {
+            assert!(is_cut_file(yes), "{yes}");
+        }
+        for no in ["cut-.img", "cut-1.im", "cut-a.img", "disk.img", "meta.json", "xcut-1.img", "cut-1.img.tmp", "cut-1x.img", "", "shadow-c.img", "shadow-a.imgx"] {
             assert!(!is_cut_file(no), "{no}");
         }
     }

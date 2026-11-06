@@ -83,6 +83,9 @@ struct FakeDriver {
     failing_memory_snapshots: Arc<AtomicBool>,
     /// `Vm::pause` and `Vm::resume` calls, as "pause <sandbox>" or "resume <sandbox>", in order.
     vm_ops: Arc<Mutex<Vec<String>>>,
+    /// Whether a VM is paused (`Vm::pause` to `Vm::resume`): a test's guest writer holds this lock
+    /// for each write and writes only while it's false, as a real guest's writes stop in a pause.
+    guest_gate: Arc<Mutex<bool>>,
 }
 
 #[async_trait]
@@ -113,6 +116,7 @@ impl Driver for FakeDriver {
             resume_latch: self.resume_latch.clone(),
             failing_memory_snapshots: self.failing_memory_snapshots.clone(),
             vm_ops: self.vm_ops.clone(),
+            guest_gate: self.guest_gate.clone(),
             running: false,
             emu: None,
             guest: None,
@@ -133,6 +137,7 @@ struct FakeVm {
     resume_latch: Arc<ResumeLatch>,
     failing_memory_snapshots: Arc<AtomicBool>,
     vm_ops: Arc<Mutex<Vec<String>>>,
+    guest_gate: Arc<Mutex<bool>>,
     running: bool,
     emu: Option<Emulator>,
     guest: Option<tokio::task::JoinHandle<()>>,
@@ -182,6 +187,7 @@ impl Vm for FakeVm {
         if self.fail_next_pause.swap(false, Ordering::SeqCst) {
             return Err(std::io::Error::other("fake VM failed to pause"));
         }
+        *self.guest_gate.lock().unwrap() = true;
         self.vm_ops.lock().unwrap().push(format!("pause {}", self.spec.sandbox.0));
         Ok(())
     }
@@ -191,6 +197,7 @@ impl Vm for FakeVm {
             self.resume_latch.reached.store(true, Ordering::SeqCst);
             released.await;
         }
+        *self.guest_gate.lock().unwrap() = false;
         self.vm_ops.lock().unwrap().push(format!("resume {}", self.spec.sandbox.0));
         Ok(())
     }
@@ -1061,6 +1068,12 @@ async fn start_host_cutting() -> Started {
     start_host_leased(None, 5000, STEADY_LEASE, "locked_copy").await
 }
 
+/// [`start_host_cutting`] with M3′'s shadow cut (its test stand-in, `sim_shadow`), every cut checked
+/// byte for byte against its disk (`disk_cut_verify`): a shadow that differs fails the cut.
+async fn start_host_shadow() -> Started {
+    start_host_configured(None, 5000, STEADY_LEASE, "sim_shadow", serde_json::json!({"disk_cut_verify": true})).await
+}
+
 /// [`start_host`] for a test about a lease lapse ([`LAPSING_LEASE`]).
 async fn start_host_lapsing() -> Started {
     start_host_leased(None, 5000, LAPSING_LEASE, "auto").await
@@ -1071,10 +1084,19 @@ async fn start_host_leased(proxy_ca: Option<(CaCertificate, nest_protocol::host:
 }
 
 /// [`start_host_leased`] with more of nestd.json (`extra`'s keys over the test's).
-async fn start_host_configured(
-    proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>, commit_timeout_ms: u64, lease: LeaseTiming, disk_cut: &str, extra: serde_json::Value,
+async fn start_host_configured(proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>, commit_timeout_ms: u64, lease: LeaseTiming, disk_cut: &str, extra: serde_json::Value) -> Started {
+    start_host_in(tempfile::tempdir().unwrap(), proxy_ca, commit_timeout_ms, lease, disk_cut, extra).await
+}
+
+/// [`start_host_configured`] with its state in `dir` (a filesystem of the test's choosing).
+async fn start_host_in(
+    dir: tempfile::TempDir,
+    proxy_ca: Option<(CaCertificate, nest_protocol::host::Secret)>,
+    commit_timeout_ms: u64,
+    lease: LeaseTiming,
+    disk_cut: &str,
+    extra: serde_json::Value,
 ) -> Started {
-    let dir = tempfile::tempdir().unwrap();
     let fleet = mock_fleet_with(lease).await;
     let mut cfg = serde_json::json!({
         "role": "sandbox", "cell": "test-cell",
@@ -3202,4 +3224,434 @@ async fn a_cut_whose_clone_is_cheaper_than_a_read_clones() {
         Some(waiting) => assert!(waiting, "cloned: the cut waits for its commit"),
         None => no_fiemap("a_cut_whose_clone_is_cheaper_than_a_read_clones"),
     }
+}
+
+// --- The same, with M3′'s shadow cut ------------------------------------------------------------------
+
+/// A commit answered after a fence stopped the VM that resumed past its read (a cut's, or since
+/// M1 a read checkpoint's) must leave the disk dirty, so the retire salvages what the VM wrote. It
+/// was marked clean (no VM ran at the answer), and the retire dropped that work. Both modes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_answered_after_a_fence_leaves_the_written_disk_to_salvage_with_shadows() {
+    for cutting in [true, false] {
+        let h = if cutting { start_host_shadow().await } else { start_host().await };
+        let sbx = SandboxId("sbx_1".into());
+        h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+        assert!(is_ok(&h.fleet.result("cmd_create").await));
+        let disk = disk_path(h.dir.path(), "sbx_1", 1);
+        h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+        h.fleet.commands.send(vec![ck("cmd_ck", "sbx_1")]).unwrap();
+        wait_until("the commit is out", || !commit_requests(&h.fleet, "sbx_1").is_empty()).await;
+        guest_write(&disk, 0, b"written after the checkpoint's read");
+        h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
+        h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+        wait_until("the VM stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
+        h.fleet.release_commit_answers();
+        h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
+        let salvaged: Vec<_> = commit_requests(&h.fleet, "sbx_1").into_iter().filter(|r| r.0 == CommitReason::Salvage).collect();
+        assert_eq!(salvaged.len(), 1, "cutting={cutting}: the work after the checkpoint is salvaged");
+        assert!(first_chunk_of(&h, &salvaged[0].2).starts_with(b"written after the checkpoint's read"), "cutting={cutting}");
+    }
+}
+
+/// M2: a fork waits for its parent's cut to commit and its child restores it here, from chunks the
+/// fork's pass kept local.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fork_waits_for_its_cut_and_the_child_has_the_disk_as_cut_with_shadows() {
+    let h = start_host_shadow().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    // Past what the fake VM writes at the start of its disk when it boots (the child's too).
+    guest_write(&disk_path(h.dir.path(), "sbx_1", 1), 4096, b"the parent's work");
+    let fork = CommandBody::SandboxFork {
+        parent: SandboxId("sbx_1".into()),
+        parent_epoch: Epoch(1),
+        child: SandboxId("sbx_2".into()),
+        child_epoch: Epoch(1),
+        child_workstream: None,
+        mode: ForkMode::DiskOnly,
+        policy: policy(),
+    };
+    h.fleet.commands.send(vec![cmd("cmd_fork", fork)]).unwrap();
+    let r = h.fleet.result("cmd_fork").await;
+    assert!(is_ok(&r), "{r:?}");
+    let reqs = commit_requests(&h.fleet, "sbx_1");
+    assert_eq!(reqs.len(), 1);
+    assert_eq!(reqs[0].0, CommitReason::Fork);
+    let child = std::fs::read(disk_path(h.dir.path(), "sbx_2", 1)).unwrap();
+    assert!(child[4096..].starts_with(b"the parent's work"));
+}
+
+/// A checkpoint of an incarnation that was fenced, and whose salvage holds the commit lock (its
+/// answer held back here), fails at once with `stale_epoch`, as on main: it never waits on that
+/// lock, which would stall the host's one command executor and every sandbox's commands behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_checkpoint_of_a_fenced_incarnation_fails_at_once_while_its_salvage_holds_the_commit_lock_with_shadows() {
+    for cutting in [false, true] {
+        let h = if cutting { start_host_shadow().await } else { start_host().await };
+        let sbx = SandboxId("sbx_1".into());
+        h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+        assert!(is_ok(&h.fleet.result("cmd_create").await));
+        h.fleet.commands.send(vec![create("cmd_create2", "sbx_2")]).unwrap();
+        assert!(is_ok(&h.fleet.result("cmd_create2").await));
+        guest_write(&disk_path(h.dir.path(), "sbx_1", 1), 0, b"work");
+        h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+        h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
+        wait_until("the salvage is out", || commit_requests(&h.fleet, "sbx_1").iter().any(|r| r.0 == CommitReason::Salvage)).await;
+        // The other sandbox's command is behind it in the one executor.
+        h.fleet.commands.send(vec![ck("cmd_ck_stale", "sbx_1")]).unwrap();
+        h.fleet.commands.send(vec![cmd("cmd_ck_other", CommandBody::PortUnexpose { sandbox: SandboxId("sbx_2".into()), epoch: Epoch(1), port: 8080 })]).unwrap();
+        let stale = tokio::time::timeout(Duration::from_secs(2), h.fleet.result("cmd_ck_stale")).await;
+        let other = tokio::time::timeout(Duration::from_secs(2), h.fleet.result("cmd_ck_other")).await;
+        h.fleet.release_commit_answers();
+        match stale {
+            Ok(CommandOutcome::Error { error }) => assert_eq!(error.code, "stale_epoch", "cutting={cutting}"),
+            other => panic!("cutting={cutting}: the stale checkpoint waited on the salvage's commit lock: {other:?}"),
+        }
+        assert!(other.is_ok(), "cutting={cutting}: another sandbox's command waited behind it");
+    }
+}
+
+/// A retire waits for the commit in flight: the salvage's `commit_request` goes out only once the
+/// checkpoint's commit has its answer, so two commits of one incarnation never overlap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_salvage_waits_for_the_checkpoints_answer_with_shadows() {
+    for cutting in [false, true] {
+        let h = if cutting { start_host_shadow().await } else { start_host().await };
+        let sbx = SandboxId("sbx_1".into());
+        h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+        assert!(is_ok(&h.fleet.result("cmd_create").await));
+        let disk = disk_path(h.dir.path(), "sbx_1", 1);
+        guest_write(&disk, 0, b"the checkpoint's");
+        h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+        h.fleet.commands.send(vec![ck("cmd_ck", "sbx_1")]).unwrap();
+        wait_until("the checkpoint's commit is out", || !commit_requests(&h.fleet, "sbx_1").is_empty()).await;
+        guest_write(&disk, 0, b"after the checkpoint");
+        h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
+        h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+        wait_until("the VM stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let before: Vec<_> = commit_requests(&h.fleet, "sbx_1").into_iter().map(|r| r.0).collect();
+        assert_eq!(before, vec![CommitReason::TurnEnd], "cutting={cutting}: no salvage while the checkpoint's commit waits for its answer");
+        h.fleet.release_commit_answers();
+        h.fleet.wait_event("retired", |b| matches!(b, HostEventBody::IncarnationRetired { epoch: Epoch(1), .. })).await;
+        let after: Vec<_> = commit_requests(&h.fleet, "sbx_1").into_iter().map(|r| r.0).collect();
+        assert_eq!(after, vec![CommitReason::TurnEnd, CommitReason::Salvage], "cutting={cutting}");
+    }
+}
+
+/// M2: the checkpoint answers once the disk is cut, before its commit is read, uploaded or
+/// answered; the commit carries the cut's instant and the disk as it was at the cut, whatever the
+/// guest wrote after; the cut file goes; the disk stays dirty (its VM resumed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_answers_at_once_and_commits_the_disk_as_cut_with_shadows() {
+    let h = start_host_shadow().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    guest_write(&disk, 0, b"before the cut");
+    h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+    let before = now_ms_test();
+    cut(&h.fleet, "cmd_ck", "sbx_1").await;
+    guest_write(&disk, 0, b"after the cut!");
+    wait_until("the cut's commit request", || !commit_requests(&h.fleet, "sbx_1").is_empty()).await;
+    assert!(!h.fleet.log.lock().unwrap().held.is_empty(), "the command answered while its commit waits");
+    h.fleet.release_commit_answers();
+    let reqs = commit_requests(&h.fleet, "sbx_1");
+    let (reason, cut_ms, manifest) = &reqs[0];
+    assert_eq!(*reason, CommitReason::TurnEnd);
+    assert!(cut_ms.is_some_and(|c| c >= before && c <= now_ms_test()), "{cut_ms:?}");
+    assert!(first_chunk_of(&h, manifest).starts_with(b"before the cut"));
+    wait_until("the head moves", || sandbox_meta(h.dir.path(), "sbx_1", 1).head.is_some()).await;
+    assert!(!sandbox_meta(h.dir.path(), "sbx_1", 1).clean, "the VM ran after the cut");
+}
+
+/// M2: while a commit is out, cuts queue one deep: a newer one replaces the queued one, so three
+/// turn ends make two commits, the first and the last, in order.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cuts_coalesce_behind_a_commit_in_flight_with_shadows() {
+    let h = start_host_shadow().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+    guest_write(&disk, 0, b"one__");
+    cut(&h.fleet, "cmd_ck1", "sbx_1").await;
+    wait_until("the first commit is out", || commit_requests(&h.fleet, "sbx_1").len() == 1).await;
+    guest_write(&disk, 0, b"two__");
+    cut(&h.fleet, "cmd_ck2", "sbx_1").await;
+    guest_write(&disk, 0, b"three");
+    cut(&h.fleet, "cmd_ck3", "sbx_1").await;
+    h.fleet.release_commit_answers();
+    wait_until("the last cut's commit", || commit_requests(&h.fleet, "sbx_1").len() == 2).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let reqs = commit_requests(&h.fleet, "sbx_1");
+    assert_eq!(reqs.len(), 2, "the replaced cut commits nothing: {reqs:?}");
+    assert!(first_chunk_of(&h, &reqs[0].2).starts_with(b"one__"));
+    assert!(first_chunk_of(&h, &reqs[1].2).starts_with(b"three"));
+    assert!(reqs[0].1 < reqs[1].1, "in cut order");
+}
+
+/// M2: a suspend waits for the commit in flight and drops the queued cut (it reads a newer disk):
+/// the head never goes back to an older cut, and the suspended disk is clean.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_suspend_waits_for_the_commit_in_flight_and_drops_the_queued_cut_with_shadows() {
+    let h = start_host_shadow().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+    guest_write(&disk, 0, b"in flight");
+    cut(&h.fleet, "cmd_ck1", "sbx_1").await;
+    wait_until("the first commit is out", || commit_requests(&h.fleet, "sbx_1").len() == 1).await;
+    guest_write(&disk, 0, b"queued___");
+    cut(&h.fleet, "cmd_ck2", "sbx_1").await;
+    guest_write(&disk, 0, b"suspended");
+    h.fleet.commands.send(vec![suspend_cmd("cmd_suspend", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(commit_requests(&h.fleet, "sbx_1").len(), 1, "the suspend waits for the commit in flight");
+    h.fleet.release_commit_answers();
+    assert!(is_ok(&h.fleet.result("cmd_suspend").await));
+    let reqs = commit_requests(&h.fleet, "sbx_1");
+    assert_eq!(reqs.iter().map(|r| r.0).collect::<Vec<_>>(), vec![CommitReason::TurnEnd, CommitReason::Suspend], "{reqs:?}");
+    assert!(first_chunk_of(&h, &reqs[1].2).starts_with(b"suspended"));
+    assert!(reqs[1].1.is_none(), "a suspend reads its disk in place");
+    assert!(cut_files(h.dir.path(), "sbx_1").is_empty());
+    assert!(sandbox_meta(h.dir.path(), "sbx_1", 1).clean);
+}
+
+/// M2 keeps M1's short-circuit: an unchanged disk isn't cut (no cut file), and its manifest is
+/// reused unread (bytes changed with the time put back show it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unchanged_disk_is_not_cut_with_shadows() {
+    let h = start_host_shadow().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    cut(&h.fleet, "cmd_ck1", "sbx_1").await;
+    wait_until("the first commit lands", || sandbox_meta(h.dir.path(), "sbx_1", 1).head.is_some()).await;
+    rewrite_keeping_mtime(&disk, 0, b"unseen");
+    cut(&h.fleet, "cmd_ck2", "sbx_1").await;
+    assert!(cut_files(h.dir.path(), "sbx_1").is_empty(), "nothing cut");
+    wait_until("the second commit", || commit_requests(&h.fleet, "sbx_1").len() == 2).await;
+    let reqs = commit_requests(&h.fleet, "sbx_1");
+    assert_eq!(reqs[1].2, reqs[0].2, "reused unread");
+}
+
+/// M3′: the shadows stay (a cut is read in place), and cuts alternate between them; each commit has
+/// the disk as it was at its cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shadow_cuts_are_read_in_place_and_each_commit_has_its_cut() {
+    let h = start_host_shadow().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    let dir = disk.parent().unwrap().to_path_buf();
+    guest_write(&disk, 0, b"first cut");
+    cut(&h.fleet, "cmd_ck1", "sbx_1").await;
+    wait_until("the first commit lands", || sandbox_meta(h.dir.path(), "sbx_1", 1).head.is_some()).await;
+    assert!(dir.join("shadow-a.img").exists(), "the shadow stays after its commit");
+    guest_write(&disk, 1 << 20, b"second cut");
+    cut(&h.fleet, "cmd_ck2", "sbx_1").await;
+    wait_until("the second commit", || commit_requests(&h.fleet, "sbx_1").len() == 2).await;
+    let reqs = commit_requests(&h.fleet, "sbx_1");
+    assert!(first_chunk_of(&h, &reqs[0].2).starts_with(b"first cut"));
+    assert_ne!(reqs[1].2, reqs[0].2);
+    assert!(first_chunk_of(&h, &reqs[1].2).starts_with(b"first cut"));
+    assert!(dir.join("shadow-b.img").exists(), "the second cut went to the other shadow");
+    guest_write(&disk, 0, b"third cut");
+    cut(&h.fleet, "cmd_ck3", "sbx_1").await;
+    wait_until("the third commit", || commit_requests(&h.fleet, "sbx_1").len() == 3).await;
+    assert!(first_chunk_of(&h, &commit_requests(&h.fleet, "sbx_1")[2].2).starts_with(b"third cut"), "back into shadow a");
+}
+
+/// [`start_host_shadow`] with commits that time out sooner, and every pre-copy cloning into its
+/// shadow (`shadow_pre_copy_min_ranges: 0`), so a cut into a shadow a commit names would show.
+async fn start_host_shadow_eager() -> Started {
+    start_host_configured(None, 4000, STEADY_LEASE, "sim_shadow", serde_json::json!({"disk_cut_verify": true, "shadow_pre_copy_min_ranges": 0})).await
+}
+
+/// The bytes at `at..at+5` of each commit's disk, in order.
+fn committed_at(h: &Started, sandbox: &str, at: usize) -> Vec<String> {
+    commit_requests(&h.fleet, sandbox).iter().map(|r| String::from_utf8_lossy(&first_chunk_of(h, &r.2)[at..at + 5]).into_owned()).collect()
+}
+
+/// #159's review: a commit that has taken its cut and re-asks an unanswered request (the sandbox
+/// unlocked meanwhile) still reads its own cut, never a newer cut written into the same shadow.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_commit_reasking_reads_its_own_shadow() {
+    let h = start_host_shadow_eager().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+    guest_write(&disk, 4096, b"one__");
+    cut(&h.fleet, "cmd_ck1", "sbx_1").await;
+    wait_until("commit 1 out", || commit_requests(&h.fleet, "sbx_1").len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(5000)).await; // commit 1 times out, unanswered
+    guest_write(&disk, 4096, b"two__");
+    cut(&h.fleet, "cmd_ck2", "sbx_1").await;
+    wait_until("commit 2 re-asks commit 1", || commit_requests(&h.fleet, "sbx_1").len() == 2).await;
+    guest_write(&disk, 4096, b"three");
+    cut(&h.fleet, "cmd_ck3", "sbx_1").await;
+    h.fleet.release_commit_answers();
+    wait_until("commit 3", || committed_at(&h, "sbx_1", 4096).contains(&"three".to_string())).await;
+    let got = committed_at(&h, "sbx_1", 4096);
+    assert!(got.contains(&"two__".to_string()), "cut 2's bytes were never committed: {got:?}");
+    let two = got.iter().position(|c| c == "two__").unwrap();
+    assert!(got[two..].iter().all(|c| c != "one__"), "{got:?}");
+}
+
+/// Both shadows held (a commit re-asking with one cut taken, and one cut queued): a newer cut drops
+/// the queued one and takes its shadow, never the taken one's; the taken cut and the newest commit
+/// their own bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn with_both_shadows_held_a_newer_cut_replaces_the_queued_one() {
+    let h = start_host_shadow_eager().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+    guest_write(&disk, 4096, b"one__");
+    cut(&h.fleet, "cmd_ck1", "sbx_1").await;
+    wait_until("commit 1 out", || commit_requests(&h.fleet, "sbx_1").len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(5000)).await; // commit 1 times out, unanswered
+    guest_write(&disk, 4096, b"two__");
+    cut(&h.fleet, "cmd_ck2", "sbx_1").await;
+    wait_until("commit 2 re-asks commit 1", || commit_requests(&h.fleet, "sbx_1").len() == 2).await;
+    guest_write(&disk, 4096, b"three");
+    cut(&h.fleet, "cmd_ck3", "sbx_1").await; // queued behind commit 2
+    guest_write(&disk, 4096, b"four_");
+    cut(&h.fleet, "cmd_ck4", "sbx_1").await; // both held: cut 3 is dropped
+    h.fleet.release_commit_answers();
+    wait_until("commit 4", || committed_at(&h, "sbx_1", 4096).contains(&"four_".to_string())).await;
+    let got = committed_at(&h, "sbx_1", 4096);
+    assert!(got.contains(&"two__".to_string()), "cut 2's bytes were never committed: {got:?}");
+    assert!(!got.contains(&"three".to_string()), "cut 3 was dropped: {got:?}");
+    assert_eq!(got.last().map(String::as_str), Some("four_"), "{got:?}");
+}
+
+/// A cut that fails after its pre-copy wrote a shadow (the pause fails) never touches the shadow a
+/// queued cut names: that cut still commits its own bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cut_failing_after_its_pre_copy_leaves_the_queued_cut_whole() {
+    let h = start_host_shadow_eager().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    h.fleet.hold_commit_answers.store(true, Ordering::SeqCst);
+    guest_write(&disk, 4096, b"one__");
+    cut(&h.fleet, "cmd_ck1", "sbx_1").await;
+    wait_until("commit 1 out", || commit_requests(&h.fleet, "sbx_1").len() == 1).await;
+    guest_write(&disk, 4096, b"two__");
+    cut(&h.fleet, "cmd_ck2", "sbx_1").await; // queued behind commit 1
+    guest_write(&disk, 4096, b"three");
+    h.vm.fail_next_pause.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![ck("cmd_ck3", "sbx_1")]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_ck3").await), "the pause failed");
+    h.fleet.release_commit_answers();
+    wait_until("commit 2", || committed_at(&h, "sbx_1", 4096).iter().any(|c| c != "one__")).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let got = committed_at(&h, "sbx_1", 4096);
+    assert_eq!(got.last().map(String::as_str), Some("two__"), "{got:?}");
+    assert!(!got.contains(&"three".to_string()), "{got:?}");
+}
+
+/// A new shadow is made while the VM runs (the pre-copy's whole clone), not in the pause: a cut
+/// whose pause fails has made it already, and the next cut into it is a comparison.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_shadow_is_made_before_the_pause() {
+    let h = start_host_shadow().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    let shadow = disk.parent().unwrap().join("shadow-a.img");
+    guest_write(&disk, 0, b"made early");
+    h.vm.fail_next_pause.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![ck("cmd_ck1", "sbx_1")]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_ck1").await), "the pause failed");
+    assert!(shadow.exists(), "made before the pause");
+    guest_write(&disk, 0, b"cut after_");
+    cut(&h.fleet, "cmd_ck2", "sbx_1").await;
+    wait_until("the commit", || commit_requests(&h.fleet, "sbx_1").len() == 1).await;
+    assert!(first_chunk_of(&h, &commit_requests(&h.fleet, "sbx_1")[0].2).starts_with(b"cut after_"));
+}
+
+/// The XFS filesystem CI mounts for the real shadow cut (`NEST_TEST_XFS_DIR`), or `None` with a
+/// `NEST-TEST-SKIP:` line locally; in CI (`NEST_CI_REQUIRE_USERNS`) a missing one fails.
+fn xfs_dir(test: &str) -> Option<PathBuf> {
+    match std::env::var_os("NEST_TEST_XFS_DIR") {
+        Some(d) => Some(PathBuf::from(d)),
+        None if std::env::var_os("NEST_CI_REQUIRE_USERNS").is_some() => {
+            panic!("{test}: NEST_TEST_XFS_DIR is unset, and CI forbids skipping")
+        }
+        None => {
+            eprintln!("NEST-TEST-SKIP: {test}: NEST_TEST_XFS_DIR is unset (an XFS mount with reflink)");
+            None
+        }
+    }
+}
+
+/// A guest writing its disk throughout, as a VM does: a few KiB at a time at scattered offsets,
+/// buffered (written back whenever the kernel likes), stopping only while the VM is paused.
+fn spawn_guest_writer(gate: Arc<Mutex<bool>>, disk: PathBuf, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<u64> {
+    std::thread::spawn(move || {
+        use std::os::unix::fs::FileExt;
+        let f = std::fs::OpenOptions::new().write(true).open(&disk).unwrap();
+        let (mut n, mut x) = (0u64, 0x9e37_79b9_7f4a_7c15u64);
+        while !stop.load(Ordering::SeqCst) {
+            {
+                let paused = gate.lock().unwrap();
+                if !*paused {
+                    for _ in 0..8 {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        let at = (x % (64 << 20)) & !511;
+                        let len = 512 * (1 + (x >> 40) % 16) as usize;
+                        f.write_all_at(&vec![(x >> 24) as u8 | 1; len], at).unwrap();
+                        n += 1;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        n
+    })
+}
+
+/// M3′ on a real XFS (CI loop-mounts one): `disk_cut: auto` picks the shadow cut, and cut after cut
+/// with a guest writing throughout, every shadow equals its disk in the pause (`disk_cut_verify`,
+/// byte for byte; a shadow that differs fails the cut), then each commit has its cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn real_xfs_shadow_cuts_under_a_concurrent_writer() {
+    use std::io::Read;
+    let Some(xfs) = xfs_dir("real_xfs_shadow_cuts_under_a_concurrent_writer") else {
+        return;
+    };
+    let h = start_host_in(tempfile::tempdir_in(&xfs).unwrap(), None, 20_000, STEADY_LEASE, "auto", serde_json::json!({"disk_cut_verify": true})).await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    let disk = disk_path(h.dir.path(), "sbx_1", 1);
+    let dir = disk.parent().unwrap().to_path_buf();
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = spawn_guest_writer(h.vm.guest_gate.clone(), disk.clone(), stop.clone());
+    for i in 0..12 {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        cut(&h.fleet, &format!("cmd_ck{i}"), "sbx_1").await;
+    }
+    stop.store(true, Ordering::SeqCst);
+    assert!(writer.join().unwrap() > 100, "the guest wrote throughout");
+    assert!(dir.join("shadow-a.img").exists() && dir.join("shadow-b.img").exists(), "auto cut into both shadows (XFS has reflink and FIEMAP)");
+    // A last cut with the disk still: its commit has the disk's bytes.
+    cut(&h.fleet, "cmd_last", "sbx_1").await;
+    let mut disk_now = vec![0u8; nestd::storage::DISK_CHUNK as usize];
+    std::fs::File::open(&disk).unwrap().read_exact(&mut disk_now).unwrap();
+    wait_until("the last cut's commit", || {
+        commit_requests(&h.fleet, "sbx_1").last().is_some_and(|r| {
+            let c = first_chunk_of(&h, &r.2);
+            disk_now.starts_with(&c) && disk_now[c.len()..].iter().all(|b| *b == 0)
+        })
+    })
+    .await;
 }

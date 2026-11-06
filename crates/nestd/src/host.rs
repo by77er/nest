@@ -18,11 +18,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use nestd_core::shadow::{self as shadow_core, Shadows, Slot};
 use nestd_core::checkpoint::{DiskStamp, Pass, SENTINEL, ScanMemo};
 use nestd_core::incarnation;
 use nestd_core::results::ResultCache;
@@ -140,6 +141,8 @@ struct Sbx {
     /// A cut taken and not yet picked up by its background commit (at most one: a newer cut
     /// replaces it; a suspend, archive or salvage drops it, since what it reads is newer).
     pending_cut: Option<PendingCut>,
+    /// Which shadow a cut writes and which one a commit reads (M3′).
+    shadows: Shadows,
     /// How many times a VM has started or resumed on this disk: a commit marks the disk clean only
     /// if none has since its read (a cut's VM resumes right after the cut).
     runs: u64,
@@ -185,6 +188,7 @@ impl Sbx {
             unanswered: None,
             scan_memo: ScanMemo::new(),
             pending_cut: None,
+            shadows: Shadows::new(),
             runs: 0,
         }
     }
@@ -2076,7 +2080,39 @@ impl Inner {
                 .flatten()
         };
         let extents = counted.map(|c| c.0);
-        let read_instead = match counted {
+        // M3′: the shadow this cut writes, and its pre-copy while the VM runs (a shadow not made yet
+        // is made here, a whole clone of the running disk, then compared like any other). A failed
+        // pre-copy leaves the shadow to be cloned whole in the pause, as M2 cuts. The target is never
+        // a shadow a queued or taken cut names (`Shadows`); when both are (one cut taken by its
+        // commit, one queued), the queued cut is dropped first: this newer cut replaces it anyway.
+        let shadow = if self.cut.shadow() {
+            let slot = match s.shadows.target() {
+                Some(t) => t,
+                None => {
+                    drop_pending_cut(&mut s, "both shadows are held: a newer cut replaces the queued one");
+                    s.shadows.target().ok_or_else(|| error(error_codes::INTERNAL, "no shadow is free for a cut", true))?
+                }
+            };
+            let path = shadow_path(&s.state_dir, slot);
+            let (mode, d, p, make, min) = (self.cut, disk.clone(), path.clone(), !path.exists(), self.cfg.shadow_pre_copy_min_ranges);
+            let pre = match tokio::task::spawn_blocking(move || pre_copy(mode, &d, &p, make, min)).await {
+                Ok(Ok(pre)) => Some(pre),
+                Ok(Err(e)) => {
+                    tracing::warn!(sandbox = %id, epoch = epoch.0, error = %e, "checkpoint: the shadow's pre-copy failed: this cut clones the disk whole");
+                    None
+                }
+                Err(e) => {
+                    s.shadows.cut_failed(slot);
+                    return Err(internal(e));
+                }
+            };
+            Some((slot, path, pre))
+        } else {
+            None
+        };
+        // Only a whole clone can outlast a read: the shadow's in-pause step is a walk of the map.
+        let whole = shadow.as_ref().is_none_or(|(_, _, pre)| pre.is_none());
+        let read_instead = whole && match counted {
             Some((extents, allocated)) => {
                 let slower = storage::clone_slower_than_read(extents, allocated, self.cfg.cut_clone_ns_per_extent, self.cfg.cut_read_bytes_per_s);
                 if slower {
@@ -2087,8 +2123,12 @@ impl Inner {
             None => false,
         };
         let paused_at = Instant::now();
-        if running {
-            self.pause_vm(&mut s, format!("checkpoint ({})", commit_reason_wire(reason))).await.map_err(internal)?;
+        if running && let Err(e) = self.pause_vm(&mut s, format!("checkpoint ({})", commit_reason_wire(reason))).await {
+            // The pre-copy may have written the shadow: it wasn't held, so no cut names it.
+            if let Some((slot, _, _)) = &shadow {
+                s.shadows.cut_failed(*slot);
+            }
+            return Err(internal(e));
         }
         // Paused, or no VM runs. A fork's pass reads every chunk (to keep them local): no reuse.
         let stable = self.driver.pause_quiesces_disk();
@@ -2097,27 +2137,36 @@ impl Inner {
         let cut_path = s.state_dir.join(format!("cut-{cut_id}.img"));
         let (store, mode) = (self.store.clone(), self.cut);
         let (d, c) = (disk.clone(), cut_path.clone());
-        let cut = tokio::task::spawn_blocking(move || -> std::io::Result<(CutSource, Option<DiskStamp>)> {
+        let verify = self.cfg.disk_cut_verify;
+        let shadow_for_cut = shadow.as_ref().map(|(slot, path, pre)| (*slot, path.clone(), pre.as_ref().map(|p| p.base.clone())));
+        let cut = tokio::task::spawn_blocking(move || -> std::io::Result<(CutSource, Option<DiskStamp>, Option<ShadowCut>)> {
             // An unchanged disk isn't cut: its manifest is checked as M1 does (reading only the
             // chunks the 12 h rule doubts), inside this pause.
             let reread = match &reuse {
                 Some(prev) => storage::rescan_unchanged(store.as_ref(), &d, prev, HOLD_BACK_BYTES)?,
                 None => None,
             };
+            let mut shadow_cut = None;
             let source = match reread {
                 Some(read) => CutSource::Read(read),
                 None if read_instead => CutSource::Read(storage::scan_file_keeping(store.as_ref(), &d, ManifestKind::Disk, HOLD_BACK_BYTES, keep_local)?),
-                None => {
-                    match mode {
-                        CutMode::LockedCopy => storage::locked_copy(&d, &c)?,
-                        _ => storage::reflink(&d, &c)?,
+                None => match shadow_for_cut {
+                    Some((slot, path, base)) => {
+                        shadow_cut = Some(cut_shadow(mode, &d, &path, base, verify)?);
+                        CutSource::Shadow(slot, path)
                     }
-                    CutSource::File(c)
-                }
+                    None => {
+                        match mode {
+                            CutMode::LockedCopy => storage::locked_copy(&d, &c)?,
+                            _ => storage::reflink(&d, &c)?,
+                        }
+                        CutSource::File(c)
+                    }
+                },
             };
             // Last, still paused: a write from here on moves the mtime off the sentinel.
             let stamp = if stable { set_sentinel(&d).ok() } else { None };
-            Ok((source, stamp))
+            Ok((source, stamp, shadow_cut))
         })
         .await
         .map_err(internal)
@@ -2141,18 +2190,37 @@ impl Inner {
             self.with_row(id, epoch, |x| x.dirty = true);
         }
         let paused_ms = paused_at.elapsed().as_millis() as u64;
-        let (source, stamp) = match cut {
+        let (source, stamp, shadow_cut) = match cut {
             Ok(c) => c,
             Err(e) => {
                 let _ = std::fs::remove_file(&cut_path);
+                if let Some((slot, _, _)) = &shadow {
+                    s.shadows.cut_failed(*slot);
+                }
                 tracing::warn!(sandbox = %id, epoch = epoch.0, error = %e.message, "checkpoint: the cut failed");
                 return Err(e);
             }
         };
-        let reused = matches!(source, CutSource::Read(_));
-        tracing::info!(sandbox = %id, epoch = epoch.0, reason = ?reason, cut = cut_id, paused_ms, reused, extents, "checkpoint: disk cut");
-        let (tx, rx) = oneshot::channel();
+        // The cut is queued from here: its shadow is held until its commit is done with it, and the
+        // cut it replaces releases its own.
         drop_pending_cut(&mut s, "a newer cut replaces it");
+        match (&source, &shadow) {
+            (CutSource::Shadow(slot, _), _) => s.shadows.cut(*slot),
+            // Read instead: the pre-copy may have written the shadow, which no cut names.
+            (_, Some((slot, _, _))) => s.shadows.cut_failed(*slot),
+            _ => {}
+        }
+        let reused = matches!(source, CutSource::Read(_));
+        match (&shadow_cut, shadow.as_ref().and_then(|(_, _, pre)| pre.as_ref())) {
+            // The record count and the pause per cut, for measuring real disks (docs/sandbox/state/disk/, M3′).
+            (Some(c), pre) => tracing::info!(
+                sandbox = %id, epoch = epoch.0, reason = ?reason, cut = cut_id, paused_ms, records = c.records, walk_ms = c.walk_ms,
+                ranges = c.ranges, bytes = c.bytes, whole = c.whole, made = pre.map(|p| p.made), precopy_ranges = pre.map(|p| p.ranges), precopy_bytes = pre.map(|p| p.bytes),
+                precopy_ms = pre.map(|p| p.ms), "checkpoint: disk cut into a shadow"
+            ),
+            (None, _) => tracing::info!(sandbox = %id, epoch = epoch.0, reason = ?reason, cut = cut_id, paused_ms, reused, extents, "checkpoint: disk cut"),
+        }
+        let (tx, rx) = oneshot::channel();
         s.pending_cut = Some(PendingCut { id: cut_id, source, pass, stable, stamp, cut_ms, runs_at_cut, reason, keep_local, done: Some(tx) });
         let entry = tokio::sync::OwnedMutexGuard::mutex(&s).clone();
         drop(s);
@@ -2175,13 +2243,22 @@ impl Inner {
         let mut cut = s.pending_cut.take().expect("checked");
         let done = cut.done.take();
         let (id, epoch) = (s.id.clone(), s.epoch);
-        let finish = |cut: &PendingCut| {
+        // The shadow this cut names stays held (no cut writes it) until this commit is done with it,
+        // on every path out: the re-ask below waits with the sandbox unlocked, and newer cuts run.
+        let held = match &cut.source {
+            CutSource::Shadow(slot, _) => Some(*slot),
+            _ => None,
+        };
+        let finish = |s: &mut Sbx, cut: &PendingCut| {
             if let CutSource::File(f) = &cut.source {
                 let _ = std::fs::remove_file(f);
             }
+            if let Some(slot) = held {
+                s.shadows.release(slot);
+            }
         };
         if self.fenced(&id, epoch) {
-            finish(&cut);
+            finish(&mut s, &cut);
             if let Some(d) = done {
                 let _ = d.send(Err(error(error_codes::STALE_EPOCH, format!("{id}@{} was fenced", epoch.0), false)));
             }
@@ -2193,28 +2270,29 @@ impl Inner {
         let answered = match answered {
             Ok(a) => a,
             Err(e) => {
-                finish(&cut);
+                finish(&mut s, &cut);
                 if let Some(d) = done {
                     let _ = d.send(Err(e));
                 }
                 return;
             }
         };
-        // Read the cut with the sandbox unlocked: it is a frozen file no one else writes.
+        // Read the cut with the sandbox unlocked: it is a frozen file no cut writes (it is held).
         drop(s);
         let started = Instant::now();
-        let read = match std::mem::replace(&mut cut.source, CutSource::File(PathBuf::new())) {
-            CutSource::Read(r) => Ok(r),
-            CutSource::File(f) => {
-                let (store, keep) = (self.store.clone(), cut.keep_local);
-                let f2 = f.clone();
-                cut.source = CutSource::File(f);
-                // The VM runs again: uploads go as the cut is read (nothing to hold back for).
+        let read = match &cut.source {
+            CutSource::Read(_) => match std::mem::replace(&mut cut.source, CutSource::File(PathBuf::new())) {
+                CutSource::Read(r) => Ok(r),
+                _ => unreachable!(),
+            },
+            // The VM runs again: uploads go as the cut is read (nothing to hold back for).
+            CutSource::Shadow(_, f) | CutSource::File(f) => {
+                let (store, keep, f2) = (self.store.clone(), cut.keep_local, f.clone());
                 tokio::task::spawn_blocking(move || storage::scan_file_keeping(store.as_ref(), &f2, ManifestKind::Disk, 0, keep)).await.map_err(internal).and_then(|r| r.map_err(internal))
             }
         };
-        finish(&cut);
         let mut s = entry.lock_owned().await;
+        finish(&mut s, &cut);
         let read = match read {
             Ok(r) => r,
             Err(e) => {
@@ -2738,10 +2816,21 @@ struct Prepared {
 enum CutMode {
     /// No cut: the VM is paused while its disk is read (M1).
     None,
-    /// `FICLONE` inside a pause only as long as the clone; read in the background.
+    /// `FICLONE` inside a pause only as long as the clone; read in the background (M2).
     Reflink,
     /// Tests and the e2e harness: a copy under an exclusive `flock` (`storage::locked_copy`).
     LockedCopy,
+    /// Two shadows per incarnation, made equal to the disk by cloning only what changed (M3′,
+    /// `nestd_core::shadow`): `FIEMAP` and `FICLONERANGE`.
+    Shadow,
+    /// Tests and the e2e harness: the shadow cut over `storage::sim_fiemap` and a byte copy.
+    SimShadow,
+}
+
+impl CutMode {
+    fn shadow(self) -> bool {
+        matches!(self, CutMode::Shadow | CutMode::SimShadow)
+    }
 }
 
 /// The configured cut, probed on the sandboxes' filesystem at start: `auto` takes a reflink where
@@ -2751,9 +2840,13 @@ fn decide_cut(cfg: &Config) -> CutMode {
     match cfg.disk_cut {
         DiskCut::Read => CutMode::None,
         DiskCut::LockedCopy => CutMode::LockedCopy,
+        DiskCut::SimShadow => CutMode::SimShadow,
         DiskCut::Auto => {
             let _ = std::fs::create_dir_all(&dir);
-            if storage::reflink_works(&dir) {
+            if storage::shadow_cut_works(&dir) {
+                tracing::info!(dir = %dir.display(), "checkpoints cut disks into shadows, cloning only what changed");
+                CutMode::Shadow
+            } else if storage::reflink_works(&dir) {
                 tracing::info!(dir = %dir.display(), "checkpoints cut disks with a reflink");
                 CutMode::Reflink
             } else {
@@ -2789,6 +2882,8 @@ struct PendingCut {
 enum CutSource {
     File(PathBuf),
     Read(storage::Scanned),
+    /// A shadow left equal to the disk (M3′): read in place, never deleted.
+    Shadow(Slot, PathBuf),
 }
 
 /// What a checkpoint with a cut returns: the generation at once (nothing to cut: no disk), or a
@@ -2803,13 +2898,122 @@ enum CutOutcome {
 fn drop_pending_cut(s: &mut Sbx, why: &str) {
     if let Some(p) = s.pending_cut.take() {
         tracing::info!(sandbox = %s.id, epoch = s.epoch.0, cut = p.id, why, "a queued cut is dropped");
-        if let CutSource::File(f) = &p.source {
-            let _ = std::fs::remove_file(f);
+        match &p.source {
+            CutSource::File(f) => {
+                let _ = std::fs::remove_file(f);
+            }
+            CutSource::Shadow(slot, _) => s.shadows.release(*slot),
+            CutSource::Read(_) => {}
         }
         if let Some(done) = p.done {
             let _ = done.send(Err(error(error_codes::INTERNAL, format!("cut dropped: {why}"), true)));
         }
     }
+}
+
+/// A shadow's file in an incarnation directory (M3′).
+fn shadow_path(dir: &Path, slot: Slot) -> PathBuf {
+    dir.join(match slot {
+        Slot::A => "shadow-a.img",
+        Slot::B => "shadow-b.img",
+    })
+}
+
+/// What the pre-copy leaves the pause: the shadow's map as it is now (after the pre-copy's clones),
+/// to compare the disk's with.
+struct PreCopy {
+    base: Vec<shadow_core::Extent>,
+    /// The shadow was made by this pre-copy (a whole clone while the VM ran).
+    made: bool,
+    ranges: usize,
+    bytes: u64,
+    ms: u64,
+}
+
+/// What a shadow cut did in the pause.
+struct ShadowCut {
+    records: usize,
+    walk_ms: u64,
+    ranges: usize,
+    bytes: u64,
+    /// Cloned whole (a new shadow, a failed pre-copy, or a check that failed).
+    whole: bool,
+}
+
+fn shadow_map(mode: CutMode, path: &Path) -> std::io::Result<Vec<shadow_core::Extent>> {
+    let raw = if mode == CutMode::SimShadow { storage::sim_fiemap(path)? } else { storage::fiemap(path)? };
+    Ok(shadow_core::normalize(raw))
+}
+
+fn shadow_clone(mode: CutMode, disk: &Path, shadow: &Path, ranges: &[shadow_core::Range]) -> std::io::Result<()> {
+    if mode == CutMode::SimShadow { storage::sim_clone_ranges(disk, shadow, ranges) } else { storage::clone_ranges(disk, shadow, ranges) }
+}
+
+/// The shadow made equal to the disk whole: a clone into a new file that replaces it.
+fn shadow_whole(mode: CutMode, disk: &Path, shadow: &Path) -> std::io::Result<()> {
+    let tmp = shadow.with_extension("img.tmp");
+    let _ = std::fs::remove_file(&tmp);
+    if mode == CutMode::SimShadow { storage::locked_copy(disk, &tmp)? } else { storage::reflink(disk, &tmp)? }
+    std::fs::rename(&tmp, shadow)
+}
+
+/// While the VM runs: make the shadow if it isn't (`make`: a whole clone of the disk), write back
+/// what the guest flushed, compare the disk's map with the shadow's, and, from `min_ranges` ranges
+/// that differ, clone them now and read the shadow's map again, so the pause has little left to
+/// clone (`nestd_core::shadow`). The VM writes throughout: the pause's comparison, against the
+/// shadow's map as it is after these clones, catches whatever they missed.
+fn pre_copy(mode: CutMode, disk: &Path, shadow: &Path, make: bool, min_ranges: usize) -> std::io::Result<PreCopy> {
+    let started = Instant::now();
+    if make {
+        shadow_whole(mode, disk, shadow)?;
+    }
+    storage::sync_data(disk)?;
+    let d0 = shadow_map(mode, disk)?;
+    let s0 = shadow_map(mode, shadow)?;
+    let ranges = shadow_core::changed(&d0, &s0);
+    let bytes = ranges.iter().map(|r| r.end - r.start).sum();
+    // The base is the shadow's map as it is after the clones, never the one read before them.
+    let base = if ranges.len() >= min_ranges {
+        shadow_clone(mode, disk, shadow, &ranges)?;
+        shadow_map(mode, shadow)?
+    } else {
+        s0
+    };
+    Ok(PreCopy { base, made: make, ranges: ranges.len(), bytes, ms: started.elapsed().as_millis() as u64 })
+}
+
+/// In the pause: make the shadow equal to the disk. With a pre-copy's `base`, write back, walk the
+/// disk's map, compare it with the shadow's and clone what differs; without one (or if that fails),
+/// clone the disk whole. `verify` compares the two files after, and fails the cut if they differ.
+fn cut_shadow(mode: CutMode, disk: &Path, shadow: &Path, base: Option<Vec<shadow_core::Extent>>, verify: bool) -> std::io::Result<ShadowCut> {
+    let started = Instant::now();
+    let by_diff = base.map(|base| -> std::io::Result<ShadowCut> {
+        storage::sync_data(disk)?;
+        let d1 = shadow_map(mode, disk)?;
+        let walk_ms = started.elapsed().as_millis() as u64;
+        let ranges = shadow_core::changed(&d1, &base);
+        shadow_clone(mode, disk, shadow, &ranges)?;
+        Ok(ShadowCut { records: d1.len(), walk_ms, ranges: ranges.len(), bytes: ranges.iter().map(|r| r.end - r.start).sum(), whole: false })
+    });
+    let cut = match by_diff {
+        Some(Ok(c)) => c,
+        Some(Err(e)) => {
+            tracing::warn!(shadow = %shadow.display(), error = %e, "checkpoint: the shadow's comparison failed: cutting it whole");
+            shadow_whole(mode, disk, shadow)?;
+            ShadowCut { records: 0, walk_ms: 0, ranges: 0, bytes: 0, whole: true }
+        }
+        None => {
+            shadow_whole(mode, disk, shadow)?;
+            ShadowCut { records: 0, walk_ms: 0, ranges: 0, bytes: 0, whole: true }
+        }
+    };
+    // The check the model proves can't fail (`verification/nestd/check`, `shadow`), made in tests:
+    // a shadow that differs fails the cut, loudly.
+    if verify && !storage::same_bytes(disk, shadow)? {
+        tracing::error!(shadow = %shadow.display(), whole = cut.whole, "checkpoint: the shadow differs from its disk after the cut");
+        return Err(std::io::Error::other("the shadow differs from its disk after the cut"));
+    }
+    Ok(cut)
 }
 
 /// Chunks a commit holds back in memory for upload after a checkpoint's VM resumes; past this it
@@ -3114,5 +3318,39 @@ mod tests {
         super::grow_filesystem(&img).unwrap();
         let after = blocks();
         assert!(after >= before * 3, "{before} -> {after} blocks");
+    }
+
+    /// The pause's write-back is load-bearing on a real XFS (`NEST_TEST_XFS_DIR`): a write after the
+    /// pre-copy, still only in the page cache over a block the shadow shares, doesn't move the
+    /// disk's map until it is written back. The same comparison without the write-back misses it
+    /// (shown here, so the test can't pass vacuously); `cut_shadow`, which writes back first, doesn't.
+    #[test]
+    fn the_pauses_write_back_catches_a_write_after_the_pre_copy() {
+        use super::{CutMode, cut_shadow, pre_copy, shadow_clone, shadow_map, storage};
+        use std::os::unix::fs::FileExt;
+        let Some(xfs) = std::env::var_os("NEST_TEST_XFS_DIR") else {
+            assert!(std::env::var_os("NEST_CI_REQUIRE_USERNS").is_none(), "NEST_TEST_XFS_DIR is unset, and CI forbids skipping");
+            eprintln!("NEST-TEST-SKIP: the_pauses_write_back_catches_a_write_after_the_pre_copy: NEST_TEST_XFS_DIR is unset");
+            return;
+        };
+        let dir = tempfile::tempdir_in(xfs).unwrap();
+        let (disk, a, b) = (dir.path().join("disk.img"), dir.path().join("shadow-a.img"), dir.path().join("shadow-b.img"));
+        let f = std::fs::File::create(&disk).unwrap();
+        f.write_all_at(&vec![7u8; 1 << 20], 0).unwrap();
+        f.sync_all().unwrap();
+        let after = |f: &std::fs::File| f.write_all_at(&[9u8; 4096], 64 << 10).unwrap();
+        // Without the write-back: the write is missed.
+        let pre = pre_copy(CutMode::Shadow, &disk, &a, true, 0).unwrap();
+        after(&f);
+        let unsynced = shadow_map(CutMode::Shadow, &disk).unwrap();
+        shadow_clone(CutMode::Shadow, &disk, &a, &nestd_core::shadow::changed(&unsynced, &pre.base)).unwrap();
+        assert!(!storage::same_bytes(&disk, &a).unwrap(), "the map moved before write-back: this kernel doesn't show the hazard");
+        // `cut_shadow`, the same steps with the write-back first: equal.
+        f.write_all_at(&[7u8; 4096], 64 << 10).unwrap();
+        let pre = pre_copy(CutMode::Shadow, &disk, &b, true, 0).unwrap();
+        after(&f);
+        let cut = cut_shadow(CutMode::Shadow, &disk, &b, Some(pre.base), false).unwrap();
+        assert!(!cut.whole);
+        assert!(storage::same_bytes(&disk, &b).unwrap(), "the shadow missed a write made after its pre-copy");
     }
 }

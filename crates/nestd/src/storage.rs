@@ -451,6 +451,160 @@ fn fiemap_extent_count(f: &File) -> io::Result<u64> {
     Ok(u64::from(m.mapped_extents))
 }
 
+/// Every extent of `path`, as FIEMAP reports it (raw: `nestd_core::shadow::normalize` reads it), in
+/// batches. Blocking, and it walks the whole map: call it off the async runtime.
+pub fn fiemap(path: &Path) -> io::Result<Vec<nestd_core::shadow::Extent>> {
+    const BATCH: usize = 16384;
+    const HDR: usize = 32;
+    const EXT: usize = 56;
+    let f = File::open(path)?;
+    let mut out = Vec::new();
+    let mut start = 0u64;
+    let mut buf = vec![0u8; HDR + BATCH * EXT];
+    loop {
+        buf.fill(0);
+        buf[0..8].copy_from_slice(&start.to_ne_bytes());
+        buf[8..16].copy_from_slice(&(u64::MAX - start).to_ne_bytes());
+        buf[24..28].copy_from_slice(&(BATCH as u32).to_ne_bytes());
+        // SAFETY: FS_IOC_FIEMAP reads a `struct fiemap` header and writes at most `fm_extent_count`
+        // extents after it; `buf` holds the header and that many.
+        let r = unsafe { libc::ioctl(f.as_raw_fd(), libc::_IOWR::<[u8; HDR]>(b'f' as u32, 11), buf.as_mut_ptr()) };
+        if r < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let n = u32::from_ne_bytes(buf[20..24].try_into().expect("4 bytes")) as usize;
+        let mut last = false;
+        for i in 0..n {
+            let e = &buf[HDR + i * EXT..HDR + (i + 1) * EXT];
+            let word = |o: usize| u64::from_ne_bytes(e[o..o + 8].try_into().expect("8 bytes"));
+            let flags = u32::from_ne_bytes(e[40..44].try_into().expect("4 bytes"));
+            out.push(nestd_core::shadow::Extent { logical: word(0), physical: word(8), length: word(16), flags });
+            last |= flags & nestd_core::shadow::flags::LAST != 0;
+        }
+        if n == 0 || last {
+            return Ok(out);
+        }
+        let e = out.last().expect("n > 0");
+        start = e.logical + e.length;
+    }
+}
+
+/// Clone each of `ranges` of `src` into `dst` at the same offsets (`FICLONERANGE`): `dst` then shares
+/// `src`'s blocks there. A range is clipped to `src`'s size (its tail extent may run past it).
+pub fn clone_ranges(src: &Path, dst: &Path, ranges: &[nestd_core::shadow::Range]) -> io::Result<()> {
+    #[repr(C)]
+    struct FileCloneRange {
+        src_fd: i64,
+        src_offset: u64,
+        src_length: u64,
+        dest_offset: u64,
+    }
+    let from = File::open(src)?;
+    let to = OpenOptions::new().write(true).open(dst)?;
+    let size = from.metadata()?.len();
+    for r in ranges {
+        let end = r.end.min(size);
+        if end <= r.start {
+            continue;
+        }
+        let a = FileCloneRange { src_fd: i64::from(from.as_raw_fd()), src_offset: r.start, src_length: end - r.start, dest_offset: r.start };
+        // SAFETY: FICLONERANGE reads one `struct file_clone_range` we own; both fds are ours and open.
+        if unsafe { libc::ioctl(to.as_raw_fd(), libc::_IOW::<FileCloneRange>(0x94, 13), &a as *const FileCloneRange) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Whether the filesystem of `dir` supports the shadow cut: a range clone and a map read (two
+/// scratch files, removed again).
+pub fn shadow_cut_works(dir: &Path) -> bool {
+    let a = dir.join(format!(".shadow-probe-{}", crate::util::random_hex(8)));
+    let b = a.with_extension("b");
+    let ok = (|| -> io::Result<bool> {
+        fs::write(&a, vec![7u8; 8192])?;
+        File::open(&a)?.sync_all()?;
+        reflink(&a, &b)?;
+        File::open(&b)?.sync_all()?;
+        clone_ranges(&a, &b, &[nestd_core::shadow::Range { start: 0, end: 4096 }])?;
+        let (ma, mb) = (fiemap(&a)?, fiemap(&b)?);
+        Ok(!ma.is_empty() && !mb.is_empty())
+    })()
+    .unwrap_or(false);
+    let _ = fs::remove_file(&a);
+    let _ = fs::remove_file(&b);
+    ok
+}
+
+/// Tests and the e2e harness only, where the filesystem has no reflink: a stand-in for [`fiemap`]
+/// whose "physical" address of each 4 KiB block is a hash of its bytes, so two files compare equal
+/// exactly where their bytes are, as two reflinked files do. Holes are left out.
+pub fn sim_fiemap(path: &Path) -> io::Result<Vec<nestd_core::shadow::Extent>> {
+    let f = File::open(path)?;
+    let size = f.metadata()?.len();
+    let mut out = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let mut pos = 0u64;
+    while pos < size {
+        let Some(data) = next_data(&f, pos)? else { break };
+        // SAFETY: lseek on an fd we own.
+        let hole = unsafe { libc::lseek(f.as_raw_fd(), data as libc::off_t, libc::SEEK_HOLE) };
+        let end = if hole < 0 { size } else { (hole as u64).min(size) };
+        let mut at = data - data % 4096;
+        while at < end {
+            let n = (end - at).min(4096) as usize;
+            f.read_exact_at(&mut buf[..n], at)?;
+            let h = blake3::hash(&buf[..n]);
+            let physical = u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 bytes"));
+            out.push(nestd_core::shadow::Extent { logical: at, physical, length: n as u64, flags: 0 });
+            at += n as u64;
+        }
+        pos = end;
+    }
+    Ok(out)
+}
+
+/// The stand-in for [`clone_ranges`] beside [`sim_fiemap`]: copies the bytes.
+pub fn sim_clone_ranges(src: &Path, dst: &Path, ranges: &[nestd_core::shadow::Range]) -> io::Result<()> {
+    let from = File::open(src)?;
+    let to = OpenOptions::new().write(true).open(dst)?;
+    let size = from.metadata()?.len();
+    to.set_len(size)?;
+    let mut buf = vec![0u8; 1 << 20];
+    for r in ranges {
+        let mut at = r.start;
+        let end = r.end.min(size);
+        while at < end {
+            let n = (end - at).min(buf.len() as u64) as usize;
+            from.read_exact_at(&mut buf[..n], at)?;
+            to.write_all_at(&buf[..n], at)?;
+            at += n as u64;
+        }
+    }
+    to.sync_data()
+}
+
+/// Whether two files hold the same bytes (the shadow cut's check, in tests and when configured).
+pub fn same_bytes(a: &Path, b: &Path) -> io::Result<bool> {
+    let (fa, fb) = (File::open(a)?, File::open(b)?);
+    let size = fa.metadata()?.len();
+    if fb.metadata()?.len() != size {
+        return Ok(false);
+    }
+    let (mut x, mut y) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    let mut at = 0u64;
+    while at < size {
+        let n = (size - at).min(x.len() as u64) as usize;
+        fa.read_exact_at(&mut x[..n], at)?;
+        fb.read_exact_at(&mut y[..n], at)?;
+        if x[..n] != y[..n] {
+            return Ok(false);
+        }
+        at += n as u64;
+    }
+    Ok(true)
+}
+
 /// Whether cloning a file of `extents` records (at `clone_ns_per_extent` each) would pause a VM
 /// longer than reading its `allocated` bytes (at `read_bytes_per_s`) would. M2's measurement put a
 /// clone at 10-15 us a record and a cold read at about 180 MB/s on a `c8id.large`

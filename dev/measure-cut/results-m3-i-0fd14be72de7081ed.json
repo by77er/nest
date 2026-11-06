@@ -1,0 +1,920 @@
+{
+ "fdiff_built": true,
+ "kernel": "6.18.56-125.164.amzn2023.x86_64",
+ "instance_type": "m8id.large",
+ "mkfs_exchange": true,
+ "xfsprogs": "mkfs.xfs version 6.12.0",
+ "instance_store": 118000000000,
+ "xfs_info": "meta-data=/dev/nvme1n1           isize=512    agcount=4, agsize=7202149 blks\n         =                       sectsz=512   attr=2, projid32bit=1\n         =                       crc=1        finobt=1, sparse=1, rmapbt=0\n         =                       reflink=1    bigtime=1 inobtcount=1 nrext64=0\n         =                       exchange=1  \ndata     =                       bsize=4096   blocks=28808593, imaxpct=25\n         =                       sunit=0      swidth=0 blks\nnaming   =version 2              bsize=4096   ascii-ci=0, ftype=1, parent=0\nlog      =internal log bsize=4096   blocks=16384, version=2\n         =                       sectsz=512   sunit=0 blks, lazy-count=1\nrealtime =none                   extsz=4096   blocks=0, rtextents=0\n",
+ "clone_fresh": {
+  "extents": 44,
+  "ms": [
+   14,
+   14,
+   14,
+   14,
+   14
+  ]
+ },
+ "walk_fresh": {
+  "extents": 46,
+  "walk_ms": 0.05,
+  "walk_kernel_ms": 0.03,
+  "walk2_ms": 0.04,
+  "diff_of_equal_maps_ms": 0.0,
+  "nextents": 60
+ },
+ "clone_churn_1gib": {
+  "extents": 141334,
+  "ms": [
+   1566,
+   2371,
+   2351,
+   2352,
+   2702
+  ]
+ },
+ "walk_churn_1gib": {
+  "extents": 298175,
+  "walk_ms": 587.75,
+  "walk_kernel_ms": 583.79,
+  "walk2_ms": 223.21,
+  "diff_of_equal_maps_ms": 1.45,
+  "nextents": 301039
+ },
+ "clone_month": {
+  "extents": 814256,
+  "ms": [
+   10832,
+   8289,
+   8012,
+   8046,
+   7998
+  ]
+ },
+ "walk_month": {
+  "extents": 887714,
+  "walk_ms": 1953.9,
+  "walk_kernel_ms": 1941.73,
+  "walk2_ms": 828.9,
+  "diff_of_equal_maps_ms": 4.54,
+  "nextents": 895121
+ },
+ "opt1_turn": {
+  "turn_writes": 2000,
+  "residue_writes": 50,
+  "precopy": {
+   "sync_ms": 200.91,
+   "fiemap_disk_ms": 695.47,
+   "fiemap_shadow_ms": 666.41,
+   "diff_ms": 4.25,
+   "ranges": 2000,
+   "bytes": 23007232,
+   "clone_ms": 33.5,
+   "total_ms": 1600.53,
+   "extents": 889641
+  },
+  "pause": {
+   "sync_ms": 6.52,
+   "fiemap_ms": 674.28,
+   "fiemap_kernel_ms": 665.26,
+   "diff_ms": 4.24,
+   "ranges": 262,
+   "bytes": 2371584,
+   "clone_ms": 1.2,
+   "total_ms": 686.24,
+   "extents": 889460
+  },
+  "shadow_equals_disk": true
+ },
+ "opt1_1gib": {
+  "turn_writes": 262144,
+  "residue_writes": 50,
+  "precopy": {
+   "sync_ms": 13177.77,
+   "fiemap_disk_ms": 858.98,
+   "fiemap_shadow_ms": 686.55,
+   "diff_ms": 9.74,
+   "ranges": 226833,
+   "bytes": 2242797568,
+   "clone_ms": 2267.25,
+   "total_ms": 17000.3,
+   "extents": 1118182
+  },
+  "pause": {
+   "sync_ms": 2.97,
+   "fiemap_ms": 833.65,
+   "fiemap_kernel_ms": 818.97,
+   "diff_ms": 5.8,
+   "ranges": 25026,
+   "bytes": 236408832,
+   "clone_ms": 25.66,
+   "total_ms": 868.08,
+   "extents": 1090605
+  },
+  "shadow_equals_disk": true
+ },
+ "read_cut": {
+  "bytes": 7317950464,
+  "ms": 36515
+ },
+ "vm_files": "crw-rw-rw-. 1 root kvm   10, 232 Nov  4 08:34 /dev/kvm\n-rwxr-xr-x. 1 root root  3676680 Nov  3 22:14 /opt/nest/bin/firecracker\n-rw-r--r--. 1 root root 27893008 Nov  3 22:14 /var/lib/nest/kernel/vmlinux\n",
+ "fc_api": "\n\n\n\n\n",
+ "vm_running": true,
+ "cut_while_writing_m2": {
+  "pauses_ms": [
+   [
+    1793783222660,
+    6728
+   ],
+   [
+    1793783234617,
+    6603
+   ],
+   [
+    1793783246526,
+    6744
+   ],
+   [
+    1793783258420,
+    6624
+   ],
+   [
+    1793783270175,
+    6586
+   ],
+   [
+    1793783282115,
+    6680
+   ]
+  ]
+ },
+ "cut_while_writing_opt1": [
+  {
+   "precopy": {
+    "sync_ms": 73.09,
+    "fiemap_disk_ms": 1024.16,
+    "fiemap_shadow_ms": 1871.17,
+    "diff_ms": 6.46,
+    "ranges": 6882,
+    "bytes": 64323584,
+    "clone_ms": 126.17,
+    "total_ms": 3101.05,
+    "extents": 1096872
+   },
+   "at_ms": 1793783296986,
+   "residue": {
+    "sync_ms": 41.23,
+    "fiemap_ms": 838.22,
+    "fiemap_kernel_ms": 826.63,
+    "diff_ms": 5.48,
+    "ranges": 711,
+    "bytes": 7458816,
+    "clone_ms": 5.89,
+    "total_ms": 890.83,
+    "extents": 1096779
+   },
+   "pause_ms": 903.88
+  },
+  {
+   "precopy": {
+    "sync_ms": 117.17,
+    "fiemap_disk_ms": 1006.99,
+    "fiemap_shadow_ms": 1092.31,
+    "diff_ms": 7.05,
+    "ranges": 1465,
+    "bytes": 14868480,
+    "clone_ms": 111.75,
+    "total_ms": 2335.27,
+    "extents": 1098102
+   },
+   "at_ms": 1793783305227,
+   "residue": {
+    "sync_ms": 9.18,
+    "fiemap_ms": 860.3,
+    "fiemap_kernel_ms": 848.36,
+    "diff_ms": 5.31,
+    "ranges": 196,
+    "bytes": 1163264,
+    "clone_ms": 1.83,
+    "total_ms": 876.62,
+    "extents": 1098092
+   },
+   "pause_ms": 888.27
+  },
+  {
+   "precopy": {
+    "sync_ms": 114.7,
+    "fiemap_disk_ms": 1028.09,
+    "fiemap_shadow_ms": 1096.22,
+    "diff_ms": 6.66,
+    "ranges": 1461,
+    "bytes": 13557760,
+    "clone_ms": 28.07,
+    "total_ms": 2273.74,
+    "extents": 1099408
+   },
+   "at_ms": 1793783313391,
+   "residue": {
+    "sync_ms": 20.68,
+    "fiemap_ms": 839.16,
+    "fiemap_kernel_ms": 827.27,
+    "diff_ms": 5.34,
+    "ranges": 236,
+    "bytes": 1576960,
+    "clone_ms": 1.72,
+    "total_ms": 866.9,
+    "extents": 1099352
+   },
+   "pause_ms": 878.68
+  },
+  {
+   "precopy": {
+    "sync_ms": 84.61,
+    "fiemap_disk_ms": 1051.81,
+    "fiemap_shadow_ms": 1097.94,
+    "diff_ms": 6.63,
+    "ranges": 1431,
+    "bytes": 14446592,
+    "clone_ms": 25.15,
+    "total_ms": 2266.14,
+    "extents": 1100663
+   },
+   "at_ms": 1793783321538,
+   "residue": {
+    "sync_ms": 9.2,
+    "fiemap_ms": 844.24,
+    "fiemap_kernel_ms": 832.51,
+    "diff_ms": 5.38,
+    "ranges": 210,
+    "bytes": 1634304,
+    "clone_ms": 1.93,
+    "total_ms": 860.75,
+    "extents": 1100670
+   },
+   "pause_ms": 872.45
+  },
+  {
+   "precopy": {
+    "sync_ms": 94.16,
+    "fiemap_disk_ms": 1021.78,
+    "fiemap_shadow_ms": 1096.9,
+    "diff_ms": 7.24,
+    "ranges": 1431,
+    "bytes": 13017088,
+    "clone_ms": 24.27,
+    "total_ms": 2244.34,
+    "extents": 1101961
+   },
+   "at_ms": 1793783329657,
+   "residue": {
+    "sync_ms": 20.03,
+    "fiemap_ms": 841.33,
+    "fiemap_kernel_ms": 829.52,
+    "diff_ms": 5.44,
+    "ranges": 221,
+    "bytes": 2842624,
+    "clone_ms": 2.22,
+    "total_ms": 869.02,
+    "extents": 1101989
+   },
+   "pause_ms": 880.68
+  },
+  {
+   "precopy": {
+    "sync_ms": 100.34,
+    "fiemap_disk_ms": 1026.51,
+    "fiemap_shadow_ms": 1105.09,
+    "diff_ms": 6.68,
+    "ranges": 1432,
+    "bytes": 11489280,
+    "clone_ms": 25.77,
+    "total_ms": 2264.4,
+    "extents": 1103233
+   },
+   "at_ms": 1793783337804,
+   "residue": {
+    "sync_ms": 14.21,
+    "fiemap_ms": 841.41,
+    "fiemap_kernel_ms": 829.83,
+    "diff_ms": 5.41,
+    "ranges": 222,
+    "bytes": 3579904,
+    "clone_ms": 2.46,
+    "total_ms": 863.49,
+    "extents": 1103278
+   },
+   "pause_ms": 874.89
+  }
+ ],
+ "vm_log": "[Block:aged] notifying queues\n2026-11-04T09:08:50.537251881 [anonymous-instance:fc_vcpu 0] Received a VcpuEvent::Resume message with immediate_exit enabled. immediate_exit was disabled before proceeding\n2026-11-04T09:08:50.537275845 [anonymous-instance:fc_vcpu 1] Received a VcpuEvent::Resume message with immediate_exit enabled. immediate_exit was disabled before proceeding\n2026-11-04T09:08:50.537484100 [anonymous-instance:main] 'resume vm' VMM action took 258 us.\n2026-11-04T09:08:50.537497814 [anonymous-instance:main] Got a spurious notification from api thread\n2026-11-04T09:08:50.537513934 [anonymous-instance:fc_api] The request was executed successfully. Status code: 204 No Content.\n2026-11-04T09:08:50.537517883 [anonymous-instance:fc_api] 'resume vm' API request took 339 us.\nNEST-STALL 1793783329318 20029 13437\r\nNEST-STALL 1793783331001 1992 13668\r\nNEST-STALL 1793783331999 1928 13955\r\nNEST-STALL 1793783333000 2016 14243\r\nNEST-STALL 1793783333999 1959 14530\r\nNEST-STALL 1793783335001 2238 14814\r\nNEST-STALL 1793783336008 34966 14907\r\nNEST-STALL 1793783337008 21808 14964\r\n2026-11-04T09:08:57.809477764 [anonymous-instance:fc_api] The API server received a Patch request on \"/vm\" with body \"{\\\"state\\\": \\\"Paused\\\"}\".\n2026-11-04T09:08:57.809570894 [anonymous-instance:main] 'pause vm' VMM action took 58 us.\n2026-11-04T09:08:57.809587210 [anonymous-instance:fc_api] The request was executed successfully. Status code: 204 No Content.\n2026-11-04T09:08:57.809591241 [anonymous-instance:fc_api] 'pause vm' API request took 120 us.\n2026-11-04T09:08:58.678437718 [anonymous-instance:fc_api] The API server received a Patch request on \"/vm\" with body \"{\\\"state\\\": \\\"Resumed\\\"}\".\n2026-11-04T09:08:58.678477906 [anonymous-instance:main] Artificially kick devices\n2026-11-04T09:08:58.678485422 [anonymous-instance:main] [Block:rootfs] notifying queues\n2026-11-04T09:08:58.678490076 [anonymous-instance:main] [Block:aged] notifying queues\n2026-11-04T09:08:58.678504034 [anonymous-instance:fc_vcpu 0] Received a VcpuEvent::Resume message with immediate_exit enabled. immediate_exit was disabled before proceeding\n2026-11-04T09:08:58.678539278 [anonymous-instance:fc_vcpu 1] Received a VcpuEvent::Resume message with immediate_exit enabled. immediate_exit was disabled before proceeding\n2026-11-04T09:08:58.678808207 [anonymous-instance:main] 'resume vm' VMM action took 331 us.\n2026-11-04T09:08:58.678823629 [anonymous-instance:main] Got a spurious notification from api thread\n2026-11-04T09:08:58.678838544 [anonymous-instance:fc_api] The request was executed successfully. Status code: 204 No Content.\n2026-11-04T09:08:58.678849057 [anonymous-instance:fc_api] 'resume vm' API request took 417 us.\nNEST-STALL 1793783337462 25936 14993\r\nNEST-STALL 1793783338999 1963 15183\r\nNEST-STALL 1793783340000 1960 15470\r\nNEST-STALL 1793783341002 2022 15756\r\nNEST-STALL 1793783342002 2106 16042\r\nNEST-STALL 1793783343001 6115 16313\r\nNEST-STALL 1793783344000 11767 16587\r\nNEST-STALL 1793783345001 2033 16874\r\n",
+ "guest_stalls": [
+  [
+   1793783203002,
+   9114,
+   5
+  ],
+  [
+   1793783204002,
+   9149,
+   111
+  ],
+  [
+   1793783204998,
+   31368,
+   233
+  ],
+  [
+   1793783206000,
+   7527,
+   404
+  ],
+  [
+   1793783207002,
+   2524,
+   679
+  ],
+  [
+   1793783207999,
+   2186,
+   959
+  ],
+  [
+   1793783209002,
+   2230,
+   1243
+  ],
+  [
+   1793783210001,
+   2124,
+   1530
+  ],
+  [
+   1793783211001,
+   2220,
+   1816
+  ],
+  [
+   1793783212000,
+   2167,
+   2103
+  ],
+  [
+   1793783213000,
+   2227,
+   2390
+  ],
+  [
+   1793783214001,
+   2282,
+   2669
+  ],
+  [
+   1793783215000,
+   2125,
+   2957
+  ],
+  [
+   1793783216000,
+   2275,
+   3241
+  ],
+  [
+   1793783216999,
+   1936,
+   3529
+  ],
+  [
+   1793783217999,
+   2213,
+   3817
+  ],
+  [
+   1793783219001,
+   2149,
+   4104
+  ],
+  [
+   1793783220000,
+   1935,
+   4392
+  ],
+  [
+   1793783221001,
+   2137,
+   4678
+  ],
+  [
+   1793783222002,
+   20707,
+   4900
+  ],
+  [
+   1793783229034,
+   6710120,
+   4956
+  ],
+  [
+   1793783230004,
+   31910,
+   5019
+  ],
+  [
+   1793783230999,
+   67035,
+   5071
+  ],
+  [
+   1793783232004,
+   34530,
+   5127
+  ],
+  [
+   1793783233019,
+   19619,
+   5187
+  ],
+  [
+   1793783233998,
+   57210,
+   5242
+  ],
+  [
+   1793783240870,
+   16208,
+   5264
+  ],
+  [
+   1793783240998,
+   15131,
+   5274
+  ],
+  [
+   1793783242014,
+   23705,
+   5333
+  ],
+  [
+   1793783243003,
+   35587,
+   5392
+  ],
+  [
+   1793783244009,
+   34930,
+   5454
+  ],
+  [
+   1793783245001,
+   20580,
+   5512
+  ],
+  [
+   1793783246009,
+   62172,
+   5602
+  ],
+  [
+   1793783252915,
+   6727823,
+   5614
+  ],
+  [
+   1793783253011,
+   14554,
+   5623
+  ],
+  [
+   1793783253999,
+   29892,
+   5705
+  ],
+  [
+   1793783255002,
+   36220,
+   5763
+  ],
+  [
+   1793783256006,
+   25636,
+   5822
+  ],
+  [
+   1793783256999,
+   25225,
+   5879
+  ],
+  [
+   1793783258005,
+   85219,
+   5933
+  ],
+  [
+   1793783264689,
+   6597259,
+   5940
+  ],
+  [
+   1793783265009,
+   21695,
+   5961
+  ],
+  [
+   1793783265998,
+   23517,
+   6024
+  ],
+  [
+   1793783266998,
+   36984,
+   6074
+  ],
+  [
+   1793783267999,
+   23809,
+   6132
+  ],
+  [
+   1793783269009,
+   18098,
+   6192
+  ],
+  [
+   1793783276406,
+   6566866,
+   6236
+  ],
+  [
+   1793783277013,
+   35155,
+   6271
+  ],
+  [
+   1793783277999,
+   23282,
+   6327
+  ],
+  [
+   1793783279015,
+   32433,
+   6385
+  ],
+  [
+   1793783280019,
+   16043,
+   6448
+  ],
+  [
+   1793783281009,
+   31241,
+   6507
+  ],
+  [
+   1793783288438,
+   6670897,
+   6573
+  ],
+  [
+   1793783289012,
+   17741,
+   6614
+  ],
+  [
+   1793783290014,
+   16859,
+   6675
+  ],
+  [
+   1793783290998,
+   20011,
+   6729
+  ],
+  [
+   1793783292018,
+   20064,
+   6790
+  ],
+  [
+   1793783293011,
+   56863,
+   6840
+  ],
+  [
+   1793783293998,
+   26130,
+   6899
+  ],
+  [
+   1793783295000,
+   34713,
+   7024
+  ],
+  [
+   1793783295998,
+   23629,
+   7174
+  ],
+  [
+   1793783297549,
+   901043,
+   7212
+  ],
+  [
+   1793783298001,
+   1956,
+   7341
+  ],
+  [
+   1793783299002,
+   2317,
+   7628
+  ],
+  [
+   1793783300000,
+   2169,
+   7916
+  ],
+  [
+   1793783301001,
+   1932,
+   8203
+  ],
+  [
+   1793783302000,
+   2136,
+   8491
+  ],
+  [
+   1793783302998,
+   35389,
+   8682
+  ],
+  [
+   1793783303998,
+   30083,
+   8726
+  ],
+  [
+   1793783305776,
+   51143,
+   8775
+  ],
+  [
+   1793783306001,
+   1927,
+   8839
+  ],
+  [
+   1793783307001,
+   2106,
+   9128
+  ],
+  [
+   1793783308001,
+   2197,
+   9416
+  ],
+  [
+   1793783309000,
+   1960,
+   9703
+  ],
+  [
+   1793783310000,
+   2095,
+   9989
+  ],
+  [
+   1793783310998,
+   25570,
+   10228
+  ],
+  [
+   1793783311999,
+   35110,
+   10274
+  ],
+  [
+   1793783312998,
+   30051,
+   10330
+  ],
+  [
+   1793783313999,
+   885821,
+   10353
+  ],
+  [
+   1793783315001,
+   1978,
+   10639
+  ],
+  [
+   1793783315999,
+   1983,
+   10925
+  ],
+  [
+   1793783316999,
+   2196,
+   11211
+  ],
+  [
+   1793783318001,
+   2312,
+   11498
+  ],
+  [
+   1793783319001,
+   11716,
+   11769
+  ],
+  [
+   1793783319998,
+   38840,
+   11813
+  ],
+  [
+   1793783321008,
+   25669,
+   11874
+  ],
+  [
+   1793783322071,
+   19299,
+   11885
+  ],
+  [
+   1793783323000,
+   3567,
+   12147
+  ],
+  [
+   1793783323999,
+   2278,
+   12434
+  ],
+  [
+   1793783324999,
+   2274,
+   12722
+  ],
+  [
+   1793783326001,
+   1978,
+   13010
+  ],
+  [
+   1793783327000,
+   2135,
+   13296
+  ],
+  [
+   1793783328014,
+   35624,
+   13359
+  ],
+  [
+   1793783328998,
+   26246,
+   13419
+  ],
+  [
+   1793783329318,
+   20029,
+   13437
+  ],
+  [
+   1793783331001,
+   1992,
+   13668
+  ],
+  [
+   1793783331999,
+   1928,
+   13955
+  ],
+  [
+   1793783333000,
+   2016,
+   14243
+  ],
+  [
+   1793783333999,
+   1959,
+   14530
+  ],
+  [
+   1793783335001,
+   2238,
+   14814
+  ],
+  [
+   1793783336008,
+   34966,
+   14907
+  ],
+  [
+   1793783337008,
+   21808,
+   14964
+  ],
+  [
+   1793783337462,
+   25936,
+   14993
+  ],
+  [
+   1793783338999,
+   1963,
+   15183
+  ],
+  [
+   1793783340000,
+   1960,
+   15470
+  ],
+  [
+   1793783341002,
+   2022,
+   15756
+  ],
+  [
+   1793783342002,
+   2106,
+   16042
+  ],
+  [
+   1793783343001,
+   6115,
+   16313
+  ],
+  [
+   1793783344000,
+   11767,
+   16587
+  ],
+  [
+   1793783345001,
+   2033,
+   16874
+  ]
+ ],
+ "defrag": {
+  "chunk_mib": 64,
+  "max_extents": 16,
+  "records_before": 1113672,
+  "records_after": 551763,
+  "chunks_rewritten": 256,
+  "bytes_rewritten": 17179869184,
+  "bytes_copied": 7698817024,
+  "total_ms": 101289.96,
+  "exchange_ms": 10414.11
+ },
+ "clone_defragged": {
+  "extents": 177283,
+  "ms": [
+   3061,
+   5106,
+   4897,
+   4919,
+   4924
+  ]
+ },
+ "walk_defragged": {
+  "extents": 551755,
+  "walk_ms": 1066.33,
+  "walk_kernel_ms": 1058.83,
+  "walk2_ms": 402.78,
+  "diff_of_equal_maps_ms": 2.61,
+  "nextents": 551763
+ },
+ "opt1_defragged": {
+  "turn_writes": 2000,
+  "residue_writes": 50,
+  "precopy": {
+   "sync_ms": 9.78,
+   "fiemap_disk_ms": 428.81,
+   "fiemap_shadow_ms": 766.31,
+   "diff_ms": 11.11,
+   "ranges": 551725,
+   "bytes": 7698817024,
+   "clone_ms": 16119.16,
+   "total_ms": 17335.17,
+   "extents": 551755
+  },
+  "pause": {
+   "sync_ms": 8.1,
+   "fiemap_ms": 415.18,
+   "fiemap_kernel_ms": 402.39,
+   "diff_ms": 3.33,
+   "ranges": 47,
+   "bytes": 4360826880,
+   "clone_ms": 1.23,
+   "total_ms": 427.83,
+   "extents": 551790
+  },
+  "shadow_equals_disk": true
+ },
+ "done": true
+}
