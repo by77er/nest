@@ -63,3 +63,15 @@ export interface NetworkView {
   egress_hosts: string[] | null;
   base: import("../../network").OperatorRule[] | null;
 }
+
+// Routines and memory (README.md#routines, README.md#memory).
+export type { Proposal, Routine, RoutineRun } from "../../do/project";
+export type { Created, RunOutcome, RunState, Timer, TriggerKind, Triggers } from "../../routines";
+export type { Note } from "../../memory";
+export type { CreateRoutineBody, DeclineProposalBody, RoutineKind, RoutinePreset, UpdateRoutineBody } from "../../requests";
+/** `GET /api/projects/<id>/routines`. */
+export interface RoutinesAnswer {
+  routines: import("../../do/project").Routine[];
+  max_routine_runs: number;
+  live: number;
+}
