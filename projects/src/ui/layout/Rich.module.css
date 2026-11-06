@@ -276,3 +276,31 @@
 }
 
 
+
+/* A highlighted fence (rich/highlight.ts): monochrome first, a role's text shade (AA on the subtle
+   ground in both schemes) only where it helps the eye find structure. Keywords in primary, strings in
+   success, numbers and literals in the warning text shade, comments muted, names by weight. */
+.prose code[data-highlighted] :global(:is(.hljs-keyword, .hljs-selector-tag, .hljs-doctag, .hljs-meta .hljs-keyword)) {
+  color: var(--mantine-color-primary-text);
+}
+
+.prose code[data-highlighted] :global(:is(.hljs-string, .hljs-regexp, .hljs-addition, .hljs-attr-value, .hljs-template-tag, .hljs-symbol)) {
+  color: var(--mantine-color-success-text);
+}
+
+.prose code[data-highlighted] :global(:is(.hljs-number, .hljs-literal, .hljs-variable.constant_, .hljs-bullet)) {
+  color: var(--mantine-color-warning-text);
+}
+
+.prose code[data-highlighted] :global(.hljs-deletion) {
+  color: var(--mantine-color-danger-text);
+}
+
+.prose code[data-highlighted] :global(:is(.hljs-comment, .hljs-quote, .hljs-meta)) {
+  color: var(--nest-muted);
+  font-style: italic;
+}
+
+.prose code[data-highlighted] :global(:is(.hljs-title, .hljs-section, .hljs-type, .hljs-attr, .hljs-attribute, .hljs-name)) {
+  font-weight: 600;
+}

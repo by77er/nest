@@ -1,9 +1,9 @@
-// The chat's pure parts: grouping by author and day, the turn in progress read from a trace, how a tool
-// call reads as an activity, and the quote a reply starts from.
+// The chat's pure parts: grouping by author and day, the turn in progress read from a trace as steps, the
+// steps found again for each reply, and the quote a reply starts from.
 import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "../../api/types";
 import type { TraceEvent } from "../trace/model";
-import { describeTool, GROUP_GAP_MS, groupLog, liveTurn, quote } from "./model";
+import { GROUP_GAP_MS, groupLog, liveTurn, quote, stepsByReply } from "./model";
 
 const NOW = new Date(2026, 10, 2, 15, 0).getTime();
 const msg = (seq: number, sender: string, at_ms: number): ChatMessage => ({ seq, at_ms, sender, text: `m${seq}`, delivered: true, error: null });
@@ -33,28 +33,57 @@ describe("groupLog", () => {
 
 describe("liveTurn", () => {
   let seq = 0;
-  const ev = (type: string, more: Record<string, unknown> = {}) => ({ seq: ++seq, ts_ms: NOW, type, turn: "trn_1", ...more }) as unknown as TraceEvent;
+  const ev = (type: string, more: Record<string, unknown> = {}, turn = "trn_1") => ({ seq: ++seq, ts_ms: NOW, type, turn, ...more }) as unknown as TraceEvent;
 
-  it("is the running turn's text so far and the tool it's in", () => {
-    const t = liveTurn([ev("turn_started"), ev("assistant_text", { text: "Looking." }), ev("tool_call", { call_id: "c1", name: "Read", input: JSON.stringify({ file_path: "src/a.ts" }) })]);
-    expect(t).toEqual({ turn: "trn_1", text: "Looking.", activity: "Reading src/a.ts" });
+  it("is the running turn's steps in order: what it said, and each tool call with its name, main argument and input", () => {
+    const t = liveTurn([ev("turn_started"), ev("assistant_text", { text: "Looking." }), ev("tool_call", { call_id: "c1", name: "mcp__projects-board__write_spec", input: JSON.stringify({ task: "tsk_1", spec: "Do it", criteria: ["a", "b"], limits: { n: 1 } }) })]);
+    expect(t?.turn).toBe("trn_1");
+    expect(t?.steps.map((s) => s.kind)).toEqual(["text", "tool"]);
+    const tool = t!.steps[1]!;
+    expect(tool).toMatchObject({ kind: "tool", name: "write_spec", summary: "tsk_1", result: null, status: "running" });
+    // Each field as text: a string as it is, a list of strings a line each, anything else compact JSON.
+    expect(tool.kind === "tool" && tool.input).toEqual([{ key: "task", value: "tsk_1" }, { key: "spec", value: "Do it" }, { key: "criteria", value: "a\nb" }, { key: "limits", value: '{"n":1}' }]);
   });
 
-  it("drops the activity once the tool answers, and is nothing once the turn completes", () => {
-    const started = [ev("turn_started"), ev("tool_call", { call_id: "c1", name: "Bash", input: { command: "ls" } }), ev("tool_result", { call_id: "c1", is_error: false })];
-    expect(liveTurn(started)?.activity).toBeNull();
+  it("marks a call done or failed by its result, and is nothing once the turn completes", () => {
+    const started = [
+      ev("turn_started"),
+      ev("tool_call", { call_id: "c1", name: "Bash", input: { command: "ls" } }),
+      ev("tool_result", { call_id: "c1", is_error: false, summary: "a\nb" }),
+      ev("tool_call", { call_id: "c2", name: "Bash", input: { command: "git push" } }),
+      ev("tool_result", { call_id: "c2", is_error: true, summary: "403" }),
+    ];
+    expect(liveTurn(started)?.steps.map((s) => s.kind === "tool" && [s.status, s.result])).toEqual([["done", "a\nb"], ["error", "403"]]);
     expect(liveTurn([...started, ev("turn_completed", { stop_reason: "end_turn" })])).toBeNull();
     expect(liveTurn([])).toBeNull();
   });
 });
 
-describe("describeTool", () => {
-  it("reads a call as what it does, and an MCP tool by its own name", () => {
-    expect(describeTool("Bash", { command: "npm test" })).toBe("Running npm test");
-    expect(describeTool("Edit", JSON.stringify({ file_path: "src/x.ts" }))).toBe("Editing src/x.ts");
-    expect(describeTool("Grep", { pattern: "TODO" })).toBe("Searching for TODO");
-    expect(describeTool("mcp__projects-board__write_spec", {})).toBe("Write spec");
-    expect(describeTool("Read", "not json")).toBe("Reading");
+describe("stepsByReply", () => {
+  let seq = 100;
+  const ev = (type: string, turn: string, more: Record<string, unknown> = {}) => ({ seq: ++seq, ts_ms: NOW, type, turn, ...more }) as unknown as TraceEvent;
+
+  it("finds a finished turn's steps by its reply (its last text), and a call the turn never answered reads stopped", () => {
+    const steps = stepsByReply([
+      ev("turn_started", "t1"),
+      ev("assistant_text", "t1", { text: "Checking." }),
+      ev("tool_call", "t1", { call_id: "c1", name: "Read", input: { file_path: "a.ts" } }),
+      ev("tool_call", "t1", { call_id: "c2", name: "Bash", input: { command: "npm test" } }),
+      ev("tool_result", "t1", { call_id: "c1", is_error: false, summary: "ok" }),
+      ev("assistant_text", "t1", { text: "  All good.  " }),
+      ev("turn_completed", "t1"),
+      // A turn that called no tool has nothing to show behind its reply.
+      ev("turn_started", "t2"),
+      ev("assistant_text", "t2", { text: "Hello." }),
+      ev("turn_completed", "t2"),
+      // A turn still running isn't a reply yet.
+      ev("turn_started", "t3"),
+      ev("tool_call", "t3", { call_id: "c3", name: "Bash", input: { command: "ls" } }),
+      ev("assistant_text", "t3", { text: "Partial." }),
+    ]);
+    expect([...steps.keys()]).toEqual(["All good."]);
+    const s = steps.get("All good.")!;
+    expect(s.map((x) => (x.kind === "tool" ? `${x.name}:${x.status}` : x.text))).toEqual(["Checking.", "Read:done", "Bash:stopped"]);
   });
 });
 

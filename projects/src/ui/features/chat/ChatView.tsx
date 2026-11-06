@@ -1,34 +1,103 @@
 // The conversation with the project's manager (README.md#the-manager-chat), held to the bar of the best
 // web chats through the design skill: the owner's messages a quiet bubble on the right, the manager's
-// unboxed prose across the measure; groups by author and day; the manager's turn streaming in from its
-// live trace with what it's doing now; a docked composer (Enter sends, drafts kept, Stop while a turn
-// runs); a log that scrolls in itself, sticks to the bottom only when you're there, and loads older
-// messages as you scroll up without losing your place.
+// unboxed prose across the measure under its name; groups by author and day; the manager's turn
+// streaming in from its live trace, each tool it calls a compact row that opens onto its input and
+// result, and a reply keeping its steps behind "Used n tools"; a docked composer in a rounded box (Enter
+// sends, drafts kept, Stop while a turn runs); a log that scrolls in itself, sticks to the bottom only
+// when you're there, offers the way back down when you're not, and loads older messages as you scroll up
+// without losing your place.
 
 import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Textarea, Tooltip, VisuallyHidden } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
-import { IconArrowDown, IconCopy, IconDots, IconPlayerStop, IconQuote, IconRefresh, IconSend } from "@tabler/icons-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { IconAlertTriangle, IconArrowDown, IconArrowUp, IconCalendarEvent, IconCopy, IconDots, IconHourglass, IconListCheck, IconMessage, IconPlayerStop, IconQuote, IconRefresh, IconWritingSign } from "@tabler/icons-react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { human } from "../../../waits";
 import { api } from "../../api/client";
-import { useChat, useInterruptManager, usePostChat } from "../../api/queries";
+import { useChat, useInterruptManager, usePostChat, useWaits } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import {
-  ActivityLine, ChatFrame, ChatLog, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, Stack, StreamText,
+  ChatFrame, ChatLog, ChatWelcome, ComposerBox, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine,
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
 import { useTrace } from "../trace/useTrace";
-import { groupLog, liveTurn, loadDraft, markRead, quote, saveDraft } from "./model";
+import { groupLog, liveTurn, loadDraft, markRead, quote, saveDraft, type Step, stepsByReply, type ToolStep } from "./model";
 
 /** What a new conversation can start with: they fill the composer, they don't send. */
 export const STARTERS = ["Spec a task for ", "What's blocked right now?", "Summarize progress this week", "Plan the next milestone"];
+const STARTER_ICONS = [IconWritingSign, IconAlertTriangle, IconListCheck, IconCalendarEvent];
+
+/** One tool call: its row, and behind it each input field and the result. */
+function ToolStepView({ s }: { s: ToolStep }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <StepRow name={s.name} summary={s.summary} status={s.status} open={open} onToggle={() => setOpen((o) => !o)}>
+      {s.input.map((f) => (
+        <StepField key={f.key} label={f.key}>
+          {f.value}
+        </StepField>
+      ))}
+      <StepField label="Result" tone={s.status === "error" ? "danger" : undefined}>
+        {s.result === null ? (s.status === "running" ? "Running…" : "No result was recorded.") : s.result || "(no output)"}
+      </StepField>
+    </StepRow>
+  );
+}
+
+/**
+ * A turn's steps in order: what it said, and each run of tool calls as one tight list. `quiet`: the
+ * steps behind a finished reply, where what it said along the way is secondary to the reply itself.
+ */
+function Steps({ steps, projectId, quiet = false }: { steps: Step[]; projectId: string; quiet?: boolean }) {
+  const runs: (Step | ToolStep[])[] = [];
+  for (const s of steps) {
+    const last = runs.at(-1);
+    if (s.kind === "tool" && Array.isArray(last)) last.push(s);
+    else runs.push(s.kind === "tool" ? [s] : s);
+  }
+  return (
+    <Stack gap="sm">
+      {runs.map((r) =>
+        Array.isArray(r) ? (
+          <StepList key={r[0]!.key} label={r.length === 1 ? "A tool call" : `${r.length} tool calls`}>
+            {r.map((s) => (
+              <div role="listitem" key={s.key}>
+                <ToolStepView s={s} />
+              </div>
+            ))}
+          </StepList>
+        ) : r.kind === "text" ? (
+          quiet ? (
+            <Prose key={r.key} size="sm" dimmed>
+              {r.text}
+            </Prose>
+          ) : (
+            <RichMessage key={r.key} text={r.text} projectId={projectId} />
+          )
+        ) : null,
+      )}
+    </Stack>
+  );
+}
+
+/** A reply's steps, closed until asked for: "Used 3 tools". */
+function ReplySteps({ steps, projectId }: { steps: Step[]; projectId: string }) {
+  const [open, setOpen] = useState(false);
+  const n = steps.filter((s) => s.kind === "tool").length;
+  return (
+    <StepsDisclosure label={`Used ${n} ${n === 1 ? "tool" : "tools"}`} open={open} onToggle={() => setOpen((o) => !o)}>
+      <Steps steps={steps} projectId={projectId} quiet />
+    </StepsDisclosure>
+  );
+}
+
+/** The manager's mark beside its name. */
+const MANAGER_MARK = <IconMessage size={icon.sm} />;
 
 /** How close to the bottom counts as at the bottom (px), and to the top starts loading older ones. */
 const NEAR = 24;
 const OLDER_AT = 80;
 const PAGE = 50;
-/** The streaming turn's cursor: its text's last character, so it sits right after the last word. */
-const STREAM_CURSOR = "\u258C";
 
 function MessageActions({ m, onQuote, onRetry }: { m: ChatMessage; onQuote: (text: string) => void; onRetry?: () => void }) {
   return (
@@ -60,7 +129,7 @@ function MessageActions({ m, onQuote, onRetry }: { m: ChatMessage; onQuote: (tex
   );
 }
 
-function Message({ m, projectId, appear, onQuote, onRetry }: { m: ChatMessage; projectId: string; appear: boolean; onQuote: (t: string) => void; onRetry: (m: ChatMessage) => void }) {
+function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMessage; projectId: string; appear: boolean; steps?: Step[]; onQuote: (t: string) => void; onRetry: (m: ChatMessage) => void }) {
   if (m.sender === "app") {
     return (
       <MessageRow side="note" appear={appear} data-sender="app">
@@ -101,7 +170,14 @@ function Message({ m, projectId, appear, onQuote, onRetry }: { m: ChatMessage; p
         </>
       }
     >
-      {mine ? <Prose size="lg">{m.text}</Prose> : <RichMessage text={m.text} projectId={projectId} />}
+      {mine ? (
+        <Prose size="lg">{m.text}</Prose>
+      ) : (
+        <Stack gap="xs">
+          {steps && <ReplySteps steps={steps} projectId={projectId} />}
+          <RichMessage text={m.text} projectId={projectId} />
+        </Stack>
+      )}
       {failed && m.error && (
         <Text fz="xs" c="warning">
           {m.error}
@@ -118,6 +194,9 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const trace = useTrace(agent);
   const coarse = useMediaQuery("(pointer: coarse)") ?? false;
   const live = useMemo(() => liveTurn(trace.state.events), [trace.state.events]);
+  const replies = useMemo(() => stepsByReply(trace.state.events), [trace.state.events]);
+  const waits = useWaits(projectId);
+  const replyWait = waits.data?.pending.find((w) => w.kind === "reply");
 
   const [older, setOlder] = useState<ChatMessage[]>([]);
   const [hasOlder, setHasOlder] = useState(true);
@@ -139,7 +218,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const seen = useRef<Set<number> | null>(null);
   const anchor = useRef<number | null>(null);
   // The last stream, kept until the turn's message lands, so the swap doesn't jump.
-  const [held, setHeld] = useState<{ text: string; sinceSeq: number } | null>(null);
+  const [held, setHeld] = useState<{ steps: Step[]; sinceSeq: number } | null>(null);
 
   const latest = useMemo(() => chat.data ?? [], [chat.data]);
   const messages = useMemo(() => {
@@ -158,7 +237,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
 
   // Hold the stream until its message lands (a manager message newer than when it began).
   useEffect(() => {
-    if (live && (live.text || live.activity)) setHeld((h) => ({ text: live.text, sinceSeq: h?.sinceSeq ?? lastManagerSeq }));
+    if (live && live.steps.length) setHeld((h) => ({ steps: live.steps, sinceSeq: h?.sinceSeq ?? lastManagerSeq }));
   }, [live]); // `lastManagerSeq` is read at the stream's start only
   useEffect(() => {
     if (held && !live && lastManagerSeq > held.sinceSeq) setHeld(null);
@@ -190,7 +269,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
 
   useLayoutEffect(() => {
     if (atBottomRef.current) scrollToBottom();
-  }, [held?.text, live?.activity]); // the stream growing, while at the bottom
+  }, [held?.steps, live?.turn]); // the stream growing, while at the bottom
 
   // Content that grows after it renders (math, an image or figure decoding) keeps the end in view while
   // the reader is at it.
@@ -260,6 +339,10 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
       composer.current?.focus();
     });
   };
+  const jumpToLatest = () => {
+    setAtBottom(true);
+    scrollToBottom();
+  };
   const retry = (m: ChatMessage) => send(m.text, m.seq < 0 ? m : undefined);
   // Quoting puts the quote at the composer's start and the caret at its end, once the menu has closed
   // (it returns focus to its button first).
@@ -275,8 +358,20 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   };
 
   const items = groupLog(messages);
-  const stream = live ?? (held ? { text: held.text, activity: null, turn: "" } : null);
   const running = !!live;
+  const streamSteps = live?.steps ?? held?.steps ?? [];
+  const stream = running || streamSteps.length > 0;
+  // A tool running shows itself; otherwise the turn is between steps (thinking, writing): a working line.
+  const toolRunning = streamSteps.some((st) => st.kind === "tool" && st.status === "running");
+  const fillStarter = (st: string) => {
+    setText(st);
+    setTimeout(() => {
+      const c = composer.current;
+      if (!c) return;
+      c.focus();
+      c.setSelectionRange(st.length, st.length);
+    }, 0);
+  };
 
   return (
     <Stack gap="md">
@@ -288,50 +383,46 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
           ) : chat.isError ? (
             <ErrorState title="The chat couldn't be loaded" error={chat.error} onRetry={() => void chat.refetch()} />
           ) : messages.length === 0 && !stream ? (
-            <Stack gap="lg" align="flex-start" py="xl" data-slot="empty">
-              <Text fz="lg">The manager keeps this project's board: it specs tasks, assigns them, and tells you what's blocked.</Text>
-              <Row gap="sm">
-                {STARTERS.map((s) => (
-                  <Button
-                    key={s}
-                    variant="default"
-                    onClick={() => {
-                      setText(s);
-                      composer.current?.focus();
-                    }}
-                  >
-                    {s.endsWith(" ") ? `${s}…` : s}
-                  </Button>
-                ))}
-              </Row>
-            </Stack>
+            <ChatWelcome
+              title="What should we work on?"
+              starters={STARTERS.map((st, i) => {
+                const Icon = STARTER_ICONS[i] ?? IconMessage;
+                return (
+                  <Starter key={st} leftSection={<Icon size={icon.md} aria-hidden />} onClick={() => fillStarter(st)}>
+                    {st.endsWith(" ") ? `${st}…` : st}
+                  </Starter>
+                );
+              })}
+            >
+              The manager keeps this project's board: it specs tasks, assigns them, and tells you what's blocked.
+            </ChatWelcome>
           ) : (
             items.map((it) =>
               it.kind === "day" ? (
                 <DaySeparator key={it.key} label={it.label} />
               ) : (
-                <MessageGroup key={it.key} side={it.sender === "owner" ? "owner" : it.sender === "manager" ? "manager" : "note"} name={it.sender === "manager" ? "Manager" : undefined}>
+                <MessageGroup key={it.key} side={it.sender === "owner" ? "owner" : it.sender === "manager" ? "manager" : "note"} name={it.sender === "manager" ? "Manager" : undefined} avatar={MANAGER_MARK}>
                   {it.messages.map((m) => (
-                    <Message key={m.seq} m={m} projectId={projectId} appear={!!seen.current && m.seq > 0 && !seen.current.has(m.seq)} onQuote={quoteReply} onRetry={retry} />
+                    <Message
+                      key={m.seq}
+                      m={m}
+                      projectId={projectId}
+                      appear={!!seen.current && m.seq > 0 && !seen.current.has(m.seq)}
+                      steps={m.sender === "manager" ? replies.get(m.text.trim()) : undefined}
+                      onQuote={quoteReply}
+                      onRetry={retry}
+                    />
                   ))}
                 </MessageGroup>
               ),
             )
           )}
           {stream && !chat.isError && (
-            <MessageGroup side="manager" name="Manager">
+            <MessageGroup side="manager" name="Manager" avatar={MANAGER_MARK}>
               <MessageRow side="manager" data-sender="stream">
-                <Stack gap="xs">
-                  {stream.text &&
-                    (running ? (
-                      // The cursor is the text's last character, inline after it.
-                      <StreamText>
-                        <RichMessage text={`${stream.text}${STREAM_CURSOR}`} projectId={projectId} />
-                      </StreamText>
-                    ) : (
-                      <RichMessage text={stream.text} projectId={projectId} />
-                    ))}
-                  {stream.activity && <ActivityLine>{stream.activity}</ActivityLine>}
+                <Stack gap="sm">
+                  {streamSteps.length > 0 && <Steps steps={streamSteps} projectId={projectId} />}
+                  {running && !toolRunning && <WorkingLine>Working…</WorkingLine>}
                 </Stack>
               </MessageRow>
             </MessageGroup>
@@ -344,10 +435,10 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
 
       <ComposerDock
         pill={
-          unseen > 0 &&
-          !atBottom && (
-            <Button size="xs" radius="xl" leftSection={<IconArrowDown size={icon.sm} />} onClick={scrollToBottom}>
-              Jump to latest · {unseen} new
+          !atBottom &&
+          messages.length > 0 && (
+            <Button size="xs" radius="xl" variant="default" leftSection={<IconArrowDown size={icon.sm} />} onClick={jumpToLatest}>
+              {unseen > 0 ? `Jump to latest · ${unseen} new` : "Jump to latest"}
             </Button>
           )
         }
@@ -358,13 +449,47 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
             send();
           }}
         >
-          <Stack gap="sm">
+          <ComposerBox
+            bar={
+              <>
+                {replyWait ? (
+                  <Row gap="xs" wrap="nowrap" data-slot="reply-wait">
+                    <Text component="span" c="dimmed" display="inline-flex">
+                      <IconHourglass size={icon.sm} aria-hidden />
+                    </Text>
+                    <Text fz="xs" c="dimmed" title={`Times out ${exact(replyWait.deadline_ms)}`}>
+                      Waiting for your reply · {replyWait.deadline_ms > Date.now() ? `${human(replyWait.deadline_ms - Date.now())} left` : "timing out"}
+                    </Text>
+                  </Row>
+                ) : (
+                  !coarse && (
+                    <Text fz="xs" c="dimmed">
+                      Enter to send · Shift+Enter for a new line
+                    </Text>
+                  )
+                )}
+                <Row gap="sm" wrap="nowrap">
+                  {running && (
+                    <Button variant="default" size="compact-sm" leftSection={<IconPlayerStop size={icon.sm} />} loading={interrupt.isPending} onClick={() => interrupt.mutate()}>
+                      Stop
+                    </Button>
+                  )}
+                  <Tooltip label="Send" withArrow disabled={coarse}>
+                    <ActionIcon type="submit" size="lg" aria-label="Send" disabled={!text.trim() || post.isPending}>
+                      <IconArrowUp size={icon.md} />
+                    </ActionIcon>
+                  </Tooltip>
+                </Row>
+              </>
+            }
+          >
             <Textarea
               ref={composer}
-              label="Message to the manager"
-              placeholder="Write a message"
+              aria-label="Message to the manager"
+              placeholder="Message the manager"
+              variant="unstyled"
               autosize
-              minRows={2}
+              minRows={1}
               maxRows={10}
               maxLength={20000}
               value={text}
@@ -377,24 +502,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
                 }
               }}
             />
-            <Row justify={coarse ? "flex-end" : "space-between"}>
-              {!coarse && (
-                <Text fz="xs" c="dimmed">
-                  Enter to send · Shift+Enter for a new line
-                </Text>
-              )}
-              <Row gap="sm">
-                {running && (
-                  <Button variant="default" leftSection={<IconPlayerStop size={icon.sm} />} loading={interrupt.isPending} onClick={() => interrupt.mutate()}>
-                    Stop
-                  </Button>
-                )}
-                <Button type="submit" rightSection={<IconSend size={icon.sm} />} disabled={!text.trim() || post.isPending}>
-                  Send
-                </Button>
-              </Row>
-            </Row>
-          </Stack>
+          </ComposerBox>
         </form>
       </ComposerDock>
     </Stack>

@@ -4,6 +4,7 @@
 import { MantineProvider } from "@mantine/core";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { createMemoryHistory, createRootRoute, createRoute, createRouter, RouterProvider } from "@tanstack/react-router";
 import { describe, expect, it, vi } from "vitest";
 import { keys } from "../../api/queries";
@@ -70,6 +71,29 @@ describe("Markdown", () => {
     expect(link).toHaveAttribute("href", "https://example.com/docs");
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("highlights a fence in a language it knows, under its language and a Copy that copies the code itself", async () => {
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal("navigator", { ...navigator, clipboard: { writeText } });
+    const { root } = await show(["```ts\nconst x = \"a\"; // why\n```", "```klingon\nqapla'\n```", "```\nplain <b>\n```"].join("\n\n"));
+    const [ts, unknown, bare] = [...root.querySelectorAll<HTMLElement>("[data-ds=code-block]")];
+    // Tokens as elements (never markup from a string), coloured by the theme through their classes.
+    const code = ts!.querySelector("code")!;
+    expect(code).toHaveAttribute("data-highlighted");
+    expect(code.querySelector(".hljs-keyword")).toHaveTextContent("const");
+    expect(code.querySelector(".hljs-string")).toHaveTextContent('"a"');
+    expect(code.querySelector(".hljs-comment")).toHaveTextContent("// why");
+    expect(ts).toHaveTextContent(/^ts/);
+    // A language it doesn't know, or none, stays plain text: nothing guessed.
+    expect(unknown!.querySelector("code")).not.toHaveAttribute("data-highlighted");
+    expect(unknown!.querySelector("[class^=hljs]")).toBeNull();
+    expect(bare!.querySelector("code")!.innerHTML).toBe("plain &lt;b&gt;\n");
+    // Copy takes the code's text, not its token spans.
+    await userEvent.click(within(ts!).getByRole("button", { name: "Copy" }));
+    expect(writeText).toHaveBeenCalledWith('const x = "a"; // why');
+    expect(await within(ts!).findByRole("button", { name: "Copied" })).toBeInTheDocument();
+    vi.unstubAllGlobals();
   });
 
   it("escapes raw HTML: it shows as text, never as markup", async () => {

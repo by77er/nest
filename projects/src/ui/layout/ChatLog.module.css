@@ -31,6 +31,8 @@
   display: flex;
   flex-direction: column;
   gap: var(--mantine-spacing-xl);
+  /* At least the log's height, so an empty chat's welcome centres in it. */
+  min-height: 100%;
 }
 
 .day {
@@ -60,9 +62,25 @@
 }
 
 .name {
-  font-size: var(--mantine-font-size-xs);
+  display: flex;
+  align-items: center;
+  gap: var(--mantine-spacing-sm);
+  font-size: var(--mantine-font-size-sm);
   font-weight: 600;
   color: var(--mantine-color-text);
+}
+
+/* The manager's mark beside its name: a small round of the subtle ground. */
+.avatar {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  background: var(--nest-subtle);
+  border: var(--nest-border);
+  color: var(--nest-muted);
 }
 
 .row {
@@ -136,30 +154,256 @@
   z-index: 2;
 }
 
-/* The turn in progress: the text so far (its last character the cursor, inline after the last word:
-   the feature appends it), and the running tool's line. */
-.cursor {
-  min-width: 0;
-}
-
-.activity {
+/* The manager at work with nothing new to show: three dots (a loading indicator) and a muted word. */
+.working {
   display: flex;
-  align-items: baseline;
-  gap: var(--mantine-spacing-xs);
-  font-family: var(--mantine-font-family-monospace);
-  font-size: var(--mantine-font-size-xs);
+  align-items: center;
+  gap: var(--mantine-spacing-sm);
+  min-height: var(--nest-hit);
+  font-size: var(--mantine-font-size-sm);
   color: var(--nest-muted);
 }
 
-.dot {
+/* A turn's steps: compact rows, tight together (a group), each opening onto its detail. */
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-2xs);
+  min-width: 0;
+}
+
+.step {
+  min-width: 0;
+}
+
+.stepRow {
+  display: flex;
+  align-items: center;
+  gap: var(--mantine-spacing-sm);
+  width: 100%;
+  min-height: var(--nest-hit);
+  padding: var(--mantine-spacing-2xs) var(--mantine-spacing-sm);
+  border-radius: var(--mantine-radius-md);
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  text-align: left;
+  color: var(--mantine-color-text);
+  transition: background-color var(--nest-motion-fast) var(--nest-ease-enter);
+}
+
+.stepRow:hover {
+  background: var(--nest-subtle);
+}
+
+.stepIcon {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  width: var(--mantine-spacing-lg);
   color: var(--mantine-color-success-text);
+}
+
+.stepIcon[data-status="error"] {
+  color: var(--mantine-color-danger-text);
+}
+
+.stepIcon[data-status="running"],
+.stepIcon[data-status="stopped"] {
+  color: var(--nest-muted);
+}
+
+.stepName {
+  flex: 0 0 auto;
+  font-family: var(--mantine-font-family-monospace);
+  font-weight: 500;
+}
+
+/* The main argument: muted, on the name's line while it fits, wrapping (never cut) when it doesn't. */
+.stepSummary {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mantine-font-family-monospace);
+  color: var(--nest-muted);
+  overflow-wrap: anywhere;
+}
+
+.chevron {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--nest-muted);
+  transition: transform var(--nest-motion-base) var(--nest-ease-enter);
+}
+
+[data-open] > button > .chevron {
+  transform: rotate(90deg);
+}
+
+/* A step's detail: under its row, on the name's edge, the subtle ground. */
+.stepDetail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-sm);
+  margin: var(--mantine-spacing-2xs) 0 var(--mantine-spacing-sm) calc(var(--mantine-spacing-lg) + var(--mantine-spacing-sm) * 2);
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  border-radius: var(--mantine-radius-md);
+  background: var(--nest-subtle);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-2xs);
+  min-width: 0;
+}
+
+.fieldLabel {
+  font-size: var(--mantine-font-size-xs);
+  font-weight: 500;
+  color: var(--nest-muted);
+}
+
+.fieldValue {
+  font-family: var(--mantine-font-family-monospace);
+  font-size: var(--mantine-font-size-xs);
+  line-height: var(--mantine-line-height-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.fieldValue[data-tone="danger"] {
+  color: var(--mantine-color-danger-text);
+}
+
+/* "Used 3 tools": a quiet row above a reply, opening onto its steps behind a hairline. */
+.disclosureRow {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--mantine-spacing-xs);
+  min-height: var(--nest-hit);
+  padding: 0 var(--mantine-spacing-sm);
+  margin-left: calc(var(--mantine-spacing-sm) * -1);
+  border-radius: var(--mantine-radius-md);
+  font-size: var(--mantine-font-size-sm);
+  color: var(--nest-muted);
+  transition: background-color var(--nest-motion-fast) var(--nest-ease-enter);
+}
+
+.disclosureRow:hover {
+  background: var(--nest-subtle);
+  color: var(--mantine-color-text);
+}
+
+.disclosureRow .chevron {
+  margin-left: 0;
+}
+
+.disclosureBody {
+  margin: var(--mantine-spacing-xs) 0 var(--mantine-spacing-sm);
+  padding-left: var(--mantine-spacing-sm);
+  border-left: var(--nest-border);
 }
 
 .dock {
   position: relative;
-  padding: var(--mantine-spacing-md) 0 calc(var(--mantine-spacing-md) + env(safe-area-inset-bottom));
-  border-top: var(--nest-border);
+  padding: var(--mantine-spacing-sm) 0 calc(var(--mantine-spacing-lg) + env(safe-area-inset-bottom));
   background: var(--nest-page-bg);
+}
+
+/* The composer: one rounded box on the surface, the field over its bar; focused, its edge in primary. */
+.composer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--mantine-spacing-xs);
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-sm) var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  border: var(--nest-border);
+  border-radius: var(--mantine-radius-md);
+  background: var(--nest-surface);
+  transition: border-color var(--nest-motion-fast) var(--nest-ease-enter);
+}
+
+.composer:focus-within {
+  border-color: var(--mantine-primary-color-filled);
+  outline: 1px solid var(--mantine-primary-color-filled);
+}
+
+.composer textarea {
+  padding: var(--mantine-spacing-2xs) 0;
+  font-size: var(--mantine-font-size-md);
+  line-height: var(--mantine-line-height-md);
+}
+
+.composerBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--mantine-spacing-sm);
+  min-height: var(--nest-hit);
+}
+
+.composerBar > :last-child {
+  margin-left: auto;
+}
+
+/* The empty chat: centred in the log, the starters a grid of quiet cards under the line. */
+.welcome {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--mantine-spacing-sm);
+  margin: auto 0;
+  padding: var(--mantine-spacing-2xl) 0;
+  text-align: center;
+}
+
+.welcomeTitle {
+  font-size: var(--mantine-font-size-lg);
+  line-height: var(--mantine-line-height-lg);
+  font-weight: 600;
+}
+
+.welcomeText {
+  max-width: 32rem;
+  color: var(--nest-muted);
+}
+
+.starters {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--mantine-spacing-sm);
+  width: 100%;
+  margin-top: var(--mantine-spacing-lg);
+}
+
+@media (max-width: 48em) {
+  .starters {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.starter {
+  display: flex;
+  align-items: center;
+  gap: var(--mantine-spacing-sm);
+  min-height: var(--nest-hit);
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  border: var(--nest-border);
+  border-radius: var(--mantine-radius-md);
+  background: var(--nest-surface);
+  font-size: var(--mantine-font-size-sm);
+  text-align: left;
+  color: var(--mantine-color-text);
+  transition: background-color var(--nest-motion-fast) var(--nest-ease-enter);
+}
+
+.starter:hover {
+  background: var(--nest-subtle);
+}
+
+.starter > svg {
+  flex: 0 0 auto;
+  color: var(--nest-muted);
 }
 
 /* On a phone the page's column is the one scroller (the viewport less the top bar): the header and the

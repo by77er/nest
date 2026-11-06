@@ -3,7 +3,7 @@
 // (src/ui/design.test.ts).
 export { AppFrame } from "./AppFrame";
 export { ScrollLog } from "./Chat";
-export { ActivityLine, ChatFrame, ChatLog, CodeFrame, ComposerDock, DaySeparator, MessageGroup, MessageRow, StreamText } from "./ChatLog";
+export { ChatFrame, ChatLog, ChatWelcome, CodeFrame, ComposerBox, ComposerDock, DaySeparator, MessageGroup, MessageRow, Starter, StepField, StepList, StepRow, StepsDisclosure, type StepStatus, WorkingLine } from "./ChatLog";
 export { FadeIn } from "./FadeIn";
 export { Glyph, GLYPH, Terminal, TermLine, TermProse, TermRule, TermStatus, type TermTone } from "./Terminal";
 export { FieldGroup } from "./FieldGroup";

@@ -1,16 +1,18 @@
 // A manager's message, rendered (README.md#rich-messages): Markdown with GFM (tables, task lists),
 // LaTeX math (KaTeX, untrusted), SVG figures (sanitized, shown only as images) and task references
-// resolved live from the board. Raw HTML in the text is never rendered: remarkEscapeHtml turns it into
+// resolved live from the board, code blocks highlighted (a short list of languages) with their language
+// and a copy button. Raw HTML in the text is never rendered: remarkEscapeHtml turns it into
 // literal text first, and no rehype-raw is in the pipeline.
 
 import { Anchor, Button, CopyButton } from "@mantine/core";
 import { IconCheck, IconCopy, IconPhoto } from "@tabler/icons-react";
-import { isValidElement, memo } from "react";
+import { isValidElement, memo, type ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
 import { CodeFrame, icon, RichImage, RichProse, RichTableFrame, Stack, TaskCheck } from "../../layout";
+import { rehypeHighlightCode } from "../../rich/highlight";
 import { INLINE_IMAGE, LINK, urlTransform } from "../../rich/links";
 import { splitSvg } from "../../rich/svg";
 import { remarkDemoteHeadings, remarkEscapeHtml, remarkTaskRefs, TASK_HREF } from "../../rich/tasks";
@@ -30,6 +32,15 @@ export const KATEX_OPTIONS = {
   maxExpand: 500,
   output: "htmlAndMathml",
 } as const;
+
+/** The text of rendered children (a highlighted fence is spans of tokens): what Copy copies. */
+function textOf(node: ReactNode): string {
+  if (node === null || node === undefined || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join("");
+  if (isValidElement(node)) return textOf((node.props as { children?: ReactNode }).children);
+  return "";
+}
 
 function components(projectId: string): Components {
   return {
@@ -58,9 +69,9 @@ function components(projectId: string): Components {
     },
     // A code block: its language and a copy button above it (math and SVG never reach here).
     pre: ({ children }) => {
-      const code = isValidElement(children) ? (children.props as { className?: string; children?: unknown }) : null;
+      const code = isValidElement(children) ? (children.props as { className?: string; children?: ReactNode }) : null;
       const lang = /language-([\w+-]+)/.exec(code?.className ?? "")?.[1] ?? "";
-      const source = String(code?.children ?? "").replace(/\n$/, "");
+      const source = textOf(code?.children).replace(/\n$/, "");
       return (
         <CodeFrame
           lang={lang}
@@ -101,7 +112,7 @@ export const Markdown = memo(function Markdown({ text, projectId }: { text: stri
   return (
     <ReactMarkdown
       remarkPlugins={[remarkEscapeHtml, remarkGfm, remarkMath, remarkTaskRefs, remarkDemoteHeadings]}
-      rehypePlugins={[[rehypeKatex, KATEX_OPTIONS]]}
+      rehypePlugins={[[rehypeKatex, KATEX_OPTIONS], rehypeHighlightCode]}
       urlTransform={urlTransform}
       skipHtml={false}
       components={componentsFor(projectId)}

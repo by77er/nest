@@ -9,7 +9,7 @@
 // "secret-requests" (agents asking for credentials, one tainted). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
-import { trace } from "./trace.mjs";
+import { PLAN_REPLY, trace } from "./trace.mjs";
 
 const DAY = 86_400_000;
 
@@ -103,7 +103,7 @@ export function data(variant = "demo", now = Date.now()) {
   ].sort((a, b) => a.at_ms - b.at_ms);
   const chat = [
     { seq: 1, at_ms: now - 3_600_000, sender: "owner", text: "Plan the search work and split it into tasks.", delivered: true, error: null },
-    { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: 'Done: "Add search by tag" is specced and assigned. I left "Export gadgets as CSV" ready for later.', delivered: true, error: null },
+    { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: PLAN_REPLY, delivered: true, error: null },
     { seq: 3, at_ms: now - 900_000, sender: "app", text: "The manager ended (exited).", delivered: true, error: null },
     { seq: 4, at_ms: now - 300_000, sender: "owner", text: "Can you also look at the auth migration? It stalled.", delivered: false, error: "nest answered 409: the agent has ended" },
   ];

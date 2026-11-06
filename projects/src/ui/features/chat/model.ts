@@ -1,9 +1,10 @@
 // The chat's pure parts: messages grouped by author (proximity) with a separator at each new day, the
-// manager's turn in progress read from its live trace, and the read marker kept per browser.
+// manager's turn in progress read from its live trace as steps (what it said, each tool it called), the
+// steps behind each reply the trace still holds, and the read marker and draft kept per browser.
 
 import type { ChatMessage } from "../../api/types";
-import type { TraceEvent } from "../trace/model";
-import { groupTurns } from "../trace/model";
+import type { HistoryEvent, TraceEvent, TurnGroup } from "../trace/model";
+import { groupTurns, primaryArg, toolName } from "../trace/model";
 
 /** Messages from one author within this long of each other are one group. */
 export const GROUP_GAP_MS = 5 * 60 * 1000;
@@ -45,12 +46,33 @@ export function groupLog(messages: ChatMessage[], now = Date.now()): LogItem[] {
   return out;
 }
 
-/** The manager's turn in progress, from its trace: the text so far and what it's doing now. */
+/** A tool call of a turn, as the chat shows it: a compact row, its input and result behind it. */
+export interface ToolStep {
+  kind: "tool";
+  key: string;
+  /** The tool's own name (an MCP tool's without its server: `write_spec`). */
+  name: string;
+  /** Its main argument's first line (`npm test`, `src/a.ts`), or "". */
+  summary: string;
+  /** Its input's fields, each a line of text (a string as it is, anything else as compact JSON). */
+  input: { key: string; value: string }[];
+  /** What it returned (nest keeps a result's first 200 characters), or null before it has. */
+  result: string | null;
+  /** running: no result yet in a running turn; stopped: the turn ended without one. */
+  status: "running" | "done" | "error" | "stopped";
+}
+/** Something the manager said along the way (its last text is the reply itself). */
+export interface TextStep {
+  kind: "text";
+  key: string;
+  text: string;
+}
+export type Step = ToolStep | TextStep;
+
+/** The manager's turn in progress, from its trace: what it has said and done so far, in order. */
 export interface LiveTurn {
   turn: string;
-  text: string;
-  /** The latest tool still running, as a person reads it ("Reading src/worker.ts"), if any. */
-  activity: string | null;
+  steps: Step[];
 }
 
 const str = (v: unknown) => (typeof v === "string" ? v : "");
@@ -63,31 +85,35 @@ const parse = (input: unknown): Record<string, unknown> => {
     return {};
   }
 };
-const clip = (s: string, n = 60) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+/** The most of one input field the chat holds (a file's whole content is the trace's to show). */
+const FIELD_MAX = 2000;
 
-/** A tool call, as an activity line. */
-export function describeTool(name: string, input: unknown): string {
-  const i = parse(input);
-  const path = str(i.file_path) || str(i.path) || str(i.notebook_path);
-  const short = name.replace(/^mcp__[^_]+(?:-[^_]+)*__/, "").replace(/_/g, " ");
-  switch (name) {
-    case "Read":
-      return path ? `Reading ${clip(path)}` : "Reading";
-    case "Write":
-    case "Edit":
-    case "MultiEdit":
-      return path ? `Editing ${clip(path)}` : "Editing";
-    case "Bash":
-      return str(i.command) ? `Running ${clip(str(i.command))}` : "Running a command";
-    case "Grep":
-    case "Glob":
-      return str(i.pattern) ? `Searching for ${clip(str(i.pattern), 40)}` : "Searching";
-    case "WebFetch":
-    case "WebSearch":
-      return "Looking it up";
-    default:
-      return clip(short.charAt(0).toUpperCase() + short.slice(1));
+const field = (v: unknown): string => {
+  // A list of strings (a spec's criteria) a line each; anything else not a string as compact JSON.
+  const s = typeof v === "string" ? v : Array.isArray(v) && v.every((x) => typeof x === "string") ? v.join("\n") : JSON.stringify(v);
+  return s.length > FIELD_MAX ? `${s.slice(0, FIELD_MAX - 1)}…` : s;
+};
+
+/** A turn's steps, in order: its texts and its tool calls (each with its result when it came). */
+export function stepsOf(g: TurnGroup, running: boolean): Step[] {
+  const out: Step[] = [];
+  for (const item of g.items) {
+    if (item.kind === "event" && item.event.type === "assistant_text" && str(item.event.text).trim()) {
+      out.push({ kind: "text", key: item.key, text: str(item.event.text) });
+    } else if (item.kind === "tool") {
+      const r = item.result as (TraceEvent | HistoryEvent | null);
+      out.push({
+        kind: "tool",
+        key: item.key,
+        name: toolName(str(item.call.name)),
+        summary: primaryArg(item.call.input),
+        input: Object.entries(parse(item.call.input)).map(([key, value]) => ({ key, value: field(value) })),
+        result: r ? str(r.summary) : null,
+        status: r ? (r.is_error ? "error" : "done") : running ? "running" : "stopped",
+      });
+    }
   }
+  return out;
 }
 
 /** The turn running now (started, not completed), if any. */
@@ -95,13 +121,26 @@ export function liveTurn(events: TraceEvent[]): LiveTurn | null {
   const groups = groupTurns(events);
   const g = groups.at(-1);
   if (!g || !g.turn || !g.started || g.completed) return null;
-  let text = "";
-  let activity: string | null = null;
-  for (const item of g.items) {
-    if (item.kind === "event" && item.event.type === "assistant_text") text += (text ? "\n\n" : "") + str(item.event.text);
-    if (item.kind === "tool") activity = item.result ? null : describeTool(str(item.call.name), item.call.input);
+  return { turn: g.turn, steps: stepsOf(g, true) };
+}
+
+/**
+ * The steps behind each reply the trace still holds: a completed turn's reply is its last text (what nest
+ * records as the manager's message), and its steps are everything before it, kept only when it called a
+ * tool. Keyed by that text, trimmed, so a message finds its own turn by what it says (never by time).
+ */
+export function stepsByReply(events: TraceEvent[]): Map<string, Step[]> {
+  const out = new Map<string, Step[]>();
+  for (const g of groupTurns(events)) {
+    if (!g.turn || !g.completed) continue;
+    const steps = stepsOf(g, false);
+    let last = steps.length - 1;
+    while (last >= 0 && steps[last]!.kind !== "text") last--;
+    if (last < 0) continue;
+    const before = steps.slice(0, last);
+    if (before.some((s) => s.kind === "tool")) out.set((steps[last] as TextStep).text.trim(), before);
   }
-  return { turn: g.turn, text, activity };
+  return out;
 }
 
 // --- read state, per browser ----------------------------------------------------------------------
