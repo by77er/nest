@@ -42,6 +42,8 @@ export const PERMISSIONS = {
   // Reading PRs to attach them (`GET /repos/{o}/{r}/pulls`, `…/pulls/{n}`): Pull requests: read, on
   // the same permissions page (which also lists `…/pulls/{n}` under Contents: read, as one of a set).
   pullsRead: { pull_requests: "read" },
+  // A public account by login (`GET /users/{login}`): no permission of its own; metadata, the least one.
+  metadata: { metadata: "read" },
 } as const satisfies Record<string, Record<string, "read" | "write">>;
 
 // --- the webhook's signature ---------------------------------------------------------------------------
@@ -144,6 +146,22 @@ export class GitHub {
     const r = (await this.call<{ default_branch?: unknown }>("GET", `/repos/${repo}`))!;
     if (typeof r.default_branch !== "string" || !r.default_branch) throw new GitHubError(502, "the repo has no default branch", false);
     return r.default_branch;
+  }
+
+  /** A GitHub account by login (https://docs.github.com/en/rest/users/users#get-a-user): public, so any token reads it; null when there's none. */
+  async user(login: string): Promise<{ id: number; login: string; type: string } | null> {
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(login)) return null;
+    const u = await this.call<{ id?: unknown; login?: unknown; type?: unknown }>("GET", `/users/${login}`, undefined, { nullOn404: true });
+    if (!u) return null;
+    if (typeof u.id !== "number" || typeof u.login !== "string" || typeof u.type !== "string") throw new GitHubError(502, "GitHub's answer for the user isn't one", false);
+    return { id: u.id, login: u.login, type: u.type };
+  }
+
+  /** The repo's owner: its id (immutable), login and kind (`User` or `Organization`). Metadata: read. */
+  async repoOwner(repo: string): Promise<{ id: number; login: string; type: string }> {
+    const o = ((await this.call<{ owner?: { id?: unknown; login?: unknown; type?: unknown } }>("GET", `/repos/${repo}`))!.owner ?? {});
+    if (typeof o.id !== "number" || typeof o.login !== "string" || typeof o.type !== "string") throw new GitHubError(502, "the repo has no owner", false);
+    return { id: o.id, login: o.login, type: o.type };
   }
 
   createCheckRun(repo: string, b: { head_sha: string; external_id: string; details_url?: string; output: CheckOutput }): Promise<{ id: number; app?: { id?: number } } | null> {

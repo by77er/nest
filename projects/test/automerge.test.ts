@@ -144,7 +144,9 @@ describe("a PR's auto-merge", () => {
     const t = await task(p, id);
     expect(t.prs[0]?.auto_merge ?? null).toMatchObject({ state: "enabled", method: "rebase", error: null });
     expect(t.history.at(-1)).toMatchObject({ action: "auto_merge_enabled", actor: "app:github" });
-    expect(mintsFor(p).at(-1)).toEqual({ pull_requests: "write", contents: "write" });
+    // Its token, exactly (the review's check-run token may be minted before or after it: two objects' alarms).
+    expect(mintsFor(p)).toContainEqual({ pull_requests: "write", contents: "write" });
+    expect(mintsFor(p).filter((m) => "pull_requests" in m)).toEqual([{ pull_requests: "write", contents: "write" }]);
     // Not a task's PR; a fork's branch named like the task's.
     await pr(p, 8, { ref: "feature/x" });
     const other = await taskWithWorker(p);

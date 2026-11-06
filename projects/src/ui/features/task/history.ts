@@ -56,6 +56,12 @@ export function summarize(h: HistoryRow): string {
       return text ? `The worker couldn't start: ${clip(text)}` : "The worker couldn't start";
     case "start_abandoned":
       return "The worker's start began again, without workflow changes (the setting was turned off)";
+    case "pr_comment":
+      return typeof o.pr === "number" ? `The owner's comment on PR #${o.pr} went to ${str(o.to) ?? "the worker"}` : "The owner's PR comment went to the worker";
+    case "pr_comment_dropped":
+      return typeof o.pr === "number" ? `The owner's comment on PR #${o.pr} wasn't sent${str(o.why) ? `: ${clip(str(o.why)!, 80)}` : ""}` : "The owner's PR comment wasn't sent";
+    case "revise":
+      return typeof o.pr === "number" ? `A worker starts again for the owner's comment on PR #${o.pr}` : "A worker starts again for the owner's PR comment";
     case "pr_opened":
       return typeof o.pr === "number" ? `PR #${o.pr} opened` : "PR opened";
     case "worker_exited": {

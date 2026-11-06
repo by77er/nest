@@ -5,8 +5,9 @@
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-long" (thirty messages), "chat-paged"
-// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents) or
-// "secret-requests" (agents asking for credentials, one tainted). Traces come from
+// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents),
+// "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
+// PR comments reach workers: a user with a login, or by id only; nobody otherwise). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
 import { PLAN_REPLY, trace } from "./trace.mjs";
@@ -195,6 +196,9 @@ export function data(variant = "demo", now = Date.now()) {
     id: "prj_demo", name, repo, auto_assign: true, max_workers: 2, manager: "agt_mgr7k2", manager_error: null, created_ms: now - DAY * 3,
     attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: now },
     auto_merge: true, merge_method: "squash", max_concurrent_reviews: null, repo_auto_merge: { state: "applied", want: true, repo: true, error: null, at_ms: now - 3_600_000 },
+    // Whose PR comments reach workers (README.md#pr-comments): nobody by default here; set, or set by id only.
+    comments_from: variant === "comments-set" ? { id: 5839471, login: "by77er" } : variant === "comments-id-only" ? { id: 5839471, login: null } : null,
+    repo_owner: { id: 5839471, login: "by77er" },
   };
   const demo = { id: "prj_demo", name, repo, created_ms: now - DAY * 3, settings };
   const other = { id: "prj_other", name: "Widgets", repo: "by77er/widgets", created_ms: now - DAY * 9 };

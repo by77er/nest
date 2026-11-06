@@ -93,6 +93,7 @@ Only the client interface. One client, `projects`, has this grant:
 
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.
 - Tasks without a PR (research, specs) end by the owner marking them done, from `draft`, `ready` or `stalled`.
+- Routing GitHub's events by `repository.id` and the installation id recorded at attach rather than by `full_name` ([PR comments](#pr-comments); a follow-up).
 - Whether PRs from outside the owner's account are reviewed: on a public repo anyone's PR starts a reviewer (the owner asked for any PR). `max_concurrent_reviews` caps how many run at once, not how many run.
 
 ## Built: the core
@@ -130,7 +131,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 **What the build settled** (2026-11-02), against GitHub's docs for [webhook signatures](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [events](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [check runs](https://docs.github.com/en/rest/checks/runs) and [branch protection](https://docs.github.com/en/rest/branches/branch-protection):
 - **The webhook:**
   - `X-Hub-Signature-256` is checked over the raw bytes in constant time: missing or wrong is `401`.
-  - Deduplicated by `X-GitHub-Delivery` (DirectoryDO, 7 days); routed by `repository.full_name` to its project; an unknown repo, `ping` and other events are a `2xx`.
+  - Deduplicated by `X-GitHub-Delivery` (DirectoryDO, 7 days); routed by `repository.full_name` to its project; an unknown repo, `ping` and other events are a `2xx`. The owner's PR comments: [below](#pr-comments).
   - It only records: ReviewDO and ProjectDO write one step each and arm their alarms, so it answers within GitHub's 10 s.
   - GitHub doesn't redeliver by itself (unverified: its docs offer manual redelivery only). A lost `pull_request` leaves the head without the check, which blocks merging until the next push or a redelivery.
 - **The queue:**
@@ -225,6 +226,41 @@ The owner's request (2026-11-03): "PRs should be attachable to tasks."
 - **Done:** a task is done once at least one PR is attached and every attached one has merged (`prsDone` in `src/tasks.ts`). Merging one of several leaves it in review. A PR closed without merging is detached with a note, and the task is done if the rest have merged. `merged` now moves any task that isn't over, since a PR may be attached to a task with no worker.
 - **Review and auto-merge:** every PR is reviewed already. With auto-merge on, every attached PR gets it: the owner's, the manager's, the worker's or the branch's, but only once GitHub has said it's from the repo itself and given its node id. A fork's PR never gets it, and neither does one whose head repo GitHub no longer names.
 - **The live worker is told** when PRs are attached or detached ([task changes](#task-changes)).
+
+## PR comments
+
+The owner's request (2026-11-06): their comments on a task's PR reach that task's worker.
+
+- **Events** (`/hooks/github`, the same signature check). Each delivery is claimed by its `X-GitHub-Delivery` before it's handled, in one step, so concurrent copies act once. The claim is confirmed when handling succeeds; one never confirmed (its handler died) lapses after 5 minutes, so a redelivery is handled:
+  - `issue_comment` `created` on a PR (`issue.pull_request` present);
+  - `pull_request_review` `submitted`, with text or requesting changes;
+  - `pull_request_review_comment` `created`.
+
+  An edit, a delete, an approval with no text, or a comment on an issue that isn't a PR is ignored.
+- **Only the project's GitHub user** (Settings, "PR comments"), matched by GitHub user **id**, which is immutable. A login can be renamed and then registered by someone else; an id can't.
+  - **The default** is the repo's owner, if a user, applied once at attach (projects attached before this release attach again once, for it). After that, the owner's choice stands, nobody included, however often the repo is attached again.
+  - **Settings** shows whose comments count ("last seen as" its login), takes a GitHub login (looked up with `GET /users/{login}`, kept as its id; an organization or a bot is refused), offers "Use the repo owner" (taken on the server as the repo's owner GitHub names at save, by id, never by a login it once had), and warns about the account's credentials. An organization's repo has nobody until it's set.
+  - With nobody set, a comment on a task's PR is noted on the task (at most once an hour), so the owner's comment isn't lost silently.
+  - **The author must be a person writing as themself:** `user.type` is `User`, and `performed_via_github_app` is unset. An App acting with the user's token is refused, even though GitHub calls its comments the user's.
+  - Everyone else is ignored, bots included, and so is the app's own reviewer, which posts as its App.
+  - **Anything that holds a credential of that GitHub account** (a token in an agent's sandbox, a CI secret) can comment as it, and those comments count. So keep the account's tokens out of agents and CI, and use the App's brokered tokens there.
+- **The PR's task:**
+  - For the two review events, it's the head branch `task/<id>` of the repo itself, never a fork's, as for `pull_request`.
+  - `issue_comment` names no head, so it's the task the PR is (or was) attached to, from its branch or the owner's attach. A fork's PR is never a task's.
+  - A PR no task holds is ignored.
+- **The message** (`prCommentMessage`) says it's a PR comment from the owner, and gives the kind, the author, the PR, the file and line for a review comment, and the link. Each of these is cut to one line, so a crafted file path can't add lines to the frame. The text comes between rules, cut at 4,000 characters with a pointer to the link.
+- **Relayed, so the worker's session is tainted** (nest's rule for webhook input). A comment could be written by anything holding the user's credential, and a tainted worker is held to what tainted sessions may do. Workers with hands are tainted already, so it costs nothing today.
+- **Delivery:**
+  - **A worker that has started** (brief delivered: in progress or in review) gets it in its inbox through the app's outbox (`messages`, retried).
+  - **A worker that's starting** (assigned, its brief not yet delivered) gets it after its brief, in order (`pr_inputs`), never ahead of it.
+  - **No worker running**, with the task open (in review, stalled or ready): a worker is started again (`revise`: back to `assigned`), the comment after its brief.
+    - Started from the alarm, not on the webhook's request.
+    - Held to the task's dependencies, as any assign is, and to 3 restarts per task an hour (each refusal recorded).
+    - Not held to `max_workers`: the owner's explicit comment, as with the owner's own assign.
+  - **A merged PR, a closed or detached one, or a task that's over:** the comment is dropped and recorded on the task (`pr_comment_dropped`, with why). A comment after the work is over is the owner's to raise with the manager in chat; sending it on would restart work no one asked to restart.
+  - Comments still queued for a task that ends are dropped with it.
+- Each delivery is recorded on the task (`pr_comment`, `revise`).
+- **Open:** route GitHub's events by `repository.id` and the installation id recorded at attach, not by `full_name`, so a renamed namespace that someone registers again can't reach the project (a follow-up).
 
 ## Dependencies
 
@@ -428,7 +464,7 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 2. Cloudflare Access comes from the app's own inframe stack, [`deploy/`](deploy/) (not nest's `edge` stack): the owner's login on `projects-nest.bitcru.sh`, with `/hooks` and `/mcp` bypassed, since they are authenticated by signature and by identity instead. `.github/workflows/deploy-projects-infra.yml` applies it on a push to `main` that touches `deploy/`, with `CLOUDFLARE_ACCESS_API_TOKEN` (Access: Apps and Policies: Edit); or by hand, `inframe plan --stack projects` then `apply` ([deploy/README.md](deploy/README.md#use)). Set `PROJECTS_AUD` in `wrangler.jsonc` to its output `projects_aud`.
 3. The Worker deploys by `.github/workflows/deploy-projects.yml` on a push to `main` that touches `projects/` (outside `deploy/`), to `projects-nest.bitcru.sh`. It puts its secrets from the `production` environment's `PROJECTS_NEST_CLIENT_TOKEN`, `PROJECTS_NEST_WEBHOOK_SECRET` and `PROJECTS_GITHUB_WEBHOOK_SECRET` when they're set. Then `POST /api/admin/sync` writes the catalog.
 4. `PUT /v1/clients/self/webhook {url: https://projects-nest.bitcru.sh/hooks/nest}` (the app does this at its first start), and store the secret as `NEST_WEBHOOK_SECRET`.
-5. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github` (content type `application/json`), with a new secret, stored as `GITHUB_WEBHOOK_SECRET` (`wrangler secret put`). Subscribe the App to the `pull_request` and `check_run` events. The App needs the repository permissions the grant names (Checks: read and write, Administration: read and write, Metadata: read) and Pull requests (read at least), without which GitHub doesn't offer the `pull_request` event. Its installation must cover each attached repo. For auto-merge, the App also needs Contents: read and write, and Pull requests: read and write.
+5. Point the GitHub App's webhook at `https://projects-nest.bitcru.sh/hooks/github` (content type `application/json`), with a new secret, stored as `GITHUB_WEBHOOK_SECRET` (`wrangler secret put`). Subscribe the App to the `pull_request` and `check_run` events, and for [PR comments](#pr-comments) `issue_comment`, `pull_request_review` and `pull_request_review_comment` (with Issues: read for `issue_comment`; done for nest-by77er 2026-11-06). The App needs the repository permissions the grant names (Checks: read and write, Administration: read and write, Metadata: read) and Pull requests (read at least), without which GitHub doesn't offer the `pull_request` event. Its installation must cover each attached repo. For auto-merge, the App also needs Contents: read and write, and Pull requests: read and write.
 6. **Auto-merge's permissions (2026-11-02):** add `pull_requests: write` and `contents: write` to the live client's `github.permissions`. Use `PATCH /v1/admin/clients/<id>`, which takes the grant ([clients doc](../docs/control-plane/api/clients/)). Until then, turning auto-merge on writes the repo setting, but each PR's auto-merge fails with nest's 403, recorded on its task.
 7. **The Network page's ceiling (2026-11-02):** add `egress_hosts` to the client's grant (`PATCH /v1/admin/clients/<id>`, which takes the whole grant): the hosts the owner may open for agents on the Network page, e.g. `registry.npmjs.org`, `nodejs.org`, `pypi.org`, `files.pythonhosted.org`. Until then the page refuses every host.
 8. **Secrets (2026-11-02, after nest #125):** give the live client's grant `secrets: {max_count, max_bytes}` and the `inject_hosts` its projects may need (e.g. `api.cloudflare.com`, `registry.npmjs.org`), and `github_push: {workflows: true}` only if workers may edit CI. Use `PATCH /v1/admin/clients/<id>`. Until then, the Secrets page shows no hosts and saving is refused. The variables need nest #134 (env and the client layer); a host's nestd from before it ignores env, so its sandboxes' commands get no variables until it's upgraded.

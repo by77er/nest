@@ -26,6 +26,8 @@ const FLOW: [TaskState, TaskEvent, TaskState][] = [
   ...(["draft", "ready", "stalled"] as const).map((s): [TaskState, TaskEvent, TaskState] => [s, "done", "done"]),
   // Cancelling: anything not over.
   ...(["draft", "ready", "assigned", "in_progress", "in_review", "stalled"] as const).map((s): [TaskState, TaskEvent, TaskState] => [s, "cancel", "cancelled"]),
+  // The owner's PR comment with no worker running: one is started again (README.md#pr-comments).
+  ...(["ready", "in_review", "stalled"] as const).map((s): [TaskState, TaskEvent, TaskState] => [s, "revise", "assigned"]),
 ];
 
 describe("the task state machine", () => {
