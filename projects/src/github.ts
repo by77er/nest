@@ -146,6 +146,13 @@ export class GitHub {
     return r.default_branch;
   }
 
+  /** The repo's owner: its id (immutable), login and kind (`User` or `Organization`). Metadata: read. */
+  async repoOwner(repo: string): Promise<{ id: number; login: string; type: string }> {
+    const o = ((await this.call<{ owner?: { id?: unknown; login?: unknown; type?: unknown } }>("GET", `/repos/${repo}`))!.owner ?? {});
+    if (typeof o.id !== "number" || typeof o.login !== "string" || typeof o.type !== "string") throw new GitHubError(502, "the repo has no owner", false);
+    return { id: o.id, login: o.login, type: o.type };
+  }
+
   createCheckRun(repo: string, b: { head_sha: string; external_id: string; details_url?: string; output: CheckOutput }): Promise<{ id: number; app?: { id?: number } } | null> {
     return this.call("POST", `/repos/${repo}/check-runs`, {
       name: CHECK_NAME, status: "in_progress", started_at: new Date().toISOString(), ...b,

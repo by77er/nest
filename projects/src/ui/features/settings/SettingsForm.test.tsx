@@ -13,6 +13,22 @@ async function openSettings(api: FakeApi) {
   return { ...r, dialog: await screen.findByRole("main") };
 }
 
+describe("PR comments in the settings", () => {
+  it("names whose comments reach workers, warns what else can comment as them, and sets another user's id", async () => {
+    const api = new FakeApi();
+    const { user, dialog } = await openSettings(api);
+    expect(dialog).toHaveTextContent("owner's comments on a task's PR reach its worker");
+    expect(dialog).toHaveTextContent("Anything that holds this account's GitHub credentials");
+    const field = within(dialog).getByLabelText("From GitHub user (id)");
+    expect(field).toHaveValue("1001");
+    await user.clear(field);
+    await user.type(field, "4242");
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(api.writes).toHaveLength(1));
+    expect(api.writes[0]!.body).toMatchObject({ comments_from_id: 4242 });
+  });
+});
+
 describe("auto-merge in the settings", () => {
   it("turns on with a merge method, sending both", async () => {
     const api = new FakeApi();

@@ -16,7 +16,10 @@ import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../au
 
 const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", merge: "Merge commit", rebase: "Rebase and merge" };
 
-const values = (s: Settings) => ({ auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method, workers_edit_workflows: s.workers_edit_workflows });
+const values = (s: Settings) => ({
+  auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method, workers_edit_workflows: s.workers_edit_workflows,
+  comments_from_id: s.comments_from?.id ?? null,
+});
 
 /** The editable settings as Panels in a row, saved together by the one Save right under them. */
 export function SettingsForm({ projectId, settings, onDone }: { projectId: string; settings: Settings; onDone?: () => void }) {
@@ -82,6 +85,26 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
             <Section title="CI workflows" order={4} region={false}>
               <FieldGroup>
                 <WorkflowsSetting projectId={projectId} {...form.getInputProps("workers_edit_workflows", { type: "checkbox" })} />
+              </FieldGroup>
+            </Section>
+          </Panel>
+          <Panel>
+            <Section title="PR comments" order={4} region={false}>
+              <FieldGroup>
+                <NumberInput
+                  label="From GitHub user (id)"
+                  description={
+                    settings.comments_from
+                      ? `${settings.comments_from.login ?? `User ${settings.comments_from.id}`}'s comments on a task's PR reach its worker. Anything that holds this account's GitHub credentials (a token in an agent or CI) can comment as it.`
+                      : "Nobody's yet: an organization's repo needs the user set. That user's comments on a task's PR will reach its worker."
+                  }
+                  min={1}
+                  allowDecimal={false}
+                  allowNegative={false}
+                  hideControls
+                  value={form.getValues().comments_from_id ?? ""}
+                  onChange={(v) => form.setFieldValue("comments_from_id", typeof v === "number" ? v : null)}
+                />
               </FieldGroup>
             </Section>
           </Panel>

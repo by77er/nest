@@ -562,7 +562,12 @@ export interface FakeCheckRun {
  * each token is a repo's, with its permissions (403 outside them, as GitHub answers an installation
  * token); branch protection is kept in GET's shape and written by PUT and PATCH.
  */
+/** A GitHub account's id in the fake: fixed for its login. */
+export const ownerIdOf = (login: string) => 10_000 + [...login].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1_000_000, 7);
+
 export class FakeGitHub {
+  /** Accounts that are organizations (a repo's owner is a user otherwise). */
+  readonly orgs = new Set<string>();
   readonly calls: { method: string; path: string; body: any; token: string | null }[] = [];
   readonly tokens = new Map<string, { repo: string; permissions: Record<string, string> }>();
   readonly repos = new Map<string, { default_branch: string; protection: Record<string, any> | null; allow_auto_merge: boolean }>();
@@ -647,7 +652,12 @@ export class FakeGitHub {
 
     // Merge settings are shown only to contents: read and write
     // (https://docs.github.com/en/rest/repos/repos#get-a-repository).
-    const repoView = () => ({ full_name: repoName, default_branch: repo.default_branch, ...(need("contents", "write") ? { allow_auto_merge: repo.allow_auto_merge } : {}) });
+    // Its owner: the account in its name, a user unless the test made it an org.
+    const owner = repoName.split("/")[0]!;
+    const repoView = () => ({
+      full_name: repoName, default_branch: repo.default_branch, owner: { login: owner, id: ownerIdOf(owner), type: this.orgs.has(owner) ? "Organization" : "User" },
+      ...(need("contents", "write") ? { allow_auto_merge: repo.allow_auto_merge } : {}),
+    });
     if (req.method === "GET" && sub === "") {
       // Metadata, which GitHub grants every installation token; the fake asks for it named.
       if (!need("metadata", "read")) return denied();

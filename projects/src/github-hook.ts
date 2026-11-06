@@ -34,15 +34,16 @@ const COMMENT_EVENTS = new Set(["issue_comment", "pull_request_review", "pull_re
 const BODY_MAX = 20_000;
 
 /**
- * Whether a comment is the owner's: GitHub's `author_association` (computed by GitHub, inside the
- * signed payload) is `OWNER`, the account that owns the repo, and the author is a person, not an App or
- * a bot (the app's own reviewer posts as its App). MEMBER and COLLABORATOR are left out: either may be
- * someone with read access only, and the app has no way to tell from the event.
+ * A comment's author, if it may be the project's GitHub user: a person (`user.type` `User`) writing as
+ * themself, not through an App (`performed_via_github_app` set: an App acting with a user's token).
+ * Whether it is that user is ProjectDO's to say, by id (README.md#pr-comments).
  */
-export function ownerComment(by: unknown, association: unknown): string | null {
+export function personAuthor(by: unknown, viaApp: unknown): { id: number; login: string } | null {
   const u = obj(by);
   const login = str(u.login);
-  return association === "OWNER" && u.type === "User" && login ? login : null;
+  const id = prNumber(u.id);
+  if (viaApp !== null && viaApp !== undefined) return null;
+  return u.type === "User" && login && id !== null ? { id, login } : null;
 }
 
 /**
@@ -62,12 +63,12 @@ export function prCommentOf(event: string, payload: Obj, repo: string): PrCommen
     const issue = obj(payload.issue);
     if (action !== "created" || !issue.pull_request) return null;
     const c = obj(payload.comment);
-    const author = ownerComment(c.user, c.author_association);
+    const author = personAuthor(c.user, c.performed_via_github_app);
     const pr = prNumber(issue.number);
     const url = str(c.html_url);
     if (!author || pr === null || !url) return null;
     // The event doesn't name the head: the PR's task is the one it's attached to.
-    return { pr, fork: null, headTask: null, kind: "comment", author, url, body: text(c.body) };
+    return { pr, fork: null, headTask: null, kind: "comment", author: author.login, author_id: author.id, url, body: text(c.body) };
   }
   const pr = obj(payload.pull_request);
   const number = prNumber(pr.number);
@@ -77,18 +78,18 @@ export function prCommentOf(event: string, payload: Obj, repo: string): PrCommen
     const state = str(r.state)?.toLowerCase() ?? null;
     const body = text(r.body);
     if (action !== "submitted" || (!body.trim() && state !== "changes_requested")) return null;
-    const author = ownerComment(r.user, r.author_association);
+    const author = personAuthor(r.user, r.performed_via_github_app);
     const url = str(r.html_url);
     if (!author || !url) return null;
-    return { pr: number, ...headOf(pr), kind: "review", author, url, body, review_state: state };
+    return { pr: number, ...headOf(pr), kind: "review", author: author.login, author_id: author.id, url, body, review_state: state };
   }
   const c = obj(payload.comment);
   if (action !== "created") return null;
-  const author = ownerComment(c.user, c.author_association);
+  const author = personAuthor(c.user, c.performed_via_github_app);
   const url = str(c.html_url);
   if (!author || !url) return null;
   const line = prNumber(c.line) ?? prNumber(c.original_line);
-  return { pr: number, ...headOf(pr), kind: "review_comment", author, url, body: text(c.body), path: (str(c.path) ?? "").slice(0, 500) || null, line };
+  return { pr: number, ...headOf(pr), kind: "review_comment", author: author.login, author_id: author.id, url, body: text(c.body), path: (str(c.path) ?? "").slice(0, 500) || null, line };
 }
 
 export async function githubHook(request: Request, env: Env): Promise<Response> {
@@ -110,13 +111,22 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
 
   const dir = directory(env);
   const seenId = `github:${delivery}`;
-  if (await dir.seen(seenId)) return json({ duplicate: true });
+  // Claimed before it's handled, in one step: a concurrent copy of the delivery is a duplicate.
+  if (!(await dir.claim(seenId))) return json({ duplicate: true });
+  try {
+    return await handle(env, event!, payload, seenId);
+  } catch (e) {
+    // Failed: the claim goes, so a redelivery is handled.
+    await dir.release(seenId);
+    throw e;
+  }
+}
+
+async function handle(env: Env, event: string, payload: Obj, seenId: string): Promise<Response> {
+  const dir = directory(env);
   const repo = str(obj(payload.repository).full_name)?.toLowerCase() ?? null;
   const p = repo ? await dir.projectByRepo(repo) : null;
-  if (!p) {
-    await dir.markSeen(seenId);
-    return json({ ignored: "no project for this repo" });
-  }
+  if (!p) return json({ ignored: "no project for this repo" });
   const of = { project: p.id, repo: p.repo };
   const action = str(payload.action);
 
@@ -125,7 +135,10 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
     const number = prNumber(pr.number) ?? prNumber(payload.number);
     const head = obj(pr.head);
     const sha = str(head.sha);
-    if (number === null || !sha || !SHA.test(sha)) return json({ error: "not a pull_request payload" }, 400);
+    if (number === null || !sha || !SHA.test(sha)) {
+      await dir.release(seenId);
+      return json({ error: "not a pull_request payload" }, 400);
+    }
     const updated_at = str(pr.updated_at) ?? new Date().toISOString();
     // The task its branch names, only for a branch of the repo itself (a fork may name any branch).
     const fromRepo = str(obj(head.repo).full_name)?.toLowerCase() === p.repo;
@@ -157,6 +170,5 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
       await review(env, p.id).onRerequest(of, { check_run: id, sha, prs });
     }
   }
-  await dir.markSeen(seenId);
   return json({ ok: true });
 }

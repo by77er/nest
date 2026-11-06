@@ -93,6 +93,7 @@ Only the client interface. One client, `projects`, has this grant:
 
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.
 - Tasks without a PR (research, specs) end by the owner marking them done, from `draft`, `ready` or `stalled`.
+- Routing GitHub's events by `repository.id` and the installation id recorded at attach rather than by `full_name` ([PR comments](#pr-comments); a follow-up).
 - Whether PRs from outside the owner's account are reviewed: on a public repo anyone's PR starts a reviewer (the owner asked for any PR). `max_concurrent_reviews` caps how many run at once, not how many run.
 
 ## Built: the core
@@ -230,19 +231,34 @@ The owner's request (2026-11-03): "PRs should be attachable to tasks."
 
 The owner's request (2026-11-06): their comments on a task's PR reach that task's worker.
 
-- **Events** (`/hooks/github`, the same signature check and delivery dedup): `issue_comment` `created` on a PR (`issue.pull_request` present), `pull_request_review` `submitted` with text or requesting changes, and `pull_request_review_comment` `created`. An edit, a delete, an approval with no text, or a comment on an issue that isn't a PR is ignored.
-- **Only the owner's:** GitHub's `author_association` is `OWNER` (the account that owns the repo), and the author is a person, not an App or a bot. It's computed by GitHub and inside the signed payload, so it can't be claimed. `MEMBER` and `COLLABORATOR` are left out, because either may have read access only, and the event can't tell. Bots are left out too, including the app's own reviewer, which posts as its App. Everyone else is ignored.
+- **Events** (`/hooks/github`, the same signature check; each delivery claimed by its `X-GitHub-Delivery` before it's handled, in one step, so concurrent copies act once):
+  - `issue_comment` `created` on a PR (`issue.pull_request` present);
+  - `pull_request_review` `submitted`, with text or requesting changes;
+  - `pull_request_review_comment` `created`.
+
+  An edit, a delete, an approval with no text, or a comment on an issue that isn't a PR is ignored.
+- **Only the project's GitHub user** (Settings, "PR comments"), matched by GitHub user **id**, which is immutable. A login can be renamed and then registered by someone else; an id can't.
+  - **The default** is the repo's owner, recorded when the repo is attached, if that owner is a user. An organization's repo has nobody until the owner sets the id.
+  - **The author must be a person writing as themself:** `user.type` is `User`, and `performed_via_github_app` is unset. An App acting with the user's token is refused, even though GitHub calls its comments the user's.
+  - Everyone else is ignored, bots included, and so is the app's own reviewer, which posts as its App.
+  - **Anything that holds a credential of that GitHub account** (a token in an agent's sandbox, a CI secret) can comment as it, and those comments count. So keep the account's tokens out of agents and CI, and use the App's brokered tokens there.
 - **The PR's task:**
   - For the two review events, it's the head branch `task/<id>` of the repo itself, never a fork's, as for `pull_request`.
-  - `issue_comment` names no head, so it's the task the PR is attached to, from its branch or the owner's attach. A fork's PR is never a task's.
+  - `issue_comment` names no head, so it's the task the PR is (or was) attached to, from its branch or the owner's attach. A fork's PR is never a task's.
   - A PR no task holds is ignored.
-- **The message** (`prCommentMessage`) says it's the owner's comment, and gives the kind, the author, the PR, the file and line for a review comment, and the link. Then comes the text between rules, cut at 4,000 characters with a pointer to the link. It's not relayed (no taint): GitHub vouches for the author, as for the owner's answer to a block. The text is still framed as data, since it may quote anyone.
+- **The message** (`prCommentMessage`) says it's a PR comment from the owner, and gives the kind, the author, the PR, the file and line for a review comment, and the link. Each of these is cut to one line, so a crafted file path can't add lines to the frame. The text comes between rules, cut at 4,000 characters with a pointer to the link.
+- **Relayed, so the worker's session is tainted** (nest's rule for webhook input). A comment could be written by anything holding the user's credential, and a tainted worker is held to what tainted sessions may do. Workers with hands are tainted already, so it costs nothing today.
 - **Delivery:**
-  - **A running worker** gets it in its inbox through the app's outbox (`messages`, retried).
-  - **A worker that's starting** gets it right after its brief (`pr_inputs`).
-  - **No worker running**, with the task open (in review, stalled or ready): a worker is started again (`revise`: back to `assigned`, not capped, as the owner's own assign), with the comment right after its brief.
-  - **A merged or closed PR, or a task that's over:** the comment is dropped and recorded on the task (`pr_comment_dropped`, with why). A comment after the work is over is the owner's to raise with the manager in chat. Sending it on would restart work no one asked to restart.
+  - **A worker that has started** (brief delivered: in progress or in review) gets it in its inbox through the app's outbox (`messages`, retried).
+  - **A worker that's starting** (assigned, its brief not yet delivered) gets it after its brief, in order (`pr_inputs`), never ahead of it.
+  - **No worker running**, with the task open (in review, stalled or ready): a worker is started again (`revise`: back to `assigned`), the comment after its brief.
+    - Started from the alarm, not on the webhook's request.
+    - Held to the task's dependencies, as any assign is, and to 3 restarts per task an hour (each refusal recorded).
+    - Not held to `max_workers`: the owner's explicit comment, as with the owner's own assign.
+  - **A merged PR, a closed or detached one, or a task that's over:** the comment is dropped and recorded on the task (`pr_comment_dropped`, with why). A comment after the work is over is the owner's to raise with the manager in chat; sending it on would restart work no one asked to restart.
+  - Comments still queued for a task that ends are dropped with it.
 - Each delivery is recorded on the task (`pr_comment`, `revise`).
+- **Open:** route GitHub's events by `repository.id` and the installation id recorded at attach, not by `full_name`, so a renamed namespace that someone registers again can't reach the project (a follow-up).
 
 ## Dependencies
 

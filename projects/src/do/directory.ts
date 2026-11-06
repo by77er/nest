@@ -111,6 +111,20 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.sql.exec("SELECT 1 FROM seen WHERE id = ?", id).toArray().length > 0;
   }
 
+  /**
+   * Claim an event before handling it, in one step: true the first time, false for a copy (so two
+   * concurrent deliveries of one id never both act). `release` undoes a claim whose handling failed.
+   */
+  async claim(id: string): Promise<boolean> {
+    const now = Date.now();
+    this.sql.exec("DELETE FROM seen WHERE at_ms < ?", now - SEEN_KEEP_MS);
+    return this.sql.exec("INSERT OR IGNORE INTO seen (id, at_ms) VALUES (?, ?) RETURNING id", id, now).toArray().length > 0;
+  }
+
+  async release(id: string): Promise<void> {
+    this.sql.exec("DELETE FROM seen WHERE id = ?", id);
+  }
+
   /** Mark an event handled (after it was), and forget the ones older than the window. */
   async markSeen(id: string): Promise<void> {
     const now = Date.now();
