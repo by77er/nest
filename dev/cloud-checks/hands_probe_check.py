@@ -6,7 +6,7 @@ brain and no turn) to it, resolves the sandbox for that agent as a brain would, 
 over the tunnel: resolve answers only for an attached agent. Then the gateway answers `bound` only after it has connected to the guest's vsock socket, so
 `bound` proves a hands call can reach the VM (2026-11-04: a host whose gateway couldn't open the
 vsock socket answered `busy` "guest not reachable" to every bind). Reports the host, its instance
-and, when the AWS CLI can see it, its type. Stops the agent, deletes its template and destroys the
+and, when the AWS CLI can see it, its type. Ends the agent, deletes its template and destroys the
 sandbox on every exit path.
 
 Reads NEST_ADMIN_TOKEN (required), NEST_ACCESS_CLIENT_ID and NEST_ACCESS_CLIENT_SECRET (Cloudflare
@@ -61,19 +61,8 @@ async def bind(url, binding, version):
 
 
 def destroy(sid):
-    """Destroy the sandbox, retried: True once the API answers 2xx (or 404, already gone). A leaked
-    sandbox keeps a host (and its cost) alive, so a cleanup that fails fails the check."""
-    for attempt in range(5):
-        try:
-            st, body = api("DELETE", f"/v1/sandboxes/{sid}")
-        except (urllib.error.URLError, OSError) as e:
-            st, body = None, str(e)
-        print(f"destroy {sid}: {st}")
-        if st is not None and (200 <= st < 300 or st == 404):
-            return True
-        time.sleep(2 * (attempt + 1))
-    print(f"LEAKED: {sid} wasn't destroyed ({str(body)[:200]}): destroy it by hand (DELETE /v1/sandboxes/{sid})")
-    return False
+    """A leaked sandbox keeps a host (and its cost) alive, so a destroy that fails fails the check."""
+    return cleanup_step(f"destroy {sid}", "DELETE", f"/v1/sandboxes/{sid}")
 
 
 TEMPLATE_NAME = "hands-probe-check"
@@ -85,22 +74,42 @@ TEMPLATE = {
 
 
 def on_sigterm(_signum, _frame):
-    # Unwind through main's `finally`, which destroys the sandbox.
+    # Unwind through main's `finally`, which cleans up.
     raise KeyboardInterrupt
+
+
+def cleanup_step(what, method, path, body=None):
+    """One cleanup call, retried, that never raises: True once it answers 2xx (or 404, already gone).
+    Every step runs whatever an earlier one did, so a transport error can't skip the sandbox's destroy."""
+    st, out = None, None
+    for attempt in range(5):
+        try:
+            st, out = api(method, path, body)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            st, out = None, str(e)
+        if st is not None and (200 <= st < 300 or st == 404):
+            print(f"{what}: {st}")
+            return True
+        time.sleep(2 * (attempt + 1))
+    print(f"LEAKED: {what} failed ({st} {str(out)[:200]}): {method} {path} by hand")
+    return False
 
 
 def main():
     signal.signal(signal.SIGTERM, on_sigterm)
     if not ADMIN or not all(ACCESS.values()):
         sys.exit("NEST_ADMIN_TOKEN, NEST_ACCESS_CLIENT_ID and NEST_ACCESS_CLIENT_SECRET are required")
-    st, sbx = api("POST", "/v1/sandboxes", {"cell": CELL, "labels": {"check": "hands-probe"}})
-    if st not in (201, 202):
-        sys.exit(f"FAIL: create: {st} {sbx}")
-    sid = sbx["sandbox"]
-    print(f"created {sid} (destroyed on exit; if this process dies, DELETE /v1/sandboxes/{sid} by hand)")
     result = 1
-    agent = None
+    sid = agent = None
+    template = False
     try:
+        st, sbx = api("POST", "/v1/sandboxes", {"cell": CELL, "labels": {"check": "hands-probe"}})
+        if st not in (201, 202) or not isinstance(sbx, dict):
+            print(f"FAIL: create: {st} {str(sbx)[:200]}")
+            return result
+        sid = sbx["sandbox"]
+        print(f"created {sid} (destroyed on exit; if this process dies, DELETE /v1/sandboxes/{sid} by hand)")
+        template = True  # a PUT that fails after the server applied it still leaves the template to delete
         st, v = api("PUT", f"/v1/admin/templates/{TEMPLATE_NAME}", TEMPLATE)
         if not 200 <= st < 300:
             print(f"FAIL: template: {st} {str(v)[:200]}")
@@ -140,14 +149,16 @@ def main():
         result = 0 if ok else 1
         return result
     finally:
-        # The check's own verdict is printed above; a failed cleanup fails the check besides.
-        if agent:
-            st, _ = api("POST", f"/v1/agents/{agent}/stop")
-            print(f"stop {agent}: {st}")
-            if not 200 <= st < 300:
-                result = 1
-        print(f"delete template {TEMPLATE_NAME}: {api('DELETE', f'/v1/admin/templates/{TEMPLATE_NAME}')[0]}")
-        if not destroy(sid):
+        # The check's own verdict is printed above; a failed cleanup fails the check besides. A second
+        # SIGTERM must not cut the cleanup short.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        # End the agent (not the operator's stop, which its next input lifts): it detaches, and its
+        # records go 30 days later. It never started, so nothing is killed.
+        if agent and not cleanup_step(f"end {agent}", "POST", f"/v1/agents/{agent}/stop", {"end": True}):
+            result = 1
+        if template and not cleanup_step(f"delete template {TEMPLATE_NAME}", "DELETE", f"/v1/admin/templates/{TEMPLATE_NAME}"):
+            result = 1
+        if sid and not destroy(sid):
             result = 1
         print("PASS" if result == 0 else "FAIL")
         sys.exit(result)
