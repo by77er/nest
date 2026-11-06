@@ -415,7 +415,8 @@ export class ClientDO extends DurableObject<Env> {
   /** A page of its agents or sandboxes, oldest first, filtered by labels (each must hold), state and cell. */
   async list(kind: MemberKind, q: ListQuery = {}): Promise<{ items: Member[]; next_cursor: string | null }> {
     this.requireClient();
-    const limit = Math.min(Math.max(q.limit ?? 100, 1), 500);
+    // An integer, whoever calls (it reaches SQL LIMIT): anything else is the default.
+    const limit = Number.isSafeInteger(q.limit) ? Math.min(Math.max(q.limit!, 1), 500) : 100;
     const where = ["kind = ?"];
     const args: (string | number)[] = [kind];
     const state = q.state ?? "live";
