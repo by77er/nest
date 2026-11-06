@@ -2,7 +2,7 @@
 // with every call and the page holds no credential of its own.
 
 import type {
-  NetworkBody, NetworkView, Waits,
+  NetworkBody, NetworkView, Waits, AcceptIssueBody, DeclineIssueBody, Issue,
   AddDependencyBody, PutSecretBody, SecretsAnswer, SecretView, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
   Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
 } from "./types";
@@ -61,6 +61,7 @@ export const api = {
   assignTask: (id: string, task: string) => call<Task>("POST", `${tsk(id, task)}/assign`),
   cancelTask: (id: string, task: string, b: CancelBody) => call<Task>("POST", `${tsk(id, task)}/cancel`, b),
   markDone: (id: string, task: string) => call<Task>("POST", `${tsk(id, task)}/done`),
+  retryIssueClose: (id: string, task: string) => call<Task>("POST", `${tsk(id, task)}/issue/close`),
 
   /** The latest page, or the page before `before` (a seq): oldest first. */
   chat: (id: string, before?: number) => call<ChatMessage[]>("GET", `${prj(id)}/chat${before === undefined ? "" : `?before=${before}`}`),
@@ -76,6 +77,10 @@ export const api = {
   secrets: (id: string) => call<SecretsAnswer>("GET", `${prj(id)}/secrets`),
   putSecret: (id: string, name: string, b: PutSecretBody) => call<SecretView>("PUT", `${prj(id)}/secrets/${encodeURIComponent(name)}`, b),
   deleteSecret: (id: string, name: string) => call<{ deleted: string; holders: { agent: string; role: string }[] }>("DELETE", `${prj(id)}/secrets/${encodeURIComponent(name)}`),
+  issues: (id: string) => call<Issue[]>("GET", `${prj(id)}/issues`),
+  acceptIssue: (id: string, n: number, b: AcceptIssueBody) => call<Task>("POST", `${prj(id)}/issues/${n}/accept`, b),
+  declineIssue: (id: string, n: number, b: DeclineIssueBody) => call<{ declined: number }>("POST", `${prj(id)}/issues/${n}/decline`, b),
+  importIssues: (id: string) => call<{ imported: number; known: number }>("POST", `${prj(id)}/issues/import`),
   secretRequestDone: (id: string, req: string) => call<{ done: string }>("POST", `${prj(id)}/secret-requests/${encodeURIComponent(req)}/done`),
   answerBlocked: (id: string, task: string, b: AnswerBody) => call<Task>("POST", `${tsk(id, task)}/answer`, b),
   answerAsk: (id: string, ask: string, b: AnswerBody) => call<{ delivered: unknown }>("POST", `${prj(id)}/asks/${encodeURIComponent(ask)}/answer`, b),

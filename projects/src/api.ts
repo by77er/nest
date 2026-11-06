@@ -9,7 +9,7 @@ import { clientIdOf, NestError, nestFrom } from "./nest";
 import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSIDE, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
-import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineProposal, Network, PutSecret, Settings, Spec, UpdateRoutine, UpdateTask } from "./requests";
+import { AcceptIssue, AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, PutSecret, Settings, Spec, UpdateRoutine, UpdateTask } from "./requests";
 import { PRESETS } from "./routines";
 import type { Result } from "./sql";
 import { proxyTrace, proxyTraceHistory } from "./trace";
@@ -207,6 +207,23 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       }
       return done(await p.deleteSecretMeta(name));
     }
+    // Triage (README.md#triage): the repo's issues waiting, accepting one as a draft task, declining one,
+    // and a one-off import of the open ones.
+    case "GET issues":
+      return done(await p.issues());
+    case "POST issues/:n/accept": {
+      // With the issue's `updated_ms` as the owner read it: changed since, it's refused (409).
+      const b = await body(req, AcceptIssue);
+      if (!b.ok) return b.res;
+      return done(await p.acceptIssue(Number(rest[1]), b.value.updated_ms));
+    }
+    case "POST issues/:n/decline": {
+      const b = await body(req, DeclineIssue);
+      if (!b.ok) return b.res;
+      return done(await p.declineIssue(Number(rest[1]), b.value.reason?.trim() || null));
+    }
+    case "POST issues/import":
+      return done(await p.importIssues());
     case "POST secret-requests/:id/done":
       return done(await p.secretRequestDone(rest[1]!));
     case "POST auto-merge/retry":
@@ -259,6 +276,9 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "POST tasks/:task/done":
       return done(await p.markDone(task));
+    case "POST tasks/:task/issue/close":
+      // Try closing the task's issue again, after GitHub refused it for good (README.md#triage).
+      return done(await p.retryIssueClose(task));
     case "GET chat": {
       // `before=<seq>`: the page before it (older messages, as the owner scrolls up); `limit` is capped.
       const before = url.searchParams.get("before");

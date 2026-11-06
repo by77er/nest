@@ -95,8 +95,8 @@ describe("the views", () => {
     const views = within(sidebar()).getByRole("group", { name: "Views" });
     const rows = within(views).getAllByRole("link");
     // The manager first: the project's default view.
-    expect(rows.map((r) => r.textContent)).toEqual(["Manager", "Board", "Reviews", "Secrets", "Network", "Settings"]);
-    expect(rows.map((r) => r.getAttribute("href"))).toEqual(["manager", "board", "reviews", "secrets", "network", "settings"].map((v) => `/projects/prj_one/${v}`));
+    expect(rows.map((r) => r.textContent)).toEqual(["Manager", "Board", "Triage", "Reviews", "Secrets", "Network", "Settings"]);
+    expect(rows.map((r) => r.getAttribute("href"))).toEqual(["manager", "board", "triage", "reviews", "secrets", "network", "settings"].map((v) => `/projects/prj_one/${v}`));
     expect(rows.filter((r) => r.getAttribute("aria-current") === "page").map((r) => r.textContent)).toEqual(["Reviews"]);
     for (const r of rows) expect(r).toHaveAttribute("data-ds", "nav-row");
     expect(document.querySelector(".mantine-Breadcrumbs-root")).toBeNull();
