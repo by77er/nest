@@ -59,6 +59,9 @@ export const PutSecret = z.strictObject({
   /** The variable holding its placeholder (src/secrets.ts checks it). */
   env: z.string().min(1).max(64),
 });
+/** Declining an issue in triage (README.md#triage): an optional reason, kept on it. */
+export const DeclineIssue = z.strictObject({ reason: z.string().max(500).optional() });
+export type DeclineIssueBody = z.input<typeof DeclineIssue>;
 export const Chat = z.strictObject({ text: z.string().min(1).max(20000) });
 export const Answer = z.strictObject({ answer: z.string().max(20000) });
 export const Cancel = z.strictObject({ reason: Text(1000).optional() });

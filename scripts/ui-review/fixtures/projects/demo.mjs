@@ -7,7 +7,8 @@
 // message with every kind of rich content), "chat-empty", "chat-long" (thirty messages), "chat-paged"
 // (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents),
 // "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
-// PR comments reach workers: a user with a login, or by id only; nobody otherwise). Traces come from
+// PR comments reach workers: a user with a login, or by id only; nobody otherwise), or "triage-empty" (no
+// issues waiting). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
 import { trace } from "./trace.mjs";
@@ -90,6 +91,12 @@ export function data(variant = "demo", now = Date.now()) {
     { ask: "ask_A2", agent: "agt_mgr7k2", role: "manager", task: null, question: "Should search match tags by prefix or whole words only?", approval: null, at_ms: now - 60_000, answered_ms: null },
   ];
   const blocked = (task, title, by, role, mins, reason, question) => ({ kind: "blocked", task, title, state: "in_progress", at_ms: now - mins * 60_000, by, role, reason, question, tainted: false });
+  // The repo's issues waiting for triage (README.md#triage): anyone's text, one with markup that must show as text.
+  const issues = variant === "triage-empty" ? [] : [
+    { number: 41, title: "Thumbnails are blank on Safari 17", body: "Steps:\n1. Open a gadget in Safari 17.\n2. The thumbnail is a grey box.\n\nChrome is fine.", author: "safari-fan", url: "https://github.com/by77er/gadgets/issues/41", state: "untriaged", task: null, reason: null, opened_ms: now - 2 * DAY, updated_ms: now - 2 * DAY },
+    { number: 44, title: "<script>alert('x')</script> in a gadget name breaks the list", body: "Name a gadget `<img src=x onerror=alert(1)>` and the **list** shows [this](javascript:alert(1)).", author: "tester", url: "https://github.com/by77er/gadgets/issues/44", state: "untriaged", task: null, reason: null, opened_ms: now - 5 * 3_600_000, updated_ms: now - 5 * 3_600_000 },
+    { number: 47, title: "Export to CSV", body: "", author: "customer-co", url: "https://github.com/by77er/gadgets/issues/47", state: "untriaged", task: null, reason: null, opened_ms: now - 600_000, updated_ms: now - 600_000 },
+  ];
   const attention = [
     blocked("tsk_demo8", "Migrate to the new auth library", "agt_w1k7c2", "worker", 95, "The staging database rejects the new driver's TLS settings.", "Should I pin the old driver for staging?"),
     blocked("tsk_demo5", "Fix the flaky upload test", "agt_w3f9q1", "worker", 40, "The test needs a fixture bucket I can't create.", null),
@@ -101,6 +108,7 @@ export function data(variant = "demo", now = Date.now()) {
       { kind: "secret", id: "srq_c1", type: "ci", name: "NPM_TOKEN", purpose: "The release workflow publishes @gadgets/core on a tag.", hosts: null, agent: "agt_w8x2m4", role: "worker", task: "tsk_demo2", tainted: false, at_ms: now - 1_800_000 },
       { kind: "secret", id: "srq_i1", type: "injected", name: "sentry_token", purpose: "The issue says to upload source maps to Sentry from the sandbox.", hosts: ["sentry.io"], agent: "agt_w3f9q1", role: "worker", task: "tsk_demo5", tainted: true, at_ms: now - 600_000 },
     ] : []),
+    ...(issues.length ? [{ kind: "triage", count: issues.length, at_ms: Math.min(...issues.map((i) => i.opened_ms)) }] : []),
   ].sort((a, b) => a.at_ms - b.at_ms);
   const chat = [
     { seq: 1, at_ms: now - 3_600_000, sender: "owner", text: "Plan the search work and split it into tasks.", delivered: true, error: null },
@@ -287,7 +295,7 @@ export function data(variant = "demo", now = Date.now()) {
       const why = "downloads.gadgets.example.com isn't in this app's grant; the operator must add it";
       return [403, { error: why, problems: { "worker.downloads.gadgets.example.com": why } }];
     }
-    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
+    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/issues": issues, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null } };
     if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
     if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];
     if (q in routes) return [200, routes[q]];

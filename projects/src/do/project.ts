@@ -118,7 +118,27 @@ export interface Blocked {
 }
 
 /** One thing waiting on the owner: an agent's ask (nest's), or a blocked task. Oldest first. */
-export type Attention = ({ kind: "ask" } & Ask) | ({ kind: "blocked"; task: string; title: string; state: TaskState } & Blocked) | ({ kind: "secret" } & SecretRequest);
+export type Attention = ({ kind: "ask" } & Ask) | ({ kind: "blocked"; task: string; title: string; state: TaskState } & Blocked) | ({ kind: "secret" } & SecretRequest)
+  // The repo's issues waiting for triage (README.md#triage): one item, their count, as old as the oldest.
+  | { kind: "triage"; count: number; at_ms: number };
+
+/** An issue of the repo in triage (README.md#triage): its title and body are anyone's, kept as data. */
+export interface Issue {
+  number: number;
+  title: string;
+  body: string;
+  author: string | null;
+  url: string;
+  state: "untriaged" | "accepted" | "declined" | "gone";
+  task: string | null;
+  reason: string | null;
+  opened_ms: number;
+  updated_ms: number;
+}
+
+/** What the app keeps of an issue's text (GitHub's limits are larger; the rest is at its link). */
+export const ISSUE_TITLE_MAX = 300;
+export const ISSUE_BODY_MAX = 20_000;
 
 /** An agent asking the owner for a secret (README.md#secrets): one to inject, or one CI needs. */
 export interface SecretRequest {
@@ -309,6 +329,16 @@ export const MIGRATIONS = [
     "ALTER TABLE settings ADD COLUMN repo_owner_login TEXT",
     // Projects attached before: attach again, so the default (and the repo's owner) is recorded.
     "UPDATE settings SET attach_next_ms = 0 WHERE attached_ms IS NOT NULL",
+  ],
+  [
+    // The repo's issues for triage (README.md#triage): untriaged, accepted (a task made of it), declined,
+    // or gone (closed, deleted or moved before triage); a task's issue; and the closes owed on GitHub
+    // when such a task is done through a merged PR.
+    `CREATE TABLE issues (number INTEGER PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, author TEXT, url TEXT NOT NULL, state TEXT NOT NULL,
+      task TEXT, reason TEXT, opened_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, triaged_ms INTEGER)`,
+    "ALTER TABLE tasks ADD COLUMN issue INTEGER",
+    `CREATE TABLE issue_closes (task TEXT PRIMARY KEY, issue INTEGER NOT NULL, pr INTEGER, next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
+      error TEXT, commented INTEGER NOT NULL DEFAULT 0, closed_ms INTEGER)`,
   ],
 ] as const;
 
@@ -770,6 +800,134 @@ export class ProjectDO extends DurableObject<Env> {
     return { delivered: "restarted", task };
   }
 
+  // --- triage (README.md#triage) ---------------------------------------------------------------------
+
+  /**
+   * An `issues` event on the repo (the Worker checked its signature; never a PR). Opened or reopened adds
+   * the issue to triage, or restores one that went (or was declined); edited updates one still
+   * untriaged (or adds it, open, if its opening was missed); closed, deleted or transferred takes an
+   * untriaged one out. An accepted issue is the task's from then on: nothing here changes it.
+   */
+  async onIssue(e: { action: string; number: number; title: string; body: string; author: string | null; url: string; open: boolean }): Promise<void> {
+    if (!this.settings()) return;
+    const had = this.sql.exec("SELECT state FROM issues WHERE number = ?", e.number).toArray()[0];
+    const now = Date.now();
+    const title = e.title.slice(0, ISSUE_TITLE_MAX);
+    const body = e.body.slice(0, ISSUE_BODY_MAX);
+    const put = () => this.sql.exec(
+      `INSERT INTO issues (number, title, body, author, url, state, opened_ms, updated_ms) VALUES (?, ?, ?, ?, ?, 'untriaged', ?, ?)
+        ON CONFLICT (number) DO UPDATE SET title = excluded.title, body = excluded.body, author = excluded.author, url = excluded.url,
+          state = 'untriaged', reason = NULL, triaged_ms = NULL, updated_ms = excluded.updated_ms`,
+      e.number, title, body, e.author, e.url, now, now,
+    );
+    if (e.action === "opened" || e.action === "reopened") {
+      if (!had || had.state === "gone" || (e.action === "reopened" && had.state === "declined")) put();
+    } else if (e.action === "edited") {
+      if (had?.state === "untriaged") this.sql.exec("UPDATE issues SET title = ?, body = ?, updated_ms = ? WHERE number = ?", title, body, now, e.number);
+      else if (!had && e.open) put();
+    } else if (e.action === "closed" || e.action === "deleted" || e.action === "transferred") {
+      if (had?.state === "untriaged") this.sql.exec("UPDATE issues SET state = 'gone', updated_ms = ? WHERE number = ?", now, e.number);
+    }
+  }
+
+  /** The issues waiting for triage, oldest first. */
+  async issues(): Promise<Result<Issue[]>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    return ok(this.sql.exec("SELECT * FROM issues WHERE state = 'untriaged' ORDER BY opened_ms, number").toArray().map(issueOf));
+  }
+
+  /**
+   * Accept an issue: a draft task of its title and body, with a link back, for the owner or the manager
+   * to spec as any draft. Its text is anyone's, so the task is marked tainted: a session that reads it
+   * through the app (the manager's, its worker's) is tainted as nest's rule has it.
+   */
+  async acceptIssue(n: number): Promise<Result<Task>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const i = this.sql.exec("SELECT * FROM issues WHERE number = ?", n).toArray()[0];
+    if (!i) return fail(404, `no issue #${n} in triage`);
+    if (i.state !== "untriaged") return fail(409, `issue #${n} is ${i.state as string}`);
+    const body = [(i.body as string).trim(), `From issue #${n}: ${i.url as string}${i.author ? ` (opened by ${i.author as string})` : ""}`].filter(Boolean).join("\n\n");
+    const t = await this.createTask({ title: (i.title as string).slice(0, 200) || `Issue #${n}`, body });
+    if (!t.ok) return t;
+    const id = t.value.id;
+    this.sql.exec("UPDATE tasks SET issue = ? WHERE id = ?", n, id);
+    this.sql.exec("UPDATE issues SET state = 'accepted', task = ?, triaged_ms = ?, updated_ms = ? WHERE number = ?", id, Date.now(), Date.now(), n);
+    // Tainted: written from an issue's text, which anyone could have filed.
+    this.sql.exec("INSERT INTO history (task, at_ms, actor, action, detail, tainted) VALUES (?, ?, 'owner', 'issue_accepted', ?, 1)",
+      id, Date.now(), JSON.stringify({ issue: n, url: i.url }));
+    return ok(this.toTask(this.taskRow(id)!));
+  }
+
+  /** Decline an issue: out of triage, with the owner's reason if any. GitHub isn't touched. */
+  async declineIssue(n: number, reason: string | null): Promise<Result<{ declined: number }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const i = this.sql.exec("SELECT state FROM issues WHERE number = ?", n).toArray()[0];
+    if (!i) return fail(404, `no issue #${n} in triage`);
+    if (i.state !== "untriaged") return fail(409, `issue #${n} is ${i.state as string}`);
+    this.sql.exec("UPDATE issues SET state = 'declined', reason = ?, triaged_ms = ?, updated_ms = ? WHERE number = ?", reason, Date.now(), Date.now(), n);
+    return ok({ declined: n });
+  }
+
+  /**
+   * Bring the repo's open issues into triage (a one-off, the owner's): each not known yet. Read from
+   * GitHub (Issues: read), up to 300, oldest first; PRs (which GitHub lists as issues) are left out.
+   */
+  async importIssues(): Promise<Result<{ imported: number; known: number }>> {
+    const s = this.settings();
+    if (!s) return fail(404, "unknown project");
+    const nest = nestFrom(this.env);
+    if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
+    let list: Record<string, unknown>[];
+    try {
+      const gh = await githubFor(nest, s.repo, PERMISSIONS.issuesRead);
+      list = await gh.openIssues(s.repo);
+    } catch (e) {
+      return fail(e instanceof NestError || e instanceof GitHubError ? (e.status === 403 ? 403 : 502) : 502, `the issues couldn't be read: ${message(e)}`);
+    }
+    let imported = 0;
+    let known = 0;
+    for (const x of list) {
+      const e = issueEventOf(x);
+      if (!e) continue;
+      if (this.sql.exec("SELECT 1 FROM issues WHERE number = ?", e.number).toArray().length) {
+        known++;
+        continue;
+      }
+      await this.onIssue({ action: "opened", ...e });
+      imported++;
+    }
+    return ok({ imported, known });
+  }
+
+  /**
+   * Close a done task's issue on GitHub (Issues: write): a comment naming the PR, then closed as
+   * completed. A refusal that will repeat (the grant lacks `issues: write`, the issue is gone) is
+   * recorded on the task and not retried; anything else is retried from the alarm.
+   */
+  private async closeIssue(nest: Nest, task: string): Promise<void> {
+    const s = this.settings()!;
+    const row = this.sql.exec("SELECT * FROM issue_closes WHERE task = ?", task).toArray()[0];
+    if (!row) return;
+    const app: Actor = { kind: "app", what: "github" };
+    const n = row.issue as number;
+    try {
+      const gh = await githubFor(nest, s.repo, PERMISSIONS.issuesWrite);
+      // The comment once: a retry after it landed (the close failed) doesn't post it again.
+      if (row.commented !== 1) {
+        await gh.commentIssue(s.repo, n, row.pr !== null ? `Done in #${row.pr as number}.` : "Done.");
+        this.sql.exec("UPDATE issue_closes SET commented = 1 WHERE task = ?", task);
+      }
+      await gh.closeIssue(s.repo, n);
+      this.sql.exec("UPDATE issue_closes SET next_ms = NULL, error = NULL, closed_ms = ? WHERE task = ?", Date.now(), task);
+      this.record(task, app, "issue_closed", { issue: n, pr: row.pr });
+    } catch (e) {
+      const attempts = (row.attempts as number) + 1;
+      const permanent = (e instanceof GitHubError || e instanceof NestError) && e.permanent;
+      this.sql.exec("UPDATE issue_closes SET attempts = ?, error = ?, next_ms = ? WHERE task = ?", attempts, message(e), permanent ? null : Date.now() + backoff(attempts), task);
+      if (permanent) this.record(task, app, "issue_close_failed", { issue: n, error: message(e) });
+    }
+  }
+
   // --- PRs (README.md#prs) ----------------------------------------------------------------------------
 
   private prRow(pr: number): Row | undefined {
@@ -837,6 +995,11 @@ export class ProjectDO extends DurableObject<Env> {
     if (this.move(id, "merged", actor).ok) {
       this.stopWorkerOf(id, "merged");
       this.autoAssign();
+      // A task made of an issue: the issue is closed on GitHub, with a line naming the PR (README.md#triage).
+      if (t.issue !== null && t.issue !== undefined) {
+        const pr = this.sql.exec<{ pr: number }>("SELECT pr FROM task_prs WHERE task = ? AND state = 'merged' ORDER BY ended_ms DESC LIMIT 1", id).toArray()[0]?.pr ?? null;
+        this.sql.exec("INSERT OR IGNORE INTO issue_closes (task, issue, pr, next_ms) VALUES (?, ?, ?, ?)", id, t.issue, pr, Date.now());
+      }
     }
   }
 
@@ -1355,14 +1518,17 @@ export class ProjectDO extends DurableObject<Env> {
     }));
     const open = asks.value.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
     const secrets = this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL").toArray().map((r): Attention => ({ kind: "secret", ...requestOf(r) }));
-    return ok([...open, ...blocked, ...secrets].sort((a, b) => a.at_ms - b.at_ms));
+    const t = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(opened_ms) AS at FROM issues WHERE state = 'untriaged'").one();
+    const triage: Attention[] = t.n ? [{ kind: "triage", count: t.n, at_ms: t.at ?? Date.now() }] : [];
+    return ok([...open, ...blocked, ...secrets, ...triage].sort((a, b) => a.at_ms - b.at_ms));
   }
 
   /** How many things wait on the owner (the projects list's count). */
   async attentionCount(): Promise<number> {
     if (!this.settings()) return 0;
     return this.sql.exec<{ n: number }>(
-      "SELECT (SELECT COUNT(*) FROM asks WHERE answered_ms IS NULL) + (SELECT COUNT(*) FROM tasks WHERE blocked_ms IS NOT NULL) + (SELECT COUNT(*) FROM secret_requests WHERE done_ms IS NULL) AS n",
+      `SELECT (SELECT COUNT(*) FROM asks WHERE answered_ms IS NULL) + (SELECT COUNT(*) FROM tasks WHERE blocked_ms IS NOT NULL) + (SELECT COUNT(*) FROM secret_requests WHERE done_ms IS NULL)
+        + (SELECT COUNT(*) FROM issues WHERE state = 'untriaged') AS n`,
     ).one().n;
   }
 
@@ -2037,7 +2203,8 @@ export class ProjectDO extends DurableObject<Env> {
         SELECT deadline_ms AS t FROM waits WHERE resolved_ms IS NULL
         UNION ALL SELECT next_ms FROM layers WHERE next_ms IS NOT NULL
         UNION ALL SELECT secrets_next_ms FROM settings WHERE secrets_next_ms IS NOT NULL
-        UNION ALL SELECT next_ms FROM abandoned)`),
+        UNION ALL SELECT next_ms FROM abandoned
+        UNION ALL SELECT next_ms FROM issue_closes WHERE next_ms IS NOT NULL)`),
       // Auto-merge: the repo's setting to write or read, and each task PR's change (an enable only once
       // the repo allows it).
       min(`SELECT MIN(t) AS t FROM (
@@ -2092,6 +2259,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo(nest);
     if (s.secrets_next_ms !== null && (s.secrets_next_ms as number) <= now) await this.secretsUpkeep(nest);
     for (const r of this.sql.exec("SELECT task, start FROM abandoned WHERE next_ms <= ?", now).toArray()) await this.cleanAbandoned(nest, r.task as string, r.start as number);
+    for (const r of this.sql.exec("SELECT task FROM issue_closes WHERE next_ms IS NOT NULL AND next_ms <= ?", now).toArray()) await this.closeIssue(nest, r.task as string);
     if (s.am_write_next_ms !== null && (s.am_write_next_ms as number) <= now) await this.writeRepoAutoMerge(nest);
     if (s.am_read_next_ms !== null && (s.am_read_next_ms as number) <= now) await this.readRepoAutoMerge(nest);
     // A PR's auto-merge is enabled only once the repo allows it; disabling needn't wait.
@@ -2462,6 +2630,28 @@ export interface PrComment {
   /** A review comment's file and line. */
   path?: string | null;
   line?: number | null;
+}
+
+function issueOf(r: Row): Issue {
+  return {
+    number: r.number as number, title: r.title as string, body: r.body as string, author: (r.author as string | null) ?? null, url: r.url as string,
+    state: r.state as Issue["state"], task: (r.task as string | null) ?? null, reason: (r.reason as string | null) ?? null,
+    opened_ms: r.opened_ms as number, updated_ms: r.updated_ms as number,
+  };
+}
+
+/** An issue as GitHub lists or sends it, in the fields triage keeps; null for a PR or a malformed one. */
+export function issueEventOf(x: unknown): { number: number; title: string; body: string; author: string | null; url: string; open: boolean } | null {
+  const o = typeof x === "object" && x !== null ? (x as Record<string, unknown>) : {};
+  if (o.pull_request) return null;
+  const number = typeof o.number === "number" && Number.isSafeInteger(o.number) && o.number > 0 ? o.number : null;
+  const url = typeof o.html_url === "string" && o.html_url.startsWith("https://github.com/") ? o.html_url : null;
+  if (number === null || !url) return null;
+  const user = typeof o.user === "object" && o.user !== null ? (o.user as Record<string, unknown>) : {};
+  return {
+    number, url, title: typeof o.title === "string" ? o.title : "", body: typeof o.body === "string" ? o.body : "",
+    author: typeof user.login === "string" ? user.login.slice(0, 100) : null, open: o.state !== "closed",
+  };
 }
 
 /** At most this many workers started again for one task's PR comments in REVISE_WINDOW_MS. */

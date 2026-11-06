@@ -9,7 +9,7 @@ import { clientIdOf, NestError, nestFrom } from "./nest";
 import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSIDE, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
-import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, Network, PutSecret, Settings, Spec, UpdateTask } from "./requests";
+import { AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, DeclineIssue, Network, PutSecret, Settings, Spec, UpdateTask } from "./requests";
 import type { Result } from "./sql";
 import { proxyTrace, proxyTraceHistory } from "./trace";
 
@@ -202,6 +202,19 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       }
       return done(await p.deleteSecretMeta(name));
     }
+    // Triage (README.md#triage): the repo's issues waiting, accepting one as a draft task, declining one,
+    // and a one-off import of the open ones.
+    case "GET issues":
+      return done(await p.issues());
+    case "POST issues/:n/accept":
+      return done(await p.acceptIssue(Number(rest[1])));
+    case "POST issues/:n/decline": {
+      const b = await body(req, DeclineIssue);
+      if (!b.ok) return b.res;
+      return done(await p.declineIssue(Number(rest[1]), b.value.reason?.trim() || null));
+    }
+    case "POST issues/import":
+      return done(await p.importIssues());
     case "POST secret-requests/:id/done":
       return done(await p.secretRequestDone(rest[1]!));
     case "POST auto-merge/retry":

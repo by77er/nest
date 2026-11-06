@@ -152,6 +152,9 @@ describe("who is set", () => {
       // The shape before the step: none of its columns or table, the attach long done.
       const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("CREATE TABLE pr_inputs")));
       sql.exec("DROP TABLE pr_inputs");
+      // And the steps after it (triage).
+      for (const t of ["issues", "issue_closes"]) sql.exec(`DROP TABLE ${t}`);
+      sql.exec("ALTER TABLE tasks DROP COLUMN issue");
       for (const c of ["comments_from_id", "comments_from_login", "comments_decided", "repo_owner_id", "repo_owner_login"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE settings SET attach_next_ms = NULL");
       sql.exec("UPDATE schema_version SET v = ?", step);

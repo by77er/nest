@@ -27,6 +27,7 @@ export function gist(x: Attention): string {
     const a = approvalOf(x);
     text = x.question ?? (a ? `Approve a call to ${a.name}` : "A question");
   } else if (x.kind === "secret") text = `Asks for ${x.type === "ci" ? "the Actions secret" : "a credential"} ${x.name}: ${x.purpose}`;
+  else if (x.kind === "triage") text = `${x.count === 1 ? "1 issue waits" : `${x.count} issues wait`} for triage`;
   else text = x.question ?? x.reason;
   const line = text.replace(/\s+/g, " ").trim();
   return line.length > GIST ? `${line.slice(0, GIST - 1).trimEnd()}…` : line;
@@ -69,12 +70,12 @@ export function ManagerContext({ projectId }: { projectId: string }) {
         {asks.length ? (
           <Stack gap="md" data-slot="top-asks">
             {asks.map((x) => (
-              <Stack key={x.kind === "ask" ? x.ask : x.kind === "secret" ? x.id : `blocked-${x.task}`} gap="xs">
+              <Stack key={x.kind === "ask" ? x.ask : x.kind === "secret" ? x.id : x.kind === "triage" ? "triage" : `blocked-${x.task}`} gap="xs">
                 <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{}} fz="sm">
                   {gist(x)}
                 </AnchorLink>
                 <MetaRow>
-                  <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.role === "manager" ? "The manager asks" : "A worker asks"}</MetaItem>
+                  <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.kind === "triage" ? "The repo's issues" : x.role === "manager" ? "The manager asks" : "A worker asks"}</MetaItem>
                   <MetaItem title={exact(x.at_ms)}>{ago(x.at_ms)}</MetaItem>
                 </MetaRow>
               </Stack>

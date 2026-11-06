@@ -1,5 +1,6 @@
 // "Needs you": everything in the project waiting on the owner, in one calm panel above the board:
-// agents' asks (approvals and questions, nest's) and blocked tasks (README.md#blocked), oldest first.
+// agents' asks (approvals and questions, nest's), blocked tasks (README.md#blocked), agents' requests
+// for secrets, and the repo's issues waiting for triage (one line, linking to Triage), oldest first.
 // A warning rule and title mark it; the panel itself is the surface, so it leads without shouting.
 
 import { Button, Collapse, Divider, Text, Textarea } from "@mantine/core";
@@ -73,12 +74,33 @@ function Item({ projectId, x, first }: { projectId: string; x: Attention; first:
   return (
     <Stack gap="lg">
       {!first && <Divider />}
-      {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : x.kind === "blocked" ? <BlockedTask projectId={projectId} item={x} /> : <SecretRequestItem projectId={projectId} item={x} />}
+      {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : x.kind === "blocked" ? <BlockedTask projectId={projectId} item={x} />
+        : x.kind === "triage" ? <TriageItem projectId={projectId} count={x.count} at_ms={x.at_ms} /> : <SecretRequestItem projectId={projectId} item={x} />}
     </Stack>
   );
 }
 
-const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.id);
+const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.kind === "triage" ? "triage" : x.id);
+
+/** The repo's issues waiting for triage: how many, since when, and the way to them (README.md#triage). */
+function TriageItem({ projectId, count, at_ms }: { projectId: string; count: number; at_ms: number }) {
+  return (
+    <Stack gap="sm" data-triage>
+      <MetaRow>
+        <MetaItem>The repo's issues</MetaItem>
+        <MetaItem title={exact(at_ms)}>oldest {ago(at_ms)}</MetaItem>
+      </MetaRow>
+      <Text fz="md">
+        {count === 1 ? "1 issue waits" : `${count} issues wait`} for triage: accept it as a draft task, or decline it.
+      </Text>
+      <Row>
+        <Button variant="default" renderRoot={(props) => <AnchorLink {...props} to="/projects/$projectId/triage" params={{ projectId }} />}>
+          Open Triage
+        </Button>
+      </Row>
+    </Stack>
+  );
+}
 
 export function NeedsYou({ projectId }: { projectId: string }) {
   const attention = useAttention(projectId);

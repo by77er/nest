@@ -528,7 +528,7 @@ export async function eventually<T>(f: () => T | Promise<T>, what: string): Prom
 export const GH_APP_ID = 4242;
 
 /** The app's grant's `github.permissions` (README.md#how-it-uses-nest). */
-export const GRANT_PERMISSIONS: Record<string, string> = { checks: "write", administration: "write", metadata: "read", pull_requests: "write", contents: "write" };
+export const GRANT_PERMISSIONS: Record<string, string> = { checks: "write", administration: "write", metadata: "read", pull_requests: "write", contents: "write", issues: "write" };
 const RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
 const levelWithin = (want: string, have: string | undefined) => !!have && !!RANK[want] && RANK[want]! <= RANK[have]!;
 
@@ -573,6 +573,8 @@ export class FakeGitHub {
   readonly repos = new Map<string, { default_branch: string; protection: Record<string, any> | null; allow_auto_merge: boolean }>();
   /** Each PR's auto-merge, by node id, as GraphQL's mutations leave it. */
   readonly autoMerge = new Map<string, { method: string } | null>();
+  /** Each repo's issues (PRs among them, as GitHub lists them), by number, with the comments posted on them. */
+  readonly issues = new Map<string, Map<number, { title: string; body: string; state: "open" | "closed"; login: string; pr?: boolean; comments: string[]; state_reason?: string }>>();
   /** Each repo's PRs, by number. */
   readonly pulls = new Map<string, Map<number, FakePull>>();
   /** GraphQL errors to answer (a 200 with `errors`), for mutations whose name matches. */
@@ -698,6 +700,31 @@ export class FakeGitHub {
           p.required_status_checks = statusChecksFrom({ ...call.body, strict: call.body.strict ?? rsc.strict }, this.appOf(repoName), rsc);
           return json(200, p.required_status_checks);
         }
+      }
+    }
+    // Issues (https://docs.github.com/en/rest/issues): Issues: read to list, write to comment and close.
+    if (req.method === "GET" && sub === "/issues") {
+      if (!need("issues", "read")) return denied();
+      const page = Number(u.searchParams.get("page") ?? "1");
+      const per = Number(u.searchParams.get("per_page") ?? "30");
+      const open = [...(this.issues.get(repoName) ?? new Map()).entries()].filter(([, i]) => i.state === "open").sort(([a], [b]) => a - b);
+      return json(200, open.slice((page - 1) * per, page * per).map(([n, i]) => ({
+        number: n, title: i.title, body: i.body, state: i.state, user: { login: i.login }, html_url: `https://github.com/${repoName}/issues/${n}`,
+        ...(i.pr ? { pull_request: { url: `https://api.github.com/repos/${repoName}/pulls/${n}` } } : {}),
+      })));
+    }
+    if ((s = sub.match(/^\/issues\/(\d+)(\/comments)?$/)) && (req.method === "POST" || req.method === "PATCH")) {
+      if (!need("issues", "write")) return denied();
+      const i = this.issues.get(repoName)?.get(Number(s[1]));
+      if (!i) return json(404, { message: "Not Found" });
+      if (s[2] && req.method === "POST") {
+        i.comments.push(call.body.body);
+        return json(201, { id: ++this.nextId });
+      }
+      if (!s[2] && req.method === "PATCH") {
+        if (call.body.state) i.state = call.body.state;
+        if (call.body.state_reason) i.state_reason = call.body.state_reason;
+        return json(200, { number: Number(s[1]), state: i.state });
       }
     }
     // PRs (https://docs.github.com/en/rest/pulls/pulls): Pull requests: read.

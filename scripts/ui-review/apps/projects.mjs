@@ -779,6 +779,10 @@ const app = {
       }));
       return [...(r.error ? [] : ["a refused save shows no reason under Save"]), ...(r.row ? [] : ["a refused save doesn't mark the host it names"]), ...(r.toast ? ["a refused save shows a toast"] : [])];
     } },
+    // Triage (README.md#triage): the issues waiting (one with markup shown as text), none, declining one.
+    { name: "triage", section: "project", path: "/projects/prj_demo/triage" },
+    { name: "triage-empty", section: "project", path: "/projects/prj_demo/triage", fixture: "triage-empty" },
+    { name: "triage-decline", section: "project", path: "/projects/prj_demo/triage", full: false, after: (p) => p.getByRole("button", { name: "Decline issue #44" }).click() },
     { name: "settings", section: "project", path: "/projects/prj_demo/settings", checkName: "workflows", check: (p) => p.evaluate(workflowsAgree) },
     { name: "settings-comments-set", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-set" },
     { name: "settings-comments-id-only", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-id-only" },
