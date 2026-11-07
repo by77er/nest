@@ -4,7 +4,7 @@
 import type { AgentRow, AgentsResponse, Fleet, Host, LifetimesResponse, SandboxRow } from "../api";
 import { age, short, span } from "./format";
 import { destroyIn, idleSince, SANDBOX_WHY } from "./lifetimes";
-import { AGENT_LIFETIME_ROLE, AGENT_STATE_ROLE, LIFECYCLE_ROLE, PHASE_ROLE, SANDBOX_LIFETIME_ROLE, SANDBOX_STATE_ROLE } from "./status";
+import { AGENT_LIFETIME_ROLE, AGENT_STATE_ROLE, LIFECYCLE_ROLE, PHASE_ROLE, roleOf, SANDBOX_LIFETIME_ROLE, SANDBOX_STATE_ROLE } from "./status";
 
 /** A host is live when it is active and connected; everything else is history. */
 export const isLive = (h: Host) => h.status === "active" && h.connected;
@@ -123,10 +123,10 @@ export function attention({ fleet, agents, agentsError, lifetimes, lifetimesErro
     const i = row?.info;
     if (!i) continue;
     const facts = [i.state && `state ${i.state}`, i.lifecycle && `lifecycle ${i.lifecycle}`, i.activity && `activity ${i.activity}`].filter(Boolean).join(", ");
-    const stateRole = AGENT_STATE_ROLE[i.state ?? ""];
+    const stateRole = roleOf(AGENT_STATE_ROLE, i.state);
     if (i.state && stateRole && flagged(stateRole)) add({ role: stateRole as AttentionItem["role"], noun: "Agent", label: i.state, subject: agent, reason: facts, target });
-    else if (i.lifecycle && LIFECYCLE_ROLE[i.lifecycle] === "danger") add({ role: "danger", noun: "Agent", label: i.lifecycle, subject: agent, reason: facts, target });
-    if (i.brain && PHASE_ROLE[i.brain.phase] === "danger") {
+    else if (i.lifecycle && roleOf(LIFECYCLE_ROLE, i.lifecycle) === "danger") add({ role: "danger", noun: "Agent", label: i.lifecycle, subject: agent, reason: facts, target });
+    if (i.brain && roleOf(PHASE_ROLE, i.brain.phase) === "danger") {
       add({ role: "danger", noun: "Agent", label: `brain ${i.brain.phase}`, subject: agent, reason: `None of its brain's sessions is current, since ${age(i.brain.since_ms, now)} ago`, target });
     }
   }
