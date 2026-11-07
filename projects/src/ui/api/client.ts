@@ -2,7 +2,7 @@
 // with every call and the page holds no credential of its own.
 
 import type {
-  NetworkBody, NetworkView, Waits, AcceptIssueBody, DeclineIssueBody, Issue,
+  NetworkBody, NetworkView, OutboxState, Waits, AcceptIssueBody, DeclineIssueBody, Issue,
   AddDependencyBody, PutSecretBody, SecretsAnswer, SecretView, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
   Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
   CreateRoutineBody, DeclineProposalBody, Note, Proposal, Routine, RoutineRun, RoutinesAnswer, UpdateRoutineBody,
@@ -67,7 +67,8 @@ export const api = {
   /** The latest page, or the page before `before` (a seq): oldest first. */
   chat: (id: string, before?: number) => call<ChatMessage[]>("GET", `${prj(id)}/chat${before === undefined ? "" : `?before=${before}`}`),
   interruptManager: (id: string) => call<unknown>("POST", `${prj(id)}/manager/interrupt`),
-  postChat: (id: string, b: ChatBody) => call<{ seq: number; delivered: boolean }>("POST", `${prj(id)}/chat`, b),
+  postChat: (id: string, b: ChatBody) => call<{ seq: number; delivered: boolean; status: OutboxState }>("POST", `${prj(id)}/chat`, b),
+  retryChat: (id: string, seq: number) => call<{ seq: number; delivered: boolean; status: OutboxState }>("POST", `${prj(id)}/chat/${seq}/retry`),
   asks: (id: string) => call<Ask[]>("GET", `${prj(id)}/asks`),
   attention: (id: string) => call<Attention[]>("GET", `${prj(id)}/attention`),
   openPrs: (id: string) => call<OpenPr[]>("GET", `${prj(id)}/prs/open`),

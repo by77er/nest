@@ -708,6 +708,8 @@ const app = {
     { name: "manager-rich", section: "project", path: "/projects/prj_demo/manager", fixture: "rich" },
     { name: "manager-rich-view", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false },
     { name: "manager-empty", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false },
+    // The owner's messages still being sent (owed; retrying, with why): no Retry, unlike the failed one in "manager".
+    { name: "chat-sending", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-sending", full: false },
     { name: "manager-long", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false },
     { name: "manager-long-full", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long" },
     { name: "manager-context-open", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click() },

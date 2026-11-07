@@ -133,6 +133,40 @@ The owner's request (2026-11-06): a task's state, its worker, its PRs and the co
   - Everything else that names the draft goes in the same step: tasks waiting on it stop waiting (noted on each), its own dependencies, detached PR rows, and the manager's waits on it. A draft never had a worker, so it has no queued changes or comments to leak.
   - An issue it was made of returns to triage, to be accepted or declined afresh.
 
+## Outboxes
+
+The owner's request (2026-11-06): the app's retry queues as one machine, so each shows its real state and treats a failure the same way.
+
+- **One pure function,** `outboxStep(row, event)` in `src/outbox.ts`, over each queue's `next_ms`, `attempts` and `error`.
+  - **States:**
+    - `owed`: not tried yet;
+    - `retrying`: tried, or waiting for something it needs, and due again;
+    - `failed`: refused for good, or out of attempts; shown, and tried again only when asked;
+    - `done`.
+  - **Events:**
+    - `sent`;
+    - `failed`, transient or permanent by one verdict (`verdict`: nest's or GitHub's refusal that will repeat);
+    - `wait`: nothing to send it to yet; due again, never counted, never failed;
+    - `retry`: only a failed row changes, so asking twice sends once.
+  - **Pruning by age** (`pruneBefore`). Tested on its own, with a seeded random walk (`test/outbox.test.ts`).
+- **The queues on it:**
+
+  | Queue | On failure | Kept once ended |
+  |---|---|---|
+  | `chat` (the owner's messages to the manager) | permanent: failed, with Retry | always (it's the log) |
+  | `messages` (to agents) | permanent: failed | a week |
+  | `stops` (ending agents) | transient: retried until it goes; permanent: failed, recorded among the project's errors (`stop_failed`), its worker's place freed | a month |
+  | `issue_closes` | permanent: failed; tried again on the owner's retry or a grant gaining `issues: write` | always (the task's record) |
+  | client `layers` | permanent: failed, shown on the Network page | while the agent lives |
+
+  Stops used to retry everything forever. ReviewDO's `check_updates` and `ended` move onto the machine once its open changes (#171) have landed.
+- **The chat (B9).**
+  - **States.** Each message carries `status` (`ChatMessage.status`). A message waiting for the manager, or retried after an outage, reads "Sending…" or "Retrying…" with why. Only a failed one reads "Not delivered", with Retry.
+  - **Retry.**
+    - On a failed message, Retry is `POST /api/projects/:id/chat/:seq/retry`, which leaves any message that isn't failed as it is.
+    - On a message the page never had an answer for, Retry posts it again under the same `request_id`, the page's id for that message (`POST …/chat {text, request_id}`). The Worker keeps request ids (`chat_request`), so a post whose answer was lost is one message, not two.
+- **One-off cleanup.** The same migration drops PR rows whose task is gone, which deleting a draft left before [the task machine](#the-task-machine). Nothing updates them now, and a PR in one couldn't be attached again.
+
 ## Not decided here
 
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.

@@ -99,6 +99,14 @@ export class FakeApi {
     this.failures.push({ match, status, error });
   }
 
+  /** The next matching write is taken, but its answer is lost (a 502 instead), once. */
+  loseAnswer(match: RegExp): void {
+    this.lost.push(match);
+  }
+  private readonly lost: RegExp[] = [];
+  /** The chat's request ids, as the Worker keeps them (README.md#outboxes). */
+  private readonly chatRequests = new Map<string, ChatMessage>();
+
   /** The global fetch the page calls. */
   readonly fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = new URL(String(input), "https://projects.test");
@@ -113,6 +121,12 @@ export class FakeApi {
       return json({ error: x!.error }, x!.status);
     }
     this.url = url;
+    const lose = this.lost.findIndex((x) => x.test(`${method} ${url.pathname}`));
+    if (lose >= 0) {
+      this.lost.splice(lose, 1);
+      this.route(method, url.pathname.replace(/^\/api/, "").split("/").filter(Boolean), body);
+      return json({ error: "Bad gateway" }, 502);
+    }
     return this.route(method, url.pathname.replace(/^\/api/, "").split("/").filter(Boolean), body);
   };
 
@@ -228,9 +242,20 @@ export class FakeApi {
         this.interrupted += 1;
         return json({ interrupted: "turn" });
       case "POST chat": {
-        const c: ChatMessage = { seq: this.chat.length + 1, at_ms: now, sender: "owner", text: body.text, delivered: true, error: null };
-        this.chat.push(c);
-        return json({ seq: c.seq, delivered: true }, 201);
+        // As the Worker: a request id seen before is the same message.
+        const had = body.request_id ? this.chatRequests.get(body.request_id) : undefined;
+        const c: ChatMessage = had ?? { seq: this.chat.length + 1, at_ms: now, sender: "owner", text: body.text, delivered: true, status: "done", error: null };
+        if (!had) {
+          this.chat.push(c);
+          if (body.request_id) this.chatRequests.set(body.request_id, c);
+        }
+        return json({ seq: c.seq, delivered: true, status: "done" }, 201);
+      }
+      case "POST chat/:n/retry": {
+        const c = this.chat.find((m) => m.seq === Number(parts[3]));
+        if (!c) return json({ error: "no such message" }, 404);
+        if (c.status === "failed") Object.assign(c, { status: "done", delivered: true, error: null });
+        return json({ seq: c.seq, delivered: c.delivered, status: c.status });
       }
       case "GET asks":
         return json(this.asks);

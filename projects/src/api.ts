@@ -302,8 +302,11 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "POST chat": {
       const b = await body(req, Chat);
-      return b.ok ? done(await p.postChat(b.value.text), 201) : b.res;
+      return b.ok ? done(await p.postChat(b.value.text, b.value.request_id), 201) : b.res;
     }
+    case "POST chat/:n/retry":
+      // Sends again a message nest refused for good; one still being sent is left as it is (README.md#outboxes).
+      return done(await p.retryChat(Number(rest[1])));
     case "GET attention":
       return done(await p.attention());
     case "GET prs/open":

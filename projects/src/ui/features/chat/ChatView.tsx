@@ -13,7 +13,7 @@ import { IconAlertTriangle, IconArrowDown, IconArrowUp, IconCalendarEvent, IconC
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { human } from "../../../waits";
 import { api } from "../../api/client";
-import { useChat, useInterruptManager, usePostChat, useWaits } from "../../api/queries";
+import { useChat, useInterruptManager, usePostChat, useRetryChat, useWaits } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import {
@@ -22,6 +22,10 @@ import {
 import { RichMessage } from "../rich/RichMessage";
 import { useTrace } from "../trace/useTrace";
 import { finishedTurns, groupLog, liveTurn, loadDraft, markRead, quote, saveDraft, type Step, stepsBySeq, type ToolStep } from "./model";
+
+/** A message of the owner's the page couldn't post (its answer never came): kept with its request id, so Retry posts the same message. */
+type Unsent = ChatMessage & { request_id: string };
+const requestId = () => crypto.randomUUID().replace(/-/g, "");
 
 /** What a new conversation can start with: they fill the composer, they don't send. */
 export const STARTERS = ["Spec a task for ", "What's blocked right now?", "Summarize progress this week", "Plan the next milestone"];
@@ -187,21 +191,24 @@ function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMes
     );
   }
   const mine = m.sender === "owner";
-  // A message the app couldn't send (a negative seq with an error), or one nest refused for good.
-  const sending = mine && m.seq < 0 && m.error === null;
-  const failed = mine && !m.delivered && !sending && m.error !== null;
+  // Its real state (README.md#outboxes): being sent (owed, or retrying with why), or failed: refused for
+  // good, or never taken by the app (an unsent one, a negative seq). Retry only on failed.
+  const status = m.status ?? (m.delivered ? "done" : m.error ? "failed" : "owed");
+  const failed = mine && status === "failed";
+  const retrying = mine && status === "retrying";
+  const sending = mine && (status === "owed" || retrying);
   return (
     <MessageRow
       side={mine ? "owner" : "manager"}
       appear={appear}
-      pinned={failed}
+      pinned={failed || sending}
       data-sender={m.sender}
       data-seq={String(m.seq)}
       meta={
         <>
-          {mine && !m.delivered && (
-            <Badge size="xs" color="warning" variant="light" data-marker="undelivered">
-              {sending ? "Sending…" : "Not delivered"}
+          {(sending || failed) && (
+            <Badge size="xs" color={failed ? "warning" : "gray"} variant="light" data-marker={failed ? "undelivered" : "sending"}>
+              {failed ? "Not delivered" : retrying ? "Retrying…" : "Sending…"}
             </Badge>
           )}
           {/* The exact time on hover; for the keyboard and touch it heads the message's actions. */}
@@ -232,6 +239,12 @@ function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMes
           {m.error}
         </Text>
       )}
+      {/* Still being sent: why it waits (the manager not started yet, nest busy), not a failure. */}
+      {retrying && m.error && (
+        <Text fz="xs" c="dimmed">
+          {m.error}
+        </Text>
+      )}
     </MessageRow>
   );
 }
@@ -239,6 +252,7 @@ function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMes
 export function ChatView({ projectId, agent }: { projectId: string; agent: string | null }) {
   const chat = useChat(projectId);
   const post = usePostChat(projectId);
+  const retryChat = useRetryChat(projectId);
   const interrupt = useInterruptManager(projectId);
   const trace = useTrace(agent);
   const coarse = useMediaQuery("(pointer: coarse)") ?? false;
@@ -258,7 +272,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const [older, setOlder] = useState<ChatMessage[]>([]);
   const [hasOlder, setHasOlder] = useState(true);
   const [loadingOlder, setLoadingOlder] = useState(false);
-  const [failed, setFailed] = useState<ChatMessage[]>([]);
+  const [failed, setFailed] = useState<Unsent[]>([]);
   const [text, setText] = useState(() => loadDraft(projectId));
   const [atBottom, setAtBottomState] = useState(true);
   // Read by observers between renders; the state drives the pill.
@@ -401,12 +415,14 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     if (el.scrollTop < OLDER_AT && latest.length >= PAGE) void loadOlder();
   };
 
-  const send = (t = text.trim(), fromRetry?: ChatMessage) => {
+  const send = (t = text.trim(), fromRetry?: Unsent) => {
     if (!t || post.isPending) return;
     if (fromRetry) setFailed((f) => f.filter((x) => x !== fromRetry));
-    post.mutate(t, {
+    // The same request id on a retry: if the first post landed and only its answer was lost, it's one message.
+    const request_id = fromRetry?.request_id ?? requestId();
+    post.mutate({ text: t, request_id }, {
       // Not taken: kept in the log as not delivered, with Retry.
-      onError: (e) => setFailed((f) => [...f, { seq: -Date.now(), at_ms: Date.now(), sender: "owner", text: t, delivered: false, error: e.message }]),
+      onError: (e) => setFailed((f) => [...f, { seq: -Date.now(), at_ms: Date.now(), sender: "owner", text: t, delivered: false, status: "failed", error: e.message, request_id }]),
     });
     if (!fromRetry) setText("");
     setAtBottom(true);
@@ -419,7 +435,12 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     setAtBottom(true);
     scrollToBottom();
   };
-  const retry = (m: ChatMessage) => send(m.text, m.seq < 0 ? m : undefined);
+  // One the app took and nest refused: owed again on the server (once, however often asked). One the app
+  // never answered for: posted again under its request id.
+  const retry = (m: ChatMessage) => {
+    if (m.seq > 0) retryChat.mutate(m.seq);
+    else send(m.text, failed.find((x) => x === m));
+  };
   // Quoting puts the quote at the composer's start and the caret at its end, once the menu has closed
   // (it returns focus to its button first).
   const quoteReply = (t: string) => {

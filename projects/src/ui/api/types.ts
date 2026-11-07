@@ -8,6 +8,7 @@ export type { ProjectRow, SyncState } from "../../do/directory";
 export type { PutSecretBody } from "../../requests";
 export type { AddDependencyBody, AttachPrBody, AnswerBody, CancelBody, ChatBody, CreateProjectBody, CreateTaskBody, SettingsBody, UpdateTaskBody } from "../../requests";
 export type { Spec, TaskState } from "../../tasks";
+export type { OutboxState } from "../../outbox";
 export type { ManagerPhase, ManagerStatus } from "../../manager";
 export type { Job, JobState } from "../../do/review";
 export type { Dimension, Verdict } from "../../github";
