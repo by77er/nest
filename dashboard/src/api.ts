@@ -5,7 +5,7 @@
 export type {
   CapacityView as Capacity, FleetView as Fleet, HostRole, HostStatus, HostView as Host, ImageView as Image, ImagesView as Images,
   LaunchEndReason, LaunchView as Launch, ResidentView as Resident, SandboxState, SandboxView as SandboxRow, TemplateView as Template,
-  TunnelState,
+  TunnelState, AgentState, AgentLifecycle, BrainPhase,
 } from "../../protocol/admin/view";
 export type {
   AgentLifetimeKind, LifetimeAgentView as LifetimeAgent, LifetimeSandboxView as LifetimeSandbox, LifetimesView as Lifetimes, SandboxLifetimeKind,

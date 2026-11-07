@@ -64,9 +64,10 @@ describe("the board", () => {
       const card = within(column(want.column)).getByRole("article", { name: `a ${state} task` });
       const badge = card.querySelector(`[data-state="${state}"]`) as HTMLElement;
       expect(badge, state).not.toBeNull();
-      // Mantine draws a badge from its color's CSS variables: the role's, and no other.
+      // Mantine draws a badge from its color's CSS variables: the role's, and no other (a neutral one,
+      // the theme's neutral badge variables).
       const style = badge.getAttribute("style") ?? "";
-      expect(style, state).toContain(`--mantine-color-${want.role}-`);
+      expect(style, state).toContain(want.role === "gray" ? "--nest-neutral-badge" : `--mantine-color-${want.role}-`);
       for (const other of ["gray", "primary", "warning", "success", "danger"].filter((r) => r !== want.role)) {
         expect(style, `${state} isn't ${other}`).not.toContain(`--mantine-color-${other}-`);
       }

@@ -2,7 +2,7 @@
 // primary in progress, warning stalled, waiting on someone or expiring, danger failed or broken, gray
 // at rest. A Record over a typed enum fails the typecheck until a new value has a role.
 
-import type { AgentLifetimeKind, SandboxLifetimeKind, SandboxState, TunnelState } from "../api";
+import type { AgentLifecycle, AgentLifetimeKind, AgentState, BrainPhase, SandboxLifetimeKind, SandboxState, TunnelState } from "../api";
 import type { Role } from "./theme";
 
 export const SANDBOX_STATE_ROLE: Record<SandboxState, Role> = {
@@ -12,10 +12,12 @@ export const SANDBOX_STATE_ROLE: Record<SandboxState, Role> = {
   failed: "danger", fenced: "danger",
 };
 
-// An agent's fields come from `GET /v1/agents/:agent`, outside the typed view, as strings: a value not
-// listed here is gray.
+// Typed over the admin view's enums (protocol/admin/view.ts, which the control plane holds equal to its
+// own at compile time), so a new state fails the typecheck here until it has a role. An agent's fields
+// still arrive from `GET /v1/agents/:agent` as strings: `roleOf` reads one, a value the enum lacks
+// (an older or newer control plane's) being gray.
 /** protocol/model.ts `AgentState`: an agent's `state`, and its `activity` (the runner's last report). */
-export const AGENT_STATE_ROLE: Record<string, Role> = {
+export const AGENT_STATE_ROLE: Record<AgentState, Role> = {
   ready: "success",
   working: "primary", starting: "primary", compacting: "primary",
   waiting_permission: "warning", waiting_input: "warning", quota_parked: "warning", stalled: "warning",
@@ -23,9 +25,9 @@ export const AGENT_STATE_ROLE: Record<string, Role> = {
   errored: "danger", needs_attention: "danger",
 };
 /** protocol/model.ts `AgentLifecycle`: AgentDO's own part of `state`. */
-export const LIFECYCLE_ROLE: Record<string, Role> = { ready: "success", starting: "primary", detached: "gray", errored: "danger" };
+export const LIFECYCLE_ROLE: Record<AgentLifecycle, Role> = { ready: "success", starting: "primary", detached: "gray", errored: "danger" };
 /** lib/brain.ts `Brain.phase`: `condemned` once none of the brain's sessions is current. */
-export const PHASE_ROLE: Record<string, Role> = { live: "success", starting: "primary", condemned: "danger" };
+export const PHASE_ROLE: Record<BrainPhase, Role> = { live: "success", starting: "primary", condemned: "danger" };
 
 export const TUNNEL_ROLE: Record<TunnelState, Role> = { connected: "success", connecting: "warning", none: "gray" };
 
