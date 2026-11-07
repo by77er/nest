@@ -1531,8 +1531,6 @@ async fn retryable_fleet_error_resends_the_failed_batch() {
     assert!(results.windows(2).all(|w| w[0] == w[1]), "a redelivered command is answered with its first outcome: {results:?}");
 }
 
-/// Review #10: the proxy intermediate CA is renewed (new key + CSR) before it expires, and the
-/// renewed certificate is installed in nest-proxy with the new key.
 /// A CA certificate for a fresh key, expiring at `expires_ms` (what a host saved at enrollment).
 fn ca_pair(expires_ms: i64) -> (CaCertificate, nest_protocol::host::Secret) {
     let key = rcgen::KeyPair::generate().unwrap();
@@ -1553,7 +1551,7 @@ fn ca_installs(h: &Started) -> Vec<(CaCertificate, String)> {
     h.proxy.lock().unwrap().iter().filter_map(|c| match c { ProxyCommand::CaInstall { ca, key_pem } => Some((ca.clone(), key_pem.0.clone())), _ => None }).collect()
 }
 
-/// A saved CA near its expiry is installed at start, then renewed (a CSR for a new key); the
+/// Review #10: a saved CA near its expiry is installed at start, then renewed (a CSR for a new key); the
 /// renewal's certificate is installed with that key. Audit P-B2: the certificate for another key
 /// that the mock sends first (a late answer to a CSR whose key was replaced) is never installed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1576,7 +1574,8 @@ async fn a_saved_ca_far_from_expiry_is_installed_and_kept() {
     let (ca, key) = ca_pair(nestd_now_ms() + 7 * 24 * 3600 * 1000);
     let h = start_host_with(Some((ca.clone(), key.clone()))).await;
     wait_until("the saved CA installed", || !ca_installs(&h).is_empty()).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Housekeeping looks at the CA, then reports capacity: once that is in, the CA was looked at.
+    h.fleet.wait_event("startup capacity", |b| matches!(b, HostEventBody::Capacity { .. })).await;
     assert!(h.fleet.log.lock().unwrap().ca_renews.is_empty(), "renewed a week before expiry");
     assert_eq!(ca_installs(&h).len(), 1);
 }

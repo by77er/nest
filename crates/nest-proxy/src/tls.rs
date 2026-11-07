@@ -215,7 +215,7 @@ mod tests {
     use rustls_pki_types::{ServerName, UnixTime};
 
     /// Audit P-B2: an intermediate installed with a key that isn't its own is refused (every
-    /// leaf it minted would fail to chain), and nestd's own check agrees with this one.
+    /// leaf it minted would fail to chain). The check is nestd's (`nestd_core::ca`).
     #[test]
     fn install_refuses_a_key_that_is_not_the_certificates() {
         let pki = testca::proxy_pki();

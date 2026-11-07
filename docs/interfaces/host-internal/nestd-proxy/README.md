@@ -9,7 +9,7 @@ nestd owns all state. **nest-proxy is a stateless cache:** on every (re)connecti
 | `type` | fds | Purpose |
 |---|---|---|
 | `hello_ack` | 0 | Starts a resync |
-| `ca_install` | 0 | `ca: control::CaCertificate` (the intermediate: pathLen 0, about 7 days) + `key_pem` (nestd generated the key for the enrollment or renewal CSR the certificate answers). Memory only. A key that isn't the one the certificate names is refused (`invalid_ca`), and the previous CA stays |
+| `ca_install` | 0 | `ca: control::CaCertificate` (the intermediate: pathLen 0, about 7 days) + `key_pem` (nestd generated the key for the enrollment or renewal CSR the certificate answers). Memory only. A key that isn't the one the certificate names is refused (`invalid_ca`), and the previous CA stays (after a resync's `hello_ack`, which clears it, there is none: inspected egress fails closed) |
 | `lease_update` | 0 | `valid_until_ms`, every heartbeat. Past it: refuse new connections and stop injecting for all sandboxes |
 | `sandbox_upsert` | 0 | `{sandbox, epoch, workstream?, policy: model::EgressPolicy}` (`workstream`: the compat `ws_` value nestd got, unused). Ignored for an older epoch, or unless `version` is newer. A newer epoch (or a `secrets_set` at one) starts the sandbox's view afresh: nothing of the older epoch's policy or secrets carries over. Precedes the sandbox's first `listeners_add`. Not acknowledged ([below](#policy-acknowledgement)) |
 | `secrets_set` | 0 | `{sandbox, epoch, secrets: model::InjectionSecret[]}`, replace all; checked against the epoch only. Memory only |
