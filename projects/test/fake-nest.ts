@@ -263,11 +263,11 @@ export class FakeNest {
       }
     }
     if (req.method === "DELETE" && (m = u.pathname.match(/^\/v1\/sandboxes\/(sbx_[A-Za-z0-9]+)$/))) {
-      // Destroy a sandbox (owner auth): ended, its attached agents with it.
+      // Destroy a sandbox (owner auth): ended. Its attached agents are left as they are, as nest's
+      // SandboxDO.destroy leaves them (an agent is ended only by its own stop).
       const sb = this.sandboxes.get(m[1]!);
       if (!sb || sb.owner !== CLIENT) return nestErr(404, "unknown_sandbox", "unknown sandbox");
       sb.ended = true;
-      for (const a of this.agents.values()) if (a.sandbox === sb.sandbox) a.ended = true;
       return json(200, { sandbox: sb.sandbox, state: "destroyed" });
     }
     if (r === "GET /v1/sandboxes") {
