@@ -66,9 +66,10 @@ pub struct Timers {
     pub idle_grace: Duration,
     /// After an interrupt request: SIGINT this long after it, SIGKILL as long again after that.
     pub interrupt_grace: Duration,
-    /// After stdin is closed (idleness, a graceful stop): SIGKILL the process group if Claude Code
-    /// hasn't exited this long after, so a process that ignores EOF can't keep the brain (and a
-    /// turn stashed for its respawn) waiting for ever.
+    /// After stdin is closed with no turn running (an idle close; a graceful stop, from its running
+    /// turn's end): SIGKILL the process group if Claude Code hasn't exited this long after, so a
+    /// process that ignores EOF can't keep the brain (and a turn stashed for its respawn) waiting
+    /// for ever.
     pub exit_grace: Duration,
 }
 
@@ -153,7 +154,11 @@ impl Brain {
             Input::Stop(StopMode::Graceful) => {
                 let mut fx = self.request_end(ExitReason::Stopped);
                 fx.push(Effect::CloseStdin);
-                self.exit_by(now);
+                // A running turn finishes first (a graceful stop's contract): the exit clock starts
+                // at its `result`.
+                if self.turn.is_none() {
+                    self.exit_by(now);
+                }
                 fx
             }
             Input::Stop(StopMode::Kill) => self.kill(ExitReason::Stopped),
@@ -215,6 +220,10 @@ impl Brain {
         }
         let turn = self.turn.take().map(|t| t.id);
         self.idle_at = Some(now + self.timers.idle_grace);
+        // Stopped while this turn ran: stdin is closed, and now nothing runs.
+        if matches!(self.ending, Ending::Requested(_)) {
+            self.exit_by(now);
+        }
         let usage = stream::usage_from(&r.usage, Some(r.total_cost_usd));
         let stop_reason = r.stop_reason.clone().unwrap_or_else(|| r.subtype.clone());
         vec![
@@ -538,16 +547,28 @@ mod tests {
         assert_eq!(b.step(Input::Exited { killed: None }, now + GRACE + EXIT), [Effect::Respawn], "the stashed turn still runs");
     }
 
-    /// A graceful stop sets the same deadline: a process that ignores EOF is killed and the brain
-    /// reports `stopped`; one that exits in time clears it.
+    /// A graceful stop lets a running turn finish (its contract): no deadline until the turn's
+    /// `result`, however long it takes; from then, a process that ignores EOF is killed at the exit
+    /// grace and the brain reports `stopped`. With no turn running the clock starts at once, and a
+    /// process that exits in time clears it.
     #[test]
-    fn a_graceful_stop_kills_a_process_that_ignores_eof() {
+    fn a_graceful_stop_kills_a_process_that_ignores_eof_only_after_its_turn() {
         let (mut b, now) = brain();
         b.step(run("t1"), now);
         assert_eq!(b.step(Input::Stop(StopMode::Graceful), now), [Effect::CloseStdin]);
-        assert_eq!(b.next_deadline(), Some(now + EXIT));
+        assert_eq!(b.next_deadline(), None, "the turn runs on");
+        let late = now + EXIT * 10;
+        assert_eq!(b.step(Input::Tick, late), [], "nothing killed while the turn runs");
+        let fx = b.step(result(false), late);
+        assert_eq!(shape(&fx), ["turn_completed t1", "idle t1"]);
+        assert_eq!(b.next_deadline(), Some(late + EXIT), "from the turn's end");
+        assert!(kills_the_group(&b.step(Input::Tick, late + EXIT)));
+        assert_eq!(shape(&b.step(Input::Exited { killed: None }, late + EXIT)), ["exit stopped"]);
+
+        let (mut b, now) = brain();
+        assert_eq!(b.step(Input::Stop(StopMode::Graceful), now), [Effect::CloseStdin]);
+        assert_eq!(b.next_deadline(), Some(now + EXIT), "no turn: at once");
         assert!(kills_the_group(&b.step(Input::Tick, now + EXIT)));
-        assert_eq!(shape(&b.step(Input::Exited { killed: None }, now + EXIT)), ["exit stopped"]);
 
         let (mut b, now) = brain();
         b.step(Input::Stop(StopMode::Graceful), now);
@@ -577,7 +598,7 @@ mod tests {
         b.step(run("t1"), now + GRACE);
         b.step(Input::Exited { killed: None }, now + GRACE + Duration::from_secs(1));
         b.step(Input::Respawned { ok: true }, now + GRACE + Duration::from_secs(1));
-        assert_ne!(b.next_deadline(), Some(now + GRACE + EXIT), "the new process has its own clock");
+        assert_eq!(b.next_deadline(), None, "the stashed turn runs: nothing is due");
 
         let (mut b, now) = brain();
         b.step(Input::Tick, now + GRACE);
