@@ -16,7 +16,7 @@ import { backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras
 import { envName, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
-import { canBlock, canUnblock, dependencyError, pickForAssignment, type PrState, prsDone, waitingOn, type Spec, taskBranch, type TaskEvent, type TaskState, TERMINAL, transition, WORKER_STATES } from "../tasks";
+import { canBlock, canUnblock, dependencyError, pickForAssignment, type Spec, step, taskBranch, type TaskEvent, type TaskFacts, type TaskState, TERMINAL, waitingOn, WORKER_STATES } from "../tasks";
 import { type Server, toolOf } from "../tools";
 import type { NestEvent } from "../webhook";
 import { asBinding, type ClientLayer, clientLayerFor, type EgressRule, egressWithinGrant, hostAllowed, LAYER_ROLES, type LayerRole, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules, shrinkLayer } from "../network";
@@ -88,6 +88,8 @@ export interface Task {
   waiting_on: string[];
   /** Set while an agent has the task waiting on the owner (README.md#blocked). */
   blocked: Blocked | null;
+  /** A worker of its own is starting or running (README.md#the-task-machine); one being stopped isn't. */
+  worker_live: boolean;
   /** The issue it was made of (README.md#triage), if any. */
   issue: TaskIssue | null;
   created_ms: number;
@@ -590,6 +592,7 @@ export class ProjectDO extends DurableObject<Env> {
       id: r.id as string, title: r.title as string, body: r.body as string, spec: r.spec ? (JSON.parse(r.spec as string) as Spec) : null,
       state: r.state as TaskState, ord: r.ord as number, assignee: (r.assignee as string | null) ?? null,
       start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, blocked: blockedOf(r),
+      worker_live: r.worker_live === 1 && !TERMINAL.has(r.state as TaskState),
       ...this.relations(r.id as string), issue: this.taskIssue(r),
       created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     };
@@ -665,53 +668,145 @@ export class ProjectDO extends DurableObject<Env> {
     return ok(this.toTask(this.taskRow(id)!));
   }
 
-  /** Delete a draft (anything further along is cancelled instead, so its history stays). */
+  /**
+   * Delete a draft (anything further along is cancelled instead, so its history stays). One holding an
+   * open PR is refused: detach it first, since detaching turns the PR's auto-merge off on GitHub, which a
+   * delete shouldn't do unseen. Everything else that names it goes with it, in the same step: tasks
+   * waiting on it stop waiting (noted on each), its own dependencies, detached PR rows, and the manager's
+   * waits on it; an issue it was made of goes back to triage. (A draft never had a worker, so it has no
+   * queued changes or comments: those are kept only for a live or starting worker.)
+   */
   async deleteTask(id: string): Promise<Result<{ deleted: string }>> {
     if (!this.settings()) return fail(404, "unknown project");
     const r = this.taskRow(id);
     if (!r) return fail(404, "unknown task");
     if (r.state !== "draft") return fail(409, "only a draft is deleted; cancel it instead");
+    const open = this.sql.exec<{ pr: number }>("SELECT pr FROM task_prs WHERE task = ? AND state != 'detached' ORDER BY pr", id).toArray().map((x) => `#${x.pr}`);
+    if (open.length) return fail(409, `PR ${open.join(", ")} ${open.length === 1 ? "is" : "are"} attached: detach ${open.length === 1 ? "it" : "them"} first`);
+    const board: Actor = { kind: "app", what: "board" };
+    for (const d of this.sql.exec<{ task: string }>("SELECT task FROM task_deps WHERE blocker = ?", id).toArray()) {
+      const before = this.depList(d.task);
+      this.sql.exec("DELETE FROM task_deps WHERE task = ? AND blocker = ?", d.task, id);
+      this.record(d.task, board, "dependency_removed", { blocked_by: id, title: r.title as string, why: "deleted" });
+      this.noteChange(d.task, "dependencies", before, this.depList(d.task), board);
+    }
+    this.sql.exec("DELETE FROM task_deps WHERE task = ?", id);
+    this.sql.exec("DELETE FROM task_prs WHERE task = ?", id);
+    // Its issue waits for triage again: the owner accepts or declines it afresh.
+    this.sql.exec("UPDATE issues SET state = 'untriaged', task = NULL, triaged_ms = NULL, updated_ms = ? WHERE task = ? AND state = 'accepted'", Date.now(), id);
     this.sql.exec("DELETE FROM tasks WHERE id = ?", id);
     this.sql.exec("DELETE FROM history WHERE task = ?", id);
     for (const w of this.pendingWaits("task", id)) this.resolveWait(w.id, "ended", "deleted");
+    // A task that waited only on it may be assignable now.
+    this.autoAssign();
     await this.arm();
     return ok({ deleted: id });
   }
 
-  /** Move a task by `event`, or answer why it can't move. The caller adds the side effects. */
-  private move(id: string, event: TaskEvent, actor: Actor, detail?: unknown): Result<{ from: TaskState; to: TaskState }> {
+  /** The facts the task machine moves together (src/tasks.ts `step`), as this project's tables hold them. */
+  private factsOf(r: Row): TaskFacts {
+    const state = r.state as TaskState;
+    const prs = this.sql.exec<{ open: number | null; merged: number | null }>(
+      "SELECT SUM(state = 'open') AS open, SUM(state = 'merged') AS merged FROM task_prs WHERE task = ?", r.id).one();
+    const queued = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM pr_inputs WHERE task = ?", r.id).one().n;
+    // A task that's over has no worker of its own: one still counted live is being stopped (`stops`).
+    const live = r.worker_live === 1 && !TERMINAL.has(state);
+    return { state, openPrs: prs.open ?? 0, mergedPrs: prs.merged ?? 0, workerLive: live, startOwed: live && state === "assigned", queuedInputs: queued };
+  }
+
+  /**
+   * Take `event` on a task through the one machine (src/tasks.ts `step`), or answer why it can't. In one
+   * step: `write` (the PR row the event is about), then the state, the worker's columns, its queued
+   * inputs and the history, all as the step says. Nothing else writes them.
+   * - `detail`: the history line's detail; `text`: a comment to queue (`revise`, `input_queued`);
+   *   `error`: why the start failed; `reason`: why its worker is stopped.
+   */
+  private move(id: string, event: TaskEvent, actor: Actor, o: { detail?: unknown; write?: () => void; text?: string; error?: string; reason?: string } = {}): Result<{ from: TaskState; to: TaskState }> {
     const r = this.taskRow(id);
     if (!r) return fail(404, "unknown task");
     const from = r.state as TaskState;
-    const t = transition(from, event);
-    if (!t.ok) return fail(409, t.error);
-    this.sql.exec("UPDATE tasks SET state = ?, updated_ms = ? WHERE id = ?", t.to, Date.now(), id);
-    this.record(id, actor, event, detail);
-    // The manager's waits on this task see the move in this step.
-    this.taskWaitsOn(id, t.to);
-    // Tasks waiting on it hear it's done; their live workers are told (README.md#task-changes).
-    if (t.to === "done") {
+    const st = step(this.factsOf(r), event);
+    if (!st.ok) return fail(409, st.error);
+    o.write?.();
+    const { to, effects } = st;
+    const now = Date.now();
+    if (to !== from || effects.record) {
+      this.sql.exec("UPDATE tasks SET state = ?, updated_ms = ? WHERE id = ?", to, now, id);
+      if (effects.record) this.record(id, actor, effects.record, o.detail);
+      // The manager's waits on this task see the move in this step.
+      this.taskWaitsOn(id, to);
+    }
+    // Its worker (README.md#the-task-machine).
+    switch (effects.worker) {
+      case "start":
+        // A new generation: the alarm starts it (`startWorker`), and it counts as live from now.
+        this.sql.exec("UPDATE tasks SET assignee = NULL, assignments = assignments + 1, worker_live = 1, start_next_ms = ?, start_attempts = 0, start_error = NULL WHERE id = ?", now, id);
+        break;
+      case "started":
+        this.sql.exec("UPDATE tasks SET start_next_ms = NULL, start_error = NULL WHERE id = ?", id);
+        break;
+      case "failed":
+        this.sql.exec("UPDATE tasks SET worker_live = 0, start_next_ms = NULL, start_error = ? WHERE id = ?", o.error ?? null, id);
+        // An agent made before the refusal goes.
+        if (r.assignee) this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, ?, 'start failed', ?)", r.assignee, id, now);
+        break;
+      case "exited":
+        this.sql.exec("UPDATE tasks SET worker_live = 0 WHERE id = ?", id);
+        break;
+      case "stop":
+        // Counted live until nest has stopped it (`stop`); with no agent made yet, gone at once (a start in
+        // flight lands on a stale attempt and stops what it made, `startWorker`).
+        if (r.assignee) this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, ?, ?, ?)", r.assignee, id, o.reason ?? to, now);
+        else this.sql.exec("UPDATE tasks SET worker_live = 0, start_next_ms = NULL WHERE id = ?", id);
+        break;
+    }
+    // The owner's PR comments for its worker (README.md#pr-comments).
+    switch (effects.inputs) {
+      case "queue":
+        this.sql.exec("INSERT INTO pr_inputs (task, text, at_ms) VALUES (?, ?, ?)", id, o.text ?? "", now);
+        break;
+      case "flush": {
+        // After its brief, in order.
+        const agent = this.taskRow(id)!.assignee as string | null;
+        for (const x of this.sql.exec("DELETE FROM pr_inputs WHERE task = ? RETURNING text, seq", id).toArray().sort((a, b) => (a.seq as number) - (b.seq as number))) {
+          if (agent) this.oweMessage(agent, x.text as string, true);
+        }
+        break;
+      }
+      case "drop": {
+        // The worker they waited for won't start: not kept for whichever starts next.
+        const n = this.sql.exec("DELETE FROM pr_inputs WHERE task = ? RETURNING seq", id).toArray().length;
+        this.record(id, { kind: "app", what: "board" }, "pr_comment_dropped", { comments: n, why: TERMINAL.has(to) ? `the task is ${to}` : "its worker didn't start" });
+        break;
+      }
+    }
+    if (to === "done" && from !== "done") {
       // The routines' counter of tasks done (README.md#routines).
       this.countFor("tasks_done");
+      // Tasks waiting on it hear it's done; their live workers are told (README.md#task-changes).
       for (const d of this.sql.exec("SELECT task FROM task_deps WHERE blocker = ?", id).toArray()) {
         this.record(d.task as string, { kind: "app", what: "board" }, "dependency_done", { blocker: id, title: r.title as string });
         this.noteChange(d.task as string, "dependencies", `${id} (${from.replace("_", " ")})`, `${id} (done)`, { kind: "app", what: "board" });
       }
+      // Done through its merged PRs, by whichever event (the last one merging, or the last open one closed
+      // or detached after another merged), a task made of an issue closes it, naming the PR (README.md#triage).
+      if (st.facts.mergedPrs > 0 && r.issue !== null && r.issue !== undefined) {
+        const pr = this.sql.exec<{ pr: number }>("SELECT pr FROM task_prs WHERE task = ? AND state = 'merged' ORDER BY ended_ms DESC LIMIT 1", id).toArray()[0]?.pr ?? null;
+        this.sql.exec("INSERT OR IGNORE INTO issue_closes (task, issue, pr, next_ms, owed_ms) VALUES (?, ?, ?, ?, ?)", id, r.issue, pr, now, now);
+      }
     }
-    // Nor comments queued for a worker that won't start now.
-    if (TERMINAL.has(t.to)) this.sql.exec("DELETE FROM pr_inputs WHERE task = ?", id);
     // A task that ends has nothing left to wait on the owner for.
-    if (TERMINAL.has(t.to) && r.blocked_ms !== null) {
+    if (TERMINAL.has(to) && !TERMINAL.has(from) && r.blocked_ms !== null) {
       this.clearBlock(id);
-      this.record(id, { kind: "app", what: "board" }, "unblocked", { why: t.to });
+      this.record(id, { kind: "app", what: "board" }, "unblocked", { why: to });
     }
-    return ok({ from, to: t.to });
+    return ok({ from, to });
   }
 
   async writeSpec(id: string, spec: Spec, actor: Actor = { kind: "owner" }): Promise<Result<Task>> {
     if (!this.settings()) return fail(404, "unknown project");
     const before = this.taskRow(id)?.spec as string | null | undefined;
-    const m = this.move(id, "spec", actor, spec);
+    const m = this.move(id, "spec", actor, { detail: spec });
     if (!m.ok) return m;
     this.sql.exec("UPDATE tasks SET spec = ? WHERE id = ?", JSON.stringify(spec), id);
     if (before !== JSON.stringify(spec)) this.noteChange(id, "spec", before ?? null, JSON.stringify(spec), actor);
@@ -728,10 +823,6 @@ export class ProjectDO extends DurableObject<Env> {
   private assignNow(id: string, actor: Actor): Result<Task> {
     const m = this.move(id, "assign", actor);
     if (!m.ok) return m;
-    this.sql.exec(
-      "UPDATE tasks SET assignee = NULL, assignments = assignments + 1, worker_live = 1, start_next_ms = ?, start_attempts = 0, start_error = NULL WHERE id = ?",
-      Date.now(), id,
-    );
     return ok(this.toTask(this.taskRow(id)!));
   }
 
@@ -762,19 +853,10 @@ export class ProjectDO extends DurableObject<Env> {
     for (const id of pickForAssignment(tasks, this.liveWorkers(), s.max_workers)) this.assignNow(id, { kind: "app", what: "auto-assign" });
   }
 
-  /** Owe nest a stop of the task's worker, if it has one. */
-  private stopWorkerOf(id: string, reason: string): void {
-    const r = this.taskRow(id)!;
-    const agent = r.assignee as string | null;
-    if (agent) this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, ?, ?, ?)", agent, id, reason, Date.now());
-    else this.sql.exec("UPDATE tasks SET worker_live = 0, start_next_ms = NULL WHERE id = ?", id);
-  }
-
   async cancel(id: string, actor: Actor = { kind: "owner" }, reason?: string): Promise<Result<Task>> {
     if (!this.settings()) return fail(404, "unknown project");
-    const m = this.move(id, "cancel", actor, reason);
+    const m = this.move(id, "cancel", actor, { detail: reason, reason: "cancelled" });
     if (!m.ok) return m;
-    this.stopWorkerOf(id, "cancelled");
     this.autoAssign();
     await this.arm();
     if (actor.kind === "owner") await this.drain();
@@ -782,14 +864,13 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
-   * The owner marks a task done: one with no PR and no live worker (src/tasks.ts). A stalled task's
-   * stopped worker is ended for good, if it isn't already.
+   * The owner marks a task done: one with no open PR and no live worker (src/tasks.ts `step`). A stalled
+   * task's stopped worker is ended for good, if it isn't already.
    */
   async markDone(id: string): Promise<Result<Task>> {
     if (!this.settings()) return fail(404, "unknown project");
-    const m = this.move(id, "done", { kind: "owner" });
+    const m = this.move(id, "done", { kind: "owner" }, { reason: "done" });
     if (!m.ok) return m;
-    this.stopWorkerOf(id, "done");
     this.autoAssign();
     await this.arm();
     await this.drain();
@@ -833,23 +914,26 @@ export class ProjectDO extends DurableObject<Env> {
     const had = this.prRow(e.pr);
     if (e.action === "opened") {
       if (had && had.state !== "detached") {
-        this.sql.exec("UPDATE task_prs SET state = 'open', node = COALESCE(?, node), fork = COALESCE(?, fork), title = COALESCE(?, title) WHERE pr = ?",
+        // Its facts only: its state moves through the machine alone (`move`), and a merged PR stays merged
+        // however late an `opened` for it arrives (GitHub doesn't order its deliveries).
+        this.sql.exec("UPDATE task_prs SET node = COALESCE(?, node), fork = COALESCE(?, fork), title = COALESCE(?, title) WHERE pr = ?",
           e.node ?? null, e.fork === undefined ? null : e.fork ? 1 : 0, e.title ?? null, e.pr);
         this.oweEnableIfDue(e.pr);
       } else if (e.task && this.taskRow(e.task)) {
         const r = this.attachPr(e.task, { pr: e.pr, node: e.node ?? null, fork: e.fork ?? null, title: e.title ?? null }, github);
         if (!r.ok) this.record(e.task, github, "pr_seen", { pr: e.pr, why: r.error });
       }
-    } else if (had && had.state !== "detached") {
+    } else if (had && had.state === "open") {
+      // Only an open one: the same close handled again (a redelivery) changes nothing.
       const id = had.task as string;
       // A closed PR's auto-merge is GitHub's to drop: nothing more is owed for it.
       this.sql.exec("UPDATE task_prs SET am_owed = NULL, am_next_ms = NULL WHERE pr = ?", e.pr);
       if (e.merged) {
-        this.sql.exec("UPDATE task_prs SET state = 'merged', ended_ms = ? WHERE pr = ?", Date.now(), e.pr);
         this.record(id, github, "pr_merged", { pr: e.pr });
         // The routines' counter of task PRs merged (README.md#routines).
         this.countFor("prs_merged");
-        this.finishIfMerged(id, github);
+        // The last one makes the task done, and its worker is ended (src/tasks.ts `step`).
+        this.move(id, "pr_merged", github, { write: () => this.sql.exec("UPDATE task_prs SET state = 'merged', ended_ms = ? WHERE pr = ?", Date.now(), e.pr), reason: "merged" });
       } else {
         this.detach(id, e.pr, github, "pr_closed", { pr: e.pr, detached: true });
       }
@@ -903,8 +987,9 @@ export class ProjectDO extends DurableObject<Env> {
       return { delivered: "worker", task };
     }
     if (t.worker_live === 1) {
-      // Starting: it's sent right after the brief.
-      this.sql.exec("INSERT INTO pr_inputs (task, text, at_ms) VALUES (?, ?, ?)", task, text, Date.now());
+      // Starting: it's sent right after the brief (src/tasks.ts `step`, `input_queued`).
+      const q = this.move(task, "input_queued", github, { text });
+      if (!q.ok) return drop(q.error);
       this.record(task, github, "pr_comment", { ...note, to: "the worker starting" });
       return { delivered: "pending", task };
     }
@@ -914,13 +999,9 @@ export class ProjectDO extends DurableObject<Env> {
     if (waiting.length) return drop(`it waits on ${waiting.map((b) => b.id).join(", ")}`);
     const recent = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM history WHERE task = ? AND action = 'revise' AND at_ms > ?", task, Date.now() - REVISE_WINDOW_MS).one().n;
     if (recent >= REVISE_MAX) return drop(`a worker was started again ${recent} times in the last hour (at most ${REVISE_MAX})`);
-    const m = this.move(task, "revise", github, note);
+    // A new worker, the comment queued for after its brief (src/tasks.ts `step`).
+    const m = this.move(task, "revise", github, { detail: note, text });
     if (!m.ok) return drop(m.error);
-    this.sql.exec("INSERT INTO pr_inputs (task, text, at_ms) VALUES (?, ?, ?)", task, text, Date.now());
-    this.sql.exec(
-      "UPDATE tasks SET assignee = NULL, assignments = assignments + 1, worker_live = 1, start_next_ms = ?, start_attempts = 0, start_error = NULL WHERE id = ?",
-      Date.now(), task,
-    );
     // Started from the alarm, off the webhook's request.
     await this.arm();
     return { delivered: "restarted", task };
@@ -1098,14 +1179,13 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
-   * Attach a PR to a task (one step): refused when it's attached to another task (detach it there
-   * first), or the task is over. A task in progress goes to review; its live worker is told; the PR gets
-   * auto-merge when it's due.
+   * Attach a PR to a task (one step, src/tasks.ts `step`): refused when it's attached to another task
+   * (detach it there first), or the task is over. A task in progress goes to review; its live worker is
+   * told; the PR gets auto-merge when it's due.
    */
   private attachPr(id: string, p: { pr: number; node: string | null; fork: boolean | null; title: string | null }, actor: Actor): Result<Task> {
     const t = this.taskRow(id);
     if (!t) return fail(404, "unknown task");
-    if (TERMINAL.has(t.state as TaskState)) return fail(409, `a ${t.state} task takes no PR`);
     const had = this.prRow(p.pr);
     if (had && had.state !== "detached") {
       if (had.task === id) return ok(this.toTask(t));
@@ -1113,53 +1193,41 @@ export class ProjectDO extends DurableObject<Env> {
     }
     const before = this.prList(id);
     const who = actor.kind === "owner" ? "owner" : actor.kind === "app" ? `app:${actor.what}` : actor.agent;
-    this.sql.exec(
-      `INSERT INTO task_prs (pr, task, state, node, fork, title, attached_by, attached_ms) VALUES (?, ?, 'open', ?, ?, ?, ?, ?)
-        ON CONFLICT (pr) DO UPDATE SET task = excluded.task, state = 'open', node = COALESCE(excluded.node, node), fork = COALESCE(excluded.fork, fork),
-          title = COALESCE(excluded.title, title), attached_by = excluded.attached_by, attached_ms = excluded.attached_ms, ended_ms = NULL`,
-      p.pr, id, p.node, p.fork === null ? null : p.fork ? 1 : 0, p.title, who, Date.now(),
-    );
-    if (t.state === "in_progress") this.move(id, "pr_opened", actor, { pr: p.pr });
-    else this.record(id, actor, "pr_attached", { pr: p.pr });
+    const m = this.move(id, "pr_attached", actor, {
+      detail: { pr: p.pr },
+      write: () => this.sql.exec(
+        `INSERT INTO task_prs (pr, task, state, node, fork, title, attached_by, attached_ms) VALUES (?, ?, 'open', ?, ?, ?, ?, ?)
+          ON CONFLICT (pr) DO UPDATE SET task = excluded.task, state = 'open', node = COALESCE(excluded.node, node), fork = COALESCE(excluded.fork, fork),
+            title = COALESCE(excluded.title, title), attached_by = excluded.attached_by, attached_ms = excluded.attached_ms, ended_ms = NULL`,
+        p.pr, id, p.node, p.fork === null ? null : p.fork ? 1 : 0, p.title, who, Date.now(),
+      ),
+    });
+    if (!m.ok) return m;
     this.syncPr(id);
     this.noteChange(id, "prs", before, this.prList(id), actor);
     this.oweEnableIfDue(p.pr);
     return ok(this.toTask(this.taskRow(id)!));
   }
 
-  /** Detach a PR from its task: its auto-merge is undone if it had one; the task is done if the rest merged. */
+  /**
+   * Detach an open PR from its task (closed without merging, or detached by hand): its auto-merge is
+   * undone if it had one. The last open one leaves review (src/tasks.ts `step`): the task is done if
+   * others merged, back in progress if its worker runs, stalled if not.
+   */
   private detach(id: string, pr: number, actor: Actor, action: string, detail: unknown): void {
     const before = this.prList(id);
     const row = this.prRow(pr)!;
-    this.sql.exec("UPDATE task_prs SET state = 'detached', ended_ms = ? WHERE pr = ?", Date.now(), pr);
+    this.record(id, actor, action, detail);
+    this.move(id, "pr_detached", actor, { detail: { pr }, write: () => this.sql.exec("UPDATE task_prs SET state = 'detached', ended_ms = ? WHERE pr = ?", Date.now(), pr), reason: "merged" });
     const am = row.am_status ? (JSON.parse(row.am_status as string) as TaskAutoMerge) : null;
     if (action !== "pr_closed" && (am?.state === "enabled" || row.am_owed === "enable")) this.owePrAutoMerge(pr, "disable");
-    this.record(id, actor, action, detail);
     this.syncPr(id);
     this.noteChange(id, "prs", before, this.prList(id), actor);
-    this.finishIfMerged(id, actor);
   }
 
   /** The task's `pr` column (kept for older readers): its first attached PR. */
   private syncPr(id: string): void {
     this.sql.exec("UPDATE tasks SET pr = ? WHERE id = ?", this.relations(id).pr, id);
-  }
-
-  /** A task whose attached PRs have all merged is done, and its worker ended. */
-  private finishIfMerged(id: string, actor: Actor): void {
-    const t = this.taskRow(id);
-    if (!t || TERMINAL.has(t.state as TaskState)) return;
-    const prs = this.sql.exec("SELECT state FROM task_prs WHERE task = ?", id).toArray().map((p) => ({ state: p.state as PrState }));
-    if (!prsDone(prs)) return;
-    if (this.move(id, "merged", actor).ok) {
-      this.stopWorkerOf(id, "merged");
-      this.autoAssign();
-      // A task made of an issue: the issue is closed on GitHub, with a line naming the PR (README.md#triage).
-      if (t.issue !== null && t.issue !== undefined) {
-        const pr = this.sql.exec<{ pr: number }>("SELECT pr FROM task_prs WHERE task = ? AND state = 'merged' ORDER BY ended_ms DESC LIMIT 1", id).toArray()[0]?.pr ?? null;
-        this.sql.exec("INSERT OR IGNORE INTO issue_closes (task, issue, pr, next_ms, owed_ms) VALUES (?, ?, ?, ?, ?)", id, t.issue, pr, Date.now(), Date.now());
-      }
-    }
   }
 
   /** The owner or the manager attaches a PR by its number, checked on GitHub: in the repo, and open. */
@@ -1781,17 +1849,16 @@ export class ProjectDO extends DurableObject<Env> {
     await this.arm();
   }
 
-  /** A worker ended: its task stalls unless its PR is open or it's over; its place frees. */
+  /**
+   * A worker ended: its task stalls unless an open PR keeps it in review, or it's over; comments queued
+   * for it are dropped; its place frees (src/tasks.ts `step`).
+   */
   private workerExited(agent: string, reason?: string, text?: string): void {
     this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
     this.sql.exec("DELETE FROM layers WHERE agent = ?", agent);
-    const r = this.sql.exec("SELECT id, state FROM tasks WHERE assignee = ?", agent).toArray()[0];
+    const r = this.sql.exec("SELECT id FROM tasks WHERE assignee = ?", agent).toArray()[0];
     if (!r) return;
-    const id = r.id as string;
-    this.sql.exec("UPDATE tasks SET worker_live = 0 WHERE id = ?", id);
-    if (r.state === "assigned" || r.state === "in_progress") {
-      this.move(id, "worker_exited", { kind: "app", what: "nest" }, { agent, reason: reason ?? null, text: text?.slice(0, 2000) ?? null });
-    }
+    this.move(r.id as string, "worker_exited", { kind: "app", what: "nest" }, { detail: { agent, reason: reason ?? null, text: text?.slice(0, 2000) ?? null } });
     this.autoAssign();
   }
 
@@ -2172,7 +2239,8 @@ export class ProjectDO extends DurableObject<Env> {
       const spec = this.frozenSpec(`${s.id}/${t.id}/${t.assignments}`);
       if (!spec?.extras.github_push?.workflows) continue;
       this.sql.exec("INSERT OR IGNORE INTO abandoned (task, start, next_ms) VALUES (?, ?, ?)", t.id, t.assignments, Date.now());
-      this.sql.exec("UPDATE tasks SET assignments = assignments + 1, start_next_ms = ?, start_attempts = 0, start_error = NULL WHERE id = ?", Date.now(), t.id);
+      // A new start attempt (src/tasks.ts `step`); comments queued for it wait for this one's brief.
+      if (!this.move(t.id, "start_abandoned", { kind: "app", what: "assign" }).ok) continue;
       this.record(t.id, { kind: "app", what: "assign" }, "start_abandoned", { start: t.assignments, reason: "workflows turned off" });
     }
   }
@@ -2845,8 +2913,8 @@ export class ProjectDO extends DurableObject<Env> {
         case "clear_blocked":
           return this.unblock(id, caller, (a.note as string | undefined) ?? null);
         case "report_pr": {
-          const may = transition(r.state as TaskState, "pr_opened");
-          if (!may.ok) return fail(409, may.error);
+          // Its own PR, while its worker runs: in progress, or in review (the same PR reported again).
+          if (r.state !== "in_progress" && r.state !== "in_review") return fail(409, `a ${(r.state as string).replace("_", " ")} task's worker can't report a PR`);
           const at = this.attachPr(id, { pr: a.number as number, node: null, fork: null, title: null }, actor);
           if (!at.ok) return at;
           await this.arm();
@@ -3157,23 +3225,20 @@ export class ProjectDO extends DurableObject<Env> {
       // A spec a tainted session wrote reaches the worker as relayed text, so its session is tainted too.
       await nest.postInbox(agent, workerBrief(s, t) + (this.frozenSpec(`${s.id}/${id}/${n}`)?.brief ?? ""), { requestId: `${id}/${n}/brief`, ...(t.tainted ? { from: "projects/board" } : {}) });
       if (!current()) return;
-      this.move(id, "started", { kind: "app", what: "assign" }, { agent });
-      this.sql.exec("UPDATE tasks SET start_next_ms = NULL, start_error = NULL WHERE id = ?", id);
-      // The owner's PR comments that waited for it (README.md#pr-comments), after its brief.
-      for (const x of this.sql.exec("DELETE FROM pr_inputs WHERE task = ? RETURNING text, seq", id).toArray().sort((a, b) => (a.seq as number) - (b.seq as number))) {
-        this.oweMessage(agent, x.text as string, true);
-      }
+      // In progress, or in review with an open PR; the owner's PR comments that waited for it follow its
+      // brief (README.md#pr-comments).
+      this.move(id, "started", { kind: "app", what: "assign" }, { detail: { agent } });
     } catch (e) {
       const r = current();
       if (!r) return;
       if (e instanceof NestError && e.permanent) {
         // nest refused it for good (the grant, the template): the task stalls with the reason shown.
-        this.move(id, "start_failed", { kind: "app", what: "assign" }, message(e));
-        this.sql.exec("UPDATE tasks SET worker_live = 0, start_next_ms = NULL, start_error = ? WHERE id = ?", message(e), id);
-        if (r.assignee) this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, ?, 'start failed', ?)", r.assignee, id, Date.now());
+        // Comments queued for it are dropped, not kept for whichever worker starts next.
+        this.move(id, "start_failed", { kind: "app", what: "assign" }, { detail: message(e), error: message(e) });
         this.autoAssign();
         return;
       }
+      // The start's retry schedule (not a move: it stays owed).
       const attempts = (r.start_attempts as number) + 1;
       this.sql.exec("UPDATE tasks SET start_attempts = ?, start_next_ms = ?, start_error = ? WHERE id = ?", attempts, Date.now() + backoff(attempts), message(e), id);
     }
@@ -3194,7 +3259,9 @@ export class ProjectDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
     // Its sandbox goes with it: nothing more is owed to its client layer.
     this.sql.exec("DELETE FROM layers WHERE agent = ?", agent);
-    this.sql.exec("UPDATE tasks SET worker_live = 0 WHERE assignee = ? AND state NOT IN ('assigned', 'in_progress', 'in_review')", agent);
+    // A worker that was no longer its task's own (the task is over, or its start failed): its place frees.
+    const t = this.sql.exec("SELECT * FROM tasks WHERE assignee = ?", agent).toArray()[0];
+    if (t && !this.factsOf(t).workerLive) this.move(t.id as string, "worker_exited", { kind: "app", what: "nest" });
     this.autoAssign();
   }
 

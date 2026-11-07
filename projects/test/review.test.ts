@@ -368,15 +368,19 @@ describe("tasks and their PRs", () => {
     const b = await taskWithWorker(p);
     const s = sha();
     // The worker reported PR 4; GitHub's opened came later and changes nothing.
-    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => { st.storage.sql.exec("UPDATE tasks SET state = 'in_review', pr = 4 WHERE id = ?", a.task); });
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => {
+      st.storage.sql.exec("UPDATE tasks SET state = 'in_review', pr = 4 WHERE id = ?", a.task);
+      st.storage.sql.exec("INSERT INTO task_prs (pr, task, state, attached_by, attached_ms) VALUES (4, ?, 'open', ?, 0)", a.task, a.worker);
+    });
     await push(p, 4, s, "opened", { ref: `task/${a.task}` });
     await push(p, 4, s, "closed", { ref: `task/${a.task}`, merged: true });
     expect((await task(p, a.task)).state).toBe("done");
     await push(p, 5, sha(), "opened", { ref: `task/${b.task}` });
     await push(p, 5, sha(), "closed", { ref: `task/${b.task}`, merged: false });
     const tb = await task(p, b.task);
-    expect(tb.state).toBe("in_review");
-    expect(tb.history.at(-1)).toMatchObject({ action: "pr_closed", actor: "app:github" });
+    // Its worker still runs: back in progress, to open another.
+    expect(tb.state).toBe("in_progress");
+    expect(tb.history.slice(-2)).toMatchObject([{ action: "pr_closed", actor: "app:github" }, { action: "review_ended", actor: "app:github" }]);
     expect(fake.agents.get(b.worker)!.ended).toBe(false);
   });
 

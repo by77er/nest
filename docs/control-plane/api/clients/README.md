@@ -5,7 +5,7 @@
 **Built (2026-11-02), all of it:** clients and grants (with [read-only repos](../../../sandbox/networking/egress/policy/#read-only-repos)), ownership and visibility, labels, the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`), [caller identity](#caller-identity-for-mcp-servers) (`control-plane/src/lib/identity.ts`), [events to the owner](#events-to-the-owner) (`control-plane/src/lib/client-events.ts`), the [live trace](#live-trace) (`control-plane/src/lib/trace.ts`), [GitHub tokens](#github-tokens), and `GET /v1/clients/self`. **Built (2026-11-02, later):** [secrets](#secrets), [injection](#injection) and [workflow files](#workflow-files).
 
 **How the built parts read the grant** (each a choice the design left open):
-- **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
+- **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. The model credential is checked again at each brain start against the grant as it is then, and a client's agent runs only on that credential: if it isn't stored (or has expired) the start is refused, never moved to the operator's default token ([BrokerDO](../../durable-objects/broker/), 2026-11-06). So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
 - **Brokered actions:** only GitHub actions scoped to repos in `repos` are within a grant. An http profile (a URL and a credential no field covers), a fork (it widens the push allowlist) and an unscoped GitHub action are refused.
 - **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's: a client's route that carries one refuses it (`policy` in `POST /v1/sandboxes`, `host` in `…/start`: 403), and their own routes (`PUT /v1/sandboxes/<id>/policy`, `PUT /v1/agents/<id>/rules`, `…/ports`) take only the admin token (401).
 - **Writes into a namespace are held to its client's grant, whoever writes them,** the operator included.
@@ -145,7 +145,7 @@ POST /v1/agents
   - `agent.turn_completed {agent, turn, text}`;
   - `agent.exited {agent, reason, text}`;
   - `agent.ask {agent, ask, question, approval?}`;
-  - `agent.error {agent, code, message}`;
+  - `agent.error {agent, code, message}` (`start_refused`: every start refused for good, whatever the cause, with the reason in `message` (a credential the grant no longer names or that isn't stored, say); `errored`: its brain kept failing; or the runner's own error code);
   - `agent.timer_fired {agent, timer, note}` ([timers](#timers));
   - `sandbox.destroyed {sandbox}`.
 - **Delivery:** to the client's webhook (`PUT /v1/clients/self/webhook {url}`, `https` only), signed with `Nest-Signature: t=<ms>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>`, with the event's `id` for deduplication. The secret is shown once, when the webhook is set.
