@@ -290,13 +290,25 @@ export function githubRefusalStatus(e: unknown): number | null {
 export const STALE_INSTALLATION_STATUSES: readonly number[] = [401, 404, 422];
 
 /**
- * Whether a refused mint is retried, once, with the installation looked up afresh: only when the id came
- * from the cache (a fresh one that is refused is a real refusal), only on the first attempt, and only for a
- * status that may mean it is stale. A lost answer (retryable) is the caller's to retry, as before.
+ * Whether a refused mint makes the caller look the installation up afresh: only when the id came from the
+ * cache (a fresh one that is refused is a real refusal), only on the first attempt, and only for a status
+ * that may mean it is stale. GitHub answers 422 for an ordinary refusal too (permissions the installation
+ * wasn't granted), so the lookup decides (`installationVerdict`), never the status alone. A lost answer
+ * (retryable) is the caller's to retry, as before.
  */
 export function retryMintFresh(e: unknown, fromCache: boolean, attempt: number): boolean {
   const status = githubRefusalStatus(e);
   return attempt === 0 && fromCache && status !== null && STALE_INSTALLATION_STATUSES.includes(status);
+}
+
+/**
+ * After a refused mint with cached installation `cached`, what a fresh lookup of each repo it covered
+ * says: `stale` if any is now another installation or none (a reinstall, a moved repo, an uninstall), so
+ * the cached id and its tokens go and the mint is tried once more; `same` if every repo is still on it,
+ * so the refusal is real: the cache and every token minted from it stay, and nothing is minted again.
+ */
+export function installationVerdict(cached: number, fresh: readonly (number | null)[]): "stale" | "same" {
+  return fresh.every((f) => f === cached) ? "same" : "stale";
 }
 
 // --- The actions -------------------------------------------------------------------------------------------

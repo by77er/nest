@@ -6,7 +6,7 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BrokerDO } from "../src/do/broker";
-import { retryMintFresh, STALE_INSTALLATION_STATUSES } from "../src/lib/github";
+import { installationVerdict, retryMintFresh, STALE_INSTALLATION_STATUSES } from "../src/lib/github";
 import { adminJson, BASE, enrollHost, uniqueCell } from "./helpers";
 import { bytesToB64 } from "../src/lib/util";
 
@@ -21,6 +21,10 @@ class FakeGitHub {
   /** Every mint asked for (refused ones too), by installation; and a status every mint is refused with, when set. */
   readonly mintAsks: number[] = [];
   refuseMints: number | null = null;
+  /** A permission the App wasn't granted: a mint asking for it is refused 422, as GitHub does. */
+  ungranted: string | null = null;
+  /** Installation lookups (`GET /repos/{repo}/installation`). */
+  lookups = 0;
 
   async handle(req: Request): Promise<Response> {
     const u = new URL(req.url);
@@ -31,6 +35,7 @@ class FakeGitHub {
       return this.app ? json(200, { ...this.app, client_id: "Iv1.test", name: "nest test" }) : json(503, { message: "unavailable" });
     }
     if ((m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/installation$/))) {
+      this.lookups++;
       const id = this.installs.get(m[1]!.toLowerCase());
       return id ? json(200, { id }) : json(404, { message: "Not Found" });
     }
@@ -39,6 +44,7 @@ class FakeGitHub {
       const installation = Number(m[1]);
       this.mintAsks.push(installation);
       if (this.refuseMints !== null) return json(this.refuseMints, { message: "refused" });
+      if (this.ungranted && Object.hasOwn(body.permissions, this.ungranted)) return json(422, { message: "The permissions requested are not granted to this installation." });
       const ok = body.repositories.every((name) => [...this.installs].some(([r, i]) => i === installation && r.endsWith(`/${name}`)));
       if (!ok) return json(422, { message: "There is at least one repository that does not exist or is not accessible to the parent installation." });
       // Built at run time and low in entropy (review lesson 9).
@@ -349,6 +355,14 @@ describe("the installation cache", () => {
     expect(STALE_INSTALLATION_STATUSES).toEqual([401, 404, 422]);
   });
 
+  it("a fresh lookup decides: stale only if a repo moved or the App is gone from it (pure)", () => {
+    expect(installationVerdict(7, [7])).toBe("same");
+    expect(installationVerdict(7, [7, 7])).toBe("same");
+    expect(installationVerdict(7, [8])).toBe("stale");
+    expect(installationVerdict(7, [null])).toBe("stale");
+    expect(installationVerdict(7, [7, 8])).toBe("stale");
+  });
+
   it("a reinstalled App (a new installation id) mints at once from the new installation, not 502 for a day", async () => {
     const r = repo();
     const c = await newClient({ repos: [r], permissions: { contents: "read", checks: "write" } });
@@ -383,13 +397,46 @@ describe("the installation cache", () => {
       const a = gh.mintAsks.length;
       expect((await ask(c.token, { repo: r, permissions: { contents: "read" } })).status).toBe(502);
       expect(gh.mintAsks.length - a).toBe(1);
-      // Cached now: refused, looked up afresh, refused again; two mints, then the refusal.
+      // Cached now: refused, looked up afresh, still the same installation: a real refusal, one mint.
       const b = gh.mintAsks.length;
+      const l = gh.lookups;
       expect((await ask(c.token, { repo: r, permissions: { checks: "read" } })).status).toBe(502);
-      expect(gh.mintAsks.length - b).toBe(2);
+      expect(gh.mintAsks.length - b).toBe(1);
+      expect(gh.lookups - l).toBe(1);
     } finally {
       gh.refuseMints = null;
     }
+  });
+
+  it("one client's real refusal (a permission the App lacks) leaves another's cached token in use and costs one mint", async () => {
+    const r = repo();
+    const a = await newClient({ repos: [r], permissions: { contents: "read", issues: "write" } });
+    const b = await newClient({ repos: [r], permissions: { contents: "read", issues: "write" } });
+    const t = await askJson(a.token, { repo: r, permissions: { contents: "read" } }, 200);
+    gh.ungranted = "issues";
+    try {
+      const before = gh.mintAsks.length;
+      expect((await ask(b.token, { repo: r, permissions: { issues: "write" } })).status).toBe(502);
+      expect(gh.mintAsks.length - before).toBe(1);
+      // A's token wasn't dropped: served from the cache, no mint.
+      const again = gh.mintAsks.length;
+      expect((await askJson(a.token, { repo: r, permissions: { contents: "read" } }, 200)).token).toBe(t.token);
+      expect(gh.mintAsks.length).toBe(again);
+    } finally {
+      gh.ungranted = null;
+    }
+  });
+
+  it("after a reinstall, a token cached from the old installation is never served again", async () => {
+    const r = repo();
+    const c = await newClient({ repos: [r], permissions: { contents: "read", checks: "write" } });
+    const t = await askJson(c.token, { repo: r, permissions: { contents: "read" } }, 200);
+    gh.installs.set(r, gh.installs.get(r)! + 1);
+    // Another request finds the installation stale; the old installation's tokens go with it.
+    await askJson(c.token, { repo: r, permissions: { checks: "read" } }, 200);
+    const again = await askJson(c.token, { repo: r, permissions: { contents: "read" } }, 200);
+    expect(again.token).not.toBe(t.token);
+    expect(gh.mints.at(-1)).toMatchObject({ installation: gh.installs.get(r), token: again.token });
   });
 
   it("a replaced github_app never hands out the old App's cached tokens", async () => {

@@ -356,6 +356,26 @@ describe("a sandbox's push allowlist", () => {
     expect(gh.mints.at(-1)!.installation).toBe(old + 1);
   });
 
+  it("a sandbox's held token is reused, but never after the App is replaced: the next push mints under the new one", async () => {
+    const r = repo();
+    const broker = env.BROKER.get(env.BROKER.idFromName("broker"));
+    const source = { kind: "github_app" as const, binding: "github", repos: [r] };
+    const target = { sandbox: `sbx_${rand()}`, epoch: 1 };
+    await broker.injectionSecret(target, source, "test");
+    const minted = gh.mints.length;
+    await broker.injectionSecret(target, source, "test");
+    expect(gh.mints.length).toBe(minted);
+    const was = await runInDurableObject(broker, (_i, st) => st.storage.sql.exec<{ value: string }>("SELECT value FROM secrets WHERE name = 'github_app'").one().value);
+    const creds = JSON.parse(was) as { app_id: string; private_key: string };
+    await adminJson("/v1/admin/secrets/github_app", { method: "PUT", body: { value: JSON.stringify({ ...creds, app_id: `${creds.app_id}9` }) } });
+    try {
+      await broker.injectionSecret(target, source, "test");
+      expect(gh.mints.length).toBe(minted + 1);
+    } finally {
+      await adminJson("/v1/admin/secrets/github_app", { method: "PUT", body: { value: was } });
+    }
+  });
+
   it("a token minted for an allowlist that changed meanwhile is never pushed", async () => {
     const a = repo(5151);
     const b = repo(5151);

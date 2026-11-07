@@ -7,7 +7,7 @@ import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken }
 import { type OAuthAudit, type OAuthStatus, OAuthStore, type StartAnswer, type StartInput } from "../lib/mcp-auth";
 import { b64url, bytesToB64, NestError, newId } from "../lib/util";
 import {
-  appJwt, type GitHubApi, githubApiOf, retryMintFresh, GithubRepoPermissions, importAppKey, parseAppSecret, revokeInstallationToken, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
+  appJwt, type GitHubApi, githubApiOf, installationVerdict, retryMintFresh, GithubRepoPermissions, importAppKey, parseAppSecret, revokeInstallationToken, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
 } from "../lib/github";
 import { isClientId } from "../lib/clients";
 import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
@@ -275,10 +275,13 @@ export class BrokerDO extends DurableObject<Env> {
     const seq = ++this.injectionSeq;
     this.injectionRequests.set(slot, seq);
     const overtaken = () => this.injectionRequests.get(slot) !== seq;
-    // A push token's key is the previous release's, so its tokens are reused across the deploy; a read
-    // token's names its access, so neither is ever reused for the other.
-    // With `workflows`, its own key: never reused for a token without it, nor the other way round.
-    const key = JSON.stringify(access === "read" ? { kind: source.kind, repos, access } : workflows ? { kind: source.kind, repos, workflows } : { kind: source.kind, repos });
+    // The key names the App (`app`, its `app_id`), so a token minted by a replaced App is never reused:
+    // the next push after a swap mints under the new one. A read token's names its access, so neither is
+    // ever reused for the other. With `workflows`, its own key: never reused for a token without it, nor
+    // the other way round.
+    const appId = parseAppSecret(this.secret("github_app")?.value ?? "")?.app_id ?? null;
+    const key = JSON.stringify(access === "read" ? { kind: source.kind, repos, access, app: appId } : workflows ? { kind: source.kind, repos, workflows, app: appId }
+      : { kind: source.kind, repos, app: appId });
     const now = Date.now();
     this.sql.exec("DELETE FROM secrets WHERE name LIKE 'inject:%:sbx\\_%' ESCAPE '\\' AND expires_ms IS NOT NULL AND expires_ms <= ?", now);
     const audit = { event: "github_installation_token", permissions, target, binding: source.binding, caller };
@@ -359,10 +362,7 @@ export class BrokerDO extends DurableObject<Env> {
       try {
         t = await api.mint(jwt, installation, covers.map((r) => r.split("/")[1]!), permissions);
       } catch (e) {
-        if (retryMintFresh(e, cachedIds.has(installation), attempt)) {
-          this.forgetInstallation(creds.app_id, covers, installation);
-          continue;
-        }
+        if (retryMintFresh(e, cachedIds.has(installation), attempt) && (await this.installationStale(api, jwt, creds.app_id, covers, installation))) continue;
         if (e instanceof NestError && !e.retryable) {
           await forget();
           await this.auditMint({ ...audit, repos: covers, installation, refused: e.detail });
@@ -395,7 +395,7 @@ export class BrokerDO extends DurableObject<Env> {
 
   /**
    * App `appId`'s installation on `repo` (lowercase): cached a day per App and repo (`cached`), else looked
-   * up; null when it isn't installed there. A retry after a stale refusal finds no row (`forgetInstallation`).
+   * up; null when it isn't installed there.
    */
   private async installationOf(api: GitHubApi, jwt: string, appId: string, repo: string): Promise<{ id: number | null; cached: boolean }> {
     const known = this.sql.exec<{ installation: number; fetched_ms: number }>(
@@ -412,13 +412,35 @@ export class BrokerDO extends DurableObject<Env> {
     return { id, cached: false };
   }
 
-  /** A mint with `installation` was refused as stale: its cached rows for these repos go, and every token minted from it. */
-  private forgetInstallation(appId: string, repos: readonly string[], installation: number): void {
-    for (const r of repos) {
-      this.sql.exec("DELETE FROM github_app_installations WHERE app_id = ? AND repo = ? AND installation = ?", appId, r, installation);
-      this.sql.exec("DELETE FROM github_installations WHERE repo = ? AND installation = ?", r, installation);
+  /**
+   * A mint with the cached `installation` for `repos` was refused as it would be were the installation
+   * stale: each repo is looked up afresh (`installationVerdict`). Moved or uninstalled: the cache takes the
+   * fresh ids (an uninstalled repo's row goes), every token minted from the old installation goes, and the
+   * caller mints once more (true). Still there: the refusal is real (permissions the installation lacks,
+   * say), so the cache is confirmed, no token is dropped, and nothing is minted again (false).
+   */
+  private async installationStale(api: GitHubApi, jwt: string, appId: string, repos: readonly string[], installation: number): Promise<boolean> {
+    const fresh = await Promise.all(repos.map((r) => api.installation(jwt, r)));
+    const now = Date.now();
+    if (installationVerdict(installation, fresh) === "same") {
+      for (const r of repos) this.sql.exec("UPDATE github_app_installations SET fetched_ms = ? WHERE app_id = ? AND repo = ? AND installation = ?", now, appId, r, installation);
+      return false;
     }
+    for (const [i, r] of repos.entries()) {
+      const id = fresh[i]!;
+      if (id === null) {
+        this.sql.exec("DELETE FROM github_app_installations WHERE app_id = ? AND repo = ?", appId, r);
+        this.sql.exec("DELETE FROM github_installations WHERE repo = ?", r);
+        continue;
+      }
+      this.sql.exec(`INSERT INTO github_app_installations (app_id, repo, installation, fetched_ms) VALUES (?, ?, ?, ?)
+        ON CONFLICT(app_id, repo) DO UPDATE SET installation = excluded.installation, fetched_ms = excluded.fetched_ms`, appId, r, id, now);
+      this.sql.exec(`INSERT INTO github_installations (repo, installation, fetched_ms) VALUES (?, ?, ?)
+        ON CONFLICT(repo) DO UPDATE SET installation = excluded.installation, fetched_ms = excluded.fetched_ms`, r, id, now);
+    }
+    // Tokens of the old installation (revoked at GitHub by an uninstall) are never handed out again.
     this.sql.exec("DELETE FROM github_tokens WHERE installation = ?", installation);
+    return true;
   }
 
   // --- binding keys (docs/interfaces/gateway/) --------------------------------------------------
@@ -783,9 +805,8 @@ export class BrokerDO extends DurableObject<Env> {
         try {
           t = await api.mint(jwt, installation, r.split("/")[1]!, permissions);
         } catch (e) {
-          // Refused as if the cached installation were stale (a reinstall, a moved repo): once more, looked up afresh.
-          if (!retryMintFresh(e, found.cached, attempt)) throw e;
-          this.forgetInstallation(creds.app_id, [r], installation);
+          // Maybe a stale installation (a reinstall, a moved repo): looked up afresh, and minted once more only if it moved.
+          if (!(retryMintFresh(e, found.cached, attempt) && (await this.installationStale(api, jwt, creds.app_id, [r], installation)))) throw e;
         }
       }
       // Audited before anyone holds it: a mint whose record can't be written is never handed out.
