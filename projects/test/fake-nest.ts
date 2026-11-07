@@ -439,14 +439,14 @@ export class Signer {
 const nowS = () => Math.floor(Date.now() / 1000);
 
 /** The claims nest puts on an agent's session token for one of the app's servers. */
-export function agentClaims(server: "board" | "task" | "review", agent: string, labels: Record<string, string>, over: Record<string, unknown> = {}) {
+export function agentClaims(server: "board" | "task" | "review" | "routine", agent: string, labels: Record<string, string>, over: Record<string, unknown> = {}) {
   return {
     iss: NEST, aud: `${APP}/mcp/${server}`, sub: agent, owner: CLIENT, client: CLIENT, labels, epoch: 1, tainted: false,
     iat: nowS(), exp: nowS() + 300, ...over,
   };
 }
 
-export const connectorClaims = (server: "board" | "task" | "review") => ({ iss: NEST, aud: `${APP}/mcp/${server}`, sub: "nest:connector", iat: nowS(), exp: nowS() + 300 });
+export const connectorClaims = (server: "board" | "task" | "review" | "routine") => ({ iss: NEST, aud: `${APP}/mcp/${server}`, sub: "nest:connector", iat: nowS(), exp: nowS() + 300 });
 
 let rpcId = 0;
 /** One JSON-RPC message to an MCP server, as nest sends it. */

@@ -2,14 +2,15 @@
 // role, so a role's tool list is its URL's. The catalog (src/catalog.ts) names the same tools, and their
 // read-only and idempotent marks, so nest's connector and retries agree with what the server does.
 
+import { MAX_NOTES, NOTE_MAX } from "./memory";
 import { TASK_STATES } from "./tasks";
 
-export const SERVERS = ["board", "task", "review"] as const;
+export const SERVERS = ["board", "task", "review", "routine"] as const;
 export type Server = (typeof SERVERS)[number];
-export type Role = "manager" | "worker" | "reviewer";
+export type Role = "manager" | "worker" | "reviewer" | "routine";
 
 /** The role whose agents a server serves. */
-export const ROLE_OF: Record<Server, Role> = { board: "manager", task: "worker", review: "reviewer" };
+export const ROLE_OF: Record<Server, Role> = { board: "manager", task: "worker", review: "reviewer", routine: "routine" };
 
 export interface ToolDef {
   name: string;
@@ -46,6 +47,26 @@ const REQUEST_SECRET: ToolDef = {
     hosts: { ...strs("injected: the API hosts it's for, like api.cloudflare.com."), maxItems: 16 },
   }, ["name", "purpose", "kind"]),
 };
+
+/** The project's memory (README.md#memory): every role but the reviewer reads it; the manager and routine runs write it. */
+const noteKey = { type: "string", pattern: "^[a-z0-9][a-z0-9._-]{0,63}$", description: "The note's key: lowercase words joined by -, . or _, like conventions-testing." };
+const MEMORY_READ: ToolDef[] = [
+  {
+    name: "memory_list",
+    description: "The project's memory: every note's key, the first line of its text, who wrote it last and when. Notes are what the manager and routines learned about this project: the owner's preferences, conventions, traps, decisions.",
+    inputSchema: obj({}), readOnly: true, idempotent: true,
+  },
+  { name: "memory_get", description: "One memory note in full.", inputSchema: obj({ key: noteKey }, ["key"]), readOnly: true, idempotent: true },
+];
+const MEMORY_WRITE: ToolDef[] = [
+  {
+    name: "memory_write",
+    description: `Write a memory note, replacing the note with that key if there is one. Keep it short, specific and durable (at most ${NOTE_MAX} characters; the project holds at most ${MAX_NOTES} notes, so merge related ones).`,
+    inputSchema: obj({ key: noteKey, text: str("The note.", NOTE_MAX) }, ["key", "text"]),
+    idempotent: true,
+  },
+  { name: "memory_delete", description: "Delete a memory note that's wrong, stale or merged into another.", inputSchema: obj({ key: noteKey }, ["key"]), idempotent: true },
+];
 
 export const TOOLS: Record<Server, readonly ToolDef[]> = {
   board: [
@@ -115,6 +136,8 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
     },
     { name: "cancel_wait", description: "Drop a pending wait (aw_…): no message comes for it.", inputSchema: obj({ wait: str("The wait's id.", 64) }, ["wait"]), idempotent: true },
     { name: "list_waits", description: "Your pending waits, each with its deadline.", inputSchema: obj({}), readOnly: true, idempotent: true },
+    ...MEMORY_READ,
+    ...MEMORY_WRITE,
   ],
   task: [
     { name: "get_task", description: "Your task: its title, body, spec, repo, the branch to push, its attached PRs, and the tasks it waits on (its dependencies) with their states.", inputSchema: obj({}), readOnly: true, idempotent: true },
@@ -127,6 +150,7 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
     },
     { name: "clear_blocked", description: "Clear your task's block (you resolved it another way).", inputSchema: obj({ note: str("How it was resolved.", 1000) }), idempotent: true },
     { name: "report_pr", description: "Tell the board you opened your task's PR (from its task branch).", inputSchema: obj({ number: { type: "integer", minimum: 1, description: "The PR's number." } }, ["number"]), idempotent: true },
+    ...MEMORY_READ,
   ],
   review: [
     { name: "review_get", description: "The PR you review, as the app knows it: its repo, number, head commit (sha), base branch and title.", inputSchema: obj({}), readOnly: true, idempotent: true },
@@ -140,6 +164,30 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
         summary: str("The review's summary, shown as the check's summary.", 20000),
       }, ["correctness", "quality", "architecture", "summary"]),
     },
+  ],
+  // A routine run (README.md#routines): it reads, proposes and keeps memory; it never assigns, starts or changes work.
+  routine: [
+    { name: "list_tasks", description: "The project's board: every task in board order with its state, assignee and PRs.", inputSchema: obj({}), readOnly: true, idempotent: true },
+    { name: "get_task", description: "One task in full: its body, spec and history.", inputSchema: obj({ task: taskId }, ["task"]), readOnly: true, idempotent: true },
+    {
+      name: "recent_activity",
+      description: "What happened on the project lately: task PRs merged, tasks done, reviews with their verdicts and summaries, and the owner's PR comments relayed to workers, newest first.",
+      inputSchema: obj({ days: { type: "integer", minimum: 1, maximum: 30, description: "How far back, in days (7 if not given)." } }),
+      readOnly: true, idempotent: true,
+    },
+    {
+      name: "manager_chat",
+      description: "The owner's chat with the project's manager, newest last: what the owner asked for, decided and corrected.",
+      inputSchema: obj({ limit: { type: "integer", minimum: 1, maximum: 200, description: "How many of the latest messages (50 if not given)." } }),
+      readOnly: true, idempotent: true,
+    },
+    {
+      name: "propose_task",
+      description: "Propose a task to the owner: it goes to their triage queue (or onto the board as a draft, if your routine says so), marked as yours. The owner accepts or declines it. At most 5 per run.",
+      inputSchema: obj({ title: str("A short title.", 200), body: str("What is wanted and why: the files and lines, the problem, why it matters, what would fix it.", 20000) }, ["title", "body"]),
+    },
+    ...MEMORY_READ,
+    ...MEMORY_WRITE,
   ],
 };
 

@@ -4,6 +4,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
+import type { ProjectDO } from "../src/do/project";
 import { TERMINAL } from "../src/tasks";
 import { MAX_WAITS, prVerdict, taskVerdict, timeoutProblem, waitKey, waitMessage } from "../src/waits";
 import { AccessTeam, agentClaims, api, callTool, FakeNest, installFetch, Signer } from "./fake-nest";
@@ -201,7 +202,16 @@ describe("await_pr", () => {
     const t = await s.task("t");
     await stub(s).onPullRequest({ pr: 42, task: t, action: "opened", merged: false, node: "PR_42", fork: false, title: "t" });
     await stub(s).onPullRequest({ pr: 42, task: t, action: "closed", merged: true });
-    const answers = await Promise.all([1, 2].map(() => board(s, "await_pr", { pr: 42, until: "merged", timeout_s: 600 }).then(ok)));
+    // Both calls in the object at once, the second started while the first awaits (its first await comes
+    // after it records the wait): through the Worker, the second request's arrival depends on load.
+    const caller = { kind: "agent" as const, agent: s.manager, role: "manager" as const, labels: { project: s.id, role: "manager", start: "1" }, tainted: false };
+    const answers = await runInDurableObject(stub(s), async (o: InstanceType<typeof ProjectDO>) => {
+      const calls = [1, 2].map(() => o.mcpCall("board", caller, "await_pr", { pr: 42, until: "merged", timeout_s: 600 }, null));
+      return (await Promise.all(calls)).map((r) => {
+        expect(r.error).toBeNull();
+        return JSON.parse(r.result!) as { status: string; wait: { id: string } };
+      });
+    });
     const statuses = answers.map((a) => a.status).sort();
     await settle(s);
     const pending = await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM waits WHERE resolved_ms IS NULL").one().n);

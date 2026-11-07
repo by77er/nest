@@ -9,7 +9,8 @@ import { clientIdOf, NestError, nestFrom } from "./nest";
 import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSIDE, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
-import { AcceptIssue, AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateTask, DeclineIssue, Network, PutSecret, Settings, Spec, UpdateTask } from "./requests";
+import { AcceptIssue, AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, PutSecret, Settings, Spec, UpdateRoutine, UpdateTask } from "./requests";
+import { PRESETS } from "./routines";
 import type { Result } from "./sql";
 import { proxyTrace, proxyTraceHistory } from "./trace";
 
@@ -49,7 +50,10 @@ async function sync(env: Env): Promise<Response> {
   }
 }
 
-const ID = { project: /^prj_[a-z0-9]+$/, task: /^tsk_[a-z0-9]+$/, ask: /^ask_[A-Za-z0-9]+$/ };
+const ID = {
+  project: /^prj_[a-z0-9]+$/, task: /^tsk_[a-z0-9]+$/, ask: /^ask_[A-Za-z0-9]+$/,
+  routine: /^rtn_[a-z0-9]+$/, run: /^run_[a-z0-9]+$/, proposal: /^prp_[a-z0-9]+$/,
+};
 
 /** Answer a request under /api/ (the Access check already passed). */
 export async function handleApi(req: Request, env: Env, url: URL): Promise<Response> {
@@ -97,7 +101,8 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   const rest = parts.slice(2);
   const route = rest[0] === "secrets" && rest.length === 2 ? `${m} secrets/:name`
     : rest[0] === "secret-requests" && rest.length === 3 ? `${m} secret-requests/:id/${rest[2]}`
-    : `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
+    : rest[0] === "memory" && rest.length === 2 ? `${m} memory/:key`
+    : `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : ID.routine.test(s) ? ":routine" : ID.run.test(s) ? ":run" : ID.proposal.test(s) ? ":proposal" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
   const task = rest[1] ?? "";
   const ask = rest[1] ?? "";
 
@@ -354,6 +359,43 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const r = await p.setNetwork(b.value);
       return r.ok ? networkView(env, p, r.value) : done(r);
     }
+    // Routines (README.md#routines): background runs on a timer or the board's counters; their runs, the
+    // tasks they propose (in triage until the owner accepts or declines them), and the project's memory.
+    case "GET routines":
+      return done(await p.routines());
+    case "POST routines": {
+      const b = await body(req, CreateRoutine);
+      if (!b.ok) return b.res;
+      return done("preset" in b.value ? await p.createRoutine(PRESETS[b.value.preset], b.value.preset) : await p.createRoutine(b.value), 201);
+    }
+    case "GET routines/:routine":
+      return done(await p.getRoutine(rest[1]!));
+    case "PATCH routines/:routine": {
+      const b = await body(req, UpdateRoutine);
+      return b.ok ? done(await p.updateRoutine(rest[1]!, b.value)) : b.res;
+    }
+    case "DELETE routines/:routine":
+      return done(await p.deleteRoutine(rest[1]!));
+    case "POST routines/:routine/run":
+      return done(await p.runRoutineNow(rest[1]!));
+    case "GET routines/:routine/runs":
+      return done(await p.routineRuns(rest[1]!));
+    case "GET routine-runs":
+      return done(await p.routineRuns(null));
+    case "POST routine-runs/:run/stop":
+      return done(await p.stopRun(rest[1]!));
+    case "GET proposals":
+      return done(await p.proposals());
+    case "POST proposals/:proposal/accept":
+      return done(await p.acceptProposal(rest[1]!));
+    case "POST proposals/:proposal/decline": {
+      const b = await body(req, DeclineProposal);
+      return b.ok ? done(await p.declineProposal(rest[1]!, b.value.reason?.trim() || null)) : b.res;
+    }
+    case "GET memory":
+      return done(await p.memory());
+    case "DELETE memory/:key":
+      return done(await p.deleteNote(rest[1]!));
     case "GET errors":
       return done(await p.errors());
     default:

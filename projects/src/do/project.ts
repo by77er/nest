@@ -10,7 +10,7 @@ import { DurableObject } from "cloudflare:workers";
 import { TEMPLATE } from "../catalog";
 import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
-import { type AttachChange, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
+import { type AttachChange, DIMENSIONS, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
 import type { AgentCaller } from "../identity";
 import { backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras } from "../nest";
 import { envName, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
@@ -21,6 +21,9 @@ import { type Server, toolOf } from "../tools";
 import type { NestEvent } from "../webhook";
 import { asBinding, type ClientLayer, clientLayerFor, type EgressRule, egressWithinGrant, hostAllowed, LAYER_ROLES, type LayerRole, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules, shrinkLayer } from "../network";
 import { MAX_WAITS, type PrUntil, prVerdict, taskVerdict, timeoutProblem, type Wait, type WaitKind, waitKey, waitMessage, type WaitOutcome } from "../waits";
+import { MAX_NOTES, mayWriteMemory, NOTE_KEY, NOTE_MAX, type Note, preview } from "../memory";
+import type { RoutineKind, RoutinePreset } from "../requests";
+import { type Created, firedTrigger, MAX_PROPOSALS_PER_RUN, MAX_ROUTINES, MAX_START_ATTEMPTS, MAX_UNTRIAGED_PROPOSALS, nextTimerFire, type RoutineFields, routineSpawnExtras, runBrief, type RunOutcome, type RunState, startVerdict, type TriggerKind, type Triggers } from "../routines";
 import { randomId } from "./directory";
 
 export interface Settings {
@@ -51,6 +54,8 @@ export interface Settings {
   comments_from: { id: number; login: string | null } | null;
   /** The repo's owner, when it's a user (the "Use the repo owner" shortcut); null for an org's repo, or before attach. */
   repo_owner: { id: number; login: string } | null;
+  /** Routine runs live at once across the project (README.md#routines). */
+  max_routine_runs: number;
   created_ms: number;
 }
 
@@ -203,6 +208,67 @@ export interface Ask {
 /** Who did something: the owner (from the board), the app itself, or an agent over MCP (with its taint). */
 export type Actor = { kind: "owner" } | { kind: "app"; what: string } | { kind: "agent"; agent: string; tainted: boolean };
 
+/** A routine (README.md#routines), with what the page shows: its next timer fire, its counters, why it waits, its live and last runs. */
+export interface Routine extends RoutineFields {
+  id: string;
+  preset: RoutinePreset | null;
+  /** When its timer fires next; null without a timer or while disabled. */
+  next_timer_ms: number | null;
+  /** Tasks done and task PRs merged since its last run (or since it was enabled). */
+  counts: { tasks_done: number; prs_merged: number };
+  /** A trigger that fired and hasn't started a run yet, and why it waits. */
+  due: { trigger: TriggerKind; at_ms: number } | null;
+  waiting: "running" | "cooldown" | "cap" | null;
+  cooldown_until_ms: number | null;
+  live_run: RoutineRun | null;
+  last_run: RoutineRun | null;
+  runs: number;
+  created_ms: number;
+  updated_ms: number;
+}
+
+/** One run of a routine: why it started, its agent (whose trace the page shows), how it ended and what it made. */
+export interface RoutineRun {
+  id: string;
+  routine: string;
+  n: number;
+  trigger: TriggerKind;
+  /** For a counter: how many tasks done or PRs merged since the last run, when it started. */
+  count: number | null;
+  state: RunState;
+  outcome: RunOutcome | null;
+  agent: string | null;
+  error: string | null;
+  /** Why a guard ended it, if one did. */
+  note: string | null;
+  turns: number;
+  max_turns: number;
+  /** Its last turn's text: an agent's, shown as text. */
+  summary: string | null;
+  created: Created[];
+  queued_ms: number;
+  started_ms: number | null;
+  deadline_ms: number | null;
+  ended_ms: number | null;
+}
+
+/** A task a routine run proposed, waiting in triage for the owner (README.md#routines). Its text is an agent's that read anyone's: data. */
+export interface Proposal {
+  id: string;
+  routine: string;
+  routine_name: string;
+  run: string;
+  title: string;
+  body: string;
+  state: "untriaged" | "accepted" | "declined";
+  task: string | null;
+  reason: string | null;
+  created_ms: number;
+}
+
+/** How much of a run's last turn is kept as its report. */
+const RUN_SUMMARY_MAX = 4000;
+
 const MAX_WORKERS_LIMIT = 20;
 /** A chat page's size by default, and at most: older pages load as the owner scrolls up. */
 export const CHAT_PAGE = 50;
@@ -352,6 +418,30 @@ export const MIGRATIONS = [
     `CREATE TABLE issue_closes (task TEXT PRIMARY KEY, issue INTEGER NOT NULL, pr INTEGER, next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0,
       error TEXT, commented INTEGER NOT NULL DEFAULT 0, closed_ms INTEGER, owed_ms INTEGER NOT NULL)`,
   ],
+  [
+    // Routines (README.md#routines): each with its triggers, its counters' marks (the board's totals at its
+    // last run), the trigger due and not yet started, and its runs; the project's cap on live runs and the
+    // board's totals (tasks done, task PRs merged) the counters read. The project's memory notes
+    // (README.md#memory), and the tasks routines proposed, waiting in triage.
+    "ALTER TABLE settings ADD COLUMN routine_cap INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE settings ADD COLUMN tasks_done_total INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE settings ADD COLUMN prs_merged_total INTEGER NOT NULL DEFAULT 0",
+    `CREATE TABLE routines (id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL, prompt TEXT NOT NULL, enabled INTEGER NOT NULL, triggers TEXT NOT NULL,
+      cooldown_min INTEGER NOT NULL, max_minutes INTEGER NOT NULL, max_turns INTEGER NOT NULL, proposals TEXT NOT NULL, preset TEXT,
+      timer_next_ms INTEGER, done_mark INTEGER NOT NULL, merged_mark INTEGER NOT NULL, due TEXT, due_ms INTEGER, last_start_ms INTEGER, prev_start_ms INTEGER,
+      runs INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL)`,
+    `CREATE TABLE routine_runs (id TEXT PRIMARY KEY, routine TEXT NOT NULL, n INTEGER NOT NULL, trigger TEXT NOT NULL, count INTEGER, state TEXT NOT NULL,
+      outcome TEXT, agent TEXT, next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, note TEXT, deadline_ms INTEGER,
+      turns INTEGER NOT NULL DEFAULT 0, max_turns INTEGER NOT NULL, summary TEXT, created TEXT NOT NULL, queued_ms INTEGER NOT NULL,
+      started_ms INTEGER, ended_ms INTEGER, spawn TEXT)`,
+    "CREATE INDEX routine_runs_routine ON routine_runs (routine, queued_ms)",
+    "CREATE INDEX routine_runs_agent ON routine_runs (agent)",
+    // Each turn counted once per run, by its event id (a redelivered event isn't a second turn).
+    "CREATE TABLE run_turns (run TEXT NOT NULL, event TEXT NOT NULL, PRIMARY KEY (run, event))",
+    "CREATE TABLE memory (key TEXT PRIMARY KEY, text TEXT NOT NULL, source TEXT NOT NULL, tainted INTEGER NOT NULL, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL)",
+    `CREATE TABLE proposals (id TEXT PRIMARY KEY, routine TEXT NOT NULL, routine_name TEXT NOT NULL, run TEXT NOT NULL, agent TEXT NOT NULL, title TEXT NOT NULL,
+      body TEXT NOT NULL, state TEXT NOT NULL, task TEXT, reason TEXT, tainted INTEGER NOT NULL, created_ms INTEGER NOT NULL, triaged_ms INTEGER)`,
+  ],
 ] as const;
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
@@ -414,6 +504,7 @@ export class ProjectDO extends DurableObject<Env> {
         want: r.auto_merge === 1, owed: r.am_write_next_ms !== null, error: (r.am_write_error as string | null) ?? null,
         applied: r.am_applied ? (JSON.parse(r.am_applied as string) as Seen) : null, observed: r.am_observed ? (JSON.parse(r.am_observed as string) as Seen) : null,
       }),
+      max_routine_runs: r.routine_cap as number,
       created_ms: r.created_ms as number,
     };
   }
@@ -425,7 +516,7 @@ export class ProjectDO extends DurableObject<Env> {
 
   async updateSettings(u: {
     auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean;
-    comments_from_id?: number | null; comments_from_login?: string | null; comments_from_repo_owner?: boolean;
+    comments_from_id?: number | null; comments_from_login?: string | null; comments_from_repo_owner?: boolean; max_routine_runs?: number;
   }): Promise<Result<Settings>> {
     const before = this.settings();
     if (!before) return fail(404, "unknown project");
@@ -467,6 +558,10 @@ export class ProjectDO extends DurableObject<Env> {
     if (u.max_workers !== undefined) this.sql.exec("UPDATE settings SET max_workers = ?", clampWorkers(u.max_workers));
     if (u.merge_method !== undefined) this.sql.exec("UPDATE settings SET merge_method = ?", u.merge_method);
     if (u.workers_edit_workflows !== undefined) this.sql.exec("UPDATE settings SET workers_edit_workflows = ?", u.workers_edit_workflows ? 1 : 0);
+    if (u.max_routine_runs !== undefined) {
+      this.sql.exec("UPDATE settings SET routine_cap = ?", u.max_routine_runs);
+      this.routinesTick(Date.now());
+    }
     if (u.workers_edit_workflows === false && before.workers_edit_workflows) this.abandonWorkflowStarts();
     // Live workers too, both ways, through their sandbox's client layer (README.md#secrets).
     if (u.workers_edit_workflows !== undefined && u.workers_edit_workflows !== before.workers_edit_workflows) await this.oweLayers(["worker"]);
@@ -589,6 +684,8 @@ export class ProjectDO extends DurableObject<Env> {
     this.taskWaitsOn(id, t.to);
     // Tasks waiting on it hear it's done; their live workers are told (README.md#task-changes).
     if (t.to === "done") {
+      // The routines' counter of tasks done (README.md#routines).
+      this.countFor("tasks_done");
       for (const d of this.sql.exec("SELECT task FROM task_deps WHERE blocker = ?", id).toArray()) {
         this.record(d.task as string, { kind: "app", what: "board" }, "dependency_done", { blocker: id, title: r.title as string });
         this.noteChange(d.task as string, "dependencies", `${id} (${from.replace("_", " ")})`, `${id} (done)`, { kind: "app", what: "board" });
@@ -743,6 +840,8 @@ export class ProjectDO extends DurableObject<Env> {
       if (e.merged) {
         this.sql.exec("UPDATE task_prs SET state = 'merged', ended_ms = ? WHERE pr = ?", Date.now(), e.pr);
         this.record(id, github, "pr_merged", { pr: e.pr });
+        // The routines' counter of task PRs merged (README.md#routines).
+        this.countFor("prs_merged");
         this.finishIfMerged(id, github);
       } else {
         this.detach(id, e.pr, github, "pr_closed", { pr: e.pr, detached: true });
@@ -1647,6 +1746,7 @@ export class ProjectDO extends DurableObject<Env> {
   async onEvent(e: NestEvent, route: { role: string | null; task: string | null }): Promise<void> {
     const s = this.settings();
     if (!s) return;
+    if (route.role === "routine") this.routineEvent(e);
     switch (e.type) {
       case "agent.turn_completed":
         if (route.role === "manager" && e.text) {
@@ -2133,6 +2233,495 @@ export class ProjectDO extends DurableObject<Env> {
     this.sql.exec("UPDATE settings SET secrets_next_ms = ?", more ? now + UPKEEP_EVERY_MS : null);
   }
 
+  // --- routines (README.md#routines) --------------------------------------------------------------------
+
+  private routineRow(id: string): Row | undefined {
+    return this.sql.exec("SELECT * FROM routines WHERE id = ?", id).toArray()[0];
+  }
+
+  private runRow(id: string): Row | undefined {
+    return this.sql.exec("SELECT * FROM routine_runs WHERE id = ?", id).toArray()[0];
+  }
+
+  private liveRuns(routine?: string): number {
+    return routine === undefined
+      ? this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM routine_runs WHERE state != 'ended'").one().n
+      : this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM routine_runs WHERE state != 'ended' AND routine = ?", routine).one().n;
+  }
+
+  /** The board's counters since a routine's marks: tasks done and task PRs merged since its last run (or since it was enabled). */
+  private countsSince(r: Row): { tasks_done: number; prs_merged: number } {
+    const s = this.settingsRow()!;
+    return { tasks_done: (s.tasks_done_total as number) - (r.done_mark as number), prs_merged: (s.prs_merged_total as number) - (r.merged_mark as number) };
+  }
+
+  /** A task reached done, or a task's PR merged: the routines' counters move, and any at its threshold fires in this step. */
+  private countFor(what: "tasks_done" | "prs_merged"): void {
+    this.sql.exec(what === "tasks_done" ? "UPDATE settings SET tasks_done_total = tasks_done_total + 1" : "UPDATE settings SET prs_merged_total = prs_merged_total + 1");
+    this.routinesTick(Date.now());
+  }
+
+  /**
+   * The routines' one step: each enabled routine whose timer is reached or whose counters are at their
+   * thresholds becomes due (once: a trigger while it's due already is the same run), its timer moving to
+   * its next fire (missed fires aren't caught up). Then each due routine, oldest first, starts a run if
+   * `startVerdict` lets it: none of it live, past its cooldown (a manual run skips that), and fewer live
+   * runs than the project's cap. Starting resets its counters (`*_mark`) and its cooldown. Synchronous:
+   * the run's agent is started by `drain`.
+   */
+  private routinesTick(now: number): void {
+    const s = this.settingsRow();
+    if (!s) return;
+    for (const r of this.sql.exec("SELECT * FROM routines WHERE enabled = 1").toArray()) {
+      const triggers = JSON.parse(r.triggers as string) as Triggers;
+      const fired = firedTrigger({ triggers, timer_next_ms: (r.timer_next_ms as number | null) ?? null }, this.countsSince(r), now);
+      if (fired === "timer") this.sql.exec("UPDATE routines SET timer_next_ms = ? WHERE id = ?", nextTimerFire(triggers.timer!, now), r.id);
+      if (fired && r.due === null) this.sql.exec("UPDATE routines SET due = ?, due_ms = ? WHERE id = ?", fired, now, r.id);
+    }
+    const cap = s.routine_cap as number;
+    for (const r of this.sql.exec("SELECT * FROM routines WHERE due IS NOT NULL AND (enabled = 1 OR due = 'manual') ORDER BY due_ms, id").toArray()) {
+      const v = startVerdict({
+        live_for_routine: this.liveRuns(r.id as string), live_total: this.liveRuns(), cap,
+        last_start_ms: (r.last_start_ms as number | null) ?? null, cooldown_min: r.cooldown_min as number, manual: r.due === "manual", now,
+      });
+      if (!v.start) continue;
+      const trigger = r.due as TriggerKind;
+      const counts = this.countsSince(r);
+      const count = trigger === "tasks_done" ? counts.tasks_done : trigger === "prs_merged" ? counts.prs_merged : null;
+      const id = `run_${randomId()}`;
+      const n = (r.runs as number) + 1;
+      this.sql.exec(
+        `INSERT INTO routine_runs (id, routine, n, trigger, count, state, next_ms, max_turns, queued_ms, created) VALUES (?, ?, ?, ?, ?, 'starting', ?, ?, ?, '[]')`,
+        id, r.id, n, trigger, count, now, r.max_turns, r.due_ms ?? now,
+      );
+      const totals = this.settingsRow()!;
+      this.sql.exec(
+        "UPDATE routines SET due = NULL, due_ms = NULL, last_start_ms = ?, prev_start_ms = last_start_ms, runs = ?, done_mark = ?, merged_mark = ? WHERE id = ?",
+        now, n, totals.tasks_done_total, totals.prs_merged_total, r.id,
+      );
+    }
+  }
+
+  private toRun(r: Row): RoutineRun {
+    return {
+      id: r.id as string, routine: r.routine as string, n: r.n as number, trigger: r.trigger as TriggerKind, count: (r.count as number | null) ?? null,
+      state: r.state as RunState, outcome: (r.outcome as RunOutcome | null) ?? null, agent: (r.agent as string | null) ?? null,
+      error: (r.error as string | null) ?? null, note: (r.note as string | null) ?? null, turns: r.turns as number, max_turns: r.max_turns as number,
+      summary: (r.summary as string | null) ?? null, created: JSON.parse(r.created as string) as Created[],
+      queued_ms: r.queued_ms as number, started_ms: (r.started_ms as number | null) ?? null, deadline_ms: (r.deadline_ms as number | null) ?? null,
+      ended_ms: (r.ended_ms as number | null) ?? null,
+    };
+  }
+
+  private toRoutine(r: Row): Routine {
+    const id = r.id as string;
+    const live = this.sql.exec("SELECT * FROM routine_runs WHERE routine = ? AND state != 'ended' ORDER BY queued_ms DESC LIMIT 1", id).toArray()[0];
+    const last = this.sql.exec("SELECT * FROM routine_runs WHERE routine = ? AND state = 'ended' ORDER BY ended_ms DESC LIMIT 1", id).toArray()[0];
+    const triggers = JSON.parse(r.triggers as string) as Triggers;
+    const lastStart = (r.last_start_ms as number | null) ?? null;
+    const cooldownUntil = lastStart === null ? null : lastStart + (r.cooldown_min as number) * 60_000;
+    // Why a due routine hasn't started: its own run, its cooldown, or the project's cap.
+    let waiting: Routine["waiting"] = r.due !== null && live ? "running" : null;
+    if (r.due !== null && !live) {
+      const v = startVerdict({
+        live_for_routine: 0, live_total: this.liveRuns(), cap: this.settingsRow()!.routine_cap as number,
+        last_start_ms: lastStart, cooldown_min: r.cooldown_min as number, manual: r.due === "manual", now: Date.now(),
+      });
+      waiting = v.start ? null : v.why;
+    }
+    return {
+      id, name: r.name as string, kind: r.kind as RoutineKind, prompt: r.prompt as string, enabled: r.enabled === 1, triggers,
+      cooldown_min: r.cooldown_min as number, max_minutes: r.max_minutes as number, max_turns: r.max_turns as number,
+      proposals: r.proposals as "triage" | "draft", preset: (r.preset as RoutinePreset | null) ?? null,
+      next_timer_ms: r.enabled === 1 ? ((r.timer_next_ms as number | null) ?? null) : null, counts: this.countsSince(r),
+      due: r.due === null ? null : { trigger: r.due as TriggerKind, at_ms: r.due_ms as number }, waiting,
+      cooldown_until_ms: cooldownUntil !== null && cooldownUntil > Date.now() ? cooldownUntil : null,
+      live_run: live ? this.toRun(live) : null, last_run: last ? this.toRun(last) : null, runs: r.runs as number,
+      created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
+    };
+  }
+
+  async routines(): Promise<Result<{ routines: Routine[]; max_routine_runs: number; live: number }>> {
+    const s = this.settingsRow();
+    if (!s) return fail(404, "unknown project");
+    return ok({
+      routines: this.sql.exec("SELECT * FROM routines ORDER BY created_ms, id").toArray().map((r) => this.toRoutine(r)),
+      max_routine_runs: s.routine_cap as number, live: this.liveRuns(),
+    });
+  }
+
+  async getRoutine(id: string): Promise<Result<Routine>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const r = this.routineRow(id);
+    return r ? ok(this.toRoutine(r)) : fail(404, "unknown routine");
+  }
+
+  /** A new routine: a preset's fields (README.md#presets) or the owner's. Its counters start from now, its timer from now. */
+  async createRoutine(f: RoutineFields, preset: RoutinePreset | null = null): Promise<Result<Routine>> {
+    const s = this.settingsRow();
+    if (!s) return fail(404, "unknown project");
+    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM routines").one().n >= MAX_ROUTINES) return fail(409, `a project holds at most ${MAX_ROUTINES} routines`);
+    const id = `rtn_${randomId()}`;
+    const now = Date.now();
+    this.sql.exec(
+      `INSERT INTO routines (id, name, kind, prompt, enabled, triggers, cooldown_min, max_minutes, max_turns, proposals, preset, timer_next_ms,
+        done_mark, merged_mark, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, f.name, f.kind, f.prompt, f.enabled ? 1 : 0, JSON.stringify(f.triggers), f.cooldown_min, f.max_minutes, f.max_turns, f.proposals, preset,
+      f.enabled && f.triggers.timer ? nextTimerFire(f.triggers.timer, now) : null, s.tasks_done_total, s.prs_merged_total, now, now,
+    );
+    await this.arm();
+    return ok(this.toRoutine(this.routineRow(id)!));
+  }
+
+  /**
+   * Change a routine. A new timer counts from now; enabling it counts its counters from now (so a long
+   * pause doesn't fire it at once); disabling it drops a due trigger (not the owner's "Run now") and its
+   * timer. A live run keeps going with what it started with.
+   */
+  async updateRoutine(id: string, u: Partial<RoutineFields>): Promise<Result<Routine>> {
+    const s = this.settingsRow();
+    if (!s) return fail(404, "unknown project");
+    const r = this.routineRow(id);
+    if (!r) return fail(404, "unknown routine");
+    const before = this.toRoutine(r);
+    const f: RoutineFields = {
+      name: u.name ?? before.name, kind: u.kind ?? before.kind, prompt: u.prompt ?? before.prompt, enabled: u.enabled ?? before.enabled,
+      triggers: u.triggers ?? before.triggers, cooldown_min: u.cooldown_min ?? before.cooldown_min, max_minutes: u.max_minutes ?? before.max_minutes,
+      max_turns: u.max_turns ?? before.max_turns, proposals: u.proposals ?? before.proposals,
+    };
+    const now = Date.now();
+    const timerChanged = JSON.stringify(f.triggers.timer) !== JSON.stringify(before.triggers.timer);
+    const timerNext = !f.enabled || !f.triggers.timer ? null
+      : timerChanged || !before.enabled || r.timer_next_ms === null ? nextTimerFire(f.triggers.timer, now) : (r.timer_next_ms as number);
+    this.sql.exec(
+      `UPDATE routines SET name = ?, kind = ?, prompt = ?, enabled = ?, triggers = ?, cooldown_min = ?, max_minutes = ?, max_turns = ?, proposals = ?,
+        timer_next_ms = ?, updated_ms = ? WHERE id = ?`,
+      f.name, f.kind, f.prompt, f.enabled ? 1 : 0, JSON.stringify(f.triggers), f.cooldown_min, f.max_minutes, f.max_turns, f.proposals, timerNext, now, id,
+    );
+    if (f.enabled && !before.enabled) this.sql.exec("UPDATE routines SET done_mark = ?, merged_mark = ? WHERE id = ?", s.tasks_done_total, s.prs_merged_total, id);
+    if (!f.enabled) this.sql.exec("UPDATE routines SET due = NULL, due_ms = NULL WHERE id = ? AND due != 'manual'", id);
+    this.routinesTick(now);
+    await this.arm();
+    await this.drain();
+    return ok(this.toRoutine(this.routineRow(id)!));
+  }
+
+  /** Delete a routine with no live run (stop it first). Its runs' history goes with it; the tasks it proposed stay. */
+  async deleteRoutine(id: string): Promise<Result<{ deleted: string }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    if (!this.routineRow(id)) return fail(404, "unknown routine");
+    if (this.liveRuns(id) > 0) return fail(409, "the routine has a run going: stop it first");
+    this.sql.exec("DELETE FROM routines WHERE id = ?", id);
+    this.sql.exec("DELETE FROM routine_runs WHERE routine = ?", id);
+    await this.arm();
+    return ok({ deleted: id });
+  }
+
+  /**
+   * The owner's "Run now": due at once, skipping the cooldown but not the one-at-a-time rule or the
+   * project's cap (it waits for a free place, shown as queued). Disabled routines may run too.
+   */
+  async runRoutineNow(id: string): Promise<Result<Routine>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    if (!this.routineRow(id)) return fail(404, "unknown routine");
+    if (this.liveRuns(id) > 0) return fail(409, "the routine has a run going already");
+    this.sql.exec("UPDATE routines SET due = 'manual', due_ms = ? WHERE id = ?", Date.now(), id);
+    this.routinesTick(Date.now());
+    await this.arm();
+    await this.drain();
+    return ok(this.toRoutine(this.routineRow(id)!));
+  }
+
+  /** A routine's runs, newest first; or every routine's. */
+  async routineRuns(routine: string | null, limit = 50): Promise<Result<RoutineRun[]>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    if (routine !== null && !this.routineRow(routine)) return fail(404, "unknown routine");
+    const n = Math.max(1, Math.min(200, Math.floor(limit)));
+    const rows = routine === null
+      ? this.sql.exec("SELECT * FROM routine_runs ORDER BY queued_ms DESC, n DESC LIMIT ?", n)
+      : this.sql.exec("SELECT * FROM routine_runs WHERE routine = ? ORDER BY queued_ms DESC, n DESC LIMIT ?", routine, n);
+    return ok(rows.toArray().map((r) => this.toRun(r)));
+  }
+
+  /** The owner stops a live run: it ends at once, its agent and sandbox owed a stop. */
+  async stopRun(id: string): Promise<Result<RoutineRun>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const r = this.runRow(id);
+    if (!r) return fail(404, "unknown run");
+    if (r.state === "ended") return fail(409, "the run has ended");
+    this.endRun(id, "stopped", null, "stopped by the owner");
+    await this.arm();
+    await this.drain();
+    return ok(this.toRun(this.runRow(id)!));
+  }
+
+  /**
+   * End a run that hasn't (in one step): its outcome, its agent owed a stop that ends it and destroys
+   * its sandbox, and the next due routine may start in its place. False if it had ended already.
+   */
+  private endRun(id: string, outcome: RunOutcome, error: string | null, note: string | null): boolean {
+    const r = this.runRow(id);
+    if (!r || r.state === "ended") return false;
+    const now = Date.now();
+    this.sql.exec("UPDATE routine_runs SET state = 'ended', outcome = ?, error = COALESCE(?, error), note = ?, next_ms = NULL, ended_ms = ? WHERE id = ?",
+      outcome, error, note, now, id);
+    if (r.agent) this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, NULL, ?, ?)", r.agent, `routine run ${outcome}`, now);
+    this.routinesTick(now);
+    return true;
+  }
+
+  /** nest's events about a routine run's agent: its turns (counted against its budget), its end. */
+  private routineEvent(e: NestEvent): void {
+    const r = this.sql.exec("SELECT * FROM routine_runs WHERE agent = ?", e.agent).toArray()[0];
+    if (!r || r.state === "ended") return;
+    const id = r.id as string;
+    if (e.type === "agent.turn_completed") {
+      // Counted once per event: a redelivery (nest's retry, a concurrent copy) is the same turn.
+      if (this.sql.exec("INSERT OR IGNORE INTO run_turns (run, event) VALUES (?, ?)", id, e.id).rowsWritten === 0) return;
+      const turns = (r.turns as number) + 1;
+      // The run's report: its latest turn's last text, kept short (an agent wrote it: shown as text, never followed).
+      this.sql.exec("UPDATE routine_runs SET turns = ?, summary = COALESCE(?, summary) WHERE id = ?", turns, e.text ? e.text.slice(0, RUN_SUMMARY_MAX) : null, id);
+      if (turns >= (r.max_turns as number)) this.endRun(id, "done", null, `its turn budget (${turns}) was reached`);
+    } else if (e.type === "agent.exited") {
+      const turns = r.turns as number;
+      if (turns > 0) this.endRun(id, "done", null, null);
+      else this.endRun(id, "failed", `it ended before finishing a turn (${(e.reason ?? "exited").slice(0, 100)})`, null);
+    }
+  }
+
+  /**
+   * Start a run's agent: a sandbox that reads the repo (`read_repos`, never pushing) and the `routine`
+   * template (ephemeral: it ends itself once its turn is done), labelled with its routine and run, then its
+   * brief. Idempotent by its key, as every start is. Retried from the alarm up to MAX_START_ATTEMPTS; a
+   * refusal for good fails the run.
+   */
+  private async startRun(nest: Nest, id: string): Promise<void> {
+    const before = this.runRow(id);
+    if (!before || before.state !== "starting") return;
+    const s = this.settings()!;
+    const routine = this.routineRow(before.routine as string);
+    if (!routine) {
+      this.endRun(id, "stopped", "its routine was deleted", null);
+      return;
+    }
+    const labels = { project: s.id, role: "routine", routine: routine.id as string, run: id };
+    const current = () => this.runRow(id)?.state === "starting";
+    // Its deadline and its spawn's extra fields (a dreaming run's transcript grant, which expires at that
+    // deadline), decided at its first attempt and kept: a retried create sends the request its key was bound to.
+    if (before.spawn === null) {
+      const now = Date.now();
+      const deadline = now + (routine.max_minutes as number) * 60_000;
+      const extras = routineSpawnExtras({
+        kind: routine.kind as RoutineKind, project: s.id, deadline_ms: deadline, last_start_ms: (routine.prev_start_ms as number | null) ?? null, now,
+      });
+      this.sql.exec("UPDATE routine_runs SET spawn = ?, deadline_ms = ? WHERE id = ? AND spawn IS NULL", JSON.stringify(extras), deadline, id);
+    }
+    const frozen = this.runRow(id)!;
+    const spawn = JSON.parse(frozen.spawn as string) as Record<string, unknown>;
+    try {
+      let agent = (before.agent as string | null) ?? null;
+      if (!agent) {
+        // No secrets and no egress beyond nest's own and the repo's: a routine reads the repo and the board.
+        // A dreaming run has no hands (no sandbox, no repo): the board, recent work, memory and transcripts are all it reads.
+        agent = routine.kind === "dreaming"
+          ? (await nest.createAgent({ ...spawn, template: TEMPLATE.dreaming, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent
+          : await nest.startAgent(TEMPLATE.routine, labels, { read: s.repo }, `${s.id}/routine/${id}`, {}, spawn);
+        await directory(this.env).recordAgent({ agent, project: s.id, role: "routine", task: null, pr: null });
+        this.sql.exec("UPDATE routine_runs SET agent = ? WHERE id = ? AND agent IS NULL", agent, id);
+        if (!current()) {
+          this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, NULL, 'routine run stopped', ?)", agent, Date.now());
+          return;
+        }
+      }
+      const brief = runBrief({
+        project: { id: s.id, name: s.name, repo: s.repo },
+        routine: { id: routine.id as string, name: routine.name as string, kind: routine.kind as RoutineKind, prompt: routine.prompt as string, max_minutes: routine.max_minutes as number, proposals: routine.proposals as "triage" | "draft" },
+        run: { id, trigger: before.trigger as TriggerKind, count: (before.count as number | null) ?? null },
+        last_start_ms: (routine.prev_start_ms as number | null) ?? null,
+        transcripts: Array.isArray(spawn.grants) && spawn.grants.length > 0,
+      });
+      await nest.postInbox(agent, brief, { requestId: `${id}/brief` });
+      if (!current()) return;
+      // Its time budget counts from its first attempt (the deadline its grant expires at).
+      this.sql.exec("UPDATE routine_runs SET state = 'running', started_ms = ?, next_ms = NULL, error = NULL WHERE id = ?", Date.now(), id);
+    } catch (e) {
+      if (!current()) return;
+      const attempts = (this.runRow(id)!.attempts as number) + 1;
+      if ((e instanceof NestError && e.permanent) || attempts >= MAX_START_ATTEMPTS) {
+        this.endRun(id, "failed", message(e), null);
+        return;
+      }
+      this.sql.exec("UPDATE routine_runs SET attempts = ?, next_ms = ?, error = ? WHERE id = ?", attempts, Date.now() + backoff(attempts), message(e), id);
+    }
+  }
+
+  /** The live run a routine agent's call is for: its labels' run, still live, and this very agent's. */
+  private callerRun(caller: AgentCaller): Row | null {
+    const r = this.runRow(caller.labels.run ?? "");
+    if (!r || r.routine !== caller.labels.routine || r.agent !== caller.agent || r.state === "ended") return null;
+    return r;
+  }
+
+  private noteCreated(run: string, c: Created): void {
+    const r = this.runRow(run)!;
+    this.sql.exec("UPDATE routine_runs SET created = ? WHERE id = ?", JSON.stringify([...(JSON.parse(r.created as string) as Created[]), c]), run);
+  }
+
+  /**
+   * A routine run proposes a task: into the triage queue for the owner (the default), or onto the board as
+   * a draft when its routine says so. Either way it's marked as the routine's and tainted (a run reads
+   * anyone's text), and nothing is assigned or started. At most MAX_PROPOSALS_PER_RUN per run, and
+   * MAX_UNTRIAGED_PROPOSALS waiting at once.
+   */
+  private async propose(run: Row, caller: AgentCaller, title: string, body: string): Promise<Result<unknown>> {
+    const runId = run.id as string;
+    const made = (JSON.parse(run.created as string) as Created[]).filter((c) => c.kind === "proposal" || c.kind === "task").length;
+    if (made >= MAX_PROPOSALS_PER_RUN) return fail(429, `a run proposes at most ${MAX_PROPOSALS_PER_RUN} tasks`);
+    const routine = this.routineRow(run.routine as string);
+    if (!routine) return fail(409, "the routine was deleted");
+    const from = `Proposed by the routine "${routine.name as string}" (run ${runId}).`;
+    if (routine.proposals === "draft") {
+      // As many pending as triage holds: drafts a routine proposed that nobody has specced, cancelled or deleted yet.
+      const pending = this.sql.exec<{ n: number }>(
+        "SELECT COUNT(DISTINCT h.task) AS n FROM history h JOIN tasks t ON t.id = h.task WHERE h.action = 'proposed' AND t.state = 'draft'",
+      ).one().n;
+      if (pending >= MAX_UNTRIAGED_PROPOSALS) return fail(429, `the board has ${MAX_UNTRIAGED_PROPOSALS} drafts routines proposed already: propose nothing more for now`);
+      // Recorded as the run's agent, tainted whatever the session says: it read the repo and others' text.
+      const t = await this.createTask({ title, body: `${body.trim()}\n\n${from}` }, { kind: "agent", agent: caller.agent, tainted: true });
+      if (!t.ok) return t;
+      this.record(t.value.id, { kind: "agent", agent: caller.agent, tainted: true }, "proposed", { routine: routine.id, run: runId });
+      this.noteCreated(runId, { kind: "task", id: t.value.id, title });
+      return ok({ task: t.value.id, state: "draft", where: "board" });
+    }
+    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM proposals WHERE state = 'untriaged'").one().n >= MAX_UNTRIAGED_PROPOSALS) {
+      return fail(429, `the owner has ${MAX_UNTRIAGED_PROPOSALS} proposals waiting already: propose nothing more for now`);
+    }
+    const id = `prp_${randomId()}`;
+    this.sql.exec(
+      "INSERT INTO proposals (id, routine, routine_name, run, agent, title, body, state, tainted, created_ms) VALUES (?, ?, ?, ?, ?, ?, ?, 'untriaged', 1, ?)",
+      id, routine.id, routine.name, runId, caller.agent, title, body, Date.now(),
+    );
+    this.noteCreated(runId, { kind: "proposal", id, title });
+    return ok({ proposal: id, where: "triage" });
+  }
+
+  /** The routines' proposals waiting for the owner, oldest first. */
+  async proposals(): Promise<Result<Proposal[]>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    return ok(this.sql.exec("SELECT * FROM proposals WHERE state = 'untriaged' ORDER BY created_ms, id").toArray().map(proposalOf));
+  }
+
+  /** Accept a proposal: a draft task of it, with a line naming its routine, marked tainted (an agent that read anyone's text wrote it). */
+  async acceptProposal(id: string): Promise<Result<Task>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const p = this.sql.exec("SELECT * FROM proposals WHERE id = ?", id).toArray()[0];
+    if (!p) return fail(404, "unknown proposal");
+    if (p.state !== "untriaged") return fail(409, `the proposal is ${p.state as string}`);
+    const t = await this.createTask({ title: p.title as string, body: `${(p.body as string).trim()}\n\nProposed by the routine "${p.routine_name as string}" (run ${p.run as string}).` });
+    if (!t.ok) return t;
+    this.sql.exec("UPDATE proposals SET state = 'accepted', task = ?, triaged_ms = ? WHERE id = ?", t.value.id, Date.now(), id);
+    this.sql.exec("INSERT INTO history (task, at_ms, actor, action, detail, tainted) VALUES (?, ?, 'owner', 'proposal_accepted', ?, 1)",
+      t.value.id, Date.now(), JSON.stringify({ proposal: id, routine: p.routine, run: p.run, agent: p.agent }));
+    return ok(this.toTask(this.taskRow(t.value.id)!));
+  }
+
+  async declineProposal(id: string, reason: string | null): Promise<Result<{ declined: string }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const p = this.sql.exec("SELECT state FROM proposals WHERE id = ?", id).toArray()[0];
+    if (!p) return fail(404, "unknown proposal");
+    if (p.state !== "untriaged") return fail(409, `the proposal is ${p.state as string}`);
+    this.sql.exec("UPDATE proposals SET state = 'declined', reason = ?, triaged_ms = ? WHERE id = ?", reason, Date.now(), id);
+    return ok({ declined: id });
+  }
+
+  /** What happened lately, for a routine run (README.md#routines): task PRs merged, tasks done, reviews, the owner's PR comments relayed. */
+  private async recentActivity(days: number): Promise<Record<string, unknown>> {
+    const since = Date.now() - days * 24 * 3600_000;
+    const merged = this.sql.exec(
+      "SELECT p.pr, p.task, p.title, p.ended_ms, t.title AS task_title FROM task_prs p JOIN tasks t ON t.id = p.task WHERE p.state = 'merged' AND p.ended_ms >= ? ORDER BY p.ended_ms DESC LIMIT 50", since,
+    ).toArray().map((r) => ({ pr: r.pr, title: r.title, task: r.task, task_title: r.task_title, merged_ms: r.ended_ms }));
+    const done = this.sql.exec("SELECT id, title, updated_ms FROM tasks WHERE state = 'done' AND updated_ms >= ? ORDER BY updated_ms DESC LIMIT 50", since)
+      .toArray().map((r) => ({ task: r.id, title: r.title, done_ms: r.updated_ms }));
+    const comments = this.sql.exec("SELECT task, at_ms, detail FROM history WHERE action = 'pr_comment' AND at_ms >= ? ORDER BY seq DESC LIMIT 50", since)
+      .toArray().map((r) => ({ task: r.task, at_ms: r.at_ms, ...(r.detail ? (JSON.parse(r.detail as string) as Record<string, unknown>) : {}) }));
+    const reviews = (await review(this.env, this.settings()!.id).jobs())
+      .filter((j) => j.updated_ms >= since && (j.verdict !== null || j.state === "failed"))
+      .slice(0, 50)
+      .map((j) => ({
+        pr: j.pr, sha: j.sha, title: j.title, state: j.state, at_ms: j.updated_ms,
+        verdict: j.verdict === null ? null : {
+          summary: j.verdict.summary.slice(0, 2000),
+          ...Object.fromEntries(DIMENSIONS.map((d) => [d, { verdict: j.verdict![d].verdict, notes: j.verdict![d].notes.slice(0, 1000) }])),
+        },
+      }));
+    return { since_ms: since, merged_prs: merged, tasks_done: done, reviews, pr_comments: comments };
+  }
+
+  // --- memory (README.md#memory) -------------------------------------------------------------------------
+
+  async memory(): Promise<Result<Note[]>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    return ok(this.sql.exec("SELECT * FROM memory ORDER BY key").toArray().map(noteOf));
+  }
+
+  /** The owner deletes a note. */
+  async deleteNote(key: string): Promise<Result<{ deleted: string }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    return this.sql.exec("DELETE FROM memory WHERE key = ?", key).rowsWritten > 0 ? ok({ deleted: key }) : fail(404, "unknown note");
+  }
+
+  /**
+   * A memory tool, from the manager, a worker or a routine run (`run` set). Reads for every role but the
+   * reviewer; writes only for the manager and routine runs (`mayWriteMemory`), each recorded with its
+   * source and its session's taint (a routine run's always tainted).
+   */
+  private memoryTool(caller: AgentCaller, tool: string, a: Record<string, unknown>, run: Row | null): Result<unknown> | null {
+    const key = a.key as string | undefined;
+    if (key !== undefined && !NOTE_KEY.test(key)) return fail(400, "a key is lowercase words joined by -, . or _ (at most 64 characters)");
+    switch (tool) {
+      case "memory_list": {
+        const notes = this.sql.exec("SELECT * FROM memory ORDER BY updated_ms DESC").toArray().map(noteOf);
+        return ok({ notes: notes.map((n) => ({ key: n.key, preview: preview(n.text), source: n.source, tainted: n.tainted, updated_ms: n.updated_ms })), count: notes.length, max: MAX_NOTES });
+      }
+      case "memory_get": {
+        const n = this.sql.exec("SELECT * FROM memory WHERE key = ?", key!).toArray()[0];
+        return n ? ok(noteOf(n)) : fail(404, `no note ${key}`);
+      }
+      case "memory_write":
+      case "memory_delete": {
+        if (!mayWriteMemory(caller.role)) return fail(403, "only the manager and routines write the project's memory");
+        const source = run ? `routine:${(this.routineRow(run.routine as string)?.name as string | undefined) ?? run.routine as string} (${run.id as string})` : caller.role;
+        const tainted = run !== null || caller.tainted ? 1 : 0;
+        // Provenance: a tainted session never changes or removes what an untainted one wrote (refused, the
+        // note kept as it is); it may write a note of its own beside it.
+        const had = this.sql.exec("SELECT source, tainted FROM memory WHERE key = ?", key!).toArray()[0];
+        if (had && had.tainted === 0 && tainted === 1) {
+          return fail(403, `the note ${key} was written by an untainted session (${had.source as string}): a tainted one can't ${tool === "memory_delete" ? "delete" : "change"} it; write a note of your own under another key`);
+        }
+        if (tool === "memory_delete") {
+          if (this.sql.exec("DELETE FROM memory WHERE key = ?", key!).rowsWritten === 0) return fail(404, `no note ${key}`);
+          if (run) this.noteCreated(run.id as string, { kind: "memory_delete", key: key! });
+          return ok({ deleted: key });
+        }
+        const text = (a.text as string).trim();
+        if (!text) return fail(400, "a note needs text");
+        const exists = this.sql.exec("SELECT 1 FROM memory WHERE key = ?", key!).toArray().length > 0;
+        if (!exists && this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM memory").one().n >= MAX_NOTES) {
+          return fail(409, `the project's memory is full (${MAX_NOTES} notes): merge or delete notes first`);
+        }
+        const now = Date.now();
+        this.sql.exec(
+          `INSERT INTO memory (key, text, source, tainted, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (key) DO UPDATE SET text = excluded.text, source = excluded.source, tainted = excluded.tainted, updated_ms = excluded.updated_ms`,
+          key!, text.slice(0, NOTE_MAX), source, tainted, now, now,
+        );
+        if (run) this.noteCreated(run.id as string, { kind: "memory_write", key: key! });
+        return ok({ written: key, created: !exists });
+      }
+    }
+    return null;
+  }
+
   // --- the MCP tools ---------------------------------------------------------------------------------
 
   /**
@@ -2163,6 +2752,9 @@ export class ProjectDO extends DurableObject<Env> {
 
   private async runTool(server: Server, caller: AgentCaller, tool: string, a: Record<string, unknown>): Promise<Result<unknown>> {
     const actor: Actor = { kind: "agent", agent: caller.agent, tainted: caller.tainted };
+    if (server === "routine") return this.routineTool(caller, tool, a);
+    // The project's memory (README.md#memory): the manager reads and writes it, a worker reads it.
+    if (tool.startsWith("memory_") && (server === "board" || server === "task")) return this.memoryTool(caller, tool, a, null) ?? fail(400, `unknown tool ${tool}`);
     if (server === "board") {
       switch (tool) {
         case "list_tasks": {
@@ -2254,6 +2846,37 @@ export class ProjectDO extends DurableObject<Env> {
     return fail(400, `unknown tool ${tool}`);
   }
 
+  /**
+   * A routine run's tool (README.md#routines). Its scope is its labels' run, which must be live and this
+   * very agent's: a run that ended (its budget, the owner's stop) can't act. It reads the board and recent
+   * work, proposes tasks and keeps memory; it never assigns, starts or changes a task.
+   */
+  private async routineTool(caller: AgentCaller, tool: string, a: Record<string, unknown>): Promise<Result<unknown>> {
+    const run = this.callerRun(caller);
+    if (!run) return fail(403, "this run has ended");
+    switch (tool) {
+      case "list_tasks": {
+        const tasks = await this.listTasks();
+        if (!tasks.ok) return tasks;
+        return ok({ tasks: tasks.value.map(({ body: _b, spec, ...t }) => ({ ...t, specced: spec !== null })) });
+      }
+      case "get_task":
+        return this.getTask(a.task as string);
+      case "recent_activity":
+        return ok(await this.recentActivity((a.days as number | undefined) ?? 7));
+      case "manager_chat": {
+        const c = await this.chat((a.limit as number | undefined) ?? CHAT_PAGE);
+        return c.ok ? ok({ messages: c.value.map((m) => ({ at_ms: m.at_ms, sender: m.sender, text: m.text })) }) : c;
+      }
+      case "propose_task": {
+        const title = (a.title as string).trim();
+        if (!title) return fail(400, "a proposal needs a title");
+        return this.propose(run, caller, title, a.body as string);
+      }
+    }
+    return this.memoryTool(caller, tool, a, run) ?? fail(400, `unknown tool ${tool}`);
+  }
+
   // --- work owed to nest -----------------------------------------------------------------------------
 
   /** Arm the alarm for the earliest work owed (in the step that owed it). */
@@ -2283,6 +2906,13 @@ export class ProjectDO extends DurableObject<Env> {
         UNION ALL SELECT notify_next_ms FROM tasks WHERE notify_next_ms IS NOT NULL
         UNION ALL SELECT p.am_next_ms FROM task_prs p, settings s WHERE p.am_next_ms IS NOT NULL
           AND (p.am_owed = 'disable' OR (s.am_write_next_ms IS NULL AND s.am_write_error IS NULL)))`),
+      // Routines (README.md#routines): timers, cooldowns that end in the future (one that's over waits on a
+      // run's end, which ticks), runs to start, and live runs' deadlines.
+      min(`SELECT MIN(t) AS t FROM (
+        SELECT timer_next_ms AS t FROM routines WHERE enabled = 1 AND timer_next_ms IS NOT NULL
+        UNION ALL SELECT last_start_ms + cooldown_min * 60000 FROM routines WHERE due IS NOT NULL AND due != 'manual' AND last_start_ms + cooldown_min * 60000 > ${Date.now()}
+        UNION ALL SELECT next_ms FROM routine_runs WHERE state = 'starting' AND next_ms IS NOT NULL
+        UNION ALL SELECT deadline_ms FROM routine_runs WHERE state = 'running' AND deadline_ms IS NOT NULL)`),
     ].filter((t): t is number => t !== null);
     const next = times.length ? Math.min(...times) : null;
     if (next === null) return;
@@ -2322,9 +2952,17 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT id FROM waits WHERE resolved_ms IS NULL AND deadline_ms <= ?", Date.now()).toArray()) {
       this.resolveWait(r.id as string, "timed_out", "timed out");
     }
+    // Routines: due triggers start runs, and a run past its time budget ends (README.md#routines).
+    for (const r of this.sql.exec("SELECT id, deadline_ms FROM routine_runs WHERE state = 'running' AND deadline_ms <= ?", Date.now()).toArray()) {
+      this.endRun(r.id as string, "timed_out", null, "its time budget ran out");
+    }
+    this.routinesTick(Date.now());
     const nest = nestFrom(this.env);
     if (!nest) return;
     const now = Date.now();
+    for (const r of this.sql.exec("SELECT id FROM routine_runs WHERE state = 'starting' AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY queued_ms", now).toArray()) {
+      await this.startRun(nest, r.id as string);
+    }
     if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo(nest);
     if (s.secrets_next_ms !== null && (s.secrets_next_ms as number) <= now) await this.secretsUpkeep(nest);
     for (const r of this.sql.exec("SELECT task, start FROM abandoned WHERE next_ms <= ?", now).toArray()) await this.cleanAbandoned(nest, r.task as string, r.start as number);
@@ -2789,4 +3427,19 @@ function reviewConclusion(j: { state: string; verdict: unknown }): string {
   const v = j.verdict as { correctness?: { verdict: string }; quality?: { verdict: string }; architecture?: { verdict: string } } | null;
   const all = v && [v.correctness, v.quality, v.architecture].every((d) => d?.verdict === "pass");
   return all ? "passed" : "failed";
+}
+
+function proposalOf(r: Row): Proposal {
+  return {
+    id: r.id as string, routine: r.routine as string, routine_name: r.routine_name as string, run: r.run as string, title: r.title as string,
+    body: r.body as string, state: r.state as Proposal["state"], task: (r.task as string | null) ?? null, reason: (r.reason as string | null) ?? null,
+    created_ms: r.created_ms as number,
+  };
+}
+
+function noteOf(r: Row): Note {
+  return {
+    key: r.key as string, text: r.text as string, source: r.source as string, tainted: r.tainted === 1,
+    created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
+  };
 }
