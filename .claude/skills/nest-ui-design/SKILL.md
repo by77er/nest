@@ -73,7 +73,7 @@ Defined once in the theme (as Mantine values and CSS variables) and used by name
 - No pure RGB, and no color outside this table and the syntax table below.
 - **Contrast:** all text, every filled role's text and every light badge meet WCAG AA (4.5:1) in both schemes. A failing value is fixed here and in the theme together. A neutral (gray) outline badge is `muted` text on a `border` hairline in both schemes, mapped once in the theme for every such badge; the framework's error color (a field's error, the required asterisk) is the danger role's text shade. (Bootstrap's `#6c757d` is 4.49:1 on light `page`, hence `muted` `#666e76`.)
 
-**Syntax colors** (the owner, 2026-11-06: color in code blocks is allowed, "but with a suitable color theme following the design system"). Color inside a code block, and only there, through these tokens: the monochrome base with the softened Bootstrap hues (blue, green, orange, purple, teal, red: six), toned for text on the code block's `subtle` ground, comments in the muted grays. Each is AA (4.5:1) on `subtle` in its scheme. They are not the roles' text shades: a keyword isn't an action, nor a deletion a failure. Unknown languages stay monochrome; nothing is guessed.
+**Syntax colors** (the owner, 2026-11-06: color in code blocks is allowed, "but with a suitable color theme following the design system"). Color inside a code block, and only there, through these tokens: the monochrome base with the softened Bootstrap hues (blue, green, orange, purple, cyan, red: six), toned for text on the code block's `subtle` ground, comments in the muted gray and punctuation in the text color. Each is AA (4.5:1) on `subtle` in its scheme, and any two different colors are at least ΔE 20 apart (CIE76), so neighbouring tokens (a JSON key and its value) never blur together. They are not the roles' text shades: a keyword isn't an action, nor a deletion a failure. Unknown languages stay monochrome; nothing is guessed.
 
 | Syntax token | Light | Dark | Use |
 |---|---|---|---|
@@ -81,9 +81,9 @@ Defined once in the theme (as Mantine values and CSS variables) and used by name
 | string | `#237047` | `#74c69d` | strings, regular expressions |
 | number | `#a4510b` | `#e8a35c` | numbers, literals (`true`, `null`), constants |
 | title | `#6a3fb0` | `#b49ae6` | a function's or section's name |
-| type | `#13705f` | `#5fcfb6` | types, classes |
-| attribute | `#13705f` | `#5fcfb6` | attributes, properties, keys |
-| punctuation | `#495057` | `#c1c4c8` | punctuation, operators |
+| type | `#0b6680` | `#5ccfe6` | types, classes |
+| attribute | `#0b6680` | `#5ccfe6` | attributes, properties, keys |
+| punctuation | `#212529` | `#e9ecef` | punctuation, operators |
 | comment | `#666e76` | `#9aa0a6` | comments, a prompt, meta |
 | addition | `#237047` | `#74c69d` | a diff's added lines |
 | deletion | `#b02a37` | `#ec8a92` | a diff's removed lines |

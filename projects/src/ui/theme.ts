@@ -64,12 +64,13 @@ export const roleText = {
 
 /**
  * The syntax colors of a code block (the skill's syntax table; the owner, 2026-11-06): the only color
- * inside one, each AA on the `subtle` ground it sits on (theme.test.ts). Six softened Bootstrap hues and
- * the muted grays, not the roles' text shades.
+ * inside one, each AA on the `subtle` ground it sits on and every two at least ΔE 20 apart (theme.test.ts).
+ * Six softened Bootstrap hues, the muted gray for comments and the text color for punctuation; not the
+ * roles' text shades.
  */
 export const syntax = {
-  light: { keyword: "#2f5fa8", string: "#237047", number: "#a4510b", title: "#6a3fb0", type: "#13705f", attribute: "#13705f", punctuation: "#495057", comment: "#666e76", addition: "#237047", deletion: "#b02a37" },
-  dark: { keyword: "#7ea6e6", string: "#74c69d", number: "#e8a35c", title: "#b49ae6", type: "#5fcfb6", attribute: "#5fcfb6", punctuation: "#c1c4c8", comment: "#9aa0a6", addition: "#74c69d", deletion: "#ec8a92" },
+  light: { keyword: "#2f5fa8", string: "#237047", number: "#a4510b", title: "#6a3fb0", type: "#0b6680", attribute: "#0b6680", punctuation: "#212529", comment: "#666e76", addition: "#237047", deletion: "#b02a37" },
+  dark: { keyword: "#7ea6e6", string: "#74c69d", number: "#e8a35c", title: "#b49ae6", type: "#5ccfe6", attribute: "#5ccfe6", punctuation: "#e9ecef", comment: "#9aa0a6", addition: "#74c69d", deletion: "#ec8a92" },
 } as const;
 export type SyntaxToken = keyof (typeof syntax)["light"];
 

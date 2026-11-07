@@ -38,6 +38,16 @@ const contrast = (a: string, b: string) => {
 };
 const AA = 4.5;
 
+/** CIELAB of an sRGB hex (D65), for color difference. */
+function lab(color: string): [number, number, number] {
+  const [r, g, b] = [1, 3, 5].map((i) => parseInt(color.slice(i, i + 2), 16) / 255).map((c) => (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+  const xyz = [(0.4124 * r! + 0.3576 * g! + 0.1805 * b!) / 0.95047, 0.2126 * r! + 0.7152 * g! + 0.0722 * b!, (0.0193 * r! + 0.1192 * g! + 0.9505 * b!) / 1.08883];
+  const [fx, fy, fz] = xyz.map((t) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116));
+  return [116 * fy! - 16, 500 * (fx! - fy!), 200 * (fy! - fz!)];
+}
+/** CIE76 color difference: the Euclidean distance in CIELAB. */
+const deltaE = (a: string, b: string) => Math.hypot(...lab(a).map((v, i) => v - lab(b)[i]!));
+
 describe("the tokens match the skill", () => {
   it("type scale: caption, small, body, body-lg and h1 to h4, size and line height", () => {
     const ours: Record<string, { fontSize: string; lineHeight: string }> = {
@@ -146,6 +156,11 @@ describe("tooltips", () => {
 describe("contrast, in both schemes", () => {
   const vars = cssVariablesResolver(full);
   const schemes = ["light", "dark"] as const;
+
+  it.each(schemes)("%s: any two different syntax colors are at least ΔE 20 apart (CIE76), so neighbouring tokens don't blur", (s) => {
+    const colors = [...new Set(Object.values(syntax[s]))];
+    for (const [i, a] of colors.entries()) for (const b of colors.slice(i + 1)) expect(deltaE(a, b), `${a} vs ${b}`).toBeGreaterThanOrEqual(20);
+  });
 
   it.each(schemes)("%s: every syntax color on a code block's subtle ground (and the surface), as the page's variables", (s) => {
     for (const [token, color] of Object.entries(syntax[s])) {
