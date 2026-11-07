@@ -542,6 +542,8 @@ export interface FakePull {
   ref: string;
   /** The head's repo; null: a fork GitHub no longer names. */
   headRepo: string | null;
+  /** GitHub's `updated_at` for it, when the test gives one. */
+  updated_at?: string;
 }
 
 export interface FakeCheckRun {
@@ -747,6 +749,7 @@ export class FakeGitHub {
       const view = (p: FakePull) => ({
         number: p.number, title: p.title, state: p.state, merged: p.merged, merged_at: p.merged ? "2026-11-02T00:00:00Z" : null, node_id: prNode(repoName, p.number),
         head: { ref: p.ref, repo: p.headRepo === null ? null : { full_name: p.headRepo } }, html_url: `https://github.com/${repoName}/pull/${p.number}`,
+        ...(p.updated_at ? { updated_at: p.updated_at } : {}),
       });
       const mine = [...(this.pulls.get(repoName)?.values() ?? [])];
       if (sub === "/pulls") return json(200, mine.filter((p) => p.state === "open").map(view));

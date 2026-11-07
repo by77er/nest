@@ -176,6 +176,43 @@ The owner's request (2026-11-06): the app's retry queues as one machine, so each
     - On a message the page never had an answer for, Retry posts it again under the same `request_id`, the page's id for that message (`POST …/chat {text, request_id}`). The Worker keeps request ids (`chat_request`), so a post whose answer was lost is one message, not two.
 - **One-off cleanup.** The same migration drops PR rows whose task is gone, which deleting a draft left before [the task machine](#the-task-machine). Nothing updates them now, and a PR in one couldn't be attached again.
 
+## The manager lifecycle
+
+The owner's request (2026-11-06), after the state-machine sweep (B11): a manager that ended used to stay the project's manager, with its brief and the owner's chat retried against a dead inbox.
+
+- **A pure step,** `managerStep` in `src/manager.ts`. ProjectDO applies it in one step (`managerMove`), and nothing else writes these settings.
+  - It works over the manager's agent, when a start is due, the recent automatic restarts (`settings.manager_restarts`), and why it isn't running.
+- **Ended: replaced by itself, up to a cap.** The manager counts as ended when:
+  - nest's `agent.exited` arrives for it;
+  - the Manager page's read of nest finds it ended or gone, so a missed exit still counts;
+  - its brief is refused for good after it was made (404, 409, 410).
+
+  A new one starts with backoff, up to 3 times an hour (`MANAGER_RESTARTS`). Past that, nothing is started: the page shows it ended, and the owner restarts it.
+- **The replaced manager:**
+  - its sandbox is destroyed (a stop owed, `manager replaced`);
+  - its pending waits end, unannounced, since the new one never made them;
+  - the next start gets a start number of its own, so its creates' keys aren't the old one's.
+- **The owner's Restart** (`POST /api/projects/:id/manager/restart`; **Restart manager** on the page when it ended or errored) stops the current manager and starts a new one now. Asking while one is already starting changes nothing.
+- **Chat during a restart.** The owner's chat messages wait for a manager ("Retrying…"), and go as soon as one has started. Each change is noted in the chat.
+- An exit of a manager that isn't the current one changes nothing.
+
+## Creating a project
+
+The owner's request (2026-11-06), after the sweep (B10): creating a project used to be four awaited steps. A failure after the first left a project that answered 404, with its repo taken.
+
+- **A recoverable sequence** (`src/creation.ts`, DirectoryDO):
+  1. The directory row is created **pending**, holding the create's body.
+  2. `finishProject` runs, and each of its steps is idempotent: the catalog sync (whose failure doesn't stop it), `ReviewDO.init`, then `ProjectDO.init`.
+  3. The row is marked **ready**, and the project's first drain runs (its own alarm retries what fails there).
+- **Pending.**
+  - The project's routes answer 503 ("still being created").
+  - The list shows it "Being created", with nothing to open.
+  - GitHub's events for its repo reach nothing.
+  - The same repo asked for again resumes it rather than being refused.
+- **Resumed by the alarm.**
+  - If the Worker's request fails or dies, DirectoryDO's alarm resumes the create: after a minute, then with backoff, as an outbox row (`src/outbox.ts`).
+  - A create that can't be finished (8 attempts, or a body that can't be read) is removed, and its repo is free again.
+
 ## Not decided here
 
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.
@@ -314,6 +351,10 @@ The owner's request (2026-11-03): "PRs should be attachable to tasks."
 - **Done:** a task is done once at least one PR is attached and every attached one has merged (`prsDone` in `src/tasks.ts`). Merging one of several leaves it in review. A PR closed without merging is detached with a note, and the task is done if the rest have merged; the last open one leaving with none merged takes the task out of review ([the task machine](#the-task-machine)). A merge moves any task that isn't over, since a PR may be attached to a task with no worker. A ready or stalled task may hold an open PR; it isn't marked done by hand while it does.
 - **Review and auto-merge:** every PR is reviewed already. With auto-merge on, every attached PR gets it: the owner's, the manager's, the worker's or the branch's, but only once GitHub has said it's from the repo itself and given its node id. A fork's PR never gets it, and neither does one whose head repo GitHub no longer names.
 - **The live worker is told** when PRs are attached or detached ([task changes](#task-changes)).
+- **GitHub's order, not its delivery's** (B7). GitHub doesn't order its deliveries, so ProjectDO keeps each PR's latest `updated_at`, whether attached or not (`pr_facts`).
+  - An `opened` or `closed` older than what's recorded is stale, and ignored. So is an `opened` as new as a recorded close: a reopen is its own, newer event.
+  - A merged PR's `closed` arriving before its `opened` therefore leaves the late `opened` attaching nothing.
+  - An attach is refused for a PR GitHub has said is closed, which covers an attach that raced its merge. The owner's attach records what its own read of GitHub said, so a reopened PR attaches.
 
 ## PR comments
 
@@ -348,6 +389,7 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
   - **A merged PR, a closed or detached one, or a task that's over:** the comment is dropped and recorded on the task (`pr_comment_dropped`, with why). A comment after the work is over is the owner's to raise with the manager in chat; sending it on would restart work no one asked to restart.
   - Comments still queued are dropped (recorded) when the task ends, its worker's start fails, or the worker exits before its brief: never kept for a later worker.
 - Each delivery is recorded on the task (`pr_comment`, `revise`).
+- **Once per comment** (B6), by its own key (its kind and URL, `comments_seen`, kept 30 days), in the step that acts on it. A delivery handled again acts once: its claim was released after a later step failed, or lapsed, or it came under a new delivery id. So it never sends twice, queues twice, or starts a second worker.
 - **Open:** route GitHub's events by `repository.id` and the installation id recorded at attach, not by `full_name`, so a renamed namespace that someone registers again can't reach the project (a follow-up).
 
 ## Triage

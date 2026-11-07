@@ -132,6 +132,9 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
   const repo = str(obj(payload.repository).full_name)?.toLowerCase() ?? null;
   const p = repo ? await dir.projectByRepo(repo) : null;
   if (!p) return json({ ignored: "no project for this repo" });
+  // Still being created (README.md#creating-a-project): its objects aren't whole, so nothing reaches them;
+  // an import or a later event catches up.
+  if (p.state === "pending") return json({ ignored: "the project is still being created" });
   const of = { project: p.id, repo: p.repo };
   const action = str(payload.action);
 
@@ -157,11 +160,12 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
       if (action !== "synchronize") {
         await project(env, p.id).onPullRequest({
           pr: number, task, action: "opened", merged: false, node: node && NODE.test(node) ? node : null, fork: !fromRepo, title: (str(pr.title) ?? "").slice(0, 300),
+          updated_at: str(pr.updated_at) ?? null,
         });
       }
     } else if (action === "closed") {
       await review(env, p.id).onClosed(of, { pr: number, updated_at });
-      await project(env, p.id).onPullRequest({ pr: number, task, action: "closed", merged: pr.merged === true });
+      await project(env, p.id).onPullRequest({ pr: number, task, action: "closed", merged: pr.merged === true, updated_at: str(pr.updated_at) ?? null });
     }
   } else if (event === "issues") {
     // The repo's own issues only (an event names its repo: a fork's goes to no project). Anyone may file;
