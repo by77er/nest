@@ -728,6 +728,8 @@ const app = {
     // A reply's steps behind "Used 4 tools", opened, with one call's input and result; a call of the
     // running turn opened in place.
     { name: "chat-steps", section: "project", path: "/projects/prj_demo/manager", full: false, ready: shown("[data-ds=steps-disclosure]"), after: async (p) => { await p.getByRole("button", { name: "Used 4 tools" }).click(); await p.getByRole("button", { name: /^write_spec tsk_demo7/ }).click(); await p.waitForTimeout(400); } },
+    // The code-block palette (the skill's syntax table): TypeScript, a diff, JSON and a console session.
+    { name: "chat-code", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-code", full: false, ready: shown("[data-ds=code-block] [data-highlighted]") },
     // A heavy reply: a 60-line code block showing its first 20 (then all of it), a table wider than the measure.
     { name: "chat-heavy", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-heavy", full: false, ready: shown("[data-ds=code-block]") },
     { name: "chat-heavy-all", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-heavy", full: false, ready: shown("[data-ds=code-block]"), after: async (p) => { await p.getByRole("button", { name: "Show all 60 lines" }).click(); await p.waitForTimeout(300); } },

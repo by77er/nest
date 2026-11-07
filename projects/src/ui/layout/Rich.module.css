@@ -277,30 +277,50 @@
 
 
 
-/* A highlighted fence (rich/highlight.ts): monochrome first, a role's text shade (AA on the subtle
-   ground in both schemes) only where it helps the eye find structure. Keywords in primary, strings in
-   success, numbers and literals in the warning text shade, comments muted, names by weight. */
-.prose code[data-highlighted] :global(:is(.hljs-keyword, .hljs-selector-tag, .hljs-doctag, .hljs-meta .hljs-keyword)) {
-  color: var(--mantine-color-primary-text);
+/* A highlighted fence (rich/highlight.ts): the syntax tokens (theme.ts `syntax`, the skill's syntax
+   table), the only color inside a code block, each AA on its subtle ground. Names and keys by hue, not
+   weight; anything unclassed stays the text color. */
+.prose code[data-highlighted] :global(:is(.hljs-keyword, .hljs-selector-tag, .hljs-doctag, .hljs-name)) {
+  color: var(--nest-syntax-keyword);
 }
 
-.prose code[data-highlighted] :global(:is(.hljs-string, .hljs-regexp, .hljs-addition, .hljs-attr-value, .hljs-template-tag, .hljs-symbol)) {
-  color: var(--mantine-color-success-text);
+.prose code[data-highlighted] :global(:is(.hljs-string, .hljs-regexp, .hljs-template-tag, .hljs-symbol, .hljs-char)) {
+  color: var(--nest-syntax-string);
 }
 
 .prose code[data-highlighted] :global(:is(.hljs-number, .hljs-literal, .hljs-variable.constant_, .hljs-bullet)) {
-  color: var(--mantine-color-warning-text);
+  color: var(--nest-syntax-number);
 }
 
-.prose code[data-highlighted] :global(.hljs-deletion) {
-  color: var(--mantine-color-danger-text);
+.prose code[data-highlighted] :global(:is(.hljs-title, .hljs-section)) {
+  color: var(--nest-syntax-title);
+}
+
+.prose code[data-highlighted] :global(:is(.hljs-type, .hljs-title.class_)) {
+  color: var(--nest-syntax-type);
+}
+
+.prose code[data-highlighted] :global(:is(.hljs-attr, .hljs-attribute, .hljs-property, .hljs-selector-attr, .hljs-selector-class, .hljs-selector-id)) {
+  color: var(--nest-syntax-attribute);
+}
+
+.prose code[data-highlighted] :global(:is(.hljs-punctuation, .hljs-operator)) {
+  color: var(--nest-syntax-punctuation);
 }
 
 .prose code[data-highlighted] :global(:is(.hljs-comment, .hljs-quote, .hljs-meta)) {
-  color: var(--nest-muted);
+  color: var(--nest-syntax-comment);
   font-style: italic;
 }
 
-.prose code[data-highlighted] :global(:is(.hljs-title, .hljs-section, .hljs-type, .hljs-attr, .hljs-attribute, .hljs-name)) {
-  font-weight: 600;
+.prose code[data-highlighted] :global(.hljs-meta .hljs-keyword) {
+  color: var(--nest-syntax-keyword);
+}
+
+.prose code[data-highlighted] :global(.hljs-addition) {
+  color: var(--nest-syntax-addition);
+}
+
+.prose code[data-highlighted] :global(.hljs-deletion) {
+  color: var(--nest-syntax-deletion);
 }

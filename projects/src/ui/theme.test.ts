@@ -7,7 +7,7 @@ import { darken, DEFAULT_THEME, mergeMantineTheme } from "@mantine/core";
 import { describe, expect, it } from "vitest";
 import { TASK_STATES } from "../tasks";
 import { STATE_COLOR, STATE_LABEL } from "./status";
-import { cssVariablesResolver, terminalWarning, filled, filledHover, fontSizes, headings, layout, lineHeights, motion, neutrals, palette, radius, ROLES, roleText, spacing, theme } from "./theme";
+import { cssVariablesResolver, syntax, type SyntaxToken, terminalWarning, filled, filledHover, fontSizes, headings, layout, lineHeights, motion, neutrals, palette, radius, ROLES, roleText, spacing, theme } from "./theme";
 
 // vitest runs from projects/; the skill is the repo's.
 const SKILL = readFileSync(`${process.cwd()}/../.claude/skills/nest-ui-design/SKILL.md`, "utf8");
@@ -95,6 +95,16 @@ describe("the tokens match the skill", () => {
     expect(full.primaryShade).toEqual({ light: filled.light.shade, dark: filled.dark.shade });
   });
 
+  it("syntax colors: exactly the skill's syntax table, light and dark", () => {
+    const hex = (cell: string) => /#[0-9a-f]{6}/i.exec(cell)![0].toLowerCase();
+    const rows = table("Syntax token");
+    expect(rows.map((r) => r[0]).sort()).toEqual(Object.keys(syntax.light).sort());
+    expect(Object.keys(syntax.dark).sort()).toEqual(Object.keys(syntax.light).sort());
+    for (const [token, light, dark] of rows) expect([syntax.light[token as SyntaxToken], syntax.dark[token as SyntaxToken]], token).toEqual([hex(light!), hex(dark!)]);
+    // Restrained: six hues at most besides the grays (punctuation and comment).
+    expect(new Set(Object.entries(syntax.light).filter(([k]) => k !== "punctuation" && k !== "comment").map(([, v]) => v)).size).toBeLessThanOrEqual(6);
+  });
+
   it("each task status in its semantic role, as the skill's color table says", () => {
     const use = Object.fromEntries(table("Role").map((r) => [r[0], r[3]!.toLowerCase()]));
     for (const s of TASK_STATES) {
@@ -136,6 +146,14 @@ describe("tooltips", () => {
 describe("contrast, in both schemes", () => {
   const vars = cssVariablesResolver(full);
   const schemes = ["light", "dark"] as const;
+
+  it.each(schemes)("%s: every syntax color on a code block's subtle ground (and the surface), as the page's variables", (s) => {
+    for (const [token, color] of Object.entries(syntax[s])) {
+      expect(vars[s][`--nest-syntax-${token}`], token).toBe(color);
+      expect(contrast(color, neutrals[s].subtle), `${token} on subtle`).toBeGreaterThanOrEqual(AA);
+      expect(contrast(color, neutrals[s].surface), `${token} on surface`).toBeGreaterThanOrEqual(AA);
+    }
+  });
 
   it.each(schemes)("%s: text and muted text on the page, the surface and the subtle ground", (s) => {
     const n = neutrals[s];
