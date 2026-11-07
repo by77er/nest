@@ -69,6 +69,15 @@ describe("the Manager page", () => {
     const { user } = renderApp("/projects/prj_one/manager", api);
     const problem = await screen.findByRole("alert", { name: /isn't running/ });
     expect(problem).toHaveTextContent("4 times within an hour");
+    // Said where the composer is too (a phone lands there), with its Restart, and nothing to Stop.
+    const down = await waitFor(() => {
+      const el = document.querySelector("[data-slot=manager-down]");
+      if (!el) throw new Error("not yet");
+      return el as HTMLElement;
+    });
+    expect(down).toHaveTextContent("The manager isn't running");
+    expect(within(down).getByRole("button", { name: "Restart manager" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
     await user.click(within(problem).getByRole("button", { name: "Restart manager" }));
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/manager/restart", body: undefined }]));
     expect(await screen.findByText("Starting")).toBeInTheDocument();

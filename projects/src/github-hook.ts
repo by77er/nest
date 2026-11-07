@@ -160,7 +160,7 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
       if (action !== "synchronize") {
         await project(env, p.id).onPullRequest({
           pr: number, task, action: "opened", merged: false, node: node && NODE.test(node) ? node : null, fork: !fromRepo, title: (str(pr.title) ?? "").slice(0, 300),
-          updated_at: str(pr.updated_at) ?? null,
+          updated_at: str(pr.updated_at) ?? null, reopened: action === "reopened",
         });
       }
     } else if (action === "closed") {

@@ -981,11 +981,11 @@ export class ProjectDO extends DurableObject<Env> {
    * - merged: the PR is marked merged, and its task done once all its PRs are;
    * - closed without merging: detached from its task, noted in its history.
    */
-  async onPullRequest(e: { pr: number; task: string | null; action: "opened" | "closed"; merged: boolean; node?: string | null; fork?: boolean; title?: string | null; updated_at?: string | null }): Promise<void> {
+  async onPullRequest(e: { pr: number; task: string | null; action: "opened" | "closed"; merged: boolean; node?: string | null; fork?: boolean; title?: string | null; updated_at?: string | null; reopened?: boolean }): Promise<void> {
     if (!this.settings()) return;
     // GitHub doesn't order its deliveries (B7): one older than what it last said of the PR is stale. A
     // close is recorded even for a PR no task holds yet, so its late `opened` doesn't attach it as open.
-    if (!this.seePr(e.pr, e.updated_at ?? null, e.action === "closed", e.merged)) return;
+    if (!this.seePr(e.pr, e.updated_at ?? null, e.action === "closed", e.merged, e.reopened === true)) return;
     // Any PR of the repo, a task's or not: the manager's waits on it.
     if (e.action === "closed") {
       for (const w of this.pendingWaits("pr", String(e.pr))) this.prWaitOn(w, e.merged ? { kind: "merged" } : { kind: "closed" });
@@ -1030,12 +1030,6 @@ export class ProjectDO extends DurableObject<Env> {
   async onPrComment(c: PrComment): Promise<{ delivered: "worker" | "pending" | "restarted" | "dropped" | "duplicate"; task: string | null }> {
     const s = this.settings();
     if (!s) return { delivered: "dropped", task: null };
-    // Once per comment, by its own key, in the step that acts on it (B6): a delivery handled again (its
-    // claim released after a later failure, or lapsed) sends nothing twice, queues nothing twice, and
-    // starts no second worker.
-    if (!this.sql.exec("INSERT INTO comments_seen (key, at_ms) VALUES (?, ?) ON CONFLICT (key) DO NOTHING RETURNING key", `${c.kind}:${c.url}`, Date.now()).toArray().length) {
-      return { delivered: "duplicate", task: null };
-    }
     const github: Actor = { kind: "app", what: "github" };
     const had = this.prRow(c.pr);
     // The task: the one the PR is attached to (from its branch or the owner's attach), never a fork's.
@@ -1054,6 +1048,13 @@ export class ProjectDO extends DurableObject<Env> {
       return { delivered: "dropped", task };
     }
     if (s.comments_from.id !== c.author_id) return { delivered: "dropped", task: null };
+    // Once per comment, by its own key (B6), claimed here, where it's decided to act on it (deliver, queue,
+    // restart, or drop it on the record): a delivery handled again (its claim released after a later
+    // failure, or lapsed) does none of that twice. One with no task yet (its PR's opened not seen) isn't
+    // claimed, so a redelivery after it can still act.
+    if (!this.sql.exec("INSERT INTO comments_seen (key, at_ms) VALUES (?, ?) ON CONFLICT (key) DO NOTHING RETURNING key", `${c.kind}:${c.url}`, Date.now()).toArray().length) {
+      return { delivered: "duplicate", task };
+    }
     if (s.comments_from.login !== c.author) this.sql.exec("UPDATE settings SET comments_from_login = ?", c.author);
     const t = this.taskRow(task)!;
     const note = { pr: c.pr, url: c.url, author: c.author };
@@ -1266,14 +1267,15 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
-   * What GitHub says of a PR, as of `updated_at`: recorded when it's at least as new as what it last said
-   * (an `opened` as new as a recorded close is stale too: a reopen is its own, newer, event). Answers
-   * false for a stale one. With no `updated_at` (GitHub didn't say), it can't be ordered: taken as it is.
+   * What GitHub says of a PR, as of `updated_at`: recorded when it's at least as new as what it last said.
+   * Within the same second (GitHub's resolution), the actions' own order decides: an `opened` can't follow
+   * a close (it's older), a `reopened` can, and a close follows either. Answers false for a stale one.
+   * With no `updated_at` (GitHub didn't say), it can't be ordered: taken as it is.
    */
-  private seePr(pr: number, updated_at: string | null, closed: boolean, merged: boolean): boolean {
+  private seePr(pr: number, updated_at: string | null, closed: boolean, merged: boolean, reopened = false): boolean {
     if (updated_at === null) return true;
     const f = this.sql.exec("SELECT updated_at, closed FROM pr_facts WHERE pr = ?", pr).toArray()[0];
-    if (f && ((f.updated_at as string) > updated_at || (f.updated_at === updated_at && f.closed === 1 && !closed))) return false;
+    if (f && ((f.updated_at as string) > updated_at || (f.updated_at === updated_at && f.closed === 1 && !closed && !reopened))) return false;
     this.sql.exec(
       `INSERT INTO pr_facts (pr, updated_at, closed, merged) VALUES (?, ?, ?, ?)
         ON CONFLICT (pr) DO UPDATE SET updated_at = excluded.updated_at, closed = excluded.closed, merged = excluded.merged`,
@@ -1961,14 +1963,15 @@ export class ProjectDO extends DurableObject<Env> {
         }
         break;
       case "agent.exited":
+        // Ended, whatever its role: a stop owed for it (failed or not, a routine run's or a manager's) is done.
+        this.sql.exec("DELETE FROM stops WHERE agent = ?", e.agent);
         if (route.role === "manager" && s.manager === e.agent) {
           this.sql.exec("INSERT OR IGNORE INTO chat (at_ms, sender, text, event_id) VALUES (?, 'app', ?, ?)", Date.now(), `The manager ended (${e.reason ?? "exited"}).`, e.id);
-          // A new one starts, up to a few times an hour (README.md#the-manager-lifecycle).
+          // A new one starts, up to a few times an hour (README.md#the-manager-lifecycle); the ended one's
+          // sandbox is destroyed first (its stop, owed again here).
           this.managerMove({ kind: "ended", agent: e.agent, reason: e.reason ?? "exited" });
         }
         if (route.role === "worker") this.workerExited(e.agent, e.reason, e.text);
-        // Ended, whatever its role: a stop owed for it (failed or not, a routine run's or a manager's) is done.
-        this.sql.exec("DELETE FROM stops WHERE agent = ?", e.agent);
         this.sql.exec("DELETE FROM agent_secrets WHERE agent = ?", e.agent);
         break;
       case "agent.ask":
@@ -3139,6 +3142,7 @@ export class ProjectDO extends DurableObject<Env> {
     const times = [
       min(`SELECT MIN(t) AS t FROM (
         SELECT manager_next_ms AS t FROM settings WHERE manager_next_ms IS NOT NULL AND attached_ms IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM stops WHERE reason = 'manager replaced' AND failed_ms IS NULL)
         UNION ALL SELECT attach_next_ms FROM settings WHERE attach_next_ms IS NOT NULL
         UNION ALL SELECT start_next_ms FROM tasks WHERE state = 'assigned' AND start_next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM stops WHERE failed_ms IS NULL
@@ -3264,13 +3268,20 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT pr, am_owed FROM task_prs WHERE am_next_ms IS NOT NULL AND am_next_ms <= ?", now).toArray()) {
       if (r.am_owed === "disable" || repoReady) await this.prAutoMerge(nest, r.pr as number);
     }
-    // The manager starts once the repo is attached (README.md#flows).
+    // The manager starts once the repo is attached (README.md#flows), and a replaced one only after the
+    // old one's stop has been tried (README.md#the-manager-lifecycle): two managers never run at once,
+    // unless nest refuses that stop (then the board answers only the new one).
     const a = this.settingsRow()!;
-    if (a.attached_ms !== null && a.manager_next_ms !== null && (a.manager_next_ms as number) <= now) await this.startManager(nest);
+    const managerDue = a.attached_ms !== null && a.manager_next_ms !== null && (a.manager_next_ms as number) <= now;
+    const replacing = () => this.sql.exec("SELECT 1 FROM stops WHERE reason = 'manager replaced' AND failed_ms IS NULL").toArray().length > 0;
+    const held = managerDue && replacing();
+    if (managerDue && !held) await this.startManager(nest);
     for (const r of this.sql.exec("SELECT id FROM tasks WHERE state = 'assigned' AND start_next_ms IS NOT NULL AND start_next_ms <= ? ORDER BY ord", now).toArray()) {
       await this.startWorker(nest, r.id as string);
     }
     for (const r of this.sql.exec("SELECT agent FROM stops WHERE failed_ms IS NULL AND next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
+    // The old manager's stop went (or failed for good): its successor starts in this drain.
+    if (held && !replacing()) this.again = true;
     // Ended rows past their queue's keep (README.md#outboxes): messages sent or failed a week ago, stops failed a month ago.
     const msgs = pruneBefore(OUTBOX.messages, now);
     if (msgs !== null) this.sql.exec("DELETE FROM messages WHERE next_ms IS NULL AND COALESCE(ended_ms, at_ms) < ?", msgs);
@@ -3434,10 +3445,17 @@ export class ProjectDO extends DurableObject<Env> {
     return moved;
   }
 
+  /**
+   * Start (or brief again) the manager, as start `n`. Its generation is `manager_starts` as read here:
+   * every move of the lifecycle (`managerMove`: an exit, the owner's Restart) bumps it, so a start that
+   * lands after one (across its awaits) is stale. It writes nothing then, and an agent it made goes.
+   */
   private async startManager(nest: Nest): Promise<void> {
     const s = this.settings()!;
-    const n = (this.settingsRow()!.manager_starts as number) + 1;
+    const base = this.settingsRow()!.manager_starts as number;
+    const n = base + 1;
     const labels = { project: s.id, role: "manager", start: String(n) };
+    const current = () => this.settingsRow()?.manager_starts === base;
     try {
       const key = `${s.id}/manager/${n}`;
       const frozen = await this.frozenEgress(nest, key, "manager");
@@ -3445,14 +3463,25 @@ export class ProjectDO extends DurableObject<Env> {
       const spec = await this.sandboxSpec(nest, "manager", key);
       const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
+      if (!current()) {
+        // Superseded while it was being made: it goes, unless it's somehow the manager now.
+        if (this.settings()?.manager !== agent) this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, NULL, 'manager replaced', ?)", agent, Date.now());
+        return;
+      }
       this.sql.exec("UPDATE settings SET manager = ?", agent);
       this.trackLayer(agent, "manager", frozen.rev);
       this.recordHolder(agent, "manager", spec.names);
       await nest.postInbox(agent, managerBrief(s) + spec.brief, { requestId: `${s.id}/manager/${n}/brief` });
-      this.sql.exec("UPDATE settings SET manager_next_ms = NULL, manager_attempts = 0, manager_error = NULL, manager_starts = ?", n);
+      // Done only if nothing moved meanwhile (it exited during its brief, the owner restarted it): else
+      // that move's own start stands.
+      const done = this.sql.exec(
+        "UPDATE settings SET manager_next_ms = NULL, manager_attempts = 0, manager_error = NULL, manager_starts = ? WHERE manager_starts = ? AND manager = ?",
+        n, base, agent,
+      ).rowsWritten;
       // The owner's messages that waited for a manager go now, not at their next retry.
-      this.sql.exec("UPDATE chat SET next_ms = ? WHERE next_ms IS NOT NULL", Date.now());
+      if (done) this.sql.exec("UPDATE chat SET next_ms = ? WHERE next_ms IS NOT NULL", Date.now());
     } catch (e) {
+      if (!current()) return;
       // Made, but its brief refused for good (nest has ended it, or never will take it): replaced.
       const made = this.settings()!.manager;
       if (made && e instanceof NestError && e.permanent && (e.status === 404 || e.status === 409 || e.status === 410)) {

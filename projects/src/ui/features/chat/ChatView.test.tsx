@@ -319,6 +319,24 @@ describe("the chat", () => {
     }
   });
 
+  it("a manager that ended says so at the composer, with Restart, and offers no Stop even with a turn's stream left", async () => {
+    vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Half a thought" })]));
+    const api = new FakeApi();
+    api.manager = { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited)." };
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    const down = await waitFor(() => {
+      const el = c.querySelector("[data-slot=manager-down]");
+      if (!el) throw new Error("not yet");
+      return el as HTMLElement;
+    });
+    expect(down).toHaveTextContent("The manager isn't running");
+    expect(within(c).queryByRole("button", { name: "Stop" })).toBeNull();
+    await user.click(within(down).getByRole("button", { name: "Restart manager" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/manager/restart", body: undefined }]));
+    await waitFor(() => expect(c.querySelector("[data-slot=manager-down]")).toBeNull());
+  });
+
   it("with no turn running there's no stream and no Stop", async () => {
     vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Done." }), ev("turn_completed", { stop_reason: "end_turn" })]));
     renderApp("/projects/prj_one/manager", new FakeApi());

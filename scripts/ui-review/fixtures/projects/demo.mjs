@@ -288,7 +288,7 @@ const RICH = [
   const { messages: allMessages, pages: historyPages } = trace(now, { busy: variant === "turn-busy" });
   // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
   // "chat-empty" is a new conversation: no turn running either (its starters show); "chat-heavy" ends on its reply; "chat-sending" ends on the owner's messages being sent.
-  const traceMessages = variant === "connecting" || variant === "chat-empty" || variant === "chat-heavy" || variant === "chat-code" || variant === "chat-sending" ? [] : allMessages;
+  const traceMessages = variant === "connecting" || variant === "chat-empty" || variant === "chat-heavy" || variant === "chat-code" || variant === "chat-sending" || variant === "manager-ended" ? [] : allMessages;
   const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length, state: "ready" }, { ...other, needs_you: 0, state: "ready" },
     // One still being created (README.md#creating-a-project): nothing to open yet.
     ...(variant === "creating" ? [{ id: "prj_new4k2", name: "Thingamajigs", repo: "by77er/thingamajigs", created_ms: now - 20_000, needs_you: 0, state: "pending" }] : [])];

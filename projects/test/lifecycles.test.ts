@@ -64,6 +64,27 @@ describe("a PR comment handled again (B6)", () => {
     expect((await task(p, t.id)).history.filter((h: { action: string }) => h.action === "pr_comment")).toHaveLength(1);
   });
 
+  it("one that came before its PR was seen (no task yet) isn't used up: delivered again after, it acts", async () => {
+    const p = await newProject();
+    const t = await working(p);
+    const url = `https://github.com/${p.repo}/pull/77#issuecomment-${rand()}`;
+    await deliverGithub("issue_comment", comment(p, 77, url));
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 77, sha: shaOf("i"), action: "opened", ref: `task/${t.id}` }));
+    await deliverGithub("issue_comment", comment(p, 77, url));
+    await stub(p).drain();
+    expect(fake.inbox.filter((m) => m.agent === t.worker && m.text.includes("Rename the flag."))).toHaveLength(1);
+  });
+
+  it("a comment's key is pruned after 30 days", async () => {
+    const p = await newProject();
+    await runInDurableObject(stub(p), (_o, st) => {
+      st.storage.sql.exec("INSERT INTO comments_seen (key, at_ms) VALUES ('comment:old', ?), ('comment:new', ?)", Date.now() - 31 * 86_400_000, Date.now() - 86_400_000);
+    });
+    await stub(p).drain();
+    const keys = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT key FROM comments_seen WHERE key LIKE 'comment:%' ORDER BY key").toArray().map((r) => r.key));
+    expect(keys).toEqual(["comment:new"]);
+  });
+
   it("starts one worker again, not one per copy, and queues the comment once", async () => {
     const p = await newProject();
     const t = await working(p);
@@ -118,6 +139,17 @@ describe("GitHub's deliveries out of order (B7)", () => {
     await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 76, sha: s, action: "closed", merged: true, ref: `task/${t.id}`, updated_at: at(30) }));
     await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 76, sha: s, action: "opened", ref: `task/${t.id}`, updated_at: at(30) }));
     expect((await task(p, t.id)).prs).toEqual([]);
+  });
+
+  it("a close and a reopen within the same second: the reopen stands (the actions' own order)", async () => {
+    const p = await newProject();
+    const t = await working(p);
+    const s = shaOf(`j${rand()}`);
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 78, sha: s, action: "opened", ref: `task/${t.id}`, updated_at: at(40) }));
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 78, sha: s, action: "closed", merged: false, ref: `task/${t.id}`, updated_at: at(41) }));
+    expect((await task(p, t.id)).prs).toEqual([]);
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 78, sha: s, action: "reopened", ref: `task/${t.id}`, updated_at: at(41) }));
+    expect((await task(p, t.id)).prs).toMatchObject([{ number: 78, state: "open" }]);
   });
 
   it("a close older than the reopen already seen changes nothing", async () => {
@@ -254,6 +286,105 @@ describe("a manager that ended (B11)", () => {
     expect((await settingsOf(p)).manager).toBeTruthy();
     expect(fake.agents.size).toBe(agents + 1);
     expect((await api(token, "GET", `/api/projects/${p.id}/manager`)).body.phase).toBe("running");
+  });
+
+  it("an exit during the new manager's brief leaves a start owed, not a project with no manager (B11-a)", async () => {
+    const p = await newProject();
+    let release!: () => void;
+    const hold = { match: /^POST \/v1\/agents\/[^/]+\/inbox$/, release: new Promise<void>((r) => (release = r)), reached: false };
+    fake.holds.push(hold);
+    const restarting = api(token, "POST", `/api/projects/${p.id}/manager/restart`);
+    for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(hold.reached).toBe(true);
+    const briefed = (await settingsOf(p)).manager as string;
+    expect(briefed).toBeTruthy();
+    await exited(briefed);
+    release();
+    await restarting;
+    const s = await settingsOf(p);
+    expect(s.manager).toBeNull();
+    expect(s.manager_next_ms).not.toBeNull();
+    await startDue(p);
+    const next = (await settingsOf(p)).manager as string;
+    expect(next).toBeTruthy();
+    expect(next).not.toBe(briefed);
+  });
+
+  it("a second Restart during the first one's brief: the second stands, and a manager starts (B11-a)", async () => {
+    const p = await newProject();
+    let release!: () => void;
+    const hold = { match: /^POST \/v1\/agents\/[^/]+\/inbox$/, release: new Promise<void>((r) => (release = r)), reached: false };
+    fake.holds.push(hold);
+    const first = api(token, "POST", `/api/projects/${p.id}/manager/restart`);
+    for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+    const x = (await settingsOf(p)).manager as string;
+    const second = api(token, "POST", `/api/projects/${p.id}/manager/restart`);
+    await new Promise((r) => setTimeout(r, 50));
+    release();
+    await Promise.all([first, second]);
+    await startDue(p);
+    await startDue(p);
+    const s = await settingsOf(p);
+    expect(s.manager).toBeTruthy();
+    expect(s.manager).not.toBe(x);
+    expect(s.manager_next_ms).toBeNull();
+    expect(fake.callsTo("POST", new RegExp(`^/v1/agents/${x}/stop$`)).length).toBeGreaterThan(0);
+  });
+
+  it("the owner's Restart while an automatic restart's agent is being made: that agent goes, and the Restart's own start stands (B11-a)", async () => {
+    const p = await newProject();
+    await exited(p.manager);
+    // The automatic restart's create is held; the owner restarts meanwhile.
+    let release!: () => void;
+    const hold = { match: /^POST \/v1\/agents$/, release: new Promise<void>((r) => (release = r)), reached: false };
+    fake.holds.push(hold);
+    await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE stops SET next_ms = 0"); });
+    const starting = (async () => { await stub(p).drain(); await startDue(p); })();
+    for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(hold.reached).toBe(true);
+    const before = new Set(fake.agents.keys());
+    await runInDurableObject(stub(p), (o) => (o as unknown as { managerMove(e: { kind: "restart" }): boolean }).managerMove({ kind: "restart" }));
+    release();
+    await starting;
+    const made = [...fake.agents.keys()].filter((a) => !before.has(a));
+    expect(made.length).toBeGreaterThan(0);
+    const stale = made[0]!;
+    expect((await settingsOf(p)).manager).not.toBe(stale);
+    await startDue(p);
+    await startDue(p);
+    const s = await settingsOf(p);
+    expect(s.manager).toBeTruthy();
+    expect(s.manager).not.toBe(stale);
+    expect(s.manager_next_ms).toBeNull();
+  });
+
+  it("the new manager starts only once the old one's stop has gone through (B11-b), with no busy alarm meanwhile", async () => {
+    const p = await newProject();
+    const stopOld = new RegExp(`^POST /v1/agents/${p.manager}/stop$`);
+    fake.fail(stopOld, 503, { retryable: true, times: 1000 });
+    await api(token, "POST", `/api/projects/${p.id}/manager/restart`);
+    await startDue(p);
+    expect((await settingsOf(p)).manager).toBeNull();
+    const alarm = await runInDurableObject(stub(p), (_o, st) => st.storage.getAlarm());
+    expect(alarm).toBeGreaterThan(Date.now() + 1_000);
+    fake.failures = fake.failures.filter((f) => f.match !== stopOld);
+    await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE stops SET next_ms = 0 WHERE failed_ms IS NULL"); });
+    await stub(p).drain();
+    const next = (await settingsOf(p)).manager as string;
+    expect(next).toBeTruthy();
+    expect(fake.agents.get(p.manager)!.ended).toBe(true);
+  });
+
+  it("the replaced manager's pending waits end with it, unannounced", async () => {
+    const p = await newProject();
+    const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "w" })).body;
+    const old = await signer.sign(agentClaims("board", p.manager, { project: p.id, role: "manager", start: "1" }));
+    expect((await callTool("board", old, "await_task", { task: t.id, states: ["done"], timeout_s: 600 })).result?.isError).toBeFalsy();
+    expect((await api(token, "GET", `/api/projects/${p.id}/waits`)).body.pending).toHaveLength(1);
+    await api(token, "POST", `/api/projects/${p.id}/manager/restart`);
+    const w = (await api(token, "GET", `/api/projects/${p.id}/waits`)).body;
+    expect(w.pending).toEqual([]);
+    expect(w.recent).toEqual([expect.objectContaining({ outcome: "ended", detail: "the manager was replaced" })]);
   });
 
   it("the board is the current manager's alone: a replaced one's calls are refused, the new one's work", async () => {

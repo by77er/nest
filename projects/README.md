@@ -192,11 +192,16 @@ The owner's request (2026-11-06), after the state-machine sweep (B11): a manager
 
   A new one starts with backoff, up to 3 times an hour (`MANAGER_RESTARTS`). Past that, nothing is started: the page shows it ended, and the owner restarts it.
 - **The replaced manager:**
-  - its sandbox is destroyed (a stop owed, `manager replaced`);
+  - its sandbox is destroyed (a stop owed, `manager replaced`), and its successor starts only once that stop has been tried. With nest refusing it for good, the successor starts anyway (the stop is failed, shown on the Network page);
   - its pending waits end, unannounced, since the new one never made them;
-  - the next start gets a start number of its own, so its creates' keys aren't the old one's.
+  - the next start gets a start number of its own, so its creates' keys aren't the old one's;
+  - **it loses the board:** the board's tools answer only `settings.manager`. A replaced manager still holds its token and labels for a while (its stop owed, or refused), and gets 403.
+- **A start is of one generation.** `manager_starts` as read when it began. Every move bumps it (an exit, the owner's Restart), so a start that lands after one is stale:
+  - an agent it made goes;
+  - its final write (manager started, nothing owed) applies only to its own generation;
+  - an exit during its brief, or a second Restart, leaves that move's start owed.
 - **The owner's Restart** (`POST /api/projects/:id/manager/restart`; **Restart manager** on the page when it ended or errored) stops the current manager and starts a new one now. Asking while one is already starting changes nothing.
-- **Chat during a restart.** The owner's chat messages wait for a manager ("Retrying…"), and go as soon as one has started. Each change is noted in the chat.
+- **Chat during a restart.** The owner's chat messages wait for a manager ("Retrying…"), and go as soon as one has started. Each change is noted in the chat. While the manager has ended or errored, the composer says so ("The manager isn't running", with Restart manager), where a phone lands, and offers no Stop.
 - An exit of a manager that isn't the current one changes nothing.
 
 ## Creating a project
@@ -215,6 +220,9 @@ The owner's request (2026-11-06), after the sweep (B10): creating a project used
 - **Resumed by the alarm.**
   - If the Worker's request fails or dies, DirectoryDO's alarm resumes the create: after a minute, then with backoff, as an outbox row (`src/outbox.ts`).
   - A create that can't be finished (8 attempts, or a body that can't be read) is removed, and its repo is free again.
+- **A project's object acts only once DirectoryDO lists it ready** (`settings.listed_ms`, asked until it does):
+  - while the create is pending, its alarm checks again every 30 s and nothing is drained;
+  - one removed (its `init` succeeded, the rest didn't) leaves its object inert, its settings gone: no attach, no manager.
 
 ## Not decided here
 
@@ -355,7 +363,8 @@ The owner's request (2026-11-03): "PRs should be attachable to tasks."
 - **Review and auto-merge:** every PR is reviewed already. With auto-merge on, every attached PR gets it: the owner's, the manager's, the worker's or the branch's, but only once GitHub has said it's from the repo itself and given its node id. A fork's PR never gets it, and neither does one whose head repo GitHub no longer names.
 - **The live worker is told** when PRs are attached or detached ([task changes](#task-changes)).
 - **GitHub's order, not its delivery's** (B7). GitHub doesn't order its deliveries, so ProjectDO keeps each PR's latest `updated_at`, whether attached or not (`pr_facts`).
-  - An `opened` or `closed` older than what's recorded is stale, and ignored. So is an `opened` as new as a recorded close: a reopen is its own, newer event.
+  - An `opened` or `closed` older than what's recorded is stale, and ignored.
+  - Within the same second (GitHub's resolution), the actions' own order decides: an `opened` can't follow a close, a `reopened` can, and a close follows either.
   - A merged PR's `closed` arriving before its `opened` therefore leaves the late `opened` attaching nothing.
   - An attach is refused for a PR GitHub has said is closed, which covers an attach that raced its merge. The owner's attach records what its own read of GitHub said, so a reopened PR attaches.
 
@@ -392,7 +401,9 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
   - **A merged PR, a closed or detached one, or a task that's over:** the comment is dropped and recorded on the task (`pr_comment_dropped`, with why). A comment after the work is over is the owner's to raise with the manager in chat; sending it on would restart work no one asked to restart.
   - Comments still queued are dropped (recorded) when the task ends, its worker's start fails, or the worker exits before its brief: never kept for a later worker.
 - Each delivery is recorded on the task (`pr_comment`, `revise`).
-- **Once per comment** (B6), by its own key (its kind and URL, `comments_seen`, kept 30 days), in the step that acts on it. A delivery handled again acts once: its claim was released after a later step failed, or lapsed, or it came under a new delivery id. So it never sends twice, queues twice, or starts a second worker.
+- **Once per comment** (B6), by its own key (its kind and URL, `comments_seen`, kept 30 days). It's claimed where it's decided to act on it (deliver, queue, restart, or drop it on the record), in that step.
+  - A delivery handled again acts once: its claim was released after a later step failed, or lapsed, or it came under a new delivery id. So it never sends twice, queues twice, or starts a second worker.
+  - One with no task yet (its PR's `opened` not seen) isn't claimed, so its redelivery after can act.
 - **Open:** route GitHub's events by `repository.id` and the installation id recorded at attach, not by `full_name`, so a renamed namespace that someone registers again can't reach the project (a follow-up).
 
 ## Triage

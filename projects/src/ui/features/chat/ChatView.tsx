@@ -13,7 +13,7 @@ import { IconAlertTriangle, IconArrowDown, IconArrowUp, IconCalendarEvent, IconC
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { human } from "../../../waits";
 import { api } from "../../api/client";
-import { useChat, useInterruptManager, usePostChat, useRetryChat, useWaits } from "../../api/queries";
+import { useChat, useInterruptManager, useManager, usePostChat, useRestartManager, useRetryChat, useWaits } from "../../api/queries";
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import {
@@ -455,7 +455,12 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   };
 
   const items = groupLog(messages);
-  const running = !!live;
+  // The manager ended or errored (README.md#the-manager-lifecycle): said where the composer is (a phone
+  // lands here, far below the page's notice), with its Restart, and nothing to Stop.
+  const manager = useManager(projectId);
+  const restart = useRestartManager(projectId);
+  const down = manager.data?.phase === "ended" || manager.data?.phase === "errored";
+  const running = !!live && !down;
   const streamSteps = live?.steps ?? (held ? (heldEnd?.steps ?? held.steps) : []);
   const replySteps = stepsBySeq(messages, finished);
   const stream = running || streamSteps.length > 0;
@@ -549,7 +554,16 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
             <ComposerBox
               bar={
                 <>
-                  {replyWait ? (
+                  {down ? (
+                    <Row gap="xs" wrap="nowrap" data-slot="manager-down">
+                      <Text fz="xs" c="warning">
+                        The manager isn&apos;t running
+                      </Text>
+                      <Button variant="subtle" size="compact-sm" loading={restart.isPending} onClick={() => restart.mutate()}>
+                        Restart manager
+                      </Button>
+                    </Row>
+                  ) : replyWait ? (
                     <Row gap="xs" wrap="nowrap" data-slot="reply-wait">
                       <Text component="span" c="dimmed" display="inline-flex">
                         <IconHourglass size={icon.sm} aria-hidden />
