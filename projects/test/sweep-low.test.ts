@@ -65,6 +65,9 @@ describe("B12: an exit that overtakes its create's answer", () => {
     expect(after).toMatchObject({ state: "stalled", assignee: agent });
     expect(fake.inbox.filter((m) => m.agent === agent)).toEqual([]);
     expect(await inProject(p, (sql) => sql.exec("SELECT worker_live FROM tasks WHERE id = ?", t.id).one().worker_live)).toBe(0);
+    // Its secret holdings and layer went with it (the Secrets page lists no dead worker).
+    expect(await inProject(p, (sql) => sql.exec("SELECT COUNT(*) AS n FROM agent_secrets WHERE agent = ?", agent).one().n)).toBe(0);
+    expect(await inProject(p, (sql) => sql.exec("SELECT COUNT(*) AS n FROM layers WHERE agent = ?", agent).one().n)).toBe(0);
   });
 
   it("a reviewer: its exit is an attempt spent once the job learns it", async () => {
@@ -122,6 +125,27 @@ describe("B14: an attach owed while one runs", () => {
     // The retry's attach, then the one owed while it ran (not erased by the first one's success).
     expect(attaches() - before).toBe(2);
   });
+
+  it("stays owed when the running one fails for good", async () => {
+    const p = await newProject();
+    const attaches = () => fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/clients/self/github-token"
+      && c.body?.repo === p.repo && JSON.stringify(c.body?.permissions) === JSON.stringify(PERMISSIONS.attach)).length;
+    const before = attaches();
+    let release!: () => void;
+    const hold = { match: /^POST \/v1\/clients\/self\/github-token$/, release: new Promise<void>((r) => (release = r)), reached: false };
+    fake.holds.push(hold);
+    // The held token call is then refused for good (a 403): the running attach fails permanently.
+    fake.fail(/^POST \/v1\/clients\/self\/github-token$/, 403);
+    const retrying = api(token, "POST", `/api/projects/${p.id}/attach`);
+    await until(() => hold.reached);
+    await projectStub(p).appIdLearned(999_002);
+    release();
+    await retrying;
+    await projectStub(p).drain();
+    // The attach owed meanwhile still ran (the failure's "for good" didn't clear it), and succeeded.
+    expect(attaches() - before).toBe(2);
+    expect(await inProject(p, (sql) => sql.exec("SELECT attach_error FROM settings").one().attach_error)).toBeNull();
+  });
 });
 
 describe("B15: two catalog syncs at once", () => {
@@ -171,6 +195,8 @@ describe("B20: terminal history-like rows pruned by age", () => {
         sql.exec("INSERT INTO routine_runs (id, routine, n, trigger, state, outcome, max_turns, created, queued_ms, ended_ms) VALUES (?, 'rtn_x', 1, 'manual', 'ended', 'done', 3, '[]', 0, ?)", id, ended);
         sql.exec("INSERT INTO run_turns (run, event) VALUES (?, 'evt')", id);
       }
+      // An old run whose clean-up by labels is still owed: kept (its row is what finds its agents).
+      sql.exec("INSERT INTO routine_runs (id, routine, n, trigger, state, outcome, max_turns, created, queued_ms, ended_ms, cleanup_next_ms) VALUES ('run_cleanup', 'rtn_x', 1, 'manual', 'ended', 'failed', 3, '[]', 0, ?, ?)", now - ENDED_RUNS_KEEP_MS - 1, now);
       sql.exec("UPDATE history SET at_ms = 0 WHERE task = ?", t.id);
     });
     await runInDurableObject(projectStub(p), (inst: unknown) => (inst as { prune(now: number): void }).prune(Date.now()));
@@ -178,7 +204,7 @@ describe("B20: terminal history-like rows pruned by age", () => {
       const col = (q: string) => sql.exec(q).toArray().map((r) => Object.values(r)[0]);
       expect(col("SELECT event_id FROM errors ORDER BY event_id")).toEqual(["e-new", "e-stop"]);
       expect(col("SELECT id FROM proposals ORDER BY id")).toEqual(["prp_new", "prp_wait"]);
-      expect(col("SELECT id FROM routine_runs ORDER BY id")).toEqual(["run_new"]);
+      expect(col("SELECT id FROM routine_runs ORDER BY id")).toEqual(["run_cleanup", "run_new"]);
       // The recent run's turns stay a day (a redelivered turn); the old run's went with it.
       expect(col("SELECT run FROM run_turns ORDER BY run")).toEqual(["run_new"]);
       expect(sql.exec("SELECT COUNT(*) AS n FROM history WHERE task = ?", t.id).one().n).toBeGreaterThan(0);
@@ -193,9 +219,12 @@ describe("B20: terminal history-like rows pruned by age", () => {
     await inReview(p, (sql) => {
       sql.exec("UPDATE jobs SET state = 'done', updated_ms = ? WHERE pr = 9", old);
       sql.exec("INSERT INTO jobs (pr, sha, state, attempts, created_ms, updated_ms) VALUES (8, ?, 'superseded', 0, 0, ?), (8, ?, 'done', 0, 0, ?)", sha(), old, sha(), Date.now());
+      // An old ended job whose check's completion is still owed to GitHub: kept.
+      sql.exec("INSERT INTO jobs (pr, sha, state, attempts, check_run, created_ms, updated_ms) VALUES (7, ?, 'closed', 0, 4711, 0, ?)", sha(), old);
+      sql.exec("INSERT INTO check_updates (check_run, body, next_ms) VALUES (4711, '{}', ?)", Date.now());
     });
     await runInDurableObject(reviewStub(p), (inst: unknown) => (inst as { prune(now: number): void }).prune(Date.now()));
     const left = await inReview(p, (sql) => sql.exec("SELECT pr, state FROM jobs ORDER BY pr").toArray());
-    expect(left).toEqual([{ pr: 8, state: "done" }, { pr: 9, state: "done" }]);
+    expect(left).toEqual([{ pr: 7, state: "closed" }, { pr: 8, state: "done" }, { pr: 9, state: "done" }]);
   });
 });

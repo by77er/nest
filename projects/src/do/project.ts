@@ -3324,7 +3324,9 @@ export class ProjectDO extends DurableObject<Env> {
         // It exited before the task named it (its exit overtook the create's answer): handled now.
         const early = this.sql.exec("DELETE FROM early_exits WHERE agent = ? RETURNING reason", agent).toArray()[0];
         if (early) {
+          // As `onEvent`'s exit does: its layer, and the secrets it held (just recorded), go with it.
           this.workerExited(agent, (early.reason as string | null) ?? undefined);
+          this.sql.exec("DELETE FROM agent_secrets WHERE agent = ?", agent);
           return;
         }
       }
