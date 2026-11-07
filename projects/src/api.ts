@@ -40,15 +40,27 @@ async function body<S extends z.ZodType>(req: Request, schema: S): Promise<{ ok:
 async function sync(env: Env): Promise<Response> {
   const nest = nestFrom(env);
   if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
-  const repos = await directory(env).repos();
   try {
-    const r = await syncCatalog(nest, env.PUBLIC_BASE_URL, repos);
-    await directory(env).recordSync({ written: r.written, repos });
-    return json({ ...r, repos });
+    // Two syncs at once (two projects created together) may write from different snapshots, the older
+    // landing last and dropping the newer repo. So each writes, then reads the repos again, and writes
+    // again while they changed: the set only grows, and every sync's last write follows its last read,
+    // so the catalog ends with every repo. A few rounds at most (each round is a project created meanwhile).
+    for (let round = 0; ; round++) {
+      const repos = await directory(env).repos();
+      const r = await syncCatalog(nest, env.PUBLIC_BASE_URL, repos);
+      const now = await directory(env).repos();
+      if (now.join("\n") === repos.join("\n") || round >= SYNC_ROUNDS) {
+        await directory(env).recordSync({ written: r.written, repos });
+        return json({ ...r, repos });
+      }
+    }
   } catch (e) {
     return err(502, `the catalog sync failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 }
+
+/** A sync writes again at most this many times while the repos change under it. */
+const SYNC_ROUNDS = 5;
 
 const ID = {
   project: /^prj_[a-z0-9]+$/, task: /^tsk_[a-z0-9]+$/, ask: /^ask_[A-Za-z0-9]+$/,
@@ -126,8 +138,12 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
         if (!g.ok) return err(g.status, g.error);
         if (!g.value.workflows) return err(409, "the app's grant doesn't allow workflows on push tokens: the operator must set github_push.workflows in its grant");
       }
+      // All or nothing: ProjectDO's part first (its refusals, a GitHub lookup among them, come before it
+      // writes anything), then ReviewDO's, only if that went through.
+      const updated = await p.updateSettings(rest);
+      if (!updated.ok) return done(updated);
       if (max_concurrent_reviews !== undefined) await review(env, pid).setMaxConcurrent(max_concurrent_reviews);
-      return done(await withReviews(env, pid, await p.updateSettings(rest)));
+      return done(await withReviews(env, pid, updated));
     }
     case "GET secrets": {
       // Metadata only: the app's, with nest's last injection and size; never a value.

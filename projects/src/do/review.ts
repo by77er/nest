@@ -19,6 +19,7 @@ import { backoff, NestError, nestFrom, type Nest } from "../nest";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { toolOf } from "../tools";
+import { EARLY_EXITS_KEEP_MS, PRUNE_EVERY_MS, REVIEW_JOBS_KEEP_MS } from "../retention";
 import { type JobEvent, type JobState, jobTransition, REVIEW_DEADLINE_MS } from "../review-job";
 
 export type { JobState };
@@ -96,6 +97,11 @@ const MIGRATIONS = [
     // attempt spent. Jobs running before this step get one at the next drain.
     "ALTER TABLE jobs ADD COLUMN deadline_ms INTEGER",
   ],
+  [
+    // A reviewer's exit that came before its job named it (the exit overtook the create's answer):
+    // matched by its id once the job learns it (pruned after a day).
+    "CREATE TABLE early_exits (agent TEXT PRIMARY KEY, reason TEXT, at_ms INTEGER NOT NULL)",
+  ],
 ] as const;
 
 type Row = Record<string, SqlStorageValue>;
@@ -103,6 +109,8 @@ type Row = Record<string, SqlStorageValue>;
 export class ReviewDO extends DurableObject<Env> {
   private draining: Promise<void> | null = null;
   private again = false;
+  /** When this instance last pruned (in memory: a restart prunes at its first drain). */
+  private prunedMs = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -293,6 +301,8 @@ export class ReviewDO extends DurableObject<Env> {
   /** nest's `agent.exited` for a reviewer: without a verdict, it's started again, up to MAX_RETRIES times. */
   async onAgentExited(agent: string, reason?: string): Promise<void> {
     const j = this.sql.exec("SELECT * FROM jobs WHERE agent = ?", agent).toArray()[0];
+    // No job names it yet: kept for the job's start, which learns it from the create's answer.
+    if (!j) this.sql.exec("INSERT OR IGNORE INTO early_exits (agent, reason, at_ms) VALUES (?, ?, ?)", agent, reason ?? null, Date.now());
     if (!j || j.state !== "running" || j.verdict !== null) return;
     this.spendAttempt(j, `the reviewer exited without a verdict (${(reason ?? "exited").slice(0, 100)})`, "exited");
     await this.arm();
@@ -429,7 +439,23 @@ export class ReviewDO extends DurableObject<Env> {
     return this.draining;
   }
 
+  /**
+   * Ended jobs older than REVIEW_JOBS_KEEP_MS, except an open PR's current head's (a re-run of its check
+   * needs it), and early exits no start claimed (src/retention.ts).
+   */
+  prune(now: number): void {
+    this.prunedMs = now;
+    this.sql.exec(
+      `DELETE FROM jobs WHERE state IN ('done', 'failed', 'superseded', 'closed') AND updated_ms < ?
+        AND NOT EXISTS (SELECT 1 FROM prs WHERE prs.pr = jobs.pr AND prs.sha = jobs.sha AND prs.open = 1)
+        AND NOT EXISTS (SELECT 1 FROM check_updates c WHERE c.check_run = jobs.check_run)`,
+      now - REVIEW_JOBS_KEEP_MS,
+    );
+    this.sql.exec("DELETE FROM early_exits WHERE at_ms < ?", now - EARLY_EXITS_KEEP_MS);
+  }
+
   private async drainOnce(): Promise<void> {
+    if (Date.now() - this.prunedMs >= PRUNE_EVERY_MS) this.prune(Date.now());
     // Ended reviews to the project (nothing of nest's or GitHub's needed): each until ProjectDO took it.
     const project = this.setting("project");
     for (const e of project ? this.sql.exec("SELECT * FROM ended WHERE next_ms <= ?", Date.now()).toArray() : []) {
@@ -511,14 +537,23 @@ export class ReviewDO extends DurableObject<Env> {
         // The project's secrets for reviewers, frozen per attempt (ProjectDO keeps them).
         const spec = await projectStub(this.env, project).reviewerSpec(key);
         agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, key, spec.extras);
-        await directory(this.env).recordAgent({ agent, project, role: "reviewer", task: null, pr });
-        // Its holdings and live layer: a secret changed or removed later reaches it too.
-        await projectStub(this.env, project).reviewerStarted(agent, key);
         if (!current()) {
           this.oweStop(agent, "superseded");
           return;
         }
+        // Named on the job in the step the create's answer came, before any other await, so its exit finds it.
         this.sql.exec("UPDATE jobs SET agent = ? WHERE pr = ? AND sha = ?", agent, pr, sha);
+        await directory(this.env).recordAgent({ agent, project, role: "reviewer", task: null, pr });
+        // Its holdings and live layer: a secret changed or removed later reaches it too.
+        await projectStub(this.env, project).reviewerStarted(agent, key);
+        // It exited before the job named it: an attempt spent now, as any exit without a verdict.
+        const early = this.sql.exec("DELETE FROM early_exits WHERE agent = ? RETURNING reason", agent).toArray()[0];
+        if (early) {
+          const j = current();
+          if (j) this.spendAttempt(j, `the reviewer exited without a verdict (${((early.reason as string | null) ?? "exited").slice(0, 100)})`, "exited");
+          return;
+        }
+        if (!current()) return;
       }
       const j = current()!;
       if (j.briefed !== 1) {
