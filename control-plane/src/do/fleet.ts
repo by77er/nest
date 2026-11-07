@@ -38,9 +38,12 @@ import {
   type CapacityView, type FleetView, HOST_STATUSES, type HostStatus, type HostView, type ImagesView, LAUNCH_END_REASONS, type LaunchEndReason,
   type LaunchView, type SandboxView, type TemplateView,
   type HostRole as AdminHostRole, type SandboxState as AdminSandboxState, type TunnelState as AdminTunnelState,
+  type AgentState as AdminAgentState, type AgentLifecycle as AdminAgentLifecycle, type BrainPhase as AdminBrainPhase,
   type AwsView, AGENT_LIFETIME_KINDS, type AgentLifetimeKind, type LifetimeAgentView, type LifetimeSandboxView, type LifetimesView,
   SANDBOX_LIFETIME_KINDS, type SandboxLifetimeKind,
 } from "../../../protocol/admin/view";
+import type { AgentLifecycle, AgentState } from "../protocol/model";
+import type { Brain } from "../lib/brain";
 import { AGENTS_CURSOR, agentCursorOf, type AgentRead, classifyAgent, classifySandbox, cursorOf, DEFAULT_QUIET_MS, mapBounded, parseCursor } from "../lib/abandoned";
 import { cellIdleTtlMs } from "../lib/lifetimes";
 import { labelWhere, type Labels } from "../lib/clients";
@@ -95,7 +98,8 @@ const LIVE_STATUSES = ["active", "draining", "stonith_pending"] as const satisfi
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 export const ADMIN_ENUMS_AGREE: [
   Same<AdminSandboxState, SandboxState>, Same<AdminHostRole, HostKind>, Same<AdminTunnelState, TunnelState>,
-] = [true, true, true];
+  Same<AdminAgentState, AgentState>, Same<AdminAgentLifecycle, AgentLifecycle>, Same<AdminBrainPhase, Brain["phase"]>,
+] = [true, true, true, true, true, true];
 
 /**
  * Where a host's sandbox gateway is reached (`hostGatewayUrl`): through its tunnel (Cloudflare

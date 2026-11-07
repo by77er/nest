@@ -178,8 +178,9 @@ describe("clients and their tokens", () => {
     expect(del).toMatchObject({ deleted: c.id, catalog_entries: 1 });
     expect((await as(rotated.token, "/v1/agents")).status).toBe(401);
     expect((await adminJson("/v1/admin/catalog")).templates[c.tpl]).toBeUndefined();
-    // The name is free again.
-    await adminJson("/v1/admin/clients", { body: { name: c.name, grant: {} } }, 201);
+    // The name is held as a tombstone until the directory's sweep frees it (test/client-names.test.ts).
+    expect(del.name_free_ms).toBeGreaterThan(Date.now());
+    expect((await adminJson("/v1/admin/clients", { body: { name: c.name, grant: {} } }, 409)).error.message).toContain("was deleted");
   });
 
   it("a delete is refused while its subtree lives", async () => {

@@ -28,6 +28,42 @@ use crate::tailer::Tailer;
 
 /// Flush an event batch early at this size.
 pub const MAX_BATCH: usize = 100;
+/// A connection that lasted this long was healthy: the reconnect backoff starts over after it.
+pub const HEALTHY: Duration = Duration::from_secs(30);
+
+/// Where an inbound reliable message stands against what this lineage has taken (`last_in`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InSeq {
+    /// Taken already: ack again, apply nothing.
+    Duplicate,
+    /// The next one: take it.
+    Next,
+    /// A message is missing before it: take nothing, ack nothing, reconnect (the hello asks for
+    /// everything past `last_in`, in order).
+    Gap { expected: u64 },
+}
+
+/// The receiver's rule for one reliable seq. The lineage's first message (nothing taken yet) is
+/// the baseline whatever its seq: AgentDO keeps its seq counter across a lineage reset. Pure.
+pub fn classify(last_in: u64, seq: u64) -> InSeq {
+    if last_in == 0 {
+        InSeq::Next
+    } else if seq <= last_in {
+        InSeq::Duplicate
+    } else if seq == last_in + 1 {
+        InSeq::Next
+    } else {
+        InSeq::Gap { expected: last_in + 1 }
+    }
+}
+
+/// The `seq` of a message this runner can't parse, if it has one: a reliable message of a type
+/// (or shape) this release doesn't know. Skipping it would let the next seq's cumulative ack tell
+/// AgentDO it was processed.
+fn unparsed_seq(text: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(text).ok()?.get("seq")?.as_u64()
+}
+
 /// How long a closing session keeps trying to make everything durable.
 pub const CLOSE_FLUSH: Duration = Duration::from_secs(30);
 
@@ -35,6 +71,18 @@ enum Step {
     Reconnect,
     Close,
 }
+
+/// Why a connection ended on a protocol error (it reconnects with a growing backoff).
+#[derive(Debug)]
+struct ProtocolError(String);
+
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ProtocolError {}
 
 pub struct Session {
     pub rt: Arc<Runtime>,
@@ -61,6 +109,8 @@ struct State {
     resolves: Vec<model::RequestId>,
     /// Set by `Close`: give up at this instant.
     close_deadline: Option<tokio::time::Instant>,
+    /// When the current connection's hello was acked (cleared before each connection).
+    opened_at: Option<tokio::time::Instant>,
 }
 
 impl State {
@@ -102,9 +152,19 @@ impl Session {
         let mut st = State::default();
         let mut backoff = Duration::from_millis(100);
         loop {
-            match self.connect_once(&mut st, &mut out).await {
+            st.opened_at = None;
+            let r = self.connect_once(&mut st, &mut out).await;
+            // The backoff starts over only after a connection that stayed up: a reconnect asked for
+            // at once (AgentDO refused what was sent, a frame this release can't read) doesn't
+            // turn into a reconnect loop at the first step's 100 ms.
+            if st.opened_at.is_some_and(|t| t.elapsed() >= HEALTHY) {
+                backoff = Duration::from_millis(100);
+            }
+            match r {
                 Ok(Step::Close) => return,
-                Ok(Step::Reconnect) => backoff = Duration::from_millis(100),
+                Ok(Step::Reconnect) => {}
+                // A protocol error was logged where it was found.
+                Err(e) if e.downcast_ref::<ProtocolError>().is_some() => {}
                 Err(e) => tracing::warn!(agent = %self.agent.id, "session channel: {e:#}"),
             }
             if st.close_expired() {
@@ -217,6 +277,7 @@ impl Session {
         if let Some(o) = self.opened.take() {
             let _ = o.send(());
         }
+        st.opened_at = Some(tokio::time::Instant::now());
 
         if st.closing() {
             self.flush_tail(&mut tx).await?;
@@ -235,10 +296,18 @@ impl Session {
                     Some(Ok(Message::Text(t))) => {
                         let msg: AgentToRunner = match serde_json::from_str(&t) {
                             Ok(m) => m,
-                            Err(e) => { tracing::warn!("bad AgentToRunner: {e}"); continue; }
+                            Err(e) => match unparsed_seq(&t) {
+                                // A reliable message this release can't read is never skipped: the
+                                // next one's cumulative ack would say it was processed.
+                                Some(seq) if seq > st.last_in => return Err(self.protocol_error(format!("can't read AgentDO's message {seq}: {e}")).into()),
+                                Some(_) => continue, // one taken already
+                                None => { tracing::warn!(agent = %self.agent.id, "skipping an AgentToRunner it can't read (no seq): {e}"); continue; }
+                            },
                         };
-                        if let Some(reply) = self.inbound(st, msg) {
-                            tx.send(text(&reply)?).await?;
+                        match self.inbound(st, msg) {
+                            Ok(Some(reply)) => tx.send(text(&reply)?).await?,
+                            Ok(None) => {}
+                            Err(e) => return Err(e.into()),
                         }
                     }
                     Some(Ok(Message::Ping(p))) => tx.send(Message::Pong(p)).await?,
@@ -286,8 +355,28 @@ impl Session {
         }
     }
 
-    /// Handle one inbound message; returns an immediate reply (acks).
-    fn inbound(&mut self, st: &mut State, msg: AgentToRunner) -> Option<RunnerToAgent> {
+    /// A protocol error on the session channel: logged, and reported to nestd (the channel can't go
+    /// on past it, so the brain is stuck until it is fixed: an upgrade, AgentDO quarantining it).
+    fn protocol_error(&self, message: String) -> ProtocolError {
+        tracing::error!(agent = %self.agent.id, "session channel: {message}; reconnecting");
+        self.report(message.clone());
+        ProtocolError(message)
+    }
+
+    /// Tell nestd the session channel can't go on as it is (it logs it beside the brain's events).
+    fn report(&self, message: String) {
+        self.rt.report_for(
+            &self.agent,
+            nest_protocol::host::runner::RunnerEvent::Error {
+                agent: Some(self.agent.id.clone()),
+                error: model::ErrorBody { code: error_codes::INVALID_MESSAGE.into(), message: format!("session channel: {message}"), retryable: true },
+            },
+        );
+    }
+
+    /// Handle one inbound message; returns an immediate reply (acks), or a protocol error (a gap)
+    /// that ends the connection.
+    fn inbound(&mut self, st: &mut State, msg: AgentToRunner) -> Result<Option<RunnerToAgent>, ProtocolError> {
         let reliable_seq = match &msg {
             AgentToRunner::RunTurn { seq, .. }
             | AgentToRunner::Inbox { seq, .. }
@@ -297,10 +386,11 @@ impl Session {
             _ => None,
         };
         if let Some(seq) = reliable_seq {
-            if seq <= st.last_in {
-                return Some(RunnerToAgent::Ack { up_to: Seq(st.last_in) });
+            match classify(st.last_in, seq) {
+                InSeq::Duplicate => return Ok(Some(RunnerToAgent::Ack { up_to: Seq(st.last_in) })),
+                InSeq::Gap { expected } => return Err(self.protocol_error(format!("message {seq} arrived, {expected} expected"))),
+                InSeq::Next => st.last_in = seq,
             }
-            st.last_in = seq;
         }
         let a = &self.agent;
         match msg {
@@ -331,11 +421,15 @@ impl Session {
                 if error.code == error_codes::STALE_EPOCH {
                     a.command(AgentCmd::StaleEpoch);
                 } else if error.code == error_codes::INVALID_MESSAGE {
+                    // AgentDO refused what was sent; reconnecting resends it, so this repeats until
+                    // either side changes: reported to nestd (logged just above), and paced by the
+                    // reconnect backoff.
+                    self.report(format!("AgentDO refused a message: {}", error.message));
                     a.send_out(Outbound::Reconnect);
                 }
             }
         }
-        reliable_seq.map(|_| RunnerToAgent::Ack { up_to: Seq(st.last_in) })
+        Ok(reliable_seq.map(|_| RunnerToAgent::Ack { up_to: Seq(st.last_in) }))
     }
 
     async fn flush_events<S>(&mut self, st: &mut State, tx: &mut S) -> anyhow::Result<()>
@@ -620,5 +714,187 @@ mod resolve_tests {
         rt.host_token.send_replace(Some(Secret("tok".into())));
         tokio::time::timeout(Duration::from_secs(5), watch.changed()).await.expect("tools_changed reached the watcher").unwrap();
         assert!(server.await.unwrap(), "the hello advertised tools_changed");
+    }
+    #[test]
+    fn the_receivers_seq_rule() {
+        assert_eq!(classify(0, 57), InSeq::Next, "a lineage's first message is its baseline");
+        assert_eq!(classify(5, 6), InSeq::Next);
+        assert_eq!(classify(5, 5), InSeq::Duplicate);
+        assert_eq!(classify(5, 1), InSeq::Duplicate);
+        assert_eq!(classify(5, 7), InSeq::Gap { expected: 6 });
+        assert_eq!(unparsed_seq(r#"{"type":"run_turn_v2","seq":4}"#), Some(4));
+        assert_eq!(unparsed_seq(r#"{"type":"news"}"#), None);
+        assert_eq!(unparsed_seq("not json"), None);
+    }
+
+    /// Audit R-B2: AgentDO answers a batch it can't take with `invalid_message` and keeps the socket;
+    /// the runner reconnects and resends it, which repeats until a side changes. The reconnects are
+    /// paced by a growing backoff (they used to run at 100 ms for the brain's life).
+    #[tokio::test]
+    async fn a_rejected_batch_reconnects_with_a_growing_backoff() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/agents/agt_p/session", listener.local_addr().unwrap());
+        let hellos = Arc::new(AtomicUsize::new(0));
+        let h = hellos.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let h = h.clone();
+                tokio::spawn(async move {
+                    let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else { return };
+                    let (mut wtx, mut wrx) = ws.split();
+                    while let Some(Ok(m)) = wrx.next().await {
+                        let Message::Text(t) = m else { continue };
+                        let reply = match serde_json::from_str::<RunnerToAgent>(&t) {
+                            Ok(RunnerToAgent::Hello(_)) => {
+                                h.fetch_add(1, Ordering::SeqCst);
+                                AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None }
+                            }
+                            Ok(RunnerToAgent::Events { .. }) => AgentToRunner::Error {
+                                error: model::ErrorBody { code: error_codes::INVALID_MESSAGE.into(), message: "schema".into(), retryable: false },
+                            },
+                            _ => continue,
+                        };
+                        if wtx.send(Message::Text(serde_json::to_string(&reply).unwrap().into())).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let rt = Runtime::new(Config { batch_interval: Duration::from_millis(50), tail_interval: Duration::from_millis(50), ..Config::default() });
+        let (ctx, _crx) = mpsc::unbounded_channel();
+        let (otx, orx) = mpsc::unbounded_channel();
+        let agent = Agent::new(AgentId("agt_p".into()), Epoch(1), std::env::temp_dir(), None, vec![], 0, ctx, otx);
+        let transcript = std::env::temp_dir().join(format!("nest-probe-{}.jsonl", uuid::Uuid::new_v4().simple()));
+        let _opened = spawn(rt.clone(), agent.clone(), url, transcript, None, orx);
+        rt.host_token.send_replace(Some(Secret("tok".into())));
+        agent.emit(model::AgentEventBody::AssistantText { text: "x".into() });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let n = hellos.load(Ordering::SeqCst);
+        // 100, 200, 400, 800 and 1600 ms apart: at most 6 in 3 s (it was about 30).
+        assert!((2..=6).contains(&n), "{n} session hellos in 3 s");
+    }
+    /// A seq that skips one (a message lost or reordered) is never taken or acked: the runner
+    /// reconnects, and its hello asks for everything past the last one it took.
+    #[tokio::test]
+    async fn a_gap_is_never_acked_past() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/agents/agt_g/session", listener.local_addr().unwrap());
+        // Two connections: on the first, seq 1 then 3 (2 missing); on the second, the hello's
+        // last_seq, then 2 and 3 resent in order.
+        let server = tokio::spawn(async move {
+            let mut out: Vec<(Option<u64>, Vec<u64>)> = Vec::new();
+            for conn in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let (mut wtx, mut wrx) = ws.split();
+                let (mut hello_last, mut acks) = (None, Vec::new());
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+                loop {
+                    let m = tokio::select! {
+                        m = wrx.next() => m,
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    };
+                    let t = match m {
+                        Some(Ok(Message::Text(t))) => t,
+                        Some(Ok(_)) => continue,
+                        _ => break,
+                    };
+                    match serde_json::from_str::<RunnerToAgent>(&t) {
+                        Ok(RunnerToAgent::Hello(h)) => {
+                            hello_last = h.last_seq.map(|s| s.0);
+                            let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None };
+                            wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
+                            let seqs: &[u64] = if conn == 0 { &[1, 3] } else { &[2, 3] };
+                            for seq in seqs {
+                                wtx.send(Message::Text(format!(r#"{{"type":"interrupt","seq":{seq}}}"#).into())).await.unwrap();
+                            }
+                        }
+                        Ok(RunnerToAgent::Ack { up_to }) => {
+                            acks.push(up_to.0);
+                            if conn == 1 && up_to.0 == 3 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                out.push((hello_last, acks));
+            }
+            out
+        });
+        let rt = Runtime::new(Config { batch_interval: Duration::from_millis(50), tail_interval: Duration::from_millis(50), ..Config::default() });
+        let (ctx, _crx) = mpsc::unbounded_channel();
+        let (otx, orx) = mpsc::unbounded_channel();
+        let agent = Agent::new(AgentId("agt_g".into()), Epoch(1), std::env::temp_dir(), None, vec![], 0, ctx, otx);
+        let transcript = std::env::temp_dir().join(format!("nest-probe-{}.jsonl", uuid::Uuid::new_v4().simple()));
+        let _opened = spawn(rt.clone(), agent.clone(), url, transcript, None, orx);
+        rt.host_token.send_replace(Some(Secret("tok".into())));
+        let conns = server.await.unwrap();
+        assert_eq!(conns[0].1, [1], "seq 1 taken, nothing past the gap: {conns:?}");
+        assert_eq!(conns[1].0, Some(1), "the reconnect asks for everything past 1: {conns:?}");
+        assert_eq!(conns[1].1, [2, 3], "then takes 2 and 3 in order: {conns:?}");
+        // nestd was told.
+        let (_, ev) = rt.to_nestd_rx.lock().await.try_recv().expect("a report to nestd");
+        assert!(matches!(ev, nest_protocol::host::runner::RunnerEvent::Error { error, .. } if error.code == error_codes::INVALID_MESSAGE && error.message.contains("3 arrived, 2 expected")));
+    }
+
+    /// Audit R-B1: a reliable message this runner can't read (a newer Worker's variant) used to be
+    /// skipped, and the next seq's cumulative ack told AgentDO it was processed. It is a protocol
+    /// error now: nothing past it is taken or acked, and the runner reconnects.
+    #[tokio::test]
+    async fn a_reliable_message_it_cant_read_is_never_acked_past() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/agents/agt_u/session", listener.local_addr().unwrap());
+        // Two connections, each sending a variant this release can't parse at seq 1 and a known
+        // message at seq 2: the runner never acks past seq 1, and its reconnect's hello still
+        // asks from the start.
+        let server = tokio::spawn(async move {
+            let mut out: Vec<(Option<u64>, Vec<u64>)> = Vec::new();
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let (mut wtx, mut wrx) = ws.split();
+                let (mut hello_last, mut acks) = (None, Vec::new());
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let m = tokio::select! {
+                        m = wrx.next() => m,
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    };
+                    let t = match m {
+                        Some(Ok(Message::Text(t))) => t,
+                        Some(Ok(_)) => continue,
+                        _ => break,
+                    };
+                    match serde_json::from_str::<RunnerToAgent>(&t) {
+                        Ok(RunnerToAgent::Hello(h)) => {
+                            hello_last = h.last_seq.map(|s| s.0);
+                            let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None };
+                            wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
+                            wtx.send(Message::Text(r#"{"type":"run_turn_v2","seq":1}"#.to_string().into())).await.unwrap();
+                            wtx.send(Message::Text(r#"{"type":"interrupt","seq":2}"#.to_string().into())).await.unwrap();
+                        }
+                        Ok(RunnerToAgent::Ack { up_to }) => acks.push(up_to.0),
+                        _ => {}
+                    }
+                }
+                out.push((hello_last, acks));
+            }
+            out
+        });
+        let rt = Runtime::new(Config { batch_interval: Duration::from_millis(50), tail_interval: Duration::from_millis(50), ..Config::default() });
+        let (ctx, _crx) = mpsc::unbounded_channel();
+        let (otx, orx) = mpsc::unbounded_channel();
+        let agent = Agent::new(AgentId("agt_u".into()), Epoch(1), std::env::temp_dir(), None, vec![], 0, ctx, otx);
+        let transcript = std::env::temp_dir().join(format!("nest-probe-{}.jsonl", uuid::Uuid::new_v4().simple()));
+        let _opened = spawn(rt.clone(), agent.clone(), url, transcript, None, orx);
+        rt.host_token.send_replace(Some(Secret("tok".into())));
+        let conns = server.await.unwrap();
+        assert!(conns.iter().all(|(_, acks)| acks.is_empty()), "nothing past the message it can't read is acked: {conns:?}");
+        assert_eq!(conns[1].0, None, "the reconnect asks from the start: nothing was taken");
+        let (_, ev) = rt.to_nestd_rx.lock().await.try_recv().expect("a report to nestd");
+        assert!(matches!(ev, nest_protocol::host::runner::RunnerEvent::Error { error, .. } if error.message.contains("can't read AgentDO's message 1")));
     }
 }
