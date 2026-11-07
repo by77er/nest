@@ -268,9 +268,35 @@ export function ghError(r: GhAnswer, what: string): NestError {
   if (r.kind === "refused") {
     const code = r.status === 401 ? ErrorCodes.UNAUTHORIZED : r.status === 403 || r.status === 404 ? ErrorCodes.FORBIDDEN
       : r.status === 429 ? ErrorCodes.RATE_LIMITED : ErrorCodes.INVALID_MESSAGE;
-    return new NestError(code, `GitHub: ${what}: HTTP ${r.status}: ${r.message}`, r.status === 429 ? 429 : 502, r.status === 429);
+    const e = new NestError(code, `GitHub: ${what}: HTTP ${r.status}: ${r.message}`, r.status === 429 ? 429 : 502, r.status === 429);
+    // GitHub's own status, for a caller that decides by it (`retryMintFresh`); never sent anywhere.
+    return Object.assign(e, { github_status: r.status });
   }
   return new NestError(ErrorCodes.INTERNAL, `GitHub: ${what}: an unexpected answer (HTTP ${r.status})`, 502, true);
+}
+
+/** The HTTP status GitHub refused a request with (`ghError`), or null for anything else. */
+export function githubRefusalStatus(e: unknown): number | null {
+  const s = (e as { github_status?: unknown } | null)?.github_status;
+  return typeof s === "number" ? s : null;
+}
+
+/**
+ * Statuses of a refused installation-token mint that may mean the cached installation is stale rather than
+ * the request wrong: the App was uninstalled and installed again (a new id: 404), the repo moved to another
+ * installation (422, "not accessible to the parent installation"), or the installation or App changed
+ * under the JWT (401).
+ */
+export const STALE_INSTALLATION_STATUSES: readonly number[] = [401, 404, 422];
+
+/**
+ * Whether a refused mint is retried, once, with the installation looked up afresh: only when the id came
+ * from the cache (a fresh one that is refused is a real refusal), only on the first attempt, and only for a
+ * status that may mean it is stale. A lost answer (retryable) is the caller's to retry, as before.
+ */
+export function retryMintFresh(e: unknown, fromCache: boolean, attempt: number): boolean {
+  const status = githubRefusalStatus(e);
+  return attempt === 0 && fromCache && status !== null && STALE_INSTALLATION_STATUSES.includes(status);
 }
 
 // --- The actions -------------------------------------------------------------------------------------------
