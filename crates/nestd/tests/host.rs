@@ -1737,7 +1737,9 @@ async fn a_detach_the_guest_refused_is_sent_again_when_asked_again() {
     };
     assert_ne!(port("agt_b"), port("agt_nodetach"), "two agents on one proxy port");
     h.fleet.commands.send(vec![detach("cmd_detach_2")]).unwrap();
-    assert!(matches!(h.fleet.result("cmd_detach_2").await, CommandOutcome::Ok { detail: None }), "sent again, and taken");
+    // Sent again by the repeated command (or, on a run slow enough, by the connection's 10 s sweep
+    // first, when the command then finds nothing owed): either way, ok and delivered.
+    assert!(is_ok(&h.fleet.result("cmd_detach_2").await), "sent again, and taken");
     assert_eq!(detaches(), 2, "the second detach reached the guest");
     h.fleet.commands.send(vec![detach("cmd_detach_3")]).unwrap();
     assert!(matches!(h.fleet.result("cmd_detach_3").await, CommandOutcome::Ok { detail: Some(_) }), "nothing owed any more: not attached");

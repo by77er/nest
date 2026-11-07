@@ -6,8 +6,9 @@
 //! - while it is owed, the guest connection keeps the agent's slot in every `configure` it sends,
 //!   so a reconnect never drops the agent from the guest's table (which would orphan its processes
 //!   where the guest has no cgroup to find them by) before the detach arrives;
-//! - the connection sends every owed detach after each `configure`; an `agent_detach` asked again,
-//!   and an attach of the same agent, send it first;
+//! - the connection sends every owed detach after each `configure` (before the guest counts as
+//!   ready) and every 10 s while one is owed; an `agent_detach` asked again, and an attach of the
+//!   same agent, send it first;
 //! - a kill, once asked, stays asked until a detach carrying it is confirmed.
 //!
 //! Each ask gets a number, and only a confirmation of the newest ask's detach settles it: a late
@@ -26,10 +27,16 @@ pub struct Owed {
 }
 
 /// Detaches owed to one guest, by agent.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Detaches<K: Ord> {
     owed: BTreeMap<K, Owed>,
     next_ask: u64,
+}
+
+impl<K: Ord + Clone> Default for Detaches<K> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<K: Ord + Clone> Detaches<K> {

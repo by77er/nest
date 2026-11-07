@@ -637,16 +637,17 @@ pub(crate) mod tests {
         let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
         let (etx, _erx) = mpsc::unbounded_channel();
         let (a, b) = (AgentId("agt_a".into()), AgentId("agt_b".into()));
-        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_a"), slot("agt_b")], etx);
+        let ctl = GuestCtl::spawn_sweeping(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_a"), slot("agt_b")], etx, Duration::from_secs(3600));
         assert!(ctl.detach(&a, true).await.is_err(), "not connected");
         let fake = FakeGuest::start(&guest_dir, "boot-1");
-        fake.detach_delay_ms.store(150, std::sync::atomic::Ordering::SeqCst);
+        fake.detach_delay_ms.store(1000, std::sync::atomic::Ordering::SeqCst);
         // Once the handshake is sending a's detach (slowly answered), b's is asked.
         let mut tries = 0;
         while detaches(&fake.seen.lock().unwrap()).is_empty() && tries < 250 {
             tokio::time::sleep(Duration::from_millis(5)).await;
             tries += 1;
         }
+        assert!(tries < 250, "the handshake never sent a's detach");
         assert!(!*ctl.ready.borrow(), "still in the handshake");
         assert!(ctl.detach(&b, false).await.is_err(), "not ready yet");
         ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
@@ -666,7 +667,8 @@ pub(crate) mod tests {
         let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
         let (etx, _erx) = mpsc::unbounded_channel();
         let agent = AgentId("agt_1".into());
-        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_1")], etx);
+        // No sweep during the test: the tail of requests is exact.
+        let ctl = GuestCtl::spawn_sweeping(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_1")], etx, Duration::from_secs(3600));
         ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
         fake.refuse_detaches.store(2, std::sync::atomic::Ordering::SeqCst);
         assert!(ctl.detach(&agent, true).await.is_err());
