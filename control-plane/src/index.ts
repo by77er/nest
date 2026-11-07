@@ -17,6 +17,7 @@ import {
 } from "./lib/clients";
 import type { ClientScope } from "./do/catalog";
 import { CLIENT_DIRECTORY, CLIENT_OPERATOR } from "./do/client";
+import { TOMBSTONE_MS } from "./lib/client-names";
 import { idempotencyKey, type KeyClaim, requestDigest } from "./lib/idempotency";
 import {
   CLIENT_BINDING_PREFIX, CLIENT_SECRET_PREFIX, ClientInjections, ClientSecretName, ClientSecretPut, holdInjections, injectionsOutsideGrant, SECRET_MAX_BYTES_DEFAULT,
@@ -944,25 +945,41 @@ export const ROUTES: Route[] = [
       for (const cell of r.grant.cells) checkCell(env, cell);
       const id = newId("cli_");
       const token = newClientToken(id);
-      const view = await clientDO(env, id).create({ client: id, name: r.name, grant: r.grant, token_hash: await tokenHash(token) });
+      // The name first, reserved (409 when taken), then the record, then the name confirmed live: only
+      // then is the token handed out (docs/control-plane/durable-objects/client/#names).
+      await directory(env).reserveName(r.name, id);
+      let view;
       try {
-        await directory(env).claimName(r.name, id);
+        view = await clientDO(env, id).create({ client: id, name: r.name, grant: r.grant, token_hash: await tokenHash(token) });
       } catch (e) {
-        // The name is taken: this record never had a usable token out; it goes.
-        await clientDO(env, id).markDeleted();
-        await clientDO(env, id).purge();
+        // No record (or not sure): the reservation goes back now; a stale one would go at the sweep.
+        await directory(env).abandonName(r.name, id).catch(() => undefined);
         throw e;
+      }
+      // Idempotent: an answer lost on the way is asked for again, and a confirmed name answers the same.
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await directory(env).confirmName(r.name, id);
+          break;
+        } catch (e) {
+          const ne = asNestError(e);
+          // Taken over or deleted meanwhile: the token never goes out, and its record purges itself (the directory no longer names it).
+          if (ne?.code === ErrorCodes.CONFLICT || attempt >= 3) throw e;
+        }
       }
       return { ...view, token };
     },
   }),
   route({ method: "GET", path: "/v1/admin/clients", auth: "admin", run: async ({ env }) => ({
     clients: await Promise.all((await directory(env).names()).map(async (n) => {
+      // A deleted client's name, held until the sweep frees it; a create still in progress (or dead, until its reservation goes stale).
+      if (n.phase === "deleted") return { client: n.client, name: n.name, phase: n.phase, deleted: true, name_free_ms: n.phase_ms + TOMBSTONE_MS };
+      if (n.phase === "reserved") return { client: n.client, name: n.name, phase: n.phase };
       try {
-        return await clientDO(env, n.client).info();
+        return { ...(await clientDO(env, n.client).info()), phase: n.phase };
       } catch {
-        // A delete that stopped half-way (its DELETE, run again, finishes it).
-        return { client: n.client, name: n.name, deleted: true };
+        // A record gone under a live name (a rollback's half-done delete): its DELETE, run again, finishes it.
+        return { client: n.client, name: n.name, phase: n.phase, deleted: true };
       }
     })),
   }) }),
@@ -983,14 +1000,25 @@ export const ROUTES: Route[] = [
     return { ...(await clientDO(env, p.client).rotate(await tokenHash(token))), token };
   } }),
   route({ method: "DELETE", path: "/v1/admin/clients/:client", auth: "admin", run: async ({ env, p }) => {
-    // Refused while its subtree lives; then its token stops, its catalog namespace and name go, and its record.
-    const { name } = await clientDO(env, p.client).markDeleted();
+    // Refused while its subtree lives; then its token stops, its name becomes a tombstone, and its catalog
+    // namespace, secrets and record go. Idempotent: a delete that stopped half-way (its record already
+    // purged) finds its name in the directory and finishes; the directory's sweep runs the cleanup once
+    // more when the tombstone ages out, then frees the name.
+    let name: string;
+    try {
+      name = (await clientDO(env, p.client).markDeleted()).name;
+    } catch (e) {
+      if (asNestError(e)?.code !== ErrorCodes.NOT_FOUND) throw e;
+      const row = await directory(env).nameOf(p.client);
+      if (!row) throw e;
+      name = row.name;
+    }
+    const { free_ms } = await directory(env).tombstoneName(name, p.client);
     const entries = await catalog(env).deleteNamespace(name);
     // Its secrets go with it (a BrokerDO of the previous release keeps them, unreachable, until a retried DELETE).
     const secrets = await newMethod("BrokerDO.deleteClientSecrets", () => broker(env).deleteClientSecrets(p.client));
-    await directory(env).releaseName(name, p.client);
     await clientDO(env, p.client).purge();
-    return { deleted: p.client, name, catalog_entries: entries, secrets };
+    return { deleted: p.client, name, catalog_entries: entries, secrets, name_free_ms: free_ms };
   } }),
   // A client's own record (its grant, live counts and events: what it missed shows as `events.dropped`;
   // with a `github` grant, the App its tokens come from, `github_app`) and webhook

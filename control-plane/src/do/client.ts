@@ -4,8 +4,9 @@
 // `max_agents` and `max_sandboxes` count and what the client lists. And its webhook, with the backlog
 // of events its subtree's agents and sandboxes handed it, delivered one at a time from its alarm.
 //
-// One more instance, named `directory`, holds the names: unique, each mapped to its client's id, and
-// the list of clients. Nothing else addresses it.
+// One more instance, named `directory`, holds the names: unique, each mapped to its client's id with
+// the client's phase (lib/client-names.ts: reserved, live, deleted; purged is no row), and the list of
+// clients. Its alarm sweeps stale reservations and finishes deletes once their tombstone has aged.
 //
 // Each principal's idempotency keys for creates (lib/idempotency.ts) live here too: a client's in its
 // own instance, the operator's in one more, named `operator`, which holds nothing else.
@@ -24,7 +25,11 @@ import { num } from "../env";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { Deadlines } from "../lib/reliable";
 import { IdempotencyKeys, type KeyClaim } from "../lib/idempotency";
-import { storedEnum } from "../lib/stored";
+import { addColumn, storedEnum } from "../lib/stored";
+import {
+  confirmDecision, type NameRow, nameRow, phaseOf, type ClientPhase, reserveDecision, RESERVE_TTL_MS, sweepDecision, sweepDueMs, tombstoneDecision,
+  TOMBSTONE_MS,
+} from "../lib/client-names";
 import { asNestError, clip, hex, NestError, timingSafeEqual } from "../lib/util";
 import { z } from "zod";
 import { ErrorCodes } from "../protocol/model";
@@ -136,7 +141,7 @@ export interface ListQuery {
   cursor?: string;
 }
 
-type Key = "reconcile" | "prune" | "deliver";
+type Key = "reconcile" | "prune" | "deliver" | "sweep";
 
 const notFound = () => new NestError(ErrorCodes.NOT_FOUND, "unknown client", 404);
 
@@ -161,6 +166,10 @@ export class ClientDO extends DurableObject<Env> {
     if (ctx.id.equals(env.CLIENT.idFromName(CLIENT_DIRECTORY))) {
       this.directory = true;
       this.sql.exec("CREATE TABLE IF NOT EXISTS names (name TEXT PRIMARY KEY, client TEXT NOT NULL, created_ms INTEGER NOT NULL)");
+      // The client's phase (`reserved`, `live`, `deleted`) and since when; a row from before them is live.
+      addColumn(this.sql, "names", "phase", "TEXT");
+      addColumn(this.sql, "names", "phase_ms", "INTEGER");
+      this.deadlines = new Deadlines(this.sql, ctx.storage);
       return;
     }
     if (ctx.id.equals(env.CLIENT.idFromName(CLIENT_OPERATOR))) {
@@ -212,29 +221,136 @@ export class ClientDO extends DurableObject<Env> {
     if (!this.directory) throw new NestError(ErrorCodes.INTERNAL, "not the client directory", 500);
   }
 
-  /** Take `name` for `client` (409 when another client has it). Idempotent for the same client. */
-  async claimName(name: string, client: string): Promise<void> {
-    this.requireDirectory();
-    const cur = this.sql.exec<{ client: string }>("SELECT client FROM names WHERE name = ?", name).toArray()[0];
-    if (cur && cur.client !== client) throw new NestError(ErrorCodes.CONFLICT, `a client named ${name} exists`, 409);
-    if (!cur) this.sql.exec("INSERT INTO names (name, client, created_ms) VALUES (?, ?, ?)", name, client, Date.now());
+  private nameRows(where: string, ...args: (string | number)[]): NameRow[] {
+    return this.sql.exec<{ name: string; client: string; created_ms: number; phase: string | null; phase_ms: number | null }>(
+      `SELECT name, client, created_ms, phase, phase_ms FROM names WHERE ${where}`, ...args).toArray().map(nameRow);
   }
 
+  private setPhase(r: NameRow, phase: NameRow["phase"], now: number): void {
+    this.sql.exec("UPDATE names SET phase = ?, phase_ms = ? WHERE name = ? AND client = ?", phase, now, r.name, r.client);
+  }
+
+  /** The sweep runs when the earliest reservation or tombstone is due (armed in each writer's step). */
+  private async armSweep(): Promise<void> {
+    const due = this.nameRows("phase IN ('reserved', 'deleted')").map(sweepDueMs).filter((x): x is number => x !== null);
+    if (due.length) await this.deadlines.set("sweep", Math.min(...due));
+  }
+
+  /**
+   * Reserve `name` for client `client`, which is being created (`reserveDecision`): free, or another
+   * client's stale reservation, it is taken; a retry by the same client finds it. Taken: 409, saying
+   * when a deleted client's name is free again.
+   */
+  async reserveName(name: string, client: string): Promise<void> {
+    this.requireDirectory();
+    const now = Date.now();
+    const d = reserveDecision(this.nameRows("name = ?", name)[0], client, now);
+    if (d.kind === "taken") {
+      const when = d.free_ms !== null ? `; it is free again at ${new Date(d.free_ms).toISOString()}` : "";
+      throw new NestError(ErrorCodes.CONFLICT, `a client named ${name} ${d.phase === "deleted" ? "was deleted" : d.phase === "reserved" ? "is being created" : "exists"}${when}`, 409);
+    }
+    if (d.kind === "insert") {
+      this.sql.exec("INSERT INTO names (name, client, created_ms, phase, phase_ms) VALUES (?, ?, ?, 'reserved', ?)", name, client, now, now);
+    } else if (d.kind === "takeover") {
+      // That create died before answering, so its token was never out; its record purges itself at its next prune.
+      this.sql.exec("UPDATE names SET client = ?, created_ms = ?, phase = 'reserved', phase_ms = ? WHERE name = ? AND client = ?", client, now, now, name, d.stale);
+    }
+    if (d.kind !== "held") await this.armSweep();
+  }
+
+  /**
+   * The client's record exists: its reservation becomes live. Idempotent, so a create whose answer was
+   * lost asks again and learns it is live. `lost` (taken over or deleted meanwhile): 409, and the create
+   * must not hand out its token.
+   */
+  async confirmName(name: string, client: string): Promise<void> {
+    this.requireDirectory();
+    const row = this.nameRows("name = ?", name)[0];
+    const d = confirmDecision(row, client);
+    if (d === "lost") throw new NestError(ErrorCodes.CONFLICT, `${client}'s reservation of ${name} was lost`, 409);
+    if (d === "confirm") this.setPhase(row!, "live", Date.now());
+  }
+
+  /**
+   * Compat, for one release (a Worker of the previous release mid-deploy): its create's claim, as a
+   * reservation confirmed at once, and its delete's release, as a tombstone.
+   */
+  async claimName(name: string, client: string): Promise<void> {
+    await this.reserveName(name, client);
+    await this.confirmName(name, client);
+  }
   async releaseName(name: string, client: string): Promise<void> {
     this.requireDirectory();
-    this.sql.exec("DELETE FROM names WHERE name = ? AND client = ?", name, client);
+    if (tombstoneDecision(this.nameRows("name = ?", name)[0], client) !== "none") await this.tombstoneName(name, client);
   }
 
-  /** Every client, by name. */
-  async names(): Promise<{ name: string; client: string; created_ms: number }[]> {
+  /** A create that failed before it confirmed gives its reservation back (only its own, only while reserved). */
+  async abandonName(name: string, client: string): Promise<void> {
     this.requireDirectory();
-    return this.sql.exec<{ name: string; client: string; created_ms: number }>("SELECT name, client, created_ms FROM names ORDER BY name").toArray();
+    this.sql.exec("DELETE FROM names WHERE name = ? AND client = ? AND COALESCE(phase, 'live') = 'reserved'", name, client);
   }
 
-  /** The client named `name`, if any. */
+  /**
+   * A client's delete: its name becomes a tombstone (`deleted`), held `TOMBSTONE_MS`, then the sweep
+   * deletes once more what late requests may have written and frees the name. Answers when it is free.
+   */
+  async tombstoneName(name: string, client: string): Promise<{ free_ms: number }> {
+    this.requireDirectory();
+    const row = this.nameRows("name = ?", name)[0];
+    const d = tombstoneDecision(row, client);
+    if (d === "none") throw new NestError(ErrorCodes.NOT_FOUND, `${name} isn't ${client}'s`, 404);
+    if (d === "tombstone") {
+      this.setPhase(row!, "deleted", Date.now());
+      await this.armSweep();
+    }
+    return { free_ms: this.nameRows("name = ?", name)[0]!.phase_ms + TOMBSTONE_MS };
+  }
+
+  /** The row of client `client`, whatever its phase (a delete whose record is already gone finds its name here). */
+  async nameOf(client: string): Promise<{ name: string; phase: ClientPhase } | null> {
+    this.requireDirectory();
+    const r = this.nameRows("client = ?", client)[0];
+    return r ? { name: r.name, phase: r.phase } : null;
+  }
+
+  /** Client `client`'s phase under `name`: `purged` when the name isn't (or is no longer) its. */
+  async phaseOf(name: string, client: string): Promise<ClientPhase> {
+    this.requireDirectory();
+    return phaseOf(this.nameRows("name = ? AND client = ?", name, client)[0]);
+  }
+
+  /** Every client, by name, with its phase. */
+  async names(): Promise<{ name: string; client: string; created_ms: number; phase: ClientPhase; phase_ms: number }[]> {
+    this.requireDirectory();
+    return this.nameRows("1 ORDER BY name");
+  }
+
+  /** The live client named `name`, if any (a reserved or deleted one owns no namespace). */
   async lookup(name: string): Promise<string | null> {
     this.requireDirectory();
-    return this.sql.exec<{ client: string }>("SELECT client FROM names WHERE name = ?", name).toArray()[0]?.client ?? null;
+    const r = this.nameRows("name = ?", name)[0];
+    return r && r.phase === "live" ? r.client : null;
+  }
+
+  /**
+   * The sweep: a stale reservation goes (its create died; its record purges itself); a tombstone past
+   * `TOMBSTONE_MS` has its client's namespace, secrets and record deleted once more, then goes, and the
+   * name is free. Each row is re-read before it is removed, in that step.
+   */
+  private async sweep(): Promise<void> {
+    const now = Date.now();
+    for (const r of this.nameRows("phase IN ('reserved', 'deleted')")) {
+      const d = sweepDecision(r, now);
+      if (d === "drop_reservation") {
+        this.sql.exec("DELETE FROM names WHERE name = ? AND client = ? AND phase = 'reserved' AND phase_ms = ?", r.name, r.client, r.phase_ms);
+      } else if (d === "finish_delete") {
+        await this.env.CATALOG.get(this.env.CATALOG.idFromName("catalog")).deleteNamespace(r.name);
+        await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).deleteClientSecrets(r.client);
+        await this.env.CLIENT.get(this.env.CLIENT.idFromName(r.client)).purge();
+        this.sql.exec("DELETE FROM names WHERE name = ? AND client = ? AND phase = 'deleted'", r.name, r.client);
+      }
+    }
+    await this.armSweep();
   }
 
   // --- the record ----------------------------------------------------------------------------------
@@ -558,7 +674,13 @@ export class ClientDO extends DurableObject<Env> {
   // --- alarms --------------------------------------------------------------------------------------
 
   override async alarm(): Promise<void> {
-    if (this.directory || this.operatorKeys) return;
+    if (this.operatorKeys) return;
+    if (this.directory) {
+      await this.deadlines.runDue(Date.now(), async (key) => {
+        if (key === "sweep") await this.sweep();
+      });
+      return;
+    }
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key === "reconcile") await this.reconcile();
       else if (key === "deliver") await this.deliver();
@@ -568,9 +690,37 @@ export class ClientDO extends DurableObject<Env> {
         // A delivery a rolled-back release dropped (it has no handler for `deliver`) is armed again.
         if (this.backlog() && !this.deadlines.has("deliver")) await this.deadlines.set("deliver", Date.now());
         await this.recheckLive();
-        if (this.record()) await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS);
+        if (await this.orphaned()) return;
+        // A deleted record waits for its purge (the delete's, or the directory's sweep), not the hour.
+        const r = this.record();
+        if (r && !r.deleted_ms) await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS);
       }
     });
+  }
+
+  /**
+   * A record the directory doesn't hold under its name (`purged` there: its create died before
+   * confirming and the reservation went, or a delete from before phases released the name and stopped)
+   * purges itself, unless anything of its subtree lives. Its token was never handed out, or it was
+   * deleted. True when it did; a directory that can't say (a release without phases) keeps it.
+   */
+  private async orphaned(): Promise<boolean> {
+    const r = this.record();
+    if (!r || Date.now() - r.created_ms < RESERVE_TTL_MS) return false;
+    let phase: ClientPhase;
+    try {
+      phase = await this.env.CLIENT.get(this.env.CLIENT.idFromName(CLIENT_DIRECTORY)).phaseOf(r.name, r.client);
+    } catch (e) {
+      console.warn(`client ${r.client}: asking the directory for its phase failed`, e);
+      return false;
+    }
+    // Re-read in this step: a member admitted meanwhile keeps it.
+    if (phase !== "purged" || this.count("agent") || this.count("sandbox")) return false;
+    console.log(`client ${r.client}: no directory row for ${r.name}; an orphan record, purged`);
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    this.schema();
+    return true;
   }
 
   /** Reservations older than `RESERVE_CHECK_MS`: dropped if the object was never created, else counted as it stands. */
