@@ -109,7 +109,7 @@ struct State {
     resolves: Vec<model::RequestId>,
     /// Set by `Close`: give up at this instant.
     close_deadline: Option<tokio::time::Instant>,
-    /// When the current (or last) connection's hello was acked.
+    /// When the current connection's hello was acked (cleared before each connection).
     opened_at: Option<tokio::time::Instant>,
 }
 
@@ -847,35 +847,42 @@ mod resolve_tests {
     async fn a_reliable_message_it_cant_read_is_never_acked_past() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/v1/agents/agt_u/session", listener.local_addr().unwrap());
+        // Two connections, each sending a variant this release can't parse at seq 1 and a known
+        // message at seq 2: the runner never acks past seq 1, and its reconnect's hello still
+        // asks from the start.
         let server = tokio::spawn(async move {
-            let (tcp, _) = listener.accept().await.unwrap();
-            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
-            let (mut wtx, mut wrx) = ws.split();
-            let mut acks = Vec::new();
-            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-            loop {
-                let m = tokio::select! {
-                    m = wrx.next() => m,
-                    _ = tokio::time::sleep_until(deadline) => break,
-                };
-                let t = match m {
-                    Some(Ok(Message::Text(t))) => t,
-                    Some(Ok(_)) => continue,
-                    _ => break,
-                };
-                match serde_json::from_str::<RunnerToAgent>(&t) {
-                    Ok(RunnerToAgent::Hello(_)) => {
-                        let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None };
-                        wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
-                        // A variant this release can't parse, then a known one.
-                        wtx.send(Message::Text(r#"{"type":"run_turn_v2","seq":1}"#.to_string().into())).await.unwrap();
-                        wtx.send(Message::Text(r#"{"type":"interrupt","seq":2}"#.to_string().into())).await.unwrap();
+            let mut out: Vec<(Option<u64>, Vec<u64>)> = Vec::new();
+            for _ in 0..2 {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let (mut wtx, mut wrx) = ws.split();
+                let (mut hello_last, mut acks) = (None, Vec::new());
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let m = tokio::select! {
+                        m = wrx.next() => m,
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    };
+                    let t = match m {
+                        Some(Ok(Message::Text(t))) => t,
+                        Some(Ok(_)) => continue,
+                        _ => break,
+                    };
+                    match serde_json::from_str::<RunnerToAgent>(&t) {
+                        Ok(RunnerToAgent::Hello(h)) => {
+                            hello_last = h.last_seq.map(|s| s.0);
+                            let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None };
+                            wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
+                            wtx.send(Message::Text(r#"{"type":"run_turn_v2","seq":1}"#.to_string().into())).await.unwrap();
+                            wtx.send(Message::Text(r#"{"type":"interrupt","seq":2}"#.to_string().into())).await.unwrap();
+                        }
+                        Ok(RunnerToAgent::Ack { up_to }) => acks.push(up_to.0),
+                        _ => {}
                     }
-                    Ok(RunnerToAgent::Ack { up_to }) => acks.push(up_to.0),
-                    _ => {}
                 }
+                out.push((hello_last, acks));
             }
-            acks
+            out
         });
         let rt = Runtime::new(Config { batch_interval: Duration::from_millis(50), tail_interval: Duration::from_millis(50), ..Config::default() });
         let (ctx, _crx) = mpsc::unbounded_channel();
@@ -884,7 +891,10 @@ mod resolve_tests {
         let transcript = std::env::temp_dir().join(format!("nest-probe-{}.jsonl", uuid::Uuid::new_v4().simple()));
         let _opened = spawn(rt.clone(), agent.clone(), url, transcript, None, orx);
         rt.host_token.send_replace(Some(Secret("tok".into())));
-        let acks = server.await.unwrap();
-        assert!(acks.is_empty(), "nothing past the message it can't read is acked: {acks:?}");
+        let conns = server.await.unwrap();
+        assert!(conns.iter().all(|(_, acks)| acks.is_empty()), "nothing past the message it can't read is acked: {conns:?}");
+        assert_eq!(conns[1].0, None, "the reconnect asks from the start: nothing was taken");
+        let (_, ev) = rt.to_nestd_rx.lock().await.try_recv().expect("a report to nestd");
+        assert!(matches!(ev, nest_protocol::host::runner::RunnerEvent::Error { error, .. } if error.message.contains("can't read AgentDO's message 1")));
     }
 }
