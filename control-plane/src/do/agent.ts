@@ -29,6 +29,7 @@ import {
   type Target,
 } from "../lib/grants";
 import type { MemberFacts } from "./client";
+import { secretRef } from "./broker";
 import { type ClientEvent, ClientOutbox, EVENT_TEXT_MAX } from "../lib/client-events";
 import { field, TRACE_PING, TRACE_PONG, TRACE_SOCKETS_MAX, type TraceBody, type TraceControl, TraceRing, traceOf } from "../lib/trace";
 import { decodeCursor, encodeCursor, HISTORY_DEFAULT_LIMIT, type HistoryCursor, type HistoryPage, historyPage } from "../lib/trace-history";
@@ -148,6 +149,12 @@ export interface AgentInfo extends AgentSpec, BrainFields {
   ended?: Ended;
   /** How many spawns deep: 0 for the operator's agents (absent: 0), its spawner's plus one. */
   depth?: number;
+  /**
+   * Why its last start was refused for good (the start never issued): a credential its client's grant
+   * doesn't name or that isn't stored, say. Shown with the record and sent as `agent.error`
+   * (`start_refused`); cleared by the next start issued. Absent: none.
+   */
+  start_error?: { code: string; message: string; ms: number };
 }
 
 /** Tools that spawn or end agents: never from a sandbox. */
@@ -483,17 +490,26 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.load();
     const was = info.lifecycle;
     const wasState = agentState(info);
+    const wasStartError = JSON.stringify(info.start_error ?? null);
     fn(info);
+    // `start_error` says why this step entered `errored`, so it is kept only when this step set it:
+    // entered another way (a start deadline, a crash loop), an older refusal's reason goes.
+    const why = was !== "errored" && info.lifecycle === "errored" && JSON.stringify(info.start_error ?? null) !== wasStartError
+      ? info.start_error : undefined;
+    if (was !== "errored" && info.lifecycle === "errored" && !why) delete info.start_error;
     this.save(info);
     // Every change of its state is in its trace, in the same step.
     const state = agentState(info);
     if (state !== wasState) this.traceEmit({ type: "state", state }, Date.now(), info.current_turn);
     // Every way into `errored` goes through here: its client hears of it in the same step.
     if (was !== "errored" && info.lifecycle === "errored") {
-      this.emit(info, `${info.agent}/errored/${newId("evt_")}`, {
-        type: "agent.error", agent: info.agent, code: "errored",
-        message: "its brain could not be started, or kept exiting without completing a turn; it waits for new input",
-      });
+      // A start refused for good says why (`start_refused`); otherwise the general note.
+      this.emit(info, `${info.agent}/errored/${newId("evt_")}`, why
+        ? { type: "agent.error", agent: info.agent, code: "start_refused", message: `its brain could not be started: ${why.message}; it waits for new input` }
+        : {
+          type: "agent.error", agent: info.agent, code: "errored",
+          message: "its brain could not be started, or kept exiting without completing a turn; it waits for new input",
+        });
     }
     return info;
   }
@@ -832,7 +848,7 @@ export class AgentDO extends DurableObject<Env> {
           return this.startStatus();
         }
         const host = await this.pickHost(snap, intent);
-        const oauthRef = await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).credentialRef(snap.credential);
+        const oauthRef = await this.startCredential(snap);
         // `--resume` reads R2 only: make what's still buffered durable first, or the new brain would
         // resume from up to a flush interval ago.
         await this.flush();
@@ -848,6 +864,29 @@ export class AgentDO extends DurableObject<Env> {
     // Changed under us three times: the alarm looks again.
     await this.deadlines.set("intent", Date.now() + START_RETRY_MS, true);
     return this.startStatus();
+  }
+
+  /**
+   * The setup token a start names (`credentialFor`, docs/control-plane/durable-objects/broker/): the
+   * operator's agents may fall back to the default; an API client's agent runs only on the credential
+   * its spec names, while its client's grant (read now) names it. Never across authority.
+   */
+  private async startCredential(info: AgentInfo): Promise<string> {
+    const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
+    if (!info.client) return await broker.credentialRef(info.credential);
+    let credentials: string[] | null = null;
+    try {
+      credentials = (await this.clientStub(info.client).scope()).grant.credentials;
+    } catch (e) {
+      // Deleted (403): its grant names nothing now.
+      if (asNestError(e)?.code !== ErrorCodes.FORBIDDEN) throw e;
+    }
+    const ref = await broker.credentialRef(info.credential, { client: info.client, credentials });
+    // A BrokerDO of the previous release ignores the principal and may fall back: only the spec's own goes out.
+    if (ref !== secretRef(info.credential)) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `the Claude setup token ${info.credential} isn't configured or has expired; an API client's agent runs only on the credential its spec names (no fallback)`, 409);
+    }
+    return ref;
   }
 
   /** The brain record and intent are still what `snap` saw. */
@@ -913,6 +952,7 @@ export class AgentDO extends DurableObject<Env> {
     const started = this.update((i) => {
       i.agent_epoch += 1;
       Object.assign(i, NO_INTENT, { brain: { host, epoch: i.agent_epoch, phase: "starting", since_ms: Date.now() }, lifecycle: "starting", activity: null });
+      delete i.start_error;
     });
     const armed = Promise.all([this.deadlines.clear("intent"), this.armPhase(started.brain, this.startDeadline(started))]);
     await this.hook("start:afterCommit");
@@ -980,7 +1020,12 @@ export class AgentDO extends DurableObject<Env> {
     }
     this.update((i) => {
       Object.assign(i, NO_INTENT);
-      if (!i.brain && (i.lifecycle === "starting" || i.lifecycle === "detached")) i.lifecycle = "errored";
+      // Only when this step makes it `errored` (with a live brain it stays as it is): why, on the record
+      // and in the `agent.error` this step sends.
+      if (!i.brain && (i.lifecycle === "starting" || i.lifecycle === "detached")) {
+        i.start_error = { code: ne?.code ?? ErrorCodes.INTERNAL, message: clip(ne?.detail ?? String(e), 1000), ms: Date.now() };
+        i.lifecycle = "errored";
+      }
     });
     await this.deadlines.clear("intent");
   }

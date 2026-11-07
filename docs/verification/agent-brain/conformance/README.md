@@ -362,3 +362,15 @@ Tests: `brain-hosts.test.ts`, "a stop ends a start waiting for a brain host…",
 | The `end` and `reap` deadlines | agent.ts `finishEnd`, `endChildren`, `reap` | outside the model | Sandbox release, the cascade to owned agents (`end` on each child's AgentDO, never back into a caller awaiting it) and the owner's `childEnded` read the brain record but never write it. `reap` deletes the storage only with no brain record, so a condemned brain never proven gone keeps its record |
 
 Tests: `test/agent-lifecycle.test.ts` (an end kills, drops, refuses and doesn't restart after the release; `exit` waits for the turn; ephemeral ends only with nothing queued; the stale-epoch stop; the cascade). Mutations run: no turn drop, no input refusal, a graceful stop before the turn ends, no cascade, no epoch fence on `agent_stop`, each fails a test.
+
+## a client's start credential (fix/client-credential-fallback, author's map, 2026-11-06)
+
+**Head:** `fix/client-credential-fallback` (on main e421c59). A start may now be refused for one more reason before it is issued: a credential an API client's agent may not run on. That adds no transition: the refusal takes the existing non-retryable path of a start that couldn't be issued. Citations by function name. Not checked by a model run.
+
+| Change | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| The start's credential | agent.ts `processIntent` → `startCredential` | yes (S-neutral) | Read before the commit, like `pickHost`. It awaits ClientDO's `scope()` and BrokerDO's `credentialRef`, then `unchanged(snap)` re-checks the brain and intent as before. A refusal throws before `issueStart`, so no epoch is spent and no brain is recorded |
+| The refusal | agent.ts `intentFailed` | yes | The existing non-retryable branch: `NO_INTENT`, and `errored` when there's no brain, in one `update`. That same step also records `start_error`, and `update` queues the client's `agent.error` from it. Neither is read by any brain decision |
+| Cleared | agent.ts `issueStart` | yes | `start_error` is deleted in the commit's `update`, so the brain transition and its alarms don't change |
+
+Tests: `test/credentials.test.ts`. Mutations run: the old fallback, no principal passed, no reference check, the grant not re-read, `start_error` not recorded, not cleared, or not in the event. Each fails a test.

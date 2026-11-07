@@ -249,7 +249,8 @@ describe("delivery", () => {
     await deliverGithub("issue_comment", issueComment(s, { body: "Pick it up again: the CI fails." }));
     await drain(s);
     const t = await taskOf(s);
-    expect(t.state).toBe("in_progress");
+    // Its PR still open: the new worker starts in review (README.md#the-task-machine).
+    expect(t.state).toBe("in_review");
     expect(t.assignee).not.toBe(s.worker);
     const theirs = fake.inbox.filter((m) => m.agent === t.assignee);
     expect(theirs).toHaveLength(2);
@@ -276,7 +277,7 @@ describe("delivery", () => {
       await dueNow(s);
       await drain(s);
     }
-    expect((await taskOf(s)).state).toBe("in_progress");
+    expect((await taskOf(s)).state).toBe("in_review");
     const theirs = fake.inbox.filter((m) => m.agent === mid.assignee).map((m) => m.text);
     expect(theirs[0]!.startsWith("A PR comment")).toBe(false);
     expect(theirs.slice(1).map((t) => (t.includes("first comment") ? 1 : t.includes("second comment") ? 2 : 0))).toEqual([1, 2]);
@@ -325,8 +326,9 @@ describe("delivery", () => {
     await deliverGithub("issue_comment", issueComment(s, { body: "one more" }));
     await drain(s);
     const t = await taskOf(s);
-    // No worker started: still without one (its last one exited while in progress).
-    expect(t.state).toBe("stalled");
+    // No worker started: still without one, in review with its PR open.
+    expect(t.state).toBe("in_review");
+    expect(t.worker_live).toBe(false);
     const last = t.history.at(-1);
     expect(last.action).toBe("pr_comment_dropped");
     expect(JSON.parse(last.detail).why).toContain(`at most ${REVISE_MAX}`);

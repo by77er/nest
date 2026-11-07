@@ -14,7 +14,7 @@ const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine
 const drawer = () => screen.getByRole("dialog", SHEET);
 const now = Date.now();
 const job = (pr: number, o: Partial<Job> = {}): Job => ({
-  pr, sha: "a".repeat(40), state: "done", title: null, base: "main", agent: "agt_r", check_run: 1, tainted: false, attempts: 0, runs: 1, error: null,
+  pr, sha: "a".repeat(40), state: "done", title: null, base: "main", agent: "agt_r", check_run: 1, tainted: false, deadline_ms: null, attempts: 0, runs: 1, error: null,
   created_ms: now - 1000, updated_ms: now,
   verdict: { correctness: { verdict: "pass", notes: "" }, quality: { verdict: "fail", notes: "" }, architecture: { verdict: "pass", notes: "" }, summary: "s" },
   ...o,
@@ -190,7 +190,9 @@ describe("a task's dependencies", () => {
     const card = await screen.findByRole("article", { name: "Second" });
     const badge = within(card).getByText("Waiting on 2").closest(".mantine-Badge-root") as HTMLElement;
     expect(card.querySelectorAll("[data-marker=waiting]")).toHaveLength(1);
-    expect(badge.getAttribute("style") ?? "").toContain("--mantine-color-gray");
+    // Neutral: the theme's neutral badge, no role's color.
+    expect(badge.getAttribute("style") ?? "").toContain("--nest-neutral-badge");
+    expect(badge.getAttribute("style") ?? "").not.toMatch(/--mantine-color-(primary|warning|success|danger)-/);
     expect(badge.getAttribute("data-variant")).toBe("light");
     expect(badge.querySelector("svg")).not.toBeNull();
     expect(within(card).queryByText("Blocked")).toBeNull();

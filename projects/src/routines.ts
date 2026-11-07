@@ -30,8 +30,12 @@ export interface RoutineFields {
   proposals: "triage" | "draft";
 }
 
-/** How a run ended: it finished its turn and ended itself, or failed to start or ended without a turn, or a guard or the owner stopped it. */
-export type RunOutcome = "done" | "failed" | "timed_out" | "over_budget" | "stopped";
+/**
+ * How a run ended: `done` (it finished its turn and ended itself, or its turns reached their budget: a
+ * note says so), `failed` (it didn't start, or ended before a turn), `timed_out` (its time budget) or
+ * `stopped` (the owner).
+ */
+export type RunOutcome = "done" | "failed" | "timed_out" | "stopped";
 export type RunState = "starting" | "running" | "ended";
 
 /** What a run made: a proposed task (in triage), a draft task (on the board), a memory note written or deleted. */
