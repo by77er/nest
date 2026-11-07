@@ -16,7 +16,8 @@ export type { Dimension, Verdict } from "../../github";
 export type Project = ProjectRow & { settings: Settings };
 /** A row of the projects list: with `needs_you`, how many asks and blocked tasks wait on the owner. */
 export type ListedProject = ProjectRow & { needs_you: number };
-export type { Attention, Blocked, SecretRequest, SecretView, TaskPr, TaskRef } from "../../do/project";
+export type { Attention, Blocked, Issue, SecretRequest, SecretView, TaskIssue, TaskPr, TaskRef } from "../../do/project";
+export type { AcceptIssueBody, DeclineIssueBody } from "../../requests";
 export type { SecretGrant, SecretLocation, SecretRole } from "../../secrets";
 /** `GET /api/projects/:id/secrets`: the project's secrets with nest's facts, and the grant's limits. */
 export interface SecretsAnswer {
@@ -62,4 +63,16 @@ export interface NetworkView {
   agents: import("../../do/project").LayerStatus[];
   egress_hosts: string[] | null;
   base: import("../../network").OperatorRule[] | null;
+}
+
+// Routines and memory (README.md#routines, README.md#memory).
+export type { Proposal, Routine, RoutineRun } from "../../do/project";
+export type { Created, RunOutcome, RunState, Timer, TriggerKind, Triggers } from "../../routines";
+export type { Note } from "../../memory";
+export type { CreateRoutineBody, DeclineProposalBody, RoutineKind, RoutinePreset, UpdateRoutineBody } from "../../requests";
+/** `GET /api/projects/<id>/routines`. */
+export interface RoutinesAnswer {
+  routines: import("../../do/project").Routine[];
+  max_routine_runs: number;
+  live: number;
 }

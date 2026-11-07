@@ -654,6 +654,8 @@ const app = {
     { name: "drawer-blocks-deps", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false, after: drawerAt("Pull requests") },
     { name: "drawer-deps-done", section: "project", path: "/projects/prj_demo/board?task=tsk_demo6", full: false, after: drawerAt("Dependencies") },
     { name: "drawer-over", section: "project", path: "/projects/prj_demo/board?task=tsk_demo9", full: false, after: drawerAt("Pull requests") },
+    // A done task made of an issue that GitHub refused to close: why, and the retry.
+    { name: "drawer-issue-failed", section: "project", path: "/projects/prj_demo/board?task=tsk_demo9", full: false },
     { name: "attach-picker-open", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: picker("Pull requests", "Attach PR") },
     { name: "attach-picker-empty", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: picker("Pull requests", "Attach PR", "zzz") },
     { name: "attach-picker-typed", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: picker("Pull requests", "Attach PR", "130") },
@@ -749,6 +751,14 @@ const app = {
     { name: "manager-trace-beginning", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, check: traceCheck, checkName: "trace", after: toTop("the beginning of the trace") },
     { name: "reviews", section: "project", path: "/projects/prj_demo/reviews" },
     { name: "reviews-trace", section: "project", path: "/projects/prj_demo/reviews", after: (p) => p.getByRole("button", { name: "Show the trace of #118" }).click(), check: traceCheck, checkName: "trace" },
+    // The Routines page (README.md#routines): routines in each state, proposals, runs, memory; empty; the editor; a run opened with its trace.
+    { name: "routines", section: "project", path: "/projects/prj_demo/routines" },
+    { name: "routines-empty", section: "project", path: "/projects/prj_demo/routines", fixture: "routines-empty" },
+    { name: "routines-long", section: "project", path: "/projects/prj_demo/routines", fixture: "routines-long" },
+    { name: "routines-add", section: "project", path: "/projects/prj_demo/routines", full: false, after: (p) => p.getByRole("button", { name: "Add routine" }).click() },
+    { name: "routine-edit", section: "project", path: "/projects/prj_demo/routines", full: false, after: (p) => p.getByRole("button", { name: "Edit Dreaming" }).click() },
+    { name: "routine-new", section: "project", path: "/projects/prj_demo/routines", full: false, after: async (p) => { await p.getByRole("button", { name: "Add routine" }).click(); await p.getByRole("menuitem", { name: /Custom routine/ }).click(); } },
+    { name: "routines-run-open", section: "project", path: "/projects/prj_demo/routines", after: async (p) => { const b = p.getByRole("button", { name: "Show run 2 of Dreaming" }); await b.scrollIntoViewIfNeeded(); await b.click(); await p.locator("[data-ds=terminal]").first().waitFor(); }, check: traceCheck, checkName: "trace" },
     // The Network page (README.md#network): rules per role, live agents applied, pending and failed; empty; a host refused.
     { name: "network", section: "project", path: "/projects/prj_demo/network" },
     { name: "network-empty", section: "project", path: "/projects/prj_demo/network", fixture: "network-empty" },
@@ -797,6 +807,13 @@ const app = {
       }));
       return [...(r.error ? [] : ["a refused save shows no reason under Save"]), ...(r.row ? [] : ["a refused save doesn't mark the host it names"]), ...(r.toast ? ["a refused save shows a toast"] : [])];
     } },
+    // Triage (README.md#triage): the issues waiting (one with markup shown as text), none, many and long,
+    // the board's Needs you item for them, declining one.
+    { name: "triage", section: "project", path: "/projects/prj_demo/triage" },
+    { name: "triage-empty", section: "project", path: "/projects/prj_demo/triage", fixture: "triage-empty" },
+    { name: "triage-long", section: "project", path: "/projects/prj_demo/triage", fixture: "triage-long" },
+    { name: "triage-board", section: "project", path: "/projects/prj_demo/board" },
+    { name: "triage-decline", section: "project", path: "/projects/prj_demo/triage", full: false, after: (p) => p.getByRole("button", { name: "Decline issue #44" }).click() },
     { name: "settings", section: "project", path: "/projects/prj_demo/settings", checkName: "workflows", check: (p) => p.evaluate(workflowsAgree) },
     { name: "settings-comments-set", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-set" },
     { name: "settings-comments-id-only", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-id-only" },

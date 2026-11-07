@@ -151,8 +151,10 @@ describe("who is set", () => {
       const sql = st.storage.sql;
       // The shape before the step: none of its columns or table, the attach long done.
       const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("CREATE TABLE pr_inputs")));
-      sql.exec("DROP TABLE pr_inputs");
-      for (const c of ["comments_from_id", "comments_from_login", "comments_decided", "repo_owner_id", "repo_owner_login"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      // And the steps after it (triage, routines).
+      for (const t of ["pr_inputs", "issues", "issue_closes", "routines", "routine_runs", "run_turns", "memory", "proposals"]) sql.exec(`DROP TABLE ${t}`);
+      sql.exec("ALTER TABLE tasks DROP COLUMN issue");
+      for (const c of ["comments_from_id", "comments_from_login", "comments_decided", "repo_owner_id", "repo_owner_login", "routine_cap", "tasks_done_total", "prs_merged_total"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE settings SET attach_next_ms = NULL");
       sql.exec("UPDATE schema_version SET v = ?", step);
       migrate(st.storage, MIGRATIONS);

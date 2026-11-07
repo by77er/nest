@@ -10,9 +10,10 @@
 //   (`opened`, `reopened`, `synchronize`, `closed`) and `check_run` `rerequested` for the app's own
 //   check; the owner's comments on a PR (README.md#pr-comments): `issue_comment` `created` on a PR,
 //   `pull_request_review` `submitted` (with text, or requesting changes) and `pull_request_review_comment`
-//   `created`; `ping` and anything else is acknowledged and ignored, as is a repo no project is attached to.
+//   `created`; `issues` (README.md#triage: opened, reopened, edited, closed, deleted, transferred), never a
+//   PR's; `ping` and anything else is acknowledged and ignored, as is a repo no project is attached to.
 
-import type { PrComment } from "./do/project";
+import { issueEventOf, type PrComment } from "./do/project";
 import { directory, type Env, project, review } from "./env";
 import { CHECK_NAME, verifyGithubSignature } from "./github";
 
@@ -30,6 +31,7 @@ const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
 const prNumber = (v: unknown): number | null => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null);
 
 const COMMENT_EVENTS = new Set(["issue_comment", "pull_request_review", "pull_request_review_comment"]);
+const ISSUE_ACTIONS = new Set(["opened", "reopened", "edited", "closed", "deleted", "transferred"]);
 /** A comment's text kept from the event; the message cuts it further (PR_COMMENT_MAX). */
 const BODY_MAX = 20_000;
 
@@ -107,7 +109,7 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
   } catch {
     return new Response(null, { status: 400 });
   }
-  if (event !== "pull_request" && event !== "check_run" && !COMMENT_EVENTS.has(event ?? "")) return json({ ignored: event ?? "no event" });
+  if (event !== "pull_request" && event !== "check_run" && event !== "issues" && !COMMENT_EVENTS.has(event ?? "")) return json({ ignored: event ?? "no event" });
 
   const dir = directory(env);
   const seenId = `github:${delivery}`;
@@ -161,6 +163,13 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
       await review(env, p.id).onClosed(of, { pr: number, updated_at });
       await project(env, p.id).onPullRequest({ pr: number, task, action: "closed", merged: pr.merged === true });
     }
+  } else if (event === "issues") {
+    // The repo's own issues only (an event names its repo: a fork's goes to no project). Anyone may file;
+    // the text is kept as data, shown escaped, and reaches no agent before the owner accepts it.
+    const e = issueEventOf(payload.issue);
+    // The sender (who acted) by id: a declined issue comes back only when someone the owner trusts reopens it.
+    const sender = obj(payload.sender).id;
+    if (e && action && ISSUE_ACTIONS.has(action)) await project(env, p.id).onIssue({ action, ...e, sender: typeof sender === "number" ? sender : null });
   } else if (COMMENT_EVENTS.has(event!)) {
     const c = prCommentOf(event!, payload, p.repo);
     if (c) await project(env, p.id).onPrComment(c);

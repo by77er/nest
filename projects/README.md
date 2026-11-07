@@ -2,7 +2,7 @@
 
 A task board for GitHub repos, run by agents on nest: an app with its own Worker and Durable Objects, built only on nest's [API clients](../docs/control-plane/api/clients/) interface. nest knows nothing of projects, tasks or reviews. A feature here that seems to need one of nest's internals means that interface is wrong: fix it there, generically, and build this on the result.
 
-**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), the UI ([below](#the-ui)), attaching a repo and the review pipeline ([below](#built-the-review-pipeline)), and auto-merge ([below](#auto-merge)). **Not built:** setting nest's webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
+**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), the UI ([below](#the-ui)), attaching a repo and the review pipeline ([below](#built-the-review-pipeline)), auto-merge ([below](#auto-merge)), and routines and memory ([below](#routines)). **Not built:** setting nest's webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
 
 ## What it does
 
@@ -18,7 +18,7 @@ A task board for GitHub repos, run by agents on nest: an app with its own Worker
 |---|---|
 | Worker `projects` | The UI (Vite + React), the JSON API behind it, the MCP server agents call (`/mcp/<role>`), and two webhook endpoints: nest's (`/hooks/nest`) and GitHub's (`/hooks/github`) |
 | `DirectoryDO` (one) | Projects, repo → project, agent → project and role, the events and deliveries already handled, the app's catalog sync state, the GitHub App's id |
-| `ProjectDO` (one per project) | The project's settings and its repo's attachment, the board (tasks, specs, assignments, the history of each), the chat with the manager, PR → task |
+| `ProjectDO` (one per project) | The project's settings and its repo's attachment, the board (tasks, specs, assignments, the history of each), the chat with the manager, PR → task, the routines and their runs, the memory notes |
 | `ReviewDO` (one per project) | The review queue: one job per PR head, its reviewer agent, its check run, its verdict. It's an asynchronous process of its own, with its own alarm and an optional concurrency cap (none by default) |
 
 All state is the app's. nest holds the agents, their sandboxes and their transcripts, and labels each agent with `project`, `role` and, for a worker, `task`, or for a reviewer, `pr` and `sha`. The app finds its agents by those labels after losing track of one.
@@ -36,7 +36,7 @@ Only the client interface. One client, `projects`, has this grant:
 
 | Need | Interface |
 |---|---|
-| Templates for the three roles | `PUT /v1/catalog/templates/projects/{manager,worker,reviewer}` and capabilities `projects/{board,task,review}` (the MCP URLs), synced from this directory at deploy |
+| Templates for the four roles | `PUT /v1/catalog/templates/projects/{manager,worker,reviewer,routine}` and capabilities `projects/{board,task,review,routine}` (the MCP URLs), synced from this directory at deploy |
 | Starting an agent | `POST /v1/sandboxes {cell, labels}`, then `POST /v1/agents {template: "projects/<role>", cell, sandbox, labels, overrides}`, each with an `Idempotency-Key`. `overrides` is `{repos: [<repo>]}` for a worker, whose sandbox pushes only to that repo, and `{read_repos: [<repo>]}` for the manager and a reviewer, whose sandboxes only read it ([read-only repos](../docs/sandbox/networking/egress/policy/#read-only-repos)). The agent clones it |
 | Talking to the manager | `POST /v1/agents/<id>/inbox`. Replies arrive as `agent.turn_completed` events |
 | Approvals | `agent.ask` events, shown in "Needs you" with blocked tasks ([below](#blocked)), answered by `POST /v1/agents/<id>/asks/…` |
@@ -51,7 +51,7 @@ Only the client interface. One client, `projects`, has this grant:
 
 ## The MCP server: agents see only their own work
 
-- **One URL per role:** `/mcp/board` for the manager, `/mcp/task` for a worker, `/mcp/review` for a reviewer. nest lists a server's tools over one session shared by every agent on it, so a role's tool list is its URL's. Which data a call may touch is decided per call, from the caller's identity.
+- **One URL per role:** `/mcp/board` for the manager, `/mcp/task` for a worker, `/mcp/review` for a reviewer, `/mcp/routine` for a routine run ([routines](#routines)). nest lists a server's tools over one session shared by every agent on it, so a role's tool list is its URL's. Which data a call may touch is decided per call, from the caller's identity.
 - **Every request** must carry a valid `Nest-Identity`:
   - signed by a key from nest's JWKS;
   - `aud` is that URL, and `iss` is nest;
@@ -62,6 +62,7 @@ Only the client interface. One client, `projects`, has this grant:
   - The manager reads and writes the board of its `project`.
   - A worker reads its `task`, posts progress on it, marks it blocked or clears that, and says when its PR is open. It sees no other task.
   - A reviewer reads its `pr` at its `sha`, and submits one verdict per dimension (correctness, quality, architectural cohesiveness) with a summary.
+  - A routine run acts only while its `run` is live and is this very agent's (its `routine` and `run` labels): it reads the board and recent work, proposes tasks and keeps memory ([routines](#routines)).
 - **`tainted`** is recorded with each write and shown on the board. It gates nothing: a worker and a reviewer read repo content by design.
 
 ## Flows
@@ -262,6 +263,78 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
 - Each delivery is recorded on the task (`pr_comment`, `revise`).
 - **Open:** route GitHub's events by `repository.id` and the installation id recorded at attach, not by `full_name`, so a renamed namespace that someone registers again can't reach the project (a follow-up).
 
+## Triage
+
+The owner's request (2026-11-06): GitHub issues on a project's repo go into a triage queue, and accepted ones are added to the board.
+
+- **Intake** (`/hooks/github`, the same signature check, delivery claim and repo → project routing):
+  - `issues` `opened` and `reopened` add an issue, or restore one that went, when the event shows it open (a late delivery for an issue closed since adds nothing).
+  - A declined issue comes back only when reopened by the comments user or the repo's owner (the event's `sender`, by id), so its author can't undo a decline by closing and reopening it.
+  - `edited` updates one still untriaged (or adds it, open, if its opening was missed).
+  - `closed`, `deleted` and `transferred` take an untriaged one out.
+  - An accepted issue is its task's from then on, and none of these change it.
+  - A PR (GitHub sends a PR's issue as an issue) is ignored. Another repo's issue, a fork's included, reaches no project.
+- **Anyone can file, so its text is data:**
+  - The title and body are kept (300 and 20,000 characters, the rest at its link).
+  - They're shown as plain text, never rendered as markup.
+  - Accept carries the issue's `updated_ms` as the owner read it; an issue edited since is refused (`409`), and the page shows the new text and asks again. What becomes the task is what the owner read.
+  - No agent reads them before the owner accepts the issue.
+- **The Triage page** (after Board) lists the untriaged issues, oldest first, with title, number, author, age, the body as text (its first five lines, with "Show more" for the rest in place) and the link.
+  - **Accept** makes a draft task: the issue's title, and its body plus a line linking back (`From issue #n: <url> (opened by <author>)`). The owner or the manager specs it, as any draft.
+    - The task records its issue.
+    - It's marked tainted (an `issue_accepted` record), since its text is anyone's. The manager's and its workers' sessions that read it are then tainted, as nest's rule has it.
+  - **Decline** takes it out, with an optional reason. It doesn't touch GitHub: closing there is the owner's call.
+  - **Import open issues** is a one-off that brings in the repo's open issues the app doesn't know yet (it reads the oldest 300 open items, and PRs, which GitHub lists among issues, count toward the 300 before they're left out). It needs `issues: read`. Issues opened before the app subscribed come in only this way: events GitHub sent before it was ignored and aren't replayed.
+- **"Needs you"** shows one item for the waiting issues, their count, linking to Triage. The projects list's count includes each one.
+- **A task made of an issue, done through a merged PR,** closes the issue: a comment "Done in #<pr>.", then closed as completed (`issue_closes`, from the alarm).
+  - It needs `issues: write` in the client's grant.
+  - A refusal that will repeat (no permission, the issue gone) is recorded on the task (`issue_close_failed`) and shown in its drawer, with **Retry closing the issue** (`POST /api/projects/<id>/tasks/<task>/issue/close`). It's also tried again by itself when a read of the grant (`GET /v1/clients/self`) shows its `issues` permission changed to `write` or `admin`. Anything else is retried with backoff.
+  - The comment is posted once: not again on a retry after it landed, nor when it landed and its answer was lost (the issue's comments since the close was owed are checked for the line first).
+  - A task's message to its worker is relayed (`from`) whenever the task was ever tainted, whoever made the change.
+
+## Routines
+
+The owner's request (2026-11-06): "schedule periodic background tasks for things like spontaneous reviews and memory consolidation (dreaming)… on a timer or on some other condition, like 'n tasks completed', and have the ability to create tasks."
+
+- **A routine** (`src/routines.ts`, pure; ProjectDO's `routines` and `routine_runs`): a name, a kind (`review`, `dreaming`, `custom`), the owner's prompt, enabled, its triggers, a cooldown, a time and turn budget, and where its proposals go. Nothing of it is in nest: nest sees only the agents it starts.
+- **Triggers,** any of which fires it:
+  - a timer: an interval of 15 minutes to 7 days, or a daily or weekly time in an IANA time zone (DST handled; a time skipped forward lands after the skip). Missed fires aren't caught up;
+  - counters: N tasks reached `done`, or N task PRs merged (a task's own PR only), since its last run. The board keeps two totals (`tasks_done_total`, `prs_merged_total`, moved where a task becomes done and where a task PR merges); a routine keeps the totals at its last run, or at its enabling, so a long pause doesn't fire it at once.
+  - "Run now", the owner's.
+- **Starting** (`startVerdict`), decided in one synchronous step in ProjectDO (its alarm, or the step that moved a counter): a fired trigger makes the routine due (a second trigger while it's due is the same run). A due routine starts a run only if none of its own runs is live (one at a time), past its cooldown from its last start ("Run now" skips the cooldown, not the rest), and while the project's live runs are fewer than `max_routine_runs` (Settings, 1 to 3, default 1). Otherwise it waits, shown as `running`, `cooldown` or `cap`, and a run's end ticks again.
+- **A run** is one agent, started as workers are (`Nest.startAgent`, `Idempotency-Key: <project>/routine/<run>/{sandbox,agent}`), labelled `project`, `role=routine`, `routine`, `run`:
+  - the `projects/routine` template: ephemeral (nest ends it once its turn is done), `read_repos` (it reads the repo, never pushes), no secrets, no egress beyond nest's and the repo's, no timers, no spawning;
+  - a **dreaming** run uses `projects/dreaming` instead: no hands at all (no sandbox, no repo, no web), since the board, recent work, memory and transcripts are all it reads;
+  - its brief: why it runs (the trigger and count), when the last run started, where its proposals go, whether it may read transcripts, and the owner's prompt. App-authored and the owner's, so not relayed;
+  - **cost guards:** stopped (`stop {end, destroy_sandbox}`) when its time budget (`max_minutes`, 5 to 120, from its first start attempt) runs out (`timed_out`), or once its turns reach `max_turns` (1 to 20), each turn counted once by its event id (`run_turns`), so a redelivered event isn't a second turn. A start retried 8 times, or refused for good, fails the run;
+  - **its record:** the trigger, its state and outcome (`done`, `failed`, `timed_out`, `stopped`), its agent (its trace is viewable, as any agent's), its turns, its last turn's text as its report, and what it made (proposals, draft tasks, memory notes written or deleted).
+- **Its tools** (`/mcp/routine`): `list_tasks`, `get_task`, `recent_activity` (task PRs merged, tasks done, reviews and their verdicts, the owner's PR comments relayed, for up to 30 days), `manager_chat`, `propose_task`, and the memory tools. Nothing that assigns, starts or changes a task.
+- **Proposals:** `propose_task` puts a task into the triage queue (`proposals`, `GET /api/projects/:id/proposals`), marked with its routine and run; the owner accepts it (a draft task, recorded tainted: `proposal_accepted`) or declines it. A routine may instead be set to put them on the board as drafts (unassigned; a draft is never auto-assigned). At most 5 per run, and 50 pending across the project either way (untriaged, or drafts a routine proposed not yet specced, cancelled or deleted).
+- **Taint:** a run has hands, so nest taints its session; the app records every write of a run as tainted whatever the session says (its proposals, its tasks, its notes), since it reads anyone's text (the repo, PRs, comments, reviews).
+- **The API:** `GET`/`POST /api/projects/:id/routines` (a body of every field, or `{preset}`), `GET`/`PATCH`/`DELETE …/routines/:routine` (a routine with a live run isn't deleted), `POST …/routines/:routine/run`, `GET …/routines/:routine/runs`, `GET …/routine-runs`, `POST …/routine-runs/:run/stop`, `POST …/proposals/:proposal/{accept,decline}`.
+- **Transcripts:** a dreaming run is spawned with nest's own transcript grant ([grants to its agents](../docs/control-plane/api/clients/#grants-to-its-agents): `grants: [{action: read_transcript, resource: "agent{project=<id>}", limits: {max_age_ms, max_entries: 200}, expires_ms}]` at `POST /v1/agents`). It reads the project's agents' transcripts back to its last run (a week for the first, 30 days at most), until its deadline (a grant can't be revoked on its own, so it expires with the run), with nest's `list` and `read_transcript`, which taint it. The app never reads or proxies a transcript. `routineSpawnExtras` is the one place it's made. It's kept with the run, with the run's template and brief, all frozen at its first start attempt, so a retry sends the same requests however the routine was edited meanwhile. Other kinds get none.
+
+- **The Routines page** (`src/ui/features/routines/`, after Reviews in the sidebar), top to bottom:
+  - **Routines,** as Panels: the name, a status badge only when there's something to say (Running, Queued, Cooling down, Off), the triggers in words ("Mondays at 09:00 (Europe/London) · Every 5 task PRs merged"), the next timer, the counters' progress ("3 of 5 PRs merged"), the last run and its outcome, and why a queued one waits. Edit and Run now at the top right. "Add routine" offers the two presets (one click, each once) and a custom one.
+  - **The editor,** a Sheet: name, kind, instructions; when it runs (a timer, the two counters; empty is off); limits; where proposed tasks go. Checked with the Worker's schema before it's sent; its refusal is shown in the form. Delete is last, set apart, confirmed, and refused while a run is going.
+  - **Proposed tasks** waiting for the owner, under a caption saying they come from what agents read: title; "Tainted", which explains itself on hover, focus or tap ("Written by an agent that read untrusted text…"); its routine, run and when; the body as plain text (never rendered), its first 5 lines or 400 characters with "Show more", as Triage shows an issue (the first 10 proposals, then "Show all"); "Accept as draft" at the left and Decline (an optional reason, confirmed) at the right edge, as on Triage.
+  - **Runs,** newest first, the latest 10 then "Show older": routine, why, state, what it made, started, took; opened, why it ended, its report (plain text), what it made, Stop while live (confirmed), and its agent's trace (`RunTrace`, the shared viewer). A card per run below `sm`, its "Show details" the card's full width.
+  - **Memory:** the latest 10 notes, then "Show all", and a filter by key or text once there are more; each note's key, its text (first lines, "Show more"), who wrote it ("the manager", "the routine Dreaming (run …)") and when, and "Tainted" on one a tainted session wrote; Delete, confirmed. Read-only otherwise for now.
+- **Not yet:** proposals in "Needs you" and its count, and on the Triage page beside the issues; editing a note.
+
+### Presets
+
+Enabled with one click (`POST …/routines {preset}`), then edited like any routine (times in UTC until edited):
+- **Spontaneous review:** every 5 task PRs merged, or weekly (Monday 09:00); 6 h cooldown, 30 min. Reviews what merged to the default branch since its last run for bugs, risks and smells, and proposes tasks.
+- **Dreaming:** nightly (03:00), or every 10 tasks done; 12 h cooldown, 20 min. Consolidates memory: merges duplicates, rewrites stale notes, prunes, and folds in lessons from recent tasks, reviews, PR comments and the manager chat; may propose tasks.
+
+## Memory
+
+- **Notes** (`src/memory.ts`; ProjectDO's `memory`): a key (lowercase words joined by `-`, `.` or `_`), text (at most 2,000 characters), when it was last written, its source (`manager`, or `routine:<name> (<run>)`) and that write's taint. At most 100 per project: a write past that is refused until notes are merged or deleted.
+- **Provenance:** a tainted session (every routine run, and any manager session nest has tainted) can't change or delete a note an untainted session wrote: refused, with the note kept as it was. It may write its own note under another key. So text a run read from anyone can't replace what came from a clean session; dreaming writes beside such a note and says why.
+- **Who:** the manager reads and writes it (`memory_list`, `memory_get`, `memory_write`, `memory_delete` on `/mcp/board`; its prompt says to read it at the start and before it specs); a worker reads it (`memory_list`, `memory_get`); routine runs read and write it; a reviewer gets none. The owner reads it and deletes notes (`GET /api/projects/:id/memory`, `DELETE …/memory/:key`).
+- **Why the app's own store:** nest's `memory` capability is per agent and not built (its tools answer `not_implemented`), and nest has no channel primitive yet. A project's memory is shared by its agents and outlives each one, so it's the project's state, like the board. If nest gains a shared keyed store an app can grant its agents, this moves there.
+
 ## Dependencies
 
 The owner's request (2026-11-03): "Tasks should be able to block other tasks."
@@ -341,7 +414,7 @@ The owner's rule (2026-11-02): credentials never enter sandboxes. What an agent 
 
 ## The UI
 
-**Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `attention`, `settings`, `admin`, `trace`), each component next to its test. `src/main.tsx` mounts it.
+**Code:** `src/ui/`: the layout primitives in `layout/`, one folder per feature in `features/` (`shell`, `projects`, `project`, `board`, `task`, `chat`, `attention`, `settings`, `admin`, `trace`, `routines`), each component next to its test. `src/main.tsx` mounts it.
 
 - **Stack:** React 19 with [Mantine](https://mantine.dev/) 9 and one theme (`src/ui/theme.ts`); TanStack Query for all server state (`src/ui/api/`), TanStack Router for typed routes (`src/ui/router.tsx`), dnd-kit for reordering the board, Tabler icons, Inter and JetBrains Mono self-hosted from npm.
 - **A strict Content-Security-Policy** (`src/csp.ts`) on everything the Worker serves from its assets: only the app's own scripts (no inline script or eval; the color-scheme snippet is `public/scheme.js`), fetches and the trace's WebSocket to this origin only, fonts and images from it or `data:`, no framing (`frame-ancestors 'none'`). Styles may be inline: Mantine writes CSS variables in `style` attributes and a `<style>` tag. `vite dev` runs without it, for its inline preamble and HMR client.
@@ -351,7 +424,7 @@ The owner's rule (2026-11-02): credentials never enter sandboxes. What an agent 
 - **Actions follow the state machine:** a button shows only when `src/tasks.ts` allows its move. Cancelling, deleting and marking done are confirmed, with the safe choice focused; "Mark done" shows only for a task with no PR and no live worker. A failed write is a notification (bottom right) with the Worker's reason.
 - **The shell** (the skill's [Navigation](../.claude/skills/nest-ui-design/SKILL.md#navigation)): a persistent left sidebar (a burger-toggled drawer below `md`). At its top the product's name, small; then **which project**, a switcher (the current project's name; a searchable, keyboard-first list of "All projects" and every project, keeping the view on a pick); then **which view**, the project's Manager (first, the default), Board, Reviews and Settings as flat rows (Board carries its "needs you" count, the one place it shows for the current project; the switcher's list shows every project's); outside a project, the projects list's row only; Admin at its foot. Every row is one `NavRow`; the active one is quiet (the subtle ground, full weight, a 2 px rule in the text color). The page's h1 is the project's name, with the repo, auto-assign and the worker cap below it; no breadcrumb.
 - **Settings:** what can be changed (Workers, Auto-merge) as two Panels in one row, saved together by the Save right under them at the bottom right (on a phone, right after the last field); then what's read-only (the project's repo, its secrets) in a row of its own. Panel titles are h4s, and each Panel is as tall as its content.
-- **Routes:** `/projects` (the list; `/` redirects there); `/projects/<id>/manager` is the default for `/projects/<id>` (an old link with `?task=` goes to the board); `/projects/<id>/board` ( "Needs you" at the top, its oldest three shown and the rest behind "Show all (n)", then the board at full width, `?task=<id>` opening the task's drawer; an old `/projects/<id>?task=…` link redirects with its task), `/projects/<id>/manager` (the chat; `?view=trace` the manager's live trace), `/projects/<id>/reviews` (ReviewDO's jobs, read-only, each with its reviewer's live trace on demand; a table, or below `sm` a card per review: its PR and title, sha, state, verdicts, when, and its trace), `/projects/<id>/settings`, and `/admin` (the catalog sync and the last one). Each page is a chunk of its own, loaded on first visit; Mantine, React and the other libraries are chunks of their own too (vite.config.ts), cached across releases.
+- **Routes:** `/projects/<id>/routines` (routines, proposed tasks, runs, memory; [routines](#routines)); `/projects` (the list; `/` redirects there); `/projects/<id>/manager` is the default for `/projects/<id>` (an old link with `?task=` goes to the board); `/projects/<id>/board` ( "Needs you" at the top, its oldest three shown and the rest behind "Show all (n)", then the board at full width, `?task=<id>` opening the task's drawer; an old `/projects/<id>?task=…` link redirects with its task), `/projects/<id>/manager` (the chat; `?view=trace` the manager's live trace), `/projects/<id>/reviews` (ReviewDO's jobs, read-only, each with its reviewer's live trace on demand; a table, or below `sm` a card per review: its PR and title, sha, state, verdicts, when, and its trace), `/projects/<id>/settings`, and `/admin` (the catalog sync and the last one). Each page is a chunk of its own, loaded on first visit; Mantine, React and the other libraries are chunks of their own too (vite.config.ts), cached across releases.
 - **The Manager page:** in the same frame as every view: the conversation on the frame's left edge, at least the reading measure, and a context column beside it to the frame's right edge, at most a third of the width, one `2xl` gap away at every width: "Working on" (the tasks under way, `assigned` to `stalled`, newest change first, as task cards; five, then "and N more on the board"; the count is all of them) and "Needs you" (the oldest three asks and blocks, each a link to the Board's "Needs you", or a sentence when there are none). Its status is the header's. Below `lg` the context is a disclosure above the chat ([the chat](#the-manager-chat)). The manager's status comes from `GET /api/projects/<id>/manager` (`src/manager.ts`): attaching, attach failed (with a retry), starting, waiting for a host, running (and what it's doing), errored, ended.
 - **History** reads as sentences ("PR #118 opened", "Assigned to agt_…", "Spec written, 3 acceptance criteria"), with who and when; the raw detail is behind "Details".
 - **The board's cards** carry `tainted` (any write to the task came from a tainted session), which the task list returns, a "Blocked" badge (warning) while the task is blocked, and a "needs input" marker from the project's open asks.

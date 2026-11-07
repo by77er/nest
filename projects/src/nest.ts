@@ -83,6 +83,9 @@ export interface SpawnOverrides {
   sandbox_idle_ttl_ms?: number;
 }
 
+/** Fields an agent's spawn carries beyond its template and overrides (none yet: README.md#routines, the transcript grant). */
+export type AgentExtras = Record<string, unknown>;
+
 const TOKEN = /^nest_cli_([A-Za-z0-9]+)_[0-9a-f]{64}$/;
 
 /** The client id a token belongs to (`nest_cli_<id>_<secret>` → `cli_<id>`), or null if it isn't a client token. */
@@ -135,7 +138,7 @@ export class Nest {
   }
 
   /** Create an agent in the app's cell. The same `idempotencyKey` with the same request answers the same agent. */
-  createAgent(r: { template: string; sandbox?: string; labels: Labels; overrides?: SpawnOverrides; start?: boolean }, idempotencyKey: string): Promise<AgentView> {
+  createAgent(r: { template: string; sandbox?: string; labels: Labels; overrides?: SpawnOverrides; start?: boolean } & AgentExtras, idempotencyKey: string): Promise<AgentView> {
     return this.call("POST", "/v1/agents", { ...r, cell: this.config.cell }, { idempotencyKey });
   }
 
@@ -143,12 +146,13 @@ export class Nest {
    * A new agent with a sandbox of its own, both labelled, its repos narrowed to `repo`: to push to
    * (`overrides.repos`), or only to read (`overrides.read_repos`), as its template has them.
    * `key` names this start attempt: a retry after a lost answer sends the same Idempotency-Keys
-   * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back.
+   * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back. `agent` adds fields to the
+   * agent's spawn (README.md#routines: a routine's grants).
    */
-  async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string, extras: SandboxExtras = {}): Promise<string> {
+  async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string, extras: SandboxExtras = {}, agent: AgentExtras = {}): Promise<string> {
     const sandbox = (await this.createSandbox({ labels, ...extras }, `${key}/sandbox`)).sandbox;
     const overrides: SpawnOverrides = "push" in repo ? { repos: [repo.push] } : { read_repos: [repo.read] };
-    return (await this.createAgent({ template, sandbox, labels, overrides, start: true }, `${key}/agent`)).agent;
+    return (await this.createAgent({ ...agent, template, sandbox, labels, overrides, start: true }, `${key}/agent`)).agent;
   }
 
   /** Destroy one of the app's sandboxes (`DELETE /v1/sandboxes/<id>`, owner auth). */
@@ -228,7 +232,10 @@ export class Nest {
   /** The client's own record (`GET /v1/clients/self`): its grant, among the rest. */
   self(): Promise<{
     client?: string;
-    grant?: { egress_hosts?: string[]; inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean } };
+    grant?: {
+      egress_hosts?: string[]; inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean };
+      github?: { repos?: string[]; permissions?: Record<string, string> };
+    };
   }> {
     return this.call("GET", "/v1/clients/self");
   }

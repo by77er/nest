@@ -3,7 +3,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "./client";
-import type { PutSecretBody } from "./types";
+import type { CreateRoutineBody, PutSecretBody, UpdateRoutineBody } from "./types";
 import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
 
 export const keys = {
@@ -18,11 +18,16 @@ export const keys = {
   openPrs: (id: string) => ["projects", id, "open-prs"] as const,
   secrets: (id: string) => ["projects", id, "secrets"] as const,
   attention: (id: string) => ["projects", id, "attention"] as const,
+  routines: (id: string) => ["projects", id, "routines"] as const,
+  runs: (id: string) => ["projects", id, "routine-runs"] as const,
+  proposals: (id: string) => ["projects", id, "proposals"] as const,
+  memory: (id: string) => ["projects", id, "memory"] as const,
+  issues: (id: string) => ["projects", id, "issues"] as const,
   syncState: ["admin", "sync-state"] as const,
 };
 
 /** How often each live view polls, in ms. */
-export const POLL = { board: 5_000, chat: 3_000, asks: 5_000, project: 10_000, task: 5_000, manager: 10_000, reviews: 15_000 } as const;
+export const POLL = { board: 5_000, chat: 3_000, asks: 5_000, project: 10_000, task: 5_000, manager: 10_000, reviews: 15_000, routines: 10_000 } as const;
 
 // --- reads ------------------------------------------------------------------------------------------
 
@@ -176,6 +181,29 @@ export function useSecretRequestDone(id: string) {
   });
 }
 
+// --- triage (README.md#triage) ----------------------------------------------------------------------
+
+/** The repo's issues waiting for triage, polled as "Needs you" is. */
+export const useIssues = (id: string) => useQuery({ queryKey: keys.issues(id), queryFn: () => api.issues(id), refetchInterval: POLL.asks });
+
+/** A triage write: the queue, the board and "Needs you" (its count) all move. */
+function useTriageWrite<V, R>(id: string, fn: (v: V) => Promise<R>, failure: string, inline = false) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: fn,
+    meta: { failure, inline },
+    onSettled: () => Promise.all([
+      qc.invalidateQueries({ queryKey: keys.issues(id) }), qc.invalidateQueries({ queryKey: keys.tasks(id) }),
+      qc.invalidateQueries({ queryKey: keys.attention(id) }), qc.invalidateQueries({ queryKey: keys.projects, exact: true }),
+    ]),
+  });
+}
+/** Accept, with the issue's `updated_ms` as read: its failure shows on the issue (one edited since asks again). */
+export const useAcceptIssue = (id: string) =>
+  useTriageWrite(id, (v: { n: number; updated_ms: number }) => api.acceptIssue(id, v.n, { updated_ms: v.updated_ms }), "The issue wasn't accepted", true);
+export const useDeclineIssue = (id: string) => useTriageWrite(id, (v: { n: number; reason: string }) => api.declineIssue(id, v.n, v.reason ? { reason: v.reason } : {}), "The issue wasn't declined");
+export const useImportIssues = (id: string) => useTriageWrite(id, () => api.importIssues(id), "The open issues weren't imported");
+
 export const useSyncState = () => useQuery({ queryKey: keys.syncState, queryFn: api.syncState });
 
 // --- writes -----------------------------------------------------------------------------------------
@@ -250,6 +278,9 @@ export const useCancelTask = (id: string) =>
   useTaskWrite(id, (v: { task: string } & CancelBody) => api.cancelTask(id, v.task, { ...(v.reason ? { reason: v.reason } : {}) }), "The task wasn't cancelled");
 
 export const useMarkDone = (id: string) => useTaskWrite(id, (v: { task: string }) => api.markDone(id, v.task), "The task wasn't marked done");
+
+/** Try closing a done task's issue on GitHub again, after GitHub refused it (README.md#triage). */
+export const useRetryIssueClose = (id: string) => useTaskWrite(id, (v: { task: string }) => api.retryIssueClose(id, v.task), "The issue close wasn't retried");
 
 export function useDeleteTask(id: string) {
   const qc = useQueryClient();
@@ -330,5 +361,55 @@ export function useSync() {
     mutationFn: api.sync,
     meta: { inline: true },
     onSettled: () => qc.invalidateQueries({ queryKey: keys.syncState }),
+  });
+}
+
+// --- routines and memory (README.md#routines) ------------------------------------------------------------
+
+export const useRoutines = (id: string) => useQuery({ queryKey: keys.routines(id), queryFn: () => api.routines(id), refetchInterval: POLL.routines });
+export const useRoutineRuns = (id: string) => useQuery({ queryKey: keys.runs(id), queryFn: () => api.routineRuns(id), refetchInterval: POLL.routines });
+export const useProposals = (id: string) => useQuery({ queryKey: keys.proposals(id), queryFn: () => api.proposals(id), refetchInterval: POLL.routines });
+export const useMemory = (id: string) => useQuery({ queryKey: keys.memory(id), queryFn: () => api.memory(id), refetchInterval: POLL.routines });
+
+/** A write to routines: the routines and their runs read again after it. */
+function useRoutineWrite<V, R>(id: string, fn: (v: V) => Promise<R>, failure: string | null) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: fn,
+    // null: the form shows its error itself.
+    meta: failure === null ? { inline: true } : { failure },
+    onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: keys.routines(id) }), qc.invalidateQueries({ queryKey: keys.runs(id) })]),
+  });
+}
+
+export const useCreateRoutine = (id: string) => useRoutineWrite(id, (b: CreateRoutineBody) => api.createRoutine(id, b), null);
+/** A preset, added with one click (its failure a notification: there's no form to show it). */
+export const useAddPreset = (id: string) => useRoutineWrite(id, (preset: "review" | "dreaming") => api.createRoutine(id, { preset }), "The routine wasn't added");
+export const useUpdateRoutine = (id: string) =>
+  useRoutineWrite(id, (v: { routine: string } & UpdateRoutineBody) => {
+    const { routine, ...b } = v;
+    return api.updateRoutine(id, routine, b);
+  }, null);
+export const useDeleteRoutine = (id: string) => useRoutineWrite(id, (routine: string) => api.deleteRoutine(id, routine), "The routine wasn't deleted");
+export const useRunRoutine = (id: string) => useRoutineWrite(id, (routine: string) => api.runRoutine(id, routine), "The routine didn't start");
+export const useStopRun = (id: string) => useRoutineWrite(id, (run: string) => api.stopRun(id, run), "The run wasn't stopped");
+
+/** Accept or decline a proposed task: the queue, and the board an accepted one lands on, read again. */
+export function useTriageProposal(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (v: { proposal: string; accept: boolean; reason?: string }): Promise<unknown> =>
+      v.accept ? api.acceptProposal(id, v.proposal) : api.declineProposal(id, v.proposal, v.reason ? { reason: v.reason } : {}),
+    meta: { failure: "The proposal wasn't triaged" },
+    onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: keys.proposals(id) }), qc.invalidateQueries({ queryKey: keys.tasks(id) })]),
+  });
+}
+
+export function useDeleteNote(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (key: string) => api.deleteNote(id, key),
+    meta: { failure: "The note wasn't deleted" },
+    onSettled: () => qc.invalidateQueries({ queryKey: keys.memory(id) }),
   });
 }

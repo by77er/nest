@@ -5,6 +5,7 @@
 //   /projects/$projectId/board         its board; `?task=` opens a task's drawer
 //   /projects/$projectId/manager       the chat with its manager (the default page); `?view=trace` its trace
 //   /projects/$projectId/reviews       its review jobs
+//   /projects/$projectId/routines      its routines, their runs and proposals, and its memory
 //   /projects/$projectId/network       its agents' network rules
 //   /projects/$projectId/settings      its settings
 //   /admin                             the catalog sync
@@ -20,8 +21,10 @@ const ProjectsPage = lazyRouteComponent(() => import("./features/projects/Projec
 const BoardPage = lazyRouteComponent(() => import("./features/project/BoardPage"), "BoardPage");
 const ManagerPage = lazyRouteComponent(() => import("./features/manager/ManagerPage"), "ManagerPage");
 const ReviewsPage = lazyRouteComponent(() => import("./features/reviews/ReviewsPage"), "ReviewsPage");
+const RoutinesPage = lazyRouteComponent(() => import("./features/routines/RoutinesPage"), "RoutinesPage");
 const SettingsPage = lazyRouteComponent(() => import("./features/settings/SettingsPage"), "SettingsPage");
 const NetworkPage = lazyRouteComponent(() => import("./features/network/NetworkPage"), "NetworkPage");
+const TriagePage = lazyRouteComponent(() => import("./features/triage/TriagePage"), "TriagePage");
 const SecretsPage = lazyRouteComponent(() => import("./features/secrets/SecretsPage"), "SecretsPage");
 const AdminPage = lazyRouteComponent(() => import("./features/admin/AdminPage"), "AdminPage");
 
@@ -64,8 +67,10 @@ const manager = createRoute({
 });
 
 const reviews = createRoute({ getParentRoute: () => project, path: "reviews", component: ReviewsPage });
+const routines = createRoute({ getParentRoute: () => project, path: "routines", component: RoutinesPage });
 const settings = createRoute({ getParentRoute: () => project, path: "settings", component: SettingsPage });
 const network = createRoute({ getParentRoute: () => project, path: "network", component: NetworkPage });
+const triage = createRoute({ getParentRoute: () => project, path: "triage", component: TriagePage });
 /** `?add=<name>&hosts=<a,b>` opens the form prefilled: an agent's request, from "Needs you". */
 const secrets = createRoute({
   getParentRoute: () => project,
@@ -79,7 +84,7 @@ const secrets = createRoute({
 
 const admin = createRoute({ getParentRoute: () => root, path: "/admin", component: AdminPage });
 
-export const routeTree = root.addChildren([home, projects, project.addChildren([projectIndex, board, manager, reviews, secrets, network, settings]), admin]);
+export const routeTree = root.addChildren([home, projects, project.addChildren([projectIndex, board, triage, manager, reviews, routines, secrets, network, settings]), admin]);
 
 export function createAppRouter(o: { history?: RouterHistory } = {}) {
   return createRouter({ routeTree, ...(o.history ? { history: o.history } : {}), defaultPreload: "intent", scrollRestoration: true });

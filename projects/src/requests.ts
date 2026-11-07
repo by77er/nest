@@ -34,6 +34,8 @@ export const Settings = z.strictObject({
   comments_from_login: z.string().trim().min(1).max(39).nullable().optional(),
   // Or the repo's owner, as GitHub names the repo's owner now (by its id: never looked up by login).
   comments_from_repo_owner: z.boolean().optional(),
+  // Routine runs at once across the project (README.md#routines).
+  max_routine_runs: z.number().int().min(1).max(3).optional(),
 });
 export const CreateTask = z.strictObject({ title: z.string().min(1).max(200), body: Text(20000).optional() });
 export const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).optional(), body: Text(20000).optional(), ord: z.number().finite().optional() });
@@ -59,12 +61,68 @@ export const PutSecret = z.strictObject({
   /** The variable holding its placeholder (src/secrets.ts checks it). */
   env: z.string().min(1).max(64),
 });
+/** Accepting an issue in triage (README.md#triage): its `updated_ms` as the owner read it. */
+export const AcceptIssue = z.strictObject({ updated_ms: z.number().int().nonnegative() });
+export type AcceptIssueBody = z.input<typeof AcceptIssue>;
+/** Declining an issue in triage (README.md#triage): an optional reason, kept on it. */
+export const DeclineIssue = z.strictObject({ reason: z.string().max(500).optional() });
+export type DeclineIssueBody = z.input<typeof DeclineIssue>;
 export const Chat = z.strictObject({ text: z.string().min(1).max(20000) });
 export const Answer = z.strictObject({ answer: z.string().max(20000) });
 export const Cancel = z.strictObject({ reason: Text(1000).optional() });
 /** A role's egress rules (src/network.ts checks hosts against the grant). */
 const Rule = z.strictObject({ host: z.string().min(1).max(253), ports: z.array(z.number().int().min(1).max(65_535)).min(1).max(16).optional() });
 export const Network = z.strictObject({ worker: z.array(Rule).max(64), manager: z.array(Rule).max(64) });
+
+/** A time of day, HH:MM (24 h). */
+const HHMM = z.string().regex(/^([01][0-9]|2[0-3]):[0-5][0-9]$/, "a time, HH:MM");
+/** An IANA time zone the runtime knows (the daily and weekly timers' wall clock). */
+const TimeZone = z.string().min(1).max(64).refine((tz) => {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}, "an IANA time zone, like Europe/London");
+/** A routine's timer (README.md#routines): an interval of 15 minutes to 7 days, or a daily or weekly time. */
+export const Timer = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("interval"), minutes: z.number().int().min(15, "At least 15 minutes").max(7 * 24 * 60, "At most 7 days (10080 minutes)") }),
+  z.strictObject({ kind: z.literal("daily"), time: HHMM, tz: TimeZone }),
+  // day: 0 is Sunday, as JavaScript's getDay.
+  z.strictObject({ kind: z.literal("weekly"), day: z.number().int().min(0).max(6), time: HHMM, tz: TimeZone }),
+]);
+/** What fires a routine, any of them: its timer, or N tasks done or N task PRs merged since its last run. */
+export const Triggers = z.strictObject({
+  timer: Timer.nullable(),
+  tasks_done: z.number().int().min(1).max(1000).nullable(),
+  prs_merged: z.number().int().min(1).max(1000).nullable(),
+});
+export const ROUTINE_KINDS = ["review", "dreaming", "custom"] as const;
+export const ROUTINE_PRESETS = ["review", "dreaming"] as const;
+const RoutineFields = {
+  name: z.string().trim().min(1).max(80),
+  kind: z.enum(ROUTINE_KINDS),
+  /** The owner's instructions for each run (the brief carries them, untainted). */
+  prompt: z.string().trim().min(1).max(8000),
+  enabled: z.boolean(),
+  triggers: Triggers,
+  /** At least this long between two runs' starts (a manual run skips it). */
+  cooldown_min: z.number().int().min(0).max(7 * 24 * 60),
+  /** The run is stopped after this long (its cost guard). */
+  max_minutes: z.number().int().min(5).max(120),
+  /** The run is stopped after this many turns. */
+  max_turns: z.number().int().min(1).max(20),
+  /** Where its proposed tasks go: the triage queue (the owner accepts them), or the board as drafts. */
+  proposals: z.enum(["triage", "draft"]),
+};
+/** A new routine: a preset (README.md#presets) or every field. */
+export const CreateRoutine = z.union([z.strictObject({ preset: z.enum(ROUTINE_PRESETS) }), z.strictObject(RoutineFields)]);
+export const UpdateRoutine = z.strictObject(Object.fromEntries(Object.entries(RoutineFields).map(([k, v]) => [k, v.optional()])) as {
+  [K in keyof typeof RoutineFields]: z.ZodOptional<(typeof RoutineFields)[K]>;
+});
+/** Declining a routine's proposed task: an optional reason, kept on it. */
+export const DeclineProposal = z.strictObject({ reason: z.string().max(500).optional() });
 
 export type CreateProjectBody = z.input<typeof CreateProject>;
 export type SettingsBody = z.input<typeof Settings>;
@@ -77,3 +135,10 @@ export type PutSecretBody = z.input<typeof PutSecret>;
 export type ChatBody = z.input<typeof Chat>;
 export type AnswerBody = z.input<typeof Answer>;
 export type CancelBody = z.input<typeof Cancel>;
+export type TimerBody = z.input<typeof Timer>;
+export type TriggersBody = z.input<typeof Triggers>;
+export type CreateRoutineBody = z.input<typeof CreateRoutine>;
+export type UpdateRoutineBody = z.input<typeof UpdateRoutine>;
+export type DeclineProposalBody = z.input<typeof DeclineProposal>;
+export type RoutineKind = (typeof ROUTINE_KINDS)[number];
+export type RoutinePreset = (typeof ROUTINE_PRESETS)[number];

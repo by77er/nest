@@ -2,9 +2,10 @@
 // with every call and the page holds no credential of its own.
 
 import type {
-  NetworkBody, NetworkView, Waits,
+  NetworkBody, NetworkView, Waits, AcceptIssueBody, DeclineIssueBody, Issue,
   AddDependencyBody, PutSecretBody, SecretsAnswer, SecretView, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
   Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
+  CreateRoutineBody, DeclineProposalBody, Note, Proposal, Routine, RoutineRun, RoutinesAnswer, UpdateRoutineBody,
 } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
@@ -61,6 +62,7 @@ export const api = {
   assignTask: (id: string, task: string) => call<Task>("POST", `${tsk(id, task)}/assign`),
   cancelTask: (id: string, task: string, b: CancelBody) => call<Task>("POST", `${tsk(id, task)}/cancel`, b),
   markDone: (id: string, task: string) => call<Task>("POST", `${tsk(id, task)}/done`),
+  retryIssueClose: (id: string, task: string) => call<Task>("POST", `${tsk(id, task)}/issue/close`),
 
   /** The latest page, or the page before `before` (a seq): oldest first. */
   chat: (id: string, before?: number) => call<ChatMessage[]>("GET", `${prj(id)}/chat${before === undefined ? "" : `?before=${before}`}`),
@@ -76,6 +78,10 @@ export const api = {
   secrets: (id: string) => call<SecretsAnswer>("GET", `${prj(id)}/secrets`),
   putSecret: (id: string, name: string, b: PutSecretBody) => call<SecretView>("PUT", `${prj(id)}/secrets/${encodeURIComponent(name)}`, b),
   deleteSecret: (id: string, name: string) => call<{ deleted: string; holders: { agent: string; role: string }[] }>("DELETE", `${prj(id)}/secrets/${encodeURIComponent(name)}`),
+  issues: (id: string) => call<Issue[]>("GET", `${prj(id)}/issues`),
+  acceptIssue: (id: string, n: number, b: AcceptIssueBody) => call<Task>("POST", `${prj(id)}/issues/${n}/accept`, b),
+  declineIssue: (id: string, n: number, b: DeclineIssueBody) => call<{ declined: number }>("POST", `${prj(id)}/issues/${n}/decline`, b),
+  importIssues: (id: string) => call<{ imported: number; known: number }>("POST", `${prj(id)}/issues/import`),
   secretRequestDone: (id: string, req: string) => call<{ done: string }>("POST", `${prj(id)}/secret-requests/${encodeURIComponent(req)}/done`),
   answerBlocked: (id: string, task: string, b: AnswerBody) => call<Task>("POST", `${tsk(id, task)}/answer`, b),
   answerAsk: (id: string, ask: string, b: AnswerBody) => call<{ delivered: unknown }>("POST", `${prj(id)}/asks/${encodeURIComponent(ask)}/answer`, b),
@@ -86,6 +92,19 @@ export const api = {
   setNetwork: (id: string, b: NetworkBody) => call<NetworkView>("PUT", `${prj(id)}/network`, b),
   retryAttach: (id: string) => call<Settings>("POST", `${prj(id)}/attach`),
   reviews: (id: string) => call<Job[]>("GET", `${prj(id)}/reviews`),
+
+  routines: (id: string) => call<RoutinesAnswer>("GET", `${prj(id)}/routines`),
+  createRoutine: (id: string, b: CreateRoutineBody) => call<Routine>("POST", `${prj(id)}/routines`, b),
+  updateRoutine: (id: string, routine: string, b: UpdateRoutineBody) => call<Routine>("PATCH", `${prj(id)}/routines/${encodeURIComponent(routine)}`, b),
+  deleteRoutine: (id: string, routine: string) => call<{ deleted: string }>("DELETE", `${prj(id)}/routines/${encodeURIComponent(routine)}`),
+  runRoutine: (id: string, routine: string) => call<Routine>("POST", `${prj(id)}/routines/${encodeURIComponent(routine)}/run`),
+  routineRuns: (id: string) => call<RoutineRun[]>("GET", `${prj(id)}/routine-runs`),
+  stopRun: (id: string, run: string) => call<RoutineRun>("POST", `${prj(id)}/routine-runs/${encodeURIComponent(run)}/stop`),
+  proposals: (id: string) => call<Proposal[]>("GET", `${prj(id)}/proposals`),
+  acceptProposal: (id: string, p: string) => call<Task>("POST", `${prj(id)}/proposals/${encodeURIComponent(p)}/accept`),
+  declineProposal: (id: string, p: string, b: DeclineProposalBody) => call<{ declined: string }>("POST", `${prj(id)}/proposals/${encodeURIComponent(p)}/decline`, b),
+  memory: (id: string) => call<Note[]>("GET", `${prj(id)}/memory`),
+  deleteNote: (id: string, key: string) => call<{ deleted: string }>("DELETE", `${prj(id)}/memory/${encodeURIComponent(key)}`),
 
   syncState: () => call<SyncState | null>("GET", "/admin/sync-state"),
   sync: () => call<SyncResult>("POST", "/admin/sync"),
