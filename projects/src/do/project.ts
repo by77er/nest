@@ -3097,13 +3097,15 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
-   * Terminal rows of history-like tables, pruned by age (src/retention.ts): nest's error events, triaged
+   * Terminal rows of history-like tables, pruned by age (src/retention.ts): nest's error events (not a refused stop), triaged
    * proposals, ended routine runs (with their proposals' and turns' rows), counted turns of runs that ended,
    * and early exits no start claimed. Never a task's history, the chat, memory or issues.
    */
   prune(now: number): void {
     this.prunedMs = now;
-    this.sql.exec("DELETE FROM errors WHERE at_ms < ?", now - ERRORS_KEEP_MS);
+    // Not a refused stop (`stop_failed`): the only sign an agent nest wouldn't stop may still run; kept until
+    // the owner dismisses it or the agent is gone.
+    this.sql.exec("DELETE FROM errors WHERE at_ms < ? AND (code IS NULL OR code != 'stop_failed')", now - ERRORS_KEEP_MS);
     this.sql.exec("DELETE FROM proposals WHERE state != 'untriaged' AND triaged_ms < ?", now - TRIAGED_PROPOSALS_KEEP_MS);
     this.sql.exec("DELETE FROM run_turns WHERE run IN (SELECT id FROM routine_runs WHERE state = 'ended' AND ended_ms < ?)", now - RUN_TURNS_KEEP_MS);
     // An ended run with nothing owed for it (its clean-up done).

@@ -162,6 +162,8 @@ describe("B20: terminal history-like rows pruned by age", () => {
     const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "keep my history" })).body;
     await inProject(p, (sql) => {
       sql.exec("INSERT INTO errors (event_id, at_ms, agent) VALUES ('e-old', ?, 'agt_x'), ('e-new', ?, 'agt_x')", now - ERRORS_KEEP_MS - 1, now);
+      // A refused stop (#178's record): the only sign an agent may still run, kept however old.
+      sql.exec("INSERT INTO errors (event_id, at_ms, agent, code, message) VALUES ('e-stop', ?, 'agt_y', 'stop_failed', 'refused')", now - ERRORS_KEEP_MS - 1);
       for (const [id, state, at] of [["prp_old", "declined", now - TRIAGED_PROPOSALS_KEEP_MS - 1], ["prp_new", "accepted", now], ["prp_wait", "untriaged", null]] as const) {
         sql.exec("INSERT INTO proposals (id, routine, routine_name, run, agent, title, body, state, tainted, created_ms, triaged_ms) VALUES (?, 'rtn_x', 'R', 'run_x', 'agt_x', 't', 'b', ?, 1, 0, ?)", id, state, at);
       }
@@ -174,7 +176,7 @@ describe("B20: terminal history-like rows pruned by age", () => {
     await runInDurableObject(projectStub(p), (inst: unknown) => (inst as { prune(now: number): void }).prune(Date.now()));
     await inProject(p, (sql) => {
       const col = (q: string) => sql.exec(q).toArray().map((r) => Object.values(r)[0]);
-      expect(col("SELECT event_id FROM errors ORDER BY event_id")).toEqual(["e-new"]);
+      expect(col("SELECT event_id FROM errors ORDER BY event_id")).toEqual(["e-new", "e-stop"]);
       expect(col("SELECT id FROM proposals ORDER BY id")).toEqual(["prp_new", "prp_wait"]);
       expect(col("SELECT id FROM routine_runs ORDER BY id")).toEqual(["run_new"]);
       // The recent run's turns stay a day (a redelivered turn); the old run's went with it.

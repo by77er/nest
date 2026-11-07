@@ -579,7 +579,7 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 
 Terminal rows of history-like tables are pruned by age, at most hourly from each object's drain (`src/retention.ts`):
 - ReviewDO: ended review jobs after 30 days, except an open PR's current head's (a re-run of its check needs it) and any whose check update is still owed.
-- ProjectDO: nest's error events after 30 days; triaged proposals after 30 days; ended routine runs after 90 days (none with a clean-up owed); a run's counted turns a day after it ended.
+- ProjectDO: nest's error events after 30 days, except a refused stop (`stop_failed`, the only sign an agent nest wouldn't stop may still run); triaged proposals after 30 days; ended routine runs after 90 days (none with a clean-up owed); a run's counted turns a day after it ended.
 - Both: exits that came before their start named the agent (`early_exits`), after a day.
 
 Kept: a task's history, the chat, memory, issues (a declined issue's row keeps an import from bringing it back), and anything live or owed.

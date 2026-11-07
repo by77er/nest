@@ -7,7 +7,7 @@ const DAY = 24 * 3600_000;
 
 /** Ended review jobs, other than an open PR's head's. */
 export const REVIEW_JOBS_KEEP_MS = 30 * DAY;
-/** nest's error events about the project's agents (the API's `errors`). */
+/** nest's error events about the project's agents (the API's `errors`); never a refused stop (`stop_failed`). */
 export const ERRORS_KEEP_MS = 30 * DAY;
 /** Proposed tasks the owner accepted or declined. */
 export const TRIAGED_PROPOSALS_KEEP_MS = 30 * DAY;
