@@ -13,6 +13,9 @@ nestd's pure state-machine cores. Each is a synchronous `step(state, input) -> e
 | `lease` | The lease watchdog: self-fence once the deadline passes on `CLOCK_MONOTONIC` or `CLOCK_BOOTTIME` |
 | `incarnation` | One sandbox incarnation's lifetime: its fenced-epoch tombstone, the scan a starting nestd makes of what the last one left, and salvage on retire |
 | `results` | The bounded `cmd` → outcome cache, so a redelivered command answers with its first outcome |
+| `checkpoint` | The unchanged-disk memo: whether a commit may reuse the last stable pass's manifest unread |
+| `shadow` | M3′'s shadow cut: which ranges of a disk differ from its shadow, and which shadow a cut writes |
+| `detach` | Agent detaches a guest hasn't confirmed: what is owed, and which confirmation settles it |
 | `invariant` | Runtime assertions: a violation panics under `debug_assertions` (tests, the checker) and is an effect, never an abort, in release |
 | `ca` | The proxy intermediate CA's renewal: when to ask, and which key an answer goes with (only one its certificate names); a certificate's subject public key from DER |
 

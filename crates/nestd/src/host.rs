@@ -2456,7 +2456,9 @@ impl Inner {
         let slot = match s.slots.get(agent) {
             Some((slot, _)) => *slot,
             None => {
-                let used: BTreeSet<u16> = s.slots.values().map(|(n, _)| *n).collect();
+                // A slot kept in the guest's `configure` for an owed detach still holds its port.
+                let owed = s.guest.as_ref().map(|g| g.owed_ports(agent)).unwrap_or_default();
+                let used: BTreeSet<u16> = s.slots.values().map(|(n, _)| *n).chain(owed.iter().filter_map(|p| p.checked_sub(EXPLICIT_BASE_PORT))).collect();
                 (0..MAX_AGENT_SLOTS).find(|n| !used.contains(n)).ok_or_else(|| error(error_codes::CAPACITY_EXHAUSTED, "no free agent slots", false))?
             }
         };
@@ -2514,14 +2516,23 @@ impl Inner {
     }
 
     /// Remove an agent's slot (an unknown agent is `ok`); with `kill_processes`, its whole cgroup
-    /// goes first. The gateway then refuses the agent's bindings.
+    /// goes first. The gateway refuses the agent's bindings from here on. `ok` only once the guest
+    /// confirmed the detach: until then the guest connection owes it (`GuestCtl::detach`), and a
+    /// second `agent_detach` sends it again, though the slot here is already gone.
     async fn agent_detach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, kill_processes: bool) -> CmdResult {
         let mut s = self.lock_live(sandbox, epoch).await?;
         let Some((_, listener)) = s.slots.remove(agent) else {
-            // Not ours, and not the guest connection's either (no stale slot is re-configured).
-            if let Some(g) = &s.guest {
-                g.forget_slot(agent);
+            let Some(g) = s.guest.clone() else { return Ok(Some(serde_json::json!({ "note": "not attached" }))) };
+            if g.owes_detach(agent) {
+                // An earlier detach never reached the guest: send it again.
+                drop(s);
+                let r = g.detach(agent, kill_processes).await;
+                self.ensure_not_fenced(sandbox, epoch)?;
+                r.map_err(|e| error(error_codes::INTERNAL, format!("guest agent_detach: {e}"), true))?;
+                return Ok(None);
             }
+            // Not ours, and not the guest connection's either (no stale slot is re-configured).
+            g.forget_slot(agent);
             return Ok(Some(serde_json::json!({ "note": "not attached" })));
         };
         s.slot_cwds.remove(agent);
@@ -2532,7 +2543,10 @@ impl Inner {
         self.gateway_sync(&s);
         if let Some(g) = s.guest.clone() {
             drop(s);
-            g.detach(agent, kill_processes).await.map_err(|e| error(error_codes::INTERNAL, format!("guest agent_detach: {e}"), true))?;
+            let r = g.detach(agent, kill_processes).await;
+            // Fenced meanwhile: the VM is stopped (its processes with it), and the answer is `stale_epoch`.
+            self.ensure_not_fenced(sandbox, epoch)?;
+            r.map_err(|e| error(error_codes::INTERNAL, format!("guest agent_detach: {e}"), true))?;
         }
         Ok(None)
     }

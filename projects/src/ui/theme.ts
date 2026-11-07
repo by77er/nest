@@ -74,6 +74,9 @@ export const syntax = {
 } as const;
 export type SyntaxToken = keyof (typeof syntax)["light"];
 
+/** A neutral light badge's text, per scheme (on the subtle ground): the text color in light, muted in dark. */
+export const neutralBadgeText = { light: neutrals.light.text, dark: neutrals.dark.muted } as const;
+
 /** The warning role's text shade on the terminal surface, per scheme. */
 export const terminalWarning = { light: 9, dark: 3 } as const;
 
@@ -185,6 +188,9 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
     // darker in light (shade 8 is under AA there), each checked by theme.test.ts.
     "--nest-term-muted": neutrals[s].terminalMuted,
     "--nest-term-warning": palette.warning[terminalWarning[s]],
+    // A neutral light badge: the subtle ground; the text color in light, the muted gray in dark.
+    "--nest-neutral-badge": neutrals[s].subtle,
+    "--nest-neutral-badge-text": neutralBadgeText[s],
     // A code block's syntax colors (`--nest-syntax-keyword`, …).
     ...Object.fromEntries(Object.entries(syntax[s]).map(([k, v]) => [`--nest-syntax-${k}`, v])),
     "--mantine-color-body": neutrals[s].surface,
@@ -247,6 +253,12 @@ const variantColorResolver: VariantColorsResolver = (input) => {
   // dark, never Mantine's shade 0 in dark, which is near-white and loses the role's cue.
   if ((input.variant === "subtle" || input.variant === "light") && parsed.isThemeColor && (ROLES as readonly string[]).includes(parsed.color) && parsed.shade === undefined) {
     return { ...r, color: `var(--mantine-color-${parsed.color}-text)`, hoverColor: `var(--mantine-color-${parsed.color}-text)` };
+  }
+  // A neutral light badge (Ready, Draft, Queued, Sending…): the subtle ground, with the text color in light
+  // and the muted gray in dark. Mantine's dark default (gray 9 darkened, near-white text) barely shows its
+  // ground and outshouts a warning badge beside it.
+  if (input.variant === "light" && (input.color ?? "") === "gray") {
+    return { ...r, background: "var(--nest-neutral-badge)", hover: "var(--nest-neutral-badge)", color: "var(--nest-neutral-badge-text)" };
   }
   // A neutral outline (a "Tainted" badge): muted text on a hairline, not Mantine's gray 6 (3.3:1 on white).
   if (input.variant === "outline" && (input.color ?? "") === "gray") {

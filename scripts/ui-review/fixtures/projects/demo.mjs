@@ -39,7 +39,7 @@ export function data(variant = "demo", now = Date.now()) {
     "| Endpoint | p95 now | Target |\n|---|---|---|\n| `/api/gadgets?tag=` | 840 ms | 100 ms |",
   ].join("\n\n");
   let i = 0;
-  const t = (title, state, o = {}) => ({ id: `tsk_demo${++i}`, title, body: "", spec: state === "draft" ? null : spec, state, ord: i, assignee: null, pr: null, start_error: null, tainted: false, blocked: null, prs: [], blocked_by: [], blocks: [], waiting_on: [], issue: null, created_ms: now - 7_200_000, updated_ms: now - 600_000, ...o });
+  const t = (title, state, o = {}) => ({ id: `tsk_demo${++i}`, title, body: "", spec: state === "draft" ? null : spec, state, ord: i, assignee: null, pr: null, start_error: null, tainted: false, blocked: null, prs: [], blocked_by: [], blocks: [], waiting_on: [], issue: null, worker_live: ["assigned", "in_progress", "in_review"].includes(state), created_ms: now - 7_200_000, updated_ms: now - 600_000, ...o });
   const tasks = [
     t("Support dark gadget skins", "draft"),
     t("Rate-limit the public API", "draft", { tainted: true }),
@@ -71,6 +71,13 @@ export function data(variant = "demo", now = Date.now()) {
   ];
   byId.tsk_demo7.pr = 118;
   byId.tsk_demo9.prs = [pr(112, "merged", "Changelog for 0.5", { auto_merge: am("enabled") })];
+  // Review-only (the task machine): a stalled task and a ready one, each holding an open PR.
+  if (variant === "machine") {
+    byId.tsk_demo8.prs = [pr(130, "open", "Auth: switch to the new library behind a flag", { auto_merge: am("enabled") })];
+    byId.tsk_demo8.pr = 130;
+    byId.tsk_demo3.prs = [pr(129, "closed", "Thumbnails: cache in R2", { attached_by: "agt_w3f9q1" }), pr(131, "open", "Thumbnails: cache in R2, take two", { attached_by: "owner" })];
+    byId.tsk_demo3.pr = 131;
+  }
   // Dependencies: the CSV export waits on two of three (thumbnails ready, search in review, the
   // changelog done); dark skins wait on the thumbnails; pagination's only blocker is done.
   const deps = { tsk_demo4: ["tsk_demo3", "tsk_demo7", "tsk_demo9"], tsk_demo1: ["tsk_demo3"], tsk_demo6: ["tsk_demo9"] };
@@ -144,6 +151,33 @@ export function data(variant = "demo", now = Date.now()) {
       { at_ms: now - 30_000, actor: "agt_mgr7k2", action: "blocked", detail: JSON.stringify({ reason: "Needs a product decision: which columns?" }), tainted: false },
     ],
   };
+  if (variant === "machine") {
+    const h = (mins, actor, action, detail, tainted = false) => ({ at_ms: now - mins * 60_000, actor, action, detail: detail === undefined ? null : typeof detail === "string" ? detail : JSON.stringify(detail), tainted });
+    history.tsk_demo8 = [
+      h(240, "agt_mgr7k2", "created", { title: "Migrate to the new auth library" }),
+      h(235, "agt_mgr7k2", "dependency_added", { blocked_by: "tsk_demo1", title: "Support dark gadget skins" }),
+      h(200, "owner", "dependency_removed", { blocked_by: "tsk_demo1", title: "Support dark gadget skins", why: "deleted" }),
+      h(190, "app:auto-assign", "assign"),
+      h(189, "app:assign", "started", { agent: "agt_w1k7c2" }),
+      h(150, "agt_w1k7c2", "pr_opened", { pr: 130 }, true),
+      h(120, "owner", "pr_comment", { pr: 130, to: "agt_w1k7c2" }),
+      h(110, "app:nest", "worker_exited", { agent: "agt_w1k7c2", reason: "exited", text: null }),
+      h(100, "app:board", "revise", { pr: 130 }),
+      h(99, "app:assign", "start_failed", "nest refused the worker: max_agents reached (403)"),
+      h(98, "app:board", "pr_comment_dropped", { comments: 2, why: "its worker didn't start" }),
+      h(95, "agt_w1k7c2", "blocked", { reason: "The staging database rejects the new driver's TLS settings." }),
+    ];
+    history.tsk_demo3 = [
+      h(300, "owner", "created", { title: "Cache gadget thumbnails" }),
+      h(290, "app:auto-assign", "assign"),
+      h(289, "app:assign", "started", { agent: "agt_w3f9q1" }),
+      h(260, "agt_w3f9q1", "pr_opened", { pr: 129 }, true),
+      h(200, "app:github", "pr_closed", { pr: 129 }),
+      h(200, "app:github", "review_ended", { pr: 129 }),
+      h(199, "app:board", "pr_comment_dropped", { comments: 1, why: "its worker didn't start" }),
+      h(120, "owner", "pr_attached", { pr: 131 }),
+    ];
+  }
   // Review-only variants: a manager message with every kind of rich content, an empty chat, a long chat.
   const SVG = [
     '```svg',
