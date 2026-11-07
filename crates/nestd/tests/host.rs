@@ -1725,6 +1725,17 @@ async fn a_detach_the_guest_refused_is_sent_again_when_asked_again() {
         matches!(last_gateway_word(&h.gateway, "sbx_1"), Some(GatewayCommand::SandboxUpsert { clients, .. }) if !clients.contains(&"agt_nodetach".to_string()))
     })
     .await;
+    // Its slot is still in the guest's `configure` until the detach is confirmed: a new agent
+    // never takes its proxy port.
+    h.fleet.commands.send(vec![attach_cmd("cmd_attach_b", "sbx_1", "agt_b")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_attach_b").await));
+    let port = |agent: &str| {
+        h.vm.seen.lock().unwrap().iter().rev().find_map(|b| match b {
+            ControlBody::AgentAttach { slot } if slot.agent_id.0 == agent => Some(slot.proxy_port),
+            _ => None,
+        })
+    };
+    assert_ne!(port("agt_b"), port("agt_nodetach"), "two agents on one proxy port");
     h.fleet.commands.send(vec![detach("cmd_detach_2")]).unwrap();
     assert!(matches!(h.fleet.result("cmd_detach_2").await, CommandOutcome::Ok { detail: None }), "sent again, and taken");
     assert_eq!(detaches(), 2, "the second detach reached the guest");

@@ -14,7 +14,7 @@ use std::time::Duration;
 use nest_protocol::guest::framed::{FramedReader, write_json};
 use nest_protocol::guest::{AgentSlot, CliCommand, CliResult, ControlBody, ControlFrame, ForkIdentity, PORT_CONTROL, PROTOCOL_VERSION};
 use nest_protocol::model::{AgentId, Epoch, SandboxId};
-use nestd_core::detach::Detaches;
+use nestd_core::detach::{Detaches, Owed};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::util::{error, now_ms, random_hex};
@@ -44,13 +44,6 @@ struct Config {
     /// Detaches the guest hasn't confirmed (`nestd_core::detach`): sent after every `configure`.
     detaches: Detaches<AgentId>,
 }
-
-/// How long a detach waits for a disconnected guest before it answers that it couldn't reach it
-/// (the connection still sends it after its next `configure`).
-#[cfg(not(test))]
-const DETACH_READY_WAIT: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const DETACH_READY_WAIT: Duration = Duration::from_millis(300);
 
 struct Req {
     body: ControlBody,
@@ -108,11 +101,15 @@ impl GuestCtl {
     }
 
     /// Add an agent slot (persisted for reconfiguration after reconnects). A detach still owed for
-    /// the agent is dropped: it must never kill this newer attachment.
+    /// the agent goes first, as the guest would have seen it, so the newer attachment starts clean;
+    /// if that detach fails, so does the attach, and the detach stays owed.
     pub async fn attach(&self, slot: AgentSlot) -> io::Result<()> {
+        let owed = self.cfg.lock().expect("guest cfg").detaches.owed(&slot.agent_id);
+        if let Some(sent) = owed {
+            self.send_detach(&slot.agent_id, sent).await?;
+        }
         {
             let mut c = self.cfg.lock().expect("guest cfg");
-            c.detaches.attached(&slot.agent_id);
             c.slots.retain(|s| s.agent_id != slot.agent_id);
             c.slots.push(slot.clone());
         }
@@ -120,26 +117,39 @@ impl GuestCtl {
     }
 
     /// Drop an agent's slot from the set `configure` sends, without telling the guest (a slot
-    /// that never took, or one nestd no longer has).
+    /// that never took, or one nestd no longer has). One whose detach is owed stays until the guest
+    /// confirms the detach: dropped from `configure` first, its processes would be orphaned.
     pub fn forget_slot(&self, agent: &AgentId) {
-        self.cfg.lock().expect("guest cfg").slots.retain(|s| &s.agent_id != agent);
+        let mut c = self.cfg.lock().expect("guest cfg");
+        if c.detaches.owed(agent).is_none() {
+            c.slots.retain(|s| &s.agent_id != agent);
+        }
+    }
+
+    /// The proxy ports of slots kept only for an owed detach: a new slot must not take one, or a
+    /// `configure` would carry two agents on one port.
+    pub fn owed_ports(&self) -> Vec<u16> {
+        let c = self.cfg.lock().expect("guest cfg");
+        c.slots.iter().filter(|s| c.detaches.owed(&s.agent_id).is_some()).map(|s| s.proxy_port).collect()
     }
 
     /// Detach an agent in the guest (stopping its tasks, and with `kill_processes` killing its
     /// processes). Ok only once the guest confirmed it. Until then it is owed: the agent stays in
-    /// every `configure`, and the connection sends the detach after each one. A guest that isn't
-    /// connected is waited for, up to [`DETACH_READY_WAIT`]; an error says the detach didn't arrive.
+    /// every `configure`, the connection sends the detach after each one, and an `agent_detach`
+    /// asked again or an attach of the agent sends it first. A guest that isn't connected gets it
+    /// on its next `configure`; this answers at once that it didn't arrive.
     pub async fn detach(&self, agent: &AgentId, kill_processes: bool) -> io::Result<()> {
-        self.cfg.lock().expect("guest cfg").detaches.ask(agent.clone(), kill_processes);
+        let sent = self.cfg.lock().expect("guest cfg").detaches.ask(agent.clone(), kill_processes);
         if !*self.ready.borrow() {
-            self.wait_ready(DETACH_READY_WAIT)
-                .await
-                .map_err(|e| io::Error::new(e.kind(), format!("{e}: the detach is sent when the guest connects again")))?;
+            return Err(io::Error::new(io::ErrorKind::NotConnected, "the guest is not connected: the detach is sent after its next configure"));
         }
-        // The handshake that made it ready may have sent it already.
-        let Some(kill) = self.cfg.lock().expect("guest cfg").detaches.owed(agent) else { return Ok(()) };
-        expect_ok(self.request(ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes: kill }).await?)?;
-        self.detach_confirmed(agent, kill);
+        self.send_detach(agent, sent).await
+    }
+
+    /// Send the owed detach `sent`, and settle it on the guest's confirmation.
+    async fn send_detach(&self, agent: &AgentId, sent: Owed) -> io::Result<()> {
+        expect_ok(self.request(ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes: sent.kill }).await?)?;
+        self.detach_confirmed(agent, sent);
         Ok(())
     }
 
@@ -148,11 +158,11 @@ impl GuestCtl {
         self.cfg.lock().expect("guest cfg").detaches.owed(agent).is_some()
     }
 
-    /// The guest confirmed a detach of `agent` sent with `kill`: once that settles what is owed,
-    /// its slot leaves the `configure` set.
-    fn detach_confirmed(&self, agent: &AgentId, kill: bool) {
+    /// The guest confirmed the detach sent for `sent`: once that settles what is owed, the agent's
+    /// slot leaves the `configure` set.
+    fn detach_confirmed(&self, agent: &AgentId, sent: Owed) {
         let mut c = self.cfg.lock().expect("guest cfg");
-        if c.detaches.confirmed(agent, kill) {
+        if c.detaches.confirmed(agent, sent) {
             c.slots.retain(|s| &s.agent_id != agent);
         }
     }
@@ -293,10 +303,10 @@ impl Task {
         }
         // 3. the detaches still owed: the agents are in the configure just sent, so the guest has
         // their tasks to stop. A refusal leaves one owed (logged); a lost connection ends this one.
-        let owed: Vec<(AgentId, bool)> = self.ctl.cfg.lock().expect("guest cfg").detaches.all().map(|(a, k)| (a.clone(), k)).collect();
-        for (agent, kill) in owed {
-            match self.call(c, ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes: kill }).await? {
-                ControlBody::Ok {} => self.ctl.detach_confirmed(&agent, kill),
+        let owed: Vec<(AgentId, Owed)> = self.ctl.cfg.lock().expect("guest cfg").detaches.all().map(|(a, o)| (a.clone(), o)).collect();
+        for (agent, sent) in owed {
+            match self.call(c, ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes: sent.kill }).await? {
+                ControlBody::Ok {} => self.ctl.detach_confirmed(&agent, sent),
                 other => tracing::warn!(sandbox = %self.sandbox, %agent, reply = ?other, "the guest refused an owed detach; it is sent again after the next configure"),
             }
         }
@@ -498,8 +508,9 @@ pub(crate) mod tests {
 
     /// Audit G-B2: a detach asked while the guest isn't connected used to answer `ok` and send
     /// nothing; the next `configure` only dropped the agent from the guest's table, so its processes
-    /// ran on. Now it is owed: the agent stays in the next `configure` (the guest still has its tasks
-    /// to stop), the kill follows it, and only the guest's confirmation lets the slot go.
+    /// ran on. Now it answers that the detach didn't arrive, and it is owed: the agent stays in the
+    /// next `configure` (the guest still has its tasks to stop), the detach follows it, and only the
+    /// guest's confirmation lets the slot go.
     #[tokio::test]
     async fn a_detach_asked_while_disconnected_reaches_the_guest_when_it_connects() {
         let dir = tempfile::tempdir().unwrap();
@@ -509,22 +520,25 @@ pub(crate) mod tests {
         let (etx, _erx) = mpsc::unbounded_channel();
         let agent = AgentId("agt_1".into());
         let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_1")], etx);
-        // No guest within the wait: not ok, and still owed.
         let e = ctl.detach(&agent, true).await.unwrap_err();
-        assert!(e.to_string().contains("sent when the guest connects again"), "{e}");
+        assert!(e.to_string().contains("sent after its next configure"), "{e}");
         assert!(ctl.owes_detach(&agent));
-        // The guest comes: configured with the agent, then the kill.
+        ctl.forget_slot(&agent);
+        assert_eq!(ctl.cfg.lock().unwrap().slots.len(), 1, "an owed slot is never forgotten before its detach");
+        // The guest comes: configured with the agent, then the kill, before it is ready.
         let fake = FakeGuest::start(&guest_dir, "boot-1");
         ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
         let seen = fake.seen.lock().unwrap().clone();
         assert_eq!(configured_agents(&seen), [vec!["agt_1".to_string()]], "{seen:?}");
         assert_eq!(detaches(&seen), [("agt_1".to_string(), true)], "{seen:?}");
         assert!(!ctl.owes_detach(&agent), "confirmed");
-        // A second detach that arrives while the guest is connecting waits for it.
+        assert!(ctl.cfg.lock().unwrap().slots.is_empty(), "confirmed: out of configure");
+        // Connected, a detach goes at once and is ok once confirmed.
         let other = AgentId("agt_2".into());
         ctl.cfg.lock().unwrap().slots.push(slot("agt_2"));
         ctl.detach(&other, false).await.unwrap();
         assert_eq!(detaches(&fake.seen.lock().unwrap()).last(), Some(&("agt_2".to_string(), false)));
+        assert!(!ctl.owes_detach(&other));
         ctl.shutdown();
     }
 
@@ -562,25 +576,36 @@ pub(crate) mod tests {
         ctl.shutdown();
     }
 
-    /// An attach of the same agent ends an owed detach: the newer attachment is never killed.
+    /// An attach of an agent whose detach is owed sends that detach first (the newer attachment
+    /// starts clean, its kill done); if the guest refuses it, the attach fails and it stays owed.
     #[tokio::test]
-    async fn an_attach_ends_an_owed_detach() {
+    async fn an_attach_sends_an_owed_detach_first() {
         let dir = tempfile::tempdir().unwrap();
         let guest_dir = dir.path().join("guest");
-        std::fs::create_dir_all(&guest_dir).unwrap();
+        let fake = FakeGuest::start(&guest_dir, "boot-1");
         let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
         let (etx, _erx) = mpsc::unbounded_channel();
         let agent = AgentId("agt_1".into());
         let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_1")], etx);
-        assert!(ctl.detach(&agent, true).await.is_err());
-        let _ = ctl.attach(slot("agt_1")).await; // not connected: the request fails, the slot stays
-        assert!(!ctl.owes_detach(&agent));
-        let fake = FakeGuest::start(&guest_dir, "boot-1");
         ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        fake.refuse_detaches.store(2, std::sync::atomic::Ordering::SeqCst);
+        assert!(ctl.detach(&agent, true).await.is_err());
+        assert!(ctl.attach(slot("agt_1")).await.is_err(), "its owed detach was refused: the attach fails");
+        assert!(ctl.owes_detach(&agent));
+        ctl.attach(slot("agt_1")).await.unwrap();
+        assert!(!ctl.owes_detach(&agent));
         let seen = fake.seen.lock().unwrap().clone();
-        assert_eq!(configured_agents(&seen), [vec!["agt_1".to_string()]]);
-        assert!(detaches(&seen).is_empty(), "the newer attachment was killed: {seen:?}");
+        let tail: Vec<&str> = seen
+            .iter()
+            .filter_map(|b| match b {
+                ControlBody::AgentDetach { .. } => Some("detach"),
+                ControlBody::AgentAttach { .. } => Some("attach"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tail, ["detach", "detach", "detach", "attach"], "the kill goes before the attach: {seen:?}");
+        assert_eq!(detaches(&seen).last(), Some(&("agt_1".to_string(), true)));
+        assert_eq!(ctl.cfg.lock().unwrap().slots.len(), 1, "the new attachment's slot");
         ctl.shutdown();
     }
 

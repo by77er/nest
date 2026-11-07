@@ -2473,7 +2473,9 @@ impl Inner {
         let slot = match s.slots.get(agent) {
             Some((slot, _)) => *slot,
             None => {
-                let used: BTreeSet<u16> = s.slots.values().map(|(n, _)| *n).collect();
+                // A slot kept in the guest's `configure` for an owed detach still holds its port.
+                let owed = s.guest.as_ref().map(|g| g.owed_ports()).unwrap_or_default();
+                let used: BTreeSet<u16> = s.slots.values().map(|(n, _)| *n).chain(owed.iter().filter_map(|p| p.checked_sub(EXPLICIT_BASE_PORT))).collect();
                 (0..MAX_AGENT_SLOTS).find(|n| !used.contains(n)).ok_or_else(|| error(error_codes::CAPACITY_EXHAUSTED, "no free agent slots", false))?
             }
         };
@@ -2541,7 +2543,9 @@ impl Inner {
             if g.owes_detach(agent) {
                 // An earlier detach never reached the guest: send it again.
                 drop(s);
-                g.detach(agent, kill_processes).await.map_err(|e| error(error_codes::INTERNAL, format!("guest agent_detach: {e}"), true))?;
+                let r = g.detach(agent, kill_processes).await;
+                self.ensure_not_fenced(sandbox, epoch)?;
+                r.map_err(|e| error(error_codes::INTERNAL, format!("guest agent_detach: {e}"), true))?;
                 return Ok(None);
             }
             // Not ours, and not the guest connection's either (no stale slot is re-configured).
@@ -2556,7 +2560,10 @@ impl Inner {
         self.gateway_sync(&s);
         if let Some(g) = s.guest.clone() {
             drop(s);
-            g.detach(agent, kill_processes).await.map_err(|e| error(error_codes::INTERNAL, format!("guest agent_detach: {e}"), true))?;
+            let r = g.detach(agent, kill_processes).await;
+            // Fenced meanwhile: the VM is stopped (its processes with it), and the answer is `stale_epoch`.
+            self.ensure_not_fenced(sandbox, epoch)?;
+            r.map_err(|e| error(error_codes::INTERNAL, format!("guest agent_detach: {e}"), true))?;
         }
         Ok(None)
     }
