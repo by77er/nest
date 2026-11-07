@@ -321,6 +321,13 @@ export function data(variant = "demo", now = Date.now()) {
     { key: "search-ranking", text: "Ranking is tf weighted by field (title 3, tags 2, body 1); the owner decided against fuzzy matching on 2026-10-30.", source: "manager", tainted: false, created_ms: now - 5 * DAY, updated_ms: now - 5 * DAY },
   ];
 
+  if (variant === "routines-long") {
+    const para = (k) => `Paragraph ${k}: reviewed src/very/long/path/module${k}.ts and found the cache key ignores the locale; https://example.com/${"p".repeat(90)} needs a fix and a test.`;
+    const longText = (n) => Array.from({ length: n }, (_, k) => para(k + 1)).join("\n\n");
+    for (let k = 0; k < 40; k++) runs.push(rrun(`run_lg${String(k).padStart(4, "0")}`, k % 2 ? "rtn_review" : "rtn_dream", 10 + k, k % 3 ? "timer" : "manual", { summary: k === 0 ? longText(30) : `Run ${k}: short report.`, created: k === 0 ? Array.from({ length: 12 }, (_, j) => ({ kind: "memory_write", key: `note-key-${j}-with-a-fairly-long-name` })) : [] }));
+    for (let k = 0; k < 15; k++) proposals.push({ id: `prp_lg${k}`, routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", title: k === 0 ? "A_very_long_unbroken_proposal_title_" + "q".repeat(120) : `Proposal ${k}: a long-ish title about fixing the export pipeline when the client aborts mid-stream`, body: longText(k % 2 ? 2 : 25), state: "untriaged", task: null, reason: null, created_ms: now - k * 3_600_000 });
+    for (let k = 0; k < 100; k++) notes.push({ key: `note-${k}-${"k".repeat(k % 5 * 8)}`, text: k % 7 === 0 ? longText(4) : `Note ${k}: a convention the agents follow.`, source: k % 3 ? "manager" : "routine:Dreaming (run_dr8m1c)", tainted: k % 3 === 0, created_ms: now - k * DAY, updated_ms: now - k * 3_600_000 });
+  }
   /** The answer to `GET|POST /api<path>?<search>`: [status, body]. */
   const answer = (method, path, search = new URLSearchParams()) => {
     if (variant === "error") return [500, { error: "internal error (fixture)" }];

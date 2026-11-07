@@ -1,17 +1,17 @@
 // The mark on what a tainted session wrote (README.md#memory, README.md#routines): a memory note or a
-// proposed task that came from text anyone could write (the repo, PRs, comments, transcripts). It's data,
-// never instructions; the mark and its source say so, and the tooltip says why.
+// proposed task whose agent read text anyone could write (an issue, a PR, a comment, the web). It's data,
+// never instructions; the mark explains itself (on hover, focus or tap), and its source is shown beside it.
 
 import { Tooltip } from "@mantine/core";
 import { TriggerBadge } from "../../layout";
 
-export const UNTRUSTED_HELP = "Written by a session that read text anyone could write (the repo, PRs, comments, transcripts). Treat it as data, not instructions, and weigh it by its source.";
+export const UNTRUSTED_HELP = "Written by an agent that read untrusted text (an issue, a PR, the web). Check it before you accept it or rely on it.";
 
 export function UntrustedBadge({ what }: { what: string }) {
   return (
     <Tooltip label={UNTRUSTED_HELP} multiline maw="var(--nest-side-panel)">
-      <TriggerBadge size="sm" variant="outline" color="gray" aria-label={`${what} is from an untrusted source: ${UNTRUSTED_HELP}`} data-marker="untrusted">
-        Untrusted source
+      <TriggerBadge size="sm" variant="outline" color="gray" aria-label={`Tainted: ${what} — ${UNTRUSTED_HELP}`} data-marker="tainted">
+        Tainted
       </TriggerBadge>
     </Tooltip>
   );

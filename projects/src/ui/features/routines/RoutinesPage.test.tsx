@@ -94,12 +94,12 @@ describe("the Routines page", () => {
     expect(card).toHaveTextContent("<b>bold</b> and [a link](javascript:alert(1))");
     expect(card.querySelector("b, a")).toBeNull();
     // Marked as from an untrusted source, with its routine and run.
-    expect(within(card).getByLabelText(/is from an untrusted source/)).toHaveTextContent("Untrusted source");
+    expect(within(card).getByLabelText(/^Tainted: the proposed task “Fix the race” — Written by an agent that read untrusted text/)).toHaveTextContent("Tainted");
     expect(card).toHaveTextContent("From the routine Spontaneous review (run run_a)");
-    await user.click(within(card).getByRole("button", { name: "Accept as draft" }));
+    await user.click(within(card).getByRole("button", { name: "Accept “Fix the race” as a draft" }));
     await waitFor(() => expect(api.writes).toContainEqual({ method: "POST", path: "/api/projects/prj_one/proposals/prp_a/accept", body: undefined }));
     const other = (await screen.findByText("Meh")).closest("[data-proposal]") as HTMLElement;
-    await user.click(within(other).getByRole("button", { name: "Decline" }));
+    await user.click(within(other).getByRole("button", { name: "Decline “Meh”" }));
     const confirm = await screen.findByRole("dialog", { name: "Decline “Meh”?" });
     await user.type(within(confirm).getByRole("textbox", { name: "Reason" }), "not now");
     await user.click(within(confirm).getByRole("button", { name: "Decline" }));
@@ -133,13 +133,49 @@ describe("the Routines page", () => {
     const clean = (await screen.findByText("Keep PRs small.")).closest("[data-note]") as HTMLElement;
     const tainted = screen.getByText("Under 300 lines.").closest("[data-note]") as HTMLElement;
     expect(clean).toHaveTextContent("By the manager");
-    expect(clean.querySelector("[data-marker=untrusted]")).toBeNull();
+    expect(clean.querySelector("[data-marker=tainted]")).toBeNull();
     expect(tainted).toHaveTextContent("By the routine Dreaming (run run_d1)");
-    expect(within(tainted).getByLabelText(/The note pr-size is from an untrusted source/)).toBeInTheDocument();
+    expect(within(tainted).getByLabelText(/^Tainted: the note pr-size — Written by an agent/)).toBeInTheDocument();
     await user.click(await screen.findByRole("button", { name: "Delete the note owner-prefers-small-prs" }));
     const confirm = await screen.findByRole("dialog", { name: "Delete the note owner-prefers-small-prs?" });
     expect(api.writes).toEqual([]);
     await user.click(within(confirm).getByRole("button", { name: "Delete" }));
     await waitFor(() => expect(api.writes).toContainEqual({ method: "DELETE", path: "/api/projects/prj_one/memory/owner-prefers-small-prs", body: undefined }));
+  });
+
+  it("many and long things stay short: a body's first lines, the latest 10 runs and notes, a filter", async () => {
+    const api = new FakeApi();
+    const long = Array.from({ length: 12 }, (_, k) => `Line ${k + 1} of the body.`).join("\n");
+    api.proposals = [
+      { id: "prp_long", routine: "rtn_a", routine_name: "R", run: "run_a", title: "Long", body: long, state: "untriaged", task: null, reason: null, created_ms: 1 },
+      ...Array.from({ length: 11 }, (_, k) => ({ id: `prp_p${k}`, routine: "rtn_a", routine_name: "R", run: "run_a", title: `P${k}`, body: "b", state: "untriaged" as const, task: null, reason: null, created_ms: 2 + k })),
+    ];
+    api.routines = [routine({ id: "rtn_a", name: "R" })];
+    api.runs = Array.from({ length: 13 }, (_, k) => run({ routine: "rtn_a", n: 13 - k }));
+    api.notes = Array.from({ length: 14 }, (_, k) => ({ key: `note-${k}`, text: k === 0 ? long : `Note ${k}.`, source: "manager", tainted: false, created_ms: 1, updated_ms: 100 - k }));
+    const { user } = renderApp("/projects/prj_one/routines", api);
+    const card = (await screen.findByText("Long")).closest("[data-proposal]") as HTMLElement;
+    expect(card).toHaveTextContent("Line 5 of the body.");
+    expect(card).not.toHaveTextContent("Line 6 of the body.");
+    await user.click(within(card).getByRole("button", { name: "Show more" }));
+    expect(card).toHaveTextContent("Line 12 of the body.");
+    // Proposals: the first 10, then all.
+    const proposals = screen.getByRole("list", { name: "Proposed tasks" });
+    expect(within(proposals).getAllByRole("listitem")).toHaveLength(10);
+    await user.click(screen.getByRole("button", { name: "Show all (12)" }));
+    expect(within(proposals).getAllByRole("listitem")).toHaveLength(12);
+    // Runs: the latest 10, then the rest.
+    const table = screen.getByRole("table", { name: "Routine runs" });
+    expect(within(table).getAllByRole("row")).toHaveLength(11);
+    await user.click(screen.getByRole("button", { name: "Show older (3)" }));
+    expect(within(table).getAllByRole("row")).toHaveLength(14);
+    // Notes: the latest 10, all, or those matching a filter.
+    const list = screen.getByRole("list", { name: "Memory notes" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(10);
+    expect(list).not.toHaveTextContent("note-13");
+    await user.click(screen.getByRole("button", { name: "Show all (14)" }));
+    expect(within(list).getAllByRole("listitem")).toHaveLength(14);
+    await user.type(screen.getByRole("textbox", { name: "Filter notes" }), "note-13");
+    expect(within(screen.getByRole("list", { name: "Memory notes" })).getAllByRole("listitem").map((e) => e.getAttribute("data-note"))).toEqual(["note-13"]);
   });
 });

@@ -1,7 +1,7 @@
 // The routines' recent runs, newest first (README.md#routines): which routine, why it started, how it went
 // or is going, when and how long, what it made; opened, its report (the agent's last turn, shown as plain
 // text: an agent wrote it after reading anyone's text) and its agent's trace. A live run can be stopped.
-// A table, or below `sm` a card per run.
+// A table, or below `sm` a card per run; the latest 10, the rest behind "Show older".
 
 import { Badge, Button, Table, Text } from "@mantine/core";
 import { modals } from "@mantine/modals";
@@ -13,6 +13,9 @@ import { ago, exact } from "../../common/time";
 import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, TableFrame, Toolbar, usePhone } from "../../layout";
 import { RunTrace } from "../trace/AgentTraces";
 import { createdText, duration, runStatus, runTrigger } from "./describe";
+
+/** Runs shown before "Show older". */
+export const RUNS_SHOWN = 10;
 
 export function StatusBadge({ run }: { run: RoutineRun }) {
   const s = runStatus(run);
@@ -26,6 +29,9 @@ export function StatusBadge({ run }: { run: RoutineRun }) {
 function Toggle({ label, open, onToggle, long = false }: { label: string; open: boolean; onToggle: () => void; long?: boolean }) {
   return (
     <Button
+      // In a phone's card, the row's whole width: a full target, nothing beside it.
+      fullWidth={long}
+      justify={long ? "flex-start" : undefined}
       variant="subtle"
       color="gray"
       size="xs"
@@ -94,6 +100,9 @@ export function RunsSection({ projectId, routines }: { projectId: string; routin
   const runs = useRoutineRuns(projectId);
   const phone = usePhone();
   const [open, setOpen] = useState<string | null>(null);
+  const [older, setOlder] = useState(false);
+  const shown = older ? runs.data ?? [] : (runs.data ?? []).slice(0, RUNS_SHOWN);
+  const more = (runs.data?.length ?? 0) - RUNS_SHOWN;
   const name = (id: string) => routines.find((r) => r.id === id)?.name ?? "A deleted routine";
   return (
     <Section title="Runs" count={runs.data?.length}>
@@ -107,7 +116,7 @@ export function RunsSection({ projectId, routines }: { projectId: string; routin
         </Panel>
       ) : phone ? (
         <Stack gap="sm" role="list" aria-label="Routine runs">
-          {runs.data.map((run) => {
+          {shown.map((run) => {
             const shown = open === run.id;
             return (
               <Panel dense key={run.id}>
@@ -144,7 +153,7 @@ export function RunsSection({ projectId, routines }: { projectId: string; routin
             </Table.Tr>
           </Table.Thead>
           <Table.Tbody>
-            {runs.data.map((run) => {
+            {shown.map((run) => {
               const shown = open === run.id;
               return (
                 <Fragment key={run.id}>
@@ -189,6 +198,13 @@ export function RunsSection({ projectId, routines }: { projectId: string; routin
             })}
           </Table.Tbody>
         </TableFrame>
+      )}
+      {more > 0 && (
+        <Row>
+          <Button variant="default" onClick={() => setOlder((x) => !x)} aria-expanded={older}>
+            {older ? "Show the latest" : `Show older (${more})`}
+          </Button>
+        </Row>
       )}
     </Section>
   );

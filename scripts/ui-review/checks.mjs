@@ -384,6 +384,8 @@ export function measure(sel) {
             const x = x0 + fx * w, y = y0 + fy * h;
             if (x < 0 || y < 0 || x >= W || y >= H) continue;
             const hit = document.elementFromPoint(x, y);
+            // Nothing there: a point on the viewport's last fractional pixel, off screen for a tap.
+            if (!hit) continue;
             // A layer open over it (a tooltip, a picker's list), or a fixed bar it has scrolled under (the
             // app's header), is passing, not a neighbour: those taps don't count either way.
             if ((hit && !el.contains(hit) && openOver(hit, el)) || pinned(hit, el)) continue;
