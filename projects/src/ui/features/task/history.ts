@@ -59,9 +59,13 @@ export function summarize(h: HistoryRow): string {
     case "pr_comment":
       return typeof o.pr === "number" ? `The owner's comment on PR #${o.pr} went to ${str(o.to) ?? "the worker"}` : "The owner's PR comment went to the worker";
     case "pr_comment_dropped":
+      // Comments queued for a worker that won't start (README.md#the-task-machine).
+      if (typeof o.comments === "number") return `${o.comments === 1 ? "A queued PR comment was" : `${o.comments} queued PR comments were`} dropped${str(o.why) ? `: ${clip(str(o.why)!, 80)}` : ""}`;
       return typeof o.pr === "number" ? `The owner's comment on PR #${o.pr} wasn't sent${str(o.why) ? `: ${clip(str(o.why)!, 80)}` : ""}` : "The owner's PR comment wasn't sent";
     case "revise":
       return typeof o.pr === "number" ? `A worker starts again for the owner's comment on PR #${o.pr}` : "A worker starts again for the owner's PR comment";
+    case "review_ended":
+      return typeof o.pr === "number" ? `Out of review: PR #${o.pr} was its last open PR` : "Out of review: no PR open";
     case "pr_opened":
       return typeof o.pr === "number" ? `PR #${o.pr} opened` : "PR opened";
     case "worker_exited": {
@@ -93,8 +97,11 @@ export function summarize(h: HistoryRow): string {
     // The task's title when recorded (older entries have only its id).
     case "dependency_added":
       return str(o.title) ? `Waits on "${clip(str(o.title)!)}"` : str(o.blocked_by) ? `Waits on ${str(o.blocked_by)}` : "Dependency added";
-    case "dependency_removed":
-      return str(o.title) ? `No longer waits on "${clip(str(o.title)!)}"` : str(o.blocked_by) ? `No longer waits on ${str(o.blocked_by)}` : "Dependency removed";
+    case "dependency_removed": {
+      // Removed because the task it waited on was deleted (README.md#the-task-machine).
+      const why = o.why === "deleted" ? " (deleted)" : "";
+      return str(o.title) ? `No longer waits on "${clip(str(o.title)!)}"${why}` : str(o.blocked_by) ? `No longer waits on ${str(o.blocked_by)}${why}` : `Dependency removed${why}`;
+    }
     case "dependency_done":
       return str(o.title) ? `"${clip(str(o.title)!)}", which it waits on, is done` : str(o.blocker) ? `${str(o.blocker)}, which it waits on, is done` : "A dependency is done";
     case "worker_notified":
