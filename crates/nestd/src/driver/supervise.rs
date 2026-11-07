@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::net::Netns;
 
-type Request = (Command, Option<Arc<Netns>>, mpsc::Sender<io::Result<Child>>);
+type Request = (Command, Option<Arc<Netns>>, bool, mpsc::Sender<io::Result<Child>>);
 
 fn spawner() -> &'static Mutex<mpsc::Sender<Request>> {
     static SPAWNER: OnceLock<Mutex<mpsc::Sender<Request>>> = OnceLock::new();
@@ -36,8 +36,8 @@ fn spawner() -> &'static Mutex<mpsc::Sender<Request>> {
             .spawn(move || {
                 // Never returns while nestd runs: the death signal of every child is tied to it.
                 let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    for (cmd, netns, reply) in rx {
-                        let _ = reply.send(spawn_here(cmd, netns.as_deref()));
+                    for (cmd, netns, session, reply) in rx {
+                        let _ = reply.send(spawn_here(cmd, netns.as_deref(), session));
                     }
                 }));
                 tracing::error!(panicked = r.is_err(), "the VM spawner thread ended: aborting nestd");
@@ -50,21 +50,34 @@ fn spawner() -> &'static Mutex<mpsc::Sender<Request>> {
 
 /// Spawn `cmd` (in `netns`, if given) so it is SIGKILLed when nestd dies.
 pub fn spawn(cmd: Command, netns: Option<Arc<Netns>>) -> io::Result<Child> {
+    request(cmd, netns, false)
+}
+
+/// [`spawn`], the child leading a session of its own (`setsid`): what it starts keeps its session
+/// id, even once init adopts it, so the process driver finds the guest's whole tree (`tree.rs`).
+pub fn spawn_in_session(cmd: Command, netns: Option<Arc<Netns>>) -> io::Result<Child> {
+    request(cmd, netns, true)
+}
+
+fn request(cmd: Command, netns: Option<Arc<Netns>>, session: bool) -> io::Result<Child> {
     let (tx, rx) = mpsc::channel();
-    spawner().lock().expect("spawner").send((cmd, netns, tx)).map_err(|_| io::Error::other("VM spawner thread is gone"))?;
+    spawner().lock().expect("spawner").send((cmd, netns, session, tx)).map_err(|_| io::Error::other("VM spawner thread is gone"))?;
     rx.recv().map_err(|_| io::Error::other("VM spawner thread is gone"))?
 }
 
-fn spawn_here(mut cmd: Command, netns: Option<&Netns>) -> io::Result<Child> {
+fn spawn_here(mut cmd: Command, netns: Option<&Netns>, session: bool) -> io::Result<Child> {
     let ns_fd = netns.map(|n| n.as_fd().as_raw_fd());
     let parent = std::process::id() as libc::pid_t;
-    // SAFETY: between fork and exec only async-signal-safe syscalls (setns, prctl, getppid, open,
-    // write, close), no allocation.
+    // SAFETY: between fork and exec only async-signal-safe syscalls (setns, setsid, prctl, getppid,
+    // open, write, close), no allocation.
     unsafe {
         cmd.pre_exec(move || {
             if let Some(fd) = ns_fd
                 && libc::setns(fd, libc::CLONE_NEWNET) != 0
             {
+                return Err(io::Error::last_os_error());
+            }
+            if session && libc::setsid() < 0 {
                 return Err(io::Error::last_os_error());
             }
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong, 0, 0, 0) != 0 {

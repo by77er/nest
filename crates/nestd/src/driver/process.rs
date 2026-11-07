@@ -5,8 +5,10 @@
 //! The child starts inside the sandbox netns (when networking is enabled), so its egress hits the
 //! same nft rules and proxy listeners a VM would, and dies with nestd (`supervise.rs`).
 //! Pause, resume and stop act on the guest's whole process tree (`tree.rs`): the guest starts each
-//! call in a session of its own, which a signal to the guest alone never reaches. Pause freezes
-//! the tree (SIGSTOP), resume continues it, and stop freezes it and kills every process in it.
+//! call in a process group of its own and each PTY in a session of its own, which a signal to the
+//! guest alone never reaches. The guest runs as a session leader, so an orphan of a call stays a
+//! member. Pause freezes the tree (SIGSTOP), resume continues what the pause stopped, and stop
+//! freezes it and kills every process in it.
 //!
 //! With `mount_disk` (root only), the disk image is formatted ext4 on first use and the guest
 //! runs in a private mount namespace with it loop-mounted at `/workspace`, so what an agent writes
@@ -20,7 +22,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use nix::sys::signal::Signal;
 
-use super::{Driver, Pauser, Vm, VmSpec, tree};
+use super::tree::Tree;
+use super::{Driver, Pauser, Vm, VmSpec};
 use crate::vsock::Emulator;
 
 pub struct ProcessDriver {
@@ -78,7 +81,7 @@ impl Driver for ProcessDriver {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "process driver: empty guest_command"));
         }
         super::access::create_searchable(&self.run_dir, &spec.vm_dir)?;
-        Ok(Box::new(ProcessVm { cmd: self.guest_command.clone(), mount_disk: self.mount_disk, gateway_gid: self.gateway_gid, spec, child: None, emulator: None }))
+        Ok(Box::new(ProcessVm { cmd: self.guest_command.clone(), mount_disk: self.mount_disk, gateway_gid: self.gateway_gid, spec, child: None, tree: None, emulator: None }))
     }
 }
 
@@ -88,48 +91,46 @@ pub struct ProcessVm {
     gateway_gid: Option<u32>,
     spec: VmSpec,
     child: Option<std::process::Child>,
+    /// The guest's process tree, shared with the lock-free pauser (`tree.rs`).
+    tree: Option<SharedTree>,
     emulator: Option<Emulator>,
+}
+
+type SharedTree = Arc<std::sync::Mutex<Tree>>;
+
+fn locked(t: &SharedTree) -> std::sync::MutexGuard<'_, Tree> {
+    t.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 impl ProcessVm {
     fn guest_dir(&self) -> PathBuf {
         self.spec.vm_dir.join("guest")
     }
-    fn root(&self) -> Option<i32> {
-        self.child.as_ref().map(|c| c.id() as i32)
-    }
 }
 
-/// Freeze the guest's process tree: the guest and every process below it, stopped.
-async fn freeze(root: i32) -> io::Result<()> {
-    tokio::task::spawn_blocking(move || tree::freeze(root)).await.map_err(io::Error::other)?;
-    Ok(())
+/// Freeze the guest's process tree: the guest and every member, stopped. Blocking work.
+async fn freeze(t: SharedTree) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || locked(&t).freeze()).await.map_err(io::Error::other)?
 }
 
-/// Continue a frozen tree: every process below the guest, then the guest.
-async fn thaw(root: i32) -> io::Result<()> {
-    tokio::task::spawn_blocking(move || {
-        let mut all = vec![root];
-        all.extend(tree::descendants(root, &tree::table()));
-        tree::signal_all(&all, Signal::SIGCONT);
-    })
-    .await
-    .map_err(io::Error::other)
+/// Continue what the freezes stopped.
+async fn thaw(t: SharedTree) -> io::Result<()> {
+    tokio::task::spawn_blocking(move || locked(&t).thaw()).await.map_err(io::Error::other)
 }
 
-struct TreePauser(i32);
+struct TreePauser(SharedTree);
 
 #[async_trait]
 impl Pauser for TreePauser {
     async fn pause(&self) -> io::Result<()> {
-        freeze(self.0).await
+        freeze(self.0.clone()).await
     }
 }
 
 #[async_trait]
 impl Vm for ProcessVm {
     fn pauser(&self) -> Option<Arc<dyn Pauser>> {
-        self.root().map(|root| Arc::new(TreePauser(root)) as Arc<dyn Pauser>)
+        self.tree.as_ref().map(|t| Arc::new(TreePauser(t.clone())) as Arc<dyn Pauser>)
     }
     fn vsock_uds_path(&self) -> PathBuf {
         self.spec.vm_dir.join("vsock.sock")
@@ -162,38 +163,49 @@ impl Vm for ProcessVm {
             .arg(format!("unix:{}", guest_dir.display()))
             .env("NEST_DISK_IMAGE", &self.spec.disk_path)
             .stdin(std::process::Stdio::null());
-        // Dies with nestd, and starts inside the sandbox netns (`supervise.rs`).
-        let child = super::supervise::spawn(cmd, self.spec.netns.clone())?;
+        // Dies with nestd, starts inside the sandbox netns, and leads a session of its own, so
+        // what it starts stays a member of its tree (`supervise.rs`, `tree.rs`).
+        let child = super::supervise::spawn_in_session(cmd, self.spec.netns.clone())?;
         let pid = child.id();
         // Held first: on any error below, stop or drop reaps it.
         self.child = Some(child);
+        self.tree = Some(Arc::new(std::sync::Mutex::new(Tree::new(pid as i32)?)));
         super::supervise::write_pidfile(&self.spec.vm_dir, pid)?;
         Ok(())
     }
     async fn pause(&mut self) -> io::Result<()> {
-        match self.root() {
-            Some(root) => freeze(root).await,
+        match &self.tree {
+            Some(t) => freeze(t.clone()).await,
             None => Ok(()),
         }
     }
     async fn resume(&mut self) -> io::Result<()> {
-        match self.root() {
-            Some(root) => thaw(root).await,
+        match &self.tree {
+            Some(t) => thaw(t.clone()).await,
             None => Ok(()),
         }
     }
     async fn stop(&mut self) -> io::Result<()> {
         if let Some(c) = self.child.take() {
-            let _ = tokio::task::spawn_blocking(move || kill_tree(c)).await;
+            let pid = c.id() as i32;
+            let t = self.tree.take();
+            // Should the blocking task never run (the runtime shutting down), the guest at least
+            // goes; its tree is then the next start's sweep of what nestd left.
+            if tokio::task::spawn_blocking(move || kill_tree(c, t)).await.is_err() {
+                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), Signal::SIGKILL);
+            }
         }
         self.emulator = None;
         Ok(())
     }
 }
 
-/// Freeze the guest's tree, kill every process in it, and reap the guest. Blocking.
-fn kill_tree(mut guest: std::process::Child) {
-    tree::signal_all(&tree::freeze(guest.id() as i32), Signal::SIGKILL);
+/// Freeze the guest's tree, kill every process in it, and reap the guest. Blocking (a freeze is
+/// bounded by `tree::FREEZE_BUDGET`).
+fn kill_tree(mut guest: std::process::Child, t: Option<SharedTree>) {
+    if let Some(t) = t {
+        locked(&t).kill();
+    }
     let _ = guest.kill();
     let _ = guest.wait();
 }
@@ -201,7 +213,7 @@ fn kill_tree(mut guest: std::process::Child) {
 impl Drop for ProcessVm {
     fn drop(&mut self) {
         if let Some(c) = self.child.take() {
-            kill_tree(c);
+            kill_tree(c, self.tree.take());
         }
     }
 }
@@ -246,13 +258,11 @@ mod tests {
         }
     }
 
-    /// A guest whose shell starts `child` in a session of its own (as the guest starts every Bash
-    /// call), writing that child's pid to `<dir>/child.pid`; returns the started VM and the pid.
-    async fn guest_with_a_setsid_child(dir: &std::path::Path, child: &str) -> (Box<dyn Vm>, i32) {
-        let pidf = dir.join("child.pid");
-        // The driver appends `--listen unix:<dir>`: with `sh -c`, those become $0 and $1.
-        let script = format!("setsid {child} & echo $! > {}; exec sleep 300", pidf.display());
-        let driver = ProcessDriver { guest_command: vec!["/bin/sh".into(), "-c".into(), script], mount_disk: false, gateway_gid: None, run_dir: dir.into() };
+    /// A started VM whose guest is `/bin/sh -c <script>` (its `--listen` arguments become `$0` and
+    /// `$1`), and the pids the script wrote to `<dir>/pids`, one per line, once there are `n`.
+    async fn guest_running(dir: &std::path::Path, script: &str, n: usize) -> (Box<dyn Vm>, Vec<i32>) {
+        let pidf = dir.join("pids");
+        let driver = ProcessDriver { guest_command: vec!["/bin/sh".into(), "-c".into(), script.replace("PIDS", &pidf.display().to_string())], mount_disk: false, gateway_gid: None, run_dir: dir.into() };
         let spec = VmSpec {
             sandbox: nest_protocol::model::SandboxId("sbx_tree".into()),
             epoch: nest_protocol::model::Epoch(1),
@@ -264,13 +274,14 @@ mod tests {
         };
         let mut vm = driver.create(spec).await.unwrap();
         vm.start().await.unwrap();
-        for _ in 0..100 {
-            if let Some(p) = std::fs::read_to_string(&pidf).ok().and_then(|s| s.trim().parse::<i32>().ok()) {
-                return (vm, p);
+        for _ in 0..200 {
+            let pids: Vec<i32> = std::fs::read_to_string(&pidf).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect();
+            if pids.len() >= n {
+                return (vm, pids);
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        panic!("the guest's child never started");
+        panic!("the guest's processes never started");
     }
 
     /// `pid`'s state letter (`R`, `S`, `T`, `Z`, ...), or `None` once it is gone.
@@ -279,45 +290,139 @@ mod tests {
         s.rsplit_once(')')?.1.split_whitespace().next()?.chars().next()
     }
 
-    /// Audit G-B4: a stopped VM leaves none of its guest's processes running, including those in a
-    /// session of their own (every Bash call is), which a signal to the guest alone never reached.
-    #[tokio::test]
-    async fn stop_kills_the_guests_whole_process_tree() {
-        let dir = tempfile::tempdir().unwrap();
-        let (mut vm, child) = guest_with_a_setsid_child(dir.path(), "sleep 300").await;
-        assert!(state(child).is_some_and(|s| s != 'Z'), "the child runs");
-        vm.stop().await.unwrap();
-        let mut gone = false;
+    /// Every live process whose session is `sid`.
+    fn in_session(sid: i32) -> Vec<i32> {
+        std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|pid| {
+                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
+                    .and_then(|s| Some(s.rsplit_once(')')?.1.split_whitespace().nth(3)?.parse::<i32>().ok()? == sid && !s.rsplit_once(')')?.1.trim_start().starts_with('Z')))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    /// Until `pids` are all gone (or zombies), for up to 2 s; then SIGKILL what is left (a failed
+    /// test leaves nothing behind) and say whether they went.
+    async fn all_gone(pids: &[i32]) -> bool {
         for _ in 0..100 {
-            // Killed, it is reaped by init (its parent, the guest, is gone): gone, or a zombie for a moment.
-            if state(child).is_none_or(|s| s == 'Z') {
-                gone = true;
+            if pids.iter().all(|&p| state(p).is_none_or(|s| s == 'Z')) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        for &p in pids {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), Signal::SIGKILL);
+        }
+        false
+    }
+
+    /// Audit G-B4: a stopped VM leaves none of its guest's processes running: a child in a session
+    /// of its own (as the guest starts a PTY), one in a process group of its own (as it starts every
+    /// Bash call), and an orphan whose parent exited (`cmd &` in a call that returned), which init
+    /// adopted. A signal to the guest alone reached none of them. A process outside the guest's tree
+    /// is left alone.
+    #[tokio::test]
+    async fn stop_kills_the_guests_whole_tree_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = "setsid sleep 300 & echo $! >> PIDS; \
+                      (set -m; sleep 300 & echo $! >> PIDS; wait) & \
+                      sh -c 'sleep 300 & echo $! >> PIDS'; \
+                      exec sleep 300";
+        let (mut vm, pids) = guest_running(dir.path(), script, 3).await;
+        let bystander = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+        let by = bystander.id() as i32;
+        for &p in &pids {
+            assert!(state(p).is_some_and(|s| s != 'Z'), "{p} runs");
+        }
+        vm.stop().await.unwrap();
+        let gone = all_gone(&pids).await;
+        let left = state(by);
+        let mut bystander = bystander;
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        assert!(gone, "a guest's process outlived the VM's stop: {:?}", pids.iter().map(|&p| (p, state(p))).collect::<Vec<_>>());
+        assert!(left.is_some_and(|s| s != 'T' && s != 'Z'), "a process outside the tree was hit: {left:?}");
+    }
+
+    /// A tree two levels deep that keeps forking (a loop starting a child every few ms, in a
+    /// session of its own) is frozen whole and killed whole.
+    #[tokio::test]
+    async fn a_tree_that_keeps_forking_is_killed_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = "setsid sh -c 'echo $$ >> PIDS; while :; do sleep 300 & sleep 0.005; done' & exec sleep 300";
+        let (mut vm, pids) = guest_running(dir.path(), script, 1).await;
+        let looping = pids[0];
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(in_session(looping).len() > 3, "the loop forks");
+        vm.pause().await.unwrap();
+        for p in in_session(looping) {
+            assert!(matches!(state(p), Some('T' | 't')), "{p} runs on in a paused VM: {:?}", state(p));
+        }
+        vm.stop().await.unwrap();
+        let mut left = vec![];
+        for _ in 0..100 {
+            left = in_session(looping);
+            if left.is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        if !gone {
-            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), Signal::SIGKILL);
+        for &p in &left {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(p), Signal::SIGKILL);
         }
-        assert!(gone, "the guest's setsid child outlived the VM's stop: {:?}", state(child));
+        assert!(left.is_empty(), "the forking tree outlived the stop: {left:?}");
     }
 
-    /// A paused VM's tree is stopped, its setsid children included (they would write the disk a
-    /// commit reads), and both the lock-free pauser and `pause` do it; resume continues them all.
+    /// A member continued from inside the tree (here a loop that sends SIGCONT to a sibling every
+    /// millisecond, racing the freeze) is stopped again: the freeze ends with every member stopped.
     #[tokio::test]
-    async fn pause_freezes_the_whole_tree_and_resume_continues_it() {
+    async fn a_member_continued_during_the_freeze_is_stopped_again() {
         let dir = tempfile::tempdir().unwrap();
-        let (mut vm, child) = guest_with_a_setsid_child(dir.path(), "sleep 300").await;
+        let script = "sleep 300 & S=$!; echo $S >> PIDS; (while :; do kill -CONT $S; sleep 0.001; done) & echo $! >> PIDS; exec sleep 300";
+        let (mut vm, pids) = guest_running(dir.path(), script, 2).await;
+        for _ in 0..5 {
+            vm.pause().await.unwrap();
+            for &p in &pids {
+                assert!(matches!(state(p), Some('T' | 't')), "{p} runs on in a paused VM: {:?}", state(p));
+            }
+            vm.resume().await.unwrap();
+        }
+        vm.stop().await.unwrap();
+        assert!(all_gone(&pids).await);
+    }
+
+    /// A paused VM's tree is stopped, its own-session children included (they would write the disk
+    /// a commit reads), by `pause` and by the lock-free pauser alike; resume continues what the
+    /// pause stopped, and only that: a process the agent had stopped itself stays stopped.
+    #[tokio::test]
+    async fn pause_freezes_the_whole_tree_and_resume_continues_only_what_it_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = "setsid sleep 300 & echo $! >> PIDS; sleep 300 & kill -STOP $!; echo $! >> PIDS; exec sleep 300";
+        let (mut vm, pids) = guest_running(dir.path(), script, 2).await;
+        let (child, stopped_by_agent) = (pids[0], pids[1]);
         let stopped = |pid| matches!(state(pid), Some('T' | 't'));
+        for _ in 0..100 {
+            if stopped(stopped_by_agent) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(stopped(stopped_by_agent));
         vm.pause().await.unwrap();
         assert!(stopped(child), "pause left the child running: {:?}", state(child));
         vm.resume().await.unwrap();
         assert!(!stopped(child), "resume left the child stopped");
+        assert!(stopped(stopped_by_agent), "resume continued a process the agent had stopped");
         vm.pauser().expect("a started VM has a pauser").pause().await.unwrap();
         assert!(stopped(child), "the lock-free pause left the child running: {:?}", state(child));
         vm.resume().await.unwrap();
         assert!(!stopped(child), "resume left the child stopped");
         vm.stop().await.unwrap();
+        assert!(all_gone(&pids).await);
     }
 
     /// A fresh image is formatted once; a formatted (e.g. restored) one is left alone.
