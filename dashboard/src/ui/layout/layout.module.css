@@ -155,9 +155,29 @@
   align-items: center;
 }
 
+/* The control itself fills the target: a tap anywhere in it lands on the control, not on the span
+   around the control's text. Its text stays centred, so nothing visible moves. */
+.target > :is(a, button) {
+  min-height: 2rem;
+  min-width: 2rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
 @media (pointer: coarse) {
   .target {
     min-height: 2.75rem;
+  }
+
+  .target > :is(a, button) {
+    min-height: 2.75rem;
+    min-width: 2.75rem;
+  }
+
+  /* A small button keeps its look on a mouse and grows to the touch minimum on a touch screen. */
+  .touchButton.touchButton {
+    height: 2.75rem;
   }
 }
 

@@ -231,7 +231,23 @@
    "region": "us-east-1",
    "credentials": true,
    "kms_key": true
-  }
+  },
+  "enroll_breakers": [
+   {
+    "role": "sandbox",
+    "type": "c8id.large",
+    "failures": 3,
+    "open_until_ms": 1793540452229,
+    "open": true
+   },
+   {
+    "role": "sandbox",
+    "type": "m8id.large",
+    "failures": 1,
+    "open_until_ms": null,
+    "open": false
+   }
+  ]
  },
  "images": {
   "current": "ami-0a1b2c3d4e5f60718",

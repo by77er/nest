@@ -22,7 +22,7 @@ import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
-import { type BreakerEvent, type Breakers, breakerOpen, breakerStep, filterPlan } from "../lib/enroll-breaker";
+import { basisChanged, type BreakerEvent, type Breakers, breakerOpen, breakerStep, filterPlan, pausedReason } from "../lib/enroll-breaker";
 import { addColumn, sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
 import { retentionMode } from "../lib/retention";
 import {
@@ -185,6 +185,8 @@ const launchKey = (role: HostKind) => `launch:${role}`;
 const noRoomKey = (role: HostKind) => `noroom:${role}`;
 /** A kind's enrolment breakers, by instance type (`lib/enroll-breaker.ts`). */
 const breakerKey = (role: HostKind) => `enroll_breaker:${role}`;
+/** The host image (its parameter's value) the cell's breakers counted their failures under. */
+const BREAKER_BASIS_KEY = "enroll_breaker_basis";
 /**
  * The old process's unanswered commands, and (until `dropUnreported` has run) the leases it held
  * that the new process doesn't report. An older shape is the bare array of commands.
@@ -2037,7 +2039,13 @@ export class FleetDO extends DurableObject<Env> {
     const plan = scaleUpPlan(s, live, pending, now);
     if (!plan.launch) return;
     // Types whose launches keep never enrolling are skipped for their cool-down; with none left, nothing launches.
-    const breakers = this.breakers(role);
+    let breakers = this.breakers(role);
+    // A breaker counted under another host image than the cell's now: the fix may be in it; all go.
+    if (plan.launch.some((a) => breakerOpen(breakers, a.type, now)) && basisChanged(this.kvValue<string>(BREAKER_BASIS_KEY), await this.hostImage())) {
+      const cleared = this.clearBreakers();
+      console.log(`FleetDO: the host image changed since launches stopped enrolling; ${cleared.length} enrolment breakers cleared`);
+      breakers = this.breakers(role);
+    }
     const allowed = filterPlan(breakers, plan.launch, now);
     if (allowed.role_open_until_ms !== null) {
       if (this.roleOpenLogged.get(role) === allowed.role_open_until_ms) return;
@@ -2070,6 +2078,61 @@ export class FleetDO extends DurableObject<Env> {
     console.warn(`FleetDO: no room for a ${role} host anywhere; the next launch pass waits ${wait / 1000} s`);
   }
 
+  /** A JSON value in `kv`, or undefined. */
+  private kvValue<T>(key: string): T | undefined {
+    const v = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", key).toArray()[0]?.value;
+    return v === undefined ? undefined : (JSON.parse(v) as T);
+  }
+
+  /** The host image the cell's launch template resolves (the Image Builder parameter); null when unknown. */
+  private async hostImage(): Promise<string | null> {
+    const ssm = this.ssm();
+    const cell = this.cellName();
+    if (!ssm || !cell) return null;
+    try {
+      return (await ssm.parameter(`/imagebuilder/nest-${cell}/host-ami`))?.value ?? null;
+    } catch (e) {
+      console.warn("FleetDO: reading the host image parameter failed", e);
+      return null;
+    }
+  }
+
+  /** Clear enrolment breakers (every one, or a kind's, or one type's): the ones it cleared. The basis goes with the last. */
+  private clearBreakers(role?: HostKind, type?: string): { role: HostKind; type: string }[] {
+    const cleared: { role: HostKind; type: string }[] = [];
+    for (const r of [SANDBOX_ROLE, BRAIN_ROLE]) {
+      if (role && r !== role) continue;
+      const b = { ...this.breakers(r) };
+      for (const t of Object.keys(b)) {
+        if (type && t !== type) continue;
+        delete b[t];
+        cleared.push({ role: r, type: t });
+      }
+      this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", breakerKey(r), JSON.stringify(b));
+      this.roleOpenLogged.delete(r);
+    }
+    if (![SANDBOX_ROLE, BRAIN_ROLE].some((r) => Object.keys(this.breakers(r)).length)) this.sql.exec("DELETE FROM kv WHERE key = ?", BREAKER_BASIS_KEY);
+    return cleared;
+  }
+
+  /**
+   * The operator's reset (`POST /v1/admin/fleet/enroll-breakers/reset`): every breaker, a kind's or one
+   * type's, closed now; launches of those types resume at the next demand.
+   */
+  async resetEnrollBreakers(role?: HostKind, type?: string): Promise<{ cleared: { role: HostKind; type: string }[] }> {
+    const cleared = this.clearBreakers(role, type);
+    console.log(`FleetDO: the operator reset ${cleared.length} enrolment breakers`);
+    return { cleared };
+  }
+
+  /** Why no host of `role` is launched for waiting work, when every type it would launch has its breaker open; else null. */
+  async launchPause(role: HostKind = SANDBOX_ROLE): Promise<{ reason: string; until_ms: number } | null> {
+    const cfg = this.cellConfig();
+    const s = cfg ? this.scaleSettings(cfg, role) : null;
+    if (!s) return null;
+    return pausedReason(this.breakers(role), [...(s.spot ? s.instance_types : []), ...(s.on_demand_types ?? s.instance_types)], Date.now());
+  }
+
   /** The role-wide openings already logged (once each, not at every demand). */
   private readonly roleOpenLogged = new Map<HostKind, number>();
 
@@ -2093,6 +2156,8 @@ export class FleetDO extends DurableObject<Env> {
       console.error(`FleetDO: ${step.opened.failures} consecutive ${type} ${role} launches never enrolled (the type may lack what the host needs, e.g. KVM): no ${type} launches before ${new Date(step.opened.until_ms).toISOString()}`);
     }
     if (step.reset) console.log(`FleetDO: a ${type} ${role} host enrolled; its enrolment breaker is closed`);
+    // No breaker left anywhere: the basis goes too, so failures counted later get the image of their time.
+    if (![SANDBOX_ROLE, BRAIN_ROLE].some((r) => Object.keys(this.breakers(r)).length)) this.sql.exec("DELETE FROM kv WHERE key = ?", BREAKER_BASIS_KEY);
   }
 
   /** The kind's backoff after a pass where nothing had room (`noRoomBackoffMs`). */
@@ -2156,9 +2221,15 @@ export class FleetDO extends DurableObject<Env> {
   private async scaleDown(now: number): Promise<void> {
     const cfg = this.cellConfig();
     if (!cfg) return;
-    for (const r of this.sql.exec<{ instance_id: string; role: string | null }>(
+    const timedOut = this.sql.exec<{ instance_id: string; role: string | null }>(
       "SELECT instance_id, role FROM launched WHERE host IS NULL AND reason IS NULL AND launched_ms < ?",
-      now - cfg.enroll_timeout_ms).toArray()) {
+      now - cfg.enroll_timeout_ms).toArray();
+    // What these hosts were built from, if the breakers have no basis yet: a later change resets them.
+    const basis = timedOut.length && !this.kvValue(BREAKER_BASIS_KEY) ? await this.hostImage() : null;
+    for (const r of timedOut) {
+      // Re-read in this step (the image read awaited): another tick may have ended it meanwhile.
+      if (!this.sql.exec("SELECT 1 FROM launched WHERE instance_id = ? AND host IS NULL AND reason IS NULL", r.instance_id).toArray().length) continue;
+      if (basis !== null && !this.kvValue(BREAKER_BASIS_KEY)) this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", BREAKER_BASIS_KEY, JSON.stringify(basis));
       this.sql.exec("UPDATE launched SET reason = ? WHERE instance_id = ?", "enroll_timeout" satisfies LaunchEndReason, r.instance_id);
       console.warn(`FleetDO: ${r.instance_id} never enrolled; terminating`);
       const kind = storedEnumOrNull(HostRole, r.role, "launched.role");

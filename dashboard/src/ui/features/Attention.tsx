@@ -40,7 +40,7 @@ function Item({ item }: { item: AttentionItem }) {
         <StatusBadge role={item.role} icon={<RoleIcon role={item.role} />}>{item.label}</StatusBadge>
         <Text size="sm" fw={500}>
           {item.noun}
-          {item.subject && <> <Id id={item.subject} /></>}
+          {item.subject && <> <Id id={item.subject} full={item.subjectWhole} /></>}
         </Text>
         <Text size="sm" c="dimmed">{item.reason}</Text>
       </Group>

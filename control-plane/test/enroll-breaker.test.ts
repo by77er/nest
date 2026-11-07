@@ -3,7 +3,7 @@
 // enrolment closes it. The pure step first; FleetDO's wiring is in fleet.test.ts ("autoscaling").
 import { describe, expect, it } from "vitest";
 import {
-  breakerOpen, breakerStep, type Breakers, cooldownMs, ENROLL_BREAKER_COOLDOWN_MAX_MS, ENROLL_BREAKER_COOLDOWN_MS, ENROLL_BREAKER_THRESHOLD, filterPlan,
+  basisChanged, pausedReason, breakerOpen, breakerStep, type Breakers, cooldownMs, ENROLL_BREAKER_COOLDOWN_MAX_MS, ENROLL_BREAKER_COOLDOWN_MS, ENROLL_BREAKER_THRESHOLD, filterPlan,
 } from "../src/lib/enroll-breaker";
 
 const T = "c8i.large";
@@ -57,5 +57,22 @@ describe("breakerStep (pure)", () => {
     expect(filterPlan(b, plan.slice(0, 2), 100)).toEqual({ launch: [], role_open_until_ms: 500 });
     expect(filterPlan(b, plan.slice(0, 2), 600)).toEqual({ launch: [{ type: "b", spot: true }], role_open_until_ms: null });
     expect(filterPlan(b, [], 100)).toEqual({ launch: [], role_open_until_ms: null });
+  });
+});
+
+describe("the pause reason and the basis (pure)", () => {
+  const b: Breakers = { a: { failures: 3, opens: 1, open_until_ms: 900 }, b: { failures: 4, opens: 2, open_until_ms: 500 } };
+  it("names every type with its failures and the earliest probe, only when all are open", () => {
+    expect(pausedReason(b, ["a", "b", "a"], 100)).toEqual({ reason: `launches paused: consecutive enrolment failures for a (3), b (4); next probe at ${new Date(500).toISOString()}`, until_ms: 500 });
+    expect(pausedReason(b, ["a", "b", "c"], 100)).toBeNull();
+    expect(pausedReason(b, ["a", "b"], 600)).toBeNull();
+    expect(pausedReason(b, [], 100)).toBeNull();
+  });
+  it("a basis changed only when both sides are known and differ", () => {
+    expect(basisChanged("ami-1", "ami-2")).toBe(true);
+    expect(basisChanged("ami-1", "ami-1")).toBe(false);
+    expect(basisChanged(undefined, "ami-2")).toBe(false);
+    expect(basisChanged(null, "ami-2")).toBe(false);
+    expect(basisChanged("ami-1", null)).toBe(false);
   });
 });

@@ -31,7 +31,7 @@ import { Port, SandboxPolicyLayer } from "./do/sandbox";
 import { type CreateAgent, TRACE_HEADER } from "./do/agent";
 import { type GrantParent, inScope, parseGrantRequests } from "./lib/grants";
 import { parseAppSecret } from "./lib/github";
-import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, PROTOCOL_VERSION, Resources } from "./protocol/model";
+import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, hostKind, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
 export { AgentDO } from "./do/agent";
 export { BrokerDO } from "./do/broker";
@@ -552,6 +552,13 @@ export const ROUTES: Route[] = [
   route({ method: "GET", path: "/v1/admin/hosts/:host", auth: "admin", run: ({ env, cell, p }) => fleet(env, cell).hostStatus(p.host) }),
   route({ method: "GET", path: "/v1/admin/fleet", auth: "admin", run: ({ env, cell }) => fleet(env, cell).fleetView() }),
   route({ method: "GET", path: "/v1/admin/images", auth: "admin", run: ({ env, cell }) => fleet(env, cell).images() }),
+  // The cell's enrolment breakers (docs/compute/autoscaling/#enrolment-breaker), closed now: every one, a host
+  // kind's (`role`), or one instance type's.
+  route({
+    method: "POST", path: "/v1/admin/fleet/enroll-breakers/reset", auth: "admin", optionalBody: true,
+    body: z.strictObject({ role: HostRole.optional(), type: z.string().min(1).max(64).optional() }).default({}),
+    run: ({ env, cell, body }) => fleet(env, cell).resetEnrollBreakers(body.role ? hostKind(body.role) : undefined, body.type),
+  }),
   // What is left lying around: dormant sandboxes, sandboxes held by agents nobody uses, quiet agents (docs/control-plane/dashboard/#abandoned).
   route({ method: "GET", path: "/v1/admin/lifetimes", auth: "admin", run: ({ env, cell, url }) => {
     const q = url.searchParams;

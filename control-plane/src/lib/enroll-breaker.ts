@@ -76,3 +76,23 @@ export function filterPlan<T extends { type: string }>(b: Breakers, plan: readon
   if (launch.length || !plan.length) return { launch, role_open_until_ms: null };
   return { launch, role_open_until_ms: Math.min(...plan.map((a) => b[a.type]!.open_until_ms!)) };
 }
+
+/**
+ * Why a role launches nothing, for a sandbox (or brain) waiting on it: null unless every type its plan
+ * has (`types`) is open. Names the types with their failures and when the next one may be tried.
+ */
+export function pausedReason(b: Breakers, types: readonly string[], now: number): { reason: string; until_ms: number } | null {
+  const distinct = [...new Set(types)];
+  if (!distinct.length || !distinct.every((t) => breakerOpen(b, t, now))) return null;
+  const until_ms = Math.min(...distinct.map((t) => b[t]!.open_until_ms!));
+  const each = distinct.map((t) => `${t} (${b[t]!.failures})`).join(", ");
+  return { reason: `launches paused: consecutive enrolment failures for ${each}; next probe at ${new Date(until_ms).toISOString()}`, until_ms };
+}
+
+/**
+ * Whether what hosts are built from changed since the breakers counted their failures (the host image
+ * the cell's launch template resolves, as its parameter names it): a fixed release must not wait out
+ * an old cool-down. Unknown on either side (no parameter, unreadable) is no change.
+ */
+export const basisChanged = (basis: string | null | undefined, current: string | null): boolean =>
+  typeof basis === "string" && current !== null && basis !== current;

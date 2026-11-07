@@ -53,11 +53,13 @@ export const rowId = (table: "agent" | "sandbox" | "host" | "lifetime", id: stri
 export interface AttentionItem {
   key: string;
   role: "danger" | "warning";
-  /** What it is: an agent, a sandbox, a host, or a read of the control plane. */
-  noun: "Agent" | "Sandbox" | "Host" | "Read";
+  /** What it is: an agent, a sandbox, a host, the cell's launches of an instance type, or a read of the control plane. */
+  noun: "Agent" | "Sandbox" | "Host" | "Launches" | "Read";
   /** Its status, as its badge says it. */
   label: string;
   subject: string | null;
+  /** The subject is a name to show whole (an instance type), not an id to shorten. */
+  subjectWhole?: boolean;
   reason: string;
   /** The row it is detailed in, if the page lists it. */
   target: string | null;
@@ -95,6 +97,15 @@ export function attention({ fleet, agents, agentsError, lifetimes, lifetimesErro
         target: null,
       });
     }
+  }
+  // An instance type whose launches kept never enrolling isn't launched until its cool-down ends.
+  for (const b of fleet?.enroll_breakers ?? []) {
+    if (!b.open) continue;
+    add({
+      role: "warning", noun: "Launches", label: "paused", subject: b.type, subjectWhole: true,
+      reason: `${b.failures} ${b.role} host launches in a row never enrolled; next try ${b.open_until_ms !== null ? `in ${span(Math.max(0, b.open_until_ms - now))}` : "at the next demand"}`,
+      target: null,
+    });
   }
   for (const h of l.hosts) {
     if (h.wedged_ms !== null) add({ role: "danger", noun: "Host", label: "wedged", subject: h.host, reason: `A brain did not exit after a kill, ${age(h.wedged_ms, now)} ago`, target: rowId("host", h.host) });
