@@ -206,7 +206,10 @@ export class BrokerDO extends DurableObject<Env> {
    * named one, or a refusal. Only those names: the value is sent to a brain host, so a credential naming
    * any other secret is refused. Other objects store and pass the reference ({@link SECRET_REF_PREFIX});
    * FleetDO resolves it only when it sends `agent_start`, so no copy of the value is kept elsewhere.
-   * Without `principal` (a caller of the previous release) it decides for the operator.
+   * Without `principal` (a caller of the previous release) it decides for the operator. Every caller
+   * of this release (AgentDO's `startCredential`) passes the principal for a client's agent, so the
+   * operator's branch, with its fallback, is never reached for one; AgentDO also refuses any reference
+   * but the spec's own for a client's agent.
    */
   async credentialRef(credential: string, principal?: { client: string; credentials: string[] | null }): Promise<string> {
     const who: CredentialPrincipal = principal ? { kind: "client", client: principal.client } : { kind: "operator" };

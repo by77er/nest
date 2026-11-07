@@ -490,7 +490,13 @@ export class AgentDO extends DurableObject<Env> {
     const info = this.load();
     const was = info.lifecycle;
     const wasState = agentState(info);
+    const wasStartError = JSON.stringify(info.start_error ?? null);
     fn(info);
+    // `start_error` says why this step entered `errored`, so it is kept only when this step set it:
+    // entered another way (a start deadline, a crash loop), an older refusal's reason goes.
+    const why = was !== "errored" && info.lifecycle === "errored" && JSON.stringify(info.start_error ?? null) !== wasStartError
+      ? info.start_error : undefined;
+    if (was !== "errored" && info.lifecycle === "errored" && !why) delete info.start_error;
     this.save(info);
     // Every change of its state is in its trace, in the same step.
     const state = agentState(info);
@@ -498,7 +504,6 @@ export class AgentDO extends DurableObject<Env> {
     // Every way into `errored` goes through here: its client hears of it in the same step.
     if (was !== "errored" && info.lifecycle === "errored") {
       // A start refused for good says why (`start_refused`); otherwise the general note.
-      const why = info.start_error;
       this.emit(info, `${info.agent}/errored/${newId("evt_")}`, why
         ? { type: "agent.error", agent: info.agent, code: "start_refused", message: `its brain could not be started: ${why.message}; it waits for new input` }
         : {
@@ -1015,9 +1020,12 @@ export class AgentDO extends DurableObject<Env> {
     }
     this.update((i) => {
       Object.assign(i, NO_INTENT);
-      // Why, on the record and in the `agent.error` this step sends.
-      i.start_error = { code: ne?.code ?? ErrorCodes.INTERNAL, message: clip(ne?.detail ?? String(e), 1000), ms: Date.now() };
-      if (!i.brain && (i.lifecycle === "starting" || i.lifecycle === "detached")) i.lifecycle = "errored";
+      // Only when this step makes it `errored` (with a live brain it stays as it is): why, on the record
+      // and in the `agent.error` this step sends.
+      if (!i.brain && (i.lifecycle === "starting" || i.lifecycle === "detached")) {
+        i.start_error = { code: ne?.code ?? ErrorCodes.INTERNAL, message: clip(ne?.detail ?? String(e), 1000), ms: Date.now() };
+        i.lifecycle = "errored";
+      }
     });
     await this.deadlines.clear("intent");
   }

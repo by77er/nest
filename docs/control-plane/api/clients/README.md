@@ -145,7 +145,7 @@ POST /v1/agents
   - `agent.turn_completed {agent, turn, text}`;
   - `agent.exited {agent, reason, text}`;
   - `agent.ask {agent, ask, question, approval?}`;
-  - `agent.error {agent, code, message}` (`start_refused`: a start refused for good, such as a credential the grant no longer names or that isn't stored, with the reason; `errored`: its brain kept failing; or the runner's own error code);
+  - `agent.error {agent, code, message}` (`start_refused`: every start refused for good, whatever the cause, with the reason in `message` (a credential the grant no longer names or that isn't stored, say); `errored`: its brain kept failing; or the runner's own error code);
   - `agent.timer_fired {agent, timer, note}` ([timers](#timers));
   - `sandbox.destroyed {sandbox}`.
 - **Delivery:** to the client's webhook (`PUT /v1/clients/self/webhook {url}`, `https` only), signed with `Nest-Signature: t=<ms>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>`, with the event's `id` for deduplication. The secret is shown once, when the webhook is set.
