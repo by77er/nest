@@ -97,8 +97,11 @@ export function summarize(h: HistoryRow): string {
     // The task's title when recorded (older entries have only its id).
     case "dependency_added":
       return str(o.title) ? `Waits on "${clip(str(o.title)!)}"` : str(o.blocked_by) ? `Waits on ${str(o.blocked_by)}` : "Dependency added";
-    case "dependency_removed":
-      return str(o.title) ? `No longer waits on "${clip(str(o.title)!)}"` : str(o.blocked_by) ? `No longer waits on ${str(o.blocked_by)}` : "Dependency removed";
+    case "dependency_removed": {
+      // Removed because the task it waited on was deleted (README.md#the-task-machine).
+      const why = o.why === "deleted" ? " (deleted)" : "";
+      return str(o.title) ? `No longer waits on "${clip(str(o.title)!)}"${why}` : str(o.blocked_by) ? `No longer waits on ${str(o.blocked_by)}${why}` : `Dependency removed${why}`;
+    }
     case "dependency_done":
       return str(o.title) ? `"${clip(str(o.title)!)}", which it waits on, is done` : str(o.blocker) ? `${str(o.blocker)}, which it waits on, is done` : "A dependency is done";
     case "worker_notified":

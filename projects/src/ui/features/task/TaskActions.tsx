@@ -11,6 +11,14 @@ import type { Task } from "../../api/types";
 import { FieldGroup, icon, Toolbar } from "../../layout";
 import { can } from "../../status";
 
+/** Why Mark done isn't offered when it's only the open PRs (README.md#the-task-machine), or null. */
+export function doneWaitsOnPrs(task: Pick<Task, "state" | "prs" | "worker_live">): string | null {
+  const open = task.prs.filter((p) => p.state === "open").map((p) => `#${p.number}`);
+  if (!open.length || can(task, "done") || !can({ ...task, prs: [] }, "done")) return null;
+  const list = open.length === 1 ? `PR ${open[0]}` : `PRs ${open.slice(0, -1).join(", ")} and ${open.at(-1)}`;
+  return `Done when ${list} ${open.length === 1 ? "merges" : "merge"}, or detach ${open.length === 1 ? "it" : "them"} to finish by hand.`;
+}
+
 export function TaskActions({ projectId, task, onDeleted }: { projectId: string; task: Task; onDeleted: () => void }) {
   const assign = useAssignTask(projectId);
   const done = useMarkDone(projectId);
@@ -39,6 +47,7 @@ export function TaskActions({ projectId, task, onDeleted }: { projectId: string;
     });
 
   const any = can(task, "assign") || can(task, "done") || can(task, "cancel") || task.state === "draft";
+  const prsHold = doneWaitsOnPrs(task);
   if (!any) return null;
 
   return (
@@ -86,6 +95,12 @@ export function TaskActions({ projectId, task, onDeleted }: { projectId: string;
           <Button color="success" leftSection={<IconCheck size={icon.md} />} loading={done.isPending} onClick={confirmDone}>
             Mark done
           </Button>
+        )}
+        {/* Not offered while its PRs are open (the machine refuses it): said, as a dependency's wait is. */}
+        {prsHold && (
+          <Text fz="sm" c="dimmed" data-slot="done-waits">
+            {prsHold}
+          </Text>
         )}
       </Toolbar>
       <CancelTaskModal projectId={projectId} task={task} opened={cancelling} onClose={cancelModal.close} />

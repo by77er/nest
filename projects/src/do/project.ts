@@ -788,8 +788,9 @@ export class ProjectDO extends DurableObject<Env> {
         this.record(d.task as string, { kind: "app", what: "board" }, "dependency_done", { blocker: id, title: r.title as string });
         this.noteChange(d.task as string, "dependencies", `${id} (${from.replace("_", " ")})`, `${id} (done)`, { kind: "app", what: "board" });
       }
-      // Done through its merged PRs, a task made of an issue closes it, with a line naming the PR (README.md#triage).
-      if (effects.record === "merged" && r.issue !== null && r.issue !== undefined) {
+      // Done through its merged PRs, by whichever event (the last one merging, or the last open one closed
+      // or detached after another merged), a task made of an issue closes it, naming the PR (README.md#triage).
+      if (st.facts.mergedPrs > 0 && r.issue !== null && r.issue !== undefined) {
         const pr = this.sql.exec<{ pr: number }>("SELECT pr FROM task_prs WHERE task = ? AND state = 'merged' ORDER BY ended_ms DESC LIMIT 1", id).toArray()[0]?.pr ?? null;
         this.sql.exec("INSERT OR IGNORE INTO issue_closes (task, issue, pr, next_ms, owed_ms) VALUES (?, ?, ?, ?, ?)", id, r.issue, pr, now, now);
       }

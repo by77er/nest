@@ -210,6 +210,57 @@ describe("deleting a draft (B4)", () => {
   });
 });
 
+describe("done through a merged PR, a task made of an issue closes it, by whichever route", () => {
+  async function fromIssue(p: P, n: number) {
+    gh.issues.set(p.repo, new Map([[n, { title: `Issue ${n}`, body: "", state: "open" as const, login: "a", comments: [] as string[] }]]));
+    await deliverGithub("issues", { action: "opened", sender: { id: 1 }, issue: { number: n, title: `Issue ${n}`, body: "b", state: "open", user: { login: "a" }, html_url: `https://github.com/${p.repo}/issues/${n}` }, repository: { full_name: p.repo } });
+    const issue = (await api(token, "GET", `/api/projects/${p.id}/issues`)).body[0];
+    const id = (await api(token, "POST", `/api/projects/${p.id}/issues/${n}/accept`, { updated_ms: issue.updated_ms })).body.id as string;
+    await api(token, "PUT", `/api/projects/${p.id}/tasks/${id}/spec`, spec);
+    return { id, issue: gh.issues.get(p.repo)!.get(n)! };
+  }
+
+  it("the last open PR detached by the owner after another merged: done, and the issue is closed naming the merged PR", async () => {
+    const p = await newProject();
+    const t = await fromIssue(p, 41);
+    gh.pull(p.repo, 141);
+    gh.pull(p.repo, 142);
+    await attach(p, t.id, 141);
+    await attach(p, t.id, 142);
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 141, sha: sha(), action: "closed", merged: true, updated_at: later() }));
+    expect((await task(p, t.id)).state).toBe("ready");
+    expect((await api(token, "DELETE", `/api/projects/${p.id}/tasks/${t.id}/prs/142`)).body.state).toBe("done");
+    await stub(p).drain();
+    expect(t.issue.state).toBe("closed");
+    expect(t.issue.comments).toEqual(["Done in #141."]);
+    expect((await task(p, t.id)).issue).toMatchObject({ number: 41, close: "closed" });
+  });
+
+  it("the last open PR closed unmerged after another merged: the same", async () => {
+    const p = await newProject();
+    const t = await fromIssue(p, 42);
+    gh.pull(p.repo, 143);
+    gh.pull(p.repo, 144);
+    await attach(p, t.id, 143);
+    await attach(p, t.id, 144);
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 143, sha: sha(), action: "closed", merged: true, updated_at: later() }));
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 144, sha: sha(), action: "closed", merged: false, updated_at: later() }));
+    expect((await task(p, t.id)).state).toBe("done");
+    await stub(p).drain();
+    expect(t.issue.state).toBe("closed");
+    expect(t.issue.comments).toEqual(["Done in #143."]);
+  });
+
+  it("done by hand (no PR merged) leaves the issue to the owner", async () => {
+    const p = await newProject();
+    const t = await fromIssue(p, 43);
+    expect((await done(p, t.id)).body.state).toBe("done");
+    await stub(p).drain();
+    expect(t.issue.state).toBe("open");
+    expect((await task(p, t.id)).issue).toMatchObject({ number: 43, close: null });
+  });
+});
+
 describe("a merged PR's close handled twice", () => {
   it("counts once: only an open PR merges", async () => {
     const p = await newProject();

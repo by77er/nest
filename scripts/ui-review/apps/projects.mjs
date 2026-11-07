@@ -636,6 +636,10 @@ const app = {
     { name: "drawer-trace-expanded", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: traceCheck, checkName: "trace", after: async (p) => { await traceTab(p); await expandResult(p); } },
     { name: "drawer-trace-loading", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: traceCheck, checkName: "trace", after: async (p) => { await traceTab(p); p.holdHistory = true; await toTop("loading earlier…")(p); } },
     { name: "drawer-trace-beginning", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: traceCheck, checkName: "trace", after: async (p) => { await traceTab(p); await toTop("the beginning of the trace")(p); } },
+    { name: "drawer-stalled-pr", section: "project", path: "/projects/prj_demo/board?task=tsk_demo8", fixture: "machine", full: false },
+    { name: "drawer-stalled-pr-history", section: "project", path: "/projects/prj_demo/board?task=tsk_demo8", fixture: "machine", full: false, after: drawerAt("History") },
+    { name: "drawer-ready-pr", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", fixture: "machine", full: false },
+    { name: "drawer-ready-pr-history", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", fixture: "machine", full: false, after: drawerAt("History") },
     { name: "drawer-no-worker", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false },
     // A task's PRs and dependencies (PR #127): several PRs in mixed states, a task waiting on others,
     // one that others wait on, one that's over; both pickers, open and with no match; the card's tooltip.

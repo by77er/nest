@@ -5,6 +5,7 @@ import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+import { doneWaitsOnPrs } from "./TaskActions";
 /** The task drawer (titled with its task's title). */
 const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
 
@@ -130,6 +131,8 @@ describe("the task drawer", () => {
     const d = await waitFor(drawer);
     expect(await within(d).findByRole("button", { name: "Assign" })).toBeInTheDocument();
     expect(within(d).queryByRole("button", { name: "Mark done" })).toBeNull();
+    // Said, where the button would be.
+    expect(within(d).getByText("Done when PR #9 merges, or detach it to finish by hand.")).toBeInTheDocument();
     await user.click(screen.getByRole("link", { name: "Stalled with a PR" }));
     expect(await within(drawer()).findByRole("button", { name: "Reassign" })).toBeInTheDocument();
     expect(within(drawer()).queryByRole("button", { name: "Mark done" })).toBeNull();
@@ -138,6 +141,16 @@ describe("the task drawer", () => {
     await user.click(screen.getByRole("link", { name: "Ready with a PR" }));
     await user.click(screen.getByRole("link", { name: "Stalled with a PR" }));
     expect(await within(drawer()).findByRole("button", { name: "Mark done" })).toBeInTheDocument();
+    expect(within(drawer()).queryByText(/Done when PR/)).toBeNull();
+  });
+
+  it("says why Mark done waits only when the open PRs are the reason: not for a running worker", () => {
+    const open = (n: number) => ({ number: n, state: "open" as const, title: null, fork: false, attached_by: "owner", attached_ms: 0, auto_merge: null });
+    expect(doneWaitsOnPrs(task({ state: "stalled", prs: [open(130)] }))).toBe("Done when PR #130 merges, or detach it to finish by hand.");
+    expect(doneWaitsOnPrs(task({ state: "ready", prs: [open(1), open(2), open(3)] }))).toBe("Done when PRs #1, #2 and #3 merge, or detach them to finish by hand.");
+    expect(doneWaitsOnPrs(task({ state: "in_progress", prs: [open(4)] }))).toBeNull();
+    expect(doneWaitsOnPrs(task({ state: "ready", prs: [] }))).toBeNull();
+    expect(doneWaitsOnPrs(task({ state: "done", prs: [] }))).toBeNull();
   });
 
   it("marks a task with no PR done, in green, once confirmed", async () => {
