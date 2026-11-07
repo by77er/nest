@@ -843,6 +843,32 @@ describe("autoscaling", () => {
     await expect(Promise.resolve().then(() => sandboxStub(other.sandbox).resolve(agent))).rejects.toThrow(/not placed yet: launches paused: consecutive enrolment failures for c8id\.large/);
   });
 
+  it("failures from launches of several images count under the newest of them", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("terminated");
+    const setUp = () => runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+      inst.ec2Override = ec2;
+      inst.cellConfigOverride = config;
+      inst.ssmOverride = { parameter: async (n: string) => (n === `/imagebuilder/nest-${cell}/host-ami` ? { value: "ami-2", modified_ms: null } : null) };
+      inst.hostImageCache = undefined;
+    });
+    await setUp();
+    const sbx = await createSandbox(cell, 202);
+    // The pending launch, recorded first, was the oldest (ami-1); two newer ones from ami-2 time out in the
+    // same tick. Read in the order recorded, ami-1 would come first.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE launched SET image = 'ami-1', launched_ms = ?", Date.now() - 5_000);
+      state.storage.sql.exec("INSERT INTO launched (instance_id, launched_ms, role, region, cell, type, image) VALUES ('i-0new1', ?, 'sandbox', 'us-east-1', ?, 'c8i-flex.large', 'ami-2'), ('i-0new2', ?, 'sandbox', 'us-east-1', ?, 'c8i-flex.large', 'ami-2')",
+        Date.now() - 2_000, cell, Date.now() - 1_000, cell);
+    });
+    await tickAt(cell, ec2, 601_000);
+    // The basis is ami-2, the image now: the breaker stands and the next type is launched.
+    await setUp();
+    const n = ec2.launched.length;
+    await sandboxStub(sbx.sandbox).retryPlacement();
+    expect(ec2.launched.slice(n).map((l) => l.instanceType)).toEqual(["c8i.large"]);
+  });
+
   it("retires a launched host that enrolled but never said hello once the enroll timeout passes (B-8)", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("running");

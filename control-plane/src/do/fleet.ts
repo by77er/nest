@@ -2240,7 +2240,8 @@ export class FleetDO extends DurableObject<Env> {
     const cfg = this.cellConfig();
     if (!cfg) return;
     const timedOut = this.sql.exec<{ instance_id: string; role: string | null; image: string | null }>(
-      "SELECT instance_id, role, image FROM launched WHERE host IS NULL AND reason IS NULL AND launched_ms < ?",
+      // Newest first: the basis is the newest image any of them was launched from.
+      "SELECT instance_id, role, image FROM launched WHERE host IS NULL AND reason IS NULL AND launched_ms < ? ORDER BY launched_ms DESC",
       now - cfg.enroll_timeout_ms).toArray();
     // What these hosts were built from, if the breakers have no basis yet: recorded at their launch (an
     // image fixed since then resets them at the next pass), else the image now. A later change resets them.
