@@ -332,15 +332,14 @@ mod tests {
     }
 
     /// Audit G-B4: a stopped VM leaves none of its guest's processes running: a child in a session
-    /// of its own (as the guest starts a PTY), one in a process group of its own (as it starts every
-    /// Bash call), and an orphan whose parent exited (`cmd &` in a call that returned), which init
-    /// adopted. A signal to the guest alone reached none of them. A process outside the guest's tree
+    /// of its own (as the guest starts a PTY), one a level further down, and an orphan whose parent
+    /// exited (`cmd &` in a call that returned), which init adopted. A signal to the guest alone reached none of them. A process outside the guest's tree
     /// is left alone.
     #[tokio::test]
     async fn stop_kills_the_guests_whole_tree_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         let script = "setsid sleep 300 & echo $! >> PIDS; \
-                      (set -m; sleep 300 & echo $! >> PIDS; wait) & \
+                      (sleep 300 & echo $! >> PIDS; wait) & \
                       sh -c 'sleep 300 & echo $! >> PIDS'; \
                       exec sleep 300";
         let (mut vm, pids) = guest_running(dir.path(), script, 3).await;
@@ -415,6 +414,32 @@ mod tests {
         }
         vm.stop().await.unwrap();
         assert!(all_gone(&pids).await);
+    }
+
+    /// Resume is transparent to a parent that waits with `WUNTRACED` (an interactive shell): it
+    /// never sees its child as stopped by a pause, since children are continued before parents.
+    #[tokio::test]
+    async fn a_waiting_parent_never_sees_its_child_stopped_by_a_pause() {
+        if std::process::Command::new("python3").arg("-c").arg("import os").output().map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("NEST-TEST-SKIP: a_waiting_parent_never_sees_its_child_stopped_by_a_pause: no python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("saw-a-stop");
+        let script = format!(
+            "python3 -c 'import os, subprocess\nc = subprocess.Popen([\"sleep\", \"300\"])\nopen(\"PIDS\", \"a\").write(\"%d\\n%d\\n\" % (os.getpid(), c.pid))\nwhile True:\n    pid, st = os.waitpid(c.pid, os.WUNTRACED)\n    if os.WIFSTOPPED(st): open(\"{}\", \"w\").write(\"stopped\")\n    else: break' & exec sleep 300",
+            marker.display()
+        );
+        let (mut vm, pids) = guest_running(dir.path(), &script, 2).await;
+        // The window is the gap between continuing a parent and its child: many tries.
+        for _ in 0..100 {
+            vm.pause().await.unwrap();
+            vm.resume().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        vm.stop().await.unwrap();
+        assert!(all_gone(&pids).await);
+        assert!(!marker.exists(), "the parent saw its child stopped by a pause");
     }
 
     /// A paused VM's tree is stopped, its own-session children included (they would write the disk

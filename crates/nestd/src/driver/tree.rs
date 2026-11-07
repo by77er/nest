@@ -11,16 +11,24 @@
 //!   every process it starts that doesn't start a session of its own carries its session id, and
 //!   keeps it when its parent exits and init adopts it (`cmd &` in a Bash call that returns). A
 //!   member is the guest, a process in its session, or a descendant of a member ([`members`]).
-//! - **Freeze first.** [`Tree::freeze`] stops the guest, then every member, pass after pass, and
+//! - **Freeze first.** [`Tree::freeze`] stops the guest, then every member (each only once its
+//!   parent has stopped, so no parent sees a child's stop as its job stopping), pass after pass, and
 //!   stops again any member that runs again (a SIGCONT from inside, a job-control SIGCONT), until a
 //!   pass finds no new member and every member is stopped: a stopped process can't fork, so the set
 //!   can only grow while some still run. It gives up after [`FREEZE_BUDGET`] with an error.
-//! - **Never another process.** A pidfd is opened for each member when it is found, after its
-//!   parent or session was read and before it is signalled, and kept: every later signal goes
-//!   through it, so a pid that exited and was reused is never hit, and a member whose parent
-//!   exited is still reached.
+//! - **Never another process.** A pidfd is opened for each member when it is found, then its
+//!   parent or session is read, and the pidfd is kept: every later signal goes through it, so a
+//!   pid that exited and was reused is never hit, and a member whose parent exited is still
+//!   reached. (A pid reused by a new member within one freeze, which takes wraparound within a
+//!   second, could hide that member until the next freeze.)
 //! - **Resume is transparent.** [`Tree::thaw`] continues exactly the processes the freezes
-//!   stopped; one an agent had stopped itself (`kill -STOP`, a suspended job) stays stopped.
+//!   stopped, children before parents; one an agent had stopped itself (`kill -STOP`, a suspended
+//!   job) stays stopped.
+//! - **Quiescence is per process, not per thread or I/O.** A process counts as stopped from its
+//!   state (that of its main thread), and one in an uninterruptible wait with SIGSTOP pending (a
+//!   write throttled on dirty pages) counts as stopped though that write may still finish. A
+//!   commit that must not race a guest's writes needs the disk's own quiescence, which a VM's
+//!   pause gives and this driver only approximates.
 //! - **The limit:** a process that leaves both the tree and the session (a PTY's own session whose
 //!   leader exited, a daemon that calls `setsid` and whose parent exited) escapes. Containing that
 //!   needs a cgroup or a pid namespace, which the process driver doesn't have. It is for
@@ -193,7 +201,8 @@ impl Tree {
         let before = self.stopped.clone();
         let r = self.freeze_keeping(budget);
         if r.is_err() {
-            for m in &self.members {
+            // Children first, as `thaw` does.
+            for m in self.members.iter().rev() {
                 if self.stopped.contains(&m.pid) && !before.contains(&m.pid) {
                     let _ = send(&m.fd, Signal::SIGCONT);
                 }
@@ -234,10 +243,25 @@ impl Tree {
                 };
                 let ours = |s: Stat| s.session == self.root || self.members.iter().any(|m| m.pid == s.ppid);
                 let Some(s) = stat(pid).filter(|s| ours(*s)) else { continue };
+                // A child is stopped only once its parent has: a parent still running (its
+                // SIGSTOP not yet taken) and waiting with WUNTRACED would see its child's stop as
+                // its job stopping. Left for the next pass.
+                if self.members.iter().any(|m| m.pid == s.ppid && !m.halted()) {
+                    found = true;
+                    continue;
+                }
                 let m = Member { pid, fd };
                 let was_halted = matches!(s.state, 'T' | 't');
-                if send(&m.fd, Signal::SIGSTOP).is_ok() && !was_halted {
-                    self.stopped.insert(pid);
+                match send(&m.fd, Signal::SIGSTOP) {
+                    Ok(()) if !was_halted => {
+                        self.stopped.insert(pid);
+                    }
+                    Ok(()) => {}
+                    // A member nestd may not signal (another uid, setuid) can never be stopped.
+                    Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                        return Err(io::Error::new(e.kind(), format!("the guest's process {pid} can't be stopped: {e}")));
+                    }
+                    Err(_) => {}
                 }
                 known.insert(pid);
                 self.members.push(m);
@@ -245,11 +269,13 @@ impl Tree {
             }
             // A member that runs again (a SIGCONT from inside the tree, a job-control SIGCONT) is
             // stopped again.
+            // Parents first, and a member only once its parent (a member) has stopped, as above.
             let mut running = 0;
             for m in &self.members {
                 if !m.halted() {
                     running += 1;
-                    if send(&m.fd, Signal::SIGSTOP).is_ok() {
+                    let parent_runs = stat(m.pid).is_some_and(|s| self.members.iter().any(|p| p.pid == s.ppid && !p.halted()));
+                    if !parent_runs && send(&m.fd, Signal::SIGSTOP).is_ok() {
                         self.stopped.insert(m.pid);
                     }
                 }
@@ -264,12 +290,15 @@ impl Tree {
         }
     }
 
-    /// Continue what the freezes stopped, and forget the members that have exited.
+    /// Continue what the freezes stopped, children before parents: the kernel tells a parent
+    /// waiting with `WUNTRACED` (an interactive shell) that its job stopped until the child itself
+    /// is continued, so a parent continued first could see its foreground job as stopped. Then
+    /// forget the members that have exited.
     pub fn thaw(&mut self) {
         if self.dead {
             return;
         }
-        for m in &self.members {
+        for m in self.members.iter().rev() {
             if self.stopped.contains(&m.pid) {
                 let _ = send(&m.fd, Signal::SIGCONT);
             }
@@ -317,6 +346,15 @@ mod tests {
         Stat { state: 'S', ppid, session }
     }
 
+    /// A child process, killed and reaped however the test ends.
+    struct Reaped(std::process::Child);
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
     /// A child shell that starts `sleep 300` and writes its pid, as the tree's root; the pid.
     fn tree_with_a_child() -> (std::process::Child, i32) {
         let dir = tempfile::tempdir().unwrap();
@@ -346,20 +384,25 @@ mod tests {
     /// stopped with nothing to resume it. A kill after it still finds and kills every member.
     #[test]
     fn a_failed_freeze_continues_what_it_stopped() {
-        let (mut root, child) = tree_with_a_child();
-        let mut t = Tree::new(root.id() as i32).unwrap();
+        let (root, child) = tree_with_a_child();
+        let mut root = Reaped(root);
+        let mut t = Tree::new(root.0.id() as i32).unwrap();
         assert!(t.freeze_within(Duration::ZERO).is_err(), "no budget: the members found aren't all stopped yet");
         std::thread::sleep(Duration::from_millis(50));
-        for p in [root.id() as i32, child] {
+        for p in [root.0.id() as i32, child] {
             assert!(!matches!(state(p), Some('T' | 't')), "{p} left stopped by a failed freeze");
         }
         assert!(t.stopped.is_empty());
         t.freeze().unwrap();
         assert!(matches!(state(child), Some('T' | 't')));
         t.kill();
-        let _ = root.wait();
+        let _ = root.0.wait();
         std::thread::sleep(Duration::from_millis(50));
-        assert!(state(child).is_none_or(|s| s == 'Z'), "the child outlived the kill");
+        let alive = state(child).is_some_and(|s| s != 'Z');
+        if alive {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), Signal::SIGKILL);
+        }
+        assert!(!alive, "the child outlived the kill");
         assert!(t.freeze().is_ok() && t.dead, "a dead tree freezes nothing");
     }
 
@@ -372,14 +415,15 @@ mod tests {
             eprintln!("NEST-TEST-SKIP: a_freeze_during_a_vfork_loop_succeeds: no python3 with posix_spawn");
             return;
         }
-        let mut root = std::process::Command::new("python3")
+        let root = std::process::Command::new("python3")
             .arg("-c")
             .arg("import os\nwhile True:\n    pid = os.posix_spawn('/bin/true', ['true'], {})\n    os.waitpid(pid, 0)")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        let mut t = Tree::new(root.id() as i32).unwrap();
+        let mut root = Reaped(root);
+        let mut t = Tree::new(root.0.id() as i32).unwrap();
         std::thread::sleep(Duration::from_millis(100));
         let mut failed = 0;
         for _ in 0..30 {
@@ -389,7 +433,7 @@ mod tests {
             t.thaw();
         }
         t.kill();
-        let _ = root.wait();
+        let _ = root.0.wait();
         assert_eq!(failed, 0, "freezes failed during the vfork loop");
     }
 
