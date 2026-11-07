@@ -26,3 +26,19 @@ SandboxLease.tla MCFixedS4.cfg holds full
 SandboxLease.tla MCFixedS5.cfg holds full
 SandboxLease.tla MCDoubleRunNoShutting.cfg holds full
 SandboxLease.tla MCLive.cfg holds full
+#
+# SlotFollowups: a command result's follow-ups (bug 2) and a placement's (bug 3), with the slots and
+# Resolve. Old configs are the code before #187. Hands and Placed finish in under a minute on 4
+# workers; they are `full` only to spare CI minutes.
+SlotFollowups.tla MCSlotsOld.cfg violates:BindingOnlyConfirmed ci
+SlotFollowups.tla MCSlotsOldPlacement.cfg violates:BindingOnlyConfirmed ci
+SlotFollowups.tla MCSlotsOldResults.cfg violates:FollowupsDone ci
+SlotFollowups.tla MCSlotsMutNoRerun.cfg violates:FollowupsDone ci
+SlotFollowups.tla MCSlotsMutNoPlacedDeadline.cfg violates:PlacedDone ci
+SlotFollowups.tla MCSlotsReachRerun.cfg violates:NoRerun ci
+SlotFollowups.tla MCSlotsReachCut.cfg violates:NoCut ci
+SlotFollowups.tla MCSlotsReachMovedBind.cfg violates:NoMovedBind ci
+SlotFollowups.tla MCSlotsFixed.cfg holds ci
+SlotFollowups.tla MCSlotsFixedFollowups.cfg holds ci
+SlotFollowups.tla MCSlotsFixedHands.cfg holds full
+SlotFollowups.tla MCSlotsFixedPlaced.cfg holds full

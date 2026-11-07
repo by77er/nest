@@ -1,5 +1,5 @@
-// A host command's result and the follow-ups it owes (docs/control-plane/durable-objects/fleet/#command-results;
-// the sandbox-lease model's `RecordResult`/`RunFollowup`). Pure.
+// A host command's result and the follow-ups it owes (docs/control-plane/durable-objects/fleet/, "Command results";
+// verification/tla/sandbox-lease/SlotFollowups.tla: `Recv`, `Finish`, `Rerun`). Pure.
 //
 // FleetDO records a result and, in the same synchronous step, that its follow-ups are owed (a durable
 // flag on the command's row). Each follow-up is a call to another Durable Object (SandboxDO's

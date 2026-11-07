@@ -674,9 +674,8 @@ export class SandboxDO extends DurableObject<Env> {
   /**
    * A command failed on the lease holder: `sandbox_create` failures matter here, and `sandbox_checkpoint`
    * ones from a FleetDO of the previous release (this one sends `checkpointResult` instead).
-   */
-  /**
-   * A command of this sandbox failed. A `sandbox_create`'s failure is decided once per command (`cmd`):
+   *
+   * A `sandbox_create`'s failure is decided once per command (`cmd`):
    * FleetDO runs this again when a reset or a failed call cut it (its result's follow-ups stay owed until
    * they've run), and `createFailed` counts an attempt, so a repeat finishes the recorded decision's
    * remaining steps (the re-issue, then the secrets) instead of deciding again.
