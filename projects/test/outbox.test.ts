@@ -88,7 +88,8 @@ describe("pruning", () => {
     expect(prunable(owed, 0, OUTBOX.messages, NOW)).toBe(false);
     expect(prunable(done, 0, OUTBOX.chat, NOW)).toBe(false);
     expect(prunable(failed, 0, OUTBOX.issue_closes, NOW)).toBe(false);
-    expect(pruneBefore(OUTBOX.stops, NOW)).toBe(NOW - 30 * 86_400_000);
+    // A failed stop is never pruned: its agent may still be running, its place counted.
+    expect(pruneBefore(OUTBOX.stops, NOW)).toBeNull();
   });
 });
 

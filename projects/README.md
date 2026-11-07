@@ -155,7 +155,7 @@ The owner's request (2026-11-06): the app's retry queues as one machine, so each
   |---|---|---|
   | `chat` (the owner's messages to the manager) | permanent: failed, with Retry | always (it's the log) |
   | `messages` (to agents) | permanent: failed | a week from when it was sent or failed |
-  | `stops` (ending agents) | retried until it goes, except nest's own refusal (failed stops, below) | a month once failed |
+  | `stops` (ending agents) | retried until it goes, except nest's own refusal (failed stops, below) | never once failed: kept until resolved |
   | `issue_closes` | permanent: failed; tried again on the owner's retry or a grant gaining `issues: write` | always (the task's record) |
   | client `layers` | permanent: failed, shown on the Network page | while the agent lives |
 
@@ -167,8 +167,11 @@ The owner's request (2026-11-06): the app's retry queues as one machine, so each
     - on the Network page, with **Retry stop** (`POST /api/projects/:id/stops/:agent/retry`) and **Dismiss** (`DELETE …/stops/:agent`, confirmed);
     - in a message to the manager;
     - among the project's errors.
-  - **Its place stays counted** toward `max_workers` until the stop goes, the owner dismisses it, or nest's `agent.exited` says the agent ended.
-  - **Nothing in it is due before the owner acts.** Its next try is set to its prune time, so the alarm never spins on it.
+  - **Its place stays counted** toward `max_workers` until the stop goes, the owner dismisses it, or nest's `agent.exited` says the agent ended. Any agent's exit counts here: a worker's, a routine run's or a manager's.
+  - **A failed stop is never pruned.** Its agent may still be running.
+  - **Nothing in it is due before the owner acts.** Its next try is set to never, so the alarm never spins on it.
+  - **Nothing is said for an agent that exited during the refused try.** Its stop is gone already, so there's no notice and no row.
+  - **The Network page names what each one was for:** its task, by title; its routine, by name; and why it was stopped, in words ("A routine run timed out").
 - **The chat (B9).**
   - **States.** Each message carries `status` (`ChatMessage.status`). A message waiting for the manager, or retried after an outage, reads "Sending…" or "Retrying…" with why. Only a failed one reads "Not delivered", with Retry.
   - **Retry.**

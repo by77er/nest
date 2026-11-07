@@ -11,6 +11,21 @@ import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { icon, MetaItem, MetaRow, Notice, Stack, Toolbar } from "../../layout";
 
+type Stop = NetworkView["failed_stops"][number];
+
+/** A routine run's outcome, as a person says it (a stop's reason is `routine run <outcome>`). */
+const RUN_ENDED: Record<string, string> = { done: "finished", failed: "failed", timed_out: "timed out", stopped: "was stopped" };
+
+/** Why it was being stopped, as a sentence: "A routine run timed out", "Its task was cancelled". */
+export function stopWhy(s: Pick<Stop, "reason">): string {
+  const run = /^routine run (\w+)$/.exec(s.reason);
+  if (run) return `A routine run ${RUN_ENDED[run[1]!] ?? run[1]!.replace(/_/g, " ")}`;
+  if (s.reason === "manager replaced") return "A manager that was replaced";
+  if (s.reason === "start failed") return "Its worker didn't start";
+  if (s.reason === "cancelled" || s.reason === "done" || s.reason === "merged") return `Its task was ${s.reason === "done" ? "marked done" : s.reason}`;
+  return s.reason.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
+
 export function FailedStops({ projectId, stops }: { projectId: string; stops: NetworkView["failed_stops"] }) {
   const retry = useRetryStop(projectId);
   const dismiss = useDismissStop(projectId);
@@ -32,16 +47,23 @@ export function FailedStops({ projectId, stops }: { projectId: string; stops: Ne
           <Stack key={s.agent} gap="xs" data-agent={s.agent}>
             <MetaRow>
               <MetaItem mono>{s.agent}</MetaItem>
+              {/* What it was for: its task, or its routine, by name. */}
               {s.task ? (
                 <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: s.task }} fz="xs" lh="lg" c="bright" underline="always">
-                  its task
+                  {s.task_title ?? s.task}
                 </AnchorLink>
-              ) : (
-                <MetaItem>{s.reason}</MetaItem>
-              )}
+              ) : s.routine ? (
+                <AnchorLink to="/projects/$projectId/routines" params={{ projectId }} fz="xs" lh="lg" c="bright" underline="always">
+                  {s.routine.name}
+                </AnchorLink>
+              ) : null}
               <MetaItem title={exact(s.failed_ms)}>{ago(s.failed_ms)}</MetaItem>
             </MetaRow>
-            {s.error && <Text fz="sm">{s.error}</Text>}
+            {/* A reading line's length, inside the notice (an error can be long). */}
+            <Text fz="sm" maw="var(--nest-reading-measure)">
+              {stopWhy(s)}
+              {s.error ? `: ${s.error}` : "."}
+            </Text>
             <Toolbar
               align="start"
               danger={
