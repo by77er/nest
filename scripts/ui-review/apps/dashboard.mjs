@@ -6,6 +6,21 @@ import { readFileSync } from "node:fs";
 
 const fixture = (name) => JSON.parse(readFileSync(new URL(`../fixtures/dashboard/${name}.json`, import.meta.url), "utf8"));
 
+/**
+ * The attention list's rows share one height where none wraps (desktop widths): a row without an action
+ * keeps the action's target height (the design review of #179).
+ */
+async function uniformRows(page, { width }) {
+  if (width < 1280) return [];
+  const rows = await page.evaluate(() => {
+    const list = document.querySelector('[aria-label="Needs attention"] ul, ul[aria-label="Needs attention"]');
+    return list ? [...list.children].map((li) => ({ text: li.textContent.slice(0, 60), h: Math.round(li.getBoundingClientRect().height) })) : [];
+  });
+  if (rows.length < 2) return [];
+  const tallest = Math.max(...rows.map((r) => r.h));
+  return rows.filter((r) => tallest - r.h > 1).map((r) => `an attention row is ${r.h} px tall, the others ${tallest} px: "${r.text}"`);
+}
+
 export default {
   dir: "dashboard",
   ready: "/",
@@ -28,7 +43,7 @@ export default {
   },
   states: [
     { name: "fleet", section: "fleet", path: "/", fixture: "recorded" },
-    { name: "fleet-busy", section: "fleet", path: "/", fixture: "busy" },
+    { name: "fleet-busy", section: "fleet", path: "/", fixture: "busy", check: uniformRows, checkName: "attention-rows" },
     { name: "fleet-empty", section: "fleet", path: "/", fixture: "empty" },
     { name: "fleet-error", section: "fleet", path: "/", fixture: "error", httpErrors: true, ready: (p) => p.getByText("Couldn't read the control plane").waitFor({ timeout: 30_000 }) },
   ],

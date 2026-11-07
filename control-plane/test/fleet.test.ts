@@ -1,6 +1,6 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { FleetDO } from "../src/do/fleet";
+import { FleetDO } from "../src/do/fleet";
 import { CapacityError, QuotaError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
 import type { AwsCellConfig } from "../src/lib/cells";
 import { adminJson, connectHost, hostHello, manifest, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
@@ -684,6 +684,8 @@ describe("autoscaling", () => {
       inst.ec2Override = ec2;
       inst.cellConfigOverride = config;
       inst.ssmOverride = { parameter: async (n: string) => (n === `/imagebuilder/nest-${cell}/host-ami` ? { value: ami, modified_ms: null } : null) };
+      // The image changes between passes here: none of them reuses the last read.
+      inst.hostImageCache = undefined;
     });
     await setUp();
     const sbx = await createSandbox(cell, 202);
@@ -713,6 +715,7 @@ describe("autoscaling", () => {
 
     // A new host image (the fix released): every breaker counted under the old one is cleared at the next demand.
     ami = "ami-2";
+    await setUp();
     const m = ec2.launched.length;
     await sandboxStub(sbx.sandbox).retryPlacement();
     expect(ec2.launched.slice(m).map((l) => l.instanceType)).toEqual(["c8i-flex.large"]);
@@ -733,6 +736,8 @@ describe("autoscaling", () => {
       inst.ec2Override = ec2;
       inst.cellConfigOverride = config;
       inst.ssmOverride = { parameter: async (n: string) => (n === `/imagebuilder/nest-${cell}/host-ami` ? { value: ami, modified_ms: null } : null) };
+      // The image changes between passes here: none of them reuses the last read.
+      inst.hostImageCache = undefined;
     });
     await setUp();
     const sbx = await createSandbox(cell, 202);
@@ -750,12 +755,92 @@ describe("autoscaling", () => {
     // Under ami-2, both types fail until open, each exactly three times: a stale ami-1 basis would clear
     // the first to open at once (one more c8i-flex launch). Then a pass launches nothing.
     ami = "ami-2";
+    // The launch still pending was made under ami-2 too: the only trace of ami-1 is a basis that must be gone.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE launched SET image = 'ami-2' WHERE host IS NULL AND reason IS NULL");
+    });
     const from = ec2.launched.length;
     for (let i = 1; i <= 6; i++) await failOnce();
     expect(ec2.launched.slice(from).map((l) => l.instanceType)).toEqual(["c8i-flex.large", "c8i-flex.large", "c8i.large", "c8i.large", "c8i.large"]);
     const n = ec2.launched.length;
     await sandboxStub(sbx.sandbox).retryPlacement();
     expect(ec2.launched).toHaveLength(n);
+  });
+
+  it("launches record the image they were built from: failures under an image already replaced reset at the next pass", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("terminated");
+    let ami = "ami-1";
+    let reads = 0;
+    const setUp = (fresh = true) => runInDurableObject(fleetStub(cell), (inst: FleetDO) => {
+      inst.ec2Override = ec2;
+      inst.cellConfigOverride = config;
+      inst.ssmOverride = { parameter: async (n: string) => (reads++, n === `/imagebuilder/nest-${cell}/host-ami` ? { value: ami, modified_ms: null } : null) };
+      if (fresh) inst.hostImageCache = undefined;
+    });
+    await setUp();
+    const sbx = await createSandbox(cell, 202);
+    expect((await runInDurableObject(fleetStub(cell), (_i, state) => state.storage.sql.exec<{ image: string | null }>("SELECT image FROM launched").one().image))).toBe("ami-1");
+    // The image is replaced while three c8i-flex launches from ami-1 fail; their timeouts come after it.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("INSERT INTO launched (instance_id, launched_ms, role, region, cell, type, image) VALUES ('i-0a', ?, 'sandbox', 'us-east-1', ?, 'c8i-flex.large', 'ami-1'), ('i-0b', ?, 'sandbox', 'us-east-1', ?, 'c8i-flex.large', 'ami-1')", Date.now(), cell, Date.now(), cell);
+    });
+    ami = "ami-2";
+    await tickAt(cell, ec2, 601_000);
+    const view = async () => ((await fleetStub(cell).fleetView()) as { enroll_breakers?: { type: string; open: boolean }[] }).enroll_breakers ?? [];
+    expect((await view()).filter((b) => b.open).map((b) => b.type)).toEqual(["c8i-flex.large"]);
+    // Counted under ami-1, the image now ami-2: the next demand clears it and launches c8i-flex again.
+    await setUp();
+    const n = ec2.launched.length;
+    await sandboxStub(sbx.sandbox).retryPlacement();
+    expect(ec2.launched.slice(n).map((l) => l.instanceType)).toEqual(["c8i-flex.large"]);
+    expect(await view()).toEqual([]);
+
+    // The read is reused for a minute: passes with a breaker open don't each call SSM.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE launched SET image = 'ami-2'");
+      state.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('enroll_breaker:sandbox', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        JSON.stringify({ "c8i-flex.large": { failures: 3, opens: 1, open_until_ms: Date.now() + 3_600_000 } }));
+      state.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('enroll_breaker_basis', '\"ami-2\"') ON CONFLICT(key) DO UPDATE SET value = excluded.value");
+    });
+    await tickAt(cell, ec2, 601_000);
+    await setUp(false);
+    const before = reads;
+    for (let i = 0; i < 3; i++) await sandboxStub(sbx.sandbox).retryPlacement();
+    expect(reads - before).toBeLessThanOrEqual(1);
+  });
+
+  it("a sandbox placed while FleetDO said why none came keeps no note; hands are refused with the reason while it waits", async () => {
+    const cell = uniqueCell();
+    const sbx = await createSandbox(cell, 202);
+    const pause = { reason: "launches paused: consecutive enrolment failures for c8id.large (3); next probe at 2026-11-06T12:00:00.000Z", until_ms: Date.now() + 60_000 };
+    const kvNote = () => runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) =>
+      st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'placement_wait'").toArray()[0]?.value ?? null);
+    const proto = FleetDO.prototype as unknown as { launchPause: () => Promise<unknown> };
+    const real = proto.launchPause;
+    // Placed meanwhile (another placement landed while FleetDO answered): the note isn't written.
+    proto.launchPause = async () => {
+      await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
+        const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+        info.host = "hst_meanwhile";
+        st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+      });
+      return pause;
+    };
+    try {
+      await sandboxStub(sbx.sandbox).retryPlacement().catch(() => undefined);
+    } finally {
+      proto.launchPause = real;
+    }
+    expect(await kvNote()).toBeNull();
+
+    // Unplaced with the note: an attached agent's hands are refused with the reason, not only "not placed".
+    const other = await createSandbox(cell, 202);
+    const agent = (await adminJson("/v1/agents", { body: { template: "worker", sandbox: other.sandbox, cell, start: false } }, 201)).agent as string;
+    await runInDurableObject(sandboxStub(other.sandbox), (_i, st) => {
+      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('placement_wait', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ ...pause, ms: Date.now() }));
+    });
+    await expect(Promise.resolve().then(() => sandboxStub(other.sandbox).resolve(agent))).rejects.toThrow(/not placed yet: launches paused: consecutive enrolment failures for c8id\.large/);
   });
 
   it("retires a launched host that enrolled but never said hello once the enroll timeout passes (B-8)", async () => {

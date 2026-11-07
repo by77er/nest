@@ -191,6 +191,8 @@ const noRoomKey = (role: HostKind) => `noroom:${role}`;
 const breakerKey = (role: HostKind) => `enroll_breaker:${role}`;
 /** The host image (its parameter's value) the cell's breakers counted their failures under. */
 const BREAKER_BASIS_KEY = "enroll_breaker_basis";
+/** How long a read of the host image parameter is reused: passes with a breaker open don't each call SSM. */
+const HOST_IMAGE_CACHE_MS = 60_000;
 /**
  * The old process's unanswered commands, and (until `dropUnreported` has run) the leases it held
  * that the new process doesn't report. An older shape is the bare array of commands.
@@ -371,6 +373,8 @@ export class FleetDO extends DurableObject<Env> {
     addColumn(this.sql, "launched", "ended_ms", "INTEGER");
     // The instance type it was launched as (the enrolment breaker counts by type); absent on older rows.
     addColumn(this.sql, "launched", "type", "TEXT");
+    // The host image (its parameter's value) the instance was launched from; absent when unknown.
+    addColumn(this.sql, "launched", "image", "TEXT");
     addColumn(this.sql, "hosts", "idle_since", "INTEGER");
     // The seam: where clients reach a host's sandbox gateway (docs/sandbox/gateway/).
     addColumn(this.sql, "hosts", "gateway_url", "TEXT");
@@ -2090,16 +2094,24 @@ export class FleetDO extends DurableObject<Env> {
 
   /** The host image the cell's launch template resolves (the Image Builder parameter); null when unknown. */
   private async hostImage(): Promise<string | null> {
+    const now = Date.now();
+    if (this.hostImageCache && now - this.hostImageCache.at < HOST_IMAGE_CACHE_MS) return this.hostImageCache.value;
     const ssm = this.ssm();
     const cell = this.cellName();
     if (!ssm || !cell) return null;
     try {
-      return (await ssm.parameter(`/imagebuilder/nest-${cell}/host-ami`))?.value ?? null;
+      const value = (await ssm.parameter(`/imagebuilder/nest-${cell}/host-ami`))?.value ?? null;
+      this.hostImageCache = { value, at: now };
+      return value;
     } catch (e) {
+      // Not cached: the next pass asks again.
       console.warn("FleetDO: reading the host image parameter failed", e);
       return null;
     }
   }
+
+  /** The host image parameter as last read, kept `HOST_IMAGE_CACHE_MS` (memory only: a restart reads it again). */
+  hostImageCache: { value: string | null; at: number } | undefined = undefined;
 
   /** Clear enrolment breakers (every one, or a kind's, or one type's): the ones it cleared. The basis goes with the last. */
   private clearBreakers(role?: HostKind, type?: string): { role: HostKind; type: string }[] {
@@ -2177,6 +2189,8 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", launchKey(role), JSON.stringify(a));
     this.launching.add(role);
     try {
+      // What it is built from, recorded with it: the basis its breaker counts a failure under.
+      const image = await this.hostImage();
       const id = await ec2.launch({
         launchTemplateId: template, instanceType: a.type, subnetId: a.subnet, spot: a.spot, clientToken: a.token,
         // Brain hosts are burstable (IAM allows t3/t3a only): unlimited, so a host full of
@@ -2184,8 +2198,8 @@ export class FleetDO extends DurableObject<Env> {
         ...(role === BRAIN_ROLE ? { cpuCredits: "unlimited" as const } : {}),
       });
       this.sql.exec(
-        "INSERT OR IGNORE INTO launched (instance_id, launched_ms, role, region, cell, type) VALUES (?, ?, ?, ?, ?, ?)",
-        id, a.at, roleName(role), cfg.region, this.cellName(), a.type,
+        "INSERT OR IGNORE INTO launched (instance_id, launched_ms, role, region, cell, type, image) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        id, a.at, roleName(role), cfg.region, this.cellName(), a.type, image,
       );
       this.endLaunchIntent(role, a.token);
       console.log(`FleetDO: launched ${role} host ${id} (${a.type}, ${a.spot ? "spot" : "on-demand"}, ${a.subnet})`);
@@ -2225,11 +2239,13 @@ export class FleetDO extends DurableObject<Env> {
   private async scaleDown(now: number): Promise<void> {
     const cfg = this.cellConfig();
     if (!cfg) return;
-    const timedOut = this.sql.exec<{ instance_id: string; role: string | null }>(
-      "SELECT instance_id, role FROM launched WHERE host IS NULL AND reason IS NULL AND launched_ms < ?",
+    const timedOut = this.sql.exec<{ instance_id: string; role: string | null; image: string | null }>(
+      "SELECT instance_id, role, image FROM launched WHERE host IS NULL AND reason IS NULL AND launched_ms < ?",
       now - cfg.enroll_timeout_ms).toArray();
-    // What these hosts were built from, if the breakers have no basis yet: a later change resets them.
-    const basis = timedOut.length && !this.kvValue(BREAKER_BASIS_KEY) ? await this.hostImage() : null;
+    // What these hosts were built from, if the breakers have no basis yet: recorded at their launch (an
+    // image fixed since then resets them at the next pass), else the image now. A later change resets them.
+    const basis = timedOut.length && !this.kvValue(BREAKER_BASIS_KEY)
+      ? timedOut.find((r) => r.image)?.image ?? await this.hostImage() : null;
     for (const r of timedOut) {
       // Re-read in this step (the image read awaited): another tick may have ended it meanwhile.
       if (!this.sql.exec("SELECT 1 FROM launched WHERE instance_id = ? AND host IS NULL AND reason IS NULL", r.instance_id).toArray().length) continue;

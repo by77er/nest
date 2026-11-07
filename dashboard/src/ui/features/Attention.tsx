@@ -44,13 +44,14 @@ function Item({ item }: { item: AttentionItem }) {
         </Text>
         <Text size="sm" c="dimmed">{item.reason}</Text>
       </Group>
-      {item.target && (
-        <Target>
+      {/* Every row has the target's height, with its action or without (rows stay one rhythm). */}
+      <Target>
+        {item.target && (
           <Anchor component="button" type="button" size="sm" onClick={() => showRow(item.target!)} aria-label={`Show ${item.noun.toLowerCase()} ${item.subject ?? ""}`}>
             Show
           </Anchor>
-        </Target>
-      )}
+        )}
+      </Target>
     </Group>
   );
 }
