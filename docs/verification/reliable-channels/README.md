@@ -2,7 +2,7 @@
 
 > **Study, not a decision.** Code on `main` (edf6829); every claim cites `file:line`. Contract: [control-host](../../interfaces/control-host/), [fleet](../../interfaces/control-host/fleet/), [session](../../interfaces/control-host/session/); settled rule in [docs/README.md](../../README.md) ("Reliable channels deliver strictly in order ... a new `instance_id` resets the lineage").
 
-> **Since:** the fleet direction is now checked over nestd's real core ([nestd/](../nestd/)). B1, B2 (with the pilot's F2 and F3), B3 and the pilot's F4 are fixed there (#39); the checker shows each fix holds, and each, removed, fails. B5 is open ([nestd/](../nestd/#open-questions)); B4 and B6 have not been re-checked. The runner's session receiver still has no gap check.
+> **Since:** the fleet direction is now checked over nestd's real core ([nestd/](../nestd/)). B1, B2 (with the pilot's F2 and F3), B3 and the pilot's F4 are fixed there (#39); the checker shows each fix holds, and each, removed, fails. B5 is open ([nestd/](../nestd/#open-questions)); B4 has not been re-checked. Since 2026-11-06 the runner's session receiver has a gap check and never skips a reliable message it can't read (`session.rs` `classify`, `unparsed_seq`): either is a protocol error that ends the connection, reported to nestd, before any ack. B6 is confirmed (a 100 ms reconnect loop) and now paced by a backoff that starts over only after a healthy connection; AgentDO's quarantine is still open.
 
 ## Scope and actors
 
@@ -75,7 +75,7 @@ Per channel direction and lineage `L` (between two resets): `sent(L)` the seqs t
 
 | Id | Predicate | Holds on main? |
 |---|---|---|
-| S1 no gap | `proc(L)` is a contiguous interval `[b, k]` and is applied in increasing order | FleetDO, AgentDO: yes (`reliable.ts:57-62`). **nestd, runner: no** (no gap check, `fleet.rs:394-404`, `session.rs` `inbound`); see B1 |
+| S1 no gap | `proc(L)` is a contiguous interval `[b, k]` and is applied in increasing order | FleetDO, AgentDO: yes (`reliable.ts:57-62`). nestd: yes since #39 (`nestd_core::fleet`). Runner: yes since 2026-11-06 (`session.rs` `classify`: the lineage's first message is the baseline, a gap ends the connection) |
 | S2 at most once | each seq enters `proc(L)` at most once | batch level: yes (`markProcessed` after processing). Per event: **at least once** when a later event in the batch throws (B4) |
 | S3 ack ⇒ processed | `ack(n)` sent ⇒ `∀ s ≤ n, s ∈ sent(L): s ∈ proc(L)` and durable | FleetDO, AgentDO, nestd: yes. Runner: ack on enqueue; acceptable only because its lineage dies with the process |
 | S4 no loss | the sender deletes `m` from its outbox only if `m ∈ proc(L)`, or `L` was reset and `m` got a terminal outcome | **no**: B1 (commands), B3 (events) |
@@ -112,9 +112,9 @@ Per channel direction and lineage `L` (between two resets): `sent(L)` the seqs t
 
 **B4 — partial batch failure re-applies earlier events (suspected; medium).** A throw at event `j` closes the socket; the resend re-runs events `< j`. Not idempotent per event: `guest_cli` relay (`fleet.ts:1048-1058,1067-1082`, no request-id dedup seen; unverified in `AgentDO.guestCli`), `egress_audit` (new R2 key each time, `fleet.ts:1031-1035`), `task_exited`. A permanent failure repeats them forever.
 
-**B5 — mixed-version frames vanish (latent).** An old nestd or runner that cannot parse a frame drops it silently (`fleet.rs:436-448`, `session.rs` `connect_once`); with no gap check the next seq is accepted and the cumulative ack deletes the unknown batch, including known commands in it. `CommandBody` has no catch-all (`crates/nest-protocol/src/control.rs:291-292`). "Compatible one version back" (`docs/control-plane/README.md:34`) covers fields, not variants; `protocol_version` must match exactly (`fleet.ts:730`, `agent.ts:730`), so no bump is possible without stranding hosts. Branch 0c3a85c gated new commands on host capabilities (later removed in 65bf6ef).
+**B5 — mixed-version frames vanish (latent; the runner's half closed 2026-11-06).** An old nestd or runner that cannot parse a frame drops it silently (`fleet.rs:436-448`, `session.rs` `connect_once`); with no gap check the next seq is accepted and the cumulative ack deletes the unknown batch, including known commands in it. The runner now treats a reliable message it can't read as a protocol error (no ack past it; reported to nestd), so the loss is a stalled channel instead: capability gating is still what avoids it. `CommandBody` has no catch-all (`crates/nest-protocol/src/control.rs:291-292`). "Compatible one version back" (`docs/control-plane/README.md:34`) covers fields, not variants; `protocol_version` must match exactly (`fleet.ts:730`, `agent.ts:730`), so no bump is possible without stranding hosts. Branch 0c3a85c gated new commands on host capabilities (later removed in 65bf6ef).
 
-**B6 — session poison loop (suspected).** AgentDO rejects a frame that fails its schema with `invalid_message` and does not close (`agent.ts:626-635`); the runner reconnects on `invalid_message` (`session.rs` `inbound`) and resends the same batch forever. Breaks L3.
+**B6 — session poison loop (confirmed 2026-11-06: 30 reconnects in 3 s).** AgentDO rejects a frame that fails its schema with `invalid_message` and does not close (`agent.ts:626-635`); the runner reconnects on `invalid_message` (`session.rs` `inbound`) and resends the same batch forever. Breaks L3. Runner side since 2026-11-06: the reconnects back off (100 ms doubling to 5 s, starting over only after a connection that stayed up 30 s) and each is reported to nestd; AgentDO's per-event quarantine is still open.
 
 **B7 — a failed send lost a runner session message and wedged the channel (fixed).** The runner assigned a seq, sent, and only then queued the message for resending; a send that failed (a broken socket) spent the seq and dropped the message, so every later batch was a gap to AgentDO until the brain exited. Now the message is queued before it is sent (`session.rs` `State::queue`, `send_reliable`), as the model's separate *assign* and *send* actions require: the send may fail, the message stays in `unacked` under its seq. Test: `a_batch_whose_send_fails_is_resent_under_its_seq`.
 
@@ -136,5 +136,5 @@ Per channel direction and lineage `L` (between two resets): `sent(L)` the seqs t
 
 The fleet ones (nestd's gap check, the send chain, `onEvents`' socket check, the synchronous capture) are built (#39). Left:
 - `ReliableChannels.markProcessed`: assert `seq = last_in + 1` or `last_in = ⊥`; `ack(up_to)`: log when `up_to ≥ next_out` (lineage confusion).
-- Runner: log and reconnect on an inbound gap.
+- Runner: log and reconnect on an inbound gap (built 2026-11-06).
 - Session channel: per-event quarantine like the fleet channel (B6).
