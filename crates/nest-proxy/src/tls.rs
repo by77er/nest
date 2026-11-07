@@ -46,8 +46,8 @@ impl Ca {
     pub fn from_install(ca: &CaCertificate, key_pem: &str) -> Result<Ca> {
         let key = KeyPair::from_pem(key_pem).context("parse CA key")?;
         let der = CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).map_err(|e| anyhow!("parse CA certificate: {e:?}"))?;
-        let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|e| anyhow!("parse CA certificate: {e}"))?;
-        if cert.public_key().subject_public_key.data.as_ref() != rcgen::PublicKeyData::der_bytes(&key) {
+        // The same reading of the certificate's key as nestd's, which pairs answers with keys.
+        if nestd_core::ca::cert_public_key(&der) != Some(rcgen::PublicKeyData::der_bytes(&key)) {
             return Err(anyhow!("the CA key is not the certificate's key"));
         }
         let issuer = Issuer::from_ca_cert_pem(&ca.cert_pem, key).context("parse CA certificate")?;
@@ -223,10 +223,7 @@ mod tests {
         let e = Ca::from_install(&pki.install, &other).err().expect("a foreign key was accepted");
         assert!(format!("{e:#}").contains("not the certificate's key"), "{e:#}");
         assert!(Ca::from_install(&pki.install, &pki.key_pem).is_ok());
-        // nestd's parser (nestd_core::ca) finds the same key bits as x509-parser.
-        let der = CertificateDer::from_pem_slice(pki.install.cert_pem.as_bytes()).unwrap();
-        let key = KeyPair::from_pem(&pki.key_pem).unwrap();
-        assert_eq!(nestd_core::ca::cert_public_key(&der), Some(rcgen::PublicKeyData::der_bytes(&key)));
+        assert!(Ca::from_install(&CaCertificate { cert_pem: "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n".into(), ..pki.install.clone() }, &pki.key_pem).is_err());
     }
 
     #[test]

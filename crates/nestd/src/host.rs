@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use nestd_core::shadow::{self as shadow_core, Shadows, Slot};
-use nestd_core::ca::{Answer as CaAnswer, CaRenewal};
+use nestd_core::ca::{Answer as CaAnswer, CaRenewal, Saved as CaSaved};
 use nestd_core::checkpoint::{DiskStamp, Pass, SENTINEL, ScanMemo};
 use nestd_core::incarnation;
 use nestd_core::results::ResultCache;
@@ -561,17 +561,14 @@ impl Host {
         // The CA and key the host enrolled with (or saved): installed only if the key is the
         // certificate's. A pair that isn't (one a previous release persisted after pairing a late
         // answer with another key) installs nothing and is renewed at once.
-        let proxy_ca = match &enrolled.proxy_ca {
-            Some((ca, key)) if ca_key_matches(&ca.cert_pem, key) => {
-                proxy.apply(ProxyOp::CaInstall { ca: ca.clone(), key_pem: key.clone() });
-                CaRenewal::new(Some(key.clone()), Some(ca.expires_ms))
-            }
-            Some((ca, _)) => {
-                tracing::error!(expires_ms = ca.expires_ms, "the saved proxy CA's key is not its certificate's: renewing it now");
-                CaRenewal::new(None, Some(0))
-            }
-            None => CaRenewal::new(None, None),
-        };
+        let saved = enrolled.proxy_ca.as_ref().map(|(ca, key)| CaSaved { key: key.clone(), expires_ms: ca.expires_ms, matches: ca_key_matches(&ca.cert_pem, key) });
+        if saved.as_ref().is_some_and(|s| !s.matches) {
+            tracing::error!("the saved proxy CA's key is not its certificate's: nothing installed, renewing it now");
+        }
+        let proxy_ca = CaRenewal::from_saved(saved);
+        if let (Some(key), Some((ca, _))) = (proxy_ca.current(), &enrolled.proxy_ca) {
+            proxy.apply(ProxyOp::CaInstall { ca: ca.clone(), key_pem: key.clone() });
+        }
         runner.host_token(enrolled.host_token.clone(), enrolled.host_token_expires_ms);
 
         // Each incarnation found is a fenced row (one per sandbox: its newest epoch), reported in

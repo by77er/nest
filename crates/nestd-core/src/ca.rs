@@ -33,13 +33,39 @@ pub struct CaRenewal<K> {
     expires_ms: Option<i64>,
     /// The key of the renewal in flight, and when (monotonic ms) its CSR went out.
     pending: Option<(K, u64)>,
+    /// The saved pair was refused: renew now, whatever the clock says.
+    unusable: bool,
+}
+
+/// What the host saved: its key, its certificate's expiry, and whether the key is the one the
+/// certificate names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Saved<K> {
+    pub key: K,
+    pub expires_ms: i64,
+    pub matches: bool,
 }
 
 impl<K: Clone> CaRenewal<K> {
-    /// `current`: the installed key, if any; `expires_ms`: its certificate's expiry. A host with
-    /// no usable key but an expiry (a persisted pair that doesn't match) is due at once.
+    /// `current`: the installed key, if any; `expires_ms`: its certificate's expiry.
     pub fn new(current: Option<K>, expires_ms: Option<i64>) -> Self {
-        CaRenewal { current, expires_ms, pending: None }
+        CaRenewal { current, expires_ms, pending: None, unusable: false }
+    }
+
+    /// What a starting host has: no CA (a brain host: nothing to renew), a usable pair (installed,
+    /// renewed near its expiry), or a pair whose key isn't its certificate's (one a previous release
+    /// persisted after pairing a late answer with another key): nothing installed, renewed at once.
+    pub fn from_saved(saved: Option<Saved<K>>) -> Self {
+        match saved {
+            None => Self::new(None, None),
+            Some(Saved { key, expires_ms, matches: true }) => Self::new(Some(key), Some(expires_ms)),
+            Some(Saved { matches: false, .. }) => CaRenewal { current: None, expires_ms: None, pending: None, unusable: true },
+        }
+    }
+
+    /// The key to install now, if any.
+    pub fn current(&self) -> Option<&K> {
+        self.current.as_ref()
     }
 
     pub fn expires_ms(&self) -> Option<i64> {
@@ -54,9 +80,11 @@ impl<K: Clone> CaRenewal<K> {
     /// Whether to send a CSR now: within [`RENEW_BEFORE_MS`] of the expiry, and no renewal sent in
     /// the last [`RETRY_MS`]. A host that never had a CA (none enrolled) renews nothing.
     pub fn due(&self, now_wall_ms: i64, now_mono_ms: u64) -> bool {
-        let Some(expires) = self.expires_ms else { return false };
-        if expires - now_wall_ms > RENEW_BEFORE_MS {
-            return false;
+        if !self.unusable {
+            let Some(expires) = self.expires_ms else { return false };
+            if expires.saturating_sub(now_wall_ms) > RENEW_BEFORE_MS {
+                return false;
+            }
         }
         self.pending.as_ref().is_none_or(|(_, at)| now_mono_ms.saturating_sub(*at) >= RETRY_MS)
     }
@@ -77,6 +105,7 @@ impl<K: Clone> CaRenewal<K> {
             self.current = Some(k.clone());
             self.expires_ms = Some(expires_ms);
             self.pending = None;
+            self.unusable = false;
             return Answer::Renewed(k);
         }
         if let Some(k) = &self.current
@@ -179,7 +208,30 @@ mod tests {
         assert!(!r.due(99 * H, 1_000 + RETRY_MS - 1), "a renewal is in flight");
         assert!(r.due(99 * H, 1_000 + RETRY_MS), "unanswered too long: ask again");
         assert!(!CaRenewal::<&str>::new(None, None).due(i64::MAX, u64::MAX), "no CA, nothing to renew");
-        assert!(CaRenewal::<&str>::new(None, Some(0)).due(1, 0), "an unusable pair renews at once");
+        // No overflow on any clock: far in the past is not due, an expiry long gone is.
+        assert!(!r.due(i64::MIN, 0));
+        assert!(CaRenewal::new(Some("k"), Some(i64::MIN)).due(i64::MAX, 0));
+    }
+
+    #[test]
+    fn what_a_starting_host_saved() {
+        let none: CaRenewal<&str> = CaRenewal::from_saved(None);
+        assert_eq!(none.current(), None);
+        assert!(!none.due(i64::MAX, u64::MAX), "a brain host renews nothing");
+        let good = CaRenewal::from_saved(Some(Saved { key: "k1", expires_ms: 100 * H, matches: true }));
+        assert_eq!(good.current(), Some(&"k1"), "installed");
+        assert!(!good.due(0, 0), "far from its expiry");
+        assert!(good.due(100 * H - RENEW_BEFORE_MS, 0));
+        let mut bad = CaRenewal::from_saved(Some(Saved { key: "k1", expires_ms: 100 * H, matches: false }));
+        assert_eq!(bad.current(), None, "nothing installed");
+        assert!(!bad.expired(i64::MAX), "nothing installed has expired");
+        assert!(bad.due(0, 0), "renewed at once, whatever the clock");
+        bad.asked("k2", 0);
+        assert!(!bad.due(0, RETRY_MS - 1), "but not asked twice at once");
+        assert!(bad.due(0, RETRY_MS));
+        assert_eq!(bad.answered(50 * H, |k| *k == "k1"), Answer::Refused, "the refused key is no current key");
+        assert_eq!(bad.answered(50 * H, |k| *k == "k2"), Answer::Renewed("k2"));
+        assert!(!bad.due(0, u64::MAX), "renewed: back on the clock");
     }
 
     #[test]
