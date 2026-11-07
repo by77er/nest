@@ -10,13 +10,16 @@
 //! - **Membership.** The guest is spawned as a session leader (`supervise::spawn_in_session`), so
 //!   every process it starts that doesn't start a session of its own carries its session id, and
 //!   keeps it when its parent exits and init adopts it (`cmd &` in a Bash call that returns). A
-//!   member is the guest, a process in its session, or a descendant of a member ([`members`]).
+//!   member is the guest, a process in its session, a process pinned as a member that has since
+//!   left both (a `setsid` server whose call returned), or a descendant of a member ([`members`]).
 //! - **Freeze first, parents before children.** [`Tree::freeze`] stops the guest, then members
 //!   pass after pass: each pass stops what [`stop_now`] allows (a process whose parent, if in the
 //!   tree, has already stopped, so no parent waiting with WUNTRACED sees its child's stop as its
 //!   job stopping) and stops again any that runs again, until no new member appears and every
 //!   member, every thread of it, is stopped (a stopped process can't fork). It gives up after
-//!   [`FREEZE_BUDGET`] with an error, and continues what it stopped.
+//!   [`FREEZE_BUDGET`] with an error, and continues what it stopped. A fence's [`Tree::halt`]
+//!   instead keeps what it stopped and passes over what it can't stop: a fenced guest must not run
+//!   on.
 //! - **Never another process.** A pidfd is opened for each member when it is found, then its
 //!   parent or session is read, and the pidfd is kept: every later signal goes through it, so a
 //!   pid that exited and was reused is never hit, and a member whose parent exited is still
@@ -34,11 +37,14 @@
 //!   waits for it (and fails after the budget) rather than count it stopped. A
 //!   commit that must not race a guest's writes needs the disk's own quiescence, which a VM's
 //!   pause gives and this driver only approximates.
-//! - **The limit:** a process that leaves both the tree and the session (a PTY's own session whose
-//!   leader exited, a daemon that calls `setsid` and whose parent exited) escapes. Containing that
-//!   needs a cgroup or a pid namespace, which the process driver doesn't have. It is for
-//!   development and the e2e harness only (`config::unconfined_driver_refusal`); a cell host runs
-//!   Firecracker under the jailer, whose VMM cgroup holds everything.
+//! - **The limits:** a process that leaves both the tree and the session before any freeze has
+//!   pinned it (a PTY's own session whose leader exited, a daemon that calls `setsid` and whose
+//!   parent exited, between two pauses) escapes, with its descendants. Containing that needs a
+//!   cgroup or a pid namespace, which the process driver doesn't have. Each live member holds a
+//!   pidfd in nestd until it exits, so a guest with about a thousand processes nears the default
+//!   1024-descriptor limit. It is for development and the e2e harness only
+//!   (`config::unconfined_driver_refusal`); a cell host runs Firecracker under the jailer, whose
+//!   VMM cgroup holds everything.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
@@ -58,9 +64,11 @@ pub struct Stat {
     pub session: i32,
 }
 
-/// Every member of `root`'s tree in `table` but `root`: its session's processes, and every
-/// descendant of `root` or of one of them, parents before their children. Pure.
-pub fn members(root: i32, table: &BTreeMap<i32, Stat>) -> Vec<i32> {
+/// Every member of `root`'s tree in `table` but `root`: its session's processes, the `pinned`
+/// members still in the table (one that left the tree and the session after it was found is still
+/// a member), and every descendant of `root` or of one of them, parents before their children.
+/// Pure.
+pub fn members(root: i32, pinned: &BTreeSet<i32>, table: &BTreeMap<i32, Stat>) -> Vec<i32> {
     let mut children: BTreeMap<i32, Vec<i32>> = BTreeMap::new();
     for (&pid, s) in table {
         if pid != s.ppid {
@@ -71,7 +79,8 @@ pub fn members(root: i32, table: &BTreeMap<i32, Stat>) -> Vec<i32> {
     let mut seen = BTreeSet::from([root]);
     let mut todo = VecDeque::from([root]);
     let in_session = table.iter().filter(|(pid, s)| s.session == root && **pid != root).map(|(pid, _)| *pid);
-    for start in std::iter::once(None).chain(in_session.map(Some)) {
+    let still_pinned = pinned.iter().copied().filter(|p| table.contains_key(p));
+    for start in std::iter::once(None).chain(in_session.chain(still_pinned).map(Some)) {
         if let Some(p) = start {
             if !seen.insert(p) {
                 continue;
@@ -186,18 +195,17 @@ pub fn runs_no_more(state: char, stop_pending: impl FnOnce() -> bool) -> bool {
     matches!(state, 'T' | 't' | 'Z' | 'X' | 'x') || (state == 'D' && stop_pending())
 }
 
-/// Which processes a freeze's pass may stop now, in order: each candidate (`members` of `root`'s
-/// tree in `table`, then the `pinned` members no longer in it: one whose parent exited and which
-/// left the guest's session) that isn't `halted` yet, but only once its parent has stopped,
-/// unless the parent is outside the tree (init, for an orphan). A child stopped while its parent
-/// still runs (its SIGSTOP not yet taken) would show a parent waiting with WUNTRACED its job
-/// stopping; it waits for a later pass. `halted` is a snapshot taken before the pass. Pure.
+/// Which processes a freeze's pass may stop now, in order: each candidate ([`members`] of
+/// `root`'s tree in `table`, given what is `pinned`) that isn't `halted` yet, but only once its
+/// parent has stopped, unless the parent is outside the tree (init, for an orphan or a member that
+/// left the guest's session). A child stopped while its parent still runs (its SIGSTOP not yet
+/// taken) would show a parent waiting with WUNTRACED its job stopping; it waits for a later pass.
+/// `halted` is a snapshot taken before the pass. Pure.
 pub fn stop_now(root: i32, table: &BTreeMap<i32, Stat>, pinned: &BTreeSet<i32>, halted: &BTreeSet<i32>) -> Vec<i32> {
-    let tree: BTreeSet<i32> = std::iter::once(root).chain(members(root, table)).collect();
-    let left: Vec<i32> = pinned.iter().copied().filter(|p| !tree.contains(p)).collect();
+    let found = members(root, pinned, table);
+    let tree: BTreeSet<i32> = std::iter::once(root).chain(found.iter().copied()).collect();
     std::iter::once(root)
-        .chain(members(root, table))
-        .chain(left)
+        .chain(found)
         .filter(|p| !halted.contains(p))
         .filter(|p| match table.get(p) {
             Some(s) if *p != root => !tree.contains(&s.ppid) || halted.contains(&s.ppid),
@@ -273,6 +281,21 @@ impl Tree {
         r
     }
 
+    /// For a fence: stop what can be stopped and keep it stopped, passing over (and reporting) what
+    /// can't be, so a fenced guest runs no more than it must. [`Tree::freeze`] undoes a failed
+    /// freeze instead, since a commit's failed pause must leave the guest as it was. Blocking.
+    pub fn halt(&mut self) -> io::Result<()> {
+        self.halt_within(FREEZE_BUDGET)
+    }
+
+    /// [`Tree::halt`] with its own budget.
+    fn halt_within(&mut self, budget: Duration) -> io::Result<()> {
+        if self.dead {
+            return Ok(());
+        }
+        self.freeze_keeping(budget, true)
+    }
+
     /// SIGCONT to `pids` (members), deepest first, as `thaw` does.
     fn continue_(&self, pids: &[i32]) {
         for p in deepest_first(pids, |p| stat(p).map(|s| s.ppid)) {
@@ -300,10 +323,15 @@ impl Tree {
             let halted: BTreeSet<i32> = self.members.iter().filter(|m| m.halted()).map(|m| m.pid).collect();
             let t = table();
             let mut running = self.members.len() - halted.len();
-            // Pin what is new, before deciding: what a pidfd names is a member from now on.
-            let candidates: BTreeSet<i32> = members(root, &t).into_iter().collect();
+            // Pin what is new, before deciding: what a pidfd names is a member from now on, and so
+            // are its descendants, wherever it went (seeded by the pinned members still alive
+            // after the table was read, so a pid in it is still theirs).
+            let live: BTreeSet<i32> = self.members.iter().filter(|m| !exited(&m.fd)).map(|m| m.pid).collect();
+            let candidates = members(root, &live, &t);
+            let candidate_set: BTreeSet<i32> = candidates.iter().copied().collect();
+            let before = self.members.len();
             let mut found = false;
-            for pid in members(root, &t) {
+            for pid in candidates {
                 if known.contains(&pid) {
                     continue;
                 }
@@ -324,7 +352,7 @@ impl Tree {
                 };
                 // Read again once pinned: the pid still names a process of the tree (its session,
                 // or a parent in the tree), not one that took a freed pid since the table was read.
-                let ours = |s: &Stat| s.session == root || s.ppid == root || known.contains(&s.ppid) || candidates.contains(&s.ppid);
+                let ours = |s: &Stat| s.session == root || s.ppid == root || known.contains(&s.ppid) || candidate_set.contains(&s.ppid);
                 if stat(pid).filter(ours).is_none() {
                     continue;
                 }
@@ -333,7 +361,7 @@ impl Tree {
                 found = true;
                 running += 1;
             }
-            let pinned: BTreeSet<i32> = self.members.iter().map(|m| m.pid).collect();
+            let pinned: BTreeSet<i32> = live.iter().copied().chain(self.members.iter().skip(before).map(|m| m.pid)).collect();
             for pid in stop_now(root, &t, &pinned, &halted) {
                 let Some(m) = self.members.iter().find(|m| m.pid == pid) else { continue };
                 let was_halted = task_state(&format!("/proc/{pid}")).is_some_and(|s| matches!(s, 'T' | 't'));
@@ -416,6 +444,10 @@ mod tests {
         Stat { state: 'S', ppid, session }
     }
 
+    fn none() -> BTreeSet<i32> {
+        BTreeSet::new()
+    }
+
     /// A child process, killed and reaped however the test ends.
     struct Reaped(std::process::Child);
     impl Drop for Reaped {
@@ -474,6 +506,27 @@ mod tests {
         }
         assert!(!alive, "the child outlived the kill");
         assert!(t.freeze().is_ok() && t.dead, "a dead tree freezes nothing");
+    }
+
+    /// A fence's halt that fails keeps what it stopped (the guest here, its child not yet: no
+    /// budget left for a second pass): a fenced guest must not run on. A thaw still continues it.
+    #[test]
+    fn a_failed_halt_keeps_what_it_stopped() {
+        let (root, child) = tree_with_a_child();
+        let mut root = Reaped(root);
+        let pid = root.0.id() as i32;
+        let mut t = Tree::new(pid).unwrap();
+        assert!(t.halt_within(Duration::ZERO).is_err(), "no budget: the child isn't stopped yet");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(matches!(state(pid), Some('T' | 't')), "the guest left running by a failed halt");
+        assert!(t.stopped.contains(&pid));
+        t.thaw();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!matches!(state(pid), Some('T' | 't')));
+        t.kill();
+        let _ = root.0.wait();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(state(child).is_none_or(|s| s == 'Z'), "the kill killed the child");
     }
 
     /// A freeze that lands while a member spawns children with vfork (`posix_spawn`, as Python,
@@ -553,10 +606,10 @@ mod tests {
         //   └ 20        └ 13
         // 30 ─ 31 (another tree, another session)
         let t = BTreeMap::from([(1, s(0, 1)), (10, s(1, 10)), (11, s(10, 10)), (12, s(11, 10)), (13, s(11, 10)), (20, s(1, 1)), (30, s(0, 30)), (31, s(30, 30))]);
-        assert_eq!(members(10, &t), [11, 12, 13]);
-        assert_eq!(members(1, &t), [10, 20, 11, 12, 13]);
-        assert!(members(12, &t).is_empty());
-        assert!(members(99, &t).is_empty(), "not in the table");
+        assert_eq!(members(10, &none(), &t), [11, 12, 13]);
+        assert_eq!(members(1, &none(), &t), [10, 20, 11, 12, 13]);
+        assert!(members(12, &none(), &t).is_empty());
+        assert!(members(99, &none(), &t).is_empty(), "not in the table");
     }
 
     #[test]
@@ -564,20 +617,35 @@ mod tests {
         // The guest 5 started a call 6, which started 7 and exited: init (1) adopted 7, still in
         // session 5. 8 is 7's child. 9 is init's child in another session: not a member.
         let t = BTreeMap::from([(1, s(0, 1)), (5, s(1, 5)), (7, s(1, 5)), (8, s(7, 5)), (9, s(1, 9))]);
-        assert_eq!(members(5, &t), [7, 8]);
+        assert_eq!(members(5, &none(), &t), [7, 8]);
+    }
+
+    /// A member that left the tree and the session after it was pinned (a `setsid` server whose
+    /// call returned: init's child, session 9) is still a member, and so is what it forks; a pinned
+    /// pid no longer in the table is not.
+    #[test]
+    fn a_pinned_member_that_left_brings_its_descendants() {
+        let t = BTreeMap::from([(1, s(0, 1)), (5, s(1, 5)), (9, s(1, 9)), (10, s(9, 9)), (11, s(10, 9)), (20, s(1, 20))]);
+        assert_eq!(members(5, &none(), &t), Vec::<i32>::new(), "unpinned, 9 is out of reach");
+        assert_eq!(members(5, &BTreeSet::from([5, 9, 42]), &t), [9, 10, 11]);
+        // Parents first among them too: 10 waits for 9, 11 for 10.
+        let pinned = BTreeSet::from([5, 9]);
+        assert_eq!(stop_now(5, &t, &pinned, &BTreeSet::from([5])), [9]);
+        assert_eq!(stop_now(5, &t, &pinned, &BTreeSet::from([5, 9])), [10]);
+        assert_eq!(stop_now(5, &t, &pinned, &BTreeSet::from([5, 9, 10])), [11]);
     }
 
     #[test]
     fn a_member_in_another_session_is_found_through_its_parent() {
         // A PTY: 6 is the guest's child in a session of its own, 7 its child.
         let t = BTreeMap::from([(5, s(1, 5)), (6, s(5, 6)), (7, s(6, 6))]);
-        assert_eq!(members(5, &t), [6, 7]);
+        assert_eq!(members(5, &none(), &t), [6, 7]);
     }
 
     #[test]
     fn a_self_parented_entry_never_loops() {
         let t = BTreeMap::from([(1, s(1, 1)), (2, s(1, 2)), (3, s(2, 2))]);
-        assert_eq!(members(1, &t), [2, 3]);
+        assert_eq!(members(1, &none(), &t), [2, 3]);
         assert_eq!(stop_now(1, &t, &BTreeSet::new(), &BTreeSet::new()), [1], "the guest goes first, whatever its parent");
     }
 }

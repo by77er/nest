@@ -118,12 +118,14 @@ async fn thaw(t: SharedTree) -> io::Result<()> {
     tokio::task::spawn_blocking(move || locked(&t).thaw()).await.map_err(io::Error::other)
 }
 
+/// A fence's pauser: it keeps what it stopped when some member can't be stopped (`Tree::halt`).
 struct TreePauser(SharedTree);
 
 #[async_trait]
 impl Pauser for TreePauser {
     async fn pause(&self) -> io::Result<()> {
-        freeze(self.0.clone()).await
+        let t = self.0.clone();
+        tokio::task::spawn_blocking(move || locked(&t).halt()).await.map_err(io::Error::other)?
     }
 }
 
@@ -469,26 +471,45 @@ mod tests {
     }
 
     /// A member that leaves the tree (a `setsid` server whose call returns: init adopts it, in its
-    /// own session) is still stopped by the next pause, which succeeds; it used to count as running
-    /// for ever, failing every pause.
+    /// own session) is still stopped by the next pause, which succeeds (it used to count as running
+    /// for ever, failing every pause), and so is what it forks after leaving; resume continues
+    /// both, and a stop kills both.
     #[tokio::test]
-    async fn a_member_that_left_the_tree_is_still_frozen() {
+    async fn a_member_that_left_the_tree_is_still_frozen_with_its_children() {
         let dir = tempfile::tempdir().unwrap();
-        let gone = dir.path().join("call-returns");
-        let script = format!("sh -c 'setsid sleep 300 & echo $! >> PIDS; while [ ! -e {} ]; do sleep 0.05; done' & exec sleep 300", gone.display());
+        let (gone, fork) = (dir.path().join("call-returns"), dir.path().join("fork"));
+        let server = dir.path().join("server.sh");
+        let pidf = dir.path().join("pids");
+        std::fs::write(&server, format!("echo $$ >> {p}; while [ ! -e {f} ]; do sleep 0.05; done; sleep 300 & echo $! >> {p}; wait\n", p = pidf.display(), f = fork.display())).unwrap();
+        let script = format!("sh -c 'setsid sh {} & while [ ! -e {} ]; do sleep 0.05; done' & exec sleep 300", server.display(), gone.display());
         let (mut vm, pids) = guest_running(dir.path(), &script, 1).await;
         let server = pids[0];
         vm.pause().await.unwrap();
         vm.resume().await.unwrap();
         // The call returns (it polls every 50 ms): the server is init's now, outside the guest's
-        // tree and session.
+        // tree and session. Then it forks.
         std::fs::write(&gone, "").unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        std::fs::write(&fork, "").unwrap();
+        let mut child = None;
+        for _ in 0..200 {
+            child = std::fs::read_to_string(&pidf).unwrap_or_default().lines().nth(1).and_then(|l| l.trim().parse::<i32>().ok());
+            if child.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let child = child.expect("the server forked");
         vm.pause().await.expect("a pause with a member that left the tree");
         assert!(crate::driver::tree::halted_pid(server), "the server runs on in a paused VM");
+        assert!(crate::driver::tree::halted_pid(child), "the server's child runs on in a paused VM");
         vm.resume().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for p in [server, child] {
+            assert!(!matches!(state(p), Some('T' | 't')), "{p} left stopped by the resume");
+        }
         vm.stop().await.unwrap();
-        assert!(all_gone(&[server]).await, "the stop killed it too");
+        assert!(all_gone(&[server, child]).await, "the stop killed them too");
     }
 
     /// A paused VM's tree is stopped, its own-session children included (they would write the disk
