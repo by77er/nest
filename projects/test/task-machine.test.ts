@@ -261,6 +261,25 @@ describe("done through a merged PR, a task made of an issue closes it, by whiche
   });
 });
 
+describe("a late opened for a merged PR (GitHub doesn't order deliveries)", () => {
+  it("leaves the PR merged and the task done", async () => {
+    const p = await newProject();
+    const id = await readyTask(p);
+    await api(token, "POST", `/api/projects/${p.id}/tasks/${id}/assign`);
+    const s = sha();
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 26, sha: s, action: "opened", ref: `task/${id}`, updated_at: later() }));
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 26, sha: s, action: "closed", merged: true, ref: `task/${id}`, updated_at: later() }));
+    expect((await task(p, id)).state).toBe("done");
+    // The opening again, as a redelivery under a new id, or a reopened that arrives late.
+    for (const action of ["opened", "reopened"] as const) {
+      await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 26, sha: s, action, ref: `task/${id}`, title: "Renamed", updated_at: later() }));
+    }
+    const t = await task(p, id);
+    expect(t.state).toBe("done");
+    expect(t.prs).toMatchObject([{ number: 26, state: "merged", title: "Renamed" }]);
+  });
+});
+
 describe("a merged PR's close handled twice", () => {
   it("counts once: only an open PR merges", async () => {
     const p = await newProject();

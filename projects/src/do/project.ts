@@ -914,7 +914,9 @@ export class ProjectDO extends DurableObject<Env> {
     const had = this.prRow(e.pr);
     if (e.action === "opened") {
       if (had && had.state !== "detached") {
-        this.sql.exec("UPDATE task_prs SET state = 'open', node = COALESCE(?, node), fork = COALESCE(?, fork), title = COALESCE(?, title) WHERE pr = ?",
+        // Its facts only: its state moves through the machine alone (`move`), and a merged PR stays merged
+        // however late an `opened` for it arrives (GitHub doesn't order its deliveries).
+        this.sql.exec("UPDATE task_prs SET node = COALESCE(?, node), fork = COALESCE(?, fork), title = COALESCE(?, title) WHERE pr = ?",
           e.node ?? null, e.fork === undefined ? null : e.fork ? 1 : 0, e.title ?? null, e.pr);
         this.oweEnableIfDue(e.pr);
       } else if (e.task && this.taskRow(e.task)) {
@@ -931,8 +933,7 @@ export class ProjectDO extends DurableObject<Env> {
         // The routines' counter of task PRs merged (README.md#routines).
         this.countFor("prs_merged");
         // The last one makes the task done, and its worker is ended (src/tasks.ts `step`).
-        const merged = () => this.sql.exec("UPDATE task_prs SET state = 'merged', ended_ms = ? WHERE pr = ?", Date.now(), e.pr);
-        if (!this.move(id, "pr_merged", github, { write: merged, reason: "merged" }).ok) merged();
+        this.move(id, "pr_merged", github, { write: () => this.sql.exec("UPDATE task_prs SET state = 'merged', ended_ms = ? WHERE pr = ?", Date.now(), e.pr), reason: "merged" });
       } else {
         this.detach(id, e.pr, github, "pr_closed", { pr: e.pr, detached: true });
       }
@@ -1217,8 +1218,7 @@ export class ProjectDO extends DurableObject<Env> {
     const before = this.prList(id);
     const row = this.prRow(pr)!;
     this.record(id, actor, action, detail);
-    const detached = () => this.sql.exec("UPDATE task_prs SET state = 'detached', ended_ms = ? WHERE pr = ?", Date.now(), pr);
-    if (!this.move(id, "pr_detached", actor, { detail: { pr }, write: detached, reason: "merged" }).ok) detached();
+    this.move(id, "pr_detached", actor, { detail: { pr }, write: () => this.sql.exec("UPDATE task_prs SET state = 'detached', ended_ms = ? WHERE pr = ?", Date.now(), pr), reason: "merged" });
     const am = row.am_status ? (JSON.parse(row.am_status as string) as TaskAutoMerge) : null;
     if (action !== "pr_closed" && (am?.state === "enabled" || row.am_owed === "enable")) this.owePrAutoMerge(pr, "disable");
     this.syncPr(id);
