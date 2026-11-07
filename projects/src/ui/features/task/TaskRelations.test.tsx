@@ -190,7 +190,9 @@ describe("a task's dependencies", () => {
     const card = await screen.findByRole("article", { name: "Second" });
     const badge = within(card).getByText("Waiting on 2").closest(".mantine-Badge-root") as HTMLElement;
     expect(card.querySelectorAll("[data-marker=waiting]")).toHaveLength(1);
-    expect(badge.getAttribute("style") ?? "").toContain("--mantine-color-gray");
+    // Neutral: the theme's neutral badge, no role's color.
+    expect(badge.getAttribute("style") ?? "").toContain("--nest-neutral-badge");
+    expect(badge.getAttribute("style") ?? "").not.toMatch(/--mantine-color-(primary|warning|success|danger)-/);
     expect(badge.getAttribute("data-variant")).toBe("light");
     expect(badge.querySelector("svg")).not.toBeNull();
     expect(within(card).queryByText("Blocked")).toBeNull();

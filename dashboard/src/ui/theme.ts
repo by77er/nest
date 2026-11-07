@@ -62,6 +62,9 @@ function alpha(hex: string, a: number): string {
   return `rgba(${r}, ${g}, ${b}, ${a})`;
 }
 
+/** A neutral light badge's text, per scheme, on the subtle ground (the skill): the text color in light, muted in dark. */
+export const neutralBadgeText = { light: neutrals.light.text, dark: neutrals.dark.muted } as const;
+
 /** The skill's motion tokens. */
 export const motion = {
   fast: 120,
@@ -174,10 +177,11 @@ const schemeVariables = (scheme: "light" | "dark") => {
     "--mantine-color-default-border": n.border,
     "--mantine-color-anchor": `var(--mantine-color-primary-${scheme === "light" ? 6 : 5})`,
   };
-  // A gray badge: the text on the subtle well (light), or on the border's gray (dark).
-  vars["--mantine-color-gray-light"] = scheme === "light" ? n.subtle : n.border;
-  vars["--mantine-color-gray-light-hover"] = scheme === "light" ? n.border : n.subtle;
-  vars["--mantine-color-gray-light-color"] = n.text;
+  // A neutral (gray) light badge, as the skill says for both apps: the subtle ground, with the text color in
+  // light and the muted gray in dark, so in dark it's quieter than a warning badge beside it.
+  vars["--mantine-color-gray-light"] = n.subtle;
+  vars["--mantine-color-gray-light-hover"] = n.border;
+  vars["--mantine-color-gray-light-color"] = neutralBadgeText[scheme];
   for (const role of ROLES) {
     const v = lightVariant(role, scheme);
     vars[`--nest-on-${role}`] = onFilled[scheme][role];

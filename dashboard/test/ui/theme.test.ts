@@ -7,7 +7,7 @@ import skill from "../../../.claude/skills/nest-ui-design/SKILL.md?raw";
 import html from "../../index.html?raw";
 import main from "../../src/main.tsx?raw";
 import { describe, expect, it } from "vitest";
-import { cssVariablesResolver, motion, neutrals, onFilled, palette, ROLES, theme } from "../../src/ui/theme";
+import { cssVariablesResolver, lightVariant, motion, neutralBadgeText, neutrals, onFilled, palette, ROLES, theme } from "../../src/ui/theme";
 
 
 const full = mergeMantineTheme(DEFAULT_THEME, theme);
@@ -181,6 +181,21 @@ describe("contrast meets AA in both schemes", () => {
       const bg = vars[s][`--mantine-color-${role}-light`]!;
       const fg = vars[s][`--mantine-color-${role}-light-color`]!;
       expect(contrast(fg, bg, neutrals[s].surface)).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+
+  it.each(SCHEMES)("%s: a neutral light badge (the skill's rule for both apps) is the subtle ground, its text the scheme's and quieter than a warning badge in dark", (s) => {
+    expect(vars[s]["--mantine-color-gray-light"]).toBe(neutrals[s].subtle);
+    expect(vars[s]["--mantine-color-gray-light-color"]).toBe(neutralBadgeText[s]);
+    expect(neutralBadgeText[s]).toBe(s === "light" ? neutrals.light.text : neutrals.dark.muted);
+    const bg = neutrals[s].subtle;
+    expect(contrast(neutralBadgeText[s], bg, neutrals[s].surface)).toBeGreaterThanOrEqual(4.5);
+    if (s === "dark") {
+      // It shows on the surface and the page it sits on, and a warning badge outshouts it.
+      expect(contrast(bg, neutrals.dark.surface, neutrals.dark.surface)).toBeGreaterThan(1);
+      expect(contrast(bg, neutrals.dark.page, neutrals.dark.page)).toBeGreaterThan(1.1);
+      const warn = lightVariant("warning", "dark");
+      expect(contrast(neutralBadgeText.dark, bg, neutrals.dark.surface)).toBeLessThan(contrast(warn.color, warn.background, neutrals.dark.surface));
     }
   });
 
