@@ -268,6 +268,8 @@ export interface Proposal {
 
 /** How much of a run's last turn is kept as its report. */
 const RUN_SUMMARY_MAX = 4000;
+/** How long a run whose agent exited before any turn was counted waits for that turn's event. */
+export const RUN_EXIT_GRACE_MS = 60_000;
 
 const MAX_WORKERS_LIMIT = 20;
 /** A chat page's size by default, and at most: older pages load as the owner scrolls up. */
@@ -448,6 +450,17 @@ export const MIGRATIONS = [
     // the release before has them null: its routine's current kind and fields then, as that release did.
     "ALTER TABLE routine_runs ADD COLUMN template TEXT",
     "ALTER TABLE routine_runs ADD COLUMN brief TEXT",
+  ],
+  [
+    // A run's agent that exited before its turn was counted: the run waits RUN_EXIT_GRACE_MS for the turn
+    // (events aren't ordered) before it fails. And a run that failed to start with no agent recorded: what
+    // its attempts may have made, found by its labels and ended, twice (the second after a create still in
+    // flight has landed).
+    "ALTER TABLE routine_runs ADD COLUMN exited_ms INTEGER",
+    "ALTER TABLE routine_runs ADD COLUMN exit_reason TEXT",
+    "ALTER TABLE routine_runs ADD COLUMN cleanup_next_ms INTEGER",
+    "ALTER TABLE routine_runs ADD COLUMN cleanup_passes INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE routine_runs ADD COLUMN cleanup_attempts INTEGER NOT NULL DEFAULT 0",
   ],
 ] as const;
 
@@ -2489,11 +2502,15 @@ export class ProjectDO extends DurableObject<Env> {
       const turns = (r.turns as number) + 1;
       // The run's report: its latest turn's last text, kept short (an agent wrote it: shown as text, never followed).
       this.sql.exec("UPDATE routine_runs SET turns = ?, summary = COALESCE(?, summary) WHERE id = ?", turns, e.text ? e.text.slice(0, RUN_SUMMARY_MAX) : null, id);
-      if (turns >= (r.max_turns as number)) this.endRun(id, "done", null, `its turn budget (${turns}) was reached`);
+      // Its agent exited already (that event came first): this was its turn, and the run is done.
+      if (r.exited_ms !== null) this.endRun(id, "done", null, null);
+      else if (turns >= (r.max_turns as number)) this.endRun(id, "done", null, `its turn budget (${turns}) was reached`);
     } else if (e.type === "agent.exited") {
       const turns = r.turns as number;
       if (turns > 0) this.endRun(id, "done", null, null);
-      else this.endRun(id, "failed", `it ended before finishing a turn (${(e.reason ?? "exited").slice(0, 100)})`, null);
+      // No turn counted yet: its turn's event may still be on its way (nest doesn't order them), so the run
+      // waits RUN_EXIT_GRACE_MS for it before it fails.
+      else this.sql.exec("UPDATE routine_runs SET exited_ms = COALESCE(exited_ms, ?), exit_reason = ? WHERE id = ?", Date.now(), (e.reason ?? "exited").slice(0, 100), id);
     }
   }
 
@@ -2560,9 +2577,36 @@ export class ProjectDO extends DurableObject<Env> {
       const attempts = (this.runRow(id)!.attempts as number) + 1;
       if ((e instanceof NestError && e.permanent) || attempts >= MAX_START_ATTEMPTS) {
         this.endRun(id, "failed", message(e), null);
+        // No agent recorded (every answer lost, or refused): what its attempts made is found by its labels.
+        if (!this.runRow(id)!.agent) this.sql.exec("UPDATE routine_runs SET cleanup_next_ms = ?, cleanup_passes = 0 WHERE id = ?", Date.now(), id);
         return;
       }
       this.sql.exec("UPDATE routine_runs SET attempts = ?, next_ms = ?, error = ? WHERE id = ?", attempts, Date.now() + backoff(attempts), message(e), id);
+    }
+  }
+
+  /**
+   * A run that failed to start with no agent recorded: its agents and sandboxes, found by its labels
+   * (`project`, `role`, `run`; nest's listing is the app's own), are ended and destroyed. Twice, the second
+   * after a create still in flight (nest's idempotency lease) has landed; retried until nest answers.
+   */
+  private async cleanRun(nest: Nest, id: string): Promise<void> {
+    const r = this.runRow(id);
+    if (!r || r.cleanup_next_ms === null) return;
+    const labels = { project: this.settings()!.id, role: "routine", run: id };
+    try {
+      for (const a of (await nest.listAgents(labels)).agents) {
+        if (a.agent) await nest.stopAgent(a.agent, { end: true, destroySandbox: true, reason: "routine run failed to start" });
+      }
+      for (const sb of (await nest.listSandboxes(labels)).sandboxes) {
+        const sandbox = (sb as { sandbox?: string }).sandbox;
+        if (sandbox) await nest.destroySandbox(sandbox);
+      }
+      const passes = (r.cleanup_passes as number) + 1;
+      this.sql.exec("UPDATE routine_runs SET cleanup_passes = ?, cleanup_attempts = 0, cleanup_next_ms = ? WHERE id = ?", passes, passes >= 2 ? null : Date.now() + ABANDON_RECHECK_MS, id);
+    } catch (e) {
+      const attempts = (r.cleanup_attempts as number) + 1;
+      this.sql.exec("UPDATE routine_runs SET cleanup_attempts = ?, cleanup_next_ms = ? WHERE id = ?", attempts, Date.now() + backoff(attempts), id);
     }
   }
 
@@ -2924,6 +2968,10 @@ export class ProjectDO extends DurableObject<Env> {
         UNION ALL SELECT last_start_ms + cooldown_min * 60000 FROM routines WHERE due IS NOT NULL AND due != 'manual' AND last_start_ms + cooldown_min * 60000 > ${Date.now()}
         UNION ALL SELECT next_ms FROM routine_runs WHERE state = 'starting' AND next_ms IS NOT NULL
         UNION ALL SELECT deadline_ms FROM routine_runs WHERE state = 'running' AND deadline_ms IS NOT NULL)`),
+      // A routine run's exit grace, and its cleanup by labels.
+      min(`SELECT MIN(t) AS t FROM (
+        SELECT exited_ms + ${RUN_EXIT_GRACE_MS} AS t FROM routine_runs WHERE state = 'running' AND exited_ms IS NOT NULL
+        UNION ALL SELECT cleanup_next_ms FROM routine_runs WHERE cleanup_next_ms IS NOT NULL)`),
     ].filter((t): t is number => t !== null);
     const next = times.length ? Math.min(...times) : null;
     if (next === null) return;
@@ -2967,12 +3015,19 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT id, deadline_ms FROM routine_runs WHERE state = 'running' AND deadline_ms <= ?", Date.now()).toArray()) {
       this.endRun(r.id as string, "timed_out", null, "its time budget ran out");
     }
+    // An agent that exited with no turn counted, and no turn came in its grace: the run failed.
+    for (const r of this.sql.exec("SELECT id, exit_reason FROM routine_runs WHERE state = 'running' AND exited_ms IS NOT NULL AND exited_ms + ? <= ?", RUN_EXIT_GRACE_MS, Date.now()).toArray()) {
+      this.endRun(r.id as string, "failed", `it ended before finishing a turn (${(r.exit_reason as string | null) ?? "exited"})`, null);
+    }
     this.routinesTick(Date.now());
     const nest = nestFrom(this.env);
     if (!nest) return;
     const now = Date.now();
     for (const r of this.sql.exec("SELECT id FROM routine_runs WHERE state = 'starting' AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY queued_ms", now).toArray()) {
       await this.startRun(nest, r.id as string);
+    }
+    for (const r of this.sql.exec("SELECT id FROM routine_runs WHERE cleanup_next_ms IS NOT NULL AND cleanup_next_ms <= ?", now).toArray()) {
+      await this.cleanRun(nest, r.id as string);
     }
     if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo(nest);
     if (s.secrets_next_ms !== null && (s.secrets_next_ms as number) <= now) await this.secretsUpkeep(nest);

@@ -243,7 +243,7 @@ describe("await_pr", () => {
     await runInDurableObject(review, async (inst: any, st: DurableObjectState) => {
       st.storage.sql.exec("INSERT INTO jobs (pr, sha, state, attempts, created_ms, updated_ms) VALUES (31, ?, 'running', 0, 1, 1)", "b".repeat(40));
       const row = st.storage.sql.exec("SELECT * FROM jobs WHERE pr = 31").one();
-      inst.end(row, "done", "success", { title: "t", summary: "s" });
+      inst.end(row, "verdict", "success", { title: "t", summary: "s" });
       await inst.drain();
     });
     await settle(s);

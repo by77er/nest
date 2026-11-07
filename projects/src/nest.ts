@@ -146,13 +146,28 @@ export class Nest {
    * A new agent with a sandbox of its own, both labelled, its repos narrowed to `repo`: to push to
    * (`overrides.repos`), or only to read (`overrides.read_repos`), as its template has them.
    * `key` names this start attempt: a retry after a lost answer sends the same Idempotency-Keys
-   * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back. `agent` adds fields to the
+   * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back. An agent create refused for
+   * good destroys the sandbox made for it. `agent` adds fields to the
    * agent's spawn (README.md#routines: a routine's grants).
    */
   async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string, extras: SandboxExtras = {}, agent: AgentExtras = {}): Promise<string> {
     const sandbox = (await this.createSandbox({ labels, ...extras }, `${key}/sandbox`)).sandbox;
     const overrides: SpawnOverrides = "push" in repo ? { repos: [repo.push] } : { read_repos: [repo.read] };
-    return (await this.createAgent({ ...agent, template, sandbox, labels, overrides, start: true }, `${key}/agent`)).agent;
+    try {
+      return (await this.createAgent({ ...agent, template, sandbox, labels, overrides, start: true }, `${key}/agent`)).agent;
+    } catch (e) {
+      // Refused for good (a quota, the template): no agent will ever use this attempt's sandbox, so it goes
+      // now, or it would be left until its idle TTL (and every retry of the work is a new attempt, with a
+      // sandbox of its own). Best effort: a destroy that fails leaves it to that TTL. The refusal is thrown.
+      if (e instanceof NestError && e.permanent) {
+        try {
+          await this.destroySandbox(sandbox);
+        } catch {
+          // Left to its idle TTL.
+        }
+      }
+      throw e;
+    }
   }
 
   /** Destroy one of the app's sandboxes (`DELETE /v1/sandboxes/<id>`, owner auth). */

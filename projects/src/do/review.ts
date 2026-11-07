@@ -4,10 +4,11 @@
 // alarm does the calls to GitHub and nest, retried from 5 s doubling to 5 min, and re-reads the job
 // after each, since other requests run while one awaits.
 //
-// A job's states: `queued` (waiting for its turn, under `max_concurrent_reviews`), `running` (its check
-// run, reviewer and brief are made in turn, then it waits for the verdict), and how it ended: `done`
-// (a verdict), `failed` (no verdict after retries, or refused for good), `superseded` (a newer head) or
-// `closed` (the PR closed). Each end owes GitHub its check's completion and nest the reviewer's stop.
+// A job's states (the table in src/review-job.ts, through which every change of state goes): `queued`
+// (waiting for its turn, under `max_concurrent_reviews`), `running` (its check run, reviewer and brief are
+// made in turn, then it waits for the verdict, until its deadline), and how it ended: `done` (a verdict),
+// `failed` (no verdict after retries, or refused for good), `superseded` (a newer head) or `closed` (the PR
+// closed). Each end owes GitHub its check's completion, once, and nest the reviewer's stop.
 
 import { DurableObject } from "cloudflare:workers";
 import { TEMPLATE } from "../catalog";
@@ -18,6 +19,9 @@ import { backoff, NestError, nestFrom, type Nest } from "../nest";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { toolOf } from "../tools";
+import { type JobEvent, type JobState, jobTransition, REVIEW_DEADLINE_MS } from "../review-job";
+
+export type { JobState };
 
 /** How many times a reviewer that exits without a verdict is started again before the job fails. */
 export const MAX_RETRIES = 2;
@@ -31,7 +35,6 @@ export const NO_VERDICT: Conclusion = "action_required";
 export const ENDED: Conclusion = "cancelled";
 const CALLS_KEEP_MS = 24 * 3600 * 1000;
 
-export type JobState = "queued" | "running" | "done" | "failed" | "superseded" | "closed";
 
 export interface Job {
   pr: number;
@@ -49,6 +52,8 @@ export interface Job {
   /** Reviewers started for the job, ever: each start's idempotency keys carry it. */
   runs: number;
   error: string | null;
+  /** While running: when the current reviewer's time is up (an attempt spent, like an exit without a verdict). */
+  deadline_ms: number | null;
   created_ms: number;
   updated_ms: number;
 }
@@ -85,6 +90,11 @@ const MIGRATIONS = [
     // Reviews that ended (a verdict, or failed), owed to ProjectDO for the manager's waits on them
     // (README.md#waiting): each told once, retried from the alarm until it's taken.
     "CREATE TABLE ended (pr INTEGER NOT NULL, sha TEXT NOT NULL, state TEXT NOT NULL, conclusion TEXT, next_ms INTEGER NOT NULL, PRIMARY KEY (pr, sha))",
+  ],
+  [
+    // A running job's deadline (src/review-job.ts): a reviewer that neither submits nor exits by then is an
+    // attempt spent. Jobs running before this step get one at the next drain.
+    "ALTER TABLE jobs ADD COLUMN deadline_ms INTEGER",
   ],
 ] as const;
 
@@ -155,6 +165,7 @@ export class ReviewDO extends DurableObject<Env> {
       agent: (r.agent as string | null) ?? null, check_run: (r.check_run as number | null) ?? null,
       verdict: r.verdict ? (JSON.parse(r.verdict as string) as Verdict) : null, tainted: r.tainted === null ? null : r.tainted === 1,
       attempts: r.attempts as number, runs: r.runs as number, error: (r.error as string | null) ?? null,
+      deadline_ms: r.state === "running" ? ((r.deadline_ms as number | null) ?? null) : null,
       created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     };
   }
@@ -229,18 +240,37 @@ export class ReviewDO extends DurableObject<Env> {
     return { queued: true };
   }
 
+  /**
+   * Move a job by `event` (src/review-job.ts), from the state its row had when read: written only if the
+   * table allows it and the row is still in that state (another step may have moved it meanwhile).
+   * Every change of a job's state goes through here. Answers the new state, or null for no move.
+   */
+  private move(pr: number, sha: string, from: JobState, event: JobEvent): JobState | null {
+    const t = jobTransition(from, event);
+    if (!t.ok) return null;
+    const moved = this.sql.exec("UPDATE jobs SET state = ?, updated_ms = ? WHERE pr = ? AND sha = ? AND state = ?", t.to, Date.now(), pr, sha, from).rowsWritten;
+    return moved ? t.to : null;
+  }
+
   /** Queue an ended job again from scratch: a new check run, new reviewers, no verdict. */
   private requeue(pr: number, sha: string): void {
+    const j = this.jobRow(pr, sha);
+    if (!j || !this.move(pr, sha, j.state as JobState, "requeue")) return;
     this.sql.exec(
-      `UPDATE jobs SET state = 'queued', next_ms = ?, agent = NULL, check_run = NULL, briefed = 0, verdict = NULL, tainted = NULL,
-        attempts = 0, errors = 0, error = NULL, updated_ms = ? WHERE pr = ? AND sha = ?`,
-      Date.now(), Date.now(), pr, sha,
+      `UPDATE jobs SET next_ms = ?, agent = NULL, check_run = NULL, briefed = 0, verdict = NULL, tainted = NULL,
+        attempts = 0, errors = 0, error = NULL, deadline_ms = NULL WHERE pr = ? AND sha = ?`,
+      Date.now(), pr, sha,
     );
   }
 
-  /** End a job in one step: its check's completion and its reviewer's stop are owed. */
-  private end(j: Row, state: Exclude<JobState, "queued" | "running">, conclusion: Conclusion, output: CheckOutput, error?: string): void {
-    this.sql.exec("UPDATE jobs SET state = ?, next_ms = NULL, error = COALESCE(?, error), updated_ms = ? WHERE pr = ? AND sha = ?", state, error ?? null, Date.now(), j.pr, j.sha);
+  /**
+   * End a job in one step, by `event` (verdict, give_up, refused, superseded, closed): its check's
+   * completion and its reviewer's stop are owed, once, only if the job moved (an ended job doesn't end again).
+   */
+  private end(j: Row, event: Extract<JobEvent, "verdict" | "give_up" | "refused" | "superseded" | "closed">, conclusion: Conclusion, output: CheckOutput, error?: string): void {
+    const state = this.move(j.pr as number, j.sha as string, j.state as JobState, event);
+    if (!state) return;
+    this.sql.exec("UPDATE jobs SET next_ms = NULL, deadline_ms = NULL, error = COALESCE(?, error) WHERE pr = ? AND sha = ?", error ?? null, j.pr, j.sha);
     if (j.check_run !== null) this.oweCheck(j.check_run as number, { status: "completed", conclusion, completed_at: new Date().toISOString(), output });
     if (j.agent !== null) this.oweStop(j.agent as string, state);
     // A review that finished (or failed for good) is owed to the project's waits; superseded and closed aren't ends of the PR's review.
@@ -264,23 +294,32 @@ export class ReviewDO extends DurableObject<Env> {
   async onAgentExited(agent: string, reason?: string): Promise<void> {
     const j = this.sql.exec("SELECT * FROM jobs WHERE agent = ?", agent).toArray()[0];
     if (!j || j.state !== "running" || j.verdict !== null) return;
-    // Its sandbox goes with it.
-    this.oweStop(agent, "exited");
+    this.spendAttempt(j, `the reviewer exited without a verdict (${(reason ?? "exited").slice(0, 100)})`, "exited");
+    await this.arm();
+  }
+
+  /**
+   * A running job's reviewer ended without a verdict (it exited, or its deadline passed): its agent is
+   * stopped with its sandbox, and a new reviewer starts, up to MAX_RETRIES times; then the job fails, its
+   * check completed as `action_required` with the reason. The slot frees either way.
+   */
+  private spendAttempt(j: Row, why: string, what: "exited" | "timed out"): void {
+    if (j.agent !== null) this.oweStop(j.agent as string, what);
     const attempts = (j.attempts as number) + 1;
-    const why = `the reviewer exited without a verdict (${(reason ?? "exited").slice(0, 100)})`;
     if (attempts <= MAX_RETRIES) {
+      if (!this.move(j.pr as number, j.sha as string, "running", "retry")) return;
+      const next = Date.now() + backoff(attempts);
       this.sql.exec(
-        "UPDATE jobs SET attempts = ?, agent = NULL, briefed = 0, runs = runs + 1, next_ms = ?, error = ?, updated_ms = ? WHERE pr = ? AND sha = ?",
-        attempts, Date.now() + backoff(attempts), why, Date.now(), j.pr, j.sha,
+        "UPDATE jobs SET attempts = ?, agent = NULL, briefed = 0, runs = runs + 1, next_ms = ?, deadline_ms = ?, error = ? WHERE pr = ? AND sha = ?",
+        attempts, next, next + REVIEW_DEADLINE_MS, why, j.pr, j.sha,
       );
     } else {
       this.sql.exec("UPDATE jobs SET attempts = ? WHERE pr = ? AND sha = ?", attempts, j.pr, j.sha);
-      this.end({ ...j, agent: null }, "failed", NO_VERDICT, {
+      this.end({ ...j, agent: null }, "give_up", NO_VERDICT, {
         title: "No verdict",
-        summary: `The reviewer exited ${attempts} times without submitting a verdict. Re-run this check to review the commit again.`,
+        summary: `${attempts} reviewers ended without submitting a verdict (the last: ${why}). Re-run this check to review the commit again.`,
       }, why);
     }
-    await this.arm();
   }
 
   // --- the reviewer's tools --------------------------------------------------------------------------
@@ -330,7 +369,7 @@ export class ReviewDO extends DurableObject<Env> {
         };
         const check = verdictCheck(verdict, { agent: caller.agent, tainted: caller.tainted });
         this.sql.exec("UPDATE jobs SET verdict = ?, tainted = ? WHERE pr = ? AND sha = ?", JSON.stringify(verdict), caller.tainted ? 1 : 0, r.pr, r.sha);
-        this.end(r, "done", check.conclusion, check.output);
+        this.end(r, "verdict", check.conclusion, check.output);
         await this.arm();
         return ok({ recorded: true, conclusion: check.conclusion });
       }
@@ -347,7 +386,8 @@ export class ReviewDO extends DurableObject<Env> {
 
   /** Arm the alarm for the earliest work owed. Queued jobs count only while there's room for one. */
   private async arm(): Promise<void> {
-    const next = this.sql.exec<{ t: number | null }>(
+    // Two queries: the platform's SQLite caps the terms of one compound SELECT.
+    const first = this.sql.exec<{ t: number | null }>(
       `SELECT MIN(t) AS t FROM (
         SELECT next_ms AS t FROM jobs WHERE state = 'running' AND next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM jobs WHERE state = 'queued' AND next_ms IS NOT NULL AND ? = 1
@@ -356,6 +396,10 @@ export class ReviewDO extends DurableObject<Env> {
         UNION ALL SELECT next_ms FROM ended)`,
       this.underCap() ? 1 : 0,
     ).one().t;
+    // A running job's deadline (src/review-job.ts).
+    const deadline = this.sql.exec<{ t: number | null }>("SELECT MIN(deadline_ms) AS t FROM jobs WHERE state = 'running' AND deadline_ms IS NOT NULL").one().t;
+    const times = [first, deadline].filter((t): t is number => t !== null);
+    const next = times.length ? Math.min(...times) : null;
     if (next === null) return;
     const cur = await this.ctx.storage.getAlarm();
     if (cur === null || next < cur) await this.ctx.storage.setAlarm(Math.max(next, Date.now()));
@@ -396,6 +440,12 @@ export class ReviewDO extends DurableObject<Env> {
         this.sql.exec("UPDATE ended SET next_ms = ? WHERE pr = ? AND sha = ?", Date.now() + 30_000, e.pr, e.sha);
       }
     }
+    // A running job always has a deadline (one running from before deadlines gets one now); past it, the
+    // reviewer's attempt is spent, in one step.
+    this.sql.exec("UPDATE jobs SET deadline_ms = ? WHERE state = 'running' AND deadline_ms IS NULL", Date.now() + REVIEW_DEADLINE_MS);
+    for (const j of this.sql.exec("SELECT * FROM jobs WHERE state = 'running' AND deadline_ms <= ?", Date.now()).toArray()) {
+      this.spendAttempt(j, `no verdict within ${REVIEW_DEADLINE_MS / 60_000} minutes`, "timed out");
+    }
     const nest = nestFrom(this.env);
     const repo = this.setting("repo");
     if (!nest || !repo) return;
@@ -408,7 +458,8 @@ export class ReviewDO extends DurableObject<Env> {
     // Queued jobs start in order while there's room.
     for (const q of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'queued' AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       if (!this.underCap()) break;
-      this.sql.exec("UPDATE jobs SET state = 'running', runs = runs + 1, agent = NULL, briefed = 0, next_ms = ?, updated_ms = ? WHERE pr = ? AND sha = ?", now, now, q.pr, q.sha);
+      if (!this.move(q.pr as number, q.sha as string, "queued", "start")) continue;
+      this.sql.exec("UPDATE jobs SET runs = runs + 1, agent = NULL, briefed = 0, next_ms = ?, deadline_ms = ? WHERE pr = ? AND sha = ?", now, now + REVIEW_DEADLINE_MS, q.pr, q.sha);
     }
     for (const r of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'running' AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       await this.advance(nest, github, repo, r.pr as number, r.sha as string);
@@ -481,7 +532,7 @@ export class ReviewDO extends DurableObject<Env> {
       if (!r) return;
       if ((e instanceof NestError || e instanceof GitHubError) && e.permanent) {
         // Refused for good (the App, the grant, the template): the job fails with the reason shown.
-        this.end(r, "failed", NO_VERDICT, { title: "The review couldn't run", summary: message(e) }, message(e));
+        this.end(r, "refused", NO_VERDICT, { title: "The review couldn't run", summary: message(e) }, message(e));
         return;
       }
       const errors = (r.errors as number) + 1;
