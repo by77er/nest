@@ -394,10 +394,28 @@ describe("cost guards", () => {
     expect(r).toMatchObject({ state: "ended", outcome: "failed", agent: null });
     const made = () => [...fake.agents.values()].filter((a) => a.labels.run === r.id);
     const boxes = () => [...fake.sandboxes.values()].filter((sb) => sb.labels.run === r.id);
-    expect(made().length).toBeGreaterThan(0);
+    expect(made()).toHaveLength(1);
     await settle(s);
     expect(made().filter((a) => !a.ended)).toEqual([]);
     expect(boxes().filter((sb) => !sb.ended)).toEqual([]);
+    // Ended by its own stop, with its sandbox: destroying a sandbox alone doesn't end an agent.
+    expect(stopsOf(made()[0]!.agent).map((c) => c.body)).toEqual([expect.objectContaining({ end: true, destroy_sandbox: true })]);
+  });
+
+  it("B16: a run the owner stops while its first create's answer was lost: the agent that create made is found and ended", async () => {
+    const s = await setup();
+    const id = await create(s);
+    fake.lost.push({ match: /^POST \/v1\/agents$/, times: 1 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const r = (await runs(s, id))[0];
+    expect(r).toMatchObject({ state: "starting", agent: null });
+    expect((await api(token, "POST", `/api/projects/${s.id}/routine-runs/${r.id}/stop`)).status).toBe(200);
+    await settle(s);
+    const made = [...fake.agents.values()].filter((a) => a.labels.run === r.id);
+    expect(made).toHaveLength(1);
+    expect(made[0]!.ended).toBe(true);
+    expect(stopsOf(made[0]!.agent).map((c) => c.body)).toEqual([expect.objectContaining({ end: true, destroy_sandbox: true })]);
+    expect([...fake.sandboxes.values()].filter((sb) => sb.labels.run === r.id && !sb.ended)).toEqual([]);
   });
 
   it("B13: an exit delivered before its turn: the turn still counts, and the run is done", async () => {

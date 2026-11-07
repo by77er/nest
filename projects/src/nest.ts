@@ -147,7 +147,7 @@ export class Nest {
    * (`overrides.repos`), or only to read (`overrides.read_repos`), as its template has them.
    * `key` names this start attempt: a retry after a lost answer sends the same Idempotency-Keys
    * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back. An agent create refused for
-   * good destroys the sandbox made for it. `agent` adds fields to the
+   * good destroys the sandbox made for it (not on a 409: the key's create may have landed). `agent` adds fields to the
    * agent's spawn (README.md#routines: a routine's grants).
    */
   async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string, extras: SandboxExtras = {}, agent: AgentExtras = {}): Promise<string> {
@@ -159,7 +159,9 @@ export class Nest {
       // Refused for good (a quota, the template): no agent will ever use this attempt's sandbox, so it goes
       // now, or it would be left until its idle TTL (and every retry of the work is a new attempt, with a
       // sandbox of its own). Best effort: a destroy that fails leaves it to that TTL. The refusal is thrown.
-      if (e instanceof NestError && e.permanent) {
+      // Not a 409: a key bound to another request means an earlier attempt's create landed, so an agent
+      // may be using the sandbox.
+      if (e instanceof NestError && e.permanent && e.status !== 409) {
         try {
           await this.destroySandbox(sandbox);
         } catch {

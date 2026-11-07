@@ -2487,6 +2487,9 @@ export class ProjectDO extends DurableObject<Env> {
     this.sql.exec("UPDATE routine_runs SET state = 'ended', outcome = ?, error = COALESCE(?, error), note = ?, next_ms = NULL, ended_ms = ? WHERE id = ?",
       outcome, error, note, now, id);
     if (r.agent) this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, NULL, ?, ?)", r.agent, `routine run ${outcome}`, now);
+    // Ended while starting with no agent recorded (its start failed, or the owner stopped it while a
+    // create's answer was lost): what its attempts may have made is found by its labels and ended.
+    else if (r.state === "starting") this.sql.exec("UPDATE routine_runs SET cleanup_next_ms = ?, cleanup_passes = 0 WHERE id = ?", now, id);
     this.routinesTick(now);
     return true;
   }
@@ -2576,9 +2579,8 @@ export class ProjectDO extends DurableObject<Env> {
       if (!current()) return;
       const attempts = (this.runRow(id)!.attempts as number) + 1;
       if ((e instanceof NestError && e.permanent) || attempts >= MAX_START_ATTEMPTS) {
+        // No agent recorded (every answer lost, or refused): endRun has what its attempts made found by its labels.
         this.endRun(id, "failed", message(e), null);
-        // No agent recorded (every answer lost, or refused): what its attempts made is found by its labels.
-        if (!this.runRow(id)!.agent) this.sql.exec("UPDATE routine_runs SET cleanup_next_ms = ?, cleanup_passes = 0 WHERE id = ?", Date.now(), id);
         return;
       }
       this.sql.exec("UPDATE routine_runs SET attempts = ?, next_ms = ?, error = ? WHERE id = ?", attempts, Date.now() + backoff(attempts), message(e), id);

@@ -215,6 +215,12 @@ describe("a refused agent create leaves no sandbox (B5)", () => {
     const reviewBoxes = sandboxesOf((l) => l.role === "reviewer" && l.sha === s);
     expect(reviewBoxes).toHaveLength(1);
     expect(reviewBoxes.filter((sb) => !sb.ended)).toEqual([]);
+    // A 409 (the key bound to another request: an earlier create may have landed) keeps the sandbox.
+    const t2 = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "t2" })).body;
+    await api(token, "PUT", `/api/projects/${p.id}/tasks/${t2.id}/spec`, { goal: "g", acceptance_criteria: [], files: [], test_plan: "p" });
+    fake.fail(/^POST \/v1\/agents$/, 409);
+    expect((await api(token, "POST", `/api/projects/${p.id}/tasks/${t2.id}/assign`)).body.state).toBe("stalled");
+    expect(sandboxesOf((l) => l.task === t2.id).filter((sb) => !sb.ended)).toHaveLength(1);
     // A routine run.
     const r = (await api(token, "POST", `/api/projects/${p.id}/routines`, {
       name: "R", kind: "review", prompt: "p", enabled: true, triggers: { timer: null, tasks_done: null, prs_merged: null },
