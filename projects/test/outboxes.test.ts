@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { MIGRATIONS } from "../src/do/project";
 import { migrate } from "../src/sql";
-import { AccessTeam, api, FakeNest, installFetch } from "./fake-nest";
+import { AccessTeam, api, deliver, FakeNest, installFetch } from "./fake-nest";
 
 const fake = new FakeNest();
 let restore: () => void;
@@ -107,21 +107,85 @@ describe("stops", () => {
     expect(fake.agents.get(w.worker)!.ended).toBe(true);
   });
 
-  it("one nest refuses for good is failed, not retried: recorded among the errors, and its place freed", async () => {
+  it("an auth failure or a page that isn't nest's is retried, never failed: the agent may still be running", async () => {
     const p = await newProject();
     const w = await cancelledWorker(p);
-    fake.fail(new RegExp(`^POST /v1/agents/${w.worker}/stop$`), 403, { times: 10 });
+    const stop = new RegExp(`^POST /v1/agents/${w.worker}/stop$`);
+    fake.fail(stop, 403, { times: 2 });
+    fake.fail(stop, 401, { times: 2 });
+    fake.fail(stop, 403, { times: 2, page: true });
     await api(token, "POST", `/api/projects/${p.id}/tasks/${w.task}/cancel`, {});
-    const row = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT failed_ms, error FROM stops WHERE agent = ?", w.worker).one());
+    for (let i = 0; i < 2; i++) {
+      await due(p, "stops");
+      await stub(p).drain();
+    }
+    const row = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT failed_ms, attempts FROM stops WHERE agent = ?", w.worker).one());
+    expect(row.failed_ms).toBeNull();
+    expect(row.attempts).toBeGreaterThanOrEqual(3);
+    expect(await live(p)).toBe(1);
+    // Still being tried: not the owner's to dismiss.
+    expect((await api(token, "DELETE", `/api/projects/${p.id}/stops/${w.worker}`)).status).toBe(409);
+    expect(await live(p)).toBe(1);
+    expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.failed_stops).toEqual([]);
+  });
+
+  it("nest's own refusal fails it, shown everywhere, its place still counted; Retry and Dismiss are the owner's", async () => {
+    const p = await newProject();
+    const w = await cancelledWorker(p);
+    const stop = new RegExp(`^POST /v1/agents/${w.worker}/stop$`);
+    fake.fail(stop, 409, { times: 1 });
+    await api(token, "POST", `/api/projects/${p.id}/tasks/${w.task}/cancel`, {});
+    const row = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT failed_ms, next_ms, error FROM stops WHERE agent = ?", w.worker).one());
     expect(row.failed_ms).not.toBeNull();
-    expect(row.error).toContain("403");
-    expect(await live(p)).toBe(0);
+    expect(row.error).toContain("409");
+    // Not due again before the owner acts: the alarm never spins on it.
+    expect(row.next_ms as number).toBeGreaterThan(Date.now() + 86_400_000);
+    // Still counted: auto-assign doesn't run past max_workers on a worker that may be running.
+    expect(await live(p)).toBe(1);
+    // Shown: the Network page, the task's history, the manager, the errors.
+    const net = (await api(token, "GET", `/api/projects/${p.id}/network`)).body;
+    expect(net.failed_stops).toEqual([expect.objectContaining({ agent: w.worker, task: w.task, reason: "cancelled", error: expect.stringContaining("409") })]);
+    expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${w.task}`)).body.history.map((h: { action: string }) => h.action)).toContain("stop_failed");
+    await stub(p).drain();
+    expect(fake.inbox.filter((m) => m.agent === p.manager && m.text.includes(`refused to stop ${w.worker}`))).toHaveLength(1);
+    // Sent: its end recorded, which its pruning counts from.
+    const ended = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT ended_ms FROM messages WHERE to_agent = ? AND text LIKE '%refused to stop%'", p.manager).one().ended_ms);
+    expect(ended).not.toBeNull();
     const errors = (await api(token, "GET", `/api/projects/${p.id}/errors`)).body as { agent: string; code: string }[];
     expect(errors).toEqual(expect.arrayContaining([expect.objectContaining({ agent: w.worker, code: "stop_failed" })]));
+    // Not tried again by itself.
     const calls = fake.callsTo("POST", new RegExp(`^/v1/agents/${w.worker}/stop$`)).length;
     await due(p, "stops");
     await stub(p).drain();
     expect(fake.callsTo("POST", new RegExp(`^/v1/agents/${w.worker}/stop$`))).toHaveLength(calls);
+    // The owner's Retry: tried now, and it goes.
+    const r = await api(token, "POST", `/api/projects/${p.id}/stops/${w.worker}/retry`);
+    expect(r.body).toEqual({ agent: w.worker, state: "done" });
+    expect(await live(p)).toBe(0);
+    expect(fake.agents.get(w.worker)!.ended).toBe(true);
+  });
+
+  it("dismissed by the owner, it stops counting; only a failed stop is dismissed", async () => {
+    const p = await newProject();
+    const w = await cancelledWorker(p);
+    fake.fail(new RegExp(`^POST /v1/agents/${w.worker}/stop$`), 409, { times: 1 });
+    await api(token, "POST", `/api/projects/${p.id}/tasks/${w.task}/cancel`, {});
+    expect(await live(p)).toBe(1);
+    expect((await api(token, "DELETE", `/api/projects/${p.id}/stops/${w.worker}`)).body).toEqual({ dismissed: w.worker });
+    expect(await live(p)).toBe(0);
+    expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.failed_stops).toEqual([]);
+    expect((await api(token, "DELETE", `/api/projects/${p.id}/stops/${w.worker}`)).status).toBe(409);
+    expect((await api(token, "POST", `/api/projects/${p.id}/stops/${w.worker}/retry`)).status).toBe(404);
+  });
+
+  it("nest's word that the agent ended clears a failed stop and frees its place", async () => {
+    const p = await newProject();
+    const w = await cancelledWorker(p);
+    fake.fail(new RegExp(`^POST /v1/agents/${w.worker}/stop$`), 409, { times: 1 });
+    await api(token, "POST", `/api/projects/${p.id}/tasks/${w.task}/cancel`, {});
+    await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: w.worker, reason: "ended" });
+    expect(await live(p)).toBe(0);
+    expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.failed_stops).toEqual([]);
   });
 });
 
@@ -136,11 +200,14 @@ describe("pruning", () => {
       ins(old, null, "refused");
       ins(old, Date.now() + 3_600_000, "busy");
       ins(Date.now(), null, null);
+      // Owed long ago, but it ended (sent, after a week of retries) just now: kept, by its end.
+      st.storage.sql.exec("INSERT INTO messages (to_agent, text, relayed, at_ms, next_ms, attempts, error, ended_ms) VALUES ('agt_x', 'late', 0, ?, NULL, 9, NULL, ?)", old, Date.now());
     });
     await stub(p).drain();
-    const left = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT at_ms, next_ms FROM messages WHERE to_agent = 'agt_x'").toArray());
-    expect(left).toHaveLength(2);
-    expect(left.every((r) => r.next_ms !== null || (r.at_ms as number) > old)).toBe(true);
+    const left = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT text, at_ms, next_ms FROM messages WHERE to_agent = 'agt_x'").toArray());
+    expect(left).toHaveLength(3);
+    expect(left.map((r) => r.text)).toContain("late");
+    expect(left.every((r) => r.next_ms !== null || r.text === "late" || (r.at_ms as number) > old)).toBe(true);
   });
 });
 
@@ -154,6 +221,7 @@ describe("the outboxes' migration", () => {
       sql.exec("DROP INDEX chat_request");
       sql.exec("ALTER TABLE chat DROP COLUMN request_id");
       sql.exec("ALTER TABLE stops DROP COLUMN failed_ms");
+      sql.exec("ALTER TABLE messages DROP COLUMN ended_ms");
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec("INSERT INTO task_prs (pr, task, state, attached_by, attached_ms) VALUES (61, 'tsk_gone', 'open', 'owner', 1), (62, 'tsk_gone', 'detached', 'owner', 1), (63, ?, 'open', 'owner', 1)", t.id);
       migrate(st.storage, MIGRATIONS);

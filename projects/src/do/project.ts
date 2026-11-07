@@ -278,6 +278,8 @@ export interface Proposal {
 
 /** How much of a run's last turn is kept as its report. */
 const RUN_SUMMARY_MAX = 4000;
+/** How long a run whose agent exited before any turn was counted waits for that turn's event. */
+export const RUN_EXIT_GRACE_MS = 60_000;
 
 const MAX_WORKERS_LIMIT = 20;
 /** A chat page's size by default, and at most: older pages load as the owner scrolls up. */
@@ -460,11 +462,24 @@ export const MIGRATIONS = [
     "ALTER TABLE routine_runs ADD COLUMN brief TEXT",
   ],
   [
+    // A run's agent that exited before its turn was counted: the run waits RUN_EXIT_GRACE_MS for the turn
+    // (events aren't ordered) before it fails. And a run that failed to start with no agent recorded: what
+    // its attempts may have made, found by its labels and ended, twice (the second after a create still in
+    // flight has landed).
+    "ALTER TABLE routine_runs ADD COLUMN exited_ms INTEGER",
+    "ALTER TABLE routine_runs ADD COLUMN exit_reason TEXT",
+    "ALTER TABLE routine_runs ADD COLUMN cleanup_next_ms INTEGER",
+    "ALTER TABLE routine_runs ADD COLUMN cleanup_passes INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE routine_runs ADD COLUMN cleanup_attempts INTEGER NOT NULL DEFAULT 0",
+  ],
+  [
     // The outboxes as one machine (README.md#outboxes): the owner's chat message keyed by the page's
     // request id, so a retried post is the same message; a stop nest refuses for good is failed, not retried.
     "ALTER TABLE chat ADD COLUMN request_id TEXT",
     "CREATE UNIQUE INDEX chat_request ON chat (request_id)",
     "ALTER TABLE stops ADD COLUMN failed_ms INTEGER",
+    // When a message to an agent was sent or failed: its pruning counts from then, not from when it was owed.
+    "ALTER TABLE messages ADD COLUMN ended_ms INTEGER",
     // PR rows of tasks that no longer exist: deleting a draft left them before the task machine (README.md#the-task-machine),
     // and nothing updates them now (a PR's state moves only with its task's). Gone, so the PR can be attached again.
     "DELETE FROM task_prs WHERE task NOT IN (SELECT id FROM tasks)",
@@ -475,6 +490,25 @@ export const MIGRATIONS = [
 const RECENT_WAITS = 10;
 
 type Row = Record<string, SqlStorageValue>;
+
+/**
+ * A stop's refusal that will repeat (README.md#outboxes): nest's own refusal of the request, in its JSON
+ * error body (400, 409). An auth failure (401, 403) or a page that isn't nest's (a proxy's, Access's) may
+ * pass, so it's retried: failing it would leave an agent running unseen.
+ */
+export function stopRefused(e: unknown): boolean {
+  return e instanceof NestError && e.code !== "http" && !e.retryable && (e.status === 400 || e.status === 409);
+}
+
+/** A stop nest refused (README.md#outboxes): the agent may still be running. */
+export interface FailedStop {
+  agent: string;
+  task: string | null;
+  /** Why it was being stopped (`cancelled`, `routine run done`, …). */
+  reason: string;
+  error: string | null;
+  failed_ms: number;
+}
 
 /** A queue row's outbox columns (README.md#outboxes). */
 const outboxRow = (r: Row): OutboxRow => ({ next_ms: (r.next_ms as number | null) ?? null, attempts: (r.attempts as number | null) ?? 0, error: (r.error as string | null) ?? null });
@@ -2057,7 +2091,7 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** The page's view: the rules, and each live agent's layer (applied, pending or failed). */
-  async network(): Promise<Result<{ rules: RoleRules; rev: number; agents: LayerStatus[] }>> {
+  async network(): Promise<Result<{ rules: RoleRules; rev: number; agents: LayerStatus[]; failed_stops: FailedStop[] }>> {
     if (!this.settings()) return fail(404, "unknown project");
     const { rules, rev } = this.rules();
     const live = new Set(this.liveAgents().map((a) => a.agent));
@@ -2066,7 +2100,7 @@ export class ProjectDO extends DurableObject<Env> {
       state: r.error !== null && r.next_ms === null ? "failed" : r.rev === r.want_rev && r.next_ms === null ? "applied" : "pending",
       error: (r.error as string | null) ?? null, rev: (r.rev as number | null) ?? null, at_ms: (r.at_ms as number | null) ?? null,
     }));
-    return ok({ rules, rev, agents });
+    return ok({ rules, rev, agents, failed_stops: this.failedStops() });
   }
 
   /** The manager's sandbox, if known (the operator's base policy is read from it). */
@@ -2080,7 +2114,7 @@ export class ProjectDO extends DurableObject<Env> {
    * New rules (the caller checked them against the grant): stored with a new revision, and owed to
    * every live agent of a role whose rules changed, through its sandbox's client layer.
    */
-  async setNetwork(next: RoleRules): Promise<Result<{ rules: RoleRules; rev: number; agents: LayerStatus[] }>> {
+  async setNetwork(next: RoleRules): Promise<Result<{ rules: RoleRules; rev: number; agents: LayerStatus[]; failed_stops: FailedStop[] }>> {
     if (!this.settings()) return fail(404, "unknown project");
     const before = this.rules();
     const rules: RoleRules = { worker: normalizeRules(next.worker), manager: normalizeRules(next.manager) };
@@ -2589,6 +2623,9 @@ export class ProjectDO extends DurableObject<Env> {
     this.sql.exec("UPDATE routine_runs SET state = 'ended', outcome = ?, error = COALESCE(?, error), note = ?, next_ms = NULL, ended_ms = ? WHERE id = ?",
       outcome, error, note, now, id);
     if (r.agent) this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, NULL, ?, ?)", r.agent, `routine run ${outcome}`, now);
+    // Ended while starting with no agent recorded (its start failed, or the owner stopped it while a
+    // create's answer was lost): what its attempts may have made is found by its labels and ended.
+    else if (r.state === "starting") this.sql.exec("UPDATE routine_runs SET cleanup_next_ms = ?, cleanup_passes = 0 WHERE id = ?", now, id);
     this.routinesTick(now);
     return true;
   }
@@ -2604,11 +2641,15 @@ export class ProjectDO extends DurableObject<Env> {
       const turns = (r.turns as number) + 1;
       // The run's report: its latest turn's last text, kept short (an agent wrote it: shown as text, never followed).
       this.sql.exec("UPDATE routine_runs SET turns = ?, summary = COALESCE(?, summary) WHERE id = ?", turns, e.text ? e.text.slice(0, RUN_SUMMARY_MAX) : null, id);
-      if (turns >= (r.max_turns as number)) this.endRun(id, "done", null, `its turn budget (${turns}) was reached`);
+      // Its agent exited already (that event came first): this was its turn, and the run is done.
+      if (r.exited_ms !== null) this.endRun(id, "done", null, null);
+      else if (turns >= (r.max_turns as number)) this.endRun(id, "done", null, `its turn budget (${turns}) was reached`);
     } else if (e.type === "agent.exited") {
       const turns = r.turns as number;
       if (turns > 0) this.endRun(id, "done", null, null);
-      else this.endRun(id, "failed", `it ended before finishing a turn (${(e.reason ?? "exited").slice(0, 100)})`, null);
+      // No turn counted yet: its turn's event may still be on its way (nest doesn't order them), so the run
+      // waits RUN_EXIT_GRACE_MS for it before it fails.
+      else this.sql.exec("UPDATE routine_runs SET exited_ms = COALESCE(exited_ms, ?), exit_reason = ? WHERE id = ?", Date.now(), (e.reason ?? "exited").slice(0, 100), id);
     }
   }
 
@@ -2674,10 +2715,36 @@ export class ProjectDO extends DurableObject<Env> {
       if (!current()) return;
       const attempts = (this.runRow(id)!.attempts as number) + 1;
       if ((e instanceof NestError && e.permanent) || attempts >= MAX_START_ATTEMPTS) {
+        // No agent recorded (every answer lost, or refused): endRun has what its attempts made found by its labels.
         this.endRun(id, "failed", message(e), null);
         return;
       }
       this.sql.exec("UPDATE routine_runs SET attempts = ?, next_ms = ?, error = ? WHERE id = ?", attempts, Date.now() + backoff(attempts), message(e), id);
+    }
+  }
+
+  /**
+   * A run that failed to start with no agent recorded: its agents and sandboxes, found by its labels
+   * (`project`, `role`, `run`; nest's listing is the app's own), are ended and destroyed. Twice, the second
+   * after a create still in flight (nest's idempotency lease) has landed; retried until nest answers.
+   */
+  private async cleanRun(nest: Nest, id: string): Promise<void> {
+    const r = this.runRow(id);
+    if (!r || r.cleanup_next_ms === null) return;
+    const labels = { project: this.settings()!.id, role: "routine", run: id };
+    try {
+      for (const a of (await nest.listAgents(labels)).agents) {
+        if (a.agent) await nest.stopAgent(a.agent, { end: true, destroySandbox: true, reason: "routine run failed to start" });
+      }
+      for (const sb of (await nest.listSandboxes(labels)).sandboxes) {
+        const sandbox = (sb as { sandbox?: string }).sandbox;
+        if (sandbox) await nest.destroySandbox(sandbox);
+      }
+      const passes = (r.cleanup_passes as number) + 1;
+      this.sql.exec("UPDATE routine_runs SET cleanup_passes = ?, cleanup_attempts = 0, cleanup_next_ms = ? WHERE id = ?", passes, passes >= 2 ? null : Date.now() + ABANDON_RECHECK_MS, id);
+    } catch (e) {
+      const attempts = (r.cleanup_attempts as number) + 1;
+      this.sql.exec("UPDATE routine_runs SET cleanup_attempts = ?, cleanup_next_ms = ? WHERE id = ?", attempts, Date.now() + backoff(attempts), id);
     }
   }
 
@@ -3039,6 +3106,10 @@ export class ProjectDO extends DurableObject<Env> {
         UNION ALL SELECT last_start_ms + cooldown_min * 60000 FROM routines WHERE due IS NOT NULL AND due != 'manual' AND last_start_ms + cooldown_min * 60000 > ${Date.now()}
         UNION ALL SELECT next_ms FROM routine_runs WHERE state = 'starting' AND next_ms IS NOT NULL
         UNION ALL SELECT deadline_ms FROM routine_runs WHERE state = 'running' AND deadline_ms IS NOT NULL)`),
+      // A routine run's exit grace, and its cleanup by labels.
+      min(`SELECT MIN(t) AS t FROM (
+        SELECT exited_ms + ${RUN_EXIT_GRACE_MS} AS t FROM routine_runs WHERE state = 'running' AND exited_ms IS NOT NULL
+        UNION ALL SELECT cleanup_next_ms FROM routine_runs WHERE cleanup_next_ms IS NOT NULL)`),
     ].filter((t): t is number => t !== null);
     const next = times.length ? Math.min(...times) : null;
     if (next === null) return;
@@ -3082,12 +3153,19 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT id, deadline_ms FROM routine_runs WHERE state = 'running' AND deadline_ms <= ?", Date.now()).toArray()) {
       this.endRun(r.id as string, "timed_out", null, "its time budget ran out");
     }
+    // An agent that exited with no turn counted, and no turn came in its grace: the run failed.
+    for (const r of this.sql.exec("SELECT id, exit_reason FROM routine_runs WHERE state = 'running' AND exited_ms IS NOT NULL AND exited_ms + ? <= ?", RUN_EXIT_GRACE_MS, Date.now()).toArray()) {
+      this.endRun(r.id as string, "failed", `it ended before finishing a turn (${(r.exit_reason as string | null) ?? "exited"})`, null);
+    }
     this.routinesTick(Date.now());
     const nest = nestFrom(this.env);
     if (!nest) return;
     const now = Date.now();
     for (const r of this.sql.exec("SELECT id FROM routine_runs WHERE state = 'starting' AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY queued_ms", now).toArray()) {
       await this.startRun(nest, r.id as string);
+    }
+    for (const r of this.sql.exec("SELECT id FROM routine_runs WHERE cleanup_next_ms IS NOT NULL AND cleanup_next_ms <= ?", now).toArray()) {
+      await this.cleanRun(nest, r.id as string);
     }
     if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo(nest);
     if (s.secrets_next_ms !== null && (s.secrets_next_ms as number) <= now) await this.secretsUpkeep(nest);
@@ -3110,7 +3188,7 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT agent FROM stops WHERE failed_ms IS NULL AND next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
     // Ended rows past their queue's keep (README.md#outboxes): messages sent or failed a week ago, stops failed a month ago.
     const msgs = pruneBefore(OUTBOX.messages, now);
-    if (msgs !== null) this.sql.exec("DELETE FROM messages WHERE next_ms IS NULL AND at_ms < ?", msgs);
+    if (msgs !== null) this.sql.exec("DELETE FROM messages WHERE next_ms IS NULL AND COALESCE(ended_ms, at_ms) < ?", msgs);
     const stops = pruneBefore(OUTBOX.stops, now);
     if (stops !== null) this.sql.exec("DELETE FROM stops WHERE failed_ms IS NOT NULL AND failed_ms < ?", stops);
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
@@ -3297,9 +3375,11 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
-   * End an agent the app owes nest a stop of, and its sandbox (README.md#outboxes). Retried until it goes;
-   * a refusal that will repeat fails it: recorded among the project's errors, and its place freed, since
-   * asking again can't end it.
+   * End an agent the app owes nest a stop of, and its sandbox (README.md#outboxes). Retried until it goes.
+   * Only nest's own refusal of the request (`stopRefused`) fails it, and a failed stop is never quiet: the
+   * agent may still be running, so it's shown (its task's history, the Network page, the manager told), its
+   * place stays counted, and it waits for the owner's Retry or Dismiss (`retryStop`, `dismissStop`), or for
+   * nest's word that the agent ended (`agent.exited`).
    */
   private async stop(nest: Nest, agent: string): Promise<void> {
     const row = this.sql.exec("SELECT task, reason, next_ms, attempts, error FROM stops WHERE agent = ? AND failed_ms IS NULL", agent).toArray()[0];
@@ -3309,19 +3389,64 @@ export class ProjectDO extends DurableObject<Env> {
     } catch (e) {
       // Gone already (404): as good as stopped.
       if (!(e instanceof NestError && e.status === 404)) {
-        const st = outboxStep(outboxRow(row), { kind: "failed", ...verdict(e) }, Date.now(), OUTBOX.stops);
+        const st = outboxStep(outboxRow(row), { kind: "failed", error: message(e), permanent: stopRefused(e) }, Date.now(), OUTBOX.stops);
         if (!st.ok) return;
-        if (st.state === "failed") {
-          this.sql.exec("UPDATE stops SET attempts = ?, error = ?, failed_ms = ? WHERE agent = ?", st.row.attempts, st.row.error, Date.now(), agent);
-          this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, ?, ?, ?, 'stop_failed', ?)",
-            `stop/${agent}`, Date.now(), agent, row.task ? "worker" : null, (row.task as string | null) ?? null, `nest refused to stop it: ${st.row.error}`);
-          this.stopped(agent);
-        } else this.sql.exec("UPDATE stops SET attempts = ?, next_ms = ?, error = ? WHERE agent = ?", st.row.attempts, st.row.next_ms, st.row.error, agent);
+        if (st.state === "failed") this.stopFailed(agent, row.task as string | null, row.reason as string, st.row);
+        else this.sql.exec("UPDATE stops SET attempts = ?, next_ms = ?, error = ? WHERE agent = ?", st.row.attempts, st.row.next_ms, st.row.error, agent);
         return;
       }
     }
     this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
     this.stopped(agent);
+  }
+
+  /** A stop nest refused for good: kept (not due again until it's pruned), and said everywhere it matters. */
+  private stopFailed(agent: string, task: string | null, reason: string, r: OutboxRow): void {
+    const now = Date.now();
+    // Its next try is the prune's time: nothing is due before the owner acts, so the alarm never spins on it.
+    this.sql.exec("UPDATE stops SET attempts = ?, error = ?, failed_ms = ?, next_ms = ? WHERE agent = ?", r.attempts, r.error, now, now + (OUTBOX.stops.keepMs ?? 0), agent);
+    const what = `nest refused to stop ${agent} (${reason}): ${r.error}. It may still be running; it counts as live until it's stopped or dismissed.`;
+    this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, ?, ?, ?, 'stop_failed', ?)",
+      `stop/${agent}/${now}`, now, agent, task ? "worker" : null, task, what);
+    if (task) this.record(task, { kind: "app", what: "nest" }, "stop_failed", { agent, error: r.error });
+    const manager = this.settings()?.manager;
+    if (manager && manager !== agent) this.oweMessage(manager, `${what} The owner can retry or dismiss it on the Network page.`, false);
+  }
+
+  /** The owner's Retry of a stop nest refused: owed again now (asked again while it's owed, nothing changes). */
+  async retryStop(agent: string): Promise<Result<{ agent: string; state: OutboxState }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const r = this.sql.exec("SELECT task FROM stops WHERE agent = ?", agent).toArray()[0];
+    if (!r) return fail(404, `no stop of ${agent} is owed`);
+    if (this.sql.exec("UPDATE stops SET failed_ms = NULL, next_ms = ?, attempts = 0, error = NULL WHERE agent = ? AND failed_ms IS NOT NULL", Date.now(), agent).rowsWritten && r.task) {
+      this.record(r.task as string, { kind: "owner" }, "stop_retried", { agent });
+    }
+    await this.arm();
+    await this.drain();
+    const left = this.sql.exec("SELECT failed_ms, next_ms, attempts, error FROM stops WHERE agent = ?", agent).toArray()[0];
+    return ok({ agent, state: !left ? "done" : left.failed_ms !== null ? "failed" : outboxState(outboxRow(left)) });
+  }
+
+  /**
+   * The owner dismisses a stop nest refused (they've ended the agent themselves, or accept it running):
+   * the app stops counting it, and owes it nothing more.
+   */
+  async dismissStop(agent: string): Promise<Result<{ dismissed: string }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const r = this.sql.exec("SELECT task FROM stops WHERE agent = ? AND failed_ms IS NOT NULL", agent).toArray()[0];
+    if (!r) return fail(409, `no failed stop of ${agent}: only a stop nest refused is dismissed`);
+    this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
+    if (r.task) this.record(r.task as string, { kind: "owner" }, "stop_dismissed", { agent });
+    this.stopped(agent);
+    await this.arm();
+    return ok({ dismissed: agent });
+  }
+
+  /** The stops nest refused, for the Network page. */
+  private failedStops(): FailedStop[] {
+    return this.sql.exec("SELECT agent, task, reason, error, failed_ms FROM stops WHERE failed_ms IS NOT NULL ORDER BY failed_ms").toArray().map((r) => ({
+      agent: r.agent as string, task: (r.task as string | null) ?? null, reason: r.reason as string, error: (r.error as string | null) ?? null, failed_ms: r.failed_ms as number,
+    }));
   }
 
   /** An agent the app stopped (or can't): nothing more is owed to its client layer, and a worker's place frees. */
@@ -3336,6 +3461,8 @@ export class ProjectDO extends DurableObject<Env> {
   /** Write a row's outbox columns back (README.md#outboxes). */
   private saveOutbox(table: "chat" | "messages" | "issue_closes", key: "seq" | "task", id: number | string, r: OutboxRow): void {
     this.sql.exec(`UPDATE ${table} SET next_ms = ?, attempts = ?, error = ? WHERE ${key} = ?`, r.next_ms, r.attempts, r.error, id);
+    // A message's end (sent or failed), which its pruning counts from.
+    if (table === "messages") this.sql.exec("UPDATE messages SET ended_ms = CASE WHEN next_ms IS NULL THEN COALESCE(ended_ms, ?) ELSE NULL END WHERE seq = ?", Date.now(), id);
   }
 
   /** Take `event` on a row of a queue and write it back, or nothing when the row can't take it. */

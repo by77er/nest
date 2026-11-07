@@ -12,6 +12,31 @@ const role = (r: "worker" | "manager") => document.querySelector(`[data-role="${
 const picker = (el: HTMLElement) => within(el).getAllByLabelText("Add hosts").find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden")!;
 
 describe("the Network page", () => {
+  it("shows the agents nest refused to stop, with why, a Retry and a confirmed Dismiss; none, nothing", async () => {
+    const api = new FakeApi();
+    const t = task({ state: "cancelled" });
+    api.tasks = [t];
+    api.network.failed_stops = [
+      { agent: "agt_w1", task: t.id, reason: "cancelled", error: "nest 409 conflict: the agent is busy", failed_ms: Date.now() - 60_000 },
+      { agent: "agt_r1", task: null, reason: "routine run done", error: "nest 400 invalid: bad request", failed_ms: Date.now() - 30_000 },
+    ];
+    const { user } = renderApp("/projects/prj_one/network", api);
+    const box = (await screen.findByText("2 agents the app couldn't stop")).closest("[data-ds=notice]") as HTMLElement;
+    expect(box).toHaveTextContent("may still be running");
+    const worker = box.querySelector('[data-agent="agt_w1"]') as HTMLElement;
+    expect(worker).toHaveTextContent("the agent is busy");
+    expect(within(worker).getByRole("link", { name: "its task" })).toHaveAttribute("href", `/projects/prj_one/board?task=${t.id}`);
+    expect(box.querySelector('[data-agent="agt_r1"]')).toHaveTextContent("routine run done");
+    await user.click(within(worker).getByRole("button", { name: "Retry the stop of agt_w1" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/stops/agt_w1/retry", body: undefined }]));
+    await waitFor(() => expect(screen.getByText("An agent the app couldn't stop")).toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: "Dismiss the stop of agt_r1" }));
+    const confirm = await screen.findByRole("dialog", { name: "Dismiss the stop of agt_r1?" });
+    await user.click(within(confirm).getByRole("button", { name: "Dismiss" }));
+    await waitFor(() => expect(api.writes.at(-1)).toEqual({ method: "DELETE", path: "/api/projects/prj_one/stops/agt_r1", body: undefined }));
+    await waitFor(() => expect(screen.queryByText(/couldn't stop/)).toBeNull());
+  });
+
   it("shows the grant's ceiling, nest's defaults and the operator's rules apart, and each role's hosts", async () => {
     const api = new FakeApi();
     api.network.rules = { worker: [{ host: "registry.npmjs.org" }], manager: [] };

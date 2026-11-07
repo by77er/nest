@@ -5,7 +5,7 @@
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-sending" (the owner's messages still being sent), "chat-long" (thirty messages), "chat-paged"
-// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents),
+// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" (agents nest refused to stop),
 // "chat-code" (a reply with every syntax token), "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
 // a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
@@ -326,6 +326,11 @@ const RICH = [
       { host: "mirror.internal.example", ports: [8443], source: "operator" },
       ...["api.github.com", "codeload.github.com"].map((host) => ({ host, ports: [443], source: "repos" })),
     ],
+    // Agents nest refused to stop (README.md#outboxes): a cancelled task's worker, a routine run's.
+    failed_stops: variant === "stops-failed" ? [
+      { agent: "agt_w5t8q3", task: "tsk_demo10", reason: "cancelled", error: "nest 409 conflict: the agent's host is draining; ask again once it has moved", failed_ms: now - 25 * 60_000 },
+      { agent: "agt_r2m9x4", task: null, reason: "routine run timed_out", error: "nest 400 invalid: destroy_sandbox isn't allowed for an agent whose sandbox is shared", failed_ms: now - 3 * 60_000 },
+    ] : [],
   };
 
   // The Secrets page (README.md#secrets): what the app keeps of each (never a value), the grant, and the

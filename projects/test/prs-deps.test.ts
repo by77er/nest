@@ -314,7 +314,8 @@ describe("the migration", () => {
       sql.exec("DROP INDEX chat_request");
       sql.exec("ALTER TABLE chat DROP COLUMN request_id");
       sql.exec("ALTER TABLE stops DROP COLUMN failed_ms");
-      expect(step).toBe(MIGRATIONS.length - 8);
+      sql.exec("ALTER TABLE messages DROP COLUMN ended_ms");
+      expect(step).toBe(MIGRATIONS.length - 9);
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, pr_node, am_status, created_ms, updated_ms) VALUES ('tsk_old', 't', '', 'in_review', 1, 7, 'PR_x', '{"state":"enabled"}', 1, 2)`);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, created_ms, updated_ms) VALUES ('tsk_done', 't', '', 'done', 2, 8, 1, 2)`);

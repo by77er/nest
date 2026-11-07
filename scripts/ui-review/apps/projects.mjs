@@ -770,6 +770,9 @@ const app = {
     // The Network page (README.md#network): rules per role, live agents applied, pending and failed; empty; a host refused.
     { name: "network", section: "project", path: "/projects/prj_demo/network" },
     { name: "network-empty", section: "project", path: "/projects/prj_demo/network", fixture: "network-empty" },
+    // Agents nest refused to stop: why, Retry and Dismiss (README.md#outboxes).
+    { name: "network-stops-failed", section: "project", path: "/projects/prj_demo/network", fixture: "stops-failed", full: false },
+    { name: "network-stop-dismiss", section: "project", path: "/projects/prj_demo/network", fixture: "stops-failed", full: false, after: (p) => p.getByRole("button", { name: "Dismiss the stop of agt_r2m9x4" }).click() },
     { name: "network-refused", section: "project", path: "/projects/prj_demo/network", full: false, after: async (p) => {
       const role = p.locator("[data-role=manager]");
       await role.getByLabel("Add hosts").first().click();

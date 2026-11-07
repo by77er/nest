@@ -64,6 +64,8 @@ export interface NetworkView {
   agents: import("../../do/project").LayerStatus[];
   egress_hosts: string[] | null;
   base: import("../../network").OperatorRule[] | null;
+  /** Agents nest refused to stop (README.md#outboxes): they may still be running. */
+  failed_stops: import("../../do/project").FailedStop[];
 }
 
 // Routines and memory (README.md#routines, README.md#memory).

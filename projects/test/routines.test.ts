@@ -6,6 +6,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
+import { MAX_START_ATTEMPTS } from "../src/routines";
 import { DREAM_MAX_ENTRIES, FIRST_DREAM_WINDOW_MS, firedTrigger, MAX_DREAM_WINDOW_MS, MAX_PROPOSALS_PER_RUN, nextTimerFire, PRESETS, routineSpawnExtras, startVerdict, type Triggers, wallToUtc } from "../src/routines";
 import { AccessTeam, agentClaims, api, callTool, deliver, deliverGithub, FakeNest, installFetch, prEvent, shaOf, Signer } from "./fake-nest";
 
@@ -206,7 +207,7 @@ describe("firing", () => {
     const run = await liveRun(s, id);
     expect(run).toMatchObject({ trigger: "tasks_done", count: 2 });
     expect((await routine(s, id)).counts.tasks_done).toBe(0);
-    await exited(run.agent);
+    await finish(run.agent);
     await doneTask(s);
     await settle(s);
     expect(await runs(s, id)).toHaveLength(1);
@@ -270,7 +271,7 @@ describe("one at a time, the cooldown and the cap", () => {
     await doneTask(s);
     await settle(s);
     const first = await liveRun(s, id);
-    await exited(first.agent);
+    await finish(first.agent);
     await doneTask(s);
     await settle(s);
     const r = await routine(s, id);
@@ -289,7 +290,7 @@ describe("one at a time, the cooldown and the cap", () => {
     const runA = await liveRun(s, a);
     expect(runA).not.toBeNull();
     expect(await routine(s, b)).toMatchObject({ live_run: null, due: { trigger: "manual" }, waiting: "cap" });
-    await exited(runA.agent);
+    await finish(runA.agent);
     await settle(s);
     expect(await liveRun(s, b)).toMatchObject({ state: "running", trigger: "manual" });
   });
@@ -360,13 +361,71 @@ describe("cost guards", () => {
     expect(await liveRun(s, id)).toMatchObject({ turns: 1, state: "running" });
   });
 
-  it("a run whose agent ends before a turn has failed", async () => {
+  it("a run whose agent ends before a turn has failed, once its turn hasn't come within the grace", async () => {
     const s = await setup();
     const id = await create(s);
     await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
     const run = await liveRun(s, id);
     await exited(run.agent);
-    expect((await runs(s, id))[0]).toMatchObject({ outcome: "failed", error: expect.stringMatching(/before finishing a turn/) });
+    // Not yet: its turn's event may still be on its way.
+    expect(await liveRun(s, id)).toMatchObject({ state: "running" });
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET exited_ms = 0 WHERE id = ?", run.id);
+    });
+    await settle(s);
+    expect((await runs(s, id))[0]).toMatchObject({ outcome: "failed", error: expect.stringMatching(/before finishing a turn \(done\)/) });
+    expect(stopsOf(run.agent)).toHaveLength(1);
+  });
+
+  it("B16: a run whose answers are all lost fails with no agent recorded, and what it made is found by its labels and ended", async () => {
+    const s = await setup();
+    const id = await create(s);
+    // The first create lands but its answer is lost; every retry after fails for now (nest busy).
+    fake.lost.push({ match: /^POST \/v1\/agents$/, times: 1 });
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 3 * (MAX_START_ATTEMPTS - 1) });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    for (let k = 1; k < MAX_START_ATTEMPTS; k++) {
+      await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+        st.storage.sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE state = 'starting'");
+      });
+      await settle(s);
+    }
+    const r = (await runs(s, id))[0];
+    expect(r).toMatchObject({ state: "ended", outcome: "failed", agent: null });
+    const made = () => [...fake.agents.values()].filter((a) => a.labels.run === r.id);
+    const boxes = () => [...fake.sandboxes.values()].filter((sb) => sb.labels.run === r.id);
+    expect(made()).toHaveLength(1);
+    await settle(s);
+    expect(made().filter((a) => !a.ended)).toEqual([]);
+    expect(boxes().filter((sb) => !sb.ended)).toEqual([]);
+    // Ended by its own stop, with its sandbox: destroying a sandbox alone doesn't end an agent.
+    expect(stopsOf(made()[0]!.agent).map((c) => c.body)).toEqual([expect.objectContaining({ end: true, destroy_sandbox: true })]);
+  });
+
+  it("B16: a run the owner stops while its first create's answer was lost: the agent that create made is found and ended", async () => {
+    const s = await setup();
+    const id = await create(s);
+    fake.lost.push({ match: /^POST \/v1\/agents$/, times: 1 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const r = (await runs(s, id))[0];
+    expect(r).toMatchObject({ state: "starting", agent: null });
+    expect((await api(token, "POST", `/api/projects/${s.id}/routine-runs/${r.id}/stop`)).status).toBe(200);
+    await settle(s);
+    const made = [...fake.agents.values()].filter((a) => a.labels.run === r.id);
+    expect(made).toHaveLength(1);
+    expect(made[0]!.ended).toBe(true);
+    expect(stopsOf(made[0]!.agent).map((c) => c.body)).toEqual([expect.objectContaining({ end: true, destroy_sandbox: true })]);
+    expect([...fake.sandboxes.values()].filter((sb) => sb.labels.run === r.id && !sb.ended)).toEqual([]);
+  });
+
+  it("B13: an exit delivered before its turn: the turn still counts, and the run is done", async () => {
+    const s = await setup();
+    const id = await create(s);
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const run = await liveRun(s, id);
+    await exited(run.agent);
+    await deliver({ id: eid(), type: "agent.turn_completed", agent: run.agent, turn: 1, text: "Reviewed; nothing to propose." });
+    expect((await runs(s, id))[0]).toMatchObject({ state: "ended", outcome: "done", turns: 1, summary: "Reviewed; nothing to propose.", error: null });
   });
 });
 

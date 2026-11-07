@@ -73,7 +73,7 @@ export class FakeApi {
   workflowWorkers: string[] = [];
   /** `PUT network`'s answer instead of saving: a refusal (403 with `problems`, say). */
   networkRefusal: { status: number; body: unknown } | null = null;
-  network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }] };
+  network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }], failed_stops: [] };
   openPrs: OpenPr[] = [];
   secrets: SecretsAnswer["secrets"] = [];
   grant: SecretsAnswer["grant"] = { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org"], max_count: 10, max_bytes: 4096, workflows: true, used: 0 };
@@ -194,7 +194,7 @@ export class FakeApi {
       this.notes = this.notes.filter((n) => n.key !== key);
       return json({ deleted: key });
     }
-    const route = `${m} ${parts.slice(2).map((s) => (/^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : /^rtn_/.test(s) ? ":routine" : /^run_/.test(s) ? ":run" : /^prp_/.test(s) ? ":proposal" : /^\d+$/.test(s) ? ":n" : s)).join("/")}`;
+    const route = `${m} ${parts.slice(2).map((s) => (/^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : /^rtn_/.test(s) ? ":routine" : /^run_/.test(s) ? ":run" : /^prp_/.test(s) ? ":proposal" : /^agt_/.test(s) ? ":agent" : /^\d+$/.test(s) ? ":n" : s)).join("/")}`;
     const rt = this.routines.find((x) => x.id === parts[3]);
     const t = this.tasks.find((x) => x.id === parts[3]);
     switch (route) {
@@ -222,6 +222,13 @@ export class FakeApi {
         return json(this.waits);
       case "GET network":
         return json(this.network);
+      case "POST stops/:agent/retry":
+      case "DELETE stops/:agent": {
+        const agent = parts[3]!;
+        if (!this.network.failed_stops.some((f) => f.agent === agent)) return json({ error: "no failed stop" }, 409);
+        this.network = { ...this.network, failed_stops: this.network.failed_stops.filter((f) => f.agent !== agent) };
+        return json(m === "DELETE" ? { dismissed: agent } : { agent, state: "done" });
+      }
       case "PUT network":
         if (this.networkRefusal) return json(this.networkRefusal.body, this.networkRefusal.status);
         this.network = { ...this.network, rules: body, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };

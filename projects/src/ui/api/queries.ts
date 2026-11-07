@@ -79,6 +79,18 @@ export function useRetryAttach(id: string) {
 export const useWaits = (id: string) => useQuery({ queryKey: ["projects", id, "waits"], queryFn: () => api.waits(id), refetchInterval: POLL.manager });
 
 /** The Network page: polled while changes reach the live agents. */
+/** A stop nest refused, tried again or dismissed by the owner (README.md#outboxes): the Network page and the board move. */
+function useStopWrite<R>(id: string, fn: (agent: string) => Promise<R>, failure: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: fn,
+    meta: { failure },
+    onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: ["projects", id, "network"] }), qc.invalidateQueries({ queryKey: keys.tasks(id) })]),
+  });
+}
+export const useRetryStop = (id: string) => useStopWrite(id, (agent: string) => api.retryStop(id, agent), "The stop wasn't tried again");
+export const useDismissStop = (id: string) => useStopWrite(id, (agent: string) => api.dismissStop(id, agent), "The stop wasn't dismissed");
+
 export const useNetwork = (id: string) =>
   useQuery({ queryKey: ["projects", id, "network"], queryFn: () => api.network(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.manager) });
 

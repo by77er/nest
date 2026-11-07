@@ -82,7 +82,7 @@ export class FakeNest {
   jwks: { keys: unknown[] } = { keys: [] };
   jwksFetches = 0;
   /** Failures to answer, in order, for calls whose `METHOD path` matches. */
-  failures: { match: RegExp; status: number; retryable?: boolean; times: number }[] = [];
+  failures: { match: RegExp; status: number; retryable?: boolean; times: number; page?: boolean }[] = [];
   /** Play a control plane from before the push opt-in was in the client layer (nest #157). */
   layerWithoutPush = false;
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
@@ -111,8 +111,9 @@ export class FakeNest {
     return full;
   }
 
-  fail(match: RegExp, status: number, o: { retryable?: boolean; times?: number } = {}): void {
-    this.failures.push({ match, status, retryable: o.retryable, times: o.times ?? 1 });
+  /** Answer calls matching `METHOD path` with an error: nest's JSON one, or (`page`) a page that isn't nest's (an edge's, Access's). */
+  fail(match: RegExp, status: number, o: { retryable?: boolean; times?: number; page?: boolean } = {}): void {
+    this.failures.push({ match, status, retryable: o.retryable, times: o.times ?? 1, page: o.page });
   }
 
   callsTo(method: string, path: RegExp): Call[] {
@@ -143,6 +144,7 @@ export class FakeNest {
     const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
     if (f) {
       f.times--;
+      if (f.page) return new Response("<html><body>Forbidden</body></html>", { status: f.status, headers: { "content-type": "text/html" } });
       return nestErr(f.status, f.status === 503 ? "internal" : "refused", "injected", f.retryable ?? false);
     }
     if (route !== "POST /v1/sandboxes" && route !== "POST /v1/agents") return this.route(req, u, call);
@@ -263,11 +265,11 @@ export class FakeNest {
       }
     }
     if (req.method === "DELETE" && (m = u.pathname.match(/^\/v1\/sandboxes\/(sbx_[A-Za-z0-9]+)$/))) {
-      // Destroy a sandbox (owner auth): ended, its attached agents with it.
+      // Destroy a sandbox (owner auth): ended. Its attached agents are left as they are, as nest's
+      // SandboxDO.destroy leaves them (an agent is ended only by its own stop).
       const sb = this.sandboxes.get(m[1]!);
       if (!sb || sb.owner !== CLIENT) return nestErr(404, "unknown_sandbox", "unknown sandbox");
       sb.ended = true;
-      for (const a of this.agents.values()) if (a.sandbox === sb.sandbox) a.ended = true;
       return json(200, { sandbox: sb.sandbox, state: "destroyed" });
     }
     if (r === "GET /v1/sandboxes") {
