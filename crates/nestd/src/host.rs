@@ -2531,14 +2531,21 @@ impl Inner {
     }
 
     /// Remove an agent's slot (an unknown agent is `ok`); with `kill_processes`, its whole cgroup
-    /// goes first. The gateway then refuses the agent's bindings.
+    /// goes first. The gateway refuses the agent's bindings from here on. `ok` only once the guest
+    /// confirmed the detach: until then the guest connection owes it (`GuestCtl::detach`), and a
+    /// second `agent_detach` sends it again, though the slot here is already gone.
     async fn agent_detach(self: &Arc<Self>, sandbox: &SandboxId, epoch: Epoch, agent: &AgentId, kill_processes: bool) -> CmdResult {
         let mut s = self.lock_live(sandbox, epoch).await?;
         let Some((_, listener)) = s.slots.remove(agent) else {
-            // Not ours, and not the guest connection's either (no stale slot is re-configured).
-            if let Some(g) = &s.guest {
-                g.forget_slot(agent);
+            let Some(g) = s.guest.clone() else { return Ok(Some(serde_json::json!({ "note": "not attached" }))) };
+            if g.owes_detach(agent) {
+                // An earlier detach never reached the guest: send it again.
+                drop(s);
+                g.detach(agent, kill_processes).await.map_err(|e| error(error_codes::INTERNAL, format!("guest agent_detach: {e}"), true))?;
+                return Ok(None);
             }
+            // Not ours, and not the guest connection's either (no stale slot is re-configured).
+            g.forget_slot(agent);
             return Ok(Some(serde_json::json!({ "note": "not attached" })));
         };
         s.slot_cwds.remove(agent);

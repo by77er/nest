@@ -225,6 +225,8 @@ fn fake_guest(dir: &Path, seen: Seen, latch: Option<Arc<AttachLatch>>) -> tokio:
     let _ = std::fs::remove_file(dir.join("1024.sock"));
     let listener = UnixListener::bind(dir.join("1024.sock")).unwrap();
     tokio::spawn(async move {
+        // The first detach of `agt_nodetach` is refused (a guest that couldn't take it).
+        let mut refused_a_detach = false;
         loop {
             let Ok((mut s, _)) = listener.accept().await else { break };
             let hello = ControlFrame {
@@ -255,8 +257,12 @@ fn fake_guest(dir: &Path, seen: Seen, latch: Option<Arc<AttachLatch>>) -> tokio:
                         ControlBody::AgentAttach { slot } => slot.agent_id.0.clone(),
                         _ => String::new(),
                     };
+                    let refuse_detach = !refused_a_detach && matches!(&cf.body, ControlBody::AgentDetach { agent_id, .. } if agent_id.0 == "agt_nodetach");
                     let body = if attaching == "agt_fail" {
                         ControlBody::Error { error: ErrorBody { code: "attach_failed".into(), message: "refused".into(), retryable: false } }
+                    } else if refuse_detach {
+                        refused_a_detach = true;
+                        ControlBody::Error { error: ErrorBody { code: "internal".into(), message: "detach refused".into(), retryable: true } }
                     } else if let ControlBody::Resume { .. } = cf.body {
                         // A fork's first boot: clock and entropy taken.
                         ControlBody::ResumeDone { clock_step_ms: 0 }
@@ -1700,6 +1706,31 @@ async fn a_refused_attach_leaves_no_slot_in_the_guest_configuration() {
     assert_eq!(agents, vec!["agt_bye", "agt_x"], "{slots:?}");
     let ports: std::collections::BTreeSet<u16> = slots.iter().map(|s| s.proxy_port).collect();
     assert_eq!(ports.len(), slots.len(), "two agents share a proxy port: {slots:?}");
+}
+
+/// Audit G-B3: a detach the guest didn't take is answered as a failure, never `ok`, and asked again
+/// it is sent to the guest again, though nestd's own slot went with the first: it used to answer the
+/// retry "not attached" and never send the kill. Meanwhile the gateway already refuses the agent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_detach_the_guest_refused_is_sent_again_when_asked_again() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1"), attach_cmd("cmd_attach", "sbx_1", "agt_nodetach")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_attach").await));
+    let detach = |id: &str| cmd(id, CommandBody::AgentDetach { sandbox: SandboxId("sbx_1".into()), epoch: Epoch(1), agent: AgentId("agt_nodetach".into()), kill_processes: true });
+    let detaches = || h.vm.seen.lock().unwrap().iter().filter(|b| matches!(b, ControlBody::AgentDetach { agent_id, kill_processes: true } if agent_id.0 == "agt_nodetach")).count();
+    h.fleet.commands.send(vec![detach("cmd_detach_1")]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_detach_1").await), "the guest refused it: not ok");
+    assert_eq!(detaches(), 1);
+    wait_until("the gateway refuses the agent at once", || {
+        matches!(last_gateway_word(&h.gateway, "sbx_1"), Some(GatewayCommand::SandboxUpsert { clients, .. }) if !clients.contains(&"agt_nodetach".to_string()))
+    })
+    .await;
+    h.fleet.commands.send(vec![detach("cmd_detach_2")]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_detach_2").await, CommandOutcome::Ok { detail: None }), "sent again, and taken");
+    assert_eq!(detaches(), 2, "the second detach reached the guest");
+    h.fleet.commands.send(vec![detach("cmd_detach_3")]).unwrap();
+    assert!(matches!(h.fleet.result("cmd_detach_3").await, CommandOutcome::Ok { detail: Some(_) }), "nothing owed any more: not attached");
+    assert_eq!(detaches(), 2);
 }
 
 /// nestd review #6: a suspended sandbox is not reachable through the gateway. An attach while it

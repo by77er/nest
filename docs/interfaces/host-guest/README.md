@@ -52,7 +52,7 @@ kind  := 0x00 JSON (one UTF-8 JSON object)  |  0x01 DATA (opaque bytes)
 |---|---|---|---|
 | `hello` | guest → host | first frame | `protocol_version`, `agent_version`, `boot_id`, `instance_id`, `since_boot_ms`, `capabilities` |
 | `configure` | host → guest | request | `sandbox_id`, `epoch`, `hostname`, complete `agents[]` set. Sent after every hello and on change. |
-| `agent_attach` / `agent_detach` | host → guest | request | Add or remove one `AgentSlot`. `kill_processes` → `cgroup.kill` the agent subtree. |
+| `agent_attach` / `agent_detach` | host → guest | request | Add or remove one `AgentSlot`. `kill_processes` → stop the agent's tasks and `cgroup.kill` the agent subtree. nestd sends a detach until the guest confirms it (below). |
 | `resume` | host → guest | request | After a memory restore: `wall_clock_ms`, `entropy_b64` (64 bytes), optional `fork` identity. Reply `resume_done{clock_step_ms}`, or `error`: `bad_request` when `entropy_b64` isn't 64 bytes of base64 (nothing applied), `internal` when the entropy couldn't be mixed into the RNG. |
 | `flush` (v2) | host → guest | request | `syncfs` every filesystem. Reply `ok`, or `error{sync_failed}` on a writeback error. Precedes every commit, pause and suspend ([flush before commit](../../sandbox/state/disk/#flush-before-commit)). |
 | `prepare_snapshot` | host → guest | request | `sync` (v2: the `flush` above, stopping on `sync_failed`); `drop_caches` → `echo 3 > /proc/sys/vm/drop_caches`. Reply `ok`. `fsfreeze` (a list of mounts) is deprecated: accepted and ignored, never sent by nestd (every guest defaults it). Nothing is frozen until memory snapshots are built. |
@@ -130,7 +130,8 @@ A memory snapshot keeps the guest agent it was taken with ([guest agent](../../s
 **Interrupt:**
 - A cancelled call → `cgroup.kill` on `calls/<call_id>`. **Background tasks survive** interrupts, matching Claude Code.
 - **A hangup is a cancel,** whatever caused it, a runner restart included: hands calls get no detach grace (v2 terminals do).
-- `agent_detach{kill_processes: true}` → `cgroup.kill` on the whole agent subtree, and the agent's output directory is deleted.
+- `agent_detach{kill_processes: true}` → the agent's tasks are stopped, `cgroup.kill` runs on the whole agent subtree (where the guest has cgroups), and the agent's output directory is deleted.
+- **A detach is owed until the guest confirms it** (nestd, `nestd_core::detach`). A `configure` only sets the agent table: an agent missing from it is dropped without its processes being stopped. So nestd keeps a detaching agent in every `configure` until its `agent_detach` is answered `ok`, sends every owed detach right after each `configure`, and answers the control plane's `agent_detach` `ok` only once the guest has. A kill asked once stays asked; an `agent_attach` of the same agent ends what is owed.
 
 ## Hands RPC (port 1025)
 

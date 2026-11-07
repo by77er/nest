@@ -14,6 +14,7 @@ use std::time::Duration;
 use nest_protocol::guest::framed::{FramedReader, write_json};
 use nest_protocol::guest::{AgentSlot, CliCommand, CliResult, ControlBody, ControlFrame, ForkIdentity, PORT_CONTROL, PROTOCOL_VERSION};
 use nest_protocol::model::{AgentId, Epoch, SandboxId};
+use nestd_core::detach::Detaches;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::util::{error, now_ms, random_hex};
@@ -37,8 +38,19 @@ struct Config {
     sandbox: SandboxId,
     epoch: Epoch,
     hostname: String,
+    /// What `configure` carries: every attached agent, and every agent whose detach the guest
+    /// hasn't confirmed yet (`detaches`), so a reconnect never drops one before its detach arrives.
     slots: Vec<AgentSlot>,
+    /// Detaches the guest hasn't confirmed (`nestd_core::detach`): sent after every `configure`.
+    detaches: Detaches<AgentId>,
 }
+
+/// How long a detach waits for a disconnected guest before it answers that it couldn't reach it
+/// (the connection still sends it after its next `configure`).
+#[cfg(not(test))]
+const DETACH_READY_WAIT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const DETACH_READY_WAIT: Duration = Duration::from_millis(300);
 
 struct Req {
     body: ControlBody,
@@ -61,7 +73,7 @@ pub struct GuestCtl {
 impl GuestCtl {
     /// Connect to the guest behind `uds`; every `configure` carries `slots` and those attached since.
     pub fn spawn(uds: PathBuf, sandbox: SandboxId, epoch: Epoch, hostname: String, slots: Vec<AgentSlot>, events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>) -> GuestCtl {
-        let cfg = Arc::new(Mutex::new(Config { sandbox: sandbox.clone(), epoch, hostname, slots }));
+        let cfg = Arc::new(Mutex::new(Config { sandbox: sandbox.clone(), epoch, hostname, slots, detaches: Detaches::new() }));
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = watch::channel(false);
         let ctl = GuestCtl { cfg, reqs: tx, ready: ready_rx, pending_resume: Arc::new(Mutex::new(None)), stop: Arc::new(tokio::sync::Notify::new()), guest: Arc::new(Mutex::new(None)) };
@@ -95,10 +107,12 @@ impl GuestCtl {
             .map_err(|_| io::Error::other("guest control connection dropped"))?
     }
 
-    /// Add an agent slot (persisted for reconfiguration after reconnects).
+    /// Add an agent slot (persisted for reconfiguration after reconnects). A detach still owed for
+    /// the agent is dropped: it must never kill this newer attachment.
     pub async fn attach(&self, slot: AgentSlot) -> io::Result<()> {
         {
             let mut c = self.cfg.lock().expect("guest cfg");
+            c.detaches.attached(&slot.agent_id);
             c.slots.retain(|s| s.agent_id != slot.agent_id);
             c.slots.push(slot.clone());
         }
@@ -111,12 +125,36 @@ impl GuestCtl {
         self.cfg.lock().expect("guest cfg").slots.retain(|s| &s.agent_id != agent);
     }
 
+    /// Detach an agent in the guest (stopping its tasks, and with `kill_processes` killing its
+    /// processes). Ok only once the guest confirmed it. Until then it is owed: the agent stays in
+    /// every `configure`, and the connection sends the detach after each one. A guest that isn't
+    /// connected is waited for, up to [`DETACH_READY_WAIT`]; an error says the detach didn't arrive.
     pub async fn detach(&self, agent: &AgentId, kill_processes: bool) -> io::Result<()> {
-        self.cfg.lock().expect("guest cfg").slots.retain(|s| &s.agent_id != agent);
+        self.cfg.lock().expect("guest cfg").detaches.ask(agent.clone(), kill_processes);
         if !*self.ready.borrow() {
-            return Ok(()); // the next `configure` carries the reduced slot set
+            self.wait_ready(DETACH_READY_WAIT)
+                .await
+                .map_err(|e| io::Error::new(e.kind(), format!("{e}: the detach is sent when the guest connects again")))?;
         }
-        expect_ok(self.request(ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes }).await?)
+        // The handshake that made it ready may have sent it already.
+        let Some(kill) = self.cfg.lock().expect("guest cfg").detaches.owed(agent) else { return Ok(()) };
+        expect_ok(self.request(ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes: kill }).await?)?;
+        self.detach_confirmed(agent, kill);
+        Ok(())
+    }
+
+    /// Whether a detach of `agent` is still owed to the guest (asked, not confirmed).
+    pub fn owes_detach(&self, agent: &AgentId) -> bool {
+        self.cfg.lock().expect("guest cfg").detaches.owed(agent).is_some()
+    }
+
+    /// The guest confirmed a detach of `agent` sent with `kill`: once that settles what is owed,
+    /// its slot leaves the `configure` set.
+    fn detach_confirmed(&self, agent: &AgentId, kill: bool) {
+        let mut c = self.cfg.lock().expect("guest cfg");
+        if c.detaches.confirmed(agent, kill) {
+            c.slots.retain(|s| &s.agent_id != agent);
+        }
     }
 
     /// `sync` and optionally `drop_caches`. The deprecated `fsfreeze` list stays empty, so it
@@ -253,12 +291,21 @@ impl Task {
                 });
             }
         }
+        // 3. the detaches still owed: the agents are in the configure just sent, so the guest has
+        // their tasks to stop. A refusal leaves one owed (logged); a lost connection ends this one.
+        let owed: Vec<(AgentId, bool)> = self.ctl.cfg.lock().expect("guest cfg").detaches.all().map(|(a, k)| (a.clone(), k)).collect();
+        for (agent, kill) in owed {
+            match self.call(c, ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes: kill }).await? {
+                ControlBody::Ok {} => self.ctl.detach_confirmed(&agent, kill),
+                other => tracing::warn!(sandbox = %self.sandbox, %agent, reply = ?other, "the guest refused an owed detach; it is sent again after the next configure"),
+            }
+        }
         let guest = nest_protocol::gateway::GuestInfo { protocol_version, capabilities };
         *self.ctl.guest.lock().expect("guest info") = Some(guest.clone());
         self.ready.send_replace(true);
         let _ = self.events.send((self.sandbox.clone(), GuestEvent::Ready { resumed, guest }));
 
-        // 3. steady state
+        // 4. steady state
         loop {
             tokio::select! {
                 f = c.rd.next_json() => {
@@ -384,6 +431,8 @@ pub(crate) mod tests {
     pub struct FakeGuest {
         pub seen: Arc<Mutex<Vec<ControlBody>>>,
         pub task: tokio::task::JoinHandle<()>,
+        /// The next this many `agent_detach` requests are refused.
+        pub refuse_detaches: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl FakeGuest {
@@ -392,6 +441,8 @@ pub(crate) mod tests {
             let listener = UnixListener::bind(guest_dir.join("1024.sock")).unwrap();
             let seen = Arc::new(Mutex::new(vec![]));
             let seen2 = seen.clone();
+            let refuse_detaches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let refuse = refuse_detaches.clone();
             let boot_id = boot_id.to_string();
             let task = tokio::spawn(async move {
                 loop {
@@ -416,6 +467,11 @@ pub(crate) mod tests {
                                     s.write_all(&frame::encode_json(&ports).unwrap()).await.unwrap();
                                     continue;
                                 }
+                                ControlBody::AgentDetach { .. }
+                                    if refuse.fetch_update(std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() =>
+                                {
+                                    ControlBody::Error { error: error("internal", "detach refused", true) }
+                                }
                                 _ => ControlBody::Ok {},
                             };
                             let r = ControlFrame { id: None, reply_to: cf.id, body: reply };
@@ -424,8 +480,108 @@ pub(crate) mod tests {
                     }
                 }
             });
-            FakeGuest { seen, task }
+            FakeGuest { seen, task, refuse_detaches }
         }
+    }
+
+    fn slot(agent: &str) -> AgentSlot {
+        AgentSlot { agent_id: AgentId(agent.into()), proxy_port: 3128, cwd: "/workspace".into(), env: Default::default(), memory_max_bytes: None }
+    }
+
+    fn configured_agents(seen: &[ControlBody]) -> Vec<Vec<String>> {
+        seen.iter().filter_map(|b| match b { ControlBody::Configure { agents, .. } => Some(agents.iter().map(|a| a.agent_id.0.clone()).collect()), _ => None }).collect()
+    }
+
+    fn detaches(seen: &[ControlBody]) -> Vec<(String, bool)> {
+        seen.iter().filter_map(|b| match b { ControlBody::AgentDetach { agent_id, kill_processes } => Some((agent_id.0.clone(), *kill_processes)), _ => None }).collect()
+    }
+
+    /// Audit G-B2: a detach asked while the guest isn't connected used to answer `ok` and send
+    /// nothing; the next `configure` only dropped the agent from the guest's table, so its processes
+    /// ran on. Now it is owed: the agent stays in the next `configure` (the guest still has its tasks
+    /// to stop), the kill follows it, and only the guest's confirmation lets the slot go.
+    #[tokio::test]
+    async fn a_detach_asked_while_disconnected_reaches_the_guest_when_it_connects() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest_dir = dir.path().join("guest");
+        std::fs::create_dir_all(&guest_dir).unwrap();
+        let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
+        let (etx, _erx) = mpsc::unbounded_channel();
+        let agent = AgentId("agt_1".into());
+        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_1")], etx);
+        // No guest within the wait: not ok, and still owed.
+        let e = ctl.detach(&agent, true).await.unwrap_err();
+        assert!(e.to_string().contains("sent when the guest connects again"), "{e}");
+        assert!(ctl.owes_detach(&agent));
+        // The guest comes: configured with the agent, then the kill.
+        let fake = FakeGuest::start(&guest_dir, "boot-1");
+        ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
+        let seen = fake.seen.lock().unwrap().clone();
+        assert_eq!(configured_agents(&seen), [vec!["agt_1".to_string()]], "{seen:?}");
+        assert_eq!(detaches(&seen), [("agt_1".to_string(), true)], "{seen:?}");
+        assert!(!ctl.owes_detach(&agent), "confirmed");
+        // A second detach that arrives while the guest is connecting waits for it.
+        let other = AgentId("agt_2".into());
+        ctl.cfg.lock().unwrap().slots.push(slot("agt_2"));
+        ctl.detach(&other, false).await.unwrap();
+        assert_eq!(detaches(&fake.seen.lock().unwrap()).last(), Some(&("agt_2".to_string(), false)));
+        ctl.shutdown();
+    }
+
+    /// A detach the guest refuses stays owed: the next `configure` keeps the agent and sends the
+    /// detach again; once confirmed, the agent leaves `configure`.
+    #[tokio::test]
+    async fn a_refused_detach_is_sent_again_after_the_next_configure() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest_dir = dir.path().join("guest");
+        let mut fake = FakeGuest::start(&guest_dir, "boot-1");
+        let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
+        let (etx, _erx) = mpsc::unbounded_channel();
+        let agent = AgentId("agt_1".into());
+        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_1")], etx);
+        ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
+        fake.refuse_detaches.store(1, std::sync::atomic::Ordering::SeqCst);
+        assert!(ctl.detach(&agent, true).await.is_err(), "refused: not ok");
+        assert!(ctl.owes_detach(&agent));
+        assert!(ctl.cfg.lock().unwrap().slots.iter().any(|s| s.agent_id == agent), "kept for the next configure");
+        // The guest agent restarts: the new connection configures the agent and sends the kill.
+        fake.task.abort();
+        let _ = (&mut fake.task).await;
+        std::fs::remove_file(guest_dir.join("1024.sock")).unwrap();
+        let fake = FakeGuest::start(&guest_dir, "boot-1");
+        let mut tries = 0;
+        while ctl.owes_detach(&agent) && tries < 250 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tries += 1;
+        }
+        assert!(!ctl.owes_detach(&agent), "the reconnect delivered it");
+        let seen = fake.seen.lock().unwrap().clone();
+        assert_eq!(configured_agents(&seen)[0], ["agt_1"], "{seen:?}");
+        assert_eq!(detaches(&seen), [("agt_1".to_string(), true)]);
+        assert!(ctl.cfg.lock().unwrap().slots.is_empty(), "confirmed: out of configure");
+        ctl.shutdown();
+    }
+
+    /// An attach of the same agent ends an owed detach: the newer attachment is never killed.
+    #[tokio::test]
+    async fn an_attach_ends_an_owed_detach() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest_dir = dir.path().join("guest");
+        std::fs::create_dir_all(&guest_dir).unwrap();
+        let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
+        let (etx, _erx) = mpsc::unbounded_channel();
+        let agent = AgentId("agt_1".into());
+        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_1")], etx);
+        assert!(ctl.detach(&agent, true).await.is_err());
+        let _ = ctl.attach(slot("agt_1")).await; // not connected: the request fails, the slot stays
+        assert!(!ctl.owes_detach(&agent));
+        let fake = FakeGuest::start(&guest_dir, "boot-1");
+        ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let seen = fake.seen.lock().unwrap().clone();
+        assert_eq!(configured_agents(&seen), [vec!["agt_1".to_string()]]);
+        assert!(detaches(&seen).is_empty(), "the newer attachment was killed: {seen:?}");
+        ctl.shutdown();
     }
 
     #[tokio::test]
