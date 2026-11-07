@@ -11,22 +11,25 @@
 //!   every process it starts that doesn't start a session of its own carries its session id, and
 //!   keeps it when its parent exits and init adopts it (`cmd &` in a Bash call that returns). A
 //!   member is the guest, a process in its session, or a descendant of a member ([`members`]).
-//! - **Freeze first.** [`Tree::freeze`] stops the guest, then every member (each only once its
-//!   parent has stopped, so no parent sees a child's stop as its job stopping), pass after pass, and
-//!   stops again any member that runs again (a SIGCONT from inside, a job-control SIGCONT), until a
-//!   pass finds no new member and every member is stopped: a stopped process can't fork, so the set
-//!   can only grow while some still run. It gives up after [`FREEZE_BUDGET`] with an error.
+//! - **Freeze first, parents before children.** [`Tree::freeze`] stops the guest, then members
+//!   pass after pass: each pass stops what [`stop_now`] allows (a process whose parent, if in the
+//!   tree, has already stopped, so no parent waiting with WUNTRACED sees its child's stop as its
+//!   job stopping) and stops again any that runs again, until no new member appears and every
+//!   member, every thread of it, is stopped (a stopped process can't fork). It gives up after
+//!   [`FREEZE_BUDGET`] with an error, and continues what it stopped.
 //! - **Never another process.** A pidfd is opened for each member when it is found, then its
 //!   parent or session is read, and the pidfd is kept: every later signal goes through it, so a
 //!   pid that exited and was reused is never hit, and a member whose parent exited is still
 //!   reached. (A pid reused by a new member within one freeze, which takes wraparound within a
 //!   second, could hide that member until the next freeze.)
 //! - **Resume is transparent.** [`Tree::thaw`] continues exactly the processes the freezes
-//!   stopped, children before parents; one an agent had stopped itself (`kill -STOP`, a suspended
-//!   job) stays stopped.
-//! - **Quiescence is per process, not per thread or I/O.** A process counts as stopped from its
-//!   state (that of its main thread), and one in an uninterruptible wait with SIGSTOP pending (a
-//!   write throttled on dirty pages) counts as stopped though that write may still finish. A
+//!   stopped, deepest first ([`deepest_first`]); one an agent had stopped itself (`kill -STOP`, a
+//!   suspended job) stays stopped.
+//! - **A kill goes on regardless.** It passes over a process it can't pin or stop (reported) and
+//!   keeps looking, so nothing after it in the tree escapes.
+//! - **Quiescence is per thread, not per I/O.** A process counts as stopped once every thread of
+//!   it is, and one in an uninterruptible wait with SIGSTOP pending (a write throttled on dirty
+//!   pages) counts as stopped though that write may still finish. A
 //!   commit that must not race a guest's writes needs the disk's own quiescence, which a VM's
 //!   pause gives and this driver only approximates.
 //! - **The limit:** a process that leaves both the tree and the session (a PTY's own session whose
@@ -141,15 +144,37 @@ struct Member {
     fd: OwnedFd,
 }
 
-/// Whether SIGSTOP is pending for `pid` (`/proc/<pid>/status`, `SigPnd` or `ShdPnd`): it stops
-/// the moment it leaves the kernel, so it runs no user code again.
-fn stop_pending(pid: i32) -> bool {
-    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else { return false };
+/// Whether SIGSTOP is pending in a task's `status` (`SigPnd`, or the process-wide `ShdPnd`): it
+/// stops the moment it leaves the kernel, so it runs no user code again.
+fn stop_pending(status_path: &str) -> bool {
+    let Ok(status) = std::fs::read_to_string(status_path) else { return false };
     let bit = 1u64 << (Signal::SIGSTOP as u32 - 1);
     status
         .lines()
         .filter_map(|l| l.strip_prefix("SigPnd:").or_else(|| l.strip_prefix("ShdPnd:")))
         .any(|v| u64::from_str_radix(v.trim(), 16).is_ok_and(|m| m & bit != 0))
+}
+
+/// One task's state letter, from `<dir>/stat`.
+fn task_state(dir: &str) -> Option<char> {
+    let text = std::fs::read_to_string(format!("{dir}/stat")).ok()?;
+    text.rsplit_once(')')?.1.split_whitespace().next()?.chars().next()
+}
+
+/// Whether `pid` runs no user code again, every thread of it (tests read a freeze's outcome with it).
+#[cfg(test)]
+pub(crate) fn halted_pid(pid: i32) -> bool {
+    all_threads_halted(pid)
+}
+
+/// Whether every thread of `pid` [`runs_no_more`]: a process whose main thread stopped (or
+/// exited) while another runs still runs. Gone reads as halted.
+fn all_threads_halted(pid: i32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else { return true };
+    tasks.flatten().all(|t| {
+        let dir = t.path().display().to_string();
+        task_state(&dir).is_none_or(|state| runs_no_more(state, || stop_pending(&format!("{dir}/status"))))
+    })
 }
 
 /// Whether a process in `state` runs no user code again: stopped, dead, or in an uninterruptible
@@ -159,11 +184,46 @@ pub fn runs_no_more(state: char, stop_pending: impl FnOnce() -> bool) -> bool {
     matches!(state, 'T' | 't' | 'Z' | 'X' | 'x') || (state == 'D' && stop_pending())
 }
 
+/// Which processes a freeze's pass may stop now, in order: each candidate (`members` of `root`'s
+/// tree in `table`) that isn't `halted` yet, but only once its parent has stopped, unless the
+/// parent is outside the tree (init, for an orphan). A child stopped while its parent still runs
+/// (its SIGSTOP not yet taken) would show a parent waiting with WUNTRACED its job stopping; it
+/// waits for a later pass. `halted` is a snapshot taken before the pass. Pure.
+pub fn stop_now(root: i32, table: &BTreeMap<i32, Stat>, halted: &BTreeSet<i32>) -> Vec<i32> {
+    let tree: BTreeSet<i32> = std::iter::once(root).chain(members(root, table)).collect();
+    std::iter::once(root)
+        .chain(members(root, table))
+        .filter(|p| !halted.contains(p))
+        .filter(|p| match table.get(p) {
+            Some(s) if *p != root => !tree.contains(&s.ppid) || halted.contains(&s.ppid),
+            _ => true,
+        })
+        .collect()
+}
+
+/// `pids` ordered deepest first by their parents within the set (`parent`), so a child is
+/// continued before its parent. Pure.
+pub fn deepest_first(pids: &[i32], parent: impl Fn(i32) -> Option<i32>) -> Vec<i32> {
+    let set: BTreeSet<i32> = pids.iter().copied().collect();
+    let depth = |mut p: i32| {
+        let mut d = 0usize;
+        let mut seen = BTreeSet::new();
+        while let Some(pp) = parent(p).filter(|pp| set.contains(pp) && seen.insert(*pp)) {
+            d += 1;
+            p = pp;
+        }
+        d
+    };
+    let mut out: Vec<(usize, i32)> = pids.iter().map(|&p| (depth(p), p)).collect();
+    out.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    out.into_iter().map(|(_, p)| p).collect()
+}
+
 impl Member {
     /// Gone, or [`runs_no_more`]. Checked through the pidfd first and last, so a pid reused after
     /// an exit never reads as this member.
     fn halted(&self) -> bool {
-        exited(&self.fd) || stat(self.pid).is_none_or(|s| runs_no_more(s.state, || stop_pending(self.pid))) || exited(&self.fd)
+        exited(&self.fd) || all_threads_halted(self.pid) || exited(&self.fd)
     }
 }
 
@@ -199,59 +259,75 @@ impl Tree {
             return Ok(());
         }
         let before = self.stopped.clone();
-        let r = self.freeze_keeping(budget);
+        let r = self.freeze_keeping(budget, false);
         if r.is_err() {
-            // Children first, as `thaw` does.
-            for m in self.members.iter().rev() {
-                if self.stopped.contains(&m.pid) && !before.contains(&m.pid) {
-                    let _ = send(&m.fd, Signal::SIGCONT);
-                }
-            }
+            let undo: Vec<i32> = self.stopped.difference(&before).copied().collect();
+            self.continue_(&undo);
             self.stopped = before;
         }
         r
     }
 
-    /// [`Tree::freeze`], keeping whatever it stopped when it fails (a kill follows).
-    fn freeze_keeping(&mut self, budget: Duration) -> io::Result<()> {
+    /// SIGCONT to `pids` (members), deepest first, as `thaw` does.
+    fn continue_(&self, pids: &[i32]) {
+        for p in deepest_first(pids, |p| stat(p).map(|s| s.ppid)) {
+            if let Some(m) = self.members.iter().find(|m| m.pid == p) {
+                let _ = send(&m.fd, Signal::SIGCONT);
+            }
+        }
+    }
+
+    /// [`Tree::freeze`], keeping whatever it stopped when it fails. `killing`: a kill follows, so
+    /// a process that can't be pinned or stopped is passed over (and reported) instead of ending
+    /// the discovery of what comes after it.
+    fn freeze_keeping(&mut self, budget: Duration, killing: bool) -> io::Result<()> {
         let deadline = Instant::now() + budget;
         // A member that has exited since the last freeze goes: its pid may name a newer member.
         let root = self.root;
         self.members.retain(|m| m.pid == root || !exited(&m.fd));
         self.stopped.retain(|p| *p == root || self.members.iter().any(|m| m.pid == *p));
-        let guest = &self.members[0];
-        let was_halted = guest.halted();
-        send(&guest.fd, Signal::SIGSTOP).map_err(|e| io::Error::new(e.kind(), format!("stopping the guest: {e}")))?;
-        if !was_halted {
-            self.stopped.insert(self.root);
-        }
         let mut known: BTreeSet<i32> = self.members.iter().map(|m| m.pid).collect();
+        let mut passed_over: Option<io::Error> = None;
         loop {
             let t = table();
+            let halted: BTreeSet<i32> = self.members.iter().filter(|m| m.halted()).map(|m| m.pid).collect();
+            let mut running = self.members.len() - halted.len();
+            // Pin what is new, before deciding: what a pidfd names is a member from now on.
+            let candidates: BTreeSet<i32> = members(root, &t).into_iter().collect();
             let mut found = false;
-            for pid in members(self.root, &t) {
+            for pid in members(root, &t) {
                 if known.contains(&pid) {
                     continue;
                 }
-                // Pinned first, then checked: what the pidfd names is a member now. A process
-                // that exited meanwhile (ESRCH) is no member; any other failure (out of
-                // descriptors) means a member can't be held, and the freeze fails.
                 let fd = match pidfd_open(pid) {
                     Ok(fd) => fd,
+                    // Exited meanwhile: no member.
                     Err(e) if e.raw_os_error() == Some(libc::ESRCH) => continue,
-                    Err(e) => return Err(io::Error::new(e.kind(), format!("pinning the guest's process {pid}: {e}"))),
+                    // Can't be held (out of descriptors): a freeze fails; a kill goes on without it.
+                    Err(e) => {
+                        let e = io::Error::new(e.kind(), format!("pinning the guest's process {pid}: {e}"));
+                        if !killing {
+                            return Err(e);
+                        }
+                        known.insert(pid);
+                        passed_over.get_or_insert(e);
+                        continue;
+                    }
                 };
-                let ours = |s: Stat| s.session == self.root || self.members.iter().any(|m| m.pid == s.ppid);
-                let Some(s) = stat(pid).filter(|s| ours(*s)) else { continue };
-                // A child is stopped only once its parent has: a parent still running (its
-                // SIGSTOP not yet taken) and waiting with WUNTRACED would see its child's stop as
-                // its job stopping. Left for the next pass.
-                if self.members.iter().any(|m| m.pid == s.ppid && !m.halted()) {
-                    found = true;
+                // Read again once pinned: the pid still names a process of the tree (its session,
+                // or a parent in the tree), not one that took a freed pid since the table was read.
+                let ours = |s: &Stat| s.session == root || s.ppid == root || known.contains(&s.ppid) || candidates.contains(&s.ppid);
+                if stat(pid).filter(ours).is_none() {
                     continue;
                 }
-                let m = Member { pid, fd };
-                let was_halted = matches!(s.state, 'T' | 't');
+                known.insert(pid);
+                self.members.push(Member { pid, fd });
+                found = true;
+                running += 1;
+            }
+            for pid in stop_now(root, &t, &halted) {
+                let Some(m) = self.members.iter().find(|m| m.pid == pid) else { continue };
+                let was_halted = task_state(&format!("/proc/{pid}")).is_some_and(|s| matches!(s, 'T' | 't'));
                 match send(&m.fd, Signal::SIGSTOP) {
                     Ok(()) if !was_halted => {
                         self.stopped.insert(pid);
@@ -259,64 +335,49 @@ impl Tree {
                     Ok(()) => {}
                     // A member nestd may not signal (another uid, setuid) can never be stopped.
                     Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
-                        return Err(io::Error::new(e.kind(), format!("the guest's process {pid} can't be stopped: {e}")));
+                        let e = io::Error::new(e.kind(), format!("the guest's process {pid} can't be stopped: {e}"));
+                        if !killing {
+                            return Err(e);
+                        }
+                        passed_over.get_or_insert(e);
                     }
                     Err(_) => {}
                 }
-                known.insert(pid);
-                self.members.push(m);
-                found = true;
-            }
-            // A member that runs again (a SIGCONT from inside the tree, a job-control SIGCONT) is
-            // stopped again.
-            // Parents first, and a member only once its parent (a member) has stopped, as above.
-            let mut running = 0;
-            for m in &self.members {
-                if !m.halted() {
-                    running += 1;
-                    let parent_runs = stat(m.pid).is_some_and(|s| self.members.iter().any(|p| p.pid == s.ppid && !p.halted()));
-                    if !parent_runs && send(&m.fd, Signal::SIGSTOP).is_ok() {
-                        self.stopped.insert(m.pid);
-                    }
-                }
             }
             if !found && running == 0 {
-                return Ok(());
+                return passed_over.map_or(Ok(()), Err);
             }
             if Instant::now() >= deadline {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, format!("{running} of the guest's {} processes didn't stop", self.members.len())));
+                return Err(passed_over.unwrap_or_else(|| io::Error::new(io::ErrorKind::TimedOut, format!("{running} of the guest's {} processes didn't stop", self.members.len()))));
             }
             std::thread::sleep(Duration::from_millis(2));
         }
     }
 
-    /// Continue what the freezes stopped, children before parents: the kernel tells a parent
-    /// waiting with `WUNTRACED` (an interactive shell) that its job stopped until the child itself
-    /// is continued, so a parent continued first could see its foreground job as stopped. Then
+    /// Continue what the freezes stopped, deepest first: the kernel tells a parent waiting with
+    /// `WUNTRACED` (an interactive shell) that its job stopped until the child itself is
+    /// continued, so a parent continued first could see its foreground job as stopped. Then
     /// forget the members that have exited.
     pub fn thaw(&mut self) {
         if self.dead {
             return;
         }
-        for m in self.members.iter().rev() {
-            if self.stopped.contains(&m.pid) {
-                let _ = send(&m.fd, Signal::SIGCONT);
-            }
-        }
+        let stopped: Vec<i32> = self.stopped.iter().copied().collect();
+        self.continue_(&stopped);
         self.stopped.clear();
         let root = self.root;
         self.members.retain(|m| m.pid == root || !exited(&m.fd));
     }
 
-    /// Freeze (as far as it goes, keeping what it stopped), then kill every member, parents
-    /// first, so no parent outlives the scan that found its children; then look again, and kill
-    /// what a parent that wasn't stopped started meanwhile, until nothing new is found (bounded).
-    /// The tree is dead afterwards: the caller reaps the guest.
+    /// Freeze (as far as it goes, keeping what it stopped and passing over what it can't hold),
+    /// then kill every member, parents first, so no parent outlives the scan that found its
+    /// children; then look again, and kill what a parent that wasn't stopped started meanwhile,
+    /// until nothing new is found (bounded). The tree is dead afterwards: the caller reaps the guest.
     pub fn kill(&mut self) {
         if self.dead {
             return;
         }
-        if let Err(e) = self.freeze_keeping(FREEZE_BUDGET) {
+        if let Err(e) = self.freeze_keeping(FREEZE_BUDGET, true) {
             tracing::warn!(guest = self.root, error = %e, "killing a guest's processes not all of which stopped");
         }
         let mut killed = BTreeSet::new();
@@ -332,7 +393,7 @@ impl Tree {
                 break;
             }
             // Members started since (only possible if the freeze failed) are found and pinned.
-            let _ = self.freeze_keeping(FREEZE_BUDGET);
+            let _ = self.freeze_keeping(FREEZE_BUDGET, true);
         }
         self.dead = true;
     }
@@ -435,6 +496,30 @@ mod tests {
         t.kill();
         let _ = root.0.wait();
         assert_eq!(failed, 0, "freezes failed during the vfork loop");
+    }
+
+    /// The parent-first rule over a snapshot: guest 1 (stopped) → A 2 (a member still running)
+    /// → B 3 → C 4, all in the guest's session, plus an orphan 5 (init's child, in the session)
+    /// and its child 6. Only what has no running parent in the tree may be stopped now.
+    #[test]
+    fn a_pass_stops_a_process_only_once_its_parent_has() {
+        let t = BTreeMap::from([(1, s(0, 1)), (2, s(1, 1)), (3, s(2, 1)), (4, s(3, 1)), (5, s(0, 1)), (6, s(5, 1)), (9, s(0, 9))]);
+        let halted = BTreeSet::from([1]);
+        assert_eq!(stop_now(1, &t, &halted), [2, 5], "A (its parent stopped) and the orphan (init's child); not B, C or 6 yet");
+        let halted = BTreeSet::from([1, 2, 5]);
+        assert_eq!(stop_now(1, &t, &halted), [3, 6], "a level further down each pass");
+        let halted = BTreeSet::from([1, 2, 3, 5, 6]);
+        assert_eq!(stop_now(1, &t, &halted), [4]);
+        assert_eq!(stop_now(1, &t, &BTreeSet::new()), [1, 5], "the guest first; never 9, outside the tree");
+    }
+
+    #[test]
+    fn continuing_goes_deepest_first() {
+        let parent = |p: i32| BTreeMap::from([(2, 1), (3, 2), (4, 3), (6, 5), (5, 0), (1, 0)]).get(&p).copied();
+        assert_eq!(deepest_first(&[1, 2, 3, 4, 5, 6], parent), [4, 3, 2, 6, 1, 5]);
+        assert_eq!(deepest_first(&[2, 4], parent), [2, 4], "depth counts only parents in the set");
+        let cycle = |p: i32| Some(if p == 1 { 2 } else { 1 });
+        assert_eq!(deepest_first(&[1, 2], cycle).len(), 2, "a cycle ends");
     }
 
     #[test]

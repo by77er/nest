@@ -381,7 +381,7 @@ mod tests {
         assert!(in_session(looping).len() > 3, "the loop forks");
         vm.pause().await.unwrap();
         for p in in_session(looping) {
-            assert!(matches!(state(p), Some('T' | 't')), "{p} runs on in a paused VM: {:?}", state(p));
+            assert!(crate::driver::tree::halted_pid(p), "{p} runs on in a paused VM: {:?}", state(p));
         }
         vm.stop().await.unwrap();
         let mut left = vec![];
@@ -408,7 +408,7 @@ mod tests {
         for _ in 0..5 {
             vm.pause().await.unwrap();
             for &p in &pids {
-                assert!(matches!(state(p), Some('T' | 't')), "{p} runs on in a paused VM: {:?}", state(p));
+                assert!(crate::driver::tree::halted_pid(p), "{p} runs on in a paused VM: {:?}", state(p));
             }
             vm.resume().await.unwrap();
         }
@@ -442,6 +442,32 @@ mod tests {
         assert!(!marker.exists(), "the parent saw its child stopped by a pause");
     }
 
+    /// The same two levels down, inside the guest's own session: a call (a shell) whose child
+    /// waits with WUNTRACED on a grandchild. Every level is stopped only once its parent has.
+    #[tokio::test]
+    async fn a_waiting_parent_two_levels_down_never_sees_its_child_stopped_by_a_pause() {
+        if std::process::Command::new("python3").arg("-c").arg("import os").output().map(|o| !o.status.success()).unwrap_or(true) {
+            eprintln!("NEST-TEST-SKIP: a_waiting_parent_two_levels_down_never_sees_its_child_stopped_by_a_pause: no python3");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("saw-a-stop");
+        let waiter = format!(
+            "import os, subprocess\nc = subprocess.Popen([\"sleep\", \"300\"])\nopen(\"PIDS\", \"a\").write(\"%d\\n%d\\n\" % (os.getpid(), c.pid))\nwhile True:\n    pid, st = os.waitpid(c.pid, os.WUNTRACED)\n    if os.WIFSTOPPED(st): open(\"{}\", \"w\").write(\"stopped\")\n    else: break",
+            marker.display()
+        );
+        let script = format!("sh -c 'python3 -c \"$0\"; true' '{}' & exec sleep 300", waiter.replace('\'', "'\\''"));
+        let (mut vm, pids) = guest_running(dir.path(), &script, 2).await;
+        for _ in 0..100 {
+            vm.pause().await.unwrap();
+            vm.resume().await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        vm.stop().await.unwrap();
+        assert!(all_gone(&pids).await);
+        assert!(!marker.exists(), "the parent saw its child stopped by a pause");
+    }
+
     /// A paused VM's tree is stopped, its own-session children included (they would write the disk
     /// a commit reads), by `pause` and by the lock-free pauser alike; resume continues what the
     /// pause stopped, and only that: a process the agent had stopped itself stays stopped.
@@ -451,7 +477,7 @@ mod tests {
         let script = "setsid sleep 300 & echo $! >> PIDS; sleep 300 & kill -STOP $!; echo $! >> PIDS; exec sleep 300";
         let (mut vm, pids) = guest_running(dir.path(), script, 2).await;
         let (child, stopped_by_agent) = (pids[0], pids[1]);
-        let stopped = |pid| matches!(state(pid), Some('T' | 't'));
+        let stopped = crate::driver::tree::halted_pid;
         for _ in 0..100 {
             if stopped(stopped_by_agent) {
                 break;
