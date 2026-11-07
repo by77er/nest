@@ -495,6 +495,9 @@ export const MIGRATIONS = [
     "CREATE TABLE pr_facts (pr INTEGER PRIMARY KEY, updated_at TEXT NOT NULL, closed INTEGER NOT NULL, merged INTEGER NOT NULL)",
     // The owner's PR comments already handled, by the comment's own key: a redelivery acts once (README.md#pr-comments).
     "CREATE TABLE comments_seen (key TEXT PRIMARY KEY, at_ms INTEGER NOT NULL)",
+    // When DirectoryDO was first seen listing the project ready (README.md#creating-a-project): until then
+    // nothing is drained; a project removed before it was ready leaves this object inert.
+    "ALTER TABLE settings ADD COLUMN listed_ms INTEGER",
   ],
 ] as const;
 
@@ -2967,13 +2970,16 @@ export class ProjectDO extends DurableObject<Env> {
    * is its labels: the manager this project's board, a worker its own task only. A write with a call key
    * of the caller's own is answered once: a retry gets the first answer.
    */
-  async mcpCall(server: Server, caller: AgentCaller, tool: string, args: Record<string, unknown>, callKey: string | null): Promise<{ result: string | null; error: string | null }> {
+  async mcpCall(server: Server, caller: AgentCaller, tool: string, args: Record<string, unknown>, callKey: string | null): Promise<{ result: string | null; error: string | null; forbidden?: boolean }> {
     const def = toolOf(server, tool);
     if (!def) return { result: null, error: `unknown tool ${tool}` };
     const bad = invalid(def.inputSchema, args);
     if (bad) return { result: null, error: bad };
     const s = this.settings();
     if (!s || caller.labels.project !== s.id) return { result: null, error: "unknown project" };
+    // The board is the current manager's alone (README.md#the-manager-lifecycle): one replaced (restarted,
+    // its stop owed or refused) keeps its token for a while, and its labels, but no authority.
+    if (server === "board" && caller.agent !== s.manager) return { result: null, error: "this agent isn't the project's manager", forbidden: true };
     const key = !def.readOnly && callKey && callKey.startsWith(`${caller.agent}/`) ? callKey : null;
     if (key) {
       const prior = this.sql.exec<{ result: string }>("SELECT result FROM mcp_calls WHERE key = ?", key).toArray()[0];
@@ -3163,8 +3169,32 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   override async alarm(): Promise<void> {
+    // Not listed ready (README.md#creating-a-project): a create still pending waits; one removed (it
+    // couldn't be finished) leaves this object inert, so nothing here attaches the repo or starts a manager.
+    if (this.settingsRow()) {
+      const listed = await this.listed();
+      if (listed === "gone") {
+        this.sql.exec("DELETE FROM settings");
+        return;
+      }
+      if (listed === "pending") {
+        await this.ctx.storage.setAlarm(Date.now() + LISTED_RECHECK_MS);
+        return;
+      }
+    }
     await this.drain();
     await this.arm();
+  }
+
+  /** Whether DirectoryDO lists this project as ready: asked until it says so, then remembered (`listed_ms`). */
+  private async listed(): Promise<"ready" | "pending" | "gone"> {
+    const s = this.settingsRow()!;
+    if (s.listed_ms !== null && s.listed_ms !== undefined) return "ready";
+    const row = await directory(this.env).getProject(s.id as string);
+    if (!row) return "gone";
+    if (row.state !== "ready") return "pending";
+    this.sql.exec("UPDATE settings SET listed_ms = ?", Date.now());
+    return "ready";
   }
 
   /** Do the work that is due; one run at a time (a call while one runs makes it go round once more). */
@@ -3188,6 +3218,7 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   private async drainOnce(): Promise<void> {
+    if (!this.settingsRow() || (await this.listed()) !== "ready") return;
     const s = this.settingsRow();
     if (!s) return;
     // A wait whose deadline passed times out here, in one step, unless its condition resolved it first.
@@ -3748,6 +3779,9 @@ export function issueEventOf(x: unknown): { number: number; title: string; body:
     author: typeof user.login === "string" ? user.login.slice(0, 100) : null, open: o.state !== "closed",
   };
 }
+
+/** How often a project's object asks again whether its create is finished. */
+const LISTED_RECHECK_MS = 30_000;
 
 /** How long a PR comment's key is kept, so a redelivery of it acts once. */
 const COMMENTS_SEEN_KEEP_MS = 30 * 86_400_000;

@@ -85,6 +85,8 @@ async function call(env: Env, server: Server, caller: Caller, msg: Rpc): Promise
   const r = server === "review"
     ? await review(env, id).mcpCall(caller, name, args as Record<string, unknown>, callKey)
     : await project(env, id).mcpCall(server, caller, name, args as Record<string, unknown>, callKey);
+  // Not this server's agent any more (a replaced manager): refused outright, not a tool's failure.
+  if ("forbidden" in r && r.forbidden) return new Response(null, { status: 403 });
   if (r.error !== null || r.result === null) return toolError(msg.id, r.error ?? "no result");
   return answer(msg.id, { content: [{ type: "text", text: r.result }], structuredContent: JSON.parse(r.result) });
 }

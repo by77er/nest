@@ -5,12 +5,13 @@ import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test"
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { MANAGER_RESTARTS } from "../src/manager";
-import { AccessTeam, api, deliver, deliverGithub, FakeNest, installFetch, ownerIdOf, prEvent, shaOf } from "./fake-nest";
+import { AccessTeam, agentClaims, api, callTool, deliver, deliverGithub, FakeNest, installFetch, ownerIdOf, prEvent, shaOf, Signer } from "./fake-nest";
 
 const fake = new FakeNest();
 const gh = fake.github;
 let restore: () => void;
 let token: string;
+let signer: Signer;
 
 beforeAll(async () => {
   const team = await AccessTeam.create();
@@ -18,6 +19,8 @@ beforeAll(async () => {
   restore = installFetch(fake, () => certs);
   resetAccessKeys();
   token = await team.token();
+  signer = await Signer.create("k1");
+  fake.jwks = { keys: [await signer.jwk()] };
 });
 afterAll(() => restore());
 
@@ -165,6 +168,30 @@ describe("a project whose create failed half-way (B10)", () => {
     expect((await api(token, "POST", "/api/projects", { name: "Third", repo })).status).toBe(409);
   });
 
+  it("its object does nothing while pending, and a removed project's object is left inert (no attach, no manager)", async () => {
+    const repo = `o-${rand()}/r-${rand()}`;
+    const row = await dir().createProject({ name: "Orphan", repo }, { name: "Orphan", repo });
+    const id = row.ok ? row.value.id : "";
+    // ProjectDO initialized (its alarm armed), then the create failed for good before it was marked ready.
+    const pj = env.PROJECT.get(env.PROJECT.idFromName(id));
+    await pj.init({ id, name: "Orphan", repo: repo.toLowerCase() });
+    const agents = fake.agents.size;
+    await runDurableObjectAlarm(pj);
+    await pj.drain();
+    expect(fake.agents.size).toBe(agents);
+    // Asked again later, not at once: a pending create doesn't spin its object's alarm.
+    const next = await runInDurableObject(pj, (_o, st) => st.storage.getAlarm());
+    expect(next).toBeGreaterThan(Date.now() + 10_000);
+    await runInDurableObject(dir(), (_o, st) => { st.storage.sql.exec("UPDATE projects SET next_ms = 0, attempts = 7 WHERE id = ?", id); });
+    await dir().creationFailed(id, { error: "init kept failing", permanent: false });
+    expect(await dir().getProject(id)).toBeNull();
+    await runDurableObjectAlarm(pj);
+    await pj.drain();
+    expect(fake.agents.size).toBe(agents);
+    expect(fake.github.calls.filter((c) => c.path === `/repos/${repo.toLowerCase()}/branches/main/protection`)).toEqual([]);
+    expect(await runInDurableObject(pj, (_o, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM settings").one().n)).toBe(0);
+  });
+
   it("one that can't be finished is removed by the alarm, and its repo is free again", async () => {
     const repo = `o-${rand()}/r-${rand()}`;
     const row = await dir().createProject({ name: "Broken", repo }, { name: "Broken", repo });
@@ -227,6 +254,26 @@ describe("a manager that ended (B11)", () => {
     expect((await settingsOf(p)).manager).toBeTruthy();
     expect(fake.agents.size).toBe(agents + 1);
     expect((await api(token, "GET", `/api/projects/${p.id}/manager`)).body.phase).toBe("running");
+  });
+
+  it("the board is the current manager's alone: a replaced one's calls are refused, the new one's work", async () => {
+    const p = await newProject();
+    const as = (agent: string) => signer.sign(agentClaims("board", agent, { project: p.id, role: "manager", start: "1" }));
+    const old = await as(p.manager);
+    expect((await callTool("board", old, "create_task", { title: "before" })).result?.isError).toBeFalsy();
+    await api(token, "POST", `/api/projects/${p.id}/manager/restart`);
+    const next = (await settingsOf(p)).manager as string;
+    expect(next).toBeTruthy();
+    expect(next).not.toBe(p.manager);
+    for (const [tool, args] of [["create_task", { title: "from the old one" }], ["list_tasks", {}], ["memory_write", { key: "k", text: "t" }]] as const) {
+      expect((await callTool("board", old, tool, args)).status, tool).toBe(403);
+    }
+    const r = await callTool("board", await as(next), "create_task", { title: "from the new one" });
+    expect(r.status).toBe(200);
+    expect(r.result?.isError).toBeFalsy();
+    const titles = ((await api(token, "GET", `/api/projects/${p.id}/tasks`)).body as { title: string }[]).map((t) => t.title);
+    expect(titles).toContain("from the new one");
+    expect(titles).not.toContain("from the old one");
   });
 
   it("a brief nest refuses for good (the agent ended under it) is replaced too, not retried forever", async () => {
