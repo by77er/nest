@@ -203,7 +203,7 @@ describe("the chat", () => {
     }
   });
 
-  it("a running turn shows its last four steps, the earlier ones folded above them, opening on asking", async () => {
+  it("a running turn shows its last four steps, the earlier calls folded above them, opening on asking", async () => {
     // In seq order, as nest sends them.
     const head = [ev("turn_started", { turn: "trn_b" }), ev("assistant_text", { turn: "trn_b", text: "Reading them all." })];
     const calls = Array.from({ length: 7 }, (_, i) => [
@@ -213,15 +213,35 @@ describe("the chat", () => {
     vi.stubGlobal("WebSocket", traceSocket([...head, ...calls]));
     const { user } = renderApp("/projects/prj_one/manager", new FakeApi());
     const c = await chat();
-    const fold = await within(c).findByRole("button", { name: "+4 earlier steps" });
+    // Its text stays out of the fold (what it last said), so three calls are behind it.
+    const fold = await within(c).findByRole("button", { name: "+3 earlier steps" });
     const stream = fold.closest("[data-sender=stream]") as HTMLElement;
-    // The last four calls show; the text and the first three are behind the fold.
+    // The last four calls show; the first three are behind the fold.
     const shown = () => within(stream).queryAllByRole("button", { name: /^Read f\d\.ts, done$/ }).map((b) => /^Read (\S+),/.exec(b.getAttribute("aria-label")!)![1]);
     expect(shown()).toEqual(["f3.ts", "f4.ts", "f5.ts", "f6.ts"]);
     expect(fold).toHaveAttribute("aria-expanded", "false");
     await user.click(fold);
     expect(await within(stream).findByRole("button", { name: "Read f0.ts, done" })).toBeVisible();
     expect(within(stream).getByText("Reading them all.")).toBeVisible();
+    expect(within(stream).getAllByText("Reading them all.")).toHaveLength(1);
+  });
+
+  it("folding a running turn keeps what it last said in view, and names a failure behind the fold", async () => {
+    const head = [ev("turn_started", { turn: "trn_f" }), ev("tool_call", { turn: "trn_f", call_id: "f0", name: "Bash", input: { command: "git push" } }), ev("tool_result", { turn: "trn_f", call_id: "f0", is_error: true, summary: "403" }), ev("assistant_text", { turn: "trn_f", text: "The push was refused; checking the grant." })];
+    const calls = Array.from({ length: 5 }, (_, i) => [
+      ev("tool_call", { turn: "trn_f", call_id: `g${i}`, name: "Read", input: { file_path: `g${i}.ts` } }),
+      ev("tool_result", { turn: "trn_f", call_id: `g${i}`, is_error: false, summary: "ok" }),
+    ]).flat();
+    vi.stubGlobal("WebSocket", traceSocket([...head, ...calls]));
+    renderApp("/projects/prj_one/manager", new FakeApi());
+    const c = await chat();
+    // Six steps behind four shown would fold the text too; it stays out, above the fold, and the fold says what failed.
+    const fold = await within(c).findByRole("button", { name: "+2 earlier steps · 1 failed" });
+    const stream = fold.closest("[data-sender=stream]") as HTMLElement;
+    const said = within(stream).getByText("The push was refused; checking the grant.");
+    expect(said).toBeVisible();
+    expect(said.compareDocumentPosition(fold) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(stream).getByRole("button", { name: "Bash git push, failed", hidden: true })).not.toBeVisible();
   });
 
   it("an empty chat opens at its top, not following an end there's nothing at", async () => {

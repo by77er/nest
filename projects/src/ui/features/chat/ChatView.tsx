@@ -104,11 +104,25 @@ const LIVE_SHOWN = 4;
 
 function LiveSteps({ steps, projectId }: { steps: Step[]; projectId: string }) {
   if (steps.length <= LIVE_SHOWN) return <Steps steps={steps} projectId={projectId} />;
-  const earlier = steps.slice(0, -LIVE_SHOWN);
+  const recent = steps.slice(-LIVE_SHOWN);
+  let earlier = steps.slice(0, -LIVE_SHOWN);
+  // What it last said stays in view above the fold, when the fold would take it.
+  let said: Step | null = null;
+  if (!recent.some((s) => s.kind === "text")) {
+    const i = earlier.map((s) => s.kind).lastIndexOf("text");
+    if (i >= 0) {
+      said = earlier[i]!;
+      earlier = earlier.filter((_, k) => k !== i);
+    }
+  }
+  // A failure behind the fold is named on it.
+  const failed = earlier.filter((s) => s.kind === "tool" && s.status === "error").length;
+  const label = `+${earlier.length} earlier ${earlier.length === 1 ? "step" : "steps"}${failed ? ` · ${failed} failed` : ""}`;
   return (
     <Stack gap="xs">
-      <ReplySteps steps={earlier} projectId={projectId} label={`+${earlier.length} earlier ${earlier.length === 1 ? "step" : "steps"}`} />
-      <Steps steps={steps.slice(-LIVE_SHOWN)} projectId={projectId} />
+      {said && <Steps steps={[said]} projectId={projectId} />}
+      {earlier.length > 0 && <ReplySteps steps={earlier} projectId={projectId} label={label} />}
+      <Steps steps={recent} projectId={projectId} />
     </Stack>
   );
 }
