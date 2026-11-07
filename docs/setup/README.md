@@ -16,7 +16,7 @@ What I provide, where it goes, and what each piece unlocks, in the order testing
 | AWS region | `us-east-1` | It hosts the first cell: the sandbox hosts, the brain hosts and the cell's S3 bucket. It must offer C8i instances. |
 | Monthly spend cap | $25 | Becomes an AWS Budgets alarm. Testing costs a few dollars. |
 | Dedicated AWS account | Yes | Keeps the blast radius of broad testing credentials to nest. |
-| Separate Claude token for captains | Optional | A template's `credential` names its BrokerDO setup token (`claude_oauth_token:captain` for the `captain` template, falling back to `claude_oauth_token` while unset). Needed only to verify that two setup tokens can be revoked independently. |
+| Separate Claude token for captains | Optional | A template's `credential` names its BrokerDO setup token (`claude_oauth_token:captain` for the `captain` template, falling back to `claude_oauth_token` while unset; an API client's agents never fall back). Needed only to verify that two setup tokens can be revoked independently. |
 | Domain on Cloudflare | `nest.bitcru.sh` for the control plane; every other nest hostname is a first-level label of `bitcru.sh` ending in `-nest` | Universal SSL covers them all ([hostnames](#hostnames)): the tunnel path (one hostname per sandbox host, which is how brains reach hands), previews and share links. Not for the local harness. |
 | Brain-host instance class | `t3a.medium`, then `t3.medium` (x86, because both kinds boot the one x86 host AMI) | Brains need no KVM; the class sets the cost of keeping a warm host for 30 min after its last brain ([brain hosts](../compute/brain-hosts/)). |
 
