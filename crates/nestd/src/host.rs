@@ -2474,7 +2474,7 @@ impl Inner {
             Some((slot, _)) => *slot,
             None => {
                 // A slot kept in the guest's `configure` for an owed detach still holds its port.
-                let owed = s.guest.as_ref().map(|g| g.owed_ports()).unwrap_or_default();
+                let owed = s.guest.as_ref().map(|g| g.owed_ports(agent)).unwrap_or_default();
                 let used: BTreeSet<u16> = s.slots.values().map(|(n, _)| *n).chain(owed.iter().filter_map(|p| p.checked_sub(EXPLICIT_BASE_PORT))).collect();
                 (0..MAX_AGENT_SLOTS).find(|n| !used.contains(n)).ok_or_else(|| error(error_codes::CAPACITY_EXHAUSTED, "no free agent slots", false))?
             }

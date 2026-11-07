@@ -66,11 +66,16 @@ pub struct GuestCtl {
 impl GuestCtl {
     /// Connect to the guest behind `uds`; every `configure` carries `slots` and those attached since.
     pub fn spawn(uds: PathBuf, sandbox: SandboxId, epoch: Epoch, hostname: String, slots: Vec<AgentSlot>, events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>) -> GuestCtl {
+        Self::spawn_sweeping(uds, sandbox, epoch, hostname, slots, events, OWED_SWEEP)
+    }
+
+    /// [`GuestCtl::spawn`], sending owed detaches to a connected guest every `sweep`.
+    fn spawn_sweeping(uds: PathBuf, sandbox: SandboxId, epoch: Epoch, hostname: String, slots: Vec<AgentSlot>, events: mpsc::UnboundedSender<(SandboxId, GuestEvent)>, sweep: Duration) -> GuestCtl {
         let cfg = Arc::new(Mutex::new(Config { sandbox: sandbox.clone(), epoch, hostname, slots, detaches: Detaches::new() }));
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = watch::channel(false);
         let ctl = GuestCtl { cfg, reqs: tx, ready: ready_rx, pending_resume: Arc::new(Mutex::new(None)), stop: Arc::new(tokio::sync::Notify::new()), guest: Arc::new(Mutex::new(None)) };
-        let task = Task { uds, ctl: ctl.clone(), events, ready: ready_tx, sandbox, last_identity: None };
+        let task = Task { uds, ctl: ctl.clone(), events, ready: ready_tx, sandbox, last_identity: None, sweep };
         tokio::spawn(task.run(rx));
         ctl
     }
@@ -126,21 +131,27 @@ impl GuestCtl {
         }
     }
 
-    /// The proxy ports of slots kept only for an owed detach: a new slot must not take one, or a
+    /// The proxy ports of slots kept only for an owed detach, but `attaching`'s own (its attach
+    /// sends the detach first and replaces the slot): a new slot must not take one, or a
     /// `configure` would carry two agents on one port.
-    pub fn owed_ports(&self) -> Vec<u16> {
+    pub fn owed_ports(&self, attaching: &AgentId) -> Vec<u16> {
         let c = self.cfg.lock().expect("guest cfg");
-        c.slots.iter().filter(|s| c.detaches.owed(&s.agent_id).is_some()).map(|s| s.proxy_port).collect()
+        c.slots.iter().filter(|s| &s.agent_id != attaching && c.detaches.owed(&s.agent_id).is_some()).map(|s| s.proxy_port).collect()
     }
 
-    /// Detach an agent in the guest (stopping its tasks, and with `kill_processes` killing its
-    /// processes). Ok only once the guest confirmed it. Until then it is owed: the agent stays in
+    /// Detach an agent in the guest (it leaves the guest's table; with `kill_processes` its tasks
+    /// are stopped and its processes killed). Ok only once the guest confirmed it. Until then it is owed: the agent stays in
     /// every `configure`, the connection sends the detach after each one, and an `agent_detach`
     /// asked again or an attach of the agent sends it first. A guest that isn't connected gets it
     /// on its next `configure`; this answers at once that it didn't arrive.
     pub async fn detach(&self, agent: &AgentId, kill_processes: bool) -> io::Result<()> {
-        let sent = self.cfg.lock().expect("guest cfg").detaches.ask(agent.clone(), kill_processes);
-        if !*self.ready.borrow() {
+        // Asked, and `ready` read, under the `cfg` lock: the handshake sets `ready` under it only
+        // once it has sent every ask (see `serve`).
+        let (sent, ready) = {
+            let mut c = self.cfg.lock().expect("guest cfg");
+            (c.detaches.ask(agent.clone(), kill_processes), *self.ready.borrow())
+        };
+        if !ready {
             return Err(io::Error::new(io::ErrorKind::NotConnected, "the guest is not connected: the detach is sent after its next configure"));
         }
         self.send_detach(agent, sent).await
@@ -204,6 +215,8 @@ struct Task {
     sandbox: SandboxId,
     /// `(boot_id, instance_id)` from the previous hello.
     last_identity: Option<(String, String)>,
+    /// How often owed detaches go again to a connected guest.
+    sweep: Duration,
 }
 
 type Conn = tokio::io::BufReader<tokio::net::UnixStream>;
@@ -303,21 +316,46 @@ impl Task {
         }
         // 3. the detaches still owed: the agents are in the configure just sent, so the guest has
         // their tasks to stop. A refusal leaves one owed (logged); a lost connection ends this one.
-        let owed: Vec<(AgentId, Owed)> = self.ctl.cfg.lock().expect("guest cfg").detaches.all().map(|(a, o)| (a.clone(), o)).collect();
-        for (agent, sent) in owed {
-            match self.call(c, ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes: sent.kill }).await? {
-                ControlBody::Ok {} => self.ctl.detach_confirmed(&agent, sent),
-                other => tracing::warn!(sandbox = %self.sandbox, %agent, reply = ?other, "the guest refused an owed detach; it is sent again after the next configure"),
-            }
-        }
+        // A detach asked meanwhile is sent too: ready is set under the `cfg` lock only once a pass
+        // finds no ask this handshake hasn't sent, and `detach()` asks and reads `ready` under the
+        // same lock, so every ask is either sent here or sent by `detach()` itself.
         let guest = nest_protocol::gateway::GuestInfo { protocol_version, capabilities };
         *self.ctl.guest.lock().expect("guest info") = Some(guest.clone());
-        self.ready.send_replace(true);
+        let mut sent_here: std::collections::BTreeSet<(AgentId, u64)> = std::collections::BTreeSet::new();
+        loop {
+            let unsent: Vec<(AgentId, Owed)> = {
+                let cfg = self.ctl.cfg.lock().expect("guest cfg");
+                let unsent: Vec<_> = cfg.detaches.all().filter(|(a, o)| !sent_here.contains(&((*a).clone(), o.ask))).map(|(a, o)| (a.clone(), o)).collect();
+                if unsent.is_empty() {
+                    self.ready.send_replace(true);
+                    break;
+                }
+                unsent
+            };
+            for (agent, sent) in unsent {
+                sent_here.insert((agent.clone(), sent.ask));
+                match self.call(c, ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes: sent.kill }).await? {
+                    ControlBody::Ok {} => self.ctl.detach_confirmed(&agent, sent),
+                    other => tracing::warn!(sandbox = %self.sandbox, %agent, reply = ?other, "the guest refused an owed detach; the sweep sends it again"),
+                }
+            }
+        }
         let _ = self.events.send((self.sandbox.clone(), GuestEvent::Ready { resumed, guest }));
 
-        // 4. steady state
+        // 4. steady state; every `sweep`, the detaches still owed (refused, timed out) go again.
+        let mut sweep = tokio::time::interval_at(tokio::time::Instant::now() + self.sweep, self.sweep);
         loop {
             tokio::select! {
+                _ = sweep.tick() => {
+                    let owed: Vec<(AgentId, Owed)> = self.ctl.cfg.lock().expect("guest cfg").detaches.all().map(|(a, o)| (a.clone(), o)).collect();
+                    for (agent, sent) in owed {
+                        if c.sweeps.values().any(|(a, o)| *a == agent && *o == sent) {
+                            continue; // in flight
+                        }
+                        let id = c.send(ControlBody::AgentDetach { agent_id: agent.clone(), kill_processes: sent.kill }).await?;
+                        c.sweeps.insert(id, (agent, sent));
+                    }
+                }
                 f = c.rd.next_json() => {
                     let Some(f) = f? else { return Ok(()) };
                     self.route(c, f);
@@ -346,6 +384,11 @@ impl Task {
         if let Some(r) = cf.reply_to {
             if let Some(tx) = c.pending.remove(&r) {
                 let _ = tx.send(Ok(cf.body));
+            } else if let Some((agent, sent)) = c.sweeps.remove(&r) {
+                match cf.body {
+                    ControlBody::Ok {} => self.ctl.detach_confirmed(&agent, sent),
+                    other => tracing::warn!(sandbox = %self.sandbox, %agent, reply = ?other, "the guest refused an owed detach; the sweep sends it again"),
+                }
             }
             return;
         }
@@ -387,6 +430,8 @@ impl Task {
 
 /// How long a handshake read waits for the guest.
 const HANDSHAKE_READ: Duration = Duration::from_secs(10);
+/// How often a connected guest is sent the detaches it still owes (refused, or timed out).
+const OWED_SWEEP: Duration = Duration::from_secs(10);
 
 /// One control connection: its reader, its writer, and the requests awaiting a reply.
 struct Session {
@@ -394,6 +439,8 @@ struct Session {
     wr: tokio::net::unix::OwnedWriteHalf,
     next_id: u64,
     pending: HashMap<u64, oneshot::Sender<io::Result<ControlBody>>>,
+    /// Owed detaches the steady-state sweep sent, by request id, until their replies.
+    sweeps: HashMap<u64, (AgentId, Owed)>,
     /// Where a relayed CLI command's answer goes, to be written back by the session.
     cli_tx: mpsc::UnboundedSender<(u64, CliResult)>,
 }
@@ -403,7 +450,7 @@ impl Session {
         // Any bytes buffered after the handshake line belong to the frame stream.
         let buffered = conn.buffer().to_vec();
         let (rd, wr) = conn.into_inner().into_split();
-        Session { rd: FramedReader::with_buffered(rd, &buffered), wr, next_id: 1, pending: HashMap::new(), cli_tx }
+        Session { rd: FramedReader::with_buffered(rd, &buffered), wr, next_id: 1, pending: HashMap::new(), sweeps: HashMap::new(), cli_tx }
     }
 
     /// The next control frame within `limit`; the end of the stream is an error.
@@ -443,6 +490,8 @@ pub(crate) mod tests {
         pub task: tokio::task::JoinHandle<()>,
         /// The next this many `agent_detach` requests are refused.
         pub refuse_detaches: Arc<std::sync::atomic::AtomicUsize>,
+        /// Each `agent_detach` is answered this many ms late.
+        pub detach_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl FakeGuest {
@@ -453,6 +502,8 @@ pub(crate) mod tests {
             let seen2 = seen.clone();
             let refuse_detaches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let refuse = refuse_detaches.clone();
+            let detach_delay_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let delay = detach_delay_ms.clone();
             let boot_id = boot_id.to_string();
             let task = tokio::spawn(async move {
                 loop {
@@ -467,6 +518,10 @@ pub(crate) mod tests {
                         while let Ok(Some(f)) = dec.next_frame() {
                             let cf: ControlFrame = serde_json::from_slice(&f.payload).unwrap();
                             seen2.lock().unwrap().push(cf.body.clone());
+                            if matches!(cf.body, ControlBody::AgentDetach { .. }) {
+                                let ms = delay.load(std::sync::atomic::Ordering::SeqCst);
+                                tokio::time::sleep(Duration::from_millis(ms)).await;
+                            }
                             let reply = match cf.body {
                                 ControlBody::Resume { .. } => ControlBody::ResumeDone { clock_step_ms: 0 },
                                 ControlBody::Configure { .. } => {
@@ -490,7 +545,7 @@ pub(crate) mod tests {
                     }
                 }
             });
-            FakeGuest { seen, task, refuse_detaches }
+            FakeGuest { seen, task, refuse_detaches, detach_delay_ms }
         }
     }
 
@@ -542,37 +597,62 @@ pub(crate) mod tests {
         ctl.shutdown();
     }
 
-    /// A detach the guest refuses stays owed: the next `configure` keeps the agent and sends the
-    /// detach again; once confirmed, the agent leaves `configure`.
+    /// A detach the guest refuses stays owed and the agent stays in `configure`; the connection's
+    /// sweep sends it again while the guest stays connected (no reconnect needed), and once
+    /// confirmed the agent leaves `configure`.
     #[tokio::test]
-    async fn a_refused_detach_is_sent_again_after_the_next_configure() {
+    async fn a_refused_detach_is_sent_again_while_connected() {
         let dir = tempfile::tempdir().unwrap();
         let guest_dir = dir.path().join("guest");
-        let mut fake = FakeGuest::start(&guest_dir, "boot-1");
+        let fake = FakeGuest::start(&guest_dir, "boot-1");
         let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
         let (etx, _erx) = mpsc::unbounded_channel();
         let agent = AgentId("agt_1".into());
-        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_1")], etx);
+        let ctl = GuestCtl::spawn_sweeping(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_1")], etx, Duration::from_millis(100));
         ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
-        fake.refuse_detaches.store(1, std::sync::atomic::Ordering::SeqCst);
+        fake.refuse_detaches.store(2, std::sync::atomic::Ordering::SeqCst);
         assert!(ctl.detach(&agent, true).await.is_err(), "refused: not ok");
         assert!(ctl.owes_detach(&agent));
         assert!(ctl.cfg.lock().unwrap().slots.iter().any(|s| s.agent_id == agent), "kept for the next configure");
-        // The guest agent restarts: the new connection configures the agent and sends the kill.
-        fake.task.abort();
-        let _ = (&mut fake.task).await;
-        std::fs::remove_file(guest_dir.join("1024.sock")).unwrap();
-        let fake = FakeGuest::start(&guest_dir, "boot-1");
         let mut tries = 0;
         while ctl.owes_detach(&agent) && tries < 250 {
             tokio::time::sleep(Duration::from_millis(20)).await;
             tries += 1;
         }
-        assert!(!ctl.owes_detach(&agent), "the reconnect delivered it");
+        assert!(!ctl.owes_detach(&agent), "the sweep delivered it");
         let seen = fake.seen.lock().unwrap().clone();
-        assert_eq!(configured_agents(&seen)[0], ["agt_1"], "{seen:?}");
-        assert_eq!(detaches(&seen), [("agt_1".to_string(), true)]);
+        assert_eq!(configured_agents(&seen).len(), 1, "no reconnect: {seen:?}");
+        assert_eq!(detaches(&seen), vec![("agt_1".to_string(), true); 3], "refused twice, then taken");
         assert!(ctl.cfg.lock().unwrap().slots.is_empty(), "confirmed: out of configure");
+        ctl.shutdown();
+    }
+
+    /// A detach asked while the handshake is still sending the owed ones (not ready yet) goes out
+    /// in that same handshake, before the guest is ready: it is never left for a later sweep.
+    #[tokio::test]
+    async fn a_detach_asked_during_the_handshake_is_sent_before_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let guest_dir = dir.path().join("guest");
+        std::fs::create_dir_all(&guest_dir).unwrap();
+        let emu = vsock::Emulator::start(&dir.path().join("vsock.sock"), &guest_dir).unwrap();
+        let (etx, _erx) = mpsc::unbounded_channel();
+        let (a, b) = (AgentId("agt_a".into()), AgentId("agt_b".into()));
+        let ctl = GuestCtl::spawn(emu.path.clone(), SandboxId("sbx_1".into()), Epoch(3), "sbx-1".into(), vec![slot("agt_a"), slot("agt_b")], etx);
+        assert!(ctl.detach(&a, true).await.is_err(), "not connected");
+        let fake = FakeGuest::start(&guest_dir, "boot-1");
+        fake.detach_delay_ms.store(150, std::sync::atomic::Ordering::SeqCst);
+        // Once the handshake is sending a's detach (slowly answered), b's is asked.
+        let mut tries = 0;
+        while detaches(&fake.seen.lock().unwrap()).is_empty() && tries < 250 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            tries += 1;
+        }
+        assert!(!*ctl.ready.borrow(), "still in the handshake");
+        assert!(ctl.detach(&b, false).await.is_err(), "not ready yet");
+        ctl.wait_ready(Duration::from_secs(5)).await.unwrap();
+        let seen = fake.seen.lock().unwrap().clone();
+        assert_eq!(detaches(&seen), [("agt_a".to_string(), true), ("agt_b".to_string(), false)], "b went in the handshake: {seen:?}");
+        assert!(!ctl.owes_detach(&a) && !ctl.owes_detach(&b));
         ctl.shutdown();
     }
 
