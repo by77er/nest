@@ -22,6 +22,7 @@ import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
+import { type BreakerEvent, type Breakers, breakerOpen, breakerStep, filterPlan } from "../lib/enroll-breaker";
 import { addColumn, sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
 import { retentionMode } from "../lib/retention";
 import {
@@ -36,7 +37,7 @@ import {
 } from "../protocol/model";
 import {
   type CapacityView, type FleetView, HOST_STATUSES, type HostStatus, type HostView, type ImagesView, LAUNCH_END_REASONS, type LaunchEndReason,
-  type LaunchView, type SandboxView, type TemplateView,
+  type LaunchView, type SandboxView, type TemplateView, type EnrollBreakerView,
   type HostRole as AdminHostRole, type SandboxState as AdminSandboxState, type TunnelState as AdminTunnelState,
   type AwsView, AGENT_LIFETIME_KINDS, type AgentLifetimeKind, type LifetimeAgentView, type LifetimeSandboxView, type LifetimesView,
   SANDBOX_LIFETIME_KINDS, type SandboxLifetimeKind,
@@ -182,6 +183,8 @@ interface LaunchIntent { token: string; type: string; subnet: string; spot: bool
 const launchKey = (role: HostKind) => `launch:${role}`;
 /** A kind's backoff after a launch pass where nothing had room: `{until_ms, wait_ms}`. */
 const noRoomKey = (role: HostKind) => `noroom:${role}`;
+/** A kind's enrolment breakers, by instance type (`lib/enroll-breaker.ts`). */
+const breakerKey = (role: HostKind) => `enroll_breaker:${role}`;
 /**
  * The old process's unanswered commands, and (until `dropUnreported` has run) the leases it held
  * that the new process doesn't report. An older shape is the bare array of commands.
@@ -360,6 +363,8 @@ export class FleetDO extends DurableObject<Env> {
     addColumn(this.sql, "launched", "cell", "TEXT");
     addColumn(this.sql, "launched", "reason", "TEXT");
     addColumn(this.sql, "launched", "ended_ms", "INTEGER");
+    // The instance type it was launched as (the enrolment breaker counts by type); absent on older rows.
+    addColumn(this.sql, "launched", "type", "TEXT");
     addColumn(this.sql, "hosts", "idle_since", "INTEGER");
     // The seam: where clients reach a host's sandbox gateway (docs/sandbox/gateway/).
     addColumn(this.sql, "hosts", "gateway_url", "TEXT");
@@ -515,6 +520,8 @@ export class FleetDO extends DurableObject<Env> {
     if (consume) {
       if (row.host) this.retireNeverConnected(row.host, consume.host);
       this.sql.exec("UPDATE launched SET host = ? WHERE instance_id = ?", consume.host, identity.instanceId);
+      // An enrolment of its type closes that type's breaker (in this step).
+      if (launchedAs) this.breakerEvent(launchedAs, identity.instanceId, "enrolled");
     }
     return identity.instanceId;
   }
@@ -2029,6 +2036,16 @@ export class FleetDO extends DurableObject<Env> {
     const now = Date.now();
     const plan = scaleUpPlan(s, live, pending, now);
     if (!plan.launch) return;
+    // Types whose launches keep never enrolling are skipped for their cool-down; with none left, nothing launches.
+    const breakers = this.breakers(role);
+    const allowed = filterPlan(breakers, plan.launch, now);
+    if (allowed.role_open_until_ms !== null) {
+      if (this.roleOpenLogged.get(role) === allowed.role_open_until_ms) return;
+      this.roleOpenLogged.set(role, allowed.role_open_until_ms);
+      console.error(`FleetDO: every ${role} instance type's enrolment breaker is open (launches kept ending enroll_timeout): no ${role} host is launched before ${new Date(allowed.role_open_until_ms).toISOString()}`);
+      return;
+    }
+    plan.launch = allowed.launch;
     // A pass with no room anywhere waits before the next (each waiting sandbox and brain is demand).
     const noRoom = this.noRoom(role);
     if (noRoom && now < noRoom.until_ms) return;
@@ -2053,6 +2070,31 @@ export class FleetDO extends DurableObject<Env> {
     console.warn(`FleetDO: no room for a ${role} host anywhere; the next launch pass waits ${wait / 1000} s`);
   }
 
+  /** The role-wide openings already logged (once each, not at every demand). */
+  private readonly roleOpenLogged = new Map<HostKind, number>();
+
+  /** A kind's enrolment breakers, by instance type; none stored reads as all closed. */
+  private breakers(role: HostKind): Breakers {
+    const v = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", breakerKey(role)).toArray()[0]?.value;
+    return v === undefined ? {} : (JSON.parse(v) as Breakers);
+  }
+
+  /**
+   * A launched instance enrolled, or never did (`enroll_timeout`): its type's breaker steps
+   * (`breakerStep`), written in the caller's synchronous step. An opening is the operator's to see:
+   * logged as an error, and in the fleet view. A row from before types counts for nothing.
+   */
+  private breakerEvent(role: HostKind, instanceId: string, kind: BreakerEvent["kind"]): void {
+    const type = this.sql.exec<{ type: string | null }>("SELECT type FROM launched WHERE instance_id = ?", instanceId).toArray()[0]?.type;
+    if (!type) return;
+    const step = breakerStep(this.breakers(role), { kind, type }, Date.now());
+    this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", breakerKey(role), JSON.stringify(step.next));
+    if (step.opened) {
+      console.error(`FleetDO: ${step.opened.failures} consecutive ${type} ${role} launches never enrolled (the type may lack what the host needs, e.g. KVM): no ${type} launches before ${new Date(step.opened.until_ms).toISOString()}`);
+    }
+    if (step.reset) console.log(`FleetDO: a ${type} ${role} host enrolled; its enrolment breaker is closed`);
+  }
+
   /** The kind's backoff after a pass where nothing had room (`noRoomBackoffMs`). */
   private noRoom(role: HostKind): { until_ms: number; wait_ms: number } | null {
     const v = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", noRoomKey(role)).toArray()[0]?.value;
@@ -2073,8 +2115,8 @@ export class FleetDO extends DurableObject<Env> {
         ...(role === BRAIN_ROLE ? { cpuCredits: "unlimited" as const } : {}),
       });
       this.sql.exec(
-        "INSERT OR IGNORE INTO launched (instance_id, launched_ms, role, region, cell) VALUES (?, ?, ?, ?, ?)",
-        id, a.at, roleName(role), cfg.region, this.cellName(),
+        "INSERT OR IGNORE INTO launched (instance_id, launched_ms, role, region, cell, type) VALUES (?, ?, ?, ?, ?, ?)",
+        id, a.at, roleName(role), cfg.region, this.cellName(), a.type,
       );
       this.endLaunchIntent(role, a.token);
       console.log(`FleetDO: launched ${role} host ${id} (${a.type}, ${a.spot ? "spot" : "on-demand"}, ${a.subnet})`);
@@ -2114,11 +2156,13 @@ export class FleetDO extends DurableObject<Env> {
   private async scaleDown(now: number): Promise<void> {
     const cfg = this.cellConfig();
     if (!cfg) return;
-    for (const r of this.sql.exec<{ instance_id: string }>(
-      "SELECT instance_id FROM launched WHERE host IS NULL AND reason IS NULL AND launched_ms < ?",
+    for (const r of this.sql.exec<{ instance_id: string; role: string | null }>(
+      "SELECT instance_id, role FROM launched WHERE host IS NULL AND reason IS NULL AND launched_ms < ?",
       now - cfg.enroll_timeout_ms).toArray()) {
       this.sql.exec("UPDATE launched SET reason = ? WHERE instance_id = ?", "enroll_timeout" satisfies LaunchEndReason, r.instance_id);
       console.warn(`FleetDO: ${r.instance_id} never enrolled; terminating`);
+      const kind = storedEnumOrNull(HostRole, r.role, "launched.role");
+      if (kind) this.breakerEvent(hostKind(kind), r.instance_id, "enroll_timeout");
     }
     // Enrolled but never said hello within the timeout: retired like a launch that never enrolls.
     for (const h of this.hostsBy({ status: "active", where: "last_rx IS NULL AND instance_id IS NOT NULL AND enrolled_ms < ?" }, now - cfg.enroll_timeout_ms)) {
@@ -2397,7 +2441,10 @@ export class FleetDO extends DurableObject<Env> {
         instance_id: l.instance_id, launched_ms: l.launched_ms, host: l.host,
         reason: storedEnumOrNull(LaunchEndReason, l.reason, "launched.reason"), ended_ms: l.ended_ms,
       }));
-    return { hosts, launches, sandboxes: await this.liveSandboxes(), aws: this.awsView() };
+    const now = Date.now();
+    const enroll_breakers = [SANDBOX_ROLE, BRAIN_ROLE].flatMap((role) => Object.entries(this.breakers(role))
+      .map(([type, b]): EnrollBreakerView => ({ role, type, failures: b.failures, open_until_ms: b.open_until_ms, open: breakerOpen(this.breakers(role), type, now) })));
+    return { hosts, launches, sandboxes: await this.liveSandboxes(), aws: this.awsView(), enroll_breakers };
   }
 
   /** A host's last capacity report as stored (validated when it arrived; checked again here). */

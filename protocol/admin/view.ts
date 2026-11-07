@@ -111,11 +111,25 @@ export interface SandboxView {
   info_error: boolean;
 }
 
+/**
+ * An instance type whose launches kept ending `enroll_timeout` (control-plane/src/lib/enroll-breaker.ts):
+ * `open` while no launch of it is made, until `open_until_ms`; consecutive `failures` since its last enrolment.
+ */
+export interface EnrollBreakerView {
+  role: HostRole;
+  type: string;
+  failures: number;
+  open_until_ms: number | null;
+  open: boolean;
+}
+
 export interface FleetView {
   hosts: HostView[];
   launches: LaunchView[];
   sandboxes: SandboxView[];
   aws: AwsView;
+  /** Types with enrolment failures counted (absent from a control plane before it). */
+  enroll_breakers?: EnrollBreakerView[];
 }
 
 /** lib/ec2.ts `ImageInfo`: a host AMI. `state` is EC2's image state. */

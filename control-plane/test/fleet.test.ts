@@ -642,6 +642,40 @@ describe("autoscaling", () => {
     expect(ec2.launched).toHaveLength(2);
   });
 
+  it("stops launching a type whose launches keep never enrolling, then the whole role; an enrolment closes it", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("terminated");
+    await autoscaled(cell, ec2);
+    const sbx = await createSandbox(cell, 202);
+    const view = async () => ((await fleetStub(cell).fleetView()) as { enroll_breakers?: { type: string; failures: number; open: boolean }[] }).enroll_breakers ?? [];
+    // Each launch times out without enrolling (as a type without KVM does), and the next demand launches again.
+    const failOnce = async () => {
+      await tickAt(cell, ec2, 601_000);
+      await autoscaled(cell, ec2);
+      await sandboxStub(sbx.sandbox).retryPlacement();
+    };
+    for (let i = 1; i <= 3; i++) await failOnce();
+    // Three c8i-flex launches, then its breaker is open: the next is the next type.
+    expect(ec2.launched.map((l) => l.instanceType)).toEqual(["c8i-flex.large", "c8i-flex.large", "c8i-flex.large", "c8i.large"]);
+    expect(await view()).toContainEqual(expect.objectContaining({ type: "c8i-flex.large", failures: 3, open: true }));
+    for (let i = 1; i <= 3; i++) await failOnce();
+    // Every type open: nothing more is launched, however much demand.
+    const n = ec2.launched.length;
+    await sandboxStub(sbx.sandbox).retryPlacement();
+    await sandboxStub(sbx.sandbox).retryPlacement();
+    expect(ec2.launched).toHaveLength(n);
+    expect((await view()).filter((b) => b.open).map((b) => b.type).sort()).toEqual(["c8i-flex.large", "c8i.large"]);
+    // Not "no room": the backoff for a pass where EC2 had none isn't started.
+    expect(await runInDurableObject(fleetStub(cell), (_i, state) => state.storage.sql.exec("SELECT 1 FROM kv WHERE key LIKE 'noroom:%'").toArray().length)).toBe(0);
+
+    // A c8i.large that does enroll closes its breaker.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("INSERT INTO launched (instance_id, launched_ms, role, region, cell, type) VALUES ('i-0enrolls', ?, 'sandbox', 'us-east-1', ?, 'c8i.large')", Date.now(), cell);
+    });
+    await enrollLaunched(cell, "i-0enrolls");
+    expect((await view()).map((b) => b.type)).toEqual(["c8i-flex.large"]);
+  });
+
   it("retires a launched host that enrolled but never said hello once the enroll timeout passes (B-8)", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("running");
