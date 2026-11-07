@@ -5,7 +5,7 @@
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-sending" (the owner's messages still being sent), "chat-long" (thirty messages), "chat-paged"
-// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" (agents nest refused to stop),
+// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors),
 // "chat-code" (a reply with every syntax token), "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
 // a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
@@ -327,7 +327,10 @@ const RICH = [
       ...["api.github.com", "codeload.github.com"].map((host) => ({ host, ports: [443], source: "repos" })),
     ],
     // Agents nest refused to stop (README.md#outboxes): a cancelled task's worker, a routine run's.
-    failed_stops: variant === "stops-failed" ? [
+    failed_stops: variant === "stops-long" ? [
+      { agent: "agt_w5t8q3x9z2k4m7p1", task: "tsk_demo10", task_title: "Drop the legacy XML export, the importer and every fixture that still mentions the old schema", routine: null, reason: "cancelled", error: "nest 409 conflict: the agent's host bh_3f2a is draining and the brain hasn't moved yet; ask again once it has moved to another host, or end it from the operator console. trace=0123456789abcdef0123456789abcdef0123456789abcdef", failed_ms: now - 25 * 60_000 },
+      { agent: "agt_r2m9x4", task: null, task_title: null, routine: { id: "rtn_dream", name: "Dreaming" }, reason: "routine run timed_out", error: "nest 400 invalid: destroy_sandbox isn't allowed for an agent whose sandbox is shared", failed_ms: now - 3 * 60_000 },
+    ] : variant === "stops-failed" ? [
       { agent: "agt_w5t8q3", task: "tsk_demo10", task_title: "Drop the legacy XML export", routine: null, reason: "cancelled", error: "nest 409 conflict: the agent's host is draining; ask again once it has moved", failed_ms: now - 25 * 60_000 },
       { agent: "agt_r2m9x4", task: null, task_title: null, routine: { id: "rtn_dream", name: "Dreaming" }, reason: "routine run timed_out", error: "nest 400 invalid: destroy_sandbox isn't allowed for an agent whose sandbox is shared", failed_ms: now - 3 * 60_000 },
     ] : [],

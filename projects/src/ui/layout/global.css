@@ -146,3 +146,14 @@ body {
     row-gap: calc(var(--mantine-spacing-lg) + var(--mantine-spacing-sm)) !important;
   }
 }
+
+/* A notice's text breaks a long unbroken token (an error's trace id, a URL) rather than run past its
+   edge: notices carry other systems' errors verbatim. */
+[data-ds="notice"] {
+  overflow-wrap: anywhere;
+}
+
+/* A link in a meta row (a task's title, a routine's name) keeps to the row's width, wrapping, on a phone. */
+[data-ds="meta"] a {
+  max-width: 100%;
+}
