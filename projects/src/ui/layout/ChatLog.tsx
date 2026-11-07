@@ -1,11 +1,15 @@
 // The manager chat's pieces (layout only; the feature gives the data): its log, which scrolls in itself
 // and never the page; day separators; author groups; the owner's quiet bubble and the manager's
-// unboxed prose; a message's revealed meta row; the jump pill; the turn in progress; the docked
-// composer; an arriving message's 4 px fade-and-slide (180 ms, never on load, never under reduced motion);
+// unboxed prose; a message's revealed meta row; the jump pill; the turn in progress (its steps as
+// compact rows that open, and a working line); the docked composer in its rounded box; the empty chat's
+// starters; an arriving message's 4 px fade-and-slide (180 ms, never on load, never under reduced motion);
 // and a code block's header.
 
+import { Collapse, Loader, UnstyledButton } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
-import { forwardRef, type ReactNode, useEffect, useImperativeHandle, useLayoutEffect, useRef } from "react";
+import { IconCheck, IconChevronRight, IconPlayerStopFilled, IconX } from "@tabler/icons-react";
+import { forwardRef, type ReactNode, useEffect, useId, useImperativeHandle, useLayoutEffect, useRef } from "react";
+import { icon, motion } from "../theme";
 import classes from "./ChatLog.module.css";
 
 /**
@@ -110,17 +114,29 @@ export function DaySeparator({ label }: { label: string }) {
   );
 }
 
-export function MessageGroup({ side, name, children }: { side: "owner" | "manager" | "note"; name?: ReactNode; children: ReactNode }) {
+export function MessageGroup({ side, name, avatar, children }: { side: "owner" | "manager" | "note"; name?: ReactNode; avatar?: ReactNode; children: ReactNode }) {
   return (
     <div className={classes.group} data-side={side} data-ds="message-group">
-      {name && <div className={classes.name}>{name}</div>}
+      {name && (
+        <div className={classes.name}>
+          {avatar && (
+            <span className={classes.avatar} aria-hidden>
+              {avatar}
+            </span>
+          )}
+          {name}
+        </div>
+      )}
       {children}
     </div>
   );
 }
 
-/** One message: its body, then its meta (time and actions) revealed on hover or focus. */
-export function MessageRow({ side, children, meta, appear = false, pinned = false, ...data }: { side: "owner" | "manager" | "note"; children: ReactNode; meta?: ReactNode; appear?: boolean; pinned?: boolean; [k: `data-${string}`]: string | undefined }) {
+/**
+ * One message: its body, then its meta (time and actions) revealed on hover or focus. `quiet`: not read
+ * out as it changes (a turn streaming in; its reply is announced once when it lands).
+ */
+export function MessageRow({ side, children, meta, appear = false, pinned = false, quiet = false, ...data }: { side: "owner" | "manager" | "note"; children: ReactNode; meta?: ReactNode; appear?: boolean; pinned?: boolean; quiet?: boolean; [k: `data-${string}`]: string | undefined }) {
   const cls = [classes.row, appear ? classes.appear : ""].join(" ");
   if (side === "note") {
     return (
@@ -130,7 +146,7 @@ export function MessageRow({ side, children, meta, appear = false, pinned = fals
     );
   }
   return (
-    <div className={cls} data-ds="message" {...data}>
+    <div className={cls} data-ds="message" aria-live={quiet ? "off" : undefined} {...data}>
       {side === "owner" ? <div className={classes.bubble}>{children}</div> : children}
       {meta && (
         <div className={classes.meta} data-pinned={pinned || undefined} data-slot="meta">
@@ -150,22 +166,125 @@ function JumpPill({ children }: { children: ReactNode }) {
   );
 }
 
-/** The turn's text so far; its last character is a static cursor (no blink), set inline by the feature. */
-export function StreamText({ children }: { children: ReactNode }) {
+
+/** The manager is at work and has nothing new to show yet: a quiet loading line. */
+export function WorkingLine({ children }: { children: ReactNode }) {
   return (
-    <div className={classes.cursor} data-ds="stream">
+    <div className={classes.working} data-ds="working">
+      <Loader type="dots" size="xs" color="gray" aria-hidden />
+      <span>{children}</span>
+    </div>
+  );
+}
+
+export type StepStatus = "running" | "done" | "error" | "stopped";
+
+const STATUS_LABEL: Record<StepStatus, string> = { running: "running", done: "done", error: "failed", stopped: "stopped" };
+
+function StepIcon({ status }: { status: StepStatus }) {
+  return (
+    <span className={classes.stepIcon} data-status={status} aria-hidden>
+      {status === "running" ? (
+        <Loader size={icon.sm} color="gray" />
+      ) : status === "error" ? (
+        <IconX size={icon.sm} />
+      ) : status === "stopped" ? (
+        <IconPlayerStopFilled size={icon.sm} />
+      ) : (
+        <IconCheck size={icon.sm} />
+      )}
+    </span>
+  );
+}
+
+/**
+ * One tool call of a turn: a compact row (its status, its name, its main argument) that opens onto its
+ * details. The row is a button as wide as the steps; its details are the feature's.
+ */
+export function StepRow({ name, summary, status, open, onToggle, children }: { name: string; summary: string; status: StepStatus; open: boolean; onToggle: () => void; children: ReactNode }) {
+  const id = useId();
+  return (
+    <div className={classes.step} data-ds="step" data-status={status} data-open={open || undefined}>
+      <UnstyledButton className={classes.stepRow} onClick={onToggle} aria-expanded={open} aria-controls={id} aria-label={`${name}${summary ? ` ${summary}` : ""}, ${STATUS_LABEL[status]}`}>
+        <StepIcon status={status} />
+        <span className={classes.stepName}>{name}</span>
+        {summary && <span className={classes.stepSummary}>{summary}</span>}
+        <IconChevronRight size={icon.sm} className={classes.chevron} aria-hidden />
+      </UnstyledButton>
+      <Collapse expanded={open} transitionDuration={motion.slow} transitionTimingFunction={motion.enter} id={id}>
+        <div className={classes.stepDetail} data-slot="step-detail">
+          {children}
+        </div>
+      </Collapse>
+    </div>
+  );
+}
+
+/** A step's detail: a caption over its value, verbatim in the mono family, wrapped. */
+export function StepField({ label, children, tone }: { label: string; children: ReactNode; tone?: "danger" }) {
+  return (
+    <div className={classes.field}>
+      <div className={classes.fieldLabel}>{label}</div>
+      <div className={classes.fieldValue} data-tone={tone}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** A turn's steps, one under another, tight: a group of their own. */
+export function StepList({ children, label }: { children: ReactNode; label: string }) {
+  return (
+    <div className={classes.steps} role="list" aria-label={label} data-ds="steps">
       {children}
     </div>
   );
 }
 
-/** What the turn is doing now, in the trace's terminal style: "● Reading src/worker.ts". */
-export function ActivityLine({ children }: { children: ReactNode }) {
+/** What the manager did along the way to a reply, closed ("Used 3 tools"), opening onto its steps. */
+export function StepsDisclosure({ label, open, onToggle, children }: { label: string; open: boolean; onToggle: () => void; children: ReactNode }) {
+  const id = useId();
   return (
-    <div className={classes.activity} data-ds="activity" aria-hidden>
-      <span className={classes.dot}>●</span>
-      <span>{children}</span>
+    <div className={classes.disclosure} data-ds="steps-disclosure" data-open={open || undefined}>
+      <UnstyledButton className={classes.disclosureRow} onClick={onToggle} aria-expanded={open} aria-controls={id}>
+        <span>{label}</span>
+        <IconChevronRight size={icon.sm} className={classes.chevron} aria-hidden />
+      </UnstyledButton>
+      <Collapse expanded={open} transitionDuration={motion.slow} transitionTimingFunction={motion.enter} id={id}>
+        <div className={classes.disclosureBody}>{children}</div>
+      </Collapse>
     </div>
+  );
+}
+
+/** The composer's box: the field over a bar (a hint or a note on its left, the actions on its right). */
+export function ComposerBox({ children, bar }: { children: ReactNode; bar: ReactNode }) {
+  return (
+    <div className={classes.composer} data-ds="composer">
+      {children}
+      <div className={classes.composerBar}>{bar}</div>
+    </div>
+  );
+}
+
+/** The empty chat: centred in the log, a line about the manager and its starters under it. */
+export function ChatWelcome({ title, children, starters }: { title: ReactNode; children: ReactNode; starters: ReactNode }) {
+  return (
+    <div className={classes.welcome} data-slot="empty">
+      <div className={classes.welcomeTitle}>{title}</div>
+      <div className={classes.welcomeText}>{children}</div>
+      <div className={classes.starters}>{starters}</div>
+    </div>
+  );
+}
+
+/** A starter: a suggestion that fills the composer. */
+export function Starter({ children, onClick, leftSection }: { children: ReactNode; onClick: () => void; leftSection?: ReactNode }) {
+  return (
+    <UnstyledButton className={classes.starter} onClick={onClick} data-ds="starter">
+      {leftSection}
+      <span>{children}</span>
+    </UnstyledButton>
   );
 }
 
@@ -173,13 +292,20 @@ export function ActivityLine({ children }: { children: ReactNode }) {
 export function ComposerDock({ children, pill }: { children: ReactNode; pill?: ReactNode }) {
   return (
     <div className={classes.dock} data-ds="composer-dock">
-      {pill && <JumpPill>{pill}</JumpPill>}
+      {pill && (
+        <>
+          {/* The log fades out under the pill, so it never sits on a line cut in half. */}
+          <div className={classes.fade} aria-hidden />
+          <JumpPill>{pill}</JumpPill>
+        </>
+      )}
       {children}
     </div>
   );
 }
 
-export function CodeFrame({ lang, copy, children }: { lang: string; copy: ReactNode; children: ReactNode }) {
+/** A code block's frame: its language and Copy above the code, and a footer (Show all N lines) under it. */
+export function CodeFrame({ lang, copy, footer, children }: { lang: string; copy: ReactNode; footer?: ReactNode; children: ReactNode }) {
   return (
     <div className={classes.code} data-ds="code-block">
       <div className={classes.codeHead}>
@@ -187,6 +313,7 @@ export function CodeFrame({ lang, copy, children }: { lang: string; copy: ReactN
         {copy}
       </div>
       {children}
+      {footer && <div className={classes.codeFoot}>{footer}</div>}
     </div>
   );
 }

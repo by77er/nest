@@ -157,7 +157,8 @@ describe("merging", () => {
     await closed(p, 52, false);
     t = await task(p, v.id);
     expect(t.prs).toEqual([]);
-    expect(t.state).toBe("in_review");
+    // Its worker still runs: back in progress, to open another (README.md#the-task-machine).
+    expect(t.state).toBe("in_progress");
   });
 });
 

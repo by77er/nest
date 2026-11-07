@@ -1,8 +1,9 @@
 // What the board shows for each task state: its label, its semantic color, and its column. The moves a
-// button offers come from the state machine itself (src/tasks.ts), so the page never offers one the
-// Worker refuses.
+// button offers come from the state machine itself (src/tasks.ts `step`, over the task's PRs and worker
+// as well as its state), so the page never offers one the Worker refuses.
 
-import { type TaskEvent, type TaskState, transition } from "../tasks";
+import { factsOf, step, type TaskEvent, type TaskState } from "../tasks";
+import type { Task } from "../do/project";
 import type { JobState } from "../do/review";
 import type { Role } from "./theme";
 
@@ -46,8 +47,8 @@ export const COLUMNS: readonly Column[] = [
 ];
 export const CANCELLED_COLUMN: Column = { id: "cancelled", title: "Cancelled", states: ["cancelled"] };
 
-/** Whether the owner's `event` applies to a task in `state` (the Worker's own table). */
-export const can = (state: TaskState, event: TaskEvent) => transition(state, event).ok;
+/** Whether the owner's `event` applies to a task (the Worker's own machine). */
+export const can = (task: Pick<Task, "state" | "prs" | "worker_live">, event: TaskEvent) => step(factsOf(task), event).ok;
 
 /** A review job's state (src/do/review.ts) as the Reviews page shows it; a done job by its verdict. */
 export const REVIEW_STATE: Record<JobState, { label: string; color: Role }> = {

@@ -27,8 +27,11 @@ const px = (v: string) => {
 const kebab = (n: string) => n.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
 
 // --- the skill's tables ---
+// The color table only (its rows up to the blank line after it): the syntax table below it is the
+// projects app's code blocks', and this page shows no code.
+const colorTable = skill.slice(skill.indexOf("| Role |")).split("\n\n")[0]!;
 const colorRows = Object.fromEntries(
-  [...skill.matchAll(/^\| ([\w-]+) \| `(#[0-9a-f]{6})`[^|]*\| `(#[0-9a-f]{6})`[^|]*\|/gm)].map((m) => [m[1]!, { light: m[2]!, dark: m[3]! }]),
+  [...colorTable.matchAll(/^\| ([\w-]+) \| `(#[0-9a-f]{6})`[^|]*\| `(#[0-9a-f]{6})`[^|]*\|/gm)].map((m) => [m[1]!, { light: m[2]!, dark: m[3]! }]),
 );
 const typeRows = Object.fromEntries(
   [...skill.matchAll(/^\| ([\w-]+) \| (\d+)\/(\d+)(?:, (\d+))? \|/gm)].map((m) => [m[1]!, { size: Number(m[2]), lh: Number(m[3]), weight: m[4] }]),

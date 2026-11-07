@@ -182,7 +182,8 @@ describe("the manager's waits", () => {
     const { user } = renderApp("/projects/prj_one/manager", api);
     await user.click(await screen.findByRole("button", { name: "About the manager" }));
     const list = await screen.findByRole("list", { name: "The manager's waits" });
-    expect(list).toHaveTextContent(/^Add search by tag to be In review or Done · (59|60) min left$/);
+    // The waits can arrive before the board (the chat asks for them too): the title follows the board.
+    await waitFor(() => expect(list).toHaveTextContent(/^Add search by tag to be In review or Done · (59|60) min left$/));
     expect(within(list).getByRole("link", { name: "Add search by tag" })).toHaveAttribute("href", expect.stringContaining(`task=${t.id}`));
     const done = screen.getByRole("list", { name: "The manager's resolved waits" });
     expect(within(done).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["#118 merged · met 3 minutes ago", "The owner's reply · timed out 10 minutes ago"]);

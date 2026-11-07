@@ -103,7 +103,10 @@ describe("routing nest's events", () => {
   it("leaves a task in review alone when its worker exits", async () => {
     const w = await projectWithWorker();
     const stub = env.PROJECT.get(env.PROJECT.idFromName(w.project));
-    await runInDurableObject(stub, (_o, st) => { st.storage.sql.exec("UPDATE tasks SET state = 'in_review', pr = 7 WHERE id = ?", w.task); });
+    await runInDurableObject(stub, (_o, st) => {
+      st.storage.sql.exec("UPDATE tasks SET state = 'in_review', pr = 7 WHERE id = ?", w.task);
+      st.storage.sql.exec("INSERT INTO task_prs (pr, task, state, attached_by, attached_ms) VALUES (7, ?, 'open', ?, 0)", w.task, w.worker);
+    });
     await deliver({ id: eid(), type: "agent.exited", agent: w.worker, reason: "done" });
     expect((await task(w.project, w.task)).state).toBe("in_review");
   });

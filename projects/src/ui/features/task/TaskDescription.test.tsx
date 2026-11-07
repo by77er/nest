@@ -51,7 +51,8 @@ describe("a task's description", () => {
     expect(within(view).getByText("Pin the driver").closest("ol")).not.toBeNull();
     expect(within(view).getByText("staging first").closest("ul")).not.toBeNull();
     expect(view.querySelectorAll("[data-task-check]")).toHaveLength(2);
-    expect(within(view).getByText("createClient({ tls: true });").closest("pre")).not.toBeNull();
+    // Highlighted (its tokens are spans), as in the chat.
+    expect(view.querySelector("pre code")).toHaveTextContent("createClient({ tls: true });");
     const link = within(view).getByRole("link", { name: "the runbook" });
     expect(link).toHaveAttribute("href", "https://example.com/runbook");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");

@@ -5,58 +5,149 @@ export const TASK_STATES = ["draft", "ready", "assigned", "in_progress", "in_rev
 export type TaskState = (typeof TASK_STATES)[number];
 
 /**
- * What can happen to a task:
+ * What can happen to a task (README.md#the-task-machine). Each moves its state, its worker and its queued
+ * inputs together, through `step`:
  * - `spec`: the manager wrote its spec (a draft becomes ready; a ready one, or one with a live worker,
  *   is re-specced, and that worker is told);
- * - `assign`: by the owner, the manager or auto-assign; a worker is to be started for it;
- * - `started`: its worker exists and has its first input;
+ * - `assign`: by the owner, the manager or auto-assign; a worker is owed (started from the alarm);
+ * - `started`: its worker exists and has its brief; the comments queued for it follow;
  * - `start_failed`: nest refused the worker for good (a stalled task is reassigned by hand);
- * - `pr_opened`: its worker reported its PR;
- * - `worker_exited`: its worker ended (nest's `agent.exited`);
- * - `merged`: the last of its attached PRs merged (GitHub's event; README.md#prs), from any state not
- *   over: a PR may be attached to a task with no worker;
- * - `done`: the owner marked it done: only a task with no PR and no live worker (a draft, a ready task,
- *   a stalled one). A task with an open PR is done when it merges (`merged`); one with a worker is
- *   cancelled instead;
+ * - `start_abandoned`: a start in flight is begun again (a setting it was frozen with changed);
+ * - `worker_exited`: its worker ended (nest's `agent.exited`, or a stop the app owed went through);
+ * - `pr_attached`: a PR was attached (its worker's report, its branch, the owner's or the manager's);
+ * - `pr_merged`: one of its open attached PRs merged; the last one makes it done;
+ * - `pr_detached`: one of its open attached PRs closed without merging, or was detached;
+ * - `done`: the owner marked it done: only a task with no open PR and no live worker;
  * - `cancel`: the owner or the manager cancelled it; its worker is stopped;
- * - `revise`: the owner commented on its open PR while no worker runs for it (README.md#pr-comments): a
- *   worker is started again, the comment its first input after its brief.
+ * - `revise`: the owner commented on its PR while no worker runs for it (README.md#pr-comments): a
+ *   worker is started again, the comment its first input after its brief;
+ * - `input_queued`: the owner commented on its PR while its worker is starting: the comment waits for
+ *   the brief.
  */
-export const TASK_EVENTS = ["spec", "assign", "started", "start_failed", "pr_opened", "worker_exited", "merged", "done", "cancel", "revise"] as const;
+export const TASK_EVENTS = [
+  "spec", "assign", "started", "start_failed", "start_abandoned", "worker_exited", "pr_attached", "pr_merged", "pr_detached", "done", "cancel", "revise", "input_queued",
+] as const;
 export type TaskEvent = (typeof TASK_EVENTS)[number];
 
 export const TERMINAL: ReadonlySet<TaskState> = new Set(["done", "cancelled"]);
 
-/** The states each event moves from, and where to. Anything not listed is refused. */
-const MOVES: Record<TaskEvent, Partial<Record<TaskState, TaskState>>> = {
-  // A task with a live worker may be re-specced too: its worker is told (README.md#task-changes).
-  spec: { draft: "ready", ready: "ready", assigned: "assigned", in_progress: "in_progress", in_review: "in_review" },
-  assign: { ready: "assigned", stalled: "assigned" },
-  started: { assigned: "in_progress" },
-  start_failed: { assigned: "stalled" },
-  pr_opened: { in_progress: "in_review", in_review: "in_review" },
-  worker_exited: { assigned: "stalled", in_progress: "stalled" },
-  merged: { draft: "done", ready: "done", assigned: "done", in_progress: "done", in_review: "done", stalled: "done" },
-  done: { draft: "done", ready: "done", stalled: "done" },
-  cancel: { draft: "cancelled", ready: "cancelled", assigned: "cancelled", in_progress: "cancelled", in_review: "cancelled", stalled: "cancelled" },
-  revise: { ready: "assigned", in_review: "assigned", stalled: "assigned" },
-};
+/**
+ * The facts about a task the machine moves together. `workerLive`: a worker of its own is starting or
+ * running (one the app is stopping, for a task that's over, isn't its own any more). `startOwed`: that
+ * worker hasn't had its brief yet. `queuedInputs`: the owner's comments waiting for that brief.
+ */
+export interface TaskFacts {
+  state: TaskState;
+  openPrs: number;
+  mergedPrs: number;
+  workerLive: boolean;
+  startOwed: boolean;
+  queuedInputs: number;
+}
 
-export type Transition = { ok: true; to: TaskState } | { ok: false; error: string };
+/**
+ * What a step does besides the state, for ProjectDO to write in the same step:
+ * - `worker`: `start` owes a new start (a new generation of its worker); `started` ends the start;
+ *   `failed` ends it with no worker; `exited` frees the worker's place; `stop` owes a stop of whatever
+ *   worker it had;
+ * - `inputs`: `queue` keeps the comment for the brief; `flush` sends the queued ones after it; `drop`
+ *   drops them (recorded);
+ * - `record`: the history action for the task's move, or null when the step moves nothing worth a line
+ *   of its own (the caller records the PR's event).
+ */
+export interface StepEffects {
+  worker: "start" | "started" | "failed" | "exited" | "stop" | null;
+  inputs: "queue" | "flush" | "drop" | null;
+  record: string | null;
+}
 
-/** Why the owner can't mark a task done where the reason isn't obvious from its state's name. */
-const NOT_DONE: Partial<Record<TaskState, string>> = {
-  in_review: "its PR is open: the task is done when the PR merges",
-  assigned: "its worker is running: cancel the task instead",
-  in_progress: "its worker is running: cancel the task instead",
-};
+export type Step = { ok: true; to: TaskState; facts: TaskFacts; effects: StepEffects } | { ok: false; error: string };
 
-/** Where `event` takes a task in `from`, or why it can't. */
-export function transition(from: TaskState, event: TaskEvent): Transition {
-  const to = MOVES[event][from];
-  if (to) return { ok: true, to };
-  const why = event === "done" ? NOT_DONE[from] : undefined;
-  return { ok: false, error: `a ${from.replace("_", " ")} task can't take ${event.replace("_", " ")}${why ? `: ${why}` : ""}` };
+const label = (s: TaskState) => s.replace("_", " ");
+const refuse = (f: TaskFacts, event: TaskEvent, why?: string): Step => ({ ok: false, error: `a ${label(f.state)} task can't take ${event.replace("_", " ")}${why ? `: ${why}` : ""}` });
+const go = (f: TaskFacts, to: TaskState, change: Partial<TaskFacts>, effects: Partial<StepEffects>): Step => ({
+  ok: true, to, facts: { ...f, ...change, state: to }, effects: { worker: null, inputs: null, record: null, ...effects },
+});
+const among = (s: TaskState, ...states: TaskState[]) => states.includes(s);
+
+/**
+ * The one machine (README.md#the-task-machine): where `event` takes a task, and what moves with it, or
+ * why it can't. Pure; ProjectDO applies it and nothing else writes a task's state, worker or queued inputs.
+ * Its invariants (test/machine.test.ts walks it at random): a task that's `done` has no open PR and no
+ * worker of its own; `in_review` has an open PR or a live worker; `stalled` has no live worker; queued
+ * inputs exist only while a start is owed; a live worker only in `assigned`, `in_progress`, `in_review`.
+ */
+export function step(f: TaskFacts, event: TaskEvent): Step {
+  const s = f.state;
+  const over = TERMINAL.has(s);
+  // A worker of its own that's being stopped for good also takes its queued inputs with it.
+  const ending = { worker: "stop" as const, inputs: f.queuedInputs > 0 ? ("drop" as const) : null };
+  const workerGone = { workerLive: false, startOwed: false, queuedInputs: 0 };
+  switch (event) {
+    case "spec":
+      if (s === "draft") return go(f, "ready", {}, { record: "spec" });
+      if (among(s, "ready", "assigned", "in_progress", "in_review")) return go(f, s, {}, { record: "spec" });
+      return refuse(f, event);
+    case "assign":
+      if (!among(s, "ready", "stalled") || f.workerLive) return refuse(f, event);
+      return go(f, "assigned", { workerLive: true, startOwed: true, queuedInputs: 0 }, { worker: "start", record: "assign" });
+    case "started":
+      if (s !== "assigned" || !f.startOwed) return refuse(f, event);
+      // A task that holds an open PR (attached while it waited, or the one a comment revised) is in review.
+      return go(f, f.openPrs > 0 ? "in_review" : "in_progress", { startOwed: false, queuedInputs: 0 }, { worker: "started", inputs: "flush", record: "started" });
+    case "start_failed":
+      if (s !== "assigned") return refuse(f, event);
+      return go(f, "stalled", workerGone, { worker: "failed", inputs: f.queuedInputs > 0 ? "drop" : null, record: "start_failed" });
+    case "start_abandoned":
+      if (s !== "assigned" || !f.startOwed) return refuse(f, event);
+      return go(f, "assigned", {}, { worker: "start", record: null });
+    case "worker_exited": {
+      // Not its own any more (being stopped, or already gone): only its place frees.
+      if (!f.workerLive) return go(f, s, {}, { worker: "exited" });
+      const inputs = f.queuedInputs > 0 ? ("drop" as const) : null;
+      // An open PR keeps it in review: it's done when the PR merges, or revised by a comment.
+      if (s === "in_review" && f.openPrs > 0) return go(f, s, workerGone, { worker: "exited", inputs });
+      return go(f, "stalled", workerGone, { worker: "exited", inputs, record: "worker_exited" });
+    }
+    case "pr_attached":
+      if (over) return refuse(f, event, "a task that's over takes no PR");
+      if (s === "in_progress") return go(f, "in_review", { openPrs: f.openPrs + 1 }, { record: "pr_opened" });
+      return go(f, s, { openPrs: f.openPrs + 1 }, { record: "pr_attached" });
+    case "pr_merged":
+    case "pr_detached": {
+      if (f.openPrs === 0) return refuse(f, event, "it has no open PR");
+      const merged = f.mergedPrs + (event === "pr_merged" ? 1 : 0);
+      const change = { openPrs: f.openPrs - 1, mergedPrs: merged };
+      if (over || f.openPrs > 1) return go(f, s, change, {});
+      // The last open one: done if any merged (README.md#prs), else out of review.
+      if (merged > 0) return go(f, "done", { ...change, ...workerGone }, { ...ending, record: "merged" });
+      if (s === "in_review") return go(f, f.workerLive ? "in_progress" : "stalled", change, { record: "review_ended" });
+      return go(f, s, change, {});
+    }
+    case "done":
+      if (f.openPrs > 0) return refuse(f, event, "its PR is open: the task is done when it merges (or detach it first)");
+      if (f.workerLive) return refuse(f, event, "its worker is running: cancel the task instead");
+      if (!among(s, "draft", "ready", "stalled")) return refuse(f, event);
+      return go(f, "done", workerGone, { ...ending, record: "done" });
+    case "cancel":
+      if (over) return refuse(f, event);
+      return go(f, "cancelled", workerGone, { ...ending, record: "cancel" });
+    case "revise":
+      if (f.workerLive) return refuse(f, event, "its worker is running: the comment goes to it");
+      if (!among(s, "ready", "in_review", "stalled")) return refuse(f, event);
+      return go(f, "assigned", { workerLive: true, startOwed: true, queuedInputs: 1 }, { worker: "start", inputs: "queue", record: "revise" });
+    case "input_queued":
+      if (!f.startOwed) return refuse(f, event, "no worker is starting for it");
+      return go(f, s, { queuedInputs: f.queuedInputs + 1 }, { inputs: "queue" });
+  }
+}
+
+/** The facts of a task as the API shows it (the UI's view): its queued inputs aren't shown, and don't matter to the owner's moves. */
+export function factsOf(t: { state: TaskState; prs: readonly { state: "open" | "merged" }[]; worker_live: boolean }): TaskFacts {
+  return {
+    state: t.state, openPrs: t.prs.filter((p) => p.state === "open").length, mergedPrs: t.prs.filter((p) => p.state === "merged").length,
+    workerLive: t.worker_live, startOwed: t.worker_live && t.state === "assigned", queuedInputs: 0,
+  };
 }
 
 /** States in which a task's worker, if it has one, is expected to be running. */

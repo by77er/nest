@@ -260,6 +260,9 @@ def configure_host():
         "enrollment": {"type": "token_file", "path": os.path.join(WORK, "enroll.token")},
         "run_dir": os.path.join(WORK, "run"), "state_dir": os.path.join(WORK, "state"),
         "driver": {"type": "process", "guest_command": guest},
+        # The process driver runs the guest with nestd's privileges: development and e2e only, so
+        # nestd refuses it unless asked (a cell host runs Firecracker under the jailer).
+        "unconfined_driver": True,
         "network": {"type": "netns", "persist_dir": os.path.join(WORK, "netns")},
         "gateway_url": GW_URL,
         # As on a host: only the gateway's uid on gateway.sock, and its group owns that socket and

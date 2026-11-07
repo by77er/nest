@@ -14,7 +14,7 @@ import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
 import { canonicalRepos, Repo } from "../lib/repos";
 import type { GithubPermissions } from "../lib/brokered";
 import { canonicalJson } from "../lib/sinks";
-import { Credential } from "../protocol/control";
+import { credentialFor, type CredentialPrincipal } from "../lib/credentials";
 import { BINDING_VERSION, type BindingClaims, type BindingKey } from "../protocol/gateway";
 import { ErrorCodes, type InjectionSecret } from "../protocol/model";
 import {
@@ -200,19 +200,23 @@ export class BrokerDO extends DurableObject<Env> {
   }
 
   /**
-   * Reference to the `claude setup-token` OAuth token an agent's spec names (`credential`):
-   * `claude_oauth_token:<name>`, falling back to `claude_oauth_token` while the named one isn't
-   * configured. Only those names: the value is sent to a brain host, so a credential naming any
-   * other secret is refused. Other objects store and pass the reference ({@link SECRET_REF_PREFIX});
+   * Reference to the `claude setup-token` OAuth token an agent's spec names (`credential`), as
+   * `credentialFor` decides it: for the operator's agents the named one, else `claude_oauth_token`;
+   * for an API client's agent (`principal`, with its grant's `credentials` as they are now) exactly the
+   * named one, or a refusal. Only those names: the value is sent to a brain host, so a credential naming
+   * any other secret is refused. Other objects store and pass the reference ({@link SECRET_REF_PREFIX});
    * FleetDO resolves it only when it sends `agent_start`, so no copy of the value is kept elsewhere.
+   * Without `principal` (a caller of the previous release) it decides for the operator. Every caller
+   * of this release (AgentDO's `startCredential`) passes the principal for a client's agent, so the
+   * operator's branch, with its fallback, is never reached for one; AgentDO also refuses any reference
+   * but the spec's own for a client's agent.
    */
-  async credentialRef(credential: string): Promise<string> {
-    if (!Credential.safeParse(credential).success) {
-      throw new NestError(ErrorCodes.FORBIDDEN, `${credential} is not a Claude setup token credential`, 403);
-    }
-    const name = this.secret(credential) ? credential : "claude_oauth_token";
-    if (!this.secret(name)) throw new NestError(ErrorCodes.FORBIDDEN, `no Claude setup token configured for ${credential}`, 409);
-    return secretRef(name);
+  async credentialRef(credential: string, principal?: { client: string; credentials: string[] | null }): Promise<string> {
+    const who: CredentialPrincipal = principal ? { kind: "client", client: principal.client } : { kind: "operator" };
+    const grant = principal ? (principal.credentials ? { credentials: principal.credentials } : null) : null;
+    const c = credentialFor(who, credential, grant, (name) => this.secret(name) !== undefined);
+    if (!c.ok) throw new NestError(ErrorCodes.FORBIDDEN, c.message, c.reason === "not_a_credential" ? 403 : 409);
+    return secretRef(c.name);
   }
 
   /**
