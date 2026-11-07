@@ -30,6 +30,8 @@ ADMIN = os.environ.get("NEST_ADMIN_TOKEN", "")
 MARKS = {
     "store": re.compile(r"sandbox state on the instance store at \S+ \(XFS, reflink\)"),
     "store_fallback": re.compile(r"the instance store isn't usable|no instance store: sandbox state stays on the root volume"),
+    # No /dev/kvm, firecracker or jailer: the sandbox role is refused and the instance shuts down.
+    "refused_sandbox_role": re.compile(r"refusing the sandbox role"),
     # cloud-init didn't run the user data (it couldn't read it: gzip not unpacked, say) or it failed.
     "user_data_failed": re.compile(r"Failed to run module scripts[_-]user|scripts-user.*fail|Unhandled non-multipart|Unhandled unknown content-type", re.I),
     "cloud_init_done": re.compile(r"Cloud-init v\. \S+ finished"),

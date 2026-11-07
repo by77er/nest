@@ -46,12 +46,15 @@ EOF
 fi
 
 # A sandbox host runs its sandboxes in Firecracker under the jailer, or not at all. Without /dev/kvm
-# (nested virtualization) or without firecracker in the release, it refuses the sandbox role: it
-# writes no config, enables nothing and never enrolls, and FleetDO's enroll timeout ends the
-# instance. There is no fallback: the process driver runs every guest, and agents' Bash with it,
-# as root on the host. It is for development and e2e only, and nestd refuses it on a cell host.
-if [ ! -e /dev/kvm ] || [ ! -x /opt/nest/bin/firecracker ]; then
-  echo "refusing the sandbox role: no /dev/kvm (nested virtualization) or no firecracker in the release; this host enables nothing and never enrolls" >&2
+# (nested virtualization) or without firecracker and the jailer in the release, it refuses the
+# sandbox role: it writes no config, enables nothing, never enrolls, and shuts down (the launch
+# template terminates on shutdown; FleetDO's enroll timeout ends the launch either way). There is
+# no fallback: the process driver runs every guest, and agents' Bash with it, as root on the host.
+# It is for development and e2e only, and nestd refuses it unless its config opts in.
+modprobe kvm_intel 2>/dev/null || modprobe kvm_amd 2>/dev/null || true
+if [ ! -e /dev/kvm ] || [ ! -x /opt/nest/bin/firecracker ] || [ ! -x /opt/nest/bin/jailer ]; then
+  echo "refusing the sandbox role: no /dev/kvm (nested virtualization), or no firecracker or jailer in the release; this host enables nothing, never enrolls, and shuts down" >&2
+  shutdown -h now || true
   exit 1
 fi
 

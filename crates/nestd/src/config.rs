@@ -27,6 +27,11 @@ pub struct Config {
     /// How sandboxes run: required on a sandbox host, refused on a brain host.
     #[serde(default)]
     pub driver: Option<DriverConfig>,
+    /// Development and the e2e harness only: allow a driver that runs guests with nestd's own
+    /// privileges (the process driver, Firecracker without the jailer). A host enrolling any way
+    /// but `static` refuses one without this ([`unconfined_driver_refusal`]); no cell host sets it.
+    #[serde(default)]
+    pub unconfined_driver: bool,
     #[serde(default)]
     pub network: NetworkConfig,
     /// Event batch flush interval (spec: 1–2 s).
@@ -289,7 +294,7 @@ impl Config {
         match self.role {
             HostRole::Sandbox => {
                 let Some(driver) = &self.driver else { anyhow::bail!("a sandbox host needs a `driver`") };
-                if let Some(why) = cell_host_refusal(&self.enrollment, driver) {
+                if let Some(why) = unconfined_driver_refusal(&self.enrollment, driver, self.unconfined_driver) {
                     anyhow::bail!("{why}");
                 }
             }
@@ -317,20 +322,21 @@ impl Config {
     }
 }
 
-/// Why a sandbox host refuses `driver`, if it does. A host that enrolls with its AWS identity is a
-/// cell host, and a cell host runs guests only in Firecracker under the jailer: the process driver
-/// and an unjailed Firecracker run every guest (the process driver its agents' Bash too) with
-/// nestd's privileges, as root on the host. Both stay for development and the e2e harness, which
-/// enroll with a token file or static credentials. `deploy/host/bootstrap.sh` refuses the sandbox
-/// role without KVM, so a cell host never writes one; this is the backstop.
-pub fn cell_host_refusal(enrollment: &EnrollmentConfig, driver: &DriverConfig) -> Option<&'static str> {
-    if !matches!(enrollment, EnrollmentConfig::AwsImds { .. }) {
+/// Why a sandbox host refuses `driver`, if it does. A host runs guests only in Firecracker under
+/// the jailer unless it says otherwise: the process driver and an unjailed Firecracker run every
+/// guest (the process driver its agents' Bash too) with nestd's privileges, as root on the host.
+/// Both stay for development and the e2e harness, which set `unconfined_driver` or enroll with
+/// static credentials (development and tests only). A real host, which enrolls with its AWS
+/// identity or an operator's token, never does: `deploy/host/bootstrap.sh` refuses the sandbox
+/// role without KVM and writes Firecracker under the jailer, and this is the backstop.
+pub fn unconfined_driver_refusal(enrollment: &EnrollmentConfig, driver: &DriverConfig, allowed: bool) -> Option<&'static str> {
+    if allowed || matches!(enrollment, EnrollmentConfig::Static { .. }) {
         return None;
     }
     match driver {
-        DriverConfig::Process { .. } => Some("a cell host (aws_imds enrollment) refuses the process driver: it runs every guest as root on the host; use Firecracker under the jailer"),
+        DriverConfig::Process { .. } => Some("refusing the process driver: it runs every guest as root on the host (development only: set `unconfined_driver`); use Firecracker under the jailer"),
         DriverConfig::Firecracker(fc) if fc.jailer_bin.is_none() || fc.jailer.is_none() => {
-            Some("a cell host (aws_imds enrollment) refuses Firecracker without the jailer: it runs every VMM with nestd's privileges; set `jailer_bin` and `jailer`")
+            Some("refusing Firecracker without the jailer: it runs every VMM with nestd's privileges (development only: set `unconfined_driver`); set `jailer_bin` and `jailer`")
         }
         DriverConfig::Firecracker(_) => None,
     }
@@ -499,44 +505,50 @@ mod tests {
         }
     }
 
-    /// A cell host (one that enrolls with its AWS identity) runs guests only in Firecracker under
-    /// the jailer: the process driver and an unjailed Firecracker, which run guests with nestd's
-    /// privileges, are refused at start; a host enrolling any other way (development, the e2e
-    /// harness) may use either, and a brain host has no driver to refuse.
+    /// A host runs guests only in Firecracker under the jailer unless its config opts out
+    /// (`unconfined_driver`, development and e2e) or it enrolls with static credentials (tests):
+    /// the process driver and an unjailed Firecracker, which run guests with nestd's privileges,
+    /// are refused at start whatever the enrollment, AWS or an operator's token.
     #[test]
-    fn a_cell_host_runs_guests_only_under_the_jailer() {
+    fn a_host_runs_guests_only_under_the_jailer_unless_it_opts_out() {
         let process = serde_json::json!({"type": "process", "guest_command": ["g"]});
-        let fc = |jailed: bool| {
+        let fc = |jailer_bin: bool, jailer: bool| {
             let mut d = serde_json::json!({"type": "firecracker", "firecracker_bin": "/fc", "kernel_image": "/k", "images_dir": "/i"});
-            if jailed {
+            if jailer_bin {
                 d["jailer_bin"] = "/jailer".into();
+            }
+            if jailer {
                 d["jailer"] = serde_json::json!({"uid": 900, "gid": 900, "chroot_base_dir": "/srv/jailer"});
             }
-            d
-        };
-        let half = {
-            let mut d = fc(false);
-            d["jailer_bin"] = "/jailer".into();
             d
         };
         let aws = serde_json::json!({"type": "aws_imds"});
         let token = serde_json::json!({"type": "token_file", "path": "/t"});
         let fixed = serde_json::json!({"type": "static", "host": "hst_1", "host_token": "t", "fleet_ws_url": "ws://x"});
+        let (no_process, no_jailer) = (Some("refusing the process driver"), Some("refusing Firecracker without the jailer"));
         let cases = [
-            (&aws, &process, Some("refuses the process driver")),
-            (&aws, &fc(false), Some("refuses Firecracker without the jailer")),
-            (&aws, &half, Some("refuses Firecracker without the jailer")),
-            (&aws, &fc(true), None),
-            (&token, &process, None),
-            (&token, &fc(false), None),
-            (&fixed, &process, None),
+            (&aws, process.clone(), false, no_process),
+            (&token, process.clone(), false, no_process),
+            (&aws, fc(false, false), false, no_jailer),
+            (&token, fc(false, false), false, no_jailer),
+            (&aws, fc(true, false), false, no_jailer),
+            (&aws, fc(false, true), false, no_jailer),
+            (&aws, fc(true, true), false, None),
+            (&token, fc(true, true), false, None),
+            (&token, process.clone(), true, None),
+            (&aws, fc(false, false), true, None),
+            (&fixed, process.clone(), false, None),
+            (&fixed, fc(false, false), false, None),
         ];
-        for (enrollment, driver, refused) in cases {
-            let cfg: Config = serde_json::from_value(serde_json::json!({"role": "sandbox", "cell": "c", "enrollment": enrollment, "driver": driver})).unwrap();
+        for (enrollment, driver, unconfined, refused) in cases {
+            let cfg: Config = serde_json::from_value(serde_json::json!({
+                "role": "sandbox", "cell": "c", "enrollment": enrollment, "driver": driver, "unconfined_driver": unconfined,
+            }))
+            .unwrap();
             match (cfg.validate(), refused) {
                 (Ok(()), None) => {}
-                (Err(e), Some(why)) => assert!(e.to_string().contains(why), "{enrollment} {driver}: {e}"),
-                (r, want) => panic!("{enrollment} {driver}: {r:?}, wanted a refusal: {want:?}"),
+                (Err(e), Some(why)) => assert!(e.to_string().contains(why), "{enrollment} {driver} {unconfined}: {e}"),
+                (r, want) => panic!("{enrollment} {driver} {unconfined}: {r:?}, wanted a refusal: {want:?}"),
             }
         }
     }
@@ -580,7 +592,7 @@ mod tests {
         assert_eq!(cfg.agents_dir(), PathBuf::from(paths::AGENTS_DIR));
         assert!(matches!(cfg.storage, StorageConfig::Local));
         // A cell host (AWS identity) with the process driver: parsed, and refused at start.
-        assert!(cfg.validate().unwrap_err().to_string().contains("refuses the process driver"));
+        assert!(cfg.validate().unwrap_err().to_string().contains("refusing the process driver"));
         let s3: StorageConfig = serde_json::from_value(serde_json::json!({"type": "s3", "bucket": "b", "region": "us-east-1"})).unwrap();
         assert!(matches!(s3, StorageConfig::S3 { ref prefix, .. } if prefix == "store/"));
     }
