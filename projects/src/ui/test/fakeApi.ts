@@ -58,7 +58,7 @@ export function task(over: Partial<Task> = {}): Task {
 
 export function ask(over: Partial<Ask> = {}): Ask {
   seq += 1;
-  return { ask: `ask_a${seq}`, agent: "agt_worker", role: "worker", task: null, question: null, approval: null, at_ms: now - 30_000, answered_ms: null, ...over };
+  return { ask: `ask_a${seq}`, agent: "agt_worker", role: "worker", task: null, question: null, approval: null, at_ms: now - 30_000, answered_ms: null, previous: false, ...over };
 }
 
 export class FakeApi {

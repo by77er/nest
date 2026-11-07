@@ -216,6 +216,8 @@ export interface Ask {
   approval: unknown;
   at_ms: number;
   answered_ms: number | null;
+  /** A manager's ask from one that isn't the project's manager any more (README.md#the-manager-lifecycle): labelled so. */
+  previous: boolean;
 }
 
 /** Who did something: the owner (from the board), the app itself, or an agent over MCP (with its taint). */
@@ -1924,10 +1926,12 @@ export class ProjectDO extends DurableObject<Env> {
 
   async asks(): Promise<Result<Ask[]>> {
     if (!this.settings()) return fail(404, "unknown project");
+    const manager = this.settings()!.manager;
     return ok(this.sql.exec("SELECT * FROM asks ORDER BY at_ms").toArray().map((r) => ({
       ask: r.ask as string, agent: r.agent as string, role: (r.role as string | null) ?? null, task: (r.task as string | null) ?? null,
       question: (r.question as string | null) ?? null, approval: r.approval ? JSON.parse(r.approval as string) : null,
       at_ms: r.at_ms as number, answered_ms: (r.answered_ms as number | null) ?? null,
+      previous: r.role === "manager" && r.agent !== manager,
     })));
   }
 
@@ -1958,7 +1962,9 @@ export class ProjectDO extends DurableObject<Env> {
     if (route.role === "routine") this.routineEvent(e);
     switch (e.type) {
       case "agent.turn_completed":
-        if (route.role === "manager" && e.text) {
+        // The current manager's alone (README.md#the-manager-lifecycle): a replaced one (its stop owed, or
+        // refused) writes nothing that reads as the manager's.
+        if (route.role === "manager" && s.manager === e.agent && e.text) {
           this.sql.exec("INSERT OR IGNORE INTO chat (at_ms, sender, text, event_id) VALUES (?, 'manager', ?, ?)", Date.now(), e.text, e.id);
         }
         break;

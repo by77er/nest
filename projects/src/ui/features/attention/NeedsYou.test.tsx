@@ -40,6 +40,27 @@ describe("asks", () => {
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/asks/${a.ask}/answer`, body: { answer: "deny" } }]));
   });
 
+  it("a previous manager's ask says so, and its question shows as plain text, not the manager's rich content", async () => {
+    const api = new FakeApi();
+    api.asks = [
+      ask({ question: "Merge **everything**?", role: "manager", agent: "agt_old", previous: true }),
+      ask({ question: "Use **main**?", role: "manager", agent: "agt_manager" }),
+    ];
+    renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    const old = await waitFor(() => {
+      const el = [...p.querySelectorAll("[data-ask]")].find((e) => e.textContent?.includes("agt_old"));
+      if (!el) throw new Error("not yet");
+      return el as HTMLElement;
+    });
+    expect(old).toHaveTextContent("The previous manager");
+    expect(old).toHaveTextContent("Merge **everything**?");
+    expect(old.querySelector("strong")).toBeNull();
+    const current = [...p.querySelectorAll("[data-ask]")].find((e) => e.textContent?.includes("agt_manager")) as HTMLElement;
+    expect(current).not.toHaveTextContent("The previous manager");
+    expect(current.querySelector("strong")).not.toBeNull();
+  });
+
   it("a question is answered in words; one nest refuses keeps the ask and what was typed", async () => {
     const api = new FakeApi();
     const a = ask({ question: "Which branch should I base on?", role: "manager", agent: "agt_manager" });
