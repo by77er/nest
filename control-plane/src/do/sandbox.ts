@@ -6,13 +6,14 @@
 // from a copy loaded before an await. Mutations go through `update()`, which loads, applies and
 // saves synchronously.
 import { DurableObject } from "cloudflare:workers";
+import { PLACE_REFUSED_RETRY, retryAfter } from "../lib/retry";
 import { z } from "zod";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { signShare } from "../lib/tokens";
-import { asNestError, compatWorkstream, hex, NestError, newId, sha256 } from "../lib/util";
+import { asNestError, clip, compatWorkstream, hex, NestError, newId, sha256 } from "../lib/util";
 import * as lease from "../lib/sandbox-lease";
 import * as slots from "../lib/slots";
 import { addColumn, storedEnum } from "../lib/stored";
@@ -109,6 +110,17 @@ const accessKey = (a: { push: string[]; read: string[]; workflows?: boolean; inj
   `${a.push.join()}|${a.read.join()}${a.workflows ? "|workflows" : ""}${a.inject?.length ? `|${JSON.stringify(a.inject)}` : ""}`;
 
 /** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
+/** FleetDO refused this sandbox's placements: how often since the last success, why, and whether it gave up. */
+export interface PlacementRefused {
+  count: number;
+  first_ms: number;
+  last_ms: number;
+  reason: string;
+  /** No more automatic tries: an operator's `POST /v1/sandboxes/<id>/place` places it. */
+  gave_up: boolean;
+}
+const PLACEMENT_REFUSED_KEY = "placement_refused";
+
 export interface SandboxInfo extends lease.Lease, slots.Slots {
   sandbox: string;
   /**
@@ -452,9 +464,11 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /** The record as the API shows it: without the compat `workstream`. */
-  private view(): SandboxInfo {
+  private view(): SandboxInfo & { placement_refused?: PlacementRefused } {
     const { workstream: _, ...info } = this.info_();
-    return { ...info, labels: info.labels ?? {} };
+    // Placements FleetDO refused (the leases disagree), while it isn't placed: retried, or given up.
+    const refused = !info.host ? this.get<PlacementRefused>(PLACEMENT_REFUSED_KEY) : undefined;
+    return { ...info, labels: info.labels ?? {}, ...(refused ? { placement_refused: refused } : {}) };
   }
 
   /** A placement that never finished leaves `placing` set: once stale, FleetDO's lease decides. */
@@ -528,14 +542,29 @@ export class SandboxDO extends DurableObject<Env> {
         // A lease may exist: the marker stays for the `place` deadline to reconcile.
         throw failure;
       case "unplaced":
-        // A refusal is not retried on its own (the leases disagree: an operator looks); no room is.
+        // A refusal (the leases disagree) is retried on this object's own `place` deadline with backoff
+        // (`PLACE_REFUSED_RETRY`), then given up: shown as `placement_refused` until an operator places it.
         if (answer.kind === "refused") {
-          await this.deadlines.clear("place");
+          const now2 = Date.now();
+          const prev = this.get<PlacementRefused>(PLACEMENT_REFUSED_KEY);
+          const count = (prev?.count ?? 0) + 1;
+          const next = retryAfter(count, now2, PLACE_REFUSED_RETRY);
+          const gave_up = "gave_up" in next;
+          this.put(PLACEMENT_REFUSED_KEY, {
+            count, first_ms: prev?.first_ms ?? now2, last_ms: now2, reason: clip(asNestError(failure)?.detail ?? String(failure), 500), gave_up,
+          } satisfies PlacementRefused);
+          if ("gave_up" in next) {
+            await this.deadlines.clear("place");
+            console.error(`sandbox ${before.sandbox}: placement refused ${count} times; given up until an operator places it`, failure);
+          } else {
+            await this.deadlines.set("place", next.at_ms);
+          }
           throw failure;
         }
         await this.deadlines.set("place", Date.now() + PLACE_RETRY_MS, true);
         return null;
       case "placed":
+        this.del(PLACEMENT_REFUSED_KEY);
         await this.deadlines.clear("place");
         await this.afterPlaced();
         return after.host;
@@ -555,6 +584,8 @@ export class SandboxDO extends DurableObject<Env> {
    * host, its lease released, and placed again under a new epoch.
    */
   async retryPlacement(): Promise<string | null> {
+    // The operator's try: a refusal count starts again.
+    this.del(PLACEMENT_REFUSED_KEY);
     const info = this.info_();
     const old = lease.failedHolder(info);
     if (old) {

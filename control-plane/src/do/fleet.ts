@@ -22,6 +22,7 @@ import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
+import { REASSIGN_RETRY, retryAfter } from "../lib/retry";
 import { addColumn, sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
 import { retentionMode } from "../lib/retention";
 import {
@@ -356,6 +357,9 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec(`INSERT OR IGNORE INTO reassignments (sandbox, host, epoch, host_dead, attempts)
       SELECT sandbox, host, epoch, host_dead, attempts FROM reassign_queue`);
     this.sql.exec("DELETE FROM reassign_queue");
+    // A failed reassignment's next try (backoff, `REASSIGN_RETRY`) and when it gave up (null: still trying).
+    addColumn(this.sql, "reassignments", "next_ms", "INTEGER");
+    addColumn(this.sql, "reassignments", "gave_up_ms", "INTEGER");
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     // Every host this cell made a tunnel for, written before the first Cloudflare call: what the
     // sweep may delete.
@@ -1617,6 +1621,8 @@ export class FleetDO extends DurableObject<Env> {
     }
     this.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired, vcpus, memory_mib) VALUES (?, ?, ?, 0, ?, ?)",
       req.sandbox, host, req.epoch, need.vcpus, need.memory_mib);
+    // Placed again (an operator's retry, or the cause went): a reassignment of it that gave up is done.
+    this.sql.exec("DELETE FROM reassignments WHERE sandbox = ? AND gave_up_ms IS NOT NULL", req.sandbox);
     this.issueCommands(host, [{
       type: "sandbox_create",
       sandbox: req.sandbox,
@@ -1851,7 +1857,7 @@ export class FleetDO extends DurableObject<Env> {
       || this.hostsBy({ status: "expired", where: "instance_id IS NOT NULL" }).length
       || this.sql.exec(LOST_WITH_BRAINS).toArray().length
       || this.sql.exec("SELECT 1 FROM host_agents WHERE gone = 1").toArray().length
-      || this.sql.exec("SELECT 1 FROM reassignments").toArray().length
+      || this.sql.exec("SELECT 1 FROM reassignments WHERE gave_up_ms IS NULL").toArray().length
       || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND host IS NULL AND reason IS NULL").toArray().length
       || (this.ec2() && this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND reason IS NOT NULL").toArray().length)
       || this.sql.exec("SELECT 1 FROM evictions").toArray().length
@@ -1888,7 +1894,7 @@ export class FleetDO extends DurableObject<Env> {
       status: "dead",
       where: `dead_ms < ? AND tunnel_id IS NULL AND dns_record_id IS NULL
         AND host NOT IN (SELECT host FROM leases) AND host NOT IN (SELECT host FROM stale_incarnations)
-        AND host NOT IN (SELECT host FROM reassignments) AND host NOT IN (SELECT host FROM evictions)
+        AND host NOT IN (SELECT host FROM reassignments WHERE gave_up_ms IS NULL) AND host NOT IN (SELECT host FROM evictions)
         AND host NOT IN (SELECT host FROM host_agents) AND lost = 1`,
     }, now - DEAD_HOST_RETENTION_MS);
     for (const { host } of dead) {
@@ -2807,8 +2813,11 @@ export class FleetDO extends DurableObject<Env> {
 
   /** Idempotent per lost lease: drop it if it is still the sandbox's, then have SandboxDO grant a new one elsewhere. */
   private async processReassign(): Promise<void> {
+    const now = Date.now();
+    // Due ones only: a failed one waits out its backoff, and one that gave up waits for the operator.
     const rows = this.sql
-      .exec<{ sandbox: string; host: string; epoch: number; host_dead: number }>("SELECT sandbox, host, epoch, host_dead FROM reassignments ORDER BY epoch")
+      .exec<{ sandbox: string; host: string; epoch: number; host_dead: number }>(
+        "SELECT sandbox, host, epoch, host_dead FROM reassignments WHERE gave_up_ms IS NULL AND (next_ms IS NULL OR next_ms <= ?) ORDER BY epoch", now)
       .toArray();
     for (const r of rows) {
       try {
@@ -2817,11 +2826,23 @@ export class FleetDO extends DurableObject<Env> {
         await this.sandbox(r.sandbox).leaseLost(r.host, r.epoch, r.host_dead === 1);
         this.sql.exec("DELETE FROM reassignments WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch);
       } catch (e) {
-        this.sql.exec("UPDATE reassignments SET attempts = attempts + 1 WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch);
-        console.error(`FleetDO: reassigning ${r.sandbox} failed; will retry`, e);
+        // Bounded, with backoff (`REASSIGN_RETRY`): a refusal that never heals (the leases disagree) stops
+        // being retried, said once as an error; the sandbox shows its own refusal (`placement_refused`).
+        const row = this.sql.exec<{ attempts: number }>("SELECT attempts FROM reassignments WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch).toArray()[0];
+        if (!row) continue;
+        const attempts = row.attempts + 1;
+        const next = retryAfter(attempts, Date.now(), REASSIGN_RETRY);
+        if ("gave_up" in next) {
+          this.sql.exec("UPDATE reassignments SET attempts = ?, next_ms = NULL, gave_up_ms = ? WHERE sandbox = ? AND host = ? AND epoch = ?",
+            attempts, Date.now(), r.sandbox, r.host, r.epoch);
+          console.error(`FleetDO: reassigning ${r.sandbox} (lost from ${r.host} at epoch ${r.epoch}) failed ${attempts} times; given up until an operator places it`, e);
+        } else {
+          this.sql.exec("UPDATE reassignments SET attempts = ?, next_ms = ? WHERE sandbox = ? AND host = ? AND epoch = ?", attempts, next.at_ms, r.sandbox, r.host, r.epoch);
+          console.error(`FleetDO: reassigning ${r.sandbox} failed (${attempts}); next try at ${new Date(next.at_ms).toISOString()}`, e);
+        }
       }
     }
-    if (this.sql.exec("SELECT 1 FROM reassignments").toArray().length) await this.armTick();
+    if (this.sql.exec("SELECT 1 FROM reassignments WHERE gave_up_ms IS NULL").toArray().length) await this.armTick();
   }
 
   // ---------------------------------------------------------------------------------------------

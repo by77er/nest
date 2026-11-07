@@ -123,7 +123,7 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 |---|---|---|---|
 | L1 | A sandbox whose lease is lost, with work, is eventually placed again | capacity eventually; EC2 reachable, or the host reconnects, or an operator confirms; weak fairness on alarms and `processReassign` | Fails in B3 (fenced/failed state never retried by the alarm), B4, and the Refused state (lease at another epoch: `place` deadline cleared, no automatic repair, `sandbox.ts:322`) |
 | L2 | Every `placing` marker is eventually cleared or adopted | the `place` deadline fires (written in the same synchronous block as the claim: `Deadlines.set` writes its row before its first await); FleetDO eventually answers `leaseOf` | Holds |
-| L3 | Every `reassign_queue` row is eventually deleted | `leaseLost` eventually returns | Holds; but rows can be silently not inserted (B4) |
+| L3 | Every `reassign_queue` row is eventually deleted | `leaseLost` eventually returns | Holds, except a row that gave up after its bounded retries (since 2026-11-06, conformance below); but rows can be silently not inserted (B4) |
 | L4 | Every stale incarnation is eventually destroyed or retired | host reachable | Mostly: `sandbox_destroy` is sent once; if the host restarts before running it the row keeps `cmd` set and is skipped for 24 h (`fleet.ts:893`, `1324`); nestd's own retire usually deletes it first |
 | L5 | STONITH eventually resolves | EC2 or reconnect or operator | By design waits forever otherwise ("we wait or ask me") |
 | L6 | Every salvage terminates | — | Holds since `77b3b30` (final refusals end it); `parent_mismatch` retries until destroy |
@@ -187,3 +187,21 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 **Invariants worth checking now, in code or tests:**
 - Runtime: in `FleetDO.place`, log an error if `req.epoch ≤` the highest epoch this cell ever leased for the sandbox (needs a column; detects S3' failures).
 - Tests: B1 (salvage after a NoCapacity rollback), and a nestd test that a `fence` command result is emitted only after the pause landed, or a doc change saying it isn't.
+
+## Conformance: bounded retries of a refused placement (fix/refused-placement, 2026-11-06)
+
+**Head:** `fix/refused-placement` (on main 9fd147ff). No lease decision changed (`placeAnswered`, `leaseLost`, `claim` are as they were). Only who tries again, and when. Not checked by a model run.
+
+| Model action | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| `PlaceFail` (Refused) | `SandboxDO.placeCurrentEpoch`, "unplaced" refused | partly | Still clears `placing`, rolls the epoch back and rethrows. It now also re-arms the `place` deadline with backoff (`PLACE_REFUSED_RETRY`), so the alarm `place` action (`placeWanted`) runs again, as after NoCapacity, up to 6 times. The spec's Refused leaves no retry, so L1's "Refused" failure is now bounded rather than permanent. The spec doesn't model the retry; it is the same transition NoCapacity already takes |
+| `Reassign` | `FleetDO.processReassign` | partly | A failed `leaseLost` is retried with backoff and gives up after 10 tries (`gave_up_ms`). The spec's `Reassign` retries under weak fairness, unbounded, so L3 ("every row is eventually deleted") no longer holds for a row that gives up. Such a row stays until a placement of the sandbox deletes it; the sandbox shows `placement_refused` |
+
+Tests: `control-plane/test/placement-refused.test.ts`. Mutations run, each killed:
+- no backoff;
+- never giving up (reassignments or refusals);
+- given-up rows retried;
+- a refusal clearing the deadline (the old behaviour);
+- the note kept once placed;
+- the given-up row left after a placement;
+- no note.
