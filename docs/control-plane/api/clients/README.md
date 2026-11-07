@@ -10,7 +10,7 @@
 - **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's: a client's route that carries one refuses it (`policy` in `POST /v1/sandboxes`, `host` in `…/start`: 403), and their own routes (`PUT /v1/sandboxes/<id>/policy`, `PUT /v1/agents/<id>/rules`, `…/ports`) take only the admin token (401).
 - **Writes into a namespace are held to its client's grant, whoever writes them,** the operator included.
 - **An mcp capability's tools are named `<client>-<entry>_<tool>`** (tool names hold no `/`). A spec where two capabilities would give the same names is refused.
-- **Deleting a client is refused while anything in its subtree lives.** Then its token stops, and its namespace, name and record go.
+- **Deleting a client is refused while anything in its subtree lives.** Then its token stops, and its namespace and record go. Its name is held for 15 minutes (the answer's `name_free_ms`), and the cleanup runs once more before the name is free, so a request that was in flight across the delete leaves nothing a later client of that name inherits ([names](../../durable-objects/client/)).
 
 ## Clients and grants
 
