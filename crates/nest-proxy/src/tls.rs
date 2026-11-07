@@ -41,8 +41,15 @@ pub struct Ca {
 }
 
 impl Ca {
+    /// The intermediate CA nestd installs. Refused unless `key_pem` is the private half of the key
+    /// the certificate names: with any other key every minted leaf would fail to chain.
     pub fn from_install(ca: &CaCertificate, key_pem: &str) -> Result<Ca> {
         let key = KeyPair::from_pem(key_pem).context("parse CA key")?;
+        let der = CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).map_err(|e| anyhow!("parse CA certificate: {e:?}"))?;
+        let (_, cert) = x509_parser::parse_x509_certificate(&der).map_err(|e| anyhow!("parse CA certificate: {e}"))?;
+        if cert.public_key().subject_public_key.data.as_ref() != rcgen::PublicKeyData::der_bytes(&key) {
+            return Err(anyhow!("the CA key is not the certificate's key"));
+        }
         let issuer = Issuer::from_ca_cert_pem(&ca.cert_pem, key).context("parse CA certificate")?;
         let chain_src = if ca.chain_pem.trim().is_empty() { &ca.cert_pem } else { &ca.chain_pem };
         let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(chain_src.as_bytes())
@@ -206,6 +213,21 @@ mod tests {
     use rustls::client::WebPkiServerVerifier;
     use rustls::client::danger::ServerCertVerifier;
     use rustls_pki_types::{ServerName, UnixTime};
+
+    /// Audit P-B2: an intermediate installed with a key that isn't its own is refused (every
+    /// leaf it minted would fail to chain), and nestd's own check agrees with this one.
+    #[test]
+    fn install_refuses_a_key_that_is_not_the_certificates() {
+        let pki = testca::proxy_pki();
+        let other = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap().serialize_pem();
+        let e = Ca::from_install(&pki.install, &other).err().expect("a foreign key was accepted");
+        assert!(format!("{e:#}").contains("not the certificate's key"), "{e:#}");
+        assert!(Ca::from_install(&pki.install, &pki.key_pem).is_ok());
+        // nestd's parser (nestd_core::ca) finds the same key bits as x509-parser.
+        let der = CertificateDer::from_pem_slice(pki.install.cert_pem.as_bytes()).unwrap();
+        let key = KeyPair::from_pem(&pki.key_pem).unwrap();
+        assert_eq!(nestd_core::ca::cert_public_key(&der), Some(rcgen::PublicKeyData::der_bytes(&key)));
+    }
 
     #[test]
     fn minted_leaf_chains_to_root() {

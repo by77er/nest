@@ -364,6 +364,21 @@ const LAPSING_LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms
 /// Like FleetDO, it keeps each command batch until the host acks it and, after each hello_ack,
 /// resends those past the hello's `last_command_seq`: a batch sent on a connection the host was
 /// already dropping (after a retryable error) is not lost.
+/// A CA certificate for the key a CSR names, signed by a throwaway root (what FleetDO does).
+fn sign_csr(csr_pem: &str) -> String {
+    let mut root = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    root.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let issuer = rcgen::Issuer::new(root, rcgen::KeyPair::generate().unwrap());
+    let mut csr = rcgen::CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
+    csr.params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    csr.signed_by(&issuer).unwrap().pem()
+}
+
+/// A CSR for a key nestd never made.
+fn other_csr() -> String {
+    rcgen::CertificateParams::new(Vec::<String>::new()).unwrap().serialize_request(&rcgen::KeyPair::generate().unwrap()).unwrap().pem().unwrap()
+}
+
 async fn mock_fleet() -> MockFleet {
     mock_fleet_with(STEADY_LEASE).await
 }
@@ -519,8 +534,13 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
                                 log2.lock().unwrap().acks.push(up_to.0);
                             }
                             HostToFleet::CaRenew { csr_pem } => {
+                                // Signed for the CSR's key, as FleetDO does; and first, a certificate
+                                // for another key (a late answer to a CSR whose key was replaced),
+                                // which nestd must refuse.
+                                let late = CaCertificate { cert_pem: sign_csr(&other_csr()), chain_pem: "CHAIN".into(), expires_ms: i64::MAX / 4 };
+                                let _ = ws.send(send(FleetToHost::ProxyCa(late))).await;
+                                let ca = CaCertificate { cert_pem: sign_csr(&csr_pem), chain_pem: "CHAIN".into(), expires_ms: i64::MAX / 2 };
                                 log2.lock().unwrap().ca_renews.push(csr_pem);
-                                let ca = CaCertificate { cert_pem: "RENEWED".into(), chain_pem: "CHAIN".into(), expires_ms: i64::MAX / 2 };
                                 let _ = ws.send(send(FleetToHost::ProxyCa(ca))).await;
                             }
                         }
@@ -1520,10 +1540,21 @@ async fn proxy_ca_is_renewed_before_expiry() {
     let h = start_host_with(Some((ca, nest_protocol::host::Secret("OLD KEY".into())))).await;
     wait_until("ca_renew", || !h.fleet.log.lock().unwrap().ca_renews.is_empty()).await;
     assert!(h.fleet.log.lock().unwrap().ca_renews[0].contains("BEGIN CERTIFICATE REQUEST"));
+    let names_its_key = |ca: &CaCertificate, key_pem: &str| {
+        use rustls::pki_types::{CertificateDer, pem::PemObject};
+        let cert = CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).unwrap();
+        nestd_core::ca::cert_public_key(&cert) == Some(rcgen::PublicKeyData::der_bytes(&rcgen::KeyPair::from_pem(key_pem).unwrap()))
+    };
     wait_until("renewed CA installed", || {
-        h.proxy.lock().unwrap().iter().any(|c| matches!(c, ProxyCommand::CaInstall { ca, key_pem } if ca.cert_pem == "RENEWED" && key_pem.0.contains("PRIVATE KEY")))
+        h.proxy.lock().unwrap().iter().any(|c| matches!(c, ProxyCommand::CaInstall { ca, key_pem } if ca.expires_ms == i64::MAX / 2 && names_its_key(ca, &key_pem.0)))
     })
     .await;
+    // Audit P-B2: the certificate for another key that came first was never installed, and every
+    // install pairs a certificate with its own key. ("ORIGINAL" isn't a certificate: refused at start.)
+    let installs: Vec<(CaCertificate, String)> =
+        h.proxy.lock().unwrap().iter().filter_map(|c| match c { ProxyCommand::CaInstall { ca, key_pem } => Some((ca.clone(), key_pem.0.clone())), _ => None }).collect();
+    assert_eq!(installs.len(), 1, "only the renewal's certificate: {:?}", installs.iter().map(|(c, _)| c.expires_ms).collect::<Vec<_>>());
+    assert!(installs.iter().all(|(ca, key)| names_its_key(ca, key)));
 }
 
 /// Review #17, revised for per-incarnation directories: a newer-epoch create of a sandbox that
