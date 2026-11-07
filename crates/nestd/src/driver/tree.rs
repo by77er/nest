@@ -29,7 +29,9 @@
 //!   keeps looking, so nothing after it in the tree escapes.
 //! - **Quiescence is per thread, not per I/O.** A process counts as stopped once every thread of
 //!   it is, and one in an uninterruptible wait with SIGSTOP pending (a write throttled on dirty
-//!   pages) counts as stopped though that write may still finish. A
+//!   pages) counts as stopped though that write may still finish. In a multithreaded process whose
+//!   other thread took the SIGSTOP, a thread in such a wait shows no pending signal, so the freeze
+//!   waits for it (and fails after the budget) rather than count it stopped. A
 //!   commit that must not race a guest's writes needs the disk's own quiescence, which a VM's
 //!   pause gives and this driver only approximates.
 //! - **The limit:** a process that leaves both the tree and the session (a PTY's own session whose
@@ -185,14 +187,17 @@ pub fn runs_no_more(state: char, stop_pending: impl FnOnce() -> bool) -> bool {
 }
 
 /// Which processes a freeze's pass may stop now, in order: each candidate (`members` of `root`'s
-/// tree in `table`) that isn't `halted` yet, but only once its parent has stopped, unless the
-/// parent is outside the tree (init, for an orphan). A child stopped while its parent still runs
-/// (its SIGSTOP not yet taken) would show a parent waiting with WUNTRACED its job stopping; it
-/// waits for a later pass. `halted` is a snapshot taken before the pass. Pure.
-pub fn stop_now(root: i32, table: &BTreeMap<i32, Stat>, halted: &BTreeSet<i32>) -> Vec<i32> {
+/// tree in `table`, then the `pinned` members no longer in it: one whose parent exited and which
+/// left the guest's session) that isn't `halted` yet, but only once its parent has stopped,
+/// unless the parent is outside the tree (init, for an orphan). A child stopped while its parent
+/// still runs (its SIGSTOP not yet taken) would show a parent waiting with WUNTRACED its job
+/// stopping; it waits for a later pass. `halted` is a snapshot taken before the pass. Pure.
+pub fn stop_now(root: i32, table: &BTreeMap<i32, Stat>, pinned: &BTreeSet<i32>, halted: &BTreeSet<i32>) -> Vec<i32> {
     let tree: BTreeSet<i32> = std::iter::once(root).chain(members(root, table)).collect();
+    let left: Vec<i32> = pinned.iter().copied().filter(|p| !tree.contains(p)).collect();
     std::iter::once(root)
         .chain(members(root, table))
+        .chain(left)
         .filter(|p| !halted.contains(p))
         .filter(|p| match table.get(p) {
             Some(s) if *p != root => !tree.contains(&s.ppid) || halted.contains(&s.ppid),
@@ -289,8 +294,11 @@ impl Tree {
         let mut known: BTreeSet<i32> = self.members.iter().map(|m| m.pid).collect();
         let mut passed_over: Option<io::Error> = None;
         loop {
-            let t = table();
+            // The snapshot of what has stopped comes first, the table after it: a child a member
+            // forked before it stopped is in the table, so it can't be missed by a pass that sees
+            // that member stopped.
             let halted: BTreeSet<i32> = self.members.iter().filter(|m| m.halted()).map(|m| m.pid).collect();
+            let t = table();
             let mut running = self.members.len() - halted.len();
             // Pin what is new, before deciding: what a pidfd names is a member from now on.
             let candidates: BTreeSet<i32> = members(root, &t).into_iter().collect();
@@ -325,7 +333,8 @@ impl Tree {
                 found = true;
                 running += 1;
             }
-            for pid in stop_now(root, &t, &halted) {
+            let pinned: BTreeSet<i32> = self.members.iter().map(|m| m.pid).collect();
+            for pid in stop_now(root, &t, &pinned, &halted) {
                 let Some(m) = self.members.iter().find(|m| m.pid == pid) else { continue };
                 let was_halted = task_state(&format!("/proc/{pid}")).is_some_and(|s| matches!(s, 'T' | 't'));
                 match send(&m.fd, Signal::SIGSTOP) {
@@ -504,13 +513,17 @@ mod tests {
     #[test]
     fn a_pass_stops_a_process_only_once_its_parent_has() {
         let t = BTreeMap::from([(1, s(0, 1)), (2, s(1, 1)), (3, s(2, 1)), (4, s(3, 1)), (5, s(0, 1)), (6, s(5, 1)), (9, s(0, 9))]);
+        let none = BTreeSet::new();
         let halted = BTreeSet::from([1]);
-        assert_eq!(stop_now(1, &t, &halted), [2, 5], "A (its parent stopped) and the orphan (init's child); not B, C or 6 yet");
+        assert_eq!(stop_now(1, &t, &none, &halted), [2, 5], "A (its parent stopped) and the orphan (init's child); not B, C or 6 yet");
         let halted = BTreeSet::from([1, 2, 5]);
-        assert_eq!(stop_now(1, &t, &halted), [3, 6], "a level further down each pass");
+        assert_eq!(stop_now(1, &t, &none, &halted), [3, 6], "a level further down each pass");
         let halted = BTreeSet::from([1, 2, 3, 5, 6]);
-        assert_eq!(stop_now(1, &t, &halted), [4]);
-        assert_eq!(stop_now(1, &t, &BTreeSet::new()), [1, 5], "the guest first; never 9, outside the tree");
+        assert_eq!(stop_now(1, &t, &none, &halted), [4]);
+        assert_eq!(stop_now(1, &t, &none, &BTreeSet::new()), [1, 5], "the guest first; never 9, outside the tree");
+        // 9 was pinned while in the tree, then left it (its parent exited, its own session): still
+        // stopped, as an orphan, or it would count as running for ever.
+        assert_eq!(stop_now(1, &t, &BTreeSet::from([1, 9]), &BTreeSet::from([1, 2, 3, 4, 5, 6])), [9]);
     }
 
     #[test]
@@ -565,5 +578,6 @@ mod tests {
     fn a_self_parented_entry_never_loops() {
         let t = BTreeMap::from([(1, s(1, 1)), (2, s(1, 2)), (3, s(2, 2))]);
         assert_eq!(members(1, &t), [2, 3]);
+        assert_eq!(stop_now(1, &t, &BTreeSet::new(), &BTreeSet::new()), [1], "the guest goes first, whatever its parent");
     }
 }

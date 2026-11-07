@@ -468,6 +468,29 @@ mod tests {
         assert!(!marker.exists(), "the parent saw its child stopped by a pause");
     }
 
+    /// A member that leaves the tree (a `setsid` server whose call returns: init adopts it, in its
+    /// own session) is still stopped by the next pause, which succeeds; it used to count as running
+    /// for ever, failing every pause.
+    #[tokio::test]
+    async fn a_member_that_left_the_tree_is_still_frozen() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("call-returns");
+        let script = format!("sh -c 'setsid sleep 300 & echo $! >> PIDS; while [ ! -e {} ]; do sleep 0.05; done' & exec sleep 300", gone.display());
+        let (mut vm, pids) = guest_running(dir.path(), &script, 1).await;
+        let server = pids[0];
+        vm.pause().await.unwrap();
+        vm.resume().await.unwrap();
+        // The call returns (it polls every 50 ms): the server is init's now, outside the guest's
+        // tree and session.
+        std::fs::write(&gone, "").unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        vm.pause().await.expect("a pause with a member that left the tree");
+        assert!(crate::driver::tree::halted_pid(server), "the server runs on in a paused VM");
+        vm.resume().await.unwrap();
+        vm.stop().await.unwrap();
+        assert!(all_gone(&[server]).await, "the stop killed it too");
+    }
+
     /// A paused VM's tree is stopped, its own-session children included (they would write the disk
     /// a commit reads), by `pause` and by the lock-free pauser alike; resume continues what the
     /// pause stopped, and only that: a process the agent had stopped itself stays stopped.
