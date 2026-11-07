@@ -500,6 +500,13 @@ async function chatFitsNarrow(p) {
   return out;
 }
 /** A two-line draft (Shift+Enter between), still in the composer, unsent; and the chat still fits. */
+/** Focus inside a message (its steps' button) shows its meta row (time, actions), as hover does. */
+async function metaOnFocus(p) {
+  const row = p.locator("[data-sender=manager]", { has: p.getByRole("button", { name: "Used 4 tools" }) });
+  const opacity = await row.locator("[data-slot=meta]").evaluate((e) => getComputedStyle(e).opacity);
+  return opacity === "1" ? [] : [`focus inside a message leaves its time and actions hidden (opacity ${opacity})`];
+}
+
 async function draftKept(p) {
   const problems = await chatFits(p);
   const value = await p.locator("[data-ds=composer-dock] textarea").inputValue();
@@ -561,7 +568,7 @@ const scroll = {
   sendReadback: (fixture) => async (p) => {
     await liveChat(p, fixture);
     await readBack(p, p.viewportSize().width);
-    await p.getByPlaceholder("Write a message").fill("Sent while reading back");
+    await p.getByLabel("Message to the manager").fill("Sent while reading back");
     // Send, as on a phone (where Enter is a new line).
     await p.getByRole("button", { name: "Send" }).click();
     await p.waitForTimeout(1_000);
@@ -715,9 +722,22 @@ const app = {
     { name: "context-empty-chat", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, widths: DESKTOP, check: contextShown, checkName: "clipping" },
     { name: "chat-fit-empty", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, widths: PHONE, check: chatFitsNarrow, checkName: "chat-fit" },
     { name: "chat-fit-long", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false, check: chatFits, checkName: "chat-fit" },
-    // The chat (README.md#the-manager-chat): a turn streaming with its activity line and Stop; the composer
+    // The chat (README.md#the-manager-chat): a turn streaming with its tool calls and Stop; the composer
     // with a draft; the jump-to-latest pill; older history paged in; a message's actions; the unread dot.
     { name: "chat-streaming", section: "project", path: "/projects/prj_demo/manager", full: false, ready: shown("[data-sender=stream]") },
+    // A reply's steps behind "Used 4 tools", opened, with one call's input and result; a call of the
+    // running turn opened in place.
+    { name: "chat-steps", section: "project", path: "/projects/prj_demo/manager", full: false, ready: shown("[data-ds=steps-disclosure]"), after: async (p) => { await p.getByRole("button", { name: "Used 4 tools" }).click(); await p.getByRole("button", { name: /^write_spec tsk_demo7/ }).click(); await p.waitForTimeout(400); } },
+    // The code-block palette (the skill's syntax table): TypeScript, a diff, JSON and a console session.
+    { name: "chat-code", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-code", full: false, ready: shown("[data-ds=code-block] [data-highlighted]") },
+    // A heavy reply: a 60-line code block showing its first 20 (then all of it), a table wider than the measure.
+    { name: "chat-heavy", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-heavy", full: false, ready: shown("[data-ds=code-block]") },
+    { name: "chat-heavy-all", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-heavy", full: false, ready: shown("[data-ds=code-block]"), after: async (p) => { await p.getByRole("button", { name: "Show all 60 lines" }).click(); await p.waitForTimeout(300); } },
+    // A running turn a dozen calls in: its last steps, the earlier ones folded above them.
+    { name: "chat-busy", section: "project", path: "/projects/prj_demo/manager", fixture: "turn-busy", full: false, ready: shown("[data-sender=stream] [data-ds=steps-disclosure]") },
+    // The keyboard reaches a message's time and actions: focus inside it reveals them, as hover does.
+    { name: "chat-keyboard", section: "project", path: "/projects/prj_demo/manager", full: false, widths: DESKTOP, ready: shown("[data-ds=steps-disclosure]"), after: async (p) => { await p.getByRole("button", { name: "Used 4 tools" }).focus(); await p.waitForTimeout(300); }, check: metaOnFocus, checkName: "chat-fit" },
+    { name: "chat-tool-open", section: "project", path: "/projects/prj_demo/manager", full: false, ready: shown("[data-sender=stream] [data-ds=step]"), after: async (p) => { await p.getByRole("button", { name: /^Bash git push origin search-by-tag, failed/ }).click(); await p.waitForTimeout(400); } },
     { name: "chat-draft", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false, after: async (p) => { await p.getByRole("button", { name: /^Spec a task for/ }).click(); await p.keyboard.type("exporting gadgets as CSV,"); await p.keyboard.press("Shift+Enter"); await p.keyboard.type("with prices and tags."); }, check: draftKept, checkName: "chat-fit" },
     { name: "chat-jump", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-arriving", full: false, after: async (p) => { await scrollChat(p, "third"); await p.getByRole("button", { name: /Jump to latest/ }).waitFor({ timeout: 10_000 }); } },
     { name: "chat-older", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-paged", full: false, after: async (p) => { await scrollChat(p, "top"); await p.getByText("Message 22: how is the search work going?").waitFor({ timeout: 10_000 }); } },

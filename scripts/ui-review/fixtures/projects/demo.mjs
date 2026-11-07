@@ -6,13 +6,14 @@
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-long" (thirty messages), "chat-paged"
 // (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents),
-// "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
+// "chat-code" (a reply with every syntax token), "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
+// a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
 // issues waiting) / "triage-long" (24 issues, long titles, bodies and logins), or "routines-empty" (no
 // routines, runs, proposals or notes) / "routines-long" (many and long runs, proposals and notes). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
-import { trace } from "./trace.mjs";
+import { PLAN_REPLY, trace } from "./trace.mjs";
 
 const DAY = 86_400_000;
 
@@ -115,7 +116,7 @@ export function data(variant = "demo", now = Date.now()) {
   ].sort((a, b) => a.at_ms - b.at_ms);
   const chat = [
     { seq: 1, at_ms: now - 3_600_000, sender: "owner", text: "Plan the search work and split it into tasks.", delivered: true, error: null },
-    { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: 'Done: "Add search by tag" is specced and assigned. I left "Export gadgets as CSV" ready for later.', delivered: true, error: null },
+    { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: PLAN_REPLY, delivered: true, error: null },
     { seq: 3, at_ms: now - 900_000, sender: "app", text: "The manager ended (exited).", delivered: true, error: null },
     { seq: 4, at_ms: now - 300_000, sender: "owner", text: "Can you also look at the auth migration? It stalled.", delivered: false, error: "nest answered 409: the agent has ended" },
   ];
@@ -155,7 +156,23 @@ export function data(variant = "demo", now = Date.now()) {
     '</svg>',
     '```',
   ].join("\n");
-  const RICH = [
+  /** A reply with every syntax token: TypeScript, a diff, JSON and a console session (the code-block palette). */
+const CODE = [
+  "The parser, the change, its config and the run:",
+  "```ts\n// Whole-word tag matching (see the spec).\ninterface Tag {\n  name: string;\n  count: number;\n}\n\nexport function parseTags(query: string, limit = 20): Tag[] {\n  const parts = query.split(/\\s*,\\s*/).filter(Boolean);\n  return parts.slice(0, limit).map((name) => ({ name, count: 0 }));\n}\n\nconst DEFAULTS = { strict: true, separator: \",\", max: null };\n```",
+  "```diff\n@@ -12,3 +12,3 @@ export function parseTags\n-  const parts = query.split(\",\");\n+  const parts = query.split(/\\s*,\\s*/).filter(Boolean);\n   return parts.slice(0, limit);\n```",
+  "```json\n{ \"search\": { \"tags\": [\"outdoor\", \"waterproof\"], \"limit\": 200, \"strict\": true } }\n```",
+  "```console\n$ npm test -- tags\n PASS  test/tags.test.ts (9 tests)\n```",
+].join("\n\n");
+
+/** A heavy reply: a long code block (capped at its first lines) and a table wider than the measure. */
+const HEAVY = [
+  "Here's the parser as it stands, and the suites before and after.",
+  "```ts\n" + Array.from({ length: 60 }, (_, i) => (i === 0 ? "export function parseTags(query: string): string[] {" : i === 59 ? "}" : `  const part${i} = query.split(",")[${i}]?.trim() ?? ""; // field ${i}`)).join("\n") + "\n```",
+  "| suite | files | tests | before | after | slowest | flaky | owner | since | notes |\n|---|---|---|---|---|---|---|---|---|---|\n| search | 4 | 38 | 12 failing | 0 failing | 1.8 s | 0 | agt_w8x2m4 | Monday | whole-word matching |\n| tags | 2 | 9 | none | 9 passing | 0.4 s | 0 | agt_w8x2m4 | today | new |\n| gadgets-api-integration | 11 | 140 | 3 failing | 0 failing | 12.6 s | 1 | agt_w3f9q1 | last week | one flaky upload test |",
+].join("\n\n");
+
+const RICH = [
     "## Search plan",
     "I split the search work into three tasks. task:tsk_demo7 is in review; [the flaky test](task:tsk_demo5) blocks the next release, and task:tsk_demo99 isn't on this board.",
     "### Where things stand",
@@ -200,6 +217,8 @@ export function data(variant = "demo", now = Date.now()) {
       return Date.now() - born > 3_000 ? [...base, { seq: 31, at_ms: now, sender: "manager", text: "New: task:tsk_demo7 passed review.", delivered: true, error: null }] : base;
     }
     if (variant === "chat-long") return chatLong();
+    if (variant === "chat-code") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: CODE, delivered: true, error: null }];
+    if (variant === "chat-heavy") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: HEAVY, delivered: true, error: null }];
     return chat;
   };
   const detail = (id) => byId[id] && { ...byId[id], history: history[id] ?? [{ at_ms: now - 7_200_000, actor: "owner", action: "created", detail: JSON.stringify({ title: byId[id].title }), tainted: false }] };
@@ -227,10 +246,10 @@ export function data(variant = "demo", now = Date.now()) {
     job(114, "Write the 0.5 changelog", "superseded"),
   ];
   // Every trace (the manager's, a worker's, a reviewer's): history offered and paged, then the live ring (trace.mjs).
-  const { messages: allMessages, pages: historyPages } = trace(now);
+  const { messages: allMessages, pages: historyPages } = trace(now, { busy: variant === "turn-busy" });
   // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
-  // "chat-empty" is a new conversation: no turn running either (its starters show).
-  const traceMessages = variant === "connecting" || variant === "chat-empty" ? [] : allMessages;
+  // "chat-empty" is a new conversation: no turn running either (its starters show); "chat-heavy" ends on its reply.
+  const traceMessages = variant === "connecting" || variant === "chat-empty" || variant === "chat-heavy" || variant === "chat-code" ? [] : allMessages;
   const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length }, { ...other, needs_you: 0 }];
   const sync = { written: ["capabilities/projects/board", "capabilities/projects/task", "templates/projects/manager", "templates/projects/worker"], repos: ["by77er/gadgets", "by77er/widgets"], at_ms: now - 3_600_000 };
 

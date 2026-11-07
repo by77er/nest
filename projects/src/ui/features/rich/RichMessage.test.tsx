@@ -4,6 +4,7 @@
 import { MantineProvider } from "@mantine/core";
 import { QueryClientProvider } from "@tanstack/react-query";
 import { act, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { createMemoryHistory, createRootRoute, createRoute, createRouter, RouterProvider } from "@tanstack/react-router";
 import { describe, expect, it, vi } from "vitest";
 import { keys } from "../../api/queries";
@@ -13,6 +14,7 @@ import { ask, FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 import { cssVariablesResolver, theme } from "../../theme";
 import { sanitizeSvg, SVG_MAX_BYTES } from "../../rich/svg";
+import { HIGHLIGHT_MAX } from "../../rich/highlight";
 import { RichMessage } from "./RichMessage";
 /** The task drawer (titled with its task's title). */
 const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
@@ -70,6 +72,62 @@ describe("Markdown", () => {
     expect(link).toHaveAttribute("href", "https://example.com/docs");
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("highlights a fence in a language it knows, under its language and a Copy that copies the code itself", async () => {
+    // user-event's clipboard stands in for the browser's (set up per test, restored after it).
+    const user = userEvent.setup();
+    const { root } = await show(["```ts\nconst x = \"a\"; // why\n```", "```klingon\nqapla'\n```", "```\nplain <b>\n```"].join("\n\n"));
+    const [ts, unknown, bare] = [...root.querySelectorAll<HTMLElement>("[data-ds=code-block]")];
+    // Tokens as elements (never markup from a string), coloured by the theme through their classes.
+    const code = ts!.querySelector("code")!;
+    expect(code).toHaveAttribute("data-highlighted");
+    expect(code.querySelector(".hljs-keyword")).toHaveTextContent("const");
+    expect(code.querySelector(".hljs-string")).toHaveTextContent('"a"');
+    expect(code.querySelector(".hljs-comment")).toHaveTextContent("// why");
+    expect(ts).toHaveTextContent(/^ts/);
+    // A language it doesn't know, or none, stays plain text: nothing guessed.
+    expect(unknown!.querySelector("code")).not.toHaveAttribute("data-highlighted");
+    expect(unknown!.querySelector("[class^=hljs]")).toBeNull();
+    expect(bare!.querySelector("code")!.innerHTML).toBe('<span data-line="">plain &lt;b&gt;\n</span>');
+    // Copy takes the code's text, not its token spans.
+    await user.click(within(ts!).getByRole("button", { name: "Copy" }));
+    expect(await navigator.clipboard.readText()).toBe('const x = "a"; // why');
+    expect(await within(ts!).findByRole("button", { name: "Copied" })).toBeInTheDocument();
+  });
+
+  it("shows a long fence's first 20 lines, then all of it on asking; Copy copies all of it either way", async () => {
+    const user = userEvent.setup();
+    // A comment spanning lines 1-3: cut into a token per line, each still a comment.
+    const lines = ["/* one", "   two", "   three */", ...Array.from({ length: 27 }, (_, i) => `const v${i + 4} = ${i + 4};`)];
+    const { root } = await show("```ts\n" + lines.join("\n") + "\n```");
+    const block = root.querySelector<HTMLElement>("[data-ds=code-block]")!;
+    const shown = () => [...block.querySelectorAll("code [data-line]")].map((l) => l.textContent!.replace(/\n$/, ""));
+    expect(shown()).toEqual(lines.slice(0, 20));
+    expect([...block.querySelectorAll("code [data-line]")].slice(0, 3).map((l) => l.querySelector(".hljs-comment")?.textContent)).toEqual(["/* one", "   two", "   three */"]);
+    await user.click(within(block).getByRole("button", { name: "Copy" }));
+    expect(await navigator.clipboard.readText()).toBe(lines.join("\n"));
+    const more = within(block).getByRole("button", { name: "Show all 30 lines" });
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    await user.click(more);
+    expect(shown()).toEqual(lines);
+    await user.click(within(block).getByRole("button", { name: "Show fewer lines" }));
+    expect(shown()).toHaveLength(20);
+  });
+
+  it("shows a fence of 25 lines whole, with no Show all", async () => {
+    const { root } = await show("```\n" + Array.from({ length: 25 }, (_, i) => `line ${i}`).join("\n") + "\n```");
+    expect(root.querySelectorAll("code [data-line]")).toHaveLength(25);
+    expect(within(root).queryByRole("button", { name: /Show all/ })).toBeNull();
+  });
+
+  it("leaves a fence longer than the cap plain, and highlights console sessions as sessions, scripts as scripts", async () => {
+    const big = "const x = 1;\n".repeat(Math.ceil(HIGHLIGHT_MAX / 13) + 1);
+    const { root } = await show(["```ts\n" + big + "```", "```console\n$ npm test\nok\n```"].join("\n\n"));
+    const [long, session] = [...root.querySelectorAll<HTMLElement>("[data-ds=code-block] code")];
+    expect(long).not.toHaveAttribute("data-highlighted");
+    expect(session).toHaveAttribute("data-highlighted");
+    expect(session!.querySelector(".hljs-meta")).toHaveTextContent("$");
   });
 
   it("escapes raw HTML: it shows as text, never as markup", async () => {

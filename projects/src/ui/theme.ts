@@ -62,6 +62,18 @@ export const roleText = {
   dark: { primary: 3, danger: 3, warning: 3, success: 3 },
 } as const;
 
+/**
+ * The syntax colors of a code block (the skill's syntax table; the owner, 2026-11-06): the only color
+ * inside one, each AA on the `subtle` ground it sits on and every two at least ΔE 20 apart (theme.test.ts).
+ * Six softened Bootstrap hues, the muted gray for comments and the text color for punctuation; not the
+ * roles' text shades.
+ */
+export const syntax = {
+  light: { keyword: "#2f5fa8", string: "#237047", number: "#a4510b", title: "#6a3fb0", type: "#0b6680", attribute: "#0b6680", punctuation: "#212529", comment: "#666e76", addition: "#237047", deletion: "#b02a37" },
+  dark: { keyword: "#7ea6e6", string: "#74c69d", number: "#e8a35c", title: "#b49ae6", type: "#5ccfe6", attribute: "#5ccfe6", punctuation: "#e9ecef", comment: "#9aa0a6", addition: "#74c69d", deletion: "#ec8a92" },
+} as const;
+export type SyntaxToken = keyof (typeof syntax)["light"];
+
 /** The warning role's text shade on the terminal surface, per scheme. */
 export const terminalWarning = { light: 9, dark: 3 } as const;
 
@@ -173,6 +185,8 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
     // darker in light (shade 8 is under AA there), each checked by theme.test.ts.
     "--nest-term-muted": neutrals[s].terminalMuted,
     "--nest-term-warning": palette.warning[terminalWarning[s]],
+    // A code block's syntax colors (`--nest-syntax-keyword`, …).
+    ...Object.fromEntries(Object.entries(syntax[s]).map(([k, v]) => [`--nest-syntax-${k}`, v])),
     "--mantine-color-body": neutrals[s].surface,
     "--mantine-color-text": neutrals[s].text,
     "--mantine-color-bright": neutrals[s].text,
