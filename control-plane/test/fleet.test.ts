@@ -642,6 +642,28 @@ describe("autoscaling", () => {
     expect(ec2.launched).toHaveLength(2);
   });
 
+  it("an instance whose launch was ended for not enrolling can't enroll late: refused, no host, and it is terminated", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running");
+    await autoscaled(cell, ec2);
+    await createSandbox(cell, 202);
+    expect(ec2.launched).toHaveLength(1);
+    // The enroll timeout passes: the launch is ended and its instance terminated.
+    await tickAt(cell, ec2, 601_000);
+    expect(((await fleetStub(cell).fleetView()) as { launches: unknown[] }).launches[0]).toMatchObject({ instance_id: "i-000000001", reason: "enroll_timeout" });
+    expect(ec2.terminated).toEqual(["i-000000001"]);
+    const hosts = async () => ((await fleetStub(cell).fleetView()) as { hosts: unknown[] }).hosts.length;
+    const before = await hosts();
+    // Its enrollment arrives late: refused; nothing enrolled, nothing placeable.
+    await expect(Promise.resolve().then(() => enrollLaunched(cell, "i-000000001"))).rejects.toThrow(/launch was ended \(enroll_timeout\); it is being terminated/);
+    expect(await hosts()).toBe(before);
+    expect(await runInDurableObject(fleetStub(cell), (_i, state) => state.storage.sql.exec<{ host: string | null }>("SELECT host FROM launched WHERE instance_id = 'i-000000001'").one().host)).toBeNull();
+    // And the tick keeps terminating it until EC2 says it's gone.
+    ec2.terminated.length = 0;
+    await tickAt(cell, ec2);
+    expect(ec2.terminated).toEqual(["i-000000001"]);
+  });
+
   it("retires a launched host that enrolled but never said hello once the enroll timeout passes (B-8)", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("running");
