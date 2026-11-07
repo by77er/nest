@@ -335,6 +335,19 @@ describe("cost guards", () => {
     expect(stopsOf(run.agent)).toHaveLength(1);
   });
 
+  it("deleting a routine deletes its runs' turns", async () => {
+    const s = await setup();
+    const id = await create(s);
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const run = await liveRun(s, id);
+    await deliver({ id: eid(), type: "agent.turn_completed", agent: run.agent, turn: 1, text: "Done." });
+    await exited(run.agent);
+    const turns = () => runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM run_turns WHERE run = ?", run.id).one().n);
+    expect(await turns()).toBe(1);
+    expect((await api(token, "DELETE", `/api/projects/${s.id}/routines/${id}`)).status).toBe(200);
+    expect(await turns()).toBe(0);
+  });
+
   it("a redelivered turn is counted once", async () => {
     const s = await setup();
     const id = await create(s, { max_turns: 2 });
@@ -508,6 +521,32 @@ describe("the transcript grant at a dreaming run's spawn", () => {
       action: "read_transcript", resource: `agent{project=${s.id}}`, limits: { max_age_ms: FIRST_DREAM_WINDOW_MS, max_entries: DREAM_MAX_ENTRIES }, expires_ms: run.deadline_ms,
     }]);
     expect(fake.inbox.find((m) => m.agent === run.agent)!.text).toContain("read_transcript");
+  });
+});
+
+describe("a start's requests are frozen at its first attempt", () => {
+  it("a routine edited while its start is retried sends the same template, body and brief", async () => {
+    const s = await setup();
+    const r = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
+    fake.lost.push({ match: /^POST \/v1\/agents$/, times: 1 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${r.id}/run`);
+    const first = (await runs(s, r.id))[0];
+    expect(first.state).toBe("starting");
+    // Edited meanwhile: another kind (a sandbox and the routine template) and another prompt.
+    expect((await api(token, "PATCH", `/api/projects/${s.id}/routines/${r.id}`, { kind: "review", prompt: "Something else." })).status).toBe(200);
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE id = ?", first.id);
+    });
+    await settle(s);
+    const run = await liveRun(s, r.id);
+    expect(run.state).toBe("running");
+    const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id);
+    expect(creates.map((c) => c.body.template)).toEqual(["projects/dreaming", "projects/dreaming"]);
+    expect(creates[1]!.body).toEqual(creates[0]!.body);
+    expect(fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/sandboxes" && c.body.labels?.run === run.id)).toEqual([]);
+    const brief = fake.inbox.find((m) => m.agent === run.agent)!.text;
+    expect(brief).toContain("Consolidate the project's memory");
+    expect(brief).not.toContain("Something else.");
   });
 });
 

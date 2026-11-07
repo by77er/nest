@@ -18,7 +18,7 @@ export interface Note {
   text: string;
   /** Who wrote it last: `manager`, `routine:<name>` (with its run), or the owner. */
   source: string;
-  /** Whether the session that wrote it last was tainted (shown; it gates nothing). */
+  /** Whether the session that wrote it last was tainted: shown, and it gates provenance (a tainted session can't change or delete an untainted note). */
   tainted: boolean;
   created_ms: number;
   updated_ms: number;
