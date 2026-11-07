@@ -2,11 +2,11 @@
 // the operator's agents may fall back to the default; an API client's agent runs only on the credential
 // its spec names, while its grant names it, or its start is refused, visibly. Pure table first, then
 // through the Worker, AgentDO, BrokerDO and FleetDO (the value a brain host actually receives).
-import { SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BrokerDO, secretRef } from "../src/do/broker";
 import { credentialFor, type CredentialPrincipal, DEFAULT_CREDENTIAL } from "../src/lib/credentials";
-import { adminJson, BASE, connectHost, eventually, nextCommands, uniqueCell } from "./helpers";
+import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueCell } from "./helpers";
 
 // --- Pure -------------------------------------------------------------------------------------------------
 
@@ -194,6 +194,29 @@ describe("a client's agent and the operator's default token", () => {
     } finally {
       proto.credentialRef = real;
     }
+  });
+
+  it("an older refusal's reason never labels a later error: entered another way, it says errored and the reason goes", async () => {
+    const w = await world();
+    await adminJson(`/v1/admin/secrets/${w.cred}`, { method: "PUT", body: { value: "sk-ant-oat01-tenant" } });
+    const a = await asJson(w.token, "/v1/agents", { body: { template: w.tpl, cell: w.cell } }, 201);
+    await nextCommands(w.brain.ws, (x) => x.type === "agent_start" && x.agent === a.agent);
+    // A refusal's reason left on the record (as a refusal with a live brain once left it), then the start
+    // deadline passes with no hello: errored, by another route.
+    const stub = env.AGENT.get(env.AGENT.idFromName(a.agent));
+    await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.start_error = { code: "forbidden", message: "an old refusal", ms: 1 };
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'starting'");
+    });
+    await runDue(stub);
+    const rec = await asJson(w.token, `/v1/agents/${a.agent}`);
+    expect(rec.lifecycle).toBe("errored");
+    expect(rec.start_error).toBeUndefined();
+    const e = await eventually("agent.error", () => w.events().find((x) => x.type === "agent.error" && x.agent === a.agent));
+    expect(e).toMatchObject({ code: "errored" });
+    expect(e.message).not.toContain("an old refusal");
   });
 
   it("the operator's own agents keep falling back to the default", async () => {
