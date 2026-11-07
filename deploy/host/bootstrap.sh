@@ -45,6 +45,16 @@ EOF
   exit 0
 fi
 
+# A sandbox host runs its sandboxes in Firecracker under the jailer, or not at all. Without /dev/kvm
+# (nested virtualization) or without firecracker in the release, it refuses the sandbox role: it
+# writes no config, enables nothing and never enrolls, and FleetDO's enroll timeout ends the
+# instance. There is no fallback: the process driver runs every guest, and agents' Bash with it,
+# as root on the host. It is for development and e2e only, and nestd refuses it on a cell host.
+if [ ! -e /dev/kvm ] || [ ! -x /opt/nest/bin/firecracker ]; then
+  echo "refusing the sandbox role: no /dev/kvm (nested virtualization) or no firecracker in the release; this host enables nothing and never enrolls" >&2
+  exit 1
+fi
+
 # Sandbox state on the instance-store NVMe, where the instance type has one (c8id): formatted XFS
 # with reflink at first boot (fstab mounts it again after a reboot; a stop wipes it, as the root
 # volume's sandbox state dies with a spot host anyway). A checkpoint then cuts a disk with a reflink
@@ -102,26 +112,19 @@ else
   echo "no instance store: sandbox state stays on the root volume, and checkpoints pause VMs for whole reads"
 fi
 
-# Sandboxes run in Firecracker when the instance has KVM (nested virtualization, set in the launch
-# template); otherwise in the process driver, so a host never comes up unusable.
-if [ -e /dev/kvm ] && [ -x /opt/nest/bin/firecracker ]; then
-  BASE=$IMAGES_DIR/nest-base:latest.ext4
-  [ -f "$BASE" ] || { zstd -q -d -f /var/lib/nest/images/nest-base.ext4.zst -o "$BASE.tmp" && mv "$BASE.tmp" "$BASE"; }
-  # Guest memory is regular pages, demand-paged and overcommitted: a guest costs what it touches,
-  # and the control plane packs by MemAvailable (docs/sandbox/state/memory/). No hugepage pool:
-  # one would be a reservation that caps occupancy at pool / declared size. The jailer caps each
-  # VM's cgroup at its declared memory plus a VMM overhead, and nest's services carry a low OOM
-  # score, so a guest that outgrows its declaration dies alone.
-  rm -f /etc/sysctl.d/90-nest-hugepages.conf
-  sysctl -q -w vm.nr_hugepages=0 || true
-  DRIVER='{"type": "firecracker", "firecracker_bin": "/opt/nest/bin/firecracker", "jailer_bin": "/opt/nest/bin/jailer",
-    "jailer": {"uid": 900, "gid": 900, "chroot_base_dir": "'"$JAILER_BASE"'"},
-    "kernel_image": "'"$KERNEL_DIR"'/vmlinux", "images_dir": "'"$IMAGES_DIR"'", "huge_pages": false}'
-else
-  echo "no /dev/kvm (or no firecracker in the release): using the process driver"
-  DRIVER='{"type": "process", "guest_command": ["/opt/nest/bin/nest-guest", "--state-dir", "/var/lib/nest/guest",
-    "--cgroup-root", "none", "--cli-socket", "none", "--run-as", "none"], "mount_disk": true}'
-fi
+# Sandboxes run in Firecracker under the jailer (KVM was checked above).
+BASE=$IMAGES_DIR/nest-base:latest.ext4
+[ -f "$BASE" ] || { zstd -q -d -f /var/lib/nest/images/nest-base.ext4.zst -o "$BASE.tmp" && mv "$BASE.tmp" "$BASE"; }
+# Guest memory is regular pages, demand-paged and overcommitted: a guest costs what it touches,
+# and the control plane packs by MemAvailable (docs/sandbox/state/memory/). No hugepage pool:
+# one would be a reservation that caps occupancy at pool / declared size. The jailer caps each
+# VM's cgroup at its declared memory plus a VMM overhead, and nest's services carry a low OOM
+# score, so a guest that outgrows its declaration dies alone.
+rm -f /etc/sysctl.d/90-nest-hugepages.conf
+sysctl -q -w vm.nr_hugepages=0 || true
+DRIVER='{"type": "firecracker", "firecracker_bin": "/opt/nest/bin/firecracker", "jailer_bin": "/opt/nest/bin/jailer",
+  "jailer": {"uid": 900, "gid": 900, "chroot_base_dir": "'"$JAILER_BASE"'"},
+  "kernel_image": "'"$KERNEL_DIR"'/vmlinux", "images_dir": "'"$IMAGES_DIR"'", "huge_pages": false}'
 
 # The gateway runs as nest-gw (install.sh made it; its ids are the AMI's, read back here): nestd
 # lets only that uid on gateway.sock and gives its group the socket and each VM's vsock socket. A

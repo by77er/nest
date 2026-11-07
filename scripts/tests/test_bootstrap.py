@@ -72,6 +72,15 @@ def render(role: str, fake: Path) -> str:
 USER_DATA_MAX = 16384
 
 
+class NoProcessDriver(unittest.TestCase):
+    def test_no_role_ever_configures_the_process_driver(self):
+        """The process driver runs every guest as root on the host: development and e2e only. No
+        rendering of the user data may name it (nestd refuses it on a cell host besides)."""
+        for role in ("burst", "controller"):
+            self.assertNotIn('"process"', rendered(role).replace(" ", ""), role)
+            self.assertNotIn('"type":"process"', rendered(role).replace(" ", ""), role)
+
+
 class UserDataSize(unittest.TestCase):
     def test_the_user_data_fits_ec2s_limit_gzipped(self):
         """The stack gzips each template's user data (cloud-init unpacks it), and what EC2 counts is
@@ -94,10 +103,11 @@ def stub(bin_dir: Path, name: str, body: str) -> None:
 
 @unittest.skipUnless(SYSTEMCTL, "needs systemctl (for `systemctl --root`)")
 class Bootstrap(unittest.TestCase):
-    def run_role(self, role: str, nestd: str = "current", nvme: bool | str = False):
+    def run_role(self, role: str, nestd: str = "current", nvme: bool | str = False, kvm: bool = True, firecracker: bool = True):
         """`nestd`: the installed release's nestd, `current` (`--features` lists `gateway-user`) or
         `previous` (doesn't: a host launched before the release is published). `nvme`: the instance
-        has an instance-store disk (lsblk lists one; mkfs, mount and xfs_info are stubs)."""
+        has an instance-store disk (lsblk lists one; mkfs, mount and xfs_info are stubs). `kvm` and
+        `firecracker`: the host has `/dev/kvm` and the release has firecracker."""
         fake = Path(tempfile.mkdtemp(prefix="nest-boot-"))
         self.addCleanup(shutil.rmtree, fake, ignore_errors=True)
         bin_dir = fake / "stub-bin"
@@ -143,10 +153,13 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         else:
             stub(bin_dir, "lsblk", 'echo "/dev/nvme0n1 Amazon Elastic Block Store"\n')
         script = fake / "user-data.sh"
-        # A host with KVM and Firecracker, so nestd.json names the jailer's chroots (what the gateway
-        # must reach): /dev isn't moved under the fake root, so its KVM node is a stand-in file.
-        (fake / "dev-kvm").write_text("")
-        stub(fake / "opt/nest/bin", "firecracker", "exit 0\n")
+        # By default a host with KVM and Firecracker, so nestd.json names the jailer's chroots (what
+        # the gateway must reach): /dev isn't moved under the fake root, so its KVM node is a
+        # stand-in file.
+        if kvm:
+            (fake / "dev-kvm").write_text("")
+        if firecracker:
+            stub(fake / "opt/nest/bin", "firecracker", "exit 0\n")
         script.write_text(render(role, fake).replace("/dev/kvm", f"{fake}/dev-kvm"))
         env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(fake / "root")}
         proc = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=env, timeout=60)
@@ -255,6 +268,27 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         self.assertIn("CapabilityBoundingSet=CAP_DAC_OVERRIDE", unit)
         self.assertFalse([line for line in unit if line.startswith(("User=", "Group="))], unit)
         self.assertIn("NoNewPrivileges=yes", unit)
+
+    def test_a_sandbox_host_without_kvm_or_firecracker_refuses_the_role(self):
+        """No /dev/kvm (or no firecracker in the release): the user data fails, writes no nestd.json,
+        enables nothing and touches no disk, so the host never enrolls (FleetDO's enroll timeout ends
+        it). It never falls back to the process driver, which runs every guest as root on the host."""
+        for kvm, firecracker in ((False, True), (True, False), (False, False)):
+            fake, proc, calls = self.run_role("burst", nvme=True, kvm=kvm, firecracker=firecracker)
+            what = f"kvm={kvm} firecracker={firecracker}"
+            self.assertNotEqual(proc.returncode, 0, f"{what}: the sandbox role was taken\n{proc.stdout[-2000:]}")
+            self.assertIn("refusing the sandbox role", proc.stdout + proc.stderr + (fake / "var/log/nest-bootstrap.log").read_text(), what)
+            self.assertFalse((fake / "etc/nest/nestd.json").exists(), f"{what}: a config was written")
+            wants = fake / "etc/systemd/system/multi-user.target.wants"
+            self.assertFalse(wants.exists() and any(wants.iterdir()), f"{what}: units enabled")
+            self.assertNotIn("enable", calls, what)
+            self.assertFalse((fake / "disk.log").exists(), f"{what}: the instance store was formatted")
+
+    def test_a_brain_host_needs_no_kvm(self):
+        """Brain hosts never have KVM (no nested virtualization): the refusal is the sandbox role's."""
+        fake, proc, calls = self.run_role("controller", kvm=False, firecracker=False)
+        self.assertEqual(proc.returncode, 0, proc.stdout[-2000:] + proc.stderr[-2000:])
+        self.assertIn("enable", calls)
 
     @staticmethod
     def gateway_unit(fake: Path) -> list:

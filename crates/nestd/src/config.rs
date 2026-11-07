@@ -288,7 +288,10 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         match self.role {
             HostRole::Sandbox => {
-                anyhow::ensure!(self.driver.is_some(), "a sandbox host needs a `driver`");
+                let Some(driver) = &self.driver else { anyhow::bail!("a sandbox host needs a `driver`") };
+                if let Some(why) = cell_host_refusal(&self.enrollment, driver) {
+                    anyhow::bail!("{why}");
+                }
             }
             HostRole::Brain => {
                 let mut extra = vec![];
@@ -312,7 +315,28 @@ impl Config {
         }
         Ok(())
     }
+}
 
+/// Why a sandbox host refuses `driver`, if it does. A host that enrolls with its AWS identity is a
+/// cell host, and a cell host runs guests only in Firecracker under the jailer: the process driver
+/// and an unjailed Firecracker run every guest (the process driver its agents' Bash too) with
+/// nestd's privileges, as root on the host. Both stay for development and the e2e harness, which
+/// enroll with a token file or static credentials. `deploy/host/bootstrap.sh` refuses the sandbox
+/// role without KVM, so a cell host never writes one; this is the backstop.
+pub fn cell_host_refusal(enrollment: &EnrollmentConfig, driver: &DriverConfig) -> Option<&'static str> {
+    if !matches!(enrollment, EnrollmentConfig::AwsImds { .. }) {
+        return None;
+    }
+    match driver {
+        DriverConfig::Process { .. } => Some("a cell host (aws_imds enrollment) refuses the process driver: it runs every guest as root on the host; use Firecracker under the jailer"),
+        DriverConfig::Firecracker(fc) if fc.jailer_bin.is_none() || fc.jailer.is_none() => {
+            Some("a cell host (aws_imds enrollment) refuses Firecracker without the jailer: it runs every VMM with nestd's privileges; set `jailer_bin` and `jailer`")
+        }
+        DriverConfig::Firecracker(_) => None,
+    }
+}
+
+impl Config {
     /// What must exist before nestd starts: a Firecracker driver's kernel and images directory. On
     /// an instance store left blank by a stop and start (user data doesn't run again), they are
     /// gone, and a host that started anyway would enroll and fail every sandbox it was given.
@@ -475,6 +499,48 @@ mod tests {
         }
     }
 
+    /// A cell host (one that enrolls with its AWS identity) runs guests only in Firecracker under
+    /// the jailer: the process driver and an unjailed Firecracker, which run guests with nestd's
+    /// privileges, are refused at start; a host enrolling any other way (development, the e2e
+    /// harness) may use either, and a brain host has no driver to refuse.
+    #[test]
+    fn a_cell_host_runs_guests_only_under_the_jailer() {
+        let process = serde_json::json!({"type": "process", "guest_command": ["g"]});
+        let fc = |jailed: bool| {
+            let mut d = serde_json::json!({"type": "firecracker", "firecracker_bin": "/fc", "kernel_image": "/k", "images_dir": "/i"});
+            if jailed {
+                d["jailer_bin"] = "/jailer".into();
+                d["jailer"] = serde_json::json!({"uid": 900, "gid": 900, "chroot_base_dir": "/srv/jailer"});
+            }
+            d
+        };
+        let half = {
+            let mut d = fc(false);
+            d["jailer_bin"] = "/jailer".into();
+            d
+        };
+        let aws = serde_json::json!({"type": "aws_imds"});
+        let token = serde_json::json!({"type": "token_file", "path": "/t"});
+        let fixed = serde_json::json!({"type": "static", "host": "hst_1", "host_token": "t", "fleet_ws_url": "ws://x"});
+        let cases = [
+            (&aws, &process, Some("refuses the process driver")),
+            (&aws, &fc(false), Some("refuses Firecracker without the jailer")),
+            (&aws, &half, Some("refuses Firecracker without the jailer")),
+            (&aws, &fc(true), None),
+            (&token, &process, None),
+            (&token, &fc(false), None),
+            (&fixed, &process, None),
+        ];
+        for (enrollment, driver, refused) in cases {
+            let cfg: Config = serde_json::from_value(serde_json::json!({"role": "sandbox", "cell": "c", "enrollment": enrollment, "driver": driver})).unwrap();
+            match (cfg.validate(), refused) {
+                (Ok(()), None) => {}
+                (Err(e), Some(why)) => assert!(e.to_string().contains(why), "{enrollment} {driver}: {e}"),
+                (r, want) => panic!("{enrollment} {driver}: {r:?}, wanted a refusal: {want:?}"),
+            }
+        }
+    }
+
     /// The gateway's group owns `gateway.sock` when set, else the shared group does; it parses
     /// from a host's `sockets` block and is absent from an older config.
     #[test]
@@ -513,7 +579,8 @@ mod tests {
         assert_eq!(cfg.gateway_sock(), PathBuf::from(paths::GATEWAY_SOCK));
         assert_eq!(cfg.agents_dir(), PathBuf::from(paths::AGENTS_DIR));
         assert!(matches!(cfg.storage, StorageConfig::Local));
-        cfg.validate().unwrap();
+        // A cell host (AWS identity) with the process driver: parsed, and refused at start.
+        assert!(cfg.validate().unwrap_err().to_string().contains("refuses the process driver"));
         let s3: StorageConfig = serde_json::from_value(serde_json::json!({"type": "s3", "bucket": "b", "region": "us-east-1"})).unwrap();
         assert!(matches!(s3, StorageConfig::S3 { ref prefix, .. } if prefix == "store/"));
     }
