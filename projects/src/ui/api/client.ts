@@ -5,6 +5,7 @@ import type {
   NetworkBody, NetworkView, Waits, AcceptIssueBody, DeclineIssueBody, Issue,
   AddDependencyBody, PutSecretBody, SecretsAnswer, SecretView, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
   Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
+  CreateRoutineBody, DeclineProposalBody, Note, Proposal, Routine, RoutineRun, RoutinesAnswer, UpdateRoutineBody,
 } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
@@ -91,6 +92,19 @@ export const api = {
   setNetwork: (id: string, b: NetworkBody) => call<NetworkView>("PUT", `${prj(id)}/network`, b),
   retryAttach: (id: string) => call<Settings>("POST", `${prj(id)}/attach`),
   reviews: (id: string) => call<Job[]>("GET", `${prj(id)}/reviews`),
+
+  routines: (id: string) => call<RoutinesAnswer>("GET", `${prj(id)}/routines`),
+  createRoutine: (id: string, b: CreateRoutineBody) => call<Routine>("POST", `${prj(id)}/routines`, b),
+  updateRoutine: (id: string, routine: string, b: UpdateRoutineBody) => call<Routine>("PATCH", `${prj(id)}/routines/${encodeURIComponent(routine)}`, b),
+  deleteRoutine: (id: string, routine: string) => call<{ deleted: string }>("DELETE", `${prj(id)}/routines/${encodeURIComponent(routine)}`),
+  runRoutine: (id: string, routine: string) => call<Routine>("POST", `${prj(id)}/routines/${encodeURIComponent(routine)}/run`),
+  routineRuns: (id: string) => call<RoutineRun[]>("GET", `${prj(id)}/routine-runs`),
+  stopRun: (id: string, run: string) => call<RoutineRun>("POST", `${prj(id)}/routine-runs/${encodeURIComponent(run)}/stop`),
+  proposals: (id: string) => call<Proposal[]>("GET", `${prj(id)}/proposals`),
+  acceptProposal: (id: string, p: string) => call<Task>("POST", `${prj(id)}/proposals/${encodeURIComponent(p)}/accept`),
+  declineProposal: (id: string, p: string, b: DeclineProposalBody) => call<{ declined: string }>("POST", `${prj(id)}/proposals/${encodeURIComponent(p)}/decline`, b),
+  memory: (id: string) => call<Note[]>("GET", `${prj(id)}/memory`),
+  deleteNote: (id: string, key: string) => call<{ deleted: string }>("DELETE", `${prj(id)}/memory/${encodeURIComponent(key)}`),
 
   syncState: () => call<SyncState | null>("GET", "/admin/sync-state"),
   sync: () => call<SyncResult>("POST", "/admin/sync"),

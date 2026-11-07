@@ -46,6 +46,16 @@ export const filled = {
   dark: { shade: 5, text: { primary: "#121314", danger: "#121314", warning: "#121314", success: "#121314" } },
 } as const;
 
+/**
+ * A filled button's hover shade, per scheme and role: away from the label so it keeps AA (theme.test.ts).
+ * Mantine's default (one shade darker) puts the dark label in dark on 3.7:1, and darkens warning under its
+ * dark label in light.
+ */
+export const filledHover = {
+  light: { primary: 7, danger: 7, warning: 5, success: 7 },
+  dark: { primary: 4, danger: 4, warning: 4, success: 4 },
+} as const;
+
 /** The shade a role's text takes on the surface, per scheme (`c="danger"`; theme.test.ts checks AA). */
 export const roleText = {
   light: { primary: 7, danger: 7, warning: 8, success: 7 },
@@ -169,6 +179,9 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
     "--mantine-color-dimmed": neutrals[s].muted,
     "--mantine-color-default-border": neutrals[s].border,
     ...Object.fromEntries(ROLES.map((r) => [`--nest-on-${r}`, filled[s].text[r]])),
+    // A filled button's hover (Mantine's own variables, which its filled variant reads).
+    ...Object.fromEntries(ROLES.map((r) => [`--mantine-color-${r}-filled-hover`, palette[r][filledHover[s][r]]])),
+    "--mantine-primary-color-filled-hover": palette.primary[filledHover[s].primary],
     // Mantine's error color (a field's error, the required asterisk) is the danger role's text shade.
     "--mantine-color-error": palette.danger[roleText[s].danger],
     // A role's text on the surface (`c="warning"`): dark enough in light, light enough in dark, for AA.

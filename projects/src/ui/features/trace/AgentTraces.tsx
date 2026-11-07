@@ -20,3 +20,8 @@ export function TaskTraces({ task }: { task: Pick<Task, "assignee"> }) {
 export function ReviewTrace({ job }: { job: { pr: number; agent: string | null } }) {
   return <TraceView key={job.agent ?? ""} title={`Reviewer of #${job.pr}`} agent={job.agent} empty="No reviewer has started on this review yet." />;
 }
+
+/** A routine run's agent's trace (the Routines page, per run). */
+export function RunTrace({ run, name }: { run: { agent: string | null; n: number }; name: string }) {
+  return <TraceView key={run.agent ?? ""} title={`${name}, run ${run.n}`} agent={run.agent} empty="This run's agent hasn't started yet." />;
+}

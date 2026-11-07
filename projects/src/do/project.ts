@@ -442,6 +442,13 @@ export const MIGRATIONS = [
     `CREATE TABLE proposals (id TEXT PRIMARY KEY, routine TEXT NOT NULL, routine_name TEXT NOT NULL, run TEXT NOT NULL, agent TEXT NOT NULL, title TEXT NOT NULL,
       body TEXT NOT NULL, state TEXT NOT NULL, task TEXT, reason TEXT, tainted INTEGER NOT NULL, created_ms INTEGER NOT NULL, triaged_ms INTEGER)`,
   ],
+  [
+    // A run's template and brief, frozen with its spawn's extras at its first start attempt: a routine
+    // edited while the start is retried doesn't change what's sent under the same keys. A run frozen by
+    // the release before has them null: its routine's current kind and fields then, as that release did.
+    "ALTER TABLE routine_runs ADD COLUMN template TEXT",
+    "ALTER TABLE routine_runs ADD COLUMN brief TEXT",
+  ],
 ] as const;
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
@@ -2412,6 +2419,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (!this.routineRow(id)) return fail(404, "unknown routine");
     if (this.liveRuns(id) > 0) return fail(409, "the routine has a run going: stop it first");
     this.sql.exec("DELETE FROM routines WHERE id = ?", id);
+    this.sql.exec("DELETE FROM run_turns WHERE run IN (SELECT id FROM routine_runs WHERE routine = ?)", id);
     this.sql.exec("DELETE FROM routine_runs WHERE routine = ?", id);
     await this.arm();
     return ok({ deleted: id });
@@ -2506,24 +2514,33 @@ export class ProjectDO extends DurableObject<Env> {
     }
     const labels = { project: s.id, role: "routine", routine: routine.id as string, run: id };
     const current = () => this.runRow(id)?.state === "starting";
-    // Its deadline and its spawn's extra fields (a dreaming run's transcript grant, which expires at that
-    // deadline), decided at its first attempt and kept: a retried create sends the request its key was bound to.
+    // Its deadline, its template, its spawn's extra fields (a dreaming run's transcript grant, which expires
+    // at that deadline) and its brief, decided at its first attempt and kept: a retry sends the requests its
+    // keys were bound to, however the routine was edited meanwhile.
+    const briefOf = (spawn: Record<string, unknown>) => runBrief({
+      project: { id: s.id, name: s.name, repo: s.repo },
+      routine: { id: routine.id as string, name: routine.name as string, kind: routine.kind as RoutineKind, prompt: routine.prompt as string, max_minutes: routine.max_minutes as number, proposals: routine.proposals as "triage" | "draft" },
+      run: { id, trigger: before.trigger as TriggerKind, count: (before.count as number | null) ?? null },
+      last_start_ms: (routine.prev_start_ms as number | null) ?? null,
+      transcripts: Array.isArray(spawn.grants) && spawn.grants.length > 0,
+    });
     if (before.spawn === null) {
       const now = Date.now();
       const deadline = now + (routine.max_minutes as number) * 60_000;
-      const extras = routineSpawnExtras({
-        kind: routine.kind as RoutineKind, project: s.id, deadline_ms: deadline, last_start_ms: (routine.prev_start_ms as number | null) ?? null, now,
-      });
-      this.sql.exec("UPDATE routine_runs SET spawn = ?, deadline_ms = ? WHERE id = ? AND spawn IS NULL", JSON.stringify(extras), deadline, id);
+      const kind = routine.kind as RoutineKind;
+      const extras = routineSpawnExtras({ kind, project: s.id, deadline_ms: deadline, last_start_ms: (routine.prev_start_ms as number | null) ?? null, now });
+      this.sql.exec("UPDATE routine_runs SET spawn = ?, deadline_ms = ?, template = ?, brief = ? WHERE id = ? AND spawn IS NULL",
+        JSON.stringify(extras), deadline, kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine, briefOf(extras), id);
     }
     const frozen = this.runRow(id)!;
     const spawn = JSON.parse(frozen.spawn as string) as Record<string, unknown>;
+    const template = (frozen.template as string | null) ?? (routine.kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine);
     try {
       let agent = (before.agent as string | null) ?? null;
       if (!agent) {
         // No secrets and no egress beyond nest's own and the repo's: a routine reads the repo and the board.
         // A dreaming run has no hands (no sandbox, no repo): the board, recent work, memory and transcripts are all it reads.
-        agent = routine.kind === "dreaming"
+        agent = template === TEMPLATE.dreaming
           ? (await nest.createAgent({ ...spawn, template: TEMPLATE.dreaming, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent
           : await nest.startAgent(TEMPLATE.routine, labels, { read: s.repo }, `${s.id}/routine/${id}`, {}, spawn);
         await directory(this.env).recordAgent({ agent, project: s.id, role: "routine", task: null, pr: null });
@@ -2533,13 +2550,7 @@ export class ProjectDO extends DurableObject<Env> {
           return;
         }
       }
-      const brief = runBrief({
-        project: { id: s.id, name: s.name, repo: s.repo },
-        routine: { id: routine.id as string, name: routine.name as string, kind: routine.kind as RoutineKind, prompt: routine.prompt as string, max_minutes: routine.max_minutes as number, proposals: routine.proposals as "triage" | "draft" },
-        run: { id, trigger: before.trigger as TriggerKind, count: (before.count as number | null) ?? null },
-        last_start_ms: (routine.prev_start_ms as number | null) ?? null,
-        transcripts: Array.isArray(spawn.grants) && spawn.grants.length > 0,
-      });
+      const brief = (frozen.brief as string | null) ?? briefOf(spawn);
       await nest.postInbox(agent, brief, { requestId: `${id}/brief` });
       if (!current()) return;
       // Its time budget counts from its first attempt (the deadline its grant expires at).

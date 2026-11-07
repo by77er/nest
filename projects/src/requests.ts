@@ -87,7 +87,7 @@ const TimeZone = z.string().min(1).max(64).refine((tz) => {
 }, "an IANA time zone, like Europe/London");
 /** A routine's timer (README.md#routines): an interval of 15 minutes to 7 days, or a daily or weekly time. */
 export const Timer = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("interval"), minutes: z.number().int().min(15).max(7 * 24 * 60) }),
+  z.strictObject({ kind: z.literal("interval"), minutes: z.number().int().min(15, "At least 15 minutes").max(7 * 24 * 60, "At most 7 days (10080 minutes)") }),
   z.strictObject({ kind: z.literal("daily"), time: HHMM, tz: TimeZone }),
   // day: 0 is Sunday, as JavaScript's getDay.
   z.strictObject({ kind: z.literal("weekly"), day: z.number().int().min(0).max(6), time: HHMM, tz: TimeZone }),

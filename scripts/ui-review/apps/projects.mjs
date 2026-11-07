@@ -733,6 +733,14 @@ const app = {
     { name: "manager-trace-beginning", section: "project", path: "/projects/prj_demo/manager?view=trace", full: false, check: traceCheck, checkName: "trace", after: toTop("the beginning of the trace") },
     { name: "reviews", section: "project", path: "/projects/prj_demo/reviews" },
     { name: "reviews-trace", section: "project", path: "/projects/prj_demo/reviews", after: (p) => p.getByRole("button", { name: "Show the trace of #118" }).click(), check: traceCheck, checkName: "trace" },
+    // The Routines page (README.md#routines): routines in each state, proposals, runs, memory; empty; the editor; a run opened with its trace.
+    { name: "routines", section: "project", path: "/projects/prj_demo/routines" },
+    { name: "routines-empty", section: "project", path: "/projects/prj_demo/routines", fixture: "routines-empty" },
+    { name: "routines-long", section: "project", path: "/projects/prj_demo/routines", fixture: "routines-long" },
+    { name: "routines-add", section: "project", path: "/projects/prj_demo/routines", full: false, after: (p) => p.getByRole("button", { name: "Add routine" }).click() },
+    { name: "routine-edit", section: "project", path: "/projects/prj_demo/routines", full: false, after: (p) => p.getByRole("button", { name: "Edit Dreaming" }).click() },
+    { name: "routine-new", section: "project", path: "/projects/prj_demo/routines", full: false, after: async (p) => { await p.getByRole("button", { name: "Add routine" }).click(); await p.getByRole("menuitem", { name: /Custom routine/ }).click(); } },
+    { name: "routines-run-open", section: "project", path: "/projects/prj_demo/routines", after: async (p) => { const b = p.getByRole("button", { name: "Show run 2 of Dreaming" }); await b.scrollIntoViewIfNeeded(); await b.click(); await p.locator("[data-ds=terminal]").first().waitFor(); }, check: traceCheck, checkName: "trace" },
     // The Network page (README.md#network): rules per role, live agents applied, pending and failed; empty; a host refused.
     { name: "network", section: "project", path: "/projects/prj_demo/network" },
     { name: "network-empty", section: "project", path: "/projects/prj_demo/network", fixture: "network-empty" },

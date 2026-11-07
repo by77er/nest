@@ -7,7 +7,7 @@ import { darken, DEFAULT_THEME, mergeMantineTheme } from "@mantine/core";
 import { describe, expect, it } from "vitest";
 import { TASK_STATES } from "../tasks";
 import { STATE_COLOR, STATE_LABEL } from "./status";
-import { cssVariablesResolver, terminalWarning, filled, fontSizes, headings, layout, lineHeights, motion, neutrals, palette, radius, ROLES, roleText, spacing, theme } from "./theme";
+import { cssVariablesResolver, terminalWarning, filled, filledHover, fontSizes, headings, layout, lineHeights, motion, neutrals, palette, radius, ROLES, roleText, spacing, theme } from "./theme";
 
 // vitest runs from projects/; the skill is the repo's.
 const SKILL = readFileSync(`${process.cwd()}/../.claude/skills/nest-ui-design/SKILL.md`, "utf8");
@@ -174,6 +174,12 @@ describe("contrast, in both schemes", () => {
     }
     // And the theme uses that label: the variant resolver names the variable.
     expect(full.variantColorResolver({ color: "warning", theme: full, variant: "filled" }).color).toBe("var(--nest-on-warning)");
+    // Hovered, the label keeps AA on the hover shade (Mantine's filled-hover variables, set per scheme).
+    for (const r of ROLES) {
+      expect(vars[s][`--mantine-color-${r}-filled-hover`]).toBe(palette[r][filledHover[s][r]]);
+      expect(contrast(vars[s][`--nest-on-${r}`]!, palette[r][filledHover[s][r]]), `${r} hovered`).toBeGreaterThanOrEqual(AA);
+    }
+    expect(vars[s]["--mantine-primary-color-filled-hover"]).toBe(palette.primary[filledHover[s].primary]);
   });
 
   it.each(schemes)("%s: a light badge's text on its tint, roles and gray", (s) => {

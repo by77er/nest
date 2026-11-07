@@ -5,6 +5,8 @@
 import { type TaskEvent, transition } from "../../tasks";
 import type { Issue, SecretRequest, SecretsAnswer } from "../api/types";
 import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
+import type { Note, Proposal, Routine, RoutineRun } from "../api/types";
+import { PRESETS } from "../../routines";
 
 export interface Write {
   method: string;
@@ -25,6 +27,26 @@ export function project(over: Partial<ProjectRow> = {}): Project {
 }
 
 let seq = 0;
+
+/** A routine as the Worker answers it (README.md#routines). */
+export function routine(over: Partial<Routine> = {}): Routine {
+  seq += 1;
+  return {
+    id: `rtn_r${seq}`, name: `Routine ${seq}`, kind: "custom", prompt: "Look around.", enabled: true,
+    triggers: { timer: null, tasks_done: null, prs_merged: null }, cooldown_min: 60, max_minutes: 30, max_turns: 3, proposals: "triage", preset: null,
+    next_timer_ms: null, counts: { tasks_done: 0, prs_merged: 0 }, due: null, waiting: null, cooldown_until_ms: null, live_run: null, last_run: null, runs: 0,
+    created_ms: now - 86_400_000, updated_ms: now - 86_400_000, ...over,
+  };
+}
+
+export function run(over: Partial<RoutineRun> = {}): RoutineRun {
+  seq += 1;
+  return {
+    id: `run_u${seq}`, routine: "rtn_r1", n: 1, trigger: "timer", count: null, state: "ended", outcome: "done", agent: `agt_run${seq}`, error: null, note: null,
+    turns: 1, max_turns: 3, summary: null, created: [], queued_ms: now - 3_600_000, started_ms: now - 3_600_000, deadline_ms: now, ended_ms: now - 3_000_000, ...over,
+  };
+}
+
 export function task(over: Partial<Task> = {}): Task {
   seq += 1;
   return {
@@ -57,6 +79,10 @@ export class FakeApi {
   grant: SecretsAnswer["grant"] = { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org"], max_count: 10, max_bytes: 4096, workflows: true, used: 0 };
   secretRequests: SecretRequest[] = [];
   manager: ManagerStatus = { phase: "running", agent: "agt_manager", state: "idle", host: "bh_1", error: null };
+  routines: Routine[] = [];
+  runs: RoutineRun[] = [];
+  proposals: Proposal[] = [];
+  notes: Note[] = [];
   readonly writes: Write[] = [];
   /** Every GET's path, in order. */
   readonly reads: string[] = [];
@@ -148,7 +174,13 @@ export class FakeApi {
       this.secretRequests = this.secretRequests.filter((r) => r.id !== parts[3]);
       return json({ done: parts[3] });
     }
-    const route = `${m} ${parts.slice(2).map((s) => (/^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : /^\d+$/.test(s) ? ":n" : s)).join("/")}`;
+    if (parts[2] === "memory" && parts[3] && m === "DELETE") {
+      const key = decodeURIComponent(parts[3]);
+      this.notes = this.notes.filter((n) => n.key !== key);
+      return json({ deleted: key });
+    }
+    const route = `${m} ${parts.slice(2).map((s) => (/^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : /^rtn_/.test(s) ? ":routine" : /^run_/.test(s) ? ":run" : /^prp_/.test(s) ? ":proposal" : /^\d+$/.test(s) ? ":n" : s)).join("/")}`;
+    const rt = this.routines.find((x) => x.id === parts[3]);
     const t = this.tasks.find((x) => x.id === parts[3]);
     switch (route) {
       case "GET ":
@@ -229,6 +261,52 @@ export class FakeApi {
         a.answered_ms = now;
         return json({ delivered: true });
       }
+      case "GET routines":
+        return json({ routines: this.routines, max_routine_runs: p.settings.max_routine_runs, live: this.routines.filter((r) => r.live_run).length });
+      case "POST routines": {
+        const r = routine("preset" in body ? { ...PRESETS[body.preset as "review" | "dreaming"], preset: body.preset } : body);
+        this.routines.push(r);
+        return json(r, 201);
+      }
+      case "PATCH routines/:routine": {
+        if (!rt) return json({ error: "unknown routine" }, 404);
+        Object.assign(rt, body);
+        return json(rt);
+      }
+      case "DELETE routines/:routine":
+        this.routines = this.routines.filter((r) => r.id !== parts[3]);
+        return json({ deleted: parts[3] });
+      case "POST routines/:routine/run": {
+        if (!rt) return json({ error: "unknown routine" }, 404);
+        if (rt.live_run) return json({ error: "the routine has a run going already" }, 409);
+        const r = run({ routine: rt.id, trigger: "manual", state: "running", outcome: null, ended_ms: null, n: rt.runs + 1 });
+        rt.live_run = r;
+        this.runs.unshift(r);
+        return json(rt);
+      }
+      case "GET routine-runs":
+        return json(this.runs);
+      case "POST routine-runs/:run/stop": {
+        const r = this.runs.find((x) => x.id === parts[3]);
+        if (!r) return json({ error: "unknown run" }, 404);
+        Object.assign(r, { state: "ended", outcome: "stopped", ended_ms: now });
+        return json(r);
+      }
+      case "GET proposals":
+        return json(this.proposals);
+      case "POST proposals/:proposal/accept": {
+        const pr = this.proposals.find((x) => x.id === parts[3]);
+        if (!pr) return json({ error: "unknown proposal" }, 404);
+        this.proposals = this.proposals.filter((x) => x !== pr);
+        const nt = task({ title: pr.title, body: pr.body, tainted: true });
+        this.tasks.push(nt);
+        return json(nt);
+      }
+      case "POST proposals/:proposal/decline":
+        this.proposals = this.proposals.filter((x) => x.id !== parts[3]);
+        return json({ declined: parts[3] });
+      case "GET memory":
+        return json(this.notes);
     }
     if (!t) return json({ error: "unknown task" }, 404);
     switch (route) {
