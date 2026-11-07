@@ -59,9 +59,13 @@ export function summarize(h: HistoryRow): string {
     case "pr_comment":
       return typeof o.pr === "number" ? `The owner's comment on PR #${o.pr} went to ${str(o.to) ?? "the worker"}` : "The owner's PR comment went to the worker";
     case "pr_comment_dropped":
+      // Comments queued for a worker that won't start (README.md#the-task-machine).
+      if (typeof o.comments === "number") return `${o.comments === 1 ? "A queued PR comment was" : `${o.comments} queued PR comments were`} dropped${str(o.why) ? `: ${clip(str(o.why)!, 80)}` : ""}`;
       return typeof o.pr === "number" ? `The owner's comment on PR #${o.pr} wasn't sent${str(o.why) ? `: ${clip(str(o.why)!, 80)}` : ""}` : "The owner's PR comment wasn't sent";
     case "revise":
       return typeof o.pr === "number" ? `A worker starts again for the owner's comment on PR #${o.pr}` : "A worker starts again for the owner's PR comment";
+    case "review_ended":
+      return typeof o.pr === "number" ? `Out of review: PR #${o.pr} was its last open PR` : "Out of review: no PR open";
     case "pr_opened":
       return typeof o.pr === "number" ? `PR #${o.pr} opened` : "PR opened";
     case "worker_exited": {

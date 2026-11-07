@@ -2,7 +2,7 @@
 // the Worker's shapes (typed by them) and applying the same state machine (src/tasks.ts), and a record
 // of every write the page made.
 
-import { type TaskEvent, transition } from "../../tasks";
+import { factsOf, step, type TaskEvent } from "../../tasks";
 import type { Issue, SecretRequest, SecretsAnswer } from "../api/types";
 import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
 import type { Note, Proposal, Routine, RoutineRun } from "../api/types";
@@ -51,7 +51,7 @@ export function task(over: Partial<Task> = {}): Task {
   seq += 1;
   return {
     id: `tsk_t${seq}`, title: `Task ${seq}`, body: "", spec: null, state: "draft", ord: seq, assignee: null, pr: null, start_error: null, tainted: false, blocked: null,
-    prs: [], blocked_by: [], blocks: [], waiting_on: [], issue: null,
+    prs: [], blocked_by: [], blocks: [], waiting_on: [], issue: null, worker_live: ["assigned", "in_progress", "in_review"].includes(over.state ?? "draft"),
     created_ms: now - 3_600_000, updated_ms: now - 60_000, ...over,
   };
 }
@@ -133,9 +133,10 @@ export class FakeApi {
   }
 
   private move(t: Task, event: TaskEvent): Response | null {
-    const r = transition(t.state, event);
+    const r = step(factsOf(t), event);
     if (!r.ok) return json({ error: r.error }, 409);
     t.state = r.to;
+    t.worker_live = r.facts.workerLive;
     return null;
   }
 

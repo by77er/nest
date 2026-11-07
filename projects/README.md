@@ -81,14 +81,57 @@ Only the client interface. One client, `projects`, has this grant:
   5. The worker pushes a branch `task/<task-id>` and opens a PR (`in_review`). The PR's branch maps it to the task. The owner or the manager may attach more ([below](#prs)).
   6. All its attached PRs merged (`done`), and the worker is ended.
   
-  A worker that exits before opening a PR leaves the task `stalled`, shown on the board, to be reassigned. Cancelling a task stops its worker.
+  A worker that exits before opening a PR leaves the task `stalled`, shown on the board, to be reassigned. Cancelling a task stops its worker. [The task machine](#the-task-machine) has every move.
 - **Review:**
   1. GitHub's `pull_request` events (`opened`, `synchronize`, `reopened`) reach `/hooks/github`, which checks the signature. Every PR is reviewed, a task's or not.
   2. ReviewDO queues a job for the PR's head SHA. A newer head replaces a queued job and stops a running one, whose check is cancelled.
   3. Each job creates a check run (`in_progress`) and starts a reviewer.
   4. The reviewer's verdict completes the check: `success` only if all three dimensions pass, else `failure`, with the summary as the check's output.
   5. A reviewer that exits without a verdict is started again, twice, then the check completes as `action_required`. Not `neutral`: a required check accepts `success`, `skipped` and `neutral` ([GitHub](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches#require-status-checks-before-merging)), so `neutral` would let the PR merge unreviewed. A `check_run` `rerequested` queues the job again.
-- **Merging** is GitHub's, gated by the required check. With the project's auto-merge on, the app enables GitHub's auto-merge on each task PR ([below](#auto-merge)); it never merges itself. A `pull_request` `closed` event with `merged: true` marks the PR merged, and its task `done` once every attached PR has, ending its worker; closed without merging, the PR is detached, noted in the task's history, and the task stays. Marking done by hand doesn't get past this gate: it's refused for a task with an open PR (`in_review`) and for one with a live worker (`assigned`, `in_progress`, which is cancelled instead).
+- **Merging** is GitHub's, gated by the required check. With the project's auto-merge on, the app enables GitHub's auto-merge on each task PR ([below](#auto-merge)); it never merges itself. A `pull_request` `closed` event with `merged: true` marks the PR merged, and its task `done` once every attached PR has, ending its worker; closed without merging, the PR is detached, noted in the task's history, and the task leaves review if it was the last ([the task machine](#the-task-machine)). Marking done by hand doesn't get past this gate: it's refused for a task holding an open PR, whatever its state, and for one with a live worker (cancelled instead).
+
+## The task machine
+
+The owner's request (2026-11-06): a task's state, its worker, its PRs and the comments queued for its worker move as one machine, so no mix of webhooks, nest's events and the owner's moves leaves a task where the flow has no way out.
+
+- **One pure function,** `step(facts, event)` in `src/tasks.ts`. The facts are the state, the open and merged attached PRs, whether a worker of its own is live, whether its start is owed, and how many comments wait for its brief. It answers the new state and facts and what else to do, or why not.
+- **ProjectDO applies it and nothing else writes these.** `move` reads the facts from its tables, steps, then writes in one step:
+  - the PR row the event is about;
+  - the state and the history line;
+  - the worker's columns: a new start, started, failed, exited, or a stop owed;
+  - the queued comments: queued, sent after the brief, or dropped (recorded).
+
+  The start's retry schedule (attempts, next try, last error) is the outbox's, not a move.
+- **The UI's buttons** come from the same `step`, over the task's state, PRs and `worker_live`, so it never offers a move the Worker refuses.
+- **States:** `draft`, `ready`, `assigned` (a worker starting), `in_progress`, `in_review`, `stalled`, `done`, `cancelled`.
+- **Events and moves:**
+
+  | Event | From | To | With it |
+  |---|---|---|---|
+  | `spec` | draft; ready, assigned, in progress, in review | ready; the same | its live worker is told |
+  | `assign` | ready, stalled (no live worker) | assigned | a new start owed |
+  | `started` | assigned | in review with an open PR, else in progress | queued comments sent after the brief |
+  | `start_failed` | assigned | stalled | no worker; queued comments dropped |
+  | `start_abandoned` | assigned | assigned | a new start attempt |
+  | `worker_exited` | a live worker's state | in review with an open PR, else stalled | queued comments dropped |
+  | `pr_attached` | not over | in review from in progress, else the same | |
+  | `pr_merged` | an open PR | done when it was the last open one | the worker stopped |
+  | `pr_detached` | an open PR | the last open one: done if any merged, else in progress (worker live) or stalled, from in review | the worker stopped, if done |
+  | `done` | draft, ready, stalled; no open PR, no live worker | done | a stale worker stopped |
+  | `cancel` | not over | cancelled | the worker stopped; queued comments dropped |
+  | `revise` | ready, in review, stalled; no live worker | assigned | a new start owed; the comment queued |
+  | `input_queued` | assigned | assigned | the comment queued |
+
+- **Invariants,** checked after every step of a seeded random walk over the machine (`test/machine.test.ts`): `done` has no open PR and no worker of its own; `in_review` has an open PR or a live worker; `stalled`, `draft` and `ready` have no live worker; a start is owed exactly in `assigned`; comments are queued only while a start is owed.
+- **"Live"** is a worker of its own, starting or running. One being stopped for a task that's over still counts toward `max_workers` until nest has stopped it, but isn't the task's.
+- **What the sweep found, fixed here:**
+  - **Done with a PR open (B2).** Marking done by hand looked only at the state, and a ready or stalled task can hold an open PR. Now it's refused, and a worker started for a task with an open PR (a revise) starts in review.
+  - **In review with no way out (B3).** The last open PR closed unmerged, or detached, with no worker running, now stalls the task. With the worker running, the task goes back to in progress.
+  - **Comments outliving their worker (B8).** These are dropped when the start fails or the worker exits before its brief, and recorded as dropped.
+  - **A close handled twice** merges an open PR only once, so the routines' counters count it once.
+- **Deleting a draft (B4)** is refused while it holds an open PR: detach it first. Detaching turns the PR's auto-merge off on GitHub, a write a delete shouldn't make unseen, and the owner sees the PR they're letting go.
+  - Everything else that names the draft goes in the same step: tasks waiting on it stop waiting (noted on each), its own dependencies, detached PR rows, and the manager's waits on it. A draft never had a worker, so it has no queued changes or comments to leak.
+  - An issue it was made of returns to triage, to be accepted or declined afresh.
 
 ## Not decided here
 
@@ -118,7 +161,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **First input:** the worker's brief (title, body, spec, repo, branch) and the manager's go to their inbox with a request id, so a retry posts once. A brief for a task any tainted session wrote is posted as relayed text (`from: "projects/board"`), so the worker's session is tainted too.
   - **Retries:** ProjectDO owes nest its manager, workers, stops and chat messages, each retried from its alarm (5 s doubling to 5 min); a retryable 503 or 409 is also retried within the call. A worker nest refuses for good (a 4xx) stalls its task with the reason; the manager is retried until it starts.
 - **The board:**
-  - **States** (`src/tasks.ts`; a task with a live worker may be re-specced, [below](#task-changes)): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark done only a task with no PR and no live worker (`draft`, `ready`, `stalled`; a stalled task never has a PR, since one with a PR is `in_review`); a draft may be deleted, anything later is cancelled.
+  - **States** (`src/tasks.ts`; a task with a live worker may be re-specced, [below](#task-changes)): `draft` → `ready` (specced) → `assigned` → `in_progress` (worker started) → `in_review` (PR reported) → `done`, with `stalled` and `cancelled`. A task is assigned only once specced. The owner may mark done only a task with no open PR and no live worker (`draft`, `ready`, `stalled`; [the task machine](#the-task-machine)); a draft may be deleted (not while it holds an open PR), anything later is cancelled.
   - **A spec** is a goal, acceptance criteria, the files it likely touches and a test plan.
   - **`max_workers`** caps auto-assign and the manager's `assign_task`; the owner's assign by hand isn't capped (nest's `max_agents` still is). A worker counts from its assignment until it exits or the app has stopped it.
   - **History:** every change records who (the owner, the app, or an agent), what, when, and whether the session was tainted.
@@ -224,7 +267,7 @@ The owner's request (2026-11-03): "PRs should be attachable to tasks."
   The owner's and the manager's are checked on GitHub with a `pull_requests: read` token: the PR is in the repo and open, and GitHub says whether it's from a fork. A task in progress goes to review; a task that's over takes no PR.
 - **One task per PR:** attaching a PR that's attached to another task is refused, naming that task: detach it there first. A branch `task/<id>` never moves a PR attached elsewhere; it's noted on the task it names. Moving it silently would take a PR from a task someone chose.
 - **Detaching** (`DELETE …/prs/<n>`, or `detach_pr`) works on an open PR only, since a merged one stays as the record. A detached PR's auto-merge is turned off.
-- **Done:** a task is done once at least one PR is attached and every attached one has merged (`prsDone` in `src/tasks.ts`). Merging one of several leaves it in review. A PR closed without merging is detached with a note, and the task is done if the rest have merged. `merged` now moves any task that isn't over, since a PR may be attached to a task with no worker.
+- **Done:** a task is done once at least one PR is attached and every attached one has merged (`prsDone` in `src/tasks.ts`). Merging one of several leaves it in review. A PR closed without merging is detached with a note, and the task is done if the rest have merged; the last open one leaving with none merged takes the task out of review ([the task machine](#the-task-machine)). A merge moves any task that isn't over, since a PR may be attached to a task with no worker. A ready or stalled task may hold an open PR; it isn't marked done by hand while it does.
 - **Review and auto-merge:** every PR is reviewed already. With auto-merge on, every attached PR gets it: the owner's, the manager's, the worker's or the branch's, but only once GitHub has said it's from the repo itself and given its node id. A fork's PR never gets it, and neither does one whose head repo GitHub no longer names.
 - **The live worker is told** when PRs are attached or detached ([task changes](#task-changes)).
 
@@ -259,7 +302,7 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
     - Held to the task's dependencies, as any assign is, and to 3 restarts per task an hour (each refusal recorded).
     - Not held to `max_workers`: the owner's explicit comment, as with the owner's own assign.
   - **A merged PR, a closed or detached one, or a task that's over:** the comment is dropped and recorded on the task (`pr_comment_dropped`, with why). A comment after the work is over is the owner's to raise with the manager in chat; sending it on would restart work no one asked to restart.
-  - Comments still queued for a task that ends are dropped with it.
+  - Comments still queued are dropped (recorded) when the task ends, its worker's start fails, or the worker exits before its brief: never kept for a later worker.
 - Each delivery is recorded on the task (`pr_comment`, `revise`).
 - **Open:** route GitHub's events by `repository.id` and the installation id recorded at attach, not by `full_name`, so a renamed namespace that someone registers again can't reach the project (a follow-up).
 

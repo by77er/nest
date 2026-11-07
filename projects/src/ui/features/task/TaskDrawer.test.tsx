@@ -120,6 +120,26 @@ describe("the task drawer", () => {
     expect(within(drawer()).queryByRole("button", { name: "Mark done" })).toBeNull();
   });
 
+  it("offers no Mark done for a ready or stalled task holding an open PR (it's done when the PR merges), and does once it's detached", async () => {
+    const api = new FakeApi();
+    const open = { number: 9, state: "open" as const, title: "PR 9", fork: false, attached_by: "owner", attached_ms: Date.now(), auto_merge: null };
+    const ready = task({ title: "Ready with a PR", state: "ready", pr: 9, prs: [open] });
+    const stalled = task({ title: "Stalled with a PR", state: "stalled", pr: 10, prs: [{ ...open, number: 10 }] });
+    api.tasks = [ready, stalled];
+    const { user } = renderApp(`/projects/prj_one/board?task=${ready.id}`, api);
+    const d = await waitFor(drawer);
+    expect(await within(d).findByRole("button", { name: "Assign" })).toBeInTheDocument();
+    expect(within(d).queryByRole("button", { name: "Mark done" })).toBeNull();
+    await user.click(screen.getByRole("link", { name: "Stalled with a PR" }));
+    expect(await within(drawer()).findByRole("button", { name: "Reassign" })).toBeInTheDocument();
+    expect(within(drawer()).queryByRole("button", { name: "Mark done" })).toBeNull();
+    // The same task with its PR detached: done by hand.
+    stalled.prs = [];
+    await user.click(screen.getByRole("link", { name: "Ready with a PR" }));
+    await user.click(screen.getByRole("link", { name: "Stalled with a PR" }));
+    expect(await within(drawer()).findByRole("button", { name: "Mark done" })).toBeInTheDocument();
+  });
+
   it("marks a task with no PR done, in green, once confirmed", async () => {
     const api = new FakeApi();
     const t = task({ title: "Research", state: "ready" });

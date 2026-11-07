@@ -38,7 +38,7 @@ export function data(variant = "demo", now = Date.now()) {
     "| Endpoint | p95 now | Target |\n|---|---|---|\n| `/api/gadgets?tag=` | 840 ms | 100 ms |",
   ].join("\n\n");
   let i = 0;
-  const t = (title, state, o = {}) => ({ id: `tsk_demo${++i}`, title, body: "", spec: state === "draft" ? null : spec, state, ord: i, assignee: null, pr: null, start_error: null, tainted: false, blocked: null, prs: [], blocked_by: [], blocks: [], waiting_on: [], issue: null, created_ms: now - 7_200_000, updated_ms: now - 600_000, ...o });
+  const t = (title, state, o = {}) => ({ id: `tsk_demo${++i}`, title, body: "", spec: state === "draft" ? null : spec, state, ord: i, assignee: null, pr: null, start_error: null, tainted: false, blocked: null, prs: [], blocked_by: [], blocks: [], waiting_on: [], issue: null, worker_live: ["assigned", "in_progress", "in_review"].includes(state), created_ms: now - 7_200_000, updated_ms: now - 600_000, ...o });
   const tasks = [
     t("Support dark gadget skins", "draft"),
     t("Rate-limit the public API", "draft", { tainted: true }),

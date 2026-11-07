@@ -38,7 +38,7 @@ export function TaskActions({ projectId, task, onDeleted }: { projectId: string;
       onConfirm: () => del.mutate({ task: task.id }, { onSuccess: onDeleted }),
     });
 
-  const any = can(task.state, "assign") || can(task.state, "done") || can(task.state, "cancel") || task.state === "draft";
+  const any = can(task, "assign") || can(task, "done") || can(task, "cancel") || task.state === "draft";
   if (!any) return null;
 
   return (
@@ -47,9 +47,9 @@ export function TaskActions({ projectId, task, onDeleted }: { projectId: string;
         align="start"
         aria-label="Task actions"
         danger={
-          (can(task.state, "cancel") || task.state === "draft") && (
+          (can(task, "cancel") || task.state === "draft") && (
             <>
-              {can(task.state, "cancel") && (
+              {can(task, "cancel") && (
                 <Button color="danger" variant="light" leftSection={<IconX size={icon.md} />} onClick={cancelModal.open}>
                   Cancel task
                 </Button>
@@ -63,7 +63,7 @@ export function TaskActions({ projectId, task, onDeleted }: { projectId: string;
           )
         }
       >
-        {can(task.state, "assign") && (
+        {can(task, "assign") && (
           <>
             {/* Waiting on unfinished tasks, the Worker refuses it (README.md#dependencies): said, not offered. */}
             <Button
@@ -82,7 +82,7 @@ export function TaskActions({ projectId, task, onDeleted }: { projectId: string;
             )}
           </>
         )}
-        {can(task.state, "done") && (
+        {can(task, "done") && (
           <Button color="success" leftSection={<IconCheck size={icon.md} />} loading={done.isPending} onClick={confirmDone}>
             Mark done
           </Button>
