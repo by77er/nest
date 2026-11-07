@@ -22,6 +22,7 @@ export const keys = {
   runs: (id: string) => ["projects", id, "routine-runs"] as const,
   proposals: (id: string) => ["projects", id, "proposals"] as const,
   memory: (id: string) => ["projects", id, "memory"] as const,
+  issues: (id: string) => ["projects", id, "issues"] as const,
   syncState: ["admin", "sync-state"] as const,
 };
 
@@ -180,6 +181,29 @@ export function useSecretRequestDone(id: string) {
   });
 }
 
+// --- triage (README.md#triage) ----------------------------------------------------------------------
+
+/** The repo's issues waiting for triage, polled as "Needs you" is. */
+export const useIssues = (id: string) => useQuery({ queryKey: keys.issues(id), queryFn: () => api.issues(id), refetchInterval: POLL.asks });
+
+/** A triage write: the queue, the board and "Needs you" (its count) all move. */
+function useTriageWrite<V, R>(id: string, fn: (v: V) => Promise<R>, failure: string, inline = false) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: fn,
+    meta: { failure, inline },
+    onSettled: () => Promise.all([
+      qc.invalidateQueries({ queryKey: keys.issues(id) }), qc.invalidateQueries({ queryKey: keys.tasks(id) }),
+      qc.invalidateQueries({ queryKey: keys.attention(id) }), qc.invalidateQueries({ queryKey: keys.projects, exact: true }),
+    ]),
+  });
+}
+/** Accept, with the issue's `updated_ms` as read: its failure shows on the issue (one edited since asks again). */
+export const useAcceptIssue = (id: string) =>
+  useTriageWrite(id, (v: { n: number; updated_ms: number }) => api.acceptIssue(id, v.n, { updated_ms: v.updated_ms }), "The issue wasn't accepted", true);
+export const useDeclineIssue = (id: string) => useTriageWrite(id, (v: { n: number; reason: string }) => api.declineIssue(id, v.n, v.reason ? { reason: v.reason } : {}), "The issue wasn't declined");
+export const useImportIssues = (id: string) => useTriageWrite(id, () => api.importIssues(id), "The open issues weren't imported");
+
 export const useSyncState = () => useQuery({ queryKey: keys.syncState, queryFn: api.syncState });
 
 // --- writes -----------------------------------------------------------------------------------------
@@ -254,6 +278,9 @@ export const useCancelTask = (id: string) =>
   useTaskWrite(id, (v: { task: string } & CancelBody) => api.cancelTask(id, v.task, { ...(v.reason ? { reason: v.reason } : {}) }), "The task wasn't cancelled");
 
 export const useMarkDone = (id: string) => useTaskWrite(id, (v: { task: string }) => api.markDone(id, v.task), "The task wasn't marked done");
+
+/** Try closing a done task's issue on GitHub again, after GitHub refused it (README.md#triage). */
+export const useRetryIssueClose = (id: string) => useTaskWrite(id, (v: { task: string }) => api.retryIssueClose(id, v.task), "The issue close wasn't retried");
 
 export function useDeleteTask(id: string) {
   const qc = useQueryClient();

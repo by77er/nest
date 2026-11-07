@@ -263,6 +263,35 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
 - Each delivery is recorded on the task (`pr_comment`, `revise`).
 - **Open:** route GitHub's events by `repository.id` and the installation id recorded at attach, not by `full_name`, so a renamed namespace that someone registers again can't reach the project (a follow-up).
 
+## Triage
+
+The owner's request (2026-11-06): GitHub issues on a project's repo go into a triage queue, and accepted ones are added to the board.
+
+- **Intake** (`/hooks/github`, the same signature check, delivery claim and repo → project routing):
+  - `issues` `opened` and `reopened` add an issue, or restore one that went, when the event shows it open (a late delivery for an issue closed since adds nothing).
+  - A declined issue comes back only when reopened by the comments user or the repo's owner (the event's `sender`, by id), so its author can't undo a decline by closing and reopening it.
+  - `edited` updates one still untriaged (or adds it, open, if its opening was missed).
+  - `closed`, `deleted` and `transferred` take an untriaged one out.
+  - An accepted issue is its task's from then on, and none of these change it.
+  - A PR (GitHub sends a PR's issue as an issue) is ignored. Another repo's issue, a fork's included, reaches no project.
+- **Anyone can file, so its text is data:**
+  - The title and body are kept (300 and 20,000 characters, the rest at its link).
+  - They're shown as plain text, never rendered as markup.
+  - Accept carries the issue's `updated_ms` as the owner read it; an issue edited since is refused (`409`), and the page shows the new text and asks again. What becomes the task is what the owner read.
+  - No agent reads them before the owner accepts the issue.
+- **The Triage page** (after Board) lists the untriaged issues, oldest first, with title, number, author, age, the body as text (its first five lines, with "Show more" for the rest in place) and the link.
+  - **Accept** makes a draft task: the issue's title, and its body plus a line linking back (`From issue #n: <url> (opened by <author>)`). The owner or the manager specs it, as any draft.
+    - The task records its issue.
+    - It's marked tainted (an `issue_accepted` record), since its text is anyone's. The manager's and its workers' sessions that read it are then tainted, as nest's rule has it.
+  - **Decline** takes it out, with an optional reason. It doesn't touch GitHub: closing there is the owner's call.
+  - **Import open issues** is a one-off that brings in the repo's open issues the app doesn't know yet (it reads the oldest 300 open items, and PRs, which GitHub lists among issues, count toward the 300 before they're left out). It needs `issues: read`. Issues opened before the app subscribed come in only this way: events GitHub sent before it was ignored and aren't replayed.
+- **"Needs you"** shows one item for the waiting issues, their count, linking to Triage. The projects list's count includes each one.
+- **A task made of an issue, done through a merged PR,** closes the issue: a comment "Done in #<pr>.", then closed as completed (`issue_closes`, from the alarm).
+  - It needs `issues: write` in the client's grant.
+  - A refusal that will repeat (no permission, the issue gone) is recorded on the task (`issue_close_failed`) and shown in its drawer, with **Retry closing the issue** (`POST /api/projects/<id>/tasks/<task>/issue/close`). It's also tried again by itself when a read of the grant (`GET /v1/clients/self`) shows its `issues` permission changed to `write` or `admin`. Anything else is retried with backoff.
+  - The comment is posted once: not again on a retry after it landed, nor when it landed and its answer was lost (the issue's comments since the close was owed are checked for the line first).
+  - A task's message to its worker is relayed (`from`) whenever the task was ever tainted, whoever made the change.
+
 ## Routines
 
 The owner's request (2026-11-06): "schedule periodic background tasks for things like spontaneous reviews and memory consolidation (dreaming)… on a timer or on some other condition, like 'n tasks completed', and have the ability to create tasks."

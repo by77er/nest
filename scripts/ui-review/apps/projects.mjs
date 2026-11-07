@@ -647,6 +647,8 @@ const app = {
     { name: "drawer-blocks-deps", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false, after: drawerAt("Pull requests") },
     { name: "drawer-deps-done", section: "project", path: "/projects/prj_demo/board?task=tsk_demo6", full: false, after: drawerAt("Dependencies") },
     { name: "drawer-over", section: "project", path: "/projects/prj_demo/board?task=tsk_demo9", full: false, after: drawerAt("Pull requests") },
+    // A done task made of an issue that GitHub refused to close: why, and the retry.
+    { name: "drawer-issue-failed", section: "project", path: "/projects/prj_demo/board?task=tsk_demo9", full: false },
     { name: "attach-picker-open", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: picker("Pull requests", "Attach PR") },
     { name: "attach-picker-empty", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: picker("Pull requests", "Attach PR", "zzz") },
     { name: "attach-picker-typed", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, after: picker("Pull requests", "Attach PR", "130") },
@@ -786,6 +788,13 @@ const app = {
       }));
       return [...(r.error ? [] : ["a refused save shows no reason under Save"]), ...(r.row ? [] : ["a refused save doesn't mark the host it names"]), ...(r.toast ? ["a refused save shows a toast"] : [])];
     } },
+    // Triage (README.md#triage): the issues waiting (one with markup shown as text), none, many and long,
+    // the board's Needs you item for them, declining one.
+    { name: "triage", section: "project", path: "/projects/prj_demo/triage" },
+    { name: "triage-empty", section: "project", path: "/projects/prj_demo/triage", fixture: "triage-empty" },
+    { name: "triage-long", section: "project", path: "/projects/prj_demo/triage", fixture: "triage-long" },
+    { name: "triage-board", section: "project", path: "/projects/prj_demo/board" },
+    { name: "triage-decline", section: "project", path: "/projects/prj_demo/triage", full: false, after: (p) => p.getByRole("button", { name: "Decline issue #44" }).click() },
     { name: "settings", section: "project", path: "/projects/prj_demo/settings", checkName: "workflows", check: (p) => p.evaluate(workflowsAgree) },
     { name: "settings-comments-set", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-set" },
     { name: "settings-comments-id-only", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-id-only" },

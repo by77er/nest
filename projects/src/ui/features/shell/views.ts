@@ -1,9 +1,10 @@
 // A project's views, flat, in the order the sidebar lists them (the manager first: the default view); and which one the URL is on.
-import { IconKey, IconLayoutKanban, IconMessage, IconRepeat, IconSettings, IconShieldCheck, IconWorld } from "@tabler/icons-react";
+import { IconInbox, IconKey, IconLayoutKanban, IconMessage, IconRepeat, IconSettings, IconShieldCheck, IconWorld } from "@tabler/icons-react";
 
 export const VIEWS = [
   { view: "manager", to: "/projects/$projectId/manager", label: "Manager", icon: IconMessage },
   { view: "board", to: "/projects/$projectId/board", label: "Board", icon: IconLayoutKanban },
+  { view: "triage", to: "/projects/$projectId/triage", label: "Triage", icon: IconInbox },
   { view: "reviews", to: "/projects/$projectId/reviews", label: "Reviews", icon: IconShieldCheck },
   { view: "routines", to: "/projects/$projectId/routines", label: "Routines", icon: IconRepeat },
   { view: "secrets", to: "/projects/$projectId/secrets", label: "Secrets", icon: IconKey },

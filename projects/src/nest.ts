@@ -232,7 +232,10 @@ export class Nest {
   /** The client's own record (`GET /v1/clients/self`): its grant, among the rest. */
   self(): Promise<{
     client?: string;
-    grant?: { egress_hosts?: string[]; inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean } };
+    grant?: {
+      egress_hosts?: string[]; inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean };
+      github?: { repos?: string[]; permissions?: Record<string, string> };
+    };
   }> {
     return this.call("GET", "/v1/clients/self");
   }
