@@ -233,7 +233,7 @@ describe("the chat", () => {
       ev("tool_result", { turn: "trn_f", call_id: `g${i}`, is_error: false, summary: "ok" }),
     ]).flat();
     vi.stubGlobal("WebSocket", traceSocket([...head, ...calls]));
-    renderApp("/projects/prj_one/manager", new FakeApi());
+    const { user } = renderApp("/projects/prj_one/manager", new FakeApi());
     const c = await chat();
     // Six steps behind four shown would fold the text too; it stays out, above the fold, and the fold says what failed.
     const fold = await within(c).findByRole("button", { name: "+2 earlier steps · 1 failed" });
@@ -241,7 +241,11 @@ describe("the chat", () => {
     const said = within(stream).getByText("The push was refused; checking the grant.");
     expect(said).toBeVisible();
     expect(said.compareDocumentPosition(fold) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(within(stream).getByRole("button", { name: "Bash git push, failed", hidden: true })).not.toBeVisible();
+    // The failed call is behind the fold (not shown, or not mounted, until it opens).
+    const failedRow = within(stream).queryByRole("button", { name: "Bash git push, failed", hidden: true });
+    if (failedRow) expect(failedRow).not.toBeVisible();
+    await user.click(fold);
+    expect(await within(stream).findByRole("button", { name: "Bash git push, failed" })).toBeVisible();
   });
 
   it("an empty chat opens at its top, not following an end there's nothing at", async () => {
