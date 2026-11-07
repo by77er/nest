@@ -120,7 +120,8 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
     templates: {
       [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read", false, true),
       [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push", true),
-      [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, sorted, "read"),
+      // Ephemeral: a reviewer ends itself once its turn is done, verdict or not (its job's deadline covers one that doesn't).
+      [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, sorted, "read", false, false, true),
       // Reads only, like the manager and reviewers (`read_repos`): a routine never pushes.
       [`${NAMESPACE}/routine`]: template("routine", PROMPTS.routine, sorted, "read", false, false, true),
       // A dreaming run has no hands (no sandbox, no repo, no web): it needs only the board, recent work,

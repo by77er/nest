@@ -11,7 +11,7 @@ const verdict = (quality: "pass" | "fail"): Verdict => ({
   correctness: { verdict: "pass", notes: "ok" }, quality: { verdict: quality, notes: "q" }, architecture: { verdict: "pass", notes: "a" }, summary: "s",
 });
 const job = (pr: number, o: Partial<Job> = {}): Job => ({
-  pr, sha: `${pr}`.padEnd(40, "0"), state: "queued", title: `PR ${pr}`, base: "main", agent: null, check_run: null, verdict: null, tainted: null,
+  pr, sha: `${pr}`.padEnd(40, "0"), state: "queued", title: `PR ${pr}`, base: "main", agent: null, check_run: null, verdict: null, tainted: null, deadline_ms: null,
   attempts: 0, runs: 1, error: null, created_ms: pr, updated_ms: pr, ...o,
 });
 
