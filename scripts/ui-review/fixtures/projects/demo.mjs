@@ -330,8 +330,8 @@ const RICH = [
     ],
     // Agents nest refused to stop (README.md#outboxes): a cancelled task's worker, a routine run's.
     failed_stops: variant === "stops-failed" ? [
-      { agent: "agt_w5t8q3", task: "tsk_demo10", reason: "cancelled", error: "nest 409 conflict: the agent's host is draining; ask again once it has moved", failed_ms: now - 25 * 60_000 },
-      { agent: "agt_r2m9x4", task: null, reason: "routine run timed_out", error: "nest 400 invalid: destroy_sandbox isn't allowed for an agent whose sandbox is shared", failed_ms: now - 3 * 60_000 },
+      { agent: "agt_w5t8q3", task: "tsk_demo10", task_title: "Drop the legacy XML export", routine: null, reason: "cancelled", error: "nest 409 conflict: the agent's host is draining; ask again once it has moved", failed_ms: now - 25 * 60_000 },
+      { agent: "agt_r2m9x4", task: null, task_title: null, routine: { id: "rtn_dream", name: "Dreaming" }, reason: "routine run timed_out", error: "nest 400 invalid: destroy_sandbox isn't allowed for an agent whose sandbox is shared", failed_ms: now - 3 * 60_000 },
     ] : [],
   };
 

@@ -114,18 +114,29 @@ describe("stops", () => {
     fake.fail(stop, 403, { times: 2 });
     fake.fail(stop, 401, { times: 2 });
     fake.fail(stop, 403, { times: 2, page: true });
+    // A 400 or a 409 that isn't nest's own (an edge's page) is no refusal of the request either.
+    fake.fail(stop, 409, { times: 1, page: true });
+    fake.fail(stop, 400, { times: 1, page: true });
     await api(token, "POST", `/api/projects/${p.id}/tasks/${w.task}/cancel`, {});
-    for (let i = 0; i < 2; i++) {
+    for (let i = 0; i < 7; i++) {
       await due(p, "stops");
       await stub(p).drain();
     }
     const row = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT failed_ms, attempts FROM stops WHERE agent = ?", w.worker).one());
     expect(row.failed_ms).toBeNull();
-    expect(row.attempts).toBeGreaterThanOrEqual(3);
+    expect(row.attempts).toBe(8);
     expect(await live(p)).toBe(1);
-    // Still being tried: not the owner's to dismiss.
+    // Still being tried: not the owner's to dismiss, and the owner's Retry leaves its schedule as it is.
     expect((await api(token, "DELETE", `/api/projects/${p.id}/stops/${w.worker}`)).status).toBe(409);
     expect(await live(p)).toBe(1);
+    fake.failures = [];
+    fake.fail(stop, 503, { retryable: true, times: 1000 });
+    const before = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT attempts FROM stops WHERE agent = ?", w.worker).one().attempts as number);
+    await api(token, "POST", `/api/projects/${p.id}/stops/${w.worker}/retry`);
+    const after = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT attempts FROM stops WHERE agent = ?", w.worker).one().attempts as number);
+    expect(after).toBeGreaterThanOrEqual(before);
+    expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${w.task}`)).body.history.map((h: { action: string }) => h.action)).not.toContain("stop_retried");
+    fake.failures = [];
     expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.failed_stops).toEqual([]);
   });
 
@@ -176,6 +187,47 @@ describe("stops", () => {
     expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.failed_stops).toEqual([]);
     expect((await api(token, "DELETE", `/api/projects/${p.id}/stops/${w.worker}`)).status).toBe(409);
     expect((await api(token, "POST", `/api/projects/${p.id}/stops/${w.worker}/retry`)).status).toBe(404);
+  });
+
+  it("a failed stop is never pruned: however old, its place stays counted until it's resolved (F1b)", async () => {
+    const p = await newProject();
+    const w = await cancelledWorker(p);
+    fake.fail(new RegExp(`^POST /v1/agents/${w.worker}/stop$`), 409, { times: 1 });
+    await api(token, "POST", `/api/projects/${p.id}/tasks/${w.task}/cancel`, {});
+    await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE stops SET failed_ms = ? WHERE agent = ?", Date.now() - 400 * 86_400_000, w.worker); });
+    await stub(p).drain();
+    expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.failed_stops).toHaveLength(1);
+    expect(await live(p)).toBe(1);
+  });
+
+  it("a stop whose agent exits while nest refuses it says nothing: its row is gone, nothing to show", async () => {
+    const p = await newProject();
+    const w = await cancelledWorker(p);
+    const stop = new RegExp(`^POST /v1/agents/${w.worker}/stop$`);
+    let release!: () => void;
+    const hold = { match: stop, release: new Promise<void>((r) => (release = r)), reached: false };
+    fake.holds.push(hold);
+    fake.fail(stop, 409, { times: 1 });
+    const cancelling = api(token, "POST", `/api/projects/${p.id}/tasks/${w.task}/cancel`, {});
+    for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(hold.reached).toBe(true);
+    await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: w.worker, reason: "ended" });
+    release();
+    await cancelling;
+    await stub(p).drain();
+    expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.failed_stops).toEqual([]);
+    expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${w.task}`)).body.history.map((h: { action: string }) => h.action)).not.toContain("stop_failed");
+    expect(fake.inbox.filter((m) => m.agent === p.manager && m.text.includes(`refused to stop ${w.worker}`))).toEqual([]);
+  });
+
+  it("nest's word that any agent ended (a routine run's, a manager's) clears its failed stop", async () => {
+    const p = await newProject();
+    await runInDurableObject(stub(p), (_o, st) => {
+      st.storage.sql.exec("INSERT INTO stops (agent, task, reason, next_ms, attempts, error, failed_ms) VALUES (?, NULL, 'manager replaced', 0, 1, 'nest 409 refused: injected', ?)", p.manager, Date.now());
+    });
+    expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.failed_stops).toHaveLength(1);
+    await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: p.manager, reason: "ended" });
+    expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.failed_stops).toEqual([]);
   });
 
   it("nest's word that the agent ended clears a failed stop and frees its place", async () => {

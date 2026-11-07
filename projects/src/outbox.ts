@@ -88,13 +88,14 @@ const DAY = 86_400_000;
 
 /**
  * Each queue's rules. The chat is the owner's log and an issue's close is its task's record, so neither
- * is pruned; a message to an agent is kept a week once ended; a failed stop a month, for the record.
+ * is pruned; a message to an agent is kept a week once ended; a failed stop until it's resolved.
  * Nothing gives up on transient failures: a stop must go in the end, and the rest are cheap to retry.
  */
 export const OUTBOX: Record<"chat" | "messages" | "stops" | "issue_closes" | "layers", OutboxPolicy> = {
   chat: {},
   messages: { keepMs: 7 * DAY },
-  stops: { keepMs: 30 * DAY },
+  // A failed stop is kept until its agent is stopped, dismissed or exits: its place stays counted meanwhile.
+  stops: {},
   issue_closes: {},
   layers: {},
 };

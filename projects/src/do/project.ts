@@ -506,6 +506,9 @@ const RECENT_WAITS = 10;
 
 type Row = Record<string, SqlStorageValue>;
 
+/** A failed stop's `next_ms` (the column is NOT NULL): never due (9999-12-31), until the owner's Retry. */
+const NOT_DUE_MS = 253_402_300_799_000;
+
 /**
  * A stop's refusal that will repeat (README.md#outboxes): nest's own refusal of the request, in its JSON
  * error body (400, 409). An auth failure (401, 403) or a page that isn't nest's (a proxy's, Access's) may
@@ -519,6 +522,10 @@ export function stopRefused(e: unknown): boolean {
 export interface FailedStop {
   agent: string;
   task: string | null;
+  /** Its task's title, when it's a worker's. */
+  task_title: string | null;
+  /** The routine whose run it is, when it's a run's. */
+  routine: { id: string; name: string } | null;
   /** Why it was being stopped (`cancelled`, `routine run done`, …). */
   reason: string;
   error: string | null;
@@ -1960,6 +1967,8 @@ export class ProjectDO extends DurableObject<Env> {
           this.managerMove({ kind: "ended", agent: e.agent, reason: e.reason ?? "exited" });
         }
         if (route.role === "worker") this.workerExited(e.agent, e.reason, e.text);
+        // Ended, whatever its role: a stop owed for it (failed or not, a routine run's or a manager's) is done.
+        this.sql.exec("DELETE FROM stops WHERE agent = ?", e.agent);
         this.sql.exec("DELETE FROM agent_secrets WHERE agent = ?", e.agent);
         break;
       case "agent.ask":
@@ -3267,8 +3276,6 @@ export class ProjectDO extends DurableObject<Env> {
     if (msgs !== null) this.sql.exec("DELETE FROM messages WHERE next_ms IS NULL AND COALESCE(ended_ms, at_ms) < ?", msgs);
     // A comment's key outlives any redelivery GitHub makes of it.
     this.sql.exec("DELETE FROM comments_seen WHERE at_ms < ?", now - COMMENTS_SEEN_KEEP_MS);
-    const stops = pruneBefore(OUTBOX.stops, now);
-    if (stops !== null) this.sql.exec("DELETE FROM stops WHERE failed_ms IS NOT NULL AND failed_ms < ?", stops);
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT seq FROM messages WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverMessage(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT id FROM tasks WHERE notify_next_ms IS NOT NULL AND notify_next_ms <= ?", now).toArray()) await this.notifyWorker(nest, r.id as string);
@@ -3535,11 +3542,15 @@ export class ProjectDO extends DurableObject<Env> {
     this.stopped(agent);
   }
 
-  /** A stop nest refused for good: kept (not due again until it's pruned), and said everywhere it matters. */
+  /**
+   * A stop nest refused for good: kept until the agent is stopped, dismissed or exits (never pruned: its
+   * place stays counted meanwhile), and said everywhere it matters. Nothing in it is due before the owner
+   * acts, so the alarm never spins on it.
+   */
   private stopFailed(agent: string, task: string | null, reason: string, r: OutboxRow): void {
     const now = Date.now();
-    // Its next try is the prune's time: nothing is due before the owner acts, so the alarm never spins on it.
-    this.sql.exec("UPDATE stops SET attempts = ?, error = ?, failed_ms = ?, next_ms = ? WHERE agent = ?", r.attempts, r.error, now, now + (OUTBOX.stops.keepMs ?? 0), agent);
+    // Only while it's still owed: one whose agent exited during the try (its row gone) needs no word.
+    if (!this.sql.exec("UPDATE stops SET attempts = ?, error = ?, failed_ms = ?, next_ms = ? WHERE agent = ?", r.attempts, r.error, now, NOT_DUE_MS, agent).rowsWritten) return;
     const what = `nest refused to stop ${agent} (${reason}): ${r.error}. It may still be running; it counts as live until it's stopped or dismissed.`;
     this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, ?, ?, ?, 'stop_failed', ?)",
       `stop/${agent}/${now}`, now, agent, task ? "worker" : null, task, what);
@@ -3579,8 +3590,14 @@ export class ProjectDO extends DurableObject<Env> {
 
   /** The stops nest refused, for the Network page. */
   private failedStops(): FailedStop[] {
-    return this.sql.exec("SELECT agent, task, reason, error, failed_ms FROM stops WHERE failed_ms IS NOT NULL ORDER BY failed_ms").toArray().map((r) => ({
-      agent: r.agent as string, task: (r.task as string | null) ?? null, reason: r.reason as string, error: (r.error as string | null) ?? null, failed_ms: r.failed_ms as number,
+    return this.sql.exec(
+      `SELECT s.agent, s.task, s.reason, s.error, s.failed_ms, t.title AS task_title, ro.id AS routine_id, ro.name AS routine_name
+        FROM stops s LEFT JOIN tasks t ON t.id = s.task LEFT JOIN routine_runs ru ON ru.agent = s.agent LEFT JOIN routines ro ON ro.id = ru.routine
+        WHERE s.failed_ms IS NOT NULL ORDER BY s.failed_ms`,
+    ).toArray().map((r) => ({
+      agent: r.agent as string, task: (r.task as string | null) ?? null, task_title: (r.task_title as string | null) ?? null,
+      routine: r.routine_id ? { id: r.routine_id as string, name: r.routine_name as string } : null,
+      reason: r.reason as string, error: (r.error as string | null) ?? null, failed_ms: r.failed_ms as number,
     }));
   }
 
