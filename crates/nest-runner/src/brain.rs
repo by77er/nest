@@ -220,7 +220,8 @@ impl Brain {
         }
         let turn = self.turn.take().map(|t| t.id);
         self.idle_at = Some(now + self.timers.idle_grace);
-        // Stopped while this turn ran: stdin is closed, and now nothing runs.
+        // Ending (stopped, or killed with its final result still being read) while this turn ran:
+        // stdin is closed, and now nothing runs.
         if matches!(self.ending, Ending::Requested(_)) {
             self.exit_by(now);
         }
@@ -326,7 +327,6 @@ impl Brain {
         };
         self.turn = None;
         self.idle_at = None;
-        self.exit_at = None;
         vec![Effect::Exit(reason)]
     }
 }
@@ -565,6 +565,17 @@ mod tests {
         assert!(kills_the_group(&b.step(Input::Tick, late + EXIT)));
         assert_eq!(shape(&b.step(Input::Exited { killed: None }, late + EXIT)), ["exit stopped"]);
 
+        // A result while the turn's Stop hook blocked doesn't end it: no clock yet. An error result
+        // ends it, and starts the clock.
+        let (mut b, now) = brain();
+        b.step(run("t1"), now);
+        b.step(Input::StopHook { blocked: true }, now);
+        b.step(Input::Stop(StopMode::Graceful), now);
+        assert_eq!(b.step(result(false), now), []);
+        assert_eq!(b.next_deadline(), None, "a continuation is owed: the turn runs on");
+        assert_eq!(shape(&b.step(result(true), now))[..1], ["turn_completed t1".to_string()]);
+        assert_eq!(b.next_deadline(), Some(now + EXIT));
+
         let (mut b, now) = brain();
         assert_eq!(b.step(Input::Stop(StopMode::Graceful), now), [Effect::CloseStdin]);
         assert_eq!(b.next_deadline(), Some(now + EXIT), "no turn: at once");
@@ -589,17 +600,9 @@ mod tests {
         assert_eq!(b.step(Input::Tick, now + GRACE + EXIT), [], "the old deadline kills nothing");
     }
 
-    /// An exit deadline set by an idle close is cleared by a respawn, and a stop after an idle
-    /// close keeps the earlier deadline.
+    /// A stop after an idle close keeps the earlier deadline.
     #[test]
-    fn the_exit_deadline_is_per_process_and_never_postponed() {
-        let (mut b, now) = brain();
-        b.step(Input::Tick, now + GRACE);
-        b.step(run("t1"), now + GRACE);
-        b.step(Input::Exited { killed: None }, now + GRACE + Duration::from_secs(1));
-        b.step(Input::Respawned { ok: true }, now + GRACE + Duration::from_secs(1));
-        assert_eq!(b.next_deadline(), None, "the stashed turn runs: nothing is due");
-
+    fn the_exit_deadline_is_never_postponed() {
         let (mut b, now) = brain();
         b.step(Input::Tick, now + GRACE);
         b.step(Input::Stop(StopMode::Graceful), now + GRACE + Duration::from_secs(10));

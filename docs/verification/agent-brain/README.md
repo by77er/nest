@@ -69,10 +69,10 @@ Paths: `agent.ts`, `fleet.ts` and `sandbox.ts` are under `control-plane/src/do/`
 | N2 | in order: `agent_start{e}` | AE: refuses if `killed[a] >= e` (`agent_exited{fenced, e}` + `stale_epoch`) | table row Starting, Sent On or Pending; `epochs[a]:=e`; **result ok{dispatched} at once** (not on start) | `host.rs:1916-1922`; AE:`host.rs:1924-1935` |
 | N3 | in order: `agent_stop` graceful | — | AgentStop{graceful} to the runner; with no runner connected, the row is removed | `host.rs:1388-1391`; `runner_link.rs:153-163` |
 | N4 | runner: AgentStart | spawned task | no lease ⇒ exit fenced. register: ok ⇒ run; an older-connection brain ⇒ kill and retry for up to 10 s; AE: a stopping brain ⇒ kill and retry for up to 10 s; **else adopt** (main: set_hands; AE: set_hands + `adopt_epoch` = fetch_max) | `agent.rs:72-145`; AE:`agent.rs:110-136`; AE:`runtime.rs:389-396` |
-| N5 | runner: AgentStop | **registered only** (otherwise a no-op) | kill, or graceful (close stdin); AE sets `stopping` | `supervisor.rs:91-104`; AE:`supervisor.rs:94` |
+| N5 | runner: AgentStop | **registered only** (otherwise a no-op) | kill, or graceful (close stdin; once no turn runs, the process group is killed if it hasn't exited within the exit grace, 30 s); AE sets `stopping` | `supervisor.rs:91-104`; AE:`supervisor.rs:94` |
 | N6 | lease lapse / nestd lost | nestd watchdog at the deadline; runner watchdog `now_ms() > valid_until`; nestd socket EOF | runner kill_all (SIGKILL to the process group). nestd reports each brain of the lost connection as exited (crashed or fenced) | `host.rs:1055-1094`; `supervisor.rs:16-29,119-140`; `runner_link.rs:295-300` |
 | N7 | brain process exits | pid matches | `agent_exited{reason}` (AE: `epoch`), deregister | `agent.rs:779-808` |
-| N8 | idle | 120 s after turn end, no pending inbox | close stdin, then exit `idle` (respawned in place if input was stashed) | `agent.rs:656-664,779-797`; `config.rs:55` |
+| N8 | idle | 120 s after turn end, no pending inbox | close stdin, then exit `idle` (killed if it hasn't exited within the exit grace, 30 s; respawned in place if input was stashed) | `agent.rs:656-664,779-797`; `config.rs:55` |
 
 ### 2.4 A turn's life (AgentDO `turns.status`)
 

@@ -178,6 +178,14 @@ async fn a_brain_that_ignores_eof_is_killed_after_the_exit_grace() {
     nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_eof", &[]));
     wait_for(&e.rt, "brain", || pids(e.dir.path()).len() == 1).await;
     let pid = pids(e.dir.path())[0];
+    // However the test ends, the fake doesn't outlive it.
+    struct Killed(i32);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.0), nix::sys::signal::Signal::SIGKILL);
+        }
+    }
+    let _guard = Killed(pid);
     wait_for(&e.rt, "brain killed after its idle close", || !alive(pid)).await;
     wait_for(&e.rt, "deregistered", || e.rt.agent(&id).is_none()).await;
     let evs = events(&e.rt, Duration::from_millis(500)).await;
