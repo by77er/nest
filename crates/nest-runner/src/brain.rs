@@ -66,6 +66,10 @@ pub struct Timers {
     pub idle_grace: Duration,
     /// After an interrupt request: SIGINT this long after it, SIGKILL as long again after that.
     pub interrupt_grace: Duration,
+    /// After stdin is closed (idleness, a graceful stop): SIGKILL the process group if Claude Code
+    /// hasn't exited this long after, so a process that ignores EOF can't keep the brain (and a
+    /// turn stashed for its respawn) waiting for ever.
+    pub exit_grace: Duration,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,6 +104,8 @@ pub struct Brain {
     timers: Timers,
     turn: Option<Turn>,
     idle_at: Option<Instant>,
+    /// stdin was closed: the process is killed if it hasn't exited by then.
+    exit_at: Option<Instant>,
     ending: Ending,
     interrupt_supported: bool,
 }
@@ -108,7 +114,7 @@ impl Brain {
     /// A brain just spawned: the idle clock runs from the start, so a brain that never gets a
     /// turn still exits and its host can retire.
     pub fn new(timers: Timers, now: Instant) -> Self {
-        Brain { timers, turn: None, idle_at: Some(now + timers.idle_grace), ending: Ending::Running, interrupt_supported: false }
+        Brain { timers, turn: None, idle_at: Some(now + timers.idle_grace), exit_at: None, ending: Ending::Running, interrupt_supported: false }
     }
 
     /// The turn running now.
@@ -126,7 +132,7 @@ impl Brain {
         let interrupt = self.turn.as_ref().and_then(|t| t.interrupt).map(|s| match s {
             InterruptStage::Requested(at) | InterruptStage::Signalled(at) => at,
         });
-        [interrupt, self.idle_at].into_iter().flatten().min()
+        [interrupt, self.idle_at, self.exit_at].into_iter().flatten().min()
     }
 
     pub fn step(&mut self, input: Input, now: Instant) -> Vec<Effect> {
@@ -147,6 +153,7 @@ impl Brain {
             Input::Stop(StopMode::Graceful) => {
                 let mut fx = self.request_end(ExitReason::Stopped);
                 fx.push(Effect::CloseStdin);
+                self.exit_by(now);
                 fx
             }
             Input::Stop(StopMode::Kill) => self.kill(ExitReason::Stopped),
@@ -216,7 +223,20 @@ impl Brain {
         ]
     }
 
+    /// stdin is being closed: the process must exit within the exit grace (an earlier deadline
+    /// stays).
+    fn exit_by(&mut self, now: Instant) {
+        let at = now + self.timers.exit_grace;
+        self.exit_at = Some(self.exit_at.map_or(at, |e| e.min(at)));
+    }
+
     fn tick(&mut self, now: Instant) -> Vec<Effect> {
+        // stdin closed and still no exit: kill the process group. Why the brain ends is unchanged
+        // (an idle close with a stashed turn still respawns; a stop still reports `stopped`).
+        if self.exit_at.is_some_and(|at| at <= now) {
+            self.exit_at = None;
+            return vec![Effect::AbortStdin, Effect::CancelHands, Effect::KillGroup];
+        }
         let grace = self.timers.interrupt_grace;
         if let Some(t) = &mut self.turn {
             match t.interrupt {
@@ -235,6 +255,7 @@ impl Brain {
             self.idle_at = None;
             if self.turn.is_none() && matches!(self.ending, Ending::Running) {
                 self.ending = Ending::IdleClose { stash: Vec::new() };
+                self.exit_by(now);
                 return vec![Effect::CloseStdin];
             }
         }
@@ -259,6 +280,7 @@ impl Brain {
     }
 
     fn exited(&mut self, killed: Option<ExitReason>) -> Vec<Effect> {
+        self.exit_at = None;
         if let Some(r) = killed {
             let mut fx = self.request_end(r);
             fx.extend(self.finish());
@@ -295,6 +317,7 @@ impl Brain {
         };
         self.turn = None;
         self.idle_at = None;
+        self.exit_at = None;
         vec![Effect::Exit(reason)]
     }
 }
@@ -319,10 +342,11 @@ mod tests {
 
     const GRACE: Duration = Duration::from_secs(120);
     const INT: Duration = Duration::from_secs(10);
+    const EXIT: Duration = Duration::from_secs(30);
 
     fn brain() -> (Brain, Instant) {
         let now = Instant::now();
-        (Brain::new(Timers { idle_grace: GRACE, interrupt_grace: INT }, now), now)
+        (Brain::new(Timers { idle_grace: GRACE, interrupt_grace: INT, exit_grace: EXIT }, now), now)
     }
 
     fn run(id: &str) -> Input {
@@ -492,5 +516,72 @@ mod tests {
         assert_eq!(b.step(run("t1"), now), [], "a duplicate");
         assert_eq!(shape(&b.step(run("t2"), now)), ["error turn_overlap t2"]);
         assert_eq!(b.turn().map(|t| t.0.as_str()), Some("t1"));
+    }
+
+    fn kills_the_group(fx: &[Effect]) -> bool {
+        fx == [Effect::AbortStdin, Effect::CancelHands, Effect::KillGroup]
+    }
+
+    /// Audit R-B3: an idle close sets an exit deadline; a process that ignores EOF is killed at
+    /// it, and a turn stashed meanwhile is still run by the respawn (the brain ends as idle, not
+    /// as a stop).
+    #[test]
+    fn an_idle_close_kills_a_process_that_ignores_eof_and_still_respawns() {
+        let (mut b, now) = brain();
+        assert_eq!(b.step(Input::Tick, now + GRACE), [Effect::CloseStdin]);
+        assert_eq!(b.next_deadline(), Some(now + GRACE + EXIT), "the exit is due");
+        assert_eq!(b.step(run("t1"), now + GRACE), [], "stashed");
+        assert_eq!(b.step(Input::Tick, now + GRACE + EXIT - Duration::from_millis(1)), [], "not yet");
+        assert!(kills_the_group(&b.step(Input::Tick, now + GRACE + EXIT)));
+        assert_eq!(b.next_deadline(), None, "killed once");
+        assert_eq!(b.step(Input::Tick, now + GRACE + EXIT * 2), []);
+        assert_eq!(b.step(Input::Exited { killed: None }, now + GRACE + EXIT), [Effect::Respawn], "the stashed turn still runs");
+    }
+
+    /// A graceful stop sets the same deadline: a process that ignores EOF is killed and the brain
+    /// reports `stopped`; one that exits in time clears it.
+    #[test]
+    fn a_graceful_stop_kills_a_process_that_ignores_eof() {
+        let (mut b, now) = brain();
+        b.step(run("t1"), now);
+        assert_eq!(b.step(Input::Stop(StopMode::Graceful), now), [Effect::CloseStdin]);
+        assert_eq!(b.next_deadline(), Some(now + EXIT));
+        assert!(kills_the_group(&b.step(Input::Tick, now + EXIT)));
+        assert_eq!(shape(&b.step(Input::Exited { killed: None }, now + EXIT)), ["exit stopped"]);
+
+        let (mut b, now) = brain();
+        b.step(Input::Stop(StopMode::Graceful), now);
+        assert_eq!(shape(&b.step(Input::Exited { killed: None }, now + Duration::from_secs(1))), ["exit stopped"]);
+        assert_eq!(b.next_deadline(), None, "exited in time: nothing is due");
+        assert_eq!(b.step(Input::Tick, now + EXIT), []);
+    }
+
+    /// A process that exits in time ends its deadline: a tick at it while the stashed turn's
+    /// respawn is under way kills nothing (it would hit the new process).
+    #[test]
+    fn an_exit_in_time_ends_the_deadline_before_the_respawn() {
+        let (mut b, now) = brain();
+        b.step(Input::Tick, now + GRACE);
+        b.step(run("t1"), now + GRACE);
+        assert_eq!(b.step(Input::Exited { killed: None }, now + GRACE + Duration::from_secs(1)), [Effect::Respawn]);
+        assert_eq!(b.next_deadline(), None, "nothing is due while it respawns");
+        assert_eq!(b.step(Input::Tick, now + GRACE + EXIT), [], "the old deadline kills nothing");
+    }
+
+    /// An exit deadline set by an idle close is cleared by a respawn, and a stop after an idle
+    /// close keeps the earlier deadline.
+    #[test]
+    fn the_exit_deadline_is_per_process_and_never_postponed() {
+        let (mut b, now) = brain();
+        b.step(Input::Tick, now + GRACE);
+        b.step(run("t1"), now + GRACE);
+        b.step(Input::Exited { killed: None }, now + GRACE + Duration::from_secs(1));
+        b.step(Input::Respawned { ok: true }, now + GRACE + Duration::from_secs(1));
+        assert_ne!(b.next_deadline(), Some(now + GRACE + EXIT), "the new process has its own clock");
+
+        let (mut b, now) = brain();
+        b.step(Input::Tick, now + GRACE);
+        b.step(Input::Stop(StopMode::Graceful), now + GRACE + Duration::from_secs(10));
+        assert_eq!(b.next_deadline(), Some(now + GRACE + EXIT), "the earlier deadline stays");
     }
 }

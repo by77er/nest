@@ -30,12 +30,17 @@ fn now_ms() -> i64 {
 }
 
 fn env() -> Env {
+    env_with(|_| {})
+}
+
+fn env_with(tune: impl FnOnce(&mut Config)) -> Env {
     let dir = tempfile::tempdir().unwrap();
     let fake = dir.path().join("claude");
     // Never `std::fs::write`: a parallel test's fork could hold it open and fail its exec (ETXTBSY).
     nest_runner::test_support::install_executable(&fake, FAKE);
     std::fs::create_dir_all(dir.path().join("empty")).unwrap();
-    let cfg = Config { claude_bin: fake, cwd: dir.path().join("empty"), ..Config::default() };
+    let mut cfg = Config { claude_bin: fake, cwd: dir.path().join("empty"), ..Config::default() };
+    tune(&mut cfg);
     let rt = Runtime::new(cfg);
     *rt.lease.lock().unwrap() = Some(now_ms() + 600_000);
     Env { dir, rt }
@@ -159,6 +164,24 @@ async fn a_brain_with_full_stdin_is_still_killed() {
     wait_for(&e.rt, "deregistered", || e.rt.agent(&id).is_none()).await;
     let evs = events(&e.rt, Duration::from_millis(500)).await;
     assert!(exited(&evs).contains(&ExitReason::Fenced), "{evs:?}");
+}
+
+/// Audit R-B3: a Claude Code that ignores EOF (the fake one sleeps on) is killed once the exit
+/// grace after the idle close is over, and the brain exits `idle`: it used to stay forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_brain_that_ignores_eof_is_killed_after_the_exit_grace() {
+    let e = env_with(|c| {
+        c.idle_grace = Duration::from_millis(200);
+        c.exit_grace = Duration::from_millis(300);
+    });
+    let id = AgentId("agt_eof".into());
+    nest_runner::supervisor::handle(&e.rt, start_cmd(e.dir.path(), "agt_eof", &[]));
+    wait_for(&e.rt, "brain", || pids(e.dir.path()).len() == 1).await;
+    let pid = pids(e.dir.path())[0];
+    wait_for(&e.rt, "brain killed after its idle close", || !alive(pid)).await;
+    wait_for(&e.rt, "deregistered", || e.rt.agent(&id).is_none()).await;
+    let evs = events(&e.rt, Duration::from_millis(500)).await;
+    assert!(exited(&evs).contains(&ExitReason::Idle), "{evs:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
