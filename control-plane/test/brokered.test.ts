@@ -256,6 +256,22 @@ function call(ws: Ws, callId: string, name: string, args: unknown) {
   seqs.set(ws, seq);
   ws.send({ type: "tool_call", seq, call: callId, turn: "trn_x", name, arguments: args });
 }
+/** What another delivery of a call settled it as. */
+const STANDING = { status: "ok", content: [{ type: "text", text: "made by the other delivery" }] };
+
+/**
+ * Just before `callId`'s request would leave (its epoch check), its journal row is settled, as another
+ * delivery of the same call finishing first would leave it.
+ */
+async function settleBeforeSend(agent: string, callId: string, action: string, target: string): Promise<void> {
+  await runInDurableObject(agentStub(agent), (inst: AgentDO) => {
+    inst.testHooks["dispatch:beforeWrite"] = async () => {
+      delete inst.testHooks["dispatch:beforeWrite"];
+      (inst as any).journal.settle({ key: `${agent}/1/${callId}`, action, target, idem: "i", digest: "d", args: "{}", tainted: false }, "done", STANDING, "by the other delivery");
+    };
+  });
+}
+
 const result = async (ws: Ws, callId: string, timeoutMs = 6000) => (await ws.next("tool_result", (m) => m.call === callId, timeoutMs)).outcome;
 const run = async (ws: Ws, name: string, args: unknown) => {
   const id = `cal_${rand()}`;
@@ -485,6 +501,17 @@ describe("github actions", () => {
     expect(gh.comments.get(`${r}#1`) ?? []).toEqual([]);
   });
 
+  it("a GitHub call settled by another delivery just before it would leave isn't sent: it answers with the outcome that stands", async () => {
+    const r = repo();
+    const s = await setup([{ action: "github.comment", repos: [r] }]);
+    await settleBeforeSend(s.agent, "cal_gs1", "github.comment", r);
+    call(s.ws, "cal_gs1", "github_comment", { repo: r, issue_number: 1, body: "x" });
+    expect(await result(s.ws, "cal_gs1")).toEqual(STANDING);
+    expect(gh.comments.get(`${r}#1`) ?? []).toEqual([]);
+    expect(gh.writes.some((w) => w.path.includes(r))).toBe(false);
+    expect((await journal(s.agent)).find((e: any) => e.key.endsWith("/cal_gs1"))).toMatchObject({ status: "done", attempts: 0, detail: "by the other delivery" });
+  });
+
   it("an action is capped per hour; refused calls don't count", async () => {
     const r = repo();
     const s = await setup([{ action: "github.comment", repos: [r], per_hour: 2 }]);
@@ -589,6 +616,19 @@ describe("github.fork", () => {
     expect(policy.guards!.find((g) => g.name === "github-push")!.allow).toEqual([{ path: "/operator/lib/**" }, { path: "/operator/lib.git/**" }]);
   });
 
+  it("a fork settled by another delivery just before it would leave isn't sent", async () => {
+    await adminJson("/v1/admin/secrets/github_user", { method: "PUT", body: { value: GITHUB_USER_TOKEN } });
+    const up = `up${rand()}/lib`;
+    const s = await setup([{ action: "github.fork", repos: [up] }], { hands: true });
+    const p = await run(s.ws, "github_fork", { repo: up });
+    expect(p.status).toBe("pending");
+    await answer(s.agent, p.ask, "approve");
+    await settleBeforeSend(s.agent, "cal_fs1", "github.fork", up);
+    call(s.ws, "cal_fs1", "github_fork", { repo: up });
+    expect(await result(s.ws, "cal_fs1")).toEqual(STANDING);
+    expect(gh.forks.filter((f) => f.upstream === up)).toEqual([]);
+  });
+
   it("the operator's token never resolves into a host command", async () => {
     const r = await env.BROKER.get(env.BROKER.idFromName("broker")).resolveRefs(["$nest-secret:github_user"], ["github_user", "inject:"]);
     expect(r).toEqual({ "$nest-secret:github_user": null });
@@ -628,6 +668,14 @@ describe("http.request profiles", () => {
       expect(await run(p.ws, "http_request", { profile: "p", method, path }), `${method} ${path}`).toMatchObject({ status: "error", error: { code: expect.stringMatching(/forbidden|invalid_message/) } });
     }
     expect(p.stub.requests).toHaveLength(2);
+  });
+
+  it("an http request settled by another delivery just before it would leave isn't sent", async () => {
+    const p = await profileSetup();
+    await settleBeforeSend(p.agent, "cal_hs1", "http.request", "p");
+    call(p.ws, "cal_hs1", "http_request", { profile: "p", method: "POST", path: "/v1/items", body: "{}" });
+    expect(await result(p.ws, "cal_hs1")).toEqual(STANDING);
+    expect(p.stub.requests).toEqual([]);
   });
 
   it("a tainted session's rw profile call waits for approval; a read-only profile isn't a sink; a trusted profile's answer doesn't taint", async () => {

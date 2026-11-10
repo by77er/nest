@@ -65,14 +65,14 @@ const ForwardStatus = z.enum(["forwarded", "settled"]);
 export type ForwardStatus = z.output<typeof ForwardStatus>;
 export const FORWARD_STATUSES = ForwardStatus.options;
 
-/** What happens to a forward: an attempt leaves (`forward`), it gets its outcome (`settle`), or it never did and is given up on by age (`abandon`). */
-export const FORWARD_EVENTS = ["forward", "settle", "abandon"] as const;
+/** What happens to a forward: an attempt leaves (`forward`), or it gets its outcome (`settle`). (One never settled is deleted by age: `prune`.) */
+export const FORWARD_EVENTS = ["forward", "settle"] as const;
 export type ForwardEvent = (typeof FORWARD_EVENTS)[number];
 
 /**
  * The forward ledger's one step (`none`: no row yet): the status after `event`, or `refuse`. `settled` is
- * final: a settled call keeps its outcome and is never sent again. Nothing settles before it was
- * forwarded. Every write to `mcp_forwards.status` goes through it.
+ * final: a settled call is never sent again. Nothing settles before it was forwarded. Every change of
+ * `mcp_forwards.status` goes through it. (Which outcome a settled row keeps is `settle`'s rule.)
  */
 export function forwardStep(status: ForwardStatus | "none", event: ForwardEvent): ForwardStatus | "refuse" {
   if (status === "none") return event === "forward" ? "forwarded" : "refuse";
@@ -166,6 +166,9 @@ const unknown = (why: string): McpCallOutcome => ({
   outcome: { status: "error", error: errorBody(ErrorCodes.OUTCOME_UNKNOWN, `${why}; the call may or may not have taken effect. Check before retrying anything with side effects.`) },
   from_server: false,
 });
+/** A platform-made "outcome unknown" (never the server's own answer). */
+const isUnknown = (o: McpCallOutcome | null): boolean =>
+  !!o && !o.from_server && o.outcome.status === "error" && o.outcome.error.code === ErrorCodes.OUTCOME_UNKNOWN;
 const platformError = (code: string, message: string, retryable = false): McpCallOutcome =>
   ({ outcome: { status: "error", error: errorBody(code, message, retryable) }, from_server: false });
 
@@ -367,11 +370,20 @@ export class McpProxy {
     return true;
   }
 
-  /** The call's outcome, once (`forwardStep`). The outcome that stands: `o`, or the one the row already had. */
-  private settle(key: string, o: McpCallOutcome, event: ForwardEvent = "settle"): McpCallOutcome {
+  /**
+   * The call's outcome (`forwardStep`). The outcome that stands: `o`, or the one the row already had.
+   * A settled row keeps its outcome, with one exception: the server's own answer replaces a recorded
+   * "unknown" (another delivery of the call gave up on it while this one's request was still out), so
+   * the row says what happened once anyone knows.
+   */
+  private settle(key: string, o: McpCallOutcome): McpCallOutcome {
     const row = this.forward(key);
-    const to = forwardStep(row?.status ?? "none", event);
-    if (to === "refuse") return row?.outcome ?? o;
+    const to = forwardStep(row?.status ?? "none", "settle");
+    if (to === "refuse") {
+      if (!(row?.status === "settled" && isUnknown(row.outcome) && o.from_server)) return row?.outcome ?? o;
+      this.d.sql.exec("UPDATE mcp_forwards SET outcome = ? WHERE key = ?", JSON.stringify(o), key);
+      return o;
+    }
     this.d.sql.exec("UPDATE mcp_forwards SET status = ?, outcome = ? WHERE key = ?", to, JSON.stringify(o), key);
     return o;
   }
@@ -548,13 +560,10 @@ export class McpProxy {
   }
 
   /**
-   * Settled rows older than `cutoff` go. A forward still unsettled that long after it left can't settle
-   * on its own (its deadline passed long ago and no newer epoch waited on it): it is settled as unknown
-   * first (`abandon`), then goes with the rest.
+   * Rows older than `cutoff` go, whatever their status: a forward still unsettled that long after it left
+   * can't settle on its own (its deadline passed long ago), so it is deleted with the settled ones.
    */
   prune(cutoff: number): void {
-    const stale = this.d.sql.exec<{ key: string }>("SELECT key FROM mcp_forwards WHERE status = 'forwarded' AND created_ms < ?", cutoff).toArray();
-    for (const r of stale) this.settle(r.key, unknown("the answer never came (given up on by age)"), "abandon");
-    this.d.sql.exec("DELETE FROM mcp_forwards WHERE status = 'settled' AND created_ms < ?", cutoff);
+    this.d.sql.exec("DELETE FROM mcp_forwards WHERE created_ms < ?", cutoff);
   }
 }

@@ -23,7 +23,7 @@ describe("journalStep and forwardStep: every status and event", () => {
       none: { send: "sending", done: "done", fail: "failed", unknown: "unknown", refuse: "refused", abandon: "refuse" },
       sending: { send: "sending", done: "done", fail: "failed", unknown: "unknown", refuse: "refuse", abandon: "unknown" },
       done: { send: "refuse", done: "refuse", fail: "refuse", unknown: "refuse", refuse: "refuse", abandon: "refuse" },
-      failed: { send: "refuse", done: "refuse", fail: "refuse", unknown: "refuse", refuse: "refuse", abandon: "refuse" },
+      failed: { send: "refuse", done: "done", fail: "refuse", unknown: "refuse", refuse: "refuse", abandon: "refuse" },
       unknown: { send: "refuse", done: "done", fail: "failed", unknown: "refuse", refuse: "refuse", abandon: "refuse" },
       refused: { send: "refuse", done: "refuse", fail: "refuse", unknown: "refuse", refuse: "refuse", abandon: "refuse" },
     });
@@ -32,9 +32,9 @@ describe("journalStep and forwardStep: every status and event", () => {
   it("forwardStep", () => {
     const table = Object.fromEntries((["none", ...FORWARD_STATUSES] as const).map((st) => [st, Object.fromEntries(FORWARD_EVENTS.map((e) => [e, forwardStep(st, e)]))]));
     expect(table).toEqual({
-      none: { forward: "forwarded", settle: "refuse", abandon: "refuse" },
-      forwarded: { forward: "forwarded", settle: "settled", abandon: "settled" },
-      settled: { forward: "refuse", settle: "refuse", abandon: "refuse" },
+      none: { forward: "forwarded", settle: "refuse" },
+      forwarded: { forward: "forwarded", settle: "settled" },
+      settled: { forward: "refuse", settle: "refuse" },
     });
   });
 });
@@ -65,6 +65,22 @@ describe("BrokeredJournal: the guards are the journal's", () => {
       expect(j.settle(row("k"), "done", ok, "found")).toBe(true);
       expect(j.get("k")).toMatchObject({ status: "done", outcome: ok, detail: "found" });
       expect(j.settle(row("k"), "failed", failed, "no")).toBe(false);
+    });
+  });
+
+  it("a call the provider refused for one delivery and accepted for another reads done: failed may become done, nothing else", async () => {
+    await withJournal((j) => {
+      j.sending(row("k"));
+      j.sending(row("k"));
+      // The delivery the provider refused (a duplicate) settles first; the one it accepted, after.
+      expect(j.settle(row("k"), "failed", failed, "duplicate")).toBe(true);
+      expect(j.sending(row("k"))).toBe(false);
+      expect(j.settle(row("k"), "unknown", unknown, "lost")).toBe(false);
+      expect(j.settle(row("k"), "failed", failed, "again")).toBe(false);
+      expect(j.get("k")).toMatchObject({ status: "failed", detail: "duplicate" });
+      expect(j.settle(row("k"), "done", ok, "made")).toBe(true);
+      expect(j.get("k")).toMatchObject({ status: "done", outcome: ok, detail: "made" });
+      expect(j.settle(row("k"), "failed", failed, "late")).toBe(false);
     });
   });
 
@@ -103,8 +119,13 @@ describe("BrokeredJournal: the guards are the journal's", () => {
       j.sending(row("resent"));
       at("resent", now - 1 * day, now - 9 * day);
 
+      // And one of those from over a week ago: given up on now, whatever settle time it carried.
+      j.sending(row("resent-old"));
+      at("resent-old", now - 8 * day, now - 9 * day);
+
       j.prune(now - 7 * day, now);
       expect(j.get("resent")).toMatchObject({ status: "sending" });
+      expect(j.get("resent-old")).toMatchObject({ status: "unknown", settled_ms: now });
       expect(j.get("stuck")).toMatchObject({ status: "unknown", settled_ms: now, outcome: { status: "error", error: { code: "outcome_unknown" } } });
       expect(j.get("recent")).toMatchObject({ status: "sending", outcome: null });
       expect(j.get("old-done")).toBeUndefined();
@@ -115,6 +136,7 @@ describe("BrokeredJournal: the guards are the journal's", () => {
       expect(j.get("stuck")).toMatchObject({ status: "unknown" });
       j.prune(now + 1, now + 7 * day + 1);
       expect(j.get("stuck")).toBeUndefined();
+      expect(j.get("resent-old")).toBeUndefined();
     });
   });
 });
@@ -163,24 +185,43 @@ describe("the MCP forward ledger", () => {
     });
   });
 
-  it("prune settles a forward still open after the retention as unknown, then drops it with the other old settled ones", async () => {
+  it("the server's own answer replaces a recorded unknown; nothing else replaces a settled outcome", async () => {
+    await runInDurableObject(fresh(), (inst: AgentDO, st) => {
+      const m = (inst as any).mcp;
+      const lost = { outcome: { status: "error", error: { code: "outcome_unknown", message: "lost", retryable: false } }, from_server: false };
+      const stored = (key: string) => JSON.parse(read(st, key)!.outcome!);
+      // One delivery gave up on the call; the other's request then came back with the server's answer.
+      m.recordForward(ctx("k"), g, "send", 1);
+      expect(m.settle("k", lost)).toEqual(lost);
+      expect(m.settle("k", { ...lost, outcome: { ...lost.outcome, error: { ...lost.outcome.error, message: "lost again" } } })).toEqual(lost);
+      expect(m.settle("k", out("the real answer"))).toEqual(out("the real answer"));
+      expect(stored("k")).toEqual(out("the real answer"));
+      // A real answer stays: neither a later unknown nor another answer replaces it.
+      expect(m.settle("k", lost)).toEqual(out("the real answer"));
+      expect(m.settle("k", out("another"))).toEqual(out("the real answer"));
+      expect(stored("k")).toEqual(out("the real answer"));
+      // The server's own error saying "unknown" is its answer, not a gap to fill.
+      const servers = { ...lost, from_server: true };
+      m.recordForward(ctx("s"), g, "send", 1);
+      m.settle("s", servers);
+      expect(m.settle("s", out("late"))).toEqual(servers);
+      expect(read(st, "k")).toMatchObject({ status: "settled" });
+    });
+  });
+
+  it("prune deletes forwards past the retention, settled or still open; recent ones stay", async () => {
     await runInDurableObject(fresh(), (inst: AgentDO, st) => {
       const m = (inst as any).mcp;
       const sql = st.storage.sql;
-      m.recordForward(ctx("stuck"), g, "send", 1);
-      m.recordForward(ctx("recent"), g, "send", 1);
-      m.recordForward(ctx("old-settled"), g, "send", 1);
+      for (const k of ["stuck", "recent", "old-settled", "recent-settled"]) m.recordForward(ctx(k), g, "send", 1);
       m.settle("old-settled", out("x"));
+      m.settle("recent-settled", out("y"));
       sql.exec("UPDATE mcp_forwards SET created_ms = 10 WHERE key IN ('stuck', 'old-settled')");
-      // What the stale one is settled as (seen with a cutoff that deletes nothing yet settled before it).
-      const before = sql.exec("SELECT COUNT(*) AS n FROM mcp_forwards WHERE status = 'forwarded'").one().n;
-      expect(before).toBe(2);
       m.prune(1000);
       expect(read(st, "stuck")).toBeUndefined();
       expect(read(st, "old-settled")).toBeUndefined();
       expect(read(st, "recent")).toMatchObject({ status: "forwarded" });
-      // No forward of an older epoch is left open for a newer one to wait on.
-      expect(sql.exec("SELECT COUNT(*) AS n FROM mcp_forwards WHERE status = 'forwarded' AND created_ms < 1000").one().n).toBe(0);
+      expect(read(st, "recent-settled")).toMatchObject({ status: "settled" });
     });
   });
 });

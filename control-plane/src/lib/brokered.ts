@@ -427,9 +427,10 @@ export type JournalEvent = (typeof JOURNAL_EVENTS)[number];
 /**
  * The journal's one step: the status after `event`, or `refuse` when it doesn't apply there (`none`: no
  * row yet). Every write to `brokered_journal.status` goes through it.
- * - `done`, `failed` and `refused` are final: a settled call is never sent again, and keeps its outcome.
- * - `unknown` may still become `done` or `failed` (another delivery of the call learned what happened); it
- *   is never sent again.
+ * - Nothing settled is ever sent again.
+ * - `done` and `refused` are final. `unknown` may still become `done` or `failed`, and `failed` may still
+ *   become `done`: another delivery of the same call learned that it took effect (two deliveries can both
+ *   reach the provider; the one it refused as a duplicate must not hide the one it accepted).
  * - A call can settle with no attempt recorded (a pull request that was already open).
  */
 export function journalStep(status: JournalStatus | "none", event: JournalEvent): JournalStatus | "refuse" {
@@ -437,6 +438,7 @@ export function journalStep(status: JournalStatus | "none", event: JournalEvent)
   if (status === "none") return event === "send" ? "sending" : event === "refuse" ? "refused" : settled ?? "refuse";
   if (status === "sending") return event === "send" ? "sending" : event === "abandon" ? "unknown" : settled ?? "refuse";
   if (status === "unknown") return event === "done" || event === "fail" ? settled! : "refuse";
+  if (status === "failed") return event === "done" ? "done" : "refuse";
   return "refuse";
 }
 
