@@ -333,8 +333,10 @@ export class FakeNest {
         return json(200, { interrupted: a.ended ? "none" : "turn" });
       }
       if (req.method === "POST" && sub === "/stop") {
-        a.ended = !!call.body?.end;
-        if (a.ended && call.body?.destroy_sandbox && a.sandbox) this.sandboxes.get(a.sandbox)!.ended = true;
+        // As nest: a stop of an agent that ended already destroys no sandbox.
+        const was = a.ended;
+        a.ended = !!call.body?.end || was;
+        if (!was && a.ended && call.body?.destroy_sandbox && a.sandbox) this.sandboxes.get(a.sandbox)!.ended = true;
         return json(200, { status: "stopped" });
       }
       if (req.method === "POST" && (m = sub.match(/^\/asks\/(ask_[A-Za-z0-9]+)\/answer$/))) {
@@ -542,6 +544,8 @@ export interface FakePull {
   ref: string;
   /** The head's repo; null: a fork GitHub no longer names. */
   headRepo: string | null;
+  /** GitHub's `updated_at` for it, when the test gives one. */
+  updated_at?: string;
 }
 
 export interface FakeCheckRun {
@@ -747,6 +751,7 @@ export class FakeGitHub {
       const view = (p: FakePull) => ({
         number: p.number, title: p.title, state: p.state, merged: p.merged, merged_at: p.merged ? "2026-11-02T00:00:00Z" : null, node_id: prNode(repoName, p.number),
         head: { ref: p.ref, repo: p.headRepo === null ? null : { full_name: p.headRepo } }, html_url: `https://github.com/${repoName}/pull/${p.number}`,
+        ...(p.updated_at ? { updated_at: p.updated_at } : {}),
       });
       const mine = [...(this.pulls.get(repoName)?.values() ?? [])];
       if (sub === "/pulls") return json(200, mine.filter((p) => p.state === "open").map(view));

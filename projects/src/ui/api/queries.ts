@@ -74,6 +74,18 @@ export function useRetryAttach(id: string) {
   });
 }
 
+/** The owner's Restart of the manager (README.md#the-manager-lifecycle): the chat and the status move. */
+export function useRestartManager(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.restartManager(id),
+    meta: { failure: "The manager wasn't restarted" },
+    onSettled: () => Promise.all([
+      qc.invalidateQueries({ queryKey: keys.manager(id) }), qc.invalidateQueries({ queryKey: keys.project(id), exact: true }), qc.invalidateQueries({ queryKey: keys.chat(id) }),
+    ]),
+  });
+}
+
 /** What waits on the owner: open asks and blocked tasks, oldest first (README.md#blocked). */
 /** The manager's pending waits (and the last few that ended): polled, since their deadlines run down. */
 export const useWaits = (id: string) => useQuery({ queryKey: ["projects", id, "waits"], queryFn: () => api.waits(id), refetchInterval: POLL.manager });

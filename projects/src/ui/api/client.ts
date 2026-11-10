@@ -94,6 +94,7 @@ export const api = {
   dismissStop: (id: string, agent: string) => call<{ dismissed: string }>("DELETE", `${prj(id)}/stops/${agent}`),
   setNetwork: (id: string, b: NetworkBody) => call<NetworkView>("PUT", `${prj(id)}/network`, b),
   retryAttach: (id: string) => call<Settings>("POST", `${prj(id)}/attach`),
+  restartManager: (id: string) => call<Settings>("POST", `${prj(id)}/manager/restart`),
   reviews: (id: string) => call<Job[]>("GET", `${prj(id)}/reviews`),
 
   routines: (id: string) => call<RoutinesAnswer>("GET", `${prj(id)}/routines`),

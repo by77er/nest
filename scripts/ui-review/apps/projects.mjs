@@ -628,6 +628,8 @@ const app = {
   // viewport, for an open overlay. `widths` limits a state to some widths.
   states: [
     { name: "projects", section: "top", path: "/projects" },
+    // A project still being created (README.md#creating-a-project).
+    { name: "projects-creating", section: "top", path: "/projects", fixture: "creating" },
     { name: "projects-empty", section: "top", path: "/projects", fixture: "empty" },
     { name: "projects-error", section: "top", path: "/projects", fixture: "error", httpErrors: true, ready: shown("[data-ds=error]") },
     { name: "new-project", section: "top", path: "/projects", full: false, after: (p) => p.getByRole("button", { name: "New project" }).first().click() },
@@ -705,6 +707,8 @@ const app = {
       await p.keyboard.type("Same columns as the CSV");
     } },
     { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false, check: waitsCheck, checkName: "waits" },
+    // Ended past its automatic restarts: why, and the owner's Restart (README.md#the-manager-lifecycle).
+    { name: "manager-ended", section: "project", path: "/projects/prj_demo/manager", fixture: "manager-ended", full: false },
     { name: "manager-rich", section: "project", path: "/projects/prj_demo/manager", fixture: "rich" },
     { name: "manager-rich-view", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false },
     { name: "manager-empty", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false },
