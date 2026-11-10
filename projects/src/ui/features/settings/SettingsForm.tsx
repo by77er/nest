@@ -18,7 +18,7 @@ import { ago, exact } from "../../common/time";
 import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
 import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
 import { MODELS, modelProblem } from "../../../models";
-import { useLocation } from "@tanstack/react-router";
+import { useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 
 const CUSTOM = "custom";
@@ -79,13 +79,17 @@ const values = (s: Settings) => ({
  */
 function useFocusLinkTarget() {
   const hash = useLocation({ select: (l) => l.hash });
+  const navigate = useNavigate();
   useEffect(() => {
     if (!hash) return;
     const heading = document.getElementById(hash)?.querySelector<HTMLElement>("h1, h2, h3, h4, h5, h6");
     if (!heading) return;
     heading.tabIndex = -1;
     heading.focus();
-  }, [hash]);
+    // Once per arrival: the hash leaves the URL, so a remount of the form (a Save of some settings) doesn't
+    // move focus there again.
+    void navigate({ to: ".", hash: "", replace: true });
+  }, [hash, navigate]);
 }
 
 export function SettingsForm({ projectId, settings, onDone }: { projectId: string; settings: Settings; onDone?: () => void }) {

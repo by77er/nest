@@ -107,6 +107,23 @@ describe("who 'you' is for issues", () => {
     await waitFor(() => expect(heading).toHaveFocus());
     expect(heading.closest("#triage")).not.toBeNull();
   });
+
+  it("focus moves there once per arrival: a Save after it (which remounts the form) leaves focus on Save", async () => {
+    const api = new FakeApi();
+    const { user, router } = renderApp("/projects/prj_one/settings#triage", api);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Triage" })).toHaveFocus());
+    // The hash is gone from the URL.
+    await waitFor(() => expect(router.state.location.hash).toBe(""));
+    const workers = screen.getByRole("textbox", { name: /Max workers/ });
+    await user.clear(workers);
+    await user.type(workers, "3");
+    const save = screen.getByRole("button", { name: "Save settings" });
+    await user.click(save);
+    await waitFor(() => expect(api.writes).toHaveLength(1));
+    await screen.findByText("Settings saved");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.getByRole("heading", { name: "Triage" })).not.toHaveFocus();
+  });
 });
 
 describe("auto-merge in the settings", () => {
