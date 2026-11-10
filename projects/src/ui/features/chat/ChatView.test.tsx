@@ -330,7 +330,8 @@ describe("the chat", () => {
 
   it("a message's exact time is in its actions (hover shows it too), so the keyboard and touch reach it", async () => {
     const api = new FakeApi();
-    const at = new Date(2026, 10, 2, 9, 30).getTime();
+    // A few hours ago, whenever the test runs: the time line then says so ("3 hours ago"), not the exact time.
+    const at = Date.now() - 3 * 3_600_000;
     api.chat = [{ seq: 1, at_ms: at, sender: "manager", text: "Hello", delivered: true, status: "done" as const, error: null }];
     const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
