@@ -175,6 +175,8 @@ export interface AuthServer {
   iss_parameter: boolean;
   /** `token_endpoint_auth_methods_supported`; absent means `client_secret_basic` (RFC 8414 §2). */
   auth_methods: string[] | null;
+  /** RFC 7009's `revocation_endpoint`, when the AS has one. */
+  revocation_endpoint?: string | null;
 }
 
 export interface Discovery {
@@ -275,6 +277,7 @@ async function authServerMetadata(issuer: URL, allowLoopback: boolean): Promise<
       cimd: m.client_id_metadata_document_supported === true,
       iss_parameter: m.authorization_response_iss_parameter_supported === true,
       auth_methods: strings(m.token_endpoint_auth_methods_supported),
+      revocation_endpoint: typeof m.revocation_endpoint === "string" ? checkOAuthUrl(m.revocation_endpoint, allowLoopback, "revocation_endpoint").href : null,
     };
   }
   throw oauthError(`no authorization server metadata for ${issuer.href}: tried ${tried.join(", ")}`);
@@ -422,6 +425,26 @@ export async function tokenRequest(endpoint: string, client: OAuthClient, params
   };
 }
 
+/**
+ * RFC 7009: ask the AS to revoke `token`, authenticating as the client the way a token request does.
+ * 200 is revoked (also for a token it no longer knows). Never throws.
+ */
+export async function revokeToken(endpoint: string, client: OAuthClient, token: string, hint: "refresh_token" | "access_token"): Promise<{ ok: true } | { ok: false; why: string }> {
+  const form = new URLSearchParams({ token, token_type_hint: hint });
+  const headers: Record<string, string> = { "content-type": "application/x-www-form-urlencoded", accept: "application/json" };
+  if (client.auth_method === "client_secret_basic" && client.client_secret) headers.authorization = basic(client.client_id, client.client_secret);
+  else {
+    form.set("client_id", client.client_id);
+    if (client.auth_method === "client_secret_post" && client.client_secret) form.set("client_secret", client.client_secret);
+  }
+  const r = await exchange(endpoint, { method: "POST", headers, body: form.toString() });
+  if (!r.ok) return { ok: false, why: r.why };
+  return r.status === 200 ? { ok: true } : { ok: false, why: `HTTP ${r.status}` };
+}
+
+/** What became of a revoked authorization's tokens at its authorization server. */
+export type ServerRevocation = "revoked" | "unsupported" | "failed" | "no_tokens";
+
 // --- The store (BrokerDO) ------------------------------------------------------------------------------------
 
 const GrantStatus = z.enum(["authorized", "reauthorize"]);
@@ -462,7 +485,8 @@ interface Flow {
 
 /** An audit record (docs/control-plane/durable-objects/broker/#issuance-audit): never a token, code, verifier or state. */
 export interface OAuthAudit {
-  event: "oauth_start" | "oauth_authorized" | "oauth_callback_refused" | "oauth_refreshed" | "oauth_refresh_failed" | "oauth_registered" | "oauth_token_refused";
+  event: "oauth_start" | "oauth_authorized" | "oauth_callback_refused" | "oauth_refreshed" | "oauth_refresh_failed" | "oauth_registered" | "oauth_token_refused"
+    | "oauth_revoked";
   capability?: string;
   ref?: string;
   resource?: string;
@@ -686,6 +710,46 @@ export class OAuthStore {
       this.refreshing.set(ref, p);
     }
     return await p;
+  }
+
+  /**
+   * The operator revokes capability `capability`'s authorizations (state-machine sweep, bug 11): each
+   * record goes at once, in this step, so no token is served or refreshed from it again; then, best
+   * effort, its tokens are revoked at the authorization server when it advertises a revocation endpoint
+   * (RFC 7009: the refresh token, else the access token). Audited, never a token. A capability with
+   * none answers an empty list.
+   */
+  async revoke(capability: string, caller: string): Promise<{ ref: string; issuer: string; server: ServerRevocation }[]> {
+    const refs = this.d.sql.exec<{ ref: string }>("SELECT ref FROM oauth_grants WHERE capability = ?", capability).toArray().map((r) => r.ref);
+    const rows = refs.map((ref) => this.grant(ref)!);
+    this.d.sql.exec("DELETE FROM oauth_grants WHERE capability = ?", capability);
+    // Flows the operator started for it and never finished can't complete into a new record.
+    for (const f of this.d.sql.exec<{ state: string; body: string }>("SELECT state, body FROM oauth_flows").toArray()) {
+      if ((JSON.parse(f.body) as { capability?: string }).capability === capability) this.d.sql.exec("DELETE FROM oauth_flows WHERE state = ?", f.state);
+    }
+    const out: { ref: string; issuer: string; server: ServerRevocation }[] = [];
+    for (const row of rows) {
+      let server: ServerRevocation = "no_tokens";
+      let reason: string | undefined;
+      const token = row.refresh_token ?? row.access_token;
+      if (token !== null) {
+        try {
+          const as = await authServerMetadata(new URL(row.issuer), this.d.allowLoopback);
+          if (!as.revocation_endpoint) server = "unsupported";
+          else {
+            const r = await revokeToken(as.revocation_endpoint, this.client(row.client, as), token, row.refresh_token !== null ? "refresh_token" : "access_token");
+            server = r.ok ? "revoked" : "failed";
+            if (!r.ok) reason = r.why;
+          }
+        } catch (e) {
+          server = "failed";
+          reason = e instanceof NestError ? e.detail : String(e);
+        }
+      }
+      this.d.audit({ event: "oauth_revoked", capability, ref: row.ref, issuer: row.issuer, caller, reason: reason ? `${server}: ${reason.slice(0, 200)}` : server });
+      out.push({ ref: row.ref, issuer: row.issuer, server });
+    }
+    return out;
   }
 
   private markReauthorize(row: GrantRow, reason: string, caller: string): never {

@@ -4,7 +4,7 @@ import { DurableObject } from "cloudflare:workers";
 import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken } from "../lib/binding";
-import { type OAuthAudit, type OAuthStatus, OAuthStore, type StartAnswer, type StartInput } from "../lib/mcp-auth";
+import { type OAuthAudit, type OAuthStatus, OAuthStore, type ServerRevocation, type StartAnswer, type StartInput } from "../lib/mcp-auth";
 import { b64url, bytesToB64, NestError, newId } from "../lib/util";
 import {
   appJwt, type GitHubApi, githubApiOf, installationVerdict, retryMintFresh, GithubRepoPermissions, importAppKey, parseAppSecret, revokeInstallationToken, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
@@ -187,6 +187,26 @@ export class BrokerDO extends DurableObject<Env> {
   /** What the operator may see of an OAuth authorization: never a token. */
   async oauthStatus(ref: string): Promise<OAuthStatus> {
     return this.oauth.status(ref);
+  }
+
+  /** The operator revokes a capability's OAuth authorizations (`OAuthStore.revoke`): gone here at once, revoked at the AS where it can be. */
+  async oauthRevoke(capability: string): Promise<{ revoked: { ref: string; issuer: string; server: ServerRevocation }[] }> {
+    return { revoked: await this.oauth.revoke(capability, "operator") };
+  }
+
+  /**
+   * The operator deletes a secret it stored (state-machine sweep, bug 11): the row goes, value and all,
+   * and what named it resolves to nothing from then on. Not the broker's own keys, nor a client's secrets
+   * (theirs to delete, or their client's delete). Audited by name, never a value.
+   */
+  async deleteSecret(name: string): Promise<{ deleted: boolean }> {
+    if (name.startsWith("binding_key:")) throw new NestError(ErrorCodes.FORBIDDEN, "binding keys are the broker's own", 403);
+    if (name.startsWith(CLIENT_SECRET_PREFIX)) throw new NestError(ErrorCodes.FORBIDDEN, "an API client's secrets are deleted with its own token", 403);
+    const deleted = this.sql.exec("DELETE FROM secrets WHERE name = ?", name).rowsWritten > 0;
+    // The tokens minted with a deleted GitHub App are never handed out again.
+    if (name === "github_app") this.sql.exec("DELETE FROM github_tokens");
+    this.auditInBackground({ event: "secret_deleted", name, deleted, caller: "operator" });
+    return { deleted };
   }
 
   async putSecret(name: string, value: string, expiresMs?: number): Promise<void> {
