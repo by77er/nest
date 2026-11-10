@@ -521,6 +521,26 @@ export function checkTemplate(tpl: Template, capabilities: Readonly<Record<strin
   return ok(tpl);
 }
 
+/**
+ * A launch's `model` and `effort` become arguments of the brain's command (`--model <m>`, `--effort <e>`),
+ * so each is one plain token: letters, digits and `. _ : @ / [ ] -`, starting with a letter or digit (never
+ * `-`, which would read as an option), at most 100 characters.
+ */
+export const LAUNCH_ARG = /^[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,99}$/;
+
+/**
+ * Why a launch can't be written, or null. Checked where a launch is written (a template put, the
+ * operator's spawn override), for every writer alike; a stored one is read as it is, so a template
+ * written before this rule still expands.
+ */
+export function launchProblem(launch: { model?: string; effort?: string } | undefined): string | null {
+  for (const k of ["model", "effort"] as const) {
+    const v = launch?.[k];
+    if (v !== undefined && !LAUNCH_ARG.test(v)) return `launch.${k} is letters, digits and . _ : @ / [ ] - (at most 100), starting with a letter or digit`;
+  }
+  return null;
+}
+
 /** Templates that list capability `name` (it can't be deleted while any does). */
 export function templatesUsing(catalog: Catalog, name: string): string[] {
   return Object.entries(catalog.templates).filter(([, t]) => t.capabilities.includes(name)).map(([n]) => n).sort();

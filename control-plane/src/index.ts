@@ -9,7 +9,7 @@ import { asNestError, errorResponse, json, NestError, newId, timingSafeEqual } f
 import { checkHealth, healthProbes } from "./lib/health";
 import { CONFIG_DIGEST } from "./lib/build";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
-import { Capability, CatalogName, EntryName, OperatorOverrides, type SpawnerOverrides, Template } from "./lib/spec";
+import { Capability, CatalogName, EntryName, launchProblem, OperatorOverrides, type SpawnerOverrides, Template } from "./lib/spec";
 import { cellIdleTtlMs, MIN_IDLE_TTL_MS } from "./lib/lifetimes";
 import {
   CLIENT_ID, ClientName, GithubTokenRequest, githubTokenOutsideGrant, Grant, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
@@ -817,6 +817,9 @@ export const ROUTES: Route[] = [
           params: z.never({ error: "overrides.params is no longer accepted: the task ledger left the platform" }).optional(),
         }).optional().safeParse(r.overrides);
         if (!o.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, o.error.message);
+        // A launch given here is written into the agent's spec: held to the rule a template's is.
+        const bad = launchProblem(r.launch) ?? launchProblem(o.data?.launch);
+        if (bad) throw new NestError(ErrorCodes.INVALID_MESSAGE, bad);
         const overrides: OperatorOverrides = { ...(r.launch ? { launch: r.launch } : {}), ...(r.rules ? { rules: r.rules } : {}), ...o.data };
         spec = await catalog(env).expand({ template, hands: !!r.sandbox, by: "operator", overrides }, scope);
       }

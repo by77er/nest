@@ -77,7 +77,7 @@ The checks:
 | `PUT` | `/v1/sandboxes/<sandbox>/client-policy` | Subtree. Within its client's grant as it is now (`github_push.workflows` too). |
 | `GET` | `/v1/catalog` | The operator's entries and its own namespace's. |
 | `GET` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. |
-| `PUT` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. Within the grant, when written and again at spawn. |
+| `PUT` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. Within the grant, when written and again at spawn. Its `launch.model` and `launch.effort` are [plain tokens](../../durable-objects/catalog/) (400). |
 | `DELETE` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. |
 | `GET` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. |
 | `PUT` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. Within the grant (`mcp_urls`, `credentials`, brokered actions). |
