@@ -3,7 +3,9 @@
 
 import { z } from "zod";
 import type { ToolOutcome } from "../protocol/control";
+import { ErrorCodes } from "../protocol/model";
 import { addColumn, storedEnum } from "./stored";
+import { errorBody } from "./util";
 
 // Closed unions for the status columns (docs/data/#enums), checked on read (`storedEnum`).
 /** `tool_calls.status`: running (re-run if redelivered after an eviction), waiting on an ask, or finished. */
@@ -21,6 +23,58 @@ const ApprovalStatusEnum = z.enum(["pending", "approved", "denied"]);
 const CALL = CallStatusEnum.enum;
 const ASK = AskStatusEnum.enum;
 const APPROVAL = ApprovalStatusEnum.enum;
+
+// --- the ledgers' steps (pure) ------------------------------------------------------------------------
+
+/**
+ * What happens to a call: it waits on an ask (`wait`), gets its outcome (`finish`), is given up by the
+ * runner (`cancel`), or never finished and is settled by age (`abandon`, the prune).
+ */
+export const CALL_EVENTS = ["wait", "finish", "cancel", "abandon"] as const;
+export type CallEvent = (typeof CALL_EVENTS)[number];
+export const CALL_STATUSES = CallStatusEnum.options;
+
+/**
+ * The call ledger's one step: the status after `event`, or `refuse` when it doesn't apply there. `done`
+ * is final: a finished call keeps its outcome whatever comes later (a second finish, a cancel). Every
+ * write to `tool_calls.status` goes through it (`CallLedger.applyCall`).
+ */
+export function callStep(status: CallStatus, event: CallEvent): CallStatus | "refuse" {
+  if (status === "dispatching") return event === "wait" ? "waiting" : "done";
+  if (status === "waiting") return event === "wait" ? "refuse" : "done";
+  return "refuse";
+}
+
+/** What happens to an ask: nothing waits inside a call for it any more (`detach`), or it is answered. */
+export const ASK_EVENTS = ["detach", "answer"] as const;
+export type AskEvent = (typeof ASK_EVENTS)[number];
+export const ASK_STATUSES = AskStatusEnum.options;
+
+/** The ask ledger's one step. `answered` is final: the first answer stands. */
+export function askStep(status: AskStatus, event: AskEvent): AskStatus | "refuse" {
+  if (status === "answered") return "refuse";
+  if (event === "answer") return "answered";
+  return status === "async" ? "refuse" : "async";
+}
+
+export const APPROVAL_EVENTS = ["approve", "deny"] as const;
+export type ApprovalEvent = (typeof APPROVAL_EVENTS)[number];
+export type ApprovalStatus = z.output<typeof ApprovalStatusEnum>;
+export const APPROVAL_STATUSES = ApprovalStatusEnum.options;
+
+/** The approval ledger's one step: only a pending approval is decided, once. */
+export function approvalStep(status: ApprovalStatus, event: ApprovalEvent): ApprovalStatus | "refuse" {
+  if (status !== "pending") return "refuse";
+  return event === "approve" ? "approved" : "denied";
+}
+
+/**
+ * Whether an approval may be spent on the call key `key` at `nowMs`: approved, not expired, and not
+ * already spent on another call (its own redelivery may use it again). One approval, one call.
+ */
+export function approvalUsable(a: { status: ApprovalStatus; expires_ms: number | null; used_by: string | null }, key: string, nowMs: number): boolean {
+  return a.status === "approved" && a.expires_ms !== null && a.expires_ms > nowMs && (a.used_by === null || a.used_by === key);
+}
 
 /** A call as stored: the epoch whose row and idempotency key it keeps. */
 export interface StoredCall {
@@ -86,13 +140,44 @@ export class CallLedger {
       epoch, call, name, Date.now());
   }
 
-  /** The call waits for an ask; only from `dispatching` (an answer that came while it was routed finished it). */
-  wait(epoch: number, call: string): void {
-    this.sql.exec(`UPDATE tool_calls SET status = '${CALL.waiting}' WHERE epoch = ? AND call = ? AND status = '${CALL.dispatching}'`, epoch, call);
+  /**
+   * Apply `event` to the calls matching `where`, as `callStep` decides for each one's status: a row whose
+   * status refuses the event is left as it is. An event that ends a call stores `outcome` with it. How
+   * many rows moved.
+   */
+  private applyCall(event: CallEvent, outcome: ToolOutcome | null, where: string, ...args: SqlStorageValue[]): number {
+    let n = 0;
+    for (const from of CALL_STATUSES) {
+      const to = callStep(from, event);
+      if (to === "refuse") continue;
+      n += to === CALL.done
+        ? this.sql.exec(`UPDATE tool_calls SET status = ?, outcome = ? WHERE status = ? AND (${where})`, to, JSON.stringify(outcome), from, ...args).rowsWritten
+        : this.sql.exec(`UPDATE tool_calls SET status = ? WHERE status = ? AND (${where})`, to, from, ...args).rowsWritten;
+    }
+    return n;
   }
 
-  finish(epoch: number, call: string, outcome: ToolOutcome): void {
-    this.sql.exec(`UPDATE tool_calls SET status = '${CALL.done}', outcome = ? WHERE epoch = ? AND call = ?`, JSON.stringify(outcome), epoch, call);
+  /** As `applyCall`, for asks (`askStep`). */
+  private applyAsk(event: AskEvent, answer: string | null, where: string, ...args: SqlStorageValue[]): number {
+    let n = 0;
+    for (const from of ASK_STATUSES) {
+      const to = askStep(from, event);
+      if (to === "refuse") continue;
+      n += to === ASK.answered
+        ? this.sql.exec(`UPDATE asks SET status = ?, answer = ? WHERE status = ? AND (${where})`, to, answer, from, ...args).rowsWritten
+        : this.sql.exec(`UPDATE asks SET status = ? WHERE status = ? AND (${where})`, to, from, ...args).rowsWritten;
+    }
+    return n;
+  }
+
+  /** The call waits for an ask; only from `dispatching` (an answer that came while it was routed finished it). Whether it does. */
+  wait(epoch: number, call: string): boolean {
+    return this.applyCall("wait", null, "epoch = ? AND call = ?", epoch, call) > 0;
+  }
+
+  /** The call's outcome, once: a call already done keeps the outcome it has. Whether this one was stored. */
+  finish(epoch: number, call: string, outcome: ToolOutcome): boolean {
+    return this.applyCall("finish", outcome, "epoch = ? AND call = ?", epoch, call) > 0;
   }
 
   /** The runner gave up on the call: it never runs, and its ask's answer comes as a turn. A done call keeps its outcome. */
@@ -100,9 +185,8 @@ export class CallLedger {
     if (!prior) {
       this.sql.exec(`INSERT INTO tool_calls (epoch, call, name, status, outcome, created_ms) VALUES (?, ?, '', '${CALL.done}', ?, ?)`,
         epoch, call, JSON.stringify(outcome), Date.now());
-    } else if (prior.status !== "done") {
-      this.finish(epoch, call, outcome);
-      this.sql.exec(`UPDATE asks SET status = '${ASK.async}' WHERE call = ? AND epoch = ? AND status = '${ASK.sync}'`, call, epoch);
+    } else if (this.applyCall("cancel", outcome, "epoch = ? AND call = ?", epoch, call) > 0) {
+      this.applyAsk("detach", null, `call = ? AND epoch = ? AND status = '${ASK.sync}'`, call, epoch);
     }
   }
 
@@ -120,12 +204,13 @@ export class CallLedger {
   }
 
   /** Nothing waits for the ask any more (its sync window lapsed, or the guest CLI gave up): answered as a turn. */
-  toAsync(ask: string, from: "sync" | "cli"): void {
-    this.sql.exec(`UPDATE asks SET status = '${ASK.async}' WHERE ask = ? AND status = ?`, ask, from);
+  toAsync(ask: string, from: "sync" | "cli"): boolean {
+    return this.applyAsk("detach", null, "ask = ? AND status = ?", ask, from) > 0;
   }
 
-  answer(ask: string, text: string): void {
-    this.sql.exec(`UPDATE asks SET status = '${ASK.answered}', answer = ? WHERE ask = ?`, text, ask);
+  /** The ask's answer, once: an answered ask keeps the answer it has. Whether this one was stored. */
+  answer(ask: string, text: string): boolean {
+    return this.applyAsk("answer", text, "ask = ?", ask) > 0;
   }
 
   /** Asks not yet answered, oldest first, with the approval each one decides (if any). */
@@ -155,9 +240,15 @@ export class CallLedger {
       ask, name, digest, Date.now(), tool);
   }
 
-  decide(ask: string, approved: boolean, expiresMs: number): void {
-    this.sql.exec(`UPDATE approvals SET status = ?, expires_ms = ? WHERE ask = ? AND status = '${APPROVAL.pending}'`,
-      approved ? APPROVAL.approved : APPROVAL.denied, expiresMs, ask);
+  /** The operator's decision, once (`approvalStep`): a decided approval keeps its decision and its expiry. Whether it was pending. */
+  decide(ask: string, approved: boolean, expiresMs: number): boolean {
+    const event: ApprovalEvent = approved ? "approve" : "deny";
+    let n = 0;
+    for (const from of APPROVAL_STATUSES) {
+      const to = approvalStep(from, event);
+      if (to !== "refuse") n += this.sql.exec("UPDATE approvals SET status = ?, expires_ms = ? WHERE ask = ? AND status = ?", to, expiresMs, ask, from).rowsWritten;
+    }
+    return n > 0;
   }
 
   /**
@@ -165,15 +256,25 @@ export class CallLedger {
    * was already spent on `key`: a redelivery). One approval, one call.
    */
   takeApproval(name: string, digest: string, key: string, nowMs: number): boolean {
-    const r = this.sql.exec<{ ask: string }>(
-      `SELECT ask FROM approvals WHERE name = ? AND digest = ? AND status = '${APPROVAL.approved}' AND expires_ms > ?
-       AND (used_by IS NULL OR used_by = ?) ORDER BY used_by IS NULL LIMIT 1`, name, digest, nowMs, key).toArray()[0];
+    // The one already spent on this key first (a redelivery), else an unspent one.
+    const r = this.sql.exec<{ ask: string; status: string; expires_ms: number | null; used_by: string | null }>(
+      "SELECT ask, status, expires_ms, used_by FROM approvals WHERE name = ? AND digest = ? ORDER BY used_by IS NULL, created_ms, ask", name, digest).toArray()
+      .find((a) => approvalUsable({ ...a, status: storedEnum(ApprovalStatusEnum, a.status, "approvals.status") }, key, nowMs));
     if (!r) return false;
     this.sql.exec("UPDATE approvals SET used_by = ? WHERE ask = ?", key, r.ask);
     return true;
   }
 
+  /**
+   * Rows older than `cutoff` go once final. Rows that can't become final on their own are settled first,
+   * by age, so none stays for ever: a call still dispatching or waiting that long never got an outcome
+   * (its brain is long gone) and ends `outcome_unknown`; an ask a previous release's call or guest CLI
+   * was waiting inside is answered as a turn like any other. An open ask, and the pending approval it
+   * decides, is the operator's work still to do: it stays until answered.
+   */
   prune(cutoff: number): void {
+    this.applyCall("abandon", { status: "error", error: errorBody(ErrorCodes.OUTCOME_UNKNOWN, "the call never finished; whether it ran is unknown") }, "created_ms < ?", cutoff);
+    this.applyAsk("detach", null, "created_ms < ?", cutoff);
     this.sql.exec(`DELETE FROM tool_calls WHERE status = '${CALL.done}' AND created_ms < ?`, cutoff);
     this.sql.exec(`DELETE FROM asks WHERE status = '${ASK.answered}' AND created_ms < ?`, cutoff);
     this.sql.exec(`DELETE FROM approvals WHERE status != '${APPROVAL.pending}' AND created_ms < ?`, cutoff);

@@ -1,13 +1,16 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
-import { askRoute, CallLedger } from "../src/lib/calls";
+import {
+  APPROVAL_EVENTS, APPROVAL_STATUSES, approvalStep, approvalUsable, ASK_EVENTS, ASK_STATUSES, askRoute, askStep, CALL_EVENTS, CALL_STATUSES, CallLedger, callStep,
+} from "../src/lib/calls";
 import type { ToolOutcome } from "../src/protocol/control";
+import { adminJson, connectHost, uniqueCell } from "./helpers";
 
 /** A fresh ledger on a real Durable Object's SQLite (an AgentDO's storage: its own ledger's tables). */
-async function withLedger<T>(f: (l: CallLedger) => T): Promise<T> {
+async function withLedger<T>(f: (l: CallLedger, sql: SqlStorage) => T): Promise<T> {
   const stub = env.AGENT.get(env.AGENT.idFromName(`calls-${crypto.randomUUID()}`));
-  return runInDurableObject(stub, (_i: AgentDO, st) => f(new CallLedger(st.storage.sql)));
+  return runInDurableObject(stub, (_i: AgentDO, st) => f(new CallLedger(st.storage.sql), st.storage.sql));
 }
 const ok: ToolOutcome = { status: "ok", content: [{ type: "text", text: "done" }] };
 const unknown: ToolOutcome = { status: "error", error: { code: "outcome_unknown", message: "cancelled", retryable: false } };
@@ -58,5 +61,185 @@ describe("CallLedger", () => {
       l.begin(2, "cal_x", "emit");
       expect(l.call("cal_x")?.epoch).toBe(1);
     });
+  });
+});
+
+describe("the ledgers' steps: every status and event, and nothing leaves a final status", () => {
+  it("callStep", () => {
+    const table = Object.fromEntries(CALL_STATUSES.map((st) => [st, Object.fromEntries(CALL_EVENTS.map((e) => [e, callStep(st, e)]))]));
+    expect(table).toEqual({
+      dispatching: { wait: "waiting", finish: "done", cancel: "done", abandon: "done" },
+      waiting: { wait: "refuse", finish: "done", cancel: "done", abandon: "done" },
+      done: { wait: "refuse", finish: "refuse", cancel: "refuse", abandon: "refuse" },
+    });
+  });
+
+  it("askStep", () => {
+    const table = Object.fromEntries(ASK_STATUSES.map((st) => [st, Object.fromEntries(ASK_EVENTS.map((e) => [e, askStep(st, e)]))]));
+    expect(table).toEqual({
+      sync: { detach: "async", answer: "answered" },
+      cli: { detach: "async", answer: "answered" },
+      async: { detach: "refuse", answer: "answered" },
+      answered: { detach: "refuse", answer: "refuse" },
+    });
+  });
+
+  it("approvalStep", () => {
+    const table = Object.fromEntries(APPROVAL_STATUSES.map((st) => [st, Object.fromEntries(APPROVAL_EVENTS.map((e) => [e, approvalStep(st, e)]))]));
+    expect(table).toEqual({
+      pending: { approve: "approved", deny: "denied" },
+      approved: { approve: "refuse", deny: "refuse" },
+      denied: { approve: "refuse", deny: "refuse" },
+    });
+  });
+
+  it.each([
+    ["approved, unspent, unexpired", { status: "approved", expires_ms: 200, used_by: null }, true],
+    ["spent on this call (its redelivery)", { status: "approved", expires_ms: 200, used_by: "k" }, true],
+    ["spent on another call", { status: "approved", expires_ms: 200, used_by: "other" }, false],
+    ["expired at this instant", { status: "approved", expires_ms: 100, used_by: null }, false],
+    ["no expiry recorded", { status: "approved", expires_ms: null, used_by: null }, false],
+    ["pending", { status: "pending", expires_ms: 200, used_by: null }, false],
+    ["denied", { status: "denied", expires_ms: 200, used_by: null }, false],
+  ] as const)("approvalUsable: %s", (_n, a, usable) => {
+    expect(approvalUsable(a, "k", 100)).toBe(usable);
+  });
+});
+
+describe("CallLedger: the guards are the ledger's", () => {
+  it("a finished call keeps its outcome: a second finish, a cancel and a wait change nothing", async () => {
+    await withLedger((l) => {
+      l.begin(1, "cal_f", "emit");
+      expect(l.finish(1, "cal_f", ok)).toBe(true);
+      expect(l.finish(1, "cal_f", unknown)).toBe(false);
+      l.cancel(1, "cal_f", unknown, l.call("cal_f"));
+      expect(l.wait(1, "cal_f")).toBe(false);
+      expect(l.call("cal_f")).toEqual({ epoch: 1, status: "done", outcome: ok });
+      // A waiting call is finished once too.
+      l.begin(1, "cal_w", "ask");
+      expect(l.wait(1, "cal_w")).toBe(true);
+      expect(l.wait(1, "cal_w")).toBe(false);
+      expect(l.finish(1, "cal_w", ok)).toBe(true);
+      expect(l.finish(1, "cal_w", unknown)).toBe(false);
+      expect(l.call("cal_w")?.outcome).toEqual(ok);
+      // Finishing a call nobody began stores nothing.
+      expect(l.finish(1, "cal_none", ok)).toBe(false);
+      expect(l.call("cal_none")).toBeUndefined();
+    });
+  });
+
+  it("an ask is answered once, and only a waiting one is detached", async () => {
+    await withLedger((l, sql) => {
+      const answerOf = (ask: string) => sql.exec<{ answer: string | null }>("SELECT answer FROM asks WHERE ask = ?", ask).one().answer;
+      l.recordAsk({ ask: "ask_a", call: "cal_a", epoch: 1, question: "q", status: "async", deadline: 0 });
+      expect(l.toAsync("ask_a", "sync")).toBe(false);
+      expect(l.answer("ask_a", "first")).toBe(true);
+      expect(l.answer("ask_a", "second")).toBe(false);
+      expect(answerOf("ask_a")).toBe("first");
+      expect(l.toAsync("ask_a", "sync")).toBe(false);
+      expect(l.ask("ask_a")?.status).toBe("answered");
+      // A previous release's waiting asks: detached only from the status named.
+      l.recordAsk({ ask: "ask_s", call: "cal_s", epoch: 1, question: "q", status: "sync", deadline: 0 });
+      expect(l.toAsync("ask_s", "cli")).toBe(false);
+      expect(l.toAsync("ask_s", "sync")).toBe(true);
+      expect(l.ask("ask_s")?.status).toBe("async");
+      expect(l.answer("ask_unknown", "x")).toBe(false);
+    });
+  });
+
+  it("an approval is decided once and spent on one call", async () => {
+    await withLedger((l) => {
+      l.requestApproval("ask_p", "notes_send", "d1", "mcp__nest__notes_send");
+      // Undecided, it can't be spent.
+      expect(l.takeApproval("notes_send", "d1", "k1", 50)).toBe(false);
+      expect(l.decide("ask_p", true, 100)).toBe(true);
+      // Decided, it stays: a later denial or a new expiry changes nothing.
+      expect(l.decide("ask_p", false, 999)).toBe(false);
+      expect(l.decide("ask_p", true, 999)).toBe(false);
+      expect(l.approvalOf("ask_p")?.status).toBe("approved");
+      expect(l.takeApproval("notes_send", "other-digest", "k1", 50)).toBe(false);
+      expect(l.takeApproval("notes_send", "d1", "k1", 50)).toBe(true);
+      expect(l.takeApproval("notes_send", "d1", "k1", 60)).toBe(true); // its redelivery
+      expect(l.takeApproval("notes_send", "d1", "k2", 60)).toBe(false);
+      expect(l.takeApproval("notes_send", "d1", "k1", 100)).toBe(false); // expired (the first expiry stood)
+      // A denial can't be spent or reversed.
+      l.requestApproval("ask_d", "notes_send", "d2");
+      expect(l.decide("ask_d", false, 100)).toBe(true);
+      expect(l.decide("ask_d", true, 100)).toBe(false);
+      expect(l.takeApproval("notes_send", "d2", "k3", 50)).toBe(false);
+      // Two approvals of the same call: each is spent on one call key.
+      l.requestApproval("ask_1", "x", "d");
+      l.decide("ask_1", true, 100);
+      l.requestApproval("ask_2", "x", "d");
+      l.decide("ask_2", true, 100);
+      expect(l.takeApproval("x", "d", "ka", 50)).toBe(true);
+      expect(l.takeApproval("x", "d", "ka", 50)).toBe(true); // a redelivery uses the one it spent, not the other
+      expect(l.takeApproval("x", "d", "kb", 50)).toBe(true);
+      expect(l.takeApproval("x", "d", "kc", 50)).toBe(false);
+      expect(l.takeApproval("x", "d", "ka", 50)).toBe(true);
+    });
+  });
+
+  it("prune settles by age what can't end on its own, and keeps the operator's open work", async () => {
+    await withLedger((l, sql) => {
+      const cutoff = Date.now() - 1000;
+      const age = (table: string, col: string, id: string) => sql.exec(`UPDATE ${table} SET created_ms = 1 WHERE ${col} = ?`, id);
+      const status = (call: string) => l.call(call)?.status;
+      l.begin(1, "cal_stuck", "emit");
+      l.begin(1, "cal_waiting", "ask");
+      l.wait(1, "cal_waiting");
+      l.begin(1, "cal_done", "emit");
+      l.finish(1, "cal_done", ok);
+      l.begin(1, "cal_new", "emit");
+      for (const c of ["cal_stuck", "cal_waiting", "cal_done"]) age("tool_calls", "call", c);
+      l.recordAsk({ ask: "ask_sync", call: "cal_waiting", epoch: 1, question: "q", status: "sync", deadline: 0 });
+      l.recordAsk({ ask: "ask_cli", call: "cal_c", epoch: 1, question: "q", status: "cli", deadline: 0 });
+      l.recordAsk({ ask: "ask_open", call: "cal_o", epoch: 1, question: "q", status: "async", deadline: 0 });
+      l.recordAsk({ ask: "ask_answered", call: "cal_a", epoch: 1, question: "q", status: "async", deadline: 0 });
+      l.answer("ask_answered", "yes");
+      l.recordAsk({ ask: "ask_sync_new", call: "cal_n", epoch: 1, question: "q", status: "sync", deadline: 0 });
+      for (const a of ["ask_sync", "ask_cli", "ask_open", "ask_answered"]) age("asks", "ask", a);
+      l.requestApproval("ask_open", "x", "d");
+      l.requestApproval("ask_spent", "x", "d2");
+      l.decide("ask_spent", true, 5);
+      for (const a of ["ask_open", "ask_spent"]) age("approvals", "ask", a);
+
+      l.prune(cutoff);
+      // Old calls that never finished are settled, and being old, go in the same prune; so does the old finished one.
+      expect(status("cal_stuck")).toBeUndefined();
+      expect(status("cal_waiting")).toBeUndefined();
+      expect(status("cal_done")).toBeUndefined();
+      expect(status("cal_new")).toBe("dispatching");
+      // A previous release's waiting asks are answered as a turn from now on; a recent one still waits.
+      expect(l.ask("ask_sync")?.status).toBe("async");
+      expect(l.ask("ask_cli")?.status).toBe("async");
+      expect(l.ask("ask_sync_new")?.status).toBe("sync");
+      // The operator's open ask and its pending approval stay, however old; answered and decided ones go.
+      expect(l.ask("ask_open")?.status).toBe("async");
+      expect(l.approvalOf("ask_open")?.status).toBe("pending");
+      expect(l.ask("ask_answered")).toBeUndefined();
+      expect(l.approvalOf("ask_spent")).toBeUndefined();
+      expect(l.open().map((a) => a.ask).sort()).toEqual(["ask_cli", "ask_open", "ask_sync", "ask_sync_new"]);
+    });
+  });
+});
+
+describe("AgentDO.finishCall", () => {
+  it("sends a call's result once: a call that already has its outcome keeps it and nothing more goes to the runner", async () => {
+    const cell = uniqueCell();
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
+    await connectHost(cell, "brain");
+    const agent = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
+    const sent = await runInDurableObject(env.AGENT.get(env.AGENT.idFromName(agent)), (inst: AgentDO) => {
+      const a = inst as any;
+      a.calls.begin(1, "cal_once", "emit");
+      a.finishCall(1, "cal_once", ok);
+      a.finishCall(1, "cal_once", unknown);
+      // Cancelled by the runner, then its dispatch returns: the runner is told nothing.
+      a.calls.cancel(1, "cal_gone", unknown, undefined);
+      a.finishCall(1, "cal_gone", ok);
+      return (a.rel.pendingAfter("runner", undefined) as { type: string; call?: string; outcome?: ToolOutcome }[]).filter((m) => m.type === "tool_result");
+    });
+    expect(sent.map((m) => [m.call, m.outcome])).toEqual([["cal_once", ok]]);
   });
 });

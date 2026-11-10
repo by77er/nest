@@ -3020,7 +3020,8 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   private finishCall(epoch: number, call: string, outcome: ToolOutcome): void {
-    this.calls.finish(epoch, call, outcome);
+    // A call that already has its outcome (finished, or cancelled by the runner) keeps it: nothing more is sent.
+    if (!this.calls.finish(epoch, call, outcome)) return;
     this.pushReliable((seq) => ({ type: "tool_result", seq, call, outcome }));
   }
 
