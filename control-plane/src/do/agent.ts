@@ -878,6 +878,10 @@ export class AgentDO extends DurableObject<Env> {
           await this.hook("intent:beforeCommit");
           if (!this.unchanged(snap)) continue;
           if (decided === "condemn") {
+            // Condemned only because a restart was asked for: a start that can't be issued (below) leaves
+            // the brain running, and the restart is refused with why. A move or an unhealthy host condemns
+            // it all the same (a brain is never pinned to a host it must leave); its start then fails.
+            if (intent.reason === "restart" && liveBrainStart({ ...intent, reason: "operator" }, brain, healthy) !== "condemn") this.requireLaunch(snap);
             await this.condemn(intent.reason === "restart" ? "restarting" : `starting on ${intent.host_hint ?? "another host"}`, brain.epoch);
           } else if (decided === "drop") {
             this.update((i) => Object.assign(i, NO_INTENT));
@@ -888,8 +892,7 @@ export class AgentDO extends DurableObject<Env> {
         // A start is issued from here, with the agent's stored launch: its model and effort become arguments
         // of the brain's command, so a spec stored before the rule (lib/spec.ts `launchProblem`) starts no
         // brain. Refused for good, as any start a host would refuse: the agent is `errored`, with why.
-        const badLaunch = launchProblem(snap.launch);
-        if (badLaunch) throw new NestError(ErrorCodes.INVALID_MESSAGE, `the agent's ${badLaunch}: no brain is started with it`);
+        this.requireLaunch(snap);
         const host = await this.pickHost(snap, intent);
         const oauthRef = await this.startCredential(snap);
         // `--resume` reads R2 only: make what's still buffered durable first, or the new brain would
@@ -907,6 +910,12 @@ export class AgentDO extends DurableObject<Env> {
     // Changed under us three times: the alarm looks again.
     await this.deadlines.set("intent", Date.now() + START_RETRY_MS, true);
     return this.startStatus();
+  }
+
+  /** The stored launch is one a brain can be started with (lib/spec.ts `launchProblem`), or a refusal for good. */
+  private requireLaunch(info: AgentInfo): void {
+    const bad = launchProblem(info.launch);
+    if (bad) throw new NestError(ErrorCodes.INVALID_MESSAGE, `the agent's ${bad}: no brain is started with it`);
   }
 
   /**

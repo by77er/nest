@@ -395,6 +395,11 @@ Line citations above this section are function names or older heads; `agent.ts` 
 
 - **`processIntent`, with no brain:** before `pickHost`, an agent whose stored launch isn't plain tokens (`launchProblem`, `lib/spec.ts`) throws a non-retryable `invalid_message`. `intentFailed` ends the intent and, with no brain, sets `errored` with `start_error`, as for any start refused for good. Conforms: no brain record is read or written by the refusal, no command is issued, and no new transition is added (the model's start is simply not taken). The branches with a brain (release, condemned, `liveBrainStart`) are unchanged.
 
+## a restart refused before the condemn (cp/restart-launch-check, author's map, 2026-11-09)
+
+- **`processIntent`, with a live brain and `liveBrainStart` = `condemn` only because a restart was asked for** (the same intent as `operator` wouldn't condemn: a healthy host, no move): the launch check (`requireLaunch`) runs before `condemn`, after the snapshot is seen unchanged. Before, the check sat only on the no-brain branch, so a restart of an agent whose stored launch fails the rule condemned the running brain and only then failed the start. Now the throw is non-retryable, `intentFailed` ends the intent, and with a brain it leaves `lifecycle` and `start_error` alone. Conforms: the refusal reads the brain record and writes none of it, issues no command, and takes no transition the model has (the condemn is simply not taken, so fewer behaviours, not new ones).
+- **A move or an unhealthy host condemns as before** (a drain's `avoid`, a hint, a host that's not active, with or without a restart): a brain is never pinned to a host it must leave, and a drain isn't blocked. The start after its release is refused on the no-brain branch and the agent is `errored` with `start_error`. `keep` and `drop` are unchanged.
+- Tests (`agent-seams.test.ts`): "a restart that couldn't start a brain", "a brain on a draining host is condemned even if no start can follow it", "a restart on a host that's no longer healthy condemns the brain all the same".
 
 ## the turn ledger's step (refactor/turn-ledger, author's map, 2026-11-09)
 
