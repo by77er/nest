@@ -1,5 +1,5 @@
 //! Hook intake: async tracking datagrams (→ state events) and synchronous decisions answered
-//! from local state only (the `AgentCache`, the inbox mirror, the hands connection).
+//! from local state only (the `AgentCache` and the inbox mirror).
 
 use std::io::BufRead;
 use std::sync::Arc;

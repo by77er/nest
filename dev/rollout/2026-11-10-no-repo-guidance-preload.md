@@ -2,7 +2,7 @@
 
 A release's rollout rule ([Rollout rules](../deploy.md#rollout-rules)).
 
-**Ordering constraint.** The runner's `SessionStart` hook stops reading the sandbox's `CLAUDE.md` through hands and passing it to the model: nest loads none of a repo's guidance, which is the client's to ask for. A client whose agents relied on the pre-load must first tell them to read the repo's guidance themselves (in its template's prompt, or each task), and that change must be live before hosts take this release. The projects app's change that does so merges and deploys first.
+**Ordering constraint.** The runner's `SessionStart` hook stops reading the sandbox's `CLAUDE.md` through hands and passing it to the model: nest loads none of a repo's guidance, which is the client's to ask for. A client whose agents relied on the pre-load must first tell them to read the repo's guidance themselves (in its template's prompt, or each task), and that change must be live before hosts take this release. The projects app is such a client: its manager and worker prompts must tell agents to read the repo's guidance when a session starts, a resumed one included (a worker that resumes in its clone got the guidance from the pre-load), and that change merges and deploys before this one merges.
 
 - **Not a one-way deploy.** No stored state, wire field, route or DO method changes. `SessionStart` still answers in the same shape (now always `{}`), and the managed settings give its hook 10 s instead of 20 s.
 - **Hosts one release behind:** an old runner still pre-loads `CLAUDE.md`; a new one doesn't. An agent told to read the guidance itself reads it either way, so the order above is the only constraint.

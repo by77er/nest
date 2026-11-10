@@ -14,7 +14,7 @@ Every Claude Code hook runs `/usr/lib/nest/nest hook [--sync]` (wired in managed
 `SessionStart` (10 s, fail open), `PreToolUse` and `PermissionRequest` (10 s, `onFailure: block`), `PostToolUse` and `Stop` (10 s, fail open).
 
 - One `HookDecisionRequest{v, agent, input}` frame on `hook.sock`, then one `HookDecisionResponse{output}` frame. `output` is printed verbatim to stdout.
-- **The runner answers from local state only** (the `AgentCache` from AgentDO, the inbox mirror, the hands connection). It never waits on the network. Target ~1 ms.
+- **The runner answers from local state only** (the `AgentCache` from AgentDO and the inbox mirror). It never waits on the network. Target ~1 ms.
 - **If the runner is unreachable or doesn't answer within 8 s**, `nest hook` prints `hook::fallback_output(event)`: deny for `PreToolUse`/`PermissionRequest`, nothing (allow) for `PostToolUse`/`Stop`/`SessionStart`.
 - **Peer binding:** the runner checks the connecting process (`SO_PEERCRED`) descends from the declared agent's Claude Code process; otherwise it answers with the same fallback. The async datagram socket isn't peer-checked (tracking only; a forged datagram can only mislabel state).
 

@@ -501,12 +501,10 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
     assert_eq!(env["HOME"].as_str().unwrap(), h.config_dir().to_str().unwrap());
     assert!(!env.keys().any(|k| k.starts_with("ANTHROPIC_") || k.starts_with("CARGO")), "inherited env leaked: {:?}", env.keys());
     let events = run["events"].as_array().unwrap();
-    let ctx = events
-        .iter()
-        .find(|e| e["kind"] == "hook" && e["event"] == "SessionStart")
-        .map(|e| e["output"]["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string())
-        .unwrap();
-    assert!(ctx.contains("# Project rules"), "{ctx}");
+    // SessionStart answers through the real `nest hook` with nothing: no repo guidance is
+    // pre-loaded (a repo's guidance is the client's to ask for).
+    let session_start = events.iter().find(|e| e["kind"] == "hook" && e["event"] == "SessionStart").expect("SessionStart ran");
+    assert!(session_start["output"].as_object().is_some_and(|o| o.is_empty()), "SessionStart added something: {session_start}");
     let tools = events.iter().find(|e| e["kind"] == "tool").map(|_| ()).is_some();
     assert!(tools);
     let names: Vec<&str> = events.iter().find(|e| e["kind"] == "tools").unwrap()["names"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
