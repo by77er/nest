@@ -2,8 +2,8 @@
 // in Settings, and how it reaches nest: a template of the project's own with `launch.model`, named for
 // the role and the model, which each start names (frozen with the attempt, so a change applies to the
 // next start).
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { env, runInDurableObject } from "cloudflare:test";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { roleTemplate, TEMPLATE } from "../src/catalog";
 import { DEFAULT_MODEL, MODELS, modelLabel, modelProblem, modelTemplateEntry } from "../src/models";
@@ -70,6 +70,10 @@ describe("a project's models", () => {
   }
   type P = Awaited<ReturnType<typeof newProject>>;
   const stub = (p: P) => env.PROJECT.get(env.PROJECT.idFromName(p.id));
+  /** Run the project's alarm now, whether or not one is scheduled. */
+  const alarm = (p: P) => runInDurableObject(stub(p), (o) => (o as unknown as { alarm(): Promise<void> }).alarm());
+  // One test's injected failures never reach the next.
+  beforeEach(() => { fake.failures = []; });
   const entry = (p: P, role: "manager" | "worker", model: string) => `projects/${modelTemplateEntry(role, p.id, model)}`;
   const written = (name: string) => fake.catalog.get(`templates/${name}`) as { launch: { model?: string }; repos?: string[]; read_repos?: string[] } | undefined;
   async function assign(p: P, title = "t") {
@@ -162,6 +166,8 @@ describe("a project's models", () => {
     await stub(p).drain();
     expect(fake.catalog.has(opus)).toBe(true);
     fake.failures = [];
+    // Once its backoff has passed.
+    await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE model_templates SET del_next_ms = 0 WHERE del_next_ms IS NOT NULL"); });
     await stub(p).drain();
     expect(fake.catalog.has(opus)).toBe(false);
     // The current setting's, and the manager's, stay.
@@ -171,6 +177,74 @@ describe("a project's models", () => {
     await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: second.assignee, reason: "exited" });
     await stub(p).drain();
     expect(fake.catalog.has(haiku)).toBe(true);
+  });
+
+  it("a delete nest can't take is backed off, not tried at every drain; one it refuses for good is recorded and left", async () => {
+    const p = await newProject();
+    const first = await assign(p, "first");
+    const opus = `templates/${entry(p, "worker", "claude-opus-5-5")}`;
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { worker_model: "claude-haiku-5-5" });
+    const deletes = () => fake.callsTo("DELETE", new RegExp(`^/v1/catalog/templates/projects/${entry(p, "worker", "claude-opus-5-5").replace("projects/", "")}$`)).length;
+    fake.fail(/^DELETE \/v1\/catalog\/templates\//, 503, { retryable: true, times: 1000 });
+    await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: first.assignee, reason: "exited" });
+    await stub(p).drain();
+    const tried = deletes();
+    expect(tried).toBeGreaterThan(0);
+    // More drains before it's due: not tried again; the alarm is set for when it is.
+    await stub(p).drain();
+    await stub(p).drain();
+    expect(deletes()).toBe(tried);
+    const row = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT del_next_ms, del_attempts FROM model_templates WHERE del_next_ms IS NOT NULL").one());
+    expect(row.del_next_ms as number).toBeGreaterThan(Date.now());
+    expect(row.del_attempts).toBe(1);
+    // The alarm's own run arms the next one no later than the retry.
+    await runInDurableObject(stub(p), (_o, st) => st.storage.deleteAlarm());
+    await alarm(p);
+    const armed = await runInDurableObject(stub(p), (_o, st) => st.storage.getAlarm());
+    expect(armed).not.toBeNull();
+    expect(armed as number).toBeLessThanOrEqual(row.del_next_ms as number);
+    expect(deletes()).toBe(tried);
+    // Due, and refused for good this time: recorded among the errors, not tried again.
+    fake.failures = [];
+    fake.fail(/^DELETE \/v1\/catalog\/templates\//, 403, { times: 1 });
+    await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE model_templates SET del_next_ms = 0 WHERE del_next_ms IS NOT NULL"); });
+    await stub(p).drain();
+    const after = deletes();
+    expect(after).toBeGreaterThan(tried);
+    await stub(p).drain();
+    expect(deletes()).toBe(after);
+    expect(fake.catalog.has(opus)).toBe(true);
+    const errors = (await api(token, "GET", `/api/projects/${p.id}/errors`)).body as { code: string; message: string }[];
+    expect(errors).toEqual(expect.arrayContaining([expect.objectContaining({ code: "template_delete_failed" })]));
+    // Chosen again, the template is the setting's: a start writes it, and its delete is no longer owed or failed.
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { worker_model: "claude-opus-5-5" });
+    await assign(p, "third");
+    const reset = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT del_next_ms, del_error FROM model_templates WHERE name = ?", entry(p, "worker", "claude-opus-5-5")).one());
+    expect(reset).toEqual({ del_next_ms: null, del_error: null });
+  });
+
+  it("a project that's gone keeps trying the deletes nest couldn't take, from its own alarm", async () => {
+    const p = await newProject();
+    await assign(p);
+    const mine = () => [...fake.catalog.keys()].filter((k) => k.includes(`-${p.id.replace("prj_", "")}-`));
+    expect(mine()).toHaveLength(2);
+    await runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => { st.storage.sql.exec("DELETE FROM projects WHERE id = ?", p.id); });
+    await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET listed_ms = NULL"); });
+    fake.fail(/^DELETE \/v1\/catalog\/templates\//, 503, { retryable: true, times: 1000 });
+    await alarm(p);
+    expect(mine()).toHaveLength(2);
+    // The project is gone, its templates still owed: an alarm is set for their retry.
+    const state = await runInDurableObject(stub(p), async (_o, st) => ({
+      settings: st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM settings").one().n,
+      alarm: await st.storage.getAlarm(),
+    }));
+    expect(state.settings).toBe(0);
+    expect(state.alarm).not.toBeNull();
+    fake.failures = [];
+    await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE model_templates SET del_next_ms = 0"); });
+    await alarm(p);
+    expect(mine()).toEqual([]);
+    expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM model_templates").one().n)).toBe(0);
   });
 
   it("nothing is swept while a start is owed: it may be about to name the template", async () => {
@@ -196,7 +270,7 @@ describe("a project's models", () => {
     // Removed from the directory (as a create that couldn't be finished is): its object goes inert.
     await runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => { st.storage.sql.exec("DELETE FROM projects WHERE id = ?", p.id); });
     await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET listed_ms = NULL"); });
-    await runDurableObjectAlarm(stub(p));
+    await alarm(p);
     expect(mine()).toEqual([]);
   });
 

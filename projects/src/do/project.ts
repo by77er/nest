@@ -514,6 +514,13 @@ export const MIGRATIONS = [
     "CREATE TABLE model_templates (name TEXT PRIMARY KEY, role TEXT NOT NULL, model TEXT NOT NULL, at_ms INTEGER NOT NULL)",
     "CREATE TABLE agent_templates (agent TEXT PRIMARY KEY, name TEXT NOT NULL)",
   ],
+  [
+    // A model template's delete in nest's catalog as an outbox row (README.md#outboxes): when it's tried
+    // next (backed off after a failure), the attempts made, and why it failed (for good: not tried again).
+    "ALTER TABLE model_templates ADD COLUMN del_next_ms INTEGER",
+    "ALTER TABLE model_templates ADD COLUMN del_attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE model_templates ADD COLUMN del_error TEXT",
+  ],
 ] as const;
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
@@ -1710,7 +1717,7 @@ export class ProjectDO extends DurableObject<Env> {
     const s = this.settings()!;
     const t = roleTemplate(role, s.id, s.repo, spec.model);
     // Recorded before it's written: one written and never recorded would be left in nest for good.
-    this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = excluded.at_ms", t.name, role, spec.model, Date.now());
+    this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = excluded.at_ms, del_next_ms = NULL, del_attempts = 0, del_error = NULL", t.name, role, spec.model, Date.now());
     await nest.putCatalog("templates", t.name, t.body);
     return t.name;
   }
@@ -1720,10 +1727,12 @@ export class ProjectDO extends DurableObject<Env> {
    * (README.md#models): not the role's current setting, and not the one a live agent started from (nest
    * may read an agent's template again; unverified, so it's kept while that agent lives). Nothing is
    * swept while a start is owed (it may be about to name one). `all`: every one (the project is gone).
-   * One nest can't delete now stays recorded, for the next sweep.
+   * A delete nest can't take now is tried again with backoff (from the alarm, not at every drain); one it
+   * refuses for good is recorded among the project's errors and not tried again.
    */
   private async sweepModelTemplates(nest: Nest, all = false): Promise<void> {
-    const rows = this.sql.exec<{ name: string; role: string; model: string }>("SELECT name, role, model FROM model_templates").toArray();
+    const rows = this.sql.exec<{ name: string; role: string; model: string; del_next_ms: number | null; del_attempts: number; del_error: string | null }>(
+      "SELECT name, role, model, del_next_ms, del_attempts, del_error FROM model_templates").toArray();
     if (!rows.length) return;
     const s = this.settings();
     let keep = new Set<string>();
@@ -1737,15 +1746,30 @@ export class ProjectDO extends DurableObject<Env> {
       }
       keep = new Set([...keep, ...rows.filter((r) => r.model === (r.role === "manager" ? s.manager_model : s.worker_model)).map((r) => r.name)]);
     }
+    const now = Date.now();
     for (const r of rows) {
       if (keep.has(r.name)) continue;
+      // Its delete as an outbox row: backing off (not due yet), or failed for good (not tried again).
+      const row: OutboxRow = { next_ms: r.del_next_ms ?? (r.del_error === null ? now : null), attempts: r.del_attempts, error: r.del_error };
+      if (row.next_ms === null || row.next_ms > now) continue;
       try {
         await nest.deleteCatalog("templates", r.name);
         this.sql.exec("DELETE FROM model_templates WHERE name = ?", r.name);
       } catch (e) {
-        console.error(`model template ${r.name} wasn't deleted (the next sweep retries): ${message(e)}`);
+        const st = outboxStep(row, { kind: "failed", ...verdict(e) }, Date.now(), {});
+        if (!st.ok) continue;
+        this.sql.exec("UPDATE model_templates SET del_next_ms = ?, del_attempts = ?, del_error = ? WHERE name = ?", st.row.next_ms, st.row.attempts, st.row.error, r.name);
+        if (st.state === "failed") {
+          this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, 'app', NULL, NULL, 'template_delete_failed', ?)",
+            `template-delete/${r.name}`, Date.now(), `nest refused to delete the model template ${r.name}: ${st.row.error}. It stays in nest's catalog.`);
+        }
       }
     }
+  }
+
+  /** When a model template's delete is next due, if any is. */
+  private templateDeleteDue(): number | null {
+    return this.sql.exec<{ t: number | null }>("SELECT MIN(del_next_ms) AS t FROM model_templates WHERE del_next_ms IS NOT NULL").one().t;
   }
 
   /** A start attempt's spec as first frozen, if it was. */
@@ -3238,6 +3262,8 @@ export class ProjectDO extends DurableObject<Env> {
         UNION ALL SELECT secrets_next_ms FROM settings WHERE secrets_next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM abandoned
         UNION ALL SELECT next_ms FROM issue_closes WHERE next_ms IS NOT NULL)`),
+      // A model template's delete in nest's catalog, backed off after a failure (README.md#models).
+      this.templateDeleteDue(),
       // Auto-merge: the repo's setting to write or read, and each task PR's change (an enable only once
       // the repo allows it).
       min(`SELECT MIN(t) AS t FROM (
@@ -3275,12 +3301,22 @@ export class ProjectDO extends DurableObject<Env> {
         const nest = nestFrom(this.env);
         if (nest) await this.sweepModelTemplates(nest, true);
         this.sql.exec("DELETE FROM settings");
+        // A delete nest couldn't take is tried again from this alarm, though the project is gone.
+        const due = this.templateDeleteDue();
+        if (due !== null) await this.ctx.storage.setAlarm(Math.max(due, Date.now()));
         return;
       }
       if (listed === "pending") {
         await this.ctx.storage.setAlarm(Date.now() + LISTED_RECHECK_MS);
         return;
       }
+    } else {
+      // A project that's gone, with model templates still to delete in nest's catalog: only that.
+      const nest = nestFrom(this.env);
+      if (nest) await this.sweepModelTemplates(nest, true);
+      const due = this.templateDeleteDue();
+      if (due !== null) await this.ctx.storage.setAlarm(Math.max(due, Date.now()));
+      return;
     }
     await this.drain();
     await this.arm();

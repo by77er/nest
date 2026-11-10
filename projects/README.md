@@ -203,7 +203,7 @@ The owner's request (2026-11-06), after the state-machine sweep (B11): a manager
   - its final write (manager started, nothing owed) applies only to its own generation;
   - an exit during its brief, or a second Restart, leaves that move's start owed.
 - **The owner's Restart** (`POST /api/projects/:id/manager/restart`; **Restart manager** on the page when it ended or errored) stops the current manager and starts a new one now. Asking while one is already starting changes nothing.
-- **Chat during a restart.** The owner's chat messages wait for a manager ("Retrying…"), and go as soon as one has started. Each change is noted in the chat. While the manager has ended or errored, the composer offers no Stop; on a phone, where the page's notice scrolls away, it also says so ("The manager isn't running", with Restart manager).
+- **Chat during a restart.** The owner's chat messages wait for a manager ("Retrying…"), and go as soon as one has started. Each change is noted in the chat. While the manager has ended or errored, the composer offers no Stop and doesn't say it's waiting for the owner's reply; on a phone, where the page's notice scrolls away, it also says so ("The manager isn't running", with Restart manager).
 - An exit of a manager that isn't the current one changes nothing.
 
 ## Models
@@ -220,8 +220,9 @@ The owner's request (2026-11-09): "allow me to select the model for the manager 
   - ProjectDO writes it before each start that names it (`templateFor`): the same body every time, so writing it again changes nothing.
 - **Stale templates are cleaned up** (`sweepModelTemplates`, from the alarm). The project records each template it writes and the template each agent started from.
   - One is deleted from nest's catalog (`DELETE /v1/catalog/templates/projects/<entry>`) once it's neither the role's current setting nor the template a live agent started from. Whether nest reads a live agent's template again is unverified, so it's kept while that agent lives.
-  - Nothing is swept while a start is owed, since it may be about to name one. A delete nest can't take is tried again at the next sweep.
-  - A project that's gone (a create that couldn't be finished) takes all of its with it.
+  - Nothing is swept while a start is owed, since it may be about to name one.
+  - A template's delete is an [outbox](#outboxes) row. One nest can't take now is tried again with backoff, from the alarm, not at every drain. One nest refuses for good is recorded among the project's errors (`template_delete_failed`) and not tried again; the template stays in nest's catalog. Chosen again, the template is written afresh and its delete forgotten.
+  - A project that's gone (a create that couldn't be finished) takes all of its with it. Deletes nest couldn't take then are tried again from the project object's own alarm, which does nothing else once the project is gone.
 - **A change applies to the next start.** A start freezes its model with its attempt (`start_specs`), so its retries name the same template under the same idempotency keys.
   - Workers started after the change run on the new model; running ones keep theirs.
   - The manager keeps its model until it next starts: **Restart manager**, or its replacement after it ends ([the manager lifecycle](#the-manager-lifecycle)).

@@ -360,9 +360,13 @@ describe("the chat", () => {
     vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Half a thought" })]));
     const api = new FakeApi();
     api.manager = { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited)." };
+    // A reply it was waiting for: not said while it's down (nothing is waiting any more).
+    api.waits = { pending: [{ id: "aw_1", kind: "reply", target: null, want: null, created_ms: Date.now(), deadline_ms: Date.now() + 2 * 3_600_000 + 60_000, resolved_ms: null, outcome: null, detail: null }], recent: [] };
     renderApp("/projects/prj_one/manager", api);
     const c = await chat();
     await screen.findByRole("alert", { name: /isn't running/ });
+    expect(await within(c).findByText(/Enter to send/)).toBeInTheDocument();
+    expect(within(c).queryByText(/Waiting for your reply/)).toBeNull();
     expect(c.querySelector("[data-slot=manager-down]")).toBeNull();
     expect(screen.getAllByRole("button", { name: "Restart manager" })).toHaveLength(1);
     expect(within(c).queryByRole("button", { name: "Stop" })).toBeNull();
