@@ -153,7 +153,7 @@ body {
   overflow-wrap: anywhere;
 }
 
-/* A link in a meta row (a task's title, a routine's name) keeps to the row's width, wrapping, on a phone. */
-[data-ds="meta"] a {
+/* A failed stop's links (its task's title, its routine's name) keep to the row's width, wrapping, on a phone. */
+[data-slot="failed-stops"] [data-ds="meta"] a {
   max-width: 100%;
 }

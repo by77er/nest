@@ -195,6 +195,7 @@ The owner's request (2026-11-06), after the state-machine sweep (B11): a manager
   - its sandbox is destroyed: a stop is owed (`manager replaced`), which ends the agent and then destroys its sandbox through the sandbox API, since stopping an agent that already ended destroys nothing. Its successor starts only once that stop has been tried. With nest refusing it for good, the successor starts anyway (the stop is failed, shown on the Network page);
   - its pending waits end, unannounced, since the new one never made them;
   - the next start gets a start number of its own, so its creates' keys aren't the old one's;
+  - **it loses its voice:** only the current manager's turns are recorded as the manager's chat, and an ask from a manager that isn't current is labelled "The previous manager" in "Needs you" (its question shown as plain text);
   - **it loses the board:** the board's tools answer only `settings.manager`. A replaced manager still holds its token and labels for a while (its stop owed, or refused), and gets 403.
 - **A start is of one generation.** `manager_starts` as read when it began. Every move bumps it (an exit, the owner's Restart), so a start that lands after one is stale:
   - an agent it made goes;
