@@ -1,7 +1,7 @@
 // Templates and capabilities as data (CatalogDO, the admin routes) and agents spawned from them: what
 // an agent is offered, may call and is started with comes from its expanded spec, and
 // nothing decides on a role or a template's name.
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { CatalogDO } from "../src/do/catalog";
