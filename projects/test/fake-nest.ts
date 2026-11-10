@@ -639,7 +639,7 @@ export class FakeGitHub {
     const um = u.pathname.match(/^\/users\/([^/]+)$/);
     if (um && req.method === "GET") {
       if (!token || !this.tokens.has(token)) return json(401, { message: "Bad credentials" });
-      const login = um[1]!;
+      const login = decodeURIComponent(um[1]!);
       if (login.startsWith("ghost-")) return json(404, { message: "Not Found" });
       return json(200, { login, id: ownerIdOf(login.toLowerCase()), type: login.endsWith("[bot]") ? "Bot" : this.orgs.has(login.toLowerCase()) ? "Organization" : "User" });
     }
@@ -877,12 +877,17 @@ export async function deliverGithub(event: string, payload: unknown, o: { secret
 /** A `pull_request` event's payload, in the fields GitHub sends that the app reads. */
 export function prEvent(o: {
   repo: string; number: number; sha: string; action: string; ref?: string; base?: string; title?: string; merged?: boolean; updated_at?: string; headRepo?: string;
+  /** The PR's author: the repo's owner (a user) unless given; null for an event naming none. */
+  user?: { id: number; login: string; type: string } | null;
 }) {
+  const owner = o.repo.split("/")[0]!.toLowerCase();
+  const user = o.user === undefined ? { id: ownerIdOf(owner), login: owner, type: "User" } : o.user;
   return {
     action: o.action, number: o.number,
     pull_request: {
       number: o.number, node_id: prNode(o.repo, o.number), title: o.title ?? `PR ${o.number}`, state: o.action === "closed" ? "closed" : "open", merged: o.merged ?? false,
       updated_at: o.updated_at ?? new Date().toISOString(),
+      ...(user ? { user } : {}),
       head: { sha: o.sha, ref: o.ref ?? `feature-${o.number}`, repo: { full_name: o.headRepo ?? o.repo } },
       base: { ref: o.base ?? "main", repo: { full_name: o.repo } },
     },

@@ -13,12 +13,14 @@ import { AccessTeam, agentClaims, api, callTool, deliverGithub, FakeNest, instal
 describe("the job table (pure)", () => {
   // The oracle: what the README's review pipeline says, written out here, not read from the code.
   const want: Record<JobState, Partial<Record<JobEvent, JobState>>> = {
+    held: { approve: "queued", dismiss: "dismissed", superseded: "superseded", closed: "closed" },
     queued: { start: "running", superseded: "superseded", closed: "closed" },
     running: { verdict: "done", retry: "running", give_up: "failed", refused: "failed", superseded: "superseded", closed: "closed" },
     done: { requeue: "queued" },
     failed: { requeue: "queued" },
-    superseded: { requeue: "queued" },
-    closed: { requeue: "queued" },
+    superseded: { requeue: "queued", hold: "held" },
+    closed: { requeue: "queued", hold: "held" },
+    dismissed: { approve: "queued" },
   };
   it("every state and event, swept", () => {
     for (const s of JOB_STATES) {

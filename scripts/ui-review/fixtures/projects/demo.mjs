@@ -119,6 +119,11 @@ export function data(variant = "demo", now = Date.now()) {
       { kind: "secret", id: "srq_c1", type: "ci", name: "NPM_TOKEN", purpose: "The release workflow publishes @gadgets/core on a tag.", hosts: null, agent: "agt_w8x2m4", role: "worker", task: "tsk_demo2", tainted: false, at_ms: now - 1_800_000 },
       { kind: "secret", id: "srq_i1", type: "injected", name: "sentry_token", purpose: "The issue says to upload source maps to Sentry from the sandbox.", hosts: ["sentry.io"], agent: "agt_w3f9q1", role: "worker", task: "tsk_demo5", tainted: true, at_ms: now - 600_000 },
     ] : []),
+    // Reviews held for the owner's approval (README.md#the-review-gate): a fork's PR, and one with a long title and no author.
+    ...(variant === "held-reviews" ? [
+      { kind: "review", pr: 131, sha: "9f3c2ab".padEnd(40, "b"), title: "Speed up tag search with a trie", author: "octo-contributor", fork: true, at_ms: now - 2_400_000 },
+      { kind: "review", pr: 132, sha: "41d07ee".padEnd(40, "c"), title: "Rework the gadget importer so that malformed rows are reported per line and the rest of the file still loads", author: null, fork: false, at_ms: now - 20_000 },
+    ] : []),
     ...(issues.length ? [{ kind: "triage", count: issues.length, at_ms: Math.min(...issues.map((i) => i.opened_ms)) }] : []),
   ].sort((a, b) => a.at_ms - b.at_ms);
   const chat = [
@@ -268,8 +273,11 @@ const RICH = [
   const demo = { id: "prj_demo", name, repo, created_ms: now - DAY * 3, settings };
   const other = { id: "prj_other", name: "Widgets", repo: "by77er/widgets", created_ms: now - DAY * 9 };
   const verdict = (ok) => ({ correctness: { verdict: "pass", notes: "Tests cover the parser." }, quality: { verdict: ok ? "pass" : "fail", notes: ok ? "Clear." : "The query builder repeats itself." }, architecture: { verdict: "pass", notes: "Fits the routes layer." }, summary: ok ? "Good to merge." : "One change needed." });
-  const job = (pr, title, state, o = {}) => ({ pr, sha: (pr * 7919).toString(16).padEnd(40, "a"), state, title, base: "main", agent: state === "running" ? "agt_r9k2" : null, check_run: 1000 + pr, verdict: null, tainted: null, attempts: 0, runs: 1, error: null, created_ms: now - pr * 60_000, updated_ms: now - pr * 30_000, ...o });
+  const job = (pr, title, state, o = {}) => ({ pr, sha: (pr * 7919).toString(16).padEnd(40, "a"), state, title, base: "main", agent: state === "running" ? "agt_r9k2" : null, check_run: 1000 + pr, verdict: null, tainted: null, attempts: 0, runs: 1, error: null, author: null, fork: false, approved_ms: null, created_ms: now - pr * 60_000, updated_ms: now - pr * 30_000, ...o });
   const reviews = [
+    // Held for the owner (README.md#the-review-gate), and one the owner dismissed.
+    job(131, "Speed up tag search with a trie", "held", { runs: 0, author: "octo-contributor", fork: true, check_run: 2131 }),
+    job(129, "Bump the lockfile", "dismissed", { runs: 0, author: "some-bot[bot]", check_run: 2129 }),
     job(124, "Tag search for nested categories", "queued"),
     job(121, "Search: tag suggestions in the filter bar", "done", { verdict: verdict(false), runs: 2 }),
     job(119, "Search: build the tag index", "done", { verdict: verdict(true) }),

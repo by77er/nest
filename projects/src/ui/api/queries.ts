@@ -168,6 +168,23 @@ export function useDeleteSecret(id: string) {
   });
 }
 
+/** Approve or dismiss a review held for the owner (README.md#the-review-gate): it leaves "Needs you", and the Reviews page shows where it went. */
+function useHeldReview(id: string, act: (pr: number, sha: string) => Promise<unknown>, failure: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (k: { pr: number; sha: string }) => act(k.pr, k.sha),
+    meta: { failure },
+    onSuccess: (_d, k) => {
+      qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "review" && x.pr === k.pr && x.sha === k.sha)));
+      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
+      void qc.invalidateQueries({ queryKey: keys.reviews(id) });
+      return qc.invalidateQueries({ queryKey: keys.attention(id) });
+    },
+  });
+}
+export const useApproveReview = (id: string) => useHeldReview(id, (pr, sha) => api.approveReview(id, pr, sha), "The review wasn't started");
+export const useDismissReview = (id: string) => useHeldReview(id, (pr, sha) => api.dismissReview(id, pr, sha), "The review wasn't dismissed");
+
 export function useSecretRequestDone(id: string) {
   const qc = useQueryClient();
   return useMutation({

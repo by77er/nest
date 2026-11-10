@@ -16,7 +16,10 @@ export type { Dimension, Verdict } from "../../github";
 export type Project = ProjectRow & { settings: Settings };
 /** A row of the projects list: with `needs_you`, how many asks and blocked tasks wait on the owner. */
 export type ListedProject = ProjectRow & { needs_you: number };
-export type { Attention, Blocked, Issue, SecretRequest, SecretView, TaskIssue, TaskPr, TaskRef } from "../../do/project";
+export type { Blocked, Issue, SecretRequest, SecretView, TaskIssue, TaskPr, TaskRef } from "../../do/project";
+/** One thing waiting on the owner: ProjectDO's (asks, blocked tasks, secret requests, triage), or a review held for approval (README.md#the-review-gate). */
+export type Attention = import("../../do/project").Attention
+  | { kind: "review"; pr: number; sha: string; title: string | null; author: string | null; fork: boolean; at_ms: number };
 export type { AcceptIssueBody, DeclineIssueBody } from "../../requests";
 export type { SecretGrant, SecretLocation, SecretRole } from "../../secrets";
 /** `GET /api/projects/:id/secrets`: the project's secrets with nest's facts, and the grant's limits. */

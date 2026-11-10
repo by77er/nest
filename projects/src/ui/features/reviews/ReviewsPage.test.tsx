@@ -12,7 +12,7 @@ const verdict = (quality: "pass" | "fail"): Verdict => ({
 });
 const job = (pr: number, o: Partial<Job> = {}): Job => ({
   pr, sha: `${pr}`.padEnd(40, "0"), state: "queued", title: `PR ${pr}`, base: "main", agent: null, check_run: null, verdict: null, tainted: null, deadline_ms: null,
-  attempts: 0, runs: 1, error: null, created_ms: pr, updated_ms: pr, ...o,
+  attempts: 0, runs: 1, error: null, author: null, fork: false, approved_ms: null, created_ms: pr, updated_ms: pr, ...o,
 });
 
 describe("the Reviews page", () => {
@@ -35,6 +35,32 @@ describe("the Reviews page", () => {
     expect(badge(rows[2]!)).toHaveTextContent("Reviewed");
     expect(badge(rows[2]!).getAttribute("style")).toContain("--mantine-color-success-");
     expect(rows[3]).toHaveTextContent("The reviewer exited without a verdict.");
+  });
+
+  it("a held review says who it's from and is approved or dismissed there; a dismissed one can still be reviewed", async () => {
+    const api = new FakeApi();
+    api.reviews = [
+      job(4, { state: "held", runs: 0, author: "mallory", fork: true, title: "<img src=x onerror=alert(1)>" }),
+      job(5, { state: "dismissed", runs: 0, author: null, fork: false }),
+    ];
+    const { user } = renderApp("/projects/prj_one/reviews", api);
+    const table = await screen.findByRole("table", { name: "Review jobs" });
+    const held = table.querySelector(`[data-job="${api.reviews[0]!.pr}/${api.reviews[0]!.sha}"]`) as HTMLElement;
+    const badge = held.querySelector("[data-state]")!;
+    expect(badge).toHaveTextContent("Needs approval");
+    expect(badge.getAttribute("style")).toContain("--mantine-color-warning-");
+    expect(held).toHaveTextContent("A fork's PR by mallory: its review waits for your approval");
+    // The title is anyone's text: text, not markup.
+    expect(held.querySelector("img")).toBeNull();
+    expect(held).toHaveTextContent("<img src=x onerror=alert(1)>");
+    const dismissed = table.querySelector(`[data-job="${api.reviews[1]!.pr}/${api.reviews[1]!.sha}"]`) as HTMLElement;
+    expect(dismissed.querySelector("[data-state]")).toHaveTextContent("Dismissed");
+    expect(dismissed).toHaveTextContent("A PR: you dismissed its review");
+    expect(within(dismissed).queryByRole("button", { name: /Dismiss/ })).toBeNull();
+    await user.click(within(held).getByRole("button", { name: "Dismiss the review of PR #4" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/reviews/4/${api.reviews[0]!.sha}/dismiss`, body: undefined }]));
+    await user.click(within(dismissed).getByRole("button", { name: "Review PR #5" }));
+    await waitFor(() => expect(api.writes[1]).toMatchObject({ method: "POST", path: `/api/projects/prj_one/reviews/5/${api.reviews[1]!.sha}/approve` }));
   });
 
   it("opens one reviewer's trace at a time, for that job's agent", async () => {

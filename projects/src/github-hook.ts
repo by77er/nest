@@ -15,7 +15,9 @@
 
 import { issueEventOf, type PrComment } from "./do/project";
 import { directory, type Env, project, review } from "./env";
-import { CHECK_NAME, verifyGithubSignature } from "./github";
+import { appBotId, CHECK_NAME, verifyGithubSignature } from "./github";
+import { nestFrom } from "./nest";
+import type { TrustedIds } from "./review-trust";
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
@@ -94,6 +96,36 @@ export function prCommentOf(event: string, payload: Obj, repo: string): PrCommen
   return { pr: number, ...headOf(pr), kind: "review_comment", author: author.login, author_id: author.id, url, body: text(c.body), path: (str(c.path) ?? "").slice(0, 500) || null, line };
 }
 
+/**
+ * A PR's author from the signed `pull_request` event: its GitHub id (what trust is decided by), its login
+ * (text to show), and whether GitHub says it's a bot.
+ */
+export function prAuthor(pr: Obj): { id: number | null; login: string | null; bot: boolean } {
+  const u = obj(pr.user);
+  return { id: prNumber(u.id), login: (str(u.login) ?? "").slice(0, 100) || null, bot: u.type === "Bot" };
+}
+
+/**
+ * The GitHub ids a project trusts to have their PRs reviewed unasked (src/review-trust.ts). The App's
+ * bot is looked up once, the first time a bot's PR from the repo itself needs it, and kept; a lookup that
+ * fails leaves it unknown, so that PR is held (the safe side) and the next one looks again.
+ */
+async function trustedIds(env: Env, projectId: string, repo: string, needBot: boolean): Promise<TrustedIds> {
+  const s = await project(env, projectId).getSettings();
+  const dir = directory(env);
+  let bot = await dir.githubAppBotId();
+  const nest = nestFrom(env);
+  if (bot === null && needBot && nest) {
+    try {
+      bot = await appBotId(nest, repo);
+      if (bot !== null) await dir.recordGithubAppBotId(bot);
+    } catch (e) {
+      console.warn(`the App's bot couldn't be looked up; a bot's PR is held meanwhile: ${String(e).slice(0, 200)}`);
+    }
+  }
+  return { comments_from: s.ok ? (s.value.comments_from?.id ?? null) : null, repo_owner: s.ok ? (s.value.repo_owner?.id ?? null) : null, app_bot: bot };
+}
+
 export async function githubHook(request: Request, env: Env): Promise<Response> {
   if (request.method !== "POST") return new Response(null, { status: 405 });
   if (!env.GITHUB_WEBHOOK_SECRET) return new Response(null, { status: 503 });
@@ -149,9 +181,13 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
     const fromRepo = str(obj(head.repo).full_name)?.toLowerCase() === p.repo;
     const task = fromRepo ? (TASK_BRANCH.exec(str(head.ref) ?? "")?.[1] ?? null) : null;
     if (action === "opened" || action === "reopened" || action === "synchronize") {
+      // Whose PR, from where (README.md#the-review-gate): one the project doesn't trust is held, not reviewed.
+      const author = prAuthor(pr);
+      const trust = await trustedIds(env, p.id, p.repo, fromRepo && author.bot);
       await review(env, p.id).onHead(of, {
         pr: number, sha, base: (str(obj(pr.base).ref) ?? "").slice(0, 255), title: (str(pr.title) ?? "").slice(0, 1000), updated_at,
-      });
+        fork: !fromRepo, author_id: author.id, author: author.login,
+      }, trust);
       // Its node id, for GraphQL's auto-merge on a task's PR.
       const node = str(pr.node_id);
       if (action !== "synchronize") {

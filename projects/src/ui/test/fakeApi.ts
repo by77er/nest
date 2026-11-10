@@ -128,8 +128,9 @@ export class FakeApi {
     const asks = this.asks.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
     const blocked = this.tasks.filter((t) => t.blocked).map((t): Attention => ({ kind: "blocked", task: t.id, title: t.title, state: t.state, ...t.blocked! }));
     const secrets = this.secretRequests.map((r): Attention => ({ kind: "secret", ...r }));
+    const held = this.reviews.filter((j) => j.state === "held").map((j): Attention => ({ kind: "review", pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
     const triage: Attention[] = this.issues.length ? [{ kind: "triage", count: this.issues.length, at_ms: Math.min(...this.issues.map((i) => i.opened_ms)) }] : [];
-    return [...asks, ...blocked, ...secrets, ...triage].sort((a, b) => a.at_ms - b.at_ms);
+    return [...asks, ...blocked, ...secrets, ...held, ...triage].sort((a, b) => a.at_ms - b.at_ms);
   }
 
   private move(t: Task, event: TaskEvent): Response | null {
@@ -170,6 +171,12 @@ export class FakeApi {
         this.layersOwed();
         return json({ deleted: name, holders: had?.holders ?? [] });
       }
+    }
+    if (parts[2] === "reviews" && (parts[5] === "approve" || parts[5] === "dismiss") && m === "POST") {
+      const j = this.reviews.find((r) => String(r.pr) === parts[3] && r.sha === parts[4]);
+      if (!j) return json({ error: "no review for that PR and commit" }, 404);
+      j.state = parts[5] === "approve" ? "queued" : "dismissed";
+      return json(j);
     }
     if (parts[2] === "secret-requests" && parts[4] === "done") {
       this.secretRequests = this.secretRequests.filter((r) => r.id !== parts[3]);

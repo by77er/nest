@@ -138,7 +138,6 @@ The owner's request (2026-11-06): a task's state, its worker, its PRs and the co
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.
 - Tasks without a PR (research, specs) end by the owner marking them done, from `draft`, `ready` or `stalled`.
 - Routing GitHub's events by `repository.id` and the installation id recorded at attach rather than by `full_name` ([PR comments](#pr-comments); a follow-up).
-- Whether PRs from outside the owner's account are reviewed: on a public repo anyone's PR starts a reviewer (the owner asked for any PR). `max_concurrent_reviews` caps how many run at once, not how many run.
 
 ## Built: the core
 
@@ -183,7 +182,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **`max_concurrent_reviews`**: per project, unset (no cap) by default, set with `PATCH /api/projects/:id/settings`. Jobs start from ReviewDO's alarm, oldest first, while running ones are fewer.
   - **Retries:** every call to GitHub or nest is retried from the alarm (5 s doubling to 5 min). A refusal that will repeat fails the job with the reason, its check `action_required`. A check-run create whose answer was lost is found again by its `external_id`, not made twice.
   - **Reviewers:** made as workers are (`Nest.startAgent`, `Idempotency-Key: <project>/review/<pr>/<sha>/<start>/{sandbox,agent}`), labelled `project`, `role=reviewer`, `pr`, `sha`, `start`, reading the repo but unable to push or write to it (`read_repos`, above), and ended with their sandboxes (`stop {end, destroy_sandbox}`) on a verdict, a newer head, a closed PR, an exit, or the run's deadline. Ephemeral: a reviewer ends itself once its turn is done, verdict or not (from the catalog sync after deploy, which writes the template; until then the deadline covers it). Two more starts after one ends without a verdict.
-  - **The job's states** are one table (`src/review-job.ts`): queued → running → done, failed, superseded or closed, and back to queued on a re-run. Every change of a job's state goes through it, only from the state the row has (so an ended job never ends twice, and its check completes once). A running job always has a deadline (`REVIEW_DEADLINE_MS`, 60 minutes per reviewer): past it, the attempt is spent as an exit's is.
+  - **The job's states** are one table (`src/review-job.ts`): queued → running → done, failed, superseded or closed, and back to queued on a re-run; and `held` → queued (approved) or `dismissed` ([the review gate](#the-review-gate)). Every change of a job's state goes through it, only from the state the row has (so an ended job never ends twice, and its check completes once). A running job always has a deadline (`REVIEW_DEADLINE_MS`, 60 minutes per reviewer): past it, the attempt is spent as an exit's is.
   - **The brief** has only what the app knows from GitHub's routing (repo, number, head, base), none of the PR's own text. `review_get` gives the title.
 - **The check:** `nest-projects/review`, created `in_progress` at the head with `details_url` the project's board. On completion:
   - a verdict: `success` only if all three pass, else `failure`. The title names the failed dimensions, the summary is the reviewer's, the text holds each dimension's notes, the reviewer and whether its session was tainted. Clipped to GitHub's 65535 characters (the title to 255; GitHub documents no limit for it);
@@ -196,6 +195,18 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **The App's id:** the check is required from the App (`checks: [{context, app_id}]`) from the first attach, so no other app or commit status can pass it. The id is the `app_id` of nest's token answer ([GitHub tokens](../docs/control-plane/api/clients/#github-tokens)). If an answer has none (nest can't tell), the check is required from any source (`contexts`, or `checks` without `app_id` where other entries are pinned, which keeps their pins), and the first check run's `app.id` then pins it: the project attaches again. Another entry's `app_id: null` (any source) is sent back as `-1`, GitHub's "any app".
   - Rulesets aren't read or changed: a repo protected by rulesets alone gets branch protection besides.
 - **Tasks and PRs:** a `pull_request` from the repo's own branch `task/<id>` (not a fork's) links the PR to its task (`pr_opened`) if the worker hadn't reported it. Merged, the task is `done` (through `pr_opened` first if it was still `in_progress`) and its worker ended.
+
+## The review gate
+
+**Code:** `src/review-trust.ts` (the decision, pure), ReviewDO's `held` state, `src/github-hook.ts`. Tests: `test/review-gate.test.ts`. Decided 2026-11-09.
+
+A review starts an agent on the PR's code, on the owner's subscription and hosts, so on a public repo it starts by itself only for a PR the project trusts:
+- **Trusted:** the head is a branch of the repo itself (not a fork: pushing there needs write access), and the author is, by `pull_request.user.id` of the signed webhook, the project's comments user ([PR comments](#pr-comments)), the repo's owner, or the App's own bot (workers' task PRs). Ids only, never logins. The bot's id is looked up once (`GET /users/<app_slug>[bot]`, the slug from nest's token answer), the first time a bot's PR from the repo needs it, and kept in DirectoryDO; until it is known, a bot's PR is held.
+- **Anything else is `held`:** a job in the table's `held` state, with a check completed as `action_required` ("Waiting for the owner's approval"). No reviewer, no sandbox, and none of the PR's text or diff reaches any agent. It shows in "Needs you" and on the Reviews page with **Review this PR** and **Dismiss** (`POST /api/projects/:id/reviews/:pr/:sha/approve` and `/dismiss`).
+- **Approval is per head commit.** Approving queues that commit's review, if it is still the open PR's head; a push to the PR makes a new job, held again. A held PR closed and reopened is held again; a commit approved before is reviewed again. GitHub's "Re-run" of the check starts nothing for a held or dismissed job. A dismissed job can still be approved.
+- **Bounded:** at most 50 held jobs per project (`MAX_HELD`); a PR past that gets no job (and no check) until some are approved, dismissed, superseded or closed. A held job leaves `held` when its PR closes or moves on.
+- **The setting:** `untrusted_reviews`, `hold` (the default) or `review` (every PR is reviewed, as before the gate), with `PATCH /api/projects/:id/settings`; no control in the UI.
+- **Rollout:** expand-only (three columns on ReviewDO's `jobs`). A project whose repo an organization owns and that has no comments user trusts only the App's bot, so its people's PRs are held until a comments user is set. Rolled back, the previous Worker leaves `held` jobs alone (it starts only `queued` ones) and reviews new PRs unasked again; its Reviews page doesn't know the `held` and `dismissed` states.
 
 ## Auto-merge
 

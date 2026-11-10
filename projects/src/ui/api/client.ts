@@ -92,6 +92,8 @@ export const api = {
   setNetwork: (id: string, b: NetworkBody) => call<NetworkView>("PUT", `${prj(id)}/network`, b),
   retryAttach: (id: string) => call<Settings>("POST", `${prj(id)}/attach`),
   reviews: (id: string) => call<Job[]>("GET", `${prj(id)}/reviews`),
+  approveReview: (id: string, pr: number, sha: string) => call<Job>("POST", `${prj(id)}/reviews/${pr}/${sha}/approve`),
+  dismissReview: (id: string, pr: number, sha: string) => call<Job>("POST", `${prj(id)}/reviews/${pr}/${sha}/dismiss`),
 
   routines: (id: string) => call<RoutinesAnswer>("GET", `${prj(id)}/routines`),
   createRoutine: (id: string, b: CreateRoutineBody) => call<Routine>("POST", `${prj(id)}/routines`, b),
