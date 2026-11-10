@@ -11,6 +11,21 @@ export const SANDBOX_STATES = [
 ] as const;
 export type SandboxState = (typeof SANDBOX_STATES)[number];
 
+/** protocol/model.ts `AgentState`: an agent's `state`, and its `activity` (the runner's last report). */
+export const AGENT_STATES = [
+  "starting", "ready", "working", "waiting_permission", "waiting_input", "compacting", "idle", "errored",
+  "quota_parked", "stalled", "needs_attention", "detached",
+] as const;
+export type AgentState = (typeof AGENT_STATES)[number];
+
+/** protocol/model.ts `AgentLifecycle`: AgentDO's own part of an agent's `state`. */
+export const AGENT_LIFECYCLES = ["starting", "ready", "detached", "errored"] as const;
+export type AgentLifecycle = (typeof AGENT_LIFECYCLES)[number];
+
+/** lib/brain.ts `Brain["phase"]`: a brain's phase (`condemned` once none of its sessions is current). */
+export const BRAIN_PHASES = ["starting", "live", "condemned"] as const;
+export type BrainPhase = (typeof BRAIN_PHASES)[number];
+
 /** protocol/model.ts `HostRole`. */
 export const HOST_ROLES = ["sandbox", "brain"] as const;
 export type HostRole = (typeof HOST_ROLES)[number];
@@ -111,11 +126,25 @@ export interface SandboxView {
   info_error: boolean;
 }
 
+/**
+ * An instance type whose launches kept ending `enroll_timeout` (control-plane/src/lib/enroll-breaker.ts):
+ * `open` while no launch of it is made, until `open_until_ms`; consecutive `failures` since its last enrolment.
+ */
+export interface EnrollBreakerView {
+  role: HostRole;
+  type: string;
+  failures: number;
+  open_until_ms: number | null;
+  open: boolean;
+}
+
 export interface FleetView {
   hosts: HostView[];
   launches: LaunchView[];
   sandboxes: SandboxView[];
   aws: AwsView;
+  /** Types with enrolment failures counted (absent from a control plane before it). */
+  enroll_breakers?: EnrollBreakerView[];
 }
 
 /** lib/ec2.ts `ImageInfo`: a host AMI. `state` is EC2's image state. */

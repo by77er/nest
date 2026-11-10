@@ -6,13 +6,14 @@
 // from a copy loaded before an await. Mutations go through `update()`, which loads, applies and
 // saves synchronously.
 import { DurableObject } from "cloudflare:workers";
+import { PLACE_REFUSED_RETRY, retryAfter } from "../lib/retry";
 import { z } from "zod";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { signShare } from "../lib/tokens";
-import { asNestError, compatWorkstream, hex, NestError, newId, sha256 } from "../lib/util";
+import { asNestError, clip, compatWorkstream, hex, NestError, newId, sha256 } from "../lib/util";
 import * as lease from "../lib/sandbox-lease";
 import * as slots from "../lib/slots";
 import { addColumn, storedEnum } from "../lib/stored";
@@ -109,6 +110,25 @@ const accessKey = (a: { push: string[]; read: string[]; workflows?: boolean; inj
   `${a.push.join()}|${a.read.join()}${a.workflows ? "|workflows" : ""}${a.inject?.length ? `|${JSON.stringify(a.inject)}` : ""}`;
 
 /** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
+/** FleetDO refused this sandbox's placements: how often since the last success, why, and whether it gave up. */
+export interface PlacementRefused {
+  count: number;
+  first_ms: number;
+  last_ms: number;
+  reason: string;
+  /** No more automatic tries: an operator's `POST /v1/sandboxes/<id>/place` places it. */
+  gave_up: boolean;
+}
+const PLACEMENT_REFUSED_KEY = "placement_refused";
+/** Why a sandbox waiting for a host gets none (FleetDO's `launchPause`), and since when it was noted. */
+export interface PlacementWait {
+  reason: string;
+  /** When the next launch may be tried. */
+  until_ms: number;
+  ms: number;
+}
+const PLACEMENT_WAIT_KEY = "placement_wait";
+
 export interface SandboxInfo extends lease.Lease, slots.Slots {
   sandbox: string;
   /**
@@ -265,6 +285,28 @@ type CommandOutcome = Extract<HostEvent, { type: "command_result" }>["outcome"];
 /** A command addressed to this sandbox at its current epoch, before `command()` stamps both. */
 type SandboxCommand = CommandBody extends infer C ? (C extends { sandbox: string; epoch: number } ? Omit<C, "sandbox" | "epoch"> : never) : never;
 
+/**
+ * The placement step's slot reset (gateway-bindings P4): when `r` is the decision that placed the
+ * sandbox (`placed`: answered; `adopted`: an unfinished placement reconciled), every slot is pending
+ * again in that same step, so `resolve` mints no binding for the new guest before its `agent_attach` is
+ * confirmed, whatever happens to the follow-ups. Answers `r`.
+ */
+export function placedStep<R extends string>(i: SandboxInfo, r: R, placed: R): R {
+  if (r === placed) slots.newPlacement(i);
+  return r;
+}
+
+/** When a placement's follow-ups run again if the run right after it was cut (a throw, a reset). */
+export const PLACED_BACKSTOP_MS = 30_000;
+
+/** A `sandbox_create` failure as decided for its command (`commandFailed`), and how far its steps got. */
+interface CreateFailure {
+  cmd: string;
+  r: "reissue" | "failed" | "ignore";
+  reissued: boolean;
+  done: boolean;
+}
+
 export class SandboxDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   // `!`: set in the constructor, except on the health instance, which serves only `health()`.
@@ -305,6 +347,9 @@ export class SandboxDO extends DurableObject<Env> {
     this.deadlines = new Deadlines(this.sql, ctx.storage);
     this.outbox = new ClientOutbox(this.sql);
   }
+
+  /** `sandbox_create` commands whose failure a `commandFailed` call is handling now (in memory: a reset ends the call). */
+  private readonly failing = new Set<string>();
 
   // --- state helpers ------------------------------------------------------------------------------
 
@@ -451,10 +496,33 @@ export class SandboxDO extends DurableObject<Env> {
     return this.view();
   }
 
-  /** The record as the API shows it: without the compat `workstream`. */
-  private view(): SandboxInfo {
+  /**
+   * The record as the API shows it: without the compat `workstream`, and, while it isn't placed, why:
+   * `placement_wait` (launches paused by the cell's enrolment breakers) and `placement_refused`
+   * (placements FleetDO refused because the leases disagree: retried, or given up).
+   */
+  private view(): SandboxInfo & { placement_wait?: PlacementWait; placement_refused?: PlacementRefused } {
     const { workstream: _, ...info } = this.info_();
-    return { ...info, labels: info.labels ?? {} };
+    const wait = !info.host ? this.get<PlacementWait>(PLACEMENT_WAIT_KEY) : undefined;
+    const refused = !info.host ? this.get<PlacementRefused>(PLACEMENT_REFUSED_KEY) : undefined;
+    return { ...info, labels: info.labels ?? {}, ...(wait ? { placement_wait: wait } : {}), ...(refused ? { placement_refused: refused } : {}) };
+  }
+
+  /**
+   * No host had room: whether FleetDO is launching one at all. While every instance type it would launch
+   * has its enrolment breaker open, the reason is kept for the API and for `resolve`'s refusal; anything
+   * else clears it. Best effort: a FleetDO that can't say (one of the previous release) leaves none.
+   */
+  private async notePlacementWait(cell: string): Promise<void> {
+    let pause: { reason: string; until_ms: number } | null = null;
+    try {
+      pause = await this.fleet(cell).launchPause();
+    } catch (e) {
+      console.warn(`SandboxDO: asking FleetDO why no host is launched failed`, e);
+    }
+    // Re-read in this step: placed meanwhile, nothing to say.
+    if (pause && !this.info_().host) this.put(PLACEMENT_WAIT_KEY, { ...pause, ms: Date.now() } satisfies PlacementWait);
+    else this.del(PLACEMENT_WAIT_KEY);
   }
 
   /** A placement that never finished leaves `placing` set: once stale, FleetDO's lease decides. */
@@ -468,21 +536,24 @@ export class SandboxDO extends DurableObject<Env> {
     }
     const epoch = info.placing!;
     const held = await this.fleet(info.cell).leaseOf(info.sandbox);
-    const [r, after] = this.decide((i) => lease.reconciled(i, epoch, held));
+    // Adopted: a new placement, its slots reset in the same step (`placedStep`), its follow-ups owed.
+    const [r, after] = this.decide((i) => placedStep(i, lease.reconciled(i, epoch, held), "adopted"));
+    const owed = r === "adopted" ? this.owePlaced() : undefined;
     if (r === "adopted") this.recordEpoch(epoch, after.host!);
+    await owed;
     if (r === "gone") {
       // Destroyed while FleetDO answered: a lease at this epoch was never this object's to adopt.
       if (held?.epoch === epoch) await this.discardPlacement(after, held.host, epoch);
     } else if (r === "adopted") {
       console.warn(`sandbox ${info.sandbox}: adopted the lease on ${after.host} (epoch ${epoch}) from an unfinished placement`);
-      await this.afterPlaced();
+      await this.afterPlaced(epoch);
     } else if (r === "cleared") {
       console.warn(`sandbox ${info.sandbox}: cleared an unfinished placement at epoch ${epoch} (no lease)`);
     }
   }
 
   /** Place an unplaced sandbox on a host under a new epoch (`lease.claim` says which it may). */
-  async placeCurrentEpoch(excludeHost?: string): Promise<string | null> {
+  async placeCurrentEpoch(excludeHost?: string, own = true): Promise<string | null> {
     await this.reconcilePlacing();
     const now = Date.now();
     // The source is chosen and pinned by id in the claim's step: retention, in this same single
@@ -515,8 +586,12 @@ export class SandboxDO extends DurableObject<Env> {
       failure = e;
       answer = { kind: asNestError(e)?.code === ErrorCodes.FORBIDDEN ? "refused" : "unknown" };
     }
-    const [r, after] = this.decide((i) => lease.placeAnswered(i, epoch, answer, from !== undefined));
+    // Placed: its slots reset in the same step (`placedStep`), and its follow-ups owed (`placed`), so a
+    // throw or a reset among them leaves them to the deadline, never a binding for a slot the new guest lacks.
+    const [r, after] = this.decide((i) => placedStep(i, lease.placeAnswered(i, epoch, answer, from !== undefined), "placed"));
+    const owed = r === "placed" ? this.owePlaced() : undefined;
     if (r === "placed") this.recordEpoch(epoch, after.host!);
+    await owed;
     switch (r) {
       case "stale":
         // Overtaken while FleetDO answered: destroyed (whatever it granted goes too), or the marker
@@ -528,26 +603,65 @@ export class SandboxDO extends DurableObject<Env> {
         // A lease may exist: the marker stays for the `place` deadline to reconcile.
         throw failure;
       case "unplaced":
-        // A refusal is not retried on its own (the leases disagree: an operator looks); no room is.
+        // A refusal (the leases disagree) is retried on this object's own `place` deadline with backoff
+        // (`PLACE_REFUSED_RETRY`), then given up: shown as `placement_refused` until an operator places it.
         if (answer.kind === "refused") {
-          await this.deadlines.clear("place");
+          const now2 = Date.now();
+          const prev = this.get<PlacementRefused>(PLACEMENT_REFUSED_KEY);
+          const reason = clip(asNestError(failure)?.detail ?? String(failure), 500);
+          if (!own) {
+            // FleetDO's reassignment asked (it retries on its own count): noted, not counted here. This
+            // object's retries start from its own deadline, armed if none is.
+            this.put(PLACEMENT_REFUSED_KEY, { count: prev?.count ?? 0, first_ms: prev?.first_ms ?? now2, last_ms: now2, reason, gave_up: prev?.gave_up ?? false } satisfies PlacementRefused);
+            if (!prev?.gave_up) await this.deadlines.set("place", now2 + PLACE_REFUSED_RETRY.first_ms, true);
+            throw failure;
+          }
+          const count = (prev?.count ?? 0) + 1;
+          const next = retryAfter(count, now2, PLACE_REFUSED_RETRY);
+          this.put(PLACEMENT_REFUSED_KEY, { count, first_ms: prev?.first_ms ?? now2, last_ms: now2, reason, gave_up: "gave_up" in next } satisfies PlacementRefused);
+          if ("gave_up" in next) {
+            await this.deadlines.clear("place");
+            console.error(`sandbox ${before.sandbox}: placement refused ${count} times; given up until an operator places it`, failure);
+          } else {
+            await this.deadlines.set("place", next.at_ms);
+          }
           throw failure;
         }
         await this.deadlines.set("place", Date.now() + PLACE_RETRY_MS, true);
+        await this.notePlacementWait(before.cell);
         return null;
       case "placed":
+        this.del(PLACEMENT_REFUSED_KEY);
+        this.del(PLACEMENT_WAIT_KEY);
         await this.deadlines.clear("place");
-        await this.afterPlaced();
+        await this.afterPlaced(epoch);
         return after.host;
     }
   }
 
-  /** What every new placement (answered or adopted) is followed by. */
-  private async afterPlaced(): Promise<void> {
+  /**
+   * Owe a new placement's follow-ups (`afterPlaced`): the `placed` deadline, armed in the step that
+   * placed it (its row is written before this returns its promise), runs them if the run right after is
+   * cut by a throw or a reset, and again until they've all run.
+   */
+  private owePlaced(): Promise<void> {
+    return this.deadlines.set("placed", Date.now() + PLACED_BACKSTOP_MS, true);
+  }
+
+  /**
+   * What every new placement (answered or adopted) is followed by, its slots already reset with it:
+   * the secrets, the slots' `agent_attach` (a failed send retried from `attach_retry`), the agents' move
+   * notices and the idle countdown. Each is idempotent. Run right after the placement, and by the `placed`
+   * deadline until it has run once to the end for the placement still current (`epoch`).
+   */
+  private async afterPlaced(epoch: number): Promise<void> {
     await this.pushSecrets();
     await this.issueAttachesOrRetry();
     await this.notifyAgentsMoved();
     await this.armIdle();
+    // Done for this placement; a newer one owes its own (and keeps the deadline).
+    const now = this.info_();
+    if (now.epoch === epoch && this.deadlines.has("placed")) await this.deadlines.clear("placed");
   }
 
   /**
@@ -555,6 +669,8 @@ export class SandboxDO extends DurableObject<Env> {
    * host, its lease released, and placed again under a new epoch.
    */
   async retryPlacement(): Promise<string | null> {
+    // The operator's try: a refusal count starts again.
+    this.del(PLACEMENT_REFUSED_KEY);
     const info = this.info_();
     const old = lease.failedHolder(info);
     if (old) {
@@ -628,17 +744,53 @@ export class SandboxDO extends DurableObject<Env> {
   /**
    * A command failed on the lease holder: `sandbox_create` failures matter here, and `sandbox_checkpoint`
    * ones from a FleetDO of the previous release (this one sends `checkpointResult` instead).
+   *
+   * A `sandbox_create`'s failure is decided once per command (`cmd`):
+   * FleetDO runs this again when a reset or a failed call cut it (its result's follow-ups stay owed until
+   * they've run), and `createFailed` counts an attempt, so a repeat finishes the recorded decision's
+   * remaining steps (the re-issue, then the secrets) instead of deciding again.
    */
-  async commandFailed(host: string, type: string, epoch: number, error: ErrorBody): Promise<void> {
+  async commandFailed(host: string, type: string, epoch: number, error: ErrorBody, cmd?: string): Promise<void> {
     if (type === "sandbox_checkpoint" && this.tryInfo()) {
       await this.turnCheckpointLanded(epoch);
       return;
     }
     if (type !== "sandbox_create" || !this.tryInfo()) return;
-    const [r, info] = this.decide((i) => lease.createFailed(i, host, epoch, error.retryable));
+    // One run per command at a time: a repeat that overlaps a run still in its re-issue would re-issue
+    // too. It is refused (retryable), so FleetDO keeps the follow-up owed and tries again later.
+    if (cmd !== undefined) {
+      if (this.failing.has(cmd)) throw new NestError(ErrorCodes.INTERNAL, `the failure of ${cmd} is already being handled`, 503, true);
+      this.failing.add(cmd);
+    }
+    try {
+      await this.createFailed(host, epoch, error, cmd);
+    } finally {
+      if (cmd !== undefined) this.failing.delete(cmd);
+    }
+  }
+
+  private async createFailed(host: string, epoch: number, error: ErrorBody, cmd?: string): Promise<void> {
+    const prior = cmd !== undefined ? this.get<CreateFailure>("create_failure") : undefined;
+    let r: ReturnType<typeof lease.createFailed>;
+    let info: SandboxInfo;
+    let reissued = false;
+    if (prior && prior.cmd === cmd) {
+      info = this.info_();
+      // Decided already; done, or no longer this lease's (moved, destroyed): nothing left to do.
+      if (prior.done || !lease.holds(info, host, epoch)) return;
+      r = prior.r;
+      reissued = prior.reissued;
+    } else {
+      [r, info] = this.decide((i) => lease.createFailed(i, host, epoch, error.retryable));
+      if (cmd !== undefined) this.put("create_failure", { cmd, r, reissued: false, done: r !== "reissue" } satisfies CreateFailure);
+    }
     if (r === "reissue") {
-      await this.fleet(info.cell).issueCommands(host, [this.createBody(info)]);
+      if (!reissued) {
+        await this.fleet(info.cell).issueCommands(host, [this.createBody(info)]);
+        if (cmd !== undefined) this.put("create_failure", { cmd, r, reissued: true, done: false } satisfies CreateFailure);
+      }
       await this.pushSecrets();
+      if (cmd !== undefined) this.put("create_failure", { cmd, r, reissued: true, done: true } satisfies CreateFailure);
     } else if (r === "failed") {
       console.warn(`sandbox ${info.sandbox}: create failed: ${error.code} ${error.message}`);
     }
@@ -650,7 +802,7 @@ export class SandboxDO extends DurableObject<Env> {
     const [r] = this.decide((i) => lease.leaseLost(i, host, epoch));
     if (r === "ignore") return; // gone, or already handled (re-placed, or a newer epoch exists)
     // A dead host is excluded; a host that came back and fenced is healthy and may get the new lease.
-    const placed = await this.placeCurrentEpoch(hostIsDead ? host : undefined);
+    const placed = await this.placeCurrentEpoch(hostIsDead ? host : undefined, false);
     if (!placed) await this.notifyAgentsMoved();
   }
 
@@ -1060,6 +1212,10 @@ export class SandboxDO extends DurableObject<Env> {
         if (info.host && info.state === "running" && info.working.length === 0) {
           await this.command({ type: "sandbox_suspend", mode: "disk_only" });
         }
+      } else if (key === "placed") {
+        // A placement's follow-ups a throw or a reset cut: run again, for the placement current now.
+        const info = this.info_();
+        if (info.host && info.placing === null && !lease.gone(info.state)) await this.afterPlaced(info.epoch);
       } else if (key === "attach_retry") {
         await this.reissuePendingAttaches(false);
       } else if (key === "commit_prune") {
@@ -1600,9 +1756,12 @@ export class SandboxDO extends DurableObject<Env> {
     });
   }
 
-  /** A new placement configures every slot again; a failed send is retried from the alarm, so the other follow-ups run. */
+  /**
+   * A new placement's slots (reset in its step, `placedStep`) get their `agent_attach`; one already in
+   * flight isn't sent twice. A failed send is retried from the alarm, so the other follow-ups run.
+   */
   private async issueAttachesOrRetry(): Promise<void> {
-    const [agents, info] = this.decide(slots.newPlacement);
+    const [agents, info] = this.decide((i) => slots.due(i, false));
     if (!info.host || !agents.length) return;
     try {
       await this.issueAttachCommands(agents);
@@ -1644,7 +1803,12 @@ export class SandboxDO extends DurableObject<Env> {
       info = this.info_();
     }
     const refused = slots.unbindable(info, agent);
-    if (refused) throw refused;
+    if (refused) {
+      // Not placed because no host is being launched: say why, not only "not placed yet".
+      const wait = !info.host ? this.get<PlacementWait>(PLACEMENT_WAIT_KEY) : undefined;
+      if (wait && asNestError(refused)?.code === ErrorCodes.SANDBOX_NOT_READY) throw notReady(`sandbox is not placed yet: ${wait.reason}`);
+      throw refused;
+    }
     const host = info.host!;
     const gateway = await this.fleet(info.cell).hostGatewayUrl(host);
     if (!gateway) throw notReady(`host ${host} advertises no gateway yet`);

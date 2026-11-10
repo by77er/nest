@@ -82,7 +82,7 @@ export function ManagerContext({ projectId }: { projectId: string }) {
                   </AnchorLink>
                 )}
                 <MetaRow>
-                  <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.kind === "triage" ? "The repo's issues" : x.role === "manager" ? "The manager asks" : "A worker asks"}</MetaItem>
+                  <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.kind === "triage" ? "The repo's issues" : x.role === "manager" ? (x.kind === "ask" && x.previous ? "The previous manager asks" : "The manager asks") : "A worker asks"}</MetaItem>
                   <MetaItem title={exact(x.at_ms)}>{ago(x.at_ms)}</MetaItem>
                 </MetaRow>
               </Stack>

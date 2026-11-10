@@ -186,8 +186,12 @@ describe("B20: terminal history-like rows pruned by age", () => {
     const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "keep my history" })).body;
     await inProject(p, (sql) => {
       sql.exec("INSERT INTO errors (event_id, at_ms, agent) VALUES ('e-old', ?, 'agt_x'), ('e-new', ?, 'agt_x')", now - ERRORS_KEEP_MS - 1, now);
-      // A refused stop (#178's record): the only sign an agent may still run, kept however old.
-      sql.exec("INSERT INTO errors (event_id, at_ms, agent, code, message) VALUES ('e-stop', ?, 'agt_y', 'stop_failed', 'refused')", now - ERRORS_KEEP_MS - 1);
+      // A refused stop whose stop is still failed (README.md#outboxes): the only sign an agent may still
+      // run, kept however old. One whose stop went through or was dismissed (no failed row) goes like any error.
+      sql.exec("INSERT INTO errors (event_id, at_ms, agent, code, message) VALUES ('e-stop', ?, 'agt_y', 'stop_failed', 'refused'), ('e-stop-over', ?, 'agt_z', 'stop_failed', 'refused')", now - ERRORS_KEEP_MS - 1, now - ERRORS_KEEP_MS - 1);
+      sql.exec("INSERT INTO stops (agent, reason, next_ms, failed_ms) VALUES ('agt_y', 'cancelled', 0, ?)", now - ERRORS_KEEP_MS - 1);
+      // A stop still being retried isn't a failed one: its old error goes.
+      sql.exec("INSERT INTO stops (agent, reason, next_ms) VALUES ('agt_z', 'cancelled', ?)", now + 3_600_000);
       for (const [id, state, at] of [["prp_old", "declined", now - TRIAGED_PROPOSALS_KEEP_MS - 1], ["prp_new", "accepted", now], ["prp_wait", "untriaged", null]] as const) {
         sql.exec("INSERT INTO proposals (id, routine, routine_name, run, agent, title, body, state, tainted, created_ms, triaged_ms) VALUES (?, 'rtn_x', 'R', 'run_x', 'agt_x', 't', 'b', ?, 1, 0, ?)", id, state, at);
       }

@@ -17,9 +17,9 @@ export interface Write {
 const now = Date.UTC(2026, 10, 2, 9, 0, 0);
 
 export function project(over: Partial<ProjectRow> = {}): Project {
-  const row: ProjectRow = { id: "prj_one", name: "Widgets", repo: "owner/widgets", created_ms: now - 86_400_000, ...over };
+  const row: ProjectRow = { id: "prj_one", name: "Widgets", repo: "owner/widgets", created_ms: now - 86_400_000, state: "ready", ...over };
   const settings: Settings = {
-    id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null,
+    id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null, manager_start_owed: false,
     attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: row.created_ms },
     auto_merge: false, merge_method: "squash", workers_edit_workflows: false, comments_from: { id: 1001, login: "owner" }, repo_owner: { id: 1001, login: "owner" }, repo_auto_merge: { state: "none", want: false, repo: null, error: null, at_ms: null }, max_routine_runs: 1, created_ms: row.created_ms,
   };
@@ -58,7 +58,7 @@ export function task(over: Partial<Task> = {}): Task {
 
 export function ask(over: Partial<Ask> = {}): Ask {
   seq += 1;
-  return { ask: `ask_a${seq}`, agent: "agt_worker", role: "worker", task: null, question: null, approval: null, at_ms: now - 30_000, answered_ms: null, ...over };
+  return { ask: `ask_a${seq}`, agent: "agt_worker", role: "worker", task: null, question: null, approval: null, at_ms: now - 30_000, answered_ms: null, previous: false, ...over };
 }
 
 export class FakeApi {
@@ -73,7 +73,7 @@ export class FakeApi {
   workflowWorkers: string[] = [];
   /** `PUT network`'s answer instead of saving: a refusal (403 with `problems`, say). */
   networkRefusal: { status: number; body: unknown } | null = null;
-  network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }] };
+  network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }], failed_stops: [] };
   openPrs: OpenPr[] = [];
   secrets: SecretsAnswer["secrets"] = [];
   grant: SecretsAnswer["grant"] = { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org"], max_count: 10, max_bytes: 4096, workflows: true, used: 0 };
@@ -99,6 +99,14 @@ export class FakeApi {
     this.failures.push({ match, status, error });
   }
 
+  /** The next matching write is taken, but its answer is lost (a 502 instead), once. */
+  loseAnswer(match: RegExp): void {
+    this.lost.push(match);
+  }
+  private readonly lost: RegExp[] = [];
+  /** The chat's request ids, as the Worker keeps them (README.md#outboxes). */
+  private readonly chatRequests = new Map<string, ChatMessage>();
+
   /** The global fetch the page calls. */
   readonly fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = new URL(String(input), "https://projects.test");
@@ -113,6 +121,12 @@ export class FakeApi {
       return json({ error: x!.error }, x!.status);
     }
     this.url = url;
+    const lose = this.lost.findIndex((x) => x.test(`${method} ${url.pathname}`));
+    if (lose >= 0) {
+      this.lost.splice(lose, 1);
+      this.route(method, url.pathname.replace(/^\/api/, "").split("/").filter(Boolean), body);
+      return json({ error: "Bad gateway" }, 502);
+    }
     return this.route(method, url.pathname.replace(/^\/api/, "").split("/").filter(Boolean), body);
   };
 
@@ -180,7 +194,7 @@ export class FakeApi {
       this.notes = this.notes.filter((n) => n.key !== key);
       return json({ deleted: key });
     }
-    const route = `${m} ${parts.slice(2).map((s) => (/^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : /^rtn_/.test(s) ? ":routine" : /^run_/.test(s) ? ":run" : /^prp_/.test(s) ? ":proposal" : /^\d+$/.test(s) ? ":n" : s)).join("/")}`;
+    const route = `${m} ${parts.slice(2).map((s) => (/^tsk_/.test(s) ? ":task" : /^ask_/.test(s) ? ":ask" : /^rtn_/.test(s) ? ":routine" : /^run_/.test(s) ? ":run" : /^prp_/.test(s) ? ":proposal" : /^agt_/.test(s) ? ":agent" : /^\d+$/.test(s) ? ":n" : s)).join("/")}`;
     const rt = this.routines.find((x) => x.id === parts[3]);
     const t = this.tasks.find((x) => x.id === parts[3]);
     switch (route) {
@@ -204,10 +218,20 @@ export class FakeApi {
       case "POST attach":
         this.manager = { ...this.manager, phase: "starting", error: null };
         return json(p.settings);
+      case "POST manager/restart":
+        this.manager = { ...this.manager, phase: "starting", agent: null, state: null, host: null, error: null };
+        return json(p.settings);
       case "GET waits":
         return json(this.waits);
       case "GET network":
         return json(this.network);
+      case "POST stops/:agent/retry":
+      case "DELETE stops/:agent": {
+        const agent = parts[3]!;
+        if (!this.network.failed_stops.some((f) => f.agent === agent)) return json({ error: "no failed stop" }, 409);
+        this.network = { ...this.network, failed_stops: this.network.failed_stops.filter((f) => f.agent !== agent) };
+        return json(m === "DELETE" ? { dismissed: agent } : { agent, state: "done" });
+      }
       case "PUT network":
         if (this.networkRefusal) return json(this.networkRefusal.body, this.networkRefusal.status);
         this.network = { ...this.network, rules: body, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
@@ -228,9 +252,20 @@ export class FakeApi {
         this.interrupted += 1;
         return json({ interrupted: "turn" });
       case "POST chat": {
-        const c: ChatMessage = { seq: this.chat.length + 1, at_ms: now, sender: "owner", text: body.text, delivered: true, error: null };
-        this.chat.push(c);
-        return json({ seq: c.seq, delivered: true }, 201);
+        // As the Worker: a request id seen before is the same message.
+        const had = body.request_id ? this.chatRequests.get(body.request_id) : undefined;
+        const c: ChatMessage = had ?? { seq: this.chat.length + 1, at_ms: now, sender: "owner", text: body.text, delivered: true, status: "done", error: null };
+        if (!had) {
+          this.chat.push(c);
+          if (body.request_id) this.chatRequests.set(body.request_id, c);
+        }
+        return json({ seq: c.seq, delivered: true, status: "done" }, 201);
+      }
+      case "POST chat/:n/retry": {
+        const c = this.chat.find((m) => m.seq === Number(parts[3]));
+        if (!c) return json({ error: "no such message" }, 404);
+        if (c.status === "failed") Object.assign(c, { status: "done", delivered: true, error: null });
+        return json({ seq: c.seq, delivered: c.delivered, status: c.status });
       }
       case "GET asks":
         return json(this.asks);

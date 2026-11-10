@@ -628,6 +628,8 @@ const app = {
   // viewport, for an open overlay. `widths` limits a state to some widths.
   states: [
     { name: "projects", section: "top", path: "/projects" },
+    // A project still being created (README.md#creating-a-project).
+    { name: "projects-creating", section: "top", path: "/projects", fixture: "creating" },
     { name: "projects-empty", section: "top", path: "/projects", fixture: "empty" },
     { name: "projects-error", section: "top", path: "/projects", fixture: "error", httpErrors: true, ready: shown("[data-ds=error]") },
     { name: "new-project", section: "top", path: "/projects", full: false, after: (p) => p.getByRole("button", { name: "New project" }).first().click() },
@@ -705,9 +707,13 @@ const app = {
       await p.keyboard.type("Same columns as the CSV");
     } },
     { name: "manager", section: "project", path: "/projects/prj_demo/manager", full: false, check: waitsCheck, checkName: "waits" },
+    // Ended past its automatic restarts: why, and the owner's Restart (README.md#the-manager-lifecycle).
+    { name: "manager-ended", section: "project", path: "/projects/prj_demo/manager", fixture: "manager-ended", full: false },
     { name: "manager-rich", section: "project", path: "/projects/prj_demo/manager", fixture: "rich" },
     { name: "manager-rich-view", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false },
     { name: "manager-empty", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-empty", full: false },
+    // The owner's messages still being sent (owed; retrying, with why): no Retry, unlike the failed one in "manager".
+    { name: "chat-sending", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-sending", full: false },
     { name: "manager-long", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false },
     { name: "manager-long-full", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long" },
     { name: "manager-context-open", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click() },
@@ -768,6 +774,10 @@ const app = {
     // The Network page (README.md#network): rules per role, live agents applied, pending and failed; empty; a host refused.
     { name: "network", section: "project", path: "/projects/prj_demo/network" },
     { name: "network-empty", section: "project", path: "/projects/prj_demo/network", fixture: "network-empty" },
+    // Agents nest refused to stop: why, Retry and Dismiss (README.md#outboxes).
+    { name: "network-stops-failed", section: "project", path: "/projects/prj_demo/network", fixture: "stops-failed", full: false },
+    { name: "network-stops-long", section: "project", path: "/projects/prj_demo/network", fixture: "stops-long", full: false },
+    { name: "network-stop-dismiss", section: "project", path: "/projects/prj_demo/network", fixture: "stops-failed", full: false, after: (p) => p.getByRole("button", { name: "Dismiss the stop of agt_r2m9x4" }).click() },
     { name: "network-refused", section: "project", path: "/projects/prj_demo/network", full: false, after: async (p) => {
       const role = p.locator("[data-role=manager]");
       await role.getByLabel("Add hosts").first().click();

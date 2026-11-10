@@ -4,7 +4,7 @@
 import type { AgentRow, AgentsResponse, Fleet, Host, LifetimesResponse, SandboxRow } from "../api";
 import { age, short, span } from "./format";
 import { destroyIn, idleSince, SANDBOX_WHY } from "./lifetimes";
-import { AGENT_LIFETIME_ROLE, AGENT_STATE_ROLE, LIFECYCLE_ROLE, PHASE_ROLE, SANDBOX_LIFETIME_ROLE, SANDBOX_STATE_ROLE } from "./status";
+import { AGENT_LIFETIME_ROLE, AGENT_STATE_ROLE, LIFECYCLE_ROLE, PHASE_ROLE, roleOf, SANDBOX_LIFETIME_ROLE, SANDBOX_STATE_ROLE } from "./status";
 
 /** A host is live when it is active and connected; everything else is history. */
 export const isLive = (h: Host) => h.status === "active" && h.connected;
@@ -53,11 +53,13 @@ export const rowId = (table: "agent" | "sandbox" | "host" | "lifetime", id: stri
 export interface AttentionItem {
   key: string;
   role: "danger" | "warning";
-  /** What it is: an agent, a sandbox, a host, or a read of the control plane. */
-  noun: "Agent" | "Sandbox" | "Host" | "Read";
+  /** What it is: an agent, a sandbox, a host, the cell's launches of an instance type, or a read of the control plane. */
+  noun: "Agent" | "Sandbox" | "Host" | "Launches" | "Read";
   /** Its status, as its badge says it. */
   label: string;
   subject: string | null;
+  /** The subject is a name to show whole (an instance type), not an id to shorten. */
+  subjectWhole?: boolean;
   reason: string;
   /** The row it is detailed in, if the page lists it. */
   target: string | null;
@@ -96,6 +98,15 @@ export function attention({ fleet, agents, agentsError, lifetimes, lifetimesErro
       });
     }
   }
+  // An instance type whose launches kept never enrolling isn't launched until its cool-down ends.
+  for (const b of fleet?.enroll_breakers ?? []) {
+    if (!b.open) continue;
+    add({
+      role: "warning", noun: "Launches", label: "paused", subject: b.type, subjectWhole: true,
+      reason: `${b.failures} ${b.role} host launches in a row never enrolled; next try ${b.open_until_ms !== null ? `in ${span(Math.max(0, b.open_until_ms - now))}` : "at the next demand"}`,
+      target: null,
+    });
+  }
   for (const h of l.hosts) {
     if (h.wedged_ms !== null) add({ role: "danger", noun: "Host", label: "wedged", subject: h.host, reason: `A brain did not exit after a kill, ${age(h.wedged_ms, now)} ago`, target: rowId("host", h.host) });
     if (h.tunnel_hostname && h.tunnel_state !== "connected") {
@@ -112,10 +123,10 @@ export function attention({ fleet, agents, agentsError, lifetimes, lifetimesErro
     const i = row?.info;
     if (!i) continue;
     const facts = [i.state && `state ${i.state}`, i.lifecycle && `lifecycle ${i.lifecycle}`, i.activity && `activity ${i.activity}`].filter(Boolean).join(", ");
-    const stateRole = AGENT_STATE_ROLE[i.state ?? ""];
+    const stateRole = roleOf(AGENT_STATE_ROLE, i.state);
     if (i.state && stateRole && flagged(stateRole)) add({ role: stateRole as AttentionItem["role"], noun: "Agent", label: i.state, subject: agent, reason: facts, target });
-    else if (i.lifecycle && LIFECYCLE_ROLE[i.lifecycle] === "danger") add({ role: "danger", noun: "Agent", label: i.lifecycle, subject: agent, reason: facts, target });
-    if (i.brain && PHASE_ROLE[i.brain.phase] === "danger") {
+    else if (i.lifecycle && roleOf(LIFECYCLE_ROLE, i.lifecycle) === "danger") add({ role: "danger", noun: "Agent", label: i.lifecycle, subject: agent, reason: facts, target });
+    if (i.brain && roleOf(PHASE_ROLE, i.brain.phase) === "danger") {
       add({ role: "danger", noun: "Agent", label: `brain ${i.brain.phase}`, subject: agent, reason: `None of its brain's sessions is current, since ${age(i.brain.since_ms, now)} ago`, target });
     }
   }

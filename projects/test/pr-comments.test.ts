@@ -154,6 +154,15 @@ describe("who is set", () => {
       // And the steps after it (triage, routines).
       for (const t of ["pr_inputs", "issues", "issue_closes", "routines", "routine_runs", "run_turns", "memory", "proposals", "early_exits"]) sql.exec(`DROP TABLE ${t}`);
       sql.exec("ALTER TABLE tasks DROP COLUMN issue");
+      // The outboxes' step (README.md#outboxes).
+      sql.exec("DROP INDEX chat_request");
+      sql.exec("ALTER TABLE chat DROP COLUMN request_id");
+      sql.exec("ALTER TABLE stops DROP COLUMN failed_ms");
+      sql.exec("ALTER TABLE messages DROP COLUMN ended_ms");
+      // The lifecycles' step.
+      for (const t of ["pr_facts", "comments_seen"]) sql.exec(`DROP TABLE ${t}`);
+      sql.exec("ALTER TABLE settings DROP COLUMN manager_restarts");
+      sql.exec("ALTER TABLE settings DROP COLUMN listed_ms");
       for (const c of ["comments_from_id", "comments_from_login", "comments_decided", "repo_owner_id", "repo_owner_login", "routine_cap", "tasks_done_total", "prs_merged_total", "attach_gen"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE settings SET attach_next_ms = NULL");
       sql.exec("UPDATE schema_version SET v = ?", step);

@@ -7,7 +7,7 @@ import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken }
 import { type OAuthAudit, type OAuthStatus, OAuthStore, type StartAnswer, type StartInput } from "../lib/mcp-auth";
 import { b64url, bytesToB64, NestError, newId } from "../lib/util";
 import {
-  appJwt, type GitHubApi, githubApiOf, GithubRepoPermissions, importAppKey, parseAppSecret, revokeInstallationToken, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
+  appJwt, type GitHubApi, githubApiOf, installationVerdict, retryMintFresh, GithubRepoPermissions, importAppKey, parseAppSecret, revokeInstallationToken, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
 } from "../lib/github";
 import { isClientId } from "../lib/clients";
 import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
@@ -26,6 +26,8 @@ import {
 const GITHUB_TOKEN_REUSE_MS = 10 * 60_000;
 /** A repo's installation id is looked up again after this long. */
 const INSTALLATION_TTL_MS = 24 * 3_600_000;
+/** After a fresh lookup confirmed an installation a mint was refused with, no lookup for it again this long. */
+export const INSTALLATION_CONFIRMED_MS = 5 * 60_000;
 /**
  * A sandbox's injected token is reused while it has this long left. SandboxDO refreshes 15 minutes
  * before expiry, so a refresh always mints.
@@ -121,7 +123,12 @@ export class BrokerDO extends DurableObject<Env> {
     // Minted GitHub installation tokens, by (repo, permissions): reused while they have 10 minutes left.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS github_tokens (key TEXT PRIMARY KEY, token TEXT NOT NULL, expires_ms INTEGER NOT NULL,
       installation INTEGER NOT NULL, minted_ms INTEGER NOT NULL)`);
+    // The previous release's installation cache, by repo alone: still written (it reads it after a rollback), never read.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS github_installations (repo TEXT PRIMARY KEY, installation INTEGER NOT NULL, fetched_ms INTEGER NOT NULL)`);
+    // The App's installation on each repo, by the App (`app_id` as its credentials name it) and repo: a
+    // new App is new rows. Kept a day, and dropped at once when a mint with it is refused as stale.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS github_app_installations (app_id TEXT NOT NULL, repo TEXT NOT NULL, installation INTEGER NOT NULL,
+      fetched_ms INTEGER NOT NULL, PRIMARY KEY (app_id, repo))`);
     // The App's identity (`GET /app`), by the `app_id` its credentials name (a new App is a new row): its
     // numeric id and slug, kept until `expires_ms`.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS github_app_identity (configured TEXT PRIMARY KEY, app_id INTEGER NOT NULL, slug TEXT,
@@ -273,10 +280,13 @@ export class BrokerDO extends DurableObject<Env> {
     const seq = ++this.injectionSeq;
     this.injectionRequests.set(slot, seq);
     const overtaken = () => this.injectionRequests.get(slot) !== seq;
-    // A push token's key is the previous release's, so its tokens are reused across the deploy; a read
-    // token's names its access, so neither is ever reused for the other.
-    // With `workflows`, its own key: never reused for a token without it, nor the other way round.
-    const key = JSON.stringify(access === "read" ? { kind: source.kind, repos, access } : workflows ? { kind: source.kind, repos, workflows } : { kind: source.kind, repos });
+    // The key names the App (`app`, its `app_id`), so a token minted by a replaced App is never reused:
+    // the next push after a swap mints under the new one. A read token's names its access, so neither is
+    // ever reused for the other. With `workflows`, its own key: never reused for a token without it, nor
+    // the other way round.
+    const appId = parseAppSecret(this.secret("github_app")?.value ?? "")?.app_id ?? null;
+    const key = JSON.stringify(access === "read" ? { kind: source.kind, repos, access, app: appId } : workflows ? { kind: source.kind, repos, workflows, app: appId }
+      : { kind: source.kind, repos, app: appId });
     const now = Date.now();
     this.sql.exec("DELETE FROM secrets WHERE name LIKE 'inject:%:sbx\\_%' ESCAPE '\\' AND expires_ms IS NOT NULL AND expires_ms <= ?", now);
     const audit = { event: "github_installation_token", permissions, target, binding: source.binding, caller };
@@ -328,35 +338,46 @@ export class BrokerDO extends DurableObject<Env> {
       await this.auditMint({ ...audit, repos, refused: "github_app's private_key isn't an RSA private key (PKCS#1 or PKCS#8 PEM)" });
       return null;
     }
-    // A lost answer throws (retryable): the caller tries again. Repos the App isn't on are left out.
-    const byInstallation = new Map<number, string[]>();
-    const missing: string[] = [];
-    for (const r of repos) {
-      const id = await this.installationOf(api, jwt, r);
-      if (id === null) missing.push(r);
-      else byInstallation.set(id, [...(byInstallation.get(id) ?? []), r]);
-    }
-    const best = [...byInstallation.entries()].sort((x, y) => y[1].length - x[1].length || x[1][0]!.localeCompare(y[1][0]!))[0];
-    const installation: number | null = best ? best[0] : null;
-    const covers: string[] = best ? best[1] : [];
-    const others = repos.filter((r) => !covers.includes(r));
-    if (others.length) {
-      await this.auditMint({ ...audit, repos: others, refused: missing.length === others.length ? "the GitHub App isn't installed on these repos"
-        : "these repos aren't in the one installation the token is minted for (or the App isn't installed on them)" });
-    }
-    if (installation === null) {
-      await forget();
-      return null;
-    }
-    let t: { token: string; expires_ms: number };
-    try {
-      t = await api.mint(jwt, installation, covers.map((r) => r.split("/")[1]!), permissions);
-    } catch (e) {
-      if (e instanceof NestError && !e.retryable) {
-        await forget();
-        await this.auditMint({ ...audit, repos: covers, installation, refused: e.detail });
+    // A lost answer throws (retryable): the caller tries again. Repos the App isn't on are left out. A
+    // mint refused as if the cached installation were stale is tried once more with it looked up afresh.
+    let installation: number | null = null;
+    let covers: string[] = [];
+    let t: { token: string; expires_ms: number } | null = null;
+    for (let attempt = 0; t === null; attempt++) {
+      const byInstallation = new Map<number, string[]>();
+      const cachedIds = new Set<number>();
+      const missing: string[] = [];
+      for (const r of repos) {
+        const { id, cached } = await this.installationOf(api, jwt, creds.app_id, r);
+        if (id === null) missing.push(r);
+        else {
+          byInstallation.set(id, [...(byInstallation.get(id) ?? []), r]);
+          if (cached && !this.recentlyConfirmed(creds.app_id, r)) cachedIds.add(id);
+        }
       }
-      throw e;
+      const best = [...byInstallation.entries()].sort((x, y) => y[1].length - x[1].length || x[1][0]!.localeCompare(y[1][0]!))[0];
+      installation = best ? best[0] : null;
+      covers = best ? best[1] : [];
+      const others = repos.filter((r) => !covers.includes(r));
+      if (installation === null) {
+        if (others.length) await this.auditMint({ ...audit, repos: others, refused: "the GitHub App isn't installed on these repos" });
+        await forget();
+        return null;
+      }
+      try {
+        t = await api.mint(jwt, installation, covers.map((r) => r.split("/")[1]!), permissions);
+      } catch (e) {
+        if (retryMintFresh(e, cachedIds.has(installation), attempt) && (await this.installationStale(api, jwt, creds.app_id, covers, installation))) continue;
+        if (e instanceof NestError && !e.retryable) {
+          await forget();
+          await this.auditMint({ ...audit, repos: covers, installation, refused: e.detail });
+        }
+        throw e;
+      }
+      if (others.length) {
+        await this.auditMint({ ...audit, repos: others, refused: missing.length === others.length ? "the GitHub App isn't installed on these repos"
+          : "these repos aren't in the one installation the token is minted for (or the App isn't installed on them)" });
+      }
     }
     // Audited before anyone holds it: a mint whose record can't be written is never stored or pushed.
     await this.auditMint({ ...audit, repos: covers, installation, expires_ms: t.expires_ms });
@@ -377,16 +398,70 @@ export class BrokerDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM injections WHERE sandbox = ?", sandbox);
   }
 
-  /** The App's installation on `repo` (lowercase), looked up and cached a day; null when it isn't installed there. */
-  private async installationOf(api: GitHubApi, jwt: string, repo: string): Promise<number | null> {
-    const known = this.sql.exec<{ installation: number; fetched_ms: number }>("SELECT installation, fetched_ms FROM github_installations WHERE repo = ?", repo).toArray()[0];
-    if (known && Date.now() - known.fetched_ms < INSTALLATION_TTL_MS) return known.installation;
+  /**
+   * Installations a fresh lookup confirmed after a refusal (`installationStale`'s "same"), by `<app_id>|<repo>`,
+   * until when: a refusal meanwhile is real without looking again. Memory only: a reset costs one lookup.
+   */
+  private readonly confirmedInstallations = new Map<string, number>();
+
+  private recentlyConfirmed(appId: string, repo: string): boolean {
+    const until = this.confirmedInstallations.get(`${appId}|${repo}`);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.confirmedInstallations.delete(`${appId}|${repo}`);
+    return false;
+  }
+
+  /**
+   * App `appId`'s installation on `repo` (lowercase): cached a day per App and repo (`cached`), else looked
+   * up; null when it isn't installed there.
+   */
+  private async installationOf(api: GitHubApi, jwt: string, appId: string, repo: string): Promise<{ id: number | null; cached: boolean }> {
+    const known = this.sql.exec<{ installation: number; fetched_ms: number }>(
+      "SELECT installation, fetched_ms FROM github_app_installations WHERE app_id = ? AND repo = ?", appId, repo).toArray()[0];
+    if (known && Date.now() - known.fetched_ms < INSTALLATION_TTL_MS) return { id: known.installation, cached: true };
     const id = await api.installation(jwt, repo);
     if (id !== null) {
+      const now = Date.now();
+      this.sql.exec(`INSERT INTO github_app_installations (app_id, repo, installation, fetched_ms) VALUES (?, ?, ?, ?)
+        ON CONFLICT(app_id, repo) DO UPDATE SET installation = excluded.installation, fetched_ms = excluded.fetched_ms`, appId, repo, id, now);
       this.sql.exec(`INSERT INTO github_installations (repo, installation, fetched_ms) VALUES (?, ?, ?)
-        ON CONFLICT(repo) DO UPDATE SET installation = excluded.installation, fetched_ms = excluded.fetched_ms`, repo, id, Date.now());
+        ON CONFLICT(repo) DO UPDATE SET installation = excluded.installation, fetched_ms = excluded.fetched_ms`, repo, id, now);
     }
-    return id;
+    return { id, cached: false };
+  }
+
+  /**
+   * A mint with the cached `installation` for `repos` was refused as it would be were the installation
+   * stale: each repo is looked up afresh (`installationVerdict`). Moved or uninstalled: the cache takes the
+   * fresh ids (an uninstalled repo's row goes), every token minted from the old installation goes, and the
+   * caller mints once more (true). Still there: the refusal is real (permissions the installation lacks,
+   * say), so the cache is confirmed, no token is dropped, and nothing is minted again (false).
+   */
+  private async installationStale(api: GitHubApi, jwt: string, appId: string, repos: readonly string[], installation: number): Promise<boolean> {
+    const fresh = await Promise.all(repos.map((r) => api.installation(jwt, r)));
+    const now = Date.now();
+    if (installationVerdict(installation, fresh) === "same") {
+      // A repeated real refusal within a few minutes costs the mint alone, not another lookup each time.
+      for (const r of repos) this.confirmedInstallations.set(`${appId}|${r}`, now + INSTALLATION_CONFIRMED_MS);
+      for (const r of repos) this.sql.exec("UPDATE github_app_installations SET fetched_ms = ? WHERE app_id = ? AND repo = ? AND installation = ?", now, appId, r, installation);
+      return false;
+    }
+    for (const [i, r] of repos.entries()) {
+      const id = fresh[i]!;
+      if (id === null) {
+        this.sql.exec("DELETE FROM github_app_installations WHERE app_id = ? AND repo = ?", appId, r);
+        this.sql.exec("DELETE FROM github_installations WHERE repo = ?", r);
+        continue;
+      }
+      this.sql.exec(`INSERT INTO github_app_installations (app_id, repo, installation, fetched_ms) VALUES (?, ?, ?, ?)
+        ON CONFLICT(app_id, repo) DO UPDATE SET installation = excluded.installation, fetched_ms = excluded.fetched_ms`, appId, r, id, now);
+      this.sql.exec(`INSERT INTO github_installations (repo, installation, fetched_ms) VALUES (?, ?, ?)
+        ON CONFLICT(repo) DO UPDATE SET installation = excluded.installation, fetched_ms = excluded.fetched_ms`, r, id, now);
+    }
+    // Tokens of the old installation (revoked at GitHub by an uninstall) are never handed out again.
+    this.sql.exec("DELETE FROM github_tokens WHERE installation = ?", installation);
+    return true;
   }
 
   // --- binding keys (docs/interfaces/gateway/) --------------------------------------------------
@@ -648,7 +723,6 @@ export class BrokerDO extends DurableObject<Env> {
     if (!isClientId(client) || !r.success || !p.success || !Object.keys(p.data).length) {
       throw new NestError(ErrorCodes.INVALID_MESSAGE, "a client's GitHub token is for a cli_ client, one owner/name repo and at least one repository permission", 400);
     }
-    this.sql.exec("DELETE FROM github_tokens WHERE key LIKE 'client:%' AND expires_ms <= ?", Date.now());
     const name = r.data.toLowerCase();
     return await this.mintGithub(`client:${client}|${name}|${canonicalJson(p.data)}`, name, p.data, { client });
   }
@@ -716,9 +790,7 @@ export class BrokerDO extends DurableObject<Env> {
    * while it has 10 minutes left, else a new one for repo `r` (lowercase) with exactly `permissions`,
    * audited (with `caller`) before anyone holds it.
    */
-  private async mintGithub(key: string, r: string, permissions: GithubPermissions, caller: unknown): Promise<{ token: string; expires_ms: number }> {
-    const cached = this.sql.exec<{ token: string; expires_ms: number }>("SELECT token, expires_ms FROM github_tokens WHERE key = ?", key).toArray()[0];
-    if (cached && cached.expires_ms - Date.now() > GITHUB_TOKEN_REUSE_MS) return cached;
+  private async mintGithub(baseKey: string, r: string, permissions: GithubPermissions, caller: unknown): Promise<{ token: string; expires_ms: number }> {
     const audit = { event: "github_installation_token", repos: [r], permissions, caller };
     let audited = false;
     const refuse = async (e: NestError, installation?: number): Promise<never> => {
@@ -731,6 +803,12 @@ export class BrokerDO extends DurableObject<Env> {
     if (!creds) {
       return refuse(new NestError(ErrorCodes.FORBIDDEN, app ? "github_app isn't {\"app_id\", \"private_key\"} JSON" : "no GitHub App is configured (github_app)", 409));
     }
+    // Expired tokens, whoever's, go at every mint (none is ever served: reuse needs 10 minutes left).
+    this.sql.exec("DELETE FROM github_tokens WHERE expires_ms <= ?", Date.now());
+    // Cached per App: a replaced `github_app` never hands out the old App's tokens.
+    const key = `app:${creds.app_id}|${baseKey}`;
+    const cached = this.sql.exec<{ token: string; expires_ms: number }>("SELECT token, expires_ms FROM github_tokens WHERE key = ?", key).toArray()[0];
+    if (cached && cached.expires_ms - Date.now() > GITHUB_TOKEN_REUSE_MS) return { token: cached.token, expires_ms: cached.expires_ms };
     const api = githubApiOf(this.env);
     let jwt: string;
     try {
@@ -738,16 +816,20 @@ export class BrokerDO extends DurableObject<Env> {
     } catch {
       return refuse(new NestError(ErrorCodes.FORBIDDEN, "github_app's private_key isn't an RSA private key (PKCS#1 or PKCS#8 PEM)", 409));
     }
-    const known = this.sql.exec<{ installation: number; fetched_ms: number }>("SELECT installation, fetched_ms FROM github_installations WHERE repo = ?", r).toArray()[0];
-    let installation = known && Date.now() - known.fetched_ms < INSTALLATION_TTL_MS ? known.installation : null;
+    let installation: number | null = null;
     try {
-      if (installation === null) {
-        installation = await api.installation(jwt, r);
+      let t: { token: string; expires_ms: number } | null = null;
+      for (let attempt = 0; t === null; attempt++) {
+        const found = await this.installationOf(api, jwt, creds.app_id, r);
+        installation = found.id;
         if (installation === null) return await refuse(new NestError(ErrorCodes.FORBIDDEN, `the GitHub App isn't installed on ${r}`, 403));
-        this.sql.exec(`INSERT INTO github_installations (repo, installation, fetched_ms) VALUES (?, ?, ?)
-          ON CONFLICT(repo) DO UPDATE SET installation = excluded.installation, fetched_ms = excluded.fetched_ms`, r, installation, Date.now());
+        try {
+          t = await api.mint(jwt, installation, r.split("/")[1]!, permissions);
+        } catch (e) {
+          // Maybe a stale installation (a reinstall, a moved repo): looked up afresh, and minted once more only if it moved.
+          if (!(retryMintFresh(e, found.cached && !this.recentlyConfirmed(creds.app_id, r), attempt) && (await this.installationStale(api, jwt, creds.app_id, [r], installation)))) throw e;
+        }
       }
-      const t = await api.mint(jwt, installation, r.split("/")[1]!, permissions);
       // Audited before anyone holds it: a mint whose record can't be written is never handed out.
       await this.auditMint({ ...audit, installation, expires_ms: t.expires_ms });
       this.sql.exec(`INSERT INTO github_tokens (key, token, expires_ms, installation, minted_ms) VALUES (?, ?, ?, ?, ?)

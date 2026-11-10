@@ -2,7 +2,8 @@
 // own Durable Objects'; the only calls out are to nest's client interface (src/nest.ts).
 
 import type { z } from "zod";
-import { syncCatalog } from "./catalog";
+import { finishProject, syncRepos } from "./creation";
+import { verdict } from "./outbox";
 import { directory, type Env, project, review } from "./env";
 import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { clientIdOf, NestError, nestFrom } from "./nest";
@@ -38,29 +39,9 @@ async function body<S extends z.ZodType>(req: Request, schema: S): Promise<{ ok:
 
 /** Write the catalog for every project's repo, and remember that it did. */
 async function sync(env: Env): Promise<Response> {
-  const nest = nestFrom(env);
-  if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
-  try {
-    // Two syncs at once (two projects created together) may write from different snapshots, the older
-    // landing last and dropping the newer repo. So each writes, then reads the repos again, and writes
-    // again while they changed: the set only grows, and every sync's last write follows its last read,
-    // so the catalog ends with every repo. A few rounds at most (each round is a project created meanwhile).
-    for (let round = 0; ; round++) {
-      const repos = await directory(env).repos();
-      const r = await syncCatalog(nest, env.PUBLIC_BASE_URL, repos);
-      const now = await directory(env).repos();
-      if (now.join("\n") === repos.join("\n") || round >= SYNC_ROUNDS) {
-        await directory(env).recordSync({ written: r.written, repos });
-        return json({ ...r, repos });
-      }
-    }
-  } catch (e) {
-    return err(502, `the catalog sync failed: ${e instanceof Error ? e.message : String(e)}`);
-  }
+  const r = await syncRepos(env);
+  return r.ok ? json({ written: r.written, repos: r.repos }) : err(r.status, r.error);
 }
-
-/** A sync writes again at most this many times while the repos change under it. */
-const SYNC_ROUNDS = 5;
 
 const ID = {
   project: /^prj_[a-z0-9]+$/, task: /^tsk_[a-z0-9]+$/, ask: /^ask_[A-Za-z0-9]+$/,
@@ -88,32 +69,34 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     if (m !== "POST") return err(405, "GET or POST");
     const b = await body(req, CreateProject);
     if (!b.ok) return b.res;
-    const created = await directory(env).createProject({ name: b.value.name, repo: b.value.repo });
+    // Pending first, then finished here; should this request fail or die half-way, DirectoryDO's alarm
+    // finishes it (README.md#creating-a-project). The same repo asked for again while pending resumes it.
+    const created = await directory(env).createProject({ name: b.value.name, repo: b.value.repo }, b.value);
     if (!created.ok) return err(created.status, created.error);
     const p = created.value;
-    // The templates may push only to attached repos: written again with this one before its manager starts.
-    const synced = await sync(env);
-    await review(env, p.id).init({ project: p.id, repo: p.repo }, { max_concurrent_reviews: b.value.max_concurrent_reviews });
-    const stub = project(env, p.id);
-    await stub.init({
-      id: p.id, name: p.name, repo: p.repo, auto_assign: b.value.auto_assign, max_workers: b.value.max_workers,
-      auto_merge: b.value.auto_merge, merge_method: b.value.merge_method,
-    });
-    // Attaches the repo, then starts the manager (README.md#flows).
-    await stub.drain();
-    const settings = await withReviews(env, p.id, await stub.getSettings());
-    return json({ ...p, settings: settings.ok ? settings.value : null, catalog_synced: synced.ok }, 201);
+    let synced: boolean;
+    try {
+      synced = (await finishProject(env, p, b.value)).catalog_synced;
+    } catch (e) {
+      const still = await directory(env).creationFailed(p.id, verdict(e));
+      return json({ error: `the project ${still ? "is still being created (it's retried)" : "couldn't be created"}: ${verdict(e).error}`, id: p.id, state: still ? "pending" : "removed" }, 503);
+    }
+    const settings = await withReviews(env, p.id, await project(env, p.id).getSettings());
+    return json({ ...p, state: "ready", settings: settings.ok ? settings.value : null, catalog_synced: synced }, 201);
   }
 
   const pid = parts[1]!;
   if (!ID.project.test(pid)) return err(404, "unknown project");
   const row = await directory(env).getProject(pid);
   if (!row) return err(404, "unknown project");
+  // Not whole yet: said so, rather than its objects' 404 (README.md#creating-a-project).
+  if (row.state === "pending") return err(503, "the project is still being created: try again shortly");
   const p = project(env, pid);
   const rest = parts.slice(2);
   const route = rest[0] === "secrets" && rest.length === 2 ? `${m} secrets/:name`
     : rest[0] === "secret-requests" && rest.length === 3 ? `${m} secret-requests/:id/${rest[2]}`
     : rest[0] === "memory" && rest.length === 2 ? `${m} memory/:key`
+    : rest[0] === "stops" && (rest.length === 2 || rest.length === 3) && /^agt_[A-Za-z0-9]{1,64}$/.test(rest[1]!) ? `${m} ${["stops", ":agent", ...rest.slice(2)].join("/")}`
     : `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : ID.routine.test(s) ? ":routine" : ID.run.test(s) ? ":run" : ID.proposal.test(s) ? ":proposal" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
   const task = rest[1] ?? "";
   const ask = rest[1] ?? "";
@@ -261,9 +244,20 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
             lookup = e instanceof NestError && e.status === 404 ? { gone: true } : { failed: e instanceof Error ? e.message : String(e) };
           }
         }
+        // Ended, or gone from nest, whether or not its exit reached the app: replaced as its exit would be
+        // (README.md#the-manager-lifecycle), and the status read again.
+        const r = lookup && "record" in lookup ? lookup.record : null;
+        const why = lookup && "gone" in lookup ? "nest no longer has it" : r && (r.ended || r.state === "ended") ? (r.ended?.reason ?? "ended") : null;
+        if (why && (await p.managerGone(s.value.manager, why))) {
+          const again = await p.getSettings();
+          if (again.ok) return json(managerStatus(again.value, null));
+        }
       }
       return json(managerStatus(s.value, lookup));
     }
+    case "POST manager/restart":
+      // The owner's Restart (README.md#the-manager-lifecycle): the manager goes, a new one starts.
+      return done(await p.restartManager());
     case "GET reviews":
       return json(await review(env, pid).jobs());
     case "GET tasks":
@@ -318,8 +312,16 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "POST chat": {
       const b = await body(req, Chat);
-      return b.ok ? done(await p.postChat(b.value.text), 201) : b.res;
+      return b.ok ? done(await p.postChat(b.value.text, b.value.request_id), 201) : b.res;
     }
+    // A stop nest refused (README.md#outboxes): tried again, or dismissed by the owner (it stops counting).
+    case "POST stops/:agent/retry":
+      return done(await p.retryStop(rest[1]!));
+    case "DELETE stops/:agent":
+      return done(await p.dismissStop(rest[1]!));
+    case "POST chat/:n/retry":
+      // Sends again a message nest refused for good; one still being sent is left as it is (README.md#outboxes).
+      return done(await p.retryChat(Number(rest[1])));
     case "GET attention":
       return done(await p.attention());
     case "GET prs/open":

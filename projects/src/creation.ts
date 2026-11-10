@@ -1,0 +1,57 @@
+// Creating a project (README.md#creating-a-project): the directory row first, as pending, then the steps
+// that make the project whole (the catalog synced with its repo, ReviewDO and ProjectDO initialized), then
+// the row marked ready. Each step is idempotent, so the Worker's request or, should it fail or die
+// half-way, DirectoryDO's alarm finishes it from the row; a project that can't be finished is removed.
+
+import { syncCatalog } from "./catalog";
+import { directory, type Env, project, review } from "./env";
+import { nestFrom } from "./nest";
+import { CreateProject } from "./requests";
+import type { ProjectRow } from "./do/directory";
+import type { z } from "zod";
+
+export type CreateSpec = z.output<typeof CreateProject>;
+
+/** A sync writes again at most this many times while the repos change under it. */
+const SYNC_ROUNDS = 5;
+
+/** Write the catalog again with every project's repo (the templates may push only to attached repos). */
+export async function syncRepos(env: Env): Promise<{ ok: true; written: string[]; repos: string[] } | { ok: false; status: number; error: string }> {
+  const nest = nestFrom(env);
+  if (!nest) return { ok: false, status: 503, error: "NEST_CLIENT_TOKEN is not set" };
+  try {
+    // Two syncs at once (two projects created together) may write from different snapshots, the older
+    // landing last and dropping the newer repo. So each writes, then reads the repos again, and writes
+    // again while they changed: the set only grows, and every sync's last write follows its last read,
+    // so the catalog ends with every repo. A few rounds at most (each round is a project created meanwhile).
+    for (let round = 0; ; round++) {
+      const repos = await directory(env).repos();
+      const r = await syncCatalog(nest, env.PUBLIC_BASE_URL, repos);
+      const now = await directory(env).repos();
+      if (now.join("\n") === repos.join("\n") || round >= SYNC_ROUNDS) {
+        await directory(env).recordSync({ written: r.written, repos });
+        return { ok: true, written: r.written, repos };
+      }
+    }
+  } catch (e) {
+    return { ok: false, status: 502, error: `the catalog sync failed: ${e instanceof Error ? e.message : String(e)}` };
+  }
+}
+
+/**
+ * The steps after the row, each idempotent: run again from the start whenever it's resumed. The catalog
+ * sync's failure doesn't stop it (the next sync covers it; the answer says so). Throws when a step does.
+ */
+export async function finishProject(env: Env, p: ProjectRow, spec: CreateSpec): Promise<{ catalog_synced: boolean }> {
+  const synced = await syncRepos(env);
+  await review(env, p.id).init({ project: p.id, repo: p.repo }, { max_concurrent_reviews: spec.max_concurrent_reviews });
+  const stub = project(env, p.id);
+  await stub.init({
+    id: p.id, name: p.name, repo: p.repo, auto_assign: spec.auto_assign, max_workers: spec.max_workers,
+    auto_merge: spec.auto_merge, merge_method: spec.merge_method,
+  });
+  await directory(env).creationDone(p.id);
+  // Attaches the repo, then starts the manager (README.md#flows); its own alarm retries what fails here.
+  await stub.drain().catch(() => {});
+  return { catalog_synced: synced.ok };
+}

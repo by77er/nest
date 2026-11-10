@@ -144,13 +144,17 @@ describe("routing nest's events", () => {
     const w = await projectWithWorker();
     // Created by the app (owner = the client) but not recorded: found by its labels.
     const ours = fake.plant({ labels: { project: w.project, role: "manager" } });
-    await deliver({ id: eid(), type: "agent.turn_completed", agent: ours.agent, text: "from the labels" });
+    // (An error, not a turn: only the project's current manager's turns are chat, README.md#the-manager-lifecycle.)
+    await deliver({ id: eid(), type: "agent.error", agent: ours.agent, code: "errored", message: "from the labels" });
+    await deliver({ id: eid(), type: "agent.turn_completed", agent: ours.agent, text: "not the current manager" });
     // Spawned by one of the app's agents with the same labels: its labels mean nothing.
     const spawned = fake.plant({ owner: w.worker, labels: { project: w.project, role: "manager" } });
-    expect((await deliver({ id: eid(), type: "agent.turn_completed", agent: spawned.agent, text: "spoofed" })).status).toBe(200);
+    expect((await deliver({ id: eid(), type: "agent.error", agent: spawned.agent, code: "errored", message: "spoofed" })).status).toBe(200);
+    const errors = ((await api(token, "GET", `/api/projects/${w.project}/errors`)).body as { message: string; role: string }[]);
+    expect(errors).toEqual(expect.arrayContaining([expect.objectContaining({ message: "from the labels", role: "manager" })]));
+    expect(errors.map((e) => e.message)).not.toContain("spoofed");
     const chat = (await api(token, "GET", `/api/projects/${w.project}/chat`)).body.map((m: { text: string }) => m.text);
-    expect(chat).toContain("from the labels");
-    expect(chat).not.toContain("spoofed");
+    expect(chat).not.toContain("not the current manager");
   });
 
   it("acknowledges and ignores unknown agents and event types", async () => {
