@@ -149,6 +149,49 @@ export function createFailed(l: Lease, host: string, epoch: number, retryable: b
 export const failedHolder = (l: Lease): { host: string; epoch: number } | null =>
   l.state === "failed" && l.host ? { host: l.host, epoch: l.epoch } : null;
 
+/** How long a failed sandbox keeps its lease (and so its host) before `failedReleased` (state-machine sweep, bug 6). */
+export const FAILED_RELEASE_MS = 15 * 60_000;
+
+/**
+ * A failed sandbox's lease, released after `FAILED_RELEASE_MS` (its holder fenced first), if nothing moved
+ * meanwhile: unplaced, still `failed`, so its host can retire. Nothing places it again on its own
+ * (`placeWanted`, `wake`): an operator's retry (`claim`) or a destroy does.
+ *
+ * The release spends an epoch: the incarnation it leaves on the host is then of an older epoch, so the
+ * salvage of what it hadn't committed (it may have run before it failed) is accepted as an orphan from
+ * that epoch's host (`decideCommit`), never refused as stale and deleted.
+ */
+export function failedReleased(l: Lease, host: string, epoch: number): boolean {
+  if (l.state !== "failed" || !holds(l, host, epoch)) return false;
+  l.host = null;
+  l.lost_from = null;
+  l.epoch += 1;
+  return true;
+}
+
+/** When a sandbox failed, and as which incarnation (kept beside the record, for the release's grace). */
+export interface FailedSince { host: string; epoch: number; ms: number }
+
+/**
+ * What the `failed_release` deadline does at `now`: `release` once the sandbox has been failed on this
+ * holder for the whole grace; `wait` until then (a sandbox that failed, was retried and failed again is
+ * measured from its latest failure, `since`; one with no record of it, from now); `none` when it isn't
+ * failed on a host any more.
+ */
+export function failedReleaseDue(l: Lease, since: FailedSince | undefined, now: number): { kind: "none" } | { kind: "wait"; at_ms: number; since: FailedSince } | { kind: "release"; host: string; epoch: number } {
+  const old = failedHolder(l);
+  if (!old) return { kind: "none" };
+  const mine = since && since.host === old.host && since.epoch === old.epoch ? since : { ...old, ms: now };
+  return now - mine.ms >= FAILED_RELEASE_MS ? { kind: "release", ...old } : { kind: "wait", at_ms: mine.ms + FAILED_RELEASE_MS, since: mine };
+}
+
+/** An operator's retry of a failed sandbox whose lease was already released: placeable again (`creating`). */
+export function retriedReleased(l: Lease): boolean {
+  if (l.state !== "failed" || l.host !== null || l.placing !== null) return false;
+  l.state = "creating";
+  return true;
+}
+
 /** Retry, after the fence and release, if nothing moved meanwhile. */
 export function retried(l: Lease, host: string, epoch: number): void {
   if (!holds(l, host, epoch)) return;
@@ -166,7 +209,7 @@ export function destroyed(l: Lease): void {
 
 /** The `place` alarm places a live, unplaced sandbox; a suspended one only while someone works. */
 export const placeWanted = (l: Lease): boolean =>
-  l.host === null && l.placing === null && !gone(l.state) && (l.state !== "suspended" || l.working.length > 0);
+  l.host === null && l.placing === null && !gone(l.state) && l.state !== "failed" && (l.state !== "suspended" || l.working.length > 0);
 
 /**
  * Commit (sandbox-lease §2.4; the commit-gc pilot's `CommitChain.commit`, guard for guard). `kind`

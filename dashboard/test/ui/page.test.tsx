@@ -118,6 +118,22 @@ describe("what needs attention", () => {
     expect(tile("Needs attention")).toHaveTextContent(/4 errors.*4 warnings/);
   });
 
+  it("an instance type whose launches are paused is a warning naming the type whole, with no control that acts", async () => {
+    const fleet = recorded.fleet();
+    fleet.enroll_breakers = [{ role: "sandbox", type: "c8id.large", failures: 3, open_until_ms: Date.now() + 25 * 60_000, open: true }];
+    renderPage({ "/api/fleet": fleet });
+    const item = await waitFor(() => {
+      const l = attentionList();
+      const li = within(l!).getAllByRole("listitem").find((i) => i.textContent?.includes("Launches"));
+      expect(li).toBeDefined();
+      return li!;
+    });
+    expect(item).toHaveTextContent("paused");
+    expect(item).toHaveTextContent("Launches c8id.large");
+    expect(item).toHaveTextContent(/3 sandbox host launches in a row never enrolled; next try in 2[45]m/);
+    expect(within(item).queryByRole("button")).toBeNull();
+  });
+
   it("says all clear only once everything it depends on has been read", async () => {
     const empty = { ...recorded.lifetimes(), sandboxes: [], agents: [] };
     let answer: (v: Response) => void = () => {};

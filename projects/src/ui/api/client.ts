@@ -2,7 +2,7 @@
 // with every call and the page holds no credential of its own.
 
 import type {
-  NetworkBody, NetworkView, Waits, AcceptIssueBody, DeclineIssueBody, Issue,
+  NetworkBody, NetworkView, OutboxState, Waits, AcceptIssueBody, DeclineIssueBody, Issue,
   AddDependencyBody, PutSecretBody, SecretsAnswer, SecretView, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
   Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
   CreateRoutineBody, DeclineProposalBody, Note, Proposal, Routine, RoutineRun, RoutinesAnswer, UpdateRoutineBody,
@@ -67,7 +67,8 @@ export const api = {
   /** The latest page, or the page before `before` (a seq): oldest first. */
   chat: (id: string, before?: number) => call<ChatMessage[]>("GET", `${prj(id)}/chat${before === undefined ? "" : `?before=${before}`}`),
   interruptManager: (id: string) => call<unknown>("POST", `${prj(id)}/manager/interrupt`),
-  postChat: (id: string, b: ChatBody) => call<{ seq: number; delivered: boolean }>("POST", `${prj(id)}/chat`, b),
+  postChat: (id: string, b: ChatBody) => call<{ seq: number; delivered: boolean; status: OutboxState }>("POST", `${prj(id)}/chat`, b),
+  retryChat: (id: string, seq: number) => call<{ seq: number; delivered: boolean; status: OutboxState }>("POST", `${prj(id)}/chat/${seq}/retry`),
   asks: (id: string) => call<Ask[]>("GET", `${prj(id)}/asks`),
   attention: (id: string) => call<Attention[]>("GET", `${prj(id)}/attention`),
   openPrs: (id: string) => call<OpenPr[]>("GET", `${prj(id)}/prs/open`),
@@ -89,9 +90,14 @@ export const api = {
   manager: (id: string) => call<ManagerStatus>("GET", `${prj(id)}/manager`),
   waits: (id: string) => call<Waits>("GET", `${prj(id)}/waits`),
   network: (id: string) => call<NetworkView>("GET", `${prj(id)}/network`),
+  retryStop: (id: string, agent: string) => call<{ agent: string; state: OutboxState }>("POST", `${prj(id)}/stops/${agent}/retry`),
+  dismissStop: (id: string, agent: string) => call<{ dismissed: string }>("DELETE", `${prj(id)}/stops/${agent}`),
   setNetwork: (id: string, b: NetworkBody) => call<NetworkView>("PUT", `${prj(id)}/network`, b),
   retryAttach: (id: string) => call<Settings>("POST", `${prj(id)}/attach`),
+  restartManager: (id: string) => call<Settings>("POST", `${prj(id)}/manager/restart`),
   reviews: (id: string) => call<Job[]>("GET", `${prj(id)}/reviews`),
+  approveReview: (id: string, pr: number, sha: string) => call<Job>("POST", `${prj(id)}/reviews/${pr}/${sha}/approve`),
+  dismissReview: (id: string, pr: number, sha: string) => call<Job>("POST", `${prj(id)}/reviews/${pr}/${sha}/dismiss`),
 
   routines: (id: string) => call<RoutinesAnswer>("GET", `${prj(id)}/routines`),
   createRoutine: (id: string, b: CreateRoutineBody) => call<Routine>("POST", `${prj(id)}/routines`, b),

@@ -56,7 +56,7 @@ jobs:
         run: |
           ./run.sh guest_stream 600
           ./run.sh guest_control_json 600
-          for t in vsock_handshake proxy_events gateway_events runner_events fleet_to_host meta_json; do
+          for t in vsock_handshake proxy_events gateway_events runner_events fleet_to_host meta_json cert_public_key; do
             ./run.sh "$t" 180
           done
       - name: Keep the grown corpus for the PR replay

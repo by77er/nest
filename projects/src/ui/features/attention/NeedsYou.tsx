@@ -1,17 +1,19 @@
 // "Needs you": everything in the project waiting on the owner, in one calm panel above the board:
 // agents' asks (approvals and questions, nest's), blocked tasks (README.md#blocked), agents' requests
-// for secrets, and the repo's issues waiting for triage (one line, linking to Triage), oldest first.
+// for secrets, reviews held for approval (README.md#the-review-gate), and the repo's issues waiting for
+// triage (one line, linking to Triage), oldest first.
 // A warning rule and title mark it; the panel itself is the surface, so it leads without shouting.
 
 import { Button, Collapse, Divider, Text, Textarea } from "@mantine/core";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import { useState } from "react";
-import { useAnswerBlocked, useAttention } from "../../api/queries";
+import { useAnswerBlocked, useAttention, useProject } from "../../api/queries";
 import type { Attention } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
 import { motion } from "../../theme";
+import { HeldReviewItem } from "../reviews/HeldReview";
 import { RichMessage } from "../rich/RichMessage";
 import { AskItem } from "./AskItem";
 import { SecretRequestItem } from "./SecretRequestItem";
@@ -70,17 +72,35 @@ function BlockedTask({ projectId, item }: { projectId: string; item: BlockedItem
 /** How many items show before "Show all": enough to act on, without pushing the board below the fold. */
 export const SHOWN = 3;
 
-function Item({ projectId, x, first }: { projectId: string; x: Attention; first: boolean }) {
+function Item({ projectId, x, first, explain }: { projectId: string; x: Attention; first: boolean; explain: boolean }) {
+  const project = useProject(projectId);
   return (
     <Stack gap="lg">
       {!first && <Divider />}
       {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : x.kind === "blocked" ? <BlockedTask projectId={projectId} item={x} />
+        : x.kind === "review_backlog" ? <ReviewBacklogItem count={x.count} at_ms={x.at_ms} />
+        : x.kind === "review" ? <HeldReviewItem projectId={projectId} repo={project.data?.repo} item={x} full={explain} />
         : x.kind === "triage" ? <TriageItem projectId={projectId} count={x.count} at_ms={x.at_ms} /> : <SecretRequestItem projectId={projectId} item={x} />}
     </Stack>
   );
 }
 
-const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.kind === "triage" ? "triage" : x.id);
+const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.kind === "triage" ? "triage" : x.kind === "review" ? `review-${x.pr}-${x.sha}` : x.kind === "review_backlog" ? "review-backlog" : x.id);
+
+/** PRs past the review queue's limits, with no job yet: how many, and what frees them (README.md#the-review-gate). */
+function ReviewBacklogItem({ count, at_ms }: { count: number; at_ms: number }) {
+  return (
+    <Stack gap="sm" data-review-backlog>
+      <MetaRow>
+        <MetaItem>The review queue</MetaItem>
+        <MetaItem title={exact(at_ms)}>oldest {ago(at_ms)}</MetaItem>
+      </MetaRow>
+      <Text fz="md">
+        {count === 1 ? "1 more pull request waits" : `${count} more pull requests wait`} beyond the queue's limit, with no review yet. They are listed as you approve or dismiss the ones waiting.
+      </Text>
+    </Stack>
+  );
+}
 
 /** The repo's issues waiting for triage: how many, since when, and the way to them (README.md#triage). */
 function TriageItem({ projectId, count, at_ms }: { projectId: string; count: number; at_ms: number }) {
@@ -108,6 +128,8 @@ export function NeedsYou({ projectId }: { projectId: string }) {
   // Oldest first, as the Worker answers; the rest behind "Show all", collapsing in 180 ms.
   const items = [...(attention.data ?? [])].sort((a, b) => a.at_ms - b.at_ms);
   if (items.length === 0) return null;
+  // The held reviews' explanation is said once, on the first of them.
+  const firstHeld = items.find((x) => x.kind === "review");
   const shown = items.slice(0, SHOWN);
   const rest = items.slice(SHOWN);
   return (
@@ -115,14 +137,14 @@ export function NeedsYou({ projectId }: { projectId: string }) {
       <Section title="Needs you" count={items.length} icon={IconAlertTriangle} iconColor="warning" region={false}>
         <Stack gap="lg">
           {shown.map((x, i) => (
-            <Item key={keyOf(x)} projectId={projectId} x={x} first={i === 0} />
+            <Item key={keyOf(x)} projectId={projectId} x={x} first={i === 0} explain={x === firstHeld} />
           ))}
           {rest.length > 0 && (
             <>
               <Collapse expanded={all} transitionDuration={motion.base} id={`needs-you-rest-${projectId}`}>
                 <Stack gap="lg">
                   {rest.map((x) => (
-                    <Item key={keyOf(x)} projectId={projectId} x={x} first={false} />
+                    <Item key={keyOf(x)} projectId={projectId} x={x} first={false} explain={x === firstHeld} />
                   ))}
                 </Stack>
               </Collapse>

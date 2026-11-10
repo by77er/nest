@@ -232,7 +232,7 @@ describe("task references", () => {
   it("while the board loads, a reference is a chip-sized placeholder, then the chip", async () => {
     const t = task({ title: "Arrives later", state: "ready" });
     const api = new FakeApi();
-    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: `See task:${t.id}.`, delivered: true, error: null }];
+    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: `See task:${t.id}.`, delivered: true, status: "done" as const, error: null }];
     let release!: () => void;
     api.holds.push({ match: /^GET .*\/tasks$/, until: new Promise<void>((r) => (release = r)) });
     api.tasks = [t];
@@ -290,7 +290,7 @@ describe("task references", () => {
     const api = new FakeApi();
     const t = task({ title: "Stay put", state: "ready" });
     api.tasks = [t];
-    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: `See task:${t.id}.`, delivered: true, error: null }];
+    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: `See task:${t.id}.`, delivered: true, status: "done" as const, error: null }];
     const { user } = renderApp("/projects/prj_one/manager", api);
     const chip = await screen.findByRole("link", { name: "Task Stay put" });
     // Typing re-renders the chat (its state), and so every message in it.
@@ -303,7 +303,7 @@ describe("task references", () => {
     const api = new FakeApi();
     const t = task({ title: "Click me", state: "ready" });
     api.tasks = [t];
-    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: `Created task:${t.id}.`, delivered: true, error: null }];
+    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: `Created task:${t.id}.`, delivered: true, status: "done" as const, error: null }];
     const { user, router } = renderApp("/projects/prj_one/manager", api);
     const chip = await screen.findByRole("link", { name: "Task Click me" });
     await user.click(chip);

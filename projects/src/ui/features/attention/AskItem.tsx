@@ -28,7 +28,8 @@ export function AskItem({ projectId, ask }: { projectId: string; ask: Ask }) {
     <Stack gap="sm" data-ask={ask.ask}>
       <MetaRow>
         <MetaItem>
-          {ask.role === "manager" ? "The manager" : ask.role === "worker" ? "A worker" : ask.role === "reviewer" ? "A reviewer" : "An agent"}
+          {/* One that isn't the manager any more (README.md#the-manager-lifecycle) is said to be the previous one. */}
+          {ask.role === "manager" ? (ask.previous ? "The previous manager" : "The manager") : ask.role === "worker" ? "A worker" : ask.role === "reviewer" ? "A reviewer" : "An agent"}
         </MetaItem>
         <MetaItem mono>{ask.agent}</MetaItem>
         {ask.task && (
@@ -47,7 +48,8 @@ export function AskItem({ projectId, ask }: { projectId: string; ask: Ask }) {
           {approval.tool && approval.tool !== approval.name ? ` (${approval.tool})` : ""}.
         </Text>
       )}
-      {ask.question && (ask.role === "manager" ? <RichMessage text={ask.question} projectId={projectId} /> : <Prose>{ask.question}</Prose>)}
+      {/* The manager's own question renders rich; a previous manager's is plain text, as any other agent's. */}
+      {ask.question && (ask.role === "manager" && !ask.previous ? <RichMessage text={ask.question} projectId={projectId} /> : <Prose>{ask.question}</Prose>)}
       {approval ? (
         <Toolbar align="start">
           <Button color="success" leftSection={<IconCheck size={icon.md} />} loading={answer.isPending && answer.variables?.answer === "approve"} disabled={answer.isPending} onClick={() => send("approve")}>

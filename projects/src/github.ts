@@ -295,6 +295,8 @@ export interface Pull {
   node_id: string | null;
   head_ref: string;
   fork: boolean;
+  /** GitHub's `updated_at` (ISO 8601), which orders what it says of the PR; null when it doesn't say. */
+  updated_at: string | null;
 }
 
 function pullOf(p: Record<string, unknown>, repo: string): Pull {
@@ -304,6 +306,7 @@ function pullOf(p: Record<string, unknown>, repo: string): Pull {
     number: Number(p.number), state: p.state === "open" ? "open" : "closed", merged: p.merged === true || typeof p.merged_at === "string",
     title: typeof p.title === "string" ? p.title.slice(0, 300) : "", node_id: typeof p.node_id === "string" ? p.node_id : null,
     head_ref: typeof head.ref === "string" ? head.ref : "", fork: headRepo !== repo.toLowerCase(),
+    updated_at: typeof p.updated_at === "string" ? p.updated_at : null,
   };
 }
 
@@ -311,6 +314,18 @@ function pullOf(p: Record<string, unknown>, repo: string): Pull {
 export async function githubFor(nest: Nest, repo: string, permissions: Record<string, string>): Promise<GitHub> {
   const t = await nest.githubToken(repo, permissions);
   return new GitHub(t.token, typeof t.app_id === "number" && Number.isSafeInteger(t.app_id) && t.app_id > 0 ? t.app_id : null);
+}
+
+/**
+ * The GitHub id of nest's App's bot account, `<app_slug>[bot]` (the author of what the App's tokens
+ * create, workers' PRs among them), by the slug nest's token answer names; null when nest names none or
+ * GitHub has no such bot. https://docs.github.com/en/rest/users/users#get-a-user
+ */
+export async function appBotId(nest: Nest, repo: string): Promise<number | null> {
+  const t = await nest.githubToken(repo, PERMISSIONS.metadata);
+  if (typeof t.app_slug !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(t.app_slug)) return null;
+  const u = await new GitHub(t.token).call<{ id?: unknown; type?: unknown }>("GET", `/users/${t.app_slug}%5Bbot%5D`, undefined, { nullOn404: true });
+  return u && u.type === "Bot" && typeof u.id === "number" && Number.isSafeInteger(u.id) && u.id > 0 ? u.id : null;
 }
 
 // --- branch protection, kept ---------------------------------------------------------------------------

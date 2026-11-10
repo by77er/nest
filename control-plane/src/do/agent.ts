@@ -34,7 +34,7 @@ import { type ClientEvent, ClientOutbox, EVENT_TEXT_MAX } from "../lib/client-ev
 import { field, TRACE_PING, TRACE_PONG, TRACE_SOCKETS_MAX, type TraceBody, type TraceControl, TraceRing, traceOf } from "../lib/trace";
 import { decodeCursor, encodeCursor, HISTORY_DEFAULT_LIMIT, type HistoryCursor, type HistoryPage, historyPage } from "../lib/trace-history";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
-import { type AgentSpec, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
+import { type AgentSpec, launchProblem, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
 import {
   AGENT_RECORD_RETENTION_MS, cellIdleTtlMs, END_GRACE_MS, END_RETRY_MS, type Ended, type EndReason, ephemeralDone, MAX_OWNER_HOPS, narrowTtl, ownsVia,
   spawnRefusal,
@@ -847,6 +847,11 @@ export class AgentDO extends DurableObject<Env> {
           }
           return this.startStatus();
         }
+        // A start is issued from here, with the agent's stored launch: its model and effort become arguments
+        // of the brain's command, so a spec stored before the rule (lib/spec.ts `launchProblem`) starts no
+        // brain. Refused for good, as any start a host would refuse: the agent is `errored`, with why.
+        const badLaunch = launchProblem(snap.launch);
+        if (badLaunch) throw new NestError(ErrorCodes.INVALID_MESSAGE, `the agent's ${badLaunch}: no brain is started with it`);
         const host = await this.pickHost(snap, intent);
         const oauthRef = await this.startCredential(snap);
         // `--resume` reads R2 only: make what's still buffered durable first, or the new brain would

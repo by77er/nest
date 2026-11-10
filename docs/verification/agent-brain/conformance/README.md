@@ -375,6 +375,27 @@ Tests: `test/agent-lifecycle.test.ts` (an end kills, drops, refuses and doesn't 
 
 Tests: `test/credentials.test.ts`. Mutations run: the old fallback, no principal passed, no reference check, the grant not re-read, `start_error` not recorded, not cleared, or not in the event. Each fails a test.
 
+## main 9fd147ff (re-dated 2026-11-06)
+
+By reading, no model run; the inventory's [§2.4](../#24-a-turns-life-agentdo-turnsstatus) gained `dropped`. The merges since the #82 map change the brain's environment as follows; none adds a start that bypasses the intent, so each is S-neutral:
+
+- **Timers (#134):** `timerFired` → `postInbox` → `inputArrived` clears `stop_quiet` → `wake` (`wakeDecision`, the intent). A new wake source after a stop, like any input.
+- **Asks as turns (#92-#94):** `answerAsk` enqueues an `ask_answer` turn through `enqueueTurn`, which wakes through the same path.
+- **`emit` and `traceEmit` in `update` (#103, #116):** no new awaits.
+- **Spawn grants (#166):** `conferGrants` and `resolveGrant` add awaits before a child's `children` row; outside the model (no brain state).
+- **`pokeIntent`** (in #36's final head, unchecked until now): arms the `intent` deadline now; the intent runs as from its own alarm.
+- **`hostReport`:** a detached brain on its recorded host, not condemned, becomes `ready` with the reported activity; any other report kills an orphan at the highest epoch (N1). Missing from the inventory's §2.1 (cited at `edf6829`).
+- **`load()`:** a previous release's record with a host and a `detached` or `errored` state migrates to a `condemned` brain (its escalation proves it gone), any other to `starting` or `live`.
+- **FleetDO side:** N16 fixed (`hello_back` in the step that sends `hello_ack`); F3 gone (an `agent_stop`'s `ok` drops no index row); a failed `agent_start`'s `startFailed` is a result follow-up, owed until it ran (#187).
+
+Line citations above this section are function names or older heads; `agent.ts` has grown, so `file:line` there is stale while the names resolve.
+
+
+## a start refused for its launch (cp/launch-model-chars, author's map, 2026-11-09)
+
+- **`processIntent`, with no brain:** before `pickHost`, an agent whose stored launch isn't plain tokens (`launchProblem`, `lib/spec.ts`) throws a non-retryable `invalid_message`. `intentFailed` ends the intent and, with no brain, sets `errored` with `start_error`, as for any start refused for good. Conforms: no brain record is read or written by the refusal, no command is issued, and no new transition is added (the model's start is simply not taken). The branches with a brain (release, condemned, `liveBrainStart`) are unchanged.
+
+
 ## the turn ledger's step (refactor/turn-ledger, author's map, 2026-11-09)
 
 **Head:** `refactor/turn-ledger` (on main 045ef5fc). The queue's transitions are unchanged; their guards moved from the callers into one pure step, `turnStep` (`lib/turns.ts`), which every status write goes through. Not checked by a model run.

@@ -2,7 +2,7 @@
 // and the new project's page opens.
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { ask, FakeApi } from "../../test/fakeApi";
+import { ask, FakeApi, project } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 
 describe("projects", () => {
@@ -11,6 +11,16 @@ describe("projects", () => {
     const link = await screen.findByRole("link", { name: "Widgets" });
     expect(link).toHaveAttribute("href", "/projects/prj_one/manager");
     expect(screen.getByRole("link", { name: "owner/widgets" })).toHaveAttribute("href", "https://github.com/owner/widgets");
+  });
+
+  it("one still being created says so, with nothing to open yet (B10)", async () => {
+    const api = new FakeApi();
+    api.projects = [...api.projects, project({ id: "prj_new", name: "Gizmos", repo: "owner/gizmos", state: "pending" })];
+    renderApp("/projects", api);
+    const card = await screen.findByRole("article", { name: "Gizmos" });
+    expect(within(card).getByText("Being created")).toBeInTheDocument();
+    expect(within(card).queryByRole("link", { name: "Gizmos" })).toBeNull();
+    expect(within(screen.getByRole("article", { name: "Widgets" })).queryByText("Being created")).toBeNull();
   });
 
   it("a project's \"needs you\" goes to its Board, where asks are answered; the project opens on its Manager", async () => {

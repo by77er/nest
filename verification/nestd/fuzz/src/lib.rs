@@ -249,6 +249,13 @@ mod tests {
     // The seeds are valid frames, so every run starts from inputs that reach the deep parsers.
 
     #[test]
+    fn cert_public_key_seeds_have_a_key() {
+        for (name, s) in seeds("cert_public_key") {
+            assert!(nestd_core::ca::cert_public_key(&s).is_some_and(|k| !k.is_empty()), "{name}");
+        }
+    }
+
+    #[test]
     fn guest_stream_seeds_decode_to_control_frames() {
         for (name, s) in seeds("guest_stream") {
             let d = guest_decode(&[&s[1..]]);

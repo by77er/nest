@@ -12,7 +12,7 @@
 | `host_token` | Bearer for session-channel upgrades; sent after `hello_ack` and on rotation. Memory only |
 | `lease_update` | Every heartbeat. If it lapses, **or the socket closes**, the runner kills every brain (SIGKILL to its process group) |
 | `agent_start` | `{start: control::AgentStart, config_dir}`. `start.epoch` is the agent epoch; `start.hands`, when present, names the sandbox only; the runner fetches the gateway target from AgentDO. A start for a brain already running adopts a newer epoch and the new hands (the brain keeps running). Refused without a valid lease mirror (`error{no_lease}` + `agent_exited{fenced}`) or when `launch.builtin_tools` names a host-side tool (`error{forbidden_tool}` + `agent_exited{crashed}`); a refused start supersedes any older brain of the agent (killed under its epoch) and its exit is reported only once that brain has gone |
-| `agent_stop` | `mode: graceful` (close stdin, finish turn; a brain still starting is killed) \| `kill`. Either names the agent `epoch` it is for; a stop never reaches a newer brain. A kill carries the agent `epoch` it is for (absent from nestd of the previous release: whatever runs): the runner raises the agent's tombstone to it, kills a brain at or below it, spares a newer one, and refuses to register any start at or below it (`agent_exited{fenced}` at the start's epoch, once no older brain of the agent is registered) |
+| `agent_stop` | `mode: graceful` (close stdin, finish turn; once no turn runs, a process that hasn't exited within the exit grace, 30 s, is killed; a brain still starting is killed) \| `kill`. Either names the agent `epoch` it is for; a stop never reaches a newer brain. A kill carries the agent `epoch` it is for (absent from nestd of the previous release: whatever runs): the runner raises the agent's tombstone to it, kills a brain at or below it, spares a newer one, and refuses to register any start at or below it (`agent_exited{fenced}` at the start's epoch, once no older brain of the agent is registered) |
 | `fence` | Kill listed brains (empty = all) now, including ones still starting. An empty fence (like a lease lapse or a lost socket) also drops every start that arrived before it and hasn't registered yet (`agent_exited{fenced}` at its epoch) |
 | `ping` | Health |
 
@@ -78,6 +78,7 @@ nestd            runner                         claude (stdio)          nest hoo
  │                │◄── result ─────────────────────│ Stop ──► nest hook --sync (inbox mirror)
  │                │ tail transcript → segment ──────────────────────────────────────────────►│
  │                │ idle grace → close stdin → exit │
+ │                │ (killed after the exit grace)   │
  │◄ agent_exited{idle}
 ```
 
