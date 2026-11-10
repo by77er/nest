@@ -69,6 +69,24 @@ const toolError = (r: { status: number; result?: any }) => {
 };
 
 describe("attaching PRs", () => {
+  it("a task's PR opened after the repo was renamed is still the repo's own, by GitHub's ids: attached to its task, not a fork's", async () => {
+    const p = await newProject();
+    const w = await withWorker(p);
+    const id = 5_000_000 + Math.floor(Math.random() * 1_000_000);
+    const renamed = `${p.repo}-renamed`;
+    const opened = (n: number, repoName: string, headId: number) => {
+      const e = prEvent({ repo: p.repo, number: n, sha: sha(), action: "opened", ref: `task/${w.id}`, updated_at: later() });
+      return { ...e, repository: { id, full_name: repoName }, pull_request: { ...e.pull_request, head: { ...e.pull_request.head, repo: { id: headId, full_name: repoName } } } };
+    };
+    // The project learns the repo's id from an event under the name it was created with.
+    await deliverGithub("pull_request", opened(21, p.repo, id));
+    await deliverGithub("pull_request", opened(22, renamed, id));
+    // A fork's branch of the same name, under the new name's lookalike: not the repo's own.
+    await deliverGithub("pull_request", opened(23, renamed, id + 1));
+    const t = await task(p, w.id);
+    expect(t.prs.map((x: { number: number; fork: boolean }) => [x.number, x.fork])).toEqual([[21, false], [22, false]]);
+  });
+
   it("the owner attaches open PRs by number, #n or URL, checked on GitHub; the task goes to review", async () => {
     const p = await newProject();
     const w = await withWorker(p);

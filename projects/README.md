@@ -256,7 +256,7 @@ The owner's request (2026-11-06), after the sweep (B10): creating a project used
 
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.
 - Tasks without a PR (research, specs) end by the owner marking them done, from `draft`, `ready` or `stalled`.
-- Routing GitHub's events by `repository.id` and the installation id recorded at attach rather than by `full_name` ([PR comments](#pr-comments); a follow-up).
+- Recording the repo's id and the installation id at attach, rather than learning the id from the first event ([PR comments](#pr-comments); a follow-up).
 
 ## Built: the core
 
@@ -293,7 +293,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 **What the build settled** (2026-11-02), against GitHub's docs for [webhook signatures](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [events](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [check runs](https://docs.github.com/en/rest/checks/runs) and [branch protection](https://docs.github.com/en/rest/branches/branch-protection):
 - **The webhook:**
   - `X-Hub-Signature-256` is checked over the raw bytes in constant time: missing or wrong is `401`.
-  - Deduplicated by `X-GitHub-Delivery` (DirectoryDO, 7 days); routed by `repository.full_name` to its project; an unknown repo, `ping` and other events are a `2xx`. The owner's PR comments: [below](#pr-comments).
+  - Deduplicated by `X-GitHub-Delivery` (DirectoryDO, 7 days); routed by `repository.id` to its project (`projectForRepo`), so a repo that's renamed or transferred keeps its project, and its old name, registered again by someone else, reaches no project. A project learns its repo's id from the first event that names it: until then it's found by the name it was created with (trust on first use: the id isn't read from GitHub at attach). A PR's head is the repo's own, not a fork's, by id too. The project still calls GitHub and nest by the name it was created with, which GitHub redirects after a rename (unverified for nest's tokens after a transfer). An unknown repo, `ping` and other events are a `2xx`. The owner's PR comments: [below](#pr-comments).
   - It only records: ReviewDO and ProjectDO write one step each and arm their alarms, so it answers within GitHub's 10 s.
   - GitHub doesn't redeliver by itself (unverified: its docs offer manual redelivery only). A lost `pull_request` leaves the head without the check, which blocks merging until the next push or a redelivery.
 - **The queue:**
@@ -451,7 +451,7 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
 - **Once per comment** (B6), by its own key (its kind and URL, `comments_seen`, kept 30 days). It's claimed where it's decided to act on it (deliver, queue, restart, or drop it on the record), in that step.
   - A delivery handled again acts once: its claim was released after a later step failed, or lapsed, or it came under a new delivery id. So it never sends twice, queues twice, or starts a second worker.
   - One with no task yet (its PR's `opened` not seen) isn't claimed, so its redelivery after can act.
-- **Open:** route GitHub's events by `repository.id` and the installation id recorded at attach, not by `full_name`, so a renamed namespace that someone registers again can't reach the project (a follow-up).
+- **Open:** events are routed by `repository.id` ([the webhook](#built-the-review-pipeline)), learned from the first event. Reading the id and the installation id at attach, so not even the first event is taken by name, is a follow-up.
 
 ## Triage
 
@@ -553,6 +553,7 @@ The owner's request (2026-11-02): the manager "should be able to set timers and 
   - "Add search by tag to be In review or Done · 45 min left", "#118 to merge · 2 h left", "The owner's reply · 26 h left".
   - A task shows by its title, as a link to its drawer; its states use the board's labels; a PR shows by its number, as a link to it on GitHub.
   - What resolved in the last half hour follows: "#119 merged · met 3 minutes ago", and a timeout ("The owner's reply · timed out 10 minutes ago") in the warning tone.
+  - While the manager isn't running (ended or errored) nothing is waited for: the pending waits aren't listed or counted, and one line says "Nothing while the manager isn't running." (the page's header says why and offers Restart; the composer says nothing of a reply either). The waits themselves are kept, and show again once a manager runs. What resolved lately still shows.
   - Nothing shows when there's neither. ui-review's `waits` check fails on a raw task id or snake_case state in it, on the section missing where the column shows and the fixture has waits, and on a task or PR line that isn't a link.
 - **A condition that holds already** answers at once with no wait left behind and no message, for `await_pr` as for `await_task`: a message would wake the manager, which might ask again. If a second identical call found that wait pending meanwhile (while the first read the review queue) and was told "waiting", the wait is resolved instead, with the one message that caller waits for.
 - **Resolved waits** beyond the 10 the API's `recent` returns are pruned as new ones resolve.

@@ -220,6 +220,22 @@ describe("the manager's waits", () => {
     expect(screen.getByRole("heading", { name: "Waiting for" }).closest('[data-ds="section"]')!.textContent).not.toMatch(/tsk_|[a-z]_[a-z]/);
   });
 
+  it.each(["ended", "errored"] as const)("an %s manager waits for nothing: its pending waits aren't counted down, what resolved still shows", async (phase) => {
+    const api = new FakeApi();
+    const now = Date.now();
+    const w = (o: Partial<import("../../../waits").Wait>) => ({ id: `aw_${Math.random()}`, kind: "reply" as const, target: null, want: null, created_ms: now - 3_600_000, deadline_ms: now + 26 * 3_600_000, resolved_ms: null, outcome: null, detail: null, ...o });
+    api.waits = { pending: [w({})], recent: [w({ kind: "pr", target: "118", want: "merged", resolved_ms: now - 3 * 60_000, outcome: "met", detail: "merged" })] };
+    api.manager = { phase, agent: null, state: null, host: null, error: null };
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
+    const section = (await screen.findByRole("heading", { name: "Waiting for" })).closest('[data-ds="section"]') as HTMLElement;
+    expect(await within(section).findByText("Nothing while the manager isn't running.")).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "The manager's waits" })).toBeNull();
+    expect(section).not.toHaveTextContent("left");
+    expect(section.querySelector("[data-slot=count]")).toBeNull();
+    expect(within(section).getByRole("list", { name: "The manager's resolved waits" })).toHaveTextContent("#118 merged");
+  });
+
   it("shows nothing when the manager waits for nothing", async () => {
     renderApp("/projects/prj_one/manager", new FakeApi());
     await screen.findByRole("heading", { name: "Manager" });

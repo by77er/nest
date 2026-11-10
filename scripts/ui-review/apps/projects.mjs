@@ -717,6 +717,8 @@ const app = {
     { name: "manager-long", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long", full: false },
     { name: "manager-long-full", section: "project", path: "/projects/prj_demo/manager", fixture: "chat-long" },
     { name: "manager-context-open", section: "project", path: "/projects/prj_demo/manager", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click() },
+    // An ended manager waits for nothing: its pending waits aren't counted down in the context (README.md#waiting).
+    { name: "manager-ended-context", section: "project", path: "/projects/prj_demo/manager", fixture: "manager-ended", widths: PHONE, after: (p) => p.getByRole("button", { name: "About the manager" }).click() },
     { name: "svg-modal", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false, widths: DESKTOP, after: (p) => p.getByRole("button", { name: /Search pipeline: open larger/ }).click() },
     { name: "card-pr-link", section: "project", path: "/projects/prj_demo/manager", full: false, widths: DESKTOP, check: cardPrLink, checkName: "card-links" },
     { name: "card-pr-link-chat", section: "project", path: "/projects/prj_demo/manager", fixture: "rich", full: false, widths: DESKTOP, check: chatCardPrLink, checkName: "card-links" },

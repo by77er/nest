@@ -50,6 +50,23 @@ export function personAuthor(by: unknown, viaApp: unknown): { id: number; login:
   return u.type === "User" && login && id !== null ? { id, login } : null;
 }
 
+/** A GitHub repo's id from a payload, or null. */
+const repoId = (v: unknown): number | null => {
+  const id = obj(v).id;
+  return typeof id === "number" && Number.isSafeInteger(id) && id > 0 ? id : null;
+};
+
+/**
+ * Whether a PR's head is in the event's own repo, not a fork: by GitHub's ids when the payload carries
+ * both (a renamed repo is still itself), else by the name the project was created with.
+ */
+export function sameRepo(headRepo: unknown, repository: unknown, name: string): boolean {
+  const a = repoId(headRepo);
+  const b = repoId(repository);
+  if (a !== null && b !== null) return a === b;
+  return str(obj(headRepo).full_name)?.toLowerCase() === name;
+}
+
 /**
  * The owner's comment on a PR from one of the comment events, or null: another author, an action it
  * doesn't act on (an edit, a delete, a review with no text that isn't requesting changes), a comment
@@ -59,7 +76,7 @@ export function prCommentOf(event: string, payload: Obj, repo: string): PrCommen
   const action = str(payload.action);
   const headOf = (pr: Obj) => {
     const head = obj(pr.head);
-    const fork = str(obj(head.repo).full_name)?.toLowerCase() !== repo;
+    const fork = !sameRepo(head.repo, payload.repository, repo);
     return { fork, headTask: fork ? null : (TASK_BRANCH.exec(str(head.ref) ?? "")?.[1] ?? null) };
   };
   const text = (v: unknown) => (str(v) ?? "").slice(0, BODY_MAX);
@@ -164,8 +181,8 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
 
 async function handle(env: Env, event: string, payload: Obj, seenId: string): Promise<Response> {
   const dir = directory(env);
-  const repo = str(obj(payload.repository).full_name)?.toLowerCase() ?? null;
-  const p = repo ? await dir.projectByRepo(repo) : null;
+  // By the repo's id (README.md#built-the-review-pipeline): a rename or a transfer changes the name, never the id.
+  const p = await dir.projectForRepo(repoId(payload.repository), str(obj(payload.repository).full_name) ?? null);
   if (!p) return json({ ignored: "no project for this repo" });
   // Still being created (README.md#creating-a-project): its objects aren't whole, so nothing reaches them;
   // an import or a later event catches up.
@@ -184,7 +201,7 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
     }
     const updated_at = str(pr.updated_at) ?? new Date().toISOString();
     // The task its branch names, only for a branch of the repo itself (a fork may name any branch).
-    const fromRepo = str(obj(head.repo).full_name)?.toLowerCase() === p.repo;
+    const fromRepo = sameRepo(head.repo, payload.repository, p.repo);
     const task = fromRepo ? (TASK_BRANCH.exec(str(head.ref) ?? "")?.[1] ?? null) : null;
     if (action === "opened" || action === "reopened" || action === "synchronize") {
       // Whose PR, from where (README.md#the-review-gate): one the project doesn't trust is held, not reviewed.

@@ -3,14 +3,15 @@
 // 45 min left", "#12 to merge · 2 h left", "The owner's reply · 26 h left". A task by its title (a link
 // to its drawer), its states by the board's labels, a PR by its number (a link to it on GitHub). Then
 // what resolved in the last half hour, "#12 merged · met 3 min ago", a timeout in the warning tone.
-// Nothing when there's neither.
+// Nothing when there's neither. While the manager isn't running (ended or errored) nothing is waited
+// for: its pending waits aren't listed as if a manager were counting them down, and one line says so.
 
 import { Anchor, Text } from "@mantine/core";
 import { IconHourglass } from "@tabler/icons-react";
 import type { ReactNode } from "react";
 import type { TaskState } from "../../../tasks";
 import { human, type PrUntil, type Wait } from "../../../waits";
-import { useProject, useTasks, useWaits } from "../../api/queries";
+import { useManager, useProject, useTasks, useWaits } from "../../api/queries";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { icon, Row, Section, Stack } from "../../layout";
@@ -90,12 +91,21 @@ export function ManagerWaits({ projectId, now = Date.now() }: { projectId: strin
   const tasks = useTasks(projectId).data ?? [];
   const repo = useProject(projectId).data?.repo;
   const titles = new Map(tasks.map((t) => [t.id, t.title]));
-  const pending = [...(waits.data?.pending ?? [])].sort((a, b) => a.deadline_ms - b.deadline_ms);
+  const phase = useManager(projectId).data?.phase;
+  // No manager is there to wait (the page's header says why, and offers Restart).
+  const down = phase === "ended" || phase === "errored";
+  const held = [...(waits.data?.pending ?? [])].sort((a, b) => a.deadline_ms - b.deadline_ms);
+  const pending = down ? [] : held;
   const recent = (waits.data?.recent ?? []).filter((w) => w.resolved_ms !== null && now - w.resolved_ms < RECENT_MS).slice(0, RECENT_SHOWN);
-  if (pending.length === 0 && recent.length === 0) return null;
+  if (held.length === 0 && recent.length === 0) return null;
   return (
-    <Section title="Waiting for" dense count={pending.length} region={false}>
+    <Section title="Waiting for" dense count={down ? undefined : pending.length} region={false}>
       <Stack gap="xs">
+        {down && held.length > 0 && (
+          <Text fz="sm" c="dimmed" data-slot="waits-down">
+            Nothing while the manager isn&apos;t running.
+          </Text>
+        )}
         {pending.length > 0 && (
           <Stack gap="xs" role="list" aria-label="The manager's waits" data-slot="waits">
             {pending.map((w) => (
