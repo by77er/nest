@@ -91,11 +91,13 @@ const DAY = 86_400_000;
  * is pruned; a message to an agent is kept a week once ended; a failed stop until it's resolved.
  * Nothing gives up on transient failures: a stop must go in the end, and the rest are cheap to retry.
  */
-export const OUTBOX: Record<"chat" | "messages" | "stops" | "issue_closes" | "layers", OutboxPolicy> = {
+export const OUTBOX: Record<"chat" | "messages" | "stops" | "issue_closes" | "layers" | "templates", OutboxPolicy> = {
   chat: {},
   messages: { keepMs: 7 * DAY },
   // A failed stop is kept until its agent is stopped, dismissed or exits: its place stays counted meanwhile.
   stops: {},
   issue_closes: {},
   layers: {},
+  // A stale model template's delete: given up after this many tries, so a removed project's object can rest.
+  templates: { maxAttempts: 30 },
 };

@@ -158,6 +158,7 @@ The owner's request (2026-11-06): the app's retry queues as one machine, so each
   | `stops` (ending agents) | retried until it goes, except nest's own refusal (failed stops, below) | never once failed: kept until resolved |
   | `issue_closes` | permanent: failed; tried again on the owner's retry or a grant gaining `issues: write` | always (the task's record) |
   | client `layers` | permanent: failed, shown on the Network page | while the agent lives |
+  | `templates` (a stale [model template](#models)'s delete) | permanent, or 30 attempts: failed, among the project's errors | until its template is written again |
 
   Stops used to retry everything forever. ReviewDO's `check_updates` and `ended` aren't on the machine yet (a follow-up).
 - **Failed stops.** A failed stop may leave an agent running, with its sandbox and its credentials, so it's never quiet.
@@ -221,8 +222,9 @@ The owner's request (2026-11-09): "allow me to select the model for the manager 
 - **Stale templates are cleaned up** (`sweepModelTemplates`, from the alarm). The project records each template it writes and the template each agent started from.
   - One is deleted from nest's catalog (`DELETE /v1/catalog/templates/projects/<entry>`) once it's neither the role's current setting nor the template a live agent started from. Whether nest reads a live agent's template again is unverified, so it's kept while that agent lives.
   - Nothing is swept while a start is owed, since it may be about to name one.
-  - A template's delete is an [outbox](#outboxes) row. One nest can't take now is tried again with backoff, from the alarm, not at every drain. One nest refuses for good is recorded among the project's errors (`template_delete_failed`) and not tried again; the template stays in nest's catalog. Chosen again, the template is written afresh and its delete forgotten.
-  - A project that's gone (a create that couldn't be finished) takes all of its with it. Deletes nest couldn't take then are tried again from the project object's own alarm, which does nothing else once the project is gone.
+  - A template's delete is an [outbox](#outboxes) row. One nest can't take now is tried again with backoff, from the alarm, not at every drain. One nest refuses for good, or can't take 30 times, is recorded among the project's errors (`template_delete_failed`) and not tried again; the template stays in nest's catalog.
+  - A template that's kept again (the setting came back to it, or a start wrote it) is owed no delete: what a failed one left is cleared, and it's no reason for the alarm. Each delete is decided afresh after the last one's answer, and a row a start wrote while its delete was at nest is left to that start.
+  - A project that's gone (a create that couldn't be finished) takes all of its with it. Deletes nest couldn't take then are tried again from the project object's own alarm, which does nothing else once the project is gone, and is set only after a sweep ran and while a delete is still to be tried.
 - **A change applies to the next start.** A start freezes its model with its attempt (`start_specs`), so its retries name the same template under the same idempotency keys.
   - Workers started after the change run on the new model; running ones keep theirs.
   - The manager keeps its model until it next starts: **Restart manager**, or its replacement after it ends ([the manager lifecycle](#the-manager-lifecycle)).
