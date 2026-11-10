@@ -18,6 +18,7 @@ It's a standalone crate (its own `[workspace]` and lockfile), so `cargo test --w
   - The defaults are 3 commands and one of each fault.
 - **Lease:** `lease[,unit=MS][,horizon=STEPS][,drops=N][,suspends=N][,suspend=STEPS][,inflight=N]`.
 - **Unchanged disk:** `sentinel[,async][,trust-running][,writes=N][,commits=N][,restarts=N]`; `async` and `trust-running` are the two broken shells, each expected to fail.
+- **Incarnation lifecycle:** `incarnation[,today][,same-epoch][,stuck-archive][,lapsed-create][,disk-only][,cmds=N][,fences=N][,epochs=N]`. The default is the shell with the audit's three fixes, which holds; `today` is the shell as it is, and `same-epoch`, `stuck-archive` and `lapsed-create` each remove one fix. Each is expected to fail the property its fix is there for.
 
 **Environment variables:**
 
