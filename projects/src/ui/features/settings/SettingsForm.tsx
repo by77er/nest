@@ -17,11 +17,18 @@ import type { Settings } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
 import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
-import { MODELS, modelProblem } from "../../../models";
+import { MODELS, modelLabel, modelProblem } from "../../../models";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 
 const CUSTOM = "custom";
+
+/** A pending switch of the running manager, in words: "Running Fable 5.2; switches to Sonnet 5.5 after this turn." */
+export function switchText(s: { from: string | null; to: string; after_turn: boolean }): string {
+  const to = modelLabel(s.to);
+  const when = s.after_turn ? `switches to ${to} after this turn.` : `switching to ${to}…`;
+  return s.from ? `Running ${modelLabel(s.from)}; ${when}` : `${when.charAt(0).toUpperCase()}${when.slice(1)}`;
+}
 
 /**
  * A role's model (README.md#models): one of the listed ones, or "Custom" and the id typed. A value that
@@ -149,11 +156,16 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
               <FieldGroup>
                 <ModelField
                   label="Manager's model"
-                  description="A change applies the next time the manager starts (Restart manager, on its page)."
+                  description="A change applies now: the running manager switches between turns, keeping its conversation. A turn it starts at the moment of the switch is cut and redone."
                   value={form.getValues().manager_model}
                   onChange={(v) => form.setFieldValue("manager_model", v)}
                   error={form.errors.manager_model}
                 />
+                {settings.manager_switch && (
+                  <Text fz="sm" c="dimmed" data-slot="manager-switch" role="status">
+                    {switchText(settings.manager_switch)}
+                  </Text>
+                )}
                 <ModelField
                   label="Workers' model"
                   description="A change applies to workers started from now on; running ones keep theirs."

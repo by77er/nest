@@ -21,7 +21,7 @@ export function project(over: Partial<ProjectRow> = {}): Project {
   const settings: Settings = {
     id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null, manager_start_owed: false, manager_model: "claude-fable-5-2", worker_model: "claude-opus-5-5",
     attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: row.created_ms },
-    auto_merge: false, merge_method: "squash", workers_edit_workflows: false, comments_from: { id: 1001, login: "owner" }, repo_owner: { id: 1001, login: "owner" }, repo_auto_merge: { state: "none", want: false, repo: null, error: null, at_ms: null }, max_routine_runs: 1, issues_from: "trusted", issues_dropped: null, created_ms: row.created_ms,
+    auto_merge: false, merge_method: "squash", workers_edit_workflows: false, comments_from: { id: 1001, login: "owner" }, repo_owner: { id: 1001, login: "owner" }, repo_auto_merge: { state: "none", want: false, repo: null, error: null, at_ms: null }, max_routine_runs: 1, issues_from: "trusted", issues_dropped: null, manager_switch: null, created_ms: row.created_ms,
   };
   return { ...row, settings };
 }

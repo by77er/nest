@@ -5,6 +5,7 @@ import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+import { switchText } from "./SettingsForm";
 
 /** The Settings page (it was a modal): its form, as `dialog` for the tests below. */
 async function openSettings(api: FakeApi) {
@@ -189,6 +190,23 @@ describe("auto-merge in the settings", () => {
   });
 });
 
+describe("the manager's model, switched now", () => {
+  it("a pending switch says when: after this turn, or now", async () => {
+    const turn = new FakeApi();
+    turn.projects[0]!.settings = { ...turn.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch: { from: "claude-fable-5-2", to: "claude-sonnet-5-5", after_turn: true } };
+    const b = await openSettings(turn);
+    expect(b.dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Running Fable 5.2; switches to Sonnet 5.5 after this turn.");
+    b.unmount();
+    const now = new FakeApi();
+    now.projects[0]!.settings = { ...now.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch: { from: "claude-fable-5-2", to: "claude-sonnet-5-5", after_turn: false } };
+    const c = await openSettings(now);
+    expect(c.dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Running Fable 5.2; switching to Sonnet 5.5…");
+    // A manager from before the switch (its model not recorded): just where it's going.
+    expect(switchText({ from: null, to: "claude-sonnet-5-5", after_turn: true })).toBe("Switches to Sonnet 5.5 after this turn.");
+    expect(switchText({ from: null, to: "claude-sonnet-5-5", after_turn: false })).toBe("Switching to Sonnet 5.5…");
+  });
+});
+
 describe("the models in the settings", () => {
   const select = (dialog: HTMLElement, label: string) => within(dialog).getAllByLabelText(label).find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden") as HTMLInputElement;
 
@@ -197,7 +215,8 @@ describe("the models in the settings", () => {
     const { user, dialog } = await openSettings(api);
     expect(select(dialog, "Manager's model")).toHaveValue("Fable 5.2");
     expect(select(dialog, "Workers' model")).toHaveValue("Opus 5.5");
-    expect(dialog).toHaveTextContent("applies the next time the manager starts");
+    expect(dialog).toHaveTextContent("A change applies now: the running manager switches between turns, keeping its conversation. A turn it starts at the moment of the switch is cut and redone.");
+    expect(dialog.querySelector("[data-slot=manager-switch]")).toBeNull();
     expect(dialog).toHaveTextContent("workers started from now on; running ones keep theirs");
     expect(dialog).toHaveTextContent("Reviewers and routine runs keep nest's default model.");
     await user.click(select(dialog, "Workers' model"));

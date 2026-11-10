@@ -185,6 +185,16 @@ export class Nest {
     await this.call("DELETE", `/v1/sandboxes/${encodeURIComponent(sandbox)}`);
   }
 
+  /**
+   * Restart an agent's brain on a new launch, resuming its session (`POST /v1/agents/<id>/start {restart,
+   * launch}`, owner auth): nest stores the launch's model and effort and restarts on them in one step, and
+   * answers the launch as stored. A release before that route ignores `launch`: its answer has none.
+   * It kills a live brain at once, so a turn in progress is cut: call it only between turns.
+   */
+  async restartAgent(agent: string, launch: { model?: string; effort?: string }): Promise<{ launch?: { model?: string; effort?: string } }> {
+    return this.call("POST", `/v1/agents/${encodeURIComponent(agent)}/start`, { restart: true, launch });
+  }
+
   getAgent(agent: string): Promise<AgentView> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}`);
   }

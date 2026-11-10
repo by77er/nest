@@ -30,6 +30,9 @@ export interface FakeAgent {
   /** nest's `state` to report (idle by default), and its start's capacity waits. */
   state?: string;
   capacityWaits?: number;
+  /** The launch's model a restart stored (`POST …/start {restart, launch}`), and each restart's. */
+  model?: string;
+  restarts?: { model?: string; effort?: string }[];
 }
 
 export interface Call {
@@ -85,6 +88,8 @@ export class FakeNest {
   failures: { match: RegExp; status: number; retryable?: boolean; times: number; page?: boolean }[] = [];
   /** Play a control plane from before the push opt-in was in the client layer (nest #157). */
   layerWithoutPush = false;
+  /** Play a nest whose `start` ignores `launch` (a rolled-back Worker): its answer names none. */
+  launchIgnored = false;
   /** The repos the client's grant names, lowercased (`github.repos`); null: any (the grant isn't what a test is about). */
   grantRepos: string[] | null = null;
   /** The grant's `repos` (push) when a test needs it to differ from `github.repos`; null: the same as `grantRepos`. */
@@ -339,6 +344,17 @@ export class FakeNest {
           return nestErr(500, "internal", "the answer was lost", true);
         }
         return json(201, { message: { seq: this.inbox.length } });
+      }
+      // A restart on a new launch, resuming the session (docs/control-plane/api/clients/): stored and restarted in one step.
+      if (req.method === "POST" && sub === "/start") {
+        if (a.ended) return nestErr(409, "conflict", "the agent has ended");
+        const launch = (call.body?.launch ?? {}) as { model?: string; effort?: string };
+        if (launch.model !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,99}$/.test(launch.model)) return nestErr(400, "invalid_message", "launch.model is plain tokens");
+        if (call.body?.restart) (a.restarts ??= []).push(launch);
+        // A release before the route ignores `launch`: nothing stored, none answered.
+        if (this.launchIgnored) return json(200, { kind: "waiting", host: null, cmd: null });
+        if (launch.model) a.model = launch.model;
+        return json(200, { kind: "waiting", host: null, cmd: null, launch: { ...(a.model ? { model: a.model } : {}) } });
       }
       if (req.method === "POST" && sub === "/interrupt") {
         this.interrupts.push(a.agent);
