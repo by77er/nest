@@ -131,6 +131,8 @@ export interface AgentInfo extends AgentSpec, BrainFields {
   recv_base: number;
   recv_session: string | null;
   recv_durable: number;
+  /** The receive stream's rewrite length, from its base segment's `total_bytes`; absent: unknown (an older runner), or no rewrite. */
+  recv_total?: number;
   /** Logical end of the receive stream so far (durable + buffered). */
   received_bytes: number;
   /** Runner process (session `hello.instance_id`); a change starts a new channel lineage. */
@@ -310,12 +312,23 @@ const CAPACITY_RETRY_MAX_MS = 5 * 60_000;
 const same = <T>(a: T, b: T) => JSON.stringify(a) === JSON.stringify(b);
 
 /** A rewritten file or another session starts a new receive stream; the committed base stays resumable until it is durable. */
-function newStream(i: AgentInfo, session: string): void {
+function newStream(i: AgentInfo, session: string, total?: number): void {
   i.recv_base = Math.max(i.recv_base, i.base_gen) + 1;
   i.recv_durable = 0;
   i.received_bytes = 0;
   i.recv_session = session;
+  if (total === undefined) delete i.recv_total;
+  else i.recv_total = total;
 }
+
+/**
+ * Whether the receive stream may become the committed base (what `--resume` and transcripts read): all
+ * it received is durable, and, when its base segment said how long the rewrite is, at least that much.
+ * So a rewrite that arrives in several segments is never committed part-way, where a brain dying before
+ * the rest came would resume from a truncated session.
+ */
+export const streamCommittable = (i: Pick<AgentInfo, "recv_durable" | "received_bytes" | "recv_total">): boolean =>
+  i.recv_durable >= i.received_bytes && (i.recv_total === undefined || i.recv_durable >= i.recv_total);
 
 function adoptSession(i: AgentInfo, session: string): void {
   i.recv_session = session;
@@ -2327,7 +2340,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!this.current(att)) return;
     if (seg.base) {
       if (seg.offset !== 0) throw new NestError(ErrorCodes.INVALID_MESSAGE, "a base segment must start at offset 0");
-      const i2 = this.update((i) => newStream(i, seg.session));
+      const i2 = this.update((i) => newStream(i, seg.session, seg.total_bytes));
       this.sql.exec("DELETE FROM seg_buffer WHERE base < ?", i2.recv_base);
     } else {
       const cur = this.load();
@@ -2396,7 +2409,7 @@ export class AgentDO extends DurableObject<Env> {
       i.durable_ms = Date.now();
       if (i.base_gen === base) {
         i.durable_bytes = i.recv_durable;
-      } else if (i.recv_durable >= i.received_bytes) {
+      } else if (streamCommittable(i)) {
         i.base_gen = base;
         i.durable_bytes = i.recv_durable;
         i.session = i.recv_session;

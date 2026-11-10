@@ -1,7 +1,7 @@
 // Regression tests for the control-plane review findings (one block per finding).
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { AgentDO } from "../src/do/agent";
+import { type AgentDO, streamCommittable } from "../src/do/agent";
 import type { FleetDO } from "../src/do/fleet";
 import { Deadlines } from "../src/lib/reliable";
 import { issueHostToken } from "../src/lib/tokens";
@@ -478,6 +478,59 @@ describe("#17/#14 read_transcript pages by entry", () => {
     const after = await adminJson(`/v1/agents/${s.agent}/transcript?since=4&base=0`);
     expect(after).toEqual({ lines: ["n1", "n2"], next_seq: 2, more: false, base: 1, reset: true });
     expect(await adminJson(`/v1/agents/${s.agent}/transcript?since=1&base=1`)).toEqual({ lines: ["n2"], next_seq: 2, more: false, base: 1 });
+  });
+});
+
+describe("sweep bug 5: a rewrite that arrives in several segments is committed only whole", () => {
+  it("streamCommittable: all received is durable, and at least the rewrite's stated length (pure)", () => {
+    // [recv_durable, received_bytes, recv_total, committable]
+    const table: [number, number, number | undefined, boolean][] = [
+      [6, 6, undefined, true], // an older runner: as before
+      [4, 6, undefined, false],
+      [6, 6, 12, false], // the first of two segments, durable: not yet
+      [12, 12, 12, true],
+      [10, 12, 12, false],
+      [20, 20, 12, true], // the file grew past the rewrite
+      [0, 0, 0, true],
+    ];
+    for (const [recv_durable, received_bytes, recv_total, want] of table) {
+      expect(streamCommittable({ recv_durable, received_bytes, ...(recv_total !== undefined ? { recv_total } : {}) }), `${recv_durable}/${received_bytes}/${recv_total}`).toBe(want);
+    }
+  });
+
+  it("a flush between a rewrite's segments keeps the old base resumable; the last segment commits it", async () => {
+    const s = await setup({ captain: true });
+    const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
+    const old = "o1\no2\no3\n";
+    ws.send(seg(0, old));
+    await received(s.agent, old.length);
+    await agentStub(s.agent).flush();
+    const base = (await agentStub(s.agent).info()).base_gen;
+    // A compaction rewrite, in two segments; only the first says it is a base, and how long the rewrite is.
+    ws.send({ ...seg(0, "n1\nn2\n", true), total_bytes: 12 });
+    await received(s.agent, 6, base + 1);
+    await agentStub(s.agent).flush();
+    // Durable, but not the base yet: transcripts and a resume still read the complete old file.
+    expect(await agentStub(s.agent).transcript()).toBe(old);
+    expect(await agentStub(s.agent).info()).toMatchObject({ base_gen: base, durable_bytes: old.length, recv_durable: 6 });
+    ws.send(seg(6, "n3\nn4\n"));
+    await received(s.agent, 12, base + 1);
+    await agentStub(s.agent).flush();
+    expect(await agentStub(s.agent).transcript()).toBe("n1\nn2\nn3\nn4\n");
+    expect(await agentStub(s.agent).info()).toMatchObject({ base_gen: base + 1, durable_bytes: 12 });
+  });
+
+  it("a runner of the previous release (no total_bytes) is committed as before, at the first durable segment", async () => {
+    const s = await setup({ captain: true });
+    const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
+    ws.send(seg(0, "o1\no2\no3\n"));
+    await received(s.agent, 9);
+    await agentStub(s.agent).flush();
+    const base = (await agentStub(s.agent).info()).base_gen;
+    ws.send(seg(0, "n1\nn2\n", true));
+    await received(s.agent, 6, base + 1);
+    await agentStub(s.agent).flush();
+    expect(await agentStub(s.agent).transcript()).toBe("n1\nn2\n");
   });
 });
 

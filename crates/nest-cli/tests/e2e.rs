@@ -156,7 +156,7 @@ impl MockDo {
                                 l.hellos.push(h);
                                 let _ = tx.send(AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None });
                             }
-                            RunnerToAgent::Segment { offset, base, data_b64, session } => {
+                            RunnerToAgent::Segment { offset, base, data_b64, session, .. } => {
                                 let data = base64::engine::general_purpose::STANDARD.decode(data_b64).unwrap();
                                 let end = offset + data.len() as u64;
                                 l.segments.push((offset, base, data));
