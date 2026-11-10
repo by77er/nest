@@ -149,6 +149,28 @@ export function createFailed(l: Lease, host: string, epoch: number, retryable: b
 export const failedHolder = (l: Lease): { host: string; epoch: number } | null =>
   l.state === "failed" && l.host ? { host: l.host, epoch: l.epoch } : null;
 
+/** How long a failed sandbox keeps its lease (and so its host) before `failedReleased` (state-machine sweep, bug 6). */
+export const FAILED_RELEASE_MS = 15 * 60_000;
+
+/**
+ * A failed sandbox's lease, released after `FAILED_RELEASE_MS` (its holder fenced first), if nothing moved
+ * meanwhile: unplaced, still `failed`, so its host can retire. Nothing places it again on its own
+ * (`placeWanted`, `wake`): an operator's retry (`claim`) or a destroy does.
+ */
+export function failedReleased(l: Lease, host: string, epoch: number): boolean {
+  if (l.state !== "failed" || !holds(l, host, epoch)) return false;
+  l.host = null;
+  l.lost_from = null;
+  return true;
+}
+
+/** An operator's retry of a failed sandbox whose lease was already released: placeable again (`creating`). */
+export function retriedReleased(l: Lease): boolean {
+  if (l.state !== "failed" || l.host !== null || l.placing !== null) return false;
+  l.state = "creating";
+  return true;
+}
+
 /** Retry, after the fence and release, if nothing moved meanwhile. */
 export function retried(l: Lease, host: string, epoch: number): void {
   if (!holds(l, host, epoch)) return;
@@ -166,7 +188,7 @@ export function destroyed(l: Lease): void {
 
 /** The `place` alarm places a live, unplaced sandbox; a suspended one only while someone works. */
 export const placeWanted = (l: Lease): boolean =>
-  l.host === null && l.placing === null && !gone(l.state) && (l.state !== "suspended" || l.working.length > 0);
+  l.host === null && l.placing === null && !gone(l.state) && l.state !== "failed" && (l.state !== "suspended" || l.working.length > 0);
 
 /**
  * Commit (sandbox-lease §2.4; the commit-gc pilot's `CommitChain.commit`, guard for guard). `kind`

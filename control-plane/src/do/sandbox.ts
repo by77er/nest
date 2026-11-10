@@ -561,6 +561,9 @@ export class SandboxDO extends DurableObject<Env> {
       await this.fleet(info.cell).issueCommands(old.host, [{ type: "fence", sandboxes: [info.sandbox], reason: "create failed; re-placing" }]);
       await this.fleet(info.cell).releaseLease(info.sandbox, old.epoch);
       this.update((i) => lease.retried(i, old.host, old.epoch));
+    } else {
+      // Failed with its lease already released (`releaseFailed`): placeable again, retried until placed.
+      this.update((i) => lease.retriedReleased(i));
     }
     return this.placeCurrentEpoch();
   }
@@ -576,8 +579,10 @@ export class SandboxDO extends DurableObject<Env> {
     if (!info || !lease.holds(info, host, epoch)) return;
     // The host's reason, to Workers Logs only (it names host paths): the one place it was kept.
     if (state === "failed" && detail) console.warn(`sandbox ${info.sandbox}: failed on ${host}: ${detail}`);
-    const [r] = this.decide((i) => lease.reported(i, host, epoch, state, guest));
+    const [r, after] = this.decide((i) => lease.reported(i, host, epoch, state, guest));
     if (!r.applied) return;
+    // Failed: its lease (and host) goes after a grace, unless something moves it first.
+    if (after.state === "failed") await this.deadlines.set("failed_release", Date.now() + lease.FAILED_RELEASE_MS, true);
     // A guest that just came up (boot, resume) takes the slots its sandbox was suspended without.
     if (r.becameRunning) await this.reissuePendingAttaches(true);
     await this.armIdle();
@@ -590,6 +595,8 @@ export class SandboxDO extends DurableObject<Env> {
   async wake(): Promise<{ host: string | null; state: SandboxState }> {
     let info = this.info_();
     if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
+    // Failed, its lease released: it stays failed until an operator retries it or it is destroyed.
+    if (info.state === "failed" && !info.host) return { host: null, state: info.state };
     if (!info.host && info.placing !== null) {
       await this.reconcilePlacing();
       info = this.info_();
@@ -601,6 +608,21 @@ export class SandboxDO extends DurableObject<Env> {
     if (info.placing !== null) return { host: null, state: info.state };
     const host = await this.placeCurrentEpoch();
     return { host, state: this.info_().state };
+  }
+
+  /**
+   * The `failed_release` deadline (state-machine sweep, bug 6): a sandbox still failed on its host
+   * `FAILED_RELEASE_MS` after it failed has its holder fenced and its lease released, so the host (no
+   * longer busy with it) can retire. The record stays `failed`, with its last generation, unplaced.
+   */
+  private async releaseFailed(): Promise<void> {
+    const info = this.info_();
+    const old = lease.failedHolder(info);
+    if (!old) return;
+    await this.fleet(info.cell).issueCommands(old.host, [{ type: "fence", sandboxes: [info.sandbox], reason: "failed; its lease released" }]);
+    await this.fleet(info.cell).releaseLease(info.sandbox, old.epoch);
+    const [released] = this.decide((i) => lease.failedReleased(i, old.host, old.epoch));
+    if (released) console.warn(`sandbox ${info.sandbox}: failed for ${lease.FAILED_RELEASE_MS / 60_000} min; its lease on ${old.host} released`);
   }
 
   /** FleetDO took this suspended sandbox off a host going away (`lease.evicted`). */
@@ -641,6 +663,7 @@ export class SandboxDO extends DurableObject<Env> {
       await this.pushSecrets();
     } else if (r === "failed") {
       console.warn(`sandbox ${info.sandbox}: create failed: ${error.code} ${error.message}`);
+      await this.deadlines.set("failed_release", Date.now() + lease.FAILED_RELEASE_MS, true);
     }
   }
 
@@ -1046,6 +1069,8 @@ export class SandboxDO extends DurableObject<Env> {
         const next = this.sql.exec<{ at: number | null }>("SELECT MIN(expires_ms) AS at FROM grants").toArray()[0]?.at;
         if (next) await this.deadlines.set("grants", next);
         if (expired) await this.policyChanged(false);
+      } else if (key === "failed_release") {
+        await this.releaseFailed();
       } else if (key === "place") {
         // An unfinished placement is reconciled first (or the deadline re-armed until it goes stale).
         await this.reconcilePlacing();

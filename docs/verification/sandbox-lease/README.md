@@ -187,3 +187,17 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 **Invariants worth checking now, in code or tests:**
 - Runtime: in `FleetDO.place`, log an error if `req.epoch ≤` the highest epoch this cell ever leased for the sandbox (needs a column; detects S3' failures).
 - Tests: B1 (salvage after a NoCapacity rollback), and a nestd test that a `fence` command result is emitted only after the pause landed, or a doc change saying it isn't.
+
+## Policy and conformance: a failed sandbox releases its lease (fix/failed-releases-host, 2026-11-06)
+
+**Policy (the owner's default):** a sandbox `failed` on its host keeps the lease for 15 minutes, then gives it up, so the host can retire. The record stays `failed` and unplaced, with its head, until an operator or client retries or destroys it. An attached agent no longer pins the host.
+
+**Head:** `fix/failed-releases-host` (on main 9fd147ff). Not checked by a model run.
+
+| Model action | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| (new) `FailedRelease` | `failedReleased` (`lib/sandbox-lease.ts`); the shell `SandboxDO.releaseFailed` | not in the spec | The same steps as `Retry` up to the release: a `fence` to the holder, `releaseLease` at that epoch, then `host := null` if the sandbox is still failed on that host at that epoch. Unlike `Retry`, no claim follows. The lease is deleted without waiting for the fence's acknowledgement, as in `Retry` (B5's window, unchanged) |
+| alarm `place` | `placeWanted` | changed | False for a `failed` sandbox, so an unplaced failed one is never claimed by the alarm. This narrows B3's fix (#62) to `fenced`: a failed sandbox that loses its host and finds no room now stays failed until retried |
+| `Retry` | `retriedReleased` + `claim` (shell `retryPlacement`) | extends | For a failed sandbox with no host: `state := creating`, then the usual claim. With a host, unchanged |
+
+Tests: `control-plane/test/sandbox-lease-core.test.ts` (the decisions, by table) and `test/fleet.test.ts` (the host retires; the sandbox stays failed until retried).

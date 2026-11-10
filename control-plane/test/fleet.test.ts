@@ -642,6 +642,57 @@ describe("autoscaling", () => {
     expect(ec2.launched).toHaveLength(2);
   });
 
+  it("a failed sandbox releases its lease after a grace, so its host retires; it stays failed until an operator retries it", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running", "terminated");
+    await autoscaled(cell, ec2);
+    const sbx = await createSandbox(cell, 202);
+    const enrolled = await enrollLaunched(cell, "i-000000001");
+    const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
+    ws.send(hostHello(enrolled.host, cell));
+    await ws.next("hello_ack");
+    expect(await sandboxStub(sbx.sandbox).retryPlacement()).toBe(enrolled.host);
+    const [create] = await nextCommands(ws, (c) => c.type === "sandbox_create");
+    // An agent is attached (it used to pin the host too: never dormant).
+    const agent = (await adminJson("/v1/agents", { body: { template: "worker", sandbox: sbx.sandbox, cell, start: false } }, 201)).agent as string;
+    // The create fails for good.
+    const seq = sendEvents(ws, [{ ts_ms: Date.now(), type: "command_result", cmd: create.cmd, outcome: { status: "error", error: { code: "internal", message: "boom", retryable: false } } }]);
+    await ws.next("ack", (m) => m.up_to >= seq);
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "failed", host: enrolled.host });
+    // Within the grace: the failed lease still counts, and the host isn't retired however long it idles.
+    await tickAt(cell, ec2, 3_600_000);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("active");
+
+    // The grace passes: its holder is fenced, the lease released; the record stays failed, unplaced.
+    await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'failed_release'");
+    });
+    await runDue(sandboxStub(sbx.sandbox));
+    const fence = await nextCommands(ws, (c) => c.type === "fence");
+    expect(fence.find((c) => c.type === "fence").sandboxes).toEqual([sbx.sandbox]);
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "failed", host: null });
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toBeNull();
+    // Nothing places it again on its own: neither its alarm nor a wake (the attached agent's start).
+    expect(await sandboxStub(sbx.sandbox).wake()).toEqual({ host: null, state: "failed" });
+    const launched = ec2.launched.length;
+    // The host, holding nothing now, is retired after its idle grace.
+    await tickAt(cell, ec2);
+    await tickAt(cell, ec2, 61_000);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("dead");
+    expect(ec2.launched).toHaveLength(launched);
+    await expect(Promise.resolve().then(() => sandboxStub(sbx.sandbox).resolve(agent))).rejects.toThrow(/not placed yet|failed/);
+
+    // An operator's retry places it again (a new host is launched for it).
+    await autoscaled(cell, ec2);
+    await adminJson(`/v1/sandboxes/${sbx.sandbox}/place`, { body: {} });
+    expect(ec2.launched.length).toBeGreaterThan(launched);
+    // No longer failed: waiting for that host, its own alarm places it once one has room.
+    const after = await sandboxStub(sbx.sandbox).info();
+    expect(after.state).toBe("creating");
+    expect(after.host).toBeNull();
+    ws.close();
+  });
+
   it("retires a launched host that enrolled but never said hello once the enroll timeout passes (B-8)", async () => {
     const cell = uniqueCell();
     const ec2 = new MockEc2("running");

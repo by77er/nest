@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 import {
   claim, createFailed, decideCommit, destroyed, evicted, failedHolder, gone, type Lease, leaseLost, type PlaceAnswer, placeAnswered,
-  placeWanted, reconciled, reported, retried,
+  failedReleased, placeWanted, reconciled, reported, retried, retriedReleased,
 } from "../src/lib/sandbox-lease";
 import type { SandboxState } from "../src/protocol/model";
 
@@ -293,5 +293,47 @@ describe("the commit decision (sandbox-lease §2.4), guard by guard in order", (
   it("an unplaced sandbox moves no head, and the first commit has no parent", () => {
     expect(decideCommit({ epoch: 3, host: null, head: "gen_h" }, epochHost, "hst_a", ev())).toEqual({ kind: "rejected", reason: "stale_epoch" });
     expect(decideCommit({ epoch: 1, host: "hst_c", head: null }, epochHost, "hst_c", ev({ epoch: 1, parent: undefined }))).toEqual({ kind: "head" });
+  });
+});
+
+describe("a failed sandbox's lease is released, and only an operator's retry places it again (bug 6)", () => {
+  const failed = (over: Partial<Lease> = {}): Lease => ({
+    epoch: 3, placing: null, placing_ms: null, host: "hst_a", state: "failed", head: "blake3:h", lost_from: null, create_attempts: 3, guest: null, working: ["agt_w"], ...over,
+  });
+
+  // [what, lease, host, epoch, released]
+  const table: [string, Lease, string, number, boolean][] = [
+    ["failed on its holder at its epoch", failed(), "hst_a", 3, true],
+    ["another host", failed(), "hst_b", 3, false],
+    ["another epoch (retried meanwhile)", failed(), "hst_a", 2, false],
+    ["no longer failed (the retry placed it)", failed({ state: "running" }), "hst_a", 3, false],
+    ["already released", failed({ host: null }), "hst_a", 3, false],
+    ["destroyed meanwhile", failed({ state: "destroyed", host: null }), "hst_a", 3, false],
+  ];
+  it.each(table)("failedReleased: %s", (_w, l, host, epoch, want) => {
+    const before = structuredClone(l);
+    expect(failedReleased(l, host, epoch)).toBe(want);
+    // Released: unplaced, still failed, its head and epoch kept. Otherwise untouched.
+    expect(l).toEqual(want ? { ...before, host: null, lost_from: null } : before);
+  });
+
+  it("released, it is never placed on its own, even with an agent working; an operator's retry makes it placeable", () => {
+    const l = failed();
+    failedReleased(l, "hst_a", 3);
+    expect(placeWanted(l)).toBe(false);
+    expect(failedHolder(l)).toBeNull();
+    expect(retriedReleased(l)).toBe(true);
+    expect(l).toMatchObject({ state: "creating", host: null, epoch: 3, head: "blake3:h" });
+    expect(placeWanted(l)).toBe(true);
+    const c = claim(l, 1);
+    expect(c).toMatchObject({ ok: true, epoch: 4 });
+  });
+
+  it("retriedReleased touches only a failed, unplaced sandbox with no placement in flight", () => {
+    for (const l of [failed(), failed({ host: null, placing: 4 }), failed({ host: null, state: "suspended" }), failed({ host: null, state: "destroyed" })]) {
+      const before = structuredClone(l);
+      expect(retriedReleased(l)).toBe(false);
+      expect(l).toEqual(before);
+    }
   });
 });
