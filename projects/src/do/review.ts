@@ -19,7 +19,8 @@ import { TEMPLATE } from "../catalog";
 import { directory, type Env, project as projectStub } from "../env";
 import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, type Verdict, verdictCheck } from "../github";
 import type { AgentCaller } from "../identity";
-import { backoff, NestError, nestFrom, type Nest } from "../nest";
+import { backoff, NestError, nestFrom, type Nest, stopRefused } from "../nest";
+import { OUTBOX, type OutboxPolicy, type OutboxRow, outboxStep } from "../outbox";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { toolOf } from "../tools";
@@ -140,7 +141,24 @@ const MIGRATIONS = [
     // matched by its id once the job learns it (pruned after a day).
     "CREATE TABLE early_exits (agent TEXT PRIMARY KEY, reason TEXT, at_ms INTEGER NOT NULL)",
   ],
+  [
+    // The queues as outbox rows (README.md#outboxes): a finished review's word to the project counts its
+    // tries, and a reviewer's stop nest refused for good is kept, not retried (`failed_ms`).
+    "ALTER TABLE ended ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE ended ADD COLUMN error TEXT",
+    "ALTER TABLE stops ADD COLUMN failed_ms INTEGER",
+  ],
 ] as const;
+
+/** `next_ms` for a row that's kept but never due (its column can't be null): a failed stop. */
+const NOT_DUE_MS = 253_402_300_799_000;
+
+/** A queue row's columns as the outbox's (`attempts` is `errors` on a job's own step). */
+const outboxRow = (r: Row, attempts: "attempts" | "errors" = "attempts"): OutboxRow =>
+  ({ next_ms: (r.next_ms as number | null) ?? Date.now(), attempts: (r[attempts] as number | null) ?? 0, error: (r.error as string | null) ?? null });
+
+/** Whether a call's failure will repeat (nest's or GitHub's refusal), not an outage or a timeout. */
+const refused = (e: unknown) => (e instanceof NestError || e instanceof GitHubError) && e.permanent;
 
 type Row = Record<string, SqlStorageValue>;
 
@@ -497,6 +515,8 @@ export class ReviewDO extends DurableObject<Env> {
 
   /** nest's `agent.exited` for a reviewer: without a verdict, it's started again, up to MAX_RETRIES times. */
   async onAgentExited(agent: string, reason?: string): Promise<void> {
+    // Gone, by nest's word: a stop of it that nest refused has nothing left to stop.
+    this.sql.exec("DELETE FROM stops WHERE agent = ? AND failed_ms IS NOT NULL", agent);
     const j = this.sql.exec("SELECT * FROM jobs WHERE agent = ?", agent).toArray()[0];
     // No job names it yet: kept for the job's start, which learns it from the create's answer.
     if (!j) this.sql.exec("INSERT OR IGNORE INTO early_exits (agent, reason, at_ms) VALUES (?, ?, ?)", agent, reason ?? null, Date.now());
@@ -599,7 +619,7 @@ export class ReviewDO extends DurableObject<Env> {
         SELECT next_ms AS t FROM jobs WHERE state IN ('running', 'held', 'overflow') AND next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM jobs WHERE state = 'queued' AND next_ms IS NOT NULL AND ? = 1
         UNION ALL SELECT next_ms FROM check_updates
-        UNION ALL SELECT next_ms FROM stops
+        UNION ALL SELECT next_ms FROM stops WHERE failed_ms IS NULL
         UNION ALL SELECT next_ms FROM ended)`,
       this.underCap() ? 1 : 0,
     ).one().t;
@@ -660,8 +680,15 @@ export class ReviewDO extends DurableObject<Env> {
       try {
         await projectStub(this.env, project!).onReviewEnded({ pr: e.pr as number, sha: e.sha as string, state: e.state as string, conclusion: (e.conclusion as string | null) ?? null });
         this.sql.exec("DELETE FROM ended WHERE pr = ? AND sha = ? AND state = ?", e.pr, e.sha, e.state);
-      } catch {
-        this.sql.exec("UPDATE ended SET next_ms = ? WHERE pr = ? AND sha = ?", Date.now() + 30_000, e.pr, e.sha);
+      } catch (err) {
+        const st = this.failedStep(e, err, false, OUTBOX.review_ended);
+        if (st && st.next_ms !== null) {
+          this.sql.exec("UPDATE ended SET next_ms = ?, attempts = ?, error = ? WHERE pr = ? AND sha = ? AND state = ?", st.next_ms, st.attempts, st.error, e.pr, e.sha, e.state);
+        } else if (st) {
+          // Given up: said on the job. A manager's wait on this review ends by its own timeout.
+          this.sql.exec("DELETE FROM ended WHERE pr = ? AND sha = ? AND state = ?", e.pr, e.sha, e.state);
+          this.sql.exec("UPDATE jobs SET error = ? WHERE pr = ? AND sha = ?", `the project wasn't told this review ended, after ${st.attempts} tries: ${st.error}`, e.pr, e.sha);
+        }
       }
     }
     // A running job always has a deadline (one running from before deadlines gets one now); past it, the
@@ -678,7 +705,7 @@ export class ReviewDO extends DurableObject<Env> {
     const github = () => (gh ??= githubFor(nest, repo, PERMISSIONS.checks));
     const now = Date.now();
     for (const r of this.sql.exec("SELECT check_run FROM check_updates WHERE next_ms <= ?", now).toArray()) await this.sendCheck(github, repo, r.check_run as number);
-    for (const r of this.sql.exec("SELECT agent FROM stops WHERE next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
+    for (const r of this.sql.exec("SELECT agent FROM stops WHERE failed_ms IS NULL AND next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
     // A held job's check: made once, completed at once as needing the owner's approval. Nothing else of it runs.
     for (const h of this.sql.exec("SELECT pr, sha FROM jobs WHERE state IN ('held', 'overflow') AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       await this.heldCheck(github, repo, h.pr as number, h.sha as string);
@@ -767,14 +794,25 @@ export class ReviewDO extends DurableObject<Env> {
     } catch (e) {
       const r = current();
       if (!r) return;
-      if ((e instanceof NestError || e instanceof GitHubError) && e.permanent) {
+      const st = this.failedStep(r, e, refused(e), OUTBOX.review_steps, "errors");
+      if (!st) return;
+      if (st.next_ms === null) {
         // Refused for good (the App, the grant, the template): the job fails with the reason shown.
         this.end(r, "refused", NO_VERDICT, { title: "The review couldn't run", summary: message(e) }, message(e));
         return;
       }
-      const errors = (r.errors as number) + 1;
-      this.sql.exec("UPDATE jobs SET errors = ?, next_ms = ?, error = ? WHERE pr = ? AND sha = ?", errors, Date.now() + backoff(errors), message(e), pr, sha);
+      this.sql.exec("UPDATE jobs SET errors = ?, next_ms = ?, error = ? WHERE pr = ? AND sha = ?", st.attempts, st.next_ms, st.error, pr, sha);
     }
+  }
+
+  /**
+   * A queue row's failed try as the outbox steps it (README.md#outboxes): due again with backoff, or
+   * failed (`next_ms` null: refused for good, or out of the queue's attempts). Null for a row that
+   * wasn't being sent.
+   */
+  private failedStep(r: Row, e: unknown, permanent: boolean, policy: OutboxPolicy, attempts: "attempts" | "errors" = "attempts"): OutboxRow | null {
+    const st = outboxStep(outboxRow(r, attempts), { kind: "failed", error: message(e), permanent }, Date.now(), policy);
+    return st.ok ? st.row : null;
   }
 
   /**
@@ -814,38 +852,51 @@ export class ReviewDO extends DurableObject<Env> {
       }
       this.sql.exec(`UPDATE jobs SET next_ms = NULL, errors = 0, error = NULL WHERE pr = ? AND sha = ? AND ${waiting}`, pr, sha);
     } catch (e) {
-      const permanent = (e instanceof NestError || e instanceof GitHubError) && e.permanent;
-      const errors = (before.errors as number) + 1;
-      this.sql.exec(`UPDATE jobs SET errors = ?, next_ms = ?, error = ? WHERE pr = ? AND sha = ? AND ${waiting}`, errors, permanent ? null : Date.now() + backoff(errors), message(e), pr, sha);
+      // Failed for good (refused, or out of tries): shown on the job, which waits for the owner all the same.
+      const st = this.failedStep(before, e, refused(e), OUTBOX.review_held, "errors");
+      if (st) this.sql.exec(`UPDATE jobs SET errors = ?, next_ms = ?, error = ? WHERE pr = ? AND sha = ? AND ${waiting}`, st.attempts, st.next_ms, st.error, pr, sha);
     }
   }
 
   private async sendCheck(github: () => Promise<GitHub>, repo: string, checkRun: number): Promise<void> {
-    const row = this.sql.exec("SELECT body, attempts FROM check_updates WHERE check_run = ?", checkRun).toArray()[0];
+    const row = this.sql.exec("SELECT body, next_ms, attempts, error FROM check_updates WHERE check_run = ?", checkRun).toArray()[0];
     if (!row) return;
     try {
       await (await github()).updateCheckRun(repo, checkRun, JSON.parse(row.body as string) as CheckRunUpdate);
     } catch (e) {
-      if (!((e instanceof NestError || e instanceof GitHubError) && e.permanent)) {
-        const attempts = (row.attempts as number) + 1;
-        this.sql.exec("UPDATE check_updates SET attempts = ?, next_ms = ?, error = ? WHERE check_run = ?", attempts, Date.now() + backoff(attempts), message(e), checkRun);
+      const st = this.failedStep(row, e, refused(e), OUTBOX.review_checks);
+      if (!st) return;
+      if (st.next_ms !== null) {
+        // Only the body that was tried: one owed since starts afresh.
+        this.sql.exec("UPDATE check_updates SET attempts = ?, next_ms = ?, error = ? WHERE check_run = ? AND body = ?", st.attempts, st.next_ms, st.error, checkRun, row.body);
         return;
       }
-      this.sql.exec("UPDATE jobs SET error = ? WHERE check_run = ?", `the check's update was refused: ${message(e)}`, checkRun);
+      // Failed for good: said on the job, and not tried again.
+      this.sql.exec("UPDATE jobs SET error = ? WHERE check_run = ?",
+        refused(e) ? `the check's update was refused: ${message(e)}` : `the check's update couldn't be sent, after ${st.attempts} tries: ${message(e)}`, checkRun);
     }
     // Only if it wasn't owed again meanwhile (a newer body replaced this one).
     this.sql.exec("DELETE FROM check_updates WHERE check_run = ? AND body = ?", checkRun, row.body);
   }
 
   private async stop(nest: Nest, agent: string): Promise<void> {
-    const row = this.sql.exec("SELECT reason, attempts FROM stops WHERE agent = ?", agent).toArray()[0];
+    const row = this.sql.exec("SELECT reason, next_ms, attempts, error FROM stops WHERE agent = ? AND failed_ms IS NULL", agent).toArray()[0];
     if (!row) return;
     try {
       await nest.stopAgent(agent, { end: true, destroySandbox: true, reason: `review ${row.reason as string}` });
     } catch (e) {
+      // Gone already (404): as good as stopped.
       if (!(e instanceof NestError && e.status === 404)) {
-        const attempts = (row.attempts as number) + 1;
-        this.sql.exec("UPDATE stops SET attempts = ?, next_ms = ?, error = ? WHERE agent = ?", attempts, Date.now() + backoff(attempts), message(e), agent);
+        const st = this.failedStep(row, e, stopRefused(e), OUTBOX.review_stops);
+        if (!st) return;
+        if (st.next_ms !== null) {
+          this.sql.exec("UPDATE stops SET attempts = ?, next_ms = ?, error = ? WHERE agent = ?", st.attempts, st.next_ms, st.error, agent);
+          return;
+        }
+        // nest's own refusal: kept, not tried again (until nest says the agent is gone), and said on its job.
+        this.sql.exec("UPDATE stops SET attempts = ?, next_ms = ?, error = ?, failed_ms = ? WHERE agent = ?", st.attempts, NOT_DUE_MS, st.error, Date.now(), agent);
+        this.sql.exec("UPDATE jobs SET error = ? WHERE agent = ?", `nest refused to stop its reviewer ${agent}, which may still be running: ${st.error}`, agent);
+        console.error(`review: nest refused to stop reviewer ${agent} (${row.reason as string}): ${st.error}`);
         return;
       }
     }

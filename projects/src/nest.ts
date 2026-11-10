@@ -307,6 +307,15 @@ function parseError(status: number, text: string): NestError {
 }
 
 /** The app's nest client from the Worker's env, or null when its token isn't set. */
+/**
+ * A stop's refusal that will repeat (README.md#outboxes): nest's own refusal of the request, in its JSON
+ * error body (400, 409). An auth failure (401, 403) or a page that isn't nest's (a proxy's, Access's) may
+ * pass, so it's retried: failing it would leave an agent running unseen.
+ */
+export function stopRefused(e: unknown): boolean {
+  return e instanceof NestError && e.code !== "http" && !e.retryable && (e.status === 400 || e.status === 409);
+}
+
 export function nestFrom(env: { NEST_CONTROL_PLANE: string; NEST_CELL: string; NEST_CLIENT_TOKEN?: string }): Nest | null {
   return env.NEST_CLIENT_TOKEN ? new Nest({ base: env.NEST_CONTROL_PLANE, token: env.NEST_CLIENT_TOKEN, cell: env.NEST_CELL }) : null;
 }

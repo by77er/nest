@@ -159,8 +159,13 @@ The owner's request (2026-11-06): the app's retry queues as one machine, so each
   | `issue_closes` | permanent: failed; tried again on the owner's retry or a grant gaining `issues: write` | always (the task's record) |
   | client `layers` | permanent: failed, shown on the Network page | while the agent lives |
   | `templates` (a stale [model template](#models)'s delete) | permanent, or 30 attempts: failed, among the project's errors | until its template is written again |
+  | ReviewDO's `check_updates` (a check run's update on GitHub) | permanent, or 30 attempts: given up, said on the review job | until sent or given up |
+  | ReviewDO's `stops` (ending reviewers) | retried until it goes, except nest's own refusal: kept, said on the job, not tried again | until nest says the agent ended |
+  | ReviewDO's `ended` (a finished review, told to the project for the manager's waits) | 30 attempts: given up, said on the job (the wait ends by its timeout) | until taken or given up |
+  | a review job's own step (its check, its reviewer, the brief) | permanent: the job fails, with why; otherwise retried within the job's deadline | with the job |
+  | a held job's check | permanent, or 30 attempts: shown on the job, which waits for the owner all the same | with the job |
 
-  Stops used to retry everything forever. ReviewDO's `check_updates` and `ended` aren't on the machine yet (a follow-up).
+  Stops used to retry everything forever. ReviewDO's queues used to keep their own retry counts: a refused reviewer stop was retried forever, and a review's word to the project every 30 seconds with no count. A reviewer's refused stop isn't among the Network page's failed stops (those are ProjectDO's): it shows on its review job (a follow-up, if it ever happens).
 - **Failed stops.** A failed stop may leave an agent running, with its sandbox and its credentials, so it's never quiet.
   - **Only a real refusal fails a stop.** That's nest's own refusal of the request, in its JSON error body (400, 409; `stopRefused`). An auth failure (401, 403), or a page that isn't nest's (a proxy's, Access's), may pass, so it's retried.
   - **A failed stop is shown everywhere it matters:**

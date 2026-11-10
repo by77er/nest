@@ -89,9 +89,10 @@ const DAY = 86_400_000;
 /**
  * Each queue's rules. The chat is the owner's log and an issue's close is its task's record, so neither
  * is pruned; a message to an agent is kept a week once ended; a failed stop until it's resolved.
- * Nothing gives up on transient failures: a stop must go in the end, and the rest are cheap to retry.
+ * A stop never gives up on transient failures (it must go in the end); the queues with `maxAttempts`
+ * do, and say so where their failure shows.
  */
-export const OUTBOX: Record<"chat" | "messages" | "stops" | "issue_closes" | "layers" | "templates", OutboxPolicy> = {
+export const OUTBOX: Record<"chat" | "messages" | "stops" | "issue_closes" | "layers" | "templates" | "review_checks" | "review_stops" | "review_ended" | "review_steps" | "review_held", OutboxPolicy> = {
   chat: {},
   messages: { keepMs: 7 * DAY },
   // A failed stop is kept until its agent is stopped, dismissed or exits: its place stays counted meanwhile.
@@ -100,4 +101,13 @@ export const OUTBOX: Record<"chat" | "messages" | "stops" | "issue_closes" | "la
   layers: {},
   // A stale model template's delete: given up after this many tries, so a removed project's object can rest.
   templates: { maxAttempts: 30 },
+  // ReviewDO's queues (README.md#outboxes). A check run's update and a finished review's word to the
+  // project are given up after this many tries, said on the job. A reviewer's stop is a stop: it must go.
+  review_checks: { maxAttempts: 30 },
+  review_stops: {},
+  review_ended: { maxAttempts: 30 },
+  // A running job's next step (its check, its reviewer, the brief): its deadline bounds the tries.
+  review_steps: {},
+  // A held job's check, saying it waits for the owner: the job waits on the Reviews page either way.
+  review_held: { maxAttempts: 30 },
 };
