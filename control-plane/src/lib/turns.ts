@@ -121,6 +121,11 @@ export class TurnQueue {
     return this.sql.exec(`SELECT 1 FROM turns WHERE status = '${TURN.queued}' LIMIT 1`).toArray().length > 0;
   }
 
+  /** The turn that would start next (the oldest queued), if any. */
+  nextQueued(): string | undefined {
+    return this.sql.exec<{ turn: string }>(`SELECT turn FROM turns WHERE status = '${TURN.queued}' ORDER BY ord LIMIT 1`).toArray()[0]?.turn;
+  }
+
   queuedCount(): number {
     return this.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM turns WHERE status = '${TURN.queued}'`).one().n;
   }

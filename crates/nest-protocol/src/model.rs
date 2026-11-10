@@ -159,12 +159,15 @@ pub mod error_codes {
     /// A remote (MCP) tool ran and reported an error (`isError`); the message is its text. Passed
     /// through as an ordinary tool error.
     pub const TOOL_ERROR: &str = "tool_error";
+    /// Refused because the agent is working now (a restart asked for only when idle, while a turn
+    /// runs or is queued): ask again later. HTTP 409.
+    pub const BUSY: &str = "busy";
 
     /// Every code above that is sent (the legacy alias is not).
     pub const ALL: &[&str] = &[
         STALE_EPOCH, PARENT_MISMATCH, UNKNOWN_SANDBOX, UNKNOWN_AGENT, UNAUTHORIZED, FORBIDDEN,
         UNSUPPORTED_VERSION, INVALID_MESSAGE, UNKNOWN_TOOL, CAPACITY_EXHAUSTED, RATE_LIMITED, NOT_BOUND,
-        SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN, CONFLICT, NOT_FOUND, TOOL_ERROR,
+        SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN, CONFLICT, NOT_FOUND, TOOL_ERROR, BUSY,
     ];
 
     /// `unsupported_version` under either name.

@@ -60,6 +60,8 @@ export const ErrorCodes = {
   NOT_FOUND: "not_found",
   /** A remote (MCP) tool ran and reported an error (`isError`): its text is the message. Passed through as an ordinary tool error. */
   TOOL_ERROR: "tool_error",
+  /** Refused because the agent is working now (`POST /start {when: "idle"}` while a turn runs or is queued): ask again later. HTTP 409. */
+  BUSY: "busy",
 } as const;
 /** What the control-host channels sent for `unsupported_version` before the names merged: read, never sent. */
 export const LEGACY_UNSUPPORTED_VERSION = "unsupported_protocol_version";

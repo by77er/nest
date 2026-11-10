@@ -20,6 +20,7 @@
 | `START_FAIL` | a refused start's command error releases via `startFailed` (a38d3c0, D1) |
 | `SPLIT_EXPIRE`, `EXPIRE_RECHECK` | the tick's expiry split at its await (N1, 6073da7), and its fix |
 | `NO_REISSUE` | 82396b3: a start while a non-condemned brain exists answers `none`; an operator restart (`ROpRestart`, under `ALLOW_STOP`) condemns and keeps the intent |
+| `SPLIT_RESTART`, `PUMP_GUARD` | 2026-11-10: an operator's restart records its intent (`ROpRestart`) and condemns the brain in a later step, after AgentDO's awaits on FleetDO (`ROpRestartCondemn`), or is refused there (`ROpRestartDrop`), as the code does; `Pump` sends no turn while one is pending (`AgentDO.pump`). Without the guard a turn sent in between is cut (`NoCutAfterAsk`, a ghost `tn.cut`) |
 | `NO_ADOPT` | 82396b3: the runner never adopts; a registered brain is ended and the new start registers after it |
 | `OLD_HOST` | `NoHost`, or a host running the previous release: seeded with a live brain, drained on sight, never started on, released only on loss, wedged at the 15 min cap (`ROldCap`, 36b60d5) |
 | `WAIT`, `TOMBSTONE`, `F`/`E` | mutations |

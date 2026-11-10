@@ -937,16 +937,18 @@ export const ROUTES: Route[] = [
       host: HostId.optional(),
       restart: z.boolean().optional(),
       launch: z.strictObject({ model: z.string().nullable().optional(), effort: z.string().nullable().optional() }).optional(),
+      when: z.literal("idle").optional(),
     }),
     run: async (c) => {
       if (c.body.host) operatorOnly(c, "choosing a brain's host");
-      const launch = c.body.launch;
-      if (launch === undefined) return (await ownAgent(c, c.p.agent)).start(c.body.host, undefined, c.body.restart ?? false);
-      // No stored change without the restart that applies it.
-      if (c.body.restart !== true) throw new NestError(ErrorCodes.INVALID_MESSAGE, "launch changes an agent only with restart: true");
+      const { launch, when } = c.body;
+      if (launch === undefined && when === undefined) return (await ownAgent(c, c.p.agent)).start(c.body.host, undefined, c.body.restart ?? false);
+      // No stored change without the restart that applies it; `when` says when a restart may happen.
+      if (c.body.restart !== true) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${launch !== undefined ? "launch" : "when"} is only for a restart: send restart: true`);
       // Checked as a spawn's launch is (lib/spec.ts `launchProblem`), by AgentDO, on the launch it would store.
       const a = await ownAgent(c, c.p.agent);
-      return newMethod("AgentDO.restartWith", async (): Promise<RestartResult> => await a.restartWith(launch, c.body.host));
+      if (when === "idle") return newMethod("AgentDO.restartWhenIdle", async (): Promise<RestartResult> => await a.restartWhenIdle(launch ?? {}, c.body.host));
+      return newMethod("AgentDO.restartWith", async (): Promise<RestartResult> => await a.restartWith(launch ?? {}, c.body.host));
     },
   }),
   route({

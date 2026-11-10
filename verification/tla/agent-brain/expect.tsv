@@ -82,3 +82,10 @@ AgentBrain.tla  MC_nr_live.cfg         holds                     full
 AgentBrain.tla  MC_old_live.cfg        holds                     full
 AgentBrain.tla  MC_nr_live_crash.cfg   holds                     full
 AgentBrain.tla  MC_nr_live_lost.cfg    holds                     full
+# An operator's restart split as the code is (intent, then the condemn after AgentDO's awaits), 2026-11-10.
+# One host: the restart and the turn race on one brain.
+AgentBrain.tla  MC_nr_restart_split_noguard.cfg violates:NoCutAfterAsk ci
+AgentBrain.tla  MC_nr_restart_split.cfg         holds                  ci
+AgentBrain.tla  MC_nr_restart_split_live.cfg    holds                  ci
+# live2: expected holds, not confirmed (did not finish in 25 min with 4 workers)
+AgentBrain.tla  MC_nr_restart_split_live2.cfg   holds                  full

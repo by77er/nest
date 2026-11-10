@@ -82,6 +82,12 @@ const ACTIVITY_RETRY_MS = 5_000;
 const WAKE_STATES: AgentState[] = ["detached", "errored"];
 /** A wake that found no host (or failed transiently) retries this often. */
 const WAKE_RETRY_MS = 30_000;
+/**
+ * A restart whose intent run fails retryably this many times in a row while its brain is live is refused
+ * (about 2.5 minutes at WAKE_RETRY_MS): turns are held while a restart is pending (`pump`), so a restart
+ * that can't get past FleetDO must not hold them for good. The brain stays, and the turns run on it.
+ */
+export const RESTART_MAX_FAILURES = 5;
 /** `hands_resolved{error}` hint when the sandbox isn't ready: how long the runner waits before asking again. */
 const HANDS_RETRY_MS = 2_000;
 const RETENTION_MS = 7 * 86_400_000;
@@ -159,6 +165,8 @@ export interface AgentInfo extends AgentSpec, BrainFields {
    * (`start_refused`); cleared by the next start issued. Absent: none.
    */
   start_error?: { code: string; message: string; ms: number };
+  /** Why the last restart was given up while its brain stayed live (`RESTART_MAX_FAILURES`); cleared by the next restart asked for. */
+  restart_error?: { code: string; message: string; ms: number };
 }
 
 /** Tools that spawn or end agents: never from a sandbox. */
@@ -813,12 +821,35 @@ export class AgentDO extends DurableObject<Env> {
    * changes, the last stored is the one the brain starts with. Answers what was stored.
    */
   async restartWith(change: LaunchChange, hostHint?: string): Promise<RestartResult> {
+    return this.restartOn(change, hostHint, undefined);
+  }
+
+  /**
+   * As `restartWith`, only between turns (`POST /start {restart: true, when: "idle"}`): refused with
+   * `busy` (409, retryable, naming the turn) while a turn runs or is queued to start, with nothing
+   * stored. A method of its own, so a Worker of this release never sends it to an AgentDO of the
+   * previous one, which would restart regardless (it answers "does not implement": a 503).
+   */
+  async restartWhenIdle(change: LaunchChange, hostHint?: string): Promise<RestartResult> {
+    return this.restartOn(change, hostHint, "idle");
+  }
+
+  private async restartOn(change: LaunchChange, hostHint: string | undefined, when: "idle" | undefined): Promise<RestartResult> {
     if (hostHint) await this.requireBrainHost(this.load().cell, hostHint);
-    // From here to the intent's write, no await: the check is of what is stored with it.
+    // From here to the intent's write, no await: the checks are of what is stored with it.
     const info = this.load();
     this.refuseEnded(info, "starts");
     const bad = launchProblem(changedLaunch(info.launch, change));
     if (bad) throw new NestError(ErrorCodes.INVALID_MESSAGE, `the agent's ${bad}`);
+    // Only between turns, when asked: nothing runs and nothing is queued to start, checked in the step
+    // that records the restart, so no turn can be admitted between the check and the restart that would cut it.
+    if (when === "idle") {
+      const running = info.current_turn;
+      const next = running === null ? this.queue.nextQueued() : undefined;
+      if (running !== null || next !== undefined) {
+        throw new NestError(ErrorCodes.BUSY, running !== null ? `turn ${running} is running` : `turn ${next} is queued to start`, 409, true);
+      }
+    }
     await this.setIntent({ ...(hostHint ? { host_hint: hostHint } : {}), reason: "restart" }, change);
     const r = await this.runIntent(true);
     const now = this.load().launch;
@@ -848,8 +879,13 @@ export class AgentDO extends DurableObject<Env> {
     // Nothing starts an agent that ended for good.
     if (this.load().ended) return;
     this.update((i) => {
+      // A restart first recorded (none pending before) counts its failures from zero: a count left by an
+      // earlier one (cleared by a release that didn't reset it) never shortens its bound. A restart asked
+      // again while one is pending keeps the count: asking again doesn't extend the bound.
+      if (patch.reason === "restart" && i.intent?.reason !== "restart") delete i.restart_failures;
       i.intent = mergeIntent(i.intent, patch);
       if (launch) i.launch = changedLaunch(i.launch, launch);
+      if (patch.reason === "restart") delete i.restart_error;
     });
     await this.deadlines.set("intent", Date.now() + WAKE_RETRY_MS, true);
   }
@@ -938,6 +974,21 @@ export class AgentDO extends DurableObject<Env> {
     // Changed under us three times: the alarm looks again.
     await this.deadlines.set("intent", Date.now() + START_RETRY_MS, true);
     return this.startStatus();
+  }
+
+  /**
+   * A restart given up while its brain stays live: the intent goes, why is on the record (`restart_error`,
+   * in `GET /v1/agents/<id>`) and sent to its client as `agent.error` (`restart_refused`), all in one step;
+   * then the turns held behind it run. A launch the restart stored stays the agent's: its next start uses it.
+   */
+  private async restartGivenUp(code: string, message: string): Promise<void> {
+    const info = this.update((i) => {
+      Object.assign(i, NO_INTENT);
+      i.restart_error = { code, message, ms: Date.now() };
+    });
+    this.emit(info, `${info.agent}/restart_refused/${newId("evt_")}`, { type: "agent.error", agent: info.agent, code: "restart_refused", message });
+    await this.deadlines.clear("intent");
+    await this.pump();
   }
 
   /** The stored launch is one a brain can be started with (lib/spec.ts `launchProblem`), or a refusal for good. */
@@ -1084,6 +1135,17 @@ export class AgentDO extends DurableObject<Env> {
     // A newer start merged in meanwhile: its own run (`intentDirty`) decides.
     if (!same(now.intent, intent)) return;
     if (ne?.retryable ?? true) {
+      // A restart held up before its condemn (FleetDO not answering, anything unexpected): bounded, since
+      // turns wait while it is pending. Past the bound it's refused, and the brain that stays runs them.
+      if (intent.reason === "restart" && now.brain && now.brain.phase !== "condemned") {
+        const n = this.update((i) => {
+          i.restart_failures = (i.restart_failures ?? 0) + 1;
+        }).restart_failures ?? 1;
+        if (n >= RESTART_MAX_FAILURES) {
+          await this.restartGivenUp(ne?.code ?? ErrorCodes.INTERNAL, `the restart failed ${n} times in a row and was given up; the brain keeps running on the launch it started with, and a launch the restart stored takes effect at its next start: ${clip(ne?.detail ?? String(e), 800)}`);
+          return;
+        }
+      }
       // No brain host with room: back off, so a cell at its cap isn't polled by every waiting agent.
       let delay = WAKE_RETRY_MS;
       if (ne?.code === ErrorCodes.CAPACITY_EXHAUSTED) {
@@ -1112,6 +1174,8 @@ export class AgentDO extends DurableObject<Env> {
       }
     });
     await this.deadlines.clear("intent");
+    // A refused restart leaves the brain as it was: turns held back while it was pending run now.
+    await this.pump();
   }
 
   /**
@@ -2735,7 +2799,11 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Send the next queued turn when the runner is connected and no turn is running. */
   private async pump(): Promise<void> {
-    if (!this.socket() || this.load().current_turn) return;
+    const at = this.load();
+    // Not while a restart is pending (verification/tla/agent-brain `PUMP_GUARD`): the restart condemns this
+    // brain after awaits on FleetDO, and a turn sent meanwhile would be cut. Queued turns run on the next
+    // brain, or on this one if the restart is refused (`intentFailed` pumps once it clears the intent).
+    if (!this.socket() || at.current_turn || at.intent?.reason === "restart") return;
     const next = this.queue.claimNext();
     if (!next) return;
     const info = this.update((i) => {
