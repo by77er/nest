@@ -434,7 +434,8 @@ export const ToolCall = z.object({
 
 export const RunnerToAgentVariants = [
   RunnerHello.extend({ type: z.literal("hello") }),
-  z.object({ type: z.literal("segment"), session: SessionId, offset: U64, base: z.boolean(), data_b64: z.string() }),
+  // `total_bytes` (a base segment's): the bytes its rewrite carries in all; absent from a runner of the previous release.
+  z.object({ type: z.literal("segment"), session: SessionId, offset: U64, base: z.boolean(), total_bytes: U64.optional(), data_b64: z.string() }),
   z.object({ type: z.literal("events"), seq: Seq, events: z.array(AgentEvent) }),
   ToolCall.extend({ type: z.literal("tool_call") }),
   z.object({ type: z.literal("tools_list_request"), request: RequestId }),
