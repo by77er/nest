@@ -6,7 +6,14 @@ import type { ProjectRow } from "../../do/directory";
 export type { Ask, ChatMessage, HistoryRow, Task } from "../../do/project";
 /** A project's settings as the API answers them: ProjectDO's, with ReviewDO's `untrusted_reviews` (README.md#the-review-gate; `hold` when absent). */
 export type Settings = ProjectSettings & { untrusted_reviews?: "hold" | "review" };
-export type { ProjectRow, SyncState } from "../../do/directory";
+export type { ProjectRow, RepoBinding, SyncState } from "../../do/directory";
+/** `POST /api/admin/bindings/<project>`: the binding as read again, and what happened to a rename. */
+export interface RereadBinding {
+  binding: import("../../do/directory").RepoBinding;
+  changed: boolean;
+  previous_id: number | null;
+  rename: { applied: string } | { blocked: string } | null;
+}
 export type { PutSecretBody } from "../../requests";
 export type { AddDependencyBody, AttachPrBody, AnswerBody, CancelBody, ChatBody, CreateProjectBody, CreateTaskBody, SettingsBody, UpdateTaskBody } from "../../requests";
 export type { Spec, TaskState } from "../../tasks";

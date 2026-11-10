@@ -999,6 +999,15 @@ export class ProjectDO extends DurableObject<Env> {
     return ok(this.settings()!);
   }
 
+  /**
+   * The repo was renamed or transferred (README.md#the-repos-binding): the project calls it by `name` from
+   * now on, for GitHub, nest's grant and the agents it starts. Agents running keep what they started with.
+   */
+  async repoRenamed(name: string): Promise<void> {
+    if (!this.settings()) return;
+    this.sql.exec("UPDATE settings SET repo = ?", name.toLowerCase());
+  }
+
   /** The App's id is known (from a check run it made): attach again to require the check from it. */
   async appIdLearned(appId: number): Promise<void> {
     const s = this.settings();
@@ -3585,7 +3594,11 @@ export class ProjectDO extends DurableObject<Env> {
       const r = await requireReviewCheck(gh, s.repo, appId);
       // Whose PR comments count (README.md#pr-comments): the repo's owner, when it's a user; never changed once set.
       // Once only: after that (the owner's choice, nobody included), an attach never changes it.
-      const owner = await gh.repoOwner(s.repo);
+      const info = await gh.repoInfo(s.repo);
+      const owner = info.owner;
+      // The repo's binding (README.md#the-repos-binding): its id read from GitHub now, so events never bind it.
+      // One that doesn't bind (another project's, or another id) is shown on the Admin page; the attach goes on.
+      await directory(this.env).bindRepo(s.id, info, "fill");
       const user = owner.type === "User";
       this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", user ? owner.id : null, user ? owner.login : null);
       if (user) this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1 WHERE comments_decided = 0", owner.id, owner.login);

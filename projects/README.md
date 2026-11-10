@@ -237,6 +237,23 @@ The owner's request (2026-11-09): "allow me to select the model for the manager 
 - **Reviewers and routine runs are unchanged:** their templates name no model, so they run on nest's and Claude Code's default. Choosing theirs is a later setting if it's wanted.
 - nest doesn't check that a model exists or that the credential may use it (`LaunchConfig.model` is any string). How a wrong id shows (Claude Code failing its first turn, so nest's `agent.error` among the project's errors) is unverified.
 
+## The repo's binding
+
+A security follow-up (2026-11-09, once the repo was public): a project's repo is bound by GitHub's ids, read from GitHub, not learned from an event.
+
+- **What's bound** (DirectoryDO's `projects`): the repo's GitHub id (`repo_id`), how it was learned (`github`, or `event` for a project from before ids were read) and when, the name GitHub last gave the repo when that isn't the project's (`renamed_to`), why the last read didn't bind it, and the App installation's id (null until nest's token answer names it; then each event's installation is checked against it, a follow-up).
+- **Read from GitHub** (`GET /repos/{owner}/{repo}` with a metadata token from nest, `src/binding.ts`):
+  - **at attach,** so a new project is never without one;
+  - **at every catalog sync,** for a project that has none or was bound from an event (a sync runs at each project's creation and from the Admin page). One whose id matches is confirmed; one that doesn't is kept as it is and shown;
+  - **by the operator's Re-read** (Admin page, `POST /api/admin/bindings/<project>`), which binds whatever GitHub answers. It reads by the name GitHub last gave the repo, so an old name taken since by another repo isn't read.
+  - A repo id another project holds is never bound: the binding says whose it is. A read that fails changes nothing.
+- **Until it's read,** a project with no id is found by the name it was created with, and takes the id of the first event that names it.
+- **A rename or transfer:**
+  - An event routed by the id names the repo's new name: it's kept as `renamed_to`.
+  - It's applied (ProjectDO, ReviewDO, then the directory, then the catalog synced) by a sync or a Re-read, once nest's grant for the app names the new name. nest mints tokens only for the repos its grant names, so until then the project calls GitHub by the old name, which GitHub redirects (unverified for every call nest makes after a transfer). Never onto a name another project has.
+  - Agents running keep what they started with; new ones get the new name.
+- **The Admin page** lists each binding (project, repo, id, how it was learned, a rename not applied yet, why it didn't bind) with Re-read.
+
 ## Creating a project
 
 The owner's request (2026-11-06), after the sweep (B10): creating a project used to be four awaited steps. A failure after the first left a project that answered 404, with its repo taken.
@@ -261,7 +278,7 @@ The owner's request (2026-11-06), after the sweep (B10): creating a project used
 
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.
 - Tasks without a PR (research, specs) end by the owner marking them done, from `draft`, `ready` or `stalled`.
-- Recording the repo's id and the installation id at attach, rather than learning the id from the first event ([PR comments](#pr-comments); a follow-up).
+- Checking each event's installation id against the project's, once nest's token answer names it ([the repo's binding](#the-repos-binding); a follow-up).
 
 ## Built: the core
 
@@ -298,7 +315,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 **What the build settled** (2026-11-02), against GitHub's docs for [webhook signatures](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [events](https://docs.github.com/en/webhooks/webhook-events-and-payloads), [check runs](https://docs.github.com/en/rest/checks/runs) and [branch protection](https://docs.github.com/en/rest/branches/branch-protection):
 - **The webhook:**
   - `X-Hub-Signature-256` is checked over the raw bytes in constant time: missing or wrong is `401`.
-  - Deduplicated by `X-GitHub-Delivery` (DirectoryDO, 7 days); routed by `repository.id` to its project (`projectForRepo`), so a repo that's renamed or transferred keeps its project, and its old name, registered again by someone else, reaches no project. A project learns its repo's id from the first event that names it: until then it's found by the name it was created with (trust on first use: the id isn't read from GitHub at attach). A PR's head is the repo's own, not a fork's, by id too. The project still calls GitHub and nest by the name it was created with, which GitHub redirects after a rename (unverified for nest's tokens after a transfer). An unknown repo, `ping` and other events are a `2xx`. The owner's PR comments: [below](#pr-comments).
+  - Deduplicated by `X-GitHub-Delivery` (DirectoryDO, 7 days); routed by `repository.id` to its project (`projectForRepo`), so a repo that's renamed or transferred keeps its project, and its old name, registered again by someone else, reaches no project. The id is read from GitHub ([the repo's binding](#the-repos-binding)); a project from before that is found by its name until it's read. A PR's head is the repo's own, not a fork's, by id too. An unknown repo, `ping` and other events are a `2xx`. The owner's PR comments: [below](#pr-comments).
   - It only records: ReviewDO and ProjectDO write one step each and arm their alarms, so it answers within GitHub's 10 s.
   - GitHub doesn't redeliver by itself (unverified: its docs offer manual redelivery only). A lost `pull_request` leaves the head without the check, which blocks merging until the next push or a redelivery.
 - **The queue:**
@@ -456,7 +473,7 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
 - **Once per comment** (B6), by its own key (its kind and URL, `comments_seen`, kept 30 days). It's claimed where it's decided to act on it (deliver, queue, restart, or drop it on the record), in that step.
   - A delivery handled again acts once: its claim was released after a later step failed, or lapsed, or it came under a new delivery id. So it never sends twice, queues twice, or starts a second worker.
   - One with no task yet (its PR's `opened` not seen) isn't claimed, so its redelivery after can act.
-- **Open:** events are routed by `repository.id` ([the webhook](#built-the-review-pipeline)), learned from the first event. Reading the id and the installation id at attach, so not even the first event is taken by name, is a follow-up.
+- **Events are routed by `repository.id`,** read from GitHub ([the repo's binding](#the-repos-binding)), never taken by name from an event.
 
 ## Triage
 

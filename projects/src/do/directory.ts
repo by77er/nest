@@ -65,7 +65,42 @@ const MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN repo_id INTEGER",
     "CREATE UNIQUE INDEX projects_repo_id ON projects (repo_id) WHERE repo_id IS NOT NULL",
   ],
+  [
+    // The repo's binding (README.md#the-repos-binding): how its id was learned (`github`: read from GitHub
+    // at attach, a sync or the operator's re-read; `event`: from the first event, before ids were read) and
+    // when; the name GitHub last gave it, when that isn't the name the project calls it by (a rename not
+    // yet applied); and the App installation's id, filled once nest's token answer names it.
+    "ALTER TABLE projects ADD COLUMN repo_bound TEXT",
+    "ALTER TABLE projects ADD COLUMN repo_bound_ms INTEGER",
+    "ALTER TABLE projects ADD COLUMN repo_name TEXT",
+    "ALTER TABLE projects ADD COLUMN installation_id INTEGER",
+    // Why the last read from GitHub didn't bind it (another project's repo, an id that doesn't match), if it didn't.
+    "ALTER TABLE projects ADD COLUMN bind_error TEXT",
+  ],
 ] as const;
+
+/** A project's repo binding (README.md#the-repos-binding), as the Admin page shows it. */
+export interface RepoBinding {
+  project: string;
+  name: string;
+  /** The name the project calls the repo by (GitHub, nest's grant, its agents). */
+  repo: string;
+  repo_id: number | null;
+  /** The name GitHub last gave the repo, when it isn't `repo`: renamed or transferred, not yet applied. */
+  renamed_to: string | null;
+  /** The App installation's id: null until nest's token answer names it. */
+  installation_id: number | null;
+  /** How the id was learned: read from GitHub, or taken from the first event; null while there's none. */
+  bound: "github" | "event" | null;
+  bound_ms: number | null;
+  /** Why the last read from GitHub didn't bind it, if it didn't. */
+  error: string | null;
+}
+
+/** What `bindRepo` did with what GitHub answered. */
+export type BindOutcome =
+  | { ok: true; binding: RepoBinding; changed: boolean; previous_id: number | null }
+  | { ok: false; error: string; binding: RepoBinding | null };
 
 /** How long the Worker has to finish a create before the alarm takes it over. */
 export const CREATE_GRACE_MS = 60_000;
@@ -73,6 +108,16 @@ export const CREATE_GRACE_MS = 60_000;
 export const CREATE_POLICY: OutboxPolicy = { maxAttempts: 8 };
 
 const COLUMNS = "id, name, repo, created_ms, CASE WHEN pending IS NULL THEN 'ready' ELSE 'pending' END AS state";
+const BINDING = "id, name, repo, repo_id, repo_name, installation_id, repo_bound, repo_bound_ms, bind_error";
+
+function bindingOf(r: Record<string, SqlStorageValue>): RepoBinding {
+  return {
+    project: r.id as string, name: r.name as string, repo: r.repo as string, repo_id: (r.repo_id as number | null) ?? null,
+    renamed_to: (r.repo_name as string | null) ?? null, installation_id: (r.installation_id as number | null) ?? null,
+    bound: (r.repo_bound as "github" | "event" | null) ?? null, bound_ms: (r.repo_bound_ms as number | null) ?? null,
+    error: (r.bind_error as string | null) ?? null,
+  };
+}
 
 /** How long a claim stays taken without its handler confirming it (`markSeen`). */
 export const CLAIM_LAPSE_MS = 5 * 60_000;
@@ -176,11 +221,77 @@ export class DirectoryDO extends DurableObject<Env> {
       this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS} FROM projects WHERE ${where}`, v).toArray()[0] ?? null;
     if (repoId !== null) {
       const byId = one("repo_id = ?", repoId);
-      if (byId) return byId;
+      if (byId) {
+        // The name GitHub gives it now: a rename or transfer is noted (README.md#the-repos-binding).
+        if (name) this.noteName(byId.id, name);
+        return byId;
+      }
     }
     const byName = name ? one("repo = ? AND repo_id IS NULL", name.toLowerCase()) : null;
-    if (byName && repoId !== null) this.sql.exec("UPDATE projects SET repo_id = ? WHERE id = ? AND repo_id IS NULL", repoId, byName.id);
+    if (byName && repoId !== null) {
+      this.sql.exec("UPDATE projects SET repo_id = ?, repo_bound = 'event', repo_bound_ms = ? WHERE id = ? AND repo_id IS NULL", repoId, Date.now(), byName.id);
+    }
     return byName;
+  }
+
+  /**
+   * The name GitHub gives the repo now, from an event routed by its id: kept when it isn't the name the
+   * project calls it by (renamed or transferred; applied by a sync or the operator's re-read, once nest's
+   * grant names it), cleared when it is again.
+   */
+  private noteName(project: string, name: string): void {
+    const n = name.toLowerCase();
+    if (!REPO.test(n)) return;
+    this.sql.exec("UPDATE projects SET repo_name = CASE WHEN repo = ? THEN NULL ELSE ? END WHERE id = ? AND repo_id IS NOT NULL", n, n, project);
+  }
+
+  /** Each project's repo binding, oldest project first. */
+  async bindings(): Promise<RepoBinding[]> {
+    return this.sql.exec(`SELECT ${BINDING} FROM projects WHERE pending IS NULL ORDER BY created_ms`).toArray().map(bindingOf);
+  }
+
+  async binding(project: string): Promise<RepoBinding | null> {
+    const r = this.sql.exec(`SELECT ${BINDING} FROM projects WHERE id = ?`, project).toArray()[0];
+    return r ? bindingOf(r) : null;
+  }
+
+  /**
+   * Bind the project to the repo GitHub answered (`id`, and its name now). `fill` (attach, a sync) sets an
+   * id only where there's none, and confirms one that matches; `replace` (the operator's re-read) sets it
+   * whatever it was. Never an id another project holds. The name is kept as `renamed_to` when it isn't the
+   * project's.
+   */
+  async bindRepo(project: string, gh: { id: number; full_name: string }, mode: "fill" | "replace"): Promise<BindOutcome> {
+    const before = await this.binding(project);
+    if (!before) return { ok: false, error: "unknown project", binding: null };
+    const name = gh.full_name.toLowerCase();
+    const refuse = async (error: string): Promise<BindOutcome> => {
+      this.sql.exec("UPDATE projects SET bind_error = ? WHERE id = ?", error, project);
+      return { ok: false, error, binding: (await this.binding(project))! };
+    };
+    if (!Number.isSafeInteger(gh.id) || gh.id <= 0 || !REPO.test(name)) return refuse("GitHub's answer names no repo");
+    const other = this.sql.exec<{ id: string }>("SELECT id FROM projects WHERE repo_id = ? AND id != ?", gh.id, project).toArray()[0];
+    if (other) return refuse(`GitHub's repo ${name} (${gh.id}) is project ${other.id}'s`);
+    if (mode === "fill" && before.repo_id !== null && before.repo_id !== gh.id) {
+      return refuse(`bound to repo ${before.repo_id}, but GitHub's ${before.renamed_to ?? before.repo} is repo ${gh.id} now: re-read it to bind to that one`);
+    }
+    this.sql.exec(
+      "UPDATE projects SET repo_id = ?, repo_bound = 'github', repo_bound_ms = ?, bind_error = NULL, repo_name = CASE WHEN repo = ? THEN NULL ELSE ? END WHERE id = ?",
+      gh.id, Date.now(), name, name, project,
+    );
+    return { ok: true, binding: (await this.binding(project))!, changed: before.repo_id !== gh.id, previous_id: before.repo_id };
+  }
+
+  /** Whether a project other than `except` calls its repo `name`. */
+  async projectByName(name: string, except: string): Promise<boolean> {
+    return this.sql.exec("SELECT 1 FROM projects WHERE repo = ? AND id != ?", name.toLowerCase(), except).toArray().length > 0;
+  }
+
+  /** The repo renamed: the project calls it by `name` from now on (ProjectDO and ReviewDO switched first). */
+  async renameRepo(project: string, name: string): Promise<boolean> {
+    const n = name.toLowerCase();
+    if (this.sql.exec("SELECT 1 FROM projects WHERE repo = ? AND id != ?", n, project).toArray().length) return false;
+    return this.sql.exec("UPDATE projects SET repo = ?, repo_name = NULL WHERE id = ? AND repo_name = ?", n, project, n).rowsWritten > 0;
   }
 
   /** nest's GitHub App's id, as nest's token answer (`app_id`) or a check run it made (`app.id`) last told it; null until one has. */

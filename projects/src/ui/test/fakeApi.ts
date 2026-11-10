@@ -5,7 +5,7 @@
 import { factsOf, step, type TaskEvent } from "../../tasks";
 import type { Issue, SecretRequest, SecretsAnswer } from "../api/types";
 import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
-import type { Note, Proposal, Routine, RoutineRun } from "../api/types";
+import type { Note, Proposal, RepoBinding, RereadBinding, Routine, RoutineRun } from "../api/types";
 import { PRESETS } from "../../routines";
 
 export interface Write {
@@ -68,6 +68,10 @@ export class FakeApi {
   chat: ChatMessage[] = [];
   asks: Ask[] = [];
   sync: SyncState | null = null;
+  /** Each project's repo binding (README.md#the-repos-binding). */
+  bindings: RepoBinding[] = [];
+  /** What the Worker's re-read answers for a binding: by default, GitHub's id as it is. */
+  reread: (b: RepoBinding) => RereadBinding | { error: string; binding: RepoBinding } = (b) => ({ binding: b, changed: false, previous_id: b.repo_id, rename: null });
   reviews: Job[] = [];
   /** PRs past the review queue's limits, with no job yet. */
   reviewBacklog = 0;
@@ -162,6 +166,13 @@ export class FakeApi {
   private route(m: string, parts: string[], body: any): Response {
     if (parts[0] === "admin") {
       if (parts[1] === "sync-state") return json(this.sync);
+      if (parts[1] === "bindings" && !parts[2]) return json(this.bindings);
+      if (parts[1] === "bindings" && parts[2]) {
+        const b = this.bindings.find((x) => x.project === parts[2]);
+        if (!b) return json({ error: "unknown project" }, 404);
+        const r = this.reread(b);
+        return "error" in r ? json(r, 409) : json(r);
+      }
       this.sync = { written: ["templates/projects/manager"], repos: this.projects.map((p) => p.repo), at_ms: now };
       return json({ written: this.sync.written, repos: this.sync.repos });
     }

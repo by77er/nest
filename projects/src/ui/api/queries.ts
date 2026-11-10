@@ -24,6 +24,7 @@ export const keys = {
   memory: (id: string) => ["projects", id, "memory"] as const,
   issues: (id: string) => ["projects", id, "issues"] as const,
   syncState: ["admin", "sync-state"] as const,
+  bindings: ["admin", "bindings"] as const,
 };
 
 /** How often each live view polls, in ms. */
@@ -415,7 +416,20 @@ export function useSync() {
   return useMutation({
     mutationFn: api.sync,
     meta: { inline: true },
-    onSettled: () => qc.invalidateQueries({ queryKey: keys.syncState }),
+    // A sync reads the repos' bindings too (README.md#the-repos-binding).
+    onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: keys.syncState }), qc.invalidateQueries({ queryKey: keys.bindings })]),
+  });
+}
+
+export const useBindings = () => useQuery({ queryKey: keys.bindings, queryFn: api.bindings });
+
+/** The operator's re-read of a project's repo binding: the bindings, and the projects (a rename) move. */
+export function useRereadBinding() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.rereadBinding(id),
+    meta: { inline: true },
+    onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: keys.bindings }), qc.invalidateQueries({ queryKey: keys.projects }), qc.invalidateQueries({ queryKey: keys.syncState })]),
   });
 }
 

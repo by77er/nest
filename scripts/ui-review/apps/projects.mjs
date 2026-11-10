@@ -634,6 +634,8 @@ const app = {
     { name: "projects-error", section: "top", path: "/projects", fixture: "error", httpErrors: true, ready: shown("[data-ds=error]") },
     { name: "new-project", section: "top", path: "/projects", full: false, after: (p) => p.getByRole("button", { name: "New project" }).first().click() },
     { name: "admin", section: "top", path: "/admin" },
+    // The repo bindings' Re-read and what it says (README.md#the-repos-binding).
+    { name: "admin-reread", section: "top", path: "/admin", full: false, after: (p) => p.getByRole("button", { name: "Re-read Gadgets's repo from GitHub" }).click() },
     { name: "board", section: "project", path: "/projects/prj_demo/board", check: sixColumns, checkName: "board-columns" },
     { name: "board-long", section: "project", path: "/projects/prj_demo/board", fixture: "long" },
     { name: "board-needs-you-all", section: "project", path: "/projects/prj_demo/board", after: (p) => p.getByRole("button", { name: /Show all/ }).click() },
