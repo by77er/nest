@@ -18,6 +18,7 @@ import type { Issue, Settings } from "../../api/types";
 import { issuesFromWho, names } from "./words";
 import { ago, exact } from "../../common/time";
 import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
+import { AnchorLink } from "../../common/links";
 import { MAX_UNTRIAGED_ISSUES } from "../../../issues";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ProposalsSection } from "../routines/ProposalsSection";
@@ -141,8 +142,28 @@ export function importText(r: { imported: number; ignored: number; dropped: numb
 export function issuesCaption(s: Settings | null): string {
   if (!s || s.issues_from === "anyone") return "The repo's issues, anyone's, as they're opened: accept each as a draft task, or decline it.";
   const who = issuesFromWho(s);
-  if (!who.length) return "No one's issues come in yet: set the PR comments user in Settings, or choose Anyone under Triage there.";
+  // No one counts yet: said in a Notice beside it (`NoOneYet`), with the way to Settings.
+  if (!who.length) return "Issues opened by the PR comments user or the repo's owner, as they're opened: accept each as a draft task, or decline it.";
   return `Issues opened by ${names(who)}, as they're opened: accept each as a draft task, or decline it.`;
+}
+
+/**
+ * No one's issues come in (an organization's repo with no PR comments user): as loud as Settings says it,
+ * with the way there (its Triage panel).
+ */
+function NoOneYet({ projectId }: { projectId: string }) {
+  return (
+    <Notice tone="warning" title="No one's issues come in yet" role="status">
+      <Stack gap="sm" align="flex-start">
+        <Text fz="sm">
+          Only issues opened by the PR comments user or the repo&apos;s owner come in, and this repo has neither (an organization owns it). Set the PR comments user, or choose Anyone under Issues from.
+        </Text>
+        <Button variant="default" renderRoot={(props) => <AnchorLink {...props} to="/projects/$projectId/settings" params={{ projectId }} hash="triage" />}>
+          Open Settings
+        </Button>
+      </Stack>
+    </Notice>
+  );
 }
 
 export function TriagePage() {
@@ -174,6 +195,7 @@ export function TriagePage() {
               <Text fz="sm" c="dimmed">
                 {issuesCaption(settings)} Their text is shown as it is, and no agent reads it until you accept it.
               </Text>
+              {settings && settings.issues_from !== "anyone" && !issuesFromWho(settings).length && <NoOneYet projectId={projectId} />}
               {dropped && (
                 <Notice tone="warning" title={`${dropped.count === 1 ? "1 issue" : `${dropped.count} issues`} left out`} role="status">
                   Triage holds at most {MAX_UNTRIAGED_ISSUES} issues waiting, so {dropped.count === 1 ? "it wasn't" : "they weren't"} brought in (the last {ago(dropped.last_ms)}). Accept or decline some, then Import open issues to bring the rest in.

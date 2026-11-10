@@ -113,8 +113,28 @@ describe("the Triage page", () => {
   it("names whose issues come in, or says no one's do yet and what to do", () => {
     const base = project().settings!;
     expect(issuesCaption({ ...base, comments_from: { id: 2, login: null } })).toMatch(/^Issues opened by user 2 and owner,/);
-    expect(issuesCaption({ ...base, comments_from: null, repo_owner: null })).toBe("No one's issues come in yet: set the PR comments user in Settings, or choose Anyone under Triage there.");
+    // No one counts: the caption says the rule; the Notice (below) says no one's do yet.
+    expect(issuesCaption({ ...base, comments_from: null, repo_owner: null })).toMatch(/^Issues opened by the PR comments user or the repo's owner,/);
     expect(issuesCaption({ ...base, comments_from: null, repo_owner: null, issues_from: "anyone" })).toMatch(/^The repo's issues, anyone's/);
+  });
+
+  it("when no one's issues come in, a warning Notice says so, with the way to Settings' Triage panel; not when someone's do", async () => {
+    const api = new FakeApi();
+    api.projects[0]!.settings = { ...api.projects[0]!.settings!, comments_from: null, repo_owner: null };
+    const view = renderApp("/projects/prj_one/triage", api);
+    const notice = await screen.findByRole("status", { name: "No one's issues come in yet" });
+    expect(notice).toHaveTextContent("Set the PR comments user, or choose Anyone under Issues from.");
+    expect(within(notice).getByRole("link", { name: "Open Settings" })).toHaveAttribute("href", "/projects/prj_one/settings#triage");
+    view.unmount();
+    // Someone's do (the default fake's owner), or anyone's: no Notice.
+    renderApp("/projects/prj_one/triage", new FakeApi());
+    await screen.findByText(/^Issues opened by owner/);
+    expect(screen.queryByRole("status", { name: "No one's issues come in yet" })).toBeNull();
+    const anyone = new FakeApi();
+    anyone.projects[0]!.settings = { ...anyone.projects[0]!.settings!, comments_from: null, repo_owner: null, issues_from: "anyone" };
+    renderApp("/projects/prj_one/triage", anyone);
+    await screen.findAllByText(/^The repo's issues, anyone's/);
+    expect(screen.queryByRole("status", { name: "No one's issues come in yet" })).toBeNull();
   });
 
   it("an import says what it left out", async () => {

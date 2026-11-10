@@ -95,6 +95,8 @@ describe("who 'you' is for issues", () => {
     const b = await openSettings(none);
     expect((within(b.dialog).getAllByLabelText("Issues from").find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden") as HTMLInputElement).value).toBe("You only (no one yet)");
     expect(b.dialog.querySelector("[data-slot=issues-no-one]")).toHaveTextContent("No one yet: set the PR comments user, or choose Anyone.");
+    // The Triage page's Notice links to this panel.
+    expect(b.dialog.querySelector("#triage")).toHaveTextContent("Issues from");
   });
 });
 

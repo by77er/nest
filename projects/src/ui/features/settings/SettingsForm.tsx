@@ -210,7 +210,8 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
               </CommentsFrom>
             </Section>
           </Panel>
-          <Panel>
+          {/* The Triage page's "No one's issues come in yet" links here. */}
+          <Panel id="triage">
             <Section title="Triage" order={4} region={false}>
               <FieldGroup>
                 <Select
