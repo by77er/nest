@@ -5,9 +5,9 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { Issue, Proposal } from "../../api/types";
-import { FakeApi, task } from "../../test/fakeApi";
+import { FakeApi, project, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
-import { importText } from "./TriagePage";
+import { importText, issuesCaption } from "./TriagePage";
 import { triageSource, triageWaits } from "./words";
 
 const now = Date.now();
@@ -98,7 +98,7 @@ describe("the Triage page", () => {
     const api = new FakeApi();
     api.issues = [issue()];
     const view = renderApp("/projects/prj_one/triage", api);
-    expect(await screen.findByText(/^Issues opened by you \(the PR comments user or the repo's owner\), as they're opened/)).toBeInTheDocument();
+    expect(await screen.findByText(/^Issues opened by owner, as they're opened/)).toBeInTheDocument();
     expect(screen.queryByText(/left out/)).toBeNull();
     view.unmount();
     const busy = new FakeApi();
@@ -108,6 +108,13 @@ describe("the Triage page", () => {
     expect(await screen.findByText(/^The repo's issues, anyone's, as they're opened/)).toBeInTheDocument();
     const notice = await screen.findByRole("status", { name: "3 issues left out" });
     expect(notice).toHaveTextContent("Triage holds at most 200 issues waiting, so they weren't brought in (the last 10 minutes ago). Accept or decline some, then Import open issues to bring the rest in.");
+  });
+
+  it("names whose issues come in, or says no one's do yet and what to do", () => {
+    const base = project().settings!;
+    expect(issuesCaption({ ...base, comments_from: { id: 2, login: null } })).toMatch(/^Issues opened by user 2 and owner,/);
+    expect(issuesCaption({ ...base, comments_from: null, repo_owner: null })).toBe("No one's issues come in yet: set the PR comments user in Settings, or choose Anyone under Triage there.");
+    expect(issuesCaption({ ...base, comments_from: null, repo_owner: null, issues_from: "anyone" })).toMatch(/^The repo's issues, anyone's/);
   });
 
   it("an import says what it left out", async () => {

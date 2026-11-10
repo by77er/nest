@@ -14,3 +14,18 @@ export function triageSource(issues: number, proposals: number): string {
   if (issues && proposals) return "Issues and routines' proposals";
   return proposals ? "Routines' proposals" : "The repo's issues";
 }
+
+/**
+ * Who "you" is for whose issues come into triage (README.md#triage): the PR comments user and the repo's
+ * owner (a person's repo), by login (or id, when no login was seen), each once. Empty: no one yet (an
+ * organization's repo with no comments user set).
+ */
+export function issuesFromWho(s: { comments_from: { id: number; login: string | null } | null; repo_owner: { id: number; login: string } | null }): string[] {
+  const who: { id: number; name: string }[] = [];
+  if (s.comments_from) who.push({ id: s.comments_from.id, name: s.comments_from.login ?? `user ${s.comments_from.id}` });
+  if (s.repo_owner && !who.some((w) => w.id === s.repo_owner!.id)) who.push({ id: s.repo_owner.id, name: s.repo_owner.login });
+  return who.map((w) => w.name);
+}
+
+/** "by77er", "by77er and alice". */
+export const names = (who: string[]) => (who.length > 1 ? `${who.slice(0, -1).join(", ")} and ${who.at(-1)}` : (who[0] ?? ""));

@@ -866,6 +866,9 @@ const app = {
     { name: "settings-comments-set", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-set" },
     // Whose issues come into triage: anyone's (README.md#triage).
     { name: "settings-issues-anyone", section: "project", path: "/projects/prj_demo/settings", fixture: "issues-anyone" },
+    // No one's issues come in yet (an org's repo, no comments user): said, with what to do.
+    { name: "settings-issues-no-one", section: "project", path: "/projects/prj_demo/settings", fixture: "issues-no-one" },
+    { name: "triage-issues-no-one", section: "project", path: "/projects/prj_demo/triage", fixture: "issues-no-one" },
     // The models (README.md#models): a custom id shown with its field; the list open.
     { name: "settings-models-custom", section: "project", path: "/projects/prj_demo/settings", fixture: "models-custom" },
     { name: "settings-models-open", section: "project", path: "/projects/prj_demo/settings", full: false, after: async (p) => { const f = p.getByLabel("Manager's model").first(); await f.scrollIntoViewIfNeeded(); await f.click(); } },

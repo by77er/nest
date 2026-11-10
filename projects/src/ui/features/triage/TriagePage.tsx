@@ -14,7 +14,8 @@ import { useParams } from "@tanstack/react-router";
 import { useId, useRef, useState } from "react";
 import { useAcceptIssue, useDeclineIssue, useImportIssues, useIssues, useProject, useProposals } from "../../api/queries";
 import { ApiError } from "../../api/client";
-import type { Issue } from "../../api/types";
+import type { Issue, Settings } from "../../api/types";
+import { issuesFromWho, names } from "./words";
 import { ago, exact } from "../../common/time";
 import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
 import { MAX_UNTRIAGED_ISSUES } from "../../../issues";
@@ -136,6 +137,14 @@ export function importText(r: { imported: number; ignored: number; dropped: numb
   return `${parts.join("; ")}.`;
 }
 
+/** Whose issues come in, by name (README.md#triage), as the page's caption says it. */
+export function issuesCaption(s: Settings | null): string {
+  if (!s || s.issues_from === "anyone") return "The repo's issues, anyone's, as they're opened: accept each as a draft task, or decline it.";
+  const who = issuesFromWho(s);
+  if (!who.length) return "No one's issues come in yet: set the PR comments user in Settings, or choose Anyone under Triage there.";
+  return `Issues opened by ${names(who)}, as they're opened: accept each as a draft task, or decline it.`;
+}
+
 export function TriagePage() {
   const { projectId } = useParams({ from: "/projects/$projectId/triage" });
   const issues = useIssues(projectId);
@@ -163,7 +172,7 @@ export function TriagePage() {
           >
             <Stack gap="lg">
               <Text fz="sm" c="dimmed">
-                {settings?.issues_from === "anyone" ? "The repo's issues, anyone's," : "Issues opened by you (the PR comments user or the repo's owner),"} as they&apos;re opened: accept each as a draft task, or decline it. Their text is shown as it is, and no agent reads it until you accept it.
+                {issuesCaption(settings)} Their text is shown as it is, and no agent reads it until you accept it.
               </Text>
               {dropped && (
                 <Notice tone="warning" title={`${dropped.count === 1 ? "1 issue" : `${dropped.count} issues`} left out`} role="status">
