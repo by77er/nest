@@ -1,13 +1,16 @@
 // The API's shapes, taken from the Worker's own modules by type only: nothing here reaches the bundle.
 
-import type { HistoryRow, Settings, Task } from "../../do/project";
+import type { HistoryRow, Settings as ProjectSettings, Task } from "../../do/project";
 import type { ProjectRow } from "../../do/directory";
 
-export type { Ask, ChatMessage, HistoryRow, Settings, Task } from "../../do/project";
+export type { Ask, ChatMessage, HistoryRow, Task } from "../../do/project";
+/** A project's settings as the API answers them: ProjectDO's, with ReviewDO's `untrusted_reviews` (README.md#the-review-gate; `hold` when absent). */
+export type Settings = ProjectSettings & { untrusted_reviews?: "hold" | "review" };
 export type { ProjectRow, SyncState } from "../../do/directory";
 export type { PutSecretBody } from "../../requests";
 export type { AddDependencyBody, AttachPrBody, AnswerBody, CancelBody, ChatBody, CreateProjectBody, CreateTaskBody, SettingsBody, UpdateTaskBody } from "../../requests";
 export type { Spec, TaskState } from "../../tasks";
+export type { OutboxState } from "../../outbox";
 export type { ManagerPhase, ManagerStatus } from "../../manager";
 export type { Job, JobState } from "../../do/review";
 export type { Dimension, Verdict } from "../../github";
@@ -16,7 +19,12 @@ export type { Dimension, Verdict } from "../../github";
 export type Project = ProjectRow & { settings: Settings };
 /** A row of the projects list: with `needs_you`, how many asks and blocked tasks wait on the owner. */
 export type ListedProject = ProjectRow & { needs_you: number };
-export type { Attention, Blocked, Issue, SecretRequest, SecretView, TaskIssue, TaskPr, TaskRef } from "../../do/project";
+export type { Blocked, Issue, SecretRequest, SecretView, TaskIssue, TaskPr, TaskRef } from "../../do/project";
+/** One thing waiting on the owner: ProjectDO's (asks, blocked tasks, secret requests, triage), or a review held for approval (README.md#the-review-gate). */
+export type Attention = import("../../do/project").Attention
+  | { kind: "review"; pr: number; sha: string; title: string | null; author: string | null; fork: boolean; at_ms: number }
+  // PRs from authors the project doesn't trust that got no review job yet: too many already wait.
+  | { kind: "review_backlog"; count: number; at_ms: number };
 export type { AcceptIssueBody, DeclineIssueBody } from "../../requests";
 export type { SecretGrant, SecretLocation, SecretRole } from "../../secrets";
 /** `GET /api/projects/:id/secrets`: the project's secrets with nest's facts, and the grant's limits. */
@@ -63,6 +71,8 @@ export interface NetworkView {
   agents: import("../../do/project").LayerStatus[];
   egress_hosts: string[] | null;
   base: import("../../network").OperatorRule[] | null;
+  /** Agents nest refused to stop (README.md#outboxes): they may still be running. */
+  failed_stops: import("../../do/project").FailedStop[];
 }
 
 // Routines and memory (README.md#routines, README.md#memory).

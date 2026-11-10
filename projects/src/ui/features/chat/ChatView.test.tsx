@@ -1,6 +1,6 @@
 // The chat with the manager, on its own page (/projects/:id/manager): the log as the Worker keeps it,
 // undelivered messages flagged with why, and the composer posting the owner's words.
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { exact } from "../../common/time";
 import { FakeApi } from "../../test/fakeApi";
@@ -29,16 +29,21 @@ function traceSocket(events: object[]) {
     close() {}
   };
 }
-/** The same, but each message in a tick of its own (React renders between them), as a real socket's backlog. */
-function slowTraceSocket(events: object[], gapMs = 15) {
-  return class {
-    private listeners: Record<string, ((e: { data?: string }) => void)[]> = {};
+/**
+ * A trace socket the test drives: `push` delivers messages when the test says, each push rendered before
+ * the next, so a state that lasts only between two events (a call running, a replay looking live) is seen
+ * for certain. (A socket replaying on timers raced the renders under load: a 60 ms window could pass
+ * between two renders and never be shown.)
+ */
+function drivenTraceSocket() {
+  let socket: { listeners: Record<string, ((e: { data?: string }) => void)[]> } | null = null;
+  class Socket {
+    listeners: Record<string, ((e: { data?: string }) => void)[]> = {};
     constructor(readonly url: string) {
-      const all = [...events, { type: "live" }];
+      socket = this;
       setTimeout(() => this.emit("open", {}), 0);
-      all.forEach((e, i) => setTimeout(() => this.emit("message", { data: JSON.stringify(e) }), (i + 1) * gapMs));
     }
-    private emit(type: string, e: { data?: string }) {
+    emit(type: string, e: { data?: string }) {
       for (const l of this.listeners[type] ?? []) l(e);
     }
     addEventListener(type: string, l: (e: { data?: string }) => void) {
@@ -47,11 +52,19 @@ function slowTraceSocket(events: object[], gapMs = 15) {
     removeEventListener() {}
     send() {}
     close() {}
+  }
+  const push = async (...events: object[]) => {
+    // The page is listening (its trace hook has subscribed), then the messages arrive in one render.
+    await waitFor(() => expect(socket?.listeners.message?.length).toBeGreaterThan(0));
+    act(() => {
+      for (const e of events) for (const l of socket!.listeners.message ?? []) l({ data: JSON.stringify(e) });
+    });
   };
+  return { Socket, push };
 }
 let seq = 0;
 const ev = (type: string, more: Record<string, unknown> = {}) => ({ seq: ++seq, ts_ms: Date.now(), type, turn: "trn_9", ...more });
-const msgs = (n: number, from = 1) => Array.from({ length: n }, (_, k) => ({ seq: from + k, at_ms: Date.now() - (n - k) * 1000, sender: k % 2 ? "manager" : "owner", text: `Message ${from + k}`, delivered: true, error: null }));
+const msgs = (n: number, from = 1) => Array.from({ length: n }, (_, k) => ({ seq: from + k, at_ms: Date.now() - (n - k) * 1000, sender: k % 2 ? "manager" : "owner", text: `Message ${from + k}`, delivered: true, status: "done" as const, error: null }));
 
 afterEach(() => vi.unstubAllGlobals());
 // Drafts are kept per project in the browser: each test starts with none.
@@ -108,8 +121,8 @@ describe("the chat", () => {
     ]));
     const api = new FakeApi();
     api.chat = [
-      { seq: 1, at_ms: Date.now() - 2000, sender: "manager", text: "An older reply, its turn long gone.", delivered: true, error: null },
-      { seq: 2, at_ms: Date.now(), sender: "manager", text: "Three tasks; the push was refused.", delivered: true, error: null },
+      { seq: 1, at_ms: Date.now() - 2000, sender: "manager", text: "An older reply, its turn long gone.", delivered: true, status: "done" as const, error: null },
+      { seq: 2, at_ms: Date.now(), sender: "manager", text: "Three tasks; the push was refused.", delivered: true, status: "done" as const, error: null },
     ];
     const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
@@ -141,29 +154,34 @@ describe("the chat", () => {
   });
 
   it("a turn that ends without a reply (stopped) leaves no stream behind, its calls never left spinning", async () => {
-    vi.stubGlobal("WebSocket", slowTraceSocket([ev("turn_started", { turn: "trn_s" }), ev("tool_call", { turn: "trn_s", call_id: "c1", name: "Bash", input: { command: "sleep 100" } }), ev("turn_completed", { turn: "trn_s", stop_reason: "interrupted" })], 60));
+    const trace = drivenTraceSocket();
+    vi.stubGlobal("WebSocket", trace.Socket);
     renderApp("/projects/prj_one/manager", new FakeApi());
     const c = await chat();
-    // Seen running first (its own tick), then gone once the turn ends with nothing to say.
+    // Seen running first, then gone once the turn ends with nothing to say.
+    await trace.push(ev("turn_started", { turn: "trn_s" }), ev("tool_call", { turn: "trn_s", call_id: "c1", name: "Bash", input: { command: "sleep 100" } }));
     expect(await within(c).findByRole("button", { name: "Bash sleep 100, running" })).toBeInTheDocument();
+    await trace.push(ev("turn_completed", { turn: "trn_s", stop_reason: "interrupted" }));
     await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
   });
 
   it("reopening the chat, a replayed backlog doesn't leave the last turn's stream under its own reply", async () => {
-    vi.stubGlobal("WebSocket", slowTraceSocket([
+    const trace = drivenTraceSocket();
+    vi.stubGlobal("WebSocket", trace.Socket);
+    const api = new FakeApi();
+    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: "Read it.", delivered: true, status: "done" as const, error: null }];
+    renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await within(c).findByText("Read it.");
+    // The replay looks live for a moment (rendered before the turn's end arrives)…
+    await trace.push(
       ev("turn_started", { turn: "trn_r" }),
       ev("tool_call", { turn: "trn_r", call_id: "c1", name: "Read", input: { file_path: "a.ts" } }),
       ev("tool_result", { turn: "trn_r", call_id: "c1", is_error: false, summary: "ok" }),
       ev("assistant_text", { turn: "trn_r", text: "Read it." }),
-      ev("turn_completed", { turn: "trn_r", stop_reason: "end_turn" }),
-    ], 60));
-    const api = new FakeApi();
-    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: "Read it.", delivered: true, error: null }];
-    renderApp("/projects/prj_one/manager", api);
-    const c = await chat();
-    await within(c).findByText("Read it.");
-    // The replay looks live for a moment (its own ticks)…
+    );
     await waitFor(() => expect(c.querySelector("[data-sender=stream]")).not.toBeNull());
+    await trace.push(ev("turn_completed", { turn: "trn_r", stop_reason: "end_turn" }), { type: "live" });
     // …then the turn is the reply's, behind it, once.
     expect(await within(c).findByRole("button", { name: "Used 1 tool" })).toBeInTheDocument();
     await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
@@ -273,7 +291,7 @@ describe("the chat", () => {
     expect(box).toHaveValue("First line\nsecond line");
     expect(api.writes).toEqual([]);
     await user.type(box, "{Enter}");
-    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/chat", body: { text: "First line\nsecond line" } }]));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/chat", body: { text: "First line\nsecond line", request_id: expect.any(String) } }]));
     expect(box).toHaveValue("");
     // Enter on an empty composer sends nothing.
     await user.type(box, "{Enter}");
@@ -319,6 +337,37 @@ describe("the chat", () => {
     }
   });
 
+  it("a manager that ended says so at the composer on a phone, with Restart, and offers no Stop even with a turn's stream left", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(max-width: 48em)", media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => false }));
+    vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Half a thought" })]));
+    const api = new FakeApi();
+    api.manager = { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited)." };
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    const down = await waitFor(() => {
+      const el = c.querySelector("[data-slot=manager-down]");
+      if (!el) throw new Error("not yet");
+      return el as HTMLElement;
+    });
+    expect(down).toHaveTextContent("The manager isn't running");
+    expect(within(c).queryByRole("button", { name: "Stop" })).toBeNull();
+    await user.click(within(down).getByRole("button", { name: "Restart manager" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/manager/restart", body: undefined }]));
+    await waitFor(() => expect(c.querySelector("[data-slot=manager-down]")).toBeNull());
+  });
+
+  it("wider than a phone, an ended manager's composer has no second Restart (the page's notice has it), and still no Stop", async () => {
+    vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Half a thought" })]));
+    const api = new FakeApi();
+    api.manager = { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited)." };
+    renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await screen.findByRole("alert", { name: /isn't running/ });
+    expect(c.querySelector("[data-slot=manager-down]")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Restart manager" })).toHaveLength(1);
+    expect(within(c).queryByRole("button", { name: "Stop" })).toBeNull();
+  });
+
   it("with no turn running there's no stream and no Stop", async () => {
     vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Done." }), ev("turn_completed", { stop_reason: "end_turn" })]));
     renderApp("/projects/prj_one/manager", new FakeApi());
@@ -328,22 +377,24 @@ describe("the chat", () => {
     expect(c.querySelector("[data-sender=stream]")).toBeNull();
   });
 
-  it("a message's exact time is in its actions (hover shows it too), so the keyboard and touch reach it", async () => {
+  // Whatever the message's age: under a week its time line is relative, past it the line is the exact time
+  // itself (so the text is on the page twice: the test reads the actions' own copy, in the menu).
+  it.each([["three hours old", 3 * 3_600_000], ["a month old", 30 * 86_400_000]])("a message's exact time is in its actions (hover shows it too), so the keyboard and touch reach it: %s", async (_age, ageMs) => {
     const api = new FakeApi();
-    const at = new Date(2026, 10, 2, 9, 30).getTime();
-    api.chat = [{ seq: 1, at_ms: at, sender: "manager", text: "Hello", delivered: true, error: null }];
+    const at = Date.now() - ageMs;
+    api.chat = [{ seq: 1, at_ms: at, sender: "manager", text: "Hello", delivered: true, status: "done" as const, error: null }];
     const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
     await within(c).findByText("Hello");
     // The time line isn't a tab stop of its own.
     expect(c.querySelector("time")).not.toHaveAttribute("tabindex");
     await user.click(within(c).getByRole("button", { name: "Message actions" }));
-    expect(await screen.findByText(exact(at))).toBeInTheDocument();
+    expect(within(await screen.findByRole("menu")).getByText(exact(at))).toBeInTheDocument();
   });
 
   it("\"Quote in a reply\" quotes into the composer and puts focus there, the caret at the end", async () => {
     const api = new FakeApi();
-    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: "Line one\nLine two", delivered: true, error: null }];
+    api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: "Line one\nLine two", delivered: true, status: "done" as const, error: null }];
     const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
     await within(c).findByText(/Line one/);
@@ -366,7 +417,7 @@ describe("the chat", () => {
     expect(api.writes).toEqual([]);
     expect(within(c).queryByText(/Enter to send/)).toBeNull();
     await user.click(within(c).getByRole("button", { name: "Send" }));
-    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/chat", body: { text: "First line\nsecond line" } }]));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/chat", body: { text: "First line\nsecond line", request_id: expect.any(String) } }]));
   });
 
   it("a chat that can't be loaded shows why, and no turn streaming under it", async () => {
@@ -418,24 +469,35 @@ describe("the chat", () => {
     await waitFor(() => expect(screen.queryByLabelText(/unread message/)).toBeNull());
   });
 
-  it("shows the manager's replies and flags only the owner's undelivered messages, with the reason", async () => {
+  it("flags only the owner's failed messages as not delivered, with the reason and Retry; one still being retried says so, with no Retry (B9)", async () => {
     const api = new FakeApi();
     api.chat = [
-      { seq: 1, at_ms: 1, sender: "owner", text: "Plan the widgets", delivered: true, error: null },
-      { seq: 2, at_ms: 2, sender: "manager", text: "Three tasks, coming up", delivered: true, error: null },
-      { seq: 3, at_ms: 3, sender: "owner", text: "And a fourth", delivered: false, error: "the manager isn't started yet" },
-      { seq: 4, at_ms: 4, sender: "app", text: "The manager ended (exited).", delivered: true, error: null },
+      { seq: 1, at_ms: 1, sender: "owner", text: "Plan the widgets", delivered: true, status: "done" as const, error: null },
+      { seq: 2, at_ms: 2, sender: "manager", text: "Three tasks, coming up", delivered: true, status: "done" as const, error: null },
+      { seq: 3, at_ms: 3, sender: "owner", text: "And a fourth", delivered: false, status: "retrying" as const, error: "the manager isn't started yet" },
+      { seq: 4, at_ms: 4, sender: "app", text: "The manager ended (exited).", delivered: true, status: "done" as const, error: null },
+      { seq: 5, at_ms: 5, sender: "owner", text: "Are you there?", delivered: false, status: "failed" as const, error: "nest 409 ended: the agent has ended" },
     ];
-    renderApp("/projects/prj_one/manager", api);
+    const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
 
     await within(c).findByText("Three tasks, coming up");
     const flagged = c.querySelectorAll('[data-marker="undelivered"]');
     expect(flagged).toHaveLength(1);
-    const msg = flagged[0]!.closest("[data-sender]")!;
-    expect(msg).toHaveTextContent("And a fourth");
-    expect(msg).toHaveTextContent("the manager isn't started yet");
+    const failed = flagged[0]!.closest("[data-sender]") as HTMLElement;
+    expect(failed).toHaveTextContent("Are you there?");
+    expect(failed).toHaveTextContent("the agent has ended");
     expect(flagged[0]!.getAttribute("style")).toContain("--mantine-color-warning-");
+    // Still being sent: said, with why, and nothing to retry.
+    const retrying = within(c).getByText("And a fourth").closest("[data-sender]") as HTMLElement;
+    expect(retrying).toHaveTextContent("Retrying…");
+    expect(retrying).toHaveTextContent("the manager isn't started yet");
+    expect(within(retrying).queryByRole("button", { name: "Retry" })).toBeNull();
+    // Retry on the failed one asks the server to send it again: no second message.
+    await user.click(within(failed).getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/chat/5/retry", body: undefined }]));
+    await waitFor(() => expect(c.querySelectorAll('[data-marker="undelivered"]')).toHaveLength(0));
+    expect(api.chat.filter((m) => m.text === "Are you there?")).toHaveLength(1);
   });
 
   it("sends what the owner wrote, trimmed, and clears the composer", async () => {
@@ -448,7 +510,7 @@ describe("the chat", () => {
     await user.type(box, "  Spec the first task  ");
     await user.click(within(c).getByRole("button", { name: "Send" }));
 
-    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/chat", body: { text: "Spec the first task" } }]));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/chat", body: { text: "Spec the first task", request_id: expect.stringMatching(/^[a-f0-9]{32}$/) } }]));
     expect(box).toHaveValue("");
     expect(await within(c).findByText("Spec the first task")).toBeInTheDocument();
   });
@@ -469,10 +531,26 @@ describe("the chat", () => {
     expect(screen.queryByText("That didn't work")).toBeNull();
     expect(screen.queryByText("The message wasn't sent")).toBeNull();
     expect(box).toHaveValue("");
-    // Retry sends it again (the failure was once); taken, it's an ordinary message.
+    // Retry sends it again (the failure was once), under the same request id; taken, it's an ordinary message.
     await user.click(within(row).getByRole("button", { name: "Retry" }));
     await waitFor(() => expect(api.writes.filter((w) => w.method === "POST" && w.path.endsWith("/chat"))).toHaveLength(2));
+    const [first, second] = api.writes.filter((w) => w.path.endsWith("/chat")).map((w) => (w.body as { request_id?: string }).request_id);
+    expect(second).toBe(first);
     await waitFor(() => expect(within(c).queryByText(/not delivered/i)).toBeNull());
     expect(within(c).getByText("Hello")).toBeInTheDocument();
+  });
+
+  it("a post whose answer is lost, retried, is one message (the server knows its request id)", async () => {
+    const api = new FakeApi();
+    // Taken by the server, its answer lost on the way back.
+    api.loseAnswer(/^POST .*\/chat$/);
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await user.type(within(c).getByLabelText("Message to the manager"), "Once only{Control>}{Enter}{/Control}");
+    const row = (await within(c).findByText(/not delivered/i)).closest("[data-sender=owner]") as HTMLElement;
+    await user.click(within(row).getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(within(c).queryByText(/not delivered/i)).toBeNull());
+    expect(api.chat.filter((m) => m.text === "Once only")).toHaveLength(1);
+    await waitFor(() => expect(within(c).getAllByText("Once only")).toHaveLength(1));
   });
 });

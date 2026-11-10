@@ -4,8 +4,10 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
-import { REPO } from "../requests";
+import { CreateProject, REPO } from "../requests";
 import { fail, migrate, ok, type Result } from "../sql";
+import { type OutboxPolicy, outboxStep, verdict } from "../outbox";
+import { type CreateSpec, finishProject } from "../creation";
 import type { Role } from "../tools";
 
 export interface ProjectRow {
@@ -13,6 +15,8 @@ export interface ProjectRow {
   name: string;
   repo: string;
   created_ms: number;
+  /** `pending` until creating it is finished (README.md#creating-a-project): its routes answer 503 until then. */
+  state: "pending" | "ready";
 }
 
 /** The last catalog sync that succeeded: what it wrote, for which repos, and when. */
@@ -47,7 +51,22 @@ const MIGRATIONS = [
     // whose handler died lapses after CLAIM_LAPSE_MS, so a redelivery is handled.
     "ALTER TABLE seen ADD COLUMN pending INTEGER NOT NULL DEFAULT 0",
   ],
+  [
+    // A project being created (README.md#creating-a-project): its create's body while pending (null once
+    // ready), and when the alarm resumes it, as an outbox row (src/outbox.ts).
+    "ALTER TABLE projects ADD COLUMN pending TEXT",
+    "ALTER TABLE projects ADD COLUMN next_ms INTEGER",
+    "ALTER TABLE projects ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE projects ADD COLUMN error TEXT",
+  ],
 ] as const;
+
+/** How long the Worker has to finish a create before the alarm takes it over. */
+export const CREATE_GRACE_MS = 60_000;
+/** A create is resumed this many times before the project is removed (its repo free again). */
+export const CREATE_POLICY: OutboxPolicy = { maxAttempts: 8 };
+
+const COLUMNS = "id, name, repo, created_ms, CASE WHEN pending IS NULL THEN 'ready' ELSE 'pending' END AS state";
 
 /** How long a claim stays taken without its handler confirming it (`markSeen`). */
 export const CLAIM_LAPSE_MS = 5 * 60_000;
@@ -62,28 +81,87 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.ctx.storage.sql;
   }
 
-  /** Record a project for `repo` (one project per repo, compared without case). */
-  async createProject(r: { name: string; repo: string }): Promise<Result<ProjectRow>> {
+  /**
+   * Record a project for `repo` (one project per repo, compared without case), pending until its create is
+   * finished (`creationDone`); the alarm takes the create over if the Worker doesn't finish it. The same
+   * repo asked for again while pending is that project: its create is resumed, not refused.
+   */
+  async createProject(r: { name: string; repo: string }, spec?: CreateSpec): Promise<Result<ProjectRow>> {
     if (!REPO.test(r.repo) || /\.git$/i.test(r.repo)) return fail(400, "repo is owner/name");
     const repo = r.repo.toLowerCase();
-    const taken = this.sql.exec<{ id: string }>("SELECT id FROM projects WHERE repo = ?", repo).toArray()[0];
+    const taken = this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS} FROM projects WHERE repo = ?`, repo).toArray()[0];
+    if (taken?.state === "pending") return ok(taken);
     if (taken) return fail(409, `${repo} is already project ${taken.id}`);
-    const row: ProjectRow = { id: `prj_${randomId()}`, name: r.name, repo, created_ms: Date.now() };
-    this.sql.exec("INSERT INTO projects (id, name, repo, created_ms) VALUES (?, ?, ?, ?)", row.id, row.name, row.repo, row.created_ms);
+    const row: ProjectRow = { id: `prj_${randomId()}`, name: r.name, repo, created_ms: Date.now(), state: "pending" };
+    const due = Date.now() + CREATE_GRACE_MS;
+    this.sql.exec("INSERT INTO projects (id, name, repo, created_ms, pending, next_ms) VALUES (?, ?, ?, ?, ?, ?)",
+      row.id, row.name, row.repo, row.created_ms, JSON.stringify(spec ?? { name: r.name, repo }), due);
+    await this.armCreates();
     return ok(row);
   }
 
+  /** The create is finished: the project is ready. */
+  async creationDone(id: string): Promise<void> {
+    this.sql.exec("UPDATE projects SET pending = NULL, next_ms = NULL, error = NULL WHERE id = ?", id);
+  }
+
+  /**
+   * A step of the create failed (the Worker's or the alarm's run): resumed later with backoff; one that
+   * will fail again, or past CREATE_POLICY's attempts, removes the project, so its repo is free again.
+   * Answers whether it's still pending.
+   */
+  async creationFailed(id: string, e: { error: string; permanent: boolean }): Promise<boolean> {
+    const r = this.sql.exec("SELECT next_ms, attempts, error FROM projects WHERE id = ? AND pending IS NOT NULL", id).toArray()[0];
+    if (!r) return false;
+    const st = outboxStep({ next_ms: (r.next_ms as number | null) ?? Date.now(), attempts: r.attempts as number, error: (r.error as string | null) ?? null }, { kind: "failed", ...e }, Date.now(), CREATE_POLICY);
+    if (!st.ok || st.state === "failed") {
+      console.error(`project ${id}: its create couldn't be finished, removed: ${e.error}`);
+      this.sql.exec("DELETE FROM projects WHERE id = ? AND pending IS NOT NULL", id);
+      return false;
+    }
+    this.sql.exec("UPDATE projects SET next_ms = ?, attempts = ?, error = ? WHERE id = ?", st.row.next_ms, st.row.attempts, st.row.error, id);
+    await this.armCreates();
+    return true;
+  }
+
+  private async armCreates(): Promise<void> {
+    const next = this.sql.exec<{ t: number | null }>("SELECT MIN(next_ms) AS t FROM projects WHERE pending IS NOT NULL").one().t;
+    if (next === null) return;
+    const cur = await this.ctx.storage.getAlarm();
+    if (cur === null || next < cur) await this.ctx.storage.setAlarm(Math.max(next, Date.now()));
+  }
+
+  /** Resume each create that's due: the Worker's request failed, or died, before finishing it. */
+  override async alarm(): Promise<void> {
+    for (const r of this.sql.exec("SELECT id, name, repo, created_ms, pending FROM projects WHERE pending IS NOT NULL AND next_ms <= ?", Date.now()).toArray()) {
+      const row: ProjectRow = { id: r.id as string, name: r.name as string, repo: r.repo as string, created_ms: r.created_ms as number, state: "pending" };
+      let spec: CreateSpec;
+      try {
+        spec = CreateProject.parse(JSON.parse(r.pending as string));
+      } catch (e) {
+        await this.creationFailed(row.id, { error: `its create can't be read: ${verdict(e).error}`, permanent: true });
+        continue;
+      }
+      try {
+        await finishProject(this.env, row, spec);
+      } catch (e) {
+        await this.creationFailed(row.id, verdict(e));
+      }
+    }
+    await this.armCreates();
+  }
+
   async projects(): Promise<ProjectRow[]> {
-    return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>("SELECT id, name, repo, created_ms FROM projects ORDER BY created_ms").toArray();
+    return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS} FROM projects ORDER BY created_ms`).toArray();
   }
 
   async getProject(id: string): Promise<ProjectRow | null> {
-    return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>("SELECT id, name, repo, created_ms FROM projects WHERE id = ?", id).toArray()[0] ?? null;
+    return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS} FROM projects WHERE id = ?`, id).toArray()[0] ?? null;
   }
 
   /** The project attached to `repo` (compared without case), if any. */
   async projectByRepo(repo: string): Promise<ProjectRow | null> {
-    return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>("SELECT id, name, repo, created_ms FROM projects WHERE repo = ?", repo.toLowerCase()).toArray()[0] ?? null;
+    return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS} FROM projects WHERE repo = ?`, repo.toLowerCase()).toArray()[0] ?? null;
   }
 
   /** nest's GitHub App's id, as nest's token answer (`app_id`) or a check run it made (`app.id`) last told it; null until one has. */
@@ -95,6 +173,17 @@ export class DirectoryDO extends DurableObject<Env> {
   async recordGithubAppId(id: number): Promise<void> {
     if (!Number.isSafeInteger(id) || id <= 0) return;
     this.sql.exec("INSERT INTO sync (k, v) VALUES ('github_app_id', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", String(id));
+  }
+
+  /** The GitHub id of nest's App's bot account (`<slug>[bot]`), the author of workers' PRs; null until looked up (src/github.ts `appBotId`). */
+  async githubAppBotId(): Promise<number | null> {
+    const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'github_app_bot_id'").toArray()[0];
+    return row ? Number(row.v) : null;
+  }
+
+  async recordGithubAppBotId(id: number): Promise<void> {
+    if (!Number.isSafeInteger(id) || id <= 0) return;
+    this.sql.exec("INSERT INTO sync (k, v) VALUES ('github_app_bot_id', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", String(id));
   }
 
   /** Every project's repo: what the role templates may push to. */

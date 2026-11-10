@@ -183,7 +183,7 @@ export function ErrorState({ title, error, onRetry }: { title: string; error: st
     <Alert color="danger" title={title} role="alert">
       <Stack gap="sm" align="flex-start">
         <Text size="sm">{error}</Text>
-        {onRetry && <Button size="xs" variant="default" onClick={onRetry}>Try again</Button>}
+        {onRetry && <Button size="xs" variant="default" className={classes.touchButton} onClick={onRetry}>Try again</Button>}
       </Stack>
     </Alert>
   );
