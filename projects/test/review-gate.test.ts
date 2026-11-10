@@ -146,6 +146,26 @@ describe("a PR the project doesn't trust is held", () => {
     expect((await job(p, 4, s4)).state).toBe("held");
   });
 
+  it("a stale bot id is looked up again before the App's bot is held; a failed lookup holds, and the next one starts both", async () => {
+    const p = await newProject();
+    const bot = { id: ownerIdOf("nest-test[bot]"), login: "nest-test[bot]", type: "Bot" };
+    const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
+    await dir.recordGithubAppBotId(424_242);
+    // nest's token answer names no App just now: the lookup finds nothing.
+    const app = fake.githubApp;
+    fake.githubApp = null;
+    const s1 = sha();
+    await push(p, 1, s1, "opened", { user: bot });
+    fake.githubApp = app;
+    expect((await job(p, 1, s1)).state).toBe("held");
+    const s2 = sha();
+    await push(p, 2, s2, "opened", { user: bot });
+    expect(going((await job(p, 2, s2)).state)).toBe("going");
+    expect(await dir.githubAppBotId()).toBe(bot.id);
+    // The one held while the id was unknown starts too (re-decided), unasked.
+    expect(going((await job(p, 1, s1)).state)).toBe("going");
+  });
+
   it("the project's opt-out reviews every PR", async () => {
     const p = await newProject();
     const patched = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { untrusted_reviews: "review" });
@@ -211,7 +231,7 @@ describe("the owner's approval is for one head commit", () => {
     expect(reviewers(p)).toEqual([]);
   });
 
-  it("a held PR closed and reopened is held again; one approved before is reviewed again", async () => {
+  it("a held PR closed and reopened is held again; so is one approved before: an approval is for one run", async () => {
     const p = await newProject();
     const s = sha();
     const o = { user: stranger };
@@ -221,9 +241,22 @@ describe("the owner's approval is for one head commit", () => {
     await push(p, 1, s, "reopened", o);
     expect((await job(p, 1, s)).state).toBe("held");
     expect((await approve(p, 1, s)).status).toBe(200);
+    await run(p);
+    expect(reviewers(p)).toHaveLength(1);
+    // An approval is for one run: closing and reopening (or pushing away and back) waits for the owner again.
     await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 1, sha: s, action: "closed", updated_at: later(), ...o }));
     await push(p, 1, s, "reopened", o);
-    expect(going((await job(p, 1, s)).state)).toBe("going");
+    expect(await job(p, 1, s)).toMatchObject({ state: "held", approved_ms: null });
+    const other = sha();
+    await push(p, 1, other, "synchronize", o);
+    expect((await approve(p, 1, other)).status).toBe(200);
+    await push(p, 1, s, "synchronize", o);
+    expect((await job(p, 1, s)).state).toBe("held");
+    await push(p, 1, other, "synchronize", o);
+    expect(await job(p, 1, other)).toMatchObject({ state: "held", approved_ms: null });
+    await run(p);
+    expect(reviewers(p).filter((a) => !a.ended)).toEqual([]);
+    expect(reviewers(p).length).toBeLessThanOrEqual(2);
   });
 
   it("dismissing ends it without a review; GitHub's re-run of the check starts nothing for a held or dismissed job", async () => {
@@ -252,23 +285,120 @@ describe("the owner's approval is for one head commit", () => {
     expect(reviewers(p)).toEqual([]);
   });
 
-  it(`at most ${MAX_HELD} are held: the next untrusted PR gets no job, a trusted one still does`, async () => {
+  /** Fill the project's held slots with other PRs' jobs (each its open PR's head). */
+  const fillHeld = (p: P, n = MAX_HELD) => runInDurableObject(reviews(p), (_i: unknown, st: DurableObjectState) => {
+    for (let k = 1; k <= n; k++) {
+      const s = String(k).padStart(40, "0");
+      st.storage.sql.exec("INSERT INTO jobs (pr, sha, state, needs_approval, fork, created_ms, updated_ms) VALUES (?, ?, 'held', 1, 1, 1, 1)", 1000 + k, s);
+      st.storage.sql.exec("INSERT INTO prs (pr, sha, base, title, updated_at, open) VALUES (?, ?, 'main', 't', '2026-01-01T00:00:00Z', 1)", 1000 + k, s);
+    }
+  });
+  const filler = (k: number) => String(k).padStart(40, "0");
+
+  it(`at most ${MAX_HELD} are held: the next untrusted head waits as overflow (a check saying the queue is full, not in Needs you), approvable, and is held once a slot frees`, async () => {
     const p = await newProject();
-    await runInDurableObject(reviews(p), (_i: unknown, st: DurableObjectState) => {
-      for (let n = 1; n <= MAX_HELD; n++) {
-        st.storage.sql.exec("INSERT INTO jobs (pr, sha, state, created_ms, updated_ms) VALUES (?, ?, 'held', 1, 1)", 1000 + n, String(n).padStart(40, "0"));
-      }
-    });
+    await fillHeld(p);
     const s = sha();
     await push(p, 1, s, "opened", { user: stranger });
-    expect(await job(p, 1, s)).toBeUndefined();
+    await run(p);
+    await run(p);
+    expect(await job(p, 1, s)).toMatchObject({ state: "overflow", approved_ms: null });
+    // Its check says the queue is full; never a passing one.
+    expect(gh.runsOf(p.repo, s)).toHaveLength(1);
+    expect(gh.runsOf(p.repo, s)[0]).toMatchObject({ status: "completed", conclusion: "action_required" });
+    expect(gh.runsOf(p.repo, s)[0]!.output?.title).toMatch(/queue is full/);
+    expect((await attention(p)).some((x) => x.pr === 1)).toBe(false);
+    // A trusted PR isn't the cap's business.
     const s2 = sha();
     await push(p, 2, s2, "opened");
     expect(going((await job(p, 2, s2)).state)).toBe("going");
-    // Room again once one is dismissed.
-    expect((await dismiss(p, 1001, "1".padStart(40, "0"))).status).toBe(200);
+    // A slot frees (the owner dismisses one): the waiting head is held, with its check.
+    expect((await dismiss(p, 1001, filler(1))).status).toBe(200);
+    expect((await job(p, 1, s)).state).toBe("held");
+    await run(p);
+    // The same check, now saying it waits for the owner.
+    expect(gh.runsOf(p.repo, s)).toHaveLength(1);
+    expect(gh.runsOf(p.repo, s)[0]!.output?.title).toMatch(/owner's approval/);
+    expect((await attention(p)).some((x) => x.pr === 1)).toBe(true);
+    // Another, past the cap again, is approved straight from overflow.
     const s3 = sha();
-    await push(p, 1, s3, "synchronize", { user: stranger });
-    expect((await job(p, 1, s3)).state).toBe("held");
+    await push(p, 3, s3, "opened", { user: stranger });
+    expect((await job(p, 3, s3)).state).toBe("overflow");
+    const ok = await approve(p, 3, s3);
+    expect(ok.status, JSON.stringify(ok.body)).toBe(200);
+    expect(ok.body.approved_ms).toEqual(expect.any(Number));
+    expect(reviewers(p).filter((a) => a.labels.pr === "1")).toEqual([]);
+  });
+
+  it("GitHub's re-run never starts a review of a head that needed approval and never got it (the security review's F1)", async () => {
+    const p = await newProject();
+    const s = sha();
+    const o = { headRepo: "mallory/fork", user: stranger };
+    // Held, with its check; then closed.
+    await push(p, 1, s, "opened", o);
+    await run(p);
+    const check = gh.runsOf(p.repo, s)[0]!;
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 1, sha: s, action: "closed", updated_at: later(), ...o }));
+    expect((await job(p, 1, s)).state).toBe("closed");
+    // The held slots fill meanwhile; the PR comes back at the same commit.
+    await fillHeld(p);
+    await push(p, 1, s, "reopened", o);
+    expect((await job(p, 1, s)).state).toBe("overflow");
+    const rerun = { action: "rerequested", check_run: { id: check.id, name: CHECK_NAME, head_sha: s, pull_requests: [{ number: 1 }] }, repository: { full_name: p.repo } };
+    expect((await deliverGithub("check_run", rerun)).status).toBe(200);
+    await run(p);
+    expect((await job(p, 1, s)).state).toBe("overflow");
+    expect(reviewers(p)).toEqual([]);
+    // Whatever state such a job is in: one left closed while its PR is open is refused too.
+    await runInDurableObject(reviews(p), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE jobs SET state = 'closed' WHERE pr = 1");
+    });
+    await deliverGithub("check_run", rerun);
+    await run(p);
+    expect((await job(p, 1, s)).state).toBe("closed");
+    expect(reviewers(p)).toEqual([]);
+  });
+
+  it("an author the project comes to trust: its waiting reviews start at the next PR event; a fork's never", async () => {
+    const p = await newProject();
+    const own = sha();
+    const forked = sha();
+    await push(p, 1, own, "opened", { user: stranger });
+    await push(p, 2, forked, "opened", { user: stranger, headRepo: "mallory/fork" });
+    expect((await api(token, "PATCH", `/api/projects/${p.id}/settings`, { comments_from_id: stranger.id })).status).toBe(200);
+    // Nothing moves by the setting alone; the next event re-decides.
+    expect((await job(p, 1, own)).state).toBe("held");
+    await push(p, 3, sha(), "opened");
+    expect(going((await job(p, 1, own)).state)).toBe("going");
+    expect((await job(p, 2, forked)).state).toBe("held");
+  });
+
+  it("one held check per PR per interval: fast pushes cost GitHub one check, and a superseded held head no update", async () => {
+    const p = await newProject();
+    const creates = () => gh.callsTo("POST", new RegExp(`^/repos/${p.repo}/check-runs$`)).length;
+    const updates = () => gh.callsTo("PATCH", new RegExp(`^/repos/${p.repo}/check-runs/`)).length;
+    const s1 = sha();
+    await push(p, 1, s1, "opened", { user: stranger });
+    await run(p);
+    await run(p);
+    expect([creates(), updates()]).toEqual([1, 1]);
+    const heads = [sha(), sha(), sha()];
+    for (const h of heads) {
+      await push(p, 1, h, "synchronize", { user: stranger });
+      await run(p);
+    }
+    expect([creates(), updates()]).toEqual([1, 1]);
+    expect((await job(p, 1, heads[2]!)).state).toBe("held");
+    expect(gh.runsOf(p.repo, heads[2]!)).toEqual([]);
+    // The interval over: the current head gets its check; the superseded ones never do.
+    await runInDurableObject(reviews(p), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE prs SET held_check_ms = 1 WHERE pr = 1");
+      st.storage.sql.exec("UPDATE jobs SET next_ms = 1 WHERE pr = 1 AND state = 'held'");
+    });
+    await run(p);
+    await run(p);
+    expect([creates(), updates()]).toEqual([2, 2]);
+    expect(gh.runsOf(p.repo, heads[2]!)).toHaveLength(1);
+    expect(gh.runsOf(p.repo, heads[0]!)).toEqual([]);
   });
 });

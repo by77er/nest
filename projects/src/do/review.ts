@@ -24,7 +24,7 @@ import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { toolOf } from "../tools";
 import { type JobEvent, type JobState, jobTransition, REVIEW_DEADLINE_MS } from "../review-job";
-import { MAX_HELD, type PrOrigin, reviewDecision, type TrustedIds, type UntrustedPolicy } from "../review-trust";
+import { HELD_CHECK_INTERVAL_MS, MAX_HELD, MAX_OVERFLOW, type PrOrigin, reviewDecision, type TrustedIds, trustedAuthor, type UntrustedPolicy } from "../review-trust";
 
 export type { JobState };
 
@@ -121,6 +121,12 @@ const MIGRATIONS = [
     "ALTER TABLE jobs ADD COLUMN author TEXT",
     "ALTER TABLE jobs ADD COLUMN fork INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE jobs ADD COLUMN approved_ms INTEGER",
+    // The author's GitHub id (what trust is decided by), and that this head needs the owner's approval:
+    // set when it was decided, whatever state the job is in later. Such a job is never queued unapproved.
+    "ALTER TABLE jobs ADD COLUMN author_id INTEGER",
+    "ALTER TABLE jobs ADD COLUMN needs_approval INTEGER NOT NULL DEFAULT 0",
+    // When the PR's last held check run was made (HELD_CHECK_INTERVAL_MS).
+    "ALTER TABLE prs ADD COLUMN held_check_ms INTEGER",
   ],
 ] as const;
 
@@ -232,7 +238,7 @@ export class ReviewDO extends DurableObject<Env> {
    *
    * A head the project doesn't trust (`reviewDecision`, by the ids `trust` carries) is held instead: per
    * commit, so a push to a PR whose earlier head was approved is held again. Past MAX_HELD held jobs it
-   * gets no job at all.
+   * waits as `overflow` until a slot frees. Jobs waiting for an author the project now trusts start.
    */
   async onHead(p: ReviewOf, e: HeadEvent, trust: TrustedIds): Promise<{ queued: boolean; held: boolean }> {
     this.bind(p);
@@ -243,41 +249,85 @@ export class ReviewDO extends DurableObject<Env> {
       "INSERT INTO prs (pr, sha, base, title, updated_at, open) VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT (pr) DO UPDATE SET sha = excluded.sha, base = excluded.base, title = excluded.title, updated_at = excluded.updated_at, open = 1",
       e.pr, e.sha, e.base, e.title, e.updated_at,
     );
-    for (const old of this.sql.exec("SELECT * FROM jobs WHERE pr = ? AND sha != ? AND state IN ('held', 'queued', 'running')", e.pr, e.sha).toArray()) {
+    for (const old of this.sql.exec("SELECT * FROM jobs WHERE pr = ? AND sha != ? AND state IN ('held', 'overflow', 'queued', 'running')", e.pr, e.sha).toArray()) {
       this.end(old, "superseded", ENDED, { title: "Superseded", summary: `A newer commit, ${e.sha}, was pushed to the PR; it gets its own review.` });
     }
     const now = Date.now();
     const j = this.jobRow(e.pr, e.sha);
     let queued = false;
     let held = false;
-    const room = () => this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM jobs WHERE state = 'held'").one().n < MAX_HELD;
     if (!j) {
-      if (!hold || room()) {
+      // Its first state: queued, or for an untrusted head held, or overflow past the cap on held jobs.
+      const state: JobState | null = !hold ? "queued" : this.heldRoom() ? "held" : this.count("overflow") < MAX_OVERFLOW ? "overflow" : null;
+      if (state) {
         this.sql.exec(
-          "INSERT INTO jobs (pr, sha, state, title, base, author, fork, next_ms, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-          e.pr, e.sha, hold ? "held" : "queued", e.title, e.base, e.author, e.fork ? 1 : 0, now, now, now,
+          "INSERT INTO jobs (pr, sha, state, title, base, author, author_id, fork, needs_approval, next_ms, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          e.pr, e.sha, state, e.title, e.base, e.author, e.author_id, e.fork ? 1 : 0, hold ? 1 : 0, now, now, now,
         );
-        queued = !hold;
-        held = hold;
+        queued = state === "queued";
+        held = state === "held";
       } else {
-        console.warn(`review: ${MAX_HELD} reviews are held for approval; PR #${e.pr} at ${e.sha} gets none`);
+        console.warn(`review: ${MAX_HELD} reviews are held and ${MAX_OVERFLOW} more wait; PR #${e.pr} at ${e.sha} gets no job`);
       }
     } else {
-      this.sql.exec("UPDATE jobs SET title = ?, base = ? WHERE pr = ? AND sha = ?", e.title, e.base, e.pr, e.sha);
+      // Decided again for this event: a head that needs approval keeps needing it until it has it.
+      this.sql.exec(
+        "UPDATE jobs SET title = ?, base = ?, author = ?, author_id = ?, fork = ?, needs_approval = ? WHERE pr = ? AND sha = ?",
+        e.title, e.base, e.author, e.author_id, e.fork ? 1 : 0, hold && (j.approved_ms === null || j.state === "superseded" || j.state === "closed") ? 1 : 0, e.pr, e.sha,
+      );
+      // An ended job's approval is spent.
+      if (hold && (j.state === "superseded" || j.state === "closed")) this.sql.exec("UPDATE jobs SET approved_ms = NULL WHERE pr = ? AND sha = ?", e.pr, e.sha);
       // The head moved back to a commit whose job ended, or the PR was reopened: reviewed again, or, for
-      // a commit that needs the owner's approval and never had it, held again.
+      // an untrusted head, held again (overflow with no slot free). An approval is for one run of the
+      // review: an author who closes and reopens, or pushes away and back, waits for the owner again.
       if (j.state === "superseded" || j.state === "closed") {
-        if (!hold || j.approved_ms !== null) {
-          this.requeue(e.pr, e.sha);
-          queued = true;
-        } else if (room() && this.move(e.pr, e.sha, j.state as JobState, "hold")) {
+        if (!hold) {
+          queued = this.requeue(e.pr, e.sha);
+        } else if (this.move(e.pr, e.sha, j.state as JobState, this.heldRoom() ? "hold" : "park")) {
           this.reset(e.pr, e.sha);
-          held = true;
+          held = this.jobRow(e.pr, e.sha)!.state === "held";
         }
       }
     }
+    this.redecide(trust);
+    this.fillHeld();
     await this.arm();
     return { queued, held };
+  }
+
+  private count(state: JobState): number {
+    return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM jobs WHERE state = ?", state).one().n;
+  }
+
+  private heldRoom(): boolean {
+    return this.count("held") < MAX_HELD;
+  }
+
+  /** A held slot freed: the oldest overflow jobs take the room, becoming held (their checks made, in "Needs you"). */
+  private fillHeld(): void {
+    const room = MAX_HELD - this.count("held");
+    if (room <= 0) return;
+    for (const j of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'overflow' ORDER BY created_ms, pr LIMIT ?", room).toArray()) {
+      if (!this.move(j.pr as number, j.sha as string, "overflow", "hold")) continue;
+      // Its check, if it has one, now says it waits for the owner (no new check run); else one is made.
+      const r = this.jobRow(j.pr as number, j.sha as string)!;
+      if (r.check_run !== null) this.oweCheck(r.check_run as number, { status: "completed", conclusion: NO_VERDICT, completed_at: new Date().toISOString(), output: HELD_OUTPUT });
+      else this.sql.exec("UPDATE jobs SET next_ms = ? WHERE pr = ? AND sha = ?", Date.now(), j.pr, j.sha);
+    }
+  }
+
+  /**
+   * Jobs waiting for approval whose author the project trusts by now (the App's bot's id learned since,
+   * a comments user set) and whose head is the repo's own: they start, as they would have. Never a fork's.
+   */
+  private redecide(trust: TrustedIds): void {
+    if (this.policy() !== "hold") return;
+    for (const j of this.sql.exec("SELECT pr, sha, state, fork, author_id FROM jobs WHERE state IN ('held', 'overflow') AND approved_ms IS NULL").toArray()) {
+      if (!trustedAuthor({ fork: j.fork === 1, author_id: (j.author_id as number | null) ?? null }, trust)) continue;
+      if (!this.move(j.pr as number, j.sha as string, j.state as JobState, "trust")) continue;
+      this.reset(j.pr as number, j.sha as string);
+      this.sql.exec("UPDATE jobs SET needs_approval = 0 WHERE pr = ? AND sha = ?", j.pr, j.sha);
+    }
   }
 
   /**
@@ -287,12 +337,13 @@ export class ReviewDO extends DurableObject<Env> {
   async approve(pr: number, sha: string): Promise<Result<Job>> {
     const j = this.jobRow(pr, sha);
     if (!j) return fail(404, "no review for that PR and commit");
-    if (j.state !== "held" && j.state !== "dismissed") return fail(409, `this review is ${j.state as string}, not waiting for approval`);
+    if (j.state !== "held" && j.state !== "overflow" && j.state !== "dismissed") return fail(409, `this review is ${j.state as string}, not waiting for approval`);
     const head = this.sql.exec("SELECT sha, open FROM prs WHERE pr = ?", pr).toArray()[0];
     if (!head || head.open !== 1 || head.sha !== sha) return fail(409, "that commit is no longer the open PR's head");
     if (!this.move(pr, sha, j.state as JobState, "approve")) return fail(409, "the review moved meanwhile");
     this.reset(pr, sha);
-    this.sql.exec("UPDATE jobs SET approved_ms = ? WHERE pr = ? AND sha = ?", Date.now(), pr, sha);
+    this.sql.exec("UPDATE jobs SET approved_ms = ?, needs_approval = 0 WHERE pr = ? AND sha = ?", Date.now(), pr, sha);
+    this.fillHeld();
     await this.arm();
     return ok(this.toJob(this.jobRow(pr, sha)!));
   }
@@ -303,6 +354,7 @@ export class ReviewDO extends DurableObject<Env> {
     if (!j) return fail(404, "no review for that PR and commit");
     if (j.state !== "held") return fail(409, `this review is ${j.state as string}, not waiting for approval`);
     this.end(j, "dismiss", NO_VERDICT, { title: "Review dismissed", summary: "The project's owner dismissed this review; the commit isn't reviewed." });
+    this.fillHeld();
     await this.arm();
     return ok(this.toJob(this.jobRow(pr, sha)!));
   }
@@ -313,9 +365,10 @@ export class ReviewDO extends DurableObject<Env> {
     const prev = this.sql.exec("SELECT updated_at FROM prs WHERE pr = ?", e.pr).toArray()[0];
     if (prev && e.updated_at < (prev.updated_at as string)) return;
     this.sql.exec("UPDATE prs SET open = 0, updated_at = ? WHERE pr = ?", e.updated_at, e.pr);
-    for (const j of this.sql.exec("SELECT * FROM jobs WHERE pr = ? AND state IN ('held', 'queued', 'running')", e.pr).toArray()) {
+    for (const j of this.sql.exec("SELECT * FROM jobs WHERE pr = ? AND state IN ('held', 'overflow', 'queued', 'running')", e.pr).toArray()) {
       this.end(j, "closed", ENDED, { title: "PR closed", summary: "The PR was closed before its review finished." });
     }
+    this.fillHeld();
     await this.arm();
   }
 
@@ -332,11 +385,12 @@ export class ReviewDO extends DurableObject<Env> {
     if (!j) return { queued: false };
     const head = this.sql.exec("SELECT sha, open FROM prs WHERE pr = ?", j.pr).toArray()[0];
     if (!head || head.open !== 1 || head.sha !== j.sha) return { queued: false };
-    // Held or dismissed: only the owner's approval starts it (`requeue` isn't in their rows of the table).
-    if (j.state === "queued" || j.state === "running" || j.state === "held" || j.state === "dismissed") return { queued: false };
-    this.requeue(j.pr as number, j.sha as string);
+    // Waiting for approval, or dismissed: only the owner's approval starts it (`requeue` isn't in their
+    // rows of the table, and refuses any job whose head needs approval it never got).
+    if (j.state === "queued" || j.state === "running") return { queued: false };
+    const queued = this.requeue(j.pr as number, j.sha as string);
     await this.arm();
-    return { queued: true };
+    return { queued };
   }
 
   /**
@@ -352,10 +406,13 @@ export class ReviewDO extends DurableObject<Env> {
   }
 
   /** Queue an ended job again from scratch: a new check run, new reviewers, no verdict. */
-  private requeue(pr: number, sha: string): void {
+  private requeue(pr: number, sha: string): boolean {
     const j = this.jobRow(pr, sha);
-    if (!j || !this.move(pr, sha, j.state as JobState, "requeue")) return;
+    // Never a head that needs the owner's approval and hasn't had it, whatever state its job is in.
+    if (!j || (j.needs_approval === 1 && j.approved_ms === null)) return false;
+    if (!this.move(pr, sha, j.state as JobState, "requeue")) return false;
     this.reset(pr, sha);
+    return true;
   }
 
   /** A job starting over (queued, or held): a new check run, new reviewers, no verdict, due now. */
@@ -375,7 +432,9 @@ export class ReviewDO extends DurableObject<Env> {
     const state = this.move(j.pr as number, j.sha as string, j.state as JobState, event);
     if (!state) return;
     this.sql.exec("UPDATE jobs SET next_ms = NULL, deadline_ms = NULL, error = COALESCE(?, error) WHERE pr = ? AND sha = ?", error ?? null, j.pr, j.sha);
-    if (j.check_run !== null) this.oweCheck(j.check_run as number, { status: "completed", conclusion, completed_at: new Date().toISOString(), output });
+    // A held job's check is complete already ("waiting for approval"): only the owner's dismissal rewrites
+    // it, so a stranger's pushes and closes cost no calls to GitHub beyond the one check per interval.
+    if (j.check_run !== null && ((j.state !== "held" && j.state !== "overflow") || event === "dismiss")) this.oweCheck(j.check_run as number, { status: "completed", conclusion, completed_at: new Date().toISOString(), output });
     if (j.agent !== null) this.oweStop(j.agent as string, state);
     // A review that finished (or failed for good) is owed to the project's waits; superseded and closed aren't ends of the PR's review.
     if (state === "done" || state === "failed") {
@@ -493,7 +552,7 @@ export class ReviewDO extends DurableObject<Env> {
     // Two queries: the platform's SQLite caps the terms of one compound SELECT.
     const first = this.sql.exec<{ t: number | null }>(
       `SELECT MIN(t) AS t FROM (
-        SELECT next_ms AS t FROM jobs WHERE state IN ('running', 'held') AND next_ms IS NOT NULL
+        SELECT next_ms AS t FROM jobs WHERE state IN ('running', 'held', 'overflow') AND next_ms IS NOT NULL
         UNION ALL SELECT next_ms FROM jobs WHERE state = 'queued' AND next_ms IS NOT NULL AND ? = 1
         UNION ALL SELECT next_ms FROM check_updates
         UNION ALL SELECT next_ms FROM stops
@@ -560,7 +619,7 @@ export class ReviewDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT check_run FROM check_updates WHERE next_ms <= ?", now).toArray()) await this.sendCheck(github, repo, r.check_run as number);
     for (const r of this.sql.exec("SELECT agent FROM stops WHERE next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
     // A held job's check: made once, completed at once as needing the owner's approval. Nothing else of it runs.
-    for (const h of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'held' AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
+    for (const h of this.sql.exec("SELECT pr, sha FROM jobs WHERE state IN ('held', 'overflow') AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       await this.heldCheck(github, repo, h.pr as number, h.sha as string);
     }
     // Queued jobs start in order while there's room.
@@ -648,26 +707,46 @@ export class ReviewDO extends DurableObject<Env> {
     }
   }
 
-  /** A held job's check run, saying why no review runs: retried with backoff; a refusal for good is shown on the job. */
+  /**
+   * A held (or overflow) job's check run, saying why no review runs: retried with backoff; a refusal for
+   * good is shown on the job. Made before the job can start: drains run one at a time, and a job approved
+   * while this one's call is out starts (and makes the review's own check) only after it returns, so the
+   * commit's latest check is always the review's.
+   */
   private async heldCheck(github: () => Promise<GitHub>, repo: string, pr: number, sha: string): Promise<void> {
     const before = this.jobRow(pr, sha);
-    if (!before || before.state !== "held") return;
+    if (!before || (before.state !== "held" && before.state !== "overflow")) return;
+    const waiting = "state IN ('held', 'overflow')";
+    const output = before.state === "held" ? HELD_OUTPUT : OVERFLOW_OUTPUT;
     const project = this.setting("project")!;
+    // At most one held check per PR per interval: a head pushed sooner waits its turn (or is superseded first).
+    const last = (this.sql.exec("SELECT held_check_ms FROM prs WHERE pr = ?", pr).toArray()[0]?.held_check_ms as number | null | undefined) ?? null;
+    if (before.check_run === null && last !== null && Date.now() < last + HELD_CHECK_INTERVAL_MS) {
+      this.sql.exec(`UPDATE jobs SET next_ms = ? WHERE pr = ? AND sha = ? AND ${waiting}`, last + HELD_CHECK_INTERVAL_MS, pr, sha);
+      return;
+    }
     try {
       if (before.check_run === null) {
+        this.sql.exec("UPDATE prs SET held_check_ms = ? WHERE pr = ?", Date.now(), pr);
         const made = (await (await github()).createCheckRun(repo, {
           head_sha: sha, external_id: `${project}/${pr}/${sha}/held`, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}/reviews`,
-          output: HELD_OUTPUT,
+          output,
         }))!;
-        this.oweCheck(made.id, { status: "completed", conclusion: NO_VERDICT, completed_at: new Date().toISOString(), output: HELD_OUTPUT });
-        // Still held: the check is its job's. Approved, dismissed or ended meanwhile: the check just says it waited.
-        this.sql.exec("UPDATE jobs SET check_run = ? WHERE pr = ? AND sha = ? AND state = 'held' AND check_run IS NULL", made.id, pr, sha);
+        const after = this.jobRow(pr, sha);
+        if (after && (after.state === "held" || after.state === "overflow") && after.check_run === null) {
+          // Still waiting: the check is its job's, saying what it waits for now.
+          this.oweCheck(made.id, { status: "completed", conclusion: NO_VERDICT, completed_at: new Date().toISOString(), output: after.state === "held" ? HELD_OUTPUT : OVERFLOW_OUTPUT });
+          this.sql.exec(`UPDATE jobs SET check_run = ? WHERE pr = ? AND sha = ? AND ${waiting} AND check_run IS NULL`, made.id, pr, sha);
+        } else {
+          // Approved, dismissed or ended while the call was out: this check is done with, never a passing one.
+          this.oweCheck(made.id, { status: "completed", conclusion: ENDED, completed_at: new Date().toISOString(), output: { title: "No longer waiting", summary: "This commit's review moved on while this check was being made." } });
+        }
       }
-      this.sql.exec("UPDATE jobs SET next_ms = NULL, errors = 0, error = NULL WHERE pr = ? AND sha = ? AND state = 'held'", pr, sha);
+      this.sql.exec(`UPDATE jobs SET next_ms = NULL, errors = 0, error = NULL WHERE pr = ? AND sha = ? AND ${waiting}`, pr, sha);
     } catch (e) {
       const permanent = (e instanceof NestError || e instanceof GitHubError) && e.permanent;
       const errors = (before.errors as number) + 1;
-      this.sql.exec("UPDATE jobs SET errors = ?, next_ms = ?, error = ? WHERE pr = ? AND sha = ? AND state = 'held'", errors, permanent ? null : Date.now() + backoff(errors), message(e), pr, sha);
+      this.sql.exec(`UPDATE jobs SET errors = ?, next_ms = ?, error = ? WHERE pr = ? AND sha = ? AND ${waiting}`, errors, permanent ? null : Date.now() + backoff(errors), message(e), pr, sha);
     }
   }
 
@@ -710,6 +789,11 @@ export class ReviewDO extends DurableObject<Env> {
 const HELD_OUTPUT: CheckOutput = {
   title: "Waiting for the owner's approval",
   summary: "This pull request isn't from someone the project trusts, so its review doesn't start by itself. The project's owner can approve the review of this commit, or dismiss it.",
+};
+
+const OVERFLOW_OUTPUT: CheckOutput = {
+  title: "Waiting: the project's review queue is full",
+  summary: "This pull request isn't from someone the project trusts, and too many such reviews already wait for the owner's approval. It will be listed for the owner once some of those are approved, dismissed or closed.",
 };
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 500);

@@ -17,19 +17,23 @@ export interface Held {
   fork: boolean;
 }
 
-/** Why it waits, in a phrase: "A fork's PR by mallory" / "A PR by mallory" / "A PR". */
+/** Whose PR, and why it waits: "A fork's PR by mallory" (the fork is the reason), or "A PR by mallory, who isn't someone the project trusts". */
 export function heldFrom(h: Pick<Held, "author" | "fork">): string {
-  return `${h.fork ? "A fork's PR" : "A PR"}${h.author ? ` by ${h.author}` : ""}`;
+  if (h.fork) return `A fork's PR${h.author ? ` by ${h.author}` : ""}`;
+  return h.author ? `A PR by ${h.author}, who isn't someone the project trusts` : "A PR whose author the project doesn't know";
 }
 
-/** Review this PR (the primary action) and Dismiss; `dismiss` false where only approving is left (a dismissed job). */
-export function HeldActions({ projectId, held, dismiss = true }: { projectId: string; held: Held; dismiss?: boolean }) {
+/**
+ * Review this PR and Dismiss. Review is the filled action only where the review waits on the owner now
+ * (`primary`); on a row the owner already dismissed, or one waiting its turn, it is a default button.
+ */
+export function HeldActions({ projectId, held, dismiss = true, primary = true }: { projectId: string; held: Held; dismiss?: boolean; primary?: boolean }) {
   const approve = useApproveReview(projectId);
   const drop = useDismissReview(projectId);
   const key = { pr: held.pr, sha: held.sha };
   return (
     <Toolbar align="start">
-      <Button size="xs" loading={approve.isPending} disabled={drop.isPending} onClick={() => approve.mutate(key)} aria-label={`Review PR #${held.pr}`}>
+      <Button size="xs" variant={primary ? "filled" : "default"} loading={approve.isPending} disabled={drop.isPending} onClick={() => approve.mutate(key)} aria-label={`Review PR #${held.pr}`}>
         Review this PR
       </Button>
       {dismiss && (
@@ -43,8 +47,8 @@ export function HeldActions({ projectId, held, dismiss = true }: { projectId: st
 
 type Item = Extract<Attention, { kind: "review" }>;
 
-/** In "Needs you": the PR, who it's from, what approving does, and the two actions. */
-export function HeldReviewItem({ projectId, repo, item }: { projectId: string; repo: string | undefined; item: Item }) {
+/** In "Needs you": the PR, who it's from, what approving does (in full on the first held review shown, short after), and the two actions. */
+export function HeldReviewItem({ projectId, repo, item, full = true }: { projectId: string; repo: string | undefined; item: Item; full?: boolean }) {
   return (
     <Stack gap="sm" data-held-review={`${item.pr}/${item.sha}`}>
       <MetaRow>
@@ -64,7 +68,7 @@ export function HeldReviewItem({ projectId, repo, item }: { projectId: string; r
         )}
       </Text>
       <Text fz="sm" c="dimmed">
-        Its review waits for you: it isn't from someone the project trusts. Reviewing starts a reviewer agent on this commit's code; a later push waits again.
+        {full ? "Its review waits for your approval. Reviewing starts a reviewer agent on this commit's code; a later push waits again." : "Its review waits for your approval."}
       </Text>
       <HeldActions projectId={projectId} held={item} />
     </Stack>

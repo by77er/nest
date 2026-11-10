@@ -22,6 +22,14 @@ const DIMENSIONS = [
   ["architecture", "Architecture"],
 ] as const satisfies readonly (readonly [Dimension, string])[];
 
+/** Reviews waiting for the owner's approval first (the oldest first: longest waiting), then the rest, newest first. */
+export function byHeldThenNewest(a: Job, b: Job): number {
+  const ha = a.state === "held";
+  const hb = b.state === "held";
+  if (ha !== hb) return ha ? -1 : 1;
+  return ha ? a.created_ms - b.created_ms : b.updated_ms - a.updated_ms;
+}
+
 /** A review job's state, or "Changes needed" for a verdict that failed a dimension (also on a task's PRs). */
 export function JobState({ job, size = "md" }: { job: Job; size?: "sm" | "md" }) {
   const failedVerdict = job.state === "done" && job.verdict && DIMENSIONS.some(([d]) => job.verdict![d].verdict !== "pass");
@@ -43,14 +51,15 @@ function TaintedBadge() {
 
 /** The verdict badges; `tainted` (the table's) puts Tainted after them, a card puts it on its state row. */
 function Verdicts({ job, tainted = true, projectId }: { job: Job; tainted?: boolean; projectId: string }) {
-  // Held for the owner (or dismissed by them): who it's from, and what the owner can do about it.
-  if (job.state === "held" || job.state === "dismissed") {
+  // Waiting for the owner (held, or past the cap on held ones), or dismissed by them: who it's from, and what the owner can do.
+  if (job.state === "held" || job.state === "overflow" || job.state === "dismissed") {
+    const why = job.state === "held" ? "Its review waits for your approval." : job.state === "overflow" ? "It waits its turn: too many reviews wait for your approval." : "You dismissed its review.";
     return (
       <Stack gap="sm">
         <Text fz="sm" c="dimmed">
-          {heldFrom(job)}: {job.state === "held" ? "its review waits for your approval" : "you dismissed its review"}
+          {heldFrom(job)}. {why}
         </Text>
-        <HeldActions projectId={projectId} held={job} dismiss={job.state === "held"} />
+        <HeldActions projectId={projectId} held={job} dismiss={job.state === "held"} primary={job.state === "held"} />
       </Stack>
     );
   }
@@ -166,7 +175,7 @@ export function ReviewsPage() {
           ) : phone ? (
             <Stack gap="sm" role="list" aria-label="Review jobs">
               {[...reviews.data]
-                .sort((a, b) => b.updated_ms - a.updated_ms)
+                .sort(byHeldThenNewest)
                 .map((j) => {
                   const key = `${j.pr}/${j.sha}`;
                   const open = traced === key;
@@ -187,7 +196,7 @@ export function ReviewsPage() {
               </Table.Thead>
               <Table.Tbody>
                 {[...reviews.data]
-                  .sort((a, b) => b.updated_ms - a.updated_ms)
+                  .sort(byHeldThenNewest)
                   .map((j) => {
                     const key = `${j.pr}/${j.sha}`;
                     const open = traced === key;

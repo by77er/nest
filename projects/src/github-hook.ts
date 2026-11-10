@@ -107,15 +107,18 @@ export function prAuthor(pr: Obj): { id: number | null; login: string | null; bo
 
 /**
  * The GitHub ids a project trusts to have their PRs reviewed unasked (src/review-trust.ts). The App's
- * bot is looked up once, the first time a bot's PR from the repo itself needs it, and kept; a lookup that
- * fails leaves it unknown, so that PR is held (the safe side) and the next one looks again.
+ * bot is looked up when a bot's PR from the repo itself doesn't match the id kept (none yet, or a stale
+ * one), and kept; a lookup that fails leaves what was kept, so that PR is held (the safe side) and the
+ * next one looks again.
  */
-async function trustedIds(env: Env, projectId: string, repo: string, needBot: boolean): Promise<TrustedIds> {
+async function trustedIds(env: Env, projectId: string, repo: string, botAuthor: number | null): Promise<TrustedIds> {
   const s = await project(env, projectId).getSettings();
   const dir = directory(env);
   let bot = await dir.githubAppBotId();
   const nest = nestFrom(env);
-  if (bot === null && needBot && nest) {
+  // `botAuthor`: a bot's PR from the repo itself. One the stored id doesn't match is looked up again
+  // before it's held (the App was replaced, or the id recorded was stale).
+  if (botAuthor !== null && bot !== botAuthor && nest) {
     try {
       bot = await appBotId(nest, repo);
       if (bot !== null) await dir.recordGithubAppBotId(bot);
@@ -183,7 +186,7 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
     if (action === "opened" || action === "reopened" || action === "synchronize") {
       // Whose PR, from where (README.md#the-review-gate): one the project doesn't trust is held, not reviewed.
       const author = prAuthor(pr);
-      const trust = await trustedIds(env, p.id, p.repo, fromRepo && author.bot);
+      const trust = await trustedIds(env, p.id, p.repo, fromRepo && author.bot ? author.id : null);
       await review(env, p.id).onHead(of, {
         pr: number, sha, base: (str(obj(pr.base).ref) ?? "").slice(0, 255), title: (str(pr.title) ?? "").slice(0, 1000), updated_at,
         fork: !fromRepo, author_id: author.id, author: author.login,

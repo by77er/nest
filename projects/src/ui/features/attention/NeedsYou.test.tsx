@@ -128,19 +128,26 @@ describe("asks", () => {
   it("a review held for approval: the PR, who it's from, and Review this PR, after which it leaves", async () => {
     const api = new FakeApi();
     const sha = "c".repeat(40);
-    api.reviews = [{
-      pr: 12, sha, state: "held", title: "Speed up the parser", base: "main", agent: null, check_run: null, verdict: null, tainted: null, deadline_ms: null,
-      attempts: 0, runs: 0, error: null, author: "mallory", fork: true, approved_ms: null, created_ms: Date.now() - 120_000, updated_ms: Date.now(),
-    }];
+    const heldJob = (pr: number, s: string, age: number, o: Record<string, unknown> = {}) => ({
+      pr, sha: s, state: "held" as const, title: "Speed up the parser", base: "main", agent: null, check_run: null, verdict: null, tainted: null, deadline_ms: null,
+      attempts: 0, runs: 0, error: null, author: "mallory", fork: true, approved_ms: null, created_ms: Date.now() - age, updated_ms: Date.now(), ...o,
+    });
+    api.reviews = [heldJob(12, sha, 120_000), heldJob(13, "d".repeat(40), 60_000, { fork: false, author: "eve" })];
     const { user } = renderApp("/projects/prj_one/board", api);
     const p = await panel();
     const item = p.querySelector(`[data-held-review="12/${sha}"]`) as HTMLElement;
     expect(item).toHaveTextContent("A fork's PR by mallory");
+    // The explanation in full once, on the first held review; the short form after.
+    expect(item).toHaveTextContent("Reviewing starts a reviewer agent on this commit's code; a later push waits again.");
+    const second = p.querySelector(`[data-held-review="13/${"d".repeat(40)}"]`) as HTMLElement;
+    expect(second).toHaveTextContent("A PR by eve, who isn't someone the project trusts");
+    expect(second).toHaveTextContent("Its review waits for your approval.");
+    expect(second).not.toHaveTextContent("Reviewing starts a reviewer agent");
     expect(item).toHaveTextContent("ccccccc");
     expect(within(item).getByRole("link", { name: "#12 Speed up the parser" })).toHaveAttribute("href", expect.stringMatching(/\/pull\/12$/));
     expect(within(item).getByRole("button", { name: "Dismiss the review of PR #12" })).toBeInTheDocument();
     await user.click(within(item).getByRole("button", { name: "Review PR #12" }));
-    await waitFor(gone);
+    await waitFor(() => expect(p.querySelector(`[data-held-review="12/${sha}"]`)).toBeNull());
     expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/reviews/12/${sha}/approve`, body: undefined }]);
   });
 

@@ -72,13 +72,13 @@ function BlockedTask({ projectId, item }: { projectId: string; item: BlockedItem
 /** How many items show before "Show all": enough to act on, without pushing the board below the fold. */
 export const SHOWN = 3;
 
-function Item({ projectId, x, first }: { projectId: string; x: Attention; first: boolean }) {
+function Item({ projectId, x, first, explain }: { projectId: string; x: Attention; first: boolean; explain: boolean }) {
   const project = useProject(projectId);
   return (
     <Stack gap="lg">
       {!first && <Divider />}
       {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : x.kind === "blocked" ? <BlockedTask projectId={projectId} item={x} />
-        : x.kind === "review" ? <HeldReviewItem projectId={projectId} repo={project.data?.repo} item={x} />
+        : x.kind === "review" ? <HeldReviewItem projectId={projectId} repo={project.data?.repo} item={x} full={explain} />
         : x.kind === "triage" ? <TriageItem projectId={projectId} count={x.count} at_ms={x.at_ms} /> : <SecretRequestItem projectId={projectId} item={x} />}
     </Stack>
   );
@@ -112,6 +112,8 @@ export function NeedsYou({ projectId }: { projectId: string }) {
   // Oldest first, as the Worker answers; the rest behind "Show all", collapsing in 180 ms.
   const items = [...(attention.data ?? [])].sort((a, b) => a.at_ms - b.at_ms);
   if (items.length === 0) return null;
+  // The held reviews' explanation is said once, on the first of them.
+  const firstHeld = items.find((x) => x.kind === "review");
   const shown = items.slice(0, SHOWN);
   const rest = items.slice(SHOWN);
   return (
@@ -119,14 +121,14 @@ export function NeedsYou({ projectId }: { projectId: string }) {
       <Section title="Needs you" count={items.length} icon={IconAlertTriangle} iconColor="warning" region={false}>
         <Stack gap="lg">
           {shown.map((x, i) => (
-            <Item key={keyOf(x)} projectId={projectId} x={x} first={i === 0} />
+            <Item key={keyOf(x)} projectId={projectId} x={x} first={i === 0} explain={x === firstHeld} />
           ))}
           {rest.length > 0 && (
             <>
               <Collapse expanded={all} transitionDuration={motion.base} id={`needs-you-rest-${projectId}`}>
                 <Stack gap="lg">
                   {rest.map((x) => (
-                    <Item key={keyOf(x)} projectId={projectId} x={x} first={false} />
+                    <Item key={keyOf(x)} projectId={projectId} x={x} first={false} explain={x === firstHeld} />
                   ))}
                 </Stack>
               </Collapse>

@@ -1,9 +1,11 @@
 // The API's shapes, taken from the Worker's own modules by type only: nothing here reaches the bundle.
 
-import type { HistoryRow, Settings, Task } from "../../do/project";
+import type { HistoryRow, Settings as ProjectSettings, Task } from "../../do/project";
 import type { ProjectRow } from "../../do/directory";
 
-export type { Ask, ChatMessage, HistoryRow, Settings, Task } from "../../do/project";
+export type { Ask, ChatMessage, HistoryRow, Task } from "../../do/project";
+/** A project's settings as the API answers them: ProjectDO's, with ReviewDO's `untrusted_reviews` (README.md#the-review-gate; `hold` when absent). */
+export type Settings = ProjectSettings & { untrusted_reviews?: "hold" | "review" };
 export type { ProjectRow, SyncState } from "../../do/directory";
 export type { PutSecretBody } from "../../requests";
 export type { AddDependencyBody, AttachPrBody, AnswerBody, CancelBody, ChatBody, CreateProjectBody, CreateTaskBody, SettingsBody, UpdateTaskBody } from "../../requests";

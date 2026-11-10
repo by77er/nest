@@ -53,6 +53,7 @@ export const can = (task: Pick<Task, "state" | "prs" | "worker_live">, event: Ta
 /** A review job's state (src/do/review.ts) as the Reviews page shows it; a done job by its verdict. */
 export const REVIEW_STATE: Record<JobState, { label: string; color: Role }> = {
   held: { label: "Needs approval", color: "warning" },
+  overflow: { label: "Waiting", color: "gray" },
   queued: { label: "Queued", color: "gray" },
   running: { label: "Reviewing", color: "primary" },
   done: { label: "Reviewed", color: "success" },
