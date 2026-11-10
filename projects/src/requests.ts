@@ -2,6 +2,7 @@
 // page (src/ui/) validates its forms with the very schemas the Worker checks, and types its calls by them.
 
 import { z } from "zod";
+import { MODEL_ID } from "./models";
 import { MERGE_METHODS } from "./automerge";
 
 /** A GitHub repo, `owner/name`. */
@@ -25,6 +26,8 @@ export const Settings = z.strictObject({
   max_workers: z.number().int().min(0).max(20).optional(),
   // ReviewDO's: null (the default) for no cap on running reviews.
   max_concurrent_reviews: z.number().int().min(0).max(50).nullable().optional(),
+  // ReviewDO's: a PR the project doesn't trust waits for the owner's approval (`hold`, the default), or is reviewed like any other.
+  untrusted_reviews: z.enum(["hold", "review"]).optional(),
   // GitHub's auto-merge on task PRs, and the repo's "Allow auto-merge" written back (README.md#auto-merge).
   auto_merge: z.boolean().optional(),
   merge_method: z.enum(MERGE_METHODS).optional(),
@@ -36,6 +39,9 @@ export const Settings = z.strictObject({
   comments_from_repo_owner: z.boolean().optional(),
   // Routine runs at once across the project (README.md#routines).
   max_routine_runs: z.number().int().min(1).max(3).optional(),
+  // The models the manager and the workers run on (README.md#models): an id or alias Claude Code's --model takes.
+  manager_model: z.string().trim().regex(MODEL_ID, "a model id: letters, digits and . _ : @ / [ ] -").optional(),
+  worker_model: z.string().trim().regex(MODEL_ID, "a model id: letters, digits and . _ : @ / [ ] -").optional(),
 });
 export const CreateTask = z.strictObject({ title: z.string().min(1).max(200), body: Text(20000).optional() });
 export const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).optional(), body: Text(20000).optional(), ord: z.number().finite().optional() });
@@ -67,7 +73,8 @@ export type AcceptIssueBody = z.input<typeof AcceptIssue>;
 /** Declining an issue in triage (README.md#triage): an optional reason, kept on it. */
 export const DeclineIssue = z.strictObject({ reason: z.string().max(500).optional() });
 export type DeclineIssueBody = z.input<typeof DeclineIssue>;
-export const Chat = z.strictObject({ text: z.string().min(1).max(20000) });
+/** The owner's chat message; `request_id` is the page's, so posting it again (an answer lost) is the same message (README.md#outboxes). */
+export const Chat = z.strictObject({ text: z.string().min(1).max(20000), request_id: z.string().regex(/^[A-Za-z0-9_-]{8,64}$/).optional() });
 export const Answer = z.strictObject({ answer: z.string().max(20000) });
 export const Cancel = z.strictObject({ reason: Text(1000).optional() });
 /** A role's egress rules (src/network.ts checks hosts against the grant). */

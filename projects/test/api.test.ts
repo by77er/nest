@@ -1,6 +1,7 @@
 // The board's JSON API (src/api.ts) and what it makes nest do, against README.md#flows and the client
 // interface (docs/control-plane/api/clients/): a fake nest records every call, and a key pair made here
 // plays Cloudflare Access.
+import { modelTemplateEntry } from "../src/models";
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
@@ -92,7 +93,8 @@ describe("projects", () => {
     const managers = [...fake.agents.values()].filter((a) => a.labels.project === p.id && a.labels.role === "manager");
     expect(managers).toHaveLength(1);
     const m = managers[0]!;
-    expect(m.template).toBe("projects/manager");
+    // The project's own template for the role, on its model (README.md#models; test/models.test.ts).
+    expect(m.template).toBe(`projects/${modelTemplateEntry("manager", p.id, "claude-fable-5-2")}`);
     expect(m.sandbox).toMatch(/^sbx_/);
     expect(fake.sandboxes.get(m.sandbox!)!.labels).toEqual(m.labels);
     // It reads its project's repo and pushes to none.
@@ -199,7 +201,7 @@ describe("tasks", () => {
     expect(ws).toHaveLength(1);
     const w = ws[0]!;
     expect(w.labels).toEqual({ project: p.id, role: "worker", task: t.id, start: "1" });
-    expect(w.template).toBe("projects/worker");
+    expect(w.template).toBe(`projects/${modelTemplateEntry("worker", p.id, "claude-opus-5-5")}`);
     expect(w.overrides).toEqual({ repos: [p.repo.toLowerCase()] });
     expect(fake.sandboxes.get(w.sandbox!)!.labels).toEqual(w.labels);
     expect(r.body.assignee).toBe(w.agent);
@@ -368,7 +370,8 @@ describe("the catalog sync", () => {
     expect(second.body.written).toEqual(first.body.written);
     expect(fake.callsTo("PUT", /^\/v1\/catalog\//).length - puts).toBe(9);
     expect(new Map(fake.catalog)).toEqual(snapshot);
-    expect([...fake.catalog.keys()].sort()).toEqual([
+    // The sync's own entries; each project's model templates are its starts' (README.md#models).
+    expect([...fake.catalog.keys()].filter((k) => !/^templates\/projects\/(manager|worker)-/.test(k)).sort()).toEqual([
       "capabilities/projects/board", "capabilities/projects/review", "capabilities/projects/routine", "capabilities/projects/task",
       "templates/projects/dreaming", "templates/projects/manager", "templates/projects/reviewer", "templates/projects/routine", "templates/projects/worker",
     ]);

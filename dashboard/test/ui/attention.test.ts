@@ -47,3 +47,21 @@ describe("the attention list", () => {
     expect(live(off("suspended"), undefined)).toMatchObject({ parked: 1, waiting: 0, other: 0, sandboxes: [] });
   });
 });
+
+describe("the cell's enrolment breakers", () => {
+  it("an open one is a warning naming the type whole, its failures and the next try; a closed one with failures is not attention", () => {
+    const f = fleet((x) => {
+      x.enroll_breakers = [
+        { role: "sandbox", type: "c8id.large", failures: 3, open_until_ms: NOW + 25 * 60_000, open: true },
+        { role: "sandbox", type: "c8i.large", failures: 2, open_until_ms: null, open: false },
+      ];
+    });
+    expect(brief(f)).toEqual(["warning Launches paused"]);
+    expect(read(f)[0]).toMatchObject({ subject: "c8id.large", subjectWhole: true, reason: "3 sandbox host launches in a row never enrolled; next try in 25m", target: null });
+  });
+
+  it("a control plane before the breaker sends none: nothing to show", () => {
+    const f = fleet((x) => { delete x.enroll_breakers; });
+    expect(brief(f)).toEqual([]);
+  });
+});

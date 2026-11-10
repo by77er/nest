@@ -63,6 +63,27 @@ describe("the Manager page", () => {
     expect(await screen.findByText("Starting")).toBeInTheDocument();
   });
 
+  it("an ended manager says why and offers Restart, which posts the restart (B11); a running one doesn't", async () => {
+    const api = new FakeApi();
+    api.manager = { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited), 4 times within an hour: restart it when you're ready." };
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    const problem = await screen.findByRole("alert", { name: /isn't running/ });
+    expect(problem).toHaveTextContent("4 times within an hour");
+    expect(screen.queryByRole("button", { name: "Stop" })).toBeNull();
+    await user.click(within(problem).getByRole("button", { name: "Restart manager" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/manager/restart", body: undefined }]));
+    expect(await screen.findByText("Starting")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Restart manager" })).toBeNull();
+  });
+
+  it("an errored manager offers Restart too, though nest gave no reason", async () => {
+    const api = new FakeApi();
+    api.manager = { phase: "errored", agent: "agt_manager", state: "errored", host: "bh_1", error: null };
+    renderApp("/projects/prj_one/manager", api);
+    const problem = await screen.findByRole("alert", { name: /isn't running/ });
+    expect(within(problem).getByRole("button", { name: "Restart manager" })).toBeInTheDocument();
+  });
+
   it("waiting for a host is a warning, not an error", async () => {
     const api = new FakeApi();
     api.manager = { phase: "waiting_for_host", agent: "agt_manager", state: "starting", host: null, error: null };

@@ -113,7 +113,9 @@ struct MockDo {
     to_runner: Arc<Mutex<Option<mpsc::UnboundedSender<AgentToRunner>>>>,
     /// What `hands_resolve` is answered with (set once the gateway exists).
     hands: Arc<Mutex<Option<HandsTarget>>>,
-    seq: std::sync::atomic::AtomicU64,
+    /// The last seq given to a reliable message to the runner: one lineage, no gaps (the runner
+    /// never acks past one).
+    seq: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl MockDo {
@@ -123,10 +125,11 @@ impl MockDo {
         let log: Arc<Mutex<DoLog>> = Default::default();
         let to_runner: Arc<Mutex<Option<mpsc::UnboundedSender<AgentToRunner>>>> = Default::default();
         let hands: Arc<Mutex<Option<HandsTarget>>> = Default::default();
-        let (log2, tr2, hands2) = (log.clone(), to_runner.clone(), hands.clone());
+        let seq: Arc<std::sync::atomic::AtomicU64> = Default::default();
+        let (log2, tr2, hands2, seq2) = (log.clone(), to_runner.clone(), hands.clone(), seq.clone());
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                let (log, tr, hands) = (log2.clone(), tr2.clone(), hands2.clone());
+                let (log, tr, hands, seq) = (log2.clone(), tr2.clone(), hands2.clone(), seq2.clone());
                 tokio::spawn(async move {
                     let auth = Arc::new(std::sync::Mutex::new(String::new()));
                     let a2 = auth.clone();
@@ -172,7 +175,8 @@ impl MockDo {
                                     _ => ToolOutcome::Pending { ask: nest_protocol::model::AskId("ask_1".into()), message: "Question posted.".into() },
                                 };
                                 let _ = tx.send(AgentToRunner::Ack { up_to: c.seq });
-                                let _ = tx.send(AgentToRunner::ToolResult { seq: Seq(900 + c.seq.0), call: c.call.clone(), outcome });
+                                let next = Seq(seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1);
+                                let _ = tx.send(AgentToRunner::ToolResult { seq: next, call: c.call.clone(), outcome });
                                 l.tool_calls.push(c);
                             }
                             RunnerToAgent::ToolsListRequest { request } => {
@@ -208,7 +212,7 @@ impl MockDo {
                 });
             }
         });
-        Arc::new(Self { url, log, to_runner, hands, seq: std::sync::atomic::AtomicU64::new(0) })
+        Arc::new(Self { url, log, to_runner, hands, seq })
     }
 
     async fn send(&self, f: impl FnOnce(Seq) -> AgentToRunner) {
