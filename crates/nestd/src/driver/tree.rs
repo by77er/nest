@@ -457,13 +457,36 @@ mod tests {
         }
     }
 
-    /// A child shell that starts `sleep 300` and writes its pid, as the tree's root; the pid.
+    impl Reaped {
+        /// Whether the child has exited within 2 s (reaped if so): a test never waits for ever on
+        /// a process a broken kill left stopped.
+        fn exits(&mut self) -> bool {
+            for _ in 0..200 {
+                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            false
+        }
+    }
+
+    /// SIGKILLs a pid when dropped: a process the test's tree should have killed, however the test
+    /// ends (a stopped process never exits by itself).
+    struct Killed(i32);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(self.0), Signal::SIGKILL);
+        }
+    }
+
+    /// A child shell that starts `sleep 20` and writes its pid, as the tree's root; the pid.
     fn tree_with_a_child() -> (std::process::Child, i32) {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("pid");
         let mut root = std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!("exec >/dev/null 2>&1; sleep 300 & echo $! > {}; exec sleep 300", f.display()))
+            .arg(format!("exec >/dev/null 2>&1; sleep 20 & echo $! > {}; exec sleep 20", f.display()))
             .spawn()
             .unwrap();
         for _ in 0..250 {
@@ -487,7 +510,7 @@ mod tests {
     #[test]
     fn a_failed_freeze_continues_what_it_stopped() {
         let (root, child) = tree_with_a_child();
-        let mut root = Reaped(root);
+        let (mut root, _child) = (Reaped(root), Killed(child));
         let mut t = Tree::new(root.0.id() as i32).unwrap();
         assert!(t.freeze_within(Duration::ZERO).is_err(), "no budget: the members found aren't all stopped yet");
         std::thread::sleep(Duration::from_millis(50));
@@ -498,13 +521,9 @@ mod tests {
         t.freeze().unwrap();
         assert!(matches!(state(child), Some('T' | 't')));
         t.kill();
-        let _ = root.0.wait();
+        assert!(root.exits(), "the guest outlived the kill");
         std::thread::sleep(Duration::from_millis(50));
-        let alive = state(child).is_some_and(|s| s != 'Z');
-        if alive {
-            let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), Signal::SIGKILL);
-        }
-        assert!(!alive, "the child outlived the kill");
+        assert!(state(child).is_none_or(|s| s == 'Z'), "the child outlived the kill");
         assert!(t.freeze().is_ok() && t.dead, "a dead tree freezes nothing");
     }
 
@@ -513,7 +532,7 @@ mod tests {
     #[test]
     fn a_failed_halt_keeps_what_it_stopped() {
         let (root, child) = tree_with_a_child();
-        let mut root = Reaped(root);
+        let (mut root, _child) = (Reaped(root), Killed(child));
         let pid = root.0.id() as i32;
         let mut t = Tree::new(pid).unwrap();
         assert!(t.halt_within(Duration::ZERO).is_err(), "no budget: the child isn't stopped yet");
@@ -524,7 +543,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(!matches!(state(pid), Some('T' | 't')));
         t.kill();
-        let _ = root.0.wait();
+        assert!(root.exits(), "the guest outlived the kill");
         std::thread::sleep(Duration::from_millis(50));
         assert!(state(child).is_none_or(|s| s == 'Z'), "the kill killed the child");
     }
@@ -540,7 +559,7 @@ mod tests {
         }
         let root = std::process::Command::new("python3")
             .arg("-c")
-            .arg("import os\nwhile True:\n    pid = os.posix_spawn('/bin/true', ['true'], {})\n    os.waitpid(pid, 0)")
+            .arg("import os, time\nend = time.time() + 20\nwhile time.time() < end:\n    pid = os.posix_spawn('/bin/true', ['true'], {})\n    os.waitpid(pid, 0)")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -556,7 +575,7 @@ mod tests {
             t.thaw();
         }
         t.kill();
-        let _ = root.0.wait();
+        assert!(root.exits(), "the guest outlived the kill");
         assert_eq!(failed, 0, "freezes failed during the vfork loop");
     }
 

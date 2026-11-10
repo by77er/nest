@@ -268,9 +268,42 @@ mod tests {
         }
     }
 
+    /// Kills, when dropped, every process that carries its mark in its environment: a test guest's
+    /// whole tree, whatever session or parent each process has now.
+    struct Sweep(String);
+
+    impl Drop for Sweep {
+        fn drop(&mut self) {
+            for _ in 0..5 {
+                let marked: Vec<i32> = std::fs::read_dir("/proc")
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+                    .filter(|pid| std::fs::read(format!("/proc/{pid}/environ")).is_ok_and(|env| env.split(|b| *b == 0).any(|v| v == self.0.as_bytes())))
+                    .collect();
+                if marked.is_empty() {
+                    return;
+                }
+                for pid in marked {
+                    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), Signal::SIGKILL);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
     /// A started VM whose guest is `/bin/sh -c <script>` (its `--listen` arguments become `$0` and
     /// `$1`), and the pids the script wrote to `<dir>/pids`, one per line, once there are `n`.
-    async fn guest_running(dir: &std::path::Path, script: &str, n: usize) -> (Box<dyn Vm>, Vec<i32>) {
+    ///
+    /// Every script here is bounded: its loops count, and its processes live 20 s at most, so a
+    /// test that dies without stopping its VM (a timeout, a mutant that breaks the kill) leaves
+    /// nothing that forks on. The [`Sweep`] returned kills whatever is left when the test ends,
+    /// a panic included.
+    async fn guest_running(dir: &std::path::Path, script: &str, n: usize) -> (Box<dyn Vm>, Vec<i32>, Sweep) {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sweep = Sweep(format!("NEST_TEST_TREE={}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let script = format!("export {}; {script}", sweep.0);
         let pidf = dir.join("pids");
         // Nothing of the guest's holds the test's output open (a process that escaped would stall
         // a piped run until it exits).
@@ -290,7 +323,7 @@ mod tests {
         for _ in 0..200 {
             let pids: Vec<i32> = std::fs::read_to_string(&pidf).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect();
             if pids.len() >= n {
-                return (vm, pids);
+                return (vm, pids, sweep);
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -340,11 +373,11 @@ mod tests {
     #[tokio::test]
     async fn stop_kills_the_guests_whole_tree_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
-        let script = "setsid sleep 300 & echo $! >> PIDS; \
-                      (sleep 300 & echo $! >> PIDS; wait) & \
-                      sh -c 'sleep 300 & echo $! >> PIDS'; \
-                      exec sleep 300";
-        let (mut vm, pids) = guest_running(dir.path(), script, 3).await;
+        let script = "setsid sleep 20 & echo $! >> PIDS; \
+                      (sleep 20 & echo $! >> PIDS; wait) & \
+                      sh -c 'sleep 20 & echo $! >> PIDS'; \
+                      exec sleep 20";
+        let (mut vm, pids, _sweep) = guest_running(dir.path(), script, 3).await;
         /// Killed and reaped however the test ends.
         struct Bystander(std::process::Child);
         impl Drop for Bystander {
@@ -353,7 +386,7 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let bystander = Bystander(std::process::Command::new("sleep").arg("300").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
+        let bystander = Bystander(std::process::Command::new("sleep").arg("20").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap());
         let by = bystander.0.id() as i32;
         for &p in &pids {
             assert!(state(p).is_some_and(|s| s != 'Z'), "{p} runs");
@@ -367,12 +400,13 @@ mod tests {
     }
 
     /// A tree two levels deep that keeps forking (a loop starting a child every few ms, in a
-    /// session of its own) is frozen whole and killed whole.
+    /// session of its own) is frozen whole and killed whole. The loop is bounded (100 children)
+    /// and everything in it exits by itself within 20 s, whatever becomes of the test.
     #[tokio::test]
     async fn a_tree_that_keeps_forking_is_killed_whole() {
         let dir = tempfile::tempdir().unwrap();
-        let script = "setsid sh -c 'echo $$ >> PIDS; while :; do sleep 300 & sleep 0.005; done' & exec sleep 300";
-        let (mut vm, pids) = guest_running(dir.path(), script, 1).await;
+        let script = "setsid sh -c 'echo $$ >> PIDS; i=0; while [ $i -lt 100 ]; do sleep 20 & i=$((i+1)); sleep 0.005; done; wait' & exec sleep 20";
+        let (mut vm, pids, _sweep) = guest_running(dir.path(), script, 1).await;
         let looping = pids[0];
         for _ in 0..250 {
             if in_session(looping).len() > 3 {
@@ -401,12 +435,13 @@ mod tests {
     }
 
     /// A member continued from inside the tree (here a loop that sends SIGCONT to a sibling every
-    /// millisecond, racing the freeze) is stopped again: the freeze ends with every member stopped.
+    /// millisecond, racing the freeze; bounded, and over once the sibling is gone) is stopped
+    /// again: the freeze ends with every member stopped.
     #[tokio::test]
     async fn a_member_continued_during_the_freeze_is_stopped_again() {
         let dir = tempfile::tempdir().unwrap();
-        let script = "sleep 300 & S=$!; echo $S >> PIDS; (while :; do kill -CONT $S; sleep 0.001; done) & echo $! >> PIDS; exec sleep 300";
-        let (mut vm, pids) = guest_running(dir.path(), script, 2).await;
+        let script = "sleep 20 & S=$!; echo $S >> PIDS; (i=0; while [ $i -lt 3000 ]; do kill -CONT $S || exit; i=$((i+1)); sleep 0.001; done) & echo $! >> PIDS; exec sleep 20";
+        let (mut vm, pids, _sweep) = guest_running(dir.path(), script, 2).await;
         for _ in 0..5 {
             vm.pause().await.unwrap();
             for &p in &pids {
@@ -429,10 +464,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("saw-a-stop");
         let script = format!(
-            "python3 -c 'import os, subprocess\nc = subprocess.Popen([\"sleep\", \"300\"])\nopen(\"PIDS\", \"a\").write(\"%d\\n%d\\n\" % (os.getpid(), c.pid))\nwhile True:\n    pid, st = os.waitpid(c.pid, os.WUNTRACED)\n    if os.WIFSTOPPED(st): open(\"{}\", \"w\").write(\"stopped\")\n    else: break' & exec sleep 300",
+            "python3 -c 'import os, subprocess\nc = subprocess.Popen([\"sleep\", \"20\"])\nopen(\"PIDS\", \"a\").write(\"%d\\n%d\\n\" % (os.getpid(), c.pid))\nwhile True:\n    pid, st = os.waitpid(c.pid, os.WUNTRACED)\n    if os.WIFSTOPPED(st): open(\"{}\", \"w\").write(\"stopped\")\n    else: break' & exec sleep 20",
             marker.display()
         );
-        let (mut vm, pids) = guest_running(dir.path(), &script, 2).await;
+        let (mut vm, pids, _sweep) = guest_running(dir.path(), &script, 2).await;
         // The window is the gap between continuing a parent and its child: many tries.
         for _ in 0..100 {
             vm.pause().await.unwrap();
@@ -455,11 +490,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("saw-a-stop");
         let waiter = format!(
-            "import os, subprocess\nc = subprocess.Popen([\"sleep\", \"300\"])\nopen(\"PIDS\", \"a\").write(\"%d\\n%d\\n\" % (os.getpid(), c.pid))\nwhile True:\n    pid, st = os.waitpid(c.pid, os.WUNTRACED)\n    if os.WIFSTOPPED(st): open(\"{}\", \"w\").write(\"stopped\")\n    else: break",
+            "import os, subprocess\nc = subprocess.Popen([\"sleep\", \"20\"])\nopen(\"PIDS\", \"a\").write(\"%d\\n%d\\n\" % (os.getpid(), c.pid))\nwhile True:\n    pid, st = os.waitpid(c.pid, os.WUNTRACED)\n    if os.WIFSTOPPED(st): open(\"{}\", \"w\").write(\"stopped\")\n    else: break",
             marker.display()
         );
-        let script = format!("sh -c 'python3 -c \"$0\"; true' '{}' & exec sleep 300", waiter.replace('\'', "'\\''"));
-        let (mut vm, pids) = guest_running(dir.path(), &script, 2).await;
+        let script = format!("sh -c 'python3 -c \"$0\"; true' '{}' & exec sleep 20", waiter.replace('\'', "'\\''"));
+        let (mut vm, pids, _sweep) = guest_running(dir.path(), &script, 2).await;
         for _ in 0..100 {
             vm.pause().await.unwrap();
             vm.resume().await.unwrap();
@@ -480,9 +515,9 @@ mod tests {
         let (gone, fork) = (dir.path().join("call-returns"), dir.path().join("fork"));
         let server = dir.path().join("server.sh");
         let pidf = dir.path().join("pids");
-        std::fs::write(&server, format!("echo $$ >> {p}; while [ ! -e {f} ]; do sleep 0.05; done; sleep 300 & echo $! >> {p}; wait\n", p = pidf.display(), f = fork.display())).unwrap();
-        let script = format!("sh -c 'setsid sh {} & while [ ! -e {} ]; do sleep 0.05; done' & exec sleep 300", server.display(), gone.display());
-        let (mut vm, pids) = guest_running(dir.path(), &script, 1).await;
+        std::fs::write(&server, format!("echo $$ >> {p}; i=0; while [ ! -e {f} ] && [ $i -lt 300 ]; do i=$((i+1)); sleep 0.05; done; sleep 20 & echo $! >> {p}; wait\n", p = pidf.display(), f = fork.display())).unwrap();
+        let script = format!("sh -c 'setsid sh {} & i=0; while [ ! -e {} ] && [ $i -lt 300 ]; do i=$((i+1)); sleep 0.05; done' & exec sleep 20", server.display(), gone.display());
+        let (mut vm, pids, _sweep) = guest_running(dir.path(), &script, 1).await;
         let server = pids[0];
         vm.pause().await.unwrap();
         vm.resume().await.unwrap();
@@ -518,8 +553,8 @@ mod tests {
     #[tokio::test]
     async fn pause_freezes_the_whole_tree_and_resume_continues_only_what_it_stopped() {
         let dir = tempfile::tempdir().unwrap();
-        let script = "setsid sleep 300 & echo $! >> PIDS; sleep 300 & kill -STOP $!; echo $! >> PIDS; exec sleep 300";
-        let (mut vm, pids) = guest_running(dir.path(), script, 2).await;
+        let script = "setsid sleep 20 & echo $! >> PIDS; sleep 20 & kill -STOP $!; echo $! >> PIDS; exec sleep 20";
+        let (mut vm, pids, _sweep) = guest_running(dir.path(), script, 2).await;
         let (child, stopped_by_agent) = (pids[0], pids[1]);
         let stopped = crate::driver::tree::halted_pid;
         for _ in 0..100 {
