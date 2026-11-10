@@ -362,6 +362,31 @@ describe("the installation a token was minted from", () => {
     expect(gh.mints.length).toBe(before);
   });
 
+  it("a cached token answers its own installation even after another mint refreshed the repo's lookup to a new one", async () => {
+    const r = repo();
+    const c = await newClient({ repos: [r], permissions: { contents: "read", checks: "write" } });
+    // (1) Permission set A, minted from installation X.
+    const a = await askJson(c.token, { repo: r, permissions: { contents: "read" } }, 200);
+    const x = gh.installs.get(r)!;
+    expect(a.installation_id).toBe(x);
+    // (2) The repo moves to installation Y, and its lookup row passes its day.
+    const y = x + 11;
+    gh.installs.set(r, y);
+    const broker = env.BROKER.get(env.BROKER.idFromName("broker"));
+    await runInDurableObject(broker, (_i: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE github_app_installations SET fetched_ms = 0 WHERE repo = ?", r);
+    });
+    // (3) Permission set B: looked up afresh, minted from Y; the lookup row now says Y.
+    const b = await askJson(c.token, { repo: r, permissions: { checks: "write" } }, 200);
+    expect(b.installation_id).toBe(y);
+    expect(await runInDurableObject(broker, (_i: BrokerDO, st) =>
+      st.storage.sql.exec<{ installation: number }>("SELECT installation FROM github_app_installations WHERE repo = ?", r).one().installation)).toBe(y);
+    // (4) A again: its cached token, which was minted from X, and says so.
+    const mints = gh.mints.length;
+    expect(await askJson(c.token, { repo: r, permissions: { contents: "read" } }, 200)).toMatchObject({ token: a.token, installation_id: x });
+    expect(gh.mints.length).toBe(mints);
+  });
+
   it("is absent, not guessed, from a BrokerDO of the previous release (it returned no installation)", async () => {
     const r = repo();
     const c = await newClient({ repos: [r], permissions: { contents: "read" } });
