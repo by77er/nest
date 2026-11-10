@@ -63,7 +63,6 @@ The inventories list more suspected bugs, each with what would confirm it.
 **Docs and code disagree** on these points; each needs an owner decision or code, not just an edit:
 1. "An epoch is never retried" vs. the no-capacity rollback in `placeAnswered` (`lib/sandbox-lease.ts`).
 2. Hands-call journaling is a settled decision ([hands](../agents/hands/)) but isn't built: the guest keeps no call records and nothing answers `call_status`. Only the gateway's refusal before `bound` carries `executed: false`.
-3. "A gap closes the socket" holds for FleetDO's receivers and nestd's command receiver (#39), not for the runner's session receiver, which drops duplicates but accepts a higher seq.
 
 ## What the methods would and wouldn't have caught
 
