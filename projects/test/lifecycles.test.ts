@@ -383,6 +383,24 @@ describe("a manager that ended (B11)", () => {
     expect(s.manager_error).toBeNull();
   });
 
+  it("a replaced manager that exits by itself while its stop is still owed loses its sandbox all the same", async () => {
+    const p = await newProject();
+    const old = fake.agents.get(p.manager)!;
+    // Its stop fails once (retried later); meanwhile it exits on its own.
+    fake.fail(new RegExp(`^POST /v1/agents/${p.manager}/stop$`), 500, { times: 1 });
+    await api(token, "POST", `/api/projects/${p.id}/manager/restart`);
+    expect(fake.sandboxes.get(old.sandbox!)!.ended).toBe(false);
+    old.ended = true;
+    await exited(p.manager);
+    await stub(p).drain();
+    expect(fake.sandboxes.get(old.sandbox!)!.ended).toBe(true);
+    const left = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM stops WHERE agent = ?", p.manager).one().n);
+    expect(left).toBe(0);
+    // And the new manager starts.
+    await startDue(p);
+    expect((await settingsOf(p)).manager).toBeTruthy();
+  });
+
   it("the new manager starts only once the old one's stop has gone through (B11-b), with no busy alarm meanwhile", async () => {
     const p = await newProject();
     const stopOld = new RegExp(`^POST /v1/agents/${p.manager}/stop$`);

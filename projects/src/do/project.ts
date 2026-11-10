@@ -2004,8 +2004,11 @@ export class ProjectDO extends DurableObject<Env> {
         }
         break;
       case "agent.exited":
-        // Ended, whatever its role: a stop owed for it (failed or not, a routine run's or a manager's) is done.
-        this.sql.exec("DELETE FROM stops WHERE agent = ?", e.agent);
+        // Ended, whatever its role: a stop owed for it (failed or not, a routine run's or a worker's) is done.
+        // Not a replaced manager's: that stop also destroys its sandbox, which an agent's own exit leaves
+        // up, so it stays owed (a failed one is owed again) until the sandbox is gone.
+        this.sql.exec("DELETE FROM stops WHERE agent = ? AND reason != 'manager replaced'", e.agent);
+        this.sql.exec("UPDATE stops SET failed_ms = NULL, next_ms = ?, attempts = 0, error = NULL WHERE agent = ? AND reason = 'manager replaced'", Date.now(), e.agent);
         if (route.role === "manager" && s.manager === e.agent) {
           this.sql.exec("INSERT OR IGNORE INTO chat (at_ms, sender, text, event_id) VALUES (?, 'app', ?, ?)", Date.now(), `The manager ended (${e.reason ?? "exited"}).`, e.id);
           // A new one starts, up to a few times an hour (README.md#the-manager-lifecycle); the ended one's
