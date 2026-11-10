@@ -198,7 +198,7 @@ interface PreviousReleaseFields {
 }
 
 /** AgentDO's alarm keys (each needs a handler in `alarm()`). */
-type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | "client_events";
+type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | "client_events" | "seg_trash";
 /**
  * A `sync` ask's window, `ask:<ask id>`: armed only by the previous release's `ask` tool, which left the
  * platform. One it armed still ends its waiting call here (`askWindowLapsed`); dropped next release.
@@ -206,6 +206,8 @@ type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after
 const ASK_DEADLINE = "ask:";
 /** An approved sink call may be made once within this long. */
 const APPROVAL_TTL_MS = 60 * 60_000;
+/** How long until a failed delete of dropped segments is tried again. */
+const SEG_TRASH_RETRY_MS = 60_000;
 /** How much of a sink call's arguments the approval question shows. */
 const APPROVAL_ARGS_SHOWN = 2000;
 type AskDeadline = `${typeof ASK_DEADLINE}${string}`;
@@ -216,7 +218,7 @@ type TimerDeadline = `${typeof TIMER_DEADLINE}${string}`;
 export type HookPoint =
   | "intent:beforeCommit" | "resolveHands:afterResolve" | "dispatch:beforeWrite" | "sandboxMoved:enter" | "kill:beforeIssue"
   | "hostLost:enter" | "exited:enter" | "start:afterCommit" | "release:afterCommit" | "event:afterApply" | "escalate:afterProgress" | "escalate:afterStatus" | "pump:beforeSend"
-  | "flush:beforePut";
+  | "flush:beforePut" | "segTrash:beforeDelete";
 
 export interface CreateAgent {
   agent: string;
@@ -386,6 +388,8 @@ export class AgentDO extends DurableObject<Env> {
       key TEXT NOT NULL, PRIMARY KEY (base, offset))`);
     this.sql.exec(`CREATE TABLE IF NOT EXISTS seg_buffer (base INTEGER NOT NULL, offset INTEGER NOT NULL, data BLOB NOT NULL,
       PRIMARY KEY (base, offset))`);
+    // R2 keys of dropped receive streams still to delete (`trashSegments`): retried until R2 took the delete.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS seg_trash (key TEXT PRIMARY KEY)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY, body TEXT NOT NULL)`);
     this.rel = new ReliableChannels(this.sql);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
@@ -1952,18 +1956,42 @@ export class AgentDO extends DurableObject<Env> {
   /** Segments for `claude --resume`: signed GET URLs for the committed base, in offset order. */
   /**
    * The buffered and stored segments of receive streams that aren't the committed base nor the current
-   * receive stream (a dropped rewrite's): rows in this step, their R2 objects in the background (their
-   * numbers are never reused, so a late delete can't take a newer stream's bytes).
+   * receive stream (a dropped rewrite's): rows in this step, their R2 objects behind it (`trashSegments`;
+   * their numbers are never reused, so a late delete can't take a newer stream's bytes).
    */
   private deleteStreamsAbove(info: AgentInfo): void {
     const keep = [info.base_gen, info.recv_base];
     const rows = this.sql.exec<{ key: string; base: number }>("SELECT key, base FROM segments WHERE base > ?", info.base_gen).toArray().filter((r) => !keep.includes(r.base));
     this.sql.exec("DELETE FROM seg_buffer WHERE base > ? AND base <> ?", info.base_gen, info.recv_base);
     this.sql.exec("DELETE FROM segments WHERE base > ? AND base <> ?", info.base_gen, info.recv_base);
-    if (rows.length) {
-      this.ctx.waitUntil(this.env.BUCKET.delete(rows.map((r) => r.key)).catch((e: unknown) =>
-        console.warn(`agent ${info.agent}: deleting a dropped rewrite's segments failed (they are unreferenced)`, e)));
+    this.trashSegments(rows.map((r) => r.key));
+  }
+
+  /**
+   * R2 objects nothing refers to any more: recorded in this step, deleted behind it, and tried again from
+   * the `seg_trash` deadline until R2 took the delete.
+   */
+  private trashSegments(keys: string[]): void {
+    if (!keys.length) return;
+    for (const key of keys) this.sql.exec("INSERT OR IGNORE INTO seg_trash (key) VALUES (?)", key);
+    const armed = this.deadlines.set("seg_trash", Date.now() + SEG_TRASH_RETRY_MS, true);
+    this.ctx.waitUntil(armed.then(() => this.emptySegTrash()).catch((e: unknown) => console.warn(`agent ${this.load().agent}: emptying the segment trash failed`, e)));
+  }
+
+  private async emptySegTrash(): Promise<void> {
+    // R2 deletes at most 1000 keys a call.
+    const keys = this.sql.exec<{ key: string }>("SELECT key FROM seg_trash LIMIT 1000").toArray().map((r) => r.key);
+    if (keys.length) {
+      try {
+        await this.hook("segTrash:beforeDelete");
+        await this.env.BUCKET.delete(keys);
+        for (const key of keys) this.sql.exec("DELETE FROM seg_trash WHERE key = ?", key);
+      } catch (e) {
+        console.warn(`agent ${this.load().agent}: deleting ${keys.length} dropped segments failed; tried again later`, e);
+      }
     }
+    if (this.sql.exec("SELECT 1 FROM seg_trash LIMIT 1").toArray().length) await this.deadlines.set("seg_trash", Date.now() + SEG_TRASH_RETRY_MS);
+    else await this.deadlines.clear("seg_trash");
   }
 
   private async sessionResume(info: AgentInfo) {
@@ -2286,6 +2314,15 @@ export class AgentDO extends DurableObject<Env> {
       ws.close(4426, "unsupported protocol version");
       return;
     }
+    // A new runner process drops a rewrite the old one left unfinished (below). One that was received
+    // whole (the runner stated its length) and only waits to be made durable is flushed first, so it
+    // becomes the base instead: the file the new process tails is the rewritten one. A rewrite of
+    // unstated length (a previous release's runner) can't be known whole, and is dropped. Everything
+    // after this await reads the record again.
+    const pre = this.load();
+    if (pre.recv_base !== pre.base_gen && pre.recv_total !== undefined && pre.received_bytes >= pre.recv_total) {
+      await this.flush().catch((e: unknown) => console.warn(`agent ${pre.agent}: flushing a received rewrite at a new runner's hello failed; it is dropped`, e));
+    }
     const before = this.load();
     if (hello.agent !== before.agent || hello.host !== att.host || before.brain?.host !== att.host) {
       this.send(ws, { type: "error", error: errorBody(ErrorCodes.UNAUTHORIZED, "hello does not match agent/host") });
@@ -2447,8 +2484,15 @@ export class AgentDO extends DurableObject<Env> {
     await this.hook("flush:beforePut");
     await this.env.BUCKET.put(key, bytes.slice().buffer);
     // State may have moved on during the put: apply only what this flush made durable.
-    this.sql.exec("INSERT OR REPLACE INTO segments (base, offset, len, key) VALUES (?, ?, ?, ?)", base, start, bytes.length, key);
-    this.sql.exec("DELETE FROM seg_buffer WHERE base = ? AND offset <= ?", base, last);
+    const now = this.load();
+    if (base !== now.base_gen && base !== now.recv_base) {
+      // The stream was dropped (or superseded) during the put: nothing will ever read this object.
+      this.sql.exec("DELETE FROM seg_buffer WHERE base = ?", base);
+      this.trashSegments([key]);
+    } else {
+      this.sql.exec("INSERT OR REPLACE INTO segments (base, offset, len, key) VALUES (?, ?, ?, ?)", base, start, bytes.length, key);
+      this.sql.exec("DELETE FROM seg_buffer WHERE base = ? AND offset <= ?", base, last);
+    }
     const after = this.update((i) => {
       if (i.recv_base !== base) return; // a newer stream started meanwhile; this one is superseded
       i.recv_durable = Math.max(i.recv_durable, start + bytes.length);
@@ -3541,6 +3585,7 @@ export class AgentDO extends DurableObject<Env> {
   override async alarm(): Promise<void> {
     const handlers: Record<AgentDeadline, () => Promise<void>> = {
       flush: () => this.flush(),
+      seg_trash: () => this.emptySegTrash(),
       starting: () => this.unresponsiveBrain("starting"),
       no_session: () => this.unresponsiveBrain("no_session"),
       activity: () => this.syncActivity(),
