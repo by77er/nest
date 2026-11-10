@@ -125,6 +125,7 @@ export function data(variant = "demo", now = Date.now()) {
       kind: "review", pr: 140 + i, sha: ((140 + i) * 7919).toString(16).padEnd(40, "a"), title: i % 3 === 0 ? LONG_TITLE : `Fix typo ${i + 1} in the contributing guide`,
       author: i % 4 === 1 ? null : i % 3 === 0 ? "a-contributor-with-a-very-long-github-login-name" : `contributor-${i}`, fork: i % 2 === 0, at_ms: now - (140 + i) * 60_000,
     })) : []),
+    ...(variant === "held-many" ? [{ kind: "review_backlog", count: 37, at_ms: now - 90 * 60_000 }] : []),
     ...(variant === "held-reviews" ? [
       { kind: "review", pr: 131, sha: "9f3c2ab".padEnd(40, "b"), title: "Speed up tag search with a trie", author: "octo-contributor", fork: true, at_ms: now - 2_400_000 },
       { kind: "review", pr: 132, sha: "41d07ee".padEnd(40, "c"), title: "Rework the gadget importer so that malformed rows are reported per line and the rest of the file still loads", author: null, fork: false, at_ms: now - 20_000 },

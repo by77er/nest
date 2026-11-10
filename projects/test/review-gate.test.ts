@@ -6,7 +6,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { CHECK_NAME } from "../src/github";
-import { MAX_HELD, reviewDecision, trustedAuthor } from "../src/review-trust";
+import { MAX_HELD, MAX_OVERFLOW, reviewDecision, trustedAuthor } from "../src/review-trust";
 import { AccessTeam, api, deliverGithub, FakeNest, installFetch, ownerIdOf, prEvent, Signer } from "./fake-nest";
 
 describe("who is trusted (pure)", () => {
@@ -328,6 +328,87 @@ describe("the owner's approval is for one head commit", () => {
     expect(ok.status, JSON.stringify(ok.body)).toBe(200);
     expect(ok.body.approved_ms).toEqual(expect.any(Number));
     expect(reviewers(p).filter((a) => a.labels.pr === "1")).toEqual([]);
+  });
+
+  it("slots free oldest-first: the overflow job that waited longest is held first", async () => {
+    const p = await newProject();
+    await fillHeld(p);
+    const heads: string[] = [];
+    for (const n of [1, 2, 3]) {
+      heads.push(sha());
+      await push(p, n, heads[n - 1]!, "opened", { user: stranger });
+      // Each a later time than the last: the order is by when it started waiting, not by its number.
+      await runInDurableObject(reviews(p), (_i: unknown, st: DurableObjectState) => {
+        st.storage.sql.exec("UPDATE jobs SET created_ms = ? WHERE pr = ?", 100 - n, n);
+      });
+    }
+    expect((await dismiss(p, 1001, filler(1))).status).toBe(200);
+    expect(await Promise.all([1, 2, 3].map(async (n) => (await job(p, n, heads[n - 1]!)).state))).toEqual(["overflow", "overflow", "held"]);
+    expect((await dismiss(p, 1002, filler(2))).status).toBe(200);
+    expect(await Promise.all([1, 2, 3].map(async (n) => (await job(p, n, heads[n - 1]!)).state))).toEqual(["overflow", "held", "held"]);
+  });
+
+  it(`past ${MAX_OVERFLOW} waiting jobs an untrusted head gets no job or check; it is counted in Needs you and gets its job when there is room`, async () => {
+    const p = await newProject();
+    await fillHeld(p);
+    await runInDurableObject(reviews(p), (_i: unknown, st: DurableObjectState) => {
+      for (let k = 1; k <= MAX_OVERFLOW; k++) {
+        const s = String(5000 + k).padStart(40, "0");
+        st.storage.sql.exec("INSERT INTO jobs (pr, sha, state, needs_approval, fork, created_ms, updated_ms) VALUES (?, ?, 'overflow', 1, 1, 2, 2)", 5000 + k, s);
+        st.storage.sql.exec("INSERT INTO prs (pr, sha, base, title, updated_at, open) VALUES (?, ?, 'main', 't', '2026-01-01T00:00:00Z', 1)", 5000 + k, s);
+      }
+    });
+    const s = sha();
+    await push(p, 1, s, "opened", { user: stranger, headRepo: "mallory/fork" });
+    await run(p);
+    expect(await job(p, 1, s)).toBeUndefined();
+    expect(gh.runsOf(p.repo, s)).toEqual([]);
+    const all = (await api(token, "GET", `/api/projects/${p.id}/attention`)).body as any[];
+    expect(all.filter((x) => x.kind === "review_backlog")).toEqual([expect.objectContaining({ count: 1 })]);
+    // A re-run of some check at that commit starts nothing: there is no job.
+    await deliverGithub("check_run", { action: "rerequested", check_run: { id: 999_999, name: CHECK_NAME, head_sha: s, pull_requests: [{ number: 1 }] }, repository: { full_name: p.repo } });
+    expect(reviewers(p)).toEqual([]);
+    // A held slot frees: an overflow job is held, and the skipped head takes the overflow's room, as untrusted as it was.
+    expect((await dismiss(p, 1001, filler(1))).status).toBe(200);
+    expect(await job(p, 1, s)).toMatchObject({ state: "overflow", fork: true, author: "mallory", approved_ms: null });
+    expect(((await api(token, "GET", `/api/projects/${p.id}/attention`)).body as any[]).some((x) => x.kind === "review_backlog")).toBe(false);
+    // A skipped head whose PR closed first is forgotten.
+    await runInDurableObject(reviews(p), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE jobs SET state = 'overflow' WHERE pr = 1");
+      st.storage.sql.exec("INSERT INTO jobs (pr, sha, state, needs_approval, fork, created_ms, updated_ms) VALUES (9001, ?, 'overflow', 1, 1, 2, 2)", "9".padStart(40, "0"));
+    });
+    const s2 = sha();
+    await push(p, 2, s2, "opened", { user: stranger });
+    expect(await job(p, 2, s2)).toBeUndefined();
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 2, sha: s2, action: "closed", updated_at: later(), user: stranger }));
+    expect((await dismiss(p, 1002, filler(2))).status).toBe(200);
+    expect(await job(p, 2, s2)).toBeUndefined();
+  });
+
+  it("a held check whose job was approved while GitHub made it completes as cancelled, before the review's own check", async () => {
+    const p = await newProject();
+    const s = sha();
+    await push(p, 1, s, "opened", { user: stranger });
+    // The owner approves while the held check's create call is out.
+    const handle = gh.handle.bind(gh);
+    let once = true;
+    gh.handle = async (req: Request) => {
+      if (once && req.method === "POST" && new URL(req.url).pathname === `/repos/${p.repo}/check-runs`) {
+        once = false;
+        expect((await approve(p, 1, s)).status).toBe(200);
+      }
+      return handle(req);
+    };
+    try {
+      await run(p);
+      await run(p);
+    } finally {
+      gh.handle = handle;
+    }
+    const runs = gh.runsOf(p.repo, s).sort((a, b) => a.id - b.id);
+    expect(runs.map((c) => [c.status, c.conclusion])).toEqual([["completed", "cancelled"], ["in_progress", null]]);
+    expect(runs[0]!.output?.title).toBe("No longer waiting");
+    expect((await job(p, 1, s)).check_run).toBe(runs[1]!.id);
   });
 
   it("GitHub's re-run never starts a review of a head that needed approval and never got it (the security review's F1)", async () => {

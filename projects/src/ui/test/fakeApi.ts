@@ -69,6 +69,8 @@ export class FakeApi {
   asks: Ask[] = [];
   sync: SyncState | null = null;
   reviews: Job[] = [];
+  /** PRs past the review queue's limits, with no job yet. */
+  reviewBacklog = 0;
   waits: Waits = { pending: [], recent: [] };
   workflowWorkers: string[] = [];
   /** `PUT network`'s answer instead of saving: a refusal (403 with `problems`, say). */
@@ -144,7 +146,8 @@ export class FakeApi {
     const secrets = this.secretRequests.map((r): Attention => ({ kind: "secret", ...r }));
     const held = this.reviews.filter((j) => j.state === "held").map((j): Attention => ({ kind: "review", pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
     const triage: Attention[] = this.issues.length ? [{ kind: "triage", count: this.issues.length, at_ms: Math.min(...this.issues.map((i) => i.opened_ms)) }] : [];
-    return [...asks, ...blocked, ...secrets, ...held, ...triage].sort((a, b) => a.at_ms - b.at_ms);
+    const backlog: Attention[] = this.reviewBacklog ? [{ kind: "review_backlog", count: this.reviewBacklog, at_ms: Date.now() - 60_000 }] : [];
+    return [...asks, ...blocked, ...secrets, ...held, ...backlog, ...triage].sort((a, b) => a.at_ms - b.at_ms);
   }
 
   private move(t: Task, event: TaskEvent): Response | null {

@@ -77,12 +77,14 @@ describe("the Reviews page", () => {
     renderApp("/projects/prj_one/reviews", api);
     const table = await screen.findByRole("table", { name: "Review jobs" });
     const rows = within(table).getAllByRole("row").slice(1);
-    expect(rows.map((r) => within(r).getAllByRole("link")[0]!.textContent)).toEqual(["#6 PR 6", "#7 PR 7", "#9 PR 9", "#8 PR 8"]);
+    expect(rows.map((r) => within(r).getAllByRole("link")[0]!.textContent)).toEqual(["#6 PR 6", "#7 PR 7", "#8 PR 8", "#9 PR 9"]);
     expect(rows[1]).toHaveTextContent("A PR by mallory, who isn't someone the project trusts. Its review waits for your approval.");
-    expect(rows[3]!.querySelector("[data-state]")).toHaveTextContent("Waiting");
-    expect(rows[3]).toHaveTextContent("It waits its turn: too many reviews wait for your approval.");
-    expect(within(rows[3]!).getByRole("button", { name: "Review PR #8" })).toHaveAttribute("data-variant", "default");
-    expect(within(rows[3]!).queryByRole("button", { name: /Dismiss/ })).toBeNull();
+    expect(rows[2]!.querySelector("[data-state]")).toHaveTextContent("Waiting");
+    expect(rows[2]).toHaveTextContent("It waits its turn: too many reviews wait for your approval.");
+    expect(within(rows[2]!).getByRole("button", { name: "Review PR #8" })).toHaveAttribute("data-variant", "default");
+    // A time on one line, however narrow its column.
+    expect(rows[3]!.querySelector("td:nth-child(5) span")!.getAttribute("style")).toContain("white-space: nowrap");
+    expect(within(rows[2]!).queryByRole("button", { name: /Dismiss/ })).toBeNull();
   });
 
   it("opens one reviewer's trace at a time, for that job's agent", async () => {

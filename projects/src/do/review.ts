@@ -127,6 +127,12 @@ const MIGRATIONS = [
     "ALTER TABLE jobs ADD COLUMN needs_approval INTEGER NOT NULL DEFAULT 0",
     // When the PR's last held check run was made (HELD_CHECK_INTERVAL_MS).
     "ALTER TABLE prs ADD COLUMN held_check_ms INTEGER",
+    // An untrusted head that got no job (past MAX_OVERFLOW): who and from where, kept with the PR so it
+    // gets its job once there is room. `skipped_ms` is when; null for a PR whose head has its job.
+    "ALTER TABLE prs ADD COLUMN skipped_ms INTEGER",
+    "ALTER TABLE prs ADD COLUMN author TEXT",
+    "ALTER TABLE prs ADD COLUMN author_id INTEGER",
+    "ALTER TABLE prs ADD COLUMN fork INTEGER NOT NULL DEFAULT 0",
   ],
 ] as const;
 
@@ -246,8 +252,10 @@ export class ReviewDO extends DurableObject<Env> {
     const prev = this.sql.exec("SELECT updated_at FROM prs WHERE pr = ?", e.pr).toArray()[0];
     if (prev && e.updated_at < (prev.updated_at as string)) return { queued: false, held: false };
     this.sql.exec(
-      "INSERT INTO prs (pr, sha, base, title, updated_at, open) VALUES (?, ?, ?, ?, ?, 1) ON CONFLICT (pr) DO UPDATE SET sha = excluded.sha, base = excluded.base, title = excluded.title, updated_at = excluded.updated_at, open = 1",
-      e.pr, e.sha, e.base, e.title, e.updated_at,
+      `INSERT INTO prs (pr, sha, base, title, updated_at, open, author, author_id, fork) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+        ON CONFLICT (pr) DO UPDATE SET sha = excluded.sha, base = excluded.base, title = excluded.title, updated_at = excluded.updated_at, open = 1,
+          author = excluded.author, author_id = excluded.author_id, fork = excluded.fork, skipped_ms = NULL`,
+      e.pr, e.sha, e.base, e.title, e.updated_at, e.author, e.author_id, e.fork ? 1 : 0,
     );
     for (const old of this.sql.exec("SELECT * FROM jobs WHERE pr = ? AND sha != ? AND state IN ('held', 'overflow', 'queued', 'running')", e.pr, e.sha).toArray()) {
       this.end(old, "superseded", ENDED, { title: "Superseded", summary: `A newer commit, ${e.sha}, was pushed to the PR; it gets its own review.` });
@@ -267,7 +275,9 @@ export class ReviewDO extends DurableObject<Env> {
         queued = state === "queued";
         held = state === "held";
       } else {
-        console.warn(`review: ${MAX_HELD} reviews are held and ${MAX_OVERFLOW} more wait; PR #${e.pr} at ${e.sha} gets no job`);
+        // No job yet: the head is marked on its PR, counted for the owner, and gets its job when there is room.
+        this.sql.exec("UPDATE prs SET skipped_ms = ? WHERE pr = ?", now, e.pr);
+        console.warn(`review: ${MAX_HELD} reviews are held and ${MAX_OVERFLOW} more wait; PR #${e.pr} at ${e.sha} gets no job until there is room`);
       }
     } else {
       // Decided again for this event: a head that needs approval keeps needing it until it has it.
@@ -303,8 +313,32 @@ export class ReviewDO extends DurableObject<Env> {
     return this.count("held") < MAX_HELD;
   }
 
-  /** A held slot freed: the oldest overflow jobs take the room, becoming held (their checks made, in "Needs you"). */
+  /** Untrusted heads that got no job (past the cap on waiting ones), still their open PR's head: how many, and since when. */
+  async skipped(): Promise<{ count: number; at_ms: number | null }> {
+    const r = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(skipped_ms) AS at FROM prs WHERE skipped_ms IS NOT NULL AND open = 1").one();
+    return { count: r.n, at_ms: r.at };
+  }
+
+  /**
+   * Room freed: the oldest overflow jobs become held (their checks say so, and they show in "Needs you"),
+   * and the oldest heads that got no job take the overflow's room.
+   */
   private fillHeld(): void {
+    this.promote();
+    const room = MAX_OVERFLOW - this.count("overflow");
+    if (room <= 0) return;
+    const now = Date.now();
+    for (const p of this.sql.exec("SELECT * FROM prs WHERE skipped_ms IS NOT NULL AND open = 1 ORDER BY skipped_ms, pr LIMIT ?", room).toArray()) {
+      this.sql.exec(
+        "INSERT OR IGNORE INTO jobs (pr, sha, state, title, base, author, author_id, fork, needs_approval, next_ms, created_ms, updated_ms) VALUES (?, ?, 'overflow', ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+        p.pr, p.sha, p.title, p.base, p.author, p.author_id, p.fork, now, p.skipped_ms, now,
+      );
+      this.sql.exec("UPDATE prs SET skipped_ms = NULL WHERE pr = ?", p.pr);
+    }
+    this.promote();
+  }
+
+  private promote(): void {
     const room = MAX_HELD - this.count("held");
     if (room <= 0) return;
     for (const j of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'overflow' ORDER BY created_ms, pr LIMIT ?", room).toArray()) {
@@ -364,7 +398,7 @@ export class ReviewDO extends DurableObject<Env> {
     this.bind(p);
     const prev = this.sql.exec("SELECT updated_at FROM prs WHERE pr = ?", e.pr).toArray()[0];
     if (prev && e.updated_at < (prev.updated_at as string)) return;
-    this.sql.exec("UPDATE prs SET open = 0, updated_at = ? WHERE pr = ?", e.updated_at, e.pr);
+    this.sql.exec("UPDATE prs SET open = 0, skipped_ms = NULL, updated_at = ? WHERE pr = ?", e.updated_at, e.pr);
     for (const j of this.sql.exec("SELECT * FROM jobs WHERE pr = ? AND state IN ('held', 'overflow', 'queued', 'running')", e.pr).toArray()) {
       this.end(j, "closed", ENDED, { title: "PR closed", summary: "The PR was closed before its review finished." });
     }

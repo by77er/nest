@@ -35,11 +35,11 @@ export function reviewDecision(o: PrOrigin, ids: TrustedIds, policy: UntrustedPo
 }
 
 /**
- * Held jobs a project keeps at once. A head past it waits as `overflow` (no check, not in "Needs you",
- * still approvable on the Reviews page) and is held once a slot frees.
+ * Held jobs a project keeps at once. A head past it waits as `overflow` (its check says the review
+ * queue is full; not in "Needs you", still approvable on the Reviews page) and is held once a slot frees.
  */
 export const MAX_HELD = 50;
-/** Overflow jobs a project keeps: past it an untrusted head gets no job at all (and so no review, whatever GitHub sends). */
+/** Overflow jobs a project keeps: past it an untrusted head gets no job (and so no check and no review, whatever GitHub sends) until there is room; it is counted for the owner meanwhile. */
 export const MAX_OVERFLOW = 500;
 /** At most one held check run per PR in this long: fast pushes to one PR can't spend the installation's GitHub rate limit. */
 export const HELD_CHECK_INTERVAL_MS = 60_000;

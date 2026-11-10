@@ -10,7 +10,7 @@ import { Fragment, useState } from "react";
 import { useReviews } from "../../api/queries";
 import type { Dimension, Job } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Stack, TableFrame, TriggerBadge, usePhone, weight } from "../../layout";
+import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Stack, TableFrame, Token, TriggerBadge, usePhone, weight } from "../../layout";
 import { REVIEW_STATE } from "../../status";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ReviewTrace } from "../trace/AgentTraces";
@@ -22,12 +22,11 @@ const DIMENSIONS = [
   ["architecture", "Architecture"],
 ] as const satisfies readonly (readonly [Dimension, string])[];
 
-/** Reviews waiting for the owner's approval first (the oldest first: longest waiting), then the rest, newest first. */
+/** Reviews waiting for the owner's approval first (the longest waiting on top), then those waiting their turn, then the rest, newest first. */
 export function byHeldThenNewest(a: Job, b: Job): number {
-  const ha = a.state === "held";
-  const hb = b.state === "held";
-  if (ha !== hb) return ha ? -1 : 1;
-  return ha ? a.created_ms - b.created_ms : b.updated_ms - a.updated_ms;
+  const rank = (j: Job) => (j.state === "held" ? 0 : j.state === "overflow" ? 1 : 2);
+  if (rank(a) !== rank(b)) return rank(a) - rank(b);
+  return rank(a) < 2 ? a.created_ms - b.created_ms : b.updated_ms - a.updated_ms;
 }
 
 /** A review job's state, or "Changes needed" for a verdict that failed a dimension (also on a task's PRs). */
@@ -216,9 +215,9 @@ export function ReviewsPage() {
                         <Text fz="sm">{j.runs}</Text>
                       </Table.Td>
                       <Table.Td ta="right">
-                        <Text fz="sm" c="dimmed" title={exact(j.updated_ms)}>
+                        <Token mono={false} size="sm" nowrap title={exact(j.updated_ms)}>
                           {ago(j.updated_ms)}
-                        </Text>
+                        </Token>
                       </Table.Td>
                       <Table.Td>
                         <TraceToggle j={j} open={open} onToggle={() => setTraced(open ? null : key)} />

@@ -78,13 +78,29 @@ function Item({ projectId, x, first, explain }: { projectId: string; x: Attentio
     <Stack gap="lg">
       {!first && <Divider />}
       {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : x.kind === "blocked" ? <BlockedTask projectId={projectId} item={x} />
+        : x.kind === "review_backlog" ? <ReviewBacklogItem count={x.count} at_ms={x.at_ms} />
         : x.kind === "review" ? <HeldReviewItem projectId={projectId} repo={project.data?.repo} item={x} full={explain} />
         : x.kind === "triage" ? <TriageItem projectId={projectId} count={x.count} at_ms={x.at_ms} /> : <SecretRequestItem projectId={projectId} item={x} />}
     </Stack>
   );
 }
 
-const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.kind === "triage" ? "triage" : x.kind === "review" ? `review-${x.pr}-${x.sha}` : x.id);
+const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.kind === "triage" ? "triage" : x.kind === "review" ? `review-${x.pr}-${x.sha}` : x.kind === "review_backlog" ? "review-backlog" : x.id);
+
+/** PRs past the review queue's limits, with no job yet: how many, and what frees them (README.md#the-review-gate). */
+function ReviewBacklogItem({ count, at_ms }: { count: number; at_ms: number }) {
+  return (
+    <Stack gap="sm" data-review-backlog>
+      <MetaRow>
+        <MetaItem>The review queue</MetaItem>
+        <MetaItem title={exact(at_ms)}>oldest {ago(at_ms)}</MetaItem>
+      </MetaRow>
+      <Text fz="md">
+        {count === 1 ? "1 more pull request waits" : `${count} more pull requests wait`} beyond the queue's limit, with no review yet. They are listed as you approve or dismiss the ones waiting.
+      </Text>
+    </Stack>
+  );
+}
 
 /** The repo's issues waiting for triage: how many, since when, and the way to them (README.md#triage). */
 function TriageItem({ projectId, count, at_ms }: { projectId: string; count: number; at_ms: number }) {

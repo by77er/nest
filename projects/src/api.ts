@@ -333,7 +333,10 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const a = (await p.attention()) as Result<{ at_ms: number }[]>;
       if (!a.ok) return err(a.status, a.error);
       const held = (await review(env, pid).held()).map((j) => ({ kind: "review" as const, pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
-      return json([...a.value, ...held].sort((x, y) => x.at_ms - y.at_ms));
+      // PRs past every cap, with no job yet: one item, their count.
+      const skipped = await review(env, pid).skipped();
+      const backlog = skipped.count ? [{ kind: "review_backlog" as const, count: skipped.count, at_ms: skipped.at_ms ?? Date.now() }] : [];
+      return json([...a.value, ...held, ...backlog].sort((x, y) => x.at_ms - y.at_ms));
     }
     case "GET prs/open":
       return done(await p.openPrs());

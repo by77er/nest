@@ -7,7 +7,6 @@
 import { Anchor, Badge, Button, NumberInput, Select, Switch, Text, TextInput } from "@mantine/core";
 import { schemaResolver, useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
-import { useState } from "react";
 import { Settings as SettingsSchema } from "../../../requests";
 import { ApiError } from "../../api/client";
 import { useRetryRepoAutoMerge, useSecrets, useUpdateSettings } from "../../api/queries";

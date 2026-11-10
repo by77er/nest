@@ -172,6 +172,16 @@ describe("asks", () => {
     expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/reviews/12/${sha}/approve`, body: undefined }]);
   });
 
+  it("counts the pull requests past the review queue's limit, in one line", async () => {
+    const api = new FakeApi();
+    api.reviewBacklog = 7;
+    renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    const item = p.querySelector("[data-review-backlog]") as HTMLElement;
+    expect(item).toHaveTextContent("7 more pull requests wait beyond the queue's limit, with no review yet.");
+    expect(within(item).queryByRole("button")).toBeNull();
+  });
+
   it("has no toggle with three or fewer", async () => {
     const api = new FakeApi();
     api.asks = [ask({ question: "Only one" })];

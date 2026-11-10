@@ -17,7 +17,7 @@
 //
 // A PR the project doesn't trust (src/review-trust.ts) starts `held`, not `queued`: nothing of it reaches
 // an agent until the owner approves that commit. Past the cap on held jobs it starts `overflow`: the
-// same, but with no check and not in "Needs you", until a held slot frees. A held, overflow or dismissed
+// same, but its check says the review queue is full and it isn't in "Needs you", until a held slot frees. A held, overflow or dismissed
 // job is never requeued by GitHub's events; ReviewDO also refuses to requeue any job whose head needed
 // approval and never got it, whatever its state.
 //
