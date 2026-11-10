@@ -95,8 +95,8 @@ impl Config {
         for ((k, lo, hi), v) in TIMERS.iter().zip(c.timers_mut()) {
             let Some(raw) = var(k) else { continue };
             match clamp_ms(&raw, *lo, *hi) {
-                Some(d) => {
-                    if raw.trim().parse::<u128>().ok() != Some(d.as_millis()) {
+                Some((d, clamped)) => {
+                    if clamped {
                         tracing::warn!("{k}={raw} is out of range: using {} ms", d.as_millis());
                     }
                     *v = d;
@@ -116,16 +116,19 @@ impl Config {
 /// Each `NEST_RUNNER_*_MS` override and the range it is clamped to: zero would panic a `tokio`
 /// interval (batching, tailing) or make a grace meaningless, and a huge one overflow an `Instant`.
 pub const TIMERS: [(&str, Duration, Duration); 5] = [
-    ("NEST_RUNNER_IDLE_GRACE_MS", Duration::from_secs(1), Duration::from_secs(60 * 60)),
+    ("NEST_RUNNER_IDLE_GRACE_MS", Duration::from_secs(1), Duration::from_secs(3600)),
     ("NEST_RUNNER_BATCH_MS", Duration::from_millis(10), Duration::from_secs(10)),
     ("NEST_RUNNER_TAIL_MS", Duration::from_millis(10), Duration::from_secs(10)),
-    ("NEST_RUNNER_INTERRUPT_GRACE_MS", Duration::from_secs(1), Duration::from_secs(10 * 60)),
-    ("NEST_RUNNER_EXIT_GRACE_MS", Duration::from_secs(1), Duration::from_secs(10 * 60)),
+    ("NEST_RUNNER_INTERRUPT_GRACE_MS", Duration::from_secs(1), Duration::from_secs(600)),
+    ("NEST_RUNNER_EXIT_GRACE_MS", Duration::from_secs(1), Duration::from_secs(600)),
 ];
 
-/// A millisecond override clamped to `lo..=hi`; none if it isn't a whole number. Pure.
-pub fn clamp_ms(raw: &str, lo: Duration, hi: Duration) -> Option<Duration> {
-    raw.trim().parse::<u64>().ok().map(|n| Duration::from_millis(n).clamp(lo, hi))
+/// A millisecond override clamped to `lo..=hi`, and whether that changed it; none if it isn't a
+/// whole number. Pure.
+pub fn clamp_ms(raw: &str, lo: Duration, hi: Duration) -> Option<(Duration, bool)> {
+    let asked = Duration::from_millis(raw.trim().parse::<u64>().ok()?);
+    let d = asked.clamp(lo, hi);
+    Some((d, d != asked))
 }
 
 #[cfg(test)]
@@ -135,11 +138,11 @@ mod tests {
     #[test]
     fn a_timer_override_is_clamped_to_its_range() {
         let (lo, hi) = (Duration::from_secs(1), Duration::from_secs(600));
-        assert_eq!(clamp_ms("30000", lo, hi), Some(Duration::from_secs(30)));
-        assert_eq!(clamp_ms("0", lo, hi), Some(lo), "zero: the floor");
-        assert_eq!(clamp_ms(&u64::MAX.to_string(), lo, hi), Some(hi), "u64::MAX: the ceiling, no overflow");
-        assert_eq!(clamp_ms("1000", lo, hi), Some(lo));
-        assert_eq!(clamp_ms("600000", lo, hi), Some(hi));
+        assert_eq!(clamp_ms("30000", lo, hi), Some((Duration::from_secs(30), false)));
+        assert_eq!(clamp_ms("0", lo, hi), Some((lo, true)), "zero: the floor");
+        assert_eq!(clamp_ms(&u64::MAX.to_string(), lo, hi), Some((hi, true)), "u64::MAX: the ceiling, no overflow");
+        assert_eq!(clamp_ms(" 1000 ", lo, hi), Some((lo, false)), "the floor itself is in range");
+        assert_eq!(clamp_ms("600000", lo, hi), Some((hi, false)));
         assert_eq!(clamp_ms("-5", lo, hi), None);
         assert_eq!(clamp_ms("30s", lo, hi), None);
     }
@@ -158,6 +161,9 @@ mod tests {
         let c = Config::from_vars(|k| vars.get(k).cloned());
         let d = Config::default();
         assert_eq!(c.idle_grace, Duration::from_secs(1), "zero is clamped up");
+        let top = |k: &str, ms: &str| Config::from_vars(|v| (v == k).then(|| ms.to_string()));
+        assert_eq!(top("NEST_RUNNER_IDLE_GRACE_MS", "99999999").idle_grace, Duration::from_secs(3600), "an hour at most");
+        assert_eq!(top("NEST_RUNNER_INTERRUPT_GRACE_MS", "99999999").interrupt_grace, Duration::from_secs(600), "ten minutes at most");
         assert_eq!(c.batch_interval, Duration::from_millis(250));
         assert_eq!(c.tail_interval, d.tail_interval, "not a number: the default");
         assert_eq!(c.interrupt_grace, Duration::from_secs(2));
@@ -172,7 +178,7 @@ mod tests {
     fn the_defaults_are_inside_the_ranges() {
         let mut c = Config::default();
         for ((k, lo, hi), d) in TIMERS.iter().zip(c.timers_mut()) {
-            assert!(Duration::ZERO < *lo && lo <= d && d <= hi && *hi <= Duration::from_secs(60 * 60), "{k}");
+            assert!(Duration::ZERO < *lo && *lo <= *d && *d <= *hi && *hi <= Duration::from_secs(3600), "{k}");
         }
     }
 }
