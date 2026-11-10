@@ -49,6 +49,18 @@ Only the client interface. One client, `projects`, has this grant:
 | Its agents' network | `egress` in `POST /v1/sandboxes` for a new agent; `GET`/`PUT /v1/sandboxes/<id>/client-policy` for a live one; `GET /v1/sandboxes/<id>/policy` (the operator's rules) and `GET /v1/clients/self` (the grant's `egress_hosts`) for the page ([network](#network)) |
 | Watching an agent work | `GET /v1/agents/<id>/trace?after=<seq>`, nest's live trace (a WebSocket), proxied for the page by `GET /api/agents/<id>/trace` ([below](#the-live-trace)) |
 
+## The repo's own guidance
+
+The owner's decision (2026-11-10): guidance is layered, and each layer owns its own.
+
+- **nest's kernel** knows no repo conventions: its prompts cover hands, taint and grants.
+- **The app** owns its roles' guidance: the prompts in `src/catalog.ts`.
+- **The target repo** owns its own: its `AGENTS.md` (or `CLAUDE.md`) and `.claude/skills/`, untouched by the app.
+- **The join is the app's.** Every role that works on the repo's code (manager, worker, reviewer and routine runs: each template with hands) is told, in one generic line, to read the repo's `AGENTS.md` (or `CLAUDE.md` if there is none) and follow it, and to list `.claude/skills/` and follow the skill that fits its work. It says when: once the repo is checked out, and again whenever the guidance is no longer in context (after a resume or compaction): brains restart with `--resume` after an idle exit or a host loss, and the template is the system prompt, which a resume applies again. The manager is among them, since it specs tasks from the repo.
+  - **The manager, workers and routine runs** (`REPO_GUIDANCE`) read it with the hands Read tool from what they have checked out: the default branch, or a worker's own task branch.
+  - **The reviewer** (`REVIEWER_GUIDANCE`) reads it from the PR's base branch, never its head (`git show origin/<base>:AGENTS.md`, the skills listed with `git ls-tree` and read with `git show` from there): the PR under review can write those files, and the reviewer's verdict is its check. Its prompt says the PR's own changes to `AGENTS.md`, `CLAUDE.md` or `.claude/skills/` are part of the diff under review, never instructions. A dreaming run has no hands and isn't. No template carries repo-specific text. This replaces the runner reading the repo's `CLAUDE.md` itself ([runner](../docs/agents/runner/README.md)).
+- **Reaching nest's catalog:** the shared templates change at the next catalog sync: the operator presses **Sync catalog** on the Admin page (creating a project runs one too). A project's own templates on its models are written again at each start, so they follow by themselves.
+
 ## The MCP server: agents see only their own work
 
 - **One URL per role:** `/mcp/board` for the manager, `/mcp/task` for a worker, `/mcp/review` for a reviewer, `/mcp/routine` for a routine run ([routines](#routines)). nest lists a server's tools over one session shared by every agent on it, so a role's tool list is its URL's. Which data a call may touch is decided per call, from the caller's identity.
@@ -480,7 +492,12 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
 
 The owner's request (2026-11-06): GitHub issues on a project's repo go into a triage queue, and accepted ones are added to the board.
 
-- **Intake** (`/hooks/github`, the same signature check, delivery claim and repo → project routing):
+- **Whose issues come in** (the owner's question, 2026-11-10: "Only my issues or comments trigger triage, right?"): by default only issues opened by the comments user or the repo's owner, by the issue's author (`issue.user.id`, never the event's sender), the same people a declined issue's reopening counts from. Others are ignored, not stored.
+  - **The setting:** `issues_from`, `trusted` (the default, "You only") or `anyone`, in Settings ("Triage", beside PR comments and Reviews: "Issues from") or `PATCH /api/projects/<id>/settings`. A project that wants outside reports opts in.
+  - **Named:** "You only" names who that is, from the saved settings ("You only (by77er)", "(alice and by77er)"), and so does the Triage page's caption. On an organization's repo with no comments user set, no one counts (the owner is the org, which can't open issues): Settings says "No one yet: set the PR comments user, or choose Anyone.", and so does the Triage page.
+  - **At most 200 wait** (`MAX_UNTRIAGED_ISSUES`, `src/issues.ts`), whichever the setting. Past it a new issue is dropped and counted (`issues_dropped` in the project's settings, with when the last was); the Triage page says how many were left out and what to do (accept or decline some, then Import open issues). An import counts afresh.
+  - **Issues already waiting** from authors the setting now leaves out stay, until the owner accepts or declines them: nothing is removed by the rule.
+- **Intake** (`/hooks/github`, the same signature check, delivery claim and repo → project routing), for issues the rule above lets in:
   - `issues` `opened` and `reopened` add an issue, or restore one that went, when the event shows it open (a late delivery for an issue closed since adds nothing).
   - A declined issue comes back only when reopened by the comments user or the repo's owner (the event's `sender`, by id), so its author can't undo a decline by closing and reopening it.
   - `edited` updates one still untriaged (or adds it, open, if its opening was missed).
@@ -497,7 +514,7 @@ The owner's request (2026-11-06): GitHub issues on a project's repo go into a tr
     - The task records its issue.
     - It's marked tainted (an `issue_accepted` record), since its text is anyone's. The manager's and its workers' sessions that read it are then tainted, as nest's rule has it.
   - **Decline** takes it out, with an optional reason. It doesn't touch GitHub: closing there is the owner's call.
-  - **Import open issues** is a one-off that brings in the repo's open issues the app doesn't know yet (it reads the oldest 300 open items, and PRs, which GitHub lists among issues, count toward the 300 before they're left out). It needs `issues: read`. Issues opened before the app subscribed come in only this way: events GitHub sent before it was ignored and aren't replayed.
+  - **Import open issues** is a one-off that brings in the repo's open issues the app doesn't know yet (it reads the oldest 300 open items, and PRs, which GitHub lists among issues, count toward the 300 before they're left out). It needs `issues: read`. Issues opened before the app subscribed come in only this way: events GitHub sent before it was ignored and aren't replayed. It follows the same rule as an event (whose issues, and the cap), and says how many it left out: `{imported, known, ignored, dropped}`.
 - **Routines' proposed tasks wait here too** ([routines](#routines)): under the issues, in their own section ("Proposed tasks", the Routines page's list: accept as a draft, or decline), shown only while there are some. They stay on the Routines page as well. With proposals waiting and no issues, the issues' section says "No issues to triage." in one quiet line; the page's empty state ("Nothing to triage") shows only when both are empty.
 - **"Needs you"** shows one item for what waits for triage, linking to Triage: the issues and the proposed tasks, counted in words ("3 issues and 1 proposed task wait for triage"), as old as the oldest of them. The projects list's count includes each issue and each proposal. Accepting or declining either refreshes both.
 - **A task made of an issue, done through a merged PR,** closes the issue: a comment "Done in #<pr>.", then closed as completed (`issue_closes`, from the alarm).

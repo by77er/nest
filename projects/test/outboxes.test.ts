@@ -282,6 +282,8 @@ describe("the outboxes' migration", () => {
       // And the step after them (an attach's generation, early exits).
       sql.exec("ALTER TABLE settings DROP COLUMN attach_gen");
       sql.exec("DROP TABLE early_exits");
+      // And the triage-trust step's columns.
+      for (const c of ["issues_from", "issues_dropped", "issues_dropped_ms"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec("INSERT INTO task_prs (pr, task, state, attached_by, attached_ms) VALUES (61, 'tsk_gone', 'open', 'owner', 1), (62, 'tsk_gone', 'detached', 'owner', 1), (63, ?, 'open', 'owner', 1)", t.id);
       migrate(st.storage, MIGRATIONS);

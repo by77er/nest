@@ -4,6 +4,8 @@
 // and whether workers may change CI workflows (README.md#secrets). The Panels sit in one row with Save right under them at the bottom right; on a phone, one column,
 // so Save comes right after the last field.
 
+import { MAX_UNTRIAGED_ISSUES } from "../../../issues";
+import { issuesFromWho, names } from "../triage/words";
 import { Anchor, Badge, Button, NumberInput, Select, Switch, Text, TextInput } from "@mantine/core";
 import { schemaResolver, useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
@@ -63,7 +65,7 @@ const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", 
 
 const values = (s: Settings) => ({
   auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method, workers_edit_workflows: s.workers_edit_workflows,
-  manager_model: s.manager_model, worker_model: s.worker_model,
+  manager_model: s.manager_model, worker_model: s.worker_model, issues_from: s.issues_from,
   comments_from_login: s.comments_from?.login ?? null,
   // "Use the repo owner": the server takes the repo's owner by id, never this login.
   comments_from_repo_owner: false,
@@ -79,6 +81,8 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
   // The review gate (README.md#the-review-gate): held unless the project opted out. Sent only when changed.
   const held = settings.untrusted_reviews !== "review";
   const [hold, setHold] = useState(held);
+  // Who "you" is for issues, as saved (README.md#triage).
+  const who = issuesFromWho(settings);
 
   return (
     <form
@@ -162,13 +166,6 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
             </Section>
           </Panel>
           <Panel>
-            <Section title="CI workflows" order={4} region={false}>
-              <FieldGroup>
-                <WorkflowsSetting projectId={projectId} {...form.getInputProps("workers_edit_workflows", { type: "checkbox" })} />
-              </FieldGroup>
-            </Section>
-          </Panel>
-          <Panel>
             <Section title="Reviews" order={4} region={false}>
               <FieldGroup>
                 <Switch
@@ -211,6 +208,34 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                   spellCheck={false}
                 />
               </CommentsFrom>
+            </Section>
+          </Panel>
+          <Panel>
+            <Section title="Triage" order={4} region={false}>
+              <FieldGroup>
+                <Select
+                  label="Issues from"
+                  description="Which GitHub issues come into Triage, by who opened them: the PR comments user and the repo's owner (by GitHub id), or anyone."
+                  data={[{ value: "trusted", label: who.length ? `You only (${names(who)})` : "You only (no one yet)" }, { value: "anyone", label: "Anyone" }]}
+                  allowDeselect={false}
+                  {...form.getInputProps("issues_from")}
+                />
+                {!who.length && form.getValues().issues_from === "trusted" && (
+                  <Text fz="sm" c="warning" data-tone="warning" data-slot="issues-no-one">
+                    No one yet: set the PR comments user, or choose Anyone.
+                  </Text>
+                )}
+                <Text fz="sm" c="dimmed">
+                  Issues already waiting stay until you accept or decline them. At most {MAX_UNTRIAGED_ISSUES} wait at once.
+                </Text>
+              </FieldGroup>
+            </Section>
+          </Panel>
+          <Panel>
+            <Section title="CI workflows" order={4} region={false}>
+              <FieldGroup>
+                <WorkflowsSetting projectId={projectId} {...form.getInputProps("workers_edit_workflows", { type: "checkbox" })} />
+              </FieldGroup>
             </Section>
           </Panel>
         </SectionGrid>

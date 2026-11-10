@@ -21,7 +21,7 @@ export function project(over: Partial<ProjectRow> = {}): Project {
   const settings: Settings = {
     id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null, manager_start_owed: false, manager_model: "claude-fable-5-2", worker_model: "claude-opus-5-5",
     attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: row.created_ms },
-    auto_merge: false, merge_method: "squash", workers_edit_workflows: false, comments_from: { id: 1001, login: "owner" }, repo_owner: { id: 1001, login: "owner" }, repo_auto_merge: { state: "none", want: false, repo: null, error: null, at_ms: null }, max_routine_runs: 1, created_ms: row.created_ms,
+    auto_merge: false, merge_method: "squash", workers_edit_workflows: false, comments_from: { id: 1001, login: "owner" }, repo_owner: { id: 1001, login: "owner" }, repo_auto_merge: { state: "none", want: false, repo: null, error: null, at_ms: null }, max_routine_runs: 1, issues_from: "trusted", issues_dropped: null, created_ms: row.created_ms,
   };
   return { ...row, settings };
 }
@@ -144,6 +144,8 @@ export class FakeApi {
 
   /** The repo's issues waiting for triage. */
   issues: Issue[] = [];
+  /** What an import answers (README.md#triage): by default nothing new. */
+  importAnswer: { imported: number; known: number; ignored: number; dropped: number } | null = null;
   /** What the Worker's attention list answers: open asks and blocked tasks, oldest first. */
   /** A secrets change, like a network one, is owed to every live agent's layer (one revision for both). */
   layersOwed(): void {
@@ -318,7 +320,7 @@ export class FakeApi {
         return json({ declined: n });
       }
       case "POST issues/import":
-        return json({ imported: 0, known: this.issues.length });
+        return json(this.importAnswer ?? { imported: 0, known: this.issues.length, ignored: 0, dropped: 0 });
       case "POST asks/:ask/answer": {
         const a = this.asks.find((x) => x.ask === parts[3]);
         if (!a) return json({ error: "unknown ask" }, 404);

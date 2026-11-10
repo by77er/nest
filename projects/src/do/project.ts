@@ -6,6 +6,7 @@
 // after, from `drain` (run by the request that made the work, and by the alarm until it's done), and
 // re-read the row before acting on an answer, since other requests run while one awaits nest.
 
+import { type IssuesFrom, MAX_UNTRIAGED_ISSUES } from "../issues";
 import { DurableObject } from "cloudflare:workers";
 import { roleTemplate, TEMPLATE } from "../catalog";
 import { DEFAULT_MODEL, type ModelRole, modelProblem } from "../models";
@@ -65,8 +66,14 @@ export interface Settings {
   repo_owner: { id: number; login: string } | null;
   /** Routine runs live at once across the project (README.md#routines). */
   max_routine_runs: number;
+  /** Whose issues come into triage (README.md#triage): the comments user's or the repo owner's only, or anyone's. */
+  issues_from: IssuesFrom;
+  /** Issues dropped because triage held MAX_UNTRIAGED_ISSUES already, since the last import; and when the last was. */
+  issues_dropped: { count: number; last_ms: number } | null;
   created_ms: number;
 }
+
+export { MAX_UNTRIAGED_ISSUES };
 
 export interface AttachDetail {
   branch: string;
@@ -531,6 +538,14 @@ export const MIGRATIONS = [
     "ALTER TABLE model_templates ADD COLUMN del_attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE model_templates ADD COLUMN del_error TEXT",
   ],
+  [
+    // Whose issues come into triage (README.md#triage): `trusted` (the default: the comments user or the
+    // repo's owner, by the issue's author id) or `anyone`. Issues dropped for the cap on untriaged ones,
+    // since the last import, and when the last was.
+    "ALTER TABLE settings ADD COLUMN issues_from TEXT NOT NULL DEFAULT 'trusted'",
+    "ALTER TABLE settings ADD COLUMN issues_dropped INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE settings ADD COLUMN issues_dropped_ms INTEGER",
+  ],
 ] as const;
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
@@ -617,6 +632,8 @@ export class ProjectDO extends DurableObject<Env> {
         applied: r.am_applied ? (JSON.parse(r.am_applied as string) as Seen) : null, observed: r.am_observed ? (JSON.parse(r.am_observed as string) as Seen) : null,
       }),
       max_routine_runs: r.routine_cap as number,
+      issues_from: ((r.issues_from as string | undefined) ?? "trusted") as IssuesFrom,
+      issues_dropped: (r.issues_dropped as number | undefined) ? { count: r.issues_dropped as number, last_ms: r.issues_dropped_ms as number } : null,
       created_ms: r.created_ms as number,
     };
   }
@@ -629,7 +646,7 @@ export class ProjectDO extends DurableObject<Env> {
   async updateSettings(u: {
     auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean;
     comments_from_id?: number | null; comments_from_login?: string | null; comments_from_repo_owner?: boolean; max_routine_runs?: number;
-    manager_model?: string; worker_model?: string;
+    manager_model?: string; worker_model?: string; issues_from?: IssuesFrom;
   }): Promise<Result<Settings>> {
     const before = this.settings();
     if (!before) return fail(404, "unknown project");
@@ -678,6 +695,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (u.manager_model !== undefined) this.sql.exec("UPDATE settings SET manager_model = ?", u.manager_model);
     if (u.worker_model !== undefined) this.sql.exec("UPDATE settings SET worker_model = ?", u.worker_model);
     if (u.workers_edit_workflows !== undefined) this.sql.exec("UPDATE settings SET workers_edit_workflows = ?", u.workers_edit_workflows ? 1 : 0);
+    if (u.issues_from !== undefined) this.sql.exec("UPDATE settings SET issues_from = ?", u.issues_from);
     if (u.max_routine_runs !== undefined) {
       this.sql.exec("UPDATE settings SET routine_cap = ?", u.max_routine_runs);
       this.routinesTick(Date.now());
@@ -1148,28 +1166,40 @@ export class ProjectDO extends DurableObject<Env> {
    * closed, deleted or transferred takes an untriaged one out. An accepted issue is the task's from then
    * on: nothing here changes it. `sender` is the GitHub user id the event names as its actor.
    */
-  async onIssue(e: { action: string; number: number; title: string; body: string; author: string | null; url: string; open: boolean; sender?: number | null }): Promise<void> {
+  async onIssue(e: { action: string; number: number; title: string; body: string; author: string | null; author_id?: number | null; url: string; open: boolean; sender?: number | null }): Promise<"put" | "ignored" | "dropped" | "none"> {
     const s = this.settingsRow();
-    if (!s) return;
+    if (!s) return "none";
     const had = this.sql.exec("SELECT state FROM issues WHERE number = ?", e.number).toArray()[0];
     const now = Date.now();
     const title = e.title.slice(0, ISSUE_TITLE_MAX);
     const body = e.body.slice(0, ISSUE_BODY_MAX);
-    const put = () => this.sql.exec(
-      `INSERT INTO issues (number, title, body, author, url, state, opened_ms, updated_ms) VALUES (?, ?, ?, ?, ?, 'untriaged', ?, ?)
-        ON CONFLICT (number) DO UPDATE SET title = excluded.title, body = excluded.body, author = excluded.author, url = excluded.url,
-          state = 'untriaged', reason = NULL, triaged_ms = NULL, updated_ms = excluded.updated_ms`,
-      e.number, title, body, e.author, e.url, now, now,
-    );
+    // Into triage only an issue whose author (the issue's, not who acted) the project takes issues from,
+    // and only while triage holds fewer than MAX_UNTRIAGED_ISSUES; past it, dropped and counted.
+    const put = (): "put" | "ignored" | "dropped" => {
+      const author = e.author_id ?? null;
+      if (s.issues_from !== "anyone" && (author === null || (author !== s.comments_from_id && author !== s.repo_owner_id))) return "ignored";
+      if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM issues WHERE state = 'untriaged'").one().n >= MAX_UNTRIAGED_ISSUES) {
+        this.sql.exec("UPDATE settings SET issues_dropped = issues_dropped + 1, issues_dropped_ms = ?", now);
+        return "dropped";
+      }
+      this.sql.exec(
+        `INSERT INTO issues (number, title, body, author, url, state, opened_ms, updated_ms) VALUES (?, ?, ?, ?, ?, 'untriaged', ?, ?)
+          ON CONFLICT (number) DO UPDATE SET title = excluded.title, body = excluded.body, author = excluded.author, url = excluded.url,
+            state = 'untriaged', reason = NULL, triaged_ms = NULL, updated_ms = excluded.updated_ms`,
+        e.number, title, body, e.author, e.url, now, now,
+      );
+      return "put";
+    };
     if (e.action === "opened" || e.action === "reopened") {
       const trusted = typeof e.sender === "number" && (e.sender === s.comments_from_id || e.sender === s.repo_owner_id);
-      if (e.open && (!had || had.state === "gone" || (e.action === "reopened" && had.state === "declined" && trusted))) put();
+      if (e.open && (!had || had.state === "gone" || (e.action === "reopened" && had.state === "declined" && trusted))) return put();
     } else if (e.action === "edited") {
       if (had?.state === "untriaged") this.sql.exec("UPDATE issues SET title = ?, body = ?, updated_ms = ? WHERE number = ?", title, body, now, e.number);
-      else if (!had && e.open) put();
+      else if (!had && e.open) return put();
     } else if (e.action === "closed" || e.action === "deleted" || e.action === "transferred") {
       if (had?.state === "untriaged") this.sql.exec("UPDATE issues SET state = 'gone', updated_ms = ? WHERE number = ?", now, e.number);
     }
+    return "none";
   }
 
   /** The issues waiting for triage, oldest first. */
@@ -1218,7 +1248,7 @@ export class ProjectDO extends DurableObject<Env> {
    * GitHub (Issues: read), the oldest 300 open items, PRs among them (GitHub lists PRs as issues): the
    * PRs are left out, so fewer than 300 issues come in when PRs are open.
    */
-  async importIssues(): Promise<Result<{ imported: number; known: number }>> {
+  async importIssues(): Promise<Result<{ imported: number; known: number; ignored: number; dropped: number }>> {
     const s = this.settings();
     if (!s) return fail(404, "unknown project");
     const nest = nestFrom(this.env);
@@ -1232,6 +1262,10 @@ export class ProjectDO extends DurableObject<Env> {
     }
     let imported = 0;
     let known = 0;
+    let ignored = 0;
+    let dropped = 0;
+    // A fresh count of what the cap drops: the import reads every open issue again.
+    this.sql.exec("UPDATE settings SET issues_dropped = 0, issues_dropped_ms = NULL");
     for (const x of list) {
       const e = issueEventOf(x);
       if (!e) continue;
@@ -1239,10 +1273,13 @@ export class ProjectDO extends DurableObject<Env> {
         known++;
         continue;
       }
-      await this.onIssue({ action: "opened", ...e });
-      imported++;
+      // By the same rules as an opened issue's event: whose, and the cap.
+      const r = await this.onIssue({ action: "opened", ...e });
+      if (r === "put") imported++;
+      else if (r === "ignored") ignored++;
+      else if (r === "dropped") dropped++;
     }
-    return ok({ imported, known });
+    return ok({ imported, known, ignored, dropped });
   }
 
   /**
@@ -4058,7 +4095,7 @@ function issueOf(r: Row): Issue {
 }
 
 /** An issue as GitHub lists or sends it, in the fields triage keeps; null for a PR or a malformed one. */
-export function issueEventOf(x: unknown): { number: number; title: string; body: string; author: string | null; url: string; open: boolean } | null {
+export function issueEventOf(x: unknown): { number: number; title: string; body: string; author: string | null; author_id: number | null; url: string; open: boolean } | null {
   const o = typeof x === "object" && x !== null ? (x as Record<string, unknown>) : {};
   if (o.pull_request) return null;
   const number = typeof o.number === "number" && Number.isSafeInteger(o.number) && o.number > 0 ? o.number : null;
@@ -4067,7 +4104,10 @@ export function issueEventOf(x: unknown): { number: number; title: string; body:
   const user = typeof o.user === "object" && o.user !== null ? (o.user as Record<string, unknown>) : {};
   return {
     number, url, title: typeof o.title === "string" ? o.title : "", body: typeof o.body === "string" ? o.body : "",
-    author: typeof user.login === "string" ? user.login.slice(0, 100) : null, open: o.state !== "closed",
+    author: typeof user.login === "string" ? user.login.slice(0, 100) : null,
+    // Who opened it, by id (immutable): what whose issues come into triage is decided by.
+    author_id: typeof user.id === "number" && Number.isSafeInteger(user.id) && user.id > 0 ? user.id : null,
+    open: o.state !== "closed",
   };
 }
 

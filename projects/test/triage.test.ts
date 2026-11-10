@@ -6,6 +6,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
+import { MAX_UNTRIAGED_ISSUES } from "../src/do/project";
 import { AccessTeam, api, deliverGithub, FakeNest, GRANT_PERMISSIONS, installFetch, ownerIdOf, prEvent, shaOf } from "./fake-nest";
 
 const fake = new FakeNest();
@@ -29,11 +30,11 @@ async function newProject() {
   return { id: p.id as string, repo };
 }
 type P = Awaited<ReturnType<typeof newProject>>;
-const issueEvent = (p: P, action: string, n: number, o: { title?: string; body?: string; login?: string; pr?: boolean; state?: string; repo?: string; sender?: number } = {}) => ({
+const issueEvent = (p: P, action: string, n: number, o: { title?: string; body?: string; login?: string; pr?: boolean; state?: string; repo?: string; sender?: number; author?: number } = {}) => ({
   action,
   sender: { id: o.sender ?? ownerIdOf(o.login ?? "someone"), login: "x" },
   issue: {
-    number: n, title: o.title ?? `Issue ${n}`, body: o.body ?? "It breaks.", state: o.state ?? (action === "closed" ? "closed" : "open"), user: { login: o.login ?? "someone" },
+    number: n, title: o.title ?? `Issue ${n}`, body: o.body ?? "It breaks.", state: o.state ?? (action === "closed" ? "closed" : "open"), user: { login: o.login ?? "someone", ...(o.author === undefined ? {} : { id: o.author }) },
     html_url: `https://github.com/${o.repo ?? p.repo}/issues/${n}`, ...(o.pr ? { pull_request: { url: "x" } } : {}),
   },
   repository: { full_name: o.repo ?? p.repo },
@@ -110,6 +111,72 @@ describe("intake", () => {
   });
 });
 
+describe("whose issues come in", () => {
+  const ownerOf = (p: P) => ownerIdOf(p.repo.split("/")[0]!);
+  const settings = (p: P, b: Record<string, unknown>) => api(token, "PATCH", `/api/projects/${p.id}/settings`, b);
+
+  it("by default only the repo owner's and the comments user's, by the issue's author: not by who acted on it", async () => {
+    const p = await newProject();
+    expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings).toMatchObject({ issues_from: "trusted", issues_dropped: null });
+    await settings(p, { comments_from_id: 4242 });
+    await deliverGithub("issues", issueEvent(p, "opened", 1, { author: ownerOf(p) }));
+    await deliverGithub("issues", issueEvent(p, "opened", 2, { author: 4242 }));
+    // A stranger's, though the repo's owner acted on it (an edit, a reopen): not stored.
+    await deliverGithub("issues", issueEvent(p, "opened", 3, { author: 77, sender: ownerOf(p) }));
+    await deliverGithub("issues", issueEvent(p, "edited", 3, { author: 77, sender: ownerOf(p) }));
+    await deliverGithub("issues", issueEvent(p, "reopened", 3, { author: 77, sender: ownerOf(p) }));
+    // An issue naming no author: not stored either.
+    await deliverGithub("issues", { ...issueEvent(p, "opened", 4), issue: { ...issueEvent(p, "opened", 4).issue, user: { login: "ghost", id: undefined } } });
+    // The owner's, though a stranger acted on it: stored.
+    await deliverGithub("issues", issueEvent(p, "opened", 5, { author: ownerOf(p), sender: 77 }));
+    expect(await numbers(p)).toEqual([1, 2, 5]);
+    expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT number FROM issues WHERE number IN (3, 4)").toArray())).toEqual([]);
+  });
+
+  it("anyone's once the project takes them; switched back, those waiting stay for the owner to decline", async () => {
+    const p = await newProject();
+    expect((await settings(p, { issues_from: "anyone" })).body).toMatchObject({ issues_from: "anyone" });
+    await deliverGithub("issues", issueEvent(p, "opened", 1, { author: 77 }));
+    expect(await numbers(p)).toEqual([1]);
+    await settings(p, { issues_from: "trusted" });
+    await deliverGithub("issues", issueEvent(p, "opened", 2, { author: 77 }));
+    expect(await numbers(p)).toEqual([1]);
+    expect((await settings(p, { issues_from: "everyone" })).status).toBe(400);
+  });
+
+  it("import follows the same rule, and says how many it left out", async () => {
+    const p = await newProject();
+    const gh = new Map<number, { title: string; body: string; state: "open" | "closed"; login: string; user_id?: number; comments: string[] }>();
+    fake.github.issues.set(p.repo, gh);
+    gh.set(1, { title: "Mine", body: "", state: "open", login: "me", comments: [] });
+    gh.set(2, { title: "A stranger's", body: "", state: "open", login: "x", user_id: 77, comments: [] });
+    expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).body).toEqual({ imported: 1, known: 0, ignored: 1, dropped: 0 });
+    expect(await numbers(p)).toEqual([1]);
+  });
+
+  it(`at most ${MAX_UNTRIAGED_ISSUES} wait, whoever's: past it new ones are dropped and counted, and an import counts afresh`, async () => {
+    const p = await newProject();
+    await settings(p, { issues_from: "anyone" });
+    await runInDurableObject(stub(p), (_o, st) => {
+      for (let n = 1; n <= MAX_UNTRIAGED_ISSUES; n++) {
+        st.storage.sql.exec("INSERT INTO issues (number, title, body, author, url, state, opened_ms, updated_ms) VALUES (?, 't', 'b', 'a', 'https://github.com/x/y/issues/1', 'untriaged', 1, 1)", n);
+      }
+    });
+    await deliverGithub("issues", issueEvent(p, "opened", 1001, { author: ownerOf(p) }));
+    await deliverGithub("issues", issueEvent(p, "opened", 1002, { author: 77 }));
+    expect(await numbers(p)).toHaveLength(MAX_UNTRIAGED_ISSUES);
+    expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.issues_dropped).toEqual({ count: 2, last_ms: expect.any(Number) });
+    // One declined: room for the next.
+    await api(token, "POST", `/api/projects/${p.id}/issues/1/decline`, {});
+    await deliverGithub("issues", issueEvent(p, "opened", 1003, { author: 77 }));
+    expect(await numbers(p)).toContain(1003);
+    // An import reads every open issue again: its count is the dropped ones now.
+    fake.github.issues.set(p.repo, new Map());
+    await api(token, "POST", `/api/projects/${p.id}/issues/import`);
+    expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.issues_dropped).toBeNull();
+  });
+});
+
 describe("the owner's triage", () => {
   it("accept makes a draft task of the issue (tainted, linked back); decline takes it out with a reason; neither twice", async () => {
     const p = await newProject();
@@ -181,9 +248,9 @@ describe("the owner's triage", () => {
     gh.set(23, { title: "Closed", body: "", state: "closed", login: "a", comments: [] });
     await deliverGithub("issues", issueEvent(p, "opened", 24));
     gh.set(24, { title: "Issue 24", body: "", state: "open", login: "a", comments: [] });
-    expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).body).toEqual({ imported: 1, known: 1 });
+    expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).body).toEqual({ imported: 1, known: 1, ignored: 0, dropped: 0 });
     expect((await numbers(p)).sort()).toEqual([21, 24]);
-    expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).body).toEqual({ imported: 0, known: 2 });
+    expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).body).toEqual({ imported: 0, known: 2, ignored: 0, dropped: 0 });
   });
 
   it("import reads page after page, PRs counting toward the 300 it reads, and stops there", async () => {
@@ -193,11 +260,13 @@ describe("the owner's triage", () => {
     // 350 open: every fifth a PR, so the first 300 hold 240 issues.
     for (let n = 1; n <= 350; n++) gh.set(n, { title: `Item ${n}`, body: "", state: "open", login: "a", pr: n % 5 === 0, comments: [] });
     const before = fake.github.callsTo("GET", new RegExp(`^/repos/${p.repo}/issues$`)).length;
-    expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).body).toEqual({ imported: 240, known: 0 });
+    // 240 issues read; triage holds at most MAX_UNTRIAGED_ISSUES, the oldest first, the rest dropped and counted.
+    expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).body).toEqual({ imported: MAX_UNTRIAGED_ISSUES, known: 0, ignored: 0, dropped: 240 - MAX_UNTRIAGED_ISSUES });
     expect(fake.github.callsTo("GET", new RegExp(`^/repos/${p.repo}/issues$`)).length - before).toBe(3);
     const got = await numbers(p);
+    expect(got).toHaveLength(MAX_UNTRIAGED_ISSUES);
     expect(got).toContain(101);
-    expect(got).toContain(299);
+    expect(Math.max(...got)).toBe(249);
     expect(got.some((n) => n > 300)).toBe(false);
     expect(got.some((n) => n % 5 === 0)).toBe(false);
   });

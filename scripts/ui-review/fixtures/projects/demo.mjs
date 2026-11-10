@@ -9,7 +9,9 @@
 // "chat-code" (a reply with every syntax token), "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
 // a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
-// issues or proposals waiting) / "proposals-only" (no issues, two routines' proposals) / "held-reviews" and "held-many" (reviews waiting for the owner's approval: two, or a dozen with long titles and logins) / "reviews-open" (the review gate turned off) / "triage-long" (24 issues, long titles, bodies and logins), or "routines-empty" (no
+// issues or proposals waiting) / "proposals-only" (no issues, two routines' proposals) / "issues-anyone" (issues from
+// anyone) / "triage-dropped" (issues the cap on waiting ones left out) / "issues-no-one" (an org's repo, no comments user:
+// no one's issues come in) / "held-reviews" and "held-many" (reviews waiting for the owner's approval: two, or a dozen with long titles and logins) / "reviews-open" (the review gate turned off) / "triage-long" (24 issues, long titles, bodies and logins), or "routines-empty" (no
 // routines, runs, proposals or notes) / "routines-long" (many and long runs, proposals and notes). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
@@ -279,8 +281,12 @@ const RICH = [
     // Whose PR comments reach workers (README.md#pr-comments): nobody by default here; set, or set by id only.
     untrusted_reviews: variant === "reviews-open" ? "review" : "hold",
     comments_from: variant === "comments-set" ? { id: 5839471, login: "by77er" } : variant === "comments-id-only" ? { id: 5839471, login: null } : null,
-    repo_owner: { id: 5839471, login: "by77er" },
+    // An organization's repo with no comments user (issues-no-one): no one's issues come into triage.
+    repo_owner: variant === "issues-no-one" ? null : { id: 5839471, login: "by77er" },
     max_routine_runs: 1,
+    // Whose issues come into triage (README.md#triage), and (triage-dropped) how many the cap left out.
+    issues_from: variant === "issues-anyone" || variant === "triage-dropped" ? "anyone" : "trusted",
+    issues_dropped: variant === "triage-dropped" ? { count: 17, last_ms: now - 25 * 60_000 } : null,
     // The models (README.md#models): the defaults, or (models-custom) a long custom id for the workers.
     manager_model: "claude-fable-5-2",
     worker_model: variant === "models-custom" ? "us.anthropic.claude-opus-5-5-20260915-v1:0[1m]" : "claude-opus-5-5",

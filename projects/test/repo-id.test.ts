@@ -27,6 +27,8 @@ let nextId = 1_000_000 + Math.floor(Math.random() * 1_000_000);
 async function newProject() {
   const repo = `o-${rand()}/r-${rand()}`.toLowerCase();
   const p = (await api(token, "POST", "/api/projects", { name: repo, repo })).body;
+  // Issues from anyone: these tests route events, renamed and transferred repos' among them.
+  await api(token, "PATCH", `/api/projects/${p.id}/settings`, { issues_from: "anyone" });
   return { id: p.id as string, repo };
 }
 /**

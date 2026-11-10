@@ -34,6 +34,8 @@ const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 10);
 async function newProject() {
   const repo = `o-${rand()}/r-${rand()}`.toLowerCase();
   const p = (await api(token, "POST", "/api/projects", { name: repo, repo })).body;
+  // Issues from anyone: these tests route events, renamed and transferred repos' among them.
+  await api(token, "PATCH", `/api/projects/${p.id}/settings`, { issues_from: "anyone" });
   return { id: p.id as string, repo };
 }
 type P = Awaited<ReturnType<typeof newProject>>;
