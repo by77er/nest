@@ -45,6 +45,7 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 |---|---|
 | [ci.md](ci.md) | The checks every change must pass |
 | [deploy.md](deploy.md) | `deploy.yml`, the health window, `rollback.yml` |
+| [rollout/](rollout/README.md) | each release's rollout rule, one file per change |
 | [github.md](github.md) | The App's permissions and bindings for this repo, branch protection, merge policy |
 | [setup.md](setup.md) | What I set up on GitHub and Cloudflare for all of the above |
 | [practices.md](practices.md) | Guards, test rules, evidence tiers, review and supply chain: what keeps agent-written changes safe |

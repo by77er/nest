@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use nestd_core::shadow::{self as shadow_core, Shadows, Slot};
+use nestd_core::ca::{Answer as CaAnswer, CaRenewal, Saved as CaSaved};
 use nestd_core::checkpoint::{DiskStamp, Pass, SENTINEL, ScanMemo};
 use nestd_core::incarnation;
 use nestd_core::results::ResultCache;
@@ -67,10 +68,6 @@ const CLI_RELAY_TIMEOUT_S: u64 = 27;
 /// Extra time beyond an `ask`'s `wait_s` for the control plane to answer `pending` (the guest
 /// allows `wait_s + 15`).
 const CLI_RELAY_SLACK_S: u64 = 12;
-/// Renew the proxy intermediate CA when less than this remains.
-const CA_RENEW_BEFORE_MS: i64 = 48 * 3600 * 1000;
-/// Retry a CA renewal that got no answer after this long.
-const CA_RENEW_RETRY: Duration = Duration::from_secs(600);
 /// How often capacity is re-evaluated (emitted when it changed, or every 10 minutes).
 const CAPACITY_EVERY: Duration = Duration::from_secs(30);
 /// GC: first offer a few minutes after start, then hourly.
@@ -308,7 +305,9 @@ pub struct Inner {
     lapse_guard: LapseGuard,
     denied_seen: RecentSet<(SandboxId, String, u16)>,
     alerts_seen: RecentSet<(SandboxId, String, String)>,
-    proxy_ca: Mutex<CaState>,
+    /// The proxy intermediate CA's renewal (`nestd_core::ca`): the installed key, its expiry, and
+    /// a renewal in flight. An answer installs only with a key its certificate names.
+    proxy_ca: Mutex<CaRenewal<Secret>>,
     /// Lock-free pause handles of running VMs (fencing freezes vCPUs without the sandbox lock).
     pausers: Pausers,
     limiter: Limiter,
@@ -323,15 +322,6 @@ pub struct Inner {
     /// sandbox lock, never under it.
     commit_locks: Mutex<HashMap<(SandboxId, Epoch), CommitLock>>,
     next_cut: std::sync::atomic::AtomicU64,
-}
-
-/// The proxy intermediate CA: current key and expiry, and a renewal in flight.
-#[derive(Default)]
-struct CaState {
-    key: Option<Secret>,
-    expires_ms: Option<i64>,
-    /// Key of an outstanding renewal CSR and when it was sent.
-    pending: Option<(Secret, Instant)>,
 }
 
 /// Running nestd instance.
@@ -568,7 +558,15 @@ impl Host {
         let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
         let (lease_tx, lease_rx) = watch::channel(None);
 
-        if let Some((ca, key)) = &enrolled.proxy_ca {
+        // The CA and key the host enrolled with (or saved): installed only if the key is the
+        // certificate's. A pair that isn't (one a previous release persisted after pairing a late
+        // answer with another key) installs nothing and is renewed at once.
+        let saved = enrolled.proxy_ca.as_ref().map(|(ca, key)| CaSaved { key: key.clone(), expires_ms: ca.expires_ms, matches: ca_key_matches(&ca.cert_pem, key) });
+        if saved.as_ref().is_some_and(|s| !s.matches) {
+            tracing::error!("the saved proxy CA's key is not its certificate's: nothing installed, renewing it now");
+        }
+        let proxy_ca = CaRenewal::from_saved(saved);
+        if let (Some(key), Some((ca, _))) = (proxy_ca.current(), &enrolled.proxy_ca) {
             proxy.apply(ProxyOp::CaInstall { ca: ca.clone(), key_pem: key.clone() });
         }
         runner.host_token(enrolled.host_token.clone(), enrolled.host_token_expires_ms);
@@ -621,11 +619,7 @@ impl Host {
             lapse_guard: LapseGuard::default(),
             denied_seen: RecentSet::new(RELAY_DEDUP_WINDOW, MAX_DENIED_SEEN),
             alerts_seen: RecentSet::new(RELAY_DEDUP_WINDOW, MAX_DENIED_SEEN),
-            proxy_ca: Mutex::new(CaState {
-                key: enrolled.proxy_ca.as_ref().map(|(_, k)| k.clone()),
-                expires_ms: enrolled.proxy_ca.as_ref().map(|(c, _)| c.expires_ms),
-                pending: None,
-            }),
+            proxy_ca: Mutex::new(proxy_ca),
             pausers: Pausers::default(),
             limiter: Limiter::default(),
             cli_inflight: Mutex::new(HashMap::new()),
@@ -973,23 +967,16 @@ impl Inner {
                 self.gateway.keys(keys);
             }
             FleetNotice::ProxyCa(ca) => {
-                // A renewal answer is for the pending key; otherwise it re-issues the current one.
-                let key = {
-                    let mut st = self.proxy_ca.lock().expect("ca");
-                    let key = st.pending.take().map(|(k, _)| k).or_else(|| st.key.clone());
-                    if key.is_some() {
-                        st.key = key.clone();
-                        st.expires_ms = Some(ca.expires_ms);
-                    }
-                    key
-                };
-                match key {
-                    Some(key_pem) => {
+                // Installed only with the key its certificate names: the renewal's, or the current
+                // one's (a re-issue). A late answer to a CSR whose key was replaced is refused.
+                let answer = self.proxy_ca.lock().expect("ca").answered(ca.expires_ms, |k| ca_key_matches(&ca.cert_pem, k));
+                match answer {
+                    CaAnswer::Renewed(key_pem) | CaAnswer::Reissued(key_pem) => {
                         tracing::info!(expires_ms = ca.expires_ms, "installing proxy intermediate CA");
                         crate::credentials::update_proxy_ca(&self.cfg.credentials_path(), &ca, key_pem.expose());
                         self.proxy.apply(ProxyOp::CaInstall { ca, key_pem });
                     }
-                    None => tracing::warn!("received proxy CA without a local key"),
+                    CaAnswer::Refused => tracing::error!(expires_ms = ca.expires_ms, "refusing a proxy CA whose public key is neither the renewal's nor the current one's"),
                 }
             }
             FleetNotice::Connected { lease } => tracing::info!(?lease, "fleet connected"),
@@ -1434,26 +1421,22 @@ impl Inner {
         }
     }
 
-    /// Send a `ca_renew` CSR (new key) when the proxy CA is within [`CA_RENEW_BEFORE_MS`] of
-    /// expiry; retry after [`CA_RENEW_RETRY`] without an answer. An expired CA breaks inspected
+    /// Send a `ca_renew` CSR (new key) when the proxy CA is near its expiry, and again after a
+    /// while without an answer (`nestd_core::ca::CaRenewal::due`). An expired CA breaks inspected
     /// egress (the proxy fails closed), so it is logged loudly.
     fn maybe_renew_ca(&self) {
         let mut st = self.proxy_ca.lock().expect("ca");
-        let Some(expires) = st.expires_ms else { return };
-        let remaining = expires - now_ms();
-        if remaining <= 0 {
-            tracing::error!(expires_ms = expires, "proxy intermediate CA has EXPIRED: inspected egress fails closed until renewed");
+        let (now, mono) = (now_ms(), crate::util::boottime().as_millis() as u64);
+        if st.expired(now) {
+            tracing::error!(expires_ms = st.expires_ms(), "proxy intermediate CA has EXPIRED: inspected egress fails closed until renewed");
         }
-        if remaining > CA_RENEW_BEFORE_MS {
-            return;
-        }
-        if st.pending.as_ref().is_some_and(|(_, at)| at.elapsed() < CA_RENEW_RETRY) {
+        if !st.due(now, mono) {
             return;
         }
         match crate::enroll::proxy_ca_csr(&self.cfg.cell) {
             Ok((key, csr_pem)) => {
-                tracing::info!(expires_ms = expires, "renewing the proxy intermediate CA");
-                st.pending = Some((key, Instant::now()));
+                tracing::info!(expires_ms = st.expires_ms(), "renewing the proxy intermediate CA");
+                st.asked(key, mono);
                 let _ = self.fleet.send(FleetInput::CaRenew { csr_pem });
             }
             Err(e) => tracing::error!(error = %e, "proxy CA renewal: CSR generation failed"),
@@ -2008,7 +1991,7 @@ impl Inner {
             if self.fenced(id, epoch)
                 && let Some(vm) = s.vm.as_mut()
             {
-                let _ = vm.pause().await;
+                refreeze_fenced(id, epoch, vm.as_mut()).await;
             }
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
@@ -2182,7 +2165,7 @@ impl Inner {
             if self.fenced(id, epoch)
                 && let Some(vm) = s.vm.as_mut()
             {
-                let _ = vm.pause().await;
+                refreeze_fenced(id, epoch, vm.as_mut()).await;
             }
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
@@ -3179,12 +3162,32 @@ fn cli_agent_refusal(agent: Option<&AgentId>) -> Option<CliResult> {
     Some(CliResult::Error { error: error(error_codes::INVALID_MESSAGE, format!("NEST_AGENT_ID {shown:?} is not an agent id"), false) })
 }
 
+/// Whether `key_pem` is the private half of the key `cert_pem` (the proxy CA's certificate) names.
+fn ca_key_matches(cert_pem: &str, key_pem: &Secret) -> bool {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    let (Ok(cert), Ok(key)) = (CertificateDer::from_pem_slice(cert_pem.as_bytes()), rcgen::KeyPair::from_pem(key_pem.expose())) else { return false };
+    nestd_core::ca::cert_public_key(&cert).is_some_and(|k| k == rcgen::PublicKeyData::der_bytes(&key))
+}
+
 fn grow_filesystem(disk: &std::path::Path) -> anyhow::Result<()> {
     let out = std::process::Command::new("resize2fs").arg("-f").arg(disk).output().context("run resize2fs")?;
     anyhow::ensure!(out.status.success(), "resize2fs {}: {}", disk.display(), String::from_utf8_lossy(&out.stderr).trim());
     Ok(())
 }
 
+
+/// Freeze a fenced VM again after a resume undid the fence's pause: as the fence's own pauser does,
+/// keeping what it stops when not everything can be (a fenced guest must not run on), and saying
+/// when it fails.
+async fn refreeze_fenced(id: &SandboxId, epoch: Epoch, vm: &mut dyn Vm) {
+    let r = match vm.pauser() {
+        Some(p) => p.pause().await,
+        None => vm.pause().await,
+    };
+    if let Err(e) = r {
+        tracing::warn!(sandbox = %id, epoch = epoch.0, error = %e, "a fenced VM can't be frozen again");
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::LapseGuard;

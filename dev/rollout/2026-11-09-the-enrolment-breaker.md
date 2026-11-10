@@ -1,0 +1,5 @@
+# The enrolment breaker (2026-11-09)
+
+A release's rollout rule ([Rollout rules](../deploy.md#rollout-rules)).
+
+**Not a one-way deploy, and no ordering constraint.** No Durable Object class or host change. FleetDO gains nullable columns, `launched.type` and `launched.image`, and a `kv` key per host kind, `enroll_breaker:<kind>`. The admin fleet view gains an optional `enroll_breakers`, which this release's dashboard shows and the previous one ignores (the dashboard reads it as none when absent). FleetDO gains `launchPause` and `resetEnrollBreakers` and a `kv` key `enroll_breaker_basis`; SandboxDO a `kv` key `placement_wait`, shown as an optional field; the Worker a route, `POST /v1/admin/fleet/enroll-breakers/reset`. A SandboxDO calling a FleetDO of the previous release gets an error for `launchPause` and notes nothing. A `wrangler rollback`: the previous release ignores both and launches as before, relaunching a failing type every enrolment timeout. A breaker this release opened then applies again once it is redeployed.

@@ -12,15 +12,27 @@ import type { z } from "zod";
 
 export type CreateSpec = z.output<typeof CreateProject>;
 
+/** A sync writes again at most this many times while the repos change under it. */
+const SYNC_ROUNDS = 5;
+
 /** Write the catalog again with every project's repo (the templates may push only to attached repos). */
 export async function syncRepos(env: Env): Promise<{ ok: true; written: string[]; repos: string[] } | { ok: false; status: number; error: string }> {
   const nest = nestFrom(env);
   if (!nest) return { ok: false, status: 503, error: "NEST_CLIENT_TOKEN is not set" };
-  const repos = await directory(env).repos();
   try {
-    const r = await syncCatalog(nest, env.PUBLIC_BASE_URL, repos);
-    await directory(env).recordSync({ written: r.written, repos });
-    return { ok: true, written: r.written, repos };
+    // Two syncs at once (two projects created together) may write from different snapshots, the older
+    // landing last and dropping the newer repo. So each writes, then reads the repos again, and writes
+    // again while they changed: the set only grows, and every sync's last write follows its last read,
+    // so the catalog ends with every repo. A few rounds at most (each round is a project created meanwhile).
+    for (let round = 0; ; round++) {
+      const repos = await directory(env).repos();
+      const r = await syncCatalog(nest, env.PUBLIC_BASE_URL, repos);
+      const now = await directory(env).repos();
+      if (now.join("\n") === repos.join("\n") || round >= SYNC_ROUNDS) {
+        await directory(env).recordSync({ written: r.written, repos });
+        return { ok: true, written: r.written, repos };
+      }
+    }
   } catch (e) {
     return { ok: false, status: 502, error: `the catalog sync failed: ${e instanceof Error ? e.message : String(e)}` };
   }

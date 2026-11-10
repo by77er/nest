@@ -21,6 +21,7 @@
 
 extern crate alloc;
 
+pub mod ca;
 pub mod checkpoint;
 pub mod detach;
 pub mod fleet;
@@ -29,3 +30,4 @@ pub mod invariant;
 pub mod lease;
 pub mod results;
 pub mod shadow;
+pub mod tree;

@@ -602,6 +602,9 @@ export const ROUTES: Route[] = [
       return broker(env).putSecret(p.secret, r.value, r.expires_ms);
     },
   }),
+  // The operator deletes a secret it stored: the value is gone, not only hidden (BrokerDO refuses its own keys and clients' secrets).
+  route({ method: "DELETE", path: "/v1/admin/secrets/:secret", auth: "admin", run: ({ env, p }) =>
+    newMethod("BrokerDO.deleteSecret", () => broker(env).deleteSecret(p.secret)) }),
 
   // Templates and capabilities (docs/agents/capabilities/): data the operator edits.
   route({ method: "GET", path: "/v1/admin/catalog", auth: "admin", run: ({ env }) => catalog(env).catalog() }),
@@ -623,6 +626,10 @@ export const ROUTES: Route[] = [
   }),
   route({ method: "GET", path: "/v1/admin/capabilities/:name/oauth", auth: "admin", run: async ({ env, p }) =>
     broker(env).oauthStatus((await oauthCapability(env, p.name)).mcp.auth.oauth) }),
+  // Revoke its authorization: by the capability's name as the record holds it, so one whose capability
+  // was already deleted can still be revoked.
+  route({ method: "DELETE", path: "/v1/admin/capabilities/:name/oauth", auth: "admin", run: ({ env, p }) =>
+    newMethod("BrokerDO.oauthRevoke", () => broker(env).oauthRevoke(catalogName(p.name))) }),
   // No admin token: a browser follows the authorization server's redirect here. The single-use, 10-minute
   // state names the flow the operator started, and the code is useless without that flow's PKCE verifier.
   route({ method: "GET", path: "/v1/oauth/callback", auth: "none", run: async ({ env, url }) => {

@@ -29,7 +29,7 @@ description: Use when changing anything that crosses a process boundary in nest:
 - **Brain and sandbox hosts may be a release apart** in either direction. The gateway protocol serves `[min_supported, current]`, and features follow the guest's advertised `capabilities` ([gateway](../../../docs/interfaces/gateway/README.md#versions-and-capabilities)). Raising `min_supported` is a one-way release.
 - **Gate new behaviour on a flag the peer sends** in its hello: an optional bool, default false, stored per host. The example is `brain_epochs` (`hello.brain_epochs.json`, FleetDO's `hosts.brain_epochs`). Send the new thing only to peers that advertise it.
 - **Handle previous-release peers structurally,** not by reasoning about their old code. For example, FleetDO never gives a brain to a host without `brain_epochs` and drains such a host of brains on sight.
-- **Record the window** in the interface doc's pending list, and its rollout rule in `dev/deploy.md`. Name the release that drops the shim.
+- **Record the window** in the interface doc's pending list, and its rollout rule in a new file under `dev/rollout/`. Name the release that drops the shim.
 
 ## Verify
 

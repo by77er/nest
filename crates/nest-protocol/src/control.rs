@@ -730,7 +730,19 @@ pub enum RunnerToAgent {
     /// rewritten (shrank / new inode): discard earlier segments, this one starts at offset 0.
     /// Acknowledged by `segment_ack` after the bytes are durable in R2. Not seq-numbered:
     /// offsets are the ordering and dedup key.
-    Segment { session: SessionId, offset: u64, base: bool, data_b64: String },
+    ///
+    /// `total_bytes`, on a base segment: how many bytes of the rewritten file this base and the
+    /// segments right after it carry. AgentDO makes the rewrite the resumable base only once that
+    /// many are durable, so a rewrite cut off part-way never replaces the complete one before it.
+    /// Absent from a runner of the previous release (AgentDO then commits as it always did).
+    Segment {
+        session: SessionId,
+        offset: u64,
+        base: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_bytes: Option<u64>,
+        data_b64: String,
+    },
     /// Reliable, batched every 1–2 s; coalesced (heartbeat-ish tool events may be dropped
     /// under pressure, leaving a seq gap that AgentDO repairs from the session).
     Events { seq: Seq, events: Vec<AgentEvent> },

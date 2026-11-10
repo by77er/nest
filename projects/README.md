@@ -72,7 +72,7 @@ Only the client interface. One client, `projects`, has this grant:
   2. makes the check `nest-projects/review` required on it, with nothing else changed. A branch with no protection gets a minimal one: that check alone, `strict: false`, `enforce_admins: false`, no required reviews, no restrictions;
   3. only then starts the project's manager.
 
-  A failure is shown on the project (`attach_error`), with the manager not started. A refusal that will repeat (the App not installed, the repo outside the grant, no admin) waits for the owner's `POST /api/projects/:id/attach`; anything else is retried from the alarm.
+  A failure is shown on the project (`attach_error`), with the manager not started. A refusal that will repeat (the App not installed, the repo outside the grant, no admin) waits for the owner's `POST /api/projects/:id/attach`; anything else is retried from the alarm. An attach owed while one runs (the owner's retry, the App's id learned) is a new generation (`attach_gen`): the running one's outcome doesn't clear it, so it runs after.
 - **A task:**
   1. It's created (`draft`).
   2. The manager specs it (`ready`).
@@ -257,7 +257,6 @@ The owner's request (2026-11-06), after the sweep (B10): creating a project used
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.
 - Tasks without a PR (research, specs) end by the owner marking them done, from `draft`, `ready` or `stalled`.
 - Routing GitHub's events by `repository.id` and the installation id recorded at attach rather than by `full_name` ([PR comments](#pr-comments); a follow-up).
-- Whether PRs from outside the owner's account are reviewed: on a public repo anyone's PR starts a reviewer (the owner asked for any PR). `max_concurrent_reviews` caps how many run at once, not how many run.
 
 ## Built: the core
 
@@ -274,7 +273,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **The app's client id is its token's** (`nest_cli_<id>_…` → `cli_<id>`), the way nest itself reads it.
 - **Agents:**
   - **Every agent gets a sandbox of its own,** made first (`POST /v1/sandboxes`) with the agent's labels, and ended with it (`stop {end: true, destroy_sandbox: true}`). An agent create nest refuses for good destroys the sandbox made for it (`Nest.startAgent`), so a refused start leaves nothing behind; not on a 409, whose key's earlier create may have landed (an agent may be using the sandbox). The manager has one too, to read the code it specs. The agent clones the repo itself.
-  - **Repo access:** the worker's template pushes to every attached project's repo (`repos`); the manager's and the reviewer's only read them (`read_repos`), so nest refuses their sandboxes' pushes and REST writes (comments, reviews) and mints them only `contents: read`. Each spawn narrows the list to its project's repo (`overrides.repos` or `overrides.read_repos`). Creating a project syncs the catalog again first.
+  - **Repo access:** the worker's template pushes to every attached project's repo (`repos`); the manager's and the reviewer's only read them (`read_repos`), so nest refuses their sandboxes' pushes and REST writes (comments, reviews) and mints them only `contents: read`. Each spawn narrows the list to its project's repo (`overrides.repos` or `overrides.read_repos`). Creating a project syncs the catalog again first. Two syncs at once (two projects created together) can't drop a repo: each writes, reads the repos again, and writes again while they changed.
   - **Labels:** `project`, `role`, `task` for a worker, and `start`, the task's (or the manager's) start count. They find the app's agents again after a gap (`GET /v1/agents?label=…`).
   - **Creates are idempotent:** each start attempt sends `Idempotency-Key: <project>/<task or manager>/<start>/{sandbox,agent}` with its creates, so a retry after a lost answer gets the same sandbox and agent back. A key nest is still handling (a retryable 409) is retried like a 503; a key bound to another request (a 409 that isn't) is a refusal for good.
   - **First input:** the worker's brief (title, body, spec, repo, branch) and the manager's go to their inbox with a request id, so a retry posts once. A brief for a task any tainted session wrote is posted as relayed text (`from: "projects/board"`), so the worker's session is tainted too.
@@ -299,10 +298,10 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - GitHub doesn't redeliver by itself (unverified: its docs offer manual redelivery only). A lost `pull_request` leaves the head without the check, which blocks merging until the next push or a redelivery.
 - **The queue:**
   - One job per PR head. An event with an older `updated_at` than the PR's last is ignored, since deliveries aren't ordered. A head moving back to a reviewed commit, or a reopened PR, queues that commit again.
-  - **`max_concurrent_reviews`**: per project, unset (no cap) by default, set with `PATCH /api/projects/:id/settings`. Jobs start from ReviewDO's alarm, oldest first, while running ones are fewer.
+  - **`max_concurrent_reviews`**: per project, unset (no cap) by default, set with `PATCH /api/projects/:id/settings`. Jobs start from ReviewDO's alarm, oldest first, while running ones are fewer. A `PATCH` that changes it with other settings is all or nothing: ProjectDO's part first (its refusals come before it writes), then this.
   - **Retries:** every call to GitHub or nest is retried from the alarm (5 s doubling to 5 min). A refusal that will repeat fails the job with the reason, its check `action_required`. A check-run create whose answer was lost is found again by its `external_id`, not made twice.
   - **Reviewers:** made as workers are (`Nest.startAgent`, `Idempotency-Key: <project>/review/<pr>/<sha>/<start>/{sandbox,agent}`), labelled `project`, `role=reviewer`, `pr`, `sha`, `start`, reading the repo but unable to push or write to it (`read_repos`, above), and ended with their sandboxes (`stop {end, destroy_sandbox}`) on a verdict, a newer head, a closed PR, an exit, or the run's deadline. Ephemeral: a reviewer ends itself once its turn is done, verdict or not (from the catalog sync after deploy, which writes the template; until then the deadline covers it). Two more starts after one ends without a verdict.
-  - **The job's states** are one table (`src/review-job.ts`): queued → running → done, failed, superseded or closed, and back to queued on a re-run. Every change of a job's state goes through it, only from the state the row has (so an ended job never ends twice, and its check completes once). A running job always has a deadline (`REVIEW_DEADLINE_MS`, 60 minutes per reviewer): past it, the attempt is spent as an exit's is.
+  - **The job's states** are one table (`src/review-job.ts`): queued → running → done, failed, superseded or closed, and back to queued on a re-run; and, for a PR the project doesn't trust, `held` or `overflow` → queued (approved) or `dismissed` ([the review gate](#the-review-gate)). Every change of a job's state goes through it, only from the state the row has (so an ended job never ends twice, and its check completes once). A running job always has a deadline (`REVIEW_DEADLINE_MS`, 60 minutes per reviewer): past it, the attempt is spent as an exit's is.
   - **The brief** has only what the app knows from GitHub's routing (repo, number, head, base), none of the PR's own text. `review_get` gives the title.
 - **The check:** `nest-projects/review`, created `in_progress` at the head with `details_url` the project's board. On completion:
   - a verdict: `success` only if all three pass, else `failure`. The title names the failed dimensions, the summary is the reviewer's, the text holds each dimension's notes, the reviewer and whether its session was tainted. Clipped to GitHub's 65535 characters (the title to 255; GitHub documents no limit for it);
@@ -315,6 +314,26 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
   - **The App's id:** the check is required from the App (`checks: [{context, app_id}]`) from the first attach, so no other app or commit status can pass it. The id is the `app_id` of nest's token answer ([GitHub tokens](../docs/control-plane/api/clients/#github-tokens)). If an answer has none (nest can't tell), the check is required from any source (`contexts`, or `checks` without `app_id` where other entries are pinned, which keeps their pins), and the first check run's `app.id` then pins it: the project attaches again. Another entry's `app_id: null` (any source) is sent back as `-1`, GitHub's "any app".
   - Rulesets aren't read or changed: a repo protected by rulesets alone gets branch protection besides.
 - **Tasks and PRs:** a `pull_request` from the repo's own branch `task/<id>` (not a fork's) links the PR to its task (`pr_opened`) if the worker hadn't reported it. Merged, the task is `done` (through `pr_opened` first if it was still `in_progress`) and its worker ended.
+
+## The review gate
+
+**Code:** `src/review-trust.ts` (the decision, pure), ReviewDO's `held` and `overflow` states, `src/github-hook.ts`. Tests: `test/review-gate.test.ts`. Decided 2026-11-09.
+
+A review starts an agent on the PR's code, on the owner's subscription and hosts, so on a public repo it starts by itself only for a PR the project trusts:
+- **Trusted:** the head is a branch of the repo itself (not a fork: pushing there needs write access), and the author is, by `pull_request.user.id` of the signed webhook, the project's comments user ([PR comments](#pr-comments)), the repo's owner, or the App's own bot (workers' task PRs). Ids only, never logins.
+  - **The bot's id** is looked up (`GET /users/<app_slug>[bot]`, the slug from nest's token answer) whenever a bot's PR from the repo doesn't match the id kept in DirectoryDO (none yet, or a stale one), and kept. A lookup that fails holds that PR.
+  - **Decided again at every PR event:** jobs waiting for approval whose author the project trusts by now (the bot's id learned, a comments user set) start then. Never a fork's.
+- **Anything else is `held`:** a job in the table's `held` state, with a check completed as `action_required` ("Waiting for the owner's approval"). No reviewer, no sandbox, and none of the PR's text or diff reaches any agent. It shows in "Needs you" and on the Reviews page (pinned first) with **Review this PR** and **Dismiss** (`POST /api/projects/:id/reviews/:pr/:sha/approve` and `/dismiss`).
+- **An approval is for one head commit and one run.** Approving queues that commit's review, if it is still the open PR's head. A push to the PR makes a new job, held again. A PR closed and reopened, or pushed away from and back to a commit, is held again, approved before or not. A dismissed job can still be approved.
+- **GitHub's "Re-run"** of the check never starts a review of a head that needs approval and hasn't had it, whatever state its job is in (the job records `needs_approval`); it re-runs a review that was approved or needed none.
+- **Bounded:**
+  - at most 50 held jobs per project (`MAX_HELD`). A head past that waits as `overflow`: its check says the review queue is full, it isn't in "Needs you", the Reviews page lists it right after the held ones (approvable there), and it becomes held, the longest waiting first, as slots free (an approval, a dismissal, a close, a newer head);
+  - at most 500 overflow jobs (`MAX_OVERFLOW`). A head past that gets no job and no check, so nothing can start its review; it is kept with its PR, "Needs you" says how many such PRs wait, and each gets its job (overflow, as untrusted as it was), the longest waiting first, as room frees;
+  - at most one held check run per PR a minute (`HELD_CHECK_INTERVAL_MS`): a head pushed sooner gets its check when the minute is up, if it is still the head. A held job that is superseded or closed owes GitHub nothing more, so fast pushes cost one check-run create and one update a minute.
+- **The check's order:** a held job's check is made before the job can start (ReviewDO's drains run one at a time), so after an approval the commit's latest check is the review's own; a held check whose job moved on while it was being made completes as `cancelled`.
+- **The setting:** `untrusted_reviews`, `hold` (the default) or `review` (every PR is reviewed, as before the gate), in Settings ("Reviews": one switch, with what turning it off means) or `PATCH /api/projects/:id/settings`. It decides heads as they arrive: switching to `review` starts nothing that already waits (held, overflow or without a job: the owner approves or dismisses those, or a new push is reviewed), and switching back to `hold` stops nothing that runs.
+- **Rollout:** expand-only (five columns on ReviewDO's `jobs`, five on `prs`). A project whose repo an organization owns and that has no comments user trusts only the App's bot, so its people's PRs are held until a comments user is set.
+- **Rollback:** the previous release has no row for `held` or `overflow` in its job table (`review-job.ts`). It reviews new PRs unasked again and leaves such jobs alone (it starts only `queued` ones). GitHub's "Re-run" of such a job's check throws there (the delivery fails, nothing starts), and its Reviews page can't show them. Redeploying this release picks them up as they were.
 
 ## Auto-merge
 
@@ -701,6 +720,19 @@ npm test       # two vitest projects: `worker` (workerd) and `ui` (jsdom, Testin
 ```
 
 **Spawning:** a worker may run Claude Code's own subagents (the `Agent` tool, through nest's `subagents` capability). They live in its brain and reach the same sandbox through its hands, with the same grant and taint. No role gets nest-level spawning (`spawn_agent`, `fork_sandbox`): the app starts every agent itself, one worker per task (`test/catalog-roles.test.ts`).
+
+## Retention
+
+Terminal rows of history-like tables are pruned by age, at most hourly from each object's drain (`src/retention.ts`):
+- ReviewDO: ended review jobs after 30 days, except an open PR's current head's (a re-run of its check needs it) and any whose check update is still owed.
+- ProjectDO: nest's error events after 30 days, except a refused stop (`stop_failed`) while its stop is still failed ([outboxes](#outboxes): the only sign an agent nest wouldn't stop may still run, until the owner retries or dismisses it); triaged proposals after 30 days; ended routine runs after 90 days (none with a clean-up owed); a run's counted turns a day after it ended.
+- Both: exits that came before their start named the agent (`early_exits`), after a day.
+
+Kept: a task's history, the chat, memory, issues (a declined issue's row keeps an import from bringing it back), and anything live or owed.
+
+## Agents that exit before they're named
+
+An agent's `agent.exited` can overtake its create's answer. A worker's, reviewer's or routine run's exit that no row names yet is kept (`early_exits`), and the start that learns the agent from the create's answer finds it: the task stalls, the review spends an attempt, the run waits for a turn as after any exit before one. Each start also names its agent in the step the answer comes, before any other await.
 
 ## Setup (the operator's)
 

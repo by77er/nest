@@ -143,12 +143,14 @@ struct FakeVm {
     guest: Option<tokio::task::JoinHandle<()>>,
 }
 
-struct FakePauser(Arc<Mutex<Vec<(String, u64)>>>, String, u64);
+/// The lock-free pauser: each pause is recorded, and in the VM's ops as `pauser <sandbox>`.
+struct FakePauser(Arc<Mutex<Vec<(String, u64)>>>, String, u64, Arc<Mutex<Vec<String>>>);
 
 #[async_trait]
 impl nestd::driver::Pauser for FakePauser {
     async fn pause(&self) -> std::io::Result<()> {
         self.0.lock().unwrap().push((self.1.clone(), self.2));
+        self.3.lock().unwrap().push(format!("pauser {}", self.1));
         Ok(())
     }
 }
@@ -156,7 +158,7 @@ impl nestd::driver::Pauser for FakePauser {
 #[async_trait]
 impl Vm for FakeVm {
     fn pauser(&self) -> Option<Arc<dyn nestd::driver::Pauser>> {
-        Some(Arc::new(FakePauser(self.paused.clone(), self.spec.sandbox.0.clone(), self.spec.epoch.0)))
+        Some(Arc::new(FakePauser(self.paused.clone(), self.spec.sandbox.0.clone(), self.spec.epoch.0, self.vm_ops.clone())))
     }
     fn vsock_uds_path(&self) -> PathBuf {
         self.spec.vm_dir.join("vsock.sock")
@@ -365,6 +367,21 @@ const STEADY_LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms:
 /// partition fences quickly.
 const LAPSING_LEASE: LeaseTiming = LeaseTiming { heartbeat_ms: 50, host_fence_ms: 500, cp_expiry_ms: 800 };
 
+/// A CA certificate for the key a CSR names, signed by a throwaway root (what FleetDO does).
+fn sign_csr(csr_pem: &str) -> String {
+    let mut root = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    root.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let issuer = rcgen::Issuer::new(root, rcgen::KeyPair::generate().unwrap());
+    let mut csr = rcgen::CertificateSigningRequestParams::from_pem(csr_pem).unwrap();
+    csr.params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    csr.signed_by(&issuer).unwrap().pem()
+}
+
+/// A CSR for a key nestd never made.
+fn other_csr() -> String {
+    rcgen::CertificateParams::new(Vec::<String>::new()).unwrap().serialize_request(&rcgen::KeyPair::generate().unwrap()).unwrap().pem().unwrap()
+}
+
 /// Mock FleetDO. Accepts reconnects. While `partition` is set it answers nothing on the open
 /// connection and refuses new ones (a network partition); clearing it lets the host reconnect.
 /// Like FleetDO, it keeps each command batch until the host acks it and, after each hello_ack,
@@ -525,8 +542,13 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
                                 log2.lock().unwrap().acks.push(up_to.0);
                             }
                             HostToFleet::CaRenew { csr_pem } => {
+                                // Signed for the CSR's key, as FleetDO does; and first, a certificate
+                                // for another key (a late answer to a CSR whose key was replaced),
+                                // which nestd must refuse.
+                                let late = CaCertificate { cert_pem: sign_csr(&other_csr()), chain_pem: "CHAIN".into(), expires_ms: i64::MAX / 4 };
+                                let _ = ws.send(send(FleetToHost::ProxyCa(late))).await;
+                                let ca = CaCertificate { cert_pem: sign_csr(&csr_pem), chain_pem: "CHAIN".into(), expires_ms: i64::MAX / 2 };
                                 log2.lock().unwrap().ca_renews.push(csr_pem);
-                                let ca = CaCertificate { cert_pem: "RENEWED".into(), chain_pem: "CHAIN".into(), expires_ms: i64::MAX / 2 };
                                 let _ = ws.send(send(FleetToHost::ProxyCa(ca))).await;
                             }
                         }
@@ -1555,19 +1577,69 @@ async fn retryable_fleet_error_resends_the_failed_batch() {
     assert!(results.windows(2).all(|w| w[0] == w[1]), "a redelivered command is answered with its first outcome: {results:?}");
 }
 
-/// Review #10: the proxy intermediate CA is renewed (new key + CSR) before it expires, and the
-/// renewed certificate is installed in nest-proxy with the new key.
+/// A CA certificate for a fresh key, expiring at `expires_ms` (what a host saved at enrollment).
+fn ca_pair(expires_ms: i64) -> (CaCertificate, nest_protocol::host::Secret) {
+    let key = rcgen::KeyPair::generate().unwrap();
+    let mut p = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+    p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    let cert = p.self_signed(&key).unwrap();
+    (CaCertificate { cert_pem: cert.pem(), chain_pem: cert.pem(), expires_ms }, nest_protocol::host::Secret(key.serialize_pem()))
+}
+
+/// Whether `key_pem` is the key `ca`'s certificate names.
+fn names_its_key(ca: &CaCertificate, key_pem: &str) -> bool {
+    use rustls::pki_types::{CertificateDer, pem::PemObject};
+    let cert = CertificateDer::from_pem_slice(ca.cert_pem.as_bytes()).unwrap();
+    nestd_core::ca::cert_public_key(&cert) == Some(rcgen::PublicKeyData::der_bytes(&rcgen::KeyPair::from_pem(key_pem).unwrap()))
+}
+
+fn ca_installs(h: &Started) -> Vec<(CaCertificate, String)> {
+    h.proxy.lock().unwrap().iter().filter_map(|c| match c { ProxyCommand::CaInstall { ca, key_pem } => Some((ca.clone(), key_pem.0.clone())), _ => None }).collect()
+}
+
+/// Review #10: a saved CA near its expiry is installed at start, then renewed (a CSR for a new key); the
+/// renewal's certificate is installed with that key. Audit P-B2: the certificate for another key
+/// that the mock sends first (a late answer to a CSR whose key was replaced) is never installed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxy_ca_is_renewed_before_expiry() {
     let soon = nestd_now_ms() + 3600 * 1000; // expires in an hour: inside the renewal window
-    let ca = CaCertificate { cert_pem: "ORIGINAL".into(), chain_pem: "CHAIN".into(), expires_ms: soon };
-    let h = start_host_with(Some((ca, nest_protocol::host::Secret("OLD KEY".into())))).await;
+    let (ca, key) = ca_pair(soon);
+    let h = start_host_with(Some((ca.clone(), key.clone()))).await;
     wait_until("ca_renew", || !h.fleet.log.lock().unwrap().ca_renews.is_empty()).await;
     assert!(h.fleet.log.lock().unwrap().ca_renews[0].contains("BEGIN CERTIFICATE REQUEST"));
-    wait_until("renewed CA installed", || {
-        h.proxy.lock().unwrap().iter().any(|c| matches!(c, ProxyCommand::CaInstall { ca, key_pem } if ca.cert_pem == "RENEWED" && key_pem.0.contains("PRIVATE KEY")))
-    })
-    .await;
+    wait_until("renewed CA installed", || ca_installs(&h).iter().any(|(c, k)| c.expires_ms == i64::MAX / 2 && names_its_key(c, k))).await;
+    let installs = ca_installs(&h);
+    assert_eq!(installs.len(), 2, "the saved CA, then the renewal's: {:?}", installs.iter().map(|(c, _)| c.expires_ms).collect::<Vec<_>>());
+    assert_eq!((installs[0].0.expires_ms, installs[0].1.as_str()), (soon, key.0.as_str()), "the saved pair installed at start");
+    assert!(installs.iter().all(|(c, k)| names_its_key(c, k)));
+}
+
+/// A saved CA far from its expiry is installed and not renewed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_ca_far_from_expiry_is_installed_and_kept() {
+    let (ca, key) = ca_pair(nestd_now_ms() + 7 * 24 * 3600 * 1000);
+    let h = start_host_with(Some((ca.clone(), key.clone()))).await;
+    wait_until("the saved CA installed", || !ca_installs(&h).is_empty()).await;
+    // Housekeeping looks at the CA, then reports capacity: once that is in, the CA was looked at.
+    h.fleet.wait_event("startup capacity", |b| matches!(b, HostEventBody::Capacity { .. })).await;
+    assert!(h.fleet.log.lock().unwrap().ca_renews.is_empty(), "renewed a week before expiry");
+    assert_eq!(ca_installs(&h).len(), 1);
+}
+
+/// Audit P-B2: a saved pair whose key isn't its certificate's (a previous release could persist
+/// one) is never installed, and is renewed at once though its certificate is far from expiry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_saved_ca_whose_key_isnt_its_certificates_is_renewed_at_once() {
+    let far = nestd_now_ms() + 7 * 24 * 3600 * 1000;
+    let (ca, _) = ca_pair(far);
+    let (_, other_key) = ca_pair(far);
+    let h = start_host_with(Some((ca, other_key))).await;
+    wait_until("ca_renew", || !h.fleet.log.lock().unwrap().ca_renews.is_empty()).await;
+    wait_until("renewed CA installed", || !ca_installs(&h).is_empty()).await;
+    let installs = ca_installs(&h);
+    assert_eq!(installs.len(), 1, "only the renewal's certificate");
+    assert_eq!(installs[0].0.expires_ms, i64::MAX / 2);
+    assert!(names_its_key(&installs[0].0, &installs[0].1));
 }
 
 /// Review #17, revised for per-incarnation directories: a newer-epoch create of a sandbox that
@@ -2087,8 +2159,9 @@ async fn a_replaced_disk_file_is_read() {
 }
 
 /// Review of #122: a fence that lands between a checkpoint's "not fenced" check and its resume is
-/// undone by the resume, so the checkpoint freezes the VM again. (The fence's own lock-free pause
-/// may run before the resume, as here: the resume is held until the fence has marked the row.)
+/// undone by the resume, so the checkpoint freezes the VM again, through the fence's pauser (which
+/// keeps what it stops when not everything can be). (The fence's own lock-free pause may run before
+/// the resume, as here: the resume is held until the fence has marked the row.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_during_a_checkpoints_resume_freezes_the_vm_again() {
     let h = start_host().await;
@@ -2106,7 +2179,7 @@ async fn a_fence_during_a_checkpoints_resume_freezes_the_vm_again() {
     wait_until("the VM is stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
     let ops = h.vm.vm_ops.lock().unwrap().clone();
     let resumed = ops.iter().rposition(|o| o == "resume sbx_1").expect("resumed");
-    assert!(ops[resumed + 1..].iter().any(|o| o == "pause sbx_1"), "frozen again after the resume: {ops:?}");
+    assert!(ops[resumed + 1..].iter().any(|o| o == "pauser sbx_1"), "frozen again after the resume: {ops:?}");
 }
 
 /// A drain whose deadline passes while a suspend waits for its commit's answer gives the suspend

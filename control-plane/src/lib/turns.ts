@@ -16,6 +16,41 @@ const InboxStatusEnum = z.enum(["delivered", "consumed"]);
 const TURN = TurnStatusEnum.enum;
 const INBOX = InboxStatusEnum.enum;
 
+// --- the ledgers' steps (pure) ------------------------------------------------------------------------
+
+/**
+ * What happens to a turn: `claim` (Q2, the pump takes it), `complete` (Q3), `recover` (Q4, cut short by a
+ * restart), `drop` (the agent ended for good), `abandon` (an active row that isn't the agent's turn any
+ * more, found by the prune).
+ */
+export const TURN_EVENTS = ["claim", "complete", "recover", "drop", "abandon"] as const;
+export type TurnEvent = (typeof TURN_EVENTS)[number];
+export const TURN_STATUSES = TurnStatusEnum.options;
+
+/**
+ * The turn ledger's one step: the status after `event`, or `refuse` when the event doesn't apply there.
+ * `done`, `interrupted` and `dropped` are final: nothing moves a turn out of them. Every write to
+ * `turns.status` goes through it (`TurnQueue.apply`), so no caller can skip a guard.
+ */
+export function turnStep(status: TurnStatus, event: TurnEvent): TurnStatus | "refuse" {
+  if (status === "queued") return event === "claim" ? "active" : event === "drop" ? "dropped" : "refuse";
+  if (status === "active") {
+    return event === "complete" ? "done" : event === "recover" || event === "abandon" ? "interrupted" : event === "drop" ? "dropped" : "refuse";
+  }
+  return "refuse";
+}
+
+/** What happens to a mirrored message: the runner showed it (`confirm`), its turn ended, or it outlived its turn (`abandon`: requeued as a turn, like one unconfirmed at a turn's end). */
+export const INBOX_EVENTS = ["confirm", "turn_ended", "abandon"] as const;
+export type InboxEvent = (typeof INBOX_EVENTS)[number];
+export type InboxStatus = z.output<typeof InboxStatusEnum>;
+export const INBOX_STATUSES = InboxStatusEnum.options;
+
+/** The inbox mirror's one step: a delivered message is consumed by any of its events; a consumed one is final. */
+export function inboxStep(status: InboxStatus, _event: InboxEvent): InboxStatus | "refuse" {
+  return status === "delivered" ? "consumed" : "refuse";
+}
+
 /** Separates a recovery turn's notes from the original turn's text. */
 export const RECOVERY_MARK = "\nThe turn was:\n";
 
@@ -48,6 +83,29 @@ export class TurnQueue {
     sql.exec("CREATE UNIQUE INDEX IF NOT EXISTS inbox_request ON inbox (request_id) WHERE request_id IS NOT NULL");
   }
 
+  /**
+   * Apply `event` to the turns matching `where`, as `turnStep` decides for each one's status: a row whose
+   * status refuses the event is left as it is. How many rows moved.
+   */
+  private apply(event: TurnEvent, where: string, ...args: SqlStorageValue[]): number {
+    let n = 0;
+    for (const from of TURN_STATUSES) {
+      const to = turnStep(from, event);
+      if (to !== "refuse") n += this.sql.exec(`UPDATE turns SET status = ? WHERE status = ? AND (${where})`, to, from, ...args).rowsWritten;
+    }
+    return n;
+  }
+
+  /** As `apply`, for mirrored messages (`inboxStep`). */
+  private applyInbox(event: InboxEvent, where = "1", ...args: SqlStorageValue[]): number {
+    let n = 0;
+    for (const from of INBOX_STATUSES) {
+      const to = inboxStep(from, event);
+      if (to !== "refuse") n += this.sql.exec(`UPDATE inbox SET status = ? WHERE status = ? AND (${where})`, to, from, ...args).rowsWritten;
+    }
+    return n;
+  }
+
   // --- turns (Q1-Q4) ------------------------------------------------------------------------------
 
   turnFor(requestId: string): string | undefined {
@@ -72,7 +130,8 @@ export class TurnQueue {
     const next = this.sql.exec<{ turn: string; input: string; recovers: string | null }>(
       `SELECT turn, input, recovers FROM turns WHERE status = '${TURN.queued}' ORDER BY ord LIMIT 1`).toArray()[0];
     if (!next) return undefined;
-    this.sql.exec(`UPDATE turns SET status = '${TURN.active}', started_ms = ? WHERE turn = ?`, now, next.turn);
+    this.apply("claim", "turn = ?", next.turn);
+    this.sql.exec("UPDATE turns SET started_ms = ? WHERE turn = ?", now, next.turn);
     return { turn: next.turn, input: JSON.parse(next.input) as TurnInput, recovers: next.recovers };
   }
 
@@ -89,27 +148,41 @@ export class TurnQueue {
   /**
    * Q3. Mirrored messages the runner never confirmed (`inbox_delivered`) come back as one queued turn:
    * first if one of them interrupted the turn (it was meant for now), else where the first of them
-   * arrived: behind the queued turns created by then, ahead of those created later.
+   * arrived: behind the queued turns created by then, ahead of those created later. Whether the turn was
+   * active (one already done, cut short or dropped stays so; its unseen messages are requeued all the same).
    */
-  complete(turn: string, now = Date.now()): void {
-    this.sql.exec(`UPDATE turns SET status = '${TURN.done}' WHERE turn = ?`, turn);
+  complete(turn: string, now = Date.now()): boolean {
+    const completed = this.apply("complete", "turn = ?", turn) > 0;
+    this.requeueUnseen("turn_ended", now);
+    return completed;
+  }
+
+  /**
+   * The mirrored messages matching `where` that the runner never confirmed come back as one queued turn
+   * (once: keyed by the first of them), and are consumed by `event` in the same step.
+   */
+  private requeueUnseen(event: InboxEvent, now: number, where = "1", ...args: SqlStorageValue[]): void {
     const unseen = this.sql.exec<{ message: string; request_id: string | null; created_ms: number }>(
-      `SELECT message, request_id, created_ms FROM inbox WHERE status = '${INBOX.delivered}' ORDER BY rowid`).toArray()
+      `SELECT message, request_id, created_ms FROM inbox WHERE status = '${INBOX.delivered}' AND (${where}) ORDER BY rowid`, ...args).toArray()
       .map((r) => ({ message: JSON.parse(r.message) as InboxMessage, request_id: r.request_id, created_ms: r.created_ms }));
     if (unseen.length) {
       const { input, requestId } = requeuedTurn(unseen);
       const ord = unseen.some((r) => r.message.interrupt) ? this.ord("MIN") - 1 : this.ordArrivedAt(Math.min(...unseen.map((r) => r.created_ms)));
       this.insert(input, ord, requestId, null, now, true);
     }
-    this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE status = '${INBOX.delivered}'`);
+    this.applyInbox(event, where, ...args);
   }
 
-  /** Q4: `turn` was cut short by a restart; a recovery turn continuing it goes first, in the same step. */
-  recover(turn: string, notes: string[], now = Date.now()): void {
+  /**
+   * Q4: `turn` was cut short by a restart; a recovery turn continuing it goes first, in the same step.
+   * Only an active turn is recovered, once: one already done, interrupted or dropped gets no recovery
+   * turn (asked twice, the second is nothing). Whether it was.
+   */
+  recover(turn: string, notes: string[], now = Date.now()): boolean {
     const row = this.sql.exec<{ input: string }>("SELECT input FROM turns WHERE turn = ?", turn).toArray()[0];
-    this.sql.exec(`UPDATE turns SET status = '${TURN.interrupted}' WHERE turn = ?`, turn);
-    if (!row) return;
+    if (!row || this.apply("recover", "turn = ?", turn) === 0) return false;
     this.insert(recoveryInput(JSON.parse(row.input) as TurnInput, notes), this.ord("MIN") - 1, null, turn, now);
+    return true;
   }
 
   /**
@@ -117,9 +190,8 @@ export class TurnQueue {
    * gone), is dropped, and mirrored messages with them. How many turns went.
    */
   dropAll(active: string | null = null): number {
-    const n = this.sql.exec(`UPDATE turns SET status = '${TURN.dropped}' WHERE status = '${TURN.queued}' OR (status = '${TURN.active}' AND turn = ?)`,
-      active ?? "").rowsWritten;
-    this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE status = '${INBOX.delivered}'`);
+    const n = this.apply("drop", `status = '${TURN.queued}' OR turn = ?`, active ?? "");
+    this.applyInbox("turn_ended");
     return n;
   }
 
@@ -154,7 +226,7 @@ export class TurnQueue {
 
   /** The runner showed mirrored message `id` to the model; whether it was still mirrored. */
   confirm(id: string): boolean {
-    return this.sql.exec(`UPDATE inbox SET status = '${INBOX.consumed}' WHERE id = ? AND status = '${INBOX.delivered}'`, id).rowsWritten > 0;
+    return this.applyInbox("confirm", "id = ?", id) > 0;
   }
 
   mirrored(): InboxMessage[] {
@@ -162,8 +234,18 @@ export class TurnQueue {
       .toArray().map((r) => JSON.parse(r.message) as InboxMessage);
   }
 
-  prune(cutoff: number): void {
-    this.sql.exec(`DELETE FROM turns WHERE status IN ('${TURN.done}', '${TURN.interrupted}', '${TURN.dropped}') AND created_ms < ?`, cutoff);
+  /**
+   * Rows older than `cutoff` go once final. Rows that can't become final on their own are settled first,
+   * by age, so none stays for ever: an `active` turn that isn't `current` (the agent's turn now) and
+   * started before `cutoff` is abandoned (interrupted), and a message still mirrored to a turn that is no
+   * longer active comes back as a queued turn, as at a turn's end (never shown to the model, it isn't
+   * dropped). Queued turns are work still to run: they stay until run or dropped.
+   */
+  prune(cutoff: number, current: string | null = null, now = Date.now()): void {
+    this.apply("abandon", "turn <> ? AND COALESCE(started_ms, created_ms) < ?", current ?? "", cutoff);
+    this.requeueUnseen("abandon", now, `created_ms < ? AND (turn IS NULL OR turn NOT IN (SELECT turn FROM turns WHERE status = '${TURN.active}'))`, cutoff);
+    const final = TURN_STATUSES.filter((st) => TURN_EVENTS.every((e) => turnStep(st, e) === "refuse"));
+    this.sql.exec(`DELETE FROM turns WHERE status IN (${final.map((st) => `'${st}'`).join(", ")}) AND created_ms < ?`, cutoff);
     this.sql.exec(`DELETE FROM inbox WHERE status = '${INBOX.consumed}' AND created_ms < ?`, cutoff);
   }
 
