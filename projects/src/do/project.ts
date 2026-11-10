@@ -1974,7 +1974,8 @@ export class ProjectDO extends DurableObject<Env> {
         if (route.role === "manager" && s.manager === e.agent) {
           this.sql.exec("INSERT OR IGNORE INTO chat (at_ms, sender, text, event_id) VALUES (?, 'app', ?, ?)", Date.now(), `The manager ended (${e.reason ?? "exited"}).`, e.id);
           // A new one starts, up to a few times an hour (README.md#the-manager-lifecycle); the ended one's
-          // sandbox is destroyed first (its stop, owed again here).
+          // sandbox is destroyed first (its stop, owed again here: `stop` destroys it through the sandbox API,
+          // since stopping an agent that ended destroys nothing).
           this.managerMove({ kind: "ended", agent: e.agent, reason: e.reason ?? "exited" });
         }
         if (route.role === "worker") this.workerExited(e.agent, e.reason, e.text);
@@ -3562,7 +3563,19 @@ export class ProjectDO extends DurableObject<Env> {
     const row = this.sql.exec("SELECT task, reason, next_ms, attempts, error FROM stops WHERE agent = ? AND failed_ms IS NULL", agent).toArray()[0];
     if (!row) return;
     try {
+      // A replaced manager may have ended already, and a stop of an ended agent destroys no sandbox: its
+      // sandbox is found first and destroyed by itself (gone already is fine).
+      let sandbox: string | null = null;
+      if (row.reason === "manager replaced") {
+        sandbox = (this.sql.exec<{ sandbox: string | null }>("SELECT sandbox FROM layers WHERE agent = ?", agent).toArray()[0]?.sandbox) ?? null;
+        if (!sandbox) sandbox = ((await nest.getAgent(agent)).hands as { sandbox?: string } | null | undefined)?.sandbox ?? null;
+      }
       await nest.stopAgent(agent, { end: true, destroySandbox: true, reason: row.reason as string });
+      if (sandbox) {
+        await nest.destroySandbox(sandbox).catch((e) => {
+          if (!(e instanceof NestError && e.status === 404)) throw e;
+        });
+      }
     } catch (e) {
       // Gone already (404): as good as stopped.
       if (!(e instanceof NestError && e.status === 404)) {

@@ -333,8 +333,10 @@ export class FakeNest {
         return json(200, { interrupted: a.ended ? "none" : "turn" });
       }
       if (req.method === "POST" && sub === "/stop") {
-        a.ended = !!call.body?.end;
-        if (a.ended && call.body?.destroy_sandbox && a.sandbox) this.sandboxes.get(a.sandbox)!.ended = true;
+        // As nest: a stop of an agent that ended already destroys no sandbox.
+        const was = a.ended;
+        a.ended = !!call.body?.end || was;
+        if (!was && a.ended && call.body?.destroy_sandbox && a.sandbox) this.sandboxes.get(a.sandbox)!.ended = true;
         return json(200, { status: "stopped" });
       }
       if (req.method === "POST" && (m = sub.match(/^\/asks\/(ask_[A-Za-z0-9]+)\/answer$/))) {

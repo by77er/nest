@@ -192,7 +192,7 @@ The owner's request (2026-11-06), after the state-machine sweep (B11): a manager
 
   A new one starts with backoff, up to 3 times an hour (`MANAGER_RESTARTS`). Past that, nothing is started: the page shows it ended, and the owner restarts it.
 - **The replaced manager:**
-  - its sandbox is destroyed (a stop owed, `manager replaced`), and its successor starts only once that stop has been tried. With nest refusing it for good, the successor starts anyway (the stop is failed, shown on the Network page);
+  - its sandbox is destroyed: a stop is owed (`manager replaced`), which ends the agent and then destroys its sandbox through the sandbox API, since stopping an agent that already ended destroys nothing. Its successor starts only once that stop has been tried. With nest refusing it for good, the successor starts anyway (the stop is failed, shown on the Network page);
   - its pending waits end, unannounced, since the new one never made them;
   - the next start gets a start number of its own, so its creates' keys aren't the old one's;
   - **it loses the board:** the board's tools answer only `settings.manager`. A replaced manager still holds its token and labels for a while (its stop owed, or refused), and gets 403.
@@ -201,7 +201,7 @@ The owner's request (2026-11-06), after the state-machine sweep (B11): a manager
   - its final write (manager started, nothing owed) applies only to its own generation;
   - an exit during its brief, or a second Restart, leaves that move's start owed.
 - **The owner's Restart** (`POST /api/projects/:id/manager/restart`; **Restart manager** on the page when it ended or errored) stops the current manager and starts a new one now. Asking while one is already starting changes nothing.
-- **Chat during a restart.** The owner's chat messages wait for a manager ("Retrying…"), and go as soon as one has started. Each change is noted in the chat. While the manager has ended or errored, the composer says so ("The manager isn't running", with Restart manager), where a phone lands, and offers no Stop.
+- **Chat during a restart.** The owner's chat messages wait for a manager ("Retrying…"), and go as soon as one has started. Each change is noted in the chat. While the manager has ended or errored, the composer offers no Stop; on a phone, where the page's notice scrolls away, it also says so ("The manager isn't running", with Restart manager).
 - An exit of a manager that isn't the current one changes nothing.
 
 ## Creating a project

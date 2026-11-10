@@ -245,6 +245,7 @@ describe("a manager that ended (B11)", () => {
 
   it("is replaced: the old one's sandbox goes, a new one starts and gets the owner's messages", async () => {
     const p = await newProject();
+    fake.agents.get(p.manager)!.ended = true;
     await exited(p.manager);
     const s = await settingsOf(p);
     expect(s.manager).toBeNull();
@@ -258,6 +259,8 @@ describe("a manager that ended (B11)", () => {
     await stub(p).drain();
     expect(fake.inbox.filter((m) => m.agent === next && m.text === "Still there?")).toHaveLength(1);
     expect(fake.callsTo("POST", new RegExp(`^/v1/agents/${p.manager}/stop$`)).length).toBeGreaterThan(0);
+    // The ended manager's sandbox is gone, though a stop of an ended agent destroys none.
+    expect(fake.sandboxes.get(fake.agents.get(p.manager)!.sandbox!)!.ended).toBe(true);
     // An old manager's exit (not the current one) changes nothing.
     await exited(p.manager);
     expect((await settingsOf(p)).manager).toBe(next);
@@ -356,6 +359,28 @@ describe("a manager that ended (B11)", () => {
     expect(s.manager).toBeTruthy();
     expect(s.manager).not.toBe(stale);
     expect(s.manager_next_ms).toBeNull();
+  });
+
+  it("a start that fails after a newer Restart leaves that Restart's schedule alone: its manager starts at once (B11-a)", async () => {
+    const p = await newProject();
+    let release!: () => void;
+    const inbox = /^POST \/v1\/agents\/[^/]+\/inbox$/;
+    const hold = { match: inbox, release: new Promise<void>((r) => (release = r)), reached: false };
+    fake.holds.push(hold);
+    // The first Restart's brief is held, then fails (once); the second Restart lands meanwhile.
+    fake.fail(inbox, 500, { times: 1 });
+    const first = api(token, "POST", `/api/projects/${p.id}/manager/restart`);
+    for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(hold.reached).toBe(true);
+    const second = api(token, "POST", `/api/projects/${p.id}/manager/restart`);
+    await new Promise((r) => setTimeout(r, 50));
+    release();
+    await Promise.all([first, second]);
+    await stub(p).drain();
+    // Not pushed back by the stale start's failure (its retry backoff): started in the same drain.
+    const s = await settingsOf(p);
+    expect(s.manager).toBeTruthy();
+    expect(s.manager_error).toBeNull();
   });
 
   it("the new manager starts only once the old one's stop has gone through (B11-b), with no busy alarm meanwhile", async () => {

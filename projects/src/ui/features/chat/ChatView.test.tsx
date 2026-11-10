@@ -319,7 +319,8 @@ describe("the chat", () => {
     }
   });
 
-  it("a manager that ended says so at the composer, with Restart, and offers no Stop even with a turn's stream left", async () => {
+  it("a manager that ended says so at the composer on a phone, with Restart, and offers no Stop even with a turn's stream left", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(max-width: 48em)", media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => false }));
     vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Half a thought" })]));
     const api = new FakeApi();
     api.manager = { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited)." };
@@ -337,6 +338,18 @@ describe("the chat", () => {
     await waitFor(() => expect(c.querySelector("[data-slot=manager-down]")).toBeNull());
   });
 
+  it("wider than a phone, an ended manager's composer has no second Restart (the page's notice has it), and still no Stop", async () => {
+    vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Half a thought" })]));
+    const api = new FakeApi();
+    api.manager = { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited)." };
+    renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await screen.findByRole("alert", { name: /isn't running/ });
+    expect(c.querySelector("[data-slot=manager-down]")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Restart manager" })).toHaveLength(1);
+    expect(within(c).queryByRole("button", { name: "Stop" })).toBeNull();
+  });
+
   it("with no turn running there's no stream and no Stop", async () => {
     vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Done." }), ev("turn_completed", { stop_reason: "end_turn" })]));
     renderApp("/projects/prj_one/manager", new FakeApi());
@@ -348,7 +361,8 @@ describe("the chat", () => {
 
   it("a message's exact time is in its actions (hover shows it too), so the keyboard and touch reach it", async () => {
     const api = new FakeApi();
-    const at = new Date(2026, 10, 2, 9, 30).getTime();
+    // A few hours ago, whenever the test runs: the time line then says so ("3 hours ago"), not the exact time.
+    const at = Date.now() - 3 * 3_600_000;
     api.chat = [{ seq: 1, at_ms: at, sender: "manager", text: "Hello", delivered: true, status: "done" as const, error: null }];
     const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();

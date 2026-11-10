@@ -17,7 +17,7 @@ import { useChat, useInterruptManager, useManager, usePostChat, useRestartManage
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import {
-  ChatFrame, ChatLog, ChatWelcome, ComposerBox, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine,
+  ChatFrame, ChatLog, ChatWelcome, ComposerBox, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine, usePhone,
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
 import { useTrace } from "../trace/useTrace";
@@ -461,6 +461,8 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const restart = useRestartManager(projectId);
   const down = manager.data?.phase === "ended" || manager.data?.phase === "errored";
   const running = !!live && !down;
+  // On a phone only: wider, the page's notice (with its own Restart) stays in view above the log.
+  const phone = usePhone();
   const streamSteps = live?.steps ?? (held ? (heldEnd?.steps ?? held.steps) : []);
   const replySteps = stepsBySeq(messages, finished);
   const stream = running || streamSteps.length > 0;
@@ -554,7 +556,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
             <ComposerBox
               bar={
                 <>
-                  {down ? (
+                  {down && phone ? (
                     <Row gap="xs" wrap="nowrap" data-slot="manager-down">
                       <Text fz="xs" c="warning">
                         The manager isn&apos;t running
