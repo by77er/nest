@@ -29,6 +29,15 @@ const WORKER_EXTRA = { capabilities: ["subagents"], builtin_tools: ["Agent"] } a
 const SECRETS_RULE =
   "Credentials never enter your sandbox: nest's proxy injects them, and the ones you have are environment variables holding placeholders, named in your brief (a placeholder isn't a secret: it works only through the proxy, on its hosts). Never ask anyone for a secret's value, in chat or anywhere, and never write one into a file, a commit or a log. If you need a credential you don't have, call request_secret: kind injected for your own API calls, kind ci for a secret GitHub Actions needs, which the owner adds on GitHub.";
 
+/**
+ * How a role that works on the repo's code finds the repo's own guidance (README.md#the-repos-own-guidance):
+ * nest's prompts cover hands, taint and grants; the app's cover its role; the repo's are its own files,
+ * read through hands, never copied into a template. The system prompt is applied again on a resume, so the
+ * line holds for every session, a resumed or compacted one included.
+ */
+export const REPO_GUIDANCE =
+  "At the start of each session, and again whenever the repo's guidance is no longer in your context (after a resume or compaction), read the repo's AGENTS.md (or CLAUDE.md if there is none) at its root with the hands Read tool, and follow it. Its skills are under .claude/skills/: list them, read the one that fits your work, and follow it.";
+
 export const PROMPTS = {
   manager: [
     "You are the manager of one project on a task board: a GitHub repo, which your sandbox can read but not push to.",
@@ -96,7 +105,8 @@ const template = (capability: Server, prompt: string, repos: readonly string[], 
   // timer_list) is the manager's only: workers have nothing to wait for that their task doesn't bring.
   capabilities: ["nest", "hands", ...(subagents ? WORKER_EXTRA.capabilities : []), ...(timers ? ["timers"] : []), `${NAMESPACE}/${capability}`],
   // `model` becomes Claude Code's `--model` (README.md#models); without one, nest's and Claude Code's default.
-  launch: { ...(model ? { model } : {}), builtin_tools: [...BUILTIN_TOOLS, ...(subagents ? WORKER_EXTRA.builtin_tools : [])], system_prompt: { mode: "append", text: prompt } },
+  // Every role with hands works on the repo's code (manager, worker, reviewer, routine): each reads the repo's own guidance.
+  launch: { ...(model ? { model } : {}), builtin_tools: [...BUILTIN_TOOLS, ...(subagents ? WORKER_EXTRA.builtin_tools : [])], system_prompt: { mode: "append", text: `${prompt}\n${REPO_GUIDANCE}` } },
   hands: "required",
   credential: CREDENTIAL,
   ...(repos.length ? { [access === "push" ? "repos" : "read_repos"]: [...repos] } : {}),
