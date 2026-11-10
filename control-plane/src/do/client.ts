@@ -23,6 +23,7 @@ import { type Grant, labelWhere, type Labels } from "../lib/clients";
 import { BACKLOG_MAX, checkWebhookUrl, retryDelayMs, signature, type StampedEvent, WEBHOOK_TIMEOUT_MS } from "../lib/client-events";
 import { num } from "../env";
 import { healthRead, isHealthInstance } from "../lib/health";
+import { type MemberEvent, MemberState, memberStep } from "../lib/members";
 import { Deadlines } from "../lib/reliable";
 import { IdempotencyKeys, type KeyClaim } from "../lib/idempotency";
 import { addColumn, storedEnum } from "../lib/stored";
@@ -31,7 +32,6 @@ import {
   TOMBSTONE_MS,
 } from "../lib/client-names";
 import { asNestError, clip, hex, NestError, timingSafeEqual } from "../lib/util";
-import { z } from "zod";
 import { ErrorCodes } from "../protocol/model";
 import type { ClientScope } from "./catalog";
 
@@ -50,8 +50,6 @@ const RECHECK_PER_RUN = 100;
 const DELIVER_PER_RUN = 100;
 
 export type MemberKind = "agent" | "sandbox";
-const MemberState = z.enum(["reserved", "live", "ended"]);
-type MemberState = z.output<typeof MemberState>;
 
 /** What the record holds (never shown whole: the token hash stays here). */
 interface ClientRecord {
@@ -498,20 +496,48 @@ export class ClientDO extends DurableObject<Env> {
   async admit(m: MemberFacts): Promise<void> {
     const r = this.record();
     if (!r || r.deleted_ms) throw new NestError(ErrorCodes.FORBIDDEN, "the client was deleted", 403);
-    const cur = this.sql.exec<{ state: string }>("SELECT state FROM members WHERE id = ?", m.id).toArray()[0];
-    if (cur) return;
+    if (this.memberState(m.id) !== "none") return;
     if (!r.grant.cells.includes(m.cell)) throw new NestError(ErrorCodes.FORBIDDEN, `outside ${r.client}'s grant: cell ${m.cell}`, 403);
     const max = m.kind === "agent" ? r.grant.max_agents : r.grant.max_sandboxes;
     const n = this.count(m.kind);
     if (n >= max) throw new NestError(ErrorCodes.FORBIDDEN, `${r.client} has ${n} live ${m.kind === "agent" ? "agents" : "sandboxes"}, its grant's max_${m.kind === "agent" ? "agents" : "sandboxes"}`, 403);
-    this.sql.exec("INSERT INTO members (id, kind, cell, owner, labels, created_ms, state) VALUES (?, ?, ?, ?, ?, ?, 'reserved')",
-      m.id, m.kind, m.cell, m.owner, JSON.stringify(m.labels), Date.now());
+    this.move(m.id, "admit", { facts: m });
     await this.deadlines.set("reconcile", Date.now() + RESERVE_CHECK_MS, true);
   }
 
   /** A create that failed for good: its place, if still only reserved, goes back. */
   async release(id: string): Promise<void> {
-    this.sql.exec("DELETE FROM members WHERE id = ? AND state = 'reserved'", id);
+    this.move(id, "release");
+  }
+
+  private memberState(id: string): MemberState | "none" {
+    const r = this.sql.exec<{ state: string }>("SELECT state FROM members WHERE id = ?", id).toArray()[0];
+    return r ? storedEnum(MemberState, r.state, "members.state") : "none";
+  }
+
+  /**
+   * Apply `event` to member `id` as `memberStep` decides for its state now, read in this step (so a
+   * caller that awaited since it last looked can't act on what it saw then). Whether anything changed.
+   * `facts`: the row's columns, for an event that may create it; `endedMs`: when it ended, if the event
+   * says (else now).
+   */
+  private move(id: string, event: MemberEvent, o: { facts?: MemberFacts; endedMs?: number | null } = {}): boolean {
+    const from = this.memberState(id);
+    const to = memberStep(from, event);
+    if (to === "refuse") return false;
+    const now = Date.now();
+    const ended = to === "ended" ? o.endedMs ?? now : null;
+    if (to === "none") {
+      this.sql.exec("DELETE FROM members WHERE id = ?", id);
+    } else if (from === "none") {
+      const m = o.facts;
+      if (!m) return false;
+      this.sql.exec("INSERT INTO members (id, kind, cell, owner, labels, created_ms, state, ended_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        m.id, m.kind, m.cell, m.owner, JSON.stringify(m.labels), now, to, ended);
+    } else {
+      this.sql.exec("UPDATE members SET state = ?, ended_ms = ? WHERE id = ?", to, ended, id);
+    }
+    return true;
   }
 
   /**
@@ -520,12 +546,10 @@ export class ClientDO extends DurableObject<Env> {
    * so the count never misses one that exists.
    */
   async report(m: MemberFacts & { ended_ms: number | null }): Promise<void> {
-    this.requireClient();
-    const state: MemberState = m.ended_ms === null ? "live" : "ended";
-    this.sql.exec(`INSERT INTO members (id, kind, cell, owner, labels, created_ms, state, ended_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET state = CASE WHEN members.state = 'ended' THEN 'ended' ELSE excluded.state END,
-        ended_ms = COALESCE(members.ended_ms, excluded.ended_ms)`,
-    m.id, m.kind, m.cell, m.owner, JSON.stringify(m.labels), Date.now(), state, m.ended_ms);
+    // A purged client keeps no registry: a report retried after the purge is answered and recorded nowhere
+    // (it used to leave a row in an empty object that no alarm would ever remove).
+    if (!this.record()) return;
+    this.move(m.id, m.ended_ms === null ? "report_live" : "report_ended", { facts: m, endedMs: m.ended_ms });
   }
 
   /** A page of its agents or sandboxes, oldest first, filtered by labels (each must hold), state and cell. */
@@ -685,7 +709,7 @@ export class ClientDO extends DurableObject<Env> {
       if (key === "reconcile") await this.reconcile();
       else if (key === "deliver") await this.deliver();
       else if (key === "prune") {
-        this.sql.exec("DELETE FROM members WHERE state = 'ended' AND ended_ms < ?", Date.now() - ENDED_RETENTION_MS);
+        for (const r of this.sql.exec<{ id: string }>("SELECT id FROM members WHERE ended_ms < ?", Date.now() - ENDED_RETENTION_MS).toArray()) this.move(r.id, "expire");
         this.keys.prune();
         // A delivery a rolled-back release dropped (it has no handler for `deliver`) is armed again.
         if (this.backlog() && !this.deadlines.has("deliver")) await this.deadlines.set("deliver", Date.now());
@@ -730,9 +754,8 @@ export class ClientDO extends DurableObject<Env> {
     for (const r of due) {
       const exists = await this.exists(r.kind as MemberKind, r.id);
       // Re-read in this step: its own report may have landed during the await.
-      if (exists === "gone") this.sql.exec("DELETE FROM members WHERE id = ? AND state = 'reserved'", r.id);
-      else if (exists === "ended") this.sql.exec("UPDATE members SET state = 'ended', ended_ms = ? WHERE id = ? AND state = 'reserved'", Date.now(), r.id);
-      else this.sql.exec("UPDATE members SET state = 'live' WHERE id = ? AND state = 'reserved'", r.id);
+      // A reservation is all this looked at: a row that is live by now is the recheck's to judge, not this one's.
+      if (this.memberState(r.id) === "reserved") this.move(r.id, `check_${exists}`);
     }
     const next = this.sql.exec<{ at: number | null }>("SELECT MIN(created_ms) AS at FROM members WHERE state = 'reserved'").one().at;
     if (next !== null) await this.deadlines.set("reconcile", next + RESERVE_CHECK_MS);
@@ -748,8 +771,8 @@ export class ClientDO extends DurableObject<Env> {
     for (const r of rows) {
       const now = await this.exists(r.kind as MemberKind, r.id);
       // Re-read in this step: a report may have landed during the await (ended stays ended).
-      if (now === "live") this.sql.exec("UPDATE members SET checked_ms = ? WHERE id = ?", Date.now(), r.id);
-      else this.sql.exec("UPDATE members SET state = 'ended', ended_ms = ?, checked_ms = ? WHERE id = ? AND state = 'live'", Date.now(), Date.now(), r.id);
+      if (now !== "live") this.move(r.id, `check_${now}`);
+      this.sql.exec("UPDATE members SET checked_ms = ? WHERE id = ?", Date.now(), r.id);
     }
   }
 

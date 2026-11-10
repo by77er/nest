@@ -5,7 +5,8 @@ import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import type { ClientDO } from "../src/do/client";
-import { RESERVE_CHECK_MS } from "../src/do/client";
+import { ClientDO as ClientDOClass, RESERVE_CHECK_MS } from "../src/do/client";
+import { MEMBER_EVENTS, MEMBER_STATES, memberStep } from "../src/lib/members";
 import {
   capabilityOutsideGrant, entryVisible, Grant, Labels, labelsMatch, mcpUrlAllowed, newClientToken, parseClientToken, parseLabelFilters, specOutsideGrant,
   tokenHash,
@@ -433,6 +434,87 @@ describe("the grant bounds everything in the subtree", () => {
     await runDue(stub);
     expect((await stub.list("agent", { state: "all" })).items.map((m) => [m.id, m.state])).toEqual([[real.agent, "live"]]);
     await createAgent(c);
+  });
+
+  it("memberStep: every state and event; ended is final and a check never creates a row", () => {
+    const table = Object.fromEntries((["none", ...MEMBER_STATES] as const).map((st) => [st, Object.fromEntries(MEMBER_EVENTS.map((e) => [e, memberStep(st, e)]))]));
+    expect(table).toEqual({
+      none: { admit: "reserved", release: "refuse", report_live: "live", report_ended: "ended", check_live: "refuse", check_ended: "refuse", check_gone: "refuse", expire: "refuse" },
+      reserved: { admit: "refuse", release: "none", report_live: "live", report_ended: "ended", check_live: "live", check_ended: "ended", check_gone: "none", expire: "refuse" },
+      live: { admit: "refuse", release: "refuse", report_live: "refuse", report_ended: "ended", check_live: "refuse", check_ended: "ended", check_gone: "ended", expire: "refuse" },
+      ended: { admit: "refuse", release: "refuse", report_live: "refuse", report_ended: "refuse", check_live: "refuse", check_ended: "refuse", check_gone: "refuse", expire: "none" },
+    });
+  });
+
+  it("the registry's guards: ended is final, only a reservation is released, a report is believed with no row, and old ended rows go", async () => {
+    const c = await newClient({ max_agents: 5 });
+    const stub = clientStub(c.id);
+    const facts = (id: string) => ({ kind: "agent" as const, id, cell: c.cell, owner: c.id, labels: {} });
+    const states = async () => Object.fromEntries((await stub.list("agent", { state: "all" })).items.map((m) => [m.id, [m.state, m.ended_ms]]));
+    // Ended is final: a late live report, a release and a second admit change nothing, and it holds no place.
+    await stub.admit(facts("agt_e"));
+    await stub.report({ ...facts("agt_e"), ended_ms: 5 });
+    await stub.report({ ...facts("agt_e"), ended_ms: null });
+    await stub.report({ ...facts("agt_e"), ended_ms: 9 });
+    await stub.release("agt_e");
+    await stub.admit(facts("agt_e"));
+    expect((await states()).agt_e).toEqual(["ended", 5]);
+    expect((await adminJson(`/v1/admin/clients/${c.id}`)).live.agents).toBe(0);
+    // Only a reservation is released: one whose object reported itself keeps its place.
+    await stub.admit(facts("agt_l"));
+    await stub.report({ ...facts("agt_l"), ended_ms: null });
+    await stub.release("agt_l");
+    await stub.admit(facts("agt_r"));
+    await stub.release("agt_r");
+    // A report with no row (one the reconcile dropped) is recorded.
+    await stub.report({ ...facts("agt_n"), ended_ms: null });
+    expect(await states()).toEqual({ agt_e: ["ended", 5], agt_l: ["live", null], agt_n: ["live", null] });
+    // Past its retention an ended row goes; a recently ended one and live ones stay.
+    await stub.report({ ...facts("agt_recent"), ended_ms: Date.now() });
+    await runInDurableObject(stub, (_i: ClientDO, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('prune', 0)");
+    });
+    await runDue(stub);
+    expect(Object.keys(await states()).sort()).toEqual(["agt_l", "agt_n", "agt_recent"]);
+  });
+
+  it("a reservation that became live while the reconcile asked about it keeps its place, whatever the answer was", async () => {
+    const c = await newClient({ max_agents: 5 });
+    const stub = clientStub(c.id);
+    await stub.admit({ kind: "agent", id: "agt_raced", cell: c.cell, owner: c.id, labels: {} });
+    await runInDurableObject(stub, (_i: ClientDO, st) => {
+      st.storage.sql.exec("UPDATE members SET created_ms = ?", Date.now() - RESERVE_CHECK_MS - 1);
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'reconcile'");
+    });
+    // The object's own report lands while the reconcile waits for its answer (which was read before the object existed).
+    const proto = ClientDOClass.prototype as unknown as { exists: (kind: string, id: string) => Promise<string> };
+    const real = proto.exists;
+    proto.exists = async function (this: ClientDO, _kind: string, id: string) {
+      await this.report({ kind: "agent", id, cell: c.cell, owner: c.id, labels: {}, ended_ms: null });
+      return "gone";
+    };
+    try {
+      await runDue(stub);
+    } finally {
+      proto.exists = real;
+    }
+    expect((await stub.list("agent", { state: "all" })).items.map((m) => [m.id, m.state])).toEqual([["agt_raced", "live"]]);
+  });
+
+  it("a retried admit of the same id finds its place even at the maximum; another id is refused", async () => {
+    const c = await newClient({ max_agents: 1 });
+    const stub = clientStub(c.id);
+    const facts = (id: string) => ({ kind: "agent" as const, id, cell: c.cell, owner: c.id, labels: {} });
+    await stub.admit(facts("agt_once"));
+    await stub.admit(facts("agt_once"));
+    await expect(Promise.resolve().then(() => stub.admit(facts("agt_other")))).rejects.toThrow(/max_agents/);
+    expect((await stub.list("agent", { state: "all" })).items.map((m) => [m.id, m.state])).toEqual([["agt_once", "reserved"]]);
+  });
+
+  it("a report retried after its client was purged leaves nothing behind", async () => {
+    const stub = clientStub(`cli_gone${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`);
+    await stub.report({ kind: "agent", id: "agt_late", cell: "c", owner: null, labels: {}, ended_ms: null });
+    expect(await runInDurableObject(stub, (_i: ClientDO, st) => st.storage.sql.exec("SELECT 1 FROM members").toArray().length)).toBe(0);
   });
 
   it("the hourly recheck frees the place of a destroyed sandbox whose report never came, and keeps a live one", async () => {
