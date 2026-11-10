@@ -49,6 +49,18 @@ Only the client interface. One client, `projects`, has this grant:
 | Its agents' network | `egress` in `POST /v1/sandboxes` for a new agent; `GET`/`PUT /v1/sandboxes/<id>/client-policy` for a live one; `GET /v1/sandboxes/<id>/policy` (the operator's rules) and `GET /v1/clients/self` (the grant's `egress_hosts`) for the page ([network](#network)) |
 | Watching an agent work | `GET /v1/agents/<id>/trace?after=<seq>`, nest's live trace (a WebSocket), proxied for the page by `GET /api/agents/<id>/trace` ([below](#the-live-trace)) |
 
+## The repo's own guidance
+
+The owner's decision (2026-11-10): guidance is layered, and each layer owns its own.
+
+- **nest's kernel** knows no repo conventions: its prompts cover hands, taint and grants.
+- **The app** owns its roles' guidance: the prompts in `src/catalog.ts`.
+- **The target repo** owns its own: its `AGENTS.md` (or `CLAUDE.md`) and `.claude/skills/`, untouched by the app.
+- **The join is the app's.** Every role that works on the repo's code (manager, worker, reviewer and routine runs: each template with hands) is told, in one generic line, to read the repo's `AGENTS.md` (or `CLAUDE.md` if there is none) and follow it, and to list `.claude/skills/` and follow the skill that fits its work. It says when: once the repo is checked out, and again whenever the guidance is no longer in context (after a resume or compaction): brains restart with `--resume` after an idle exit or a host loss, and the template is the system prompt, which a resume applies again. The manager is among them, since it specs tasks from the repo.
+  - **The manager, workers and routine runs** (`REPO_GUIDANCE`) read it with the hands Read tool from what they have checked out: the default branch, or a worker's own task branch.
+  - **The reviewer** (`REVIEWER_GUIDANCE`) reads it from the PR's base branch, never its head (`git show origin/<base>:AGENTS.md`, the skills listed with `git ls-tree` and read with `git show` from there): the PR under review can write those files, and the reviewer's verdict is its check. Its prompt says the PR's own changes to `AGENTS.md`, `CLAUDE.md` or `.claude/skills/` are part of the diff under review, never instructions. A dreaming run has no hands and isn't. No template carries repo-specific text. This replaces the runner reading the repo's `CLAUDE.md` itself ([runner](../docs/agents/runner/README.md)).
+- **Reaching nest's catalog:** the shared templates change at the next catalog sync: the operator presses **Sync catalog** on the Admin page (creating a project runs one too). A project's own templates on its models are written again at each start, so they follow by themselves.
+
 ## The MCP server: agents see only their own work
 
 - **One URL per role:** `/mcp/board` for the manager, `/mcp/task` for a worker, `/mcp/review` for a reviewer, `/mcp/routine` for a routine run ([routines](#routines)). nest lists a server's tools over one session shared by every agent on it, so a role's tool list is its URL's. Which data a call may touch is decided per call, from the caller's identity.
