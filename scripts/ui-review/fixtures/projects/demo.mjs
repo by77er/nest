@@ -461,6 +461,23 @@ const RICH = [
     if (variant === "error") return [500, { error: "internal error (fixture)" }];
     if (path === "/projects") return [200, { projects }];
     if (path === "/admin/sync-state") return [200, sync];
+    // The repos a new project may be attached to (README.md#flows): nest's answer, each with the project on it.
+    if (path === "/repos") {
+      if (variant === "repos-failed") return [502, { error: "nest couldn't say which repos the app may attach: no answer within 20000 ms (fixture)" }];
+      if (variant === "repos-none") return [200, { complete: true, unlisted: [], repos: [] }];
+      const attached = [{ repo, project: demo.id }, { repo: other.repo, project: other.id }];
+      if (variant === "repos-many") {
+        return [200, { complete: true, unlisted: [], repos: [...attached,
+          { repo: "by77er/gadgets-platform-customer-facing-catalogue-and-search-with-a-very-long-name", project: null },
+          ...Array.from({ length: 30 }, (_, k) => ({ repo: `by77er/repo-${String(k).padStart(2, "0")}`, project: null })),
+          { repo: "by77er/gadget-docs", project: null }] }];
+      }
+      if (variant === "repos-unlisted") {
+        return [200, { complete: false, unlisted: ["acme-industries-holding-company-international/*", "someone-else/*"],
+          repos: [...attached, { repo: "by77er/sprockets", project: null }, { repo: "by77er/cogs", project: null }] }];
+      }
+      return [200, { complete: true, unlisted: [], repos: [...attached, { repo: "by77er/sprockets", project: null }, { repo: "by77er/cogs", project: null }] }];
+    }
     if (path === "/admin/sync" && method === "POST") return [200, { written: sync.written.slice(0, 2), repos: ["by77er/gadgets"] }];
     // Each project's repo binding (README.md#the-repos-binding): read from GitHub; learned from an event, renamed
     // since and not applied; and one that didn't bind, with why. Re-read: Gadgets confirms; Widgets finds

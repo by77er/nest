@@ -1,12 +1,7 @@
 // The one module that calls the JSON API (src/api.ts). Same origin, so Cloudflare Access's cookie goes
 // with every call and the page holds no credential of its own.
 
-import type {
-  NetworkBody, NetworkView, OutboxState, Waits, AcceptIssueBody, DeclineIssueBody, Issue,
-  AddDependencyBody, PutSecretBody, SecretsAnswer, SecretView, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
-  Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
-  CreateRoutineBody, DeclineProposalBody, Note, Proposal, Routine, RoutineRun, RoutinesAnswer, UpdateRoutineBody, RepoBinding, RereadBinding,
-} from "./types";
+import type { AcceptIssueBody, AddDependencyBody, AnswerBody, Ask, AttachableRepos, AttachPrBody, Attention, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateRoutineBody, CreateTaskBody, DeclineIssueBody, DeclineProposalBody, Issue, Job, ListedProject, ManagerStatus, NetworkBody, NetworkView, Note, OpenPr, OutboxState, Project, ProjectRow, Proposal, PutSecretBody, RepoBinding, RereadBinding, Routine, RoutineRun, RoutinesAnswer, SecretsAnswer, SecretView, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateRoutineBody, UpdateTaskBody, Waits } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
 export class ApiError extends Error {
@@ -50,6 +45,7 @@ const tsk = (id: string, task: string) => `${prj(id)}/tasks/${encodeURIComponent
 export const api = {
   projects: () => call<{ projects: ListedProject[] }>("GET", "/projects").then((r) => r.projects),
   createProject: (b: CreateProjectBody) => call<CreatedProject>("POST", "/projects", b),
+  attachableRepos: () => call<AttachableRepos>("GET", "/repos"),
   project: (id: string) => call<Project>("GET", prj(id)),
   updateSettings: (id: string, b: SettingsBody) => call<Settings>("PATCH", `${prj(id)}/settings`, b),
   retryRepoAutoMerge: (id: string) => call<Settings>("POST", `${prj(id)}/auto-merge/retry`),

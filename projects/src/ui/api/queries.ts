@@ -25,6 +25,7 @@ export const keys = {
   issues: (id: string) => ["projects", id, "issues"] as const,
   syncState: ["admin", "sync-state"] as const,
   bindings: ["admin", "bindings"] as const,
+  attachableRepos: ["repos"] as const,
 };
 
 /** How often each live view polls, in ms. */
@@ -250,6 +251,9 @@ export const useImportIssues = (id: string) => useTriageWrite(id, () => api.impo
 
 export const useSyncState = () => useQuery({ queryKey: keys.syncState, queryFn: api.syncState });
 
+/** The repos a new project may be attached to (nest's answer), read when the form opens. */
+export const useAttachableRepos = () => useQuery({ queryKey: keys.attachableRepos, queryFn: api.attachableRepos });
+
 // --- writes -----------------------------------------------------------------------------------------
 
 export function useCreateProject() {
@@ -257,7 +261,10 @@ export function useCreateProject() {
   return useMutation({
     mutationFn: (b: CreateProjectBody) => api.createProject(b),
     meta: { failure: "The project wasn't created" },
-    onSuccess: () => qc.invalidateQueries({ queryKey: keys.projects, exact: true }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
+      void qc.invalidateQueries({ queryKey: keys.attachableRepos, exact: true });
+    },
   });
 }
 

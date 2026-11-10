@@ -5,6 +5,12 @@ import { describe, expect, it } from "vitest";
 import { ask, FakeApi, project } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
 
+/** The create form's repo picker (Mantine's Select: its visible input), once the list has loaded. */
+const repoPicker = async (d: HTMLElement) => {
+  await within(d).findAllByLabelText(/Repository/);
+  return within(d).getAllByLabelText(/Repository/).find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden")!;
+};
+
 describe("projects", () => {
   it("lists each project with a link to its page and its repo", async () => {
     renderApp("/projects");
@@ -55,6 +61,43 @@ describe("projects", () => {
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects", body: { name: "Gadgets", repo: "Owner/Gadgets", auto_assign: true, max_workers: 3 } }]));
     await waitFor(() => expect(router.state.location.pathname).toMatch(/^\/projects\/prj_new[a-z0-9]+\/manager$/));
     expect(await screen.findByRole("heading", { level: 1, name: "Gadgets" })).toBeInTheDocument();
+  });
+
+  it("picks the repo from those nest's grant lets the app attach; one already a project's is shown but can't be picked", async () => {
+    const api = new FakeApi();
+    api.attachable = {
+      repos: [{ repo: "owner/widgets", project: "prj_one" }, { repo: "owner/gadgets", project: null }],
+      unlisted: ["elsewhere/*"], complete: true,
+    };
+    const { user } = renderApp("/projects", api);
+    await user.click(await screen.findByRole("button", { name: "New project" }));
+    const d = screen.getByRole("dialog", { name: "New project" });
+    await user.type(within(d).getByLabelText(/Name/), "Gadgets");
+    const picker = await repoPicker(d);
+    await waitFor(() => expect(picker).toBeEnabled());
+    // What nest couldn't list is a note of its own under the field.
+    expect(within(d).getByText("Some repos aren't listed")).toBeInTheDocument();
+    expect(within(d).getByText(/elsewhere: nest's GitHub App isn't installed there/)).toBeInTheDocument();
+    await user.click(picker);
+    const taken = await screen.findByRole("option", { name: "owner/widgets (already a project)" });
+    expect(taken).toHaveAttribute("data-combobox-disabled", "true");
+    // Pickable repos first, then those already a project's.
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["owner/gadgets", "owner/widgets (already a project)"]);
+    await user.click(screen.getByRole("option", { name: "owner/gadgets" }));
+    await user.click(within(d).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects", body: { name: "Gadgets", repo: "owner/gadgets", auto_assign: false, max_workers: 2 } }]));
+  });
+
+  it("with nothing to attach, the picker says why and can't be opened", async () => {
+    const api = new FakeApi();
+    api.attachable = { repos: [], unlisted: [], complete: true };
+    const { user } = renderApp("/projects", api);
+    await user.click(await screen.findByRole("button", { name: "New project" }));
+    const d = screen.getByRole("dialog", { name: "New project" });
+    expect(await within(d).findByText(/None yet: the operator adds repos to the app's grant in nest/)).toBeInTheDocument();
+    expect(await repoPicker(d)).toBeDisabled();
+    expect(within(d).getByRole("button", { name: "Create project" })).toBeDisabled();
+    expect(within(d).queryByText("Some repos aren't listed")).toBeNull();
   });
 
   it("says when the list can't be loaded", async () => {

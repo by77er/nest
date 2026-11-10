@@ -3,7 +3,7 @@
 // of every write the page made.
 
 import { factsOf, step, type TaskEvent } from "../../tasks";
-import type { Issue, SecretRequest, SecretsAnswer } from "../api/types";
+import type { AttachableRepos, Issue, SecretRequest, SecretsAnswer } from "../api/types";
 import type { Ask, Attention, OpenPr, ChatMessage, HistoryRow, Job, ManagerStatus, NetworkView, Project, ProjectRow, Settings, SyncState, Task, Waits } from "../api/types";
 import type { Note, Proposal, RepoBinding, RereadBinding, Routine, RoutineRun } from "../api/types";
 import { PRESETS } from "../../routines";
@@ -63,6 +63,8 @@ export function ask(over: Partial<Ask> = {}): Ask {
 
 export class FakeApi {
   projects: Project[] = [project()];
+  /** `GET /api/repos`'s answer; null: the Worker can't say (502), so the form takes a typed name. */
+  attachable: AttachableRepos | null = null;
   tasks: Task[] = [];
   history = new Map<string, HistoryRow[]>();
   chat: ChatMessage[] = [];
@@ -172,6 +174,7 @@ export class FakeApi {
   }
 
   private route(m: string, parts: string[], body: any): Response {
+    if (parts[0] === "repos" && m === "GET") return this.attachable ? json(this.attachable) : json({ error: "nest couldn't say which repos the app may attach" }, 502);
     if (parts[0] === "admin") {
       if (parts[1] === "sync-state") return json(this.sync);
       if (parts[1] === "bindings" && !parts[2]) return json(this.bindings);

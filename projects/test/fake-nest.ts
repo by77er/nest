@@ -87,6 +87,14 @@ export class FakeNest {
   layerWithoutPush = false;
   /** The repos the client's grant names, lowercased (`github.repos`); null: any (the grant isn't what a test is about). */
   grantRepos: string[] | null = null;
+  /** The grant's `repos` (push) when a test needs it to differ from `github.repos`; null: the same as `grantRepos`. */
+  pushRepos: string[] | null = null;
+  /**
+   * nest's answer for the grant's repos (`GET`/`POST /v1/clients/self/grant/repos`), as nest decides it
+   * (owner-wide entries included). Null: the grant isn't what a test is about, so it covers `grantRepos`
+   * (every repo while that's null too). `"missing"`: a nest from before those routes (404).
+   */
+  grantListing: { repos: { repo: string; push: boolean; read: boolean; github: boolean }[]; unlisted: string[]; complete: boolean } | null | "missing" = null;
   /** The installation nest's token answer names (`installation_id`); null: none, as a nest from before #219. */
   tokenInstallation: number | null = GH_INSTALLATION_ID;
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
@@ -358,7 +366,15 @@ export class FakeNest {
       this.catalog.set(`${m[1]}/${m[2]}/${m[3]}`, call.body);
       return json(200, { ok: true });
     }
-    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts, github: { repos: this.grantRepos ?? [], permissions: { ...GRANT_PERMISSIONS } } }, created_ms: 1 });
+    if ((r === "GET /v1/clients/self/grant/repos" || r === "POST /v1/clients/self/grant/repos") && this.grantListing === "missing") return nestErr(404, "not_found", "no route");
+    const all = (repo: string) => ({ repo, push: true, read: true, github: true });
+    const listing = this.grantListing === "missing" ? null : this.grantListing ?? { repos: (this.grantRepos ?? []).map(all), unlisted: [], complete: true };
+    if (r === "GET /v1/clients/self/grant/repos") return json(200, listing);
+    if (r === "POST /v1/clients/self/grant/repos") {
+      const covered = (x: string) => listing!.repos.find((l) => l.repo === x) ?? (this.grantListing === null && this.grantRepos === null ? all(x) : { repo: x, push: false, read: false, github: false });
+      return json(200, { repos: (call.body as { repos: string[] }).repos.map((x) => covered(x.toLowerCase())) });
+    }
+    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts, repos: this.pushRepos ?? this.grantRepos ?? [], github: { repos: this.grantRepos ?? [], permissions: { ...GRANT_PERMISSIONS } } }, created_ms: 1 });
     if (r === "GET /v1/clients/self/secrets") {
       return json(200, { secrets: [...this.secrets].sort(([a], [b]) => a.localeCompare(b)).map(([name, x]) => ({ name, description: x.description, size: new TextEncoder().encode(x.value).length, created_ms: x.created_ms, updated_ms: x.updated_ms, last_injected_ms: x.last_injected_ms })) });
     }
