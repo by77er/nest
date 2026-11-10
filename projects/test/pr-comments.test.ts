@@ -164,6 +164,7 @@ describe("who is set", () => {
       sql.exec("ALTER TABLE settings DROP COLUMN manager_restarts");
       sql.exec("ALTER TABLE settings DROP COLUMN listed_ms");
       for (const c of ["manager_model", "worker_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      for (const t of ["model_templates", "agent_templates"]) sql.exec(`DROP TABLE ${t}`);
       for (const c of ["comments_from_id", "comments_from_login", "comments_decided", "repo_owner_id", "repo_owner_login", "routine_cap", "tasks_done_total", "prs_merged_total"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE settings SET attach_next_ms = NULL");
       sql.exec("UPDATE schema_version SET v = ?", step);

@@ -43,16 +43,19 @@ function hash8(s: string): string {
 }
 
 const SLUG_MAX = 28;
+/** A model id that is its own slug: lowercase words joined by single hyphens (so never `--`). */
+const PLAIN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
 /**
  * The catalog entry (in the app's namespace) for a project's role on a model: `<role>-<project>-<model>`,
  * within nest's entry names (`[a-z][a-z0-9-]{0,62}`). A model id that isn't already such a name (capitals,
- * dots, brackets, too long) is cut down and told apart by a hash of the whole id, so two ids never share
- * an entry.
+ * dots, brackets, too long) is cut down and ends `--<hash of the whole id>`. A plain id never holds `--`,
+ * so a plain id can't take a hashed one's entry; two hashed ids share one only if their hashes collide
+ * (32 bits: an accident, not something a plain id can be chosen to do).
  */
 export function modelTemplateEntry(role: ModelRole, project: string, model: string): string {
   const p = project.replace(/^prj_/, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").slice(0, 16);
-  const plain = /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(model) && model.length <= SLUG_MAX;
-  const slug = plain ? model : `${model.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, SLUG_MAX - 9) || "m"}-${hash8(model)}`;
+  const plain = PLAIN.test(model) && model.length <= SLUG_MAX;
+  const slug = plain ? model : `${model.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, SLUG_MAX - 10).replace(/-+$/, "") || "m"}--${hash8(model)}`;
   return `${role}-${p}-${slug}`;
 }

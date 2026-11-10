@@ -2,12 +2,12 @@
 // in Settings, and how it reaches nest: a template of the project's own with `launch.model`, named for
 // the role and the model, which each start names (frozen with the attempt, so a change applies to the
 // next start).
-import { env, runInDurableObject } from "cloudflare:test";
+import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { roleTemplate, TEMPLATE } from "../src/catalog";
 import { DEFAULT_MODEL, MODELS, modelLabel, modelProblem, modelTemplateEntry } from "../src/models";
-import { AccessTeam, api, FakeNest, installFetch } from "./fake-nest";
+import { AccessTeam, api, deliver, FakeNest, installFetch } from "./fake-nest";
 
 describe("model ids", () => {
   it("the defaults are the owner's: the manager on Fable 5.2, workers on Opus 5.5, both among the listed ones", () => {
@@ -29,6 +29,12 @@ describe("model ids", () => {
     const names = ids.flatMap((m) => (["manager", "worker"] as const).map((r) => modelTemplateEntry(r, "prj_0123456789abcdef", m)));
     for (const n of names) expect(n, n).toMatch(/^[a-z][a-z0-9-]{0,62}$/);
     expect(new Set(names).size).toBe(names.length);
+    // A plain id can't be chosen to take a hashed id's entry: hashed ones end `--<hash>`, plain ones never hold `--`.
+    const hashed = modelTemplateEntry("worker", "prj_abc123", "Foo");
+    expect(hashed).toMatch(/^worker-abc123-foo--[0-9a-f]{8}$/);
+    const lookalike = hashed.replace("worker-abc123-", "");
+    expect(modelTemplateEntry("worker", "prj_abc123", lookalike)).not.toBe(hashed);
+    expect(modelTemplateEntry("worker", "prj_abc123", lookalike.replace("--", "-"))).not.toBe(hashed);
     // Another project's are its own.
     expect(modelTemplateEntry("worker", "prj_other", "opus")).not.toBe(modelTemplateEntry("worker", "prj_abc123", "opus"));
   });
@@ -137,6 +143,61 @@ describe("a project's models", () => {
     await stub(p).drain();
     const t = (await api(token, "GET", `/api/projects/${p.id}/tasks/${w.id}`)).body;
     expect(fake.agents.get(t.assignee)!.template).toBe(TEMPLATE.worker);
+  });
+
+  it("a model's template goes from nest's catalog once no start uses it: not the setting, no live agent started from it", async () => {
+    const p = await newProject();
+    const first = await assign(p, "first");
+    const opus = `templates/${entry(p, "worker", "claude-opus-5-5")}`;
+    const haiku = `templates/${entry(p, "worker", "claude-haiku-5-5")}`;
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { worker_model: "claude-haiku-5-5" });
+    const second = await assign(p, "second");
+    await stub(p).drain();
+    // The first worker still runs on Opus: its template stays.
+    expect(fake.catalog.has(opus)).toBe(true);
+    expect(fake.catalog.has(haiku)).toBe(true);
+    // A delete nest can't take now is tried again at the next sweep.
+    fake.fail(/^DELETE \/v1\/catalog\/templates\//, 503, { retryable: true, times: 1000 });
+    await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: first.assignee, reason: "exited" });
+    await stub(p).drain();
+    expect(fake.catalog.has(opus)).toBe(true);
+    fake.failures = [];
+    await stub(p).drain();
+    expect(fake.catalog.has(opus)).toBe(false);
+    // The current setting's, and the manager's, stay.
+    expect(fake.catalog.has(haiku)).toBe(true);
+    expect(fake.catalog.has(`templates/${entry(p, "manager", "claude-fable-5-2")}`)).toBe(true);
+    // With no worker left at all, the setting's own template still stays: the next start names it.
+    await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: second.assignee, reason: "exited" });
+    await stub(p).drain();
+    expect(fake.catalog.has(haiku)).toBe(true);
+  });
+
+  it("nothing is swept while a start is owed: it may be about to name the template", async () => {
+    const p = await newProject();
+    const first = await assign(p, "first");
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { worker_model: "claude-haiku-5-5" });
+    await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: first.assignee, reason: "exited" });
+    // A start in flight (its agent create failing for now), frozen on Haiku; then the setting moves on to Sonnet.
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
+    const second = await assign(p, "second");
+    expect(second.state).toBe("assigned");
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { worker_model: "claude-sonnet-5-5" });
+    await stub(p).drain();
+    expect(fake.catalog.has(`templates/${entry(p, "worker", "claude-haiku-5-5")}`)).toBe(true);
+    expect(fake.catalog.has(`templates/${entry(p, "worker", "claude-opus-5-5")}`)).toBe(true);
+  });
+
+  it("a project that's gone takes all its model templates with it", async () => {
+    const p = await newProject();
+    await assign(p);
+    const mine = () => [...fake.catalog.keys()].filter((k) => k.includes(`-${p.id.replace("prj_", "")}-`));
+    expect(mine()).toHaveLength(2);
+    // Removed from the directory (as a create that couldn't be finished is): its object goes inert.
+    await runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => { st.storage.sql.exec("DELETE FROM projects WHERE id = ?", p.id); });
+    await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET listed_ms = NULL"); });
+    await runDurableObjectAlarm(stub(p));
+    expect(mine()).toEqual([]);
   });
 
   it("refuses a model id that could be an option or carry a space, and changes nothing", async () => {

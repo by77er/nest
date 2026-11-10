@@ -509,6 +509,10 @@ export const MIGRATIONS = [
     // The models the manager and the workers run on (README.md#models); null: the default for the role.
     "ALTER TABLE settings ADD COLUMN manager_model TEXT",
     "ALTER TABLE settings ADD COLUMN worker_model TEXT",
+    // The model templates this project wrote to nest's catalog, and the agent each live agent started
+    // from: one no start uses any more is deleted there (`sweepModelTemplates`).
+    "CREATE TABLE model_templates (name TEXT PRIMARY KEY, role TEXT NOT NULL, model TEXT NOT NULL, at_ms INTEGER NOT NULL)",
+    "CREATE TABLE agent_templates (agent TEXT PRIMARY KEY, name TEXT NOT NULL)",
   ],
 ] as const;
 
@@ -1705,8 +1709,43 @@ export class ProjectDO extends DurableObject<Env> {
     if (!spec.model) return TEMPLATE[role];
     const s = this.settings()!;
     const t = roleTemplate(role, s.id, s.repo, spec.model);
+    // Recorded before it's written: one written and never recorded would be left in nest for good.
+    this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = excluded.at_ms", t.name, role, spec.model, Date.now());
     await nest.putCatalog("templates", t.name, t.body);
     return t.name;
+  }
+
+  /**
+   * Delete from nest's catalog each model template of this project's that no start uses any more
+   * (README.md#models): not the role's current setting, and not the one a live agent started from (nest
+   * may read an agent's template again; unverified, so it's kept while that agent lives). Nothing is
+   * swept while a start is owed (it may be about to name one). `all`: every one (the project is gone).
+   * One nest can't delete now stays recorded, for the next sweep.
+   */
+  private async sweepModelTemplates(nest: Nest, all = false): Promise<void> {
+    const rows = this.sql.exec<{ name: string; role: string; model: string }>("SELECT name, role, model FROM model_templates").toArray();
+    if (!rows.length) return;
+    const s = this.settings();
+    let keep = new Set<string>();
+    if (!all && s) {
+      const owed = this.settingsRow()!.manager_next_ms !== null || this.sql.exec("SELECT 1 FROM tasks WHERE state = 'assigned' LIMIT 1").toArray().length > 0;
+      if (owed) return;
+      const live = new Set(this.liveAgents().map((a) => a.agent));
+      for (const a of this.sql.exec<{ agent: string; name: string }>("SELECT agent, name FROM agent_templates").toArray()) {
+        if (live.has(a.agent)) keep.add(a.name);
+        else this.sql.exec("DELETE FROM agent_templates WHERE agent = ?", a.agent);
+      }
+      keep = new Set([...keep, ...rows.filter((r) => r.model === (r.role === "manager" ? s.manager_model : s.worker_model)).map((r) => r.name)]);
+    }
+    for (const r of rows) {
+      if (keep.has(r.name)) continue;
+      try {
+        await nest.deleteCatalog("templates", r.name);
+        this.sql.exec("DELETE FROM model_templates WHERE name = ?", r.name);
+      } catch (e) {
+        console.error(`model template ${r.name} wasn't deleted (the next sweep retries): ${message(e)}`);
+      }
+    }
   }
 
   /** A start attempt's spec as first frozen, if it was. */
@@ -3232,6 +3271,9 @@ export class ProjectDO extends DurableObject<Env> {
     if (this.settingsRow()) {
       const listed = await this.listed();
       if (listed === "gone") {
+        // Its model templates go from nest's catalog with it (README.md#models).
+        const nest = nestFrom(this.env);
+        if (nest) await this.sweepModelTemplates(nest, true);
         this.sql.exec("DELETE FROM settings");
         return;
       }
@@ -3330,6 +3372,8 @@ export class ProjectDO extends DurableObject<Env> {
     // Ended rows past their queue's keep (README.md#outboxes): messages sent or failed a week ago (a failed stop is kept until resolved).
     const msgs = pruneBefore(OUTBOX.messages, now);
     if (msgs !== null) this.sql.exec("DELETE FROM messages WHERE next_ms IS NULL AND COALESCE(ended_ms, at_ms) < ?", msgs);
+    // Model templates no start uses any more go from nest's catalog (README.md#models).
+    await this.sweepModelTemplates(nest);
     // A comment's key outlives any redelivery GitHub makes of it.
     this.sql.exec("DELETE FROM comments_seen WHERE at_ms < ?", now - COMMENTS_SEEN_KEEP_MS);
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
@@ -3506,7 +3550,9 @@ export class ProjectDO extends DurableObject<Env> {
       const frozen = await this.frozenEgress(nest, key, "manager");
       // Its bindings, env and workflows, frozen with the same key (README.md#secrets).
       const spec = await this.sandboxSpec(nest, "manager", key);
-      const agent = s.manager ?? (await nest.startAgent(await this.templateFor(nest, "manager", spec), labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
+      const from = s.manager ? null : await this.templateFor(nest, "manager", spec);
+      const agent = s.manager ?? (await nest.startAgent(from!, labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
+      if (from) this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       if (!current()) {
         // Superseded while it was being made: it goes, unless it's somehow the manager now.
@@ -3555,7 +3601,9 @@ export class ProjectDO extends DurableObject<Env> {
         const key = `${s.id}/${id}/${n}`;
         const frozen = await this.frozenEgress(nest, key, "worker");
         const spec = await this.sandboxSpec(nest, "worker", key);
-        agent = await nest.startAgent(await this.templateFor(nest, "worker", spec), labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
+        const from = await this.templateFor(nest, "worker", spec);
+        agent = await nest.startAgent(from, labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
+        this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
         await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
         if (!current()) {
           // Cancelled (or reassigned, or abandoned) while it was being made: it goes, with no layer or holdings kept for it.
