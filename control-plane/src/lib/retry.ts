@@ -15,6 +15,20 @@ export function retryAfter(attempts: number, now: number, p: RetryPolicy): { at_
   return { at_ms: now + Math.min(p.first_ms * 2 ** Math.max(0, attempts - 1), p.max_ms) };
 }
 
+/**
+ * What a failed reassignment does next (`FleetDO.processReassign`). Only a refusal counts toward giving
+ * up: `leaseLost` reached SandboxDO, which let go of the host, and its new placement was refused. Any
+ * other failure (the call never landed, SandboxDO unreachable) is retried for ever, with the same capped
+ * backoff: giving up then would leave SandboxDO still believing it is placed on a host that is gone.
+ */
+export function reassignRetry(f: { attempts: number; refusals: number; refused: boolean }, now: number, p: RetryPolicy = REASSIGN_RETRY):
+  { attempts: number; refusals: number; next: { at_ms: number } | { gave_up: true } } {
+  const attempts = f.attempts + 1;
+  const refusals = f.refusals + (f.refused ? 1 : 0);
+  if (f.refused && refusals >= p.max_attempts) return { attempts, refusals, next: { gave_up: true } };
+  return { attempts, refusals, next: { at_ms: now + Math.min(p.first_ms * 2 ** Math.min(attempts - 1, 30), p.max_ms) } };
+}
+
 /** FleetDO's reassignment of a lost lease (`leaseLost` to SandboxDO): ~5 s doubling to 5 min, 10 tries (about 20 min). */
 export const REASSIGN_RETRY: RetryPolicy = { first_ms: 5_000, max_ms: 5 * 60_000, max_attempts: 10 };
 /** SandboxDO's placement that FleetDO refused (the leases disagree): 30 s doubling to 10 min, 6 tries (about half an hour). */

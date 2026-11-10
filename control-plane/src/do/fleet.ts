@@ -22,7 +22,7 @@ import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
-import { REASSIGN_RETRY, retryAfter } from "../lib/retry";
+import { reassignRetry } from "../lib/retry";
 import { addColumn, sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
 import { retentionMode } from "../lib/retention";
 import {
@@ -360,6 +360,8 @@ export class FleetDO extends DurableObject<Env> {
     // A failed reassignment's next try (backoff, `REASSIGN_RETRY`) and when it gave up (null: still trying).
     addColumn(this.sql, "reassignments", "next_ms", "INTEGER");
     addColumn(this.sql, "reassignments", "gave_up_ms", "INTEGER");
+    // How many of its failed tries were refusals (SandboxDO took the loss, its placement was refused): only those give up.
+    addColumn(this.sql, "reassignments", "refusals", "INTEGER NOT NULL DEFAULT 0");
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     // Every host this cell made a tunnel for, written before the first Cloudflare call: what the
     // sweep may delete.
@@ -2282,6 +2284,8 @@ export class FleetDO extends DurableObject<Env> {
   async sandboxDestroyed(sandbox: string): Promise<void> {
     this.sql.exec("INSERT INTO sandboxes (sandbox, registered_ms, destroyed_ms) VALUES (?, ?, ?) ON CONFLICT(sandbox) DO UPDATE SET destroyed_ms = excluded.destroyed_ms",
       sandbox, Date.now(), Date.now());
+    // Nothing of it is reassigned any more (`leaseLost` on a destroyed sandbox is nothing), given up or not.
+    this.sql.exec("DELETE FROM reassignments WHERE sandbox = ?", sandbox);
   }
 
   /** SandboxDO's `create`, before anything is written for the sandbox. A destroyed one stays destroyed. */
@@ -2826,19 +2830,24 @@ export class FleetDO extends DurableObject<Env> {
         await this.sandbox(r.sandbox).leaseLost(r.host, r.epoch, r.host_dead === 1);
         this.sql.exec("DELETE FROM reassignments WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch);
       } catch (e) {
-        // Bounded, with backoff (`REASSIGN_RETRY`): a refusal that never heals (the leases disagree) stops
-        // being retried, said once as an error; the sandbox shows its own refusal (`placement_refused`).
-        const row = this.sql.exec<{ attempts: number }>("SELECT attempts FROM reassignments WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch).toArray()[0];
+        // With backoff (`reassignRetry`). Only a refusal counts toward giving up: SandboxDO took the loss
+        // (it no longer names the host) and its new placement was refused, which the sandbox shows itself
+        // (`placement_refused`). A call that never landed is retried for ever: giving up would leave
+        // SandboxDO placed on a host that is gone, with no way to place it again.
+        const row = this.sql.exec<{ attempts: number; refusals: number }>(
+          "SELECT attempts, refusals FROM reassignments WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch).toArray()[0];
         if (!row) continue;
-        const attempts = row.attempts + 1;
-        const next = retryAfter(attempts, Date.now(), REASSIGN_RETRY);
-        if ("gave_up" in next) {
-          this.sql.exec("UPDATE reassignments SET attempts = ?, next_ms = NULL, gave_up_ms = ? WHERE sandbox = ? AND host = ? AND epoch = ?",
-            attempts, Date.now(), r.sandbox, r.host, r.epoch);
-          console.error(`FleetDO: reassigning ${r.sandbox} (lost from ${r.host} at epoch ${r.epoch}) failed ${attempts} times; given up until an operator places it`, e);
+        const ne = asNestError(e);
+        const refused = ne?.code === ErrorCodes.FORBIDDEN && !ne.retryable;
+        const n = reassignRetry({ ...row, refused }, Date.now());
+        if ("gave_up" in n.next) {
+          this.sql.exec("UPDATE reassignments SET attempts = ?, refusals = ?, next_ms = NULL, gave_up_ms = ? WHERE sandbox = ? AND host = ? AND epoch = ?",
+            n.attempts, n.refusals, Date.now(), r.sandbox, r.host, r.epoch);
+          console.error(`FleetDO: reassigning ${r.sandbox} (lost from ${r.host} at epoch ${r.epoch}) was refused ${n.refusals} times; given up until an operator places it`, e);
         } else {
-          this.sql.exec("UPDATE reassignments SET attempts = ?, next_ms = ? WHERE sandbox = ? AND host = ? AND epoch = ?", attempts, next.at_ms, r.sandbox, r.host, r.epoch);
-          console.error(`FleetDO: reassigning ${r.sandbox} failed (${attempts}); next try at ${new Date(next.at_ms).toISOString()}`, e);
+          this.sql.exec("UPDATE reassignments SET attempts = ?, refusals = ?, next_ms = ? WHERE sandbox = ? AND host = ? AND epoch = ?",
+            n.attempts, n.refusals, n.next.at_ms, r.sandbox, r.host, r.epoch);
+          console.error(`FleetDO: reassigning ${r.sandbox} failed (${n.attempts}${refused ? ", refused" : ""}); next try at ${new Date(n.next.at_ms).toISOString()}`, e);
         }
       }
     }

@@ -195,12 +195,16 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 | Model action | Code | Conforms (author) | Detail |
 |---|---|---|---|
 | `PlaceFail` (Refused) | `SandboxDO.placeCurrentEpoch`, "unplaced" refused | partly | Still clears `placing`, rolls the epoch back and rethrows. It now also re-arms the `place` deadline with backoff (`PLACE_REFUSED_RETRY`), so the alarm `place` action (`placeWanted`) runs again, as after NoCapacity, up to 6 times. The spec's Refused leaves no retry, so L1's "Refused" failure is now bounded rather than permanent. The spec doesn't model the retry; it is the same transition NoCapacity already takes |
-| `Reassign` | `FleetDO.processReassign` | partly | A failed `leaseLost` is retried with backoff and gives up after 10 tries (`gave_up_ms`). The spec's `Reassign` retries under weak fairness, unbounded, so L3 ("every row is eventually deleted") no longer holds for a row that gives up. Such a row stays until a placement of the sandbox deletes it; the sandbox shows `placement_refused` |
+| `Reassign` | `FleetDO.processReassign` | partly | A failed `leaseLost` is retried with backoff. It gives up (`gave_up_ms`) only after 10 refusals, each of which means `LeaseLost` was taken (SandboxDO no longer names the host) and the placement after it was refused. A call that never landed is retried without bound, as the spec's `Reassign` is under weak fairness. So L3 ("every row is eventually deleted") fails only for a row that gave up after refusals; it stays until a placement or the destroy of the sandbox deletes it, and the sandbox shows `placement_refused` |
 
 Tests: `control-plane/test/placement-refused.test.ts`. Mutations run, each killed:
 - no backoff;
 - never giving up (reassignments or refusals);
-- given-up rows retried;
+- a call that never landed counting toward giving up;
+- given-up rows retried, arming the tick (either place) or keeping their dead host's record;
+- FleetDO's tries using up the sandbox's own count;
+- the operator's retry keeping the refusal count;
+- a destroyed sandbox's rows kept;
 - a refusal clearing the deadline (the old behaviour);
 - the note kept once placed;
 - the given-up row left after a placement;
