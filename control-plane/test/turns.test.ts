@@ -1,7 +1,9 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
-import { moveNoteDue, recoveryInput, TurnQueue } from "../src/lib/turns";
+import {
+  INBOX_EVENTS, INBOX_STATUSES, inboxStep, moveNoteDue, recoveryInput, TURN_EVENTS, TURN_STATUSES, TurnQueue, type TurnStatus, turnStep,
+} from "../src/lib/turns";
 import type { InboxMessage } from "../src/protocol/control";
 
 /** A fresh queue on a real Durable Object's SQLite (an AgentDO's storage: its own queue's tables). */
@@ -130,5 +132,94 @@ describe("moveNoteDue", () => {
     expect(moveNoteDue({ epoch: null, told: 2, continued: undefined, movedMs: 5_000 })).toBe(false);
     expect(moveNoteDue({ epoch: null, told: 2, continued, movedMs: 5_000 })).toBe(true);
     expect(moveNoteDue({ epoch: null, told: 2, continued, movedMs: 500 })).toBe(false);
+  });
+});
+
+// --- The ledgers' steps (state-machine sweep: F1 to F2) ---------------------------------------------------------
+
+describe("turnStep and inboxStep (pure, exhaustive)", () => {
+  it("every (status, event) pair is one row of this table", () => {
+    const R = "refuse" as const;
+    //                         claim     complete  recover        drop       abandon
+    const table: Record<TurnStatus, (TurnStatus | typeof R)[]> = {
+      queued:      ["active", R,        R,             "dropped", R],
+      active:      [R,        "done",   "interrupted", "dropped", "interrupted"],
+      done:        [R,        R,        R,             R,         R],
+      interrupted: [R,        R,        R,             R,         R],
+      dropped:     [R,        R,        R,             R,         R],
+    };
+    expect(Object.keys(table).sort()).toEqual([...TURN_STATUSES].sort());
+    expect(TURN_EVENTS).toEqual(["claim", "complete", "recover", "drop", "abandon"]);
+    for (const s of TURN_STATUSES) expect(TURN_EVENTS.map((e) => turnStep(s, e)), s).toEqual(table[s]);
+  });
+
+  it("no event applies twice: what it leads to refuses it, so a repeat changes nothing", () => {
+    for (const s of TURN_STATUSES) {
+      for (const e of TURN_EVENTS) {
+        const to = turnStep(s, e);
+        if (to !== "refuse") expect(turnStep(to, e), `${s} ${e}`).toBe("refuse");
+      }
+    }
+    for (const e of INBOX_EVENTS) {
+      expect(inboxStep("delivered", e)).toBe("consumed");
+      expect(inboxStep("consumed", e)).toBe("refuse");
+    }
+    expect(INBOX_STATUSES).toEqual(["delivered", "consumed"]);
+  });
+});
+
+describe("TurnQueue holds every write to the step", () => {
+  it("a turn that isn't active is neither completed nor recovered: dropped stays dropped, and a second recover adds no turn", async () => {
+    await withQueue((q) => {
+      q.enqueue(user("a"));
+      const a = q.claimNext()!.turn;
+      q.enqueue(user("b"));
+      // The agent ended: its turn and the queued one are dropped. A late completion changes nothing.
+      expect(q.dropAll(a)).toBe(2);
+      expect(q.complete(a)).toBe(false);
+      expect(q.recover(a, ["Restarted."])).toBe(false);
+      expect(statuses(q)).toEqual([["a", "dropped"], ["b", "dropped"]]);
+
+      q.enqueue(user("c"));
+      const c = q.claimNext()!.turn;
+      expect(q.recover(c, ["Restarted."])).toBe(true);
+      expect(q.recover(c, ["Restarted."])).toBe(false);
+      expect(q.complete(c)).toBe(false);
+      expect(q.list().filter((t) => t.input.kind === "recovery")).toHaveLength(1);
+      expect(q.list().find((t) => t.turn === c)!.status).toBe("interrupted");
+      // A queued turn can't be completed or recovered either.
+      const queued = q.list().find((t) => t.status === "queued")!.turn;
+      expect(q.complete(queued)).toBe(false);
+      expect(q.recover(queued, ["x"])).toBe(false);
+      expect(q.list().find((t) => t.turn === queued)!.status).toBe("queued");
+    });
+  });
+
+  it("prune settles by age what can't end on its own: a stale active turn that isn't the agent's, a message mirrored to a turn long gone", async () => {
+    await withQueue((q, sql) => {
+      const old = 1000;
+      const cutoff = 5000;
+      q.enqueue(user("stale"), null, old);
+      q.claimNext(old);
+      q.enqueue(user("current"), null, old);
+      const current = q.claimNext(old)!.turn;
+      q.enqueue(user("waiting"), null, old);
+      q.enqueue(user("fresh"), null, 9000);
+      q.claimNext(9000); // "waiting", the older of the two queued, started recently
+      q.mirror(msg("m-stale", "to a turn long gone"), "trn_gone", null, old);
+      q.mirror(msg("m-live", "to the current turn"), current, null, old);
+      q.mirror(msg("m-new", "to a turn long gone, but recent"), "trn_gone", null, 9000);
+
+      q.prune(cutoff, current);
+      const by = Object.fromEntries(q.list().map((t) => [t.input.text, t.status]));
+      // The stale active turn is interrupted, and being old, goes in the same prune.
+      expect(by.stale).toBeUndefined();
+      expect(by.current).toBe("active");
+      // Queued work is never pruned, however old; a recently started active turn stays.
+      expect(by.fresh).toBe("queued");
+      expect(by.waiting).toBe("active");
+      expect(q.mirrored().map((m) => m.id)).toEqual(["m-live", "m-new"]);
+      expect(sql.exec("SELECT 1 FROM inbox WHERE id = 'm-stale'").toArray()).toHaveLength(0);
+    });
   });
 });

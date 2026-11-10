@@ -3562,7 +3562,7 @@ export class AgentDO extends DurableObject<Env> {
     this.calls.prune(cutoff);
     this.mcp.prune(cutoff);
     this.journal.prune(cutoff);
-    this.queue.prune(cutoff);
+    this.queue.prune(cutoff, this.load().current_turn);
   }
 }
 
