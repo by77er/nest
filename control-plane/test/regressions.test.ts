@@ -666,6 +666,21 @@ describe("sweep bug 5: a rewrite that arrives in several segments is committed o
     expect(await agentStub(s.agent).transcript()).toBe(old);
   });
 
+  it("dropped segments left listed with no deadline (a rollback dropped it) are collected at the next alarm", async () => {
+    const s = await setup({ captain: true });
+    const key = `sessions/${s.agent}/b9/0`;
+    await env.BUCKET.put(key, "left behind");
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("INSERT INTO seg_trash (key) VALUES (?)", key);
+      st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'seg_trash'");
+      // Any due deadline brings an alarm.
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('prune', 0)");
+    });
+    await runDue(agentStub(s.agent));
+    await eventually("the listed object deleted", async () => (await env.BUCKET.head(key)) === null);
+    expect(await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => st.storage.sql.exec("SELECT 1 FROM seg_trash").toArray().length)).toBe(0);
+  });
+
   it("a brain started from the committed base drops a half-received rewrite at the start itself", async () => {
     const s = await setup({ captain: true });
     const { ws } = await runner(s.agent, s.host.host, s.host.host_token);

@@ -3622,6 +3622,8 @@ export class AgentDO extends DurableObject<Env> {
       if (this.kvGet<string>("registry") !== this.registryWanted() && !this.deadlines.has("registry")) await this.deadlines.set("registry", Date.now());
       // Timers whose deadline a rolled-back release dropped (no handler for `timer:`): armed again.
       await this.rearmTimers();
+      // Dropped segments whose retry a rolled-back release dropped (no handler for `seg_trash`): collected again.
+      if (!this.deadlines.has("seg_trash") && this.sql.exec("SELECT 1 FROM seg_trash LIMIT 1").toArray().length) await this.deadlines.set("seg_trash", Date.now());
       // Events whose hand-off a rolled-back release dropped (no handler for `client_events`).
       if (this.outbox.waiting() && !this.deadlines.has("client_events")) await this.deadlines.set("client_events", Date.now());
     }
