@@ -5,6 +5,7 @@ import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+import { switchText } from "./SettingsForm";
 
 /** The Settings page (it was a modal): its form, as `dialog` for the tests below. */
 async function openSettings(api: FakeApi) {
@@ -192,14 +193,17 @@ describe("auto-merge in the settings", () => {
 describe("the manager's model, switched now", () => {
   it("a pending switch says when: after this turn, or now", async () => {
     const turn = new FakeApi();
-    turn.projects[0]!.settings = { ...turn.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch: { to: "claude-sonnet-5-5", after_turn: true } };
+    turn.projects[0]!.settings = { ...turn.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch: { from: "claude-fable-5-2", to: "claude-sonnet-5-5", after_turn: true } };
     const b = await openSettings(turn);
-    expect(b.dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Switches to Sonnet 5.5 after this turn.");
+    expect(b.dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Running Fable 5.2; switches to Sonnet 5.5 after this turn.");
     b.unmount();
     const now = new FakeApi();
-    now.projects[0]!.settings = { ...now.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch: { to: "claude-sonnet-5-5", after_turn: false } };
+    now.projects[0]!.settings = { ...now.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch: { from: "claude-fable-5-2", to: "claude-sonnet-5-5", after_turn: false } };
     const c = await openSettings(now);
-    expect(c.dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Switching to Sonnet 5.5…");
+    expect(c.dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Running Fable 5.2; switching to Sonnet 5.5…");
+    // A manager from before the switch (its model not recorded): just where it's going.
+    expect(switchText({ from: null, to: "claude-sonnet-5-5", after_turn: true })).toBe("Switches to Sonnet 5.5 after this turn.");
+    expect(switchText({ from: null, to: "claude-sonnet-5-5", after_turn: false })).toBe("Switching to Sonnet 5.5…");
   });
 });
 

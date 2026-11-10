@@ -312,7 +312,10 @@ const RICH = [
     manager_model: "claude-fable-5-2",
     worker_model: variant === "models-custom" ? "us.anthropic.claude-opus-5-5-20260915-v1:0[1m]" : "claude-opus-5-5",
     // A switch of the running manager waiting for its turn to end (manager-switching).
-    ...(variant === "manager-switching" ? { manager_model: "claude-sonnet-5-5", manager_switch: { to: "claude-sonnet-5-5", after_turn: true } } : { manager_switch: null }),
+    // manager-switching-now: due now, between turns.
+    ...(variant === "manager-switching" || variant === "manager-switching-now"
+      ? { manager_model: "claude-sonnet-5-5", manager_switch: { from: "claude-fable-5-2", to: "claude-sonnet-5-5", after_turn: variant === "manager-switching" } }
+      : { manager_switch: null }),
   };
   const demo = { id: "prj_demo", name, repo, created_ms: now - DAY * 3, settings };
   const other = { id: "prj_other", name: "Widgets", repo: "by77er/widgets", created_ms: now - DAY * 9 };

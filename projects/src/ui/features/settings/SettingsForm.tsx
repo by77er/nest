@@ -23,6 +23,13 @@ import { useEffect, useState } from "react";
 
 const CUSTOM = "custom";
 
+/** A pending switch of the running manager, in words: "Running Fable 5.2; switches to Sonnet 5.5 after this turn." */
+export function switchText(s: { from: string | null; to: string; after_turn: boolean }): string {
+  const to = modelLabel(s.to);
+  const when = s.after_turn ? `switches to ${to} after this turn.` : `switching to ${to}…`;
+  return s.from ? `Running ${modelLabel(s.from)}; ${when}` : `${when.charAt(0).toUpperCase()}${when.slice(1)}`;
+}
+
 /**
  * A role's model (README.md#models): one of the listed ones, or "Custom" and the id typed. A value that
  * isn't listed shows as Custom with its id.
@@ -156,9 +163,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                 />
                 {settings.manager_switch && (
                   <Text fz="sm" c="dimmed" data-slot="manager-switch" role="status">
-                    {settings.manager_switch.after_turn
-                      ? `Switches to ${modelLabel(settings.manager_switch.to)} after this turn.`
-                      : `Switching to ${modelLabel(settings.manager_switch.to)}…`}
+                    {switchText(settings.manager_switch)}
                   </Text>
                 )}
                 <ModelField

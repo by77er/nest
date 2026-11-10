@@ -61,7 +61,7 @@ export interface Settings {
    * A switch of the running manager onto `manager_model` (README.md#models), while one is owed: now, or
    * (`after_turn`) once the turn it's in ends. Null when it runs on the setting's model, or there's none.
    */
-  manager_switch: { to: string; after_turn: boolean } | null;
+  manager_switch: { from: string | null; to: string; after_turn: boolean } | null;
   /**
    * The GitHub user whose PR comments reach workers (README.md#pr-comments), by id (immutable): the
    * repo's owner when it's a user, recorded at attach; an org's repo needs it set. Null: nobody's do.
@@ -644,7 +644,7 @@ export class ProjectDO extends DurableObject<Env> {
       auto_merge: r.auto_merge === 1, merge_method: r.merge_method as MergeMethod, workers_edit_workflows: r.workers_edit_workflows === 1,
       manager_model: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, worker_model: (r.worker_model as string | null) ?? DEFAULT_MODEL.worker,
       manager_switch: r.switch_next_ms === null || r.switch_next_ms === undefined ? null
-        : { to: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, after_turn: r.switch_after_turn === 1 },
+        : { from: (r.manager_running_model as string | null) ?? null, to: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, after_turn: r.switch_after_turn === 1 },
       comments_from: r.comments_from_id === null || r.comments_from_id === undefined ? null : { id: r.comments_from_id as number, login: (r.comments_from_login as string | null) ?? null },
       repo_owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: r.repo_owner_login as string },
       repo_auto_merge: repoAutoMerge({

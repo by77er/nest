@@ -145,7 +145,7 @@ describe("a project's models", () => {
       const p = await newProject();
       const m = fake.agents.get(p.manager)!;
       m.state = "working";
-      expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toEqual({ to: "claude-sonnet-5-5", after_turn: true });
+      expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toEqual({ from: "claude-fable-5-2", to: "claude-sonnet-5-5", after_turn: true });
       await alarm(p);
       expect(m.restarts ?? []).toEqual([]);
       // Its turn ends: due now.
@@ -183,7 +183,7 @@ describe("a project's models", () => {
       expect(m.restarts).toEqual([{ model: "claude-haiku-5-5" }]);
       m.state = "working";
       await setModel(p, "claude-opus-5-5");
-      expect((await settings(p)).manager_switch).toEqual({ to: "claude-opus-5-5", after_turn: true });
+      expect((await settings(p)).manager_switch).toEqual({ from: "claude-haiku-5-5", to: "claude-opus-5-5", after_turn: true });
       await setModel(p, "claude-haiku-5-5");
       expect((await settings(p)).manager_switch).toBeNull();
       m.state = "waiting_input";
@@ -249,7 +249,7 @@ describe("a project's models", () => {
       const m = fake.agents.get(p.manager)!;
       // The client retries a retryable answer itself: nest can't take it for a while.
       fake.fail(new RegExp(`^POST /v1/agents/${p.manager}/start$`), 503, { retryable: true, times: 1000 });
-      expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toEqual({ to: "claude-sonnet-5-5", after_turn: false });
+      expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toEqual({ from: "claude-fable-5-2", to: "claude-sonnet-5-5", after_turn: false });
       expect(m.restarts ?? []).toEqual([]);
       fake.failures = [];
       await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET switch_next_ms = 0"); });
