@@ -326,6 +326,26 @@ describe("tool listing and authority", () => {
 // --- Calls: _meta, sessions, errors ---------------------------------------------------------------------
 
 describe("calls", () => {
+  it("a call settled by another delivery while this one waited isn't sent: it answers with the outcome that stands", async () => {
+    const s = await setup({ trusted: true });
+    call(s.ws, "cal_w0", s.t("echo"), { text: "warm" });
+    await result(s.ws, "cal_w0");
+    const sent = s.stub.calls.length;
+    // Just before this delivery's request would leave, the call's row is settled (as another delivery of it would).
+    await runInDurableObject(env.AGENT.get(env.AGENT.idFromName(s.agent)), (inst: AgentDO) => {
+      inst.testHooks["dispatch:beforeWrite"] = async () => {
+        delete inst.testHooks["dispatch:beforeWrite"];
+        const m = (inst as any).mcp;
+        const key = `${s.agent}/1/cal_late`;
+        m.recordForward({ key, epoch: 1 }, { capability: s.cap }, "note_put", 1);
+        m.settle(key, { outcome: { status: "ok", content: [{ type: "text", text: "from the first delivery" }] }, from_server: true });
+      };
+    });
+    call(s.ws, "cal_late", s.t("note_put"), { key: "k", value: "v" });
+    expect(await result(s.ws, "cal_late")).toEqual({ status: "ok", content: [{ type: "text", text: "from the first delivery" }] });
+    expect(s.stub.calls.length).toBe(sent);
+  });
+
   it("initializes once, reuses the session, and sends the bearer, the protocol version and nest's _meta", async () => {
     const s = await setup({ trusted: true });
     call(s.ws, "cal_m1", s.t("echo"), { text: "hello" });
