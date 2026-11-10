@@ -151,8 +151,12 @@ export type GhAnswer =
 export class GitHubApi {
   constructor(private readonly fetchFn: typeof fetch = fetch, readonly base = GITHUB_API, private readonly timeoutMs = 20_000) {}
 
+  /** Requests this client has made (what an owner lookup costs is charged by it). */
+  requests = 0;
+
   /** One request with `auth` as the bearer (the App's JWT or an installation token; null: none, a public read). Never throws. */
   async request(auth: string | null, method: string, path: string, body?: unknown): Promise<GhAnswer> {
+    this.requests++;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
     try {
@@ -262,10 +266,13 @@ export class GitHubApi {
    */
   async accountLogin(jwt: string | null, account: number): Promise<string | null> {
     if (jwt !== null) {
-      const page = await this.request(jwt, "GET", "/app/installations?per_page=100");
-      if (page.kind === "ok" && Array.isArray(page.json)) {
+      // A page of 100 at a time, at most 10 pages (as `installationOfAccount`).
+      for (let n = 1; n <= 10; n++) {
+        const page = await this.request(jwt, "GET", `/app/installations?per_page=100&page=${n}`);
+        if (page.kind !== "ok" || !Array.isArray(page.json)) break;
         const hit = (page.json as { account?: { id?: unknown; login?: unknown } }[]).find((i) => i?.account?.id === account);
         if (typeof hit?.account?.login === "string") return hit.account.login.toLowerCase();
+        if (page.json.length < 100) break;
       }
     }
     const r = await this.request(null, "GET", `/user/${account}`);

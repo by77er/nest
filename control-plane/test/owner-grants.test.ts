@@ -27,6 +27,8 @@ class FakeGitHub {
   readonly revoked: string[] = [];
   /** A login whose account answers (`/users/{login}`, its installation) name another login, as GitHub's could after a rename. */
   readonly loginOverride = new Map<string, string>();
+  /** Repos whose lookups GitHub doesn't answer (502). */
+  readonly down = new Set<string>();
   /** GitHub's unauthenticated reads answer 403 (its anonymous rate limit). */
   limitPublic = false;
   /** Repos GitHub answers with a redirect (moved), as for a renamed or transferred repo. */
@@ -55,6 +57,9 @@ class FakeGitHub {
       const login = decodeURIComponent(m[1]!).toLowerCase();
       const id = this.accounts.get(login);
       return id !== undefined ? json(200, { id, login: this.loginOverride.get(login) ?? login, type: "User" }) : json(404, { message: "Not Found" });
+    }
+    if ((m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/installation)?$/)) && this.down.has(m[1]!.toLowerCase())) {
+      return json(502, { message: "Bad Gateway" });
     }
     if ((m = u.pathname.match(/^\/user\/(\d+)$/))) {
       const id = Number(m[1]);
@@ -402,6 +407,121 @@ describe("the check sites", () => {
     const mints = gh.mints.length;
     await as(c.token, "/v1/clients/self/github-token", { body: { repo: a.repo("evil"), permissions: { contents: "read" } } }, 403);
     expect(gh.mints.length).toBe(mints);
+  });
+
+  it("the budget is an hour's: past the hour, lookups go on again", async () => {
+    const a = account(["app", "lib"]);
+    const c = await newClient({ repos: [`${a.login}/*`] });
+    await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: [a.repo("app")] } });
+    const broker = env.BROKER.get(env.BROKER.idFromName("broker"));
+    await runInDurableObject(broker, (_i: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE github_lookup_budget SET used = 600, window_ms = ? WHERE client = ?", Date.now() - 3_600_001, c.id);
+    });
+    expect((await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: [a.repo("lib")] } })).repos[0]).toMatchObject({ push: true });
+    expect(await runInDurableObject(broker, (_i: BrokerDO, st) =>
+      st.storage.sql.exec<{ used: number }>("SELECT used FROM github_lookup_budget WHERE client = ?", c.id).one().used)).toBe(1);
+  });
+
+  it("a token's fresh owner lookup spends the client's budget: past it, 429 and nothing minted", async () => {
+    const a = account(["app"]);
+    const c = await newClient({ github: { repos: [`${a.login}/*`], permissions: { contents: "read", metadata: "read" } } });
+    const broker = env.BROKER.get(env.BROKER.idFromName("broker"));
+    const used = () => runInDurableObject(broker, (_i: BrokerDO, st) =>
+      st.storage.sql.exec<{ used: number }>("SELECT used FROM github_lookup_budget WHERE client = ?", c.id).toArray()[0]?.used ?? 0);
+    // Learn the login first (it spends too), then count the mint's own lookup.
+    await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: [a.repo("app")] } });
+    const before = await used();
+    await as(c.token, "/v1/clients/self/github-token", { body: { repo: a.repo("app"), permissions: { contents: "read" } } });
+    expect(await used()).toBe(before + 1);
+    // A second permission set: a new mint, a new lookup; at the limit, refused before it.
+    await runInDurableObject(broker, (_i: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE github_lookup_budget SET used = 600 WHERE client = ?", c.id);
+    });
+    const mints = gh.mints.length;
+    const res = await as(c.token, "/v1/clients/self/github-token", { body: { repo: a.repo("app"), permissions: { metadata: "read" } } }, 429);
+    expect(res.error).toMatchObject({ retryable: true });
+    expect(gh.mints.length).toBe(mints);
+  });
+
+  it("an account's login is found past the first page of the App's installations; one GitHub can't give is asked again within a minute", async () => {
+    // A hundred installations ahead of the one that matters.
+    for (let k = 0; k < 100; k++) account([]);
+    const a = account(["app"]);
+    const c = await newClient({ repos: [`${a.login}/*`] });
+    // Only the App's answer can say it (the anonymous profile is rate limited).
+    gh.limitPublic = true;
+    try {
+      expect((await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: [a.repo("app")] } })).repos[0]).toMatchObject({ push: true });
+    } finally {
+      gh.limitPublic = false;
+    }
+    // An account GitHub can't name now: its row is a miss, kept a minute, not five.
+    const b = account(["x"], { installed: false, public: true });
+    const cb = await newClient({ repos: [`${b.login}/*`] });
+    gh.accounts.delete(b.login);
+    expect((await as(cb.token, "/v1/clients/self/grant/repos", { body: { repos: [b.repo("x")] } })).repos[0]).toMatchObject({ push: false });
+    gh.accounts.set(b.login, b.id);
+    await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), (_i: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE github_account_logins SET fetched_ms = ? WHERE account_id = ?", Date.now() - 61_000, b.id);
+    });
+    expect((await as(cb.token, "/v1/clients/self/grant/repos", { body: { repos: [b.repo("x")] } })).repos[0]).toMatchObject({ push: true });
+  });
+
+  it("GitHub not answering at the token route is a retryable 503, not the 403 of a repo the grant doesn't cover", async () => {
+    const a = account(["app"]);
+    const c = await newClient({ github: { repos: [`${a.login}/*`], permissions: { contents: "read" } } });
+    gh.down.add(a.repo("app"));
+    try {
+      const res = await as(c.token, "/v1/clients/self/github-token", { body: { repo: a.repo("app"), permissions: { contents: "read" } } }, 503);
+      expect(res.error).toMatchObject({ retryable: true });
+      expect(res.error.message).not.toMatch(/502|Bad Gateway/);
+    } finally {
+      gh.down.delete(a.repo("app"));
+    }
+    expect((await as(c.token, "/v1/clients/self/github-token", { body: { repo: a.repo("app"), permissions: { contents: "read" } } })).token).toBeTruthy();
+  });
+
+  it("all clients together are held to one hourly cap: past it, 429 for everyone, and GitHub isn't asked", async () => {
+    const a = account(["app"]);
+    const c = await newClient({ repos: [`${a.login}/*`] });
+    const broker = env.BROKER.get(env.BROKER.idFromName("broker"));
+    await runInDurableObject(broker, (_i: BrokerDO, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO github_lookup_budget (client, window_ms, used) VALUES ('*', ?, 2000)", Date.now());
+    });
+    const before = gh.asked.length;
+    try {
+      const res = await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: [a.repo("app")] } }, 429);
+      expect(res.error.message).toContain("all clients");
+      expect(gh.asked.length).toBe(before);
+    } finally {
+      await runInDurableObject(broker, (_i: BrokerDO, st) => {
+        st.storage.sql.exec("DELETE FROM github_lookup_budget WHERE client = '*'");
+      });
+    }
+  });
+
+  it("a listing is charged for every GitHub call it makes", async () => {
+    const a = account(["app", "lib"]);
+    const c = await newClient({ repos: [`${a.login}/*`] });
+    const broker = env.BROKER.get(env.BROKER.idFromName("broker"));
+    const used = () => runInDurableObject(broker, (_i: BrokerDO, st) =>
+      st.storage.sql.exec<{ used: number }>("SELECT used FROM github_lookup_budget WHERE client = ?", c.id).toArray()[0]?.used ?? 0);
+    const before = await used();
+    const asked = gh.asked.length;
+    await as(c.token, "/v1/clients/self/grant/repos");
+    const all = () => runInDurableObject(broker, (_i: BrokerDO, st) =>
+      st.storage.sql.exec<{ used: number }>("SELECT used FROM github_lookup_budget WHERE client = '*'").toArray()[0]?.used ?? 0);
+    // The installations' pages, the mint, the listing's page and the revoke: each one counted, to the client and to all clients.
+    const calls = gh.asked.length - asked;
+    expect(calls).toBeGreaterThanOrEqual(4);
+    expect(await used()).toBe(before + calls);
+    const allBefore = await all();
+    await runInDurableObject(broker, (_i: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE github_account_repos SET fetched_ms = 0");
+    });
+    const asked2 = gh.asked.length;
+    await as(c.token, "/v1/clients/self/grant/repos");
+    expect(await all()).toBe(allBefore + (gh.asked.length - asked2));
   });
 
   it("a token for a moved repo, or one not found, answers the same 403 as a name outside the grant", async () => {
