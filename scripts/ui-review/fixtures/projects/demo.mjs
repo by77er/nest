@@ -446,8 +446,9 @@ const RICH = [
     // GitHub's repo for its name is another (both shown, to choose); Thingamajigs fails.
     const owner = { id: 4_118_220, login: "by77er" };
     const bindings = [
-      { project: demo.id, name, repo, repo_id: 734_118_202, renamed_to: null, installation_id: 51_920_388, bound: "github", bound_ms: now - 2 * 3_600_000, error: null, owner,
-        // A reinstalled App's events, refused until Re-read takes its new installation.
+      { project: demo.id, name, repo, repo_id: 734_118_202, renamed_to: "by77er/gadgets-app", installation_id: 51_920_388, bound: "github", bound_ms: now - 2 * 3_600_000, error: null, owner,
+        // A reinstalled App's events, refused until Re-read takes its new installation; and a rename pending
+        // too, so a row with two badges is shown.
         refused: { installation: 51_977_120, count: 14, last_ms: now - 12 * 60_000 } },
       { project: other.id, name: other.name, repo: other.repo, repo_id: 512_330_977, renamed_to: "gadget-works-incorporated/widgets-and-sprockets-monorepo", installation_id: null, bound: "event", bound_ms: now - 6 * DAY, error: null, owner: null, refused: null },
       { project: "prj_legacy", name: "Thingamajigs", repo: "by77er/thingamajigs", repo_id: null, renamed_to: null, installation_id: null, bound: null, bound_ms: null, error: "Didn't bind: GitHub's repo by77er/thingamajigs (734118202) is already project prj_demo's", owner: null, refused: null },

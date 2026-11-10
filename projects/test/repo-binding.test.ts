@@ -216,6 +216,24 @@ describe("the App installation", () => {
     expect((await binding(p)).repo_id).toBeNull();
   });
 
+  it("a token minted for the old name (the new one not in nest's grant yet) never stores its installation", async () => {
+    const p = await newProject();
+    const to = `${p.repo}-renamed`;
+    gh.rename(p.repo, to);
+    await deliverGithub("issues", issue(1, { id: repoIdOf(p.repo), full_name: to }));
+    expect((await binding(p)).renamed_to).toBe(to);
+    // The grant names only the old name, whose token comes from another installation (the name's owner now).
+    fake.grantRepos = [p.repo];
+    fake.tokenInstallation = 31_337;
+    expect((await reread(p)).status).toBe(200);
+    expect((await sync()).status).toBe(200);
+    expect(await binding(p)).toMatchObject({ repo_id: repoIdOf(p.repo), installation_id: GH_INSTALLATION_ID });
+    // The real repo's events still reach the project.
+    fake.grantRepos = null;
+    await deliverGithub("issues", issue(2, { id: repoIdOf(p.repo), full_name: to }));
+    expect(await numbers(p)).toEqual([1, 2]);
+  });
+
   it("a nest that doesn't name it keeps the stored one; another repo chosen takes its own", async () => {
     const p = await newProject();
     fake.tokenInstallation = null;
