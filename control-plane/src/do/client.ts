@@ -20,7 +20,9 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
 import { type Grant, labelWhere, type Labels } from "../lib/clients";
-import { BACKLOG_MAX, checkWebhookUrl, retryDelayMs, signature, type StampedEvent, WEBHOOK_TIMEOUT_MS } from "../lib/client-events";
+import {
+  BACKLOG_MAX, checkWebhookUrl, type Delivery, type DeliveryEvent, deliveryStep, EVENT_MAX_AGE_MS, signature, type StampedEvent, WEBHOOK_TIMEOUT_MS,
+} from "../lib/client-events";
 import { num } from "../env";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { type MemberEvent, MemberState, memberStep } from "../lib/members";
@@ -85,7 +87,7 @@ export interface EventsView {
   webhook: string | null;
   /** Events waiting to be delivered. */
   backlog: number;
-  /** Events dropped because the backlog was full (oldest first), ever. */
+  /** Events dropped, ever: the oldest when the backlog was full, and any that waited 7 days undelivered. */
   dropped: number;
   /** Consecutive failed attempts (0 once one succeeds), and the last failure's reason. */
   failures: number;
@@ -97,15 +99,6 @@ interface Webhook {
   url: string;
   secret: string;
   set_ms: number;
-}
-
-/** Delivery's state: its retry schedule survives a restart. */
-interface Delivery {
-  failures: number;
-  dropped: number;
-  last_error?: string;
-  /** When the last attempt failed (the next one is `retryDelayMs(failures)` later). */
-  failed_ms?: number;
 }
 
 /** One agent or sandbox of a client's subtree, as listed. */
@@ -188,6 +181,8 @@ export class ClientDO extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS deadlines (key TEXT PRIMARY KEY, at INTEGER NOT NULL)");
     // Events waiting for its webhook, in the order they were handed over; `id` is the event's (dedup).
     this.sql.exec("CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, body TEXT NOT NULL)");
+    // When the event was queued, for its age limit (`EVENT_MAX_AGE_MS`); null in a row from before the column.
+    addColumn(this.sql, "outbox", "queued_ms", "INTEGER");
     this.keys = new IdempotencyKeys(this.sql);
   }
 
@@ -204,8 +199,9 @@ export class ClientDO extends DurableObject<Env> {
   }
 
   /** The create under `key` was answered `status`. */
-  async finishKey(key: string, status: number): Promise<void> {
-    this.requireKeys().finish(key, status);
+  /** `id`: the object the finishing request made (absent from a Worker of the previous release: not checked then). */
+  async finishKey(key: string, status: number, id?: string): Promise<void> {
+    this.requireKeys().finish(key, status, id);
   }
 
   /** The request holding `claim` failed; `free`: nothing was ever created under the key. */
@@ -604,6 +600,26 @@ export class ClientDO extends DurableObject<Env> {
     return this.kv<Delivery>("delivery") ?? { failures: 0, dropped: 0 };
   }
 
+  /** Apply `event` to the delivery state as it is in this step (`deliveryStep`), and say when the next attempt is due. */
+  private deliveryEvent(event: DeliveryEvent): "now" | "keep" | number {
+    const { delivery, next } = deliveryStep(this.delivery(), event);
+    this.kvPut("delivery", delivery);
+    return next;
+  }
+
+  /**
+   * Events that waited `EVENT_MAX_AGE_MS` for a receiver that never took them are dropped and counted, so
+   * none waits for ever. A row from before `queued_ms` starts its wait now.
+   */
+  private dropOldEvents(now = Date.now()): void {
+    this.sql.exec("UPDATE outbox SET queued_ms = ? WHERE queued_ms IS NULL", now);
+    const n = this.sql.exec("DELETE FROM outbox WHERE queued_ms <= ?", now - EVENT_MAX_AGE_MS).rowsWritten;
+    if (n) {
+      this.deliveryEvent({ kind: "dropped", n });
+      console.warn(`client ${this.record()?.client ?? "?"}: dropped ${n} events that waited ${EVENT_MAX_AGE_MS / 86_400_000} days undelivered`);
+    }
+  }
+
   private backlog(): number {
     return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM outbox").one().n;
   }
@@ -623,8 +639,7 @@ export class ClientDO extends DurableObject<Env> {
     if (bad) throw new NestError(ErrorCodes.INVALID_MESSAGE, bad);
     const secret = `whsec_${hex(crypto.getRandomValues(new Uint8Array(32)))}`;
     this.kvPut("webhook", { url, secret, set_ms: Date.now() } satisfies Webhook);
-    const d = this.delivery();
-    this.kvPut("delivery", { failures: 0, dropped: d.dropped } satisfies Delivery);
+    this.deliveryEvent({ kind: "webhook_set" });
     if (this.backlog()) await this.deadlines.set("deliver", Date.now());
     return { url, secret };
   }
@@ -639,12 +654,11 @@ export class ClientDO extends DurableObject<Env> {
     this.requireClient();
     const r = this.record();
     if (!r || r.deleted_ms || !this.kv<Webhook>("webhook") || !events.length) return;
-    for (const ev of events) this.sql.exec("INSERT OR IGNORE INTO outbox (id, body) VALUES (?, ?)", ev.id, JSON.stringify(ev));
+    for (const ev of events) this.sql.exec("INSERT OR IGNORE INTO outbox (id, body, queued_ms) VALUES (?, ?, ?)", ev.id, JSON.stringify(ev), Date.now());
     const over = this.backlog() - BACKLOG_MAX;
     if (over > 0) {
       this.sql.exec("DELETE FROM outbox WHERE seq IN (SELECT seq FROM outbox ORDER BY seq LIMIT ?)", over);
-      const d = this.delivery();
-      this.kvPut("delivery", { ...d, dropped: d.dropped + over } satisfies Delivery);
+      this.deliveryEvent({ kind: "dropped", n: over });
       console.warn(`client ${r.client}: its event backlog is full; dropped the ${over} oldest`);
     }
     // A delivery waiting out its backoff keeps its time; otherwise the next one goes now.
@@ -678,18 +692,16 @@ export class ClientDO extends DurableObject<Env> {
         error = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError") ? `no answer within ${timeoutMs} ms` : clip(String(e), 300);
       }
       // Re-read in this step: a new webhook set during the attempt starts its own schedule.
-      const d = this.delivery();
       if (this.kv<Webhook>("webhook")?.set_ms !== hook.set_ms) continue;
       if (error === null) {
         this.sql.exec("DELETE FROM outbox WHERE seq = ?", row.seq);
-        if (d.failures) this.kvPut("delivery", { failures: 0, dropped: d.dropped } satisfies Delivery);
+        this.deliveryEvent({ kind: "delivered" });
         continue;
       }
       // The wait runs from the failure: an attempt cut off at the timeout is retried 1 s after that.
-      const failures = d.failures + 1;
       const now = Date.now();
-      this.kvPut("delivery", { failures, dropped: d.dropped, last_error: error, failed_ms: now } satisfies Delivery);
-      await this.deadlines.set("deliver", now + retryDelayMs(failures));
+      const wait = this.deliveryEvent({ kind: "failed", error, now });
+      await this.deadlines.set("deliver", now + (typeof wait === "number" ? wait : 0));
       return;
     }
     if (this.backlog()) await this.deadlines.set("deliver", Date.now());
@@ -711,6 +723,7 @@ export class ClientDO extends DurableObject<Env> {
       else if (key === "prune") {
         for (const r of this.sql.exec<{ id: string }>("SELECT id FROM members WHERE ended_ms < ?", Date.now() - ENDED_RETENTION_MS).toArray()) this.move(r.id, "expire");
         this.keys.prune();
+        this.dropOldEvents();
         // A delivery a rolled-back release dropped (it has no handler for `deliver`) is armed again.
         if (this.backlog() && !this.deadlines.has("deliver")) await this.deadlines.set("deliver", Date.now());
         await this.recheckLive();
@@ -771,7 +784,8 @@ export class ClientDO extends DurableObject<Env> {
     for (const r of rows) {
       const now = await this.exists(r.kind as MemberKind, r.id);
       // Re-read in this step: a report may have landed during the await (ended stays ended).
-      if (now !== "live") this.move(r.id, `check_${now}`);
+      // A live row is all this looked at: one that went and was admitted again meanwhile is the reconcile's.
+      if (now !== "live" && this.memberState(r.id) === "live") this.move(r.id, `check_${now}`);
       this.sql.exec("UPDATE members SET checked_ms = ? WHERE id = ?", Date.now(), r.id);
     }
   }

@@ -155,7 +155,7 @@ POST /v1/agents
     - each attempt is cut off after 10 s;
     - failures retry after 1 s, doubling to 5 min;
     - any non-2xx response is a failure.
-  - The backlog is bounded at 10,000 events, and past that the oldest go. The number dropped is counted and shown in the client's record.
+  - The backlog is bounded at 10,000 events, and past that the oldest go. An event that has waited 7 days undelivered goes too (decided 2026-11-09: a receiver down that long has missed more than a replay would mend, and nothing should wait for ever). The number dropped, either way, is counted and shown in the client's record.
   - A client that missed events re-reads the agents' state.
 
 **How the build settled what the design left open (2026-11-02):**

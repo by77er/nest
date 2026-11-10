@@ -36,6 +36,59 @@ export function retryDelayMs(failures: number): number {
   return Math.min(RETRY_FIRST_MS * 2 ** Math.min(failures - 1, 20), RETRY_MAX_MS);
 }
 
+// --- the delivery's step (pure) ----------------------------------------------------------------------
+
+/** An event waits for its delivery at most this long; after that it is dropped and counted (`dropped`). */
+export const EVENT_MAX_AGE_MS = 7 * 86_400_000;
+
+/** A client's delivery state (ClientDO `kv.delivery`): its retry schedule survives a restart. */
+export interface Delivery {
+  /** Consecutive failed attempts (0: the last one succeeded, or none was made). */
+  failures: number;
+  /** Events dropped, ever: the oldest when the backlog was full, and any that waited `EVENT_MAX_AGE_MS`. */
+  dropped: number;
+  last_error?: string;
+  /** When the last attempt failed (the next one is `retryDelayMs(failures)` later). */
+  failed_ms?: number;
+}
+
+/** `ok`: the next event goes at once. `backing_off`: the last attempt failed, and the next waits its turn. */
+export const DELIVERY_PHASES = ["ok", "backing_off"] as const;
+export type DeliveryPhase = (typeof DELIVERY_PHASES)[number];
+export const deliveryPhase = (d: Delivery): DeliveryPhase => (d.failures > 0 ? "backing_off" : "ok");
+
+/**
+ * What happens to a delivery: an attempt was answered 2xx (`delivered`) or not (`failed`), the client set
+ * a webhook (`webhook_set`: a new receiver starts its own schedule), or events were dropped unsent.
+ */
+export const DELIVERY_EVENTS = ["delivered", "failed", "webhook_set", "dropped"] as const;
+export type DeliveryEvent =
+  | { kind: "delivered" }
+  | { kind: "failed"; error: string; now: number }
+  | { kind: "webhook_set" }
+  | { kind: "dropped"; n: number };
+
+/**
+ * The delivery's one step: the state after `event`, and when the next attempt is due: `now`, after a wait
+ * (ms, from the failure), or `keep` (whatever is armed stays: dropping events changes no schedule).
+ * Every write of `kv.delivery` goes through it. Nothing is refused: every event applies in both phases.
+ * - A success or a new webhook clears the failures and the last error; `dropped` is only ever added to.
+ * - A failure counts one more and waits `retryDelayMs` of the new count.
+ */
+export function deliveryStep(d: Delivery, e: DeliveryEvent): { delivery: Delivery; next: "now" | "keep" | number } {
+  switch (e.kind) {
+    case "delivered":
+    case "webhook_set":
+      return { delivery: { failures: 0, dropped: d.dropped }, next: "now" };
+    case "failed": {
+      const failures = d.failures + 1;
+      return { delivery: { failures, dropped: d.dropped, last_error: e.error, failed_ms: e.now }, next: retryDelayMs(failures) };
+    }
+    case "dropped":
+      return { delivery: { ...d, dropped: d.dropped + Math.max(0, e.n) }, next: "keep" };
+  }
+}
+
 /** `Nest-Signature`: `t=<ms>,v1=<hex HMAC-SHA256(secret, "<t>.<body>")>`, the key the secret's UTF-8 bytes. */
 export async function signature(secret: string, t: number, body: string): Promise<string> {
   const enc = new TextEncoder();

@@ -534,6 +534,31 @@ describe("the grant bounds everything in the subtree", () => {
     expect((await stub.list("sandbox", { state: "all" })).items.map((m) => [m.id, m.state]))
       .toEqual([[gone.sandbox, "ended"], [kept.sandbox, "live"]]);
   });
+
+  it("the hourly recheck judges only a row that is still live: one admitted afresh while it asked keeps its reservation", async () => {
+    const c = await newClient({ max_agents: 5 });
+    const stub = clientStub(c.id);
+    const facts = { kind: "agent" as const, id: "agt_again", cell: c.cell, owner: c.id, labels: {} };
+    await stub.report({ ...facts, ended_ms: null });
+    await runInDurableObject(stub, (_i: ClientDO, st) => {
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'prune'");
+    });
+    // While the recheck asks about the live row, the row goes and the same id is admitted again (a reservation).
+    const proto = ClientDOClass.prototype as unknown as { exists: (kind: string, id: string) => Promise<string> };
+    const real = proto.exists;
+    proto.exists = async function (this: ClientDO, _kind: string, id: string) {
+      if (id !== facts.id) return "live";
+      this.ctx.storage.sql.exec("DELETE FROM members WHERE id = ?", id);
+      await this.admit(facts);
+      return "gone";
+    };
+    try {
+      await runDue(stub);
+    } finally {
+      proto.exists = real;
+    }
+    expect((await stub.list("agent", { state: "all" })).items.map((m) => [m.id, m.state])).toEqual([["agt_again", "reserved"]]);
+  });
 });
 
 // --- Labels and listings -----------------------------------------------------------------------------------

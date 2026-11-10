@@ -140,9 +140,17 @@ export class IdempotencyKeys {
     return { kind: "run", id: row.id, claim, fresh: false };
   }
 
-  /** The create under `key` was answered `status`: later requests with it replay that. The first to finish decides. Whether this one did. */
-  finish(key: string, status: number, now = Date.now()): boolean {
-    if (keyStep(keyView(this.row(key), now), "finish") === "refuse") return false;
+  /**
+   * The create of object `id` under `key` was answered `status`: later requests with it replay that. The
+   * first to finish decides, among requests for the object the key is bound to now: a finish for another
+   * id is refused (its request held the key before the TTL freed it, and the key has since been claimed
+   * afresh for a new object, whose own request is still running). Whether this one did. `id` undefined
+   * (a caller of the previous release): not checked.
+   */
+  finish(key: string, status: number, id?: string, now = Date.now()): boolean {
+    const row = this.row(key);
+    if (id !== undefined && row && row.id !== id) return false;
+    if (keyStep(keyView(row, now), "finish") === "refuse") return false;
     this.sql.exec("UPDATE idempotency_keys SET state = 'done', status = ?, claim = NULL WHERE key = ?", status, key);
     return true;
   }
