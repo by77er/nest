@@ -25,6 +25,8 @@ describe("a history entry's summary", () => {
     [row("start_failed", "nest refused: max_agents", "app:assign"), "The worker couldn't start: nest refused: max_agents"],
     [row("pr_opened", { pr: 118 }, "agt_w1"), "PR #118 opened"],
     [row("review_ended", { pr: 118 }, "app:github"), "Out of review: PR #118 was its last open PR"],
+    [row("stop_failed", { agent: "agt_w1", error: "nest 409 conflict: busy" }, "app:nest"), "nest refused to stop agt_w1: nest 409 conflict: busy; it may still be running"],
+    [row("stop_dismissed", { agent: "agt_w1" }, "owner"), "The stop of agt_w1 dismissed: no longer counted"],
     [row("dependency_removed", { blocked_by: "tsk_a", title: "Old blocker", why: "deleted" }, "app:board"), 'No longer waits on "Old blocker" (deleted)'],
     [row("dependency_removed", { blocked_by: "tsk_a", title: "Old blocker" }, "owner"), 'No longer waits on "Old blocker"'],
     [row("pr_comment_dropped", { comments: 2, why: "its worker didn't start" }, "app:board"), "2 queued PR comments were dropped: its worker didn't start"],
