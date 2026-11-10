@@ -196,7 +196,7 @@ fn comparing_with_the_disks_map_from_the_pre_copy_also_holds() {
 
 use nestd_check::incarnation::{self, AGREE, ARCHIVING, FENCED, IncarnationModel, LAPSED, OWN_EPOCH};
 
-const LIFECYCLE_EXAMPLES: [&str; 3] = ["a_suspended_sandbox_ran_again", "an_archive_landed", "a_fence_landed_during_a_boot"];
+const LIFECYCLE_EXAMPLES: [&str; 4] = ["a_suspended_sandbox_ran_again", "an_archive_landed", "a_fence_landed_during_a_boot", "a_fence_landed_between_a_check_and_its_pause"];
 
 /// With the three fixes the audit proposed, the shell and the table agree and every property
 /// holds, whether a suspend keeps its VM paused or releases it.

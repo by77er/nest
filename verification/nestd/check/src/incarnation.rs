@@ -125,6 +125,7 @@ pub struct State {
     pub resumed: bool,
     pub archived: bool,
     pub fenced_while_booting: bool,
+    pub fenced_before_a_pause: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -154,7 +155,7 @@ impl State {
         let refused = row.machine.step(input).is_err();
         if refused || row.machine.state() != row.state {
             self.mismatch = true;
-            row.machine = Incarnation::at(row.state, row.machine.vm());
+            row.machine.follow(row.state, input);
         }
     }
 
@@ -191,6 +192,9 @@ impl State {
         self.fence_task = true;
         if matches!(self.op, Op::Starting | Op::Booted) {
             self.fenced_while_booting = true;
+        }
+        if matches!(self.op, Op::Pausing(_)) && vm {
+            self.fenced_before_a_pause = true;
         }
     }
 
@@ -274,7 +278,9 @@ impl State {
                 self.stop();
                 self.row = None;
                 self.fence_task = false;
-                // The proxy refuses a tombstoned epoch: this create fails before it has a row.
+                // The proxy refuses a tombstoned epoch: this create fails while it sets up its
+                // network, before any VM. (The shell has a `creating` row meanwhile and reports
+                // `failed`; the table takes those two steps, and they are left out here.)
                 if self.tombstone.is_some_and(|t| epoch <= t) {
                     return;
                 }
@@ -435,6 +441,7 @@ impl Model for IncarnationModel {
             resumed: false,
             archived: false,
             fenced_while_booting: false,
+            fenced_before_a_pause: false,
         }]
     }
 
@@ -503,6 +510,7 @@ impl Model for IncarnationModel {
             Property::sometimes("a_suspended_sandbox_ran_again", |_, s: &State| s.resumed),
             Property::sometimes("an_archive_landed", |_, s: &State| s.archived),
             Property::sometimes("a_fence_landed_during_a_boot", |_, s: &State| s.fenced_while_booting),
+            Property::sometimes("a_fence_landed_between_a_check_and_its_pause", |_, s: &State| s.fenced_before_a_pause),
         ]
     }
 }

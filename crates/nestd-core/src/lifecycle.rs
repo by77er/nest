@@ -21,11 +21,16 @@
 //! property: H-B1, H-B2, and H-B3 (a create admitted under a lapsed lease, which this table has
 //! no part in).
 //!
-//! One rule is stricter than the shell on purpose: a pause held by one step is never taken by
-//! another step, except by a fence (which takes any) and by an archive of a suspended VM. The
-//! shell breaks it where a step left a VM paused and nothing recorded it: after H-B1 (a checkpoint
-//! pauses and resumes the VM a failed archive left paused), and after a suspend left in
-//! `suspending` by a roll-back that couldn't finish. Those then show as mismatches.
+//! The table is stricter than the shell in two ways, on purpose; each shows as a mismatch where
+//! the shell goes beyond it:
+//! - **A pause is held by the step that took it.** That step may take it again (a retry), a
+//!   fence takes any pause, and an archive takes a suspended VM's; no other step takes another's.
+//!   The shell does where a step left a VM paused and nothing recorded it: a checkpoint after
+//!   H-B1, and a suspend or archive after a checkpoint whose resume of the VM failed.
+//! - **A suspend begins only from `running`, an archive only from `running` or `suspended`.** The
+//!   shell begins both from any state that isn't fenced: a retried archive or a suspend on a row
+//!   H-B1 left `archiving`, and a retried suspend or an archive on a row left `suspending` by a
+//!   roll-back that couldn't finish.
 
 /// The reported state: `nest_protocol::model::SandboxState`, member for member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

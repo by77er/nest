@@ -379,12 +379,21 @@ Phase 2 waits for the proxy link's rework (PR #28, open) to merge. Each machine 
   - **H-B4:** a step that checked the fence before it awaited acts on the VM after the fence landed: it pauses a fenced VM, or resumes one the fence paused. The fence's own stop follows, so no property below fails; the table accepts both (a fenced VM's pause is the fence's, whoever took it).
 - **How it is fed.** `Inner::shadow` (`host.rs`) feeds it every step: each state the shell reports, in the same critical section that sets the row's state (so a fence on another task never comes between the two), and each start, pause, resume and stop of a VM, after it succeeded. A step the machine refuses, or a reported state that differs from the row's, is logged at error level (`lifecycle shadow mismatch`, with the input, the machine before and after, the refusal and the row's state) and counted (`Inner::lifecycle_mismatches`); the machine then follows the shell again: the row's state, and the VM's condition that step left. There is no metrics path in nestd to export the count, and no wire field: the log line is the signal on a host.
 - **Where a mismatch fails a run:** every `tests/host.rs` test (the harness asserts the count when it is dropped), and the e2e harness (a check over nestd's log).
-- **One rule is stricter than the shell on purpose:** a pause is held by the step that took it. That step may take it again (a retry), a fence takes any pause and an archive takes a suspended VM's; nothing else takes another's. The shell breaks it where a step left a VM paused and nothing recorded it, and each such case shows as a mismatch, once (the machine then follows the shell):
-  - after H-B1: a checkpoint pauses the VM the failed archive left paused, and a retried archive starts from `archiving`;
-  - after a suspend left in `suspending` (its roll-back couldn't persist or resume): a retried suspend or archive starts from `suspending`;
-  - after a checkpoint whose resume of the VM failed: a later suspend or archive pauses a VM the checkpoint still holds.
+- **The table is stricter than the shell in two ways, on purpose.** Where the shell goes beyond it, the step shows as a mismatch, and the machine then follows the shell:
+  - **A pause is held by the step that took it.** That step may take it again (a retry), a fence takes any pause and an archive takes a suspended VM's; nothing else takes another's. The shell does where a step left a VM paused and nothing recorded it.
+  - **A suspend begins only from `running`, an archive only from `running` or `suspended`.** The shell begins both from any state that isn't fenced.
 
-  So on a real host a mismatch is expected after those failures (an archive's commit timing out is the ordinary one) and nowhere else. The rollout's "no mismatch" is judged with that in mind: each logged mismatch is read, and one not of these kinds blocks.
+  The cases on a real host, each following a failure nestd already logs:
+
+  | After | The next step | Mismatches |
+  |---|---|---|
+  | H-B1 (an archive's commit failed: the ordinary one is a timeout) | a checkpoint | 1: its pause is the archive's |
+  | H-B1 | a retried archive | 1: it begins from `archiving` |
+  | H-B1 | a suspend | 2: it begins from `archiving`, and its pause is the archive's |
+  | a suspend left in `suspending` (its roll-back couldn't persist or resume) | a retried suspend, or an archive | 1: it begins from `suspending` |
+  | a checkpoint whose resume of the VM failed | a suspend or an archive | 1: its pause is the checkpoint's |
+
+  The rollout's "no mismatch" is judged with that in mind: each logged mismatch is read, and one not of these kinds blocks.
 - **No Kani harness:** the machine is small and finite, and its unit tests sweep every state, holder and VM condition; the mutation run on the module has none missed.
 - **The rollout:** one release on real hosts with no mismatch, then the machine starts deciding (reported state first, then the VM's condition, then retire and the start scan); the shadow comparison is deleted one release after the last step.
 - **What the model shows** (`verification/nestd/check`, `incarnation`: the real table beside a model of the shell's steps, with a fence or a lease lapse between any two):
@@ -397,8 +406,9 @@ Phase 2 waits for the proxy link's rework (PR #28, open) to merge. Each machine 
 | no create is admitted under a lapsed lease | fails (H-B3): the admission never looks at the lease | holds: it refuses while lapsed |
 | a fenced VM is stopped once nothing is in flight | holds | holds |
 
-  The model's bounds: one sandbox, epochs 1 and 2, four commands, one fence, one lapse; a suspend that keeps its VM paused (1,082 states with the fixes, 2,354 as today) and one that releases it (1,115). A command's fence check and its pause of the VM are separate steps, so a fence lands between them too. A variant whose resume ignores the fence fails the last property, so that property can fail. Not modelled: commits beyond "landed or not", `meta.json`, crashes, the retire loop, a pause or resume that fails, and the fence's lock-free pause landing later than its mark (the table's unit tests cover those orders). Those are the rest of this section, still to build.
+  The model's bounds: one sandbox, epochs 1 and 2, four commands, one fence, one lapse; a suspend that keeps its VM paused (1,412 states with the fixes, 3,013 as today) and one that releases it (1,398). A command's fence check and its pause of the VM are separate steps, so a fence lands between them too. A variant whose resume ignores the fence fails the last property, so that property can fail. After a mismatch the model's machine follows the shell as `Inner::shadow` does. Not modelled: commits beyond "landed or not", `meta.json`, crashes, the retire loop, a pause or resume that fails, and the fence's lock-free pause landing later than its mark (the table's unit tests cover those orders). Those are the rest of this section, still to build.
 - **Host-level tests** (`tests/host.rs`): `a_failed_archive_stays_archiving_and_the_machine_refuses_what_follows` (H-B1) and `a_same_epoch_create_of_a_suspended_sandbox_fences_it` (H-B2) pin today's behaviour through the real shell; they are turned round when the fixes land. H-B3 is in the model only. `a_fence_between_a_checkpoints_check_and_its_pause_is_no_mismatch` fences inside that window (H-B4) and expects agreement.
+- **Known gap, to close when the machine decides:** the fence's lock-free pause feeds the machine from a task of its own, keyed by sandbox and epoch only. A later row at the same epoch (a destroy, then a create, with that task delayed across both) could take the stale step. Nothing reaches it today: a same-epoch create fails before its VM starts.
 
 **The full design (not built):**
 

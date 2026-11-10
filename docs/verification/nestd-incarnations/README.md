@@ -1,5 +1,7 @@
 # nestd incarnations, fenced-epoch tombstones and restart recovery
 
+**Since this inventory:** the lifecycle (reported state, the VM's condition, who holds a pause) is a machine, `nestd_core::lifecycle`, run beside nestd and deciding nothing yet, and the create's admission is `lifecycle::admit_create`. See [nestd/](../nestd/#incarnations-nestd_coreincarnation). The line numbers below predate it.
+
 Inventory for modelling: per-(sandbox, epoch) state on a sandbox host, `Fenced` as terminal, salvage and retire, the tombstone map, restart reconciliation, and FleetDO's reap of stale incarnations. Code is cited at main `edf6829` (PR #27); rows changed since cite functions. Design: [nestd](../../compute/nestd/README.md), [fencing](../../sandbox/fencing/README.md).
 
 > **Since:** the pure decisions here (tombstones, the scan, `meta.json` versions, salvage retry, retire backoff, the re-ask rule) are in `nestd_core::incarnation`, proved with Kani or table-tested; the machine itself is phase 2 of [nestd/](../nestd/#phase-2-design). B1 and B2 are fixed (#62).

@@ -5,7 +5,7 @@
 //! Example: `fixed,cmds=2,drops=1`. `lease[,...]` and `sentinel[,async][,trust-running][,keep-on-begin][,stale-records][,writes=N]
 //! [,commits=N][,restarts=N]` check the lease and the unchanged-disk short-circuit; `shadow[,...]` and
 //! `slots[,unheld-queue][,writes=N][,cuts=N]` M3′'s shadow cut and its two shadows.
-//! `incarnation[,today][,same-epoch][,stuck-archive][,lapsed-create][,disk-only][,cmds=N][,fences=N][,epochs=N]`
+//! `incarnation[,today][,same-epoch][,stuck-archive][,lapsed-create][,unfenced-resume][,disk-only][,cmds=N][,fences=N][,epochs=N]`
 //! checks the lifecycle table beside a model of the shell that feeds it.
 
 use nestd_check::fleet::{Config, FleetModel, describe};
