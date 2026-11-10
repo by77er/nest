@@ -123,6 +123,8 @@ describe("the Triage page", () => {
     api.projects[0]!.settings = { ...api.projects[0]!.settings!, comments_from: null, repo_owner: null };
     const view = renderApp("/projects/prj_one/triage", api);
     const notice = await screen.findByRole("status", { name: "No one's issues come in yet" });
+    expect(notice).toHaveTextContent("no PR comments user is set and the repo's owner isn't known as a person");
+    expect(notice).not.toHaveTextContent("organization");
     expect(notice).toHaveTextContent("Set the PR comments user, or choose Anyone under Issues from.");
     expect(within(notice).getByRole("link", { name: "Open Settings" })).toHaveAttribute("href", "/projects/prj_one/settings#triage");
     view.unmount();

@@ -98,6 +98,15 @@ describe("who 'you' is for issues", () => {
     // The Triage page's Notice links to this panel.
     expect(b.dialog.querySelector("#triage")).toHaveTextContent("Issues from");
   });
+
+  it("arriving by the Triage page's link (#triage), focus lands on the panel's heading", async () => {
+    const api = new FakeApi();
+    api.projects[0]!.settings = { ...api.projects[0]!.settings!, comments_from: null, repo_owner: null };
+    renderApp("/projects/prj_one/settings#triage", api);
+    const heading = await screen.findByRole("heading", { name: "Triage" });
+    await waitFor(() => expect(heading).toHaveFocus());
+    expect(heading.closest("#triage")).not.toBeNull();
+  });
 });
 
 describe("auto-merge in the settings", () => {

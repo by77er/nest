@@ -156,7 +156,7 @@ function NoOneYet({ projectId }: { projectId: string }) {
     <Notice tone="warning" title="No one's issues come in yet" role="status">
       <Stack gap="sm" align="flex-start">
         <Text fz="sm">
-          Only issues opened by the PR comments user or the repo&apos;s owner come in, and this repo has neither (an organization owns it). Set the PR comments user, or choose Anyone under Issues from.
+          Only issues opened by the PR comments user or the repo&apos;s owner come in, and no PR comments user is set and the repo&apos;s owner isn&apos;t known as a person. Set the PR comments user, or choose Anyone under Issues from.
         </Text>
         <Button variant="default" renderRoot={(props) => <AnchorLink {...props} to="/projects/$projectId/settings" params={{ projectId }} hash="triage" />}>
           Open Settings
