@@ -126,6 +126,12 @@ impl State {
         self.close_deadline.get_or_insert(tokio::time::Instant::now() + CLOSE_FLUSH);
     }
 
+    /// AgentDO has every reliable message up to `up_to` (an `ack`, or a `hello_ack`'s `last_seq`):
+    /// those are never resent; the ones after it are.
+    fn acked(&mut self, up_to: u64) {
+        self.unacked.retain(|(s, _)| *s > up_to);
+    }
+
     /// Give the next seq to a reliable message and keep it until AgentDO acks it.
     fn queue(&mut self, make: impl FnOnce(Seq) -> RunnerToAgent) -> &RunnerToAgent {
         self.last_out += 1;
@@ -267,7 +273,7 @@ impl Session {
         };
         self.tailer.rewind(durable);
         st.durable = durable;
-        st.unacked.retain(|(s, _)| *s > peer_last);
+        st.acked(peer_last);
         for (_, m) in &st.unacked {
             tx.send(text(m)?).await?;
         }
@@ -410,7 +416,7 @@ impl Session {
                 });
                 a.resolve_hands(&request, outcome);
             }
-            AgentToRunner::Ack { up_to } => st.unacked.retain(|(s, _)| *s > up_to.0),
+            AgentToRunner::Ack { up_to } => st.acked(up_to.0),
             AgentToRunner::SegmentAck { durable_bytes, .. } => {
                 st.durable = st.durable.max(durable_bytes);
                 self.tailer.confirm();
@@ -584,6 +590,18 @@ mod tests {
             })
             .collect();
         assert_eq!(kept, [(1, 1), (2, 1)], "both batches wait for the next connection, seqs 1 and 2");
+    }
+
+    /// An ack covers its own seq: the acked message is never resent (nor waited for by a close's
+    /// flush), the next one is.
+    #[test]
+    fn an_ack_covers_up_to_its_seq() {
+        let ev = |seq| (seq, RunnerToAgent::Events { seq: Seq(seq), events: vec![] });
+        let mut st = State { last_out: 3, unacked: VecDeque::from([ev(1), ev(2), ev(3)]), ..State::default() };
+        st.acked(2);
+        assert_eq!(st.unacked.iter().map(|(s, _)| *s).collect::<Vec<_>>(), [3]);
+        st.acked(3);
+        assert!(st.unacked.is_empty(), "everything acked: a close's flush is done");
     }
 
     #[test]

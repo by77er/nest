@@ -75,10 +75,16 @@ pub struct Timers {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum InterruptStage {
-    /// The control request went out; SIGINT at the deadline.
-    Requested(Instant),
-    /// SIGINT went out; SIGKILL at the deadline.
-    Signalled(Instant),
+    /// The control request went out; SIGINT at the deadline (none: a grace too long to reach).
+    Requested(Option<Instant>),
+    /// SIGINT went out; SIGKILL at the deadline (likewise).
+    Signalled(Option<Instant>),
+}
+
+/// The deadline `grace` after `now`, or none for a grace too long to represent (it never comes):
+/// `Instant + Duration` panics on overflow, which would kill the actor.
+fn after(now: Instant, grace: Duration) -> Option<Instant> {
+    now.checked_add(grace)
 }
 
 #[derive(Debug)]
@@ -115,7 +121,7 @@ impl Brain {
     /// A brain just spawned: the idle clock runs from the start, so a brain that never gets a
     /// turn still exits and its host can retire.
     pub fn new(timers: Timers, now: Instant) -> Self {
-        Brain { timers, turn: None, idle_at: Some(now + timers.idle_grace), exit_at: None, ending: Ending::Running, interrupt_supported: false }
+        Brain { timers, turn: None, idle_at: after(now, timers.idle_grace), exit_at: None, ending: Ending::Running, interrupt_supported: false }
     }
 
     /// The turn running now.
@@ -130,7 +136,7 @@ impl Brain {
     }
 
     pub fn next_deadline(&self) -> Option<Instant> {
-        let interrupt = self.turn.as_ref().and_then(|t| t.interrupt).map(|s| match s {
+        let interrupt = self.turn.as_ref().and_then(|t| t.interrupt).and_then(|s| match s {
             InterruptStage::Requested(at) | InterruptStage::Signalled(at) => at,
         });
         [interrupt, self.idle_at, self.exit_at].into_iter().flatten().min()
@@ -205,10 +211,10 @@ impl Brain {
             return vec![];
         }
         if self.interrupt_supported {
-            t.interrupt = Some(InterruptStage::Requested(now + grace));
+            t.interrupt = Some(InterruptStage::Requested(after(now, grace)));
             vec![Effect::WriteInterrupt]
         } else {
-            t.interrupt = Some(InterruptStage::Signalled(now + grace));
+            t.interrupt = Some(InterruptStage::Signalled(after(now, grace)));
             vec![Effect::Sigint, Effect::CancelHands]
         }
     }
@@ -219,7 +225,7 @@ impl Brain {
             return vec![];
         }
         let turn = self.turn.take().map(|t| t.id);
-        self.idle_at = Some(now + self.timers.idle_grace);
+        self.idle_at = after(now, self.timers.idle_grace);
         // Ending (stopped, or killed with its final result still being read) while this turn ran:
         // stdin is closed, and now nothing runs.
         if matches!(self.ending, Ending::Requested(_)) {
@@ -236,8 +242,9 @@ impl Brain {
     /// stdin is being closed: the process must exit within the exit grace (an earlier deadline
     /// stays).
     fn exit_by(&mut self, now: Instant) {
-        let at = now + self.timers.exit_grace;
-        self.exit_at = Some(self.exit_at.map_or(at, |e| e.min(at)));
+        if let Some(at) = after(now, self.timers.exit_grace) {
+            self.exit_at = Some(self.exit_at.map_or(at, |e| e.min(at)));
+        }
     }
 
     fn tick(&mut self, now: Instant) -> Vec<Effect> {
@@ -250,11 +257,11 @@ impl Brain {
         let grace = self.timers.interrupt_grace;
         if let Some(t) = &mut self.turn {
             match t.interrupt {
-                Some(InterruptStage::Requested(at)) if at <= now => {
-                    t.interrupt = Some(InterruptStage::Signalled(now + grace));
+                Some(InterruptStage::Requested(at)) if at.is_some_and(|at| at <= now) => {
+                    t.interrupt = Some(InterruptStage::Signalled(after(now, grace)));
                     return vec![Effect::Sigint, Effect::CancelHands];
                 }
-                Some(InterruptStage::Signalled(at)) if at <= now => {
+                Some(InterruptStage::Signalled(at)) if at.is_some_and(|at| at <= now) => {
                     t.interrupt = None;
                     return self.kill(ExitReason::Crashed);
                 }
@@ -448,7 +455,11 @@ mod tests {
         assert!(!b.takes_inbox(), "a turn being interrupted takes no more inbox");
         assert_eq!(b.step(Input::Interrupt { turn: None }, now), [], "once");
         assert_eq!(b.next_deadline(), Some(now + INT));
+        let early = Duration::from_millis(1);
+        assert_eq!(b.step(Input::Tick, now + INT - early), [], "no SIGINT before the grace");
         assert_eq!(b.step(Input::Tick, now + INT), [Effect::Sigint, Effect::CancelHands]);
+        assert_eq!(b.next_deadline(), Some(now + INT * 2), "SIGKILL a grace after the SIGINT");
+        assert_eq!(b.step(Input::Tick, now + INT * 2 - early), [], "no SIGKILL before it");
         assert_eq!(shape(&b.step(Input::Tick, now + INT * 2)), ["AbortStdin", "CancelHands", "KillGroup"]);
         assert_eq!(shape(&b.step(Input::Exited { killed: None }, now)), ["exit crashed"]);
     }
@@ -458,6 +469,7 @@ mod tests {
         let (mut b, now) = brain();
         b.step(run("t1"), now);
         assert_eq!(b.step(Input::Interrupt { turn: None }, now), [Effect::Sigint, Effect::CancelHands]);
+        assert_eq!(b.step(Input::Tick, now + INT - Duration::from_millis(1)), [], "no SIGKILL before the grace");
         // The interrupted turn's result ends it, a block notwithstanding.
         b.step(Input::StopHook { blocked: true }, now);
         assert_eq!(shape(&b.step(result(false), now)), ["turn_completed t1", "idle t1"]);
@@ -507,6 +519,54 @@ mod tests {
         b.step(Input::Tick, now + GRACE);
         b.step(run("t1"), now);
         assert_eq!(shape(&b.step(Input::Exited { killed: Some(ExitReason::Stopped) }, now)), ["error agent_stopping t1", "exit stopped"]);
+    }
+
+    /// The idle clock still running when a graceful stop came (no turn ran) closes nothing more:
+    /// the stop is the exit's reason, not idleness.
+    #[test]
+    fn an_idle_deadline_after_a_stop_is_not_an_idle_close() {
+        let (mut b, now) = brain();
+        let stop = now + GRACE - Duration::from_secs(1);
+        assert_eq!(b.step(Input::Stop(StopMode::Graceful), stop), [Effect::CloseStdin]);
+        assert_eq!(b.step(Input::Tick, now + GRACE), [], "the idle deadline closes nothing");
+        assert_eq!(shape(&b.step(run("t1"), now + GRACE)), ["error agent_stopping t1"], "refused, not stashed for a respawn");
+        assert_eq!(shape(&b.step(Input::Exited { killed: None }, now + GRACE)), ["exit stopped"]);
+    }
+
+    /// A resumed process is the same Claude Code: the interrupt control request still works on it.
+    #[test]
+    fn a_respawn_keeps_the_interrupt_request() {
+        let (mut b, now) = brain();
+        b.step(Input::InterruptSupported(true), now);
+        b.step(Input::Tick, now + GRACE);
+        b.step(run("t1"), now + GRACE);
+        b.step(Input::Exited { killed: None }, now + GRACE);
+        b.step(Input::Respawned { ok: true }, now + GRACE);
+        assert_eq!(b.step(Input::Interrupt { turn: None }, now + GRACE), [Effect::WriteInterrupt]);
+    }
+
+    /// A grace too long to add to an instant (an unclamped override) never comes, and never panics
+    /// the actor.
+    #[test]
+    fn a_grace_too_long_to_represent_never_comes() {
+        let now = Instant::now();
+        let max = Duration::MAX;
+        let mut b = Brain::new(Timers { idle_grace: max, interrupt_grace: max, exit_grace: max }, now);
+        assert_eq!(b.next_deadline(), None);
+        b.step(Input::InterruptSupported(true), now);
+        b.step(run("t1"), now);
+        assert_eq!(b.step(Input::Interrupt { turn: None }, now), [Effect::WriteInterrupt]);
+        assert_eq!(b.next_deadline(), None);
+        assert_eq!(b.step(Input::Tick, now + GRACE), []);
+        b.step(result(false), now);
+        assert_eq!(b.next_deadline(), None);
+        assert_eq!(b.step(Input::Stop(StopMode::Graceful), now), [Effect::CloseStdin]);
+        assert_eq!(b.next_deadline(), None, "no exit deadline either");
+        // Without the control request: SIGINT at once, then a SIGKILL that never comes.
+        let mut b = Brain::new(Timers { idle_grace: max, interrupt_grace: max, exit_grace: max }, now);
+        b.step(run("t1"), now);
+        assert_eq!(b.step(Input::Interrupt { turn: None }, now), [Effect::Sigint, Effect::CancelHands]);
+        assert_eq!(b.step(Input::Tick, now + GRACE), []);
     }
 
     #[test]

@@ -17,7 +17,10 @@ runner-mcp, runner-claude) and `docs/interfaces/control-host/session/`.
 | `stream` | stream-json → canonical `AgentEvent`s |
 
 Run: `nest-runner` (paths from `nest_protocol::host::paths`; override with `NEST_RUNNER_*`, see
-`config.rs`).
+`config.rs`). Timer overrides (`NEST_RUNNER_*_MS`) are clamped to a range each (`config::TIMERS`:
+graces from 1 s, batching and tailing from 10 ms; at most an hour), with a warning; one that isn't a
+number is ignored. A brain's deadlines are added with `checked_add`: a grace too long to represent
+never comes, rather than panicking the actor.
 
 ## Behavior worth knowing
 
