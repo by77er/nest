@@ -13,7 +13,7 @@ import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, DIMENSIONS, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
 import type { AgentCaller } from "../identity";
-import { backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras } from "../nest";
+import { backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras, stopRefused } from "../nest";
 import { envName, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
@@ -539,15 +539,6 @@ type Row = Record<string, SqlStorageValue>;
 
 /** A failed stop's `next_ms` (the column is NOT NULL): never due (9999-12-31), until the owner's Retry. */
 const NOT_DUE_MS = 253_402_300_799_000;
-
-/**
- * A stop's refusal that will repeat (README.md#outboxes): nest's own refusal of the request, in its JSON
- * error body (400, 409). An auth failure (401, 403) or a page that isn't nest's (a proxy's, Access's) may
- * pass, so it's retried: failing it would leave an agent running unseen.
- */
-export function stopRefused(e: unknown): boolean {
-  return e instanceof NestError && e.code !== "http" && !e.retryable && (e.status === 400 || e.status === 409);
-}
 
 /** A stop nest refused (README.md#outboxes): the agent may still be running. */
 export interface FailedStop {
