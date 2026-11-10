@@ -300,6 +300,68 @@ describe("a project's models", () => {
       expect((await settings(p)).manager_switch).toBeNull();
     });
 
+    it("restarts only when nest finds the manager idle: a turn running is nest's 409 busy, and the switch waits for its end", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      m.state = "working";
+      expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toMatchObject({ after_turn: true });
+      // Asked of nest with when: idle, and refused; nothing restarted, so no turn was cut.
+      const asked = fake.callsTo("POST", new RegExp(`^/v1/agents/${p.manager}/start$`));
+      expect(asked.at(-1)!.body).toEqual({ restart: true, launch: { model: "claude-sonnet-5-5" }, when: "idle" });
+      expect(m.restarts ?? []).toEqual([]);
+      m.state = "waiting_input";
+      await deliver({ id: `evt-${rand()}`, type: "agent.turn_completed", agent: p.manager, text: "Done." });
+      await alarm(p);
+      expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }]);
+    });
+
+    it("a nest before when: idle (400) falls back to looking at the state itself", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      fake.whenUnsupported = true;
+      try {
+        m.state = "working";
+        expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toMatchObject({ after_turn: true });
+        expect(m.restarts ?? []).toEqual([]);
+        m.state = "idle";
+        await deliver({ id: `evt-${rand()}`, type: "agent.turn_completed", agent: p.manager, text: "Done." });
+        await alarm(p);
+        expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }]);
+        const last = fake.callsTo("POST", new RegExp(`^/v1/agents/${p.manager}/start$`)).at(-1)!;
+        expect(last.body).toEqual({ restart: true, launch: { model: "claude-sonnet-5-5" } });
+        expect(await appChat(p)).toContain(`Switched to ${modelLabel("claude-sonnet-5-5")}.`);
+      } finally {
+        fake.whenUnsupported = false;
+      }
+    });
+
+    it("nest giving up an accepted restart (restart_refused) is said, and the switch is owed again; once per event", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      await setModel(p, "claude-sonnet-5-5");
+      expect(m.restarts).toHaveLength(1);
+      expect(await appChat(p)).toContain(`Switched to ${modelLabel("claude-sonnet-5-5")}.`);
+      const refused = { id: `evt-${rand()}`, type: "agent.error", agent: p.manager, code: "restart_refused", message: "the restart failed after retries" };
+      // While the manager is in a turn: the switch is owed, and waits for nest to find it idle.
+      m.state = "working";
+      await deliver(refused);
+      const retry = (await appChat(p)).filter((t) => t.startsWith("The switch to Sonnet 5.5 didn't complete"));
+      expect(retry).toEqual(["The switch to Sonnet 5.5 didn't complete (nest couldn't restart the manager): trying again."]);
+      expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT manager_running_model AS m FROM settings").one().m)).toBeNull();
+      await alarm(p);
+      expect((await settings(p)).manager_switch).toMatchObject({ to: "claude-sonnet-5-5", after_turn: true });
+      expect(m.restarts).toHaveLength(1);
+      // Delivered again (past the webhook's own dedup, straight to the project): said once.
+      await deliver(refused);
+      await runInDurableObject(stub(p), (o) => (o as unknown as { onEvent(e: unknown, r: unknown): Promise<void> }).onEvent(refused, { role: "manager", task: null }));
+      expect((await appChat(p)).filter((t) => t.startsWith("The switch to Sonnet 5.5 didn't complete"))).toHaveLength(1);
+      m.state = "idle";
+      await deliver({ id: `evt-${rand()}`, type: "agent.turn_completed", agent: p.manager, text: "Done." });
+      await alarm(p);
+      expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }, { model: "claude-sonnet-5-5" }]);
+      expect((await settings(p)).manager_switch).toBeNull();
+    });
+
     it("a switch made stale by a move of the manager (it ended meanwhile) writes nothing", async () => {
       const p = await newProject();
       let release!: () => void;

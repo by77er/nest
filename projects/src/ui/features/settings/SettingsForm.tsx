@@ -156,7 +156,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
               <FieldGroup>
                 <ModelField
                   label="Manager's model"
-                  description="A change applies now: the running manager switches between turns, keeping its conversation. A turn it starts at the moment of the switch is cut and redone."
+                  description="A change applies now: the running manager switches between turns, keeping its conversation."
                   value={form.getValues().manager_model}
                   onChange={(v) => form.setFieldValue("manager_model", v)}
                   error={form.errors.manager_model}

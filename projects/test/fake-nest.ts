@@ -88,6 +88,8 @@ export class FakeNest {
   failures: { match: RegExp; status: number; retryable?: boolean; times: number; page?: boolean }[] = [];
   /** Play a control plane from before the push opt-in was in the client layer (nest #157). */
   layerWithoutPush = false;
+  /** Play a nest before `when: "idle"` (#232): its `start` refuses the field (400). */
+  whenUnsupported = false;
   /** Play a nest whose `start` ignores `launch` (a rolled-back Worker): its answer names none. */
   launchIgnored = false;
   /** The repos the client's grant names, lowercased (`github.repos`); null: any (the grant isn't what a test is about). */
@@ -348,6 +350,11 @@ export class FakeNest {
       // A restart on a new launch, resuming the session (docs/control-plane/api/clients/): stored and restarted in one step.
       if (req.method === "POST" && sub === "/start") {
         if (a.ended) return nestErr(409, "conflict", "the agent has ended");
+        // `when: "idle"` (nest #232): refused while a turn runs; a release before it refuses the field.
+        if (call.body?.when !== undefined) {
+          if (this.whenUnsupported) return nestErr(400, "invalid_message", "unknown field: when");
+          if (MID_TURN_STATES.has(a.state ?? "")) return nestErr(409, "busy", "a turn is running");
+        }
         const launch = (call.body?.launch ?? {}) as { model?: string; effort?: string };
         if (launch.model !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,99}$/.test(launch.model)) return nestErr(400, "invalid_message", "launch.model is plain tokens");
         if (call.body?.restart) (a.restarts ??= []).push(launch);
@@ -616,6 +623,9 @@ export interface FakeCheckRun {
  * token); branch protection is kept in GET's shape and written by PUT and PATCH.
  */
 /** A GitHub account's id in the fake: fixed for its login. */
+/** The states nest refuses an idle-only restart in (a turn running). */
+const MID_TURN_STATES = new Set(["working", "waiting_permission", "compacting"]);
+
 export const ownerIdOf = (login: string) => 10_000 + [...login].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1_000_000, 7);
 /** A repo's GitHub id, as the fake gives it (from its first name: a rename keeps it). */
 export const repoIdOf = (name: string) => 500_000_000 + [...name.toLowerCase()].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 100_000_000, 11);

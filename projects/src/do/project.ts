@@ -2191,10 +2191,15 @@ export class ProjectDO extends DurableObject<Env> {
           e.ask, e.agent, route.role, route.task, e.question ?? null, e.approval === undefined ? null : JSON.stringify(e.approval), Date.now(),
         );
         break;
-      case "agent.error":
+      case "agent.error": {
+        const fresh = this.sql.exec("SELECT 1 FROM errors WHERE event_id = ?", e.id).toArray().length === 0;
         this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, ?, ?, ?, ?, ?)",
           e.id, Date.now(), e.agent, route.role, route.task, e.code ?? null, e.message ?? null);
+        // nest accepted a switch's restart, then gave it up (README.md#models): the manager still runs its old
+        // model. Once per event (a redelivery isn't fresh), and the switch is owed again.
+        if (fresh && e.code === "restart_refused" && route.role === "manager" && s.manager === e.agent) this.restartRefused();
         break;
+      }
     }
     await this.arm();
   }
@@ -3751,14 +3756,29 @@ export class ProjectDO extends DurableObject<Env> {
       const now = this.settingsRow();
       return !!now && now.manager === agent && now.manager_starts === base && now.switch_next_ms !== null;
     };
+    const waitForTurn = () => this.sql.exec("UPDATE settings SET switch_after_turn = 1, switch_next_ms = ?", Date.now() + SWITCH_RECHECK_MS);
     try {
-      const view = await nest.getAgent(agent);
-      if (!current()) return;
-      if (MID_TURN.has(String(view.state ?? ""))) {
-        this.sql.exec("UPDATE settings SET switch_after_turn = 1, switch_next_ms = ?", Date.now() + SWITCH_RECHECK_MS);
-        return;
+      let answer: { launch?: { model?: string } };
+      try {
+        // Only between turns, as nest decides it: a turn running is a 409 `busy`, and nothing is cut.
+        answer = await nest.restartAgent(agent, { model: to }, "idle");
+      } catch (e) {
+        if (!current()) return;
+        if (e instanceof NestError && e.status === 409 && e.code === "busy") {
+          waitForTurn();
+          return;
+        }
+        // A nest before `when` refuses the field (400): the app looks at the manager's state itself, then
+        // restarts. If a turn starts just as it switches, that turn starts again on the new model.
+        if (!(e instanceof NestError && e.status === 400 && /\bwhen\b/.test(e.message))) throw e;
+        const view = await nest.getAgent(agent);
+        if (!current()) return;
+        if (MID_TURN.has(String(view.state ?? ""))) {
+          waitForTurn();
+          return;
+        }
+        answer = await nest.restartAgent(agent, { model: to });
       }
-      const answer = await nest.restartAgent(agent, { model: to });
       // The same manager (no move of its lifecycle meanwhile): what nest now runs is recorded whether or not
       // the switch is still owed (the setting may have changed back while the restart was out), and any
       // switch onto the setting as it is now is owed afresh.
@@ -3786,6 +3806,18 @@ export class ProjectDO extends DurableObject<Env> {
       const attempts = (r.switch_attempts as number) + 1;
       this.sql.exec("UPDATE settings SET switch_attempts = ?, switch_next_ms = ?", attempts, Date.now() + backoff(attempts));
     }
+  }
+
+  /**
+   * nest gave up a switch's restart (`restart_refused`) after it was announced: the brain runs on its old
+   * model, which isn't known here, so the switch onto the setting is owed again (between turns, as always).
+   */
+  private restartRefused(): void {
+    const r = this.settingsRow()!;
+    const want = (r.manager_model as string | null) ?? DEFAULT_MODEL.manager;
+    this.sql.exec("UPDATE settings SET manager_running_model = NULL, switch_next_ms = NULL, switch_after_turn = 0, switch_attempts = 0");
+    this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `The switch to ${modelLabel(want)} didn't complete (nest couldn't restart the manager): trying again.`);
+    this.oweManagerSwitch();
   }
 
   /** The owner's Restart: the manager (if any) goes, a new one starts now. Asked while one is starting, nothing changes. */

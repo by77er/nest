@@ -191,8 +191,9 @@ export class Nest {
    * answers the launch as stored. A release before that route ignores `launch`: its answer has none.
    * It kills a live brain at once, so a turn in progress is cut: call it only between turns.
    */
-  async restartAgent(agent: string, launch: { model?: string; effort?: string }): Promise<{ launch?: { model?: string; effort?: string } }> {
-    return this.call("POST", `/v1/agents/${encodeURIComponent(agent)}/start`, { restart: true, launch });
+  async restartAgent(agent: string, launch: { model?: string; effort?: string }, when?: "idle"): Promise<{ launch?: { model?: string; effort?: string } }> {
+    // `when: "idle"`: only between turns; nest answers 409 `busy` while one runs (a release before it: 400).
+    return this.call("POST", `/v1/agents/${encodeURIComponent(agent)}/start`, { restart: true, launch, ...(when ? { when } : {}) });
   }
 
   getAgent(agent: string): Promise<AgentView> {
