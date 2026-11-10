@@ -53,8 +53,37 @@ The follow-ups the sweep found lost ([`verification/tla/sandbox-lease/SlotFollow
 
 The other follow-ups of a result (`checkpoint_result`, `command_failed`, `start_failed`) are owed and re-run the same way; their receivers are idempotent per command (`checkpointResult` by `cmd`, `commandFailed` by its `create_failure` record, `startFailed` by epoch and intent). The model checks one, `attach_result`.
 
+## PlacementRetry.tla and FailedRelease.tla
+
+**Dated pass: 2026-11-09**, by reading `main` at `78dc720a` (#191 and #192 merged). The models: [`PlacementRetry.tla`, `FailedRelease.tla`](../../../../verification/tla/sandbox-lease/README.md#placementretry). `retry.ts` is `control-plane/src/lib/retry.ts`.
+
+| Action | Code | Conforms | Notes |
+|---|---|---|---|
+| Send, Resume (PlacementRetry) | `processReassign` `fleet.ts:3030`; `reassignRetry` `retry.ts:24` | yes | Only a `FORBIDDEN`, non-retryable answer counts as a refusal; "placement already in progress" is retryable and doesn't. The backoff is abstracted to "tried again later". |
+| LoseCall, FleetReset | `processReassign`'s catch with `refused` false; a reset leaves the row | yes | Retried without limit, as the model's fair `Send`. |
+| Land | `leaseLost` `sandbox.ts:859`, then `placeCurrentEpoch(…, false)` `558` | partly | One step in the model: lost answers and resets inside SandboxDO's placement are SandboxLease's. A refusal asked by FleetDO is noted, not counted, and arms SandboxDO's own deadline unless it gave up. |
+| Alarm | alarm `place` `sandbox.ts:1262` (`placeWanted`), `retryAfter` `retry.ts:13` | yes | Counted, then given up: the deadline cleared, `placement_refused.gave_up` shown. |
+| Operator | `retryPlacement` `sandbox.ts:673` | yes | The count starts again. |
+| Granted deleting a given-up row | `place` `fleet.ts:1698` | yes | |
+| Fail (FailedRelease) | `lease.reported`, `createFailed`; `failedChanged` `sandbox.ts:766` arms `failed_release` | yes | The 15-minute grace is abstracted to "some time later". |
+| FRStart, FRFleet, FRFinish | `releaseFailed` `sandbox.ts:737`; `releaseFailedLease` `fleet.ts:1723`; `failedReleased` `lease.ts:164` | yes | The lease and the stale record in one FleetDO step; the epoch spent only if still failed on (h, e). A reset between the steps leaves the deadline to run it again. |
+| RetryRelease, RetryPlace | `retryPlacement` with a holder: `releaseLease` `fleet.ts:1713`, `lease.retried` (`lease.ts`) | yes | `retried` spends an epoch (the finding below, fixed with this pass). `releaseLease` records no stale incarnation (FleetDO learns of it from the host's next hello). |
+| RetryReleased | `lease.retriedReleased` `lease.ts:189` | yes | |
+| Alarm | `placeWanted` `lease.ts:211` | yes | False for `failed`. |
+| Salvage | `decideCommit` `lease.ts:220` | yes | An orphan from an older epoch's holder; the current epoch's only from its holder. |
+| WindowPass, Reap | `reapStale` `fleet.ts:1194` | partly | The model lacks its drop of a row superseded on the same host. |
+| Retire | `scaleDown`'s `salvaging` `fleet.ts:2359` | yes | A row counts until its `sandbox_destroy` is issued (`cmd`), which the model's "destroyed" is. |
+| HostLoss | `die` → `queueReassign` → `leaseLost` | partly | One step in the model. |
+
+**Finding, fixed with this pass:** at `78dc720a`, an operator's retry of a sandbox failed on (h, e) left it unplaced at epoch e until its next claim succeeded (`lease.retried` spent no epoch). The incarnation's salvage commit arriving then was refused as stale by `decideCommit`, and nestd deleted the work. With #192 the retry could also run between FleetDO's release and SandboxDO's (`MCFailedRetryNoSpend`, 6 steps to the refusal), but the window was `retried`'s own and older than #192. `retried` now spends an epoch, as `failedReleased` does (`MCFailedFixed`); tests: the table in `control-plane/test/sandbox-lease-core.test.ts` and the six steps against the real objects in `test/fleet.test.ts`.
+
+**What is left of B1** (the owner's open decision on the no-capacity rollback): a lease lost through `leaseLost` (the host fenced itself, a STONITH fence, a restarted nestd), whose salvage arrives while the sandbox is unplaced at the lost epoch: before its next claim succeeds, or after a claim that found no room, or was refused, rolled back to it. Neither model here covers `leaseLost` from a live host; SandboxLease's `MCB1` does.
+
 ## Results (TLC 1.7.4, 4 workers)
 
 SlotFollowups, at this pass's head, with the bounds in the [model README](../../../../verification/tla/sandbox-lease/README.md#slotfollowups) (two hosts, epochs ≤ 3, one of each fault): `BindingOnlyConfirmed`, `BindingConfigured`, `FollowupsDone`, `HandsEventually` and `PlacedDone` hold with both fixes (1,363,140 states). With either fix off, the old code's counterexample: `BindingOnlyConfirmed` fails in 6 steps (attach confirmed at epoch 1, a move adopting a running lease, `resolve`), `FollowupsDone` after a FleetDO reset at the follow-up's await and the redelivered result ignored. Each fix's mutation and three reachability checks fail as expected. Rows in [`expect.tsv`](../../../../verification/tla/sandbox-lease/expect.tsv).
 
 SandboxLease was not re-run for this pass: no action it models changed since its last run except the follow-ups SlotFollowups adds.
+
+PlacementRetry and FailedRelease (2026-11-09, `78dc720a`): every row of [`expect.tsv`](../../../../verification/tla/sandbox-lease/expect.tsv) for them gives its expected result; the bounds and state counts are in the [model README](../../../../verification/tla/sandbox-lease/README.md#placementretry).
+

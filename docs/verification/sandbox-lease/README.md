@@ -37,7 +37,7 @@ Out of scope: agent epochs and brain hosts, attach/bindings (except where an epo
 | LeaseLost | FleetDO `processReassign` | not destroyed/archived; `(epoch = e ∧ (host = h ∨ (host = null ∧ placing = null)))`, or already handled `(host = null ∧ lost_from = h)` | `host := null; lost_from := h` (`working` kept: brains run elsewhere); Claim excluding h if `hostIsDead` | `leaseLost` |
 | Evicted | FleetDO `processEvictions` | `host = h ∧ epoch = e` | `host := null; state := suspended`; Claim (excluding h) if anyone works | `evicted` |
 | CreateFailed | `commandFailed(h, sandbox_create, e)` | `e = epoch ∧ h = host` | re-issue create at the **same** epoch up to 3 times, then `state := failed` | `createFailed` |
-| Retry | operator `POST /place` | `state = failed ∧ host` | `fence` to old host, `releaseLease(e)` (not waiting for the fence), `host := null`, Claim | `failedHolder`, `retried` |
+| Retry | operator `POST /place` | `state = failed ∧ host` | `fence` to old host, `releaseLease(e)` (not waiting for the fence), `host := null`, `epoch := e + 1` (spent, since 2026-11-09: the incarnation left on the host is then an older epoch's, its salvage an orphan), Claim | `failedHolder`, `retried` |
 | Destroy | operator | — | `state := destroyed; host := null; placing := null` first (no await before it); then **await** `FleetDO.sandboxDestroyed` (from then on Grant refuses), `sandbox_destroy` to the old host if any, **await** `releaseLease` (all epochs); clear `place`. A Placed or Reconcile continuation that then finds the sandbox gone releases the lease it got at e and sends `sandbox_destroy(e)` to its host (`discardPlacement`) | `destroy`, `discardPlacement` |
 | Commit | `commit(h, ev)` via FleetDO | see 2.4 | may move `head` | `decideCommit` |
 
@@ -192,7 +192,7 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 
 ## Conformance: bounded retries of a refused placement (fix/refused-placement, 2026-11-06)
 
-**Head:** `fix/refused-placement` (on main 9fd147ff). No lease decision changed (`placeAnswered`, `leaseLost`, `claim` are as they were). Only who tries again, and when. Not checked by a model run.
+**Head:** `fix/refused-placement` (on main 9fd147ff). No lease decision changed (`placeAnswered`, `leaseLost`, `claim` are as they were). Only who tries again, and when. Checked since by `PlacementRetry.tla` ([conformance](conformance/#placementretrytla-and-failedreleasetla), 2026-11-09), which also reproduces this branch's first version (giving up on a call that never landed) as a violation.
 
 | Model action | Code | Conforms (author) | Detail |
 |---|---|---|---|
@@ -216,7 +216,7 @@ Tests: `control-plane/test/placement-refused.test.ts`. Mutations run, each kille
 
 **Policy (the owner's default):** a sandbox `failed` on its host keeps the lease for 15 minutes, then gives it up, so the host can retire. The record stays `failed` and unplaced, with its head, until an operator or client retries or destroys it. An attached agent no longer pins the host.
 
-**Head:** `fix/failed-releases-host` (on main 9fd147ff). Not checked by a model run.
+**Head:** `fix/failed-releases-host` (on main 9fd147ff). Checked since by `FailedRelease.tla` ([conformance](conformance/#placementretrytla-and-failedreleasetla), 2026-11-09): the release's own properties hold. It found that an operator's retry between the release's two steps left the sandbox unplaced at the released epoch, where the incarnation's salvage was refused; `lease.retried` now spends an epoch too.
 
 | Model action | Code | Conforms (author) | Detail |
 |---|---|---|---|
