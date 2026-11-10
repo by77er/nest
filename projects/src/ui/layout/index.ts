@@ -7,7 +7,7 @@ export { ChatFrame, ChatLog, ChatWelcome, CodeFrame, ComposerBox, ComposerDock, 
 export { FadeIn } from "./FadeIn";
 export { Glyph, GLYPH, Terminal, TermLine, TermProse, TermRule, TermStatus, type TermTone } from "./Terminal";
 export { FieldGroup } from "./FieldGroup";
-export { BadgeAnchor, CardGrid, ColumnGrid, SectionGrid, WithContext } from "./Layouts";
+export { BadgeAnchor, CardGrid, SectionGrid, WithContext } from "./Layouts";
 export { MetaItem, MetaRow, Token } from "./Meta";
 export { NavGroup, NavGroups, NavRow, SwitcherTarget } from "./Nav";
 export { Switcher, type SwitcherItem } from "./Switcher";
@@ -16,7 +16,7 @@ export { Measure, Page, PageHeader } from "./Page";
 export { Panel, type PanelTone, TableFrame, Well } from "./Panel";
 export { Section } from "./Section";
 export { Sheet, useFillColumn } from "./Sheet";
-export { SortablePanel } from "./Sortable";
+export { StateGlyph, TaskGroup, TaskList, TaskRow, TaskRowTitleAnchor, TaskRowsEmpty } from "./TaskList";
 export { Prose, Row, Stack } from "./Stack";
 export { RichImage, RichProse, RichTableFrame, SvgFigure, TaskCards, TaskCheck, TaskChipPending, TaskRefCard } from "./Rich";
 export { EmptyState, ErrorState, LoadingState } from "./States";

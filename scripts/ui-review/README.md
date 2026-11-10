@@ -30,7 +30,7 @@ node scripts/ui-review/selftest.mjs             # the checks fail their planted 
 | Check | Fails when |
 |---|---|
 | `overflow` | the page scrolls sideways, or an element is partly outside the viewport, other than inside its own scroller (a table or board) |
-| `clipping` | text is cut by its own `overflow` or ellipsis, or something runs past its Panel's edge |
+| `clipping` | text is cut by its own `overflow` or ellipsis, or something runs past its Panel's edge; a deliberate one-line cut (`data-ds=truncate`) passes only with its whole text as its `title` |
 | `frame` | a screen hasn't exactly one visible h1; or across a section's views (same width and scheme), the h1's left edge, the header's width or the content's left edge differs by more than 1 px from the section's first view |
 | `nav` | the visible nav rows' icons or labels aren't on one left edge, the product's name is off it, or the active row's ground, rule or text is a role color (chromatic) |
 | `contrast` | visible text is under WCAG AA (4.5:1, or 3:1 for large text) against the composited background, in either scheme; text under an overlay, disabled, or transparent (a character drawn as something else) is skipped |
@@ -43,7 +43,7 @@ node scripts/ui-review/selftest.mjs             # the checks fail their planted 
 | `chat-fit` (projects) | on the Manager's chat, at both ends of its scroll (the log, or on a phone the page's column): the document scrolls, the composer is off screen or not pinned at the viewport's bottom, or at the end it isn't right under the log; a two-line draft (Shift+Enter) isn't kept unsent. Planted cases in `selftest.mjs`. Beside it, the context column scrolls in itself while the viewport has room below it (`context-empty-chat`, a `clipping` failure) |
 | `rhythm` (projects) | measured on what's painted (text and badges), never the grown hit boxes, at 390: the header's meta text moves more than 4 px from the h1's on touch against a mouse; or in the trace (consecutive calls in document order), a call's gap to its result is more than half its gap to the next call; or in a task's PRs, a gap between its lines (number and title, badges, who attached it) is more than half the gap to the next PR; or the Manager's context differs touch against mouse. Planted cases in `selftest.mjs` |
 | `chat-scroll` (projects) | acted out with the wheel: reading back, the line moves more than 2 px as content above grows or a reply arrives; a reply while reading back shows no cue; while following (on open, after growth, after the pill, after sending), the newest message isn't at least `md` (12 px) above the composer |
-| `board-columns` (projects) | at 1280 px and up, the board's six columns don't fit without scrolling |
+| `board-list` (projects) | the board's list scrolls sideways; or from 768 px up a row is taller than one line (44 px), or the rows' titles or times don't line up; or a row moved by keyboard (space, arrow down, space) isn't where it was dropped (`board-keyboard-move`) |
 | `trace` (projects) | an agent trace's log scrolls sideways (its long lines must wrap), or one of its glyphs renders in an emoji font |
 | `trace-tabs` (projects, `trace-tabs.mjs`) | switching the task drawer's tabs away from the trace and back opens a second trace socket, fetches a history page again, or loses the log's scroll or what was expanded (a browser-only check: Mantine's test environment renders `keepMounted` tabs without React's `<Activity>`) |
 

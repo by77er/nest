@@ -1,5 +1,5 @@
 // A titled block: a heading row of one height everywhere (the title, an optional count, its actions at
-// the right), then its content `lg` below. `dense` is a board column's: an h4 and `sm` below.
+// the right), then its content `lg` below. `dense` is a panel's or a context column's: an h4 and `sm` below.
 
 import { Badge, Group, Stack, Text, Title } from "@mantine/core";
 import { type ReactNode, useId } from "react";

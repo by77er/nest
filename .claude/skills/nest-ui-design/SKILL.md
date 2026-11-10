@@ -40,14 +40,14 @@ Defined once in the theme (as Mantine values and CSS variables) and used by name
 | small | 13/20 | secondary text, table cells |
 | body | 14/20 | default |
 | body-lg | 16/24 | lead text, chat |
-| h4 | 14/20, 600 | panel and column titles |
+| h4 | 14/20, 600 | panel titles, a list group's header |
 | h3 | 16/24, 600 | section titles |
 | h2 | 20/28, 600 | drawer and modal titles |
 | h1 | 24/32, 600 | the page title, once per page |
 
 **Spacing** (4 px base): `2xs 2`, `xs 4`, `sm 8`, `md 12`, `lg 16`, `xl 24`, `2xl 32`, `3xl 48`, `4xl 64`. Nothing else.
 
-**Radii:** `sm 4` (badges, inputs), `md 8` (panels, cards, buttons). **Borders:** 1 px, `border` color. **Shadows:** `raised` (a dragged or hovered card) and `overlay` (drawers, modals, menus); no others.
+**Radii:** `sm 4` (badges, inputs), `md 8` (panels, cards, buttons). **Borders:** 1 px, `border` color. **Shadows:** `raised` (a dragged row or a hovered card) and `overlay` (drawers, modals, menus); no others.
 
 **Color** is monochrome, with color only for actions and status. The scheme follows the system (`prefers-color-scheme`, Mantine `defaultColorScheme="auto"`), with no toggle.
 
@@ -55,7 +55,7 @@ Defined once in the theme (as Mantine values and CSS variables) and used by name
 |---|---|---|---|
 | page | `#fafafa` | `#121314` | page background |
 | surface | `#ffffff` | `#1a1b1e` | panels, cards, drawers |
-| subtle | `#f1f3f5` | `#222327` | hover, column wells, code |
+| subtle | `#f1f3f5` | `#222327` | hover, a list group's header, code |
 | border | `#e9ecef` | `#2c2e33` | hairlines |
 | text | `#212529` | `#e9ecef` | body |
 | muted | `#666e76` | `#9aa0a6` | meta, captions |
@@ -105,6 +105,7 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 | `Stack` / `Row` | Gaps only from the spacing scale |
 | `FieldGroup` | Labels above fields, one column, `lg` between fields; actions bottom-right |
 | `EmptyState` / `LoadingState` / `ErrorState` | Centred in their container, at most one action; errors offer a retry |
+| `TaskList` / `TaskGroup` / `TaskRow` | The board as one list (the owner, 2026-11-10: "a table layout instead of a column layout"): one frame (a hairline on the surface, no overflow of its own) of groups in the stages' order, each a quiet sticky header on the `subtle` ground (its state's glyph, its name, its count; a toggle that collapses it) over dense rows divided by hairlines. A row is one line from `sm` up, in fixed columns: grip, state glyph, short id, title (cut, its whole text its `title`), markers, worker, PR, updated (right-aligned, tabular); on a phone it wraps to two lines, the title first and the metadata under it. The whole row opens the task (its title link covers it), with a subtle hover and the focus ring drawn round the row; its own controls sit above that link. Rows drag by their grip within their group only (pointer or keyboard). Empty groups are left out. Minimal: color only in the state glyph and the markers that need the owner |
 | `Terminal` / `TermLine` / `TermRule` | An agent's trace as a terminal transcript: the `terminal` surface and hairline, the mono family, long lines wrapped (`pre-wrap`, breaking anywhere), a glyph column with hanging text, a quiet rule between turns. Glyphs without an emoji presentation only (`●` U+25CF, `○` U+25CB, `✗` U+2717, `⎿` U+23BF; never U+23FA), drawn in CSS at the font's stem weight since few fonts have them. **Rows are text-line targets**, an exception to the 32 px rule that keeps a transcript's density: a row that acts (a tool call, `… +N lines`) is a real button as wide as its row |
 
 **The frame is stable.** Across the views of a section, the h1's position and width, the content's left edge, the gutters, the header and the nav don't move or change shape. Shared things (task cards, badges, status colors) look identical wherever they appear.
@@ -116,7 +117,7 @@ Every screen is composed from these, in `src/ui/layout/`. Feature code arranges 
 - **Proximity:** a gap inside a group is at most half the gap between groups (`sm` between a card's lines, `md` between cards, `2xl` between sections).
 - **Common region:** what belongs together sits in one Panel. Panels nest at most one deep; inside one, group with spacing and dividers, not another border.
 - **Similarity:** one card style, one badge style per status, one button hierarchy (filled primary, default secondary, subtle tertiary).
-- **Alignment:** one shared left edge per container; column headers align with their cards' padding; numbers right-aligned, text left; centring only for empty states and single-purpose dialogs.
+- **Alignment:** one shared left edge per container; a list's group headers and rows share its left edge, and its rows' columns line up; numbers right-aligned, text left; centring only for empty states and single-purpose dialogs.
 - **Figure and ground:** one focal element per view (the board, the fleet table). Color marks only actions and status, so the eye goes where something needs doing.
 - **User content** (Markdown, SVG) can't change the page's outline, hierarchy or ground: its headings are demoted below the page's own and set at body size by weight; its figures sit on a fixed light canvas in both schemes, never inverted.
 - **Hierarchy:** one h1 per page, at most three text sizes in a component, weight before size.
@@ -160,7 +161,7 @@ Motion explains a change; it never decorates.
 - Hit targets at least 32 px on desktop and 44 px on touch, except inline links in running text, at least 24 px (WCAG 2.5.8's inline exception), when the same thing is reachable through a large target.
 - Touch hit areas reserve layout space; they never overlap a neighbouring control.
 - A label on every control; `aria-live` for polled changes that matter.
-- Works from 390 px up with no horizontal page scroll; only a board or table may scroll, inside its own scroller.
+- Works from 390 px up with no horizontal page scroll; only a table may scroll sideways, inside its own scroller (the board's list never does: its rows wrap).
 
 ## Enforcement
 

@@ -7,6 +7,7 @@ import { type AnchorHTMLAttributes, forwardRef } from "react";
 import { BadgeAnchor } from "../layout/Layouts";
 import { NavRow } from "../layout/Nav";
 import { TaskCardTitleAnchor, TaskChipAnchor } from "../layout/Rich";
+import { TaskRowTitleAnchor } from "../layout/TaskList";
 
 type AnchorBaseProps = AnchorProps & Omit<AnchorHTMLAttributes<HTMLAnchorElement>, keyof AnchorProps>;
 const AnchorBase = forwardRef<HTMLAnchorElement, AnchorBaseProps>((props, ref) => <Anchor ref={ref} {...props} />);
@@ -32,3 +33,6 @@ const CreatedChipLink = createLink(TaskChipAnchor);
 export const TaskChipLink: LinkComponent<typeof TaskChipAnchor> = (props) => <CreatedChipLink preload="intent" {...props} />;
 const CreatedCardTitleLink = createLink(TaskCardTitleAnchor);
 export const TaskCardTitleLink: LinkComponent<typeof TaskCardTitleAnchor> = (props) => <CreatedCardTitleLink preload="intent" {...props} />;
+// A task's row on the board's list: its title, a link covering the row.
+const CreatedRowTitleLink = createLink(TaskRowTitleAnchor);
+export const TaskRowTitleLink: LinkComponent<typeof TaskRowTitleAnchor> = (props) => <CreatedRowTitleLink preload="intent" {...props} />;
