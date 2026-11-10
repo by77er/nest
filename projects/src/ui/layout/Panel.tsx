@@ -19,6 +19,8 @@ export interface PanelProps extends Omit<PaperProps, "p" | "bg" | "withBorder" |
   component?: "div" | "section" | "article" | "aside";
   children?: ReactNode;
   role?: string;
+  /** A link's target (`#…`): a Panel another page links to. */
+  id?: string;
   [data: `data-${string}`]: string | number | boolean | undefined;
   [aria: `aria-${string}`]: string | number | boolean | undefined;
 }

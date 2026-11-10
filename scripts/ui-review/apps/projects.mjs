@@ -918,6 +918,8 @@ const app = {
     // No one's issues come in yet (an org's repo, no comments user): said, with what to do.
     { name: "settings-issues-no-one", section: "project", path: "/projects/prj_demo/settings", fixture: "issues-no-one" },
     { name: "triage-issues-no-one", section: "project", path: "/projects/prj_demo/triage", fixture: "issues-no-one" },
+    // Arriving by its Open Settings: the Triage panel scrolled to just below the phone's top bar, its heading focused.
+    { name: "settings-from-triage-link", section: "project", path: "/projects/prj_demo/settings#triage", fixture: "issues-no-one", full: false },
     // The models (README.md#models): a custom id shown with its field; the list open.
     { name: "settings-models-custom", section: "project", path: "/projects/prj_demo/settings", fixture: "models-custom" },
     { name: "settings-models-open", section: "project", path: "/projects/prj_demo/settings", full: false, after: async (p) => { const f = p.getByLabel("Manager's model").first(); await f.scrollIntoViewIfNeeded(); await f.click(); } },

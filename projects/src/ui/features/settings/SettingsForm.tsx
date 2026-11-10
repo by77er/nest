@@ -18,7 +18,8 @@ import { ago, exact } from "../../common/time";
 import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
 import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
 import { MODELS, modelProblem } from "../../../models";
-import { useState } from "react";
+import { useLocation, useNavigate } from "@tanstack/react-router";
+import { useEffect, useState } from "react";
 
 const CUSTOM = "custom";
 
@@ -72,7 +73,27 @@ const values = (s: Settings) => ({
 });
 
 /** The editable settings as Panels in a row, saved together by the one Save right under them. */
+/**
+ * Arriving at a Panel by its `#id` (the Triage page's Open Settings): focus moves to its heading, so
+ * keyboard and screen-reader users land there too, not only the scroll.
+ */
+function useFocusLinkTarget() {
+  const hash = useLocation({ select: (l) => l.hash });
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (!hash) return;
+    const heading = document.getElementById(hash)?.querySelector<HTMLElement>("h1, h2, h3, h4, h5, h6");
+    if (!heading) return;
+    heading.tabIndex = -1;
+    heading.focus();
+    // Once per arrival: the hash leaves the URL, so a remount of the form (a Save of some settings) doesn't
+    // move focus there again.
+    void navigate({ to: ".", hash: "", replace: true });
+  }, [hash, navigate]);
+}
+
 export function SettingsForm({ projectId, settings, onDone }: { projectId: string; settings: Settings; onDone?: () => void }) {
+  useFocusLinkTarget();
   const update = useUpdateSettings(projectId);
   const form = useForm({
     initialValues: values(settings),
@@ -210,7 +231,8 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
               </CommentsFrom>
             </Section>
           </Panel>
-          <Panel>
+          {/* The Triage page's "No one's issues come in yet" links here. */}
+          <Panel id="triage">
             <Section title="Triage" order={4} region={false}>
               <FieldGroup>
                 <Select

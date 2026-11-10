@@ -95,6 +95,34 @@ describe("who 'you' is for issues", () => {
     const b = await openSettings(none);
     expect((within(b.dialog).getAllByLabelText("Issues from").find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden") as HTMLInputElement).value).toBe("You only (no one yet)");
     expect(b.dialog.querySelector("[data-slot=issues-no-one]")).toHaveTextContent("No one yet: set the PR comments user, or choose Anyone.");
+    // The Triage page's Notice links to this panel.
+    expect(b.dialog.querySelector("#triage")).toHaveTextContent("Issues from");
+  });
+
+  it("arriving by the Triage page's link (#triage), focus lands on the panel's heading", async () => {
+    const api = new FakeApi();
+    api.projects[0]!.settings = { ...api.projects[0]!.settings!, comments_from: null, repo_owner: null };
+    renderApp("/projects/prj_one/settings#triage", api);
+    const heading = await screen.findByRole("heading", { name: "Triage" });
+    await waitFor(() => expect(heading).toHaveFocus());
+    expect(heading.closest("#triage")).not.toBeNull();
+  });
+
+  it("focus moves there once per arrival: a Save after it (which remounts the form) leaves focus on Save", async () => {
+    const api = new FakeApi();
+    const { user, router } = renderApp("/projects/prj_one/settings#triage", api);
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Triage" })).toHaveFocus());
+    // The hash is gone from the URL.
+    await waitFor(() => expect(router.state.location.hash).toBe(""));
+    const workers = screen.getByRole("textbox", { name: /Max workers/ });
+    await user.clear(workers);
+    await user.type(workers, "3");
+    const save = screen.getByRole("button", { name: "Save settings" });
+    await user.click(save);
+    await waitFor(() => expect(api.writes).toHaveLength(1));
+    await screen.findByText("Settings saved");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(screen.getByRole("heading", { name: "Triage" })).not.toHaveFocus();
   });
 });
 
