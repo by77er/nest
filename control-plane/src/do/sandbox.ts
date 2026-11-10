@@ -328,6 +328,9 @@ export class SandboxDO extends DurableObject<Env> {
     this.outbox = new ClientOutbox(this.sql);
   }
 
+  /** `sandbox_create` commands whose failure a `commandFailed` call is handling now (in memory: a reset ends the call). */
+  private readonly failing = new Set<string>();
+
   // --- state helpers ------------------------------------------------------------------------------
 
   private get<T>(key: string): T | undefined {
@@ -686,6 +689,20 @@ export class SandboxDO extends DurableObject<Env> {
       return;
     }
     if (type !== "sandbox_create" || !this.tryInfo()) return;
+    // One run per command at a time: a repeat that overlaps a run still in its re-issue would re-issue
+    // too. It is refused (retryable), so FleetDO keeps the follow-up owed and tries again later.
+    if (cmd !== undefined) {
+      if (this.failing.has(cmd)) throw new NestError(ErrorCodes.INTERNAL, `the failure of ${cmd} is already being handled`, 503, true);
+      this.failing.add(cmd);
+    }
+    try {
+      await this.createFailed(host, epoch, error, cmd);
+    } finally {
+      if (cmd !== undefined) this.failing.delete(cmd);
+    }
+  }
+
+  private async createFailed(host: string, epoch: number, error: ErrorBody, cmd?: string): Promise<void> {
     const prior = cmd !== undefined ? this.get<CreateFailure>("create_failure") : undefined;
     let r: ReturnType<typeof lease.createFailed>;
     let info: SandboxInfo;
