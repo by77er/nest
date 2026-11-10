@@ -17,9 +17,9 @@ export interface Write {
 const now = Date.UTC(2026, 10, 2, 9, 0, 0);
 
 export function project(over: Partial<ProjectRow> = {}): Project {
-  const row: ProjectRow = { id: "prj_one", name: "Widgets", repo: "owner/widgets", created_ms: now - 86_400_000, ...over };
+  const row: ProjectRow = { id: "prj_one", name: "Widgets", repo: "owner/widgets", created_ms: now - 86_400_000, state: "ready", ...over };
   const settings: Settings = {
-    id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null,
+    id: row.id, name: row.name, repo: row.repo, auto_assign: false, max_workers: 2, manager: "agt_manager", manager_error: null, manager_start_owed: false,
     attached: true, attach_error: null, attach: { branch: "main", change: "created", app_id: null, at_ms: row.created_ms },
     auto_merge: false, merge_method: "squash", workers_edit_workflows: false, comments_from: { id: 1001, login: "owner" }, repo_owner: { id: 1001, login: "owner" }, repo_auto_merge: { state: "none", want: false, repo: null, error: null, at_ms: null }, max_routine_runs: 1, created_ms: row.created_ms,
   };
@@ -58,7 +58,7 @@ export function task(over: Partial<Task> = {}): Task {
 
 export function ask(over: Partial<Ask> = {}): Ask {
   seq += 1;
-  return { ask: `ask_a${seq}`, agent: "agt_worker", role: "worker", task: null, question: null, approval: null, at_ms: now - 30_000, answered_ms: null, ...over };
+  return { ask: `ask_a${seq}`, agent: "agt_worker", role: "worker", task: null, question: null, approval: null, at_ms: now - 30_000, answered_ms: null, previous: false, ...over };
 }
 
 export class FakeApi {
@@ -224,6 +224,9 @@ export class FakeApi {
         return json(this.manager);
       case "POST attach":
         this.manager = { ...this.manager, phase: "starting", error: null };
+        return json(p.settings);
+      case "POST manager/restart":
+        this.manager = { ...this.manager, phase: "starting", agent: null, state: null, host: null, error: null };
         return json(p.settings);
       case "GET waits":
         return json(this.waits);

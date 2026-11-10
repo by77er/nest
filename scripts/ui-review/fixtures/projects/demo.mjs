@@ -5,7 +5,7 @@
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-sending" (the owner's messages still being sent), "chat-long" (thirty messages), "chat-paged"
-// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors),
+// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors), "manager-ended" (past its automatic restarts), "creating" (a project still being created),
 // "chat-code" (a reply with every syntax token), "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
 // a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
@@ -312,8 +312,10 @@ const RICH = [
   const { messages: allMessages, pages: historyPages } = trace(now, { busy: variant === "turn-busy" });
   // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
   // "chat-empty" is a new conversation: no turn running either (its starters show); "chat-heavy" ends on its reply; "chat-sending" ends on the owner's messages being sent.
-  const traceMessages = variant === "connecting" || variant === "chat-empty" || variant === "chat-heavy" || variant === "chat-code" || variant === "chat-sending" ? [] : allMessages;
-  const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length }, { ...other, needs_you: 0 }];
+  const traceMessages = variant === "connecting" || variant === "chat-empty" || variant === "chat-heavy" || variant === "chat-code" || variant === "chat-sending" || variant === "manager-ended" ? [] : allMessages;
+  const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length, state: "ready" }, { ...other, needs_you: 0, state: "ready" },
+    // One still being created (README.md#creating-a-project): nothing to open yet.
+    ...(variant === "creating" ? [{ id: "prj_new4k2", name: "Thingamajigs", repo: "by77er/thingamajigs", created_ms: now - 20_000, needs_you: 0, state: "pending" }] : [])];
   const sync = { written: ["capabilities/projects/board", "capabilities/projects/task", "templates/projects/manager", "templates/projects/worker"], repos: ["by77er/gadgets", "by77er/widgets"], at_ms: now - 3_600_000 };
 
   // The manager's waits (README.md#waiting), and the Network page (README.md#network): rules per role,
@@ -431,7 +433,10 @@ const RICH = [
       const why = "downloads.gadgets.example.com isn't in this app's grant; the operator must add it";
       return [403, { error: why, problems: { "worker.downloads.gadgets.example.com": why } }];
     }
-    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/issues": issues, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null },
+    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/issues": issues, "/manager": variant === "manager-ended"
+      // Ended past its automatic restarts (README.md#the-manager-lifecycle): the owner's Restart.
+      ? { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited), 4 times within an hour: restart it when you're ready." }
+      : { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null },
       "/routines": { routines, max_routine_runs: 1, live: noRoutines ? 0 : 1 }, "/routine-runs": runs, "/proposals": proposals, "/memory": notes };
     if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
     if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];

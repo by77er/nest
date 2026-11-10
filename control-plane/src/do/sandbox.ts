@@ -6,13 +6,14 @@
 // from a copy loaded before an await. Mutations go through `update()`, which loads, applies and
 // saves synchronously.
 import { DurableObject } from "cloudflare:workers";
+import { PLACE_REFUSED_RETRY, retryAfter } from "../lib/retry";
 import { z } from "zod";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { signShare } from "../lib/tokens";
-import { asNestError, compatWorkstream, hex, NestError, newId, sha256 } from "../lib/util";
+import { asNestError, clip, compatWorkstream, hex, NestError, newId, sha256 } from "../lib/util";
 import * as lease from "../lib/sandbox-lease";
 import * as slots from "../lib/slots";
 import { addColumn, storedEnum } from "../lib/stored";
@@ -109,6 +110,16 @@ const accessKey = (a: { push: string[]; read: string[]; workflows?: boolean; inj
   `${a.push.join()}|${a.read.join()}${a.workflows ? "|workflows" : ""}${a.inject?.length ? `|${JSON.stringify(a.inject)}` : ""}`;
 
 /** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
+/** FleetDO refused this sandbox's placements: how often since the last success, why, and whether it gave up. */
+export interface PlacementRefused {
+  count: number;
+  first_ms: number;
+  last_ms: number;
+  reason: string;
+  /** No more automatic tries: an operator's `POST /v1/sandboxes/<id>/place` places it. */
+  gave_up: boolean;
+}
+const PLACEMENT_REFUSED_KEY = "placement_refused";
 /** Why a sandbox waiting for a host gets none (FleetDO's `launchPause`), and since when it was noted. */
 export interface PlacementWait {
   reason: string;
@@ -486,13 +497,15 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * The record as the API shows it: without the compat `workstream`, and, while it waits for a host,
-   * why no host is coming (`placement_wait`: launches paused by the cell's enrolment breakers).
+   * The record as the API shows it: without the compat `workstream`, and, while it isn't placed, why:
+   * `placement_wait` (launches paused by the cell's enrolment breakers) and `placement_refused`
+   * (placements FleetDO refused because the leases disagree: retried, or given up).
    */
-  private view(): SandboxInfo & { placement_wait?: PlacementWait } {
+  private view(): SandboxInfo & { placement_wait?: PlacementWait; placement_refused?: PlacementRefused } {
     const { workstream: _, ...info } = this.info_();
     const wait = !info.host ? this.get<PlacementWait>(PLACEMENT_WAIT_KEY) : undefined;
-    return { ...info, labels: info.labels ?? {}, ...(wait ? { placement_wait: wait } : {}) };
+    const refused = !info.host ? this.get<PlacementRefused>(PLACEMENT_REFUSED_KEY) : undefined;
+    return { ...info, labels: info.labels ?? {}, ...(wait ? { placement_wait: wait } : {}), ...(refused ? { placement_refused: refused } : {}) };
   }
 
   /**
@@ -540,7 +553,7 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /** Place an unplaced sandbox on a host under a new epoch (`lease.claim` says which it may). */
-  async placeCurrentEpoch(excludeHost?: string): Promise<string | null> {
+  async placeCurrentEpoch(excludeHost?: string, own = true): Promise<string | null> {
     await this.reconcilePlacing();
     const now = Date.now();
     // The source is chosen and pinned by id in the claim's step: retention, in this same single
@@ -590,15 +603,35 @@ export class SandboxDO extends DurableObject<Env> {
         // A lease may exist: the marker stays for the `place` deadline to reconcile.
         throw failure;
       case "unplaced":
-        // A refusal is not retried on its own (the leases disagree: an operator looks); no room is.
+        // A refusal (the leases disagree) is retried on this object's own `place` deadline with backoff
+        // (`PLACE_REFUSED_RETRY`), then given up: shown as `placement_refused` until an operator places it.
         if (answer.kind === "refused") {
-          await this.deadlines.clear("place");
+          const now2 = Date.now();
+          const prev = this.get<PlacementRefused>(PLACEMENT_REFUSED_KEY);
+          const reason = clip(asNestError(failure)?.detail ?? String(failure), 500);
+          if (!own) {
+            // FleetDO's reassignment asked (it retries on its own count): noted, not counted here. This
+            // object's retries start from its own deadline, armed if none is.
+            this.put(PLACEMENT_REFUSED_KEY, { count: prev?.count ?? 0, first_ms: prev?.first_ms ?? now2, last_ms: now2, reason, gave_up: prev?.gave_up ?? false } satisfies PlacementRefused);
+            if (!prev?.gave_up) await this.deadlines.set("place", now2 + PLACE_REFUSED_RETRY.first_ms, true);
+            throw failure;
+          }
+          const count = (prev?.count ?? 0) + 1;
+          const next = retryAfter(count, now2, PLACE_REFUSED_RETRY);
+          this.put(PLACEMENT_REFUSED_KEY, { count, first_ms: prev?.first_ms ?? now2, last_ms: now2, reason, gave_up: "gave_up" in next } satisfies PlacementRefused);
+          if ("gave_up" in next) {
+            await this.deadlines.clear("place");
+            console.error(`sandbox ${before.sandbox}: placement refused ${count} times; given up until an operator places it`, failure);
+          } else {
+            await this.deadlines.set("place", next.at_ms);
+          }
           throw failure;
         }
         await this.deadlines.set("place", Date.now() + PLACE_RETRY_MS, true);
         await this.notePlacementWait(before.cell);
         return null;
       case "placed":
+        this.del(PLACEMENT_REFUSED_KEY);
         this.del(PLACEMENT_WAIT_KEY);
         await this.deadlines.clear("place");
         await this.afterPlaced(epoch);
@@ -636,6 +669,8 @@ export class SandboxDO extends DurableObject<Env> {
    * host, its lease released, and placed again under a new epoch.
    */
   async retryPlacement(): Promise<string | null> {
+    // The operator's try: a refusal count starts again.
+    this.del(PLACEMENT_REFUSED_KEY);
     const info = this.info_();
     const old = lease.failedHolder(info);
     if (old) {
@@ -767,7 +802,7 @@ export class SandboxDO extends DurableObject<Env> {
     const [r] = this.decide((i) => lease.leaseLost(i, host, epoch));
     if (r === "ignore") return; // gone, or already handled (re-placed, or a newer epoch exists)
     // A dead host is excluded; a host that came back and fenced is healthy and may get the new lease.
-    const placed = await this.placeCurrentEpoch(hostIsDead ? host : undefined);
+    const placed = await this.placeCurrentEpoch(hostIsDead ? host : undefined, false);
     if (!placed) await this.notifyAgentsMoved();
   }
 

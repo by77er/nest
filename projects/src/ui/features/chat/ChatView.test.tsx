@@ -337,6 +337,37 @@ describe("the chat", () => {
     }
   });
 
+  it("a manager that ended says so at the composer on a phone, with Restart, and offers no Stop even with a turn's stream left", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(max-width: 48em)", media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => false }));
+    vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Half a thought" })]));
+    const api = new FakeApi();
+    api.manager = { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited)." };
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    const down = await waitFor(() => {
+      const el = c.querySelector("[data-slot=manager-down]");
+      if (!el) throw new Error("not yet");
+      return el as HTMLElement;
+    });
+    expect(down).toHaveTextContent("The manager isn't running");
+    expect(within(c).queryByRole("button", { name: "Stop" })).toBeNull();
+    await user.click(within(down).getByRole("button", { name: "Restart manager" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/manager/restart", body: undefined }]));
+    await waitFor(() => expect(c.querySelector("[data-slot=manager-down]")).toBeNull());
+  });
+
+  it("wider than a phone, an ended manager's composer has no second Restart (the page's notice has it), and still no Stop", async () => {
+    vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Half a thought" })]));
+    const api = new FakeApi();
+    api.manager = { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited)." };
+    renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await screen.findByRole("alert", { name: /isn't running/ });
+    expect(c.querySelector("[data-slot=manager-down]")).toBeNull();
+    expect(screen.getAllByRole("button", { name: "Restart manager" })).toHaveLength(1);
+    expect(within(c).queryByRole("button", { name: "Stop" })).toBeNull();
+  });
+
   it("with no turn running there's no stream and no Stop", async () => {
     vi.stubGlobal("WebSocket", traceSocket([ev("turn_started"), ev("assistant_text", { text: "Done." }), ev("turn_completed", { stop_reason: "end_turn" })]));
     renderApp("/projects/prj_one/manager", new FakeApi());

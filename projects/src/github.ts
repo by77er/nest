@@ -295,6 +295,8 @@ export interface Pull {
   node_id: string | null;
   head_ref: string;
   fork: boolean;
+  /** GitHub's `updated_at` (ISO 8601), which orders what it says of the PR; null when it doesn't say. */
+  updated_at: string | null;
 }
 
 function pullOf(p: Record<string, unknown>, repo: string): Pull {
@@ -304,6 +306,7 @@ function pullOf(p: Record<string, unknown>, repo: string): Pull {
     number: Number(p.number), state: p.state === "open" ? "open" : "closed", merged: p.merged === true || typeof p.merged_at === "string",
     title: typeof p.title === "string" ? p.title.slice(0, 300) : "", node_id: typeof p.node_id === "string" ? p.node_id : null,
     head_ref: typeof head.ref === "string" ? head.ref : "", fork: headRepo !== repo.toLowerCase(),
+    updated_at: typeof p.updated_at === "string" ? p.updated_at : null,
   };
 }
 
