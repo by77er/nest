@@ -182,8 +182,14 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
 async function handle(env: Env, event: string, payload: Obj, seenId: string): Promise<Response> {
   const dir = directory(env);
   // By the repo's id (README.md#built-the-review-pipeline): a rename or a transfer changes the name, never the id.
-  const p = await dir.projectForRepo(repoId(payload.repository), str(obj(payload.repository).full_name) ?? null);
-  if (!p) return json({ ignored: "no project for this repo" });
+  // And by the App installation the event came from, once the project's is known (README.md#the-repos-binding).
+  const routed = await dir.projectForRepo(repoId(payload.repository), str(obj(payload.repository).full_name) ?? null, repoId(payload.installation));
+  if (!routed) return json({ ignored: "no project for this repo" });
+  if ("refused" in routed) {
+    console.warn(`github event refused: ${routed.refused}`);
+    return json({ ignored: routed.refused });
+  }
+  const p = routed.project;
   // Still being created (README.md#creating-a-project): its objects aren't whole, so nothing reaches them;
   // an import or a later event catches up.
   if (p.state === "pending") return json({ ignored: "the project is still being created" });

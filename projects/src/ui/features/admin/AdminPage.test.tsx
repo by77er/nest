@@ -3,11 +3,11 @@ import { act, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { RepoBinding } from "../../api/types";
 import { FakeApi } from "../../test/fakeApi";
-import { rereadText } from "./BindingsSection";
+import { rereadText, statusBadges } from "./BindingsSection";
 import { renderApp } from "../../test/render";
 
 const binding = (o: Partial<RepoBinding> = {}): RepoBinding => ({
-  project: "prj_one", name: "Widgets", repo: "owner/widgets", repo_id: 1, renamed_to: null, installation_id: null, bound: "github", bound_ms: null, error: null, owner: null, ...o,
+  project: "prj_one", name: "Widgets", repo: "owner/widgets", repo_id: 1, renamed_to: null, installation_id: null, bound: "github", bound_ms: null, error: null, owner: null, refused: null, ...o,
 });
 
 describe("the admin page", () => {
@@ -27,7 +27,7 @@ describe("the admin page", () => {
     const api = new FakeApi();
     const now = Date.now();
     api.bindings = [
-      binding({ project: "prj_one", name: "Widgets", repo: "owner/widgets", repo_id: 101, bound: "github", bound_ms: now - 3_600_000 }),
+      binding({ project: "prj_one", name: "Widgets", repo: "owner/widgets", repo_id: 101, bound: "github", bound_ms: now - 3_600_000, installation_id: 777001, refused: { installation: 888002, count: 14, last_ms: now - 12 * 60_000 } }),
       binding({ project: "prj_two", name: "Gadgets", repo: "owner/gadgets", repo_id: 102, bound: "event", bound_ms: now - 86_400_000, renamed_to: "neworg/gadgets" }),
       binding({ project: "prj_three", name: "Old", repo: "owner/old", repo_id: null, bound: null, error: "Didn't bind: GitHub's repo owner/old (7) is already project prj_one's" }),
     ];
@@ -38,7 +38,15 @@ describe("the admin page", () => {
     expect(row("prj_one")).toHaveTextContent("owner/widgets");
     expect(row("prj_one")).toHaveTextContent("101");
     expect(row("prj_one")).toHaveTextContent("Read from GitHub 1 hour ago");
+    expect(row("prj_one").querySelector("[data-slot=installation]")).toHaveTextContent("App installation 777001");
+    // Events from another installation (a reinstalled App), refused: said, with what to do.
+    expect(within(row("prj_one")).getByText("Events refused")).toBeInTheDocument();
+    expect(row("prj_one").querySelector("[data-slot=refused]")).toHaveTextContent(
+      "14 events refused, from App installation 888002, not the project's (777001); the last 12 minutes ago. If the App was reinstalled, Re-read to take its new installation. If it wasn't, nothing reached the project: no action needed.",
+    );
+    expect(row("prj_two").querySelector("[data-slot=installation]")).toHaveTextContent("App installation not known yet: events from any installation are accepted");
     expect(within(row("prj_one")).queryByText(/Rename pending|Not bound/)).toBeNull();
+    expect(row("prj_two").querySelector("[data-slot=refused]")).toBeNull();
     expect(row("prj_two")).toHaveTextContent("From its first event yesterday, not read from GitHub yet");
     expect(within(row("prj_two")).getByText("Rename pending")).toBeInTheDocument();
     expect(row("prj_two").querySelector('[data-tone="warning"]')).toHaveTextContent("Renamed on GitHub to neworg/gadgets: applied once nest's grant names it");
@@ -119,6 +127,7 @@ describe("the admin page", () => {
     expect(card).toHaveTextContent("Gadgets");
     expect(card).toHaveTextContent("owner/gadgets");
     expect(card).toHaveTextContent("GitHub id none");
+    expect(card.querySelector("[data-slot=installation]")).toHaveTextContent("App installation not known yet: events from any installation are accepted");
     expect(within(card).getByText("Not bound")).toBeInTheDocument();
     expect(card).toHaveTextContent("Didn't bind: why");
     expect(within(card).getByRole("button", { name: "Re-read Gadgets's repo from GitHub" })).toBeInTheDocument();
@@ -159,6 +168,19 @@ describe("the admin page", () => {
     expect(card.querySelector(".mantine-Divider-root")!.compareDocumentPosition(bindButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(within(card).getAllByRole("button", { name: /^Bind / })).toHaveLength(1);
     expect(bindButton).toHaveAttribute("data-variant", "light");
+  });
+
+  it("a row shows every badge that applies, the most urgent first", async () => {
+    const b = binding({ repo_id: null, renamed_to: "a/b", refused: { installation: 2, count: 1, last_ms: 1 } });
+    expect(statusBadges(b, true).map((s) => s.label)).toEqual(["Mismatch", "Events refused", "Not bound", "Rename pending"]);
+    expect(statusBadges(binding({ repo_id: 5 }), false)).toEqual([]);
+    const api = new FakeApi();
+    api.bindings = [binding({ project: "prj_two", name: "Gadgets", repo_id: 5, renamed_to: "a/b", refused: { installation: 2, count: 3, last_ms: Date.now() } })];
+    renderApp("/admin", api);
+    const table = await screen.findByRole("table", { name: "Repository bindings" });
+    const row = table.querySelector("[data-binding=prj_two]") as HTMLElement;
+    const badges = [...row.querySelectorAll(".mantine-Badge-root")].map((x) => x.textContent);
+    expect(badges).toEqual(["Events refused", "Rename pending"]);
   });
 
   it("says a re-read's outcome in words", () => {

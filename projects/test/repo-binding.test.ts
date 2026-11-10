@@ -9,7 +9,7 @@ import { applyRename } from "../src/binding";
 import type { RepoBinding } from "../src/do/directory";
 import type { Env } from "../src/env";
 import { nestFrom } from "../src/nest";
-import { AccessTeam, api, deliverGithub, FakeNest, installFetch, repoIdOf } from "./fake-nest";
+import { AccessTeam, api, deliverGithub, FakeNest, GH_INSTALLATION_ID, installFetch, repoIdOf } from "./fake-nest";
 
 const fake = new FakeNest();
 const gh = fake.github;
@@ -26,6 +26,7 @@ beforeAll(async () => {
 afterAll(() => restore());
 beforeEach(() => {
   fake.grantRepos = null;
+  fake.tokenInstallation = GH_INSTALLATION_ID;
   gh.failures = [];
 });
 
@@ -53,9 +54,9 @@ const reviewRepo = (p: P) => runInDurableObject(env.REVIEW.get(env.REVIEW.idFrom
   st.storage.sql.exec<{ v: string }>("SELECT v FROM settings WHERE k = 'repo'").one().v);
 
 describe("read from GitHub, not taken from an event", () => {
-  it("attach binds the repo's id from GitHub, so no event's id binds it; the installation id is empty until nest names it", async () => {
+  it("attach binds the repo's id from GitHub, and the installation nest minted its token from, so no event's id binds it", async () => {
     const p = await newProject();
-    expect(await binding(p)).toMatchObject({ repo: p.repo, repo_id: repoIdOf(p.repo), bound: "github", renamed_to: null, installation_id: null, error: null });
+    expect(await binding(p)).toMatchObject({ repo: p.repo, repo_id: repoIdOf(p.repo), bound: "github", renamed_to: null, installation_id: GH_INSTALLATION_ID, error: null });
     // Another repo's id under this name (or an event with none) reaches nothing.
     expect(await (await deliverGithub("issues", issue(1, { id: 7, full_name: p.repo }))).json()).toEqual({ ignored: "no project for this repo" });
     expect(await (await deliverGithub("issues", issue(2, { id: undefined, full_name: p.repo }))).json()).toEqual({ ignored: "no project for this repo" });
@@ -158,6 +159,98 @@ describe("a re-read never rebinds by itself", () => {
     expect(await binding(p)).toMatchObject({ repo_id: repoIdOf(p.repo), bound: "event", owner: null });
     expect((await sync()).status).toBe(200);
     expect(await binding(p)).toMatchObject({ repo_id: repoIdOf(p.repo), bound: "github", owner: { login: p.repo.split("/")[0] } });
+  });
+});
+
+describe("the App installation", () => {
+  it("a project whose installation is known takes events only from it: another, or none, is refused and acts on nothing", async () => {
+    const p = await newProject();
+    const other = await deliverGithub("issues", { ...issue(1, { full_name: p.repo }), installation: { id: GH_INSTALLATION_ID + 1 } });
+    expect(await other.json()).toEqual({ ignored: `the event's installation (${GH_INSTALLATION_ID + 1}) isn't the project's (${GH_INSTALLATION_ID})` });
+    const none = await deliverGithub("issues", { ...issue(2, { full_name: p.repo }), installation: undefined });
+    expect(((await none.json()) as { ignored: string }).ignored).toContain("installation (none)");
+    // A refused event notes nothing either (a name it gives isn't taken as a rename).
+    await deliverGithub("issues", { ...issue(3, { id: repoIdOf(p.repo), full_name: `${p.repo}-x` }), installation: { id: 5 } });
+    expect((await binding(p)).renamed_to).toBeNull();
+    await deliverGithub("issues", issue(4, { full_name: p.repo }));
+    expect(await numbers(p)).toEqual([4]);
+  });
+
+  it("an App reinstalled: the right repo's events from the new installation are refused, counted on the binding for the owner to see, until Re-read takes it", async () => {
+    const p = await newProject();
+    const reinstalled = GH_INSTALLATION_ID + 100;
+    for (const n of [1, 2]) {
+      const r = await deliverGithub("issues", { ...issue(n, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: reinstalled } });
+      expect(((await r.json()) as { ignored: string }).ignored).toContain(`installation (${reinstalled}) isn't the project's (${GH_INSTALLATION_ID})`);
+    }
+    expect(await numbers(p)).toEqual([]);
+    // Shown on the Admin page's binding: how many, from which installation, when.
+    expect((await binding(p)).refused).toEqual({ installation: reinstalled, count: 2, last_ms: expect.any(Number) });
+    // A re-read while nest still names the old installation changes nothing.
+    expect((await reread(p)).status).toBe(200);
+    expect(await binding(p)).toMatchObject({ installation_id: GH_INSTALLATION_ID, refused: { count: 2 } });
+    // nest mints from the new installation now: Re-read takes it, the refusals are over, its events act.
+    fake.tokenInstallation = reinstalled;
+    expect((await reread(p)).status).toBe(200);
+    expect(await binding(p)).toMatchObject({ installation_id: reinstalled, refused: null });
+    await deliverGithub("issues", { ...issue(3, { full_name: p.repo }), installation: { id: reinstalled } });
+    expect(await numbers(p)).toEqual([3]);
+  });
+
+  it("a project with none yet takes events as before, until a sync reads it; then it's held to it", async () => {
+    const p = await newProject();
+    await dirSql("UPDATE projects SET installation_id = NULL WHERE id = ?", p.id);
+    await deliverGithub("issues", { ...issue(1, { full_name: p.repo }), installation: { id: 5 } });
+    expect(await numbers(p)).toEqual([1]);
+    expect((await sync()).status).toBe(200);
+    expect((await binding(p)).installation_id).toBe(GH_INSTALLATION_ID);
+    await deliverGithub("issues", { ...issue(2, { full_name: p.repo }), installation: { id: 5 } });
+    expect(await numbers(p)).toEqual([1]);
+  });
+
+  it("a project bound from an event (name only) is held to a stored installation too", async () => {
+    const p = await newProject();
+    await dirSql("UPDATE projects SET repo_id = NULL, repo_bound = NULL WHERE id = ?", p.id);
+    const r = await deliverGithub("issues", { ...issue(1, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: 5 } });
+    expect(((await r.json()) as { ignored: string }).ignored).toContain("isn't the project's");
+    expect((await binding(p)).repo_id).toBeNull();
+  });
+
+  it("a token minted for the old name (the new one not in nest's grant yet) never stores its installation", async () => {
+    const p = await newProject();
+    const to = `${p.repo}-renamed`;
+    gh.rename(p.repo, to);
+    await deliverGithub("issues", issue(1, { id: repoIdOf(p.repo), full_name: to }));
+    expect((await binding(p)).renamed_to).toBe(to);
+    // The grant names only the old name, whose token comes from another installation (the name's owner now).
+    fake.grantRepos = [p.repo];
+    fake.tokenInstallation = 31_337;
+    expect((await reread(p)).status).toBe(200);
+    expect((await sync()).status).toBe(200);
+    expect(await binding(p)).toMatchObject({ repo_id: repoIdOf(p.repo), installation_id: GH_INSTALLATION_ID });
+    // The real repo's events still reach the project.
+    fake.grantRepos = null;
+    await deliverGithub("issues", issue(2, { id: repoIdOf(p.repo), full_name: to }));
+    expect(await numbers(p)).toEqual([1, 2]);
+  });
+
+  it("a nest that doesn't name it keeps the stored one; another repo chosen takes its own", async () => {
+    const p = await newProject();
+    fake.tokenInstallation = null;
+    expect((await reread(p)).status).toBe(200);
+    expect((await binding(p)).installation_id).toBe(GH_INSTALLATION_ID);
+    // The repo replaced on GitHub, and the operator binds the new one: the installation is the one nest names for it now.
+    gh.rename(p.repo, `${p.repo}-gone`);
+    const impostor = gh.take(p.repo);
+    expect((await reread(p)).body.mismatch.github.id).toBe(impostor);
+    expect((await binding(p)).installation_id).toBe(GH_INSTALLATION_ID);
+    // Chosen while nest names none: the old repo's installation isn't kept for the new one.
+    await bind(p, impostor);
+    expect(await binding(p)).toMatchObject({ repo_id: impostor, installation_id: null });
+    // Read again with nest naming it: that one.
+    fake.tokenInstallation = 4_242_424;
+    await reread(p);
+    expect(await binding(p)).toMatchObject({ repo_id: impostor, installation_id: 4_242_424 });
   });
 });
 

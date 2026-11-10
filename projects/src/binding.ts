@@ -19,19 +19,24 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
   const dir = directory(env);
   const b = await dir.binding(id);
   if (!b) return { ok: false, error: "unknown project", binding: null };
-  let info: GithubRepo;
+  let info: GithubRepo & { installation_id: number | null };
   const name = b.renamed_to ?? b.repo;
   try {
     let gh;
+    // Whether the token is for the repo's current name: only then is its installation the repo's.
+    let current = true;
     try {
       gh = await githubFor(nest, name, PERMISSIONS.metadata);
     } catch (e) {
       // The new name isn't in nest's grant yet (403): a token for the name the grant holds reads the same repo.
       if (!(b.renamed_to && e instanceof NestError && e.status === 403)) throw e;
       gh = await githubFor(nest, b.repo, PERMISSIONS.metadata);
+      current = false;
     }
     const r = await gh.repoInfo(name);
-    info = { id: r.id, full_name: r.full_name, owner: { id: r.owner.id, login: r.owner.login } };
+    // A token for the old name may come from another installation (the name taken since, by a repo the App
+    // is installed on): its installation is never stored, so the one stored stays.
+    info = { id: r.id, full_name: r.full_name, owner: { id: r.owner.id, login: r.owner.login }, installation_id: current ? gh.installationId : null };
   } catch (e) {
     return { ok: false, error: `GitHub couldn't be read: ${message(e)}`, binding: b };
   }
@@ -77,7 +82,8 @@ export async function bindAll(env: Env, nest: Nest): Promise<void> {
   for (const b of await directory(env).bindings()) {
     try {
       let now: RepoBinding | null = b;
-      if (b.repo_id === null || b.bound !== "github") {
+      // No id, one taken from an event, or no installation yet (bound before nest named it): read from GitHub.
+      if (b.repo_id === null || b.bound !== "github" || b.installation_id === null) {
         const r = await readBinding(env, nest, b.project, "fill");
         now = r.binding;
       }

@@ -3598,7 +3598,7 @@ export class ProjectDO extends DurableObject<Env> {
       const owner = info.owner;
       // The repo's binding (README.md#the-repos-binding): its id read from GitHub now, so events never bind it.
       // One that doesn't bind (another project's, or another id) is shown on the Admin page; the attach goes on.
-      await directory(this.env).bindRepo(s.id, { id: info.id, full_name: info.full_name, owner: { id: owner.id, login: owner.login } }, "fill");
+      await directory(this.env).bindRepo(s.id, { id: info.id, full_name: info.full_name, owner: { id: owner.id, login: owner.login }, installation_id: gh.installationId }, "fill");
       const user = owner.type === "User";
       this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", user ? owner.id : null, user ? owner.login : null);
       if (user) this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1 WHERE comments_decided = 0", owner.id, owner.login);

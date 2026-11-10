@@ -87,6 +87,8 @@ export class FakeNest {
   layerWithoutPush = false;
   /** The repos the client's grant names, lowercased (`github.repos`); null: any (the grant isn't what a test is about). */
   grantRepos: string[] | null = null;
+  /** The installation nest's token answer names (`installation_id`); null: none, as a nest from before #219. */
+  tokenInstallation: number | null = GH_INSTALLATION_ID;
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
   holds: { match: RegExp; release: Promise<void>; reached: boolean }[] = [];
   /** Creates that are made but whose answer is lost (a 500 instead), as after a timeout. */
@@ -387,7 +389,9 @@ export class FakeNest {
       // The App it's from (docs/control-plane/api/clients/#github-tokens), unless nest can't tell.
       const app = this.githubApp ? { app_id: this.githubApp.app_id, app_slug: this.githubApp.app_slug } : {};
       // And the installation it was minted from (one installation in this fake).
-      return json(200, { token, expires_at: new Date(Date.now() + 3600_000).toISOString(), repo: repo.toLowerCase(), permissions, installation_id: GH_INSTALLATION_ID, ...app });
+      // The installation it's minted from, unless the test plays a nest from before it was named.
+      const installation = this.tokenInstallation === null ? {} : { installation_id: this.tokenInstallation };
+      return json(200, { token, expires_at: new Date(Date.now() + 3600_000).toISOString(), repo: repo.toLowerCase(), permissions, ...installation, ...app });
     }
     return nestErr(404, "not_found", `no route for ${r}`);
   }
@@ -907,6 +911,8 @@ export async function deliverGithub(event: string, payload: unknown, o: { secret
   // GitHub names the repo's id in every event: the fake's, unless the test gives one (or `id: undefined`, none).
   const repo = (payload as { repository?: Record<string, unknown> } | null)?.repository;
   if (repo && typeof repo === "object" && !("id" in repo) && typeof repo.full_name === "string") repo.id = repoIdOf(repo.full_name);
+  // And the App installation it came from: the fake's, unless the test gives one (or `installation: undefined`, none).
+  if (payload && typeof payload === "object" && !("installation" in payload)) (payload as Record<string, unknown>).installation = { id: GH_INSTALLATION_ID };
   const body = o.raw ?? JSON.stringify(payload);
   const signature = o.signature === undefined ? await signGithub(o.secret ?? env.GITHUB_WEBHOOK_SECRET!, new TextEncoder().encode(body)) : o.signature;
   const delivery = o.delivery === undefined ? crypto.randomUUID() : o.delivery;
@@ -938,7 +944,7 @@ export function prEvent(o: {
       base: { ref: o.base ?? "main", repo: { full_name: o.repo } },
     },
     repository: { full_name: o.repo },
-    installation: { id: 1 },
+    installation: { id: GH_INSTALLATION_ID },
   };
 }
 

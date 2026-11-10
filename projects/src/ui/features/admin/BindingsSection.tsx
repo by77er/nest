@@ -31,6 +31,17 @@ export function rereadText(name: string, r: Extract<RereadBinding, { changed: bo
   return { tone: r.rename && "blocked" in r.rename ? "warning" : "success", message: parts.join(" ") };
 }
 
+/** The App installation events must come from, once nest has named it (README.md#the-repos-binding). */
+const installationText = (b: RepoBinding) =>
+  b.installation_id === null ? "App installation not known yet: events from any installation are accepted" : `App installation ${b.installation_id}`;
+
+/** Events refused for another App installation, and what to do about it (README.md#the-repos-binding). */
+export function refusedText(b: RepoBinding, r: NonNullable<RepoBinding["refused"]>): string {
+  const n = r.count === 1 ? "1 event" : `${r.count} events`;
+  const from = r.installation === null ? "naming no App installation" : `from App installation ${r.installation}`;
+  return `${n} refused, ${from}, not the project's (${b.installation_id ?? "none"}); the last ${ago(r.last_ms)}. If the App was reinstalled, Re-read to take its new installation. If it wasn't, nothing reached the project: no action needed.`;
+}
+
 const ownerText = (o: { id: number; login: string } | null) => (o ? `${o.login} (${o.id})` : "not known: learned from an event");
 
 /** One side of the comparison: a repo's name, id and owner. */
@@ -154,11 +165,26 @@ function useBinding(b: RepoBinding, r: Rereads) {
   return { busy, mismatch, failure, reread: () => r.run(b), bind };
 }
 
+/** Every problem a binding has, as badges, the most urgent first. */
+export function statusBadges(b: RepoBinding, mismatch: boolean): { label: string; color: "danger" | "warning" }[] {
+  return [
+    mismatch && { label: "Mismatch", color: "danger" as const },
+    b.refused && { label: "Events refused", color: "danger" as const },
+    b.repo_id === null && { label: "Not bound", color: "danger" as const },
+    b.renamed_to && { label: "Rename pending", color: "warning" as const },
+  ].filter((x): x is { label: string; color: "danger" | "warning" } => !!x);
+}
+
 function Status({ b, mismatch }: { b: RepoBinding; mismatch: boolean }) {
-  if (mismatch) return <Badge size="sm" color="danger" variant="light">Mismatch</Badge>;
-  if (b.repo_id === null) return <Badge size="sm" color="danger" variant="light">Not bound</Badge>;
-  if (b.renamed_to) return <Badge size="sm" color="warning" variant="light">Rename pending</Badge>;
-  return null;
+  return (
+    <>
+      {statusBadges(b, mismatch).map((s) => (
+        <Badge key={s.label} size="sm" color={s.color} variant="light">
+          {s.label}
+        </Badge>
+      ))}
+    </>
+  );
 }
 
 /** The Bound cell (the card's middle): how it was learned, a pending rename, why it didn't bind, a failed re-read, a mismatch. */
@@ -179,6 +205,11 @@ function BoundDetail({ b, s, card = false }: { b: RepoBinding; s: ReturnType<typ
             {b.renamed_to}
           </Text>
           : applied once nest&apos;s grant names it
+        </Text>
+      )}
+      {b.refused && (
+        <Text fz="sm" c="danger" data-tone="danger" data-slot="refused" title={exact(b.refused.last_ms)}>
+          {refusedText(b, b.refused)}
         </Text>
       )}
       {b.error && (
@@ -217,10 +248,15 @@ function BindingRow({ b, rereads }: { b: RepoBinding; rereads: Rereads }) {
         </Stack>
       </Table.Td>
       <Table.Td>
-        {/* An id is one token: never broken across lines. */}
-        <Token size="sm" nowrap dimmed={b.repo_id === null}>
-          {b.repo_id ?? "None"}
-        </Token>
+        <Stack gap="2xs">
+          {/* An id is one token: never broken across lines. */}
+          <Token size="sm" nowrap dimmed={b.repo_id === null}>
+            {b.repo_id ?? "None"}
+          </Token>
+          <Text fz="xs" c="dimmed" data-slot="installation">
+            {installationText(b)}
+          </Text>
+        </Stack>
       </Table.Td>
       <Table.Td>
         <BoundDetail b={b} s={s} />
@@ -248,6 +284,9 @@ function BindingCard({ b, rereads }: { b: RepoBinding; rereads: Rereads }) {
         </Stack>
         <MetaRow>
           <MetaItem mono>GitHub id {b.repo_id ?? "none"}</MetaItem>
+          <MetaItem>
+            <span data-slot="installation">{installationText(b)}</span>
+          </MetaItem>
         </MetaRow>
         <BoundDetail b={b} s={s} card />
         <Row>
