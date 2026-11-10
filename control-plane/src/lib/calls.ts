@@ -168,6 +168,15 @@ export class CallLedger {
     return n;
   }
 
+  /**
+   * A call still dispatching is dispatched again (its message was redelivered after an eviction): its
+   * row counts as begun now, so the prune can't take it for an old one and delete it under the dispatch
+   * (the outcome would then be stored nowhere and never sent).
+   */
+  redispatch(epoch: number, call: string): void {
+    this.sql.exec(`UPDATE tool_calls SET created_ms = ? WHERE epoch = ? AND call = ? AND status = '${CALL.dispatching}'`, Date.now(), epoch, call);
+  }
+
   /** The call waits for an ask; only from `dispatching` (an answer that came while it was routed finished it). Whether it does. */
   wait(epoch: number, call: string): boolean {
     return this.applyCall("wait", null, "epoch = ? AND call = ?", epoch, call) > 0;

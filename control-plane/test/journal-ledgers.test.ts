@@ -185,7 +185,7 @@ describe("the MCP forward ledger", () => {
     });
   });
 
-  it("the server's own answer replaces a recorded unknown; nothing else replaces a settled outcome", async () => {
+  it("the server's own answer replaces an outcome nest made itself (an unknown, a refusal); nothing replaces the server's answer", async () => {
     await runInDurableObject(fresh(), (inst: AgentDO, st) => {
       const m = (inst as any).mcp;
       const lost = { outcome: { status: "error", error: { code: "outcome_unknown", message: "lost", retryable: false } }, from_server: false };
@@ -200,6 +200,14 @@ describe("the MCP forward ledger", () => {
       expect(m.settle("k", lost)).toEqual(out("the real answer"));
       expect(m.settle("k", out("another"))).toEqual(out("the real answer"));
       expect(stored("k")).toEqual(out("the real answer"));
+      // A platform refusal stored first (one delivery was refused a slot) gives way to the server's answer too,
+      // but not to another platform outcome.
+      const refused = { outcome: { status: "error", error: { code: "rate_limited", message: "at nest's cap", retryable: true } }, from_server: false };
+      m.recordForward(ctx("r"), g, "send", 1);
+      m.settle("r", refused);
+      expect(m.settle("r", lost)).toEqual(refused);
+      expect(m.settle("r", out("answered"))).toEqual(out("answered"));
+      expect(stored("r")).toEqual(out("answered"));
       // The server's own error saying "unknown" is its answer, not a gap to fill.
       const servers = { ...lost, from_server: true };
       m.recordForward(ctx("s"), g, "send", 1);

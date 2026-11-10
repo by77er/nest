@@ -512,6 +512,24 @@ describe("github actions", () => {
     expect((await journal(s.agent)).find((e: any) => e.key.endsWith("/cal_gs1"))).toMatchObject({ status: "done", attempts: 0, detail: "by the other delivery" });
   });
 
+  it("a call first begun over a week ago and redelivered now gets its result, even when the hourly prune runs under its dispatch", async () => {
+    const r = repo();
+    const s = await setup([{ action: "github.comment", repos: [r] }]);
+    // An earlier incarnation began the call and never finished it; its row is past the retention.
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO, st) => {
+      (inst as any).calls.begin(1, "cal_old1", "github_comment");
+      st.storage.sql.exec("UPDATE tool_calls SET created_ms = ? WHERE call = 'cal_old1'", Date.now() - 8 * 86_400_000);
+      // The prune fires while the redelivered call is out.
+      inst.testHooks["dispatch:beforeWrite"] = async () => {
+        delete inst.testHooks["dispatch:beforeWrite"];
+        (inst as any).prune();
+      };
+    });
+    call(s.ws, "cal_old1", "github_comment", { repo: r, issue_number: 1, body: "late" });
+    expect((await result(s.ws, "cal_old1")).status).toBe("ok");
+    expect(gh.comments.get(`${r}#1`)).toHaveLength(1);
+  });
+
   it("an action is capped per hour; refused calls don't count", async () => {
     const r = repo();
     const s = await setup([{ action: "github.comment", repos: [r], per_hour: 2 }]);
