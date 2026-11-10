@@ -161,6 +161,9 @@ export function ownerLookups(grant: Grant, repos: readonly string[]): string[] {
   return [...want].sort();
 }
 
+/** Repos BrokerDO's `repoOwners` looks up in one call (a caller with more batches them). */
+export const REPO_OWNERS_PER_CALL = 100;
+
 /** Every repo an expanded spec names (pushed, read, or reached by a brokered action): what `specOutsideGrant` checks. */
 export function specRepos(spec: Pick<AgentSpec, "repos" | "read_repos" | "brokered">): string[] {
   return [...(spec.repos ?? []), ...(spec.read_repos ?? []), ...(spec.brokered ?? []).flatMap((b) => ("repos" in b && b.repos ? b.repos : []))];
@@ -169,6 +172,12 @@ export function specRepos(spec: Pick<AgentSpec, "repos" | "read_repos" | "broker
 /** Every repo a capability's brokered actions are scoped to. */
 export function capabilityRepos(cap: Capability): string[] {
   return (cap.brokered ?? []).flatMap((e) => ("repos" in e && e.repos ? e.repos : []));
+}
+
+/** The account ids every owner-wide entry of a grant is bound to (each once): the only accounts nest asks GitHub about for it. */
+export function grantBoundIds(grant: Pick<Grant, "repos" | "read_repos" | "github" | "repo_owners">): number[] {
+  const all = [...grant.repos, ...(grant.read_repos ?? []), ...(grant.github?.repos ?? [])];
+  return [...wildcardOwnerIds(all, grant)].sort((a, b) => a - b);
 }
 
 /** The logins of every owner-wide entry in a grant (lowercase, each once). */

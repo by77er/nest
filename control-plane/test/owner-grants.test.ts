@@ -25,6 +25,12 @@ class FakeGitHub {
   /** token → the installation it was minted for (for `GET /installation/repositories`); revoked ones. */
   readonly tokens = new Map<string, number>();
   readonly revoked: string[] = [];
+  /** A login whose account answers (`/users/{login}`, its installation) name another login, as GitHub's could after a rename. */
+  readonly loginOverride = new Map<string, string>();
+  /** GitHub's unauthenticated reads answer 403 (its anonymous rate limit). */
+  limitPublic = false;
+  /** Repos GitHub answers with a redirect (moved), as for a renamed or transferred repo. */
+  readonly moved = new Set<string>();
   /** Requests by path, to count lookups. */
   readonly asked: string[] = [];
   private n = 0;
@@ -33,8 +39,12 @@ class FakeGitHub {
     const u = new URL(req.url);
     this.asked.push(`${req.method} ${u.pathname}`);
     const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
-    const loginOf = (id: number) => [...this.accounts].find(([, i]) => i === id)?.[0] ?? `ghost-${id}`;
+    const loginOf = (id: number) => {
+      const login = [...this.accounts].find(([, i]) => i === id)?.[0] ?? `ghost-${id}`;
+      return this.loginOverride.get(login) ?? login;
+    };
     const authed = req.headers.has("authorization");
+    if (!authed && this.limitPublic) return json(403, { message: "API rate limit exceeded" });
     let m: RegExpMatchArray | null;
     if ((m = u.pathname.match(/^\/users\/([^/]+)\/installation$/))) {
       const id = this.accounts.get(decodeURIComponent(m[1]!).toLowerCase());
@@ -44,7 +54,14 @@ class FakeGitHub {
     if ((m = u.pathname.match(/^\/users\/([^/]+)$/))) {
       const login = decodeURIComponent(m[1]!).toLowerCase();
       const id = this.accounts.get(login);
-      return id !== undefined ? json(200, { id, login, type: "User" }) : json(404, { message: "Not Found" });
+      return id !== undefined ? json(200, { id, login: this.loginOverride.get(login) ?? login, type: "User" }) : json(404, { message: "Not Found" });
+    }
+    if ((m = u.pathname.match(/^\/user\/(\d+)$/))) {
+      const id = Number(m[1]);
+      return [...this.accounts.values()].includes(id) ? json(200, { id, login: loginOf(id) }) : json(404, { message: "Not Found" });
+    }
+    if ((m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/installation)?$/)) && this.moved.has(m[1]!.toLowerCase())) {
+      return json(301, { message: "Moved Permanently", url: "https://api.github.com/repositories/1" });
     }
     if ((m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/installation$/))) {
       const r = this.repos.get(m[1]!.toLowerCase());
@@ -237,6 +254,53 @@ describe("writing a grant", () => {
     expect(again.grant.repo_owners).toEqual({ [a.login]: 777_000_001 });
   });
 
+  it("an account answer for another login is refused: the id is bound only to the login GitHub names", async () => {
+    const a = account();
+    // GitHub's answer for the login names a different account (as a lookup that followed a rename could).
+    gh.loginOverride.set(a.login, `someone${rand()}`);
+    const cell = uniqueCell();
+    const res = await adminJson("/v1/admin/clients", { body: { name: `og-${rand()}`, grant: { cells: [cell], repos: [`${a.login}/*`] } } }, 409);
+    expect(res.error.message).toContain(a.login);
+    gh.loginOverride.delete(a.login);
+  });
+
+  it("a spec naming more repos than BrokerDO looks up at once is checked whole, in batches", async () => {
+    const names = Array.from({ length: 101 }, (_, i) => `r${i}`);
+    const a = account(names);
+    const c = await newClient({ repos: [`${a.login}/*`] });
+    await putTemplate(c, "many", { read_repos: names.slice(0, 100).map((n) => a.repo(n)), repos: [a.repo("r100")] });
+  });
+
+  it("the public profile's answer is held to the login too: an account the App isn't on, answered as another login, is refused", async () => {
+    const a = account(["app"], { installed: false, public: true });
+    gh.loginOverride.set(a.login, `someone${rand()}`);
+    await adminJson("/v1/admin/clients", { body: { name: `og-${rand()}`, grant: { cells: [uniqueCell()], read_repos: [`${a.login}/*`] } } }, 409);
+    gh.loginOverride.delete(a.login);
+    const c = await newClient({ read_repos: [`${a.login}/*`] });
+    expect(c.grant.repo_owners).toEqual({ [a.login]: a.id });
+  });
+
+  it("an id the operator sends for a new login is dropped: GitHub's is stored, and the answer shows it", async () => {
+    const a = account();
+    const c = await newClient({ repos: [`${a.login}/*`], repo_owners: { [a.login]: 1 } });
+    expect(c.grant.repo_owners).toEqual({ [a.login]: a.id });
+    const b = account();
+    const patched = await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { cells: [c.cell], repos: [`${a.login}/*`, `${b.login}/*`], repo_owners: { [b.login]: 2 } } } });
+    expect(patched.grant.repo_owners).toEqual({ [a.login]: a.id, [b.login]: b.id });
+  });
+
+  it("GitHub's anonymous limit hit while resolving a login says so (503, retry later), not that there's no such account", async () => {
+    const a = account([], { installed: false });
+    gh.limitPublic = true;
+    try {
+      const res = await adminJson("/v1/admin/clients", { body: { name: `og-${rand()}`, grant: { cells: [uniqueCell()], repos: [`${a.login}/*`] } } }, 503);
+      expect(res.error).toMatchObject({ retryable: true });
+      expect(res.error.message).toContain("try again later");
+    } finally {
+      gh.limitPublic = false;
+    }
+  });
+
   it("a grant of exact entries asks GitHub nothing", async () => {
     const before = gh.asked.length;
     const c = await newClient({ repos: ["acme/app"] });
@@ -282,6 +346,73 @@ describe("the check sites", () => {
     expect(gh.mints.filter((m) => m.installation === thiefInst)).toEqual([]);
     expect((await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: [a.repo("evil")] } })).repos)
       .toEqual([{ repo: a.repo("evil"), push: false, read: false, github: false }]);
+  });
+
+  it("names under no bound account's login cost GitHub nothing; a renamed account is followed by its id", async () => {
+    const a = account(["app"]);
+    const c = await newClient({ repos: [`${a.login}/*`], github: { repos: [`${a.login}/*`], permissions: { contents: "read" } } });
+    // Warm: the bound account's login is learned once.
+    await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: [a.repo("app")] } });
+    const before = gh.asked.length;
+    const random = Array.from({ length: 100 }, () => `x${rand()}/y${rand()}`);
+    const r = await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: random } });
+    expect(r.repos.every((x: { push: boolean }) => !x.push)).toBe(true);
+    await putTemplate(c, "rnd", { repos: random.slice(0, 5) }, 403);
+    const t = await as(c.token, "/v1/clients/self/github-token", { body: { repo: random[0], permissions: { contents: "read" } } }, 403);
+    expect(t.error.message).toContain("outside");
+    expect(gh.asked.length).toBe(before);
+    // The account renames itself: its login is learned again once the kept one is past its time, and its repos match under the new login.
+    const renamed = `ren${rand()}`;
+    gh.accounts.delete(a.login);
+    gh.accounts.set(renamed, a.id);
+    gh.repos.set(`${renamed}/app`, { owner: a.id, installation: a.installation, public: false });
+    await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), (_i: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE github_account_logins SET fetched_ms = 0 WHERE account_id = ?", a.id);
+    });
+    expect((await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: [`${renamed}/app`] } })).repos[0]).toMatchObject({ push: true });
+  });
+
+  it("a client past its hourly budget of owner lookups is refused (429, retryable) and GitHub isn't asked", async () => {
+    const a = account(["app", "lib"]);
+    const c = await newClient({ repos: [`${a.login}/*`] });
+    await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: [a.repo("app")] } });
+    await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), (_i: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE github_lookup_budget SET used = 600 WHERE client = ?", c.id);
+    });
+    const before = gh.asked.length;
+    const res = await as(c.token, "/v1/clients/self/grant/repos", { body: { repos: [a.repo("lib")] } }, 429);
+    expect(res.error).toMatchObject({ code: "rate_limited", retryable: true });
+    expect(gh.asked.length).toBe(before);
+    // Another client's budget is its own.
+    const other = await newClient({ repos: [`${a.login}/*`] });
+    expect((await as(other.token, "/v1/clients/self/grant/repos", { body: { repos: [a.repo("lib")] } })).repos[0]).toMatchObject({ push: true });
+  });
+
+  it("a login taken over while nest still holds the old owner's login: the mint's fresh lookup refuses the new owner's repo", async () => {
+    const a = account(["app"]);
+    const c = await newClient({ github: { repos: [`${a.login}/*`], permissions: { contents: "read" } } });
+    // nest learns the bound account's login (kept a few minutes).
+    await as(c.token, "/v1/clients/self/github-token", { body: { repo: a.repo("app"), permissions: { contents: "read" } } });
+    // Within that window the account renames away and another takes its login, with nest's App on it.
+    const thief = ++nextId;
+    const thiefInst = ++nextId;
+    gh.accounts.set(a.login, thief);
+    gh.installations.set(thiefInst, thief);
+    gh.repos.set(a.repo("evil"), { owner: thief, installation: thiefInst, public: true });
+    const mints = gh.mints.length;
+    await as(c.token, "/v1/clients/self/github-token", { body: { repo: a.repo("evil"), permissions: { contents: "read" } } }, 403);
+    expect(gh.mints.length).toBe(mints);
+  });
+
+  it("a token for a moved repo, or one not found, answers the same 403 as a name outside the grant", async () => {
+    const a = account(["app"]);
+    const c = await newClient({ github: { repos: [`${a.login}/*`], permissions: { contents: "read" } } });
+    gh.moved.add(a.repo("old"));
+    const moved = await as(c.token, "/v1/clients/self/github-token", { body: { repo: a.repo("old"), permissions: { contents: "read" } } }, 403);
+    const missing = await as(c.token, "/v1/clients/self/github-token", { body: { repo: a.repo("nope"), permissions: { contents: "read" } } }, 403);
+    const strip = (e: { error: { message: string } }, repo: string) => e.error.message.replace(repo, "R");
+    expect(strip(moved, a.repo("old"))).toBe(strip(missing, a.repo("nope")));
+    expect(moved.error.message).not.toMatch(/301|Moved/i);
   });
 
   it("tokens: minted from the bound account's installation by GitHub's answer; a cached one only while that holds", async () => {
@@ -361,6 +492,31 @@ describe("the check sites", () => {
     const mints = gh.mints.length;
     await as(c.token, "/v1/clients/self/grant/repos");
     expect(gh.mints.length).toBe(mints);
+  });
+
+  it("the listing token is audited as covering the whole installation, and revoked even when its audit can't be written", async () => {
+    const a = account(["app"]);
+    const c = await newClient({ repos: [`${a.login}/*`] });
+    const proto = BrokerDO.prototype as unknown as { auditMint: (r: Record<string, unknown>) => Promise<void> };
+    const real = proto.auditMint;
+    const records: Record<string, unknown>[] = [];
+    const listed = () => gh.asked.filter((p) => p === "GET /installation/repositories").length;
+    const before = listed();
+    proto.auditMint = async function (this: unknown, r: Record<string, unknown>) {
+      records.push(r);
+      throw new Error("R2 unavailable");
+    };
+    try {
+      await as(c.token, "/v1/clients/self/grant/repos", {}, 500);
+    } finally {
+      proto.auditMint = real;
+    }
+    const listing = gh.mints.find((m) => m.installation === a.installation && m.repositories === null)!;
+    expect(records.at(-1)).toMatchObject({ all_repos: true, installation: a.installation, permissions: { metadata: "read" } });
+    expect(records.at(-1)).not.toHaveProperty("repos");
+    // Never used to list, and revoked.
+    expect(listed()).toBe(before);
+    await eventually("the token revoked", () => gh.revoked.includes(listing.token));
   });
 
   it("a brokered capability a client writes: scoped to the bound account's repos is in, unscoped isn't", async () => {

@@ -249,8 +249,30 @@ export class GitHubApi {
       if (id !== null) return id;
     }
     const r = await this.request(null, "GET", `/users/${encodeURIComponent(login)}`);
-    if (r.kind === "lost") throw ghError(r, `looking up GitHub account ${login}`);
-    return r.kind === "ok" ? accountId(r.json, login) : null;
+    if (r.kind === "ok") return accountId(r.json, login);
+    if (r.kind === "refused" && r.status === 404) return null;
+    // No answer, or refused (the unauthenticated rate limit is 60 an hour): not known either way.
+    throw new NestError(ErrorCodes.INTERNAL, `GitHub couldn't confirm account ${login} now (${r.kind === "lost" ? r.why : `HTTP ${r.status}`}): try again later`, 503, true);
+  }
+
+  /**
+   * The current login of the account with id `account` (lowercase): from the App's installations when the
+   * App is on it (the App's JWT), else its public profile (`GET /user/{id}`). Null when GitHub knows no
+   * such account. Throws (retryable) when GitHub gave no answer or refused (rate limited).
+   */
+  async accountLogin(jwt: string | null, account: number): Promise<string | null> {
+    if (jwt !== null) {
+      const page = await this.request(jwt, "GET", "/app/installations?per_page=100");
+      if (page.kind === "ok" && Array.isArray(page.json)) {
+        const hit = (page.json as { account?: { id?: unknown; login?: unknown } }[]).find((i) => i?.account?.id === account);
+        if (typeof hit?.account?.login === "string") return hit.account.login.toLowerCase();
+      }
+    }
+    const r = await this.request(null, "GET", `/user/${account}`);
+    const o = r.kind === "ok" ? (r.json as { id?: unknown; login?: unknown } | null) : null;
+    if (o && o.id === account && typeof o.login === "string") return o.login.toLowerCase();
+    if (r.kind === "refused" && r.status === 404) return null;
+    throw new NestError(ErrorCodes.INTERNAL, `GitHub couldn't say account ${account}'s login now: try again later`, 503, true);
   }
 
   /**

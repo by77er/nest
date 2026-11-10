@@ -12,7 +12,7 @@ import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { Capability, CatalogName, EntryName, OperatorOverrides, type SpawnerOverrides, Template } from "./lib/spec";
 import { cellIdleTtlMs, MIN_IDLE_TTL_MS } from "./lib/lifetimes";
 import {
-  CLIENT_ID, ClientName, GithubTokenRequest, githubTokenOutsideGrant, githubTokenOwners, Grant, grantWildcardLogins, inGrantList, ownerLookups, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
+  CLIENT_ID, ClientName, GithubTokenRequest, githubTokenOutsideGrant, githubTokenOwners, Grant, grantBoundIds, grantWildcardLogins, inGrantList, ownerLookups, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
   parseLabelFilters, tokenHash,
 } from "./lib/clients";
 import type { ClientScope } from "./do/catalog";
@@ -1089,9 +1089,6 @@ export const ROUTES: Route[] = [
     const app = self.grant.github ? await githubAppOf(c.env) : null;
     return { ...view, ...(app ? { github_app: app } : {}) };
   } }),
-  // Which of these repos its grant covers (docs/control-plane/api/clients/#owner-wide-entries), as nest
-  // decides it: an exact entry, or an owner-wide one whose account GitHub says owns the repo. So a client
-  // needn't copy the matching. `push`: `repos`; `read`: `repos` or `read_repos`; `github`: `github.repos`.
   // The repos its grant covers that nest can list (docs/control-plane/api/clients/#owner-wide-entries):
   // every exact entry, and for each owner-wide entry the repos of that account the App's installation
   // reaches (an account the App isn't on can't be listed: `unlisted`). Each with what it may do there.
@@ -1127,13 +1124,16 @@ export const ROUTES: Route[] = [
       };
     },
   }),
+  // Which of these repos its grant covers (docs/control-plane/api/clients/#owner-wide-entries), as nest
+  // decides it: an exact entry, or an owner-wide one whose account GitHub says owns the repo. So a client
+  // needn't copy the matching. `push`: `repos`; `read`: `repos` or `read_repos`; `github`: `github.repos`.
   route({
     method: "POST", path: "/v1/clients/self/grant/repos", auth: "owner", body: z.strictObject({ repos: z.array(Repo).min(1).max(100) }),
     run: async (c) => {
       const self = selfClient(c);
       const g = self.grant;
       const need = ownerLookups(g, c.body.repos);
-      const owners = need.length ? await newMethod("BrokerDO.repoOwners", () => broker(c.env).repoOwners(need)) : {};
+      const owners = need.length ? await newMethod("BrokerDO.repoOwners", () => broker(c.env).repoOwners(need, grantBoundIds(g), self.client)) : {};
       return {
         repos: canonicalRepos(c.body.repos).map((repo) => ({
           repo,
