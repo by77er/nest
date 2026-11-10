@@ -79,6 +79,10 @@ struct FakeDriver {
     resume_latch: Arc<ResumeLatch>,
     /// The same for `pause`: held, a VM's pause waits (after the caller's fence check).
     pause_latch: Arc<ResumeLatch>,
+    /// The same for `stop`: held, a VM's stop waits.
+    stop_latch: Arc<ResumeLatch>,
+    /// The same for the lock-free pauser's `pause`.
+    pauser_latch: Arc<ResumeLatch>,
     /// The driver says a pause doesn't stop every write to the disk (`pause_quiesces_disk`).
     leaky_pause: Arc<AtomicBool>,
     /// Memory snapshots are offered, and each one's file can't be read (a failed snapshot).
@@ -117,6 +121,8 @@ impl Driver for FakeDriver {
             live: self.live.clone(),
             resume_latch: self.resume_latch.clone(),
             pause_latch: self.pause_latch.clone(),
+            stop_latch: self.stop_latch.clone(),
+            pauser_latch: self.pauser_latch.clone(),
             failing_memory_snapshots: self.failing_memory_snapshots.clone(),
             vm_ops: self.vm_ops.clone(),
             guest_gate: self.guest_gate.clone(),
@@ -140,6 +146,10 @@ struct FakeVm {
     resume_latch: Arc<ResumeLatch>,
     /// The same for `pause`: held, a VM's pause waits (after the caller's fence check).
     pause_latch: Arc<ResumeLatch>,
+    /// The same for `stop`: held, a VM's stop waits.
+    stop_latch: Arc<ResumeLatch>,
+    /// The same for the lock-free pauser's `pause`.
+    pauser_latch: Arc<ResumeLatch>,
     failing_memory_snapshots: Arc<AtomicBool>,
     vm_ops: Arc<Mutex<Vec<String>>>,
     guest_gate: Arc<Mutex<bool>>,
@@ -149,11 +159,16 @@ struct FakeVm {
 }
 
 /// The lock-free pauser: each pause is recorded, and in the VM's ops as `pauser <sandbox>`.
-struct FakePauser(Arc<Mutex<Vec<(String, u64)>>>, String, u64, Arc<Mutex<Vec<String>>>);
+struct FakePauser(Arc<Mutex<Vec<(String, u64)>>>, String, u64, Arc<Mutex<Vec<String>>>, Arc<ResumeLatch>);
 
 #[async_trait]
 impl nestd::driver::Pauser for FakePauser {
     async fn pause(&self) -> std::io::Result<()> {
+        if self.4.held.load(Ordering::SeqCst) {
+            let released = self.4.release.notified();
+            self.4.reached.store(true, Ordering::SeqCst);
+            released.await;
+        }
         self.0.lock().unwrap().push((self.1.clone(), self.2));
         self.3.lock().unwrap().push(format!("pauser {}", self.1));
         Ok(())
@@ -163,7 +178,7 @@ impl nestd::driver::Pauser for FakePauser {
 #[async_trait]
 impl Vm for FakeVm {
     fn pauser(&self) -> Option<Arc<dyn nestd::driver::Pauser>> {
-        Some(Arc::new(FakePauser(self.paused.clone(), self.spec.sandbox.0.clone(), self.spec.epoch.0, self.vm_ops.clone())))
+        Some(Arc::new(FakePauser(self.paused.clone(), self.spec.sandbox.0.clone(), self.spec.epoch.0, self.vm_ops.clone(), self.pauser_latch.clone())))
     }
     fn vsock_uds_path(&self) -> PathBuf {
         self.spec.vm_dir.join("vsock.sock")
@@ -221,6 +236,11 @@ impl Vm for FakeVm {
         Ok(None)
     }
     async fn stop(&mut self) -> std::io::Result<()> {
+        if self.stop_latch.held.load(Ordering::SeqCst) {
+            let released = self.stop_latch.release.notified();
+            self.stop_latch.reached.store(true, Ordering::SeqCst);
+            released.await;
+        }
         self.stopped.lock().unwrap().push(self.spec.sandbox.0.clone());
         if std::mem::take(&mut self.running) {
             self.live.fetch_sub(1, Ordering::SeqCst);
@@ -2201,6 +2221,66 @@ async fn a_fence_during_a_checkpoints_resume_freezes_the_vm_again() {
     let ops = h.vm.vm_ops.lock().unwrap().clone();
     let resumed = ops.iter().rposition(|o| o == "resume sbx_1").expect("resumed");
     assert!(ops[resumed + 1..].iter().any(|o| o == "pauser sbx_1"), "frozen again after the resume: {ops:?}");
+}
+
+/// The same race at each of the two checkpoints (the one that reads the disk in the pause, and the
+/// one that cuts it): once the checkpoint has frozen the fenced VM again, the lifecycle machine
+/// holds that VM paused by the fence, not running. The fence's stop of the VM is held, so the
+/// machine is read between the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_machine_sees_a_fenced_vm_frozen_again_after_each_checkpoints_resume() {
+    for cutting in [false, true] {
+        let h = if cutting { start_host_cutting().await } else { start_host().await };
+        let sbx = SandboxId("sbx_1".into());
+        h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+        assert!(is_ok(&h.fleet.result("cmd_create").await));
+        assert_eq!(h._host.inner.lifecycle_vm(&sbx).as_deref(), Some("Running"));
+        h.vm.resume_latch.held.store(true, Ordering::SeqCst);
+        h.vm.stop_latch.held.store(true, Ordering::SeqCst);
+        h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+        wait_until("the checkpoint resumes its VM", || h.vm.resume_latch.reached.load(Ordering::SeqCst)).await;
+        h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
+        h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+        wait_until("the fence's lock-free pause ran", || h.vm.paused.lock().unwrap().contains(&("sbx_1".to_string(), 1))).await;
+        h.vm.resume_latch.held.store(false, Ordering::SeqCst);
+        h.vm.resume_latch.release.notify_waiters();
+        // The fence's task has the sandbox once the checkpoint lets go of it: its stop waits here.
+        wait_until("the fence stops the VM", || h.vm.stop_latch.reached.load(Ordering::SeqCst)).await;
+        let ops = h.vm.vm_ops.lock().unwrap().clone();
+        let resumed = ops.iter().rposition(|o| o == "resume sbx_1").expect("resumed");
+        assert!(ops[resumed + 1..].iter().any(|o| o == "pauser sbx_1"), "cutting={cutting}: frozen again after the resume: {ops:?}");
+        assert_eq!(h._host.inner.lifecycle_vm(&sbx).as_deref(), Some("Paused(Fence)"), "cutting={cutting}: the machine's view of the fenced VM");
+        h.vm.stop_latch.held.store(false, Ordering::SeqCst);
+        h.vm.stop_latch.release.notify_waiters();
+        wait_until("the VM is stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
+        wait_until("the machine sees it gone", || h._host.inner.lifecycle_vm(&sbx).as_deref() == Some("Absent")).await;
+    }
+}
+
+/// A fence's lock-free pause that ends late, after its incarnation was destroyed and the sandbox
+/// created again at the same epoch, is not the new incarnation's: the lifecycle machine still
+/// holds the new VM running, and a checkpoint of it agrees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fences_late_pause_is_not_fed_to_a_later_row_of_the_same_epoch() {
+    let h = start_host().await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    h.vm.pauser_latch.held.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "test".into() })]).unwrap();
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    wait_until("the fence's lock-free pause began", || h.vm.pauser_latch.reached.load(Ordering::SeqCst)).await;
+    h.fleet.commands.send(vec![cmd("cmd_destroy", CommandBody::SandboxDestroy { sandbox: sbx.clone(), epoch: Epoch(1) })]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_destroy").await));
+    h.fleet.commands.send(vec![create("cmd_again", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_again").await), "created again at the same epoch");
+    assert_eq!(h._host.inner.lifecycle_vm(&sbx).as_deref(), Some("Running"));
+    h.vm.pauser_latch.held.store(false, Ordering::SeqCst);
+    h.vm.pauser_latch.release.notify_waiters();
+    wait_until("the old incarnation's pause ended", || h.vm.paused.lock().unwrap().contains(&("sbx_1".to_string(), 1))).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(h._host.inner.lifecycle_vm(&sbx).as_deref(), Some("Running"), "the new incarnation's VM, as the machine sees it");
+    checkpoint(&h.fleet, "cmd_ck", "sbx_1", 1).await;
 }
 
 /// A fence that lands after a checkpoint's fence check and before its pause of the VM (the read of
