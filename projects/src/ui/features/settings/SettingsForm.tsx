@@ -49,7 +49,6 @@ export function ModelField({ label, description, value, onChange, error }: { lab
           value={value}
           onChange={(e) => onChange(e.currentTarget.value.trim())}
           error={value && problem ? `A model id is ${problem}` : error}
-          ff="monospace"
         />
       )}
     </FieldGroup>
