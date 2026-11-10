@@ -87,7 +87,7 @@ pub fn refusal(pid: i32, start: u64, own: i32, guest_start: u64, table: &BTreeMa
     }
     let mut seen = BTreeSet::from([own]);
     let mut p = own;
-    while let Some(parent) = table.get(&p).map(|s| s.ppid).filter(|pp| *pp > 0 && seen.insert(*pp)) {
+    while let Some(parent) = table.get(&p).map(|s| s.ppid).filter(|pp| seen.insert(*pp)) {
         if parent == pid {
             return Some("an ancestor of nestd");
         }
