@@ -74,11 +74,35 @@ export function useRetryAttach(id: string) {
   });
 }
 
+/** The owner's Restart of the manager (README.md#the-manager-lifecycle): the chat and the status move. */
+export function useRestartManager(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.restartManager(id),
+    meta: { failure: "The manager wasn't restarted" },
+    onSettled: () => Promise.all([
+      qc.invalidateQueries({ queryKey: keys.manager(id) }), qc.invalidateQueries({ queryKey: keys.project(id), exact: true }), qc.invalidateQueries({ queryKey: keys.chat(id) }),
+    ]),
+  });
+}
+
 /** What waits on the owner: open asks and blocked tasks, oldest first (README.md#blocked). */
 /** The manager's pending waits (and the last few that ended): polled, since their deadlines run down. */
 export const useWaits = (id: string) => useQuery({ queryKey: ["projects", id, "waits"], queryFn: () => api.waits(id), refetchInterval: POLL.manager });
 
 /** The Network page: polled while changes reach the live agents. */
+/** A stop nest refused, tried again or dismissed by the owner (README.md#outboxes): the Network page and the board move. */
+function useStopWrite<R>(id: string, fn: (agent: string) => Promise<R>, failure: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: fn,
+    meta: { failure },
+    onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: ["projects", id, "network"] }), qc.invalidateQueries({ queryKey: keys.tasks(id) })]),
+  });
+}
+export const useRetryStop = (id: string) => useStopWrite(id, (agent: string) => api.retryStop(id, agent), "The stop wasn't tried again");
+export const useDismissStop = (id: string) => useStopWrite(id, (agent: string) => api.dismissStop(id, agent), "The stop wasn't dismissed");
+
 export const useNetwork = (id: string) =>
   useQuery({ queryKey: ["projects", id, "network"], queryFn: () => api.network(id), refetchInterval: (q) => (q.state.data?.agents.some((a) => a.state === "pending") ? 3_000 : POLL.manager) });
 
@@ -316,22 +340,36 @@ export function useReorderTask(id: string) {
 }
 
 /** Say something to the manager: shown at once as not yet delivered, then as the Worker logged it. */
+/**
+ * Post a chat message under the page's request id for it (README.md#outboxes): posting it again after an
+ * answer lost on the way back is the same message, never a second one.
+ */
 export function usePostChat(id: string) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (text: string) => api.postChat(id, { text }),
+    mutationFn: (v: { text: string; request_id: string }) => api.postChat(id, v),
     // No toast: a message that isn't taken stays in the log, not delivered, with Retry.
     meta: { inline: true },
-    onMutate: async (text) => {
+    onMutate: async ({ text }) => {
       await qc.cancelQueries({ queryKey: keys.chat(id) });
       const before = qc.getQueryData<ChatMessage[]>(keys.chat(id));
-      const pending: ChatMessage = { seq: -Date.now(), at_ms: Date.now(), sender: "owner", text, delivered: false, error: null };
+      const pending: ChatMessage = { seq: -Date.now(), at_ms: Date.now(), sender: "owner", text, delivered: false, status: "owed", error: null };
       qc.setQueryData<ChatMessage[]>(keys.chat(id), (old) => [...(old ?? []), pending]);
       return { before };
     },
     onError: (_e, _v, ctx) => {
       if (ctx?.before) qc.setQueryData(keys.chat(id), ctx.before);
     },
+    onSettled: () => qc.invalidateQueries({ queryKey: keys.chat(id) }),
+  });
+}
+
+/** Send again a message nest refused for good (only a failed one changes: asking twice sends once). */
+export function useRetryChat(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (seq: number) => api.retryChat(id, seq),
+    meta: { failure: "The message wasn't sent again" },
     onSettled: () => qc.invalidateQueries({ queryKey: keys.chat(id) }),
   });
 }

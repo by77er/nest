@@ -82,7 +82,7 @@ export class FakeNest {
   jwks: { keys: unknown[] } = { keys: [] };
   jwksFetches = 0;
   /** Failures to answer, in order, for calls whose `METHOD path` matches. */
-  failures: { match: RegExp; status: number; retryable?: boolean; times: number }[] = [];
+  failures: { match: RegExp; status: number; retryable?: boolean; times: number; page?: boolean }[] = [];
   /** Play a control plane from before the push opt-in was in the client layer (nest #157). */
   layerWithoutPush = false;
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
@@ -111,8 +111,9 @@ export class FakeNest {
     return full;
   }
 
-  fail(match: RegExp, status: number, o: { retryable?: boolean; times?: number } = {}): void {
-    this.failures.push({ match, status, retryable: o.retryable, times: o.times ?? 1 });
+  /** Answer calls matching `METHOD path` with an error: nest's JSON one, or (`page`) a page that isn't nest's (an edge's, Access's). */
+  fail(match: RegExp, status: number, o: { retryable?: boolean; times?: number; page?: boolean } = {}): void {
+    this.failures.push({ match, status, retryable: o.retryable, times: o.times ?? 1, page: o.page });
   }
 
   callsTo(method: string, path: RegExp): Call[] {
@@ -143,6 +144,7 @@ export class FakeNest {
     const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
     if (f) {
       f.times--;
+      if (f.page) return new Response("<html><body>Forbidden</body></html>", { status: f.status, headers: { "content-type": "text/html" } });
       return nestErr(f.status, f.status === 503 ? "internal" : "refused", "injected", f.retryable ?? false);
     }
     if (route !== "POST /v1/sandboxes" && route !== "POST /v1/agents") return this.route(req, u, call);
@@ -331,14 +333,21 @@ export class FakeNest {
         return json(200, { interrupted: a.ended ? "none" : "turn" });
       }
       if (req.method === "POST" && sub === "/stop") {
-        a.ended = !!call.body?.end;
-        if (a.ended && call.body?.destroy_sandbox && a.sandbox) this.sandboxes.get(a.sandbox)!.ended = true;
+        // As nest: a stop of an agent that ended already destroys no sandbox.
+        const was = a.ended;
+        a.ended = !!call.body?.end || was;
+        if (!was && a.ended && call.body?.destroy_sandbox && a.sandbox) this.sandboxes.get(a.sandbox)!.ended = true;
         return json(200, { status: "stopped" });
       }
       if (req.method === "POST" && (m = sub.match(/^\/asks\/(ask_[A-Za-z0-9]+)\/answer$/))) {
         this.answers.push({ agent: a.agent, ask: m[1]!, answer: call.body.answer });
         return json(200, { delivered: true });
       }
+    }
+    if (req.method === "DELETE" && (m = u.pathname.match(/^\/v1\/catalog\/(templates|capabilities)\/([a-z][a-z0-9-]+)\/([a-z][a-z0-9-]*)$/))) {
+      if (m[2] !== "projects") return nestErr(403, "forbidden", `${m[2]} is not your namespace (projects)`);
+      this.catalog.delete(`${m[1]}/${m[2]}/${m[3]}`);
+      return json(200, { ok: true });
     }
     if (req.method === "PUT" && (m = u.pathname.match(/^\/v1\/catalog\/(templates|capabilities)\/([a-z][a-z0-9-]+)\/([a-z][a-z0-9-]*)$/))) {
       if (m[2] !== "projects") return nestErr(403, "forbidden", `${m[2]} is not your namespace (projects)`);
@@ -540,6 +549,8 @@ export interface FakePull {
   ref: string;
   /** The head's repo; null: a fork GitHub no longer names. */
   headRepo: string | null;
+  /** GitHub's `updated_at` for it, when the test gives one. */
+  updated_at?: string;
 }
 
 export interface FakeCheckRun {
@@ -745,6 +756,7 @@ export class FakeGitHub {
       const view = (p: FakePull) => ({
         number: p.number, title: p.title, state: p.state, merged: p.merged, merged_at: p.merged ? "2026-11-02T00:00:00Z" : null, node_id: prNode(repoName, p.number),
         head: { ref: p.ref, repo: p.headRepo === null ? null : { full_name: p.headRepo } }, html_url: `https://github.com/${repoName}/pull/${p.number}`,
+        ...(p.updated_at ? { updated_at: p.updated_at } : {}),
       });
       const mine = [...(this.pulls.get(repoName)?.values() ?? [])];
       if (sub === "/pulls") return json(200, mine.filter((p) => p.state === "open").map(view));

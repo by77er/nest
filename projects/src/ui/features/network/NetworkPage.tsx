@@ -20,6 +20,7 @@ import { useNetwork, useSetNetwork } from "../../api/queries";
 import type { EgressRule, LayerStatus, NetworkView, RoleRules } from "../../api/types";
 import { ErrorState, icon, LoadingState, Measure, MetaItem, MetaRow, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
 import { LiveAgents } from "../project/LiveAgents";
+import { FailedStops } from "./FailedStops";
 import { ProjectFrame } from "../project/ProjectFrame";
 
 const ROLE: Record<NetworkRole, { title: string; description: string }> = {
@@ -330,6 +331,7 @@ export function NetworkPage() {
             <ErrorState title="The network rules couldn't be loaded" error={net.error} onRetry={() => void net.refetch()} />
           ) : (
             <Stack gap="2xl">
+              <FailedStops projectId={projectId} stops={net.data.failed_stops ?? []} />
               <Measure type="reading">
                 <Stack gap="md">
                   <Text fz="md">

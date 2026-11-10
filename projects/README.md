@@ -133,6 +133,122 @@ The owner's request (2026-11-06): a task's state, its worker, its PRs and the co
   - Everything else that names the draft goes in the same step: tasks waiting on it stop waiting (noted on each), its own dependencies, detached PR rows, and the manager's waits on it. A draft never had a worker, so it has no queued changes or comments to leak.
   - An issue it was made of returns to triage, to be accepted or declined afresh.
 
+## Outboxes
+
+The owner's request (2026-11-06): the app's retry queues as one machine, so each shows its real state and treats a failure the same way.
+
+- **One pure function,** `outboxStep(row, event)` in `src/outbox.ts`, over each queue's `next_ms`, `attempts` and `error`.
+  - **States:**
+    - `owed`: not tried yet;
+    - `retrying`: tried, or waiting for something it needs, and due again;
+    - `failed`: refused for good, or out of attempts; shown, and tried again only when asked;
+    - `done`.
+  - **Events:**
+    - `sent`;
+    - `failed`, transient or permanent by one verdict (`verdict`: nest's or GitHub's refusal that will repeat);
+    - `wait`: nothing to send it to yet; due again, never counted, never failed;
+    - `retry`: only a failed row changes, so asking twice sends once.
+  - **Pruning by age** (`pruneBefore`). Tested on its own, with a seeded random walk (`test/outbox.test.ts`).
+- **The queues on it:**
+
+  | Queue | On failure | Kept once ended |
+  |---|---|---|
+  | `chat` (the owner's messages to the manager) | permanent: failed, with Retry | always (it's the log) |
+  | `messages` (to agents) | permanent: failed | a week from when it was sent or failed |
+  | `stops` (ending agents) | retried until it goes, except nest's own refusal (failed stops, below) | never once failed: kept until resolved |
+  | `issue_closes` | permanent: failed; tried again on the owner's retry or a grant gaining `issues: write` | always (the task's record) |
+  | client `layers` | permanent: failed, shown on the Network page | while the agent lives |
+
+  Stops used to retry everything forever. ReviewDO's `check_updates` and `ended` aren't on the machine yet (a follow-up).
+- **Failed stops.** A failed stop may leave an agent running, with its sandbox and its credentials, so it's never quiet.
+  - **Only a real refusal fails a stop.** That's nest's own refusal of the request, in its JSON error body (400, 409; `stopRefused`). An auth failure (401, 403), or a page that isn't nest's (a proxy's, Access's), may pass, so it's retried.
+  - **A failed stop is shown everywhere it matters:**
+    - in its task's history (`stop_failed`);
+    - on the Network page, with **Retry stop** (`POST /api/projects/:id/stops/:agent/retry`) and **Dismiss** (`DELETE …/stops/:agent`, confirmed);
+    - in a message to the manager;
+    - among the project's errors.
+  - **Its place stays counted** toward `max_workers` until the stop goes, the owner dismisses it, or nest's `agent.exited` says the agent ended. Any agent's exit counts here: a worker's, a routine run's or a manager's.
+  - **A failed stop is never pruned.** Its agent may still be running.
+  - **Nothing in it is due before the owner acts.** Its next try is set to never, so the alarm never spins on it.
+  - **Nothing is said for an agent that exited during the refused try.** Its stop is gone already, so there's no notice and no row.
+  - **The Network page names what each one was for:** its task, by title; its routine, by name; and why it was stopped, in words ("A routine run timed out").
+- **The chat (B9).**
+  - **States.** Each message carries `status` (`ChatMessage.status`). A message waiting for the manager, or retried after an outage, reads "Sending…" or "Retrying…" with why. Only a failed one reads "Not delivered", with Retry.
+  - **Retry.**
+    - On a failed message, Retry is `POST /api/projects/:id/chat/:seq/retry`, which leaves any message that isn't failed as it is.
+    - On a message the page never had an answer for, Retry posts it again under the same `request_id`, the page's id for that message (`POST …/chat {text, request_id}`). The Worker keeps request ids (`chat_request`), so a post whose answer was lost is one message, not two.
+- **One-off cleanup.** The same migration drops PR rows whose task is gone, which deleting a draft left before [the task machine](#the-task-machine). Nothing updates them now, and a PR in one couldn't be attached again.
+
+## The manager lifecycle
+
+The owner's request (2026-11-06), after the state-machine sweep (B11): a manager that ended used to stay the project's manager, with its brief and the owner's chat retried against a dead inbox.
+
+- **A pure step,** `managerStep` in `src/manager.ts`. ProjectDO applies it in one step (`managerMove`), and nothing else writes these settings.
+  - It works over the manager's agent, when a start is due, the recent automatic restarts (`settings.manager_restarts`), and why it isn't running.
+- **Ended: replaced by itself, up to a cap.** The manager counts as ended when:
+  - nest's `agent.exited` arrives for it;
+  - the Manager page's read of nest finds it ended or gone, so a missed exit still counts;
+  - its brief is refused for good after it was made (404, 409, 410).
+
+  A new one starts with backoff, up to 3 times an hour (`MANAGER_RESTARTS`). Past that, nothing is started: the page shows it ended, and the owner restarts it.
+- **The replaced manager:**
+  - its sandbox is destroyed: a stop is owed (`manager replaced`), which ends the agent and then destroys its sandbox through the sandbox API, since stopping an agent that already ended destroys nothing. Its successor starts only once that stop has been tried. With nest refusing it for good, the successor starts anyway (the stop is failed, shown on the Network page);
+  - its pending waits end, unannounced, since the new one never made them;
+  - the next start gets a start number of its own, so its creates' keys aren't the old one's;
+  - if it exits by itself while that stop is still owed (or failed), the stop stays owed until its sandbox is gone;
+  - **it loses its voice:** only the current manager's turns are recorded as the manager's chat, and an ask from a manager that isn't current is labelled "The previous manager" in "Needs you" (its question shown as plain text);
+  - **it loses the board:** the board's tools answer only `settings.manager`. A replaced manager still holds its token and labels for a while (its stop owed, or refused), and gets 403.
+- **A start is of one generation.** `manager_starts` as read when it began. Every move bumps it (an exit, the owner's Restart), so a start that lands after one is stale:
+  - an agent it made goes;
+  - its final write (manager started, nothing owed) applies only to its own generation;
+  - an exit during its brief, or a second Restart, leaves that move's start owed.
+- **The owner's Restart** (`POST /api/projects/:id/manager/restart`; **Restart manager** on the page when it ended or errored) stops the current manager and starts a new one now. Asking while one is already starting changes nothing.
+- **Chat during a restart.** The owner's chat messages wait for a manager ("Retrying…"), and go as soon as one has started. Each change is noted in the chat. While the manager has ended or errored, the composer offers no Stop; on a phone, where the page's notice scrolls away, it also says so ("The manager isn't running", with Restart manager).
+- An exit of a manager that isn't the current one changes nothing.
+
+## Models
+
+The owner's request (2026-11-09): "allow me to select the model for the manager and the workers. Default manager = Fable 5.2, worker = Opus 5.5."
+
+- **Two settings per project,** `manager_model` and `worker_model` (`PATCH /api/projects/:id/settings`; the Models panel in Settings).
+  - **Defaults:** the manager on `claude-fable-5-2`, workers on `claude-opus-5-5` (`DEFAULT_MODEL` in `src/models.ts`). A project made before this reads as the defaults.
+  - **Offered by name:** Fable 5.2, Opus 5.5, Sonnet 5.5 (`claude-sonnet-5-5`), Haiku 5.5 (`claude-haiku-5-5`), and **Custom**: any id or alias Claude Code's `--model` takes.
+  - **A model id is one argument of a command,** so it's letters, digits and `. _ : @ / [ ] -`, starting with a letter or digit (never `-`, which would read as an option), at most 100 characters. Checked in the form, the API and ProjectDO.
+- **Through nest's generic interface only.** A client's spawn can't override a template's launch (nest answers 400: a different launch is a template in the client's namespace, [clients](../docs/control-plane/api/clients/)). So each choice is a template of the app's own:
+  - `projects/<role>-<project>-<model>` (`modelTemplateEntry`), the role's template with `launch.model` (which nest passes to Claude Code as `--model`, [runner](../docs/agents/runner/)) and only that project's repo.
+  - An id that isn't already a legal entry name (capitals, dots, brackets, too long) is cut down and ends `--<hash of the whole id>`. A plain id never holds `--`, so no plain id can take a hashed id's template. Two hashed ids would share one only if their 32-bit hashes collided, which the owner's own typing won't arrange.
+  - ProjectDO writes it before each start that names it (`templateFor`): the same body every time, so writing it again changes nothing.
+- **Stale templates are cleaned up** (`sweepModelTemplates`, from the alarm). The project records each template it writes and the template each agent started from.
+  - One is deleted from nest's catalog (`DELETE /v1/catalog/templates/projects/<entry>`) once it's neither the role's current setting nor the template a live agent started from. Whether nest reads a live agent's template again is unverified, so it's kept while that agent lives.
+  - Nothing is swept while a start is owed, since it may be about to name one. A delete nest can't take is tried again at the next sweep.
+  - A project that's gone (a create that couldn't be finished) takes all of its with it.
+- **A change applies to the next start.** A start freezes its model with its attempt (`start_specs`), so its retries name the same template under the same idempotency keys.
+  - Workers started after the change run on the new model; running ones keep theirs.
+  - The manager keeps its model until it next starts: **Restart manager**, or its replacement after it ends ([the manager lifecycle](#the-manager-lifecycle)).
+  - A start frozen before this release has no model: it keeps the role's shared template (`projects/manager`, `projects/worker`), which now carry the defaults.
+- **Reviewers and routine runs are unchanged:** their templates name no model, so they run on nest's and Claude Code's default. Choosing theirs is a later setting if it's wanted.
+- nest doesn't check that a model exists or that the credential may use it (`LaunchConfig.model` is any string). How a wrong id shows (Claude Code failing its first turn, so nest's `agent.error` among the project's errors) is unverified.
+
+## Creating a project
+
+The owner's request (2026-11-06), after the sweep (B10): creating a project used to be four awaited steps. A failure after the first left a project that answered 404, with its repo taken.
+
+- **A recoverable sequence** (`src/creation.ts`, DirectoryDO):
+  1. The directory row is created **pending**, holding the create's body.
+  2. `finishProject` runs, and each of its steps is idempotent: the catalog sync (whose failure doesn't stop it), `ReviewDO.init`, then `ProjectDO.init`.
+  3. The row is marked **ready**, and the project's first drain runs (its own alarm retries what fails there).
+- **Pending.**
+  - The project's routes answer 503 ("still being created").
+  - The list shows it "Being created", with nothing to open.
+  - GitHub's events for its repo reach nothing.
+  - The same repo asked for again resumes it rather than being refused.
+- **Resumed by the alarm.**
+  - If the Worker's request fails or dies, DirectoryDO's alarm resumes the create: after a minute, then with backoff, as an outbox row (`src/outbox.ts`).
+  - A create that can't be finished (8 attempts, or a body that can't be read) is removed, and its repo is free again.
+- **A project's object acts only once DirectoryDO lists it ready** (`settings.listed_ms`, asked until it does):
+  - while the create is pending, its alarm checks again every 30 s and nothing is drained;
+  - one removed (its `init` succeeded, the rest didn't) leaves its object inert, its settings gone: no attach, no manager.
+
 ## Not decided here
 
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.
@@ -271,6 +387,11 @@ The owner's request (2026-11-03): "PRs should be attachable to tasks."
 - **Done:** a task is done once at least one PR is attached and every attached one has merged (`prsDone` in `src/tasks.ts`). Merging one of several leaves it in review. A PR closed without merging is detached with a note, and the task is done if the rest have merged; the last open one leaving with none merged takes the task out of review ([the task machine](#the-task-machine)). A merge moves any task that isn't over, since a PR may be attached to a task with no worker. A ready or stalled task may hold an open PR; it isn't marked done by hand while it does.
 - **Review and auto-merge:** every PR is reviewed already. With auto-merge on, every attached PR gets it: the owner's, the manager's, the worker's or the branch's, but only once GitHub has said it's from the repo itself and given its node id. A fork's PR never gets it, and neither does one whose head repo GitHub no longer names.
 - **The live worker is told** when PRs are attached or detached ([task changes](#task-changes)).
+- **GitHub's order, not its delivery's** (B7). GitHub doesn't order its deliveries, so ProjectDO keeps each PR's latest `updated_at`, whether attached or not (`pr_facts`).
+  - An `opened` or `closed` older than what's recorded is stale, and ignored.
+  - Within the same second (GitHub's resolution), the actions' own order decides: an `opened` can't follow a close, a `reopened` can, and a close follows either.
+  - A merged PR's `closed` arriving before its `opened` therefore leaves the late `opened` attaching nothing.
+  - An attach is refused for a PR GitHub has said is closed, which covers an attach that raced its merge. The owner's attach records what its own read of GitHub said, so a reopened PR attaches.
 
 ## PR comments
 
@@ -305,6 +426,9 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
   - **A merged PR, a closed or detached one, or a task that's over:** the comment is dropped and recorded on the task (`pr_comment_dropped`, with why). A comment after the work is over is the owner's to raise with the manager in chat; sending it on would restart work no one asked to restart.
   - Comments still queued are dropped (recorded) when the task ends, its worker's start fails, or the worker exits before its brief: never kept for a later worker.
 - Each delivery is recorded on the task (`pr_comment`, `revise`).
+- **Once per comment** (B6), by its own key (its kind and URL, `comments_seen`, kept 30 days). It's claimed where it's decided to act on it (deliver, queue, restart, or drop it on the record), in that step.
+  - A delivery handled again acts once: its claim was released after a later step failed, or lapsed, or it came under a new delivery id. So it never sends twice, queues twice, or starts a second worker.
+  - One with no task yet (its PR's `opened` not seen) isn't claimed, so its redelivery after can act.
 - **Open:** route GitHub's events by `repository.id` and the installation id recorded at attach, not by `full_name`, so a renamed namespace that someone registers again can't reach the project (a follow-up).
 
 ## Triage

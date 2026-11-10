@@ -6,7 +6,7 @@ import type { TraceEvent } from "../trace/model";
 import { finishedTurns, GROUP_GAP_MS, groupLog, liveTurn, quote, stepsBySeq } from "./model";
 
 const NOW = new Date(2026, 10, 2, 15, 0).getTime();
-const msg = (seq: number, sender: string, at_ms: number): ChatMessage => ({ seq, at_ms, sender, text: `m${seq}`, delivered: true, error: null });
+const msg = (seq: number, sender: string, at_ms: number): ChatMessage => ({ seq, at_ms, sender, text: `m${seq}`, delivered: true, status: "done" as const, error: null });
 
 describe("groupLog", () => {
   it("groups an author's messages within five minutes, and starts a new group past that or for another author", () => {
@@ -62,7 +62,7 @@ describe("liveTurn", () => {
 describe("finishedTurns and stepsBySeq", () => {
   let seq = 100;
   const ev = (type: string, turn: string | undefined, more: Record<string, unknown> = {}) => ({ seq: ++seq, ts_ms: NOW, type, turn, ...more }) as unknown as TraceEvent;
-  const reply = (s: number, text: string): ChatMessage => ({ seq: s, at_ms: NOW, sender: "manager", text, delivered: true, error: null });
+  const reply = (s: number, text: string): ChatMessage => ({ seq: s, at_ms: NOW, sender: "manager", text, delivered: true, status: "done" as const, error: null });
 
   it("pairs a finished turn with the message saying its reply (its last text); everything else it did is behind it, a call it never answered stopped", () => {
     const turns = finishedTurns([

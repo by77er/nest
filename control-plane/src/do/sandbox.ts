@@ -6,13 +6,14 @@
 // from a copy loaded before an await. Mutations go through `update()`, which loads, applies and
 // saves synchronously.
 import { DurableObject } from "cloudflare:workers";
+import { PLACE_REFUSED_RETRY, retryAfter } from "../lib/retry";
 import { z } from "zod";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { num, type Env } from "../env";
 import { Deadlines } from "../lib/reliable";
 import { splitDomain } from "../lib/cloudflare";
 import { signShare } from "../lib/tokens";
-import { asNestError, compatWorkstream, hex, NestError, newId, sha256 } from "../lib/util";
+import { asNestError, clip, compatWorkstream, hex, NestError, newId, sha256 } from "../lib/util";
 import * as lease from "../lib/sandbox-lease";
 import * as slots from "../lib/slots";
 import { addColumn, storedEnum } from "../lib/stored";
@@ -109,6 +110,27 @@ const accessKey = (a: { push: string[]; read: string[]; workflows?: boolean; inj
   `${a.push.join()}|${a.read.join()}${a.workflows ? "|workflows" : ""}${a.inject?.length ? `|${JSON.stringify(a.inject)}` : ""}`;
 
 /** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
+/** FleetDO refused this sandbox's placements: how often since the last success, why, and whether it gave up. */
+export interface PlacementRefused {
+  count: number;
+  first_ms: number;
+  last_ms: number;
+  reason: string;
+  /** No more automatic tries: an operator's `POST /v1/sandboxes/<id>/place` places it. */
+  gave_up: boolean;
+}
+const PLACEMENT_REFUSED_KEY = "placement_refused";
+/** When it failed and as which incarnation (`lease.FailedSince`), for the release's grace. */
+const FAILED_SINCE_KEY = "failed_since";
+/** Why a sandbox waiting for a host gets none (FleetDO's `launchPause`), and since when it was noted. */
+export interface PlacementWait {
+  reason: string;
+  /** When the next launch may be tried. */
+  until_ms: number;
+  ms: number;
+}
+const PLACEMENT_WAIT_KEY = "placement_wait";
+
 export interface SandboxInfo extends lease.Lease, slots.Slots {
   sandbox: string;
   /**
@@ -476,10 +498,33 @@ export class SandboxDO extends DurableObject<Env> {
     return this.view();
   }
 
-  /** The record as the API shows it: without the compat `workstream`. */
-  private view(): SandboxInfo {
+  /**
+   * The record as the API shows it: without the compat `workstream`, and, while it isn't placed, why:
+   * `placement_wait` (launches paused by the cell's enrolment breakers) and `placement_refused`
+   * (placements FleetDO refused because the leases disagree: retried, or given up).
+   */
+  private view(): SandboxInfo & { placement_wait?: PlacementWait; placement_refused?: PlacementRefused } {
     const { workstream: _, ...info } = this.info_();
-    return { ...info, labels: info.labels ?? {} };
+    const wait = !info.host ? this.get<PlacementWait>(PLACEMENT_WAIT_KEY) : undefined;
+    const refused = !info.host ? this.get<PlacementRefused>(PLACEMENT_REFUSED_KEY) : undefined;
+    return { ...info, labels: info.labels ?? {}, ...(wait ? { placement_wait: wait } : {}), ...(refused ? { placement_refused: refused } : {}) };
+  }
+
+  /**
+   * No host had room: whether FleetDO is launching one at all. While every instance type it would launch
+   * has its enrolment breaker open, the reason is kept for the API and for `resolve`'s refusal; anything
+   * else clears it. Best effort: a FleetDO that can't say (one of the previous release) leaves none.
+   */
+  private async notePlacementWait(cell: string): Promise<void> {
+    let pause: { reason: string; until_ms: number } | null = null;
+    try {
+      pause = await this.fleet(cell).launchPause();
+    } catch (e) {
+      console.warn(`SandboxDO: asking FleetDO why no host is launched failed`, e);
+    }
+    // Re-read in this step: placed meanwhile, nothing to say.
+    if (pause && !this.info_().host) this.put(PLACEMENT_WAIT_KEY, { ...pause, ms: Date.now() } satisfies PlacementWait);
+    else this.del(PLACEMENT_WAIT_KEY);
   }
 
   /** A placement that never finished leaves `placing` set: once stale, FleetDO's lease decides. */
@@ -510,7 +555,7 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /** Place an unplaced sandbox on a host under a new epoch (`lease.claim` says which it may). */
-  async placeCurrentEpoch(excludeHost?: string): Promise<string | null> {
+  async placeCurrentEpoch(excludeHost?: string, own = true): Promise<string | null> {
     await this.reconcilePlacing();
     const now = Date.now();
     // The source is chosen and pinned by id in the claim's step: retention, in this same single
@@ -560,14 +605,36 @@ export class SandboxDO extends DurableObject<Env> {
         // A lease may exist: the marker stays for the `place` deadline to reconcile.
         throw failure;
       case "unplaced":
-        // A refusal is not retried on its own (the leases disagree: an operator looks); no room is.
+        // A refusal (the leases disagree) is retried on this object's own `place` deadline with backoff
+        // (`PLACE_REFUSED_RETRY`), then given up: shown as `placement_refused` until an operator places it.
         if (answer.kind === "refused") {
-          await this.deadlines.clear("place");
+          const now2 = Date.now();
+          const prev = this.get<PlacementRefused>(PLACEMENT_REFUSED_KEY);
+          const reason = clip(asNestError(failure)?.detail ?? String(failure), 500);
+          if (!own) {
+            // FleetDO's reassignment asked (it retries on its own count): noted, not counted here. This
+            // object's retries start from its own deadline, armed if none is.
+            this.put(PLACEMENT_REFUSED_KEY, { count: prev?.count ?? 0, first_ms: prev?.first_ms ?? now2, last_ms: now2, reason, gave_up: prev?.gave_up ?? false } satisfies PlacementRefused);
+            if (!prev?.gave_up) await this.deadlines.set("place", now2 + PLACE_REFUSED_RETRY.first_ms, true);
+            throw failure;
+          }
+          const count = (prev?.count ?? 0) + 1;
+          const next = retryAfter(count, now2, PLACE_REFUSED_RETRY);
+          this.put(PLACEMENT_REFUSED_KEY, { count, first_ms: prev?.first_ms ?? now2, last_ms: now2, reason, gave_up: "gave_up" in next } satisfies PlacementRefused);
+          if ("gave_up" in next) {
+            await this.deadlines.clear("place");
+            console.error(`sandbox ${before.sandbox}: placement refused ${count} times; given up until an operator places it`, failure);
+          } else {
+            await this.deadlines.set("place", next.at_ms);
+          }
           throw failure;
         }
         await this.deadlines.set("place", Date.now() + PLACE_RETRY_MS, true);
+        await this.notePlacementWait(before.cell);
         return null;
       case "placed":
+        this.del(PLACEMENT_REFUSED_KEY);
+        this.del(PLACEMENT_WAIT_KEY);
         await this.deadlines.clear("place");
         await this.afterPlaced(epoch);
         return after.host;
@@ -604,12 +671,18 @@ export class SandboxDO extends DurableObject<Env> {
    * host, its lease released, and placed again under a new epoch.
    */
   async retryPlacement(): Promise<string | null> {
+    // The operator's try: a refusal count starts again.
+    this.del(PLACEMENT_REFUSED_KEY);
     const info = this.info_();
     const old = lease.failedHolder(info);
     if (old) {
       await this.fleet(info.cell).issueCommands(old.host, [{ type: "fence", sandboxes: [info.sandbox], reason: "create failed; re-placing" }]);
       await this.fleet(info.cell).releaseLease(info.sandbox, old.epoch);
       this.update((i) => lease.retried(i, old.host, old.epoch));
+      await this.failedChanged(this.info_());
+    } else {
+      // Failed with its lease already released (`releaseFailed`): placeable again, retried until placed.
+      this.update((i) => lease.retriedReleased(i));
     }
     return this.placeCurrentEpoch();
   }
@@ -625,8 +698,10 @@ export class SandboxDO extends DurableObject<Env> {
     if (!info || !lease.holds(info, host, epoch)) return;
     // The host's reason, to Workers Logs only (it names host paths): the one place it was kept.
     if (state === "failed" && detail) console.warn(`sandbox ${info.sandbox}: failed on ${host}: ${detail}`);
-    const [r] = this.decide((i) => lease.reported(i, host, epoch, state, guest));
+    const [r, after] = this.decide((i) => lease.reported(i, host, epoch, state, guest));
     if (!r.applied) return;
+    // Failed: its lease (and host) goes after a grace, measured from this failure, unless something moves it first.
+    await this.failedChanged(after);
     // A guest that just came up (boot, resume) takes the slots its sandbox was suspended without.
     if (r.becameRunning) await this.reissuePendingAttaches(true);
     await this.armIdle();
@@ -639,6 +714,8 @@ export class SandboxDO extends DurableObject<Env> {
   async wake(): Promise<{ host: string | null; state: SandboxState }> {
     let info = this.info_();
     if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
+    // Failed, its lease released: it stays failed until an operator retries it or it is destroyed.
+    if (info.state === "failed" && !info.host) return { host: null, state: info.state };
     if (!info.host && info.placing !== null) {
       await this.reconcilePlacing();
       info = this.info_();
@@ -650,6 +727,54 @@ export class SandboxDO extends DurableObject<Env> {
     if (info.placing !== null) return { host: null, state: info.state };
     const host = await this.placeCurrentEpoch();
     return { host, state: this.info_().state };
+  }
+
+  /**
+   * The `failed_release` deadline (state-machine sweep, bug 6): a sandbox still failed on its host
+   * `FAILED_RELEASE_MS` after it failed has its holder fenced and its lease released, so the host (no
+   * longer busy with it) can retire. The record stays `failed`, with its last generation, unplaced.
+   */
+  private async releaseFailed(): Promise<void> {
+    const info = this.info_();
+    const due = lease.failedReleaseDue(info, this.get<lease.FailedSince>(FAILED_SINCE_KEY), Date.now());
+    if (due.kind === "none") {
+      this.del(FAILED_SINCE_KEY);
+      return;
+    }
+    if (due.kind === "wait") {
+      // Not the whole grace yet (it failed again since this deadline was armed): from its latest failure.
+      this.put(FAILED_SINCE_KEY, due.since);
+      await this.deadlines.set("failed_release", due.at_ms);
+      return;
+    }
+    await this.fleet(info.cell).issueCommands(due.host, [{ type: "fence", sandboxes: [info.sandbox], reason: "failed; its lease released" }]);
+    // The lease goes and the incarnation it leaves is FleetDO's to watch: the host isn't retired until
+    // it is salvaged (or its salvage window passed) and destroyed.
+    await this.fleet(info.cell).releaseFailedLease(info.sandbox, due.host, due.epoch);
+    const [released] = this.decide((i) => lease.failedReleased(i, due.host, due.epoch));
+    if (released) {
+      this.del(FAILED_SINCE_KEY);
+      console.warn(`sandbox ${info.sandbox}: failed for ${lease.FAILED_RELEASE_MS / 60_000} min; its lease on ${due.host} released`);
+    }
+  }
+
+  /**
+   * After a change that may have made it failed, or not failed any more: the time it failed is kept (for
+   * this holder and epoch) with the `failed_release` deadline, and both go when it leaves `failed`, so a
+   * later failure gets its own whole grace.
+   */
+  private async failedChanged(info: SandboxInfo): Promise<void> {
+    const old = lease.failedHolder(info);
+    const since = this.get<lease.FailedSince>(FAILED_SINCE_KEY);
+    if (!old) {
+      if (since) this.del(FAILED_SINCE_KEY);
+      await this.deadlines.clear("failed_release");
+      return;
+    }
+    if (since && since.host === old.host && since.epoch === old.epoch) return;
+    const now = Date.now();
+    this.put(FAILED_SINCE_KEY, { ...old, ms: now } satisfies lease.FailedSince);
+    await this.deadlines.set("failed_release", now + lease.FAILED_RELEASE_MS);
   }
 
   /** FleetDO took this suspended sandbox off a host going away (`lease.evicted`). */
@@ -726,6 +851,7 @@ export class SandboxDO extends DurableObject<Env> {
       if (cmd !== undefined) this.put("create_failure", { cmd, r, reissued: true, done: true } satisfies CreateFailure);
     } else if (r === "failed") {
       console.warn(`sandbox ${info.sandbox}: create failed: ${error.code} ${error.message}`);
+      await this.failedChanged(info);
     }
   }
 
@@ -735,7 +861,7 @@ export class SandboxDO extends DurableObject<Env> {
     const [r] = this.decide((i) => lease.leaseLost(i, host, epoch));
     if (r === "ignore") return; // gone, or already handled (re-placed, or a newer epoch exists)
     // A dead host is excluded; a host that came back and fenced is healthy and may get the new lease.
-    const placed = await this.placeCurrentEpoch(hostIsDead ? host : undefined);
+    const placed = await this.placeCurrentEpoch(hostIsDead ? host : undefined, false);
     if (!placed) await this.notifyAgentsMoved();
   }
 
@@ -1131,6 +1257,8 @@ export class SandboxDO extends DurableObject<Env> {
         const next = this.sql.exec<{ at: number | null }>("SELECT MIN(expires_ms) AS at FROM grants").toArray()[0]?.at;
         if (next) await this.deadlines.set("grants", next);
         if (expired) await this.policyChanged(false);
+      } else if (key === "failed_release") {
+        await this.releaseFailed();
       } else if (key === "place") {
         // An unfinished placement is reconciled first (or the deadline re-armed until it goes stale).
         await this.reconcilePlacing();
@@ -1736,7 +1864,12 @@ export class SandboxDO extends DurableObject<Env> {
       info = this.info_();
     }
     const refused = slots.unbindable(info, agent);
-    if (refused) throw refused;
+    if (refused) {
+      // Not placed because no host is being launched: say why, not only "not placed yet".
+      const wait = !info.host ? this.get<PlacementWait>(PLACEMENT_WAIT_KEY) : undefined;
+      if (wait && asNestError(refused)?.code === ErrorCodes.SANDBOX_NOT_READY) throw notReady(`sandbox is not placed yet: ${wait.reason}`);
+      throw refused;
+    }
     const host = info.host!;
     const gateway = await this.fleet(info.cell).hostGatewayUrl(host);
     if (!gateway) throw notReady(`host ${host} advertises no gateway yet`);

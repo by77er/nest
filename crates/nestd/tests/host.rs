@@ -1422,6 +1422,44 @@ async fn failed_create_retried_at_the_same_epoch_reaches_the_gateway() {
     assert!(gw.errors.lock().unwrap().is_empty());
 }
 
+/// A failed create leaves nothing to salvage: the incarnation's directories went with the failure
+/// (it never ran for an agent). So when the control plane later fences that epoch (a failed
+/// sandbox's lease released after its grace, or an operator's retry), no salvage commit is sent,
+/// and the destroy that follows at that epoch is answered ok with nothing left here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_create_then_fenced_has_nothing_to_salvage() {
+    let dir = tempfile::tempdir().unwrap();
+    let fleet = mock_fleet().await;
+    let cfg: Config = serde_json::from_value(serde_json::json!({
+        "role": "sandbox", "cell": "test-cell",
+        "enrollment": {"type": "static", "host": "hst_t", "host_token": "tok", "fleet_ws_url": fleet.url},
+        "run_dir": dir.path().join("run"), "state_dir": dir.path().join("state"),
+        "driver": {"type": "process", "guest_command": ["unused"]},
+        "network": {"type": "none"}, "flush_interval_ms": 20, "commit_timeout_ms": 5000,
+    }))
+    .unwrap();
+    let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca: None, tunnel_token: None, gateway_url: None };
+    let fail = Arc::new(AtomicBool::new(true));
+    let _host = Host::start(cfg, enrolled, Some(Arc::new(FakeDriver { fail_next_start: fail.clone(), ..Default::default() }))).await.unwrap();
+    let _runner = fake_runner(&dir.path().join("run/runner.sock")).await;
+    let _proxy = fake_proxy(dir.path().join("run/proxy.sock"));
+    let _gw = fake_gateway(&dir.path().join("run/gateway.sock")).await;
+    wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+
+    let sbx = SandboxId("sbx_1".into());
+    fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(matches!(fleet.result("cmd_create").await, CommandOutcome::Error { .. }), "the create fails");
+    fleet.wait_event("failed", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Failed, .. })).await;
+    assert!(!dir.path().join("state/sandboxes/sbx_1/1").exists(), "a failed create leaves no directory");
+
+    fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx.clone()], reason: "failed; its lease released".into() })]).unwrap();
+    assert!(is_ok(&fleet.result("cmd_fence").await));
+    fleet.commands.send(vec![cmd("cmd_destroy", CommandBody::SandboxDestroy { sandbox: sbx.clone(), epoch: Epoch(1) })]).unwrap();
+    assert!(is_ok(&fleet.result("cmd_destroy").await));
+    assert!(salvage_requests(&fleet, "sbx_1", 1).is_empty(), "nothing was there to salvage");
+    assert!(!dir.path().join("state/sandboxes/sbx_1").join("1").exists());
+}
+
 /// Review #3: the lease lapses while `sandbox_create` is still booting. `Fenced` is terminal: the
 /// create must not flip the sandbox back to `running`, must not report success, must not re-add
 /// it to the proxy, and heartbeats must stop claiming it.

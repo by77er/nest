@@ -22,6 +22,8 @@ import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
+import { reassignRetry } from "../lib/retry";
+import { basisChanged, type BreakerEvent, type Breakers, breakerOpen, breakerStep, filterPlan, pausedReason } from "../lib/enroll-breaker";
 import { addColumn, sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
 import { followupBackoff, resultFollowups, resultStep } from "../lib/command-result";
 import { retentionMode } from "../lib/retention";
@@ -37,7 +39,7 @@ import {
 } from "../protocol/model";
 import {
   type CapacityView, type FleetView, HOST_STATUSES, type HostStatus, type HostView, type ImagesView, LAUNCH_END_REASONS, type LaunchEndReason,
-  type LaunchView, type SandboxView, type TemplateView,
+  type LaunchView, type SandboxView, type TemplateView, type EnrollBreakerView,
   type HostRole as AdminHostRole, type SandboxState as AdminSandboxState, type TunnelState as AdminTunnelState,
   type AgentState as AdminAgentState, type AgentLifecycle as AdminAgentLifecycle, type BrainPhase as AdminBrainPhase,
   type AwsView, AGENT_LIFETIME_KINDS, type AgentLifetimeKind, type LifetimeAgentView, type LifetimeSandboxView, type LifetimesView,
@@ -187,6 +189,12 @@ interface LaunchIntent { token: string; type: string; subnet: string; spot: bool
 const launchKey = (role: HostKind) => `launch:${role}`;
 /** A kind's backoff after a launch pass where nothing had room: `{until_ms, wait_ms}`. */
 const noRoomKey = (role: HostKind) => `noroom:${role}`;
+/** A kind's enrolment breakers, by instance type (`lib/enroll-breaker.ts`). */
+const breakerKey = (role: HostKind) => `enroll_breaker:${role}`;
+/** The host image (its parameter's value) the cell's breakers counted their failures under. */
+const BREAKER_BASIS_KEY = "enroll_breaker_basis";
+/** How long a read of the host image parameter is reused: passes with a breaker open don't each call SSM. */
+const HOST_IMAGE_CACHE_MS = 60_000;
 /**
  * The old process's unanswered commands, and (until `dropUnreported` has run) the leases it held
  * that the new process doesn't report. An older shape is the bare array of commands.
@@ -359,6 +367,11 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec(`INSERT OR IGNORE INTO reassignments (sandbox, host, epoch, host_dead, attempts)
       SELECT sandbox, host, epoch, host_dead, attempts FROM reassign_queue`);
     this.sql.exec("DELETE FROM reassign_queue");
+    // A failed reassignment's next try (backoff, `REASSIGN_RETRY`) and when it gave up (null: still trying).
+    addColumn(this.sql, "reassignments", "next_ms", "INTEGER");
+    addColumn(this.sql, "reassignments", "gave_up_ms", "INTEGER");
+    // How many of its failed tries were refusals (SandboxDO took the loss, its placement was refused): only those give up.
+    addColumn(this.sql, "reassignments", "refusals", "INTEGER NOT NULL DEFAULT 0");
     this.sql.exec("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
     // Every host this cell made a tunnel for, written before the first Cloudflare call: what the
     // sweep may delete.
@@ -367,6 +380,10 @@ export class FleetDO extends DurableObject<Env> {
     addColumn(this.sql, "launched", "cell", "TEXT");
     addColumn(this.sql, "launched", "reason", "TEXT");
     addColumn(this.sql, "launched", "ended_ms", "INTEGER");
+    // The instance type it was launched as (the enrolment breaker counts by type); absent on older rows.
+    addColumn(this.sql, "launched", "type", "TEXT");
+    // The host image (its parameter's value) the instance was launched from; absent when unknown.
+    addColumn(this.sql, "launched", "image", "TEXT");
     addColumn(this.sql, "hosts", "idle_since", "INTEGER");
     // The seam: where clients reach a host's sandbox gateway (docs/sandbox/gateway/).
     addColumn(this.sql, "hosts", "gateway_url", "TEXT");
@@ -531,6 +548,8 @@ export class FleetDO extends DurableObject<Env> {
     if (consume) {
       if (row.host) this.retireNeverConnected(row.host, consume.host);
       this.sql.exec("UPDATE launched SET host = ? WHERE instance_id = ?", consume.host, identity.instanceId);
+      // An enrolment of its type closes that type's breaker (in this step).
+      if (launchedAs) this.breakerEvent(launchedAs, identity.instanceId, "enrolled");
     }
     return identity.instanceId;
   }
@@ -1675,6 +1694,8 @@ export class FleetDO extends DurableObject<Env> {
     }
     this.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired, vcpus, memory_mib) VALUES (?, ?, ?, 0, ?, ?)",
       req.sandbox, host, req.epoch, need.vcpus, need.memory_mib);
+    // Placed again (an operator's retry, or the cause went): a reassignment of it that gave up is done.
+    this.sql.exec("DELETE FROM reassignments WHERE sandbox = ? AND gave_up_ms IS NOT NULL", req.sandbox);
     this.issueCommands(host, [{
       type: "sandbox_create",
       sandbox: req.sandbox,
@@ -1692,6 +1713,19 @@ export class FleetDO extends DurableObject<Env> {
   async releaseLease(sandbox: string, epoch?: number): Promise<void> {
     if (epoch === undefined) this.sql.exec("DELETE FROM leases WHERE sandbox = ?", sandbox);
     else this.sql.exec("DELETE FROM leases WHERE sandbox = ? AND epoch = ?", sandbox, epoch);
+  }
+
+  /**
+   * SandboxDO releases a failed sandbox's lease (`releaseFailed`): the lease goes, and the incarnation it
+   * leaves on `host` is recorded as stale, not yet clean, in the same step. While it is, the host isn't
+   * retired as idle (`scaleDown`); `reapStale` destroys it once salvaged or past its salvage window.
+   */
+  async releaseFailedLease(sandbox: string, host: string, epoch: number): Promise<void> {
+    const had = this.sql.exec("DELETE FROM leases WHERE sandbox = ? AND host = ? AND epoch = ?", sandbox, host, epoch).rowsWritten > 0;
+    if (had) {
+      this.recordStale(sandbox, host, epoch, false);
+      await this.armTick();
+    }
   }
 
   async leaseOf(sandbox: string): Promise<{ host: string; epoch: number; expired: boolean; state: SandboxState | null; guest: GuestInfo | null } | null> {
@@ -1910,7 +1944,7 @@ export class FleetDO extends DurableObject<Env> {
       || this.hostsBy({ status: "expired", where: "instance_id IS NOT NULL" }).length
       || this.sql.exec(LOST_WITH_BRAINS).toArray().length
       || this.sql.exec("SELECT 1 FROM host_agents WHERE gone = 1").toArray().length
-      || this.sql.exec("SELECT 1 FROM reassignments").toArray().length
+      || this.sql.exec("SELECT 1 FROM reassignments WHERE gave_up_ms IS NULL").toArray().length
       || this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND host IS NULL AND reason IS NULL").toArray().length
       || (this.ec2() && this.sql.exec("SELECT 1 FROM launched WHERE ended_ms IS NULL AND reason IS NOT NULL").toArray().length)
       || this.sql.exec("SELECT 1 FROM evictions").toArray().length
@@ -1948,7 +1982,7 @@ export class FleetDO extends DurableObject<Env> {
       status: "dead",
       where: `dead_ms < ? AND tunnel_id IS NULL AND dns_record_id IS NULL
         AND host NOT IN (SELECT host FROM leases) AND host NOT IN (SELECT host FROM stale_incarnations)
-        AND host NOT IN (SELECT host FROM reassignments) AND host NOT IN (SELECT host FROM evictions)
+        AND host NOT IN (SELECT host FROM reassignments WHERE gave_up_ms IS NULL) AND host NOT IN (SELECT host FROM evictions)
         AND host NOT IN (SELECT host FROM host_agents) AND lost = 1`,
     }, now - DEAD_HOST_RETENTION_MS);
     for (const { host } of dead) {
@@ -2093,6 +2127,22 @@ export class FleetDO extends DurableObject<Env> {
     const now = Date.now();
     const plan = scaleUpPlan(s, live, pending, now);
     if (!plan.launch) return;
+    // Types whose launches keep never enrolling are skipped for their cool-down; with none left, nothing launches.
+    let breakers = this.breakers(role);
+    // A breaker counted under another host image than the cell's now: the fix may be in it; all go.
+    if (plan.launch.some((a) => breakerOpen(breakers, a.type, now)) && basisChanged(this.kvValue<string>(BREAKER_BASIS_KEY), await this.hostImage())) {
+      const cleared = this.clearBreakers();
+      console.log(`FleetDO: the host image changed since launches stopped enrolling; ${cleared.length} enrolment breakers cleared`);
+      breakers = this.breakers(role);
+    }
+    const allowed = filterPlan(breakers, plan.launch, now);
+    if (allowed.role_open_until_ms !== null) {
+      if (this.roleOpenLogged.get(role) === allowed.role_open_until_ms) return;
+      this.roleOpenLogged.set(role, allowed.role_open_until_ms);
+      console.error(`FleetDO: every ${role} instance type's enrolment breaker is open (launches kept ending enroll_timeout): no ${role} host is launched before ${new Date(allowed.role_open_until_ms).toISOString()}`);
+      return;
+    }
+    plan.launch = allowed.launch;
     // A pass with no room anywhere waits before the next (each waiting sandbox and brain is demand).
     const noRoom = this.noRoom(role);
     if (noRoom && now < noRoom.until_ms) return;
@@ -2117,6 +2167,96 @@ export class FleetDO extends DurableObject<Env> {
     console.warn(`FleetDO: no room for a ${role} host anywhere; the next launch pass waits ${wait / 1000} s`);
   }
 
+  /** A JSON value in `kv`, or undefined. */
+  private kvValue<T>(key: string): T | undefined {
+    const v = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", key).toArray()[0]?.value;
+    return v === undefined ? undefined : (JSON.parse(v) as T);
+  }
+
+  /** The host image the cell's launch template resolves (the Image Builder parameter); null when unknown. */
+  private async hostImage(): Promise<string | null> {
+    const now = Date.now();
+    if (this.hostImageCache && now - this.hostImageCache.at < HOST_IMAGE_CACHE_MS) return this.hostImageCache.value;
+    const ssm = this.ssm();
+    const cell = this.cellName();
+    if (!ssm || !cell) return null;
+    try {
+      const value = (await ssm.parameter(`/imagebuilder/nest-${cell}/host-ami`))?.value ?? null;
+      this.hostImageCache = { value, at: now };
+      return value;
+    } catch (e) {
+      // Not cached: the next pass asks again.
+      console.warn("FleetDO: reading the host image parameter failed", e);
+      return null;
+    }
+  }
+
+  /** The host image parameter as last read, kept `HOST_IMAGE_CACHE_MS` (memory only: a restart reads it again). */
+  hostImageCache: { value: string | null; at: number } | undefined = undefined;
+
+  /** Clear enrolment breakers (every one, or a kind's, or one type's): the ones it cleared. The basis goes with the last. */
+  private clearBreakers(role?: HostKind, type?: string): { role: HostKind; type: string }[] {
+    const cleared: { role: HostKind; type: string }[] = [];
+    for (const r of [SANDBOX_ROLE, BRAIN_ROLE]) {
+      if (role && r !== role) continue;
+      const b = { ...this.breakers(r) };
+      for (const t of Object.keys(b)) {
+        if (type && t !== type) continue;
+        delete b[t];
+        cleared.push({ role: r, type: t });
+      }
+      this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", breakerKey(r), JSON.stringify(b));
+      this.roleOpenLogged.delete(r);
+    }
+    if (![SANDBOX_ROLE, BRAIN_ROLE].some((r) => Object.keys(this.breakers(r)).length)) this.sql.exec("DELETE FROM kv WHERE key = ?", BREAKER_BASIS_KEY);
+    return cleared;
+  }
+
+  /**
+   * The operator's reset (`POST /v1/admin/fleet/enroll-breakers/reset`): every breaker, a kind's or one
+   * type's, closed now; launches of those types resume at the next demand.
+   */
+  async resetEnrollBreakers(role?: HostKind, type?: string): Promise<{ cleared: { role: HostKind; type: string }[] }> {
+    const cleared = this.clearBreakers(role, type);
+    console.log(`FleetDO: the operator reset ${cleared.length} enrolment breakers`);
+    return { cleared };
+  }
+
+  /** Why no host of `role` is launched for waiting work, when every type it would launch has its breaker open; else null. */
+  async launchPause(role: HostKind = SANDBOX_ROLE): Promise<{ reason: string; until_ms: number } | null> {
+    const cfg = this.cellConfig();
+    const s = cfg ? this.scaleSettings(cfg, role) : null;
+    if (!s) return null;
+    return pausedReason(this.breakers(role), [...(s.spot ? s.instance_types : []), ...(s.on_demand_types ?? s.instance_types)], Date.now());
+  }
+
+  /** The role-wide openings already logged (once each, not at every demand). */
+  private readonly roleOpenLogged = new Map<HostKind, number>();
+
+  /** A kind's enrolment breakers, by instance type; none stored reads as all closed. */
+  private breakers(role: HostKind): Breakers {
+    const v = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", breakerKey(role)).toArray()[0]?.value;
+    return v === undefined ? {} : (JSON.parse(v) as Breakers);
+  }
+
+  /**
+   * A launched instance enrolled, or never did (`enroll_timeout`): its type's breaker steps
+   * (`breakerStep`), written in the caller's synchronous step. An opening is the operator's to see:
+   * logged as an error, and in the fleet view. A row from before types counts for nothing.
+   */
+  private breakerEvent(role: HostKind, instanceId: string, kind: BreakerEvent["kind"]): void {
+    const type = this.sql.exec<{ type: string | null }>("SELECT type FROM launched WHERE instance_id = ?", instanceId).toArray()[0]?.type;
+    if (!type) return;
+    const step = breakerStep(this.breakers(role), { kind, type }, Date.now());
+    this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", breakerKey(role), JSON.stringify(step.next));
+    if (step.opened) {
+      console.error(`FleetDO: ${step.opened.failures} consecutive ${type} ${role} launches never enrolled (the type may lack what the host needs, e.g. KVM): no ${type} launches before ${new Date(step.opened.until_ms).toISOString()}`);
+    }
+    if (step.reset) console.log(`FleetDO: a ${type} ${role} host enrolled; its enrolment breaker is closed`);
+    // No breaker left anywhere: the basis goes too, so failures counted later get the image of their time.
+    if (![SANDBOX_ROLE, BRAIN_ROLE].some((r) => Object.keys(this.breakers(r)).length)) this.sql.exec("DELETE FROM kv WHERE key = ?", BREAKER_BASIS_KEY);
+  }
+
   /** The kind's backoff after a pass where nothing had room (`noRoomBackoffMs`). */
   private noRoom(role: HostKind): { until_ms: number; wait_ms: number } | null {
     const v = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = ?", noRoomKey(role)).toArray()[0]?.value;
@@ -2130,6 +2270,8 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", launchKey(role), JSON.stringify(a));
     this.launching.add(role);
     try {
+      // What it is built from, recorded with it: the basis its breaker counts a failure under.
+      const image = await this.hostImage();
       const id = await ec2.launch({
         launchTemplateId: template, instanceType: a.type, subnetId: a.subnet, spot: a.spot, clientToken: a.token,
         // Brain hosts are burstable (IAM allows t3/t3a only): unlimited, so a host full of
@@ -2137,8 +2279,8 @@ export class FleetDO extends DurableObject<Env> {
         ...(role === BRAIN_ROLE ? { cpuCredits: "unlimited" as const } : {}),
       });
       this.sql.exec(
-        "INSERT OR IGNORE INTO launched (instance_id, launched_ms, role, region, cell) VALUES (?, ?, ?, ?, ?)",
-        id, a.at, roleName(role), cfg.region, this.cellName(),
+        "INSERT OR IGNORE INTO launched (instance_id, launched_ms, role, region, cell, type, image) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        id, a.at, roleName(role), cfg.region, this.cellName(), a.type, image,
       );
       this.endLaunchIntent(role, a.token);
       console.log(`FleetDO: launched ${role} host ${id} (${a.type}, ${a.spot ? "spot" : "on-demand"}, ${a.subnet})`);
@@ -2178,11 +2320,22 @@ export class FleetDO extends DurableObject<Env> {
   private async scaleDown(now: number): Promise<void> {
     const cfg = this.cellConfig();
     if (!cfg) return;
-    for (const r of this.sql.exec<{ instance_id: string }>(
-      "SELECT instance_id FROM launched WHERE host IS NULL AND reason IS NULL AND launched_ms < ?",
-      now - cfg.enroll_timeout_ms).toArray()) {
+    const timedOut = this.sql.exec<{ instance_id: string; role: string | null; image: string | null }>(
+      // Newest first: the basis is the newest image any of them was launched from.
+      "SELECT instance_id, role, image FROM launched WHERE host IS NULL AND reason IS NULL AND launched_ms < ? ORDER BY launched_ms DESC",
+      now - cfg.enroll_timeout_ms).toArray();
+    // What these hosts were built from, if the breakers have no basis yet: recorded at their launch (an
+    // image fixed since then resets them at the next pass), else the image now. A later change resets them.
+    const basis = timedOut.length && !this.kvValue(BREAKER_BASIS_KEY)
+      ? timedOut.find((r) => r.image)?.image ?? await this.hostImage() : null;
+    for (const r of timedOut) {
+      // Re-read in this step (the image read awaited): another tick may have ended it meanwhile.
+      if (!this.sql.exec("SELECT 1 FROM launched WHERE instance_id = ? AND host IS NULL AND reason IS NULL", r.instance_id).toArray().length) continue;
+      if (basis !== null && !this.kvValue(BREAKER_BASIS_KEY)) this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", BREAKER_BASIS_KEY, JSON.stringify(basis));
       this.sql.exec("UPDATE launched SET reason = ? WHERE instance_id = ?", "enroll_timeout" satisfies LaunchEndReason, r.instance_id);
       console.warn(`FleetDO: ${r.instance_id} never enrolled; terminating`);
+      const kind = storedEnumOrNull(HostRole, r.role, "launched.role");
+      if (kind) this.breakerEvent(hostKind(kind), r.instance_id, "enroll_timeout");
     }
     // Enrolled but never said hello within the timeout: retired like a launch that never enrolls.
     for (const h of this.hostsBy({ status: "active", where: "last_rx IS NULL AND instance_id IS NOT NULL AND enrolled_ms < ?" }, now - cfg.enroll_timeout_ms)) {
@@ -2201,7 +2354,10 @@ export class FleetDO extends DurableObject<Env> {
         if (!h) continue;
         // Suspended sandboxes don't keep a host up; a brain does until its exit is reported (or its
         // host expired): declaring the host dead before would let it run twice.
-        const busy = this.leasesOf(h.host).some((l) => l.state !== "suspended") || this.brainsOn(h.host) > 0;
+        // Nor is a host retired while it holds an incarnation not yet salvaged and destroyed (a failed
+        // sandbox's, released): its uncommitted work would go with the instance.
+        const salvaging = this.sql.exec("SELECT 1 FROM stale_incarnations WHERE host = ? AND cmd IS NULL", h.host).toArray().length > 0;
+        const busy = this.leasesOf(h.host).some((l) => l.state !== "suspended") || this.brainsOn(h.host) > 0 || salvaging;
         const step = idleStep(busy, h.idle_since, now, grace);
         if (step === "busy") {
           if (h.idle_since !== null) this.sql.exec("UPDATE hosts SET idle_since = NULL WHERE host = ?", h.host);
@@ -2336,6 +2492,8 @@ export class FleetDO extends DurableObject<Env> {
   async sandboxDestroyed(sandbox: string): Promise<void> {
     this.sql.exec("INSERT INTO sandboxes (sandbox, registered_ms, destroyed_ms) VALUES (?, ?, ?) ON CONFLICT(sandbox) DO UPDATE SET destroyed_ms = excluded.destroyed_ms",
       sandbox, Date.now(), Date.now());
+    // Nothing of it is reassigned any more (`leaseLost` on a destroyed sandbox is nothing), given up or not.
+    this.sql.exec("DELETE FROM reassignments WHERE sandbox = ?", sandbox);
   }
 
   /** SandboxDO's `create`, before anything is written for the sandbox. A destroyed one stays destroyed. */
@@ -2461,7 +2619,10 @@ export class FleetDO extends DurableObject<Env> {
         instance_id: l.instance_id, launched_ms: l.launched_ms, host: l.host,
         reason: storedEnumOrNull(LaunchEndReason, l.reason, "launched.reason"), ended_ms: l.ended_ms,
       }));
-    return { hosts, launches, sandboxes: await this.liveSandboxes(), aws: this.awsView() };
+    const now = Date.now();
+    const enroll_breakers = [SANDBOX_ROLE, BRAIN_ROLE].flatMap((role) => Object.entries(this.breakers(role))
+      .map(([type, b]): EnrollBreakerView => ({ role, type, failures: b.failures, open_until_ms: b.open_until_ms, open: breakerOpen(this.breakers(role), type, now) })));
+    return { hosts, launches, sandboxes: await this.liveSandboxes(), aws: this.awsView(), enroll_breakers };
   }
 
   /** A host's last capacity report as stored (validated when it arrived; checked again here). */
@@ -2867,8 +3028,11 @@ export class FleetDO extends DurableObject<Env> {
 
   /** Idempotent per lost lease: drop it if it is still the sandbox's, then have SandboxDO grant a new one elsewhere. */
   private async processReassign(): Promise<void> {
+    const now = Date.now();
+    // Due ones only: a failed one waits out its backoff, and one that gave up waits for the operator.
     const rows = this.sql
-      .exec<{ sandbox: string; host: string; epoch: number; host_dead: number }>("SELECT sandbox, host, epoch, host_dead FROM reassignments ORDER BY epoch")
+      .exec<{ sandbox: string; host: string; epoch: number; host_dead: number }>(
+        "SELECT sandbox, host, epoch, host_dead FROM reassignments WHERE gave_up_ms IS NULL AND (next_ms IS NULL OR next_ms <= ?) ORDER BY epoch", now)
       .toArray();
     for (const r of rows) {
       try {
@@ -2877,11 +3041,28 @@ export class FleetDO extends DurableObject<Env> {
         await this.sandbox(r.sandbox).leaseLost(r.host, r.epoch, r.host_dead === 1);
         this.sql.exec("DELETE FROM reassignments WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch);
       } catch (e) {
-        this.sql.exec("UPDATE reassignments SET attempts = attempts + 1 WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch);
-        console.error(`FleetDO: reassigning ${r.sandbox} failed; will retry`, e);
+        // With backoff (`reassignRetry`). Only a refusal counts toward giving up: SandboxDO took the loss
+        // (it no longer names the host) and its new placement was refused, which the sandbox shows itself
+        // (`placement_refused`). A call that never landed is retried for ever: giving up would leave
+        // SandboxDO placed on a host that is gone, with no way to place it again.
+        const row = this.sql.exec<{ attempts: number; refusals: number }>(
+          "SELECT attempts, refusals FROM reassignments WHERE sandbox = ? AND host = ? AND epoch = ?", r.sandbox, r.host, r.epoch).toArray()[0];
+        if (!row) continue;
+        const ne = asNestError(e);
+        const refused = ne?.code === ErrorCodes.FORBIDDEN && !ne.retryable;
+        const n = reassignRetry({ ...row, refused }, Date.now());
+        if ("gave_up" in n.next) {
+          this.sql.exec("UPDATE reassignments SET attempts = ?, refusals = ?, next_ms = NULL, gave_up_ms = ? WHERE sandbox = ? AND host = ? AND epoch = ?",
+            n.attempts, n.refusals, Date.now(), r.sandbox, r.host, r.epoch);
+          console.error(`FleetDO: reassigning ${r.sandbox} (lost from ${r.host} at epoch ${r.epoch}) was refused ${n.refusals} times; given up until an operator places it`, e);
+        } else {
+          this.sql.exec("UPDATE reassignments SET attempts = ?, refusals = ?, next_ms = ? WHERE sandbox = ? AND host = ? AND epoch = ?",
+            n.attempts, n.refusals, n.next.at_ms, r.sandbox, r.host, r.epoch);
+          console.error(`FleetDO: reassigning ${r.sandbox} failed (${n.attempts}${refused ? ", refused" : ""}); next try at ${new Date(n.next.at_ms).toISOString()}`, e);
+        }
       }
     }
-    if (this.sql.exec("SELECT 1 FROM reassignments").toArray().length) await this.armTick();
+    if (this.sql.exec("SELECT 1 FROM reassignments WHERE gave_up_ms IS NULL").toArray().length) await this.armTick();
   }
 
   // ---------------------------------------------------------------------------------------------
