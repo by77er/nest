@@ -394,3 +394,18 @@ Line citations above this section are function names or older heads; `agent.ts` 
 ## a start refused for its launch (cp/launch-model-chars, author's map, 2026-11-09)
 
 - **`processIntent`, with no brain:** before `pickHost`, an agent whose stored launch isn't plain tokens (`launchProblem`, `lib/spec.ts`) throws a non-retryable `invalid_message`. `intentFailed` ends the intent and, with no brain, sets `errored` with `start_error`, as for any start refused for good. Conforms: no brain record is read or written by the refusal, no command is issued, and no new transition is added (the model's start is simply not taken). The branches with a brain (release, condemned, `liveBrainStart`) are unchanged.
+
+
+## the turn ledger's step (refactor/turn-ledger, author's map, 2026-11-09)
+
+**Head:** `refactor/turn-ledger` (on main 045ef5fc). The queue's transitions are unchanged; their guards moved from the callers into one pure step, `turnStep` (`lib/turns.ts`), which every status write goes through. Not checked by a model run.
+
+| Model action | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| Q2 claim | `TurnQueue.claimNext` | yes | queued → active, as before |
+| Q3 complete | `TurnQueue.complete` | yes (stricter) | active → done only. The model completes only the current turn; the code used to set `done` from any status. The unseen inbox is requeued as before |
+| Q4 recover | `TurnQueue.recover` | yes (stricter) | active → interrupted, and the recovery turn is inserted only when that happened, so a repeated recover adds none |
+| (not modelled) drop | `TurnQueue.dropAll` | outside the model | queued or the given active turn → dropped, as before |
+| (not modelled) abandon | `TurnQueue.prune` | outside the model | An active row that isn't `current_turn`, older than the retention, → interrupted. No brain decision reads it. A message mirrored to a turn no longer active, that old, is requeued as a turn (as Q3 does for the unseen inbox) |
+
+Tests: `test/turns.test.ts` (the exhaustive table; the guards; the prune) and `test/contract-r2.test.ts` (AgentDO's prune under a live brain). Mutations run: a final turn completable, a second recovery turn, no abandon, the current turn abandoned, stale mirrored messages kept, a queued turn abandoned, `complete` bypassing the step, a live turn's message abandoned, AgentDO's prune not passing `current_turn`, a stale mirrored message dropped instead of requeued, every mirrored message requeued by the prune, requeued messages left mirrored. Each fails a test.
