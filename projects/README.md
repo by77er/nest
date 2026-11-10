@@ -205,6 +205,25 @@ The owner's request (2026-11-06), after the state-machine sweep (B11): a manager
 - **Chat during a restart.** The owner's chat messages wait for a manager ("Retrying…"), and go as soon as one has started. Each change is noted in the chat. While the manager has ended or errored, the composer offers no Stop; on a phone, where the page's notice scrolls away, it also says so ("The manager isn't running", with Restart manager).
 - An exit of a manager that isn't the current one changes nothing.
 
+## Models
+
+The owner's request (2026-11-09): "allow me to select the model for the manager and the workers. Default manager = Fable 5.2, worker = Opus 5.5."
+
+- **Two settings per project,** `manager_model` and `worker_model` (`PATCH /api/projects/:id/settings`; the Models panel in Settings).
+  - **Defaults:** the manager on `claude-fable-5-2`, workers on `claude-opus-5-5` (`DEFAULT_MODEL` in `src/models.ts`). A project made before this reads as the defaults.
+  - **Offered by name:** Fable 5.2, Opus 5.5, Sonnet 5.5 (`claude-sonnet-5-5`), Haiku 5.5 (`claude-haiku-5-5`), and **Custom**: any id or alias Claude Code's `--model` takes.
+  - **A model id is one argument of a command,** so it's letters, digits and `. _ : @ / [ ] -`, starting with a letter or digit (never `-`, which would read as an option), at most 100 characters. Checked in the form, the API and ProjectDO.
+- **Through nest's generic interface only.** A client's spawn can't override a template's launch (nest answers 400: a different launch is a template in the client's namespace, [clients](../docs/control-plane/api/clients/)). So each choice is a template of the app's own:
+  - `projects/<role>-<project>-<model>` (`modelTemplateEntry`), the role's template with `launch.model` (which nest passes to Claude Code as `--model`, [runner](../docs/agents/runner/)) and only that project's repo.
+  - An id that isn't already a legal entry name (capitals, dots, brackets, too long) is cut down and told apart by a hash of the whole id, so two ids never share a template.
+  - ProjectDO writes it before each start that names it (`templateFor`): the same body every time, so writing it again changes nothing.
+- **A change applies to the next start.** A start freezes its model with its attempt (`start_specs`), so its retries name the same template under the same idempotency keys.
+  - Workers started after the change run on the new model; running ones keep theirs.
+  - The manager keeps its model until it next starts: **Restart manager**, or its replacement after it ends ([the manager lifecycle](#the-manager-lifecycle)).
+  - A start frozen before this release has no model: it keeps the role's shared template (`projects/manager`, `projects/worker`), which now carry the defaults.
+- **Reviewers and routine runs are unchanged:** their templates name no model, so they run on nest's and Claude Code's default. Choosing theirs is a later setting if it's wanted.
+- nest doesn't check that a model exists or that the credential may use it (`LaunchConfig.model` is any string). How a wrong id shows (Claude Code failing its first turn, so nest's `agent.error` among the project's errors) is unverified.
+
 ## Creating a project
 
 The owner's request (2026-11-06), after the sweep (B10): creating a project used to be four awaited steps. A failure after the first left a project that answered 404, with its repo taken.

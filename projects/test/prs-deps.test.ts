@@ -318,7 +318,8 @@ describe("the migration", () => {
       for (const t of ["pr_facts", "comments_seen"]) sql.exec(`DROP TABLE ${t}`);
       sql.exec("ALTER TABLE settings DROP COLUMN manager_restarts");
       sql.exec("ALTER TABLE settings DROP COLUMN listed_ms");
-      expect(step).toBe(MIGRATIONS.length - 10);
+      for (const c of ["manager_model", "worker_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      expect(step).toBe(MIGRATIONS.length - 11);
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, pr_node, am_status, created_ms, updated_ms) VALUES ('tsk_old', 't', '', 'in_review', 1, 7, 'PR_x', '{"state":"enabled"}', 1, 2)`);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, created_ms, updated_ms) VALUES ('tsk_done', 't', '', 'done', 2, 8, 1, 2)`);

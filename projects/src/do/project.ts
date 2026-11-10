@@ -7,7 +7,8 @@
 // re-read the row before acting on an answer, since other requests run while one awaits nest.
 
 import { DurableObject } from "cloudflare:workers";
-import { TEMPLATE } from "../catalog";
+import { roleTemplate, TEMPLATE } from "../catalog";
+import { DEFAULT_MODEL, type ModelRole, modelProblem } from "../models";
 import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, DIMENSIONS, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
@@ -51,6 +52,9 @@ export interface Settings {
   repo_auto_merge: RepoAutoMerge;
   /** Whether workers' push tokens may change `.github/workflows/` (README.md#secrets); off by default. */
   workers_edit_workflows: boolean;
+  /** The models the manager and the workers run on (README.md#models): a change applies to the next start. */
+  manager_model: string;
+  worker_model: string;
   /**
    * The GitHub user whose PR comments reach workers (README.md#pr-comments), by id (immutable): the
    * repo's owner when it's a user, recorded at attach; an org's repo needs it set. Null: nobody's do.
@@ -501,6 +505,11 @@ export const MIGRATIONS = [
     // nothing is drained; a project removed before it was ready leaves this object inert.
     "ALTER TABLE settings ADD COLUMN listed_ms INTEGER",
   ],
+  [
+    // The models the manager and the workers run on (README.md#models); null: the default for the role.
+    "ALTER TABLE settings ADD COLUMN manager_model TEXT",
+    "ALTER TABLE settings ADD COLUMN worker_model TEXT",
+  ],
 ] as const;
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
@@ -586,6 +595,7 @@ export class ProjectDO extends DurableObject<Env> {
       attached: r.attached_ms !== null, attach_error: (r.attach_error as string | null) ?? null,
       attach: r.attach_detail ? (JSON.parse(r.attach_detail as string) as AttachDetail) : null,
       auto_merge: r.auto_merge === 1, merge_method: r.merge_method as MergeMethod, workers_edit_workflows: r.workers_edit_workflows === 1,
+      manager_model: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, worker_model: (r.worker_model as string | null) ?? DEFAULT_MODEL.worker,
       comments_from: r.comments_from_id === null || r.comments_from_id === undefined ? null : { id: r.comments_from_id as number, login: (r.comments_from_login as string | null) ?? null },
       repo_owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: r.repo_owner_login as string },
       repo_auto_merge: repoAutoMerge({
@@ -605,9 +615,15 @@ export class ProjectDO extends DurableObject<Env> {
   async updateSettings(u: {
     auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean;
     comments_from_id?: number | null; comments_from_login?: string | null; comments_from_repo_owner?: boolean; max_routine_runs?: number;
+    manager_model?: string; worker_model?: string;
   }): Promise<Result<Settings>> {
     const before = this.settings();
     if (!before) return fail(404, "unknown project");
+    // The models (README.md#models): checked before anything is written; the next start of each role uses them.
+    for (const m of [u.manager_model, u.worker_model]) {
+      const bad = m === undefined ? null : modelProblem(m);
+      if (bad) return fail(400, `a model is ${bad}`);
+    }
     // Whose PR comments count (README.md#pr-comments): a login is looked up on GitHub and kept as its id.
     let who: { id: number; login: string | null } | null | undefined = u.comments_from_id === undefined ? undefined : u.comments_from_id === null ? null : { id: u.comments_from_id, login: null };
     if (u.comments_from_repo_owner) {
@@ -645,6 +661,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (u.auto_assign !== undefined) this.sql.exec("UPDATE settings SET auto_assign = ?", u.auto_assign ? 1 : 0);
     if (u.max_workers !== undefined) this.sql.exec("UPDATE settings SET max_workers = ?", clampWorkers(u.max_workers));
     if (u.merge_method !== undefined) this.sql.exec("UPDATE settings SET merge_method = ?", u.merge_method);
+    if (u.manager_model !== undefined) this.sql.exec("UPDATE settings SET manager_model = ?", u.manager_model);
+    if (u.worker_model !== undefined) this.sql.exec("UPDATE settings SET worker_model = ?", u.worker_model);
     if (u.workers_edit_workflows !== undefined) this.sql.exec("UPDATE settings SET workers_edit_workflows = ?", u.workers_edit_workflows ? 1 : 0);
     if (u.max_routine_runs !== undefined) {
       this.sql.exec("UPDATE settings SET routine_cap = ?", u.max_routine_runs);
@@ -1667,11 +1685,28 @@ export class ProjectDO extends DurableObject<Env> {
         ...(inject.length ? { inject, env } : {}),
         ...(role === "worker" && s.workers_edit_workflows ? { github_push: { workflows: true } } : {}),
       };
-      frozen = { extras, names: mine.map((m) => m.name), brief: secretsBrief(mine), rev: this.rules().rev };
+      // The role's model as the settings have it now (README.md#models): frozen with the attempt, so its
+      // retries name the same template, whatever the settings say by then.
+      const model = role === "manager" ? s.manager_model : role === "worker" ? s.worker_model : undefined;
+      frozen = { extras, names: mine.map((m) => m.name), brief: secretsBrief(mine), rev: this.rules().rev, ...(model ? { model } : {}) };
       this.sql.exec("INSERT INTO start_specs (key, spec, at_ms) VALUES (?, ?, ?)", key, JSON.stringify(frozen), Date.now());
       this.sql.exec("DELETE FROM start_specs WHERE at_ms < ?", Date.now() - 7 * 24 * 3600 * 1000);
     }
     return frozen;
+  }
+
+  /**
+   * The template a manager or worker starts from (README.md#models): the project's own for the role on
+   * the model its start froze, written to the app's catalog here (the same body every time, so writing
+   * it again changes nothing). A client's spawn can't override a template's launch, so the model is the
+   * template's. A start frozen before models were chosen keeps the role's shared template.
+   */
+  private async templateFor(nest: Nest, role: ModelRole, spec: StartSpec): Promise<string> {
+    if (!spec.model) return TEMPLATE[role];
+    const s = this.settings()!;
+    const t = roleTemplate(role, s.id, s.repo, spec.model);
+    await nest.putCatalog("templates", t.name, t.body);
+    return t.name;
   }
 
   /** A start attempt's spec as first frozen, if it was. */
@@ -3468,7 +3503,7 @@ export class ProjectDO extends DurableObject<Env> {
       const frozen = await this.frozenEgress(nest, key, "manager");
       // Its bindings, env and workflows, frozen with the same key (README.md#secrets).
       const spec = await this.sandboxSpec(nest, "manager", key);
-      const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
+      const agent = s.manager ?? (await nest.startAgent(await this.templateFor(nest, "manager", spec), labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       if (!current()) {
         // Superseded while it was being made: it goes, unless it's somehow the manager now.
@@ -3517,7 +3552,7 @@ export class ProjectDO extends DurableObject<Env> {
         const key = `${s.id}/${id}/${n}`;
         const frozen = await this.frozenEgress(nest, key, "worker");
         const spec = await this.sandboxSpec(nest, "worker", key);
-        agent = await nest.startAgent(TEMPLATE.worker, labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
+        agent = await nest.startAgent(await this.templateFor(nest, "worker", spec), labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
         await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
         if (!current()) {
           // Cancelled (or reassigned, or abandoned) while it was being made: it goes, with no layer or holdings kept for it.
@@ -3886,6 +3921,8 @@ export interface StartSpec {
   names: string[];
   brief: string;
   rev: number;
+  /** The model the manager or worker starts on (README.md#models). Absent: frozen before models were chosen (the role's shared template then). */
+  model?: string;
 }
 
 /** A live agent's client layer, as the Network page shows it. */

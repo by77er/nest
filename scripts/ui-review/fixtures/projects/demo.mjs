@@ -5,7 +5,7 @@
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-sending" (the owner's messages still being sent), "chat-long" (thirty messages), "chat-paged"
-// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors), "manager-ended" (past its automatic restarts), "creating" (a project still being created),
+// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors), "manager-ended" (past its automatic restarts), "creating" (a project still being created), "models-custom" (a custom model id for the workers),
 // "chat-code" (a reply with every syntax token), "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
 // a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
@@ -269,6 +269,9 @@ const RICH = [
     comments_from: variant === "comments-set" ? { id: 5839471, login: "by77er" } : variant === "comments-id-only" ? { id: 5839471, login: null } : null,
     repo_owner: { id: 5839471, login: "by77er" },
     max_routine_runs: 1,
+    // The models (README.md#models): the defaults, or (models-custom) a long custom id for the workers.
+    manager_model: "claude-fable-5-2",
+    worker_model: variant === "models-custom" ? "us.anthropic.claude-opus-5-5-20260915-v1:0[1m]" : "claude-opus-5-5",
   };
   const demo = { id: "prj_demo", name, repo, created_ms: now - DAY * 3, settings };
   const other = { id: "prj_other", name: "Widgets", repo: "by77er/widgets", created_ms: now - DAY * 9 };

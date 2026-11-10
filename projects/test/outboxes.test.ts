@@ -277,6 +277,7 @@ describe("the outboxes' migration", () => {
       for (const t of ["pr_facts", "comments_seen"]) sql.exec(`DROP TABLE ${t}`);
       sql.exec("ALTER TABLE settings DROP COLUMN manager_restarts");
       sql.exec("ALTER TABLE settings DROP COLUMN listed_ms");
+      for (const c of ["manager_model", "worker_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec("INSERT INTO task_prs (pr, task, state, attached_by, attached_ms) VALUES (61, 'tsk_gone', 'open', 'owner', 1), (62, 'tsk_gone', 'detached', 'owner', 1), (63, ?, 'open', 'owner', 1)", t.id);
       migrate(st.storage, MIGRATIONS);
