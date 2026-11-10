@@ -201,6 +201,11 @@ export class ReviewDO extends DurableObject<Env> {
     if (o.max_concurrent_reviews !== undefined) await this.setMaxConcurrent(o.max_concurrent_reviews);
   }
 
+  /** The repo was renamed or transferred (README.md#the-repos-binding): its check runs are made under `name` from now on. */
+  async repoRenamed(name: string): Promise<void> {
+    if (this.setting("project") !== null) this.setSetting("repo", name.toLowerCase());
+  }
+
   /** The cap on running reviews: null (the default) for none. */
   async maxConcurrent(): Promise<number | null> {
     return this.cap();

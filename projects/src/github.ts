@@ -161,11 +161,22 @@ export class GitHub {
     return { id: u.id, login: u.login, type: u.type };
   }
 
+  /**
+   * The repo itself (https://docs.github.com/en/rest/repos/repos#get-a-repository): its id (immutable, what
+   * events are routed by), its name now (GitHub answers a renamed repo's old name with the repo, unless the
+   * name was taken since), and its owner's id, login and kind. Metadata: read.
+   */
+  async repoInfo(repo: string): Promise<{ id: number; full_name: string; owner: { id: number; login: string; type: string } }> {
+    const r = (await this.call<{ id?: unknown; full_name?: unknown; owner?: { id?: unknown; login?: unknown; type?: unknown } }>("GET", `/repos/${repo}`))!;
+    const o = r.owner ?? {};
+    if (typeof r.id !== "number" || !Number.isSafeInteger(r.id) || r.id <= 0 || typeof r.full_name !== "string") throw new GitHubError(502, "GitHub's answer for the repo names no id", false);
+    if (typeof o.id !== "number" || typeof o.login !== "string" || typeof o.type !== "string") throw new GitHubError(502, "the repo has no owner", false);
+    return { id: r.id, full_name: r.full_name, owner: { id: o.id, login: o.login, type: o.type } };
+  }
+
   /** The repo's owner: its id (immutable), login and kind (`User` or `Organization`). Metadata: read. */
   async repoOwner(repo: string): Promise<{ id: number; login: string; type: string }> {
-    const o = ((await this.call<{ owner?: { id?: unknown; login?: unknown; type?: unknown } }>("GET", `/repos/${repo}`))!.owner ?? {});
-    if (typeof o.id !== "number" || typeof o.login !== "string" || typeof o.type !== "string") throw new GitHubError(502, "the repo has no owner", false);
-    return { id: o.id, login: o.login, type: o.type };
+    return (await this.repoInfo(repo)).owner;
   }
 
   createCheckRun(repo: string, b: { head_sha: string; external_id: string; details_url?: string; output: CheckOutput }): Promise<{ id: number; app?: { id?: number } } | null> {

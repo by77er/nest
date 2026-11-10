@@ -1,6 +1,7 @@
 // GitHub's events reach a project by the repo's id (README.md#built-the-review-pipeline): a repo that's
 // renamed or transferred keeps its project, and its old name, taken by another repo, reaches none. A
-// project learns the id from the first event that names it, and is found by name until then.
+// project reads the id from GitHub at attach (test/repo-binding.test.ts); one from before that (no id yet,
+// `legacy` here) is found by name and learns the id from the first event that names it.
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
@@ -28,6 +29,19 @@ async function newProject() {
   const p = (await api(token, "POST", "/api/projects", { name: repo, repo })).body;
   return { id: p.id as string, repo };
 }
+/**
+ * Projects as made before ids were read at attach: none yet. Made first, then unbound: a project's
+ * creation syncs the catalog, which reads every id-less project's id from GitHub.
+ */
+async function legacies(n: number) {
+  const ps: { id: string; repo: string }[] = [];
+  for (let k = 0; k < n; k++) ps.push(await newProject());
+  await runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => {
+    for (const p of ps) st.storage.sql.exec("UPDATE projects SET repo_id = NULL, repo_bound = NULL, repo_bound_ms = NULL WHERE id = ?", p.id);
+  });
+  return ps;
+}
+const legacy = async () => (await legacies(1))[0]!;
 type P = Awaited<ReturnType<typeof newProject>>;
 const issue = (n: number, repository: Record<string, unknown>) => ({
   action: "opened", sender: { id: 1, login: "x" },
@@ -40,7 +54,7 @@ const storedId = (p: P) => runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.id
 
 describe("routing by the repo's id", () => {
   it("a project takes its repo's id from the first event, and keeps its events when the repo is renamed or transferred", async () => {
-    const p = await newProject();
+    const p = await legacy();
     const id = nextId++;
     expect(await storedId(p)).toBeNull();
     await deliverGithub("issues", issue(1, { id, full_name: p.repo }));
@@ -53,7 +67,7 @@ describe("routing by the repo's id", () => {
   });
 
   it("the old name, taken by another repo, reaches no project; nor does an event that names no id", async () => {
-    const p = await newProject();
+    const p = await legacy();
     const id = nextId++;
     await deliverGithub("issues", issue(1, { id, full_name: p.repo }));
     const other = await deliverGithub("issues", issue(2, { id: nextId++, full_name: p.repo }));
@@ -65,8 +79,8 @@ describe("routing by the repo's id", () => {
   });
 
   it("a project with no id yet is found by its name, with or without an id on the event; an id that isn't one is not kept", async () => {
-    const p = await newProject();
-    await deliverGithub("issues", issue(1, { full_name: p.repo.toUpperCase() }));
+    const p = await legacy();
+    await deliverGithub("issues", issue(1, { id: undefined, full_name: p.repo.toUpperCase() }));
     await deliverGithub("issues", issue(2, { id: "12", full_name: p.repo }));
     await deliverGithub("issues", issue(3, { id: -4, full_name: p.repo }));
     expect(await numbers(p)).toEqual([1, 2, 3]);
@@ -74,8 +88,7 @@ describe("routing by the repo's id", () => {
   });
 
   it("one repo's id never moves to another project: a second project's name with the first's id is the first's event", async () => {
-    const a = await newProject();
-    const b = await newProject();
+    const [a, b] = (await legacies(2)) as [P, P];
     const id = nextId++;
     await deliverGithub("issues", issue(1, { id, full_name: a.repo }));
     await deliverGithub("issues", issue(2, { id, full_name: b.repo }));

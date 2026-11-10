@@ -5,7 +5,7 @@ import type {
   NetworkBody, NetworkView, OutboxState, Waits, AcceptIssueBody, DeclineIssueBody, Issue,
   AddDependencyBody, PutSecretBody, SecretsAnswer, SecretView, AnswerBody, Ask, AttachPrBody, OpenPr, Attention, ListedProject, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateTaskBody, Project, ProjectRow,
   Job, ManagerStatus, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateTaskBody,
-  CreateRoutineBody, DeclineProposalBody, Note, Proposal, Routine, RoutineRun, RoutinesAnswer, UpdateRoutineBody,
+  CreateRoutineBody, DeclineProposalBody, Note, Proposal, Routine, RoutineRun, RoutinesAnswer, UpdateRoutineBody, RepoBinding, RereadBinding,
 } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
@@ -114,4 +114,7 @@ export const api = {
 
   syncState: () => call<SyncState | null>("GET", "/admin/sync-state"),
   sync: () => call<SyncResult>("POST", "/admin/sync"),
+  bindings: () => call<RepoBinding[]>("GET", "/admin/bindings"),
+  rereadBinding: (id: string) => call<RereadBinding>("POST", `/admin/bindings/${encodeURIComponent(id)}`),
+  bindRepo: (id: string, repo_id: number) => call<RereadBinding>("POST", `/admin/bindings/${encodeURIComponent(id)}/bind`, { repo_id }),
 };

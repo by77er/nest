@@ -1,5 +1,6 @@
 // The operator's page: write the app's templates and capabilities to nest's catalog again
-// (README.md#setup-the-operators), and beside it what the last sync wrote: two Panels, two-up.
+// (README.md#setup-the-operators), and beside it what the last sync wrote: two Panels, two-up. Under them,
+// each project's repo binding, with a re-read from GitHub (README.md#the-repos-binding).
 
 import { Button, Code, List, Text } from "@mantine/core";
 import { IconRefresh } from "@tabler/icons-react";
@@ -7,6 +8,7 @@ import { useSync, useSyncState } from "../../api/queries";
 import type { SyncState } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { ErrorState, icon, LoadingState, Notice, Page, PageHeader, Panel, Section, SectionGrid, Stack, weight } from "../../layout";
+import { BindingsSection } from "./BindingsSection";
 
 function Written({ s }: { s: Pick<SyncState, "written" | "repos"> }) {
   return (
@@ -85,6 +87,9 @@ export function AdminPage() {
           </Section>
         </Panel>
       </SectionGrid>
+      <Panel>
+        <BindingsSection />
+      </Panel>
     </Page>
   );
 }

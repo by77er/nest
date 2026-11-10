@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { MIGRATIONS } from "../src/do/project";
 import { migrate } from "../src/sql";
-import { AccessTeam, agentClaims, api, callTool, deliverGithub, FakeNest, installFetch, prEvent, prNode, Signer } from "./fake-nest";
+import { AccessTeam, agentClaims, api, callTool, deliverGithub, FakeNest, installFetch, prEvent, prNode, repoIdOf, Signer } from "./fake-nest";
 
 const fake = new FakeNest();
 const gh = fake.github;
@@ -72,7 +72,8 @@ describe("attaching PRs", () => {
   it("a task's PR opened after the repo was renamed is still the repo's own, by GitHub's ids: attached to its task, not a fork's", async () => {
     const p = await newProject();
     const w = await withWorker(p);
-    const id = 5_000_000 + Math.floor(Math.random() * 1_000_000);
+    // The repo's id, as attach read it from GitHub.
+    const id = repoIdOf(p.repo);
     const renamed = `${p.repo}-renamed`;
     const opened = (n: number, repoName: string, headId: number) => {
       const e = prEvent({ repo: p.repo, number: n, sha: sha(), action: "opened", ref: `task/${w.id}`, updated_at: later() });

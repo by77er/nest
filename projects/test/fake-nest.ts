@@ -85,6 +85,8 @@ export class FakeNest {
   failures: { match: RegExp; status: number; retryable?: boolean; times: number; page?: boolean }[] = [];
   /** Play a control plane from before the push opt-in was in the client layer (nest #157). */
   layerWithoutPush = false;
+  /** The repos the client's grant names, lowercased (`github.repos`); null: any (the grant isn't what a test is about). */
+  grantRepos: string[] | null = null;
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
   holds: { match: RegExp; release: Promise<void>; reached: boolean }[] = [];
   /** Creates that are made but whose answer is lost (a 500 instead), as after a timeout. */
@@ -354,7 +356,7 @@ export class FakeNest {
       this.catalog.set(`${m[1]}/${m[2]}/${m[3]}`, call.body);
       return json(200, { ok: true });
     }
-    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts, github: { repos: [], permissions: { ...GRANT_PERMISSIONS } } }, created_ms: 1 });
+    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts, github: { repos: this.grantRepos ?? [], permissions: { ...GRANT_PERMISSIONS } } }, created_ms: 1 });
     if (r === "GET /v1/clients/self/secrets") {
       return json(200, { secrets: [...this.secrets].sort(([a], [b]) => a.localeCompare(b)).map(([name, x]) => ({ name, description: x.description, size: new TextEncoder().encode(x.value).length, created_ms: x.created_ms, updated_ms: x.updated_ms, last_injected_ms: x.last_injected_ms })) });
     }
@@ -380,6 +382,7 @@ export class FakeNest {
       for (const [k, v] of Object.entries(permissions)) {
         if (!levelWithin(v, GRANT_PERMISSIONS[k])) return nestErr(403, "forbidden", `${k}: ${v} is outside the grant`);
       }
+      if (this.grantRepos && !this.grantRepos.includes(repo.toLowerCase())) return nestErr(403, "forbidden", `${repo} is outside the grant`);
       const token = this.github.mint(repo, permissions);
       // The App it's from (docs/control-plane/api/clients/#github-tokens), unless nest can't tell.
       const app = this.githubApp ? { app_id: this.githubApp.app_id, app_slug: this.githubApp.app_slug } : {};
@@ -578,13 +581,17 @@ export interface FakeCheckRun {
  */
 /** A GitHub account's id in the fake: fixed for its login. */
 export const ownerIdOf = (login: string) => 10_000 + [...login].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1_000_000, 7);
+/** A repo's GitHub id, as the fake gives it (from its first name: a rename keeps it). */
+export const repoIdOf = (name: string) => 500_000_000 + [...name.toLowerCase()].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 100_000_000, 11);
 
 export class FakeGitHub {
   /** Accounts that are organizations (a repo's owner is a user otherwise). */
   readonly orgs = new Set<string>();
   readonly calls: { method: string; path: string; body: any; token: string | null }[] = [];
   readonly tokens = new Map<string, { repo: string; permissions: Record<string, string> }>();
-  readonly repos = new Map<string, { default_branch: string; protection: Record<string, any> | null; allow_auto_merge: boolean }>();
+  readonly repos = new Map<string, { id: number; default_branch: string; protection: Record<string, any> | null; allow_auto_merge: boolean; owner_id?: number }>();
+  /** Renamed or transferred repos, old name to new: the old name answers with the repo, as GitHub's redirect does, until it's taken. */
+  readonly renamed = new Map<string, string>();
   /** Each PR's auto-merge, by node id, as GraphQL's mutations leave it. */
   readonly autoMerge = new Map<string, { method: string } | null>();
   /** Each repo's issues (PRs among them, as GitHub lists them), by number, with the comments posted on them. */
@@ -621,8 +628,27 @@ export class FakeGitHub {
 
   repo(name: string) {
     const k = name.toLowerCase();
-    if (!this.repos.has(k)) this.repos.set(k, { default_branch: "main", protection: null, allow_auto_merge: false });
+    if (!this.repos.has(k)) this.repos.set(k, { id: repoIdOf(k), default_branch: "main", protection: null, allow_auto_merge: false });
     return this.repos.get(k)!;
+  }
+
+  /** Rename (or transfer) a repo: its id stays; the old name answers with it until `take` makes it another repo's. */
+  rename(from: string, to: string): void {
+    const f = from.toLowerCase();
+    const t = to.toLowerCase();
+    this.repos.set(t, this.repo(f));
+    this.repos.delete(f);
+    // The new name is this repo's now, whatever redirected from it before.
+    this.renamed.delete(t);
+    this.renamed.set(f, t);
+  }
+
+  /** Someone registers a repo under a name a renamed repo had: the old name is that repo's from now on. */
+  take(name: string, ownerId?: number): number {
+    const k = name.toLowerCase();
+    this.renamed.delete(k);
+    this.repos.set(k, { id: repoIdOf(k) + 1, default_branch: "main", protection: null, allow_auto_merge: false, ...(ownerId === undefined ? {} : { owner_id: ownerId }) });
+    return this.repos.get(k)!.id;
   }
 
   runsOf(repo: string, sha?: string): FakeCheckRun[] {
@@ -659,11 +685,13 @@ export class FakeGitHub {
     }
     const m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)?$/);
     if (!m) return json(404, { message: "Not Found" });
-    const repoName = m[1]!.toLowerCase();
+    // A renamed repo's old name is the repo (GitHub redirects it), as is a token minted for the old name.
+    const asked = m[1]!.toLowerCase();
+    const repoName = this.renamed.get(asked) ?? asked;
     const sub = m[2] ?? "";
     const t = token ? this.tokens.get(token) : undefined;
     if (!t) return json(401, { message: "Bad credentials" });
-    if (t.repo !== repoName) return json(404, { message: "Not Found" });
+    if ((this.renamed.get(t.repo) ?? t.repo) !== repoName) return json(404, { message: "Not Found" });
     const need = (perm: string, level: string) => levelWithin(level, t.permissions[perm]);
     const denied = () => json(403, { message: "Resource not accessible by integration" });
     const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
@@ -679,7 +707,7 @@ export class FakeGitHub {
     // Its owner: the account in its name, a user unless the test made it an org.
     const owner = repoName.split("/")[0]!;
     const repoView = () => ({
-      full_name: repoName, default_branch: repo.default_branch, owner: { login: owner, id: ownerIdOf(owner), type: this.orgs.has(owner) ? "Organization" : "User" },
+      id: repo.id, full_name: repoName, default_branch: repo.default_branch, owner: { login: owner, id: repo.owner_id ?? ownerIdOf(owner), type: this.orgs.has(owner) ? "Organization" : "User" },
       ...(need("contents", "write") ? { allow_auto_merge: repo.allow_auto_merge } : {}),
     });
     if (req.method === "GET" && sub === "") {
@@ -876,6 +904,9 @@ function protectionFromPut(b: any, before: Record<string, any> | null, appOf: (c
 
 /** POST one event to /hooks/github, signed as GitHub signs it (or with what `o` changes). */
 export async function deliverGithub(event: string, payload: unknown, o: { secret?: string; signature?: string | null; delivery?: string | null; raw?: string } = {}): Promise<Response> {
+  // GitHub names the repo's id in every event: the fake's, unless the test gives one (or `id: undefined`, none).
+  const repo = (payload as { repository?: Record<string, unknown> } | null)?.repository;
+  if (repo && typeof repo === "object" && !("id" in repo) && typeof repo.full_name === "string") repo.id = repoIdOf(repo.full_name);
   const body = o.raw ?? JSON.stringify(payload);
   const signature = o.signature === undefined ? await signGithub(o.secret ?? env.GITHUB_WEBHOOK_SECRET!, new TextEncoder().encode(body)) : o.signature;
   const delivery = o.delivery === undefined ? crypto.randomUUID() : o.delivery;

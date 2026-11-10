@@ -3,6 +3,7 @@
 // the row marked ready. Each step is idempotent, so the Worker's request or, should it fail or die
 // half-way, DirectoryDO's alarm finishes it from the row; a project that can't be finished is removed.
 
+import { bindAll } from "./binding";
 import { syncCatalog } from "./catalog";
 import { directory, type Env, project, review } from "./env";
 import { nestFrom } from "./nest";
@@ -20,6 +21,9 @@ export async function syncRepos(env: Env): Promise<{ ok: true; written: string[]
   const nest = nestFrom(env);
   if (!nest) return { ok: false, status: 503, error: "NEST_CLIENT_TOKEN is not set" };
   try {
+    // Each project's repo binding first (README.md#the-repos-binding): an id for one with none, a rename
+    // applied, so the catalog names the repos by their names now.
+    await bindAll(env, nest);
     // Two syncs at once (two projects created together) may write from different snapshots, the older
     // landing last and dropping the newer repo. So each writes, then reads the repos again, and writes
     // again while they changed: the set only grows, and every sync's last write follows its last read,
