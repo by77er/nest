@@ -77,6 +77,8 @@ struct FakeDriver {
     /// VMs started and not yet stopped.
     live: Arc<AtomicUsize>,
     resume_latch: Arc<ResumeLatch>,
+    /// The same for `pause`: held, a VM's pause waits (after the caller's fence check).
+    pause_latch: Arc<ResumeLatch>,
     /// The driver says a pause doesn't stop every write to the disk (`pause_quiesces_disk`).
     leaky_pause: Arc<AtomicBool>,
     /// Memory snapshots are offered, and each one's file can't be read (a failed snapshot).
@@ -114,6 +116,7 @@ impl Driver for FakeDriver {
             stopped: self.stopped.clone(),
             live: self.live.clone(),
             resume_latch: self.resume_latch.clone(),
+            pause_latch: self.pause_latch.clone(),
             failing_memory_snapshots: self.failing_memory_snapshots.clone(),
             vm_ops: self.vm_ops.clone(),
             guest_gate: self.guest_gate.clone(),
@@ -135,6 +138,8 @@ struct FakeVm {
     stopped: Arc<Mutex<Vec<String>>>,
     live: Arc<AtomicUsize>,
     resume_latch: Arc<ResumeLatch>,
+    /// The same for `pause`: held, a VM's pause waits (after the caller's fence check).
+    pause_latch: Arc<ResumeLatch>,
     failing_memory_snapshots: Arc<AtomicBool>,
     vm_ops: Arc<Mutex<Vec<String>>>,
     guest_gate: Arc<Mutex<bool>>,
@@ -188,6 +193,11 @@ impl Vm for FakeVm {
     async fn pause(&mut self) -> std::io::Result<()> {
         if self.fail_next_pause.swap(false, Ordering::SeqCst) {
             return Err(std::io::Error::other("fake VM failed to pause"));
+        }
+        if self.pause_latch.held.load(Ordering::SeqCst) {
+            let released = self.pause_latch.release.notified();
+            self.pause_latch.reached.store(true, Ordering::SeqCst);
+            released.await;
         }
         *self.guest_gate.lock().unwrap() = true;
         self.vm_ops.lock().unwrap().push(format!("pause {}", self.spec.sandbox.0));
@@ -1065,6 +1075,9 @@ fn netns_listeners_handed_to_proxy() {
 // ---------------------------------------------------------------------------------------------
 
 struct Started {
+    /// How many times the lifecycle machine may disagree with nestd in this test (checked when
+    /// the harness is dropped): none, unless the test is about a known disagreement.
+    lifecycle_mismatches: u64,
     _host: Host,
     dir: tempfile::TempDir,
     fleet: MockFleet,
@@ -1073,6 +1086,14 @@ struct Started {
     gateway: FakeGateway,
     /// The fake driver its VMs come from (what they saw, which stopped, the next start's faults).
     vm: FakeDriver,
+}
+
+impl Drop for Started {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            assert_eq!(self._host.inner.lifecycle_mismatches(), self.lifecycle_mismatches, "the lifecycle machine disagreed with nestd (see the `lifecycle shadow mismatch` errors)");
+        }
+    }
 }
 
 /// How long the harness's nestd waits for a guest agent to come up (the fake guest is in-process).
@@ -1145,7 +1166,7 @@ async fn start_host_in(
     let proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gateway = fake_gateway(&dir.path().join("run/gateway.sock")).await;
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
-    Started { _host: host, dir, fleet, _runner: runner, proxy, gateway, vm: driver }
+    Started { lifecycle_mismatches: 0, _host: host, dir, fleet, _runner: runner, proxy, gateway, vm: driver }
 }
 
 /// Whether `pid` is still a live process (a zombie counts as dead: it has been killed).
@@ -2182,6 +2203,30 @@ async fn a_fence_during_a_checkpoints_resume_freezes_the_vm_again() {
     assert!(ops[resumed + 1..].iter().any(|o| o == "pauser sbx_1"), "frozen again after the resume: {ops:?}");
 }
 
+/// A fence that lands after a checkpoint's fence check and before its pause of the VM (the read of
+/// the disk comes between them): the checkpoint still pauses the VM, which the lifecycle machine
+/// takes as the fence's pause, not as a step out of `fenced`. The VM is never resumed, and the
+/// fence stops it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fence_between_a_checkpoints_check_and_its_pause_is_no_mismatch() {
+    let h = start_host().await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    h.vm.pause_latch.held.store(true, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
+    wait_until("the checkpoint pauses its VM", || h.vm.pause_latch.reached.load(Ordering::SeqCst)).await;
+    h.fleet.commands.send(vec![cmd("cmd_fence", CommandBody::Fence { sandboxes: vec![sbx], reason: "test".into() })]).unwrap();
+    h.fleet.wait_event("fenced", |b| matches!(b, HostEventBody::SandboxState { state: SandboxState::Fenced, .. })).await;
+    h.vm.pause_latch.held.store(false, Ordering::SeqCst);
+    h.vm.pause_latch.release.notify_waiters();
+    wait_until("the VM is stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
+    let ops = h.vm.vm_ops.lock().unwrap().clone();
+    assert!(ops.iter().any(|o| o == "pause sbx_1"), "the checkpoint's pause landed after the fence: {ops:?}");
+    assert!(!ops.iter().any(|o| o == "resume sbx_1"), "a fenced VM was resumed: {ops:?}");
+    // The harness checks, when dropped, that the machine agreed with every step.
+}
+
 /// A drain whose deadline passes while a suspend waits for its commit's answer gives the suspend
 /// that much time, never cancels it: the request is kept as unanswered, so the next commit asks
 /// again under its id. Cancelled, the record was lost, and the next commit's stale parent was
@@ -2367,6 +2412,58 @@ fn salvage_requests(fleet: &MockFleet, sandbox: &str, epoch: u64) -> Vec<Request
 
 fn distinct(ids: &[RequestId]) -> usize {
     ids.iter().collect::<std::collections::BTreeSet<_>>().len()
+}
+
+/// Audit H-B1, as nestd behaves today (the lifecycle machine's characterization of it, to be
+/// turned round when the machine decides): an archive whose commit's answer is lost returns its
+/// error and nothing else, so the row stays `archiving` with the VM paused. A checkpoint then
+/// pauses that VM again and resumes it, still `archiving`: the machine refuses that pause (it is
+/// the archive's), a disagreement the shadow reports by design, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_archive_stays_archiving_and_the_machine_refuses_what_follows() {
+    let mut h = start_host_opts(None, 400).await;
+    let sbx = SandboxId("sbx_1".into());
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    h.fleet.lose_commit_answers.store(1, Ordering::SeqCst);
+    h.fleet.commands.send(vec![cmd("cmd_archive", CommandBody::SandboxArchive { sandbox: sbx.clone(), epoch: Epoch(1) })]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_archive").await), "the archive's commit timed out");
+    let last_state = |h: &Started| {
+        let events = h.fleet.log.lock().unwrap().events.clone();
+        events.iter().rev().find_map(|e| match &e.body {
+            HostEventBody::SandboxState { state, .. } => Some(*state),
+            _ => None,
+        })
+    };
+    assert_eq!(last_state(&h), Some(SandboxState::Archiving), "no exit from `archiving`");
+    assert_eq!(*h.vm.vm_ops.lock().unwrap(), ["pause sbx_1"], "the VM stays paused");
+    assert_eq!(h._host.inner.lifecycle_mismatches(), 0, "up to here the machine follows");
+
+    checkpoint(&h.fleet, "cmd_ck", "sbx_1", 1).await;
+    assert_eq!(*h.vm.vm_ops.lock().unwrap(), ["pause sbx_1", "pause sbx_1", "resume sbx_1"], "the checkpoint runs the archive's VM again");
+    assert_eq!(last_state(&h), Some(SandboxState::Archiving));
+    // The checkpoint's pause is refused; the machine then follows the shell (a VM paused by the
+    // checkpoint), so its resume and every later checkpoint agree again.
+    h.lifecycle_mismatches = 1;
+    checkpoint(&h.fleet, "cmd_ck2", "sbx_1", 1).await;
+}
+
+/// Audit H-B2, as nestd behaves today (`lifecycle::admit_create`'s table has the rule): a create
+/// at the epoch of a suspended sandbox supersedes it, so the host fences its own live epoch and
+/// the create then fails on that tombstone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_same_epoch_create_of_a_suspended_sandbox_fences_it() {
+    let h = start_host().await;
+    h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_create").await));
+    h.fleet.commands.send(vec![suspend_cmd("cmd_suspend", "sbx_1", SuspendMode::DiskOnly)]).unwrap();
+    assert!(is_ok(&h.fleet.result("cmd_suspend").await));
+    h.fleet.commands.send(vec![create("cmd_again", "sbx_1")]).unwrap();
+    assert!(!is_ok(&h.fleet.result("cmd_again").await), "the second create fails");
+    let events = h.fleet.log.lock().unwrap().events.clone();
+    let fenced = events.iter().any(|e| matches!(&e.body, HostEventBody::SandboxState { epoch: Epoch(1), state: SandboxState::Fenced, detail: Some(d), .. } if d == "superseded by a newer epoch"));
+    assert!(fenced, "the host fenced its own epoch: {:?}", events.iter().filter(|e| matches!(e.body, HostEventBody::SandboxState { .. })).collect::<Vec<_>>());
+    assert_eq!(h._host.inner.fenced_epoch(&SandboxId("sbx_1".into())), Some(Epoch(1)));
 }
 
 async fn checkpoint(fleet: &MockFleet, id: &str, sandbox: &str, epoch: u64) -> GenerationId {

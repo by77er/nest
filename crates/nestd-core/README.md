@@ -12,6 +12,7 @@ nestd's pure state-machine cores. Each is a synchronous `step(state, input) -> e
 | `fleet` | nestd's side of the fleet link to FleetDO: connect and backoff, hello and what its ack resets, the reliable `events` outbox (seq, cumulative acks, resend, audit coalescing and shedding), inbound command dedup |
 | `lease` | The lease watchdog: self-fence once the deadline passes on `CLOCK_MONOTONIC` or `CLOCK_BOOTTIME` |
 | `incarnation` | One sandbox incarnation's lifetime: its fenced-epoch tombstone, the scan a starting nestd makes of what the last one left, and salvage on retire |
+| `lifecycle` | One incarnation's lifecycle as a machine (reported state, the VM's condition and who holds a pause) and the create's admission. The table of what nestd does today: run beside the shell, deciding nothing yet |
 | `results` | The bounded `cmd` → outcome cache, so a redelivered command answers with its first outcome |
 | `checkpoint` | The unchanged-disk memo: whether a commit may reuse the last stable pass's manifest unread |
 | `shadow` | M3′'s shadow cut: which ranges of a disk differ from its shadow, and which shadow a cut writes |

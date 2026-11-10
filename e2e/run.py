@@ -1695,6 +1695,20 @@ def run_fencing(ids):
         check("gateway refuses the fenced sandbox's binding (moved, because nestd removed it)",
               m.get("type") == "error" and m.get("error", {}).get("code") == "moved" and removed and not link_lost,
               f"{json.dumps(r)[:140]} removed={removed} link_lost={link_lost}")
+    # The lifecycle machine runs beside nestd and decides nothing yet (nestd_core::lifecycle): a
+    # step it refused, or a state it reported that nestd didn't, is logged. Over the whole run,
+    # the self-fence above included, there is none.
+    # The fence's own stop of the VM runs in a task of its own: read the log once it has been
+    # quiet for a second (10 s at most).
+    nestd_log = os.path.join(WORK, "logs", "nestd.log")
+    size, quiet_since, deadline = -1, time.time(), time.time() + 10
+    while time.time() < deadline and time.time() - quiet_since < 1:
+        now = os.path.getsize(nestd_log)
+        if now != size:
+            size, quiet_since = now, time.time()
+        time.sleep(0.1)
+    mismatches = [l for l in ANSI.sub("", read(os.path.join(WORK, "logs", "nestd.log"))).splitlines() if "lifecycle shadow mismatch" in l]
+    check("the lifecycle machine agreed with nestd throughout", not mismatches, f"{len(mismatches)} mismatches; first: {mismatches[0][:300] if mismatches else ''}")
 
 
 def main():

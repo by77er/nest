@@ -2,6 +2,7 @@
 //! their peers. See `docs/verification/nestd/`.
 
 pub mod fleet;
+pub mod incarnation;
 pub mod lease;
 pub mod sentinel;
 pub mod shadow;

@@ -191,3 +191,64 @@ fn comparing_with_the_disks_map_from_the_pre_copy_also_holds() {
     let o = check(nestd_check::shadow::ShadowModel { cfg });
     assert!(o.violations.is_empty(), "{:?}", o.violations);
 }
+
+// --- The incarnation lifecycle: nestd_core::lifecycle beside a model of the shell ----------------
+
+use nestd_check::incarnation::{self, AGREE, ARCHIVING, FENCED, IncarnationModel, LAPSED, OWN_EPOCH};
+
+const LIFECYCLE_EXAMPLES: [&str; 4] = ["a_suspended_sandbox_ran_again", "an_archive_landed", "a_fence_landed_during_a_boot", "a_fence_landed_between_a_check_and_its_pause"];
+
+/// With the three fixes the audit proposed, the shell and the table agree and every property
+/// holds, whether a suspend keeps its VM paused or releases it.
+#[test]
+fn the_fixed_lifecycle_holds() {
+    for disk_only in [false, true] {
+        let o = check(IncarnationModel { cfg: incarnation::Config { disk_only, ..incarnation::Config::fixed() } });
+        assert!(o.violations.is_empty(), "disk_only={disk_only}: violated {:?} ({} states)", o.violations, o.unique_states);
+        for e in LIFECYCLE_EXAMPLES {
+            assert!(o.examples.contains(&e), "disk_only={disk_only}: no example of {e}: {:?}", o.examples);
+        }
+    }
+}
+
+/// The shell as it is: one property fails per audit finding, and a fenced VM is still stopped.
+#[test]
+fn todays_lifecycle_has_the_audits_findings() {
+    let o = check(IncarnationModel { cfg: incarnation::Config::today() });
+    for p in [OWN_EPOCH, ARCHIVING, LAPSED, AGREE] {
+        assert!(o.violated(p), "expected {p} to fail; violated {:?} ({} states)", o.violations, o.unique_states);
+    }
+    assert!(!o.violated(FENCED));
+}
+
+/// H-B2: a create at the epoch of a suspended row fences that epoch.
+#[test]
+fn a_same_epoch_create_fences_its_own_epoch() {
+    let o = check(IncarnationModel { cfg: incarnation::Config { refuse_same_epoch: false, ..incarnation::Config::fixed() } });
+    assert_eq!(o.violations, [OWN_EPOCH], "that property and no other");
+}
+
+/// H-B1: an archive whose commit fails stays `archiving`, and the steps that follow (a
+/// checkpoint's pause of the VM the archive paused, another archive) are ones the table refuses.
+#[test]
+fn a_failed_archive_has_no_exit() {
+    let o = check(IncarnationModel { cfg: incarnation::Config { archive_rolls_back: false, ..incarnation::Config::fixed() } });
+    assert_eq!(o.violations, [ARCHIVING, AGREE]);
+}
+
+/// H-B3: a create executed after the lease lapsed starts a VM.
+#[test]
+fn a_create_after_a_lapse_starts_a_vm() {
+    let o = check(IncarnationModel { cfg: incarnation::Config { admit_checks_lapse: false, ..incarnation::Config::fixed() } });
+    assert_eq!(o.violations, [LAPSED]);
+}
+
+/// The property about fenced VMs can fail: a resume that didn't check the fence starts a fenced
+/// incarnation's VM after the fence stopped it, and nothing stops it again.
+#[test]
+fn a_resume_that_ignores_the_fence_runs_a_fenced_vm() {
+    for disk_only in [false, true] {
+        let o = check(IncarnationModel { cfg: incarnation::Config { resume_checks_fence: false, disk_only, ..incarnation::Config::fixed() } });
+        assert!(o.violated(FENCED), "disk_only={disk_only}: {:?}", o.violations);
+    }
+}

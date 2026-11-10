@@ -56,7 +56,7 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
 | Owed detaches | `nestd_core::detach::Detaches` (a data structure, not a stepped machine) | per guest: agent → (ask number, kill) while unconfirmed | ask, confirm (of the newest ask only) | none: the guest connection decides when to send (after each `configure`, before ready; every 10 s while owed; on a repeated `agent_detach`; before an attach of the agent) and keeps owed agents in `configure`; that ordering is checked by `guest.rs` and `tests/host.rs` tests, not modelled | none (memory only: the VM, and its guest, don't outlive nestd). **Constraint on memory restore (not built):** a restored guest outlives the connection that owed it a detach, so restore must carry what is owed, or the first `configure` drops the agent without stopping it | done (unit tests, mutants 0 missed) |
 | Process-driver tree rules | `nestd_core::tree` (pure functions, not a stepped machine) | none: the shell (`nestd::driver::tree`) keeps the pinned members and what it stopped | the process table as read (`/proc`), the pinned members, a snapshot of what has stopped, a task's `status` text | none: the shell opens the pidfds and sends the signals. The functions say who is a member (`members`), who is never signalled (`refusal`, `signallable`), whom a freeze's pass may stop (`stop_now`), the order of a thaw (`deepest_first`) and when a process runs no more (`runs_no_more`, `stop_pending_in`) | none | done (unit tests, mutants 0 missed); the shell's races with the kernel (a fork between two reads, a pid reused) are tested against real processes, not modelled |
 | Unchanged-disk memo | `nestd_core::checkpoint::ScanMemo` | per incarnation: the last stable pass's disk stamp and manifest | a pass (stable or not, with the stamp read after the sentinel), a stamp read before a commit | reuse the manifest, or read the disk | none (memory only) | done (M1) |
-| Incarnations | `nestd_core::incarnation` (decisions now; the machine in phase 2) | per `(sandbox, epoch)`: phase, `meta` (head, clean, unanswered), tombstone, salvage retry | commands, driver and store outcomes, commit answers, a scan at start | write meta, boot, pause or stop the VM, send `commit_request`, rename to `.del`, proxy and gateway ops, report | `meta.json`, the directory | 2 |
+| Incarnations | `nestd_core::incarnation` (decisions), `nestd_core::lifecycle` (the lifecycle machine, **run beside the shell, deciding nothing yet**: below) | per `(sandbox, epoch)`: phase, `meta` (head, clean, unanswered), tombstone, salvage retry | commands, driver and store outcomes, commit answers, a scan at start | write meta, boot, pause or stop the VM, send `commit_request`, rename to `.del`, proxy and gateway ops, report | `meta.json`, the directory | 2 |
 | Proxy link | phase 2 | mirror, `seq`, listener ownership, resync | proxy frames, connection, timers | send op, resync, pass fds | none | 2 |
 | Gateway link | phase 2 | binding keys, per-sandbox entries, pause marks (per sandbox and epoch), tombstones | gateway frames, sandbox upserts/forgets/removes | send op, replay | none | 2 |
 | Runner link (brain table) | phase 2 | brains by agent: binding, state, connection | runner frames, `agent_start`/`agent_stop`, connection | send, report `agent_exited` | none | 2 |
@@ -369,6 +369,49 @@ Phase 2 waits for the proxy link's rework (PR #28, open) to merge. Each machine 
 8. shuttle tests where a shell keeps shared-memory concurrency: host.rs's summary and per-sandbox locks, the lock-free pause handles, the fence-on-arrival path that runs beside the executor. The fleet shell needs none: one task owns its state in one `select!` loop.
 
 ### Incarnations (`nestd_core::incarnation`)
+
+**Built so far: the lifecycle machine in shadow mode** (`nestd_core::lifecycle`, 2026-11).
+
+- **What it is.** One [`Incarnation`](../../../crates/nestd-core/src/lifecycle.rs) per row: the reported state, the VM's condition (absent, running, or paused and by whom: a suspend, an archive, a checkpoint or a fence), and a `step` that takes or refuses each step the shell takes. `admit_create` is the create's admission; the shell already calls it.
+- **It is the table of what nestd does today**, known bugs included, so that a release can run it beside the shell before it decides anything. The bugs are findings of the host state-machine audit of 2026-11 (the audit itself isn't in the repo; each is stated here and listed as open in [docs/README.md](../../README.md)):
+  - **H-B1:** an archive whose commit fails has no exit: the row stays `archiving`, the VM paused.
+  - **H-B2:** a create at the epoch of a local row that is neither running nor fenced supersedes it, so the host fences its own live epoch.
+  - **H-B3:** a create is admitted under a lapsed lease (only `agent_start` consults the lapse guard). The table has no part in this one; the model shows it.
+  - **H-B4:** a step that checked the fence before it awaited acts on the VM after the fence landed: it pauses a fenced VM, or resumes one the fence paused. The fence's own stop follows, so no property below fails; the table accepts both (a fenced VM's pause is the fence's, whoever took it).
+- **How it is fed.** `Inner::shadow` (`host.rs`) feeds it every step: each state the shell reports, in the same critical section that sets the row's state (so a fence on another task never comes between the two), and each start, pause, resume and stop of a VM, after it succeeded. A step the machine refuses, or a reported state that differs from the row's, is logged at error level (`lifecycle shadow mismatch`, with the input, the machine before and after, the refusal and the row's state) and counted (`Inner::lifecycle_mismatches`); the machine then follows the shell again: the row's state, and the VM's condition that step left. There is no metrics path in nestd to export the count, and no wire field: the log line is the signal on a host.
+- **Where a mismatch fails a run:** every `tests/host.rs` test (the harness asserts the count when it is dropped), and the e2e harness (a check over nestd's log).
+- **The table is stricter than the shell in two ways, on purpose.** Where the shell goes beyond it, the step shows as a mismatch, and the machine then follows the shell:
+  - **A pause is held by the step that took it.** That step may take it again (a retry), a fence takes any pause and an archive takes a suspended VM's; nothing else takes another's. The shell does where a step left a VM paused and nothing recorded it.
+  - **A suspend begins only from `running`, an archive only from `running` or `suspended`.** The shell begins both from any state that isn't fenced.
+
+  The cases on a real host, each following a failure nestd already logs:
+
+  | After | The next step | Mismatches |
+  |---|---|---|
+  | H-B1 (an archive's commit failed: the ordinary one is a timeout) | a checkpoint | 1: its pause is the archive's |
+  | H-B1 | a retried archive | 1: it begins from `archiving` |
+  | H-B1 | a suspend | 2: it begins from `archiving`, and its pause is the archive's |
+  | a suspend left in `suspending` (its roll-back couldn't persist or resume) | a retried suspend, or an archive | 1: it begins from `suspending` |
+  | a checkpoint whose resume of the VM failed | a suspend or an archive | 1: its pause is the checkpoint's |
+
+  The rollout's "no mismatch" is judged with that in mind: each logged mismatch is read, and one not of these kinds blocks.
+- **No Kani harness:** the machine is small and finite, and its unit tests sweep every state, holder and VM condition; the mutation run on the module has none missed.
+- **The rollout:** one release on real hosts with no mismatch, then the machine starts deciding (reported state first, then the VM's condition, then retire and the start scan); the shadow comparison is deleted one release after the last step.
+- **What the model shows** (`verification/nestd/check`, `incarnation`: the real table beside a model of the shell's steps, with a fence or a lease lapse between any two):
+
+| Property | The shell today | With the audit's fix |
+|---|---|---|
+| a create never fences its own epoch | fails (H-B2): a create at a suspended row's epoch supersedes it | holds: such a create answers "already here" |
+| an `archiving` incarnation is being archived | fails (H-B1): an archive whose commit fails has no exit | holds: it lifts its pause and reports the state it began from (`Input::ArchiveRolledBack`, declared in the table, not taken by the shell yet) |
+| the machine accepts what nestd does | fails (H-B1's consequence): a checkpoint pauses the VM the failed archive left paused, and a second archive starts from `archiving` | holds |
+| no create is admitted under a lapsed lease | fails (H-B3): the admission never looks at the lease | holds: it refuses while lapsed |
+| a fenced VM is stopped once nothing is in flight | holds | holds |
+
+  The model's bounds: one sandbox, epochs 1 and 2, four commands, one fence, one lapse; a suspend that keeps its VM paused (1,412 states with the fixes, 3,013 as today) and one that releases it (1,398). A command's fence check and its pause of the VM are separate steps, so a fence lands between them too. A variant whose resume ignores the fence fails the last property, so that property can fail. After a mismatch the model's machine follows the shell as `Inner::shadow` does. Not modelled: commits beyond "landed or not", `meta.json`, crashes, the retire loop, a pause or resume that fails, and the fence's lock-free pause landing later than its mark (the table's unit tests cover those orders). Those are the rest of this section, still to build.
+- **Host-level tests** (`tests/host.rs`): `a_failed_archive_stays_archiving_and_the_machine_refuses_what_follows` (H-B1) and `a_same_epoch_create_of_a_suspended_sandbox_fences_it` (H-B2) pin today's behaviour through the real shell; they are turned round when the fixes land. H-B3 is in the model only. `a_fence_between_a_checkpoints_check_and_its_pause_is_no_mismatch` fences inside that window (H-B4) and expects agreement.
+- **Known gap, to close when the machine decides:** the fence's lock-free pause feeds the machine from a task of its own, keyed by sandbox and epoch only. A later row at the same epoch (a destroy, then a create, with that task delayed across both) could take the stale step. Nothing reaches it today: a same-epoch create fails before its VM starts.
+
+**The full design (not built):**
 
 - **State per `(sandbox, epoch)`:**
   - phase: `Creating → DiskReady → Running ↔ Paused → Suspended | Fenced | Retiring → Gone`;

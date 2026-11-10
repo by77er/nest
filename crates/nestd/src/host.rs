@@ -27,6 +27,7 @@ use nestd_core::shadow::{self as shadow_core, Shadows, Slot};
 use nestd_core::ca::{Answer as CaAnswer, CaRenewal, Saved as CaSaved};
 use nestd_core::checkpoint::{DiskStamp, Pass, SENTINEL, ScanMemo};
 use nestd_core::incarnation;
+use nestd_core::lifecycle::{self, Admission, Holder, Incarnation};
 use nestd_core::results::ResultCache;
 use nest_protocol::control::{
     AgentReport, Capacity, Command, CommandBody, CommandOutcome, CommitOutcome, ComponentVersions, DEFAULT_CWD, EgressAuditRecord,
@@ -91,6 +92,25 @@ struct Summary {
     resources: Resources,
     /// The guest's version and capabilities, cached from its last hello (reported with `running`).
     guest: Option<GuestInfo>,
+    /// The lifecycle machine, fed every step taken beside this row ([`Inner::shadow`]). It decides
+    /// nothing yet.
+    shadow: Incarnation,
+}
+
+/// The lifecycle machine's state for a reported one, and back.
+fn lifecycle_state(state: SandboxState) -> lifecycle::State {
+    match state {
+        SandboxState::Creating => lifecycle::State::Creating,
+        SandboxState::Restoring => lifecycle::State::Restoring,
+        SandboxState::Running => lifecycle::State::Running,
+        SandboxState::Suspending => lifecycle::State::Suspending,
+        SandboxState::Suspended => lifecycle::State::Suspended,
+        SandboxState::Archiving => lifecycle::State::Archiving,
+        SandboxState::Archived => lifecycle::State::Archived,
+        SandboxState::Fenced => lifecycle::State::Fenced,
+        SandboxState::Destroyed => lifecycle::State::Destroyed,
+        SandboxState::Failed => lifecycle::State::Failed,
+    }
 }
 
 struct Sbx {
@@ -303,6 +323,9 @@ pub struct Inner {
     lease_deadline: watch::Sender<Option<(Instant, Duration)>>,
     /// Starts against lease lapses (amendment A3).
     lapse_guard: LapseGuard,
+    /// Steps the lifecycle machine refused, or after which it reported another state than the row
+    /// ([`Inner::shadow`]).
+    lifecycle_mismatches: std::sync::atomic::AtomicU64,
     denied_seen: RecentSet<(SandboxId, String, u16)>,
     alerts_seen: RecentSet<(SandboxId, String, String)>,
     /// The proxy intermediate CA's renewal (`nestd_core::ca`): the installed key, its expiry, and
@@ -589,6 +612,7 @@ impl Host {
                     dirty: true,
                     resources: m.resources,
                     guest: None,
+                    shadow: Incarnation::at(lifecycle::State::Fenced, lifecycle::Vm::Absent),
                 },
             );
             let mut sbx = Sbx::new(m.sandbox.clone(), m.workstream, m.epoch, m.image, m.resources, None, m.head, cfg.vm_dir(&m.sandbox.0, m.epoch.0), f.state_dir);
@@ -617,6 +641,7 @@ impl Host {
             results: Mutex::new(ResultCache::default()),
             lease_deadline: lease_tx,
             lapse_guard: LapseGuard::default(),
+            lifecycle_mismatches: std::sync::atomic::AtomicU64::new(0),
             denied_seen: RecentSet::new(RELAY_DEDUP_WINDOW, MAX_DENIED_SEEN),
             alerts_seen: RecentSet::new(RELAY_DEDUP_WINDOW, MAX_DENIED_SEEN),
             proxy_ca: Mutex::new(proxy_ca),
@@ -757,6 +782,37 @@ impl Inner {
         &self.host_id
     }
 
+    /// How often the lifecycle machine disagreed with what nestd did (tests; each is also logged).
+    pub fn lifecycle_mismatches(&self) -> u64 {
+        self.lifecycle_mismatches.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Tell the lifecycle machine a step just taken for `id@epoch` (after the row's state was
+    /// set, where the step sets one). The machine decides nothing yet: it is run beside the shell
+    /// to find where its table and the shell differ. A step it refuses, or a state it reports that
+    /// the row doesn't hold, is logged and counted, and the machine then follows the shell again
+    /// (the row's state, and the VM's condition the step left: `Incarnation::follow`).
+    fn shadow(&self, id: &SandboxId, epoch: Epoch, input: lifecycle::Input) {
+        let mut summary = self.summary.lock().expect("summary");
+        if let Some(row) = summary.get_mut(id).filter(|r| r.epoch == epoch) {
+            self.shadow_row(id, row, input);
+        }
+    }
+
+    /// [`Self::shadow`] on the row itself, under the summary lock: a step that sets the row's state
+    /// feeds the machine in the same critical section, so a fence on another task never comes
+    /// between the two.
+    fn shadow_row(&self, id: &SandboxId, row: &mut Summary, input: lifecycle::Input) {
+        let before = row.shadow;
+        let refused = row.shadow.step(input).err();
+        let shell = lifecycle_state(row.state);
+        if refused.is_some() || row.shadow.state() != shell {
+            self.lifecycle_mismatches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(sandbox = %id, epoch = row.epoch.0, ?input, ?before, machine = ?row.shadow, ?refused, shell = ?row.state, "lifecycle shadow mismatch");
+            row.shadow.follow(shell, input);
+        }
+    }
+
     /// The fenced epoch tombstoned for `sandbox` on this host, if any (introspection and tests).
     pub fn fenced_epoch(&self, sandbox: &SandboxId) -> Option<Epoch> {
         self.tombstones.get(sandbox)
@@ -784,7 +840,7 @@ impl Inner {
 
     /// Record and report a state transition. `Fenced` is terminal for its epoch: a transition out
     /// of it (e.g. an in-flight create finishing after a fence) is refused and returns `false`.
-    fn set_state(&self, sbx: &SandboxId, epoch: Epoch, state: SandboxState, suspend_mode: Option<SuspendMode>, detail: Option<String>) -> bool {
+    fn set_state(&self, sbx: &SandboxId, epoch: Epoch, state: SandboxState, step: lifecycle::Input, suspend_mode: Option<SuspendMode>, detail: Option<String>) -> bool {
         {
             let mut summary = self.summary.lock().expect("summary");
             if let Some(s) = summary.get_mut(sbx) {
@@ -796,6 +852,7 @@ impl Inner {
                     return false;
                 }
                 s.state = state;
+                self.shadow_row(sbx, s, step);
             }
         }
         let guest = if state == SandboxState::Running { self.summary.lock().expect("summary").get(sbx).and_then(|s| s.guest.clone()) } else { None };
@@ -1233,11 +1290,14 @@ impl Inner {
                 return;
             }
             s.state = SandboxState::Fenced;
+            self.shadow_row(id, s, lifecycle::Input::Fence);
         }
         if let Some(pauser) = self.pausers.get(id, epoch) {
+            let (this, id) = (self.clone(), id.clone());
             tokio::spawn(async move {
-                if let Err(e) = pauser.pause().await {
-                    tracing::warn!(error = %e, "fence: lock-free pause failed (retried under the sandbox lock)");
+                match pauser.pause().await {
+                    Ok(()) => this.shadow(&id, epoch, lifecycle::Input::Pause(Holder::Fence)),
+                    Err(e) => tracing::warn!(error = %e, "fence: lock-free pause failed (retried under the sandbox lock)"),
                 }
             });
         }
@@ -1546,25 +1606,19 @@ impl Inner {
         fork: Option<ForkIdentity>,
     ) -> CmdResult {
         // A tombstoned epoch was fenced here: final, whatever the summary still holds.
-        if self.tombstones.refuses(&sandbox, epoch) {
-            return Err(error(error_codes::STALE_EPOCH, format!("{sandbox}@{} was fenced here", epoch.0), false));
-        }
-        let existing = self.summary.lock().expect("summary").get(&sandbox).cloned();
-        if let Some(s) = existing {
-            if s.epoch == epoch && s.state == SandboxState::Running {
-                return Ok(Some(serde_json::json!({ "note": "already running" })));
-            }
-            if s.epoch == epoch && s.state == SandboxState::Fenced {
-                return Err(error(error_codes::STALE_EPOCH, format!("{sandbox}@{} was fenced here", epoch.0), false));
-            }
-            if s.epoch > epoch {
-                return Err(error(error_codes::STALE_EPOCH, format!("{sandbox} already at epoch {}", s.epoch.0), false));
-            }
+        let local = self.summary.lock().expect("summary").get(&sandbox).map(|s| (s.epoch.0, lifecycle_state(s.state)));
+        match lifecycle::admit_create(self.tombstones.refuses(&sandbox, epoch), local, epoch.0) {
+            Admission::Create => {}
+            Admission::AlreadyRunning => return Ok(Some(serde_json::json!({ "note": "already running" }))),
+            Admission::FencedHere => return Err(error(error_codes::STALE_EPOCH, format!("{sandbox}@{} was fenced here", epoch.0), false)),
+            Admission::NewerHere(at) => return Err(error(error_codes::STALE_EPOCH, format!("{sandbox} already at epoch {at}"), false)),
             // An older local incarnation. Its lease has moved on: fence it, and retire it in the
             // background (salvage, then delete). It has its own directory, so this one never waits.
-            self.fence_sandbox(&sandbox, s.epoch, "superseded by a newer epoch", false).await;
-            if let Some(old) = self.teardown(&sandbox, DropReason::Moved).await {
-                self.retire(old);
+            Admission::Supersede(old) => {
+                self.fence_sandbox(&sandbox, Epoch(old), "superseded by a newer epoch", false).await;
+                if let Some(old) = self.teardown(&sandbox, DropReason::Moved).await {
+                    self.retire(old);
+                }
             }
         }
         let vm_dir = self.cfg.vm_dir(&sandbox.0, epoch.0);
@@ -1574,7 +1628,7 @@ impl Inner {
         let initial = if restoring { SandboxState::Restoring } else { SandboxState::Creating };
         self.summary.lock().expect("summary").insert(
             sandbox.clone(),
-            Summary { workstream: workstream.clone(), epoch, state: initial, head: from.as_ref().map(|g| g.id.clone()), dirty: false, resources, guest: None },
+            Summary { workstream: workstream.clone(), epoch, state: initial, head: from.as_ref().map(|g| g.id.clone()), dirty: false, resources, guest: None, shadow: Incarnation::new(restoring) },
         );
         self.emit(HostEventBody::SandboxState { sandbox: sandbox.clone(), epoch, state: initial, suspend_mode: None, detail: None, guest: None });
 
@@ -1603,14 +1657,14 @@ impl Inner {
         match r {
             Ok(()) => {
                 self.with_row(&sandbox, epoch, |s| s.dirty = true);
-                self.transition(&sandbox, epoch, SandboxState::Running, None, detail.clone())?;
+                self.transition(&sandbox, epoch, SandboxState::Running, lifecycle::Input::Ran, None, detail.clone())?;
                 // A newer epoch runs here: the summary's epoch refuses older ones from now on, so
                 // their tombstone goes (never this epoch's, should a fence land right now).
                 self.tombstones.prune_below(&sandbox, epoch);
                 Ok(detail.map(|d| serde_json::json!({ "note": d })))
             }
             Err(e) => {
-                self.set_state(&sandbox, epoch, SandboxState::Failed, None, Some(e.to_string()));
+                self.set_state(&sandbox, epoch, SandboxState::Failed, lifecycle::Input::BootFailed, None, Some(e.to_string()));
                 self.teardown(&sandbox, DropReason::Teardown).await;
                 self.forget_commit_locks(&sandbox, epoch);
                 // It never ran for an agent: nothing to keep, and a retry at this epoch starts clean.
@@ -1688,6 +1742,7 @@ impl Inner {
         let vm = s.vm.as_mut().expect("created");
         vm.start().await.context("start VM")?;
         self.register_pauser(&s.id, s.epoch, vm.as_ref());
+        self.shadow(&s.id, s.epoch, lifecycle::Input::Start);
         let uds = vm.vsock_uds_path();
         self.unless_fenced(s, "guest connection")?;
         let guest = GuestCtl::spawn(uds, s.id.clone(), s.epoch, hostname(&s.id), s.agent_slots(), self.guest_events.clone());
@@ -1708,6 +1763,7 @@ impl Inner {
         self.pausers.remove(&s.id, s.epoch);
         if let Some(mut vm) = s.vm.take() {
             let _ = vm.stop().await;
+            self.shadow(&s.id, s.epoch, lifecycle::Input::Stop);
         }
         // A pause mark stays: the VM is gone, and the caller's `forget` (teardown, suspend,
         // fence) drops the mark with the entry; lifting it first would let binds at a stopped VM.
@@ -1718,22 +1774,24 @@ impl Inner {
     /// gateway first: until [`Self::resume_vm`], its binds get `busy` with a short hint instead of
     /// a vsock connect that hangs. Connections already bound stall and continue with the VM. A
     /// failed pause lifts the mark again. No VM: nothing to pause.
-    async fn pause_vm(&self, s: &mut Sbx, reason: String) -> std::io::Result<()> {
+    async fn pause_vm(&self, s: &mut Sbx, by: Holder, reason: String) -> std::io::Result<()> {
         let Some(vm) = s.vm.as_mut() else { return Ok(()) };
         self.gateway.set_paused(&s.id, s.epoch, Some(SandboxPause { reason }));
         let r = vm.pause().await;
-        if r.is_err() {
-            self.gateway.set_paused(&s.id, s.epoch, None);
+        match &r {
+            Ok(()) => self.shadow(&s.id, s.epoch, lifecycle::Input::Pause(by)),
+            Err(_) => self.gateway.set_paused(&s.id, s.epoch, None),
         }
         r
     }
 
     /// Run `s`'s VM again after [`Self::pause_vm`]. The gateway admits binds again only once the
     /// VM runs: a VM that fails to resume stays marked paused, which it is.
-    async fn resume_vm(&self, s: &mut Sbx) -> std::io::Result<()> {
+    async fn resume_vm(&self, s: &mut Sbx, by: Holder) -> std::io::Result<()> {
         s.runs += 1;
         if let Some(vm) = s.vm.as_mut() {
             vm.resume().await?;
+            self.shadow(&s.id, s.epoch, lifecycle::Input::Unpause(by));
         }
         self.gateway.set_paused(&s.id, s.epoch, None);
         Ok(())
@@ -1824,8 +1882,8 @@ impl Inner {
     }
 
     /// Move `id@epoch` to `state`, or `stale_epoch` if it was fenced or superseded.
-    fn transition(&self, id: &SandboxId, epoch: Epoch, state: SandboxState, suspend_mode: Option<SuspendMode>, detail: Option<String>) -> Result<(), ErrorBody> {
-        if self.set_state(id, epoch, state, suspend_mode, detail) {
+    fn transition(&self, id: &SandboxId, epoch: Epoch, state: SandboxState, step: lifecycle::Input, suspend_mode: Option<SuspendMode>, detail: Option<String>) -> Result<(), ErrorBody> {
+        if self.set_state(id, epoch, state, step, suspend_mode, detail) {
             return Ok(());
         }
         Err(error(error_codes::STALE_EPOCH, format!("{id}@{} was fenced", epoch.0), false))
@@ -1843,7 +1901,7 @@ impl Inner {
         if state == Some(SandboxState::Suspended) {
             return Ok(Some(serde_json::json!({ "note": "already suspended" })));
         }
-        self.transition(id, epoch, SandboxState::Suspending, Some(mode), None)?;
+        self.transition(id, epoch, SandboxState::Suspending, lifecycle::Input::Suspend, Some(mode), None)?;
         let (mut s, r) = self.suspend_commit(s, mode, commit_timeout).await;
         if let Err(e) = r {
             self.roll_back_suspend(&mut s, &e).await;
@@ -1859,7 +1917,7 @@ impl Inner {
         }
         // Not reachable until resumed: clients re-resolve once instead of retrying `busy`.
         self.gateway.forget(id);
-        self.transition(id, epoch, SandboxState::Suspended, Some(mode), detail.clone())?;
+        self.transition(id, epoch, SandboxState::Suspended, lifecycle::Input::SuspendLanded, Some(mode), detail.clone())?;
         Ok(detail.map(|d| serde_json::json!({ "note": d })))
     }
 
@@ -1868,7 +1926,7 @@ impl Inner {
         if let Some(g) = &s.guest {
             let _ = g.prepare_snapshot(matches!(mode, SuspendMode::Memory)).await;
         }
-        if let Err(e) = self.pause_vm(&mut s, "suspend".into()).await {
+        if let Err(e) = self.pause_vm(&mut s, Holder::Suspend, "suspend".into()).await {
             return (s, Err(internal(e)));
         }
         s.paused = true;
@@ -1900,7 +1958,7 @@ impl Inner {
             return;
         }
         if s.paused {
-            if let Err(e) = self.resume_vm(s).await {
+            if let Err(e) = self.resume_vm(s, Holder::Suspend).await {
                 tracing::error!(sandbox = %id, epoch = epoch.0, error = %e, "a failed suspend's VM can't be resumed");
                 return;
             }
@@ -1909,7 +1967,7 @@ impl Inner {
                 let _ = g.thaw().await;
             }
         }
-        self.set_state(&id, epoch, SandboxState::Running, None, Some(format!("suspend failed: {}", why.message)));
+        self.set_state(&id, epoch, SandboxState::Running, lifecycle::Input::SuspendRolledBack, None, Some(format!("suspend failed: {}", why.message)));
     }
 
     async fn resume(self: &Arc<Self>, id: &SandboxId, epoch: Epoch) -> CmdResult {
@@ -1928,6 +1986,7 @@ impl Inner {
             self.ensure_not_fenced(id, epoch)?;
             s.runs += 1;
             s.vm.as_mut().expect("checked").resume().await.map_err(internal)?;
+            self.shadow(id, epoch, lifecycle::Input::Unpause(Holder::Suspend));
             s.paused = false;
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
@@ -1942,7 +2001,7 @@ impl Inner {
             x.dirty = true;
             x.guest = guest;
         });
-        self.transition(id, epoch, SandboxState::Running, None, None)?;
+        self.transition(id, epoch, SandboxState::Running, lifecycle::Input::Resume, None, None)?;
         Ok(None)
     }
 
@@ -1975,7 +2034,7 @@ impl Inner {
         }
         let paused_at = Instant::now();
         if running {
-            self.pause_vm(&mut s, format!("checkpoint ({})", commit_reason_wire(reason))).await.map_err(internal)?;
+            self.pause_vm(&mut s, Holder::Checkpoint, format!("checkpoint ({})", commit_reason_wire(reason))).await.map_err(internal)?;
         }
         // Paused, or no VM runs: nothing writes the disk while it is read.
         let r = self.scan(&mut s, reason, None, true).await;
@@ -1983,15 +2042,16 @@ impl Inner {
         // and all). A rejection that fences comes after this, and fences the running VM through
         // its pause handle, as a fence of any running VM does.
         if running && !self.fenced(id, epoch) {
-            if let Err(e) = self.resume_vm(&mut s).await {
+            if let Err(e) = self.resume_vm(&mut s, Holder::Checkpoint).await {
                 tracing::error!(sandbox = %id, epoch = epoch.0, error = %e, "a checkpoint's VM can't be resumed");
             }
             // A fence marks the row before its lock-free pause: one that landed between the check
             // above and this resume is undone by it, so freeze the VM again.
             if self.fenced(id, epoch)
                 && let Some(vm) = s.vm.as_mut()
+                && refreeze_fenced(id, epoch, vm.as_mut()).await
             {
-                refreeze_fenced(id, epoch, vm.as_mut()).await;
+                self.shadow(id, epoch, lifecycle::Input::Pause(Holder::Fence));
             }
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
@@ -2106,7 +2166,7 @@ impl Inner {
             None => false,
         };
         let paused_at = Instant::now();
-        if running && let Err(e) = self.pause_vm(&mut s, format!("checkpoint ({})", commit_reason_wire(reason))).await {
+        if running && let Err(e) = self.pause_vm(&mut s, Holder::Checkpoint, format!("checkpoint ({})", commit_reason_wire(reason))).await {
             // The pre-copy may have written the shadow: it wasn't held, so no cut names it.
             if let Some((slot, _, _)) = &shadow {
                 s.shadows.cut_failed(*slot);
@@ -2158,14 +2218,15 @@ impl Inner {
         let runs_at_cut = s.runs;
         let resumed = running && !self.fenced(id, epoch);
         if resumed {
-            if let Err(e) = self.resume_vm(&mut s).await {
+            if let Err(e) = self.resume_vm(&mut s, Holder::Checkpoint).await {
                 tracing::error!(sandbox = %id, epoch = epoch.0, error = %e, "a checkpoint's VM can't be resumed");
             }
             // A fence that landed between the check above and this resume is undone by it.
             if self.fenced(id, epoch)
                 && let Some(vm) = s.vm.as_mut()
+                && refreeze_fenced(id, epoch, vm.as_mut()).await
             {
-                refreeze_fenced(id, epoch, vm.as_mut()).await;
+                self.shadow(id, epoch, lifecycle::Input::Pause(Holder::Fence));
             }
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
@@ -2308,10 +2369,10 @@ impl Inner {
             drop_pending_cut(&mut *self.lock_live(id, epoch).await?, "an archive commits a newer read of the disk");
             let _commit = self.commit_turn(id, epoch).await?;
             let mut s = self.lock_live(id, epoch).await?;
-            self.transition(id, epoch, SandboxState::Archiving, None, None)?;
+            self.transition(id, epoch, SandboxState::Archiving, lifecycle::Input::Archive, None, None)?;
             if s.may_hold_work() || s.head.is_none() {
                 // Stable only if the pause landed (a failed one is ignored, as before).
-                let stable = self.pause_vm(&mut s, "archive".into()).await.is_ok() || s.paused;
+                let stable = self.pause_vm(&mut s, Holder::Archive, "archive".into()).await.is_ok() || s.paused;
                 let (s2, r) = self.commit(s, CommitReason::Archive, None, stable, self.cfg.commit_timeout()).await;
                 s = s2;
                 r?;
@@ -2319,7 +2380,7 @@ impl Inner {
             self.ensure_not_fenced(id, epoch)?;
             recovery::remove_incarnation(&s.state_dir);
         }
-        self.transition(id, epoch, SandboxState::Archived, None, None)?;
+        self.transition(id, epoch, SandboxState::Archived, lifecycle::Input::ArchiveLanded, None, None)?;
         self.teardown(id, DropReason::Teardown).await;
         self.forget_commit_locks(id, epoch);
         Ok(None)
@@ -2336,7 +2397,7 @@ impl Inner {
         }
         let exists = self.summary.lock().expect("summary").contains_key(id);
         if exists {
-            self.set_state(id, epoch, SandboxState::Destroyed, None, None);
+            self.set_state(id, epoch, SandboxState::Destroyed, lifecycle::Input::Destroy, None, None);
         }
         self.teardown(id, DropReason::Teardown).await;
         // Every incarnation of it here at or below this epoch, a retiring one included (its
@@ -3178,15 +3239,16 @@ fn grow_filesystem(disk: &std::path::Path) -> anyhow::Result<()> {
 
 /// Freeze a fenced VM again after a resume undid the fence's pause: as the fence's own pauser does,
 /// keeping what it stops when not everything can be (a fenced guest must not run on), and saying
-/// when it fails.
-async fn refreeze_fenced(id: &SandboxId, epoch: Epoch, vm: &mut dyn Vm) {
+/// when it fails. Whether the VM is frozen.
+async fn refreeze_fenced(id: &SandboxId, epoch: Epoch, vm: &mut dyn Vm) -> bool {
     let r = match vm.pauser() {
         Some(p) => p.pause().await,
         None => vm.pause().await,
     };
-    if let Err(e) = r {
+    if let Err(e) = &r {
         tracing::warn!(sandbox = %id, epoch = epoch.0, error = %e, "a fenced VM can't be frozen again");
     }
+    r.is_ok()
 }
 #[cfg(test)]
 mod tests {

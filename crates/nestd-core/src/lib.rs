@@ -28,6 +28,7 @@ pub mod fleet;
 pub mod incarnation;
 pub mod invariant;
 pub mod lease;
+pub mod lifecycle;
 pub mod results;
 pub mod shadow;
 pub mod tree;

@@ -5,10 +5,12 @@
 //! Example: `fixed,cmds=2,drops=1`. `lease[,...]` and `sentinel[,async][,trust-running][,keep-on-begin][,stale-records][,writes=N]
 //! [,commits=N][,restarts=N]` check the lease and the unchanged-disk short-circuit; `shadow[,...]` and
 //! `slots[,unheld-queue][,writes=N][,cuts=N]` M3′'s shadow cut and its two shadows.
+//! `incarnation[,today][,same-epoch][,stuck-archive][,lapsed-create][,unfenced-resume][,disk-only][,cmds=N][,fences=N][,epochs=N]`
+//! checks the lifecycle table beside a model of the shell that feeds it.
 
 use nestd_check::fleet::{Config, FleetModel, describe};
 use nestd_check::{check, counterexample};
-use nestd_check::{lease, sentinel, shadow, shadow_slots};
+use nestd_check::{incarnation, lease, sentinel, shadow, shadow_slots};
 
 fn parse(spec: &str) -> Result<Config, String> {
     let mut parts = spec.split(',');
@@ -104,6 +106,31 @@ fn main() {
             for v in &o.violations {
                 if let Some(path) = counterexample(&|| shadow::ShadowModel { cfg }, v) {
                     println!("  {v} ({} steps): {:?}", path.len() - 1, path.iter().filter_map(|(_, a)| a.clone()).collect::<Vec<_>>());
+                }
+            }
+            continue;
+        }
+        if let Some(rest) = spec.strip_prefix("incarnation") {
+            let mut cfg = incarnation::Config::fixed();
+            for p in rest.split(',').filter(|p| !p.is_empty()) {
+                match p.split_once('=') {
+                    None if p == "today" => cfg = incarnation::Config { max_cmds: cfg.max_cmds, max_fences: cfg.max_fences, max_epoch: cfg.max_epoch, disk_only: cfg.disk_only, ..incarnation::Config::today() },
+                    None if p == "unfenced-resume" => cfg.resume_checks_fence = false,
+                    None if p == "same-epoch" => cfg.refuse_same_epoch = false,
+                    None if p == "stuck-archive" => cfg.archive_rolls_back = false,
+                    None if p == "lapsed-create" => cfg.admit_checks_lapse = false,
+                    None if p == "disk-only" => cfg.disk_only = true,
+                    Some(("cmds", v)) => cfg.max_cmds = v.parse().expect("a number"),
+                    Some(("fences", v)) => cfg.max_fences = v.parse().expect("a number"),
+                    Some(("epochs", v)) => cfg.max_epoch = v.parse().expect("a number"),
+                    _ => panic!("unknown incarnation option {p}"),
+                }
+            }
+            let o = check(incarnation::IncarnationModel { cfg });
+            println!("{spec}: {} states in {:.1?}; violated {:?}; examples {:?}", o.unique_states, o.elapsed, o.violations, o.examples);
+            for v in &o.violations {
+                if let Some(path) = counterexample(&|| incarnation::IncarnationModel { cfg }, v) {
+                    println!("  {v} ({} steps): {:?}", path.len() - 1, path.iter().filter_map(|(_, a)| *a).collect::<Vec<_>>());
                 }
             }
             continue;
