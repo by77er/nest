@@ -7,7 +7,7 @@
 import { describe, expect, it } from "vitest";
 import {
   claim, createFailed, decideCommit, destroyed, evicted, failedHolder, gone, type Lease, leaseLost, type PlaceAnswer, placeAnswered,
-  failedReleased, placeWanted, reconciled, reported, retried, retriedReleased,
+  FAILED_RELEASE_MS, failedReleased, failedReleaseDue, placeWanted, reconciled, reported, retried, retriedReleased,
 } from "../src/lib/sandbox-lease";
 import type { SandboxState } from "../src/protocol/model";
 
@@ -313,8 +313,8 @@ describe("a failed sandbox's lease is released, and only an operator's retry pla
   it.each(table)("failedReleased: %s", (_w, l, host, epoch, want) => {
     const before = structuredClone(l);
     expect(failedReleased(l, host, epoch)).toBe(want);
-    // Released: unplaced, still failed, its head and epoch kept. Otherwise untouched.
-    expect(l).toEqual(want ? { ...before, host: null, lost_from: null } : before);
+    // Released: unplaced, still failed, its head kept, an epoch spent. Otherwise untouched.
+    expect(l).toEqual(want ? { ...before, host: null, lost_from: null, epoch: before.epoch + 1 } : before);
   });
 
   it("released, it is never placed on its own, even with an agent working; an operator's retry makes it placeable", () => {
@@ -323,10 +323,35 @@ describe("a failed sandbox's lease is released, and only an operator's retry pla
     expect(placeWanted(l)).toBe(false);
     expect(failedHolder(l)).toBeNull();
     expect(retriedReleased(l)).toBe(true);
-    expect(l).toMatchObject({ state: "creating", host: null, epoch: 3, head: "blake3:h" });
+    expect(l).toMatchObject({ state: "creating", host: null, epoch: 4, head: "blake3:h" });
     expect(placeWanted(l)).toBe(true);
     const c = claim(l, 1);
-    expect(c).toMatchObject({ ok: true, epoch: 4 });
+    expect(c).toMatchObject({ ok: true, epoch: 5 });
+  });
+
+  it("after the release, the old incarnation's salvage is an orphan from its host only; before it, the holder's moves the head", () => {
+    const l = failed();
+    const hostOf = (e: number) => (e === 3 ? "hst_a" : undefined);
+    const salvage = { kind: "disk_only" as const, reason: "salvage", epoch: 3, parent: "blake3:h" };
+    expect(decideCommit(l, hostOf, "hst_a", salvage)).toEqual({ kind: "head" });
+    failedReleased(l, "hst_a", 3);
+    expect(decideCommit(l, hostOf, "hst_a", salvage)).toEqual({ kind: "orphan" });
+    expect(decideCommit(l, hostOf, "hst_b", salvage)).toMatchObject({ kind: "rejected" });
+  });
+
+  it("failedReleaseDue: the whole grace from the latest failure of this holder and epoch", () => {
+    const G = FAILED_RELEASE_MS;
+    const since = (ms: number, over: object = {}) => ({ host: "hst_a", epoch: 3, ms, ...over });
+    // [what, lease, since, now, expected]
+    expect(failedReleaseDue(failed(), since(1000), 1000 + G)).toEqual({ kind: "release", host: "hst_a", epoch: 3 });
+    expect(failedReleaseDue(failed(), since(1000), 1000 + G - 1)).toEqual({ kind: "wait", at_ms: 1000 + G, since: since(1000) });
+    // A record of an older failure (another epoch, another host), or none: the grace starts now.
+    for (const stale of [since(0, { epoch: 2 }), since(0, { host: "hst_b" }), undefined]) {
+      expect(failedReleaseDue(failed(), stale, 5 * G)).toEqual({ kind: "wait", at_ms: 6 * G, since: since(5 * G) });
+    }
+    // Not failed on a host any more: nothing.
+    expect(failedReleaseDue(failed({ state: "running" }), since(0), 5 * G)).toEqual({ kind: "none" });
+    expect(failedReleaseDue(failed({ host: null }), since(0), 5 * G)).toEqual({ kind: "none" });
   });
 
   it("retriedReleased touches only a failed, unplaced sandbox with no placement in flight", () => {
