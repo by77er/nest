@@ -172,6 +172,23 @@ describe("creating a client", () => {
     }))).toEqual({ record: 0, alarm: null });
   });
 
+  it("an orphan record with anything of its subtree still live or reserved is kept, not purged", async () => {
+    const name = `busy-${rand()}`;
+    const orphan = `cli_busy${rand()}`;
+    // A record the directory doesn't name, as a dead create leaves it, but with an agent being created under it.
+    await clientStub(orphan).create({ client: orphan, name, grant: { cells: [], credentials: [], repos: [], read_repos: [], mcp_urls: [], secrets: { max_count: 0, max_bytes: 4096 }, inject_hosts: [], egress_hosts: [], max_agents: 5, max_sandboxes: 0 } as never, token_hash: "x" });
+    await runInDurableObject(clientStub(orphan), (_i: ClientDO, st: DurableObjectState) => {
+      const r = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'record'").one().value);
+      r.created_ms -= RESERVE_TTL_MS;
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'record'", JSON.stringify(r));
+      st.storage.sql.exec("INSERT INTO members (id, kind, cell, owner, labels, created_ms, state) VALUES (?, 'agent', 'c', ?, '{}', ?, 'reserved')", `agt_${rand()}`, orphan, Date.now());
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'prune'");
+    });
+    await runDue(clientStub(orphan));
+    expect(await runInDurableObject(clientStub(orphan), (_i: ClientDO, st: DurableObjectState) =>
+      st.storage.sql.exec("SELECT 1 FROM kv WHERE key = 'record'").toArray().length)).toBe(1);
+  });
+
   it("a stale reservation nobody takes over goes at the sweep", async () => {
     const name = `swept-${rand()}`;
     await dir().reserveName(name, `cli_x${rand()}`);

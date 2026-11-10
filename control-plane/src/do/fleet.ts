@@ -517,10 +517,15 @@ export class FleetDO extends DurableObject<Env> {
     }
     if (!identity) throw new NestError(ErrorCodes.UNAUTHORIZED, "unverified identity document", 401);
     const row = this.sql
-      .exec<{ host: string | null; role: string | null; account_id: string | null; region: string | null }>(
-        "SELECT host, role, account_id, region FROM launched WHERE instance_id = ?", identity.instanceId)
+      .exec<{ host: string | null; role: string | null; account_id: string | null; region: string | null; reason: string | null }>(
+        "SELECT host, role, account_id, region, reason FROM launched WHERE instance_id = ?", identity.instanceId)
       .toArray()[0];
     if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance was not launched by this control plane (in this cell)", 401);
+    // Its launch was ended (it didn't enroll in time, say): it is being terminated, and a late enrollment
+    // must not give it placements it would die under. The tick keeps terminating it (`confirmTerminations`).
+    if (row.reason !== null && !row.host) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `instance ${identity.instanceId}'s launch was ended (${row.reason}); it is being terminated`, 403);
+    }
     if (row.host && !this.neverConnected(row.host)) throw new NestError(ErrorCodes.FORBIDDEN, "instance already enrolled", 409);
     const stored = storedEnumOrNull(HostRole, row.role, "launched.role");
     const launchedAs = stored ? hostKind(stored) : null;
