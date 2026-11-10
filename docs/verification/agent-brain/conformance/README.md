@@ -429,4 +429,21 @@ Tests: `control-plane/test/restart-launch.test.ts` (mid-turn kill and resume wit
 
 ## restarting only between turns (agents/restart-when-idle, author's map, 2026-11-10)
 
-No transition is added, and the brain record isn't touched. `restartWhenIdle` is a third entry point to `ROpRestart`, with one more guard in the step that records the intent: it refuses (`busy`, storing nothing) while `current_turn` is set or a turn is queued. The model doesn't track turns in its restart guard, so this only narrows when `ROpRestart` may fire. Conforms. Tests: `control-plane/test/restart-launch.test.ts` ("restarting only between turns").
+`restartWhenIdle` is a third entry point to the operator's restart, with one more guard in the step that records the intent: it refuses (`busy`, storing nothing) while `current_turn` is set or a turn is queued. That alone didn't hold the promise. The restart's condemn comes after `processIntent`'s awaits on FleetDO (`hostGone`, `hostStatus`), the model's `ROpRestart` condemned at once, and `pump` sent a turn admitted in between, which the condemn then cut.
+
+| Model action | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| `ROpRestart` (with `SPLIT_RESTART`) | `restartOn` → `setIntent({reason: "restart"})` | yes | Records the intent only, as the code does. The model's restart is now split, so the window is in it |
+| `ROpRestartCondemn` | `processIntent`, `liveBrainStart` = `condemn`, after its awaits | yes | The brain still there and not condemned is condemned; else only the start is wanted |
+| `ROpRestartDrop` | `processIntent` throws (`requireLaunch`), `intentFailed` clears the intent | yes | `intentFailed` now pumps after clearing it, so turns held back run on the brain that stays |
+| `Pump` (with `PUMP_GUARD`) | `AgentDO.pump` | yes | **The guard:** no turn is sent while `intent.reason = "restart"`; queued turns run on the next brain |
+
+Model results (TLC 1.7.4, 4 workers):
+- **Without the guard** (`MC_nr_restart_split_noguard`): `NoCutAfterAsk` fails in 11 steps. The restart is recorded, `Pump` sends the turn, and the condemn cuts it.
+- **With the guard,** one host:
+  - `MC_nr_restart_split`: `NoCutAfterAsk` and the record's invariants hold (527,817 states).
+  - `MC_nr_restart_split_live` (`LiveSpec`): `StableTurnsDrain` and `StableNoWedge` hold (77 s).
+- **The liveness check has teeth:** an ad hoc mutant whose guard never lifts (blocked once any restart was asked) fails `StableTurnsDrain`.
+- **Two hosts:** `MC_nr_restart_split_live2` (tier `full`) did not finish in 25 minutes (7.2M distinct states, 1.6M left on the queue). TLC checks liveness only once the state graph is complete, so it shows nothing yet.
+
+Tests: `control-plane/test/restart-launch.test.ts`, "no turn starts while a restart is pending". A turn admitted at `intent:beforeCommit` isn't sent to the old brain and runs whole on the next one. A restart refused after a turn queued behind it leaves the brain, and the turn runs on it.

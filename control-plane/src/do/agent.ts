@@ -1135,6 +1135,8 @@ export class AgentDO extends DurableObject<Env> {
       }
     });
     await this.deadlines.clear("intent");
+    // A refused restart leaves the brain as it was: turns held back while it was pending run now.
+    await this.pump();
   }
 
   /**
@@ -2758,7 +2760,11 @@ export class AgentDO extends DurableObject<Env> {
 
   /** Send the next queued turn when the runner is connected and no turn is running. */
   private async pump(): Promise<void> {
-    if (!this.socket() || this.load().current_turn) return;
+    const at = this.load();
+    // Not while a restart is pending (verification/tla/agent-brain `PUMP_GUARD`): the restart condemns this
+    // brain after awaits on FleetDO, and a turn sent meanwhile would be cut. Queued turns run on the next
+    // brain, or on this one if the restart is refused (`intentFailed` pumps once it clears the intent).
+    if (!this.socket() || at.current_turn || at.intent?.reason === "restart") return;
     const next = this.queue.claimNext();
     if (!next) return;
     const info = this.update((i) => {

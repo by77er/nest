@@ -273,3 +273,62 @@ describe("restarting only between turns (when: idle)", () => {
     expect(await quiet(s)).toBe(true);
   });
 });
+
+describe("no turn starts while a restart is pending (the pump guard)", () => {
+  /** Admit a turn at the restart's decision, after its awaits on FleetDO and before its condemn. */
+  const admitAtDecision = (agent: string, text: string) => {
+    const admitted: { turn: string | null } = { turn: null };
+    return {
+      admitted,
+      install: () => runInDurableObject(agentStub(agent), (inst: AgentDO) => {
+        const self = inst as unknown as { testHooks: Record<string, () => Promise<void>> };
+        self.testHooks["intent:beforeCommit"] = async () => {
+          delete self.testHooks["intent:beforeCommit"];
+          admitted.turn = (await adminJson(`/v1/agents/${agent}/turns`, { body: { text } }, 201)).turn;
+        };
+      }),
+    };
+  };
+  const turnsOf = (agent: string) => agentStub(agent).turns() as Promise<{ turn: string; status: string; input: { kind: string } }[]>;
+
+  it("a turn admitted after the restart was recorded isn't sent to the old brain: it runs, whole, on the next one", async () => {
+    const s = await setup();
+    const r1 = await runner(s.agent, s.host.host, s.host.host_token, 1);
+    const at = admitAtDecision(s.agent, "arrived mid-restart");
+    await at.install();
+    const res = await restart(s.agent, { restart: true, when: "idle", launch: { model: "sonnet" } });
+    expect(res.status).toBe(200);
+    expect(at.admitted.turn).not.toBeNull();
+    // The old brain is condemned without ever being sent it.
+    expect(await r1.none("run_turn", 300)).toBe(true);
+    await nextCommands(s.host.ws, isKillOf(s.agent));
+    r1.close();
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped", epoch: 1 }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2, launch: { model: "sonnet" } });
+    const r2 = await runner(s.agent, s.host.host, s.host.host_token, 2);
+    const run = await r2.next("run_turn");
+    expect(run).toMatchObject({ turn: at.admitted.turn, input: { kind: "user" } });
+    // Nothing was cut: no interrupted turn, no recovery.
+    expect((await turnsOf(s.agent)).map((t) => t.status)).toEqual(["active"]);
+    r2.close();
+  });
+
+  it("a restart refused after a turn queued behind it leaves the brain as it was, and the turn runs on it", async () => {
+    const s = await setup();
+    const r1 = await runner(s.agent, s.host.host, s.host.host_token, 1);
+    // A launch stored before the rule: the restart is refused at its decision, after the turn arrived.
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.launch.model = "-p";
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+    });
+    const at = admitAtDecision(s.agent, "queued behind a refused restart");
+    await at.install();
+    expect((await restart(s.agent, { restart: true })).status).toBe(400);
+    const run = await r1.next("run_turn");
+    expect(run).toMatchObject({ turn: at.admitted.turn, input: { kind: "user" } });
+    expect(await quiet(s)).toBe(true);
+    r1.close();
+  });
+});

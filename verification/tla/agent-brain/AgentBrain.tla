@@ -105,7 +105,9 @@ CONSTANTS
   LOST_RECHECK,        \* host loss re-checks FleetDO's lost flag at delivery
   WAIT, TOMBSTONE, ACK_DELAY,
   ALLOW_CRASH, ALLOW_PART, ALLOW_LOST, ALLOW_RESET, ALLOW_WEDGE,
-  ALLOW_DRAIN, ALLOW_IDLE, ALLOW_STOP
+  ALLOW_DRAIN, ALLOW_IDLE, ALLOW_STOP,
+  SPLIT_RESTART,       \* an operator's restart records its intent, and condemns the brain in a later step (after AgentDO's awaits on FleetDO), as the code does
+  PUMP_GUARD           \* with SPLIT_RESTART: no turn is sent while a restart is pending (AgentDO.pump; 2026-11-10)
 
 VARIABLES
   up, link, conn, sinceAck, ackAge, lapsed,  \* host machine, fleet link, lease
@@ -245,8 +247,8 @@ Init ==
            prev |-> NoHost, op |-> FALSE,
            bh |-> IF o THEN OLD_HOST ELSE NoHost, be |-> IF o THEN 1 ELSE 0,
            ph |-> IF o THEN "live" ELSE "none", intent |-> o, avoid |-> IF o THEN OLD_HOST ELSE NoHost,
-           killq |-> FALSE]
-  /\ tn = [q |-> 0, cur |-> "none", arrived |-> 0]
+           killq |-> FALSE, rq |-> FALSE]
+  /\ tn = [q |-> 0, cur |-> "none", arrived |-> 0, afterAsk |-> FALSE, cut |-> FALSE]
   /\ faults = 0 /\ hBad = [h \in Hosts |-> FALSE] /\ startAfterKill = FALSE
 
 -----------------------------------------------------------------------------
@@ -260,12 +262,14 @@ Enqueue ==
 
 Pump ==
   /\ CurSock /\ tn.cur = "none" /\ tn.q > 0
-  /\ tn' = [tn EXCEPT !.q = @ - 1, !.cur = "sent"]
+  /\ (PUMP_GUARD => ~ag.rq)
+  \* afterAsk (a ghost): sent while a restart was pending, which will cut it.
+  /\ tn' = [tn EXCEPT !.q = @ - 1, !.cur = "sent", !.afterAsk = ag.rq]
   /\ UNCHANGED <<hostV, brainV, nestdV, fleetV, ag, ghostV>>
 
 TurnDone ==
   /\ tn.cur = "sent" /\ CurSock
-  /\ tn' = [tn EXCEPT !.cur = "none"]
+  /\ tn' = [tn EXCEPT !.cur = "none", !.afterAsk = FALSE]
   /\ UNCHANGED <<hostV, brainV, nestdV, fleetV, ag, ghostV>>
 
 -----------------------------------------------------------------------------
@@ -424,12 +428,33 @@ RDeadline ==
 
 \* An operator's restart (record design): condemn the brain and keep the
 \* intent; the start runs once the brain is released (maybe on the same host).
+\* With SPLIT_RESTART, only the intent here (`setIntent`); the condemn is ROpRestartCondemn.
 ROpRestart ==
-  /\ RECORD /\ ALLOW_STOP /\ CanFault /\ ag.pc = "idle" /\ ag.bh # NoHost /\ ag.ph # "condemned"
-  /\ ag' = IF A1 THEN [ag EXCEPT !.ph = "condemned", !.intent = TRUE, !.killq = TRUE]
+  /\ RECORD /\ ALLOW_STOP /\ CanFault /\ ag.pc = "idle" /\ ag.bh # NoHost /\ ag.ph # "condemned" /\ ~ag.rq
+  /\ ag' = IF SPLIT_RESTART THEN [ag EXCEPT !.rq = TRUE]
+           ELSE IF A1 THEN [ag EXCEPT !.ph = "condemned", !.intent = TRUE, !.killq = TRUE]
            ELSE [ag EXCEPT !.ph = "condemned", !.intent = TRUE, !.target = ag.bh, !.ie = ag.be, !.pc = "kill"]
   /\ faults' = faults + 1
   /\ UNCHANGED <<hostV, brainV, nestdV, fleetV, tn, hBad, startAfterKill>>
+
+\* SPLIT_RESTART: `processIntent` after its awaits on FleetDO (`hostGone`, `hostStatus`): the brain still
+\* there and not condemned is condemned, as ROpRestart did at once; else only the start is wanted.
+\* A turn sent meanwhile (Pump without PUMP_GUARD) is cut by it: the ghost `tn.cut`.
+ROpRestartCondemn ==
+  /\ SPLIT_RESTART /\ ag.rq /\ ag.pc = "idle"
+  /\ ag' = IF ag.bh # NoHost /\ ag.ph # "condemned"
+             THEN IF A1 THEN [ag EXCEPT !.ph = "condemned", !.intent = TRUE, !.killq = TRUE, !.rq = FALSE]
+                  ELSE [ag EXCEPT !.ph = "condemned", !.intent = TRUE, !.target = ag.bh, !.ie = ag.be, !.pc = "kill", !.rq = FALSE]
+             ELSE [ag EXCEPT !.intent = TRUE, !.rq = FALSE]
+  /\ tn' = [tn EXCEPT !.cut = @ \/ (tn.cur = "sent" /\ tn.afterAsk)]
+  /\ UNCHANGED <<hostV, brainV, nestdV, fleetV, ghostV>>
+
+\* SPLIT_RESTART: the pending restart is refused after it was recorded (`requireLaunch`, `intentFailed`):
+\* the intent goes, the brain stays, and queued turns run on it.
+ROpRestartDrop ==
+  /\ SPLIT_RESTART /\ ag.rq /\ ag.pc = "idle"
+  /\ ag' = [ag EXCEPT !.rq = FALSE]
+  /\ UNCHANGED <<hostV, brainV, nestdV, fleetV, tn, ghostV>>
 
 KillStored(h, e) ==
   \/ fKillDone[h] >= e
@@ -518,7 +543,7 @@ Hello(h) ==
      /\ ag' = [ag EXCEPT !.sess = h, !.sessE = bTag[h], !.lin = <<h, bBorn[h]>>,
                          !.state = IF @ \in {"starting", "detached", "errored"} THEN "ready" ELSE @,
                          !.ph = IF @ = "starting" THEN "live" ELSE @]
-     /\ tn' = IF newLin /\ tn.cur = "sent" THEN [tn EXCEPT !.q = @ + 1, !.cur = "none"] ELSE tn
+     /\ tn' = IF newLin /\ tn.cur = "sent" THEN [tn EXCEPT !.q = @ + 1, !.cur = "none", !.afterAsk = FALSE] ELSE tn
   /\ UNCHANGED <<hostV, brainV, nestdV, fleetV, ghostV>>
 
 \* The session socket drops (network); the brain lives on and may reconnect.
@@ -952,7 +977,7 @@ DrainRetire(h) ==
 TStep == TWakeDrop \/ TPendDrop \/ TDrainDrop \/ (\E h \in Hosts : TChoose(h))
          \/ TStatus \/ TKill \/ TKillAwait \/ TBump \/ TDeadline \/ TExitWait \/ TOpStop \/ TOpStart
 RStep == RWake \/ (\E h \in Hosts : RStart(h)) \/ RKill \/ RKillFail \/ RDeadline \/ REscalate
-         \/ RKillAlarm \/ RStatusRelease \/ ROpRestart \/ ROldCap
+         \/ RKillAlarm \/ RStatusRelease \/ ROpRestart \/ ROpRestartCondemn \/ ROpRestartDrop \/ ROldCap
 
 Next ==
   \/ Enqueue \/ Pump \/ TurnDone
@@ -976,7 +1001,7 @@ Fairness ==
   /\ WF_vars(TBump) /\ WF_vars(TDeadline) /\ WF_vars(TExitWait)
   /\ WF_vars(RWake) /\ WF_vars(\E h \in Hosts : RStart(h)) /\ WF_vars(RKill)
   /\ WF_vars(RDeadline) /\ WF_vars(REscalate) /\ WF_vars(RKillAlarm) /\ WF_vars(RStatusRelease)
-  /\ WF_vars(ROldCap)
+  /\ WF_vars(ROldCap) /\ WF_vars(ROpRestartCondemn)
   /\ \A h \in Hosts : WF_vars(LostSend(h)) /\ WF_vars(LostDeliver(h))
   /\ WF_vars(Issue) /\ WF_vars(ResolveResp) /\ WF_vars(Tick)
   /\ \A h \in Hosts :
@@ -1038,6 +1063,8 @@ NoEpochRegression ==
 \* condemned brain / awaiting_exit is eventually resolved).  Epoch exhaustion
 \* is the model's bound, not a wedge.
 TurnsDrain == Work ~> (~Work \/ ag.epoch = MaxEpoch)
+\* A restart asked for only between turns never cuts a turn sent after it was asked (SPLIT_RESTART).
+NoCutAfterAsk == ~tn.cut
 NoWedge == (IF RECORD THEN ag.ph = "condemned" ELSE ag.awaitH # NoHost)
            ~> ((IF RECORD THEN ag.ph # "condemned" ELSE ag.awaitH = NoHost) \/ ag.epoch = MaxEpoch)
 
