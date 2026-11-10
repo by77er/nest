@@ -12,7 +12,7 @@ import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { Capability, CatalogName, EntryName, OperatorOverrides, type SpawnerOverrides, Template } from "./lib/spec";
 import { cellIdleTtlMs, MIN_IDLE_TTL_MS } from "./lib/lifetimes";
 import {
-  CLIENT_ID, ClientName, GithubTokenRequest, githubTokenOutsideGrant, Grant, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
+  CLIENT_ID, ClientName, GithubTokenRequest, githubTokenOutsideGrant, githubTokenOwners, Grant, grantBoundIds, grantWildcardLogins, inGrantList, ownerLookups, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
   parseLabelFilters, tokenHash,
 } from "./lib/clients";
 import type { ClientScope } from "./do/catalog";
@@ -32,6 +32,7 @@ import { Port, SandboxPolicyLayer } from "./do/sandbox";
 import { type CreateAgent, type RestartResult, TRACE_HEADER } from "./do/agent";
 import { type GrantParent, inScope, parseGrantRequests } from "./lib/grants";
 import { parseAppSecret } from "./lib/github";
+import { canonicalRepos, Repo } from "./lib/repos";
 import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, hostKind, PROTOCOL_VERSION, Resources } from "./protocol/model";
 
 export { AgentDO } from "./do/agent";
@@ -149,6 +150,27 @@ async function githubAppOf(env: Env): Promise<{ app_id: number; app_slug?: strin
     console.warn("the GitHub App's identity is unavailable", e instanceof Error ? e.message : e);
     return null;
   }
+}
+
+/**
+ * A grant as it is stored (docs/control-plane/api/clients/#owner-wide-entries): each owner-wide entry's
+ * login with its GitHub account id. A login `stored` already has keeps its id (re-resolving could pick up
+ * another account that took the login after a rename); a new one is asked of GitHub through BrokerDO.
+ * One GitHub can't resolve refuses the write (409), as does a BrokerDO of the previous release (503,
+ * retryable). What the request sent as `repo_owners` is ignored.
+ */
+async function resolveGrantOwners(env: Env, grant: Grant, stored: Grant | null): Promise<Grant> {
+  const { repo_owners: _sent, ...rest } = grant;
+  const owners: Record<string, number> = {};
+  for (const login of grantWildcardLogins(grant)) {
+    const kept = stored?.repo_owners && Object.hasOwn(stored.repo_owners, login) ? stored.repo_owners[login] : undefined;
+    const id = kept ?? await newMethod("BrokerDO.githubAccountId", () => broker(env).githubAccountId(login));
+    if (id === null || id === undefined) {
+      throw new NestError(ErrorCodes.CONFLICT, `${login}/*: GitHub knows no account ${login}, so the entry can't be bound to one; nothing was saved`, 409);
+    }
+    owners[login] = id;
+  }
+  return Object.keys(owners).length ? { ...rest, repo_owners: owners } : rest;
 }
 
 /** A `/v1/clients/self/…` route's client: only a client token has a self (the operator is refused, 403). */
@@ -969,6 +991,7 @@ export const ROUTES: Route[] = [
     method: "POST", path: "/v1/admin/clients", auth: "admin", status: 201, body: z.strictObject({ name: ClientName, grant: Grant }),
     run: async ({ env, body: r }) => {
       for (const cell of r.grant.cells) checkCell(env, cell);
+      const grant = await resolveGrantOwners(env, r.grant, null);
       const id = newId("cli_");
       const token = newClientToken(id);
       // The name first, reserved (409 when taken), then the record, then the name confirmed live: only
@@ -976,7 +999,7 @@ export const ROUTES: Route[] = [
       await directory(env).reserveName(r.name, id);
       let view;
       try {
-        view = await clientDO(env, id).create({ client: id, name: r.name, grant: r.grant, token_hash: await tokenHash(token) });
+        view = await clientDO(env, id).create({ client: id, name: r.name, grant, token_hash: await tokenHash(token) });
       } catch (e) {
         // No record (or not sure): the reservation goes back now; a stale one would go at the sweep.
         await directory(env).abandonName(r.name, id).catch(() => undefined);
@@ -1014,7 +1037,9 @@ export const ROUTES: Route[] = [
     method: "PATCH", path: "/v1/admin/clients/:client", auth: "admin", body: z.strictObject({ grant: Grant }),
     run: async ({ env, p, body: r }) => {
       for (const cell of r.grant.cells) checkCell(env, cell);
-      const view = await clientDO(env, p.client).setGrant(r.grant);
+      // An owner-wide entry kept from the stored grant keeps the account id it was resolved to.
+      const stored = (await clientDO(env, p.client).info()).grant;
+      const view = await clientDO(env, p.client).setGrant(await resolveGrantOwners(env, r.grant, stored));
       // Its live sandboxes apply the new `egress_hosts` at once (a narrowed one takes rules away).
       const failed = await fanOutGrant(env, p.client);
       if (failed) throw new NestError(ErrorCodes.INTERNAL, `the grant is saved, but ${failed} of its sandboxes didn't take it yet: PATCH again`, 503, true);
@@ -1076,6 +1101,61 @@ export const ROUTES: Route[] = [
     const app = self.grant.github ? await githubAppOf(c.env) : null;
     return { ...view, ...(app ? { github_app: app } : {}) };
   } }),
+  // The repos its grant covers that nest can list (docs/control-plane/api/clients/#owner-wide-entries):
+  // every exact entry, and for each owner-wide entry the repos of that account the App's installation
+  // reaches (an account the App isn't on can't be listed: `unlisted`). Each with what it may do there.
+  route({
+    method: "GET", path: "/v1/clients/self/grant/repos", auth: "owner",
+    run: async (c) => {
+      const self = selfClient(c);
+      const g = self.grant;
+      const all = [...g.repos, ...(g.read_repos ?? []), ...(g.github?.repos ?? [])];
+      const owners: Record<string, number | null> = {};
+      const unlisted: string[] = [];
+      let complete = true;
+      for (const login of grantWildcardLogins(g)) {
+        const id = g.repo_owners && Object.hasOwn(g.repo_owners, login) ? g.repo_owners[login] : undefined;
+        if (id === undefined) {
+          unlisted.push(`${login}/*`);
+          continue;
+        }
+        const listed = await newMethod("BrokerDO.accountRepos", () => broker(c.env).accountRepos(id, { client: self.client }));
+        if (!listed.installed) unlisted.push(`${login}/*`);
+        complete &&= listed.complete;
+        for (const r of listed.repos) owners[r] = id;
+      }
+      const names = canonicalRepos([...all.filter((e) => !e.endsWith("/*")), ...Object.keys(owners)]);
+      return {
+        repos: names.map((repo) => ({
+          repo,
+          push: inGrantList(repo, g.repos, g, owners),
+          read: inGrantList(repo, [...g.repos, ...(g.read_repos ?? [])], g, owners),
+          github: inGrantList(repo, g.github?.repos ?? [], g, owners),
+        })),
+        unlisted, complete,
+      };
+    },
+  }),
+  // Which of these repos its grant covers (docs/control-plane/api/clients/#owner-wide-entries), as nest
+  // decides it: an exact entry, or an owner-wide one whose account GitHub says owns the repo. So a client
+  // needn't copy the matching. `push`: `repos`; `read`: `repos` or `read_repos`; `github`: `github.repos`.
+  route({
+    method: "POST", path: "/v1/clients/self/grant/repos", auth: "owner", body: z.strictObject({ repos: z.array(Repo).min(1).max(100) }),
+    run: async (c) => {
+      const self = selfClient(c);
+      const g = self.grant;
+      const need = ownerLookups(g, c.body.repos);
+      const owners = need.length ? await newMethod("BrokerDO.repoOwners", () => broker(c.env).repoOwners(need, grantBoundIds(g), self.client)) : {};
+      return {
+        repos: canonicalRepos(c.body.repos).map((repo) => ({
+          repo,
+          push: inGrantList(repo, g.repos, g, owners),
+          read: inGrantList(repo, [...g.repos, ...(g.read_repos ?? [])], g, owners),
+          github: inGrantList(repo, g.github?.repos ?? [], g, owners),
+        })),
+      };
+    },
+  }),
   route({
     method: "PUT", path: "/v1/clients/self/webhook", auth: "owner", body: z.strictObject({ url: z.string().min(1).max(2048) }),
     run: (c) => newMethod("ClientDO.setWebhook", () => clientDO(c.env, selfClient(c).client).setWebhook(c.body.url)),
@@ -1089,7 +1169,12 @@ export const ROUTES: Route[] = [
       const self = selfClient(c);
       const refusal = grantRefusal(self.client, githubTokenOutsideGrant(c.body, self.grant));
       if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, refusal, 403);
-      const t = await newMethod("BrokerDO.clientGithubToken", () => broker(c.env).clientGithubToken(self.client, c.body.repo, c.body.permissions));
+      // Not named exactly: within the grant only if one of its owner-wide entries' accounts owns the repo,
+      // which BrokerDO confirms with GitHub at the mint (the installation it mints from must be theirs).
+      const owners = githubTokenOwners(c.body, self.grant);
+      const t = owners === null
+        ? await newMethod("BrokerDO.clientGithubToken", () => broker(c.env).clientGithubToken(self.client, c.body.repo, c.body.permissions))
+        : await newMethod("BrokerDO.clientGithubTokenOwned", () => broker(c.env).clientGithubTokenOwned(self.client, c.body.repo, c.body.permissions, owners));
       const app = await githubAppOf(c.env);
       // `installation_id`: the installation the token was minted from (absent only from a BrokerDO of the previous release, mid-deploy).
       const installation = typeof t.installation === "number" ? { installation_id: t.installation } : {};

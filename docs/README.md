@@ -199,6 +199,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 
 ## Open questions and watch items
 
+- **Open (low):** a repo admitted under an [owner-wide grant entry](control-plane/api/clients/#owner-wide-entries) is a name from then on: a live sandbox's push tokens aren't re-checked against its owner's account id, as an exact entry's never were.
 - **Open (medium):** open asks and pending approvals are uncapped per agent and their list is unpaginated; tainted content can drive sink calls with varying arguments, one ask and approval each. See [AgentDO](control-plane/durable-objects/agent/).
 - **Not built:** events to an owner agent. API clients hear their agents' turns, exits, asks and errors, and `sandbox.destroyed`, by webhook; a spawning agent hears nothing of its children, and sandbox events (ports, egress denials and alerts), salvaged work and quota parking are only logged. The operator finds a waiting approval per agent (`GET /v1/agents/<id>/asks`), with no cell-wide listing or push. See [agents/tools/](agents/tools/#taint-and-sinks), [API clients](control-plane/api/clients/#events-to-the-owner).
 - **Open (low):** a `sandbox_create` re-issued twice: its re-issue reached FleetDO, SandboxDO was reset before recording it, and the failure's re-run re-issues it. nestd treats a create at an epoch it already runs as done. An idempotency key on `issueCommands` would close it. See [FleetDO](control-plane/durable-objects/fleet/).

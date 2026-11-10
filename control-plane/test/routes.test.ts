@@ -38,6 +38,8 @@ const NOT_ADMIN = {
   ].map((r) => [r, "owner"])),
   // A client's own: only a client token has a self, the operator's is refused (test/client-github-token.test.ts).
   "POST /v1/clients/self/github-token": "owner",
+  "GET /v1/clients/self/grant/repos": "owner",
+  "POST /v1/clients/self/grant/repos": "owner",
 };
 /** A concrete path for a pattern: each parameter as an id of its kind. */
 const concrete = (path: string) => path.replace(/[:*]([a-z]+)/g, (_m, k: string) =>

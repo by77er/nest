@@ -10,7 +10,9 @@ import {
   type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, expandSpec, type PromptRewrite, pruneCapability, pruneTemplate, type Removes,
   expandTemplate, mcpPrefix, rewritePrompt, SEED_CATALOG, SEED_VERSION, seedMigration, type SpawnSpec, Template, templatesUsing,
 } from "../lib/spec";
-import { capabilityOutsideGrant, entryVisible, type Grant, grantRefusal, namespaceOf, specOutsideGrant } from "../lib/clients";
+import {
+  capabilityOutsideGrant, capabilityRepos, grantBoundIds, REPO_OWNERS_PER_CALL, entryVisible, type Grant, grantRefusal, namespaceOf, ownerLookups, type RepoOwners, specOutsideGrant, specRepos,
+} from "../lib/clients";
 import { CLIENT_DIRECTORY } from "./client";
 import { NestError } from "../lib/util";
 import { ErrorCodes } from "../protocol/model";
@@ -187,9 +189,11 @@ export class CatalogDO extends DurableObject<Env> {
       name: mcpPrefix(name), allowLoopback: this.env.ALLOW_LOOPBACK_MCP === "1", allowLoopbackBrokered: this.env.ALLOW_LOOPBACK_BROKERED === "1",
     });
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `capability ${name}: ${r.error}`);
+    // GitHub's answer for repos only an owner-wide entry could cover; the catalog is read after this await.
+    const owners = scope ? await this.repoOwners(scope, capabilityRepos(cap)) : {};
     if (scope) {
       refuseHidden(cap.spawn ?? [], scope, `capability ${name}: spawn`);
-      const refusal = grantRefusal(scope.client, capabilityOutsideGrant(name, cap, scope.grant));
+      const refusal = grantRefusal(scope.client, capabilityOutsideGrant(name, cap, scope.grant, owners));
       if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, `capability ${name}: ${refusal}`, 403);
     }
     // Every template listing it must still hold together (e.g. a parameter default it no longer takes).
@@ -217,6 +221,9 @@ export class CatalogDO extends DurableObject<Env> {
    */
   async putTemplate(name: string, tpl: Template, scope?: ClientScope): Promise<Template> {
     refuseHidden(tpl.capabilities, scope, `template ${name}`);
+    // GitHub's answer for repos only an owner-wide entry could cover, from a first expansion; everything
+    // below runs again from the catalog as it is after this await, in one step.
+    const owners = scope ? await this.repoOwners(scope, this.templateRepos(name, tpl, scope)) : {};
     const cat = this.load();
     const r = checkTemplate(tpl, cat.capabilities);
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `template ${name}: ${r.error}`);
@@ -226,12 +233,34 @@ export class CatalogDO extends DurableObject<Env> {
       scope ? { [scope.name]: scope.client } : {});
     if (!spec.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, spec.error);
     if (scope) {
-      const refusal = grantRefusal(scope.client, specOutsideGrant(spec.value, scope.grant));
+      const refusal = grantRefusal(scope.client, specOutsideGrant(spec.value, scope.grant, owners));
       if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, `template ${name}: ${refusal}`, 403);
     }
     this.sql.exec("INSERT INTO templates (name, body) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET body = excluded.body",
       name, templateRow(tpl));
     return tpl;
+  }
+
+  /**
+   * GitHub's answer (BrokerDO) for the repos among `repos` that only an owner-wide entry of `grant` could
+   * cover (`ownerLookups`); nothing is asked for a grant of exact entries.
+   */
+  private async repoOwners(scope: ClientScope, repos: readonly string[]): Promise<RepoOwners> {
+    const grant = scope.grant;
+    const need = ownerLookups(grant, repos);
+    const out: Record<string, number | null> = {};
+    // BrokerDO answers at most `REPO_OWNERS_PER_CALL` a call; a spec may name more.
+    for (let i = 0; i < need.length; i += REPO_OWNERS_PER_CALL) {
+      Object.assign(out, await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).repoOwners(need.slice(i, i + REPO_OWNERS_PER_CALL), grantBoundIds(grant), scope.client));
+    }
+    return out;
+  }
+
+  /** The repos template `name` would reach as written (none when it doesn't expand: its checks below say why). */
+  private templateRepos(name: string, tpl: Template, scope: ClientScope): string[] {
+    const cat = this.load();
+    const spec = expandTemplate({ capabilities: cat.capabilities, templates: { [name]: tpl } }, PLATFORM_TOOL_NAMES, name, { [scope.name]: scope.client });
+    return spec.ok ? specRepos(spec.value) : [];
   }
 
   async deleteTemplate(name: string): Promise<void> {
@@ -274,7 +303,8 @@ export class CatalogDO extends DurableObject<Env> {
     const r = expandSpec(cat, PLATFORM_TOOL_NAMES, spec, await this.namespaceClients(cat, spec.template, scope));
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, r.error);
     if (scope) {
-      const refusal = grantRefusal(scope.client, specOutsideGrant(r.value, scope.grant));
+      const owners = await this.repoOwners(scope, specRepos(r.value));
+      const refusal = grantRefusal(scope.client, specOutsideGrant(r.value, scope.grant, owners));
       if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, `template ${spec.template}: ${refusal}`, 403);
     }
     return r.value;

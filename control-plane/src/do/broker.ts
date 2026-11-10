@@ -9,7 +9,7 @@ import { b64url, bytesToB64, NestError, newId } from "../lib/util";
 import {
   appJwt, type GitHubApi, githubApiOf, installationVerdict, retryMintFresh, GithubRepoPermissions, importAppKey, parseAppSecret, revokeInstallationToken, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
 } from "../lib/github";
-import { isClientId } from "../lib/clients";
+import { isClientId, REPO_OWNERS_PER_CALL } from "../lib/clients";
 import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
 import { canonicalRepos, Repo } from "../lib/repos";
 import type { GithubPermissions } from "../lib/brokered";
@@ -24,6 +24,11 @@ import {
 
 /** An installation token is reused while it has this long left (tokens last an hour: reused for 50 minutes). */
 const GITHUB_TOKEN_REUSE_MS = 10 * 60_000;
+/** A repo's owner, for an owner-wide grant entry, is asked of GitHub again after this long (a miss, sooner). */
+const REPO_OWNER_TTL_MS = 5 * 60_000;
+const REPO_OWNER_MISS_TTL_MS = 60_000;
+/** GitHub calls a client's owner-wide grant entries may cost in an hour (`spendLookups`). */
+const OWNER_LOOKUPS_PER_HOUR = 600;
 /** A repo's installation id is looked up again after this long. */
 const INSTALLATION_TTL_MS = 24 * 3_600_000;
 /** After a fresh lookup confirmed an installation a mint was refused with, no lookup for it again this long. */
@@ -134,6 +139,17 @@ export class BrokerDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS github_installations (repo TEXT PRIMARY KEY, installation INTEGER NOT NULL, fetched_ms INTEGER NOT NULL)`);
     // The App's installation on each repo, by the App (`app_id` as its credentials name it) and repo: a
     // new App is new rows. Kept a day, and dropped at once when a mint with it is refused as stale.
+    // Owner-wide grant entries (docs/control-plane/api/clients/#owner-wide-entries): each repo's owner
+    // account id as GitHub last answered it, briefly (`REPO_OWNER_TTL_MS`); and each installation's account,
+    // which never changes (an installation belongs to one account).
+    this.sql.exec("CREATE TABLE IF NOT EXISTS github_repo_owners (repo TEXT PRIMARY KEY, owner_id INTEGER, fetched_ms INTEGER NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS github_installation_accounts (installation INTEGER PRIMARY KEY, account_id INTEGER NOT NULL)");
+    // Each bound account's current login (`accountLogins`), briefly; and each client's owner-lookup budget
+    // (`spendLookups`): GitHub calls made for it this hour.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS github_account_logins (account_id INTEGER PRIMARY KEY, login TEXT, fetched_ms INTEGER NOT NULL)");
+    this.sql.exec("CREATE TABLE IF NOT EXISTS github_lookup_budget (client TEXT PRIMARY KEY, window_ms INTEGER NOT NULL, used INTEGER NOT NULL)");
+    // An account's repos the App's installation reaches, for a client's list of its grant (`accountRepos`): briefly.
+    this.sql.exec("CREATE TABLE IF NOT EXISTS github_account_repos (account_id INTEGER PRIMARY KEY, body TEXT NOT NULL, fetched_ms INTEGER NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS github_app_installations (app_id TEXT NOT NULL, repo TEXT NOT NULL, installation INTEGER NOT NULL,
       fetched_ms INTEGER NOT NULL, PRIMARY KEY (app_id, repo))`);
     // The App's identity (`GET /app`), by the `app_id` its credentials name (a new App is a new row): its
@@ -745,13 +761,29 @@ export class BrokerDO extends DurableObject<Env> {
    * deleted here. Audited as every mint is, with `caller: {client}`.
    */
   async clientGithubToken(client: string, repo: string, permissions: GithubPermissions): Promise<MintedGithubToken> {
+    return await this.mintClientGithubToken(client, repo, permissions);
+  }
+
+  /**
+   * {@link clientGithubToken} for a repo the grant covers only through owner-wide entries: minted only
+   * from an installation whose account is one of `owners`, by GitHub's answer at the mint. Its own
+   * method, so a Worker of this release meeting a BrokerDO of the previous one (which would ignore an
+   * extra argument and mint for any repo) gets a missing method, and refuses (503).
+   */
+  async clientGithubTokenOwned(client: string, repo: string, permissions: GithubPermissions, owners: readonly number[]): Promise<MintedGithubToken> {
+    if (!Array.isArray(owners)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "owners is a list of account ids", 400);
+    return await this.mintClientGithubToken(client, repo, permissions, owners);
+  }
+
+  private async mintClientGithubToken(client: string, repo: string, permissions: GithubPermissions, owners?: readonly number[]): Promise<MintedGithubToken> {
     const r = Repo.safeParse(repo);
     const p = GithubRepoPermissions.safeParse(permissions);
     if (!isClientId(client) || !r.success || !p.success || !Object.keys(p.data).length) {
       throw new NestError(ErrorCodes.INVALID_MESSAGE, "a client's GitHub token is for a cli_ client, one owner/name repo and at least one repository permission", 400);
     }
     const name = r.data.toLowerCase();
-    return await this.mintGithub(`client:${client}|${name}|${canonicalJson(p.data)}`, name, p.data, { client });
+    const only = owners === undefined ? undefined : owners.filter((o) => Number.isSafeInteger(o) && o > 0);
+    return await this.mintGithub(`client:${client}|${name}|${canonicalJson(p.data)}`, name, p.data, { client }, only);
   }
 
   /**
@@ -818,7 +850,7 @@ export class BrokerDO extends DurableObject<Env> {
    * audited (with `caller`) before anyone holds it. `installation`: the installation the token was minted
    * from, as stored with it (a cached token's is its own mint's, never the repo's installation now).
    */
-  private async mintGithub(baseKey: string, r: string, permissions: GithubPermissions, caller: unknown): Promise<MintedGithubToken> {
+  private async mintGithub(baseKey: string, r: string, permissions: GithubPermissions, caller: unknown, owners?: readonly number[]): Promise<MintedGithubToken> {
     const audit = { event: "github_installation_token", repos: [r], permissions, caller };
     let audited = false;
     const refuse = async (e: NestError, installation?: number): Promise<never> => {
@@ -837,7 +869,10 @@ export class BrokerDO extends DurableObject<Env> {
     const key = `app:${creds.app_id}|${baseKey}`;
     const cached = this.sql.exec<{ token: string; expires_ms: number; installation: number }>(
       "SELECT token, expires_ms, installation FROM github_tokens WHERE key = ?", key).toArray()[0];
-    if (cached && cached.expires_ms - Date.now() > GITHUB_TOKEN_REUSE_MS) return { token: cached.token, expires_ms: cached.expires_ms, installation: cached.installation };
+    // Under an owner-wide entry (`owners`), a cached token is served only if its installation's account is one of them.
+    if (cached && cached.expires_ms - Date.now() > GITHUB_TOKEN_REUSE_MS && (owners === undefined || this.ownedBy(cached.installation, owners))) {
+      return { token: cached.token, expires_ms: cached.expires_ms, installation: cached.installation };
+    }
     const api = githubApiOf(this.env);
     let jwt: string;
     try {
@@ -848,6 +883,28 @@ export class BrokerDO extends DurableObject<Env> {
     let installation: number | null = null;
     try {
       let t: MintedGithubToken | null = null;
+      if (owners !== undefined) {
+        // Within the grant only through an owner-wide entry: GitHub says who owns the repo now (a fresh
+        // lookup, never the cache), and the token is minted from that account's installation, or not at
+        // all. Every other outcome (not under a bound account's login, not found, moved, no answer) is the
+        // same 403, which says nothing of whether the repo exists.
+        const outside = () => refuse(new NestError(ErrorCodes.FORBIDDEN, `outside the client's grant: github repo ${r}`, 403));
+        const client = (caller as { client?: string }).client ?? "";
+        if (!(await this.underBoundLogin(r, owners, client))) return await outside();
+        this.spendLookups(client, 1);
+        let found: { id: number; account: number | null } | null;
+        try {
+          found = await api.installationOwner(jwt, r);
+        } catch {
+          return await outside();
+        }
+        installation = found?.id ?? null;
+        if (found && found.account !== null) {
+          this.sql.exec("INSERT OR REPLACE INTO github_installation_accounts (installation, account_id) VALUES (?, ?)", found.id, found.account);
+        }
+        if (!found || found.account === null || !owners.includes(found.account)) return await outside();
+        t = { ...(await api.mint(jwt, found.id, r.split("/")[1]!, permissions)), installation: found.id };
+      }
       for (let attempt = 0; t === null; attempt++) {
         const found = await this.installationOf(api, jwt, creds.app_id, r);
         const id = found.id;
@@ -871,6 +928,163 @@ export class BrokerDO extends DurableObject<Env> {
       // A refusal (e.g. permissions the installation lacks) is audited; a lost answer isn't a refusal.
       if (e instanceof NestError && !e.retryable && !audited) await refuse(e, installation ?? undefined);
       throw e;
+    }
+  }
+
+  /** Whether installation `installation` belongs to one of `owners`, as GitHub said when it was last looked up. */
+  private ownedBy(installation: number, owners: readonly number[]): boolean {
+    const a = this.sql.exec<{ account_id: number }>("SELECT account_id FROM github_installation_accounts WHERE installation = ?", installation).toArray()[0];
+    return a !== undefined && owners.includes(a.account_id);
+  }
+
+  /**
+   * The numeric id of GitHub account `login`, for an owner-wide grant entry when the operator writes it
+   * (docs/control-plane/api/clients/#owner-wide-entries): through the App's installation on it when there
+   * is one, else its public profile. Null when GitHub knows no such account. Never cached: it's read once,
+   * when the entry is first written, and kept with it.
+   */
+  async githubAccountId(login: string): Promise<number | null> {
+    if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(login)) return null;
+    return await githubApiOf(this.env).accountId(await this.appJwtOrNull(), login);
+  }
+
+  /**
+   * Each repo's owner account id as GitHub answers it (`GitHubApi.repoOwnerId`): null when it can't
+   * confirm one. Kept `REPO_OWNER_TTL_MS` (a null `REPO_OWNER_MISS_TTL_MS`), so a spawn's checks don't
+   * ask GitHub each time while an owner's change still shows within minutes. At most 100 repos a call.
+   */
+  async repoOwners(repos: readonly string[], bound: readonly number[], client: string): Promise<Record<string, number | null>> {
+    const names = [...new Set(repos.map((r) => r.toLowerCase()))].filter((r) => Repo.safeParse(r).success);
+    if (names.length > REPO_OWNERS_PER_CALL) throw new NestError(ErrorCodes.INVALID_MESSAGE, `at most ${REPO_OWNERS_PER_CALL} repos are looked up at once`, 400);
+    const out: Record<string, number | null> = {};
+    // Only repos under a bound account's current login are asked about; any other name is outside with no
+    // GitHub call (so a client can't spend the App's rate limit on names that couldn't match).
+    const logins = await this.accountLogins(bound, client);
+    let jwt: string | null | undefined;
+    for (const r of names) {
+      if (!logins.has(r.split("/")[0]!)) {
+        out[r] = null;
+        continue;
+      }
+      const row = this.sql.exec<{ owner_id: number | null; fetched_ms: number }>("SELECT owner_id, fetched_ms FROM github_repo_owners WHERE repo = ?", r).toArray()[0];
+      if (row && Date.now() - row.fetched_ms < (row.owner_id === null ? REPO_OWNER_MISS_TTL_MS : REPO_OWNER_TTL_MS)) {
+        out[r] = row.owner_id;
+        continue;
+      }
+      if (jwt === undefined) jwt = await this.appJwtOrNull();
+      this.spendLookups(client, 1);
+      const id = await githubApiOf(this.env).repoOwnerId(jwt, r);
+      this.sql.exec(`INSERT INTO github_repo_owners (repo, owner_id, fetched_ms) VALUES (?, ?, ?)
+        ON CONFLICT(repo) DO UPDATE SET owner_id = excluded.owner_id, fetched_ms = excluded.fetched_ms`, r, id, Date.now());
+      out[r] = id;
+    }
+    // Rows long past their time go (at most a day's worth of repos asked about).
+    this.sql.exec("DELETE FROM github_repo_owners WHERE fetched_ms < ?", Date.now() - 86_400_000);
+    return out;
+  }
+
+  /**
+   * The repos of account `account` the App's installation on it reaches (lowercase, sorted), for a client's
+   * list of what its owner-wide entries cover (docs/control-plane/api/clients/#owner-wide-entries). Read
+   * with a token for the whole installation, `metadata: read` only, minted and audited here, used for the
+   * listing alone and never handed out (revoked after, best effort). Kept `REPO_OWNER_TTL_MS`. `installed`
+   * false when the App isn't on the account (or no App is configured): nothing nest can list.
+   * `complete` false past 1000 repos.
+   */
+  async accountRepos(account: number, caller: { client: string }): Promise<{ installed: boolean; repos: string[]; complete: boolean }> {
+    if (!Number.isSafeInteger(account) || account <= 0) throw new NestError(ErrorCodes.INVALID_MESSAGE, "an account id is a positive integer", 400);
+    const row = this.sql.exec<{ body: string; fetched_ms: number }>("SELECT body, fetched_ms FROM github_account_repos WHERE account_id = ?", account).toArray()[0];
+    if (row && Date.now() - row.fetched_ms < REPO_OWNER_TTL_MS) return JSON.parse(row.body) as { installed: boolean; repos: string[]; complete: boolean };
+    const jwt = await this.appJwtOrNull();
+    const api = githubApiOf(this.env);
+    let out: { installed: boolean; repos: string[]; complete: boolean } = { installed: false, repos: [], complete: true };
+    this.spendLookups(caller.client, 1);
+    const installation = jwt === null ? null : await api.installationOfAccount(jwt, account);
+    if (jwt !== null && installation !== null) {
+      this.sql.exec("INSERT OR REPLACE INTO github_installation_accounts (installation, account_id) VALUES (?, ?)", installation, account);
+      const permissions = { metadata: "read" } as GithubPermissions;
+      const t = await api.mint(jwt, installation, null, permissions);
+      try {
+        // Audited before it's used (a record that can't be written: never used, and revoked all the same).
+        await this.auditMint({ event: "github_installation_token", all_repos: true, permissions, installation, expires_ms: t.expires_ms, caller, why: "listing the installation's repos for an owner-wide grant entry" });
+        const listed = await api.installationRepos(t.token);
+        // Only the account's own: GitHub's answer for each, never the name.
+        out = { installed: true, repos: [...new Set(listed.repos.filter((r) => r.owner === account).map((r) => r.repo))].sort(), complete: listed.complete };
+      } finally {
+        this.ctx.waitUntil(revokeInstallationToken(api, t.token).catch(() => undefined));
+      }
+    }
+    this.sql.exec(`INSERT INTO github_account_repos (account_id, body, fetched_ms) VALUES (?, ?, ?)
+      ON CONFLICT(account_id) DO UPDATE SET body = excluded.body, fetched_ms = excluded.fetched_ms`, account, JSON.stringify(out), Date.now());
+    // The repos it lists are known to be that account's: a check right after needn't ask GitHub again.
+    for (const r of out.repos) {
+      this.sql.exec(`INSERT INTO github_repo_owners (repo, owner_id, fetched_ms) VALUES (?, ?, ?)
+        ON CONFLICT(repo) DO UPDATE SET owner_id = excluded.owner_id, fetched_ms = excluded.fetched_ms`, r, account, Date.now());
+    }
+    return out;
+  }
+
+  /**
+   * The current logins (lowercase) of the bound accounts `bound`, each kept `REPO_OWNER_TTL_MS`: an
+   * account that renamed itself is followed within minutes, and a login another account took is never
+   * its. One GitHub call per account not kept (spent from `client`'s budget); an account GitHub can't
+   * name now has no login (its repos are outside until it can).
+   */
+  private async accountLogins(bound: readonly number[], client: string): Promise<Set<string>> {
+    const out = new Set<string>();
+    let jwt: string | null | undefined;
+    for (const id of new Set(bound)) {
+      if (!Number.isSafeInteger(id) || id <= 0) continue;
+      const row = this.sql.exec<{ login: string | null; fetched_ms: number }>("SELECT login, fetched_ms FROM github_account_logins WHERE account_id = ?", id).toArray()[0];
+      let login: string | null;
+      if (row && Date.now() - row.fetched_ms < REPO_OWNER_TTL_MS) login = row.login;
+      else {
+        if (jwt === undefined) jwt = await this.appJwtOrNull();
+        this.spendLookups(client, 1);
+        try {
+          login = await githubApiOf(this.env).accountLogin(jwt, id);
+        } catch {
+          login = null;
+        }
+        this.sql.exec(`INSERT INTO github_account_logins (account_id, login, fetched_ms) VALUES (?, ?, ?)
+          ON CONFLICT(account_id) DO UPDATE SET login = excluded.login, fetched_ms = excluded.fetched_ms`, id, login, Date.now());
+      }
+      if (login) out.add(login);
+    }
+    return out;
+  }
+
+  /** Whether `repo`'s owner part is the current login of one of the accounts `bound`. */
+  private async underBoundLogin(repo: string, bound: readonly number[], client: string): Promise<boolean> {
+    return (await this.accountLogins(bound, client)).has(repo.toLowerCase().split("/")[0]!);
+  }
+
+  /**
+   * Spend `n` of `client`'s owner-lookup budget for this hour (`OWNER_LOOKUPS_PER_HOUR`): each GitHub
+   * call nest makes to decide an owner-wide entry for it. Past it, 429 (retryable) and no call is made,
+   * so one client can't drain the App's rate limit that every client and sandbox shares.
+   */
+  private spendLookups(client: string, n: number): void {
+    const now = Date.now();
+    const row = this.sql.exec<{ window_ms: number; used: number }>("SELECT window_ms, used FROM github_lookup_budget WHERE client = ?", client).toArray()[0];
+    const fresh = !row || now - row.window_ms >= 3_600_000;
+    const used = fresh ? 0 : row.used;
+    if (used + n > OWNER_LOOKUPS_PER_HOUR) {
+      throw new NestError(ErrorCodes.RATE_LIMITED, `${client || "this client"} has asked GitHub about owner-wide grant entries ${OWNER_LOOKUPS_PER_HOUR} times this hour: try again later`, 429, true);
+    }
+    this.sql.exec(`INSERT INTO github_lookup_budget (client, window_ms, used) VALUES (?, ?, ?)
+      ON CONFLICT(client) DO UPDATE SET window_ms = excluded.window_ms, used = excluded.used`, client, fresh ? now : row.window_ms, used + n);
+  }
+
+  /** The App's JWT, or null when no usable App is configured (owner lookups then go to GitHub's public API). */
+  private async appJwtOrNull(): Promise<string | null> {
+    const app = this.secret("github_app");
+    const creds = app ? parseAppSecret(app.value) : null;
+    if (!creds) return null;
+    try {
+      return await appJwt(creds.app_id, await importAppKey(creds.private_key));
+    } catch {
+      return null;
     }
   }
 
