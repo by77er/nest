@@ -1,5 +1,6 @@
 // A project's settings: whether ready tasks are assigned automatically, how many workers may run, and
 // whether task PRs merge automatically once their review passes (with the repo's setting behind it),
+// whether reviews of untrusted PRs wait for the owner (README.md#the-review-gate),
 // and whether workers may change CI workflows (README.md#secrets). The Panels sit in one row with Save right under them at the bottom right; on a phone, one column,
 // so Save comes right after the last field.
 
@@ -75,6 +76,9 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
     initialValues: values(settings),
     validate: schemaResolver(SettingsSchema, { sync: true }),
   });
+  // The review gate (README.md#the-review-gate): held unless the project opted out. Sent only when changed.
+  const held = settings.untrusted_reviews !== "review";
+  const [hold, setHold] = useState(held);
 
   return (
     <form
@@ -82,6 +86,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
         // Whose comments count is sent only when changed: an id with no login known shows as an empty field.
         update.mutate({
           ...v,
+          ...(hold !== held ? { untrusted_reviews: hold ? ("hold" as const) : ("review" as const) } : {}),
           ...(comments_from_repo_owner ? { comments_from_repo_owner: true as const }
             : form.isDirty("comments_from_login") ? { comments_from_login: comments_from_login?.trim() || null } : {}),
         }, {
@@ -164,6 +169,23 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
             </Section>
           </Panel>
           <Panel>
+            <Section title="Reviews" order={4} region={false}>
+              <FieldGroup>
+                <Switch
+                  label="Hold reviews of PRs from forks and authors the project doesn't know"
+                  description="A held PR's review waits for your approval, per commit, in Needs you. Known authors: the PR comments user, the repo's owner and nest's own bot."
+                  checked={hold}
+                  onChange={(e) => setHold(e.currentTarget.checked)}
+                />
+                {!hold && (
+                  <Notice tone="warning" title="A reviewer agent will run on anyone's code">
+                    <Text fz="sm">With this off, every PR starts a review by itself: on a public repo, anyone's pull request spends your subscription and hosts, and its text reaches an agent.</Text>
+                  </Notice>
+                )}
+              </FieldGroup>
+            </Section>
+          </Panel>
+          <Panel>
             <Section title="PR comments" order={4} region={false}>
               <CommentsFrom
                 settings={settings}
@@ -198,7 +220,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
               Cancel
             </Button>
           )}
-          <Button type="submit" loading={update.isPending} disabled={!form.isDirty()}>
+          <Button type="submit" loading={update.isPending} disabled={!form.isDirty() && hold === held}>
             Save settings
           </Button>
         </Toolbar>

@@ -12,6 +12,7 @@ import { prNumberOf } from "./prs";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
 import { AcceptIssue, AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, PutSecret, Settings, Spec, UpdateRoutine, UpdateTask } from "./requests";
 import { PRESETS } from "./routines";
+import type { UntrustedPolicy } from "./review-trust";
 import type { Result } from "./sql";
 import { proxyTrace, proxyTraceHistory } from "./trace";
 
@@ -20,9 +21,11 @@ const json = (body: unknown, status = 200) =>
 const err = (status: number, error: string) => json({ error }, status);
 const done = <T>(r: Result<T>, status = 200) => (r.ok ? json(r.value, status) : err(r.status, r.error));
 
-/** A project's settings with ReviewDO's one, `max_concurrent_reviews`. */
-async function withReviews<T extends object>(env: Env, id: string, r: Result<T>): Promise<Result<T & { max_concurrent_reviews: number | null }>> {
-  return r.ok ? { ok: true, value: { ...r.value, max_concurrent_reviews: await review(env, id).maxConcurrent() } } : r;
+/** A project's settings with ReviewDO's: `max_concurrent_reviews`, and what happens to PRs it doesn't trust (README.md#the-review-gate). */
+async function withReviews<T extends object>(env: Env, id: string, r: Result<T>): Promise<Result<T & { max_concurrent_reviews: number | null; untrusted_reviews: UntrustedPolicy }>> {
+  if (!r.ok) return r;
+  const rv = review(env, id);
+  return { ok: true, value: { ...r.value, max_concurrent_reviews: await rv.maxConcurrent(), untrusted_reviews: await rv.untrustedPolicy() } };
 }
 
 async function body<S extends z.ZodType>(req: Request, schema: S): Promise<{ ok: true; value: z.output<S> } | { ok: false; res: Response }> {
@@ -64,7 +67,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     // Each with `needs_you`: how many asks and blocked tasks wait on the owner (README.md#blocked).
     if (m === "GET") {
       const rows = await directory(env).projects();
-      return json({ projects: await Promise.all(rows.map(async (r) => ({ ...r, needs_you: await project(env, r.id).attentionCount() }))) });
+      return json({ projects: await Promise.all(rows.map(async (r) => ({ ...r, needs_you: (await project(env, r.id).attentionCount()) + (await review(env, r.id).heldCount()) }))) });
     }
     if (m !== "POST") return err(405, "GET or POST");
     const b = await body(req, CreateProject);
@@ -96,6 +99,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   const route = rest[0] === "secrets" && rest.length === 2 ? `${m} secrets/:name`
     : rest[0] === "secret-requests" && rest.length === 3 ? `${m} secret-requests/:id/${rest[2]}`
     : rest[0] === "memory" && rest.length === 2 ? `${m} memory/:key`
+    : rest[0] === "reviews" && rest.length === 4 && /^[1-9][0-9]{0,9}$/.test(rest[1]!) && /^[0-9a-f]{40}$/.test(rest[2]!) ? `${m} reviews/:pr/:sha/${rest[3]}`
     : rest[0] === "stops" && (rest.length === 2 || rest.length === 3) && /^agt_[A-Za-z0-9]{1,64}$/.test(rest[1]!) ? `${m} ${["stops", ":agent", ...rest.slice(2)].join("/")}`
     : `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : ID.routine.test(s) ? ":routine" : ID.run.test(s) ? ":run" : ID.proposal.test(s) ? ":proposal" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
   const task = rest[1] ?? "";
@@ -114,7 +118,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     case "PATCH settings": {
       const b = await body(req, Settings);
       if (!b.ok) return b.res;
-      const { max_concurrent_reviews, ...rest } = b.value;
+      const { max_concurrent_reviews, untrusted_reviews, ...rest } = b.value;
       // Workers editing CI workflows needs the grant to allow it: refused here rather than at every spawn.
       if (rest.workers_edit_workflows === true) {
         const g = await grantOf(env);
@@ -122,6 +126,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
         if (!g.value.workflows) return err(409, "the app's grant doesn't allow workflows on push tokens: the operator must set github_push.workflows in its grant");
       }
       if (max_concurrent_reviews !== undefined) await review(env, pid).setMaxConcurrent(max_concurrent_reviews);
+      if (untrusted_reviews !== undefined) await review(env, pid).setUntrustedPolicy(untrusted_reviews);
       return done(await withReviews(env, pid, await p.updateSettings(rest)));
     }
     case "GET secrets": {
@@ -256,6 +261,11 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       return done(await p.restartManager());
     case "GET reviews":
       return json(await review(env, pid).jobs());
+    // The review gate (README.md#the-review-gate): the owner approves a held review of one head commit, or dismisses it.
+    case "POST reviews/:pr/:sha/approve":
+      return done(await review(env, pid).approve(Number(rest[1]), rest[2]!));
+    case "POST reviews/:pr/:sha/dismiss":
+      return done(await review(env, pid).dismiss(Number(rest[1]), rest[2]!));
     case "GET tasks":
       return done(await p.listTasks());
     case "POST tasks": {
@@ -318,8 +328,16 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     case "POST chat/:n/retry":
       // Sends again a message nest refused for good; one still being sent is left as it is (README.md#outboxes).
       return done(await p.retryChat(Number(rest[1])));
-    case "GET attention":
-      return done(await p.attention());
+    case "GET attention": {
+      // ProjectDO's, with the reviews held for approval (ReviewDO's), oldest first.
+      const a = (await p.attention()) as Result<{ at_ms: number }[]>;
+      if (!a.ok) return err(a.status, a.error);
+      const held = (await review(env, pid).held()).map((j) => ({ kind: "review" as const, pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
+      // PRs past every cap, with no job yet: one item, their count.
+      const skipped = await review(env, pid).skipped();
+      const backlog = skipped.count ? [{ kind: "review_backlog" as const, count: skipped.count, at_ms: skipped.at_ms ?? Date.now() }] : [];
+      return json([...a.value, ...held, ...backlog].sort((x, y) => x.at_ms - y.at_ms));
+    }
     case "GET prs/open":
       return done(await p.openPrs());
     case "POST tasks/:task/prs": {
