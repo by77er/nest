@@ -271,8 +271,9 @@ mod tests {
         }
     }
 
-    /// Kills, when dropped, every process that carries its mark in its environment: a test guest's
-    /// whole tree, whatever session or parent each process has now.
+    /// Kills, when dropped, every process that carries its mark in its environment (set by `env`
+    /// before the guest's shell, so subshells carry it too): a test guest's whole tree, whatever
+    /// session or parent each process has now.
     struct Sweep(String);
 
     impl Drop for Sweep {
@@ -306,12 +307,11 @@ mod tests {
     async fn guest_running(dir: &std::path::Path, script: &str, n: usize) -> (Box<dyn Vm>, Vec<i32>, Sweep) {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let sweep = Sweep(format!("NEST_TEST_TREE={}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-        let script = format!("export {}; {script}", sweep.0);
         let pidf = dir.join("pids");
         // Nothing of the guest's holds the test's output open (a process that escaped would stall
         // a piped run until it exits).
         let script = format!("exec >/dev/null 2>&1; {}", script.replace("PIDS", &pidf.display().to_string()));
-        let driver = ProcessDriver { guest_command: vec!["/bin/sh".into(), "-c".into(), script], mount_disk: false, gateway_gid: None, run_dir: dir.into() };
+        let driver = ProcessDriver { guest_command: vec!["env".into(), sweep.0.clone(), "/bin/sh".into(), "-c".into(), script], mount_disk: false, gateway_gid: None, run_dir: dir.into() };
         let spec = VmSpec {
             sandbox: nest_protocol::model::SandboxId("sbx_tree".into()),
             epoch: nest_protocol::model::Epoch(1),
@@ -527,7 +527,15 @@ mod tests {
         // The call returns (it polls every 50 ms): the server is init's now, outside the guest's
         // tree and session. Then it forks.
         std::fs::write(&gone, "").unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let parent = |pid: i32| std::fs::read_to_string(format!("/proc/{pid}/stat")).ok().and_then(|s| s.rsplit_once(')')?.1.split_whitespace().nth(1)?.parse::<i32>().ok());
+        let call = parent(server);
+        for _ in 0..200 {
+            if parent(server) != call {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_ne!(parent(server), call, "the call returned: the server left the tree");
         std::fs::write(&fork, "").unwrap();
         let mut child = None;
         for _ in 0..200 {

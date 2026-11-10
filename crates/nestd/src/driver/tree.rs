@@ -28,12 +28,13 @@
 //! - **Never nestd's own.** Whatever the rules above made of the process table, [`refusal`] keeps
 //!   some processes from ever being pinned, and so signalled: no process id (0 and negative pids
 //!   name process groups, -1 every process), init, nestd, nestd's ancestors, and any process
-//!   older than the guest. A bug in finding members costs a refusal, not the host.
+//!   older than the guest. A bug in finding members then never reaches those; a process younger
+//!   than the guest (another guest started later) has no such protection.
 //! - **Resume is transparent.** [`Tree::thaw`] continues exactly the processes the freezes
 //!   stopped, deepest first ([`deepest_first`]); one an agent had stopped itself (`kill -STOP`, a
 //!   suspended job) stays stopped.
 //! - **A kill goes on regardless.** It passes over a process it can't pin or stop (reported) and
-//!   keeps looking, so nothing after it in the tree escapes.
+//!   keeps looking for what comes after it in the tree.
 //! - **Quiescence is per thread, not per I/O.** A process counts as stopped once every thread of
 //!   it is, and one in an uninterruptible wait with SIGSTOP pending (a write throttled on dirty
 //!   pages) counts as stopped though that write may still finish. In a multithreaded process whose
@@ -330,8 +331,10 @@ impl Tree {
     }
 
     /// For a fence: stop what can be stopped and keep it stopped, passing over (and reporting) what
-    /// can't be, so a fenced guest runs no more than it must. [`Tree::freeze`] undoes a failed
-    /// freeze instead, since a commit's failed pause must leave the guest as it was. Blocking.
+    /// can't be, so a fenced guest runs no more than it must. The descendants of a member that
+    /// can't be stopped run on too (each waits for its parent to stop) until the stop that follows
+    /// a fence kills them. [`Tree::freeze`] undoes a failed freeze instead, since a commit's failed
+    /// pause must leave the guest as it was. Blocking.
     pub fn halt(&mut self) -> io::Result<()> {
         self.halt_within(FREEZE_BUDGET)
     }
@@ -353,8 +356,8 @@ impl Tree {
         }
     }
 
-    /// [`Tree::freeze`], keeping whatever it stopped when it fails. `killing`: a kill follows, so
-    /// a process that can't be pinned or stopped is passed over (and reported) instead of ending
+    /// [`Tree::freeze`], keeping whatever it stopped when it fails. `killing` (a kill follows, or
+    /// this is a fence's halt): a process that can't be pinned or stopped is passed over (and reported) instead of ending
     /// the discovery of what comes after it.
     fn freeze_keeping(&mut self, budget: Duration, killing: bool) -> io::Result<()> {
         let deadline = Instant::now() + budget;
@@ -460,7 +463,9 @@ impl Tree {
     /// Freeze (as far as it goes, keeping what it stopped and passing over what it can't hold),
     /// then kill every member, parents first, so no parent outlives the scan that found its
     /// children; then look again, and kill what a parent that wasn't stopped started meanwhile,
-    /// until nothing new is found (bounded). The tree is dead afterwards: the caller reaps the guest.
+    /// until nothing new is found (bounded). After a freeze that failed, a child that a member in a
+    /// session of its own started after the last look, and that the member's death orphaned, is
+    /// missed. The tree is dead afterwards: the caller reaps the guest.
     pub fn kill(&mut self) {
         if self.dead {
             return;
@@ -518,8 +523,8 @@ mod tests {
         assert_eq!(super::refusal(61, 100, 60, 100, &looped), Some("an ancestor of nestd"));
     }
 
-    /// The shell refuses them too: a tree is never rooted at init, at no pid, at this process or
-    /// at its parent, and a tree whose members are found by a wrong rule never signals them.
+    /// The shell refuses them as a root too: a tree is never rooted at init, at no pid, at this
+    /// process or at its parent.
     #[test]
     fn a_tree_is_never_rooted_at_a_process_nestd_must_not_signal() {
         let own = std::process::id() as i32;
