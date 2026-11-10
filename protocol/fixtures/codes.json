@@ -18,7 +18,8 @@
     "outcome_unknown",
     "conflict",
     "not_found",
-    "tool_error"
+    "tool_error",
+    "busy"
   ],
   "gateway_error_codes": [
     "unauthorized",

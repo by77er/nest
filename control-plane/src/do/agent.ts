@@ -813,12 +813,35 @@ export class AgentDO extends DurableObject<Env> {
    * changes, the last stored is the one the brain starts with. Answers what was stored.
    */
   async restartWith(change: LaunchChange, hostHint?: string): Promise<RestartResult> {
+    return this.restartOn(change, hostHint, undefined);
+  }
+
+  /**
+   * As `restartWith`, only between turns (`POST /start {restart: true, when: "idle"}`): refused with
+   * `busy` (409, retryable, naming the turn) while a turn runs or is queued to start, with nothing
+   * stored. A method of its own, so a Worker of this release never sends it to an AgentDO of the
+   * previous one, which would restart regardless (it answers "does not implement": a 503).
+   */
+  async restartWhenIdle(change: LaunchChange, hostHint?: string): Promise<RestartResult> {
+    return this.restartOn(change, hostHint, "idle");
+  }
+
+  private async restartOn(change: LaunchChange, hostHint: string | undefined, when: "idle" | undefined): Promise<RestartResult> {
     if (hostHint) await this.requireBrainHost(this.load().cell, hostHint);
-    // From here to the intent's write, no await: the check is of what is stored with it.
+    // From here to the intent's write, no await: the checks are of what is stored with it.
     const info = this.load();
     this.refuseEnded(info, "starts");
     const bad = launchProblem(changedLaunch(info.launch, change));
     if (bad) throw new NestError(ErrorCodes.INVALID_MESSAGE, `the agent's ${bad}`);
+    // Only between turns, when asked: nothing runs and nothing is queued to start, checked in the step
+    // that records the restart, so no turn can be admitted between the check and the restart that would cut it.
+    if (when === "idle") {
+      const running = info.current_turn;
+      const next = running === null ? this.queue.nextQueued() : undefined;
+      if (running !== null || next !== undefined) {
+        throw new NestError(ErrorCodes.BUSY, running !== null ? `turn ${running} is running` : `turn ${next} is queued to start`, 409, true);
+      }
+    }
     await this.setIntent({ ...(hostHint ? { host_hint: hostHint } : {}), reason: "restart" }, change);
     const r = await this.runIntent(true);
     const now = this.load().launch;

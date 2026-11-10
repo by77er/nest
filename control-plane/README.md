@@ -61,7 +61,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      `captain` as `owner`, top-level `launch` and `rules` as overrides, and `grants` intersects the tools silently.
      Answers 201 with the agent and `started`; a start that can't run yet (no brain host, a cold cell) keeps its
      intent and runs when room appears, and the answer says why in `start_waiting` (an error body) with `started: null`
-   - `POST /v1/agents/<id>/start {host?, restart?, launch?}`: start (or restart) the brain; with `restart: true`, `launch: {model?, effort?}` restarts it on them, resuming its session (the owner's: [restarting on another model](../docs/control-plane/api/#restarting-on-another-model)); `host` puts it on a chosen active,
+   - `POST /v1/agents/<id>/start {host?, restart?, launch?, when?}`: start (or restart) the brain; with `restart: true`, `launch: {model?, effort?}` restarts it on them, resuming its session, and `when: "idle"` only between turns (`409 busy` while a turn runs or is queued) (the owner's: [restarting on another model](../docs/control-plane/api/#restarting-on-another-model)); `host` puts it on a chosen active,
      connected host of the cell (for a test); hands still go through the sandbox's gateway. Answers `{host, cmd}`;
      `kind: none` when the brain already runs (nothing sent; `{restart: true}` restarts it: condemned, then started
      again once released); `kind: waiting, waiting_for: <host>` when the brain runs on another host: it is condemned

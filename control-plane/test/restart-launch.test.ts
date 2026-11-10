@@ -195,3 +195,81 @@ describe("only the agent's owner", () => {
     expect((await nextCommands(host.ws, isStartOf(agent))).find(isStartOf(agent)).launch.model).toBe("sonnet");
   });
 });
+
+describe("restarting only between turns (when: idle)", () => {
+  const busy = async (res: Response) => {
+    expect(res.status).toBe(409);
+    const body = (await res.json()) as { error: { code: string; message: string; retryable: boolean } };
+    expect(body.error).toMatchObject({ code: "busy", retryable: true });
+    return body.error.message;
+  };
+
+  it("is refused while a turn runs, naming it, with nothing stored and the brain left running", async () => {
+    const s = await setup();
+    const r1 = await runner(s.agent, s.host.host, s.host.host_token, 1);
+    const turn = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "working" } }, 201)).turn;
+    await r1.next("run_turn", (m) => m.turn === turn);
+    expect(await busy(await restart(s.agent, { restart: true, when: "idle", launch: { model: "sonnet" } }))).toContain(turn);
+    expect(await stored(s.agent)).toEqual({ model: null, effort: null });
+    const info = (await agentStub(s.agent).info()) as unknown as { intent: unknown; brain: { phase: string } };
+    expect(info.intent ?? null).toBeNull();
+    expect(info.brain.phase).not.toBe("condemned");
+    expect(await quiet(s)).toBe(true);
+    r1.close();
+  });
+
+  it("is refused while a turn is queued to start", async () => {
+    const s = await setup();
+    // No runner yet: the turn waits for the brain's session.
+    const turn = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "next" } }, 201)).turn;
+    expect(await busy(await restart(s.agent, { restart: true, when: "idle" }))).toContain(turn);
+    expect(await quiet(s)).toBe(true);
+  });
+
+  it("a turn admitted while the restart awaits (before its step) is seen there: refused, nothing stored", async () => {
+    const s = await setup();
+    await runner(s.agent, s.host.host, s.host.host_token, 1);
+    // The operator's host hint awaits FleetDO before the restart's step; a turn arrives meanwhile.
+    let turn = "";
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      const self = inst as unknown as { requireBrainHost: (cell: string, host: string) => Promise<void> };
+      const real = self.requireBrainHost.bind(inst);
+      self.requireBrainHost = async (cell: string, host: string) => {
+        await real(cell, host);
+        turn = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "just in time" } }, 201)).turn;
+      };
+    });
+    expect(await busy(await restart(s.agent, { restart: true, when: "idle", host: s.host.host, launch: { model: "sonnet" } }))).toContain(turn);
+    expect(await stored(s.agent)).toEqual({ model: null, effort: null });
+    expect(await s.host.ws.none("commands", 150, (m) => (m.commands as any[]).some(isKillOf(s.agent)))).toBe(true);
+  });
+
+  it("idle: the restart goes ahead, on the new launch", async () => {
+    const s = await setup();
+    const r1 = await runner(s.agent, s.host.host, s.host.host_token, 1);
+    const turn = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "done soon" } }, 201)).turn;
+    await r1.next("run_turn", (m) => m.turn === turn);
+    r1.send({ type: "events", seq: 1, events: [
+      { agent: s.agent, epoch: 1, seq: 1, ts_ms: 1, turn, type: "turn_started", input_kind: "user" },
+      { agent: s.agent, epoch: 1, seq: 2, ts_ms: 2, turn, type: "turn_completed", stop_reason: "end_turn" },
+    ] });
+    await r1.next("ack", (m) => m.up_to === 1);
+    expect(((await agentStub(s.agent).info()) as unknown as { current_turn: string | null }).current_turn).toBeNull();
+    const res = await restart(s.agent, { restart: true, when: "idle", launch: { model: "sonnet" } });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ kind: "waiting", launch: { model: "sonnet", effort: null } });
+    expect((await nextCommands(s.host.ws, isKillOf(s.agent))).find(isKillOf(s.agent))).toMatchObject({ epoch: 1 });
+    r1.close();
+  });
+
+  it("is only for a restart; without it nothing changes from before", async () => {
+    const s = await setup();
+    for (const body of [{ when: "idle" }, { restart: false, when: "idle" }]) {
+      const res = await restart(s.agent, body);
+      expect(res.status, JSON.stringify(body)).toBe(400);
+      expect(JSON.stringify(await res.json())).toContain("restart: true");
+    }
+    expect((await restart(s.agent, { restart: true, when: "now" })).status).toBe(400);
+    expect(await quiet(s)).toBe(true);
+  });
+});

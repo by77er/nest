@@ -426,3 +426,7 @@ Tests: `test/turns.test.ts` (the exhaustive table; the guards; the prune) and `t
 | `RStart` (the start's commit) | `issueStart` | yes | Reads the launch in its own commit step (`started.launch`), so the brain that starts has the last one stored; `unchanged(snap)` still compares only the brain and the intent, which a launch change doesn't touch |
 
 Tests: `control-plane/test/restart-launch.test.ts` (mid-turn kill and resume with the new launch; refusals storing nothing; two changes ending on the last; an ended agent; owner auth). Mutations: listed in #227.
+
+## restarting only between turns (agents/restart-when-idle, author's map, 2026-11-10)
+
+No transition is added, and the brain record isn't touched. `restartWhenIdle` is a third entry point to `ROpRestart`, with one more guard in the step that records the intent: it refuses (`busy`, storing nothing) while `current_turn` is set or a turn is queued. The model doesn't track turns in its restart guard, so this only narrows when `ROpRestart` may fire. Conforms. Tests: `control-plane/test/restart-launch.test.ts` ("restarting only between turns").
