@@ -44,6 +44,8 @@ export interface BrainFields {
   start_timeouts?: number;
   /** Consecutive intent runs that found no brain host with room (`capacityRetryMs`); not a crash. Goes with the intent. */
   capacity_waits?: number;
+  /** Consecutive retryable failures of a restart's intent run while its brain is live (`RESTART_MAX_FAILURES`). Goes with the intent. */
+  restart_failures?: number;
   /**
    * The agent epoch of an operator's last stop: a brain at or below it restarts nothing however it
    * ends; only a start, input or sandbox move after the stop starts the agent again.
@@ -71,7 +73,7 @@ export const MAX_START_ATTEMPTS = 3;
 const INTENT_RANK: Record<IntentReason, number> = { wake: 0, retry: 1, drain: 2, operator: 3, restart: 4 };
 
 /** No start wanted: the intent and its capacity backoff go together. */
-export const NO_INTENT = { intent: null, capacity_waits: undefined } as const satisfies BrainPatch;
+export const NO_INTENT = { intent: null, capacity_waits: undefined, restart_failures: undefined } as const satisfies BrainPatch;
 
 /** Whether an intent moves a brain off `host` (another host named, or `host` avoided). */
 export const moves = (intent: StartIntent, host: string) =>

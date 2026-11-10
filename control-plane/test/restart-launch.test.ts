@@ -3,7 +3,7 @@
 // is, stored with the restart's intent in one step, and the next brain resumes the same session with it.
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { AgentDO } from "../src/do/agent";
+import { type AgentDO, RESTART_MAX_FAILURES } from "../src/do/agent";
 import { changedLaunch } from "../src/lib/spec";
 import { bytesToB64 } from "../src/lib/util";
 import { admin, adminJson, BASE, connectHost, nextCommands, received, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
@@ -331,4 +331,55 @@ describe("no turn starts while a restart is pending (the pump guard)", () => {
     expect(await quiet(s)).toBe(true);
     r1.close();
   });
+
+  /** Run the agent's `intent` deadline now. */
+  const runIntentNow = async (agent: string) => {
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'intent'"));
+    await runDue(agentStub(agent));
+  };
+
+  it(`a restart that keeps failing retryably is given up after ${RESTART_MAX_FAILURES} tries, with why on the record, and the held turns run on the brain`, async () => {
+    const s = await setup();
+    const r1 = await runner(s.agent, s.host.host, s.host.host_token, 1);
+    // FleetDO doesn't answer the restart's checks (an unexpected error: retried).
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      (inst as unknown as { hostGone: () => Promise<boolean> }).hostGone = async () => {
+        throw new Error("FleetDO not answering");
+      };
+    });
+    expect((await restart(s.agent, { restart: true, launch: { model: "sonnet" } })).status).toBe(500);
+    const turn = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "held behind the restart" } }, 201)).turn;
+    // Held while the restart is pending, through every failure short of the bound.
+    for (let n = 2; n < RESTART_MAX_FAILURES; n++) await runIntentNow(s.agent).catch(() => undefined);
+    expect(await r1.none("run_turn", 200)).toBe(true);
+    expect(((await agentStub(s.agent).info()) as unknown as { intent: { reason: string } | null }).intent).toMatchObject({ reason: "restart" });
+    // The last: given up, the brain kept, the turn sent to it.
+    await runIntentNow(s.agent).catch(() => undefined);
+    expect(await r1.next("run_turn")).toMatchObject({ turn });
+    const view = await adminJson(`/v1/agents/${s.agent}`);
+    expect(view.intent ?? null).toBeNull();
+    expect(view.restart_error.message).toContain(`failed ${RESTART_MAX_FAILURES} times`);
+    expect(view.brain).toMatchObject({ host: s.host.host, epoch: 1 });
+    expect(view.brain.phase).not.toBe("condemned");
+    expect(await quiet(s)).toBe(true);
+    // The next restart asked for starts afresh, and clears the record of the last one.
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      delete (inst as unknown as { hostGone?: unknown }).hostGone;
+    });
+    expect((await restart(s.agent, { restart: true })).status).toBe(200);
+    expect((await adminJson(`/v1/agents/${s.agent}`)).restart_error ?? null).toBeNull();
+    r1.close();
+  });
+
+  it("turns are held only behind a restart: with another start pending, a turn runs", async () => {
+    const s = await setup();
+    const r1 = await runner(s.agent, s.host.host, s.host.host_token, 1);
+    // An operator's start on a live brain keeps its intent until the brain exits (N14): a start, not a restart.
+    expect(await agentStub(s.agent).start()).toMatchObject({ kind: "none" });
+    expect(((await agentStub(s.agent).info()) as unknown as { intent: { reason: string } | null }).intent).toMatchObject({ reason: "operator" });
+    const turn = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "not held" } }, 201)).turn;
+    expect(await r1.next("run_turn")).toMatchObject({ turn });
+    r1.close();
+  });
 });
+

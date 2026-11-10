@@ -435,8 +435,10 @@ Tests: `control-plane/test/restart-launch.test.ts` (mid-turn kill and resume wit
 |---|---|---|---|
 | `ROpRestart` (with `SPLIT_RESTART`) | `restartOn` → `setIntent({reason: "restart"})` | yes | Records the intent only, as the code does. The model's restart is now split, so the window is in it |
 | `ROpRestartCondemn` | `processIntent`, `liveBrainStart` = `condemn`, after its awaits | yes | The brain still there and not condemned is condemned; else only the start is wanted |
-| `ROpRestartDrop` | `processIntent` throws (`requireLaunch`), `intentFailed` clears the intent | yes | `intentFailed` now pumps after clearing it, so turns held back run on the brain that stays |
+| `ROpRestartDrop` | `processIntent` throws (`requireLaunch`), `intentFailed` clears the intent; or `restartGivenUp` after `RESTART_MAX_FAILURES` (5) retryable failures in a row with the brain live | yes | Both pump after clearing it, so turns held back run on the brain that stays |
 | `Pump` (with `PUMP_GUARD`) | `AgentDO.pump` | yes | **The guard:** no turn is sent while `intent.reason = "restart"`; queued turns run on the next brain |
+
+**Fairness and the bound:** `ROpRestartCondemn \/ ROpRestartDrop` is weakly fair, so a pending restart resolves one way or the other. In the code that rests on the bound. A run that fails retryably (FleetDO not answering `hostGone` or `hostStatus`, or any error that isn't a `NestError`) is retried every 30 s (`WAKE_RETRY_MS`). After 5 in a row with the brain live (about 2.5 minutes), the restart is given up. Without the bound, a restart that can never get past FleetDO would hold the turns for good: the fairness the model assumes would not hold. A condemned brain's failures (a start that finds no room, for instance) aren't counted: nothing is held on a live brain then.
 
 Model results (TLC 1.7.4, 4 workers):
 - **Without the guard** (`MC_nr_restart_split_noguard`): `NoCutAfterAsk` fails in 11 steps. The restart is recorded, `Pump` sends the turn, and the condemn cuts it.
@@ -446,4 +448,8 @@ Model results (TLC 1.7.4, 4 workers):
 - **The liveness check has teeth:** an ad hoc mutant whose guard never lifts (blocked once any restart was asked) fails `StableTurnsDrain`.
 - **Two hosts:** `MC_nr_restart_split_live2` (tier `full`) did not finish in 25 minutes (7.2M distinct states, 1.6M left on the queue). TLC checks liveness only once the state graph is complete, so it shows nothing yet.
 
-Tests: `control-plane/test/restart-launch.test.ts`, "no turn starts while a restart is pending". A turn admitted at `intent:beforeCommit` isn't sent to the old brain and runs whole on the next one. A restart refused after a turn queued behind it leaves the brain, and the turn runs on it.
+Tests: `control-plane/test/restart-launch.test.ts`, "no turn starts while a restart is pending":
+- a turn admitted at `intent:beforeCommit` isn't sent to the old brain and runs whole on the next one;
+- a restart refused after a turn queued behind it leaves the brain, and the turn runs on it;
+- a restart failing retryably holds the turn through 4 failures; the 5th gives it up, with `restart_error` set, and the turn runs;
+- with another start pending (an operator's `start` kept beside a live brain), a turn runs: only a restart holds turns.

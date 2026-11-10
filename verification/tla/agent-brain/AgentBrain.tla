@@ -449,8 +449,9 @@ ROpRestartCondemn ==
   /\ tn' = [tn EXCEPT !.cut = @ \/ (tn.cur = "sent" /\ tn.afterAsk)]
   /\ UNCHANGED <<hostV, brainV, nestdV, fleetV, ghostV>>
 
-\* SPLIT_RESTART: the pending restart is refused after it was recorded (`requireLaunch`, `intentFailed`):
-\* the intent goes, the brain stays, and queued turns run on it.
+\* SPLIT_RESTART: the pending restart is refused after it was recorded (`requireLaunch`, `intentFailed`), or
+\* given up after RESTART_MAX_FAILURES retryable failures with the brain live (`restartGivenUp`): the intent
+\* goes, the brain stays, and queued turns run on it.
 ROpRestartDrop ==
   /\ SPLIT_RESTART /\ ag.rq /\ ag.pc = "idle"
   /\ ag' = [ag EXCEPT !.rq = FALSE]
@@ -1001,7 +1002,10 @@ Fairness ==
   /\ WF_vars(TBump) /\ WF_vars(TDeadline) /\ WF_vars(TExitWait)
   /\ WF_vars(RWake) /\ WF_vars(\E h \in Hosts : RStart(h)) /\ WF_vars(RKill)
   /\ WF_vars(RDeadline) /\ WF_vars(REscalate) /\ WF_vars(RKillAlarm) /\ WF_vars(RStatusRelease)
-  /\ WF_vars(ROldCap) /\ WF_vars(ROpRestartCondemn)
+  /\ WF_vars(ROldCap)
+  \* A pending restart resolves one way or the other: condemned, or refused (the code's bound on
+  \* retryable failures, RESTART_MAX_FAILURES, gives up even when FleetDO never answers).
+  /\ WF_vars(ROpRestartCondemn \/ ROpRestartDrop)
   /\ \A h \in Hosts : WF_vars(LostSend(h)) /\ WF_vars(LostDeliver(h))
   /\ WF_vars(Issue) /\ WF_vars(ResolveResp) /\ WF_vars(Tick)
   /\ \A h \in Hosts :
