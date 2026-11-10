@@ -237,6 +237,8 @@ function useTriageWrite<V, R>(id: string, fn: (v: V) => Promise<R>, failure: str
     onSettled: () => Promise.all([
       qc.invalidateQueries({ queryKey: keys.issues(id) }), qc.invalidateQueries({ queryKey: keys.tasks(id) }),
       qc.invalidateQueries({ queryKey: keys.attention(id) }), qc.invalidateQueries({ queryKey: keys.projects, exact: true }),
+      // The project's count of issues the cap left out (an import counts it afresh).
+      qc.invalidateQueries({ queryKey: keys.project(id) }),
     ]),
   });
 }

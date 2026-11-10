@@ -852,6 +852,8 @@ const app = {
     // the board's Needs you item for them, declining one.
     { name: "triage", section: "project", path: "/projects/prj_demo/triage" },
     { name: "triage-empty", section: "project", path: "/projects/prj_demo/triage", fixture: "triage-empty" },
+    // Issues the cap on waiting ones left out: said, with what to do (README.md#triage).
+    { name: "triage-dropped", section: "project", path: "/projects/prj_demo/triage", fixture: "triage-dropped" },
     { name: "triage-long", section: "project", path: "/projects/prj_demo/triage", fixture: "triage-long" },
     // Proposals waiting, no issues: the issues' empty is a quiet line, not the page's (and the board's "Needs you" names them alone).
     { name: "triage-proposals-only", section: "project", path: "/projects/prj_demo/triage", fixture: "proposals-only" },
@@ -862,6 +864,8 @@ const app = {
     { name: "triage-decline", section: "project", path: "/projects/prj_demo/triage", full: false, after: (p) => p.getByRole("button", { name: "Decline issue #44" }).click() },
     { name: "settings", section: "project", path: "/projects/prj_demo/settings", checkName: "workflows", check: (p) => p.evaluate(workflowsAgree) },
     { name: "settings-comments-set", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-set" },
+    // Whose issues come into triage: anyone's (README.md#triage).
+    { name: "settings-issues-anyone", section: "project", path: "/projects/prj_demo/settings", fixture: "issues-anyone" },
     // The models (README.md#models): a custom id shown with its field; the list open.
     { name: "settings-models-custom", section: "project", path: "/projects/prj_demo/settings", fixture: "models-custom" },
     { name: "settings-models-open", section: "project", path: "/projects/prj_demo/settings", full: false, after: async (p) => { const f = p.getByLabel("Manager's model").first(); await f.scrollIntoViewIfNeeded(); await f.click(); } },

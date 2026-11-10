@@ -2,6 +2,7 @@
 // page (src/ui/) validates its forms with the very schemas the Worker checks, and types its calls by them.
 
 import { z } from "zod";
+import { ISSUES_FROM } from "./issues";
 import { MODEL_ID } from "./models";
 import { MERGE_METHODS } from "./automerge";
 
@@ -34,6 +35,8 @@ export const Settings = z.strictObject({
   // GitHub's auto-merge on task PRs, and the repo's "Allow auto-merge" written back (README.md#auto-merge).
   auto_merge: z.boolean().optional(),
   merge_method: z.enum(MERGE_METHODS).optional(),
+  // Whose issues come into triage (README.md#triage): the comments user's or the repo owner's only, or anyone's.
+  issues_from: z.enum(ISSUES_FROM).optional(),
   // Whose PR comments reach workers (README.md#pr-comments): a GitHub user's id; null for nobody's.
   comments_from_id: z.number().int().min(1).max(2 ** 53 - 1).nullable().optional(),
   // Or by login, looked up on GitHub and kept as its id; null for nobody's.

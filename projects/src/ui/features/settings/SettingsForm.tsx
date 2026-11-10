@@ -4,6 +4,7 @@
 // and whether workers may change CI workflows (README.md#secrets). The Panels sit in one row with Save right under them at the bottom right; on a phone, one column,
 // so Save comes right after the last field.
 
+import { MAX_UNTRIAGED_ISSUES } from "../../../issues";
 import { Anchor, Badge, Button, NumberInput, Select, Switch, Text, TextInput } from "@mantine/core";
 import { schemaResolver, useForm } from "@mantine/form";
 import { notifications } from "@mantine/notifications";
@@ -63,7 +64,7 @@ const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", 
 
 const values = (s: Settings) => ({
   auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method, workers_edit_workflows: s.workers_edit_workflows,
-  manager_model: s.manager_model, worker_model: s.worker_model,
+  manager_model: s.manager_model, worker_model: s.worker_model, issues_from: s.issues_from,
   comments_from_login: s.comments_from?.login ?? null,
   // "Use the repo owner": the server takes the repo's owner by id, never this login.
   comments_from_repo_owner: false,
@@ -211,6 +212,22 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                   spellCheck={false}
                 />
               </CommentsFrom>
+            </Section>
+          </Panel>
+          <Panel>
+            <Section title="Triage" order={4} region={false}>
+              <FieldGroup>
+                <Select
+                  label="Issues from"
+                  description="Which GitHub issues come into Triage, by who opened them. You: the PR comments user and the repo's owner, by their GitHub id. Anyone: every issue opened on the repo."
+                  data={[{ value: "trusted", label: "You only" }, { value: "anyone", label: "Anyone" }]}
+                  allowDeselect={false}
+                  {...form.getInputProps("issues_from")}
+                />
+                <Text fz="sm" c="dimmed">
+                  Issues already waiting stay until you accept or decline them. At most {MAX_UNTRIAGED_ISSUES} wait at once.
+                </Text>
+              </FieldGroup>
             </Section>
           </Panel>
         </SectionGrid>

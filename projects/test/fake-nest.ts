@@ -599,7 +599,8 @@ export class FakeGitHub {
   /** Each PR's auto-merge, by node id, as GraphQL's mutations leave it. */
   readonly autoMerge = new Map<string, { method: string } | null>();
   /** Each repo's issues (PRs among them, as GitHub lists them), by number, with the comments posted on them. */
-  readonly issues = new Map<string, Map<number, { title: string; body: string; state: "open" | "closed"; login: string; pr?: boolean; comments: string[]; state_reason?: string }>>();
+  /** Each repo's issues, by number: opened by `user_id` (the repo owner's unless given). */
+  readonly issues = new Map<string, Map<number, { title: string; body: string; state: "open" | "closed"; login: string; user_id?: number; pr?: boolean; comments: string[]; state_reason?: string }>>();
   /** Each repo's PRs, by number. */
   readonly pulls = new Map<string, Map<number, FakePull>>();
   /** GraphQL errors to answer (a 200 with `errors`), for mutations whose name matches. */
@@ -755,7 +756,7 @@ export class FakeGitHub {
       const per = Number(u.searchParams.get("per_page") ?? "30");
       const open = [...(this.issues.get(repoName) ?? new Map()).entries()].filter(([, i]) => i.state === "open").sort(([a], [b]) => a - b);
       return json(200, open.slice((page - 1) * per, page * per).map(([n, i]) => ({
-        number: n, title: i.title, body: i.body, state: i.state, user: { login: i.login }, html_url: `https://github.com/${repoName}/issues/${n}`,
+        number: n, title: i.title, body: i.body, state: i.state, user: { login: i.login, id: i.user_id ?? ownerIdOf(repoName.split("/")[0]!) }, html_url: `https://github.com/${repoName}/issues/${n}`,
         ...(i.pr ? { pull_request: { url: `https://api.github.com/repos/${repoName}/pulls/${n}` } } : {}),
       })));
     }
@@ -911,6 +912,10 @@ export async function deliverGithub(event: string, payload: unknown, o: { secret
   // GitHub names the repo's id in every event: the fake's, unless the test gives one (or `id: undefined`, none).
   const repo = (payload as { repository?: Record<string, unknown> } | null)?.repository;
   if (repo && typeof repo === "object" && !("id" in repo) && typeof repo.full_name === "string") repo.id = repoIdOf(repo.full_name);
+  // An issue's author by id: the repo owner's (whose issues come into triage by default), unless the test gives one.
+  const issue = (payload as { issue?: Record<string, unknown> } | null)?.issue;
+  const user = issue && typeof issue.user === "object" && issue.user !== null ? (issue.user as Record<string, unknown>) : null;
+  if (user && !("id" in user) && repo && typeof repo.full_name === "string") user.id = ownerIdOf(repo.full_name.split("/")[0]!.toLowerCase());
   // And the App installation it came from: the fake's, unless the test gives one (or `installation: undefined`, none).
   if (payload && typeof payload === "object" && !("installation" in payload)) (payload as Record<string, unknown>).installation = { id: GH_INSTALLATION_ID };
   const body = o.raw ?? JSON.stringify(payload);

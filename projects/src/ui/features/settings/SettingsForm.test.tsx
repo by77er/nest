@@ -66,6 +66,21 @@ describe("PR comments in the settings", () => {
   });
 });
 
+describe("whose issues come into triage", () => {
+  it("is you only by default; choosing anyone sends it", async () => {
+    const api = new FakeApi();
+    const { user, dialog } = await openSettings(api);
+    const from = within(dialog).getAllByLabelText("Issues from").find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden")! as HTMLInputElement;
+    expect(from.value).toBe("You only");
+    expect(dialog).toHaveTextContent("Issues already waiting stay until you accept or decline them. At most 200 wait at once.");
+    await user.click(from);
+    await user.click(await screen.findByRole("option", { name: "Anyone" }));
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(api.writes).toHaveLength(1));
+    expect(api.writes[0]).toMatchObject({ method: "PATCH", path: "/api/projects/prj_one/settings", body: { issues_from: "anyone" } });
+  });
+});
+
 describe("auto-merge in the settings", () => {
   it("turns on with a merge method, sending both", async () => {
     const api = new FakeApi();

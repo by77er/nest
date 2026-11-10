@@ -480,7 +480,11 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
 
 The owner's request (2026-11-06): GitHub issues on a project's repo go into a triage queue, and accepted ones are added to the board.
 
-- **Intake** (`/hooks/github`, the same signature check, delivery claim and repo → project routing):
+- **Whose issues come in** (the owner's question, 2026-11-10: "Only my issues or comments trigger triage, right?"): by default only issues opened by the comments user or the repo's owner, by the issue's author (`issue.user.id`, never the event's sender), the same people a declined issue's reopening counts from. Others are ignored, not stored.
+  - **The setting:** `issues_from`, `trusted` (the default, "You only") or `anyone`, in Settings ("Triage": "Issues from") or `PATCH /api/projects/<id>/settings`. A project that wants outside reports opts in.
+  - **At most 200 wait** (`MAX_UNTRIAGED_ISSUES`, `src/issues.ts`), whichever the setting. Past it a new issue is dropped and counted (`issues_dropped` in the project's settings, with when the last was); the Triage page says how many were left out and what to do (accept or decline some, then Import open issues). An import counts afresh.
+  - **Issues already waiting** from authors the setting now leaves out stay, until the owner accepts or declines them: nothing is removed by the rule.
+- **Intake** (`/hooks/github`, the same signature check, delivery claim and repo → project routing), for issues the rule above lets in:
   - `issues` `opened` and `reopened` add an issue, or restore one that went, when the event shows it open (a late delivery for an issue closed since adds nothing).
   - A declined issue comes back only when reopened by the comments user or the repo's owner (the event's `sender`, by id), so its author can't undo a decline by closing and reopening it.
   - `edited` updates one still untriaged (or adds it, open, if its opening was missed).
@@ -497,7 +501,7 @@ The owner's request (2026-11-06): GitHub issues on a project's repo go into a tr
     - The task records its issue.
     - It's marked tainted (an `issue_accepted` record), since its text is anyone's. The manager's and its workers' sessions that read it are then tainted, as nest's rule has it.
   - **Decline** takes it out, with an optional reason. It doesn't touch GitHub: closing there is the owner's call.
-  - **Import open issues** is a one-off that brings in the repo's open issues the app doesn't know yet (it reads the oldest 300 open items, and PRs, which GitHub lists among issues, count toward the 300 before they're left out). It needs `issues: read`. Issues opened before the app subscribed come in only this way: events GitHub sent before it was ignored and aren't replayed.
+  - **Import open issues** is a one-off that brings in the repo's open issues the app doesn't know yet (it reads the oldest 300 open items, and PRs, which GitHub lists among issues, count toward the 300 before they're left out). It needs `issues: read`. Issues opened before the app subscribed come in only this way: events GitHub sent before it was ignored and aren't replayed. It follows the same rule as an event (whose issues, and the cap), and says how many it left out: `{imported, known, ignored, dropped}`.
 - **Routines' proposed tasks wait here too** ([routines](#routines)): under the issues, in their own section ("Proposed tasks", the Routines page's list: accept as a draft, or decline), shown only while there are some. They stay on the Routines page as well. With proposals waiting and no issues, the issues' section says "No issues to triage." in one quiet line; the page's empty state ("Nothing to triage") shows only when both are empty.
 - **"Needs you"** shows one item for what waits for triage, linking to Triage: the issues and the proposed tasks, counted in words ("3 issues and 1 proposed task wait for triage"), as old as the oldest of them. The projects list's count includes each issue and each proposal. Accepting or declining either refreshes both.
 - **A task made of an issue, done through a merged PR,** closes the issue: a comment "Done in #<pr>.", then closed as completed (`issue_closes`, from the alarm).
