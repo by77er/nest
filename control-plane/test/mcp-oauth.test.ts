@@ -10,7 +10,7 @@ import type { BrokerDO } from "../src/do/broker";
 import type { McpConnectorDO } from "../src/do/mcp-connector";
 import { connectorName } from "../src/lib/mcp";
 import { authServerMetadataUrls, bearerChallenge, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
-import { adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, eventually, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 /** vitest.config.ts: PUBLIC_BASE_URL. */
@@ -64,6 +64,9 @@ class FakeAuth {
   readonly registrations: unknown[] = [];
   /** Every revocation request: the token, its hint, and how the client authenticated. */
   readonly revocations: { token: string; hint: string | null; client: string | null }[] = [];
+  /** Holds a code exchange while set; `exchangeHeld` says one is waiting. Polled: no promise crosses contexts. */
+  holdExchange = false;
+  exchangeHeld = false;
   readonly cimdFetches: unknown[] = [];
   /** The MCP server's view: every request's bearer, method and status. */
   readonly rsLog: { token: string | null; method: string; status: number }[] = [];
@@ -202,6 +205,10 @@ class FakeAuth {
       if (!c || c.client_id !== client || c.redirect_uri !== form.get("redirect_uri")) return this.json(400, { error: "invalid_grant" });
       if ((await pkceChallenge(form.get("code_verifier") ?? "")) !== c.challenge) return this.json(400, { error: "invalid_grant", why: "PKCE" });
       if (form.get("resource") !== c.resource) return this.json(400, { error: "invalid_target" });
+      while (this.holdExchange) {
+        this.exchangeHeld = true;
+        await scheduler.wait(10);
+      }
       return this.json(200, this.issue(client, c.resource));
     }
     if (form.get("grant_type") === "refresh_token") {
@@ -705,6 +712,65 @@ describe("revoking an authorization", () => {
   });
 });
 
+describe("revoking an authorization: the races and the rarer records", () => {
+  it("a revoke that lands while a code is being exchanged wins: the callback stores nothing and revokes the tokens it just got", async () => {
+    const { f, cap, ref } = await capability({ revocation: true });
+    const start = await adminJson(`/v1/admin/capabilities/${cap}/oauth`, { method: "POST" });
+    const res = await fetch(start.authorize_url, { redirect: "manual" });
+    const back = res.headers.get("location")!;
+    // The callback's code exchange is held at the authorization server.
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    // The operator revokes meanwhile: no record yet, no flow row left to delete.
+    expect(await adminJson(`/v1/admin/capabilities/${cap}/oauth`, { method: "DELETE" })).toEqual({ revoked: [] });
+    f.holdExchange = false;
+    const page = await callback;
+    expect(page).toContain("Not authorized");
+    expect(page).toContain("revoked while its code was being exchanged");
+    // Nothing came back: no record, and the tokens the exchange issued are revoked at the server.
+    expect(await grantRow(ref)).toBeUndefined();
+    expect((await adminJson(`/v1/admin/capabilities/${cap}/oauth`)).status).toBe("unauthorized");
+    expect(f.revocations).toHaveLength(1);
+    expect(f.revocations[0]).toMatchObject({ hint: "refresh_token", client: CIMD });
+    expect(f.refresh.get(f.revocations[0]!.token)!.valid).toBe(false);
+    // A later authorization is unaffected.
+    await authorize(cap);
+    expect((await grantRow(ref)).status).toBe("authorized");
+  });
+
+  it("a record with only an access token has that revoked; one with no tokens says so and asks the server nothing", async () => {
+    const a = await capability({ revocation: true });
+    await authorize(a.cap);
+    const row = await grantRow(a.ref);
+    await runInDurableObject(broker(), (_: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE oauth_grants SET refresh_token = NULL WHERE ref = ?", a.ref);
+    });
+    expect((await adminJson(`/v1/admin/capabilities/${a.cap}/oauth`, { method: "DELETE" })).revoked).toEqual([{ ref: a.ref, issuer: a.f.issuer, server: "revoked" }]);
+    expect(a.f.revocations).toEqual([{ token: row.access_token, hint: "access_token", client: CIMD }]);
+
+    const b = await capability({ revocation: true });
+    await authorize(b.cap);
+    await runInDurableObject(broker(), (_: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE oauth_grants SET refresh_token = NULL, access_token = NULL, status = 'reauthorize' WHERE ref = ?", b.ref);
+    });
+    expect((await adminJson(`/v1/admin/capabilities/${b.cap}/oauth`, { method: "DELETE" })).revoked).toEqual([{ ref: b.ref, issuer: b.f.issuer, server: "no_tokens" }]);
+    expect(b.f.revocations).toEqual([]);
+  });
+
+  it("a server whose metadata can't be read is reported failed, not unsupported", async () => {
+    const { id, f, cap, ref } = await capability({ revocation: true });
+    await authorize(cap);
+    fakes.delete(id);
+    try {
+      expect((await adminJson(`/v1/admin/capabilities/${cap}/oauth`, { method: "DELETE" })).revoked).toEqual([{ ref, issuer: f.issuer, server: "failed" }]);
+    } finally {
+      fakes.set(id, f);
+    }
+    expect(await grantRow(ref)).toBeUndefined();
+  });
+});
+
 describe("deleting an operator's secret", () => {
   const secretRow = (name: string) => runInDurableObject(broker(), (_: BrokerDO, st) =>
     st.storage.sql.exec("SELECT 1 FROM secrets WHERE name = ?", name).toArray().length);
@@ -720,6 +786,26 @@ describe("deleting an operator's secret", () => {
     const records = await auditOf((x) => x.name === name, "secret_deleted");
     expect(records[0]).toMatchObject({ event: "secret_deleted", name, deleted: true, caller: "operator" });
     expect(JSON.stringify(records)).not.toContain(value);
+
+    // Deleting the GitHub App drops every installation token minted with it (restored for the other tests).
+    const was = await runInDurableObject(broker(), (_: BrokerDO, st) =>
+      st.storage.sql.exec<{ value: string }>("SELECT value FROM secrets WHERE name = 'github_app'").toArray()[0]?.value ?? null);
+    const tokens = () => runInDurableObject(broker(), (_: BrokerDO, st) =>
+      st.storage.sql.exec("SELECT 1 FROM github_tokens WHERE key = 'k-del'").toArray().length);
+    await runInDurableObject(broker(), (_: BrokerDO, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO github_tokens (key, token, expires_ms, installation, minted_ms) VALUES ('k-del', 't', ?, 1, 0)", Date.now() + 3_600_000);
+      st.storage.sql.exec("INSERT OR IGNORE INTO secrets (name, value, updated_ms) VALUES ('github_app', 'x', 0)");
+    });
+    try {
+      await adminJson(`/v1/admin/secrets/${name}x`, { method: "DELETE" });
+      expect(await tokens()).toBe(1);
+      expect(await adminJson("/v1/admin/secrets/github_app", { method: "DELETE" })).toEqual({ deleted: true });
+      expect(await tokens()).toBe(0);
+    } finally {
+      await runInDurableObject(broker(), (_: BrokerDO, st) => {
+        if (was !== null) st.storage.sql.exec("INSERT OR REPLACE INTO secrets (name, value, updated_ms) VALUES ('github_app', ?, 0)", was);
+      });
+    }
 
     expect((await adminJson("/v1/admin/secrets/binding_key:use1", { method: "DELETE" }, 403)).error.code).toBe("forbidden");
     expect((await adminJson("/v1/admin/secrets/client-secret:cli_x:name", { method: "DELETE" }, 403)).error.code).toBe("forbidden");

@@ -139,6 +139,8 @@ mcp: {url: https://mcp.example.com/mcp, auth: {oauth: cap:notes, client: cap:not
   - Then, best effort, the refresh token (else the access token) is revoked at the authorization server when its metadata lists a `revocation_endpoint` ([RFC 7009](https://datatracker.ietf.org/doc/html/rfc7009)), authenticating as the client that got it.
   - The answer says what happened there, per record: `{revoked: [{ref, issuer, server}]}`, `server` one of `revoked`, `unsupported` (no endpoint), `failed` (the tokens may live on at the server until they expire) or `no_tokens`.
   - It finds records by the capability's name as they hold it, so it works after the capability was deleted: a capability recreated under that name never reuses old tokens.
+  - **It wins over an authorization still finishing.** A callback whose code was being exchanged when the revoke ran stores nothing: it revokes the tokens it just got at the server (best effort, as above) and its page says the authorization was revoked. The operator authorizes again.
+  - **A refresh in flight can leave one token behind** (known bound): when a refresh rotated the refresh token at the server while the revoke ran, the revoke sent the old one. The record is gone either way, so nest never stores or serves the rotated token, but it lives at the server until it expires, unless the server revokes a token's whole family on a revoked predecessor ([RFC 7009 §2.1](https://datatracker.ietf.org/doc/html/rfc7009#section-2.1) leaves that to the server; unverified for any given one).
   - Audited as `oauth_revoked`, never a token. Deleting a capability doesn't revoke by itself.
 - **Not built:**
   - telling the operator unprompted when a record needs re-authorizing (the agent's error and the status route say so);

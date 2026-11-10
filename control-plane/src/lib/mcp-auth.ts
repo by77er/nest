@@ -660,10 +660,18 @@ export class OAuthStore {
     if (q.error) return refuse(`the authorization server answered ${q.error.slice(0, 64)}`, flow);
     if (!q.code) return refuse("no code", flow);
     const client = this.client(flow.client, null);
+    // A revoke that lands while the code is being exchanged finds no flow row (it went above) and no
+    // record yet: it is seen here by its count, read before the await and again after.
+    const revokedBefore = this.revocations.get(flow.capability) ?? 0;
     const a = await tokenRequest(flow.token_endpoint, client, {
       grant_type: "authorization_code", code: q.code, redirect_uri: flow.redirect_uri, code_verifier: flow.verifier, resource: flow.resource,
     });
     if (a.kind !== "tokens") return refuse(`the token endpoint ${a.kind === "refused" ? `refused the code (${a.error})` : `gave no answer (${a.why})`}`, flow);
+    if ((this.revocations.get(flow.capability) ?? 0) !== revokedBefore) {
+      // Revoked meanwhile: these tokens are never stored, and are revoked at the server where it can be.
+      const r = await this.revokeAtServer({ issuer: flow.issuer, client: flow.client, refresh_token: a.refresh_token, access_token: a.access_token });
+      return refuse(`${flow.capability}'s authorization was revoked while its code was being exchanged; the new tokens were dropped (at the server: ${r.server})`, flow);
+    }
     const now = Date.now();
     const generation = (this.grant(flow.ref)?.generation ?? 0) + 1;
     const expires = a.expires_in_s === null ? null : now + a.expires_in_s * 1000;
@@ -720,6 +728,8 @@ export class OAuthStore {
    * none answers an empty list.
    */
   async revoke(capability: string, caller: string): Promise<{ ref: string; issuer: string; server: ServerRevocation }[]> {
+    // Seen by a callback exchanging a code for this capability right now (`callback`).
+    this.revocations.set(capability, (this.revocations.get(capability) ?? 0) + 1);
     const refs = this.d.sql.exec<{ ref: string }>("SELECT ref FROM oauth_grants WHERE capability = ?", capability).toArray().map((r) => r.ref);
     const rows = refs.map((ref) => this.grant(ref)!);
     this.d.sql.exec("DELETE FROM oauth_grants WHERE capability = ?", capability);
@@ -729,27 +739,32 @@ export class OAuthStore {
     }
     const out: { ref: string; issuer: string; server: ServerRevocation }[] = [];
     for (const row of rows) {
-      let server: ServerRevocation = "no_tokens";
-      let reason: string | undefined;
-      const token = row.refresh_token ?? row.access_token;
-      if (token !== null) {
-        try {
-          const as = await authServerMetadata(new URL(row.issuer), this.d.allowLoopback);
-          if (!as.revocation_endpoint) server = "unsupported";
-          else {
-            const r = await revokeToken(as.revocation_endpoint, this.client(row.client, as), token, row.refresh_token !== null ? "refresh_token" : "access_token");
-            server = r.ok ? "revoked" : "failed";
-            if (!r.ok) reason = r.why;
-          }
-        } catch (e) {
-          server = "failed";
-          reason = e instanceof NestError ? e.detail : String(e);
-        }
-      }
+      const { server, reason } = await this.revokeAtServer(row);
       this.d.audit({ event: "oauth_revoked", capability, ref: row.ref, issuer: row.issuer, caller, reason: reason ? `${server}: ${reason.slice(0, 200)}` : server });
       out.push({ ref: row.ref, issuer: row.issuer, server });
     }
     return out;
+  }
+
+  /** Revocations per capability since this object started (memory: a reset ends any callback in flight too). */
+  private readonly revocations = new Map<string, number>();
+
+  /**
+   * Best effort, RFC 7009: revoke the refresh token (else the access token) at its authorization server,
+   * as the client that got it. `unsupported`: the server lists no revocation endpoint; `failed`: its
+   * metadata or the request failed (the tokens may live on there); `no_tokens`: nothing to revoke.
+   */
+  private async revokeAtServer(t: { issuer: string; client: ClientRef; refresh_token: string | null; access_token: string | null }): Promise<{ server: ServerRevocation; reason?: string }> {
+    const token = t.refresh_token ?? t.access_token;
+    if (token === null) return { server: "no_tokens" };
+    try {
+      const as = await authServerMetadata(new URL(t.issuer), this.d.allowLoopback);
+      if (!as.revocation_endpoint) return { server: "unsupported" };
+      const r = await revokeToken(as.revocation_endpoint, this.client(t.client, as), token, t.refresh_token !== null ? "refresh_token" : "access_token");
+      return r.ok ? { server: "revoked" } : { server: "failed", reason: r.why };
+    } catch (e) {
+      return { server: "failed", reason: e instanceof NestError ? e.detail : String(e) };
+    }
   }
 
   private markReauthorize(row: GrantRow, reason: string, caller: string): never {
