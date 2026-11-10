@@ -414,3 +414,15 @@ Line citations above this section are function names or older heads; `agent.ts` 
 | (not modelled) abandon | `TurnQueue.prune` | outside the model | An active row that isn't `current_turn`, older than the retention, → interrupted. No brain decision reads it. A message mirrored to a turn no longer active, that old, is requeued as a turn (as Q3 does for the unseen inbox) |
 
 Tests: `test/turns.test.ts` (the exhaustive table; the guards; the prune) and `test/contract-r2.test.ts` (AgentDO's prune under a live brain). Mutations run: a final turn completable, a second recovery turn, no abandon, the current turn abandoned, stale mirrored messages kept, a queued turn abandoned, `complete` bypassing the step, a live turn's message abandoned, AgentDO's prune not passing `current_turn`, a stale mirrored message dropped instead of requeued, every mirrored message requeued by the prune, requeued messages left mirrored. Each fails a test.
+
+## restarting on another model (agents/restart-launch, author's map, 2026-11-10)
+
+**Head:** `agents/restart-launch` at `c29d4f40` (on main 73d99801). No transition is added; one entry point and one field written in an existing step. Not checked by a model run.
+
+| Model action | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| `ROpRestart` | `AgentDO.restartWith` (`POST /start {restart: true, launch}`), as well as `start(…, restart)` | yes | A second entry point to the same restart: `setIntent({reason: "restart"})`, then `runIntent`. A refused launch (`launchProblem` on the whole launch it would store) throws before `setIntent`, so nothing is recorded and the brain isn't condemned |
+| (not modelled) the launch | `setIntent(patch, launch)` | outside the model | The changed `model` or `effort` is written in the same synchronous step as the intent's merge, so neither is stored without the other. The model's state has no launch, and no guard or decision reads it |
+| `RStart` (the start's commit) | `issueStart` | yes | Reads the launch in its own commit step (`started.launch`), so the brain that starts has the last one stored; `unchanged(snap)` still compares only the brain and the intent, which a launch change doesn't touch |
+
+Tests: `control-plane/test/restart-launch.test.ts` (mid-turn kill and resume with the new launch; refusals storing nothing; two changes ending on the last; an ended agent; owner auth). Mutations: listed in #227.
