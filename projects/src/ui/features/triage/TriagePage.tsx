@@ -12,11 +12,13 @@ import { notifications } from "@mantine/notifications";
 import { IconDownload, IconExternalLink, IconInbox } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
 import { useId, useRef, useState } from "react";
-import { useAcceptIssue, useDeclineIssue, useImportIssues, useIssues, useProposals } from "../../api/queries";
+import { useAcceptIssue, useDeclineIssue, useImportIssues, useIssues, useProject, useProposals } from "../../api/queries";
 import { ApiError } from "../../api/client";
-import type { Issue } from "../../api/types";
+import type { Issue, Settings } from "../../api/types";
+import { issuesFromWho, names } from "./words";
 import { ago, exact } from "../../common/time";
 import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
+import { MAX_UNTRIAGED_ISSUES } from "../../../issues";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ProposalsSection } from "../routines/ProposalsSection";
 
@@ -125,15 +127,35 @@ function IssueItem({ projectId, issue }: { projectId: string; issue: Issue }) {
   );
 }
 
+const issuesN = (n: number) => `${n} issue${n === 1 ? "" : "s"}`;
+
+/** What an import did, in a sentence: what came in, and what it left out (others' issues, past the cap). */
+export function importText(r: { imported: number; ignored: number; dropped: number }): string {
+  const parts = [r.imported ? `${issuesN(r.imported)} brought into triage` : "No open issues to bring in"];
+  if (r.ignored) parts.push(`${issuesN(r.ignored)} opened by others left out`);
+  if (r.dropped) parts.push(`${issuesN(r.dropped)} past the ${MAX_UNTRIAGED_ISSUES} waiting left out`);
+  return `${parts.join("; ")}.`;
+}
+
+/** Whose issues come in, by name (README.md#triage), as the page's caption says it. */
+export function issuesCaption(s: Settings | null): string {
+  if (!s || s.issues_from === "anyone") return "The repo's issues, anyone's, as they're opened: accept each as a draft task, or decline it.";
+  const who = issuesFromWho(s);
+  if (!who.length) return "No one's issues come in yet: set the PR comments user in Settings, or choose Anyone under Triage there.";
+  return `Issues opened by ${names(who)}, as they're opened: accept each as a draft task, or decline it.`;
+}
+
 export function TriagePage() {
   const { projectId } = useParams({ from: "/projects/$projectId/triage" });
   const issues = useIssues(projectId);
+  const settings = useProject(projectId).data?.settings ?? null;
+  const dropped = settings?.issues_dropped ?? null;
   // Proposals waiting (README.md#triage): then no issues is a quiet line, not the whole page's empty state.
   const proposalsWaiting = (useProposals(projectId).data?.length ?? 0) > 0;
   const importOpen = useImportIssues(projectId);
   const doImport = () =>
     importOpen.mutate(undefined, {
-      onSuccess: (r) => notifications.show({ color: "success", message: r.imported ? `${r.imported} open issue${r.imported === 1 ? "" : "s"} brought into triage` : "No open issues to bring in" }),
+      onSuccess: (r) => notifications.show({ color: "success", message: importText(r) }),
     });
   return (
     <ProjectFrame projectId={projectId}>
@@ -150,8 +172,13 @@ export function TriagePage() {
           >
             <Stack gap="lg">
               <Text fz="sm" c="dimmed">
-                The repo's issues, as they're opened: accept each as a draft task, or decline it. Their text is anyone's: it's shown as it is, and no agent reads it until you accept it.
+                {issuesCaption(settings)} Their text is shown as it is, and no agent reads it until you accept it.
               </Text>
+              {dropped && (
+                <Notice tone="warning" title={`${dropped.count === 1 ? "1 issue" : `${dropped.count} issues`} left out`} role="status">
+                  Triage holds at most {MAX_UNTRIAGED_ISSUES} issues waiting, so {dropped.count === 1 ? "it wasn't" : "they weren't"} brought in (the last {ago(dropped.last_ms)}). Accept or decline some, then Import open issues to bring the rest in.
+                </Notice>
+              )}
               {issues.isPending ? (
                 <LoadingState label="Loading the issues" />
               ) : issues.isError ? (

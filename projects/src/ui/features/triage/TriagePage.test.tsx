@@ -5,8 +5,9 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { Issue, Proposal } from "../../api/types";
-import { FakeApi, task } from "../../test/fakeApi";
+import { FakeApi, project, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+import { importText, issuesCaption } from "./TriagePage";
 import { triageSource, triageWaits } from "./words";
 
 const now = Date.now();
@@ -91,6 +92,39 @@ describe("the Triage page", () => {
     const { user } = renderApp("/projects/prj_one/triage", api);
     await user.click(await screen.findByRole("button", { name: "Import open issues" }));
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/issues/import", body: undefined }]));
+  });
+
+  it("says whose issues come in, and how many the cap left out, with what to do", async () => {
+    const api = new FakeApi();
+    api.issues = [issue()];
+    const view = renderApp("/projects/prj_one/triage", api);
+    expect(await screen.findByText(/^Issues opened by owner, as they're opened/)).toBeInTheDocument();
+    expect(screen.queryByText(/left out/)).toBeNull();
+    view.unmount();
+    const busy = new FakeApi();
+    busy.issues = [issue()];
+    busy.projects[0]!.settings = { ...busy.projects[0]!.settings!, issues_from: "anyone", issues_dropped: { count: 3, last_ms: Date.now() - 600_000 } };
+    renderApp("/projects/prj_one/triage", busy);
+    expect(await screen.findByText(/^The repo's issues, anyone's, as they're opened/)).toBeInTheDocument();
+    const notice = await screen.findByRole("status", { name: "3 issues left out" });
+    expect(notice).toHaveTextContent("Triage holds at most 200 issues waiting, so they weren't brought in (the last 10 minutes ago). Accept or decline some, then Import open issues to bring the rest in.");
+  });
+
+  it("names whose issues come in, or says no one's do yet and what to do", () => {
+    const base = project().settings!;
+    expect(issuesCaption({ ...base, comments_from: { id: 2, login: null } })).toMatch(/^Issues opened by user 2 and owner,/);
+    expect(issuesCaption({ ...base, comments_from: null, repo_owner: null })).toBe("No one's issues come in yet: set the PR comments user in Settings, or choose Anyone under Triage there.");
+    expect(issuesCaption({ ...base, comments_from: null, repo_owner: null, issues_from: "anyone" })).toMatch(/^The repo's issues, anyone's/);
+  });
+
+  it("an import says what it left out", async () => {
+    expect(importText({ imported: 2, ignored: 0, dropped: 0 })).toBe("2 issues brought into triage.");
+    expect(importText({ imported: 0, ignored: 1, dropped: 3 })).toBe("No open issues to bring in; 1 issue opened by others left out; 3 issues past the 200 waiting left out.");
+    const api = new FakeApi();
+    api.importAnswer = { imported: 1, known: 0, ignored: 4, dropped: 0 };
+    const { user } = renderApp("/projects/prj_one/triage", api);
+    await user.click(await screen.findByRole("button", { name: "Import open issues" }));
+    expect(await screen.findByText("1 issue brought into triage; 4 issues opened by others left out.")).toBeInTheDocument();
   });
 
   it("counts in Needs you, with a way to Triage", async () => {
