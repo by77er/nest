@@ -504,9 +504,11 @@ describe("delivery", () => {
     await eventually("the first failure", async () => (await view(c)).failures > 0);
     await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => {
       st.storage.sql.exec("UPDATE outbox SET queued_ms = ? WHERE id IN ('old1', 'old2')", Date.now() - EVENT_MAX_AGE_MS - 1000);
-      // A row a previous release queued carries no time: its wait starts at this prune.
+      // A row a previous release queued carries no time: with none queued after it, its wait starts at this prune.
       st.storage.sql.exec("INSERT INTO outbox (id, body) VALUES ('legacy', ?)", JSON.stringify(ev("legacy")));
       st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'prune'");
+      // No attempt meanwhile: the count read now is the count to find after.
+      st.storage.sql.exec("UPDATE deadlines SET at = ? WHERE key = 'deliver'", Date.now() + 3_600_000);
     });
     const failures = (await view(c)).failures;
     await runDue(stub);
@@ -516,8 +518,57 @@ describe("delivery", () => {
     expect(left[1]!.queued_ms).toBeGreaterThan(Date.now() - 60_000);
     // Counted, and the retry schedule is what it was: dropping changes no backoff.
     expect(await view(c)).toMatchObject({ backlog: 2, dropped: 2 });
-    expect((await view(c)).failures).toBeGreaterThanOrEqual(failures);
+    expect((await view(c)).failures).toBe(failures);
+    expect((await view(c)).last_error).toBe("HTTP 500");
   }, 15_000);
+
+  it("a newly queued event carries its time; one from before the column takes the earliest time queued after it, so queue order is age order", async () => {
+    const hook = new Hook("fail");
+    const c = await newClient(hook);
+    const stub = clientStub(c.id);
+    const t0 = Date.now();
+    await stub.enqueue([ev("fresh")]);
+    const rows = () => runInDurableObject(stub, (_i: unknown, st: DurableObjectState) =>
+      Object.fromEntries(st.storage.sql.exec<{ id: string; queued_ms: number | null }>("SELECT id, queued_ms FROM outbox ORDER BY seq").toArray().map((r) => [r.id, r.queued_ms])));
+    const fresh = (await rows()).fresh!;
+    expect(fresh).toBeGreaterThanOrEqual(t0);
+    expect(fresh).toBeLessThanOrEqual(Date.now());
+    // In queue order: a legacy row, one queued 3 days ago, a legacy row, one 8 days ago (overdue), a legacy row.
+    const day = 86_400_000;
+    await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => {
+      const sql = st.storage.sql;
+      sql.exec("DELETE FROM outbox");
+      const add = (id: string, at: number | null) => sql.exec("INSERT INTO outbox (id, body, queued_ms) VALUES (?, ?, ?)", id, JSON.stringify(ev(id)), at);
+      add("l1", null);
+      add("s3", t0 - 3 * day);
+      add("l2", null);
+      add("s8", t0 - 8 * day);
+      add("l3", null);
+      sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'prune'");
+      sql.exec("UPDATE deadlines SET at = ? WHERE key = 'deliver'", Date.now() + 3_600_000);
+    });
+    await runDue(stub);
+    const after = await rows();
+    // l2 was queued before s8, so it is at least as old: both go. l1 takes s8's time too (the earliest after it) and goes.
+    expect(Object.keys(after)).toEqual(["s3", "l3"]);
+    expect(after.l3).toBeGreaterThanOrEqual(t0);
+    expect((await view(c)).dropped).toBe(3);
+  }, 15_000);
+
+  it("the cap never drops the event being sent: the next oldest goes instead, and the count is of what went", async () => {
+    const hook = new Hook("hang");
+    const c = await newClient(hook);
+    const stub = clientStub(c.id);
+    const tag = rand();
+    await stub.enqueue([ev(`${tag}-first`)]);
+    await eventually("the attempt to be out", () => hook.hits.length === 1);
+    // The backlog fills past its cap while that attempt waits for its answer.
+    await stub.enqueue(Array.from({ length: BACKLOG_MAX }, (_, i) => ev(`${tag}-${i}`)));
+    const kept = await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) =>
+      st.storage.sql.exec<{ id: string }>("SELECT id FROM outbox ORDER BY seq LIMIT 2").toArray().map((r) => r.id));
+    expect(kept).toEqual([`${tag}-first`, `${tag}-1`]);
+    expect(await view(c)).toMatchObject({ backlog: BACKLOG_MAX, dropped: 1 });
+  }, 20_000);
 
   it("a new webhook starts its own schedule: the failures and the last error counted against the old one go", async () => {
     const hook = new Hook("fail");
@@ -548,6 +599,11 @@ describe("delivery", () => {
     const tag = rand();
     const events = Array.from({ length: BACKLOG_MAX + 3 }, (_, i) => ev(`${tag}-${i}`));
     await clientStub(c.id).enqueue(events.slice(0, BACKLOG_MAX));
+    // No attempt is out when the rest arrive (the first one failed, and the next waits): the oldest are free to go.
+    await eventually("the first attempt to fail", async () => (await view(c)).failures > 0);
+    await runInDurableObject(clientStub(c.id), (_i: ClientDO, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE deadlines SET at = ? WHERE key = 'deliver'", Date.now() + 3_600_000);
+    });
     await clientStub(c.id).enqueue(events.slice(BACKLOG_MAX));
     expect(await view(c)).toMatchObject({ backlog: BACKLOG_MAX, dropped: 3 });
     const kept = await runInDurableObject(clientStub(c.id), (_i: ClientDO, st: DurableObjectState) =>

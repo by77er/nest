@@ -201,6 +201,25 @@ describe("CallLedger: the guards are the ledger's", () => {
     });
   });
 
+  it("a call dispatched again counts as begun then: the prune doesn't take it for an old one; a finished one is left as it is", async () => {
+    await withLedger((l, sql) => {
+      const created = (call: string) => sql.exec<{ created_ms: number }>("SELECT created_ms FROM tool_calls WHERE call = ?", call).one().created_ms;
+      l.begin(1, "cal_redo", "emit");
+      l.begin(1, "cal_left", "emit");
+      l.begin(1, "cal_done", "emit");
+      l.finish(1, "cal_done", ok);
+      sql.exec("UPDATE tool_calls SET created_ms = 5");
+      l.redispatch(1, "cal_redo");
+      l.redispatch(1, "cal_done");
+      expect(created("cal_redo")).toBeGreaterThan(Date.now() - 60_000);
+      expect(created("cal_done")).toBe(5);
+      l.prune(Date.now() - 1000);
+      expect(l.call("cal_redo")).toMatchObject({ status: "dispatching" });
+      expect(l.call("cal_left")).toBeUndefined();
+      expect(l.call("cal_done")).toBeUndefined();
+    });
+  });
+
   it("prune settles by age what can't end on its own, and keeps the operator's open work", async () => {
     await withLedger((l, sql) => {
       const cutoff = Date.now() - 1000;

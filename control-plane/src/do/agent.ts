@@ -2981,6 +2981,7 @@ export class AgentDO extends DurableObject<Env> {
       resend();
     } else if (prior?.status !== "waiting") {
       if (!prior) this.calls.begin(epoch, call.call, call.name);
+      else this.calls.redispatch(epoch, call.call);
       let result: DispatchResult;
       try {
         result = await this.dispatch(epoch, call.call, call.name, call.arguments, undefined, att.epoch);

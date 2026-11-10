@@ -166,9 +166,6 @@ const unknown = (why: string): McpCallOutcome => ({
   outcome: { status: "error", error: errorBody(ErrorCodes.OUTCOME_UNKNOWN, `${why}; the call may or may not have taken effect. Check before retrying anything with side effects.`) },
   from_server: false,
 });
-/** A platform-made "outcome unknown" (never the server's own answer). */
-const isUnknown = (o: McpCallOutcome | null): boolean =>
-  !!o && !o.from_server && o.outcome.status === "error" && o.outcome.error.code === ErrorCodes.OUTCOME_UNKNOWN;
 const platformError = (code: string, message: string, retryable = false): McpCallOutcome =>
   ({ outcome: { status: "error", error: errorBody(code, message, retryable) }, from_server: false });
 
@@ -372,15 +369,16 @@ export class McpProxy {
 
   /**
    * The call's outcome (`forwardStep`). The outcome that stands: `o`, or the one the row already had.
-   * A settled row keeps its outcome, with one exception: the server's own answer replaces a recorded
-   * "unknown" (another delivery of the call gave up on it while this one's request was still out), so
-   * the row says what happened once anyone knows.
+   * A settled row keeps its outcome, with one exception: the server's own answer replaces an outcome
+   * nest made itself (an "unknown", a refusal or error of the platform's: another delivery of the call
+   * settled it so while this one's request was still out), so the row says what the server said once
+   * anyone knows. The server's own answer is never replaced.
    */
   private settle(key: string, o: McpCallOutcome): McpCallOutcome {
     const row = this.forward(key);
     const to = forwardStep(row?.status ?? "none", "settle");
     if (to === "refuse") {
-      if (!(row?.status === "settled" && isUnknown(row.outcome) && o.from_server)) return row?.outcome ?? o;
+      if (!(row?.status === "settled" && row.outcome && !row.outcome.from_server && o.from_server)) return row?.outcome ?? o;
       this.d.sql.exec("UPDATE mcp_forwards SET outcome = ? WHERE key = ?", JSON.stringify(o), key);
       return o;
     }

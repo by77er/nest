@@ -596,6 +596,9 @@ export class ClientDO extends DurableObject<Env> {
     this.sql.exec("INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, JSON.stringify(value));
   }
 
+  /** The `outbox.seq` of the event an attempt is out for right now (memory: a reset ends the attempt too). */
+  private delivering: number | null = null;
+
   private delivery(): Delivery {
     return this.kv<Delivery>("delivery") ?? { failures: 0, dropped: 0 };
   }
@@ -612,7 +615,11 @@ export class ClientDO extends DurableObject<Env> {
    * none waits for ever. A row from before `queued_ms` starts its wait now.
    */
   private dropOldEvents(now = Date.now()): void {
-    this.sql.exec("UPDATE outbox SET queued_ms = ? WHERE queued_ms IS NULL", now);
+    // A row with no time was queued before every row after it: it takes the earliest time among those
+    // (else now), so the queue's order is its age's order and an older event never outlives a newer one.
+    this.sql.exec(`UPDATE outbox SET queued_ms = COALESCE((SELECT MIN(o.queued_ms) FROM outbox o WHERE o.seq > outbox.seq AND o.queued_ms IS NOT NULL), ?)
+      WHERE queued_ms IS NULL`, now);
+    // No attempt is out now: this runs from the alarm, as `deliver` does, and alarm handlers don't overlap.
     const n = this.sql.exec("DELETE FROM outbox WHERE queued_ms <= ?", now - EVENT_MAX_AGE_MS).rowsWritten;
     if (n) {
       this.deliveryEvent({ kind: "dropped", n });
@@ -657,9 +664,11 @@ export class ClientDO extends DurableObject<Env> {
     for (const ev of events) this.sql.exec("INSERT OR IGNORE INTO outbox (id, body, queued_ms) VALUES (?, ?, ?)", ev.id, JSON.stringify(ev), Date.now());
     const over = this.backlog() - BACKLOG_MAX;
     if (over > 0) {
-      this.sql.exec("DELETE FROM outbox WHERE seq IN (SELECT seq FROM outbox ORDER BY seq LIMIT ?)", over);
-      this.deliveryEvent({ kind: "dropped", n: over });
-      console.warn(`client ${r.client}: its event backlog is full; dropped the ${over} oldest`);
+      // The oldest go, but never the event being sent right now: it is about to be delivered, and counting
+      // it dropped would be wrong. The cap still holds (the rows deleted are as many).
+      const n = this.sql.exec("DELETE FROM outbox WHERE seq IN (SELECT seq FROM outbox WHERE seq != ? ORDER BY seq LIMIT ?)", this.delivering ?? -1, over).rowsWritten;
+      this.deliveryEvent({ kind: "dropped", n });
+      console.warn(`client ${r.client}: its event backlog is full; dropped the ${n} oldest`);
     }
     // A delivery waiting out its backoff keeps its time; otherwise the next one goes now.
     if (!this.deadlines.has("deliver")) await this.deadlines.set("deliver", Date.now());
@@ -678,6 +687,7 @@ export class ClientDO extends DurableObject<Env> {
       if (!hook || !row) return;
       const t = Date.now();
       let error: string | null = null;
+      this.delivering = row.seq;
       try {
         const res = await fetch(hook.url, {
           method: "POST",
@@ -690,6 +700,8 @@ export class ClientDO extends DurableObject<Env> {
         if (res.status < 200 || res.status > 299) error = `HTTP ${res.status}`;
       } catch (e) {
         error = e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError") ? `no answer within ${timeoutMs} ms` : clip(String(e), 300);
+      } finally {
+        this.delivering = null;
       }
       // Re-read in this step: a new webhook set during the attempt starts its own schedule.
       if (this.kv<Webhook>("webhook")?.set_ms !== hook.set_ms) continue;
