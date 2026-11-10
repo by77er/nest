@@ -96,7 +96,7 @@ describe("a project's models", () => {
     expect(written(wt)).toMatchObject({ launch: { model: "claude-opus-5-5" }, repos: [p.repo] });
   });
 
-  it("the owner's choice applies to the next start: workers started after it, and the manager once restarted", async () => {
+  it("the owner's choice applies to workers started after it; the running manager keeps its agent and template (it's switched, below)", async () => {
     const p = await newProject();
     const first = await assign(p, "first");
     const r = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { worker_model: "claude-haiku-5-5", manager_model: "claude-opus-5-5[1m]" });
@@ -117,6 +117,179 @@ describe("a project's models", () => {
     expect(mt).toBe(entry(p, "manager", "claude-opus-5-5[1m]"));
     expect(mt).toMatch(/^projects\/[a-z][a-z0-9-]{0,62}$/);
     expect(written(mt)!.launch.model).toBe("claude-opus-5-5[1m]");
+  });
+
+  describe("the running manager switched now (README.md#models)", () => {
+    const settings = (p: P) => api(token, "GET", `/api/projects/${p.id}`).then((r) => r.body.settings);
+    const appChat = async (p: P) => ((await api(token, "GET", `/api/projects/${p.id}/chat`)).body as { sender: string; text: string }[]).filter((m) => m.sender === "app").map((m) => m.text);
+    const setModel = (p: P, m: string) => api(token, "PATCH", `/api/projects/${p.id}/settings`, { manager_model: m });
+    const managerAgents = (p: P) => [...fake.agents.values()].filter((a) => a.labels.project === p.id && a.labels.role === "manager");
+
+    it("an idle manager is restarted on the new model right away (in the save), keeping its agent and session; the chat says so", async () => {
+      const p = await newProject();
+      // Switched before the save answers: nothing is owed after it.
+      expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toBeNull();
+      const m = fake.agents.get(p.manager)!;
+      expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }]);
+      // The same agent (its session resumed by nest), no new one.
+      expect(managerAgents(p)).toHaveLength(1);
+      expect((await settings(p)).manager).toBe(p.manager);
+      expect((await settings(p)).manager_switch).toBeNull();
+      expect(await appChat(p)).toContain(`Switched to ${modelLabel("claude-sonnet-5-5")}.`);
+      // Done: more alarms restart nothing.
+      await alarm(p);
+      expect(m.restarts).toHaveLength(1);
+    });
+
+    it("a manager in a turn switches once it ends, never in it", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      m.state = "working";
+      expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toEqual({ to: "claude-sonnet-5-5", after_turn: true });
+      await alarm(p);
+      expect(m.restarts ?? []).toEqual([]);
+      // Its turn ends: due now.
+      m.state = "waiting_input";
+      await deliver({ id: `evt-${rand()}`, type: "agent.turn_completed", agent: p.manager, text: "Done." });
+      await alarm(p);
+      expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }]);
+      expect(await appChat(p)).toContain(`Switched to ${modelLabel("claude-sonnet-5-5")}.`);
+    });
+
+    it("a turn's end missed: it looks again, and still never mid-turn", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      m.state = "compacting";
+      await setModel(p, "claude-sonnet-5-5");
+      await alarm(p);
+      const due = await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT switch_next_ms FROM settings").one().switch_next_ms as number);
+      expect(due).toBeGreaterThan(Date.now());
+      expect(m.restarts ?? []).toEqual([]);
+      m.state = "idle";
+      await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET switch_next_ms = 0"); });
+      await alarm(p);
+      expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }]);
+    });
+
+    it("the last change wins: two quick changes during a turn switch once, to the second; changed back before the switch, nothing restarts", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      m.state = "working";
+      await setModel(p, "claude-sonnet-5-5");
+      await setModel(p, "claude-haiku-5-5");
+      m.state = "waiting_input";
+      await deliver({ id: `evt-${rand()}`, type: "agent.turn_completed", agent: p.manager, text: "Done." });
+      await alarm(p);
+      expect(m.restarts).toEqual([{ model: "claude-haiku-5-5" }]);
+      m.state = "working";
+      await setModel(p, "claude-opus-5-5");
+      expect((await settings(p)).manager_switch).toEqual({ to: "claude-opus-5-5", after_turn: true });
+      await setModel(p, "claude-haiku-5-5");
+      expect((await settings(p)).manager_switch).toBeNull();
+      m.state = "waiting_input";
+      await deliver({ id: `evt-${rand()}`, type: "agent.turn_completed", agent: p.manager, text: "Done again." });
+      await alarm(p);
+      expect(m.restarts).toHaveLength(1);
+    });
+
+    it("changed again while a switch is at nest: the latest follows it", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      let release!: () => void;
+      const hold = { match: new RegExp(`^POST /v1/agents/${p.manager}/start$`), release: new Promise<void>((r) => { release = r; }), reached: false };
+      fake.holds.push(hold);
+      const running = setModel(p, "claude-sonnet-5-5");
+      await vi.waitFor(() => expect(hold.reached).toBe(true));
+      await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET manager_model = 'claude-haiku-5-5'"); });
+      release();
+      await running;
+      await alarm(p);
+      expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }, { model: "claude-haiku-5-5" }]);
+      expect((await settings(p)).manager_switch).toBeNull();
+    });
+
+    it("no running manager (a start pending, or it ended): nothing to switch; its start takes the setting's model", async () => {
+      const p = await newProject();
+      fake.agents.get(p.manager)!.ended = true;
+      await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: p.manager, reason: "exited" });
+      expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toBeNull();
+      await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET manager_next_ms = 0 WHERE manager_next_ms IS NOT NULL"); });
+      await stub(p).drain();
+      const next = (await settings(p)).manager as string;
+      expect(next).not.toBe(p.manager);
+      expect(fake.agents.get(next)!.template).toBe(entry(p, "manager", "claude-sonnet-5-5"));
+      expect(fake.agents.get(next)!.restarts ?? []).toEqual([]);
+      expect((await settings(p)).manager_switch).toBeNull();
+    });
+
+    it("a start frozen before the change runs the old model, then is switched to the new one", async () => {
+      const p = await newProject();
+      fake.agents.get(p.manager)!.ended = true;
+      // nest can't take the new manager's create for a while (the client retries a retryable answer itself).
+      fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
+      await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: p.manager, reason: "exited" });
+      await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET manager_next_ms = 0 WHERE manager_next_ms IS NOT NULL"); });
+      await stub(p).drain();
+      expect((await settings(p)).manager).toBeNull();
+      // Its attempt froze Fable; the setting changes before the retry (with no running manager, nothing to switch yet).
+      expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toBeNull();
+      fake.failures = [];
+      await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET manager_next_ms = 0 WHERE manager_next_ms IS NOT NULL"); });
+      // The start, on the model it froze, then the switch onto the setting's, in the same drain.
+      await stub(p).drain();
+      const next = (await settings(p)).manager as string;
+      expect(fake.agents.get(next)!.template).toBe(entry(p, "manager", "claude-fable-5-2"));
+      await alarm(p);
+      expect(fake.agents.get(next)!.restarts).toEqual([{ model: "claude-sonnet-5-5" }]);
+      expect((await settings(p)).manager_switch).toBeNull();
+    });
+
+    it("a switch nest refuses for good is said in the chat and not tried again; one it can't take now is retried", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      // The client retries a retryable answer itself: nest can't take it for a while.
+      fake.fail(new RegExp(`^POST /v1/agents/${p.manager}/start$`), 503, { retryable: true, times: 1000 });
+      expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toEqual({ to: "claude-sonnet-5-5", after_turn: false });
+      expect(m.restarts ?? []).toEqual([]);
+      fake.failures = [];
+      await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET switch_next_ms = 0"); });
+      await alarm(p);
+      expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }]);
+      fake.fail(new RegExp(`^POST /v1/agents/${p.manager}/start$`), 400, { times: 1 });
+      await setModel(p, "claude-haiku-5-5");
+      await alarm(p);
+      expect(await appChat(p)).toEqual(expect.arrayContaining([expect.stringMatching(/^The manager couldn't be switched to Haiku/)]));
+      expect((await settings(p)).manager_switch).toBeNull();
+      await alarm(p);
+      expect(m.restarts).toHaveLength(1);
+    });
+
+    it("a nest that ignored the launch (its answer names none) is said in the chat, and the manager's model isn't taken as switched", async () => {
+      const p = await newProject();
+      fake.launchIgnored = true;
+      try {
+        expect((await setModel(p, "claude-sonnet-5-5")).body.manager_switch).toBeNull();
+        expect(await appChat(p)).toEqual(expect.arrayContaining([expect.stringMatching(/^The manager couldn't be switched to Sonnet 5\.5: nest didn't apply the model/)]));
+        expect(await appChat(p)).not.toContain(`Switched to ${modelLabel("claude-sonnet-5-5")}.`);
+        expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT manager_running_model AS m FROM settings").one().m)).not.toBe("claude-sonnet-5-5");
+      } finally {
+        fake.launchIgnored = false;
+      }
+    });
+
+    it("a switch made stale by a move of the manager (it ended meanwhile) writes nothing", async () => {
+      const p = await newProject();
+      let release!: () => void;
+      const hold = { match: new RegExp(`^POST /v1/agents/${p.manager}/start$`), release: new Promise<void>((r) => { release = r; }), reached: false };
+      fake.holds.push(hold);
+      const running = setModel(p, "claude-sonnet-5-5");
+      await vi.waitFor(() => expect(hold.reached).toBe(true));
+      await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: p.manager, reason: "exited" });
+      release();
+      await running;
+      expect(await appChat(p)).not.toContain(`Switched to ${modelLabel("claude-sonnet-5-5")}.`);
+      expect((await settings(p)).manager_switch).toBeNull();
+    });
   });
 
   it("a start in flight keeps the model it froze, though the setting changes before its retry", async () => {

@@ -17,7 +17,7 @@ import type { Settings } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
 import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
-import { MODELS, modelProblem } from "../../../models";
+import { MODELS, modelLabel, modelProblem } from "../../../models";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 
@@ -149,11 +149,18 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
               <FieldGroup>
                 <ModelField
                   label="Manager's model"
-                  description="A change applies the next time the manager starts (Restart manager, on its page)."
+                  description="A change applies now: the running manager switches when it's between turns, keeping its conversation."
                   value={form.getValues().manager_model}
                   onChange={(v) => form.setFieldValue("manager_model", v)}
                   error={form.errors.manager_model}
                 />
+                {settings.manager_switch && (
+                  <Text fz="sm" c="dimmed" data-slot="manager-switch" role="status">
+                    {settings.manager_switch.after_turn
+                      ? `Switches to ${modelLabel(settings.manager_switch.to)} after this turn.`
+                      : `Switching to ${modelLabel(settings.manager_switch.to)}…`}
+                  </Text>
+                )}
                 <ModelField
                   label="Workers' model"
                   description="A change applies to workers started from now on; running ones keep theirs."

@@ -922,6 +922,9 @@ const app = {
     { name: "settings-from-triage-link", section: "project", path: "/projects/prj_demo/settings#triage", fixture: "issues-no-one", full: false },
     // The models (README.md#models): a custom id shown with its field; the list open.
     { name: "settings-models-custom", section: "project", path: "/projects/prj_demo/settings", fixture: "models-custom" },
+    // A manager model switch waiting for the manager's turn to end, and its chat line once done (README.md#models).
+    { name: "settings-manager-switching", section: "project", path: "/projects/prj_demo/settings", fixture: "manager-switching" },
+    { name: "manager-switched", section: "project", path: "/projects/prj_demo/manager", fixture: "manager-switched", full: false },
     { name: "settings-models-open", section: "project", path: "/projects/prj_demo/settings", full: false, after: async (p) => { const f = p.getByLabel("Manager's model").first(); await f.scrollIntoViewIfNeeded(); await f.click(); } },
     { name: "settings-comments-id-only", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-id-only" },
     { name: "switcher-open", section: "project", path: "/projects/prj_demo/reviews", full: false, widths: DESKTOP, after: async (p) => { await p.getByRole("button", { name: /Switch project/ }).click(); await p.keyboard.type("gad"); } },

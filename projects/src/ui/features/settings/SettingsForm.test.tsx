@@ -189,6 +189,20 @@ describe("auto-merge in the settings", () => {
   });
 });
 
+describe("the manager's model, switched now", () => {
+  it("a pending switch says when: after this turn, or now", async () => {
+    const turn = new FakeApi();
+    turn.projects[0]!.settings = { ...turn.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch: { to: "claude-sonnet-5-5", after_turn: true } };
+    const b = await openSettings(turn);
+    expect(b.dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Switches to Sonnet 5.5 after this turn.");
+    b.unmount();
+    const now = new FakeApi();
+    now.projects[0]!.settings = { ...now.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch: { to: "claude-sonnet-5-5", after_turn: false } };
+    const c = await openSettings(now);
+    expect(c.dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Switching to Sonnet 5.5…");
+  });
+});
+
 describe("the models in the settings", () => {
   const select = (dialog: HTMLElement, label: string) => within(dialog).getAllByLabelText(label).find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden") as HTMLInputElement;
 
@@ -197,7 +211,8 @@ describe("the models in the settings", () => {
     const { user, dialog } = await openSettings(api);
     expect(select(dialog, "Manager's model")).toHaveValue("Fable 5.2");
     expect(select(dialog, "Workers' model")).toHaveValue("Opus 5.5");
-    expect(dialog).toHaveTextContent("applies the next time the manager starts");
+    expect(dialog).toHaveTextContent("A change applies now: the running manager switches when it's between turns, keeping its conversation.");
+    expect(dialog.querySelector("[data-slot=manager-switch]")).toBeNull();
     expect(dialog).toHaveTextContent("workers started from now on; running ones keep theirs");
     expect(dialog).toHaveTextContent("Reviewers and routine runs keep nest's default model.");
     await user.click(select(dialog, "Workers' model"));
