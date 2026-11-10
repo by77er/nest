@@ -34,7 +34,7 @@ import { type ClientEvent, ClientOutbox, EVENT_TEXT_MAX } from "../lib/client-ev
 import { field, TRACE_PING, TRACE_PONG, TRACE_SOCKETS_MAX, type TraceBody, type TraceControl, TraceRing, traceOf } from "../lib/trace";
 import { decodeCursor, encodeCursor, HISTORY_DEFAULT_LIMIT, type HistoryCursor, type HistoryPage, historyPage } from "../lib/trace-history";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
-import { type AgentSpec, launchProblem, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
+import { type AgentSpec, changedLaunch, type LaunchChange, launchProblem, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
 import {
   AGENT_RECORD_RETENTION_MS, cellIdleTtlMs, END_GRACE_MS, END_RETRY_MS, type Ended, type EndReason, ephemeralDone, MAX_OWNER_HOPS, narrowTtl, ownsVia,
   spawnRefusal,
@@ -286,6 +286,8 @@ export type StartResult =
   | { kind: "started"; host: string; cmd: string }
   | { kind: "waiting"; host: string | null; cmd: null; waiting_for: string }
   | { kind: "none"; host: string | null; cmd: null };
+/** A restart on a changed launch (`restartWith`): what the start did, and the launch now stored. */
+export type RestartResult = StartResult & { launch: { model: string | null; effort: string | null } };
 /** A condemned brain's escalation runs this long after its kill was sent, and again every so often. */
 const EXIT_WAIT_MS = 60_000;
 /** A kill that couldn't be sent is sent again after this long. */
@@ -801,6 +803,28 @@ export class AgentDO extends DurableObject<Env> {
     return r ?? this.startStatus();
   }
 
+  /**
+   * Its owner restarts the brain on a changed launch (`POST /start {restart: true, launch}`; lib/spec.ts
+   * `LaunchChange`): the new launch is stored in the step that records the restart intent, so neither is
+   * ever without the other, and checked there as a whole (`launchProblem`), so a stored launch is never
+   * one no brain can start with. The restart is the existing one: a live brain is condemned (killed, a turn
+   * it was running cut and redone by the next brain as a recovery turn), and the next start resumes the
+   * same session with the stored launch, which `issueStart` reads in its own commit step: of several
+   * changes, the last stored is the one the brain starts with. Answers what was stored.
+   */
+  async restartWith(change: LaunchChange, hostHint?: string): Promise<RestartResult> {
+    if (hostHint) await this.requireBrainHost(this.load().cell, hostHint);
+    // From here to the intent's write, no await: the check is of what is stored with it.
+    const info = this.load();
+    this.refuseEnded(info, "starts");
+    const bad = launchProblem(changedLaunch(info.launch, change));
+    if (bad) throw new NestError(ErrorCodes.INVALID_MESSAGE, `the agent's ${bad}`);
+    await this.setIntent({ ...(hostHint ? { host_hint: hostHint } : {}), reason: "restart" }, change);
+    const r = await this.runIntent(true);
+    const now = this.load().launch;
+    return { ...(r ?? this.startStatus()), launch: { model: now.model ?? null, effort: now.effort ?? null } };
+  }
+
   /** FleetDO saw room for a brain: run a waiting intent now instead of at its backed-off retry. */
   async pokeIntent(): Promise<boolean> {
     if (!this.load().intent) return false;
@@ -816,12 +840,16 @@ export class AgentDO extends DurableObject<Env> {
     return { kind: "none", host: b?.host ?? null, cmd: null };
   }
 
-  /** Merge a start request into the intent, with a backstop alarm in the same step (an eviction mid-start). */
-  private async setIntent(patch: StartIntent): Promise<void> {
+  /**
+   * Merge a start request into the intent, with a backstop alarm in the same step (an eviction mid-start),
+   * and a restart's launch change (`restartWith`) in that same step.
+   */
+  private async setIntent(patch: StartIntent, launch?: LaunchChange): Promise<void> {
     // Nothing starts an agent that ended for good.
     if (this.load().ended) return;
     this.update((i) => {
       i.intent = mergeIntent(i.intent, patch);
+      if (launch) i.launch = changedLaunch(i.launch, launch);
     });
     await this.deadlines.set("intent", Date.now() + WAKE_RETRY_MS, true);
   }
