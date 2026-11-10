@@ -95,6 +95,10 @@ struct Summary {
     /// The lifecycle machine, fed every step taken beside this row ([`Inner::shadow`]). It decides
     /// nothing yet.
     shadow: Incarnation,
+    /// This row's own number: unique among every row this nestd has had, so a step fed from a
+    /// task of its own (the fence's lock-free pause) never reaches a later row of the same
+    /// sandbox and epoch.
+    row: u64,
 }
 
 /// The lifecycle machine's state for a reported one, and back.
@@ -326,6 +330,8 @@ pub struct Inner {
     /// Steps the lifecycle machine refused, or after which it reported another state than the row
     /// ([`Inner::shadow`]).
     lifecycle_mismatches: std::sync::atomic::AtomicU64,
+    /// The next [`Summary::row`].
+    next_row: std::sync::atomic::AtomicU64,
     denied_seen: RecentSet<(SandboxId, String, u16)>,
     alerts_seen: RecentSet<(SandboxId, String, String)>,
     /// The proxy intermediate CA's renewal (`nestd_core::ca`): the installed key, its expiry, and
@@ -599,6 +605,7 @@ impl Host {
         // among the sandboxes: `retire` owns it.
         let mut summary = BTreeMap::new();
         let mut recovered = vec![];
+        let mut found_rows: u64 = 0;
         for f in found {
             let m = f.meta;
             tombstones.fence(&m.sandbox, m.epoch);
@@ -613,8 +620,10 @@ impl Host {
                     resources: m.resources,
                     guest: None,
                     shadow: Incarnation::at(lifecycle::State::Fenced, lifecycle::Vm::Absent),
+                    row: found_rows,
                 },
             );
+            found_rows += 1;
             let mut sbx = Sbx::new(m.sandbox.clone(), m.workstream, m.epoch, m.image, m.resources, None, m.head, cfg.vm_dir(&m.sandbox.0, m.epoch.0), f.state_dir);
             sbx.disk_clean = m.clean;
             sbx.unanswered = m.unanswered;
@@ -642,6 +651,7 @@ impl Host {
             lease_deadline: lease_tx,
             lapse_guard: LapseGuard::default(),
             lifecycle_mismatches: std::sync::atomic::AtomicU64::new(0),
+            next_row: std::sync::atomic::AtomicU64::new(found_rows),
             denied_seen: RecentSet::new(RELAY_DEDUP_WINDOW, MAX_DENIED_SEEN),
             alerts_seen: RecentSet::new(RELAY_DEDUP_WINDOW, MAX_DENIED_SEEN),
             proxy_ca: Mutex::new(proxy_ca),
@@ -787,6 +797,22 @@ impl Inner {
         self.lifecycle_mismatches.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// The lifecycle machine's view of `sandbox`'s VM here, if it has a row (introspection and
+    /// tests).
+    pub fn lifecycle_vm(&self, sandbox: &SandboxId) -> Option<lifecycle::Vm> {
+        self.summary.lock().expect("summary").get(sandbox).map(|r| r.shadow.vm())
+    }
+
+    /// [`Self::shadow`] for a step taken by a task of its own, which may end after its row is
+    /// gone: fed only to the row it was taken for (`row`, a [`Summary::row`]), never to a later
+    /// one of the same sandbox and epoch.
+    fn shadow_of(&self, id: &SandboxId, row: u64, input: lifecycle::Input) {
+        let mut summary = self.summary.lock().expect("summary");
+        if let Some(r) = summary.get_mut(id).filter(|r| r.row == row) {
+            self.shadow_row(id, r, input);
+        }
+    }
+
     /// Tell the lifecycle machine a step just taken for `id@epoch` (after the row's state was
     /// set, where the step sets one). The machine decides nothing yet: it is run beside the shell
     /// to find where its table and the shell differ. A step it refuses, or a state it reports that
@@ -807,8 +833,8 @@ impl Inner {
         let refused = row.shadow.step(input).err();
         let shell = lifecycle_state(row.state);
         if refused.is_some() || row.shadow.state() != shell {
-            self.lifecycle_mismatches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            tracing::error!(sandbox = %id, epoch = row.epoch.0, ?input, ?before, machine = ?row.shadow, ?refused, shell = ?row.state, "lifecycle shadow mismatch");
+            let total = self.lifecycle_mismatches.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            tracing::error!(total, sandbox = %id, epoch = row.epoch.0, ?input, ?before, machine = ?row.shadow, ?refused, shell = ?row.state, "lifecycle shadow mismatch");
             row.shadow.follow(shell, input);
         }
     }
@@ -1036,7 +1062,9 @@ impl Inner {
                     CaAnswer::Refused => tracing::error!(expires_ms = ca.expires_ms, "refusing a proxy CA whose public key is neither the renewal's nor the current one's"),
                 }
             }
-            FleetNotice::Connected { lease } => tracing::info!(?lease, "fleet connected"),
+            // With the lifecycle machine's disagreements so far: no metrics leave nestd, so each
+            // (re)connection's line is where an operator reads the count.
+            FleetNotice::Connected { lease } => tracing::info!(?lease, lifecycle_mismatches = self.lifecycle_mismatches(), "fleet connected"),
             FleetNotice::Disconnected => tracing::warn!("fleet disconnected"),
             FleetNotice::Error(e) => tracing::warn!(code = %e.code, message = %e.message, "fleet error"),
         }
@@ -1283,7 +1311,7 @@ impl Inner {
     /// through the lock-free pauser. Then, under the lock: close the guest connection, stop the
     /// VM, drop the netns, and retire it (salvage, then delete) when `salvage` is set.
     async fn fence_sandbox(self: &Arc<Self>, id: &SandboxId, epoch: Epoch, reason: &str, salvage: bool) {
-        {
+        let row = {
             let mut summary = self.summary.lock().expect("summary");
             let Some(s) = summary.get_mut(id) else { return };
             if s.epoch != epoch || s.state == SandboxState::Fenced {
@@ -1291,12 +1319,13 @@ impl Inner {
             }
             s.state = SandboxState::Fenced;
             self.shadow_row(id, s, lifecycle::Input::Fence);
-        }
+            s.row
+        };
         if let Some(pauser) = self.pausers.get(id, epoch) {
             let (this, id) = (self.clone(), id.clone());
             tokio::spawn(async move {
                 match pauser.pause().await {
-                    Ok(()) => this.shadow(&id, epoch, lifecycle::Input::Pause(Holder::Fence)),
+                    Ok(()) => this.shadow_of(&id, row, lifecycle::Input::Pause(Holder::Fence)),
                     Err(e) => tracing::warn!(error = %e, "fence: lock-free pause failed (retried under the sandbox lock)"),
                 }
             });
@@ -1628,7 +1657,7 @@ impl Inner {
         let initial = if restoring { SandboxState::Restoring } else { SandboxState::Creating };
         self.summary.lock().expect("summary").insert(
             sandbox.clone(),
-            Summary { workstream: workstream.clone(), epoch, state: initial, head: from.as_ref().map(|g| g.id.clone()), dirty: false, resources, guest: None, shadow: Incarnation::new(restoring) },
+            Summary { workstream: workstream.clone(), epoch, state: initial, head: from.as_ref().map(|g| g.id.clone()), dirty: false, resources, guest: None, shadow: Incarnation::new(restoring), row: self.next_row.fetch_add(1, std::sync::atomic::Ordering::Relaxed) },
         );
         self.emit(HostEventBody::SandboxState { sandbox: sandbox.clone(), epoch, state: initial, suspend_mode: None, detail: None, guest: None });
 
