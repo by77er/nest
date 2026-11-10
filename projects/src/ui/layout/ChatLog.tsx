@@ -167,6 +167,18 @@ function JumpPill({ children }: { children: ReactNode }) {
 }
 
 
+/**
+ * The room a status's spinner takes beside its word, kept whether the spinner shows yet or not, so the
+ * word doesn't move when it appears.
+ */
+export function SpinnerSlot({ on }: { on: boolean }) {
+  return (
+    <span className={classes.spinnerSlot} data-slot="spinner" aria-hidden>
+      {on && <Loader size={icon.sm} color="gray" />}
+    </span>
+  );
+}
+
 /** The manager is at work and has nothing new to show yet: a quiet loading line. */
 export function WorkingLine({ children }: { children: ReactNode }) {
   return (

@@ -8,7 +8,7 @@
 // without losing your place.
 
 import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Textarea, Tooltip, VisuallyHidden } from "@mantine/core";
-import { useMediaQuery } from "@mantine/hooks";
+import { useMediaQuery, useReducedMotion } from "@mantine/hooks";
 import { IconAlertTriangle, IconArrowDown, IconArrowUp, IconCalendarEvent, IconCopy, IconDots, IconHourglass, IconListCheck, IconMessage, IconPlayerStop, IconQuote, IconRefresh, IconWritingSign } from "@tabler/icons-react";
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { human } from "../../../waits";
@@ -17,7 +17,7 @@ import { useChat, useInterruptManager, useManager, usePostChat, useRestartManage
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import {
-  ChatFrame, ChatLog, ChatWelcome, ComposerBox, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine, usePhone,
+  ChatFrame, ChatLog, ChatWelcome, ComposerBox, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, SpinnerSlot, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine, usePhone,
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
 import { useTrace } from "../trace/useTrace";
@@ -182,7 +182,57 @@ function MessageActions({ m, onQuote, onRetry }: { m: ChatMessage; onQuote: (tex
   );
 }
 
-function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMessage; projectId: string; appear: boolean; steps?: Step[]; onQuote: (t: string) => void; onRetry: (m: ChatMessage) => void }) {
+/** A message's delivery state (README.md#outboxes): an older row without one reads from `delivered` and `error`. */
+const statusOf = (m: ChatMessage) => m.status ?? (m.delivered ? "done" : m.error ? "failed" : "owed");
+
+/**
+ * What to say of the owner's messages whose delivery changed since `seen` (updated here): the last
+ * change, as a sentence, or null.
+ */
+export function statusNews(seen: Map<number, string>, messages: ChatMessage[]): string | null {
+  let news: string | null = null;
+  for (const m of messages) {
+    if (m.sender !== "owner") continue;
+    const now = statusOf(m);
+    const before = seen.get(m.seq);
+    seen.set(m.seq, now);
+    if (before === now) continue;
+    if (now === "failed") news = `Your message wasn't delivered${m.error ? `: ${m.error}` : ""}. Retry is available.`;
+    else if (now === "retrying") news = `Still sending your message${m.error ? `: ${m.error}` : ""}.`;
+    // An ordinary send (sending, then delivered) says nothing: only one that had been held up.
+    else if (now === "done" && (before === "retrying" || before === "failed")) news = "Your message was delivered.";
+    else if (now === "owed" && before === "failed") news = "Sending your message again.";
+  }
+  return news;
+}
+
+/** How long a message is in flight before its spinner shows (the skill: loading shows only after 300 ms). */
+export const SPINNER_AFTER_MS = 300;
+
+/**
+ * A message in flight: the word ("Sending…", "Retrying…"), quiet, which always carries the state. `spin`:
+ * this is the log's one message that may show a spinner (the most recent in flight). The spinner comes only
+ * once it has been in flight here for `SPINNER_AFTER_MS`, so an ordinary send never flashes one, in room
+ * kept from the start so the word doesn't move; with reduced motion there's none at all.
+ */
+export function InFlightMark({ retrying, spin }: { retrying: boolean; spin: boolean }) {
+  const still = useReducedMotion();
+  const [late, setLate] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setLate(true), SPINNER_AFTER_MS);
+    return () => clearTimeout(t);
+  }, []);
+  return (
+    <Row gap="xs" wrap="nowrap" data-marker="sending" data-status={retrying ? "retrying" : "owed"}>
+      {spin && !still && <SpinnerSlot on={late} />}
+      <Text fz="xs" c="dimmed">
+        {retrying ? "Retrying…" : "Sending…"}
+      </Text>
+    </Row>
+  );
+}
+
+function Message({ m, projectId, appear, steps, spin = false, onQuote, onRetry }: { m: ChatMessage; projectId: string; appear: boolean; steps?: Step[]; spin?: boolean; onQuote: (t: string) => void; onRetry: (m: ChatMessage) => void }) {
   if (m.sender === "app") {
     return (
       <MessageRow side="note" appear={appear} data-sender="app">
@@ -193,7 +243,7 @@ function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMes
   const mine = m.sender === "owner";
   // Its real state (README.md#outboxes): being sent (owed, or retrying with why), or failed: refused for
   // good, or never taken by the app (an unsent one, a negative seq). Retry only on failed.
-  const status = m.status ?? (m.delivered ? "done" : m.error ? "failed" : "owed");
+  const status = statusOf(m);
   const failed = mine && status === "failed";
   const retrying = mine && status === "retrying";
   const sending = mine && (status === "owed" || retrying);
@@ -206,9 +256,10 @@ function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMes
       data-seq={String(m.seq)}
       meta={
         <>
-          {(sending || failed) && (
-            <Badge size="xs" color={failed ? "warning" : "gray"} variant="light" data-marker={failed ? "undelivered" : "sending"}>
-              {failed ? "Not delivered" : retrying ? "Retrying…" : "Sending…"}
+          {sending && <InFlightMark retrying={retrying} spin={spin} />}
+          {failed && (
+            <Badge size="xs" color="warning" variant="light" leftSection={<IconAlertTriangle size={icon.sm} aria-hidden />} data-marker="undelivered">
+              Not delivered
             </Badge>
           )}
           {/* The exact time on hover; for the keyboard and touch it heads the message's actions. */}
@@ -284,6 +335,8 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const lastTop = useRef(0);
   const [unseen, setUnseen] = useState(0);
   const [announce, setAnnounce] = useState("");
+  // Each of the owner's messages' delivery state as last seen, for announcing its changes.
+  const statuses = useRef(new Map<number, string>());
   const log = useRef<HTMLDivElement>(null);
   const composer = useRef<HTMLTextAreaElement>(null);
   const seen = useRef<Set<number> | null>(null);
@@ -347,12 +400,17 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     const fresh = messages.filter((m) => m.seq > 0 && known && !known.has(m.seq));
     seen.current = new Set(messages.filter((m) => m.seq > 0).map((m) => m.seq));
     if (!known) {
+      statusNews(statuses.current, messages);
       // An empty chat opens at its top (on a phone, the page's column with its header).
       if (messages.length) scrollToBottom();
       return;
     }
     const lastManager = fresh.filter((m) => m.sender === "manager").at(-1);
+    // A change in one of the owner's messages' delivery is said too (once per change, never on load): a
+    // reply outranks it when both land together.
+    const said = statusNews(statuses.current, messages);
     if (lastManager) setAnnounce(`The manager replied: ${lastManager.text.slice(0, 500)}`);
+    else if (said) setAnnounce(said);
     if (atBottomRef.current) scrollToBottom();
     else if (fresh.length) setUnseen((n) => n + fresh.length);
   }, [messages]); // follows the log, reading the scroll state as it is now
@@ -465,6 +523,8 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const phone = usePhone();
   const streamSteps = live?.steps ?? (held ? (heldEnd?.steps ?? held.steps) : []);
   const replySteps = stepsBySeq(messages, finished);
+  // One spinner in the log: the most recent of the owner's messages in flight.
+  const spinSeq = messages.filter((m) => m.sender === "owner" && (statusOf(m) === "owed" || statusOf(m) === "retrying")).at(-1)?.seq;
   const stream = running || streamSteps.length > 0;
   // A tool running shows itself; otherwise the turn is between steps (thinking, writing): a working line.
   emptyRef.current = messages.length === 0 && !stream;
@@ -513,6 +573,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
                         projectId={projectId}
                         appear={!!seen.current && m.seq > 0 && !seen.current.has(m.seq)}
                         steps={replySteps.get(m.seq)}
+                      spin={m.seq === spinSeq}
                         onQuote={quoteReply}
                         onRetry={retry}
                       />
