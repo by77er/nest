@@ -43,3 +43,32 @@ SlotFollowups.tla MCSlotsFixedFollowups.cfg holds ci
 SlotFollowups.tla MCSlotsFixedHands.cfg holds full
 SlotFollowups.tla MCSlotsFixedPlaced.cfg holds full
 SlotFollowups.tla MCSlotsFixedBig.cfg holds full
+#
+# PlacementRetry: a refused placement and its reassignment, retried with bounds and given up visibly
+# (#191). Old configs are the code before #191; Stranded is #191's first version.
+PlacementRetry.tla MCRetryOldHotLoop.cfg violates:RowSettles ci
+PlacementRetry.tla MCRetryOldNeverRetried.cfg violates:SandboxSettles ci
+PlacementRetry.tla MCRetryStranded.cfg violates:NotStranded ci
+PlacementRetry.tla MCRetryStrandedLive.cfg violates:SandboxSettles ci
+PlacementRetry.tla MCRetryReachGiveUp.cfg violates:NoGiveUp ci
+PlacementRetry.tla MCRetryReachRecovery.cfg violates:NoRecovery ci
+PlacementRetry.tla MCRetryReachLostRetry.cfg violates:NoLostRetry ci
+PlacementRetry.tla MCRetryFixed.cfg holds ci
+PlacementRetry.tla MCRetryFixedSandbox.cfg holds ci
+PlacementRetry.tla MCRetryFixedRow.cfg holds ci
+PlacementRetry.tla MCRetryFixedBig.cfg holds ci
+#
+# FailedRelease: a failed sandbox releases its lease after a grace (#192), and what it leaves on the host.
+# NoSpend is #192's first version; RetryNoSpend is #192 as merged (82e007f9), before lease.retried spent an epoch.
+FailedRelease.tla MCFailedNoSpend.cfg violates:EpochAboveStale ci
+FailedRelease.tla MCFailedNoSpendSalvage.cfg violates:SalvageAccepted ci
+FailedRelease.tla MCFailedRetryNoSpend.cfg violates:EpochAboveStale ci
+FailedRelease.tla MCFailedRetryNoSpendSalvage.cfg violates:SalvageAccepted ci
+FailedRelease.tla MCFailedMutDeleteAny.cfg violates:OnlyItsLease ci
+FailedRelease.tla MCFailedMutRetire.cfg violates:NoWorkLostToRetire ci
+FailedRelease.tla MCFailedReachRelease.cfg violates:NoRelease ci
+FailedRelease.tla MCFailedReachRetired.cfg violates:NoRetiredAfter ci
+FailedRelease.tla MCFailedReachReplaced.cfg violates:NoReplaced ci
+FailedRelease.tla MCFailedFixed.cfg holds ci
+FailedRelease.tla MCFailedFixedReaped.cfg holds ci
+FailedRelease.tla MCFailedFixedReleases.cfg holds ci

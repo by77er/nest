@@ -65,3 +65,41 @@ Bounds: hosts h1, h2; epochs ≤ 3 (so two moves), commands ≤ 3, and at most o
 | MCSlotsFixedBig | both fixes; epochs ≤ 3, two of each fault | holds (12,459,894 states, 110 s) |
 
 Two further mutations of the spec, run by hand and not kept: `Deliver` without its epoch check violates BindingOnlyConfirmed; `Move` resetting `pending` but not the in-flight command violates HandsEventually.
+
+## PlacementRetry
+
+`PlacementRetry.tla` models who retries a refused placement, and when each side gives up (#191): FleetDO's reassignment row and SandboxDO's own `place` deadline, for one lost lease. `SandboxLease`'s `Reassign` retries for ever under weak fairness and its Refused answer leaves no retry, so neither bound is in it. The `leaseLost` call is split at its awaits: the request can be lost before it lands, the answer after, and FleetDO can reset with the call out. A refusal is FleetDO holding a lease that disagrees, which may heal or never. SandboxDO's step (`leaseLost`, then its placement) is one step: `FleetDO.place` is synchronous.
+
+Properties: `NotStranded` (the row never gives up while SandboxDO still names the lost host), `Bounded` (neither side's refusal count passes its limit), and under weak fairness on the tick, the alarm and the call's steps (faults, the operator and the heal unfair), `SandboxSettles` (L1, weakened: placed again, or given up where the owner sees it) and `RowSettles` (L3, weakened: the row deleted, or given up).
+
+Bounds: the limits are 3 refusals for the row and 2 for SandboxDO (10 and 6 in the code: the counting is the same), one lost call, one FleetDO reset, one "no capacity", one operator retry. `MCRetryFixedBig`: limits 4 and 3, two of each.
+
+| Config | What | Expected |
+|---|---|---|
+| MCRetryOldHotLoop | before #191: a refused reassignment retried every tick | violates RowSettles |
+| MCRetryOldNeverRetried | before #191: SandboxDO's refused placement clears its deadline, with nothing shown | violates SandboxSettles (once the row gives up nothing places it, even after the conflict heals) |
+| MCRetryStranded, MCRetryStrandedLive | #191's first version: any failed call counts toward giving up | violates NotStranded (three lost requests, 7 steps), and SandboxSettles |
+| MCRetryReachGiveUp, ReachRecovery, ReachLostRetry | reachability: both sides give up; placed again after refusals; a lost call retried | violates NoGiveUp, NoRecovery, NoLostRetry (not vacuous) |
+| MCRetryFixed, FixedSandbox, FixedRow | as built | holds (912 states) |
+| MCRetryFixedBig | as built, larger | holds (7,466 states) |
+
+## FailedRelease
+
+`FailedRelease.tla` models a failed sandbox releasing its lease (#192) and what the release leaves: the incarnation on the host, recorded stale, which keeps the host from being retired until it is salvaged (or its window passed) and destroyed. `SandboxLease` has no such action. The release is split at its two awaits (the fence's issue, `releaseFailedLease`), with an operator's retry, a destroy, a host's loss and a SandboxDO reset between them. Placement is one step (claim, `FleetDO.place`, the answer), with the no-capacity rollback.
+
+Properties: `EpochAboveStale` (unplaced, the sandbox's epoch is above every incarnation not yet salvaged), `SalvageAccepted` (what that guards: no recorded incarnation's salvage is refused as stale), `OnlyItsLease` (the release deletes no lease but the one at (h, e)), `NoWorkLostToRetire` (no host retired with an unsalvaged incarnation before its window), and under weak fairness on the release's steps, the window and the reaper, `StaleReaped` (every recorded incarnation ends destroyed) and `FailedReleases` (a failed sandbox leaves its host).
+
+Bounds: two hosts, epochs ≤ 4, two failures, two retries, one destroy, one host loss, one reset, one "no capacity".
+
+| Config | What | Expected |
+|---|---|---|
+| MCFailedNoSpend, NoSpendSalvage | #192's first version: the release doesn't spend an epoch; no retry | violates EpochAboveStale, SalvageAccepted |
+| MCFailedRetryNoSpend, RetryNoSpendSalvage | #192 as merged (82e007f9): `lease.retried` spends no epoch | violates EpochAboveStale and SalvageAccepted: an operator's retry between FleetDO's release and SandboxDO's leaves it unplaced at the released epoch, and the incarnation's salvage arriving before the next claim is refused (6 steps) |
+| MCFailedFixed | as built: the release and the retry each spend an epoch | holds (56,884 states) |
+| MCFailedFixedReaped, FixedReleases | as built, one liveness property each | holds |
+| MCFailedMutDeleteAny | mutation: the release deletes the sandbox's lease whatever it is | violates OnlyItsLease |
+| MCFailedMutRetire | mutation: scaleDown ignores incarnations not yet destroyed | violates NoWorkLostToRetire |
+| MCFailedReachRelease, ReachRetired, ReachReplaced | reachability | violates NoRelease, NoRetiredAfter, NoReplaced (not vacuous) |
+
+Not modelled in either: a lease lost from a live host (`leaseLost` after a fence, where what is left of B1 lives: SandboxLease's `MCB1`), lost answers and resets around `FleetDO.place` (SandboxLease's subject), the fence's acknowledgement (B5), an incarnation a retry leaves that FleetDO never recorded, and a stale row dropped when the sandbox is placed again on the same host (`reapStale`: nestd salvages it when it creates the new one).
+

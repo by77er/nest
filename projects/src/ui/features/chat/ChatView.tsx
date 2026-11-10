@@ -565,7 +565,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
                         Restart manager
                       </Button>
                     </Row>
-                  ) : replyWait ? (
+                  ) : replyWait && !down ? (
                     <Row gap="xs" wrap="nowrap" data-slot="reply-wait">
                       <Text component="span" c="dimmed" display="inline-flex">
                         <IconHourglass size={icon.sm} aria-hidden />

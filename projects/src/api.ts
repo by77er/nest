@@ -125,9 +125,13 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
         if (!g.ok) return err(g.status, g.error);
         if (!g.value.workflows) return err(409, "the app's grant doesn't allow workflows on push tokens: the operator must set github_push.workflows in its grant");
       }
+      // All or nothing: ProjectDO's part first (its refusals, a GitHub lookup among them, come before it
+      // writes anything), then ReviewDO's, only if that went through.
+      const updated = await p.updateSettings(rest);
+      if (!updated.ok) return done(updated);
       if (max_concurrent_reviews !== undefined) await review(env, pid).setMaxConcurrent(max_concurrent_reviews);
       if (untrusted_reviews !== undefined) await review(env, pid).setUntrustedPolicy(untrusted_reviews);
-      return done(await withReviews(env, pid, await p.updateSettings(rest)));
+      return done(await withReviews(env, pid, updated));
     }
     case "GET secrets": {
       // Metadata only: the app's, with nest's last injection and size; never a value.

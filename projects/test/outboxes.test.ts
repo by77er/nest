@@ -279,6 +279,9 @@ describe("the outboxes' migration", () => {
       sql.exec("ALTER TABLE settings DROP COLUMN listed_ms");
       for (const c of ["manager_model", "worker_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       for (const t of ["model_templates", "agent_templates"]) sql.exec(`DROP TABLE ${t}`);
+      // And the step after them (an attach's generation, early exits).
+      sql.exec("ALTER TABLE settings DROP COLUMN attach_gen");
+      sql.exec("DROP TABLE early_exits");
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec("INSERT INTO task_prs (pr, task, state, attached_by, attached_ms) VALUES (61, 'tsk_gone', 'open', 'owner', 1), (62, 'tsk_gone', 'detached', 'owner', 1), (63, ?, 'open', 'owner', 1)", t.id);
       migrate(st.storage, MIGRATIONS);

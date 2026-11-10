@@ -329,6 +329,35 @@ describe("a failed sandbox's lease is released, and only an operator's retry pla
     expect(c).toMatchObject({ ok: true, epoch: 5 });
   });
 
+  // [what, lease, host, epoch, retried]
+  const retries: [string, Lease, string, number, boolean][] = [
+    ["failed on its holder at its epoch", failed(), "hst_a", 3, true],
+    ["another host", failed(), "hst_b", 3, false],
+    ["another epoch (released, or placed again, meanwhile)", failed(), "hst_a", 2, false],
+    ["already unplaced (the release finished first)", failed({ host: null, epoch: 4 }), "hst_a", 3, false],
+    ["destroyed meanwhile", failed({ state: "destroyed", host: null }), "hst_a", 3, false],
+  ];
+  it.each(retries)("retried: %s", (_w, l, host, epoch, want) => {
+    const before = structuredClone(l);
+    retried(l, host, epoch);
+    // Retried: unplaced and creating, an epoch spent (so what it left on the host is an older epoch's). Otherwise untouched.
+    expect(l).toEqual(want ? { ...before, host: null, state: "creating", epoch: before.epoch + 1 } : before);
+  });
+
+  it("after a retry, as after a release, the old incarnation's salvage is an orphan even before the next claim, and after one that found no room", () => {
+    const l = failed();
+    const hostOf = (e: number) => (e === 3 ? "hst_a" : undefined);
+    const salvage = { kind: "disk_only" as const, reason: "salvage", epoch: 3, parent: "blake3:h" };
+    retried(l, "hst_a", 3);
+    expect(decideCommit(l, hostOf, "hst_a", salvage)).toEqual({ kind: "orphan" });
+    // A claim that finds no host rolls back to the epoch the retry left, still above the incarnation's.
+    const c = claim(l, 1);
+    expect(c).toMatchObject({ ok: true, epoch: 5 });
+    expect(placeAnswered(l, 5, { kind: "none" }, false)).toBe("unplaced");
+    expect(l.epoch).toBe(4);
+    expect(decideCommit(l, hostOf, "hst_a", salvage)).toEqual({ kind: "orphan" });
+  });
+
   it("after the release, the old incarnation's salvage is an orphan from its host only; before it, the holder's moves the head", () => {
     const l = failed();
     const hostOf = (e: number) => (e === 3 ? "hst_a" : undefined);

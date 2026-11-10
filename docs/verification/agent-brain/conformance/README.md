@@ -400,3 +400,17 @@ Line citations above this section are function names or older heads; `agent.ts` 
 - **`processIntent`, with a live brain and `liveBrainStart` = `condemn` only because a restart was asked for** (the same intent as `operator` wouldn't condemn: a healthy host, no move): the launch check (`requireLaunch`) runs before `condemn`, after the snapshot is seen unchanged. Before, the check sat only on the no-brain branch, so a restart of an agent whose stored launch fails the rule condemned the running brain and only then failed the start. Now the throw is non-retryable, `intentFailed` ends the intent, and with a brain it leaves `lifecycle` and `start_error` alone. Conforms: the refusal reads the brain record and writes none of it, issues no command, and takes no transition the model has (the condemn is simply not taken, so fewer behaviours, not new ones).
 - **A move or an unhealthy host condemns as before** (a drain's `avoid`, a hint, a host that's not active, with or without a restart): a brain is never pinned to a host it must leave, and a drain isn't blocked. The start after its release is refused on the no-brain branch and the agent is `errored` with `start_error`. `keep` and `drop` are unchanged.
 - Tests (`agent-seams.test.ts`): "a restart that couldn't start a brain", "a brain on a draining host is condemned even if no start can follow it", "a restart on a host that's no longer healthy condemns the brain all the same".
+
+## the turn ledger's step (refactor/turn-ledger, author's map, 2026-11-09)
+
+**Head:** `refactor/turn-ledger` (on main 045ef5fc). The queue's transitions are unchanged; their guards moved from the callers into one pure step, `turnStep` (`lib/turns.ts`), which every status write goes through. Not checked by a model run.
+
+| Model action | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| Q2 claim | `TurnQueue.claimNext` | yes | queued → active, as before |
+| Q3 complete | `TurnQueue.complete` | yes (stricter) | active → done only. The model completes only the current turn; the code used to set `done` from any status. The unseen inbox is requeued as before |
+| Q4 recover | `TurnQueue.recover` | yes (stricter) | active → interrupted, and the recovery turn is inserted only when that happened, so a repeated recover adds none |
+| (not modelled) drop | `TurnQueue.dropAll` | outside the model | queued or the given active turn → dropped, as before |
+| (not modelled) abandon | `TurnQueue.prune` | outside the model | An active row that isn't `current_turn`, older than the retention, → interrupted. No brain decision reads it. A message mirrored to a turn no longer active, that old, is requeued as a turn (as Q3 does for the unseen inbox) |
+
+Tests: `test/turns.test.ts` (the exhaustive table; the guards; the prune) and `test/contract-r2.test.ts` (AgentDO's prune under a live brain). Mutations run: a final turn completable, a second recovery turn, no abandon, the current turn abandoned, stale mirrored messages kept, a queued turn abandoned, `complete` bypassing the step, a live turn's message abandoned, AgentDO's prune not passing `current_turn`, a stale mirrored message dropped instead of requeued, every mirrored message requeued by the prune, requeued messages left mirrored. Each fails a test.

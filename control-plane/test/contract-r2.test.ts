@@ -52,3 +52,29 @@ describe("inbox_delivered", () => {
     expect(msg).toBeDefined();
   });
 });
+
+describe("the hourly prune", () => {
+  it("leaves the agent's own turn alone however old it is, and requeues a message mirrored to a turn long gone", async () => {
+    const s = await setup();
+    const t1 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "a long job" } }, 201)).turn;
+    const run = await s.ws.next("run_turn");
+    s.ws.send({ type: "ack", up_to: run.seq });
+    // The turn has run for eight days under a live brain; a message from then was mirrored to a turn that is gone.
+    const old = Date.now() - 8 * 86_400_000;
+    await runInDurableObject(agentStub(s.agent), (_i, st) => {
+      st.storage.sql.exec("UPDATE turns SET started_ms = ?, created_ms = ? WHERE turn = ?", old, old, t1);
+      st.storage.sql.exec("INSERT INTO inbox (id, message, turn, status, created_ms) VALUES ('msg_old', ?, 'trn_gone', 'delivered', ?)",
+        JSON.stringify({ id: "msg_old", from: "operator", text: "never shown", interrupt: false, ts_ms: old }), old);
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('prune', 0)");
+    });
+    await runDue(agentStub(s.agent));
+    expect((await agentStub(s.agent).info()).current_turn).toBe(t1);
+    const turns = await runInDurableObject(agentStub(s.agent), (_i, st) =>
+      st.storage.sql.exec<{ turn: string; status: string; input: string }>("SELECT turn, status, input FROM turns ORDER BY ord").toArray());
+    expect(turns.find((t) => t.turn === t1)!.status).toBe("active");
+    const queued = turns.filter((t) => t.status === "queued");
+    expect(queued).toHaveLength(1);
+    expect(JSON.parse(queued[0]!.input)).toMatchObject({ kind: "inbox", text: "Message from operator: never shown" });
+    expect(await runInDurableObject(agentStub(s.agent), (_i, st) => st.storage.sql.exec("SELECT 1 FROM inbox WHERE status = 'delivered'").toArray().length)).toBe(0);
+  });
+});

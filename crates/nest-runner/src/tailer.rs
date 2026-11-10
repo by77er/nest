@@ -19,6 +19,8 @@ pub const MAX_SEGMENT: usize = 46 * 1024;
 pub struct Chunk {
     pub offset: u64,
     pub base: bool,
+    /// On the base chunk: the bytes this rewrite carries in all (this chunk and those after it).
+    pub total: Option<u64>,
     pub data: Vec<u8>,
 }
 
@@ -128,8 +130,9 @@ impl Tailer {
 }
 
 /// Split into ≤ [`MAX_SEGMENT`] chunks, preferring line boundaries. Only the first chunk of a
-/// base rewrite carries `base: true`.
+/// base rewrite carries `base: true`, with the rewrite's whole length.
 fn split(start: u64, base: bool, buf: Vec<u8>) -> Vec<Chunk> {
+    let total = buf.len() as u64;
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos < buf.len() {
@@ -139,7 +142,8 @@ fn split(start: u64, base: bool, buf: Vec<u8>) -> Vec<Chunk> {
         {
             end = pos + nl + 1;
         }
-        out.push(Chunk { offset: start + pos as u64, base: base && out.is_empty(), data: buf[pos..end].to_vec() });
+        let first = base && out.is_empty();
+        out.push(Chunk { offset: start + pos as u64, base: first, total: first.then_some(total), data: buf[pos..end].to_vec() });
         pos = end;
     }
     out
@@ -267,6 +271,26 @@ mod tests {
             expect += ch.data.len() as u64;
         }
         assert_eq!(expect, 100_100);
+    }
+
+    #[test]
+    fn a_rewrite_in_several_chunks_says_its_whole_length_on_the_base_chunk_only() {
+        let dir = tempdir();
+        let p = dir.join("s.jsonl");
+        let line = format!("{}\n", "y".repeat(1000));
+        append(&p, &line.repeat(100));
+        let mut t = Tailer::new(&p, vec![]);
+        // Appends never carry a length.
+        assert!(t.poll().unwrap().iter().all(|c| !c.base && c.total.is_none()));
+        // The file is rewritten shorter (a compaction), still over one segment.
+        std::fs::write(&p, line.repeat(60)).unwrap();
+        let c = t.poll().unwrap();
+        assert!(c.len() >= 2);
+        let sent: u64 = c.iter().map(|ch| ch.data.len() as u64).sum();
+        assert_eq!(sent, 60_060);
+        assert!(c[0].base);
+        assert_eq!(c[0].total, Some(sent));
+        assert!(c[1..].iter().all(|ch| !ch.base && ch.total.is_none()));
     }
 
     #[test]
