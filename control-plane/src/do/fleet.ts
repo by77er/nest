@@ -23,9 +23,10 @@ import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
 import { addColumn, sqlIn, storedEnum, storedEnumOrNull, typeEnum } from "../lib/stored";
+import { followupBackoff, resultFollowups, resultStep } from "../lib/command-result";
 import { retentionMode } from "../lib/retention";
 import {
-  Capacity, type CommandBody, CommandBodyVariants, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
+  Capacity, type CommandBody, CommandBodyVariants, type CommandOutcome, type CommitRequestEvent, DEFAULT_LEASE_TIMING, type EnrollRequest,
   type EnrollResponse, type FleetToHost, type HostEvent, type HostToFleet, HostToFleetFrame, parseHostEvents, type LeaseClaim, type CaCertificate, type SandboxReport,
   TunnelState,
 } from "../protocol/control";
@@ -38,9 +39,12 @@ import {
   type CapacityView, type FleetView, HOST_STATUSES, type HostStatus, type HostView, type ImagesView, LAUNCH_END_REASONS, type LaunchEndReason,
   type LaunchView, type SandboxView, type TemplateView,
   type HostRole as AdminHostRole, type SandboxState as AdminSandboxState, type TunnelState as AdminTunnelState,
+  type AgentState as AdminAgentState, type AgentLifecycle as AdminAgentLifecycle, type BrainPhase as AdminBrainPhase,
   type AwsView, AGENT_LIFETIME_KINDS, type AgentLifetimeKind, type LifetimeAgentView, type LifetimeSandboxView, type LifetimesView,
   SANDBOX_LIFETIME_KINDS, type SandboxLifetimeKind,
 } from "../../../protocol/admin/view";
+import type { AgentLifecycle, AgentState } from "../protocol/model";
+import type { Brain } from "../lib/brain";
 import { AGENTS_CURSOR, agentCursorOf, type AgentRead, classifyAgent, classifySandbox, cursorOf, DEFAULT_QUIET_MS, mapBounded, parseCursor } from "../lib/abandoned";
 import { cellIdleTtlMs } from "../lib/lifetimes";
 import { labelWhere, type Labels } from "../lib/clients";
@@ -95,7 +99,8 @@ const LIVE_STATUSES = ["active", "draining", "stonith_pending"] as const satisfi
 type Same<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
 export const ADMIN_ENUMS_AGREE: [
   Same<AdminSandboxState, SandboxState>, Same<AdminHostRole, HostKind>, Same<AdminTunnelState, TunnelState>,
-] = [true, true, true];
+  Same<AdminAgentState, AgentState>, Same<AdminAgentLifecycle, AgentLifecycle>, Same<AdminBrainPhase, Brain["phase"]>,
+] = [true, true, true, true, true, true];
 
 /**
  * Where a host's sandbox gateway is reached (`hostGatewayUrl`): through its tunnel (Cloudflare
@@ -260,6 +265,8 @@ const ENROLL_TOKEN_RETENTION_MS = 7 * 86_400_000;
 /** How long a cell root certificate self-signed through KMS lasts. */
 const ROOT_CA_TTL_MS = 3650 * 86_400_000;
 const ALARM_TICK = "tick";
+/** Command results whose follow-ups are owed (`commands.followup_ms`): run again until done. */
+const ALARM_FOLLOWUPS = "followups";
 /** The daily pass that deletes tunnels and records whose host is gone (docs/sandbox/gateway/). */
 const ALARM_TUNNEL_SWEEP = "tunnel_sweep";
 const TUNNEL_SWEEP_INTERVAL_MS = 24 * 3_600_000;
@@ -370,6 +377,10 @@ export class FleetDO extends DurableObject<Env> {
     // When AgentDO reported a brain on this host that didn't exit after a kill (`hostWedged`): its
     // heartbeats and hellos go unanswered until it is expired, so its own lease fences it.
     addColumn(this.sql, "hosts", "wedged_ms", "INTEGER");
+    // A result's follow-ups owed (src/lib/command-result.ts): when they're due next (null: none owed, or
+    // all run; a previous release's rows read as none), and how often they've failed.
+    addColumn(this.sql, "commands", "followup_ms", "INTEGER");
+    addColumn(this.sql, "commands", "followup_attempts", "INTEGER NOT NULL DEFAULT 0");
     // A6: the host's brains are proven gone (lease expired, or death confirmed); an idle or drained
     // retirement isn't proof until EC2 confirms it.
     addColumn(this.sql, "hosts", "lost", "INTEGER NOT NULL DEFAULT 0");
@@ -502,10 +513,15 @@ export class FleetDO extends DurableObject<Env> {
     }
     if (!identity) throw new NestError(ErrorCodes.UNAUTHORIZED, "unverified identity document", 401);
     const row = this.sql
-      .exec<{ host: string | null; role: string | null; account_id: string | null; region: string | null }>(
-        "SELECT host, role, account_id, region FROM launched WHERE instance_id = ?", identity.instanceId)
+      .exec<{ host: string | null; role: string | null; account_id: string | null; region: string | null; reason: string | null }>(
+        "SELECT host, role, account_id, region, reason FROM launched WHERE instance_id = ?", identity.instanceId)
       .toArray()[0];
     if (!row) throw new NestError(ErrorCodes.UNAUTHORIZED, "instance was not launched by this control plane (in this cell)", 401);
+    // Its launch was ended (it didn't enroll in time, say): it is being terminated, and a late enrollment
+    // must not give it placements it would die under. The tick keeps terminating it (`confirmTerminations`).
+    if (row.reason !== null && !row.host) {
+      throw new NestError(ErrorCodes.FORBIDDEN, `instance ${identity.instanceId}'s launch was ended (${row.reason}); it is being terminated`, 403);
+    }
     if (row.host && !this.neverConnected(row.host)) throw new NestError(ErrorCodes.FORBIDDEN, "instance already enrolled", 409);
     const stored = storedEnumOrNull(HostRole, row.role, "launched.role");
     const launchedAs = stored ? hostKind(stored) : null;
@@ -1432,19 +1448,32 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM kv WHERE key = ?", orphansKey(host));
   }
 
-  /** Record a command's one result (`answeredBy`: null for the host's own, else who wrote it) and act on it. */
+  /**
+   * Record a command's one result (`answeredBy`: null for the host's own, else who wrote it) and act on
+   * it (`resultStep`). The result and whether its follow-ups are owed are written in one step; the
+   * follow-ups (calls to other objects) run after, and stay owed until all have run, so a redelivered
+   * result, or FleetDO's `followups` deadline after a reset or a failed call, runs them again.
+   */
   private async onCommandResult(host: string, cmd: string, outcome: Extract<HostEvent, { type: "command_result" }>["outcome"], answeredBy: AnsweredBy | null = null) {
     const stored = this.sql
-      .exec<{ type: string; sandbox: string | null; agent: string | null; epoch: number | null; purpose: string | null; body: string; result: string | null; host: string }>(
-        "SELECT type, sandbox, agent, epoch, purpose, body, result, host FROM commands WHERE cmd = ?", cmd)
+      .exec<{ type: string; sandbox: string | null; agent: string | null; epoch: number | null; purpose: string | null; body: string; result: string | null; host: string; followup_ms: number | null }>(
+        "SELECT type, sandbox, agent, epoch, purpose, body, result, host, followup_ms FROM commands WHERE cmd = ?", cmd)
       .toArray()[0];
-    if (!stored || stored.host !== host || stored.result !== null) return; // unknown, foreign, or a redelivered result
+    const step = resultStep(stored && { host: stored.host, recorded: stored.result !== null, owed: stored.followup_ms !== null }, host);
+    if (step === "ignore") return; // unknown, foreign, or a redelivered result with nothing owed
+    if (step === "rerun") {
+      await this.runFollowups(cmd);
+      return;
+    }
     const row = {
-      ...stored,
-      type: storedEnum(CommandTypeEnum, stored.type, "commands.type"),
-      purpose: storedEnumOrNull(PurposeEnum, stored.purpose, "commands.purpose"),
+      ...stored!,
+      type: storedEnum(CommandTypeEnum, stored!.type, "commands.type"),
+      purpose: storedEnumOrNull(PurposeEnum, stored!.purpose, "commands.purpose"),
     };
-    this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ? WHERE cmd = ?", JSON.stringify(outcome), Date.now(), answeredBy, cmd);
+    const owed = resultFollowups(row, outcome).length > 0;
+    this.sql.exec("UPDATE commands SET result = ?, result_ms = ?, answered_by = ?, followup_ms = ?, followup_attempts = 0 WHERE cmd = ?",
+      JSON.stringify(outcome), Date.now(), answeredBy, owed ? Date.now() : null, cmd);
+    if (owed) await this.deadlines.set(ALARM_FOLLOWUPS, Date.now() + followupBackoff(1), true);
 
     if (row.purpose === "stonith_fence") {
       const body = JSON.parse(row.body) as Extract<CommandBody, { type: "fence" }>;
@@ -1463,29 +1492,62 @@ export class FleetDO extends DurableObject<Env> {
       return;
     }
     // An `agent_stop`'s `ok` drops no index row: only the brain's exit, or its host's loss, does.
-    if (row.type === "agent_attach" && row.sandbox && row.epoch !== null && row.agent) {
-      await this.sandbox(row.sandbox).attachResult(host, row.epoch, row.agent, cmd, outcome);
-    }
-    // A checkpoint's result, ok or not, lands it in SandboxDO (keyed by this command), even one that
-    // produced no new commit. A SandboxDO still on the previous code lacks the method for a few
-    // minutes after a deploy: logged, and its in-flight record then times out on its own.
-    if (row.type === "sandbox_checkpoint" && row.sandbox && row.epoch !== null) {
-      try {
-        await this.sandbox(row.sandbox).checkpointResult(host, row.epoch, cmd);
-      } catch (e) {
-        console.warn(`FleetDO: checkpoint result ${cmd} for ${row.sandbox} not delivered: ${e}`);
+    if (owed) await this.runFollowups(cmd);
+  }
+
+  /**
+   * Run a recorded result's owed follow-ups (`resultFollowups`, in order), each idempotent at its
+   * receiver for the same command. All ran: no longer owed. One failed: owed still, tried again from the
+   * `followups` deadline (5 s doubling to 5 min). A reset between the record and here leaves it owed too.
+   */
+  private async runFollowups(cmd: string): Promise<void> {
+    const stored = this.sql
+      .exec<{ host: string; type: string; sandbox: string | null; agent: string | null; epoch: number | null; purpose: string | null; result: string | null; followup_ms: number | null; followup_attempts: number }>(
+        "SELECT host, type, sandbox, agent, epoch, purpose, result, followup_ms, followup_attempts FROM commands WHERE cmd = ?", cmd)
+      .toArray()[0];
+    if (!stored || stored.result === null || stored.followup_ms === null) return;
+    const host = stored.host;
+    const outcome = JSON.parse(stored.result) as CommandOutcome;
+    const row = { ...stored, type: storedEnum(CommandTypeEnum, stored.type, "commands.type") };
+    try {
+      for (const f of resultFollowups(row, outcome)) {
+        switch (f) {
+          case "attach_result":
+            await this.sandbox(row.sandbox!).attachResult(host, row.epoch!, row.agent!, cmd, outcome);
+            break;
+          case "checkpoint_result":
+            // A checkpoint's result, ok or not, lands it in SandboxDO (keyed by this command), even one
+            // that produced no new commit.
+            await this.sandbox(row.sandbox!).checkpointResult(host, row.epoch!, cmd);
+            break;
+          case "command_failed":
+            if (outcome.status === "error") await this.sandbox(row.sandbox!).commandFailed(host, row.type, row.epoch!, outcome.error, cmd);
+            break;
+          case "start_failed":
+            // Its index row stays: the start's own exit (owed by nestd until older brains there have
+            // gone) or the host's loss removes it. AgentDO condemns the brain, never releases it here.
+            if (outcome.status === "error") await this.agentStub(row.agent!).startFailed(host, outcome.error, row.epoch ?? undefined);
+            break;
+        }
       }
+      this.sql.exec("UPDATE commands SET followup_ms = NULL, followup_attempts = 0 WHERE cmd = ?", cmd);
+    } catch (e) {
+      const attempts = stored.followup_attempts + 1;
+      const next = Date.now() + followupBackoff(attempts);
+      console.warn(`FleetDO: the follow-ups of ${row.type} ${cmd} failed (attempt ${attempts}); again in ${next - Date.now()} ms: ${e}`);
+      this.sql.exec("UPDATE commands SET followup_ms = ?, followup_attempts = ? WHERE cmd = ? AND followup_ms IS NOT NULL", next, attempts, cmd);
+      await this.deadlines.set(ALARM_FOLLOWUPS, next, true);
     }
-    if (outcome.status === "error") {
-      if (row.sandbox && row.epoch !== null && row.type !== "sandbox_checkpoint") {
-        await this.sandbox(row.sandbox).commandFailed(host, row.type, row.epoch, outcome.error);
-      }
-      if (row.agent && row.type === "agent_start") {
-        // Its index row stays: the start's own exit (owed by nestd until older brains there have
-        // gone) or the host's loss removes it. AgentDO condemns the brain, never releases it here.
-        await this.agentStub(row.agent).startFailed(host, outcome.error, row.epoch ?? undefined);
-      }
+  }
+
+  /** The `followups` deadline: every owed follow-up due now, then the deadline again for the next one owed. */
+  private async followupsDue(): Promise<void> {
+    const now = Date.now();
+    for (const r of this.sql.exec<{ cmd: string }>("SELECT cmd FROM commands WHERE followup_ms IS NOT NULL AND followup_ms <= ? ORDER BY followup_ms", now).toArray()) {
+      await this.runFollowups(r.cmd);
     }
+    const next = this.sql.exec<{ t: number | null }>("SELECT MIN(followup_ms) AS t FROM commands WHERE followup_ms IS NOT NULL").one().t;
+    if (next !== null) await this.deadlines.set(ALARM_FOLLOWUPS, Math.max(next, Date.now() + 1_000), true);
   }
 
   private async onCommitRequest(host: string, ev: CommitRequestEvent): Promise<void> {
@@ -1789,6 +1851,7 @@ export class FleetDO extends DurableObject<Env> {
     this.prune(Date.now());
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key === ALARM_TICK) await this.tick();
+      if (key === ALARM_FOLLOWUPS) await this.followupsDue();
       if (key === ALARM_PRUNE) {
         await this.deadlines.set(ALARM_PRUNE, Date.now() + PRUNE_DAILY_MS);
         await this.armLifetimes();
@@ -1876,7 +1939,8 @@ export class FleetDO extends DurableObject<Env> {
   private pruneTables(now: number): void {
     // A kill FleetDO answered for a host whose death isn't proof yet stays: `killProgress` would
     // read a missing row as processed. It asks only about kills, so other FleetDO answers go.
-    this.sql.exec(`DELETE FROM commands WHERE result IS NOT NULL AND result_ms < ?
+    // Nor one whose result's follow-ups are still owed.
+    this.sql.exec(`DELETE FROM commands WHERE result IS NOT NULL AND result_ms < ? AND followup_ms IS NULL
       AND (answered_by IS NULL OR type <> 'agent_stop' OR host NOT IN (SELECT host FROM hosts WHERE lost = 0))`, now - COMMAND_RETENTION_MS);
     this.sql.exec("DELETE FROM stale_incarnations WHERE cmd IS NOT NULL AND first_seen_ms < ?", now - STALE_INCARNATION_RETENTION_MS);
     this.sql.exec("DELETE FROM enroll_tokens WHERE used_ms IS NOT NULL AND used_ms < ?", now - ENROLL_TOKEN_RETENTION_MS);

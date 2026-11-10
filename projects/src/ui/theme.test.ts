@@ -7,7 +7,7 @@ import { darken, DEFAULT_THEME, mergeMantineTheme } from "@mantine/core";
 import { describe, expect, it } from "vitest";
 import { TASK_STATES } from "../tasks";
 import { STATE_COLOR, STATE_LABEL } from "./status";
-import { cssVariablesResolver, syntax, type SyntaxToken, terminalWarning, filled, filledHover, fontSizes, headings, layout, lineHeights, motion, neutrals, palette, radius, ROLES, roleText, spacing, theme } from "./theme";
+import { neutralBadgeText, cssVariablesResolver, syntax, type SyntaxToken, terminalWarning, filled, filledHover, fontSizes, headings, layout, lineHeights, motion, neutrals, palette, radius, ROLES, roleText, spacing, theme } from "./theme";
 
 // vitest runs from projects/; the skill is the repo's.
 const SKILL = readFileSync(`${process.cwd()}/../.claude/skills/nest-ui-design/SKILL.md`, "utf8");
@@ -246,6 +246,22 @@ describe("contrast, in both schemes", () => {
     const error = vars[s]["--mantine-color-error"]!;
     expect(error).toBe(palette.danger[roleText[s].danger]);
     for (const ground of [neutrals[s].surface, neutrals[s].page]) expect(contrast(error, ground), `error on ${ground}`).toBeGreaterThanOrEqual(AA);
+  });
+
+  it.each(schemes)("%s: a neutral light badge (Ready, Sending…) is the subtle ground with quiet AA text, its ground showing and never louder than a warning badge", (s) => {
+    const light = full.variantColorResolver({ color: "gray", theme: full, variant: "light" });
+    expect(light.background).toBe("var(--nest-neutral-badge)");
+    expect(light.color).toBe("var(--nest-neutral-badge-text)");
+    const ground = vars[s]["--nest-neutral-badge"]!;
+    const text = vars[s]["--nest-neutral-badge-text"]!;
+    expect(ground).toBe(neutrals[s].subtle);
+    expect(text).toBe(neutralBadgeText[s]);
+    expect(contrast(text, ground), "text on its ground").toBeGreaterThanOrEqual(AA);
+    // Its ground shows on the surface and the page it sits on (lighter than both in dark, not darker).
+    if (s === "dark") for (const under of [neutrals.dark.surface, neutrals.dark.page]) expect(luminance(ground), `ground over ${under}`).toBeGreaterThan(luminance(under));
+    // A warning light badge (its role's text on its tint) stands out more than a neutral one, in dark too.
+    const warningText = palette.warning[roleText[s].warning];
+    if (s === "dark") expect(contrast(text, ground)).toBeLessThan(contrast(warningText, ground));
   });
 
   it.each(schemes)("%s: a role's text (`c=\"warning\"`) on the surface, the page and the subtle ground", (s) => {

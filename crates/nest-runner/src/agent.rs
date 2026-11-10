@@ -482,7 +482,7 @@ struct Actor {
 
 impl Actor {
     fn new(rt: Arc<Runtime>, agent: Arc<Agent>, launch: Launch, proc: Proc, auth_method: String) -> Self {
-        let timers = Timers { idle_grace: rt.cfg.idle_grace, interrupt_grace: rt.cfg.interrupt_grace };
+        let timers = Timers { idle_grace: rt.cfg.idle_grace, interrupt_grace: rt.cfg.interrupt_grace, exit_grace: rt.cfg.exit_grace };
         Actor {
             rt,
             agent,
@@ -930,7 +930,7 @@ mod tests {
     #[tokio::test]
     async fn the_idle_exit_ignores_the_mirror() {
         let mut b = bare_actor();
-        b.actor.brain = Brain::new(Timers { idle_grace: Duration::ZERO, interrupt_grace: Duration::ZERO }, Instant::now());
+        b.actor.brain = Brain::new(Timers { idle_grace: Duration::ZERO, interrupt_grace: Duration::ZERO, exit_grace: Duration::ZERO }, Instant::now());
         b.actor.agent.set_cache(cache(vec![msg("m1")], 1));
         b.actor.step(Input::Tick);
         assert!(!b.actor.stdin.is_open(), "stdin closed for idleness");
