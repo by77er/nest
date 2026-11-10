@@ -346,9 +346,11 @@ describe("the chat", () => {
     expect(c.querySelector("[data-sender=stream]")).toBeNull();
   });
 
-  it("a message's exact time is in its actions (hover shows it too), so the keyboard and touch reach it", async () => {
+  // Whatever the message's age: under a week its time line is relative, past it the line is the exact time
+  // itself (so the text is on the page twice: the test reads the actions' own copy, in the menu).
+  it.each([["three hours old", 3 * 3_600_000], ["a month old", 30 * 86_400_000]])("a message's exact time is in its actions (hover shows it too), so the keyboard and touch reach it: %s", async (_age, ageMs) => {
     const api = new FakeApi();
-    const at = new Date(2026, 10, 2, 9, 30).getTime();
+    const at = Date.now() - ageMs;
     api.chat = [{ seq: 1, at_ms: at, sender: "manager", text: "Hello", delivered: true, error: null }];
     const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
@@ -356,7 +358,7 @@ describe("the chat", () => {
     // The time line isn't a tab stop of its own.
     expect(c.querySelector("time")).not.toHaveAttribute("tabindex");
     await user.click(within(c).getByRole("button", { name: "Message actions" }));
-    expect(await screen.findByText(exact(at))).toBeInTheDocument();
+    expect(within(await screen.findByRole("menu")).getByText(exact(at))).toBeInTheDocument();
   });
 
   it("\"Quote in a reply\" quotes into the composer and puts focus there, the caret at the end", async () => {
