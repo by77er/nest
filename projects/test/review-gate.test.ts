@@ -388,8 +388,8 @@ describe("the owner's approval is for one head commit", () => {
   it("a held check whose job was approved while GitHub made it completes as cancelled, before the review's own check", async () => {
     const p = await newProject();
     const s = sha();
-    await push(p, 1, s, "opened", { user: stranger });
-    // The owner approves while the held check's create call is out.
+    // The owner approves while the held check's create call is out (hooked before the push: the alarm
+    // may make the check as soon as the head is recorded).
     const handle = gh.handle.bind(gh);
     let once = true;
     gh.handle = async (req: Request) => {
@@ -400,6 +400,7 @@ describe("the owner's approval is for one head commit", () => {
       return handle(req);
     };
     try {
+      await push(p, 1, s, "opened", { user: stranger });
       await run(p);
       await run(p);
     } finally {

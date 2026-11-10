@@ -25,7 +25,7 @@ A failed deploy smoke test runs `wrangler rollback`, and Cloudflare rolls back c
 - **A rename takes two releases (expand/contract):** read both names and write the old one; switch the writes next release; drop the old reads the release after. The host roles are the worked example ([dev/deploy.md](../../../dev/deploy.md#host-role-names-expandcontract)).
 - **A DO class change** (new, renamed or deleted; a `migrations` tag in `wrangler.jsonc`) **is one-way:** it ships alone, and recovery is a forward revert.
 - **Test the migration on the old shape:** in `runInDurableObject`, create the table as the previous release did, insert a row, run the migration, and assert. The pattern is in `test/agent-seams.test.ts` ("rows keyed by agent alone"). That migration rebuilt a table, an exception to expand-only: don't copy it without checking the rollback.
-- **Write a rollout rule for ordering constraints** in [dev/deploy.md](../../../dev/deploy.md): what deploys first, what happens in the gap, and what a `wrangler rollback` does with the rows this release wrote.
+- **Write a rollout rule for ordering constraints** as a new file in [dev/rollout/](../../../dev/rollout/README.md) (one per change, not a paragraph in `dev/deploy.md`): what deploys first, what happens in the gap, and what a `wrangler rollback` does with the rows this release wrote.
 
 ## The one-brain rule is model-checked
 
@@ -59,6 +59,6 @@ Changes to any of these need a conformance check against [the model](../../../ve
 - Typecheck and the full suite exit 0.
 - Any migration has a test on the old shape, and the release still runs under the previous Worker.
 - Conformance is updated if a brain-rule path changed.
-- The owning doc under `docs/control-plane/` records the decision, and `dev/deploy.md` has the rollout rule if there is one.
+- The owning doc under `docs/control-plane/` records the decision, and `dev/rollout/` has the rollout rule, in its own file, if there is one.
 - `e2e/run.sh` passed if hosts are involved (`nest-validation`).
 - After the merge, the deploy is watched (`nest-change-flow`).
