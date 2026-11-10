@@ -797,15 +797,10 @@ impl Inner {
         self.lifecycle_mismatches.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Tell the lifecycle machine a step just taken for `id@epoch` (after the row's state was
-    /// set, where the step sets one). The machine decides nothing yet: it is run beside the shell
-    /// to find where its table and the shell differ. A step it refuses, or a state it reports that
-    /// the row doesn't hold, is logged and counted, and the machine then follows the shell again
-    /// (the row's state, and the VM's condition the step left: `Incarnation::follow`).
-    /// The lifecycle machine's view of `sandbox`'s VM here (`Absent`, `Running`, `Paused(<by>)`),
-    /// if it has a row (introspection and tests).
-    pub fn lifecycle_vm(&self, sandbox: &SandboxId) -> Option<String> {
-        self.summary.lock().expect("summary").get(sandbox).map(|r| format!("{:?}", r.shadow.vm()))
+    /// The lifecycle machine's view of `sandbox`'s VM here, if it has a row (introspection and
+    /// tests).
+    pub fn lifecycle_vm(&self, sandbox: &SandboxId) -> Option<lifecycle::Vm> {
+        self.summary.lock().expect("summary").get(sandbox).map(|r| r.shadow.vm())
     }
 
     /// [`Self::shadow`] for a step taken by a task of its own, which may end after its row is
@@ -818,6 +813,11 @@ impl Inner {
         }
     }
 
+    /// Tell the lifecycle machine a step just taken for `id@epoch` (after the row's state was
+    /// set, where the step sets one). The machine decides nothing yet: it is run beside the shell
+    /// to find where its table and the shell differ. A step it refuses, or a state it reports that
+    /// the row doesn't hold, is logged and counted, and the machine then follows the shell again
+    /// (the row's state, and the VM's condition the step left: `Incarnation::follow`).
     fn shadow(&self, id: &SandboxId, epoch: Epoch, input: lifecycle::Input) {
         let mut summary = self.summary.lock().expect("summary");
         if let Some(row) = summary.get_mut(id).filter(|r| r.epoch == epoch) {

@@ -30,6 +30,7 @@ use nestd::config::Config;
 use nestd::driver::{Driver, Vm, VmSpec};
 use nestd::enroll::Enrolled;
 use nestd::host::Host;
+use nestd_core::lifecycle;
 use nestd::storage::{LocalFsStore, ObjectStore};
 use nestd::vsock::Emulator;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2234,7 +2235,7 @@ async fn the_machine_sees_a_fenced_vm_frozen_again_after_each_checkpoints_resume
         let sbx = SandboxId("sbx_1".into());
         h.fleet.commands.send(vec![create("cmd_create", "sbx_1")]).unwrap();
         assert!(is_ok(&h.fleet.result("cmd_create").await));
-        assert_eq!(h._host.inner.lifecycle_vm(&sbx).as_deref(), Some("Running"));
+        assert_eq!(h._host.inner.lifecycle_vm(&sbx), Some(lifecycle::Vm::Running));
         h.vm.resume_latch.held.store(true, Ordering::SeqCst);
         h.vm.stop_latch.held.store(true, Ordering::SeqCst);
         h.fleet.commands.send(vec![cmd("cmd_ck", CommandBody::SandboxCheckpoint { sandbox: sbx.clone(), epoch: Epoch(1), reason: CommitReason::TurnEnd })]).unwrap();
@@ -2249,11 +2250,11 @@ async fn the_machine_sees_a_fenced_vm_frozen_again_after_each_checkpoints_resume
         let ops = h.vm.vm_ops.lock().unwrap().clone();
         let resumed = ops.iter().rposition(|o| o == "resume sbx_1").expect("resumed");
         assert!(ops[resumed + 1..].iter().any(|o| o == "pauser sbx_1"), "cutting={cutting}: frozen again after the resume: {ops:?}");
-        assert_eq!(h._host.inner.lifecycle_vm(&sbx).as_deref(), Some("Paused(Fence)"), "cutting={cutting}: the machine's view of the fenced VM");
+        assert_eq!(h._host.inner.lifecycle_vm(&sbx), Some(lifecycle::Vm::Paused(lifecycle::Holder::Fence)), "cutting={cutting}: the machine's view of the fenced VM");
         h.vm.stop_latch.held.store(false, Ordering::SeqCst);
         h.vm.stop_latch.release.notify_waiters();
         wait_until("the VM is stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
-        wait_until("the machine sees it gone", || h._host.inner.lifecycle_vm(&sbx).as_deref() == Some("Absent")).await;
+        wait_until("the machine sees it gone", || h._host.inner.lifecycle_vm(&sbx) == Some(lifecycle::Vm::Absent)).await;
     }
 }
 
@@ -2274,12 +2275,15 @@ async fn a_fences_late_pause_is_not_fed_to_a_later_row_of_the_same_epoch() {
     assert!(is_ok(&h.fleet.result("cmd_destroy").await));
     h.fleet.commands.send(vec![create("cmd_again", "sbx_1")]).unwrap();
     assert!(is_ok(&h.fleet.result("cmd_again").await), "created again at the same epoch");
-    assert_eq!(h._host.inner.lifecycle_vm(&sbx).as_deref(), Some("Running"));
+    assert_eq!(h._host.inner.lifecycle_vm(&sbx), Some(lifecycle::Vm::Running));
     h.vm.pauser_latch.held.store(false, Ordering::SeqCst);
     h.vm.pauser_latch.release.notify_waiters();
     wait_until("the old incarnation's pause ended", || h.vm.paused.lock().unwrap().contains(&("sbx_1".to_string(), 1))).await;
+    // A stale feed would follow that pause in the same task, with no await between: this wait
+    // only gives that task time to finish. The checkpoint below, and the harness's count of
+    // mismatches when it is dropped, would catch one that came later still.
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert_eq!(h._host.inner.lifecycle_vm(&sbx).as_deref(), Some("Running"), "the new incarnation's VM, as the machine sees it");
+    assert_eq!(h._host.inner.lifecycle_vm(&sbx), Some(lifecycle::Vm::Running), "the new incarnation's VM, as the machine sees it");
     checkpoint(&h.fleet, "cmd_ck", "sbx_1", 1).await;
 }
 

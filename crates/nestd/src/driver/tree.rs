@@ -181,8 +181,6 @@ pub struct Tree {
     dead: bool,
     /// How long a freeze or a halt keeps trying ([`FREEZE_BUDGET`]; tests shorten it).
     budget: Duration,
-    /// The processes a pass refused to treat as members (pid and start time), each logged once.
-    refused: BTreeSet<(i32, u64)>,
 }
 
 impl Tree {
@@ -197,7 +195,7 @@ impl Tree {
         if let Some(why) = refusal(root, root_start, std::process::id() as i32, root_start, &table()) {
             return Err(refused(why));
         }
-        Ok(Tree { root, root_start, members: vec![Member { pid: root, fd, stopped: false }], dead: false, budget: FREEZE_BUDGET, refused: BTreeSet::new() })
+        Ok(Tree { root, root_start, members: vec![Member { pid: root, fd, stopped: false }], dead: false, budget: FREEZE_BUDGET })
     }
 
     /// The same tree with another budget for its freezes and halts.
@@ -322,10 +320,7 @@ impl Tree {
                 // As it is now, pinned (the table's row may be an earlier holder of the pid): never
                 // one nestd must not signal, and never a parent its children are found through.
                 if let Some(why) = refusal(pid, now.start, std::process::id() as i32, self.root_start, &all) {
-                    // Said once for each such process: every pass of every freeze meets it again.
-                    if self.refused.insert((pid, now.start)) {
-                        tracing::error!(guest = root, pid, why, "refusing to treat a process as a guest's");
-                    }
+                    tracing::error!(guest = root, pid, why, "refusing to treat a process as a guest's");
                     continue;
                 }
                 known.insert(pid);
