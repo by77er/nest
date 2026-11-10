@@ -7,7 +7,7 @@ import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ClientDO } from "../src/do/client";
 import { CLIENT_OPERATOR } from "../src/do/client";
-import { IDEMPOTENCY_LEASE_MS, IDEMPOTENCY_TTL_MS } from "../src/lib/idempotency";
+import { IDEMPOTENCY_LEASE_MS, IDEMPOTENCY_TTL_MS, IdempotencyKeys, KEY_EVENTS, KEY_VIEWS, keyStep, keyView } from "../src/lib/idempotency";
 import { ADMIN, BASE, uniqueCell } from "./helpers";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
@@ -153,5 +153,88 @@ describe("Idempotency-Key on POST /v1/agents and POST /v1/sandboxes", () => {
     const rows = await runInDurableObject(store, (_: ClientDO, st) =>
       st.storage.sql.exec<{ id: string }>("SELECT id FROM idempotency_keys WHERE key = ?", key).toArray().map((r) => r.id));
     expect(rows).toEqual([later.body.sandbox]);
+  });
+});
+
+/** A fresh ledger on a real Durable Object's SQLite (a ClientDO's storage: its own keys' table). */
+async function withKeys<T>(f: (k: IdempotencyKeys, sql: SqlStorage) => T): Promise<T> {
+  return runInDurableObject(clientStub(`cli_keys${rand()}${rand()}`), (_i: ClientDO, st) => f(new IdempotencyKeys(st.storage.sql), st.storage.sql));
+}
+
+describe("the key ledger's step", () => {
+  it("keyStep: every view and event", () => {
+    const table = Object.fromEntries(KEY_VIEWS.map((v) => [v, Object.fromEntries(KEY_EVENTS.map((e) => [e, keyStep(v, e)]))]));
+    expect(table).toEqual({
+      none: { claim: "held", finish: "refuse", abandon_free: "refuse", abandon_keep: "refuse" },
+      held: { claim: "refuse", finish: "done", abandon_free: "none", abandon_keep: "open" },
+      open: { claim: "held", finish: "done", abandon_free: "none", abandon_keep: "refuse" },
+      done: { claim: "refuse", finish: "refuse", abandon_free: "refuse", abandon_keep: "refuse" },
+    });
+  });
+
+  it.each([
+    ["no row", undefined, "none"],
+    ["claimed, within its lease", { state: "pending", claim: "c", claimed_ms: 1000 - IDEMPOTENCY_LEASE_MS + 1, created_ms: 500 }, "held"],
+    ["claimed, its lease just lapsed", { state: "pending", claim: "c", claimed_ms: 1000 - IDEMPOTENCY_LEASE_MS, created_ms: 500 }, "open"],
+    ["abandoned (no claim), however recent", { state: "pending", claim: null, claimed_ms: 999, created_ms: 500 }, "open"],
+    ["answered", { state: "done", claim: null, claimed_ms: 999, created_ms: 500 }, "done"],
+    ["answered, at its TTL", { state: "done", claim: null, claimed_ms: 999, created_ms: 1000 - IDEMPOTENCY_TTL_MS }, "none"],
+    ["held, at its TTL", { state: "pending", claim: "c", claimed_ms: 999, created_ms: 1000 - IDEMPOTENCY_TTL_MS }, "none"],
+  ] as const)("keyView: %s", (_n, row, view) => {
+    expect(keyView(row, 1000)).toBe(view);
+  });
+});
+
+describe("IdempotencyKeys: the guards are the ledger's", () => {
+  it("the first answer stands; a held key is refused, an abandoned one taken over at once under its id", async () => {
+    await withKeys((k) => {
+      const t = 1_000_000;
+      const a = k.claim("k", "d", "id_1", t);
+      expect(a).toMatchObject({ kind: "run", id: "id_1", fresh: true });
+      expect(() => k.claim("k", "d", "id_2", t + 1)).toThrow(/still being handled/);
+      expect(() => k.claim("k", "other", "id_2", t + 1)).toThrow(/different request/);
+      // Its request failed after its create began: bound still, and the next request takes it over at once.
+      if (a.kind !== "run") throw new Error("unreachable");
+      expect(k.abandon("k", "not-the-holder", true, t + 2)).toBe(false);
+      expect(k.abandon("k", a.claim, false, t + 2)).toBe(true);
+      expect(k.abandon("k", a.claim, false, t + 2)).toBe(false);
+      const b = k.claim("k", "d", "id_2", t + 3);
+      expect(b).toMatchObject({ kind: "run", id: "id_1", fresh: false });
+      // The request that lost the key abandons late: nothing changes for its new holder.
+      expect(k.abandon("k", a.claim, true, t + 4)).toBe(false);
+      expect(() => k.claim("k", "d", "id_3", t + 5)).toThrow(/still being handled/);
+      expect(k.finish("k", 201, t + 6)).toBe(true);
+      expect(k.finish("k", 500, t + 7)).toBe(false);
+      if (b.kind !== "run") throw new Error("unreachable");
+      expect(k.abandon("k", b.claim, true, t + 8)).toBe(false);
+      expect(k.claim("k", "d", "id_4", t + 9)).toEqual({ kind: "done", id: "id_1", status: 201 });
+      expect(k.finish("never-claimed", 201, t)).toBe(false);
+    });
+  });
+
+  it("a request that outlived its lease still finishes; a fresh claim that failed before its create frees the key", async () => {
+    await withKeys((k) => {
+      const t = 1_000_000;
+      k.claim("slow", "d", "id_s", t);
+      expect(k.finish("slow", 202, t + IDEMPOTENCY_LEASE_MS + 5)).toBe(true);
+      expect(k.claim("slow", "d", "id_x", t + IDEMPOTENCY_LEASE_MS + 6)).toEqual({ kind: "done", id: "id_s", status: 202 });
+      const f = k.claim("fresh", "d", "id_f", t);
+      if (f.kind !== "run") throw new Error("unreachable");
+      expect(k.abandon("fresh", f.claim, true, t + 1)).toBe(true);
+      expect(k.claim("fresh", "other-body", "id_g", t + 2)).toMatchObject({ kind: "run", id: "id_g", fresh: true });
+    });
+  });
+
+  it("a key past its TTL is free even when the claim's prune didn't reach it", async () => {
+    await withKeys((k, sql) => {
+      const now = 10 * IDEMPOTENCY_TTL_MS;
+      const old = now - IDEMPOTENCY_TTL_MS - 1000;
+      // More expired keys than one claim deletes, the one under test the newest of them.
+      for (let i = 0; i < 150; i++) sql.exec("INSERT INTO idempotency_keys (key, digest, id, state, status, claimed_ms, created_ms) VALUES (?, 'd', ?, 'done', 201, ?, ?)", `x${i}`, `id_${i}`, old + i, old + i);
+      sql.exec("INSERT INTO idempotency_keys (key, digest, id, state, status, claimed_ms, created_ms) VALUES ('k', 'first-body', 'id_old', 'done', 201, ?, ?)", old + 500, old + 500);
+      // Another body under the key: no conflict, a new object.
+      expect(k.claim("k", "second-body", "id_new", now)).toMatchObject({ kind: "run", id: "id_new", fresh: true });
+      expect(sql.exec("SELECT COUNT(*) AS n FROM idempotency_keys WHERE key LIKE 'x%'").one().n).toBeGreaterThan(0);
+    });
   });
 });

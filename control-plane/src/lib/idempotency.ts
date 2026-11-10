@@ -49,12 +49,63 @@ export type KeyClaim =
 
 const KeyState = z.enum(["pending", "done"]);
 
+// --- the ledger's step (pure) -------------------------------------------------------------------------
+
+/**
+ * A key as a request finds it: `none` (never used, or past its TTL), `held` (a request is working under
+ * it, within its lease), `open` (bound to an id and a body, but nobody holds it: its request failed or
+ * its lease lapsed), or `done` (answered).
+ */
+export const KEY_VIEWS = ["none", "held", "open", "done"] as const;
+export type KeyView = (typeof KEY_VIEWS)[number];
+
+/**
+ * What happens to a key: a request with the same body claims it; the create was answered (`finish`); the
+ * request holding it failed with nothing ever created under it (`abandon_free`) or with something that
+ * may have been (`abandon_keep`). (Its TTL passing is no event: the row then reads as `none`, `keyView`.)
+ */
+export const KEY_EVENTS = ["claim", "finish", "abandon_free", "abandon_keep"] as const;
+export type KeyEvent = (typeof KEY_EVENTS)[number];
+
+/** How a stored row reads at `now` (`undefined`: no row). */
+export function keyView(row: { state: z.output<typeof KeyState>; claim: string | null; claimed_ms: number; created_ms: number } | undefined, now: number): KeyView {
+  if (!row || row.created_ms <= now - IDEMPOTENCY_TTL_MS) return "none";
+  if (row.state === "done") return "done";
+  return row.claim !== null && now - row.claimed_ms < IDEMPOTENCY_LEASE_MS ? "held" : "open";
+}
+
+/**
+ * The key ledger's one step: the view after `event`, or `refuse` when it changes nothing there. Every
+ * change of a key's row goes through it.
+ * - `done` is final until the TTL: the first answer is the one replayed.
+ * - A held key is never claimed (the second request waits); an open one is taken over, under its id.
+ * - `finish` is taken from whoever gets there, held or not (a request that outlived its lease still made
+ *   the object: the first to finish decides).
+ * - Only an abandon by the holder counts (the caller checks the claim), and it can't undo an answer.
+ */
+export function keyStep(view: KeyView, event: KeyEvent): KeyView | "refuse" {
+  switch (event) {
+    case "claim": return view === "none" || view === "open" ? "held" : "refuse";
+    case "finish": return view === "held" || view === "open" ? "done" : "refuse";
+    case "abandon_free": return view === "held" || view === "open" ? "none" : "refuse";
+    case "abandon_keep": return view === "held" ? "open" : "refuse";
+  }
+}
+
+interface KeyRow { digest: string; id: string; state: z.output<typeof KeyState>; status: number | null; claim: string | null; claimed_ms: number; created_ms: number }
+
 /** The keys of one principal, in its Durable Object's SQLite (table `idempotency_keys`). Every method is one synchronous step. */
 export class IdempotencyKeys {
   constructor(private readonly sql: SqlStorage) {
     sql.exec(`CREATE TABLE IF NOT EXISTS idempotency_keys (key TEXT PRIMARY KEY, digest TEXT NOT NULL, id TEXT NOT NULL, state TEXT NOT NULL,
       status INTEGER, claim TEXT, claimed_ms INTEGER NOT NULL, created_ms INTEGER NOT NULL)`);
     sql.exec("CREATE INDEX IF NOT EXISTS idempotency_keys_created ON idempotency_keys (created_ms)");
+  }
+
+  private row(key: string): KeyRow | undefined {
+    const r = this.sql.exec<Omit<KeyRow, "state"> & { state: string }>(
+      "SELECT digest, id, state, status, claim, claimed_ms, created_ms FROM idempotency_keys WHERE key = ?", key).toArray()[0];
+    return r && { ...r, state: storedEnum(KeyState, r.state, "idempotency_keys.state") };
   }
 
   /**
@@ -64,39 +115,52 @@ export class IdempotencyKeys {
    */
   claim(key: string, digest: string, id: string, now = Date.now()): KeyClaim {
     this.prune(now, PRUNE_PER_CLAIM);
-    const row = this.sql.exec<{ digest: string; id: string; state: string; status: number | null; claimed_ms: number }>(
-      "SELECT digest, id, state, status, claimed_ms FROM idempotency_keys WHERE key = ?", key).toArray()[0];
+    let row = this.row(key);
+    const view = keyView(row, now);
+    // Past its TTL but not yet pruned (more expired keys than one claim deletes): free all the same.
+    if (row && view === "none") {
+      this.sql.exec("DELETE FROM idempotency_keys WHERE key = ?", key);
+      row = undefined;
+    }
+    if (row && row.digest !== digest) {
+      throw new NestError(ErrorCodes.CONFLICT, "this Idempotency-Key was used for a different request (another route or body): use a new key", 409);
+    }
+    if (keyStep(view, "claim") === "refuse") {
+      if (view === "done") return { kind: "done", id: row!.id, status: row!.status ?? 201 };
+      throw new NestError(ErrorCodes.CONFLICT, "a request with this Idempotency-Key is still being handled: retry shortly", 409, true);
+    }
     const claim = crypto.randomUUID();
     if (!row) {
       this.sql.exec("INSERT INTO idempotency_keys (key, digest, id, state, claim, claimed_ms, created_ms) VALUES (?, ?, ?, 'pending', ?, ?, ?)",
         key, digest, id, claim, now, now);
       return { kind: "run", id, claim, fresh: true };
     }
-    if (row.digest !== digest) {
-      throw new NestError(ErrorCodes.CONFLICT, "this Idempotency-Key was used for a different request (another route or body): use a new key", 409);
-    }
-    if (storedEnum(KeyState, row.state, "idempotency_keys.state") === "done") return { kind: "done", id: row.id, status: row.status ?? 201 };
-    if (now - row.claimed_ms < IDEMPOTENCY_LEASE_MS) {
-      throw new NestError(ErrorCodes.CONFLICT, "a request with this Idempotency-Key is still being handled: retry shortly", 409, true);
-    }
     // Left behind, or out of its lease: taken over, under the same id.
     this.sql.exec("UPDATE idempotency_keys SET claim = ?, claimed_ms = ? WHERE key = ?", claim, now, key);
     return { kind: "run", id: row.id, claim, fresh: false };
   }
 
-  /** The create under `key` was answered `status`: later requests with it replay that. The first to finish decides. */
-  finish(key: string, status: number): void {
-    this.sql.exec("UPDATE idempotency_keys SET state = 'done', status = ?, claim = NULL WHERE key = ? AND state = 'pending'", status, key);
+  /** The create under `key` was answered `status`: later requests with it replay that. The first to finish decides. Whether this one did. */
+  finish(key: string, status: number, now = Date.now()): boolean {
+    if (keyStep(keyView(this.row(key), now), "finish") === "refuse") return false;
+    this.sql.exec("UPDATE idempotency_keys SET state = 'done', status = ?, claim = NULL WHERE key = ?", status, key);
+    return true;
   }
 
   /**
    * The request holding `claim` failed. `free`: nothing was created under the key, ever (a fresh claim
    * that failed before its create began), so the key goes; otherwise it stays bound to its id and body,
-   * and the next request with it takes it over at once.
+   * and the next request with it takes it over at once. Only the holder's abandon counts: one whose
+   * claim was taken over changes nothing. Whether it did.
    */
-  abandon(key: string, claim: string, free: boolean): void {
-    if (free) this.sql.exec("DELETE FROM idempotency_keys WHERE key = ? AND claim = ? AND state = 'pending'", key, claim);
-    else this.sql.exec("UPDATE idempotency_keys SET claim = NULL, claimed_ms = 0 WHERE key = ? AND claim = ? AND state = 'pending'", key, claim);
+  abandon(key: string, claim: string, free: boolean, now = Date.now()): boolean {
+    const row = this.row(key);
+    if (!row || row.claim !== claim) return false;
+    const to = keyStep(keyView(row, now), free ? "abandon_free" : "abandon_keep");
+    if (to === "refuse") return false;
+    if (to === "none") this.sql.exec("DELETE FROM idempotency_keys WHERE key = ?", key);
+    else this.sql.exec("UPDATE idempotency_keys SET claim = NULL, claimed_ms = 0 WHERE key = ?", key);
+    return true;
   }
 
   /** Delete up to `limit` keys older than the TTL. */
