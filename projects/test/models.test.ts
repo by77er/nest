@@ -335,31 +335,133 @@ describe("a project's models", () => {
       }
     });
 
-    it("nest giving up an accepted restart (restart_refused) is said, and the switch is owed again; once per event", async () => {
+    // nest gave an accepted restart up (README.md#models): on its record (`restart_error`, given-up time `ms`), then its event.
+    const giveUp = async (p: P, ms: number, agent = p.manager) => {
+      fake.agents.get(p.manager)!.restartError = { code: "unavailable", message: "the fleet didn't answer", ms };
+      await deliver({ id: `evt-${rand()}`, type: "agent.error", agent, code: "restart_refused", message: "the restart failed after retries" });
+      await alarm(p);
+    };
+    const row = (p: P) => runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT manager_running_model, switch_next_ms, refusal_check_ms FROM settings").one());
+    const dueNow = (p: P) => runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET switch_next_ms = 0 WHERE switch_next_ms IS NOT NULL"); });
+    const refusedLines = async (p: P) => (await appChat(p)).filter((t) => t.includes("didn't complete") || t.startsWith("Couldn't switch"));
+
+    it("nest giving up an accepted restart (restart_refused) is said, and the switch is tried again after a backoff; a give-up counted once", async () => {
       const p = await newProject();
       const m = fake.agents.get(p.manager)!;
       await setModel(p, "claude-sonnet-5-5");
       expect(m.restarts).toHaveLength(1);
       expect(await appChat(p)).toContain(`Switched to ${modelLabel("claude-sonnet-5-5")}.`);
-      const refused = { id: `evt-${rand()}`, type: "agent.error", agent: p.manager, code: "restart_refused", message: "the restart failed after retries" };
-      // While the manager is in a turn: the switch is owed, and waits for nest to find it idle.
-      m.state = "working";
-      await deliver(refused);
-      const retry = (await appChat(p)).filter((t) => t.startsWith("The switch to Sonnet 5.5 didn't complete"));
-      expect(retry).toEqual(["The switch to Sonnet 5.5 didn't complete (nest couldn't restart the manager): trying again."]);
-      expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT manager_running_model AS m FROM settings").one().m)).toBeNull();
+      const before = Date.now();
+      await giveUp(p, 1_000);
+      expect(await refusedLines(p)).toEqual(["The switch to Sonnet 5.5 didn't complete (nest couldn't restart the manager): trying again in 5 minutes."]);
+      const r = await row(p);
+      expect(r.manager_running_model).toBeNull();
+      expect(r.switch_next_ms as number).toBeGreaterThanOrEqual(before + 5 * 60_000);
+      expect(r.switch_next_ms as number).toBeLessThan(Date.now() + 5 * 60_000 + 1);
+      expect((await settings(p)).manager_switch).toMatchObject({ to: "claude-sonnet-5-5", after_turn: false });
+      // Not at once: a cause that lasts (no brain room) would hold the manager's turns again.
       await alarm(p);
-      expect((await settings(p)).manager_switch).toMatchObject({ to: "claude-sonnet-5-5", after_turn: true });
       expect(m.restarts).toHaveLength(1);
-      // Delivered again (past the webhook's own dedup, straight to the project): said once.
-      await deliver(refused);
-      await runInDurableObject(stub(p), (o) => (o as unknown as { onEvent(e: unknown, r: unknown): Promise<void> }).onEvent(refused, { role: "manager", task: null }));
-      expect((await appChat(p)).filter((t) => t.startsWith("The switch to Sonnet 5.5 didn't complete"))).toHaveLength(1);
-      m.state = "idle";
-      await deliver({ id: `evt-${rand()}`, type: "agent.turn_completed", agent: p.manager, text: "Done." });
+      // Another event naming the same give-up, and one straight to the project past the webhook's dedup: counted once.
+      await giveUp(p, 1_000);
+      await runInDurableObject(stub(p), (o) => (o as unknown as { onEvent(e: unknown, r: unknown): Promise<void> }).onEvent({ id: `evt-${rand()}`, type: "agent.error", agent: p.manager, code: "restart_refused" }, { role: "manager", task: null }));
+      await alarm(p);
+      expect(await refusedLines(p)).toHaveLength(1);
+      await dueNow(p);
       await alarm(p);
       expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }, { model: "claude-sonnet-5-5" }]);
       expect((await settings(p)).manager_switch).toBeNull();
+    });
+
+    it("nest giving up again and again: tried after 5, then 10 minutes, and given up at the third", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      await setModel(p, "claude-sonnet-5-5");
+      for (const [n, wait] of [[1, 5], [2, 10]] as const) {
+        const before = Date.now();
+        await giveUp(p, n);
+        expect((await refusedLines(p)).at(-1)).toBe(`The switch to Sonnet 5.5 didn't complete (nest couldn't restart the manager): trying again in ${wait} minutes.`);
+        const next = (await row(p)).switch_next_ms as number;
+        expect(next).toBeGreaterThanOrEqual(before + wait * 60_000);
+        expect(next).toBeLessThan(Date.now() + wait * 60_000 + 1);
+        await dueNow(p);
+        await alarm(p);
+        expect(m.restarts).toHaveLength(n + 1);
+      }
+      await giveUp(p, 3);
+      expect((await refusedLines(p)).at(-1)).toBe("Couldn't switch to Sonnet 5.5: it takes effect when the manager next starts.");
+      expect(await refusedLines(p)).toHaveLength(3);
+      expect((await settings(p)).manager_switch).toBeNull();
+      await dueNow(p);
+      await alarm(p);
+      expect(m.restarts).toHaveLength(3);
+    });
+
+    it("another model isn't held back or counted by nest's give-ups of the last", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      await setModel(p, "claude-sonnet-5-5");
+      await giveUp(p, 1);
+      await setModel(p, "claude-haiku-5-5");
+      // Tried now, not at the end of the Sonnet switch's backoff.
+      expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }, { model: "claude-haiku-5-5" }]);
+      await giveUp(p, 2);
+      expect((await refusedLines(p)).at(-1)).toBe("The switch to Haiku 5.5 didn't complete (nest couldn't restart the manager): trying again in 5 minutes.");
+    });
+
+    it("a refusal counted puts off a switch that was due in the same drain", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      await setModel(p, "claude-sonnet-5-5");
+      m.state = "working";
+      expect((await setModel(p, "claude-haiku-5-5")).body.manager_switch).toMatchObject({ after_turn: true });
+      m.state = "idle";
+      await dueNow(p);
+      await giveUp(p, 1);
+      expect((await refusedLines(p)).at(-1)).toBe("The switch to Haiku 5.5 didn't complete (nest couldn't restart the manager): trying again in 5 minutes.");
+      expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }]);
+    });
+
+    it("a late refusal of an earlier switch, after a later one was asked, changes nothing", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      await setModel(p, "claude-sonnet-5-5");
+      // nest gave the Sonnet restart up, but its event comes only after the Haiku restart was asked (which clears nest's record).
+      m.restartError = { code: "unavailable", message: "the fleet didn't answer", ms: 1 };
+      await setModel(p, "claude-haiku-5-5");
+      expect(await appChat(p)).toContain(`Switched to ${modelLabel("claude-haiku-5-5")}.`);
+      await deliver({ id: `evt-${rand()}`, type: "agent.error", agent: p.manager, code: "restart_refused", message: "the restart failed after retries" });
+      await alarm(p);
+      expect(await refusedLines(p)).toEqual([]);
+      expect((await row(p)).manager_running_model).toBe("claude-haiku-5-5");
+      expect((await settings(p)).manager_switch).toBeNull();
+      expect(m.restarts).toHaveLength(2);
+    });
+
+    it("a refusal from an agent that isn't the current manager is ignored", async () => {
+      const p = await newProject();
+      await setModel(p, "claude-sonnet-5-5");
+      // The current manager's record shows a give-up, but the event is a replaced manager's.
+      fake.agents.get(p.manager)!.restartError = { code: "unavailable", message: "the fleet didn't answer", ms: 1 };
+      await runInDurableObject(stub(p), (o) => (o as unknown as { onEvent(e: unknown, r: unknown): Promise<void> }).onEvent({ id: `evt-${rand()}`, type: "agent.error", agent: "agt_replaced", code: "restart_refused" }, { role: "manager", task: null }));
+      await alarm(p);
+      expect((await row(p)).refusal_check_ms).toBeNull();
+      expect(await refusedLines(p)).toEqual([]);
+      expect((await row(p)).manager_running_model).toBe("claude-sonnet-5-5");
+    });
+
+    it("a 409 other than busy (the manager ended) is said and dropped, not waited on", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      m.ended = true;
+      const body = (await setModel(p, "claude-sonnet-5-5")).body;
+      expect(body.manager_switch).toBeNull();
+      expect((await appChat(p)).filter((t) => t.startsWith("The manager couldn't be switched to Sonnet 5.5:"))).toHaveLength(1);
+      const asked = fake.callsTo("POST", new RegExp(`^/v1/agents/${p.manager}/start$`)).length;
+      await dueNow(p);
+      await alarm(p);
+      expect(fake.callsTo("POST", new RegExp(`^/v1/agents/${p.manager}/start$`))).toHaveLength(asked);
+      expect((await row(p)).switch_next_ms).toBeNull();
     });
 
     it("a switch made stale by a move of the manager (it ended meanwhile) writes nothing", async () => {

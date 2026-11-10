@@ -33,6 +33,8 @@ export interface FakeAgent {
   /** The launch's model a restart stored (`POST …/start {restart, launch}`), and each restart's. */
   model?: string;
   restarts?: { model?: string; effort?: string }[];
+  /** nest gave an accepted restart up (`restart_error` in its view): cleared by the next restart asked for. */
+  restartError?: { code: string; message: string; ms: number };
 }
 
 export interface Call {
@@ -357,7 +359,10 @@ export class FakeNest {
         }
         const launch = (call.body?.launch ?? {}) as { model?: string; effort?: string };
         if (launch.model !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,99}$/.test(launch.model)) return nestErr(400, "invalid_message", "launch.model is plain tokens");
-        if (call.body?.restart) (a.restarts ??= []).push(launch);
+        if (call.body?.restart) {
+          (a.restarts ??= []).push(launch);
+          delete a.restartError;
+        }
         // A release before the route ignores `launch`: nothing stored, none answered.
         if (this.launchIgnored) return json(200, { kind: "waiting", host: null, cmd: null });
         if (launch.model) a.model = launch.model;
@@ -443,6 +448,7 @@ export class FakeNest {
       host: a.ended || state === "starting" ? null : "bh_1", capacity_waits: a.capacityWaits ?? 0,
       hands: a.sandbox ? { sandbox: a.sandbox } : null,
       ...(a.ended ? { ended: { ms: 1, by: "client", reason: "stopped" } } : {}),
+      ...(a.restartError ? { restart_error: a.restartError } : {}),
     };
   }
 
