@@ -1991,7 +1991,7 @@ impl Inner {
             if self.fenced(id, epoch)
                 && let Some(vm) = s.vm.as_mut()
             {
-                let _ = vm.pause().await;
+                refreeze_fenced(id, epoch, vm.as_mut()).await;
             }
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
@@ -2165,7 +2165,7 @@ impl Inner {
             if self.fenced(id, epoch)
                 && let Some(vm) = s.vm.as_mut()
             {
-                let _ = vm.pause().await;
+                refreeze_fenced(id, epoch, vm.as_mut()).await;
             }
             if let Some(g) = &s.guest {
                 let _ = g.thaw().await;
@@ -3175,6 +3175,19 @@ fn grow_filesystem(disk: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+
+/// Freeze a fenced VM again after a resume undid the fence's pause: as the fence's own pauser does,
+/// keeping what it stops when not everything can be (a fenced guest must not run on), and saying
+/// when it fails.
+async fn refreeze_fenced(id: &SandboxId, epoch: Epoch, vm: &mut dyn Vm) {
+    let r = match vm.pauser() {
+        Some(p) => p.pause().await,
+        None => vm.pause().await,
+    };
+    if let Err(e) = r {
+        tracing::warn!(sandbox = %id, epoch = epoch.0, error = %e, "a fenced VM can't be frozen again");
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::LapseGuard;

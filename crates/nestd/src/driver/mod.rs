@@ -16,6 +16,7 @@ pub mod access;
 pub mod firecracker;
 pub mod process;
 pub mod supervise;
+pub mod tree;
 
 #[derive(Clone)]
 pub struct VmSpec {
