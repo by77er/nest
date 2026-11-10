@@ -8,7 +8,7 @@ description: Use when changing nest's cloud infrastructure or delivery: the infr
 **Where things are:**
 - **Stacks:** [deploy/README.md](../../../deploy/README.md). `deploy/lean/Cell/` holds the cell stack, its IAM statements (`Iam.lean`) and its theorems and policies (`Test.lean`); `deploy/lean/Edge/` holds the Cloudflare Access stack; `projects/deploy/` holds the projects app's Access stack.
 - **Host user data:** `deploy/host/`.
-- **Pipeline and rollout rules:** [dev/deploy.md](../../../dev/deploy.md).
+- **Pipeline and standing rollout rules:** [dev/deploy.md](../../../dev/deploy.md). **Each release's rule:** one file per change in [dev/rollout/](../../../dev/rollout/README.md).
 - **CI:** [dev/ci.md](../../../dev/ci.md).
 - **Cloud checks:** [dev/cloud-checks/](../../../dev/cloud-checks/README.md).
 
@@ -67,7 +67,7 @@ description: Use when changing nest's cloud infrastructure or delivery: the infr
   - the apps deploy from their own workflows, `deploy-dashboard.yml` and `deploy-projects.yml`;
   - the projects app's Access stack (`projects/deploy/`) applies from `deploy-projects-infra.yml`, only on its own changes;
   - the health window, the deploy pause and `rollback.yml` aren't built.
-- **A release with ordering constraints gets a rollout rule** in `dev/deploy.md`. It says what must already be true before the Worker deploys, what runs in each gap (apply → Worker → release), and what an automatic `wrangler rollback` does with what this release wrote. A DO class change or a raised gateway `min_supported` is one-way and ships alone.
+- **A release with ordering constraints gets a rollout rule:** a new file `dev/rollout/YYYY-MM-DD-<slug>.md` ([how](../../../dev/rollout/README.md)), never a paragraph appended to `dev/deploy.md` (every open PR would conflict there). It says what must already be true before the Worker deploys, what runs in each gap (apply → Worker → release), and what an automatic `wrangler rollback` does with what this release wrote. A DO class change or a raised gateway `min_supported` is one-way and ships alone.
 - **Rollback:**
   - the Worker rolls back automatically only on a failed smoke test;
   - anything else is a forward revert: a PR that restores the previous behaviour, deployed by merge;
@@ -87,5 +87,5 @@ Watch main's CI and the deploy as `nest-change-flow` says, reading the plan summ
 - `inframe test` passes for both stacks, and each new theorem or policy was mutation-checked.
 - The bootstrap test passed with shellcheck (or its skip is stated).
 - The workflows parse.
-- The rollout rule is written if order matters.
+- The rollout rule is written, as its own file in `dev/rollout/`, if order matters.
 - After merge: main's CI and the deploy are green, `/v1/health` answers, and the relevant cloud check passed.

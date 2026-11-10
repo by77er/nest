@@ -1,7 +1,7 @@
 // Auto-merge in the project's settings (README.md#auto-merge): the toggle and the merge method are sent
 // as the Worker's settings body, and the repo's setting shows its state, with a retry where GitHub
 // refused it or someone changed it by hand.
-import { screen, waitFor, within } from "@testing-library/react";
+import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
@@ -80,6 +80,29 @@ describe("auto-merge in the settings", () => {
     await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
     await waitFor(() => expect(api.writes).toHaveLength(1));
     expect(api.writes[0]).toMatchObject({ method: "PATCH", path: "/api/projects/prj_one/settings", body: { auto_merge: true, merge_method: "rebase" } });
+  });
+
+  it("holds untrusted PRs' reviews by default; turning it off warns what that means, and only a change is sent", async () => {
+    const api = new FakeApi();
+    const { user, dialog } = await openSettings(api);
+    const gate = within(dialog).getByRole("switch", { name: /Hold reviews of PRs from forks and authors the project doesn't know/ });
+    expect(gate).toBeChecked();
+    expect(dialog).not.toHaveTextContent("A reviewer agent will run on anyone's code");
+    await user.click(gate);
+    expect(dialog).toHaveTextContent("A reviewer agent will run on anyone's code");
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(api.writes).toHaveLength(1));
+    expect(api.writes[0]!.body).toMatchObject({ untrusted_reviews: "review" });
+    // Saved as off: the switch says so the next time, and an untouched one sends nothing about it.
+    const again = new FakeApi();
+    again.projects[0]!.settings.untrusted_reviews = "review";
+    cleanup();
+    const next = await openSettings(again);
+    expect(within(next.dialog).getByRole("switch", { name: /Hold reviews of PRs/ })).not.toBeChecked();
+    await next.user.click(within(next.dialog).getByRole("switch", { name: /Auto-merge when review passes/ }));
+    await next.user.click(within(next.dialog).getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(again.writes).toHaveLength(1));
+    expect(again.writes[0]!.body).not.toHaveProperty("untrusted_reviews");
   });
 
   it("shows GitHub's refusal of the repo setting, and retries it", async () => {

@@ -1,0 +1,5 @@
+# Result follow-ups and placement follow-ups (2026-11-09)
+
+A release's rollout rule ([Rollout rules](../deploy.md#rollout-rules)).
+
+**Not a one-way deploy, and no ordering constraint.** No Durable Object class, wire type or host change. FleetDO's `commands` gains two columns (`followup_ms`, nullable; `followup_attempts`, default 0) and a `followups` deadline; SandboxDO gains a `placed` deadline and a `create_failure` key in `kv`; `SandboxDO.commandFailed` takes an optional fifth argument (the command id). Mid-deploy, a SandboxDO of the previous release ignores the argument and a FleetDO of the previous release omits it (decided as before, once per call). A `wrangler rollback` brings both bugs back: the previous Worker ignores the columns and the key, and its alarms consume the `followups` and `placed` deadlines without running anything. After a redeploy, a result's follow-ups owed at the rollback run with the next owed result (which arms the deadline again), and a placement's cut follow-ups are not re-run until its next placement.

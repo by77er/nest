@@ -27,6 +27,8 @@ export function gist(x: Attention): string {
     const a = approvalOf(x);
     text = x.question ?? (a ? `Approve a call to ${a.name}` : "A question");
   } else if (x.kind === "secret") text = `Asks for ${x.type === "ci" ? "the Actions secret" : "a credential"} ${x.name}: ${x.purpose}`;
+  else if (x.kind === "review_backlog") text = `${x.count === 1 ? "1 more pull request waits" : `${x.count} more pull requests wait`} beyond the review queue's limit`;
+  else if (x.kind === "review") text = `${x.fork ? "A fork's PR" : "A PR"} #${x.pr} waits for your approval to be reviewed`;
   else if (x.kind === "triage") text = `${x.count === 1 ? "1 issue waits" : `${x.count} issues wait`} for triage`;
   else text = x.question ?? x.reason;
   const line = text.replace(/\s+/g, " ").trim();
@@ -70,7 +72,7 @@ export function ManagerContext({ projectId }: { projectId: string }) {
         {asks.length ? (
           <Stack gap="md" data-slot="top-asks">
             {asks.map((x) => (
-              <Stack key={x.kind === "ask" ? x.ask : x.kind === "secret" ? x.id : x.kind === "triage" ? "triage" : `blocked-${x.task}`} gap="xs">
+              <Stack key={x.kind === "ask" ? x.ask : x.kind === "secret" ? x.id : x.kind === "triage" ? "triage" : x.kind === "review" ? `review-${x.pr}-${x.sha}` : x.kind === "review_backlog" ? "review-backlog" : `blocked-${x.task}`} gap="xs">
                 {/* Triage's item opens the queue; everything else waits on the board's "Needs you". */}
                 {x.kind === "triage" ? (
                   <AnchorLink to="/projects/$projectId/triage" params={{ projectId }} fz="sm">
@@ -82,7 +84,7 @@ export function ManagerContext({ projectId }: { projectId: string }) {
                   </AnchorLink>
                 )}
                 <MetaRow>
-                  <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.kind === "triage" ? "The repo's issues" : x.role === "manager" ? (x.kind === "ask" && x.previous ? "The previous manager asks" : "The manager asks") : "A worker asks"}</MetaItem>
+                  <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.kind === "triage" ? "The repo's issues" : x.kind === "review" ? "A held review" : x.kind === "review_backlog" ? "The review queue" : x.role === "manager" ? (x.kind === "ask" && x.previous ? "The previous manager asks" : "The manager asks") : "A worker asks"}</MetaItem>
                   <MetaItem title={exact(x.at_ms)}>{ago(x.at_ms)}</MetaItem>
                 </MetaRow>
               </Stack>

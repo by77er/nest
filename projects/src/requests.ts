@@ -26,6 +26,8 @@ export const Settings = z.strictObject({
   max_workers: z.number().int().min(0).max(20).optional(),
   // ReviewDO's: null (the default) for no cap on running reviews.
   max_concurrent_reviews: z.number().int().min(0).max(50).nullable().optional(),
+  // ReviewDO's: a PR the project doesn't trust waits for the owner's approval (`hold`, the default), or is reviewed like any other.
+  untrusted_reviews: z.enum(["hold", "review"]).optional(),
   // GitHub's auto-merge on task PRs, and the repo's "Allow auto-merge" written back (README.md#auto-merge).
   auto_merge: z.boolean().optional(),
   merge_method: z.enum(MERGE_METHODS).optional(),

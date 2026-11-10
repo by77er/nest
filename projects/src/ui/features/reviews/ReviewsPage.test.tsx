@@ -12,7 +12,7 @@ const verdict = (quality: "pass" | "fail"): Verdict => ({
 });
 const job = (pr: number, o: Partial<Job> = {}): Job => ({
   pr, sha: `${pr}`.padEnd(40, "0"), state: "queued", title: `PR ${pr}`, base: "main", agent: null, check_run: null, verdict: null, tainted: null, deadline_ms: null,
-  attempts: 0, runs: 1, error: null, created_ms: pr, updated_ms: pr, ...o,
+  attempts: 0, runs: 1, error: null, author: null, fork: false, approved_ms: null, created_ms: pr, updated_ms: pr, ...o,
 });
 
 describe("the Reviews page", () => {
@@ -35,6 +35,56 @@ describe("the Reviews page", () => {
     expect(badge(rows[2]!)).toHaveTextContent("Reviewed");
     expect(badge(rows[2]!).getAttribute("style")).toContain("--mantine-color-success-");
     expect(rows[3]).toHaveTextContent("The reviewer exited without a verdict.");
+  });
+
+  it("a held review says who it's from and is approved or dismissed there; a dismissed one can still be reviewed", async () => {
+    const api = new FakeApi();
+    api.reviews = [
+      job(4, { state: "held", runs: 0, author: "mallory", fork: true, title: "<img src=x onerror=alert(1)>" }),
+      job(5, { state: "dismissed", runs: 0, author: null, fork: false }),
+    ];
+    const { user } = renderApp("/projects/prj_one/reviews", api);
+    const table = await screen.findByRole("table", { name: "Review jobs" });
+    const held = table.querySelector(`[data-job="${api.reviews[0]!.pr}/${api.reviews[0]!.sha}"]`) as HTMLElement;
+    const badge = held.querySelector("[data-state]")!;
+    expect(badge).toHaveTextContent("Needs approval");
+    expect(badge.getAttribute("style")).toContain("--mantine-color-warning-");
+    expect(held).toHaveTextContent("A fork's PR by mallory. Its review waits for your approval.");
+    // The title is anyone's text: text, not markup.
+    expect(held.querySelector("img")).toBeNull();
+    expect(held).toHaveTextContent("<img src=x onerror=alert(1)>");
+    const dismissed = table.querySelector(`[data-job="${api.reviews[1]!.pr}/${api.reviews[1]!.sha}"]`) as HTMLElement;
+    expect(dismissed.querySelector("[data-state]")).toHaveTextContent("Dismissed");
+    expect(dismissed).toHaveTextContent("A PR whose author the project doesn't know. You dismissed its review.");
+    // Review is the filled action only where it waits on the owner now.
+    expect(within(held).getByRole("button", { name: "Review PR #4" })).toHaveAttribute("data-variant", "filled");
+    expect(within(dismissed).getByRole("button", { name: "Review PR #5" })).toHaveAttribute("data-variant", "default");
+    expect(within(dismissed).queryByRole("button", { name: /Dismiss/ })).toBeNull();
+    await user.click(within(held).getByRole("button", { name: "Dismiss the review of PR #4" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/reviews/4/${api.reviews[0]!.sha}/dismiss`, body: undefined }]));
+    await user.click(within(dismissed).getByRole("button", { name: "Review PR #5" }));
+    await waitFor(() => expect(api.writes[1]).toMatchObject({ method: "POST", path: `/api/projects/prj_one/reviews/5/${api.reviews[1]!.sha}/approve` }));
+  });
+
+  it("pins the reviews waiting for approval first, the longest waiting on top; says why a non-fork PR waits", async () => {
+    const api = new FakeApi();
+    api.reviews = [
+      job(9, { state: "done", verdict: verdict("pass"), updated_ms: 900 }),
+      job(7, { state: "held", runs: 0, author: "mallory", created_ms: 70, updated_ms: 70 }),
+      job(6, { state: "held", runs: 0, author: "eve", fork: true, created_ms: 60, updated_ms: 800 }),
+      job(8, { state: "overflow", runs: 0, author: "trent", updated_ms: 850 }),
+    ];
+    renderApp("/projects/prj_one/reviews", api);
+    const table = await screen.findByRole("table", { name: "Review jobs" });
+    const rows = within(table).getAllByRole("row").slice(1);
+    expect(rows.map((r) => within(r).getAllByRole("link")[0]!.textContent)).toEqual(["#6 PR 6", "#7 PR 7", "#8 PR 8", "#9 PR 9"]);
+    expect(rows[1]).toHaveTextContent("A PR by mallory, who isn't someone the project trusts. Its review waits for your approval.");
+    expect(rows[2]!.querySelector("[data-state]")).toHaveTextContent("Waiting");
+    expect(rows[2]).toHaveTextContent("It waits its turn: too many reviews wait for your approval.");
+    expect(within(rows[2]!).getByRole("button", { name: "Review PR #8" })).toHaveAttribute("data-variant", "default");
+    // A time on one line, however narrow its column.
+    expect(rows[3]!.querySelector("td:nth-child(5) span")!.getAttribute("style")).toContain("white-space: nowrap");
+    expect(within(rows[2]!).queryByRole("button", { name: /Dismiss/ })).toBeNull();
   });
 
   it("opens one reviewer's trace at a time, for that job's agent", async () => {

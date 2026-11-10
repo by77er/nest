@@ -466,6 +466,7 @@ impl Session {
                 session: session.clone(),
                 offset: c.offset,
                 base: c.base,
+                total_bytes: c.total,
                 data_b64: base64::engine::general_purpose::STANDARD.encode(&c.data),
             };
             tx.send(text(&m)?).await?;
