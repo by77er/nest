@@ -454,7 +454,7 @@ jobs:
           restore-keys: fuzz-corpus-${{ runner.os }}-
       - name: Replay the seeds and the corpus through every target
         run: |
-          for t in guest_stream guest_control_json vsock_handshake proxy_events gateway_events runner_events fleet_to_host meta_json; do
+          for t in guest_stream guest_control_json vsock_handshake proxy_events gateway_events runner_events fleet_to_host meta_json cert_public_key; do
             ./run.sh "$t" replay
           done
       - name: Upload crashes
