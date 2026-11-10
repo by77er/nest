@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { FleetDO } from "../src/do/fleet";
 import { CapacityError, QuotaError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
 import type { AwsCellConfig } from "../src/lib/cells";
-import { adminJson, connectHost, hostHello, manifest, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, eventually, hostHello, manifest, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
 
 async function createSandbox(cell: string, status = 201) {
   return adminJson<{ sandbox: string; epoch: number; host: string }>(`/v1/sandboxes`, { body: { cell } }, status);
@@ -640,6 +640,165 @@ describe("autoscaling", () => {
     await autoscaled(cell, ec2);
     await sandboxStub(sbx.sandbox).retryPlacement();
     expect(ec2.launched).toHaveLength(2);
+  });
+
+  it("a failed sandbox releases its lease after a grace, so its host retires; it stays failed until an operator retries it", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running", "terminated");
+    await autoscaled(cell, ec2);
+    const sbx = await createSandbox(cell, 202);
+    const enrolled = await enrollLaunched(cell, "i-000000001");
+    const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
+    ws.send(hostHello(enrolled.host, cell));
+    await ws.next("hello_ack");
+    expect(await sandboxStub(sbx.sandbox).retryPlacement()).toBe(enrolled.host);
+    const [create] = await nextCommands(ws, (c) => c.type === "sandbox_create");
+    // An agent is attached (it used to pin the host too: never dormant).
+    const agent = (await adminJson("/v1/agents", { body: { template: "worker", sandbox: sbx.sandbox, cell, start: false } }, 201)).agent as string;
+    // The create fails for good.
+    const seq = sendEvents(ws, [{ ts_ms: Date.now(), type: "command_result", cmd: create.cmd, outcome: { status: "error", error: { code: "internal", message: "boom", retryable: false } } }]);
+    await ws.next("ack", (m) => m.up_to >= seq);
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "failed", host: enrolled.host });
+    // Within the grace: the failed lease still counts, and the host isn't retired however long it idles.
+    await tickAt(cell, ec2, 3_600_000);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("active");
+
+    // The grace passes: its holder is fenced, the lease released; the record stays failed, unplaced.
+    await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'failed_release'");
+      st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.ms', ?) WHERE key = 'failed_since'", Date.now() - 15 * 60_000);
+    });
+    await runDue(sandboxStub(sbx.sandbox));
+    const fence = await nextCommands(ws, (c) => c.type === "fence");
+    expect(fence.find((c) => c.type === "fence").sandboxes).toEqual([sbx.sandbox]);
+    // The release spends an epoch, so what the incarnation left on the host salvages as an older epoch's.
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "failed", host: null, epoch: 2 });
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toBeNull();
+    // Nothing places it again on its own: neither its alarm nor a wake (the attached agent's start).
+    expect(await sandboxStub(sbx.sandbox).wake()).toEqual({ host: null, state: "failed" });
+    const launched = ec2.launched.length;
+    // The host still holds the failed incarnation, not yet salvaged: it isn't retired, however long it idles.
+    await tickAt(cell, ec2);
+    await tickAt(cell, ec2, 3_600_000);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("active");
+    // Its salvage, of the epoch it ran at, is taken as an orphan (kept beside the head), not refused.
+    const salvage = await sandboxStub(sbx.sandbox).commit(enrolled.host, {
+      request: `req_${crypto.randomUUID()}`, sandbox: sbx.sandbox, epoch: 1, reason: "salvage", kind: "disk_only", manifest: manifest("a"), stats: { bytes: 1, chunks: 1 },
+    } as never);
+    expect(salvage.status).toBe("orphaned");
+    // Past the salvage window the incarnation is destroyed there, and the host, holding nothing, retires after its idle grace.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE stale_incarnations SET first_seen_ms = first_seen_ms - ?", 12 * 60_000);
+    });
+    await tickAt(cell, ec2);
+    expect((await nextCommands(ws, (c) => c.type === "sandbox_destroy")).find((c) => c.type === "sandbox_destroy")).toMatchObject({ sandbox: sbx.sandbox, epoch: 1 });
+    await tickAt(cell, ec2);
+    await tickAt(cell, ec2, 61_000);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("dead");
+    expect(ec2.launched).toHaveLength(launched);
+    await expect(Promise.resolve().then(() => sandboxStub(sbx.sandbox).resolve(agent))).rejects.toThrow(/not placed yet|failed/);
+
+    // An operator's retry places it again (a new host is launched for it).
+    await autoscaled(cell, ec2);
+    await adminJson(`/v1/sandboxes/${sbx.sandbox}/place`, { body: {} });
+    expect(ec2.launched.length).toBeGreaterThan(launched);
+    // No longer failed: waiting for that host, its own alarm places it once one has room.
+    const after = await sandboxStub(sbx.sandbox).info();
+    expect(after.state).toBe("creating");
+    expect(after.host).toBeNull();
+    ws.close();
+  });
+
+  it("a release that an operator's retry overtakes leaves the new lease alone, and records no incarnation for it", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    const [create] = await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const seq = sendEvents(a.ws, [{ ts_ms: Date.now(), type: "command_result", cmd: create.cmd, outcome: { status: "error", error: { code: "internal", message: "boom", retryable: false } } }]);
+    await a.ws.next("ack", (m) => m.up_to >= seq);
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "failed", host: a.host, epoch: 1 });
+    await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'failed_release'");
+      st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.ms', ?) WHERE key = 'failed_since'", Date.now() - 15 * 60_000);
+    });
+    // The release is held after its fence, before FleetDO drops the lease (this cell's FleetDO only).
+    const real = FleetDO.prototype.releaseFailedLease;
+    let held = true;
+    let reached: unknown[] | null = null;
+    FleetDO.prototype.releaseFailedLease = async function (this: FleetDO, ...args: Parameters<typeof real>) {
+      if (args[0] === sbx.sandbox) {
+        reached = args;
+        while (held) await scheduler.wait(10);
+      }
+      return real.apply(this, args);
+    };
+    try {
+      const release = runDue(sandboxStub(sbx.sandbox));
+      await eventually("the release to reach FleetDO", () => reached !== null);
+      expect(reached).toEqual([sbx.sandbox, a.host, 1]);
+      // Meanwhile the operator retries it: placed again, on the same host, at a new epoch.
+      await adminJson(`/v1/sandboxes/${sbx.sandbox}/place`, { body: {} });
+      expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 2 });
+      held = false;
+      await release;
+    } finally {
+      held = false;
+      FleetDO.prototype.releaseFailedLease = real;
+    }
+    // The late release named the old holder's epoch: the new lease stands and nothing is recorded as left behind.
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 2 });
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "creating", host: a.host, epoch: 2 });
+    expect(await runInDurableObject(fleetStub(cell), (_i, st) =>
+      st.storage.sql.exec("SELECT 1 FROM stale_incarnations WHERE sandbox = ?", sbx.sandbox).toArray().length)).toBe(0);
+    a.ws.close();
+  });
+
+  it("a sandbox its host reports failed after it ran is released the same way; one retried and failed again gets a whole new grace", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    const [create] = await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    await okResult(a.ws, create.cmd);
+    const report = async (state: string, epoch: number) => {
+      const seq = sendEvents(a.ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: sbx.sandbox, epoch, state }]);
+      await a.ws.next("ack", (m) => m.up_to >= seq);
+    };
+    const release = () => runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => ({
+      at: st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'failed_release'").toArray()[0]?.at ?? null,
+      since: st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'failed_since'").toArray()[0]?.value ?? null,
+    }));
+    await report("running", 1);
+    expect(await release()).toEqual({ at: null, since: null });
+    // It ran, then its host says it failed: the release is armed a whole grace out.
+    await report("failed", 1);
+    const first = await release();
+    expect(first.at! - Date.now()).toBeGreaterThan(14 * 60_000);
+    // Fourteen minutes in, the operator retries it: the pending release and its clock go with the failure.
+    await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
+      st.storage.sql.exec("UPDATE deadlines SET at = ? WHERE key = 'failed_release'", Date.now() + 60_000);
+      st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.ms', ?) WHERE key = 'failed_since'", Date.now() - 14 * 60_000);
+    });
+    await adminJson(`/v1/sandboxes/${sbx.sandbox}/place`, { body: {} });
+    expect(await release()).toEqual({ at: null, since: null });
+    // It fails again at its new epoch: a whole grace from now, not the minute that was left, even with an
+    // older failure's clock left behind (as a move off a lost host leaves it).
+    const [again] = await nextCommands(a.ws, (c) => c.type === "sandbox_create" && c.epoch === 2);
+    await okResult(a.ws, again.cmd);
+    await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
+      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('failed_since', ?)", JSON.stringify({ host: a.host, epoch: 1, ms: 1 }));
+    });
+    await report("failed", 2);
+    const second = await release();
+    expect(second.at! - Date.now()).toBeGreaterThan(14 * 60_000);
+    expect(JSON.parse(second.since!)).toMatchObject({ host: a.host, epoch: 2 });
+    // A deadline that fires early all the same (armed for an older failure) waits out the rest, releasing nothing.
+    await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'failed_release'");
+    });
+    await runDue(sandboxStub(sbx.sandbox));
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "failed", host: a.host, epoch: 2 });
+    expect((await release()).at! - Date.now()).toBeGreaterThan(13 * 60_000);
+    a.ws.close();
   });
 
   it("stops launching a type whose launches keep never enrolling, then the whole role; an enrolment closes it", async () => {

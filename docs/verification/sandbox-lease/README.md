@@ -211,3 +211,17 @@ Tests: `control-plane/test/placement-refused.test.ts`. Mutations run, each kille
 - the note kept once placed;
 - the given-up row left after a placement;
 - no note.
+
+## Policy and conformance: a failed sandbox releases its lease (fix/failed-releases-host, 2026-11-06)
+
+**Policy (the owner's default):** a sandbox `failed` on its host keeps the lease for 15 minutes, then gives it up, so the host can retire. The record stays `failed` and unplaced, with its head, until an operator or client retries or destroys it. An attached agent no longer pins the host.
+
+**Head:** `fix/failed-releases-host` (on main 9fd147ff). Not checked by a model run.
+
+| Model action | Code | Conforms (author) | Detail |
+|---|---|---|---|
+| (new) `FailedRelease` | `failedReleased`, `failedReleaseDue` (`lib/sandbox-lease.ts`); the shell `SandboxDO.releaseFailed`; `FleetDO.releaseFailedLease` | not in the spec | A `fence` to the holder; FleetDO deletes the lease at that epoch and records the incarnation as stale in one step; then, if the sandbox is still failed on that host at that epoch, `host := null` and `epoch := epoch + 1`. No claim follows. The spent epoch makes the incarnation's salvage an older epoch's, so `decideCommit` takes it as an orphan from that epoch's host: this release doesn't meet B1 (a salvage refused at an unplaced sandbox's own epoch), which stays open for the NoCapacity rollback. The lease is deleted without waiting for the fence's acknowledgement, as in `Retry` (B5's window, unchanged). Hosts B9 (idle retirement ignoring incarnations still salvaging) is closed by the idle path's new check |
+| alarm `place` | `placeWanted` | changed | False for a `failed` sandbox, so an unplaced failed one is never claimed by the alarm. This narrows B3's fix (#62) to `fenced`: a failed sandbox that loses its host and finds no room now stays failed until retried |
+| `Retry` | `retriedReleased` + `claim` (shell `retryPlacement`) | extends | For a failed sandbox with no host: `state := creating`, then the usual claim. With a host, unchanged |
+
+Tests: `control-plane/test/sandbox-lease-core.test.ts` (the decisions, by table) and `test/fleet.test.ts` (the host retires; the sandbox stays failed until retried).
