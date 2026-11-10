@@ -10,13 +10,11 @@ use nest_protocol::host::hook::{
     HookDatagram, HookDecisionRequest, HookDecisionResponse, HookOutput, HookSpecificOutput, PermissionDecision,
     PermissionRequestDecision, TopLevelDecision,
 };
-use nest_protocol::host::mcp::McpContent;
 use nest_protocol::model::{AgentEventBody, AgentState, MessageId};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::net::{UnixDatagram, UnixListener};
 
 use crate::framing;
-use crate::hands;
 use crate::rules;
 use crate::mirror;
 use crate::runtime::{Agent, AgentCmd, Runtime};
@@ -161,7 +159,7 @@ impl Answer {
     }
 }
 
-/// Answer a sync hook. Never waits on the network (the `SessionStart` read goes through hands).
+/// Answer a sync hook, from local state only: it never waits on the network.
 pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
     let event = req.input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default();
     let Some(agent) = rt.agent(&req.agent) else { return fallback(&req.input).into() };
@@ -194,7 +192,7 @@ pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
         // the subagent, not the main loop (checked on Claude Code 2.1.316), yet count as delivered.
         "PostToolUse" if req.input.get("agent_id").is_none() => return tool_boundary(&agent),
         "Stop" => return stop(&agent, &req.input),
-        "SessionStart" => session_start(rt, &agent, &req.input).await,
+        "SessionStart" => session_start(&agent, &req.input),
         _ => HookOutput::default(),
     };
     output.into()
@@ -250,55 +248,17 @@ fn stop(agent: &Agent, input: &Value) -> Answer {
     Answer { output, handed: pending.into_iter().map(|m| m.id).collect(), stop_blocked: true }
 }
 
-/// SessionStart: rebase the tailer on the reported transcript path and pass the repo's
-/// CLAUDE.md (read through hands) as additional context.
-async fn session_start(rt: &Runtime, agent: &Arc<Agent>, input: &Value) -> HookOutput {
+/// SessionStart: rebase the tailer on the reported transcript path. Nothing is added to the
+/// model's context: a repo's guidance (`AGENTS.md`, `CLAUDE.md`, skills) is the client's to ask
+/// for, and the agent reads it through hands itself.
+fn session_start(agent: &Agent, input: &Value) -> HookOutput {
     if let Some(p) = input.get("transcript_path").and_then(Value::as_str) {
         match valid_transcript(agent, p) {
             Some(path) => agent.set_transcript(path),
             None => tracing::warn!(agent = %agent.id, path = p, "ignoring a transcript_path outside the agent's config dir"),
         }
     }
-    if agent.hands.is_none() {
-        return HookOutput::default();
-    }
-    let op = match hands::op_from_mcp(
-        "Bash",
-        &json!({"command": "cat CLAUDE.md 2>/dev/null || true", "timeout": 5000, "description": "nest: read CLAUDE.md"}),
-    ) {
-        Ok(op) => op,
-        Err(_) => return HookOutput::default(),
-    };
-    // A kill or hard interrupt cancels the read like any hands call.
-    let call = hands::call(agent, format!("ss-{}", uuid::Uuid::new_v4().simple()), op, agent.hands_token());
-    // With a target cached the read itself is bounded; without one the call first waits for
-    // AgentDO (the sandbox may still be placing), which takes as long as the resolve budget.
-    let limit = match agent.hands_target() {
-        Some(_) => rt.cfg.session_start_read_timeout,
-        None => rt.cfg.session_start_read_timeout.max(hands::Budgets::default().not_ready),
-    };
-    let result = match tokio::time::timeout(limit, call).await {
-        Ok(r) if !r.is_error => r,
-        _ => return HookOutput::default(),
-    };
-    let text: String = result
-        .content
-        .iter()
-        .filter_map(|c| match c {
-            McpContent::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    if text.trim().is_empty() {
-        return HookOutput::default();
-    }
-    HookOutput {
-        hook_specific_output: Some(HookSpecificOutput::SessionStart {
-            additional_context: Some(format!("The sandbox repository's CLAUDE.md (read through nest hands):\n\n{text}")),
-        }),
-        ..Default::default()
-    }
+    HookOutput::default()
 }
 
 /// A transcript path the tailer may follow: absolute, no `..`, under `<config_dir>/projects/`.
@@ -312,6 +272,7 @@ pub fn valid_transcript(agent: &Agent, p: &str) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use crate::config::Config;
     use crate::runtime::{AgentCmd, Outbound};
     use nest_protocol::control::{AgentCache, InboxMessage, ToolRule};
@@ -402,6 +363,27 @@ mod tests {
         assert_eq!(o, HookOutput::default());
     }
 
+    /// SessionStart follows the reported transcript and adds nothing to the model's context, and
+    /// it reads nothing through hands, even for an agent bound to a sandbox: a repo's guidance is
+    /// the client's to ask for.
+    #[tokio::test]
+    async fn session_start_rebases_the_transcript_and_reads_nothing() {
+        let rt = Runtime::new(Config::default());
+        let (ctx, _crx) = mpsc::unbounded_channel();
+        let (otx, mut orx) = mpsc::unbounded_channel();
+        let binding = nest_protocol::control::HandsBinding { sandbox: nest_protocol::model::SandboxId("sbx_h".into()), epoch: None };
+        let a = Agent::new(AgentId("agt_h".into()), Epoch(1), std::env::temp_dir(), Some(binding), vec![], 0, ctx, otx);
+        assert!(rt.register(a.clone(), rt.fence_gen()).is_ok());
+        let path = a.config_dir.join("projects/-w/s.jsonl");
+        let input = json!({"hook_event_name": "SessionStart", "source": "startup", "transcript_path": path});
+        let answer = tokio::time::timeout(std::time::Duration::from_secs(1), decide(&rt, &req(input))).await.expect("answered at once");
+        assert_eq!(answer.output, HookOutput::default());
+        assert_eq!(a.inner.lock().unwrap().transcript.as_ref(), Some(&path));
+        while let Ok(o) = orx.try_recv() {
+            assert!(!matches!(o, Outbound::HandsResolve(_) | Outbound::ToolCall { .. }), "SessionStart reached for the network: {o:?}");
+        }
+    }
+
     #[test]
     fn transcript_paths_must_stay_in_the_config_dir() {
         let (_rt, a, _o, _c) = setup();
@@ -412,63 +394,5 @@ mod tests {
         assert_eq!(valid_transcript(&a, base.join("../../etc/x.jsonl").to_str().unwrap()), None);
         assert_eq!(valid_transcript(&a, base.join("-x/u.txt").to_str().unwrap()), None);
         assert_eq!(valid_transcript(&a, "projects/-x/u.jsonl"), None);
-    }
-}
-
-#[cfg(test)]
-mod session_start_tests {
-    use super::*;
-    use crate::config::Config;
-    use crate::hands::SANDBOX_NOT_READY;
-    use crate::runtime::{AgentCmd, Outbound};
-    use nest_protocol::control::HandsOutcome;
-    use crate::test_support::FakeGuest;
-    use crate::test_support::gateway::TestGateway;
-    use nest_protocol::control::HandsBinding;
-    use nest_protocol::model::{AgentId, Epoch, ErrorBody, SandboxId};
-    use std::time::{Duration, Instant};
-    use tokio::sync::mpsc;
-
-    /// The SessionStart read on a sandbox that becomes ready 2 s after the brain starts: the
-    /// hook's own read timeout (500 ms here) does not cut the wait for the target.
-    #[tokio::test]
-    async fn session_start_reads_claude_md_once_the_sandbox_is_ready() {
-        let gw = TestGateway::start().await;
-        let guest = FakeGuest::start().await;
-        gw.add_sandbox("sbx_s", 2, &guest.path, &["agt_s"]);
-        let rt = Runtime::new(Config { session_start_read_timeout: Duration::from_millis(500), ..Config::default() });
-        let (ctx, _crx) = mpsc::unbounded_channel::<AgentCmd>();
-        let (otx, mut orx) = mpsc::unbounded_channel::<Outbound>();
-        let agent = Agent::new(
-            AgentId("agt_s".into()),
-            Epoch(2),
-            std::env::temp_dir(),
-            Some(HandsBinding { sandbox: SandboxId("sbx_s".into()), epoch: None }),
-            vec![],
-            0,
-            ctx,
-            otx,
-        );
-        // AgentDO: not ready for the first 2 s, then the target.
-        let (a2, ready_at) = (agent.clone(), Instant::now() + Duration::from_secs(2));
-        let target = gw.target("sbx_s", 2, "agt_s");
-        tokio::spawn(async move {
-            while let Some(o) = orx.recv().await {
-                if let Outbound::HandsResolve(req) = o {
-                    let outcome = if Instant::now() < ready_at {
-                        HandsOutcome::Error {
-                            error: ErrorBody { code: SANDBOX_NOT_READY.into(), message: "placing".into(), retryable: true },
-                            retry_after_ms: Some(200),
-                        }
-                    } else {
-                        HandsOutcome::Ok { hands: target.clone() }
-                    };
-                    a2.resolve_hands(&req, outcome);
-                }
-            }
-        });
-        let out = session_start(&rt, &agent, &json!({"transcript_path": "/nope"})).await;
-        let ctx = out.hook_specific_output.map(|o| format!("{o:?}")).unwrap_or_default();
-        assert!(ctx.contains("Project rules"), "CLAUDE.md was read through hands: {ctx}");
     }
 }

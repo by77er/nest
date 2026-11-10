@@ -41,8 +41,6 @@ pub struct Config {
     pub session_open_timeout: Duration,
     /// Hook spool drain interval.
     pub spool_interval: Duration,
-    /// SessionStart: max time for reading the repo's CLAUDE.md through hands.
-    pub session_start_read_timeout: Duration,
 }
 
 impl Default for Config {
@@ -64,7 +62,6 @@ impl Default for Config {
             tools_list_timeout: Duration::from_secs(10),
             session_open_timeout: Duration::from_secs(10),
             spool_interval: Duration::from_secs(5),
-            session_start_read_timeout: Duration::from_secs(8),
         }
     }
 }

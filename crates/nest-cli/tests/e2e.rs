@@ -450,7 +450,7 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
         assert!(call.call.0.starts_with("cal_trnone-"), "{}", call.call);
     }
 
-    // Hands: SessionStart read CLAUDE.md, then the two turn steps.
+    // Hands: the two turn steps, and nothing before them (SessionStart reads no repo file).
     let reqs = h.guest.requests().await;
     let cmds: Vec<String> = reqs
         .iter()
@@ -459,8 +459,9 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
             o => o.tool_name().into(),
         })
         .collect();
-    assert!(cmds[0].contains("CLAUDE.md"), "{cmds:?}");
-    assert_eq!(h.agentdo.log.lock().await.resolves, 1, "one hands_resolve serves the hook read and both turn steps");
+    assert!(!cmds.iter().any(|c| c.contains("CLAUDE.md")), "{cmds:?}");
+    assert_eq!(cmds.len(), 2, "{cmds:?}");
+    assert_eq!(h.agentdo.log.lock().await.resolves, 1, "one hands_resolve serves both turn steps");
     assert!(cmds.iter().any(|c| c == "echo PLATFORM hello"), "{cmds:?}");
     assert!(cmds.iter().any(|c| c.starts_with("echo New messages arrived")), "{cmds:?}");
     // Hands requests carry the sandbox epoch from the binding, not the agent epoch.

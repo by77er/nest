@@ -43,8 +43,7 @@ pub struct GuestLog {
 /// A fake guest agent behind a hybrid-vsock-style unix socket (`CONNECT 1025\n` → `OK n\n`).
 ///
 /// Bash behavior: `sleep …` blocks until cancelled (or hangup); `hangup` closes the connection
-/// without any reply (a guest that died mid-call); a command mentioning `CLAUDE.md` prints
-/// `# Project rules`; anything else prints `ran: <command>`.
+/// without any reply (a guest that died mid-call); anything else prints `ran: <command>`.
 pub struct FakeGuest {
     pub path: String,
     log: Arc<Mutex<GuestLog>>,
@@ -139,9 +138,6 @@ async fn serve(mut s: tokio::net::UnixStream, log: Arc<Mutex<GuestLog>>) {
             let _ = framing::read_guest(&mut s).await;
             log.lock().await.cancelled.push(call_id.clone());
             HandsResponse::Result { call_id, result: bash("interrupted", true, true) }
-        }
-        HandsOp::Bash(b) if b.command.contains("CLAUDE.md") => {
-            HandsResponse::Result { call_id, result: bash("# Project rules\nUse tabs.", false, false) }
         }
         HandsOp::Bash(b) => HandsResponse::Result { call_id, result: bash(&format!("ran: {}", b.command), false, false) },
         other => HandsResponse::Result {

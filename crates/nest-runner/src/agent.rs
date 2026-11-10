@@ -311,7 +311,7 @@ async fn run(
         inner.session = session_id.clone();
         inner.transcript = Some(transcript.clone());
     }
-    // Ask AgentDO for the hands target while the slow steps run, for SessionStart and the first call.
+    // Ask AgentDO for the hands target while the slow steps run, for the first call.
     crate::hands::prefetch_target(agent.clone());
 
     let launch = Launch { launch: s.start.launch.clone(), config_dir: s.config_dir.clone(), env: process_env(&rt, &s) };
