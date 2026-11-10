@@ -383,7 +383,8 @@ export class FakeNest {
       const token = this.github.mint(repo, permissions);
       // The App it's from (docs/control-plane/api/clients/#github-tokens), unless nest can't tell.
       const app = this.githubApp ? { app_id: this.githubApp.app_id, app_slug: this.githubApp.app_slug } : {};
-      return json(200, { token, expires_at: new Date(Date.now() + 3600_000).toISOString(), repo: repo.toLowerCase(), permissions, ...app });
+      // And the installation it was minted from (one installation in this fake).
+      return json(200, { token, expires_at: new Date(Date.now() + 3600_000).toISOString(), repo: repo.toLowerCase(), permissions, installation_id: GH_INSTALLATION_ID, ...app });
     }
     return nestErr(404, "not_found", `no route for ${r}`);
   }
@@ -535,6 +536,8 @@ export async function eventually<T>(f: () => T | Promise<T>, what: string): Prom
 
 /** The GitHub App's id, as GitHub answers it in a check run's `app.id`. */
 export const GH_APP_ID = 4242;
+/** The installation the fake's App tokens are minted from. */
+export const GH_INSTALLATION_ID = 777001;
 
 /** The app's grant's `github.permissions` (README.md#how-it-uses-nest). */
 export const GRANT_PERMISSIONS: Record<string, string> = { checks: "write", administration: "write", metadata: "read", pull_requests: "write", contents: "write", issues: "write" };

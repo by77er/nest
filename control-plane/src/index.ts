@@ -1079,7 +1079,9 @@ export const ROUTES: Route[] = [
       if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, refusal, 403);
       const t = await newMethod("BrokerDO.clientGithubToken", () => broker(c.env).clientGithubToken(self.client, c.body.repo, c.body.permissions));
       const app = await githubAppOf(c.env);
-      return { token: t.token, expires_at: new Date(t.expires_ms).toISOString(), repo: c.body.repo.toLowerCase(), permissions: c.body.permissions, ...(app ?? {}) };
+      // `installation_id`: the installation the token was minted from (absent only from a BrokerDO of the previous release, mid-deploy).
+      const installation = typeof t.installation === "number" ? { installation_id: t.installation } : {};
+      return { token: t.token, expires_at: new Date(t.expires_ms).toISOString(), repo: c.body.repo.toLowerCase(), permissions: c.body.permissions, ...installation, ...(app ?? {}) };
     },
   }),
 

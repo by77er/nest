@@ -89,6 +89,13 @@ export interface MintedInjection extends InjectionSecret {
 /** The per-cell binding signing key, stored as a secret named `binding_key:<cell>`. */
 type StoredBindingKey = { kid: string; public_key: string; private_jwk: JsonWebKey };
 
+/** A GitHub installation token as BrokerDO hands it out: `installation` is the installation it was minted from. */
+export interface MintedGithubToken {
+  token: string;
+  expires_ms: number;
+  installation: number;
+}
+
 export class BrokerDO extends DurableObject<Env> {
   private readonly sql: SqlStorage;
   /** Imported signing keys by kid (memory only; rebuilt from the stored JWK after an eviction). */
@@ -723,7 +730,7 @@ export class BrokerDO extends DurableObject<Env> {
    * (`github_app`: `{"app_id", "private_key"}`) and cached until it has 10 minutes left. Every mint and
    * every refusal is audited to R2 before the token is handed out (never the value).
    */
-  async githubToken(repo: string, permissions: GithubPermissions, caller: CredentialCaller): Promise<{ token: string; expires_ms: number }> {
+  async githubToken(repo: string, permissions: GithubPermissions, caller: CredentialCaller): Promise<MintedGithubToken> {
     const r = repo.toLowerCase();
     return await this.mintGithub(`${r}|${canonicalJson(permissions)}`, r, permissions, caller);
   }
@@ -737,7 +744,7 @@ export class BrokerDO extends DurableObject<Env> {
    * client or an agent's action), reused while it has 10 minutes left; expired client tokens are
    * deleted here. Audited as every mint is, with `caller: {client}`.
    */
-  async clientGithubToken(client: string, repo: string, permissions: GithubPermissions): Promise<{ token: string; expires_ms: number }> {
+  async clientGithubToken(client: string, repo: string, permissions: GithubPermissions): Promise<MintedGithubToken> {
     const r = Repo.safeParse(repo);
     const p = GithubRepoPermissions.safeParse(permissions);
     if (!isClientId(client) || !r.success || !p.success || !Object.keys(p.data).length) {
@@ -808,9 +815,10 @@ export class BrokerDO extends DurableObject<Env> {
   /**
    * The mint behind {@link githubToken} and {@link clientGithubToken}: the token cached under `key`
    * while it has 10 minutes left, else a new one for repo `r` (lowercase) with exactly `permissions`,
-   * audited (with `caller`) before anyone holds it.
+   * audited (with `caller`) before anyone holds it. `installation`: the installation the token was minted
+   * from, as stored with it (a cached token's is its own mint's, never the repo's installation now).
    */
-  private async mintGithub(baseKey: string, r: string, permissions: GithubPermissions, caller: unknown): Promise<{ token: string; expires_ms: number }> {
+  private async mintGithub(baseKey: string, r: string, permissions: GithubPermissions, caller: unknown): Promise<MintedGithubToken> {
     const audit = { event: "github_installation_token", repos: [r], permissions, caller };
     let audited = false;
     const refuse = async (e: NestError, installation?: number): Promise<never> => {
@@ -827,8 +835,9 @@ export class BrokerDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM github_tokens WHERE expires_ms <= ?", Date.now());
     // Cached per App: a replaced `github_app` never hands out the old App's tokens.
     const key = `app:${creds.app_id}|${baseKey}`;
-    const cached = this.sql.exec<{ token: string; expires_ms: number }>("SELECT token, expires_ms FROM github_tokens WHERE key = ?", key).toArray()[0];
-    if (cached && cached.expires_ms - Date.now() > GITHUB_TOKEN_REUSE_MS) return { token: cached.token, expires_ms: cached.expires_ms };
+    const cached = this.sql.exec<{ token: string; expires_ms: number; installation: number }>(
+      "SELECT token, expires_ms, installation FROM github_tokens WHERE key = ?", key).toArray()[0];
+    if (cached && cached.expires_ms - Date.now() > GITHUB_TOKEN_REUSE_MS) return { token: cached.token, expires_ms: cached.expires_ms, installation: cached.installation };
     const api = githubApiOf(this.env);
     let jwt: string;
     try {
@@ -838,24 +847,26 @@ export class BrokerDO extends DurableObject<Env> {
     }
     let installation: number | null = null;
     try {
-      let t: { token: string; expires_ms: number } | null = null;
+      let t: MintedGithubToken | null = null;
       for (let attempt = 0; t === null; attempt++) {
         const found = await this.installationOf(api, jwt, creds.app_id, r);
-        installation = found.id;
-        if (installation === null) return await refuse(new NestError(ErrorCodes.FORBIDDEN, `the GitHub App isn't installed on ${r}`, 403));
+        const id = found.id;
+        installation = id;
+        if (id === null) return await refuse(new NestError(ErrorCodes.FORBIDDEN, `the GitHub App isn't installed on ${r}`, 403));
         try {
-          t = await api.mint(jwt, installation, r.split("/")[1]!, permissions);
+          // The installation is the one this mint went to: a retry after a stale one records the new one.
+          t = { ...(await api.mint(jwt, id, r.split("/")[1]!, permissions)), installation: id };
         } catch (e) {
           // Maybe a stale installation (a reinstall, a moved repo): looked up afresh, and minted once more only if it moved.
-          if (!(retryMintFresh(e, found.cached && !this.recentlyConfirmed(creds.app_id, r), attempt) && (await this.installationStale(api, jwt, creds.app_id, [r], installation)))) throw e;
+          if (!(retryMintFresh(e, found.cached && !this.recentlyConfirmed(creds.app_id, r), attempt) && (await this.installationStale(api, jwt, creds.app_id, [r], id)))) throw e;
         }
       }
       // Audited before anyone holds it: a mint whose record can't be written is never handed out.
-      await this.auditMint({ ...audit, installation, expires_ms: t.expires_ms });
+      await this.auditMint({ ...audit, installation: t.installation, expires_ms: t.expires_ms });
       this.sql.exec(`INSERT INTO github_tokens (key, token, expires_ms, installation, minted_ms) VALUES (?, ?, ?, ?, ?)
         ON CONFLICT(key) DO UPDATE SET token = excluded.token, expires_ms = excluded.expires_ms, installation = excluded.installation, minted_ms = excluded.minted_ms`,
-      key, t.token, t.expires_ms, installation, Date.now());
-      return t;
+      key, t.token, t.expires_ms, t.installation, Date.now());
+      return { token: t.token, expires_ms: t.expires_ms, installation: t.installation };
     } catch (e) {
       // A refusal (e.g. permissions the installation lacks) is audited; a lost answer isn't a refusal.
       if (e instanceof NestError && !e.retryable && !audited) await refuse(e, installation ?? undefined);

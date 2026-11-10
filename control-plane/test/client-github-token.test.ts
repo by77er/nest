@@ -123,11 +123,16 @@ describe("POST /v1/clients/self/github-token", () => {
     expect(Object.keys(mint.permissions).sort()).toEqual(["checks", "repository_projects"]);
     // Beside the token, the App it is from (its own test below).
     const { app_id, app_slug: _slug, ...answer } = t;
-    expect(answer).toEqual({ token: mint.token, expires_at: mint.expires_at, repo: r, permissions: { checks: "read", repository_projects: "write" } });
+    expect(answer).toEqual({
+      token: mint.token, expires_at: mint.expires_at, repo: r, permissions: { checks: "read", repository_projects: "write" }, installation_id: mint.installation,
+    });
     expect(typeof app_id).toBe("number");
 
-    // The same request again: the cached token (no mint). Other permissions: a token of their own.
-    expect((await askJson(c.token, { repo: r, permissions: { repository_projects: "write", checks: "read" } }, 200)).token).toBe(mint.token);
+    // The same request again: the cached token (no mint), with the installation it was minted from.
+    // Other permissions: a token of their own.
+    const again = await askJson(c.token, { repo: r, permissions: { repository_projects: "write", checks: "read" } }, 200);
+    expect(again).toMatchObject({ token: mint.token, installation_id: mint.installation });
+    expect(gh.mints.length).toBe(before + 1);
     const admin = await askJson(c.token, { repo: r, permissions: { administration: "write" } }, 200);
     expect(gh.mints.slice(before + 1).map((m) => m.permissions)).toEqual([{ administration: "write" }]);
     expect(admin.token).not.toBe(mint.token);
@@ -338,6 +343,44 @@ describe("a grant's github field", () => {
   });
 });
 
+describe("the installation a token was minted from", () => {
+  it("a cached token answers its own mint's installation, not the repo's installation now", async () => {
+    const r = repo();
+    const c = await newClient({ repos: [r], permissions: { contents: "read" } });
+    const first = await askJson(c.token, { repo: r, permissions: { contents: "read" } }, 200);
+    const minted = gh.installs.get(r)!;
+    expect(first.installation_id).toBe(minted);
+    // The repo's installation changes, and the cached lookup is past its day, so a lookup now would say
+    // the new one. The cached token isn't stale (no mint is refused): it is served, and it was minted
+    // from the first installation.
+    gh.installs.set(r, minted + 7);
+    await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), (_i: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE github_app_installations SET fetched_ms = 0 WHERE repo = ?", r);
+    });
+    const before = gh.mints.length;
+    expect(await askJson(c.token, { repo: r, permissions: { contents: "read" } }, 200)).toMatchObject({ token: first.token, installation_id: minted });
+    expect(gh.mints.length).toBe(before);
+  });
+
+  it("is absent, not guessed, from a BrokerDO of the previous release (it returned no installation)", async () => {
+    const r = repo();
+    const c = await newClient({ repos: [r], permissions: { contents: "read" } });
+    const proto = BrokerDO.prototype as unknown as { clientGithubToken: (...a: unknown[]) => Promise<Record<string, unknown>> };
+    const real = proto.clientGithubToken;
+    proto.clientGithubToken = async function (this: unknown, ...a: unknown[]) {
+      const { installation: _i, ...previous } = await real.apply(this, a);
+      return previous;
+    };
+    try {
+      const t = await askJson(c.token, { repo: r, permissions: { contents: "read" } }, 200);
+      expect(t.token).toBeTruthy();
+      expect("installation_id" in t).toBe(false);
+    } finally {
+      proto.clientGithubToken = real;
+    }
+  });
+});
+
 // --- The installation cache (state-machine sweep, bug 7) ---------------------------------------------------
 
 describe("the installation cache", () => {
@@ -374,6 +417,10 @@ describe("the installation cache", () => {
     const t = await askJson(c.token, { repo: r, permissions: { checks: "read" } }, 200);
     expect(gh.mintAsks.slice(before)).toEqual([old, old + 1]);
     expect(gh.mints.at(-1)).toMatchObject({ installation: old + 1, token: t.token });
+    // The answer names the installation the token came from: the new one, not the cached id it first tried.
+    expect(t.installation_id).toBe(old + 1);
+    // Asked again, the cached token keeps answering that installation.
+    expect(await askJson(c.token, { repo: r, permissions: { checks: "read" } }, 200)).toMatchObject({ token: t.token, installation_id: old + 1 });
     // Uninstalled outright: refused, looked up afresh, not installed. Its row is gone, so the next request
     // asks GitHub where the App is rather than minting from the dead id again.
     gh.installs.delete(r);
