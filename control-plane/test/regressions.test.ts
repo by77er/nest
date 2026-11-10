@@ -520,6 +520,106 @@ describe("sweep bug 5: a rewrite that arrives in several segments is committed o
     expect(await agentStub(s.agent).info()).toMatchObject({ base_gen: base + 1, durable_bytes: 12 });
   });
 
+  it("a rewrite that never completes is dropped when a new runner comes: it appends to the old base, never spliced into the partial rewrite", async () => {
+    const s = await setup({ captain: true });
+    const first = await runner(s.agent, s.host.host, s.host.host_token);
+    const old = "o1\no2\no3\no4\n";
+    first.ws.send(seg(0, old));
+    await received(s.agent, old.length);
+    await agentStub(s.agent).flush();
+    const base = (await agentStub(s.agent).info()).base_gen;
+    // The first of a two-segment rewrite arrives and is made durable; the brain dies before the second.
+    first.ws.send({ ...seg(0, "n1\nn2\n", true), total_bytes: 12 });
+    await received(s.agent, 6, base + 1);
+    await agentStub(s.agent).flush();
+    const partial = await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ key: string }>("SELECT key FROM segments WHERE base = ?", base + 1).toArray().map((r) => r.key));
+    expect(partial).toHaveLength(1);
+    expect(await env.BUCKET.head(partial[0]!)).not.toBeNull();
+    first.ws.close();
+
+    // A new runner process (the restarted brain, resumed from the old base): told the base's durable bytes.
+    const next = await runner(s.agent, s.host.host, s.host.host_token, "rin_two");
+    expect(next.ack.durable_bytes).toBe(old.length);
+    expect(await agentStub(s.agent).info()).toMatchObject({ base_gen: base, recv_base: base, recv_durable: old.length, received_bytes: old.length });
+    expect((await agentStub(s.agent).info()).recv_total).toBeUndefined();
+    // Its tailer goes on from there, in the old file.
+    next.ws.send(seg(old.length, "o5\n"));
+    await received(s.agent, old.length + 3);
+    await agentStub(s.agent).flush();
+    expect(await agentStub(s.agent).transcript()).toBe(`${old}o5\n`);
+    // The partial rewrite's rows and stored bytes are gone, and its number is never used again.
+    expect(await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec("SELECT 1 FROM segments WHERE base > ?", base).toArray().length + st.storage.sql.exec("SELECT 1 FROM seg_buffer WHERE base > ?", base).toArray().length)).toBe(0);
+    await eventually("the partial rewrite's bytes deleted", async () => (await env.BUCKET.head(partial[0]!)) === null);
+    next.ws.send({ ...seg(0, "m1\n", true), total_bytes: 3 });
+    await received(s.agent, 3, base + 2);
+    await agentStub(s.agent).flush();
+    expect(await agentStub(s.agent).info()).toMatchObject({ base_gen: base + 2 });
+    expect(await agentStub(s.agent).transcript()).toBe("m1\n");
+  });
+
+  it("the same runner reconnecting mid-rewrite keeps it: it's told the rewrite's durable bytes and finishes it", async () => {
+    const s = await setup({ captain: true });
+    const first = await runner(s.agent, s.host.host, s.host.host_token);
+    first.ws.send(seg(0, "o1\no2\no3\no4\n"));
+    await received(s.agent, 12);
+    await agentStub(s.agent).flush();
+    const base = (await agentStub(s.agent).info()).base_gen;
+    first.ws.send({ ...seg(0, "n1\nn2\n", true), total_bytes: 12 });
+    await received(s.agent, 6, base + 1);
+    await agentStub(s.agent).flush();
+    first.ws.close();
+    // The same process, its link dropped: its tailer is still in the rewritten file.
+    const again = await runner(s.agent, s.host.host, s.host.host_token);
+    expect(again.ack.durable_bytes).toBe(6);
+    expect(await agentStub(s.agent).info()).toMatchObject({ base_gen: base, recv_base: base + 1, recv_total: 12 });
+    again.ws.send(seg(6, "n3\nn4\n"));
+    await received(s.agent, 12, base + 1);
+    await agentStub(s.agent).flush();
+    expect(await agentStub(s.agent).info()).toMatchObject({ base_gen: base + 1 });
+    expect(await agentStub(s.agent).transcript()).toBe("n1\nn2\nn3\nn4\n");
+  });
+
+  it("a brain started from the committed base drops a half-received rewrite at the start itself", async () => {
+    const s = await setup({ captain: true });
+    const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
+    const old = "o1\no2\no3\no4\n";
+    ws.send(seg(0, old));
+    await received(s.agent, old.length);
+    await agentStub(s.agent).flush();
+    const base = (await agentStub(s.agent).info()).base_gen;
+    ws.send({ ...seg(0, "n1\nn2\n", true), total_bytes: 12 });
+    await received(s.agent, 6, base + 1);
+    await agentStub(s.agent).flush();
+    // The start's own step (its `resume` is the committed base's), before any runner says hello.
+    await runInDurableObject(agentStub(s.agent), async (inst: AgentDO) => {
+      await (inst as unknown as { issueStart: (h: string, ref: string, resume: undefined, intent: { reason: string }) => Promise<unknown> })
+        .issueStart(s.host.host, "$nest-secret:claude_oauth_token", undefined, { reason: "restart" });
+    });
+    expect(await agentStub(s.agent).info()).toMatchObject({ base_gen: base, recv_base: base, recv_durable: old.length, received_bytes: old.length });
+    expect(await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => st.storage.sql.exec("SELECT 1 FROM segments WHERE base > ?", base).toArray().length)).toBe(0);
+    expect(await agentStub(s.agent).transcript()).toBe(old);
+  });
+
+  it("a stated length doesn't outlive its rewrite: a later rewrite without one commits at its first durable segment", async () => {
+    const s = await setup({ captain: true });
+    const { ws } = await runner(s.agent, s.host.host, s.host.host_token);
+    ws.send({ ...seg(0, "a1\na2\na3\na4\n", true), total_bytes: 12 });
+    const base = (await eventually("the rewrite received", async () => {
+      const i = await agentStub(s.agent).info();
+      return i.received_bytes === 12 ? i : null;
+    })).recv_base;
+    await agentStub(s.agent).flush();
+    expect(await agentStub(s.agent).info()).toMatchObject({ base_gen: base, recv_total: 12 });
+    // A shorter rewrite with no length (a runner of the previous release): the old 12 must not hold it back.
+    ws.send(seg(0, "b1\n", true));
+    await received(s.agent, 3, base + 1);
+    await agentStub(s.agent).flush();
+    expect(await agentStub(s.agent).transcript()).toBe("b1\n");
+    expect((await agentStub(s.agent).info()).recv_total).toBeUndefined();
+  });
+
   it("a runner of the previous release (no total_bytes) is committed as before, at the first durable segment", async () => {
     const s = await setup({ captain: true });
     const { ws } = await runner(s.agent, s.host.host, s.host.host_token);

@@ -133,6 +133,8 @@ export interface AgentInfo extends AgentSpec, BrainFields {
   recv_durable: number;
   /** The receive stream's rewrite length, from its base segment's `total_bytes`; absent: unknown (an older runner), or no rewrite. */
   recv_total?: number;
+  /** The highest receive-stream number ever used, so a dropped stream's number is never given to a new one; absent: `recv_base`. */
+  recv_high?: number;
   /** Logical end of the receive stream so far (durable + buffered). */
   received_bytes: number;
   /** Runner process (session `hello.instance_id`); a change starts a new channel lineage. */
@@ -313,12 +315,31 @@ const same = <T>(a: T, b: T) => JSON.stringify(a) === JSON.stringify(b);
 
 /** A rewritten file or another session starts a new receive stream; the committed base stays resumable until it is durable. */
 function newStream(i: AgentInfo, session: string, total?: number): void {
-  i.recv_base = Math.max(i.recv_base, i.base_gen) + 1;
+  // Never a number a dropped stream used (`dropUncommittedStream`): its stored segments may still be going.
+  i.recv_base = Math.max(i.recv_base, i.base_gen, i.recv_high ?? 0) + 1;
+  i.recv_high = i.recv_base;
   i.recv_durable = 0;
   i.received_bytes = 0;
   i.recv_session = session;
   if (total === undefined) delete i.recv_total;
   else i.recv_total = total;
+}
+
+/**
+ * Forget a receive stream that never became the base (a rewrite cut off part-way): the receive state is
+ * the committed base's again, so the next runner is told the base's durable bytes and appends to the
+ * file the base describes, never into the half-received rewrite. True when there was one to forget; the
+ * caller then deletes its buffered and stored segments (`AgentDO.deleteStreamsAbove`).
+ */
+export function dropUncommittedStream(i: AgentInfo): boolean {
+  if (i.recv_base === i.base_gen) return false;
+  i.recv_high = Math.max(i.recv_high ?? 0, i.recv_base);
+  i.recv_base = i.base_gen;
+  i.recv_durable = i.durable_bytes;
+  i.received_bytes = i.durable_bytes;
+  i.recv_session = i.session;
+  delete i.recv_total;
+  return true;
 }
 
 /**
@@ -962,11 +983,15 @@ export class AgentDO extends DurableObject<Env> {
    * and the intent kept.
    */
   private async issueStart(host: string, oauthRef: string, resume: AgentStartBody["resume"], intent: StartIntent): Promise<StartResult> {
+    let dropped = false;
     const started = this.update((i) => {
       i.agent_epoch += 1;
       Object.assign(i, NO_INTENT, { brain: { host, epoch: i.agent_epoch, phase: "starting", since_ms: Date.now() }, lifecycle: "starting", activity: null });
       delete i.start_error;
+      // The new brain resumes from the committed base (`resume`): a rewrite the last one left half-received goes.
+      dropped = dropUncommittedStream(i);
     });
+    if (dropped) this.deleteStreamsAbove(started);
     const armed = Promise.all([this.deadlines.clear("intent"), this.armPhase(started.brain, this.startDeadline(started))]);
     await this.hook("start:afterCommit");
     await armed;
@@ -1925,6 +1950,22 @@ export class AgentDO extends DurableObject<Env> {
   }
 
   /** Segments for `claude --resume`: signed GET URLs for the committed base, in offset order. */
+  /**
+   * The buffered and stored segments of receive streams that aren't the committed base nor the current
+   * receive stream (a dropped rewrite's): rows in this step, their R2 objects in the background (their
+   * numbers are never reused, so a late delete can't take a newer stream's bytes).
+   */
+  private deleteStreamsAbove(info: AgentInfo): void {
+    const keep = [info.base_gen, info.recv_base];
+    const rows = this.sql.exec<{ key: string; base: number }>("SELECT key, base FROM segments WHERE base > ?", info.base_gen).toArray().filter((r) => !keep.includes(r.base));
+    this.sql.exec("DELETE FROM seg_buffer WHERE base > ? AND base <> ?", info.base_gen, info.recv_base);
+    this.sql.exec("DELETE FROM segments WHERE base > ? AND base <> ?", info.base_gen, info.recv_base);
+    if (rows.length) {
+      this.ctx.waitUntil(this.env.BUCKET.delete(rows.map((r) => r.key)).catch((e: unknown) =>
+        console.warn(`agent ${info.agent}: deleting a dropped rewrite's segments failed (they are unreferenced)`, e)));
+    }
+  }
+
   private async sessionResume(info: AgentInfo) {
     if (!info.session || info.durable_bytes === 0) return undefined;
     const exp = Date.now() + SIGNED_URL_TTL_MS;
@@ -2277,10 +2318,14 @@ export class AgentDO extends DurableObject<Env> {
       this.sql.exec("DELETE FROM events");
     }
     const recovered = newLineage ? before.current_turn : null;
+    let dropped = false;
     const info = this.update((i) => {
       i.runner_instance = hello.instance_id;
       i.start_attempts = 0;
       if (recovered && i.current_turn === recovered) i.current_turn = null;
+      // A new runner process tails its file from what it is told is durable: a rewrite the old one left
+      // half-received is forgotten, so that is the committed base's, never the partial stream's.
+      if (newLineage) dropped = dropUncommittedStream(i);
       if (hello.session && i.recv_session && hello.session !== i.recv_session) newStream(i, hello.session);
       else if (hello.session && !i.recv_session) adoptSession(i, hello.session);
       if (["starting", "detached", "errored"].includes(agentState(i))) {
@@ -2294,6 +2339,7 @@ export class AgentDO extends DurableObject<Env> {
     if (recovered) this.queue.recover(recovered, this.recoveryNotes(info));
     const armed = this.armPhase(info.brain);
     this.sql.exec("DELETE FROM seg_buffer WHERE base < ?", info.recv_base);
+    if (dropped) this.deleteStreamsAbove(info);
 
     this.send(ws, {
       type: "hello_ack",
