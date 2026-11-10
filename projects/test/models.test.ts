@@ -277,6 +277,29 @@ describe("a project's models", () => {
       }
     });
 
+    it("changed back while the restart is at nest: what nest runs is recorded, and a switch back is owed", async () => {
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      let release!: () => void;
+      const hold = { match: new RegExp(`^POST /v1/agents/${p.manager}/start$`), release: new Promise<void>((r) => { release = r; }), reached: false };
+      fake.holds.push(hold);
+      const running = setModel(p, "claude-sonnet-5-5");
+      await vi.waitFor(() => expect(hold.reached).toBe(true));
+      // Back to Fable through the API while the restart onto Sonnet is out (it clears the owed switch; its
+      // save then waits on the drain that holds the restart).
+      const back = setModel(p, "claude-fable-5-2");
+      await vi.waitFor(async () => expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT manager_model AS m, switch_next_ms AS n FROM settings").one())).toEqual({ m: "claude-fable-5-2", n: null }));
+      release();
+      await running;
+      await back;
+      // nest runs Sonnet now: recorded, said, and the switch back to Fable owed (and made).
+      expect(await appChat(p)).toContain(`Switched to ${modelLabel("claude-sonnet-5-5")}.`);
+      await alarm(p);
+      expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }, { model: "claude-fable-5-2" }]);
+      expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT manager_running_model AS m FROM settings").one().m)).toBe("claude-fable-5-2");
+      expect((await settings(p)).manager_switch).toBeNull();
+    });
+
     it("a switch made stale by a move of the manager (it ended meanwhile) writes nothing", async () => {
       const p = await newProject();
       let release!: () => void;

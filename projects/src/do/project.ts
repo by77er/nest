@@ -3759,16 +3759,21 @@ export class ProjectDO extends DurableObject<Env> {
         return;
       }
       const answer = await nest.restartAgent(agent, { model: to });
-      if (!current()) return;
-      if (answer?.launch?.model !== to) {
+      // The same manager (no move of its lifecycle meanwhile): what nest now runs is recorded whether or not
+      // the switch is still owed (the setting may have changed back while the restart was out), and any
+      // switch onto the setting as it is now is owed afresh.
+      const now = this.settingsRow();
+      if (!now || now.manager !== agent || now.manager_starts !== base) return;
+      const ran = answer?.launch?.model;
+      if (typeof ran !== "string" || ran !== to) {
         // nest restarted it without storing the model (a release before the switch): said, not tried again.
         this.sql.exec("UPDATE settings SET switch_next_ms = NULL, switch_after_turn = 0, switch_attempts = 0");
         this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `The manager couldn't be switched to ${modelLabel(to)}: nest didn't apply the model (its release can't switch a running agent yet). It runs on until its next start, which takes the new model.`);
         return;
       }
-      this.sql.exec("UPDATE settings SET manager_running_model = ?, switch_after_turn = 0, switch_attempts = 0, switch_next_ms = NULL", to);
-      this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `Switched to ${modelLabel(to)}.`);
-      // Changed again while this one was out: the latest is owed now.
+      this.sql.exec("UPDATE settings SET manager_running_model = ?, switch_after_turn = 0, switch_attempts = 0, switch_next_ms = NULL", ran);
+      this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `Switched to ${modelLabel(ran)}.`);
+      // Changed again (or back) while this one was out: the setting as it is now is owed.
       this.oweManagerSwitch();
     } catch (e) {
       if (!current()) return;

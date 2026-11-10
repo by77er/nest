@@ -215,7 +215,7 @@ describe("the models in the settings", () => {
     const { user, dialog } = await openSettings(api);
     expect(select(dialog, "Manager's model")).toHaveValue("Fable 5.2");
     expect(select(dialog, "Workers' model")).toHaveValue("Opus 5.5");
-    expect(dialog).toHaveTextContent("A change applies now: the running manager switches when it's between turns, keeping its conversation.");
+    expect(dialog).toHaveTextContent("A change applies now: the running manager switches between turns, keeping its conversation. A turn it starts at the moment of the switch is cut and redone.");
     expect(dialog.querySelector("[data-slot=manager-switch]")).toBeNull();
     expect(dialog).toHaveTextContent("workers started from now on; running ones keep theirs");
     expect(dialog).toHaveTextContent("Reviewers and routine runs keep nest's default model.");
