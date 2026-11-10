@@ -59,6 +59,12 @@ const MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE projects ADD COLUMN error TEXT",
   ],
+  [
+    // The repo's GitHub id (README.md#built-the-review-pipeline), learned from its first event: events are routed by
+    // it, so a repo renamed or transferred keeps its project, and its old name names no project of ours.
+    "ALTER TABLE projects ADD COLUMN repo_id INTEGER",
+    "CREATE UNIQUE INDEX projects_repo_id ON projects (repo_id) WHERE repo_id IS NOT NULL",
+  ],
 ] as const;
 
 /** How long the Worker has to finish a create before the alarm takes it over. */
@@ -159,9 +165,22 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS} FROM projects WHERE id = ?`, id).toArray()[0] ?? null;
   }
 
-  /** The project attached to `repo` (compared without case), if any. */
-  async projectByRepo(repo: string): Promise<ProjectRow | null> {
-    return this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS} FROM projects WHERE repo = ?`, repo.toLowerCase()).toArray()[0] ?? null;
+  /**
+   * The project a GitHub event's repo belongs to (README.md#built-the-review-pipeline): by the repo's id, whatever it's
+   * named now. A project with no id yet is found by the name it was created with, and takes the event's
+   * id from then on. A name whose project has another id is another repo's now (ours was renamed, and the
+   * name taken): no project.
+   */
+  async projectForRepo(repoId: number | null, name: string | null): Promise<ProjectRow | null> {
+    const one = (where: string, v: SqlStorageValue) =>
+      this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS} FROM projects WHERE ${where}`, v).toArray()[0] ?? null;
+    if (repoId !== null) {
+      const byId = one("repo_id = ?", repoId);
+      if (byId) return byId;
+    }
+    const byName = name ? one("repo = ? AND repo_id IS NULL", name.toLowerCase()) : null;
+    if (byName && repoId !== null) this.sql.exec("UPDATE projects SET repo_id = ? WHERE id = ? AND repo_id IS NULL", repoId, byName.id);
+    return byName;
   }
 
   /** nest's GitHub App's id, as nest's token answer (`app_id`) or a check run it made (`app.id`) last told it; null until one has. */
