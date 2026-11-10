@@ -8,6 +8,7 @@ export type { ProjectRow, SyncState } from "../../do/directory";
 export type { PutSecretBody } from "../../requests";
 export type { AddDependencyBody, AttachPrBody, AnswerBody, CancelBody, ChatBody, CreateProjectBody, CreateTaskBody, SettingsBody, UpdateTaskBody } from "../../requests";
 export type { Spec, TaskState } from "../../tasks";
+export type { OutboxState } from "../../outbox";
 export type { ManagerPhase, ManagerStatus } from "../../manager";
 export type { Job, JobState } from "../../do/review";
 export type { Dimension, Verdict } from "../../github";
@@ -66,6 +67,8 @@ export interface NetworkView {
   agents: import("../../do/project").LayerStatus[];
   egress_hosts: string[] | null;
   base: import("../../network").OperatorRule[] | null;
+  /** Agents nest refused to stop (README.md#outboxes): they may still be running. */
+  failed_stops: import("../../do/project").FailedStop[];
 }
 
 // Routines and memory (README.md#routines, README.md#memory).

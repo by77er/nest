@@ -82,7 +82,7 @@ export class FakeNest {
   jwks: { keys: unknown[] } = { keys: [] };
   jwksFetches = 0;
   /** Failures to answer, in order, for calls whose `METHOD path` matches. */
-  failures: { match: RegExp; status: number; retryable?: boolean; times: number }[] = [];
+  failures: { match: RegExp; status: number; retryable?: boolean; times: number; page?: boolean }[] = [];
   /** Play a control plane from before the push opt-in was in the client layer (nest #157). */
   layerWithoutPush = false;
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
@@ -111,8 +111,9 @@ export class FakeNest {
     return full;
   }
 
-  fail(match: RegExp, status: number, o: { retryable?: boolean; times?: number } = {}): void {
-    this.failures.push({ match, status, retryable: o.retryable, times: o.times ?? 1 });
+  /** Answer calls matching `METHOD path` with an error: nest's JSON one, or (`page`) a page that isn't nest's (an edge's, Access's). */
+  fail(match: RegExp, status: number, o: { retryable?: boolean; times?: number; page?: boolean } = {}): void {
+    this.failures.push({ match, status, retryable: o.retryable, times: o.times ?? 1, page: o.page });
   }
 
   callsTo(method: string, path: RegExp): Call[] {
@@ -143,6 +144,7 @@ export class FakeNest {
     const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
     if (f) {
       f.times--;
+      if (f.page) return new Response("<html><body>Forbidden</body></html>", { status: f.status, headers: { "content-type": "text/html" } });
       return nestErr(f.status, f.status === 503 ? "internal" : "refused", "injected", f.retryable ?? false);
     }
     if (route !== "POST /v1/sandboxes" && route !== "POST /v1/agents") return this.route(req, u, call);

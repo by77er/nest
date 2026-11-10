@@ -133,6 +133,52 @@ The owner's request (2026-11-06): a task's state, its worker, its PRs and the co
   - Everything else that names the draft goes in the same step: tasks waiting on it stop waiting (noted on each), its own dependencies, detached PR rows, and the manager's waits on it. A draft never had a worker, so it has no queued changes or comments to leak.
   - An issue it was made of returns to triage, to be accepted or declined afresh.
 
+## Outboxes
+
+The owner's request (2026-11-06): the app's retry queues as one machine, so each shows its real state and treats a failure the same way.
+
+- **One pure function,** `outboxStep(row, event)` in `src/outbox.ts`, over each queue's `next_ms`, `attempts` and `error`.
+  - **States:**
+    - `owed`: not tried yet;
+    - `retrying`: tried, or waiting for something it needs, and due again;
+    - `failed`: refused for good, or out of attempts; shown, and tried again only when asked;
+    - `done`.
+  - **Events:**
+    - `sent`;
+    - `failed`, transient or permanent by one verdict (`verdict`: nest's or GitHub's refusal that will repeat);
+    - `wait`: nothing to send it to yet; due again, never counted, never failed;
+    - `retry`: only a failed row changes, so asking twice sends once.
+  - **Pruning by age** (`pruneBefore`). Tested on its own, with a seeded random walk (`test/outbox.test.ts`).
+- **The queues on it:**
+
+  | Queue | On failure | Kept once ended |
+  |---|---|---|
+  | `chat` (the owner's messages to the manager) | permanent: failed, with Retry | always (it's the log) |
+  | `messages` (to agents) | permanent: failed | a week from when it was sent or failed |
+  | `stops` (ending agents) | retried until it goes, except nest's own refusal (failed stops, below) | never once failed: kept until resolved |
+  | `issue_closes` | permanent: failed; tried again on the owner's retry or a grant gaining `issues: write` | always (the task's record) |
+  | client `layers` | permanent: failed, shown on the Network page | while the agent lives |
+
+  Stops used to retry everything forever. ReviewDO's `check_updates` and `ended` aren't on the machine yet (a follow-up).
+- **Failed stops.** A failed stop may leave an agent running, with its sandbox and its credentials, so it's never quiet.
+  - **Only a real refusal fails a stop.** That's nest's own refusal of the request, in its JSON error body (400, 409; `stopRefused`). An auth failure (401, 403), or a page that isn't nest's (a proxy's, Access's), may pass, so it's retried.
+  - **A failed stop is shown everywhere it matters:**
+    - in its task's history (`stop_failed`);
+    - on the Network page, with **Retry stop** (`POST /api/projects/:id/stops/:agent/retry`) and **Dismiss** (`DELETE …/stops/:agent`, confirmed);
+    - in a message to the manager;
+    - among the project's errors.
+  - **Its place stays counted** toward `max_workers` until the stop goes, the owner dismisses it, or nest's `agent.exited` says the agent ended. Any agent's exit counts here: a worker's, a routine run's or a manager's.
+  - **A failed stop is never pruned.** Its agent may still be running.
+  - **Nothing in it is due before the owner acts.** Its next try is set to never, so the alarm never spins on it.
+  - **Nothing is said for an agent that exited during the refused try.** Its stop is gone already, so there's no notice and no row.
+  - **The Network page names what each one was for:** its task, by title; its routine, by name; and why it was stopped, in words ("A routine run timed out").
+- **The chat (B9).**
+  - **States.** Each message carries `status` (`ChatMessage.status`). A message waiting for the manager, or retried after an outage, reads "Sending…" or "Retrying…" with why. Only a failed one reads "Not delivered", with Retry.
+  - **Retry.**
+    - On a failed message, Retry is `POST /api/projects/:id/chat/:seq/retry`, which leaves any message that isn't failed as it is.
+    - On a message the page never had an answer for, Retry posts it again under the same `request_id`, the page's id for that message (`POST …/chat {text, request_id}`). The Worker keeps request ids (`chat_request`), so a post whose answer was lost is one message, not two.
+- **One-off cleanup.** The same migration drops PR rows whose task is gone, which deleting a draft left before [the task machine](#the-task-machine). Nothing updates them now, and a PR in one couldn't be attached again.
+
 ## Not decided here
 
 - The reviewer is one agent judging all three dimensions. Three agents, one per dimension, is a later choice if one agent's verdicts prove uneven.

@@ -106,6 +106,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     : rest[0] === "secret-requests" && rest.length === 3 ? `${m} secret-requests/:id/${rest[2]}`
     : rest[0] === "memory" && rest.length === 2 ? `${m} memory/:key`
     : rest[0] === "reviews" && rest.length === 4 && /^[1-9][0-9]{0,9}$/.test(rest[1]!) && /^[0-9a-f]{40}$/.test(rest[2]!) ? `${m} reviews/:pr/:sha/${rest[3]}`
+    : rest[0] === "stops" && (rest.length === 2 || rest.length === 3) && /^agt_[A-Za-z0-9]{1,64}$/.test(rest[1]!) ? `${m} ${["stops", ":agent", ...rest.slice(2)].join("/")}`
     : `${m} ${rest.map((s) => (ID.task.test(s) ? ":task" : ID.ask.test(s) ? ":ask" : ID.routine.test(s) ? ":routine" : ID.run.test(s) ? ":run" : ID.proposal.test(s) ? ":proposal" : /^[1-9][0-9]{0,9}$/.test(s) ? ":n" : s)).join("/")}`;
   const task = rest[1] ?? "";
   const ask = rest[1] ?? "";
@@ -312,8 +313,16 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "POST chat": {
       const b = await body(req, Chat);
-      return b.ok ? done(await p.postChat(b.value.text), 201) : b.res;
+      return b.ok ? done(await p.postChat(b.value.text, b.value.request_id), 201) : b.res;
     }
+    // A stop nest refused (README.md#outboxes): tried again, or dismissed by the owner (it stops counting).
+    case "POST stops/:agent/retry":
+      return done(await p.retryStop(rest[1]!));
+    case "DELETE stops/:agent":
+      return done(await p.dismissStop(rest[1]!));
+    case "POST chat/:n/retry":
+      // Sends again a message nest refused for good; one still being sent is left as it is (README.md#outboxes).
+      return done(await p.retryChat(Number(rest[1])));
     case "GET attention": {
       // ProjectDO's, with the reviews held for approval (ReviewDO's), oldest first.
       const a = (await p.attention()) as Result<{ at_ms: number }[]>;
