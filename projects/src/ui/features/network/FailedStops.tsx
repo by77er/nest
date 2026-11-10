@@ -47,7 +47,7 @@ export function FailedStops({ projectId, stops }: { projectId: string; stops: Ne
           <Stack key={s.agent} gap="xs" data-agent={s.agent}>
             <MetaRow>
               <MetaItem mono>{s.agent}</MetaItem>
-              {/* What it was for: its task, or its routine, by name. */}
+              {/* What it was for: its task, or its routine, by name (a long one wraps: a meta row's links keep to its width). */}
               {s.task ? (
                 <AnchorLink to="/projects/$projectId/board" params={{ projectId }} search={{ task: s.task }} fz="xs" lh="lg" c="bright" underline="always">
                   {s.task_title ?? s.task}
@@ -62,7 +62,7 @@ export function FailedStops({ projectId, stops }: { projectId: string; stops: Ne
             {/* A reading line's length, inside the notice (an error can be long). */}
             <Text fz="sm" maw="var(--nest-reading-measure)">
               {stopWhy(s)}
-              {s.error ? `: ${s.error}` : "."}
+              {s.error ? `; ${s.error.startsWith("nest ") ? `nest answered ${s.error.slice(5)}` : s.error}` : "."}
             </Text>
             <Toolbar
               align="start"

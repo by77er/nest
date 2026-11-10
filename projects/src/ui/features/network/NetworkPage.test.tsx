@@ -24,7 +24,7 @@ describe("the Network page", () => {
     const box = (await screen.findByText("2 agents the app couldn't stop")).closest("[data-ds=notice]") as HTMLElement;
     expect(box).toHaveTextContent("may still be running");
     const worker = box.querySelector('[data-agent="agt_w1"]') as HTMLElement;
-    expect(worker).toHaveTextContent("Its task was cancelled: nest 409 conflict: the agent is busy");
+    expect(worker).toHaveTextContent("Its task was cancelled; nest answered 409 conflict: the agent is busy");
     expect(within(worker).getByRole("link", { name: "Cache thumbnails" })).toHaveAttribute("href", `/projects/prj_one/board?task=${t.id}`);
     const run = box.querySelector('[data-agent="agt_r1"]') as HTMLElement;
     expect(run).toHaveTextContent("A routine run timed out");

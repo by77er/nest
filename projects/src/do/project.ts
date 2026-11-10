@@ -3288,7 +3288,7 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT agent FROM stops WHERE failed_ms IS NULL AND next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
     // The old manager's stop went (or failed for good): its successor starts in this drain.
     if (held && !replacing()) this.again = true;
-    // Ended rows past their queue's keep (README.md#outboxes): messages sent or failed a week ago, stops failed a month ago.
+    // Ended rows past their queue's keep (README.md#outboxes): messages sent or failed a week ago (a failed stop is kept until resolved).
     const msgs = pruneBefore(OUTBOX.messages, now);
     if (msgs !== null) this.sql.exec("DELETE FROM messages WHERE next_ms IS NULL AND COALESCE(ended_ms, at_ms) < ?", msgs);
     // A comment's key outlives any redelivery GitHub makes of it.

@@ -776,6 +776,7 @@ const app = {
     { name: "network-empty", section: "project", path: "/projects/prj_demo/network", fixture: "network-empty" },
     // Agents nest refused to stop: why, Retry and Dismiss (README.md#outboxes).
     { name: "network-stops-failed", section: "project", path: "/projects/prj_demo/network", fixture: "stops-failed", full: false },
+    { name: "network-stops-long", section: "project", path: "/projects/prj_demo/network", fixture: "stops-long", full: false },
     { name: "network-stop-dismiss", section: "project", path: "/projects/prj_demo/network", fixture: "stops-failed", full: false, after: (p) => p.getByRole("button", { name: "Dismiss the stop of agt_r2m9x4" }).click() },
     { name: "network-refused", section: "project", path: "/projects/prj_demo/network", full: false, after: async (p) => {
       const role = p.locator("[data-role=manager]");
