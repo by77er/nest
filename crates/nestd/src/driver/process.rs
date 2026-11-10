@@ -197,7 +197,10 @@ impl Vm for ProcessVm {
             if let Err(e) = tokio::task::spawn_blocking(move || kill_tree(c, t)).await
                 && e.is_cancelled()
             {
-                let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), Signal::SIGKILL);
+                // A child's pid, never 0, -1 (every process) or a process group.
+                if pid > 1 {
+                    let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), Signal::SIGKILL);
+                }
             }
         }
         self.emulator = None;

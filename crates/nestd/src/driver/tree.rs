@@ -25,6 +25,10 @@
 //!   pid that exited and was reused is never hit, and a member whose parent exited is still
 //!   reached. (A pid reused by a new member within one freeze, which takes wraparound within a
 //!   second, could hide that member until the next freeze.)
+//! - **Never nestd's own.** Whatever the rules above made of the process table, [`refusal`] keeps
+//!   some processes from ever being pinned, and so signalled: no process id (0 and negative pids
+//!   name process groups, -1 every process), init, nestd, nestd's ancestors, and any process
+//!   older than the guest. A bug in finding members costs a refusal, not the host.
 //! - **Resume is transparent.** [`Tree::thaw`] continues exactly the processes the freezes
 //!   stopped, deepest first ([`deepest_first`]); one an agent had stopped itself (`kill -STOP`, a
 //!   suspended job) stays stopped.
@@ -62,6 +66,37 @@ pub struct Stat {
     pub state: char,
     pub ppid: i32,
     pub session: i32,
+    /// When it started, in clock ticks since boot.
+    pub start: u64,
+}
+
+/// Why `pid` (which `table` says started at `start`) is never signalled as a member of a guest
+/// that started at `guest_start`, whatever the membership rules said: it is no process id, init,
+/// nestd itself (`own`) or an ancestor of it, or a process older than the guest (a member is the
+/// guest or was started after it). A bug in finding members then costs a refusal, not the host's
+/// own processes. Pure.
+pub fn refusal(pid: i32, start: u64, own: i32, guest_start: u64, table: &BTreeMap<i32, Stat>) -> Option<&'static str> {
+    if pid <= 0 {
+        return Some("not a process id");
+    }
+    if pid == 1 {
+        return Some("init");
+    }
+    if pid == own {
+        return Some("nestd itself");
+    }
+    let mut seen = BTreeSet::from([own]);
+    let mut p = own;
+    while let Some(parent) = table.get(&p).map(|s| s.ppid).filter(|pp| *pp > 0 && seen.insert(*pp)) {
+        if parent == pid {
+            return Some("an ancestor of nestd");
+        }
+        p = parent;
+    }
+    if start < guest_start {
+        return Some("older than the guest");
+    }
+    None
 }
 
 /// Every member of `root`'s tree in `table` but `root`: its session's processes, the `pinned`
@@ -109,7 +144,9 @@ fn stat(pid: i32) -> Option<Stat> {
     let ppid = rest.next()?.parse().ok()?;
     let _pgrp = rest.next()?;
     let session = rest.next()?.parse().ok()?;
-    Some(Stat { state, ppid, session })
+    // Fields 7 to 21 lie between the session and the start time (field 22).
+    let start = rest.nth(15)?.parse().ok()?;
+    Some(Stat { state, ppid, session, start })
 }
 
 /// Every process now.
@@ -243,6 +280,8 @@ impl Member {
 /// One guest's process tree, as the driver has seen it.
 pub struct Tree {
     root: i32,
+    /// When the guest started: no member is older.
+    root_start: u64,
     /// Every member found, the guest first and parents before children, each pinned by its pidfd.
     members: Vec<Member>,
     /// The members a freeze stopped (and no thaw has continued since).
@@ -255,7 +294,16 @@ pub struct Tree {
 impl Tree {
     /// The tree of the guest `root` (a child of nestd, not yet reaped).
     pub fn new(root: i32) -> io::Result<Tree> {
-        Ok(Tree { root, members: vec![Member { pid: root, fd: pidfd_open(root)? }], stopped: BTreeSet::new(), dead: false })
+        let refused = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, format!("{root} can't be a guest: {why}"));
+        if root <= 1 {
+            return Err(refused("not a child's process id"));
+        }
+        let fd = pidfd_open(root)?;
+        let root_start = stat(root).ok_or_else(|| refused("it has exited"))?.start;
+        if let Some(why) = refusal(root, root_start, std::process::id() as i32, root_start, &table()) {
+            return Err(refused(why));
+        }
+        Ok(Tree { root, root_start, members: vec![Member { pid: root, fd }], stopped: BTreeSet::new(), dead: false })
     }
 
     /// Stop every member (see the module docs). An error when the guest can't be signalled, when
@@ -353,10 +401,13 @@ impl Tree {
                 // Read again once pinned: the pid still names a process of the tree (its session,
                 // or a parent in the tree), not one that took a freed pid since the table was read.
                 let ours = |s: &Stat| s.session == root || s.ppid == root || known.contains(&s.ppid) || candidate_set.contains(&s.ppid);
-                if stat(pid).filter(ours).is_none() {
+                let Some(now) = stat(pid).filter(ours) else { continue };
+                // Whatever made it a candidate, some processes are never signalled.
+                known.insert(pid);
+                if let Some(why) = refusal(pid, now.start, std::process::id() as i32, self.root_start, &t) {
+                    tracing::error!(guest = root, pid, why, "refusing to treat a process as a guest's");
                     continue;
                 }
-                known.insert(pid);
                 self.members.push(Member { pid, fd });
                 found = true;
                 running += 1;
@@ -441,7 +492,42 @@ mod tests {
     use super::*;
 
     fn s(ppid: i32, session: i32) -> Stat {
-        Stat { state: 'S', ppid, session }
+        Stat { state: 'S', ppid, session, start: 100 }
+    }
+
+    /// Each process a bug in finding members could name and that must never be signalled: no
+    /// process id, init, nestd, nestd's ancestors, and anything older than the guest.
+    #[test]
+    fn some_processes_are_never_a_guests() {
+        // init ─ 50 (a shell) ─ 60 (nestd) ─ 70 (the guest, started at 100) ─ 71
+        //      └ 40 (another sandbox's guest, started at 90)
+        let t = BTreeMap::from([(1, s(0, 1)), (50, s(1, 50)), (60, s(50, 50)), (70, s(60, 70)), (71, s(70, 70)), (40, s(1, 40))]);
+        let refusal = |pid, start| refusal(pid, start, 60, 100, &t);
+        assert_eq!(refusal(0, 100), Some("not a process id"), "0 would signal nestd's own process group");
+        assert_eq!(refusal(-1, 100), Some("not a process id"), "-1 would signal every process");
+        assert_eq!(refusal(-70, 100), Some("not a process id"), "a negative pid is a process group");
+        assert_eq!(refusal(1, 100), Some("init"));
+        assert_eq!(refusal(60, 100), Some("nestd itself"));
+        assert_eq!(refusal(50, 100), Some("an ancestor of nestd"));
+        assert_eq!(refusal(40, 90), Some("older than the guest"));
+        assert_eq!(refusal(70, 100), None, "the guest");
+        assert_eq!(refusal(71, 105), None, "its child");
+        // A parent chain that loops (a table read mid-change) ends.
+        let looped = BTreeMap::from([(60, s(61, 60)), (61, s(60, 60))]);
+        assert_eq!(super::refusal(70, 100, 60, 100, &looped), None);
+        assert_eq!(super::refusal(61, 100, 60, 100, &looped), Some("an ancestor of nestd"));
+    }
+
+    /// The shell refuses them too: a tree is never rooted at init, at no pid, at this process or
+    /// at its parent, and a tree whose members are found by a wrong rule never signals them.
+    #[test]
+    fn a_tree_is_never_rooted_at_a_process_nestd_must_not_signal() {
+        let own = std::process::id() as i32;
+        let parent = stat(own).unwrap().ppid;
+        for pid in [0, -1, 1, own, parent] {
+            let e = Tree::new(pid).err().unwrap_or_else(|| panic!("{pid} became a guest"));
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{pid}: {e}");
+        }
     }
 
     fn none() -> BTreeSet<i32> {
