@@ -87,7 +87,7 @@ Bounds: the limits are 3 refusals for the row and 2 for SandboxDO (10 and 6 in t
 
 `FailedRelease.tla` models a failed sandbox releasing its lease (#192) and what the release leaves: the incarnation on the host, recorded stale, which keeps the host from being retired until it is salvaged (or its window passed) and destroyed. `SandboxLease` has no such action. The release is split at its two awaits (the fence's issue, `releaseFailedLease`), with an operator's retry, a destroy, a host's loss and a SandboxDO reset between them. Placement is one step (claim, `FleetDO.place`, the answer), with the no-capacity rollback.
 
-Properties: `EpochAboveStale` (unplaced, the sandbox's epoch is above every incarnation not yet salvaged), `SalvageAccepted` (what that guards: no recorded incarnation's salvage is refused as stale), `OnlyItsLease` (the release deletes no lease but the one at (h, e)), `NoWorkLostToRetire` (no host retired with an unsalvaged incarnation before its window), and under weak fairness on the release's steps, the window and the reaper, `StaleReaped` (every recorded incarnation ends destroyed) and `FailedReleases` (a failed sandbox leaves its host).
+Properties: `EpochAboveStale` (unplaced, the sandbox's epoch is above every incarnation not yet salvaged), `SalvageAccepted` (what that guards: no recorded incarnation's salvage is refused as stale), `OnlyItsLease` (the release deletes no lease but the one at (h, e)), `NoWorkLostToRetire` (no host retired with an incarnation a released lease left there, unrecorded or unsalvaged, before its window), and under weak fairness on the release's steps, the window and the reaper, `StaleReaped` (every recorded incarnation ends destroyed) and `FailedReleases` (a failed sandbox leaves its host).
 
 Bounds: two hosts, epochs ≤ 4, two failures, two retries, one destroy, one host loss, one reset, one "no capacity".
 
@@ -95,11 +95,12 @@ Bounds: two hosts, epochs ≤ 4, two failures, two retries, one destroy, one hos
 |---|---|---|
 | MCFailedNoSpend, NoSpendSalvage | #192's first version: the release doesn't spend an epoch; no retry | violates EpochAboveStale, SalvageAccepted |
 | MCFailedRetryNoSpend, RetryNoSpendSalvage | #192 as merged (82e007f9): `lease.retried` spends no epoch | violates EpochAboveStale and SalvageAccepted: an operator's retry between FleetDO's release and SandboxDO's leaves it unplaced at the released epoch, and the incarnation's salvage arriving before the next claim is refused (6 steps) |
-| MCFailedFixed | as built: the release and the retry each spend an epoch | holds (56,884 states) |
+| MCFailedRetryUnrecorded | before 2026-11-10: the retry releases the lease without recording the incarnation it leaves | violates NoWorkLostToRetire (fail, retry, the idle host retired: 3 steps) |
+| MCFailedFixed | as built: the release and the retry each spend an epoch and record what they leave | holds (45,140 states) |
 | MCFailedFixedReaped, FixedReleases | as built, one liveness property each | holds |
 | MCFailedMutDeleteAny | mutation: the release deletes the sandbox's lease whatever it is | violates OnlyItsLease |
 | MCFailedMutRetire | mutation: scaleDown ignores incarnations not yet destroyed | violates NoWorkLostToRetire |
 | MCFailedReachRelease, ReachRetired, ReachReplaced | reachability | violates NoRelease, NoRetiredAfter, NoReplaced (not vacuous) |
 
-Not modelled in either: a lease lost from a live host (`leaseLost` after a fence, where what is left of B1 lives: SandboxLease's `MCB1`), lost answers and resets around `FleetDO.place` (SandboxLease's subject), the fence's acknowledgement (B5), an incarnation a retry leaves that FleetDO never recorded, and a stale row dropped when the sandbox is placed again on the same host (`reapStale`: nestd salvages it when it creates the new one).
+Not modelled in either: a lease lost from a live host (`leaseLost` after a fence, where what is left of B1 lives: SandboxLease's `MCB1`), lost answers and resets around `FleetDO.place` (SandboxLease's subject), the fence's acknowledgement (B5), and a stale row dropped when the sandbox is placed again on the same host (`reapStale`: nestd salvages it when it creates the new one).
 

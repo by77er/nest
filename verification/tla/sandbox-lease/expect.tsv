@@ -64,6 +64,7 @@ FailedRelease.tla MCFailedNoSpend.cfg violates:EpochAboveStale ci
 FailedRelease.tla MCFailedNoSpendSalvage.cfg violates:SalvageAccepted ci
 FailedRelease.tla MCFailedRetryNoSpend.cfg violates:EpochAboveStale ci
 FailedRelease.tla MCFailedRetryNoSpendSalvage.cfg violates:SalvageAccepted ci
+FailedRelease.tla MCFailedRetryUnrecorded.cfg violates:NoWorkLostToRetire ci
 FailedRelease.tla MCFailedMutDeleteAny.cfg violates:OnlyItsLease ci
 FailedRelease.tla MCFailedMutRetire.cfg violates:NoWorkLostToRetire ci
 FailedRelease.tla MCFailedReachRelease.cfg violates:NoRelease ci

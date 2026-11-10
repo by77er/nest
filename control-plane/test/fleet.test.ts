@@ -709,7 +709,59 @@ describe("autoscaling", () => {
     ws.close();
   });
 
-  it("a release that an operator's retry overtakes leaves the new lease alone, and records no incarnation for it", async () => {
+  it("an operator's retry records the incarnation it leaves: its host isn't retired with unsalvaged work, and the incarnation is destroyed there once its window passes", async () => {
+    const cell = uniqueCell();
+    const ec2 = new MockEc2("running", "terminated");
+    await autoscaled(cell, ec2);
+    const sbx = await createSandbox(cell, 202);
+    const enrolled = await enrollLaunched(cell, "i-000000001");
+    const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
+    ws.send(hostHello(enrolled.host, cell));
+    await ws.next("hello_ack");
+    expect(await sandboxStub(sbx.sandbox).retryPlacement()).toBe(enrolled.host);
+    const [create] = await nextCommands(ws, (c) => c.type === "sandbox_create");
+    await okResult(ws, create.cmd);
+    // It ran (it may hold uncommitted work), then failed.
+    for (const state of ["running", "failed"]) {
+      const seq = sendEvents(ws, [{ ts_ms: Date.now(), type: "sandbox_state", sandbox: sbx.sandbox, epoch: 1, state }]);
+      await ws.next("ack", (m) => m.up_to >= seq);
+    }
+    // The operator retries it, and no host has room for it just now (this cell's FleetDO only).
+    const real = FleetDO.prototype.place;
+    FleetDO.prototype.place = async function (this: FleetDO, ...args: Parameters<typeof real>) {
+      return args[0].sandbox === sbx.sandbox ? null : real.apply(this, args);
+    };
+    try {
+      expect(await sandboxStub(sbx.sandbox).retryPlacement()).toBeNull();
+    } finally {
+      FleetDO.prototype.place = real;
+    }
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "creating", host: null, epoch: 2 });
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toBeNull();
+    // What it left on the host is recorded, not yet clean.
+    const stale = () => runInDurableObject(fleetStub(cell), (_i, st) =>
+      st.storage.sql.exec("SELECT host, epoch, clean, cmd FROM stale_incarnations WHERE sandbox = ?", sbx.sandbox).toArray());
+    expect(await stale()).toEqual([{ host: enrolled.host, epoch: 1, clean: 0, cmd: null }]);
+    // So the host, holding no lease, isn't retired however long it idles.
+    await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'place'"));
+    await tickAt(cell, ec2);
+    await tickAt(cell, ec2, 3_600_000);
+    expect((await fleetStub(cell).hostStatus(enrolled.host))!.status).toBe("active");
+    // Its salvage is an older epoch's: kept as an orphan.
+    const salvage = await sandboxStub(sbx.sandbox).commit(enrolled.host, {
+      request: `req_${crypto.randomUUID()}`, sandbox: sbx.sandbox, epoch: 1, reason: "salvage", kind: "disk_only", manifest: manifest("c"), stats: { bytes: 1, chunks: 1 },
+    } as never);
+    expect(salvage.status).toBe("orphaned");
+    // Past the salvage window it is destroyed there.
+    await runInDurableObject(fleetStub(cell), (_i, state) => {
+      state.storage.sql.exec("UPDATE stale_incarnations SET first_seen_ms = first_seen_ms - ?", 12 * 60_000);
+    });
+    await tickAt(cell, ec2);
+    expect((await nextCommands(ws, (c) => c.type === "sandbox_destroy")).find((c) => c.type === "sandbox_destroy")).toMatchObject({ sandbox: sbx.sandbox, epoch: 1 });
+    ws.close();
+  });
+
+  it("a release that an operator's retry overtakes leaves the new lease alone, and records no incarnation for the new epoch", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
     const sbx = await createSandbox(cell);
@@ -726,7 +778,8 @@ describe("autoscaling", () => {
     let held = true;
     let reached: unknown[] | null = null;
     FleetDO.prototype.releaseFailedLease = async function (this: FleetDO, ...args: Parameters<typeof real>) {
-      if (args[0] === sbx.sandbox) {
+      // The release's call only: the retry's own, made meanwhile, goes straight through.
+      if (args[0] === sbx.sandbox && reached === null) {
         reached = args;
         while (held) await scheduler.wait(10);
       }
@@ -748,8 +801,13 @@ describe("autoscaling", () => {
     // The late release named the old holder's epoch: the new lease stands and nothing is recorded as left behind.
     expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 3 });
     expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "creating", host: a.host, epoch: 3 });
-    expect(await runInDurableObject(fleetStub(cell), (_i, st) =>
-      st.storage.sql.exec("SELECT 1 FROM stale_incarnations WHERE sandbox = ?", sbx.sandbox).toArray().length)).toBe(0);
+    // The retry recorded what it left at the old epoch; nothing is recorded for the new lease, and the
+    // old record goes at the next reap (placed again on the same host, nestd replaces it at the create).
+    const rows = () => runInDurableObject(fleetStub(cell), (_i, st) =>
+      st.storage.sql.exec("SELECT host, epoch FROM stale_incarnations WHERE sandbox = ?", sbx.sandbox).toArray());
+    expect(await rows()).toEqual([{ host: a.host, epoch: 1 }]);
+    await runInDurableObject(fleetStub(cell), (inst: FleetDO) => (inst as unknown as { reapStale(): void }).reapStale());
+    expect(await rows()).toEqual([]);
     a.ws.close();
   });
 
@@ -774,7 +832,8 @@ describe("autoscaling", () => {
     let released = false;
     FleetDO.prototype.releaseFailedLease = async function (this: FleetDO, ...args: Parameters<typeof real>) {
       const r = await real.apply(this, args);
-      if (args[0] === sbx.sandbox) {
+      // The release's call only: the retry's own, made meanwhile, goes straight through.
+      if (args[0] === sbx.sandbox && !released) {
         released = true;
         while (held) await scheduler.wait(10);
       }

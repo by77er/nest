@@ -677,7 +677,10 @@ export class SandboxDO extends DurableObject<Env> {
     const old = lease.failedHolder(info);
     if (old) {
       await this.fleet(info.cell).issueCommands(old.host, [{ type: "fence", sandboxes: [info.sandbox], reason: "create failed; re-placing" }]);
-      await this.fleet(info.cell).releaseLease(info.sandbox, old.epoch);
+      // As the failed sandbox's own release does: the lease at (host, epoch) goes and the incarnation it
+      // leaves there is FleetDO's to watch (stale, not yet clean), so the host isn't retired with its
+      // uncommitted work, and it is destroyed there once salvaged or past its window.
+      await this.fleet(info.cell).releaseFailedLease(info.sandbox, old.host, old.epoch);
       this.update((i) => lease.retried(i, old.host, old.epoch));
       await this.failedChanged(this.info_());
     } else {
