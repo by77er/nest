@@ -773,6 +773,8 @@ describe("autoscaling", () => {
       st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'failed_release'");
       st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.ms', ?) WHERE key = 'failed_since'", Date.now() - 15 * 60_000);
     });
+    const rows = () => runInDurableObject(fleetStub(cell), (_i, st) =>
+      st.storage.sql.exec("SELECT host, epoch FROM stale_incarnations WHERE sandbox = ?", sbx.sandbox).toArray());
     // The release is held after its fence, before FleetDO drops the lease (this cell's FleetDO only).
     const real = FleetDO.prototype.releaseFailedLease;
     let held = true;
@@ -792,6 +794,11 @@ describe("autoscaling", () => {
       // Meanwhile the operator retries it: placed again, on the same host, at a new epoch (the retry spends one, the claim the next).
       await adminJson(`/v1/sandboxes/${sbx.sandbox}/place`, { body: {} });
       expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 3 });
+      // The retry recorded what it left at the old epoch; that record goes at the next reap (placed again
+      // on the same host, nestd replaces the incarnation at the create). Nothing is recorded now.
+      expect(await rows()).toEqual([{ host: a.host, epoch: 1 }]);
+      await runInDurableObject(fleetStub(cell), (inst: FleetDO) => (inst as unknown as { reapStale(): void }).reapStale());
+      expect(await rows()).toEqual([]);
       held = false;
       await release;
     } finally {
@@ -801,12 +808,7 @@ describe("autoscaling", () => {
     // The late release named the old holder's epoch: the new lease stands and nothing is recorded as left behind.
     expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 3 });
     expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "creating", host: a.host, epoch: 3 });
-    // The retry recorded what it left at the old epoch; nothing is recorded for the new lease, and the
-    // old record goes at the next reap (placed again on the same host, nestd replaces it at the create).
-    const rows = () => runInDurableObject(fleetStub(cell), (_i, st) =>
-      st.storage.sql.exec("SELECT host, epoch FROM stale_incarnations WHERE sandbox = ?", sbx.sandbox).toArray());
-    expect(await rows()).toEqual([{ host: a.host, epoch: 1 }]);
-    await runInDurableObject(fleetStub(cell), (inst: FleetDO) => (inst as unknown as { reapStale(): void }).reapStale());
+    // The late release deleted no lease, so it recorded nothing: not for the new lease, and not again for the old epoch.
     expect(await rows()).toEqual([]);
     a.ws.close();
   });

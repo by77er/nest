@@ -66,8 +66,8 @@ The other follow-ups of a result (`checkpoint_result`, `command_failed`, `start_
 | Operator | `retryPlacement` `sandbox.ts:673` | yes | The count starts again. |
 | Granted deleting a given-up row | `place` `fleet.ts:1698` | yes | |
 | Fail (FailedRelease) | `lease.reported`, `createFailed`; `failedChanged` `sandbox.ts:766` arms `failed_release` | yes | The 15-minute grace is abstracted to "some time later". |
-| FRStart, FRFleet, FRFinish | `releaseFailed` `sandbox.ts:737`; `releaseFailedLease` `fleet.ts:1723`; `failedReleased` `lease.ts:164` | yes | The lease and the stale record in one FleetDO step; the epoch spent only if still failed on (h, e). A reset between the steps leaves the deadline to run it again. |
-| RetryRelease, RetryPlace | `retryPlacement` with a holder: `releaseFailedLease` (`fleet.ts`), `lease.retried` (`lease.ts`) | yes | `retried` spends an epoch (the finding below, fixed with this pass). Since 2026-11-10 the retry releases the lease through `releaseFailedLease`, as the release does, so the incarnation it leaves is recorded stale in the step that deletes the lease (second note below). |
+| FRStart, FRFleet, FRFinish | `releaseFailed` `sandbox.ts:740`; `releaseFailedLease` `fleet.ts:1724`; `failedReleased` `lease.ts:164` | yes | The lease and the stale record in one FleetDO step; the epoch spent only if still failed on (h, e). A reset between the steps leaves the deadline to run it again. |
+| RetryRelease, RetryPlace | `retryPlacement` `sandbox.ts:673` with a holder: `releaseFailedLease` `fleet.ts:1724`, `retried` `lease.ts:201` | yes | `retried` spends an epoch (the finding below, fixed with this pass). Since 2026-11-10 the retry releases the lease through `releaseFailedLease`, as the release does, so the incarnation it leaves is recorded stale in the step that deletes the lease (second note below). |
 | RetryReleased | `lease.retriedReleased` `lease.ts:189` | yes | |
 | Alarm | `placeWanted` `lease.ts:211` | yes | False for `failed`. |
 | Salvage | `decideCommit` `lease.ts:220` | yes | An orphan from an older epoch's holder; the current epoch's only from its holder. |

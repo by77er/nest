@@ -555,7 +555,7 @@ describe("delivery", () => {
     expect((await view(c)).dropped).toBe(3);
   }, 15_000);
 
-  it("the cap never drops the event being sent: the next oldest goes instead, and the count is of what went", async () => {
+  it("the cap never drops the event being sent: the next oldest goes instead, and is counted", async () => {
     const hook = new Hook("hang");
     const c = await newClient(hook);
     const stub = clientStub(c.id);
@@ -569,6 +569,56 @@ describe("delivery", () => {
     expect(kept).toEqual([`${tag}-first`, `${tag}-1`]);
     expect(await view(c)).toMatchObject({ backlog: BACKLOG_MAX, dropped: 1 });
   }, 20_000);
+
+  it("an attempt that ended without an answer (cut off at the timeout) leaves no mark: its event is the oldest again, and goes at the cap", async () => {
+    const hook = new Hook("hang");
+    const c = await newClient(hook);
+    const stub = clientStub(c.id);
+    const tag = rand();
+    await stub.enqueue([ev(`${tag}-first`)]);
+    // The attempt is cut off (its fetch throws), and the next one waits out its backoff.
+    await eventually("the attempt to time out", async () => (await view(c)).failures > 0, WEBHOOK_TIMEOUT_MS + 5000);
+    await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE deadlines SET at = ? WHERE key = 'deliver'", Date.now() + 3_600_000);
+    });
+    await stub.enqueue(Array.from({ length: BACKLOG_MAX }, (_, i) => ev(`${tag}-${i}`)));
+    const oldest = await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) =>
+      st.storage.sql.exec<{ id: string }>("SELECT id FROM outbox ORDER BY seq LIMIT 1").one().id);
+    expect(oldest).toBe(`${tag}-0`);
+    expect(await view(c)).toMatchObject({ backlog: BACKLOG_MAX, dropped: 1 });
+  }, 30_000);
+
+  it("a legacy backlog (no row with a time) all takes the prune's time; runs between stamped rows take the earliest time after them", async () => {
+    const hook = new Hook("fail");
+    const c = await newClient(hook);
+    const stub = clientStub(c.id);
+    await stub.enqueue([ev("seed")]);
+    await eventually("the first failure", async () => (await view(c)).failures > 0);
+    const out = await runInDurableObject(stub, (inst: ClientDO, st: DurableObjectState) => {
+      const sql = st.storage.sql;
+      const add = (id: string, at: number | null) => sql.exec("INSERT INTO outbox (id, body, queued_ms) VALUES (?, ?, ?)", id, JSON.stringify(ev(id)), at);
+      const times = () => sql.exec<{ id: string; queued_ms: number | null }>("SELECT id, queued_ms FROM outbox ORDER BY seq").toArray().map((r) => r.queued_ms);
+      const stamp = (now: number) => {
+        const before = sql.exec<{ n: number }>("SELECT total_changes() AS n").one().n;
+        (inst as unknown as { stampLegacyEvents(now: number): void }).stampLegacyEvents(now);
+        return sql.exec<{ n: number }>("SELECT total_changes() AS n").one().n - before;
+      };
+      // A previous release's backlog: 500 rows, none with a time. Every one takes `now`.
+      sql.exec("DELETE FROM outbox");
+      for (let i = 0; i < 500; i++) add(`l${i}`, null);
+      const changed = stamp(7000);
+      const all = times();
+      // Runs between stamped rows: each takes the earliest time after it; times never decrease along the queue.
+      sql.exec("DELETE FROM outbox");
+      for (const [id, at] of [["a", null], ["b", null], ["c", 300], ["d", null], ["e", 100], ["f", null], ["g", 200], ["h", null]] as const) add(id, at);
+      stamp(9000);
+      return { changed, legacy: [...new Set(all)], mixed: times(), nothing: stamp(9999) };
+    });
+    expect(out.legacy).toEqual([7000]);
+    expect(out.changed).toBe(500);
+    expect(out.mixed).toEqual([100, 100, 300, 100, 100, 200, 200, 9000]);
+    expect(out.nothing).toBe(0);
+  }, 15_000);
 
   it("a new webhook starts its own schedule: the failures and the last error counted against the old one go", async () => {
     const hook = new Hook("fail");
