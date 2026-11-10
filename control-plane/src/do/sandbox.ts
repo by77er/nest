@@ -109,6 +109,9 @@ const accessKey = (a: { push: string[]; read: string[]; workflows?: boolean; inj
   `${a.push.join()}|${a.read.join()}${a.workflows ? "|workflows" : ""}${a.inject?.length ? `|${JSON.stringify(a.inject)}` : ""}`;
 
 /** A sandbox's record: its lease fields (lib/sandbox-lease.ts), its clients' slots (lib/slots.ts), and the rest. */
+/** When it failed and as which incarnation (`lease.FailedSince`), for the release's grace. */
+const FAILED_SINCE_KEY = "failed_since";
+
 export interface SandboxInfo extends lease.Lease, slots.Slots {
   sandbox: string;
   /**
@@ -561,6 +564,7 @@ export class SandboxDO extends DurableObject<Env> {
       await this.fleet(info.cell).issueCommands(old.host, [{ type: "fence", sandboxes: [info.sandbox], reason: "create failed; re-placing" }]);
       await this.fleet(info.cell).releaseLease(info.sandbox, old.epoch);
       this.update((i) => lease.retried(i, old.host, old.epoch));
+      await this.failedChanged(this.info_());
     } else {
       // Failed with its lease already released (`releaseFailed`): placeable again, retried until placed.
       this.update((i) => lease.retriedReleased(i));
@@ -581,8 +585,8 @@ export class SandboxDO extends DurableObject<Env> {
     if (state === "failed" && detail) console.warn(`sandbox ${info.sandbox}: failed on ${host}: ${detail}`);
     const [r, after] = this.decide((i) => lease.reported(i, host, epoch, state, guest));
     if (!r.applied) return;
-    // Failed: its lease (and host) goes after a grace, unless something moves it first.
-    if (after.state === "failed") await this.deadlines.set("failed_release", Date.now() + lease.FAILED_RELEASE_MS, true);
+    // Failed: its lease (and host) goes after a grace, measured from this failure, unless something moves it first.
+    await this.failedChanged(after);
     // A guest that just came up (boot, resume) takes the slots its sandbox was suspended without.
     if (r.becameRunning) await this.reissuePendingAttaches(true);
     await this.armIdle();
@@ -617,12 +621,45 @@ export class SandboxDO extends DurableObject<Env> {
    */
   private async releaseFailed(): Promise<void> {
     const info = this.info_();
+    const due = lease.failedReleaseDue(info, this.get<lease.FailedSince>(FAILED_SINCE_KEY), Date.now());
+    if (due.kind === "none") {
+      this.del(FAILED_SINCE_KEY);
+      return;
+    }
+    if (due.kind === "wait") {
+      // Not the whole grace yet (it failed again since this deadline was armed): from its latest failure.
+      this.put(FAILED_SINCE_KEY, due.since);
+      await this.deadlines.set("failed_release", due.at_ms);
+      return;
+    }
+    await this.fleet(info.cell).issueCommands(due.host, [{ type: "fence", sandboxes: [info.sandbox], reason: "failed; its lease released" }]);
+    // The lease goes and the incarnation it leaves is FleetDO's to watch: the host isn't retired until
+    // it is salvaged (or its salvage window passed) and destroyed.
+    await this.fleet(info.cell).releaseFailedLease(info.sandbox, due.host, due.epoch);
+    const [released] = this.decide((i) => lease.failedReleased(i, due.host, due.epoch));
+    if (released) {
+      this.del(FAILED_SINCE_KEY);
+      console.warn(`sandbox ${info.sandbox}: failed for ${lease.FAILED_RELEASE_MS / 60_000} min; its lease on ${due.host} released`);
+    }
+  }
+
+  /**
+   * After a change that may have made it failed, or not failed any more: the time it failed is kept (for
+   * this holder and epoch) with the `failed_release` deadline, and both go when it leaves `failed`, so a
+   * later failure gets its own whole grace.
+   */
+  private async failedChanged(info: SandboxInfo): Promise<void> {
     const old = lease.failedHolder(info);
-    if (!old) return;
-    await this.fleet(info.cell).issueCommands(old.host, [{ type: "fence", sandboxes: [info.sandbox], reason: "failed; its lease released" }]);
-    await this.fleet(info.cell).releaseLease(info.sandbox, old.epoch);
-    const [released] = this.decide((i) => lease.failedReleased(i, old.host, old.epoch));
-    if (released) console.warn(`sandbox ${info.sandbox}: failed for ${lease.FAILED_RELEASE_MS / 60_000} min; its lease on ${old.host} released`);
+    const since = this.get<lease.FailedSince>(FAILED_SINCE_KEY);
+    if (!old) {
+      if (since) this.del(FAILED_SINCE_KEY);
+      await this.deadlines.clear("failed_release");
+      return;
+    }
+    if (since && since.host === old.host && since.epoch === old.epoch) return;
+    const now = Date.now();
+    this.put(FAILED_SINCE_KEY, { ...old, ms: now } satisfies lease.FailedSince);
+    await this.deadlines.set("failed_release", now + lease.FAILED_RELEASE_MS);
   }
 
   /** FleetDO took this suspended sandbox off a host going away (`lease.evicted`). */
@@ -663,7 +700,7 @@ export class SandboxDO extends DurableObject<Env> {
       await this.pushSecrets();
     } else if (r === "failed") {
       console.warn(`sandbox ${info.sandbox}: create failed: ${error.code} ${error.message}`);
-      await this.deadlines.set("failed_release", Date.now() + lease.FAILED_RELEASE_MS, true);
+      await this.failedChanged(info);
     }
   }
 

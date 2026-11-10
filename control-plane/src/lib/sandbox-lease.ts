@@ -156,12 +156,33 @@ export const FAILED_RELEASE_MS = 15 * 60_000;
  * A failed sandbox's lease, released after `FAILED_RELEASE_MS` (its holder fenced first), if nothing moved
  * meanwhile: unplaced, still `failed`, so its host can retire. Nothing places it again on its own
  * (`placeWanted`, `wake`): an operator's retry (`claim`) or a destroy does.
+ *
+ * The release spends an epoch: the incarnation it leaves on the host is then of an older epoch, so the
+ * salvage of what it hadn't committed (it may have run before it failed) is accepted as an orphan from
+ * that epoch's host (`decideCommit`), never refused as stale and deleted.
  */
 export function failedReleased(l: Lease, host: string, epoch: number): boolean {
   if (l.state !== "failed" || !holds(l, host, epoch)) return false;
   l.host = null;
   l.lost_from = null;
+  l.epoch += 1;
   return true;
+}
+
+/** When a sandbox failed, and as which incarnation (kept beside the record, for the release's grace). */
+export interface FailedSince { host: string; epoch: number; ms: number }
+
+/**
+ * What the `failed_release` deadline does at `now`: `release` once the sandbox has been failed on this
+ * holder for the whole grace; `wait` until then (a sandbox that failed, was retried and failed again is
+ * measured from its latest failure, `since`; one with no record of it, from now); `none` when it isn't
+ * failed on a host any more.
+ */
+export function failedReleaseDue(l: Lease, since: FailedSince | undefined, now: number): { kind: "none" } | { kind: "wait"; at_ms: number; since: FailedSince } | { kind: "release"; host: string; epoch: number } {
+  const old = failedHolder(l);
+  if (!old) return { kind: "none" };
+  const mine = since && since.host === old.host && since.epoch === old.epoch ? since : { ...old, ms: now };
+  return now - mine.ms >= FAILED_RELEASE_MS ? { kind: "release", ...old } : { kind: "wait", at_ms: mine.ms + FAILED_RELEASE_MS, since: mine };
 }
 
 /** An operator's retry of a failed sandbox whose lease was already released: placeable again (`creating`). */
