@@ -195,6 +195,21 @@ async function boardList(page, { width }) {
   return out;
 }
 
+/** Mid-drag, the dragged row is lifted (`raised`): its shadow and a hairline round it, above its neighbours. */
+async function rowLifted(page) {
+  const r = await page.evaluate(() => {
+    const row = document.querySelector("[data-ds=task-row][data-dragging]");
+    if (!row) return null;
+    const cs = getComputedStyle(row);
+    return { shadow: cs.boxShadow, outline: cs.outlineStyle, z: cs.zIndex };
+  });
+  if (!r) return ["no row is being dragged in the capture"];
+  const out = [];
+  if (!r.shadow || r.shadow === "none") out.push("the dragged row has no shadow: it isn't lifted");
+  if (r.outline === "none") out.push("the dragged row has no hairline round it");
+  return out;
+}
+
 /** A row moved by keyboard (space, arrow down, space) lands one place down in its group. */
 async function keyboardMoved(page) {
   const names = await page.evaluate(() => [...(document.querySelectorAll("[data-ds=task-group]")[1]?.querySelectorAll("[data-ds=task-row]") ?? [])].map((r) => r.getAttribute("aria-label")));
@@ -683,7 +698,7 @@ const app = {
     { name: "board-empty", section: "project", path: "/projects/prj_demo/board", fixture: "board-empty" },
     { name: "board-collapsed", section: "project", path: "/projects/prj_demo/board", full: false, after: async (p) => { await p.getByRole("button", { name: /^Draft/ }).click(); await p.getByRole("button", { name: /^Done/ }).click(); } },
     // Dragging by keyboard: picked up (the row lifted; a desktop's keys), then moved one down and dropped (the new order).
-    { name: "board-dragging", section: "project", path: "/projects/prj_demo/board", full: false, widths: DESKTOP, after: async (p) => { const g = p.getByRole("button", { name: "Move Cache gadget thumbnails" }); await g.scrollIntoViewIfNeeded(); await g.focus(); await p.keyboard.press("Space"); await p.waitForTimeout(150); await p.keyboard.press("ArrowDown"); await p.waitForTimeout(300); } },
+    { name: "board-dragging", section: "project", path: "/projects/prj_demo/board", full: false, widths: DESKTOP, check: rowLifted, checkName: "board-list", after: async (p) => { const g = p.getByRole("button", { name: "Move Cache gadget thumbnails" }); await g.scrollIntoViewIfNeeded(); await g.focus(); await p.keyboard.press("Space"); await p.waitForTimeout(150); await p.keyboard.press("ArrowDown"); await p.waitForTimeout(300); } },
     { name: "board-keyboard-move", section: "project", path: "/projects/prj_demo/board", full: false, after: async (p) => { const g = p.getByRole("button", { name: "Move Cache gadget thumbnails" }); await g.scrollIntoViewIfNeeded(); await g.focus(); await p.keyboard.press("Space"); await p.waitForTimeout(150); await p.keyboard.press("ArrowDown"); await p.waitForTimeout(300); await p.keyboard.press("Space"); await p.waitForTimeout(400); }, check: keyboardMoved, checkName: "board-list" },
     { name: "board-long", section: "project", path: "/projects/prj_demo/board", fixture: "long" },
     { name: "board-needs-you-all", section: "project", path: "/projects/prj_demo/board", after: (p) => p.getByRole("button", { name: /Show all/ }).click() },

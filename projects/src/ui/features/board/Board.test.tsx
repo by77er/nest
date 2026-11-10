@@ -100,6 +100,26 @@ describe("the board", () => {
     expect(rowNames(column("In progress"))).toEqual(["Being done", "Just assigned"]);
   });
 
+  it("in a group of more than one state, a row whose state isn't the group's name says it, muted; the others don't repeat it", async () => {
+    const api = new FakeApi();
+    api.tasks = [task({ title: "Under way", state: "in_progress" }), task({ title: "Just picked up", state: "assigned" }), task({ title: "Fresh", state: "draft" })];
+    renderApp("/projects/prj_one/board", api);
+    const assigned = await screen.findByRole("article", { name: "Just picked up" });
+    const word = assigned.querySelector("[data-slot=row-state]") as HTMLElement;
+    expect(word).toHaveTextContent("Assigned");
+    expect(word.getAttribute("style") ?? "").toContain("--mantine-color-dimmed");
+    expect(screen.getByRole("article", { name: "Under way" }).querySelector("[data-slot=row-state]")).toBeNull();
+    expect(screen.getByRole("article", { name: "Fresh" }).querySelector("[data-slot=row-state]")).toBeNull();
+  });
+
+  it("an empty board has one focal action: New task filled, the empty state's own button quieter", async () => {
+    renderApp("/projects/prj_one/board", new FakeApi());
+    await screen.findByText("No tasks yet");
+    // Mantine's filled button (its default) carries no variant attribute.
+    expect(screen.getByRole("button", { name: "New task" }).getAttribute("data-variant") ?? "filled").toBe("filled");
+    expect(screen.getByRole("button", { name: "Create a task" })).toHaveAttribute("data-variant", "default");
+  });
+
   it("a group's header collapses and opens it, remembered in this browser", async () => {
     const api = new FakeApi();
     api.tasks = [task({ title: "A draft", state: "draft" }), task({ title: "A ready one", state: "ready" })];

@@ -2,7 +2,8 @@
 // minimalism and vertical layout or rather a table layout instead of a column layout"): one full-width
 // list grouped by stage of a task's life, in the order the columns were, cancelled behind a switch and
 // empty stages left out. Each group's header collapses it (remembered per project in the browser). Rows
-// keep their manual order and drag within their group by pointer or keyboard; a task changes stage only
+// keep their manual order and drag within their group by pointer or keyboard (the dragged row lifted, `raised`);
+// a row whose state isn't its group's name (Assigned, in In progress) says its state in a muted word; a task changes stage only
 // through its drawer's actions, as before. It polls while the tab is visible, except while a row is dragged.
 
 import { closestCenter, DndContext, type DragEndEvent, KeyboardSensor, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
@@ -84,7 +85,7 @@ function BoardGroup({ column, tasks, open, onToggle, projectId, repo, pendingAsk
         <SortableContext items={tasks.map((t) => t.id)} strategy={verticalListSortingStrategy}>
           <div>
             {tasks.map((t) => (
-              <TaskListRow key={t.id} task={t} projectId={projectId} repo={repo} pendingAsks={pendingAsks.get(t.id) ?? 0} sortable={tasks.length > 1} />
+              <TaskListRow key={t.id} task={t} projectId={projectId} repo={repo} pendingAsks={pendingAsks.get(t.id) ?? 0} sortable={tasks.length > 1} group={column.title} />
             ))}
           </div>
         </SortableContext>
@@ -136,7 +137,7 @@ export function Board({ projectId, repo }: { projectId: string; repo: string }) 
         <ErrorState title="The board couldn't be loaded" error={tasks.error} onRetry={() => void tasks.refetch()} />
       ) : tasks.data.length === 0 ? (
         <Panel>
-          <EmptyState icon={IconLayoutList} title="No tasks yet" description="Create one, or ask the manager in the chat to plan some." action={<Button onClick={open} onPointerEnter={() => void loadCreateForm()} onFocus={() => void loadCreateForm()}>Create a task</Button>} />
+          <EmptyState icon={IconLayoutList} title="No tasks yet" description="Create one, or ask the manager in the chat to plan some." action={<Button variant="default" onClick={open} onPointerEnter={() => void loadCreateForm()} onFocus={() => void loadCreateForm()}>Create a task</Button>} />
         </Panel>
       ) : (
         <TaskList label="Tasks by stage">

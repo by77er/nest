@@ -344,7 +344,7 @@ export function useReorderTask(id: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (v: { task: string; ord: number }) => api.updateTask(id, v.task, { ord: v.ord }),
-    meta: { failure: "The card wasn't moved" },
+    meta: { failure: "The task wasn't moved" },
     onMutate: async (v) => {
       await qc.cancelQueries({ queryKey: keys.tasks(id) });
       const before = qc.getQueryData<Task[]>(keys.tasks(id));
