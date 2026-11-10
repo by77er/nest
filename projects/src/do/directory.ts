@@ -81,6 +81,13 @@ const MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN repo_owner_id INTEGER",
     "ALTER TABLE projects ADD COLUMN repo_owner_login TEXT",
   ],
+  [
+    // Events refused for coming from another App installation than the project's (README.md#the-repos-binding):
+    // the last one's installation (null: it named none), how many since the binding last changed, and when.
+    "ALTER TABLE projects ADD COLUMN refused_installation INTEGER",
+    "ALTER TABLE projects ADD COLUMN refused_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE projects ADD COLUMN refused_ms INTEGER",
+  ],
 ] as const;
 
 /** A project's repo binding (README.md#the-repos-binding), as the Admin page shows it. */
@@ -101,6 +108,8 @@ export interface RepoBinding {
   error: string | null;
   /** The bound repo's owner, as GitHub answered when it was read; null when it was learned from an event. */
   owner: { id: number; login: string } | null;
+  /** Events refused for another installation than `installation_id`: the last one's (null: none named), how many, when. */
+  refused: { installation: number | null; count: number; last_ms: number } | null;
 }
 
 /** A repo as the Admin page shows it beside another: its name, id and owner. */
@@ -132,7 +141,7 @@ export const CREATE_GRACE_MS = 60_000;
 export const CREATE_POLICY: OutboxPolicy = { maxAttempts: 8 };
 
 const COLUMNS = "id, name, repo, created_ms, CASE WHEN pending IS NULL THEN 'ready' ELSE 'pending' END AS state";
-const BINDING = "id, name, repo, repo_id, repo_name, installation_id, repo_bound, repo_bound_ms, bind_error, repo_owner_id, repo_owner_login";
+const BINDING = "id, name, repo, repo_id, repo_name, installation_id, repo_bound, repo_bound_ms, bind_error, repo_owner_id, repo_owner_login, refused_installation, refused_count, refused_ms";
 
 function bindingOf(r: Record<string, SqlStorageValue>): RepoBinding {
   return {
@@ -141,6 +150,7 @@ function bindingOf(r: Record<string, SqlStorageValue>): RepoBinding {
     bound: (r.repo_bound as "github" | "event" | null) ?? null, bound_ms: (r.repo_bound_ms as number | null) ?? null,
     error: (r.bind_error as string | null) ?? null,
     owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: (r.repo_owner_login as string | null) ?? "" },
+    refused: (r.refused_count as number | null) ? { installation: (r.refused_installation as number | null) ?? null, count: r.refused_count as number, last_ms: r.refused_ms as number } : null,
   };
 }
 
@@ -239,25 +249,39 @@ export class DirectoryDO extends DurableObject<Env> {
    * The project a GitHub event's repo belongs to (README.md#built-the-review-pipeline): by the repo's id, whatever it's
    * named now. A project with no id yet is found by the name it was created with, and takes the event's
    * id from then on. A name whose project has another id is another repo's now (ours was renamed, and the
-   * name taken): no project.
+   * name taken): no project. A project whose App installation is known takes only events from that
+   * installation (`installation.id`): any other, or none, is refused (README.md#the-repos-binding).
    */
-  async projectForRepo(repoId: number | null, name: string | null): Promise<ProjectRow | null> {
+  async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null): Promise<{ project: ProjectRow } | { refused: string } | null> {
     const one = (where: string, v: SqlStorageValue) =>
-      this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS} FROM projects WHERE ${where}`, v).toArray()[0] ?? null;
+      this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS}, installation_id FROM projects WHERE ${where}`, v).toArray()[0] ?? null;
+    const row = (r: ProjectRow & Record<string, SqlStorageValue>): ProjectRow => ({ id: r.id, name: r.name, repo: r.repo, created_ms: r.created_ms, state: r.state });
+    // Refused, and counted on the binding so the Admin page shows it: a reinstalled App's events would
+    // otherwise all be dropped unseen (Re-read takes the new installation).
+    const wrongInstallation = (r: Record<string, SqlStorageValue>) => {
+      if (r.installation_id === null || r.installation_id === installation) return null;
+      this.sql.exec("UPDATE projects SET refused_installation = ?, refused_count = refused_count + 1, refused_ms = ? WHERE id = ?", installation, Date.now(), r.id);
+      return `the event's installation (${installation ?? "none"}) isn't the project's (${r.installation_id as number})`;
+    };
     if (repoId !== null) {
       const byId = one("repo_id = ?", repoId);
       if (byId) {
+        const wrong = wrongInstallation(byId);
+        if (wrong) return { refused: wrong };
         // The name GitHub gives it now: a rename or transfer is noted (README.md#the-repos-binding).
         if (name) this.noteName(byId.id, name);
-        return byId;
+        return { project: row(byId) };
       }
     }
     const byName = name ? one("repo = ? AND repo_id IS NULL", name.toLowerCase()) : null;
-    if (byName && repoId !== null) {
+    if (!byName) return null;
+    const wrong = wrongInstallation(byName);
+    if (wrong) return { refused: wrong };
+    if (repoId !== null) {
       // Learned from an event, so recorded as one (a sync reads it from GitHub): no owner known.
       this.sql.exec("UPDATE projects SET repo_id = ?, repo_bound = 'event', repo_bound_ms = ?, repo_owner_id = NULL, repo_owner_login = NULL WHERE id = ? AND repo_id IS NULL", repoId, Date.now(), byName.id);
     }
-    return byName;
+    return { project: row(byName) };
   }
 
   /**
@@ -313,10 +337,20 @@ export class DirectoryDO extends DurableObject<Env> {
         "Check on GitHub whether the repo was renamed, transferred or deleted and its name taken, then Re-read to compare the two and choose.",
       );
     }
+    // The installation nest minted the token from (null from a nest that doesn't say: the one stored stays).
+    const installation = typeof gh.installation_id === "number" && Number.isSafeInteger(gh.installation_id) && gh.installation_id > 0 ? gh.installation_id : null;
     this.sql.exec(
       `UPDATE projects SET repo_id = ?, repo_bound = 'github', repo_bound_ms = ?, bind_error = NULL, repo_name = CASE WHEN repo = ? THEN NULL ELSE ? END,
-        repo_owner_id = ?, repo_owner_login = ? WHERE id = ?`,
-      gh.id, Date.now(), name, name, gh.owner?.id ?? null, gh.owner?.login ?? null, project,
+        repo_owner_id = ?, repo_owner_login = ?,
+        installation_id = CASE WHEN ? THEN ? ELSE COALESCE(?, installation_id) END WHERE id = ?`,
+      gh.id, Date.now(), name, name, gh.owner?.id ?? null, gh.owner?.login ?? null,
+      // Another repo chosen: its installation, whatever was stored. The same one: a nest that doesn't say keeps it.
+      before.repo_id !== gh.id ? 1 : 0, installation, installation, project,
+    );
+    // The refusals are over once the binding's installation moved (a reinstalled App, read again) or is the refused one.
+    this.sql.exec(
+      "UPDATE projects SET refused_installation = NULL, refused_count = 0, refused_ms = NULL WHERE id = ? AND refused_count > 0 AND (installation_id IS NOT ? OR installation_id = refused_installation)",
+      project, before.installation_id,
     );
     return { ok: true, binding: (await this.binding(project))!, changed: before.repo_id !== gh.id, previous_id: before.repo_id };
   }

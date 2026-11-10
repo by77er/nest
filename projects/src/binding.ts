@@ -19,7 +19,7 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
   const dir = directory(env);
   const b = await dir.binding(id);
   if (!b) return { ok: false, error: "unknown project", binding: null };
-  let info: GithubRepo;
+  let info: GithubRepo & { installation_id: number | null };
   const name = b.renamed_to ?? b.repo;
   try {
     let gh;
@@ -31,7 +31,7 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
       gh = await githubFor(nest, b.repo, PERMISSIONS.metadata);
     }
     const r = await gh.repoInfo(name);
-    info = { id: r.id, full_name: r.full_name, owner: { id: r.owner.id, login: r.owner.login } };
+    info = { id: r.id, full_name: r.full_name, owner: { id: r.owner.id, login: r.owner.login }, installation_id: gh.installationId };
   } catch (e) {
     return { ok: false, error: `GitHub couldn't be read: ${message(e)}`, binding: b };
   }
@@ -77,7 +77,8 @@ export async function bindAll(env: Env, nest: Nest): Promise<void> {
   for (const b of await directory(env).bindings()) {
     try {
       let now: RepoBinding | null = b;
-      if (b.repo_id === null || b.bound !== "github") {
+      // No id, one taken from an event, or no installation yet (bound before nest named it): read from GitHub.
+      if (b.repo_id === null || b.bound !== "github" || b.installation_id === null) {
         const r = await readBinding(env, nest, b.project, "fill");
         now = r.binding;
       }

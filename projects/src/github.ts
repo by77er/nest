@@ -116,6 +116,8 @@ export class GitHub {
     private readonly token: string,
     /** The GitHub App the token is from, as nest's answer names it; null when it doesn't. */
     readonly appId: number | null = null,
+    /** The App installation the token was minted from, as nest's answer names it; null when it doesn't (a nest from before). */
+    readonly installationId: number | null = null,
   ) {}
 
   /** One call: the JSON answer, or GitHubError. A 404 is answered as null where `nullOn404`. */
@@ -324,7 +326,8 @@ function pullOf(p: Record<string, unknown>, repo: string): Pull {
 /** A client with a token for `repo` with exactly `permissions`, knowing the App it's from when nest says. */
 export async function githubFor(nest: Nest, repo: string, permissions: Record<string, string>): Promise<GitHub> {
   const t = await nest.githubToken(repo, permissions);
-  return new GitHub(t.token, typeof t.app_id === "number" && Number.isSafeInteger(t.app_id) && t.app_id > 0 ? t.app_id : null);
+  const id = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null);
+  return new GitHub(t.token, id(t.app_id), id(t.installation_id));
 }
 
 /**

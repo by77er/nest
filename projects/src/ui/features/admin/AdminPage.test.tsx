@@ -7,7 +7,7 @@ import { rereadText } from "./BindingsSection";
 import { renderApp } from "../../test/render";
 
 const binding = (o: Partial<RepoBinding> = {}): RepoBinding => ({
-  project: "prj_one", name: "Widgets", repo: "owner/widgets", repo_id: 1, renamed_to: null, installation_id: null, bound: "github", bound_ms: null, error: null, owner: null, ...o,
+  project: "prj_one", name: "Widgets", repo: "owner/widgets", repo_id: 1, renamed_to: null, installation_id: null, bound: "github", bound_ms: null, error: null, owner: null, refused: null, ...o,
 });
 
 describe("the admin page", () => {
@@ -27,7 +27,7 @@ describe("the admin page", () => {
     const api = new FakeApi();
     const now = Date.now();
     api.bindings = [
-      binding({ project: "prj_one", name: "Widgets", repo: "owner/widgets", repo_id: 101, bound: "github", bound_ms: now - 3_600_000 }),
+      binding({ project: "prj_one", name: "Widgets", repo: "owner/widgets", repo_id: 101, bound: "github", bound_ms: now - 3_600_000, installation_id: 777001, refused: { installation: 888002, count: 14, last_ms: now - 12 * 60_000 } }),
       binding({ project: "prj_two", name: "Gadgets", repo: "owner/gadgets", repo_id: 102, bound: "event", bound_ms: now - 86_400_000, renamed_to: "neworg/gadgets" }),
       binding({ project: "prj_three", name: "Old", repo: "owner/old", repo_id: null, bound: null, error: "Didn't bind: GitHub's repo owner/old (7) is already project prj_one's" }),
     ];
@@ -38,7 +38,15 @@ describe("the admin page", () => {
     expect(row("prj_one")).toHaveTextContent("owner/widgets");
     expect(row("prj_one")).toHaveTextContent("101");
     expect(row("prj_one")).toHaveTextContent("Read from GitHub 1 hour ago");
+    expect(row("prj_one").querySelector("[data-slot=installation]")).toHaveTextContent("Installation 777001");
+    // Events from another installation (a reinstalled App), refused: said, with what to do.
+    expect(within(row("prj_one")).getByText("Events refused")).toBeInTheDocument();
+    expect(row("prj_one").querySelector("[data-slot=refused]")).toHaveTextContent(
+      "14 events refused, from App installation 888002, not the project's (777001); the last 12 minutes ago. If the App was reinstalled, Re-read to take its new installation.",
+    );
+    expect(row("prj_two").querySelector("[data-slot=installation]")).toHaveTextContent("Installation not known yet: any is taken");
     expect(within(row("prj_one")).queryByText(/Rename pending|Not bound/)).toBeNull();
+    expect(row("prj_two").querySelector("[data-slot=refused]")).toBeNull();
     expect(row("prj_two")).toHaveTextContent("From its first event yesterday, not read from GitHub yet");
     expect(within(row("prj_two")).getByText("Rename pending")).toBeInTheDocument();
     expect(row("prj_two").querySelector('[data-tone="warning"]')).toHaveTextContent("Renamed on GitHub to neworg/gadgets: applied once nest's grant names it");
@@ -119,6 +127,7 @@ describe("the admin page", () => {
     expect(card).toHaveTextContent("Gadgets");
     expect(card).toHaveTextContent("owner/gadgets");
     expect(card).toHaveTextContent("GitHub id none");
+    expect(card.querySelector("[data-slot=installation]")).toHaveTextContent("Installation not known yet");
     expect(within(card).getByText("Not bound")).toBeInTheDocument();
     expect(card).toHaveTextContent("Didn't bind: why");
     expect(within(card).getByRole("button", { name: "Re-read Gadgets's repo from GitHub" })).toBeInTheDocument();
