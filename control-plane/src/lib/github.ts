@@ -151,8 +151,19 @@ export type GhAnswer =
 export class GitHubApi {
   constructor(private readonly fetchFn: typeof fetch = fetch, readonly base = GITHUB_API, private readonly timeoutMs = 20_000) {}
 
+  /** Requests this client has made. */
+  requests = 0;
+  /**
+   * Called synchronously before each request leaves, with nothing awaited in between: a budget reserves
+   * its unit here, and refuses (throws) to stop the request before it is sent.
+   */
+  beforeRequest: (() => void) | null = null;
+
   /** One request with `auth` as the bearer (the App's JWT or an installation token; null: none, a public read). Never throws. */
   async request(auth: string | null, method: string, path: string, body?: unknown): Promise<GhAnswer> {
+    // Before the try: a budget's refusal is the caller's to see, not a lost answer.
+    this.beforeRequest?.();
+    this.requests++;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
     try {
@@ -171,6 +182,8 @@ export class GitHubApi {
       });
       const text = await readCapped(res);
       if (res.status >= 500) return { kind: "lost", why: `HTTP ${res.status}` };
+      // GitHub's rate limit (primary: 403 or 429 with no requests left): no verdict, so no answer.
+      if ((res.status === 403 || res.status === 429) && res.headers.get("x-ratelimit-remaining") === "0") return { kind: "lost", why: `GitHub's rate limit (HTTP ${res.status})` };
       if (res.status >= 300) {
         let message = text.slice(0, 300);
         try {
@@ -262,10 +275,13 @@ export class GitHubApi {
    */
   async accountLogin(jwt: string | null, account: number): Promise<string | null> {
     if (jwt !== null) {
-      const page = await this.request(jwt, "GET", "/app/installations?per_page=100");
-      if (page.kind === "ok" && Array.isArray(page.json)) {
+      // A page of 100 at a time, at most 10 pages (as `installationOfAccount`).
+      for (let n = 1; n <= 10; n++) {
+        const page = await this.request(jwt, "GET", `/app/installations?per_page=100&page=${n}`);
+        if (page.kind !== "ok" || !Array.isArray(page.json)) break;
         const hit = (page.json as { account?: { id?: unknown; login?: unknown } }[]).find((i) => i?.account?.id === account);
         if (typeof hit?.account?.login === "string") return hit.account.login.toLowerCase();
+        if (page.json.length < 100) break;
       }
     }
     const r = await this.request(null, "GET", `/user/${account}`);

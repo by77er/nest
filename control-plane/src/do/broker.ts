@@ -12,6 +12,7 @@ import {
 import { isClientId, REPO_OWNERS_PER_CALL } from "../lib/clients";
 import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
 import { canonicalRepos, Repo } from "../lib/repos";
+import { addColumn } from "../lib/stored";
 import type { GithubPermissions } from "../lib/brokered";
 import { canonicalJson } from "../lib/sinks";
 import { credentialFor, type CredentialPrincipal } from "../lib/credentials";
@@ -27,7 +28,21 @@ const GITHUB_TOKEN_REUSE_MS = 10 * 60_000;
 /** A repo's owner, for an owner-wide grant entry, is asked of GitHub again after this long (a miss, sooner). */
 const REPO_OWNER_TTL_MS = 5 * 60_000;
 const REPO_OWNER_MISS_TTL_MS = 60_000;
-/** GitHub calls a client's owner-wide grant entries may cost in an hour (`spendLookups`). */
+/**
+ * GitHub calls owner-wide grant entries may cost in an hour, all clients together (`reserve`): well
+ * under the App's own limit (5,000 an hour, more for large installations: GitHub's REST rate limits), so
+ * token mints and sandboxes' pushes keep the rest.
+ */
+const OWNER_LOOKUPS_PER_HOUR_ALL = 2000;
+/** An owner-lookup budget's refusal (429, retryable): never mistaken for GitHub's own answer. */
+class BudgetExceeded extends NestError {
+  constructor(message: string) {
+    super(ErrorCodes.RATE_LIMITED, message, 429, true);
+  }
+}
+/** The budget row all clients share. */
+const ALL_CLIENTS = "*";
+/** GitHub calls a client's owner-wide grant entries may cost in an hour (`reserve`). */
 const OWNER_LOOKUPS_PER_HOUR = 600;
 /** A repo's installation id is looked up again after this long. */
 const INSTALLATION_TTL_MS = 24 * 3_600_000;
@@ -145,9 +160,11 @@ export class BrokerDO extends DurableObject<Env> {
     this.sql.exec("CREATE TABLE IF NOT EXISTS github_repo_owners (repo TEXT PRIMARY KEY, owner_id INTEGER, fetched_ms INTEGER NOT NULL)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS github_installation_accounts (installation INTEGER PRIMARY KEY, account_id INTEGER NOT NULL)");
     // Each bound account's current login (`accountLogins`), briefly; and each client's owner-lookup budget
-    // (`spendLookups`): GitHub calls made for it this hour.
+    // (`reserve`): GitHub calls made for it this hour, and for all clients (`ALL_CLIENTS`).
     this.sql.exec("CREATE TABLE IF NOT EXISTS github_account_logins (account_id INTEGER PRIMARY KEY, login TEXT, fetched_ms INTEGER NOT NULL)");
     this.sql.exec("CREATE TABLE IF NOT EXISTS github_lookup_budget (client TEXT PRIMARY KEY, window_ms INTEGER NOT NULL, used INTEGER NOT NULL)");
+    // Whether a login row records GitHub not answering (a miss either way; the token route says 503 for it).
+    addColumn(this.sql, "github_account_logins", "failed", "INTEGER");
     // An account's repos the App's installation reaches, for a client's list of its grant (`accountRepos`): briefly.
     this.sql.exec("CREATE TABLE IF NOT EXISTS github_account_repos (account_id INTEGER PRIMARY KEY, body TEXT NOT NULL, fetched_ms INTEGER NOT NULL)");
     this.sql.exec(`CREATE TABLE IF NOT EXISTS github_app_installations (app_id TEXT NOT NULL, repo TEXT NOT NULL, installation INTEGER NOT NULL,
@@ -888,14 +905,21 @@ export class BrokerDO extends DurableObject<Env> {
         // lookup, never the cache), and the token is minted from that account's installation, or not at
         // all. Every other outcome (not under a bound account's login, not found, moved, no answer) is the
         // same 403, which says nothing of whether the repo exists.
+        // GitHub not answering (no answer, rate limited) is no verdict: 503, retryable, saying nothing more.
         const outside = () => refuse(new NestError(ErrorCodes.FORBIDDEN, `outside the client's grant: github repo ${r}`, 403));
+        const unanswered = () => new NestError(ErrorCodes.INTERNAL, `GitHub didn't answer whether the grant covers ${r}: try again later`, 503, true);
         const client = (caller as { client?: string }).client ?? "";
-        if (!(await this.underBoundLogin(r, owners, client))) return await outside();
-        this.spendLookups(client, 1);
+        const logins = await this.accountLogins(owners, client);
+        if (!logins.logins.has(r.split("/")[0]!)) {
+          if (logins.failed) throw unanswered();
+          return await outside();
+        }
         let found: { id: number; account: number | null } | null;
         try {
-          found = await api.installationOwner(jwt, r);
-        } catch {
+          found = await this.budgeted(client).installationOwner(jwt, r);
+        } catch (e) {
+          if (e instanceof BudgetExceeded) throw e;
+          if (e instanceof NestError && e.retryable) throw unanswered();
           return await outside();
         }
         installation = found?.id ?? null;
@@ -959,7 +983,7 @@ export class BrokerDO extends DurableObject<Env> {
     const out: Record<string, number | null> = {};
     // Only repos under a bound account's current login are asked about; any other name is outside with no
     // GitHub call (so a client can't spend the App's rate limit on names that couldn't match).
-    const logins = await this.accountLogins(bound, client);
+    const { logins } = await this.accountLogins(bound, client);
     let jwt: string | null | undefined;
     for (const r of names) {
       if (!logins.has(r.split("/")[0]!)) {
@@ -972,8 +996,7 @@ export class BrokerDO extends DurableObject<Env> {
         continue;
       }
       if (jwt === undefined) jwt = await this.appJwtOrNull();
-      this.spendLookups(client, 1);
-      const id = await githubApiOf(this.env).repoOwnerId(jwt, r);
+      const id = await this.budgeted(client).repoOwnerId(jwt, r);
       this.sql.exec(`INSERT INTO github_repo_owners (repo, owner_id, fetched_ms) VALUES (?, ?, ?)
         ON CONFLICT(repo) DO UPDATE SET owner_id = excluded.owner_id, fetched_ms = excluded.fetched_ms`, r, id, Date.now());
       out[r] = id;
@@ -996,9 +1019,21 @@ export class BrokerDO extends DurableObject<Env> {
     const row = this.sql.exec<{ body: string; fetched_ms: number }>("SELECT body, fetched_ms FROM github_account_repos WHERE account_id = ?", account).toArray()[0];
     if (row && Date.now() - row.fetched_ms < REPO_OWNER_TTL_MS) return JSON.parse(row.body) as { installed: boolean; repos: string[]; complete: boolean };
     const jwt = await this.appJwtOrNull();
-    const api = githubApiOf(this.env);
+    // Each call it makes (installations' pages, the mint, the listing's pages) reserved as it goes.
+    const out = await this.listAccountRepos(this.budgeted(caller.client), jwt, account, caller);
+    this.sql.exec(`INSERT INTO github_account_repos (account_id, body, fetched_ms) VALUES (?, ?, ?)
+      ON CONFLICT(account_id) DO UPDATE SET body = excluded.body, fetched_ms = excluded.fetched_ms`, account, JSON.stringify(out), Date.now());
+    // The repos it lists are known to be that account's: a check right after needn't ask GitHub again.
+    for (const r of out.repos) {
+      this.sql.exec(`INSERT INTO github_repo_owners (repo, owner_id, fetched_ms) VALUES (?, ?, ?)
+        ON CONFLICT(repo) DO UPDATE SET owner_id = excluded.owner_id, fetched_ms = excluded.fetched_ms`, r, account, Date.now());
+    }
+    return out;
+  }
+
+  /** `accountRepos`' GitHub calls: the account's installation, a whole-installation token, its repos. */
+  private async listAccountRepos(api: GitHubApi, jwt: string | null, account: number, caller: { client: string }): Promise<{ installed: boolean; repos: string[]; complete: boolean }> {
     let out: { installed: boolean; repos: string[]; complete: boolean } = { installed: false, repos: [], complete: true };
-    this.spendLookups(caller.client, 1);
     const installation = jwt === null ? null : await api.installationOfAccount(jwt, account);
     if (jwt !== null && installation !== null) {
       this.sql.exec("INSERT OR REPLACE INTO github_installation_accounts (installation, account_id) VALUES (?, ?)", installation, account);
@@ -1011,15 +1046,9 @@ export class BrokerDO extends DurableObject<Env> {
         // Only the account's own: GitHub's answer for each, never the name.
         out = { installed: true, repos: [...new Set(listed.repos.filter((r) => r.owner === account).map((r) => r.repo))].sort(), complete: listed.complete };
       } finally {
-        this.ctx.waitUntil(revokeInstallationToken(api, t.token).catch(() => undefined));
+        // Never stopped by the budget (a token left unrevoked is worse): charged all the same.
+        await revokeInstallationToken(this.budgeted(caller.client, true), t.token).catch(() => undefined);
       }
-    }
-    this.sql.exec(`INSERT INTO github_account_repos (account_id, body, fetched_ms) VALUES (?, ?, ?)
-      ON CONFLICT(account_id) DO UPDATE SET body = excluded.body, fetched_ms = excluded.fetched_ms`, account, JSON.stringify(out), Date.now());
-    // The repos it lists are known to be that account's: a check right after needn't ask GitHub again.
-    for (const r of out.repos) {
-      this.sql.exec(`INSERT INTO github_repo_owners (repo, owner_id, fetched_ms) VALUES (?, ?, ?)
-        ON CONFLICT(repo) DO UPDATE SET owner_id = excluded.owner_id, fetched_ms = excluded.fetched_ms`, r, account, Date.now());
     }
     return out;
   }
@@ -1030,50 +1059,76 @@ export class BrokerDO extends DurableObject<Env> {
    * its. One GitHub call per account not kept (spent from `client`'s budget); an account GitHub can't
    * name now has no login (its repos are outside until it can).
    */
-  private async accountLogins(bound: readonly number[], client: string): Promise<Set<string>> {
+  private async accountLogins(bound: readonly number[], client: string): Promise<{ logins: Set<string>; failed: boolean }> {
     const out = new Set<string>();
+    let failed = false;
     let jwt: string | null | undefined;
     for (const id of new Set(bound)) {
       if (!Number.isSafeInteger(id) || id <= 0) continue;
-      const row = this.sql.exec<{ login: string | null; fetched_ms: number }>("SELECT login, fetched_ms FROM github_account_logins WHERE account_id = ?", id).toArray()[0];
+      const row = this.sql.exec<{ login: string | null; fetched_ms: number; failed: number | null }>(
+        "SELECT login, fetched_ms, failed FROM github_account_logins WHERE account_id = ?", id).toArray()[0];
       let login: string | null;
-      if (row && Date.now() - row.fetched_ms < REPO_OWNER_TTL_MS) login = row.login;
-      else {
+      // A login GitHub couldn't give (none, or no answer) is asked again sooner (`REPO_OWNER_MISS_TTL_MS`).
+      if (row && Date.now() - row.fetched_ms < (row.login === null ? REPO_OWNER_MISS_TTL_MS : REPO_OWNER_TTL_MS)) {
+        login = row.login;
+        if (row.failed === 1) failed = true;
+      } else {
         if (jwt === undefined) jwt = await this.appJwtOrNull();
-        this.spendLookups(client, 1);
+        let lost = false;
         try {
-          login = await githubApiOf(this.env).accountLogin(jwt, id);
-        } catch {
+          login = await this.budgeted(client).accountLogin(jwt, id);
+        } catch (e) {
+          // The budget's refusal is the caller's to see; GitHub not answering is a miss, kept a minute.
+          if (e instanceof BudgetExceeded) throw e;
           login = null;
+          lost = true;
         }
-        this.sql.exec(`INSERT INTO github_account_logins (account_id, login, fetched_ms) VALUES (?, ?, ?)
-          ON CONFLICT(account_id) DO UPDATE SET login = excluded.login, fetched_ms = excluded.fetched_ms`, id, login, Date.now());
+        if (lost) failed = true;
+        this.sql.exec(`INSERT INTO github_account_logins (account_id, login, fetched_ms, failed) VALUES (?, ?, ?, ?)
+          ON CONFLICT(account_id) DO UPDATE SET login = excluded.login, fetched_ms = excluded.fetched_ms, failed = excluded.failed`, id, login, Date.now(), lost ? 1 : 0);
       }
       if (login) out.add(login);
     }
-    return out;
-  }
-
-  /** Whether `repo`'s owner part is the current login of one of the accounts `bound`. */
-  private async underBoundLogin(repo: string, bound: readonly number[], client: string): Promise<boolean> {
-    return (await this.accountLogins(bound, client)).has(repo.toLowerCase().split("/")[0]!);
+    return { logins: out, failed };
   }
 
   /**
-   * Spend `n` of `client`'s owner-lookup budget for this hour (`OWNER_LOOKUPS_PER_HOUR`): each GitHub
-   * call nest makes to decide an owner-wide entry for it. Past it, 429 (retryable) and no call is made,
-   * so one client can't drain the App's rate limit that every client and sandbox shares.
+   * A GitHub client whose every request first reserves one unit of `client`'s hourly owner-lookup budget
+   * and all clients' (`reserve`), synchronously as it leaves: concurrent requests can't all pass a spent
+   * budget across an await. `force`: charged, never refused (a revoke).
    */
-  private spendLookups(client: string, n: number): void {
+  private budgeted(client: string, force = false): GitHubApi {
+    const api = githubApiOf(this.env);
+    api.beforeRequest = () => this.reserve(client, force);
+    return api;
+  }
+
+  /** This hour's calls for `who` (a client, or `ALL_CLIENTS`): what is used and since when (a window past its hour starts again). */
+  private budgetRow(who: string, now: number): { window_ms: number; used: number } {
+    const row = this.sql.exec<{ window_ms: number; used: number }>("SELECT window_ms, used FROM github_lookup_budget WHERE client = ?", who).toArray()[0];
+    return !row || now - row.window_ms >= 3_600_000 ? { window_ms: now, used: 0 } : row;
+  }
+
+  /**
+   * Reserve one GitHub call for `client` and for all clients, in one synchronous step (check and count
+   * together, nothing awaited): refused (`BudgetExceeded`, 429, retryable) when `client` has used its hour's
+   * owner-lookup budget (`OWNER_LOOKUPS_PER_HOUR`) or all clients theirs (`OWNER_LOOKUPS_PER_HOUR_ALL`), so
+   * neither one client nor several, however concurrent, can drain the App's rate limit everyone shares.
+   */
+  private reserve(client: string, force: boolean): void {
     const now = Date.now();
-    const row = this.sql.exec<{ window_ms: number; used: number }>("SELECT window_ms, used FROM github_lookup_budget WHERE client = ?", client).toArray()[0];
-    const fresh = !row || now - row.window_ms >= 3_600_000;
-    const used = fresh ? 0 : row.used;
-    if (used + n > OWNER_LOOKUPS_PER_HOUR) {
-      throw new NestError(ErrorCodes.RATE_LIMITED, `${client || "this client"} has asked GitHub about owner-wide grant entries ${OWNER_LOOKUPS_PER_HOUR} times this hour: try again later`, 429, true);
+    const mine = this.budgetRow(client, now);
+    const all = this.budgetRow(ALL_CLIENTS, now);
+    if (!force && mine.used >= OWNER_LOOKUPS_PER_HOUR) {
+      throw new BudgetExceeded(`${client || "this client"} has asked GitHub about owner-wide grant entries ${OWNER_LOOKUPS_PER_HOUR} times this hour: try again later`);
     }
-    this.sql.exec(`INSERT INTO github_lookup_budget (client, window_ms, used) VALUES (?, ?, ?)
-      ON CONFLICT(client) DO UPDATE SET window_ms = excluded.window_ms, used = excluded.used`, client, fresh ? now : row.window_ms, used + n);
+    if (!force && all.used >= OWNER_LOOKUPS_PER_HOUR_ALL) {
+      throw new BudgetExceeded(`nest has asked GitHub about owner-wide grant entries ${OWNER_LOOKUPS_PER_HOUR_ALL} times this hour, for all clients: try again later`);
+    }
+    for (const [who, b] of [[client, mine], [ALL_CLIENTS, all]] as const) {
+      this.sql.exec(`INSERT INTO github_lookup_budget (client, window_ms, used) VALUES (?, ?, ?)
+        ON CONFLICT(client) DO UPDATE SET window_ms = excluded.window_ms, used = excluded.used`, who, b.window_ms, b.used + 1);
+    }
   }
 
   /** The App's JWT, or null when no usable App is configured (owner lookups then go to GitHub's public API). */
