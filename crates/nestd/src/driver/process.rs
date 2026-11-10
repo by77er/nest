@@ -558,6 +558,27 @@ mod tests {
         assert!(all_gone(&[server, child]).await, "the stop killed them too");
     }
 
+    /// The fence's lock-free pauser keeps what it stopped when it can't stop everything (here it
+    /// has no time for the guest's child): a fenced guest must not run on. `pause`, a commit's,
+    /// would continue the guest again.
+    #[tokio::test]
+    async fn the_fences_pauser_keeps_the_guest_stopped_when_it_fails() {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let sweep = Sweep(format!("NEST_TEST_TREE=pauser-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        let mut guest = std::process::Command::new("env").args([&sweep.0, "/bin/sh", "-c", "exec >/dev/null 2>&1; sleep 20 & exec sleep 20"]).spawn().unwrap();
+        let pid = guest.id() as i32;
+        let tree = crate::driver::tree::Tree::new(pid).unwrap().with_budget(std::time::Duration::ZERO);
+        let pauser = TreePauser(Arc::new(std::sync::Mutex::new(tree)));
+        let r = pauser.pause().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let stopped = matches!(state(pid), Some('T' | 't'));
+        drop(sweep);
+        let _ = guest.kill();
+        let _ = guest.wait();
+        assert!(r.is_err(), "no budget: the child isn't stopped yet");
+        assert!(stopped, "the fence's pauser let the guest run on");
+    }
+
     /// A paused VM's tree is stopped, its own-session children included (they would write the disk
     /// a commit reads), by `pause` and by the lock-free pauser alike; resume continues what the
     /// pause stopped, and only that: a process the agent had stopped itself stays stopped.
