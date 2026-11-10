@@ -192,11 +192,17 @@ export function retriedReleased(l: Lease): boolean {
   return true;
 }
 
-/** Retry, after the fence and release, if nothing moved meanwhile. */
+/**
+ * Retry, after the fence and release, if nothing moved meanwhile. It spends an epoch, as `failedReleased`
+ * does: the incarnation it leaves on the host is then an older epoch's, so its salvage is an orphan from
+ * that epoch's host (`decideCommit`) even while the sandbox is unplaced (before the next claim, or after
+ * one that found no room), never the current epoch's with no holder, refused as stale.
+ */
 export function retried(l: Lease, host: string, epoch: number): void {
   if (!holds(l, host, epoch)) return;
   l.host = null;
   l.state = "creating";
+  l.epoch += 1;
 }
 
 /** Destroy. A placement in flight finds no marker, so it adopts nothing. */

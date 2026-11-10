@@ -6,7 +6,7 @@ Formal models, proofs and checkers of nest's protocols. Docs: [docs/verification
 
 | Path | Tool | What | Build |
 |---|---|---|---|
-| `tla/sandbox-lease/` | TLA+/TLC | Placement, leases, fencing, STONITH, salvage and commit as on `main` at `edf6829`; `SlotFollowups.tla`: a command result's and a placement's follow-ups, the slots and `resolve` (2026-11-06) | `run.sh --only tla` |
+| `tla/sandbox-lease/` | TLA+/TLC | Placement, leases, fencing, STONITH, salvage and commit as on `main` at `edf6829`; `SlotFollowups.tla`: a command result's and a placement's follow-ups, the slots and `resolve` (2026-11-06); `PlacementRetry.tla`: a refused placement's bounded retries and give-up; `FailedRelease.tla`: a failed sandbox's lease released, and the incarnation it leaves (2026-11-09) | `run.sh --only tla` |
 | `tla/agent-brain/` | TLA+/TLC | The brain lifecycle and the one-brain rule: 65bf6ef, the single-record design and its amendments, and the record as built (merged as #30), with a previous-release host | `run.sh --only tla` |
 | `lean/` | Lean 4 (core, v4.33.1) | SandboxDO's commit chain and the object-store GC: proved invariants and checked counterexamples | `lake build` in `lean/` |
 | `stateright/` | Stateright 0.31.0 | FleetDO → nestd command delivery at `edf6829`, and two fixes (superseded by `nestd/check/`) | `cargo test --release` in `stateright/` (its own workspace) |

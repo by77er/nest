@@ -30,7 +30,7 @@ The authority for one sandbox.
 - **Completion** is one compare-and-set. It checks that the epoch is still the newest issued and that the host reported, at that epoch, the VM running, the guest agent's hello, and the guest agent ready (its post-resume fixes done). Outcomes: `Completed`; `Superseded` (a suspend or destroy asked for meanwhile takes over, and the running VM is handed to it, not lost); `CasLost` (nothing written, and that epoch is fenced). **An epoch is never retried;** a retry is a new claim.
 - **Evidence never authorizes.** Heartbeats, `sandbox_state` and `hello` reports can block a completion but never make a transition.
 - **Failures:** no capacity releases the claim and backs off 30 s. A failed create or restore backs off 30 s, doubling to 10 min, and after a failed memory restore the next attempt boots disk-only. After three failed attempts the sandbox rests unplaced at its head (it reads as suspended) until something needs it.
-- **Never terminally failed while a committed head exists.** Only a sandbox with no committed generation, whose create from its image keeps failing, is `failed`. The operator's `POST /place` claims again at once, skipping backoff.
+- **Never terminally failed while a committed head exists.** Only a sandbox with no committed generation, whose create from its image keeps failing, is `failed`. The operator's `POST /place` claims again at once, skipping backoff. On a sandbox failed on its host it fences the holder, releases the lease and spends an epoch before it claims, as the failed sandbox's own release does: what the holder hadn't committed is then an older epoch's, and its salvage is kept as an orphan.
 
 ## Attach and bindings
 

@@ -71,9 +71,10 @@ describe("#1 one lease, one host", () => {
     expect((await sandboxStub(sbx.sandbox).info()).state).toBe("failed");
     const placed = await adminJson(`/v1/sandboxes/${sbx.sandbox}/place`, { body: {} });
     expect(placed.host).toBe(a.host);
-    const cmds = await nextCommands(a.ws, (c) => c.type === "sandbox_create" && c.epoch === 2);
-    expect(cmds.some((c) => c.type === "sandbox_create" && c.epoch === 2)).toBe(true);
-    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 2 });
+    // The retry spends an epoch (what the old host held is then an older epoch's), and the claim the next.
+    const cmds = await nextCommands(a.ws, (c) => c.type === "sandbox_create" && c.epoch === 3);
+    expect(cmds.some((c) => c.type === "sandbox_create" && c.epoch === 3)).toBe(true);
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 3 });
   });
 });
 
