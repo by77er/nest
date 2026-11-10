@@ -617,14 +617,43 @@ export class ClientDO extends DurableObject<Env> {
   private dropOldEvents(now = Date.now()): void {
     // A row with no time was queued before every row after it: it takes the earliest time among those
     // (else now), so the queue's order is its age's order and an older event never outlives a newer one.
-    this.sql.exec(`UPDATE outbox SET queued_ms = COALESCE((SELECT MIN(o.queued_ms) FROM outbox o WHERE o.seq > outbox.seq AND o.queued_ms IS NOT NULL), ?)
-      WHERE queued_ms IS NULL`, now);
+    this.stampLegacyEvents(now);
     // No attempt is out now: this runs from the alarm, as `deliver` does, and alarm handlers don't overlap.
     const n = this.sql.exec("DELETE FROM outbox WHERE queued_ms <= ?", now - EVENT_MAX_AGE_MS).rowsWritten;
     if (n) {
       this.deliveryEvent({ kind: "dropped", n });
       console.warn(`client ${this.record()?.client ?? "?"}: dropped ${n} events that waited ${EVENT_MAX_AGE_MS / 86_400_000} days undelivered`);
     }
+  }
+
+  /**
+   * Give each row with no `queued_ms` the earliest time among the rows after it, else `now`. One pass from
+   * the newest row down with a running minimum, and one UPDATE per run of rows that take the same time:
+   * a backlog a previous release left (every row without a time, ahead of every row with one) is one
+   * UPDATE, where a subquery per row would be quadratic in the backlog.
+   */
+  private stampLegacyEvents(now: number): void {
+    if (!this.sql.exec("SELECT 1 FROM outbox WHERE queued_ms IS NULL LIMIT 1").toArray().length) return;
+    let earliest: number | null = null;
+    let run: { lo: number; hi: number; at: number } | null = null;
+    const flush = () => {
+      if (run) this.sql.exec("UPDATE outbox SET queued_ms = ? WHERE queued_ms IS NULL AND seq BETWEEN ? AND ?", run.at, run.lo, run.hi);
+      run = null;
+    };
+    for (const r of this.sql.exec<{ seq: number; queued_ms: number | null }>("SELECT seq, queued_ms FROM outbox ORDER BY seq DESC")) {
+      if (r.queued_ms !== null) {
+        // Rows before this one take this time if it is the earliest so far (a new run starts at the next such row).
+        if (earliest === null || r.queued_ms < earliest) earliest = r.queued_ms;
+        continue;
+      }
+      const at: number = earliest ?? now;
+      if (run && run.at === at) run.lo = r.seq;
+      else {
+        flush();
+        run = { lo: r.seq, hi: r.seq, at };
+      }
+    }
+    flush();
   }
 
   private backlog(): number {
