@@ -57,6 +57,15 @@ export interface OpenPr {
   fork: boolean;
   task: string | null;
 }
+/**
+ * `GET /api/repos`: the repos the owner may attach a project to (nest's grant lets the app push to and mint
+ * tokens for them), each with the project already on it; owner-wide entries nest couldn't list.
+ */
+export interface AttachableRepos {
+  repos: { repo: string; project: string | null }[];
+  unlisted: string[];
+  complete: boolean;
+}
 /** `POST /api/projects`. */
 export type CreatedProject = ProjectRow & { settings: Settings | null; catalog_synced: boolean };
 /** `GET /api/projects/<id>/tasks/<task>`. */

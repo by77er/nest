@@ -5,6 +5,7 @@
 
 import { directory, type Env, project, review } from "./env";
 import { githubFor, PERMISSIONS } from "./github";
+import { repoAttachable } from "./grant-repos";
 import { type Nest, NestError } from "./nest";
 import type { BindOutcome, GithubRepo, RepoBinding } from "./do/directory";
 
@@ -57,8 +58,8 @@ export type RenameOutcome = { applied: string } | { blocked: string } | null;
 export async function applyRename(env: Env, nest: Nest, b: RepoBinding): Promise<RenameOutcome> {
   const to = b.renamed_to;
   if (!to) return null;
-  const repos = ((await nest.self()).grant?.github?.repos ?? []).map((r) => r.toLowerCase());
-  if (!repos.includes(to)) return { blocked: `nest's grant for the app doesn't name ${to} yet: add it, then re-read` };
+  // nest decides whether its grant covers the new name (an owner-wide entry by the owner's id, too).
+  if (!(await repoAttachable(nest, to))) return { blocked: `nest's grant for the app doesn't cover ${to} yet: add it, then re-read` };
   const dir = directory(env);
   if (await dir.projectByName(to, b.project)) return { blocked: `${to} is another project's repo` };
   if (!(await dir.renameRepo(b.project, to))) return { blocked: "the rename changed while it was applied: re-read" };

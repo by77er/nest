@@ -79,7 +79,7 @@ The owner's decision (2026-11-10): guidance is layered, and each layer owns its 
 
 ## Flows
 
-- **Attaching a repo.** The owner picks a repo from those both in the grant and in the App's installation. The app then, in this order:
+- **Attaching a repo.** The owner picks a repo from those both in the grant and in the App's installation. The create form lists them (`GET /api/repos`, `src/grant-repos.ts`) from nest's answer (`GET /v1/clients/self/grant/repos`): the repos its grant lets the app push to and mint tokens for, owner-wide entries (`owner/*`) included, each confirmed by nest against the owner's GitHub id. The app never matches names itself. A repo already a project's is shown but can't be picked; an owner the App isn't installed on is named as not listed. A nest from before that route gives the grant's exact entries (in both `repos` and `github.repos`) instead; if the list can't be had at all, the name is typed. A rename is applied once nest says its grant covers the new name (`POST /v1/clients/self/grant/repos`). The app then, in this order:
   1. mints a token with `administration: write` and `metadata: read`, and reads the default branch;
   2. makes the check `nest-projects/review` required on it, with nothing else changed. A branch with no protection gets a minimal one: that check alone, `strict: false`, `enforce_admins: false`, no required reviews, no restrictions;
   3. only then starts the project's manager.

@@ -10,6 +10,7 @@ import { type AgentRecord, type Lookup, managerStatus } from "./manager";
 import { clientIdOf, NestError, nestFrom } from "./nest";
 import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSIDE, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
+import { attachableRepos } from "./grant-repos";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
 import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, PutSecret, Settings, Spec, UpdateRoutine, UpdateTask } from "./requests";
 import { PRESETS } from "./routines";
@@ -116,6 +117,20 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   // An agent's live trace, a WebSocket proxied to nest (src/trace.ts).
   if (parts[0] === "agents" && parts.length === 3 && parts[2] === "trace") return proxyTrace(req, env, parts[1]!, url);
   if (parts[0] === "agents" && parts.length === 4 && parts[2] === "trace" && parts[3] === "history") return proxyTraceHistory(req, env, parts[1]!, url);
+  // The repos the owner may attach a new project to (README.md#flows): nest's answer, each with the project
+  // already on it, if any.
+  if (parts.join("/") === "repos") {
+    if (m !== "GET") return err(405, "GET only");
+    const nest = nestFrom(env);
+    if (!nest) return err(503, "nest isn't configured");
+    try {
+      const r = await attachableRepos(nest);
+      const byRepo = new Map((await directory(env).projects()).map((p) => [p.repo.toLowerCase(), p.id]));
+      return json({ repos: r.repos.map((repo) => ({ repo, project: byRepo.get(repo) ?? null })), unlisted: r.unlisted, complete: r.complete });
+    } catch (e) {
+      return err(e instanceof NestError ? 502 : 500, `nest couldn't say which repos the app may attach: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   if (parts[0] !== "projects") return err(404, "unknown route");
   if (parts.length === 1) {
     // Each with `needs_you`: how many asks and blocked tasks wait on the owner (README.md#blocked).
