@@ -6,6 +6,7 @@
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-sending" (the owner's messages still being sent), "chat-long" (thirty messages), "chat-paged"
 // (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors), "manager-ended" (past its automatic restarts), "creating" (a project still being created), "models-custom" (a custom model id for the workers),
+// "board-many" (forty more tasks in every state, long titles), "board-empty" (a project with no tasks),
 // "chat-code" (a reply with every syntax token), "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
 // a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
@@ -53,6 +54,20 @@ export function data(variant = "demo", now = Date.now()) {
     t("Write the 0.5 changelog", "done", { pr: 112, issue: { number: 38, close: "failed", error: "nest 403: issues: write is outside the grant" } }),
     t("Drop the legacy XML export", "cancelled"),
   ];
+  // "board-many": a long board, every state several times over, long titles, workers and PRs.
+  if (variant === "board-many") {
+    const states = ["draft", "ready", "assigned", "in_progress", "in_review", "stalled", "done", "cancelled"];
+    const subjects = ["the tag index", "the CSV export", "thumbnail caching at the edge", "the auth library migration", "pagination with cursors", "the public API's rate limits", "dark skins", "search suggestions in the filter bar", "the changelog"];
+    for (let k = 0; k < 40; k++) {
+      const state = states[k % states.length];
+      const long = k % 3 === 0;
+      const title = `${["Rework", "Test", "Document", "Speed up", "Fix"][k % 5]} ${subjects[k % subjects.length]}${long ? ", including the migration for existing gadgets and a note in the API docs for integrators" : ""}`;
+      const working = ["assigned", "in_progress", "in_review", "stalled", "done"].includes(state);
+      tasks.push(t(title, state, { assignee: working ? `agt_w${(k * 7919).toString(36).slice(0, 4)}` : null, pr: ["in_review", "done"].includes(state) ? 200 + k : null, updated_ms: now - k * 3_600_000 * 5 }));
+      const last = tasks.at(-1);
+      if (last.pr) last.prs = [{ number: last.pr, state: state === "done" ? "merged" : "open", title, fork: false, attached_by: "app:branch", attached_ms: now - k * 60_000, auto_merge: null }];
+    }
+  }
   const byId = Object.fromEntries(tasks.map((x) => [x.id, x]));
   // Blocked flags, as "Needs you" lists them.
   const flag = (id, by, role, mins, reason, question) => (byId[id].blocked = { at_ms: now - mins * 60_000, by, role, reason, question, tainted: false });
@@ -436,7 +451,7 @@ const RICH = [
     if (listed) listed.needs_you = attention.length;
   }
   /** The answer to `GET|POST /api<path>?<search>`: [status, body]. */
-  const answer = (method, path, search = new URLSearchParams()) => {
+  const answer = (method, path, search = new URLSearchParams(), body = null) => {
     if (variant === "error") return [500, { error: "internal error (fixture)" }];
     if (path === "/projects") return [200, { projects }];
     if (path === "/admin/sync-state") return [200, sync];
@@ -467,7 +482,7 @@ const RICH = [
       const why = "downloads.gadgets.example.com isn't in this app's grant; the operator must add it";
       return [403, { error: why, problems: { "worker.downloads.gadgets.example.com": why } }];
     }
-    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/issues": issues, "/manager": variant === "manager-ended"
+    const routes = { "": demo, "/tasks": variant === "board-empty" ? [] : tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/issues": issues, "/manager": variant === "manager-ended"
       // Ended past its automatic restarts (README.md#the-manager-lifecycle): the owner's Restart.
       ? { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited), 4 times within an hour: restart it when you're ready." }
       : { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null },
@@ -475,6 +490,14 @@ const RICH = [
     if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
     if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];
     if (q in routes) return [200, routes[q]];
+    // A row moved on the board: its new order kept, so the next poll shows it where it was dropped.
+    if (method === "PATCH" && /^\/tasks\/[^/]+$/.test(q) && typeof body?.ord === "number") {
+      const moved = byId[q.split("/")[2]];
+      if (!moved) return [404, { error: "unknown task" }];
+      moved.ord = body.ord;
+      tasks.sort((a, b) => a.ord - b.ord);
+      return [200, moved];
+    }
     // A task's detail: each task's own, with its history (tsk_demo3 has no worker).
     if (q.startsWith("/tasks/")) {
       const d = detail(q.split("/")[2]);

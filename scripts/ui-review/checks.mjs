@@ -43,6 +43,8 @@ export function measure(sel) {
     const partlyOut = (r.left < -0.5 && r.right > 0) || (r.right > W + 0.5 && r.left < W);
     if (partlyOut && !inScroller(el, null)) problems.overflow.push(`<${el.tagName.toLowerCase()}> "${short(el.textContent)}" runs past the viewport (${Math.round(r.left)}..${Math.round(r.right)} of ${W})`);
     if (isControl(el) || !el.textContent?.trim()) continue;
+    // A deliberate one-line cut (a list row's title), its whole text its title: read in full on hover.
+    if (el.matches("[data-ds=truncate]") && el.getAttribute("title")?.trim() === el.textContent.trim()) continue;
     const cs = getComputedStyle(el);
     const cutsX = cs.overflowX === "hidden" || cs.overflowX === "clip" || cs.textOverflow === "ellipsis";
     const cutsY = cs.overflowY === "hidden" || cs.overflowY === "clip" || (cs.webkitLineClamp && cs.webkitLineClamp !== "none");

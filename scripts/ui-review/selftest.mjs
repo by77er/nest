@@ -50,6 +50,7 @@ const html = (bad = {}) => `<!doctype html><html><head><style>
     <div data-ds="panel"><p class="faint">Updated 2 min ago</p>
       <p><span style="color: transparent">⎿</span> a character kept for copy, drawn as something else: not read, so not checked</p>
       ${bad.clip ? '<p class="cut">A title far too long for its box</p>' : '<p class="cut">Short</p>'}
+      <p class="cut" data-ds="truncate" ${bad.cutUntitled ? "" : 'title="A row title cut on purpose, its full text its title"'}>A row title cut on purpose, its full text its title</p>
       ${bad.escape ? '<div style="width: 2000px">Wider than its panel</div>' : ""}
       <p><button class="chip ${bad.tap ? "reach" : ""}">Waiting</button> <button class="chip">Detach</button></p>
       <p class="prose">A sentence with <a href="#">an inline link</a> in it, on a 24 px line: the inline exception.</p>
@@ -100,6 +101,8 @@ assert.match(tight["hit-size"][0], /an inline link on a 16 px line/);
 for (const [bad, checks] of [
   [{ contrast: true }, ["contrast"]],
   [{ clip: true }, ["clipping"]],
+  // A deliberate cut must carry its whole text as its title; without it, it's clipping like any other.
+  [{ cutUntitled: true }, ["clipping"]],
   [{ escape: true }, ["clipping", "overflow"]],
   [{ measure: true }, ["measure"]],
   [{ h1: true }, ["frame"]],

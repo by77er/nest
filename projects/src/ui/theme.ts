@@ -150,9 +150,7 @@ export const layout = {
   logMaxBeside: "calc(100vh - 24rem)",
   /** A narrow side element's width (a tooltip's): under a third of a desktop page. */
   sidePanel: "20rem",
-  /** A board column's least width: from `md` on (all six beside the chat at 1280 px), and below. */
-  column: { min: "8.5rem", minNarrow: "16rem" },
-  /** A section heading row's height (a small button's), so heading rows line up; a column's. */
+  /** A section heading row's height (a small button's), so heading rows line up. */
   sectionHead: "2.25rem",
   denseHead: "1.75rem",
   /**
@@ -219,8 +217,6 @@ export const cssVariablesResolver: CSSVariablesResolver = () => {
       "--nest-log-max": layout.logMax,
       "--nest-log-max-beside": layout.logMaxBeside,
       "--nest-side-panel": layout.sidePanel,
-      "--nest-column-min": layout.column.min,
-      "--nest-column-min-narrow": layout.column.minNarrow,
       "--nest-section-head": layout.sectionHead,
       "--nest-dense-head": layout.denseHead,
       "--nest-sheet-wide": layout.sheetWide,

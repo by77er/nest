@@ -7,14 +7,6 @@ import { icon } from "../theme";
 import { type AnchorHTMLAttributes, forwardRef, type ReactNode, useLayoutEffect, useRef } from "react";
 import classes from "./Layouts.module.css";
 
-export function ColumnGrid({ children, columns }: { children: ReactNode; columns: number }) {
-  return (
-    <div className={classes.columns} data-ds="columns" data-columns={columns}>
-      {children}
-    </div>
-  );
-}
-
 /** Cards in a grid, `md` apart: one column on a phone, two from `sm`, three from `lg`. */
 export function CardGrid({ children }: { children: ReactNode }) {
   return (

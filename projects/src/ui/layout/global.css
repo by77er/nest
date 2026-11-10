@@ -52,7 +52,7 @@ body {
     min-height: calc(var(--nest-hit-touch) - 2px);
   }
 
-  :is(a[href], button.mantine-Anchor-root):not([data-inline], .mantine-Button-root, [data-ds="nav-row"], [data-ds="badge-anchor"], [data-ds="card-title"]),
+  :is(a[href], button.mantine-Anchor-root):not([data-inline], .mantine-Button-root, [data-ds="nav-row"], [data-ds="badge-anchor"], [data-ds="card-title"], [data-ds="row-title"]),
   button[data-ds="term-line"] {
     --nest-hit-pad: max(0px, calc((var(--nest-hit-touch) - 1lh) / 2));
     padding-block: var(--nest-hit-pad);
@@ -63,7 +63,7 @@ body {
 
   /* A short link (a PR's number) is the target's width too, the same way; one that wraps (a long repo
      name) is one box, not ragged line fragments. */
-  :is(a[href], button.mantine-Anchor-root):not([data-inline], .mantine-Button-root, [data-ds="nav-row"], [data-ds="badge-anchor"], [data-ds="card-title"]) {
+  :is(a[href], button.mantine-Anchor-root):not([data-inline], .mantine-Button-root, [data-ds="nav-row"], [data-ds="badge-anchor"], [data-ds="card-title"], [data-ds="row-title"]) {
     padding-inline: 0.625rem;
     margin-inline: -0.625rem;
     display: inline-block;

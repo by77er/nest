@@ -1,0 +1,298 @@
+/* The board as a list (TaskList.tsx). One frame: a hairline on the surface. No overflow of its own, so a
+   group's header can stick while its rows scroll by. */
+.list {
+  border: var(--nest-border);
+  border-radius: var(--mantine-radius-md);
+  background: var(--nest-surface);
+  min-width: 0;
+}
+
+.group + .group {
+  border-top: var(--nest-border);
+}
+
+/* A group's header: the subtle ground, sticky under the page's top (the phone's header bar, if any). */
+.head {
+  position: sticky;
+  top: var(--app-shell-header-offset, 0rem);
+  z-index: 3;
+  background: var(--nest-subtle);
+}
+
+.group:first-child .head {
+  border-radius: var(--mantine-radius-md) var(--mantine-radius-md) 0 0;
+}
+
+.group:last-child:not([data-open]) .head {
+  border-radius: 0 0 var(--mantine-radius-md) var(--mantine-radius-md);
+}
+
+.group:only-child:not([data-open]) .head {
+  border-radius: var(--mantine-radius-md);
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--mantine-spacing-sm);
+  width: 100%;
+  min-height: var(--nest-hit);
+  padding: 0 var(--mantine-spacing-md);
+  border-radius: inherit;
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  color: var(--mantine-color-text);
+}
+
+.toggle:hover {
+  background: var(--nest-border-color);
+}
+
+.chevron {
+  flex: 0 0 auto;
+  color: var(--nest-muted);
+  transition: transform var(--nest-motion-base) var(--nest-ease-enter);
+}
+
+.group[data-open] .chevron {
+  transform: rotate(90deg);
+}
+
+.title {
+  font-weight: 600;
+}
+
+.count {
+  color: var(--nest-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A row: one line of fixed columns from `sm` up, hairlines between rows, a subtle hover; the title
+   link's focus is drawn round the whole row. */
+.row {
+  --grip-col: var(--nest-hit);
+  position: relative;
+  display: grid;
+  grid-template-columns: var(--grip-col) 1rem minmax(0, 1fr);
+  grid-template-areas:
+    "grip glyph title"
+    "grip . meta";
+  column-gap: var(--mantine-spacing-sm);
+  row-gap: var(--mantine-spacing-2xs);
+  align-items: center;
+  padding: var(--mantine-spacing-xs) var(--mantine-spacing-md) var(--mantine-spacing-xs) var(--mantine-spacing-xs);
+  border-top: var(--nest-border);
+  background: var(--nest-surface);
+  font-size: var(--mantine-font-size-sm);
+  line-height: var(--mantine-line-height-sm);
+  transition: background-color var(--nest-motion-fast) var(--nest-ease-enter);
+}
+
+.group:last-child .row:last-child {
+  border-radius: 0 0 var(--mantine-radius-md) var(--mantine-radius-md);
+}
+
+.row:hover {
+  background: var(--nest-subtle);
+}
+
+.row:has(.rowTitle:focus-visible) {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: -2px;
+}
+
+.row[data-dragging] {
+  z-index: 4;
+  background: var(--nest-surface);
+  box-shadow: var(--mantine-shadow-raised);
+}
+
+.gripCell {
+  grid-area: grip;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  align-self: stretch;
+}
+
+.glyphCell {
+  grid-area: glyph;
+  display: inline-flex;
+}
+
+.titleCell {
+  grid-area: title;
+  min-width: 0;
+}
+
+/* The metadata: one wrapping line under the title on a phone; its own columns from `sm` up. */
+.meta {
+  grid-area: meta;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  column-gap: var(--mantine-spacing-md);
+  row-gap: var(--mantine-spacing-2xs);
+  min-width: 0;
+  font-size: var(--mantine-font-size-xs);
+  line-height: var(--mantine-line-height-xs);
+  color: var(--nest-muted);
+}
+
+.code,
+.who {
+  font-family: var(--mantine-font-family-monospace);
+}
+
+.markers {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--mantine-spacing-xs);
+}
+
+.markers:empty,
+.who:empty,
+.pr:empty {
+  display: none;
+}
+
+.updated {
+  font-variant-numeric: tabular-nums;
+}
+
+@media (min-width: 48em) {
+  .row {
+    grid-template-columns: var(--grip-col) 1rem 5.5rem minmax(0, 1fr) auto 8.5rem 5.5rem 6.5rem;
+    grid-template-areas: "grip glyph code title markers who pr updated";
+    column-gap: var(--mantine-spacing-md);
+    min-height: calc(var(--nest-hit) + var(--mantine-spacing-xs));
+  }
+
+  .meta {
+    display: contents;
+  }
+
+  .code {
+    grid-area: code;
+  }
+
+  .markers {
+    grid-area: markers;
+    flex-wrap: nowrap;
+  }
+
+  .markers:empty,
+  .who:empty,
+  .pr:empty {
+    display: block;
+  }
+
+  .who {
+    grid-area: who;
+    min-width: 0;
+  }
+
+  .pr {
+    grid-area: pr;
+  }
+
+  .updated {
+    grid-area: updated;
+    text-align: right;
+  }
+
+  /* One line: the title cut, its full text its title (the clipping check's `data-ds=truncate`). */
+  .rowTitleText {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .who > * {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+.rowTitle {
+  display: block;
+  min-width: 0;
+  color: var(--mantine-color-text);
+  font-weight: 500;
+  text-decoration: none;
+  outline: none;
+}
+
+.rowTitle:hover .rowTitleText {
+  text-decoration: underline;
+}
+
+/* The whole row opens the task. */
+.rowTitle::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+/* The row's own controls (the grip, a PR's link, a marker with details) sit above the row's link. */
+.row :is(a, button, [tabindex]):not(.rowTitle) {
+  position: relative;
+  z-index: 1;
+}
+
+.glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1rem;
+  height: 1rem;
+}
+
+/* A drag grip: quiet until the row is hovered or focused (always there on touch), a 32 px target. */
+.grip {
+  min-width: var(--nest-hit);
+  min-height: var(--nest-hit);
+  cursor: grab;
+  touch-action: none;
+  opacity: 0;
+  transition: opacity var(--nest-motion-fast) var(--nest-ease-enter);
+}
+
+.row:hover .grip,
+.row:focus-within .grip,
+.grip[data-dragging] {
+  opacity: 1;
+}
+
+.grip[data-dragging] {
+  cursor: grabbing;
+}
+
+@media (pointer: coarse) {
+  .grip {
+    opacity: 1;
+    min-width: var(--nest-hit-touch);
+    min-height: var(--nest-hit-touch);
+  }
+
+  .row {
+    --grip-col: var(--nest-hit-touch);
+  }
+
+  /* A PR's number in the metadata is a link in a line of text (the inline exception, on a 24 px line);
+     the drawer, a large target, lists the same PRs. */
+  .meta,
+  .pr :is(p, span, a) {
+    line-height: 1.5rem;
+  }
+}
+
+.empty {
+  padding: var(--mantine-spacing-sm) var(--mantine-spacing-md);
+  border-top: var(--nest-border);
+  font-size: var(--mantine-font-size-xs);
+  color: var(--nest-muted);
+}

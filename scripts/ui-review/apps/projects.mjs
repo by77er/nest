@@ -168,15 +168,37 @@ async function editorCheck(page, { width }) {
   return problems;
 }
 
-/** At 1280 px and up, the board's six columns fit beside the sidebar without scrolling. */
-async function sixColumns(page, { width }) {
-  if (width < 1280) return [];
+/**
+ * The board's list (README.md#the-board): it never scrolls sideways, and from `sm` up every row is one
+ * line (its title cut, not wrapped), its columns lined up with the rows above it.
+ */
+async function boardList(page, { width }) {
   const r = await page.evaluate(() => {
-    const grid = document.querySelector("[data-ds=columns]");
-    return grid && { columns: grid.children.length, scrolls: grid.scrollWidth > grid.clientWidth + 1 };
+    const list = document.querySelector("[data-ds=task-list]");
+    if (!list) return null;
+    const rows = [...list.querySelectorAll("[data-ds=task-row]")];
+    const heights = rows.map((row) => Math.round(row.getBoundingClientRect().height));
+    const left = (sel) => [...new Set(rows.map((row) => row.querySelector(sel)).filter(Boolean).map((e) => Math.round(e.getBoundingClientRect().left)))];
+    return { scrolls: list.scrollWidth > list.clientWidth + 1, rows: rows.length, tallest: Math.max(0, ...heights), titles: left("[data-ds=row-title]"), times: [...new Set(rows.map((row) => Math.round(row.querySelector("time")?.getBoundingClientRect().right ?? 0)))],
+      // A cell's text on more than one line (a date and time wrapping in its column, a title not cut).
+      wrapped: rows.flatMap((row) => [...row.querySelectorAll("time, [data-ds=row-title]")].filter((e) => e.getBoundingClientRect().height > 24).map((e) => e.textContent.trim().slice(0, 40))) };
   });
-  if (!r) return ["no board columns"];
-  return r.columns !== 6 || r.scrolls ? [`the board shows ${r.columns} columns${r.scrolls ? " and scrolls sideways" : ""}, not six that fit`] : [];
+  if (!r) return ["no board list"];
+  const out = [];
+  if (r.scrolls) out.push("the board's list scrolls sideways");
+  if (width >= 768) {
+    if (r.tallest > 44) out.push(`a row is ${r.tallest} px tall: more than one line`);
+    if (r.titles.length > 1) out.push(`the rows' titles start at ${r.titles.length} different edges`);
+    if (r.times.length > 1) out.push(`the rows' times end at ${r.times.length} different edges`);
+    for (const w of r.wrapped.slice(0, 3)) out.push(`"${w}" takes more than one line in its row`);
+  }
+  return out;
+}
+
+/** A row moved by keyboard (space, arrow down, space) lands one place down in its group. */
+async function keyboardMoved(page) {
+  const names = await page.evaluate(() => [...(document.querySelectorAll("[data-ds=task-group]")[1]?.querySelectorAll("[data-ds=task-row]") ?? [])].map((r) => r.getAttribute("aria-label")));
+  return names[0] === "Export gadgets as CSV" && names[1] === "Cache gadget thumbnails" ? [] : [`the Ready group reads ${JSON.stringify(names)} after a keyboard move, not the moved order`];
 }
 
 // --- the chat's scrolling (the design review of #128): reading back holds your line, following holds the
@@ -620,7 +642,13 @@ const app = {
         const p = history[url.searchParams.get("before") ?? ""];
         return route.fulfill({ status: p ? 200 : 400, contentType: "application/json", body: JSON.stringify(p ?? { error: "unknown cursor" }) });
       }
-      const [status, body] = answer(route.request().method(), url.pathname.replace(/^\/api/, ""), url.searchParams);
+      let sent = null;
+      try {
+        sent = route.request().postDataJSON();
+      } catch {
+        // No body, or not JSON.
+      }
+      const [status, body] = answer(route.request().method(), url.pathname.replace(/^\/api/, ""), url.searchParams, sent);
       return route.fulfill({ status, contentType: "application/json", body: JSON.stringify(body) });
     });
   },
@@ -650,7 +678,13 @@ const app = {
       await p.getByRole("button", { name: "Re-read Widgets's repo from GitHub" }).click();
       await p.getByRole("button", { name: /^Bind Widgets to / }).click();
     } },
-    { name: "board", section: "project", path: "/projects/prj_demo/board", check: sixColumns, checkName: "board-columns" },
+    { name: "board", section: "project", path: "/projects/prj_demo/board", check: boardList, checkName: "board-list" },
+    { name: "board-many", section: "project", path: "/projects/prj_demo/board", fixture: "board-many", check: boardList, checkName: "board-list", after: (p) => p.getByRole("switch", { name: "Show cancelled" }).click() },
+    { name: "board-empty", section: "project", path: "/projects/prj_demo/board", fixture: "board-empty" },
+    { name: "board-collapsed", section: "project", path: "/projects/prj_demo/board", full: false, after: async (p) => { await p.getByRole("button", { name: /^Draft/ }).click(); await p.getByRole("button", { name: /^Done/ }).click(); } },
+    // Dragging by keyboard: picked up (the row lifted; a desktop's keys), then moved one down and dropped (the new order).
+    { name: "board-dragging", section: "project", path: "/projects/prj_demo/board", full: false, widths: DESKTOP, after: async (p) => { const g = p.getByRole("button", { name: "Move Cache gadget thumbnails" }); await g.scrollIntoViewIfNeeded(); await g.focus(); await p.keyboard.press("Space"); await p.waitForTimeout(150); await p.keyboard.press("ArrowDown"); await p.waitForTimeout(300); } },
+    { name: "board-keyboard-move", section: "project", path: "/projects/prj_demo/board", full: false, after: async (p) => { const g = p.getByRole("button", { name: "Move Cache gadget thumbnails" }); await g.scrollIntoViewIfNeeded(); await g.focus(); await p.keyboard.press("Space"); await p.waitForTimeout(150); await p.keyboard.press("ArrowDown"); await p.waitForTimeout(300); await p.keyboard.press("Space"); await p.waitForTimeout(400); }, check: keyboardMoved, checkName: "board-list" },
     { name: "board-long", section: "project", path: "/projects/prj_demo/board", fixture: "long" },
     { name: "board-needs-you-all", section: "project", path: "/projects/prj_demo/board", after: (p) => p.getByRole("button", { name: /Show all/ }).click() },
     // The task drawer: details and the worker's trace (history and live), side by side from `xl`, tabs below.
