@@ -344,6 +344,11 @@ export class FakeNest {
         return json(200, { delivered: true });
       }
     }
+    if (req.method === "DELETE" && (m = u.pathname.match(/^\/v1\/catalog\/(templates|capabilities)\/([a-z][a-z0-9-]+)\/([a-z][a-z0-9-]*)$/))) {
+      if (m[2] !== "projects") return nestErr(403, "forbidden", `${m[2]} is not your namespace (projects)`);
+      this.catalog.delete(`${m[1]}/${m[2]}/${m[3]}`);
+      return json(200, { ok: true });
+    }
     if (req.method === "PUT" && (m = u.pathname.match(/^\/v1\/catalog\/(templates|capabilities)\/([a-z][a-z0-9-]+)\/([a-z][a-z0-9-]*)$/))) {
       if (m[2] !== "projects") return nestErr(403, "forbidden", `${m[2]} is not your namespace (projects)`);
       this.catalog.set(`${m[1]}/${m[2]}/${m[3]}`, call.body);

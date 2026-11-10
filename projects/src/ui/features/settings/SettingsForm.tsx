@@ -16,11 +16,55 @@ import type { Settings } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
 import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
+import { MODELS, modelProblem } from "../../../models";
+import { useState } from "react";
+
+const CUSTOM = "custom";
+
+/**
+ * A role's model (README.md#models): one of the listed ones, or "Custom" and the id typed. A value that
+ * isn't listed shows as Custom with its id.
+ */
+export function ModelField({ label, description, value, onChange, error }: { label: string; description: string; value: string; onChange: (v: string) => void; error?: React.ReactNode }) {
+  const listed = MODELS.some((m) => m.id === value);
+  const [custom, setCustom] = useState(!listed);
+  const problem = custom ? modelProblem(value) : null;
+  return (
+    <FieldGroup>
+      <Select
+        label={label}
+        description={description}
+        data={[...MODELS.map((m) => ({ value: m.id, label: m.label })), { value: CUSTOM, label: "Custom…" }]}
+        allowDeselect={false}
+        value={custom ? CUSTOM : value}
+        onChange={(v) => {
+          if (v === null) return;
+          setCustom(v === CUSTOM);
+          if (v !== CUSTOM) onChange(v);
+        }}
+        error={custom ? undefined : error}
+      />
+      {custom && (
+        <TextInput
+          label="Model id"
+          aria-label={`${label}: model id`}
+          description="An id or alias Claude Code's --model takes, such as claude-opus-5-5."
+          // The id in the mono face (an identifier, read character by character); its label and help stay as they are.
+          styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
+          value={value}
+          onChange={(e) => onChange(e.currentTarget.value.trim())}
+          error={value && problem ? `A model id is ${problem}` : error}
+        />
+      )}
+    </FieldGroup>
+  );
+}
 
 const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", merge: "Merge commit", rebase: "Rebase and merge" };
 
 const values = (s: Settings) => ({
   auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method, workers_edit_workflows: s.workers_edit_workflows,
+  manager_model: s.manager_model, worker_model: s.worker_model,
   comments_from_login: s.comments_from?.login ?? null,
   // "Use the repo owner": the server takes the repo's owner by id, never this login.
   comments_from_repo_owner: false,
@@ -73,6 +117,29 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                   clampBehavior="strict"
                   {...form.getInputProps("max_workers")}
                 />
+              </FieldGroup>
+            </Section>
+          </Panel>
+          <Panel>
+            <Section title="Models" order={4} region={false}>
+              <FieldGroup>
+                <ModelField
+                  label="Manager's model"
+                  description="A change applies the next time the manager starts (Restart manager, on its page)."
+                  value={form.getValues().manager_model}
+                  onChange={(v) => form.setFieldValue("manager_model", v)}
+                  error={form.errors.manager_model}
+                />
+                <ModelField
+                  label="Workers' model"
+                  description="A change applies to workers started from now on; running ones keep theirs."
+                  value={form.getValues().worker_model}
+                  onChange={(v) => form.setFieldValue("worker_model", v)}
+                  error={form.errors.worker_model}
+                />
+                <Text fz="sm" c="dimmed">
+                  Reviewers and routine runs keep nest&apos;s default model.
+                </Text>
               </FieldGroup>
             </Section>
           </Panel>

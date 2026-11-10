@@ -7,7 +7,8 @@
 // re-read the row before acting on an answer, since other requests run while one awaits nest.
 
 import { DurableObject } from "cloudflare:workers";
-import { TEMPLATE } from "../catalog";
+import { roleTemplate, TEMPLATE } from "../catalog";
+import { DEFAULT_MODEL, type ModelRole, modelProblem } from "../models";
 import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, DIMENSIONS, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
@@ -51,6 +52,9 @@ export interface Settings {
   repo_auto_merge: RepoAutoMerge;
   /** Whether workers' push tokens may change `.github/workflows/` (README.md#secrets); off by default. */
   workers_edit_workflows: boolean;
+  /** The models the manager and the workers run on (README.md#models): a change applies to the next start. */
+  manager_model: string;
+  worker_model: string;
   /**
    * The GitHub user whose PR comments reach workers (README.md#pr-comments), by id (immutable): the
    * repo's owner when it's a user, recorded at attach; an org's repo needs it set. Null: nobody's do.
@@ -501,6 +505,15 @@ export const MIGRATIONS = [
     // nothing is drained; a project removed before it was ready leaves this object inert.
     "ALTER TABLE settings ADD COLUMN listed_ms INTEGER",
   ],
+  [
+    // The models the manager and the workers run on (README.md#models); null: the default for the role.
+    "ALTER TABLE settings ADD COLUMN manager_model TEXT",
+    "ALTER TABLE settings ADD COLUMN worker_model TEXT",
+    // The model templates this project wrote to nest's catalog, and the agent each live agent started
+    // from: one no start uses any more is deleted there (`sweepModelTemplates`).
+    "CREATE TABLE model_templates (name TEXT PRIMARY KEY, role TEXT NOT NULL, model TEXT NOT NULL, at_ms INTEGER NOT NULL)",
+    "CREATE TABLE agent_templates (agent TEXT PRIMARY KEY, name TEXT NOT NULL)",
+  ],
 ] as const;
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
@@ -586,6 +599,7 @@ export class ProjectDO extends DurableObject<Env> {
       attached: r.attached_ms !== null, attach_error: (r.attach_error as string | null) ?? null,
       attach: r.attach_detail ? (JSON.parse(r.attach_detail as string) as AttachDetail) : null,
       auto_merge: r.auto_merge === 1, merge_method: r.merge_method as MergeMethod, workers_edit_workflows: r.workers_edit_workflows === 1,
+      manager_model: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, worker_model: (r.worker_model as string | null) ?? DEFAULT_MODEL.worker,
       comments_from: r.comments_from_id === null || r.comments_from_id === undefined ? null : { id: r.comments_from_id as number, login: (r.comments_from_login as string | null) ?? null },
       repo_owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: r.repo_owner_login as string },
       repo_auto_merge: repoAutoMerge({
@@ -605,9 +619,15 @@ export class ProjectDO extends DurableObject<Env> {
   async updateSettings(u: {
     auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean;
     comments_from_id?: number | null; comments_from_login?: string | null; comments_from_repo_owner?: boolean; max_routine_runs?: number;
+    manager_model?: string; worker_model?: string;
   }): Promise<Result<Settings>> {
     const before = this.settings();
     if (!before) return fail(404, "unknown project");
+    // The models (README.md#models): checked before anything is written; the next start of each role uses them.
+    for (const m of [u.manager_model, u.worker_model]) {
+      const bad = m === undefined ? null : modelProblem(m);
+      if (bad) return fail(400, `a model is ${bad}`);
+    }
     // Whose PR comments count (README.md#pr-comments): a login is looked up on GitHub and kept as its id.
     let who: { id: number; login: string | null } | null | undefined = u.comments_from_id === undefined ? undefined : u.comments_from_id === null ? null : { id: u.comments_from_id, login: null };
     if (u.comments_from_repo_owner) {
@@ -645,6 +665,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (u.auto_assign !== undefined) this.sql.exec("UPDATE settings SET auto_assign = ?", u.auto_assign ? 1 : 0);
     if (u.max_workers !== undefined) this.sql.exec("UPDATE settings SET max_workers = ?", clampWorkers(u.max_workers));
     if (u.merge_method !== undefined) this.sql.exec("UPDATE settings SET merge_method = ?", u.merge_method);
+    if (u.manager_model !== undefined) this.sql.exec("UPDATE settings SET manager_model = ?", u.manager_model);
+    if (u.worker_model !== undefined) this.sql.exec("UPDATE settings SET worker_model = ?", u.worker_model);
     if (u.workers_edit_workflows !== undefined) this.sql.exec("UPDATE settings SET workers_edit_workflows = ?", u.workers_edit_workflows ? 1 : 0);
     if (u.max_routine_runs !== undefined) {
       this.sql.exec("UPDATE settings SET routine_cap = ?", u.max_routine_runs);
@@ -1667,11 +1689,63 @@ export class ProjectDO extends DurableObject<Env> {
         ...(inject.length ? { inject, env } : {}),
         ...(role === "worker" && s.workers_edit_workflows ? { github_push: { workflows: true } } : {}),
       };
-      frozen = { extras, names: mine.map((m) => m.name), brief: secretsBrief(mine), rev: this.rules().rev };
+      // The role's model as the settings have it now (README.md#models): frozen with the attempt, so its
+      // retries name the same template, whatever the settings say by then.
+      const model = role === "manager" ? s.manager_model : role === "worker" ? s.worker_model : undefined;
+      frozen = { extras, names: mine.map((m) => m.name), brief: secretsBrief(mine), rev: this.rules().rev, ...(model ? { model } : {}) };
       this.sql.exec("INSERT INTO start_specs (key, spec, at_ms) VALUES (?, ?, ?)", key, JSON.stringify(frozen), Date.now());
       this.sql.exec("DELETE FROM start_specs WHERE at_ms < ?", Date.now() - 7 * 24 * 3600 * 1000);
     }
     return frozen;
+  }
+
+  /**
+   * The template a manager or worker starts from (README.md#models): the project's own for the role on
+   * the model its start froze, written to the app's catalog here (the same body every time, so writing
+   * it again changes nothing). A client's spawn can't override a template's launch, so the model is the
+   * template's. A start frozen before models were chosen keeps the role's shared template.
+   */
+  private async templateFor(nest: Nest, role: ModelRole, spec: StartSpec): Promise<string> {
+    if (!spec.model) return TEMPLATE[role];
+    const s = this.settings()!;
+    const t = roleTemplate(role, s.id, s.repo, spec.model);
+    // Recorded before it's written: one written and never recorded would be left in nest for good.
+    this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = excluded.at_ms", t.name, role, spec.model, Date.now());
+    await nest.putCatalog("templates", t.name, t.body);
+    return t.name;
+  }
+
+  /**
+   * Delete from nest's catalog each model template of this project's that no start uses any more
+   * (README.md#models): not the role's current setting, and not the one a live agent started from (nest
+   * may read an agent's template again; unverified, so it's kept while that agent lives). Nothing is
+   * swept while a start is owed (it may be about to name one). `all`: every one (the project is gone).
+   * One nest can't delete now stays recorded, for the next sweep.
+   */
+  private async sweepModelTemplates(nest: Nest, all = false): Promise<void> {
+    const rows = this.sql.exec<{ name: string; role: string; model: string }>("SELECT name, role, model FROM model_templates").toArray();
+    if (!rows.length) return;
+    const s = this.settings();
+    let keep = new Set<string>();
+    if (!all && s) {
+      const owed = this.settingsRow()!.manager_next_ms !== null || this.sql.exec("SELECT 1 FROM tasks WHERE state = 'assigned' LIMIT 1").toArray().length > 0;
+      if (owed) return;
+      const live = new Set(this.liveAgents().map((a) => a.agent));
+      for (const a of this.sql.exec<{ agent: string; name: string }>("SELECT agent, name FROM agent_templates").toArray()) {
+        if (live.has(a.agent)) keep.add(a.name);
+        else this.sql.exec("DELETE FROM agent_templates WHERE agent = ?", a.agent);
+      }
+      keep = new Set([...keep, ...rows.filter((r) => r.model === (r.role === "manager" ? s.manager_model : s.worker_model)).map((r) => r.name)]);
+    }
+    for (const r of rows) {
+      if (keep.has(r.name)) continue;
+      try {
+        await nest.deleteCatalog("templates", r.name);
+        this.sql.exec("DELETE FROM model_templates WHERE name = ?", r.name);
+      } catch (e) {
+        console.error(`model template ${r.name} wasn't deleted (the next sweep retries): ${message(e)}`);
+      }
+    }
   }
 
   /** A start attempt's spec as first frozen, if it was. */
@@ -1969,8 +2043,11 @@ export class ProjectDO extends DurableObject<Env> {
         }
         break;
       case "agent.exited":
-        // Ended, whatever its role: a stop owed for it (failed or not, a routine run's or a manager's) is done.
-        this.sql.exec("DELETE FROM stops WHERE agent = ?", e.agent);
+        // Ended, whatever its role: a stop owed for it (failed or not, a routine run's or a worker's) is done.
+        // Not a replaced manager's: that stop also destroys its sandbox, which an agent's own exit leaves
+        // up, so it stays owed (a failed one is owed again) until the sandbox is gone.
+        this.sql.exec("DELETE FROM stops WHERE agent = ? AND reason != 'manager replaced'", e.agent);
+        this.sql.exec("UPDATE stops SET failed_ms = NULL, next_ms = ?, attempts = 0, error = NULL WHERE agent = ? AND reason = 'manager replaced'", Date.now(), e.agent);
         if (route.role === "manager" && s.manager === e.agent) {
           this.sql.exec("INSERT OR IGNORE INTO chat (at_ms, sender, text, event_id) VALUES (?, 'app', ?, ?)", Date.now(), `The manager ended (${e.reason ?? "exited"}).`, e.id);
           // A new one starts, up to a few times an hour (README.md#the-manager-lifecycle); the ended one's
@@ -3194,6 +3271,9 @@ export class ProjectDO extends DurableObject<Env> {
     if (this.settingsRow()) {
       const listed = await this.listed();
       if (listed === "gone") {
+        // Its model templates go from nest's catalog with it (README.md#models).
+        const nest = nestFrom(this.env);
+        if (nest) await this.sweepModelTemplates(nest, true);
         this.sql.exec("DELETE FROM settings");
         return;
       }
@@ -3292,6 +3372,8 @@ export class ProjectDO extends DurableObject<Env> {
     // Ended rows past their queue's keep (README.md#outboxes): messages sent or failed a week ago (a failed stop is kept until resolved).
     const msgs = pruneBefore(OUTBOX.messages, now);
     if (msgs !== null) this.sql.exec("DELETE FROM messages WHERE next_ms IS NULL AND COALESCE(ended_ms, at_ms) < ?", msgs);
+    // Model templates no start uses any more go from nest's catalog (README.md#models).
+    await this.sweepModelTemplates(nest);
     // A comment's key outlives any redelivery GitHub makes of it.
     this.sql.exec("DELETE FROM comments_seen WHERE at_ms < ?", now - COMMENTS_SEEN_KEEP_MS);
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
@@ -3468,7 +3550,9 @@ export class ProjectDO extends DurableObject<Env> {
       const frozen = await this.frozenEgress(nest, key, "manager");
       // Its bindings, env and workflows, frozen with the same key (README.md#secrets).
       const spec = await this.sandboxSpec(nest, "manager", key);
-      const agent = s.manager ?? (await nest.startAgent(TEMPLATE.manager, labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
+      const from = s.manager ? null : await this.templateFor(nest, "manager", spec);
+      const agent = s.manager ?? (await nest.startAgent(from!, labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
+      if (from) this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       if (!current()) {
         // Superseded while it was being made: it goes, unless it's somehow the manager now.
@@ -3517,7 +3601,9 @@ export class ProjectDO extends DurableObject<Env> {
         const key = `${s.id}/${id}/${n}`;
         const frozen = await this.frozenEgress(nest, key, "worker");
         const spec = await this.sandboxSpec(nest, "worker", key);
-        agent = await nest.startAgent(TEMPLATE.worker, labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
+        const from = await this.templateFor(nest, "worker", spec);
+        agent = await nest.startAgent(from, labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
+        this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
         await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
         if (!current()) {
           // Cancelled (or reassigned, or abandoned) while it was being made: it goes, with no layer or holdings kept for it.
@@ -3886,6 +3972,8 @@ export interface StartSpec {
   names: string[];
   brief: string;
   rev: number;
+  /** The model the manager or worker starts on (README.md#models). Absent: frozen before models were chosen (the role's shared template then). */
+  model?: string;
 }
 
 /** A live agent's client layer, as the Network page shows it. */

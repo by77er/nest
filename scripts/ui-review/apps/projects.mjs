@@ -839,6 +839,9 @@ const app = {
     { name: "triage-decline", section: "project", path: "/projects/prj_demo/triage", full: false, after: (p) => p.getByRole("button", { name: "Decline issue #44" }).click() },
     { name: "settings", section: "project", path: "/projects/prj_demo/settings", checkName: "workflows", check: (p) => p.evaluate(workflowsAgree) },
     { name: "settings-comments-set", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-set" },
+    // The models (README.md#models): a custom id shown with its field; the list open.
+    { name: "settings-models-custom", section: "project", path: "/projects/prj_demo/settings", fixture: "models-custom" },
+    { name: "settings-models-open", section: "project", path: "/projects/prj_demo/settings", full: false, after: async (p) => { const f = p.getByLabel("Manager's model").first(); await f.scrollIntoViewIfNeeded(); await f.click(); } },
     { name: "settings-comments-id-only", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-id-only" },
     { name: "switcher-open", section: "project", path: "/projects/prj_demo/reviews", full: false, widths: DESKTOP, after: async (p) => { await p.getByRole("button", { name: /Switch project/ }).click(); await p.keyboard.type("gad"); } },
     { name: "sidebar-drawer", section: "project", path: "/projects/prj_demo/board", full: false, widths: PHONE, after: menu },
