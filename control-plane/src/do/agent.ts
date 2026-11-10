@@ -840,9 +840,10 @@ export class AgentDO extends DurableObject<Env> {
           await this.hook("intent:beforeCommit");
           if (!this.unchanged(snap)) continue;
           if (decided === "condemn") {
-            // The brain is condemned for a start that follows it: one that can't be issued (below) leaves
-            // it running, and the restart or move is refused with why.
-            this.requireLaunch(snap);
+            // Condemned only because a restart was asked for: a start that can't be issued (below) leaves
+            // the brain running, and the restart is refused with why. A move or an unhealthy host condemns
+            // it all the same (a brain is never pinned to a host it must leave); its start then fails.
+            if (intent.reason === "restart" && liveBrainStart({ ...intent, reason: "operator" }, brain, healthy) !== "condemn") this.requireLaunch(snap);
             await this.condemn(intent.reason === "restart" ? "restarting" : `starting on ${intent.host_hint ?? "another host"}`, brain.epoch);
           } else if (decided === "drop") {
             this.update((i) => Object.assign(i, NO_INTENT));

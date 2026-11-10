@@ -243,6 +243,49 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     await ws.next("run_turn", (m) => m.turn === t);
   });
 
+  /** The condemned brain's exit, then the start that follows it: refused for the launch, so the agent is `errored` with why. */
+  const exitsThenErrored = async (s: Awaited<ReturnType<typeof setup>>) => {
+    const [kill] = await nextCommands(s.host.ws, isKillOf(s.agent));
+    expect(kill).toMatchObject({ epoch: 1 });
+    expect((await agentStub(s.agent).info()).brain).toMatchObject({ phase: "condemned" });
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped", epoch: 1 }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    const after: any = await eventually("the start's refusal on the record", async () => {
+      if ((await agentStub(s.agent).info()).intent) await runDeadline(s.agent, "intent");
+      const v = await adminJson(`/v1/agents/${s.agent}`);
+      return v.start_error ? v : null;
+    });
+    expect(after.start_error.message).toContain("launch.model");
+    expect(after.state).toBe("errored");
+    expect((await agentStub(s.agent).info()).brain ?? null).toBeNull();
+  };
+
+  it("a brain on a draining host is condemned even if no start can follow it: the agent ends errored with why, never pinned to the host", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    const b = await connectHost(s.cell, "brain");
+    await editAgent(s.agent, (i) => {
+      i.launch.model = "-p";
+    });
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "spot_notice", deadline_ms: Date.now() + 120_000 }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    await exitsThenErrored(s);
+    expect(await b.ws.none("commands", 150, (m) => (m.commands as any[]).some(isStartOf(s.agent)))).toBe(true);
+  });
+
+  it("a restart on a host that's no longer healthy condemns the brain all the same, and the start that follows is refused", async () => {
+    const s = await setup();
+    await okResult(s.host.ws, s.start.cmd);
+    await editAgent(s.agent, (i) => {
+      i.launch.model = "-p";
+    });
+    await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(s.cell)), (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET status = 'draining' WHERE host = ?", s.host.host);
+    });
+    expect(await adminJson(`/v1/agents/${s.agent}/start`, { body: { restart: true } })).toMatchObject({ kind: "waiting", waiting_for: s.host.host });
+    await exitsThenErrored(s);
+  });
+
   it("old stored state (main): hands.epoch becomes the agent epoch, and `host` the brain record", async () => {
     const s = await setup();
     // As stored before the agent epoch: the worker's session epoch was the sandbox epoch in `hands`,
