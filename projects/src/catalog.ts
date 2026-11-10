@@ -4,6 +4,7 @@
 // and written here, never imported. A sync writes every entry whole, so running it twice leaves nest
 // as one run did.
 
+import { DEFAULT_MODEL, type ModelRole, modelTemplateEntry } from "./models";
 import type { Nest } from "./nest";
 import { DREAMING_ROLE_PROMPT, ROUTINE_PROMPT } from "./routines";
 import { SERVERS, type Server, TOOLS } from "./tools";
@@ -89,18 +90,30 @@ function mcpCapability(base: string, server: Server, prompt: string) {
  * (`repos`, the worker's) or only `read` (`read_repos`: the manager and the reviewer, which nest refuses
  * to push). Each spawn narrows it to its own project's (`overrides.repos` or `overrides.read_repos`).
  */
-const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read", subagents = false, timers = false, ephemeral = false) => ({
+const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read", subagents = false, timers = false, ephemeral = false, model?: string) => ({
   // `nest` allows the nest tools without a prompt and `hands` gives the sandbox's tools: the operator's
   // capabilities, which a client's templates may name. `timers` (nest's timer_set, timer_cancel and
   // timer_list) is the manager's only: workers have nothing to wait for that their task doesn't bring.
   capabilities: ["nest", "hands", ...(subagents ? WORKER_EXTRA.capabilities : []), ...(timers ? ["timers"] : []), `${NAMESPACE}/${capability}`],
-  launch: { builtin_tools: [...BUILTIN_TOOLS, ...(subagents ? WORKER_EXTRA.builtin_tools : [])], system_prompt: { mode: "append", text: prompt } },
+  // `model` becomes Claude Code's `--model` (README.md#models); without one, nest's and Claude Code's default.
+  launch: { ...(model ? { model } : {}), builtin_tools: [...BUILTIN_TOOLS, ...(subagents ? WORKER_EXTRA.builtin_tools : [])], system_prompt: { mode: "append", text: prompt } },
   hands: "required",
   credential: CREDENTIAL,
   ...(repos.length ? { [access === "push" ? "repos" : "read_repos"]: [...repos] } : {}),
   // A routine run ends itself once its turn is done (nest's ephemeral agents, docs/agents/#lifetimes).
   ...(ephemeral ? { ephemeral: true } : {}),
 });
+
+/**
+ * A project's own template for its manager or its workers on `model` (README.md#models): the role's
+ * template, reaching only that project's repo, with `launch.model`. Its name is `modelTemplateEntry`'s.
+ */
+export function roleTemplate(role: ModelRole, project: string, repo: string, model: string): { name: string; body: unknown } {
+  const body = role === "manager"
+    ? template("board", PROMPTS.manager, [repo.toLowerCase()], "read", false, true, false, model)
+    : template("task", PROMPTS.worker, [repo.toLowerCase()], "push", true, false, false, model);
+  return { name: `${NAMESPACE}/${modelTemplateEntry(role, project, model)}`, body };
+}
 
 export interface CatalogEntries {
   capabilities: Record<string, unknown>;
@@ -118,8 +131,11 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
       [`${NAMESPACE}/routine`]: mcpCapability(base, "routine", "The projects-routine tools read the project's board and recent work, propose tasks, and keep its memory."),
     },
     templates: {
-      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read", false, true),
-      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push", true),
+      // The manager's and the worker's on the default models (README.md#models). A project's own starts use
+      // its own entries (`roleTemplate`), on the models its settings name; these stay for a start frozen
+      // before those existed.
+      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read", false, true, false, DEFAULT_MODEL.manager),
+      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push", true, false, false, DEFAULT_MODEL.worker),
       // Ephemeral: a reviewer ends itself once its turn is done, verdict or not (its job's deadline covers one that doesn't).
       [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, sorted, "read", false, false, true),
       // Reads only, like the manager and reviewers (`read_repos`): a routine never pushes.

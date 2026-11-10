@@ -195,6 +195,7 @@ The owner's request (2026-11-06), after the state-machine sweep (B11): a manager
   - its sandbox is destroyed: a stop is owed (`manager replaced`), which ends the agent and then destroys its sandbox through the sandbox API, since stopping an agent that already ended destroys nothing. Its successor starts only once that stop has been tried. With nest refusing it for good, the successor starts anyway (the stop is failed, shown on the Network page);
   - its pending waits end, unannounced, since the new one never made them;
   - the next start gets a start number of its own, so its creates' keys aren't the old one's;
+  - if it exits by itself while that stop is still owed (or failed), the stop stays owed until its sandbox is gone;
   - **it loses its voice:** only the current manager's turns are recorded as the manager's chat, and an ask from a manager that isn't current is labelled "The previous manager" in "Needs you" (its question shown as plain text);
   - **it loses the board:** the board's tools answer only `settings.manager`. A replaced manager still holds its token and labels for a while (its stop owed, or refused), and gets 403.
 - **A start is of one generation.** `manager_starts` as read when it began. Every move bumps it (an exit, the owner's Restart), so a start that lands after one is stale:
@@ -204,6 +205,29 @@ The owner's request (2026-11-06), after the state-machine sweep (B11): a manager
 - **The owner's Restart** (`POST /api/projects/:id/manager/restart`; **Restart manager** on the page when it ended or errored) stops the current manager and starts a new one now. Asking while one is already starting changes nothing.
 - **Chat during a restart.** The owner's chat messages wait for a manager ("Retrying…"), and go as soon as one has started. Each change is noted in the chat. While the manager has ended or errored, the composer offers no Stop; on a phone, where the page's notice scrolls away, it also says so ("The manager isn't running", with Restart manager).
 - An exit of a manager that isn't the current one changes nothing.
+
+## Models
+
+The owner's request (2026-11-09): "allow me to select the model for the manager and the workers. Default manager = Fable 5.2, worker = Opus 5.5."
+
+- **Two settings per project,** `manager_model` and `worker_model` (`PATCH /api/projects/:id/settings`; the Models panel in Settings).
+  - **Defaults:** the manager on `claude-fable-5-2`, workers on `claude-opus-5-5` (`DEFAULT_MODEL` in `src/models.ts`). A project made before this reads as the defaults.
+  - **Offered by name:** Fable 5.2, Opus 5.5, Sonnet 5.5 (`claude-sonnet-5-5`), Haiku 5.5 (`claude-haiku-5-5`), and **Custom**: any id or alias Claude Code's `--model` takes.
+  - **A model id is one argument of a command,** so it's letters, digits and `. _ : @ / [ ] -`, starting with a letter or digit (never `-`, which would read as an option), at most 100 characters. Checked in the form, the API and ProjectDO.
+- **Through nest's generic interface only.** A client's spawn can't override a template's launch (nest answers 400: a different launch is a template in the client's namespace, [clients](../docs/control-plane/api/clients/)). So each choice is a template of the app's own:
+  - `projects/<role>-<project>-<model>` (`modelTemplateEntry`), the role's template with `launch.model` (which nest passes to Claude Code as `--model`, [runner](../docs/agents/runner/)) and only that project's repo.
+  - An id that isn't already a legal entry name (capitals, dots, brackets, too long) is cut down and ends `--<hash of the whole id>`. A plain id never holds `--`, so no plain id can take a hashed id's template. Two hashed ids would share one only if their 32-bit hashes collided, which the owner's own typing won't arrange.
+  - ProjectDO writes it before each start that names it (`templateFor`): the same body every time, so writing it again changes nothing.
+- **Stale templates are cleaned up** (`sweepModelTemplates`, from the alarm). The project records each template it writes and the template each agent started from.
+  - One is deleted from nest's catalog (`DELETE /v1/catalog/templates/projects/<entry>`) once it's neither the role's current setting nor the template a live agent started from. Whether nest reads a live agent's template again is unverified, so it's kept while that agent lives.
+  - Nothing is swept while a start is owed, since it may be about to name one. A delete nest can't take is tried again at the next sweep.
+  - A project that's gone (a create that couldn't be finished) takes all of its with it.
+- **A change applies to the next start.** A start freezes its model with its attempt (`start_specs`), so its retries name the same template under the same idempotency keys.
+  - Workers started after the change run on the new model; running ones keep theirs.
+  - The manager keeps its model until it next starts: **Restart manager**, or its replacement after it ends ([the manager lifecycle](#the-manager-lifecycle)).
+  - A start frozen before this release has no model: it keeps the role's shared template (`projects/manager`, `projects/worker`), which now carry the defaults.
+- **Reviewers and routine runs are unchanged:** their templates name no model, so they run on nest's and Claude Code's default. Choosing theirs is a later setting if it's wanted.
+- nest doesn't check that a model exists or that the credential may use it (`LaunchConfig.model` is any string). How a wrong id shows (Claude Code failing its first turn, so nest's `agent.error` among the project's errors) is unverified.
 
 ## Creating a project
 

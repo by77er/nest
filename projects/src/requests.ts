@@ -2,6 +2,7 @@
 // page (src/ui/) validates its forms with the very schemas the Worker checks, and types its calls by them.
 
 import { z } from "zod";
+import { MODEL_ID } from "./models";
 import { MERGE_METHODS } from "./automerge";
 
 /** A GitHub repo, `owner/name`. */
@@ -36,6 +37,9 @@ export const Settings = z.strictObject({
   comments_from_repo_owner: z.boolean().optional(),
   // Routine runs at once across the project (README.md#routines).
   max_routine_runs: z.number().int().min(1).max(3).optional(),
+  // The models the manager and the workers run on (README.md#models): an id or alias Claude Code's --model takes.
+  manager_model: z.string().trim().regex(MODEL_ID, "a model id: letters, digits and . _ : @ / [ ] -").optional(),
+  worker_model: z.string().trim().regex(MODEL_ID, "a model id: letters, digits and . _ : @ / [ ] -").optional(),
 });
 export const CreateTask = z.strictObject({ title: z.string().min(1).max(200), body: Text(20000).optional() });
 export const UpdateTask = z.strictObject({ title: z.string().min(1).max(200).optional(), body: Text(20000).optional(), ord: z.number().finite().optional() });
