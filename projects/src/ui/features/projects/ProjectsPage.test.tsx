@@ -75,10 +75,14 @@ describe("projects", () => {
     await user.type(within(d).getByLabelText(/Name/), "Gadgets");
     const picker = await repoPicker(d);
     await waitFor(() => expect(picker).toBeEnabled());
-    expect(within(d).getByText(/Not listed: elsewhere's repos/)).toBeInTheDocument();
+    // What nest couldn't list is a note of its own under the field.
+    expect(within(d).getByText("Some repos aren't listed")).toBeInTheDocument();
+    expect(within(d).getByText(/elsewhere: nest's GitHub App isn't installed there/)).toBeInTheDocument();
     await user.click(picker);
     const taken = await screen.findByRole("option", { name: "owner/widgets (already a project)" });
     expect(taken).toHaveAttribute("data-combobox-disabled", "true");
+    // Pickable repos first, then those already a project's.
+    expect(screen.getAllByRole("option").map((o) => o.textContent)).toEqual(["owner/gadgets", "owner/widgets (already a project)"]);
     await user.click(screen.getByRole("option", { name: "owner/gadgets" }));
     await user.click(within(d).getByRole("button", { name: "Create project" }));
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects", body: { name: "Gadgets", repo: "owner/gadgets", auto_assign: false, max_workers: 2 } }]));
@@ -92,6 +96,8 @@ describe("projects", () => {
     const d = screen.getByRole("dialog", { name: "New project" });
     expect(await within(d).findByText(/None yet: the operator adds repos to the app's grant in nest/)).toBeInTheDocument();
     expect(await repoPicker(d)).toBeDisabled();
+    expect(within(d).getByRole("button", { name: "Create project" })).toBeDisabled();
+    expect(within(d).queryByText("Some repos aren't listed")).toBeNull();
   });
 
   it("says when the list can't be loaded", async () => {

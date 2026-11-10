@@ -8,15 +8,27 @@ import { schemaResolver, useForm } from "@mantine/form";
 import { CreateProject } from "../../../requests";
 import { useAttachableRepos, useCreateProject } from "../../api/queries";
 import type { AttachableRepos, CreatedProject } from "../../api/types";
-import { FieldGroup } from "../../layout";
+import { FieldGroup, Notice } from "../../layout";
 
-/** What the picker says under its label: where the repos come from, and what it couldn't list. */
+/** What the picker says under its label: where the repos come from (and, when there are none, why). */
 function pickerDescription(r: AttachableRepos): string {
-  const said = ["Repos nest's grant lets the app work in, on which nest's GitHub App is installed."];
-  if (!r.repos.length) said.push("None yet: the operator adds repos to the app's grant in nest.");
-  if (r.unlisted.length) said.push(`Not listed: ${r.unlisted.map((e) => e.replace(/\/\*$/, "")).join(", ")}'s repos (the App isn't installed there).`);
+  const said = "Repos nest's grant lets the app work in, on which nest's GitHub App is installed.";
+  return r.repos.length ? said : `${said} None yet: the operator adds repos to the app's grant in nest.`;
+}
+
+/** What nest couldn't list, said apart from the field's description: owners the App isn't on, and the cap. */
+function unlistedNote(r: AttachableRepos): string[] {
+  const said: string[] = [];
+  if (r.unlisted.length) said.push(`${r.unlisted.map((e) => e.replace(/\/\*$/, "")).join(", ")}: nest's GitHub App isn't installed there, so their repos can't be listed.`);
   if (!r.complete) said.push("Only an owner's first 1000 repos are listed.");
-  return said.join(" ");
+  return said;
+}
+
+/** The picker's options: repos that can be picked first, then those already a project's (shown, disabled); each group in nest's order. */
+function pickerOptions(r: AttachableRepos | undefined) {
+  const repos = r?.repos ?? [];
+  return [...repos.filter((x) => x.project === null), ...repos.filter((x) => x.project !== null)]
+    .map((x) => ({ value: x.repo, label: x.project ? `${x.repo} (already a project)` : x.repo, disabled: x.project !== null }));
 }
 
 export function CreateProjectForm({ onCreated, onCancel }: { onCreated: (p: CreatedProject) => void; onCancel?: () => void }) {
@@ -38,7 +50,8 @@ export function CreateProjectForm({ onCreated, onCancel }: { onCreated: (p: Crea
                 Cancel
               </Button>
             )}
-            <Button type="submit" loading={create.isPending}>
+            {/* Nothing to pick: nothing to create (the typed fallback, when the list can't be had, stays open). */}
+            <Button type="submit" loading={create.isPending} disabled={repos.data !== undefined && repos.data.repos.length === 0}>
               Create project
             </Button>
           </>
@@ -65,10 +78,15 @@ export function CreateProjectForm({ onCreated, onCancel }: { onCreated: (p: Crea
             searchable
             nothingFoundMessage="No repo matches"
             disabled={!repos.data || repos.data.repos.length === 0}
-            data={(repos.data?.repos ?? []).map((r) => ({ value: r.repo, label: r.project ? `${r.repo} (already a project)` : r.repo, disabled: r.project !== null }))}
+            data={pickerOptions(repos.data)}
             key={form.key("repo")}
             {...form.getInputProps("repo")}
           />
+        )}
+        {repos.data && unlistedNote(repos.data).length > 0 && (
+          <Notice tone="info" title="Some repos aren't listed">
+            {unlistedNote(repos.data).join(" ")}
+          </Notice>
         )}
         <Switch
           label="Assign ready tasks automatically"

@@ -661,6 +661,24 @@ const app = {
     { name: "projects-empty", section: "top", path: "/projects", fixture: "empty" },
     { name: "projects-error", section: "top", path: "/projects", fixture: "error", httpErrors: true, ready: shown("[data-ds=error]") },
     { name: "new-project", section: "top", path: "/projects", full: false, after: (p) => p.getByRole("button", { name: "New project" }).first().click() },
+    // The create form's repo picker (README.md#flows): open, with repos already a project's; searched, with a
+    // long name; owners nest couldn't list; nothing to attach; and the list failing, so the name is typed.
+    { name: "new-project-picker", section: "top", path: "/projects", full: false, after: async (p) => {
+      await p.getByRole("button", { name: "New project" }).first().click();
+      await p.getByRole("dialog").getByLabel(/^Repository/).first().click();
+    } },
+    { name: "new-project-picker-search", section: "top", path: "/projects", fixture: "repos-many", full: false, after: async (p) => {
+      await p.getByRole("button", { name: "New project" }).first().click();
+      const f = p.getByRole("dialog").getByLabel(/^Repository/).first();
+      await f.click();
+      await f.fill("gadg");
+    } },
+    { name: "new-project-picker-unlisted", section: "top", path: "/projects", fixture: "repos-unlisted", full: false, after: (p) => p.getByRole("button", { name: "New project" }).first().click() },
+    { name: "new-project-picker-none", section: "top", path: "/projects", fixture: "repos-none", full: false, after: (p) => p.getByRole("button", { name: "New project" }).first().click() },
+    { name: "new-project-repos-failed", section: "top", path: "/projects", fixture: "repos-failed", httpErrors: true, full: false, after: async (p) => {
+      await p.getByRole("button", { name: "New project" }).first().click();
+      await p.getByRole("dialog").getByText(/couldn't be listed/).first().waitFor();
+    } },
     { name: "admin", section: "top", path: "/admin" },
     // The repo bindings' Re-read and what it says (README.md#the-repos-binding).
     { name: "admin-reread", section: "top", path: "/admin", full: false, after: (p) => p.getByRole("button", { name: "Re-read Gadgets's repo from GitHub" }).click() },

@@ -369,6 +369,8 @@ describe("a renamed or transferred repo", () => {
     await deliverGithub("issues", issue(1, { id: repoIdOf(p.repo), full_name: to }));
     const impostor = gh.take(p.repo);
     expect(impostor).not.toBe(repoIdOf(p.repo));
+    // nest's grant covers only the old name, so the rename itself waits (this test is about the read).
+    fake.grantListing = { repos: [{ repo: p.repo, push: true, read: true, github: true }], unlisted: [], complete: true };
     const r = await reread(p);
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ changed: false, binding: { repo_id: repoIdOf(p.repo), renamed_to: to } });
@@ -394,11 +396,31 @@ describe("the repos the owner may attach (GET /api/repos)", () => {
     expect((await api(token, "POST", "/api/repos")).status).toBe(405);
   });
 
-  it("a nest from before its grant routes: the repos named exactly in both of the grant's lists", async () => {
-    fake.grantRepos = ["a/one", "a/two", "a/tokens-only"];
-    fake.pushRepos = ["a/one", "a/two", "a/push-only"];
+  it("a nest from before its grant routes: the repos named exactly in both of the grant's lists, never an owner-wide entry", async () => {
+    fake.grantListing = "missing";
+    // An owner-wide entry in both lists: a previous nest has no answer for it, so it's never offered (nor `owner/*` itself).
+    fake.grantRepos = ["a/one", "a/two", "a/tokens-only", "wide/*"];
+    fake.pushRepos = ["a/one", "a/two", "a/push-only", "wide/*"];
     const r = await api(token, "GET", "/api/repos");
     expect(r.body).toEqual({ repos: [{ repo: "a/one", project: null }, { repo: "a/two", project: null }], unlisted: [], complete: true });
+  });
+
+  it("a project can be created only on a repo nest's grant lets the app attach: a typed name outside it is refused, and nothing is left stuck", async () => {
+    fake.grantListing = { repos: [{ repo: "in/side", push: true, read: true, github: true }, { repo: "read/only", push: false, read: true, github: true }], unlisted: [], complete: true };
+    for (const repo of ["out/side", "read/only"]) {
+      const r = await api(token, "POST", "/api/projects", { name: `n-${rand()}`, repo });
+      expect(r.status, repo).toBe(403);
+      expect(r.body.error).toContain(repo);
+    }
+    expect(((await api(token, "GET", "/api/projects")).body.projects as { repo: string }[]).map((p) => p.repo)).not.toContain("out/side");
+    // Granted later: the same name is created at once (no project stuck on it from the refused try).
+    fake.grantListing.repos.push({ repo: "out/side", push: true, read: true, github: true });
+    expect((await api(token, "POST", "/api/projects", { name: `n-${rand()}`, repo: "out/side" })).status).toBe(201);
+    // An older nest: its exact entries decide.
+    fake.grantListing = "missing";
+    fake.grantRepos = ["old/one"];
+    expect((await api(token, "POST", "/api/projects", { name: `n-${rand()}`, repo: "old/two" })).status).toBe(403);
+    expect((await api(token, "POST", "/api/projects", { name: `n-${rand()}`, repo: "old/one" })).status).toBe(201);
   });
 
   it("nest's failure is said, not an empty list", async () => {
