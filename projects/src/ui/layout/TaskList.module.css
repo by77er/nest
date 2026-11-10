@@ -101,10 +101,14 @@
   outline-offset: -2px;
 }
 
+/* The dragged row, lifted (`raised`): above its neighbours on the surface, a hairline round it so the lift
+   reads in dark too, where a shadow barely shows. */
 .row[data-dragging] {
   z-index: 4;
   background: var(--nest-surface);
   box-shadow: var(--mantine-shadow-raised);
+  outline: 1px solid var(--nest-border-color);
+  border-radius: var(--mantine-radius-sm);
 }
 
 .gripCell {
@@ -147,6 +151,7 @@
 .markers {
   display: inline-flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: var(--mantine-spacing-xs);
 }
 

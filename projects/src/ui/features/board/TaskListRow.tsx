@@ -61,9 +61,11 @@ export interface TaskListRowProps {
   /** Open asks from this task's worker. */
   pendingAsks: number;
   sortable: boolean;
+  /** Its group's name: a row whose state reads otherwise (Assigned, in "In progress") says its own, muted. */
+  group?: string;
 }
 
-export function TaskListRow({ task, projectId, repo, pendingAsks, sortable }: TaskListRowProps) {
+export function TaskListRow({ task, projectId, repo, pendingAsks, sortable, group }: TaskListRowProps) {
   const first = task.prs[0] ?? (task.pr !== null ? { number: task.pr, state: "open" as const } : null);
   return (
     <TaskRow
@@ -80,6 +82,11 @@ export function TaskListRow({ task, projectId, repo, pendingAsks, sortable }: Ta
       }
       markers={
         <>
+          {group !== undefined && STATE_LABEL[task.state] !== group && (
+            <Text component="span" fz="xs" c="dimmed" data-slot="row-state">
+              {STATE_LABEL[task.state]}
+            </Text>
+          )}
           <WaitingBadge task={task} size="sm" plainOnTouch />
           {task.blocked && (
             <Tooltip label={`Blocked: ${task.blocked.reason}`} withArrow multiline maw="var(--nest-side-panel)">
