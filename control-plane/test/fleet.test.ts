@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { FleetDO } from "../src/do/fleet";
 import { CapacityError, QuotaError, type Ec2, type InstanceState, type LaunchSpec, type ImageInfo } from "../src/lib/ec2";
 import type { AwsCellConfig } from "../src/lib/cells";
-import { adminJson, connectHost, hostHello, manifest, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, eventually, hostHello, manifest, nextCommands, okResult, runDue, sendEvents, uniqueCell, Ws } from "./helpers";
 
 async function createSandbox(cell: string, status = 201) {
   return adminJson<{ sandbox: string; epoch: number; host: string }>(`/v1/sandboxes`, { body: { cell } }, status);
@@ -707,6 +707,50 @@ describe("autoscaling", () => {
     expect(after.state).toBe("creating");
     expect(after.host).toBeNull();
     ws.close();
+  });
+
+  it("a release that an operator's retry overtakes leaves the new lease alone, and records no incarnation for it", async () => {
+    const cell = uniqueCell();
+    const a = await connectHost(cell);
+    const sbx = await createSandbox(cell);
+    const [create] = await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const seq = sendEvents(a.ws, [{ ts_ms: Date.now(), type: "command_result", cmd: create.cmd, outcome: { status: "error", error: { code: "internal", message: "boom", retryable: false } } }]);
+    await a.ws.next("ack", (m) => m.up_to >= seq);
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "failed", host: a.host, epoch: 1 });
+    await runInDurableObject(sandboxStub(sbx.sandbox), (_i, st) => {
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'failed_release'");
+      st.storage.sql.exec("UPDATE kv SET value = json_set(value, '$.ms', ?) WHERE key = 'failed_since'", Date.now() - 15 * 60_000);
+    });
+    // The release is held after its fence, before FleetDO drops the lease (this cell's FleetDO only).
+    const real = FleetDO.prototype.releaseFailedLease;
+    let held = true;
+    let reached: unknown[] | null = null;
+    FleetDO.prototype.releaseFailedLease = async function (this: FleetDO, ...args: Parameters<typeof real>) {
+      if (args[0] === sbx.sandbox) {
+        reached = args;
+        while (held) await scheduler.wait(10);
+      }
+      return real.apply(this, args);
+    };
+    try {
+      const release = runDue(sandboxStub(sbx.sandbox));
+      await eventually("the release to reach FleetDO", () => reached !== null);
+      expect(reached).toEqual([sbx.sandbox, a.host, 1]);
+      // Meanwhile the operator retries it: placed again, on the same host, at a new epoch.
+      await adminJson(`/v1/sandboxes/${sbx.sandbox}/place`, { body: {} });
+      expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 2 });
+      held = false;
+      await release;
+    } finally {
+      held = false;
+      FleetDO.prototype.releaseFailedLease = real;
+    }
+    // The late release named the old holder's epoch: the new lease stands and nothing is recorded as left behind.
+    expect(await fleetStub(cell).leaseOf(sbx.sandbox)).toMatchObject({ host: a.host, epoch: 2 });
+    expect(await sandboxStub(sbx.sandbox).info()).toMatchObject({ state: "creating", host: a.host, epoch: 2 });
+    expect(await runInDurableObject(fleetStub(cell), (_i, st) =>
+      st.storage.sql.exec("SELECT 1 FROM stale_incarnations WHERE sandbox = ?", sbx.sandbox).toArray().length)).toBe(0);
+    a.ws.close();
   });
 
   it("a sandbox its host reports failed after it ran is released the same way; one retried and failed again gets a whole new grace", async () => {
