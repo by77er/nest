@@ -155,7 +155,7 @@ export function data(variant = "demo", now = Date.now()) {
     // The manager switched to another model (README.md#models; manager-switched), nest gave the switch up
     // (switch-refused: the manager runs on), or it ended.
     variant === "switch-refused"
-      ? { seq: 3, at_ms: now - 900_000, sender: "app", text: "The switch to Sonnet 5.5 didn't complete (nest couldn't restart the manager): trying again.", delivered: true, status: "done", error: null }
+      ? { seq: 3, at_ms: now - 900_000, sender: "app", text: "The switch to Sonnet 5.5 didn't complete (nest couldn't restart the manager): trying again in 5 minutes.", delivered: true, status: "done", error: null }
       : variant === "manager-switched"
       ? { seq: 3, at_ms: now - 900_000, sender: "app", text: "Switched to Sonnet 5.5.", delivered: true, status: "done", error: null }
       : { seq: 3, at_ms: now - 900_000, sender: "app", text: "The manager ended (exited).", delivered: true, status: "done", error: null },
