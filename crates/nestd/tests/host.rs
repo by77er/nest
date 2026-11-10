@@ -365,6 +365,9 @@ struct FleetLog {
     redelivered: Vec<u64>,
     /// `commit_result`s held back while `hold_commit_answers` is set, for the test to send.
     held: Vec<Command>,
+    /// While `Some`, the `proxy_ca` answers to a `ca_renew` are held here instead of sent, until
+    /// [`MockFleet::release_ca_answers`].
+    held_ca: Option<Vec<FleetToHost>>,
 }
 
 struct MockFleet {
@@ -577,10 +580,22 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
                                 // for another key (a late answer to a CSR whose key was replaced),
                                 // which nestd must refuse.
                                 let late = CaCertificate { cert_pem: sign_csr(&other_csr()), chain_pem: "CHAIN".into(), expires_ms: i64::MAX / 4 };
-                                let _ = ws.send(send(FleetToHost::ProxyCa(late))).await;
                                 let ca = CaCertificate { cert_pem: sign_csr(&csr_pem), chain_pem: "CHAIN".into(), expires_ms: i64::MAX / 2 };
-                                log2.lock().unwrap().ca_renews.push(csr_pem);
-                                let _ = ws.send(send(FleetToHost::ProxyCa(ca))).await;
+                                let answers = [FleetToHost::ProxyCa(late), FleetToHost::ProxyCa(ca)];
+                                let send_now = {
+                                    let mut l = log2.lock().unwrap();
+                                    l.ca_renews.push(csr_pem);
+                                    match &mut l.held_ca {
+                                        Some(held) => {
+                                            held.extend(answers);
+                                            None
+                                        }
+                                        None => Some(answers),
+                                    }
+                                };
+                                for a in send_now.into_iter().flatten() {
+                                    let _ = ws.send(send(a)).await;
+                                }
                             }
                         }
                     }
@@ -592,6 +607,18 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
 }
 
 impl MockFleet {
+    /// Hold the answers to a `ca_renew` until [`Self::release_ca_answers`].
+    fn hold_ca_answers(&self) {
+        self.log.lock().unwrap().held_ca = Some(vec![]);
+    }
+
+    /// Send the `proxy_ca` answers held so far, in order, and stop holding them.
+    fn release_ca_answers(&self) {
+        for a in self.log.lock().unwrap().held_ca.take().unwrap_or_default() {
+            self.frames.send(a).unwrap();
+        }
+    }
+
     /// Answer the commits held back so far (`hold_commit_answers`), and stop holding them.
     fn release_commit_answers(&self) {
         self.hold_commit_answers.store(false, Ordering::SeqCst);
@@ -1182,11 +1209,18 @@ async fn start_host_in(
     let cfg: Config = serde_json::from_value(cfg).unwrap();
     let enrolled = Enrolled { host: HostId("hst_t".into()), host_token: nest_protocol::host::Secret("tok".into()), host_token_expires_ms: i64::MAX, fleet_ws_url: fleet.url.clone(), proxy_ca, tunnel_token: None, gateway_url: None };
     let driver = FakeDriver::default();
+    // The CA tests check which CAs nestd installs, and in what order. The proxy sees each install
+    // only if it is connected when it is made: one that connects later gets just the current CA
+    // in its resync (right, and not what those tests are about). So the answer to a renewal at
+    // start is held until this harness's proxy has connected and taken its resync.
+    fleet.hold_ca_answers();
     let host = Host::start(cfg, enrolled, Some(Arc::new(driver.clone()))).await.unwrap();
     let runner = fake_runner(&dir.path().join("run/runner.sock")).await;
     let proxy = fake_proxy(dir.path().join("run/proxy.sock"));
     let gateway = fake_gateway(&dir.path().join("run/gateway.sock")).await;
     wait_until("fleet hello", || !fleet.log.lock().unwrap().hellos.is_empty()).await;
+    wait_until("proxy resynced", || proxy.lock().unwrap().iter().any(|c| matches!(c, ProxyCommand::ResyncComplete { .. }))).await;
+    fleet.release_ca_answers();
     Started { lifecycle_mismatches: 0, _host: host, dir, fleet, _runner: runner, proxy, gateway, vm: driver }
 }
 
