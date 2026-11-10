@@ -4,14 +4,20 @@
 // import; the count in "Needs you"; and the Manager page's link to it.
 import { screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import type { Issue } from "../../api/types";
+import type { Issue, Proposal } from "../../api/types";
 import { FakeApi, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+import { triageSource, triageWaits } from "./words";
 
 const now = Date.now();
 const issue = (o: Partial<Issue> = {}): Issue => ({
   number: 12, title: "Crash on save", body: "Steps: open, save.", author: "reporter", url: "https://github.com/owner/widgets/issues/12", state: "untriaged",
   task: null, reason: null, opened_ms: now - 3_600_000, updated_ms: now - 3_600_000, ...o,
+});
+
+const proposal = (o: Partial<Proposal> = {}): Proposal => ({
+  id: "prp_one", routine: "rtn_a", routine_name: "Spontaneous review", run: "run_a", title: "Fix the race", body: "In src/a.ts.", state: "untriaged", task: null, reason: null,
+  created_ms: now - 7_200_000, ...o,
 });
 
 describe("the Triage page", () => {
@@ -93,6 +99,88 @@ describe("the Triage page", () => {
     renderApp("/projects/prj_one/board", api);
     const item = (await screen.findByText(/2 issues wait for triage/)).closest("[data-triage]") as HTMLElement;
     expect(within(item).getByRole("link", { name: "Open Triage" })).toHaveAttribute("href", "/projects/prj_one/triage");
+  });
+
+  it("lists the tasks routines proposed under the issues, with accept and decline; nothing of them when there are none", async () => {
+    const none = new FakeApi();
+    none.issues = [issue()];
+    const first = renderApp("/projects/prj_one/triage", none);
+    await screen.findByRole("heading", { name: "Issues" });
+    await screen.findByText("Crash on save");
+    await waitFor(() => expect(first.queryClient.isFetching()).toBe(0));
+    expect(screen.queryByRole("heading", { name: "Proposed tasks" })).toBeNull();
+    expect(screen.queryByText("Nothing proposed")).toBeNull();
+    first.unmount();
+    const api = new FakeApi();
+    api.issues = [issue()];
+    api.proposals = [proposal(), proposal({ id: "prp_two", title: "Drop the old flag" })];
+    const { user } = renderApp("/projects/prj_one/triage", api);
+    const list = await screen.findByRole("list", { name: "Proposed tasks" });
+    expect(within(list).getAllByRole("listitem")).toHaveLength(2);
+    // After the issues, in the page's order.
+    const issues = screen.getByRole("list", { name: "Issues to triage" });
+    expect(issues.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const card = list.querySelector("[data-proposal=prp_one]") as HTMLElement;
+    expect(card).toHaveTextContent("From the routine Spontaneous review");
+    await user.click(within(card).getByRole("button", { name: "Accept “Fix the race” as a draft" }));
+    await waitFor(() => expect(api.writes).toContainEqual({ method: "POST", path: "/api/projects/prj_one/proposals/prp_one/accept", body: undefined }));
+    await user.click(await screen.findByRole("button", { name: "Decline “Drop the old flag”" }));
+    await user.click(within(await screen.findByRole("dialog", { name: "Decline “Drop the old flag”?" })).getByRole("button", { name: "Decline" }));
+    await waitFor(() => expect(api.writes.at(-1)).toMatchObject({ method: "POST", path: "/api/projects/prj_one/proposals/prp_two/decline" }));
+    // The last one gone: the section goes too.
+    await waitFor(() => expect(screen.queryByRole("heading", { name: "Proposed tasks" })).toBeNull());
+  });
+
+  it("with no issues but proposals waiting, the issues' empty is a quiet line; the page's empty state only when both are empty", async () => {
+    const api = new FakeApi();
+    api.proposals = [proposal()];
+    const view = renderApp("/projects/prj_one/triage", api);
+    expect(await screen.findByText("No issues to triage.")).toBeInTheDocument();
+    expect(screen.queryByText("Nothing to triage")).toBeNull();
+    expect(await screen.findByRole("list", { name: "Proposed tasks" })).toBeInTheDocument();
+    view.unmount();
+    renderApp("/projects/prj_one/triage", new FakeApi());
+    expect(await screen.findByText("Nothing to triage")).toBeInTheDocument();
+    expect(screen.queryByText("No issues to triage.")).toBeNull();
+  });
+
+  it("proposals count in Needs you with the issues, in words; triaging one there moves the count", async () => {
+    expect(triageWaits(3, 1)).toBe("3 issues and 1 proposed task wait");
+    expect(triageWaits(1, 0)).toBe("1 issue waits");
+    expect(triageWaits(0, 1)).toBe("1 proposed task waits");
+    expect(triageWaits(0, 2)).toBe("2 proposed tasks wait");
+    expect(triageWaits(1, 1)).toBe("1 issue and 1 proposed task wait");
+    expect([triageSource(2, 0), triageSource(0, 2), triageSource(1, 1)]).toEqual(["The repo's issues", "Routines' proposals", "Issues and routines' proposals"]);
+    const api = new FakeApi();
+    api.issues = [issue()];
+    api.proposals = [proposal(), proposal({ id: "prp_two", title: "Drop the old flag" })];
+    const { user, router } = renderApp("/projects/prj_one/board", api);
+    const item = (await screen.findByText(/1 issue and 2 proposed tasks wait for triage: accept each/)).closest("[data-triage]") as HTMLElement;
+    expect(item).toHaveTextContent("Issues and routines' proposals");
+    await user.click(within(item).getByRole("link", { name: "Open Triage" }));
+    await user.click(await screen.findByRole("button", { name: "Accept “Fix the race” as a draft" }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Accept “Fix the race” as a draft" })).toBeNull());
+    await router.navigate({ to: "/projects/$projectId/board", params: { projectId: "prj_one" }, search: {} });
+    expect(await screen.findByText(/1 issue and 1 proposed task wait for triage/)).toBeInTheDocument();
+  });
+
+  it("triaging the last proposal clears the sidebar's count at once, as an issue does", async () => {
+    const api = new FakeApi();
+    api.proposals = [proposal()];
+    const { user } = renderApp("/projects/prj_one/triage", api);
+    await waitFor(() => expect(document.querySelector("[data-marker=needs-you]")).toHaveTextContent("1"));
+    await user.click(await screen.findByRole("button", { name: "Accept “Fix the race” as a draft" }));
+    await waitFor(() => expect(document.querySelector("[data-marker=needs-you]")).toBeNull());
+  });
+
+  it("the Manager page's context names proposals too", async () => {
+    const api = new FakeApi();
+    api.proposals = [proposal()];
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
+    const context = document.querySelector("[data-slot=manager-context]") as HTMLElement;
+    expect(await within(context).findByRole("link", { name: /1 proposed task waits for triage/ })).toHaveAttribute("href", "/projects/prj_one/triage");
+    expect(context).toHaveTextContent("Routines' proposals");
   });
 
   it("the Manager page's context links its triage item to Triage", async () => {

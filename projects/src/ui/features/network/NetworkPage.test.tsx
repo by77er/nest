@@ -229,7 +229,7 @@ describe("the manager's waits", () => {
     const { user } = renderApp("/projects/prj_one/manager", api);
     await user.click(await screen.findByRole("button", { name: "About the manager" }));
     const section = (await screen.findByRole("heading", { name: "Waiting for" })).closest('[data-ds="section"]') as HTMLElement;
-    expect(await within(section).findByText("Nothing while the manager isn't running.")).toBeInTheDocument();
+    expect(await within(section).findByText("Nothing pending while the manager isn't running.")).toBeInTheDocument();
     expect(screen.queryByRole("list", { name: "The manager's waits" })).toBeNull();
     expect(section).not.toHaveTextContent("left");
     expect(section.querySelector("[data-slot=count]")).toBeNull();

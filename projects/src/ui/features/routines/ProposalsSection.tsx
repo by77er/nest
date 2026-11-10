@@ -2,7 +2,8 @@
 // routine, run and when, and its body as plain text (an agent wrote it after reading anyone's text, so
 // nothing in it is rendered as markup or followed), its first lines with "Show more" for the rest, as
 // Triage shows an issue. Accept makes a draft task on the board; Decline, at the right edge as on Triage,
-// drops it with an optional reason.
+// drops it with an optional reason. Shown on the Routines page and, when there are any, on Triage under
+// the issues (README.md#triage).
 
 import { Button, Text, TextInput } from "@mantine/core";
 import { modals } from "@mantine/modals";
@@ -78,11 +79,13 @@ function ProposalCard({ projectId, p }: { projectId: string; p: Proposal }) {
 /** Proposals shown before "Show all": the oldest first, as Triage lists issues. */
 export const PROPOSALS_SHOWN = 10;
 
-export function ProposalsSection({ projectId }: { projectId: string }) {
+/** `quietWhenEmpty`: nothing at all while there are none (the Triage page, where issues are the main list). */
+export function ProposalsSection({ projectId, quietWhenEmpty = false }: { projectId: string; quietWhenEmpty?: boolean }) {
   const proposals = useProposals(projectId);
   const [all, setAll] = useState(false);
   const list = proposals.data ?? [];
   const shown = all ? list : list.slice(0, PROPOSALS_SHOWN);
+  if (quietWhenEmpty && !proposals.isError && list.length === 0) return null;
   return (
     <Section title="Proposed tasks" count={proposals.data?.length}>
       {proposals.isPending ? (

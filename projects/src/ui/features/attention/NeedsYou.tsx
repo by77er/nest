@@ -15,6 +15,7 @@ import { MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, weight } from "..
 import { motion } from "../../theme";
 import { HeldReviewItem } from "../reviews/HeldReview";
 import { RichMessage } from "../rich/RichMessage";
+import { triageSource, triageWaits } from "../triage/words";
 import { AskItem } from "./AskItem";
 import { SecretRequestItem } from "./SecretRequestItem";
 
@@ -80,7 +81,7 @@ function Item({ projectId, x, first, explain }: { projectId: string; x: Attentio
       {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : x.kind === "blocked" ? <BlockedTask projectId={projectId} item={x} />
         : x.kind === "review_backlog" ? <ReviewBacklogItem count={x.count} at_ms={x.at_ms} />
         : x.kind === "review" ? <HeldReviewItem projectId={projectId} repo={project.data?.repo} item={x} full={explain} />
-        : x.kind === "triage" ? <TriageItem projectId={projectId} count={x.count} at_ms={x.at_ms} /> : <SecretRequestItem projectId={projectId} item={x} />}
+        : x.kind === "triage" ? <TriageItem projectId={projectId} issues={x.count} proposals={x.proposals} at_ms={x.at_ms} /> : <SecretRequestItem projectId={projectId} item={x} />}
     </Stack>
   );
 }
@@ -102,16 +103,16 @@ function ReviewBacklogItem({ count, at_ms }: { count: number; at_ms: number }) {
   );
 }
 
-/** The repo's issues waiting for triage: how many, since when, and the way to them (README.md#triage). */
-function TriageItem({ projectId, count, at_ms }: { projectId: string; count: number; at_ms: number }) {
+/** What waits for triage, the repo's issues and routines' proposed tasks: how many, since when, and the way to them (README.md#triage). */
+function TriageItem({ projectId, issues, proposals, at_ms }: { projectId: string; issues: number; proposals: number; at_ms: number }) {
   return (
     <Stack gap="sm" data-triage>
       <MetaRow>
-        <MetaItem>The repo's issues</MetaItem>
+        <MetaItem>{triageSource(issues, proposals)}</MetaItem>
         <MetaItem title={exact(at_ms)}>oldest {ago(at_ms)}</MetaItem>
       </MetaRow>
       <Text fz="md">
-        {count === 1 ? "1 issue waits" : `${count} issues wait`} for triage: accept it as a draft task, or decline it.
+        {triageWaits(issues, proposals)} for triage: accept {issues + proposals === 1 ? "it" : "each"} as a draft task, or decline it.
       </Text>
       <Row>
         <Button variant="default" renderRoot={(props) => <AnchorLink {...props} to="/projects/$projectId/triage" params={{ projectId }} />}>

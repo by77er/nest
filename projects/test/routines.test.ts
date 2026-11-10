@@ -440,12 +440,19 @@ describe("proposals: into triage, never onto the board", () => {
     expect((await api(token, "GET", `/api/projects/${s.id}/tasks`)).body).toEqual([]);
     const queue = (await api(token, "GET", `/api/projects/${s.id}/proposals`)).body;
     expect(queue).toEqual([expect.objectContaining({ id: p.proposal, title: "Fix the race", routine: id, routine_name: "Spontaneous review", run: run.id })]);
+    // It waits on the owner: in "Needs you" as triage's one item, and in the projects list's count.
+    const triage = async () => ((await api(token, "GET", `/api/projects/${s.id}/attention`)).body as { kind: string }[]).filter((a) => a.kind === "triage");
+    const needsYou = async () => ((await api(token, "GET", "/api/projects")).body.projects as { id: string; needs_you: number }[]).find((x) => x.id === s.id)!.needs_you;
+    expect(await triage()).toEqual([{ kind: "triage", count: 0, proposals: 1, at_ms: queue[0].created_ms }]);
+    const before = await needsYou();
     expect((await liveRun(s, id)).created).toEqual([{ kind: "proposal", id: p.proposal, title: "Fix the race" }]);
     const t = (await api(token, "POST", `/api/projects/${s.id}/proposals/${p.proposal}/accept`)).body;
     expect(t).toMatchObject({ state: "draft", title: "Fix the race", tainted: true, assignee: null });
     expect(t.body).toContain('Proposed by the routine "Spontaneous review"');
     expect((await api(token, "GET", `/api/projects/${s.id}/proposals`)).body).toEqual([]);
     expect((await api(token, "POST", `/api/projects/${s.id}/proposals/${p.proposal}/accept`)).status).toBe(409);
+    expect(await triage()).toEqual([]);
+    expect(await needsYou()).toBe(before - 1);
   });
 
   it("declined, it leaves the queue with no task", async () => {
@@ -456,6 +463,27 @@ describe("proposals: into triage, never onto the board", () => {
     expect((await api(token, "POST", `/api/projects/${s.id}/proposals/${p.proposal}/decline`, { reason: "not now" })).status).toBe(200);
     expect((await api(token, "GET", `/api/projects/${s.id}/proposals`)).body).toEqual([]);
     expect((await api(token, "GET", `/api/projects/${s.id}/tasks`)).body).toEqual([]);
+  });
+
+  it("a title the owner declined in the last 30 days isn't proposed again, by any routine: the run is told the owner's reason", async () => {
+    const s = await setup();
+    const id = await create(s);
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const run = await liveRun(s, id);
+    const p = ok(await routineTool(s, run, "propose_task", { title: "Rewrite the parser in Rust", body: "b" }));
+    await api(token, "POST", `/api/projects/${s.id}/proposals/${p.proposal}/decline`, { reason: "not worth it" });
+    // Case, punctuation and spacing don't make it another.
+    const again = toolError(await routineTool(s, run, "propose_task", { title: "  rewrite the parser — in RUST! ", body: "c" }));
+    expect(again).toContain("not worth it");
+    expect(again).toContain("Rewrite the parser in Rust");
+    expect((await api(token, "GET", `/api/projects/${s.id}/proposals`)).body).toEqual([]);
+    // Another title is proposed as usual.
+    ok(await routineTool(s, run, "propose_task", { title: "Rewrite the lexer", body: "d" }));
+    // Declined over 30 days ago: proposed again.
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE proposals SET triaged_ms = ? WHERE id = ?", Date.now() - 31 * 86_400_000, p.proposal);
+    });
+    ok(await routineTool(s, run, "propose_task", { title: "Rewrite the parser in Rust", body: "e" }));
   });
 
   it("with proposals set to draft, they go onto the board as drafts, unassigned and tainted", async () => {

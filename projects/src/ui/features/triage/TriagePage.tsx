@@ -3,7 +3,8 @@
 // as markup, and no agent sees it until it's accepted), its first lines with "Show more" for the rest.
 // Accept makes a draft task of it, linked back, of the text as the owner read it (one edited since is
 // shown again, to accept again); Decline takes it out, with an optional reason. A one-off import brings
-// the repo's open issues.
+// the repo's open issues. The tasks routines proposed wait here too, under the issues, when there are any
+// (`ProposalsSection`, the Routines page's).
 
 import { Button, Text, TextInput } from "@mantine/core";
 import { modals } from "@mantine/modals";
@@ -11,12 +12,13 @@ import { notifications } from "@mantine/notifications";
 import { IconDownload, IconExternalLink, IconInbox } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
 import { useId, useRef, useState } from "react";
-import { useAcceptIssue, useDeclineIssue, useImportIssues, useIssues } from "../../api/queries";
+import { useAcceptIssue, useDeclineIssue, useImportIssues, useIssues, useProposals } from "../../api/queries";
 import { ApiError } from "../../api/client";
 import type { Issue } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
 import { ProjectFrame } from "../project/ProjectFrame";
+import { ProposalsSection } from "../routines/ProposalsSection";
 
 /** A body's preview: its first lines, and at most this much of them (about five lines on a wide card). */
 export const PREVIEW_LINES = 5;
@@ -126,6 +128,8 @@ function IssueItem({ projectId, issue }: { projectId: string; issue: Issue }) {
 export function TriagePage() {
   const { projectId } = useParams({ from: "/projects/$projectId/triage" });
   const issues = useIssues(projectId);
+  // Proposals waiting (README.md#triage): then no issues is a quiet line, not the whole page's empty state.
+  const proposalsWaiting = (useProposals(projectId).data?.length ?? 0) > 0;
   const importOpen = useImportIssues(projectId);
   const doImport = () =>
     importOpen.mutate(undefined, {
@@ -134,40 +138,47 @@ export function TriagePage() {
   return (
     <ProjectFrame projectId={projectId}>
       {() => (
-        <Section
-          title="Triage"
-          count={issues.data?.length}
-          actions={
-            <Button variant="default" leftSection={<IconDownload size={icon.md} />} loading={importOpen.isPending} onClick={doImport}>
-              Import open issues
-            </Button>
-          }
-        >
-          <Stack gap="lg">
-            <Text fz="sm" c="dimmed">
-              The repo's issues, as they're opened: accept each as a draft task, or decline it. Their text is anyone's: it's shown as it is, and no agent reads it until you accept it.
-            </Text>
-            {issues.isPending ? (
-              <LoadingState label="Loading the issues" />
-            ) : issues.isError ? (
-              <ErrorState title="The issues couldn't be loaded" error={issues.error} onRetry={() => void issues.refetch()} />
-            ) : issues.data.length === 0 ? (
-              <Panel>
-                <EmptyState
-                  icon={IconInbox}
-                  title="Nothing to triage"
-                  description="Issues opened on the repo come here. Ones opened before the app was set up come in with Import open issues."
-                />
-              </Panel>
-            ) : (
-              <Stack gap="md" role="list" aria-label="Issues to triage">
-                {issues.data.map((i) => (
-                  <IssueItem key={i.number} projectId={projectId} issue={i} />
-                ))}
-              </Stack>
-            )}
-          </Stack>
-        </Section>
+        <Stack gap="2xl">
+          <Section
+            title="Issues"
+            count={issues.data?.length}
+            actions={
+              <Button variant="default" leftSection={<IconDownload size={icon.md} />} loading={importOpen.isPending} onClick={doImport}>
+                Import open issues
+              </Button>
+            }
+          >
+            <Stack gap="lg">
+              <Text fz="sm" c="dimmed">
+                The repo's issues, as they're opened: accept each as a draft task, or decline it. Their text is anyone's: it's shown as it is, and no agent reads it until you accept it.
+              </Text>
+              {issues.isPending ? (
+                <LoadingState label="Loading the issues" />
+              ) : issues.isError ? (
+                <ErrorState title="The issues couldn't be loaded" error={issues.error} onRetry={() => void issues.refetch()} />
+              ) : issues.data.length === 0 && proposalsWaiting ? (
+                <Text fz="sm" c="dimmed" data-slot="no-issues">
+                  No issues to triage.
+                </Text>
+              ) : issues.data.length === 0 ? (
+                <Panel>
+                  <EmptyState
+                    icon={IconInbox}
+                    title="Nothing to triage"
+                    description="Issues opened on the repo come here. Ones opened before the app was set up come in with Import open issues."
+                  />
+                </Panel>
+              ) : (
+                <Stack gap="md" role="list" aria-label="Issues to triage">
+                  {issues.data.map((i) => (
+                    <IssueItem key={i.number} projectId={projectId} issue={i} />
+                  ))}
+                </Stack>
+              )}
+            </Stack>
+          </Section>
+          <ProposalsSection projectId={projectId} quietWhenEmpty />
+        </Stack>
       )}
     </ProjectFrame>
   );

@@ -13,6 +13,7 @@ import { MetaItem, MetaRow, Section, Stack } from "../../layout";
 import { approvalOf } from "../attention/AskItem";
 import { SHOWN as ASKS_SHOWN } from "../attention/NeedsYou";
 import { TaskCardList } from "../rich/TaskRefs";
+import { triageSource, triageWaits } from "../triage/words";
 import { ManagerWaits } from "./ManagerWaits";
 
 /** The states a task is under way in: someone holds it. Drafts, ready and done aren't. */
@@ -29,7 +30,7 @@ export function gist(x: Attention): string {
   } else if (x.kind === "secret") text = `Asks for ${x.type === "ci" ? "the Actions secret" : "a credential"} ${x.name}: ${x.purpose}`;
   else if (x.kind === "review_backlog") text = `${x.count === 1 ? "1 more pull request waits" : `${x.count} more pull requests wait`} beyond the review queue's limit`;
   else if (x.kind === "review") text = `${x.fork ? "A fork's PR" : "A PR"} #${x.pr} waits for your approval to be reviewed`;
-  else if (x.kind === "triage") text = `${x.count === 1 ? "1 issue waits" : `${x.count} issues wait`} for triage`;
+  else if (x.kind === "triage") text = `${triageWaits(x.count, x.proposals)} for triage`;
   else text = x.question ?? x.reason;
   const line = text.replace(/\s+/g, " ").trim();
   return line.length > GIST ? `${line.slice(0, GIST - 1).trimEnd()}…` : line;
@@ -84,7 +85,7 @@ export function ManagerContext({ projectId }: { projectId: string }) {
                   </AnchorLink>
                 )}
                 <MetaRow>
-                  <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.kind === "triage" ? "The repo's issues" : x.kind === "review" ? "A held review" : x.kind === "review_backlog" ? "The review queue" : x.role === "manager" ? (x.kind === "ask" && x.previous ? "The previous manager asks" : "The manager asks") : "A worker asks"}</MetaItem>
+                  <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.kind === "triage" ? triageSource(x.count, x.proposals) : x.kind === "review" ? "A held review" : x.kind === "review_backlog" ? "The review queue" : x.role === "manager" ? (x.kind === "ask" && x.previous ? "The previous manager asks" : "The manager asks") : "A worker asks"}</MetaItem>
                   <MetaItem title={exact(x.at_ms)}>{ago(x.at_ms)}</MetaItem>
                 </MetaRow>
               </Stack>
