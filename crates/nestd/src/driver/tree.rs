@@ -21,10 +21,18 @@
 //!   instead keeps what it stopped and passes over what it can't stop: a fenced guest must not run
 //!   on.
 //! - **Never another process.** A pidfd is opened for each member when it is found, then its
-//!   parent or session is read, and the pidfd is kept: every later signal goes through it, so a
-//!   pid that exited and was reused is never hit, and a member whose parent exited is still
-//!   reached. (A pid reused by a new member within one freeze, which takes wraparound within a
-//!   second, could hide that member until the next freeze.)
+//!   parent, session and start time are read again, and the pidfd is kept: every later signal
+//!   goes through it, so a pid that exited and was reused is never hit, and a member whose parent
+//!   exited is still reached. A member that has exited is forgotten at the next freeze or thaw.
+//!   What is left of pid reuse, each needing a pid to wrap around within one freeze (a second at
+//!   most):
+//!   - a new member that took a pid this freeze already knows isn't pinned until the next freeze;
+//!   - a process that took a candidate's pid between the table's read and the pin passes the
+//!     second read only if it is itself in the guest's session or a child of a member, which
+//!     makes it a member anyway.
+//!
+//!   A pinned member is a seed for finding its children only if it is alive, by its pidfd, after
+//!   the table was read: the table's row for its pid is then its own, never a later holder's.
 //! - **Never nestd's own.** Whatever the rules above made of the process table, [`refusal`] keeps
 //!   some processes from ever being pinned, and so signalled: no process id (0 and negative pids
 //!   name process groups, -1 every process), init, nestd, nestd's ancestors, and any process
@@ -34,7 +42,11 @@
 //!   stopped, deepest first ([`deepest_first`]); one an agent had stopped itself (`kill -STOP`, a
 //!   suspended job) stays stopped.
 //! - **A kill goes on regardless.** It passes over a process it can't pin or stop (reported) and
-//!   keeps looking for what comes after it in the tree.
+//!   keeps looking for what comes after it in the tree. It holds the tree's lock throughout, for
+//!   up to about 11 s at worst (a freeze's budget, then ten looks of a budget each when members
+//!   keep appearing), and a pause waits for it.
+//! - **nestd's own death.** The death signal and a restarting nestd's pidfile reach the guest
+//!   alone: the rest of its tree runs on (a cell host's VMM cgroup is what holds everything).
 //! - **Quiescence is per thread, not per I/O.** A process counts as stopped once every thread of
 //!   it is, and one in an uninterruptible wait with SIGSTOP pending (a write throttled on dirty
 //!   pages) counts as stopped though that write may still finish. In a multithreaded process whose
@@ -526,9 +538,14 @@ mod tests {
         assert!(root.exits(), "the guest outlived the kill");
     }
 
-    /// A task whose `status` can't be read (it is gone) has no SIGSTOP pending.
+    /// A task's pending SIGSTOP is read from its `status`; one whose `status` can't be read (it is
+    /// gone) has none.
     #[test]
     fn a_task_that_is_gone_has_nothing_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dir.path().join("status");
+        std::fs::write(&status, "Name:\tdd\nSigPnd:\t0000000000000000\nShdPnd:\t0000000000040000\n").unwrap();
+        assert!(stop_pending(&status.display().to_string()), "a status that has SIGSTOP pending");
         assert!(!stop_pending("/proc/self/task/0/status"));
         assert!(!stop_pending(&format!("/proc/self/task/{}/status", std::process::id())), "this thread runs: nothing pending");
     }
