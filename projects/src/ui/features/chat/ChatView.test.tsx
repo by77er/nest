@@ -1,10 +1,13 @@
 // The chat with the manager, on its own page (/projects/:id/manager): the log as the Worker keeps it,
 // undelivered messages flagged with why, and the composer posting the owner's words.
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { MantineProvider } from "@mantine/core";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { exact } from "../../common/time";
 import { FakeApi } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+import { theme } from "../../theme";
+import { InFlightMark, SPINNER_AFTER_MS } from "./ChatView";
 
 const chat = () => screen.findByRole("tabpanel", { name: "Chat" });
 
@@ -512,10 +515,14 @@ describe("the chat", () => {
     const c = await chat();
     const row = async (n: number) => (await within(c).findByText(`Mine ${n}`)).closest("[data-sender]") as HTMLElement;
     const mark = async (n: number) => (await row(n)).querySelector("[data-marker=sending]") as HTMLElement | null;
-    // The cue: the words, and a spinner beside them that a screen reader skips.
+    // The cue: the words on both, and one spinner in the log, the most recent in flight's (hidden from a
+    // screen reader); the other has no room kept for one.
     expect(await mark(1)).toHaveTextContent("Sending…");
     expect(await mark(2)).toHaveTextContent("Retrying…");
-    for (const n of [1, 2]) expect((await mark(n))!.querySelector(".mantine-Loader-root")).toHaveAttribute("aria-hidden", "true");
+    await waitFor(() => expect(c.querySelectorAll(".mantine-Loader-root")).toHaveLength(1));
+    expect((await mark(2))!.querySelector("[data-slot=spinner] .mantine-Loader-root")).not.toBeNull();
+    expect((await mark(2))!.querySelector("[data-slot=spinner]")).toHaveAttribute("aria-hidden", "true");
+    expect((await mark(1))!.querySelector("[data-slot=spinner]")).toBeNull();
     const said = () => document.querySelector("[data-slot=announce]")!.textContent;
     // Nothing is announced of what was already so when the chat opened.
     expect(said()).toBe("");
@@ -542,6 +549,46 @@ describe("the chat", () => {
     await waitFor(() => expect(said()).toBe("Still sending your message: nest is busy."));
     await next(own(1, "done"), own(2, "done"));
     await waitFor(() => expect(said()).toBe("Your message was delivered."));
+  });
+
+  describe("a message in flight's spinner", () => {
+    const show = (spin: boolean) =>
+      render(
+        <MantineProvider theme={theme} env="test">
+          <InFlightMark retrying={false} spin={spin} />
+        </MantineProvider>,
+      );
+    const loader = () => document.querySelector(".mantine-Loader-root");
+    const slot = () => document.querySelector("[data-slot=spinner]");
+    beforeEach(() => vi.useFakeTimers());
+    afterEach(() => vi.useRealTimers());
+
+    it("comes only after 300 ms in flight, in room kept from the start, so an ordinary send never flashes one", () => {
+      show(true);
+      expect(screen.getByText("Sending…")).toBeInTheDocument();
+      expect(slot()).not.toBeNull();
+      act(() => void vi.advanceTimersByTime(SPINNER_AFTER_MS - 1));
+      expect(loader()).toBeNull();
+      act(() => void vi.advanceTimersByTime(1));
+      expect(loader()).not.toBeNull();
+      expect(SPINNER_AFTER_MS).toBe(300);
+    });
+
+    it("never comes for a message that isn't the log's most recent in flight", () => {
+      show(false);
+      act(() => void vi.advanceTimersByTime(5000));
+      expect(screen.getByText("Sending…")).toBeInTheDocument();
+      expect(slot()).toBeNull();
+      expect(loader()).toBeNull();
+    });
+
+    it("never comes with reduced motion: the word carries the state", () => {
+      vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(prefers-reduced-motion: reduce)", media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => false }));
+      show(true);
+      act(() => void vi.advanceTimersByTime(5000));
+      expect(screen.getByText("Sending…")).toBeInTheDocument();
+      expect(loader()).toBeNull();
+    });
   });
 
   it("sends what the owner wrote, trimmed, and clears the composer", async () => {

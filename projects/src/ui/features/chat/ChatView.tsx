@@ -7,8 +7,8 @@
 // when you're there, offers the way back down when you're not, and loads older messages as you scroll up
 // without losing your place.
 
-import { Loader, ActionIcon, Badge, Button, CopyButton, Menu, Text, Textarea, Tooltip, VisuallyHidden } from "@mantine/core";
-import { useMediaQuery } from "@mantine/hooks";
+import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Textarea, Tooltip, VisuallyHidden } from "@mantine/core";
+import { useMediaQuery, useReducedMotion } from "@mantine/hooks";
 import { IconAlertTriangle, IconArrowDown, IconArrowUp, IconCalendarEvent, IconCopy, IconDots, IconHourglass, IconListCheck, IconMessage, IconPlayerStop, IconQuote, IconRefresh, IconWritingSign } from "@tabler/icons-react";
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { human } from "../../../waits";
@@ -17,7 +17,7 @@ import { useChat, useInterruptManager, useManager, usePostChat, useRestartManage
 import type { ChatMessage } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import {
-  ChatFrame, ChatLog, ChatWelcome, ComposerBox, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine, usePhone,
+  ChatFrame, ChatLog, ChatWelcome, ComposerBox, ComposerDock, DaySeparator, ErrorState, icon, LoadingState, MessageGroup, MessageRow, Prose, Row, SpinnerSlot, Stack, Starter, StepField, StepList, StepRow, StepsDisclosure, WorkingLine, usePhone,
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
 import { useTrace } from "../trace/useTrace";
@@ -206,7 +206,33 @@ export function statusNews(seen: Map<number, string>, messages: ChatMessage[]): 
   return news;
 }
 
-function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMessage; projectId: string; appear: boolean; steps?: Step[]; onQuote: (t: string) => void; onRetry: (m: ChatMessage) => void }) {
+/** How long a message is in flight before its spinner shows (the skill: loading shows only after 300 ms). */
+export const SPINNER_AFTER_MS = 300;
+
+/**
+ * A message in flight: the word ("Sending…", "Retrying…"), quiet, which always carries the state. `spin`:
+ * this is the log's one message that may show a spinner (the most recent in flight). The spinner comes only
+ * once it has been in flight here for `SPINNER_AFTER_MS`, so an ordinary send never flashes one, in room
+ * kept from the start so the word doesn't move; with reduced motion there's none at all.
+ */
+export function InFlightMark({ retrying, spin }: { retrying: boolean; spin: boolean }) {
+  const still = useReducedMotion();
+  const [late, setLate] = useState(false);
+  useEffect(() => {
+    const t = setTimeout(() => setLate(true), SPINNER_AFTER_MS);
+    return () => clearTimeout(t);
+  }, []);
+  return (
+    <Row gap="xs" wrap="nowrap" data-marker="sending" data-status={retrying ? "retrying" : "owed"}>
+      {spin && !still && <SpinnerSlot on={late} />}
+      <Text fz="xs" c="dimmed">
+        {retrying ? "Retrying…" : "Sending…"}
+      </Text>
+    </Row>
+  );
+}
+
+function Message({ m, projectId, appear, steps, spin = false, onQuote, onRetry }: { m: ChatMessage; projectId: string; appear: boolean; steps?: Step[]; spin?: boolean; onQuote: (t: string) => void; onRetry: (m: ChatMessage) => void }) {
   if (m.sender === "app") {
     return (
       <MessageRow side="note" appear={appear} data-sender="app">
@@ -230,15 +256,7 @@ function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMes
       data-seq={String(m.seq)}
       meta={
         <>
-          {/* In flight: quiet, a small spinner (a loading indicator) and the word, never colour alone. */}
-          {sending && (
-            <Row gap="xs" wrap="nowrap" data-marker="sending" data-status={retrying ? "retrying" : "owed"}>
-              <Loader size={icon.sm} color="gray" aria-hidden />
-              <Text fz="xs" c="dimmed">
-                {retrying ? "Retrying…" : "Sending…"}
-              </Text>
-            </Row>
-          )}
+          {sending && <InFlightMark retrying={retrying} spin={spin} />}
           {failed && (
             <Badge size="xs" color="warning" variant="light" leftSection={<IconAlertTriangle size={icon.sm} aria-hidden />} data-marker="undelivered">
               Not delivered
@@ -505,6 +523,8 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const phone = usePhone();
   const streamSteps = live?.steps ?? (held ? (heldEnd?.steps ?? held.steps) : []);
   const replySteps = stepsBySeq(messages, finished);
+  // One spinner in the log: the most recent of the owner's messages in flight.
+  const spinSeq = messages.filter((m) => m.sender === "owner" && (statusOf(m) === "owed" || statusOf(m) === "retrying")).at(-1)?.seq;
   const stream = running || streamSteps.length > 0;
   // A tool running shows itself; otherwise the turn is between steps (thinking, writing): a working line.
   emptyRef.current = messages.length === 0 && !stream;
@@ -553,6 +573,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
                         projectId={projectId}
                         appear={!!seen.current && m.seq > 0 && !seen.current.has(m.seq)}
                         steps={replySteps.get(m.seq)}
+                      spin={m.seq === spinSeq}
                         onQuote={quoteReply}
                         onRetry={retry}
                       />

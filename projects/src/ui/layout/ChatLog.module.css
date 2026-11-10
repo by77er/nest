@@ -166,6 +166,14 @@
   z-index: 2;
 }
 
+/* A status's spinner: its room, the spinner's own size, held before it shows. */
+.spinnerSlot {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 0.875rem;
+  height: 0.875rem;
+}
+
 /* The manager at work with nothing new to show: three dots (a loading indicator) and a muted word. */
 .working {
   display: flex;
