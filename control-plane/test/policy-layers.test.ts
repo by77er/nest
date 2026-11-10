@@ -1,4 +1,4 @@
-import { env, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { admin, adminJson, connectHost, nextCommands, runDue, sleep, uniqueCell } from "./helpers";
 

@@ -3,7 +3,7 @@
 // brain); timers live in AgentDO's SQLite with one deadline each, so they survive a restart; the owner
 // lists and cancels them. A timer is made due by moving its row and deadline to the past and running
 // the alarm (`runDue`), never by waiting out the real 10 s minimum.
-import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { AgentDO } from "../src/do/agent";
 import { ClientOutbox } from "../src/lib/client-events";
@@ -213,8 +213,11 @@ describe("timers", () => {
     await runInDurableObject(agentStub(s.agent), (inst: AgentDO, st) => {
       st.storage.sql.exec("INSERT INTO timers (name, id, at_ms, note, set_ms) VALUES ('orphan', 'k-o', ?, '', ?)", Date.now() + 600_000, Date.now());
       st.storage.sql.exec("DELETE FROM deadlines WHERE key = 'timer:orphan'");
+      // Something due brings an alarm (`runDue`): a bare `runDurableObjectAlarm` does nothing while the
+      // new agent's own first alarm (`registry`) is still in flight, and the timer stayed unarmed.
+      st.storage.sql.exec("INSERT OR REPLACE INTO deadlines (key, at) VALUES ('prune', 0)");
     });
-    await runDurableObjectAlarm(agentStub(s.agent));
+    await runDue(agentStub(s.agent));
     const at = await runInDurableObject(agentStub(s.agent), (_: AgentDO, st) =>
       st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'timer:orphan'").toArray()[0]?.at);
     expect(at).toBeGreaterThan(Date.now() + 500_000);
