@@ -1715,6 +1715,19 @@ export class FleetDO extends DurableObject<Env> {
     else this.sql.exec("DELETE FROM leases WHERE sandbox = ? AND epoch = ?", sandbox, epoch);
   }
 
+  /**
+   * SandboxDO releases a failed sandbox's lease (`releaseFailed`): the lease goes, and the incarnation it
+   * leaves on `host` is recorded as stale, not yet clean, in the same step. While it is, the host isn't
+   * retired as idle (`scaleDown`); `reapStale` destroys it once salvaged or past its salvage window.
+   */
+  async releaseFailedLease(sandbox: string, host: string, epoch: number): Promise<void> {
+    const had = this.sql.exec("DELETE FROM leases WHERE sandbox = ? AND host = ? AND epoch = ?", sandbox, host, epoch).rowsWritten > 0;
+    if (had) {
+      this.recordStale(sandbox, host, epoch, false);
+      await this.armTick();
+    }
+  }
+
   async leaseOf(sandbox: string): Promise<{ host: string; epoch: number; expired: boolean; state: SandboxState | null; guest: GuestInfo | null } | null> {
     const l = this.lease(sandbox);
     return l ? {
@@ -2341,7 +2354,10 @@ export class FleetDO extends DurableObject<Env> {
         if (!h) continue;
         // Suspended sandboxes don't keep a host up; a brain does until its exit is reported (or its
         // host expired): declaring the host dead before would let it run twice.
-        const busy = this.leasesOf(h.host).some((l) => l.state !== "suspended") || this.brainsOn(h.host) > 0;
+        // Nor is a host retired while it holds an incarnation not yet salvaged and destroyed (a failed
+        // sandbox's, released): its uncommitted work would go with the instance.
+        const salvaging = this.sql.exec("SELECT 1 FROM stale_incarnations WHERE host = ? AND cmd IS NULL", h.host).toArray().length > 0;
+        const busy = this.leasesOf(h.host).some((l) => l.state !== "suspended") || this.brainsOn(h.host) > 0 || salvaging;
         const step = idleStep(busy, h.idle_since, now, grace);
         if (step === "busy") {
           if (h.idle_since !== null) this.sql.exec("UPDATE hosts SET idle_since = NULL WHERE host = ?", h.host);

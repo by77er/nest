@@ -175,6 +175,17 @@ export class DirectoryDO extends DurableObject<Env> {
     this.sql.exec("INSERT INTO sync (k, v) VALUES ('github_app_id', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", String(id));
   }
 
+  /** The GitHub id of nest's App's bot account (`<slug>[bot]`), the author of workers' PRs; null until looked up (src/github.ts `appBotId`). */
+  async githubAppBotId(): Promise<number | null> {
+    const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'github_app_bot_id'").toArray()[0];
+    return row ? Number(row.v) : null;
+  }
+
+  async recordGithubAppBotId(id: number): Promise<void> {
+    if (!Number.isSafeInteger(id) || id <= 0) return;
+    this.sql.exec("INSERT INTO sync (k, v) VALUES ('github_app_bot_id', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", String(id));
+  }
+
   /** Every project's repo: what the role templates may push to. */
   async repos(): Promise<string[]> {
     return this.sql.exec<{ repo: string }>("SELECT repo FROM projects ORDER BY repo").toArray().map((r) => r.repo);

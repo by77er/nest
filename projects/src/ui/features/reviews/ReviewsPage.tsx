@@ -1,5 +1,6 @@
 // A project's reviews: every review job ReviewDO knows, newest first, with its PR, where it is, and the
-// verdict on each dimension once there is one. Read-only. A table, or below `sm` a card per review (its
+// verdict on each dimension once there is one. Read-only, but for a review held for the owner's approval
+// (README.md#the-review-gate), which is approved or dismissed here. A table, or below `sm` a card per review (its
 // PR and title, its sha, its state, its verdicts, when, and its trace), so nothing starts off screen.
 
 import { Anchor, Badge, Button, Table, Text, Tooltip } from "@mantine/core";
@@ -9,16 +10,24 @@ import { Fragment, useState } from "react";
 import { useReviews } from "../../api/queries";
 import type { Dimension, Job } from "../../api/types";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Stack, TableFrame, TriggerBadge, usePhone, weight } from "../../layout";
+import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Stack, TableFrame, Token, TriggerBadge, usePhone, weight } from "../../layout";
 import { REVIEW_STATE } from "../../status";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { ReviewTrace } from "../trace/AgentTraces";
+import { HeldActions, heldFrom } from "./HeldReview";
 
 const DIMENSIONS = [
   ["correctness", "Correctness"],
   ["quality", "Quality"],
   ["architecture", "Architecture"],
 ] as const satisfies readonly (readonly [Dimension, string])[];
+
+/** Reviews waiting for the owner's approval first (the longest waiting on top), then those waiting their turn, then the rest, newest first. */
+export function byHeldThenNewest(a: Job, b: Job): number {
+  const rank = (j: Job) => (j.state === "held" ? 0 : j.state === "overflow" ? 1 : 2);
+  if (rank(a) !== rank(b)) return rank(a) - rank(b);
+  return rank(a) < 2 ? a.created_ms - b.created_ms : b.updated_ms - a.updated_ms;
+}
 
 /** A review job's state, or "Changes needed" for a verdict that failed a dimension (also on a task's PRs). */
 export function JobState({ job, size = "md" }: { job: Job; size?: "sm" | "md" }) {
@@ -40,7 +49,19 @@ function TaintedBadge() {
 }
 
 /** The verdict badges; `tainted` (the table's) puts Tainted after them, a card puts it on its state row. */
-function Verdicts({ job, tainted = true }: { job: Job; tainted?: boolean }) {
+function Verdicts({ job, tainted = true, projectId }: { job: Job; tainted?: boolean; projectId: string }) {
+  // Waiting for the owner (held, or past the cap on held ones), or dismissed by them: who it's from, and what the owner can do.
+  if (job.state === "held" || job.state === "overflow" || job.state === "dismissed") {
+    const why = job.state === "held" ? "Its review waits for your approval." : job.state === "overflow" ? "It waits its turn: too many reviews wait for your approval." : "You dismissed its review.";
+    return (
+      <Stack gap="sm">
+        <Text fz="sm" c="dimmed">
+          {heldFrom(job)}. {why}
+        </Text>
+        <HeldActions projectId={projectId} held={job} dismiss={job.state === "held"} primary={job.state === "held"} />
+      </Stack>
+    );
+  }
   if (!job.verdict) return <Text fz="sm" c="dimmed">{job.error ?? "No verdict yet"}</Text>;
   return (
     // Badges that open their notes, wrapping into rows: a 44 px pitch between rows on touch.
@@ -101,7 +122,7 @@ function TraceToggle({ j, open, onToggle, long = false }: { j: Job; open: boolea
 }
 
 /** Below `sm`: a review as a card, top to bottom, its trace under it when open. */
-function ReviewCard({ repo, j, open, onToggle }: { repo: string; j: Job; open: boolean; onToggle: () => void }) {
+function ReviewCard({ projectId, repo, j, open, onToggle }: { projectId: string; repo: string; j: Job; open: boolean; onToggle: () => void }) {
   const key = `${j.pr}/${j.sha}`;
   return (
     <Panel dense>
@@ -111,7 +132,7 @@ function ReviewCard({ repo, j, open, onToggle }: { repo: string; j: Job; open: b
           <JobState job={j} />
           {j.tainted && <TaintedBadge />}
         </Row>
-        <Verdicts job={j} tainted={false} />
+        <Verdicts job={j} tainted={false} projectId={projectId} />
         <Row justify="space-between" wrap="nowrap">
           <MetaRow>
             <MetaItem>
@@ -148,16 +169,16 @@ export function ReviewsPage() {
             <ErrorState title="The reviews couldn't be loaded" error={reviews.error} onRetry={() => void reviews.refetch()} />
           ) : reviews.data.length === 0 ? (
             <Panel>
-              <EmptyState icon={IconShieldCheck} title="No reviews yet" description="Every PR on the repo gets a review by a reviewer agent; its jobs show here." />
+              <EmptyState icon={IconShieldCheck} title="No reviews yet" description="Every PR on the repo gets a review by a reviewer agent; one from someone the project doesn't trust waits here for your approval." />
             </Panel>
           ) : phone ? (
             <Stack gap="sm" role="list" aria-label="Review jobs">
               {[...reviews.data]
-                .sort((a, b) => b.updated_ms - a.updated_ms)
+                .sort(byHeldThenNewest)
                 .map((j) => {
                   const key = `${j.pr}/${j.sha}`;
                   const open = traced === key;
-                  return <ReviewCard key={key} repo={p.repo} j={j} open={open} onToggle={() => setTraced(open ? null : key)} />;
+                  return <ReviewCard key={key} projectId={projectId} repo={p.repo} j={j} open={open} onToggle={() => setTraced(open ? null : key)} />;
                 })}
             </Stack>
           ) : (
@@ -174,7 +195,7 @@ export function ReviewsPage() {
               </Table.Thead>
               <Table.Tbody>
                 {[...reviews.data]
-                  .sort((a, b) => b.updated_ms - a.updated_ms)
+                  .sort(byHeldThenNewest)
                   .map((j) => {
                     const key = `${j.pr}/${j.sha}`;
                     const open = traced === key;
@@ -188,15 +209,15 @@ export function ReviewsPage() {
                         <JobState job={j} />
                       </Table.Td>
                       <Table.Td>
-                        <Verdicts job={j} />
+                        <Verdicts job={j} projectId={projectId} />
                       </Table.Td>
                       <Table.Td ta="right">
                         <Text fz="sm">{j.runs}</Text>
                       </Table.Td>
                       <Table.Td ta="right">
-                        <Text fz="sm" c="dimmed" title={exact(j.updated_ms)}>
+                        <Token mono={false} size="sm" nowrap title={exact(j.updated_ms)}>
                           {ago(j.updated_ms)}
-                        </Text>
+                        </Token>
                       </Table.Td>
                       <Table.Td>
                         <TraceToggle j={j} open={open} onToggle={() => setTraced(open ? null : key)} />

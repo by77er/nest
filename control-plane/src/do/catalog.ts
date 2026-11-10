@@ -220,7 +220,8 @@ export class CatalogDO extends DurableObject<Env> {
     const cat = this.load();
     const r = checkTemplate(tpl, cat.capabilities);
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `template ${name}: ${r.error}`);
-    // Expanded as written (no overrides): what it gives must hold together, and a client's stay in its grant.
+    // Expanded as written (no overrides): what it gives must hold together (its launch's model and effort
+    // plain tokens, `launchProblem`, whoever writes it), and a client's stay in its grant.
     const spec = expandTemplate({ capabilities: cat.capabilities, templates: { [name]: tpl } }, PLATFORM_TOOL_NAMES, name,
       scope ? { [scope.name]: scope.client } : {});
     if (!spec.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, spec.error);

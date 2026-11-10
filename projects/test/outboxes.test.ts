@@ -277,6 +277,8 @@ describe("the outboxes' migration", () => {
       for (const t of ["pr_facts", "comments_seen"]) sql.exec(`DROP TABLE ${t}`);
       sql.exec("ALTER TABLE settings DROP COLUMN manager_restarts");
       sql.exec("ALTER TABLE settings DROP COLUMN listed_ms");
+      for (const c of ["manager_model", "worker_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      for (const t of ["model_templates", "agent_templates"]) sql.exec(`DROP TABLE ${t}`);
       // And the step after them (an attach's generation, early exits).
       sql.exec("ALTER TABLE settings DROP COLUMN attach_gen");
       sql.exec("DROP TABLE early_exits");

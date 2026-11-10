@@ -37,6 +37,27 @@ def write(target, name, data):
     (d / name).write_bytes(data)
 
 
+def der(tag, content):
+    n = len(content)
+    if n < 0x80:
+        length = bytes([n])
+    else:
+        b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        length = bytes([0x80 | len(b)]) + b
+    return bytes([tag]) + length + content
+
+
+def certificate(version, key):
+    tbs = der(0xA0, der(0x02, b"\x02")) if version else b""
+    tbs += der(0x02, b"\x01\x02\x03")
+    tbs += der(0x30, der(0x06, b"\x2a\x86\x48\xce\x3d\x04\x03\x02"))  # ecdsa-with-SHA256
+    tbs += der(0x30, b"") + der(0x30, der(0x17, b"260101000000Z") + der(0x17, b"270101000000Z")) + der(0x30, b"")
+    spki = der(0x30, der(0x06, b"\x2a\x86\x48\xce\x3d\x02\x01") + der(0x06, b"\x2a\x86\x48\xce\x3d\x03\x01\x07"))
+    spki += der(0x03, b"\x00" + key)
+    tbs += der(0x30, spki)
+    return der(0x30, der(0x30, tbs) + der(0x30, der(0x06, b"\x2a\x86\x48\xce\x3d\x04\x03\x02")) + der(0x03, b"\x00\x01"))
+
+
 def main():
     if SEEDS.exists():
         shutil.rmtree(SEEDS)
@@ -52,6 +73,12 @@ def main():
     write("guest_stream", "data_frame", b"\x00" + guest_frame(1, b"\x1b[0mpty bytes"))
 
     write("vsock_handshake", "ok", b"OK 1073741825\n")
+
+    # The fixtures' certificates are placeholders, so the CA seeds are built here: the shape of
+    # an X.509 certificate down to its subject public key (with and without a version, a
+    # two-byte length), which is all `cert_public_key` reads.
+    for name, version, key in (("v3_ec", True, b"\x04" + bytes(range(64))), ("v1", False, b"\x04" + bytes(64)), ("long", True, bytes(300))):
+        write("cert_public_key", name, certificate(version, key))
 
     for p in fixtures("host/proxy_event"):
         write("proxy_events", p.stem, compact(p))

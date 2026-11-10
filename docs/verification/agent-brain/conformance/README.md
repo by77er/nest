@@ -390,3 +390,7 @@ By reading, no model run; the inventory's [§2.4](../#24-a-turns-life-agentdo-tu
 
 Line citations above this section are function names or older heads; `agent.ts` has grown, so `file:line` there is stale while the names resolve.
 
+
+## a start refused for its launch (cp/launch-model-chars, author's map, 2026-11-09)
+
+- **`processIntent`, with no brain:** before `pickHost`, an agent whose stored launch isn't plain tokens (`launchProblem`, `lib/spec.ts`) throws a non-retryable `invalid_message`. `intentFailed` ends the intent and, with no brain, sets `errored` with `start_error`, as for any start refused for good. Conforms: no brain record is read or written by the refusal, no command is issued, and no new transition is added (the model's start is simply not taken). The branches with a brain (release, condemned, `liveBrainStart`) are unchanged.

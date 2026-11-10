@@ -226,9 +226,12 @@ describe("B20: terminal history-like rows pruned by age", () => {
       // An old ended job whose check's completion is still owed to GitHub: kept.
       sql.exec("INSERT INTO jobs (pr, sha, state, attempts, check_run, created_ms, updated_ms) VALUES (7, ?, 'closed', 0, 4711, 0, ?)", sha(), old);
       sql.exec("INSERT INTO check_updates (check_run, body, next_ms) VALUES (4711, '{}', ?)", Date.now());
+      // The review gate's states (README.md#the-review-gate): one the owner dismissed long ago goes like any
+      // ended job; one still waiting for approval never does, however old.
+      sql.exec("INSERT INTO jobs (pr, sha, state, attempts, created_ms, updated_ms) VALUES (6, ?, 'dismissed', 0, 0, ?), (5, ?, 'held', 0, 0, ?), (4, ?, 'overflow', 0, 0, ?)", sha(), old, sha(), old, sha(), old);
     });
     await runInDurableObject(reviewStub(p), (inst: unknown) => (inst as { prune(now: number): void }).prune(Date.now()));
     const left = await inReview(p, (sql) => sql.exec("SELECT pr, state FROM jobs ORDER BY pr").toArray());
-    expect(left).toEqual([{ pr: 7, state: "closed" }, { pr: 8, state: "done" }, { pr: 9, state: "done" }]);
+    expect(left).toEqual([{ pr: 4, state: "overflow" }, { pr: 5, state: "held" }, { pr: 7, state: "closed" }, { pr: 8, state: "done" }, { pr: 9, state: "done" }]);
   });
 });

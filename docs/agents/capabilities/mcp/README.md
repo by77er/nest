@@ -133,9 +133,16 @@ mcp: {url: https://mcp.example.com/mcp, auth: {oauth: cap:notes, client: cap:not
   - A 403 `insufficient_scope` is `forbidden`, naming the scopes the challenge asks for.
   - **Bound to the server:** the record keeps the URL it was authorized for, and a grant naming another URL gets no token. The spec says clients "MUST NOT send tokens to the MCP server other than ones issued by the MCP server's authorization server".
   - The access token reaches AgentDO's memory for the request only. The refresh token, the verifier and any client secret never leave BrokerDO.
-- **Audit:** BrokerDO writes `oauth_start`, `oauth_registered`, `oauth_authorized`, `oauth_callback_refused`, `oauth_refreshed`, `oauth_refresh_failed` and `oauth_token_refused` to R2 under `audit/broker/<day>/`. Each record holds the capability, record, resource, issuer, client id, scope, expiry, caller and reason, never a token, code, verifier or state ([issuance audit](../../../control-plane/durable-objects/broker/#issuance-audit)).
+- **Audit:** BrokerDO writes `oauth_start`, `oauth_registered`, `oauth_authorized`, `oauth_callback_refused`, `oauth_refreshed`, `oauth_refresh_failed`, `oauth_token_refused` and `oauth_revoked` to R2 under `audit/broker/<day>/`. Each record holds the capability, record, resource, issuer, client id, scope, expiry, caller and reason, never a token, code, verifier or state ([issuance audit](../../../control-plane/durable-objects/broker/#issuance-audit)).
+- **Revoking** (built 2026-11-09): `DELETE /v1/admin/capabilities/<name>/oauth` (admin token) revokes the capability's authorization.
+  - Its records go at once, in one step, with any authorization the operator started and didn't finish. No token is served or refreshed from them again; the status reads `unauthorized`, and an agent's call names re-authorization.
+  - Then, best effort, the refresh token (else the access token) is revoked at the authorization server when its metadata lists a `revocation_endpoint` ([RFC 7009](https://datatracker.ietf.org/doc/html/rfc7009)), authenticating as the client that got it.
+  - The answer says what happened there, per record: `{revoked: [{ref, issuer, server}]}`, `server` one of `revoked`, `unsupported` (no endpoint), `failed` (the tokens may live on at the server until they expire) or `no_tokens`.
+  - It finds records by the capability's name as they hold it, so it works after the capability was deleted: a capability recreated under that name never reuses old tokens.
+  - **It wins over an authorization still finishing.** A callback whose code was being exchanged when the revoke ran stores nothing: it revokes the tokens it just got at the server (best effort, as above) and its page says the authorization was revoked. The operator authorizes again.
+  - **A refresh in flight can leave one token behind** (known bound): when a refresh rotated the refresh token at the server while the revoke ran, the revoke sent the old one. The record is gone either way, so nest never stores or serves the rotated token, but it lives at the server until it expires, unless the server revokes a token's whole family on a revoked predecessor ([RFC 7009 §2.1](https://datatracker.ietf.org/doc/html/rfc7009#section-2.1) leaves that to the server; unverified for any given one).
+  - Audited as `oauth_revoked`, never a token. Deleting a capability doesn't revoke by itself.
 - **Not built:**
-  - token revocation at the authorization server ([RFC 7009](https://datatracker.ietf.org/doc/html/rfc7009)) and deleting a record;
   - telling the operator unprompted when a record needs re-authorizing (the agent's error and the status route say so);
   - `private_key_jwt`;
   - choosing among several `authorization_servers`;
