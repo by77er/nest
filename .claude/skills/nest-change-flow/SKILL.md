@@ -30,7 +30,7 @@ Your instructions win over this skill where they differ (for example "no PR"). R
 
 - **Commit:** what and why, ending with the attribution lines your instructions give.
 - **Push** with `git push -u origin <branch>`, then report the pushed head from `git ls-remote origin refs/heads/<branch>`, not your local idea of it.
-- **Open the PR** with `gh pr create`. The body says what changed and why; the tests added and what was mutated; the evidence tier of each claim; any skipped test; any `CODEOWNERS` paths touched; the design review's verdict, for frontend; the rollout rule, if any.
+- **Open the PR** with `gh pr create`. The body says what changed and why; the tests added and what was mutated; the evidence tier of each claim; any skipped test; any `CODEOWNERS` paths touched; the design review's verdict, for frontend; the rollout rule's file, if any (`dev/rollout/YYYY-MM-DD-<slug>.md`, one new file per change; never edit `dev/deploy.md` for it, where every open PR would conflict).
 - **Wait for CI:** `gh pr checks <n> --watch --required` (`ci-ok` aggregates every job). A red job gets a root cause, not a rerun-until-green; a flaky test is fixed as `nest-tests` says.
 - **Self-merge on green:** the owner's standing instruction (2026-10-23), unless your task says otherwise. Use `gh pr merge <n> --squash --auto --delete-branch`; it merges PRs touching `CODEOWNERS` paths too.
   - Never use `--admin` or bypass branch protection in any other way.
