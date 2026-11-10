@@ -1,6 +1,6 @@
 // The chat with the manager, on its own page (/projects/:id/manager): the log as the Worker keeps it,
 // undelivered messages flagged with why, and the composer posting the owner's words.
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { exact } from "../../common/time";
 import { FakeApi } from "../../test/fakeApi";
@@ -29,16 +29,21 @@ function traceSocket(events: object[]) {
     close() {}
   };
 }
-/** The same, but each message in a tick of its own (React renders between them), as a real socket's backlog. */
-function slowTraceSocket(events: object[], gapMs = 15) {
-  return class {
-    private listeners: Record<string, ((e: { data?: string }) => void)[]> = {};
+/**
+ * A trace socket the test drives: `push` delivers messages when the test says, each push rendered before
+ * the next, so a state that lasts only between two events (a call running, a replay looking live) is seen
+ * for certain. (A socket replaying on timers raced the renders under load: a 60 ms window could pass
+ * between two renders and never be shown.)
+ */
+function drivenTraceSocket() {
+  let socket: { listeners: Record<string, ((e: { data?: string }) => void)[]> } | null = null;
+  class Socket {
+    listeners: Record<string, ((e: { data?: string }) => void)[]> = {};
     constructor(readonly url: string) {
-      const all = [...events, { type: "live" }];
+      socket = this;
       setTimeout(() => this.emit("open", {}), 0);
-      all.forEach((e, i) => setTimeout(() => this.emit("message", { data: JSON.stringify(e) }), (i + 1) * gapMs));
     }
-    private emit(type: string, e: { data?: string }) {
+    emit(type: string, e: { data?: string }) {
       for (const l of this.listeners[type] ?? []) l(e);
     }
     addEventListener(type: string, l: (e: { data?: string }) => void) {
@@ -47,7 +52,15 @@ function slowTraceSocket(events: object[], gapMs = 15) {
     removeEventListener() {}
     send() {}
     close() {}
+  }
+  const push = async (...events: object[]) => {
+    // The page is listening (its trace hook has subscribed), then the messages arrive in one render.
+    await waitFor(() => expect(socket?.listeners.message?.length).toBeGreaterThan(0));
+    act(() => {
+      for (const e of events) for (const l of socket!.listeners.message ?? []) l({ data: JSON.stringify(e) });
+    });
   };
+  return { Socket, push };
 }
 let seq = 0;
 const ev = (type: string, more: Record<string, unknown> = {}) => ({ seq: ++seq, ts_ms: Date.now(), type, turn: "trn_9", ...more });
@@ -141,29 +154,34 @@ describe("the chat", () => {
   });
 
   it("a turn that ends without a reply (stopped) leaves no stream behind, its calls never left spinning", async () => {
-    vi.stubGlobal("WebSocket", slowTraceSocket([ev("turn_started", { turn: "trn_s" }), ev("tool_call", { turn: "trn_s", call_id: "c1", name: "Bash", input: { command: "sleep 100" } }), ev("turn_completed", { turn: "trn_s", stop_reason: "interrupted" })], 60));
+    const trace = drivenTraceSocket();
+    vi.stubGlobal("WebSocket", trace.Socket);
     renderApp("/projects/prj_one/manager", new FakeApi());
     const c = await chat();
-    // Seen running first (its own tick), then gone once the turn ends with nothing to say.
+    // Seen running first, then gone once the turn ends with nothing to say.
+    await trace.push(ev("turn_started", { turn: "trn_s" }), ev("tool_call", { turn: "trn_s", call_id: "c1", name: "Bash", input: { command: "sleep 100" } }));
     expect(await within(c).findByRole("button", { name: "Bash sleep 100, running" })).toBeInTheDocument();
+    await trace.push(ev("turn_completed", { turn: "trn_s", stop_reason: "interrupted" }));
     await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
   });
 
   it("reopening the chat, a replayed backlog doesn't leave the last turn's stream under its own reply", async () => {
-    vi.stubGlobal("WebSocket", slowTraceSocket([
-      ev("turn_started", { turn: "trn_r" }),
-      ev("tool_call", { turn: "trn_r", call_id: "c1", name: "Read", input: { file_path: "a.ts" } }),
-      ev("tool_result", { turn: "trn_r", call_id: "c1", is_error: false, summary: "ok" }),
-      ev("assistant_text", { turn: "trn_r", text: "Read it." }),
-      ev("turn_completed", { turn: "trn_r", stop_reason: "end_turn" }),
-    ], 60));
+    const trace = drivenTraceSocket();
+    vi.stubGlobal("WebSocket", trace.Socket);
     const api = new FakeApi();
     api.chat = [{ seq: 1, at_ms: Date.now(), sender: "manager", text: "Read it.", delivered: true, status: "done" as const, error: null }];
     renderApp("/projects/prj_one/manager", api);
     const c = await chat();
     await within(c).findByText("Read it.");
-    // The replay looks live for a moment (its own ticks)…
+    // The replay looks live for a moment (rendered before the turn's end arrives)…
+    await trace.push(
+      ev("turn_started", { turn: "trn_r" }),
+      ev("tool_call", { turn: "trn_r", call_id: "c1", name: "Read", input: { file_path: "a.ts" } }),
+      ev("tool_result", { turn: "trn_r", call_id: "c1", is_error: false, summary: "ok" }),
+      ev("assistant_text", { turn: "trn_r", text: "Read it." }),
+    );
     await waitFor(() => expect(c.querySelector("[data-sender=stream]")).not.toBeNull());
+    await trace.push(ev("turn_completed", { turn: "trn_r", stop_reason: "end_turn" }), { type: "live" });
     // …then the turn is the reply's, behind it, once.
     expect(await within(c).findByRole("button", { name: "Used 1 tool" })).toBeInTheDocument();
     await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
@@ -359,10 +377,11 @@ describe("the chat", () => {
     expect(c.querySelector("[data-sender=stream]")).toBeNull();
   });
 
-  it("a message's exact time is in its actions (hover shows it too), so the keyboard and touch reach it", async () => {
+  // Whatever the message's age: under a week its time line is relative, past it the line is the exact time
+  // itself (so the text is on the page twice: the test reads the actions' own copy, in the menu).
+  it.each([["three hours old", 3 * 3_600_000], ["a month old", 30 * 86_400_000]])("a message's exact time is in its actions (hover shows it too), so the keyboard and touch reach it: %s", async (_age, ageMs) => {
     const api = new FakeApi();
-    // A few hours ago, whenever the test runs: the time line then says so ("3 hours ago"), not the exact time.
-    const at = Date.now() - 3 * 3_600_000;
+    const at = Date.now() - ageMs;
     api.chat = [{ seq: 1, at_ms: at, sender: "manager", text: "Hello", delivered: true, status: "done" as const, error: null }];
     const { user } = renderApp("/projects/prj_one/manager", api);
     const c = await chat();
@@ -370,7 +389,7 @@ describe("the chat", () => {
     // The time line isn't a tab stop of its own.
     expect(c.querySelector("time")).not.toHaveAttribute("tabindex");
     await user.click(within(c).getByRole("button", { name: "Message actions" }));
-    expect(await screen.findByText(exact(at))).toBeInTheDocument();
+    expect(within(await screen.findByRole("menu")).getByText(exact(at))).toBeInTheDocument();
   });
 
   it("\"Quote in a reply\" quotes into the composer and puts focus there, the caret at the end", async () => {

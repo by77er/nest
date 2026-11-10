@@ -427,6 +427,37 @@ describe("the installation cache", () => {
     }
   });
 
+  it("a real refusal confirmed by a lookup isn't looked up again for a while: repeated, it costs one GitHub call", async () => {
+    const r = repo();
+    const c = await newClient({ repos: [r], permissions: { contents: "read", issues: "write" } });
+    await askJson(c.token, { repo: r, permissions: { contents: "read" } }, 200);
+    gh.ungranted = "issues";
+    try {
+      const calls = () => gh.mintAsks.length + gh.lookups;
+      // The first: the mint is refused, a lookup confirms the installation (two calls).
+      let before = calls();
+      expect((await ask(c.token, { repo: r, permissions: { issues: "write" } })).status).toBe(502);
+      expect(calls() - before).toBe(2);
+      // Again at once: the mint alone.
+      before = calls();
+      const lookups = gh.lookups;
+      expect((await ask(c.token, { repo: r, permissions: { issues: "write" } })).status).toBe(502);
+      expect(calls() - before).toBe(1);
+      expect(gh.lookups).toBe(lookups);
+    } finally {
+      gh.ungranted = null;
+    }
+    // Once that lapses, a refusal is looked up again: a reinstall since is found and minted from.
+    gh.installs.set(r, gh.installs.get(r)! + 1);
+    const broker = env.BROKER.get(env.BROKER.idFromName("broker")) as DurableObjectStub;
+    await runInDurableObject(broker, (inst: unknown) => {
+      const confirmed = (inst as { confirmedInstallations: Map<string, number> }).confirmedInstallations;
+      for (const k of confirmed.keys()) confirmed.set(k, Date.now() - 1);
+    });
+    expect((await askJson(c.token, { repo: r, permissions: { issues: "write" } }, 200)).token).toBe(gh.mints.at(-1)!.token);
+    expect(gh.mints.at(-1)!.installation).toBe(gh.installs.get(r));
+  });
+
   it("after a reinstall, a token cached from the old installation is never served again", async () => {
     const r = repo();
     const c = await newClient({ repos: [r], permissions: { contents: "read", checks: "write" } });

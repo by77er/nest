@@ -30,6 +30,9 @@ pub struct Config {
     pub tail_interval: Duration,
     /// After an interrupt request: wait this long before SIGINT, and again before SIGKILL.
     pub interrupt_grace: Duration,
+    /// After stdin is closed (idleness, a graceful stop): SIGKILL the process group if Claude Code
+    /// hasn't exited this long after.
+    pub exit_grace: Duration,
     /// Platform tool relay timeout (then `rate_limited`, retryable).
     pub tool_call_timeout: Duration,
     /// Wait for AgentDO's `tools_list` before falling back to the cached list.
@@ -56,6 +59,7 @@ impl Default for Config {
             batch_interval: Duration::from_millis(1500),
             tail_interval: Duration::from_millis(500),
             interrupt_grace: Duration::from_secs(10),
+            exit_grace: Duration::from_secs(30),
             tool_call_timeout: Duration::from_secs(150),
             tools_list_timeout: Duration::from_secs(10),
             session_open_timeout: Duration::from_secs(10),
@@ -90,6 +94,7 @@ impl Config {
         ms("NEST_RUNNER_BATCH_MS", &mut c.batch_interval);
         ms("NEST_RUNNER_TAIL_MS", &mut c.tail_interval);
         ms("NEST_RUNNER_INTERRUPT_GRACE_MS", &mut c.interrupt_grace);
+        ms("NEST_RUNNER_EXIT_GRACE_MS", &mut c.exit_grace);
         c
     }
 }
