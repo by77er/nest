@@ -76,7 +76,8 @@ export const fleet = {
     "region": "us-east-1",
     "credentials": true,
     "kms_key": true
-  }
+  },
+  "enroll_breakers": []
 } satisfies Fleet;
 
 export const images = {

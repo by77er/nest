@@ -44,6 +44,8 @@ export interface FleetResponse {
   launches: FleetView["launches"];
   sandboxes: (SandboxView | LegacySandboxRow)[];
   aws?: AwsView;
+  /** Absent from a control plane before the enrolment breaker. */
+  enroll_breakers?: FleetView["enroll_breakers"];
 }
 
 /** Either shape as the current one. */
@@ -54,6 +56,7 @@ export function normalizeFleet(raw: FleetResponse): FleetView {
       role: h.role === "burst" ? "sandbox" : h.role === "controller" ? "brain" : h.role, max_brains: h.max_brains ?? null,
     })),
     launches: raw.launches,
+    enroll_breakers: raw.enroll_breakers ?? [],
     aws: raw.aws ?? { cell: null, error: "not reported by this control plane" },
     sandboxes: raw.sandboxes.map((s): SandboxView => {
       if ("lease_state" in s) return s;
