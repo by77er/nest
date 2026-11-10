@@ -89,6 +89,50 @@ pub fn signallable(own: i32, guest_start: u64, table: &BTreeMap<i32, Stat>) -> B
     table.iter().filter(|(pid, s)| refusal(**pid, s.start, own, guest_start, table).is_none()).map(|(pid, s)| (*pid, *s)).collect()
 }
 
+/// Whether the process a pid names now (`now`, read once it is pinned) is still one of the tree:
+/// in the guest's session, or a child of the guest, of a member (`known`) or of a candidate of
+/// this pass. Otherwise the pid was freed and taken by another process since the table was read.
+/// Pure.
+pub fn still_member(now: &Stat, root: i32, known: &BTreeSet<i32>, candidates: &BTreeSet<i32>) -> bool {
+    now.session == root || now.ppid == root || known.contains(&now.ppid) || candidates.contains(&now.ppid)
+}
+
+/// Linux's `ESRCH`: no such process.
+pub const ESRCH: i32 = 3;
+/// Linux's `EPERM`: not permitted.
+pub const EPERM: i32 = 1;
+
+/// What a freeze does about a member it couldn't pin or stop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    /// Nothing: the process is gone.
+    Ignore,
+    /// The freeze fails with it.
+    Fail,
+    /// It is reported, and the pass goes on to what comes after it (a kill, a fence's halt).
+    PassOver,
+}
+
+/// A candidate whose pidfd couldn't be opened (`errno`): gone meanwhile, or it can't be held (out
+/// of descriptors). `going_on`: a kill follows, or this is a fence's halt. Pure.
+pub fn pin_failure(errno: Option<i32>, going_on: bool) -> Failure {
+    match errno {
+        Some(ESRCH) => Failure::Ignore,
+        _ if going_on => Failure::PassOver,
+        _ => Failure::Fail,
+    }
+}
+
+/// A member whose SIGSTOP failed (`errno`): one nestd may not signal (another uid, setuid) can
+/// never be stopped; anything else means it is gone. Pure.
+pub fn stop_failure(errno: Option<i32>, going_on: bool) -> Failure {
+    match errno {
+        Some(EPERM) if going_on => Failure::PassOver,
+        Some(EPERM) => Failure::Fail,
+        _ => Failure::Ignore,
+    }
+}
+
 /// SIGSTOP's number on Linux (every architecture nestd runs on).
 const SIGSTOP: u32 = 19;
 
@@ -291,6 +335,37 @@ mod tests {
         let t = BTreeMap::from([(60, s(1, 60)), (70, s(60, 70)), (40, Stat { start: 90, ..s(70, 70) }), (41, young(40, 40))]);
         assert_eq!(members(70, &none(), &signallable(60, 100, &t)), Vec::<i32>::new());
         assert_eq!(members(70, &none(), &t), [40, 41]);
+    }
+
+    #[test]
+    fn a_member_that_cant_be_pinned_or_stopped_fails_a_freeze_and_is_passed_over_by_a_kill() {
+        const EMFILE: i32 = 24;
+        for going_on in [false, true] {
+            assert_eq!(pin_failure(Some(ESRCH), going_on), Failure::Ignore, "gone meanwhile");
+            assert_eq!(stop_failure(Some(ESRCH), going_on), Failure::Ignore, "gone meanwhile");
+            assert_eq!(stop_failure(Some(EMFILE), going_on), Failure::Ignore);
+            assert_eq!(stop_failure(None, going_on), Failure::Ignore);
+        }
+        for errno in [Some(EMFILE), Some(EPERM), None] {
+            assert_eq!(pin_failure(errno, false), Failure::Fail, "{errno:?}");
+            assert_eq!(pin_failure(errno, true), Failure::PassOver, "{errno:?}");
+        }
+        assert_eq!(stop_failure(Some(EPERM), false), Failure::Fail);
+        assert_eq!(stop_failure(Some(EPERM), true), Failure::PassOver);
+    }
+
+    /// A pid read again once pinned is the tree's by its session or by its parent; a process that
+    /// took a freed pid is neither.
+    #[test]
+    fn a_pid_taken_by_another_process_is_no_member() {
+        let (known, candidates) = (BTreeSet::from([5, 6]), BTreeSet::from([7]));
+        let is = |ppid, session| still_member(&s(ppid, session), 5, &known, &candidates);
+        assert!(is(1, 5), "in the guest's session, whoever its parent is");
+        assert!(is(5, 9), "the guest's child");
+        assert!(is(6, 9), "a member's child");
+        assert!(is(7, 9), "a candidate's child");
+        assert!(!is(1, 9), "another process took the pid");
+        assert!(!is(8, 6), "a member's pid as a session is not the guest's session");
     }
 
     #[test]

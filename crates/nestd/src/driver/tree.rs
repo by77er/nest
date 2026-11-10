@@ -56,7 +56,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
-use nestd_core::tree::{Stat, deepest_first, members, refusal, runs_no_more, signallable, stop_now, stop_pending_in};
+use nestd_core::tree::{Failure, Stat, deepest_first, members, pin_failure, refusal, runs_no_more, signallable, still_member, stop_failure, stop_now, stop_pending_in};
 use nix::sys::signal::Signal;
 
 /// How long a freeze keeps trying before it says which processes it couldn't stop.
@@ -117,6 +117,8 @@ fn exited(fd: &OwnedFd) -> bool {
 struct Member {
     pid: i32,
     fd: OwnedFd,
+    /// A freeze stopped it (and no thaw has continued it since).
+    stopped: bool,
 }
 
 /// Whether SIGSTOP is pending in a task's `status` (`SigPnd`, or the process-wide `ShdPnd`): it
@@ -162,8 +164,6 @@ pub struct Tree {
     root_start: u64,
     /// Every member found, the guest first and parents before children, each pinned by its pidfd.
     members: Vec<Member>,
-    /// The members a freeze stopped (and no thaw has continued since).
-    stopped: BTreeSet<i32>,
     /// Killed: the guest is reaped next, and nothing may be frozen or continued any more (its pid
     /// and session id may be reused).
     dead: bool,
@@ -183,7 +183,7 @@ impl Tree {
         if let Some(why) = refusal(root, root_start, std::process::id() as i32, root_start, &table()) {
             return Err(refused(why));
         }
-        Ok(Tree { root, root_start, members: vec![Member { pid: root, fd }], stopped: BTreeSet::new(), dead: false, budget: FREEZE_BUDGET })
+        Ok(Tree { root, root_start, members: vec![Member { pid: root, fd, stopped: false }], dead: false, budget: FREEZE_BUDGET })
     }
 
     /// The same tree with another budget for its freezes and halts.
@@ -205,12 +205,14 @@ impl Tree {
         if self.dead {
             return Ok(());
         }
-        let before = self.stopped.clone();
+        let before = self.stopped();
         let r = self.freeze_keeping(budget, false);
         if r.is_err() {
-            let undo: Vec<i32> = self.stopped.difference(&before).copied().collect();
+            let undo: Vec<i32> = self.stopped().difference(&before).copied().collect();
             self.continue_(&undo);
-            self.stopped = before;
+            for m in self.members.iter_mut().filter(|m| undo.contains(&m.pid)) {
+                m.stopped = false;
+            }
         }
         r
     }
@@ -232,6 +234,18 @@ impl Tree {
         self.freeze_keeping(budget, true)
     }
 
+    /// The members a freeze stopped (and no thaw has continued since).
+    fn stopped(&self) -> BTreeSet<i32> {
+        self.members.iter().filter(|m| m.stopped).map(|m| m.pid).collect()
+    }
+
+    /// A member that has exited goes (its pid may name another process next time); the guest
+    /// stays, unreaped until the tree is dead.
+    fn forget_exited(&mut self) {
+        let root = self.root;
+        self.members.retain(|m| m.pid == root || !exited(&m.fd));
+    }
+
     /// SIGCONT to `pids` (members), deepest first, as `thaw` does.
     fn continue_(&self, pids: &[i32]) {
         for p in deepest_first(pids, |p| stat(p).map(|s| s.ppid)) {
@@ -246,10 +260,8 @@ impl Tree {
     /// the discovery of what comes after it.
     fn freeze_keeping(&mut self, budget: Duration, killing: bool) -> io::Result<()> {
         let deadline = Instant::now() + budget;
-        // A member that has exited since the last freeze goes: its pid may name a newer member.
         let root = self.root;
-        self.members.retain(|m| m.pid == root || !exited(&m.fd));
-        self.stopped.retain(|p| *p == root || self.members.iter().any(|m| m.pid == *p));
+        self.forget_exited();
         let mut known: BTreeSet<i32> = self.members.iter().map(|m| m.pid).collect();
         let mut passed_over: Option<io::Error> = None;
         loop {
@@ -261,7 +273,7 @@ impl Tree {
             // no candidate, nor is what hangs off it alone.
             let all = table();
             let t = signallable(std::process::id() as i32, self.root_start, &all);
-            let mut running = self.members.len() - halted.len();
+            let running = self.members.len() - halted.len();
             // Pin what is new, before deciding: what a pidfd names is a member from now on, and so
             // are its descendants, wherever it went (seeded by the pinned members still alive
             // after the table was read, so a pid in it is still theirs).
@@ -276,23 +288,23 @@ impl Tree {
                 }
                 let fd = match pidfd_open(pid) {
                     Ok(fd) => fd,
-                    // Exited meanwhile: no member.
-                    Err(e) if e.raw_os_error() == Some(libc::ESRCH) => continue,
-                    // Can't be held (out of descriptors): a freeze fails; a kill goes on without it.
                     Err(e) => {
+                        let failure = pin_failure(e.raw_os_error(), killing);
                         let e = io::Error::new(e.kind(), format!("pinning the guest's process {pid}: {e}"));
-                        if !killing {
-                            return Err(e);
+                        match failure {
+                            Failure::Ignore => {}
+                            Failure::Fail => return Err(e),
+                            Failure::PassOver => {
+                                known.insert(pid);
+                                passed_over.get_or_insert(e);
+                            }
                         }
-                        known.insert(pid);
-                        passed_over.get_or_insert(e);
                         continue;
                     }
                 };
                 // Read again once pinned: the pid still names a process of the tree (its session,
                 // or a parent in the tree), not one that took a freed pid since the table was read.
-                let ours = |s: &Stat| s.session == root || s.ppid == root || known.contains(&s.ppid) || candidate_set.contains(&s.ppid);
-                let Some(now) = stat(pid).filter(ours) else { continue };
+                let Some(now) = stat(pid).filter(|now| still_member(now, root, &known, &candidate_set)) else { continue };
                 // As it is now, pinned (the table's row may be an earlier holder of the pid): never
                 // one nestd must not signal, and never a parent its children are found through.
                 if let Some(why) = refusal(pid, now.start, std::process::id() as i32, self.root_start, &all) {
@@ -300,28 +312,27 @@ impl Tree {
                     continue;
                 }
                 known.insert(pid);
-                self.members.push(Member { pid, fd });
+                self.members.push(Member { pid, fd, stopped: false });
                 found = true;
-                running += 1;
             }
             let pinned: BTreeSet<i32> = live.iter().copied().chain(self.members.iter().skip(before).map(|m| m.pid)).collect();
             for pid in stop_now(root, &t, &pinned, &halted) {
-                let Some(m) = self.members.iter().find(|m| m.pid == pid) else { continue };
+                let Some(m) = self.members.iter_mut().find(|m| m.pid == pid) else { continue };
                 let was_halted = task_state(&format!("/proc/{pid}")).is_some_and(|s| matches!(s, 'T' | 't'));
                 match send(&m.fd, Signal::SIGSTOP) {
-                    Ok(()) if !was_halted => {
-                        self.stopped.insert(pid);
-                    }
+                    Ok(()) if !was_halted => m.stopped = true,
                     Ok(()) => {}
-                    // A member nestd may not signal (another uid, setuid) can never be stopped.
-                    Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                    Err(e) => {
+                        let failure = stop_failure(e.raw_os_error(), killing);
                         let e = io::Error::new(e.kind(), format!("the guest's process {pid} can't be stopped: {e}"));
-                        if !killing {
-                            return Err(e);
+                        match failure {
+                            Failure::Ignore => {}
+                            Failure::Fail => return Err(e),
+                            Failure::PassOver => {
+                                passed_over.get_or_insert(e);
+                            }
                         }
-                        passed_over.get_or_insert(e);
                     }
-                    Err(_) => {}
                 }
             }
             if !found && running == 0 {
@@ -342,11 +353,12 @@ impl Tree {
         if self.dead {
             return;
         }
-        let stopped: Vec<i32> = self.stopped.iter().copied().collect();
+        let stopped: Vec<i32> = self.stopped().into_iter().collect();
         self.continue_(&stopped);
-        self.stopped.clear();
-        let root = self.root;
-        self.members.retain(|m| m.pid == root || !exited(&m.fd));
+        for m in &mut self.members {
+            m.stopped = false;
+        }
+        self.forget_exited();
     }
 
     /// Freeze (as far as it goes, keeping what it stopped and passing over what it can't hold),
@@ -466,7 +478,7 @@ mod tests {
         for p in [root.0.id() as i32, child] {
             assert!(!matches!(state(p), Some('T' | 't')), "{p} left stopped by a failed freeze");
         }
-        assert!(t.stopped.is_empty());
+        assert!(t.stopped().is_empty());
         t.freeze().unwrap();
         assert!(matches!(state(child), Some('T' | 't')));
         t.kill();
@@ -497,7 +509,7 @@ mod tests {
         let _child = Killed(child);
         let mut t = Tree::new(root.0.id() as i32).unwrap();
         t.freeze().unwrap();
-        assert!(t.members.iter().any(|m| m.pid == child) && t.stopped.contains(&child), "the child is a member, stopped by the freeze");
+        assert!(t.members.iter().any(|m| m.pid == child) && t.stopped().contains(&child), "the child is a member, stopped by the freeze");
         assert!(matches!(state(child), Some('T' | 't')));
         t.thaw();
         let _ = nix::sys::signal::kill(nix::unistd::Pid::from_raw(child), Signal::SIGKILL);
@@ -512,6 +524,13 @@ mod tests {
         assert!(!t.members.iter().any(|m| m.pid == child), "a dead member is still held");
         t.kill();
         assert!(root.exits(), "the guest outlived the kill");
+    }
+
+    /// A task whose `status` can't be read (it is gone) has no SIGSTOP pending.
+    #[test]
+    fn a_task_that_is_gone_has_nothing_pending() {
+        assert!(!stop_pending("/proc/self/task/0/status"));
+        assert!(!stop_pending(&format!("/proc/self/task/{}/status", std::process::id())), "this thread runs: nothing pending");
     }
 
     /// A pid that names no process can't be pinned: an error, never a descriptor.
@@ -535,7 +554,7 @@ mod tests {
         assert!(t.halt_within(Duration::ZERO).is_err(), "no budget: the child isn't stopped yet");
         std::thread::sleep(Duration::from_millis(50));
         assert!(matches!(state(pid), Some('T' | 't')), "the guest left running by a failed halt");
-        assert!(t.stopped.contains(&pid));
+        assert!(t.stopped().contains(&pid));
         t.thaw();
         std::thread::sleep(Duration::from_millis(50));
         assert!(!matches!(state(pid), Some('T' | 't')));
