@@ -12,7 +12,7 @@ import { notifications } from "@mantine/notifications";
 import { IconDownload, IconExternalLink, IconInbox } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
 import { useId, useRef, useState } from "react";
-import { useAcceptIssue, useDeclineIssue, useImportIssues, useIssues } from "../../api/queries";
+import { useAcceptIssue, useDeclineIssue, useImportIssues, useIssues, useProposals } from "../../api/queries";
 import { ApiError } from "../../api/client";
 import type { Issue } from "../../api/types";
 import { ago, exact } from "../../common/time";
@@ -128,6 +128,8 @@ function IssueItem({ projectId, issue }: { projectId: string; issue: Issue }) {
 export function TriagePage() {
   const { projectId } = useParams({ from: "/projects/$projectId/triage" });
   const issues = useIssues(projectId);
+  // Proposals waiting (README.md#triage): then no issues is a quiet line, not the whole page's empty state.
+  const proposalsWaiting = (useProposals(projectId).data?.length ?? 0) > 0;
   const importOpen = useImportIssues(projectId);
   const doImport = () =>
     importOpen.mutate(undefined, {
@@ -154,6 +156,10 @@ export function TriagePage() {
                 <LoadingState label="Loading the issues" />
               ) : issues.isError ? (
                 <ErrorState title="The issues couldn't be loaded" error={issues.error} onRetry={() => void issues.refetch()} />
+              ) : issues.data.length === 0 && proposalsWaiting ? (
+                <Text fz="sm" c="dimmed" data-slot="no-issues">
+                  No issues to triage.
+                </Text>
               ) : issues.data.length === 0 ? (
                 <Panel>
                   <EmptyState

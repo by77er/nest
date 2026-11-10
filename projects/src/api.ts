@@ -46,6 +46,21 @@ async function sync(env: Env): Promise<Response> {
   return r.ok ? json({ written: r.written, repos: r.repos }) : err(r.status, r.error);
 }
 
+/**
+ * What waits on the owner, as "Needs you" lists it: ProjectDO's (asks, blocked tasks, secret requests, and
+ * triage as one item), with the reviews held for approval (ReviewDO's) and the review backlog as one item,
+ * oldest first. The projects list's `needs_you` is its length.
+ */
+async function attentionOf(env: Env, pid: string): Promise<Result<{ kind: string; at_ms: number }[]>> {
+  const a = (await project(env, pid).attention()) as Result<{ kind: string; at_ms: number }[]>;
+  if (!a.ok) return a;
+  const held = (await review(env, pid).held()).map((j) => ({ kind: "review" as const, pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
+  // PRs past every cap, with no job yet: one item, their count.
+  const skipped = await review(env, pid).skipped();
+  const backlog = skipped.count ? [{ kind: "review_backlog" as const, count: skipped.count, at_ms: skipped.at_ms ?? Date.now() }] : [];
+  return { ok: true, value: [...a.value, ...held, ...backlog].sort((x, y) => x.at_ms - y.at_ms) };
+}
+
 const ID = {
   project: /^prj_[a-z0-9]+$/, task: /^tsk_[a-z0-9]+$/, ask: /^ask_[A-Za-z0-9]+$/,
   routine: /^rtn_[a-z0-9]+$/, run: /^run_[a-z0-9]+$/, proposal: /^prp_[a-z0-9]+$/,
@@ -67,7 +82,11 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     // Each with `needs_you`: how many asks and blocked tasks wait on the owner (README.md#blocked).
     if (m === "GET") {
       const rows = await directory(env).projects();
-      return json({ projects: await Promise.all(rows.map(async (r) => ({ ...r, needs_you: (await project(env, r.id).attentionCount()) + (await review(env, r.id).heldCount()) }))) });
+      // The count is the length of the list "Needs you" shows (`attentionOf`), so the two always agree.
+      return json({ projects: await Promise.all(rows.map(async (r) => {
+        const a = r.state === "ready" ? await attentionOf(env, r.id) : null;
+        return { ...r, needs_you: a?.ok ? a.value.length : 0 };
+      })) });
     }
     if (m !== "POST") return err(405, "GET or POST");
     const b = await body(req, CreateProject);
@@ -333,14 +352,8 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       // Sends again a message nest refused for good; one still being sent is left as it is (README.md#outboxes).
       return done(await p.retryChat(Number(rest[1])));
     case "GET attention": {
-      // ProjectDO's, with the reviews held for approval (ReviewDO's), oldest first.
-      const a = (await p.attention()) as Result<{ at_ms: number }[]>;
-      if (!a.ok) return err(a.status, a.error);
-      const held = (await review(env, pid).held()).map((j) => ({ kind: "review" as const, pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
-      // PRs past every cap, with no job yet: one item, their count.
-      const skipped = await review(env, pid).skipped();
-      const backlog = skipped.count ? [{ kind: "review_backlog" as const, count: skipped.count, at_ms: skipped.at_ms ?? Date.now() }] : [];
-      return json([...a.value, ...held, ...backlog].sort((x, y) => x.at_ms - y.at_ms));
+      const a = await attentionOf(env, pid);
+      return a.ok ? json(a.value) : err(a.status, a.error);
     }
     case "GET prs/open":
       return done(await p.openPrs());

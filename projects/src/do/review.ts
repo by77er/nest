@@ -259,10 +259,6 @@ export class ReviewDO extends DurableObject<Env> {
     return this.sql.exec("SELECT * FROM jobs WHERE state = 'held' ORDER BY created_ms, pr").toArray().map((r) => this.toJob(r));
   }
 
-  async heldCount(): Promise<number> {
-    return this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM jobs WHERE state = 'held'").one().n;
-  }
-
   /**
    * A PR's head, from `pull_request` `opened`, `reopened` or `synchronize`: its job is queued, and the
    * jobs of the PR's older heads end (superseded), their reviewers stopped and their checks cancelled.

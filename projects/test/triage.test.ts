@@ -72,6 +72,21 @@ describe("intake", () => {
     expect(attention.filter((a: { kind: string }) => a.kind === "triage")).toEqual([expect.objectContaining({ kind: "triage", count: 3 })]);
   });
 
+  it("3 issues and 2 proposals are one item in Needs you, and the projects list counts it once too", async () => {
+    const p = await newProject();
+    for (const n of [1, 2, 3]) await deliverGithub("issues", issueEvent(p, "opened", n));
+    await runInDurableObject(stub(p), (_o, st) => {
+      for (const id of ["prp_a", "prp_b"]) {
+        st.storage.sql.exec("INSERT INTO proposals (id, routine, routine_name, run, agent, title, body, state, tainted, created_ms) VALUES (?, 'rtn_x', 'R', 'run_x', 'agt_x', ?, 'b', 'untriaged', 1, ?)", id, `Proposal ${id}`, Date.now());
+      }
+    });
+    const attention = (await api(token, "GET", `/api/projects/${p.id}/attention`)).body as { kind: string; count?: number; proposals?: number }[];
+    expect(attention.filter((a) => a.kind === "triage")).toEqual([expect.objectContaining({ count: 3, proposals: 2 })]);
+    const listed = ((await api(token, "GET", "/api/projects")).body.projects as { id: string; needs_you: number }[]).find((x) => x.id === p.id)!;
+    expect(listed.needs_you).toBe(attention.length);
+    expect(listed.needs_you).toBe(1);
+  });
+
   it("ignores a PR, another repo's issue (a fork's), and a delivery seen before", async () => {
     const p = await newProject();
     await deliverGithub("issues", issueEvent(p, "opened", 7, { pr: true }));

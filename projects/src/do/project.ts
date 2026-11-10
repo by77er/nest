@@ -2003,15 +2003,6 @@ export class ProjectDO extends DurableObject<Env> {
     return ok([...open, ...blocked, ...secrets, ...triage].sort((a, b) => a.at_ms - b.at_ms));
   }
 
-  /** How many things wait on the owner (the projects list's count). */
-  async attentionCount(): Promise<number> {
-    if (!this.settings()) return 0;
-    return this.sql.exec<{ n: number }>(
-      `SELECT (SELECT COUNT(*) FROM asks WHERE answered_ms IS NULL) + (SELECT COUNT(*) FROM tasks WHERE blocked_ms IS NOT NULL) + (SELECT COUNT(*) FROM secret_requests WHERE done_ms IS NULL)
-        + (SELECT COUNT(*) FROM issues WHERE state = 'untriaged') + (SELECT COUNT(*) FROM proposals WHERE state = 'untriaged') AS n`,
-    ).one().n;
-  }
-
   // --- chat and approvals ----------------------------------------------------------------------------
 
   /** The chat's latest `limit` messages, or those before `before` (a seq): oldest first. */
@@ -2992,6 +2983,15 @@ export class ProjectDO extends DurableObject<Env> {
     const routine = this.routineRow(run.routine as string);
     if (!routine) return fail(409, "the routine was deleted");
     const from = `Proposed by the routine "${routine.name as string}" (run ${runId}).`;
+    // The owner declined this one lately (README.md#routines): not proposed again within 30 days, by any
+    // routine; the run is told why, so it can move on.
+    const key = titleKey(title);
+    const declined = this.sql.exec("SELECT title, reason, triaged_ms FROM proposals WHERE state = 'declined' AND triaged_ms >= ?", Date.now() - DECLINED_PROPOSALS_BLOCK_MS)
+      .toArray().find((r) => titleKey(r.title as string) === key);
+    if (declined) {
+      const why = (declined.reason as string | null)?.trim();
+      return fail(409, `the owner declined "${declined.title as string}" ${why ? `(their reason: ${why})` : "(no reason given)"}; don't propose it again`);
+    }
     if (routine.proposals === "draft") {
       // As many pending as triage holds: drafts a routine proposed that nobody has specced, cancelled or deleted yet.
       const pending = this.sql.exec<{ n: number }>(
@@ -4132,6 +4132,14 @@ function reviewConclusion(j: { state: string; verdict: unknown }): string {
   const v = j.verdict as { correctness?: { verdict: string }; quality?: { verdict: string }; architecture?: { verdict: string } } | null;
   const all = v && [v.correctness, v.quality, v.architecture].every((d) => d?.verdict === "pass");
   return all ? "passed" : "failed";
+}
+
+/** How long a declined proposal's title can't be proposed again (within the triaged proposals' keep). */
+export const DECLINED_PROPOSALS_BLOCK_MS = TRIAGED_PROPOSALS_KEEP_MS;
+
+/** A title as compared with declined ones: case, punctuation and spacing don't make it another. */
+export function titleKey(title: string): string {
+  return title.toLowerCase().normalize("NFKC").replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
 
 function proposalOf(r: Row): Proposal {

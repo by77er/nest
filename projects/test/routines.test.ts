@@ -465,6 +465,27 @@ describe("proposals: into triage, never onto the board", () => {
     expect((await api(token, "GET", `/api/projects/${s.id}/tasks`)).body).toEqual([]);
   });
 
+  it("a title the owner declined in the last 30 days isn't proposed again, by any routine: the run is told the owner's reason", async () => {
+    const s = await setup();
+    const id = await create(s);
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const run = await liveRun(s, id);
+    const p = ok(await routineTool(s, run, "propose_task", { title: "Rewrite the parser in Rust", body: "b" }));
+    await api(token, "POST", `/api/projects/${s.id}/proposals/${p.proposal}/decline`, { reason: "not worth it" });
+    // Case, punctuation and spacing don't make it another.
+    const again = toolError(await routineTool(s, run, "propose_task", { title: "  rewrite the parser — in RUST! ", body: "c" }));
+    expect(again).toContain("not worth it");
+    expect(again).toContain("Rewrite the parser in Rust");
+    expect((await api(token, "GET", `/api/projects/${s.id}/proposals`)).body).toEqual([]);
+    // Another title is proposed as usual.
+    ok(await routineTool(s, run, "propose_task", { title: "Rewrite the lexer", body: "d" }));
+    // Declined over 30 days ago: proposed again.
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE proposals SET triaged_ms = ? WHERE id = ?", Date.now() - 31 * 86_400_000, p.proposal);
+    });
+    ok(await routineTool(s, run, "propose_task", { title: "Rewrite the parser in Rust", body: "e" }));
+  });
+
   it("with proposals set to draft, they go onto the board as drafts, unassigned and tainted", async () => {
     const s = await setup();
     await api(token, "PATCH", `/api/projects/${s.id}/settings`, { auto_assign: true });

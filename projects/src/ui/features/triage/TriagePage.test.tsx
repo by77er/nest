@@ -131,6 +131,19 @@ describe("the Triage page", () => {
     await waitFor(() => expect(screen.queryByRole("heading", { name: "Proposed tasks" })).toBeNull());
   });
 
+  it("with no issues but proposals waiting, the issues' empty is a quiet line; the page's empty state only when both are empty", async () => {
+    const api = new FakeApi();
+    api.proposals = [proposal()];
+    const view = renderApp("/projects/prj_one/triage", api);
+    expect(await screen.findByText("No issues to triage.")).toBeInTheDocument();
+    expect(screen.queryByText("Nothing to triage")).toBeNull();
+    expect(await screen.findByRole("list", { name: "Proposed tasks" })).toBeInTheDocument();
+    view.unmount();
+    renderApp("/projects/prj_one/triage", new FakeApi());
+    expect(await screen.findByText("Nothing to triage")).toBeInTheDocument();
+    expect(screen.queryByText("No issues to triage.")).toBeNull();
+  });
+
   it("proposals count in Needs you with the issues, in words; triaging one there moves the count", async () => {
     expect(triageWaits(3, 1)).toBe("3 issues and 1 proposed task wait");
     expect(triageWaits(1, 0)).toBe("1 issue waits");

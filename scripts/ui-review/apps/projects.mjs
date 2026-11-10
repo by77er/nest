@@ -837,6 +837,9 @@ const app = {
     { name: "triage", section: "project", path: "/projects/prj_demo/triage" },
     { name: "triage-empty", section: "project", path: "/projects/prj_demo/triage", fixture: "triage-empty" },
     { name: "triage-long", section: "project", path: "/projects/prj_demo/triage", fixture: "triage-long" },
+    // Proposals waiting, no issues: the issues' empty is a quiet line, not the page's (and the board's "Needs you" names them alone).
+    { name: "triage-proposals-only", section: "project", path: "/projects/prj_demo/triage", fixture: "proposals-only" },
+    { name: "board-proposals-only", section: "project", path: "/projects/prj_demo/board", fixture: "proposals-only", full: false },
     // Routines' proposed tasks under the issues: many, with long titles and bodies.
     { name: "triage-proposals-long", section: "project", path: "/projects/prj_demo/triage", fixture: "routines-long" },
     { name: "triage-board", section: "project", path: "/projects/prj_demo/board" },
