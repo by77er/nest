@@ -1716,8 +1716,9 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * SandboxDO releases a failed sandbox's lease (`releaseFailed`): the lease goes, and the incarnation it
-   * leaves on `host` is recorded as stale, not yet clean, in the same step. While it is, the host isn't
+   * SandboxDO releases a failed sandbox's lease (`releaseFailed` after its grace, or an operator's retry,
+   * `retryPlacement`): the lease goes, and the incarnation it leaves on `host` is recorded as stale, not
+   * yet clean, in the same step. While it is, the host isn't
    * retired as idle (`scaleDown`); `reapStale` destroys it once salvaged or past its salvage window.
    */
   async releaseFailedLease(sandbox: string, host: string, epoch: number): Promise<void> {

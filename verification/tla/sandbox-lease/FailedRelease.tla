@@ -24,7 +24,8 @@
 (*   FRFinish      lib/sandbox-lease.ts failedReleased: unplaced, the      *)
 (*                 epoch spent, if still failed on (h, e)                  *)
 (*   RetryRelease, RetryPlace  do/sandbox.ts retryPlacement with a holder  *)
-(*                 (fence, releaseLease(e), lease.retried, then claim)     *)
+(*                 (fence, releaseFailedLease(h, e), lease.retried, then   *)
+(*                 claim)                                                  *)
 (*   RetryReleased retryPlacement without one (lease.retriedReleased,      *)
 (*                 then claim)                                             *)
 (*   Alarm         alarm `place`: placeWanted (never for `failed`)         *)
@@ -49,6 +50,7 @@ CONSTANTS
   RetrySpends,    \* TRUE: an operator's retry of a sandbox failed on a host spends an epoch (lease.retried). FALSE: #192 as merged
   DeleteExact,    \* TRUE: releaseFailedLease deletes only the lease at (h, e). FALSE (mutation): the sandbox's lease, whatever it is
   RecordStale,    \* TRUE: the incarnation is recorded stale in the step that deletes the lease. FALSE (mutation)
+  RetryRecords,   \* TRUE: an operator's retry records the incarnation it leaves as stale, as the release does (FleetDO.releaseFailedLease). FALSE: before (releaseLease: FleetDO learnt of it only from the host's next hello)
   RetireWaits     \* TRUE: scaleDown keeps a host with an incarnation not yet destroyed. FALSE (mutation, and the code before #192's review)
 
 VARIABLES
@@ -64,12 +66,13 @@ VARIABLES
   alive,
   \* ghosts
   held,          \* every (h, e) a lease was granted at
+  left,          \* incarnations a deleted lease left on a live host, which may hold work not yet committed
   wrongDelete,   \* a lease other than the released one was deleted by the release
   lostWork,      \* a host was retired with an unsalvaged incarnation whose window hadn't passed
   refused,       \* a salvage was refused as stale (its work deleted)
   budget
 
-vars == <<sState, sHost, sEpoch, rk, tk, lease, stale, alive, held, wrongDelete, lostWork, refused, budget>>
+vars == <<sState, sHost, sEpoch, rk, tk, lease, stale, alive, held, left, wrongDelete, lostWork, refused, budget>>
 
 NoK == [stage |-> "none", h |-> None, e |-> 0]
 Incs == [h : Hosts, e : 1..MaxEpoch]
@@ -80,7 +83,7 @@ Init ==
   /\ rk = NoK /\ tk = NoK
   /\ lease = [h |-> sHost, e |-> 1] /\ stale = [i \in {} |-> "dirty"]
   /\ alive = [h \in Hosts |-> TRUE]
-  /\ held = {[h |-> sHost, e |-> 1]} /\ wrongDelete = FALSE /\ lostWork = FALSE /\ refused = {}
+  /\ held = {[h |-> sHost, e |-> 1]} /\ left = {} /\ wrongDelete = FALSE /\ lostWork = FALSE /\ refused = {}
   /\ budget = [fail |-> MaxFail, retry |-> MaxRetry, destroy |-> MaxDestroy, loss |-> MaxLoss, reset |-> MaxReset, nocap |-> MaxNoCap]
 
 Live == {h \in Hosts : alive[h]}
@@ -98,11 +101,13 @@ Place(excl) ==
              /\ sHost' = h /\ sEpoch' = sEpoch + 1 /\ sState' = "creating"
              /\ lease' = [h |-> h, e |-> sEpoch + 1]
              /\ held' = held \cup {[h |-> h, e |-> sEpoch + 1]}
+             \* Placed on a host that still holds an older incarnation: nestd salvages and replaces it at the create.
+             /\ left' = {i \in left : i.h # h}
         /\ UNCHANGED budget
      \/ /\ lease # None \/ budget.nocap > 0
         /\ sEpoch' = IF Rollback THEN sEpoch ELSE sEpoch + 1
         /\ IF lease = None THEN Spend("nocap") ELSE UNCHANGED budget
-        /\ UNCHANGED <<sHost, sState, lease, held>>
+        /\ UNCHANGED <<sHost, sState, lease, held, left>>
 
 -----------------------------------------------------------------------------
 (* SandboxDO *)
@@ -111,13 +116,13 @@ Fail ==
   \* (below MaxEpoch, so that its release can spend an epoch within the model's bound)
   /\ sState = "creating" /\ sHost # None /\ budget.fail > 0 /\ sEpoch < MaxEpoch
   /\ sState' = "failed" /\ Spend("fail")
-  /\ UNCHANGED <<sHost, sEpoch, rk, tk, lease, stale, alive, held, wrongDelete, lostWork, refused>>
+  /\ UNCHANGED <<sHost, sEpoch, rk, tk, lease, stale, alive, held, left, wrongDelete, lostWork, refused>>
 
 \* The `failed_release` deadline, its grace over: the fence is issued (an await).
 FRStart ==
   /\ sState = "failed" /\ sHost # None /\ rk = NoK
   /\ rk' = [stage |-> "fence", h |-> sHost, e |-> sEpoch]
-  /\ UNCHANGED <<sState, sHost, sEpoch, tk, lease, stale, alive, held, wrongDelete, lostWork, refused, budget>>
+  /\ UNCHANGED <<sState, sHost, sEpoch, tk, lease, stale, alive, held, left, wrongDelete, lostWork, refused, budget>>
 
 \* FleetDO.releaseFailedLease(h, e): the lease and the stale record in one step.
 FRFleet ==
@@ -129,6 +134,7 @@ FRFleet ==
         /\ stale' = IF mine /\ RecordStale /\ [h |-> rk.h, e |-> rk.e] \notin DOMAIN stale
                       THEN [i \in DOMAIN stale \cup {[h |-> rk.h, e |-> rk.e]} |-> IF i \in DOMAIN stale THEN stale[i] ELSE "dirty"]
                       ELSE stale
+  /\ left' = IF lease # None /\ lease.h = rk.h /\ lease.e = rk.e THEN left \cup {[h |-> rk.h, e |-> rk.e]} ELSE left
   /\ rk' = [rk EXCEPT !.stage = "release"]
   /\ UNCHANGED <<sState, sHost, sEpoch, tk, alive, held, lostWork, refused, budget>>
 
@@ -139,15 +145,22 @@ FRFinish ==
        THEN /\ sHost' = None /\ sEpoch' = IF SpendEpoch THEN sEpoch + 1 ELSE sEpoch
        ELSE UNCHANGED <<sHost, sEpoch>>
   /\ rk' = NoK
-  /\ UNCHANGED <<sState, tk, lease, stale, alive, held, wrongDelete, lostWork, refused, budget>>
+  /\ UNCHANGED <<sState, tk, lease, stale, alive, held, left, wrongDelete, lostWork, refused, budget>>
 
-\* An operator's retry of a sandbox failed on a host: fence, then FleetDO.releaseLease(e) (an await) ...
+\* An operator's retry of a sandbox failed on a host: fence, then FleetDO.releaseFailedLease(h, e) (an
+\* await): the lease at (h, e) and the stale record in one step, as the release's own.
 RetryRelease ==
   /\ sState = "failed" /\ sHost # None /\ tk = NoK /\ budget.retry > 0
-  /\ lease' = IF lease # None /\ lease.e = sEpoch THEN None ELSE lease
+  /\ LET mine == lease # None /\ lease.h = sHost /\ lease.e = sEpoch
+         inc  == [h |-> sHost, e |-> sEpoch]
+     IN /\ lease' = IF mine THEN None ELSE lease
+        /\ left' = IF mine THEN left \cup {inc} ELSE left
+        /\ stale' = IF mine /\ RetryRecords /\ inc \notin DOMAIN stale
+                      THEN [i \in DOMAIN stale \cup {inc} |-> IF i \in DOMAIN stale THEN stale[i] ELSE "dirty"]
+                      ELSE stale
   /\ tk' = [stage |-> "retried", h |-> sHost, e |-> sEpoch]
   /\ Spend("retry")
-  /\ UNCHANGED <<sState, sHost, sEpoch, rk, stale, alive, held, wrongDelete, lostWork, refused>>
+  /\ UNCHANGED <<sState, sHost, sEpoch, rk, alive, held, wrongDelete, lostWork, refused>>
 
 \* ... then lease.retried, if nothing moved: unplaced and creating; the claim follows (Alarm, or at once).
 RetryPlace ==
@@ -156,13 +169,13 @@ RetryPlace ==
        THEN sHost' = None /\ sState' = "creating" /\ sEpoch' = IF RetrySpends THEN sEpoch + 1 ELSE sEpoch
        ELSE UNCHANGED <<sHost, sState, sEpoch>>
   /\ tk' = NoK
-  /\ UNCHANGED <<rk, lease, stale, alive, held, wrongDelete, lostWork, refused, budget>>
+  /\ UNCHANGED <<rk, lease, stale, alive, held, left, wrongDelete, lostWork, refused, budget>>
 
 \* An operator's retry of a failed sandbox whose lease was released: creating, then the claim.
 RetryReleased ==
   /\ sState = "failed" /\ sHost = None /\ budget.retry > 0
   /\ sState' = "creating" /\ Spend("retry")
-  /\ UNCHANGED <<sHost, sEpoch, rk, tk, lease, stale, alive, held, wrongDelete, lostWork, refused>>
+  /\ UNCHANGED <<sHost, sEpoch, rk, tk, lease, stale, alive, held, left, wrongDelete, lostWork, refused>>
 
 \* The `place` alarm (and a retry's own claim): never for a failed sandbox.
 Alarm ==
@@ -174,12 +187,12 @@ Destroy ==
   /\ sState # "destroyed" /\ budget.destroy > 0
   /\ sState' = "destroyed" /\ sHost' = None /\ lease' = None
   /\ Spend("destroy")
-  /\ UNCHANGED <<sEpoch, rk, tk, stale, alive, held, wrongDelete, lostWork, refused>>
+  /\ UNCHANGED <<sEpoch, rk, tk, stale, alive, held, left, wrongDelete, lostWork, refused>>
 
 SbxReset ==
   /\ (rk # NoK \/ tk # NoK) /\ budget.reset > 0
   /\ rk' = NoK /\ tk' = NoK /\ Spend("reset")
-  /\ UNCHANGED <<sState, sHost, sEpoch, lease, stale, alive, held, wrongDelete, lostWork, refused>>
+  /\ UNCHANGED <<sState, sHost, sEpoch, lease, stale, alive, held, left, wrongDelete, lostWork, refused>>
 
 -----------------------------------------------------------------------------
 (* Hosts and FleetDO *)
@@ -194,6 +207,7 @@ HostLoss(h) ==
        THEN /\ lease' = None
             /\ IF sHost = h /\ sEpoch = lease.e /\ sState # "destroyed" THEN sHost' = None ELSE UNCHANGED sHost
        ELSE UNCHANGED <<lease, sHost>>
+  /\ left' = {i \in left : i.h # h}
   /\ Spend("loss")
   /\ UNCHANGED <<sState, sEpoch, rk, tk, held, wrongDelete, lostWork, refused>>
 
@@ -205,19 +219,19 @@ Salvage(i) ==
          holder == i.e = sEpoch /\ sHost = i.h
      IN refused' = IF orphan \/ holder \/ sState = "destroyed" THEN refused ELSE refused \cup {i}
   /\ stale' = [stale EXCEPT ![i] = "clean"]
-  /\ UNCHANGED <<sState, sHost, sEpoch, rk, tk, lease, alive, held, wrongDelete, lostWork, budget>>
+  /\ UNCHANGED <<sState, sHost, sEpoch, rk, tk, lease, alive, held, left, wrongDelete, lostWork, budget>>
 
 \* The salvage window passes for one that never salvaged.
 WindowPass(i) ==
   /\ i \in DOMAIN stale /\ stale[i] = "dirty"
   /\ stale' = [stale EXCEPT ![i] = "expired"]
-  /\ UNCHANGED <<sState, sHost, sEpoch, rk, tk, lease, alive, held, wrongDelete, lostWork, refused, budget>>
+  /\ UNCHANGED <<sState, sHost, sEpoch, rk, tk, lease, alive, held, left, wrongDelete, lostWork, refused, budget>>
 
 \* reapStale: sandbox_destroy for one that is clean or past its window.
 Reap(i) ==
   /\ i \in DOMAIN stale /\ stale[i] \in {"clean", "expired"} /\ alive[i.h]
   /\ stale' = [stale EXCEPT ![i] = "destroyed"]
-  /\ UNCHANGED <<sState, sHost, sEpoch, rk, tk, lease, alive, held, wrongDelete, lostWork, refused, budget>>
+  /\ UNCHANGED <<sState, sHost, sEpoch, rk, tk, lease, alive, held, left, wrongDelete, lostWork, refused, budget>>
 
 \* scaleDown retires an idle host: no lease on it, and (RetireWaits) no incarnation not yet destroyed.
 Retire(h) ==
@@ -225,7 +239,9 @@ Retire(h) ==
   /\ ~(lease # None /\ lease.h = h)
   /\ RetireWaits => \A i \in StaleAt(h) : stale[i] = "destroyed"
   /\ alive' = [alive EXCEPT ![h] = FALSE]
-  /\ lostWork' = (lostWork \/ \E i \in StaleAt(h) : stale[i] = "dirty")
+  \* Work lost: an incarnation left there that FleetDO never recorded, or one recorded and not yet salvaged.
+  /\ lostWork' = (lostWork \/ \E i \in left : i.h = h /\ (i \notin DOMAIN stale \/ stale[i] = "dirty"))
+  /\ left' = {i \in left : i.h # h}
   /\ stale' = [i \in DOMAIN stale |-> IF i.h = h THEN "destroyed" ELSE stale[i]]
   /\ UNCHANGED <<sState, sHost, sEpoch, rk, tk, lease, held, wrongDelete, refused, budget>>
 
@@ -261,7 +277,8 @@ SalvageAccepted == refused = {}
 \* The release deletes no lease but the one at (h, e).
 OnlyItsLease == ~wrongDelete
 
-\* No host is retired with an incarnation not yet salvaged, before its window has passed.
+\* No host is retired with an incarnation a released lease left there, unrecorded or not yet salvaged,
+\* before its window has passed.
 NoWorkLostToRetire == ~lostWork
 
 \* A failed sandbox with a host has a lease there or a release under way or due (never pinned silently).

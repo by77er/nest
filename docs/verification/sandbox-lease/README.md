@@ -37,7 +37,7 @@ Out of scope: agent epochs and brain hosts, attach/bindings (except where an epo
 | LeaseLost | FleetDO `processReassign` | not destroyed/archived; `(epoch = e ∧ (host = h ∨ (host = null ∧ placing = null)))`, or already handled `(host = null ∧ lost_from = h)` | `host := null; lost_from := h` (`working` kept: brains run elsewhere); Claim excluding h if `hostIsDead` | `leaseLost` |
 | Evicted | FleetDO `processEvictions` | `host = h ∧ epoch = e` | `host := null; state := suspended`; Claim (excluding h) if anyone works | `evicted` |
 | CreateFailed | `commandFailed(h, sandbox_create, e)` | `e = epoch ∧ h = host` | re-issue create at the **same** epoch up to 3 times, then `state := failed` | `createFailed` |
-| Retry | operator `POST /place` | `state = failed ∧ host` | `fence` to old host, `releaseLease(e)` (not waiting for the fence), `host := null`, `epoch := e + 1` (spent, since 2026-11-09: the incarnation left on the host is then an older epoch's, its salvage an orphan), Claim | `failedHolder`, `retried` |
+| Retry | operator `POST /place` | `state = failed ∧ host` | `fence` to old host, `releaseFailedLease(h, e)` (not waiting for the fence; the lease deleted and its incarnation recorded stale in one step, since 2026-11-10), `host := null`, `epoch := e + 1` (spent, since 2026-11-09: the incarnation left on the host is then an older epoch's, its salvage an orphan), Claim | `failedHolder`, `retried` |
 | Destroy | operator | — | `state := destroyed; host := null; placing := null` first (no await before it); then **await** `FleetDO.sandboxDestroyed` (from then on Grant refuses), `sandbox_destroy` to the old host if any, **await** `releaseLease` (all epochs); clear `place`. A Placed or Reconcile continuation that then finds the sandbox gone releases the lease it got at e and sends `sandbox_destroy(e)` to its host (`discardPlacement`) | `destroy`, `discardPlacement` |
 | Commit | `commit(h, ev)` via FleetDO | see 2.4 | may move `head` | `decideCommit` |
 
@@ -54,7 +54,8 @@ Out of scope: agent epochs and brain hosts, attach/bindings (except where an epo
 | Unreported | hello of a new nestd process | live lease not in the report | captured in the reset's step (`kv`); then suspended: Evict; else `queueReassign` | `onHello`, `dropUnreported` |
 | Reassign | `processReassign` (after enqueue, every tick) | per `reassignments` row `(sbx, h, e)` | delete lease if it is still `(h, e)`; **await** `leaseLost(h, e, dead)`; delete row; on error `attempts++`, row kept | `queueReassign`, `processReassign` |
 | Evict | drain (a draining host's `suspended` report), idle retire, `die(idle/drained)`, Unreported | lease on h whose last reported `state = suspended` | delete lease; `evictions` row → `SandboxDO.evicted` (retried) | `evict`, `processEvictions` |
-| Release | SandboxDO destroy / retry | — | delete lease (all epochs, or one) | `releaseLease` |
+| Release | SandboxDO destroy, or a placement discarded | — | delete lease (all epochs, or one) | `releaseLease` |
+| ReleaseFailed | SandboxDO's failed release, or an operator's retry of a failed sandbox | lease `(h, e)` | delete it and record `I(h, e)` stale, not clean, in one step | `releaseFailedLease` |
 | Hello | host reconnects | not dead, not wedged | `last_rx := now`; `expired` → `active` (`hello_back`); **`stonith_pending` stays**; unhonored reported sandboxes fenced and recorded stale | `onHello`, `reconcileSandboxes` |
 
 Revocation: `heartbeat_ack.revoked` lists every claim whose lease is absent, on another host, at another epoch, or expired (`onHeartbeat`).
