@@ -7,7 +7,7 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { PLATFORM_TOOL_NAMES } from "../lib/registry";
 import {
-  type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, expandSpec, launchProblem, type PromptRewrite, pruneCapability, pruneTemplate, type Removes,
+  type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, expandSpec, type PromptRewrite, pruneCapability, pruneTemplate, type Removes,
   expandTemplate, mcpPrefix, rewritePrompt, SEED_CATALOG, SEED_VERSION, seedMigration, type SpawnSpec, Template, templatesUsing,
 } from "../lib/spec";
 import { capabilityOutsideGrant, entryVisible, type Grant, grantRefusal, namespaceOf, specOutsideGrant } from "../lib/clients";
@@ -220,10 +220,8 @@ export class CatalogDO extends DurableObject<Env> {
     const cat = this.load();
     const r = checkTemplate(tpl, cat.capabilities);
     if (!r.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, `template ${name}: ${r.error}`);
-    // Its model and effort become arguments of the brain's command: plain tokens only, whoever writes it.
-    const bad = launchProblem(tpl.launch);
-    if (bad) throw new NestError(ErrorCodes.INVALID_MESSAGE, `template ${name}: ${bad}`);
-    // Expanded as written (no overrides): what it gives must hold together, and a client's stay in its grant.
+    // Expanded as written (no overrides): what it gives must hold together (its launch's model and effort
+    // plain tokens, `launchProblem`, whoever writes it), and a client's stay in its grant.
     const spec = expandTemplate({ capabilities: cat.capabilities, templates: { [name]: tpl } }, PLATFORM_TOOL_NAMES, name,
       scope ? { [scope.name]: scope.client } : {});
     if (!spec.ok) throw new NestError(ErrorCodes.INVALID_MESSAGE, spec.error);

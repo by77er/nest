@@ -4,7 +4,7 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { LAUNCH_ARG, launchProblem } from "../src/lib/spec";
-import { adminJson, BASE, uniqueCell } from "./helpers";
+import { admin, adminJson, BASE, eventually, uniqueCell } from "./helpers";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 const launch = (extra: Record<string, unknown> = {}) => ({ builtin_tools: [], system_prompt: { mode: "append", text: "" }, ...extra });
@@ -62,23 +62,57 @@ describe("a launch's model and effort", () => {
     expect(refused.error.message).toContain("launch.model");
   });
 
-  it("a template stored before the rule still reads and expands: only writing is checked", async () => {
-    const c = await newClient();
-    const tpl = `${c.name}/old`;
-    await asClient(c.token, `/v1/catalog/templates/${tpl}`, { method: "PUT", body: template({ model: "opus" }) });
+  it("the operator's launch in overrides is held to it too", async () => {
+    const name = `la-ov-${rand()}`;
+    await adminJson(`/v1/admin/templates/${name}`, { method: "PUT", body: template({ model: "opus" }) });
+    const cell = uniqueCell();
+    const refused = await adminJson(`/v1/agents?cell=${cell}`, { body: { template: name, overrides: { launch: launch({ effort: "--x" }) }, start: false } }, 400);
+    expect(refused.error.message).toContain("launch.effort");
+    await adminJson(`/v1/agents?cell=${cell}`, { body: { template: name, overrides: { launch: launch({ model: "claude-opus-5-5", effort: "high" }) }, start: false } }, 201);
+  });
+
+  it("a template stored before the rule still reads, and doesn't block a capability write, but nothing spawns from it until it's written again", async () => {
+    const cap = `la-cap-${rand()}`;
+    const tpl = `la-old-${rand()}`;
+    await adminJson(`/v1/admin/capabilities/${cap}`, { method: "PUT", body: { tools: ["agent_stop"] } });
+    await adminJson(`/v1/admin/templates/${tpl}`, { method: "PUT", body: { ...template({ model: "opus" }), capabilities: ["nest", cap] } });
     // As a release before the rule could have stored it.
     await runInDurableObject(env.CATALOG.get(env.CATALOG.idFromName("catalog")), (_o, st) => {
       const row = st.storage.sql.exec<{ body: string }>("SELECT body FROM templates WHERE name = ?", tpl).one();
       const body = JSON.parse(row.body);
-      body.launch.model = "an old model id";
+      body.launch.model = "--dangerously-skip-permissions";
       st.storage.sql.exec("UPDATE templates SET body = ? WHERE name = ?", JSON.stringify(body), tpl);
     });
-    const read = await asClient(c.token, `/v1/catalog/templates/${tpl}`);
-    expect(read.status).toBe(200);
-    expect(read.body.launch.model).toBe("an old model id");
-    const made = await asClient(c.token, "/v1/agents", { body: { cell: c.cell, template: tpl, labels: {}, start: false } });
-    expect(made.status, JSON.stringify(made.body)).toBeLessThan(300);
-    // Writing it again is held to the rule.
-    expect((await asClient(c.token, `/v1/catalog/templates/${tpl}`, { method: "PUT", body: template({ model: "an old model id" }) })).status).toBe(400);
+    expect((await adminJson("/v1/admin/catalog")).templates[tpl].launch.model).toBe("--dangerously-skip-permissions");
+    // A capability it lists is written again (its templates are re-checked): not blocked by the old launch.
+    await adminJson(`/v1/admin/capabilities/${cap}`, { method: "PUT", body: { tools: ["agent_stop", "agent_spawn"], spawn: [tpl] } });
+    // No spawn from it.
+    const cell = uniqueCell();
+    const refused = await adminJson(`/v1/agents?cell=${cell}`, { body: { template: tpl, start: false } }, 400);
+    expect(refused.error.message).toContain(`template ${tpl}: launch.model`);
+    // Written again with a good model, it spawns.
+    await adminJson(`/v1/admin/templates/${tpl}`, { method: "PUT", body: { ...template({ model: "opus" }), capabilities: ["nest", cap] } });
+    await adminJson(`/v1/agents?cell=${cell}`, { body: { template: tpl, start: false } }, 201);
+  });
+
+  it("an agent whose stored spec has a bad model starts no brain: the start fails for good, with why", async () => {
+    const tpl = `la-ag-${rand()}`;
+    await adminJson(`/v1/admin/templates/${tpl}`, { method: "PUT", body: template({ model: "opus" }) });
+    const cell = uniqueCell();
+    const a = await adminJson(`/v1/agents?cell=${cell}`, { body: { template: tpl, start: false } }, 201);
+    // Its spec as a release before the rule could have stored it.
+    const stub = env.AGENT.get(env.AGENT.idFromName(a.agent));
+    await runInDurableObject(stub, (_o, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.launch.model = "-p";
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+    });
+    await admin(`/v1/agents/${a.agent}/start`, { method: "POST" }).then((r) => r.text());
+    const after: any = await eventually("the start's refusal on the record", async () => {
+      const v = await adminJson(`/v1/agents/${a.agent}`);
+      return v.start_error ? v : null;
+    });
+    expect(after.start_error.message).toContain("launch.model");
+    expect(after.brain ?? null).toBeNull();
   });
 });

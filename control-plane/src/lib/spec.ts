@@ -529,9 +529,10 @@ export function checkTemplate(tpl: Template, capabilities: Readonly<Record<strin
 export const LAUNCH_ARG = /^[A-Za-z0-9][A-Za-z0-9._:@/\[\]-]{0,99}$/;
 
 /**
- * Why a launch can't be written, or null. Checked where a launch is written (a template put, the
- * operator's spawn override), for every writer alike; a stored one is read as it is, so a template
- * written before this rule still expands.
+ * Why a launch can't be used, or null. Checked where a launch is written (a template put, the operator's
+ * spawn override) and where it's used (expansion for a spawn, an agent's start), for every writer alike.
+ * A stored one is still read as it is (a listing, a capability write over it): it only can't spawn or
+ * start until it's written again.
  */
 export function launchProblem(launch: { model?: string; effort?: string } | undefined): string | null {
   for (const k of ["model", "effort"] as const) {
@@ -602,6 +603,10 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     if (!Object.hasOwn(clients, ns)) return err(`template ${name}: no client is named ${ns}`);
     inject = holdInjections(clients[ns]!, tpl.inject);
   }
+  // Its model and effort become arguments of the brain's command: a template stored before the rule
+  // (`launchProblem`) expands into no spec, so nothing spawns from it until it's written again.
+  const badLaunch = launchProblem(tpl.launch);
+  if (badLaunch) return err(`template ${name}: ${badLaunch}`);
   return withEnv({
     template: name,
     tools: registry.filter((t) => given.has(t)),
@@ -743,6 +748,9 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
   const ephemeral = o.ephemeral ?? base.value.ephemeral ?? false;
   const workflows = o.github_push ? o.github_push.workflows : !!base.value.github_push?.workflows;
   const egress = o.egress ? o.egress.allow : base.value.egress?.allow ?? [];
+  // The operator's own launch is held to the same rule where it's used.
+  const badLaunch = launchProblem(o.launch);
+  if (badLaunch) return err(badLaunch);
   return withEnv(withRepos({
     ...rest,
     ...tools.value,
