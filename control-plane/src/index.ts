@@ -420,7 +420,7 @@ async function createOnce(c: Ctx<string, unknown>, kind: "agent" | "sandbox", cr
     throw e;
   }
   // If this isn't recorded, the next request with the key waits out the lease, then makes the same object again (found, not duplicated).
-  await store.finishKey(key, res.status).catch((x) => console.warn(`idempotency key: recording the answer failed`, x));
+  await store.finishKey(key, res.status, claim.id).catch((x) => console.warn(`idempotency key: recording the answer failed`, x));
   return res;
 }
 

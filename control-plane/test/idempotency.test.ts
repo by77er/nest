@@ -6,7 +6,7 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { ClientDO } from "../src/do/client";
-import { CLIENT_OPERATOR } from "../src/do/client";
+import { ClientDO as ClientDOClass, CLIENT_OPERATOR } from "../src/do/client";
 import { IDEMPOTENCY_LEASE_MS, IDEMPOTENCY_TTL_MS, IdempotencyKeys, KEY_EVENTS, KEY_VIEWS, keyStep, keyView } from "../src/lib/idempotency";
 import { ADMIN, BASE, uniqueCell } from "./helpers";
 
@@ -161,6 +161,39 @@ async function withKeys<T>(f: (k: IdempotencyKeys, sql: SqlStorage) => T): Promi
   return runInDurableObject(clientStub(`cli_keys${rand()}${rand()}`), (_i: ClientDO, st) => f(new IdempotencyKeys(st.storage.sql), st.storage.sql));
 }
 
+describe("a create's finish names its object", () => {
+  it("the Worker passes the created id to finishKey, and a finish for another id leaves the key as it is", async () => {
+    const cell = uniqueCell();
+    const c = await newClient(cell);
+    const key = `k-${rand()}`;
+    const seen: unknown[][] = [];
+    const proto = ClientDOClass.prototype as unknown as { finishKey: (...a: unknown[]) => Promise<void> };
+    const real = proto.finishKey;
+    proto.finishKey = function (this: ClientDO, ...a: unknown[]) {
+      seen.push(a);
+      return real.apply(this, a);
+    };
+    let made: string;
+    try {
+      const first = await post(c.token, "/v1/agents", { template: c.tpl, cell, start: false }, key);
+      expect(first.status, JSON.stringify(first.body)).toBe(201);
+      made = first.body.agent;
+    } finally {
+      proto.finishKey = real;
+    }
+    expect(seen).toEqual([[key, 201, made]]);
+    // Through the RPC: a finish for another object is refused, the right one accepted.
+    const stub = clientStub(c.id);
+    const k2 = `k-${rand()}`;
+    const claim = await stub.claimKey(k2, "d", "agt_mine");
+    expect(claim).toMatchObject({ kind: "run", id: "agt_mine" });
+    await stub.finishKey(k2, 500, "agt_someone_elses");
+    await expect((async () => { await stub.claimKey(k2, "d", "agt_x"); })()).rejects.toThrow(/still being handled/);
+    await stub.finishKey(k2, 201, "agt_mine");
+    expect(await stub.claimKey(k2, "d", "agt_x")).toEqual({ kind: "done", id: "agt_mine", status: 201 });
+  });
+});
+
 describe("the key ledger's step", () => {
   it("keyStep: every view and event", () => {
     const table = Object.fromEntries(KEY_VIEWS.map((v) => [v, Object.fromEntries(KEY_EVENTS.map((e) => [e, keyStep(v, e)]))]));
@@ -203,12 +236,12 @@ describe("IdempotencyKeys: the guards are the ledger's", () => {
       // The request that lost the key abandons late: nothing changes for its new holder.
       expect(k.abandon("k", a.claim, true, t + 4)).toBe(false);
       expect(() => k.claim("k", "d", "id_3", t + 5)).toThrow(/still being handled/);
-      expect(k.finish("k", 201, t + 6)).toBe(true);
-      expect(k.finish("k", 500, t + 7)).toBe(false);
+      expect(k.finish("k", 201, undefined, t + 6)).toBe(true);
+      expect(k.finish("k", 500, undefined, t + 7)).toBe(false);
       if (b.kind !== "run") throw new Error("unreachable");
       expect(k.abandon("k", b.claim, true, t + 8)).toBe(false);
       expect(k.claim("k", "d", "id_4", t + 9)).toEqual({ kind: "done", id: "id_1", status: 201 });
-      expect(k.finish("never-claimed", 201, t)).toBe(false);
+      expect(k.finish("never-claimed", 201, undefined, t)).toBe(false);
     });
   });
 
@@ -216,12 +249,31 @@ describe("IdempotencyKeys: the guards are the ledger's", () => {
     await withKeys((k) => {
       const t = 1_000_000;
       k.claim("slow", "d", "id_s", t);
-      expect(k.finish("slow", 202, t + IDEMPOTENCY_LEASE_MS + 5)).toBe(true);
+      expect(k.finish("slow", 202, undefined, t + IDEMPOTENCY_LEASE_MS + 5)).toBe(true);
       expect(k.claim("slow", "d", "id_x", t + IDEMPOTENCY_LEASE_MS + 6)).toEqual({ kind: "done", id: "id_s", status: 202 });
       const f = k.claim("fresh", "d", "id_f", t);
       if (f.kind !== "run") throw new Error("unreachable");
       expect(k.abandon("fresh", f.claim, true, t + 1)).toBe(true);
       expect(k.claim("fresh", "other-body", "id_g", t + 2)).toMatchObject({ kind: "run", id: "id_g", fresh: true });
+    });
+  });
+
+  it("a finish by the request that held the key before its TTL freed it doesn't answer for the new claim", async () => {
+    await withKeys((k) => {
+      const t = 1_000_000;
+      k.claim("k", "d", "id_old", t);
+      // A day on, the key is free and claimed afresh, for a new object, by a request still running.
+      const later = t + IDEMPOTENCY_TTL_MS + 1;
+      expect(k.claim("k", "d", "id_new", later)).toMatchObject({ kind: "run", id: "id_new", fresh: true });
+      // The old request finishes at last: not its row any more.
+      expect(k.finish("k", 500, "id_old", later + 1)).toBe(false);
+      expect(() => k.claim("k", "d", "id_x", later + 2)).toThrow(/still being handled/);
+      expect(k.finish("k", 201, "id_new", later + 3)).toBe(true);
+      expect(k.claim("k", "d", "id_y", later + 4)).toEqual({ kind: "done", id: "id_new", status: 201 });
+      // After a takeover the id is the same: either request's finish counts (the first decides).
+      k.claim("same", "d", "id_s", t);
+      k.claim("same", "d", "id_other", t + IDEMPOTENCY_LEASE_MS);
+      expect(k.finish("same", 202, "id_s", t + IDEMPOTENCY_LEASE_MS + 1)).toBe(true);
     });
   });
 

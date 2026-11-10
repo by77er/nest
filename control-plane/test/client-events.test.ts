@@ -5,7 +5,9 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ClientDO } from "../src/do/client";
-import { BACKLOG_MAX, retryDelayMs, type StampedEvent } from "../src/lib/client-events";
+import {
+  BACKLOG_MAX, type Delivery, DELIVERY_EVENTS, DELIVERY_PHASES, type DeliveryEvent, deliveryPhase, deliveryStep, EVENT_MAX_AGE_MS, retryDelayMs, type StampedEvent,
+} from "../src/lib/client-events";
 import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
@@ -176,6 +178,45 @@ describe("the retry schedule (pure)", () => {
     const want = [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300].map((s) => s * 1000);
     expect(want.map((_, i) => retryDelayMs(i + 1))).toEqual(want);
     expect(retryDelayMs(10_000)).toBe(300_000);
+  });
+});
+
+describe("the delivery's step (pure)", () => {
+  const states: Record<(typeof DELIVERY_PHASES)[number], Delivery> = {
+    ok: { failures: 0, dropped: 4 },
+    backing_off: { failures: 3, dropped: 4, last_error: "HTTP 500", failed_ms: 900 },
+  };
+  const events: Record<(typeof DELIVERY_EVENTS)[number], DeliveryEvent> = {
+    delivered: { kind: "delivered" },
+    failed: { kind: "failed", error: "HTTP 503", now: 1000 },
+    webhook_set: { kind: "webhook_set" },
+    dropped: { kind: "dropped", n: 2 },
+  };
+
+  it("every phase and event: the state after it and when the next attempt is due", () => {
+    const table = Object.fromEntries(DELIVERY_PHASES.map((p) => [p, Object.fromEntries(DELIVERY_EVENTS.map((e) => [e, deliveryStep(states[p], events[e])]))]));
+    expect(table).toEqual({
+      ok: {
+        delivered: { delivery: { failures: 0, dropped: 4 }, next: "now" },
+        failed: { delivery: { failures: 1, dropped: 4, last_error: "HTTP 503", failed_ms: 1000 }, next: 1000 },
+        webhook_set: { delivery: { failures: 0, dropped: 4 }, next: "now" },
+        dropped: { delivery: { failures: 0, dropped: 6 }, next: "keep" },
+      },
+      backing_off: {
+        delivered: { delivery: { failures: 0, dropped: 4 }, next: "now" },
+        failed: { delivery: { failures: 4, dropped: 4, last_error: "HTTP 503", failed_ms: 1000 }, next: 8000 },
+        webhook_set: { delivery: { failures: 0, dropped: 4 }, next: "now" },
+        dropped: { delivery: { failures: 3, dropped: 6, last_error: "HTTP 500", failed_ms: 900 }, next: "keep" },
+      },
+    });
+    expect(DELIVERY_PHASES.map((p) => deliveryPhase(states[p]))).toEqual([...DELIVERY_PHASES]);
+  });
+
+  it("the dropped count is only ever added to, and the input isn't changed", () => {
+    const d: Delivery = { failures: 2, dropped: 7, last_error: "x", failed_ms: 5 };
+    for (const e of Object.values(events)) expect(deliveryStep(d, e).delivery.dropped).toBeGreaterThanOrEqual(7);
+    expect(deliveryStep(d, { kind: "dropped", n: -3 }).delivery.dropped).toBe(7);
+    expect(d).toEqual({ failures: 2, dropped: 7, last_error: "x", failed_ms: 5 });
   });
 });
 
@@ -453,6 +494,43 @@ describe("delivery", () => {
     await clientStub(c.id).enqueue([ev(`e${rand()}`)]);
     expect(await eventually("the failure recorded", async () => (await view(c)).failures > 0 && view(c), WEBHOOK_TIMEOUT_MS + 3000))
       .toMatchObject({ backlog: 1, last_error: `no answer within ${WEBHOOK_TIMEOUT_MS} ms` });
+  }, 15_000);
+
+  it("an event that waited 7 days for a receiver that never took it is dropped and counted at the hourly prune; younger ones wait on", async () => {
+    const hook = new Hook("fail");
+    const c = await newClient(hook);
+    const stub = clientStub(c.id);
+    await stub.enqueue([ev("old1"), ev("old2"), ev("young")]);
+    await eventually("the first failure", async () => (await view(c)).failures > 0);
+    await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE outbox SET queued_ms = ? WHERE id IN ('old1', 'old2')", Date.now() - EVENT_MAX_AGE_MS - 1000);
+      // A row a previous release queued carries no time: its wait starts at this prune.
+      st.storage.sql.exec("INSERT INTO outbox (id, body) VALUES ('legacy', ?)", JSON.stringify(ev("legacy")));
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'prune'");
+    });
+    const failures = (await view(c)).failures;
+    await runDue(stub);
+    const left = await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) =>
+      st.storage.sql.exec<{ id: string; queued_ms: number | null }>("SELECT id, queued_ms FROM outbox ORDER BY seq").toArray());
+    expect(left.map((r) => r.id)).toEqual(["young", "legacy"]);
+    expect(left[1]!.queued_ms).toBeGreaterThan(Date.now() - 60_000);
+    // Counted, and the retry schedule is what it was: dropping changes no backoff.
+    expect(await view(c)).toMatchObject({ backlog: 2, dropped: 2 });
+    expect((await view(c)).failures).toBeGreaterThanOrEqual(failures);
+  }, 15_000);
+
+  it("a new webhook starts its own schedule: the failures and the last error counted against the old one go", async () => {
+    const hook = new Hook("fail");
+    const c = await newClient(hook);
+    const stub = clientStub(c.id);
+    await stub.enqueue([ev(`e${rand()}`)]);
+    await eventually("a failure", async () => (await view(c)).failures > 0);
+    // Nothing left to send, so what shows next is the reset alone, not a delivery's success.
+    await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => { st.storage.sql.exec("DELETE FROM outbox"); });
+    const next = new Hook("ok");
+    hooks.set(next.id, next);
+    await asJson(c.token, "/v1/clients/self/webhook", { method: "PUT", body: { url: next.url } });
+    expect(await view(c)).toMatchObject({ webhook: next.url, backlog: 0, failures: 0, last_error: null });
   }, 15_000);
 
   it("an event handed over twice is kept once", async () => {
