@@ -246,6 +246,16 @@ export class Nest {
     return this.call("PUT", `/v1/catalog/${kind}/${encodeURIComponent(ns!)}/${encodeURIComponent(entry!)}`, body);
   }
 
+  /** Delete a catalog entry of the client's own (`DELETE /v1/catalog/<kind>/<client-name>/<entry>`); gone already is fine. */
+  async deleteCatalog(kind: "templates" | "capabilities", name: string): Promise<void> {
+    const [ns, entry] = name.split("/");
+    try {
+      await this.call("DELETE", `/v1/catalog/${kind}/${encodeURIComponent(ns!)}/${encodeURIComponent(entry!)}`);
+    } catch (e) {
+      if (!(e instanceof NestError && e.status === 404)) throw e;
+    }
+  }
+
   /** The client's own record (`GET /v1/clients/self`): its grant, among the rest. */
   self(): Promise<{
     client?: string;

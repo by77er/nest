@@ -1,6 +1,6 @@
 // Every project, and a new one. The focal element is the list; its one action, top right.
 
-import { Anchor, Button, Modal, Text } from "@mantine/core";
+import { Anchor, Badge, Button, Modal, Text } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import { IconBrandGithub, IconFolders, IconPlus } from "@tabler/icons-react";
@@ -47,9 +47,21 @@ export function ProjectsPage() {
               {/* Two rows of controls (the title and its badge, the repo): a touch pitch apart. */}
               <Stack gap="sm" data-touch-pitch>
                 <Row gap="sm" justify="space-between" wrap="nowrap">
-                  <AnchorLink to="/projects/$projectId/manager" params={{ projectId: p.id }} search={{}} c="bright" fw={weight.bold} fz="lg">
-                    {p.name}
-                  </AnchorLink>
+                  {/* Still being created (README.md#creating-a-project): nothing to open yet. */}
+                  {p.state === "pending" ? (
+                    <Text fw={weight.bold} fz="lg">
+                      {p.name}
+                    </Text>
+                  ) : (
+                    <AnchorLink to="/projects/$projectId/manager" params={{ projectId: p.id }} search={{}} c="bright" fw={weight.bold} fz="lg">
+                      {p.name}
+                    </AnchorLink>
+                  )}
+                  {p.state === "pending" && (
+                    <Badge color="gray" variant="light" data-marker="creating">
+                      Being created
+                    </Badge>
+                  )}
                   {p.needs_you > 0 && (
                     // Asks are answered on the Board; the project itself opens on its Manager.
                     <BadgeLink

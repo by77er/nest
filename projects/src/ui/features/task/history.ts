@@ -64,6 +64,13 @@ export function summarize(h: HistoryRow): string {
       return typeof o.pr === "number" ? `The owner's comment on PR #${o.pr} wasn't sent${str(o.why) ? `: ${clip(str(o.why)!, 80)}` : ""}` : "The owner's PR comment wasn't sent";
     case "revise":
       return typeof o.pr === "number" ? `A worker starts again for the owner's comment on PR #${o.pr}` : "A worker starts again for the owner's PR comment";
+    // A stop nest refused (README.md#outboxes): the agent may still be running.
+    case "stop_failed":
+      return `nest refused to stop ${str(o.agent) ?? "its worker"}${str(o.error) ? `: ${clip(str(o.error)!, 80)}` : ""}; it may still be running`;
+    case "stop_retried":
+      return `The stop of ${str(o.agent) ?? "its worker"} tried again`;
+    case "stop_dismissed":
+      return `The stop of ${str(o.agent) ?? "its worker"} dismissed: no longer counted`;
     case "review_ended":
       return typeof o.pr === "number" ? `Out of review: PR #${o.pr} was its last open PR` : "Out of review: no PR open";
     case "pr_opened":

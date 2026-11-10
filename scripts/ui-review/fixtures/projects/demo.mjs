@@ -4,8 +4,8 @@
 // (a task waiting on two of three, one waited on by two, one whose blockers are all done).
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
-// message with every kind of rich content), "chat-empty", "chat-long" (thirty messages), "chat-paged"
-// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents),
+// message with every kind of rich content), "chat-empty", "chat-sending" (the owner's messages still being sent), "chat-long" (thirty messages), "chat-paged"
+// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors), "manager-ended" (past its automatic restarts), "creating" (a project still being created), "models-custom" (a custom model id for the workers),
 // "chat-code" (a reply with every syntax token), "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
 // a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
@@ -122,10 +122,10 @@ export function data(variant = "demo", now = Date.now()) {
     ...(issues.length ? [{ kind: "triage", count: issues.length, at_ms: Math.min(...issues.map((i) => i.opened_ms)) }] : []),
   ].sort((a, b) => a.at_ms - b.at_ms);
   const chat = [
-    { seq: 1, at_ms: now - 3_600_000, sender: "owner", text: "Plan the search work and split it into tasks.", delivered: true, error: null },
-    { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: PLAN_REPLY, delivered: true, error: null },
-    { seq: 3, at_ms: now - 900_000, sender: "app", text: "The manager ended (exited).", delivered: true, error: null },
-    { seq: 4, at_ms: now - 300_000, sender: "owner", text: "Can you also look at the auth migration? It stalled.", delivered: false, error: "nest answered 409: the agent has ended" },
+    { seq: 1, at_ms: now - 3_600_000, sender: "owner", text: "Plan the search work and split it into tasks.", delivered: true, status: "done", error: null },
+    { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: PLAN_REPLY, delivered: true, status: "done", error: null },
+    { seq: 3, at_ms: now - 900_000, sender: "app", text: "The manager ended (exited).", delivered: true, status: "done", error: null },
+    { seq: 4, at_ms: now - 300_000, sender: "owner", text: "Can you also look at the auth migration? It stalled.", delivered: false, status: "failed", error: "nest answered 409: the agent has ended" },
   ];
   const history = {
     tsk_demo7: [
@@ -226,7 +226,7 @@ const RICH = [
       const owner = k % 2 === 0;
       out.push({ seq: k + 1, at_ms: now - (30 - k) * 600_000, sender: k === 13 ? "app" : owner ? "owner" : "manager",
         text: k === 13 ? "The manager restarted (upgrade)." : owner ? `Message ${k + 1}: what is the status of the ${["search", "export", "auth", "cache"][k % 4]} work? Keep it short, please.` : `Reply ${k + 1}: **${["search", "export", "auth", "cache"][k % 4]}** is moving. task:tsk_demo${(k % 8) + 1} is the one to watch; I'll report back when it lands, with the PR and the review's verdict.`,
-        delivered: true, error: null });
+        delivered: true, status: "done", error: null });
     }
     return out;
   }
@@ -234,7 +234,7 @@ const RICH = [
   const chatHistory = Array.from({ length: 120 }, (_, k) => ({
     seq: k + 1, at_ms: now - (120 - k) * 900_000, sender: k % 3 === 0 ? "owner" : "manager",
     text: k % 3 === 0 ? `Message ${k + 1}: how is the ${["search", "export", "auth"][k % 3]} work going?` : `Reply ${k + 1}: on track; task:tsk_demo${(k % 8) + 1} next.`,
-    delivered: true, error: null,
+    delivered: true, status: "done", error: null,
   }));
   const page = (before, limit = 50) => {
     const older = before === null ? chatHistory : chatHistory.filter((m) => m.seq < before);
@@ -243,16 +243,21 @@ const RICH = [
   const paged = page(null);
   const chatFor = () => {
     if (variant === "chat-empty") return [];
-    if (variant === "rich") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: RICH, delivered: true, error: null }];
+    if (variant === "rich") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: RICH, delivered: true, status: "done", error: null }];
     if (variant === "chat-paged") return paged;
     if (variant === "chat-arriving") {
       // A reply lands a few seconds in (after the reader has scrolled up): the jump-to-latest pill.
       const base = chatLong();
-      return Date.now() - born > 3_000 ? [...base, { seq: 31, at_ms: now, sender: "manager", text: "New: task:tsk_demo7 passed review.", delivered: true, error: null }] : base;
+      return Date.now() - born > 3_000 ? [...base, { seq: 31, at_ms: now, sender: "manager", text: "New: task:tsk_demo7 passed review.", delivered: true, status: "done", error: null }] : base;
     }
     if (variant === "chat-long") return chatLong();
-    if (variant === "chat-code") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: CODE, delivered: true, error: null }];
-    if (variant === "chat-heavy") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: HEAVY, delivered: true, error: null }];
+    if (variant === "chat-code") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: CODE, delivered: true, status: "done", error: null }];
+    if (variant === "chat-heavy") return [chat[0], { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: HEAVY, delivered: true, status: "done", error: null }];
+    // The owner's message still being sent: owed, and retrying with why (README.md#outboxes).
+    if (variant === "chat-sending") {
+      return [...chat.slice(0, 3), { seq: 4, at_ms: now - 60_000, sender: "owner", text: "Pick up the auth migration when you're back.", delivered: false, status: "retrying", error: "the manager isn't started yet" },
+        { seq: 5, at_ms: now - 5_000, sender: "owner", text: "And the CSV export after it.", delivered: false, status: "owed", error: null }];
+    }
     return chat;
   };
   const detail = (id) => byId[id] && { ...byId[id], history: history[id] ?? [{ at_ms: now - 7_200_000, actor: "owner", action: "created", detail: JSON.stringify({ title: byId[id].title }), tainted: false }] };
@@ -264,6 +269,9 @@ const RICH = [
     comments_from: variant === "comments-set" ? { id: 5839471, login: "by77er" } : variant === "comments-id-only" ? { id: 5839471, login: null } : null,
     repo_owner: { id: 5839471, login: "by77er" },
     max_routine_runs: 1,
+    // The models (README.md#models): the defaults, or (models-custom) a long custom id for the workers.
+    manager_model: "claude-fable-5-2",
+    worker_model: variant === "models-custom" ? "us.anthropic.claude-opus-5-5-20260915-v1:0[1m]" : "claude-opus-5-5",
   };
   const demo = { id: "prj_demo", name, repo, created_ms: now - DAY * 3, settings };
   const other = { id: "prj_other", name: "Widgets", repo: "by77er/widgets", created_ms: now - DAY * 9 };
@@ -282,9 +290,11 @@ const RICH = [
   // Every trace (the manager's, a worker's, a reviewer's): history offered and paged, then the live ring (trace.mjs).
   const { messages: allMessages, pages: historyPages } = trace(now, { busy: variant === "turn-busy" });
   // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
-  // "chat-empty" is a new conversation: no turn running either (its starters show); "chat-heavy" ends on its reply.
-  const traceMessages = variant === "connecting" || variant === "chat-empty" || variant === "chat-heavy" || variant === "chat-code" ? [] : allMessages;
-  const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length }, { ...other, needs_you: 0 }];
+  // "chat-empty" is a new conversation: no turn running either (its starters show); "chat-heavy" ends on its reply; "chat-sending" ends on the owner's messages being sent.
+  const traceMessages = variant === "connecting" || variant === "chat-empty" || variant === "chat-heavy" || variant === "chat-code" || variant === "chat-sending" || variant === "manager-ended" ? [] : allMessages;
+  const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length, state: "ready" }, { ...other, needs_you: 0, state: "ready" },
+    // One still being created (README.md#creating-a-project): nothing to open yet.
+    ...(variant === "creating" ? [{ id: "prj_new4k2", name: "Thingamajigs", repo: "by77er/thingamajigs", created_ms: now - 20_000, needs_you: 0, state: "pending" }] : [])];
   const sync = { written: ["capabilities/projects/board", "capabilities/projects/task", "templates/projects/manager", "templates/projects/worker"], repos: ["by77er/gadgets", "by77er/widgets"], at_ms: now - 3_600_000 };
 
   // The manager's waits (README.md#waiting), and the Network page (README.md#network): rules per role,
@@ -321,6 +331,14 @@ const RICH = [
       { host: "mirror.internal.example", ports: [8443], source: "operator" },
       ...["api.github.com", "codeload.github.com"].map((host) => ({ host, ports: [443], source: "repos" })),
     ],
+    // Agents nest refused to stop (README.md#outboxes): a cancelled task's worker, a routine run's.
+    failed_stops: variant === "stops-long" ? [
+      { agent: "agt_w5t8q3x9z2k4m7p1", task: "tsk_demo10", task_title: "Drop the legacy XML export, the importer and every fixture that still mentions the old schema", routine: null, reason: "cancelled", error: "nest 409 conflict: the agent's host bh_3f2a is draining and the brain hasn't moved yet; ask again once it has moved to another host, or end it from the operator console. trace=0123456789abcdef0123456789abcdef0123456789abcdef", failed_ms: now - 25 * 60_000 },
+      { agent: "agt_r2m9x4", task: null, task_title: null, routine: { id: "rtn_dream", name: "Dreaming" }, reason: "routine run timed_out", error: "nest 400 invalid: destroy_sandbox isn't allowed for an agent whose sandbox is shared", failed_ms: now - 3 * 60_000 },
+    ] : variant === "stops-failed" ? [
+      { agent: "agt_w5t8q3", task: "tsk_demo10", task_title: "Drop the legacy XML export", routine: null, reason: "cancelled", error: "nest 409 conflict: the agent's host is draining; ask again once it has moved", failed_ms: now - 25 * 60_000 },
+      { agent: "agt_r2m9x4", task: null, task_title: null, routine: { id: "rtn_dream", name: "Dreaming" }, reason: "routine run timed_out", error: "nest 400 invalid: destroy_sandbox isn't allowed for an agent whose sandbox is shared", failed_ms: now - 3 * 60_000 },
+    ] : [],
   };
 
   // The Secrets page (README.md#secrets): what the app keeps of each (never a value), the grant, and the
@@ -394,7 +412,10 @@ const RICH = [
       const why = "downloads.gadgets.example.com isn't in this app's grant; the operator must add it";
       return [403, { error: why, problems: { "worker.downloads.gadgets.example.com": why } }];
     }
-    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/issues": issues, "/manager": { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null },
+    const routes = { "": demo, "/tasks": tasks, "/asks": asks, "/attention": attention, "/chat": chatFor(), "/reviews": reviews, "/prs/open": openPrs, "/waits": waits, "/network": network, "/secrets": secrets, "/issues": issues, "/manager": variant === "manager-ended"
+      // Ended past its automatic restarts (README.md#the-manager-lifecycle): the owner's Restart.
+      ? { phase: "ended", agent: null, state: null, host: null, error: "The manager ended (exited), 4 times within an hour: restart it when you're ready." }
+      : { phase: "running", agent: "agt_mgr7k2", state: "working", host: "bh_3f2a", error: null },
       "/routines": { routines, max_routine_runs: 1, live: noRoutines ? 0 : 1 }, "/routine-runs": runs, "/proposals": proposals, "/memory": notes };
     if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
     if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];

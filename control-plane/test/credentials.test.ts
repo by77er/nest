@@ -5,6 +5,8 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { BrokerDO, secretRef } from "../src/do/broker";
+import { ErrorCodes } from "../src/protocol/model";
+import { NestError } from "../src/lib/util";
 import { credentialFor, type CredentialPrincipal, DEFAULT_CREDENTIAL } from "../src/lib/credentials";
 import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueCell } from "./helpers";
 
@@ -217,6 +219,31 @@ describe("a client's agent and the operator's default token", () => {
     const e = await eventually("agent.error", () => w.events().find((x) => x.type === "agent.error" && x.agent === a.agent));
     expect(e).toMatchObject({ code: "errored" });
     expect(e.message).not.toContain("an old refusal");
+  });
+
+  it("a start refused for good while a brain still runs records no reason and sends no event: the agent isn't errored", async () => {
+    const w = await world();
+    await adminJson(`/v1/admin/secrets/${w.cred}`, { method: "PUT", body: { value: "sk-ant-oat01-tenant" } });
+    const a = await asJson(w.token, "/v1/agents", { body: { template: w.tpl, cell: w.cell } }, 201);
+    await nextCommands(w.brain.ws, (x) => x.type === "agent_start" && x.agent === a.agent);
+    const stub = env.AGENT.get(env.AGENT.idFromName(a.agent));
+    // A restart is wanted while its brain runs, and that start's run is refused for good (its grant narrowed, say).
+    const outcome = await runInDurableObject(stub, async (inst: any, st: DurableObjectState) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.intent = { reason: "restart" };
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+      const events = () => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM client_events").one().n;
+      const before = events();
+      await inst.intentFailed(info.intent, new NestError(ErrorCodes.FORBIDDEN, `client's grant doesn't name the credential ${w.cred}`, 409));
+      const after = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      return { start_error: after.start_error, lifecycle: after.lifecycle, brain: !!after.brain, intent: after.intent, events: events() - before };
+    });
+    expect(outcome.brain).toBe(true);
+    expect(outcome.lifecycle).not.toBe("errored");
+    expect(outcome.start_error).toBeUndefined();
+    expect(outcome.intent).toBeNull();
+    expect(outcome.events).toBe(0);
+    expect(w.events().filter((x) => x.type === "agent.error" && x.agent === a.agent)).toEqual([]);
   });
 
   it("the operator's own agents keep falling back to the default", async () => {

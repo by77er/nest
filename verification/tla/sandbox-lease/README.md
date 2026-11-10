@@ -41,3 +41,27 @@ A run that holds prints `Model checking completed. No error has been found.` A v
 | MCLive | liveness, all fixes | holds (not completed) |
 
 Each `.cfg` starts with a comment saying what it sets and what to expect.
+
+## SlotFollowups
+
+`SlotFollowups.tla` models what this spec abstracts away and the 2026-11-06 sweep found lost: a command result's follow-up (bug 2) and a new placement's follow-ups (bug 3), with one agent's slot, its `agent_attach` commands and results, and the bindings `resolve` mints. The lease is abstracted to "placed at epoch e on host h, may move to another host at e + 1" (an adopted lease may already be `running`), plus the holder's `running` report. FleetDO's follow-up is split at its await on SandboxDO, `afterPlaced` at its awaits; both objects reset (losing their continuations), a DO-to-DO call fails, `afterPlaced` throws, and nestd resends an unacked result. It is a separate module, in this directory, so that its state space stays small: the slots multiply the lease model's states, and none of the lease's properties depends on them. Its header maps each action to the code; the dated [conformance pass](../../../docs/verification/sandbox-lease/conformance/) checks the mapping.
+
+Not modelled: a re-placement on the same host (`Move` always picks another host; the slot reset doesn't depend on which), error results of `agent_attach`, and the follow-ups other than `attach_result`.
+
+Properties: `BindingOnlyConfirmed` (a binding at epoch e only for an attach confirmed at e), `BindingConfigured` (only for a slot the guest at that placement configured), and, under weak fairness on every step that isn't a fault, a move or a client call (faults bounded, unfair), `FollowupsDone` (every recorded result's follow-up runs, none stays owed), `HandsEventually` (the slot is confirmed at the placement that lasts) and `PlacedDone` (that placement's follow-ups run).
+
+Bounds: hosts h1, h2; epochs ≤ 3 (so two moves), commands ≤ 3, and at most one of each fault (FleetDO reset, SandboxDO reset, failed call, throw). `MCSlotsFixedBig` doubles the faults (the same with a third move as well did not finish in 35 minutes and isn't kept).
+
+| Config | What | Expected |
+|---|---|---|
+| MCSlotsOld | before #187: slots reset after `afterPlaced`'s awaits, follow-ups not owed | violates BindingOnlyConfirmed (bug 3: a move adopts a lease already `running`, and `resolve` in `afterPlaced`'s await window mints for the new epoch on the old epoch's confirmation; the same once the new guest reports `running` after a throw cut `afterPlaced`) |
+| MCSlotsOldPlacement | results fixed, placement as before | violates BindingOnlyConfirmed |
+| MCSlotsOldResults | placement fixed, results as before | violates FollowupsDone (bug 2: a FleetDO reset at the await, the redelivered result ignored) |
+| MCSlotsMutNoRerun | mutation: owed, but no `followups` deadline | violates FollowupsDone |
+| MCSlotsMutNoPlacedDeadline | mutation: slots reset in the step, no `placed` deadline | violates PlacedDone |
+| MCSlotsReachRerun, ReachCut, ReachMovedBind | reachability: a follow-up left to the deadline; a placement's follow-ups cut; a binding after a move | violates NoRerun, NoCut, NoMovedBind (not vacuous) |
+| MCSlotsFixed | both fixes | holds (1,363,140 states, 12 s) |
+| MCSlotsFixedFollowups, Hands, Placed | both fixes, one liveness property each | holds (1,363,140 states, 42-50 s each) |
+| MCSlotsFixedBig | both fixes; epochs ≤ 3, two of each fault | holds (12,459,894 states, 110 s) |
+
+Two further mutations of the spec, run by hand and not kept: `Deliver` without its epoch check violates BindingOnlyConfirmed; `Move` resetting `pending` but not the in-flight command violates HandsEventually.

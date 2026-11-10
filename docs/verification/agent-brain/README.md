@@ -5,7 +5,7 @@ The agent/brain lifecycle, the one-brain rule and the turn queue, across AgentDO
 - **main** (`edf6829`): as built. Cited as `path:line`.
 - **AE**: `origin/deferred/agent-epoch` at `65bf6ef`, the redesign in flux. Cited as `AE:path:line` (`git show origin/deferred/agent-epoch:<path>`). Earlier AE commits are cited by hash.
 
-> **Status:** both versions are superseded by the single-record design (#30, brain hosts in #36), written against the findings below: [design/](design/). The model of it as built is in [pilot/](pilot/) and its check against the code in [conformance/](conformance/); whether an item below still applies is answered there, not here. The turn queue (§2.4) cites today's code.
+> **Status:** both versions are superseded by the single-record design (#30, brain hosts in #36), written against the findings below: [design/](design/). The model of it as built is in [pilot/](pilot/) and its check against the code in [conformance/](conformance/); whether an item below still applies is answered there, not here. The turn queue (§2.4) cites today's code (re-dated 2026-11-06 at `9fd147ff`: `dropped` added, #82). Since `edf6829`, §2.1's machine also has `hostReport` making a detached brain on its recorded host `ready`, and `load()` migrating a previous release's record (a detached or errored brain with a host becomes `condemned`); both are in the conformance's [2026-11-06 section](conformance/#main-9fd147ff-re-dated-2026-11-06).
 
 The intended rule (owner): *AgentDO starts a brain at agent epoch N+1 on another host only once the previous brain is confirmed gone (its `agent_exited` with epoch >= N, or its host dead/expired; the host lease self-fences brains at 20 s, the DO expires the host at 30 s); kills carry an epoch tombstone, so a queued start at or below a killed epoch is refused.*
 
@@ -69,10 +69,10 @@ Paths: `agent.ts`, `fleet.ts` and `sandbox.ts` are under `control-plane/src/do/`
 | N2 | in order: `agent_start{e}` | AE: refuses if `killed[a] >= e` (`agent_exited{fenced, e}` + `stale_epoch`) | table row Starting, Sent On or Pending; `epochs[a]:=e`; **result ok{dispatched} at once** (not on start) | `host.rs:1916-1922`; AE:`host.rs:1924-1935` |
 | N3 | in order: `agent_stop` graceful | — | AgentStop{graceful} to the runner; with no runner connected, the row is removed | `host.rs:1388-1391`; `runner_link.rs:153-163` |
 | N4 | runner: AgentStart | spawned task | no lease ⇒ exit fenced. register: ok ⇒ run; an older-connection brain ⇒ kill and retry for up to 10 s; AE: a stopping brain ⇒ kill and retry for up to 10 s; **else adopt** (main: set_hands; AE: set_hands + `adopt_epoch` = fetch_max) | `agent.rs:72-145`; AE:`agent.rs:110-136`; AE:`runtime.rs:389-396` |
-| N5 | runner: AgentStop | **registered only** (otherwise a no-op) | kill, or graceful (close stdin); AE sets `stopping` | `supervisor.rs:91-104`; AE:`supervisor.rs:94` |
+| N5 | runner: AgentStop | **registered only** (otherwise a no-op) | kill, or graceful (close stdin; once no turn runs, the process group is killed if it hasn't exited within the exit grace, 30 s); AE sets `stopping` | `supervisor.rs:91-104`; AE:`supervisor.rs:94` |
 | N6 | lease lapse / nestd lost | nestd watchdog at the deadline; runner watchdog `now_ms() > valid_until`; nestd socket EOF | runner kill_all (SIGKILL to the process group). nestd reports each brain of the lost connection as exited (crashed or fenced) | `host.rs:1055-1094`; `supervisor.rs:16-29,119-140`; `runner_link.rs:295-300` |
 | N7 | brain process exits | pid matches | `agent_exited{reason}` (AE: `epoch`), deregister | `agent.rs:779-808` |
-| N8 | idle | 120 s after turn end, no pending inbox | close stdin, then exit `idle` (respawned in place if input was stashed) | `agent.rs:656-664,779-797`; `config.rs:55` |
+| N8 | idle | 120 s after turn end, no pending inbox | close stdin, then exit `idle` (killed if it hasn't exited within the exit grace, 30 s; respawned in place if input was stashed) | `agent.rs:656-664,779-797`; `config.rs:55` |
 
 ### 2.4 A turn's life (AgentDO `turns.status`)
 
@@ -84,8 +84,9 @@ Paths: `agent.ts`, `fleet.ts` and `sandbox.ts` are under `control-plane/src/do/`
 | Q4 | recover | a hello from a new lineage while `current_turn = X` | X becomes `interrupted`; a new `recovery` turn R (with X's original text) is queued at the front. The channel is reset, so `run_turn X` is never resent. All in the hello's step that clears `current_turn`; whether the sandbox moved during X is decided when R starts (Q2, `moveNoteDue`) | `AgentDO.onHello`, `TurnQueue.recover` |
 | Q5 | undeliverable | runner stdin closed (stopping) | an error event; the turn stays `active` until Q4 | `Actor::handle` (nest-runner `agent.rs`) |
 | Q6 | crash guard | 3 exit-restarts without a Q3 | `errored`; each new input gets exactly one more start (the counter isn't reset) | `AgentDO.wake`; lib/brain.ts `wakeDecision`, `RESTART_ON_EXIT`, `MAX_EXIT_RESTARTS` |
+| Q7 | drop | the agent ends for good (#82) | every `queued` turn, and the `active` one if no brain is left to recover it, becomes `dropped`, with their mirrored messages; nothing is enqueued after (`ended`) | `AgentDO` end step, `TurnQueue.dropAll` (lib/turns.ts) |
 
-There is no `failed` status: a turn ends as `done`, or as `interrupted` with a successor. `instance_id` is per brain session (`session.rs:409`), so every brain start is a new lineage.
+There is no `failed` status: a turn ends as `done`, as `interrupted` with a successor, or as `dropped` when its agent ended. `instance_id` is per brain session (`session.rs:409`), so every brain start is a new lineage.
 
 ## 3. Messages and delivery
 

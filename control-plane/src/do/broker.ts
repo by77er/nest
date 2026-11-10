@@ -26,6 +26,8 @@ import {
 const GITHUB_TOKEN_REUSE_MS = 10 * 60_000;
 /** A repo's installation id is looked up again after this long. */
 const INSTALLATION_TTL_MS = 24 * 3_600_000;
+/** After a fresh lookup confirmed an installation a mint was refused with, no lookup for it again this long. */
+export const INSTALLATION_CONFIRMED_MS = 5 * 60_000;
 /**
  * A sandbox's injected token is reused while it has this long left. SandboxDO refreshes 15 minutes
  * before expiry, so a refresh always mints.
@@ -370,7 +372,7 @@ export class BrokerDO extends DurableObject<Env> {
         if (id === null) missing.push(r);
         else {
           byInstallation.set(id, [...(byInstallation.get(id) ?? []), r]);
-          if (cached) cachedIds.add(id);
+          if (cached && !this.recentlyConfirmed(creds.app_id, r)) cachedIds.add(id);
         }
       }
       const best = [...byInstallation.entries()].sort((x, y) => y[1].length - x[1].length || x[1][0]!.localeCompare(y[1][0]!))[0];
@@ -417,6 +419,20 @@ export class BrokerDO extends DurableObject<Env> {
   }
 
   /**
+   * Installations a fresh lookup confirmed after a refusal (`installationStale`'s "same"), by `<app_id>|<repo>`,
+   * until when: a refusal meanwhile is real without looking again. Memory only: a reset costs one lookup.
+   */
+  private readonly confirmedInstallations = new Map<string, number>();
+
+  private recentlyConfirmed(appId: string, repo: string): boolean {
+    const until = this.confirmedInstallations.get(`${appId}|${repo}`);
+    if (until === undefined) return false;
+    if (until > Date.now()) return true;
+    this.confirmedInstallations.delete(`${appId}|${repo}`);
+    return false;
+  }
+
+  /**
    * App `appId`'s installation on `repo` (lowercase): cached a day per App and repo (`cached`), else looked
    * up; null when it isn't installed there.
    */
@@ -446,6 +462,8 @@ export class BrokerDO extends DurableObject<Env> {
     const fresh = await Promise.all(repos.map((r) => api.installation(jwt, r)));
     const now = Date.now();
     if (installationVerdict(installation, fresh) === "same") {
+      // A repeated real refusal within a few minutes costs the mint alone, not another lookup each time.
+      for (const r of repos) this.confirmedInstallations.set(`${appId}|${r}`, now + INSTALLATION_CONFIRMED_MS);
       for (const r of repos) this.sql.exec("UPDATE github_app_installations SET fetched_ms = ? WHERE app_id = ? AND repo = ? AND installation = ?", now, appId, r, installation);
       return false;
     }
@@ -829,7 +847,7 @@ export class BrokerDO extends DurableObject<Env> {
           t = await api.mint(jwt, installation, r.split("/")[1]!, permissions);
         } catch (e) {
           // Maybe a stale installation (a reinstall, a moved repo): looked up afresh, and minted once more only if it moved.
-          if (!(retryMintFresh(e, found.cached, attempt) && (await this.installationStale(api, jwt, creds.app_id, [r], installation)))) throw e;
+          if (!(retryMintFresh(e, found.cached && !this.recentlyConfirmed(creds.app_id, r), attempt) && (await this.installationStale(api, jwt, creds.app_id, [r], installation)))) throw e;
         }
       }
       // Audited before anyone holds it: a mint whose record can't be written is never handed out.
