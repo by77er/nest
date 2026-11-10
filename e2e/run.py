@@ -166,9 +166,32 @@ def subid_range(path):
     return None
 
 
+def ns_range(path):
+    """The ids from 1 up that this process's own user namespace maps, as (1, count), when the
+    harness already runs as root inside one (a PID-namespace wrapper started with
+    `unshare --user --map-root-user --map-users=1:<subuid>:<count> --pid ...`); else None. There
+    /etc/subuid's ids don't exist and newuidmap can't be used, but root in the namespace may map
+    the ids it has."""
+    if os.geteuid() != 0:
+        return None
+    try:
+        rows = [tuple(int(x) for x in line.split()) for line in open(path)]
+    except OSError:
+        return None
+    for inner, _outer, count in rows:
+        if inner <= 1 < inner + count and (inner, count) != (0, 4294967295):
+            return 1, inner + count - 1
+    return None
+
+
 def id_maps():
-    """`unshare` mappings for the gateway's own uid and gid (1..count onto the subordinate ranges),
-    beside root (the invoking user). Exits with a reason when they can't be made."""
+    """`unshare` mappings for the gateway's own uid and gid (1..count onto the subordinate ranges,
+    or onto the same ids of the user namespace the harness is already root in), beside root (the
+    invoking user). Exits with a reason when they can't be made."""
+    nested = [ns_range("/proc/self/uid_map"), ns_range("/proc/self/gid_map")]
+    if all(r and r[1] >= GW_UID for r in nested):
+        (su, sc), (sg, gc) = nested
+        return ["--map-users", f"1:{su}:{sc}", "--map-groups", f"1:{sg}:{gc}"], su + GW_UID - 1
     ranges = [subid_range("/etc/subuid"), subid_range("/etc/subgid")]
     if not all(r and r[1] >= GW_UID for r in ranges) or not shutil.which("newuidmap") or not shutil.which("newgidmap"):
         log(f"the gateway runs as its own uid ({GW_UID} in the namespace): this needs newuidmap/newgidmap (package uidmap) "

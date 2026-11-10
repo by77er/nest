@@ -30,6 +30,7 @@ The specs below and the fixtures describe what's implemented. This section lists
 
 Each is dropped once every host and runner runs the release that made it optional ([dev/deploy](../../dev/deploy.md)).
 
+- **`segment.total_bytes`** (2026-11-09): optional on both sides. A runner of the previous release sends none, and AgentDO then commits a rewrite at its first durable segment, as before (the window in which a brain death mid-rewrite can truncate the resumable session). An AgentDO of the previous release ignores the field. Required of runners once every brain host runs this release.
 - **Workstream fields:** they stay only so the previous release's hosts, runners and control plane parse what this one sends; nothing reads them, and once they go, sandbox and agent commands carry no grouping field.
   - `sandbox_create.workstream`, `sandbox_fork.child_workstream` and `agent_start.workstream` are optional on both sides; the control plane still sends a `ws_` value (a sandbox's stored one, else `ws_<id suffix>` of the sandbox or agent), since previous hosts and runners require it. nestd passes it on in the proxy's `sandbox_upsert.workstream`.
   - The `host_event` tag `workstream` carries a `SandboxEvent` (`egress_denied`, `egress_alert`, `port_opened`) whose `workstream` is optional and echoes that value. A rename of the tag is two releases of expand/contract.

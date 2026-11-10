@@ -25,6 +25,7 @@ import { MAX_WAITS, type PrUntil, prVerdict, taskVerdict, timeoutProblem, type W
 import { MAX_NOTES, mayWriteMemory, NOTE_KEY, NOTE_MAX, type Note, preview } from "../memory";
 import type { RoutineKind, RoutinePreset } from "../requests";
 import { type Created, firedTrigger, MAX_PROPOSALS_PER_RUN, MAX_ROUTINES, MAX_START_ATTEMPTS, MAX_UNTRIAGED_PROPOSALS, nextTimerFire, type RoutineFields, routineSpawnExtras, runBrief, type RunOutcome, type RunState, startVerdict, type TriggerKind, type Triggers } from "../routines";
+import { EARLY_EXITS_KEEP_MS, ENDED_RUNS_KEEP_MS, ERRORS_KEEP_MS, PRUNE_EVERY_MS, RUN_TURNS_KEEP_MS, TRIAGED_PROPOSALS_KEEP_MS } from "../retention";
 import { randomId } from "./directory";
 import { type ManagerEvent, type ManagerLife, managerStep } from "../manager";
 import { OUTBOX, type OutboxEvent, type OutboxPolicy, type OutboxRow, type OutboxState, outboxState, outboxStep, pruneBefore, verdict } from "../outbox";
@@ -514,6 +515,14 @@ export const MIGRATIONS = [
     "CREATE TABLE model_templates (name TEXT PRIMARY KEY, role TEXT NOT NULL, model TEXT NOT NULL, at_ms INTEGER NOT NULL)",
     "CREATE TABLE agent_templates (agent TEXT PRIMARY KEY, name TEXT NOT NULL)",
   ],
+  [
+    // An attach owed while one runs (a retry, the App's id learned) is a new generation: the running one's
+    // success or failure doesn't clear it (README.md#flows).
+    "ALTER TABLE settings ADD COLUMN attach_gen INTEGER NOT NULL DEFAULT 0",
+    // A worker's or routine run's exit that came before the start naming its agent finished: matched by
+    // the agent's id once the start knows it (pruned after a day).
+    "CREATE TABLE early_exits (agent TEXT PRIMARY KEY, reason TEXT, at_ms INTEGER NOT NULL)",
+  ],
 ] as const;
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
@@ -558,6 +567,8 @@ export class ProjectDO extends DurableObject<Env> {
   /** Waits another `await_*` caller was handed while their first caller was still checking (in memory: only across those awaits). */
   private readonly sharedWaits = new Set<string>();
   private again = false;
+  /** When this instance last pruned (in memory: a restart prunes at its first drain). */
+  private prunedMs = 0;
   /** Whether this drain already went round again for a changed grant (`grantSeen`). */
   private reowed = false;
 
@@ -983,7 +994,7 @@ export class ProjectDO extends DurableObject<Env> {
   /** Attach the repo again now (the board's retry after a failure; harmless when attached). */
   async retryAttach(): Promise<Result<Settings>> {
     if (!this.settings()) return fail(404, "unknown project");
-    this.sql.exec("UPDATE settings SET attach_next_ms = ?, attach_attempts = 0", Date.now());
+    this.sql.exec("UPDATE settings SET attach_next_ms = ?, attach_attempts = 0, attach_gen = attach_gen + 1", Date.now());
     await this.arm();
     await this.drain();
     return ok(this.settings()!);
@@ -993,7 +1004,7 @@ export class ProjectDO extends DurableObject<Env> {
   async appIdLearned(appId: number): Promise<void> {
     const s = this.settings();
     if (!s?.attached || s.attach?.app_id === appId) return;
-    this.sql.exec("UPDATE settings SET attach_next_ms = ?, attach_attempts = 0", Date.now());
+    this.sql.exec("UPDATE settings SET attach_next_ms = ?, attach_attempts = 0, attach_gen = attach_gen + 1", Date.now());
     await this.arm();
   }
 
@@ -2080,7 +2091,12 @@ export class ProjectDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
     this.sql.exec("DELETE FROM layers WHERE agent = ?", agent);
     const r = this.sql.exec("SELECT id FROM tasks WHERE assignee = ?", agent).toArray()[0];
-    if (!r) return;
+    if (!r) {
+      // No task names it yet: its start may still be finishing (the exit overtook the create's answer).
+      // Kept, so the start that learns this agent sees it exited.
+      this.sql.exec("INSERT OR IGNORE INTO early_exits (agent, reason, at_ms) VALUES (?, ?, ?)", agent, reason ?? null, Date.now());
+      return;
+    }
     this.move(r.id as string, "worker_exited", { kind: "app", what: "nest" }, { detail: { agent, reason: reason ?? null, text: text?.slice(0, 2000) ?? null } });
     this.autoAssign();
   }
@@ -2777,6 +2793,8 @@ export class ProjectDO extends DurableObject<Env> {
   /** nest's events about a routine run's agent: its turns (counted against its budget), its end. */
   private routineEvent(e: NestEvent): void {
     const r = this.sql.exec("SELECT * FROM routine_runs WHERE agent = ?", e.agent).toArray()[0];
+    // No run names it yet (its exit overtook the create's answer): kept for the start that learns it.
+    if (!r && e.type === "agent.exited") this.sql.exec("INSERT OR IGNORE INTO early_exits (agent, reason, at_ms) VALUES (?, ?, ?)", e.agent, e.reason ?? null, Date.now());
     if (!r || r.state === "ended") return;
     const id = r.id as string;
     if (e.type === "agent.turn_completed") {
@@ -2843,12 +2861,16 @@ export class ProjectDO extends DurableObject<Env> {
         agent = template === TEMPLATE.dreaming
           ? (await nest.createAgent({ ...spawn, template: TEMPLATE.dreaming, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent
           : await nest.startAgent(TEMPLATE.routine, labels, { read: s.repo }, `${s.id}/routine/${id}`, {}, spawn);
-        await directory(this.env).recordAgent({ agent, project: s.id, role: "routine", task: null, pr: null });
+        // Named on the run in the step the create's answer came, before any other await, so its exit finds it.
         this.sql.exec("UPDATE routine_runs SET agent = ? WHERE id = ? AND agent IS NULL", agent, id);
         if (!current()) {
           this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, NULL, 'routine run stopped', ?)", agent, Date.now());
           return;
         }
+        await directory(this.env).recordAgent({ agent, project: s.id, role: "routine", task: null, pr: null });
+        // It exited before the run named it: its exit is handled now (waiting, as any exit before a turn, for that turn).
+        const early = this.sql.exec("DELETE FROM early_exits WHERE agent = ? RETURNING reason", agent).toArray()[0];
+        if (early) this.routineEvent({ id: `early/${agent}`, type: "agent.exited", agent, reason: (early.reason as string | null) ?? "exited" } as NestEvent);
       }
       const brief = (frozen.brief as string | null) ?? briefOf(spawn);
       await nest.postInbox(agent, brief, { requestId: `${id}/brief` });
@@ -3317,10 +3339,31 @@ export class ProjectDO extends DurableObject<Env> {
     return this.draining;
   }
 
+  /**
+   * Terminal rows of history-like tables, pruned by age (src/retention.ts): nest's error events (not a refused stop), triaged
+   * proposals, ended routine runs (with their proposals' and turns' rows), counted turns of runs that ended,
+   * and early exits no start claimed. Never a task's history, the chat, memory or issues.
+   */
+  prune(now: number): void {
+    this.prunedMs = now;
+    // Not a refused stop (`stop_failed`) whose stop is still failed (README.md#outboxes): the sign an agent
+    // nest wouldn't stop may still run, kept until the owner retries or dismisses it or the stop goes through.
+    this.sql.exec(
+      "DELETE FROM errors WHERE at_ms < ? AND (code IS NULL OR code != 'stop_failed' OR agent NOT IN (SELECT agent FROM stops WHERE failed_ms IS NOT NULL))",
+      now - ERRORS_KEEP_MS,
+    );
+    this.sql.exec("DELETE FROM proposals WHERE state != 'untriaged' AND triaged_ms < ?", now - TRIAGED_PROPOSALS_KEEP_MS);
+    this.sql.exec("DELETE FROM run_turns WHERE run IN (SELECT id FROM routine_runs WHERE state = 'ended' AND ended_ms < ?)", now - RUN_TURNS_KEEP_MS);
+    // An ended run with nothing owed for it (its clean-up done).
+    this.sql.exec("DELETE FROM routine_runs WHERE state = 'ended' AND ended_ms < ? AND cleanup_next_ms IS NULL", now - ENDED_RUNS_KEEP_MS);
+    this.sql.exec("DELETE FROM early_exits WHERE at_ms < ?", now - EARLY_EXITS_KEEP_MS);
+  }
+
   private async drainOnce(): Promise<void> {
     if (!this.settingsRow() || (await this.listed()) !== "ready") return;
     const s = this.settingsRow();
     if (!s) return;
+    if (Date.now() - this.prunedMs >= PRUNE_EVERY_MS) this.prune(Date.now());
     // A wait whose deadline passed times out here, in one step, unless its condition resolved it first.
     for (const r of this.sql.exec("SELECT id FROM waits WHERE resolved_ms IS NULL AND deadline_ms <= ?", Date.now()).toArray()) {
       this.resolveWait(r.id as string, "timed_out", "timed out");
@@ -3461,6 +3504,8 @@ export class ProjectDO extends DurableObject<Env> {
    */
   private async attachRepo(nest: Nest): Promise<void> {
     const s = this.settings()!;
+    // An attach owed again while this one runs (a new generation) stays owed, whatever this one's outcome.
+    const gen = this.settingsRow()!.attach_gen as number;
     try {
       const gh = await githubFor(nest, s.repo, PERMISSIONS.attach);
       // The App's id from nest's token answer; else one a check run told, if any has yet.
@@ -3475,13 +3520,14 @@ export class ProjectDO extends DurableObject<Env> {
       if (user) this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1 WHERE comments_decided = 0", owner.id, owner.login);
       const detail: AttachDetail = { ...r, at_ms: Date.now() };
       this.sql.exec(
-        "UPDATE settings SET attached_ms = COALESCE(attached_ms, ?), attach_next_ms = NULL, attach_attempts = 0, attach_error = NULL, attach_detail = ?",
-        Date.now(), JSON.stringify(detail),
+        `UPDATE settings SET attached_ms = COALESCE(attached_ms, ?), attach_error = NULL, attach_detail = ?,
+          attach_next_ms = CASE WHEN attach_gen = ? THEN NULL ELSE attach_next_ms END, attach_attempts = CASE WHEN attach_gen = ? THEN 0 ELSE attach_attempts END`,
+        Date.now(), JSON.stringify(detail), gen, gen,
       );
     } catch (e) {
       const attempts = (this.settingsRow()!.attach_attempts as number) + 1;
       const permanent = (e instanceof NestError || e instanceof GitHubError) && e.permanent;
-      this.sql.exec("UPDATE settings SET attach_attempts = ?, attach_next_ms = ?, attach_error = ?", attempts, permanent ? null : Date.now() + backoff(attempts), message(e));
+      this.sql.exec("UPDATE settings SET attach_attempts = ?, attach_next_ms = ?, attach_error = ? WHERE attach_gen = ?", attempts, permanent ? null : Date.now() + backoff(attempts), message(e), gen);
     }
   }
 
@@ -3603,17 +3649,27 @@ export class ProjectDO extends DurableObject<Env> {
         const spec = await this.sandboxSpec(nest, "worker", key);
         const from = await this.templateFor(nest, "worker", spec);
         agent = await nest.startAgent(from, labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
+        // In the step the create's answer came (no await): the template it started from, for the sweep.
         this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
-        await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
         if (!current()) {
           // Cancelled (or reassigned, or abandoned) while it was being made: it goes, with no layer or holdings kept for it.
           this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, ?, 'cancelled', ?)", agent, id, Date.now());
           return;
         }
+        // Named on the task in the step the create's answer came, before any other await, so its exit finds it.
         this.trackLayer(agent, "worker", frozen.rev);
         this.recordHolder(agent, "worker", spec.names, spec.extras.github_push?.workflows === true);
         this.sql.exec("UPDATE tasks SET assignee = ? WHERE id = ?", agent, id);
         this.record(id, { kind: "app", what: "assign" }, "worker", { agent });
+        await directory(this.env).recordAgent({ agent, project: s.id, role: "worker", task: id, pr: null });
+        // It exited before the task named it (its exit overtook the create's answer): handled now.
+        const early = this.sql.exec("DELETE FROM early_exits WHERE agent = ? RETURNING reason", agent).toArray()[0];
+        if (early) {
+          // As `onEvent`'s exit does: its layer, and the secrets it held (just recorded), go with it.
+          this.workerExited(agent, (early.reason as string | null) ?? undefined);
+          this.sql.exec("DELETE FROM agent_secrets WHERE agent = ?", agent);
+          return;
+        }
       }
       const t = this.toTask(this.taskRow(id)!);
       // A spec a tainted session wrote reaches the worker as relayed text, so its session is tainted too.

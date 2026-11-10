@@ -148,12 +148,14 @@ struct FakeVm {
     guest: Option<tokio::task::JoinHandle<()>>,
 }
 
-struct FakePauser(Arc<Mutex<Vec<(String, u64)>>>, String, u64);
+/// The lock-free pauser: each pause is recorded, and in the VM's ops as `pauser <sandbox>`.
+struct FakePauser(Arc<Mutex<Vec<(String, u64)>>>, String, u64, Arc<Mutex<Vec<String>>>);
 
 #[async_trait]
 impl nestd::driver::Pauser for FakePauser {
     async fn pause(&self) -> std::io::Result<()> {
         self.0.lock().unwrap().push((self.1.clone(), self.2));
+        self.3.lock().unwrap().push(format!("pauser {}", self.1));
         Ok(())
     }
 }
@@ -161,7 +163,7 @@ impl nestd::driver::Pauser for FakePauser {
 #[async_trait]
 impl Vm for FakeVm {
     fn pauser(&self) -> Option<Arc<dyn nestd::driver::Pauser>> {
-        Some(Arc::new(FakePauser(self.paused.clone(), self.spec.sandbox.0.clone(), self.spec.epoch.0)))
+        Some(Arc::new(FakePauser(self.paused.clone(), self.spec.sandbox.0.clone(), self.spec.epoch.0, self.vm_ops.clone())))
     }
     fn vsock_uds_path(&self) -> PathBuf {
         self.spec.vm_dir.join("vsock.sock")
@@ -2178,8 +2180,9 @@ async fn a_replaced_disk_file_is_read() {
 }
 
 /// Review of #122: a fence that lands between a checkpoint's "not fenced" check and its resume is
-/// undone by the resume, so the checkpoint freezes the VM again. (The fence's own lock-free pause
-/// may run before the resume, as here: the resume is held until the fence has marked the row.)
+/// undone by the resume, so the checkpoint freezes the VM again, through the fence's pauser (which
+/// keeps what it stops when not everything can be). (The fence's own lock-free pause may run before
+/// the resume, as here: the resume is held until the fence has marked the row.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fence_during_a_checkpoints_resume_freezes_the_vm_again() {
     let h = start_host().await;
@@ -2197,7 +2200,7 @@ async fn a_fence_during_a_checkpoints_resume_freezes_the_vm_again() {
     wait_until("the VM is stopped", || h.vm.stopped.lock().unwrap().iter().any(|s| s == "sbx_1")).await;
     let ops = h.vm.vm_ops.lock().unwrap().clone();
     let resumed = ops.iter().rposition(|o| o == "resume sbx_1").expect("resumed");
-    assert!(ops[resumed + 1..].iter().any(|o| o == "pause sbx_1"), "frozen again after the resume: {ops:?}");
+    assert!(ops[resumed + 1..].iter().any(|o| o == "pauser sbx_1"), "frozen again after the resume: {ops:?}");
 }
 
 /// A fence that lands after a checkpoint's fence check and before its pause of the VM (the read of
