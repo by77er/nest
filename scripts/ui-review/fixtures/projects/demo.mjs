@@ -442,13 +442,21 @@ const RICH = [
     if (path === "/admin/sync-state") return [200, sync];
     if (path === "/admin/sync" && method === "POST") return [200, { written: sync.written.slice(0, 2), repos: ["by77er/gadgets"] }];
     // Each project's repo binding (README.md#the-repos-binding): read from GitHub; learned from an event, renamed
-    // since and not applied; and one that didn't bind, with why.
-    if (path === "/admin/bindings") return [200, [
-      { project: demo.id, name, repo, repo_id: 734_118_202, renamed_to: null, installation_id: null, bound: "github", bound_ms: now - 2 * 3_600_000, error: null },
-      { project: other.id, name: other.name, repo: other.repo, repo_id: 512_330_977, renamed_to: "gadget-works-incorporated/widgets-and-sprockets-monorepo", installation_id: null, bound: "event", bound_ms: now - 6 * DAY, error: null },
-      { project: "prj_legacy", name: "Thingamajigs", repo: "by77er/thingamajigs", repo_id: null, renamed_to: null, installation_id: null, bound: null, bound_ms: null, error: "GitHub's repo by77er/thingamajigs (734118202) is project prj_demo's" },
-    ]];
-    if (path.startsWith("/admin/bindings/") && method === "POST") return [200, { binding: { project: demo.id, name, repo, repo_id: 734_118_202, renamed_to: null, installation_id: null, bound: "github", bound_ms: now, error: null }, changed: false, previous_id: 734_118_202, rename: null }];
+    // since and not applied; and one that didn't bind, with why. Re-read: Gadgets confirms; Widgets finds
+    // GitHub's repo for its name is another (both shown, to choose); Thingamajigs fails.
+    const owner = { id: 4_118_220, login: "by77er" };
+    const bindings = [
+      { project: demo.id, name, repo, repo_id: 734_118_202, renamed_to: null, installation_id: null, bound: "github", bound_ms: now - 2 * 3_600_000, error: null, owner },
+      { project: other.id, name: other.name, repo: other.repo, repo_id: 512_330_977, renamed_to: "gadget-works-incorporated/widgets-and-sprockets-monorepo", installation_id: null, bound: "event", bound_ms: now - 6 * DAY, error: null, owner: null },
+      { project: "prj_legacy", name: "Thingamajigs", repo: "by77er/thingamajigs", repo_id: null, renamed_to: null, installation_id: null, bound: null, bound_ms: null, error: "Didn't bind: GitHub's repo by77er/thingamajigs (734118202) is already project prj_demo's", owner: null },
+    ];
+    if (path === "/admin/bindings") return [200, bindings];
+    if (path === `/admin/bindings/${other.id}` && method === "POST") return [200, { binding: bindings[1], mismatch: {
+      bound: { full_name: "gadget-works-incorporated/widgets-and-sprockets-monorepo", id: 512_330_977, owner: null },
+      github: { full_name: "gadget-works-incorporated/widgets-and-sprockets-monorepo", id: 918_400_115, owner: { id: 77_001_234, login: "gadget-works-incorporated" }, same_owner: null },
+    } }];
+    if (path === "/admin/bindings/prj_legacy" && method === "POST") return [409, { error: "GitHub couldn't be read: GitHub 502: Bad Gateway", binding: bindings[2] }];
+    if (path.startsWith("/admin/bindings/") && method === "POST") return [200, { binding: bindings[0], changed: false, previous_id: 734_118_202, rename: null }];
     if (!path.startsWith("/projects/prj_demo")) return [404, { error: "unknown project" }];
     const q = path.slice("/projects/prj_demo".length);
     // A save the API refuses (README.md#network): a host newly added outside the grant, named.

@@ -241,18 +241,19 @@ The owner's request (2026-11-09): "allow me to select the model for the manager 
 
 A security follow-up (2026-11-09, once the repo was public): a project's repo is bound by GitHub's ids, read from GitHub, not learned from an event.
 
-- **What's bound** (DirectoryDO's `projects`): the repo's GitHub id (`repo_id`), how it was learned (`github`, or `event` for a project from before ids were read) and when, the name GitHub last gave the repo when that isn't the project's (`renamed_to`), why the last read didn't bind it, and the App installation's id (null until nest's token answer names it; then each event's installation is checked against it, a follow-up).
+- **What's bound** (DirectoryDO's `projects`): the repo's GitHub id (`repo_id`), how it was learned (`github`, or `event` for a project from before ids were read) and when, the name GitHub last gave the repo when that isn't the project's (`renamed_to`), why the last read didn't bind it, the bound repo's owner as GitHub answered (none for one learned from an event), and the App installation's id (null until nest's token answer names it; then each event's installation is checked against it, a follow-up).
 - **Read from GitHub** (`GET /repos/{owner}/{repo}` with a metadata token from nest, `src/binding.ts`):
   - **at attach,** so a new project is never without one;
-  - **at every catalog sync,** for a project that has none or was bound from an event (a sync runs at each project's creation and from the Admin page). One whose id matches is confirmed; one that doesn't is kept as it is and shown;
-  - **by the operator's Re-read** (Admin page, `POST /api/admin/bindings/<project>`), which binds whatever GitHub answers. It reads by the name GitHub last gave the repo, so an old name taken since by another repo isn't read.
+  - **at every catalog sync,** for a project that has none or was bound from an event (a sync runs at each project's creation and from the Admin page). One whose id matches is confirmed. One that doesn't is kept as it is, and its error says that events still go to the bound repo and what to check (renamed, transferred, or deleted and its name taken);
+  - **by the operator's Re-read** (Admin page, `POST /api/admin/bindings/<project>`). It binds a project with no id and confirms one that matches. It never changes an id by itself: when GitHub's repo for the name is another, nothing is written and both are answered (name, id, owner, and whether GitHub's has the bound one's owner: the bound repo's as read, else the owner ProjectDO recorded at attach). Only the operator's explicit choice binds that one (`POST …/<project>/bind {repo_id}`, behind a confirmation naming it), with the id they were shown: if GitHub's answer changed since, it's refused. It reads by the name GitHub last gave the repo, so an old name taken since by another repo isn't read.
+  - An id learned from an event is recorded as `event` (with no owner), so the next sync reads it from GitHub.
   - A repo id another project holds is never bound: the binding says whose it is. A read that fails changes nothing.
 - **Until it's read,** a project with no id is found by the name it was created with, and takes the id of the first event that names it.
 - **A rename or transfer:**
   - An event routed by the id names the repo's new name: it's kept as `renamed_to`.
-  - It's applied (ProjectDO, ReviewDO, then the directory, then the catalog synced) by a sync or a Re-read, once nest's grant for the app names the new name. nest mints tokens only for the repos its grant names, so until then the project calls GitHub by the old name, which GitHub redirects (unverified for every call nest makes after a transfer). Never onto a name another project has.
+  - It's applied (the directory's guarded rename first, then ProjectDO and ReviewDO, then the catalog synced; if either can't follow, the directory's is taken back, so they never disagree) by a sync or a Re-read, once nest's grant for the app names the new name. nest mints tokens only for the repos its grant names, so until then the project calls GitHub by the old name, which GitHub redirects (unverified for every call nest makes after a transfer). Never onto a name another project has.
   - Agents running keep what they started with; new ones get the new name.
-- **The Admin page** lists each binding (project, repo, id, how it was learned, a rename not applied yet, why it didn't bind) with Re-read.
+- **The Admin page** lists each binding (project, repo, id, how it was learned, a rename not applied yet, why it didn't bind) with Re-read: a table from `sm`, a card per binding below it. "Rename pending" and "Not bound" are badged. A failed re-read is said in its row, which offers Retry; a mismatch shows both repos side by side with "Bind to this repo".
 
 ## Creating a project
 

@@ -11,7 +11,7 @@ import { clientIdOf, NestError, nestFrom } from "./nest";
 import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSIDE, rulesProblems } from "./network";
 import { prNumberOf } from "./prs";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
-import { AcceptIssue, AddDependency, Answer, AttachPr, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, PutSecret, Settings, Spec, UpdateRoutine, UpdateTask } from "./requests";
+import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, PutSecret, Settings, Spec, UpdateRoutine, UpdateTask } from "./requests";
 import { PRESETS } from "./routines";
 import type { UntrustedPolicy } from "./review-trust";
 import type { Result } from "./sql";
@@ -49,13 +49,22 @@ async function sync(env: Env): Promise<Response> {
 
 /**
  * The operator's re-read of a project's repo binding (README.md#the-repos-binding): the repo's id from
- * GitHub, whatever was bound before, and a rename applied when nest's grant names the new name (then the
- * catalog is synced, so its templates name it).
+ * GitHub. No id yet: bound. The same id: confirmed, and a rename applied when nest's grant names the new
+ * name (then the catalog is synced, so its templates name it). Another id: nothing written, and both repos
+ * answered (`mismatch`), each with its owner, and whether GitHub's has the bound one's owner; the operator
+ * binds it only by `bind` with the id they were shown.
  */
-async function rereadBinding(env: Env, id: string): Promise<Response> {
+async function rereadBinding(env: Env, id: string, shownId?: number): Promise<Response> {
   const nest = nestFrom(env);
   if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
-  const r = await readBinding(env, nest, id, "replace");
+  const r = await readBinding(env, nest, id, shownId === undefined ? "check" : "replace", shownId);
+  if (!r.ok && "mismatch" in r) {
+    // The owner the project knows: the bound repo's as read, else the repo's owner ProjectDO recorded at attach.
+    const s = await project(env, id).getSettings();
+    const known = r.mismatch.bound.owner?.id ?? (s.ok ? (s.value.repo_owner?.id ?? null) : null);
+    const owner = r.mismatch.github.owner?.id ?? null;
+    return json({ binding: r.binding, mismatch: { bound: r.mismatch.bound, github: { ...r.mismatch.github, same_owner: known === null || owner === null ? null : known === owner } } });
+  }
   if (!r.ok) return r.binding === null ? err(404, r.error) : json({ error: r.error, binding: r.binding }, 409);
   const rename = await applyRename(env, nest, r.binding);
   if (rename && "applied" in rename) await syncRepos(env);
@@ -95,6 +104,13 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     if (m !== "POST") return err(405, "POST only");
     if (!ID.project.test(parts[2]!)) return err(404, "unknown project");
     return rereadBinding(env, parts[2]!);
+  }
+  // The operator's choice of the repo a re-read showed beside the bound one: that id only.
+  if (parts[0] === "admin" && parts[1] === "bindings" && parts.length === 4 && parts[3] === "bind") {
+    if (m !== "POST") return err(405, "POST only");
+    if (!ID.project.test(parts[2]!)) return err(404, "unknown project");
+    const b = await body(req, BindRepo);
+    return b.ok ? rereadBinding(env, parts[2]!, b.value.repo_id) : b.res;
   }
 
   // An agent's live trace, a WebSocket proxied to nest (src/trace.ts).

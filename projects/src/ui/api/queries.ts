@@ -427,7 +427,8 @@ export const useBindings = () => useQuery({ queryKey: keys.bindings, queryFn: ap
 export function useRereadBinding() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => api.rereadBinding(id),
+    // `repo_id`: the operator's choice of the repo a re-read showed beside the bound one.
+    mutationFn: (v: { project: string; repo_id?: number }) => (v.repo_id === undefined ? api.rereadBinding(v.project) : api.bindRepo(v.project, v.repo_id)),
     meta: { inline: true },
     onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: keys.bindings }), qc.invalidateQueries({ queryKey: keys.projects }), qc.invalidateQueries({ queryKey: keys.syncState })]),
   });

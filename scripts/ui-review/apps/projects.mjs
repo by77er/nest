@@ -636,6 +636,20 @@ const app = {
     { name: "admin", section: "top", path: "/admin" },
     // The repo bindings' Re-read and what it says (README.md#the-repos-binding).
     { name: "admin-reread", section: "top", path: "/admin", full: false, after: (p) => p.getByRole("button", { name: "Re-read Gadgets's repo from GitHub" }).click() },
+    // A failed re-read, said in its row (card on a phone), which offers Retry.
+    { name: "admin-reread-failed", section: "top", path: "/admin", httpErrors: true, after: async (p) => {
+      await p.getByRole("button", { name: "Re-read Thingamajigs's repo from GitHub" }).click();
+      await p.locator("[data-slot=reread-error]").first().waitFor();
+    } },
+    // GitHub's repo for the name isn't the bound one: both side by side, nothing changed, and the confirm.
+    { name: "admin-mismatch", section: "top", path: "/admin", after: async (p) => {
+      await p.getByRole("button", { name: "Re-read Widgets's repo from GitHub" }).click();
+      await p.locator("[data-slot=mismatch]").first().waitFor();
+    } },
+    { name: "admin-bind-confirm", section: "top", path: "/admin", full: false, after: async (p) => {
+      await p.getByRole("button", { name: "Re-read Widgets's repo from GitHub" }).click();
+      await p.getByRole("button", { name: /^Bind Widgets to / }).click();
+    } },
     { name: "board", section: "project", path: "/projects/prj_demo/board", check: sixColumns, checkName: "board-columns" },
     { name: "board-long", section: "project", path: "/projects/prj_demo/board", fixture: "long" },
     { name: "board-needs-you-all", section: "project", path: "/projects/prj_demo/board", after: (p) => p.getByRole("button", { name: /Show all/ }).click() },

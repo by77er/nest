@@ -6,7 +6,7 @@
 import { directory, type Env, project, review } from "./env";
 import { githubFor, PERMISSIONS } from "./github";
 import { type Nest, NestError } from "./nest";
-import type { BindOutcome, RepoBinding } from "./do/directory";
+import type { BindOutcome, GithubRepo, RepoBinding } from "./do/directory";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 500);
 
@@ -15,11 +15,11 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).sli
  * operator's re-read). Read by the name GitHub last gave it, so an old name taken by another repo since
  * isn't read; with a token for that name, or (outside nest's grant yet) for the name the project has.
  */
-export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill" | "replace"): Promise<BindOutcome> {
+export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill" | "check" | "replace", shownId?: number): Promise<BindOutcome> {
   const dir = directory(env);
   const b = await dir.binding(id);
   if (!b) return { ok: false, error: "unknown project", binding: null };
-  let info: { id: number; full_name: string };
+  let info: GithubRepo;
   const name = b.renamed_to ?? b.repo;
   try {
     let gh;
@@ -30,10 +30,13 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
       if (!(b.renamed_to && e instanceof NestError && e.status === 403)) throw e;
       gh = await githubFor(nest, b.repo, PERMISSIONS.metadata);
     }
-    info = await gh.repoInfo(name);
+    const r = await gh.repoInfo(name);
+    info = { id: r.id, full_name: r.full_name, owner: { id: r.owner.id, login: r.owner.login } };
   } catch (e) {
     return { ok: false, error: `GitHub couldn't be read: ${message(e)}`, binding: b };
   }
+  // The operator's choice binds the repo they were shown, and no other: GitHub's answer changed since, nothing.
+  if (mode === "replace" && info.id !== shownId) return { ok: false, error: `GitHub's ${name} is repo ${info.id} now, not the repo ${shownId ?? "?"} you were shown: re-read to compare again`, binding: b };
   return await dir.bindRepo(id, info, mode);
 }
 
@@ -41,19 +44,29 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
 export type RenameOutcome = { applied: string } | { blocked: string } | null;
 
 /**
- * Apply a rename GitHub told (`renamed_to`): ProjectDO and ReviewDO first, the directory last, so a step
- * that fails is redone whole next time. Only once nest's grant names the new name (it mints tokens for
- * the repos it names), and never onto another project's name.
+ * Apply a rename GitHub told (`renamed_to`): the directory's guarded rename first (never onto another
+ * project's name), then ProjectDO and ReviewDO; if either can't follow, the directory's is taken back, so
+ * they never disagree and the next sync tries it whole. Only once nest's grant names the new name (it
+ * mints tokens for the repos it names).
  */
 export async function applyRename(env: Env, nest: Nest, b: RepoBinding): Promise<RenameOutcome> {
   const to = b.renamed_to;
   if (!to) return null;
   const repos = ((await nest.self()).grant?.github?.repos ?? []).map((r) => r.toLowerCase());
   if (!repos.includes(to)) return { blocked: `nest's grant for the app doesn't name ${to} yet: add it, then re-read` };
-  if (await directory(env).projectByName(to, b.project)) return { blocked: `${to} is another project's repo` };
-  await project(env, b.project).repoRenamed(to);
-  await review(env, b.project).repoRenamed(to);
-  return (await directory(env).renameRepo(b.project, to)) ? { applied: to } : { blocked: "the rename changed while it was applied: re-read" };
+  const dir = directory(env);
+  if (await dir.projectByName(to, b.project)) return { blocked: `${to} is another project's repo` };
+  if (!(await dir.renameRepo(b.project, to))) return { blocked: "the rename changed while it was applied: re-read" };
+  try {
+    await project(env, b.project).repoRenamed(to);
+    await review(env, b.project).repoRenamed(to);
+  } catch (e) {
+    await project(env, b.project).repoRenamed(b.repo).catch(() => {});
+    await review(env, b.project).repoRenamed(b.repo).catch(() => {});
+    await dir.unrenameRepo(b.project, b.repo, to);
+    return { blocked: `it couldn't be applied: ${message(e)}` };
+  }
+  return { applied: to };
 }
 
 /**

@@ -589,7 +589,7 @@ export class FakeGitHub {
   readonly orgs = new Set<string>();
   readonly calls: { method: string; path: string; body: any; token: string | null }[] = [];
   readonly tokens = new Map<string, { repo: string; permissions: Record<string, string> }>();
-  readonly repos = new Map<string, { id: number; default_branch: string; protection: Record<string, any> | null; allow_auto_merge: boolean }>();
+  readonly repos = new Map<string, { id: number; default_branch: string; protection: Record<string, any> | null; allow_auto_merge: boolean; owner_id?: number }>();
   /** Renamed or transferred repos, old name to new: the old name answers with the repo, as GitHub's redirect does, until it's taken. */
   readonly renamed = new Map<string, string>();
   /** Each PR's auto-merge, by node id, as GraphQL's mutations leave it. */
@@ -644,10 +644,10 @@ export class FakeGitHub {
   }
 
   /** Someone registers a repo under a name a renamed repo had: the old name is that repo's from now on. */
-  take(name: string): number {
+  take(name: string, ownerId?: number): number {
     const k = name.toLowerCase();
     this.renamed.delete(k);
-    this.repos.set(k, { id: repoIdOf(k) + 1, default_branch: "main", protection: null, allow_auto_merge: false });
+    this.repos.set(k, { id: repoIdOf(k) + 1, default_branch: "main", protection: null, allow_auto_merge: false, ...(ownerId === undefined ? {} : { owner_id: ownerId }) });
     return this.repos.get(k)!.id;
   }
 
@@ -707,7 +707,7 @@ export class FakeGitHub {
     // Its owner: the account in its name, a user unless the test made it an org.
     const owner = repoName.split("/")[0]!;
     const repoView = () => ({
-      id: repo.id, full_name: repoName, default_branch: repo.default_branch, owner: { login: owner, id: ownerIdOf(owner), type: this.orgs.has(owner) ? "Organization" : "User" },
+      id: repo.id, full_name: repoName, default_branch: repo.default_branch, owner: { login: owner, id: repo.owner_id ?? ownerIdOf(owner), type: this.orgs.has(owner) ? "Organization" : "User" },
       ...(need("contents", "write") ? { allow_auto_merge: repo.allow_auto_merge } : {}),
     });
     if (req.method === "GET" && sub === "") {

@@ -76,6 +76,10 @@ const MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN installation_id INTEGER",
     // Why the last read from GitHub didn't bind it (another project's repo, an id that doesn't match), if it didn't.
     "ALTER TABLE projects ADD COLUMN bind_error TEXT",
+    // The bound repo's owner as GitHub answered when it was read (an event names none): shown beside another
+    // repo GitHub answers for the name, to tell them apart.
+    "ALTER TABLE projects ADD COLUMN repo_owner_id INTEGER",
+    "ALTER TABLE projects ADD COLUMN repo_owner_login TEXT",
   ],
 ] as const;
 
@@ -95,12 +99,32 @@ export interface RepoBinding {
   bound_ms: number | null;
   /** Why the last read from GitHub didn't bind it, if it didn't. */
   error: string | null;
+  /** The bound repo's owner, as GitHub answered when it was read; null when it was learned from an event. */
+  owner: { id: number; login: string } | null;
 }
 
-/** What `bindRepo` did with what GitHub answered. */
+/** A repo as the Admin page shows it beside another: its name, id and owner. */
+export interface RepoRef {
+  full_name: string;
+  id: number | null;
+  owner: { id: number; login: string } | null;
+}
+
+/** What GitHub answered for a repo. */
+export interface GithubRepo {
+  id: number;
+  full_name: string;
+  owner?: { id: number; login: string };
+}
+
+/**
+ * What `bindRepo` did with what GitHub answered: bound (or confirmed), refused (why), or (a re-read) found
+ * GitHub's repo for the name isn't the one bound: nothing written, both shown for the operator to choose.
+ */
 export type BindOutcome =
   | { ok: true; binding: RepoBinding; changed: boolean; previous_id: number | null }
-  | { ok: false; error: string; binding: RepoBinding | null };
+  | { ok: false; error: string; binding: RepoBinding | null }
+  | { ok: false; mismatch: { bound: RepoRef; github: RepoRef }; binding: RepoBinding };
 
 /** How long the Worker has to finish a create before the alarm takes it over. */
 export const CREATE_GRACE_MS = 60_000;
@@ -108,7 +132,7 @@ export const CREATE_GRACE_MS = 60_000;
 export const CREATE_POLICY: OutboxPolicy = { maxAttempts: 8 };
 
 const COLUMNS = "id, name, repo, created_ms, CASE WHEN pending IS NULL THEN 'ready' ELSE 'pending' END AS state";
-const BINDING = "id, name, repo, repo_id, repo_name, installation_id, repo_bound, repo_bound_ms, bind_error";
+const BINDING = "id, name, repo, repo_id, repo_name, installation_id, repo_bound, repo_bound_ms, bind_error, repo_owner_id, repo_owner_login";
 
 function bindingOf(r: Record<string, SqlStorageValue>): RepoBinding {
   return {
@@ -116,6 +140,7 @@ function bindingOf(r: Record<string, SqlStorageValue>): RepoBinding {
     renamed_to: (r.repo_name as string | null) ?? null, installation_id: (r.installation_id as number | null) ?? null,
     bound: (r.repo_bound as "github" | "event" | null) ?? null, bound_ms: (r.repo_bound_ms as number | null) ?? null,
     error: (r.bind_error as string | null) ?? null,
+    owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: (r.repo_owner_login as string | null) ?? "" },
   };
 }
 
@@ -229,7 +254,8 @@ export class DirectoryDO extends DurableObject<Env> {
     }
     const byName = name ? one("repo = ? AND repo_id IS NULL", name.toLowerCase()) : null;
     if (byName && repoId !== null) {
-      this.sql.exec("UPDATE projects SET repo_id = ?, repo_bound = 'event', repo_bound_ms = ? WHERE id = ? AND repo_id IS NULL", repoId, Date.now(), byName.id);
+      // Learned from an event, so recorded as one (a sync reads it from GitHub): no owner known.
+      this.sql.exec("UPDATE projects SET repo_id = ?, repo_bound = 'event', repo_bound_ms = ?, repo_owner_id = NULL, repo_owner_login = NULL WHERE id = ? AND repo_id IS NULL", repoId, Date.now(), byName.id);
     }
     return byName;
   }
@@ -256,12 +282,15 @@ export class DirectoryDO extends DurableObject<Env> {
   }
 
   /**
-   * Bind the project to the repo GitHub answered (`id`, and its name now). `fill` (attach, a sync) sets an
-   * id only where there's none, and confirms one that matches; `replace` (the operator's re-read) sets it
-   * whatever it was. Never an id another project holds. The name is kept as `renamed_to` when it isn't the
-   * project's.
+   * Bind the project to the repo GitHub answered (`id`, its name now, its owner):
+   * - `fill` (attach, a sync): an id only where there's none; one that matches is confirmed; another is
+   *   refused and said (events still go to the bound repo);
+   * - `check` (the operator's re-read): as `fill`, but another id writes nothing and answers both repos,
+   *   for the operator to choose;
+   * - `replace` (the operator's choice, after a check showed this id): binds it whatever was bound.
+   * Never an id another project holds. The name is kept as `renamed_to` when it isn't the project's.
    */
-  async bindRepo(project: string, gh: { id: number; full_name: string }, mode: "fill" | "replace"): Promise<BindOutcome> {
+  async bindRepo(project: string, gh: GithubRepo & { installation_id?: number | null }, mode: "fill" | "check" | "replace"): Promise<BindOutcome> {
     const before = await this.binding(project);
     if (!before) return { ok: false, error: "unknown project", binding: null };
     const name = gh.full_name.toLowerCase();
@@ -269,15 +298,25 @@ export class DirectoryDO extends DurableObject<Env> {
       this.sql.exec("UPDATE projects SET bind_error = ? WHERE id = ?", error, project);
       return { ok: false, error, binding: (await this.binding(project))! };
     };
-    if (!Number.isSafeInteger(gh.id) || gh.id <= 0 || !REPO.test(name)) return refuse("GitHub's answer names no repo");
+    if (!Number.isSafeInteger(gh.id) || gh.id <= 0 || !REPO.test(name)) return refuse("Didn't bind: GitHub's answer names no repo");
     const other = this.sql.exec<{ id: string }>("SELECT id FROM projects WHERE repo_id = ? AND id != ?", gh.id, project).toArray()[0];
-    if (other) return refuse(`GitHub's repo ${name} (${gh.id}) is project ${other.id}'s`);
-    if (mode === "fill" && before.repo_id !== null && before.repo_id !== gh.id) {
-      return refuse(`bound to repo ${before.repo_id}, but GitHub's ${before.renamed_to ?? before.repo} is repo ${gh.id} now: re-read it to bind to that one`);
+    if (other) return refuse(`Didn't bind: GitHub's repo ${name} (${gh.id}) is already project ${other.id}'s`);
+    if (before.repo_id !== null && before.repo_id !== gh.id && mode !== "replace") {
+      if (mode === "check") {
+        return {
+          ok: false, binding: before,
+          mismatch: { bound: { full_name: before.renamed_to ?? before.repo, id: before.repo_id, owner: before.owner }, github: { full_name: name, id: gh.id, owner: gh.owner ?? null } },
+        };
+      }
+      return refuse(
+        `Didn't bind: GitHub's ${name} is repo ${gh.id} now, but the project is bound to repo ${before.repo_id}, and its events still go to that one. ` +
+        "Check on GitHub whether the repo was renamed, transferred or deleted and its name taken, then Re-read to compare the two and choose.",
+      );
     }
     this.sql.exec(
-      "UPDATE projects SET repo_id = ?, repo_bound = 'github', repo_bound_ms = ?, bind_error = NULL, repo_name = CASE WHEN repo = ? THEN NULL ELSE ? END WHERE id = ?",
-      gh.id, Date.now(), name, name, project,
+      `UPDATE projects SET repo_id = ?, repo_bound = 'github', repo_bound_ms = ?, bind_error = NULL, repo_name = CASE WHEN repo = ? THEN NULL ELSE ? END,
+        repo_owner_id = ?, repo_owner_login = ? WHERE id = ?`,
+      gh.id, Date.now(), name, name, gh.owner?.id ?? null, gh.owner?.login ?? null, project,
     );
     return { ok: true, binding: (await this.binding(project))!, changed: before.repo_id !== gh.id, previous_id: before.repo_id };
   }
@@ -287,7 +326,12 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.sql.exec("SELECT 1 FROM projects WHERE repo = ? AND id != ?", name.toLowerCase(), except).toArray().length > 0;
   }
 
-  /** The repo renamed: the project calls it by `name` from now on (ProjectDO and ReviewDO switched first). */
+  /** A rename taken back (ProjectDO or ReviewDO couldn't follow): the old name again, the new one still noted. */
+  async unrenameRepo(project: string, from: string, to: string): Promise<void> {
+    this.sql.exec("UPDATE projects SET repo = ?, repo_name = ? WHERE id = ? AND repo = ?", from.toLowerCase(), to.toLowerCase(), project, to.toLowerCase());
+  }
+
+  /** The repo renamed: the project calls it by `name` from now on (first: ProjectDO and ReviewDO follow it). */
   async renameRepo(project: string, name: string): Promise<boolean> {
     const n = name.toLowerCase();
     if (this.sql.exec("SELECT 1 FROM projects WHERE repo = ? AND id != ?", n, project).toArray().length) return false;

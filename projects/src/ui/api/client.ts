@@ -116,4 +116,5 @@ export const api = {
   sync: () => call<SyncResult>("POST", "/admin/sync"),
   bindings: () => call<RepoBinding[]>("GET", "/admin/bindings"),
   rereadBinding: (id: string) => call<RereadBinding>("POST", `/admin/bindings/${encodeURIComponent(id)}`),
+  bindRepo: (id: string, repo_id: number) => call<RereadBinding>("POST", `/admin/bindings/${encodeURIComponent(id)}/bind`, { repo_id }),
 };

@@ -6,6 +6,9 @@ import { MODEL_ID } from "./models";
 import { MERGE_METHODS } from "./automerge";
 
 /** A GitHub repo, `owner/name`. */
+/** `POST /api/admin/bindings/<project>/bind`: the repo id a re-read showed, which the operator chose. */
+export const BindRepo = z.object({ repo_id: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict();
+
 export const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
 
 const Text = (max: number) => z.string().max(max);

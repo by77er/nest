@@ -37,6 +37,7 @@ const directory = () => env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"))
 const dirSql = (q: string, ...args: unknown[]) => runInDurableObject(directory(), (_o, st) => st.storage.sql.exec(q, ...args).toArray());
 const binding = async (p: P) => ((await api(token, "GET", "/api/admin/bindings")).body as RepoBinding[]).find((b) => b.project === p.id)!;
 const reread = (p: P) => api(token, "POST", `/api/admin/bindings/${p.id}`);
+const bind = (p: P, repo_id: number) => api(token, "POST", `/api/admin/bindings/${p.id}/bind`, { repo_id });
 const sync = () => api(token, "POST", "/api/admin/sync");
 const issue = (n: number, repository: Record<string, unknown>) => ({
   action: "opened", sender: { id: 1, login: "x" },
@@ -74,11 +75,18 @@ describe("read from GitHub, not taken from an event", () => {
     expect((await sync()).status).toBe(200);
     expect(await binding(a)).toMatchObject({ repo_id: repoIdOf(a.repo), bound: "github", error: null });
     expect(await binding(b)).toMatchObject({ repo_id: repoIdOf(b.repo), bound: "github" });
-    expect(await binding(c)).toMatchObject({ repo_id: 42, bound: "event", error: expect.stringContaining(`is repo ${repoIdOf(c.repo)} now`) });
-    // The operator's re-read binds it to GitHub's.
+    // Kept, said plainly: its events still go to the bound repo, and what to check.
+    expect(await binding(c)).toMatchObject({ repo_id: 42, bound: "event" });
+    expect((await binding(c)).error).toContain(`is repo ${repoIdOf(c.repo)} now, but the project is bound to repo 42, and its events still go to that one`);
+    expect((await binding(c)).error).toContain("renamed, transferred or deleted");
+    // The operator's re-read shows both and binds neither; choosing GitHub's binds it.
     const r = await reread(c);
     expect(r.status).toBe(200);
-    expect(r.body).toMatchObject({ changed: true, previous_id: 42, binding: { repo_id: repoIdOf(c.repo), bound: "github", error: null } });
+    expect(r.body.mismatch).toMatchObject({ bound: { id: 42, full_name: c.repo }, github: { id: repoIdOf(c.repo), full_name: c.repo } });
+    expect((await binding(c)).repo_id).toBe(42);
+    const chosen = await bind(c, repoIdOf(c.repo));
+    expect(chosen.status).toBe(200);
+    expect(chosen.body).toMatchObject({ changed: true, previous_id: 42, binding: { repo_id: repoIdOf(c.repo), bound: "github", error: null } });
   });
 
   it("a GitHub read that fails leaves the project as it was, and the sync goes on", async () => {
@@ -99,7 +107,7 @@ describe("read from GitHub, not taken from an event", () => {
     await dirSql("UPDATE projects SET repo_id = ? WHERE id = ?", repoIdOf(b.repo), a.id);
     const r = await reread(b);
     expect(r.status).toBe(409);
-    expect(r.body.error).toContain(`is project ${a.id}'s`);
+    expect(r.body.error).toBe(`Didn't bind: GitHub's repo ${b.repo} (${repoIdOf(b.repo)}) is already project ${a.id}'s`);
     expect(await binding(b)).toMatchObject({ repo_id: null, error: expect.stringContaining(a.id) });
     expect((await api(token, "GET", `/api/projects/${b.id}`)).body.settings ?? (await api(token, "GET", `/api/projects/${b.id}/settings`)).body).toBeTruthy();
   });
@@ -109,6 +117,44 @@ describe("read from GitHub, not taken from an event", () => {
     expect((await api(token, "POST", "/api/admin/bindings/nope")).status).toBe(404);
     const p = await newProject();
     expect((await api(token, "GET", `/api/admin/bindings/${p.id}`)).status).toBe(405);
+  });
+});
+
+describe("a re-read never rebinds by itself", () => {
+  it("no event, old name taken: Re-read doesn't rebind; confirm does, with the shown id only", async () => {
+    const p = await newProject();
+    const owner = p.repo.split("/")[0]!;
+    // Renamed on GitHub with no event since, and the old name registered again by another account.
+    gh.rename(p.repo, `${p.repo}-moved`);
+    const impostor = gh.take(p.repo, 31_337);
+    const before = await binding(p);
+    expect(before.owner).toMatchObject({ login: owner });
+    const r = await reread(p);
+    expect(r.status).toBe(200);
+    expect(r.body.mismatch).toEqual({
+      bound: { full_name: p.repo, id: repoIdOf(p.repo), owner: before.owner },
+      github: { full_name: p.repo, id: impostor, owner: { id: 31_337, login: owner }, same_owner: false },
+    });
+    // Nothing written: still the owner's repo, and its events still reach the project.
+    expect(await binding(p)).toEqual(before);
+    // Only the id shown binds: any other is refused, as is one GitHub no longer answers.
+    const wrong = await bind(p, impostor + 1);
+    expect(wrong.status).toBe(409);
+    expect(wrong.body.error).toContain(`not the repo ${impostor + 1} you were shown`);
+    expect((await binding(p)).repo_id).toBe(repoIdOf(p.repo));
+    expect((await api(token, "POST", `/api/admin/bindings/${p.id}/bind`, { repo_id: "x" })).status).toBe(400);
+    const ok = await bind(p, impostor);
+    expect(ok.status).toBe(200);
+    expect(ok.body.binding).toMatchObject({ repo_id: impostor, owner: { id: 31_337 } });
+  });
+
+  it("an id learned from an event is recorded as one, so a sync reads it from GitHub", async () => {
+    const p = await newProject();
+    await dirSql("UPDATE projects SET repo_id = NULL, repo_bound = NULL, repo_bound_ms = NULL WHERE id = ?", p.id);
+    await deliverGithub("issues", issue(1, { id: repoIdOf(p.repo), full_name: p.repo }));
+    expect(await binding(p)).toMatchObject({ repo_id: repoIdOf(p.repo), bound: "event", owner: null });
+    expect((await sync()).status).toBe(200);
+    expect(await binding(p)).toMatchObject({ repo_id: repoIdOf(p.repo), bound: "github", owner: { login: p.repo.split("/")[0] } });
   });
 });
 
@@ -156,6 +202,7 @@ describe("a renamed or transferred repo", () => {
     const r = await reread(a);
     expect(r.body, JSON.stringify(r.body)).toMatchObject({ rename: { blocked: `${b.repo} is another project's repo` } });
     expect(await settingsRepo(a)).toBe(a.repo);
+    expect(await reviewRepo(a)).toBe(a.repo);
     // A name nobody holds: the sync applies it.
     const to = `${a.repo}-renamed`;
     await deliverGithub("issues", issue(2, { id: repoIdOf(a.repo), full_name: to }));
@@ -163,6 +210,25 @@ describe("a renamed or transferred repo", () => {
     expect((await sync()).status).toBe(200);
     expect(await binding(a)).toMatchObject({ repo: to, renamed_to: null });
     expect(await settingsRepo(a)).toBe(to);
+  });
+
+  it("a rename ReviewDO can't follow is taken back everywhere: the directory and ProjectDO keep the old name, and it's tried again", async () => {
+    const p = await newProject();
+    const to = `${p.repo}-renamed`;
+    gh.rename(p.repo, to);
+    await deliverGithub("issues", issue(1, { id: repoIdOf(p.repo), full_name: to }));
+    fake.grantRepos = [p.repo, to];
+    const rv = env.REVIEW.get(env.REVIEW.idFromName(p.id));
+    await runInDurableObject(rv, (_o, st) => { st.storage.sql.exec("ALTER TABLE settings RENAME TO settings_hidden"); });
+    const r = await reread(p);
+    expect(r.body.rename).toEqual({ blocked: expect.stringContaining("couldn't be applied") });
+    await runInDurableObject(rv, (_o, st) => { st.storage.sql.exec("ALTER TABLE settings_hidden RENAME TO settings"); });
+    expect(await binding(p)).toMatchObject({ repo: p.repo, renamed_to: to });
+    expect(await settingsRepo(p)).toBe(p.repo);
+    expect(await reviewRepo(p)).toBe(p.repo);
+    expect((await reread(p)).body.rename).toEqual({ applied: to });
+    expect(await settingsRepo(p)).toBe(to);
+    expect(await reviewRepo(p)).toBe(to);
   });
 
   it("a re-read follows the name GitHub last gave it, so an old name taken by another repo doesn't rebind it", async () => {
