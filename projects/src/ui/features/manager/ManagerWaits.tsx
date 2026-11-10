@@ -103,7 +103,7 @@ export function ManagerWaits({ projectId, now = Date.now() }: { projectId: strin
       <Stack gap="xs">
         {down && held.length > 0 && (
           <Text fz="sm" c="dimmed" data-slot="waits-down">
-            Nothing while the manager isn&apos;t running.
+            Nothing pending while the manager isn&apos;t running.
           </Text>
         )}
         {pending.length > 0 && (

@@ -145,7 +145,8 @@ export class FakeApi {
     const blocked = this.tasks.filter((t) => t.blocked).map((t): Attention => ({ kind: "blocked", task: t.id, title: t.title, state: t.state, ...t.blocked! }));
     const secrets = this.secretRequests.map((r): Attention => ({ kind: "secret", ...r }));
     const held = this.reviews.filter((j) => j.state === "held").map((j): Attention => ({ kind: "review", pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
-    const triage: Attention[] = this.issues.length ? [{ kind: "triage", count: this.issues.length, at_ms: Math.min(...this.issues.map((i) => i.opened_ms)) }] : [];
+    const waiting = [...this.issues.map((i) => i.opened_ms), ...this.proposals.map((p) => p.created_ms)];
+    const triage: Attention[] = waiting.length ? [{ kind: "triage", count: this.issues.length, proposals: this.proposals.length, at_ms: Math.min(...waiting) }] : [];
     const backlog: Attention[] = this.reviewBacklog ? [{ kind: "review_backlog", count: this.reviewBacklog, at_ms: Date.now() - 60_000 }] : [];
     return [...asks, ...blocked, ...secrets, ...held, ...backlog, ...triage].sort((a, b) => a.at_ms - b.at_ms);
   }

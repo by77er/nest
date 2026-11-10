@@ -115,6 +115,45 @@ describe("a check run's update", () => {
     expect(await sql(p, "SELECT 1 FROM check_updates")).toEqual([]);
     expect((await job(p, 2, b.sha)).error).toMatch(/was refused: .*422/);
   });
+
+  it("a failed try of an old body doesn't push back a newer body owed meanwhile", async () => {
+    const p = await newProject();
+    const o = await opened(p);
+    await submitted(p, o);
+    // Hold the update at GitHub, where the old body fails; a newer body is owed for the same check run while it's out.
+    const inner = globalThis.fetch;
+    let reached!: () => void;
+    let release!: () => void;
+    const waiting = new Promise<void>((r) => { reached = r; });
+    const gate = new Promise<void>((r) => { release = r; });
+    let held = false;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const req = new Request(input as RequestInfo, init);
+      if (req.method === "PATCH" && /\/check-runs\//.test(req.url) && ((await req.clone().json()) as { conclusion?: string }).conclusion === "success") {
+        if (!held) {
+          held = true;
+          reached();
+          await gate;
+        }
+        return Response.json({ message: "injected" }, { status: 502 });
+      }
+      return inner(req);
+    }) as typeof fetch;
+    try {
+      const running = run(p);
+      await waiting;
+      await sql(p, "UPDATE check_updates SET body = ?, next_ms = 5, attempts = 0, error = NULL", JSON.stringify({ status: "completed", conclusion: "neutral" }));
+      release();
+      await running;
+      // The newer body is owed afresh, due when it was owed (the old try's failure isn't its own): the
+      // next drain sends it.
+      await run(p);
+    } finally {
+      globalThis.fetch = inner;
+    }
+    expect(await sql(p, "SELECT 1 FROM check_updates")).toEqual([]);
+    expect(gh.runsOf(p.repo, o.sha)[0]).toMatchObject({ status: "completed", conclusion: "neutral" });
+  });
 });
 
 describe("a reviewer's stop", () => {

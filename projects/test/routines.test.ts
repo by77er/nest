@@ -440,12 +440,19 @@ describe("proposals: into triage, never onto the board", () => {
     expect((await api(token, "GET", `/api/projects/${s.id}/tasks`)).body).toEqual([]);
     const queue = (await api(token, "GET", `/api/projects/${s.id}/proposals`)).body;
     expect(queue).toEqual([expect.objectContaining({ id: p.proposal, title: "Fix the race", routine: id, routine_name: "Spontaneous review", run: run.id })]);
+    // It waits on the owner: in "Needs you" as triage's one item, and in the projects list's count.
+    const triage = async () => ((await api(token, "GET", `/api/projects/${s.id}/attention`)).body as { kind: string }[]).filter((a) => a.kind === "triage");
+    const needsYou = async () => ((await api(token, "GET", "/api/projects")).body.projects as { id: string; needs_you: number }[]).find((x) => x.id === s.id)!.needs_you;
+    expect(await triage()).toEqual([{ kind: "triage", count: 0, proposals: 1, at_ms: queue[0].created_ms }]);
+    const before = await needsYou();
     expect((await liveRun(s, id)).created).toEqual([{ kind: "proposal", id: p.proposal, title: "Fix the race" }]);
     const t = (await api(token, "POST", `/api/projects/${s.id}/proposals/${p.proposal}/accept`)).body;
     expect(t).toMatchObject({ state: "draft", title: "Fix the race", tainted: true, assignee: null });
     expect(t.body).toContain('Proposed by the routine "Spontaneous review"');
     expect((await api(token, "GET", `/api/projects/${s.id}/proposals`)).body).toEqual([]);
     expect((await api(token, "POST", `/api/projects/${s.id}/proposals/${p.proposal}/accept`)).status).toBe(409);
+    expect(await triage()).toEqual([]);
+    expect(await needsYou()).toBe(before - 1);
   });
 
   it("declined, it leaves the queue with no task", async () => {

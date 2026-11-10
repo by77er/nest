@@ -456,7 +456,11 @@ export function useTriageProposal(id: string) {
     mutationFn: (v: { proposal: string; accept: boolean; reason?: string }): Promise<unknown> =>
       v.accept ? api.acceptProposal(id, v.proposal) : api.declineProposal(id, v.proposal, v.reason ? { reason: v.reason } : {}),
     meta: { failure: "The proposal wasn't triaged" },
-    onSettled: () => Promise.all([qc.invalidateQueries({ queryKey: keys.proposals(id) }), qc.invalidateQueries({ queryKey: keys.tasks(id) })]),
+    // The queue, the board and "Needs you" (its count) all move, as for an issue.
+    onSettled: () => Promise.all([
+      qc.invalidateQueries({ queryKey: keys.proposals(id) }), qc.invalidateQueries({ queryKey: keys.tasks(id) }),
+      qc.invalidateQueries({ queryKey: keys.attention(id) }), qc.invalidateQueries({ queryKey: keys.projects, exact: true }),
+    ]),
   });
 }
 

@@ -480,7 +480,8 @@ The owner's request (2026-11-06): GitHub issues on a project's repo go into a tr
     - It's marked tainted (an `issue_accepted` record), since its text is anyone's. The manager's and its workers' sessions that read it are then tainted, as nest's rule has it.
   - **Decline** takes it out, with an optional reason. It doesn't touch GitHub: closing there is the owner's call.
   - **Import open issues** is a one-off that brings in the repo's open issues the app doesn't know yet (it reads the oldest 300 open items, and PRs, which GitHub lists among issues, count toward the 300 before they're left out). It needs `issues: read`. Issues opened before the app subscribed come in only this way: events GitHub sent before it was ignored and aren't replayed.
-- **"Needs you"** shows one item for the waiting issues, their count, linking to Triage. The projects list's count includes each one.
+- **Routines' proposed tasks wait here too** ([routines](#routines)): under the issues, in their own section ("Proposed tasks", the Routines page's list: accept as a draft, or decline), shown only while there are some. They stay on the Routines page as well.
+- **"Needs you"** shows one item for what waits for triage, linking to Triage: the issues and the proposed tasks, counted in words ("3 issues and 1 proposed task wait for triage"), as old as the oldest of them. The projects list's count includes each issue and each proposal. Accepting or declining either refreshes both.
 - **A task made of an issue, done through a merged PR,** closes the issue: a comment "Done in #<pr>.", then closed as completed (`issue_closes`, from the alarm).
   - It needs `issues: write` in the client's grant.
   - A refusal that will repeat (no permission, the issue gone) is recorded on the task (`issue_close_failed`) and shown in its drawer, with **Retry closing the issue** (`POST /api/projects/<id>/tasks/<task>/issue/close`). It's also tried again by itself when a read of the grant (`GET /v1/clients/self`) shows its `issues` permission changed to `write` or `admin`. Anything else is retried with backoff.
@@ -515,7 +516,8 @@ The owner's request (2026-11-06): "schedule periodic background tasks for things
   - **Proposed tasks** waiting for the owner, under a caption saying they come from what agents read: title; "Tainted", which explains itself on hover, focus or tap ("Written by an agent that read untrusted text…"); its routine, run and when; the body as plain text (never rendered), its first 5 lines or 400 characters with "Show more", as Triage shows an issue (the first 10 proposals, then "Show all"); "Accept as draft" at the left and Decline (an optional reason, confirmed) at the right edge, as on Triage.
   - **Runs,** newest first, the latest 10 then "Show older": routine, why, state, what it made, started, took; opened, why it ended, its report (plain text), what it made, Stop while live (confirmed), and its agent's trace (`RunTrace`, the shared viewer). A card per run below `sm`, its "Show details" the card's full width.
   - **Memory:** the latest 10 notes, then "Show all", and a filter by key or text once there are more; each note's key, its text (first lines, "Show more"), who wrote it ("the manager", "the routine Dreaming (run …)") and when, and "Tainted" on one a tainted session wrote; Delete, confirmed. Read-only otherwise for now.
-- **Not yet:** proposals in "Needs you" and its count, and on the Triage page beside the issues; editing a note.
+- **Proposals wait for the owner** in "Needs you" and on the Triage page too ([triage](#triage)).
+- **Not yet:** editing a note.
 
 ### Presets
 
@@ -558,7 +560,7 @@ The owner's request (2026-11-02): the manager "should be able to set timers and 
   - "Add search by tag to be In review or Done · 45 min left", "#118 to merge · 2 h left", "The owner's reply · 26 h left".
   - A task shows by its title, as a link to its drawer; its states use the board's labels; a PR shows by its number, as a link to it on GitHub.
   - What resolved in the last half hour follows: "#119 merged · met 3 minutes ago", and a timeout ("The owner's reply · timed out 10 minutes ago") in the warning tone.
-  - While the manager isn't running (ended or errored) nothing is waited for: the pending waits aren't listed or counted, and one line says "Nothing while the manager isn't running." (the page's header says why and offers Restart; the composer says nothing of a reply either). The waits themselves are kept, and show again once a manager runs. What resolved lately still shows.
+  - While the manager isn't running (ended or errored) nothing is waited for: the pending waits aren't listed or counted, and one line says "Nothing pending while the manager isn't running." (the page's header says why and offers Restart; the composer says nothing of a reply either). The waits themselves are kept, and show again once a manager runs. What resolved lately still shows.
   - Nothing shows when there's neither. ui-review's `waits` check fails on a raw task id or snake_case state in it, on the section missing where the column shows and the fixture has waits, and on a task or PR line that isn't a link.
 - **A condition that holds already** answers at once with no wait left behind and no message, for `await_pr` as for `await_task`: a message would wake the manager, which might ask again. If a second identical call found that wait pending meanwhile (while the first read the review queue) and was told "waiting", the wait is resolved instead, with the one message that caller waits for.
 - **Resolved waits** beyond the 10 the API's `recent` returns are pruned as new ones resolve.

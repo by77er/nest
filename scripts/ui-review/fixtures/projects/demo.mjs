@@ -130,7 +130,7 @@ export function data(variant = "demo", now = Date.now()) {
       { kind: "review", pr: 131, sha: "9f3c2ab".padEnd(40, "b"), title: "Speed up tag search with a trie", author: "octo-contributor", fork: true, at_ms: now - 2_400_000 },
       { kind: "review", pr: 132, sha: "41d07ee".padEnd(40, "c"), title: "Rework the gadget importer so that malformed rows are reported per line and the rest of the file still loads", author: null, fork: false, at_ms: now - 20_000 },
     ] : []),
-    ...(issues.length ? [{ kind: "triage", count: issues.length, at_ms: Math.min(...issues.map((i) => i.opened_ms)) }] : []),
+    ...(issues.length ? [{ kind: "triage", count: issues.length, proposals: 0, at_ms: Math.min(...issues.map((i) => i.opened_ms)) }] : []),
   ].sort((a, b) => a.at_ms - b.at_ms);
   const chat = [
     { seq: 1, at_ms: now - 3_600_000, sender: "owner", text: "Plan the search work and split it into tasks.", delivered: true, status: "done", error: null },
@@ -407,7 +407,7 @@ const RICH = [
       next_timer_ms: now + 13 * 3_600_000, counts: { tasks_done: 7, prs_merged: 0 }, due: { trigger: "tasks_done", at_ms: now - 600_000 }, waiting: "cap", last_run: runs[1] }),
     routine("rtn_custom", { name: "Dependency audit", kind: "custom", enabled: false, triggers: { timer: { kind: "interval", minutes: 1440 }, tasks_done: null, prs_merged: null }, last_run: runs[3] }),
   ];
-  const proposals = noRoutines ? [] : [
+  const proposals = noRoutines || variant === "triage-empty" ? [] : [
     { id: "prp_a1b2", routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", title: "Handle a missing thumbnail in the gadget list", body: "src/routes/gadgets.ts:84 reads `thumb.url` without checking that the thumbnail exists; a gadget created without an image renders a broken list row.\n\nFix: fall back to the placeholder, and add a test for a gadget with no image.", state: "untriaged", task: null, reason: null, created_ms: now - 3 * 3_600_000 },
     { id: "prp_c3d4", routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", title: "Close the export stream on a client abort", body: "src/export/csv.ts keeps writing after the client disconnects (no `signal` check), so an aborted export runs to the end.", state: "untriaged", task: null, reason: null, created_ms: now - 3 * 3_600_000 + 60_000 },
   ];
@@ -423,6 +423,14 @@ const RICH = [
     for (let k = 0; k < 40; k++) runs.push(rrun(`run_lg${String(k).padStart(4, "0")}`, k % 2 ? "rtn_review" : "rtn_dream", 10 + k, k % 3 ? "timer" : "manual", { summary: k === 0 ? longText(30) : `Run ${k}: short report.`, created: k === 0 ? Array.from({ length: 12 }, (_, j) => ({ kind: "memory_write", key: `note-key-${j}-with-a-fairly-long-name` })) : [] }));
     for (let k = 0; k < 15; k++) proposals.push({ id: `prp_lg${k}`, routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", title: k === 0 ? "A_very_long_unbroken_proposal_title_" + "q".repeat(120) : `Proposal ${k}: a long-ish title about fixing the export pipeline when the client aborts mid-stream`, body: longText(k % 2 ? 2 : 25), state: "untriaged", task: null, reason: null, created_ms: now - k * 3_600_000 });
     for (let k = 0; k < 100; k++) notes.push({ key: `note-${k}-${"k".repeat(k % 5 * 8)}`, text: k % 7 === 0 ? longText(4) : `Note ${k}: a convention the agents follow.`, source: k % 3 ? "manager" : "routine:Dreaming (run_dr8m1c)", tainted: k % 3 === 0, created_ms: now - k * DAY, updated_ms: now - k * 3_600_000 });
+  }
+  // Proposals wait for triage with the issues: the one "Needs you" item counts both, as old as the oldest.
+  if (proposals.length) {
+    const item = attention.find((a) => a.kind === "triage");
+    const oldest = Math.min(...proposals.map((p) => p.created_ms));
+    if (item) Object.assign(item, { proposals: proposals.length, at_ms: Math.min(item.at_ms, oldest) });
+    else attention.push({ kind: "triage", count: 0, proposals: proposals.length, at_ms: oldest });
+    attention.sort((a, b) => a.at_ms - b.at_ms);
   }
   /** The answer to `GET|POST /api<path>?<search>`: [status, body]. */
   const answer = (method, path, search = new URLSearchParams()) => {

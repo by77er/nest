@@ -147,8 +147,9 @@ export interface Blocked {
 
 /** One thing waiting on the owner: an agent's ask (nest's), or a blocked task. Oldest first. */
 export type Attention = ({ kind: "ask" } & Ask) | ({ kind: "blocked"; task: string; title: string; state: TaskState } & Blocked) | ({ kind: "secret" } & SecretRequest)
-  // The repo's issues waiting for triage (README.md#triage): one item, their count, as old as the oldest.
-  | { kind: "triage"; count: number; at_ms: number };
+  // What waits for triage (README.md#triage): one item, as old as the oldest of them: the repo's issues
+  // (`count`) and the tasks routines proposed (`proposals`).
+  | { kind: "triage"; count: number; proposals: number; at_ms: number };
 
 /** An issue of the repo in triage (README.md#triage): its title and body are anyone's, kept as data. */
 export interface Issue {
@@ -1996,7 +1997,9 @@ export class ProjectDO extends DurableObject<Env> {
     const open = asks.value.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
     const secrets = this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL").toArray().map((r): Attention => ({ kind: "secret", ...requestOf(r) }));
     const t = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(opened_ms) AS at FROM issues WHERE state = 'untriaged'").one();
-    const triage: Attention[] = t.n ? [{ kind: "triage", count: t.n, at_ms: t.at ?? Date.now() }] : [];
+    const pr = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(created_ms) AS at FROM proposals WHERE state = 'untriaged'").one();
+    const oldest = [t.at, pr.at].filter((x): x is number => x !== null);
+    const triage: Attention[] = t.n + pr.n ? [{ kind: "triage", count: t.n, proposals: pr.n, at_ms: oldest.length ? Math.min(...oldest) : Date.now() }] : [];
     return ok([...open, ...blocked, ...secrets, ...triage].sort((a, b) => a.at_ms - b.at_ms));
   }
 
@@ -2005,7 +2008,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (!this.settings()) return 0;
     return this.sql.exec<{ n: number }>(
       `SELECT (SELECT COUNT(*) FROM asks WHERE answered_ms IS NULL) + (SELECT COUNT(*) FROM tasks WHERE blocked_ms IS NOT NULL) + (SELECT COUNT(*) FROM secret_requests WHERE done_ms IS NULL)
-        + (SELECT COUNT(*) FROM issues WHERE state = 'untriaged') AS n`,
+        + (SELECT COUNT(*) FROM issues WHERE state = 'untriaged') + (SELECT COUNT(*) FROM proposals WHERE state = 'untriaged') AS n`,
     ).one().n;
   }
 
