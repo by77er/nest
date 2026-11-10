@@ -17,6 +17,7 @@ nestd's pure state-machine cores. Each is a synchronous `step(state, input) -> e
 | `shadow` | M3′'s shadow cut: which ranges of a disk differ from its shadow, and which shadow a cut writes |
 | `detach` | Agent detaches a guest hasn't confirmed: what is owed, and which confirmation settles it |
 | `invariant` | Runtime assertions: a violation panics under `debug_assertions` (tests, the checker) and is an effect, never an abort, in release |
+| `ca` | The proxy intermediate CA's renewal: when to ask, and which key an answer goes with (only one its certificate names); a certificate's subject public key from DER |
 
 ## Checks
 

@@ -80,6 +80,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "cert_public_key"
+path = "fuzz_targets/cert_public_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "meta_json"
 path = "fuzz_targets/meta_json.rs"
 test = false

@@ -10,7 +10,7 @@ import type { BrokerDO } from "../src/do/broker";
 import type { McpConnectorDO } from "../src/do/mcp-connector";
 import { connectorName } from "../src/lib/mcp";
 import { authServerMetadataUrls, bearerChallenge, pkceChallenge, resourceCovers, resourceMetadataUrls } from "../src/lib/mcp-auth";
-import { adminJson, connectHost, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
+import { adminJson, connectHost, eventually, nextCommands, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 /** vitest.config.ts: PUBLIC_BASE_URL. */
@@ -41,6 +41,9 @@ interface AsOpts {
   preRegistered?: { client_id: string; client_secret: string };
   /** Milliseconds each refresh takes (to hold refreshes in flight). */
   refreshDelayMs?: number;
+  /** Advertise a revocation endpoint (RFC 7009); `revokeFails`: it answers 503. */
+  revocation?: boolean;
+  revokeFails?: boolean;
   /** The protected resource metadata names this resource instead of the server (RFC 9728 §3.3: nest must refuse). */
   prmResource?: string;
 }
@@ -59,6 +62,11 @@ class FakeAuth {
   readonly tokenRequests: Record<string, string>[] = [];
   readonly tokenAuth: (string | null)[] = [];
   readonly registrations: unknown[] = [];
+  /** Every revocation request: the token, its hint, and how the client authenticated. */
+  readonly revocations: { token: string; hint: string | null; client: string | null }[] = [];
+  /** Holds a code exchange while set; `exchangeHeld` says one is waiting. Polled: no promise crosses contexts. */
+  holdExchange = false;
+  exchangeHeld = false;
   readonly cimdFetches: unknown[] = [];
   /** The MCP server's view: every request's bearer, method and status. */
   readonly rsLog: { token: string | null; method: string; status: number }[] = [];
@@ -129,6 +137,7 @@ class FakeAuth {
         code_challenge_methods_supported: this.o.s256 === false ? ["plain"] : ["S256"],
         ...(this.o.cimd ? { client_id_metadata_document_supported: true } : {}),
         ...(this.o.iss ? { authorization_response_iss_parameter_supported: true } : {}),
+        ...(this.o.revocation ? { revocation_endpoint: `${this.issuer}/revoke` } : {}),
         token_endpoint_auth_methods_supported: ["none", "client_secret_basic"], response_types_supported: ["code"],
       });
     }
@@ -141,6 +150,20 @@ class FakeAuth {
     }
     if (u.pathname === `/${this.id}/authorize`) return this.authorize(u);
     if (u.pathname === `/${this.id}/token` && req.method === "POST") return this.token(req);
+    if (u.pathname === `/${this.id}/revoke` && req.method === "POST") {
+      const form = new URLSearchParams(await req.text());
+      const client = this.clientOf(req, form);
+      this.revocations.push({ token: form.get("token") ?? "", hint: form.get("token_type_hint"), client });
+      if (this.o.revokeFails) return this.json(503, { error: "temporarily_unavailable" });
+      // Revoking a refresh token ends the access tokens issued with it too.
+      const rt = this.refresh.get(form.get("token") ?? "");
+      if (rt) {
+        rt.valid = false;
+        this.access.clear();
+      }
+      this.access.delete(form.get("token") ?? "");
+      return this.json(200, {});
+    }
     return this.json(404, { error: "not found" });
   }
 
@@ -182,6 +205,10 @@ class FakeAuth {
       if (!c || c.client_id !== client || c.redirect_uri !== form.get("redirect_uri")) return this.json(400, { error: "invalid_grant" });
       if ((await pkceChallenge(form.get("code_verifier") ?? "")) !== c.challenge) return this.json(400, { error: "invalid_grant", why: "PKCE" });
       if (form.get("resource") !== c.resource) return this.json(400, { error: "invalid_target" });
+      while (this.holdExchange) {
+        this.exchangeHeld = true;
+        await scheduler.wait(10);
+      }
       return this.json(200, this.issue(client, c.resource));
     }
     if (form.get("grant_type") === "refresh_token") {
@@ -613,5 +640,174 @@ describe("audit", () => {
     ].filter((s): s is string => typeof s === "string" && s.length > 0);
     expect(secrets.length).toBeGreaterThan(4);
     for (const s of secrets) expect(all).not.toContain(s);
+  });
+});
+
+// --- Revocation (state-machine sweep, bug 11) -----------------------------------------------------------------
+
+/** Audit records about a capability, once one of `event` is there (they're written in the background). */
+async function auditOf(match: (r: any) => boolean, event: string): Promise<any[]> {
+  let records: any[] = [];
+  for (const end = Date.now() + 10_000; !records.some((r) => r.event === event) && Date.now() < end;) {
+    await sleep(20);
+    const listed = await env.BUCKET.list({ prefix: "audit/broker/" });
+    records = (await Promise.all(listed.objects.map(async (o) => JSON.parse(await (await env.BUCKET.get(o.key))!.text())))).filter(match);
+  }
+  return records;
+}
+
+describe("revoking an authorization", () => {
+  it("deletes the tokens at once, revokes the refresh token at the authorization server, and is audited without a token", async () => {
+    const { f, cap, ref } = await capability({ revocation: true });
+    await authorize(cap);
+    const before = await grantRow(ref);
+    expect(await broker().mcpOAuthToken(ref, f.server)).toBe(before.access_token);
+
+    const r = await adminJson(`/v1/admin/capabilities/${cap}/oauth`, { method: "DELETE" });
+    expect(r).toEqual({ revoked: [{ ref, issuer: f.issuer, server: "revoked" }] });
+    // Gone here: the record, and any use of it.
+    expect(await grantRow(ref)).toBeUndefined();
+    expect((await adminJson(`/v1/admin/capabilities/${cap}/oauth`)).status).toBe("unauthorized");
+    await expect(Promise.resolve().then(() => broker().mcpOAuthToken(ref, f.server))).rejects.toThrow(/no OAuth authorization stored/);
+    // Gone there: the refresh token, as the client that got it.
+    expect(f.revocations).toEqual([{ token: before.refresh_token, hint: "refresh_token", client: CIMD }]);
+    expect(f.refresh.get(before.refresh_token)!.valid).toBe(false);
+    expect(f.access.has(before.access_token)).toBe(false);
+
+    const records = await auditOf((x) => x.capability === cap, "oauth_revoked");
+    expect(records.find((x) => x.event === "oauth_revoked")).toMatchObject({ ref, issuer: f.issuer, caller: "operator", reason: "revoked" });
+    const all = JSON.stringify(records);
+    for (const secret of [before.access_token, before.refresh_token]) expect(all).not.toContain(secret);
+    // Again: nothing left to revoke.
+    expect(await adminJson(`/v1/admin/capabilities/${cap}/oauth`, { method: "DELETE" })).toEqual({ revoked: [] });
+  });
+
+  it("a server with no revocation endpoint, or one that fails, still loses the record here, and the answer says which", async () => {
+    const plain = await capability();
+    await authorize(plain.cap);
+    expect((await adminJson(`/v1/admin/capabilities/${plain.cap}/oauth`, { method: "DELETE" })).revoked).toEqual([{ ref: plain.ref, issuer: plain.f.issuer, server: "unsupported" }]);
+    expect(await grantRow(plain.ref)).toBeUndefined();
+    expect(plain.f.revocations).toEqual([]);
+
+    const down = await capability({ revocation: true, revokeFails: true });
+    await authorize(down.cap);
+    expect((await adminJson(`/v1/admin/capabilities/${down.cap}/oauth`, { method: "DELETE" })).revoked).toEqual([{ ref: down.ref, issuer: down.f.issuer, server: "failed" }]);
+    expect(await grantRow(down.ref)).toBeUndefined();
+  });
+
+  it("works after the capability is deleted, so a recreated one never reuses the old tokens; a flow started before it can't finish", async () => {
+    const { f, cap, ref } = await capability({ revocation: true });
+    await authorize(cap);
+    // A second authorization is started and left open.
+    const pending = await adminJson(`/v1/admin/capabilities/${cap}/oauth`, { method: "POST" });
+    await adminJson(`/v1/admin/capabilities/${cap}`, { method: "DELETE" });
+    expect((await adminJson(`/v1/admin/capabilities/${cap}/oauth`, { method: "DELETE" })).revoked).toHaveLength(1);
+    expect(await grantRow(ref)).toBeUndefined();
+    // The open flow's callback authorizes nothing.
+    const res = await fetch(pending.authorize_url, { redirect: "manual" });
+    const page = await (await SELF.fetch(res.headers.get("location")!)).text();
+    expect(page).toContain("Not authorized");
+    expect(await grantRow(ref)).toBeUndefined();
+    expect(f.revocations).toHaveLength(1);
+  });
+});
+
+describe("revoking an authorization: the races and the rarer records", () => {
+  it("a revoke that lands while a code is being exchanged wins: the callback stores nothing and revokes the tokens it just got", async () => {
+    const { f, cap, ref } = await capability({ revocation: true });
+    const start = await adminJson(`/v1/admin/capabilities/${cap}/oauth`, { method: "POST" });
+    const res = await fetch(start.authorize_url, { redirect: "manual" });
+    const back = res.headers.get("location")!;
+    // The callback's code exchange is held at the authorization server.
+    f.holdExchange = true;
+    const callback = SELF.fetch(back).then((r) => r.text());
+    await eventually("the code exchange to reach the server", () => f.exchangeHeld);
+    // The operator revokes meanwhile: no record yet, no flow row left to delete.
+    expect(await adminJson(`/v1/admin/capabilities/${cap}/oauth`, { method: "DELETE" })).toEqual({ revoked: [] });
+    f.holdExchange = false;
+    const page = await callback;
+    expect(page).toContain("Not authorized");
+    expect(page).toContain("revoked while its code was being exchanged");
+    // Nothing came back: no record, and the tokens the exchange issued are revoked at the server.
+    expect(await grantRow(ref)).toBeUndefined();
+    expect((await adminJson(`/v1/admin/capabilities/${cap}/oauth`)).status).toBe("unauthorized");
+    expect(f.revocations).toHaveLength(1);
+    expect(f.revocations[0]).toMatchObject({ hint: "refresh_token", client: CIMD });
+    expect(f.refresh.get(f.revocations[0]!.token)!.valid).toBe(false);
+    // A later authorization is unaffected.
+    await authorize(cap);
+    expect((await grantRow(ref)).status).toBe("authorized");
+  });
+
+  it("a record with only an access token has that revoked; one with no tokens says so and asks the server nothing", async () => {
+    const a = await capability({ revocation: true });
+    await authorize(a.cap);
+    const row = await grantRow(a.ref);
+    await runInDurableObject(broker(), (_: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE oauth_grants SET refresh_token = NULL WHERE ref = ?", a.ref);
+    });
+    expect((await adminJson(`/v1/admin/capabilities/${a.cap}/oauth`, { method: "DELETE" })).revoked).toEqual([{ ref: a.ref, issuer: a.f.issuer, server: "revoked" }]);
+    expect(a.f.revocations).toEqual([{ token: row.access_token, hint: "access_token", client: CIMD }]);
+
+    const b = await capability({ revocation: true });
+    await authorize(b.cap);
+    await runInDurableObject(broker(), (_: BrokerDO, st) => {
+      st.storage.sql.exec("UPDATE oauth_grants SET refresh_token = NULL, access_token = NULL, status = 'reauthorize' WHERE ref = ?", b.ref);
+    });
+    expect((await adminJson(`/v1/admin/capabilities/${b.cap}/oauth`, { method: "DELETE" })).revoked).toEqual([{ ref: b.ref, issuer: b.f.issuer, server: "no_tokens" }]);
+    expect(b.f.revocations).toEqual([]);
+  });
+
+  it("a server whose metadata can't be read is reported failed, not unsupported", async () => {
+    const { id, f, cap, ref } = await capability({ revocation: true });
+    await authorize(cap);
+    fakes.delete(id);
+    try {
+      expect((await adminJson(`/v1/admin/capabilities/${cap}/oauth`, { method: "DELETE" })).revoked).toEqual([{ ref, issuer: f.issuer, server: "failed" }]);
+    } finally {
+      fakes.set(id, f);
+    }
+    expect(await grantRow(ref)).toBeUndefined();
+  });
+});
+
+describe("deleting an operator's secret", () => {
+  const secretRow = (name: string) => runInDurableObject(broker(), (_: BrokerDO, st) =>
+    st.storage.sql.exec("SELECT 1 FROM secrets WHERE name = ?", name).toArray().length);
+
+  it("removes the value, is audited by name only, and refuses the broker's own keys and clients' secrets", async () => {
+    const name = `cap:del-${rand()}`;
+    const value = `v-${random()}`;
+    await adminJson(`/v1/admin/secrets/${name}`, { method: "PUT", body: { value } });
+    expect(await secretRow(name)).toBe(1);
+    expect(await adminJson(`/v1/admin/secrets/${name}`, { method: "DELETE" })).toEqual({ deleted: true });
+    expect(await secretRow(name)).toBe(0);
+    expect(await adminJson(`/v1/admin/secrets/${name}`, { method: "DELETE" })).toEqual({ deleted: false });
+    const records = await auditOf((x) => x.name === name, "secret_deleted");
+    expect(records[0]).toMatchObject({ event: "secret_deleted", name, deleted: true, caller: "operator" });
+    expect(JSON.stringify(records)).not.toContain(value);
+
+    // Deleting the GitHub App drops every installation token minted with it (restored for the other tests).
+    const was = await runInDurableObject(broker(), (_: BrokerDO, st) =>
+      st.storage.sql.exec<{ value: string }>("SELECT value FROM secrets WHERE name = 'github_app'").toArray()[0]?.value ?? null);
+    const tokens = () => runInDurableObject(broker(), (_: BrokerDO, st) =>
+      st.storage.sql.exec("SELECT 1 FROM github_tokens WHERE key = 'k-del'").toArray().length);
+    await runInDurableObject(broker(), (_: BrokerDO, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO github_tokens (key, token, expires_ms, installation, minted_ms) VALUES ('k-del', 't', ?, 1, 0)", Date.now() + 3_600_000);
+      st.storage.sql.exec("INSERT OR IGNORE INTO secrets (name, value, updated_ms) VALUES ('github_app', 'x', 0)");
+    });
+    try {
+      await adminJson(`/v1/admin/secrets/${name}x`, { method: "DELETE" });
+      expect(await tokens()).toBe(1);
+      expect(await adminJson("/v1/admin/secrets/github_app", { method: "DELETE" })).toEqual({ deleted: true });
+      expect(await tokens()).toBe(0);
+    } finally {
+      await runInDurableObject(broker(), (_: BrokerDO, st) => {
+        if (was !== null) st.storage.sql.exec("INSERT OR REPLACE INTO secrets (name, value, updated_ms) VALUES ('github_app', ?, 0)", was);
+      });
+    }
+
+    expect((await adminJson("/v1/admin/secrets/binding_key:use1", { method: "DELETE" }, 403)).error.code).toBe("forbidden");
+    expect((await adminJson("/v1/admin/secrets/client-secret:cli_x:name", { method: "DELETE" }, 403)).error.code).toBe("forbidden");
   });
 });

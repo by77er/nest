@@ -21,6 +21,7 @@
 
 extern crate alloc;
 
+pub mod ca;
 pub mod checkpoint;
 pub mod detach;
 pub mod fleet;

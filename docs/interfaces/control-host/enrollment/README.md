@@ -28,5 +28,5 @@ host                                   Worker/FleetDO                      AWS
 
 **Rotation:**
 - **Host token:** FleetDO pushes `host_token{token, expires_ms}` about 10 minutes before expiry. The host uses the new token for every new connection.
-- **Proxy CA:** the host sends `ca_renew{csr_pem}` within a day of expiry, and FleetDO answers with `proxy_ca`.
+- **Proxy CA:** the host sends `ca_renew{csr_pem}` within 48 h of expiry, and FleetDO answers with `proxy_ca`. The host installs an answer only with the key its certificate names ([nestd](../../../compute/nestd/)).
 - **Compromise:** a compromised host is never reissued either one. Its token and intermediate expire on their own.
