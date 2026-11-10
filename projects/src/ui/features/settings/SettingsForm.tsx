@@ -44,8 +44,11 @@ export function ModelField({ label, description, value, onChange, error }: { lab
       />
       {custom && (
         <TextInput
-          label={`${label}: model id`}
+          label="Model id"
+          aria-label={`${label}: model id`}
           description="An id or alias Claude Code's --model takes, such as claude-opus-5-5."
+          // The id in the mono face (an identifier, read character by character); its label and help stay as they are.
+          styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
           value={value}
           onChange={(e) => onChange(e.currentTarget.value.trim())}
           error={value && problem ? `A model id is ${problem}` : error}
