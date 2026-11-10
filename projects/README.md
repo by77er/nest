@@ -174,7 +174,7 @@ The owner's request (2026-11-06): the app's retry queues as one machine, so each
   - **Nothing is said for an agent that exited during the refused try.** Its stop is gone already, so there's no notice and no row.
   - **The Network page names what each one was for:** its task, by title; its routine, by name; and why it was stopped, in words ("A routine run timed out").
 - **The chat (B9).**
-  - **States.** Each message carries `status` (`ChatMessage.status`). A message waiting for the manager, or retried after an outage, reads "Sending…" or "Retrying…" with why. Only a failed one reads "Not delivered", with Retry.
+  - **States.** Each message carries `status` (`ChatMessage.status`). A message waiting for the manager, or retried after an outage, reads "Sending…" or "Retrying…" with why, quiet, beside a small spinner (a loading indicator, the words always there). Only a failed one reads "Not delivered" (a warning badge with an icon), with Retry. A change in a message's delivery is announced to screen readers once (held up, not delivered and that Retry is there, sent again, delivered after a hold-up); an ordinary send and what was already so when the chat opened are not.
   - **Retry.**
     - On a failed message, Retry is `POST /api/projects/:id/chat/:seq/retry`, which leaves any message that isn't failed as it is.
     - On a message the page never had an answer for, Retry posts it again under the same `request_id`, the page's id for that message (`POST …/chat {text, request_id}`). The Worker keeps request ids (`chat_request`), so a post whose answer was lost is one message, not two.

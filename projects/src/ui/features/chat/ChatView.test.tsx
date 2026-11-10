@@ -504,6 +504,46 @@ describe("the chat", () => {
     expect(api.chat.filter((m) => m.text === "Are you there?")).toHaveLength(1);
   });
 
+  it("a message in flight shows a spinner and says Sending… or Retrying…; its delivery's changes are announced, an ordinary send's aren't", async () => {
+    const api = new FakeApi();
+    const own = (seq: number, status: "owed" | "retrying" | "failed" | "done", error: string | null = null) => ({ seq, at_ms: Date.now() - 1000 + seq, sender: "owner", text: `Mine ${seq}`, delivered: status === "done", status, error });
+    api.chat = [own(1, "owed"), own(2, "retrying", "nest is busy")];
+    const { queryClient } = renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    const row = async (n: number) => (await within(c).findByText(`Mine ${n}`)).closest("[data-sender]") as HTMLElement;
+    const mark = async (n: number) => (await row(n)).querySelector("[data-marker=sending]") as HTMLElement | null;
+    // The cue: the words, and a spinner beside them that a screen reader skips.
+    expect(await mark(1)).toHaveTextContent("Sending…");
+    expect(await mark(2)).toHaveTextContent("Retrying…");
+    for (const n of [1, 2]) expect((await mark(n))!.querySelector(".mantine-Loader-root")).toHaveAttribute("aria-hidden", "true");
+    const said = () => document.querySelector("[data-slot=announce]")!.textContent;
+    // Nothing is announced of what was already so when the chat opened.
+    expect(said()).toBe("");
+    const next = async (...rows: ReturnType<typeof own>[]) => {
+      api.chat = rows;
+      await queryClient.refetchQueries();
+    };
+    // An ordinary send lands: its cue goes, and nothing is said.
+    await next(own(1, "done"), own(2, "retrying", "nest is busy"));
+    await waitFor(async () => expect(await mark(1)).toBeNull());
+    expect(said()).toBe("");
+    // The outbox gives up on the other: said, with why and that Retry is there; the row shows it in words and an icon.
+    await next(own(1, "done"), own(2, "failed", "nest 409: the agent has ended"));
+    await waitFor(() => expect(said()).toBe("Your message wasn't delivered: nest 409: the agent has ended. Retry is available."));
+    const failed = await row(2);
+    expect(failed.querySelector("[data-marker=undelivered]")).toHaveTextContent("Not delivered");
+    expect(failed.querySelector("[data-marker=undelivered] svg")).not.toBeNull();
+    expect(failed.querySelector("[data-marker=sending]")).toBeNull();
+    expect(within(failed).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    // Retried, held up again, then delivered: each said once.
+    await next(own(1, "done"), own(2, "owed"));
+    await waitFor(() => expect(said()).toBe("Sending your message again."));
+    await next(own(1, "done"), own(2, "retrying", "nest is busy"));
+    await waitFor(() => expect(said()).toBe("Still sending your message: nest is busy."));
+    await next(own(1, "done"), own(2, "done"));
+    await waitFor(() => expect(said()).toBe("Your message was delivered."));
+  });
+
   it("sends what the owner wrote, trimmed, and clears the composer", async () => {
     const api = new FakeApi();
     const { user } = renderApp("/projects/prj_one/manager", api);

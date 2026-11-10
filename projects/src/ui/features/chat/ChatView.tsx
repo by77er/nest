@@ -7,7 +7,7 @@
 // when you're there, offers the way back down when you're not, and loads older messages as you scroll up
 // without losing your place.
 
-import { ActionIcon, Badge, Button, CopyButton, Menu, Text, Textarea, Tooltip, VisuallyHidden } from "@mantine/core";
+import { Loader, ActionIcon, Badge, Button, CopyButton, Menu, Text, Textarea, Tooltip, VisuallyHidden } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { IconAlertTriangle, IconArrowDown, IconArrowUp, IconCalendarEvent, IconCopy, IconDots, IconHourglass, IconListCheck, IconMessage, IconPlayerStop, IconQuote, IconRefresh, IconWritingSign } from "@tabler/icons-react";
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -182,6 +182,30 @@ function MessageActions({ m, onQuote, onRetry }: { m: ChatMessage; onQuote: (tex
   );
 }
 
+/** A message's delivery state (README.md#outboxes): an older row without one reads from `delivered` and `error`. */
+const statusOf = (m: ChatMessage) => m.status ?? (m.delivered ? "done" : m.error ? "failed" : "owed");
+
+/**
+ * What to say of the owner's messages whose delivery changed since `seen` (updated here): the last
+ * change, as a sentence, or null.
+ */
+export function statusNews(seen: Map<number, string>, messages: ChatMessage[]): string | null {
+  let news: string | null = null;
+  for (const m of messages) {
+    if (m.sender !== "owner") continue;
+    const now = statusOf(m);
+    const before = seen.get(m.seq);
+    seen.set(m.seq, now);
+    if (before === now) continue;
+    if (now === "failed") news = `Your message wasn't delivered${m.error ? `: ${m.error}` : ""}. Retry is available.`;
+    else if (now === "retrying") news = `Still sending your message${m.error ? `: ${m.error}` : ""}.`;
+    // An ordinary send (sending, then delivered) says nothing: only one that had been held up.
+    else if (now === "done" && (before === "retrying" || before === "failed")) news = "Your message was delivered.";
+    else if (now === "owed" && before === "failed") news = "Sending your message again.";
+  }
+  return news;
+}
+
 function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMessage; projectId: string; appear: boolean; steps?: Step[]; onQuote: (t: string) => void; onRetry: (m: ChatMessage) => void }) {
   if (m.sender === "app") {
     return (
@@ -193,7 +217,7 @@ function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMes
   const mine = m.sender === "owner";
   // Its real state (README.md#outboxes): being sent (owed, or retrying with why), or failed: refused for
   // good, or never taken by the app (an unsent one, a negative seq). Retry only on failed.
-  const status = m.status ?? (m.delivered ? "done" : m.error ? "failed" : "owed");
+  const status = statusOf(m);
   const failed = mine && status === "failed";
   const retrying = mine && status === "retrying";
   const sending = mine && (status === "owed" || retrying);
@@ -206,9 +230,18 @@ function Message({ m, projectId, appear, steps, onQuote, onRetry }: { m: ChatMes
       data-seq={String(m.seq)}
       meta={
         <>
-          {(sending || failed) && (
-            <Badge size="xs" color={failed ? "warning" : "gray"} variant="light" data-marker={failed ? "undelivered" : "sending"}>
-              {failed ? "Not delivered" : retrying ? "Retrying…" : "Sending…"}
+          {/* In flight: quiet, a small spinner (a loading indicator) and the word, never colour alone. */}
+          {sending && (
+            <Row gap="xs" wrap="nowrap" data-marker="sending" data-status={retrying ? "retrying" : "owed"}>
+              <Loader size={icon.sm} color="gray" aria-hidden />
+              <Text fz="xs" c="dimmed">
+                {retrying ? "Retrying…" : "Sending…"}
+              </Text>
+            </Row>
+          )}
+          {failed && (
+            <Badge size="xs" color="warning" variant="light" leftSection={<IconAlertTriangle size={icon.sm} aria-hidden />} data-marker="undelivered">
+              Not delivered
             </Badge>
           )}
           {/* The exact time on hover; for the keyboard and touch it heads the message's actions. */}
@@ -284,6 +317,8 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const lastTop = useRef(0);
   const [unseen, setUnseen] = useState(0);
   const [announce, setAnnounce] = useState("");
+  // Each of the owner's messages' delivery state as last seen, for announcing its changes.
+  const statuses = useRef(new Map<number, string>());
   const log = useRef<HTMLDivElement>(null);
   const composer = useRef<HTMLTextAreaElement>(null);
   const seen = useRef<Set<number> | null>(null);
@@ -347,12 +382,17 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     const fresh = messages.filter((m) => m.seq > 0 && known && !known.has(m.seq));
     seen.current = new Set(messages.filter((m) => m.seq > 0).map((m) => m.seq));
     if (!known) {
+      statusNews(statuses.current, messages);
       // An empty chat opens at its top (on a phone, the page's column with its header).
       if (messages.length) scrollToBottom();
       return;
     }
     const lastManager = fresh.filter((m) => m.sender === "manager").at(-1);
+    // A change in one of the owner's messages' delivery is said too (once per change, never on load): a
+    // reply outranks it when both land together.
+    const said = statusNews(statuses.current, messages);
     if (lastManager) setAnnounce(`The manager replied: ${lastManager.text.slice(0, 500)}`);
+    else if (said) setAnnounce(said);
     if (atBottomRef.current) scrollToBottom();
     else if (fresh.length) setUnseen((n) => n + fresh.length);
   }, [messages]); // follows the log, reading the scroll state as it is now
