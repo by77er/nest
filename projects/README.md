@@ -253,7 +253,7 @@ A security follow-up (2026-11-09, once the repo was public): a project's repo is
   - An event routed by the id names the repo's new name: it's kept as `renamed_to`.
   - It's applied (the directory's guarded rename first, then ProjectDO and ReviewDO, then the catalog synced; if either can't follow, the directory's is taken back, so they never disagree) by a sync or a Re-read, once nest's grant for the app names the new name. nest mints tokens only for the repos its grant names, so until then the project calls GitHub by the old name, which GitHub redirects (unverified for every call nest makes after a transfer). Never onto a name another project has.
   - Agents running keep what they started with; new ones get the new name.
-- **The Admin page** lists each binding (project, repo, id, how it was learned, a rename not applied yet, why it didn't bind) with Re-read: a table from `sm`, a card per binding below it. "Rename pending" and "Not bound" are badged. A failed re-read is said in its row, which offers Retry; a mismatch shows both repos side by side with "Bind to this repo".
+- **The Admin page** lists each binding (project, repo, id, how it was learned, a rename not applied yet, why it didn't bind) with Re-read: a table from `sm`, a card per binding below it. "Rename pending" and "Not bound" are badged. A failed re-read is said in its row, which offers Retry; a mismatch is badged "Mismatch" and shows both repos side by side (in columns from `sm`), with "Bind to this repo" as a quiet danger action: last in a card, after Re-read and set apart.
 
 ## Creating a project
 

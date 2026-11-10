@@ -5,7 +5,10 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
+import { applyRename } from "../src/binding";
 import type { RepoBinding } from "../src/do/directory";
+import type { Env } from "../src/env";
+import { nestFrom } from "../src/nest";
 import { AccessTeam, api, deliverGithub, FakeNest, installFetch, repoIdOf } from "./fake-nest";
 
 const fake = new FakeNest();
@@ -229,6 +232,20 @@ describe("a renamed or transferred repo", () => {
     expect((await reread(p)).body.rename).toEqual({ applied: to });
     expect(await settingsRepo(p)).toBe(to);
     expect(await reviewRepo(p)).toBe(to);
+  });
+
+  it("a directory rename that's refused (its state moved after the name check) renames neither ProjectDO nor ReviewDO", async () => {
+    const p = await newProject();
+    const to = `${p.repo}-elsewhere`;
+    fake.grantRepos = [p.repo, to];
+    // The binding as read before the directory moved on: its own rename note is gone, so its guarded
+    // rename writes nothing, as when another project takes the name between the check and the rename.
+    const stale = { ...(await binding(p)), renamed_to: to };
+    const r = await applyRename(env as unknown as Env, nestFrom(env as unknown as Env)!, stale);
+    expect(r).toEqual({ blocked: "the rename changed while it was applied: re-read" });
+    expect(await binding(p)).toMatchObject({ repo: p.repo, renamed_to: null });
+    expect(await settingsRepo(p)).toBe(p.repo);
+    expect(await reviewRepo(p)).toBe(p.repo);
   });
 
   it("a re-read follows the name GitHub last gave it, so an old name taken by another repo doesn't rebind it", async () => {

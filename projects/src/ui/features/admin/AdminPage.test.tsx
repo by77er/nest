@@ -87,6 +87,10 @@ describe("the admin page", () => {
     expect(m.querySelector("[data-slot=github-repo]")).toHaveTextContent("repo 777");
     expect(m.querySelector("[data-slot=github-repo]")).toHaveTextContent("owner owner (31337)");
     expect(m.querySelector('[data-tone="danger"]')).toHaveTextContent("Another owner than the bound repo's");
+    expect(within(row).getByText("Mismatch")).toBeInTheDocument();
+    // Side by side in the table; the choice quiet (light), not the page's loudest button.
+    expect((m.querySelector("[data-slot=bound-repo]")!.parentElement as HTMLElement).getAttribute("style")).toContain("--group-wrap: nowrap");
+    expect(within(m).getByRole("button", { name: "Bind Gadgets to owner/gadgets (repo 777)" })).toHaveAttribute("data-variant", "light");
     // Nothing was bound, and no toast claims it was.
     expect(api.writes).toEqual([{ method: "POST", path: "/api/admin/bindings/prj_two", body: undefined }]);
     expect(screen.queryByText(/Gadgets is bound to GitHub's repo 777/)).toBeNull();
@@ -138,6 +142,23 @@ describe("the admin page", () => {
     act(() => listeners.forEach((f) => f({ matches: true })));
     const list = await screen.findByRole("list", { name: "Repository bindings" });
     expect(list.querySelector("[data-binding=prj_two] [data-slot=mismatch]")).toBeTruthy();
+  });
+
+  it("on a phone, a mismatch's card puts Re-read first and Bind last, set apart", async () => {
+    vi.stubGlobal("matchMedia", (query: string) => ({ matches: query === "(max-width: 48em)", media: query, onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent: () => false }));
+    const api = new FakeApi();
+    const b = binding({ project: "prj_two", name: "Gadgets", repo: "owner/gadgets", repo_id: 102 });
+    api.bindings = [b];
+    api.reread = () => ({ binding: b, mismatch: { bound: { full_name: "owner/gadgets", id: 102, owner: null }, github: { full_name: "owner/gadgets", id: 777, owner: null, same_owner: null } } });
+    const { user } = renderApp("/admin", api);
+    await user.click(await screen.findByRole("button", { name: "Re-read Gadgets's repo from GitHub" }));
+    const card = await screen.findByRole("listitem");
+    const bindButton = await within(card).findByRole("button", { name: "Bind Gadgets to owner/gadgets (repo 777)" });
+    const reread = within(card).getByRole("button", { name: "Re-read Gadgets's repo from GitHub" });
+    expect(reread.compareDocumentPosition(bindButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(card.querySelector(".mantine-Divider-root")!.compareDocumentPosition(bindButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(within(card).getAllByRole("button", { name: /^Bind / })).toHaveLength(1);
+    expect(bindButton).toHaveAttribute("data-variant", "light");
   });
 
   it("says a re-read's outcome in words", () => {

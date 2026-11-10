@@ -5,7 +5,7 @@
 // shown side by side, and only "Bind to this repo", confirmed, binds that one. A table from `sm`, a card
 // per binding below it. A failed re-read is said in its row, which offers Retry.
 
-import { Badge, Button, Table, Text } from "@mantine/core";
+import { Badge, Button, Divider, Table, Text } from "@mantine/core";
 import { modals } from "@mantine/modals";
 import { notifications } from "@mantine/notifications";
 import { IconGitBranch, IconRefresh } from "@tabler/icons-react";
@@ -36,7 +36,7 @@ const ownerText = (o: { id: number; login: string } | null) => (o ? `${o.login} 
 /** One side of the comparison: a repo's name, id and owner. */
 function RepoSide({ label, r, slot }: { label: string; r: { full_name: string; id: number | null; owner: { id: number; login: string } | null }; slot: string }) {
   return (
-    <Stack gap="2xs" data-slot={slot}>
+    <Stack gap="2xs" flex={1} data-slot={slot}>
       <Text fz="sm" fw={weight.medium}>
         {label}
       </Text>
@@ -51,8 +51,20 @@ function RepoSide({ label, r, slot }: { label: string; r: { full_name: string; i
   );
 }
 
-/** The bound repo and GitHub's repo for its name, which differ: nothing changed until the operator chooses. */
-function Mismatch({ b, m, busy, onBind }: { b: RepoBinding; m: BindingMismatch; busy: boolean; onBind: () => void }) {
+/** The choice a mismatch offers: quiet (light), since binding another repo is the exception the copy warns against. */
+function BindButton({ b, m, busy, onBind }: { b: RepoBinding; m: BindingMismatch; busy: boolean; onBind: () => void }) {
+  return (
+    <Button variant="light" color="danger" loading={busy} onClick={onBind} aria-label={`Bind ${b.name} to ${m.github.full_name} (repo ${m.github.id})`}>
+      Bind to this repo
+    </Button>
+  );
+}
+
+/**
+ * The bound repo and GitHub's repo for its name, which differ: nothing changed until the operator chooses.
+ * Side by side in the table; one above the other in a card, whose Bind comes last, after Re-read.
+ */
+function Mismatch({ b, m, busy, onBind, card }: { b: RepoBinding; m: BindingMismatch; busy: boolean; onBind: () => void; card: boolean }) {
   const owner =
     m.github.same_owner === null ? { text: "Its owner can't be compared: the bound repo's isn't known.", tone: undefined }
       : m.github.same_owner ? { text: "Same owner as the bound repo.", tone: undefined }
@@ -62,18 +74,25 @@ function Mismatch({ b, m, busy, onBind }: { b: RepoBinding; m: BindingMismatch; 
       <Text fz="sm" c="warning" data-tone="warning">
         GitHub&apos;s repo for this name isn&apos;t the bound one. Nothing changed: events still go to the bound repo.
       </Text>
-      <Row gap="xl" align="flex-start">
-        <RepoSide label="Bound" r={m.bound} slot="bound-repo" />
-        <RepoSide label="GitHub now" r={m.github} slot="github-repo" />
-      </Row>
+      {card ? (
+        <Stack gap="md">
+          <RepoSide label="Bound" r={m.bound} slot="bound-repo" />
+          <RepoSide label="GitHub now" r={m.github} slot="github-repo" />
+        </Stack>
+      ) : (
+        <Row gap="xl" align="flex-start" wrap="nowrap">
+          <RepoSide label="Bound" r={m.bound} slot="bound-repo" />
+          <RepoSide label="GitHub now" r={m.github} slot="github-repo" />
+        </Row>
+      )}
       <Text fz="sm" c={owner.tone} data-tone={owner.tone}>
         {owner.text}
       </Text>
-      <Row>
-        <Button color="danger" loading={busy} onClick={onBind} aria-label={`Bind ${b.name} to ${m.github.full_name} (repo ${m.github.id})`}>
-          Bind to this repo
-        </Button>
-      </Row>
+      {!card && (
+        <Row>
+          <BindButton b={b} m={m} busy={busy} onBind={onBind} />
+        </Row>
+      )}
     </Stack>
   );
 }
@@ -135,19 +154,20 @@ function useBinding(b: RepoBinding, r: Rereads) {
   return { busy, mismatch, failure, reread: () => r.run(b), bind };
 }
 
-function Status({ b }: { b: RepoBinding }) {
+function Status({ b, mismatch }: { b: RepoBinding; mismatch: boolean }) {
+  if (mismatch) return <Badge size="sm" color="danger" variant="light">Mismatch</Badge>;
   if (b.repo_id === null) return <Badge size="sm" color="danger" variant="light">Not bound</Badge>;
   if (b.renamed_to) return <Badge size="sm" color="warning" variant="light">Rename pending</Badge>;
   return null;
 }
 
 /** The Bound cell (the card's middle): how it was learned, a pending rename, why it didn't bind, a failed re-read, a mismatch. */
-function BoundDetail({ b, s }: { b: RepoBinding; s: ReturnType<typeof useBinding> }) {
+function BoundDetail({ b, s, card = false }: { b: RepoBinding; s: ReturnType<typeof useBinding>; card?: boolean }) {
   const how = boundText(b);
   return (
     <Stack gap="xs">
       <Row gap="sm" wrap="wrap">
-        <Status b={b} />
+        <Status b={b} mismatch={s.mismatch !== null} />
         <Text fz="sm" c="dimmed" title={how.title}>
           {how.text}
         </Text>
@@ -171,7 +191,7 @@ function BoundDetail({ b, s }: { b: RepoBinding; s: ReturnType<typeof useBinding
           Re-read failed: {s.failure}
         </Text>
       )}
-      {s.mismatch && <Mismatch b={b} m={s.mismatch} busy={s.busy} onBind={() => s.bind(s.mismatch!)} />}
+      {s.mismatch && <Mismatch b={b} m={s.mismatch} busy={s.busy} onBind={() => s.bind(s.mismatch!)} card={card} />}
     </Stack>
   );
 }
@@ -229,10 +249,19 @@ function BindingCard({ b, rereads }: { b: RepoBinding; rereads: Rereads }) {
         <MetaRow>
           <MetaItem mono>GitHub id {b.repo_id ?? "none"}</MetaItem>
         </MetaRow>
-        <BoundDetail b={b} s={s} />
+        <BoundDetail b={b} s={s} card />
         <Row>
           <RereadButton b={b} s={s} />
         </Row>
+        {s.mismatch && (
+          <>
+            {/* The exception comes last, set apart. */}
+            <Divider />
+            <Row>
+              <BindButton b={b} m={s.mismatch} busy={s.busy} onBind={() => s.bind(s.mismatch!)} />
+            </Row>
+          </>
+        )}
       </Stack>
     </Panel>
   );
