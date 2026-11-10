@@ -879,6 +879,10 @@ export class AgentDO extends DurableObject<Env> {
     // Nothing starts an agent that ended for good.
     if (this.load().ended) return;
     this.update((i) => {
+      // A restart first recorded (none pending before) counts its failures from zero: a count left by an
+      // earlier one (cleared by a release that didn't reset it) never shortens its bound. A restart asked
+      // again while one is pending keeps the count: asking again doesn't extend the bound.
+      if (patch.reason === "restart" && i.intent?.reason !== "restart") delete i.restart_failures;
       i.intent = mergeIntent(i.intent, patch);
       if (launch) i.launch = changedLaunch(i.launch, launch);
       if (patch.reason === "restart") delete i.restart_error;

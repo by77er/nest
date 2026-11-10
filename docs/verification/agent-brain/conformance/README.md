@@ -438,7 +438,7 @@ Tests: `control-plane/test/restart-launch.test.ts` (mid-turn kill and resume wit
 | `ROpRestartDrop` | `processIntent` throws (`requireLaunch`), `intentFailed` clears the intent; or `restartGivenUp` after `RESTART_MAX_FAILURES` (5) retryable failures in a row with the brain live | yes | Both pump after clearing it, so turns held back run on the brain that stays |
 | `Pump` (with `PUMP_GUARD`) | `AgentDO.pump` | yes | **The guard:** no turn is sent while `intent.reason = "restart"`; queued turns run on the next brain |
 
-**Fairness and the bound:** `ROpRestartCondemn \/ ROpRestartDrop` is weakly fair, so a pending restart resolves one way or the other. In the code that rests on the bound. A run that fails retryably (FleetDO not answering `hostGone` or `hostStatus`, or any error that isn't a `NestError`) is retried every 30 s (`WAKE_RETRY_MS`). After 5 in a row with the brain live (about 2.5 minutes), the restart is given up. Without the bound, a restart that can never get past FleetDO would hold the turns for good: the fairness the model assumes would not hold. A condemned brain's failures (a start that finds no room, for instance) aren't counted: nothing is held on a live brain then.
+**Fairness and the bound:** `ROpRestartCondemn \/ ROpRestartDrop` is weakly fair, so a pending restart resolves one way or the other. In the code that rests on the bound. A run that fails retryably (FleetDO not answering `hostGone` or `hostStatus`, or any error that isn't a `NestError`) is retried every 30 s (`WAKE_RETRY_MS`). After 5 in a row with the brain live (about 2.5 minutes), the restart is given up. Without the bound, a restart that can never get past FleetDO would hold the turns for good: the fairness the model assumes would not hold. A condemned brain's failures aren't counted: nothing is held on a live brain then, and giving up would leave the agent with no brain once the condemned one is released. The count starts from zero when a restart is first recorded (no restart pending before), and is kept when one is asked again while pending.
 
 Model results (TLC 1.7.4, 4 workers):
 - **Without the guard** (`MC_nr_restart_split_noguard`): `NoCutAfterAsk` fails in 11 steps. The restart is recorded, `Pump` sends the turn, and the condemn cuts it.
@@ -453,3 +453,5 @@ Tests: `control-plane/test/restart-launch.test.ts`, "no turn starts while a rest
 - a restart refused after a turn queued behind it leaves the brain, and the turn runs on it;
 - a restart failing retryably holds the turn through 4 failures; the 5th gives it up, with `restart_error` set, and the turn runs;
 - with another start pending (an operator's `start` kept beside a live brain), a turn runs: only a restart holds turns.
+- failures while the brain is condemned leave the restart pending, and its start follows the brain's exit;
+- a restart first recorded counts from zero over a stale count; asked again while pending, the count stays.

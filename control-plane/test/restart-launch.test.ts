@@ -381,5 +381,57 @@ describe("no turn starts while a restart is pending (the pump guard)", () => {
     expect(await r1.next("run_turn")).toMatchObject({ turn });
     r1.close();
   });
+
+  it("failures after the condemn aren't counted: a condemned brain's restart stays pending, and starts once the brain is gone", async () => {
+    const s = await setup();
+    await runner(s.agent, s.host.host, s.host.host_token, 1);
+    expect((await restart(s.agent, { restart: true })).status).toBe(200);
+    await nextCommands(s.host.ws, isKillOf(s.agent));
+    // FleetDO stops answering while the brain is condemned: runs fail, more than the bound.
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      (inst as unknown as { hostGone: () => Promise<boolean> }).hostGone = async () => {
+        throw new Error("FleetDO not answering");
+      };
+    });
+    for (let n = 0; n < RESTART_MAX_FAILURES + 1; n++) await runIntentNow(s.agent).catch(() => undefined);
+    const info = (await agentStub(s.agent).info()) as unknown as { intent: { reason: string } | null; brain: { phase: string } | null; restart_error?: unknown };
+    expect(info.intent).toMatchObject({ reason: "restart" });
+    expect(info.brain).toMatchObject({ phase: "condemned" });
+    expect(info.restart_error ?? null).toBeNull();
+    // FleetDO answers again and the condemned brain exits: the restart's start follows.
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      delete (inst as unknown as { hostGone?: unknown }).hostGone;
+    });
+    const seq = sendEvents(s.host.ws, [{ ts_ms: Date.now(), type: "agent_exited", agent: s.agent, reason: "stopped", epoch: 1 }]);
+    await s.host.ws.next("ack", (m) => m.up_to >= seq);
+    await runIntentNow(s.agent).catch(() => undefined);
+    expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
+  });
+
+  it("a restart first recorded counts its failures from zero, whatever an earlier one left", async () => {
+    const s = await setup();
+    const r1 = await runner(s.agent, s.host.host, s.host.host_token, 1);
+    // A count left with no intent pending (a previous release cleared the intent without resetting it).
+    await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) => {
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.restart_failures = RESTART_MAX_FAILURES - 1;
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+    });
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      (inst as unknown as { hostGone: () => Promise<boolean> }).hostGone = async () => {
+        throw new Error("FleetDO not answering");
+      };
+    });
+    // Its first failure isn't its last.
+    expect((await restart(s.agent, { restart: true })).status).toBe(500);
+    const info = (await agentStub(s.agent).info()) as unknown as { intent: { reason: string } | null; restart_failures?: number; restart_error?: unknown };
+    expect(info.intent).toMatchObject({ reason: "restart" });
+    expect(info.restart_failures).toBe(1);
+    expect(info.restart_error ?? null).toBeNull();
+    // Asked again while pending: the count stays (asking again doesn't extend the bound).
+    expect((await restart(s.agent, { restart: true })).status).toBe(500);
+    expect(((await agentStub(s.agent).info()) as unknown as { restart_failures?: number }).restart_failures).toBe(2);
+    r1.close();
+  });
 });
 
