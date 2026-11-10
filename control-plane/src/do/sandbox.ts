@@ -120,6 +120,14 @@ export interface PlacementRefused {
   gave_up: boolean;
 }
 const PLACEMENT_REFUSED_KEY = "placement_refused";
+/** Why a sandbox waiting for a host gets none (FleetDO's `launchPause`), and since when it was noted. */
+export interface PlacementWait {
+  reason: string;
+  /** When the next launch may be tried. */
+  until_ms: number;
+  ms: number;
+}
+const PLACEMENT_WAIT_KEY = "placement_wait";
 
 export interface SandboxInfo extends lease.Lease, slots.Slots {
   sandbox: string;
@@ -488,12 +496,33 @@ export class SandboxDO extends DurableObject<Env> {
     return this.view();
   }
 
-  /** The record as the API shows it: without the compat `workstream`. */
-  private view(): SandboxInfo & { placement_refused?: PlacementRefused } {
+  /**
+   * The record as the API shows it: without the compat `workstream`, and, while it isn't placed, why:
+   * `placement_wait` (launches paused by the cell's enrolment breakers) and `placement_refused`
+   * (placements FleetDO refused because the leases disagree: retried, or given up).
+   */
+  private view(): SandboxInfo & { placement_wait?: PlacementWait; placement_refused?: PlacementRefused } {
     const { workstream: _, ...info } = this.info_();
-    // Placements FleetDO refused (the leases disagree), while it isn't placed: retried, or given up.
+    const wait = !info.host ? this.get<PlacementWait>(PLACEMENT_WAIT_KEY) : undefined;
     const refused = !info.host ? this.get<PlacementRefused>(PLACEMENT_REFUSED_KEY) : undefined;
-    return { ...info, labels: info.labels ?? {}, ...(refused ? { placement_refused: refused } : {}) };
+    return { ...info, labels: info.labels ?? {}, ...(wait ? { placement_wait: wait } : {}), ...(refused ? { placement_refused: refused } : {}) };
+  }
+
+  /**
+   * No host had room: whether FleetDO is launching one at all. While every instance type it would launch
+   * has its enrolment breaker open, the reason is kept for the API and for `resolve`'s refusal; anything
+   * else clears it. Best effort: a FleetDO that can't say (one of the previous release) leaves none.
+   */
+  private async notePlacementWait(cell: string): Promise<void> {
+    let pause: { reason: string; until_ms: number } | null = null;
+    try {
+      pause = await this.fleet(cell).launchPause();
+    } catch (e) {
+      console.warn(`SandboxDO: asking FleetDO why no host is launched failed`, e);
+    }
+    // Re-read in this step: placed meanwhile, nothing to say.
+    if (pause && !this.info_().host) this.put(PLACEMENT_WAIT_KEY, { ...pause, ms: Date.now() } satisfies PlacementWait);
+    else this.del(PLACEMENT_WAIT_KEY);
   }
 
   /** A placement that never finished leaves `placing` set: once stale, FleetDO's lease decides. */
@@ -599,9 +628,11 @@ export class SandboxDO extends DurableObject<Env> {
           throw failure;
         }
         await this.deadlines.set("place", Date.now() + PLACE_RETRY_MS, true);
+        await this.notePlacementWait(before.cell);
         return null;
       case "placed":
         this.del(PLACEMENT_REFUSED_KEY);
+        this.del(PLACEMENT_WAIT_KEY);
         await this.deadlines.clear("place");
         await this.afterPlaced(epoch);
         return after.host;
@@ -1772,7 +1803,12 @@ export class SandboxDO extends DurableObject<Env> {
       info = this.info_();
     }
     const refused = slots.unbindable(info, agent);
-    if (refused) throw refused;
+    if (refused) {
+      // Not placed because no host is being launched: say why, not only "not placed yet".
+      const wait = !info.host ? this.get<PlacementWait>(PLACEMENT_WAIT_KEY) : undefined;
+      if (wait && asNestError(refused)?.code === ErrorCodes.SANDBOX_NOT_READY) throw notReady(`sandbox is not placed yet: ${wait.reason}`);
+      throw refused;
+    }
     const host = info.host!;
     const gateway = await this.fleet(info.cell).hostGatewayUrl(host);
     if (!gateway) throw notReady(`host ${host} advertises no gateway yet`);

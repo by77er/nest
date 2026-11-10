@@ -125,7 +125,7 @@ Notation: `SB` = SandboxDO info, `L` = FleetDO lease row, `I(h, e)` = incarnatio
 |---|---|---|---|
 | L1 | A sandbox whose lease is lost, with work, is eventually placed again | capacity eventually; EC2 reachable, or the host reconnects, or an operator confirms; weak fairness on alarms and `processReassign` | Fails in B3 (fenced/failed state never retried by the alarm), B4, and the Refused state (lease at another epoch: `place` deadline cleared, no automatic repair, `sandbox.ts:322`) |
 | L2 | Every `placing` marker is eventually cleared or adopted | the `place` deadline fires (written in the same synchronous block as the claim: `Deadlines.set` writes its row before its first await); FleetDO eventually answers `leaseOf` | Holds |
-| L3 | Every `reassign_queue` row is eventually deleted | `leaseLost` eventually returns | Holds, except a row that gave up after its bounded retries (since 2026-11-06, conformance below); but rows can be silently not inserted (B4) |
+| L3 | Every `reassign_queue` row is eventually deleted | `leaseLost` eventually returns | Holds, except a row that gave up after refusals (since 2026-11-06, conformance below); but rows can be silently not inserted (B4) |
 | L4 | Every stale incarnation is eventually destroyed or retired | host reachable | Mostly: `sandbox_destroy` is sent once; if the host restarts before running it the row keeps `cmd` set and is skipped for 24 h (`fleet.ts:893`, `1324`); nestd's own retire usually deletes it first |
 | L5 | STONITH eventually resolves | EC2 or reconnect or operator | By design waits forever otherwise ("we wait or ask me") |
 | L6 | Every salvage terminates | — | Holds since `77b3b30` (final refusals end it); `parent_mismatch` retries until destroy |

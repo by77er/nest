@@ -25,6 +25,7 @@ import { MAX_NOTES, mayWriteMemory, NOTE_KEY, NOTE_MAX, type Note, preview } fro
 import type { RoutineKind, RoutinePreset } from "../requests";
 import { type Created, firedTrigger, MAX_PROPOSALS_PER_RUN, MAX_ROUTINES, MAX_START_ATTEMPTS, MAX_UNTRIAGED_PROPOSALS, nextTimerFire, type RoutineFields, routineSpawnExtras, runBrief, type RunOutcome, type RunState, startVerdict, type TriggerKind, type Triggers } from "../routines";
 import { randomId } from "./directory";
+import { OUTBOX, type OutboxEvent, type OutboxPolicy, type OutboxRow, type OutboxState, outboxState, outboxStep, pruneBefore, verdict } from "../outbox";
 
 export interface Settings {
   id: string;
@@ -190,7 +191,14 @@ export interface ChatMessage {
   /** `owner`, `manager` or `app`. */
   sender: string;
   text: string;
+  /** Delivered to the manager (`status` is `done`); kept for older pages. */
   delivered: boolean;
+  /**
+   * The owner's message on its way (README.md#outboxes): `owed` and `retrying` are still being sent (a
+   * retry's `error` says why it waits), `failed` was refused for good (Retry sends it again), `done` is
+   * delivered. The manager's and the app's are `done`.
+   */
+  status: OutboxState;
   error: string | null;
 }
 
@@ -464,12 +472,53 @@ export const MIGRATIONS = [
     "ALTER TABLE routine_runs ADD COLUMN cleanup_passes INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE routine_runs ADD COLUMN cleanup_attempts INTEGER NOT NULL DEFAULT 0",
   ],
+  [
+    // The outboxes as one machine (README.md#outboxes): the owner's chat message keyed by the page's
+    // request id, so a retried post is the same message; a stop nest refuses for good is failed, not retried.
+    "ALTER TABLE chat ADD COLUMN request_id TEXT",
+    "CREATE UNIQUE INDEX chat_request ON chat (request_id)",
+    "ALTER TABLE stops ADD COLUMN failed_ms INTEGER",
+    // When a message to an agent was sent or failed: its pruning counts from then, not from when it was owed.
+    "ALTER TABLE messages ADD COLUMN ended_ms INTEGER",
+    // PR rows of tasks that no longer exist: deleting a draft left them before the task machine (README.md#the-task-machine),
+    // and nothing updates them now (a PR's state moves only with its task's). Gone, so the PR can be attached again.
+    "DELETE FROM task_prs WHERE task NOT IN (SELECT id FROM tasks)",
+  ],
 ] as const;
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
 const RECENT_WAITS = 10;
 
 type Row = Record<string, SqlStorageValue>;
+
+/** A failed stop's `next_ms` (the column is NOT NULL): never due (9999-12-31), until the owner's Retry. */
+const NOT_DUE_MS = 253_402_300_799_000;
+
+/**
+ * A stop's refusal that will repeat (README.md#outboxes): nest's own refusal of the request, in its JSON
+ * error body (400, 409). An auth failure (401, 403) or a page that isn't nest's (a proxy's, Access's) may
+ * pass, so it's retried: failing it would leave an agent running unseen.
+ */
+export function stopRefused(e: unknown): boolean {
+  return e instanceof NestError && e.code !== "http" && !e.retryable && (e.status === 400 || e.status === 409);
+}
+
+/** A stop nest refused (README.md#outboxes): the agent may still be running. */
+export interface FailedStop {
+  agent: string;
+  task: string | null;
+  /** Its task's title, when it's a worker's. */
+  task_title: string | null;
+  /** The routine whose run it is, when it's a run's. */
+  routine: { id: string; name: string } | null;
+  /** Why it was being stopped (`cancelled`, `routine run done`, …). */
+  reason: string;
+  error: string | null;
+  failed_ms: number;
+}
+
+/** A queue row's outbox columns (README.md#outboxes). */
+const outboxRow = (r: Row): OutboxRow => ({ next_ms: (r.next_ms as number | null) ?? null, attempts: (r.attempts as number | null) ?? 0, error: (r.error as string | null) ?? null });
 
 /** A task's row with `tainted`: whether any write in its history came from a tainted session. */
 const TASK_SELECT = "SELECT t.*, EXISTS (SELECT 1 FROM history h WHERE h.task = t.id AND h.tainted = 1) AS tainted FROM tasks t";
@@ -1151,13 +1200,13 @@ export class ProjectDO extends DurableObject<Env> {
         this.sql.exec("UPDATE issue_closes SET commented = 1 WHERE task = ?", task);
       }
       await gh.closeIssue(s.repo, n);
-      this.sql.exec("UPDATE issue_closes SET next_ms = NULL, error = NULL, closed_ms = ? WHERE task = ?", Date.now(), task);
+      if (this.outbox("issue_closes", "task", task, row, { kind: "sent" }, OUTBOX.issue_closes)) this.sql.exec("UPDATE issue_closes SET closed_ms = ? WHERE task = ?", Date.now(), task);
       this.record(task, app, "issue_closed", { issue: n, pr: row.pr });
     } catch (e) {
-      const attempts = (row.attempts as number) + 1;
-      const permanent = (e instanceof GitHubError || e instanceof NestError) && e.permanent;
-      this.sql.exec("UPDATE issue_closes SET attempts = ?, error = ?, next_ms = ? WHERE task = ?", attempts, message(e), permanent ? null : Date.now() + backoff(attempts), task);
-      if (permanent) {
+      // As it is now (its attempts may have moved during the awaits): the outbox's verdict (README.md#outboxes).
+      const now = this.sql.exec("SELECT * FROM issue_closes WHERE task = ?", task).toArray()[0];
+      if (!now) return;
+      if (this.outbox("issue_closes", "task", task, now, { kind: "failed", ...verdict(e) }, OUTBOX.issue_closes) === "failed") {
         this.record(task, app, "issue_close_failed", { issue: n, error: message(e) });
         // The grant as it is now, so its widening later is seen as a change, and the close tried again.
         await this.readGrant(nest);
@@ -1173,8 +1222,9 @@ export class ProjectDO extends DurableObject<Env> {
     const row = this.sql.exec("SELECT * FROM issue_closes WHERE task = ?", task).toArray()[0];
     if (!row) return fail(409, "the task has no issue to close");
     if (row.closed_ms !== null) return fail(409, `issue #${row.issue as number} is closed`);
-    if (row.next_ms === null) {
-      this.sql.exec("UPDATE issue_closes SET next_ms = ?, attempts = 0 WHERE task = ?", Date.now(), task);
+    // Only a failed one is owed again: asking while it's owed changes nothing.
+    if (outboxState(outboxRow(row)) === "failed") {
+      this.outbox("issue_closes", "task", task, row, { kind: "retry" }, OUTBOX.issue_closes);
       this.record(task, { kind: "owner" }, "issue_close_retried", { issue: row.issue });
     }
     await this.arm();
@@ -1781,24 +1831,47 @@ export class ProjectDO extends DurableObject<Env> {
     if (!this.settings()) return fail(404, "unknown project");
     const n = Math.max(1, Math.min(CHAT_PAGE_MAX, Math.floor(limit)));
     const rows = (before === undefined
-      ? this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, error FROM chat ORDER BY seq DESC LIMIT ?", n)
-      : this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, error FROM chat WHERE seq < ? ORDER BY seq DESC LIMIT ?", before, n)).toArray().reverse();
-    return ok(rows.map((r) => ({
-      seq: r.seq as number, at_ms: r.at_ms as number, sender: r.sender as string, text: r.text as string,
-      delivered: r.next_ms === null && r.error === null, error: (r.error as string | null) ?? null,
-    })));
+      ? this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, attempts, error FROM chat ORDER BY seq DESC LIMIT ?", n)
+      : this.sql.exec("SELECT seq, at_ms, sender, text, next_ms, attempts, error FROM chat WHERE seq < ? ORDER BY seq DESC LIMIT ?", before, n)).toArray().reverse();
+    return ok(rows.map((r) => {
+      const status = outboxState(outboxRow(r));
+      return { seq: r.seq as number, at_ms: r.at_ms as number, sender: r.sender as string, text: r.text as string, delivered: status === "done", status, error: (r.error as string | null) ?? null };
+    }));
   }
 
-  /** The owner says something to the manager: logged, and owed to its inbox. */
-  async postChat(text: string): Promise<Result<{ seq: number; delivered: boolean }>> {
+  /**
+   * The owner says something to the manager: logged, and owed to its inbox. `requestId` is the page's for
+   * this message: posting it again (an answer lost on the way back) is the same message, not a second one.
+   */
+  async postChat(text: string, requestId?: string): Promise<Result<{ seq: number; delivered: boolean; status: OutboxState }>> {
     const s = this.settings();
     if (!s) return fail(404, "unknown project");
-    const seq = this.sql.exec<{ seq: number }>("INSERT INTO chat (at_ms, sender, text, next_ms) VALUES (?, 'owner', ?, ?) RETURNING seq", Date.now(), text, Date.now()).one().seq;
-    this.replyWaits("replied in chat");
+    const had = requestId ? this.sql.exec<{ seq: number }>("SELECT seq FROM chat WHERE request_id = ?", requestId).toArray()[0] : undefined;
+    const seq = had?.seq ?? this.sql.exec<{ seq: number }>("INSERT INTO chat (at_ms, sender, text, next_ms, request_id) VALUES (?, 'owner', ?, ?, ?) RETURNING seq", Date.now(), text, Date.now(), requestId ?? null).one().seq;
+    if (!had) {
+      this.replyWaits("replied in chat");
+      await this.arm();
+      await this.drain();
+    }
+    return ok(this.chatStatus(seq));
+  }
+
+  private chatStatus(seq: number): { seq: number; delivered: boolean; status: OutboxState } {
+    const status = outboxState(outboxRow(this.sql.exec("SELECT next_ms, attempts, error FROM chat WHERE seq = ?", seq).one()));
+    return { seq, delivered: status === "done", status };
+  }
+
+  /** The owner's Retry of a message nest refused for good: owed again, once however often it's asked (README.md#outboxes). */
+  async retryChat(seq: number): Promise<Result<{ seq: number; delivered: boolean; status: OutboxState }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const r = this.sql.exec("SELECT sender, next_ms, attempts, error FROM chat WHERE seq = ?", seq).toArray()[0];
+    if (!r || r.sender !== "owner") return fail(404, `no message ${seq} of yours`);
+    const st = outboxStep(outboxRow(r), { kind: "retry" }, Date.now(), OUTBOX.chat);
+    if (!st.ok) return fail(409, st.error);
+    this.saveOutbox("chat", "seq", seq, st.row);
     await this.arm();
     await this.drain();
-    const r = this.sql.exec("SELECT next_ms, error FROM chat WHERE seq = ?", seq).one();
-    return ok({ seq, delivered: r.next_ms === null && r.error === null });
+    return ok(this.chatStatus(seq));
   }
 
   async asks(): Promise<Result<Ask[]>> {
@@ -1846,6 +1919,8 @@ export class ProjectDO extends DurableObject<Env> {
           this.sql.exec("INSERT OR IGNORE INTO chat (at_ms, sender, text, event_id) VALUES (?, 'app', ?, ?)", Date.now(), `The manager ended (${e.reason ?? "exited"}).`, e.id);
         }
         if (route.role === "worker") this.workerExited(e.agent, e.reason, e.text);
+        // Ended, whatever its role: a stop owed for it (failed or not, a routine run's or a manager's) is done.
+        this.sql.exec("DELETE FROM stops WHERE agent = ?", e.agent);
         this.sql.exec("DELETE FROM agent_secrets WHERE agent = ?", e.agent);
         break;
       case "agent.ask":
@@ -2025,7 +2100,7 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** The page's view: the rules, and each live agent's layer (applied, pending or failed). */
-  async network(): Promise<Result<{ rules: RoleRules; rev: number; agents: LayerStatus[] }>> {
+  async network(): Promise<Result<{ rules: RoleRules; rev: number; agents: LayerStatus[]; failed_stops: FailedStop[] }>> {
     if (!this.settings()) return fail(404, "unknown project");
     const { rules, rev } = this.rules();
     const live = new Set(this.liveAgents().map((a) => a.agent));
@@ -2034,7 +2109,7 @@ export class ProjectDO extends DurableObject<Env> {
       state: r.error !== null && r.next_ms === null ? "failed" : r.rev === r.want_rev && r.next_ms === null ? "applied" : "pending",
       error: (r.error as string | null) ?? null, rev: (r.rev as number | null) ?? null, at_ms: (r.at_ms as number | null) ?? null,
     }));
-    return ok({ rules, rev, agents });
+    return ok({ rules, rev, agents, failed_stops: this.failedStops() });
   }
 
   /** The manager's sandbox, if known (the operator's base policy is read from it). */
@@ -2048,7 +2123,7 @@ export class ProjectDO extends DurableObject<Env> {
    * New rules (the caller checked them against the grant): stored with a new revision, and owed to
    * every live agent of a role whose rules changed, through its sandbox's client layer.
    */
-  async setNetwork(next: RoleRules): Promise<Result<{ rules: RoleRules; rev: number; agents: LayerStatus[] }>> {
+  async setNetwork(next: RoleRules): Promise<Result<{ rules: RoleRules; rev: number; agents: LayerStatus[]; failed_stops: FailedStop[] }>> {
     if (!this.settings()) return fail(404, "unknown project");
     const before = this.rules();
     const rules: RoleRules = { worker: normalizeRules(next.worker), manager: normalizeRules(next.manager) };
@@ -2167,7 +2242,6 @@ export class ProjectDO extends DurableObject<Env> {
         want, Date.now(), want, Date.now(), agent,
       );
     } catch (e) {
-      const attempts = (row.attempts as number) + 1;
       if (e instanceof NestError && e.status === 404) {
         this.sql.exec("DELETE FROM layers WHERE agent = ?", agent);
         return;
@@ -2192,9 +2266,9 @@ export class ProjectDO extends DurableObject<Env> {
           }
         }
       }
-      const permanent = e instanceof NestError && e.permanent;
-      this.sql.exec("UPDATE layers SET attempts = ?, error = ?, next_ms = ? WHERE agent = ? AND want_rev = ?",
-        attempts, message(e) + note, permanent ? null : Date.now() + backoff(attempts), agent, want);
+      // The outbox's verdict (README.md#outboxes): a refusal that will repeat is failed, shown, not retried.
+      const st = outboxStep(outboxRow(row), { kind: "failed", error: message(e) + note, permanent: verdict(e).permanent }, Date.now(), OUTBOX.layers);
+      if (st.ok) this.sql.exec("UPDATE layers SET attempts = ?, error = ?, next_ms = ? WHERE agent = ? AND want_rev = ?", st.row.attempts, st.row.error, st.row.next_ms, agent, want);
     }
   }
 
@@ -2227,7 +2301,10 @@ export class ProjectDO extends DurableObject<Env> {
       owed = true;
     }
     if ((was.issues ?? null) !== issues && (issues === "write" || issues === "admin")) {
-      this.sql.exec("UPDATE issue_closes SET next_ms = ?, attempts = 0 WHERE next_ms IS NULL AND closed_ms IS NULL", Date.now());
+      // Each failed one is asked again, as the owner's Retry would (README.md#outboxes).
+      for (const r of this.sql.exec("SELECT * FROM issue_closes WHERE next_ms IS NULL AND closed_ms IS NULL").toArray()) {
+        this.outbox("issue_closes", "task", r.task as string, r, { kind: "retry" }, OUTBOX.issue_closes);
+      }
       owed = true;
     }
     if (!owed) return;
@@ -3013,7 +3090,7 @@ export class ProjectDO extends DurableObject<Env> {
         SELECT manager_next_ms AS t FROM settings WHERE manager_next_ms IS NOT NULL AND attached_ms IS NOT NULL
         UNION ALL SELECT attach_next_ms FROM settings WHERE attach_next_ms IS NOT NULL
         UNION ALL SELECT start_next_ms FROM tasks WHERE state = 'assigned' AND start_next_ms IS NOT NULL
-        UNION ALL SELECT next_ms FROM stops
+        UNION ALL SELECT next_ms FROM stops WHERE failed_ms IS NULL
         UNION ALL SELECT next_ms FROM chat WHERE next_ms IS NOT NULL)`),
       // The manager's waits' deadlines, and client layers owed to live sandboxes.
       min(`SELECT MIN(t) AS t FROM (
@@ -3117,7 +3194,10 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT id FROM tasks WHERE state = 'assigned' AND start_next_ms IS NOT NULL AND start_next_ms <= ? ORDER BY ord", now).toArray()) {
       await this.startWorker(nest, r.id as string);
     }
-    for (const r of this.sql.exec("SELECT agent FROM stops WHERE next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
+    for (const r of this.sql.exec("SELECT agent FROM stops WHERE failed_ms IS NULL AND next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
+    // Ended rows past their queue's keep (README.md#outboxes): messages sent or failed a week ago (a failed stop is kept until resolved).
+    const msgs = pruneBefore(OUTBOX.messages, now);
+    if (msgs !== null) this.sql.exec("DELETE FROM messages WHERE next_ms IS NULL AND COALESCE(ended_ms, at_ms) < ?", msgs);
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT seq FROM messages WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverMessage(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT id FROM tasks WHERE notify_next_ms IS NOT NULL AND notify_next_ms <= ?", now).toArray()) await this.notifyWorker(nest, r.id as string);
@@ -3301,20 +3381,93 @@ export class ProjectDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * End an agent the app owes nest a stop of, and its sandbox (README.md#outboxes). Retried until it goes.
+   * Only nest's own refusal of the request (`stopRefused`) fails it, and a failed stop is never quiet: the
+   * agent may still be running, so it's shown (its task's history, the Network page, the manager told), its
+   * place stays counted, and it waits for the owner's Retry or Dismiss (`retryStop`, `dismissStop`), or for
+   * nest's word that the agent ended (`agent.exited`).
+   */
   private async stop(nest: Nest, agent: string): Promise<void> {
-    const row = this.sql.exec("SELECT task, reason, attempts FROM stops WHERE agent = ?", agent).toArray()[0];
+    const row = this.sql.exec("SELECT task, reason, next_ms, attempts, error FROM stops WHERE agent = ? AND failed_ms IS NULL", agent).toArray()[0];
     if (!row) return;
     try {
       await nest.stopAgent(agent, { end: true, destroySandbox: true, reason: row.reason as string });
     } catch (e) {
+      // Gone already (404): as good as stopped.
       if (!(e instanceof NestError && e.status === 404)) {
-        const attempts = (row.attempts as number) + 1;
-        this.sql.exec("UPDATE stops SET attempts = ?, next_ms = ?, error = ? WHERE agent = ?", attempts, Date.now() + backoff(attempts), message(e), agent);
+        const st = outboxStep(outboxRow(row), { kind: "failed", error: message(e), permanent: stopRefused(e) }, Date.now(), OUTBOX.stops);
+        if (!st.ok) return;
+        if (st.state === "failed") this.stopFailed(agent, row.task as string | null, row.reason as string, st.row);
+        else this.sql.exec("UPDATE stops SET attempts = ?, next_ms = ?, error = ? WHERE agent = ?", st.row.attempts, st.row.next_ms, st.row.error, agent);
         return;
       }
     }
     this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
-    // Its sandbox goes with it: nothing more is owed to its client layer.
+    this.stopped(agent);
+  }
+
+  /**
+   * A stop nest refused for good: kept until the agent is stopped, dismissed or exits (never pruned: its
+   * place stays counted meanwhile), and said everywhere it matters. Nothing in it is due before the owner
+   * acts, so the alarm never spins on it.
+   */
+  private stopFailed(agent: string, task: string | null, reason: string, r: OutboxRow): void {
+    const now = Date.now();
+    // Only while it's still owed: one whose agent exited during the try (its row gone) needs no word.
+    if (!this.sql.exec("UPDATE stops SET attempts = ?, error = ?, failed_ms = ?, next_ms = ? WHERE agent = ?", r.attempts, r.error, now, NOT_DUE_MS, agent).rowsWritten) return;
+    const what = `nest refused to stop ${agent} (${reason}): ${r.error}. It may still be running; it counts as live until it's stopped or dismissed.`;
+    this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, ?, ?, ?, 'stop_failed', ?)",
+      `stop/${agent}/${now}`, now, agent, task ? "worker" : null, task, what);
+    if (task) this.record(task, { kind: "app", what: "nest" }, "stop_failed", { agent, error: r.error });
+    const manager = this.settings()?.manager;
+    if (manager && manager !== agent) this.oweMessage(manager, `${what} The owner can retry or dismiss it on the Network page.`, false);
+  }
+
+  /** The owner's Retry of a stop nest refused: owed again now (asked again while it's owed, nothing changes). */
+  async retryStop(agent: string): Promise<Result<{ agent: string; state: OutboxState }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const r = this.sql.exec("SELECT task FROM stops WHERE agent = ?", agent).toArray()[0];
+    if (!r) return fail(404, `no stop of ${agent} is owed`);
+    if (this.sql.exec("UPDATE stops SET failed_ms = NULL, next_ms = ?, attempts = 0, error = NULL WHERE agent = ? AND failed_ms IS NOT NULL", Date.now(), agent).rowsWritten && r.task) {
+      this.record(r.task as string, { kind: "owner" }, "stop_retried", { agent });
+    }
+    await this.arm();
+    await this.drain();
+    const left = this.sql.exec("SELECT failed_ms, next_ms, attempts, error FROM stops WHERE agent = ?", agent).toArray()[0];
+    return ok({ agent, state: !left ? "done" : left.failed_ms !== null ? "failed" : outboxState(outboxRow(left)) });
+  }
+
+  /**
+   * The owner dismisses a stop nest refused (they've ended the agent themselves, or accept it running):
+   * the app stops counting it, and owes it nothing more.
+   */
+  async dismissStop(agent: string): Promise<Result<{ dismissed: string }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const r = this.sql.exec("SELECT task FROM stops WHERE agent = ? AND failed_ms IS NOT NULL", agent).toArray()[0];
+    if (!r) return fail(409, `no failed stop of ${agent}: only a stop nest refused is dismissed`);
+    this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
+    if (r.task) this.record(r.task as string, { kind: "owner" }, "stop_dismissed", { agent });
+    this.stopped(agent);
+    await this.arm();
+    return ok({ dismissed: agent });
+  }
+
+  /** The stops nest refused, for the Network page. */
+  private failedStops(): FailedStop[] {
+    return this.sql.exec(
+      `SELECT s.agent, s.task, s.reason, s.error, s.failed_ms, t.title AS task_title, ro.id AS routine_id, ro.name AS routine_name
+        FROM stops s LEFT JOIN tasks t ON t.id = s.task LEFT JOIN routine_runs ru ON ru.agent = s.agent LEFT JOIN routines ro ON ro.id = ru.routine
+        WHERE s.failed_ms IS NOT NULL ORDER BY s.failed_ms`,
+    ).toArray().map((r) => ({
+      agent: r.agent as string, task: (r.task as string | null) ?? null, task_title: (r.task_title as string | null) ?? null,
+      routine: r.routine_id ? { id: r.routine_id as string, name: r.routine_name as string } : null,
+      reason: r.reason as string, error: (r.error as string | null) ?? null, failed_ms: r.failed_ms as number,
+    }));
+  }
+
+  /** An agent the app stopped (or can't): nothing more is owed to its client layer, and a worker's place frees. */
+  private stopped(agent: string): void {
     this.sql.exec("DELETE FROM layers WHERE agent = ?", agent);
     // A worker that was no longer its task's own (the task is over, or its start failed): its place frees.
     const t = this.sql.exec("SELECT * FROM tasks WHERE assignee = ?", agent).toArray()[0];
@@ -3322,36 +3475,49 @@ export class ProjectDO extends DurableObject<Env> {
     this.autoAssign();
   }
 
+  /** Write a row's outbox columns back (README.md#outboxes). */
+  private saveOutbox(table: "chat" | "messages" | "issue_closes", key: "seq" | "task", id: number | string, r: OutboxRow): void {
+    this.sql.exec(`UPDATE ${table} SET next_ms = ?, attempts = ?, error = ? WHERE ${key} = ?`, r.next_ms, r.attempts, r.error, id);
+    // A message's end (sent or failed), which its pruning counts from.
+    if (table === "messages") this.sql.exec("UPDATE messages SET ended_ms = CASE WHEN next_ms IS NULL THEN COALESCE(ended_ms, ?) ELSE NULL END WHERE seq = ?", Date.now(), id);
+  }
+
+  /** Take `event` on a row of a queue and write it back, or nothing when the row can't take it. */
+  private outbox(table: "chat" | "messages" | "issue_closes", key: "seq" | "task", id: number | string, r: Row, event: OutboxEvent, policy: OutboxPolicy): OutboxState | null {
+    const st = outboxStep(outboxRow(r), event, Date.now(), policy);
+    if (!st.ok) return null;
+    this.saveOutbox(table, key, id, st.row);
+    return st.state;
+  }
+
   /** One message owed to an agent's inbox, posted once (its request id), retried until nest refuses it for good. */
   private async deliverMessage(nest: Nest, seq: number): Promise<void> {
-    const row = this.sql.exec("SELECT to_agent, text, relayed, attempts FROM messages WHERE seq = ? AND next_ms IS NOT NULL", seq).toArray()[0];
+    const row = this.sql.exec("SELECT to_agent, text, relayed, next_ms, attempts, error FROM messages WHERE seq = ? AND next_ms IS NOT NULL", seq).toArray()[0];
     if (!row) return;
     try {
       await nest.postInbox(row.to_agent as string, row.text as string, { requestId: `${this.settings()!.id}/message/${seq}`, ...(row.relayed === 1 ? { from: "projects/board" } : {}) });
-      this.sql.exec("UPDATE messages SET next_ms = NULL, error = NULL WHERE seq = ?", seq);
+      this.outbox("messages", "seq", seq, row, { kind: "sent" }, OUTBOX.messages);
     } catch (e) {
-      const attempts = (row.attempts as number) + 1;
-      const next = e instanceof NestError && e.permanent ? null : Date.now() + backoff(attempts);
-      this.sql.exec("UPDATE messages SET attempts = ?, next_ms = ?, error = ? WHERE seq = ?", attempts, next, message(e), seq);
+      this.outbox("messages", "seq", seq, row, { kind: "failed", ...verdict(e) }, OUTBOX.messages);
     }
   }
 
   private async deliverChat(nest: Nest, seq: number): Promise<void> {
     const s = this.settings()!;
-    const row = this.sql.exec("SELECT text, attempts FROM chat WHERE seq = ? AND next_ms IS NOT NULL", seq).toArray()[0];
+    const row = this.sql.exec("SELECT text, next_ms, attempts, error FROM chat WHERE seq = ? AND next_ms IS NOT NULL", seq).toArray()[0];
     if (!row) return;
+    // Nothing to send it to yet: still being sent (retrying, with why), never failed for it.
     if (!s.manager) {
-      this.sql.exec("UPDATE chat SET next_ms = ?, error = 'the manager isn''t started yet' WHERE seq = ?", Date.now() + backoff(1), seq);
+      this.outbox("chat", "seq", seq, row, { kind: "wait", error: "the manager isn't started yet" }, OUTBOX.chat);
       return;
     }
+    // Once per message (its request id), however often it's tried.
     try {
       await nest.postInbox(s.manager, row.text as string, { requestId: `${s.id}/chat/${seq}` });
-      this.sql.exec("UPDATE chat SET next_ms = NULL, error = NULL, to_agent = ? WHERE seq = ?", s.manager, seq);
+      if (this.outbox("chat", "seq", seq, row, { kind: "sent" }, OUTBOX.chat)) this.sql.exec("UPDATE chat SET to_agent = ? WHERE seq = ?", s.manager, seq);
     } catch (e) {
-      // Refused for good (the manager ended): kept in the log, undelivered, with the reason.
-      const attempts = (row.attempts as number) + 1;
-      const next = e instanceof NestError && e.permanent ? null : Date.now() + backoff(attempts);
-      this.sql.exec("UPDATE chat SET attempts = ?, next_ms = ?, error = ? WHERE seq = ?", attempts, next, message(e), seq);
+      // Refused for good (the manager ended): kept in the log, failed, with the reason and Retry.
+      this.outbox("chat", "seq", seq, row, { kind: "failed", ...verdict(e) }, OUTBOX.chat);
     }
   }
 }
