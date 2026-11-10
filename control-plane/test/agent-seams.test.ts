@@ -10,7 +10,7 @@ import { verifyBinding } from "../src/lib/binding";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { expandTemplate, SEED_CATALOG } from "../src/lib/spec";
 import { b64urlToBytes } from "../src/lib/util";
-import { adminJson, connectHost, eventually, hostHello, inboundSettled, nextCommands, okResult, runDue, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
+import { admin, adminJson, connectHost, eventually, hostHello, inboundSettled, nextCommands, okResult, runDue, sendEvents, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
@@ -219,6 +219,28 @@ describe("the agent epoch is AgentDO's, not the sandbox's", () => {
     await s.host.ws.next("ack", (m) => m.up_to >= seq);
     await runDeadline(s.agent, "intent");
     expect((await nextCommands(s.host.ws, isStartOf(s.agent))).find(isStartOf(s.agent))).toMatchObject({ epoch: 2 });
+  });
+
+  it("a restart that couldn't start a brain (a launch stored before the rule) is refused with why, and the running brain keeps running", async () => {
+    const s = await setup();
+    const ws = await runner(s.agent, s.host.host, s.host.host_token, "rin_one", 1);
+    await editAgent(s.agent, (i) => {
+      i.launch.model = "-p";
+    });
+    const res = await admin(`/v1/agents/${s.agent}/start`, { method: "POST", body: { restart: true } });
+    expect(res.status).toBe(400);
+    expect(JSON.stringify(await res.json())).toContain("launch.model");
+    expect(await s.host.ws.none("commands", 150, (m) => (m.commands as any[]).some((c) => c.type === "agent_start" || c.type === "agent_stop"))).toBe(true);
+    const after: any = await agentStub(s.agent).info();
+    expect(after).toMatchObject({ agent_epoch: 1, brain: { host: s.host.host, epoch: 1 } });
+    expect(after.brain.phase).not.toBe("condemned");
+    // The refused restart is over: nothing is left to run at the brain's exit, and the agent isn't errored.
+    expect(after.intent ?? null).toBeNull();
+    expect(after.lifecycle).not.toBe("errored");
+    expect(after.start_error ?? null).toBeNull();
+    // Its turns still reach the brain.
+    const t = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "still here" } }, 201)).turn;
+    await ws.next("run_turn", (m) => m.turn === t);
   });
 
   it("old stored state (main): hands.epoch becomes the agent epoch, and `host` the brain record", async () => {
