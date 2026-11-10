@@ -42,3 +42,4 @@ SlotFollowups.tla MCSlotsFixed.cfg holds ci
 SlotFollowups.tla MCSlotsFixedFollowups.cfg holds ci
 SlotFollowups.tla MCSlotsFixedHands.cfg holds full
 SlotFollowups.tla MCSlotsFixedPlaced.cfg holds full
+SlotFollowups.tla MCSlotsFixedBig.cfg holds full

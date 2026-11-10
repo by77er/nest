@@ -48,7 +48,7 @@ Each `.cfg` starts with a comment saying what it sets and what to expect.
 
 Properties: `BindingOnlyConfirmed` (a binding at epoch e only for an attach confirmed at e), `BindingConfigured` (only for a slot the guest at that placement configured), and, under weak fairness on every step that isn't a fault, a move or a client call (faults bounded, unfair), `FollowupsDone` (every recorded result's follow-up runs, none stays owed), `HandsEventually` (the slot is confirmed at the placement that lasts) and `PlacedDone` (that placement's follow-ups run).
 
-Bounds: hosts h1, h2; epochs ≤ 3 (so two moves), commands ≤ 3, and at most one of each fault (FleetDO reset, SandboxDO reset, failed call, throw). `MCSlotsFixedBig` doubles the faults and allows a third move.
+Bounds: hosts h1, h2; epochs ≤ 3 (so two moves), commands ≤ 3, and at most one of each fault (FleetDO reset, SandboxDO reset, failed call, throw). `MCSlotsFixedBig` doubles the faults (the same with a third move as well did not finish in 35 minutes and isn't kept).
 
 | Config | What | Expected |
 |---|---|---|
@@ -60,6 +60,6 @@ Bounds: hosts h1, h2; epochs ≤ 3 (so two moves), commands ≤ 3, and at most o
 | MCSlotsReachRerun, ReachCut, ReachMovedBind | reachability: a follow-up left to the deadline; a placement's follow-ups cut; a binding after a move | violates NoRerun, NoCut, NoMovedBind (not vacuous) |
 | MCSlotsFixed | both fixes | holds (1,363,140 states, 12 s) |
 | MCSlotsFixedFollowups, Hands, Placed | both fixes, one liveness property each | holds (1,363,140 states, 42-50 s each) |
-| MCSlotsFixedBig | both fixes; epochs ≤ 4, two of each fault | see expect.tsv |
+| MCSlotsFixedBig | both fixes; epochs ≤ 3, two of each fault | holds (12,459,894 states, 110 s) |
 
 Two further mutations of the spec, run by hand and not kept: `Deliver` without its epoch check violates BindingOnlyConfirmed; `Move` resetting `pending` but not the in-flight command violates HandsEventually.
