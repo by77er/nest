@@ -2,7 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import {
-  INBOX_EVENTS, INBOX_STATUSES, inboxStep, moveNoteDue, recoveryInput, TURN_EVENTS, TURN_STATUSES, TurnQueue, type TurnStatus, turnStep,
+  INBOX_EVENTS, INBOX_STATUSES, inboxStep, moveNoteDue, recoveryInput, TURN_EVENTS, TURN_STATUSES, TurnQueue, type TurnStatus, turnStep, inboxTurnText,
 } from "../src/lib/turns";
 import type { InboxMessage } from "../src/protocol/control";
 
@@ -220,6 +220,12 @@ describe("TurnQueue holds every write to the step", () => {
       expect(by.waiting).toBe("active");
       expect(q.mirrored().map((m) => m.id)).toEqual(["m-live", "m-new"]);
       expect(sql.exec("SELECT 1 FROM inbox WHERE id = 'm-stale'").toArray()).toHaveLength(0);
+      // The message nobody was shown isn't lost: it is a queued turn now, as one unconfirmed at a turn's end is.
+      const requeued = q.list().filter((t) => t.status === "queued" && t.input.kind === "inbox");
+      expect(requeued.map((t) => t.input.text)).toEqual([inboxTurnText(msg("m-stale", "to a turn long gone"))]);
+      // Once: a second prune finds nothing more to requeue.
+      q.prune(cutoff, current);
+      expect(q.list().filter((t) => t.input.kind === "inbox")).toHaveLength(1);
     });
   });
 });
