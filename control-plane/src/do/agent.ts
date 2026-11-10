@@ -3019,10 +3019,11 @@ export class AgentDO extends DurableObject<Env> {
     return verdict;
   }
 
-  private finishCall(epoch: number, call: string, outcome: ToolOutcome): void {
-    // A call that already has its outcome (finished, or cancelled by the runner) keeps it: nothing more is sent.
-    if (!this.calls.finish(epoch, call, outcome)) return;
+  /** Whether the result was sent: a call that already has its outcome (finished, or cancelled by the runner), or has no row, keeps what it has and nothing is sent. */
+  private finishCall(epoch: number, call: string, outcome: ToolOutcome): boolean {
+    if (!this.calls.finish(epoch, call, outcome)) return false;
     this.pushReliable((seq) => ({ type: "tool_result", seq, call, outcome }));
+    return true;
   }
 
   /**
@@ -3292,15 +3293,15 @@ export class AgentDO extends DurableObject<Env> {
     let r: Awaited<ReturnType<typeof api.request>> = { kind: "lost", why: "not sent" };
     for (let attempt = 1; attempt <= 2 && r.kind !== "ok" && !(r.kind === "refused"); attempt++) {
       await live();
-      this.journal.sending(row);
+      const settled = this.journalSend(row);
+      if (settled) return settled;
       r = await api.request(token, "POST", `/repos/${upstream}/forks`, { default_branch_only: true });
     }
     if (r.kind !== "ok") {
       if (r.kind === "lost") return this.unknownOutcome(row, `github.fork ${upstream}: ${r.why}`);
       const e = ghError(r, "github.fork");
       const outcome: ToolOutcome = { status: "error", error: e.body() };
-      this.journal.settle(row, "failed", outcome, e.detail);
-      return outcome;
+      return this.journalSettle(row, "failed", outcome, e.detail);
     }
     const j = (r.json ?? {}) as { full_name?: unknown; html_url?: unknown; default_branch?: unknown; parent?: { default_branch?: unknown } };
     const fork = typeof j.full_name === "string" && Repo.safeParse(j.full_name).success ? j.full_name.toLowerCase() : null;
@@ -3312,8 +3313,7 @@ export class AgentDO extends DurableObject<Env> {
     const outcome: ToolOutcome = {
       status: "ok", content: [{ type: "text", text: `Forked ${upstream} to ${fork}${info.hands ? "; it's on your sandbox's push allowlist" : ""}.` }, { type: "json", value }],
     };
-    this.journal.settle(row, "done", outcome, fork);
-    return outcome;
+    return this.journalSettle(row, "done", outcome, fork);
   }
 
   /** A `github.*` action with an installation token narrowed to its repo and permissions (BrokerDO). */
@@ -3326,8 +3326,7 @@ export class AgentDO extends DurableObject<Env> {
     const made = (m: GhMade): ToolOutcome => {
       const what = m.existing ? `Already open: ${m.url}` : `Done: ${m.url}`;
       const outcome: ToolOutcome = { status: "ok", content: [{ type: "text", text: what }, { type: "json", value: m }] };
-      this.journal.settle(row, "done", outcome, JSON.stringify(m));
-      return outcome;
+      return this.journalSettle(row, "done", outcome, JSON.stringify(m));
     };
     const look = async (): Promise<GhMade | null | "unreadable"> => {
       const r = await api.request(token, "GET", stateQuery(action, a));
@@ -3342,7 +3341,8 @@ export class AgentDO extends DurableObject<Env> {
     }
     const req = actionRequest(action, a, kd);
     await live();
-    this.journal.sending(row);
+    const settled = this.journalSend(row);
+    if (settled) return settled;
     const r = await api.request(token, req.method, req.path, req.body);
     if (r.kind === "ok") {
       const m = createdOf(r.json);
@@ -3357,16 +3357,34 @@ export class AgentDO extends DurableObject<Env> {
     }
     const e = ghError(r, action);
     const outcome: ToolOutcome = { status: "error", error: e.body() };
-    this.journal.settle(row, "failed", outcome, e.detail);
-    return outcome;
+    return this.journalSettle(row, "failed", outcome, e.detail);
   }
 
   private unknownOutcome(row: JournalRow, why: string): ToolOutcome {
     const outcome: ToolOutcome = {
       status: "error", error: errorBody(ErrorCodes.OUTCOME_UNKNOWN, `${why}; it may or may not have taken effect. Check before calling again.`),
     };
-    this.journal.settle(row, "unknown", outcome, why);
-    return outcome;
+    return this.journalSettle(row, "unknown", outcome, why);
+  }
+
+  /**
+   * Settle a brokered call in its journal. The outcome that stands: this one, or the one the row already
+   * had (another delivery of the call settled it first; `journalStep` keeps a settled row).
+   */
+  private journalSettle(row: JournalRow, status: "done" | "failed" | "unknown", outcome: ToolOutcome, detail: string): ToolOutcome {
+    if (this.journal.settle(row, status, outcome, detail)) return outcome;
+    return this.journal.get(row.key)?.outcome ?? outcome;
+  }
+
+  /**
+   * The write-ahead record of an attempt, in the step the request leaves in. Null: recorded, send it.
+   * Otherwise the call settled meanwhile (another delivery of it): its outcome, and nothing is sent.
+   */
+  private journalSend(row: JournalRow): ToolOutcome | null {
+    if (this.journal.sending(row)) return null;
+    const settled = this.journal.get(row.key);
+    if (settled?.outcome) return settled.outcome;
+    throw secretRefusal("a credential");
   }
 
   /**
@@ -3402,7 +3420,8 @@ export class AgentDO extends DurableObject<Env> {
     let why = "";
     for (let attempt = 1; attempt <= 2; attempt++) {
       await live();
-      this.journal.sending(row);
+      const settled = this.journalSend(row);
+      if (settled) return settled;
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), timeoutMs);
       try {
@@ -3417,8 +3436,7 @@ export class AgentDO extends DurableObject<Env> {
           ...(text.truncated ? { truncated: true } : {}),
         };
         const outcome: ToolOutcome = { status: "ok", content: [{ type: "text", text: text.text }, { type: "json", value }] };
-        this.journal.settle(row, "done", outcome, `HTTP ${res.status}`);
-        return outcome;
+        return this.journalSettle(row, "done", outcome, `HTTP ${res.status}`);
       } catch (e) {
         why = ctl.signal.aborted ? `no answer within ${timeoutMs} ms` : `network: ${e instanceof Error ? e.message : String(e)}`;
       } finally {
@@ -3577,10 +3595,10 @@ export class AgentDO extends DurableObject<Env> {
     if (row.status === "sync") {
       // Its result if its brain still waits, else ended unsent (the answer becomes a turn).
       const outcome: ToolOutcome = { status: "ok", content: [{ type: "text", text: answer }] };
-      if (route === "result") this.finishCall(row.epoch, row.call, outcome);
-      else this.calls.finish(row.epoch, row.call, outcome);
+      // Not sent (its call is gone, or already has an outcome): the answer isn't lost, it comes as a turn.
+      const sent = route === "result" ? this.finishCall(row.epoch, row.call, outcome) : (this.calls.finish(row.epoch, row.call, outcome), false);
       await this.deadlines.clear(`${ASK_DEADLINE}${ask}`);
-      if (route === "result") return "sync";
+      if (sent) return "sync";
     }
     await this.enqueueTurn({ kind: "ask_answer", text: `Answer to your question ${ask}: ${answer}` });
     return "async";

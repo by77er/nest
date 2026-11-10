@@ -62,7 +62,23 @@ export interface McpConnector {
 
 /** `mcp_forwards.status`: sent and not yet settled, or settled (answered, refused, or given up on). */
 const ForwardStatus = z.enum(["forwarded", "settled"]);
-type ForwardStatus = z.output<typeof ForwardStatus>;
+export type ForwardStatus = z.output<typeof ForwardStatus>;
+export const FORWARD_STATUSES = ForwardStatus.options;
+
+/** What happens to a forward: an attempt leaves (`forward`), it gets its outcome (`settle`), or it never did and is given up on by age (`abandon`). */
+export const FORWARD_EVENTS = ["forward", "settle", "abandon"] as const;
+export type ForwardEvent = (typeof FORWARD_EVENTS)[number];
+
+/**
+ * The forward ledger's one step (`none`: no row yet): the status after `event`, or `refuse`. `settled` is
+ * final: a settled call keeps its outcome and is never sent again. Nothing settles before it was
+ * forwarded. Every write to `mcp_forwards.status` goes through it.
+ */
+export function forwardStep(status: ForwardStatus | "none", event: ForwardEvent): ForwardStatus | "refuse" {
+  if (status === "none") return event === "forward" ? "forwarded" : "refuse";
+  if (status === "forwarded") return event === "forward" ? "forwarded" : "settled";
+  return "refuse";
+}
 
 export interface ProxyDeps {
   sql: SqlStorage;
@@ -336,16 +352,27 @@ export class McpProxy {
     };
   }
 
-  /** Written before the request leaves (write-ahead): an incarnation that dies mid-call leaves this row. */
-  private recordForward(ctx: CallContext, g: McpGrant, tool: string, attempts: number): void {
+  /**
+   * Written before the request leaves (write-ahead): an incarnation that dies mid-call leaves this row.
+   * False when the call settled already (another delivery of it finished meanwhile): nothing is recorded
+   * and the caller sends nothing.
+   */
+  private recordForward(ctx: CallContext, g: McpGrant, tool: string, attempts: number): boolean {
+    const to = forwardStep(this.forward(ctx.key)?.status ?? "none", "forward");
+    if (to === "refuse") return false;
     this.d.sql.exec(`INSERT INTO mcp_forwards (key, epoch, capability, tool, status, attempts, deadline, outcome, created_ms)
-      VALUES (?, ?, ?, ?, 'forwarded', ?, ?, NULL, ?)
-      ON CONFLICT(key) DO UPDATE SET status = 'forwarded', attempts = excluded.attempts, deadline = excluded.deadline`,
-    ctx.key, ctx.epoch, g.capability, tool, attempts, Date.now() + this.d.callTimeoutMs, Date.now());
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+      ON CONFLICT(key) DO UPDATE SET status = excluded.status, attempts = excluded.attempts, deadline = excluded.deadline`,
+    ctx.key, ctx.epoch, g.capability, tool, to, attempts, Date.now() + this.d.callTimeoutMs, Date.now());
+    return true;
   }
 
-  private settle(key: string, o: McpCallOutcome): McpCallOutcome {
-    this.d.sql.exec("UPDATE mcp_forwards SET status = 'settled', outcome = ? WHERE key = ?", JSON.stringify(o), key);
+  /** The call's outcome, once (`forwardStep`). The outcome that stands: `o`, or the one the row already had. */
+  private settle(key: string, o: McpCallOutcome, event: ForwardEvent = "settle"): McpCallOutcome {
+    const row = this.forward(key);
+    const to = forwardStep(row?.status ?? "none", event);
+    if (to === "refuse") return row?.outcome ?? o;
+    this.d.sql.exec("UPDATE mcp_forwards SET status = ?, outcome = ? WHERE key = ?", to, JSON.stringify(o), key);
     return o;
   }
 
@@ -466,7 +493,8 @@ export class McpProxy {
       // From here to the request leaving there is no await: the epoch was current when it left, and the
       // identity and `_meta` name the same epoch and taint.
       attempts++;
-      this.recordForward(ctx, g, tool, attempts);
+      // Settled while this delivery waited (another delivery of the call finished): its outcome, nothing sent.
+      if (!this.recordForward(ctx, g, tool, attempts)) return this.forward(ctx.key)!.outcome!;
       const meta = { "nest/agent": ctx.agent, "nest/epoch": ctx.epoch, "nest/call": ctx.key, "nest/taint": tainted };
       const a = await rpc(this.url(g), { id: 100 + attempts, method: "tools/call", params: { name: tool, arguments: args, _meta: meta } },
         { token: bearer.value, session: s.session, version: s.version, timeoutMs: this.d.callTimeoutMs, identity });
@@ -519,7 +547,14 @@ export class McpProxy {
     }
   }
 
+  /**
+   * Settled rows older than `cutoff` go. A forward still unsettled that long after it left can't settle
+   * on its own (its deadline passed long ago and no newer epoch waited on it): it is settled as unknown
+   * first (`abandon`), then goes with the rest.
+   */
   prune(cutoff: number): void {
+    const stale = this.d.sql.exec<{ key: string }>("SELECT key FROM mcp_forwards WHERE status = 'forwarded' AND created_ms < ?", cutoff).toArray();
+    for (const r of stale) this.settle(r.key, unknown("the answer never came (given up on by age)"), "abandon");
     this.d.sql.exec("DELETE FROM mcp_forwards WHERE status = 'settled' AND created_ms < ?", cutoff);
   }
 }

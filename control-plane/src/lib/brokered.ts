@@ -8,7 +8,8 @@ import { z } from "zod";
 import type { ToolDef, ToolOutcome } from "../protocol/control";
 import { storedEnum } from "./stored";
 import type { WhenTainted } from "./sinks";
-import { sha256, hex } from "./util";
+import { ErrorCodes } from "../protocol/model";
+import { errorBody, sha256, hex } from "./util";
 
 // --- The registry ------------------------------------------------------------------------------------
 
@@ -414,6 +415,30 @@ export function secretKinds(strings: readonly string[]): string[] {
 /** `brokered_journal.status`: on its way out, settled (done, failed at the provider, outcome unknown), or refused before it left. */
 const JournalStatus = z.enum(["sending", "done", "failed", "unknown", "refused"]);
 export type JournalStatus = z.output<typeof JournalStatus>;
+export const JOURNAL_STATUSES = JournalStatus.options;
+
+/**
+ * What happens to a brokered call: an attempt leaves (`send`), it settles (`done`, `fail`, `unknown`), it is
+ * refused before it left (`refuse`), or it never settled and is given up on by age (`abandon`, the prune).
+ */
+export const JOURNAL_EVENTS = ["send", "done", "fail", "unknown", "refuse", "abandon"] as const;
+export type JournalEvent = (typeof JOURNAL_EVENTS)[number];
+
+/**
+ * The journal's one step: the status after `event`, or `refuse` when it doesn't apply there (`none`: no
+ * row yet). Every write to `brokered_journal.status` goes through it.
+ * - `done`, `failed` and `refused` are final: a settled call is never sent again, and keeps its outcome.
+ * - `unknown` may still become `done` or `failed` (another delivery of the call learned what happened); it
+ *   is never sent again.
+ * - A call can settle with no attempt recorded (a pull request that was already open).
+ */
+export function journalStep(status: JournalStatus | "none", event: JournalEvent): JournalStatus | "refuse" {
+  const settled = event === "done" ? "done" : event === "fail" ? "failed" : event === "unknown" ? "unknown" : null;
+  if (status === "none") return event === "send" ? "sending" : event === "refuse" ? "refused" : settled ?? "refuse";
+  if (status === "sending") return event === "send" ? "sending" : event === "abandon" ? "unknown" : settled ?? "refuse";
+  if (status === "unknown") return event === "done" || event === "fail" ? settled! : "refuse";
+  return "refuse";
+}
 
 /** One journal row as the operator reads it (`GET /v1/agents/:agent/brokered`). */
 export interface JournalEntry {
@@ -452,26 +477,48 @@ export class BrokeredJournal {
     return r ? { ...this.row(r), outcome: r.outcome ? JSON.parse(String(r.outcome)) as ToolOutcome : null } : undefined;
   }
 
-  /** Write-ahead: recorded `sending` (an attempt more) in the same synchronous step as the request leaves. */
-  sending(e: JournalRow): void {
-    this.sql.exec(`INSERT INTO brokered_journal (key, action, target, idem, digest, args, status, attempts, tainted, created_ms)
-      VALUES (?, ?, ?, ?, ?, ?, 'sending', 1, ?, ?) ON CONFLICT(key) DO UPDATE SET attempts = attempts + 1, status = 'sending'`,
-      e.key, e.action, e.target, e.idem, e.digest, clipArgs(e.args), e.tainted ? 1 : 0, Date.now());
+  /** The row's status, or `none`. */
+  private status(key: string): JournalStatus | "none" {
+    const r = this.sql.exec<{ status: string }>("SELECT status FROM brokered_journal WHERE key = ?", key).toArray()[0];
+    return r ? storedEnum(JournalStatus, r.status, "brokered_journal.status") : "none";
   }
 
-  /** What the call came to (a row for it if it never went out: a pull request that was already open). */
-  settle(e: JournalRow, status: "done" | "failed" | "unknown", outcome: ToolOutcome, detail: string): void {
+  /**
+   * Write-ahead: recorded `sending` (an attempt more) in the same synchronous step as the request leaves.
+   * False when the call has settled already (another delivery of it finished meanwhile): nothing is
+   * recorded and the caller sends nothing.
+   */
+  sending(e: JournalRow): boolean {
+    const to = journalStep(this.status(e.key), "send");
+    if (to === "refuse") return false;
+    this.sql.exec(`INSERT INTO brokered_journal (key, action, target, idem, digest, args, status, attempts, tainted, created_ms)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?) ON CONFLICT(key) DO UPDATE SET attempts = attempts + 1, status = excluded.status`,
+      e.key, e.action, e.target, e.idem, e.digest, clipArgs(e.args), to, e.tainted ? 1 : 0, Date.now());
+    return true;
+  }
+
+  /**
+   * What the call came to (a row for it if it never went out: a pull request that was already open).
+   * False when the row keeps what it has: a settled call keeps its outcome (`journalStep`).
+   */
+  settle(e: JournalRow, status: "done" | "failed" | "unknown", outcome: ToolOutcome, detail: string): boolean {
+    const to = journalStep(this.status(e.key), status === "done" ? "done" : status === "failed" ? "fail" : "unknown");
+    if (to === "refuse") return false;
     this.sql.exec(`INSERT INTO brokered_journal (key, action, target, idem, digest, args, status, attempts, outcome, detail, tainted, created_ms, settled_ms)
       VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
       ON CONFLICT(key) DO UPDATE SET status = excluded.status, outcome = excluded.outcome, detail = excluded.detail, settled_ms = excluded.settled_ms`,
-    e.key, e.action, e.target, e.idem, e.digest, clipArgs(e.args), status, JSON.stringify(outcome), detail.slice(0, 2000), e.tainted ? 1 : 0, Date.now(), Date.now());
+    e.key, e.action, e.target, e.idem, e.digest, clipArgs(e.args), to, JSON.stringify(outcome), detail.slice(0, 2000), e.tainted ? 1 : 0, Date.now(), Date.now());
+    return true;
   }
 
-  /** Refused before it left (a credential in the arguments): the arguments aren't kept. */
-  refuse(e: Pick<JournalEntry, "key" | "action" | "target" | "idem" | "digest" | "tainted">, why: string): void {
-    this.sql.exec(`INSERT OR IGNORE INTO brokered_journal (key, action, target, idem, digest, args, status, attempts, detail, tainted, created_ms, settled_ms)
-      VALUES (?, ?, ?, ?, ?, '(withheld)', 'refused', 0, ?, ?, ?, ?)`, e.key, e.action, e.target, e.idem, e.digest, why.slice(0, 2000), e.tainted ? 1 : 0,
+  /** Refused before it left (a credential in the arguments): the arguments aren't kept. Only a call with no row yet. */
+  refuse(e: Pick<JournalEntry, "key" | "action" | "target" | "idem" | "digest" | "tainted">, why: string): boolean {
+    const to = journalStep(this.status(e.key), "refuse");
+    if (to === "refuse") return false;
+    this.sql.exec(`INSERT INTO brokered_journal (key, action, target, idem, digest, args, status, attempts, detail, tainted, created_ms, settled_ms)
+      VALUES (?, ?, ?, ?, ?, '(withheld)', ?, 0, ?, ?, ?, ?)`, e.key, e.action, e.target, e.idem, e.digest, to, why.slice(0, 2000), e.tainted ? 1 : 0,
     Date.now(), Date.now());
+    return true;
   }
 
   /** How many of `action`'s calls went out (or are going) since `sinceMs`: what the hourly cap counts. */
@@ -493,8 +540,24 @@ export class BrokeredJournal {
       Math.max(1, Math.min(limit, 500))).toArray().map((r) => this.row(r));
   }
 
-  prune(cutoff: number): void {
-    this.sql.exec("DELETE FROM brokered_journal WHERE status != 'sending' AND created_ms < ?", cutoff);
+  /**
+   * Settled rows go once they settled before `cutoff`. A row still `sending` that long after its first
+   * attempt can't settle on its own (the delivery that would is long gone): it is given up on as
+   * `unknown` (`abandon`), which the operator can then read for as long again before it goes.
+   */
+  prune(cutoff: number, now = Date.now()): void {
+    const outcome: ToolOutcome = {
+      status: "error", error: errorBody(ErrorCodes.OUTCOME_UNKNOWN, "the action never settled; it may or may not have taken effect. Check before calling again."),
+    };
+    for (const from of JOURNAL_STATUSES) {
+      const to = journalStep(from, "abandon");
+      if (to !== "refuse") {
+        this.sql.exec("UPDATE brokered_journal SET status = ?, outcome = ?, detail = ?, settled_ms = ? WHERE status = ? AND created_ms < ?",
+          to, JSON.stringify(outcome), "never settled: given up on by age", now, from, cutoff);
+      }
+    }
+    const open = JOURNAL_STATUSES.filter((st) => journalStep(st, "abandon") !== "refuse");
+    this.sql.exec(`DELETE FROM brokered_journal WHERE status NOT IN (${open.map((st) => `'${st}'`).join(", ")}) AND COALESCE(settled_ms, created_ms) < ?`, cutoff);
   }
 
   private row(r: Record<string, SqlStorageValue>): JournalEntry {

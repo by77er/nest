@@ -3,9 +3,7 @@
 
 import { z } from "zod";
 import type { ToolOutcome } from "../protocol/control";
-import { ErrorCodes } from "../protocol/model";
 import { addColumn, storedEnum } from "./stored";
-import { errorBody } from "./util";
 
 // Closed unions for the status columns (docs/data/#enums), checked on read (`storedEnum`).
 /** `tool_calls.status`: running (re-run if redelivered after an eviction), waiting on an ask, or finished. */
@@ -28,16 +26,16 @@ const APPROVAL = ApprovalStatusEnum.enum;
 
 /**
  * What happens to a call: it waits on an ask (`wait`), gets its outcome (`finish`), is given up by the
- * runner (`cancel`), or never finished and is settled by age (`abandon`, the prune).
+ * runner (`cancel`). (One that never finished is deleted by age, with the rest: `prune`.)
  */
-export const CALL_EVENTS = ["wait", "finish", "cancel", "abandon"] as const;
+export const CALL_EVENTS = ["wait", "finish", "cancel"] as const;
 export type CallEvent = (typeof CALL_EVENTS)[number];
 export const CALL_STATUSES = CallStatusEnum.options;
 
 /**
  * The call ledger's one step: the status after `event`, or `refuse` when it doesn't apply there. `done`
  * is final: a finished call keeps its outcome whatever comes later (a second finish, a cancel). Every
- * write to `tool_calls.status` goes through it (`CallLedger.applyCall`).
+ * change of `tool_calls.status` goes through it (`CallLedger.applyCall`).
  */
 export function callStep(status: CallStatus, event: CallEvent): CallStatus | "refuse" {
   if (status === "dispatching") return event === "wait" ? "waiting" : "done";
@@ -266,16 +264,15 @@ export class CallLedger {
   }
 
   /**
-   * Rows older than `cutoff` go once final. Rows that can't become final on their own are settled first,
-   * by age, so none stays for ever: a call still dispatching or waiting that long never got an outcome
-   * (its brain is long gone) and ends `outcome_unknown`; an ask a previous release's call or guest CLI
-   * was waiting inside is answered as a turn like any other. An open ask, and the pending approval it
-   * decides, is the operator's work still to do: it stays until answered.
+   * Rows older than `cutoff` go. A call of that age goes whatever its status: one still dispatching or
+   * waiting can't finish on its own (its brain is long gone), so it is deleted with the finished ones. An
+   * ask a previous release's call or guest CLI was waiting inside is first made an open ask like any
+   * other. An open ask, and the pending approval it decides, is the operator's work still to do: it
+   * stays until answered.
    */
   prune(cutoff: number): void {
-    this.applyCall("abandon", { status: "error", error: errorBody(ErrorCodes.OUTCOME_UNKNOWN, "the call never finished; whether it ran is unknown") }, "created_ms < ?", cutoff);
     this.applyAsk("detach", null, "created_ms < ?", cutoff);
-    this.sql.exec(`DELETE FROM tool_calls WHERE status = '${CALL.done}' AND created_ms < ?`, cutoff);
+    this.sql.exec("DELETE FROM tool_calls WHERE created_ms < ?", cutoff);
     this.sql.exec(`DELETE FROM asks WHERE status = '${ASK.answered}' AND created_ms < ?`, cutoff);
     this.sql.exec(`DELETE FROM approvals WHERE status != '${APPROVAL.pending}' AND created_ms < ?`, cutoff);
   }

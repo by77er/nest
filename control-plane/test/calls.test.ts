@@ -5,7 +5,10 @@ import {
   APPROVAL_EVENTS, APPROVAL_STATUSES, approvalStep, approvalUsable, ASK_EVENTS, ASK_STATUSES, askRoute, askStep, CALL_EVENTS, CALL_STATUSES, CallLedger, callStep,
 } from "../src/lib/calls";
 import type { ToolOutcome } from "../src/protocol/control";
-import { adminJson, connectHost, uniqueCell } from "./helpers";
+import { JOURNAL_EVENTS, JOURNAL_STATUSES, journalStep } from "../src/lib/brokered";
+import { FORWARD_EVENTS, FORWARD_STATUSES, forwardStep } from "../src/lib/mcp-proxy";
+import { INBOX_EVENTS, INBOX_STATUSES, inboxStep, TURN_EVENTS, TURN_STATUSES, turnStep } from "../src/lib/turns";
+import { adminJson, connectHost, nextCommands, uniqueCell } from "./helpers";
 
 /** A fresh ledger on a real Durable Object's SQLite (an AgentDO's storage: its own ledger's tables). */
 async function withLedger<T>(f: (l: CallLedger, sql: SqlStorage) => T): Promise<T> {
@@ -68,9 +71,9 @@ describe("the ledgers' steps: every status and event, and nothing leaves a final
   it("callStep", () => {
     const table = Object.fromEntries(CALL_STATUSES.map((st) => [st, Object.fromEntries(CALL_EVENTS.map((e) => [e, callStep(st, e)]))]));
     expect(table).toEqual({
-      dispatching: { wait: "waiting", finish: "done", cancel: "done", abandon: "done" },
-      waiting: { wait: "refuse", finish: "done", cancel: "done", abandon: "done" },
-      done: { wait: "refuse", finish: "refuse", cancel: "refuse", abandon: "refuse" },
+      dispatching: { wait: "waiting", finish: "done", cancel: "done" },
+      waiting: { wait: "refuse", finish: "done", cancel: "done" },
+      done: { wait: "refuse", finish: "refuse", cancel: "refuse" },
     });
   });
 
@@ -180,6 +183,24 @@ describe("CallLedger: the guards are the ledger's", () => {
     });
   });
 
+  it("a redelivery uses the approval it already spent, even when an older one of the same call is still unspent", async () => {
+    await withLedger((l, sql) => {
+      l.requestApproval("ask_old", "x", "d");
+      l.decide("ask_old", true, 100);
+      l.requestApproval("ask_new", "x", "d");
+      l.decide("ask_new", true, 100);
+      sql.exec("UPDATE approvals SET created_ms = 1 WHERE ask = 'ask_old'");
+      sql.exec("UPDATE approvals SET created_ms = 2, used_by = 'ka' WHERE ask = 'ask_new'");
+      const spentOn = (ask: string) => sql.exec<{ used_by: string | null }>("SELECT used_by FROM approvals WHERE ask = ?", ask).one().used_by;
+      expect(l.takeApproval("x", "d", "ka", 50)).toBe(true);
+      // The older, unspent one is left for another call.
+      expect(spentOn("ask_old")).toBeNull();
+      expect(l.takeApproval("x", "d", "kb", 50)).toBe(true);
+      expect(spentOn("ask_old")).toBe("kb");
+      expect(l.takeApproval("x", "d", "kc", 50)).toBe(false);
+    });
+  });
+
   it("prune settles by age what can't end on its own, and keeps the operator's open work", async () => {
     await withLedger((l, sql) => {
       const cutoff = Date.now() - 1000;
@@ -205,7 +226,7 @@ describe("CallLedger: the guards are the ledger's", () => {
       for (const a of ["ask_open", "ask_spent"]) age("approvals", "ask", a);
 
       l.prune(cutoff);
-      // Old calls that never finished are settled, and being old, go in the same prune; so does the old finished one.
+      // Old calls go whatever their status: one that never finished can't any more.
       expect(status("cal_stuck")).toBeUndefined();
       expect(status("cal_waiting")).toBeUndefined();
       expect(status("cal_done")).toBeUndefined();
@@ -221,6 +242,60 @@ describe("CallLedger: the guards are the ledger's", () => {
       expect(l.approvalOf("ask_spent")).toBeUndefined();
       expect(l.open().map((a) => a.ask).sort()).toEqual(["ask_cli", "ask_open", "ask_sync", "ask_sync_new"]);
     });
+  });
+});
+
+describe("no ledger's event chains", () => {
+  // `apply*` runs one UPDATE per source status, in enum order: were a table to map A to B and B to C on
+  // one event, a row could take both steps in one call. No table does: a status an event leads to refuses it.
+  const tables: [string, readonly string[], readonly string[], (s: any, e: any) => string][] = [
+    ["callStep", CALL_STATUSES, CALL_EVENTS, callStep],
+    ["askStep", ASK_STATUSES, ASK_EVENTS, askStep],
+    ["approvalStep", APPROVAL_STATUSES, APPROVAL_EVENTS, approvalStep],
+    ["turnStep", TURN_STATUSES, TURN_EVENTS, turnStep],
+    ["inboxStep", INBOX_STATUSES, INBOX_EVENTS, inboxStep],
+    ["journalStep", ["none", ...JOURNAL_STATUSES], JOURNAL_EVENTS, journalStep],
+    ["forwardStep", ["none", ...FORWARD_STATUSES], FORWARD_EVENTS, forwardStep],
+  ];
+  // The events meant to repeat on the status they lead to (an attempt more); they are applied to one row by key, never by `apply*`.
+  const repeats = new Set(["journalStep/send", "forwardStep/forward"]);
+  it.each(tables)("%s", (name, statuses, events, step) => {
+    for (const e of events) {
+      for (const from of statuses) {
+        const to = step(from, e);
+        if (to === "refuse" || to === from || repeats.has(`${name}/${e}`)) continue;
+        expect(step(to, e), `${name}: ${from} --${e}--> ${to} --${e}-->`).toBe("refuse");
+      }
+    }
+  });
+});
+
+describe("AgentDO.answerAsk", () => {
+  it("an answer to a previous release's waiting ask whose call is gone isn't lost: it comes as a turn", async () => {
+    const cell = uniqueCell();
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
+    const host = await connectHost(cell, "brain");
+    const agent = (await adminJson("/v1/agents", { body: { role: "captain", cell } }, 201)).agent as string;
+    await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === agent);
+    const stub = env.AGENT.get(env.AGENT.idFromName(agent));
+    const epoch = (await stub.info()).brain!.epoch;
+    // The ask waits inside a call of the current brain, but the call's row is gone (the prune took it).
+    await runInDurableObject(stub, (inst: AgentDO) => {
+      (inst as any).calls.recordAsk({ ask: "ask_lost", call: "cal_gone", epoch, question: "q", status: "sync", deadline: 0 });
+    });
+    expect(await stub.answerAsk("ask_lost", "the answer")).toBe("async");
+    const turns = await runInDurableObject(stub, (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ input: string }>("SELECT input FROM turns").toArray().map((t) => JSON.parse(t.input) as { kind: string; text: string }));
+    expect(turns.filter((t) => t.kind === "ask_answer").map((t) => t.text)).toEqual(["Answer to your question ask_lost: the answer"]);
+    // With its call still waiting, the answer is that call's result and no turn.
+    await runInDurableObject(stub, (inst: AgentDO) => {
+      const a = inst as any;
+      a.calls.begin(epoch, "cal_here", "ask");
+      a.calls.wait(epoch, "cal_here");
+      a.calls.recordAsk({ ask: "ask_here", call: "cal_here", epoch, question: "q", status: "sync", deadline: 0 });
+    });
+    expect(await stub.answerAsk("ask_here", "yes")).toBe("sync");
+    host.ws.close();
   });
 });
 
