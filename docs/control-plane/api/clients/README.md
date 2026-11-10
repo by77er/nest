@@ -59,7 +59,7 @@ The checks:
 | `GET` | `/v1/agents/<agent>/trace/history` | Subtree. |
 | `POST` | `/v1/agents/<agent>/inbox` | Subtree. `from` defaults to the client's id. Any other is a label of its own ([inbox senders](#inbox-senders)): never one of nest's senders or a principal's id (403), shown with the client's id, and it taints the session. An ended agent refuses it (404). |
 | `POST` | `/v1/agents/<agent>/interrupt` | Subtree. |
-| `POST` | `/v1/agents/<agent>/start` | Subtree. `host` is the operator's (403). |
+| `POST` | `/v1/agents/<agent>/start` | Subtree. `host` is the operator's (403). With `restart: true`, `launch: {model?, effort?}` restarts the brain on them, resuming its session ([restarting on another model](../#restarting-on-another-model)). |
 | `POST` | `/v1/agents/<agent>/stop` | Subtree. `destroy_sandbox` destroys only a sandbox that agent owns, and only once nothing else is attached. |
 | `GET` | `/v1/agents/<agent>/children` | Subtree. |
 | `GET` | `/v1/agents/<agent>/brokered` | Subtree. |

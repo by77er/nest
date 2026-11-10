@@ -29,7 +29,7 @@ import { TimerName } from "./lib/timers";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { JWKS_MAX_AGE_S } from "./lib/identity";
 import { Port, SandboxPolicyLayer } from "./do/sandbox";
-import { type CreateAgent, TRACE_HEADER } from "./do/agent";
+import { type CreateAgent, type RestartResult, TRACE_HEADER } from "./do/agent";
 import { type GrantParent, inScope, parseGrantRequests } from "./lib/grants";
 import { parseAppSecret } from "./lib/github";
 import { AgentRole, ErrorCodes, type ErrorBody, HostId, HostRole, hostKind, PROTOCOL_VERSION, Resources } from "./protocol/model";
@@ -908,11 +908,23 @@ export const ROUTES: Route[] = [
   route({ method: "POST", path: "/v1/agents/:agent/interrupt", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).interrupt() }),
   route({
     // An optional host: a brain on a chosen enrolled host (hands still reach the sandbox's gateway); the operator's only.
+    // With `restart`, an optional `launch` (`model`, `effort`; null clears one): the brain restarts on it,
+    // resuming its session (docs/control-plane/api/#restarting-on-another-model). Refused without `restart`.
     method: "POST", path: "/v1/agents/:agent/start", auth: "owner", optionalBody: true,
-    body: z.object({ host: HostId.optional(), restart: z.boolean().optional() }),
+    body: z.strictObject({
+      host: HostId.optional(),
+      restart: z.boolean().optional(),
+      launch: z.strictObject({ model: z.string().nullable().optional(), effort: z.string().nullable().optional() }).optional(),
+    }),
     run: async (c) => {
       if (c.body.host) operatorOnly(c, "choosing a brain's host");
-      return (await ownAgent(c, c.p.agent)).start(c.body.host, undefined, c.body.restart ?? false);
+      const launch = c.body.launch;
+      if (launch === undefined) return (await ownAgent(c, c.p.agent)).start(c.body.host, undefined, c.body.restart ?? false);
+      // No stored change without the restart that applies it.
+      if (c.body.restart !== true) throw new NestError(ErrorCodes.INVALID_MESSAGE, "launch changes an agent only with restart: true");
+      // Checked as a spawn's launch is (lib/spec.ts `launchProblem`), by AgentDO, on the launch it would store.
+      const a = await ownAgent(c, c.p.agent);
+      return newMethod("AgentDO.restartWith", async (): Promise<RestartResult> => await a.restartWith(launch, c.body.host));
     },
   }),
   route({

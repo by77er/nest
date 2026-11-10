@@ -9,12 +9,22 @@
   - The fleet channel accepts a token up to 24 h past expiry, so a reconnecting host can get a fresh one. The session channel accepts no grace period.
 - **Two public routes for MCP OAuth** ([mcp OAuth](../../agents/capabilities/mcp/#oauth)): `GET /v1/oauth/callback`, where an authorization server sends the operator's browser (its single-use state is the proof), and `GET /v1/oauth/client.json`, nest's client ID metadata document. Every other route needs the operator's token but the host routes and a few more public ones (health, host enrollment, blobs, the [caller identity's keys](clients/#caller-identity-for-mcp-servers)), and the owner routes (agents, sandboxes, the client catalog, a client's `self`) take an API client's too ([the list](clients/#routes); `test/routes.test.ts` holds both lists and checks that one against the code).
 - **Operator API:** endpoints are listed in `control-plane/README.md`.
-  - **Includes:** egress policy layers (`PUT /v1/sandboxes/<id>/policy`), ports and public share links (operator-only), paged transcripts, a sandbox's hands target for a person or a harness (`POST /v1/sandboxes/<id>/resolve`), starting a brain on a named host (`POST /v1/agents/<id>/start {host}`), and the Access service token for the gateways (`PUT /v1/admin/secrets/access:gateway`).
+  - **Includes:** egress policy layers (`PUT /v1/sandboxes/<id>/policy`), ports and public share links (operator-only), paged transcripts, a sandbox's hands target for a person or a harness (`POST /v1/sandboxes/<id>/resolve`), starting a brain on a named host (`POST /v1/agents/<id>/start {host}`; restarting one on another model is the owner's, [below](#restarting-on-another-model)), and the Access service token for the gateways (`PUT /v1/admin/secrets/access:gateway`).
   - **Taking a credential away:** `DELETE /v1/admin/secrets/<name>` removes an operator's secret ([BrokerDO](../durable-objects/broker/)), and `DELETE /v1/admin/capabilities/<name>/oauth` revokes an mcp capability's OAuth authorization ([mcp OAuth](../../agents/capabilities/mcp/#oauth)). Both take the admin token.
   - **Cells:** must be well-formed names, and must be in `CELLS` when that's set. See [which routes take a cell](#which-routes-take-a-cell).
   - **Agents:** `POST /v1/agents` takes an agent's cell from its sandbox when it has one; a cell that differs from the sandbox's is refused (409).
   - **Creates take an [`Idempotency-Key`](#idempotency-keys).**
   - **Compat (one release):** `POST /v1/sandboxes` and `POST /v1/agents` accept a `workstream` field and ignore it (old clients and scripts send it); the operator's `POST /v1/agents` refuses `overrides.params` with a 400 rather than drop it silently.
+
+## Restarting on another model
+
+**Decided (2026-11-10):** an agent's owner (the operator, or the [API client](clients/) whose subtree it's in) restarts its brain on another model or effort, keeping its conversation: `POST /v1/agents/<id>/start {restart: true, launch: {model?, effort?}}`.
+- **What changes:** a `model` or `effort` given replaces the agent's; `null` clears one (the brain then runs on Claude Code's default); one left out stays. Nothing else of the launch changes (tools, system prompt). The answer is the start's (`started`, `waiting` or `none`) with the launch now stored: `launch: {model, effort}`.
+- **Checked as a spawn's launch is** (`launchProblem`: plain tokens, never an option), on the whole launch it would store. A refused one stores nothing and leaves the brain as it was. Unknown fields are refused (400), in the body and in `launch`.
+- **Only with `restart: true`:** `launch` alone is refused (400), so a stored change never waits silently for some later start.
+- **Why an owner may:** no grant rule limits models, and a client can already pick any model by writing a template in its namespace and spawning from it. This is the same choice, for an agent it already owns.
+- **The restart is the existing one** ([AgentDO](../durable-objects/agent/)): the launch is stored in the step that records the restart's intent, a live brain is condemned (killed: a turn it is running is cut, and the next brain redoes it as a `recovery` turn from its text), and the next brain starts with the stored launch, resuming the same session (`--resume` with the new `--model` and `--effort`, both [documented Claude Code flags](https://code.claude.com/docs/en/cli-reference)). A caller that wants the turn to finish first waits for the agent to be idle before asking.
+- **Several at once:** each is stored in its own step; the brain that starts has the last stored. A change while a restart waits for the condemned brain's exit joins that restart. An ended agent is refused (409), as any start is.
 
 ## Live trace
 

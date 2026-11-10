@@ -542,6 +542,27 @@ export function launchProblem(launch: { model?: string; effort?: string } | unde
   return null;
 }
 
+/**
+ * A change to an agent's launch by its owner (`POST /v1/agents/<id>/start {restart: true, launch}`): a
+ * `model` or `effort` given replaces the stored one, `null` clears it (the brain then runs on Claude Code's
+ * default), and one left out stays as it is. Nothing else of the launch changes.
+ */
+export interface LaunchChange {
+  model?: string | null;
+  effort?: string | null;
+}
+
+/** The launch `cur` with `change` applied (`LaunchChange`). Pure. */
+export function changedLaunch<L extends { model?: string; effort?: string }>(cur: L, change: LaunchChange): L {
+  const next = { ...cur };
+  for (const k of ["model", "effort"] as const) {
+    const v = change[k];
+    if (v === null) delete next[k];
+    else if (v !== undefined) next[k] = v;
+  }
+  return next;
+}
+
 /** Templates that list capability `name` (it can't be deleted while any does). */
 export function templatesUsing(catalog: Catalog, name: string): string[] {
   return Object.entries(catalog.templates).filter(([, t]) => t.capabilities.includes(name)).map(([n]) => n).sort();
