@@ -27,6 +27,7 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Waiting: no drift (waits.ts:15-18,36-39,70-84; RECENT_WAITS=10 do/project.ts:593,2440; ManagerWaits.tsx:21,102,106; ManagerContext.tsx:59-72; nest's client timer API is GET/DELETE only, control-plane/src/index.ts:1035-1036).
 - Memory: no drift (memory.ts:8,10,12,28; source format do/project.ts:3359; routes api.ts:510-512; nest's memory tools fall to not_implemented, control-plane/src/do/agent.ts:3283; prompts catalog.ts:74,86).
 - Dependencies: two corrections; the rest matches (tasks.ts:177-212, api.ts:434-438, do/project.ts:1035).
 - Setup: one correction (step 4); workflows, paths, secrets names, Access bypass (deploy/lean/Projects/Test.lean:27-28), `POST /api/admin/sync` (api.ts:100), Sync catalog button (ui/features/admin/AdminPage.tsx:48) match.
