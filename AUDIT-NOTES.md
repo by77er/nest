@@ -3,6 +3,8 @@
 ## Corrections
 | doc | said | code says | evidence |
 |---|---|---|---|
+| compute/nestd, sandbox/state/object-store | M2 "built, not deployed"; object-store "no longer go into the local cache" (tombstone) | the owning disk doc: M2 "Built; deploys on merge" (merged); committed chunks skip the cache | docs/sandbox/state/disk/README.md:24, crates/nestd/src/host.rs `commit_cut` |
+| docs/README.md (decisions) | TLS line: fixed-shape CSRs (no status); injection: "opt-in wildcards" for all bindings | CSR shape unchecked (ca.ts:85-92); `wildcard` required only for API clients' bindings | control-plane/src/lib/ca.ts:85-92, lib/client-secrets.ts:90-93, do/sandbox.ts:75 |
 | sandbox/networking/ingress/README.md | terminal attach over `/pty`, port-forward over `/ingress/<port>`, ingress guards, 60 s detach: no status | the gateway answers 501 "route not served yet" on `/pty` and `/ingress/*`; no ingress guards; a dropped PTY gets SIGHUP | crates/nest-gateway/src/server.rs:236-241, crates/nest-guest/src/ingress.rs:246, docs/compute/nestd/README.md (ingress guards designed) |
 | sandbox/networking/ingress/README.md | guest connects 127.0.0.1 then 172.16.0.2 | then also `::1` | crates/nest-guest/src/ingress.rs:63 |
 | sandbox/networking/egress/tls/README.md | fixed-shape CSR (exact subject, no attributes) refused otherwise; FleetDO sets every field incl. subject; key usage `keyCertSign`, EKU `serverAuth` | `signIntermediate` only parses and verifies the CSR, copies its subject and key; sets validity (`PROXY_CA_TTL_MS`, 7 d), pathLen 0, key usage keyCertSign+cRLSign; no EKU | control-plane/src/lib/ca.ts:85-121, do/fleet.ts:847 |
