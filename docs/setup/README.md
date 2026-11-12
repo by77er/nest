@@ -13,7 +13,7 @@ What I provide, where it goes, and what each piece unlocks, in the order testing
 
 | Decision | Default | Why it matters |
 |---|---|---|
-| AWS region | `us-east-1` | It hosts the first cell: the sandbox hosts, the brain hosts and the cell's S3 bucket. It must offer 8i instances (`c8id` first, then `m8id`, `r8id`, `c8i-flex`, `c8i`, `m8i`). |
+| AWS region | `us-east-1` | It hosts the first cell: the sandbox hosts, the brain hosts and the cell's S3 bucket. It must offer 8i instances (for spot, `c8id` first, then `m8id`, `r8id`, `c8i-flex`, `c8i`, `m8i`). |
 | Monthly spend cap | $25 | Becomes an AWS Budgets alarm. Testing costs a few dollars. |
 | Dedicated AWS account | Yes | Keeps the blast radius of broad testing credentials to nest. |
 | Separate Claude token for captains | Optional | A template's `credential` names its BrokerDO setup token (`claude_oauth_token:captain` for the `captain` template, falling back to `claude_oauth_token` while unset; an API client's agents never fall back). Needed only to verify that two setup tokens can be revoked independently. |

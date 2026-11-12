@@ -101,7 +101,7 @@ See [architecture/](architecture/) for the system diagram, components, a turn en
 | Fork | Copy-on-write copy of a sandbox (disk only, or live with memory; designed, not built) |
 | Grant | Permission for a principal to do an action on a resource. Passed on only by someone who holds it. |
 | Owner | Whoever created a resource. Holds every grant on it. |
-| Taint | A per-session bit the platform sets when a session reads untrusted content (hands output, the web, MCP and API results, transcripts). Built: a per-agent stand-in that never clears, set for an agent with hands or a web built-in and once a possibly tainted agent's text or an untrusted MCP or HTTP result reaches it |
+| Taint | A per-session bit the platform sets when a session reads untrusted content (hands output, the web, MCP and API results, transcripts). Built: a per-agent stand-in that never clears, set for an agent with hands or a web built-in and once a possibly tainted agent's text, a transcript or an untrusted MCP or HTTP result reaches it |
 | Sink | An action that can send data out or widen authority; from a tainted session it needs approval |
 | Capability | A pluggable bundle of tools, the grants they need and prompt instructions, listed in spawn specs |
 | Template | A named spawn spec, stored as data in CatalogDO: capabilities, launch settings (model, built-in tools, base prompt), whether it takes a sandbox and the credential (grants and the backend choice are designed, not built) |
