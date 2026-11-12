@@ -478,7 +478,7 @@ The owner's request (2026-11-06): their comments on a task's PR reach that task'
 
   An edit, a delete, an approval with no text, or a comment on an issue that isn't a PR is ignored.
 - **Only the project's GitHub user** (Settings, "PR comments"), matched by GitHub user **id**, which is immutable. A login can be renamed and then registered by someone else; an id can't.
-  - **The default** is the repo's owner, if a user, applied once at attach (a project attached without it attaches again once, for it). After that, the owner's choice stands, nobody included, however often the repo is attached again.
+  - **The default** is the repo's owner, if a user, applied once at attach (a one-off migration attaches every already-attached project again, for it). After that, the owner's choice stands, nobody included, however often the repo is attached again.
   - **Settings** shows whose comments count ("last seen as" its login), takes a GitHub login (looked up with `GET /users/{login}`, kept as its id; an organization or a bot is refused), offers "Use the repo owner" (taken on the server as the repo's owner GitHub names at save, by id, never by a login it once had), and warns about the account's credentials. An organization's repo has nobody until it's set.
   - With nobody set, a comment on a task's PR is noted on the task (at most once an hour), so the owner's comment isn't lost silently.
   - **The author must be a person writing as themself:** `user.type` is `User`, and `performed_via_github_app` is unset. An App acting with the user's token is refused, even though GitHub calls its comments the user's.

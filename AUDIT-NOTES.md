@@ -35,7 +35,7 @@ Base: origin/main 6bbf64f.
 | The UI (board) | "the columns' old order", "as before" | wording | — |
 | The live trace | the route serves the manager, a worker or a reviewer; mounts ManagerTrace, TaskTraces, ReviewTrace | routine runs are recorded too and have `RunTrace` | projects/src/do/project.ts:3168; trace.ts:16-20; ui/features/trace/AgentTraces.tsx:25 |
 | Design system (primitives) | `JumpPill`, `StreamText`, `ActivityLine` (chat) and `TouchTarget` | no `StreamText`, `ActivityLine` or `TouchTarget` in src/ui; `JumpPill` is private to `ComposerDock`; the chat's exported primitives are SpinnerSlot, WorkingLine, StepRow, StepField, StepList, StepsDisclosure, ComposerBox, ChatWelcome, Starter | projects/src/ui/layout/ChatLog.tsx:23-320 |
-| Models; PR comments | "before this release" / "made before this" (tombstone wording) | stated by the data's condition: a start frozen with no model, a project with no models set, a project attached without a comments user | projects/src/catalog.ts:169-173 |
+| Models; PR comments | "before this release" / "made before this" (tombstone wording) | stated by the data's condition: a start frozen with no model, a project with no models set, a one-off migration re-attaching already-attached projects | projects/src/catalog.ts:169-173; do/project.ts:446-452 |
 | The UI (Manager page) | context column: "Working on" and "Needs you" | "Waiting for" (`ManagerWaits`) sits between them, as Waiting says | projects/src/ui/features/manager/ManagerContext.tsx:59-72 |
 | Outboxes | "The same migration" (no migration named before it) | the migration adding `chat_request` | projects/src/do/project.ts:506-517 |
 
