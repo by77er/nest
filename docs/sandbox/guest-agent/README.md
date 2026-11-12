@@ -3,14 +3,14 @@
 The daemon inside each sandbox VM. It is the **hands server**. It holds no credentials and runs no harness. Wire contract: [../../interfaces/host-guest/](../../interfaces/host-guest/).
 
 - **vsock, host-initiated:** nestd opens the control connection (1024); the [gateway](../gateway/) opens one connection per hands call (1025) and per ingress stream (10000), on behalf of clients anywhere. The guest **accepts only the host (CID 2)**, so a process inside the sandbox can't reach these ports even if the guest kernel has vsock loopback.
-- **Post-resume fixes** (nestd's `resume`): resync the clock, mix host entropy into the kernel RNG on every resume, and on a fork set a new machine-id and hostname.
+- **Post-resume fixes** (nestd's `resume`): resync the clock, mix host entropy into the kernel RNG on every resume (`RNDADDENTROPY`; a failure fails the resume), and on a fork set a new machine-id and hostname. Every restore cold-boots until memory snapshots exist, so nestd sends `resume` only to a fork's first boot.
 - **Hands RPC:** Bash (per-agent cwd, background tasks, PTY), Read/Write/Edit with per-agent read records and staleness checks, Glob/Grep. Everything runs as the sandbox user: processes via `setuid`, in-process file tools via a per-thread filesystem identity. Inputs that could block forever (FIFOs, devices) are refused, file tools have a deadline, and Grep and helper output is capped. v2: each call leaves a record on tmpfs for the [hands journal](../../agents/hands/#journal). See [../../agents/hands/](../../agents/hands/).
 - **Per-agent context:** each process runs in its own leaf of the agent's **cgroup** (accounting, and `cgroup.kill` on interrupt) with the user's `HOME`/`USER`/`LOGNAME`/`SHELL`, `NEST_AGENT_ID` (attribution only) and `HTTP(S)_PROXY` pointing at the agent's explicit proxy port.
 - **Output retention:** call outputs live on tmpfs (`/run/nest`, i.e. guest RAM). The newest 64 foreground outputs per agent (at most 256 MB) and the newest 32 finished background tasks are kept; `agent_detach` with `kill_processes` deletes the agent's outputs.
 - **`nest` CLI endpoint** for programs inside the sandbox (`nest expose`, `nest unexpose`, `nest whoami`; `nest hold` is designed), relayed to nestd on the control connection. What it sends is always tainted ([tools](../../agents/tools/#the-nest-cli-inside-sandboxes)). For compatibility the wire still parses `notify`, `emit` and `ask`, which the control plane answers `unknown_tool` ([pending contract changes](../../interfaces/README.md#pending-contract-changes)).
 - **Before a commit, pause or suspend** (v2; built: `sync` before a snapshot): `syncfs` on every filesystem, which must succeed ([flush before commit](../state/disk/#flush-before-commit)). `syncfs` reports writeback errors (Linux 5.8+, [syncfs(2)](https://man7.org/linux/man-pages/man2/syncfs.2.html)); `sync` doesn't. Before a snapshot, also `drop_caches`. No filesystem freeze.
 - **Ingress endpoint** (vsock `:10000`): takes a `{port}` header and connects to `127.0.0.1:<port>`, then `172.16.0.2`, then `::1`. Used by previews, `nest port-forward` and terminal attach (PTY), all arriving through the gateway. See [../networking/ingress/](../networking/ingress/).
-- **Ready:** the guest agent is ready once `configure` (and, after a restore, `resume`) is done. v2: it reports that, and nestd passes it to SandboxDO as the evidence a placement needs to complete ([placement](../../control-plane/durable-objects/sandbox/#placement)).
+- **Ready:** the guest agent is ready once `configure` (and, after a memory restore or on a fork, `resume`) is done. v2: it reports that, and nestd passes it to SandboxDO as the evidence a placement needs to complete ([placement](../../control-plane/durable-objects/sandbox/#placement)).
 - **Port watcher:** reports listening ports (`/proc/net/tcp{,6}`) as `ports` events, which nestd turns into `port_opened` sandbox events; whether a port is exposed is the control plane's business (`nest expose` is relayed there).
 - **Packages:** with `agent_root: none`, installs go through an allowlisted helper (**not built yet**).
 
@@ -41,7 +41,7 @@ A memory snapshot keeps the guest agent it was taken with. Requiring the host's 
 
 ## Admission
 
-**v2, designed.** Built: hands calls and ingress PTYs are `busy` before `configure` and while frozen; nothing else below.
+**v2, designed.** Built: hands calls and ingress PTYs are `busy` before `configure`; nothing else below.
 
 The 64 and 256 caps, the queue and the 5 s first-frame limit are SPACE's guest numbers ([lib.rs](https://github.com/perplexityai/space/blob/main/crates/libs/spaced/guest/server/src/lib.rs), [admission_queue.rs](https://github.com/perplexityai/space/blob/main/crates/libs/spaced/common/src/admission_queue.rs)).
 
