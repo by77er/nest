@@ -4,7 +4,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
-import { AccessTeam, agentClaims, api, callTool, deliver, FakeNest, installFetch, Signer } from "./fake-nest";
+import { AccessTeam, agentClaims, api, callTool, deliver, FakeNest, holdAsk, installFetch, Signer } from "./fake-nest";
 
 const fake = new FakeNest();
 let restore: () => void;
@@ -141,19 +141,17 @@ describe("the owner's answer", () => {
 describe("what needs the owner", () => {
   it("lists asks and blocked tasks together, oldest first, and the projects list counts them", async () => {
     const s = await setup();
-    await deliver({ id: `evt-${rand()}`, type: "agent.ask", agent: s.worker, ask: "ask_first1", question: "push?" });
+    // nest's asks, each a second apart around the block, so the order is unambiguous.
+    holdAsk(s.worker, `ask_first${s.id.slice(-6)}`, { question: "push?", created_ms: 1000 });
     ok(await callTool("board", await managerToken(s), "block_task", { task: s.other, reason: "decide" }));
-    await deliver({ id: `evt-${rand()}`, type: "agent.ask", agent: s.manager, ask: "ask_third1", question: "which?" });
-    // Make the order unambiguous: each a second after the one before.
+    holdAsk(s.manager, `ask_third${s.id.slice(-6)}`, { question: "which?", created_ms: 3000 });
     await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(s.id)), (_o, st) => {
-      st.storage.sql.exec("UPDATE asks SET at_ms = 1000 WHERE ask = 'ask_first1'");
       st.storage.sql.exec("UPDATE tasks SET blocked_ms = 2000 WHERE id = ?", s.other);
-      st.storage.sql.exec("UPDATE asks SET at_ms = 3000 WHERE ask = 'ask_third1'");
     });
-    expect((await attention(s)).map((x) => (x.kind === "ask" ? x.ask : x.task))).toEqual(["ask_first1", s.other, "ask_third1"]);
+    expect((await attention(s)).map((x) => (x.kind === "ask" ? x.ask : x.task))).toEqual([`ask_first${s.id.slice(-6)}`, s.other, `ask_third${s.id.slice(-6)}`]);
     const count = async () => ((await api(token, "GET", "/api/projects")).body.projects as any[]).find((p) => p.id === s.id).needs_you;
     expect(await count()).toBe(3);
-    await api(token, "POST", `/api/projects/${s.id}/asks/ask_first1/answer`, { answer: "yes" });
+    expect((await api(token, "POST", `/api/projects/${s.id}/asks/ask_first${s.id.slice(-6)}/answer`, { answer: "yes" })).status).toBe(200);
     await api(token, "POST", `/api/projects/${s.id}/tasks/${s.other}/answer`, { answer: "this" });
     expect(await count()).toBe(1);
     expect((await attention(s)).map((x) => x.kind)).toEqual(["ask"]);

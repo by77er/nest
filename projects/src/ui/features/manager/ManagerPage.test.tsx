@@ -40,6 +40,52 @@ describe("the Manager page", () => {
     expect(screen.getByText("Nothing under way.")).toBeInTheDocument();
   });
 
+  it("asks still being read, or the first read failing: the context says so, never that nothing waits", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Later?" })];
+    let release!: () => void;
+    api.holds.push({ match: /^GET \/api\/projects\/prj_one\/attention$/, until: new Promise((r) => (release = () => r(undefined))) });
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
+    const context = document.querySelector("[data-slot=manager-context]") as HTMLElement;
+    expect(await within(context).findByText("Reading the agents' asks…")).toBeInTheDocument();
+    expect(within(context).queryByText("Nothing waits on you.")).toBeNull();
+    release();
+    expect(await within(context).findByRole("link", { name: "Later?" })).toBeInTheDocument();
+  });
+
+  it("the first full read failing: the context says the asks couldn't be read", async () => {
+    const api = new FakeApi();
+    api.fail(/^GET \/api\/projects\/prj_one\/attention$/, 500, "the Worker is unavailable");
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
+    const context = document.querySelector("[data-slot=manager-context]") as HTMLElement;
+    expect(await within(context).findByText(/The agents' asks couldn't be read/)).toBeInTheDocument();
+    expect(within(context).queryByText("Nothing waits on you.")).toBeNull();
+  });
+
+  it("nest unreadable for the asks: the context says so, never that nothing waits", async () => {
+    const api = new FakeApi();
+    api.asksError = "nest 503";
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
+    const context = document.querySelector("[data-slot=manager-context]") as HTMLElement;
+    expect(await within(context).findByText(/The agents' asks couldn't be read/)).toBeInTheDocument();
+    expect(within(context).queryByText("Nothing waits on you.")).toBeNull();
+  });
+
+  it("nest unreadable for the asks, with other things waiting: they're listed and the line follows them", async () => {
+    const api = new FakeApi();
+    api.asksError = "nest 503";
+    api.tasks = [task({ title: "Pick a region", blocked: { at_ms: 5, by: "agt_w1", role: "worker", reason: "which region?", question: null, tainted: false } })];
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    await user.click(await screen.findByRole("button", { name: "About the manager" }));
+    const context = document.querySelector("[data-slot=manager-context]") as HTMLElement;
+    const needs = (await within(context).findByRole("heading", { name: "Needs you" })).closest("[data-ds=section]") as HTMLElement;
+    expect(await within(needs).findByRole("link", { name: "which region?" })).toBeInTheDocument();
+    expect(within(needs).getByText(/The agents' asks couldn't be read/)).toBeInTheDocument();
+  });
+
   it("shows the manager running, what it's doing and where, in the header", async () => {
     const api = new FakeApi();
     api.manager = { phase: "running", agent: "agt_manager", state: "waiting_input", host: "bh_7", error: null };

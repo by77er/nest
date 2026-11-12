@@ -48,6 +48,13 @@
   background: var(--nest-border-color);
 }
 
+/* The muted gray is AA on the subtle ground but not on the hover's (4.37:1): on hover the count and chevron
+   take the text color. */
+.toggle:hover .count,
+.toggle:hover .chevron {
+  color: var(--mantine-color-text);
+}
+
 .chevron {
   flex: 0 0 auto;
   color: var(--nest-muted);
