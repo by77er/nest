@@ -64,7 +64,7 @@ export const ErrorCodes = {
   BUSY: "busy",
   /**
    * A live-count limit is full (an API client's grant's `max_agents` or `max_sandboxes`, a spawner's live
-   * children): there is room once one of them ends. The message names the limit. HTTP 429, retryable.
+   * children): there is room once fewer are live than the limit. The message names the limit. HTTP 429, retryable.
    */
   AT_CAPACITY: "at_capacity",
 } as const;

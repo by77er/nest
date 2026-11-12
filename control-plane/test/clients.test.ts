@@ -13,6 +13,8 @@ import {
 } from "../src/lib/clients";
 import { expandSpec, mcpPrefix } from "../src/lib/spec";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
+import { NestError } from "../src/lib/util";
+import { ErrorCodes } from "../src/protocol/model";
 import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueCell, Ws } from "./helpers";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
@@ -702,6 +704,43 @@ describe("agent_spawn in a client's subtree", () => {
     expect(await run({ template: c.tpl })).toMatchObject({ status: "error", error: { code: "at_capacity", retryable: true, message: expect.stringMatching(/^max_agents: /) } });
     expect((await adminJson(`/v1/admin/clients/${c.id}`)).live.agents).toBe(2);
     expect((await agentStub(p.agent).children()).map((x) => x.agent)).toEqual([kid]);
+    // Any other retryable failure keeps the child's row, so a re-run of the same call (same id) finishes it.
+    const proto = ClientDOClass.prototype as any;
+    const admit = proto.admit;
+    proto.admit = async function () {
+      throw new NestError(ErrorCodes.INTERNAL, "ClientDO unavailable", 503, true);
+    };
+    try {
+      expect(await run({ template: c.tpl })).toMatchObject({ status: "error", error: { code: "internal", retryable: true } });
+    } finally {
+      proto.admit = admit;
+    }
+    const rows = (await agentStub(p.agent).children()).map((x) => x.agent);
+    expect(rows).toHaveLength(2);
+    expect(rows).toContain(kid);
+    ws.close();
+  });
+
+  it("a spawn with a new sandbox refused at max_sandboxes gives back the agent place it had taken", async () => {
+    const c = await newClient({ max_agents: 5, max_sandboxes: 1 });
+    await adminJson("/v1/admin/secrets/claude_oauth_token", { method: "PUT", body: { value: "sk-ant-oat01-test" } });
+    const brain = await connectHost(c.cell, "brain");
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/worker`, { method: "PUT", body: basic({ capabilities: ["nest", "hands"], hands: "optional" }) });
+    await asJson(c.token, `/v1/catalog/capabilities/${c.name}/spawning`, { method: "PUT", body: { tools: ["agent_spawn"], spawn: [`${c.name}/worker`] } });
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/parent`, { method: "PUT", body: basic({ capabilities: ["nest", `${c.name}/spawning`] }) });
+    const p = await asJson(c.token, "/v1/agents", { body: { template: `${c.name}/parent`, cell: c.cell } }, 201);
+    const [start] = await nextCommands(brain.ws, (x) => x.type === "agent_start" && x.agent === p.agent);
+    const ws = await Ws.connect(`/v1/agents/${p.agent}/session`, brain.host_token);
+    ws.send({ type: "hello", protocol_version: 1, agent: p.agent, host: brain.host, instance_id: `rin_${rand()}`, epoch: start.epoch, session: "ses_0b7e7a52-3c1d-4e8f-9a6b-1d2c3e4f5a6b" });
+    await ws.next("hello_ack");
+    // The one sandbox place is taken.
+    await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
+    ws.send({ type: "tool_call", seq: 1, call: "cal_new", turn: "trn_x", name: "agent_spawn", arguments: { task: "t", template: `${c.name}/worker`, sandbox: "new" } });
+    const out = (await ws.next("tool_result", (m) => m.call === "cal_new", 8000)).outcome;
+    expect(out).toMatchObject({ status: "error", error: { code: "at_capacity", retryable: true, message: expect.stringMatching(/^max_sandboxes: /) } });
+    // Its agent place was taken first (reserved): given back, so only the parent counts; nor is it indexed.
+    expect((await clientStub(c.id).list("agent", { state: "all" })).items.map((m) => m.id)).toEqual([p.agent]);
+    expect(await agentStub(p.agent).children()).toEqual([]);
     ws.close();
   });
 });

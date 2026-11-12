@@ -163,8 +163,8 @@ pub mod error_codes {
     /// runs or is queued): ask again later. HTTP 409.
     pub const BUSY: &str = "busy";
     /// A live-count limit is full (an API client's grant's `max_agents` or `max_sandboxes`, a
-    /// spawner's live children): there is room once one of them ends. The message names the limit.
-    /// HTTP 429, retryable.
+    /// spawner's live children): there is room once fewer are live than the limit. The message
+    /// names the limit. HTTP 429, retryable.
     pub const AT_CAPACITY: &str = "at_capacity";
 
     /// Every code above that is sent (the legacy alias is not).
