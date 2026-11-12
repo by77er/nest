@@ -259,12 +259,13 @@ describe("CallLedger: the guards are the ledger's", () => {
     // The steps AgentDO's `approvalCheck` and `answerAsk` take on the ledger, explored over every sequence
     // of up to DEPTH actions on the real ledger and SQLite. `check` is a new call (a fresh key: another
     // concurrent identical call, the model's retry, a restarted brain's or a new epoch's call); `again`
-    // repeats the last check's key (the runner never does: a repeated key must never get a second call
-    // through); `prune` runs a century on, everything aged; `evict` builds the ledger anew on the same
+    // repeats a key: the first one let through if any, else the last checked (the runner never repeats
+    // one: a repeated key must never get a second call through, even with another approval waiting); `prune` runs a century on, everything aged; `evict` builds the ledger anew on the same
     // storage (an eviction; a weak action, since the ledger keeps nothing outside SQLite); `sink` approves
     // a sink call of the same name and arguments, and `sinkcheck` spends one as a sink call would (each
-    // kind's approvals answer only its own kind). Bounds: 8 actions, every sequence of length 1 to 5
-    // (37,448), one call's arguments.
+    // kind's approvals answer only its own kind). Bounds: every sequence of length 1 to 5 of all 8
+    // actions (37,448), and of length 1 to 6 of `check`, `again` and `approve` (1,092: a let-through key
+    // repeated with a second approval waiting needs 6); one call's arguments.
     // What it covers is the ledger (`checkRule`, `decide`, `prune`): the AgentDO glue around it (the
     // epoch guard, the kind it records, the expiry `answerAsk` computes) is session.test.ts's. "None
     // lost" is the ledger's: a check whose answer never reaches the runner still loses its approval.
@@ -287,6 +288,7 @@ describe("CallLedger: the guards are the ledger's", () => {
         let pruned = false;
         let evicted = false;
         let last: string | undefined;
+        let firstGranted: string | undefined;
         const granted = new Map<string, string>(); // key -> ask it was let through on
         let approvedAsks = 0;
         let open: string | undefined; // the ask awaiting the operator
@@ -300,6 +302,7 @@ describe("CallLedger: the guards are the ledger's", () => {
             if (pruned) reached.afterPrune++;
             if (evicted) reached.afterEvict++;
             granted.set(key, r.ask);
+            firstGranted ??= key;
           } else {
             if (granted.has(key)) reached.againRefused++;
             // A new key not let through although an approval was waiting.
@@ -317,7 +320,7 @@ describe("CallLedger: the guards are the ledger's", () => {
         };
         for (const a of seq) {
           if (a === "check") check(last = `k${++keys}`);
-          else if (a === "again" && last) check(last);
+          else if (a === "again" && (firstGranted ?? last)) check((firstGranted ?? last)!);
           else if ((a === "approve" || a === "deny") && open) {
             expect(l.answer(open, a)).toBe(true);
             expect(l.decide(open, a === "approve", approvalExpiry("rule", now, 60_000))).toBe(true);
@@ -349,12 +352,14 @@ describe("CallLedger: the guards are the ledger's", () => {
           expect(granted.size + unspent(), `${seq}: approvals kept`).toBe(approvedAsks);
         }
       };
-      const explore = (prefix: (typeof ACTIONS)[number][]) => {
+      const explore = (actions: readonly (typeof ACTIONS)[number][], depth: number, prefix: (typeof ACTIONS)[number][] = []) => {
         if (prefix.length) run(prefix);
-        if (prefix.length < DEPTH) for (const a of ACTIONS) explore([...prefix, a]);
+        if (prefix.length < depth) for (const a of actions) explore(actions, depth, [...prefix, a]);
       };
-      explore([]);
+      explore(ACTIONS, DEPTH);
       expect(n).toBe((8 ** (DEPTH + 1) - 8) / 7);
+      explore(["check", "again", "approve"], DEPTH + 1);
+      expect(n).toBe((8 ** (DEPTH + 1) - 8) / 7 + (3 ** (DEPTH + 2) - 3) / 2);
     });
     for (const [what, count] of Object.entries(reached)) expect(count, `reached: ${what}`).toBeGreaterThan(0);
   }, 60_000); // ~20k sequences on SQLite: a few seconds here, more on a loaded CI runner
