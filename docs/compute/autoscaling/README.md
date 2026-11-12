@@ -2,7 +2,7 @@
 
 - **Scale to zero.** FleetDO launches hosts only when there's runnable work queued. **Built** for sandbox hosts (`AWS_CELLS`, [control plane](../../../control-plane/README.md)):
   - A sandbox no connected host can take launches one spot host from the cell's launch template, unless a launch is pending or the cell is at `max_hosts`.
-    - **One pass of attempts:** each type on spot, in `instance_types` order. Then each type on demand, in `on_demand_types` order: cheapest first, since the cell stack sorts it by its verified price table (`on_demand_types_priced`). So an on-demand host is never dearer than the cheapest type with room. This changed on 2026-11-04: before, only the first type went on demand.
+    - **One pass of attempts:** each type on spot, in `instance_types` order. Then each type on demand, in `on_demand_types` order: cheapest first, since the cell stack sorts it by its verified price table (`on_demand_types_priced`). So an on-demand host is never dearer than the cheapest type with room.
     - **Where a pass stops:**
       - at the first launch;
       - at a spent quota on demand (`VcpuLimitExceeded`, `InstanceLimitExceeded`). The same quota on spot skips the rest of spot and goes on to on demand;
@@ -11,7 +11,7 @@
       - Until it lapses, no demand starts a pass: not another waiting sandbox, not a brain waiter, not the tick.
       - It decays: once the last backoff lapsed more than 30 min ago, the next pass with no room waits 60 s again.
       - So a pass makes at most twice as many RunInstances calls as there are types, and a backoff stands between passes. Each RunInstances attempt is recorded before it is sent, and one whose answer was lost is repeated with the same client token until EC2 answers or `enroll_timeout_ms` passes, so its instance is recorded and none is launched twice; only demand plans a new one.
-  - **Idle grace:** a launched host that holds no lease and no agent for `idle_grace_ms` (10 min) is marked dead, then terminated; the grace keeps conversations with several turns fast. Suspended sandboxes don't keep a host up: a retired host's suspended sandboxes are evicted (lease dropped; their head is in S3) and wake lazily elsewhere.
+  - **Idle grace:** a launched host that holds no unsuspended lease, no brain and no incarnation awaiting salvage for `idle_grace_ms` (10 min) is marked dead, then terminated; the grace keeps conversations with several turns fast. Suspended sandboxes don't keep a host up: a retired host's suspended sandboxes are evicted (lease dropped; their head is in S3) and wake lazily elsewhere.
   - A launch that hasn't enrolled within `enroll_timeout_ms` is terminated, and so is a launched host that enrolled but never said hello within `enroll_timeout_ms` of its enrollment (dead, its leases reassigned). An instance whose launch was ended can't enroll late (403): it would take placements and then die under them. The tick goes on terminating it until EC2 confirms it gone.
   - **Enrolment breaker** (decided 2026-11-06, `control-plane/src/lib/enroll-breaker.ts`, pure, table-tested). Launches of one instance type that keep never enrolling, such as a type without KVM (a sandbox host refuses its role there and shuts down), would otherwise relaunch every `enroll_timeout_ms` for good while sandboxes wait. So FleetDO keeps a breaker per host kind and type (`kv enroll_breaker:<kind>`):
     - 3 consecutive launches of a type that end `enroll_timeout` open it for 30 min. A pass skips the type meanwhile and tries the next.

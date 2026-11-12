@@ -28,15 +28,15 @@ suspended → archived (S3 only) → restore in the cell: disk on any host, memo
 
 **Built in nestd only:** disk-only forks (`sandbox_fork`), which restore on any host in the cell; the control plane doesn't send them yet, so `fork_sandbox` answers `not_implemented`. Live and same-host forks wait with [memory snapshots](state/memory/).
 
-After a fork, the guest agent reseeds randomness (VMGenID), resyncs the clock (VMClock where the guest kernel supports it), and sets a new machine-id and hostname. Firecracker calls resuming one snapshot more than once insecure, so a live fork treats userspace RNG state and other process state as duplicated. Forking an agent's conversation is a separate step (`--fork-session`).
+After a fork, nestd's `resume` has the guest agent step its clock to the host's, mix host entropy into its RNG, and set a new machine-id and hostname ([guest agent](guest-agent/)). With memory snapshots (designed), VMGenID and VMClock also reseed and resync the guest kernel. Firecracker calls resuming one snapshot more than once insecure, so a live fork treats userspace RNG state and other process state as duplicated. Forking an agent's conversation is a separate step (`--fork-session`).
 
 **Sizing:** a sandbox's declared memory is a ceiling (its VMM's cgroup limit), not a reservation; hotplug isn't assumed, and the snapshot path's hugetlbfs memory can't be ballooned in the traditional way. Size the sandbox for the agents it will hold; if it gets crowded, fork instead of growing it.
 
 ## Components
 
-- [drivers/](drivers/): Firecracker (primary), gVisor, Lambda MicroVM
+- [drivers/](drivers/): Firecracker (primary), gVisor (not built), Lambda MicroVM (rejected)
 - [state/](state/): generations, restore sources, retention, memory (restore ABI, base generations), disk, object store and GC
-- [fencing/](fencing/): leases, epochs, STONITH, loss records, salvage
+- [fencing/](fencing/): leases, epochs, STONITH, loss records (not built), salvage
 - [networking/](networking/): identical internal network identity, egress, ingress
 - [gateway/](gateway/): the only network door into a sandbox: hands, terminals and previews behind the host's tunnel
 - [guest-agent/](guest-agent/): the daemon inside each VM
