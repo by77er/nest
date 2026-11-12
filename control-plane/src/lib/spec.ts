@@ -13,7 +13,7 @@ import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
 import { GithubPush } from "./rules/github";
 import { ClientEgress, type EgressRule, narrowEgress } from "./client-egress";
 import { ClientGuards, type HeldGuard, holdGuards } from "./client-guards";
-import { SandboxEnv, unboundPlaceholders } from "./sandbox-env";
+import { githubEnvConflict, githubEnvRefusal, SandboxEnv, unboundPlaceholders } from "./sandbox-env";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
@@ -772,11 +772,17 @@ export function expandTemplate(
   }, name, undefined);
 }
 
-/** The spec with `env` set over its own; refused when a value holds a placeholder none of its bindings has. */
+/**
+ * The spec with `env` set over its own; refused when a value holds a placeholder none of its bindings
+ * has, or when it sets a GitHub name (`isGithubEnvName`) beside repos or a `github_push` that make nest
+ * inject its own GitHub token.
+ */
 function withEnv(spec: AgentSpec, name: string, over: Readonly<Record<string, string>> | undefined): Result<AgentSpec> {
   const env = { ...(spec.env ?? {}), ...(over ?? {}) };
   const unbound = unboundPlaceholders(env, (spec.inject ?? []).map((b) => b.placeholder));
   if (unbound.length) return err(`template ${name}: ${unbound.join("; ")}`);
+  const github = githubEnvConflict(!!spec.repos?.length || !!spec.read_repos?.length || !!spec.github_push?.workflows, env);
+  if (github.length) return err(`template ${name}: ${githubEnvRefusal(github)}`);
   const { env: _e, ...rest } = spec;
   return ok({ ...rest, ...(Object.keys(env).length ? { env } : {}) });
 }
