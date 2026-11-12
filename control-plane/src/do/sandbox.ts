@@ -454,6 +454,7 @@ export class SandboxDO extends DurableObject<Env> {
     // Its own guards within what a sandbox applies: refused before anything is written (its caller gives its client's place back).
     const over = req.guards?.length ? layerOverLimit(req.guards) : null;
     if (over) throw new NestError(ErrorCodes.INVALID_MESSAGE, over);
+    if (req.guards?.length && !this.get<SandboxInfo>("info")) await this.requireGuardBounds(req.cell);
     // The cell's registry is the authority for which sandboxes exist (its GC roots): registered
     // before anything can be written for the sandbox, and again on a retried create, but never
     // again once destroyed (its registry row may already be pruned).
@@ -1464,7 +1465,11 @@ export class SandboxDO extends DurableObject<Env> {
       const now = this.info_();
       if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);
     }
-    // Its guards must fit beside the sandbox's (checked in the step that records them).
+    // Its guards need its cell's hosts to bound them, and must fit beside the sandbox's (checked in the step that records them).
+    if (this.countedGuards(extra.guards).length) {
+      await this.requireGuardBounds(cur.cell);
+      if (lease.gone(this.info_().state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${this.info_().state}`, 409);
+    }
     if (extra.guards?.length) this.checkGuardLimit(undefined, { id: agent, guards: extra.guards });
     // What its client bindings, push opt-ins, egress rules and guards count is the attached agents': compared across the attach itself.
     const extrasBefore = this.extrasKey();
@@ -1730,6 +1735,18 @@ export class SandboxDO extends DurableObject<Env> {
     return distinctGuards(all.map(wireGuard));
   }
 
+  /**
+   * Refuse (409) client guards while any sandbox host of its cell runs a nest-proxy that doesn't bound
+   * guarded requests (the previous release decodes per matcher, on targets of any length, on workers
+   * every sandbox on the host shares). Refused, never dropped: dropping a guard would fail open.
+   */
+  private async requireGuardBounds(cell: string): Promise<void> {
+    const old = await this.fleet(cell).hostsWithoutGuardBounds();
+    if (old.length) {
+      throw new NestError(ErrorCodes.CONFLICT, `request guards need every sandbox host of cell ${cell} to bound guarded requests; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
+    }
+  }
+
   /** Refuse (400) a layer or an attach that would give the sandbox more client guards than it applies. */
   private checkGuardLimit(own?: readonly ClientGuard[], agent?: { id: string; guards: readonly HeldGuard[] }): void {
     const over = sandboxGuardsOverLimit(this.clientGuards(own, agent));
@@ -1801,6 +1818,7 @@ export class SandboxDO extends DurableObject<Env> {
   async setClientLayer(layer: { egress: EgressRule[]; inject: HeldInjection[]; env: Record<string, string>; workflows: boolean; guards?: ClientGuard[] }): Promise<EgressPolicy> {
     const info = this.info_();
     if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
+    if (layer.guards?.length) await this.requireGuardBounds(info.cell);
     if (info.client) await this.readEgressCeiling();
     const now = this.info_();
     if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);

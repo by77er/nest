@@ -4,8 +4,12 @@
 //! - many scope matchers (`/**` plus query names), which once decoded the path and query per matcher;
 //! - many exceptions with query and body matchers, which the body pre-pass walked whatever the scope.
 //!
+//! - many query values (16 a parameter, compared with every pair of a query of same-name pairs, the
+//!   matching one last), at the control plane's matcher-work bound.
+//!
 //! A target past the guarded bounds is refused before any matcher runs; one within them is decided
-//! in well under the budget below, which the per-matcher decoding missed by orders of magnitude.
+//! within the budget below. The budget is wall time, so it catches gross regressions only; that the
+//! request is decoded once, not per matcher, is pinned by a decode count (`guard.rs` unit tests).
 
 use std::time::{Duration, Instant};
 
@@ -48,6 +52,49 @@ fn allow_heavy() -> Vec<RequestGuard> {
             ignore_case: true,
         })
         .collect()
+}
+
+/// The control plane's per-sandbox matcher work (`SANDBOX_MAX_GUARD_WORK` in control-plane/src/lib/client-guards.ts).
+const SANDBOX_MAX_GUARD_WORK: usize = 512;
+/// 16 values of 28 bytes for one parameter, ignoring case: each a scope matcher of work 1 + 2 * 17 = 35.
+fn value_heavy() -> Vec<RequestGuard> {
+    let n = SANDBOX_MAX_GUARD_WORK / 35;
+    (0..n)
+        .map(|i| RequestGuard {
+            name: format!("client:v{i}"),
+            hosts: vec![HostPattern("h.test".into())],
+            scope: vec![RequestMatch {
+                query: vec![QueryMatch { name: "q".into(), values: (0..16).map(|j| format!("{}{j:02}", "v".repeat(26))).collect() }],
+                ..Default::default()
+            }],
+            allow: vec![],
+            reason: String::new(),
+            ignore_case: true,
+        })
+        .collect()
+}
+
+/// 64 scope matchers (the per-sandbox bound) whose `**` is followed by four literals that all but match
+/// at every split of a path of 255 such segments.
+fn path_heavy() -> Vec<RequestGuard> {
+    let seg = "a".repeat(15);
+    (0..32)
+        .map(|i| RequestGuard {
+            name: format!("client:p{i}"),
+            hosts: vec![HostPattern("h.test".into())],
+            scope: (0..2).map(|_| RequestMatch { path: Some(format!("/**/{seg}/{seg}/{seg}/b")), ..Default::default() }).collect(),
+            allow: vec![],
+            reason: String::new(),
+            ignore_case: true,
+        })
+        .collect()
+}
+
+/// A query of 256 `q=` pairs whose values miss every matcher value at their last bytes, the last pair hitting.
+fn same_name_query() -> String {
+    let mut pairs: Vec<String> = (0..MAX_GUARDED_QUERY_PAIRS - 1).map(|_| format!("q={}zz", "V".repeat(26))).collect();
+    pairs.push(format!("q={}15", "v".repeat(26)));
+    pairs.join("&")
 }
 
 /// Prepare, the body pre-pass and the decision, as the proxy runs them; how long it took.
@@ -94,4 +141,17 @@ fn a_target_within_the_bounds_is_decided_within_budget() {
         eprintln!("{name}: {took:?}");
         assert!(took < BUDGET, "{name}: {took:?}");
     }
+    let q = same_name_query();
+    assert!(q.len() <= MAX_GUARDED_QUERY, "{}", q.len());
+    let guards = value_heavy();
+    // Best of a few runs: the figure the docs quote is the work, not a scheduler's hiccup.
+    let took = (0..5).map(|_| decide(&guards, "/x", &q)).map(|(out, t)| (assert_eq!(out, Ok(true)), t).1).min().unwrap();
+    eprintln!("value-heavy ({} guards, {} query bytes): {took:?}", guards.len(), q.len());
+    assert!(took < BUDGET, "value-heavy: {took:?}");
+    let p: String = (0..MAX_GUARDED_SEGMENTS - 1).map(|_| format!("/{}", "A".repeat(15))).collect();
+    assert!(p.len() <= MAX_GUARDED_PATH, "{}", p.len());
+    let guards = path_heavy();
+    let took = (0..5).map(|_| decide(&guards, &p, "")).map(|(out, t)| (assert_eq!(out, Ok(false)), t).1).min().unwrap();
+    eprintln!("path-heavy ({} path bytes): {took:?}", p.len());
+    assert!(took < BUDGET, "path-heavy: {took:?}");
 }

@@ -193,8 +193,15 @@ fn pattern(p: &str) -> Option<Vec<Seg<'_>>> {
 /// Segment glob: a literal equals the segment (without ASCII case when `ic`), `*` is one non-empty
 /// segment, `**` any number.
 fn glob<S: AsRef<str>>(pat: &[Seg<'_>], segs: &[S], ic: bool) -> bool {
+    #[cfg(test)]
+    GLOB_STEPS.with(|d| d.set(d.get() + 1));
     match pat.split_first() {
         None => segs.is_empty(),
+        // A tail with no `**` matches exactly as many segments as it has, so only the split that leaves
+        // that many can match: one `**` costs time linear in the path, not in the path times the tail.
+        Some((Seg::Any, rest)) if !rest.iter().any(|s| matches!(s, Seg::Any)) => {
+            segs.len() >= rest.len() && glob(rest, &segs[segs.len() - rest.len()..], ic)
+        }
         Some((Seg::Any, rest)) => (0..=segs.len()).any(|i| glob(rest, &segs[i..], ic)),
         Some((Seg::One, rest)) => segs.split_first().is_some_and(|(s, tail)| !s.as_ref().is_empty() && glob(rest, tail, ic)),
         Some((Seg::Lit(l), rest)) => segs.split_first().is_some_and(|(s, tail)| {
@@ -271,7 +278,17 @@ fn body_matches(f: &JsonFieldMatch, b: &BodyView<'_>, mode: Mode) -> bool {
 
 // --- percent-decoding ----------------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    /// Decodes on this thread: a test pins that matching decodes nothing (`prepare` decodes once).
+    static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Glob steps on this thread: a test pins that one `**` costs time linear in the path.
+    static GLOB_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn decode_repeatedly(s: &str, plus: bool) -> String {
+    #[cfg(test)]
+    DECODES.with(|d| d.set(d.get() + 1));
     let mut cur = if plus { s.replace('+', " ") } else { s.to_string() };
     for _ in 0..DECODE_ROUNDS {
         let next = decode(&cur);
@@ -539,6 +556,41 @@ mod tests {
         // In scope and the exception's other fields match: the body decides.
         let g = RequestGuard { scope: vec![m(&[], None)], ..body_guard() };
         assert!(needs_body(std::slice::from_ref(&g), &req("b.test", "POST", "/batch").prepare().unwrap()));
+    }
+
+    #[test]
+    fn matching_decodes_nothing_the_request_was_decoded_once() {
+        // Scope matchers this request misses, so each is tried in full (its path as sent and normalized,
+        // its query as sent and decoded), and exceptions on queries: none decodes the request again.
+        let path_scope = m(&[], Some("/**/deposit"));
+        let query_scope = RequestMatch { query: vec![QueryMatch { name: "op".into(), values: vec!["deposit".into()] }], ..Default::default() };
+        let g = RequestGuard {
+            scope: (0..50).flat_map(|_| [path_scope.clone(), query_scope.clone()]).collect(),
+            allow: (0..50).map(|_| RequestMatch { query: vec![QueryMatch { name: "op".into(), values: vec![] }], ..Default::default() }).collect(),
+            ..push_guard()
+        };
+        let r = Req { host: "vault.test", method: "POST", path: "/a%2e/b%2Fc/withdraw", query: Some("op=with%64raw&x=%2541"), injected: None };
+        let before = DECODES.with(|d| d.get());
+        let p = r.prepare().unwrap();
+        let prepared = DECODES.with(|d| d.get()) - before;
+        assert!(prepared > 0);
+        assert!(!needs_body(std::slice::from_ref(&g), &p));
+        assert!(refusing(std::slice::from_ref(&g), &p, &BodyView::Unread).is_none());
+        assert_eq!(DECODES.with(|d| d.get()) - before, prepared, "a matcher decoded the request again");
+    }
+
+    #[test]
+    fn one_double_star_tries_only_the_split_its_tail_fits() {
+        let g = RequestGuard { scope: vec![m(&[], Some("/**/a/*/a/b"))], allow: vec![], ..push_guard() };
+        let path = "/a".repeat(MAX_GUARDED_SEGMENTS - 1);
+        let r = Req { host: "vault.test", method: "GET", path: &path, query: None, injected: None }.prepare().unwrap();
+        let before = GLOB_STEPS.with(|d| d.get());
+        assert!(refusing(std::slice::from_ref(&g), &r, &BodyView::Unread).is_none());
+        // Two forms (as sent and normalized), each one split of at most five steps.
+        assert!(GLOB_STEPS.with(|d| d.get()) - before <= 12, "{}", GLOB_STEPS.with(|d| d.get()) - before);
+        let hit = format!("{path}/b");
+        let r = Req { host: "vault.test", method: "GET", path: &hit, query: None, injected: None }.prepare().unwrap();
+        assert!(refusing(std::slice::from_ref(&g), &r, &BodyView::Unread).is_some());
     }
 
     #[test]

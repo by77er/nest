@@ -107,18 +107,29 @@ export const SANDBOX_MAX_GUARDS = 32;
 export const SANDBOX_MAX_SCOPE_MATCHERS = 64;
 export const SANDBOX_MAX_GUARD_BYTES = 64 * 1024;
 /**
- * The matcher work a sandbox's client guards may ask of the proxy per request: each matcher (scope or
- * exception) counts one, plus one per query parameter it names and one for a body field. nest-proxy
- * bounds the request (`MAX_GUARDED_*` in crates/nest-proxy/src/guard.rs), and this bounds the matchers.
+ * The matcher work a sandbox's client guards may ask of the proxy per request ({@link matcherWork}).
+ * nest-proxy bounds the request (`MAX_GUARDED_*` in crates/nest-proxy/src/guard.rs), and this bounds
+ * the matchers, so what a sandbox's guards cost the proxy per request is bounded too
+ * (crates/nest-proxy/tests/guard_cost.rs measures the worst shapes at this bound).
  */
 export const SANDBOX_MAX_GUARD_WORK = 512;
 
 /** Why a sandbox's own layer alone is more than it applies (its create's, before any agent attaches); null when within. */
 export const layerOverLimit = (guards: readonly ClientGuard[]): string | null => sandboxGuardsOverLimit(distinctGuards(guards.map(wireGuard)));
 
-/** A guard's matcher work: each matcher one, plus its query parameters and its body field. */
+/**
+ * One matcher's work: 1, plus for each query parameter it names 1 and 1 per value (each compared with
+ * every pair of the request's query), doubled in a scope (compared as sent and decoded), plus for a
+ * body field 1 and 1 per value.
+ */
+export function matcherWork(m: RequestMatch, scope: boolean): number {
+  const query = (m.query ?? []).reduce((n, q) => n + 1 + (q.values?.length ?? 0), 0);
+  return 1 + (scope ? 2 : 1) * query + (m.body_json ? 1 + m.body_json.values.length : 0);
+}
+
+/** A guard's matcher work: its scope's and its exceptions'. */
 export function guardWork(g: Pick<RequestGuard, "scope" | "allow">): number {
-  return [...g.scope, ...(g.allow ?? [])].reduce((n, m) => n + 1 + (m.query?.length ?? 0) + (m.body_json ? 1 : 0), 0);
+  return g.scope.reduce((n, m) => n + matcherWork(m, true), 0) + (g.allow ?? []).reduce((n, m) => n + matcherWork(m, false), 0);
 }
 
 /** Why `guards` (wire form) are more than one sandbox applies; null when within. */
@@ -128,7 +139,7 @@ export function sandboxGuardsOverLimit(guards: readonly RequestGuard[]): string 
   if (scope > SANDBOX_MAX_SCOPE_MATCHERS) return `a sandbox applies at most ${SANDBOX_MAX_SCOPE_MATCHERS} client guard scope matchers (this would be ${scope})`;
   const work = guards.reduce((n, g) => n + guardWork(g), 0);
   if (work > SANDBOX_MAX_GUARD_WORK) {
-    return `a sandbox's client guards ask at most ${SANDBOX_MAX_GUARD_WORK} matcher work (a matcher 1, plus 1 per query parameter and body field; this would be ${work})`;
+    return `a sandbox's client guards ask at most ${SANDBOX_MAX_GUARD_WORK} matcher work (a matcher 1, plus 1 per query parameter, body field and value, a scope's query twice; this would be ${work})`;
   }
   if (bytes(guards) > SANDBOX_MAX_GUARD_BYTES) return `a sandbox applies at most ${SANDBOX_MAX_GUARD_BYTES} bytes of client guards`;
   return null;

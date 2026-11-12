@@ -15,7 +15,7 @@ import { expandSpec, type Template } from "../src/lib/spec";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { SandboxPolicyLayer } from "../src/do/sandbox";
 import type { RequestGuard } from "../src/protocol/model";
-import { adminJson, BASE, connectHost, nextCommands, uniqueCell, type Ws } from "./helpers";
+import { adminJson, BASE, connectHost, enrollHost, nextCommands, uniqueCell, type Ws } from "./helpers";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 const LAUNCH = { builtin_tools: [], system_prompt: { mode: "append", text: "" } };
@@ -96,10 +96,18 @@ describe("client request guards (pure)", () => {
     expect(sandboxGuardsOverLimit(wire(17, 4))).toContain("scope matchers");
     // Exceptions count too, with their query parameters and body fields: the review's 534 exceptions of
     // four query names and a body field each, in a few guards, is far past it.
-    const heavy = (n: number) => wireGuard({ ...writes(`h${n}`), allow: Array.from({ length: 60 }, () => ({ query: [1, 2, 3, 4].map((i) => ({ name: `q${i}` })), body_json: { pointer: "/op", values: ["read"] } })) });
-    expect(guardWork(heavy(0))).toBe(1 + 60 * 6);
+    const heavy = (n: number) => wireGuard({ ...writes(`h${n}`), allow: Array.from({ length: 40 }, () => ({ query: [1, 2, 3, 4].map((i) => ({ name: `q${i}` })), body_json: { pointer: "/op", values: ["read"] } })) });
+    expect(guardWork(heavy(0))).toBe(1 + 40 * (1 + 4 + 2));
     expect(sandboxGuardsOverLimit([heavy(0)])).toBeNull();
     expect(sandboxGuardsOverLimit([heavy(0), heavy(1)])).toContain("matcher work");
+    // Each value counts, and a scope's query twice (matched as sent and decoded): the second review's
+    // 58 scope matchers of one query parameter with 16 values each are far past it.
+    const values = (n: number) => wireGuard({ ...writes(`v${n}`), scope: [{ query: [{ name: "q", values: Array.from({ length: 16 }, (_, i) => `v${i}`) }] }] });
+    expect(guardWork(values(0))).toBe(1 + 2 * 17);
+    expect(guardWork({ scope: [{}], allow: [{ query: [{ name: "q", values: ["a", "b"] }] }] })).toBe(1 + 1 + 3);
+    expect(guardWork({ scope: [{ body_json: { pointer: "/op", values: ["a", "b", "c"] } }] })).toBe(1 + 4);
+    expect(sandboxGuardsOverLimit(Array.from({ length: 14 }, (_, i) => values(i)))).toBeNull();
+    expect(sandboxGuardsOverLimit(Array.from({ length: 15 }, (_, i) => values(i)))).toContain("matcher work");
     expect(sandboxGuardsOverLimit(wire(32))).toBeNull();
   });
 
@@ -276,6 +284,35 @@ describe("client request guards on a sandbox", () => {
     const stored = await runInDurableObject(stub, (_i, st) =>
       JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'agent_guards'").one().value) as Record<string, unknown>);
     expect(Object.keys(stored)).toEqual(["agt_kept"]);
+  });
+
+  it("are refused (409), never dropped, while a sandbox host of the cell runs a nest-proxy that doesn't bound them", async () => {
+    const c = await newClient();
+    const s = await placed(c);
+    // A host of the previous release joins the cell: its hello says nothing of guard bounds.
+    await connectHost(c.cell, "sandbox", { guard_bounds: false });
+    const layer = await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { guards: [NO_DELETE] } });
+    expect(layer.status).toBe(409);
+    expect(layer.body.error.message).toContain("bound guarded requests");
+    expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`)).guards).toEqual([]);
+    // A layer without guards still goes through.
+    await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { A: "1" } } });
+    expect((await as(c.token, "/v1/sandboxes", { body: { cell: c.cell, guards: [NO_DELETE] } })).status).toBe(409);
+    expect((await ok(c.token, "/v1/sandboxes")).sandboxes.map((x: { sandbox: string }) => x.sandbox)).toEqual([s.sandbox]);
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    await expect(Promise.resolve().then(() => stub.attach("agt_g", undefined, [], [], { guards: holdGuards(c.id, [PUSH]) }))).rejects.toThrow(/bound guarded requests/);
+    expect((await stub.info()).attached).not.toContain("agt_g");
+    // Another subtree's guards don't count here, so they aren't refused either.
+    await stub.attach("agt_other", undefined, [], [], { guards: holdGuards("cli_someoneelse", [PUSH]) });
+  });
+
+  it("a host not heard from since enrolling counts as one that doesn't bound them", async () => {
+    const c = await newClient();
+    const s = await placed(c);
+    await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { guards: [NO_DELETE] } });
+    await enrollHost(c.cell, "sandbox");
+    expect((await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { guards: [NO_DELETE, PUSH] } })).status).toBe(409);
+    expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`)).guards).toEqual([NO_DELETE]);
   });
 
   it("a client's guard never changes how the operator routes a passthrough host or a TCP exception", async () => {
