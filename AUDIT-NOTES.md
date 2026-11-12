@@ -8,6 +8,8 @@ Base: origin/main 6bbf64f.
 - credentials L9 "the proxy refuses one whose binding isn't in the installed policy": the proxy stores every pushed secret (crates/nest-proxy/src/control.rs:169-177, state.rs:312-315); one with no binding just goes unused (inject.rs:52,62). No refusal.
 - credentials L9 "Every push and refusal is audited": operator static secret pushes (`inject:<binding>[:<scope>]`, broker.ts:289-303) have no audit record; only GitHub mints (broker.ts:443,946) and API clients' secrets (broker.ts:717) are audited; no refusal exists to audit.
 
+- identity L19 "only on each binding's exact hosts (and methods and path prefix, when set)": `InjectionBinding` has only name, hosts, placeholder, locations (crates/nest-protocol/src/model.rs:346-351); inject.rs:50-70 checks host and TLS only. No method or path scope. (Also reported by #251.)
+
 ## Corrections
 - security/README L9: gVisor has no driver (crates/nestd/src/driver/: access, firecracker, process, supervise, tree) -> "gVisor, not built".
 - security/README L15: control-plane role has `kms:Sign` and `kms:GetPublicKey` on the root key (deploy/lean/Cell/Stack.lean:380); credentials L28 already says so.
@@ -31,6 +33,12 @@ Base: origin/main 6bbf64f.
 - L28 IAM user nest-<cell>-control-plane (Stack.lean:602), nest=true tag condition (Stack.lean:376), kms (Stack.lean:380), AWS_CELL_CREDENTIALS (lib/cells.ts:6).
 - L30 cap: never resolvable (broker.ts:1230), lib/mcp.ts:43. L31-32 oauth_grants/oauth_clients (lib/mcp-auth.ts:550,555), one refresh at a time (mcp-auth.ts:715-718), refused refresh -> markReauthorize (mcp-auth.ts:788), /v1/oauth/client.json auth none (index.ts:735).
 - L33 api-loop: no code, marked deferred.
+
+- identity L5: the guest image installs nest-guest, init, git-credential-nest and the proxy root CA (images/guest/build.sh:76-91) but no `nest` CLI (crates/nest-cli/README.md:3 says it should be) -> "not built into the image yet".
+- identity L15: `BindingScope` has hands/pty/ingress (control-plane/src/protocol/gateway.ts:42) but SandboxDO mints only `hands` (sandbox.ts:1886-1888) and the gateway admits only `Hands` (crates/nest-gateway/src/verify.rs:97); docs/sandbox/gateway/ L24 lists /pty and /ingress as not built -> "only `hands` is built".
+
+## Confirmed (identity)
+- Proxy CA cert baked (images/guest/build.sh:87-91); guest re-checks epoch (crates/nest-guest/src/state.rs:85-126); NEST_AGENT_ID for attribution (crates/nest-cli/src/guest_cli.rs:1-3,18); agent epoch (control-plane/src/do/agent.ts:487-516); proxy substitutes only on binding hosts and TLS (crates/nest-proxy/src/inject.rs:50-70); jwks route auth none (index.ts:732); `nest token` absent from crates/nest-cli (deferred).
 
 ## Confirmed (security/README)
 - L11 brain: `--tools` lists no Bash/Read/Write/Edit (crates/nest-protocol/src/host.rs:1000,1351), `--restricted` (host.rs:999), env cleared (crates/nest-runner/src/agent.rs:250); host allowlist marked not built on main.
