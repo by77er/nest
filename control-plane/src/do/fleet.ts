@@ -970,11 +970,11 @@ export class FleetDO extends DurableObject<Env> {
           || this.sql.exec("SELECT 1 FROM commands WHERE cmd = ? AND result IS NOT NULL", c.cmd as string).toArray().length === 0);
       }
       const slots = (m.commands as Record<string, unknown>[] | undefined ?? []).flatMap((c) => commandRefSlots(c));
-      const values = new Map<RefPurpose, Record<string, string | null>>();
+      const values = new Map<RefPurpose, Record<string, { value: string; expires_ms?: number | null } | null>>();
       for (const purpose of new Set(slots.map((s) => s.purpose))) {
         const refs = [...new Set(slots.filter((s) => s.purpose === purpose).map((s) => s.ref))];
         try {
-          values.set(purpose, await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs(refs, REF_PURPOSES[purpose]));
+          values.set(purpose, await this.resolveRefs(refs, purpose));
         } catch (e) {
           console.error(`FleetDO: resolving secret references for batch ${m.seq} failed; holding it and the rest, closing`, e);
           this.closeRetryable(ws, "resolving secret references failed; reconnect and resend");
@@ -984,17 +984,35 @@ export class FleetDO extends DurableObject<Env> {
       // Superseded or closing (meanwhile, or by an earlier failure): its successor's hello resends.
       if (this.socketFor(host) !== ws) return;
       for (const s of slots) {
-        const value = values.get(s.purpose)?.[s.ref];
-        if (value === null || value === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
+        const got = values.get(s.purpose)?.[s.ref];
+        if (got === null || got === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
         // A missing injection secret goes out as no secret at all, never an empty one: nest-proxy then
         // refuses its binding's placeholder (`injection_unavailable`) instead of substituting "".
-        s.set(value ?? (s.purpose === "secrets_update" ? DROPPED_SECRET : ""));
+        s.set(got?.value ?? (s.purpose === "secrets_update" ? DROPPED_SECRET : ""));
+        // The expiry read with the value (absent from a BrokerDO of the previous release: the entry's stands).
+        if (got && got.expires_ms !== undefined) s.setExpiry?.(got.expires_ms);
       }
       for (const c of (m.commands as Record<string, unknown>[] | undefined) ?? []) {
         if (c.type === "secrets_update" && Array.isArray(c.secrets)) c.secrets = (c.secrets as { value?: unknown }[]).filter((x) => x.value !== DROPPED_SECRET);
       }
       this.send(ws, m as FleetToHost);
       ws.serializeAttachment({ host, helloed: true, sent: m.seq } satisfies Attachment);
+    }
+  }
+
+  /**
+   * One purpose's references resolved by BrokerDO, each value with its expiry as stored now. A BrokerDO
+   * still on the previous release (minutes of a deploy) lacks `resolveRefsExpiring`: its `resolveRefs`,
+   * whose entries keep the expiry the command already carries.
+   */
+  private async resolveRefs(refs: string[], purpose: RefPurpose): Promise<Record<string, { value: string; expires_ms?: number | null } | null>> {
+    const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
+    try {
+      return await broker.resolveRefsExpiring(refs, REF_PURPOSES[purpose]);
+    } catch (e) {
+      if (!/RPC receiver does not implement/.test(e instanceof Error ? e.message : String(e))) throw e;
+      const plain = await broker.resolveRefs(refs, REF_PURPOSES[purpose]);
+      return Object.fromEntries(Object.entries(plain).map(([k, v]) => [k, v === null ? null : { value: v }]));
     }
   }
 
