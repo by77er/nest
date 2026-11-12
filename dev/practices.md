@@ -10,7 +10,9 @@ What makes this repo safe for agents to change and to review. The checks are the
   - the gateway's and the hands client's credential-free code;
   - Claude Code's launch, and permission bypass;
   - TLS interception;
-  - metrics writes.
+  - metrics writes;
+  - nestd-core's purity (no I/O, clock, randomness or runtime dependency in the cores);
+  - Durable Object schemas expand-only (no rename or drop).
 - **Fence lists only shrink:** an allow entry whose files no longer match is stale and fails.
 - **Every guard can fail.** Each fence carries an example line, which `scripts/tests/` plants outside the allowed files and expects to be rejected. The doc-link, core-manifest and workflow checkers get the same treatment. A guard that only ever passes can't be told apart from one that never looks.
 - **Loosening a guard is invisible to the guard,** so `scripts/` is in `CODEOWNERS`.
