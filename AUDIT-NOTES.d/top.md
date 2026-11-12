@@ -1,5 +1,0 @@
-## Corrections
-| docs/interfaces/README.md (Conventions, open enums) | only `agent_exited.reason` and `egress_alert.reason` are open | the gateway refusal's `reason` (`GatewayRefusalReason`) is open too | control-plane/src/protocol/gateway.ts:69, crates/nest-protocol/src/gateway.rs:256 (and control.ts:313, model.ts:337, control.rs:639, model.rs:654) |
-## No drift
-Compat windows: `segment.total_bytes` optional both sides (crates/nest-protocol/src/control.rs:743, control-plane/src/protocol/control.ts:438); compat `ws_` (control-plane/src/do/sandbox.ts:49-50,455); `roles: []` (control-plane/src/lib/registry.ts:14, mcp.ts:214, brokered.ts:347); HostRole writes burst/controller, reads sandbox/brain (crates/nest-protocol/src/model.rs:192-198); hands_resolved legacy fields (control.rs:858-866). Designed items: none found in code (grep for metrics frame, tpl_, hold, policy_ack, restore_abi, --max-turns, DISABLE_UPDATES, --system-prompt-snapshot, path_prefix, pending_uploads, base_prepare, wake_seq, guest_flush_failed, sync_failed, duplicate_call, unknown_terminal, attach_token, drain_log_sites, defer): all stay designed. #249 touched no protocol types.
-STATUS: DONE
