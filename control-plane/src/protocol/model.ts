@@ -183,10 +183,19 @@ export const RequestMatch = z.object({
   path: z.string().optional(),
   query: z.array(QueryMatch).optional(),
   body_json: JsonFieldMatch.optional(),
-  /** The proxy substituted this binding's credential into the request. */
+  /**
+   * The proxy substituted this binding's credential into the request; `INJECTED_ANY` (`*`): any binding's.
+   * A host whose fleet hello lacks `guard_injected_any` reads `*` as a binding's name.
+   */
   injected: z.string().optional(),
 });
 export type RequestMatch = z.output<typeof RequestMatch>;
+
+/**
+ * `RequestMatch.injected` naming no binding: a credential the proxy injected was substituted, whichever
+ * binding's (docs/sandbox/networking/egress/policy/#any-injected-credential).
+ */
+export const INJECTED_ANY = "*";
 /** On its hosts, a request a `scope` matcher covers is refused unless an `allow` matcher covers it too. */
 export const RequestGuard = z.object({
   name: z.string(),

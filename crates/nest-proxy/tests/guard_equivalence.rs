@@ -5,8 +5,15 @@
 //! literals, `*` and `**`, query and body matchers. Within the guarded bounds the two must agree on
 //! every request, the body pre-pass aside: `needs_body` may now say no where the old one said yes
 //! (a guard none of whose scope can match), never the other way round.
+//!
+//! `injected: "*"` (any substituted binding) came later: the new evaluator decides a guard naming it as
+//! the previous one decides that guard with `*` replaced by the binding the request carries. The
+//! previous one, which is also the previous release's nest-proxy (equal to it within the bounds, above),
+//! reads `*` as a binding's name: `an_old_proxy_reads_any_as_a_name` shows that this refuses at least as
+//! much where `*` is only in exceptions, and can refuse less where it is in a scope (why the control
+//! plane gates `*` on hosts that know it).
 
-use nest_protocol::model::{HostPattern, JsonFieldMatch, QueryMatch, RequestGuard, RequestMatch};
+use nest_protocol::model::{HostPattern, INJECTED_ANY, JsonFieldMatch, QueryMatch, RequestGuard, RequestMatch};
 use nest_proxy::guard;
 
 #[allow(dead_code, clippy::all)]
@@ -324,7 +331,7 @@ fn matcher(r: &mut Rng) -> RequestMatch {
         m.body_json = Some(JsonFieldMatch { pointer: "/op".into(), values: vec!["read".into()] });
     }
     if r.below(5) == 0 {
-        m.injected = Some(["svc", "other"][r.below(2)].into());
+        m.injected = Some(["svc", "other", "*"][r.below(3)].into());
     }
     m
 }
@@ -355,8 +362,11 @@ fn decides_as_the_evaluator_before_it_did() {
         let new = guard::Req { host, method, path: &p, query: q.as_deref(), injected };
         let prep = new.prepare().expect("small requests are within the bounds");
         let ctx = format!("case {case}: {method} {host}{p}?{q:?} injected {injected:?} guards {guards:#?}");
-        let old_nb = reference::needs_body(&guards, &old);
-        let new_nb = guard::needs_body(&guards, &prep);
+        // What `*` means: the binding this request carries (with none, `*` names no binding it carries).
+        let resolved = resolve_any(&guards, injected);
+        let guards = &guards;
+        let old_nb = reference::needs_body(&resolved, &old);
+        let new_nb = guard::needs_body(guards, &prep);
         assert!(old_nb || !new_nb, "needs_body widened: {ctx}");
         for (ob, nb) in [
             (reference::BodyView::Unread, guard::BodyView::Unread),
@@ -364,17 +374,73 @@ fn decides_as_the_evaluator_before_it_did() {
             (reference::BodyView::Json(&read), guard::BodyView::Json(&read)),
             (reference::BodyView::Json(&write), guard::BodyView::Json(&write)),
         ] {
-            let o = reference::refusing(&guards, &old, &ob).map(|g| g.name.clone());
-            let n = guard::refusing(&guards, &prep, &nb).map(|g| g.name.clone());
+            let o = reference::refusing(&resolved, &old, &ob).map(|g| g.name.clone());
+            let n = guard::refusing(guards, &prep, &nb).map(|g| g.name.clone());
             assert_eq!(o, n, "{ctx}");
         }
         // Where the new pre-pass reads no body, the decision can't depend on it.
         if !new_nb {
             let decisions: Vec<_> = [guard::BodyView::Unread, guard::BodyView::Unknown, guard::BodyView::Json(&read), guard::BodyView::Json(&write)]
                 .iter()
-                .map(|b| guard::refusing(&guards, &prep, b).map(|g| g.name.clone()))
+                .map(|b| guard::refusing(guards, &prep, b).map(|g| g.name.clone()))
                 .collect();
             assert!(decisions.windows(2).all(|w| w[0] == w[1]), "body read skipped but it decides: {ctx}");
         }
     }
+}
+
+/// The guards with every `injected: "*"` replaced by the binding `injected` names (left as it is with
+/// none: the previous evaluator matches no name against a request that carries none).
+fn resolve_any(guards: &[RequestGuard], injected: Option<&str>) -> Vec<RequestGuard> {
+    let fix = |m: &RequestMatch| RequestMatch {
+        injected: m.injected.as_deref().map(|b| if b == INJECTED_ANY { injected.unwrap_or(b) } else { b }.to_string()),
+        ..m.clone()
+    };
+    guards.iter().map(|g| RequestGuard { scope: g.scope.iter().map(fix).collect(), allow: g.allow.iter().map(fix).collect(), ..g.clone() }).collect()
+}
+
+/// `guards` with `injected: "*"` kept only in exceptions (a scope's becomes the name `svc`).
+fn any_only_in_exceptions(guards: &[RequestGuard]) -> Vec<RequestGuard> {
+    let named = |m: &RequestMatch| RequestMatch {
+        injected: m.injected.as_deref().map(|b| if b == INJECTED_ANY { "svc" } else { b }.to_string()),
+        ..m.clone()
+    };
+    guards.iter().map(|g| RequestGuard { scope: g.scope.iter().map(named).collect(), ..g.clone() }).collect()
+}
+
+/// A previous-release nest-proxy given `injected: "*"` (it reads `*` as a binding's name, which no
+/// binding has). In an exception that only refuses more: it fails closed, so the control plane needn't
+/// keep such a guard off an old host. In a scope it refuses less: it fails open, so the control plane
+/// places a sandbox whose guards name `*` in a scope only on a host that says `guard_injected_any`.
+#[test]
+fn an_old_proxy_reads_any_as_a_name() {
+    let mut r = Rng(0xD1B5_4A32_D192_ED03);
+    let read = serde_json::json!({"op": "read"});
+    let (mut stricter, mut looser) = (0, 0);
+    for case in 0..40_000 {
+        let generated: Vec<RequestGuard> = (0..1 + r.below(3)).map(|i| guard_(&mut r, i)).collect();
+        let (p, q) = (path(&mut r), query(&mut r));
+        let host = ["h.test", "x.h.test"][r.below(2)];
+        let method = ["GET", "POST", "PUT"][r.below(3)];
+        let injected = [None, Some("svc"), Some("other"), Some("client:svc")][r.below(4)];
+        let old = reference::Req { host, method, path: &p, query: q.as_deref(), injected };
+        let prep = guard::Req { host, method, path: &p, query: q.as_deref(), injected }.prepare().expect("small requests are within the bounds");
+        for body in [reference::BodyView::Unread, reference::BodyView::Unknown, reference::BodyView::Json(&read)] {
+            let new_body = match body {
+                reference::BodyView::Unread => guard::BodyView::Unread,
+                reference::BodyView::Unknown => guard::BodyView::Unknown,
+                reference::BodyView::Json(v) => guard::BodyView::Json(v),
+            };
+            // Only in exceptions: whatever the new proxy refuses, the old one refuses too.
+            let guards = any_only_in_exceptions(&generated);
+            let (o, n) = (reference::refusing(&guards, &old, &body).is_some(), guard::refusing(&guards, &prep, &new_body).is_some());
+            assert!(o || !n, "case {case}: an old proxy let through what a new one refuses, with * only in exceptions: {method} {host}{p}?{q:?} injected {injected:?} guards {guards:#?}");
+            stricter += usize::from(o && !n);
+            // Anywhere: an old proxy can let through what a new one refuses (a scope's `*` matches nothing there).
+            looser += usize::from(!reference::refusing(&generated, &old, &body).is_some() && guard::refusing(&generated, &prep, &new_body).is_some());
+        }
+    }
+    // Neither side is vacuous: an exception's `*` lets requests through on a new proxy that an old one
+    // refuses, and a scope's `*` refuses requests on a new proxy that an old one lets through.
+    assert!(stricter > 0 && looser > 0, "stricter {stricter}, looser {looser}");
 }

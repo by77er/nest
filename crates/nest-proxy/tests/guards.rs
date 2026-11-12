@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use common::*;
 use nest_protocol::control::EgressVerdict;
 use nest_protocol::host::proxy::{ProxyCommand, ProxyEvent};
-use nest_protocol::model::{Epoch, HostPattern, JsonFieldMatch, RequestGuard, RequestMatch};
+use nest_protocol::model::{Epoch, HostPattern, INJECTED_ANY, JsonFieldMatch, RequestGuard, RequestMatch};
 
 fn m(methods: &[&str], path: &str) -> RequestMatch {
     RequestMatch { methods: methods.iter().map(|s| s.to_string()).collect(), path: Some(path.into()), ..Default::default() }
@@ -131,6 +131,36 @@ async fn an_exception_can_require_the_proxys_own_credential() {
         .wait(|e| matches!(e, ProxyEvent::Audit { records } if records.iter().any(|r|
             r.reason.as_deref() == Some("guard: svc-write") && r.binding.is_none() && r.path.as_deref() == Some("/q"))))
         .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_floor_can_require_any_credential_the_proxy_injected() {
+    // An operator's floor that names no binding: a write passes only with a credential the proxy
+    // substituted, whichever binding's (`injected: "*"`), never with one the sandbox sent itself.
+    let mut env = env().await;
+    let mut p = policy(2, env.echo_addr.port());
+    p.guards = vec![RequestGuard {
+        name: "floor".into(),
+        hosts: vec![HostPattern(HOST.into())],
+        scope: vec![RequestMatch { methods_except: vec!["GET".into(), "HEAD".into()], ..Default::default() }],
+        allow: vec![RequestMatch { injected: Some(INJECTED_ANY.into()), ..Default::default() }],
+        reason: "writes only with nest's credential".into(),
+        ignore_case: false,
+    }];
+    push(&mut env, p).await;
+    let ours = format!("Bearer {PLACEHOLDER}");
+    for h2 in [false, true] {
+        let r = https_req(&env, HOST, "POST", "/anything", &[("authorization", &ours)], b"{}", h2).await;
+        assert_eq!(r.status, 200, "{:?}", r.body);
+        assert_eq!(received_auth(&r.body), format!("Bearer {SECRET}"));
+        let r = https_req(&env, HOST, "POST", "/anything", &[("authorization", "Bearer planted")], b"{}", h2).await;
+        assert_eq!((r.status, r.body["guard"].as_str()), (403, Some("floor")), "a credential the sandbox holds gets no exception");
+        assert!(r.body.get("body_len").is_none(), "refused before the upstream");
+        let r = https_req(&env, HOST, "POST", "/anything", &[], b"{}", h2).await;
+        assert_eq!(r.status, 403);
+        let r = https_req(&env, HOST, "GET", "/anything", &[], b"", h2).await;
+        assert_eq!(r.status, 200);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

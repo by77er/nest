@@ -2,6 +2,7 @@
 // leases and their expiry, STONITH, placement, and command delivery with exactly-one results.
 import { DurableObject } from "cloudflare:workers";
 import { CLIENT_GUARD_PREFIX } from "../lib/client-guards";
+import { freshInjectedAny, injectedAnyConflict, namesInjectedAny } from "../lib/injected-any";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
@@ -149,6 +150,8 @@ interface HostRow {
   brain_epochs: number;
   /** Its nest-proxy bounds guarded requests (1: its last hello said so), or not yet known or of the previous release (0). */
   guard_bounds: number;
+  /** Its nest-proxy reads a guard's `injected: "*"` as any binding (1: its last hello said so), or not yet known or of the previous release (0). */
+  guard_injected_any: number;
   /** When a drain was asked for (null: none). The status says whether it is serving; this survives an expiry and a return. */
   drain_ms: number | null;
   [key: string]: SqlStorageValue;
@@ -419,6 +422,9 @@ export class FleetDO extends DurableObject<Env> {
     // Its nest-proxy bounds guarded requests (its hello says so; a host of the previous release, or one
     // not yet heard from, doesn't): API clients' request guards are refused in a cell with any host without it.
     addColumn(this.sql, "hosts", "guard_bounds", "INTEGER NOT NULL DEFAULT 0");
+    // Its nest-proxy reads a guard's `injected: "*"` as any binding (its hello says so; one of the previous
+    // release reads it as a binding's name): guards naming it are refused in a cell with any host without it.
+    addColumn(this.sql, "hosts", "guard_injected_any", "INTEGER NOT NULL DEFAULT 0");
     // A drain is an intent, not a liveness: a host that expires and comes back returns to `draining`.
     addColumn(this.sql, "hosts", "drain_ms", "INTEGER");
     addColumn(this.sql, "leases", "state", "TEXT");
@@ -1090,8 +1096,9 @@ export class FleetDO extends DurableObject<Env> {
     const orphans = stored === undefined ? undefined : parseOrphans(stored);
     // The host has processed every command up to `last_command_seq`; the socket starts there.
     if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
-    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ?, guard_bounds = ? WHERE host = ?",
-      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, hello.guard_bounds ? 1 : 0, att.host);
+    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ?, guard_bounds = ?, guard_injected_any = ? WHERE host = ?",
+      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, hello.guard_bounds ? 1 : 0,
+      hello.guard_injected_any ? 1 : 0, att.host);
     this.setTunnelState(att.host, hello.tunnel ?? "none", prior);
     if (hello.cgroup_delegation_error) {
       console.error(`FleetDO: ${att.host} runs its VMMs outside its unit cgroup (delegation failed: ${hello.cgroup_delegation_error})`);
@@ -1715,12 +1722,17 @@ export class FleetDO extends DurableObject<Env> {
       this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
     }
     // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts. A sandbox with API
-    // clients' request guards goes only to a host whose nest-proxy bounds them (`guard_bounds`): none
-    // free means no placement yet (SandboxDO retries), never one that would decide them unbounded.
+    // clients' request guards goes only to a host whose nest-proxy bounds them (`guard_bounds`), and one
+    // with a guard whose scope names `injected: "*"` only to a host that reads it as any binding
+    // (`guard_injected_any`; another reads it as a name, and the scope would match nothing: fail open). One
+    // naming it only in exceptions goes anywhere: there such a host only refuses more. None free means no
+    // placement yet (SandboxDO retries), never one that would decide them unbounded or open.
     const need = req.resources;
     const cfg = this.cellConfig();
     const guarded = (req.policy.guards ?? []).some((g) => g.name.startsWith(CLIENT_GUARD_PREFIX));
-    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: guarded ? "wedged_ms IS NULL AND guard_bounds = 1" : "wedged_ms IS NULL" })
+    const anyScope = namesInjectedAny(req.policy.guards ?? [], "scope");
+    const where = ["wedged_ms IS NULL", ...(guarded ? ["guard_bounds = 1"] : []), ...(anyScope ? ["guard_injected_any = 1"] : [])].join(" AND ");
+    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where })
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
       .map((h) => {
         const capacity = h.capacity ? (JSON.parse(h.capacity) as Capacity) : null;
@@ -2574,6 +2586,11 @@ export class FleetDO extends DurableObject<Env> {
   async setEgressBase(input: unknown): Promise<EgressBase & { pending: number }> {
     const parsed = EgressBaseInput.safeParse(input);
     if (!parsed.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `egress base: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
+    // A guard newly naming `injected: "*"` waits for every sandbox host of the cell to read it as any
+    // binding: the layer reaches every sandbox, wherever it runs (one already stored stays writable).
+    const fresh = freshInjectedAny(parsed.data.guards, this.storedEgressBase().guards);
+    const old = fresh.length ? this.withoutInjectedAny() : [];
+    if (old.length) throw injectedAnyConflict(this.cellName() ?? "(unnamed)", fresh.map((g) => g.name), old);
     const base: EgressBase = { version: this.storedEgressBase().version + 1, allow: parsed.data.allow, guards: parsed.data.guards };
     this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", EGRESS_BASE_KEY, JSON.stringify(base));
     this.sql.exec(`INSERT INTO egress_base_notices (sandbox, version, attempts, due_ms)
@@ -3196,6 +3213,20 @@ export class FleetDO extends DurableObject<Env> {
    */
   async hostsWithoutGuardBounds(): Promise<string[]> {
     return this.hostsBy({ role: SANDBOX_ROLE, status: ["active", "draining", "expired", "stonith_pending"], where: "guard_bounds = 0" }).map((h) => h.host);
+  }
+
+  /**
+   * The cell's sandbox hosts that could hold a sandbox (any not dead) whose nest-proxy isn't known to read
+   * a guard's `injected: "*"` as any binding: of the previous release (it reads `*` as a binding's name),
+   * or not heard from since enrolling. Guards newly naming it are refused while there is one
+   * (docs/sandbox/networking/egress/policy/#any-injected-credential).
+   */
+  async hostsWithoutInjectedAny(): Promise<string[]> {
+    return this.withoutInjectedAny();
+  }
+
+  private withoutInjectedAny(): string[] {
+    return this.hostsBy({ role: SANDBOX_ROLE, status: ["active", "draining", "expired", "stonith_pending"], where: "guard_injected_any = 0" }).map((h) => h.host);
   }
 
   private hostsBy(

@@ -3,8 +3,9 @@
 //! a scope and exceptions; a request its scope covers is refused unless an exception covers it too.
 //!
 //! This module knows hosts, methods, paths, query parameters, one JSON body field and whether a
-//! binding was substituted. It knows nothing about any service: what a guard means (say, "pushes
-//! only to these repos") is built by a constructor in the control plane.
+//! binding was substituted (a named one, or any: `injected: "*"`). It knows nothing about any
+//! service: what a guard means (say, "pushes only to these repos") is built by a constructor in the
+//! control plane.
 //!
 //! Matching errs towards refusing. A scope matches a request if it matches the path as sent **or**
 //! the path decoded and normalized (percent-decoding, `\` as `/`, empty and dot segments, `;params`),
@@ -18,7 +19,7 @@
 //! `MAX_GUARDED_*` bounds is refused rather than decided. Each matcher then costs time linear in the
 //! bounded path and query (a pattern with one `**`).
 
-use nest_protocol::model::{JsonFieldMatch, QueryMatch, RequestGuard, RequestMatch};
+use nest_protocol::model::{INJECTED_ANY, JsonFieldMatch, QueryMatch, RequestGuard, RequestMatch};
 
 /// The longest request path an exception can match (the injection safe-path limit).
 const MAX_PATH: usize = 2048;
@@ -145,7 +146,7 @@ fn matches(m: &RequestMatch, req: &Prepared<'_>, body: Option<&BodyView<'_>>, ic
         return false;
     }
     if let Some(b) = &m.injected
-        && req.injected != Some(b.as_str())
+        && !injected_matches(b, req.injected)
     {
         return false;
     }
@@ -165,6 +166,12 @@ fn matches(m: &RequestMatch, req: &Prepared<'_>, body: Option<&BodyView<'_>>, ic
         (None, _) | (Some(_), None) => true,
         (Some(f), Some(b)) => body_matches(f, b, mode),
     }
+}
+
+/// `injected`: the request had that binding's credential substituted, or any binding's for
+/// [`INJECTED_ANY`]. Never when nothing was substituted.
+fn injected_matches(want: &str, substituted: Option<&str>) -> bool {
+    substituted.is_some_and(|b| want == INJECTED_ANY || want == b)
 }
 
 // --- paths ---------------------------------------------------------------------------------------
@@ -544,6 +551,32 @@ mod tests {
         assert!(!refused(&g, &r(Some("svc"))));
         assert!(refused(&g, &r(Some("other"))));
         assert!(refused(&g, &r(None)));
+    }
+
+    #[test]
+    fn injected_any_needs_some_binding_substituted() {
+        let any = || RequestMatch { injected: Some(INJECTED_ANY.into()), ..m(&["POST"], None) };
+        let r = |injected: Option<&'static str>| Req { host: "api.test", method: "POST", path: "/query", query: None, injected };
+        // In an exception: any substituted binding lets the write through; none doesn't.
+        let floor = RequestGuard {
+            name: "floor".into(),
+            hosts: vec![HostPattern("api.test".into())],
+            scope: vec![m(&["POST"], None)],
+            allow: vec![any()],
+            reason: String::new(),
+            ignore_case: false,
+        };
+        for b in ["svc", "other", "client:svc"] {
+            assert!(!refused(&floor, &r(Some(b))), "{b}");
+        }
+        assert!(refused(&floor, &r(None)));
+        // In a scope: it covers a request with any substituted binding, and none without.
+        let no_creds = RequestGuard { name: "no-creds".into(), scope: vec![any()], allow: vec![], ..floor.clone() };
+        assert!(refused(&no_creds, &r(Some("svc"))) && refused(&no_creds, &r(Some("client:x"))));
+        assert!(!refused(&no_creds, &r(None)));
+        // Only `*` itself is the wildcard: a pattern-looking name is a name.
+        let named = RequestGuard { allow: vec![RequestMatch { injected: Some("s*".into()), ..m(&["POST"], None) }], ..floor };
+        assert!(refused(&named, &r(Some("svc"))));
     }
 
     #[test]

@@ -433,10 +433,15 @@ pub struct RequestMatch {
     /// A field of a JSON request body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_json: Option<JsonFieldMatch>,
-    /// The request had this binding's credential substituted by the proxy.
+    /// The request had this binding's credential substituted by the proxy; [`INJECTED_ANY`] (`*`): any
+    /// binding's. A host whose fleet hello lacks `guard_injected_any` reads `*` as a binding's name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub injected: Option<String>,
 }
+
+/// `RequestMatch.injected` naming no binding: a credential the proxy injected was substituted, whichever
+/// binding's (docs/sandbox/networking/egress/policy/#request-guards).
+pub const INJECTED_ANY: &str = "*";
 
 /// A query parameter `name` (decoded) whose decoded value is one of `values` (any value when empty).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
