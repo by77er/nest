@@ -13,7 +13,7 @@ Base: origin/main 6bbf64f.
 | Dependencies | "Waiting on N" badge is gray, outline | gray, `variant="light"` | projects/src/ui/features/board/WaitingBadge.tsx:36 |
 | Models | shared templates "which now carry the defaults" (tombstone wording) | they carry the defaults | projects/src/catalog.ts:172-173 |
 | Creating a project | a create is removed after 8 attempts or an unreadable body | also at once on a permanent failure | projects/src/do/directory.ts:141,196-205 |
-| Pieces | labels: `project`, `role`, worker `task`, reviewer `pr`/`sha` | also a routine run's `run` and (not dreaming) `routine`, and every start's `start` | projects/src/do/project.ts:3131,3198,4072,4124; do/review.ts:886 |
+| Pieces | labels: `project`, `role`, worker `task`, reviewer `pr`/`sha` | also a routine run's `routine` and `run`, and the manager's, a worker's and a reviewer's `start` | projects/src/do/project.ts:3131,4072,4124; do/review.ts:886 |
 | How it uses nest | templates `projects/{manager,worker,reviewer,routine}` | the sync also writes `projects/dreaming` | projects/src/catalog.ts:180 |
 | The repo's own guidance | "This replaces the runner reading the repo's CLAUDE.md" (change narrative) | the runner reads none of a repo's instructions | docs/agents/runner/README.md:29 |
 | Status (line 5) | Not built: starting a new manager once one ends | built: an ended manager is replaced with backoff, up to 3 an hour, then waits for the owner's Restart (as "The manager lifecycle" says) | projects/src/manager.ts:63-101; do/project.ts:3899 |
@@ -26,6 +26,7 @@ Base: origin/main 6bbf64f.
 | Blocked; Task changes; PRs | change wording ("as before", "may now be", "It replaces the asks banner", "the old column … is still") | stated as current behaviour | projects/src/tasks.ts:89; api.ts:420 |
 | PR upkeep | a failed read backs off past a minute "from the sixth failure in a row" | from the fifth: `max(PR_READ_EVERY_MS, backoff(attempts))`, and backoff(5) = 80 s | projects/src/do/project.ts:1777-1778; nest.ts:332 |
 | PR upkeep | change wording ("before this", "as before", "now that", "this change leaves those as they are") | stated as current | projects/src/do/project.ts:584-611 |
+| Routines (the page) | badges: Running, Queued, Cooling down, Off | also Starting | projects/src/ui/features/routines/describe.ts:45-48 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
@@ -44,6 +45,9 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Triage: no drift (MAX_UNTRIAGED_ISSUES 200 issues.ts:9; ISSUES_FROM :5; title/body 300/20,000 do/project.ts:189-190; import 300 :1317; PREVIEW_LINES/CHARS ui/features/triage/TriagePage.tsx:27-28; requests.ts:39).
+- Routines: one correction; limits requests.ts:101-128 (15 min-7 d, cooldown, 5-120 min, 1-20 turns), max_routine_runs 1-3 requests.ts:47, MAX_PROPOSALS_PER_RUN 5 / MAX_UNTRIAGED_PROPOSALS 50 routines.ts:49-50, MAX_START_ATTEMPTS 8 :54, dream window 7/30 d and 200 entries :171-175, labels and keys do/project.ts:3131,3161, declined block 30 d :4557, routes api.ts:479-506, RUNS/NOTES/PROPOSALS_SHOWN 10.
+- Presets: no drift (routines.ts:155-169).
 - PR comments: no drift (CLAIM_LAPSE_MS do/directory.ts:158; once an hour do/project.ts:1175-1176; REVISE_MAX 3/hour :4486-4488; COMMENTS_SEEN_KEEP_MS 30 d :4484; PR_COMMENT_MAX 4000 :4494; pr_inputs :441).
 - PR upkeep: one number fixed, wording; the rest matches (FINDINGS_MAX pr-upkeep.ts:45, FAILING :21, PR_READ_BATCH pr-read.ts:47, PR_READ_EVERY_MS/GAP/RETELL/FLAP do/project.ts:606-611, pr_told :584, schedule columns :586-588, pr_read_failed once a day :1781, TRANSIENT_GRAPHQL github.ts:80).
 - Blocked: no drift beyond wording (canBlock/canUnblock tasks.ts:234-245; answer api.ts:440; attention/needs_you api.ts:78-142,420).
