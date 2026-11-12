@@ -1,0 +1,3 @@
+## No drift: docs/interfaces/host-internal/nestd-gateway/README.md, docs/interfaces/host-internal/README.md (socket table, framing)
+GatewayCommand/GatewayEvent (crates/nest-protocol/src/host.rs:545-600, protocol/fixtures/host/gateway_*); ping 5 s, silence/send 15 s (crates/nestd/src/gateway_link.rs:32-33,282); gateway backoff 250 ms–5 s, silence 30 s, hello_ack 10 s (crates/nest-gateway/src/link.rs:19-23); socket paths (host.rs:29-41); gateway_gid/gateway_uids (crates/nestd/src/config.rs:171-184); 0660 (crates/nest-runner/src/lib.rs:53, crates/nestd/src/proxy_link.rs:130); fdpass limits (host.rs:145-151).
+STATUS: DONE
