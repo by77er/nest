@@ -978,6 +978,12 @@ export const ROUTES: Route[] = [
   } }),
   route({ method: "GET", path: "/v1/agents/:agent/children", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).children() }),
   route({ method: "PUT", path: "/v1/agents/:agent/rules", auth: "admin", body: z.array(ToolRule), run: ({ env, p, body }) => agent(env, p.agent).setRules(body) }),
+  // The operator's rules cleared: the agent's rules come from its capabilities, as they are now, again
+  // (docs/control-plane/durable-objects/agent/#rules).
+  route({ method: "DELETE", path: "/v1/agents/:agent/rules", auth: "admin", run: ({ env, p }) => {
+    const a = agent(env, p.agent);
+    return newMethod("AgentDO.clearRules", () => a.clearRules());
+  } }),
   // The agent's brokered-action journal, newest first; `before` pages by an earlier page's last created_ms.
   route({ method: "GET", path: "/v1/agents/:agent/brokered", auth: "owner", run: async (c) => {
     const q = c.url.searchParams;

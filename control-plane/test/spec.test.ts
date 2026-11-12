@@ -8,7 +8,7 @@ import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import {
   type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
   SEED_CATALOG_V1, SEED_STEPS, SEED_VERSION, seedMigration, TIMER_CAPABILITIES, SpawnerOverrides, specFromRole, type Template, templatesUsing, CHANNEL_CAPABILITIES_REMOVED,
-  CHANNEL_TOOLS_REMOVED, EGRESS_CAPABILITIES, MESSAGING_CAPABILITIES_REMOVED, MESSAGING_TOOLS_REMOVED, pruneCapability, pruneTemplate, REMOVED_CAPABILITIES, rewritePrompt, SPAWNING_CAPABILITIES, SPAWNING_PROMPT_V5,
+  CHANNEL_TOOLS_REMOVED, EGRESS_CAPABILITIES, joinRules, liveCapabilities, type RuleSource, templateRuleSources, MESSAGING_CAPABILITIES_REMOVED, MESSAGING_TOOLS_REMOVED, pruneCapability, pruneTemplate, REMOVED_CAPABILITIES, rewritePrompt, SPAWNING_CAPABILITIES, SPAWNING_PROMPT_V5,
 } from "../src/lib/spec";
 import { Credential, type ToolRule } from "../src/protocol/control";
 
@@ -40,6 +40,7 @@ describe("the first seed catalog is what the roles were", () => {
       tools: WORKER_TOOLS,
       launch: WORKER_LAUNCH,
       rules: [NEST_ALLOW, { pattern: "Agent", decision: "allow" }, { pattern: "Task", decision: "allow" }],
+      rule_sources: SEED_CATALOG_V1.templates.worker!.capabilities.map((capability) => ({ capability })),
       credential: "claude_oauth_token:worker",
     });
   });
@@ -50,6 +51,7 @@ describe("the first seed catalog is what the roles were", () => {
       tools: CAPTAIN_TOOLS,
       launch: CAPTAIN_LAUNCH,
       rules: [NEST_ALLOW],
+      rule_sources: SEED_CATALOG_V1.templates.captain!.capabilities.map((capability) => ({ capability })),
       credential: "claude_oauth_token:captain",
     });
   });
@@ -74,7 +76,7 @@ describe("the first seed catalog is what the roles were", () => {
 describe("records stored with a role read through a frozen table, not the seed", () => {
   it("the first seed still expands to what ROLE_SPECS freezes (so a seed edit can't change it unnoticed)", () => {
     for (const role of ["worker", "captain"] as const) {
-      const { launch: _l, rules: _r, ...rest } = expand(SEED_CATALOG_V1, role, role === "worker");
+      const { launch: _l, rules: _r, rule_sources: _s, ...rest } = expand(SEED_CATALOG_V1, role, role === "worker");
       expect(rest, role).toEqual(ROLE_SPECS[role]);
     }
   });
@@ -107,6 +109,57 @@ describe("a spawner's overrides can only narrow", () => {
     expect(r.value.rules).toEqual([{ pattern: "mcp__nest__Bash(rm *)", decision: "deny" }, { pattern: "WebSearch", decision: "ask" }, ...base.rules]);
     expect([r.value.launch, r.value.credential]).toEqual([base.launch, base.credential]);
     expect(spawn({ tools: ["merge"] }).ok).toBe(false);
+  });
+});
+
+describe("rule sources: an agent's own rules apart from its capabilities' (read as they are now)", () => {
+  const deny = { pattern: "WebFetch", decision: "deny" as const };
+  const ask = { pattern: "Bash(git push *)", decision: "ask" as const };
+  const allowWeb: ToolRule = { pattern: "WebFetch", decision: "allow" };
+  const LAUNCH = { builtin_tools: [], system_prompt: { mode: "append" as const, text: "" } };
+  const tpl = (capabilities: string[]): Template => ({ capabilities, launch: LAUNCH, hands: "forbidden", credential: "claude_oauth_token" });
+  const cat: Catalog = {
+    capabilities: { nest: SEED_CATALOG.capabilities.nest!, web: { tools: [], rules: [allowWeb], prompt: "" }, "acme/tools": { tools: [], rules: [allowWeb, ask], prompt: "" } },
+    templates: { t: tpl(["nest", "web"]), "acme/t": tpl(["nest", "acme/tools"]) },
+  };
+
+  it("a spawner's narrowing is a source of its own, first; the capabilities follow, by name", () => {
+    const r = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "t", hands: false, by: "spawner", overrides: { rules: [deny] } });
+    if (!r.ok) throw new Error(r.error);
+    expect(r.value.rule_sources).toEqual([{ rules: [deny] }, { capability: "nest" }, { capability: "web" }]);
+    // At spawn the stored rules are what the sources give now: the narrowing wins over the capability's allow.
+    expect(r.value.rules).toEqual(joinRules(r.value.rule_sources!, { nest: [NEST_ALLOW], web: [allowWeb] }));
+    expect(r.value.rules).toEqual([deny, NEST_ALLOW, allowWeb]);
+    expect(r.value.rules_set).toBeUndefined();
+  });
+
+  it("joining reads each capability as it is now, keeps the narrowing first, and a deleted capability gives none", () => {
+    const sources: RuleSource[] = [{ rules: [deny] }, { capability: "nest" }, { capability: "web" }];
+    expect(joinRules(sources, { nest: [NEST_ALLOW], web: [allowWeb, ask] })).toEqual([deny, NEST_ALLOW, allowWeb, ask]);
+    expect(joinRules(sources, { nest: [NEST_ALLOW], web: null })).toEqual([deny, NEST_ALLOW]);
+    expect(joinRules(sources, { nest: [NEST_ALLOW] })).toEqual([deny, NEST_ALLOW]);
+    // Each rule once, the first kept: a capability can't move a rule ahead of the narrowing.
+    expect(joinRules(sources, { nest: [deny, NEST_ALLOW], web: [] })).toEqual([deny, NEST_ALLOW]);
+    expect(liveCapabilities([...sources, { capability: "nest" }])).toEqual(["nest", "web"]);
+  });
+
+  it("the operator's rules replace the capabilities' (rules_set), keeping the sources for when they're cleared", () => {
+    const r = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "t", hands: false, by: "operator", overrides: { rules: [ask] } });
+    if (!r.ok) throw new Error(r.error);
+    expect(r.value.rules).toEqual([ask]);
+    expect(r.value.rules_set).toBe(true);
+    expect(r.value.rule_sources).toEqual([{ capability: "nest" }, { capability: "web" }]);
+  });
+
+  it("a client's capability is read live only in that client's subtree; the operator's agent keeps it as at spawn", () => {
+    const inSubtree = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "acme/t", hands: false, by: "spawner" }, {}, "acme");
+    if (!inSubtree.ok) throw new Error(inSubtree.error);
+    expect(inSubtree.value.rule_sources).toEqual([{ capability: "nest" }, { capability: "acme/tools" }]);
+    const operators = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "acme/t", hands: false, by: "operator" });
+    if (!operators.ok) throw new Error(operators.error);
+    expect(operators.value.rule_sources).toEqual([{ capability: "nest" }, { rules: [allowWeb, ask] }]);
+    expect(templateRuleSources(cat, "acme/t", "other")).toEqual({ ok: true, value: [{ capability: "nest" }, { rules: [allowWeb, ask] }] });
+    expect(templateRuleSources(cat, "nope", null).ok).toBe(false);
   });
 });
 
@@ -174,7 +227,7 @@ describe("the current seed: spawning added, the task ledger, the channels and th
     expect(w.rules).toEqual([NEST_ALLOW]);
     expect(c.launch.builtin_tools).toEqual([]);
     for (const [v1, v2] of [[v1w, w], [v1c, c]] as const) {
-      expect({ ...v2, tools: [], launch: null, rules: [], spawn: [] }).toEqual({ ...v1, tools: [], launch: null, rules: [], spawn: [] });
+      expect({ ...v2, tools: [], launch: null, rules: [], rule_sources: [], spawn: [] }).toEqual({ ...v1, tools: [], launch: null, rules: [], rule_sources: [], spawn: [] });
       expect(v2.launch.system_prompt.text.startsWith(v1.launch.system_prompt.text)).toBe(true);
     }
     for (const name of [...REMOVED_CAPABILITIES, ...CHANNEL_CAPABILITIES_REMOVED, ...MESSAGING_CAPABILITIES_REMOVED]) {

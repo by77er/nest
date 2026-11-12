@@ -156,7 +156,19 @@ export interface AgentSpec {
   /** Platform tools, in registry order. */
   tools: string[];
   launch: LaunchConfig;
+  /**
+   * Its rules as last read (first match wins): what its runner's cache carries. With `rule_sources`
+   * (and no `rules_set`), derived from them; otherwise fixed (docs/control-plane/durable-objects/agent/#rules).
+   */
   rules: ToolRule[];
+  /**
+   * Where its rules come from, in order: rules of its own (a spawner's narrowing, or a capability outside
+   * its subtree's namespace, as it was at spawn) and the capabilities whose rules it reads as they are
+   * now. Absent: a spec from before them, whose `rules` stay as stored.
+   */
+  rule_sources?: RuleSource[];
+  /** The operator replaced its rules (a spawn's `overrides.rules`, `PUT /v1/agents/<id>/rules`): `rules` stay as set until cleared. */
+  rules_set?: true;
   credential: string;
   /** Its mcp capabilities' servers, in capability order; absent when it has none (as is every stored spec before them). */
   mcp?: McpGrant[];
@@ -180,6 +192,25 @@ export interface AgentSpec {
   egress?: { allow: EgressRule[] };
   /** Its processes' environment in its sandbox; absent when none. */
   env?: Record<string, string>;
+}
+
+/**
+ * One source of an agent's rules (docs/control-plane/durable-objects/agent/#rules): rules of its own,
+ * fixed, or a capability's, read as the capability is now.
+ */
+export type RuleSource = { rules: ToolRule[] } | { capability: string };
+
+/** The capabilities whose rules `sources` read as they are now, in order, each once. */
+export function liveCapabilities(sources: readonly RuleSource[]): string[] {
+  return [...new Set(sources.flatMap((s) => ("capability" in s ? [s.capability] : [])))];
+}
+
+/**
+ * An agent's rules from its sources, in order, each rule once (first occurrence kept): `current` holds
+ * each capability's rules as they are now; one absent or null (deleted) gives none.
+ */
+export function joinRules(sources: readonly RuleSource[], current: Readonly<Record<string, readonly ToolRule[] | null>>): ToolRule[] {
+  return dedupeRules(sources.flatMap((s) => ("rules" in s ? s.rules : Object.hasOwn(current, s.capability) ? current[s.capability] ?? [] : [])));
 }
 
 export interface Catalog {
@@ -583,10 +614,39 @@ function dedupeBy<T>(items: readonly T[], key: (t: T) => string): T[] {
 const dedupeRules = (rules: readonly ToolRule[]) => dedupeBy(rules, (r) => JSON.stringify([r.pattern, r.decision, r.reason ?? null]));
 
 /**
+ * Where a capability's rules come from for an agent in namespace `ns`'s subtree (null: the operator's):
+ * the operator's capabilities and its own namespace's are read as they are now; another namespace's (an
+ * operator's agent from a template naming a client's capability) is fixed as it is at spawn, since that
+ * client may not change what the operator's agent asks for.
+ */
+function ruleSource(name: string, cap: Capability, ns: string | null): RuleSource {
+  const own = name.includes("/") ? name.slice(0, name.indexOf("/")) : null;
+  return own === null || own === ns ? { capability: name } : { rules: cap.rules.map((r) => ({ ...r })) };
+}
+
+/**
+ * The rule sources template `name` gives an agent in namespace `ns`'s subtree, from the catalog as it is
+ * (`expandTemplate`'s, without the rest of the expansion).
+ */
+export function templateRuleSources(catalog: Catalog, name: string, ns: string | null): Result<RuleSource[]> {
+  if (!Object.hasOwn(catalog.templates, name)) return err(`unknown template ${name}`);
+  const out: RuleSource[] = [];
+  for (const c of catalog.templates[name]!.capabilities) {
+    if (!Object.hasOwn(catalog.capabilities, c)) return err(`template ${name}: unknown capability ${c}`);
+    out.push(ruleSource(c, catalog.capabilities[c]!, ns));
+  }
+  return ok(out);
+}
+
+/**
  * Template `name` expanded as it stands: no overrides, no hands check. `clients` maps a catalog namespace
  * to its client's id: an mcp capability in a mapped namespace is that client's (`McpGrant.client`).
+ * `ns`: the namespace of the client whose subtree the agent joins (null: the operator's), which decides
+ * which capabilities' rules it reads as they are now ({@link ruleSource}).
  */
-export function expandTemplate(catalog: Catalog, registry: readonly string[], name: string, clients: Readonly<Record<string, string>> = {}): Result<AgentSpec> {
+export function expandTemplate(
+  catalog: Catalog, registry: readonly string[], name: string, clients: Readonly<Record<string, string>> = {}, ns: string | null = null,
+): Result<AgentSpec> {
   if (!Object.hasOwn(catalog.templates, name)) return err(`unknown template ${name}`);
   const tpl = catalog.templates[name]!;
   const caps: Capability[] = [];
@@ -628,12 +688,15 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
   // (`launchProblem`) expands into no spec, so nothing spawns from it until it's written again.
   const badLaunch = launchProblem(tpl.launch);
   if (badLaunch) return err(`template ${name}: ${badLaunch}`);
+  const sources = templateRuleSources(catalog, name, ns);
+  if (!sources.ok) return sources;
   return withEnv({
     template: name,
     tools: registry.filter((t) => given.has(t)),
     launch: { ...tpl.launch, system_prompt: { ...tpl.launch.system_prompt, text: prompt } },
     // In capability order, each once (first occurrence kept).
     rules: dedupeRules(caps.flatMap((c) => c.rules)),
+    rule_sources: sources.value,
     credential: tpl.credential,
     ...(mcp.length ? { mcp } : {}),
     ...(brokered.length ? { brokered } : {}),
@@ -720,13 +783,18 @@ export type SpawnSpec =
    */
   | { template: string; hands: boolean; by: "spawner"; share?: boolean; cell_idle_ttl_ms?: number; overrides?: SpawnerOverrides };
 
-/** Expand a spawn spec: the template's hands rule, the template, then the overrides its author may make (`clients`: as for `expandTemplate`). */
-export function expandSpec(catalog: Catalog, registry: readonly string[], spec: SpawnSpec, clients: Readonly<Record<string, string>> = {}): Result<AgentSpec> {
+/**
+ * Expand a spawn spec: the template's hands rule, the template, then the overrides its author may make
+ * (`clients` and `ns`: as for `expandTemplate`).
+ */
+export function expandSpec(
+  catalog: Catalog, registry: readonly string[], spec: SpawnSpec, clients: Readonly<Record<string, string>> = {}, ns: string | null = null,
+): Result<AgentSpec> {
   const tpl = Object.hasOwn(catalog.templates, spec.template) ? catalog.templates[spec.template]! : undefined;
   if (!tpl) return err(`unknown template ${spec.template}`);
   if (tpl.hands === "required" && !spec.hands) return err(`template ${spec.template} needs a sandbox`);
   if (tpl.hands === "forbidden" && spec.hands) return err(`template ${spec.template} has no hands`);
-  const base = expandTemplate(catalog, registry, spec.template, clients);
+  const base = expandTemplate(catalog, registry, spec.template, clients, ns);
   if (!base.ok) return base;
   if (spec.by === "spawner") {
     if (spec.share && !tpl.share_sandbox) return err(`template ${spec.template} doesn't share its spawner's sandbox`);
@@ -757,8 +825,12 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     const tplTtl = base.value.sandbox_idle_ttl_ms;
     const ttl = asked !== undefined ? narrowTtl(tplTtl ?? spec.cell_idle_ttl_ms ?? Infinity, asked) : tplTtl;
     const lifetimes = { ...(ephemeral ? { ephemeral: true as const } : {}), ...(ttl !== undefined ? { sandbox_idle_ttl_ms: ttl } : {}) };
-    return withEnv(withRepos({ ...rest, ...tools.value, ...lifetimes, ...extras, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]) }, repos.value, readRepos.value, true),
-      spec.template, o.data.env);
+    // Its narrowing first, kept apart from the capabilities' rules, which it reads as they are now.
+    const narrowing: RuleSource[] = o.data.rules?.length ? [{ rules: o.data.rules.map((r) => ({ ...r })) }] : [];
+    const rule_sources = [...narrowing, ...(base.value.rule_sources ?? [])];
+    return withEnv(withRepos({
+      ...rest, ...tools.value, ...lifetimes, ...extras, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), rule_sources,
+    }, repos.value, readRepos.value, true), spec.template, o.data.env);
   }
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value, o.tools);
@@ -781,6 +853,8 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     ...(ephemeral ? { ephemeral: true as const } : {}),
     launch: o.launch ?? base.value.launch,
     rules: o.rules ?? base.value.rules,
+    // The operator's rules replace the capabilities' (today's meaning) until cleared; the sources stay for then.
+    ...(o.rules ? { rules_set: true as const } : {}),
     credential: o.credential ?? base.value.credential,
   }, o.repos ?? base.value.repos ?? [], o.read_repos ?? base.value.read_repos ?? []), spec.template, o.env);
 }

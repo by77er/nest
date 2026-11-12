@@ -34,7 +34,9 @@ import { type ClientEvent, ClientOutbox, EVENT_TEXT_MAX } from "../lib/client-ev
 import { field, TRACE_PING, TRACE_PONG, TRACE_SOCKETS_MAX, type TraceBody, type TraceControl, TraceRing, traceOf } from "../lib/trace";
 import { decodeCursor, encodeCursor, HISTORY_DEFAULT_LIMIT, type HistoryCursor, type HistoryPage, historyPage } from "../lib/trace-history";
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
-import { type AgentSpec, changedLaunch, type LaunchChange, launchProblem, type RoleRecord, type SpawnerOverrides, specFromRole } from "../lib/spec";
+import {
+  type AgentSpec, changedLaunch, joinRules, type LaunchChange, launchProblem, liveCapabilities, type RoleRecord, type RuleSource, type SpawnerOverrides, specFromRole,
+} from "../lib/spec";
 import {
   AGENT_RECORD_RETENTION_MS, cellIdleTtlMs, END_GRACE_MS, END_RETRY_MS, type Ended, type EndReason, ephemeralDone, MAX_OWNER_HOPS, narrowTtl, ownsVia,
   spawnRefusal,
@@ -91,6 +93,10 @@ export const RESTART_MAX_FAILURES = 5;
 /** `hands_resolved{error}` hint when the sandbox isn't ready: how long the runner waits before asking again. */
 const HANDS_RETRY_MS = 2_000;
 const RETENTION_MS = 7 * 86_400_000;
+/** A failed read of its capabilities' rules (CatalogDO unreachable) is tried again after this long. */
+export const RULES_RETRY_MS = 30_000;
+/** A capability whose stored row this release can't read is read again after this long (a write nudges sooner). */
+const RULES_UNREADABLE_RETRY_MS = 3_600_000;
 
 const PRUNE_EVERY_MS = 3_600_000;
 /** read_transcript: entries per call by default / at most, and a response size cap. */
@@ -212,7 +218,7 @@ interface PreviousReleaseFields {
 }
 
 /** AgentDO's alarm keys (each needs a handler in `alarm()`). */
-type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | "client_events" | "seg_trash";
+type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after_exit" | "intent" | "prune" | "end" | "reap" | "registry" | "client_events" | "seg_trash" | "rules";
 /**
  * A `sync` ask's window, `ask:<ask id>`: armed only by the previous release's `ask` tool, which left the
  * platform. One it armed still ends its waiting call here (`askWindowLapsed`); dropped next release.
@@ -652,6 +658,9 @@ export class AgentDO extends DurableObject<Env> {
     if (req.tainted) this.kvPut("read_tainted", true);
     await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS, true);
     await this.deadlines.set("registry", Date.now(), true);
+    // Registered with the catalog, which reads its capabilities' rules again: one changed since its expansion is seen.
+    if (info.rule_sources && !info.rules_set) this.kvPut("rules_derived", JSON.stringify(info.rules));
+    if (this.liveRuleNames(info).length) await this.deadlines.set("rules", Date.now(), true);
     return info;
   }
 
@@ -1442,6 +1451,8 @@ export class AgentDO extends DurableObject<Env> {
     });
     await this.deadlines.set("reap", done.ended!.ms + AGENT_RECORD_RETENTION_MS);
     await this.deadlines.set("registry", Date.now(), true);
+    // It reads no capability's rules any more: the catalog stops telling it of changes.
+    await this.deadlines.set("rules", Date.now(), true);
   }
 
   /** Ask every agent it owns that hasn't ended to end (each ends its own in turn, and says so: `childEnded`). */
@@ -1541,6 +1552,14 @@ export class AgentDO extends DurableObject<Env> {
       if (page.objects.length) await this.env.BUCKET.delete(page.objects.map((o) => o.key));
       cursor = page.truncated ? page.cursor : undefined;
     } while (cursor);
+    if ((this.kvGet<string>("rules_watched") ?? "[]") !== "[]") {
+      try {
+        await this.catalogStub().watchRules(info.agent, []);
+      } catch (err) {
+        // The catalog drops the watch of an agent it finds gone.
+        console.warn(`agent ${info.agent}: leaving the catalog's rule watch failed`, err);
+      }
+    }
     try {
       await this.fleet(info.cell).unregisterAgent(info.agent);
     } catch (err) {
@@ -2982,7 +3001,107 @@ export class AgentDO extends DurableObject<Env> {
     this.pushReliable((seq) => ({ type: "interrupt", seq, ...(turn ? { turn } : {}) }));
   }
 
+  /**
+   * The operator's rules (`PUT /v1/agents/<id>/rules`): they replace what its sources give, and stay
+   * until cleared (`clearRules`); its capabilities' changes don't reach it meanwhile.
+   */
   async setRules(rules: ToolRule[]): Promise<void> {
+    this.update((i) => {
+      i.rules = rules;
+      i.rules_set = true;
+    });
+    this.pushCache({ rulesChanged: true });
+    // The catalog stops telling it of changes it no longer reads.
+    await this.deadlines.set("rules", Date.now(), true);
+  }
+
+  /**
+   * Clear the operator's rules (`DELETE /v1/agents/<id>/rules`): its rules come from its sources again,
+   * read now. A record from before rule sources gets its template's as a spawn would now, after the deny
+   * and ask rules it holds (kept as its own: they may be a spawner's narrowing). Its `rules` change when
+   * the read lands (`refreshRules`).
+   */
+  async clearRules(): Promise<{ rule_sources: RuleSource[] }> {
+    const info = this.load();
+    if (info.ended) throw new NestError(ErrorCodes.INVALID_MESSAGE, "the agent has ended", 409);
+    let sources = info.rule_sources;
+    if (!sources) {
+      const ns = info.client ? (await this.clientStub(info.client).scope()).name : null;
+      const fromTemplate = await this.catalogStub().ruleSources(info.template, ns);
+      const own = info.rules.filter((r) => r.decision !== "allow");
+      sources = [...(own.length ? [{ rules: own }] : []), ...fromTemplate];
+    }
+    // One step from here: a source another call set meanwhile stays.
+    const done = this.update((i) => {
+      delete i.rules_set;
+      i.rule_sources ??= sources;
+    });
+    // The rules it holds are the operator's, not derived: the next read replaces them.
+    this.sql.exec("DELETE FROM kv WHERE key = 'rules_derived'");
+    await this.deadlines.set("rules", Date.now(), true);
+    return { rule_sources: done.rule_sources! };
+  }
+
+  /**
+   * CatalogDO: a capability it reads rules from changed or went (docs/control-plane/durable-objects/catalog/#live-rules).
+   * Answered once the read is armed (durable), so a nudge it took is never lost; `unknown_agent` once its
+   * record is pruned, which ends the catalog's watch.
+   */
+  async rulesChanged(): Promise<void> {
+    this.load();
+    await this.deadlines.set("rules", Date.now(), true);
+  }
+
+  /** The capabilities whose rules it reads now: none once it has ended, while the operator's rules stand, or without sources. */
+  private liveRuleNames(info: AgentInfo): string[] {
+    return info.ended || info.rules_set || !info.rule_sources ? [] : liveCapabilities(info.rule_sources);
+  }
+
+  private catalogStub() {
+    return this.env.CATALOG.get(this.env.CATALOG.idFromName("catalog"));
+  }
+
+  /**
+   * The `rules` deadline: set the catalog's watch to the capabilities it reads, read their rules as they
+   * are now in the same call, and, if its rules come out different, store them and push them with
+   * `rulesChanged` in one step (so a rule approval checked against the old ones gets `conflict`). Every
+   * guard is read again after the await; a change meanwhile reads again.
+   */
+  private async refreshRules(): Promise<void> {
+    if (!this.exists()) return;
+    const info = this.load();
+    const names = this.liveRuleNames(info);
+    const want = JSON.stringify(names);
+    const read = names.length || (this.kvGet<string>("rules_watched") ?? "[]") !== want
+      ? await this.catalogStub().watchRules(info.agent, names)
+      : { rules: {}, unreadable: [] };
+    if (!this.exists()) return;
+    const cur = this.load();
+    if (JSON.stringify(this.liveRuleNames(cur)) !== want) {
+      await this.deadlines.set("rules", Date.now(), true);
+      return;
+    }
+    this.kvPut("rules_watched", want);
+    if (cur.ended || cur.rules_set || !cur.rule_sources) return;
+    const derived = this.kvGet<string>("rules_derived");
+    if (derived !== undefined && derived !== JSON.stringify(cur.rules)) {
+      // Rules it didn't derive: the previous release's `setRules` (it sets no `rules_set`) after a rollback.
+      // They're the operator's, and stand as `setRules` would leave them.
+      this.update((i) => {
+        i.rules_set = true;
+      });
+      await this.deadlines.set("rules", Date.now(), true);
+      return;
+    }
+    if (read.unreadable.length) {
+      // A row this release can't read (a later release's): the rules it has stay, rather than lose that capability's.
+      console.warn(`agent ${cur.agent}: capabilities ${read.unreadable.join(", ")} don't parse; its rules stay as they are`);
+      await this.deadlines.set("rules", Date.now() + RULES_UNREADABLE_RETRY_MS, true);
+      return;
+    }
+    const rules = joinRules(cur.rule_sources, read.rules);
+    this.kvPut("rules_derived", JSON.stringify(rules));
+    if (JSON.stringify(rules) === JSON.stringify(cur.rules)) return;
     this.update((i) => {
       i.rules = rules;
     });
@@ -3789,10 +3908,21 @@ export class AgentDO extends DurableObject<Env> {
       prune: async () => {
         this.prune();
         await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS);
+        // Its capabilities' rules are read again hourly too: a change no nudge reached (one a rolled-back
+        // release wrote, which sends none) still arrives.
+        if (this.exists() && this.liveRuleNames(this.load()).length) await this.deadlines.set("rules", Date.now(), true);
       },
       end: () => this.finishEnd(),
       reap: () => this.reap(),
       registry: () => this.register(),
+      rules: async () => {
+        try {
+          await this.refreshRules();
+        } catch (e) {
+          console.warn(`agent ${this.load().agent}: reading its capabilities' rules failed; retrying`, e);
+          await this.deadlines.set("rules", Date.now() + RULES_RETRY_MS);
+        }
+      },
       client_events: async () => {
         if (await this.outbox.handOff(this.env)) await this.deadlines.set("client_events", Date.now());
       },
@@ -3805,6 +3935,9 @@ export class AgentDO extends DurableObject<Env> {
       if (e?.done_ms && !this.deadlines.has("reap")) await this.deadlines.set("reap", e.ms + AGENT_RECORD_RETENTION_MS);
       // An agent from before the registry (or whose registration failed) registers at its next alarm.
       if (this.kvGet<string>("registry") !== this.registryWanted() && !this.deadlines.has("registry")) await this.deadlines.set("registry", Date.now());
+      // A watch a rolled-back release never set or cleared (no handler for `rules`): set at its next alarm.
+      const watching = JSON.stringify(this.liveRuleNames(this.load()));
+      if ((this.kvGet<string>("rules_watched") ?? "[]") !== watching && !this.deadlines.has("rules")) await this.deadlines.set("rules", Date.now());
       // Timers whose deadline a rolled-back release dropped (no handler for `timer:`): armed again.
       await this.rearmTimers();
       // Dropped segments whose retry a rolled-back release dropped (no handler for `seg_trash`): collected again.
