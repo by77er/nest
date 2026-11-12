@@ -3,6 +3,7 @@
 
 import { z } from "zod";
 import type { ToolOutcome } from "../protocol/control";
+import { INPUT_KEPT_BYTES } from "./sinks";
 import { addColumn, storedEnum } from "./stored";
 
 // Closed unions for the status columns (docs/data/#enums), checked on read (`storedEnum`).
@@ -78,14 +79,15 @@ export function approvalStep(status: ApprovalStatus, event: ApprovalEvent): Appr
 
 /**
  * Whether an approval may be spent on the call key `key` at `nowMs`: approved, not expired (a rule's
- * never expires; a sink's is usable only before its expiry, and one with none never is), and not
- * already spent on another call (its own redelivery may use it again). One approval, one call.
+ * never expires; a sink's is usable only before its expiry, and one with none never is), and unspent.
+ * A sink's already spent on this same key is usable again (that call's redelivery); a rule's never is
+ * (the runner never sends a check twice, so a repeated key is no redelivery). One approval, one call.
  */
 export function approvalUsable(
   a: { status: ApprovalStatus; kind: ApprovalKind; expires_ms: number | null; used_by: string | null }, key: string, nowMs: number,
 ): boolean {
   const unexpired = a.kind === "rule" || (a.expires_ms !== null && a.expires_ms > nowMs);
-  return a.status === "approved" && unexpired && (a.used_by === null || a.used_by === key);
+  return a.status === "approved" && unexpired && (a.used_by === null || (a.kind === "sink" && a.used_by === key));
 }
 
 /** When an approval decided at `decidedMs` expires: a sink's after `sinkTtlMs`, a rule's never (null). */
@@ -131,6 +133,12 @@ export interface OpenAsk {
   created_ms: number;
   /** For an approval: the sink and the model-facing tool it holds (`tool` null in rows from before it was kept). */
   approval?: { name: string; tool: string | null };
+  /**
+   * For an approval: the held call's whole input, as approved (canonical JSON, parsed), and its size.
+   * `input` is left out past `INPUT_KEPT_BYTES`, and in rows from before it was kept (`input_bytes` too).
+   */
+  input?: unknown;
+  input_bytes?: number;
 }
 
 export class CallLedger {
@@ -146,6 +154,9 @@ export class CallLedger {
     addColumn(sql, "approvals", "tool", "TEXT");
     // What held the call (`ApprovalKindEnum`); NULL: a sink's, from before the column.
     addColumn(sql, "approvals", "kind", "TEXT");
+    // The held call's input as approved (canonical JSON, NULL past `INPUT_KEPT_BYTES`) and its size: the operator's to read in full.
+    addColumn(sql, "approvals", "input", "TEXT");
+    addColumn(sql, "approvals", "input_bytes", "INTEGER");
   }
 
   /** By call id: one first seen at an earlier epoch keeps that epoch's row and key, so its writes never run twice. */
@@ -245,10 +256,15 @@ export class CallLedger {
 
   /** Asks not yet answered, oldest first, with the approval each one decides (if any). */
   open(): OpenAsk[] {
-    return this.sql.exec<{ ask: string; question: string; created_ms: number; name: string | null; tool: string | null }>(
-      `SELECT a.ask, a.question, a.created_ms, p.name, p.tool FROM asks a LEFT JOIN approvals p ON p.ask = a.ask
+    return this.sql.exec<{ ask: string; question: string; created_ms: number; name: string | null; tool: string | null; input: string | null; input_bytes: number | null }>(
+      `SELECT a.ask, a.question, a.created_ms, p.name, p.tool, p.input, p.input_bytes FROM asks a LEFT JOIN approvals p ON p.ask = a.ask
         WHERE a.status != '${ASK.answered}' ORDER BY a.created_ms, a.ask`).toArray()
-      .map((r) => ({ ask: r.ask, question: r.question, created_ms: r.created_ms, ...(r.name !== null ? { approval: { name: r.name, tool: r.tool } } : {}) }));
+      .map((r) => ({
+        ask: r.ask, question: r.question, created_ms: r.created_ms,
+        ...(r.name !== null ? { approval: { name: r.name, tool: r.tool } } : {}),
+        ...(r.input !== null ? { input: JSON.parse(r.input) as unknown } : {}),
+        ...(r.input_bytes !== null ? { input_bytes: r.input_bytes } : {}),
+      }));
   }
 
   /** Asks (approvals included) not yet answered: each answer would be a turn. */
@@ -265,9 +281,11 @@ export class CallLedger {
     return this.approvalWhere("ask = ?", ask);
   }
 
-  requestApproval(ask: string, name: string, digest: string, tool: string | null = null, kind: ApprovalKind = "sink"): void {
-    this.sql.exec(`INSERT INTO approvals (ask, name, digest, status, created_ms, tool, kind) VALUES (?, ?, ?, '${APPROVAL.pending}', ?, ?, ?)`,
-      ask, name, digest, Date.now(), tool, kind);
+  /** `input`: the held call's canonical JSON (`canonicalJson`), kept whole up to `INPUT_KEPT_BYTES`. */
+  requestApproval(ask: string, name: string, digest: string, tool: string | null = null, kind: ApprovalKind = "sink", input?: string): void {
+    const bytes = input === undefined ? null : new TextEncoder().encode(input).length;
+    this.sql.exec(`INSERT INTO approvals (ask, name, digest, status, created_ms, tool, kind, input, input_bytes) VALUES (?, ?, ?, '${APPROVAL.pending}', ?, ?, ?, ?, ?)`,
+      ask, name, digest, Date.now(), tool, kind, bytes !== null && bytes <= INPUT_KEPT_BYTES ? input! : null, bytes);
   }
 
   /**
@@ -290,10 +308,12 @@ export class CallLedger {
    */
   takeApproval(name: string, digest: string, key: string, nowMs: number, kind: ApprovalKind = "sink"): string | undefined {
     // The one already spent on this key first (a redelivery), else an unspent one.
-    const r = this.sql.exec<{ ask: string; status: string; expires_ms: number | null; used_by: string | null }>(
+    const rows = this.sql.exec<{ ask: string; status: string; expires_ms: number | null; used_by: string | null }>(
       `SELECT ask, status, expires_ms, used_by FROM approvals WHERE name = ? AND digest = ? AND ${KIND} = ? ORDER BY used_by IS NULL, created_ms, ask`,
-      name, digest, kind).toArray()
-      .find((a) => approvalUsable({ ...a, kind, status: storedEnum(ApprovalStatusEnum, a.status, "approvals.status") }, key, nowMs));
+      name, digest, kind).toArray();
+    // A rule's check key spends at most one approval, ever (no redelivery: `approvalUsable`).
+    if (kind === "rule" && rows.some((a) => a.used_by === key)) return undefined;
+    const r = rows.find((a) => approvalUsable({ ...a, kind, status: storedEnum(ApprovalStatusEnum, a.status, "approvals.status") }, key, nowMs));
     if (!r) return undefined;
     this.sql.exec("UPDATE approvals SET used_by = ? WHERE ask = ?", key, r.ask);
     return r.ask;

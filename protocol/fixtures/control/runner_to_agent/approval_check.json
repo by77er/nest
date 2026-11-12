@@ -6,5 +6,6 @@
   "input": {
     "url": "https://docs.rs/serde",
     "prompt": "What does #[serde(flatten)] do?"
-  }
+  },
+  "cache_version": 7
 }

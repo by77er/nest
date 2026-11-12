@@ -204,8 +204,8 @@ pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
 async fn permission(agent: &Agent, input: &Value, check_timeout: Duration) -> (PermissionDecision, Option<String>) {
     let tool = input.get("tool_name").and_then(Value::as_str).unwrap_or_default();
     let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
-    let rules = match agent.inner.lock().unwrap().cache.as_ref() {
-        Some(c) => c.rules.clone(),
+    let (rules, version) = match agent.inner.lock().unwrap().cache.as_ref() {
+        Some(c) => (c.rules.clone(), c.version),
         None => return (PermissionDecision::Deny, Some("nest policy not loaded yet; retry shortly".into())),
     };
     let v = rules::evaluate(&rules, tool, &tool_input);
@@ -214,12 +214,14 @@ async fn permission(agent: &Agent, input: &Value, check_timeout: Duration) -> (P
         RuleDecision::Deny => (PermissionDecision::Deny, Some(v.reason.unwrap_or_else(|| format!("{tool} is not permitted")))),
         RuleDecision::Ask => {
             let checked = if agent.checks_approvals() {
-                agent.check_approval(agent.next_call_id(), tool, tool_input.clone(), check_timeout).await
+                agent.check_approval(agent.next_call_id(), tool, tool_input.clone(), version, check_timeout).await
             } else {
                 Err(CheckFailed::Unsupported)
             };
+            // Only an AgentDO that can't check (the previous release's) gets an escalation, a plain
+            // question: a check that timed out never does, or a slow control plane would bring back
+            // questions whose answer can't let the call through.
             if checked == Err(CheckFailed::Unsupported) {
-                // An AgentDO of the previous release: it holds the call as a plain question.
                 let call = agent.escalate(tool, tool_input);
                 return (PermissionDecision::Deny, Some(format!("pending approval (request {call}); end your turn and wait for the answer")));
             }
@@ -241,7 +243,13 @@ pub fn held(tool: &str, checked: Result<ApprovalOutcome, CheckFailed>) -> (Permi
             )),
         ),
         Ok(ApprovalOutcome::Error { error }) => (PermissionDecision::Deny, Some(format!("not checked: {}", error.message))),
-        Err(_) => (PermissionDecision::Deny, Some("couldn't reach nest to check this call's approval; try again shortly".into())),
+        Err(_) => (
+            PermissionDecision::Deny,
+            Some(format!(
+                "{tool} wasn't run: nest couldn't be reached to check its approval. Don't retry it now; go on with other work, \
+                 or end your turn, and try it again later"
+            )),
+        ),
     }
 }
 
@@ -383,8 +391,10 @@ mod tests {
         loop {
             let next = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv()).await;
             match next.expect("an approval_check within 5 s").expect("an outbound message") {
-                Outbound::ApprovalCheck { request, call, tool, input } => {
+                Outbound::ApprovalCheck { request, call, tool, input, cache_version } => {
                     assert_eq!((tool.as_str(), &input), ("WebFetch", &json!({"url": "https://x", "prompt": "p"})));
+                    // The version of the cache whose rules held it: AgentDO refuses it against newer rules.
+                    assert_eq!(cache_version, a.inner.lock().unwrap().cache.as_ref().unwrap().version);
                     a.resolve_check(&request, answer);
                     return (call, others);
                 }
@@ -402,8 +412,9 @@ mod tests {
     }
 
     /// With an AgentDO that checks approvals, a call a rule holds runs only on an approval AgentDO
-    /// spent on it; pending, refused or unanswered, it is denied, and nothing escalates. An AgentDO
-    /// of the previous release (the check unsupported) gets the escalation it expects.
+    /// spent on it; pending or refused, it is denied, and nothing escalates. The `None` row is the
+    /// check answered unsupported (an AgentDO of the previous release): that one escalates, as that
+    /// release expects. A check that times out is the next test's.
     #[tokio::test]
     async fn a_held_call_runs_only_on_an_approval_spent_on_it() {
         let (rt, a, mut out, _c) = setup();
@@ -459,8 +470,11 @@ mod tests {
         assert_eq!(pre(&o), PermissionDecision::Deny);
         let mut request = None;
         while let Ok(o) = out.try_recv() {
-            if let Outbound::ApprovalCheck { request: r, .. } = o {
-                request = Some(r);
+            match o {
+                Outbound::ApprovalCheck { request: r, .. } => request = Some(r),
+                // A slow control plane must not bring back the plain question that can't let the call through.
+                Outbound::Event(AgentEvent { body: AgentEventBody::Escalation { .. }, .. }) => panic!("a timed-out check escalated"),
+                _ => {}
             }
         }
         assert!(a.pending_checks.lock().unwrap().is_empty(), "the timed-out check is forgotten");

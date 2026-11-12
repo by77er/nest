@@ -209,7 +209,9 @@ impl Session {
                 st.abandon(&call);
             }
             Outbound::HandsResolve(req) => st.resolves.push(req),
-            Outbound::ApprovalCheck { request, call, tool, input } => st.checks.push(RunnerToAgent::ApprovalCheck { request, call, tool, input }),
+            Outbound::ApprovalCheck { request, call, tool, input, cache_version } => {
+                st.checks.push(RunnerToAgent::ApprovalCheck { request, call, tool, input, cache_version })
+            }
             Outbound::ToolsListRequest(_) | Outbound::Reconnect => {}
             Outbound::SetTranscript(p) => self.tailer.set_path(p),
             Outbound::SetSession(s) => self.session = Some(s),
@@ -353,8 +355,8 @@ impl Session {
                         }
                         Outbound::ToolsListRequest(request) => tx.send(text(&RunnerToAgent::ToolsListRequest { request })?).await?,
                         Outbound::HandsResolve(request) => tx.send(text(&RunnerToAgent::HandsResolve { request })?).await?,
-                        Outbound::ApprovalCheck { request, call, tool, input } => {
-                            self.send_check(st, &mut tx, RunnerToAgent::ApprovalCheck { request, call, tool, input }).await?;
+                        Outbound::ApprovalCheck { request, call, tool, input, cache_version } => {
+                            self.send_check(st, &mut tx, RunnerToAgent::ApprovalCheck { request, call, tool, input, cache_version }).await?;
                         }
                         Outbound::SetTranscript(p) => self.tailer.set_path(p),
                         Outbound::SetSession(s) => self.session = Some(s),
@@ -784,7 +786,7 @@ mod resolve_tests {
             let waiter = {
                 let a = agent.clone();
                 tokio::spawn(async move {
-                    a.check_approval(model::CallId("cal_c-1".into()), "WebFetch", serde_json::json!({}), wait).await
+                    a.check_approval(model::CallId("cal_c-1".into()), "WebFetch", serde_json::json!({}), 1, wait).await
                 })
             };
             tokio::time::sleep(Duration::from_millis(200)).await;

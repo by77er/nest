@@ -251,7 +251,7 @@ pub enum Outbound {
     /// `hands_resolve`: where are the agent's hands now? Answered through [`Agent::resolve_hands`].
     HandsResolve(RequestId),
     /// `approval_check`: may this call a rule holds run? Answered through [`Agent::resolve_check`].
-    ApprovalCheck { request: RequestId, call: CallId, tool: String, input: Value },
+    ApprovalCheck { request: RequestId, call: CallId, tool: String, input: Value, cache_version: u64 },
     /// Follow a different transcript file (SessionStart `transcript_path`, forks).
     SetTranscript(PathBuf),
     SetSession(SessionId),
@@ -546,12 +546,12 @@ impl Agent {
 
     /// One `approval_check` round trip for the call `call` a rule holds. Dropping the future
     /// forgets the request, so a late answer is ignored (and the call was never let through).
-    pub async fn check_approval(&self, call: CallId, tool: &str, input: Value, timeout: Duration) -> Result<ApprovalOutcome, CheckFailed> {
+    pub async fn check_approval(&self, call: CallId, tool: &str, input: Value, cache_version: u64, timeout: Duration) -> Result<ApprovalOutcome, CheckFailed> {
         let request = RequestId(format!("req_{}", uuid::Uuid::new_v4().simple()));
         let (tx, rx) = oneshot::channel();
         self.pending_checks.lock().unwrap().insert(request.clone(), tx);
         let _guard = PendingCheck { agent: self, req: request.clone() };
-        self.send_out(Outbound::ApprovalCheck { request, call, tool: tool.into(), input });
+        self.send_out(Outbound::ApprovalCheck { request, call, tool: tool.into(), input, cache_version });
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Some(outcome))) => Ok(outcome),
             Ok(Ok(None)) => Err(CheckFailed::Unsupported),

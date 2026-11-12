@@ -107,7 +107,7 @@ describe("the ledgers' steps: every status and event, and nothing leaves a final
     // A rule's never expires (the owner's decision, 2026-11-11), but is still spent on one call.
     ["a rule's: approved, unspent, no expiry", { status: "approved", kind: "rule", expires_ms: null, used_by: null }, true],
     ["a rule's: an expiry long past is ignored", { status: "approved", kind: "rule", expires_ms: 1, used_by: null }, true],
-    ["a rule's: spent on this call (its redelivery)", { status: "approved", kind: "rule", expires_ms: null, used_by: "k" }, true],
+    ["a rule's: spent on this same key (a rule's check is never redelivered)", { status: "approved", kind: "rule", expires_ms: null, used_by: "k" }, false],
     ["a rule's: spent on another call", { status: "approved", kind: "rule", expires_ms: null, used_by: "other" }, false],
     ["a rule's: pending", { status: "pending", kind: "rule", expires_ms: null, used_by: null }, false],
     ["a rule's: denied", { status: "denied", kind: "rule", expires_ms: null, used_by: null }, false],
@@ -229,8 +229,12 @@ describe("CallLedger: the guards are the ledger's", () => {
       // Answered whenever, used whenever: a century on, it lets one call through.
       const later = 10 + 100 * 365 * 86_400_000;
       expect(l.checkRule("WebFetch", "d", "k2", later)).toEqual({ status: "approved", ask: "ask_r" });
-      expect(l.checkRule("WebFetch", "d", "k2", later)).toEqual({ status: "approved", ask: "ask_r" }); // the same check again
       expect(l.checkRule("WebFetch", "d", "k3", later)).toBeUndefined();
+      // A repeated key isn't let through again, not even with another approval waiting.
+      l.requestApproval("ask_r2", "WebFetch", "d", "WebFetch", "rule");
+      l.decide("ask_r2", true, null);
+      expect(l.checkRule("WebFetch", "d", "k2", later)).toBeUndefined();
+      expect(l.checkRule("WebFetch", "d", "k4", later)).toEqual({ status: "approved", ask: "ask_r2" });
       // The sink's approval is still unspent, for a sink call.
       expect(l.takeApproval("WebFetch", "d", "ks", 50)).toBe("ask_s");
       expect(l.pendingApproval("WebFetch", "d")).toBeUndefined();
@@ -255,17 +259,20 @@ describe("CallLedger: the guards are the ledger's", () => {
     // The steps AgentDO's `approvalCheck` and `answerAsk` take on the ledger, explored over every sequence
     // of up to DEPTH actions on the real ledger and SQLite. `check` is a new call (a fresh key: another
     // concurrent identical call, the model's retry, a restarted brain's or a new epoch's call); `again`
-    // repeats the last check's key; `prune` runs a century on, everything aged; `evict` builds the ledger
-    // anew on the same storage (an eviction or a new release); `sink` approves a sink call of the same name
-    // and arguments. Bounds: 7 actions, every sequence of length 1 to 5 (19,607), one call's arguments.
+    // repeats the last check's key (the runner never does: a repeated key must never get a second call
+    // through); `prune` runs a century on, everything aged; `evict` builds the ledger anew on the same
+    // storage (an eviction; a weak action, since the ledger keeps nothing outside SQLite); `sink` approves
+    // a sink call of the same name and arguments, and `sinkcheck` spends one as a sink call would (each
+    // kind's approvals answer only its own kind). Bounds: 8 actions, every sequence of length 1 to 5
+    // (37,448), one call's arguments.
     // What it covers is the ledger (`checkRule`, `decide`, `prune`): the AgentDO glue around it (the
     // epoch guard, the kind it records, the expiry `answerAsk` computes) is session.test.ts's. "None
     // lost" is the ledger's: a check whose answer never reaches the runner still loses its approval.
-    const ACTIONS = ["check", "again", "approve", "deny", "prune", "evict", "sink"] as const;
+    const ACTIONS = ["check", "again", "approve", "deny", "prune", "evict", "sink", "sinkcheck"] as const;
     const DEPTH = 5;
     const CENTURY = 100 * 365 * 86_400_000;
     // Each kind of interesting state is reached, so the checks below aren't vacuous.
-    const reached = { afterPrune: 0, afterEvict: 0, besideSink: 0, refusedAfterGrant: 0, againGranted: 0 };
+    const reached = { afterPrune: 0, afterEvict: 0, besideSink: 0, refusedAfterGrant: 0, againRefused: 0, sinkSpent: 0 };
     await withLedger((first, sql) => {
       let n = 0;
       const run = (seq: readonly (typeof ACTIONS)[number][]) => {
@@ -275,6 +282,7 @@ describe("CallLedger: the guards are the ledger's", () => {
         let now = Date.now();
         let keys = 0;
         let sinks = 0;
+        let sinkKeys = 0;
         let asks = 0;
         let pruned = false;
         let evicted = false;
@@ -288,15 +296,14 @@ describe("CallLedger: the guards are the ledger's", () => {
           const before = unspent();
           const r = l.checkRule(tool, "d", key, now);
           if (r?.status === "approved") {
-            const prior = granted.get(key);
-            if (prior !== undefined) reached.againGranted++;
+            expect(granted.has(key), `${seq}: a key let through twice`).toBe(false);
             if (pruned) reached.afterPrune++;
             if (evicted) reached.afterEvict++;
-            expect(prior === undefined || prior === r.ask, `${seq}: a key keeps its approval`).toBe(true);
             granted.set(key, r.ask);
           } else {
-            // Not let through although an approval was waiting, and not because this key was let through before.
-            expect(before, `${seq}: an unspent approval let nothing through`).toBe(0);
+            if (granted.has(key)) reached.againRefused++;
+            // A new key not let through although an approval was waiting.
+            else expect(before, `${seq}: an unspent approval let nothing through`).toBe(0);
             if (granted.size > 0) reached.refusedAfterGrant++;
             if (sinks > 0) reached.besideSink++;
             if (r) expect(r.ask, `${seq}: the open ask is reused`).toBe(open);
@@ -329,6 +336,10 @@ describe("CallLedger: the guards are the ledger's", () => {
             const ask = `ask_${tool}_sink${++sinks}`;
             l.requestApproval(ask, tool, "d", tool);
             l.decide(ask, true, now + 60_000);
+          } else if (a === "sinkcheck") {
+            const taken = l.takeApproval(tool, "d", `s${++sinkKeys}`, now, "sink");
+            if (taken !== undefined) reached.sinkSpent++;
+            expect(taken === undefined || taken.startsWith(`ask_${tool}_sink`), `${seq}: a sink call spent a rule's approval`).toBe(true);
           }
           // Safety: never more calls let through than approvals given, and each approval lets one through.
           const distinct = new Set(granted.values());
@@ -343,7 +354,7 @@ describe("CallLedger: the guards are the ledger's", () => {
         if (prefix.length < DEPTH) for (const a of ACTIONS) explore([...prefix, a]);
       };
       explore([]);
-      expect(n).toBe((7 ** (DEPTH + 1) - 7) / 6);
+      expect(n).toBe((8 ** (DEPTH + 1) - 8) / 7);
     });
     for (const [what, count] of Object.entries(reached)) expect(count, `reached: ${what}`).toBeGreaterThan(0);
   }, 60_000); // ~20k sequences on SQLite: a few seconds here, more on a loaded CI runner

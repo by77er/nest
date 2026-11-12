@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { McpConnectorDO } from "../src/do/mcp-connector";
 import { approves, argsDigest, checkMcpUrl, connectorName } from "../src/lib/mcp";
+import { describeArgs, INPUT_KEPT_BYTES } from "../src/lib/sinks";
 import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
 import { fetchJwks, verifyIdentity } from "./jwt";
 
@@ -876,7 +877,9 @@ describe("sinks (docs/agents/tools/#taint-and-sinks)", () => {
     expect((await result(s.ws, "cal_k2")).ask).toBe(p1.ask);
     const asks = await adminJson(`/v1/agents/${s.agent}/asks`);
     expect(asks.map((a: { ask: string }) => a.ask)).toEqual([p1.ask]);
-    expect(asks[0].question).toContain('"value":"secret"');
+    expect(asks[0].question).toContain('value: "secret"');
+    // The whole input, as approved (canonical), is the operator's to read.
+    expect(asks[0]).toMatchObject({ input: { key: "k", value: "secret" }, input_bytes: '{"key":"k","value":"secret"}'.length });
     expect(s.stub.calls).toEqual([]);
 
     expect((await answer(s.agent, p1.ask, "approve")).delivered).toBe("async");
@@ -929,9 +932,26 @@ describe("sinks (docs/agents/tools/#taint-and-sinks)", () => {
   });
 
   it("an answer approves only when it says so; an approval binds to the arguments, not their key order", async () => {
-    for (const yes of ["approve", "Approved.", "yes", "y", "ok", "allow: fine"]) expect(approves(yes)).toBe(true);
-    for (const no of ["deny", "no", "", "yesterday's data, no", "not approved", "okey"]) expect(approves(no)).toBe(false);
+    for (const yes of ["approve", "Approved.", " yes ", "Y", "ok", "OK!", "okay", "allow", "allowed"]) expect(approves(yes), yes).toBe(true);
+    // Only a bare approving word approves: one that starts a refusal doesn't (security review of #244).
+    for (const no of ["deny", "no", "", "yesterday's data, no", "not approved", "okey", "allow: fine", "ok, no: not that host", "yes but deny",
+      "approve? no", "yes, if it's the docs host", "ok.\nno", "approve approve"]) expect(approves(no), no).toBe(false);
     expect(await argsDigest({ a: 1, b: { c: [1, { d: 2, e: 3 }] } })).toBe(await argsDigest({ b: { c: [1, { e: 3, d: 2 }] }, a: 1 }));
     expect(await argsDigest({ a: 1 })).not.toBe(await argsDigest({ a: "1" }));
+  });
+
+  it("a question shows the deciding argument first and whole, and no argument can fake a line", () => {
+    // The rules' subject order: `command` decides over `url`.
+    expect(describeArgs({ z: 1, url: "https://u", command: "rm -rf /" }).split("\n")).toEqual(['  command: "rm -rf /"', '  url: "https://u"', "  z: 1"]);
+    const long = "x".repeat(5000);
+    expect(describeArgs({ url: `https://a.test/${long}` })).toBe(`  url: "https://a.test/${long}"`);
+    expect(describeArgs({ prompt: long })).toMatch(/^ {2}prompt: "x{299}… \(5002 characters in all\)$/);
+    expect(describeArgs({ "a\nurl: \"https://ok\"": 1 })).toBe('  "a\\nurl: \\"https://ok\\"": 1');
+    expect(describeArgs({ url: "x".repeat(INPUT_KEPT_BYTES) })).toContain("too long to show here or keep");
+    expect(describeArgs(["a"])).toBe('  arguments: ["a"]');
+    expect(describeArgs(null)).toBe("  arguments: null");
+    expect(describeArgs({})).toBe("  (no arguments)");
+    // Not a string: not the deciding field, shown in its place.
+    expect(describeArgs({ url: 5, b: true }).split("\n")).toEqual(["  b: true", "  url: 5"]);
   });
 });

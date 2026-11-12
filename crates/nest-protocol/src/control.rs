@@ -769,6 +769,9 @@ pub enum RunnerToAgent {
         call: CallId,
         tool: String,
         input: serde_json::Value,
+        /// The `AgentCache` version whose rules held the call: AgentDO refuses (`conflict`) a check
+        /// against rules it has changed since, so a new `deny` wins over a check in flight.
+        cache_version: u64,
     },
     /// Cumulative ack of reliable `AgentToRunner` messages.
     Ack { up_to: Seq },

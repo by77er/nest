@@ -38,9 +38,45 @@ export function canonicalJson(v: unknown): string {
   return JSON.stringify(canon(v));
 }
 
-/** An answer to an approval approves only when it says so; anything else denies. */
+/**
+ * An answer to an approval approves only when it is nothing but an approving word (an optional `.` or
+ * `!` after it); anything else denies, including an answer that starts with one ("ok, no: not that
+ * host", "yes but deny").
+ */
 export function approves(answer: string): boolean {
-  return /^(approve[ds]?|allow(ed)?|yes|y|ok(ay)?)\b/i.test(answer.trim());
+  return /^(approve[ds]?|allow(ed)?|yes|y|ok(ay)?)[.!]?$/i.test(answer.trim());
+}
+
+/** The arguments that decide a call, in the order the runner's rules read them (`rules::subject`). */
+export const DECISIVE_KEYS = ["command", "file_path", "url", "pattern", "path", "action"] as const;
+/** How much of each other argument a question shows (the whole input is the ask's `input`). */
+export const ARG_SHOWN = 300;
+/** The most of a held call's input an ask keeps (canonical JSON); past it, `input` is left out. */
+export const INPUT_KEPT_BYTES = 32 * 1024;
+
+/**
+ * A held call's arguments as the operator's question shows them: one field a line, the deciding one
+ * (`DECISIVE_KEYS`, as the rules read it) first and whole, the others cut at `ARG_SHOWN` characters.
+ * Every value is JSON (a string quoted and escaped) and an unusual key is quoted, so no argument can
+ * fake another line or a harmless-looking end. Pure.
+ */
+export function describeArgs(args: unknown): string {
+  const cut = (s: string) => s.length > ARG_SHOWN ? `${s.slice(0, ARG_SHOWN)}… (${s.length} characters in all)` : s;
+  if (!args || typeof args !== "object" || Array.isArray(args)) return `  arguments: ${cut(JSON.stringify(args ?? null))}`;
+  const o = args as Record<string, unknown>;
+  const key = (k: string) => /^[A-Za-z0-9_.-]+$/.test(k) ? k : JSON.stringify(k);
+  const decisive = DECISIVE_KEYS.find((k) => typeof o[k] === "string");
+  const lines: string[] = [];
+  if (decisive) {
+    const v = JSON.stringify(o[decisive]);
+    lines.push(v.length > INPUT_KEPT_BYTES
+      ? `  ${decisive}: (${v.length} characters: too long to show here or keep; deny unless you have read it elsewhere)`
+      : `  ${decisive}: ${v}`);
+  }
+  for (const k of Object.keys(o).sort()) {
+    if (k !== decisive) lines.push(`  ${key(k)}: ${cut(JSON.stringify(o[k]) ?? "null")}`);
+  }
+  return lines.length ? lines.join("\n") : "  (no arguments)";
 }
 
 /** Claude Code built-ins whose results are untrusted (web). */

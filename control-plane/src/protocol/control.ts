@@ -447,7 +447,8 @@ export const RunnerToAgentVariants = [
    * A call a tool rule in `ask` mode holds (its `PreToolUse` hook waits): may it run? Spends an approval
    * of exactly this call, or holds it as an ask. Not reliable; sent only after a `hello_ack` with `rule_approvals`.
    */
-  z.object({ type: z.literal("approval_check"), request: RequestId, call: CallId, tool: z.string(), input: z.unknown() }),
+  /** `cache_version`: the `AgentCache` whose rules held the call; AgentDO refuses a check against rules changed since. */
+  z.object({ type: z.literal("approval_check"), request: RequestId, call: CallId, tool: z.string(), input: z.unknown(), cache_version: U64 }),
   z.object({ type: z.literal("ack"), up_to: Seq }),
 ] as const;
 export const RunnerToAgent = z.discriminatedUnion("type", RunnerToAgentVariants);
