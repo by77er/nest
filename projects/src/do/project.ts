@@ -2245,6 +2245,25 @@ export class ProjectDO extends DurableObject<Env> {
     this.autoAssign();
   }
 
+  /**
+   * A review has waited long for room in nest (README.md#built-the-review-pipeline): among the project's errors,
+   * once per PR head, until ReviewDO says the wait ended (`reviewRoomCleared`).
+   */
+  async reviewWaitingForRoom(e: { pr: number; sha: string; since_ms: number; why: string }): Promise<void> {
+    if (!this.settings()) return;
+    const mins = Math.max(1, Math.round((Date.now() - e.since_ms) / 60_000));
+    this.sql.exec(
+      "INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, 'app', 'reviewer', NULL, 'review_waiting_for_room', ?)",
+      `review_room:${e.pr}/${e.sha}`, Date.now(),
+      `The review of PR #${e.pr} (${e.sha.slice(0, 12)}) has waited ${mins} minutes for room in nest (${e.why.slice(0, 300)}). nest's grant for this app caps its live agents and sandboxes across every project (managers, workers, reviewers, routine runs), and a worker stays live until its PR merges, which needs its review, so a full grant can hold reviews back for good. Raise the grant's max_agents or max_sandboxes, or free a place: cancel a task whose worker can wait, or stop a routine run.`,
+    );
+  }
+
+  /** That review's wait for room ended (it started, or ended otherwise): its error goes. */
+  async reviewRoomCleared(pr: number, sha: string): Promise<void> {
+    this.sql.exec("DELETE FROM errors WHERE event_id = ?", `review_room:${pr}/${sha}`);
+  }
+
   async errors(): Promise<Result<unknown[]>> {
     if (!this.settings()) return fail(404, "unknown project");
     return ok(this.sql.exec("SELECT at_ms, agent, role, task, code, message FROM errors ORDER BY seq DESC LIMIT 100").toArray());

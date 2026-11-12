@@ -7,6 +7,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { atCapacity, NestError } from "../src/nest";
+import { ROOM_TELL_AFTER_MS } from "../src/do/review";
 import { AccessTeam, agentClaims, api, callTool, CLIENT, deliverGithub, FakeNest, installFetch, prEvent, Signer } from "./fake-nest";
 
 describe("a capacity refusal, told apart", () => {
@@ -201,6 +202,210 @@ describe("a review nest has no room for", () => {
       expect(reviewersOf(p, 3)).toEqual([]);
     } finally {
       fake.maxAgents = null;
+    }
+  });
+
+  it("a reviewer's exit (agent.exited) wakes the waiting job", async () => {
+    const p = await newProject();
+    const s1 = sha();
+    await push(p, 1, s1);
+    await run(p);
+    fake.maxAgents = liveAgents();
+    try {
+      const s2 = sha();
+      await push(p, 2, s2);
+      await run(p);
+      expect((await job(p, 2, s2)).state).toBe("queued");
+      expect(await nextIn(p, 2, s2)).toBeGreaterThan(1_000);
+      const reviewer = live(p, 1)[0]!;
+      reviewer.ended = true;
+      await reviews(p).onAgentExited(reviewer.agent, "exited");
+      expect(await nextIn(p, 2, s2)).toBeLessThanOrEqual(0);
+    } finally {
+      fake.maxAgents = null;
+    }
+  });
+
+  it("one place frees: only the oldest waiting job tries, so one sandbox is made for it, not one per waiting job", async () => {
+    const p = await newProject();
+    const s1 = sha();
+    await push(p, 1, s1);
+    await run(p);
+    fake.maxAgents = liveAgents();
+    try {
+      const shas = [sha(), sha(), sha()];
+      for (const [k, s] of shas.entries()) await push(p, 10 + k, s);
+      await run(p);
+      for (const [k, s] of shas.entries()) expect((await job(p, 10 + k, s)).state).toBe("queued");
+      const made = () => [...fake.sandboxes.values()].filter((x) => x.labels.project === p.id && x.labels.role === "reviewer").length;
+      const before = made();
+      // The first review's verdict stops its reviewer: one place. A worker takes it at once (still full).
+      const reviewer = live(p, 1)[0]!;
+      const id = await nest.sign(agentClaims("review", reviewer.agent, { project: p.id, role: "reviewer", pr: "1", sha: s1, start: reviewer.labels.start! }));
+      await callTool("review", id, "submit_review", { correctness: dim, quality: dim, architecture: dim, summary: "ok" });
+      fake.maxAgents = liveAgents();
+      await run(p);
+      expect(made() - before).toBe(1);
+      // The oldest it was; the others still wait out their backoff.
+      expect(await nextIn(p, 11, shas[1]!)).toBeGreaterThan(1_000);
+      expect(await nextIn(p, 12, shas[2]!)).toBeGreaterThan(1_000);
+    } finally {
+      fake.maxAgents = null;
+    }
+  });
+
+  it("a long wait is among the project's errors, once, saying what the owner can do; cleared when the review starts", async () => {
+    const p = await newProject();
+    fake.maxSandboxes = liveSandboxes();
+    const errors = async () => ((await api(token, "GET", `/api/projects/${p.id}/errors`)).body as any[]).filter((e) => e.code === "review_waiting_for_room");
+    const waitedFor = (ms: number) => runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE jobs SET capacity_ms = ?, next_ms = 0 WHERE capacity_ms IS NOT NULL", Date.now() - ms);
+    });
+    try {
+      const s = sha();
+      await push(p, 1, s);
+      await run(p);
+      // Not yet.
+      await waitedFor(ROOM_TELL_AFTER_MS - 60_000);
+      await run(p);
+      expect(await errors()).toEqual([]);
+      await waitedFor(ROOM_TELL_AFTER_MS + 60_000);
+      await run(p);
+      const [e] = await errors();
+      expect(e.message).toMatch(/PR #1 .* has waited 4[0-9] minutes for room in nest/);
+      expect(e.message).toMatch(/max_sandboxes/);
+      expect(e.message).toMatch(/Raise the grant's max_agents or max_sandboxes, or free a place/);
+      // Told once, however long it goes on.
+      await waitedFor(ROOM_TELL_AFTER_MS + 120_000);
+      await run(p);
+      expect(await errors()).toHaveLength(1);
+      // Room: it starts, and the error goes.
+      fake.maxSandboxes = null;
+      await dueNow(p);
+      await run(p);
+      expect((await job(p, 1, s)).state).toBe("running");
+      expect(await errors()).toEqual([]);
+    } finally {
+      fake.maxSandboxes = null;
+    }
+  });
+
+  it("a long wait's error goes when the job ends otherwise (a newer head), and the newer head's wait is its own", async () => {
+    const p = await newProject();
+    fake.maxSandboxes = liveSandboxes();
+    const errors = async () => ((await api(token, "GET", `/api/projects/${p.id}/errors`)).body as any[]).filter((e) => e.code === "review_waiting_for_room");
+    try {
+      const s1 = sha();
+      await push(p, 1, s1);
+      await run(p);
+      await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => {
+        st.storage.sql.exec("UPDATE jobs SET capacity_ms = ?, next_ms = 0 WHERE capacity_ms IS NOT NULL", Date.now() - ROOM_TELL_AFTER_MS - 60_000);
+      });
+      await run(p);
+      expect(await errors()).toHaveLength(1);
+      const s2 = sha();
+      await push(p, 1, s2, { action: "synchronize" });
+      await run(p);
+      expect((await job(p, 1, s1)).state).toBe("superseded");
+      expect((await job(p, 1, s2)).state).toBe("queued");
+      expect(await errors()).toEqual([]);
+    } finally {
+      fake.maxSandboxes = null;
+    }
+  });
+
+  it("a job that never waited isn't told 'Reviewing' again: its check has its create's output, then its completion", async () => {
+    const p = await newProject();
+    const s = sha();
+    await push(p, 1, s);
+    await run(p);
+    expect(live(p, 1)).toHaveLength(1);
+    expect(checkOf(p, s).updates).toEqual([]);
+  });
+
+  it("the wait's tries count apart: once started, the job's own step backs off from scratch", async () => {
+    const p = await newProject();
+    fake.maxSandboxes = liveSandboxes();
+    try {
+      const s = sha();
+      await push(p, 1, s);
+      await run(p);
+      for (let k = 0; k < 4; k++) {
+        await dueNow(p);
+        await run(p);
+      }
+      fake.maxSandboxes = null;
+      // Room, but the brief fails once: its retry is the first (5 s), not the sixth.
+      fake.fail(new RegExp(`^POST /v1/agents/agt_[A-Za-z0-9]+/inbox$`), 503, { retryable: true, times: 3 });
+      await dueNow(p);
+      await run(p);
+      const j = await job(p, 1, s);
+      expect(j.state).toBe("running");
+      expect(await nextIn(p, 1, s)).toBeLessThanOrEqual(5_000);
+    } finally {
+      fake.maxSandboxes = null;
+    }
+  });
+
+  it("a second wait of the same job (its reviewer exited, no room again) is its own: the check told again, the long-wait clock from it", async () => {
+    const p = await newProject();
+    const s = sha();
+    await push(p, 1, s);
+    await run(p);
+    const first = live(p, 1)[0]!;
+    const waitingTold = () => checkOf(p, s).updates.filter((u: any) => u.output?.title === "Waiting for room to start a reviewer").length;
+    expect(waitingTold()).toBe(0);
+    // Full now; its reviewer exits without a verdict: the retry finds no room.
+    fake.maxSandboxes = liveSandboxes();
+    try {
+      first.ended = true;
+      await reviews(p).onAgentExited(first.agent, "exited");
+      await dueNow(p);
+      await run(p);
+      expect((await job(p, 1, s)).state).toBe("queued");
+      expect(waitingTold()).toBe(1);
+      const since = await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => st.storage.sql.exec("SELECT capacity_ms FROM jobs WHERE pr = 1").one().capacity_ms as number);
+      // Room, it starts; full again, its reviewer exits again: a second wait, told again, timed from now.
+      fake.maxSandboxes = null;
+      await dueNow(p);
+      await run(p);
+      const second = live(p, 1)[0]!;
+      fake.maxSandboxes = liveSandboxes();
+      second.ended = true;
+      await reviews(p).onAgentExited(second.agent, "exited");
+      await dueNow(p);
+      await run(p);
+      expect((await job(p, 1, s)).state).toBe("queued");
+      expect(waitingTold()).toBe(2);
+      const again = await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => st.storage.sql.exec("SELECT capacity_ms FROM jobs WHERE pr = 1").one().capacity_ms as number);
+      expect(again).toBeGreaterThan(since);
+    } finally {
+      fake.maxSandboxes = null;
+    }
+  });
+
+  it("superseded while waiting, then the head back: requeued from scratch, its new check told it waits", async () => {
+    const p = await newProject();
+    fake.maxSandboxes = liveSandboxes();
+    try {
+      const s1 = sha();
+      await push(p, 1, s1);
+      await run(p);
+      expect((await job(p, 1, s1)).state).toBe("queued");
+      const s2 = sha();
+      await push(p, 1, s2, { action: "synchronize" });
+      await run(p);
+      expect((await job(p, 1, s1)).state).toBe("superseded");
+      expect(checkOf(p, s1)).toMatchObject({ status: "completed", conclusion: "cancelled" });
+      expect(checkOf(p, s1).updates.filter((u: any) => u.status === "completed")).toHaveLength(1);
+      await push(p, 1, s1, { action: "synchronize" });
+      await run(p);
+      expect((await job(p, 1, s1)).state).toBe("queued");
+      const runs = gh.runsOf(p.repo, s1) as any[];
+      expect(runs).toHaveLength(2);
+      expect(runs.at(-1).updates.at(-1)?.output?.title).toBe("Waiting for room to start a reviewer");
+    } finally {
+      fake.maxSandboxes = null;
     }
   });
 });
