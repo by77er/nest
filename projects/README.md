@@ -612,12 +612,12 @@ Enabled with one click (`POST …/routines {preset}`), then edited like any rout
 The owner's request (2026-11-03): "Tasks should be able to block other tasks."
 
 - **"Waiting on", a relation** (ProjectDO's `task_deps`): a task waits on others (`blocked_by`), and is waited on by others (`blocks`). This is distinct from "Blocked" ([above](#blocked)), the flag an agent raises for the owner, which is a "Needs you" item. A dependency is the board's own ordering, and nothing waits on the owner.
-- **Valid** (`dependencyError` in `src/tasks.ts`, pure): within the project only, never on itself, never on a task that's over, never twice, and never closing a cycle, which is refused with the cycle's path (`tsk_a → tsk_b → tsk_a`).
+- **Valid** (`dependencyError` in `src/tasks.ts`, pure): within the project only, never on itself, never for a task that's over (it waits on nothing), never twice, and never closing a cycle, which is refused with the cycle's path (`tsk_a → tsk_b → tsk_a`).
 - **Assignment:** a task waiting on any task not `done` can't be assigned, whether automatically, by the manager or by the owner. The refusal names the blockers and their states. **There is no override:** the owner removes the dependency instead, which says what changed and keeps the board's record honest.
 - **Becoming assignable:** when its last blocker is done, the task can be assigned, and auto-assign takes it. **A cancelled blocker still holds it:** the work it waited on won't happen, so whether to go on without it is the owner's or the manager's call, made by removing the dependency.
 - **Who:** the owner from the drawer (`POST /api/projects/:id/tasks/:task/dependencies {blocked_by}`, `DELETE …/dependencies/<task>`), and the manager with `add_dependency` and `remove_dependency`. A worker's `get_task` lists what its task waits on, with each one's state.
 - **A live worker** on a task whose dependencies change (added or removed mid-flight, or one done) is told ([task changes](#task-changes)).
-- **On the board:** a card says "Waiting on N", neutral (gray, outline), since it's no one's to act on now. Hovering or focusing it lists the blockers. The drawer has a Dependencies section: what it waits on, each removable, a task picker (the switcher) to add one, and what waits on it.
+- **On the board:** a card says "Waiting on N", neutral (gray, light), since it's no one's to act on now. Hovering or focusing it lists the blockers. The drawer has a Dependencies section: what it waits on, each removable, a task picker (the switcher) to add one, and what waits on it.
 
 ## Waiting
 
