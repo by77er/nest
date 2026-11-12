@@ -3,6 +3,8 @@
 ## Corrections
 | doc | said | code says | evidence |
 |---|---|---|---|
+| sandbox/networking/ingress/README.md | terminal attach over `/pty`, port-forward over `/ingress/<port>`, ingress guards, 60 s detach: no status | the gateway answers 501 "route not served yet" on `/pty` and `/ingress/*`; no ingress guards; a dropped PTY gets SIGHUP | crates/nest-gateway/src/server.rs:236-241, crates/nest-guest/src/ingress.rs:246, docs/compute/nestd/README.md (ingress guards designed) |
+| sandbox/networking/ingress/README.md | guest connects 127.0.0.1 then 172.16.0.2 | then also `::1` | crates/nest-guest/src/ingress.rs:63 |
 | sandbox/networking/egress/tls/README.md | fixed-shape CSR (exact subject, no attributes) refused otherwise; FleetDO sets every field incl. subject; key usage `keyCertSign`, EKU `serverAuth` | `signIntermediate` only parses and verifies the CSR, copies its subject and key; sets validity (`PROXY_CA_TTL_MS`, 7 d), pathLen 0, key usage keyCertSign+cRLSign; no EKU | control-plane/src/lib/ca.ts:85-121, do/fleet.ts:847 |
 | sandbox/networking/egress/tls/README.md | shared-proxy fairness bounds (256/64 handshakes, 4 at once/32 per s signing, LRU, 403 leaves uncached) stated as built | only `HELLO_TIMEOUT` 10 s and `LEAF_CACHE_MAX` 4096 (HashMap; expired then all dropped when full; 403 leaves cached via the same `server_config`) | crates/nest-proxy/src/tls.rs:24-28,64-102, http.rs:41,170-173 |
 | sandbox/networking/egress/README.md | pipeline: "re-check policy" after guards; open connections re-checked on every policy version and closed once denied | built: each request is decided against the current policy before injection; the final re-check and closing denied connections are designed | crates/nest-proxy/src/http.rs:390-460 (policy doc audit) |
