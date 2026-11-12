@@ -16,7 +16,8 @@ describe("the job table (pure)", () => {
     held: { approve: "queued", trust: "queued", dismiss: "dismissed", superseded: "superseded", closed: "closed" },
     overflow: { approve: "queued", trust: "queued", hold: "held", superseded: "superseded", closed: "closed" },
     queued: { start: "running", superseded: "superseded", closed: "closed" },
-    running: { verdict: "done", retry: "running", give_up: "failed", refused: "failed", superseded: "superseded", closed: "closed" },
+    // `wait`: nest at its grant's max_agents or max_sandboxes; the job waits queued for room.
+    running: { verdict: "done", retry: "running", give_up: "failed", refused: "failed", wait: "queued", superseded: "superseded", closed: "closed" },
     done: { requeue: "queued" },
     failed: { requeue: "queued" },
     superseded: { requeue: "queued", hold: "held", park: "overflow" },

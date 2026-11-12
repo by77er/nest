@@ -158,7 +158,7 @@ export class Nest {
    * good destroys the sandbox made for it (not on a 409: the key's create may have landed). `agent` adds fields to the
    * agent's spawn (README.md#routines: a routine's grants).
    */
-  async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string, extras: SandboxExtras = {}, agent: AgentExtras = {}): Promise<string> {
+  async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string, extras: SandboxExtras = {}, agent: AgentExtras = {}, o: { newAttemptOnCapacity?: boolean } = {}): Promise<string> {
     const sandbox = (await this.createSandbox({ labels, ...extras }, `${key}/sandbox`)).sandbox;
     const overrides: SpawnOverrides = "push" in repo ? { repos: [repo.push] } : { read_repos: [repo.read] };
     try {
@@ -169,7 +169,10 @@ export class Nest {
       // sandbox of its own). Best effort: a destroy that fails leaves it to that TTL. The refusal is thrown.
       // Not a 409: a key bound to another request means an earlier attempt's create landed, so an agent
       // may be using the sandbox.
-      if (e instanceof NestError && e.permanent && e.status !== 409) {
+      // At capacity (nest#248's 429 `at_capacity` is retryable, no permanent refusal): only for a caller whose
+      // next try is a new attempt (`newAttemptOnCapacity`: a review's), so this one's sandbox is spent. A
+      // caller that retries the same attempt (a worker's start) gets this sandbox back by its key, and keeps it.
+      if (e instanceof NestError && (e.permanent || (o.newAttemptOnCapacity === true && atCapacity(e))) && e.status !== 409) {
         try {
           await this.destroySandbox(sandbox);
         } catch {
@@ -350,6 +353,22 @@ function parseError(status: number, text: string): NestError {
  */
 export function stopRefused(e: unknown): boolean {
   return e instanceof NestError && e.code !== "http" && !e.retryable && (e.status === 400 || e.status === 409);
+}
+
+/**
+ * nest refused a create because the client is at a limit of live agents or sandboxes (its grant's
+ * `max_agents` or `max_sandboxes`, or a spawner's live children) (README.md#built-the-review-pipeline): a
+ * refusal that lasts only until one of them ends.
+ * - **nest from nest#248 on:** its own code, `at_capacity` (429, retryable), whatever the message.
+ * - **A nest from before it** (the fallback, removed a release after #248): a refusal of the grant (403
+ *   `forbidden`, not retryable), told apart by the words ClientDO's `admit` writes, "<client> has <n> live
+ *   sandboxes, its grant's max_sandboxes" (control-plane/src/do/client.ts). Worded otherwise, it's a refusal
+ *   like any other.
+ */
+export function atCapacity(e: unknown): boolean {
+  if (!(e instanceof NestError)) return false;
+  if (e.code === "at_capacity") return true;
+  return e.status === 403 && e.code === "forbidden" && /\bhas \d+ live (?:agents|sandboxes), its grant's max_(?:agents|sandboxes)\b/.test(e.message);
 }
 
 export function nestFrom(env: { NEST_CONTROL_PLANE: string; NEST_CELL: string; NEST_CLIENT_TOKEN?: string }): Nest | null {

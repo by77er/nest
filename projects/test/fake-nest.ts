@@ -90,6 +90,15 @@ export class FakeNest {
   failures: { match: RegExp; status: number; retryable?: boolean; times: number; page?: boolean }[] = [];
   /** Play a control plane from before the push opt-in was in the client layer (nest #157). */
   layerWithoutPush = false;
+  /**
+   * The grant's `max_agents` and `max_sandboxes` (null: none), as nest's ClientDO admits a create: counted
+   * over the client's live ones, refused 403 `forbidden` in nest's words at the limit. A retry with a key
+   * already made isn't counted again.
+   */
+  maxAgents: number | null = null;
+  maxSandboxes: number | null = null;
+  /** Answer the maxima as nest from nest#248 on does (429 `at_capacity`, retryable), not as a nest from before it (403 `forbidden` in ClientDO's words). */
+  capacityCode = false;
   /** Play a nest before `when: "idle"` (#232): its `start` refuses the field (400). */
   whenUnsupported = false;
   /** Play a nest whose `start` ignores `launch` (a rolled-back Worker): its answer names none. */
@@ -183,6 +192,14 @@ export class FakeNest {
     }
     if (had) {
       return new Response(had.body, { status: had.status, headers: { "content-type": "application/json", "idempotent-replayed": "true" } });
+    }
+    // The grant's maximum, as ClientDO.admit words its refusal (control-plane/src/do/client.ts).
+    const kind = route === "POST /v1/agents" ? "agents" : "sandboxes";
+    const max = kind === "agents" ? this.maxAgents : this.maxSandboxes;
+    const live = kind === "agents" ? [...this.agents.values()].filter((a) => !a.ended && a.client === CLIENT).length : [...this.sandboxes.values()].filter((x) => !x.ended).length;
+    if (max !== null && live >= max) {
+      // nest#248's own code, or the words of a nest from before it.
+      return this.capacityCode ? nestErr(429, "at_capacity", `max_${kind}: ${CLIENT} has ${live} live ${kind}, its grant's limit`, true) : nestErr(403, "forbidden", `${CLIENT} has ${live} live ${kind}, its grant's max_${kind}`);
     }
     const res = await this.route(req, u, call);
     if (res.ok) this.keys.set(key, { digest, status: res.status, body: await res.clone().text() });
