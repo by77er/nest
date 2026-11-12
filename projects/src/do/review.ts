@@ -203,7 +203,10 @@ export class ReviewDO extends DurableObject<Env> {
     else this.sql.exec("INSERT INTO settings (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", k, v);
   }
 
-  /** Learn which project this is (from the Worker, which routed the call here by it). */
+  /**
+   * Learn which project this is (from the Worker, which routed the call here by it). Its `repo` setting is
+   * written only for the previous release, which reads it; this one reads the name through (`repo()`).
+   */
   private bind(p: ReviewOf): void {
     if (this.setting("project") === null) {
       this.setSetting("project", p.project);
@@ -211,12 +214,25 @@ export class ReviewDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * The repo's name, read through from DirectoryDO, its one owner (README.md#the-repos-binding): a rename
+   * applied there reaches every check run and brief here at once. Null before the project is known.
+   */
+  private async repo(): Promise<string | null> {
+    const project = this.setting("project");
+    if (project === null) return null;
+    return (await directory(this.env).getProject(project))?.repo ?? null;
+  }
+
   async init(p: ReviewOf, o: { max_concurrent_reviews?: number | null } = {}): Promise<void> {
     this.bind(p);
     if (o.max_concurrent_reviews !== undefined) await this.setMaxConcurrent(o.max_concurrent_reviews);
   }
 
-  /** The repo was renamed or transferred (README.md#the-repos-binding): its check runs are made under `name` from now on. */
+  /**
+   * The repo was renamed or transferred (README.md#the-repos-binding): kept only for the previous release,
+   * which makes its check runs under this name; this one reads the name through from DirectoryDO.
+   */
   async repoRenamed(name: string): Promise<void> {
     if (this.setting("project") !== null) this.setSetting("repo", name.toLowerCase());
   }
@@ -698,7 +714,7 @@ export class ReviewDO extends DurableObject<Env> {
     if (!r) return fail(404, "no review for your PR and commit");
     switch (tool) {
       case "review_get":
-        return ok({ repo: this.setting("repo"), pr: r.pr, sha: r.sha, base: r.base, title: r.title, state: r.state });
+        return ok({ repo: await this.repo(), pr: r.pr, sha: r.sha, base: r.base, title: r.title, state: r.state });
       case "submit_review": {
         if (r.agent !== caller.agent) return fail(403, "you aren't this review's reviewer");
         if (r.verdict !== null) return fail(409, "this review already has its verdict");
@@ -820,8 +836,9 @@ export class ReviewDO extends DurableObject<Env> {
       this.spendAttempt(j, `no verdict within ${REVIEW_DEADLINE_MS / 60_000} minutes`, "timed out");
     }
     const nest = nestFrom(this.env);
-    const repo = this.setting("repo");
-    if (!nest || !repo) return;
+    if (!nest) return;
+    const repo = await this.repo();
+    if (!repo) return;
     // One token per run, minted when first needed (nest caches it besides).
     let gh: Promise<GitHub> | null = null;
     const github = () => (gh ??= githubFor(nest, repo, PERMISSIONS.checks));

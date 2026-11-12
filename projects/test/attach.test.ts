@@ -60,9 +60,10 @@ describe("attaching a repo", () => {
     expect(prot.required_pull_request_reviews).toBeUndefined();
     expect(prot.restrictions).toBeUndefined();
     expect(managersOf(p.id)).toHaveLength(1);
-    // Its token: administration and metadata, nothing more.
+    // Its token: administration and metadata, nothing more. (The second, metadata alone, is the create's answer
+    // reading the repo's owner to show.)
     const minted = fake.calls.filter((c) => c.path === "/v1/clients/self/github-token" && c.body.repo.toLowerCase() === repo.toLowerCase());
-    expect(minted.map((c) => c.body.permissions)).toEqual([{ administration: "write", metadata: "read" }]);
+    expect(minted.map((c) => c.body.permissions)).toEqual([{ administration: "write", metadata: "read" }, { metadata: "read" }]);
   });
 
   it("adds the check to existing required checks once, keeping every other setting", async () => {

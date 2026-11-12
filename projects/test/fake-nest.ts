@@ -478,8 +478,12 @@ export class FakeNest {
 }
 
 /** Install `fake` as nest (and Cloudflare Access's certs, when given) for the Worker and its objects. */
+/** The fake GitHub the installed fetch answers from: events name their repo's owner as it answers (`deliverGithub`). */
+let liveGithub: FakeGitHub | null = null;
+
 export function installFetch(fake: FakeNest, access?: () => unknown): () => void {
   const real = globalThis.fetch;
+  liveGithub = fake.github;
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input as RequestInfo, init);
     const u = new URL(req.url);
@@ -490,6 +494,7 @@ export function installFetch(fake: FakeNest, access?: () => unknown): () => void
   }) as typeof fetch;
   return () => {
     globalThis.fetch = real;
+    if (liveGithub === fake.github) liveGithub = null;
   };
 }
 
@@ -656,6 +661,12 @@ export interface FakeCheckRun {
 /** The states nest refuses an idle-only restart in (a turn running). */
 const MID_TURN_STATES = new Set(["working", "waiting_permission", "compacting"]);
 
+/** A repo's owner by its name alone, a user: for events delivered with no fake GitHub installed. */
+const defaultOwner = (name: string) => {
+  const login = name.toLowerCase().split("/")[0]!;
+  return { login, id: ownerIdOf(login), type: "User" };
+};
+
 export const ownerIdOf = (login: string) => 10_000 + [...login].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 1_000_000, 7);
 /** A repo's GitHub id, as the fake gives it (from its first name: a rename keeps it). */
 export const repoIdOf = (name: string) => 500_000_000 + [...name.toLowerCase()].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 100_000_000, 11);
@@ -726,6 +737,13 @@ export class FakeGitHub {
     this.renamed.delete(k);
     this.repos.set(k, { id: repoIdOf(k) + 1, default_branch: "main", protection: null, allow_auto_merge: false, ...(ownerId === undefined ? {} : { owner_id: ownerId }) });
     return this.repos.get(k)!.id;
+  }
+
+  /** A repo's owner as GitHub answers it (`repository.owner`), by the account its name is under. */
+  ownerOf(name: string): { id: number; login: string; type: string } {
+    const k = name.toLowerCase();
+    const login = k.split("/")[0]!;
+    return { login, id: this.repos.get(k)?.owner_id ?? ownerIdOf(login), type: this.orgs.has(login) ? "Organization" : "User" };
   }
 
   runsOf(repo: string, sha?: string): FakeCheckRun[] {
@@ -1026,6 +1044,8 @@ export async function deliverGithub(event: string, payload: unknown, o: { secret
   // GitHub names the repo's id in every event: the fake's, unless the test gives one (or `id: undefined`, none).
   const repo = (payload as { repository?: Record<string, unknown> } | null)?.repository;
   if (repo && typeof repo === "object" && !("id" in repo) && typeof repo.full_name === "string") repo.id = repoIdOf(repo.full_name);
+  // And its owner as of the event, as GitHub has it now (the fake's answer for the name), unless the test gives one.
+  if (repo && typeof repo === "object" && !("owner" in repo) && typeof repo.full_name === "string") repo.owner = liveGithub?.ownerOf(repo.full_name) ?? defaultOwner(repo.full_name);
   // An issue's author by id: the repo owner's (whose issues come into triage by default), unless the test gives one.
   const issue = (payload as { issue?: Record<string, unknown> } | null)?.issue;
   const user = issue && typeof issue.user === "object" && issue.user !== null ? (issue.user as Record<string, unknown>) : null;

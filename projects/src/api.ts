@@ -12,7 +12,9 @@ import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSID
 import { prNumberOf } from "./prs";
 import { attachableRepos, repoAttachable } from "./grant-repos";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
-import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, PutSecret, Settings, Spec, UpdateRoutine, UpdateTask } from "./requests";
+import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, PutSecret, Settings as SettingsBody, Spec, UpdateRoutine, UpdateTask } from "./requests";
+import type { ProjectSettings, Settings } from "./do/project";
+import { githubFor, PERMISSIONS } from "./github";
 import { PRESETS } from "./routines";
 import type { UntrustedPolicy } from "./review-trust";
 import type { Result } from "./sql";
@@ -23,11 +25,49 @@ const json = (body: unknown, status = 200) =>
 const err = (status: number, error: string) => json({ error }, status);
 const done = <T>(r: Result<T>, status = 200) => (r.ok ? json(r.value, status) : err(r.status, r.error));
 
-/** A project's settings with ReviewDO's: `max_concurrent_reviews`, and what happens to PRs it doesn't trust (README.md#the-review-gate). */
-async function withReviews<T extends object>(env: Env, id: string, r: Result<T>): Promise<Result<T & { max_concurrent_reviews: number | null; untrusted_reviews: UntrustedPolicy }>> {
+/** How long the repo's owner as shown is kept by one Worker instance: a page polls the project every few seconds. */
+const OWNER_SHOWN_MS = 60_000;
+const ownersShown = new Map<string, { at_ms: number; owner: { id: number; login: string } | null }>();
+
+/**
+ * The repo's owner to show (`Settings.repo_owner`: the "Use the repo owner" shortcut, who "You only" names),
+ * read through from GitHub (README.md#the-repos-binding), kept a minute per Worker instance so polling doesn't
+ * spend the App's rate limit. Shown only: trust is decided by each event's own owner. Null for an
+ * organization's repo, or when GitHub couldn't say (not kept, so the next look asks again).
+ */
+async function shownOwner(env: Env, repo: string): Promise<{ id: number; login: string } | null> {
+  const k = repo.toLowerCase();
+  const had = ownersShown.get(k);
+  if (had && Date.now() - had.at_ms < OWNER_SHOWN_MS) return had.owner;
+  const nest = nestFrom(env);
+  if (!nest) return null;
+  try {
+    const o = await (await githubFor(nest, repo, PERMISSIONS.metadata)).repoOwner(repo);
+    const owner = o.type === "User" ? { id: o.id, login: o.login } : null;
+    ownersShown.delete(k);
+    ownersShown.set(k, { at_ms: Date.now(), owner });
+    if (ownersShown.size > 500) ownersShown.delete(ownersShown.keys().next().value!);
+    return owner;
+  } catch (e) {
+    console.warn(`the owner of ${repo} couldn't be read: ${String(e).slice(0, 200)}`);
+    return null;
+  }
+}
+
+/**
+ * A project's settings as the API answers them (do/project.ts `Settings`): ProjectDO's, with the repo's name
+ * as DirectoryDO has it and its owner as GitHub answers, both read through (README.md#the-repos-binding), and
+ * ReviewDO's `max_concurrent_reviews` and what happens to PRs it doesn't trust (README.md#the-review-gate).
+ */
+async function answerSettings(env: Env, id: string, r: Result<ProjectSettings>): Promise<Result<Settings & { max_concurrent_reviews: number | null; untrusted_reviews: UntrustedPolicy }>> {
   if (!r.ok) return r;
+  const row = await directory(env).getProject(id);
+  if (!row) return { ok: false, status: 404, error: "unknown project" };
   const rv = review(env, id);
-  return { ok: true, value: { ...r.value, max_concurrent_reviews: await rv.maxConcurrent(), untrusted_reviews: await rv.untrustedPolicy() } };
+  return {
+    ok: true,
+    value: { ...r.value, repo: row.repo, repo_owner: await shownOwner(env, row.repo), max_concurrent_reviews: await rv.maxConcurrent(), untrusted_reviews: await rv.untrustedPolicy() },
+  };
 }
 
 async function body<S extends z.ZodType>(req: Request, schema: S): Promise<{ ok: true; value: z.output<S> } | { ok: false; res: Response }> {
@@ -60,9 +100,8 @@ async function rereadBinding(env: Env, id: string, shownId?: number): Promise<Re
   if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
   const r = await readBinding(env, nest, id, shownId === undefined ? "check" : "replace", shownId);
   if (!r.ok && "mismatch" in r) {
-    // The owner the project knows: the bound repo's as read, else the repo's owner ProjectDO recorded at attach.
-    const s = await project(env, id).getSettings();
-    const known = r.mismatch.bound.owner?.id ?? (s.ok ? (s.value.repo_owner?.id ?? null) : null);
+    // The bound repo's owner as GitHub answered at the binding's last read (none for one learned from an event).
+    const known = r.mismatch.bound.owner?.id ?? null;
     const owner = r.mismatch.github.owner?.id ?? null;
     return json({ binding: r.binding, mismatch: { bound: r.mismatch.bound, github: { ...r.mismatch.github, same_owner: known === null || owner === null ? null : known === owner } } });
   }
@@ -169,7 +208,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const still = await directory(env).creationFailed(p.id, verdict(e));
       return json({ error: `the project ${still ? "is still being created (it's retried)" : "couldn't be created"}: ${verdict(e).error}`, id: p.id, state: still ? "pending" : "removed" }, 503);
     }
-    const settings = await withReviews(env, p.id, await project(env, p.id).getSettings());
+    const settings = await answerSettings(env, p.id, await project(env, p.id).getSettings());
     return json({ ...p, state: "ready", settings: settings.ok ? settings.value : null, catalog_synced: synced }, 201);
   }
 
@@ -194,14 +233,14 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     case "GET ": {
       // Looking at the project reads the repo's auto-merge setting again (at most once a minute).
       await p.refreshRepoAutoMerge();
-      const s = await withReviews(env, pid, await p.getSettings());
+      const s = await answerSettings(env, pid, await p.getSettings());
       if (!s.ok) return done(s);
       return json({ ...row, settings: s.value });
     }
     case "GET settings":
-      return done(await withReviews(env, pid, await p.getSettings()));
+      return done(await answerSettings(env, pid, await p.getSettings()));
     case "PATCH settings": {
-      const b = await body(req, Settings);
+      const b = await body(req, SettingsBody);
       if (!b.ok) return b.res;
       const { max_concurrent_reviews, untrusted_reviews, ...rest } = b.value;
       // Workers editing CI workflows needs the grant to allow it: refused here rather than at every spawn.
@@ -216,7 +255,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       if (!updated.ok) return done(updated);
       if (max_concurrent_reviews !== undefined) await review(env, pid).setMaxConcurrent(max_concurrent_reviews);
       if (untrusted_reviews !== undefined) await review(env, pid).setUntrustedPolicy(untrusted_reviews);
-      return done(await withReviews(env, pid, updated));
+      return done(await answerSettings(env, pid, updated));
     }
     case "GET secrets": {
       // Metadata only: the app's, with nest's last injection and size; never a value.
@@ -316,9 +355,9 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     case "POST secret-requests/:id/done":
       return done(await p.secretRequestDone(rest[1]!));
     case "POST auto-merge/retry":
-      return done(await withReviews(env, pid, await p.retryRepoAutoMerge()));
+      return done(await answerSettings(env, pid, await p.retryRepoAutoMerge()));
     case "POST attach":
-      return done(await withReviews(env, pid, await p.retryAttach()));
+      return done(await answerSettings(env, pid, await p.retryAttach()));
     case "GET manager": {
       // The manager's status for its page: the project's record, then nest's agent record once it has one.
       const s = await p.getSettings();
@@ -347,7 +386,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "POST manager/restart":
       // The owner's Restart (README.md#the-manager-lifecycle): the manager goes, a new one starts.
-      return done(await p.restartManager());
+      return done(await answerSettings(env, pid, await p.restartManager()));
     case "GET reviews":
       return json(await review(env, pid).jobs());
     // The review gate (README.md#the-review-gate): the owner approves a held review of one head commit, or dismisses it.

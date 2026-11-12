@@ -88,6 +88,11 @@ const MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN refused_count INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE projects ADD COLUMN refused_ms INTEGER",
   ],
+  [
+    // When a refused event last made the binding be read again, to follow nest's answer for the installation
+    // (README.md#the-repos-binding): at most once a minute per project.
+    "ALTER TABLE projects ADD COLUMN installation_checked_ms INTEGER",
+  ],
 ] as const;
 
 /** A project's repo binding (README.md#the-repos-binding), as the Admin page shows it. */
@@ -134,6 +139,9 @@ export type BindOutcome =
   | { ok: true; binding: RepoBinding; changed: boolean; previous_id: number | null }
   | { ok: false; error: string; binding: RepoBinding | null }
   | { ok: false; mismatch: { bound: RepoRef; github: RepoRef }; binding: RepoBinding };
+
+/** How often a refused event may have a project's binding read again (`claimInstallationCheck`). */
+export const INSTALLATION_CHECK_EVERY_MS = 60_000;
 
 /** How long the Worker has to finish a create before the alarm takes it over. */
 export const CREATE_GRACE_MS = 60_000;
@@ -252,7 +260,7 @@ export class DirectoryDO extends DurableObject<Env> {
    * name taken): no project. A project whose App installation is known takes only events from that
    * installation (`installation.id`): any other, or none, is refused (README.md#the-repos-binding).
    */
-  async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null): Promise<{ project: ProjectRow } | { refused: string } | null> {
+  async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null): Promise<{ project: ProjectRow } | { refused: string; project_id: string } | null> {
     const one = (where: string, v: SqlStorageValue) =>
       this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS}, installation_id FROM projects WHERE ${where}`, v).toArray()[0] ?? null;
     const row = (r: ProjectRow & Record<string, SqlStorageValue>): ProjectRow => ({ id: r.id, name: r.name, repo: r.repo, created_ms: r.created_ms, state: r.state });
@@ -267,7 +275,7 @@ export class DirectoryDO extends DurableObject<Env> {
       const byId = one("repo_id = ?", repoId);
       if (byId) {
         const wrong = wrongInstallation(byId);
-        if (wrong) return { refused: wrong };
+        if (wrong) return { refused: wrong, project_id: byId.id };
         // The name GitHub gives it now: a rename or transfer is noted (README.md#the-repos-binding).
         if (name) this.noteName(byId.id, name);
         return { project: row(byId) };
@@ -276,7 +284,7 @@ export class DirectoryDO extends DurableObject<Env> {
     const byName = name ? one("repo = ? AND repo_id IS NULL", name.toLowerCase()) : null;
     if (!byName) return null;
     const wrong = wrongInstallation(byName);
-    if (wrong) return { refused: wrong };
+    if (wrong) return { refused: wrong, project_id: byName.id };
     if (repoId !== null) {
       // Learned from an event, so recorded as one (a sync reads it from GitHub): no owner known.
       this.sql.exec("UPDATE projects SET repo_id = ?, repo_bound = 'event', repo_bound_ms = ?, repo_owner_id = NULL, repo_owner_login = NULL WHERE id = ? AND repo_id IS NULL", repoId, Date.now(), byName.id);
@@ -360,12 +368,22 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.sql.exec("SELECT 1 FROM projects WHERE repo = ? AND id != ?", name.toLowerCase(), except).toArray().length > 0;
   }
 
-  /** A rename taken back (ProjectDO or ReviewDO couldn't follow): the old name again, the new one still noted. */
-  async unrenameRepo(project: string, from: string, to: string): Promise<void> {
-    this.sql.exec("UPDATE projects SET repo = ?, repo_name = ? WHERE id = ? AND repo = ?", from.toLowerCase(), to.toLowerCase(), project, to.toLowerCase());
+  /**
+   * Whether a refused event may have the binding read again now (`followInstallation`, src/binding.ts): once
+   * a minute per project at most, so a burst of refused events costs nest and GitHub one read.
+   */
+  async claimInstallationCheck(project: string): Promise<boolean> {
+    const now = Date.now();
+    return this.sql.exec(
+      "UPDATE projects SET installation_checked_ms = ? WHERE id = ? AND (installation_checked_ms IS NULL OR installation_checked_ms <= ?)",
+      now, project, now - INSTALLATION_CHECK_EVERY_MS,
+    ).rowsWritten > 0;
   }
 
-  /** The repo renamed: the project calls it by `name` from now on (first: ProjectDO and ReviewDO follow it). */
+  /**
+   * The repo renamed: the project calls it by `name` from now on. This is the name's one record: ProjectDO,
+   * ReviewDO and the Worker read it from here (README.md#the-repos-binding).
+   */
   async renameRepo(project: string, name: string): Promise<boolean> {
     const n = name.toLowerCase();
     if (this.sql.exec("SELECT 1 FROM projects WHERE repo = ? AND id != ?", n, project).toArray().length) return false;

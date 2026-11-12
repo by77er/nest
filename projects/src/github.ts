@@ -343,6 +343,17 @@ export async function githubFor(nest: Nest, repo: string, permissions: Record<st
 }
 
 /**
+ * The App installation a token was minted from, taken as the repo's own only when GitHub's name for the repo
+ * (`full_name`, its answer to the read) is the name the token was minted for. A name GitHub redirects (the
+ * repo renamed or transferred since) may be minted from another installation: the one on the account the
+ * repo moved to, or on whoever holds the old name now. Null: not known to be the repo's
+ * (README.md#the-repos-binding).
+ */
+export function ownInstallation(minted: string, fullName: string, installation: number | null): number | null {
+  return minted.toLowerCase() === fullName.toLowerCase() ? installation : null;
+}
+
+/**
  * The GitHub id of nest's App's bot account, `<app_slug>[bot]` (the author of what the App's tokens
  * create, workers' PRs among them), by the slug nest's token answer names; null when nest names none or
  * GitHub has no such bot. https://docs.github.com/en/rest/users/users#get-a-user

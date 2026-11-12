@@ -20,6 +20,7 @@ export interface PrOrigin {
 /** The GitHub ids a project trusts; null for one it doesn't have (no comments user, an organization's repo, the bot not learned yet). */
 export interface TrustedIds {
   comments_from: number | null;
+  /** The repo's owner as the signed event being decided names it (`repository.owner`), never a copy kept from before. */
   repo_owner: number | null;
   app_bot: number | null;
 }

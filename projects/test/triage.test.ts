@@ -7,7 +7,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { MAX_UNTRIAGED_ISSUES } from "../src/do/project";
-import { AccessTeam, api, deliverGithub, FakeNest, GRANT_PERMISSIONS, installFetch, ownerIdOf, prEvent, shaOf } from "./fake-nest";
+import { AccessTeam, api, deliverGithub, FakeNest, GRANT_PERMISSIONS, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf } from "./fake-nest";
 
 const fake = new FakeNest();
 let restore: () => void;
@@ -30,14 +30,15 @@ async function newProject() {
   return { id: p.id as string, repo };
 }
 type P = Awaited<ReturnType<typeof newProject>>;
-const issueEvent = (p: P, action: string, n: number, o: { title?: string; body?: string; login?: string; pr?: boolean; state?: string; repo?: string; sender?: number; author?: number } = {}) => ({
+const issueEvent = (p: P, action: string, n: number, o: { title?: string; body?: string; login?: string; pr?: boolean; state?: string; repo?: string; moved?: boolean; sender?: number; author?: number } = {}) => ({
   action,
   sender: { id: o.sender ?? ownerIdOf(o.login ?? "someone"), login: "x" },
   issue: {
     number: n, title: o.title ?? `Issue ${n}`, body: o.body ?? "It breaks.", state: o.state ?? (action === "closed" ? "closed" : "open"), user: { login: o.login ?? "someone", ...(o.author === undefined ? {} : { id: o.author }) },
     html_url: `https://github.com/${o.repo ?? p.repo}/issues/${n}`, ...(o.pr ? { pull_request: { url: "x" } } : {}),
   },
-  repository: { full_name: o.repo ?? p.repo },
+  // `moved`: the project's repo under a new name (renamed or transferred), so still its id (the fake's, from its first name).
+  repository: { full_name: o.repo ?? p.repo, ...(o.moved ? { id: repoIdOf(p.repo) } : {}) },
 });
 const queue = async (p: P) => (await api(token, "GET", `/api/projects/${p.id}/issues`)).body as { number: number; title: string; body: string; author: string; url: string; updated_ms: number }[];
 const numbers = async (p: P) => (await queue(p)).map((i) => i.number);
@@ -152,6 +153,33 @@ describe("whose issues come in", () => {
     gh.set(2, { title: "A stranger's", body: "", state: "open", login: "x", user_id: 77, comments: [] });
     expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).body).toEqual({ imported: 1, known: 0, ignored: 1, dropped: 0 });
     expect(await numbers(p)).toEqual([1]);
+  });
+
+  it("after a transfer, the account the repo left no longer counts as its owner: not its issues, not its reopening; the new owner's do, an import's too", async () => {
+    const p = await newProject();
+    const oldOwner = p.repo.split("/")[0]!;
+    // Someone else is the comments user (the owner's own choice), so only ownership is tested here.
+    await settings(p, { comments_from_id: 4321 });
+    const newOwner = `n-${rand()}`;
+    const to = `${newOwner}/moved`;
+    fake.github.rename(p.repo, to);
+    // Its events name the new name and owner; the repo's id routes them to the project.
+    await deliverGithub("issues", issueEvent(p, "opened", 1, { repo: to, moved: true, login: oldOwner, author: ownerIdOf(oldOwner) }));
+    await deliverGithub("issues", issueEvent(p, "opened", 2, { repo: to, moved: true, login: newOwner, author: ownerIdOf(newOwner) }));
+    expect(await numbers(p)).toEqual([2]);
+    // A declined issue reopened by the old owner stays declined; by the new owner, it comes back.
+    await api(token, "POST", `/api/projects/${p.id}/issues/2/decline`, {});
+    await deliverGithub("issues", issueEvent(p, "reopened", 2, { repo: to, moved: true, login: newOwner, author: ownerIdOf(newOwner), sender: ownerIdOf(oldOwner) }));
+    expect(await numbers(p)).toEqual([]);
+    await deliverGithub("issues", issueEvent(p, "reopened", 2, { repo: to, moved: true, login: newOwner, author: ownerIdOf(newOwner), sender: ownerIdOf(newOwner) }));
+    expect(await numbers(p)).toEqual([2]);
+    // An import (no event to name the owner) asks GitHub who owns the repo now.
+    const gh = new Map<number, { title: string; body: string; state: "open" | "closed"; login: string; user_id?: number; comments: string[] }>();
+    fake.github.issues.set(to, gh);
+    gh.set(3, { title: "The old owner's", body: "", state: "open", login: oldOwner, user_id: ownerIdOf(oldOwner), comments: [] });
+    gh.set(4, { title: "The new owner's", body: "", state: "open", login: newOwner, user_id: ownerIdOf(newOwner), comments: [] });
+    expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).body).toMatchObject({ imported: 1, ignored: 1 });
+    expect(await numbers(p)).toEqual([2, 4]);
   });
 
   it(`at most ${MAX_UNTRIAGED_ISSUES} wait, whoever's: past it new ones are dropped and counted, and an import counts afresh`, async () => {

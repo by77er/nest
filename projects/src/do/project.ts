@@ -12,7 +12,7 @@ import { roleTemplate, TEMPLATE } from "../catalog";
 import { DEFAULT_MODEL, modelLabel, type ModelRole, modelProblem } from "../models";
 import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
-import { type AttachChange, DIMENSIONS, GitHubError, githubFor, PERMISSIONS, requireReviewCheck, type Verdict } from "../github";
+import { type AttachChange, DIMENSIONS, GitHubError, githubFor, ownInstallation, PERMISSIONS, requireReviewCheck, type Verdict } from "../github";
 import type { AgentCaller } from "../identity";
 import { type AgentView, backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras, stopRefused } from "../nest";
 import { envName, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
@@ -33,10 +33,13 @@ import { randomId } from "./directory";
 import { type ManagerEvent, type ManagerLife, managerStep } from "../manager";
 import { OUTBOX, type OutboxEvent, type OutboxPolicy, type OutboxRow, type OutboxState, outboxState, outboxStep, pruneBefore, verdict } from "../outbox";
 
-export interface Settings {
+/**
+ * A project's settings as ProjectDO keeps them. Not the repo's name, which is DirectoryDO's alone (`repo()`
+ * reads it through), nor its owner, which is GitHub's (README.md#the-repos-binding): copies of either went stale.
+ */
+export interface ProjectSettings {
   id: string;
   name: string;
-  repo: string;
   auto_assign: boolean;
   max_workers: number;
   manager: string | null;
@@ -75,8 +78,6 @@ export interface Settings {
    * repo's owner when it's a user, recorded at attach; an org's repo needs it set. Null: nobody's do.
    */
   comments_from: { id: number; login: string | null } | null;
-  /** The repo's owner, when it's a user (the "Use the repo owner" shortcut); null for an org's repo, or before attach. */
-  repo_owner: { id: number; login: string } | null;
   /** Routine runs live at once across the project (README.md#routines). */
   max_routine_runs: number;
   /** Whose issues come into triage (README.md#triage): the comments user's or the repo owner's only, or anyone's. */
@@ -84,6 +85,16 @@ export interface Settings {
   /** Issues dropped because triage held MAX_UNTRIAGED_ISSUES already, since the last import; and when the last was. */
   issues_dropped: { count: number; last_ms: number } | null;
   created_ms: number;
+}
+
+/**
+ * The settings as the API answers them (src/api.ts): ProjectDO's, with the repo's name as DirectoryDO has it
+ * and its owner as GitHub answers now, each read through when asked (README.md#the-repos-binding).
+ */
+export interface Settings extends ProjectSettings {
+  repo: string;
+  /** The repo's owner, when it's a user (the "Use the repo owner" shortcut, and who "You only" names); null for an org's repo, or when GitHub couldn't say. Shown only: trust is decided by each event's own (README.md#the-review-gate). */
+  repo_owner: { id: number; login: string } | null;
 }
 
 export { MAX_UNTRIAGED_ISSUES };
@@ -655,7 +666,7 @@ export class ProjectDO extends DurableObject<Env> {
   // --- settings --------------------------------------------------------------------------------------
 
   /** Set the project up (once; a repeat with the same id is a no-op) and owe nest its manager. */
-  async init(p: { id: string; name: string; repo: string; auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod }): Promise<Settings> {
+  async init(p: { id: string; name: string; repo: string; auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod }): Promise<ProjectSettings> {
     if (!this.settingsRow()) {
       this.sql.exec(
         `INSERT INTO settings (id, name, repo, auto_assign, max_workers, attach_next_ms, manager_next_ms, auto_merge, merge_method, am_write_next_ms, created_ms)
@@ -672,11 +683,11 @@ export class ProjectDO extends DurableObject<Env> {
     return this.sql.exec("SELECT * FROM settings").toArray()[0];
   }
 
-  settings(): Settings | null {
+  settings(): ProjectSettings | null {
     const r = this.settingsRow();
     if (!r) return null;
     return {
-      id: r.id as string, name: r.name as string, repo: r.repo as string, auto_assign: r.auto_assign === 1, max_workers: r.max_workers as number,
+      id: r.id as string, name: r.name as string, auto_assign: r.auto_assign === 1, max_workers: r.max_workers as number,
       manager: (r.manager as string | null) ?? null, manager_error: (r.manager_error as string | null) ?? null, manager_start_owed: r.manager_next_ms !== null,
       attached: r.attached_ms !== null, attach_error: (r.attach_error as string | null) ?? null,
       attach: r.attach_detail ? (JSON.parse(r.attach_detail as string) as AttachDetail) : null,
@@ -686,7 +697,6 @@ export class ProjectDO extends DurableObject<Env> {
         : { from: (r.manager_running_model as string | null) ?? null, to: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, after_turn: r.switch_after_turn === 1 },
       manager_switch_given_up: (r.switch_gave_up_model as string | null) ?? null,
       comments_from: r.comments_from_id === null || r.comments_from_id === undefined ? null : { id: r.comments_from_id as number, login: (r.comments_from_login as string | null) ?? null },
-      repo_owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: r.repo_owner_login as string },
       repo_auto_merge: repoAutoMerge({
         want: r.auto_merge === 1, owed: r.am_write_next_ms !== null, error: (r.am_write_error as string | null) ?? null,
         applied: r.am_applied ? (JSON.parse(r.am_applied as string) as Seen) : null, observed: r.am_observed ? (JSON.parse(r.am_observed as string) as Seen) : null,
@@ -698,16 +708,28 @@ export class ProjectDO extends DurableObject<Env> {
     };
   }
 
-  async getSettings(): Promise<Result<Settings>> {
+  async getSettings(): Promise<Result<ProjectSettings>> {
     const s = this.settings();
     return s ? ok(s) : fail(404, "unknown project");
+  }
+
+  /**
+   * The repo's name, read through from DirectoryDO, its one owner (README.md#the-repos-binding): a rename
+   * applied there reaches every GitHub call, agent start and brief here at once. `settings.repo` is written
+   * only for the previous release, which reads it; nothing here does.
+   */
+  private async repo(): Promise<string> {
+    const id = this.settingsRow()?.id as string | undefined;
+    const row = id ? await directory(this.env).getProject(id) : null;
+    if (!row) throw new Error("the project isn't in the directory");
+    return row.repo;
   }
 
   async updateSettings(u: {
     auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean;
     comments_from_id?: number | null; comments_from_login?: string | null; comments_from_repo_owner?: boolean; max_routine_runs?: number;
     manager_model?: string; worker_model?: string; issues_from?: IssuesFrom;
-  }): Promise<Result<Settings>> {
+  }): Promise<Result<ProjectSettings>> {
     const before = this.settings();
     if (!before) return fail(404, "unknown project");
     // The models (README.md#models): checked before anything is written; the next start of each role uses them.
@@ -722,8 +744,10 @@ export class ProjectDO extends DurableObject<Env> {
       const nest = nestFrom(this.env);
       if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
       try {
-        const owner = await (await githubFor(nest, before.repo, PERMISSIONS.metadata)).repoOwner(before.repo);
+        const repo = await this.repo();
+        const owner = await (await githubFor(nest, repo, PERMISSIONS.metadata)).repoOwner(repo);
         if (owner.type !== "User") return fail(400, `the repo's owner, ${owner.login}, is an organization: set a person's login`);
+        // Only for the previous release, which reads it; nothing here does (README.md#the-repos-binding).
         this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", owner.id, owner.login);
         who = { id: owner.id, login: owner.login };
       } catch (e) {
@@ -735,7 +759,7 @@ export class ProjectDO extends DurableObject<Env> {
         const nest = nestFrom(this.env);
         if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
         try {
-          const found = await (await githubFor(nest, before.repo, PERMISSIONS.metadata)).user(u.comments_from_login);
+          const found = await (await githubFor(nest, await this.repo(), PERMISSIONS.metadata)).user(u.comments_from_login);
           if (!found) return fail(400, `GitHub has no user ${u.comments_from_login}`);
           if (found.type !== "User") return fail(400, `${found.login} is ${found.type === "Organization" ? "an organization" : "a bot"}, not a person: its comments can't be the owner's`);
           who = { id: found.id, login: found.login };
@@ -1078,7 +1102,7 @@ export class ProjectDO extends DurableObject<Env> {
   // --- the repo on GitHub ----------------------------------------------------------------------------
 
   /** Attach the repo again now (the board's retry after a failure; harmless when attached). */
-  async retryAttach(): Promise<Result<Settings>> {
+  async retryAttach(): Promise<Result<ProjectSettings>> {
     if (!this.settings()) return fail(404, "unknown project");
     this.sql.exec("UPDATE settings SET attach_next_ms = ?, attach_attempts = 0, attach_gen = attach_gen + 1", Date.now());
     await this.arm();
@@ -1233,20 +1257,23 @@ export class ProjectDO extends DurableObject<Env> {
    * (the comments user, or the repo's owner), so its author can't undo a decline by closing and
    * reopening it. Edited updates one still untriaged (or adds it, open, if its opening was missed);
    * closed, deleted or transferred takes an untriaged one out. An accepted issue is the task's from then
-   * on: nothing here changes it. `sender` is the GitHub user id the event names as its actor.
+   * on: nothing here changes it. `sender` is the GitHub user id the event names as its actor. `repo_owner`
+   * is the repo's owner, by id, when it's a user, as the event names it (`repository.owner`) or GitHub
+   * answers now (an import): never a copy kept from before, which a transfer would leave trusted.
    */
-  async onIssue(e: { action: string; number: number; title: string; body: string; author: string | null; author_id?: number | null; url: string; open: boolean; sender?: number | null }): Promise<"put" | "ignored" | "dropped" | "none"> {
+  async onIssue(e: { action: string; number: number; title: string; body: string; author: string | null; author_id?: number | null; url: string; open: boolean; sender?: number | null; repo_owner?: number | null }): Promise<"put" | "ignored" | "dropped" | "none"> {
     const s = this.settingsRow();
     if (!s) return "none";
     const had = this.sql.exec("SELECT state FROM issues WHERE number = ?", e.number).toArray()[0];
     const now = Date.now();
     const title = e.title.slice(0, ISSUE_TITLE_MAX);
     const body = e.body.slice(0, ISSUE_BODY_MAX);
+    const owner = e.repo_owner ?? null;
     // Into triage only an issue whose author (the issue's, not who acted) the project takes issues from,
     // and only while triage holds fewer than MAX_UNTRIAGED_ISSUES; past it, dropped and counted.
     const put = (): "put" | "ignored" | "dropped" => {
       const author = e.author_id ?? null;
-      if (s.issues_from !== "anyone" && (author === null || (author !== s.comments_from_id && author !== s.repo_owner_id))) return "ignored";
+      if (s.issues_from !== "anyone" && (author === null || (author !== s.comments_from_id && author !== owner))) return "ignored";
       if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM issues WHERE state = 'untriaged'").one().n >= MAX_UNTRIAGED_ISSUES) {
         this.sql.exec("UPDATE settings SET issues_dropped = issues_dropped + 1, issues_dropped_ms = ?", now);
         return "dropped";
@@ -1260,7 +1287,7 @@ export class ProjectDO extends DurableObject<Env> {
       return "put";
     };
     if (e.action === "opened" || e.action === "reopened") {
-      const trusted = typeof e.sender === "number" && (e.sender === s.comments_from_id || e.sender === s.repo_owner_id);
+      const trusted = typeof e.sender === "number" && (e.sender === s.comments_from_id || e.sender === owner);
       if (e.open && (!had || had.state === "gone" || (e.action === "reopened" && had.state === "declined" && trusted))) return put();
     } else if (e.action === "edited") {
       if (had?.state === "untriaged") this.sql.exec("UPDATE issues SET title = ?, body = ?, updated_ms = ? WHERE number = ?", title, body, now, e.number);
@@ -1323,9 +1350,14 @@ export class ProjectDO extends DurableObject<Env> {
     const nest = nestFrom(this.env);
     if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
     let list: Record<string, unknown>[];
+    // The repo's owner as GitHub answers now, for the same rule as an event's (no event names it here).
+    let owner: number | null;
     try {
-      const gh = await githubFor(nest, s.repo, PERMISSIONS.issuesRead);
-      list = await gh.openIssues(s.repo);
+      const repo = await this.repo();
+      const who = await (await githubFor(nest, repo, PERMISSIONS.metadata)).repoOwner(repo);
+      owner = who.type === "User" ? who.id : null;
+      const gh = await githubFor(nest, repo, PERMISSIONS.issuesRead);
+      list = await gh.openIssues(repo);
     } catch (e) {
       return fail(e instanceof NestError || e instanceof GitHubError ? (e.status === 403 ? 403 : 502) : 502, `the issues couldn't be read: ${message(e)}`);
     }
@@ -1343,7 +1375,7 @@ export class ProjectDO extends DurableObject<Env> {
         continue;
       }
       // By the same rules as an opened issue's event: whose, and the cap.
-      const r = await this.onIssue({ action: "opened", ...e });
+      const r = await this.onIssue({ action: "opened", ...e, repo_owner: owner });
       if (r === "put") imported++;
       else if (r === "ignored") ignored++;
       else if (r === "dropped") dropped++;
@@ -1365,15 +1397,16 @@ export class ProjectDO extends DurableObject<Env> {
     const n = row.issue as number;
     const line = row.pr !== null ? `Done in #${row.pr as number}.` : "Done.";
     try {
-      const gh = await githubFor(nest, s.repo, PERMISSIONS.issuesWrite);
+      const repo = await this.repo();
+      const gh = await githubFor(nest, repo, PERMISSIONS.issuesWrite);
       // The comment once: not again on a retry after it landed (the close failed), nor when it landed but
       // its answer was lost (it's among the issue's comments since the close was owed).
       if (row.commented !== 1) {
-        const since = await gh.issueCommentsSince(s.repo, n, row.owed_ms as number);
-        if (!since.some((c) => c.trim() === line)) await gh.commentIssue(s.repo, n, line);
+        const since = await gh.issueCommentsSince(repo, n, row.owed_ms as number);
+        if (!since.some((c) => c.trim() === line)) await gh.commentIssue(repo, n, line);
         this.sql.exec("UPDATE issue_closes SET commented = 1 WHERE task = ?", task);
       }
-      await gh.closeIssue(s.repo, n);
+      await gh.closeIssue(repo, n);
       if (this.outbox("issue_closes", "task", task, row, { kind: "sent" }, OUTBOX.issue_closes)) this.sql.exec("UPDATE issue_closes SET closed_ms = ? WHERE task = ?", Date.now(), task);
       this.record(task, app, "issue_closed", { issue: n, pr: row.pr });
     } catch (e) {
@@ -1496,10 +1529,12 @@ export class ProjectDO extends DurableObject<Env> {
     const nest = nestFrom(this.env);
     if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
     let p;
+    let repo = "the repo";
     try {
-      p = await (await githubFor(nest, s.repo, PERMISSIONS.pullsRead)).pull(s.repo, pr);
+      repo = await this.repo();
+      p = await (await githubFor(nest, repo, PERMISSIONS.pullsRead)).pull(repo, pr);
     } catch (e) {
-      return fail(e instanceof GitHubError && e.status === 404 ? 404 : 502, e instanceof GitHubError && e.status === 404 ? `no PR #${pr} on ${s.repo}` : message(e));
+      return fail(e instanceof GitHubError && e.status === 404 ? 404 : 502, e instanceof GitHubError && e.status === 404 ? `no PR #${pr} on ${repo}` : message(e));
     }
     if (p.state !== "open") return fail(409, `PR #${pr} is ${p.merged ? "merged" : "closed"}: attach an open one`);
     // What GitHub said, newer than a close recorded meanwhile (reopened since) or not (closed meanwhile: refused).
@@ -1529,7 +1564,8 @@ export class ProjectDO extends DurableObject<Env> {
     const nest = nestFrom(this.env);
     if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
     try {
-      const list = await (await githubFor(nest, s.repo, PERMISSIONS.pullsRead)).openPulls(s.repo);
+      const repo = await this.repo();
+      const list = await (await githubFor(nest, repo, PERMISSIONS.pullsRead)).openPulls(repo);
       return ok(list.map((p) => {
         const row = this.prRow(p.number);
         return { number: p.number, title: p.title, head: p.head_ref, fork: p.fork, task: row && row.state !== "detached" ? (row.task as string) : null };
@@ -1606,7 +1642,7 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** Write the repo's setting again now: after a refusal, or to undo a drift. */
-  async retryRepoAutoMerge(): Promise<Result<Settings>> {
+  async retryRepoAutoMerge(): Promise<Result<ProjectSettings>> {
     if (!this.settings()) return fail(404, "unknown project");
     this.sql.exec("UPDATE settings SET am_write_next_ms = ?, am_write_attempts = 0, am_write_error = NULL", Date.now());
     await this.arm();
@@ -1769,8 +1805,9 @@ export class ProjectDO extends DurableObject<Env> {
     let prs: Map<number, PrNow | null>;
     let verdicts: Record<string, Verdict>;
     try {
-      const gh = await githubFor(nest, s.repo, PERMISSIONS.prRead);
-      prs = await readPrs(gh, s.repo, owned.map((o) => o.pr));
+      const repo = await this.repo();
+      const gh = await githubFor(nest, repo, PERMISSIONS.prRead);
+      prs = await readPrs(gh, repo, owned.map((o) => o.pr));
       const heads = [...prs.values()].filter((p): p is PrNow => p !== null && p.state === "OPEN" && !p.cross_repo).map((p) => ({ pr: p.number, sha: p.head_sha }));
       verdicts = heads.length ? await review(this.env, s.id).verdictsAt(heads) : {};
     } catch (e) {
@@ -1944,8 +1981,9 @@ export class ProjectDO extends DurableObject<Env> {
    */
   private async templateFor(nest: Nest, role: ModelRole, spec: StartSpec): Promise<string> {
     if (!spec.model) return TEMPLATE[role];
+    const repo = await this.repo();
     const s = this.settings()!;
-    const t = roleTemplate(role, s.id, s.repo, spec.model);
+    const t = roleTemplate(role, s.id, repo, spec.model);
     // Recorded before it's written: one written and never recorded would be left in nest for good. A new
     // `at_ms` each time, so a sweep whose delete was in flight sees the row is this start's now.
     this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = MAX(excluded.at_ms, model_templates.at_ms + 1), del_next_ms = NULL, del_attempts = 0, del_error = NULL", t.name, role, spec.model, Date.now());
@@ -3120,6 +3158,8 @@ export class ProjectDO extends DurableObject<Env> {
    * refusal for good fails the run.
    */
   private async startRun(nest: Nest, id: string): Promise<void> {
+    // The repo's name first, so everything read of the run is read after the await.
+    const repo = await this.repo();
     const before = this.runRow(id);
     if (!before || before.state !== "starting") return;
     const s = this.settings()!;
@@ -3134,7 +3174,7 @@ export class ProjectDO extends DurableObject<Env> {
     // at that deadline) and its brief, decided at its first attempt and kept: a retry sends the requests its
     // keys were bound to, however the routine was edited meanwhile.
     const briefOf = (spawn: Record<string, unknown>) => runBrief({
-      project: { id: s.id, name: s.name, repo: s.repo },
+      project: { id: s.id, name: s.name, repo },
       routine: { id: routine.id as string, name: routine.name as string, kind: routine.kind as RoutineKind, prompt: routine.prompt as string, max_minutes: routine.max_minutes as number, proposals: routine.proposals as "triage" | "draft" },
       run: { id, trigger: before.trigger as TriggerKind, count: (before.count as number | null) ?? null },
       last_start_ms: (routine.prev_start_ms as number | null) ?? null,
@@ -3158,7 +3198,7 @@ export class ProjectDO extends DurableObject<Env> {
         // A dreaming run has no hands (no sandbox, no repo): the board, recent work, memory and transcripts are all it reads.
         agent = template === TEMPLATE.dreaming
           ? (await nest.createAgent({ ...spawn, template: TEMPLATE.dreaming, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent
-          : await nest.startAgent(TEMPLATE.routine, labels, { read: s.repo }, `${s.id}/routine/${id}`, {}, spawn);
+          : await nest.startAgent(TEMPLATE.routine, labels, { read: repo }, `${s.id}/routine/${id}`, {}, spawn);
         // Named on the run in the step the create's answer came, before any other await, so its exit finds it.
         this.sql.exec("UPDATE routine_runs SET agent = ? WHERE id = ? AND agent IS NULL", agent, id);
         if (!current()) {
@@ -3488,7 +3528,7 @@ export class ProjectDO extends DurableObject<Env> {
           return ok({
             id: t.id, title: t.title, body: t.body, spec: t.spec, state: t.state, pr: t.pr, prs: t.prs.map((p) => ({ number: p.number, state: p.state })),
             // What it waits on, and each one's state: it shouldn't build on a dependency that isn't done.
-            dependencies: t.blocked_by, repo: this.settings()!.repo, branch: taskBranch(t.id),
+            dependencies: t.blocked_by, repo: await this.repo(), branch: taskBranch(t.id),
           });
         }
         case "report_progress":
@@ -3768,8 +3808,9 @@ export class ProjectDO extends DurableObject<Env> {
     const s = this.settings()!;
     const want = s.auto_merge;
     try {
-      const gh = await githubFor(nest, s.repo, PERMISSIONS.repoSettings);
-      const after = await gh.setAllowAutoMerge(s.repo, want);
+      const repo = await this.repo();
+      const gh = await githubFor(nest, repo, PERMISSIONS.repoSettings);
+      const after = await gh.setAllowAutoMerge(repo, want);
       const now = Date.now();
       const seen = JSON.stringify({ value: want, at_ms: now } satisfies Seen);
       const observed = typeof after === "boolean" ? JSON.stringify({ value: after, at_ms: now } satisfies Seen) : null;
@@ -3789,10 +3830,10 @@ export class ProjectDO extends DurableObject<Env> {
 
   /** Read the repo's "Allow auto-merge" (`GET /repos/{o}/{r}`), to show a change made by hand. */
   private async readRepoAutoMerge(nest: Nest): Promise<void> {
-    const s = this.settings()!;
     try {
-      const gh = await githubFor(nest, s.repo, PERMISSIONS.repoRead);
-      const value = await gh.allowAutoMerge(s.repo);
+      const repo = await this.repo();
+      const gh = await githubFor(nest, repo, PERMISSIONS.repoRead);
+      const value = await gh.allowAutoMerge(repo);
       this.sql.exec("UPDATE settings SET am_observed = ?, am_read_next_ms = NULL, am_read_attempts = 0", JSON.stringify({ value, at_ms: Date.now() } satisfies Seen));
     } catch (e) {
       const attempts = (this.settingsRow()!.am_read_attempts as number) + 1;
@@ -3812,7 +3853,7 @@ export class ProjectDO extends DurableObject<Env> {
     const github: Actor = { kind: "app", what: "github" };
     const still = () => this.prRow(pr)?.am_owed === what;
     try {
-      const gh = await githubFor(nest, s.repo, PERMISSIONS.autoMerge);
+      const gh = await githubFor(nest, await this.repo(), PERMISSIONS.autoMerge);
       if (what === "enable") await gh.enableAutoMerge(before.node as string, GRAPHQL_METHOD[method]);
       else await gh.disableAutoMerge(before.node as string);
       const status: TaskAutoMerge = { state: what === "enable" ? "enabled" : "disabled", method: what === "enable" ? method : null, error: null, at_ms: Date.now() };
@@ -3844,19 +3885,23 @@ export class ProjectDO extends DurableObject<Env> {
     // An attach owed again while this one runs (a new generation) stays owed, whatever this one's outcome.
     const gen = this.settingsRow()!.attach_gen as number;
     try {
-      const gh = await githubFor(nest, s.repo, PERMISSIONS.attach);
+      const repo = await this.repo();
+      const gh = await githubFor(nest, repo, PERMISSIONS.attach);
       // The App's id from nest's token answer; else one a check run told, if any has yet.
       const appId = gh.appId ?? (await directory(this.env).githubAppId());
       if (gh.appId !== null) await directory(this.env).recordGithubAppId(gh.appId);
-      const r = await requireReviewCheck(gh, s.repo, appId);
+      const r = await requireReviewCheck(gh, repo, appId);
       // Whose PR comments count (README.md#pr-comments): the repo's owner, when it's a user; never changed once set.
       // Once only: after that (the owner's choice, nobody included), an attach never changes it.
-      const info = await gh.repoInfo(s.repo);
+      const info = await gh.repoInfo(repo);
       const owner = info.owner;
       // The repo's binding (README.md#the-repos-binding): its id read from GitHub now, so events never bind it.
       // One that doesn't bind (another project's, or another id) is shown on the Admin page; the attach goes on.
-      await directory(this.env).bindRepo(s.id, { id: info.id, full_name: info.full_name, owner: { id: owner.id, login: owner.login }, installation_id: gh.installationId }, "fill");
+      // The token's installation only when GitHub's name for the repo is the one it was minted for (`ownInstallation`).
+      await directory(this.env).bindRepo(s.id, { id: info.id, full_name: info.full_name, owner: { id: owner.id, login: owner.login }, installation_id: ownInstallation(repo, info.full_name, gh.installationId) }, "fill");
       const user = owner.type === "User";
+      // Written only for the previous release, whose review gate and triage read it; nothing here reads it
+      // (trust is decided by each event's owner, README.md#the-review-gate). Removed the release after.
       this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", user ? owner.id : null, user ? owner.login : null);
       if (user) this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1 WHERE comments_decided = 0", owner.id, owner.login);
       const detail: AttachDetail = { ...r, at_ms: Date.now() };
@@ -4044,7 +4089,7 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** The owner's Restart: the manager (if any) goes, a new one starts now. Asked while one is starting, nothing changes. */
-  async restartManager(): Promise<Result<Settings>> {
+  async restartManager(): Promise<Result<ProjectSettings>> {
     if (!this.settings()) return fail(404, "unknown project");
     this.managerMove({ kind: "restart" });
     await this.arm();
@@ -4077,7 +4122,8 @@ export class ProjectDO extends DurableObject<Env> {
       // Its bindings, env and workflows, frozen with the same key (README.md#secrets).
       const spec = await this.sandboxSpec(nest, "manager", key);
       const from = s.manager ? null : await this.templateFor(nest, "manager", spec);
-      const agent = s.manager ?? (await nest.startAgent(from!, labels, { read: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
+      const repo = await this.repo();
+      const agent = s.manager ?? (await nest.startAgent(from!, labels, { read: repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
       if (from) this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       if (!current()) {
@@ -4088,7 +4134,7 @@ export class ProjectDO extends DurableObject<Env> {
       this.sql.exec("UPDATE settings SET manager = ?", agent);
       this.trackLayer(agent, "manager", frozen.rev);
       this.recordHolder(agent, "manager", spec.names);
-      await nest.postInbox(agent, managerBrief(s) + spec.brief, { requestId: `${s.id}/manager/${n}/brief` });
+      await nest.postInbox(agent, managerBrief(s, repo) + spec.brief, { requestId: `${s.id}/manager/${n}/brief` });
       // Done only if nothing moved meanwhile (it exited during its brief, the owner restarted it): else
       // that move's own start stands.
       const done = this.sql.exec(
@@ -4133,7 +4179,7 @@ export class ProjectDO extends DurableObject<Env> {
         const frozen = await this.frozenEgress(nest, key, "worker");
         const spec = await this.sandboxSpec(nest, "worker", key);
         const from = await this.templateFor(nest, "worker", spec);
-        agent = await nest.startAgent(from, labels, { push: s.repo }, key, { ...egressExtras(frozen.egress), ...spec.extras });
+        agent = await nest.startAgent(from, labels, { push: await this.repo() }, key, { ...egressExtras(frozen.egress), ...spec.extras });
         // In the step the create's answer came (no await): the template it started from, for the sweep.
         this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
         if (!current()) {
@@ -4156,9 +4202,13 @@ export class ProjectDO extends DurableObject<Env> {
           return;
         }
       }
-      const t = this.toTask(this.taskRow(id)!);
+      // The repo's name as the directory has it now; the task read after it, so moved meanwhile, it's not briefed.
+      const repo = await this.repo();
+      const row = current();
+      if (!row) return;
+      const t = this.toTask(row);
       // A spec a tainted session wrote reaches the worker as relayed text, so its session is tainted too.
-      await nest.postInbox(agent, workerBrief(s, t) + (this.frozenSpec(`${s.id}/${id}/${n}`)?.brief ?? ""), { requestId: `${id}/${n}/brief`, ...(t.tainted ? { from: "projects/board" } : {}) });
+      await nest.postInbox(agent, workerBrief(repo, t) + (this.frozenSpec(`${s.id}/${id}/${n}`)?.brief ?? ""), { requestId: `${id}/${n}/brief`, ...(t.tainted ? { from: "projects/board" } : {}) });
       if (!current()) return;
       // In progress, or in review with an open PR; the owner's PR comments that waited for it follow its
       // brief (README.md#pr-comments).
@@ -4396,18 +4446,18 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).sli
 /** `n` random bytes as hex: a marker no text written before it could know. */
 const randomHex = (n: number) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
-function managerBrief(s: Settings): string {
+function managerBrief(s: ProjectSettings, repo: string): string {
   return [
-    `You manage project "${s.name}" (${s.id}) for the GitHub repo ${s.repo}.`,
-    `Clone it in your sandbox to read it (\`gh repo clone ${s.repo}\` or git over https), then list the board with projects-board list_tasks and spec any task that has no spec yet.`,
+    `You manage project "${s.name}" (${s.id}) for the GitHub repo ${repo}.`,
+    `Clone it in your sandbox to read it (\`gh repo clone ${repo}\` or git over https), then list the board with projects-board list_tasks and spec any task that has no spec yet.`,
     "The owner's messages come next, in your inbox.",
   ].join("\n");
 }
 
-function workerBrief(s: Settings, t: Task): string {
+function workerBrief(repo: string, t: Task): string {
   const spec = t.spec;
   return [
-    `Your task: ${t.id}, "${t.title}", on the GitHub repo ${s.repo}. Push the branch ${taskBranch(t.id)} and open one PR from it.`,
+    `Your task: ${t.id}, "${t.title}", on the GitHub repo ${repo}. Push the branch ${taskBranch(t.id)} and open one PR from it.`,
     "",
     t.body,
     ...(spec ? [

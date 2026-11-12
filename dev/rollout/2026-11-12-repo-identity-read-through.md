@@ -1,0 +1,8 @@
+# The projects app reads its repo's name and owner through (2026-11-12)
+
+A release's rollout rule ([Rollout rules](../deploy.md#rollout-rules)), for the projects app ([the repo's binding](../../projects/README.md#the-repos-binding)).
+
+**Not a one-way deploy, and no ordering constraint.** No nest change. DirectoryDO gains a migration step (`installation_checked_ms` on `projects`) and a method, `claimInstallationCheck`; it loses `unrenameRepo`, which only this script called. ProjectDO's `onIssue` takes an optional `repo_owner`. All in one script, so they deploy together.
+- **Expand, for a rollback:** this release reads neither ProjectDO's `settings.repo`, `repo_owner_id` and `repo_owner_login`, nor ReviewDO's `repo` setting, but keeps writing them as before: the repo's owner at attach and at "Use the repo owner", and the name at create, at a rename applied, and at every catalog sync (written again from the directory's). One it can't write is logged, not rolled back.
+- **What a rollback does:** the previous release reads those copies again. Its review gate and triage trust the owner ProjectDO recorded at attach, so a repo transferred since leaves its old owner trusted there, as before this release. A rename applied while the old copy couldn't be written leaves that DO on the old name until the next sync on this release, or until it's redeployed. The new column is unread.
+- **Contract, the release after:** stop writing `settings.repo_owner_id`, `repo_owner_login`, ProjectDO's `settings.repo` and ReviewDO's `repo` setting (`writeOldCopies` in `src/binding.ts`, and the two `UPDATE settings SET repo_owner_…` in `src/do/project.ts`).
