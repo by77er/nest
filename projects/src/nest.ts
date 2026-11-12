@@ -352,6 +352,17 @@ export function stopRefused(e: unknown): boolean {
   return e instanceof NestError && e.code !== "http" && !e.retryable && (e.status === 400 || e.status === 409);
 }
 
+/**
+ * nest refused a create because the client is at its grant's `max_agents` or `max_sandboxes`
+ * (README.md#built-the-review-pipeline): a refusal that lasts only until one of its agents or sandboxes
+ * ends. nest answers it as any refusal of the grant (403 `forbidden`, not retryable), so it's told apart by
+ * its message, which ClientDO's `admit` writes as "<client> has <n> live sandboxes, its grant's
+ * max_sandboxes" (control-plane/src/do/client.ts). A message nest words otherwise is a refusal like any other.
+ */
+export function atCapacity(e: unknown): boolean {
+  return e instanceof NestError && e.status === 403 && e.code === "forbidden" && /\bhas \d+ live (?:agents|sandboxes), its grant's max_(?:agents|sandboxes)\b/.test(e.message);
+}
+
 export function nestFrom(env: { NEST_CONTROL_PLANE: string; NEST_CELL: string; NEST_CLIENT_TOKEN?: string }): Nest | null {
   return env.NEST_CLIENT_TOKEN ? new Nest({ base: env.NEST_CONTROL_PLANE, token: env.NEST_CLIENT_TOKEN, cell: env.NEST_CELL }) : null;
 }

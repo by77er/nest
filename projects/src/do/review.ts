@@ -19,7 +19,7 @@ import { TEMPLATE } from "../catalog";
 import { directory, type Env, project as projectStub } from "../env";
 import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, type Verdict, verdictCheck } from "../github";
 import type { AgentCaller } from "../identity";
-import { backoff, NestError, nestFrom, type Nest, stopRefused } from "../nest";
+import { atCapacity, backoff, NestError, nestFrom, type Nest, stopRefused } from "../nest";
 import { OUTBOX, type OutboxPolicy, type OutboxRow, outboxStep } from "../outbox";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
@@ -147,6 +147,11 @@ const MIGRATIONS = [
     "ALTER TABLE ended ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE ended ADD COLUMN error TEXT",
     "ALTER TABLE stops ADD COLUMN failed_ms INTEGER",
+  ],
+  [
+    // When a job began waiting, queued, for nest to have room for its reviewer (its grant's max_agents or
+    // max_sandboxes); null when it isn't waiting for room.
+    "ALTER TABLE jobs ADD COLUMN capacity_ms INTEGER",
   ],
 ] as const;
 
@@ -480,7 +485,7 @@ export class ReviewDO extends DurableObject<Env> {
   private reset(pr: number, sha: string): void {
     this.sql.exec(
       `UPDATE jobs SET next_ms = ?, agent = NULL, check_run = NULL, briefed = 0, verdict = NULL, tainted = NULL,
-        attempts = 0, errors = 0, error = NULL, deadline_ms = NULL WHERE pr = ? AND sha = ?`,
+        attempts = 0, errors = 0, error = NULL, deadline_ms = NULL, capacity_ms = NULL WHERE pr = ? AND sha = ?`,
       Date.now(), pr, sha,
     );
   }
@@ -514,14 +519,44 @@ export class ReviewDO extends DurableObject<Env> {
     this.sql.exec("INSERT OR IGNORE INTO stops (agent, reason, next_ms) VALUES (?, ?, ?)", agent, reason, Date.now());
   }
 
+  /**
+   * nest won't start the job's reviewer for capacity (its grant's max_agents or max_sandboxes: `atCapacity`):
+   * the job waits, queued, as one over max_concurrent_reviews does, its slot freed, and is tried again with
+   * backoff (5 s doubling to 5 minutes, never given up), sooner when one of the project's reviewers ends.
+   * Its check stays in progress, saying so once. The next try is a new start (`runs`), with new keys: what
+   * this one made, nest's refusal undid. Nothing of the job's approval changes: it was cleared to run.
+   */
+  private waitForRoom(j: Row, why: string): void {
+    if (!this.move(j.pr as number, j.sha as string, "running", "wait")) return;
+    const errors = (j.errors as number) + 1;
+    this.sql.exec(
+      `UPDATE jobs SET agent = NULL, briefed = 0, deadline_ms = NULL, errors = ?, next_ms = ?, error = ?,
+        capacity_ms = COALESCE(capacity_ms, ?) WHERE pr = ? AND sha = ?`,
+      errors, Date.now() + backoff(errors), `waiting for room in nest to start a reviewer: ${why}`, Date.now(), j.pr, j.sha,
+    );
+    if (j.capacity_ms === null && j.check_run !== null) {
+      this.oweCheck(j.check_run as number, { status: "in_progress", output: ROOM_OUTPUT });
+    }
+  }
+
+  /** One of the project's reviewers ended: jobs waiting for room in nest try now. */
+  private roomFreed(): boolean {
+    return this.sql.exec("UPDATE jobs SET next_ms = ? WHERE state = 'queued' AND capacity_ms IS NOT NULL AND next_ms > ?", Date.now(), Date.now()).rowsWritten > 0;
+  }
+
   /** nest's `agent.exited` for a reviewer: without a verdict, it's started again, up to MAX_RETRIES times. */
   async onAgentExited(agent: string, reason?: string): Promise<void> {
     // Gone, by nest's word: a stop of it that nest refused has nothing left to stop.
     this.sql.exec("DELETE FROM stops WHERE agent = ? AND failed_ms IS NOT NULL", agent);
+    // Its place in nest is free: a job waiting for room tries now.
+    const freed = this.roomFreed();
     const j = this.sql.exec("SELECT * FROM jobs WHERE agent = ?", agent).toArray()[0];
     // No job names it yet: kept for the job's start, which learns it from the create's answer.
     if (!j) this.sql.exec("INSERT OR IGNORE INTO early_exits (agent, reason, at_ms) VALUES (?, ?, ?)", agent, reason ?? null, Date.now());
-    if (!j || j.state !== "running" || j.verdict !== null) return;
+    if (!j || j.state !== "running" || j.verdict !== null) {
+      if (freed) await this.arm();
+      return;
+    }
     this.spendAttempt(j, `the reviewer exited without a verdict (${(reason ?? "exited").slice(0, 100)})`, "exited");
     await this.arm();
   }
@@ -740,8 +775,7 @@ export class ReviewDO extends DurableObject<Env> {
         // A create whose answer was lost made a check run all the same: found by its external id.
         const found = (before.errors as number) > 0 ? (await gh.checkRunsAt(repo, sha)).find((c) => c.external_id === external) : undefined;
         const made = found ?? (await gh.createCheckRun(repo, {
-          head_sha: sha, external_id: external, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}`,
-          output: { title: "Reviewing", summary: `A reviewer agent is reviewing ${sha}: correctness, quality and architectural cohesiveness.` },
+          head_sha: sha, external_id: external, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}`, output: reviewingOutput(sha),
         }))!;
         const appId = made.app?.id;
         if (typeof appId === "number" && this.setting("github_app_id") !== String(appId)) {
@@ -766,13 +800,23 @@ export class ReviewDO extends DurableObject<Env> {
         const key = `${project}/review/${pr}/${sha}/${runs}`;
         // The project's secrets for reviewers, frozen per attempt (ProjectDO keeps them).
         const spec = await projectStub(this.env, project).reviewerSpec(key);
-        agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, key, spec.extras);
+        try {
+          agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, key, spec.extras);
+        } catch (e) {
+          // No room in nest for now: the job waits, queued, and starts again once there is.
+          const r = atCapacity(e) ? current() : null;
+          if (!r) throw e;
+          this.waitForRoom(r, message(e));
+          return;
+        }
         if (!current()) {
           this.oweStop(agent, "superseded");
           return;
         }
         // Named on the job in the step the create's answer came, before any other await, so its exit finds it.
-        this.sql.exec("UPDATE jobs SET agent = ? WHERE pr = ? AND sha = ?", agent, pr, sha);
+        this.sql.exec("UPDATE jobs SET agent = ?, capacity_ms = NULL WHERE pr = ? AND sha = ?", agent, pr, sha);
+        // It waited for room: its check says it's reviewing again.
+        if (j0.capacity_ms !== null && j0.check_run !== null) this.oweCheck(j0.check_run as number, { status: "in_progress", output: reviewingOutput(sha) });
         await directory(this.env).recordAgent({ agent, project, role: "reviewer", task: null, pr });
         // Its holdings and live layer: a secret changed or removed later reaches it too.
         await projectStub(this.env, project).reviewerStarted(agent, key);
@@ -902,6 +946,7 @@ export class ReviewDO extends DurableObject<Env> {
       }
     }
     this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
+    this.roomFreed();
     // Stopped with its sandbox: no layer left to keep up.
     const project = this.setting("project");
     if (project) await projectStub(this.env, project).agentEnded(agent);
@@ -911,6 +956,15 @@ export class ReviewDO extends DurableObject<Env> {
 const HELD_OUTPUT: CheckOutput = {
   title: "Waiting for the owner's approval",
   summary: "This pull request isn't from someone the project trusts, so its review doesn't start by itself. The project's owner can approve the review of this commit, or dismiss it.",
+};
+
+const reviewingOutput = (sha: string): CheckOutput => ({
+  title: "Reviewing", summary: `A reviewer agent is reviewing ${sha}: correctness, quality and architectural cohesiveness.`,
+});
+
+const ROOM_OUTPUT: CheckOutput = {
+  title: "Waiting for room to start a reviewer",
+  summary: "nest is running as many of this app's agents or sandboxes as its grant allows. The review starts by itself once there's room.",
 };
 
 const OVERFLOW_OUTPUT: CheckOutput = {
