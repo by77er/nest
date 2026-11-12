@@ -205,6 +205,18 @@ describe("the manager's model, switched now", () => {
     expect(switchText({ from: null, to: "claude-sonnet-5-5", after_turn: true })).toBe("Switches to Sonnet 5.5 after this turn.");
     expect(switchText({ from: null, to: "claude-sonnet-5-5", after_turn: false })).toBe("Switching to Sonnet 5.5…");
   });
+
+  it("a switch nest gave up says it takes effect at the manager's next start, while that model is chosen", async () => {
+    const api = new FakeApi();
+    api.projects[0]!.settings = { ...api.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch_given_up: "claude-sonnet-5-5" };
+    const { user, dialog } = await openSettings(api);
+    expect(dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Takes effect when the manager next starts.");
+    // Another model picked: that one would be switched to now, so the line goes.
+    const field = within(dialog).getAllByLabelText("Manager's model").find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden")!;
+    await user.click(field);
+    await user.click(await screen.findByRole("option", { name: "Haiku 5.5" }));
+    expect(dialog.querySelector("[data-slot=manager-switch]")).toBeNull();
+  });
 });
 
 describe("the models in the settings", () => {

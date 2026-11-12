@@ -341,7 +341,7 @@ describe("the migration", () => {
       for (const t of ["model_templates", "agent_templates"]) sql.exec(`DROP TABLE ${t}`);
       // And the triage-trust step's columns.
       for (const c of ["issues_from", "issues_dropped", "issues_dropped_ms"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
-      for (const c of ["manager_running_model", "switch_next_ms", "switch_after_turn", "switch_attempts", "switch_refusals", "refusal_seen_ms", "refusal_check_ms"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      for (const c of ["manager_running_model", "switch_next_ms", "switch_after_turn", "switch_attempts", "switch_refusals", "refusal_seen_ms", "refusal_check_ms", "switch_gave_up_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       expect(step).toBe(MIGRATIONS.length - 16);
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, pr_node, am_status, created_ms, updated_ms) VALUES ('tsk_old', 't', '', 'in_review', 1, 7, 'PR_x', '{"state":"enabled"}', 1, 2)`);

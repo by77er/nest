@@ -168,7 +168,7 @@ describe("who is set", () => {
       for (const c of ["comments_from_id", "comments_from_login", "comments_decided", "repo_owner_id", "repo_owner_login", "routine_cap", "tasks_done_total", "prs_merged_total", "attach_gen"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE settings SET attach_next_ms = NULL");
       for (const c of ["issues_from", "issues_dropped", "issues_dropped_ms"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
-      for (const c of ["manager_running_model", "switch_next_ms", "switch_after_turn", "switch_attempts", "switch_refusals", "refusal_seen_ms", "refusal_check_ms"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      for (const c of ["manager_running_model", "switch_next_ms", "switch_after_turn", "switch_attempts", "switch_refusals", "refusal_seen_ms", "refusal_check_ms", "switch_gave_up_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE schema_version SET v = ?", step);
       migrate(st.storage, MIGRATIONS);
       expect(sql.exec("SELECT attach_next_ms FROM settings").one().attach_next_ms).toBe(0);

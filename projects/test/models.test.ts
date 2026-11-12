@@ -341,7 +341,7 @@ describe("a project's models", () => {
       await deliver({ id: `evt-${rand()}`, type: "agent.error", agent, code: "restart_refused", message: "the restart failed after retries" });
       await alarm(p);
     };
-    const row = (p: P) => runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT manager_running_model, switch_next_ms, refusal_check_ms FROM settings").one());
+    const row = (p: P) => runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT manager_running_model, switch_next_ms, refusal_check_ms, switch_refusals FROM settings").one());
     const dueNow = (p: P) => runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET switch_next_ms = 0 WHERE switch_next_ms IS NOT NULL"); });
     const refusedLines = async (p: P) => (await appChat(p)).filter((t) => t.includes("didn't complete") || t.startsWith("Couldn't switch"));
 
@@ -397,6 +397,48 @@ describe("a project's models", () => {
       expect(m.restarts).toHaveLength(3);
     });
 
+    it("Settings says a given-up switch takes effect at the manager's next start, till it starts, the setting changes or a switch applies", async () => {
+      const giveUpThrice = async (p: P) => {
+        for (const n of [1, 2, 3]) {
+          await giveUp(p, n);
+          if (n < 3) {
+            await dueNow(p);
+            await alarm(p);
+          }
+        }
+      };
+      const p = await newProject();
+      const m = fake.agents.get(p.manager)!;
+      await setModel(p, "claude-sonnet-5-5");
+      await giveUpThrice(p);
+      // The manager runs its old model meanwhile: not recorded as on Sonnet.
+      expect(await settings(p)).toMatchObject({ manager_switch: null, manager_switch_given_up: "claude-sonnet-5-5" });
+      expect((await row(p)).manager_running_model).toBeNull();
+      // Saved again unchanged (the whole form): still given up, not tried again.
+      await setModel(p, "claude-sonnet-5-5");
+      await alarm(p);
+      expect(await settings(p)).toMatchObject({ manager_switch: null, manager_switch_given_up: "claude-sonnet-5-5" });
+      expect(m.restarts).toHaveLength(3);
+      // Another model: cleared at once, though its switch waits for a turn's end; then applied.
+      m.state = "working";
+      expect((await setModel(p, "claude-haiku-5-5")).body).toMatchObject({ manager_switch: { to: "claude-haiku-5-5", after_turn: true }, manager_switch_given_up: null });
+      m.state = "idle";
+      await deliver({ id: `evt-${rand()}`, type: "agent.turn_completed", agent: p.manager, text: "Done." });
+      await alarm(p);
+      expect(m.restarts).toHaveLength(4);
+      expect((await settings(p)).manager_switch_given_up).toBeNull();
+
+      // The manager's next start takes the model: cleared.
+      const q = await newProject();
+      await setModel(q, "claude-sonnet-5-5");
+      await giveUpThrice(q);
+      expect((await settings(q)).manager_switch_given_up).toBe("claude-sonnet-5-5");
+      await api(token, "POST", `/api/projects/${q.id}/manager/restart`);
+      await stub(q).drain();
+      expect(await settings(q)).toMatchObject({ manager_switch: null, manager_switch_given_up: null });
+      expect((await row(q)).manager_running_model).toBe("claude-sonnet-5-5");
+    });
+
     it("another model isn't held back or counted by nest's give-ups of the last", async () => {
       const p = await newProject();
       const m = fake.agents.get(p.manager)!;
@@ -420,6 +462,27 @@ describe("a project's models", () => {
       await giveUp(p, 1);
       expect((await refusedLines(p)).at(-1)).toBe("The switch to Haiku 5.5 didn't complete (nest couldn't restart the manager): trying again in 5 minutes.");
       expect(m.restarts).toEqual([{ model: "claude-sonnet-5-5" }]);
+    });
+
+    it("a new manager starts with no give-ups counted and no refusal to read", async () => {
+      const p = await newProject();
+      await setModel(p, "claude-sonnet-5-5");
+      await giveUp(p, 1);
+      // A refusal seen and not yet read when the manager is replaced (its alarm held off till then).
+      fake.agents.get(p.manager)!.restartError = { code: "unavailable", message: "the fleet didn't answer", ms: 2 };
+      await runInDurableObject(stub(p), async (o, st) => {
+        await (o as unknown as { onEvent(e: unknown, r: unknown): Promise<void> }).onEvent({ id: `evt-${rand()}`, type: "agent.error", agent: p.manager, code: "restart_refused" }, { role: "manager", task: null });
+        await st.storage.deleteAlarm();
+      });
+      expect(await row(p)).toMatchObject({ switch_refusals: 1, refusal_check_ms: expect.any(Number) });
+      await api(token, "POST", `/api/projects/${p.id}/manager/restart`);
+      await stub(p).drain();
+      const next = (await settings(p)).manager as string;
+      expect(next).not.toBe(p.manager);
+      // The old manager's give-ups don't count against the new one, and its refusal isn't read off the new one's record.
+      expect(await row(p)).toMatchObject({ switch_refusals: 0, refusal_check_ms: null });
+      expect(await refusedLines(p)).toHaveLength(1);
+      expect(fake.callsTo("GET", new RegExp(`^/v1/agents/${next}$`))).toEqual([]);
     });
 
     it("a late refusal of an earlier switch, after a later one was asked, changes nothing", async () => {

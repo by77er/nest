@@ -943,6 +943,8 @@ const app = {
     // A manager model switch waiting for the manager's turn to end, and its chat line once done (README.md#models).
     { name: "settings-manager-switching", section: "project", path: "/projects/prj_demo/settings", fixture: "manager-switching" },
     { name: "settings-manager-switching-now", section: "project", path: "/projects/prj_demo/settings", fixture: "manager-switching-now" },
+    { name: "manager-switch-gave-up", section: "project", path: "/projects/prj_demo/manager", fixture: "switch-gave-up", full: false },
+    { name: "settings-manager-gave-up", section: "project", path: "/projects/prj_demo/settings", fixture: "switch-gave-up" },
     { name: "manager-switch-refused", section: "project", path: "/projects/prj_demo/manager", fixture: "switch-refused", full: false },
     { name: "manager-switched", section: "project", path: "/projects/prj_demo/manager", fixture: "manager-switched", full: false },
     { name: "settings-models-open", section: "project", path: "/projects/prj_demo/settings", full: false, after: async (p) => { const f = p.getByLabel("Manager's model").first(); await f.scrollIntoViewIfNeeded(); await f.click(); } },

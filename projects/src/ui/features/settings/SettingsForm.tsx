@@ -166,6 +166,11 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                     {switchText(settings.manager_switch)}
                   </Text>
                 )}
+                {settings.manager_switch_given_up === form.getValues().manager_model && (
+                  <Text fz="sm" c="dimmed" data-slot="manager-switch" role="status">
+                    Takes effect when the manager next starts.
+                  </Text>
+                )}
                 <ModelField
                   label="Workers' model"
                   description="A change applies to workers started from now on; running ones keep theirs."
