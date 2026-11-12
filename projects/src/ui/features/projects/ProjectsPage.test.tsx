@@ -43,6 +43,9 @@ describe("projects", () => {
     api.asksError = "nest 503";
     renderApp("/projects", api);
     const badge = await screen.findByRole("link", { name: /Couldn't check what needs you/ });
+    // "?", as on the sidebar; the sentence is its name and tooltip.
+    expect(badge).toHaveTextContent(/^\?$/);
+    expect(badge).toHaveAttribute("title", "Couldn't check what needs you");
     expect(badge).toHaveAttribute("href", "/projects/prj_one/board");
     expect(document.querySelector("[data-marker=needs-you]")).toBeNull();
   });

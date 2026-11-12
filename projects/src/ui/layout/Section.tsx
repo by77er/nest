@@ -4,11 +4,12 @@
 import { Badge, Group, Stack, Text, Title } from "@mantine/core";
 import { type ReactNode, type Ref, useId } from "react";
 import { icon as iconSize, type Role } from "../theme";
+import classes from "./Section.module.css";
 
 export interface SectionProps {
   title: ReactNode;
-  /** How many things it holds, beside the title. */
-  count?: number;
+  /** How many things it holds, beside the title; `null`: unknown, shown as "?". */
+  count?: number | null;
   /** Its actions, the primary one rightmost, at the top right. */
   actions?: ReactNode;
   dense?: boolean;
@@ -37,12 +38,12 @@ export function Section({ title, count, actions, dense = false, order, region = 
               <Icon size={iconSize.lg} aria-hidden />
             </Text>
           )}
-          <Title order={order ?? (dense ? 4 : 3)} id={id} ref={headingRef} tabIndex={headingRef ? -1 : undefined}>
+          <Title order={order ?? (dense ? 4 : 3)} id={id} ref={headingRef} tabIndex={headingRef ? -1 : undefined} className={headingRef ? classes.focusTarget : undefined}>
             {title}
           </Title>
           {count !== undefined && (
-            <Badge size="sm" variant="default" aria-label={`${count} ${count === 1 ? "item" : "items"}`} data-slot="count">
-              {count}
+            <Badge size="sm" variant="default" aria-label={count === null ? "An unknown number of items" : `${count} ${count === 1 ? "item" : "items"}`} data-slot="count">
+              {count ?? "?"}
             </Badge>
           )}
         </Group>

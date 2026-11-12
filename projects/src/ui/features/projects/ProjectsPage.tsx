@@ -64,7 +64,7 @@ export function ProjectsPage() {
                     </Badge>
                   )}
                   {p.needs_you === null && (
-                    // nest couldn't be read for the agents' asks: unknown, not none.
+                    // Unknown, not none (the agents' asks couldn't be read, or the list couldn't refresh): "?", as on the sidebar.
                     <BadgeLink
                       to="/projects/$projectId/board"
                       params={{ projectId: p.id }}
@@ -73,8 +73,9 @@ export function ProjectsPage() {
                       variant="light"
                       data-marker="needs-you-unknown"
                       aria-label="Couldn't check what needs you: open the board"
+                      title="Couldn't check what needs you"
                     >
-                      Couldn't check what needs you
+                      ?
                     </BadgeLink>
                   )}
                   {p.needs_you !== null && p.needs_you > 0 && (

@@ -8,12 +8,11 @@ import { renderApp } from "../../test/render";
 
 const panel = () => screen.findByRole("region", { name: "Needs you" });
 const gone = () => expect(screen.queryByRole("region", { name: "Needs you" })).toBeNull();
-/** The last item answered here: it leaves, the panel stays saying nothing else waits, and focus is on its heading. */
+/** The last item answered here: the panel goes, focus is on the board's heading, and that's said in a live region. */
 const answeredLast = async () => {
-  const p = await panel();
-  await waitFor(() => expect(p.querySelector("[data-ask], [data-blocked]")).toBeNull());
-  expect(p).toHaveTextContent("Nothing else waits on you.");
-  expect(within(p).getByRole("heading", { name: "Needs you" })).toHaveFocus();
+  await waitFor(gone);
+  expect(screen.getByRole("heading", { name: "Tasks" })).toHaveFocus();
+  expect(document.querySelector("[data-announce]")).toHaveTextContent("Answered; nothing else waits on you.");
 };
 
 describe("asks", () => {
@@ -50,9 +49,73 @@ describe("asks", () => {
     await user.click(within(p).getByRole("button", { name: "Approve" }));
     // Well before the next poll (5 s); said in the panel, calmly, not as a failure.
     await waitFor(() => expect(p.querySelector("[data-ask]")).toBeNull(), { timeout: 1_500 });
-    expect(within(p).getByRole("status")).toHaveTextContent("Already answered: it was answered elsewhere, or its agent ended.");
+    expect(p.querySelector("[data-note]")).toHaveTextContent("Already answered: the call to WebFetch was answered elsewhere, or its agent ended.");
     expect(screen.queryByText("The answer wasn't sent")).toBeNull();
     expect(within(p).getByRole("heading", { name: "Needs you" })).toHaveFocus();
+    // Nothing waits now: no warning, no count, only the note; at the next poll the panel goes, focus to the board.
+    expect(p.getAttribute("data-tone")).toBe("default");
+    expect(p.querySelector("[data-slot=count]")).toBeNull();
+  });
+
+  it("the note goes when focus moves on from where the answer left it", async () => {
+    const api = new FakeApi();
+    const a = ask({ approval: { name: "brokered", tool: "WebFetch" }, at_ms: Date.now() - 2_000 });
+    const b = ask({ approval: { name: "brokered", tool: "WebSearch" }, at_ms: Date.now() - 1_000 });
+    api.asks = [a, b];
+    const { user } = renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    api.asks = [b];
+    api.fail(/\/answer$/, 409, "this ask isn't open any more");
+    await user.click(within(p.querySelector(`[data-ask="${a.ask}"]`) as HTMLElement).getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(p.querySelector("[data-note]")).not.toBeNull());
+    const next = within(p.querySelector(`[data-ask="${b.ask}"]`) as HTMLElement);
+    expect(next.getByRole("button", { name: "Approve" })).toHaveFocus();
+    // Still there while focus is where the answer left it (past the re-read).
+    await new Promise((r) => setTimeout(r, 300));
+    expect(p.querySelector("[data-note]")).not.toBeNull();
+    // On to the next control: the note has been read.
+    next.getByRole("button", { name: "Deny" }).focus();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(p.querySelector("[data-note]")).toBeNull();
+  });
+
+  it("the last item's note goes at the next poll, and focus goes on to the board's heading", async () => {
+    const api = new FakeApi();
+    const a = ask({ approval: { name: "brokered", tool: "WebFetch" } });
+    api.asks = [a];
+    const { user, queryClient } = renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    api.asks = [];
+    api.fail(/\/answer$/, 409, "this ask isn't open any more");
+    await user.click(within(p).getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(p.querySelector("[data-note]")).not.toBeNull());
+    await queryClient.refetchQueries({ queryKey: ["projects", "prj_one", "attention"], exact: true });
+    await waitFor(gone);
+    expect(screen.getByRole("heading", { name: "Tasks" })).toHaveFocus();
+  });
+
+  it("with none of the app's own items, a read that takes a moment shows the panel when more waits than that", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Later?" })];
+    let release!: () => void;
+    api.holds.push({ match: /^GET \/api\/projects\/prj_one\/attention$/, until: new Promise((r) => (release = () => r(undefined))) });
+    renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    expect(p).toHaveTextContent("Reading the agents' asks…");
+    expect(within(p).getByLabelText("An unknown number of items")).toHaveTextContent("?");
+    release();
+    await waitFor(() => expect(p).toHaveTextContent("Later?"));
+  });
+
+  it("with nothing waiting at all, nothing shows while the asks are read", async () => {
+    const api = new FakeApi();
+    let release!: () => void;
+    api.holds.push({ match: /^GET \/api\/projects\/prj_one\/attention$/, until: new Promise((r) => (release = () => r(undefined))) });
+    renderApp("/projects/prj_one/board", api);
+    await screen.findByRole("heading", { name: "Tasks" });
+    await new Promise((r) => setTimeout(r, 500));
+    gone();
+    release();
   });
 
   it("answering one moves focus to the next item, never to the page", async () => {
@@ -107,7 +170,7 @@ describe("asks", () => {
     expect(p).not.toHaveTextContent("Later?");
     // Said to be partial, and not counted as if it were all.
     expect(p).toHaveTextContent("Reading the agents' asks…");
-    expect(p.querySelector("[data-slot=count]")).toBeNull();
+    expect(within(p).getByLabelText("An unknown number of items")).toHaveTextContent("?");
     release();
     await waitFor(() => expect(p).toHaveTextContent("Later?"));
     expect(p).not.toHaveTextContent("Reading the agents' asks…");
@@ -124,7 +187,7 @@ describe("asks", () => {
     await waitFor(() => expect(p).toHaveTextContent("The agents' asks couldn't be read"));
     expect(p).toHaveTextContent("Pick a region");
     expect(p).not.toHaveTextContent("Reading the agents' asks…");
-    expect(p.querySelector("[data-slot=count]")).toBeNull();
+    expect(within(p).getByLabelText("An unknown number of items")).toHaveTextContent("?");
   });
 
   it("the 'Already answered' note goes once a read after the one that dropped the ask has come", async () => {
@@ -152,7 +215,7 @@ describe("asks", () => {
     expect(p).toHaveTextContent("Still here?");
     api.fail(/GET .*\/attention$/, 502, "the Worker is unavailable");
     await queryClient.refetchQueries({ queryKey: ["projects", "prj_one", "attention"], exact: true });
-    await waitFor(() => expect(p).toHaveTextContent(/Couldn't refresh; showing what was read/));
+    await waitFor(() => expect(p).toHaveTextContent(/Couldn't refresh; showing what was read at \d/));
     expect(p).toHaveTextContent("Still here?");
   });
 
@@ -167,7 +230,7 @@ describe("asks", () => {
     expect(p).toHaveTextContent("Pick a region");
     expect(p).not.toHaveTextContent("hidden?");
     // No count: the blocked task alone isn't all that waits.
-    expect(p.querySelector("[data-slot=count]")).toBeNull();
+    expect(within(p).getByLabelText("An unknown number of items")).toHaveTextContent("?");
   });
 
   it("nest unreadable and nothing else waiting: the panel still says so, never empty", async () => {

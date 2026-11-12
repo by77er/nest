@@ -94,7 +94,7 @@ function BoardGroup({ column, tasks, open, onToggle, projectId, repo, pendingAsk
   );
 }
 
-export function Board({ projectId, repo }: { projectId: string; repo: string }) {
+export function Board({ projectId, repo, headingRef }: { projectId: string; repo: string; headingRef?: React.Ref<HTMLHeadingElement> }) {
   const [dragging, setDragging] = useState(false);
   const [showCancelled, setShowCancelled] = useState(false);
   const [collapsed, setCollapsed] = useState(() => loadCollapsed(projectId));
@@ -122,6 +122,7 @@ export function Board({ projectId, repo }: { projectId: string; repo: string }) 
     <Section
       title="Tasks"
       count={tasks.data?.length}
+      headingRef={headingRef}
       actions={
         <Toolbar>
           <Switch label="Show cancelled" checked={showCancelled} onChange={(e) => setShowCancelled(e.currentTarget.checked)} />

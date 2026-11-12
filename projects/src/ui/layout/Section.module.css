@@ -1,0 +1,7 @@
+/* A heading focus is moved to from script (`tabIndex={-1}`: where focus goes when the thing it was on
+   leaves) gets the theme's ring, the same as every control's, never the browser's default outline. */
+.focusTarget:focus {
+  outline: 2px solid var(--mantine-primary-color-filled);
+  outline-offset: 2px;
+  border-radius: var(--mantine-radius-sm);
+}
