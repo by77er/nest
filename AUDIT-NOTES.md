@@ -41,6 +41,7 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Built: the review pipeline: no drift beyond the tombstone above (ROOM_TELL_AFTER_MS do/review.ts:44, room_waits :160,556, "Waiting for room…" :1053, external_id :863-865, review key :887, MAX_RETRIES :34, review_waiting_for_room do/project.ts:2389, OUTPUT_MAX/TITLE_MAX github.ts:470-472, app_id -1 github.ts:369-381, JOB_STATES review-job.ts:34, REVIEW_DEADLINE_MS :60, SEEN_KEEP_MS do/directory.ts:39).
 - Built: the core: one correction; client id nest.ts:97-102, keys do/project.ts:4075,4132 + nest.ts:162-165, backoff 5 s→5 min nest.ts:332, relayed brief do/project.ts:1680, call keys 24 h do/project.ts:320,3408, events 7 days do/directory.ts:39, no sessions mcp.ts:2, read_repos catalog.ts:123-137, deps test test/deps.test.ts:18 match.
 - The task machine: table and invariants match tasks.ts:4-143 and test/machine.test.ts:120-131 (only the B2/B3 wording changed); deleteTask do/project.ts:877-900.
 - Outboxes: table matches OUTBOX (outbox.ts:95-113), states/events outbox.ts:9-26, stopRefused nest.ts:350-356, routes api.ts:413-417, chat_request do/project.ts:510, SPINNER_AFTER_MS ui/features/chat/ChatView.tsx:210; two tombstones removed.
