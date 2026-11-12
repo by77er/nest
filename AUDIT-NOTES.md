@@ -40,6 +40,15 @@ Base: origin/main 6bbf64f.
 ## Confirmed (identity)
 - Proxy CA cert baked (images/guest/build.sh:87-91); guest re-checks epoch (crates/nest-guest/src/state.rs:85-126); NEST_AGENT_ID for attribution (crates/nest-cli/src/guest_cli.rs:1-3,18); agent epoch (control-plane/src/do/agent.ts:487-516); proxy substitutes only on binding hosts and TLS (crates/nest-proxy/src/inject.rs:50-70); jwks route auth none (index.ts:732); `nest token` absent from crates/nest-cli (deferred).
 
+- model-access L11: "enforced server-side since early 2026" has no source: the linked legal page says only "Anthropic reserves the right to take measures to enforce these restrictions and may do so without prior notice" -> marked unverified (AGENTS.md Docs rule).
+- model-access L18: the scheduler's concurrency cap is not built (docs/orchestration/scheduling/ L15); what exists is a per-brain-host cap, `max_brains_per_host`, enforced in FleetDO (control-plane/src/do/fleet.ts:1600-1606) -> "not built; today brain placement caps brains per brain host".
+
+## Confirmed (model-access)
+- Token only on brain hosts: FleetDO refuses agent_start to a non-brain host (fleet.ts:1596-1598); env only in Claude Code's (crates/nest-protocol/src/host.rs:1052).
+- Launch: `-p --input-format stream-json --output-format stream-json --verbose --restricted --tools <no Bash/Read/Write/Edit> --strict-mcp-config --mcp-config --permission-mode dontAsk --permission-prompts none --allowedTools --disable-slash-commands --append-system-prompt-file|--system-prompt-file [--model] [--effort] --session-id|--resume [--fork-session]` (host.rs:994-1028, 1350-1356); env cleared (nest-runner agent.rs:250); managed settings forceLoginMethod claudeai, allowedProviders [anthropic], allowManagedHooksOnly, disableBypassPermissionsMode (protocol/claude-code/managed-settings.json).
+- No nest-proxy on brain hosts (deploy/host/install.sh:110 "a brain host has none"); tls-interception fence.
+- External: legal-and-compliance supports Allowed/Not allowed; authentication page: setup-token is one year and "can only make model requests" (also confirms credentials L5); agent-sdk/overview says third-party products use API keys.
+
 ## Confirmed (security/README)
 - L11 brain: `--tools` lists no Bash/Read/Write/Edit (crates/nest-protocol/src/host.rs:1000,1351), `--restricted` (host.rs:999), env cleared (crates/nest-runner/src/agent.rs:250); host allowlist marked not built on main.
 - L13 gateway as nest-gw, empty CapabilityBoundingSet, IPAddressAllow=localhost (deploy/host/install.sh:59-72,136-178); cloudflared as nest-cf (install.sh:55-56).
@@ -60,8 +69,8 @@ Base: origin/main 6bbf64f.
 - L16 claims + 1h (sandbox.ts:1886-1888, protocol/gateway.ts:13), detach/epoch (nest-gateway verify.rs:115-124).
 
 ## Unconfirmed
+- model-access L15 "Only documented flags": the CLI reference page (https://code.claude.com/docs/en/cli-reference) was too large to read through the fetch tool and curl from the sandbox got 403; flags listed above not each checked against it. `--restricted` and `--permission-prompts` in particular.
 - credentials L29 "no R2 S3 credentials exist", hosts use Worker-signed URLs only: blob signing found (lib/tokens.ts:77); absence of R2 keys not provable from code.
-- L5 "1 year, model requests only": property of Anthropic's token; no code.
 - L11 "non-exportable", "CloudTrail logs each issuance": AWS properties.
 - L9 "Per host and grant": lookup is per binding and sandbox/workstream/global (broker.ts:289-303); no per-host keying found.
 
