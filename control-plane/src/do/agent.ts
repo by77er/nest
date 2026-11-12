@@ -3617,10 +3617,13 @@ export class AgentDO extends DurableObject<Env> {
     return ask;
   }
 
-  /** Questions waiting for the operator, oldest first (`GET /v1/agents/:agent/asks`). */
-  async openAsks(): Promise<OpenAsk[]> {
+  /**
+   * Questions waiting for the operator, oldest first (`GET /v1/agents/:agent/asks`): all of them, or the first
+   * `limit` (`GET /v1/asks` asks for one more than it shows, to know there are more).
+   */
+  async openAsks(limit?: number): Promise<OpenAsk[]> {
     this.load(); // an unknown agent is a 404
-    return this.calls.open();
+    return this.calls.open(limit);
   }
 
   /**

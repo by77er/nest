@@ -220,11 +220,12 @@ export class CallLedger {
     return this.applyAsk("answer", text, "ask = ?", ask) > 0;
   }
 
-  /** Asks not yet answered, oldest first, with the approval each one decides (if any). */
-  open(): OpenAsk[] {
+  /** Asks not yet answered, oldest first, with the approval each one decides (if any); the first `limit` when given. */
+  open(limit?: number): OpenAsk[] {
+    const cap = limit !== undefined && Number.isSafeInteger(limit) && limit >= 0 ? limit : -1; // SQLite: LIMIT -1 is none
     return this.sql.exec<{ ask: string; question: string; created_ms: number; name: string | null; tool: string | null }>(
       `SELECT a.ask, a.question, a.created_ms, p.name, p.tool FROM asks a LEFT JOIN approvals p ON p.ask = a.ask
-        WHERE a.status != '${ASK.answered}' ORDER BY a.created_ms, a.ask`).toArray()
+        WHERE a.status != '${ASK.answered}' ORDER BY a.created_ms, a.ask LIMIT ?`, cap).toArray()
       .map((r) => ({ ask: r.ask, question: r.question, created_ms: r.created_ms, ...(r.name !== null ? { approval: { name: r.name, tool: r.tool } } : {}) }));
   }
 
