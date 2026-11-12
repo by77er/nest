@@ -58,7 +58,7 @@ It applies to every upstream connect (inspect, passthrough, TCP exceptions; `is_
   - TCP exceptions whose rule is gone
 - **The DNS record is pruned** to names the new policy still allows ([dns](../dns/)). Designed, not built.
 - **A final check runs just before request headers go upstream** ([inspection](../inspection/)). Designed, not built.
-- **While a policy loads** (listeners installed, no acknowledged policy), new connections are held for up to 30 s, then denied with `policy_pending`. Designed, not built: a sandbox without a policy has a connection limit of 0, so its connections are refused at once (`connection_limit`) and its DNS queries get REFUSED. SPACE holds them for 31 s, its 30 s policy-load deadline plus 1 s ([state.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/state.rs)).
+- **While a policy loads** (listeners installed, no acknowledged policy), new connections are held for up to 30 s, then denied with `policy_pending`. Designed, not built. Today a sandbox without a policy has a connection limit of 0, so its connections are refused at once (`connection_limit`) and its DNS queries get REFUSED. SPACE holds them for 31 s, its 30 s policy-load deadline plus 1 s ([state.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/state.rs)).
 
 Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/state/egress.rs) (`reconcile_policy`) and [egress/tcp.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/egress/tcp.rs) (`revalidate_tcp`).
 
