@@ -446,7 +446,7 @@ export class CatalogDO extends DurableObject<Env> {
   private async namespaceClients(cat: Catalog, name: string, scope?: ClientScope): Promise<Record<string, string>> {
     const tpl = Object.hasOwn(cat.templates, name) ? cat.templates[name] : undefined;
     const out: Record<string, string> = scope ? { [scope.name]: scope.client } : {};
-    const wanted = new Set([...(tpl?.capabilities ?? []).filter((c) => cat.capabilities[c]?.mcp), ...(tpl?.inject?.length ? [name] : [])]
+    const wanted = new Set([...(tpl?.capabilities ?? []).filter((c) => cat.capabilities[c]?.mcp), ...(tpl?.inject?.length || tpl?.guards?.length ? [name] : [])]
       .map(namespaceOf).filter((ns): ns is string => ns !== null));
     for (const ns of wanted) {
       if (Object.hasOwn(out, ns)) continue;

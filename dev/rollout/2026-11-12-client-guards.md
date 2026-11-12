@@ -1,0 +1,7 @@
+# API clients' request guards (2026-11-12)
+
+A release's rollout rule ([Rollout rules](../deploy.md#rollout-rules)), for [request guards](../../docs/control-plane/api/clients/#request-guards).
+
+**Not a one-way deploy, and no ordering constraint.** Control plane only: new optional fields (`guards` in the client layer, sandbox specs, templates, spawn overrides and stored agent specs) and two SandboxDO kv keys (`client_guards`, `agent_guards`). No host change: client guards reach nest-proxy as ordinary `RequestGuard`s in `EgressPolicy.guards`, which every running proxy already evaluates.
+- **Apps:** send `guards` only to a control plane whose `GET …/client-policy` answers them; the previous release refuses the key (400).
+- **What a rollback does:** the previous release ignores the new keys and fields, so its next policy push for a sandbox leaves the client guards out: an app's refusals stop applying until this release is back (the operator's guards and the GitHub rules are unaffected). It strips `guards` from a template when it reads it, and an agent detached under it leaves its `agent_guards` entry behind, which this release ignores (only attached agents' keys count). Redeploying this release applies the stored guards again at each sandbox's next policy push, which nothing forces: an app rewrites its client layers (`PUT …/client-policy`) to get them back at once. So an app must not rely on client guards for a refusal it can't lose until this release is settled.
