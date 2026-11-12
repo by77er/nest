@@ -3,6 +3,7 @@
 ## Corrections
 | doc | said | code says | evidence |
 |---|---|---|---|
+| sandbox/README.md | after a fork the guest reseeds via VMGenID and resyncs via VMClock | nestd's `resume` on a fork's first boot: clock step to host wall clock, 64 B host entropy (RNDADDENTROPY), new machine-id and hostname; no VMGenID/VMClock code | crates/nestd/src/host.rs:1778-1780, guest.rs:297-302, crates/nest-guest/src/sys.rs:43-88 |
 | sandbox/drivers/README.md | nestd refuses "either driver" unless `unconfined_driver`; listed snapshot/restore/fork as the driver interface without status | refuses the process driver and Firecracker without `jailer_bin`/`jailer`; trait has create/start/pause/resume/stop/snapshot_memory; no memory restore | crates/nestd/src/config.rs:332-343, crates/nestd/src/driver/mod.rs:37-87, driver/firecracker.rs:332-336 |
 | sandbox/drivers/README.md | gVisor row without status | no gVisor driver | crates/nestd/src/driver/ (firecracker.rs, process.rs only) |
 | sandbox/drivers/gvisor, lambda-microvm | no status | not built | crates/nestd/src/driver/ |
