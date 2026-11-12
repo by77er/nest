@@ -11,7 +11,7 @@ import { canonicalSpki, certificateSpki, createRootCertificate, generateDevRoot,
 import { AwsKms, type Kms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, QuotaError, type Ec2 } from "../lib/ec2";
 import { AwsSsm, type Ssm } from "../lib/ssm";
-import { DEFAULT_IMAGE } from "./sandbox";
+import { DEFAULT_IMAGE, type EgressBase, EgressBaseInput, SEED_EGRESS_BASE } from "./sandbox";
 import {
   CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
   tunnelPrefix, type CloudflareApi,
@@ -20,7 +20,7 @@ import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type
 import { brainHostNeeded, idleStep, maxBrains, NO_ROOM_BACKOFF_BRAIN_MAX_MS, NO_ROOM_BACKOFF_MAX_MS, noRoomBackoffMs, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
 import { deathPlan, expiryVerdict, hostStep, type DeathCause, type HostTransition } from "../lib/host-lifecycle";
 import type { InstanceIdentity } from "../lib/aws-identity";
-import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
+import { Deadlines, ReliableChannels, SerialQueue, withTimeout } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
 import { reassignRetry } from "../lib/retry";
@@ -281,6 +281,15 @@ const ALARM_FOLLOWUPS = "followups";
 /** The daily pass that deletes tunnels and records whose host is gone (docs/sandbox/gateway/). */
 const ALARM_TUNNEL_SWEEP = "tunnel_sweep";
 const TUNNEL_SWEEP_INTERVAL_MS = 24 * 3_600_000;
+/** The cell's base egress layer (`PUT /v1/admin/egress/base`), in `kv`; absent: the seed. */
+const EGRESS_BASE_KEY = "egress_base";
+/** Telling live sandboxes their base layer changed (`egress_base_notices`): its own deadline. */
+const ALARM_EGRESS_BASE = "egress_base";
+/** Sandboxes told per alarm run, each call bounded; the next run follows at once while more are due. */
+const EGRESS_BASE_BATCH = 50;
+const EGRESS_BASE_CALL_MS = 10_000;
+/** A sandbox that didn't answer is told again after 2 s, doubling, at most every 10 minutes, until it answers. */
+const egressBaseBackoff = (attempts: number) => Math.min(2_000 * 2 ** (attempts - 1), 10 * 60_000);
 /** How long a tunnel this cell created may go without a hosts row (an enrollment still in flight). */
 const TUNNEL_INTENT_GRACE_MS = 3_600_000;
 /** GC: one run a day; a pass deletes only within 12 h of its mark; unmarked objects go after 24 h. */
@@ -454,11 +463,17 @@ export class FleetDO extends DurableObject<Env> {
     // Suspended sandboxes leaving a host that is going away; SandboxDO is told, with retries.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS evictions (sandbox TEXT NOT NULL, host TEXT NOT NULL, epoch INTEGER NOT NULL,
       PRIMARY KEY (sandbox, host, epoch))`);
+    // Live sandboxes not yet told the base layer's latest version (`egressBaseChanged`): a row goes on
+    // that version's answer, so a newer write's row stays.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS egress_base_notices (sandbox TEXT PRIMARY KEY, version INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, due_ms INTEGER NOT NULL)`);
     this.rel = new ReliableChannels(this.sql);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
     // Retention runs at least daily, whether or not the cell is busy or has tunnels.
     ctx.blockConcurrencyWhile(async () => {
       if (!this.deadlines.has(ALARM_PRUNE)) await this.deadlines.set(ALARM_PRUNE, Date.now() + PRUNE_DAILY_MS);
+      // Notices a previous release's alarm dropped (it has no `egress_base` handler) are picked up again.
+      if (!this.deadlines.has(ALARM_EGRESS_BASE)) await this.armEgressBase();
     });
   }
 
@@ -1914,6 +1929,7 @@ export class FleetDO extends DurableObject<Env> {
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key === ALARM_TICK) await this.tick();
       if (key === ALARM_FOLLOWUPS) await this.followupsDue();
+      if (key === ALARM_EGRESS_BASE) await this.tellEgressBase();
       if (key === ALARM_PRUNE) {
         await this.deadlines.set(ALARM_PRUNE, Date.now() + PRUNE_DAILY_MS);
         await this.armLifetimes();
@@ -2524,10 +2540,74 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM reassignments WHERE sandbox = ?", sandbox);
   }
 
-  /** SandboxDO's `create`, before anything is written for the sandbox. A destroyed one stays destroyed. */
-  async registerSandbox(sandbox: string, meta?: RegistryMeta): Promise<void> {
+  /**
+   * SandboxDO's `create`, before anything is written for the sandbox. A destroyed one stays destroyed.
+   * Answers the cell's base egress layer, read in the step that registers it: a later write finds it
+   * registered and tells it.
+   */
+  async registerSandbox(sandbox: string, meta?: RegistryMeta): Promise<EgressBase> {
     this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", sandbox, Date.now());
     if (meta) this.sql.exec("UPDATE sandboxes SET client = ?, labels = ? WHERE sandbox = ?", meta.client, meta.labels ? JSON.stringify(meta.labels) : null, sandbox);
+    return this.storedEgressBase();
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // The base egress layer (docs/sandbox/networking/egress/policy/#base-layer): operator data, one per
+  // cell, seeded with the hosts nest had built in. A write reaches every live sandbox of the cell.
+  // -------------------------------------------------------------------------------------------
+
+  private storedEgressBase(): EgressBase {
+    return this.kvValue<EgressBase>(EGRESS_BASE_KEY) ?? SEED_EGRESS_BASE;
+  }
+
+  /** `GET /v1/admin/egress/base`: the layer, its version (0: the seed) and how many live sandboxes haven't taken it yet. */
+  async egressBase(): Promise<EgressBase & { pending: number }> {
+    const pending = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM egress_base_notices").one().n;
+    return { ...this.storedEgressBase(), pending };
+  }
+
+  /**
+   * `PUT /v1/admin/egress/base`: replace the layer (checked again here with the operator layer's schemas)
+   * as the next version, and queue a notice for every live sandbox in the registry, in the same step; the
+   * alarm tells them (`tellEgressBase`).
+   */
+  async setEgressBase(input: unknown): Promise<EgressBase & { pending: number }> {
+    const parsed = EgressBaseInput.safeParse(input);
+    if (!parsed.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `egress base: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
+    const base: EgressBase = { version: this.storedEgressBase().version + 1, allow: parsed.data.allow, guards: parsed.data.guards };
+    this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", EGRESS_BASE_KEY, JSON.stringify(base));
+    this.sql.exec(`INSERT INTO egress_base_notices (sandbox, version, attempts, due_ms)
+      SELECT sandbox, ?, 0, ? FROM sandboxes WHERE destroyed_ms IS NULL
+      ON CONFLICT(sandbox) DO UPDATE SET version = excluded.version, attempts = 0, due_ms = excluded.due_ms`, base.version, Date.now());
+    await this.armEgressBase();
+    return this.egressBase();
+  }
+
+  /** Arm the notices' deadline for the earliest one due; none: nothing to arm. */
+  private async armEgressBase(): Promise<void> {
+    const next = this.sql.exec<{ at: number | null }>("SELECT MIN(due_ms) AS at FROM egress_base_notices").one().at;
+    if (next !== null) await this.deadlines.set(ALARM_EGRESS_BASE, next);
+  }
+
+  /**
+   * Tell up to `EGRESS_BASE_BATCH` due sandboxes the current layer, each call bounded. A row goes on its
+   * own version's answer; a failure backs off. A sandbox destroyed meanwhile answers too (it ignores it).
+   */
+  private async tellEgressBase(): Promise<void> {
+    const due = this.sql.exec<{ sandbox: string; version: number; attempts: number }>(
+      "SELECT sandbox, version, attempts FROM egress_base_notices WHERE due_ms <= ? ORDER BY due_ms LIMIT ?", Date.now(), EGRESS_BASE_BATCH).toArray();
+    const base = this.storedEgressBase();
+    await mapBounded(due, EGRESS_BASE_BATCH, async (n) => {
+      try {
+        await withTimeout(this.sandbox(n.sandbox).egressBaseChanged(base), EGRESS_BASE_CALL_MS, `sandbox ${n.sandbox}'s egress base`);
+        this.sql.exec("DELETE FROM egress_base_notices WHERE sandbox = ? AND version <= ?", n.sandbox, base.version);
+      } catch (e) {
+        console.warn(`FleetDO: telling ${n.sandbox} its egress base failed; retrying`, e);
+        this.sql.exec("UPDATE egress_base_notices SET attempts = attempts + 1, due_ms = ? WHERE sandbox = ? AND version = ?",
+          Date.now() + egressBaseBackoff(n.attempts + 1), n.sandbox, n.version);
+      }
+    });
+    await this.armEgressBase();
   }
 
   /** Operator: register sandboxes created before the registry existed, so GC keeps their data. */

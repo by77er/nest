@@ -29,7 +29,7 @@ import { SandboxEnv, unboundPlaceholders } from "./lib/sandbox-env";
 import { TimerName } from "./lib/timers";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { JWKS_MAX_AGE_S } from "./lib/identity";
-import { Port, SandboxPolicyLayer } from "./do/sandbox";
+import { EgressBaseInput, Port, SandboxPolicyLayer } from "./do/sandbox";
 import { type AgentDO, type CreateAgent, type RestartResult, TRACE_HEADER } from "./do/agent";
 import { withTimeout } from "./lib/reliable";
 import { INPUT_KEPT_BYTES } from "./lib/sinks";
@@ -723,6 +723,12 @@ export const ROUTES: Route[] = [
   } }),
   // The daily tunnel sweep, now (after a Cloudflare outage, or to see what the account holds).
   route({ method: "POST", path: "/v1/admin/tunnels/sweep", auth: "admin", run: ({ env, cell }) => fleet(env, cell).tunnelSweep() }),
+  // The cell's base egress layer (docs/sandbox/networking/egress/policy/#base-layer): the operator's, under
+  // the operator layer's allow and guard schemas; a write reaches every live sandbox of the cell.
+  route({ method: "GET", path: "/v1/admin/egress/base", auth: "admin", run: ({ env, cell }) =>
+    newMethod("FleetDO.egressBase", () => fleet(env, cell).egressBase()) }),
+  route({ method: "PUT", path: "/v1/admin/egress/base", auth: "admin", body: EgressBaseInput, run: ({ env, cell, body }) =>
+    newMethod("FleetDO.setEgressBase", () => fleet(env, cell).setEgressBase(body)) }),
   route({ method: "GET", path: "/v1/admin/gc", auth: "admin", run: ({ env, cell }) => fleet(env, cell).gcStatus() }),
   route({ method: "POST", path: "/v1/admin/gc/run", auth: "admin", run: async ({ env, cell }) => {
     await fleet(env, cell).gcRequest();

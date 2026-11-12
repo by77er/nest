@@ -92,7 +92,7 @@
 ## Which routes take a cell
 
 **Decided (2026-11-02):** only a route about one cell's FleetDO reads `?cell=`. It is checked when that route reads it (default `local`), never by the router for every route (`Ctx.cell` in `control-plane/src/index.ts`), so in a deployment whose `CELLS` doesn't name `local` an external app needs no cell on the others.
-- **About a cell** (`?cell=`): the fleet, hosts, images, lifetimes, tunnels, GC and the root certificate (`/v1/admin/…`), and the operator's `GET /v1/agents`, `GET /v1/sandboxes` and `GET /v1/asks` without `?client=` (FleetDO's registry). A client's listing, and the operator's with `?client=`, take `?cell=` only as a filter.
+- **About a cell** (`?cell=`): the fleet, hosts, images, lifetimes, tunnels, GC, the root certificate and the [base egress layer](../../sandbox/networking/egress/policy/#base-layer) (`/v1/admin/…`), and the operator's `GET /v1/agents`, `GET /v1/sandboxes` and `GET /v1/asks` without `?client=` (FleetDO's registry). A client's listing, and the operator's with `?client=`, take `?cell=` only as a filter.
 - **In the body:** `POST /v1/agents` and `POST /v1/sandboxes` take `cell` (an agent with a sandbox takes the sandbox's), and so do `POST /v1/admin/enrollment-tokens` and `POST /v1/admin/launched` (default `local`).
 - **No cell:** everything reached by an agent's or sandbox's id (its DO's record knows its cell), the catalog (one CatalogDO for every cell), clients and `/v1/clients/self/…`, and secrets (one BrokerDO). These accept a `?cell=` and ignore it, so callers that send one keep working.
 
