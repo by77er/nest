@@ -34,9 +34,9 @@ After a fork, nestd's `resume` has the guest agent step its clock to the host's,
 
 ## Components
 
-- [drivers/](drivers/): Firecracker (primary), gVisor, Lambda MicroVM
+- [drivers/](drivers/): Firecracker (primary), gVisor (not built), Lambda MicroVM (rejected)
 - [state/](state/): generations, restore sources, retention, memory (restore ABI, base generations), disk, object store and GC
-- [fencing/](fencing/): leases, epochs, STONITH, loss records, salvage
+- [fencing/](fencing/): leases, epochs, STONITH, loss records (not built), salvage
 - [networking/](networking/): identical internal network identity, egress, ingress
 - [gateway/](gateway/): the only network door into a sandbox: hands, terminals and previews behind the host's tunnel
 - [guest-agent/](guest-agent/): the daemon inside each VM

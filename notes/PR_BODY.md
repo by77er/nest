@@ -38,7 +38,9 @@ They are now marked designed, not built. `docs/security/` likely repeats some of
 | state/object-store | M2 "built, not deployed"; "no longer go into the local cache" | M2 built (the disk doc: "deploys on merge"); committed chunks skip the cache | crates/nestd/src/s3.rs:469-482 |
 | compute/nestd | refusal exemptions; nestd installs the kernel backstop; M2 "built, not deployed" | static enrollment exempt; backstop not built; M2 built | crates/nestd/src/config.rs:332-335; net.rs:204-245 |
 | compute/autoscaling | "This changed on 2026-11-04: before, …" (tombstone); idle = "no lease and no agent" | dropped; busy = any unsuspended lease, a brain, or an incarnation awaiting salvage | control-plane/src/do/fleet.ts:2356-2362 |
-| compute/provisioning | the host image has gVisor (`runsc`) | not installed | deploy/host/install.sh:18,35-47 |
+| compute/provisioning | the host image has gVisor (`runsc`); a sandbox host "still installs" the runner and "no rollback reaches" a brain-starting Worker | not installed; bootstrap enables `nest-runner` on sandbox hosts for a rolled-back Worker that starts brains there | deploy/host/install.sh:18,35-47; bootstrap.sh:163-166 |
+| compute/nestd | "nothing blocks any more" (tombstone); checkpoint pause only a `FICLONE` | dropped; `disk_cut: auto` prefers the M3′ shadow cut | crates/nestd/src/config.rs:117-120, host.rs:2929-2938 |
+| sandbox/README, guest-agent, object-store | components list without gVisor/Lambda/loss-record status; "a failure fails the resume"; "write-through cache" | gVisor not built, Lambda rejected, loss records not built; RNDADDENTROPY falls back to `/dev/urandom`; only manifests are written through | crates/nest-guest/src/sys.rs:90-102; crates/nestd/src/s3.rs:469-504 |
 | docs/README.md | TLS: fixed-shape CSRs (no status); injection: opt-in wildcards for every binding; hard deny "ahead of any policy" | shape check designed; wildcards opt-in for API clients' bindings; checked at every dial whatever the policy allows | control-plane/src/lib/ca.ts:85-92; lib/client-secrets.ts:90-93; crates/nest-proxy/src/http.rs:840-846 |
 | architecture/README.md | self-fence "pauses VMs" | freezes then stops VMs, disks kept for salvage | crates/nestd/src/host.rs:1288-1445 |
 
@@ -106,7 +108,11 @@ They are now marked designed, not built. `docs/security/` likely repeats some of
 
 - `python3 -I scripts/check-doc-links.py`: 0
 - `python3 -I scripts/check-fences.py`: 0
-- `python3 -m unittest discover -s scripts/tests`: see below
 - `git diff --name-only origin/main...HEAD`: only Markdown under docs/sandbox/ and docs/compute/, plus docs/README.md and docs/architecture/README.md
 - Tombstone grep: no hits
-- Independent review: see below
+- Independent review (nest-review), three fresh reviewers over the diff (one cut off by a sandbox move, then networking and the rest): 4 high, 7 medium and ~12 low findings, all fixed except two optional lows:
+  - The `disk/README.md` M3′ heading still says "not deployed". The heading is an anchor that docs/README.md and nestd link to, and the deploy state can't be checked here.
+  - architecture/README.md:87 says "next tool result", which is main's wording; the move notice is a system note or turn-input prefix.
+
+  All changed statuses, names, defaults, limits, timeouts and measured numbers were re-checked against file:line, and about 35 unchanged claims were sampled.
+- `python3 -m unittest discover -s scripts/tests`: 0 (6 skipped: PyYAML not installed)
