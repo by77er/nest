@@ -103,6 +103,8 @@ const PRUNE_EVERY_MS = 3_600_000;
 const TRANSCRIPT_DEFAULT_LIMIT = 200;
 const TRANSCRIPT_MAX_LIMIT = 500;
 const TRANSCRIPT_MAX_BYTES = 256 * 1024;
+/** Asks one `askInputs` call reads at most: 32 inputs of at most 32 KiB, a page's whole input budget (`GET /v1/asks`). */
+const ASK_INPUTS_MAX = 32;
 /** `list`: rows per page by default / at most. */
 const LIST_DEFAULT_LIMIT = 100;
 const LIST_MAX_LIMIT = 200;
@@ -3795,11 +3797,17 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * Questions waiting for the operator, oldest first (`GET /v1/agents/:agent/asks`): all of them, or the first
-   * `limit` (`GET /v1/asks` asks for one more than it shows, to know there are more).
+   * `limit` (`GET /v1/asks` asks for one more than it shows, to know there are more, and for no `input`).
    */
-  async openAsks(limit?: number): Promise<OpenAsk[]> {
+  async openAsks(limit?: number, o?: { input?: boolean }): Promise<OpenAsk[]> {
     this.load(); // an unknown agent is a 404
-    return this.calls.open(limit);
+    return this.calls.open(limit, o);
+  }
+
+  /** The kept inputs of those of `asks` still open, by ask (`GET /v1/asks?include=input`, within its page's budget). */
+  async askInputs(asks: string[]): Promise<Record<string, unknown>> {
+    this.load();
+    return Object.fromEntries(this.calls.inputs(asks.slice(0, ASK_INPUTS_MAX)));
   }
 
   /**
