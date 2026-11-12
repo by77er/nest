@@ -8,7 +8,7 @@ A `verification` job in `ci.yml`, added to `ci-ok`'s `needs`:
 
 | Step | Runs | Needs | Time (estimate) |
 |---|---|---|---|
-| TLC | `verification/run.sh --only tla`: every config marked `ci` in `verification/tla/*/expect.tsv`, each asserting its expected outcome (`holds`, or a violation of a named property) | Java 21 (`actions/setup-java`, pinned by commit). `run.sh` fetches the TLA+ tools v1.7.4 and checks their SHA-256 | Measured on 2026-10-26 with 6 workers on a shared 20-core machine: the sandbox-lease tier (13 configs) took 8 min and the agent-brain tier (20 configs) about 20 min. Each config finishes in under 3 min on 8 workers. On a standard runner, expect more than 30 min (estimate): see below |
+| TLC | `verification/run.sh --only tla`: every config marked `ci` in `verification/tla/*/expect.tsv`, each asserting its expected outcome (`holds`, or a violation of a named property) | Java 21 (`actions/setup-java`, pinned by commit). `run.sh` fetches the TLA+ tools v1.7.4 and checks their SHA-256 | Measured on 2026-10-26 with 6 workers on a shared 20-core machine: the sandbox-lease tier (13 configs) took 8 min and the agent-brain tier (20 configs) about 20 min. `sandbox-lease` now has 48 `ci` configs and `agent-brain` 28 (unmeasured). Each config finishes in under 3 min on 8 workers. On a standard runner, expect more than 30 min (estimate): see below |
 | Lean | `verification/run.sh --only lean`: `lake build` in `verification/lean`, refusing `sorry`, `admit` and `native_decide` | elan with the project's pinned `lean-toolchain` (v4.33.1, the same as `deploy/lean`), restored from the `infra` job's cache key | Seconds after the toolchain |
 | Stateright | `verification/run.sh --only stateright`: `cargo test --release --locked` in `verification/stateright` | The pinned Rust toolchain; its own `target/` cache keyed by `verification/stateright/Cargo.lock` | 30 s on an idle machine, 5 min on one shared with TLC runs, plus the build |
 
@@ -33,5 +33,5 @@ A `verification` job in `ci.yml`, added to `ci-ok`'s `needs`:
 
 ## Cost
 
-- One more job on PRs that touch modelled code, kept to about 10 minutes by the PR tier, within the private repo's included minutes (unverified for GitHub Pro, as in [ci.md](ci.md#cost)).
+- One more job on PRs that touch modelled code, kept to about 10 minutes by the PR tier ([cost](ci.md#cost)).
 - The nightly `full` tier would take about 1–2 h of runner time at current bounds (estimate). Run it weekly if minutes are short.
