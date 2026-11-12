@@ -1,5 +1,7 @@
 # gVisor driver
 
+**Not built:** nestd has no gVisor driver (`crates/nestd/src/driver/` holds Firecracker and the process driver only). The design:
+
 - Uses `runsc` on the **systrap** platform, so no KVM is needed. It works on any VPS.
 - A user-space kernel sits between the sandbox and the host.
 - `runsc checkpoint` / `runsc restore` provide suspend and resume with memory.

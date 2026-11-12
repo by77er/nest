@@ -1,6 +1,6 @@
 # Disk
 
-A sandbox's disk is a raw sparse file (`disk.img`, a copy of `nest-base` or a restored generation) attached to Firecracker as its root drive. A commit turns it into a manifest of 4 MB content-addressed chunks ([object store](../object-store/)).
+A sandbox's disk is a raw sparse file (`disk.img`, a copy of `nest-base` or a restored generation) attached to Firecracker as its root drive. A commit turns it into a manifest of 4 MiB content-addressed chunks (BLAKE3; all-zero chunks are `null` and never stored) ([object store](../object-store/)).
 
 **Decided (2026-11-02, revised 2026-11-03): a commit's cost follows what changed, not the disk's size, and the VM never waits for an upload or the control plane; it pauses only for a reflink clone (M2).** Reading a 32 GiB disk whole, allocated but unchanged data included, from the gp3 root volume at its 125 MiB/s baseline paused its VM for 33–39 s per turn-end checkpoint in production ([gp3](https://docs.aws.amazon.com/ebs/latest/userguide/general-purpose.html); the allocated size is inferred, not recorded). It ships in three milestones, each measured before the next.
 
@@ -9,7 +9,7 @@ A sandbox's disk is a raw sparse file (`disk.img`, a copy of `nest-base` or a re
 **Built** (`host.rs` `checkpoint`, `scan`, `publish_and_send`; `storage.rs` `scan_file`, `rescan_unchanged`, `publish`; `nestd_core::checkpoint`).
 
 - **Order:** a lost answer is asked about again, then the guest flushes, the VM pauses, the disk is read, and the VM resumes. Uploads held back during the read, the manifest's upload and the control plane's answer come after the resume. A checkpoint never marks the disk clean, so resuming before the answer changes nothing a restart reads. A commit rejected after the resume fences the VM through its pause handle, as any fence of a running VM does.
-- **Held back:** while the VM is paused, the read asks the store nothing. A non-zero chunk this process can't vouch for under the [12 h rule](../#generations) is kept in memory, up to 64 MiB, and uploaded after the resume. Past that budget it is uploaded at once, as before. A turn changes tens of MB, usually.
+- **Held back:** while the VM is paused, the read asks the store nothing. A non-zero chunk this process can't vouch for under the [12 h rule](../#generations) is kept in memory, up to 64 MiB, and uploaded after the resume. Past that budget it is uploaded at once, while the VM is paused. A turn changes tens of MB, usually.
 - **Unchanged disk:** a read made while nothing can write the disk (the VM paused or stopped) sets the file's modification time to a sentinel in 1970 and remembers its manifest. If the next commit, again with nothing writing, finds the file with the same identity, size and sentinel time, it reuses that manifest without reading. The 12 h rule still applies to every chunk the manifest names: one the store isn't known to hold is read back, checked against its entry and stored again.
   - **Why it holds:** every write sets the file's modification time to the current time, before its data lands, and only nestd sets the sentinel (assumed, from the kernel's write path; unverified on a host: [open questions](../../../README.md#open-questions-and-watch-items)). Firecracker's default `Sync` io_engine completes a write before the guest sees it complete, and a paused VM polls no device, so nothing lands between the read and the sentinel ([snapshot-support.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/snapshotting/snapshot-support.md)).
   - **Restarts:** the memo is per incarnation and in memory only, so a restarted nestd reads every disk it salvages. The process driver trusts it only without `mount_disk`, since host-kernel writeback can reach a loop-mounted image after the guest stops.
@@ -40,7 +40,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - **the command executor never waits on a fenced incarnation's lock** (review, 2026-11-03). Every command that takes the lock refuses a stale or fenced epoch before the wait and again after it. A retire releases the lock across its backoff, so a command that began waiting before the fence gets it after one salvage attempt at most, finds the fence and returns. Test: `a_checkpoint_of_a_fenced_incarnation_fails_at_once_while_its_salvage_holds_the_commit_lock`; a salvage's `commit_request` goes out only after the commit in flight is answered (`a_salvage_waits_for_the_checkpoints_answer`). A lock is forgotten at the incarnation's destroy, archive, failed create or retire.
 - **The guard against an unbounded pause:** a guest can fragment its own disk. Before a cut, while the VM runs and off the async runtime, nestd counts the disk's extent records. On XFS it reads the inode's own count (`FS_IOC_FSGETXATTR`'s `fsx_nextents`), which is O(1) and takes no lock a writer waits on. Elsewhere it uses FIEMAP, which walks them. The cut's log line carries the count. Where the clone would take longer than reading the disk's allocated bytes, that cut reads the disk in the pause instead, as M1 does, and says so in the log. The prices are `cut_clone_ns_per_extent` (15,000) and `cut_read_bytes_per_s` (180 MB/s), from the measurement. At those prices a disk must average under about 2.7 KB a record before reading wins, which 4 KiB blocks can't do, so on a `c8id` the guard is for a slower clone, not a bound. The bound is M3′'s. Test: `a_cut_whose_clone_would_outlast_a_read_reads_the_disk_instead`.
 - **`cut_ms`:** the commit request carries the cut's instant, and the generation records it (`GenerationRecord.cut_ms`, additive).
-- **Clean only if no VM ran since the read:** a commit answered after a fence stopped a VM that had resumed past its read (a cut's, or since M1 a read checkpoint's) used to mark the disk clean, and the retire then skipped the salvage of what the VM wrote. Fixed with this milestone (`Sbx::runs`); test `a_commit_answered_after_a_fence_leaves_the_written_disk_to_salvage`.
+- **Clean only if no VM ran since the read:** a commit answered after a fence stopped a VM that had resumed past its read (a cut's, or a read checkpoint's) leaves the disk dirty, so the retire salvages what the VM wrote (`Sbx::runs`); test `a_commit_answered_after_a_fence_leaves_the_written_disk_to_salvage`.
 - **The memo hands out passes:** a cut is recorded after newer cuts may have begun, and the sentinel reads the same for every cut, so only the newest pass begun may record (`nestd_core::checkpoint`).
 - **Storage: sandbox state on instance-store NVMe** where the instance type has one (`c8id.large` and the other 8id types). At first boot the host bootstrap formats it XFS with `reflink=1` and mounts it at `/srv/nest`, and nestd's state, the kernel, the base images and the jailer's chroots go there. They must share one filesystem, because the jailer hard-links the kernel and the disk. Instance store dies with a spot host, as the root volume's sandbox state does today.
   - **Any step failing** (no `mkfs.xfs`, a format or a mount failing, no reflink) leaves the state on the root volume: the host still comes up.
@@ -51,8 +51,8 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - **nestd, nest-proxy and the gateway require the mount** (`RequiresMountsFor=/srv/nest` drop-ins). After a reboot none starts before it, so nothing is written into the bare directory the mount would hide.
   - **After a stop and start,** the store comes back blank and user data doesn't run again. The mount fails (`nofail`, with a 10 s device timeout), so those units don't start and the host never enrolls. nestd also refuses to start without its guest kernel and images directory (`Config::check_paths`). The host fails loudly rather than enrolling broken. Nest never stops a host (it terminates them), so this is an operator's or AWS's doing.
 - **Fallback:** nestd probes `FICLONE` on its sandboxes' filesystem at start. Without it (an EBS-only type, an AMI with `reflink=0`), it logs a warning and checkpoints pause the VM while they read the disk (M1).
-- **Local cache:** committed chunks no longer go into the store's local write-through cache. A same-host fork's pass keeps every chunk it reads there for the child's restore (`ObjectStore::keep_local`); restores still cache what they fetch.
-- **Host kernel:** ≥ 6.7, so reads proceed during a clone ([xfs 14a53798](https://github.com/torvalds/linux/commit/14a537983b228cb050ceca3a5b743d01315dc4aa); AL2023's 6.12 kernel), with the RefluXFS fix ([CVE-2026-64600](https://seclists.org/oss-sec/2026/q3/214)).
+- **Local cache:** committed chunks don't go into the store's local cache. A same-host fork's pass keeps every chunk it reads there for the child's restore (`ObjectStore::keep_local`); restores cache what they fetch.
+- **Host kernel:** ≥ 6.7, so reads proceed during a clone ([xfs 14a53798](https://github.com/torvalds/linux/commit/14a537983b228cb050ceca3a5b743d01315dc4aa); the host AMI is AL2023's kernel-6.18 image, `deploy/lean/Cell/Stack.lean`), with the RefluXFS fix ([CVE-2026-64600](https://seclists.org/oss-sec/2026/q3/214)).
 - **Gate before it ships:** `dev/measure-cut/run.sh` launches one disposable `c8id.large` and measures:
   - the clone's pause against the disk's extent records (fresh, after 1 GiB of churn, after a simulated month of turn ends);
   - reading a cut cold;
@@ -69,7 +69,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
 
   - The clone costs about 10–15 µs per extent record. The records scattered writes add stay until the disk is rewritten, so on a disk in use a pause for a whole-file clone lasts seconds, not the milliseconds option 1 assumed.
   - Reading a cut cold: 6.69 GB of data extents in 37.0 s, about 181 MB/s.
-  - Guest write stalls weren't measured: the test VM wasn't running when the pauses began. Twelve pause-clone-resume cycles on the month-aged disk took 5.06–5.14 s each. The harness now records whether the VM is up, and its console.
+  - Guest write stalls weren't measured: the test VM wasn't running when the pauses began. Twelve pause-clone-resume cycles on the month-aged disk took 5.06–5.14 s each. The harness records whether the VM is up, and its console (`vm_running`, `vm_log`).
   - Results: `dev/measure-cut/results-i-08370229efb01aa08.json`.
 - **Checked:** `verification/nestd/check` `sentinel` drives reads and cuts together (a cut recorded behind a newer one included), and fails for a cut recorded under the newest pass instead of its own. Tests:
   - host tests use a test cut (`disk_cut: locked_copy`): a copy under an exclusive `flock`, since the test filesystems have no reflink;
@@ -77,7 +77,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
 
 ## M3′: the pause follows what a turn changed (option 1 built and measured, not deployed)
 
-**Built (2026-11-04, the owner's choice of option 1; draft, not merged):** `nestd_core::shadow` (the comparison and the shadows' slots), and `Inner::cut_checkpoint`, `pre_copy` and `cut_shadow` in `crates/nestd/src/host.rs`.
+**Built (2026-11-04, the owner's choice of option 1; merged in #159; `disk_cut: auto` picks it wherever `storage::shadow_cut_works`):** `nestd_core::shadow` (the comparison and the shadows' slots), and `Inner::cut_checkpoint`, `pre_copy` and `cut_shadow` in `crates/nestd/src/host.rs`.
 - **Two shadows per incarnation,** `shadow-a.img` and `shadow-b.img` beside `disk.img`. Cuts alternate between them (`Shadows::target`), and a commit reads its cut's shadow in place.
 - **A shadow is held from its cut's queueing to the end of its commit** (read, failed, fenced, or the queued cut dropped), and a cut never writes a held one. The commit re-asks an unanswered request and reads with the sandbox unlocked, so newer cuts run meanwhile (#159's review). When both are held (one cut taken by its commit, one queued), a newer cut drops the queued one first, as it would replace it anyway. A cut that fails after writing its shadow (a failed pause, a failed clone) therefore never tears a cut a commit will read.
 - **While the VM runs (the pre-copy):**
@@ -124,7 +124,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
    - `shadow-a.img` and `shadow-b.img` are reflink copies of the disk, made once when a fresh disk has few records. Cuts alternate between them, so the one a background commit reads is never written.
    - **While the VM runs,** nestd syncs the disk and FIEMAPs it and the shadow. Every range whose physical mapping differs is cloned into the shadow (`FICLONERANGE`, range by range). Two frozen files that map an offset to the same block hold the same bytes there, which is M3's rule.
    - **In the pause:** sync the residue, FIEMAP again, clone the ranges that changed since the pre-copy, resume. The shadow then equals the disk at the pause, and is the cut.
-   - **The commit** reads only the chunks the diff showed changed (M3's diff, done here), and takes every other entry from the previous manifest.
+   - **The commit** reads only the chunks the diff showed changed (M3's diff, done here), and takes every other entry from the previous manifest. Not built: the built commit reads its whole shadow (`commit_cut`).
    - **The pause scales with** one full FIEMAP walk (O(records), but reading the extent map writes no metadata, so its constant should be far below the clone's: unverified), plus the clones of what changed since the pre-copy. A turn's last seconds of writes are usually a few ranges.
    - **Cost:** the shadows hold at most the blocks of the last two cuts' changes. No new kernel feature, device or dependency.
    - **Risk:** if a FIEMAP walk at 819 k records is itself above the gate, this only lowers the constant.
@@ -171,12 +171,12 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - After 1 GiB of writes, the in-pause step took 2.2 s (820 ms walking in the kernel). The pre-copy took 15.7 s, 9.7 s of it the sync.
   - In Rust, the diff would cost little beside the walk (unverified). The pause would then be about the kernel's walk, roughly 0.8 µs a record warm: about 0.7–0.9 s at a month's ~1 M records. That is about 10× better than M2's 8.1 s, but still about 4× the 200 ms gate. Fewer records shrink it in proportion.
 - **The diff must treat an unwritten extent as a hole.** A clone maps it as one, so the first version re-cloned 8,978 ranges (421 MB, about 10 ms) at every pre-copy. Fixed in `m3.py`.
-- **Option 3's extent size hint doesn't help:** after 1 GiB of churn the records were 179 k with no hint, 173 k at 1 MiB and 190 k at 4 MiB, and the clone took 2.2–2.7 s in each case. Dropped.
+- **Option 3's extent size hint doesn't help:** after 1 GiB of churn the records were 179 k with no hint, 173 k at 1 MiB and 190 k at 4 MiB, and the clone took 1.6–2.7 s in each case. Dropped.
 - **Exchange-range works:** `mkfs.xfs -i exchange=1` is accepted (xfsprogs 6.12.0), and `XFS_IOC_EXCHANGE_RANGE` swapped 16 MiB in 0.18 ms while a writer ran on the same file (verified by content). Background defragmentation is possible on the hosts' stack. Its throughput, and how far it brings records down, are unmeasured.
 - **Other numbers:**
   - Reading a cut cold: 7.33 GB in 37.6 s, about 195 MB/s.
   - M2's pause on the month-aged disk with no guest writing: 6.5–6.6 s.
-- **Guest write stalls are still unmeasured.** The scattered writes had wrecked the aged disk's ext4, so its guest kernel couldn't mount root and panicked. The harness now boots a fresh root and writes the aged disk raw, as `/dev/vdb`.
+- **Guest write stalls are still unmeasured.** The scattered writes had wrecked the aged disk's ext4, so its guest kernel couldn't mount root and panicked. The harness boots a fresh root and writes the aged disk raw, as `/dev/vdb`.
 - **Capacity:** `c8id.large` had none in us-east-1a, 1b or 1c for about 20 minutes (three attempts, 20:48–21:11 UTC). FleetDO falls back to the EBS-only types meanwhile ([M2](#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)).
 
 **Measured again (2026-11-04, one `m8id.large` in us-east-1c, `i-0fd14be72de7081ed`, the same 118 GB NVMe and kernel; `c8id.large` had no capacity; results in `dev/measure-cut/results-m3-i-0fd14be72de7081ed.json`), with a compiled diff (`fdiff.c`), defragmentation, and a VM writing:**
@@ -191,7 +191,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
 - **Option 1, compiled, is the walk and little else:**
   - On the month-aged disk the in-pause step took 686 ms after a turn: walk 674 ms, diff 4 ms, residue clone 1.2 ms (262 ranges), sync 7 ms. After 1 GiB it took 868 ms.
   - The shadow equalled the disk in every run.
-  - The diff is now about 0.005 µs a record; the walk is about 0.75–0.9 µs warm, about 2 µs cold.
+  - Compiled, the diff is about 0.005 µs a record; the walk is about 0.75–0.9 µs warm, about 2 µs cold.
 - **Guest write stalls, with a VM writing 4 KiB `O_DSYNC` records to the aged disk:**
   - The guest's worst write in a second is the pause: 6.6–6.7 s under M2 (pauses 6,586–6,744 ms), and 0.88–0.90 s under option 1 (pauses 872–904 ms).
   - Between pauses its worst write in a second was 17 ms (median).
@@ -228,20 +228,20 @@ Option 2 gets its own run only if option 1's FIEMAP walk misses the gate: dm-era
 
 ## Later
 
-- **ublk** (designed, not next): lazy reads for restore and fork on another host, fetching 4 MB chunks into a local NVMe cache and prefetching the working set recorded during the previous run. It is not the cut mechanism.
-- **`nest diff <a> <b> [path]`:** mounts both generations read-only on the host and diffs the files.
+- **ublk** (designed, not next): lazy reads for restore and fork on another host, fetching 4 MiB chunks into a local NVMe cache and prefetching the working set recorded during the previous run. It is not the cut mechanism.
+- **`nest diff <a> <b> [path]`** (designed, not built): mounts both generations read-only on the host and diffs the files.
 - **Rejected:** a Firecracker block dirty bitmap (dirty tracking is for memory only); vhost-user-blk (developer preview, no snapshots, no rate limiter: [block-vhost-user.md](https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/block-vhost-user.md)); qcow2 (Firecracker drives are raw); dm-era alone (no cut); NBD (ublk is the better userspace block device). dm-thin is the fallback if neither M2 nor M3′ meets the gate: a pool that fills fails every sandbox on its host.
 
 ## Flush before commit
 
-Writes still in the guest's page cache aren't in a cut, and writes the guest has flushed may not be either: Firecracker's default `Unsafe` cache mode doesn't offer the guest a flush, so a guest `syncfs` ends once the data reaches the host, without an `fsync` ([block caching](https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/block-caching.md)). So every commit, pause and suspend (**designed, not built**, guest protocol v2; today nestd asks the guest to `sync` through `prepare_snapshot`, ignores a failure, and reads the disk while the VM is paused, as in M1):
+Writes still in the guest's page cache aren't in a cut, and writes the guest has flushed may not be either: Firecracker's default `Unsafe` cache mode doesn't offer the guest a flush, so a guest `syncfs` ends once the data reaches the host, without an `fsync` ([block caching](https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/block-caching.md)). So every commit, pause and suspend (**designed, not built**, guest protocol v2; today nestd asks the guest to `sync` through `prepare_snapshot`, ignores a failure, and cuts the disk in the pause (M2, M3′) or reads it there (M1)):
 
 1. asks the guest agent to `syncfs` every filesystem (its `flush` request; [host-guest](../../../interfaces/host-guest/)), within a **30 s** budget (SPACE uses the same budget; [guest-io.md](https://github.com/perplexityai/space/blob/main/docs/space/design/guest-io.md));
 2. `fdatasync`s the disk file on the host, so the clone's own flush is short (M2);
 3. pauses the VM and cuts the disk with a reflink (M2), or, without one, reads it while paused (M1).
 
 - **No flush, no commit.** A failed or late flush fails the commit, pause or suspend; nothing is cut. A turn-end or periodic commit tries again at its next trigger; a failed pause or suspend backs off ([SandboxDO](../../../control-plane/durable-objects/sandbox/#activity-and-idle)).
-- **Two crash-consistent exceptions,** because neither can retry: a spot notice cuts every disk after a 5 s flush budget ([spot notice](../#spot-notice-2-minutes)), and salvage cuts a fenced VM it may not resume ([fencing](../../fencing/#5-salvage)). Their `reason` (`spot`, `salvage`) marks them.
+- **Two crash-consistent exceptions,** because neither can retry: a spot notice cuts every disk after a 5 s flush budget ([spot notice](../#spot-notice-2-minutes)), and salvage cuts a fenced VM it may not resume ([fencing](../../fencing/#5-salvage)). Their `reason` (`spot_notice`, `salvage`) marks them.
 - **A paused VM isn't flushed again:** it was flushed before it paused and hasn't run since.
 
 ## I/O limits

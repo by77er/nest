@@ -1116,21 +1116,22 @@ def pending_ask(text):
 
 
 def run_rule_approvals(ids):
-    """A built-in no tool rule allows (WebFetch: the worker's rules allow only `mcp__nest__*`) is held by the
+    """A built-in no tool rule allows (`Agent`: the seed worker's rules allow `mcp__nest__*` and the built-ins it
+    launches, and no `subagents` capability allows `Agent`) is held by the
     PreToolUse hook for the operator, through nest hook -> runner -> AgentDO (`approval_check`). Approved, that
     exact call runs once; the same call again is held again."""
     if REAL:
         skip("rule approvals", "fake mode only: the calls are scripted")
         return
     agid = ids["agent"]
-    fetch = {"url": "https://docs.rs/serde", "prompt": "what does flatten do?"}
-    reordered = {"prompt": "what does flatten do?", "url": "https://docs.rs/serde"}
+    fetch = {"description": "read the docs", "prompt": "what does serde's flatten do?"}
+    reordered = {"prompt": "what does serde's flatten do?", "description": "read the docs"}
 
     def rule_turn(name, steps):
         path = os.path.join(WORK, f"rule-{name}.json")
         out = os.path.join(WORK, f"rule-{name}.jsonl")
         with open(path, "w") as fh:
-            json.dump({"results": out, "steps": [{"label": l, "builtin": "WebFetch", "args": a} for l, a in steps]}, fh, indent=2)
+            json.dump({"results": out, "steps": [{"label": l, "builtin": "Agent", "args": a} for l, a in steps]}, fh, indent=2)
         st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {path}"})
         check(f"rule approvals: {name} turn enqueued", st == 201, json.dumps(t)[:200])
         try:
@@ -1150,8 +1151,8 @@ def run_rule_approvals(ids):
     check("rule approvals: the same call again (keys reordered) holds the same ask", ask_of(res.get("again")) == ask, json.dumps(res.get("again"))[:200])
     st, asks = api("GET", f"/v1/agents/{agid}/asks")
     mine = [a for a in asks or [] if a.get("ask") == ask]
-    check("rule approvals: the ask is listed as an approval of WebFetch",
-          st == 200 and len(mine) == 1 and mine[0].get("approval") == {"name": "WebFetch", "tool": "WebFetch"}, json.dumps(asks)[:300])
+    check("rule approvals: the ask is listed as an approval of Agent",
+          st == 200 and len(mine) == 1 and mine[0].get("approval") == {"name": "Agent", "tool": "Agent"}, json.dumps(asks)[:300])
     if not ask:
         return
     st, r = api("POST", f"/v1/agents/{agid}/asks/{ask}/answer", {"answer": "approve"})
