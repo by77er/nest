@@ -65,7 +65,7 @@ They are now marked designed, not built. `docs/security/` likely repeats some of
 - **The gateway runs as `nest-gw` only when nestd reports `gateway-user`.** Otherwise it runs as root with `CAP_DAC_OVERRIDE` (install.sh:60-72).
 - **An upgrade after a credential substitution is forwarded, and its stream spliced unmasked** (crates/nest-proxy/src/http.rs:467-535). The injection doc decides it is refused.
 - **Operator-layer bindings skip the `wildcard` opt-in and the reserved-header check.** They can inject into `host`, `transfer-encoding` or `Fastly-*`, or onto `*.` hosts (control-plane/src/do/sandbox.ts:75 vs lib/client-secrets.ts:65-93).
-- **Security-relevant designs not built** (marked so in the docs; flagged here because security relies on them): routing-override stripping and the smuggling checks; the kernel backstop, so only the root-running proxy's own check guards IMDS; DNS answer filtering, where non-public answers are visible to the guest although connects refuse them; the fixed-shape CSR checks; and per-sandbox TLS fairness.
+- **Security-relevant designs not built** (marked so in the docs; flagged here because security relies on them): routing-override stripping and the smuggling checks; the kernel backstop, so only the root-running proxy's own check guards IMDS; DNS answer filtering, where non-public answers are visible to the guest although connects refuse them; the fixed-shape CSR checks; per-sandbox TLS fairness; and rejecting (rather than dropping) denied guest traffic.
 
 ## Drift outside the area (not edited)
 
