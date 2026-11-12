@@ -2,7 +2,7 @@
 
 - **Worker HTTP API,** authenticated by [operator tokens](#operator-tokens), or by an [API client](clients/)'s token: an external system's scoped principal, which sees and acts only on what it created, within the operator's grant. The read-only [dashboard](../dashboard/) is a Worker of its own behind Cloudflare Access.
 - **External events** (webhooks, email) are external integrations, not platform routes ([principle 9](../../README.md#principles)): one delivers to an agent through its inbox. Agents schedule their own wakes with `wake_at`.
-- **Approvals:** a call the sink gate or a tool rule in `ask` mode holds is listed by `GET /v1/agents/<id>/asks` (`{ask, question, created_ms, approval?: {name, tool}}`, oldest first) and answered by `POST /v1/agents/<id>/asks/<ask>/answer {answer}`; the decision reaches the agent as an `ask_answer` turn. An API client answers its own subtree's. Agent events reach an API client's webhook ([events to the owner](clients/#events-to-the-owner)); the operator has no webhook yet.
+- **Approvals:** a call the sink gate or a tool rule in `ask` mode holds is listed by `GET /v1/agents/<id>/asks` (an array of `{ask, question, created_ms, approval?: {name, tool}}`, oldest first; `tool` may be null) and answered by `POST /v1/agents/<id>/asks/<ask>/answer {answer}`; the decision reaches the agent as an `ask_answer` turn. An API client answers its own subtree's. Agent events reach an API client's webhook ([events to the owner](clients/#events-to-the-owner)); the operator has no webhook yet.
 - **`nest` CLI on my machine:** `login` (the Access service token, and a binding per sandbox from SandboxDO's `resolve`), `attach` (a terminal: a WebSocket to the sandbox host's [gateway](../../sandbox/gateway/), then vsock), `logs -f`, `port-forward` (TCP over the same path), `diff <a> <b>`. The CLI reaches a sandbox the way a brain does, by hostname and binding. Not built: these commands (the CLI has only `hook`, `mcp` and the in-sandbox commands).
 - **Host authentication:**
   - A signed instance identity document (or a one-time enrollment token) is exchanged for a rotating host token. See [../../compute/provisioning/](../../compute/provisioning/).
@@ -74,14 +74,14 @@
   - **At a turn's start** (the usual seam: an agent's first ring event of a turn, or a ring that begins at one), it's exact: the runner stamps `turn_started` before it writes the prompt to Claude Code, which stamps the prompt's entry after, and every entry of the turn before it was written before its `turn_completed`, so before the next turn was sent. Both stamps are the brain host's clock.
   - **Within a turn** (the ring pruned mid-turn, or a turn running when the live trace began): an entry is stamped when Claude Code makes it, at or a little before the runner reads it, so history may hold the seam's own events too. History leaves out any tool call or result whose id the ring has, and any assistant text equal to one in the ring within 5 s of the seam. The last turn before such a seam has no `turn_completed` in history (the ring goes on with it).
   - The viewer shows history, then the ring's backlog, then live events. A client that already holds ring events and got a `gap` drops what it holds and backfills from the gap's cursor (history covers everything before the seam), rather than merging by time.
-- **Reads only:** an RPC to AgentDO and R2 reads. It never starts a brain, never reaches the sandbox, and never changes the ring. Bytes not yet flushed to R2 (at most 30 s idle, or until the turn's end) aren't in it; by then they are after the seam.
-- **Answers:** `400` for a `before` that isn't a cursor or a `limit` that isn't an integer; `401`/`404` as for any owner route; `503` (`internal`, `retryable: true`) while AgentDO still runs a release without it.
+- **Reads only:** an RPC to AgentDO and R2 reads. It never starts a brain, never reaches the sandbox, and never changes the ring. Bytes not yet flushed to R2 (built: at most 5 s while the agent works, 30 s otherwise; the turn-end flush isn't built) aren't in it; by then they are after the seam.
+- **Answers:** `400` for a `before` that isn't a cursor or a `limit` that isn't an integer of at most 4 digits (0 counts as 1); `401`/`404` as for any owner route; `503` (`internal`, `retryable: true`) while AgentDO still runs a release without it.
 
 ## Which routes take a cell
 
 **Decided (2026-11-02):** only a route about one cell's FleetDO reads `?cell=`. It is checked when that route reads it (default `local`), never by the router for every route (`Ctx.cell` in `control-plane/src/index.ts`), so in a deployment whose `CELLS` doesn't name `local` an external app needs no cell on the others.
 - **About a cell** (`?cell=`): the fleet, hosts, images, lifetimes, tunnels, GC and the root certificate (`/v1/admin/…`), and the operator's `GET /v1/agents` and `GET /v1/sandboxes` without `?client=` (FleetDO's registry). A client's listing, and the operator's with `?client=`, take `?cell=` only as a filter.
-- **In the body:** `POST /v1/agents` and `POST /v1/sandboxes` take `cell` (an agent with a sandbox takes the sandbox's).
+- **In the body:** `POST /v1/agents` and `POST /v1/sandboxes` take `cell` (an agent with a sandbox takes the sandbox's), and so do `POST /v1/admin/enrollment-tokens` and `POST /v1/admin/launched` (default `local`).
 - **No cell:** everything reached by an agent's or sandbox's id (its DO's record knows its cell), the catalog (one CatalogDO for every cell), clients and `/v1/clients/self/…`, and secrets (one BrokerDO). These accept a `?cell=` and ignore it, so callers that send one keep working.
 
 ## Idempotency keys
@@ -115,7 +115,7 @@ The operator API takes scoped bearer tokens. Built: one `ADMIN_TOKEN` with every
 
 ## Revocation counter
 
-**One counter, `REVOCATION_COUNTER` (a Worker secret), is signed into every share link, terminal session and host token.** Anything minted under an older value is refused. Bumping it is the panic button:
+**Not built: one counter, `REVOCATION_COUNTER` (a Worker secret), signed into every share link, terminal session and host token.** Anything minted under an older value is refused. Bumping it is the panic button:
 - `wrangler secret put` deploys a new version at once ([secrets](https://developers.cloudflare.com/workers/configuration/secrets/)), which restarts every DO and drops every socket ([upgrades](../#upgrades)), so open terminals and host channels close and can't come back.
 - An instance enrolls only once, so its host can't get a new token: leases expire and sandboxes restore on fresh hosts ([FleetDO](../durable-objects/fleet/)).
 - It takes my Cloudflare credentials, not an operator token, so it works even when an `admin` token has leaked.
