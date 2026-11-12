@@ -1,4 +1,4 @@
-// The app's catalog in nest (README.md#how-it-uses-nest): three role templates and three MCP
+// The app's catalog in nest (README.md#how-it-uses-nest): the role templates and the MCP
 // capabilities in the client's namespace, written with `PUT /v1/catalog/{templates,capabilities}/…`.
 // Data only: the shapes are nest's Template and Capability (control-plane/src/lib/spec.ts), read there
 // and written here, never imported. A sync writes every entry whole, so running it twice leaves nest
@@ -15,8 +15,20 @@ export const NAMESPACE = "projects";
 /** The model credential every role runs on (in the grant's `credentials`). */
 const CREDENTIAL = "claude_oauth_token";
 
-/** Claude Code's built-in tools for every role: its own task list and the web, as nest's worker gets. */
-const BUILTIN_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"];
+/** Claude Code's task tools, which every role launches, and its web tools, which every role with hands does. */
+const TASK_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"] as const;
+const WEB_TOOLS = ["WebSearch", "WebFetch"] as const;
+/** Claude Code's built-in tools for every role with hands: its own task list and the web, as nest's worker gets. */
+const BUILTIN_TOOLS = [...TASK_TOOLS, ...WEB_TOOLS];
+/**
+ * The owner's decision (2026-11-11, README.md#built-in-tools): every built-in a role launches runs
+ * without asking, the web tools on any URL. nest's runner asks for a call no rule matches, and a
+ * template has no rules, so they come through the role capabilities every role template lists (nest
+ * joins its capabilities' rules, first match wins). Exact names, no specifier: `WebFetch` alone matches
+ * every URL. The worker's `Agent` is allowed by nest's `subagents`.
+ */
+export const BUILTIN_RULES: readonly { pattern: string; decision: "allow" }[] = BUILTIN_TOOLS.map((t) => ({ pattern: t, decision: "allow" }));
+
 /**
  * A worker may also run Claude Code's own subagents (`Agent`, through nest's `subagents` capability):
  * they live in the worker's brain and reach the same sandbox through its hands, with the same grant and
@@ -66,6 +78,7 @@ export const PROMPTS = {
     "You are a worker on a task board. You have one task: read it with projects-task get_task.",
     "Clone the repo in your sandbox, work on the branch it names (task/<task-id>), commit, push that branch, and open exactly one PR from it to the default branch with `gh pr create`.",
     "Report as you go with report_progress, and once the PR is open call report_pr with its number.",
+    "You own your PR until it merges: opening it isn't the end of your task. Merging needs the review check (a reviewer agent's verdict on each head commit) and the repo's other required checks to pass, and the branch to merge cleanly. When a message says your PR failed review, has failing checks, or conflicts with its base, fix it and push, then carry on: address the reviewer's findings (fix what they rightly find; where one is wrong, say why in the PR); find out why a check failed and fix it; and bring the branch up to date with its base by the message's steps. On your own task branch that's a rebase: push your own unpushed commits plainly first (if that needs a `git pull --rebase`, finish it with `git rebase --continue` and push before going on); fetch, and note the sha of origin/task/<task-id> (write it out in full in each command: shell variables don't last from one command to the next); `git checkout -B task/<task-id> <that sha>`, so commits someone else pushed are kept; `git -c rerere.enabled=true rebase` onto the base; then `git push --force-with-lease=refs/heads/task/<task-id>:<that sha> origin HEAD:refs/heads/task/<task-id>`. If that push is refused because the branch moved, start again from the fetch (never rebase your rebased branch onto the pushed one, and never use plain --force). If the repo's rules refuse any force-push, go back to the branch as pushed (`git checkout -B task/<task-id> <that sha>`), merge the base in and push plainly. Never force-push or rebase any other branch: an attached PR from another branch is brought up to date by merging the base in and a plain push (`git pull --no-rebase --no-edit` where it needs one), after pushing any commits of yours on it. The PR is squash-merged either way. Routine PR upkeep is yours: never block on it or ask the owner about it.",
     "If you can't go on without the owner (a decision only they can make, or credentials or access you can't get), call report_blocked with the reason and your question; the answer arrives in your inbox. Never block for anything you could resolve yourself: read the code and docs, try it, or make the reasonable choice and say so in the PR. Clear it with clear_blocked if you resolve it another way.",
     "You may split work across Claude Code subagents (the Agent tool): they share your sandbox and your task, nothing more. You can't start other nest agents or sandboxes.",
     "Meet the spec's acceptance criteria and run its test plan before you open the PR. Touch nothing outside your task.",
@@ -89,6 +102,9 @@ function mcpCapability(base: string, server: Server, prompt: string) {
   const tools = TOOLS[server];
   return {
     prompt,
+    // Each role's capability, so every role template allows the built-ins it launches. `routine`'s reach
+    // the dreaming template too, which launches the task tools but neither web tool.
+    rules: BUILTIN_RULES.map((r) => ({ ...r })),
     mcp: {
       // No `auth`: nest sends no bearer, and the Nest-Identity token is the only credential.
       url: `${base}/mcp/${server}`,
@@ -163,7 +179,7 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
       // memory and the transcripts nest's grant lets it read (README.md#routines).
       [`${NAMESPACE}/dreaming`]: {
         capabilities: ["nest", `${NAMESPACE}/routine`],
-        launch: { builtin_tools: ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"], system_prompt: { mode: "append", text: PROMPTS.dreaming } },
+        launch: { builtin_tools: [...TASK_TOOLS], system_prompt: { mode: "append", text: PROMPTS.dreaming } },
         hands: "forbidden",
         credential: CREDENTIAL,
         ephemeral: true,

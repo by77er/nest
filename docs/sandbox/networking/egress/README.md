@@ -2,7 +2,7 @@
 
 The only way out of a sandbox. **nest-proxy** is one **unprivileged** Rust process per sandbox host (tokio, hyper, rustls). **nestd** does all namespace setup and hands it pre-bound sockets.
 
-Sandboxes hold **no credentials** and never talk to model providers. Brains go directly to Anthropic from their brain hosts through a plain host allowlist, with nothing decrypted; a sandbox host's own egress needs no Anthropic hosts.
+Sandboxes hold **no credentials** and never talk to model providers. Brains go directly to Anthropic from their brain hosts, with nothing decrypted (their egress is limited by port, 443 only; a host allowlist isn't built: [brain hosts](../../../compute/brain-hosts/)); a sandbox host's own egress needs no Anthropic hosts.
 
 ```
 accept (listener ⇒ sandbox [, agent])

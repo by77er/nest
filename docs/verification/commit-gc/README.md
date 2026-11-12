@@ -4,13 +4,13 @@ Inventory for modelling: the generation chain in SandboxDO, FleetDO's GC registr
 
 **Pilot:** [pilot/](pilot/), the Lean 4 proofs over this inventory.
 
-> **Status** (by reading `main`, 2026-11-02): the retention-enums branch in the table below merged as #32: the GC-root registry is written at `create`, a destroyed sandbox is never re-registered, salvage is authorized against SandboxDO's full `epochs` table (B4 fixed), and commit records are pruned by age unless their generation is still in the chain. Generation retention (`isRestoreSource`, `deleting` generations, the placement pin) is built (#85) and modelled in [Retention](#retention) below. B1 and B3 are open.
+> **Status** (by reading `main`, 2026-11-02): the retention-enums branch in the table below merged as #32: the GC-root registry is written at `create`, a destroyed sandbox is never re-registered, salvage is authorized against SandboxDO's full `epochs` table (B4 fixed), and commit records are pruned by age unless their generation is still recorded. Generation retention (`isRestoreSource`, `deleting` generations, the placement pin) is built (#85) and modelled in [Retention](#retention) below. B1 and B3 are open.
 
 ## Scope and actors
 
 | Actor | State (exact) | Code |
 |---|---|---|
-| SandboxDO (one per sandbox, single writer) | `info.{epoch, host, head, state, history[≤50]}`; `generations(id, record, orphaned, created_ms)`; `commits(request PK, outcome)`, never pruned on main | `control-plane/src/do/sandbox.ts:125-127`, `:94` |
+| SandboxDO (one per sandbox, single writer) | `info.{epoch, host, head, state, history[≤50]}`; `generations(id, record, orphaned, created_ms)`; `commits(request PK, outcome)`, never pruned at `edf6829` | `control-plane/src/do/sandbox.ts:125-127`, `:94` |
 | FleetDO (one per cell) | `sandboxes(sandbox PK, registered_ms, destroyed_ms?)`; `gc_runs(run, host, marked_ms, dry_run, mark_version, roots, finished_ms?, report?)`; kv `gc_requested` | `control-plane/src/do/fleet.ts:224-230` |
 | nestd committer | `uploaded: key → ms` (local reuse memo); `Sbx.{head, unanswered}`; persisted `meta.json.unanswered` | `crates/nestd/src/s3.rs:312-342`, `crates/nestd/src/host.rs:129-133` |
 | nestd GC pass (burst host) | a `Claim{run, marked_ms, dry_run, roots, grace_ms, deadline_ms, max_deletes}`; `marked`, `doomed` sets | `crates/nestd/src/gc.rs:25-34`, `:73-163` |
@@ -163,7 +163,7 @@ Mutations of the proof: dropping the `pins` half of the guard breaks the `pins` 
 | `Step.unpin` (any time) | `livePins` (`retention.ts:108`) ends the pin on running, suspend, failure, destroy or a newer epoch | yes (the model allows more) |
 | a placement loads the head or a pin | `restoreSource` (`sandbox.ts:653`) checks `isRestoreSource` and refuses otherwise; used by `placeCurrentEpoch` and `createBody` (`:575`) | yes |
 | new generations are never `deleting` (`fresh`) | a commit inserts a row with `state` null under a fresh random id | yes, assuming ids don't collide |
-| `commits` never pruned (the model's `idempotent`) | a main-chain `deleting` row and its commit record are pruned a week after marking; an orphan's row and record never are | partly: a main-chain re-ask after pruning meets the compare-and-set (parent mismatch), as before retention; a salvage, which has no parent check, always finds its first answer |
+| `commits` never pruned (the model's `idempotent`) | a main-chain `deleting` row is pruned a week after marking, then its commit record (a record goes once it is a week old and its generation row is gone); a rejected record goes a week after it was made; an orphan's row and record never are (`sandbox.ts` `runRetention`, `pruneCommitRecords`) | partly: a main-chain re-ask after pruning meets the compare-and-set (parent mismatch), as before retention; a salvage, which has no parent check, always finds its first answer |
 
 **Mapped by hand, not modelled:**
 - **Memory unrooting:** the model's `Gen.keys` covers both manifests. The code marks the memory of a ready generation that isn't a restore source unrooted (`memoryToUnroot`, `retention.ts:175`; one-way `mem_unrooted_ms`), and roots follow the mark in every mode. Safe because only a restore source's memory is loaded (the restore rule) and a generation that stops being a restore source never becomes one again; the latter, and "every restore source's manifests are roots", are property-tested (`test/retention-core.test.ts`, 60 seeded walks with pruning), not proved.

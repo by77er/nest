@@ -1115,6 +1115,56 @@ def pending_ask(text):
     return m.group(1) if m else None
 
 
+def run_rule_approvals(ids):
+    """A built-in no tool rule allows (WebFetch: the worker's rules allow only `mcp__nest__*`) is held by the
+    PreToolUse hook for the operator, through nest hook -> runner -> AgentDO (`approval_check`). Approved, that
+    exact call runs once; the same call again is held again."""
+    if REAL:
+        skip("rule approvals", "fake mode only: the calls are scripted")
+        return
+    agid = ids["agent"]
+    fetch = {"url": "https://docs.rs/serde", "prompt": "what does flatten do?"}
+    reordered = {"prompt": "what does flatten do?", "url": "https://docs.rs/serde"}
+
+    def rule_turn(name, steps):
+        path = os.path.join(WORK, f"rule-{name}.json")
+        out = os.path.join(WORK, f"rule-{name}.jsonl")
+        with open(path, "w") as fh:
+            json.dump({"results": out, "steps": [{"label": l, "builtin": "WebFetch", "args": a} for l, a in steps]}, fh, indent=2)
+        st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {path}"})
+        check(f"rule approvals: {name} turn enqueued", st == 201, json.dumps(t)[:200])
+        try:
+            wait_for(lambda: len(results_by_label(out)) >= len(steps) or None, 120, 0.5, f"rule approvals {name} results")
+        except TimeoutError as e:
+            check(f"rule approvals: all {name} results returned", False, str(e)[:200])
+        return results_by_label(out)
+
+    def ask_of(r):
+        m = re.search(r"\((ask_[a-z0-9]+)\)", (r or {}).get("text") or "")
+        return m.group(1) if m else None
+
+    res = rule_turn("held", [("held", fetch), ("again", reordered)])
+    ask = ask_of(res.get("held"))
+    check("rule approvals: a call no rule allows is denied pending the operator's approval",
+          (res.get("held") or {}).get("decision") == "deny" and ask is not None, json.dumps(res.get("held"))[:200])
+    check("rule approvals: the same call again (keys reordered) holds the same ask", ask_of(res.get("again")) == ask, json.dumps(res.get("again"))[:200])
+    st, asks = api("GET", f"/v1/agents/{agid}/asks")
+    mine = [a for a in asks or [] if a.get("ask") == ask]
+    check("rule approvals: the ask is listed as an approval of WebFetch",
+          st == 200 and len(mine) == 1 and mine[0].get("approval") == {"name": "WebFetch", "tool": "WebFetch"}, json.dumps(asks)[:300])
+    if not ask:
+        return
+    st, r = api("POST", f"/v1/agents/{agid}/asks/{ask}/answer", {"answer": "approve"})
+    check("rule approvals: operator approves", st == 200 and r.get("delivered") == "async", json.dumps(r)[:200])
+    res = rule_turn("approved", [("approved", fetch), ("spent", fetch)])
+    spent = ask_of(res.get("spent"))
+    check("rule approvals: the approved call runs once; the same call next is held again",
+          (res.get("approved") or {}).get("decision") == "allow" and (res.get("spent") or {}).get("decision") == "deny"
+          and spent is not None and spent != ask, json.dumps(res)[:300])
+    if spent:
+        api("POST", f"/v1/agents/{agid}/asks/{spent}/answer", {"answer": "deny"})
+
+
 def run_brokered(ids):
     if REAL:
         skip("brokered actions and egress widening", "fake mode only: the calls are scripted")
@@ -1747,6 +1797,7 @@ def main():
         run_mcp(ids)
         run_mcp_oauth(ids)
         run_brokered(ids)
+        run_rule_approvals(ids)
         run_repos(ids)
         run_checkpoints(ids)
         run_cut_under_writes(ids)

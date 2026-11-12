@@ -19,7 +19,7 @@ import { TEMPLATE } from "../catalog";
 import { directory, type Env, project as projectStub } from "../env";
 import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, type Verdict, verdictCheck } from "../github";
 import type { AgentCaller } from "../identity";
-import { backoff, NestError, nestFrom, type Nest, stopRefused } from "../nest";
+import { atCapacity, backoff, NestError, nestFrom, type Nest, stopRefused } from "../nest";
 import { OUTBOX, type OutboxPolicy, type OutboxRow, outboxStep } from "../outbox";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
@@ -40,6 +40,8 @@ export const MAX_RETRIES = 2;
 export const NO_VERDICT: Conclusion = "action_required";
 /** A superseded or closed job's check: `cancelled`, which isn't passing either. */
 export const ENDED: Conclusion = "cancelled";
+/** A review waiting this long for room in nest is told to the project, among its errors (`roomUpkeep`). */
+export const ROOM_TELL_AFTER_MS = 45 * 60_000;
 const CALLS_KEEP_MS = 24 * 3600 * 1000;
 
 
@@ -147,6 +149,19 @@ const MIGRATIONS = [
     "ALTER TABLE ended ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE ended ADD COLUMN error TEXT",
     "ALTER TABLE stops ADD COLUMN failed_ms INTEGER",
+  ],
+  [
+    // When a job began waiting, queued, for nest to have room for its reviewer (its grant's max_agents or
+    // max_sandboxes); null when it isn't waiting for room. Its tries while waiting (the wait's backoff, apart
+    // from `errors`), and the project's word that it has waited long (an error the owner sees, cleared once the
+    // wait ends): when its tell began (so a tell whose answer was lost still gets its clear), whether the
+    // project took it, and the backoff of the tell or the clear while the project can't be reached.
+    "ALTER TABLE jobs ADD COLUMN capacity_ms INTEGER",
+    "ALTER TABLE jobs ADD COLUMN room_waits INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN room_told_ms INTEGER",
+    "ALTER TABLE jobs ADD COLUMN room_ok INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN room_next_ms INTEGER",
+    "ALTER TABLE jobs ADD COLUMN room_attempts INTEGER NOT NULL DEFAULT 0",
   ],
 ] as const;
 
@@ -257,6 +272,19 @@ export class ReviewDO extends DurableObject<Env> {
   /** The queue's jobs, newest first. */
   async jobs(): Promise<Job[]> {
     return this.sql.exec("SELECT * FROM jobs ORDER BY created_ms DESC, pr DESC LIMIT 100").toArray().map((r) => this.toJob(r));
+  }
+
+  /**
+   * The verdicts of the reviews done at these heads (README.md#pr-upkeep), by `<pr>/<sha>`: a head with no
+   * finished review (none yet, still running, failed without one) has none.
+   */
+  async verdictsAt(heads: readonly { pr: number; sha: string }[]): Promise<Record<string, Verdict>> {
+    const out: Record<string, Verdict> = {};
+    for (const h of heads) {
+      const r = this.jobRow(h.pr, h.sha);
+      if (r && r.state === "done" && r.verdict) out[`${h.pr}/${h.sha}`] = JSON.parse(r.verdict as string) as Verdict;
+    }
+    return out;
   }
 
   /** The jobs held for the owner's approval, oldest first. */
@@ -480,7 +508,7 @@ export class ReviewDO extends DurableObject<Env> {
   private reset(pr: number, sha: string): void {
     this.sql.exec(
       `UPDATE jobs SET next_ms = ?, agent = NULL, check_run = NULL, briefed = 0, verdict = NULL, tainted = NULL,
-        attempts = 0, errors = 0, error = NULL, deadline_ms = NULL WHERE pr = ? AND sha = ?`,
+        attempts = 0, errors = 0, error = NULL, deadline_ms = NULL, capacity_ms = NULL, room_waits = 0 WHERE pr = ? AND sha = ?`,
       Date.now(), pr, sha,
     );
   }
@@ -514,14 +542,101 @@ export class ReviewDO extends DurableObject<Env> {
     this.sql.exec("INSERT OR IGNORE INTO stops (agent, reason, next_ms) VALUES (?, ?, ?)", agent, reason, Date.now());
   }
 
+  /**
+   * nest won't start the job's reviewer for capacity (its grant's max_agents or max_sandboxes: `atCapacity`):
+   * the job waits, queued, as one over max_concurrent_reviews does, its slot freed, and is tried again with
+   * backoff (5 s doubling to 5 minutes, never given up), sooner when one of the project's reviewers ends.
+   * Its check stays in progress, saying so once. The next try is a new start (`runs`), with new keys: what
+   * this one made, nest's refusal undid. Nothing of the job's approval changes: it was cleared to run. Its
+   * tries count apart (`room_waits`), so the job's own step backs off from scratch once it starts. A wait past
+   * ROOM_TELL_AFTER_MS is told to the project (`roomUpkeep`).
+   */
+  private waitForRoom(j: Row, why: string): void {
+    if (!this.move(j.pr as number, j.sha as string, "running", "wait")) return;
+    const waits = ((j.room_waits as number | null) ?? 0) + 1;
+    this.sql.exec(
+      `UPDATE jobs SET agent = NULL, briefed = 0, deadline_ms = NULL, room_waits = ?, next_ms = ?, error = ?,
+        capacity_ms = COALESCE(capacity_ms, ?) WHERE pr = ? AND sha = ?`,
+      waits, Date.now() + backoff(waits), `waiting for room in nest to start a reviewer: ${why}`, Date.now(), j.pr, j.sha,
+    );
+    if (j.capacity_ms === null && j.check_run !== null) {
+      this.oweCheck(j.check_run as number, { status: "in_progress", output: ROOM_OUTPUT });
+    }
+  }
+
+  /**
+   * One of the project's reviewers ended, freeing one place: the oldest job waiting for room tries now. Only
+   * one, since under max_agents each try makes a sandbox nest then refuses an agent for (and it's destroyed).
+   */
+  private roomFreed(): boolean {
+    return this.sql.exec(
+      `UPDATE jobs SET next_ms = ? WHERE rowid = (SELECT rowid FROM jobs WHERE state = 'queued' AND capacity_ms IS NOT NULL AND next_ms > ?
+        ORDER BY created_ms, pr LIMIT 1)`,
+      Date.now(), Date.now(),
+    ).rowsWritten > 0;
+  }
+
+  /**
+   * The project's word on long waits for room (README.md#built-the-review-pipeline): a job waiting past
+   * ROOM_TELL_AFTER_MS is recorded among the project's errors, once, since a grant full of live workers can
+   * hold every review back, and no worker ends until its PR merges, which needs its review: only the owner
+   * can raise the grant's limits or stop a worker. Cleared once the wait ends (it starts, or ends otherwise).
+   * Retried at the next drain when the project can't be told.
+   */
+  private async roomUpkeep(): Promise<void> {
+    const project = this.setting("project");
+    if (!project) return;
+    const now = Date.now();
+    const due = "(room_next_ms IS NULL OR room_next_ms <= ?)";
+    const failed = (j: Row, what: string, e: unknown) => {
+      const attempts = (j.room_attempts as number) + 1;
+      // Backed off (5 s doubling to 5 min) while the project can't be reached, never a hot loop; never given up.
+      this.sql.exec("UPDATE jobs SET room_attempts = ?, room_next_ms = ? WHERE pr = ? AND sha = ?", attempts, Date.now() + backoff(attempts), j.pr, j.sha);
+      console.error(`review: ${what} for PR #${j.pr as number} (try ${attempts}): ${message(e)}`);
+    };
+    for (const j of this.sql.exec(`SELECT * FROM jobs WHERE state = 'queued' AND capacity_ms IS NOT NULL AND capacity_ms <= ? AND room_ok = 0 AND ${due}`, now - ROOM_TELL_AFTER_MS, now).toArray()) {
+      // Marked before the call: should its answer be lost, the project may have the error, and it's cleared all the same.
+      this.sql.exec("UPDATE jobs SET room_told_ms = COALESCE(room_told_ms, ?) WHERE pr = ? AND sha = ?", Date.now(), j.pr, j.sha);
+      try {
+        await this.tellRoom(project, { pr: j.pr as number, sha: j.sha as string, since_ms: j.capacity_ms as number, why: (j.error as string | null) ?? "" });
+        this.sql.exec("UPDATE jobs SET room_ok = 1, room_next_ms = NULL, room_attempts = 0 WHERE pr = ? AND sha = ?", j.pr, j.sha);
+      } catch (e) {
+        failed(j, "the project wasn't told the review waits for room", e);
+      }
+    }
+    for (const j of this.sql.exec(`SELECT * FROM jobs WHERE room_told_ms IS NOT NULL AND (state != 'queued' OR capacity_ms IS NULL) AND ${due}`, now).toArray()) {
+      try {
+        await this.clearRoom(project, j.pr as number, j.sha as string);
+        this.sql.exec("UPDATE jobs SET room_told_ms = NULL, room_ok = 0, room_next_ms = NULL, room_attempts = 0 WHERE pr = ? AND sha = ?", j.pr, j.sha);
+      } catch (e) {
+        failed(j, "the project's word on the wait for room wasn't cleared", e);
+      }
+    }
+  }
+
+  /** The project's two calls for `roomUpkeep` (one place each, so a test can make the project unreachable). */
+  private tellRoom(project: string, e: { pr: number; sha: string; since_ms: number; why: string }): Promise<void> {
+    return projectStub(this.env, project).reviewWaitingForRoom(e);
+  }
+
+  private clearRoom(project: string, pr: number, sha: string): Promise<void> {
+    return projectStub(this.env, project).reviewRoomCleared(pr, sha);
+  }
+
+
   /** nest's `agent.exited` for a reviewer: without a verdict, it's started again, up to MAX_RETRIES times. */
   async onAgentExited(agent: string, reason?: string): Promise<void> {
     // Gone, by nest's word: a stop of it that nest refused has nothing left to stop.
     this.sql.exec("DELETE FROM stops WHERE agent = ? AND failed_ms IS NOT NULL", agent);
+    // Its place in nest is free: a job waiting for room tries now.
+    const freed = this.roomFreed();
     const j = this.sql.exec("SELECT * FROM jobs WHERE agent = ?", agent).toArray()[0];
     // No job names it yet: kept for the job's start, which learns it from the create's answer.
     if (!j) this.sql.exec("INSERT OR IGNORE INTO early_exits (agent, reason, at_ms) VALUES (?, ?, ?)", agent, reason ?? null, Date.now());
-    if (!j || j.state !== "running" || j.verdict !== null) return;
+    if (!j || j.state !== "running" || j.verdict !== null) {
+      if (freed) await this.arm();
+      return;
+    }
     this.spendAttempt(j, `the reviewer exited without a verdict (${(reason ?? "exited").slice(0, 100)})`, "exited");
     await this.arm();
   }
@@ -626,7 +741,13 @@ export class ReviewDO extends DurableObject<Env> {
     ).one().t;
     // A running job's deadline (src/review-job.ts).
     const deadline = this.sql.exec<{ t: number | null }>("SELECT MIN(deadline_ms) AS t FROM jobs WHERE state = 'running' AND deadline_ms IS NOT NULL").one().t;
-    const times = [first, deadline].filter((t): t is number => t !== null);
+    // A long wait for room to tell the project of, or its word to clear (`roomUpkeep`).
+    const room = this.sql.exec<{ t: number | null }>(
+      `SELECT MIN(t) AS t FROM (
+        SELECT MAX(capacity_ms + ${ROOM_TELL_AFTER_MS}, COALESCE(room_next_ms, 0)) AS t FROM jobs WHERE state = 'queued' AND capacity_ms IS NOT NULL AND room_ok = 0
+        UNION ALL SELECT COALESCE(room_next_ms, ${Date.now()}) FROM jobs WHERE room_told_ms IS NOT NULL AND (state != 'queued' OR capacity_ms IS NULL))`,
+    ).one().t;
+    const times = [first, deadline, room].filter((t): t is number => t !== null);
     const next = times.length ? Math.min(...times) : null;
     if (next === null) return;
     const cur = await this.ctx.storage.getAlarm();
@@ -667,7 +788,7 @@ export class ReviewDO extends DurableObject<Env> {
     this.sql.exec(
       `DELETE FROM jobs WHERE state IN ('done', 'failed', 'superseded', 'closed', 'dismissed') AND updated_ms < ?
         AND NOT EXISTS (SELECT 1 FROM prs WHERE prs.pr = jobs.pr AND prs.sha = jobs.sha AND prs.open = 1)
-        AND NOT EXISTS (SELECT 1 FROM check_updates c WHERE c.check_run = jobs.check_run)`,
+        AND NOT EXISTS (SELECT 1 FROM check_updates c WHERE c.check_run = jobs.check_run) AND room_told_ms IS NULL`,
       now - REVIEW_JOBS_KEEP_MS,
     );
     this.sql.exec("DELETE FROM early_exits WHERE at_ms < ?", now - EARLY_EXITS_KEEP_MS);
@@ -720,6 +841,7 @@ export class ReviewDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'running' AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       await this.advance(nest, github, repo, r.pr as number, r.sha as string);
     }
+    await this.roomUpkeep();
     await this.arm();
   }
 
@@ -740,8 +862,7 @@ export class ReviewDO extends DurableObject<Env> {
         // A create whose answer was lost made a check run all the same: found by its external id.
         const found = (before.errors as number) > 0 ? (await gh.checkRunsAt(repo, sha)).find((c) => c.external_id === external) : undefined;
         const made = found ?? (await gh.createCheckRun(repo, {
-          head_sha: sha, external_id: external, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}`,
-          output: { title: "Reviewing", summary: `A reviewer agent is reviewing ${sha}: correctness, quality and architectural cohesiveness.` },
+          head_sha: sha, external_id: external, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}`, output: reviewingOutput(sha),
         }))!;
         const appId = made.app?.id;
         if (typeof appId === "number" && this.setting("github_app_id") !== String(appId)) {
@@ -766,13 +887,23 @@ export class ReviewDO extends DurableObject<Env> {
         const key = `${project}/review/${pr}/${sha}/${runs}`;
         // The project's secrets for reviewers, frozen per attempt (ProjectDO keeps them).
         const spec = await projectStub(this.env, project).reviewerSpec(key);
-        agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, key, spec.extras);
+        try {
+          agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, key, spec.extras, {}, { newAttemptOnCapacity: true });
+        } catch (e) {
+          // No room in nest for now: the job waits, queued, and starts again once there is.
+          const r = atCapacity(e) ? current() : null;
+          if (!r) throw e;
+          this.waitForRoom(r, message(e));
+          return;
+        }
         if (!current()) {
           this.oweStop(agent, "superseded");
           return;
         }
         // Named on the job in the step the create's answer came, before any other await, so its exit finds it.
-        this.sql.exec("UPDATE jobs SET agent = ? WHERE pr = ? AND sha = ?", agent, pr, sha);
+        this.sql.exec("UPDATE jobs SET agent = ?, capacity_ms = NULL, room_waits = 0 WHERE pr = ? AND sha = ?", agent, pr, sha);
+        // It waited for room: its check says it's reviewing again.
+        if (j0.capacity_ms !== null && j0.check_run !== null) this.oweCheck(j0.check_run as number, { status: "in_progress", output: reviewingOutput(sha) });
         await directory(this.env).recordAgent({ agent, project, role: "reviewer", task: null, pr });
         // Its holdings and live layer: a secret changed or removed later reaches it too.
         await projectStub(this.env, project).reviewerStarted(agent, key);
@@ -902,6 +1033,7 @@ export class ReviewDO extends DurableObject<Env> {
       }
     }
     this.sql.exec("DELETE FROM stops WHERE agent = ?", agent);
+    this.roomFreed();
     // Stopped with its sandbox: no layer left to keep up.
     const project = this.setting("project");
     if (project) await projectStub(this.env, project).agentEnded(agent);
@@ -911,6 +1043,15 @@ export class ReviewDO extends DurableObject<Env> {
 const HELD_OUTPUT: CheckOutput = {
   title: "Waiting for the owner's approval",
   summary: "This pull request isn't from someone the project trusts, so its review doesn't start by itself. The project's owner can approve the review of this commit, or dismiss it.",
+};
+
+const reviewingOutput = (sha: string): CheckOutput => ({
+  title: "Reviewing", summary: `A reviewer agent is reviewing ${sha}: correctness, quality and architectural cohesiveness.`,
+});
+
+const ROOM_OUTPUT: CheckOutput = {
+  title: "Waiting for room to start a reviewer",
+  summary: "nest is running as many of this app's agents or sandboxes as its grant allows. The review starts by itself once there's room.",
 };
 
 const OVERFLOW_OUTPUT: CheckOutput = {

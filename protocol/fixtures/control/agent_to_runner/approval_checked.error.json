@@ -1,0 +1,12 @@
+{
+  "type": "approval_checked",
+  "request": "req_01jb7r9a2m",
+  "outcome": {
+    "status": "error",
+    "error": {
+      "code": "stale_epoch",
+      "message": "not the current runner process or epoch",
+      "retryable": false
+    }
+  }
+}

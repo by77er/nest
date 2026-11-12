@@ -11,7 +11,8 @@ const shown = (selector) => (p) => p.locator(selector).first().waitFor({ timeout
 const PHONE = [390];
 /** Waits for the drawer's task, then scrolls the drawer to a section (by its heading) or an element. */
 const drawerAt = (target) => async (p) => {
-  const el = target.startsWith("[") ? p.locator(target).first() : p.getByRole("heading", { name: target, exact: true });
+  // A heading by its name, a selector (`[…]`), or a line of text (`text=…`).
+  const el = target.startsWith("[") ? p.locator(target).first() : target.startsWith("text=") ? p.getByText(target.slice(5)).first() : p.getByRole("heading", { name: target, exact: true });
   await el.waitFor({ timeout: 15_000 });
   // Scrolled to the top, then down from under the drawer's sticky header.
   await el.evaluate((e) => {
@@ -730,6 +731,8 @@ const app = {
     { name: "drawer-trace-beginning", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: traceCheck, checkName: "trace", after: async (p) => { await traceTab(p); await toTop("the beginning of the trace")(p); } },
     { name: "drawer-stalled-pr", section: "project", path: "/projects/prj_demo/board?task=tsk_demo8", fixture: "machine", full: false },
     { name: "drawer-stalled-pr-history", section: "project", path: "/projects/prj_demo/board?task=tsk_demo8", fixture: "machine", full: false, after: drawerAt("History") },
+    // What its worker was told of its PR (projects/README.md#pr-upkeep): the longest line (three conditions) and a reminder.
+    { name: "drawer-stalled-pr-upkeep", section: "project", path: "/projects/prj_demo/board?task=tsk_demo8", fixture: "machine", full: false, after: drawerAt("text=Its worker was told PR #130 failed review, has failing checks") },
     { name: "drawer-ready-pr", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", fixture: "machine", full: false },
     { name: "drawer-ready-pr-history", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", fixture: "machine", full: false, after: drawerAt("History") },
     { name: "drawer-no-worker", section: "project", path: "/projects/prj_demo/board?task=tsk_demo3", full: false },

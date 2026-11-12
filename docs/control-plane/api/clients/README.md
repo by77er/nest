@@ -74,11 +74,12 @@ The checks:
 | `POST` | `/v1/agents/<agent>/inbox` | Subtree. `from` defaults to the client's id. Any other is a label of its own ([inbox senders](#inbox-senders)): never one of nest's senders or a principal's id (403), shown with the client's id, and it taints the session. An ended agent refuses it (404). |
 | `POST` | `/v1/agents/<agent>/interrupt` | Subtree. |
 | `POST` | `/v1/agents/<agent>/start` | Subtree. `host` is the operator's (403). With `restart: true`, `launch: {model?, effort?}` restarts the brain on them, resuming its session, and `when: "idle"` only between turns (else `409 busy`) ([restarting on another model](../#restarting-on-another-model)). |
-| `POST` | `/v1/agents/<agent>/stop` | Subtree. `destroy_sandbox` destroys only a sandbox that agent owns, and only if nothing else is attached when its end detaches it. |
+| `POST` | `/v1/agents/<agent>/stop` | Subtree. `destroy_sandbox` (with `end: true`) destroys the agent's sandbox if the client could `DELETE` it (one in its subtree, such as one it created) or it was made for that agent, and only if nothing else is attached when its end detaches it. Without `destroy_sandbox`, an ephemeral agent's end destroys only a sandbox made for it. |
 | `GET` | `/v1/agents/<agent>/children` | Subtree. |
 | `GET` | `/v1/agents/<agent>/brokered` | Subtree. |
 | `GET` | `/v1/agents/<agent>/asks` | Subtree. |
 | `POST` | `/v1/agents/<agent>/asks/<ask>/answer` | Subtree. |
+| `GET` | `/v1/asks` | Its own registry's live agents only, as for `GET /v1/agents` ([open asks across agents](../#open-asks-across-agents)). |
 | `GET` | `/v1/agents/<agent>/timers` | Subtree ([timers](#timers)). |
 | `DELETE` | `/v1/agents/<agent>/timers/<name>` | Subtree. |
 | `POST` | `/v1/sandboxes` | Within the grant (`cells`, `max_sandboxes`, `inject_hosts`, `egress_hosts`, `github_push`, its own secrets). `policy` is the operator's (403). |
