@@ -2097,7 +2097,8 @@ export class ProjectDO extends DurableObject<Env> {
     const local = this.localAttention();
     if (!local.ok) return local;
     const asks = await this.asks();
-    if (!asks.ok && asks.status !== 502) return asks;
+    // Only an unknown project fails the list; nest unreadable (or not configured) leaves the rest, with the marker.
+    if (!asks.ok && asks.status === 404) return asks;
     const open = asks.ok
       ? asks.value.map((a): Attention => ({ kind: "ask", ...a }))
       : [{ kind: "asks_unavailable", error: asks.error, at_ms: 0 } as Attention];
@@ -2214,6 +2215,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (!a) return fail(409, "this ask isn't open any more: it was answered, or its agent ended");
     try {
       const out = await nest.answerAsk(a.agent, ask, answer);
+      // Written for the release before, which reads this table (expand/contract, README.md#asks); never read here.
+      this.sql.exec("UPDATE asks SET answered_ms = COALESCE(answered_ms, ?), answer = COALESCE(answer, ?) WHERE ask = ?", Date.now(), answer, ask);
       if (out.delivered !== "already_answered") {
         this.replyWaits(`answered ask ${ask}`);
         await this.arm();

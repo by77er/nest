@@ -75,7 +75,7 @@ async function rereadBinding(env: Env, id: string, shownId?: number): Promise<Re
 /**
  * What waits on the owner, as "Needs you" lists it: ProjectDO's (asks, blocked tasks, secret requests, and
  * triage as one item), with the reviews held for approval (ReviewDO's) and the review backlog as one item,
- * oldest first. The projects list's `needs_you` is its length.
+ * oldest first. The projects list's `needs_you` counts the same items without reading this (one nest read for every project).
  */
 async function attentionOf(env: Env, pid: string): Promise<Result<{ kind: string; at_ms: number }[]>> {
   const a = (await project(env, pid).attention()) as Result<{ kind: string; at_ms: number }[]>;

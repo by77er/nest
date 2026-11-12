@@ -3,7 +3,8 @@
 // ended, is gone without the app hearing of it; the app keeps no copy. Answering goes to nest, and only an
 // answer that reached its ask wakes the manager's await_reply.
 import { env, runInDurableObject } from "cloudflare:test";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import type { ProjectDO } from "../src/do/project";
 import { resetAccessKeys } from "../src/access";
 import { AccessTeam, agentClaims, answerInNest, api, callTool, deliver, FakeNest, holdAsk, installFetch, Signer } from "./fake-nest";
 
@@ -22,6 +23,13 @@ beforeAll(async () => {
   fake.jwks = { keys: [await nest.jwk()] };
 });
 afterAll(() => restore());
+// Each test's faults are its own: a failure, hold or page size one test set (and didn't use up) never reaches the next.
+afterEach(() => {
+  fake.failures.length = 0;
+  fake.holds.length = 0;
+  fake.asksPageMax = 100;
+  fake.asksRouteMissing = false;
+});
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 10);
 const spec = { goal: "g", acceptance_criteria: [], files: [], test_plan: "p" };
@@ -121,6 +129,35 @@ describe("asks are nest's, read when asked", () => {
     // nest back: the ask is there again, and the count has it.
     expect((await attention(s)).map((x) => x.kind).sort()).toEqual(["ask", "blocked"]);
     expect(await count(s)).toBe(2);
+  });
+
+  it("lists what was blocked while nest was being read (the app's own items are read after the await)", async () => {
+    const s = await setup();
+    let release!: () => void;
+    const hold = { match: /^GET \/v1\/asks$/, release: new Promise<void>((r) => (release = r)), reached: false };
+    fake.holds.push(hold);
+    const reading = api(token, "GET", `/api/projects/${s.id}/attention`);
+    await vi.waitFor(() => expect(hold.reached).toBe(true));
+    ok(await callTool("board", await nest.sign(agentClaims("board", s.manager, { project: s.id, role: "manager", start: "1" })), "block_task", { task: s.task, reason: "decide" }));
+    release();
+    expect(((await reading).body as { kind: string }[]).map((x) => x.kind)).toEqual(["blocked"]);
+  });
+
+  it("nest not configured: the app's own items are still listed, with the marker", async () => {
+    const s = await setup();
+    ok(await callTool("board", await nest.sign(agentClaims("board", s.manager, { project: s.id, role: "manager", start: "1" })), "block_task", { task: s.task, reason: "decide" }));
+    const kinds = await runInDurableObject(stub(s), async (o: ProjectDO) => {
+      const self = o as unknown as { env: Record<string, unknown> };
+      const was = self.env;
+      self.env = { ...was, NEST_CLIENT_TOKEN: undefined };
+      try {
+        const r = await o.attention();
+        return r.ok ? r.value.map((x) => x.kind) : [`failed ${r.status}`];
+      } finally {
+        self.env = was;
+      }
+    });
+    expect(kinds).toEqual(["asks_unavailable", "blocked"]);
   });
 
   it("pages through every page of nest's answer, oldest first across pages, and reads an agent's whole list past 20", async () => {
@@ -242,5 +279,12 @@ describe("answering", () => {
     // Nothing reads it: answered in nest, it's gone from Needs you though its row stays.
     answerInNest(s.worker, a);
     expect(await askIds(s)).toEqual([]);
+    // An answer through the app marks its row, as the release before reads it.
+    const b = askId();
+    await deliver({ id: `evt-${rand()}`, type: "agent.ask", agent: s.worker, ask: b, question: "merge?" });
+    expect((await answer(s, b, "deny")).status).toBe(200);
+    const row = await runInDurableObject(stub(s), (_o, st) => st.storage.sql.exec("SELECT answered_ms, answer FROM asks WHERE ask = ?", b).one());
+    expect(row.answer).toBe("deny");
+    expect(row.answered_ms).toEqual(expect.any(Number));
   });
 });
