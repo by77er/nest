@@ -1258,12 +1258,16 @@ export class SandboxDO extends DurableObject<Env> {
    * from now on has it) and sent as a new policy version from its own alarm (`egress_base`), so FleetDO's
    * fan-out never waits on a command back into FleetDO. Held even before its create wrote anything (the
    * create, registered, may be waiting on an answer FleetDO read before this version), so the older answer
-   * can't replace it. An older version than the one held, or a destroyed sandbox, changes nothing.
+   * can't replace it. Sent whenever the version held is at least the one told, not only when this notice
+   * brought it: a retried create may have taken it from `registerSandbox`'s answer already, and sends
+   * nothing itself (a redundant send is a policy version the proxy takes again). A destroyed sandbox
+   * changes nothing.
    */
   async egressBaseChanged(base: EgressBase): Promise<void> {
     const info = this.tryInfo();
     if (info && lease.gone(info.state)) return;
-    if (this.takeEgressBase(base) && info) await this.deadlines.set("egress_base", Date.now());
+    this.takeEgressBase(base);
+    if (info && this.egressBase().version >= base.version) await this.deadlines.set("egress_base", Date.now());
   }
 
   /** The operator's layer; one stored before `repos`, `read_repos` and `guards` reads as having none. */

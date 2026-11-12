@@ -147,6 +147,72 @@ describe("the base egress layer", () => {
     expect([names.slice(0, many.length), names.at(-1)]).toEqual([many.map((g) => g.name), "client:no-delete"]);
   });
 
+  it("a retried create that took the new base from its registration still sends it when the notice comes", async () => {
+    const cell = uniqueCell();
+    const s = await placed(cell);
+    const proto = SandboxDO.prototype as unknown as { egressBaseChanged: (b: unknown) => Promise<void> };
+    const real = proto.egressBaseChanged;
+    proto.egressBaseChanged = async function () { throw new Error("held"); };
+    try {
+      await adminJson(base(cell), { method: "PUT", body: { allow: [{ host: "new.example.org" }] } });
+      await eventually("the first notice failed", () => runInDurableObject(fleetOf(cell), (_i: FleetDO, st) =>
+        st.storage.sql.exec<{ attempts: number }>("SELECT attempts FROM egress_base_notices").toArray().some((r) => r.attempts >= 1)));
+      // The same create again (a retried POST, a retried spawn): registerSandbox answers the new base, which it holds.
+      await sandboxOf(s.sandbox).create({ sandbox: s.sandbox, cell });
+    } finally {
+      proto.egressBaseChanged = real;
+    }
+    await runInDurableObject(fleetOf(cell), (_i: FleetDO, st) => {
+      st.storage.sql.exec("UPDATE egress_base_notices SET due_ms = 0");
+      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'egress_base'");
+    });
+    await runDue(fleetOf(cell));
+    const [update] = await nextCommands(s.ws, (c) => c.type === "policy_update" && baseRules(c.policy).some((a: any) => a.host === "new.example.org"));
+    expect(baseRules(update.policy).map((a: any) => a.host)).toEqual(["new.example.org"]);
+  });
+
+  it("a destroyed sandbox told of a new base writes nothing", async () => {
+    const cell = uniqueCell();
+    const s = await placed(cell);
+    await adminJson(`/v1/sandboxes/${s.sandbox}`, { method: "DELETE" });
+    await eventually("destroyed", async () => (await sandboxOf(s.sandbox).info()).state === "destroyed");
+    await sandboxOf(s.sandbox).egressBaseChanged({ version: 3, allow: [{ host: "late.example.org" }], guards: [] });
+    const left = await runInDurableObject(sandboxOf(s.sandbox), (_i: SandboxDO, st) => [
+      st.storage.sql.exec("SELECT 1 FROM kv WHERE key = 'egress_base'").toArray().length,
+      st.storage.sql.exec("SELECT 1 FROM deadlines WHERE key = 'egress_base'").toArray().length]);
+    expect(left).toEqual([0, 0]);
+  });
+
+  it("an older run's failed notice leaves a newer write's notice as that write queued it", async () => {
+    const cell = uniqueCell();
+    const fleet = fleetOf(cell);
+    const id = `sbx_ebold${crypto.randomUUID().replace(/-/g, "").slice(0, 12)}`;
+    await fleet.registerSandboxes([id]);
+    await runInDurableObject(fleet, async (inst: FleetDO, st) => {
+      const run = inst as unknown as { tellEgressBase(): Promise<void>; armEgressBase(): Promise<void>; sandbox(id: string): unknown };
+      run.armEgressBase = async () => {};
+      let release!: () => void;
+      const gate = new Promise<void>((r) => { release = r; });
+      let reached = false;
+      run.sandbox = () => ({ egressBaseChanged: async () => { reached = true; await gate; throw new Error("unreachable"); } });
+      try {
+        await inst.setEgressBase({ allow: [{ host: "one.example.org" }] });
+        const telling = run.tellEgressBase();
+        await eventually("the notice of version 1 in flight", () => reached);
+        // A newer write while it is out: the row is version 2's, due now, no attempts.
+        await inst.setEgressBase({ allow: [{ host: "two.example.org" }] });
+        const queued = st.storage.sql.exec<{ version: number; attempts: number; due_ms: number }>("SELECT version, attempts, due_ms FROM egress_base_notices").one();
+        expect(queued).toMatchObject({ version: 2, attempts: 0 });
+        release();
+        await telling;
+        expect(st.storage.sql.exec("SELECT version, attempts, due_ms FROM egress_base_notices").one()).toEqual(queued);
+      } finally {
+        delete (run as Partial<typeof run>).armEgressBase;
+        delete (run as Partial<typeof run>).sandbox;
+      }
+    });
+  });
+
   it("tells at most one batch per alarm run, and picks notices a previous release's alarm dropped up again at start", async () => {
     const cell = uniqueCell();
     const fleet = fleetOf(cell);
