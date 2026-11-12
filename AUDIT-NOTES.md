@@ -3,6 +3,8 @@
 ## Corrections
 | doc | said | code says | evidence |
 |---|---|---|---|
+| compute/autoscaling/README.md | tombstone "This changed on 2026-11-04: before, only the first type went on demand" | (history; dropped) | AGENTS.md no-tombstones rule |
+| compute/autoscaling/README.md | idle grace: host with "no lease and no agent" | busy = any lease not `suspended`, a brain, or an incarnation awaiting salvage | control-plane/src/do/fleet.ts:2356-2362 |
 | sandbox/README.md | after a fork the guest reseeds via VMGenID and resyncs via VMClock | nestd's `resume` on a fork's first boot: clock step to host wall clock, 64 B host entropy (RNDADDENTROPY), new machine-id and hostname; no VMGenID/VMClock code | crates/nestd/src/host.rs:1778-1780, guest.rs:297-302, crates/nest-guest/src/sys.rs:43-88 |
 | sandbox/drivers/README.md | nestd refuses "either driver" unless `unconfined_driver`; listed snapshot/restore/fork as the driver interface without status | refuses the process driver and Firecracker without `jailer_bin`/`jailer`; trait has create/start/pause/resume/stop/snapshot_memory; no memory restore | crates/nestd/src/config.rs:332-343, crates/nestd/src/driver/mod.rs:37-87, driver/firecracker.rs:332-336 |
 | sandbox/drivers/README.md | gVisor row without status | no gVisor driver | crates/nestd/src/driver/ (firecracker.rs, process.rs only) |
