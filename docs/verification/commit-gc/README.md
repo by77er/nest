@@ -2,6 +2,8 @@
 
 Inventory for modelling: the generation chain in SandboxDO, FleetDO's GC registry and runs, and nestd's chunk upload and mark/sweep. Code is cited at main `edf6829`; design at [sandbox/state](../../sandbox/state/README.md) and [object-store](../../sandbox/state/object-store/README.md).
 
+**Pilot:** [pilot/](pilot/), the Lean 4 proofs over this inventory.
+
 > **Status** (by reading `main`, 2026-11-02): the retention-enums branch in the table below merged as #32: the GC-root registry is written at `create`, a destroyed sandbox is never re-registered, salvage is authorized against SandboxDO's full `epochs` table (B4 fixed), and commit records are pruned by age unless their generation is still in the chain. Generation retention (`isRestoreSource`, `deleting` generations, the placement pin) is built (#85) and modelled in [Retention](#retention) below. B1 and B3 are open.
 
 ## Scope and actors
