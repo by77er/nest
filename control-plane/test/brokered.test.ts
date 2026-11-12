@@ -561,6 +561,23 @@ describe("the secret scan", () => {
   });
 });
 
+describe("the secret scan: tokens nest minted", () => {
+  it("a GitHub installation token nest minted and holds is refused as a credential nest holds, by its exact value", async () => {
+    const r = repo();
+    const s = await setup([{ action: "github.comment", repos: [r] }]);
+    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 3, body: "first" })).status).toBe("ok");
+    const token = [...gh.tokens].find(([, v]) => v.repo === r)?.[0];
+    expect(token).toBeTruthy();
+    const o = await run(s.ws, "github_comment", { repo: r, issue_number: 3, body: `leak ${token}` });
+    expect(o).toMatchObject({ status: "error", error: { code: "forbidden", message: "Not sent: the arguments contain a credential nest holds. Remove it and call again." } });
+    expect(JSON.stringify(o)).not.toContain(token!);
+    expect(gh.comments.get(`${r}#3`)).toHaveLength(1);
+    const j = await journal(s.agent);
+    expect(j[0]).toMatchObject({ status: "refused", detail: expect.stringContaining("the value of minted GitHub token") });
+    expect(JSON.stringify(j)).not.toContain(token!);
+  });
+});
+
 // --- The sink gate ---------------------------------------------------------------------------------------
 
 describe("the sink gate for brokered actions", () => {
