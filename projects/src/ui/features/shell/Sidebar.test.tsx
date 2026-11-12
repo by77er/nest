@@ -98,9 +98,19 @@ describe("the switcher", () => {
     await queryClient.refetchQueries({ queryKey: ["projects"], exact: true });
     await waitFor(() => expect(badges("needs-you-unknown")).toHaveLength(1));
     expect(badges("needs-you")).toHaveLength(0);
+    // The list is kept, so the sidebar says nothing failed (only a first load that failed does).
+    expect(within(sidebar()).queryByText("The projects couldn't be loaded.")).toBeNull();
     // The switcher's list says the same of every project.
     await user.click(switcher());
     expect(await screen.findByRole("option", { name: "Widgets, couldn't check what needs you" })).toBeInTheDocument();
+  });
+
+  it("a projects list that fails its first load says so, on the rows' left edge", async () => {
+    const api = new FakeApi();
+    for (let i = 0; i < 3; i++) api.fail(/^GET \/api\/projects$/, 502, "the Worker is unavailable");
+    renderApp("/admin", api);
+    const note = await within(await screen.findByRole("navigation", { name: "Main" })).findByText("The projects couldn't be loaded.");
+    expect(note.closest("[data-ds=nav-note]")).not.toBeNull();
   });
 
   it("an unknown count (nest unreadable for the asks) is a \"?\" on Board, and said in the list", async () => {

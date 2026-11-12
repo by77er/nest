@@ -130,7 +130,7 @@ export class FakeApi {
     else this.reads.push(url.pathname);
     // Matched with the query too, so a hold can tell `…/attention?local=1` from `…/attention`.
     for (const h of this.holds) if (h.match.test(`${method} ${url.pathname}${url.search}`)) await h.until;
-    const f = this.failures.findIndex((x) => x.match.test(`${method} ${url.pathname}`));
+    const f = this.failures.findIndex((x) => x.match.test(`${method} ${url.pathname}${url.search}`));
     if (f >= 0) {
       const [x] = this.failures.splice(f, 1);
       return json({ error: x!.error }, x!.status);

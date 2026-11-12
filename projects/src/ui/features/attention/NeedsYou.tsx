@@ -141,7 +141,7 @@ function refocus(panel: HTMLElement | null, fallback: HTMLElement | null, prev: 
 function askName(x: Waiting): string {
   if (x.kind !== "ask") return "it";
   const a = approvalOf(x);
-  return a ? `the call to ${a.tool ?? a.name}` : "the question";
+  return a ? `the call to ${a.name}` : "the question";
 }
 
 /** How long the panel waits before saying the asks are still being read (a fast read shows nothing in between). */
@@ -151,7 +151,7 @@ const READING_DELAY_MS = 300;
  * "Needs you" above the board. `after`: the board's heading, where focus goes once the panel has nothing
  * left to hold it (the owner answered the last item), with an announcement in a live region outside it.
  */
-export function NeedsYou({ projectId, after }: { projectId: string; after?: RefObject<HTMLElement | null> }) {
+export function NeedsYou({ projectId, after, shownBeforeAsks = false }: { projectId: string; after?: RefObject<HTMLElement | null>; shownBeforeAsks?: boolean }) {
   const attention = useAttention(projectId);
   const list = useNeedsYouList(projectId);
   // The projects list's count (the sidebar's): when it's more than what's here while the asks are read, the
@@ -173,7 +173,10 @@ export function NeedsYou({ projectId, after }: { projectId: string; after?: RefO
   const whole = list.asks === "read";
   // Something to show: items, a note, the asks unknown (unreadable, or a stale read), or, while they're read,
   // more waiting than the app's own items (the sidebar's count says so) once the read has taken a moment.
-  const reading = list.asks === "reading" && (items.length > 0 || (late && typeof listed === "number" && listed > items.length));
+  // Whether more waits than the app's own items: the sidebar's count says (unknown: maybe); before it's read,
+  // only a page shown ahead of the asks (a cold load past its budget) assumes so.
+  const moreWaits = listed === undefined ? shownBeforeAsks : listed === null || listed > items.length;
+  const reading = list.asks === "reading" && (items.length > 0 || ((late || shownBeforeAsks) && moreWaits));
   const shows = items.length > 0 || note !== null || list.asks === "unavailable" || list.stale || reading;
   // Counted afresh for each project (the same panel shows another's when the route changes).
   useEffect(() => {

@@ -727,6 +727,9 @@ const app = {
     { name: "asks-loading-empty", section: "project", path: "/projects/prj_demo/board", after: asksLoadingEmpty, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
     { name: "asks-failed-empty", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: async (p) => { await asksFail(p, true, true); }, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
     { name: "asks-last-answered", section: "project", path: "/projects/prj_demo/board", full: false, after: asksLastAnswered, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-cold-fast", section: "project", path: "/projects/prj_demo/board", after: (p) => asksCold(p, 600), check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-cold-slow", section: "project", path: "/projects/prj_demo/board", after: (p) => asksCold(p, 3000), check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "projects-refresh-failed", section: "top", path: "/projects", httpErrors: true, after: projectsRefreshFailed, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
     { name: "asks-first-failed", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: asksFirstFail, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
     { name: "asks-failed-later", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: asksFailLater, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
     { name: "asks-answered", section: "project", path: "/projects/prj_demo/board", after: (p) => asksAnswer(p, 200), check: async (p) => p.asksNotes ?? [], checkName: "asks" },
@@ -1057,10 +1060,11 @@ async function asksLoadingEmpty(p) {
     if (!(await panel.locator("[data-asks-reading]").count())) notes.push("loading, none of the app's own: the panel doesn't say the asks are being read");
     if ((await countOf(panel)) !== "?") notes.push(`loading, none of the app's own: the count reads ${await countOf(panel)}, not "?"`);
   }
-  await p.waitForTimeout(2400);
+  // Just before nest answers (4 s from the reload; the board shows at about 1 s).
+  await p.waitForTimeout(1300);
   const y2 = (await tasks.boundingBox())?.y ?? 0;
   if (Math.abs(y2 - y1) > 1) notes.push(`loading, none of the app's own: the board's heading moved ${Math.round(y2 - y1)} px while the asks were read`);
-  await p.waitForTimeout(2500); // the read answers: the asks fill in
+  await p.waitForTimeout(3000); // the read answers: the asks fill in
   p.asksNotes = notes;
 }
 /** The first full read failing (the Worker), the app's own items read: listed, said to be without the asks, not counted. */
@@ -1122,8 +1126,65 @@ async function asksFailLater(p) {
   const notes = [];
   const panel = panelOf(p);
   if (!(await panel.count())) notes.push("failed later: 'Needs you' vanished");
-  else if (!(await panel.locator("[data-stale]").count())) notes.push("failed later: 'Needs you' shows an earlier read without saying so");
+  else {
+    if (!(await panel.locator("[data-stale]").count())) notes.push("failed later: 'Needs you' shows an earlier read without saying so");
+    if ((await countOf(panel)) !== "?") notes.push(`failed later: the panel's count reads ${await countOf(panel)}, not "?" (as the sidebar's)`);
+  }
   if (await sidebarBadges(p, "needs-you").count()) notes.push("failed later: the Board row's count disagrees (it shows a number while the panel's read is stale)");
+  p.asksNotes = notes;
+}
+/**
+ * A cold load (a reload) with nest taking `ms` to answer both "Needs you" and the projects list, none of the app's
+ * own items: the board shows once with the asks (fast), or past its 1 s budget with the panel saying they're
+ * being read (slow); either way the board's heading doesn't move once shown, until nest answers.
+ */
+async function asksCold(p, ms) {
+  const all = fixed("demo", "/projects/prj_demo/attention");
+  const asks = all.filter((x) => x.kind === "ask");
+  const slow = (f) => async (r) => { await new Promise((res) => setTimeout(res, ms)); return f(r); };
+  await p.route((u) => ASKS_RE.test(u.pathname), async (r) => {
+    const u = new URL(r.request().url());
+    if (isLocal(u)) return r.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+    return slow((rr) => rr.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(u.pathname.endsWith("/asks") ? asks : asks) }))(r);
+  });
+  await p.route((u) => u.pathname === "/api/projects", slow((r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ projects: fixed("demo", "/projects").projects.map((x) => ({ ...x, needs_you: x.id === "prj_demo" ? asks.length : x.needs_you })) }) })));
+  const start = Date.now();
+  await p.goto(p.url(), { waitUntil: "domcontentloaded" });
+  const tasks = p.getByRole("heading", { name: "Tasks", exact: true });
+  await tasks.waitFor();
+  const shownAt = Date.now() - start;
+  const y1 = (await tasks.boundingBox())?.y ?? 0;
+  const notes = [];
+  const panel = panelOf(p);
+  if (ms > 1500) {
+    if (!(await panel.count())) notes.push(`cold load, nest ${ms} ms: the board showed without the panel (it will jump when nest answers)`);
+    else if (!(await panel.locator("[data-asks-reading]").count())) notes.push(`cold load, nest ${ms} ms: the panel doesn't say the asks are being read`);
+    // Until nest answers, nothing above the board moves.
+    await p.waitForTimeout(Math.max(0, ms - (Date.now() - start) - 300));
+  } else {
+    if (!(await panel.locator("[data-ask]").count())) notes.push(`cold load, nest ${ms} ms: the board showed before its asks (they're within the budget)`);
+    await p.waitForTimeout(ms + 2500);
+  }
+  const y2 = (await tasks.boundingBox())?.y ?? 0;
+  if (Math.abs(y2 - y1) > 1) notes.push(`cold load, nest ${ms} ms: the board's heading moved ${Math.round(y2 - y1)} px after it showed (at ${shownAt} ms)`);
+  if (ms > 1500) await p.waitForTimeout(2500);
+  p.asksNotes = notes;
+}
+/** The projects list read, then its refresh failing: the cards stay with "?" and a calm stale line; the nav doesn't move or shout. */
+async function projectsRefreshFailed(p) {
+  await p.locator("article [data-marker=needs-you]").first().waitFor();
+  const nav = p.locator('nav[aria-label="Main"]');
+  const firstRow = async () => (await nav.locator("a, button").first().boundingBox())?.y ?? 0;
+  const y1 = await firstRow();
+  await p.route((u) => u.pathname === "/api/projects", (r) => r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "the Worker is unavailable (fixture)" }) }));
+  await p.waitForTimeout(13000); // past a poll (10 s) and its retries
+  const notes = [];
+  if (!(await p.locator("[data-stale]").filter({ hasText: /Couldn't refresh; showing what was read at/ }).count())) notes.push("refresh failed: the projects page doesn't say it shows the last read");
+  if (!(await p.locator("article [data-marker=needs-you-unknown]").count())) notes.push("refresh failed: the demo's count isn't \"?\"");
+  if (await p.locator("article [data-marker=needs-you]").count()) notes.push("refresh failed: a count from the failed refresh's last read is shown as if current");
+  if (await nav.getByText("The projects couldn't be loaded.").count()) notes.push("refresh failed: the sidebar says the projects couldn't be loaded, though the list is shown");
+  const y2 = await firstRow();
+  if (Math.abs(y2 - y1) > 1) notes.push(`refresh failed: the nav's rows moved ${Math.round(y2 - y1)} px`);
   p.asksNotes = notes;
 }
 /** Serves asks and attention without `gone` from the moment `drop()` is called. */

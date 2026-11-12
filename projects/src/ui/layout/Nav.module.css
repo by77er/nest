@@ -83,6 +83,11 @@
   padding-left: calc(2px + var(--mantine-spacing-sm));
 }
 
+/* A line in the nav (a load that failed): on the rows' left edge, like the product's name. */
+.note {
+  padding-left: calc(2px + var(--mantine-spacing-sm));
+}
+
 /* The switcher's list: the option under the keyboard and the current one are quiet too, like the rows. */
 .option {
   border-radius: var(--mantine-radius-md);

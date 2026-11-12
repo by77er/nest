@@ -1,7 +1,7 @@
 // The sidebar's pieces (the nest-ui-design skill's Navigation): one row style for every place, one group
 // spacing, and the switcher's target. A row's active state comes from the router (`aria-current="page"`).
 
-import { Stack } from "@mantine/core";
+import { Stack, Text } from "@mantine/core";
 import { forwardRef, type AnchorHTMLAttributes, type ButtonHTMLAttributes, type ReactNode } from "react";
 import { icon as iconSize } from "../theme";
 import classes from "./Nav.module.css";
@@ -29,6 +29,15 @@ export const NavRow = forwardRef<HTMLAnchorElement, NavRowProps>(function NavRow
 });
 
 /** A group of rows, `xs` apart; groups are `xl` apart (NavGroups). */
+/** A short line among the nav's rows (a load that failed), on their left edge. */
+export function NavNote({ children, tone }: { children: ReactNode; tone?: "danger" }) {
+  return (
+    <Text fz="xs" c={tone} className={classes.note} data-ds="nav-note">
+      {children}
+    </Text>
+  );
+}
+
 export function NavGroup({ children, label }: { children: ReactNode; label: string }) {
   return (
     <Stack gap="xs" role="group" aria-label={label} data-ds="nav-group">

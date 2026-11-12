@@ -9,7 +9,7 @@ export { Glyph, GLYPH, Terminal, TermLine, TermProse, TermRule, TermStatus, type
 export { FieldGroup } from "./FieldGroup";
 export { BadgeAnchor, CardGrid, SectionGrid, WithContext } from "./Layouts";
 export { MetaItem, MetaRow, Token } from "./Meta";
-export { NavGroup, NavGroups, NavRow, SwitcherTarget } from "./Nav";
+export { NavGroup, NavGroups, NavNote, NavRow, SwitcherTarget } from "./Nav";
 export { Switcher, type SwitcherItem } from "./Switcher";
 export { Notice, type NoticeTone } from "./Notice";
 export { Measure, Page, PageHeader } from "./Page";

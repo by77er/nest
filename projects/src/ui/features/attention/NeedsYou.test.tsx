@@ -39,7 +39,7 @@ describe("asks", () => {
 
   it("one answered elsewhere meanwhile (refused as no longer open) leaves at once: the asks are read again", async () => {
     const api = new FakeApi();
-    const a = ask({ approval: { name: "brokered", tool: "WebFetch" } });
+    const a = ask({ approval: { name: "github.create_pr", tool: "brokered" } });
     api.asks = [a];
     const { user } = renderApp("/projects/prj_one/board", api);
     const p = await panel();
@@ -49,7 +49,7 @@ describe("asks", () => {
     await user.click(within(p).getByRole("button", { name: "Approve" }));
     // Well before the next poll (5 s); said in the panel, calmly, not as a failure.
     await waitFor(() => expect(p.querySelector("[data-ask]")).toBeNull(), { timeout: 1_500 });
-    expect(p.querySelector("[data-note]")).toHaveTextContent("Already answered: the call to WebFetch was answered elsewhere, or its agent ended.");
+    expect(p.querySelector("[data-note]")).toHaveTextContent("Already answered: the call to github.create_pr was answered elsewhere, or its agent ended.");
     expect(screen.queryByText("The answer wasn't sent")).toBeNull();
     expect(within(p).getByRole("heading", { name: "Needs you" })).toHaveFocus();
     // Nothing waits now: no warning, no count, only the note; at the next poll the panel goes, focus to the board.
@@ -59,8 +59,8 @@ describe("asks", () => {
 
   it("the note goes when focus moves on from where the answer left it", async () => {
     const api = new FakeApi();
-    const a = ask({ approval: { name: "brokered", tool: "WebFetch" }, at_ms: Date.now() - 2_000 });
-    const b = ask({ approval: { name: "brokered", tool: "WebSearch" }, at_ms: Date.now() - 1_000 });
+    const a = ask({ approval: { name: "github.create_pr", tool: "brokered" }, at_ms: Date.now() - 2_000 });
+    const b = ask({ approval: { name: "github.merge_pr", tool: "brokered" }, at_ms: Date.now() - 1_000 });
     api.asks = [a, b];
     const { user } = renderApp("/projects/prj_one/board", api);
     const p = await panel();
@@ -81,7 +81,7 @@ describe("asks", () => {
 
   it("the last item's note goes at the next poll, and focus goes on to the board's heading", async () => {
     const api = new FakeApi();
-    const a = ask({ approval: { name: "brokered", tool: "WebFetch" } });
+    const a = ask({ approval: { name: "github.create_pr", tool: "brokered" } });
     api.asks = [a];
     const { user, queryClient } = renderApp("/projects/prj_one/board", api);
     const p = await panel();
@@ -120,8 +120,8 @@ describe("asks", () => {
 
   it("answering one moves focus to the next item, never to the page", async () => {
     const api = new FakeApi();
-    const first = ask({ approval: { name: "brokered", tool: "WebFetch" }, at_ms: Date.now() - 2_000 });
-    const second = ask({ approval: { name: "brokered", tool: "WebSearch" }, at_ms: Date.now() - 1_000 });
+    const first = ask({ approval: { name: "github.create_pr", tool: "brokered" }, at_ms: Date.now() - 2_000 });
+    const second = ask({ approval: { name: "github.merge_pr", tool: "brokered" }, at_ms: Date.now() - 1_000 });
     api.asks = [first, second];
     const { user } = renderApp("/projects/prj_one/board", api);
     const p = await panel();
@@ -134,7 +134,7 @@ describe("asks", () => {
 
   it("an answer that fails keeps focus on its button, which stays focusable while the answer is out", async () => {
     const api = new FakeApi();
-    const a = ask({ approval: { name: "brokered", tool: "WebFetch" } });
+    const a = ask({ approval: { name: "github.create_pr", tool: "brokered" } });
     api.asks = [a];
     let release!: () => void;
     api.holds.push({ match: /\/answer$/, until: new Promise((r) => (release = () => r(undefined))) });
@@ -166,6 +166,7 @@ describe("asks", () => {
     api.holds.push({ match: /^GET \/api\/projects\/prj_one\/attention$/, until: new Promise((r) => (release = () => r(undefined))) });
     renderApp("/projects/prj_one/board", api);
     const p = await panel();
+    await waitFor(() => expect(p).toHaveTextContent("Pick a region"));
     expect(p).toHaveTextContent("Pick a region");
     expect(p).not.toHaveTextContent("Later?");
     // Said to be partial, and not counted as if it were all.
@@ -182,6 +183,7 @@ describe("asks", () => {
     api.asks = [ask({ question: "Hidden?" })];
     api.tasks = [task({ title: "Pick a region", blocked: { at_ms: Date.now() - 1_000, by: "agt_w1", role: "worker", reason: "which region?", question: null, tainted: false } })];
     api.fail(/^GET \/api\/projects\/prj_one\/attention$/, 500, "the Worker is unavailable");
+    api.fail(/^GET \/api\/projects\/prj_one\/attention$/, 500, "the Worker is unavailable");
     renderApp("/projects/prj_one/board", api);
     const p = await panel();
     await waitFor(() => expect(p).toHaveTextContent("The agents' asks couldn't be read"));
@@ -192,7 +194,7 @@ describe("asks", () => {
 
   it("the 'Already answered' note goes once a read after the one that dropped the ask has come", async () => {
     const api = new FakeApi();
-    const a = ask({ approval: { name: "brokered", tool: "WebFetch" } });
+    const a = ask({ approval: { name: "github.create_pr", tool: "brokered" } });
     const b = ask({ question: "Still open?" });
     api.asks = [a, b];
     const { user, queryClient } = renderApp("/projects/prj_one/board", api);
@@ -205,6 +207,40 @@ describe("asks", () => {
     // The next poll: the note has done its job.
     await queryClient.refetchQueries({ queryKey: ["projects", "prj_one", "attention"], exact: true });
     await waitFor(() => expect(p.querySelector("[data-note]")).toBeNull());
+  });
+
+  it("a cold load holds the board until the asks are in, then shows both at once", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Which branch?" })];
+    let release!: () => void;
+    api.holds.push({ match: /^GET \/api\/projects\/prj_one\/attention$/, until: new Promise((r) => (release = () => r(undefined))) });
+    renderApp("/projects/prj_one/board", api);
+    // The tasks are in; the asks aren't (and the budget isn't spent): still one loading state, no board.
+    await waitFor(() => expect(api.reads).toContain("/api/projects/prj_one/tasks"));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(screen.getByRole("status", { name: "Loading the board" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "Tasks" })).toBeNull();
+    release();
+    // The board shows with its asks already listed: nothing above it grows afterwards.
+    await screen.findByRole("heading", { name: "Tasks" });
+    expect(await panel()).toHaveTextContent("Which branch?");
+  });
+
+  it("a cold load past its budget shows the board with the panel saying the asks are being read, never the board alone", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Which branch?" })];
+    let release!: () => void;
+    // The projects list (the sidebar's count) waits on nest too: unknown when the board shows.
+    api.holds.push({ match: /^GET \/api\/projects\/prj_one\/attention$|^GET \/api\/projects$/, until: new Promise((r) => (release = () => r(undefined))) });
+    renderApp("/projects/prj_one/board", api);
+    const tasks = await screen.findByRole("heading", { name: "Tasks" }, { timeout: 3_000 });
+    // At the moment the board shows, the panel is above it already.
+    const p = screen.getByRole("region", { name: "Needs you" });
+    expect(p.compareDocumentPosition(tasks) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(p).toHaveTextContent("Reading the agents' asks…");
+    expect(within(p).getByLabelText("An unknown number of items")).toHaveTextContent("?");
+    release();
+    await waitFor(() => expect(p).toHaveTextContent("Which branch?"));
   });
 
   it("a poll that fails after a good read says it shows that read", async () => {

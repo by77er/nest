@@ -7,7 +7,7 @@ import { IconBrandGithub, IconFolders, IconPlus } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { useProjects } from "../../api/queries";
 import { AnchorLink, BadgeLink } from "../../common/links";
-import { ago, exact } from "../../common/time";
+import { ago, clock, exact } from "../../common/time";
 import { CardGrid, EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Page, PageHeader, Panel, Row, Stack, weight } from "../../layout";
 import { CreateProjectForm } from "./CreateProjectForm";
 import { unknownIfStale } from "../shell/attention";
@@ -28,6 +28,12 @@ export function ProjectsPage() {
         }
       />
 
+      {/* A refresh that failed after a good read: the cards are that read, said so (their counts "?"). */}
+      {projects.isRefetchError && (
+        <Text fz="sm" c="dimmed" data-stale title={exact(projects.dataUpdatedAt)}>
+          Couldn't refresh; showing what was read at {clock(projects.dataUpdatedAt)}. Trying again.
+        </Text>
+      )}
       {projects.isPending ? (
         <LoadingState label="Loading projects" />
       ) : projects.isError && projects.data === undefined ? (

@@ -39,6 +39,8 @@ describe("projects", () => {
     const badge = await screen.findByRole("link", { name: /Couldn't check what needs you/ });
     expect(badge).toHaveTextContent(/^\?$/);
     expect(screen.queryByRole("link", { name: /1 thing needs you/ })).toBeNull();
+    // Said once, calmly: these cards are the last good read.
+    expect(screen.getByText(/Couldn't refresh; showing what was read at \d/)).toBeInTheDocument();
   });
 
   it("a project's \"needs you\" goes to its Board, where asks are answered; the project opens on its Manager", async () => {
