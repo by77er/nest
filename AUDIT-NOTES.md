@@ -3,6 +3,8 @@
 ## Corrections
 | doc | said | code says | evidence |
 |---|---|---|---|
+| sandbox/networking/egress/tls/README.md | fixed-shape CSR (exact subject, no attributes) refused otherwise; FleetDO sets every field incl. subject; key usage `keyCertSign`, EKU `serverAuth` | `signIntermediate` only parses and verifies the CSR, copies its subject and key; sets validity (`PROXY_CA_TTL_MS`, 7 d), pathLen 0, key usage keyCertSign+cRLSign; no EKU | control-plane/src/lib/ca.ts:85-121, do/fleet.ts:847 |
+| sandbox/networking/egress/tls/README.md | shared-proxy fairness bounds (256/64 handshakes, 4 at once/32 per s signing, LRU, 403 leaves uncached) stated as built | only `HELLO_TIMEOUT` 10 s and `LEAF_CACHE_MAX` 4096 (HashMap; expired then all dropped when full; 403 leaves cached via the same `server_config`) | crates/nest-proxy/src/tls.rs:24-28,64-102, http.rs:41,170-173 |
 | sandbox/networking/egress/README.md | pipeline: "re-check policy" after guards; open connections re-checked on every policy version and closed once denied | built: each request is decided against the current policy before injection; the final re-check and closing denied connections are designed | crates/nest-proxy/src/http.rs:390-460 (policy doc audit) |
 | sandbox/state/README.md | chunks 4 MB / 2 MB; reflink cut "built, not deployed"; components omit the shadow cut | `DISK_CHUNK = 4 << 20`, `MEMORY_CHUNK = 2 << 20`; M2 built ("deploys on merge" in disk/), M3′ shadow cut merged (#159) and picked by `disk_cut: auto` | crates/nestd/src/storage.rs:21-23, config.rs:114-129 |
 | sandbox/networking/egress/steering/README.md | kernel backstop: nestd installs a root-namespace `meta skuid` reject rule for nest-proxy (as built) | not built: no such rule in nestd or deploy/ | grep -rn "skuid" crates/ deploy/ (none); crates/nestd/src/net.rs:204-230 is the only ruleset |
@@ -54,6 +56,7 @@
 - compute/brain-hosts (cells.ts:16-33 idle 1_800_000 and max_hosts 3; placement.ts:101,108-111 2 per vCPU; control.ts:13-15 5 s/20 s/30 s; nest-runner config.rs:59 120 s; agent.ts:84,327 30 s→5 min; Stack.lean:99 t3a/t3.medium). Prices already marked unverified.
 
 ## Docs done
+- sandbox/networking/egress/tls (confirmed: root CN and 10 y fleet.ts:274,827; KMS ECDSA_SHA_256 kms.ts:28; root in image + NODE_EXTRA_CA_CERTS images/guest/build.sh:86-91; leaves P-256 ≤24 h capped by intermediate tls.rs:24,77,79)
 - sandbox/state/README (confirmed: DISK_CHUNK 4 MiB/MEMORY_CHUNK 2 MiB storage.rs:21-23; chunks/ manifests/ keys gc.rs:82-94; 12 h REUSE_MS s3.rs:54; TURN_CHECKPOINT 10 s/5 min sandbox.ts:224,230; retention retention.ts:16-45, sandbox.ts:244-259)
 - compute/provisioning (23 h resume grace credentials.rs:22-23; IMDSv2 hop 1 Stack.lean:518; 7844 Stack.lean:114-115,426-428; lifecycle policy Stack.lean:532-548; SandboxTypesOnly/ArnEqualsIfExists Stack.lean:347-370; cloudflared pin install.sh:17,81-87; Claude pin install.sh:13,74-79)
 - compute/autoscaling (numbers confirmed: placement.ts:155-160 backoff 60 s→15 min/5 min brain, 30 min decay; enroll-breaker.ts:8-11 3, 30 min, 6 h; fleet.ts:197 1 min image cache, :264 brain waits 12 min; cells.ts:44-48 idle 10 min, enroll 10 min, :28-31 brain 3 hosts, 30 min; host.rs:1473 spot poll 5 s)
