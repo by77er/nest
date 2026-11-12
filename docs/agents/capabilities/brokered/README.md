@@ -30,7 +30,7 @@ Per call, in AgentDO, in this order ([taint and sinks](../../tools/#taint-and-si
 
 1. **Grant:** a grant of that action covering the repo (or the profile, its method and path). None: `forbidden`. Several covering grants (from several capabilities) are separate: the call is allowed when tainted if any allows it, and gets the highest cap.
 2. **Hourly cap:** per agent and action, counted from the journal (refused calls don't count): `rate_limited`, retryable, with when a slot frees.
-3. **Secret scan:** every string in the arguments (keys too) is checked for credential shapes (GitHub, Anthropic, AWS, Slack and Stripe prefixes, PEM private keys) and against every BrokerDO secret's value, its base64, any long string inside a JSON value and a PEM's body lines (`BrokerDO.scanSecrets`, which answers names only). A hit is refused (`forbidden`, "the arguments contain …" with the kind, never the value or which secret), journaled as `refused` with what matched and without the arguments, and never reaches the approval question. **Why before the gate:** the operator's question shows the arguments.
+3. **Stored-value scan:** every string in the arguments (keys too) is checked against every BrokerDO secret's exact value, its base64, any long string inside a JSON value and a PEM's body lines (`BrokerDO.scanSecrets`, which answers names only). A hit is refused (`forbidden`, "the arguments contain a credential nest holds", never the value or which secret), journaled as `refused` with which secret matched and without the arguments, and never reaches the approval question. **Why before the gate:** the operator's question shows the arguments. **No credential shapes (decided 2026-11-12):** nothing looks for other services' token formats; the owner: "I don't think that the secret detectors are really something that we need specifically. It would probably be good to trace any of these outbound invocations and network accesses, but I wouldn't bake into any assumptions right now." A shape list names services the kernel shouldn't know (principle 10), and it catches only the shapes it lists.
 4. **Sink gate:** the [one gate](../../tools/#taint-and-sinks) every sink uses. GitHub writes are sinks; a profile is a sink unless its methods are only `GET` and `HEAD`. `github.fork` waits for the operator from any session, tainted or not.
 5. **Current external state:** a pull request: an open one from the same head to the same base is returned (`existing: true`) instead of a second. A redelivered call (an AgentDO eviction mid-call): GitHub is read for what that very call posted, by its marker.
 6. **Run:** the epoch is checked and the journal row written `sending` in the same synchronous step as the request leaves.
@@ -70,7 +70,7 @@ AgentDO's `brokered_journal`, one row per call key: action, target (repo or prof
 
 ## Not built
 
-`email.send` (no provider), `github.review_check`, `github.dispatch_workflow`, `github.create_webhook`, the `api` source, a secret scan of mcp tool arguments, and a per-server or global cap (the cap is per agent).
+`email.send` (no provider), `github.review_check`, `github.dispatch_workflow`, `github.create_webhook`, the `api` source, and a per-server or global cap (the cap is per agent). Mcp tool arguments get no secret scan, by decision: no shape detection (the pipeline's step 3).
 
 ## Open questions
 

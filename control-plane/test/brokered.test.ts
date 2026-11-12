@@ -7,7 +7,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { secretNeedles } from "../src/do/broker";
-import { authorize, grantOfEntry, keyDigest, pathCovered, safePath, secretKinds, stringsOf } from "../src/lib/brokered";
+import { authorize, grantOfEntry, keyDigest, pathCovered, safePath } from "../src/lib/brokered";
 import { appJwt, GitHubApi, importAppKey, pkcs1ToPkcs8 } from "../src/lib/github";
 import { CallLedger } from "../src/lib/calls";
 import { b64url, b64urlToBytes, bytesToB64 } from "../src/lib/util";
@@ -359,12 +359,7 @@ describe("authority and the scan (pure)", () => {
     expect(safePath("/a/./b")).toBe(false);
   });
 
-  it("the scan finds credential shapes in any string (keys too), and a stored value raw, base64'd, inside JSON, or as a PEM's body", () => {
-    const token = `ghp_${"a1".repeat(18)}`;
-    expect(secretKinds(stringsOf({ body: `here: ${token}` }))).toEqual(["a GitHub token"]);
-    expect(secretKinds(stringsOf({ [`AKIA${"A".repeat(16)}`]: 1 }))).toEqual(["an AWS access key id"]);
-    expect(secretKinds(stringsOf({ x: ["-----BEGIN RSA PRIVATE KEY-----"] }))).toEqual(["a private key"]);
-    expect(secretKinds(stringsOf({ body: "ghp_short, sk-ant-, an ordinary comment" }))).toEqual([]);
+  it("the scan looks for a stored value raw, base64'd, inside JSON, or as a PEM's body", () => {
     const n = secretNeedles(JSON.stringify({ client_id: "short", client_secret: "aaaaaaaaaaaaaaaa-secret" }));
     expect(n).toContain("aaaaaaaaaaaaaaaa-secret");
     expect(n).not.toContain("short");
@@ -533,7 +528,9 @@ describe("github actions", () => {
   it("an action is capped per hour; refused calls don't count", async () => {
     const r = repo();
     const s = await setup([{ action: "github.comment", repos: [r], per_hour: 2 }]);
-    await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: `ghp_${"x".repeat(36)}` }); // refused by the scan
+    const stored = `s3cr3t-${rand()}-value`;
+    await adminJson(`/v1/admin/secrets/http:cap${s.id}`, { method: "PUT", body: { value: stored } });
+    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: stored })).status).toBe("error"); // refused by the scan
     expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "1" })).status).toBe("ok");
     expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "2" })).status).toBe("ok");
     expect(await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "3" })).toMatchObject({ status: "error", error: { code: "rate_limited", retryable: true } });
@@ -544,24 +541,22 @@ describe("github actions", () => {
 // --- The secret scan -------------------------------------------------------------------------------------
 
 describe("the secret scan", () => {
-  it("arguments holding a credential shape or any stored secret's value are refused before anything is asked or sent, without the value in the error; the journal names what matched", async () => {
+  it("arguments holding any stored secret's value are refused before anything is asked or sent, without the value in the error; the journal names which secret", async () => {
     const r = repo();
     const s = await setup([{ action: "github.comment" }]); // unscoped: a tainted call would be asked
     await taint(s.agent);
     const stored = `s3cr3t-${rand()}-value`;
     await adminJson(`/v1/admin/secrets/http:leak${s.id}`, { method: "PUT", body: { value: stored } });
-    const pat = `ghp_${"Ab1".repeat(12)}`;
-    for (const body of [`token ${pat}`, `look: ${stored}`, `b64 ${btoa(stored)}`]) {
+    for (const body of [`look: ${stored}`, `b64 ${btoa(stored)}`]) {
       const o = await run(s.ws, "github_comment", { repo: r, issue_number: 2, body });
-      expect(o).toMatchObject({ status: "error", error: { code: "forbidden", message: expect.stringContaining("Not sent: the arguments contain") } });
+      expect(o).toMatchObject({ status: "error", error: { code: "forbidden", message: "Not sent: the arguments contain a credential nest holds. Remove it and call again." } });
       expect(JSON.stringify(o)).not.toContain(stored);
-      expect(JSON.stringify(o)).not.toContain(pat);
     }
     expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toEqual([]); // the operator was never asked to approve a leak
     expect(gh.writes.some((w) => w.path.includes(r))).toBe(false);
     const j = await journal(s.agent);
-    expect(j.map((e: any) => e.status)).toEqual(["refused", "refused", "refused"]);
-    expect(j.map((e: any) => e.detail)).toEqual([`the value of http:leak${s.id}`, `the value of http:leak${s.id}`, "a GitHub token"]);
+    expect(j.map((e: any) => e.status)).toEqual(["refused", "refused"]);
+    expect(j.map((e: any) => e.detail)).toEqual([`the value of http:leak${s.id}`, `the value of http:leak${s.id}`]);
     expect(JSON.stringify(j)).not.toContain(stored);
   });
 });
@@ -686,6 +681,17 @@ describe("http.request profiles", () => {
       expect(await run(p.ws, "http_request", { profile: "p", method, path }), `${method} ${path}`).toMatchObject({ status: "error", error: { code: expect.stringMatching(/forbidden|invalid_message/) } });
     }
     expect(p.stub.requests).toHaveLength(2);
+  });
+
+  it("no credential shapes are looked for: a call carrying strings shaped like other services' tokens and keys goes out, unrefused", async () => {
+    const p = await profileSetup();
+    // Built at run time: shaped like a GitHub token, an AWS access key id and a PEM private key's armour, none of them stored in nest.
+    const shaped = [`ghp_${"Ab1".repeat(12)}`, `AKIA${"Q".repeat(16)}`, ["-----BEGIN", "PRIVATE", "KEY-----"].join(" ")];
+    const o = await run(p.ws, "http_request", { profile: "p", method: "POST", path: "/v1/items", body: JSON.stringify({ note: shaped.join(" ") }) });
+    expect(o, JSON.stringify(o)).toMatchObject({ status: "ok" });
+    expect(p.stub.requests).toHaveLength(1);
+    for (const x of shaped) expect(p.stub.requests[0]!.body).toContain(x);
+    expect((await journal(p.agent)).map((e: any) => e.status)).toEqual(["done"]);
   });
 
   it("an http request settled by another delivery just before it would leave isn't sent", async () => {

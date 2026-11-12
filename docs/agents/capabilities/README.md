@@ -45,7 +45,7 @@ mcp: {url: https://mcp.example.com/mcp, auth: cap:tracker, tools: [list_issues, 
 prompt: The issue tracker: read freely; comment only when asked.
 ```
 
-- **Same pipeline as brokered actions:** every call checks the grant and taint, rate-limits, scans arguments for secrets, gets approval if it's a sink from a tainted session, and is journaled.
+- **Same pipeline as brokered actions:** every call checks the grant and taint, rate-limits, refuses arguments holding a stored secret's exact value (no credential shapes), gets approval if it's a sink from a tainted session, and is journaled.
 - **Results are untrusted:** every result from an `mcp` or `api` tool sets [taint](../tools/#taint-and-sinks), like web results, unless the operator marks the capability `trusted: true`. An untrusted `mcp` server's tool list taints too: its descriptions reach the model ([mcp/](mcp/#taint)).
 - **`ro` means no state changes, not no leaks:** requests go only to the configured base URL and path prefixes, so data can reach only that API's operator.
 - **Attenuation:** a spawner can pass on a narrower version of a capability (fewer tools, `ro` instead of `rw`, fewer paths), never a wider one.
