@@ -3,15 +3,24 @@
 Base: origin/main 6bbf64f.
 
 ## Suspected code bugs (doc left unchanged)
+- security/README L13 and L20, credentials L27, egress README L25, steering "Kernel backstop": "kernel rule on [nest-proxy's] uid" blocking IMDS and non-public addresses. No such rule exists: no `skuid` anywhere in crates/ or deploy/; nestd's nft ruleset (crates/nestd/src/net.rs:96-110) is the sandbox tap/netns one. And nest-proxy runs as root (deploy/host/install.sh:90-104: no `User=`), so a uid rule couldn't single it out from nestd. Only the proxy's own check remains (crates/nest-proxy/src/http.rs:859).
 - credentials L9 "Pushed with the policy hash": no policy hash on a secrets push. `InjectionSecret` is `{binding, value, expires_ms}` (crates/nest-protocol/src/model.rs:352-357); nestd forwards `SecretsUpdate` without one (crates/nestd/src/host.rs:1581-1584).
 - credentials L9 "the proxy refuses one whose binding isn't in the installed policy": the proxy stores every pushed secret (crates/nest-proxy/src/control.rs:169-177, state.rs:312-315); one with no binding just goes unused (inject.rs:52,62). No refusal.
 - credentials L9 "Every push and refusal is audited": operator static secret pushes (`inject:<binding>[:<scope>]`, broker.ts:289-303) have no audit record; only GitHub mints (broker.ts:443,946) and API clients' secrets (broker.ts:717) are audited; no refusal exists to audit.
 
 ## Corrections
+- security/README L9: gVisor has no driver (crates/nestd/src/driver/: access, firecracker, process, supervise, tree) -> "gVisor, not built".
+- security/README L15: control-plane role has `kms:Sign` and `kms:GetPublicKey` on the root key (deploy/lean/Cell/Stack.lean:380); credentials L28 already says so.
 - security/README L22: "audited by BrokerDO (not built)" -> partly built: GitHub mints/refusals (broker.ts:389-443, 875, 946, 1044), API clients' injected secrets (broker.ts:717), MCP OAuth (broker.ts:200, lib/mcp-auth.ts). Not built: operator secret pushes, binding mints (broker.ts:1163-1174 no audit).
 - credentials L8: push token also gets `workflows: write` when asked (broker.ts:332-336).
 - credentials L12: intermediate CA key also in nestd's root-only `<state_dir>/host-credentials.json` (crates/nestd/src/credentials.rs:5-6,109-113; docs/compute/provisioning/ L49).
 - credentials L14: host token also persisted by nestd in that file, rewritten on rotation (credentials.rs:1-9,99-104).
+
+## Confirmed (security/README)
+- L11 brain: `--tools` lists no Bash/Read/Write/Edit (crates/nest-protocol/src/host.rs:1000,1351), `--restricted` (host.rs:999), env cleared (crates/nest-runner/src/agent.rs:250); host allowlist marked not built on main.
+- L13 gateway as nest-gw, empty CapabilityBoundingSet, IPAddressAllow=localhost (deploy/host/install.sh:59-72,136-178); cloudflared as nest-cf (install.sh:55-56).
+- L13/L14 S3: sandbox whole cell (Stack.lean:330-335), brain releases/* (Stack.lean:318-320).
+- L15 control plane EC2 scoped (Stack.lean:357-377).
 
 ## Confirmed (credentials L5-16)
 - L5 setup token `claude_oauth_token[:<name>]` (protocol/control.ts:199-207), templates worker/captain (lib/spec.ts:221,230), FleetDO refuses agent_start to a non-brain host (fleet.ts:1596-1598).
