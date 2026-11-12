@@ -5,7 +5,8 @@
 A sandbox's state is a chain of immutable generations. Each generation is a manifest of content-addressed chunks.
 
 ```
-gen    { id, parent, epoch, disk_manifest, mem_manifest?, restore_abi?, session: {offset, last_tool_use}?, kind: disk-only | checkpoint, reason, state: ready | deleting, at }
+gen    { id, sandbox, parent?, epoch, kind: disk_only | checkpoint, disk_manifest, mem_manifest?, reason, created_ms, cut_ms? }   SandboxDO's row adds state: ready | deleting
+       designed, not built: restore_abi?, session: {offset, last_tool_use}?
 chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
 ```
 
@@ -13,7 +14,7 @@ chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
 - **Manifests are content-addressed in S3.** SandboxDO stores only `head = manifest hash`.
 - **Commit:** flush the guest ([disk](disk/#flush-before-commit)), read the disk while nothing writes it, upload and verify the chunks, upload the manifest, then `commit(epoch, parent, hash)` as a compare-and-set in the DO. How the read is cut and what it skips is [disk](disk/)'s.
 - **Verified before commit:** every chunk a generation adds over its parent must have been uploaded less than 12 h before the commit, by this commit's PUT or as a HEAD shows, with the manifest's length; anything older is uploaded again ([GC](object-store/#garbage-collection)). The rule is applied to every non-zero chunk of the file, not only to those that differ from the parent (`storage.rs` `scan_file` and `publish`, `s3.rs` `recent`), so a commit never relies on its parent still being a GC root: retention may have dropped it (a salvage's parent may even be pruned). A committed generation is therefore `ready`: every chunk is present.
-- **`reason`:** `turn_end`, `periodic`, `pressure`, `pause`, `suspend`, `drain`, `spot`, `fork` or `salvage`. Retention and rollback notices read it.
+- **`reason`:** `turn_end`, `timer`, `dirty_threshold`, `suspend`, `drain`, `spot_notice`, `checkpoint`, `fork`, `salvage` or `archive`. Retention reads it, and so will rollback notices.
 - **`deleting` is one-way.** A generation is marked `deleting` before any of its bytes can go, and never returns to `ready`, because a previous pass may already have removed some of them.
 - **A manifest is self-contained.** It lists every chunk of its file (`null` for an all-zero one), not a delta over its parent, and a restore reads only that manifest (`storage.rs` `scan_file`, `restore_file`). So a kept generation never needs its parent: retention can drop a parent and keep the child.
 
@@ -67,7 +68,7 @@ A memory snapshot is valid **only when it belongs to the head generation**. Rest
 - **Head is a checkpoint:** do a memory restore (the fast path) on a host that loads its [restore ABI](memory/#restore-abi).
 - **Head is disk-only** (after a crash): cold-boot with the newest disk and run `--resume`. Running processes are lost; at most 60 s of file changes are lost.
 - **Head is a checkpoint no host can load** (its ABI is gone, or its memory restore failed): cold-boot the same generation's disk. Files are intact; process state is lost.
-- **Rollback notice:** each generation records the session position it covers (`session`). After a disk-only restore, the agent's recovery context says the workspace went back to that point, which tool calls after it may be undone, and whether process state was lost, so the model checks (e.g. `git status`) instead of trusting its transcript.
+- **Rollback notice** (designed, not built): each generation records the session position it covers (`session`). After a disk-only restore, the agent's recovery context says the workspace went back to that point, which tool calls after it may be undone, and whether process state was lost, so the model checks (e.g. `git status`) instead of trusting its transcript.
 
 ## Retention
 
@@ -102,13 +103,15 @@ SandboxDO runs retention from its alarm, in the same single writer that admits f
 
 **Built:** the notice suspends every running sandbox, in no order ([autoscaling](../../compute/autoscaling/)). **Designed, not built:** the order below.
 
-1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then reflink-cut every disk in a brief pause each ([disk](disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot`).
+1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then reflink-cut every disk in a brief pause each ([disk](disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot_notice`).
 2. Then, in order of recent activity: pause, write a full memory snapshot to NVMe (`sync_snapshot_files=false`), upload with zstd compression, commit.
 3. Anything that doesn't finish falls back to its disk-only generation, and the loss is recorded.
 
-A **rebalance recommendation** can arrive with the notice rather than before it, so it's polled every 5 s and means: stop placing on the host and flush idle sandboxes, not a full drain ([AWS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/rebalance-recommendations.html)).
+A **rebalance recommendation** (designed, not built: nestd polls only `spot/instance-action`) can arrive with the notice rather than before it, so it's to be polled every 5 s and mean: stop placing on the host and flush idle sandboxes, not a full drain ([AWS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/rebalance-recommendations.html)).
 
 ## Volumes
+
+**Designed, not built:** a sandbox has one disk, committed whole.
 
 - **Durable:** `/workspace` and `$HOME`.
 - **Local only, never written back:** `/scratch`, package caches, build output. This removes most of the write churn.
