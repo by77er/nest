@@ -89,3 +89,40 @@ describe("the repo's own guidance (README.md#the-repos-own-guidance)", () => {
     for (const t of Object.values(cat.templates)) expect(prompt(t)).not.toContain("acme/app");
   });
 });
+
+describe("web access (README.md#web-access)", () => {
+  type Rule = { pattern: string; decision: string };
+  // nest's runner (crates/nest-runner/src/rules.rs): `Tool` or `Tool(glob)`, `*` any run; first match wins, none ⇒ ask.
+  const glob = (p: string, t: string) => new RegExp(`^${p.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`).test(t);
+  const decide = (rules: readonly Rule[], tool: string, subject: string) => {
+    for (const r of rules) {
+      const m = /^([^(]*)\((.*)\)$/.exec(r.pattern);
+      if (m ? glob(m[1]!, tool) && glob(m[2]!, subject) : glob(r.pattern, tool)) return r.decision;
+    }
+    return "ask";
+  };
+  // nest joins a spec's rules from its capabilities in order (control-plane/src/lib/spec.ts); the operator's
+  // (`nest`, `hands`, …) aren't this catalog's and allow no web tool, so only the app's are joined here.
+  const rulesOf = (t: { capabilities: string[] }) =>
+    t.capabilities.flatMap((c) => ((cat.capabilities[c] as { rules?: Rule[] } | undefined)?.rules ?? []));
+  const calls = [["WebSearch", "nest durable agents"], ["WebFetch", "https://docs.example.org/a/b?q=1"], ["WebFetch", "http://203.0.113.7:8080/x"]] as const;
+  type Tpl = ReturnType<typeof tpl>;
+  const roles: [string, Tpl][] = [
+    ...["manager", "worker", "reviewer", "routine"].map((r): [string, Tpl] => [r, tpl(r)]),
+    // A project's own templates on its models (README.md#models) name the same capabilities.
+    ...(["manager", "worker"] as const).map((r): [string, Tpl] => [`${r} on its model`, roleTemplate(r, "prj_abc123", "Acme/App", "claude-opus-5-5").body as Tpl]),
+  ];
+
+  it("every role with hands launches WebSearch and WebFetch, and its capabilities allow them on any URL without asking", () => {
+    for (const [role, t] of roles) {
+      expect(t.launch.builtin_tools, role).toEqual(expect.arrayContaining(["WebSearch", "WebFetch"]));
+      for (const [tool, subject] of calls) expect(decide(rulesOf(t), tool, subject), `${role}: ${tool} ${subject}`).toBe("allow");
+    }
+  });
+
+  it("the synced capabilities carry the rules nest reads: an allow for each web tool, nothing else", () => {
+    for (const c of ["board", "task", "review", "routine"]) {
+      expect((cat.capabilities[`${NAMESPACE}/${c}`] as { rules: Rule[] }).rules, c).toEqual([{ pattern: "WebSearch", decision: "allow" }, { pattern: "WebFetch", decision: "allow" }]);
+    }
+  });
+});

@@ -1,4 +1,4 @@
-// The app's catalog in nest (README.md#how-it-uses-nest): three role templates and three MCP
+// The app's catalog in nest (README.md#how-it-uses-nest): the role templates and the MCP
 // capabilities in the client's namespace, written with `PUT /v1/catalog/{templates,capabilities}/…`.
 // Data only: the shapes are nest's Template and Capability (control-plane/src/lib/spec.ts), read there
 // and written here, never imported. A sync writes every entry whole, so running it twice leaves nest
@@ -15,8 +15,17 @@ export const NAMESPACE = "projects";
 /** The model credential every role runs on (in the grant's `credentials`). */
 const CREDENTIAL = "claude_oauth_token";
 
+/** Claude Code's web built-ins, which every role with hands launches (README.md#web-access). */
+const WEB_TOOLS = ["WebSearch", "WebFetch"] as const;
 /** Claude Code's built-in tools for every role: its own task list and the web, as nest's worker gets. */
-const BUILTIN_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"];
+const BUILTIN_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", ...WEB_TOOLS];
+/**
+ * The owner's decision (2026-11-11, README.md#web-access): the web tools run on any URL without asking.
+ * nest's runner asks for a call no rule matches, and a template has no rules, so they come through the
+ * role capabilities every role template lists (nest joins its capabilities' rules, first match wins).
+ * No specifier: `WebFetch` alone matches every URL.
+ */
+export const WEB_RULES: readonly { pattern: string; decision: "allow" }[] = WEB_TOOLS.map((t) => ({ pattern: t, decision: "allow" }));
 /**
  * A worker may also run Claude Code's own subagents (`Agent`, through nest's `subagents` capability):
  * they live in the worker's brain and reach the same sandbox through its hands, with the same grant and
@@ -89,6 +98,9 @@ function mcpCapability(base: string, server: Server, prompt: string) {
   const tools = TOOLS[server];
   return {
     prompt,
+    // Each role's capability, so every role template that launches the web tools allows them. `routine`'s
+    // reach the dreaming template too, which launches neither, so they allow nothing there.
+    rules: WEB_RULES.map((r) => ({ ...r })),
     mcp: {
       // No `auth`: nest sends no bearer, and the Nest-Identity token is the only credential.
       url: `${base}/mcp/${server}`,
