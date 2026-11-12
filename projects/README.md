@@ -259,7 +259,7 @@ The owner's request (2026-11-09): "allow me to select the model for the manager 
   - **The last change wins:** the switch reads the setting when it runs, so two quick changes end on the second; a change back to the model it runs on cancels it. A change (or a change back) while a restart is at nest: what nest answers it runs is recorded, and a switch onto the setting as it is then is owed.
   - **No running manager** (a start pending, or it ended): nothing to switch; its next start takes the setting's model. A start frozen before the change runs the old model, then is switched once it's started.
   - **Race-safe:** a switch made stale by a move of the manager (an exit, the owner's Restart) writes nothing. A switch nest refuses for good is said in the chat and not tried again until the setting changes; one it can't take now is retried with backoff.
-  - A start frozen before this release has no model: it keeps the role's shared template (`projects/manager`, `projects/worker`), which now carry the defaults.
+  - A start frozen before this release has no model: it keeps the role's shared template (`projects/manager`, `projects/worker`), which carry the defaults.
 - **Reviewers and routine runs are unchanged:** their templates name no model, so they run on nest's and Claude Code's default. Choosing theirs is a later setting if it's wanted.
 - nest doesn't check that a model exists or that the credential may use it (`LaunchConfig.model` is any string). How a wrong id shows (Claude Code failing its first turn, so nest's `agent.error` among the project's errors) is unverified.
 
@@ -297,7 +297,7 @@ The owner's request (2026-11-06), after the sweep (B10): creating a project used
   - The same repo asked for again resumes it rather than being refused.
 - **Resumed by the alarm.**
   - If the Worker's request fails or dies, DirectoryDO's alarm resumes the create: after a minute, then with backoff, as an outbox row (`src/outbox.ts`).
-  - A create that can't be finished (8 attempts, or a body that can't be read) is removed, and its repo is free again.
+  - A create that can't be finished (8 attempts, a failure that will repeat, or a body that can't be read) is removed, and its repo is free again.
 - **A project's object acts only once DirectoryDO lists it ready** (`settings.listed_ms`, asked until it does):
   - while the create is pending, its alarm checks again every 30 s and nothing is drained;
   - one removed (its `init` succeeded, the rest didn't) leaves its object inert, its settings gone: no attach, no manager.

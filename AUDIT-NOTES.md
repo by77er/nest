@@ -11,12 +11,16 @@ Base: origin/main 6bbf64f.
 | Setup, step 4 | the app sets its nest webhook at its first start | nothing in projects/src calls `PUT /v1/clients/self/webhook`; only /hooks/nest verifies with NEST_WEBHOOK_SECRET | `grep -rn self/webhook projects/src` (no hit); projects/src/worker.ts:45-47 |
 | Dependencies | valid: "never on a task that's over" | the refusal is for a dependent task that's over (`a done task waits on nothing`); a done or cancelled blocker is accepted | projects/src/tasks.ts:181 |
 | Dependencies | "Waiting on N" badge is gray, outline | gray, `variant="light"` | projects/src/ui/features/board/WaitingBadge.tsx:36 |
+| Models | shared templates "which now carry the defaults" (tombstone wording) | they carry the defaults | projects/src/catalog.ts:172-173 |
+| Creating a project | a create is removed after 8 attempts or an unreadable body | also at once on a permanent failure | projects/src/do/directory.ts:141,196-205 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
 - `/mcp/task`: `report_progress` (described as "posts progress").
 
 ## Unconfirmed
+- The repo's binding (~line 281): that GitHub redirects every call nest makes under a transferred repo's old name. Already marked unverified in the doc; nothing in the repo shows it either way.
+- Models (~lines 242, 264): whether nest reads a live agent's template again, and how a wrong model id surfaces. Already marked unverified; not traced in control-plane.
 - Setup steps 5-8 (lines ~837-840): the live GitHub App's subscriptions/permissions and the live client's grant (dated 2026-11-02/06) are cloud state; not checkable from the repo.
 
 ## Suspected code bugs
@@ -27,6 +31,10 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Models: one wording fix; settings/defaults/ids (models.ts:10-31, requests.ts:49-50), templates (models.ts:56-60, catalog.ts:126-151), sweep (do/project.ts:1945-2014, outbox.ts:103), switch (nest.ts:197-199, do/project.ts:598-603,3951-4043), nest's 5 failures (control-plane/src/do/agent.ts:85-90) match.
+- The repo's binding: no drift (do/directory.ts:65-112,255-356; binding.ts:19-95; api.ts:58-115; ui/features/admin/BindingsSection.tsx).
+- Creating a project: one correction; steps creation.ts:51-65, 503 api.ts:181, grace do/directory.ts:139 match.
+- Not decided here: no drift (catalog.ts:175; tasks.ts:127-131).
 - Waiting: no drift (waits.ts:15-18,36-39,70-84; RECENT_WAITS=10 do/project.ts:593,2440; ManagerWaits.tsx:21,102,106; ManagerContext.tsx:59-72; nest's client timer API is GET/DELETE only, control-plane/src/index.ts:1035-1036).
 - Memory: no drift (memory.ts:8,10,12,28; source format do/project.ts:3359; routes api.ts:510-512; nest's memory tools fall to not_implemented, control-plane/src/do/agent.ts:3283; prompts catalog.ts:74,86).
 - Dependencies: two corrections; the rest matches (tasks.ts:177-212, api.ts:434-438, do/project.ts:1035).
