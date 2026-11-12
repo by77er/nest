@@ -16,15 +16,11 @@
 | agents/README.md | agent_spawn params; agent_stop/exit params; `(spawner,*,child)` grants built | + `read_repos`, `reason`; grants takeover designed; 15 min END_GRACE; timers don't keep ephemeral alive | platform-tools.json; lifetimes.ts:43,84,101; agent.ts:1366 |
 | tools/README.md | no timer tools; `nest hold` + 256-conn CLI built; interrupt operator-only; `user` relay name; 404 at confer | timers built; CLI has expose/unexpose/whoami only, no cap; owner route (clients too); caller's own name; `forbidden` from agent_spawn; http.request profile answers taint | guest_cli.rs:76-78; nest-guest/src/cli.rs:27; index.ts:918-928; agent.ts:1795,3538 |
 
-## To apply (capabilities)
-- capabilities/README.md:22 `--system-prompt-snapshot off` not passed (grep crates: none) → designed.
-- :23 not_implemented also memory_read/write, fork_sandbox, checkpoint.
-- :54-65 table rows schedules/authority/web/metrics not built; memory stubs.
-- :80-87 Schedules → point at timers.
-- :36-44, :67-74 examples are design.
-- :19 attenuation: capabilities expand to no grants; built = spawn list + narrowing overrides + attenuated grants.
-- brokered:25 add `github_fork` (brokered.ts:89); journal route auth owner (index.ts:981).
-- docs/README.md:8 "capability sources" → api source only.
+| capabilities/README.md | attenuation via grants a capability expands to | capabilities expand to no grants; spawn list + narrowing overrides + attenuated grants | spec.ts:349; agent.ts:1712,1734; grants.ts:289 |
+| capabilities/README.md | `--system-prompt-snapshot off` makes edits reach resumed brains | flag not passed | crates/nest-protocol/src/host.rs:991-1031 (no match in crates/) |
+| capabilities/README.md | only management tools not_implemented; table rows read as built | memory_read/write, fork_sandbox, checkpoint also not_implemented; schedules/authority/metrics/web not built | agent.ts:3257-3258; spec.ts:199-333 |
+| capabilities/README.md | Schedules (wake_at) only | timers is the built mechanism | spec.ts:250; platform-tools.json:488-536 |
+| brokered/README.md | tool list without github_fork; journal read by operator | github_fork listed; route auth owner, limit ≤500 | brokered.ts:89; index.ts:981; brokered.ts:542 |
 
 ## Unconfirmed
 - agents/README.md:47 restart after 30 s with --resume (lease 30 s found, protocol/control.ts:15; --resume path not traced)
@@ -46,6 +42,12 @@
 - docs/sandbox/guest-agent/README.md fine. docs/interfaces/host-internal/runner-claude/ (to check).
 
 ## Docs done
+capabilities/README, brokered; no drift: timers/README, mcp/README (minor omissions only); api-loop (design, consistent)
 orchestration/*, backends/README.md, agents/README.md, tools/README.md (pending merge with main)
 ## Remaining
-capabilities/* edits, runner, hands, sessions, state-tracking, claude-code backend, api-loop; merge origin/main and re-check
+runner, hands, sessions, state-tracking, claude-code backend, api-loop; merge origin/main and re-check
+
+## Minor (not edited, listed)
+- brokered: forbidden auth headers wider (hop-by-hop, proxy-*) brokered.ts:137-138; fork takes no when_tainted; profile 5xx returned as done not lost (agent.ts:3527-3553); fork result has push_allowed (agent.ts:3418)
+- mcp: approval regex also accepts `approves` (sinks.ts:42); oauth start answer also has `capability` (mcp-auth.ts:518); "at least every 250 ms" is "at most 250 ms apart" (mcp-proxy.ts:455)
+- agents: API spawn also takes cell, start, legacy role/captain/launch/rules (index.ts:789-808); list defaults limit 100 max 200, state live (agent.ts:101-102); read_transcript default limit 200 (agent.ts:97)
