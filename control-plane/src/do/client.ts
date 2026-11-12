@@ -494,9 +494,12 @@ export class ClientDO extends DurableObject<Env> {
     if (!r || r.deleted_ms) throw new NestError(ErrorCodes.FORBIDDEN, "the client was deleted", 403);
     if (this.memberState(m.id) !== "none") return;
     if (!r.grant.cells.includes(m.cell)) throw new NestError(ErrorCodes.FORBIDDEN, `outside ${r.client}'s grant: cell ${m.cell}`, 403);
+    const kinds = m.kind === "agent" ? "agents" : "sandboxes";
     const max = m.kind === "agent" ? r.grant.max_agents : r.grant.max_sandboxes;
+    // None at all is the grant's refusal for good; a full count is a wait for one of them to end (`at_capacity`).
+    if (max === 0) throw new NestError(ErrorCodes.FORBIDDEN, `outside ${r.client}'s grant: max_${kinds} is 0`, 403);
     const n = this.count(m.kind);
-    if (n >= max) throw new NestError(ErrorCodes.FORBIDDEN, `${r.client} has ${n} live ${m.kind === "agent" ? "agents" : "sandboxes"}, its grant's max_${m.kind === "agent" ? "agents" : "sandboxes"}`, 403);
+    if (n >= max) throw new NestError(ErrorCodes.AT_CAPACITY, `max_${kinds}: ${r.client} has ${n} live ${kinds}, its grant's max_${kinds} (${max}); there is room once one ends`, 429, true);
     this.move(m.id, "admit", { facts: m });
     await this.deadlines.set("reconcile", Date.now() + RESERVE_CHECK_MS, true);
   }

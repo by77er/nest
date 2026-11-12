@@ -85,10 +85,16 @@ export function ownsVia(caller: string, chain: readonly (string | null)[]): bool
   return chain.slice(0, MAX_OWNER_HOPS).includes(caller);
 }
 
-/** Whether a spawn by an agent at `depth` with `liveChildren` unended children may go ahead (null), or why not. */
-export function spawnRefusal(depth: number, liveChildren: number): string | null {
-  if (depth + 1 > MAX_SPAWN_DEPTH) return `spawn depth ${depth + 1} is over the limit of ${MAX_SPAWN_DEPTH}`;
-  if (liveChildren >= MAX_LIVE_CHILDREN) return `it already has ${liveChildren} agents that haven't ended (at most ${MAX_LIVE_CHILDREN})`;
+/**
+ * Whether a spawn by an agent at `depth` with `liveChildren` unended children may go ahead (null), or why
+ * not: `full` when only the live children are in the way, so a spawn goes ahead once one ends (`at_capacity`);
+ * the depth never changes (`forbidden`).
+ */
+export function spawnRefusal(depth: number, liveChildren: number): { message: string; full: boolean } | null {
+  if (depth + 1 > MAX_SPAWN_DEPTH) return { message: `spawn depth ${depth + 1} is over the limit of ${MAX_SPAWN_DEPTH}`, full: false };
+  if (liveChildren >= MAX_LIVE_CHILDREN) {
+    return { message: `live children: it already has ${liveChildren} agents that haven't ended (at most ${MAX_LIVE_CHILDREN}); there is room once one ends`, full: true };
+  }
   return null;
 }
 

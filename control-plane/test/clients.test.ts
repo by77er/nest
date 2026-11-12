@@ -401,20 +401,31 @@ describe("the grant bounds everything in the subtree", () => {
     const c = await newClient({ max_agents: 2, max_sandboxes: 1 });
     const results = await Promise.all(Array.from({ length: 5 }, () => as(c.token, "/v1/agents", { body: { template: c.tpl, cell: c.cell, start: false } })));
     const statuses = results.map((r) => r.status).sort();
-    expect(statuses).toEqual([201, 201, 403, 403, 403]);
+    expect(statuses).toEqual([201, 201, 429, 429, 429]);
     const made = (await asJson(c.token, "/v1/agents")).agents;
     expect(made).toHaveLength(2);
-    expect((await createAgent(c, {}, 403)).error.message).toContain("max_agents");
+    // Full: a wait for room, not a refusal for good, naming the limit.
+    expect((await createAgent(c, {}, 429)).error).toMatchObject({ code: "at_capacity", retryable: true, message: expect.stringMatching(/^max_agents: /) });
 
     await asJson(c.token, `/v1/agents/${made[0].agent}/stop`, { body: { end: true } });
     await eventually("the ended agent's place", async () => (await adminJson(`/v1/admin/clients/${c.id}`)).live.agents === 1);
     await createAgent(c);
 
     const s1 = await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
-    await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 403);
+    expect((await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 429)).error)
+      .toMatchObject({ code: "at_capacity", retryable: true, message: expect.stringMatching(/^max_sandboxes: /) });
     await asJson(c.token, `/v1/sandboxes/${s1.sandbox}`, { method: "DELETE" });
     await eventually("the destroyed sandbox's place", async () => (await adminJson(`/v1/admin/clients/${c.id}`)).live.sandboxes === 0);
     await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
+  });
+
+  it("the grant's refusals for good stay forbidden (403, not retryable): a maximum of 0, a cell outside it", async () => {
+    const c = await newClient({ max_agents: 0, max_sandboxes: 0 });
+    const forGood = { code: "forbidden", retryable: false };
+    expect((await createAgent(c, {}, 403)).error).toMatchObject({ ...forGood, message: expect.stringContaining("max_agents is 0") });
+    expect((await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 403)).error).toMatchObject({ ...forGood, message: expect.stringContaining("max_sandboxes is 0") });
+    const d = await newClient({ max_agents: 1 });
+    expect((await createAgent(d, { cell: uniqueCell() }, 403)).error).toMatchObject({ ...forGood, message: expect.stringContaining("cell") });
   });
 
   it("a reservation whose create never happened is dropped by the reconcile; one whose object exists stays counted", async () => {
@@ -427,7 +438,7 @@ describe("the grant bounds everything in the subtree", () => {
     await runInDurableObject(stub, (_i: ClientDO, st) => {
       st.storage.sql.exec("UPDATE members SET state = 'reserved', created_ms = ?", Date.now() - RESERVE_CHECK_MS - 1);
     });
-    expect((await createAgent(c, {}, 403)).error.message).toContain("max_agents");
+    expect((await createAgent(c, {}, 429)).error.message).toContain("max_agents");
     await runInDurableObject(stub, (_i: ClientDO, st) => {
       st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'reconcile'");
     });
@@ -686,9 +697,11 @@ describe("agent_spawn in a client's subtree", () => {
     // The client sees and lists the child; its labels filter.
     expect((await asJson(c.token, `/v1/agents/${kid}`)).labels).toEqual({ task: "t1" });
     expect((await asJson(c.token, "/v1/agents?label=task=t1")).agents.map((a: any) => a.agent)).toEqual([kid]);
-    // The subtree is at max_agents (parent and child): the next spawn is refused, as is a sandbox (max_sandboxes 0).
-    expect(await run({ template: c.tpl })).toMatchObject({ status: "error", error: { code: "forbidden" } });
+    // The subtree is at max_agents (parent and child): the next spawn waits for room (at_capacity, retryable),
+    // and its refused child is neither indexed nor holding a place.
+    expect(await run({ template: c.tpl })).toMatchObject({ status: "error", error: { code: "at_capacity", retryable: true, message: expect.stringMatching(/^max_agents: /) } });
     expect((await adminJson(`/v1/admin/clients/${c.id}`)).live.agents).toBe(2);
+    expect((await agentStub(p.agent).children()).map((x) => x.agent)).toEqual([kid]);
     ws.close();
   });
 });

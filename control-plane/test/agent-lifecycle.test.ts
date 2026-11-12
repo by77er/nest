@@ -117,11 +117,12 @@ describe("lifetime rules (pure)", () => {
     expect(ownsVia("agt_p", [null])).toBe(false);
   });
 
-  it("spawns stop at the depth and live-children caps", () => {
+  it("spawns stop at the depth and live-children caps; only the live children wait for room (full)", () => {
     expect(spawnRefusal(0, 0)).toBeNull();
     expect(spawnRefusal(MAX_SPAWN_DEPTH - 1, MAX_LIVE_CHILDREN - 1)).toBeNull();
-    expect(spawnRefusal(MAX_SPAWN_DEPTH, 0)).toContain("depth");
-    expect(spawnRefusal(0, MAX_LIVE_CHILDREN)).toContain("haven't ended");
+    expect(spawnRefusal(MAX_SPAWN_DEPTH, 0)).toMatchObject({ message: expect.stringContaining("depth"), full: false });
+    expect(spawnRefusal(MAX_SPAWN_DEPTH, MAX_LIVE_CHILDREN)).toMatchObject({ message: expect.stringContaining("depth"), full: false });
+    expect(spawnRefusal(0, MAX_LIVE_CHILDREN)).toMatchObject({ message: expect.stringContaining("haven't ended"), full: true });
   });
 
   it("an ephemeral agent is done only with no turn current or queued, no open ask, and no child that hasn't ended", () => {
@@ -239,12 +240,13 @@ describe("agent_spawn", () => {
     expect(await p.run("agent_spawn", { template: w.kid, task: "x", sandbox: "share" })).toMatchObject({ status: "error", error: { code: "invalid_message" } });
     expect(await p.run("agent_spawn", { template: w.kid, task: "x", tools: ["notify", "merge"] })).toMatchObject({ status: "error" });
     await runInDurableObject(agentStub(p.agent), (inst: AgentDO) => (inst as any).update((i: any) => { i.depth = MAX_SPAWN_DEPTH; }));
-    expect((await p.run("agent_spawn", { template: w.kid, task: "x" })).error.message).toContain("depth");
+    // The depth never changes: refused for good. The live children do: at_capacity, retryable.
+    expect((await p.run("agent_spawn", { template: w.kid, task: "x" })).error).toMatchObject({ code: "forbidden", retryable: false, message: expect.stringContaining("depth") });
     await runInDurableObject(agentStub(p.agent), (inst: AgentDO, st) => {
       (inst as any).update((i: any) => { delete i.depth; });
       for (let n = 0; n < MAX_LIVE_CHILDREN; n++) st.storage.sql.exec("INSERT INTO children (agent, created_ms) VALUES (?, ?)", `agt_planted${n}`, Date.now());
     });
-    expect((await p.run("agent_spawn", { template: w.kid, task: "x" })).error.message).toContain("haven't ended");
+    expect((await p.run("agent_spawn", { template: w.kid, task: "x" })).error).toMatchObject({ code: "at_capacity", retryable: true, message: expect.stringContaining("haven't ended") });
     // From inside a sandbox, never.
     const outcome = await runInDurableObject(agentStub(p.agent), (inst: AgentDO) =>
       (inst as any).dispatch(p.epoch, "cal_guest", "exit", {}, 1).catch((e: any) => e.code));
