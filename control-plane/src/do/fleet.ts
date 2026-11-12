@@ -1,6 +1,7 @@
 // FleetDO: one per cell. Host enrollment, the fleet WebSocket (docs/interfaces/control-host/fleet/),
 // leases and their expiry, STONITH, placement, and command delivery with exactly-one results.
 import { DurableObject } from "cloudflare:workers";
+import { CLIENT_GUARD_PREFIX } from "../lib/client-guards";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
@@ -1680,10 +1681,13 @@ export class FleetDO extends DurableObject<Env> {
       console.error(`FleetDO: placing ${req.sandbox}, which its SandboxDO never registered; registering it now`);
       this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
     }
-    // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts.
+    // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts. A sandbox with API
+    // clients' request guards goes only to a host whose nest-proxy bounds them (`guard_bounds`): none
+    // free means no placement yet (SandboxDO retries), never one that would decide them unbounded.
     const need = req.resources;
     const cfg = this.cellConfig();
-    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: "wedged_ms IS NULL" })
+    const guarded = (req.policy.guards ?? []).some((g) => g.name.startsWith(CLIENT_GUARD_PREFIX));
+    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: guarded ? "wedged_ms IS NULL AND guard_bounds = 1" : "wedged_ms IS NULL" })
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
       .map((h) => {
         const capacity = h.capacity ? (JSON.parse(h.capacity) as Capacity) : null;

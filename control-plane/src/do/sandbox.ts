@@ -1818,12 +1818,21 @@ export class SandboxDO extends DurableObject<Env> {
   async setClientLayer(layer: { egress: EgressRule[]; inject: HeldInjection[]; env: Record<string, string>; workflows: boolean; guards?: ClientGuard[] }): Promise<EgressPolicy> {
     const info = this.info_();
     if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
-    if (layer.guards?.length) await this.requireGuardBounds(info.cell);
+    // Absent (a caller of the previous release): none, as for every other part of the layer.
+    const guards = layer.guards ?? [];
+    // A write that adds no guard (each one already stored) goes through while a host of the cell can't
+    // bound guards, so an app rewriting its whole layer never has to drop them to change the rest;
+    // placement keeps a guarded sandbox off such hosts. One that adds a guard needs every host to bound it.
+    const adds = (stored: readonly ClientGuard[]) => guards.some((g) => !stored.some((s) => JSON.stringify(s) === JSON.stringify(g)));
+    const known = !adds(this.get<ClientGuard[]>(OWN_GUARDS) ?? []);
+    if (!known) await this.requireGuardBounds(info.cell);
     if (info.client) await this.readEgressCeiling();
     const now = this.info_();
     if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);
-    // Absent (a caller of the previous release): none, as for every other part of the layer.
-    const guards = layer.guards ?? [];
+    // Let through as adding none: still so in the step that writes (another write may have replaced them meanwhile).
+    if (known && adds(this.get<ClientGuard[]>(OWN_GUARDS) ?? [])) {
+      throw new NestError(ErrorCodes.CONFLICT, "the sandbox's guards changed while this layer was written: read the layer again and retry", 409);
+    }
     this.checkGuardLimit(guards);
     const put = (key: string, v: unknown, has: boolean) => (has ? this.put(key, v) : this.del(key));
     const envBefore = JSON.stringify(this.get(OWN_ENV) ?? {});

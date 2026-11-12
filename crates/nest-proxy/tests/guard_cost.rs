@@ -4,8 +4,9 @@
 //! - many scope matchers (`/**` plus query names), which once decoded the path and query per matcher;
 //! - many exceptions with query and body matchers, which the body pre-pass walked whatever the scope.
 //!
-//! - many query values (16 a parameter, compared with every pair of a query of same-name pairs, the
-//!   matching one last), at the control plane's matcher-work bound.
+//! - many query values (16 a parameter, compared with every pair of a query of same-name pairs, each
+//!   value a near miss, so every comparison runs to the end and no matcher stops early), at the
+//!   control plane's matcher-work bound.
 //!
 //! A target past the guarded bounds is refused before any matcher runs; one within them is decided
 //! within the budget below. The budget is wall time, so it catches gross regressions only; that the
@@ -90,11 +91,10 @@ fn path_heavy() -> Vec<RequestGuard> {
         .collect()
 }
 
-/// A query of 256 `q=` pairs whose values miss every matcher value at their last bytes, the last pair hitting.
+/// A query of 256 `q=` pairs whose values miss every matcher value only at their last bytes (and only
+/// in case before that, which the guards ignore): a full pass of every matcher, none matching.
 fn same_name_query() -> String {
-    let mut pairs: Vec<String> = (0..MAX_GUARDED_QUERY_PAIRS - 1).map(|_| format!("q={}zz", "V".repeat(26))).collect();
-    pairs.push(format!("q={}15", "v".repeat(26)));
-    pairs.join("&")
+    (0..MAX_GUARDED_QUERY_PAIRS).map(|_| format!("q={}zz", "V".repeat(26))).collect::<Vec<_>>().join("&")
 }
 
 /// Prepare, the body pre-pass and the decision, as the proxy runs them; how long it took.
@@ -145,7 +145,7 @@ fn a_target_within_the_bounds_is_decided_within_budget() {
     assert!(q.len() <= MAX_GUARDED_QUERY, "{}", q.len());
     let guards = value_heavy();
     // Best of a few runs: the figure the docs quote is the work, not a scheduler's hiccup.
-    let took = (0..5).map(|_| decide(&guards, "/x", &q)).map(|(out, t)| (assert_eq!(out, Ok(true)), t).1).min().unwrap();
+    let took = (0..5).map(|_| decide(&guards, "/x", &q)).map(|(out, t)| (assert_eq!(out, Ok(false)), t).1).min().unwrap();
     eprintln!("value-heavy ({} guards, {} query bytes): {took:?}", guards.len(), q.len());
     assert!(took < BUDGET, "value-heavy: {took:?}");
     let p: String = (0..MAX_GUARDED_SEGMENTS - 1).map(|_| format!("/{}", "A".repeat(15))).collect();

@@ -15,7 +15,8 @@ import { expandSpec, type Template } from "../src/lib/spec";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { SandboxPolicyLayer } from "../src/do/sandbox";
 import type { RequestGuard } from "../src/protocol/model";
-import { adminJson, BASE, connectHost, enrollHost, nextCommands, uniqueCell, type Ws } from "./helpers";
+import { adminJson, BASE, connectHost, enrollHost, eventually, nextCommands, uniqueCell, type Ws } from "./helpers";
+import { ClientDO } from "../src/do/client";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 const LAUNCH = { builtin_tools: [], system_prompt: { mode: "append", text: "" } };
@@ -304,6 +305,83 @@ describe("client request guards on a sandbox", () => {
     expect((await stub.info()).attached).not.toContain("agt_g");
     // Another subtree's guards don't count here, so they aren't refused either.
     await stub.attach("agt_other", undefined, [], [], { guards: holdGuards("cli_someoneelse", [PUSH]) });
+  });
+
+  it("a write that adds no guard goes through while a host can't bound them; one that adds a guard is refused", async () => {
+    const c = await newClient();
+    const s = await placed(c, { guards: [NO_DELETE, PUSH] });
+    await connectHost(c.cell, "sandbox", { guard_bounds: false });
+    // The whole layer again, with its env changed and a guard dropped: nothing added, so accepted.
+    await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { guards: [PUSH], env: { A: "1" } } });
+    expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`))).toMatchObject({ guards: [PUSH], env: { A: "1" } });
+    // Putting back the one it dropped adds a guard to what is stored now: refused.
+    const back = await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { guards: [PUSH, NO_DELETE] } });
+    expect(back.status).toBe(409);
+    expect((await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { guards: [{ ...PUSH, reason: "changed" }] } })).status).toBe(409);
+    expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`)).guards).toEqual([PUSH]);
+  });
+
+  it("a write let through as adding no guard is refused if the guards it was checked against changed meanwhile", async () => {
+    const c = await newClient();
+    const s = await placed(c, { guards: [NO_DELETE] });
+    await connectHost(c.cell, "sandbox", { guard_bounds: false });
+    // Hold the sandbox's own grant read (the second scope() of the PUT; the route's is the first).
+    const real = ClientDO.prototype.scope;
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    let reached = false;
+    ClientDO.prototype.scope = async function (this: ClientDO) {
+      const r = await real.call(this);
+      if (++calls === 2) {
+        reached = true;
+        await gate;
+      }
+      return r;
+    };
+    try {
+      const put = as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { guards: [NO_DELETE] } });
+      await eventually("the write's grant read is held", () => reached);
+      // Meanwhile the guards are emptied (a write without guards always goes through).
+      await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: {} });
+      release();
+      const r = await put;
+      expect(r.status).toBe(409);
+      expect(r.body.error.message).toContain("changed while this layer was written");
+    } finally {
+      ClientDO.prototype.scope = real;
+    }
+    expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`)).guards).toEqual([]);
+  });
+
+  it("a sandbox with client guards is placed only on a host that bounds them, and waits rather than go elsewhere", async () => {
+    const cell = uniqueCell();
+    const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
+    const old = await connectHost(cell, "sandbox", { guard_bounds: false });
+    const policy = (guards: RequestGuard[]) => ({
+      version: 1, allow: [], passthrough: [], inject: [], tcp: [], guards, limits: { max_connections: 1, bandwidth_mbps: 1, max_inspected_body_bytes: 1 },
+    });
+    const place = (sandbox: string, guards: RequestGuard[]) => fleet.place({
+      sandbox, workstream: "ws_test", epoch: 1, image: "x", resources: { vcpus: 1, memory_mib: 1, disk_gib: 1 }, policy: policy(guards),
+    });
+    expect(await place(`sbx_${rand()}`, [wireGuard(NO_DELETE)])).toBeNull();
+    // The operator's guards alone go anywhere, as before.
+    expect(await place(`sbx_${rand()}`, [{ name: "store-write", hosts: ["files.example.com"], scope: [{}] }])).toBe(old.host);
+    const current = await connectHost(cell);
+    expect(await place(`sbx_${rand()}`, [wireGuard(NO_DELETE)])).toBe(current.host);
+  });
+
+  it("an expired host of the previous release still counts (it may come back); a dead one doesn't", async () => {
+    const cell = uniqueCell();
+    const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
+    const old = await connectHost(cell, "sandbox", { guard_bounds: false });
+    await connectHost(cell);
+    expect(await fleet.hostsWithoutGuardBounds()).toEqual([old.host]);
+    const status = (to: string) => runInDurableObject(fleet, (_i, st) => { st.storage.sql.exec("UPDATE hosts SET status = ? WHERE host = ?", to, old.host); });
+    await status("expired");
+    expect(await fleet.hostsWithoutGuardBounds()).toEqual([old.host]);
+    await status("dead");
+    expect(await fleet.hostsWithoutGuardBounds()).toEqual([]);
   });
 
   it("a host not heard from since enrolling counts as one that doesn't bound them", async () => {
