@@ -2,7 +2,7 @@
 
 A task board for GitHub repos, run by agents on nest: an app with its own Worker and Durable Objects, built only on nest's [API clients](../docs/control-plane/api/clients/) interface. nest knows nothing of projects, tasks or reviews. A feature here that seems to need one of nest's internals means that interface is wrong: fix it there, generically, and build this on the result.
 
-**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), the UI ([below](#the-ui)), attaching a repo and the review pipeline ([below](#built-the-review-pipeline)), auto-merge ([below](#auto-merge)), workers carrying their PRs to merge ([below](#pr-upkeep)), and routines and memory ([below](#routines)). **Not built:** setting nest's webhook at first start, and starting a new manager once one ends (it's recorded in the chat). Builds on API clients, caller identity, events to the owner and GitHub tokens.
+**Status:** designed (2026-11-02, the owner's request). **Built:** the core: the Worker, the three Durable Objects, the catalog sync, the JSON API, the MCP servers and nest's webhook ([below](#built-the-core)), the UI ([below](#the-ui)), attaching a repo and the review pipeline ([below](#built-the-review-pipeline)), auto-merge ([below](#auto-merge)), workers carrying their PRs to merge ([below](#pr-upkeep)), and routines and memory ([below](#routines)). **Not built:** setting nest's webhook at first start. Builds on API clients, caller identity, events to the owner and GitHub tokens.
 
 ## What it does
 
@@ -139,8 +139,8 @@ The owner's request (2026-11-06): a task's state, its worker, its PRs and the co
 - **Invariants,** checked after every step of a seeded random walk over the machine (`test/machine.test.ts`): `done` has no open PR and no worker of its own; `in_review` has an open PR or a live worker; `stalled`, `draft` and `ready` have no live worker; a start is owed exactly in `assigned`; comments are queued only while a start is owed.
 - **"Live"** is a worker of its own, starting or running. One being stopped for a task that's over still counts toward `max_workers` until nest has stopped it, but isn't the task's.
 - **What the sweep found, fixed here:**
-  - **Done with a PR open (B2).** Marking done by hand looked only at the state, and a ready or stalled task can hold an open PR. Now it's refused, and a worker started for a task with an open PR (a revise) starts in review.
-  - **In review with no way out (B3).** The last open PR closed unmerged, or detached, with no worker running, now stalls the task. With the worker running, the task goes back to in progress.
+  - **Done with a PR open (B2).** A ready or stalled task can hold an open PR, so marking done by hand is refused for any task holding one, and a worker started for a task with an open PR (a revise) starts in review.
+  - **In review with no way out (B3).** The last open PR closed unmerged, or detached, with no worker running, stalls the task. With the worker running, the task goes back to in progress.
   - **Comments outliving their worker (B8).** These are dropped when the start fails or the worker exits before its brief, and recorded as dropped.
   - **A close handled twice** merges an open PR only once, so the routines' counters count it once.
 - **Deleting a draft (B4)** is refused while it holds an open PR: detach it first. Detaching turns the PR's auto-merge off on GitHub, a write a delete shouldn't make unseen, and the owner sees the PR they're letting go.
@@ -179,7 +179,7 @@ The owner's request (2026-11-06): the app's retry queues as one machine, so each
   | a review job's own step (its check, its reviewer, the brief) | permanent: the job fails, with why; otherwise retried within the job's deadline. No room in nest for its reviewer isn't permanent: the job waits, queued ([the review pipeline](#built-the-review-pipeline)) | with the job |
   | a held job's check | permanent, or 30 attempts: shown on the job, which waits for the owner all the same | with the job |
 
-  Stops used to retry everything forever. ReviewDO's queues used to keep their own retry counts: a refused reviewer stop was retried forever, and a review's word to the project every 30 seconds with no count. A reviewer's refused stop isn't among the Network page's failed stops (those are ProjectDO's): it shows on its review job (a follow-up, if it ever happens).
+  A reviewer's refused stop isn't among the Network page's failed stops (those are ProjectDO's): it shows on its review job (a follow-up, if it ever happens).
 - **Failed stops.** A failed stop may leave an agent running, with its sandbox and its credentials, so it's never quiet.
   - **Only a real refusal fails a stop.** That's nest's own refusal of the request, in its JSON error body (400, 409; `stopRefused`). An auth failure (401, 403), or a page that isn't nest's (a proxy's, Access's), may pass, so it's retried.
   - **A failed stop is shown everywhere it matters:**
@@ -197,11 +197,11 @@ The owner's request (2026-11-06): the app's retry queues as one machine, so each
   - **Retry.**
     - On a failed message, Retry is `POST /api/projects/:id/chat/:seq/retry`, which leaves any message that isn't failed as it is.
     - On a message the page never had an answer for, Retry posts it again under the same `request_id`, the page's id for that message (`POST …/chat {text, request_id}`). The Worker keeps request ids (`chat_request`), so a post whose answer was lost is one message, not two.
-- **One-off cleanup.** The same migration drops PR rows whose task is gone, which deleting a draft left before [the task machine](#the-task-machine). Nothing updates them now, and a PR in one couldn't be attached again.
+- **One-off cleanup.** The same migration drops PR rows whose task is gone: nothing updates them, and a PR in one couldn't be attached again.
 
 ## The manager lifecycle
 
-The owner's request (2026-11-06), after the state-machine sweep (B11): a manager that ended used to stay the project's manager, with its brief and the owner's chat retried against a dead inbox.
+The owner's request (2026-11-06), after the state-machine sweep (B11): a manager that ended mustn't stay the project's manager, with its brief and the owner's chat retried against a dead inbox.
 
 - **A pure step,** `managerStep` in `src/manager.ts`. ProjectDO applies it in one step (`managerMove`), and nothing else writes these settings.
   - It works over the manager's agent, when a start is due, the recent automatic restarts (`settings.manager_restarts`), and why it isn't running.

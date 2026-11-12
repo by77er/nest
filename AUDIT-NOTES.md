@@ -16,6 +16,11 @@ Base: origin/main 6bbf64f.
 | Pieces | labels: `project`, `role`, worker `task`, reviewer `pr`/`sha` | also a routine run's `run` and (not dreaming) `routine`, and every start's `start` | projects/src/do/project.ts:3131,3198,4072,4124; do/review.ts:886 |
 | How it uses nest | templates `projects/{manager,worker,reviewer,routine}` | the sync also writes `projects/dreaming` | projects/src/catalog.ts:180 |
 | The repo's own guidance | "This replaces the runner reading the repo's CLAUDE.md" (change narrative) | the runner reads none of a repo's instructions | docs/agents/runner/README.md:29 |
+| Status (line 5) | Not built: starting a new manager once one ends | built: an ended manager is replaced with backoff, up to 3 an hour, then waits for the owner's Restart (as "The manager lifecycle" says) | projects/src/manager.ts:63-101; do/project.ts:3899 |
+| The task machine | B2/B3 told as change history ("looked only at", "Now it's refused", "now stalls") | present tense; same rules | projects/src/tasks.ts:118-131 |
+| Outboxes | "Stops used to retry everything forever. ReviewDO's queues used to …" (tombstone) | dropped; the table states the current policies | projects/src/outbox.ts:95-113 |
+| Outboxes | one-off cleanup "which deleting a draft left before the task machine. Nothing updates them now" | the migration drops orphaned PR rows | projects/src/do/project.ts:516 |
+| The manager lifecycle | "a manager that ended used to stay the project's manager" (tombstone) | stated as the rule | projects/src/manager.ts:85-101 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
@@ -34,6 +39,9 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- The task machine: table and invariants match tasks.ts:4-143 and test/machine.test.ts:120-131 (only the B2/B3 wording changed); deleteTask do/project.ts:877-900.
+- Outboxes: table matches OUTBOX (outbox.ts:95-113), states/events outbox.ts:9-26, stopRefused nest.ts:350-356, routes api.ts:413-417, chat_request do/project.ts:510, SPINNER_AFTER_MS ui/features/chat/ChatView.tsx:210; two tombstones removed.
+- The manager lifecycle: MANAGER_RESTARTS=3/hour manager.ts:63-64, restart route api.ts:348, "The previous manager" ui/features/attention/AskItem.tsx:32, 'manager replaced' stop do/project.ts:3899; one tombstone removed.
 - Intro, What it does, Pieces, How it uses nest, The repo's own guidance, The MCP server, Flows: corrections above; the rest matches (grant permissions github.ts:25-47; overrides nest.ts:163; stop nest.ts:230-234; label listing nest.ts:207-208,334; github-token nest.ts:327; trace trace.ts:57, api.ts:118-119; grant repos grant-repos.ts, nest.ts:294-305, api.ts:122,158; CHECK_NAME github.ts:23; attach_error/attach_gen do/project.ts:345,542; REVIEW_DEADLINE_MS review-job.ts:60; MAX_RETRIES=2 do/review.ts:34; action_required do/review.ts:40; identity checks identity.ts:122-131; REPO_GUIDANCE/REVIEWER_GUIDANCE catalog.ts:50,58; default max_workers 2 do/project.ts:663).
 - Network: no drift (presets network.ts:39-46, ports :24, OUTSIDE :54, clientLayerFor :152; PUT network 403/400 api.ts:454-475; frozen_egress/network_rev do/project.ts:412-415; sidebar order ui/features/shell/Sidebar.test.tsx:98; strings NetworkPage.tsx:123,178,298; sources :370-373; nest's /policy route control-plane/src/index.ts:836).
 - Built-in tools: no drift (catalog.ts:19-38,106-107,130-134,178-182; control-plane/src/lib/grants.ts has no rules check).
