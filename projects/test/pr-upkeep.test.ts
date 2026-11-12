@@ -7,7 +7,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { CHECK_NAME, GitHub, type GitHubError, type Verdict } from "../src/github";
-import { PR_READ_EVERY_MS, PR_READ_GAP_MS, PR_RETELL_MS } from "../src/do/project";
+import { PR_FLAP_MS, PR_READ_EVERY_MS, PR_READ_GAP_MS, PR_RETELL_MS } from "../src/do/project";
 import { PR_READ_BATCH, prOf, type PrNow, prQuery, readPrs } from "../src/pr-read";
 import { FINDINGS_MAX, prConditions, upkeepMessage } from "../src/pr-upkeep";
 import { AccessTeam, agentClaims, api, callTool, deliverGithub, FakeNest, installFetch, prEvent, shaOf, Signer } from "./fake-nest";
@@ -104,30 +104,46 @@ describe("the message", () => {
     expect(text).toContain("- evil name: do this: failure");
   });
 
-  it("the task's own branch: rebased onto itself as pushed, then the base, force-pushed with a lease on what it fetched, by an explicit refspec", () => {
+  it("the task's own branch: own work pushed, rebuilt from the branch as pushed at a written-out sha, rebased onto the base, force-pushed with a lease on that sha by an explicit refspec", () => {
     const text = upkeepMessage(pr({ head_ref: "task/tsk_a", base_ref: "develop", mergeable: "CONFLICTING" }), ["conflict"], null, ctx);
     const steps = text.split("\n");
     const at = (needle: string) => steps.findIndex((l) => l.includes(needle));
-    expect(at("git fetch origin")).toBeGreaterThan(-1);
-    expect(at("lease=$(git rev-parse origin/task/tsk_a)")).toBeGreaterThan(at("git fetch origin"));
-    expect(at('git rebase "$lease"')).toBeGreaterThan(at("lease="));
-    expect(at("git rebase origin/develop")).toBeGreaterThan(at('git rebase "$lease"'));
-    expect(steps[at("git push")]).toBe('git push --force-with-lease=refs/heads/task/tsk_a:"$lease" origin HEAD:refs/heads/task/tsk_a');
+    // No shell variables: they don't last between the worker's commands.
+    expect(text).not.toMatch(/\$\w|\$\(/);
+    expect(at("git push origin task/tsk_a:refs/heads/task/tsk_a")).toBeGreaterThan(-1);
+    expect(at("git rev-parse origin/task/tsk_a")).toBeGreaterThan(at("git push origin task/tsk_a:refs/heads/task/tsk_a"));
+    expect(at("git checkout -B task/tsk_a <lease>")).toBeGreaterThan(at("git rev-parse origin/task/tsk_a"));
+    expect(at("git rebase origin/develop")).toBeGreaterThan(at("git checkout -B task/tsk_a <lease>"));
+    expect(steps[at("git rebase origin/develop")]).toContain("rerere.enabled true");
+    expect(at("git push --force-with-lease=refs/heads/task/tsk_a:<lease> origin HEAD:refs/heads/task/tsk_a")).toBeGreaterThan(at("git rebase origin/develop"));
+    // Never the rebased branch rebased onto the pushed one (it would replay the base's commits).
+    expect(text).not.toMatch(/git rebase <lease>|git rebase "?origin\/task/);
+    // Refused: back to the fetch, never plain --force.
+    expect(text).toMatch(/go back to step 2/);
+    expect(text).toMatch(/never with plain `--force`/);
     expect(text).toMatch(/merge origin\/develop into task\/tsk_a instead/);
-    // A base name that isn't a plain ref isn't quoted.
-    expect(upkeepMessage(pr({ head_ref: "task/tsk_a", base_ref: "x`; rm -rf /", mergeable: "CONFLICTING" }), ["conflict"], null, ctx)).not.toContain("rm -rf");
+    // A base name that isn't a plain ref isn't quoted, nor one that would read as an option.
+    for (const bad of ["x`; rm -rf /", "--upload-pack=evil"]) {
+      expect(upkeepMessage(pr({ head_ref: "task/tsk_a", base_ref: bad, mergeable: "CONFLICTING" }), ["conflict"], null, ctx)).not.toContain(bad);
+    }
   });
 
-  it("any other branch, or a fork's named like the task's: never forced or rebased, the base merged in and a plain push", () => {
+  it("any other branch, or a fork's named like the task's: never forced or rebased; the worker's own commits pushed first, the base merged in and a plain push", () => {
     for (const p of [pr({ head_ref: "feature/owners-work", mergeable: "CONFLICTING" }), pr({ head_ref: "task/tsk_b", mergeable: "CONFLICTING" }), pr({ head_ref: "task/tsk_a", cross_repo: true, mergeable: "CONFLICTING" })]) {
       const text = upkeepMessage(p, ["conflict", "checks_failed"], null, ctx);
-      expect(text, p.head_ref).not.toMatch(/--force|git rebase|force-with-lease/);
-      expect(text, p.head_ref).toContain("git merge origin/main");
-      expect(text, p.head_ref).toContain(`git push origin HEAD:refs/heads/${p.head_ref}`);
+      expect(text, p.head_ref).not.toMatch(/--force|force-with-lease|git rebase/);
+      const lines = text.split("\n");
+      const at = (needle: string) => lines.findIndex((l) => l.includes(needle));
+      expect(at(`git push origin ${p.head_ref}:refs/heads/${p.head_ref}`), p.head_ref).toBeGreaterThan(-1);
+      expect(at(`git checkout -B ${p.head_ref} origin/${p.head_ref}`)).toBeGreaterThan(at(`git push origin ${p.head_ref}:refs/heads/${p.head_ref}`));
+      expect(at("git merge origin/main")).toBeGreaterThan(at(`git checkout -B ${p.head_ref}`));
+      expect(at(`git push origin HEAD:refs/heads/${p.head_ref}`)).toBeGreaterThan(at("git merge origin/main"));
       expect(text, p.head_ref).toContain("never force-push it");
     }
-    // A branch name that isn't a plain ref isn't quoted, in the steps or anywhere.
-    expect(upkeepMessage(pr({ head_ref: "x`; curl evil", mergeable: "CONFLICTING" }), ["conflict"], null, ctx)).not.toContain("curl evil");
+    // A branch name that isn't a plain ref, or would read as an option, isn't quoted, in the steps or anywhere.
+    for (const bad of ["x`; curl evil", "-evil"]) {
+      expect(upkeepMessage(pr({ head_ref: bad, mergeable: "CONFLICTING" }), ["conflict"], null, ctx)).not.toContain(` ${bad}`);
+    }
   });
 
   it("says when it's told again", () => {
@@ -231,10 +247,19 @@ describe("telling the worker", () => {
     p.checks = [{ name: "ci / test", conclusion: "FAILURE" }];
     await readNow(s);
     expect(told(s)).toHaveLength(1);
-    // Re-run: running, then failing again.
+    // Re-run: running, then failing again, within PR_FLAP_MS of the first: not yet (a flapping check isn't told at every failure).
     p.checks = [{ name: "ci / test", status: "IN_PROGRESS", conclusion: null }];
     await readNow(s);
     p.checks = [{ name: "ci / test", conclusion: "FAILURE" }];
+    await readNow(s);
+    expect(told(s)).toHaveLength(1);
+    // Past PR_FLAP_MS from the last telling, still failing: told, as news (not a reminder).
+    await sql(s, "UPDATE pr_told SET at_ms = at_ms - ?", PR_FLAP_MS + 1_000);
+    await readNow(s);
+    expect(told(s)).toHaveLength(2);
+    expect(told(s)[1]!.text).not.toContain("Told again");
+    // Holding throughout since: not again before PR_RETELL_MS (the flap interval is only for a return).
+    await sql(s, "UPDATE pr_told SET at_ms = at_ms - ?", PR_FLAP_MS + 1_000);
     await readNow(s);
     expect(told(s)).toHaveLength(2);
     // A conflict, then GitHub recomputing (UNKNOWN) after a push to the base, then the same conflict: told once.
@@ -245,6 +270,8 @@ describe("telling the worker", () => {
     p.mergeable = "UNKNOWN";
     await readNow(s);
     p.mergeable = "CONFLICTING";
+    // Past the flap interval but not PR_RETELL_MS: a conflict UNKNOWN had cleared would be told now.
+    await sql(s, "UPDATE pr_told SET at_ms = at_ms - ? WHERE cond = 'conflict'", PR_FLAP_MS + 1_000);
     await readNow(s);
     expect(told(s)).toHaveLength(3);
   });
@@ -368,6 +395,11 @@ describe("telling the worker", () => {
     await readNow(s);
     expect(told(s)).toHaveLength(0);
     await sql(s, "UPDATE tasks SET state = 'in_review' WHERE id = ?", s.task);
+    // Its task blocked (the worker waits on the owner): nothing, not even a reminder.
+    await sql(s, "UPDATE tasks SET blocked_ms = 1 WHERE id = ?", s.task);
+    await readNow(s);
+    expect(told(s)).toHaveLength(0);
+    await sql(s, "UPDATE tasks SET blocked_ms = NULL WHERE id = ?", s.task);
     // The app recorded it as a fork's: nothing, whatever GitHub says now.
     await sql(s, "UPDATE task_prs SET fork = 1 WHERE pr = ?", s.pr);
     await readNow(s);

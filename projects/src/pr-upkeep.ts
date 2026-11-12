@@ -43,8 +43,8 @@ export function prConditions(pr: PrNow, review: Verdict | null): UpkeepCondition
 
 /** The longest the reviewer's findings run in a message; the rest is on the PR's check. */
 export const FINDINGS_MAX = 6000;
-/** A branch name the message may quote. */
-const SAFE_REF = /^[A-Za-z0-9._/-]{1,200}$/;
+/** A branch name the message may quote: never one starting with `-`, which a command would read as an option. */
+const SAFE_REF = /^[A-Za-z0-9._/][A-Za-z0-9._/-]{0,199}$/;
 const oneLine = (s: string, max = 200) => {
   const t = s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").trim();
   return t.length > max ? `${t.slice(0, max - 1)}\u2026` : t;
@@ -63,38 +63,41 @@ export interface UpkeepContext {
 export const ownBranch = (pr: PrNow, task: string) => !pr.cross_repo && pr.head_ref === `task/${task}`;
 
 /**
- * How to bring the PR's branch up to date with its base. On the worker's own task branch: rebase, first
- * onto the branch as pushed (so a commit someone else pushed to it, a suggestion committed on GitHub or the
- * owner's fix, is kept), then onto the base, and force-push with a lease on exactly the commit it fetched,
- * by an explicit refspec. On any other branch (an attached PR the owner or the manager chose): never forced,
- * the base merged in and a plain push, which can't drop anyone's commits.
+ * How to bring the PR's branch up to date with its base. Shell variables don't last between a worker's
+ * commands (each Bash call is a new shell, and a rebase that stops on conflicts spans several), so every
+ * sha is written out in full, never kept in a variable.
+ *
+ * - The worker's own task branch: its local work pushed plainly first, then rebuilt from the branch exactly
+ *   as pushed (`checkout -B` at the sha it fetched: a commit someone else pushed, a suggestion committed on
+ *   GitHub or the owner's fix, is kept), rebased onto the base, and force-pushed with a lease on that very
+ *   sha, by an explicit refspec. A push refused because the branch moved starts again from the fetch, which
+ *   throws the refused rebase away rather than rebasing it onto the branch (that would replay the base's own
+ *   commits); `rerere` replays the conflict resolutions.
+ * - Any other branch (an attached PR the owner or the manager chose): never forced or rebased. The worker's
+ *   own unpushed commits on it pushed first, then the base merged in and a plain push.
  */
 function updateSteps(pr: PrNow, task: string, base: string | null): string[] {
   const b = `origin/${base ?? "<base>"}`;
   if (ownBranch(pr, task)) {
     const own = `task/${task}`;
     return [
-      `Bring your branch ${own} up to date with ${b}, keeping any commit someone else pushed to it:`,
-      "```",
-      "git fetch origin",
-      `lease=$(git rev-parse origin/${own})`,
-      `git checkout ${own} && git rebase "$lease"   # onto your branch as pushed: others' commits kept`,
-      `git rebase ${b}   # then onto the base: resolve the conflicts, run the tests`,
-      `git push --force-with-lease=refs/heads/${own}:"$lease" origin HEAD:refs/heads/${own}`,
-      "```",
-      `Force-push only this branch, only with that lease. If the push is refused because the branch moved, start again from the fetch. If the repo's own rules refuse a force-push, merge ${b} into ${own} instead and push it plainly. The PR is squash-merged either way.`,
+      `Bring your branch ${own} up to date with ${b}, keeping any commit someone else pushed to it. Write each sha out in full: shell variables don't last from one command to the next.`,
+      `1. Push any commit of yours that isn't pushed yet, plainly: \`git push origin ${own}:refs/heads/${own}\`. If that's refused because the branch moved, \`git pull --rebase origin ${own}\` and push again. (Only here, before any rebase onto the base.)`,
+      `2. \`git fetch origin\`, then \`git rev-parse origin/${own}\`: that sha is <lease> below.`,
+      `3. \`git checkout -B ${own} <lease>\`: your branch exactly as pushed, others' commits included.`,
+      `4. \`git config rerere.enabled true\`, then \`git rebase ${b}\`: resolve the conflicts (\`git rebase --continue\`), run the tests.`,
+      `5. \`git push --force-with-lease=refs/heads/${own}:<lease> origin HEAD:refs/heads/${own}\`, with <lease> the sha from step 2.`,
+      `Force-push only this branch, only with that lease, never with plain \`--force\`. If the push is refused because the branch moved, go back to step 2: step 3 throws this rebase away and starts from what's pushed now, and rerere replays your resolutions. If the repo's own rules refuse any force-push, merge ${b} into ${own} instead and push it plainly. The PR is squash-merged either way.`,
     ];
   }
   const ref = SAFE_REF.test(pr.head_ref) ? pr.head_ref : null;
+  const r = ref ?? "<branch>";
   return [
     `This PR's branch is ${ref ?? "not a name this message quotes (read it with `gh pr view`)"}, not your task branch: never force-push it, and never rebase it. Merge the base into it and push plainly:`,
-    "```",
-    "git fetch origin",
-    `git checkout -B ${ref ?? "<branch>"} origin/${ref ?? "<branch>"}`,
-    `git merge ${b}   # resolve the conflicts, run the tests`,
-    `git push origin HEAD:refs/heads/${ref ?? "<branch>"}`,
-    "```",
-    "If the push is refused because the branch moved, fetch and merge again.",
+    `1. If you have commits on it that aren't pushed, push them first, plainly (\`git push origin ${r}:refs/heads/${r}\`; if refused, \`git pull origin ${r}\` and push again): the next step resets your copy of it to what's pushed.`,
+    `2. \`git fetch origin\`, then \`git checkout -B ${r} origin/${r}\`.`,
+    `3. \`git merge ${b}\`: resolve the conflicts, run the tests.`,
+    `4. \`git push origin HEAD:refs/heads/${r}\`. If it's refused because the branch moved, \`git pull origin ${r}\` (a merge) and push again.`,
   ];
 }
 

@@ -580,8 +580,9 @@ export const MIGRATIONS = [
     // A worker owns its PR until it merges (README.md#pr-upkeep). The only record kept: that this worker was
     // told of this condition on this PR at this head commit, so it's told once. The PRs themselves are read
     // from GitHub each time; these columns only schedule that read (when next, when last, its failures).
+    // `cleared`: a read saw it not hold at that head since (so its return is told, but not within PR_FLAP_MS).
     `CREATE TABLE pr_told (agent TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, cond TEXT NOT NULL, at_ms INTEGER NOT NULL,
-      PRIMARY KEY (agent, pr, head, cond))`,
+      cleared INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (agent, pr, head, cond))`,
     "ALTER TABLE settings ADD COLUMN pr_read_next_ms INTEGER",
     "ALTER TABLE settings ADD COLUMN pr_read_last_ms INTEGER",
     "ALTER TABLE settings ADD COLUMN pr_read_attempts INTEGER NOT NULL DEFAULT 0",
@@ -606,6 +607,8 @@ export const PR_READ_EVERY_MS = 60_000;
 export const PR_READ_GAP_MS = 30_000;
 /** A condition still holding at the same head is told again after this (README.md#pr-upkeep): a message lost or ignored doesn't strand the PR. */
 export const PR_RETELL_MS = 3 * 3600_000;
+/** A condition that cleared and returned at the same head (a flapping check) is told again no sooner than this after its last telling. */
+export const PR_FLAP_MS = 30 * 60_000;
 
 /** A failed stop's `next_ms` (the column is NOT NULL): never due (9999-12-31), until the owner's Retry. */
 const NOT_DUE_MS = 253_402_300_799_000;
@@ -1713,12 +1716,16 @@ export class ProjectDO extends DurableObject<Env> {
    */
   // --- PR upkeep (README.md#pr-upkeep) -----------------------------------------------------------------
 
-  /** The open PRs from the repo itself that a live worker owns (its task's, the worker past its brief), oldest attached first. */
+  /**
+   * The open PRs from the repo itself that a live worker owns (its task's, the worker past its brief), oldest
+   * attached first. Not while its task is blocked: the worker waits on the owner, and being told of its PR
+   * would push it to work around the block.
+   */
   private prOwners(): { pr: number; task: string; agent: string }[] {
     return this.sql.exec(
       `SELECT p.pr, p.task, t.assignee FROM task_prs p JOIN tasks t ON t.id = p.task
         WHERE p.state = 'open' AND (p.fork IS NULL OR p.fork = 0) AND t.worker_live = 1 AND t.assignee IS NOT NULL
-          AND t.state IN ('in_progress', 'in_review') ORDER BY p.attached_ms, p.pr`,
+          AND t.state IN ('in_progress', 'in_review') AND t.blocked_ms IS NULL ORDER BY p.attached_ms, p.pr`,
     ).toArray().map((r) => ({ pr: r.pr as number, task: r.task as string, agent: r.assignee as string }));
   }
 
@@ -1791,23 +1798,26 @@ export class ProjectDO extends DurableObject<Env> {
       if (!pr) continue;
       const v = verdicts[`${pr.number}/${pr.head_sha}`] ?? null;
       const holds = prConditions(pr, v);
-      // A condition seen not to hold at this head is forgotten, so its return (a Re-run that fails again) is told.
-      // A conflict GitHub hasn't computed yet (UNKNOWN) is neither.
+      // A condition seen not to hold at this head is marked cleared, so its return (a Re-run that fails again)
+      // is told, though not within PR_FLAP_MS of its last telling. A conflict GitHub hasn't computed yet
+      // (UNKNOWN) is neither.
       for (const c of UPKEEP_CONDITIONS) {
         if (holds.includes(c) || (c === "conflict" && pr.mergeable === "UNKNOWN")) continue;
-        this.sql.exec("DELETE FROM pr_told WHERE agent = ? AND pr = ? AND head = ? AND cond = ?", o.agent, pr.number, pr.head_sha, c);
+        this.sql.exec("UPDATE pr_told SET cleared = 1 WHERE agent = ? AND pr = ? AND head = ? AND cond = ?", o.agent, pr.number, pr.head_sha, c);
       }
       // Told once per condition at a head, and again every PR_RETELL_MS while it holds.
       const last = (c: UpkeepCondition) =>
-        (this.sql.exec("SELECT at_ms FROM pr_told WHERE agent = ? AND pr = ? AND head = ? AND cond = ?", o.agent, pr.number, pr.head_sha, c).toArray()[0]?.at_ms as number | undefined) ?? null;
-      const due = holds.map((c) => ({ c, at: last(c) })).filter((x) => x.at === null || x.at <= now - PR_RETELL_MS);
+        this.sql.exec("SELECT at_ms, cleared FROM pr_told WHERE agent = ? AND pr = ? AND head = ? AND cond = ?", o.agent, pr.number, pr.head_sha, c).toArray()[0];
+      const due = holds.map((c) => ({ c, row: last(c) })).filter(({ row }) =>
+        !row || (row.at_ms as number) <= now - (row.cleared === 1 ? PR_FLAP_MS : PR_RETELL_MS));
       if (!due.length) continue;
       for (const { c } of due) {
-        this.sql.exec("INSERT INTO pr_told (agent, pr, head, cond, at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT (agent, pr, head, cond) DO UPDATE SET at_ms = excluded.at_ms",
+        this.sql.exec("INSERT INTO pr_told (agent, pr, head, cond, at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT (agent, pr, head, cond) DO UPDATE SET at_ms = excluded.at_ms, cleared = 0",
           o.agent, pr.number, pr.head_sha, c, now);
       }
       const found = due.map((x) => x.c);
-      const again = due.every((x) => x.at !== null);
+      // A reminder only when every one was told and has held since; a return after clearing is news.
+      const again = due.every((x) => x.row && x.row.cleared === 0);
       // Relayed: check names and links are the repo's CI's, the findings a tainted reviewer's.
       this.oweMessage(o.agent, upkeepMessage(pr, found, v, { task: o.task, nonce: randomHex(8), again }), true);
       this.record(o.task, github, "pr_upkeep", { pr: pr.number, head: pr.head_sha, told: found, ...(again ? { again: true } : {}) });

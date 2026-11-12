@@ -116,11 +116,14 @@ export function summarize(h: HistoryRow): string {
     // A worker owns its PR until it merges (README.md#pr-upkeep): what it was told about it.
     case "pr_upkeep": {
       const said = { review_failed: "failed review", checks_failed: "has failing checks", conflict: "conflicts with its base" } as Record<string, string>;
-      const told = Array.isArray(o.told) ? o.told.map((c) => said[String(c)]).filter((x): x is string => !!x) : [];
+      const all = Array.isArray(o.told) ? o.told.map(String) : [];
+      // A condition this page doesn't know (a later release's) is still said, in general words.
+      const told = [...new Set(all.map((c) => said[c] ?? "needs work"))];
       const pr = typeof o.pr === "number" ? `PR #${o.pr}` : "its PR";
       // Told again (still so at the same head, hours on): a reminder.
       const verb = o.again === true ? "reminded" : "told";
-      return told.length ? `Its worker was ${verb} ${pr} ${told.length > 1 ? `${told.slice(0, -1).join(", ")} and ${told[told.length - 1]}` : told[0]}` : `Its worker was told ${pr} needs work`;
+      const what = told.length ? (told.length > 1 ? `${told.slice(0, -1).join(", ")} and ${told[told.length - 1]}` : told[0]) : "needs work";
+      return `Its worker was ${verb} ${pr} ${what}`;
     }
     case "worker_not_notified":
       return "Its worker couldn't be told of the change";
