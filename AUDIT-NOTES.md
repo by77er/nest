@@ -11,6 +11,7 @@
 | sandbox/guest-agent/README.md | `resume` after a restore; hands `busy` "while frozen" | `resume` only on a fork's first boot (restores cold-boot); nothing is ever frozen | crates/nestd/src/host.rs:1778-1780, crates/nest-guest/src/control.rs:107,115 |
 
 ## Unconfirmed
+- compute/README.md:49-52 prices: c8i.large spot ~$0.033/hr, DigitalOcean $42/mo, Lambda MicroVM ~$0.25/hr, "on-demand ~1.5× DO", "spot 60-70% less": no record in the repo (only on-demand prices in deploy/lean/Cell/Cells.lean:28-29).
 
 ## Suspected code bugs
 - **nest-proxy runs as root on cell hosts.** docs/compute/nestd/README.md (Privilege split: "nest-proxy, the gateway and the agent runner run unprivileged"), docs/README.md:183 ("the proxy is unprivileged") and the egress docs state it; `deploy/host/install.sh:90-104` writes `nest-proxy.service` with no `User=`/`CapabilityBoundingSet=`, and `crates/nest-proxy/src/main.rs` drops no privileges. Docs left as the decision.
@@ -18,6 +19,7 @@
 ## Drift outside the area
 
 ## Docs with no drift
+- compute/README (8i types Cells.lean:17-18; role names model.rs:192-199, Stack.lean:296-297; c8i.large $0.094 Cells.lean:28 93710 µ$; t3a.medium 37600 µ$/h ≈ $27/mo)
 - compute/cells (cells.ts:1-64, fleet.ts:2842-2843, index.ts:639,674, Stack.lean:598,602)
 - compute/brain-hosts (cells.ts:16-33 idle 1_800_000 and max_hosts 3; placement.ts:101,108-111 2 per vCPU; control.ts:13-15 5 s/20 s/30 s; nest-runner config.rs:59 120 s; agent.ts:84,327 30 s→5 min; Stack.lean:99 t3a/t3.medium). Prices already marked unverified.
 
