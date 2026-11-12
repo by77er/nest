@@ -13,6 +13,8 @@
 | sandbox/guest-agent/README.md | `resume` after a restore; hands `busy` "while frozen" | `resume` only on a fork's first boot (restores cold-boot); nothing is ever frozen | crates/nestd/src/host.rs:1778-1780, crates/nest-guest/src/control.rs:107,115 |
 
 ## Unconfirmed
+- compute/autoscaling/README.md: "Evidence: on EC2 (use1, 2026-10-17) a cell went from zero hosts to a running sandbox and back to zero" and the FIS spot run "within about 90 s of the notice": no record in dev/cloud-checks/, dev/measure-cut/ or e2e/FINDINGS.md. Also "each host is capped so a forced drain finishes in about 90 s at its measured upload bandwidth": no measurement or cap found tying `maxSandboxesPerHost` (Cells.lean:21, by disk and memory) to upload bandwidth.
+- compute/autoscaling/README.md: stopped warm host "about $2/mo for EBS": no record.
 - compute/README.md:49-52 prices: c8i.large spot ~$0.033/hr, DigitalOcean $42/mo, Lambda MicroVM ~$0.25/hr, "on-demand ~1.5× DO", "spot 60-70% less": no record in the repo (only on-demand prices in deploy/lean/Cell/Cells.lean:28-29).
 
 ## Suspected code bugs
@@ -26,4 +28,5 @@
 - compute/brain-hosts (cells.ts:16-33 idle 1_800_000 and max_hosts 3; placement.ts:101,108-111 2 per vCPU; control.ts:13-15 5 s/20 s/30 s; nest-runner config.rs:59 120 s; agent.ts:84,327 30 s→5 min; Stack.lean:99 t3a/t3.medium). Prices already marked unverified.
 
 ## Docs done
+- compute/autoscaling (numbers confirmed: placement.ts:155-160 backoff 60 s→15 min/5 min brain, 30 min decay; enroll-breaker.ts:8-11 3, 30 min, 6 h; fleet.ts:197 1 min image cache, :264 brain waits 12 min; cells.ts:44-48 idle 10 min, enroll 10 min, :28-31 brain 3 hosts, 30 min; host.rs:1473 spot poll 5 s)
 - sandbox/drivers/gvisor, lambda-microvm, sandbox/guest-agent (the rest confirmed: vsock ports and CID 2 check transport.rs:63; retention output.rs:18-21; env exec.rs:21-46; ingress order ingress.rs:63; exact protocol_version nestd guest.rs:276; busy before configure state.rs:124; SIGHUP on drop ingress.rs:246; 200 ms drain hands/bash.rs:141)
