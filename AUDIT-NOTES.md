@@ -13,6 +13,9 @@ Base: origin/main 6bbf64f.
 | Dependencies | "Waiting on N" badge is gray, outline | gray, `variant="light"` | projects/src/ui/features/board/WaitingBadge.tsx:36 |
 | Models | shared templates "which now carry the defaults" (tombstone wording) | they carry the defaults | projects/src/catalog.ts:172-173 |
 | Creating a project | a create is removed after 8 attempts or an unreadable body | also at once on a permanent failure | projects/src/do/directory.ts:141,196-205 |
+| Pieces | labels: `project`, `role`, worker `task`, reviewer `pr`/`sha` | also a routine run's `run` and (not dreaming) `routine`, and every start's `start` | projects/src/do/project.ts:3131,3198,4072,4124; do/review.ts:886 |
+| How it uses nest | templates `projects/{manager,worker,reviewer,routine}` | the sync also writes `projects/dreaming` | projects/src/catalog.ts:180 |
+| The repo's own guidance | "This replaces the runner reading the repo's CLAUDE.md" (change narrative) | the runner reads none of a repo's instructions | docs/agents/runner/README.md:29 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
@@ -31,6 +34,7 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Intro, What it does, Pieces, How it uses nest, The repo's own guidance, The MCP server, Flows: corrections above; the rest matches (grant permissions github.ts:25-47; overrides nest.ts:163; stop nest.ts:230-234; label listing nest.ts:207-208,334; github-token nest.ts:327; trace trace.ts:57, api.ts:118-119; grant repos grant-repos.ts, nest.ts:294-305, api.ts:122,158; CHECK_NAME github.ts:23; attach_error/attach_gen do/project.ts:345,542; REVIEW_DEADLINE_MS review-job.ts:60; MAX_RETRIES=2 do/review.ts:34; action_required do/review.ts:40; identity checks identity.ts:122-131; REPO_GUIDANCE/REVIEWER_GUIDANCE catalog.ts:50,58; default max_workers 2 do/project.ts:663).
 - Network: no drift (presets network.ts:39-46, ports :24, OUTSIDE :54, clientLayerFor :152; PUT network 403/400 api.ts:454-475; frozen_egress/network_rev do/project.ts:412-415; sidebar order ui/features/shell/Sidebar.test.tsx:98; strings NetworkPage.tsx:123,178,298; sources :370-373; nest's /policy route control-plane/src/index.ts:836).
 - Built-in tools: no drift (catalog.ts:19-38,106-107,130-134,178-182; control-plane/src/lib/grants.ts has no rules check).
 - Models: one wording fix; settings/defaults/ids (models.ts:10-31, requests.ts:49-50), templates (models.ts:56-60, catalog.ts:126-151), sweep (do/project.ts:1945-2014, outbox.ts:103), switch (nest.ts:197-199, do/project.ts:598-603,3951-4043), nest's 5 failures (control-plane/src/do/agent.ts:85-90) match.
