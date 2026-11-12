@@ -7,7 +7,7 @@ Sandboxes hold **no credentials** and never talk to model providers. Brains go d
 ```
 accept (listener ⇒ sandbox [, agent])
   → policy present? (no: deny; holding ≤ 30 s for an acknowledged policy is designed)
-  → read SNI / CONNECT target / Host → validate the name → policy(sandbox, agent?, host:port)
+  → read SNI / CONNECT target / Host → validate the name → policy(sandbox, host:port)
       deny        → HTTP 403 + JSON reason (over our TLS, or plaintext), `egress_denied` event
       passthrough → splice TCP without decrypting (pinned clients; SNI only, so no injection,
                     no inspection)
@@ -30,7 +30,7 @@ accept (listener ⇒ sandbox [, agent])
 | Component | Doc |
 |---|---|
 | Listeners, fd passing, nft rules, policy acknowledgement, kernel backstop, attribution | [steering/](steering/) |
-| Resolver: allowlisted names only, filtered and bounded answers | [dns/](dns/) |
+| Resolver: allowlisted names only; answer filtering and bounds (designed) | [dns/](dns/) |
 | CA chain (root in KMS), on-the-fly leaf certificates, handshake fairness, upstream verification | [tls/](tls/) |
 | Request checks after decryption: routed name, routing overrides, smuggling, limits, final re-check | [inspection/](inspection/) |
 | Hard deny, policy layers, live re-checks, temporary grants, TCP exceptions, request guards, repo allowlists, read-only repos, limits, audit | [policy/](policy/) |

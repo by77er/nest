@@ -25,7 +25,7 @@ Source for the protected fields and the `Fastly-*` rule: [SPACE's routing_header
 | Limit | Value |
 |---|---|
 | Request headers | ≤ 128, ≤ 32 KiB in total (not built: hyper's defaults apply) |
-| Time to read the headers | 30 s |
+| Time to read the headers | 30 s (HTTP/1.1; not built for h2) |
 | Concurrent h2 streams | ≤ 32 (not built: hyper's defaults apply) |
 | Request body | `limits.max_inspected_body_bytes` ([policy](../policy/)) |
 

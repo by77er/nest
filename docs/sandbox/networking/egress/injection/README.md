@@ -48,7 +48,7 @@ stripe-read:
 - **Substituted values are sensitive:** on h2 the header is sent as never-indexed ([RFC 7541 §7.1.3](https://www.rfc-editor.org/rfc/rfc7541#section-7.1.3)), so the secret never enters the HPACK dynamic table where later guest-controlled headers on the same connection could probe it.
 - **Reflected secrets are masked.** On a request where a credential was substituted, every occurrence of the secret (and of the exact credential header value, including the base64 of a `Basic` one) in the response headers and in an uncompressed response body is replaced with `*` of the same length, streaming, so `Content-Length` stays valid. Compressed (`content-encoding` other than identity) bodies aren't scanned.
 - **TRACE/TRACK are refused** on requests carrying an injected credential (405), since they echo the request back.
-- **Passthrough hosts can't receive injected credentials,** because their traffic isn't decrypted. Nor can plaintext HTTP: a placeholder on it is refused (403, `credential_requires_tls`).
+- **Passthrough hosts can't receive injected credentials,** because their traffic isn't decrypted. Nor can plaintext HTTP: a placeholder sent to the binding's own host over it is refused (403, `credential_requires_tls`).
 
 ## Secrets in the proxy
 
