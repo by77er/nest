@@ -140,7 +140,7 @@ POST /v1/agents
 ## The client's catalog
 
 - **A client writes templates and capabilities in its own namespace,** `<client-name>/<entry>` (`PUT /v1/catalog/templates/<client-name>/<entry>`, and the same for capabilities). It reads its own entries and the operator's; it never writes outside its namespace.
-- **Its capabilities' rules are read live** by the agents of its subtree, after their spawner's narrowing ([live rules](../../durable-objects/catalog/#live-rules)). Rules decide only whether a call the agent's spec already gives waits for an approval, which the client answers for its own subtree, so the grant doesn't limit them; an operator's agent spawned from the client's template keeps them as at spawn.
+- **Its capabilities' rules are read live** by the agents of its subtree, after their spawner's narrowing ([live rules](../../durable-objects/catalog/#live-rules)). Rules decide only whether a call the agent's spec already gives waits for an approval, which the client answers for its own subtree, so the grant doesn't limit them; an operator's agent spawned from the client's template outside the client's subtree keeps them as at spawn.
 - **Expansion applies the grant:** an mcp capability whose URL isn't in `mcp_urls`, a repo to push to outside `repos`, a repo to read outside `repos` and `read_repos`, or a credential outside `credentials` is refused when written and again at spawn. A client's `overrides.read_repos` narrows a template's read-only repos as `overrides.repos` narrows its allowlist, and may move a repo from the allowlist to the read list (less access), never back.
 
 ## Caller identity for MCP servers
