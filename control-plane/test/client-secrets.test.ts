@@ -14,6 +14,7 @@ import { Grant } from "../src/lib/clients";
 import { GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER } from "../src/lib/rules/github";
 import { ClientDO } from "../src/do/client";
 import { SandboxDO } from "../src/do/sandbox";
+import { BrokerDO } from "../src/do/broker";
 import { ADMIN, adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueCell, type Ws } from "./helpers";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
@@ -471,15 +472,16 @@ describe("client secrets pushed on write, and expiring", () => {
     const real = proto.clientSecretsChanged;
     const mine = sandboxIs(s.sandbox);
     let calls = 0;
+    // Twice: a give-up after the first or second failure would never deliver it (review lesson 6).
     proto.clientSecretsChanged = async function (this: any, ...args: unknown[]) {
-      if (mine.call(this) && ++calls === 1) throw new Error("SandboxDO unavailable");
+      if (mine.call(this) && ++calls <= 2) throw new Error("SandboxDO unavailable");
       return real.apply(this, args);
     };
     try {
       const second = fakeValue("n2");
       await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: second } });
-      await pushed(s.ws, s.sandbox, holds(second));
-      expect(calls).toBeGreaterThanOrEqual(2);
+      await pushed(s.ws, s.sandbox, holds(second), 12_000);
+      expect(calls).toBe(3);
     } finally {
       proto.clientSecretsChanged = real;
     }
@@ -495,15 +497,16 @@ describe("client secrets pushed on write, and expiring", () => {
     const real = proto.pushSecrets;
     const mine = sandboxIs(s.sandbox);
     let calls = 0;
+    // Twice (2 s, then 4 s): a give-up after the first or second failure leaves it to the 15-minute push.
     proto.pushSecrets = async function (this: any, ...args: unknown[]) {
-      if (mine.call(this) && ++calls === 1) throw new Error("FleetDO unavailable");
+      if (mine.call(this) && ++calls <= 2) throw new Error("FleetDO unavailable");
       return real.apply(this, args);
     };
     try {
       const second = fakeValue("p2");
       await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: second } });
-      await pushed(s.ws, s.sandbox, holds(second), 15_000);
-      expect(calls).toBeGreaterThanOrEqual(2);
+      await pushed(s.ws, s.sandbox, holds(second), 20_000);
+      expect(calls).toBe(3);
     } finally {
       proto.pushSecrets = real;
     }
@@ -552,5 +555,212 @@ describe("client secrets pushed on write, and expiring", () => {
       release();
       proto.scope = real;
     }
+  });
+});
+
+// What BrokerDO keeps of who asked (docs/control-plane/durable-objects/broker/#client-secret-pushes).
+describe("client secret pushes: who asked", () => {
+  const BEARER_ = [{ type: "authorization_bearer" }];
+  const stripe = () => ({ name: "stripe", secret: "stripe-key", hosts: ["api.stripe.com"], locations: BEARER_ });
+  const broker = () => env.BROKER.get(env.BROKER.idFromName("broker"));
+  const rows = (client: string, sandbox: string) => runInDurableObject(broker(), (_i, st) =>
+    st.storage.sql.exec<{ name: string }>("SELECT name FROM client_secret_sandboxes WHERE client = ? AND sandbox = ? ORDER BY name", client, sandbox)
+      .toArray().map((r) => r.name));
+  const queued = (sandbox: string) => runInDurableObject(broker(), (_i, st) =>
+    st.storage.sql.exec("SELECT 1 FROM client_secret_pushes WHERE sandbox = ?", sandbox).toArray().length);
+  const count = async (c: Client, name = "stripe-key") =>
+    ((await asJson(c.token, "/v1/clients/self/secrets")).secrets as any[]).find((x) => x.name === name)?.sandboxes;
+  /** Patch SandboxDO's `method` for one sandbox only; restore with the answer's `restore`. */
+  function patchSandbox(sandbox: string, method: string, fn: (real: (...a: unknown[]) => Promise<any>, self: any, args: unknown[]) => Promise<any>) {
+    const proto = SandboxDO.prototype as any;
+    const real = proto[method];
+    const id = env.SANDBOX.idFromName(sandbox);
+    proto[method] = async function (this: any, ...args: unknown[]) {
+      return this.ctx.id.equals(id) ? fn((...a) => real.apply(this, a), this, args) : real.apply(this, args);
+    };
+    return { restore: () => { proto[method] = real; } };
+  }
+
+  it("a stale push that lands after a newer one keeps the newer one's secrets recorded", async () => {
+    const c = await newClient();
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("o1") } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    const proto = ClientDO.prototype as any;
+    const real = proto.scope;
+    const clientId = env.CLIENT.idFromName(c.id);
+    const hold = { armed: true, reached: false, released: false };
+    proto.scope = async function (this: any, ...args: unknown[]) {
+      if (hold.armed && this.ctx.id.equals(clientId)) {
+        hold.armed = false;
+        hold.reached = true;
+        while (!hold.released) await new Promise((r) => setTimeout(r, 10));
+      }
+      return real.apply(this, args);
+    };
+    try {
+      // Push A (the refresh) waits at the grant read, before it records what it asks for.
+      await runInDurableObject(stub, (_i, st) => {
+        st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('inject_refresh', 0) ON CONFLICT(key) DO UPDATE SET at = 0");
+      });
+      const refresh = runDue(stub);
+      await eventually("the refresh to reach the hold", () => hold.reached);
+      // Push B binds another secret and records it.
+      const other = { name: "other", secret: "other-key", hosts: ["api.stripe.com"], locations: BEARER_ };
+      await asJson(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { inject: [other] } });
+      await eventually("push B to record other-key", async () => (await rows(c.id, s.sandbox)).includes("other-key"));
+      hold.released = true;
+      await refresh;
+      // A, stale and dropped, recorded only what it asked for, beside B's.
+      expect(await rows(c.id, s.sandbox)).toEqual(["other-key", "stripe-key"]);
+      expect((await asJson(c.token, "/v1/clients/self/secrets/other-key", { method: "PUT", body: { value: fakeValue("o2") } })).sandboxes).toBe(1);
+    } finally {
+      hold.released = true;
+      proto.scope = real;
+    }
+  });
+
+  it("a write while the previous notice is in flight gets a notice of its own (seq)", async () => {
+    const c = await newClient();
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("q0") } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    const hold = { armed: true, reached: false, released: false };
+    let calls = 0;
+    const p = patchSandbox(s.sandbox, "clientSecretsChanged", async (real, _self, args) => {
+      calls++;
+      if (hold.armed) {
+        hold.armed = false;
+        hold.reached = true;
+        while (!hold.released) await new Promise((r) => setTimeout(r, 10));
+      }
+      return real(...args);
+    });
+    try {
+      await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("q1") } });
+      await eventually("the first notice held", () => hold.reached);
+      const v2 = fakeValue("q2");
+      await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: v2 } });
+      hold.released = true;
+      // The first answer doesn't take the second write's notice with it.
+      await eventually("a second notice", () => calls >= 2);
+      await eventually("the queue drained", async () => (await queued(s.sandbox)) === 0);
+    } finally {
+      hold.released = true;
+      p.restore();
+    }
+  });
+
+  it("forgets a destroyed sandbox at its destroy, and a gone one a notice finds", async () => {
+    const c = await newClient();
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("d1") } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    expect(await count(c)).toBe(1);
+    await asJson(c.token, `/v1/sandboxes/${s.sandbox}`, { method: "DELETE" });
+    await eventually("the destroy to forget it", async () => (await count(c)) === 0);
+    // One recorded by a BrokerDO that missed the destroy (a previous release): the next write's notice finds it gone.
+    const ghost = `sbx_ghost${rand()}`;
+    await runInDurableObject(broker(), (_i, st) => {
+      st.storage.sql.exec("INSERT INTO client_secret_sandboxes (client, name, sandbox, asked_ms) VALUES (?, 'stripe-key', ?, 1)", c.id, ghost);
+    });
+    expect(await count(c)).toBe(1);
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("d2") } });
+    await eventually("gone forgotten", async () => (await count(c)) === 0);
+  });
+
+  it("forgets an unbound sandbox for the client, and names its bindings no longer name, at the next write", async () => {
+    const c = await newClient();
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("u1") } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    // A name asked for earlier that no binding names now.
+    await runInDurableObject(broker(), (_i, st) => {
+      st.storage.sql.exec("INSERT INTO client_secret_sandboxes (client, name, sandbox, asked_ms) VALUES (?, 'old-key', ?, 1)", c.id, s.sandbox);
+    });
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("u2") } });
+    await eventually("old-key forgotten, stripe-key kept", async () => JSON.stringify(await rows(c.id, s.sandbox)) === JSON.stringify(["stripe-key"]));
+    // Unbound altogether: forgotten for the client at the next write.
+    await asJson(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: {} });
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("u3") } });
+    await eventually("unbound forgotten", async () => (await count(c)) === 0);
+  });
+
+  it("an answer forgets only what was asked for before its notice went: a push recorded meanwhile stands", async () => {
+    const c = await newClient();
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("a1") } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    // While the notice is with the sandbox, a push of its records `fresh-key`; then it answers `unbound`.
+    const p = patchSandbox(s.sandbox, "clientSecretsChanged", async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      await env.BROKER.get(env.BROKER.idFromName("broker")).clientInjectionRefs(c.id, s.sandbox,
+        [{ binding: "client:fresh", secret: "fresh-key", hosts: ["api.stripe.com"] }], "test");
+      return { status: "unbound" };
+    });
+    try {
+      await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("a2") } });
+      await eventually("the notice answered", async () => (await queued(s.sandbox)) === 0);
+      expect(await rows(c.id, s.sandbox)).toEqual(["fresh-key"]);
+    } finally {
+      p.restore();
+    }
+  });
+
+  it("a sandbox that doesn't answer holds no other notice past its call's timeout", { timeout: 40_000 }, async () => {
+    const a = await newClient();
+    await asJson(a.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("h1") } });
+    const sa = await clientSandbox(a, { inject: [stripe()] });
+    const b = await newClient();
+    await asJson(b.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("h2") } });
+    const sb = await clientSandbox(b, { inject: [stripe()] });
+    const hang = { reached: false, released: false };
+    const p = patchSandbox(sa.sandbox, "clientSecretsChanged", async (real, _self, args) => {
+      hang.reached = true;
+      while (!hang.released) await new Promise((r) => setTimeout(r, 20));
+      return real(...args);
+    });
+    try {
+      await asJson(a.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("h3") } });
+      await eventually("A's notice to hang", () => hang.reached);
+      // B's write is queued behind the alarm run A holds: it goes once A's call times out (10 s).
+      const vb = fakeValue("h4");
+      await asJson(b.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: vb } });
+      await pushedTo(sb.ws, sb.sandbox, (x) => x.some((y) => y.value === vb), 25_000);
+    } finally {
+      hang.released = true;
+      p.restore();
+    }
+  });
+
+  it("roll-forward: a BrokerDO that finds notices waiting and no alarm arms it again, and they're delivered", async () => {
+    const stub = env.BROKER.get(env.BROKER.idFromName(`rearm-${rand()}`));
+    const sbx = `sbx_rearm${rand()}`;
+    await runInDurableObject(stub, async (_i, st) => {
+      st.storage.sql.exec("INSERT INTO client_secret_sandboxes (client, name, sandbox, asked_ms) VALUES ('cli_x', 'k', ?, 1)", sbx);
+      st.storage.sql.exec("INSERT INTO client_secret_pushes (sandbox, client, due_ms, attempts, seq) VALUES (?, 'cli_x', 5, 0, 1)", sbx);
+      // As a previous release's run of the alarm leaves it: rows waiting, no alarm.
+      await st.storage.deleteAlarm();
+      expect(await st.storage.getAlarm()).toBeNull();
+      // The next release's object starts on this storage.
+      new BrokerDO(st as any, env as any);
+    });
+    await eventually("the waiting notice delivered (a sandbox never made: forgotten)", () => runInDurableObject(stub, (_i, st) =>
+      st.storage.sql.exec("SELECT 1 FROM client_secret_pushes").toArray().length === 0
+      && st.storage.sql.exec("SELECT 1 FROM client_secret_sandboxes").toArray().length === 0));
+  });
+
+  it("a push carries the expiry stored with the value when FleetDO sends it, not the one the command was queued with", async () => {
+    const c = await newClient();
+    const s = await clientSandbox(c, {});
+    const host = (await runInDurableObject(env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox)), (_i, st) =>
+      JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value).host)) as string;
+    const value = fakeValue("st");
+    const at = Date.now() + 3_600_000;
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value, expires_at: new Date(at).toISOString() } });
+    await asJson(c.token, "/v1/clients/self/secrets/never", { method: "PUT", body: { value: fakeValue("nv") } });
+    // Queued with an expiry a token replaced meanwhile had (earlier), and one with none at all.
+    await env.FLEET.get(env.FLEET.idFromName(c.cell)).issueCommands(host, [{ type: "secrets_update", sandbox: s.sandbox, epoch: 1, secrets: [
+      { binding: "client:stripe", value: `$nest-secret:client-secret:${c.id}:stripe-key`, expires_ms: Date.now() + 60_000 },
+      { binding: "client:never", value: `$nest-secret:client-secret:${c.id}:never`, expires_ms: Date.now() + 60_000 },
+    ] } as any]);
+    const cmd = (await nextCommands(s.ws, (x) => x.type === "secrets_update")).find((x) => x.type === "secrets_update")!;
+    expect(cmd.secrets).toEqual([{ binding: "client:stripe", value, expires_ms: at }, { binding: "client:never", value: expect.any(String) }]);
   });
 });
