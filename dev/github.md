@@ -1,6 +1,6 @@
 # GitHub
 
-How nest's agents reach this repo, and the repo settings that bound what they can merge. **Decided:** a GitHub App from the start, with tokens minted by [BrokerDO](../docs/control-plane/durable-objects/broker/); low-risk changes auto-merge, and `CODEOWNERS` paths need me. Built: `CODEOWNERS`, the repo settings and branch protection below (with `ci-ok` the only required check until the reviewer exists), the `production` environment, and the App, installed on `by77er/nest`. Not built: BrokerDO's token minting (`GitHubAppMinter` throws `not_implemented`) and so the bindings and the webhook.
+How nest's agents reach this repo, and the repo settings that bound what they can merge. **Decided:** a GitHub App from the start, with tokens minted by [BrokerDO](../docs/control-plane/durable-objects/broker/); low-risk changes auto-merge, and `CODEOWNERS` paths need me. Built: `CODEOWNERS`, the repo settings and branch protection below, the `production` environment, the App, installed on `by77er/nest`, BrokerDO's minting of its installation tokens, and the reviewer: the [projects](../projects/README.md) app's `nest-projects/review` check. Not built: the bindings below.
 
 ## The App
 
@@ -11,13 +11,13 @@ One App, owned by me and installed only on `by77er/nest`.
 | Contents: read and write | Push branches |
 | Pull requests: read and write | Open PRs, comment, enable auto-merge |
 | Issues: read and write | Pick up and file work |
-| Checks: read and write | Read CI; post the `nest/review` check |
+| Checks: read and write | Read CI; post the `nest-projects/review` check |
 | Actions: read and write | Read logs; dispatch `rollback.yml` |
 | Workflows: read and write | Push changes to `.github/workflows/` (merging them still needs me) |
 | Deployments: read | See deploy outcomes and the pause |
 | Metadata: read | Required |
 
-- **Webhook:** the App's one webhook points at the coordination integration that delivers GitHub events to agents ([principle 9](../docs/README.md#principles); not built), with the secret shown to me once. Events: `pull_request`, `pull_request_review`, `pull_request_review_comment`, `issues`, `issue_comment`, `check_run`, `check_suite`, `workflow_run`, `push`, `deployment_status`. It covers every repo the App is installed on, so no per-repo webhook permission is needed.
+- **Webhook:** the App's one webhook points at the coordination integration that delivers GitHub events to agents ([principle 9](../docs/README.md#principles); the projects app's `/hooks/github` consumes it, unverified from GitHub's side), with the secret shown to me once. Events: `pull_request`, `pull_request_review`, `pull_request_review_comment`, `pull_request_review_thread`, `issues`, `issue_comment`, `check_run`. Designed, not yet subscribed: `check_suite`, `workflow_run`, `push`, `deployment_status`. It covers every repo the App is installed on, so no per-repo webhook permission is needed.
 - **No Administration permission:** the App can't change branch protection, environments or secrets.
 - **Commits** are authored as the App's bot user, so history shows which changes agents made.
 
@@ -33,8 +33,8 @@ One App, owned by me and installed only on `by77er/nest`.
 
 | Setting | Value |
 |---|---|
-| Plan | **GitHub Pro** (or a Team organization): branch protection on a private repo needs it. Users report rulesets not enforcing on personal private repos even on Pro (unverified), so use classic branch protection |
-| Branch protection on `main` | Require a pull request, 0 approvals, review from Code Owners. Required checks: `ci-ok` (from GitHub Actions; it aggregates every CI job) and `nest/review` (pinned to the App as its source, so a same-named check from anything else doesn't count). Not "up to date before merging": PR CI already runs on the merge with `main`, and deploys wait for CI on `main`. No force pushes or deletions. Administrators (me) may bypass |
+| Visibility and plan | Public. Branch protection on a private repo would need **GitHub Pro** (or a Team organization), and users report rulesets not enforcing on personal private repos even on Pro (unverified), so `main` uses classic branch protection, which GitHub reports as enforced |
+| Branch protection on `main` | Require a pull request, 0 approvals, review from Code Owners. Required checks: `ci-ok` (from GitHub Actions; it aggregates every CI job) and `nest-projects/review` (pinned to the App as its source, so a same-named check from anything else doesn't count; the projects app requires it when it attaches the repo). Not "up to date before merging": PR CI already runs on the merge with `main`, and deploys wait for CI on `main`. No force pushes or deletions. Administrators (me) may bypass |
 | Merging | Allow auto-merge; squash only; delete head branches |
 | Actions | Workflow permissions read-only; Actions may not create or approve pull requests |
 | Environment `production` | Deployment branches: `main` only. Secrets: `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_ANALYTICS_TOKEN`, `CLOUDFLARE_TUNNEL_API_TOKEN` (the Worker secret the deploy writes; [setup](../docs/setup/)), `CLOUDFLARE_ACCESS_API_TOKEN` (the `edge` stack's apply, and the projects app's stack in `deploy-projects-infra.yml`), `NEST_ADMIN_TOKEN` (the dashboard Worker's secret, written by `deploy-dashboard.yml`), `PROJECTS_NEST_CLIENT_TOKEN`, `PROJECTS_NEST_WEBHOOK_SECRET`, `PROJECTS_GITHUB_WEBHOOK_SECRET` (the projects Worker's secrets, written by `deploy-projects.yml`) |
@@ -44,7 +44,7 @@ One App, owned by me and installed only on `by77er/nest`.
 
 ## Merge policy
 
-- **Low-risk** means no `CODEOWNERS` path changed. Such a PR merges when CI and `nest/review` pass.
+- **Low-risk** means no `CODEOWNERS` path changed. Such a PR merges when CI and `nest-projects/review` pass.
 - **`CODEOWNERS` paths** need my approval as well:
   - the gates: `.github/`, `scripts/`, `AGENTS.md`, `.claude/`, and the toolchain, lint, dependency and secret-scanning configs;
   - dependency manifests and lockfiles;
