@@ -23,6 +23,11 @@ export interface Ended {
   kill: boolean;
   /** Destroy its sandbox, when no other agent is attached and `endMayDestroy` (an ephemeral agent's always asks). */
   destroy_sandbox: boolean;
+  /**
+   * Its ender asked for `destroy_sandbox` itself (not only the ephemeral default): only then does the ender's
+   * authority count (`endMayDestroy`'s `by`). Absent (and on ends from before it): only a sandbox made for it.
+   */
+  destroy_asked?: true;
   /** The stopper's words (`reason` of `agent_stop` or `exit`), shown in its `exited` event. */
   note?: string;
   /** The graceful `agent_stop` went out for the brain at this epoch. */

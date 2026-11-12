@@ -450,6 +450,8 @@ describe("agent_stop", () => {
     await until(async () => (await ended(o2.agent))?.sandbox, "o2's sandbox step");
     expect(await ended(o2.agent)).toMatchObject({ by: "user", sandbox: "destroyed" });
     expect((await sandboxStub(shared.sandbox).info()).state).toBe("destroyed");
+    // A retry of the release after the destroy says so again (AgentDO's step is recorded from it).
+    expect(await sandboxStub(shared.sandbox).release(o2.agent, true, "user")).toEqual({ destroyed: true });
   });
 });
 
