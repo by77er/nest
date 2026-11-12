@@ -105,7 +105,7 @@ export function Board({ projectId, repo }: { projectId: string; repo: string }) 
 
   const pendingAsks = useMemo(() => {
     const m = new Map<string, number>();
-    for (const a of asks.data ?? []) if (a.answered_ms === null && a.task) m.set(a.task, (m.get(a.task) ?? 0) + 1);
+    for (const a of asks.data ?? []) if (a.task) m.set(a.task, (m.get(a.task) ?? 0) + 1);
     return m;
   }, [asks.data]);
 

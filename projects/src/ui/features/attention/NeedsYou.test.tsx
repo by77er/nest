@@ -64,7 +64,7 @@ describe("asks", () => {
   it("a question is answered in words; one nest refuses keeps the ask and what was typed", async () => {
     const api = new FakeApi();
     const a = ask({ question: "Which branch should I base on?", role: "manager", agent: "agt_manager" });
-    api.asks = [a, ask({ question: "already answered", answered_ms: 5 })];
+    api.asks = [a];
     api.fail(/\/answer$/, 502, "nest is unavailable");
     const { user } = renderApp("/projects/prj_one/board", api);
 

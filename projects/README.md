@@ -39,7 +39,7 @@ Only the client interface. One client, `projects`, has this grant:
 | Templates for the four roles | `PUT /v1/catalog/templates/projects/{manager,worker,reviewer,routine}` and capabilities `projects/{board,task,review,routine}` (the MCP URLs), synced from this directory at deploy |
 | Starting an agent | `POST /v1/sandboxes {cell, labels}`, then `POST /v1/agents {template: "projects/<role>", cell, sandbox, labels, overrides}`, each with an `Idempotency-Key`. `overrides` is `{repos: [<repo>]}` for a worker, whose sandbox pushes only to that repo, and `{read_repos: [<repo>]}` for the manager and a reviewer, whose sandboxes only read it ([read-only repos](../docs/sandbox/networking/egress/policy/#read-only-repos)). The agent clones it |
 | Talking to the manager | `POST /v1/agents/<id>/inbox`. Replies arrive as `agent.turn_completed` events |
-| Approvals | `agent.ask` events, shown in "Needs you" with blocked tasks ([below](#blocked)), answered by `POST /v1/agents/<id>/asks/…` |
+| Approvals | `GET /v1/asks?label=project=<id>` when "Needs you" is read, answered by `POST /v1/agents/<id>/asks/…` ([asks](#asks)) |
 | Ending a worker or reviewer | `POST /v1/agents/<id>/stop {end: true, destroy_sandbox: true}` |
 | Knowing what agents did | Signed webhooks to `/hooks/nest`, deduplicated by event `id`. After a gap (the dropped count rises), it re-reads `GET /v1/agents?label=project=<id>` |
 | Check runs and branch protection | `POST /v1/clients/self/github-token {repo, permissions}`, then GitHub's API with that token |
@@ -421,8 +421,19 @@ The owner's request (2026-11-02): "Agents might mark their tasks as blocked, whi
   - **The manager** (`unblock_task`) **or the task's worker** (`clear_blocked`) clears it when it's resolved another way.
 - **The manager is told** when a worker blocks, with the reason and the question. That text is relayed (`from: "projects/board"`) when the worker's session was tainted, as a brief from a tainted spec is.
 - **Delivery:** messages to agents' inboxes are owed in ProjectDO's `messages` table, posted once each (a request id) from the alarm, retried from 5 s doubling to 5 min, and kept with the reason when nest refuses for good.
-- **"Needs you"** is one area at the top of the board: open asks and blocked tasks together, oldest first (`GET /api/projects/:id/attention`). Each shows who, why, how long ago, and its answer (approve or deny, or words). It replaces the asks banner, and is calm: the surface with a warning rule down its left edge and a warning icon by its title, not a tinted fill.
+- **"Needs you"** is one area at the top of the board: open asks ([below](#asks)) and blocked tasks together, oldest first (`GET /api/projects/:id/attention`). Each shows who, why, how long ago, and its answer (approve or deny, or words). It replaces the asks banner, and is calm: the surface with a warning rule down its left edge and a warning icon by its title, not a tinted fill.
 - **The count:** `GET /api/projects` gives each project `needs_you`: the number of items "Needs you" lists (`attentionOf` in `src/api.ts` makes both), so the projects list, the sidebar's badge and the panel agree. Triage and the review backlog are one item each, however many issues, proposals or PRs they hold.
+
+## Asks
+
+The owner's direction (2026-11-11): "eliminate any duplicate data which can become out of date". The app used to copy each `agent.ask` event into ProjectDO's `asks` table and mark a row answered only when the owner answered through the app. Answered anywhere else (the operator through nest's API, another path), or with its agent ended, the row stayed in "Needs you".
+- **nest's record is the only one.** "Needs you", the board's "Needs input" badges and the projects list's count read the project's agents' open asks from nest whenever they're read: `GET /v1/asks?label=project=<id>` ([open asks across agents](../docs/control-plane/api/#open-asks-across-agents)), one call for every agent, all its pages. An ask answered anywhere, or whose agent ended (nest lists live agents only), is gone at the next read. Nothing is kept, so nothing goes stale.
+- **Whose:** only agents the app made itself (owner and client both the app, as the webhook routes events): an agent one of its agents spawned could carry any labels. Role and task are the agent's labels (`role`, `task`). A manager's ask from one that isn't the project's manager now (a replaced one whose stop nest refused) is labelled "The previous manager".
+- **nest not answering fails the read** (502): "Needs you" keeps what it last showed rather than show nothing, and never hides an ask nest still holds. The projects list counts such a project as 0 until nest answers.
+- **Answering** (`POST /api/projects/:id/asks/:ask/answer`) finds the ask among the project's open ones first, so another project's ask, or one no longer open, is refused (409) without asking nest; then it goes to nest. Only an answer that reached the ask (nest's `delivered` isn't `already_answered`) counts as the owner's reply for the manager's `await_reply` ([waiting](#waiting)). The page reads the asks again either way.
+- **`agent.ask` events change nothing:** the app had no other use for them (no notification, no wait). They're still verified and routed like every event.
+- **One release back:** a control plane from before `GET /v1/asks` answers it 401 (a client's unknown route); the app then lists the agents by label and reads each one's `GET /v1/agents/<id>/asks`.
+- **The `asks` table** is no longer read or written. It stays this release, so a rollback's code still finds it, and a later release drops it.
 
 ## Task changes
 

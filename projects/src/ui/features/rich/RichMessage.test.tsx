@@ -259,7 +259,7 @@ describe("task references", () => {
     const a = task({ title: "First", state: "in_progress", assignee: "agt_w1", pr: 42 });
     const b = task({ title: "Second", state: "stalled", blocked: { at_ms: 1, by: "agt_w2", role: "worker", reason: "needs a key", question: null, tainted: false } });
     const fence = "```";
-    const asks = [ask({ task: b.id, question: "Which key?" }), ask({ task: a.id, question: "Done already", answered_ms: 5 })];
+    const asks = [ask({ task: b.id, question: "Which key?" })];
     const { root } = await show(`Status:\n\n${fence}tasks\n${a.id} — PR is up\n${b.id}\n${fence}`, [a, b], asks);
     const cards = [...root.querySelectorAll("[data-ds=task-card]")] as HTMLElement[];
     expect(cards.map((c) => c.getAttribute("data-task-ref"))).toEqual([a.id, b.id]);

@@ -229,7 +229,10 @@ export interface ChatMessage {
   error: string | null;
 }
 
-/** An agent's ask (nest's `agent.ask`), open until `answered_ms`. */
+/**
+ * An open ask of one of the project's agents, as nest holds it (README.md#asks): read from nest when asked,
+ * never kept here. Its role and task are the agent's labels.
+ */
 export interface Ask {
   ask: string;
   agent: string;
@@ -239,7 +242,6 @@ export interface Ask {
   /** nest's `{name, tool}` for a held sink call; null for a plain question. */
   approval: unknown;
   at_ms: number;
-  answered_ms: number | null;
   /** A manager's ask from one that isn't the project's manager any more (README.md#the-manager-lifecycle): labelled so. */
   previous: boolean;
 }
@@ -575,6 +577,9 @@ export const MIGRATIONS = [
     "ALTER TABLE settings ADD COLUMN switch_gave_up_model TEXT",
   ],
 ] as const;
+
+/** The roles an ask's agent may carry in its labels (as the webhook routes them); any other reads as none. */
+const ASK_ROLES = new Set(["manager", "worker", "reviewer", "routine"]);
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
 const RECENT_WAITS = 10;
@@ -2088,7 +2093,7 @@ export class ProjectDO extends DurableObject<Env> {
     const blocked = this.sql.exec(`${TASK_SELECT} WHERE t.blocked_ms IS NOT NULL`).toArray().map((r): Attention => ({
       kind: "blocked", task: r.id as string, title: r.title as string, state: r.state as TaskState, ...blockedOf(r)!,
     }));
-    const open = asks.value.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
+    const open = asks.value.map((a): Attention => ({ kind: "ask", ...a }));
     const secrets = this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL").toArray().map((r): Attention => ({ kind: "secret", ...requestOf(r) }));
     const t = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(opened_ms) AS at FROM issues WHERE state = 'untriaged'").one();
     const pr = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(created_ms) AS at FROM proposals WHERE state = 'untriaged'").one();
@@ -2147,29 +2152,54 @@ export class ProjectDO extends DurableObject<Env> {
     return ok(this.chatStatus(seq));
   }
 
+  /**
+   * The open asks of the project's agents (README.md#asks), oldest first: nest's, read when asked
+   * (`GET /v1/asks` by the `project` label), so one answered anywhere or whose agent ended is simply gone.
+   * Only agents the app made itself count (owner and client both the app, as the webhook routes events):
+   * an agent one of its agents spawned could carry any labels. Role and task are its labels.
+   */
   async asks(): Promise<Result<Ask[]>> {
-    if (!this.settings()) return fail(404, "unknown project");
-    const manager = this.settings()!.manager;
-    return ok(this.sql.exec("SELECT * FROM asks ORDER BY at_ms").toArray().map((r) => ({
-      ask: r.ask as string, agent: r.agent as string, role: (r.role as string | null) ?? null, task: (r.task as string | null) ?? null,
-      question: (r.question as string | null) ?? null, approval: r.approval ? JSON.parse(r.approval as string) : null,
-      at_ms: r.at_ms as number, answered_ms: (r.answered_ms as number | null) ?? null,
-      previous: r.role === "manager" && r.agent !== manager,
-    })));
-  }
-
-  async answerAsk(ask: string, answer: string): Promise<Result<{ delivered: unknown }>> {
-    if (!this.settings()) return fail(404, "unknown project");
-    const r = this.sql.exec("SELECT agent, answered_ms FROM asks WHERE ask = ?", ask).toArray()[0];
-    if (!r) return fail(404, "unknown ask");
-    if (r.answered_ms !== null) return fail(409, "already answered");
+    const s = this.settings();
+    if (!s) return fail(404, "unknown project");
     const nest = nestFrom(this.env);
     if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
+    const me = clientIdOf(this.env.NEST_CLIENT_TOKEN);
+    let open;
     try {
-      const out = await nest.answerAsk(r.agent as string, ask, answer);
-      this.sql.exec("UPDATE asks SET answered_ms = ?, answer = ? WHERE ask = ?", Date.now(), answer, ask);
-      this.replyWaits(`answered ask ${ask}`);
-      await this.arm();
+      open = await nest.openAsks({ project: s.id });
+    } catch (e) {
+      return fail(502, `nest couldn't list the agents' asks: ${message(e)}`);
+    }
+    // The manager as it is now (an await passed): one that isn't the project's manager any more is labelled so.
+    const manager = this.settings()!.manager;
+    return ok(open.filter((a) => a.owner === me && a.labels.project === s.id).map((a): Ask => {
+      const role = ASK_ROLES.has(a.labels.role ?? "") ? a.labels.role! : null;
+      return {
+        ask: a.ask, agent: a.agent, role, task: a.labels.task ?? null, question: a.question ?? null, approval: a.approval ?? null,
+        at_ms: a.created_ms, previous: role === "manager" && a.agent !== manager,
+      };
+    }).sort((x, y) => x.at_ms - y.at_ms));
+  }
+
+  /**
+   * The owner answers an open ask: found among the project's (so an ask of another project's agent, or one
+   * no longer open, is refused), then answered in nest. A manager waiting for the owner's reply is woken only
+   * when the answer reached the ask, not when nest says it was answered already.
+   */
+  async answerAsk(ask: string, answer: string): Promise<Result<{ delivered: unknown }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const nest = nestFrom(this.env);
+    if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
+    const open = await this.asks();
+    if (!open.ok) return open;
+    const a = open.value.find((x) => x.ask === ask);
+    if (!a) return fail(409, "this ask isn't open any more: it was answered, or its agent ended");
+    try {
+      const out = await nest.answerAsk(a.agent, ask, answer);
+      if (out.delivered !== "already_answered") {
+        this.replyWaits(`answered ask ${ask}`);
+        await this.arm();
+      }
       return ok(out);
     } catch (e) {
       return e instanceof NestError ? fail(e.status === 404 ? 404 : 502, e.message) : fail(502, String(e));
@@ -2209,11 +2239,9 @@ export class ProjectDO extends DurableObject<Env> {
         if (route.role === "worker") this.workerExited(e.agent, e.reason, e.text);
         this.sql.exec("DELETE FROM agent_secrets WHERE agent = ?", e.agent);
         break;
+      // An ask is nest's alone (README.md#asks): read from nest when "Needs you" is, never kept here, so its
+      // event changes nothing. (The `asks` table is no longer read or written; a later release drops it.)
       case "agent.ask":
-        this.sql.exec(
-          "INSERT OR IGNORE INTO asks (ask, agent, role, task, question, approval, at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
-          e.ask, e.agent, route.role, route.task, e.question ?? null, e.approval === undefined ? null : JSON.stringify(e.approval), Date.now(),
-        );
         break;
       case "agent.error": {
         this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, ?, ?, ?, ?, ?)",

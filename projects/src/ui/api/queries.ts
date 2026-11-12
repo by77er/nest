@@ -411,12 +411,14 @@ export function useAnswerAsk(id: string) {
     mutationFn: (v: { ask: string; answer: string }) => api.answerAsk(id, v.ask, { answer: v.answer }),
     meta: { failure: "The answer wasn't sent" },
     onSuccess: (_d, v) => {
-      qc.setQueryData<Ask[]>(keys.asks(id), (old) => old?.map((a) => (a.ask === v.ask ? { ...a, answered_ms: Date.now() } : a)));
+      // nest lists open asks only: an answered one is gone.
+      qc.setQueryData<Ask[]>(keys.asks(id), (old) => old?.filter((a) => a.ask !== v.ask));
       qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "ask" && x.ask === v.ask)));
-      void qc.invalidateQueries({ queryKey: keys.attention(id) });
-      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
-      return qc.invalidateQueries({ queryKey: keys.asks(id) });
     },
+    // Either way, read nest's again: one refused as no longer open (answered elsewhere, its agent ended) goes at once.
+    onSettled: () => Promise.all([
+      qc.invalidateQueries({ queryKey: keys.attention(id) }), qc.invalidateQueries({ queryKey: keys.projects, exact: true }), qc.invalidateQueries({ queryKey: keys.asks(id) }),
+    ]),
   });
 }
 

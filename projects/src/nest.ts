@@ -66,6 +66,20 @@ export interface Ask {
   [k: string]: unknown;
 }
 
+/** An open ask as `GET /v1/asks` lists it: with its agent, the agent's owner and labels (docs/control-plane/api/#open-asks-across-agents). */
+export interface OpenAsk {
+  agent: string;
+  owner?: string | null;
+  labels: Labels;
+  ask: string;
+  question: string;
+  created_ms: number;
+  approval?: { name: string; tool: string | null };
+}
+
+/** Pages of `GET /v1/asks` (100 agents each) read at most for one listing; past it the listing fails rather than leave asks out. */
+const ASK_PAGES = 10;
+
 /**
  * What a client may add to its own sandbox's spec: its egress rules (docs/control-plane/api/clients/#egress),
  * its secrets' bindings and the environment that names their placeholders (#injection, #environment),
@@ -253,6 +267,49 @@ export class Nest {
 
   listAsks(agent: string): Promise<unknown> {
     return this.call("GET", `/v1/agents/${encodeURIComponent(agent)}/asks`);
+  }
+
+  /**
+   * Every open ask of the app's live agents carrying every label in `labels`, in the app's cell, read from
+   * nest when asked (`GET /v1/asks`, all its pages). A control plane from before that route (one release back)
+   * answers a client's unknown route 401: then each agent's own (`GET /v1/agents/<id>/asks`), as before.
+   */
+  async openAsks(labels: Labels): Promise<OpenAsk[]> {
+    const out: OpenAsk[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < ASK_PAGES; page++) {
+      let r: { asks: OpenAsk[]; next_cursor: string | null };
+      try {
+        r = await this.call("GET", "/v1/asks", undefined, { query: { label: labelFilters(labels), cell: this.config.cell, limit: "100", ...(cursor ? { cursor } : {}) } });
+      } catch (e) {
+        if (page === 0 && e instanceof NestError && (e.status === 401 || e.status === 404)) return this.openAsksPerAgent(labels);
+        throw e;
+      }
+      out.push(...r.asks);
+      cursor = r.next_cursor;
+      if (!cursor) return out;
+    }
+    throw new Error(`more than ${ASK_PAGES * 100} agents to list asks of`);
+  }
+
+  /** `openAsks` on a control plane without `GET /v1/asks`: the agents by their labels, then each one's asks. */
+  private async openAsksPerAgent(labels: Labels): Promise<OpenAsk[]> {
+    const agents: Listed[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < ASK_PAGES; page++) {
+      const r: { agents: Listed[]; next_cursor: string | null } = await this.call("GET", "/v1/agents", undefined, {
+        query: { label: labelFilters(labels), state: "live", cell: this.config.cell, limit: "100", ...(cursor ? { cursor } : {}) },
+      });
+      agents.push(...r.agents);
+      cursor = r.next_cursor;
+      if (!cursor) break;
+    }
+    if (cursor) throw new Error(`more than ${ASK_PAGES * 100} agents to list asks of`);
+    const per = await Promise.all(agents.filter((a) => a.agent).map(async (a) => {
+      const asks = (await this.listAsks(a.agent!)) as Omit<OpenAsk, "agent" | "owner" | "labels">[];
+      return asks.map((x) => ({ ...x, agent: a.agent!, owner: a.owner ?? null, labels: a.labels }));
+    }));
+    return per.flat().sort((a, b) => a.created_ms - b.created_ms);
   }
 
   answerAsk(agent: string, ask: string, answer: string): Promise<{ delivered: unknown }> {

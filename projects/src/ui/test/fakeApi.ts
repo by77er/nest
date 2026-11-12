@@ -58,7 +58,7 @@ export function task(over: Partial<Task> = {}): Task {
 
 export function ask(over: Partial<Ask> = {}): Ask {
   seq += 1;
-  return { ask: `ask_a${seq}`, agent: "agt_worker", role: "worker", task: null, question: null, approval: null, at_ms: now - 30_000, answered_ms: null, previous: false, ...over };
+  return { ask: `ask_a${seq}`, agent: "agt_worker", role: "worker", task: null, question: null, approval: null, at_ms: now - 30_000, previous: false, ...over };
 }
 
 export class FakeApi {
@@ -155,7 +155,7 @@ export class FakeApi {
   }
 
   attention(): Attention[] {
-    const asks = this.asks.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
+    const asks = this.asks.map((a): Attention => ({ kind: "ask", ...a }));
     const blocked = this.tasks.filter((t) => t.blocked).map((t): Attention => ({ kind: "blocked", task: t.id, title: t.title, state: t.state, ...t.blocked! }));
     const secrets = this.secretRequests.map((r): Attention => ({ kind: "secret", ...r }));
     const held = this.reviews.filter((j) => j.state === "held").map((j): Attention => ({ kind: "review", pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
@@ -325,10 +325,10 @@ export class FakeApi {
       case "POST issues/import":
         return json(this.importAnswer ?? { imported: 0, known: this.issues.length, ignored: 0, dropped: 0 });
       case "POST asks/:ask/answer": {
-        const a = this.asks.find((x) => x.ask === parts[3]);
-        if (!a) return json({ error: "unknown ask" }, 404);
-        a.answered_ms = now;
-        return json({ delivered: true });
+        // As the Worker: nest lists open asks only, so an answered one is gone; one not listed is refused.
+        if (!this.asks.some((x) => x.ask === parts[3])) return json({ error: "this ask isn't open any more: it was answered, or its agent ended" }, 409);
+        this.asks = this.asks.filter((x) => x.ask !== parts[3]);
+        return json({ delivered: "async" });
       }
       case "GET routines":
         return json({ routines: this.routines, max_routine_runs: p.settings.max_routine_runs, live: this.routines.filter((r) => r.live_run).length });

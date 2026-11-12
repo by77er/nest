@@ -191,7 +191,7 @@ describe("the board", () => {
     const t = task({ title: "with markers", state: "in_review", tainted: true, pr: 42, assignee: "agt_w1" });
     const plain = task({ title: "plain", state: "in_review" });
     api.tasks = [t, plain];
-    api.asks = [ask({ task: t.id, question: "May I?" }), ask({ task: plain.id, answered_ms: 1 })];
+    api.asks = [ask({ task: t.id, question: "May I?" })];
     renderApp("/projects/prj_one/board", api);
 
     const card = await screen.findByRole("article", { name: "with markers" });
