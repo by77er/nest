@@ -62,6 +62,11 @@ export const ErrorCodes = {
   TOOL_ERROR: "tool_error",
   /** Refused because the agent is working now (`POST /start {when: "idle"}` while a turn runs or is queued): ask again later. HTTP 409. */
   BUSY: "busy",
+  /**
+   * A live-count limit is full (an API client's grant's `max_agents` or `max_sandboxes`, a spawner's live
+   * children): there is room once fewer are live than the limit. The message names the limit. HTTP 429, retryable.
+   */
+  AT_CAPACITY: "at_capacity",
 } as const;
 /** What the control-host channels sent for `unsupported_version` before the names merged: read, never sent. */
 export const LEGACY_UNSUPPORTED_VERSION = "unsupported_protocol_version";
