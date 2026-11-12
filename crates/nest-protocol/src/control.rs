@@ -168,6 +168,11 @@ pub struct HostHello {
     /// release, which the control plane neither prefers for new brains nor wedges.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub brain_epochs: bool,
+    /// This host's nest-proxy decodes a guarded host's request once and refuses one past the guarded
+    /// bounds (docs/sandbox/networking/egress/policy/#request-guards). Absent (false) from a host of the
+    /// previous release, on whose cell the control plane refuses API clients' request guards.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guard_bounds: bool,
     /// Everything this host currently holds; FleetDO reconciles against it.
     pub sandboxes: Vec<SandboxReport>,
     pub agents: Vec<AgentReport>,

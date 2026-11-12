@@ -12,6 +12,11 @@
 //! safe-path rules (no `\`, `#`, NUL, `//`, dot segments, raw or encoded), with its literals compared
 //! to the segments as sent, so an encoded or `;`-suffixed name never equals one. A body the proxy can't read (encoded, too large, not JSON) is in scope and never
 //! an exception.
+//!
+//! Cost: guards run on the proxy's shared workers, so a request is decoded and normalized once
+//! ([`Req::prepare`]), not per matcher, and on a guarded host a path or query past the
+//! `MAX_GUARDED_*` bounds is refused rather than decided. Each matcher then costs time linear in the
+//! bounded path and query (a pattern with one `**`).
 
 use nest_protocol::model::{JsonFieldMatch, QueryMatch, RequestGuard, RequestMatch};
 
@@ -19,6 +24,15 @@ use nest_protocol::model::{JsonFieldMatch, QueryMatch, RequestGuard, RequestMatc
 const MAX_PATH: usize = 2048;
 /// Decoding rounds for scope matching (`%252e` → `%2e` → `.`).
 const DECODE_ROUNDS: usize = 3;
+
+/// On a guarded host, the longest path the proxy decides (bytes as sent); a longer one is refused.
+pub const MAX_GUARDED_PATH: usize = 4096;
+/// On a guarded host, the most path segments, as sent or normalized; more are refused.
+pub const MAX_GUARDED_SEGMENTS: usize = 256;
+/// On a guarded host, the longest query string the proxy decides (bytes as sent); a longer one is refused.
+pub const MAX_GUARDED_QUERY: usize = 8192;
+/// On a guarded host, the most query parameters; more are refused.
+pub const MAX_GUARDED_QUERY_PAIRS: usize = 256;
 
 /// The request as a guard sees it.
 pub struct Req<'a> {
@@ -29,6 +43,55 @@ pub struct Req<'a> {
     pub query: Option<&'a str>,
     /// The binding whose credential the proxy substituted into this request, if any.
     pub injected: Option<&'a str>,
+}
+
+/// A request target over the bounds a guarded host's requests are decided within: refused, never
+/// decided (deciding costs time in its length for every matcher).
+#[derive(Debug, PartialEq, Eq)]
+pub struct TooLong;
+
+/// A request decoded once for every guard and matcher: its path's segments as sent and normalized,
+/// whether it is clean (an exception can match it at all), and its query's pairs as sent and decoded.
+pub struct Prepared<'a> {
+    host: &'a str,
+    method: &'a str,
+    injected: Option<&'a str>,
+    raw: Vec<&'a str>,
+    norm: Vec<String>,
+    clean: bool,
+    pairs: Vec<(&'a str, &'a str)>,
+    decoded: Vec<(String, String)>,
+}
+
+impl<'a> Req<'a> {
+    /// Decode the request once, within the bounds a guarded host's requests are decided in.
+    pub fn prepare(&self) -> Result<Prepared<'a>, TooLong> {
+        let query = self.query.unwrap_or("");
+        if self.path.len() > MAX_GUARDED_PATH || query.len() > MAX_GUARDED_QUERY {
+            return Err(TooLong);
+        }
+        let raw: Vec<&'a str> = self.path.strip_prefix('/').unwrap_or(self.path).split('/').collect();
+        let pairs: Vec<(&'a str, &'a str)> =
+            query.split(['&', ';']).filter(|p| !p.is_empty()).map(|pair| pair.split_once('=').unwrap_or((pair, ""))).collect();
+        if raw.len() > MAX_GUARDED_SEGMENTS || pairs.len() > MAX_GUARDED_QUERY_PAIRS {
+            return Err(TooLong);
+        }
+        let norm = normalize(self.path);
+        if norm.len() > MAX_GUARDED_SEGMENTS {
+            return Err(TooLong);
+        }
+        let decoded = pairs.iter().map(|(k, v)| (decode_repeatedly(k, true), decode_repeatedly(v, true))).collect();
+        Ok(Prepared {
+            host: self.host,
+            method: self.method,
+            injected: self.injected,
+            raw,
+            norm,
+            clean: clean_path(self.path),
+            pairs,
+            decoded,
+        })
+    }
 }
 
 /// What the proxy knows of the request body.
@@ -51,18 +114,21 @@ pub fn covers(g: &RequestGuard, host: &str) -> bool {
     g.hosts.iter().any(|h| h.matches(host))
 }
 
-/// Whether deciding this request needs its body: some matcher of a guard on its host looks at the
-/// body and everything else about it matches.
-pub fn needs_body(guards: &[RequestGuard], req: &Req<'_>) -> bool {
+/// Whether deciding this request needs its body: a guard on its host has a scope matcher that matches
+/// it whatever its body (a body matcher counted as matching), and a body matcher of that guard's scope
+/// or exceptions matches everything else about it. A guard none of whose scope can match doesn't refuse,
+/// whatever the body says.
+pub fn needs_body(guards: &[RequestGuard], req: &Prepared<'_>) -> bool {
     guards.iter().filter(|g| covers(g, req.host)).any(|g| {
-        g.scope.iter().map(|m| (m, Mode::Scope)).chain(g.allow.iter().map(|m| (m, Mode::Allow))).any(|(m, mode)| {
-            m.body_json.is_some() && matches(m, req, None, g.ignore_case, mode)
-        })
+        g.scope.iter().any(|m| matches(m, req, None, g.ignore_case, Mode::Scope))
+            && g.scope.iter().map(|m| (m, Mode::Scope)).chain(g.allow.iter().map(|m| (m, Mode::Allow))).any(|(m, mode)| {
+                m.body_json.is_some() && matches(m, req, None, g.ignore_case, mode)
+            })
     })
 }
 
 /// The first guard that refuses this request, if any.
-pub fn refusing<'g>(guards: &'g [RequestGuard], req: &Req<'_>, body: &BodyView<'_>) -> Option<&'g RequestGuard> {
+pub fn refusing<'g>(guards: &'g [RequestGuard], req: &Prepared<'_>, body: &BodyView<'_>) -> Option<&'g RequestGuard> {
     guards.iter().find(|g| {
         covers(g, req.host)
             && g.scope.iter().any(|m| matches(m, req, Some(body), g.ignore_case, Mode::Scope))
@@ -71,7 +137,7 @@ pub fn refusing<'g>(guards: &'g [RequestGuard], req: &Req<'_>, body: &BodyView<'
 }
 
 /// `body: None` ignores the body matcher (the pre-pass that decides whether to read it).
-fn matches(m: &RequestMatch, req: &Req<'_>, body: Option<&BodyView<'_>>, ic: bool, mode: Mode) -> bool {
+fn matches(m: &RequestMatch, req: &Prepared<'_>, body: Option<&BodyView<'_>>, ic: bool, mode: Mode) -> bool {
     if !m.methods.is_empty() && !m.methods.iter().any(|x| x.eq_ignore_ascii_case(req.method)) {
         return false;
     }
@@ -85,14 +151,14 @@ fn matches(m: &RequestMatch, req: &Req<'_>, body: Option<&BodyView<'_>>, ic: boo
     }
     if let Some(p) = &m.path {
         let ok = match mode {
-            Mode::Scope => path_in_scope(p, req.path, ic),
-            Mode::Allow => path_excepted(p, req.path, ic),
+            Mode::Scope => path_in_scope(p, req, ic),
+            Mode::Allow => path_excepted(p, req, ic),
         };
         if !ok {
             return false;
         }
     }
-    if !m.query.iter().all(|q| query_matches(q, req.query.unwrap_or(""), ic, mode)) {
+    if !m.query.iter().all(|q| query_matches(q, req, ic, mode)) {
         return false;
     }
     match (&m.body_json, body) {
@@ -126,38 +192,36 @@ fn pattern(p: &str) -> Option<Vec<Seg<'_>>> {
 
 /// Segment glob: a literal equals the segment (without ASCII case when `ic`), `*` is one non-empty
 /// segment, `**` any number.
-fn glob(pat: &[Seg<'_>], segs: &[&str], ic: bool) -> bool {
+fn glob<S: AsRef<str>>(pat: &[Seg<'_>], segs: &[S], ic: bool) -> bool {
+    #[cfg(test)]
+    GLOB_STEPS.with(|d| d.set(d.get() + 1));
     match pat.split_first() {
         None => segs.is_empty(),
-        Some((Seg::Any, rest)) => (0..=segs.len()).any(|i| glob(rest, &segs[i..], ic)),
-        Some((Seg::One, rest)) => segs.split_first().is_some_and(|(s, tail)| !s.is_empty() && glob(rest, tail, ic)),
-        Some((Seg::Lit(l), rest)) => {
-            segs.split_first().is_some_and(|(s, tail)| (if ic { s.eq_ignore_ascii_case(l) } else { s == l }) && glob(rest, tail, ic))
+        // A tail with no `**` matches exactly as many segments as it has, so only the split that leaves
+        // that many can match: one `**` costs time linear in the path, not in the path times the tail.
+        Some((Seg::Any, rest)) if !rest.iter().any(|s| matches!(s, Seg::Any)) => {
+            segs.len() >= rest.len() && glob(rest, &segs[segs.len() - rest.len()..], ic)
         }
+        Some((Seg::Any, rest)) => (0..=segs.len()).any(|i| glob(rest, &segs[i..], ic)),
+        Some((Seg::One, rest)) => segs.split_first().is_some_and(|(s, tail)| !s.as_ref().is_empty() && glob(rest, tail, ic)),
+        Some((Seg::Lit(l), rest)) => segs.split_first().is_some_and(|(s, tail)| {
+            let s = s.as_ref();
+            (if ic { s.eq_ignore_ascii_case(l) } else { s == *l }) && glob(rest, tail, ic)
+        }),
     }
 }
 
 /// In scope if the pattern matches the path as sent or normalized. A pattern that isn't one
 /// (no leading `/`) is in scope everywhere: a broken guard refuses rather than lets through.
-fn path_in_scope(p: &str, path: &str, ic: bool) -> bool {
+fn path_in_scope(p: &str, req: &Prepared<'_>, ic: bool) -> bool {
     let Some(pat) = pattern(p) else { return true };
-    let raw: Vec<&str> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
-    if glob(&pat, &raw, ic) {
-        return true;
-    }
-    let norm = normalize(path);
-    let norm: Vec<&str> = norm.iter().map(String::as_str).collect();
-    glob(&pat, &norm, ic)
+    glob(&pat, &req.raw, ic) || glob(&pat, &req.norm, ic)
 }
 
 /// An exception matches only a clean path, as sent.
-fn path_excepted(p: &str, path: &str, ic: bool) -> bool {
+fn path_excepted(p: &str, req: &Prepared<'_>, ic: bool) -> bool {
     let Some(pat) = pattern(p) else { return false };
-    if !clean_path(path) {
-        return false;
-    }
-    let segs: Vec<&str> = path[1..].split('/').collect();
-    glob(&pat, &segs, ic)
+    req.clean && glob(&pat, &req.raw, ic)
 }
 
 /// The injection safe-path rules, plus no segment that decodes to a dot segment.
@@ -190,17 +254,14 @@ fn normalize(path: &str) -> Vec<String> {
 
 // --- queries and bodies --------------------------------------------------------------------------------
 
-fn query_matches(q: &QueryMatch, raw: &str, ic: bool, mode: Mode) -> bool {
+fn query_matches(q: &QueryMatch, req: &Prepared<'_>, ic: bool, mode: Mode) -> bool {
     let eq = |a: &str, b: &str| if ic { a.eq_ignore_ascii_case(b) } else { a == b };
-    raw.split(['&', ';']).filter(|p| !p.is_empty()).any(|pair| {
-        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        let hit = |k: &str, v: &str| eq(k, &q.name) && (q.values.is_empty() || q.values.iter().any(|x| eq(v, x)));
-        match mode {
-            // Exceptions match only what was sent literally.
-            Mode::Allow => hit(k, v),
-            Mode::Scope => hit(k, v) || hit(&decode_repeatedly(k, true), &decode_repeatedly(v, true)),
-        }
-    })
+    let hit = |k: &str, v: &str| eq(k, &q.name) && (q.values.is_empty() || q.values.iter().any(|x| eq(v, x)));
+    match mode {
+        // Exceptions match only what was sent literally.
+        Mode::Allow => req.pairs.iter().any(|(k, v)| hit(k, v)),
+        Mode::Scope => req.pairs.iter().zip(&req.decoded).any(|((k, v), (dk, dv))| hit(k, v) || hit(dk, dv)),
+    }
 }
 
 fn body_matches(f: &JsonFieldMatch, b: &BodyView<'_>, mode: Mode) -> bool {
@@ -217,7 +278,17 @@ fn body_matches(f: &JsonFieldMatch, b: &BodyView<'_>, mode: Mode) -> bool {
 
 // --- percent-decoding ----------------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    /// Decodes on this thread: a test pins that matching decodes nothing (`prepare` decodes once).
+    static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Glob steps on this thread: a test pins that one `**` costs time linear in the path.
+    static GLOB_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn decode_repeatedly(s: &str, plus: bool) -> String {
+    #[cfg(test)]
+    DECODES.with(|d| d.set(d.get() + 1));
     let mut cur = if plus { s.replace('+', " ") } else { s.to_string() };
     for _ in 0..DECODE_ROUNDS {
         let next = decode(&cur);
@@ -275,7 +346,7 @@ mod tests {
     }
 
     fn refused(g: &RequestGuard, r: &Req<'_>) -> bool {
-        refusing(std::slice::from_ref(g), r, &BodyView::Unread).is_some()
+        refusing(std::slice::from_ref(g), &r.prepare().unwrap(), &BodyView::Unread).is_some()
     }
 
     #[test]
@@ -423,10 +494,10 @@ mod tests {
     #[test]
     fn body_field_exception_and_unreadable_bodies() {
         let g = body_guard();
-        let r = req("b.test", "POST", "/batch");
+        let r = req("b.test", "POST", "/batch").prepare().unwrap();
         assert!(needs_body(std::slice::from_ref(&g), &r));
-        assert!(!needs_body(std::slice::from_ref(&g), &req("b.test", "POST", "/other")));
-        assert!(!needs_body(std::slice::from_ref(&g), &req("other.test", "POST", "/batch")));
+        assert!(!needs_body(std::slice::from_ref(&g), &req("b.test", "POST", "/other").prepare().unwrap()));
+        assert!(!needs_body(std::slice::from_ref(&g), &req("other.test", "POST", "/batch").prepare().unwrap()));
         let read = serde_json::json!({"op": "read"});
         let write = serde_json::json!({"op": "write"});
         let missing = serde_json::json!({});
@@ -450,7 +521,7 @@ mod tests {
             reason: String::new(),
             ignore_case: false,
         };
-        let r = req("b.test", "POST", "/x");
+        let r = req("b.test", "POST", "/x").prepare().unwrap();
         let read = serde_json::json!({"op": "read"});
         let decide = |b: BodyView<'_>| refusing(std::slice::from_ref(&g), &r, &b).is_some();
         assert!(!decide(BodyView::Json(&read)));
@@ -476,13 +547,76 @@ mod tests {
     }
 
     #[test]
+    fn a_guard_whose_scope_cannot_match_never_reads_the_body() {
+        // Exceptions that look at the body, but a scope this request is outside: the body can't matter.
+        let g = RequestGuard { scope: vec![m(&["PUT"], None)], ..body_guard() };
+        assert!(!needs_body(std::slice::from_ref(&g), &req("b.test", "POST", "/batch").prepare().unwrap()));
+        // In scope, but the only body exception is for another method.
+        assert!(!needs_body(std::slice::from_ref(&g), &req("b.test", "PUT", "/batch").prepare().unwrap()));
+        // In scope and the exception's other fields match: the body decides.
+        let g = RequestGuard { scope: vec![m(&[], None)], ..body_guard() };
+        assert!(needs_body(std::slice::from_ref(&g), &req("b.test", "POST", "/batch").prepare().unwrap()));
+    }
+
+    #[test]
+    fn matching_decodes_nothing_the_request_was_decoded_once() {
+        // Scope matchers this request misses, so each is tried in full (its path as sent and normalized,
+        // its query as sent and decoded), and exceptions on queries: none decodes the request again.
+        let path_scope = m(&[], Some("/**/deposit"));
+        let query_scope = RequestMatch { query: vec![QueryMatch { name: "op".into(), values: vec!["deposit".into()] }], ..Default::default() };
+        let g = RequestGuard {
+            scope: (0..50).flat_map(|_| [path_scope.clone(), query_scope.clone()]).collect(),
+            allow: (0..50).map(|_| RequestMatch { query: vec![QueryMatch { name: "op".into(), values: vec![] }], ..Default::default() }).collect(),
+            ..push_guard()
+        };
+        let r = Req { host: "vault.test", method: "POST", path: "/a%2e/b%2Fc/withdraw", query: Some("op=with%64raw&x=%2541"), injected: None };
+        let before = DECODES.with(|d| d.get());
+        let p = r.prepare().unwrap();
+        let prepared = DECODES.with(|d| d.get()) - before;
+        assert!(prepared > 0);
+        assert!(!needs_body(std::slice::from_ref(&g), &p));
+        assert!(refusing(std::slice::from_ref(&g), &p, &BodyView::Unread).is_none());
+        assert_eq!(DECODES.with(|d| d.get()) - before, prepared, "a matcher decoded the request again");
+    }
+
+    #[test]
+    fn one_double_star_tries_only_the_split_its_tail_fits() {
+        let g = RequestGuard { scope: vec![m(&[], Some("/**/a/*/a/b"))], allow: vec![], ..push_guard() };
+        let path = "/a".repeat(MAX_GUARDED_SEGMENTS - 1);
+        let r = Req { host: "vault.test", method: "GET", path: &path, query: None, injected: None }.prepare().unwrap();
+        let before = GLOB_STEPS.with(|d| d.get());
+        assert!(refusing(std::slice::from_ref(&g), &r, &BodyView::Unread).is_none());
+        // Two forms (as sent and normalized), each one split of at most five steps.
+        assert!(GLOB_STEPS.with(|d| d.get()) - before <= 12, "{}", GLOB_STEPS.with(|d| d.get()) - before);
+        let hit = format!("{path}/b");
+        let r = Req { host: "vault.test", method: "GET", path: &hit, query: None, injected: None }.prepare().unwrap();
+        assert!(refusing(std::slice::from_ref(&g), &r, &BodyView::Unread).is_some());
+    }
+
+    #[test]
+    fn targets_past_the_guarded_bounds_are_not_decided() {
+        let ok = |path: &str, query: Option<&str>| Req { host: "h.test", method: "GET", path, query, injected: None }.prepare().is_ok();
+        assert!(ok(&format!("/{}", "a".repeat(MAX_GUARDED_PATH - 1)), None));
+        assert!(!ok(&format!("/{}", "a".repeat(MAX_GUARDED_PATH)), None));
+        assert!(ok(&"/a".repeat(MAX_GUARDED_SEGMENTS), None));
+        assert!(!ok(&"/a".repeat(MAX_GUARDED_SEGMENTS + 1), None));
+        // Normalizing can make segments (an encoded `/`): counted too.
+        assert!(!ok(&format!("/{}", "a%2F".repeat(MAX_GUARDED_SEGMENTS + 1)), None));
+        assert!(ok(&format!("/{}", "a%2F".repeat(MAX_GUARDED_SEGMENTS)), None));
+        assert!(ok("/", Some(&"x".repeat(MAX_GUARDED_QUERY))));
+        assert!(!ok("/", Some(&"x".repeat(MAX_GUARDED_QUERY + 1))));
+        assert!(ok("/", Some(&vec!["a=1"; MAX_GUARDED_QUERY_PAIRS].join("&"))));
+        assert!(!ok("/", Some(&vec!["a=1"; MAX_GUARDED_QUERY_PAIRS + 1].join("&"))));
+    }
+
+    #[test]
     fn every_guard_must_pass_and_a_broken_pattern_refuses() {
         let a = store_guard(false);
         let mut b = store_guard(false);
         b.name = "second".into();
         b.allow = vec![];
         let guards = [a, b];
-        let r = req("files.test", "PUT", "/store/mine/x");
+        let r = req("files.test", "PUT", "/store/mine/x").prepare().unwrap();
         assert_eq!(refusing(&guards, &r, &BodyView::Unread).map(|g| g.name.as_str()), Some("second"));
         let broken = RequestGuard { scope: vec![m(&[], Some("no-slash"))], allow: vec![m(&[], Some("no-slash"))], ..store_guard(false) };
         assert!(refused(&broken, &req("files.test", "GET", "/anything")));

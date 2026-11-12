@@ -24,6 +24,7 @@ import {
 } from "./lib/client-secrets";
 import { GithubPush } from "./lib/rules/github";
 import { ClientEgress, egressOutsideGrant } from "./lib/client-egress";
+import { ClientGuards } from "./lib/client-guards";
 import { SandboxEnv, unboundPlaceholders } from "./lib/sandbox-env";
 import { TimerName } from "./lib/timers";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
@@ -344,9 +345,12 @@ const escapeHtml = (t: string) => t.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt
 
 /**
  * `PUT /v1/sandboxes/<id>/client-policy`'s body: the whole client layer (an absent part is emptied):
- * egress rules, injection bindings, environment, and the push token's opt-ins (`github_push`).
+ * egress rules, injection bindings, environment, the push token's opt-ins (`github_push`) and request guards.
  */
-const ClientLayer = z.strictObject({ egress: ClientEgress.optional(), inject: ClientInjections.optional(), env: SandboxEnv.optional(), github_push: GithubPush.optional() });
+const ClientLayer = z.strictObject({
+  egress: ClientEgress.optional(), inject: ClientInjections.optional(), env: SandboxEnv.optional(), github_push: GithubPush.optional(),
+  guards: ClientGuards.optional(),
+});
 
 /**
  * An environment's values: no placeholder that none of `bound` is, and no value of a secret the caller
@@ -812,6 +816,8 @@ export const ROUTES: Route[] = [
       egress: ClientEgress.optional(),
       // Its processes' environment: literals, or placeholders of `inject` (docs/control-plane/api/clients/#environment).
       env: SandboxEnv.optional(),
+      // Request guards: they only refuse, so no grant covers them (docs/control-plane/api/clients/#request-guards).
+      guards: ClientGuards.optional(),
     }),
     run: (c) => createOnce(c, "sandbox", async (id, begin) => {
       const { env, body: r, caller } = c;
@@ -840,6 +846,7 @@ export const ROUTES: Route[] = [
         ...(r.policy ? { policy: r.policy } : {}), ...(r.idle_ttl_ms !== undefined ? { idle_ttl_ms: r.idle_ttl_ms } : {}),
         ...(inject.length ? { inject } : {}), ...(r.github_push?.workflows ? { github_push: { workflows: true as const } } : {}),
         ...(r.egress?.allow.length ? { egress: r.egress.allow } : {}), ...(r.env && Object.keys(r.env).length ? { env: r.env } : {}),
+        ...(r.guards?.length ? { guards: r.guards } : {}),
       }));
       // 202: accepted and waiting for a host (SandboxDO retries; an autoscaled cell launches one).
       return json(info, info.host ? 201 : 202);
@@ -847,7 +854,7 @@ export const ROUTES: Route[] = [
   }),
   route({ method: "GET", path: "/v1/sandboxes", auth: "owner", run: (c) => listing(c, "sandbox") }),
   // Its client layer (docs/control-plane/api/clients/#the-client-layer): egress rules, injection bindings,
-  // environment and the push token's opt-ins, replaced whole on a live sandbox within its client's grant,
+  // environment, the push token's opt-ins and request guards, replaced whole on a live sandbox within its client's grant,
   // through the usual policy and secrets push.
   route({ method: "GET", path: "/v1/sandboxes/:sandbox/client-policy", auth: "owner", run: async (c) =>
     newMethod("SandboxDO.clientLayer", async () => (await ownSandbox(c, c.p.sandbox)).clientLayer()) }),
@@ -872,7 +879,9 @@ export const ROUTES: Route[] = [
       const bound = [...inject.map((b) => b.placeholder),
         ...(await stub.policy()).inject.filter((b) => !b.name.startsWith(CLIENT_BINDING_PREFIX)).map((b) => b.placeholder)];
       await checkEnv(c.env, c.caller, r.env ?? {}, bound);
-      return newMethod("SandboxDO.setClientLayer", () => stub.setClientLayer({ egress: r.egress?.allow ?? [], inject, env: r.env ?? {}, workflows: r.github_push?.workflows === true }));
+      return newMethod("SandboxDO.setClientLayer", () => stub.setClientLayer({
+        egress: r.egress?.allow ?? [], inject, env: r.env ?? {}, workflows: r.github_push?.workflows === true, guards: r.guards ?? [],
+      }));
     },
   }),
   route({
