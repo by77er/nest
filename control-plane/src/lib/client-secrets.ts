@@ -14,6 +14,11 @@ export const ClientSecretName = z.string().regex(/^[a-z][a-z0-9_-]{0,62}$/,
 export const ClientSecretPut = z.strictObject({
   value: z.string().min(1),
   description: z.string().max(500).optional(),
+  /**
+   * When the value stops being injected: an RFC 3339 time with an offset (e.g. GitHub's `expires_at`).
+   * nest-proxy refuses the binding's placeholder from then on. Absent: it never expires.
+   */
+  expires_at: z.iso.datetime({ offset: true }).optional(),
 });
 /** Where BrokerDO keeps a client's secret value (its `secrets` table): only `secrets_update` resolves the prefix. */
 export const CLIENT_SECRET_PREFIX = "client-secret:";

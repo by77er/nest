@@ -1225,7 +1225,11 @@ export const ROUTES: Route[] = [
       const self = selfClient(c);
       const name = clientSecretName(c.p.name);
       const limit = { max_count: self.grant.secrets?.max_count ?? 0, max_bytes: self.grant.secrets?.max_bytes ?? SECRET_MAX_BYTES_DEFAULT };
-      return newMethod("BrokerDO.putClientSecret", () => broker(c.env).putClientSecret(self.client, name, c.body.value, c.body.description ?? null, limit));
+      // An expiry already past would store a value nothing can use: refused rather than silently dropped.
+      const expires = c.body.expires_at === undefined ? null : Date.parse(c.body.expires_at);
+      if (expires !== null && expires <= Date.now()) throw new NestError(ErrorCodes.INVALID_MESSAGE, `expires_at ${c.body.expires_at} has passed`);
+      return newMethod("BrokerDO.writeClientSecret", () => broker(c.env).writeClientSecret(self.client, name,
+        { value: c.body.value, description: c.body.description ?? null, expires_ms: expires }, limit));
     },
   }),
   route({ method: "DELETE", path: "/v1/clients/self/secrets/:name", auth: "owner", run: async (c) => {
