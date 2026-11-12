@@ -3,6 +3,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import worker, { ROUTES } from "../src/index";
+import * as entry from "../src/index";
 import clientsDoc from "../../docs/control-plane/api/clients/README.md?raw";
 import { ADMIN, BASE, uniqueCell } from "./helpers";
 
@@ -26,7 +27,7 @@ const NOT_ADMIN = {
     "POST /v1/agents", "GET /v1/agents", "GET /v1/agents/:agent", "GET /v1/agents/:agent/turns", "GET /v1/agents/:agent/transcript", "GET /v1/agents/:agent/trace", "GET /v1/agents/:agent/trace/history",
     "POST /v1/agents/:agent/turns", "POST /v1/agents/:agent/inbox", "POST /v1/agents/:agent/interrupt", "POST /v1/agents/:agent/start",
     "POST /v1/agents/:agent/stop", "GET /v1/agents/:agent/children", "GET /v1/agents/:agent/brokered", "GET /v1/agents/:agent/asks",
-    "POST /v1/agents/:agent/asks/:ask/answer", "GET /v1/agents/:agent/timers", "DELETE /v1/agents/:agent/timers/:name",
+    "POST /v1/agents/:agent/asks/:ask/answer", "GET /v1/asks", "GET /v1/agents/:agent/timers", "DELETE /v1/agents/:agent/timers/:name",
     "POST /v1/sandboxes", "GET /v1/sandboxes", "GET /v1/sandboxes/:sandbox", "DELETE /v1/sandboxes/:sandbox", "PUT /v1/sandboxes/:sandbox/lifetime",
     "GET /v1/sandboxes/:sandbox/policy", "GET /v1/sandboxes/:sandbox/client-policy", "PUT /v1/sandboxes/:sandbox/client-policy",
     "GET /v1/catalog",
@@ -131,5 +132,14 @@ describe("?cell= (a multi-cell config: CELLS names two cells, neither of them th
     expect((await call(ADMIN, "GET", "/v1/agents")).status).toBe(403);
     await ok(ADMIN, "GET", `/v1/agents?cell=${cellA}`);
     expect((await call(ADMIN, "GET", `/v1/admin/gc?cell=nowhere`)).status).toBe(403);
+  });
+});
+
+describe("the Worker's entry module", () => {
+  // workerd takes every named export of the main module as an entrypoint, and refuses to start on one that
+  // isn't a function or an object (a constant exported for tests stopped `wrangler dev`, 2026-11-12).
+  it("exports only classes, functions and objects", () => {
+    const bad = Object.entries(entry).filter(([, v]) => typeof v !== "function" && (typeof v !== "object" || v === null)).map(([k]) => k);
+    expect(bad).toEqual([]);
   });
 });
