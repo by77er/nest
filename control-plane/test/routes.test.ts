@@ -3,6 +3,7 @@
 import { env, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import worker, { ROUTES } from "../src/index";
+import * as entry from "../src/index";
 import clientsDoc from "../../docs/control-plane/api/clients/README.md?raw";
 import { ADMIN, BASE, uniqueCell } from "./helpers";
 
@@ -131,5 +132,14 @@ describe("?cell= (a multi-cell config: CELLS names two cells, neither of them th
     expect((await call(ADMIN, "GET", "/v1/agents")).status).toBe(403);
     await ok(ADMIN, "GET", `/v1/agents?cell=${cellA}`);
     expect((await call(ADMIN, "GET", `/v1/admin/gc?cell=nowhere`)).status).toBe(403);
+  });
+});
+
+describe("the Worker's entry module", () => {
+  // workerd takes every named export of the main module as an entrypoint, and refuses to start on one that
+  // isn't a function or an object (a constant exported for tests stopped `wrangler dev`, 2026-11-12).
+  it("exports only classes, functions and objects", () => {
+    const bad = Object.entries(entry).filter(([, v]) => typeof v !== "function" && (typeof v !== "object" || v === null)).map(([k]) => k);
+    expect(bad).toEqual([]);
   });
 });

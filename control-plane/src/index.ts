@@ -519,9 +519,9 @@ async function listing(c: Ctx<string, unknown>, kind: "agent" | "sandbox"): Prom
 const ASKS_PAGE = 50;
 const ASKS_PAGE_MAX = 100;
 /** Asks shown per agent on a page of `GET /v1/asks`; an agent with more is named in `more`. */
-export const ASKS_PER_AGENT = 20;
+const ASKS_PER_AGENT = 20;
 /** How long one AgentDO may take to list its asks before the page fails (retryable). */
-export const ASKS_AGENT_TIMEOUT_MS = 5_000;
+const ASKS_AGENT_TIMEOUT_MS = 5_000;
 
 /**
  * `GET /v1/asks` (docs/control-plane/api/#open-asks-across-agents): the open asks of a page of live agents
