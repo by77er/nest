@@ -210,7 +210,7 @@ describe("the manager's model, switched now", () => {
     const api = new FakeApi();
     api.projects[0]!.settings = { ...api.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch_given_up: "claude-sonnet-5-5" };
     const { user, dialog } = await openSettings(api);
-    expect(dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Takes effect when the manager next starts.");
+    expect(dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Couldn't switch the running manager: takes effect when it next starts.");
     // Another model picked: that one would be switched to now, so the line goes.
     const field = within(dialog).getAllByLabelText("Manager's model").find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden")!;
     await user.click(field);

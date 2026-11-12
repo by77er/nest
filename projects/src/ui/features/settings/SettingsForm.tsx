@@ -168,7 +168,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                 )}
                 {settings.manager_switch_given_up === form.getValues().manager_model && (
                   <Text fz="sm" c="dimmed" data-slot="manager-switch" role="status">
-                    Takes effect when the manager next starts.
+                    Couldn&apos;t switch the running manager: takes effect when it next starts.
                   </Text>
                 )}
                 <ModelField
