@@ -8,14 +8,14 @@
   - using subscription OAuth tokens in other products or tools, or routing requests through them
   - third parties collecting, storing or intermediating Claude.ai credentials
 
-  Anthropic has enforced this server-side since early 2026.
+  Anthropic has enforced this server-side since early 2026 (unverified).
 
 **How nest complies:**
 - One OAuth token from `setup-token`, used only by unmodified Claude Code.
 - Only documented flags.
 - **No proxy decrypts, injects or rewrites OAuth traffic.**
 - The token never enters a VM.
-- Usage stays within ordinary personal use; the [scheduler](../../orchestration/scheduling/) caps concurrency. The terms give no number for "ordinary".
+- Usage stays within ordinary personal use; the [scheduler](../../orchestration/scheduling/) caps concurrency (not built; today brain placement caps brains per brain host). The terms give no number for "ordinary".
 - **Single owner only.** Products built for others should use API keys ([Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)). Anything multi-user, or other people's agents on my token, needs written clearance from Anthropic first.
 
 **Platform-owned API usage:** only the [api-loop backend](../../agents/backends/api-loop/), deferred until the API credits are picked up, with a key the control plane holds.
