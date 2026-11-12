@@ -90,6 +90,15 @@ export class FakeNest {
   failures: { match: RegExp; status: number; retryable?: boolean; times: number; page?: boolean }[] = [];
   /** Play a control plane from before the push opt-in was in the client layer (nest #157). */
   layerWithoutPush = false;
+  /**
+   * The grant's `max_agents` and `max_sandboxes` (null: none), as nest's ClientDO admits a create: counted
+   * over the client's live ones, refused 403 `forbidden` in nest's words at the limit. A retry with a key
+   * already made isn't counted again.
+   */
+  maxAgents: number | null = null;
+  maxSandboxes: number | null = null;
+  /** Answer the maxima as nest from nest#248 on does (429 `at_capacity`, retryable), not as a nest from before it (403 `forbidden` in ClientDO's words). */
+  capacityCode = false;
   /** Play a nest before `when: "idle"` (#232): its `start` refuses the field (400). */
   whenUnsupported = false;
   /** Play a nest whose `start` ignores `launch` (a rolled-back Worker): its answer names none. */
@@ -183,6 +192,14 @@ export class FakeNest {
     }
     if (had) {
       return new Response(had.body, { status: had.status, headers: { "content-type": "application/json", "idempotent-replayed": "true" } });
+    }
+    // The grant's maximum, as ClientDO.admit words its refusal (control-plane/src/do/client.ts).
+    const kind = route === "POST /v1/agents" ? "agents" : "sandboxes";
+    const max = kind === "agents" ? this.maxAgents : this.maxSandboxes;
+    const live = kind === "agents" ? [...this.agents.values()].filter((a) => !a.ended && a.client === CLIENT).length : [...this.sandboxes.values()].filter((x) => !x.ended).length;
+    if (max !== null && live >= max) {
+      // nest#248's own code, or the words of a nest from before it.
+      return this.capacityCode ? nestErr(429, "at_capacity", `max_${kind}: ${CLIENT} has ${live} live ${kind}, its grant's limit`, true) : nestErr(403, "forbidden", `${CLIENT} has ${live} live ${kind}, its grant's max_${kind}`);
     }
     const res = await this.route(req, u, call);
     if (res.ok) this.keys.set(key, { digest, status: res.status, body: await res.clone().text() });
@@ -606,6 +623,13 @@ export interface FakePull {
   headRepo: string | null;
   /** GitHub's `updated_at` for it, when the test gives one. */
   updated_at?: string;
+  /** Its head commit, its base branch, and what GraphQL's PR read answers of it (README.md#pr-upkeep). */
+  sha?: string;
+  base?: string;
+  /** `UNKNOWN` (GitHub hasn't computed it yet) unless given. */
+  mergeable?: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  /** The check runs on its head, each in its app's suite. */
+  checks?: { name: string; status?: string; conclusion: string | null; url?: string; app?: string }[];
 }
 
 export interface FakeCheckRun {
@@ -891,6 +915,7 @@ export class FakeGitHub {
     const t = token ? this.tokens.get(token) : undefined;
     if (!t) return json(401, { message: "Bad credentials" });
     const query = String(body?.query ?? "");
+    if (/pullRequest\(number:/.test(query)) return this.readPulls(body, t, json);
     const name = /enablePullRequestAutoMerge|disablePullRequestAutoMerge/.exec(query)?.[0];
     const id = String(body?.variables?.id ?? "");
     const target = nodeTarget(id);
@@ -913,6 +938,47 @@ export class FakeGitHub {
       this.autoMerge.set(id, null);
     }
     return json(200, { data: { [name]: { pullRequest: { id } } } });
+  }
+
+  /** GraphQL reads of PRs by number (aliases `p<i>`, variables `n<i>`), as GitHub answers the app's query. */
+  readonly pullReads: { repo: string; numbers: number[] }[] = [];
+  /** Errors a PR read answers besides its data (each read, while set), as GitHub adds them to a partial answer. */
+  pullReadErrors: { type?: string; message: string }[] = [];
+
+  private readPulls(body: any, t: { repo: string; permissions: Record<string, string> }, json: (status: number, body: unknown) => Response): Response {
+    const v = body?.variables ?? {};
+    const repo = `${v.owner}/${v.name}`.toLowerCase();
+    if (repo !== t.repo) return json(200, { data: { repository: null }, errors: [{ type: "NOT_FOUND", message: `Could not resolve to a Repository with the name '${repo}'.` }] });
+    if (!levelWithin("read", t.permissions.pull_requests) || !levelWithin("read", t.permissions.checks)) {
+      return json(200, { data: null, errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }] });
+    }
+    const repository: Record<string, unknown> = {};
+    const errors: unknown[] = [];
+    const numbers: number[] = [];
+    for (let i = 0; v[`n${i}`] !== undefined; i++) {
+      const n = Number(v[`n${i}`]);
+      numbers.push(n);
+      const p = this.pulls.get(repo)?.get(n);
+      if (!p) {
+        repository[`p${i}`] = null;
+        errors.push({ type: "NOT_FOUND", path: ["repository", `p${i}`], message: `Could not resolve to a PullRequest with the number of ${n}.` });
+        continue;
+      }
+      const sha = p.sha ?? shaOf(`head${n}`);
+      const apps = [...new Set((p.checks ?? []).map((c) => c.app ?? "github-actions"))];
+      repository[`p${i}`] = {
+        number: n, state: p.merged ? "MERGED" : p.state === "open" ? "OPEN" : "CLOSED", title: p.title, headRefName: p.ref, headRefOid: sha, baseRefName: p.base ?? "main",
+        isCrossRepository: p.headRepo !== repo, mergeable: p.mergeable ?? "UNKNOWN", mergeStateStatus: p.mergeable === "CONFLICTING" ? "DIRTY" : "UNKNOWN",
+        autoMergeRequest: null,
+        commits: { nodes: [{ commit: { oid: sha, checkSuites: { nodes: apps.map((app) => ({
+          app: { slug: app },
+          checkRuns: { nodes: (p.checks ?? []).filter((c) => (c.app ?? "github-actions") === app).map((c) => ({ name: c.name, status: c.status ?? "COMPLETED", conclusion: c.conclusion, detailsUrl: c.url ?? null })) },
+        })) } } }] },
+      };
+    }
+    this.pullReads.push({ repo, numbers });
+    errors.push(...this.pullReadErrors);
+    return json(200, { data: { repository }, ...(errors.length ? { errors } : {}) });
   }
 
   /** The app that "recently provided" each check on the repo, as GitHub picks one for an omitted app_id. */

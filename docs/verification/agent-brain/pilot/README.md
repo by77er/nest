@@ -28,7 +28,8 @@ One agent with hands, two hosts that can run its brain, and the sandbox's gatewa
 
 | Model | Design rule / code |
 |---|---|
-| `RWake`, `RStart`, `RKill`/`RKillAlarm`, `REscalate`, `RDeadline`, `RStatusRelease`, `ROpRestart` | Rules 2-4, A1, A2. `RStart` answers `none` while a non-condemned brain exists (`NO_REISSUE`); an operator restart condemns and keeps the intent. `RDeadline` (a starting brain that can't say hello is condemned) is **assumed**. Rule 4's "processed" means the host's own result for the kill; FleetDO never writes one, as in PR #32 (`commands.answered_by`). |
+| `RWake`, `RStart`, `RKill`/`RKillAlarm`, `REscalate`, `RDeadline`, `RStatusRelease`, `ROpRestart` | Rules 2-4, A1, A2. `RStart` answers `none` while a non-condemned brain exists (`NO_REISSUE`); with `SPLIT_RESTART` off, an operator restart condemns at once and keeps the intent. `RDeadline` (a starting brain that can't say hello is condemned) is **assumed**. Rule 4's "processed" means the host's own result for the kill; FleetDO never writes one, as in PR #32 (`commands.answered_by`). |
+| `ROpRestartCondemn`, `ROpRestartDrop`, `Pump` (`SPLIT_RESTART`, `PUMP_GUARD`) | 2026-11-10, as the code is: an operator's restart records its intent, then condemns the brain after AgentDO's awaits on FleetDO, or is refused there; `Pump` sends no turn while a restart is pending. Results in [the conformance's restart-between-turns section](../conformance/README.md#restarting-only-between-turns-agentsrestart-when-idle-authors-map-2026-11-10) |
 | `RExited`, `RHostLost` | Rule 3: release on an exit at or above `brain.epoch`, or on host loss bounded by epoch (`LOSS_EPOCH`) and re-checked at delivery (`LOST_RECHECK`) |
 | `ROldCap` | A previous-release host is wedged at the 15 min cap (36b60d5, N21) |
 | `SessOK`, `Hello`, `ResolveReq/Resp` | Rule 1; 65bf6ef `current()`, `onHello`, `hands_resolve` (re-checked after its await) |
@@ -55,6 +56,7 @@ One agent with hands, two hosts that can run its brain, and the sandbox's gatewa
 | `KillTombstone` | No runner registers or adopts a start at or below a kill that reached its host first |
 | `NoHealthyWedge` (L3) | A host never partitioned, crashed, terminated or kill-ignoring is never wedged (a previous-release host is excluded: it is wedged at the cap by design) |
 | `AwaitConsistent` | 65bf6ef: `awaiting_exit` names the assigned host at the current epoch (H2) |
+| `NoCutAfterAsk` | With `SPLIT_RESTART`: a turn sent after a restart was asked is never cut by that restart |
 | `NoEpochRegression` | Epoch counters, tombstones and a process's adopted epoch never decrease |
 | `TurnsDrain`, `NoWedge` (L1, L2) | A queued turn eventually runs; a condemned brain is eventually resolved (weak fairness, finite faults) |
 | `StableTurnsDrain`, `StableNoWedge` | The same, for behaviours where lease lapses eventually stop. A lapse without a fault (a host merely slow to heartbeat) is free in the model, so without this premise a host can lapse and expire forever, which TLC duly reports. |
@@ -146,7 +148,8 @@ Every one comes from a TLC trace and has a config that reproduces it; all but C5
 | D1 | `MC_startfail` | A1-A4 + a38d3c0's `startFailed` release | S | 25 / 7.5M | real in a38d3c0 (conformance D1), fixed |
 | C5 | `MC_ex_all` (`full`) | A1-A4, no A5/A6 | S | 31 / 43.2M | design gap, fixed by A5 + A6 |
 | N1 | `MC_n1_off`, `MC_nr_n1off` | tick expiry split, no re-check | S, with **zero faults** | 26 / 0.4M | real in 6073da7 (conformance N1), fixed |
-| C6 | `MC_c6` | current design with both host-loss guards off, epochs ≤ 3 | S, with **zero faults** | 30 / 0.5M | regression: main has both guards, covered by `agent-seams.test.ts:918` (D2/M4); either guard alone clears depth ~44 |
+| C6 | `MC_c6` | current design with both host-loss guards off, epochs ≤ 3 | S, with **zero faults** | 30 / 0.5M | regression: main has both guards, covered by the `agent-seams.test.ts` test "D2/M4: a host-loss notice releases only the record at or below its epoch, and only while the host is still lost"; either guard alone clears depth ~44 |
+| — | `MC_nr_restart_split_noguard` | current design, restart split, no `PUMP_GUARD`, one host | `NoCutAfterAsk` | 11 steps | fixed by the pump guard (`AgentDO.pump`), tested in `restart-launch.test.ts` "no turn starts while a restart is pending" |
 | — | `MC_mut_nowait`, `MC_mut_FE`, `MC_tip_notomb` | mutations | S, S, `KillTombstone` | 16 / 23k; 23 / 489k; 12 / 1.1k | teeth |
 
 **C1. A healthy host wedged by a kill FleetDO never stored.** A brain is condemned and `phase = condemned` is saved. An AgentDO reset or a failed `issueCommands` then loses the kill before FleetDO stores it. Rule 4 finds the kill "not processed" and wedges a healthy host. A1 sends the kill from an alarm until it is stored.

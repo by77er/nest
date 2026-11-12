@@ -31,7 +31,7 @@ import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, inje
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
 import { slotEnv } from "../lib/sandbox-env";
 import type { MintedInjection } from "./broker";
-import { cellIdleTtlMs, dormant, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
+import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 import {
   chainView, type ChainView, type GenRow, gcRootsOf, isRestoreSource, livePins, memoryToUnroot, type Pin, retention, retentionMode,
   type RootRow,
@@ -1466,13 +1466,14 @@ export class SandboxDO extends DurableObject<Env> {
 
   /**
    * An agent ended for good: its slot goes (`detach`), and with `destroy` the sandbox too, in the same
-   * step, if it was created for that agent and no other agent is attached. Idempotent: a retry after
-   * the destroy repeats its cleanup.
+   * step, if no other agent is attached and it was created for that agent or `by` (who ended it) may
+   * destroy it (`endMayDestroy`; absent from a caller of the previous release: only the first). Idempotent:
+   * a retry after the destroy repeats its cleanup.
    */
-  async release(agent: string, destroy: boolean): Promise<{ destroyed: boolean }> {
+  async release(agent: string, destroy: boolean, by?: string): Promise<{ destroyed: boolean }> {
     const before = this.tryInfo();
     if (!before) return { destroyed: false };
-    const mine = destroy && before.owner === agent;
+    const mine = destroy && endMayDestroy(before, agent, by);
     if (before.state === "destroyed") {
       if (mine) await this.afterDestroyed(before, `its agent ${agent} ended`);
       return { destroyed: mine };

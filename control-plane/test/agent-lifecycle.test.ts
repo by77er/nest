@@ -10,7 +10,7 @@ import type { AgentDO } from "../src/do/agent";
 import type { SandboxDO } from "../src/do/sandbox";
 import type { FleetDO } from "../src/do/fleet";
 import {
-  AGENT_RECORD_RETENTION_MS, dormant, EXPIRY_NOTICE_MS, ephemeralDone, expiryStep, MAX_LIVE_CHILDREN, MAX_SPAWN_DEPTH, ownsVia, spawnRefusal,
+  AGENT_RECORD_RETENTION_MS, dormant, endMayDestroy, EXPIRY_NOTICE_MS, ephemeralDone, expiryStep, MAX_LIVE_CHILDREN, MAX_SPAWN_DEPTH, ownsVia, spawnRefusal,
 } from "../src/lib/lifetimes";
 import { expandSpec, SEED_CATALOG, type Catalog } from "../src/lib/spec";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
@@ -117,11 +117,33 @@ describe("lifetime rules (pure)", () => {
     expect(ownsVia("agt_p", [null])).toBe(false);
   });
 
-  it("spawns stop at the depth and live-children caps", () => {
+  it("an end's destroy_sandbox reaches the sandbox made for the agent, or one its ender may destroy: the agent owning it, its client, the operator", () => {
+    const madeFor = { owner: "agt_c", client: "cli_a" };
+    const clients = { client: "cli_a" };
+    const operators = {};
+    // Made for the ended agent: whoever ends it, and from a caller that doesn't say (the previous release).
+    for (const by of ["agt_c", "agt_p", "cli_a", "user", undefined]) expect(endMayDestroy(madeFor, "agt_c", by), String(by)).toBe(true);
+    // Ended by what may destroy it anyway (as DELETE /v1/sandboxes/<id> lets the client and the operator).
+    expect(endMayDestroy(madeFor, "agt_g", "agt_c")).toBe(true);
+    expect(endMayDestroy(clients, "agt_c", "cli_a")).toBe(true);
+    expect(endMayDestroy(madeFor, "agt_g", "cli_a")).toBe(true);
+    expect(endMayDestroy(clients, "agt_c", "user")).toBe(true);
+    expect(endMayDestroy(operators, "agt_c", "user")).toBe(true);
+    // Anyone else: the agent itself or its owner on a sandbox not made for it, another client, or an unsaid ender.
+    expect(endMayDestroy(clients, "agt_c", "agt_c")).toBe(false);
+    expect(endMayDestroy(madeFor, "agt_g", "agt_p")).toBe(false);
+    expect(endMayDestroy(clients, "agt_c", "cli_b")).toBe(false);
+    expect(endMayDestroy(operators, "agt_c", "agt_c")).toBe(false);
+    expect(endMayDestroy(operators, "agt_c", "cli_a")).toBe(false);
+    expect(endMayDestroy(clients, "agt_c", undefined)).toBe(false);
+  });
+
+  it("spawns stop at the depth and live-children caps; only the live children wait for room (full)", () => {
     expect(spawnRefusal(0, 0)).toBeNull();
     expect(spawnRefusal(MAX_SPAWN_DEPTH - 1, MAX_LIVE_CHILDREN - 1)).toBeNull();
-    expect(spawnRefusal(MAX_SPAWN_DEPTH, 0)).toContain("depth");
-    expect(spawnRefusal(0, MAX_LIVE_CHILDREN)).toContain("haven't ended");
+    expect(spawnRefusal(MAX_SPAWN_DEPTH, 0)).toMatchObject({ message: expect.stringContaining("depth"), full: false });
+    expect(spawnRefusal(MAX_SPAWN_DEPTH, MAX_LIVE_CHILDREN)).toMatchObject({ message: expect.stringContaining("depth"), full: false });
+    expect(spawnRefusal(0, MAX_LIVE_CHILDREN)).toMatchObject({ message: expect.stringContaining("haven't ended"), full: true });
   });
 
   it("an ephemeral agent is done only with no turn current or queued, no open ask, and no child that hasn't ended", () => {
@@ -239,12 +261,13 @@ describe("agent_spawn", () => {
     expect(await p.run("agent_spawn", { template: w.kid, task: "x", sandbox: "share" })).toMatchObject({ status: "error", error: { code: "invalid_message" } });
     expect(await p.run("agent_spawn", { template: w.kid, task: "x", tools: ["notify", "merge"] })).toMatchObject({ status: "error" });
     await runInDurableObject(agentStub(p.agent), (inst: AgentDO) => (inst as any).update((i: any) => { i.depth = MAX_SPAWN_DEPTH; }));
-    expect((await p.run("agent_spawn", { template: w.kid, task: "x" })).error.message).toContain("depth");
+    // The depth never changes: refused for good. The live children do: at_capacity, retryable.
+    expect((await p.run("agent_spawn", { template: w.kid, task: "x" })).error).toMatchObject({ code: "forbidden", retryable: false, message: expect.stringContaining("depth") });
     await runInDurableObject(agentStub(p.agent), (inst: AgentDO, st) => {
       (inst as any).update((i: any) => { delete i.depth; });
       for (let n = 0; n < MAX_LIVE_CHILDREN; n++) st.storage.sql.exec("INSERT INTO children (agent, created_ms) VALUES (?, ?)", `agt_planted${n}`, Date.now());
     });
-    expect((await p.run("agent_spawn", { template: w.kid, task: "x" })).error.message).toContain("haven't ended");
+    expect((await p.run("agent_spawn", { template: w.kid, task: "x" })).error).toMatchObject({ code: "at_capacity", retryable: true, message: expect.stringContaining("haven't ended") });
     // From inside a sandbox, never.
     const outcome = await runInDurableObject(agentStub(p.agent), (inst: AgentDO) =>
       (inst as any).dispatch(p.epoch, "cal_guest", "exit", {}, 1).catch((e: any) => e.code));
@@ -380,7 +403,7 @@ describe("agent_stop", () => {
     expect(await ended(o.agent)).toBeUndefined();
   });
 
-  it("destroy_sandbox destroys the sandbox made for it only when no other agent is attached; the GC registry drops it", async () => {
+  it("destroy_sandbox destroys the sandbox made for it, or the operator's, only when no other agent is attached; the GC registry drops it", async () => {
     const w = await world();
     const p = await operatorAgent(w, w.par);
     const registered = (sbx: string) => runInDurableObject(fleetStub(w.cell), (_i: FleetDO, st) =>
@@ -413,14 +436,24 @@ describe("agent_stop", () => {
     expect((await registered(c2.sandbox!)).destroyed_ms).toBeGreaterThan(0);
     expect((await live())).toBe(before);
     expect(await sandboxStub(c2.sandbox!).gcRoots()).toEqual([]);
-    // A sandbox it didn't make (the operator's) is never destroyed by its end.
+    // A sandbox not made for it (the operator's): its own `exit` only detaches it, since the agent may not destroy it.
     const shared = await adminJson("/v1/sandboxes", { body: { cell: w.cell } }, 201);
     const o = await operatorAgent(w, w.kid, shared.sandbox);
-    await adminJson(`/v1/agents/${o.agent}/stop`, { body: { end: true, destroy_sandbox: true } });
+    expect(await o.run("exit", { destroy_sandbox: true })).toMatchObject({ status: "ok" });
+    await nextCommands(w.brain.ws, isStop(o.agent, "graceful"));
     await exited(w, o);
     await until(async () => (await ended(o.agent))?.sandbox, "o's sandbox step");
-    expect(await ended(o.agent)).toMatchObject({ sandbox: "detached" });
+    expect(await ended(o.agent)).toMatchObject({ by: o.agent, destroy_sandbox: true, sandbox: "detached" });
     expect((await sandboxStub(shared.sandbox).info()).state).not.toBe("destroyed");
+    // The operator ending an agent there may destroy it (as its DELETE may): destroyed, once alone in it.
+    const o2 = await operatorAgent(w, w.kid, shared.sandbox);
+    await adminJson(`/v1/agents/${o2.agent}/stop`, { body: { end: true, destroy_sandbox: true } });
+    await exited(w, o2);
+    await until(async () => (await ended(o2.agent))?.sandbox, "o2's sandbox step");
+    expect(await ended(o2.agent)).toMatchObject({ by: "user", sandbox: "destroyed" });
+    expect((await sandboxStub(shared.sandbox).info()).state).toBe("destroyed");
+    // A retry of the release after the destroy says so again (AgentDO's step is recorded from it).
+    expect(await sandboxStub(shared.sandbox).release(o2.agent, true, "user")).toEqual({ destroyed: true });
   });
 });
 

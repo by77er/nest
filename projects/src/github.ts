@@ -42,6 +42,9 @@ export const PERMISSIONS = {
   // Reading PRs to attach them (`GET /repos/{o}/{r}/pulls`, `…/pulls/{n}`): Pull requests: read, on
   // the same permissions page (which also lists `…/pulls/{n}` under Contents: read, as one of a set).
   pullsRead: { pull_requests: "read" },
+  // Reading PRs through GraphQL with their head's check runs (README.md#pr-upkeep): Pull requests: read and
+  // Checks: read. GitHub's GraphQL reference names no permission per field (unverified beyond a real read).
+  prRead: { pull_requests: "read", checks: "read" },
   // Triage (README.md#triage): listing the repo's open issues, and closing a done task's with a comment
   // (https://docs.github.com/en/rest/issues: Issues: read, and write to comment and close).
   issuesRead: { issues: "read" },
@@ -72,6 +75,9 @@ export async function verifyGithubSignature(secret: string, header: string | nul
 }
 
 // --- the client ----------------------------------------------------------------------------------------
+
+/** GraphQL error types that are GitHub's trouble, not a refusal: tried again. */
+const TRANSIENT_GRAPHQL = new Set(["INTERNAL", "SERVICE_UNAVAILABLE", "TIMEOUT"]);
 
 /** GitHub's refusal: its status and `message`, never the token. */
 export class GitHubError extends Error {
@@ -245,11 +251,17 @@ export class GitHub {
    * One GraphQL request (https://docs.github.com/en/graphql/guides/forming-calls-with-graphql). Its
    * `errors` (a 200 all the same) are refusals for good, except GitHub's rate limit.
    */
-  async graphql<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+  async graphql<T>(query: string, variables: Record<string, unknown>, o: { notFound?: boolean } = {}): Promise<T> {
     const r = (await this.call<{ data?: T; errors?: { message?: unknown; type?: unknown }[] }>("POST", "/graphql", { query, variables }))!;
+    // With `notFound`, an answer whose only errors are NOT_FOUND (a PR number the repo has none of) is its
+    // data, those fields null.
+    if (o.notFound && r.data && r.errors?.length && r.errors.every((e) => e.type === "NOT_FOUND")) return r.data;
     if (r.errors?.length) {
       const limited = r.errors.some((e) => e.type === "RATE_LIMITED");
-      throw new GitHubError(limited ? 429 : 422, r.errors.map((e) => (typeof e.message === "string" ? e.message : "error")).join("; ").slice(0, 300), limited);
+      // GitHub's own trouble (its timeout, an internal error) is retried, not a refusal: only when every error is
+      // one (the types and the timeout's wording are as GitHub answers them; not a documented list: unverified).
+      const transient = !limited && r.errors.every((e) => TRANSIENT_GRAPHQL.has(String(e.type)) || (typeof e.message === "string" && /timeout|something went wrong/i.test(e.message)));
+      throw new GitHubError(limited ? 429 : transient ? 502 : 422, r.errors.map((e) => (typeof e.message === "string" ? e.message : "error")).join("; ").slice(0, 300), limited);
     }
     return r.data as T;
   }

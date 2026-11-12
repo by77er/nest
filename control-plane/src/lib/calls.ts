@@ -3,6 +3,7 @@
 
 import { z } from "zod";
 import type { ToolOutcome } from "../protocol/control";
+import { INPUT_KEPT_BYTES } from "./sinks";
 import { addColumn, storedEnum } from "./stored";
 
 // Closed unions for the status columns (docs/data/#enums), checked on read (`storedEnum`).
@@ -16,11 +17,21 @@ export type CallStatus = z.output<typeof CallStatusEnum>;
  */
 const AskStatusEnum = z.enum(["sync", "cli", "async", "answered"]);
 export type AskStatus = z.output<typeof AskStatusEnum>;
-/** `approvals.status`: a sink call waiting for the operator, or the operator's decision. */
+/** `approvals.status`: a held call waiting for the operator, or the operator's decision. */
 const ApprovalStatusEnum = z.enum(["pending", "approved", "denied"]);
+/**
+ * `approvals.kind`: what held the call. `sink`: the sink gate (docs/agents/tools/#taint-and-sinks); its
+ * approval expires. `rule`: a tool rule in `ask` mode, checked by the runner's `PreToolUse` hook
+ * (`approval_check`); its approval never expires (the operator may answer whenever). NULL in rows written
+ * before the column: a sink's.
+ */
+const ApprovalKindEnum = z.enum(["sink", "rule"]);
+export type ApprovalKind = z.output<typeof ApprovalKindEnum>;
 const CALL = CallStatusEnum.enum;
 const ASK = AskStatusEnum.enum;
 const APPROVAL = ApprovalStatusEnum.enum;
+/** `approvals.kind` as read: a row from before the column is a sink's. */
+const KIND = "COALESCE(kind, 'sink')";
 
 // --- the ledgers' steps (pure) ------------------------------------------------------------------------
 
@@ -67,11 +78,21 @@ export function approvalStep(status: ApprovalStatus, event: ApprovalEvent): Appr
 }
 
 /**
- * Whether an approval may be spent on the call key `key` at `nowMs`: approved, not expired, and not
- * already spent on another call (its own redelivery may use it again). One approval, one call.
+ * Whether an approval may be spent on the call key `key` at `nowMs`: approved, not expired (a rule's
+ * never expires; a sink's is usable only before its expiry, and one with none never is), and unspent.
+ * A sink's already spent on this same key is usable again (that call's redelivery); a rule's never is
+ * (the runner never sends a check twice, so a repeated key is no redelivery). One approval, one call.
  */
-export function approvalUsable(a: { status: ApprovalStatus; expires_ms: number | null; used_by: string | null }, key: string, nowMs: number): boolean {
-  return a.status === "approved" && a.expires_ms !== null && a.expires_ms > nowMs && (a.used_by === null || a.used_by === key);
+export function approvalUsable(
+  a: { status: ApprovalStatus; kind: ApprovalKind; expires_ms: number | null; used_by: string | null }, key: string, nowMs: number,
+): boolean {
+  const unexpired = a.kind === "rule" || (a.expires_ms !== null && a.expires_ms > nowMs);
+  return a.status === "approved" && unexpired && (a.used_by === null || (a.kind === "sink" && a.used_by === key));
+}
+
+/** When an approval decided at `decidedMs` expires: a sink's after `sinkTtlMs`, a rule's never (null). */
+export function approvalExpiry(kind: ApprovalKind, decidedMs: number, sinkTtlMs: number): number | null {
+  return kind === "rule" ? null : decidedMs + sinkTtlMs;
 }
 
 /** A call as stored: the epoch whose row and idempotency key it keeps. */
@@ -82,15 +103,17 @@ export interface StoredCall {
 }
 
 /**
- * A sink call's approval (docs/agents/tools/#taint-and-sinks): for one sink (`name`: a remote MCP tool
- * `<capability>_<tool>`, a brokered action, `egress_policy`) with exactly these arguments. `tool` is the
- * model-facing tool to call again (null in rows written before it was kept: a remote MCP tool's).
+ * A held call's approval, for exactly these arguments (`digest`). A sink's (docs/agents/tools/#taint-and-sinks)
+ * is for one sink (`name`: a remote MCP tool `<capability>_<tool>`, a brokered action, `egress_policy`); a
+ * rule's for one Claude Code tool (`name` = `tool`, e.g. `WebFetch`). `tool` is the model-facing tool to
+ * call again (null in rows written before it was kept: a remote MCP tool's).
  */
 export interface Approval {
   ask: string;
   name: string;
   digest: string;
   tool: string | null;
+  kind: ApprovalKind;
   status: z.output<typeof ApprovalStatusEnum>;
 }
 
@@ -110,6 +133,12 @@ export interface OpenAsk {
   created_ms: number;
   /** For an approval: the sink and the model-facing tool it holds (`tool` null in rows from before it was kept). */
   approval?: { name: string; tool: string | null };
+  /**
+   * For an approval: the held call's whole input, as approved (canonical JSON, parsed), and its size.
+   * `input` is left out past `INPUT_KEPT_BYTES`, and in rows from before it was kept (`input_bytes` too).
+   */
+  input?: unknown;
+  input_bytes?: number;
 }
 
 export class CallLedger {
@@ -123,6 +152,11 @@ export class CallLedger {
       status TEXT NOT NULL, expires_ms INTEGER, used_by TEXT, created_ms INTEGER NOT NULL)`);
     // The tool the model calls again once approved (null: a remote MCP tool's, `mcp__nest__<name>`).
     addColumn(sql, "approvals", "tool", "TEXT");
+    // What held the call (`ApprovalKindEnum`); NULL: a sink's, from before the column.
+    addColumn(sql, "approvals", "kind", "TEXT");
+    // The held call's input as approved (canonical JSON, NULL past `INPUT_KEPT_BYTES`) and its size: the operator's to read in full.
+    addColumn(sql, "approvals", "input", "TEXT");
+    addColumn(sql, "approvals", "input_bytes", "INTEGER");
   }
 
   /** By call id: one first seen at an earlier epoch keeps that epoch's row and key, so its writes never run twice. */
@@ -220,12 +254,18 @@ export class CallLedger {
     return this.applyAsk("answer", text, "ask = ?", ask) > 0;
   }
 
-  /** Asks not yet answered, oldest first, with the approval each one decides (if any). */
-  open(): OpenAsk[] {
-    return this.sql.exec<{ ask: string; question: string; created_ms: number; name: string | null; tool: string | null }>(
-      `SELECT a.ask, a.question, a.created_ms, p.name, p.tool FROM asks a LEFT JOIN approvals p ON p.ask = a.ask
-        WHERE a.status != '${ASK.answered}' ORDER BY a.created_ms, a.ask`).toArray()
-      .map((r) => ({ ask: r.ask, question: r.question, created_ms: r.created_ms, ...(r.name !== null ? { approval: { name: r.name, tool: r.tool } } : {}) }));
+  /** Asks not yet answered, oldest first, with the approval each one decides (if any); the first `limit` when given. */
+  open(limit?: number): OpenAsk[] {
+    const cap = limit !== undefined && Number.isSafeInteger(limit) && limit >= 0 ? limit : -1; // SQLite: LIMIT -1 is none
+    return this.sql.exec<{ ask: string; question: string; created_ms: number; name: string | null; tool: string | null; input: string | null; input_bytes: number | null }>(
+      `SELECT a.ask, a.question, a.created_ms, p.name, p.tool, p.input, p.input_bytes FROM asks a LEFT JOIN approvals p ON p.ask = a.ask
+        WHERE a.status != '${ASK.answered}' ORDER BY a.created_ms, a.ask LIMIT ?`, cap).toArray()
+      .map((r) => ({
+        ask: r.ask, question: r.question, created_ms: r.created_ms,
+        ...(r.name !== null ? { approval: { name: r.name, tool: r.tool } } : {}),
+        ...(r.input !== null ? { input: JSON.parse(r.input) as unknown } : {}),
+        ...(r.input_bytes !== null ? { input_bytes: r.input_bytes } : {}),
+      }));
   }
 
   /** Asks (approvals included) not yet answered: each answer would be a turn. */
@@ -234,21 +274,26 @@ export class CallLedger {
   }
 
   /** The undecided approval of this exact call, if one was asked for already (asked again, it's not posted again). */
-  pendingApproval(name: string, digest: string): Approval | undefined {
-    return this.approvalWhere(`name = ? AND digest = ? AND status = '${APPROVAL.pending}'`, name, digest);
+  pendingApproval(name: string, digest: string, kind: ApprovalKind = "sink"): Approval | undefined {
+    return this.approvalWhere(`name = ? AND digest = ? AND ${KIND} = ? AND status = '${APPROVAL.pending}'`, name, digest, kind);
   }
 
   approvalOf(ask: string): Approval | undefined {
     return this.approvalWhere("ask = ?", ask);
   }
 
-  requestApproval(ask: string, name: string, digest: string, tool: string | null = null): void {
-    this.sql.exec(`INSERT INTO approvals (ask, name, digest, status, created_ms, tool) VALUES (?, ?, ?, '${APPROVAL.pending}', ?, ?)`,
-      ask, name, digest, Date.now(), tool);
+  /** `input`: the held call's canonical JSON (`canonicalJson`), kept whole up to `INPUT_KEPT_BYTES`. */
+  requestApproval(ask: string, name: string, digest: string, tool: string | null = null, kind: ApprovalKind = "sink", input?: string): void {
+    const bytes = input === undefined ? null : new TextEncoder().encode(input).length;
+    this.sql.exec(`INSERT INTO approvals (ask, name, digest, status, created_ms, tool, kind, input, input_bytes) VALUES (?, ?, ?, '${APPROVAL.pending}', ?, ?, ?, ?, ?)`,
+      ask, name, digest, Date.now(), tool, kind, bytes !== null && bytes <= INPUT_KEPT_BYTES ? input! : null, bytes);
   }
 
-  /** The operator's decision, once (`approvalStep`): a decided approval keeps its decision and its expiry. Whether it was pending. */
-  decide(ask: string, approved: boolean, expiresMs: number): boolean {
+  /**
+   * The operator's decision, once (`approvalStep`): a decided approval keeps its decision and its expiry
+   * (`expiresMs` null: none, `approvalExpiry`). Whether it was pending.
+   */
+  decide(ask: string, approved: boolean, expiresMs: number | null): boolean {
     const event: ApprovalEvent = approved ? "approve" : "deny";
     let n = 0;
     for (const from of APPROVAL_STATUSES) {
@@ -259,17 +304,32 @@ export class CallLedger {
   }
 
   /**
-   * Spend an unexpired approval of exactly this call on the call key `key`; true when there is one (or it
-   * was already spent on `key`: a redelivery). One approval, one call.
+   * Spend a usable (`approvalUsable`) approval of exactly this call on the call key `key`: the ask it
+   * answered, when there is one (or one was already spent on `key`: a redelivery). One approval, one call.
    */
-  takeApproval(name: string, digest: string, key: string, nowMs: number): boolean {
+  takeApproval(name: string, digest: string, key: string, nowMs: number, kind: ApprovalKind = "sink"): string | undefined {
     // The one already spent on this key first (a redelivery), else an unspent one.
-    const r = this.sql.exec<{ ask: string; status: string; expires_ms: number | null; used_by: string | null }>(
-      "SELECT ask, status, expires_ms, used_by FROM approvals WHERE name = ? AND digest = ? ORDER BY used_by IS NULL, created_ms, ask", name, digest).toArray()
-      .find((a) => approvalUsable({ ...a, status: storedEnum(ApprovalStatusEnum, a.status, "approvals.status") }, key, nowMs));
-    if (!r) return false;
+    const rows = this.sql.exec<{ ask: string; status: string; expires_ms: number | null; used_by: string | null }>(
+      `SELECT ask, status, expires_ms, used_by FROM approvals WHERE name = ? AND digest = ? AND ${KIND} = ? ORDER BY used_by IS NULL, created_ms, ask`,
+      name, digest, kind).toArray();
+    // A rule's check key spends at most one approval, ever (no redelivery: `approvalUsable`).
+    if (kind === "rule" && rows.some((a) => a.used_by === key)) return undefined;
+    const r = rows.find((a) => approvalUsable({ ...a, kind, status: storedEnum(ApprovalStatusEnum, a.status, "approvals.status") }, key, nowMs));
+    if (!r) return undefined;
     this.sql.exec("UPDATE approvals SET used_by = ? WHERE ask = ?", key, r.ask);
-    return true;
+    return r.ask;
+  }
+
+  /**
+   * A call a tool rule in `ask` mode holds, checked once per `key` (`approval_check`): a usable approval
+   * of exactly this call is spent on `key` (`approved`), else the open ask for it (`pending`), else
+   * nothing (the caller records an ask with its approval). Synchronous: one step.
+   */
+  checkRule(tool: string, digest: string, key: string, nowMs: number): { status: "approved" | "pending"; ask: string } | undefined {
+    const taken = this.takeApproval(tool, digest, key, nowMs, "rule");
+    if (taken !== undefined) return { status: "approved", ask: taken };
+    const pending = this.pendingApproval(tool, digest, "rule");
+    return pending && { status: "pending", ask: pending.ask };
   }
 
   /**
@@ -277,19 +337,20 @@ export class CallLedger {
    * waiting can't finish on its own (its brain is long gone), so it is deleted with the finished ones. An
    * ask a previous release's call or guest CLI was waiting inside is first made an open ask like any
    * other. An open ask, and the pending approval it decides, is the operator's work still to do: it
-   * stays until answered.
+   * stays until answered. So does a rule's approval not yet spent: it never expires.
    */
   prune(cutoff: number): void {
     this.applyAsk("detach", null, "created_ms < ?", cutoff);
     this.sql.exec("DELETE FROM tool_calls WHERE created_ms < ?", cutoff);
     this.sql.exec(`DELETE FROM asks WHERE status = '${ASK.answered}' AND created_ms < ?`, cutoff);
-    this.sql.exec(`DELETE FROM approvals WHERE status != '${APPROVAL.pending}' AND created_ms < ?`, cutoff);
+    this.sql.exec(`DELETE FROM approvals WHERE status != '${APPROVAL.pending}' AND created_ms < ?
+      AND NOT (${KIND} = 'rule' AND status = '${APPROVAL.approved}' AND used_by IS NULL)`, cutoff);
   }
 
   private approvalWhere(where: string, ...args: SqlStorageValue[]): Approval | undefined {
-    const r = this.sql.exec<Omit<Approval, "status"> & { status: string }>(
-      `SELECT ask, name, digest, status, tool FROM approvals WHERE ${where} LIMIT 1`, ...args).toArray()[0];
-    return r && { ...r, status: storedEnum(ApprovalStatusEnum, r.status, "approvals.status") };
+    const r = this.sql.exec<Omit<Approval, "status" | "kind"> & { status: string; kind: string }>(
+      `SELECT ask, name, digest, status, tool, ${KIND} AS kind FROM approvals WHERE ${where} LIMIT 1`, ...args).toArray()[0];
+    return r && { ...r, status: storedEnum(ApprovalStatusEnum, r.status, "approvals.status"), kind: storedEnum(ApprovalKindEnum, r.kind, "approvals.kind") };
   }
 
   private askWhere(where: string, ...args: SqlStorageValue[]): StoredAsk | undefined {

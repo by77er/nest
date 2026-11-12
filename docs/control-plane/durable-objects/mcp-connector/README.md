@@ -2,7 +2,7 @@
 
 One per remote MCP server, credential and API client namespace (`connectorName(grant)`: `["mcp", url, auth]`, with `null` for no credential, and the client's id appended for a capability in its namespace), in `control-plane/src/do/mcp-connector.ts`. The design and its rationale are in [mcp capabilities](../../../agents/capabilities/mcp/#the-connector); this is what the object holds and does.
 
-- **RPCs (from AgentDO only):**
+- **RPCs (from AgentDO only, besides the Worker's `health`):**
   - `list(grant, subscriber)`: the shared tool list (fetched again when older than 5 minutes or reported changed); a non-null `subscriber` (an agent whose brain is handed it) is told of later changes.
   - `changed(grant)`: an AgentDO read `notifications/tools/list_changed`: list again now.
   - `acquire(grant, agent, hold_ms)` / `release(lease)`: admission, by the calling grant's `max_concurrent` and `per_minute`.

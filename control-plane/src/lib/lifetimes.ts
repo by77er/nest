@@ -21,13 +21,18 @@ export interface Ended {
   reason: EndReason;
   /** Its brain is killed (condemned) rather than left to finish its turn. */
   kill: boolean;
-  /** Destroy the sandbox it owns, when no other agent is attached (an ephemeral agent's always is). */
+  /** Destroy its sandbox, when no other agent is attached and `endMayDestroy` (an ephemeral agent's always asks). */
   destroy_sandbox: boolean;
+  /**
+   * Its ender asked for `destroy_sandbox` itself (not only the ephemeral default): only then does the ender's
+   * authority count (`endMayDestroy`'s `by`). Absent (and on ends from before it): only a sandbox made for it.
+   */
+  destroy_asked?: true;
   /** The stopper's words (`reason` of `agent_stop` or `exit`), shown in its `exited` event. */
   note?: string;
   /** The graceful `agent_stop` went out for the brain at this epoch. */
   stop_sent?: number;
-  /** What became of its sandbox: `destroyed`, `detached` (kept: another agent is attached, or it isn't its own, or not asked). */
+  /** What became of its sandbox: `destroyed`, `detached` (kept: another agent is attached, or neither it nor its ender may destroy it, or not asked). */
   sandbox?: "destroyed" | "detached";
   /** Its owner was told (`childEnded`). */
   owner_told?: boolean;
@@ -85,10 +90,32 @@ export function ownsVia(caller: string, chain: readonly (string | null)[]): bool
   return chain.slice(0, MAX_OWNER_HOPS).includes(caller);
 }
 
-/** Whether a spawn by an agent at `depth` with `liveChildren` unended children may go ahead (null), or why not. */
-export function spawnRefusal(depth: number, liveChildren: number): string | null {
-  if (depth + 1 > MAX_SPAWN_DEPTH) return `spawn depth ${depth + 1} is over the limit of ${MAX_SPAWN_DEPTH}`;
-  if (liveChildren >= MAX_LIVE_CHILDREN) return `it already has ${liveChildren} agents that haven't ended (at most ${MAX_LIVE_CHILDREN})`;
+/** `Ended.by` when the operator ended it (`POST /v1/agents/<id>/stop` with the admin token). */
+export const OPERATOR_ENDER = "user";
+
+/**
+ * Whether ending `agent` with `destroy_sandbox` may destroy the sandbox `s` it is attached to (still only
+ * once no other agent is attached; SandboxDO decides that in its step). Yes when the sandbox was made for
+ * that agent (`owner`, from `agent_spawn{sandbox: new}`), or when its ender `by` may destroy it anyway:
+ * the agent that owns it, the API client whose subtree it is in, or the operator, as
+ * `DELETE /v1/sandboxes/<id>` authorizes the API callers. `by` absent (a caller of the previous release): only the first.
+ */
+export function endMayDestroy(s: { owner?: string; client?: string }, agent: string, by?: string): boolean {
+  if (s.owner === agent) return true;
+  if (by === undefined) return false;
+  return by === OPERATOR_ENDER || s.owner === by || s.client === by;
+}
+
+/**
+ * Whether a spawn by an agent at `depth` with `liveChildren` unended children may go ahead (null), or why
+ * not: `full` when only the live children are in the way, so a spawn goes ahead once one ends (`at_capacity`);
+ * the depth never changes (`forbidden`).
+ */
+export function spawnRefusal(depth: number, liveChildren: number): { message: string; full: boolean } | null {
+  if (depth + 1 > MAX_SPAWN_DEPTH) return { message: `spawn depth ${depth + 1} is over the limit of ${MAX_SPAWN_DEPTH}`, full: false };
+  if (liveChildren >= MAX_LIVE_CHILDREN) {
+    return { message: `live children: it already has ${liveChildren} agents that haven't ended (at most ${MAX_LIVE_CHILDREN}); there is room once one ends`, full: true };
+  }
   return null;
 }
 

@@ -9,7 +9,7 @@ The parsers at nestd's trust boundaries are fuzzed. TLA+ and Quint stay for desi
 
 **Status:**
 - **Phase 1 done:** the fleet link (with the executor's dedup and the lease watchdog) is extracted and checked; Kani covers the pure decision functions that exist today; fuzz targets cover every wire parser; runtime assertions are in place.
-- **Phase 2 designed, not built** (below): sandbox incarnations, the proxy link, the gateway link and the runner link's brain table.
+- **Phase 2 designed, not built** (below): sandbox incarnations (built so far: the decision functions in `nestd_core::incarnation`, and the lifecycle machine, run beside the shell, which calls only its create admission, `admit_create`), the proxy link, the gateway link and the runner link's brain table.
 
 Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): every result here is **bounded**. A model check holds for the bounds it names, a Kani proof for its unwind bounds, and a fuzz run for the time it ran. None of it says anything about the real network, the real control plane or real hosts.
 
@@ -21,7 +21,7 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
     - It is `#![forbid(unsafe_code)]`.
     - Its unit tests are built with `std`, on the host only.
   - **The manifest and the sources, in CI `plan`.** [scripts/check-core-manifest.py](../../../scripts/check-core-manifest.py) fails on:
-    - any dependency table or key in `crates/nestd-core/Cargo.toml` (parsed as TOML: dotted, inline or per target);
+    - any `dependencies` or `build-dependencies` table or key in `crates/nestd-core/Cargo.toml` (parsed as TOML: dotted, inline or per target; `dev-dependencies` pass);
     - any build key, `[patch]` or `[replace]`, or a `build.rs`;
     - a `lib.rs` without the `no_std` line;
     - in any source file, an `extern crate` other than `alloc`, a `#[path]` module, `include!`, or a `cfg`, `cfg_attr` or `cfg!` predicate on any `target_*` key.
@@ -41,7 +41,7 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
 - **Timers are core state.** The core says when it next needs `Tick` (`wake_at()`); the shell sleeps until then.
 - **Write-ahead.** A core whose state is durable returns the record to persist with the step's effects, and the shell persists it before performing any of them. Effects carry ids (cmd, request, epoch), so a replay after a crash is idempotent. The checkers model the crash: memory lost, durable state kept.
   - The fleet link has no durable state (a new process is a new `instance_id`, and FleetDO resets the lineage). Incarnations do (`meta.json`, phase 2).
-- **Runtime assertions.** Each core asserts its invariants in the shipped code (`nestd_core::invariant`). A violation panics in debug builds (every test, and the checker, which builds with debug assertions). In release it is never fatal, and the core never logs:
+- **Runtime assertions.** The fleet link and the result cache assert their invariants in the shipped code (`nestd_core::invariant`); the other cores have none of their own (`shadow::Shadows` has one `debug_assert!`). A violation panics in debug builds (every test, and the checker, which builds with debug assertions). In release it is never fatal, and the core never logs:
   - inside a fleet step, it is that step's `Log::InvariantViolated { name }` effect, which the shell logs;
   - outside a step (`ResultCache::insert`), it is counted in an atomic that `main.rs` polls every 10 s, logging each rise.
 
@@ -56,7 +56,7 @@ Evidence tiers ([dev/practices.md](../../../dev/practices.md#evidence-tiers)): e
 | Owed detaches | `nestd_core::detach::Detaches` (a data structure, not a stepped machine) | per guest: agent → (ask number, kill) while unconfirmed | ask, confirm (of the newest ask only) | none: the guest connection decides when to send (after each `configure`, before ready; every 10 s while owed; on a repeated `agent_detach`; before an attach of the agent) and keeps owed agents in `configure`; that ordering is checked by `guest.rs` and `tests/host.rs` tests, not modelled | none (memory only: the VM, and its guest, don't outlive nestd). **Constraint on memory restore (not built):** a restored guest outlives the connection that owed it a detach, so restore must carry what is owed, or the first `configure` drops the agent without stopping it | done (unit tests, mutants 0 missed) |
 | Process-driver tree rules | `nestd_core::tree` (pure functions, not a stepped machine) | none: the shell (`nestd::driver::tree`) keeps the pinned members and what it stopped | the process table as read (`/proc`), the pinned members, a snapshot of what has stopped, a task's `status` text | none: the shell opens the pidfds and sends the signals. The functions say who is a member (`members`), who is never signalled (`refusal`, `signallable`), whom a freeze's pass may stop (`stop_now`), the order of a thaw (`deepest_first`) and when a process runs no more (`runs_no_more`, `stop_pending_in`) | none | done (unit tests, mutants 0 missed); the shell's races with the kernel (a fork between two reads, a pid reused) are tested against real processes, not modelled |
 | Unchanged-disk memo | `nestd_core::checkpoint::ScanMemo` | per incarnation: the last stable pass's disk stamp and manifest | a pass (stable or not, with the stamp read after the sentinel), a stamp read before a commit | reuse the manifest, or read the disk | none (memory only) | done (M1) |
-| Incarnations | `nestd_core::incarnation` (decisions), `nestd_core::lifecycle` (the lifecycle machine, **run beside the shell, deciding nothing yet**: below) | per `(sandbox, epoch)`: phase, `meta` (head, clean, unanswered), tombstone, salvage retry | commands, driver and store outcomes, commit answers, a scan at start | write meta, boot, pause or stop the VM, send `commit_request`, rename to `.del`, proxy and gateway ops, report | `meta.json`, the directory | 2 |
+| Incarnations | `nestd_core::incarnation` (decisions), `nestd_core::lifecycle` (the lifecycle machine, **run beside the shell, which calls only its create admission**: below) | per `(sandbox, epoch)`: phase, `meta` (head, clean, unanswered), tombstone, salvage retry | commands, driver and store outcomes, commit answers, a scan at start | write meta, boot, pause or stop the VM, send `commit_request`, rename to `.del`, proxy and gateway ops, report | `meta.json`, the directory | 2 |
 | Proxy link | phase 2 | mirror, `seq`, listener ownership, resync | proxy frames, connection, timers | send op, resync, pass fds | none | 2 |
 | Gateway link | phase 2 | binding keys, per-sandbox entries, pause marks (per sandbox and epoch), tombstones | gateway frames, sandbox upserts/forgets/removes | send op, replay | none | 2 |
 | Runner link (brain table) | phase 2 | brains by agent: binding, state, connection | runner frames, `agent_start`/`agent_stop`, connection | send, report `agent_exited` | none | 2 |
@@ -123,7 +123,7 @@ The executor still branches on the cache lookup itself; it moves into a core wit
   - A fresh connection's first timer tick runs in the step that opened it.
   - A hello with nothing to fail ends after its resend.
   - Time moves only for reconnect backoff, so heartbeats run once per connection.
-- **Variants:** each FleetDO fix can be turned off on its own (`Config`), and `main` is FleetDO as on main: none of this work's fixes.
+- **Variants:** each FleetDO fix can be turned off on its own (`Config`), and `main` is FleetDO as on `edf6829`: none of this work's fixes.
 
 ### Properties
 
@@ -137,7 +137,7 @@ The executor still branches on the cache lookup itself; it moves into a core wit
 | `reconnects_bounded` | always | closes ≤ 3 per fault used, and none without a fault: a loop exceeds it (the boundary stops exploring one step later) |
 | `every_command_answered` | eventually | every issued command gets a result. Faults are bounded, so a terminal state has the link up and nothing left to do. Stateright checks `eventually` on terminal paths; the predicate is monotone and every path is finite |
 | `answered_after_a_restart`, `answered_after_a_broker_failure` | sometimes | recovery paths exist. A spec whose faults allow one fails if its example is never found, so a pass isn't vacuous |
-| core invariants | assertion | effects well formed (one connect per step, no send after a close); unacked batches in order; a seq never reused; heartbeat keys increase; commands forwarded in order; the result cache bounded and consistent |
+| core invariants | assertion | effects well formed (one connect per step, no send after a close); unacked batches in order; a seq never reused; heartbeat keys increase; commands forwarded in order; merged audit batches keep every record; the result cache bounded and consistent |
 
 ### Results
 
@@ -167,7 +167,7 @@ Each spec is FleetDO's variant, the number of commands (each with or without a s
 - the hello's baseline without `.max(last + 1)`: `never_a_gap`, 20 steps at 2 commands and 1 drop;
 - `CommandsDone` not moving the expected seq: `never_a_gap`, 20 steps at 2 commands and 1 drop.
 
-`verification/nestd/check/tests/variants.rs` pins the expected outcome of each spec at CI bounds: 15 tests plus the lease and the unchanged-disk memo, about 10 s on 4 threads. The every-fault run is `#[ignore]`d and runs with `--include-ignored`.
+`verification/nestd/check/tests/variants.rs` pins the expected outcome of each spec at CI bounds: 28 tests (15 for the fleet link; the lease; the unchanged-disk memo; 5 for the shadow cut and its slots; 6 for the incarnation lifecycle), about 10 s on 4 threads. The every-fault run is `#[ignore]`d and runs with `--include-ignored`.
 
 ### What it found, and the fixes
 
@@ -327,6 +327,7 @@ Functions of one expression have table tests and no harness of their own; the to
 | `runner_events` | the length-delimited codec plus `RunnerEvent` | `runner_link.rs` |
 | `fleet_to_host` | text and binary WebSocket messages through the shell's pure `decode` (FleetDO is authenticated, so this is a robustness check, not a trust boundary) | `fleet.rs` `decode` |
 | `meta_json` | the real `read_meta`, then `write_meta` | `recovery.rs` |
+| `cert_public_key` | a proxy CA certificate's subject public key (DER, from a FleetDO `proxy_ca` answer) | `nestd_core::ca::cert_public_key` |
 
 **Properties checked:**
 - no panic, and no OOM at 2 GB;
@@ -336,9 +337,10 @@ Functions of one expression have table tests and no harness of their own; the to
 **Local runs (bounded):**
 - 10 to 16 min for the guest targets, 3 to 10 min for the others, 0.7M to 52M executions each;
 - `fleet_to_host` over the real `decode`: 60 s, 1.5M runs;
-- **no crash, hang or mismatch.**
+- **no crash, hang or mismatch;**
+- no local run is recorded for `cert_public_key`: CI replays its seeds and corpus, and `fuzz.yml` fuzzes it weekly.
 
-The seeds are built from `protocol/fixtures/` at every run and never committed, so the fixtures stay the only copy.
+The seeds are built from `protocol/fixtures/` at every run and never committed, so the fixtures stay the only copy; `cert_public_key`'s seeds are built by `gen_seeds.py` itself (the fixtures' certificates are placeholders).
 
 **Observations:**
 - The guest decoder copies the remaining buffer per frame. That is quadratic in what is buffered, but bounded by nestd's 64 KiB reads.
@@ -479,4 +481,4 @@ Phase 2 waits for the proxy link's rework (PR #28, open) to merge. Each machine 
 
 ## Open questions
 
-- **Capability gating for new command variants:** the study's B5. An old nestd can't parse a new variant. Since phase 1 it no longer loses the batch silently: it skips it as unparseable, the next batch's gap makes it reconnect, and the resend brings the same batch back, so the host takes no further commands until it is upgraded (by code reading). Gating new variants on the hello's capabilities would avoid that. It belongs to the [fleet contract](../../interfaces/control-host/fleet/).
+- **Capability gating for new command variants:** the study's B5. An old nestd can't parse a new variant. Since phase 1 it doesn't lose the batch silently: it skips it as unparseable, the next batch's gap makes it reconnect, and the resend brings the same batch back, so the host takes no further commands until it is upgraded (by code reading). Gating new variants on the hello's capabilities would avoid that. It belongs to the [fleet contract](../../interfaces/control-host/fleet/).
