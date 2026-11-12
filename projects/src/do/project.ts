@@ -1708,12 +1708,6 @@ export class ProjectDO extends DurableObject<Env> {
     return secretFeeds(this.clientId(), this.secretRows().filter((m) => m.roles.includes(role)), injectHosts);
   }
 
-  /**
-   * The nest name a secret's value goes under: its own (a replacement takes no new place in the grant's
-   * `max_count`), or for a new secret a new generation, minted here and usable once (`saveSecretMeta`
-   * takes it). So a write racing a delete can't record the deleted generation's name again: the row it
-   * expected is gone, and that name was never minted for a new one.
-   */
   // --- PR upkeep (README.md#pr-upkeep) -----------------------------------------------------------------
 
   /**
@@ -1826,6 +1820,12 @@ export class ProjectDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * The nest name a secret's value goes under: its own (a replacement takes no new place in the grant's
+   * `max_count`), or for a new secret a new generation, minted here and usable once (`saveSecretMeta`
+   * takes it). So a write racing a delete can't record the deleted generation's name again: the row it
+   * expected is gone, and that name was never minted for a new one.
+   */
   async nestNameFor(name: string, value: boolean): Promise<string | null> {
     const had = this.secretRows().find((x) => x.name === name)?.nest_name;
     if (had || !value) return had ?? null;
