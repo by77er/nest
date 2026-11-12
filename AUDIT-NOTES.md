@@ -3,6 +3,10 @@
 ## Corrections
 | doc | said | code says | evidence |
 |---|---|---|---|
+| sandbox/networking/egress/steering/README.md | kernel backstop: nestd installs a root-namespace `meta skuid` reject rule for nest-proxy (as built) | not built: no such rule in nestd or deploy/ | grep -rn "skuid" crates/ deploy/ (none); crates/nestd/src/net.rs:204-230 is the only ruleset |
+| sandbox/networking/egress/steering/README.md | accept list: 53, explicit and TCP-exception ports to 172.16.0.1 | also redirects 53 to any other address, and accepts 80/443 on 172.16.0.1; port ranges 3128-3191, 20000-20999 | crates/nestd/src/net.rs:30-32,212-224 |
+| sandbox/networking/egress/README.md | "Non-public addresses are refused twice" (proxy and kernel rule); pipeline holds ≤30 s for an acknowledged policy; strips routing overrides and rejects smuggling | proxy check only; no policy → immediate 403 `egress_denied` "no policy"; no override stripping or smuggling checks | crates/nest-proxy/src/http.rs:390-394,840-846 |
+| sandbox/networking/README.md | VM starts only after the proxy acknowledges its policy | boots right after the push (the nestd doc and steering step 5 already say so) | docs/compute/nestd/README.md (verified), crates/nestd/src/host.rs boot path |
 | sandbox/networking/egress/inspection/README.md | routing overrides (`Fastly-*`, `Forwarded`, `X-Forwarded-Host`, …) stripped (no status) | not built: no such stripping anywhere in nest-proxy; only hop-by-hop headers are stripped | crates/nest-proxy/src/http.rs:46-56,693-710 (grep -i fastly crates/ finds nothing) |
 | sandbox/networking/egress/inspection/README.md | smuggling checks: protected fields named in `Connection`, TE other than `chunked`, `Trailer` naming protected fields → 400 `invalid_headers` | not built: no `invalid_headers`; hop-by-hop stripping, Host checks (`host_mismatch`, `duplicate_host`) and `te: trailers` on h2 are | crates/nest-proxy/src/http.rs:375-388,472-477,553-575 |
 | sandbox/networking/egress/inspection/README.md | ≤128 headers/32 KiB, ≤32 h2 streams | not configured: hyper builders use defaults | crates/nest-proxy/src/http.rs:95,227-230 |
@@ -34,6 +38,8 @@
 - compute/README.md:49-52 prices: c8i.large spot ~$0.033/hr, DigitalOcean $42/mo, Lambda MicroVM ~$0.25/hr, "on-demand ~1.5× DO", "spot 60-70% less": no record in the repo (only on-demand prices in deploy/lean/Cell/Cells.lean:28-29).
 
 ## Suspected code bugs
+- **Guest traffic outside the allowed ports is dropped, not rejected.** docs/sandbox/networking/egress/steering/README.md step 2, docs/sandbox/networking/README.md ("rejected at once (UDP/443 too, so HTTP/3 falls back to TCP)") and docs/README.md:178 ("denied guest traffic is rejected, not dropped") state the decision; the netns ruleset's `input` and `forward` chains are `policy drop` with no reject rule (crates/nestd/src/net.rs:218-227).
+- **The agent runner runs as root** (docs/compute/nestd/README.md "Privilege split"): `nest-runner.service` has no `User=` and sets `HOME=/root` (deploy/host/install.sh:190-215). The gateway runs as `nest-gw` only when nestd reports the `gateway-user` feature, else as root with `CAP_DAC_OVERRIDE` (install.sh:60-72).
 - **nest-proxy runs as root on cell hosts.** docs/compute/nestd/README.md (Privilege split: "nest-proxy, the gateway and the agent runner run unprivileged"), docs/README.md:183 ("the proxy is unprivileged") and the egress docs state it; `deploy/host/install.sh:90-104` writes `nest-proxy.service` with no `User=`/`CapabilityBoundingSet=`, and `crates/nest-proxy/src/main.rs` drops no privileges. Docs left as the decision.
 
 ## Drift outside the area

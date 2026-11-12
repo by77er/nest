@@ -8,7 +8,7 @@ netns ns-<id>:  tap0 172.16.0.1/30 + listening sockets owned by nest-proxy — n
 ingress:        the gateway → vsock (Firecracker's host-side unix socket → guest agent)
 ```
 
-- **Egress:** the only reachable addresses are nest-proxy's listeners on `172.16.0.1`, which nestd binds inside the netns and hands to the unprivileged proxy. Anything else is rejected at once (UDP/443 too, so HTTP/3 falls back to TCP). The VM starts only after the proxy acknowledges its policy, and the proxy can't reach non-public addresses on the host's side. See [egress/](egress/).
+- **Egress:** the only reachable addresses are nest-proxy's listeners on `172.16.0.1`, which nestd binds inside the netns and hands to the unprivileged proxy. Anything else is rejected at once (UDP/443 too, so HTTP/3 falls back to TCP). The VM boots right after nestd pushes its policy (waiting for the proxy's acknowledgement is designed, not built), and the proxy refuses non-public addresses on the host's side. See [egress/](egress/).
 - **Ingress:** previews, terminals and port-forwards all arrive through the [gateway](../gateway/), then over **vsock** through the guest agent; hands take the same door. Loopback-bound servers work, and nothing needs network access into the netns. See [ingress/](ingress/).
 - **Snapshots restore unchanged** on any host or into any fork. nestd rebuilds the host side (netns, tap0, nft, listeners) before Firecracker starts.
 - **Sandboxes can't reach each other.** With identical addresses and no routes, it's structurally impossible. An explicit **link** would go through the proxy (not designed yet).
