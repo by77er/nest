@@ -1747,7 +1747,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!known) {
       const live_ = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM children WHERE ended = 0").one().n;
       const refusal = spawnRefusal(info.depth ?? 0, live_);
-      if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, `can't spawn: ${refusal}`, 403);
+      if (refusal) throw spawnRefused(refusal);
     }
     const overrides: SpawnerOverrides = {
       ...(Array.isArray(a.tools) ? { tools: a.tools.map(String) } : {}),
@@ -1777,7 +1777,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!known && this.sql.exec("SELECT 1 FROM children WHERE agent = ?", child).toArray().length === 0) {
       // Checked again in the insert's step: two spawns in flight can't both take the last place.
       const refusal = spawnRefusal(info.depth ?? 0, this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM children WHERE ended = 0").one().n);
-      if (refusal) throw new NestError(ErrorCodes.FORBIDDEN, `can't spawn: ${refusal}`, 403);
+      if (refusal) throw spawnRefused(refusal);
     }
     this.sql.exec("INSERT OR IGNORE INTO children (agent, created_ms) VALUES (?, ?)", child, Date.now());
     try {
@@ -1790,7 +1790,10 @@ export class AgentDO extends DurableObject<Env> {
       }
       return await this.spawnChild(info, child, sandbox, mode === "new", template, spec, String(a.task), key, tainted, live, labels, grants);
     } catch (e) {
-      if (!asNestError(e)?.retryable && !(await this.agentExists(child))) {
+      // A refusal for good takes its row and places back, as does `at_capacity`: retryable, but by a new
+      // call once there is room (its own id), so this call's row and places would only hold room.
+      const ne = asNestError(e);
+      if ((!ne?.retryable || ne.code === ErrorCodes.AT_CAPACITY) && !(await this.agentExists(child))) {
         this.sql.exec("DELETE FROM children WHERE agent = ? AND ended = 0", child);
         if (info.client) {
           // Places reserved for what was never made go back (the reservation check would find them too).
@@ -3790,10 +3793,13 @@ export class AgentDO extends DurableObject<Env> {
     return ask;
   }
 
-  /** Questions waiting for the operator, oldest first (`GET /v1/agents/:agent/asks`). */
-  async openAsks(): Promise<OpenAsk[]> {
+  /**
+   * Questions waiting for the operator, oldest first (`GET /v1/agents/:agent/asks`): all of them, or the first
+   * `limit` (`GET /v1/asks` asks for one more than it shows, to know there are more).
+   */
+  async openAsks(limit?: number): Promise<OpenAsk[]> {
     this.load(); // an unknown agent is a 404
-    return this.calls.open();
+    return this.calls.open(limit);
   }
 
   /**
@@ -4028,6 +4034,11 @@ export function validateArgs(schema: unknown, args: unknown): Record<string, unk
     }
   }
   return a;
+}
+
+/** A spawn `spawnRefusal` refuses: `at_capacity` (429, retryable) while only its live children are in the way, else `forbidden`. */
+function spawnRefused(r: { message: string; full: boolean }): NestError {
+  return r.full ? new NestError(ErrorCodes.AT_CAPACITY, `can't spawn: ${r.message}`, 429, true) : new NestError(ErrorCodes.FORBIDDEN, `can't spawn: ${r.message}`, 403);
 }
 
 /** The refusal of a call whose arguments hold a credential: names the kind, never the value. */

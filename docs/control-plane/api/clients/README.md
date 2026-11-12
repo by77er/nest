@@ -28,7 +28,7 @@
   - `github_push`: `{workflows}`, whether its specs may ask for [`workflows: write`](#workflow-files) on their sandboxes' push token. Default absent: no.
   - `egress_hosts`: the hosts its own [egress rules](#egress) may allow, named as `inject_hosts` are. Default none.
   - A grant stored before `secrets`, `inject_hosts`, `github_push` or `egress_hosts` reads as none of each.
-  - `max_agents`, `max_sandboxes`: live (not ended or destroyed) at once, across everything it owns.
+  - `max_agents`, `max_sandboxes`: live (not ended or destroyed) at once, across everything it owns. A create over one is refused with `429 at_capacity`, `retryable: true`, the message starting with the limit (`max_agents: …`): there is room once fewer than the maximum are live (more than one end, if the grant was lowered below the live count). A maximum of 0 is `403 forbidden`, as for anything else outside the grant.
 ### Owner-wide entries
 
 **Built 2026-11-10 (the owner approved the design):** `repos`, `read_repos` and `github.repos` may name `owner/*`, so a new repo of that account is in the grant without the operator adding it. Code: `inGrantList`, `ownerLookups` and `githubTokenOwners` in `control-plane/src/lib/clients.ts`; [BrokerDO](../../durable-objects/broker/)'s `githubAccountId`, `repoOwners` and owner-checked mint.
@@ -79,6 +79,7 @@ The checks:
 | `GET` | `/v1/agents/<agent>/brokered` | Subtree. |
 | `GET` | `/v1/agents/<agent>/asks` | Subtree. |
 | `POST` | `/v1/agents/<agent>/asks/<ask>/answer` | Subtree. |
+| `GET` | `/v1/asks` | Its own registry's live agents only, as for `GET /v1/agents` ([open asks across agents](../#open-asks-across-agents)). |
 | `GET` | `/v1/agents/<agent>/timers` | Subtree ([timers](#timers)). |
 | `DELETE` | `/v1/agents/<agent>/timers/<name>` | Subtree. |
 | `POST` | `/v1/sandboxes` | Within the grant (`cells`, `max_sandboxes`, `inject_hosts`, `egress_hosts`, `github_push`, its own secrets). `policy` is the operator's (403). |

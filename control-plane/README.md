@@ -79,6 +79,8 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `GET /v1/agents/<id>/asks`: its calls held for the operator (sink approvals, tool rules in `ask` mode), oldest
      first, `{ask, question, created_ms, approval?: {name, tool}}`; `POST /v1/agents/<id>/asks/<ask>/answer {answer}`
      decides one, and the decision reaches the agent as an `ask_answer` turn
+   - `GET /v1/asks?label=k=v&limit=&cursor=`: the open asks of a page of live agents at once (20 each, `more`
+     names the rest), each with its agent, owner and labels, read from each AgentDO when asked ([open asks across agents](../docs/control-plane/api/#open-asks-across-agents))
    - `POST /v1/sandboxes/<id>/grants {host, ttl_ms, ports?}`
    - `GET /v1/agents/<id>/transcript` (whole committed base) · `?since=<entry>&limit=<n>` (a page:
      `{lines, next_seq, more}`)

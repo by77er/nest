@@ -317,6 +317,15 @@ export const SPAWNING_PROMPT_V5 = [
 export const WORKER_BUILTIN_TOOLS: readonly string[] = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"];
 
 /**
+ * The owner's decision (2026-11-11): the built-ins an agent launches, and the web, never ask. The seed's
+ * `nest` capability, which every seed template lists, allows each built-in a seed `worker` launches by exact
+ * name: {@link WORKER_BUILTIN_TOOLS}, and the first seed's `TodoWrite` and `WebSearch` (its `Task` is
+ * `subagents`'). No specifier: `WebFetch` alone matches every URL. One a template doesn't launch is inert.
+ */
+export const SEED_BUILTIN_RULES: readonly ToolRule[] = [...new Set([...WORKER_BUILTIN_TOOLS, "TodoWrite"])]
+  .map((pattern) => ({ pattern, decision: "allow" as const }));
+
+/**
  * Tools the registry no longer has: `delegate` (inspecting without hands is a pattern,
  * docs/orchestration/captains/), `spawn_agent` and `kill` (stubs, replaced by `agent_spawn` and
  * `agent_stop`). A stored capability or spec naming one is read without it.
@@ -336,12 +345,14 @@ export const MESSAGING_TOOLS_REMOVED: readonly string[] = [
 /**
  * The seed of an empty catalog (the current version). Beyond version 1 it adds the later steps'
  * capabilities, leaves out what they removed, and, for new catalogs only (a seed step never edits an
- * entry a catalog already holds): `management` without the {@link RETIRED_TOOLS}, `captain` with
- * `spawning`, and `worker` without `subagents` and with {@link WORKER_BUILTIN_TOOLS}.
+ * entry a catalog already holds, but for a seed prompt or rules still as the seed left them):
+ * `management` without the {@link RETIRED_TOOLS}, `captain` with `spawning`, `worker` without
+ * `subagents` and with {@link WORKER_BUILTIN_TOOLS}, and `nest` with {@link SEED_BUILTIN_RULES}.
  */
 export const SEED_CATALOG: Catalog = {
   capabilities: {
     ...Object.fromEntries(Object.entries(SEED_CATALOG_V1.capabilities).filter(([n]) => !MESSAGING_CAPABILITIES_REMOVED.includes(n))),
+    nest: { ...SEED_CATALOG_V1.capabilities.nest!, rules: [...SEED_CATALOG_V1.capabilities.nest!.rules, ...SEED_BUILTIN_RULES] },
     management: {
       ...SEED_CATALOG_V1.capabilities.management!,
       tools: SEED_CATALOG_V1.capabilities.management!.tools.filter((t) => !RETIRED_TOOLS.includes(t) && !MESSAGING_TOOLS_REMOVED.includes(t)),
@@ -397,12 +408,20 @@ export interface PromptRewrite {
   now: string;
 }
 
+/** A seed capability's rules a step replaces: only where the stored rules are still exactly `was` (an operator's edit stays). */
+export interface RulesRewrite {
+  capability: string;
+  was: readonly ToolRule[];
+  now: readonly ToolRule[];
+}
+
 export interface SeedStep {
   version: number;
   capabilities: Readonly<Record<string, Capability>>;
   templates: Readonly<Record<string, Template>>;
   removes?: Removes;
   prompts?: readonly PromptRewrite[];
+  rules?: readonly RulesRewrite[];
 }
 
 /**
@@ -430,6 +449,12 @@ export const SEED_STEPS: readonly SeedStep[] = [
   },
   { version: 8, capabilities: {}, templates: {}, removes: { capabilities: MESSAGING_CAPABILITIES_REMOVED, params: [], tools: MESSAGING_TOOLS_REMOVED } },
   { version: 9, capabilities: TIMER_CAPABILITIES, templates: {} },
+  // The built-ins a seed worker launches run without asking (`SEED_BUILTIN_RULES`), in catalogs whose
+  // `nest` is still the seed's.
+  {
+    version: 10, capabilities: {}, templates: {},
+    rules: [{ capability: "nest", was: SEED_CATALOG_V1.capabilities.nest!.rules, now: SEED_CATALOG.capabilities.nest!.rules }],
+  },
 ];
 export const SEED_VERSION = Math.max(1, ...SEED_STEPS.map((s) => s.version));
 
@@ -441,12 +466,13 @@ export const SEED_VERSION = Math.max(1, ...SEED_STEPS.map((s) => s.version));
  */
 export function seedMigration(have: { capabilities: readonly string[]; templates: readonly string[] }, from: number): {
   capabilities: Record<string, Capability>; templates: Record<string, Template>; version: number;
-  removes: { capabilities: string[]; params: string[]; tools: string[]; fields: string[] }; prompts: PromptRewrite[];
+  removes: { capabilities: string[]; params: string[]; tools: string[]; fields: string[] }; prompts: PromptRewrite[]; rules: RulesRewrite[];
 } {
   const capabilities: Record<string, Capability> = {};
   const templates: Record<string, Template> = {};
   const removes = { capabilities: [] as string[], params: [] as string[], tools: [] as string[], fields: [] as string[] };
   const prompts: PromptRewrite[] = [];
+  const rules: RulesRewrite[] = [];
   const add = (into: string[], items: readonly string[] | undefined) => {
     for (const x of items ?? []) if (!into.includes(x)) into.push(x);
   };
@@ -460,8 +486,9 @@ export function seedMigration(have: { capabilities: readonly string[]; templates
     add(removes.tools, step.removes?.tools);
     add(removes.fields, step.removes?.fields);
     prompts.push(...(step.prompts ?? []));
+    rules.push(...(step.rules ?? []));
   }
-  return { capabilities, templates, version: Math.max(from, SEED_VERSION), removes, prompts };
+  return { capabilities, templates, version: Math.max(from, SEED_VERSION), removes, prompts, rules };
 }
 
 /**
@@ -485,6 +512,19 @@ export function rewritePrompt(body: unknown, r: Pick<PromptRewrite, "was" | "now
   if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
   const c = body as Record<string, unknown>;
   return c.prompt === r.was ? { ...c, prompt: r.now } : null;
+}
+
+/**
+ * A stored capability's JSON with its rules replaced, if they are still exactly `r.was` (each rule's
+ * fields compared in canonical order); null otherwise.
+ */
+export function rewriteRules(body: unknown, r: Pick<RulesRewrite, "was" | "now">): Record<string, unknown> | null {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
+  const c = body as Record<string, unknown>;
+  const canon = (rules: unknown) => Array.isArray(rules)
+    ? JSON.stringify(rules.map((x) => (typeof x === "object" && x !== null ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => a.localeCompare(b))) : x)))
+    : null;
+  return canon(c.rules) === canon(r.was) ? { ...c, rules: r.now.map((x) => ({ ...x })) } : null;
 }
 
 /**

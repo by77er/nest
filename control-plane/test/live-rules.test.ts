@@ -37,12 +37,21 @@ async function asJson<T = any>(token: string, path: string, init: { method?: str
   return JSON.parse(text) as T;
 }
 
-/** An operator capability (`lr-<rand>`, with `rules`) and a template listing `nest` and it. */
+/**
+ * The operator's capability every template here lists first, as the seed's `nest` would: its rules allow
+ * the nest tools only (the seed's also allows the built-ins, which would shadow the WebFetch rules tested here).
+ */
+const BASE_CAP = `lr-base-${rand()}`;
+let based: Promise<unknown> | undefined;
+const base = () => (based ??= adminJson(`/v1/admin/capabilities/${BASE_CAP}`, { method: "PUT", body: capability([NEST_ALLOW]) }));
+
+/** An operator capability (`lr-<rand>`, with `rules`) and a template listing the base and it. */
 async function operatorEntries(rules: ToolRule[]) {
+  await base();
   const cap = `lr-${rand()}`;
   const tpl = `lrt-${rand()}`;
   await adminJson(`/v1/admin/capabilities/${cap}`, { method: "PUT", body: capability(rules) });
-  await adminJson(`/v1/admin/templates/${tpl}`, { method: "PUT", body: template(["nest", cap]) });
+  await adminJson(`/v1/admin/templates/${tpl}`, { method: "PUT", body: template([BASE_CAP, cap]) });
   return { cap, tpl };
 }
 const putCap = (cap: string, rules: ToolRule[]) => adminJson(`/v1/admin/capabilities/${cap}`, { method: "PUT", body: capability(rules) });
@@ -66,7 +75,7 @@ describe("live capability rules", () => {
     const agent = (await adminJson("/v1/agents", { body: { template: tpl, cell } }, 201)).agent as string;
     await nextCommands(host.ws, (c) => c.type === "agent_start" && c.agent === agent);
     await rulesSettled(agent);
-    expect(await watched(agent)).toEqual([cap, "nest"].sort());
+    expect(await watched(agent)).toEqual([cap, BASE_CAP].sort());
 
     const ws = await Ws.connect(`/v1/agents/${agent}/session`, host.host_token);
     ws.send({ type: "hello", protocol_version: 1, agent, host: host.host, instance_id: "rin_test", epoch: 1, session: SESSION });
@@ -89,7 +98,7 @@ describe("live capability rules", () => {
     const view = await adminJson(`/v1/agents/${agent}`);
     expect(view.rules).toEqual([NEST_ALLOW, ALLOW_WEB]);
     expect(view.rules_version).toBe(next.version);
-    expect(view.rule_sources).toEqual([{ capability: "nest" }, { capability: cap }]);
+    expect(view.rule_sources).toEqual([{ capability: BASE_CAP }, { capability: cap }]);
     // A check made against the cache before the change (in flight across it) is refused, and spends nothing.
     expect(await check("req_2", next.version - 1)).toMatchObject({ status: "error", error: { code: "conflict" } });
     const unspent = await runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
@@ -156,7 +165,7 @@ describe("live capability rules", () => {
     await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'prune'"));
     await runDue(agentStub(agent));
     await rulesBecome(agent, [NEST_ALLOW, ALLOW_WEB]);
-    expect(await watched(agent)).toEqual([cap, "nest"].sort());
+    expect(await watched(agent)).toEqual([cap, BASE_CAP].sort());
   });
 
   it("the operator's rules stand over a capability change until cleared; then the capability's are read", async () => {
@@ -172,7 +181,7 @@ describe("live capability rules", () => {
     expect(await rulesOf(agent)).toEqual([DENY_WEB]);
     expect((await adminJson(`/v1/agents/${agent}`)).rules_set).toBe(true);
 
-    expect(await adminJson(`/v1/agents/${agent}/rules`, { method: "DELETE" })).toEqual({ rule_sources: [{ capability: "nest" }, { capability: cap }] });
+    expect(await adminJson(`/v1/agents/${agent}/rules`, { method: "DELETE" })).toEqual({ rule_sources: [{ capability: BASE_CAP }, { capability: cap }] });
     await rulesBecome(agent, [NEST_ALLOW, ALLOW_WEB]);
     expect((await adminJson(`/v1/agents/${agent}`)).rules_set).toBeUndefined();
   });
@@ -211,7 +220,7 @@ describe("live capability rules", () => {
     expect(await rulesOf(agent)).toEqual([ask, NEST_ALLOW]);
     await eventually("its watch dropped", async () => (await watched(agent)).length === 0);
 
-    expect((await adminJson(`/v1/agents/${agent}/rules`, { method: "DELETE" })).rule_sources).toEqual([{ rules: [ask] }, { capability: "nest" }, { capability: cap }]);
+    expect((await adminJson(`/v1/agents/${agent}/rules`, { method: "DELETE" })).rule_sources).toEqual([{ rules: [ask] }, { capability: BASE_CAP }, { capability: cap }]);
     await rulesBecome(agent, [ask, NEST_ALLOW, ALLOW_WEB]);
   });
 
@@ -360,7 +369,7 @@ describe("the nudge protocol's guards", () => {
       await rulesSettled(agent);
       // Never the sources joined with the empty read (the capability's deny missing).
       expect(pushed).toEqual([[ALLOW_SEARCH], [NEST_ALLOW, DENY_WEB]]);
-      expect(await watched(agent)).toEqual([cap, "nest"].sort());
+      expect(await watched(agent)).toEqual([cap, BASE_CAP].sort());
     } finally {
       release();
       pw.restore();
@@ -381,7 +390,7 @@ describe("the nudge protocol's guards", () => {
     });
     await runDue(agentStub(agent));
     await eventually("its watch set again", async () => (await watched(agent)).length === 2);
-    expect(await watched(agent)).toEqual([cap, "nest"].sort());
+    expect(await watched(agent)).toEqual([cap, BASE_CAP].sort());
   });
 
   it("the reap leaves a watch its end didn't", async () => {
@@ -465,7 +474,7 @@ describe("a seed step", () => {
     const r = await runInDurableObject(stub, async (_i: CatalogDO, st) => {
       const sql = st.storage.sql;
       // A catalog at version 6, its seed entries as that version left them: version 7 replaces `spawning`'s
-      // prompt and deletes `channels`; every later step runs too.
+      // prompt and deletes `channels`, version 10 rewrites `nest`'s rules; every later step runs too.
       sql.exec("UPDATE kv SET value = '6' WHERE key = 'seed_version'");
       const spawning = JSON.parse(sql.exec<{ body: string }>("SELECT body FROM capabilities WHERE name = 'spawning'").one().body);
       sql.exec("UPDATE capabilities SET body = ? WHERE name = 'spawning'", JSON.stringify({ ...spawning, prompt: SPAWNING_PROMPT_V5 }));
@@ -481,7 +490,8 @@ describe("a seed step", () => {
       const nudged = sql.exec<{ agent: string }>("SELECT agent FROM rule_nudges ORDER BY agent").toArray().map((x) => x.agent);
       return { changed, nudged };
     });
-    expect(r.changed).toEqual(expect.arrayContaining(["agt_w-channels", "agt_w-spawning"]));
+    // A prompt rewrite (7), a deletion (7) and a rules rewrite (10, `nest` still the first seed's).
+    expect(r.changed).toEqual(expect.arrayContaining(["agt_w-channels", "agt_w-nest", "agt_w-spawning"]));
     expect(r.nudged).toEqual(r.changed);
   });
 });
@@ -493,16 +503,17 @@ describe("a client's capability rules", () => {
     const grant = { cells: [cell], credentials: ["claude_oauth_token"], max_agents: 10, max_sandboxes: 10, mcp_urls: ["https://tools.example.com/mcp"] };
     const c = await adminJson("/v1/admin/clients", { body: { name, grant } }, 201);
     const cap = `${name}/web`;
+    await base();
     await asJson(c.token, `/v1/catalog/capabilities/${cap}`, { method: "PUT", body: capability([]) });
-    await asJson(c.token, `/v1/catalog/templates/${name}/t`, { method: "PUT", body: template(["nest", cap]) });
+    await asJson(c.token, `/v1/catalog/templates/${name}/t`, { method: "PUT", body: template([BASE_CAP, cap]) });
     // The client's agent, narrowed at spawn: WebFetch denied whatever the capability says.
     const own = (await asJson(c.token, "/v1/agents", { body: { template: `${name}/t`, cell, start: false, overrides: { rules: [DENY_WEB] } } }, 201)).agent as string;
     // The operator's agent from the client's template: the client's capability is read as at spawn.
     const operators = await spawn(`${name}/t`, cell);
     await rulesSettled(own);
     await rulesSettled(operators);
-    expect((await adminJson(`/v1/agents/${operators}`)).rule_sources).toEqual([{ capability: "nest" }, { rules: [] }]);
-    expect(await watched(operators)).toEqual(["nest"]);
+    expect((await adminJson(`/v1/agents/${operators}`)).rule_sources).toEqual([{ capability: BASE_CAP }, { rules: [] }]);
+    expect(await watched(operators)).toEqual([BASE_CAP]);
 
     await asJson(c.token, `/v1/catalog/capabilities/${cap}`, { method: "PUT", body: capability([ALLOW_WEB, ALLOW_SEARCH]) });
     // The narrowing still wins: WebFetch stays denied, WebSearch is allowed now.
