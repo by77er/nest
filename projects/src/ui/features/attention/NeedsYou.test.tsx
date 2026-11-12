@@ -239,8 +239,11 @@ describe("asks", () => {
     expect(p.compareDocumentPosition(tasks) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(p).toHaveTextContent("Reading the agents' asks…");
     expect(within(p).getByLabelText("An unknown number of items")).toHaveTextContent("?");
+    // Nothing is known to wait yet: it holds the space without the warning.
+    expect(p.getAttribute("data-tone")).toBe("default");
     release();
     await waitFor(() => expect(p).toHaveTextContent("Which branch?"));
+    expect(p.getAttribute("data-tone")).toBe("warning");
   });
 
   it("a poll that fails after a good read says it shows that read", async () => {

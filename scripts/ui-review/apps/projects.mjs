@@ -1158,7 +1158,11 @@ async function asksCold(p, ms) {
   const panel = panelOf(p);
   if (ms > 1500) {
     if (!(await panel.count())) notes.push(`cold load, nest ${ms} ms: the board showed without the panel (it will jump when nest answers)`);
-    else if (!(await panel.locator("[data-asks-reading]").count())) notes.push(`cold load, nest ${ms} ms: the panel doesn't say the asks are being read`);
+    else {
+      if (!(await panel.locator("[data-asks-reading]").count())) notes.push(`cold load, nest ${ms} ms: the panel doesn't say the asks are being read`);
+      // Nothing is known to wait yet (the sidebar's count is unread too): it holds the space, calmly.
+      if ((await panel.getAttribute("data-tone")) === "warning") notes.push(`cold load, nest ${ms} ms: the reading panel claims something needs you (warning tone) before anything is known`);
+    }
     // Until nest answers, nothing above the board moves.
     await p.waitForTimeout(Math.max(0, ms - (Date.now() - start) - 300));
   } else {
@@ -1174,7 +1178,8 @@ async function asksCold(p, ms) {
 async function projectsRefreshFailed(p) {
   await p.locator("article [data-marker=needs-you]").first().waitFor();
   const nav = p.locator('nav[aria-label="Main"]');
-  const firstRow = async () => (await nav.locator("a, button").first().boundingBox())?.y ?? 0;
+  // The first nav row below the switcher (the note, when shown, sits between them and must not push them).
+  const firstRow = async () => (await nav.locator("[data-ds=nav-row]").first().boundingBox())?.y ?? 0;
   const y1 = await firstRow();
   await p.route((u) => u.pathname === "/api/projects", (r) => r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "the Worker is unavailable (fixture)" }) }));
   await p.waitForTimeout(13000); // past a poll (10 s) and its retries

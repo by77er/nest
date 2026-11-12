@@ -240,12 +240,15 @@ export function NeedsYou({ projectId, after, shownBeforeAsks = false }: { projec
   const rest = items.slice(SHOWN);
   // A count only for a whole list; unknown ("?") while the asks are read or can't be; none for a note alone.
   // A stale read's count is unknown now too ("?", as the sidebar's): the stale line says what was read and when.
+  // The warning tone only when something waits, or might (the asks unknown); not while a cold load's read is out
+  // with nothing known yet (the sidebar's count unread): then the panel only holds the space.
+  const warn = items.length > 0 || list.stale || (!whole && !(list.asks === "reading" && listed === undefined));
   const count = items.length === 0 && whole && !list.stale ? undefined : whole && !list.stale ? items.length : null;
   return (
     <>
       {live}
-      <Panel ref={panel} tone={items.length > 0 || !whole ? "warning" : "default"} component="section" aria-label="Needs you" aria-live="polite" data-needs-you>
-        <Section title="Needs you" count={count} icon={items.length > 0 || !whole ? IconAlertTriangle : undefined} iconColor="warning" region={false} headingRef={heading}>
+      <Panel ref={panel} tone={warn ? "warning" : "default"} component="section" aria-label="Needs you" aria-live="polite" data-needs-you>
+        <Section title="Needs you" count={count} icon={warn ? IconAlertTriangle : undefined} iconColor="warning" region={false} headingRef={heading}>
           <Stack gap="lg">
             {list.asks === "reading" && (
               <Text fz="sm" c="dimmed" data-asks-reading>
