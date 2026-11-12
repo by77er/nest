@@ -20,9 +20,9 @@ When a daily limit is exceeded, operations **fail** until 00:00 UTC, so hosts mu
 ## Rules
 
 - **No bulk bytes.** Transcripts pass through the control plane and are stored in R2. Sandbox state never comes through it, and neither do hands calls: a brain talks to a sandbox host's [gateway](../sandbox/gateway/) directly, and the control plane only issues the binding and resolves the hostname. See [../data/](../data/).
-- **No S3 credentials.** The only AWS credential is a scoped IAM user per cell, for EC2 and the cell's KMS key. See [../compute/cells/](../compute/cells/).
+- **No S3 credentials.** The only AWS credential is a scoped IAM user per cell, for EC2, the cell's KMS key and reading its host AMI parameter in SSM. See [../compute/cells/](../compute/cells/).
 - **Durability means DO storage plus alarms.** Not Workflows or Queues: on Paid their retention is fine (30 days and 14 days), but a long-lived opaque process (Claude Code) doesn't fit a step function, and either would be a second authority next to the entity's DO ([Workflows limits](https://developers.cloudflare.com/workflows/reference/limits/), [Queues limits](https://developers.cloudflare.com/queues/platform/limits/)).
-- **Point-in-time recovery:** DO SQLite can be restored to any point in the last 30 days ([SQLite API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)). Each DO takes a bookmark before migrating its own schema, so a bad migration can be undone object by object.
+- **Point-in-time recovery:** DO SQLite can be restored to any point in the last 30 days ([SQLite API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)). Each DO is to take a bookmark before migrating its own schema, so a bad migration can be undone object by object (not built: constructors migrate without one).
 - **DOs restart** about once or twice a day and on every deploy, which drops every socket, hibernating ones included. Hosts reconnect with jittered backoff, and nothing assumes a socket outlives a deploy ([Oct 2026 changelog](https://developers.cloudflare.com/changelog/post/2026-10-12-longer-runtime-update-grace-period/)).
 - **Storage:** 10 GB of SQLite per DO ([limits](https://developers.cloudflare.com/durable-objects/platform/limits/)). Storage billing (over 5 GB, $0.20/GB-month) was announced; whether it has started is unverified.
 
