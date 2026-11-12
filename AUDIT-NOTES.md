@@ -6,7 +6,7 @@ Docs check of `docs/agents/` and `docs/orchestration/` against AgentDO, the runn
 |---|---|---|---|
 | agents/README.md | `agent_spawn` params without `read_repos`; `agent_stop`/`exit` without `reason` | both take them | protocol/schemas/control/platform-tools.json (agent_spawn, agent_stop, exit) |
 | agents/README.md | "Built: … the grants system takes it over as `(spawner, *, child)` grants" | ownership is only the owner-chain walk; marked designed | control-plane/src/lib/lifetimes.ts:84 (`ownsVia`) |
-| agents/README.md | (silent) | a graceful end not done in 15 min is killed; pending timers don't keep an ephemeral agent alive and are dropped at its end | lifetimes.ts:43 (`END_GRACE_MS`), :101; do/agent.ts:1366 |
+| agents/README.md | (silent) | a graceful end not done in 15 min is killed; pending timers don't keep an ephemeral agent alive and are dropped at its end | lifetimes.ts:48 (`END_GRACE_MS`), `ephemeralDone`; do/agent.ts `dropTimers` (~1380) |
 | tools/README.md | no timer tools; only `wake_at`/`wake_cancel` | `timer_set`, `timer_cancel`, `timer_list` built; `wake_at` isn't | platform-tools.json:488-536; agent.ts:3231-3256 |
 | tools/README.md | `nest expose` and `nest hold` built; CLI socket takes at most 256 connections | the CLI has `expose`, `unexpose`, `whoami`; `nest hold` and the cap are design | crates/nest-cli/src/guest_cli.rs:76-78; crates/nest-guest/src/cli.rs:27-38 |
 | tools/README.md | `interrupt` "built for the operator's API only" | the inbox route is `auth: owner`: API clients too | control-plane/src/index.ts (`POST /v1/agents/:agent/inbox`) |
@@ -30,7 +30,7 @@ Docs check of `docs/agents/` and `docs/orchestration/` against AgentDO, the runn
 | orchestration/README.md | owner events: turns, exits, asks, errors | also `agent.timer_fired` | lib/client-events.ts |
 | orchestration/captains/README.md | workers get only grants and budget it holds; `backend`/`priority`/`budget` unmarked; read-only forks and report schemas as primitives | overrides narrow against the template (the spawn grant authorizes it); those fields don't exist; neither primitive built | spec.ts `SpawnerOverrides` (`repos` comment), `Template` |
 | orchestration/repo-maintenance/README.md | read as built | designed: no `maintainer`/`reviewer`/`monitor`, no `coordination`/`authority`/`schedules`/`github_ro`/`metrics`/`web`; no `review_check`, `dispatch_workflow`, `create_pr.auto_merge`, forks, `report_schema`; the projects app builds a variant; the seeded `worker` has `WebSearch`/`WebFetch` | spec.ts seed; brokered.ts actions and create_pr schema (`additionalProperties: false`); spec.ts `WORKER_BUILTIN_TOOLS` |
-| orchestration/scheduling/README.md | usage from `usage` events; a rate limit is logged | usage on `turn_completed`; only `api_retry` emits `rate_limited` (logged, traced), `StopFailure` only sets `quota_parked`; per-host `brain.max_brains_per_host` | lib/trace.ts; nest-runner stream.rs:19-27, hooks.rs `track`; agent.ts:2752; fleet.ts:1602 |
+| orchestration/scheduling/README.md | usage from `usage` events; a rate limit is logged | usage on `turn_completed`; only `api_retry` emits `rate_limited` (logged, traced), `StopFailure` only sets `quota_parked`; per-host `brain.max_brains_per_host` | lib/trace.ts; nest-runner stream.rs:19-27, hooks.rs `track`; agent.ts:2790; do/fleet.ts:1602 |
 
 ## Unconfirmed (left as written)
 - agents/README.md (Fencing): restart on another host "after 30 s with `--resume`": the 30 s host expiry is in protocol/control.ts; the resume path wasn't traced end to end.
@@ -44,7 +44,7 @@ Docs check of `docs/agents/` and `docs/orchestration/` against AgentDO, the runn
 
 ## Suspected code bugs (not changed)
 - The model is told owners hear their children: the `agent_spawn` description ("its events … reach you", platform-tools.json:4), the spawn result ("Its events reach you.", agent.ts ~1856), the `exit` description ("Your owner hears your final text", platform-tools.json:146). The code and the `spawning` prompt say an owner agent hears nothing.
-- An ephemeral agent ends with timers pending (lifetimes.ts:101), so it can't use a timer to wait.
+- An ephemeral agent ends with timers pending (lifetimes.ts `ephemeralDone`), so it can't use a timer to wait.
 - `StopFailure` rate limits emit no `rate_limited` (hooks.rs `track`): no log, trace or retry hint. `rate_limited` sets `quota_parked` without a staleness check (agent.ts ~2723).
 - An unscoped `github.fork` grant is described as "Any repository the App is installed on" (brokered.ts ~340-345); forks use `github_user` on any public upstream.
 - An agent created through the API with `owner: agt_…` starts at depth 0 (index.ts ~855), restarting the depth cap.

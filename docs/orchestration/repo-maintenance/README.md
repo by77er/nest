@@ -2,7 +2,7 @@
 
 Agents maintaining a code repository: they pick up work, change code, review each other's changes, merge through the repo's own gates, and watch what ships. Like every pattern, this is templates and prompts; no code knows about it.
 
-**Status:** designed. None of its templates (`maintainer`, `reviewer`, `monitor`) or capabilities (`coordination`, `authority`, `schedules`, `github_ro`, `metrics`, `web`) is seeded, and `github.review_check`, `github.dispatch_workflow`, `github.create_pr`'s `auto_merge`, sandbox forks and `report_schema` aren't built. **Built as a variant:** the [projects](../../../projects/README.md) app's manager, worker per task, and reviewer per PR head, which sets a required check with the app's own GitHub token; with the project's auto-merge on, the app enables GitHub's auto-merge on each task PR.
+**Status:** designed. None of its templates (`maintainer`, `reviewer`, `monitor`) or capabilities (`coordination`, `authority`, `schedules`, `github_ro`, `metrics`, `web`) is seeded, and `github.review_check`, `github.dispatch_workflow`, `github.create_pr`'s `auto_merge`, sandbox forks and `report_schema` aren't built. **Built as a variant:** the [projects](../../../projects/README.md) app's manager, worker per task, and reviewer per PR head, which sets a required check with a GitHub token nest mints for the app; with the project's auto-merge on, the app enables GitHub's auto-merge on each task PR.
 
 ## Agents
 

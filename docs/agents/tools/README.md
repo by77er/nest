@@ -68,6 +68,6 @@ An agent that reads untrusted content, holds private data and can send data out 
 
 ## The `nest` CLI inside sandboxes
 
-Scripts and programs running in a sandbox can call `nest expose`, `nest unexpose` and `nest whoami` through the guest agent over vsock (`nest hold` is designed, not built). What they send is **always tainted**. `NEST_AGENT_ID`, set on every hands exec, attributes a call. It isn't a secret, because identity inside a sandbox is attribution only. Everything else needs a brain. The CLI socket is to take at most 256 connections ([admission](../../sandbox/guest-agent/#admission), designed; today it has no cap).
+Scripts and programs running in a sandbox can call `nest expose`, `nest unexpose` and `nest whoami` through the guest agent over vsock. What they send is **always tainted**. `NEST_AGENT_ID`, set on every hands exec, attributes a call. It isn't a secret, because identity inside a sandbox is attribution only. Everything else needs a brain. The CLI socket is to take at most 256 connections ([admission](../../sandbox/guest-agent/#admission), designed; today it has no cap).
 
 **Designed, not built:** `nest hold <duration>` asks to keep the sandbox awake (no pause or suspend) for a background build or a dev server. It's granted up to the sandbox's maximum hold (1 h by default) and prints the granted duration; a later call replaces the hold, and `nest hold 0` ends it ([idle rule](../../control-plane/durable-objects/sandbox/#activity-and-idle)). Nothing inside a sandbox can ask for it to be paused, suspended or shut down.

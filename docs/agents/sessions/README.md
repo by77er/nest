@@ -1,6 +1,6 @@
 # Sessions (stored outside the sandbox)
 
-**There's one artifact: Claude Code's native session directory.** It's written on the brain host, outside every VM and away from every sandbox host, so the agent's commands can't tamper with it. Anthropic's Agent SDK [`SessionStore`](https://code.claude.com/docs/en/agent-sdk/session-storage) mirrors the same files the same way; nest's copy is stronger, because nothing is acknowledged before it's durable.
+**There's one artifact: Claude Code's native session directory** (built: its main JSONL; below). It's written on the brain host, outside every VM and away from every sandbox host, so the agent's commands can't tamper with it. Anthropic's Agent SDK [`SessionStore`](https://code.claude.com/docs/en/agent-sdk/session-storage) mirrors the same files the same way; nest's copy is stronger, because nothing is acknowledged before it's durable.
 
 ```
 claude writes $CLAUDE_CONFIG_DIR/projects/…/<session>.jsonl, plus subagents/ and sidecar files
