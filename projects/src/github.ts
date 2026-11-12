@@ -76,6 +76,9 @@ export async function verifyGithubSignature(secret: string, header: string | nul
 
 // --- the client ----------------------------------------------------------------------------------------
 
+/** GraphQL error types that are GitHub's trouble, not a refusal: tried again. */
+const TRANSIENT_GRAPHQL = new Set(["INTERNAL", "SERVICE_UNAVAILABLE", "TIMEOUT"]);
+
 /** GitHub's refusal: its status and `message`, never the token. */
 export class GitHubError extends Error {
   constructor(
@@ -255,7 +258,10 @@ export class GitHub {
     if (o.notFound && r.data && r.errors?.length && r.errors.every((e) => e.type === "NOT_FOUND")) return r.data;
     if (r.errors?.length) {
       const limited = r.errors.some((e) => e.type === "RATE_LIMITED");
-      throw new GitHubError(limited ? 429 : 422, r.errors.map((e) => (typeof e.message === "string" ? e.message : "error")).join("; ").slice(0, 300), limited);
+      // GitHub's own trouble (its timeout, an internal error) is retried, not a refusal: only when every error is
+      // one (the types and the timeout's wording are as GitHub answers them; not a documented list: unverified).
+      const transient = !limited && r.errors.every((e) => TRANSIENT_GRAPHQL.has(String(e.type)) || (typeof e.message === "string" && /timeout|something went wrong/i.test(e.message)));
+      throw new GitHubError(limited ? 429 : transient ? 502 : 422, r.errors.map((e) => (typeof e.message === "string" ? e.message : "error")).join("; ").slice(0, 300), limited);
     }
     return r.data as T;
   }

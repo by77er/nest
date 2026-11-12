@@ -245,8 +245,9 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
     // A check on one of the repo's PRs failed: a nudge to read the PRs sooner (README.md#pr-upkeep). What a
     // worker is told is decided from that read, never from this event.
     const run = obj(payload.check_run);
-    const prs = Array.isArray(run.pull_requests) ? run.pull_requests : [];
-    if (prs.length && FAILED_CONCLUSIONS.has(str(run.conclusion) ?? "")) await project(env, p.id).nudgePrRead();
+    const prs = (Array.isArray(run.pull_requests) ? run.pull_requests : []).map((x) => prNumber(obj(x).number)).filter((n): n is number => n !== null);
+    // Only a PR a live worker owns brings the read forward (ProjectDO decides which).
+    if (prs.length && FAILED_CONCLUSIONS.has(str(run.conclusion) ?? "")) await project(env, p.id).nudgePrRead(prs);
   } else if (action === "rerequested") {
     const run = obj(payload.check_run);
     const id = prNumber(run.id);

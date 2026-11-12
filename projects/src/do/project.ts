@@ -28,7 +28,7 @@ import type { RoutineKind, RoutinePreset } from "../requests";
 import { type Created, firedTrigger, MAX_PROPOSALS_PER_RUN, MAX_ROUTINES, MAX_START_ATTEMPTS, MAX_UNTRIAGED_PROPOSALS, nextTimerFire, type RoutineFields, routineSpawnExtras, runBrief, type RunOutcome, type RunState, startVerdict, type TriggerKind, type Triggers } from "../routines";
 import { EARLY_EXITS_KEEP_MS, ENDED_RUNS_KEEP_MS, ERRORS_KEEP_MS, PR_TOLD_KEEP_MS, PRUNE_EVERY_MS, RUN_TURNS_KEEP_MS, TRIAGED_PROPOSALS_KEEP_MS } from "../retention";
 import { type PrNow, readPrs } from "../pr-read";
-import { prConditions, upkeepMessage } from "../pr-upkeep";
+import { prConditions, UPKEEP_CONDITIONS, type UpkeepCondition, upkeepMessage } from "../pr-upkeep";
 import { randomId } from "./directory";
 import { type ManagerEvent, type ManagerLife, managerStep } from "../manager";
 import { OUTBOX, type OutboxEvent, type OutboxPolicy, type OutboxRow, type OutboxState, outboxState, outboxStep, pruneBefore, verdict } from "../outbox";
@@ -603,7 +603,9 @@ const SWITCH_REFUSALS = 3;
 
 /** How often the PRs live workers own are read from GitHub (README.md#pr-upkeep), and the least time between two reads (a nudge's). */
 export const PR_READ_EVERY_MS = 60_000;
-export const PR_READ_GAP_MS = 10_000;
+export const PR_READ_GAP_MS = 30_000;
+/** A condition still holding at the same head is told again after this (README.md#pr-upkeep): a message lost or ignored doesn't strand the PR. */
+export const PR_RETELL_MS = 3 * 3600_000;
 
 /** A failed stop's `next_ms` (the column is NOT NULL): never due (9999-12-31), until the owner's Retry. */
 const NOT_DUE_MS = 253_402_300_799_000;
@@ -1727,18 +1729,24 @@ export class ProjectDO extends DurableObject<Env> {
     return (r.pr_read_next_ms as number | null) ?? Date.now();
   }
 
-  /** Something may have changed on a PR (a review failed, a check failed): read soon, but never within PR_READ_GAP_MS of the last read. */
-  private nudgePrs(): void {
+  /**
+   * Something may have changed on these PRs (a review failed, a check failed): read soon, but never within
+   * PR_READ_GAP_MS of the last read, only for a PR a live worker owns, and never while reads are failing
+   * (their backoff stands).
+   */
+  private nudgePrs(prs: readonly number[]): void {
     const r = this.settingsRow();
-    if (!r) return;
+    if (!r || (r.pr_read_attempts as number) > 0) return;
+    const owned = new Set(this.prOwners().map((o) => o.pr));
+    if (!prs.some((n) => owned.has(n))) return;
     const at = Math.max(Date.now(), ((r.pr_read_last_ms as number | null) ?? 0) + PR_READ_GAP_MS);
     this.sql.exec("UPDATE settings SET pr_read_next_ms = ? WHERE pr_read_next_ms IS NULL OR pr_read_next_ms > ?", at, at);
   }
 
-  /** A webhook's nudge (a check run on a PR failed): the read comes sooner. It decides nothing itself. */
-  async nudgePrRead(): Promise<void> {
+  /** A webhook's nudge (a check run on these PRs failed): the read comes sooner. It decides nothing itself. */
+  async nudgePrRead(prs: number[]): Promise<void> {
     if (!this.settings()) return;
-    this.nudgePrs();
+    this.nudgePrs(prs);
     await this.arm();
   }
 
@@ -1776,18 +1784,33 @@ export class ProjectDO extends DurableObject<Env> {
     }
     this.sql.exec("UPDATE settings SET pr_read_attempts = 0");
     const github: Actor = { kind: "app", what: "github" };
+    const now = Date.now();
     // Who owns which PR now (the awaits let other steps run): a worker that went, or a PR that left, is told nothing.
     for (const o of this.prOwners()) {
       const pr = prs.get(o.pr);
       if (!pr) continue;
       const v = verdicts[`${pr.number}/${pr.head_sha}`] ?? null;
-      const found = prConditions(pr, v).filter((c) =>
-        !this.sql.exec("SELECT 1 FROM pr_told WHERE agent = ? AND pr = ? AND head = ? AND cond = ?", o.agent, pr.number, pr.head_sha, c).toArray().length);
-      if (!found.length) continue;
-      for (const c of found) this.sql.exec("INSERT INTO pr_told (agent, pr, head, cond, at_ms) VALUES (?, ?, ?, ?, ?)", o.agent, pr.number, pr.head_sha, c, Date.now());
+      const holds = prConditions(pr, v);
+      // A condition seen not to hold at this head is forgotten, so its return (a Re-run that fails again) is told.
+      // A conflict GitHub hasn't computed yet (UNKNOWN) is neither.
+      for (const c of UPKEEP_CONDITIONS) {
+        if (holds.includes(c) || (c === "conflict" && pr.mergeable === "UNKNOWN")) continue;
+        this.sql.exec("DELETE FROM pr_told WHERE agent = ? AND pr = ? AND head = ? AND cond = ?", o.agent, pr.number, pr.head_sha, c);
+      }
+      // Told once per condition at a head, and again every PR_RETELL_MS while it holds.
+      const last = (c: UpkeepCondition) =>
+        (this.sql.exec("SELECT at_ms FROM pr_told WHERE agent = ? AND pr = ? AND head = ? AND cond = ?", o.agent, pr.number, pr.head_sha, c).toArray()[0]?.at_ms as number | undefined) ?? null;
+      const due = holds.map((c) => ({ c, at: last(c) })).filter((x) => x.at === null || x.at <= now - PR_RETELL_MS);
+      if (!due.length) continue;
+      for (const { c } of due) {
+        this.sql.exec("INSERT INTO pr_told (agent, pr, head, cond, at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT (agent, pr, head, cond) DO UPDATE SET at_ms = excluded.at_ms",
+          o.agent, pr.number, pr.head_sha, c, now);
+      }
+      const found = due.map((x) => x.c);
+      const again = due.every((x) => x.at !== null);
       // Relayed: check names and links are the repo's CI's, the findings a tainted reviewer's.
-      this.oweMessage(o.agent, upkeepMessage(pr, found, v), true);
-      this.record(o.task, github, "pr_upkeep", { pr: pr.number, head: pr.head_sha, told: found });
+      this.oweMessage(o.agent, upkeepMessage(pr, found, v, { task: o.task, nonce: randomHex(8), again }), true);
+      this.record(o.task, github, "pr_upkeep", { pr: pr.number, head: pr.head_sha, told: found, ...(again ? { again: true } : {}) });
       // Sent in this drain's next round.
       this.again = true;
     }
@@ -2473,7 +2496,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (!this.settings()) return;
     for (const w of this.pendingWaits("pr", String(e.pr))) this.prWaitOn(w, { kind: "review", conclusion: e.conclusion ?? e.state });
     // A failed review is a nudge to read the PRs soon (README.md#pr-upkeep): its worker is told from that read.
-    if (e.conclusion === "failure") this.nudgePrs();
+    if (e.conclusion === "failure") this.nudgePrs([e.pr]);
     await this.arm();
   }
 
@@ -4341,6 +4364,8 @@ function prAutoMerge(r: Row): TaskAutoMerge | null {
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 500);
+/** `n` random bytes as hex: a marker no text written before it could know. */
+const randomHex = (n: number) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 function managerBrief(s: Settings): string {
   return [

@@ -118,7 +118,9 @@ export function summarize(h: HistoryRow): string {
       const said = { review_failed: "failed review", checks_failed: "has failing checks", conflict: "conflicts with its base" } as Record<string, string>;
       const told = Array.isArray(o.told) ? o.told.map((c) => said[String(c)]).filter((x): x is string => !!x) : [];
       const pr = typeof o.pr === "number" ? `PR #${o.pr}` : "its PR";
-      return told.length ? `Its worker was told ${pr} ${told.length > 1 ? `${told.slice(0, -1).join(", ")} and ${told[told.length - 1]}` : told[0]}` : `Its worker was told ${pr} needs work`;
+      // Told again (still so at the same head, hours on): a reminder.
+      const verb = o.again === true ? "reminded" : "told";
+      return told.length ? `Its worker was ${verb} ${pr} ${told.length > 1 ? `${told.slice(0, -1).join(", ")} and ${told[told.length - 1]}` : told[0]}` : `Its worker was told ${pr} needs work`;
     }
     case "worker_not_notified":
       return "Its worker couldn't be told of the change";

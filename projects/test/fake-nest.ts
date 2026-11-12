@@ -925,6 +925,8 @@ export class FakeGitHub {
 
   /** GraphQL reads of PRs by number (aliases `p<i>`, variables `n<i>`), as GitHub answers the app's query. */
   readonly pullReads: { repo: string; numbers: number[] }[] = [];
+  /** Errors a PR read answers besides its data (each read, while set), as GitHub adds them to a partial answer. */
+  pullReadErrors: { type?: string; message: string }[] = [];
 
   private readPulls(body: any, t: { repo: string; permissions: Record<string, string> }, json: (status: number, body: unknown) => Response): Response {
     const v = body?.variables ?? {};
@@ -958,6 +960,7 @@ export class FakeGitHub {
       };
     }
     this.pullReads.push({ repo, numbers });
+    errors.push(...this.pullReadErrors);
     return json(200, { data: { repository }, ...(errors.length ? { errors } : {}) });
   }
 
