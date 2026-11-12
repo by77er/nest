@@ -81,8 +81,8 @@ pub async fn call(agent: &Arc<Agent>, call_id: String, op: HandsOp, cancel: Canc
     call_with(agent, call_id, op, &cancel, &Budgets::default()).await
 }
 
-/// Fetch the target in the background right after `agent_start`, so the SessionStart hook and
-/// the first tool call find it cached. Waits through `sandbox_not_ready` like a call would.
+/// Fetch the target in the background right after `agent_start`, so the first tool call finds
+/// it cached. Waits through `sandbox_not_ready` like a call would.
 pub fn prefetch_target(agent: Arc<Agent>) {
     if agent.hands.is_none() {
         return;

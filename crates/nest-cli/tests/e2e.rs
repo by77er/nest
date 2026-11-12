@@ -450,7 +450,7 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
         assert!(call.call.0.starts_with("cal_trnone-"), "{}", call.call);
     }
 
-    // Hands: SessionStart read CLAUDE.md, then the two turn steps.
+    // Hands: the two turn steps, and nothing before them (SessionStart reads no repo file).
     let reqs = h.guest.requests().await;
     let cmds: Vec<String> = reqs
         .iter()
@@ -459,8 +459,9 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
             o => o.tool_name().into(),
         })
         .collect();
-    assert!(cmds[0].contains("CLAUDE.md"), "{cmds:?}");
-    assert_eq!(h.agentdo.log.lock().await.resolves, 1, "one hands_resolve serves the hook read and both turn steps");
+    assert!(!cmds.iter().any(|c| c.contains("CLAUDE.md")), "{cmds:?}");
+    assert_eq!(cmds.len(), 2, "{cmds:?}");
+    assert_eq!(h.agentdo.log.lock().await.resolves, 1, "one hands_resolve serves both turn steps");
     assert!(cmds.iter().any(|c| c == "echo PLATFORM hello"), "{cmds:?}");
     assert!(cmds.iter().any(|c| c.starts_with("echo New messages arrived")), "{cmds:?}");
     // Hands requests carry the sandbox epoch from the binding, not the agent epoch.
@@ -500,12 +501,10 @@ async fn turn_with_hands_platform_tool_inbox_and_idle_exit() {
     assert_eq!(env["HOME"].as_str().unwrap(), h.config_dir().to_str().unwrap());
     assert!(!env.keys().any(|k| k.starts_with("ANTHROPIC_") || k.starts_with("CARGO")), "inherited env leaked: {:?}", env.keys());
     let events = run["events"].as_array().unwrap();
-    let ctx = events
-        .iter()
-        .find(|e| e["kind"] == "hook" && e["event"] == "SessionStart")
-        .map(|e| e["output"]["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string())
-        .unwrap();
-    assert!(ctx.contains("# Project rules"), "{ctx}");
+    // SessionStart answers through the real `nest hook` with nothing: no repo guidance is
+    // pre-loaded (a repo's guidance is the client's to ask for).
+    let session_start = events.iter().find(|e| e["kind"] == "hook" && e["event"] == "SessionStart").expect("SessionStart ran");
+    assert!(session_start["output"].as_object().is_some_and(|o| o.is_empty()), "SessionStart added something: {session_start}");
     let tools = events.iter().find(|e| e["kind"] == "tool").map(|_| ()).is_some();
     assert!(tools);
     let names: Vec<&str> = events.iter().find(|e| e["kind"] == "tools").unwrap()["names"].as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();

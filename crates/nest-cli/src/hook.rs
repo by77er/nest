@@ -17,9 +17,6 @@ use serde_json::Value;
 
 /// Total budget for a sync decision (the managed settings give these hooks 10 s).
 pub const SYNC_TIMEOUT: Duration = Duration::from_secs(8);
-/// `SessionStart` reads the repo's CLAUDE.md through hands (runner budget 8 s); the managed
-/// settings give it 20 s, so wait longer than the runner does.
-pub const SESSION_START_TIMEOUT: Duration = Duration::from_secs(18);
 
 pub fn main(args: &[String]) -> i32 {
     let sync = args.iter().any(|a| a == "--sync");
@@ -30,8 +27,7 @@ pub fn main(args: &[String]) -> i32 {
     if sync {
         let sock = std::env::var(env::HOOK_SOCK).unwrap_or_else(|_| paths::HOOK_SOCK.into());
         let event = input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default().to_string();
-        let timeout = if event == "SessionStart" { SESSION_START_TIMEOUT } else { SYNC_TIMEOUT };
-        let output = decide(&sock, agent, input, timeout).unwrap_or_else(|e| {
+        let output = decide(&sock, agent, input, SYNC_TIMEOUT).unwrap_or_else(|e| {
             eprintln!("nest hook: runner unavailable ({e}); using fallback for {event}");
             hook::fallback_output(&event).unwrap_or_default()
         });

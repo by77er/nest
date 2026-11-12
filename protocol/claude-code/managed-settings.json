@@ -16,7 +16,7 @@
           {
             "type": "command",
             "command": "/usr/lib/nest/nest hook --sync",
-            "timeout": 20
+            "timeout": 10
           }
         ]
       }

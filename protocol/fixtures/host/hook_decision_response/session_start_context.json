@@ -2,7 +2,7 @@
   "output": {
     "hookSpecificOutput": {
       "hookEventName": "SessionStart",
-      "additionalContext": "Repository CLAUDE.md (read from the sandbox):\n..."
+      "additionalContext": "Context the model reads at the start of the session."
     }
   }
 }

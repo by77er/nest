@@ -29,7 +29,7 @@ The App's webhooks reach agents through the coordination integration ([principle
    - the review failed: it addresses each point, or answers it in a comment;
    - merged or closed: it reports and exits.
 4. **On each new PR head,** the maintainer spawns a reviewer for it and stops any reviewer of an older head.
-5. **The reviewer** starts clean, with a fork at the head, the issue and the diff, never the worker's transcript. It runs the checks itself, reviews against the repo's own instructions (e.g. `AGENTS.md` or `CLAUDE.md`), and posts its review check (pass, or fail with reasons) plus line comments.
+5. **The reviewer** starts clean, with a fork at the head, the issue and the diff, never the worker's transcript. It runs the checks itself, reviews against the repo's own instructions (e.g. `AGENTS.md` or `CLAUDE.md`, which it reads itself through hands: nest loads none), and posts its review check (pass, or fail with reasons) plus line comments.
 6. **GitHub merges** once the required checks pass, plus an owner's review for `CODEOWNERS` paths. The repo's own CD ships it.
 7. **The monitor** wakes on each `deployment_status` and on its own schedule. It reports regressions to the maintainer, or dispatches the repo's rollback workflow for a clear one. The maintainer turns findings into tasks.
 
