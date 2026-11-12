@@ -51,31 +51,64 @@ export function approves(answer: string): boolean {
 export const DECISIVE_KEYS = ["command", "file_path", "url", "pattern", "path", "action"] as const;
 /** How much of each other argument a question shows (the whole input is the ask's `input`). */
 export const ARG_SHOWN = 300;
+/** How much of an argument's name a question shows. */
+export const KEY_SHOWN = 100;
+/** How many arguments besides the deciding one a question lists; the rest are counted. */
+export const ARGS_LISTED = 20;
 /** The most of a held call's input an ask keeps (canonical JSON); past it, `input` is left out. */
 export const INPUT_KEPT_BYTES = 32 * 1024;
+/** The longest deciding line a question shows whole (escaped); past it, the question says so instead. */
+export const DECISIVE_SHOWN = 64 * 1024;
 
 /**
- * A held call's arguments as the operator's question shows them: one field a line, the deciding one
- * (`DECISIVE_KEYS`, as the rules read it) first and whole, the others cut at `ARG_SHOWN` characters.
- * Every value is JSON (a string quoted and escaped) and an unusual key is quoted, so no argument can
- * fake another line or a harmless-looking end. Pure.
+ * Every code point that can hide or reorder what's shown: controls (Cc, DEL and C1 included), format
+ * characters (Cf: the bidi embeddings, overrides and isolates, zero-width ones, the BOM, tag
+ * characters) and the line and paragraph separators (Zl, Zp).
+ */
+const INVISIBLE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu;
+/** The bidi controls (Trojan Source, CVE-2021-42574): text that holds one is flagged as well as escaped. */
+const BIDI = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+
+/**
+ * Text as a question may show it: each `INVISIBLE` code point as `\uXXXX` (per UTF-16 unit), so what is
+ * shown is what is there, in that order. Applied to JSON, it leaves valid JSON of the same value. Pure.
+ */
+export function visible(text: string): string {
+  return text.replace(INVISIBLE, (c) => [...Array(c.length).keys()].map((i) => `\\u${c.charCodeAt(i).toString(16).padStart(4, "0")}`).join(""));
+}
+
+/**
+ * A held call's arguments as the operator's question shows them: one argument a line, the deciding one
+ * (`DECISIVE_KEYS`, as the rules read it) first and whole (up to `DECISIVE_SHOWN`), then at most
+ * `ARGS_LISTED` others, each name cut at `KEY_SHOWN` and each value at `ARG_SHOWN` characters, and a
+ * count of any left. Every value is JSON (a string quoted and escaped), an unusual name is quoted, and
+ * every control, format, line or paragraph separator character is escaped (`visible`), a bidi control
+ * also flagged on its line, so no argument can fake another line, a harmless-looking end, or text that
+ * displays in another order than it runs. Bounded: about 64 KiB for the deciding line plus 20 short
+ * ones, whatever the input. Pure.
  */
 export function describeArgs(args: unknown): string {
-  const cut = (s: string) => s.length > ARG_SHOWN ? `${s.slice(0, ARG_SHOWN)}… (${s.length} characters in all)` : s;
-  if (!args || typeof args !== "object" || Array.isArray(args)) return `  arguments: ${cut(JSON.stringify(args ?? null))}`;
+  const cut = (s: string, n: number) => s.length > n ? `${s.slice(0, n)}… (${s.length} characters in all)` : s;
+  const flag = (raw: string) => BIDI.test(raw) ? "  [holds bidirectional-text controls, shown escaped: what runs may not read as shown]" : "";
+  const shown = (v: unknown, n: number) => {
+    const raw = JSON.stringify(v) ?? "null";
+    return `${cut(visible(raw), n)}${flag(raw)}`;
+  };
+  if (!args || typeof args !== "object" || Array.isArray(args)) return `  arguments: ${shown(args ?? null, ARG_SHOWN)}`;
   const o = args as Record<string, unknown>;
-  const key = (k: string) => /^[A-Za-z0-9_.-]+$/.test(k) ? k : JSON.stringify(k);
+  const name = (k: string) => /^[A-Za-z0-9_.-]{1,100}$/.test(k) ? k : shown(k, KEY_SHOWN);
   const decisive = DECISIVE_KEYS.find((k) => typeof o[k] === "string");
   const lines: string[] = [];
   if (decisive) {
-    const v = JSON.stringify(o[decisive]);
-    lines.push(v.length > INPUT_KEPT_BYTES
-      ? `  ${decisive}: (${v.length} characters: too long to show here or keep; deny unless you have read it elsewhere)`
-      : `  ${decisive}: ${v}`);
+    const raw = JSON.stringify(o[decisive]);
+    const v = visible(raw);
+    lines.push(v.length > DECISIVE_SHOWN
+      ? `  ${decisive}: (${raw.length} characters: too long to show here; deny unless you have read it in full elsewhere)`
+      : `  ${decisive}: ${v}${flag(raw)}`);
   }
-  for (const k of Object.keys(o).sort()) {
-    if (k !== decisive) lines.push(`  ${key(k)}: ${cut(JSON.stringify(o[k]) ?? "null")}`);
-  }
+  const rest = Object.keys(o).filter((k) => k !== decisive).sort();
+  for (const k of rest.slice(0, ARGS_LISTED)) lines.push(`  ${name(k)}: ${shown(o[k], ARG_SHOWN)}`);
+  if (rest.length > ARGS_LISTED) lines.push(`  … ${rest.length - ARGS_LISTED} more arguments: see the ask's input`);
   return lines.length ? lines.join("\n") : "  (no arguments)";
 }
 

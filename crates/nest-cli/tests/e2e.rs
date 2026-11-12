@@ -616,11 +616,13 @@ fn nest_hook(sync: bool, input: Value, env: &[(&str, &str)]) -> (i32, String) {
     (out.status.code().unwrap(), String::from_utf8(out.stdout).unwrap())
 }
 
-/// `nest hook --sync --event <event>` with raw stdin; the exit code and stdout.
-fn nest_hook_raw(event: &str, raw: &[u8], env: &[(&str, &str)]) -> (i32, String) {
+/// `nest hook --sync [--event <event>]` with raw stdin; the exit code and stdout.
+fn nest_hook_raw(event: Option<&str>, raw: &[u8], env: &[(&str, &str)]) -> (i32, String) {
     use std::io::Write;
+    let mut args = vec!["hook", "--sync"];
+    args.extend(event.map(|e| ["--event", e]).into_iter().flatten());
     let mut child = std::process::Command::new(NEST_BIN)
-        .args(["hook", "--sync", "--event", event])
+        .args(args)
         .env_clear()
         .envs(env.iter().copied())
         .stdin(std::process::Stdio::piped())
@@ -666,7 +668,7 @@ fn unreadable_sync_hook_input_is_denied_not_passed_through() {
     let decision = |out: &str| serde_json::from_str::<Value>(out).unwrap()["hookSpecificOutput"]["permissionDecision"].clone();
     // Readable input reaches the runner, which allows it: the denies below are the parse path's.
     let ok = br#"{"hook_event_name":"PreToolUse","tool_name":"WebFetch","tool_input":{"url":"https://x.test","prompt":"p"}}"#;
-    let (code, out) = nest_hook_raw("PreToolUse", ok, &env);
+    let (code, out) = nest_hook_raw(Some("PreToolUse"), ok, &env);
     assert_eq!((code, decision(&out)), (0, json!("allow")));
     assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
     let surrogate = br#"{"hook_event_name":"PreToolUse","tool_name":"WebFetch","tool_input":{"url":"https://x.test","prompt":"\ud800"}}"#;
@@ -676,13 +678,16 @@ fn unreadable_sync_hook_input_is_denied_not_passed_through() {
         "]".repeat(200)
     );
     for raw in [&surrogate[..], deep.as_bytes(), b"not json"] {
-        let (code, out) = nest_hook_raw("PreToolUse", raw, &env);
+        let (code, out) = nest_hook_raw(Some("PreToolUse"), raw, &env);
         assert_eq!((code, decision(&out)), (0, json!("deny")), "{}", String::from_utf8_lossy(&raw[..raw.len().min(80)]));
-        let (code, out) = nest_hook_raw("PermissionRequest", raw, &env);
+        let (code, out) = nest_hook_raw(Some("PermissionRequest"), raw, &env);
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!((code, v["hookSpecificOutput"]["decision"]["behavior"].clone()), (0, json!("deny")));
         // A fail-open event stays open.
-        assert_eq!(nest_hook_raw("Stop", raw, &env), (0, String::new()));
+        assert_eq!(nest_hook_raw(Some("Stop"), raw, &env), (0, String::new()));
+        // No `--event` (settings older than this binary): denied as a `PreToolUse`, never passed through.
+        let (code, out) = nest_hook_raw(None, raw, &env);
+        assert_eq!((code, decision(&out)), (0, json!("deny")));
     }
     assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "unreadable input never reached the runner");
 }

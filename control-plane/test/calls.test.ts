@@ -5,6 +5,7 @@ import {
   APPROVAL_EVENTS, APPROVAL_STATUSES, approvalExpiry, approvalStep, approvalUsable, ASK_EVENTS, ASK_STATUSES, askRoute, askStep, CALL_EVENTS, CALL_STATUSES, CallLedger, callStep,
 } from "../src/lib/calls";
 import type { ToolOutcome } from "../src/protocol/control";
+import { INPUT_KEPT_BYTES } from "../src/lib/sinks";
 import { JOURNAL_EVENTS, JOURNAL_STATUSES, journalStep } from "../src/lib/brokered";
 import { FORWARD_EVENTS, FORWARD_STATUSES, forwardStep } from "../src/lib/mcp-proxy";
 import { INBOX_EVENTS, INBOX_STATUSES, inboxStep, TURN_EVENTS, TURN_STATUSES, turnStep } from "../src/lib/turns";
@@ -238,6 +239,28 @@ describe("CallLedger: the guards are the ledger's", () => {
       // The sink's approval is still unspent, for a sink call.
       expect(l.takeApproval("WebFetch", "d", "ks", 50)).toBe("ask_s");
       expect(l.pendingApproval("WebFetch", "d")).toBeUndefined();
+    });
+  });
+
+  it("an approval keeps the held call's whole input up to 32 KiB, and past it only its size", async () => {
+    await withLedger((l) => {
+      const fits = JSON.stringify({ url: "x".repeat(INPUT_KEPT_BYTES - 10) });
+      const over = JSON.stringify({ url: "x".repeat(INPUT_KEPT_BYTES - 9) });
+      expect([fits.length, over.length]).toEqual([INPUT_KEPT_BYTES, INPUT_KEPT_BYTES + 1]);
+      for (const [ask, input] of [["ask_fits", fits], ["ask_over", over]] as const) {
+        l.recordAsk({ ask, call: `cal_${ask}`, epoch: 1, question: "q", status: "async", deadline: 0 });
+        l.requestApproval(ask, "WebFetch", ask, "WebFetch", "rule", input);
+      }
+      // Bytes, not characters: a multi-byte character counts for its UTF-8 length.
+      const wide = JSON.stringify({ url: "é".repeat(INPUT_KEPT_BYTES / 2) });
+      l.recordAsk({ ask: "ask_wide", call: "cal_wide", epoch: 1, question: "q", status: "async", deadline: 0 });
+      l.requestApproval("ask_wide", "WebFetch", "dw", "WebFetch", "rule", wide);
+      const listed = Object.fromEntries(l.open().map((a) => [a.ask, a]));
+      expect(listed.ask_fits).toMatchObject({ input: JSON.parse(fits), input_bytes: INPUT_KEPT_BYTES });
+      expect(listed.ask_over).toMatchObject({ input_bytes: INPUT_KEPT_BYTES + 1 });
+      expect(listed.ask_over).not.toHaveProperty("input");
+      expect(listed.ask_wide).not.toHaveProperty("input");
+      expect(listed.ask_wide!.input_bytes).toBe(INPUT_KEPT_BYTES + 10);
     });
   });
 

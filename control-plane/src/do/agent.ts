@@ -14,7 +14,7 @@ import { SYSTEM_SENDER } from "../lib/senders";
 import { type Timer, TIMER_DEADLINE, TIMER_SENDER, timerDue, timerFiredText, TimerName, TimerSetArgs, TimerStore, TIMERS_MAX } from "../lib/timers";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX, sameConnector } from "../lib/mcp";
-import { approves, argsDigest, canonicalJson, describeArgs, gated, sessionTaint, type SinkCall } from "../lib/sinks";
+import { approves, argsDigest, canonicalJson, describeArgs, gated, sessionTaint, type SinkCall, visible } from "../lib/sinks";
 import {
   actionDef, actionOfTool, authorize, checkBaseUrl, type Authorized, BROKERED_ACTIONS, BROKERED_TOOL_NAMES, type BrokeredAction, BrokeredJournal, brokeredToolDefs,
   type GithubAction, type JournalEntry, type JournalRow, keyDigest, naturalKey, secretKinds, stringsOf,
@@ -131,9 +131,9 @@ export interface AgentInfo extends AgentSpec, BrainFields {
   current_turn: string | null;
   cache_version: number;
   /**
-   * The cache version that carries the agent's current rules (set by `setRules`): a rule's check from a
-   * runner whose cache is older is refused, so a rule changed since (a new `deny`) wins. Absent: the
-   * rules haven't changed since the agent was made.
+   * The cache version that carries the agent's current rules (`pushCache({rulesChanged})`): a rule's check
+   * from a runner whose cache is older is refused, so a rule changed since (a new `deny`) wins. Absent:
+   * the rules haven't changed since the agent was made.
    */
   rules_version?: number;
   /** Committed base: its generation and the bytes durable in R2 (what resume and transcripts read). */
@@ -2768,7 +2768,7 @@ export class AgentDO extends DurableObject<Env> {
       // `rule_approvals`) denied the call as pending approval (a tool rule in `ask` mode): held for the
       // operator as a plain question, whose answer comes as the next turn. Its approval can't let the
       // call through (that runner asks again): `approvalCheck` is what can.
-      this.recordAsk(info, ev.call, ev.epoch, `Allow ${ev.tool}? (request ${ev.call})\n${describeArgs(ev.input ?? null)}`);
+      this.recordAsk(info, ev.call, ev.epoch, `Allow ${visible(ev.tool)}? (request ${visible(ev.call)})\n${describeArgs(ev.input ?? null)}`);
     }
     await this.syncActivity();
     if (completed) {
@@ -2979,20 +2979,24 @@ export class AgentDO extends DurableObject<Env> {
   async setRules(rules: ToolRule[]): Promise<void> {
     this.update((i) => {
       i.rules = rules;
-      // The version `pushCache` gives the cache that carries them.
-      i.rules_version = i.cache_version + 1;
     });
-    this.pushCache();
+    this.pushCache({ rulesChanged: true });
   }
 
   private currentCache(info: AgentInfo): AgentCache {
     return { version: info.cache_version, rules: info.rules, inbox: this.queue.mirrored(), max_stop_continuations: 5 };
   }
 
-  /** Replace the runner's hook caches (rules + inbox mirror); the version only ever grows. */
-  private pushCache(): void {
+  /**
+   * Replace the runner's hook caches (rules + inbox mirror); the version only ever grows. `rulesChanged`:
+   * this cache carries rules that differ from the last one's, so it becomes `rules_version` in the same
+   * step, and a rule's check against an older cache is refused (`approvalCheck`). Every path that changes
+   * the rules a cache carries must say so here.
+   */
+  private pushCache(opts: { rulesChanged?: boolean } = {}): void {
     const info = this.update((i) => {
       i.cache_version += 1;
+      if (opts.rulesChanged) i.rules_version = i.cache_version;
     });
     const cache = this.currentCache(info);
     this.pushReliable((seq) => ({ type: "cache_update", seq, cache }));
@@ -3320,7 +3324,7 @@ export class AgentDO extends DurableObject<Env> {
     const pending = this.calls.pendingApproval(s.name, digest);
     let ask = pending?.ask;
     if (!ask) {
-      const question = `Approve ${s.what} from a tainted session? (options: approve | deny)\n${describeArgs(s.args)}`;
+      const question = `Approve ${visible(s.what)} from a tainted session? (options: approve | deny)\n${describeArgs(s.args)}`;
       this.assertEpoch(fence);
       ask = this.recordAsk(info, call, epoch, question, { name: s.name, digest, tool: s.tool, input: canonicalJson(s.args ?? null) });
     }
@@ -3356,7 +3360,7 @@ export class AgentDO extends DurableObject<Env> {
       if (held.status === "approved") console.log(`agent ${this.load().agent}: ${m.tool} call ${m.call} runs on approval ${held.ask}`);
       return held;
     }
-    const question = `Allow ${m.tool}? (request ${m.call}; options: approve | deny)\n${describeArgs(m.input ?? null)}`;
+    const question = `Allow ${visible(m.tool)}? (request ${visible(m.call)}; options: approve | deny)\n${describeArgs(m.input ?? null)}`;
     const ask = this.recordAsk(this.load(), m.call, att.epoch, question, { name: m.tool, digest, tool: m.tool, kind: "rule", input: canonicalJson(m.input ?? null) });
     return { status: "pending", ask };
   }
