@@ -97,6 +97,13 @@ export interface Settings extends ProjectSettings {
   repo_owner: { id: number; login: string } | null;
 }
 
+/** The attach's default PR comments user, cleared because the repo's owner is another account now (README.md#pr-comments). */
+export interface CommentsCleared {
+  was: { id: number; login: string | null };
+  owner: { id: number; login: string };
+  at_ms: number;
+}
+
 export { MAX_UNTRIAGED_ISSUES };
 
 export interface AttachDetail {
@@ -180,7 +187,9 @@ export interface Blocked {
 export type Attention = ({ kind: "ask" } & Ask) | ({ kind: "blocked"; task: string; title: string; state: TaskState } & Blocked) | ({ kind: "secret" } & SecretRequest)
   // What waits for triage (README.md#triage): one item, as old as the oldest of them: the repo's issues
   // (`count`) and the tasks routines proposed (`proposals`).
-  | { kind: "triage"; count: number; proposals: number; at_ms: number };
+  | { kind: "triage"; count: number; proposals: number; at_ms: number }
+  // The attach's default PR comments user, cleared because the repo's owner is another account now (README.md#pr-comments).
+  | ({ kind: "comments_cleared" } & CommentsCleared);
 
 /** An issue of the repo in triage (README.md#triage): its title and body are anyone's, kept as data. */
 export interface Issue {
@@ -598,6 +607,15 @@ export const MIGRATIONS = [
     "ALTER TABLE settings ADD COLUMN pr_read_last_ms INTEGER",
     "ALTER TABLE settings ADD COLUMN pr_read_attempts INTEGER NOT NULL DEFAULT 0",
   ],
+  [
+    // Whether the PR comments user is the attach's default (README.md#pr-comments): the id it defaulted to, so
+    // a choice of another (by this release or the previous) tells itself apart. Rows from before: defaulted
+    // when it's the owner recorded at attach. And the default cleared because the repo's owner is another
+    // account now: whose it was, the owner seen, when (in Needs you until the owner decides or dismisses it).
+    "ALTER TABLE settings ADD COLUMN comments_default_id INTEGER",
+    "UPDATE settings SET comments_default_id = comments_from_id WHERE comments_from_id IS NOT NULL AND comments_from_id = repo_owner_id",
+    "ALTER TABLE settings ADD COLUMN comments_cleared TEXT",
+  ],
 ] as const;
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
@@ -744,8 +762,10 @@ export class ProjectDO extends DurableObject<Env> {
       const nest = nestFrom(this.env);
       if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
       try {
-        const repo = await this.repo();
-        const owner = await (await githubFor(nest, repo, PERMISSIONS.metadata)).repoOwner(repo);
+        // The bound repo's: never whoever holds its name now, if that's another repo.
+        const bound = await this.boundOwner(nest);
+        if ("problem" in bound) return fail(409, bound.problem);
+        const owner = bound.owner;
         if (owner.type !== "User") return fail(400, `the repo's owner, ${owner.login}, is an organization: set a person's login`);
         // Only for the previous release, which reads it; nothing here does (README.md#the-repos-binding).
         this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", owner.id, owner.login);
@@ -770,8 +790,10 @@ export class ProjectDO extends DurableObject<Env> {
     }
     if (who !== undefined) {
       // Decided: the attach's default never applies after this, nobody (null) included.
+      // The owner's own choice: never the attach's default, so a transfer doesn't clear it; any notice of a
+      // cleared default is answered by it.
       const login = who?.login ?? (who && who.id === before.comments_from?.id ? before.comments_from.login : null);
-      this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1", who?.id ?? null, login);
+      this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1, comments_default_id = NULL, comments_cleared = NULL", who?.id ?? null, login);
     }
     if (u.auto_assign !== undefined) this.sql.exec("UPDATE settings SET auto_assign = ?", u.auto_assign ? 1 : 0);
     if (u.max_workers !== undefined) this.sql.exec("UPDATE settings SET max_workers = ?", clampWorkers(u.max_workers));
@@ -1111,12 +1133,64 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
-   * The repo was renamed or transferred (README.md#the-repos-binding): the project calls it by `name` from
-   * now on, for GitHub, nest's grant and the agents it starts. Agents running keep what they started with.
+   * The repo's name, as the previous release reads it (README.md#the-repos-binding): written at a rename and
+   * at every sync, for a rollback to find. This release reads the name through from DirectoryDO (`repo()`).
    */
   async repoRenamed(name: string): Promise<void> {
     if (!this.settings()) return;
     this.sql.exec("UPDATE settings SET repo = ?", name.toLowerCase());
+  }
+
+  /** The repo's owner as the previous release reads it (a user's; null for an organization's): rewritten at each sync from GitHub's last answer for the binding. */
+  async writeOldOwnerCopy(owner: { id: number; login: string } | null): Promise<void> {
+    if (!this.settings()) return;
+    this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", owner?.id ?? null, owner?.login ?? null);
+  }
+
+  /**
+   * The repo's owner recorded at attach (a user's), for a binding not read from GitHub yet: GitHub's repo for
+   * the name is bound by itself only when it has this owner (DirectoryDO's `bindRepo`). Null: none recorded.
+   */
+  async attachedOwner(): Promise<{ id: number; login: string } | null> {
+    const r = this.settingsRow();
+    return r && typeof r.repo_owner_id === "number" ? { id: r.repo_owner_id, login: (r.repo_owner_login as string | null) ?? "" } : null;
+  }
+
+  /**
+   * The repo's owner as GitHub has it now (a signed event routed by the bound id, or a read of the bound repo):
+   * a PR comments user that is only the attach's default, and isn't that owner, goes (README.md#pr-comments).
+   * Nobody's comments count then, and Needs you says so until the owner decides or dismisses it: the new owner
+   * is never taken by itself. A comments user the owner chose is never touched.
+   */
+  async repoOwnerSeen(owner: { id: number; login: string }): Promise<void> {
+    const r = this.settingsRow();
+    if (!r || r.comments_default_id === null || r.comments_default_id === undefined || r.comments_from_id !== r.comments_default_id || r.comments_from_id === owner.id) return;
+    const was = { id: r.comments_from_id as number, login: (r.comments_from_login as string | null) ?? null };
+    this.sql.exec(
+      "UPDATE settings SET comments_from_id = NULL, comments_from_login = NULL, comments_default_id = NULL, comments_cleared = ? WHERE comments_from_id = ? AND comments_default_id = ?",
+      JSON.stringify({ was, owner: { id: owner.id, login: owner.login }, at_ms: Date.now() } satisfies CommentsCleared), was.id, was.id,
+    );
+  }
+
+  /** The owner has seen that the default comments user was cleared (Needs you's Dismiss): nobody's comments count, as they do now. */
+  async dismissCommentsCleared(): Promise<Result<{ dismissed: true }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    this.sql.exec("UPDATE settings SET comments_cleared = NULL");
+    return ok({ dismissed: true });
+  }
+
+  /**
+   * The repo's owner as GitHub answers now, for the bound repo only (README.md#the-repos-binding): read by
+   * the repo's name, and refused when GitHub's repo for it isn't the one bound, or the binding isn't read from
+   * GitHub yet (the name may be another account's repo now).
+   */
+  private async boundOwner(nest: Nest): Promise<{ owner: { id: number; login: string; type: string } } | { problem: string; unbound?: true }> {
+    const b = await directory(this.env).binding(this.settingsRow()!.id as string);
+    if (!b) throw new Error("the project isn't in the directory");
+    if (b.bound !== "github" || b.repo_id === null) return { problem: "the repo's binding isn't read from GitHub yet: Re-read it on the Admin page", unbound: true };
+    const info = await (await githubFor(nest, b.repo, PERMISSIONS.metadata)).repoInfo(b.repo);
+    if (info.id !== b.repo_id) return { problem: `GitHub's ${b.repo} is repo ${info.id}, not the bound repo ${b.repo_id}: Re-read the binding on the Admin page` };
+    return { owner: info.owner };
   }
 
   /** The App's id is known (from a check run it made): attach again to require the check from it. */
@@ -1350,12 +1424,14 @@ export class ProjectDO extends DurableObject<Env> {
     const nest = nestFrom(this.env);
     if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
     let list: Record<string, unknown>[];
-    // The repo's owner as GitHub answers now, for the same rule as an event's (no event names it here).
+    // The repo's owner as GitHub answers now, for the same rule as an event's (no event names it here): the
+    // bound repo's, or none while the binding isn't read from GitHub (its issues come in as the comments user's only).
     let owner: number | null;
     try {
       const repo = await this.repo();
-      const who = await (await githubFor(nest, repo, PERMISSIONS.metadata)).repoOwner(repo);
-      owner = who.type === "User" ? who.id : null;
+      const bound = await this.boundOwner(nest);
+      if ("problem" in bound && !bound.unbound) return fail(409, `the issues weren't imported: ${bound.problem}`);
+      owner = "owner" in bound && bound.owner.type === "User" ? bound.owner.id : null;
       const gh = await githubFor(nest, repo, PERMISSIONS.issuesRead);
       list = await gh.openIssues(repo);
     } catch (e) {
@@ -2265,7 +2341,9 @@ export class ProjectDO extends DurableObject<Env> {
     const pr = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(created_ms) AS at FROM proposals WHERE state = 'untriaged'").one();
     const oldest = [t.at, pr.at].filter((x): x is number => x !== null);
     const triage: Attention[] = t.n + pr.n ? [{ kind: "triage", count: t.n, proposals: pr.n, at_ms: oldest.length ? Math.min(...oldest) : Date.now() }] : [];
-    return ok([...open, ...blocked, ...secrets, ...triage].sort((a, b) => a.at_ms - b.at_ms));
+    const c = this.settingsRow()?.comments_cleared;
+    const cleared: Attention[] = typeof c === "string" ? [{ kind: "comments_cleared", ...(JSON.parse(c) as CommentsCleared) }] : [];
+    return ok([...open, ...blocked, ...secrets, ...triage, ...cleared].sort((a, b) => a.at_ms - b.at_ms));
   }
 
   // --- chat and approvals ----------------------------------------------------------------------------
@@ -3158,8 +3236,16 @@ export class ProjectDO extends DurableObject<Env> {
    * refusal for good fails the run.
    */
   private async startRun(nest: Nest, id: string): Promise<void> {
-    // The repo's name first, so everything read of the run is read after the await.
-    const repo = await this.repo();
+    // The repo's name first, so everything read of the run is read after the await. Not read (DirectoryDO
+    // didn't answer): a start that needs it (a first attempt's brief, a sandbox reading the repo) fails as
+    // any attempt does, and is retried; the drain goes on.
+    let repo: string | null = null;
+    let unread: unknown = null;
+    try {
+      repo = await this.repo();
+    } catch (e) {
+      unread = e;
+    }
     const before = this.runRow(id);
     if (!before || before.state !== "starting") return;
     const s = this.settings()!;
@@ -3169,12 +3255,27 @@ export class ProjectDO extends DurableObject<Env> {
       return;
     }
     const labels = { project: s.id, role: "routine", routine: routine.id as string, run: id };
-    const current = () => this.runRow(id)?.state === "starting";
     // Its deadline, its template, its spawn's extra fields (a dreaming run's transcript grant, which expires
     // at that deadline) and its brief, decided at its first attempt and kept: a retry sends the requests its
     // keys were bound to, however the routine was edited meanwhile.
+    const current = () => this.runRow(id)?.state === "starting";
+    const failed = (e: unknown) => {
+      if (!current()) return;
+      const attempts = (this.runRow(id)!.attempts as number) + 1;
+      if ((e instanceof NestError && e.permanent) || attempts >= MAX_START_ATTEMPTS) {
+        // No agent recorded (every answer lost, or refused): endRun has what its attempts made found by its labels.
+        this.endRun(id, "failed", message(e), null);
+        return;
+      }
+      this.sql.exec("UPDATE routine_runs SET attempts = ?, next_ms = ?, error = ? WHERE id = ?", attempts, Date.now() + backoff(attempts), message(e), id);
+    };
+    const needsRepo = before.spawn === null || (routine.kind !== "dreaming" && before.agent === null);
+    if (repo === null && needsRepo) {
+      failed(unread ?? new Error("the repo's name couldn't be read"));
+      return;
+    }
     const briefOf = (spawn: Record<string, unknown>) => runBrief({
-      project: { id: s.id, name: s.name, repo },
+      project: { id: s.id, name: s.name, repo: repo! },
       routine: { id: routine.id as string, name: routine.name as string, kind: routine.kind as RoutineKind, prompt: routine.prompt as string, max_minutes: routine.max_minutes as number, proposals: routine.proposals as "triage" | "draft" },
       run: { id, trigger: before.trigger as TriggerKind, count: (before.count as number | null) ?? null },
       last_start_ms: (routine.prev_start_ms as number | null) ?? null,
@@ -3198,7 +3299,7 @@ export class ProjectDO extends DurableObject<Env> {
         // A dreaming run has no hands (no sandbox, no repo): the board, recent work, memory and transcripts are all it reads.
         agent = template === TEMPLATE.dreaming
           ? (await nest.createAgent({ ...spawn, template: TEMPLATE.dreaming, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent
-          : await nest.startAgent(TEMPLATE.routine, labels, { read: repo }, `${s.id}/routine/${id}`, {}, spawn);
+          : await nest.startAgent(TEMPLATE.routine, labels, { read: repo! }, `${s.id}/routine/${id}`, {}, spawn);
         // Named on the run in the step the create's answer came, before any other await, so its exit finds it.
         this.sql.exec("UPDATE routine_runs SET agent = ? WHERE id = ? AND agent IS NULL", agent, id);
         if (!current()) {
@@ -3216,14 +3317,7 @@ export class ProjectDO extends DurableObject<Env> {
       // Its time budget counts from its first attempt (the deadline its grant expires at).
       this.sql.exec("UPDATE routine_runs SET state = 'running', started_ms = ?, next_ms = NULL, error = NULL WHERE id = ?", Date.now(), id);
     } catch (e) {
-      if (!current()) return;
-      const attempts = (this.runRow(id)!.attempts as number) + 1;
-      if ((e instanceof NestError && e.permanent) || attempts >= MAX_START_ATTEMPTS) {
-        // No agent recorded (every answer lost, or refused): endRun has what its attempts made found by its labels.
-        this.endRun(id, "failed", message(e), null);
-        return;
-      }
-      this.sql.exec("UPDATE routine_runs SET attempts = ?, next_ms = ?, error = ? WHERE id = ?", attempts, Date.now() + backoff(attempts), message(e), id);
+      failed(e);
     }
   }
 
@@ -3898,12 +3992,18 @@ export class ProjectDO extends DurableObject<Env> {
       // The repo's binding (README.md#the-repos-binding): its id read from GitHub now, so events never bind it.
       // One that doesn't bind (another project's, or another id) is shown on the Admin page; the attach goes on.
       // The token's installation only when GitHub's name for the repo is the one it was minted for (`ownInstallation`).
-      await directory(this.env).bindRepo(s.id, { id: info.id, full_name: info.full_name, owner: { id: owner.id, login: owner.login }, installation_id: ownInstallation(repo, info.full_name, gh.installationId) }, "fill");
-      const user = owner.type === "User";
-      // Written only for the previous release, whose review gate and triage read it; nothing here reads it
-      // (trust is decided by each event's owner, README.md#the-review-gate). Removed the release after.
-      this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", user ? owner.id : null, user ? owner.login : null);
-      if (user) this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1 WHERE comments_decided = 0", owner.id, owner.login);
+      // A binding not read from GitHub yet binds only a repo with the owner recorded at attach (`bindRepo`).
+      const bound = await directory(this.env).bindRepo(s.id, { id: info.id, full_name: info.full_name, owner: { id: owner.id, login: owner.login, type: owner.type }, installation_id: ownInstallation(repo, info.full_name, gh.installationId) }, "fill", await this.attachedOwner());
+      // The owner below is the bound repo's only: one GitHub answers for a name that's another repo's now isn't.
+      if (bound.ok) {
+        const user = owner.type === "User";
+        // Written only for the previous release, whose review gate and triage read it; nothing here trusts it
+        // (trust is decided by each event's owner, README.md#the-review-gate). Removed the release after.
+        this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", user ? owner.id : null, user ? owner.login : null);
+        // The default, marked as one (`comments_default_id`): a transfer clears it, never a choice.
+        if (user) this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1, comments_default_id = ? WHERE comments_decided = 0", owner.id, owner.login, owner.id);
+        await this.repoOwnerSeen(owner);
+      }
       const detail: AttachDetail = { ...r, at_ms: Date.now() };
       this.sql.exec(
         `UPDATE settings SET attached_ms = COALESCE(attached_ms, ?), attach_error = NULL, attach_detail = ?,

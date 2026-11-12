@@ -82,6 +82,9 @@ export interface HeadEvent extends PrOrigin {
   author: string | null;
 }
 
+/** How soon a drain that couldn't read the repo's name from DirectoryDO is tried again. */
+const REPO_RETRY_MS = 5_000;
+
 /** What a project's ReviewDO needs to know of it. */
 export interface ReviewOf {
   project: string;
@@ -182,6 +185,8 @@ export class ReviewDO extends DurableObject<Env> {
   private again = false;
   /** When this instance last pruned (in memory: a restart prunes at its first drain). */
   private prunedMs = 0;
+  /** Not before then is the alarm set: a drain couldn't read the repo's name from DirectoryDO (in memory). */
+  private repoRetryAt = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -221,7 +226,9 @@ export class ReviewDO extends DurableObject<Env> {
   private async repo(): Promise<string | null> {
     const project = this.setting("project");
     if (project === null) return null;
-    return (await directory(this.env).getProject(project))?.repo ?? null;
+    const row = await directory(this.env).getProject(project);
+    if (!row) throw new Error("the project isn't in the directory");
+    return row.repo;
   }
 
   async init(p: ReviewOf, o: { max_concurrent_reviews?: number | null } = {}): Promise<void> {
@@ -767,7 +774,9 @@ export class ReviewDO extends DurableObject<Env> {
     const next = times.length ? Math.min(...times) : null;
     if (next === null) return;
     const cur = await this.ctx.storage.getAlarm();
-    if (cur === null || next < cur) await this.ctx.storage.setAlarm(Math.max(next, Date.now()));
+    // Not before a retry of a drain that couldn't read the repo's name (`repoRetryAt`), so it doesn't spin.
+    const at = Math.max(next, Date.now(), this.repoRetryAt);
+    if (cur === null || at < cur) await this.ctx.storage.setAlarm(at);
   }
 
   override async alarm(): Promise<void> {
@@ -837,7 +846,19 @@ export class ReviewDO extends DurableObject<Env> {
     }
     const nest = nestFrom(this.env);
     if (!nest) return;
-    const repo = await this.repo();
+    let repo: string | null;
+    try {
+      repo = await this.repo();
+    } catch (e) {
+      // Not read (DirectoryDO didn't answer): what needs no name goes on (reviewers' stops), the rest is
+      // tried again shortly, with the drain's other work.
+      console.warn(`the repo's name couldn't be read: ${String(e).slice(0, 200)}`);
+      for (const r of this.sql.exec("SELECT agent FROM stops WHERE failed_ms IS NULL AND next_ms <= ?", Date.now()).toArray()) await this.stop(nest, r.agent as string);
+      this.repoRetryAt = Date.now() + REPO_RETRY_MS;
+      await this.arm();
+      return;
+    }
+    this.repoRetryAt = 0;
     if (!repo) return;
     // One token per run, minted when first needed (nest caches it besides).
     let gh: Promise<GitHub> | null = null;

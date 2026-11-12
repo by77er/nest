@@ -38,13 +38,18 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
     // A token for the old name may come from another installation (the name taken since, by a repo the App
     // is installed on): its installation is never stored, so the one stored stays. Nor is one for a name
     // GitHub redirects (moved since, no event naming the new one yet): it may be another account's.
-    info = { id: r.id, full_name: r.full_name, owner: { id: r.owner.id, login: r.owner.login }, installation_id: current ? ownInstallation(name, r.full_name, gh.installationId) : null };
+    info = { id: r.id, full_name: r.full_name, owner: { id: r.owner.id, login: r.owner.login, type: r.owner.type }, installation_id: current ? ownInstallation(name, r.full_name, gh.installationId) : null };
   } catch (e) {
     return { ok: false, error: `GitHub couldn't be read: ${message(e)}`, binding: b };
   }
   // The operator's choice binds the repo they were shown, and no other: GitHub's answer changed since, nothing.
   if (mode === "replace" && info.id !== shownId) return { ok: false, error: `GitHub's ${name} is repo ${info.id} now, not the repo ${shownId ?? "?"} you were shown: re-read to compare again`, binding: b };
-  return await dir.bindRepo(id, info, mode);
+  // A binding not read from GitHub yet is bound only to a repo with the owner recorded at attach (bindRepo).
+  const attached = b.bound === "github" ? null : await project(env, id).attachedOwner();
+  const out = await dir.bindRepo(id, info, mode, attached);
+  // The repo's owner as GitHub answers now, for the bound repo: a default comments user that isn't it any more goes.
+  if (out.ok && info.owner) await project(env, id).repoOwnerSeen(info.owner);
+  return out;
 }
 
 /** Why a rename isn't applied yet, or null once it is (or there's none). */
@@ -69,12 +74,20 @@ export async function applyRename(env: Env, nest: Nest, b: RepoBinding): Promise
 }
 
 /**
- * The copies of the repo's name the previous release reads (ProjectDO's and ReviewDO's settings), written
- * after the directory's for a rollback to find (expand/contract: removed the release after). Nothing in this
- * release reads them, so one that fails is only logged, and written again at the next catalog sync.
+ * The copies the previous release reads, written after the directory's for a rollback to find
+ * (expand/contract: removed the release after): the repo's name (ProjectDO's and ReviewDO's settings), and, at
+ * a sync (`b`), the repo's owner (ProjectDO's) as GitHub last answered for a binding read from GitHub, so a
+ * rolled-back release trusts the owner now, not the one at attach. Nothing in this release reads them for
+ * trust, so one that fails is only logged, and written again at the next catalog sync.
  */
-export async function writeOldCopies(env: Env, id: string, name: string): Promise<void> {
-  for (const [what, write] of [["ProjectDO", () => project(env, id).repoRenamed(name)], ["ReviewDO", () => review(env, id).repoRenamed(name)]] as const) {
+export async function writeOldCopies(env: Env, id: string, name: string, b?: RepoBinding): Promise<void> {
+  const writes: [string, () => Promise<void>][] = [["ProjectDO", () => project(env, id).repoRenamed(name)], ["ReviewDO", () => review(env, id).repoRenamed(name)]];
+  // Its kind known (read by this release): a user's, or none (an organization's), as the previous release keeps it.
+  if (b?.bound === "github" && b.owner?.type) {
+    const owner = b.owner.type === "User" ? { id: b.owner.id, login: b.owner.login } : null;
+    writes.push(["ProjectDO's owner", () => project(env, id).writeOldOwnerCopy(owner)]);
+  }
+  for (const [what, write] of writes) {
     try {
       await write();
     } catch (e) {
@@ -116,8 +129,8 @@ export async function bindAll(env: Env, nest: Nest): Promise<void> {
         now = r.binding;
       }
       if (now?.renamed_to) await applyRename(env, nest, now);
-      const name = (await directory(env).getProject(b.project))?.repo;
-      if (name) await writeOldCopies(env, b.project, name);
+      const after = await directory(env).binding(b.project);
+      if (after) await writeOldCopies(env, b.project, after.repo, after);
     } catch (e) {
       console.warn(`project ${b.project}: its repo binding wasn't read: ${message(e)}`);
     }

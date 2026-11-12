@@ -13,6 +13,7 @@ import { prNumberOf } from "./prs";
 import { attachableRepos, repoAttachable } from "./grant-repos";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
 import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, PutSecret, Settings as SettingsBody, Spec, UpdateRoutine, UpdateTask } from "./requests";
+import type { RepoBinding } from "./do/directory";
 import type { ProjectSettings, Settings } from "./do/project";
 import { githubFor, PERMISSIONS } from "./github";
 import { PRESETS } from "./routines";
@@ -25,33 +26,35 @@ const json = (body: unknown, status = 200) =>
 const err = (status: number, error: string) => json({ error }, status);
 const done = <T>(r: Result<T>, status = 200) => (r.ok ? json(r.value, status) : err(r.status, r.error));
 
-/** How long the repo's owner as shown is kept by one Worker instance: a page polls the project every few seconds. */
+/** How long the repo's owner as shown is kept by one Worker instance (and a failed read): a page polls the project every few seconds. */
 const OWNER_SHOWN_MS = 60_000;
 const ownersShown = new Map<string, { at_ms: number; owner: { id: number; login: string } | null }>();
 
 /**
  * The repo's owner to show (`Settings.repo_owner`: the "Use the repo owner" shortcut, who "You only" names),
- * read through from GitHub (README.md#the-repos-binding), kept a minute per Worker instance so polling doesn't
- * spend the App's rate limit. Shown only: trust is decided by each event's own owner. Null for an
- * organization's repo, or when GitHub couldn't say (not kept, so the next look asks again).
+ * read through from GitHub (README.md#the-repos-binding) for the bound repo only, and kept a minute per Worker
+ * instance, a failed read too, so polling doesn't spend nest's or the App's rate limit. Shown only: trust is
+ * decided by each event's own owner. Null for an organization's repo, a binding not read from GitHub yet, a
+ * name that's another repo's now, or when GitHub couldn't say.
  */
-async function shownOwner(env: Env, repo: string): Promise<{ id: number; login: string } | null> {
-  const k = repo.toLowerCase();
+async function shownOwner(env: Env, b: RepoBinding): Promise<{ id: number; login: string } | null> {
+  if (b.bound !== "github" || b.repo_id === null) return null;
+  const k = `${b.repo}#${b.repo_id}`;
   const had = ownersShown.get(k);
   if (had && Date.now() - had.at_ms < OWNER_SHOWN_MS) return had.owner;
   const nest = nestFrom(env);
   if (!nest) return null;
+  let owner: { id: number; login: string } | null = null;
   try {
-    const o = await (await githubFor(nest, repo, PERMISSIONS.metadata)).repoOwner(repo);
-    const owner = o.type === "User" ? { id: o.id, login: o.login } : null;
-    ownersShown.delete(k);
-    ownersShown.set(k, { at_ms: Date.now(), owner });
-    if (ownersShown.size > 500) ownersShown.delete(ownersShown.keys().next().value!);
-    return owner;
+    const info = await (await githubFor(nest, b.repo, PERMISSIONS.metadata)).repoInfo(b.repo);
+    owner = info.id === b.repo_id && info.owner.type === "User" ? { id: info.owner.id, login: info.owner.login } : null;
   } catch (e) {
-    console.warn(`the owner of ${repo} couldn't be read: ${String(e).slice(0, 200)}`);
-    return null;
+    console.warn(`the owner of ${b.repo} couldn't be read: ${String(e).slice(0, 200)}`);
   }
+  ownersShown.delete(k);
+  ownersShown.set(k, { at_ms: Date.now(), owner });
+  if (ownersShown.size > 500) ownersShown.delete(ownersShown.keys().next().value!);
+  return owner;
 }
 
 /**
@@ -61,12 +64,12 @@ async function shownOwner(env: Env, repo: string): Promise<{ id: number; login: 
  */
 async function answerSettings(env: Env, id: string, r: Result<ProjectSettings>): Promise<Result<Settings & { max_concurrent_reviews: number | null; untrusted_reviews: UntrustedPolicy }>> {
   if (!r.ok) return r;
-  const row = await directory(env).getProject(id);
-  if (!row) return { ok: false, status: 404, error: "unknown project" };
+  const b = await directory(env).binding(id);
+  if (!b) return { ok: false, status: 404, error: "unknown project" };
   const rv = review(env, id);
   return {
     ok: true,
-    value: { ...r.value, repo: row.repo, repo_owner: await shownOwner(env, row.repo), max_concurrent_reviews: await rv.maxConcurrent(), untrusted_reviews: await rv.untrustedPolicy() },
+    value: { ...r.value, repo: b.repo, repo_owner: await shownOwner(env, b), max_concurrent_reviews: await rv.maxConcurrent(), untrusted_reviews: await rv.untrustedPolicy() },
   };
 }
 
@@ -356,6 +359,9 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       return done(await p.secretRequestDone(rest[1]!));
     case "POST auto-merge/retry":
       return done(await answerSettings(env, pid, await p.retryRepoAutoMerge()));
+    case "POST comments-cleared/dismiss":
+      // Needs you's notice that the default PR comments user was cleared (README.md#pr-comments), seen.
+      return done(await p.dismissCommentsCleared());
     case "POST attach":
       return done(await answerSettings(env, pid, await p.retryAttach()));
     case "GET manager": {

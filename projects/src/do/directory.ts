@@ -92,6 +92,9 @@ const MIGRATIONS = [
     // When a refused event last made the binding be read again, to follow nest's answer for the installation
     // (README.md#the-repos-binding): at most once a minute per project.
     "ALTER TABLE projects ADD COLUMN installation_checked_ms INTEGER",
+    // The bound repo's owner's kind as GitHub answered at the binding's last read (`User`, `Organization`):
+    // what the previous release's copy of the owner, rewritten at each sync, takes (a user's only).
+    "ALTER TABLE projects ADD COLUMN repo_owner_type TEXT",
   ],
 ] as const;
 
@@ -111,8 +114,12 @@ export interface RepoBinding {
   bound_ms: number | null;
   /** Why the last read from GitHub didn't bind it, if it didn't. */
   error: string | null;
-  /** The bound repo's owner, as GitHub answered when it was read; null when it was learned from an event. */
-  owner: { id: number; login: string } | null;
+  /**
+   * The bound repo's owner, as GitHub answered at the binding's last read (and its kind, `User` or
+   * `Organization`, when that read was by this release); null when it was learned from an event. A record of
+   * that read, never trusted (README.md#the-repos-binding).
+   */
+  owner: { id: number; login: string; type?: string | null } | null;
   /** Events refused for another installation than `installation_id`: the last one's (null: none named), how many, when. */
   refused: { installation: number | null; count: number; last_ms: number } | null;
 }
@@ -128,8 +135,14 @@ export interface RepoRef {
 export interface GithubRepo {
   id: number;
   full_name: string;
-  owner?: { id: number; login: string };
+  owner?: { id: number; login: string; type?: string };
 }
+
+/**
+ * The repo's owner the project recorded when it was attached (ProjectDO's, a user's), for a binding not read
+ * from GitHub yet: GitHub's answer for the name is bound by itself only when its owner is that one.
+ */
+export type AttachedOwner = { id: number; login: string } | null;
 
 /**
  * What `bindRepo` did with what GitHub answered: bound (or confirmed), refused (why), or (a re-read) found
@@ -149,7 +162,7 @@ export const CREATE_GRACE_MS = 60_000;
 export const CREATE_POLICY: OutboxPolicy = { maxAttempts: 8 };
 
 const COLUMNS = "id, name, repo, created_ms, CASE WHEN pending IS NULL THEN 'ready' ELSE 'pending' END AS state";
-const BINDING = "id, name, repo, repo_id, repo_name, installation_id, repo_bound, repo_bound_ms, bind_error, repo_owner_id, repo_owner_login, refused_installation, refused_count, refused_ms";
+const BINDING = "id, name, repo, repo_id, repo_name, installation_id, repo_bound, repo_bound_ms, bind_error, repo_owner_id, repo_owner_login, repo_owner_type, refused_installation, refused_count, refused_ms";
 
 function bindingOf(r: Record<string, SqlStorageValue>): RepoBinding {
   return {
@@ -157,7 +170,7 @@ function bindingOf(r: Record<string, SqlStorageValue>): RepoBinding {
     renamed_to: (r.repo_name as string | null) ?? null, installation_id: (r.installation_id as number | null) ?? null,
     bound: (r.repo_bound as "github" | "event" | null) ?? null, bound_ms: (r.repo_bound_ms as number | null) ?? null,
     error: (r.bind_error as string | null) ?? null,
-    owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: (r.repo_owner_login as string | null) ?? "" },
+    owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: (r.repo_owner_login as string | null) ?? "", type: (r.repo_owner_type as string | null) ?? null },
     refused: (r.refused_count as number | null) ? { installation: (r.refused_installation as number | null) ?? null, count: r.refused_count as number, last_ms: r.refused_ms as number } : null,
   };
 }
@@ -260,9 +273,9 @@ export class DirectoryDO extends DurableObject<Env> {
    * name taken): no project. A project whose App installation is known takes only events from that
    * installation (`installation.id`): any other, or none, is refused (README.md#the-repos-binding).
    */
-  async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null): Promise<{ project: ProjectRow } | { refused: string; project_id: string } | null> {
+  async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null): Promise<{ project: ProjectRow; anchored: boolean } | { refused: string; project_id: string } | null> {
     const one = (where: string, v: SqlStorageValue) =>
-      this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS}, installation_id FROM projects WHERE ${where}`, v).toArray()[0] ?? null;
+      this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS}, installation_id, repo_bound FROM projects WHERE ${where}`, v).toArray()[0] ?? null;
     const row = (r: ProjectRow & Record<string, SqlStorageValue>): ProjectRow => ({ id: r.id, name: r.name, repo: r.repo, created_ms: r.created_ms, state: r.state });
     // Refused, and counted on the binding so the Admin page shows it: a reinstalled App's events would
     // otherwise all be dropped unseen (Re-read takes the new installation).
@@ -278,7 +291,8 @@ export class DirectoryDO extends DurableObject<Env> {
         if (wrong) return { refused: wrong, project_id: byId.id };
         // The name GitHub gives it now: a rename or transfer is noted (README.md#the-repos-binding).
         if (name) this.noteName(byId.id, name);
-        return { project: row(byId) };
+        // Anchored: routed by an id read from GitHub, so the event's repo is the project's (README.md#the-review-gate).
+        return { project: row(byId), anchored: byId.repo_bound === "github" };
       }
     }
     const byName = name ? one("repo = ? AND repo_id IS NULL", name.toLowerCase()) : null;
@@ -287,9 +301,11 @@ export class DirectoryDO extends DurableObject<Env> {
     if (wrong) return { refused: wrong, project_id: byName.id };
     if (repoId !== null) {
       // Learned from an event, so recorded as one (a sync reads it from GitHub): no owner known.
-      this.sql.exec("UPDATE projects SET repo_id = ?, repo_bound = 'event', repo_bound_ms = ?, repo_owner_id = NULL, repo_owner_login = NULL WHERE id = ? AND repo_id IS NULL", repoId, Date.now(), byName.id);
+      this.sql.exec("UPDATE projects SET repo_id = ?, repo_bound = 'event', repo_bound_ms = ?, repo_owner_id = NULL, repo_owner_login = NULL, repo_owner_type = NULL WHERE id = ? AND repo_id IS NULL", repoId, Date.now(), byName.id);
     }
-    return { project: row(byName) };
+    // Routed by its name alone: the repo under that name may be another's now (a login taken over), so
+    // nothing of the event's repo (its owner) is trusted.
+    return { project: row(byName), anchored: false };
   }
 
   /**
@@ -321,8 +337,11 @@ export class DirectoryDO extends DurableObject<Env> {
    *   for the operator to choose;
    * - `replace` (the operator's choice, after a check showed this id): binds it whatever was bound.
    * Never an id another project holds. The name is kept as `renamed_to` when it isn't the project's.
+   * A binding not read from GitHub yet (no id, or one from an event) is bound by `fill` or `check` only when
+   * GitHub's owner for the name is the one recorded for it (the last read's, else `attached`, the owner at
+   * attach): the name may be another account's repo now (a login taken over). Unknown, it binds as before.
    */
-  async bindRepo(project: string, gh: GithubRepo & { installation_id?: number | null }, mode: "fill" | "check" | "replace"): Promise<BindOutcome> {
+  async bindRepo(project: string, gh: GithubRepo & { installation_id?: number | null }, mode: "fill" | "check" | "replace", attached: AttachedOwner = null): Promise<BindOutcome> {
     const before = await this.binding(project);
     if (!before) return { ok: false, error: "unknown project", binding: null };
     const name = gh.full_name.toLowerCase();
@@ -333,11 +352,24 @@ export class DirectoryDO extends DurableObject<Env> {
     if (!Number.isSafeInteger(gh.id) || gh.id <= 0 || !REPO.test(name)) return refuse("Didn't bind: GitHub's answer names no repo");
     const other = this.sql.exec<{ id: string }>("SELECT id FROM projects WHERE repo_id = ? AND id != ?", gh.id, project).toArray()[0];
     if (other) return refuse(`Didn't bind: GitHub's repo ${name} (${gh.id}) is already project ${other.id}'s`);
+    const recorded = before.owner ?? attached;
+    if (before.bound !== "github" && mode !== "replace" && recorded && gh.owner && gh.owner.id !== recorded.id) {
+      if (mode === "check") {
+        return {
+          ok: false, binding: before,
+          mismatch: { bound: { full_name: before.renamed_to ?? before.repo, id: before.repo_id, owner: { id: recorded.id, login: recorded.login } }, github: { full_name: name, id: gh.id, owner: { id: gh.owner.id, login: gh.owner.login } } },
+        };
+      }
+      return refuse(
+        `Didn't bind: GitHub's ${name} (repo ${gh.id}) is owned by ${gh.owner.login} (${gh.owner.id}), not ${recorded.login} (${recorded.id}), the owner recorded for the project. ` +
+        "Check on GitHub whether the account was renamed and its login taken, then Re-read to compare the two and choose.",
+      );
+    }
     if (before.repo_id !== null && before.repo_id !== gh.id && mode !== "replace") {
       if (mode === "check") {
         return {
           ok: false, binding: before,
-          mismatch: { bound: { full_name: before.renamed_to ?? before.repo, id: before.repo_id, owner: before.owner }, github: { full_name: name, id: gh.id, owner: gh.owner ?? null } },
+          mismatch: { bound: { full_name: before.renamed_to ?? before.repo, id: before.repo_id, owner: before.owner && { id: before.owner.id, login: before.owner.login } }, github: { full_name: name, id: gh.id, owner: gh.owner ? { id: gh.owner.id, login: gh.owner.login } : null } },
         };
       }
       return refuse(
@@ -349,9 +381,9 @@ export class DirectoryDO extends DurableObject<Env> {
     const installation = typeof gh.installation_id === "number" && Number.isSafeInteger(gh.installation_id) && gh.installation_id > 0 ? gh.installation_id : null;
     this.sql.exec(
       `UPDATE projects SET repo_id = ?, repo_bound = 'github', repo_bound_ms = ?, bind_error = NULL, repo_name = CASE WHEN repo = ? THEN NULL ELSE ? END,
-        repo_owner_id = ?, repo_owner_login = ?,
+        repo_owner_id = ?, repo_owner_login = ?, repo_owner_type = ?,
         installation_id = CASE WHEN ? THEN ? ELSE COALESCE(?, installation_id) END WHERE id = ?`,
-      gh.id, Date.now(), name, name, gh.owner?.id ?? null, gh.owner?.login ?? null,
+      gh.id, Date.now(), name, name, gh.owner?.id ?? null, gh.owner?.login ?? null, gh.owner?.type ?? null,
       // Another repo chosen: its installation, whatever was stored. The same one: a nest that doesn't say keeps it.
       before.repo_id !== gh.id ? 1 : 0, installation, installation, project,
     );

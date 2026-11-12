@@ -13,7 +13,7 @@ import { MetaItem, MetaRow, Section, Stack } from "../../layout";
 import { approvalOf } from "../attention/AskItem";
 import { SHOWN as ASKS_SHOWN } from "../attention/NeedsYou";
 import { TaskCardList } from "../rich/TaskRefs";
-import { triageSource, triageWaits } from "../triage/words";
+import { commentsCleared, triageSource, triageWaits } from "../triage/words";
 import { ManagerWaits } from "./ManagerWaits";
 
 /** The states a task is under way in: someone holds it. Drafts, ready and done aren't. */
@@ -31,6 +31,7 @@ export function gist(x: Attention): string {
   else if (x.kind === "review_backlog") text = `${x.count === 1 ? "1 more pull request waits" : `${x.count} more pull requests wait`} beyond the review queue's limit`;
   else if (x.kind === "review") text = `${x.fork ? "A fork's PR" : "A PR"} #${x.pr} waits for your approval to be reviewed`;
   else if (x.kind === "triage") text = `${triageWaits(x.count, x.proposals)} for triage`;
+  else if (x.kind === "comments_cleared") text = commentsCleared(x);
   else text = x.question ?? x.reason;
   const line = text.replace(/\s+/g, " ").trim();
   return line.length > GIST ? `${line.slice(0, GIST - 1).trimEnd()}…` : line;
@@ -73,7 +74,7 @@ export function ManagerContext({ projectId }: { projectId: string }) {
         {asks.length ? (
           <Stack gap="md" data-slot="top-asks">
             {asks.map((x) => (
-              <Stack key={x.kind === "ask" ? x.ask : x.kind === "secret" ? x.id : x.kind === "triage" ? "triage" : x.kind === "review" ? `review-${x.pr}-${x.sha}` : x.kind === "review_backlog" ? "review-backlog" : `blocked-${x.task}`} gap="xs">
+              <Stack key={x.kind === "ask" ? x.ask : x.kind === "secret" ? x.id : x.kind === "triage" ? "triage" : x.kind === "review" ? `review-${x.pr}-${x.sha}` : x.kind === "review_backlog" ? "review-backlog" : x.kind === "comments_cleared" ? "comments-cleared" : `blocked-${x.task}`} gap="xs">
                 {/* Triage's item opens the queue; everything else waits on the board's "Needs you". */}
                 {x.kind === "triage" ? (
                   <AnchorLink to="/projects/$projectId/triage" params={{ projectId }} fz="sm">
@@ -85,7 +86,7 @@ export function ManagerContext({ projectId }: { projectId: string }) {
                   </AnchorLink>
                 )}
                 <MetaRow>
-                  <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.kind === "triage" ? triageSource(x.count, x.proposals) : x.kind === "review" ? "A held review" : x.kind === "review_backlog" ? "The review queue" : x.role === "manager" ? (x.kind === "ask" && x.previous ? "The previous manager asks" : "The manager asks") : "A worker asks"}</MetaItem>
+                  <MetaItem>{x.kind === "blocked" ? `Blocks ${x.title}` : x.kind === "triage" ? triageSource(x.count, x.proposals) : x.kind === "review" ? "A held review" : x.kind === "review_backlog" ? "The review queue" : x.kind === "comments_cleared" ? "PR comments" : x.role === "manager" ? (x.kind === "ask" && x.previous ? "The previous manager asks" : "The manager asks") : "A worker asks"}</MetaItem>
                   <MetaItem title={exact(x.at_ms)}>{ago(x.at_ms)}</MetaItem>
                 </MetaRow>
               </Stack>

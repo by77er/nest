@@ -220,7 +220,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
               </FieldGroup>
             </Section>
           </Panel>
-          <Panel>
+          <Panel id="pr-comments">
             <Section title="PR comments" order={4} region={false}>
               <CommentsFrom
                 settings={settings}

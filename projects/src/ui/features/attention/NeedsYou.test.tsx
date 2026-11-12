@@ -190,3 +190,18 @@ describe("asks", () => {
     expect(within(p).queryByRole("button", { name: /Show all/ })).toBeNull();
   });
 });
+
+describe("the default PR comments user cleared by a transfer (README.md#pr-comments)", () => {
+  it("says whose it was and who owns the repo now, links to Settings, and Leave it unset dismisses it", async () => {
+    const api = new FakeApi();
+    api.commentsCleared = { kind: "comments_cleared", was: { id: 1001, login: "owner" }, owner: { id: 2002, login: "new-owner" }, at_ms: Date.now() - 60_000 };
+    const { user } = renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    await waitFor(() => expect(p).toHaveTextContent("The repo's owner is new-owner now, so owner is no longer the PR comments user"));
+    expect(within(p).getByRole("link", { name: "Open Settings" }).getAttribute("href")).toBe("/projects/prj_one/settings#pr-comments");
+    await user.click(within(p).getByRole("button", { name: "Leave it unset" }));
+    await waitFor(gone);
+    expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/comments-cleared/dismiss", body: undefined }]);
+    cleanup();
+  });
+});

@@ -127,13 +127,15 @@ export function prAuthor(pr: Obj): { id: number | null; login: string | null; bo
 
 /**
  * The repo's owner as the signed event names it (`repository.owner`, which GitHub puts in every event about a
- * repo), by id, when it's a user (an organization opens no PR or issue); null otherwise. It is the owner as
- * of the event: once a repo is transferred, its events name the new owner, so the account it left is no
- * longer trusted by being its owner (README.md#the-review-gate). Never a copy kept from before.
+ * repo), whatever its kind (`User`, `Organization`); null when it names none. It is the owner as of the event:
+ * once a repo is transferred, its events name the new owner, so the account it left is no longer trusted by
+ * being its owner (README.md#the-review-gate). Never a copy kept from before.
  */
-export function eventRepoOwner(payload: Obj): number | null {
+function eventOwner(payload: Obj): { id: number; login: string; type: string } | null {
   const o = obj(obj(payload.repository).owner);
-  return o.type === "User" ? prNumber(o.id) : null;
+  const id = prNumber(o.id);
+  const login = str(o.login);
+  return id !== null && login ? { id, login: login.slice(0, 100), type: str(o.type) ?? "" } : null;
 }
 
 /**
@@ -222,6 +224,13 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
   // Still being created (README.md#creating-a-project): its objects aren't whole, so nothing reaches them;
   // an import or a later event catches up.
   if (p.state === "pending") return json({ ignored: "the project is still being created" });
+  // The repo's owner, from the event only when it was routed by the id read from GitHub (`anchored`): one
+  // routed by its name alone may be another account's repo under that name now, whose owner is nobody's to
+  // trust (README.md#the-review-gate).
+  const owner = routed.anchored ? eventOwner(payload) : null;
+  const repoOwner = owner?.type === "User" ? owner.id : null;
+  // A default comments user that isn't the owner any more goes, before anything is decided by it (README.md#pr-comments).
+  if (owner) await project(env, p.id).repoOwnerSeen({ id: owner.id, login: owner.login });
   const of = { project: p.id, repo: p.repo };
   const action = str(payload.action);
 
@@ -241,7 +250,7 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
     if (action === "opened" || action === "reopened" || action === "synchronize") {
       // Whose PR, from where (README.md#the-review-gate): one the project doesn't trust is held, not reviewed.
       const author = prAuthor(pr);
-      const trust = await trustedIds(env, p.id, p.repo, fromRepo && author.bot ? author.id : null, eventRepoOwner(payload));
+      const trust = await trustedIds(env, p.id, p.repo, fromRepo && author.bot ? author.id : null, repoOwner);
       await review(env, p.id).onHead(of, {
         pr: number, sha, base: (str(obj(pr.base).ref) ?? "").slice(0, 255), title: (str(pr.title) ?? "").slice(0, 1000), updated_at,
         fork: !fromRepo, author_id: author.id, author: author.login,
@@ -265,7 +274,7 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
     // The sender (who acted) by id: a declined issue comes back only when someone the owner trusts reopens it.
     const sender = obj(payload.sender).id;
     // The repo's owner as this event names it, never a copy (a transfer leaves none trusted that shouldn't be).
-    if (e && action && ISSUE_ACTIONS.has(action)) await project(env, p.id).onIssue({ action, ...e, sender: typeof sender === "number" ? sender : null, repo_owner: eventRepoOwner(payload) });
+    if (e && action && ISSUE_ACTIONS.has(action)) await project(env, p.id).onIssue({ action, ...e, sender: typeof sender === "number" ? sender : null, repo_owner: repoOwner });
   } else if (COMMENT_EVENTS.has(event!)) {
     const c = prCommentOf(event!, payload, p.repo);
     if (c) await project(env, p.id).onPrComment(c);

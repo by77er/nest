@@ -886,6 +886,7 @@ const app = {
     // Many, with long titles and logins: pinned first on Reviews, and all of them in "Needs you".
     { name: "reviews-held-many", section: "project", path: "/projects/prj_demo/reviews", fixture: "held-many" },
     { name: "board-held-many", section: "project", path: "/projects/prj_demo/board", fixture: "held-many", after: async (p) => { await p.getByRole("button", { name: /Show all/ }).click(); } },
+    { name: "board-comments-cleared", section: "project", path: "/projects/prj_demo/board", fixture: "comments-cleared" },
     // The gate turned off: the switch off, with what that means.
     { name: "settings-reviews-open", section: "project", path: "/projects/prj_demo/settings", fixture: "reviews-open" },
     { name: "secret-delete", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Delete cloudflare_token" }).click() },

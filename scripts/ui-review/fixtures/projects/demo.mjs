@@ -148,6 +148,8 @@ export function data(variant = "demo", now = Date.now()) {
       { kind: "review", pr: 132, sha: "41d07ee".padEnd(40, "c"), title: "Rework the gadget importer so that malformed rows are reported per line and the rest of the file still loads", author: null, fork: false, at_ms: now - 20_000 },
     ] : []),
     ...(issues.length ? [{ kind: "triage", count: issues.length, proposals: 0, at_ms: Math.min(...issues.map((i) => i.opened_ms)) }] : []),
+    // The default PR comments user cleared by a transfer (README.md#pr-comments): the oldest, so it shows first.
+    ...(variant === "comments-cleared" ? [{ kind: "comments_cleared", was: { id: 1001, login: "by77er" }, owner: { id: 2002, login: "gadgets-collective" }, at_ms: now - 3 * 3_600_000 }] : []),
   ].sort((a, b) => a.at_ms - b.at_ms);
   const chat = [
     { seq: 1, at_ms: now - 3_600_000, sender: "owner", text: "Plan the search work and split it into tasks.", delivered: true, status: "done", error: null },

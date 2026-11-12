@@ -8,7 +8,7 @@ import { resetAccessKeys } from "../src/access";
 import { MIGRATIONS, PR_COMMENT_MAX, REVISE_MAX } from "../src/do/project";
 import { migrate } from "../src/sql";
 import { personAuthor } from "../src/github-hook";
-import { AccessTeam, api, deliver, deliverGithub, FakeNest, installFetch, ownerIdOf, prEvent, shaOf } from "./fake-nest";
+import { AccessTeam, api, deliver, deliverGithub, FakeNest, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf } from "./fake-nest";
 
 const fake = new FakeNest();
 let restore: () => void;
@@ -172,12 +172,69 @@ describe("who is set", () => {
       // And the PR upkeep step's (README.md#pr-upkeep).
       sql.exec("DROP TABLE pr_told");
       for (const c of ["pr_read_next_ms", "pr_read_last_ms", "pr_read_attempts"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      // And the comments default's step (README.md#pr-comments).
+      for (const c of ["comments_default_id", "comments_cleared"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE schema_version SET v = ?", step);
       migrate(st.storage, MIGRATIONS);
       expect(sql.exec("SELECT attach_next_ms FROM settings").one().attach_next_ms).toBe(0);
     });
     await drain(s);
     expect((await api(token, "GET", `/api/projects/${s.project}`)).body.settings.comments_from).toEqual({ id: s.owner.id, login: s.owner.login });
+  });
+
+  it("after a transfer, the default comments user goes (nobody, said in Needs you), and its comments reach no worker; the new owner is never taken by itself", async () => {
+    const s = await setup();
+    const newOwner = `n-${rand()}`;
+    const to = `${newOwner}/moved`;
+    fake.github.rename(s.repo, to);
+    // Any event routed by the repo's id that names the new owner.
+    const moved = { full_name: to, id: repoIdOf(s.repo) };
+    await deliverGithub("issue_comment", { ...issueComment(s), repository: moved });
+    const settings = (await api(token, "GET", `/api/projects/${s.project}`)).body.settings;
+    expect(settings.comments_from).toBeNull();
+    expect(said(s.worker)).toEqual([]);
+    const notice = ((await api(token, "GET", `/api/projects/${s.project}/attention`)).body as any[]).filter((x) => x.kind === "comments_cleared");
+    expect(notice).toEqual([expect.objectContaining({ was: { id: s.owner.id, login: s.owner.login }, owner: { id: ownerIdOf(newOwner), login: newOwner } })]);
+    // The new owner's comments don't count either: nobody's do until the owner chooses.
+    await deliverGithub("issue_comment", { ...issueComment(s, { user: { login: newOwner, id: ownerIdOf(newOwner), type: "User" } }), repository: moved });
+    expect(said(s.worker)).toEqual([]);
+    // Left unset: the notice goes, nobody stays.
+    expect((await api(token, "POST", `/api/projects/${s.project}/comments-cleared/dismiss`)).status).toBe(200);
+    expect(((await api(token, "GET", `/api/projects/${s.project}/attention`)).body as any[]).filter((x) => x.kind === "comments_cleared")).toEqual([]);
+    expect((await api(token, "GET", `/api/projects/${s.project}`)).body.settings.comments_from).toBeNull();
+  });
+
+  it("a project from before the default was marked: its comments user is the default when it's the owner recorded at attach, else a choice", async () => {
+    const [same, other] = [await setup(), await setup()];
+    await api(token, "PATCH", `/api/projects/${other.project}/settings`, { comments_from_id: 4321 });
+    for (const [s, want] of [[same, same.owner.id], [other, null]] as const) {
+      const got = await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(s.project)), (_o, st) => {
+        const sql = st.storage.sql;
+        const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("comments_default_id")));
+        for (const c of ["comments_default_id", "comments_cleared"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+        sql.exec("UPDATE schema_version SET v = ?", step);
+        migrate(st.storage, MIGRATIONS);
+        return sql.exec("SELECT comments_default_id AS d FROM settings").one().d;
+      });
+      expect(got).toBe(want);
+    }
+  });
+
+  it("a comments user the owner chose stays whoever owns the repo; a re-read clears a default one as an event does", async () => {
+    // Chosen (the same account as the default, chosen explicitly): kept through a transfer.
+    const a = await setup();
+    expect((await api(token, "PATCH", `/api/projects/${a.project}/settings`, { comments_from_id: a.owner.id })).status).toBe(200);
+    const toA = `n-${rand()}/moved`;
+    fake.github.rename(a.repo, toA);
+    await deliverGithub("issue_comment", { ...issueComment(a), repository: { full_name: toA, id: repoIdOf(a.repo) } });
+    expect((await api(token, "GET", `/api/projects/${a.project}`)).body.settings.comments_from).toMatchObject({ id: a.owner.id });
+    expect(said(a.worker)).toHaveLength(1);
+    // Defaulted, transferred with no event since: the operator's Re-read reads the new owner, and clears it.
+    const b = await setup();
+    const toB = `n-${rand()}/moved`;
+    fake.github.rename(b.repo, toB);
+    expect((await api(token, "POST", `/api/admin/bindings/${b.project}`)).status).toBe(200);
+    expect((await api(token, "GET", `/api/projects/${b.project}`)).body.settings.comments_from).toBeNull();
   });
 
   it("with nobody set, a comment on a task's PR is noted on the task, once an hour", async () => {

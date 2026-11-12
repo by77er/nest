@@ -7,7 +7,7 @@
 import { Button, Collapse, Divider, Text, Textarea } from "@mantine/core";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import { useState } from "react";
-import { useAnswerBlocked, useAttention, useProject } from "../../api/queries";
+import { useAnswerBlocked, useAttention, useDismissCommentsCleared, useProject } from "../../api/queries";
 import type { Attention } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
@@ -15,7 +15,7 @@ import { MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, weight } from "..
 import { motion } from "../../theme";
 import { HeldReviewItem } from "../reviews/HeldReview";
 import { RichMessage } from "../rich/RichMessage";
-import { triageSource, triageWaits } from "../triage/words";
+import { commentsCleared, triageSource, triageWaits } from "../triage/words";
 import { AskItem } from "./AskItem";
 import { SecretRequestItem } from "./SecretRequestItem";
 
@@ -81,12 +81,42 @@ function Item({ projectId, x, first, explain }: { projectId: string; x: Attentio
       {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : x.kind === "blocked" ? <BlockedTask projectId={projectId} item={x} />
         : x.kind === "review_backlog" ? <ReviewBacklogItem count={x.count} at_ms={x.at_ms} />
         : x.kind === "review" ? <HeldReviewItem projectId={projectId} repo={project.data?.repo} item={x} full={explain} />
-        : x.kind === "triage" ? <TriageItem projectId={projectId} issues={x.count} proposals={x.proposals} at_ms={x.at_ms} /> : <SecretRequestItem projectId={projectId} item={x} />}
+        : x.kind === "triage" ? <TriageItem projectId={projectId} issues={x.count} proposals={x.proposals} at_ms={x.at_ms} />
+        : x.kind === "comments_cleared" ? <CommentsClearedItem projectId={projectId} item={x} /> : <SecretRequestItem projectId={projectId} item={x} />}
     </Stack>
   );
 }
 
-const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.kind === "triage" ? "triage" : x.kind === "review" ? `review-${x.pr}-${x.sha}` : x.kind === "review_backlog" ? "review-backlog" : x.id);
+const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.kind === "triage" ? "triage" : x.kind === "review" ? `review-${x.pr}-${x.sha}` : x.kind === "review_backlog" ? "review-backlog" : x.kind === "comments_cleared" ? "comments-cleared" : x.id);
+
+type CommentsCleared = Extract<Attention, { kind: "comments_cleared" }>;
+
+/**
+ * The default PR comments user cleared because the repo's owner is another account now (README.md#pr-comments):
+ * nobody's comments count until the owner chooses in Settings, or dismisses this to leave it so.
+ */
+function CommentsClearedItem({ projectId, item }: { projectId: string; item: CommentsCleared }) {
+  const dismiss = useDismissCommentsCleared(projectId);
+  return (
+    <Stack gap="sm" data-comments-cleared>
+      <MetaRow>
+        <MetaItem>PR comments</MetaItem>
+        <MetaItem title={exact(item.at_ms)}>{ago(item.at_ms)}</MetaItem>
+      </MetaRow>
+      <Text fz="md">
+        {commentsCleared(item)}: it was only the default from when the repo was attached. Nobody's comments reach workers, and nobody is trusted as the comments user for reviews and triage, until you choose someone.
+      </Text>
+      <Row>
+        <Button variant="default" renderRoot={(props) => <AnchorLink {...props} to="/projects/$projectId/settings" params={{ projectId }} hash="pr-comments" />}>
+          Open Settings
+        </Button>
+        <Button variant="subtle" color="gray" onClick={() => dismiss.mutate()} loading={dismiss.isPending}>
+          Leave it unset
+        </Button>
+      </Row>
+    </Stack>
+  );
+}
 
 /** PRs past the review queue's limits, with no job yet: how many, and what frees them (README.md#the-review-gate). */
 function ReviewBacklogItem({ count, at_ms }: { count: number; at_ms: number }) {
