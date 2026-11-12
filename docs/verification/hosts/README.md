@@ -141,14 +141,14 @@ Purpose `stonith_fence`: an error re-issues the fence (`:1109-1111`); ok drives 
 
 | Id | Predicate | Holds on main? |
 |---|---|---|
-| S1 | No transition out of `dead`. | **No** under one interleaving (B3). |
+| S1 | No transition out of `dead`. | **No** at `edf6829` under one interleaving (B3). Yes since #62: every status write is `hostStep` (test "never leaves dead, and each transition applies only from its own statuses", `control-plane/test/host-lifecycle.test.ts`). |
 | S2 | A lease expired by H5 is dropped (reassigned) only after a successful `stonith_fence` covering it, or EC2-confirmed death, or an operator confirm. | Yes: reassignment sources are `:1120`, `:1841`, `:815` (unexpired only), `:863` (holder's own `fenced`, needs a live lease, `:986-990`). Relies on `isDead(null)` (B7). |
 | S3 | `stonith_pending → active` only when no expired lease remains outside the fence just reported, and a socket exists. | Yes (`:1827-1830` rechecks all leases even though `ensureStonithFence` skips queued sandboxes). |
 | S4 | scaleDown terminates a host only when every lease on it is `suspended` (idle) or none remain (drained), and it has no brain. | Yes as written; but `state` is FleetDO's last report, not what is in flight (B8), and dirty stale incarnations are ignored (B9). |
 | S5 | A proof enrolls at most one host that ever said hello; a proof re-used by a never-connected host retires that host first (in the same synchronous step). | Yes (`:294-323`, `:353-358`). Note: the weaker "used once" from the docs is by design not true. |
 | S6 | Cloudflare deletes target only (a) a dead host's recorded ids, (b) listed nest-named objects whose host is in `tunnels_created` and dead or rowless for ≥ 1 h, (c) a tunnel just created whose enrollment failed. | Yes. Depends on S1: a resurrected host (B3) keeps nulled tunnel ids. |
 | S7 | Every command gets exactly one result, or a failure when its host dies or restarts. | Yes since #39 (B1, B2), #62 (answer on death, B10). At `edf6829`: no. |
-| S8 | Commands to a host execute in `seq` order, none skipped. | **No** (B1, B2); docs claim `seq = last + 1` on both channels, nestd does not check it for commands. |
+| S8 | Commands to a host execute in `seq` order, none skipped. | **No** at `edf6829` (B1, B2): nestd did not check `seq = last + 1` for commands. Yes since #39: nestd's gap check (`nestd_core::fleet`, `CommandGap`), checked as `in_order_per_lineage` in [nestd/](../nestd/#fleet-link-phase-1). |
 | S9 | Drain terminates only after an all-or-nothing upload report. | Not built; current code: spot drain needs no gate (docs agree), H11/H12 have none. |
 | S10 | `#pending launches ≤ 1` and `#burst hosts in {active, stonith_pending} ≤ max_hosts` at launch time. | Yes within one object instance (`launching` flag + pending row); untracked launches (B6) escape it. |
 
@@ -196,7 +196,7 @@ Fairness assumed: the alarm fires; DO RPCs eventually succeed; EC2/Cloudflare ca
 | B10 | `fleet.ts:783` vs `:789` | On a new nestd, `reconcileSandboxes` (and any concurrent caller during its SandboxDO awaits) issues commands to the new process before `pending` is captured; they are then failed as "restarted before running this command" although delivered, and their real result is ignored. The reconcile `fence` and `reapStale`'s `sandbox_destroy` get a fake failure every time; today their failure handling is a no-op (`fence` has no `sandbox` column, `commandFailed` acts only on `sandbox_create`, `sandbox.ts:437`). A `sandbox_create` from a concurrent placement gets a fake retryable failure and SandboxDO re-issues it. | S7 | Real (deterministic for the reconcile commands, harmless today); the concurrent create case is suspected, low impact. The comment at `:788` states the opposite intent. |
 | B11 | `fleet.ts:1389-1390`, `:772` | `rotateToken` stores the new `token_exp` before the unreliable `host_token` frame is delivered; if it is lost, hello does not re-rotate (DB expiry is not near), so the host runs on an expired token; the session channel accepts no grace (`index.ts:120`). | docs claim "fresh token right after hello" | Suspected, low. |
 
-Doc/code disagreements: S8 (docs: gap closes the socket on both channels); the docs' "used only once" for identity proofs (code: once per connected host); FleetDO docs list "drains and the drain gate" as not built while autoscaling docs describe the forced drain as built (both true: forced drain without gate).
+Doc/code disagreements: S8 at `edf6829` (docs: gap closes the socket on both channels; nestd checks it since #39); the docs' "used only once" for identity proofs (code: once per connected host); FleetDO docs list "drains and the drain gate" as not built while autoscaling docs describe the forced drain as built (both true: forced drain without gate).
 
 ## 8. Modelling notes
 

@@ -15,9 +15,9 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 | FleetDO | `keysSent` (memory), host `gateway_url`, tunnel row and state | `control-plane/src/do/fleet.ts:1339-1349,1372-1395` |
 | Binding | `nbd_<claims>.<sig>`, claims `{v, kid, sandbox, epoch, client, scope, exp_ms}`, ECDSA P-256, lifetime 1 h | `control-plane/src/lib/binding.ts:41-50`, `control-plane/src/protocol/gateway.ts:13` |
 | nestd | per sandbox `Sbx{epoch, slots, guest_info, vm}` behind an async mutex; `summary{epoch, state}`; gateway mirror `{keys, sandboxes: id→{epoch, vsock, clients, guest}, conn}`; `Tombstones: id→max fenced epoch` | `crates/nestd/src/gateway_link.rs:55-73`, `crates/nestd/src/tombstones.rs:17-55` |
-| gateway | `keys: kid→point`; `sandboxes: id→{epoch, vsock, clients, guest, generation}`; `resyncing`; `conns: id→{sandbox, epoch, close}` | `crates/nest-gateway/src/state.rs` `SandboxEntry`, `Inner` |
+| gateway | `keys: kid→point`; `sandboxes: id→{epoch, vsock, clients, guest, paused, generation}`; `resyncing`; `conns: id→{sandbox, epoch, close}` | `crates/nest-gateway/src/state.rs` `SandboxEntry`, `Inner` |
 | guest | `identity{sandbox, epoch}?`, `agents` (slots) | `crates/nest-guest/src/state.rs` `Inner`, `crates/nest-guest/src/control.rs` |
-| runner | cached target `{url, sandbox, epoch, binding, guest, edge?}` + generation; per-call `Retries{re_resolved, busy_since}` | `crates/nest-runner/src/hands.rs` `call_with`, `connect`, `ensure_target` |
+| runner | cached target `{url, sandbox, epoch, binding, guest, edge?}` + generation; per-call `Retries{re_resolved, busy_since, paused_seen}` | `crates/nest-runner/src/hands.rs` `call_with`, `connect`, `ensure_target` |
 
 ## Transitions
 
@@ -31,7 +31,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 | P4 | new placement | SandboxDO | — | `pending := attached`, `inflight := {}` in the placement's own step; then issue the due slots from `afterPlaced`, owed to the `placed` deadline | `newPlacement` (`lib/slots.ts`) via `placedStep`; shell `issueAttachesOrRetry` (since #187: before, the reset ran in `afterPlaced`, after the placement's awaits, so `resolve` could mint for a guest without the slot) |
 | P5 | detach(a) | SandboxDO | — | remove `a` everywhere; issue `agent_detach{kill_processes}` | `detach` (`lib/slots.ts`) |
 | P6 | resolve(a) | SandboxDO | attached; not destroyed/archived; placed, not placing; `running`; `a ∉ pending`; gateway URL; tunnel connected; guest known | mint `{sandbox, epoch, client: a, hands, now+1h}`; after the awaits re-check the same rule (`unbindable`) and the epoch and host | `unbindable` (`lib/slots.ts`); shell `SandboxDO.resolve` |
-| P7 | hands_resolve | AgentDO | socket is the current runner and epoch (checked **before** the await only) | answer `hands_resolved` | `agent.ts:651-658,568-579` |
+| P7 | hands_resolve | AgentDO | socket is the current runner and epoch (at `edf6829` checked **before** the await only; since #30 also after, B4) | answer `hands_resolved` | `agent.ts:651-658,568-579` |
 | K1 | keys | BrokerDO → FleetDO → nestd → gateway | hello, or a heartbeat while `keysSent` lacks the host | `binding_key{keys}` (one key); nestd mirrors and sends `key_update`, which replaces the set | `broker.ts:124-127`, `fleet.ts:773-774,951-954,1341-1349`, `crates/nestd/src/fleet.rs:415-417`, `gateway_link.rs:138-141` |
 
 **Sandbox host.**
@@ -111,7 +111,7 @@ A hands call travels runner → (AgentDO `resolve`) → gateway → guest. Bindi
 
 **B3 — detach then attach reordered (suspected; low).** P5 and P1 each send their command after an await (`SandboxDO.detach`, `SandboxDO.attach`); if `agent_attach` reaches the host before `agent_detach`, SandboxDO records the slot confirmed while the host has removed it. Every `resolve` then mints a binding the gateway refuses as `unauthorized`, each call fails after one re-resolve, until the next placement. Whether two RPCs from one DO to another keep their order is unverified.
 
-**B4 — no re-check after resolving (low).** AgentDO checks the runner is current before `await resolve` and not after (`agent.ts:651-658`); a superseded socket is closed, so the send usually fails. Branch 0c3a85c (L2) adds the re-check.
+**B4 — no re-check after resolving (low; fixed in #30).** AgentDO checked the runner is current before `await resolve` and not after (`agent.ts:651-658`); a superseded socket is closed, so the send usually fails. Branch 0c3a85c (L2) added the re-check. Now `hands_resolve` checks the runner and epoch again after resolving and answers `stale_epoch` if either changed (`AgentDO.webSocketMessage`). Test: "rule 1: an answer resolved while a newer start was issued is not handed out (re-check after the resolve)" (`control-plane/test/agent-seams.test.ts`).
 
 **Docs vs code.** `docs/README.md` (settled) states journaling, `executed: false`, duplicate refusal and crash lookup; none is built (S5). The fleet doc says the gateway refuses a detached client's bindings (`docs/interfaces/control-host/fleet/README.md:61`): true only once the command lands.
 
