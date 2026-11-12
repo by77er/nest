@@ -1337,11 +1337,6 @@ export class BrokerDO extends DurableObject<Env> {
   }
 
   /**
-   * Resolve references to current values, for one purpose: only names `allow` admits (see
-   * {@link nameAllowed}) and never a name in {@link NEVER_RESOLVED}. Anything else, and missing or
-   * expired secrets, resolve to `null`.
-   */
-  /**
    * As `resolveRefs`, each with its expiry as stored at this moment (null: none), so a push carries the
    * value and its expiry read together: a value replaced while the push was on its way never goes out
    * with the old value's expiry. FleetDO stamps it on the `secrets_update` entry.
@@ -1357,6 +1352,11 @@ export class BrokerDO extends DurableObject<Env> {
     return out;
   }
 
+  /**
+   * Resolve references to current values, for one purpose: only names `allow` admits (see
+   * {@link nameAllowed}) and never a name in {@link NEVER_RESOLVED}. Anything else, and missing or
+   * expired secrets, resolve to `null`.
+   */
   async resolveRefs(refs: string[], allow: readonly string[]): Promise<Record<string, string | null>> {
     const out: Record<string, string | null> = {};
     for (const ref of refs) {

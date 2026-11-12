@@ -703,6 +703,45 @@ describe("client secret pushes: who asked", () => {
     }
   });
 
+  it("a name asked for again while its notice is out survives an answer that no longer names it", async () => {
+    const c = await newClient();
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("m1") } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    // Unbound when the sandbox answered, bound again (a push asks for it anew) before the answer lands:
+    // the re-ask moves its `asked_ms` past the notice's, so the answer can't take it.
+    const p = patchSandbox(s.sandbox, "clientSecretsChanged", async () => {
+      await new Promise((r) => setTimeout(r, 5));
+      await env.BROKER.get(env.BROKER.idFromName("broker")).clientInjectionRefs(c.id, s.sandbox,
+        [{ binding: "client:stripe", secret: "stripe-key", hosts: ["api.stripe.com"] }], "test");
+      return { status: "unbound" };
+    });
+    try {
+      await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("m2") } });
+      await eventually("the notice answered", async () => (await queued(s.sandbox)) === 0);
+      expect(await rows(c.id, s.sandbox)).toEqual(["stripe-key"]);
+    } finally {
+      p.restore();
+    }
+  });
+
+  it("a BrokerDO of the previous release (no resolveRefsExpiring): the push goes out, with the expiry it was queued with", async () => {
+    const c = await newClient();
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("f0") } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    const proto = BrokerDO.prototype as any;
+    const real = proto.resolveRefsExpiring;
+    delete proto.resolveRefsExpiring;
+    try {
+      const v = fakeValue("f1");
+      const at = Date.now() + 3_600_000;
+      await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: v, expires_at: new Date(at).toISOString() } });
+      // FleetDO falls back to `resolveRefs`; the entry keeps what `clientInjectionRefs` put on it.
+      expect(await pushedTo(s.ws, s.sandbox, (x) => x.some((y) => y.value === v))).toContainEqual({ binding: "client:stripe", value: v, expires_ms: at });
+    } finally {
+      proto.resolveRefsExpiring = real;
+    }
+  });
+
   it("a sandbox that doesn't answer holds no other notice past its call's timeout", { timeout: 40_000 }, async () => {
     const a = await newClient();
     await asJson(a.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("h1") } });
