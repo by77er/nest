@@ -3,9 +3,10 @@
 Policy is layered and pushed by SandboxDO through nestd to nest-proxy. Changes apply live: every request, on an open connection too, is decided against the current policy (closing open connections the policy now denies is designed, not built: [changes](#changes)).
 
 ```yaml
-base:        # image defaults
+base:        # the cell's, operator data (seeded with these); every sandbox of the cell
   allow: [registry.npmjs.org, pypi.org, files.pythonhosted.org, crates.io, static.crates.io,
           index.crates.io, github.com, "*.githubusercontent.com", deb.debian.org]
+  guards: []
 sandbox:     # the operator's (designed: also the sandbox's owner); forks inherit it
   allow: [api.stripe.com]
   inject: [stripe]   # needs a grant on the binding
@@ -21,13 +22,31 @@ limits: {max_connections: 256, bandwidth_mbps: 200, max_inspected_body_bytes: 51
 
 **Built:** the `sandbox` layer is the operator's (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), and its rules reach hosts tagged `layer: workstream`, the layer's wire name, which hosts parse as a closed enum ([pending contract changes](../../../../interfaces/README.md#pending-contract-changes)); grants are tagged `sandbox`. **API clients' rules** (built 2026-11-02, [egress](../../../../control-plane/api/clients/#egress)) join the same layer on the wire: allow rules only, within the client's grant's `egress_hosts`, from its templates (while their agents are attached), its sandbox specs and the sandbox's client layer. Allow rules only add, so the guards below and the hard deny apply to whatever they open, and no client rule allows what the operator's policy refuses.
 
+## Base layer
+
+**Decided (2026-11-12, [principle 10](../../../../README.md#principles)): the base layer is operator data, one per cell.** It used to be a list built into the control plane.
+- **`GET /v1/admin/egress/base?cell=<cell>`** answers `{allow, guards, version, pending}`: `version` 0 is the seed, never written, and `pending` is how many live sandboxes of the cell haven't taken the latest version yet.
+- **`PUT /v1/admin/egress/base?cell=<cell>`** with `{"allow": [{"host", "ports"?}], "guards"?: [RequestGuard]}` replaces it whole as the next version. It is checked with the operator layer's own allow and [guard](#request-guards) schemas (a rule's host non-empty, ports 1-65535, at most 64 guards); `allow` is required and an unknown field is refused (400), so a typo can't empty it. Admin only.
+- **The seed** is the list nest had built in, on ports 80 and 443, with no guards: nothing changes until the operator edits it. Trimming it, with apps adding their own hosts in their client layers, is the operator's later step.
+- **Its rules reach hosts tagged `layer: base`** and show as `source: base` ([sources](#sources)). Its guards join every guard of the sandbox's policy (each must let a request through), ahead of the constructed and operator ones.
+- **Stored once per cell, in FleetDO** (kv `egress_base`). Why FleetDO and per cell:
+  - FleetDO already holds the cell's sandbox registry, which a change walks. A global store would have to enumerate cells, which nest doesn't list (`CELLS` is optional).
+  - A cell is the unit of rollout and failure: a change can be tried on one cell first, and a cell elsewhere may need other mirrors.
+  - The cost is one `PUT` per cell; there is one cell today.
+- **A change reaches every live sandbox of the cell:**
+  1. The write queues one notice per live sandbox in the registry (`egress_base_notices`), in the same step.
+  2. FleetDO's alarm tells at most 50 a run, each call bounded at 10 s, and runs again at once while more are due. A sandbox that doesn't answer is told again after 2 s, doubling, at most every 10 minutes, until it answers. A notice goes only on its own version's answer, so a newer write's notice stays.
+  3. SandboxDO holds the newer version (versions only grow; kv `egress_base`) and sends a new policy version through `policyChanged` from its own alarm (`egress_base`), so the fan-out never waits on a command back into FleetDO.
+  4. A sandbox created later gets the layer in `registerSandbox`'s answer, read in the step that registers it; a write after that finds it registered and tells it.
+- **Rollback:** a previous release ignores the stored layer and uses its constant (today's list), in FleetDO and SandboxDO alike ([rollout](../../../../../dev/rollout/2026-11-12-egress-base-layer.md)).
+
 ## Sources
 
 **Decided (2026-11-03):** the effective policy the API shows (`GET /v1/sandboxes/<id>/policy`, and the answers of `PUT …/policy` and `PUT …/client-policy`) marks each allow rule with its `source`, so a reader needn't subtract one layer from another to tell them apart.
 
 | `source` | What it is |
 |---|---|
-| `base` | nest's built-in defaults (the image's allowlist) |
+| `base` | the cell's [base layer](#base-layer) (operator data, seeded with nest's former built-in list) |
 | `operator` | the operator's policy layer |
 | `repos` | rules the GitHub constructor derives from the push and read allowlists |
 | `client` | the sandbox's API client's own rules: its client layer, its sandbox spec, and its attached agents' specs |
@@ -96,7 +115,7 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 
 ## Repo allowlists
 
-**Moving out (decided 2026-11-12, not built):** repo allowlists, read-only repos and the [GitHub](#github) constructor leave the kernel; an app builds the same from its own secrets, bindings and request guards in a sandbox's client layer, and the base layer's allowlist becomes operator data ([principle 10](../../../../README.md#principles)). Until then these sections describe what runs.
+**Moving out (decided 2026-11-12, not built):** repo allowlists, read-only repos and the [GitHub](#github) constructor leave the kernel; an app builds the same from its own secrets, bindings and request guards in a sandbox's client layer, and the base layer's allowlist becomes operator data ([built](#base-layer); [principle 10](../../../../README.md#principles)). Until then these sections describe what runs.
 
 **Built.** A sandbox may push only to repos explicitly on its **push allowlist**, enforced by nest-proxy whatever credential a push carries, so a prompt-injected agent can't push to an attacker's repo with the attacker's own token.
 

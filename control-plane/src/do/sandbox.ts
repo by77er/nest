@@ -40,7 +40,10 @@ import {
 export const DEFAULT_IMAGE = "nest-base:latest";
 export const DEFAULT_RESOURCES: Resources = { vcpus: 2, memory_mib: 4096, disk_gib: 32 };
 export const DEFAULT_LIMITS: EgressLimits = { max_connections: 256, bandwidth_mbps: 200, max_inspected_body_bytes: 512 * 1024 * 1024 };
-/** Base layer (docs/sandbox/networking/egress/policy/). */
+/**
+ * The base layer's hosts before the operator edits it (docs/sandbox/networking/egress/policy/#base-layer):
+ * its seed, and what a previous release hard-codes. Trimming it is the operator's (`PUT /v1/admin/egress/base`).
+ */
 export const BASE_ALLOW = [
   "registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "crates.io", "static.crates.io", "index.crates.io",
   "github.com", "*.githubusercontent.com", "deb.debian.org",
@@ -85,6 +88,21 @@ export type SandboxPolicyLayer = z.output<typeof SandboxPolicyLayer>;
 /** What a caller may pass: the fields with defaults may be left out. */
 export type SandboxPolicyInput = z.input<typeof SandboxPolicyLayer>;
 const EMPTY_LAYER: SandboxPolicyLayer = SandboxPolicyLayer.parse({});
+/**
+ * A cell's base egress layer as the operator writes it (`PUT /v1/admin/egress/base`): allow rules and
+ * request guards under the operator layer's own schemas. `allow` is required, so a body that forgets it
+ * can't empty the layer.
+ */
+export const EgressBaseInput = z.strictObject({ allow: SandboxPolicyLayer.shape.allow.unwrap(), guards: SandboxPolicyLayer.shape.guards });
+/** A cell's base layer as FleetDO stores it and each SandboxDO holds it: `version` 0 is the seed, never written. */
+export interface EgressBase {
+  version: number;
+  allow: SandboxPolicyLayer["allow"];
+  guards: SandboxPolicyLayer["guards"];
+}
+export const SEED_EGRESS_BASE: EgressBase = { version: 0, allow: BASE_ALLOW.map((host) => ({ host })), guards: [] };
+/** Its cell's base layer as last heard from FleetDO (`egressBaseChanged`, `registerSandbox`); absent: the seed. */
+const EGRESS_BASE = "egress_base";
 /**
  * The operator layer's rules on the wire: `workstream` is the layer's historical name, which hosts
  * parse as a closed enum (`PolicyLayer`), so it stays (docs/interfaces/#pending-contract-changes).
@@ -451,7 +469,8 @@ export class SandboxDO extends DurableObject<Env> {
     const existing = this.get<SandboxInfo>("info");
     const labels = req.labels && Object.keys(req.labels).length ? req.labels : undefined;
     if (existing?.state !== "destroyed") {
-      await this.fleet(req.cell).registerSandbox(req.sandbox, req.client || labels ? { client: req.client ?? null, labels: labels ?? null } : undefined);
+      // Its answer is the cell's base layer (a FleetDO of the previous release answers nothing: the seed).
+      this.takeEgressBase(await this.fleet(req.cell).registerSandbox(req.sandbox, req.client || labels ? { client: req.client ?? null, labels: labels ?? null } : undefined));
     }
     if (existing) return this.view();
     const info: SandboxInfo = {
@@ -1177,8 +1196,9 @@ export class SandboxDO extends DurableObject<Env> {
     // Its client's bindings, under names of their own (`client:<name>`), never replacing another.
     const inject = [...built, ...this.appliedClientInjections(built.map((b) => b.name)).map(wireBinding)];
     const tag = (source: AllowSource) => (r: AllowRule): SourcedAllowRule => ({ ...r, source });
+    const base = this.egressBase();
     const allow: SourcedAllowRule[] = [
-      ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const, source: "base" as const })),
+      ...base.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: "base" as const, source: "base" as const })),
       ...ws.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER, source: "operator" as const })),
       ...gh.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER, source: "repos" as const })),
       // Its own and its agents' egress rules (docs/control-plane/api/clients/#egress): allow rules only, so the
@@ -1199,8 +1219,34 @@ export class SandboxDO extends DurableObject<Env> {
       inject,
       tcp: ws.tcp,
       limits: DEFAULT_LIMITS,
-      guards: [...gh.guards, ...(ws.guards ?? [])],
+      // Every guard must let a request through, so the base's only add refusals to the operator's.
+      guards: [...base.guards, ...gh.guards, ...(ws.guards ?? [])],
     };
+  }
+
+  /** Its cell's base layer as last heard (absent: the seed, today's hosts). */
+  private egressBase(): EgressBase {
+    return this.get<EgressBase>(EGRESS_BASE) ?? SEED_EGRESS_BASE;
+  }
+
+  /** Hold `base` if it is newer than the one held (versions only grow); whether it was. */
+  private takeEgressBase(base: EgressBase | null | undefined | void): boolean {
+    if (!base || typeof base.version !== "number" || base.version <= this.egressBase().version) return false;
+    this.put(EGRESS_BASE, { version: base.version, allow: base.allow, guards: base.guards });
+    return true;
+  }
+
+  /**
+   * FleetDO: its cell's base layer changed (`PUT /v1/admin/egress/base`). Held at once (any policy built
+   * from now on has it) and sent as a new policy version from its own alarm (`egress_base`), so FleetDO's
+   * fan-out never waits on a command back into FleetDO. Held even before its create wrote anything (the
+   * create, registered, may be waiting on an answer FleetDO read before this version), so the older answer
+   * can't replace it. An older version than the one held, or a destroyed sandbox, changes nothing.
+   */
+  async egressBaseChanged(base: EgressBase): Promise<void> {
+    const info = this.tryInfo();
+    if (info && lease.gone(info.state)) return;
+    if (this.takeEgressBase(base) && info) await this.deadlines.set("egress_base", Date.now());
   }
 
   /** The operator's layer; one stored before `repos`, `read_repos` and `guards` reads as having none. */
@@ -1286,6 +1332,9 @@ export class SandboxDO extends DurableObject<Env> {
         }
       } else if (key === "client_secrets") {
         await this.pushChangedClientSecrets();
+      } else if (key === "egress_base") {
+        const info = this.tryInfo();
+        if (info && !lease.gone(info.state)) await this.policyChanged(false);
       } else if (key === "turn_checkpoint") {
         await this.turnEndCheckpoint();
       } else if (key === "idle") {
