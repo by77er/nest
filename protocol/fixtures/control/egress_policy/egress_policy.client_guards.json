@@ -1,0 +1,166 @@
+{
+  "version": 4,
+  "allow": [
+    {
+      "host": "files.example.com",
+      "ports": [
+        443
+      ],
+      "layer": "workstream"
+    },
+    {
+      "host": "api.example.com",
+      "ports": [
+        443
+      ],
+      "layer": "workstream"
+    },
+    {
+      "host": "git.example.com",
+      "ports": [
+        443
+      ],
+      "layer": "workstream"
+    }
+  ],
+  "passthrough": [],
+  "inject": [
+    {
+      "name": "svc",
+      "hosts": [
+        "api.example.com"
+      ],
+      "placeholder": "nest-ph-svc",
+      "locations": [
+        {
+          "type": "authorization_bearer"
+        }
+      ]
+    },
+    {
+      "name": "client:svc",
+      "hosts": [
+        "api.example.com"
+      ],
+      "placeholder": "nest-ph.cli_01JTESTCLIENT.svc.",
+      "locations": [
+        {
+          "type": "authorization_bearer"
+        }
+      ]
+    }
+  ],
+  "tcp": [],
+  "limits": {
+    "max_connections": 256,
+    "bandwidth_mbps": 200,
+    "max_inspected_body_bytes": 536870912
+  },
+  "guards": [
+    {
+      "name": "store-write",
+      "hosts": [
+        "files.example.com"
+      ],
+      "scope": [
+        {
+          "methods_except": [
+            "GET",
+            "HEAD"
+          ]
+        }
+      ],
+      "allow": [
+        {
+          "path": "/store/mine/**"
+        }
+      ],
+      "reason": "the operator's: writes only under /store/mine"
+    },
+    {
+      "name": "client:no-delete",
+      "hosts": [
+        "files.example.com"
+      ],
+      "scope": [
+        {
+          "methods": [
+            "DELETE"
+          ]
+        }
+      ],
+      "allow": [
+        {
+          "path": "/store/theirs/**"
+        }
+      ],
+      "reason": "the client's: no deletes outside /store/theirs"
+    },
+    {
+      "name": "client:api-write",
+      "hosts": [
+        "api.example.com"
+      ],
+      "scope": [
+        {
+          "methods_except": [
+            "GET",
+            "HEAD"
+          ]
+        }
+      ],
+      "allow": [
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/query",
+          "injected": "client:svc"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/batch",
+          "body_json": {
+            "pointer": "/op",
+            "values": [
+              "read"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "client:push",
+      "hosts": [
+        "git.example.com"
+      ],
+      "scope": [
+        {
+          "path": "/**/git-receive-pack"
+        },
+        {
+          "path": "/**/info/refs",
+          "query": [
+            {
+              "name": "service",
+              "values": [
+                "git-receive-pack"
+              ]
+            }
+          ]
+        }
+      ],
+      "allow": [
+        {
+          "path": "/me/box/**"
+        },
+        {
+          "path": "/me/box.git/**"
+        }
+      ],
+      "ignore_case": true
+    }
+  ]
+}

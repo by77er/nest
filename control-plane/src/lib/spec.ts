@@ -12,6 +12,7 @@ import { canonicalRepos, narrowRepos, readOnlyRepos, Repos } from "./repos";
 import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
 import { GithubPush } from "./rules/github";
 import { ClientEgress, type EgressRule, narrowEgress } from "./client-egress";
+import { ClientGuards, type HeldGuard, holdGuards } from "./client-guards";
 import { SandboxEnv, unboundPlaceholders } from "./sandbox-env";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
@@ -86,6 +87,11 @@ export const Template = z.object({
    * literals, or placeholders of its own `inject` bindings.
    */
   env: SandboxEnv.optional(),
+  /**
+   * Request guards its agents' sandboxes get while they are attached (docs/control-plane/api/clients/#request-guards):
+   * they only refuse, so they need no grant.
+   */
+  guards: ClientGuards.optional(),
 });
 export type Template = z.output<typeof Template>;
 
@@ -112,6 +118,8 @@ export const OperatorOverrides = z.object({
   egress: ClientEgress.optional(),
   /** Set over the template's environment (a name in both takes this value). */
   env: SandboxEnv.optional(),
+  /** Replaces the template's request guards. */
+  guards: ClientGuards.optional(),
 });
 export type OperatorOverrides = z.output<typeof OperatorOverrides>;
 
@@ -146,6 +154,8 @@ export const SpawnerOverrides = z.strictObject({
   egress: ClientEgress.optional(),
   /** Set over the template's environment: values are literals or the spec's own placeholders, so this grants nothing. */
   env: SandboxEnv.optional(),
+  /** Request guards added to the template's (never replacing one): a guard only refuses, so this grants nothing. */
+  guards: ClientGuards.optional(),
 });
 export type SpawnerOverrides = z.output<typeof SpawnerOverrides>;
 
@@ -192,6 +202,8 @@ export interface AgentSpec {
   egress?: { allow: EgressRule[] };
   /** Its processes' environment in its sandbox; absent when none. */
   env?: Record<string, string>;
+  /** Request guards its sandbox gets while it is attached, each with whose it is; absent when none (as in every spec before them). */
+  guards?: HeldGuard[];
 }
 
 /**
@@ -724,6 +736,13 @@ export function expandTemplate(
     if (!Object.hasOwn(clients, ns)) return err(`template ${name}: no client is named ${ns}`);
     inject = holdInjections(clients[ns]!, tpl.inject);
   }
+  // A template's guards are its namespace's client's (the operator's: null), which decides the sandboxes they count in.
+  let guards: HeldGuard[] = [];
+  if (tpl.guards?.length) {
+    const ns = name.includes("/") ? name.slice(0, name.indexOf("/")) : null;
+    if (ns !== null && !Object.hasOwn(clients, ns)) return err(`template ${name}: no client is named ${ns}`);
+    guards = holdGuards(ns === null ? null : clients[ns]!, tpl.guards);
+  }
   // Its model and effort become arguments of the brain's command: a template stored before the rule
   // (`launchProblem`) expands into no spec, so nothing spawns from it until it's written again.
   const badLaunch = launchProblem(tpl.launch);
@@ -749,6 +768,7 @@ export function expandTemplate(
     ...(tpl.github_push?.workflows ? { github_push: { workflows: true as const } } : {}),
     ...(tpl.egress?.allow.length ? { egress: { allow: tpl.egress.allow.map((r) => ({ ...r })) } } : {}),
     ...(tpl.env && Object.keys(tpl.env).length ? { env: { ...tpl.env } } : {}),
+    ...(guards.length ? { guards } : {}),
   }, name, undefined);
 }
 
@@ -852,11 +872,14 @@ export function expandSpec(
     if (!inject.ok) return err(`template ${spec.template}: ${inject.error}`);
     const egress = narrowEgress(base.value.egress?.allow ?? [], o.data.egress?.allow);
     if (!egress.ok) return err(`template ${spec.template}: ${egress.error}`);
-    const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, inject: _i, github_push: _g, egress: _x, ...rest } = base.value;
+    const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, inject: _i, github_push: _g, egress: _x, guards: _gd, ...rest } = base.value;
     const push = o.data.github_push?.workflows === false ? undefined : base.value.github_push;
+    // Its guards join the template's, held as its subtree's client's: a spawner adds refusals, never removes one.
+    if (o.data.guards?.length && ns !== null && !Object.hasOwn(clients, ns)) return err(`template ${spec.template}: no client is named ${ns}`);
+    const guards = [...(base.value.guards ?? []), ...holdGuards(ns === null ? null : clients[ns]!, o.data.guards ?? [])];
     const extras = {
       ...(inject.value.length ? { inject: inject.value } : {}), ...(push ? { github_push: push } : {}),
-      ...(egress.value.length ? { egress: { allow: egress.value } } : {}),
+      ...(egress.value.length ? { egress: { allow: egress.value } } : {}), ...(guards.length ? { guards } : {}),
     };
     // Lifetimes only shorten: ephemeral once set stays, and the shorter TTL wins.
     const ephemeral = base.value.ephemeral || o.data.ephemeral;
@@ -877,10 +900,12 @@ export function expandSpec(
   if (!tools.ok) return tools;
   const inject = narrowInjections(base.value.inject ?? [], o.inject);
   if (!inject.ok) return err(`template ${spec.template}: ${inject.error}`);
-  const { mcp: _mcp, brokered: _brokered, ephemeral: _ephemeral, inject: _i, github_push: _g, egress: _egress, ...rest } = base.value;
+  const { mcp: _mcp, brokered: _brokered, ephemeral: _ephemeral, inject: _i, github_push: _g, egress: _egress, guards: _gd, ...rest } = base.value;
   const ephemeral = o.ephemeral ?? base.value.ephemeral ?? false;
   const workflows = o.github_push ? o.github_push.workflows : !!base.value.github_push?.workflows;
   const egress = o.egress ? o.egress.allow : base.value.egress?.allow ?? [];
+  // The operator's replace the template's (the operator holds the root), held as the operator's.
+  const guards = o.guards ? holdGuards(null, o.guards) : base.value.guards ?? [];
   // The operator's own launch is held to the same rule where it's used.
   const badLaunch = launchProblem(o.launch);
   if (badLaunch) return err(badLaunch);
@@ -890,6 +915,7 @@ export function expandSpec(
     ...(inject.value.length ? { inject: inject.value } : {}),
     ...(workflows ? { github_push: { workflows: true as const } } : {}),
     ...(egress.length ? { egress: { allow: egress.map((r) => ({ ...r })) } } : {}),
+    ...(guards.length ? { guards } : {}),
     ...(ephemeral ? { ephemeral: true as const } : {}),
     launch: o.launch ?? base.value.launch,
     rules: o.rules ?? base.value.rules,
