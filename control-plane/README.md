@@ -68,6 +68,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      and killed there, and this start (kept as the agent's intent, merged with any other start wanted meanwhile) runs
      once that brain's exit or its host's loss releases it
    - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt`
+   - `PUT /v1/agents/<id>/rules [ToolRule]` replaces an agent's rules until `DELETE /v1/agents/<id>/rules` clears them; otherwise an agent reads its capabilities' rules as they are now, after its spawner's narrowing, so a capability write reaches it ([rules](../docs/control-plane/durable-objects/agent/#rules))
    - `POST /v1/agents` and `POST /v1/sandboxes` take an `Idempotency-Key` header (`src/lib/idempotency.ts`): the same key and
      body within 24 h answer the first object (`Idempotent-Replayed: true`), another body 409 ([idempotency keys](../docs/control-plane/api/#idempotency-keys)).
      Only a cell's own routes read `?cell=` (the fleet, hosts, images, lifetimes, tunnels, GC, root CA, the operator's
