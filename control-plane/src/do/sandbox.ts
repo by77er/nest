@@ -26,10 +26,10 @@ import {
 import { canonicalRepos, readOnlyRepos, Repos, unionRepos } from "../lib/repos";
 import type { Labels } from "../lib/clients";
 import { ClientOutbox } from "../lib/client-events";
-import { GITHUB_BINDING, GITHUB_READ_BINDING, githubEgress, GithubPush, readBindings } from "../lib/rules/github";
+import { GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING, githubEgress, GithubPush, readBindings } from "../lib/rules/github";
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
-import { slotEnv } from "../lib/sandbox-env";
+import { githubEnvConflict, githubEnvRefusal, isGithubEnvName, slotEnv } from "../lib/sandbox-env";
 import { CLIENT_GUARD_PREFIX, type ClientGuard, distinctGuards, type HeldGuard, layerOverLimit, outsideOperatorRouting, sandboxGuardsOverLimit, wireGuard } from "../lib/client-guards";
 import type { MintedInjection, SecretsChangedAnswer } from "./broker";
 import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
@@ -91,6 +91,9 @@ export type SandboxPolicyLayer = z.output<typeof SandboxPolicyLayer>;
 /** What a caller may pass: the fields with defaults may be left out. */
 export type SandboxPolicyInput = z.input<typeof SandboxPolicyLayer>;
 const EMPTY_LAYER: SandboxPolicyLayer = SandboxPolicyLayer.parse({});
+/** Whether an operator layer has nest inject a GitHub token: repos, read-only repos, `github_push`, or its own binding under a GitHub binding's name. */
+const layerGithub = (l: SandboxPolicyLayer): boolean => l.repos.length > 0 || l.read_repos.length > 0 || !!l.github_push?.workflows
+  || l.inject.some((b) => b.name === GITHUB_BINDING || b.name === GITHUB_READ_BINDING || b.name === GITHUB_READ_DEFAULT_BINDING);
 /**
  * A cell's base egress layer as the operator writes it (`PUT /v1/admin/egress/base`): allow rules and
  * request guards under the operator layer's own schemas. `allow` is required, so a body that forgets it
@@ -474,6 +477,10 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** Create (idempotent) and place the sandbox; the first placement grants epoch 1. */
   async create(req: CreateSandbox): Promise<SandboxInfo> {
+    // Its own env beside its own GitHub access (docs/control-plane/api/clients/#environment); refused
+    // before anything is written. An attached agent's are checked at its attach.
+    const asked = req.policy ? SandboxPolicyLayer.parse(req.policy) : EMPTY_LAYER;
+    this.refuseGithubEnv(layerGithub(asked) || !!req.github_push?.workflows, req.env);
     // Its own guards within what a sandbox applies: refused before anything is written (its caller gives its client's place back).
     const over = req.guards?.length ? layerOverLimit(req.guards) : null;
     if (over) throw new NestError(ErrorCodes.INVALID_MESSAGE, over);
@@ -1288,6 +1295,7 @@ export class SandboxDO extends DurableObject<Env> {
   async setPolicy(input: SandboxPolicyInput): Promise<EgressPolicy> {
     this.info_();
     const layer = SandboxPolicyLayer.parse(input);
+    this.refuseGithubEnv(this.kernelGithub({ layer }), ...this.envs());
     this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos), read_repos: canonicalRepos(layer.read_repos) });
     await this.policyChanged(true);
     return this.policy();
@@ -1589,6 +1597,9 @@ export class SandboxDO extends DurableObject<Env> {
       if (lease.gone(this.info_().state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${this.info_().state}`, 409);
     }
     if (extra.guards?.length) this.checkGuardLimit(undefined, { id: agent, guards: extra.guards });
+    // Its env and the sandbox's beside the GitHub access both bring, before anything is recorded.
+    this.refuseGithubEnv(this.kernelGithub({ except: agent }) || !!repos?.length || !!readRepos?.length || !!extra.workflows,
+      ...this.envs(agent), extra.env);
     // What its client bindings, push opt-ins, egress rules and guards count is the attached agents': compared across the attach itself.
     const extrasBefore = this.extrasKey();
     this.setAgentExtras(agent, extra);
@@ -1733,6 +1744,7 @@ export class SandboxDO extends DurableObject<Env> {
    */
   async allowAgentRepos(agent: string, repos: string[]): Promise<string[]> {
     if (!this.info_().attached.includes(agent)) return this.pushRepos();
+    if (repos.length) this.refuseGithubEnv(true, ...this.envs());
     const have = this.get<Record<string, string[]>>("agent_repos")?.[agent] ?? [];
     const read = this.get<Record<string, string[]>>(AGENT_READ_REPOS)?.[agent] ?? [];
     if (this.setAgentRepos(agent, [...have, ...repos], read)) await this.policyChanged(true);
@@ -1952,6 +1964,7 @@ export class SandboxDO extends DurableObject<Env> {
       throw new NestError(ErrorCodes.CONFLICT, "the sandbox's guards changed while this layer was written: read the layer again and retry", 409);
     }
     this.checkGuardLimit(guards);
+    this.refuseGithubEnv(this.kernelGithub({ ownPush: layer.workflows }), layer.env, ...this.envs().slice(1));
     const put = (key: string, v: unknown, has: boolean) => (has ? this.put(key, v) : this.del(key));
     const envBefore = JSON.stringify(this.get(OWN_ENV) ?? {});
     put(OWN_EGRESS, layer.egress, layer.egress.length > 0);
@@ -2014,14 +2027,47 @@ export class SandboxDO extends DurableObject<Env> {
     return { ...this.repoAccess(), workflows: this.pushWorkflows() };
   }
 
+  /**
+   * Whether nest injects a GitHub token of its own here (`githubEnvConflict`): the operator's layer (its
+   * repos, read-only repos, `github_push`, or a binding of its own under a GitHub binding's name), its own
+   * `github_push`, or an attached agent's repos or `github_push`. `layer` and `ownPush` stand in for what
+   * a write would store; `except`: an agent whose part a write replaces.
+   */
+  private kernelGithub(change: { layer?: SandboxPolicyLayer; ownPush?: boolean; except?: string } = {}): boolean {
+    const attached = new Set((this.tryInfo()?.attached ?? []).filter((a) => a !== change.except));
+    const agents = (key: string) => Object.entries(this.get<Record<string, unknown>>(key) ?? {})
+      .some(([a, v]) => a !== change.except && (!Array.isArray(v) || v.length > 0));
+    return layerGithub(change.layer ?? this.operatorLayer())
+      || (change.ownPush ?? !!this.get<{ workflows: true }>(OWN_PUSH)?.workflows)
+      || agents("agent_repos") || agents(AGENT_READ_REPOS)
+      || Object.keys(this.get<Record<string, true>>(AGENT_PUSH) ?? {}).some((a) => attached.has(a));
+  }
+
+  /** Its own env, then each attached agent's but `except`'s: what its slots are made from. */
+  private envs(except?: string): Record<string, string>[] {
+    const agents = this.get<Record<string, Record<string, string>>>(AGENT_ENV) ?? {};
+    const attached = (this.tryInfo()?.attached ?? []).filter((a) => a !== except);
+    return [this.get<Record<string, string>>(OWN_ENV) ?? {}, ...attached.map((a) => agents[a] ?? {})];
+  }
+
+  /** Refuse (400) a write that would leave a GitHub env name (`isGithubEnvName`) where nest injects its own GitHub token. */
+  private refuseGithubEnv(kernelGithub: boolean, ...envs: (Readonly<Record<string, string>> | undefined)[]): void {
+    const names = githubEnvConflict(kernelGithub, ...envs);
+    if (names.length) throw new NestError(ErrorCodes.INVALID_MESSAGE, githubEnvRefusal(names));
+  }
+
   /** Send `agent_attach` for these agents, each as the agent's one in flight. */
   private async issueAttachCommands(agents: string[]): Promise<void> {
     const info = this.info_();
     if (!info.host || !agents.length) return;
+    const github = this.kernelGithub();
     const bodies = agents.map((agent): CommandBody => {
       const cwd = info.attach_cwd[agent];
       // Its slot's environment: the sandbox's, then the agent's (a nestd of the previous release ignores it).
-      const env = slotEnv(this.get<Record<string, string>>(OWN_ENV) ?? {}, this.get<Record<string, Record<string, string>>>(AGENT_ENV)?.[agent]);
+      // Where nest injects its own GitHub token the GitHub names stay its own: every write here refuses
+      // them then, but a previous release (after a rollback) did not.
+      const env = Object.fromEntries(Object.entries(slotEnv(this.get<Record<string, string>>(OWN_ENV) ?? {}, this.get<Record<string, Record<string, string>>>(AGENT_ENV)?.[agent]))
+        .filter(([k]) => !github || !isGithubEnvName(k)));
       return { type: "agent_attach", sandbox: info.sandbox, epoch: info.epoch, agent, ...(cwd ? { cwd } : {}), ...(Object.keys(env).length ? { env } : {}) };
     });
     const cmds = await this.fleet(info.cell).issueCommands(info.host, bodies);
