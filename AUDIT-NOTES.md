@@ -3,6 +3,9 @@
 ## Corrections
 | doc | said | code says | evidence |
 |---|---|---|---|
+| sandbox/networking/egress/dns/README.md | only A/AAAA (class IN) answered, else NOTIMP; AAAA always empty | NOTIMP only for a non-Query opcode or ≠1 question; an allowed name gets A and AAAA from getaddrinfo, other types NOERROR empty; class unchecked | crates/nest-proxy/src/dns.rs:36-72 |
+| sandbox/networking/egress/dns/README.md | answers filtered of hard-denied addresses, SERVFAIL `dns_non_public` (as built) | not built: dns.rs adds every resolved address; non-public addresses are refused at connect (`connect_addrs`, TCP exceptions included) | crates/nest-proxy/src/dns.rs:55-72, http.rs:113-129,840-846 |
+| sandbox/networking/egress/dns/README.md | ≤64 records, ≤4 KiB (listed as bounds) | no record cap; 60 s TTL cap built | crates/nest-proxy/src/state.rs:24, dns.rs:21-22 |
 | sandbox/state/README.md | generation record `{…, restore_abi?, session?, kind: disk-only|checkpoint, state, at}` | `GenerationRecord {id, sandbox, parent?, epoch, kind: disk_only|checkpoint, disk_manifest, mem_manifest?, reason, created_ms, cut_ms?}`; `state` is SandboxDO's column; no `restore_abi`/`session` | crates/nest-protocol/src/model.rs:678-719, control-plane/src/do/sandbox.ts:330-336 |
 | sandbox/state/README.md | reasons `turn_end, periodic, pressure, pause, suspend, drain, spot, fork, salvage` | `turn_end, timer, dirty_threshold, suspend, drain, spot_notice, checkpoint, fork, salvage, archive` | crates/nest-protocol/src/model.rs:687-699, control-plane/src/protocol/model.ts:354 |
 | sandbox/state/README.md | rollback notice from `session` (no status) | not built: no `session`/`last_tool_use` anywhere | grep crates/ control-plane/src/ |
