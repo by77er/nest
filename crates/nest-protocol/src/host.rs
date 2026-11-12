@@ -1484,7 +1484,8 @@ mod tests {
         assert_eq!(s["autoMemoryEnabled"], false);
         for ev in hook::SYNC_EVENTS {
             let h = &s["hooks"][ev][0]["hooks"][0];
-            assert_eq!(h["command"], format!("{} hook --sync", paths::NEST_BIN), "{ev}");
+            // `--event`: input `nest hook` can't parse still gets that event's fallback (a deny where one is due).
+            assert_eq!(h["command"], format!("{} hook --sync --event {ev}", paths::NEST_BIN), "{ev}");
             assert!(h.get("async").is_none(), "{ev} must be sync");
         }
         for ev in hook::ASYNC_EVENTS {

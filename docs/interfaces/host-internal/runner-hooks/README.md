@@ -1,6 +1,6 @@
 # runner ↔ `nest hook`
 
-Every Claude Code hook runs `/usr/lib/nest/nest hook [--sync]` (wired in managed settings, see [../runner-claude/](../runner-claude/)). It reads the hook input JSON on stdin and `NEST_AGENT_ID`, `NEST_HOOK_DGRAM`, `NEST_HOOK_SOCK` and `NEST_HOOK_SPOOL` from its environment. **It always exits 0.**
+Every Claude Code hook runs `/usr/lib/nest/nest hook [--sync --event <event>]` (wired in managed settings, see [../runner-claude/](../runner-claude/)). It reads the hook input JSON on stdin and `NEST_AGENT_ID`, `NEST_HOOK_DGRAM`, `NEST_HOOK_SOCK` and `NEST_HOOK_SPOOL` from its environment. **It always exits 0.**
 
 ## Async tracking hooks
 
@@ -16,6 +16,7 @@ Every Claude Code hook runs `/usr/lib/nest/nest hook [--sync]` (wired in managed
 - One `HookDecisionRequest{v, agent, input}` frame on `hook.sock`, then one `HookDecisionResponse{output}` frame. `output` is printed verbatim to stdout.
 - **The runner answers from local state** (the `AgentCache` from AgentDO and the inbox mirror), in ~1 ms, with one exception: a call a rule in `ask` mode holds waits up to 5 s for AgentDO's `approval_check` ([session](../../control-host/session/#turns-inbox-and-caches)), because only AgentDO can spend an approval durably before the call runs.
 - **If the runner is unreachable or doesn't answer within 8 s**, `nest hook` prints `hook::fallback_output(event)`: deny for `PreToolUse`/`PermissionRequest`, nothing (allow) for `PostToolUse`/`Stop`/`SessionStart`.
+- **Input it can't parse** (serde_json refuses a lone surrogate such as `\ud800`, and nesting deeper than 128): never sent to the runner; `nest hook` prints the fallback for the event `--event` names, so a `PreToolUse` or `PermissionRequest` is denied. Before `--event` (2026-11-11) it sent `null`, the runner answered nothing, and Claude Code, which runs with the web built-ins in `--allowedTools`, let the call run: a fail-open for `ask` and `deny` rules on them.
 - **Peer binding:** the runner checks the connecting process (`SO_PEERCRED`) descends from the declared agent's Claude Code process; otherwise it answers with the same fallback. The async datagram socket isn't peer-checked (tracking only; a forged datagram can only mislabel state).
 
 | Event | Runner logic | Output |
