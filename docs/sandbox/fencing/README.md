@@ -24,7 +24,7 @@ SandboxDO issues a new epoch with every [placement claim](../../control-plane/du
 
 Before a sandbox on a host whose lease expired is placed again, FleetDO terminates the old instance through the cloud provider's API and waits for EC2 to confirm it dead. A host that reconnects first proves it instead with a successful `fence` of every expired lease (STONITH by fence); its fenced incarnations are salvaged and destroyed as below. A silent host holding no live lease gets no STONITH: nothing of it can run twice. **If termination can't be confirmed, the sandbox is not run twice:** we wait or ask me. An unreachable host means defer, never destroy: nothing of its sandboxes' state or generations is deleted because it went quiet.
 
-Every STONITH is to record each sandbox's loss explicitly ("work since generation G at T lost") ([losses](../../control-plane/durable-objects/sandbox/#losses)), which reaches its attached agents with the move notice (not built: the move notice carries only the new epoch and host). The loss is bounded by the [commit cadence](../state/#writeback-cadence); salvage may still recover it (below).
+Every STONITH is to record each sandbox's loss explicitly ("work since generation G at T lost") ([losses](../../control-plane/durable-objects/sandbox/#losses)), which reaches its attached agents with the move notice (not built: the record; today AgentDO tells the brain the time of the head it was restored from, and that later file changes were lost). The loss is bounded by the [commit cadence](../state/#writeback-cadence); salvage may still recover it (below).
 
 ## 4. External side effects
 
@@ -47,6 +47,6 @@ The same happens when a newer epoch of a sandbox is created on a host that still
 t=0    last heartbeat
 t=20s  host self-fences (if alive)
 t=30s  DO lease expires → terminate the instance → confirmed (or the host reconnects and fences) → loss recorded ("work since G at T"; not built)
-t≈35s  new claim, epoch+1 → place on another host → lazy restore of head (disk-only → cold boot); the brain, on its brain host, re-resolves its binding and is told what was lost (not built)
+t≈35s  new claim, epoch+1 → place on another host → lazy restore of head (disk-only → cold boot); the brain, on its brain host, re-resolves its binding and is told what was lost (from the head's time; the loss record isn't built)
        → completion CAS once the host reports the VM running, guest hello and agent ready (evidence-checked completion not built)
 ```

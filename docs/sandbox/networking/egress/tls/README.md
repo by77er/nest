@@ -40,6 +40,6 @@ One proxy serves every sandbox on the host, so TLS work is bounded globally and 
 
 - **Verification:** the proxy validates server certificates against the standard public roots (webpki-roots) and **fails closed**. Sandboxes depend on it for this.
 - **Addressing:** the proxy **re-resolves the SNI name** for the upstream connection, never using the IP the guest dialed, and never connects to a [hard-denied](../policy/#hard-deny) address.
-- **Protocols:** the client is offered the same ALPN the upstream negotiated, so HTTP/1.1, h2, gRPC and WebSocket upgrades all work. HTTP/3 is refused at the netns, so clients fall back to TCP at once ([steering](../steering/)).
+- **Protocols:** the client is offered the same ALPN the upstream negotiated, so HTTP/1.1, h2, gRPC and WebSocket upgrades all work. HTTP/3 is to be refused at the netns, so clients fall back to TCP at once (designed, not built: today UDP/443 is dropped, so a client waits out its QUIC timeout; [steering](../steering/)).
 - **Pinned clients** go on the SNI-passthrough list. They get no injection and no inspection, and passthrough is SNI-only ([policy](../policy/)).
 - What the proxy checks inside decrypted requests: [inspection/](../inspection/).

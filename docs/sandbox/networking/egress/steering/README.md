@@ -7,7 +7,7 @@
    - tcp/80 and tcp/443 from the guest → redirect to the transparent listeners on `172.16.0.1`
    - udp/53 and tcp/53 to any other address → redirect to the `:53` listeners
    - udp/53 and tcp/53, tcp/80 and tcp/443, the explicit listener ports (3128–3191) and the TCP-exception ports (20000–20999) to `172.16.0.1` → accept
-   - everything else → **reject**: TCP with a reset, anything else with ICMP port-unreachable. A rejected connection fails at once where a dropped one waits out a timeout; the guest is the only sender, so rejecting reveals nothing. In particular, UDP/443 (QUIC) is rejected, so HTTP/3 clients fall back to TCP immediately, as in [SPACE's guardrails](https://github.com/perplexityai/space/blob/main/docker/space/nftables/sandbox-pre-tproxy-guardrails.json).
+   - everything else → **reject** (designed, not built: today the `input` and `forward` chains drop it): TCP with a reset, anything else with ICMP port-unreachable. A rejected connection fails at once where a dropped one waits out a timeout; the guest is the only sender, so rejecting reveals nothing. In particular, UDP/443 (QUIC) is rejected, so HTTP/3 clients fall back to TCP immediately, as in [SPACE's guardrails](https://github.com/perplexityai/space/blob/main/docker/space/nftables/sandbox-pre-tproxy-guardrails.json).
 3. Create the **listening sockets inside the netns** (a helper thread does `setns` → `socket`/`bind`/`listen` → switches back; a socket keeps the namespace it was created in):
    - `:53` udp+tcp (DNS)
    - `:80` and `:443` (transparent)
