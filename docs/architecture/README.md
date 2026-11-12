@@ -50,7 +50,7 @@ Neither system knows where the other runs. A brain reaches a sandbox only throug
 | **CatalogDO** | Cloudflare, one | Templates and capabilities, as data I edit; expands spawn specs | [catalog/](../control-plane/durable-objects/catalog/) |
 | **McpConnectorDO** | Cloudflare, one per remote MCP server, credential and API client namespace | The server's shared tool list, `list_changed`, admission | [mcp-connector/](../control-plane/durable-objects/mcp-connector/) |
 | **ClientDO** | Cloudflare, one per API client | Its record and grant, webhook and event backlog, idempotency keys (its catalog namespace's entries are CatalogDO's) | [client/](../control-plane/durable-objects/client/) |
-| **nestd** | Every host | Enrollment, the lease, command delivery, self-fencing. On sandbox hosts: runs sandboxes, builds their network namespaces, launches cloudflared, commits sandbox state to S3 (the gateway is its own systemd unit). On brain hosts: supervises the runner | [compute/nestd/](../compute/nestd/) |
+| **nestd** | Every host | Enrollment, the lease, command delivery, self-fencing. On sandbox hosts: runs sandboxes, builds their network namespaces, launches cloudflared, commits sandbox state to S3. On brain hosts: drives the runner over its socket. The gateway and the runner are systemd units of their own | [compute/nestd/](../compute/nestd/) |
 | **nest-proxy** | Sandbox hosts | All sandbox egress: allowlist, TLS inspection, credential injection by placeholder, audit | [egress/](../sandbox/networking/egress/) |
 | **Gateway** | Sandbox hosts | The one door into a sandbox: checks the binding, pins `(sandbox, epoch)`, forwards hands connections to the guest over vsock (terminal and ingress connections designed, not built) | [sandbox/gateway/](../sandbox/gateway/) |
 | **cloudflared** | Sandbox hosts | Dials Cloudflare outbound and carries the host's tunnel hostname to the gateway; no inbound ports | [sandbox/gateway/](../sandbox/gateway/) |
@@ -81,7 +81,7 @@ The contract is in [interfaces/gateway/](../interfaces/gateway/). Any runner can
 
 | Failure | What happens |
 |---|---|
-| Brain crash | AgentDO restarts it with `--resume` (a recovery context that asks the guest for each in-flight hands call's outcome through `call_status` is designed). After three restarts without a completed turn, the next exit leaves it errored until new input |
+| Brain crash | AgentDO restarts it with `--resume` and a recovery note (where the saved transcript ends; check the workspace); asking the guest for each in-flight hands call's outcome through `call_status` is designed. After three restarts without a completed turn, the next exit leaves it errored until new input |
 | Wedged host (processes no commands, or a killed brain outlives its kill) | nestd first drops its runner connection, killing that host's brains. If that doesn't end them, AgentDO reports the host wedged: FleetDO cuts it off, places nothing on it, and sends it to STONITH; its brains restart elsewhere only once its death is confirmed (an operator's confirm-dead in a cell without EC2), and its sandboxes are placed again from their heads |
 | Brain host loss | Heartbeats stop. The runner kills its brains at 20 s; at 30 s FleetDO expires the host, AgentDO releases each brain record and starts each brain on another brain host with `--resume`. Open hands connections drop, so the gateway cancels those calls in the guest. The sandbox is untouched: no pause, no fence, no loss record |
 | Sandbox host loss | The host self-fences at 20 s (pauses VMs); at 30 s FleetDO expires its leases and terminates the instance (STONITH), then each sandbox is claimed again under a new epoch (loss records are designed), restoring from its last committed generation. Every binding for the old epoch is dead; the brain survives, its next call is refused, it re-resolves, and its next tool result says the sandbox moved and what was lost |
@@ -89,7 +89,7 @@ The contract is in [interfaces/gateway/](../interfaces/gateway/). Any runner can
 | Cloudflare edge or tunnel outage | Every hands path is down: new calls fail, open calls are cancelled. Sandboxes keep running and brains wait |
 | Control-plane restart or deploy | Hosts reconnect with jittered backoff; reliable channels resend in order from the last ack. Bindings keep working until they expire (about an hour), so a turn in flight continues as long as the tunnel is up |
 | Gateway crash | systemd restarts it (`nest-gateway.service`). Open calls are cancelled; bindings are unaffected, since they are verified, not stored |
-| Spot notice | Every running sandbox is suspended disk-only within the 2-minute warning (memory snapshots after the disks, in order of recent activity, are designed) |
+| Spot notice | Every running sandbox is sent a disk-only suspend at the notice, inside the 2-minute warning (memory snapshots after the disks, in order of recent activity, are designed) |
 | Stale host comes back | Its epochs are fenced; uncommitted work is offered as an orphaned sibling generation. A stale brain's platform calls are rejected by its agent epoch |
 
 Details: [sandbox/fencing/](../sandbox/fencing/), [sandbox/gateway/](../sandbox/gateway/), [sandbox/state/](../sandbox/state/), [agents/sessions/](../agents/sessions/).
