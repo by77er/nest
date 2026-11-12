@@ -13,6 +13,7 @@
 ## Unconfirmed
 
 ## Suspected code bugs
+- **nest-proxy runs as root on cell hosts.** docs/compute/nestd/README.md (Privilege split: "nest-proxy, the gateway and the agent runner run unprivileged"), docs/README.md:183 ("the proxy is unprivileged") and the egress docs state it; `deploy/host/install.sh:90-104` writes `nest-proxy.service` with no `User=`/`CapabilityBoundingSet=`, and `crates/nest-proxy/src/main.rs` drops no privileges. Docs left as the decision.
 
 ## Drift outside the area
 
