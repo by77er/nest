@@ -65,12 +65,12 @@ def skip(name, why):
     log(f"SKIP {name} — {why}")
 
 
-# wrangler dev's proxy forwards each request to the worker on a pooled keep-alive connection, and the
-# worker's runtime closes one idle for 5 s (both workerd's defaults). A request the proxy sends on one the
-# worker is closing is lost before the worker reads it, and the proxy resends only a GET or HEAD itself:
-# any other method comes back as this text 500, from miniflare, never from the Worker (whose every error
-# is JSON, `errorResponse`). A busy runtime widens the race: after `start_control_plane`, the redelivery
-# scenario's next request came about 5 s after the health check, while the new runtime was busy.
+# This text 500 is miniflare's, not the Worker's (whose every error is JSON, `errorResponse`): wrangler
+# dev's proxy lost its connection to the worker's runtime, and resends only a GET or HEAD itself. In this
+# harness the cause is a closing keep-alive: the proxy forwards on pooled connections, and the runtime
+# closes one idle for 5 s (both workerd's defaults), so a request sent on one it is closing is lost
+# (reproduced: the worker logged none). A busy runtime widens the race: after `start_control_plane`, the
+# redelivery scenario's next request came about 5 s after the health check (e2e/FINDINGS.md).
 DEV_PROXY_LOST = "Error: Network connection lost."
 DEV_PROXY_RESENDS = 2
 
@@ -87,8 +87,9 @@ def api(method, path, body=None, raw=False, timeout=30):
         except urllib.error.HTTPError as e:
             text = e.read().decode()
             if e.code == 500 and text.startswith(DEV_PROXY_LOST) and attempt < DEV_PROXY_RESENDS:
-                # Never reached the Worker (DEV_PROXY_LOST): the same request again, on a new connection.
-                log(f"{method} {path}: lost in wrangler dev's proxy before the worker read it; sending it again")
+                # The proxy's connection to the runtime failed; in this harness the cause is the closing
+                # keep-alive (above). The same request again, on a new connection.
+                log(f"{method} {path}: wrangler dev's proxy lost its connection to the worker; sending it again")
                 time.sleep(0.25)
                 continue
             try:
