@@ -379,6 +379,8 @@ describe("a review nest has no room for", () => {
       expect(waitingTold()).toBe(2);
       const again = await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => st.storage.sql.exec("SELECT capacity_ms FROM jobs WHERE pr = 1").one().capacity_ms as number);
       expect(again).toBeGreaterThan(since);
+      // Its tries count afresh: the first wait's don't carry over (5 s, not 10 s or more).
+      expect(await nextIn(p, 1, s)).toBeLessThanOrEqual(5_000);
     } finally {
       fake.maxSandboxes = null;
     }
@@ -407,5 +409,124 @@ describe("a review nest has no room for", () => {
     } finally {
       fake.maxSandboxes = null;
     }
+  });
+
+  describe("the project's word on a long wait, when the project can't be reached", () => {
+    const errorsOf = async (p: P) => ((await api(token, "GET", `/api/projects/${p.id}/errors`)).body as any[]).filter((e) => e.code === "review_waiting_for_room");
+    /** A job waiting for room past ROOM_TELL_AFTER_MS, its own next try `nextMs` from now. */
+    async function longWait(nextMs: number) {
+      const p = await newProject();
+      fake.maxSandboxes = liveSandboxes();
+      const s = sha();
+      await push(p, 1, s);
+      await run(p);
+      expect((await job(p, 1, s)).state).toBe("queued");
+      await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => {
+        st.storage.sql.exec("UPDATE jobs SET capacity_ms = ?, next_ms = ? WHERE pr = 1", Date.now() - ROOM_TELL_AFTER_MS - 60_000, Date.now() + nextMs);
+      });
+      return { p, s };
+    }
+    const unreachable = async () => { throw new Error("the project's object is unreachable"); };
+    const within = <T>(p: P, f: (o: any, st: DurableObjectState) => Promise<T>) => runInDurableObject(reviews(p), f as any) as Promise<T>;
+    const roomRow = (p: P, s?: string) => within(p, async (_o, st) => st.storage.sql.exec("SELECT room_told_ms, room_ok, room_next_ms, room_attempts, state FROM jobs WHERE pr = 1 AND (? IS NULL OR sha = ?) ORDER BY created_ms LIMIT 1", s ?? null, s ?? null).one());
+
+    it("is due at once, past the job's own backoff (the alarm's term)", async () => {
+      const { p } = await longWait(10 * 60_000);
+      try {
+        // In one step (no alarm can run between): nothing armed, the long wait as it is, then arm.
+        const alarm = await within(p, async (o, st) => {
+          await st.storage.deleteAlarm();
+          st.storage.sql.exec("UPDATE jobs SET capacity_ms = ?, next_ms = ?, room_ok = 0, room_next_ms = NULL WHERE pr = 1", Date.now() - ROOM_TELL_AFTER_MS - 60_000, Date.now() + 10 * 60_000);
+          await o.arm();
+          return st.storage.getAlarm();
+        });
+        expect(alarm).not.toBeNull();
+        expect(alarm! - Date.now()).toBeLessThan(2_000);
+      } finally {
+        fake.maxSandboxes = null;
+      }
+    });
+
+    it("a tell that fails backs off (no alarm due at once), and is tried again", async () => {
+      const { p } = await longWait(60_000);
+      try {
+        await within(p, async (o) => { o.tellRoom = unreachable; await o.drain(); });
+        let r = await roomRow(p);
+        expect(r.room_attempts).toBe(1);
+        expect((r.room_next_ms as number) - Date.now()).toBeGreaterThan(4_000);
+        expect(await errorsOf(p)).toEqual([]);
+        const alarm = await within(p, async (_o, st) => st.storage.getAlarm());
+        expect(alarm! - Date.now()).toBeGreaterThan(4_000);
+        // Fails again: backed off further.
+        await within(p, async (o, st) => { st.storage.sql.exec("UPDATE jobs SET room_next_ms = 0"); await o.drain(); });
+        r = await roomRow(p);
+        expect(r.room_attempts).toBe(2);
+        expect((r.room_next_ms as number) - Date.now()).toBeGreaterThan(9_000);
+        // Reachable again: told.
+        await within(p, async (o, st) => { delete o.tellRoom; st.storage.sql.exec("UPDATE jobs SET room_next_ms = 0"); await o.drain(); });
+        expect(await errorsOf(p)).toHaveLength(1);
+        expect((await roomRow(p)).room_attempts).toBe(0);
+      } finally {
+        fake.maxSandboxes = null;
+      }
+    });
+
+    it("a tell whose answer was lost is still cleared when the wait ends", async () => {
+      const { p, s } = await longWait(60_000);
+      try {
+        await within(p, async (o) => {
+          const real = o.tellRoom.bind(o);
+          o.tellRoom = async (...a: unknown[]) => { await real(...a); throw new Error("the answer was lost"); };
+          await o.drain();
+          delete o.tellRoom;
+        });
+        expect(await errorsOf(p)).toHaveLength(1);
+        fake.maxSandboxes = null;
+        await dueNow(p);
+        // (Its clear waits out the failed tell's backoff, as time passing would.)
+        await within(p, async (_o, st) => { st.storage.sql.exec("UPDATE jobs SET room_next_ms = 0 WHERE room_next_ms IS NOT NULL"); });
+        await run(p);
+        expect((await job(p, 1, s)).state).toBe("running");
+        expect(await errorsOf(p)).toEqual([]);
+      } finally {
+        fake.maxSandboxes = null;
+      }
+    });
+
+    it("told once: the project isn't asked again while the wait goes on", async () => {
+      const { p } = await longWait(60_000);
+      try {
+        await run(p);
+        expect(await errorsOf(p)).toHaveLength(1);
+        // Gone from the project (say, pruned): a later drain doesn't put it back.
+        await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => { st.storage.sql.exec("DELETE FROM errors WHERE code = 'review_waiting_for_room'"); });
+        await dueNow(p);
+        await run(p);
+        expect(await errorsOf(p)).toEqual([]);
+      } finally {
+        fake.maxSandboxes = null;
+      }
+    });
+
+    it("a clear that fails is retried, backed off, and its job isn't pruned meanwhile", async () => {
+      const { p, s } = await longWait(60_000);
+      try {
+        await run(p);
+        expect(await errorsOf(p)).toHaveLength(1);
+        await push(p, 1, sha(), { action: "synchronize" });
+        await within(p, async (o) => { o.clearRoom = unreachable; await o.drain(); });
+        expect((await job(p, 1, s)).state).toBe("superseded");
+        const r = await roomRow(p, s);
+        expect(r.room_attempts).toBe(1);
+        expect((r.room_next_ms as number) - Date.now()).toBeGreaterThan(4_000);
+        // Long past the jobs' keep: still kept while its word is owed.
+        await within(p, async (o, st) => { st.storage.sql.exec("UPDATE jobs SET updated_ms = 0 WHERE pr = 1 AND sha = ?", s); o.prune(Date.now()); });
+        expect(await within(p, async (_o, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM jobs WHERE pr = 1 AND sha = ?", s).one().n)).toBe(1);
+        await within(p, async (o, st) => { delete o.clearRoom; st.storage.sql.exec("UPDATE jobs SET room_next_ms = 0"); await o.drain(); });
+        expect(await errorsOf(p)).toEqual([]);
+      } finally {
+        fake.maxSandboxes = null;
+      }
+    });
   });
 });

@@ -153,11 +153,15 @@ const MIGRATIONS = [
   [
     // When a job began waiting, queued, for nest to have room for its reviewer (its grant's max_agents or
     // max_sandboxes); null when it isn't waiting for room. Its tries while waiting (the wait's backoff, apart
-    // from `errors`), and when the project was told it has waited long (an error the owner sees, cleared once
-    // the wait ends).
+    // from `errors`), and the project's word that it has waited long (an error the owner sees, cleared once the
+    // wait ends): when its tell began (so a tell whose answer was lost still gets its clear), whether the
+    // project took it, and the backoff of the tell or the clear while the project can't be reached.
     "ALTER TABLE jobs ADD COLUMN capacity_ms INTEGER",
     "ALTER TABLE jobs ADD COLUMN room_waits INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE jobs ADD COLUMN room_told_ms INTEGER",
+    "ALTER TABLE jobs ADD COLUMN room_ok INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN room_next_ms INTEGER",
+    "ALTER TABLE jobs ADD COLUMN room_attempts INTEGER NOT NULL DEFAULT 0",
   ],
 ] as const;
 
@@ -570,23 +574,42 @@ export class ReviewDO extends DurableObject<Env> {
     const project = this.setting("project");
     if (!project) return;
     const now = Date.now();
-    for (const j of this.sql.exec("SELECT pr, sha, capacity_ms, error FROM jobs WHERE state = 'queued' AND capacity_ms IS NOT NULL AND capacity_ms <= ? AND room_told_ms IS NULL", now - ROOM_TELL_AFTER_MS).toArray()) {
+    const due = "(room_next_ms IS NULL OR room_next_ms <= ?)";
+    const failed = (j: Row, what: string, e: unknown) => {
+      const attempts = (j.room_attempts as number) + 1;
+      // Backed off (5 s doubling to 5 min) while the project can't be reached, never a hot loop; never given up.
+      this.sql.exec("UPDATE jobs SET room_attempts = ?, room_next_ms = ? WHERE pr = ? AND sha = ?", attempts, Date.now() + backoff(attempts), j.pr, j.sha);
+      console.error(`review: ${what} for PR #${j.pr as number} (try ${attempts}): ${message(e)}`);
+    };
+    for (const j of this.sql.exec(`SELECT * FROM jobs WHERE state = 'queued' AND capacity_ms IS NOT NULL AND capacity_ms <= ? AND room_ok = 0 AND ${due}`, now - ROOM_TELL_AFTER_MS, now).toArray()) {
+      // Marked before the call: should its answer be lost, the project may have the error, and it's cleared all the same.
+      this.sql.exec("UPDATE jobs SET room_told_ms = COALESCE(room_told_ms, ?) WHERE pr = ? AND sha = ?", Date.now(), j.pr, j.sha);
       try {
-        await projectStub(this.env, project).reviewWaitingForRoom({ pr: j.pr as number, sha: j.sha as string, since_ms: j.capacity_ms as number, why: (j.error as string | null) ?? "" });
-        this.sql.exec("UPDATE jobs SET room_told_ms = ? WHERE pr = ? AND sha = ? AND room_told_ms IS NULL", Date.now(), j.pr, j.sha);
+        await this.tellRoom(project, { pr: j.pr as number, sha: j.sha as string, since_ms: j.capacity_ms as number, why: (j.error as string | null) ?? "" });
+        this.sql.exec("UPDATE jobs SET room_ok = 1, room_next_ms = NULL, room_attempts = 0 WHERE pr = ? AND sha = ?", j.pr, j.sha);
       } catch (e) {
-        console.error(`review: the project wasn't told PR #${j.pr as number}'s review waits for room: ${message(e)}`);
+        failed(j, "the project wasn't told the review waits for room", e);
       }
     }
-    for (const j of this.sql.exec("SELECT pr, sha FROM jobs WHERE room_told_ms IS NOT NULL AND (state != 'queued' OR capacity_ms IS NULL)").toArray()) {
+    for (const j of this.sql.exec(`SELECT * FROM jobs WHERE room_told_ms IS NOT NULL AND (state != 'queued' OR capacity_ms IS NULL) AND ${due}`, now).toArray()) {
       try {
-        await projectStub(this.env, project).reviewRoomCleared(j.pr as number, j.sha as string);
-        this.sql.exec("UPDATE jobs SET room_told_ms = NULL WHERE pr = ? AND sha = ?", j.pr, j.sha);
+        await this.clearRoom(project, j.pr as number, j.sha as string);
+        this.sql.exec("UPDATE jobs SET room_told_ms = NULL, room_ok = 0, room_next_ms = NULL, room_attempts = 0 WHERE pr = ? AND sha = ?", j.pr, j.sha);
       } catch (e) {
-        console.error(`review: the project's word on PR #${j.pr as number}'s wait for room wasn't cleared: ${message(e)}`);
+        failed(j, "the project's word on the wait for room wasn't cleared", e);
       }
     }
   }
+
+  /** The project's two calls for `roomUpkeep` (one place each, so a test can make the project unreachable). */
+  private tellRoom(project: string, e: { pr: number; sha: string; since_ms: number; why: string }): Promise<void> {
+    return projectStub(this.env, project).reviewWaitingForRoom(e);
+  }
+
+  private clearRoom(project: string, pr: number, sha: string): Promise<void> {
+    return projectStub(this.env, project).reviewRoomCleared(pr, sha);
+  }
+
 
   /** nest's `agent.exited` for a reviewer: without a verdict, it's started again, up to MAX_RETRIES times. */
   async onAgentExited(agent: string, reason?: string): Promise<void> {
@@ -708,8 +731,8 @@ export class ReviewDO extends DurableObject<Env> {
     // A long wait for room to tell the project of, or its word to clear (`roomUpkeep`).
     const room = this.sql.exec<{ t: number | null }>(
       `SELECT MIN(t) AS t FROM (
-        SELECT capacity_ms + ${ROOM_TELL_AFTER_MS} AS t FROM jobs WHERE state = 'queued' AND capacity_ms IS NOT NULL AND room_told_ms IS NULL
-        UNION ALL SELECT ${Date.now()} FROM jobs WHERE room_told_ms IS NOT NULL AND (state != 'queued' OR capacity_ms IS NULL))`,
+        SELECT MAX(capacity_ms + ${ROOM_TELL_AFTER_MS}, COALESCE(room_next_ms, 0)) AS t FROM jobs WHERE state = 'queued' AND capacity_ms IS NOT NULL AND room_ok = 0
+        UNION ALL SELECT COALESCE(room_next_ms, ${Date.now()}) FROM jobs WHERE room_told_ms IS NOT NULL AND (state != 'queued' OR capacity_ms IS NULL))`,
     ).one().t;
     const times = [first, deadline, room].filter((t): t is number => t !== null);
     const next = times.length ? Math.min(...times) : null;
