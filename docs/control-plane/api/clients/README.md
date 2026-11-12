@@ -7,7 +7,7 @@
 **How the built parts read the grant** (each a choice the design left open):
 - **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. The model credential is checked again at each brain start against the grant as it is then, and a client's agent runs only on that credential: if it isn't stored (or has expired) the start is refused, never moved to the operator's default token ([BrokerDO](../../durable-objects/broker/), 2026-11-06). So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
 - **Brokered actions:** only GitHub actions scoped to repos in `repos` are within a grant. An http profile (a URL and a credential no field covers), a fork (it widens the push allowlist) and an unscoped GitHub action are refused.
-- **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's: a client's route that carries one refuses it (`policy` in `POST /v1/sandboxes`, `host` in `…/start`: 403), and their own routes (`PUT /v1/sandboxes/<id>/policy`, `PUT /v1/agents/<id>/rules`, `…/ports`) take only the admin token (401).
+- **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's: a client's route that carries one refuses it (`policy` in `POST /v1/sandboxes`, `host` in `…/start`: 403), and their own routes (`PUT /v1/sandboxes/<id>/policy`, `PUT|DELETE /v1/agents/<id>/rules`, `…/ports`) take only the admin token (401).
 - **Writes into a namespace are held to its client's grant, whoever writes them,** the operator included.
 - **An mcp capability's tools are named `<client>-<entry>_<tool>`** (tool names hold no `/`). A spec where two capabilities would give the same names is refused.
 - **Deleting a client is refused while anything in its subtree lives.** Then its token stops, and its namespace and record go. Its name is held for 15 minutes (the answer's `name_free_ms`), and the cleanup runs once more before the name is free, so a request that was in flight across the delete leaves nothing a later client of that name inherits ([names](../../durable-objects/client/)).
@@ -95,8 +95,8 @@ The checks:
 | `PUT` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. Within the grant, when written and again at spawn. Its `launch.model` and `launch.effort` are [plain tokens](../../durable-objects/catalog/) (400). |
 | `DELETE` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. |
 | `GET` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. |
-| `PUT` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. Within the grant (`mcp_urls`, `credentials`, brokered actions). |
-| `DELETE` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. |
+| `PUT` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. Within the grant (`mcp_urls`, `credentials`, brokered actions). Its `rules` reach the live agents of its subtree that list it ([live rules](../../durable-objects/catalog/#live-rules)); a refused write reaches none. |
+| `DELETE` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. The live agents that read its rules have none of them from then on. |
 | `GET` | `/v1/clients/self` | Self. |
 | `PUT` | `/v1/clients/self/webhook` | Self ([events](#events-to-the-owner)). |
 | `POST` | `/v1/clients/self/github-token` | Self. Within `github` ([GitHub tokens](#github-tokens)). |
@@ -140,6 +140,7 @@ POST /v1/agents
 ## The client's catalog
 
 - **A client writes templates and capabilities in its own namespace,** `<client-name>/<entry>` (`PUT /v1/catalog/templates/<client-name>/<entry>`, and the same for capabilities). It reads its own entries and the operator's; it never writes outside its namespace.
+- **Its capabilities' rules are read live** by the agents of its subtree, after their spawner's narrowing ([live rules](../../durable-objects/catalog/#live-rules)). Rules decide only whether a call the agent's spec already gives waits for an approval, which the client answers for its own subtree, so the grant doesn't limit them; an operator's agent spawned from the client's template outside the client's subtree keeps them as at spawn.
 - **Expansion applies the grant:** an mcp capability whose URL isn't in `mcp_urls`, a repo to push to outside `repos`, a repo to read outside `repos` and `read_repos`, or a credential outside `credentials` is refused when written and again at spawn. A client's `overrides.read_repos` narrows a template's read-only repos as `overrides.repos` narrows its allowlist, and may move a repo from the allowlist to the read list (less access), never back.
 
 ## Caller identity for MCP servers
