@@ -15,17 +15,20 @@ export const NAMESPACE = "projects";
 /** The model credential every role runs on (in the grant's `credentials`). */
 const CREDENTIAL = "claude_oauth_token";
 
-/** Claude Code's web built-ins, which every role with hands launches (README.md#web-access). */
+/** Claude Code's task tools, which every role launches, and its web tools, which every role with hands does. */
+const TASK_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"] as const;
 const WEB_TOOLS = ["WebSearch", "WebFetch"] as const;
-/** Claude Code's built-in tools for every role: its own task list and the web, as nest's worker gets. */
-const BUILTIN_TOOLS = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", ...WEB_TOOLS];
+/** Claude Code's built-in tools for every role with hands: its own task list and the web, as nest's worker gets. */
+const BUILTIN_TOOLS = [...TASK_TOOLS, ...WEB_TOOLS];
 /**
- * The owner's decision (2026-11-11, README.md#web-access): the web tools run on any URL without asking.
- * nest's runner asks for a call no rule matches, and a template has no rules, so they come through the
- * role capabilities every role template lists (nest joins its capabilities' rules, first match wins).
- * No specifier: `WebFetch` alone matches every URL.
+ * The owner's decision (2026-11-11, README.md#built-in-tools): every built-in a role launches runs
+ * without asking, the web tools on any URL. nest's runner asks for a call no rule matches, and a
+ * template has no rules, so they come through the role capabilities every role template lists (nest
+ * joins its capabilities' rules, first match wins). Exact names, no specifier: `WebFetch` alone matches
+ * every URL. The worker's `Agent` is allowed by nest's `subagents`.
  */
-export const WEB_RULES: readonly { pattern: string; decision: "allow" }[] = WEB_TOOLS.map((t) => ({ pattern: t, decision: "allow" }));
+export const BUILTIN_RULES: readonly { pattern: string; decision: "allow" }[] = BUILTIN_TOOLS.map((t) => ({ pattern: t, decision: "allow" }));
+
 /**
  * A worker may also run Claude Code's own subagents (`Agent`, through nest's `subagents` capability):
  * they live in the worker's brain and reach the same sandbox through its hands, with the same grant and
@@ -98,9 +101,9 @@ function mcpCapability(base: string, server: Server, prompt: string) {
   const tools = TOOLS[server];
   return {
     prompt,
-    // Each role's capability, so every role template that launches the web tools allows them. `routine`'s
-    // reach the dreaming template too, which launches neither, so they allow nothing there.
-    rules: WEB_RULES.map((r) => ({ ...r })),
+    // Each role's capability, so every role template allows the built-ins it launches. `routine`'s reach
+    // the dreaming template too, which launches the task tools but neither web tool.
+    rules: BUILTIN_RULES.map((r) => ({ ...r })),
     mcp: {
       // No `auth`: nest sends no bearer, and the Nest-Identity token is the only credential.
       url: `${base}/mcp/${server}`,
@@ -175,7 +178,7 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
       // memory and the transcripts nest's grant lets it read (README.md#routines).
       [`${NAMESPACE}/dreaming`]: {
         capabilities: ["nest", `${NAMESPACE}/routine`],
-        launch: { builtin_tools: ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"], system_prompt: { mode: "append", text: PROMPTS.dreaming } },
+        launch: { builtin_tools: [...TASK_TOOLS], system_prompt: { mode: "append", text: PROMPTS.dreaming } },
         hands: "forbidden",
         credential: CREDENTIAL,
         ephemeral: true,
