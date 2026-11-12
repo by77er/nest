@@ -1,6 +1,7 @@
 // FleetDO: one per cell. Host enrollment, the fleet WebSocket (docs/interfaces/control-host/fleet/),
 // leases and their expiry, STONITH, placement, and command delivery with exactly-one results.
 import { DurableObject } from "cloudflare:workers";
+import { CLIENT_GUARD_PREFIX } from "../lib/client-guards";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
@@ -146,6 +147,8 @@ interface HostRow {
   wedged_ms: number | null;
   /** Its nestd keys brains by agent epoch (1), or is of the previous release (0). */
   brain_epochs: number;
+  /** Its nest-proxy bounds guarded requests (1: its last hello said so), or not yet known or of the previous release (0). */
+  guard_bounds: number;
   /** When a drain was asked for (null: none). The status says whether it is serving; this survives an expiry and a return. */
   drain_ms: number | null;
   [key: string]: SqlStorageValue;
@@ -413,6 +416,9 @@ export class FleetDO extends DurableObject<Env> {
     // The host's nestd keys brains by agent epoch (its hello says so; nestd of the previous release
     // doesn't): preferred for new brains, and the only kind escalation ever wedges.
     addColumn(this.sql, "hosts", "brain_epochs", "INTEGER NOT NULL DEFAULT 0");
+    // Its nest-proxy bounds guarded requests (its hello says so; a host of the previous release, or one
+    // not yet heard from, doesn't): API clients' request guards are refused in a cell with any host without it.
+    addColumn(this.sql, "hosts", "guard_bounds", "INTEGER NOT NULL DEFAULT 0");
     // A drain is an intent, not a liveness: a host that expires and comes back returns to `draining`.
     addColumn(this.sql, "hosts", "drain_ms", "INTEGER");
     addColumn(this.sql, "leases", "state", "TEXT");
@@ -1084,8 +1090,8 @@ export class FleetDO extends DurableObject<Env> {
     const orphans = stored === undefined ? undefined : parseOrphans(stored);
     // The host has processed every command up to `last_command_seq`; the socket starts there.
     if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
-    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ? WHERE host = ?",
-      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, att.host);
+    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ?, guard_bounds = ? WHERE host = ?",
+      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, hello.guard_bounds ? 1 : 0, att.host);
     this.setTunnelState(att.host, hello.tunnel ?? "none", prior);
     if (hello.cgroup_delegation_error) {
       console.error(`FleetDO: ${att.host} runs its VMMs outside its unit cgroup (delegation failed: ${hello.cgroup_delegation_error})`);
@@ -1708,10 +1714,13 @@ export class FleetDO extends DurableObject<Env> {
       console.error(`FleetDO: placing ${req.sandbox}, which its SandboxDO never registered; registering it now`);
       this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
     }
-    // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts.
+    // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts. A sandbox with API
+    // clients' request guards goes only to a host whose nest-proxy bounds them (`guard_bounds`): none
+    // free means no placement yet (SandboxDO retries), never one that would decide them unbounded.
     const need = req.resources;
     const cfg = this.cellConfig();
-    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: "wedged_ms IS NULL" })
+    const guarded = (req.policy.guards ?? []).some((g) => g.name.startsWith(CLIENT_GUARD_PREFIX));
+    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: guarded ? "wedged_ms IS NULL AND guard_bounds = 1" : "wedged_ms IS NULL" })
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
       .map((h) => {
         const capacity = h.capacity ? (JSON.parse(h.capacity) as Capacity) : null;
@@ -3180,6 +3189,15 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /** Host rows matching typed filters (and an optional extra SQL condition), their enums checked. */
+  /**
+   * The cell's sandbox hosts that could hold a sandbox (any not dead) whose nest-proxy isn't known to
+   * bound guarded requests: of the previous release, or not heard from since enrolling. SandboxDO
+   * refuses API clients' request guards while there is one (docs/control-plane/api/clients/#request-guards).
+   */
+  async hostsWithoutGuardBounds(): Promise<string[]> {
+    return this.hostsBy({ role: SANDBOX_ROLE, status: ["active", "draining", "expired", "stonith_pending"], where: "guard_bounds = 0" }).map((h) => h.host);
+  }
+
   private hostsBy(
     f: { status?: HostStatus | readonly HostStatus[]; role?: HostKind; where?: string; order?: "role" | "enrolled_ms" }, ...args: SqlStorageValue[]
   ): HostRow[] {

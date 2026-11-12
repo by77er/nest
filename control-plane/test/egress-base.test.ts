@@ -120,6 +120,33 @@ describe("the base egress layer", () => {
     expect((await sandboxOf(id).policy()).allow.filter((a) => a.source === "base").map((a) => a.host)).toEqual(["told.example.org"]);
   });
 
+  it("its guards are the operator's: never a client's name, counted against no client's guard budget, and no bar to a host that can't bound client guards", async () => {
+    // Over the 32 client guards a sandbox applies (SANDBOX_MAX_GUARDS), within the operator layer's 64.
+    const many = Array.from({ length: 40 }, (_, i) => ({ ...GUARD, name: `base-${i}` }));
+    const old = uniqueCell();
+    expect((await admin(base(old), { method: "PUT", body: { allow: [], guards: [{ ...GUARD, name: "client:mine" }] } })).status).toBe(400);
+    await adminJson(base(old), { method: "PUT", body: { allow: [{ host: "deb.debian.org" }], guards: many } });
+    // Only a host whose nest-proxy doesn't bound client guards: a sandbox with the base's guards is placed there.
+    const host = await connectHost(old, "sandbox", { guard_bounds: false });
+    const s = await placed(old, host.ws);
+    expect(s.create.policy.guards.map((g: { name: string }) => g.name).slice(0, many.length)).toEqual(many.map((g) => g.name));
+    // A client's guard beside them is held to its own budget alone.
+    const cell = uniqueCell();
+    await adminJson(base(cell), { method: "PUT", body: { allow: [{ host: "deb.debian.org" }], guards: many } });
+    await connectHost(cell);
+    const c = await adminJson("/v1/admin/clients", { body: { name: `ebg-${crypto.randomUUID().slice(0, 8)}`, grant: { cells: [cell], max_sandboxes: 2 } } }, 201);
+    const res = await SELF.fetch(`${BASE}/v1/sandboxes`, { method: "POST", headers: { authorization: `Bearer ${c.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ cell, guards: [{ name: "no-delete", hosts: ["deb.debian.org"], scope: [{ methods: ["DELETE"] }] }] }) });
+    expect(res.status, await res.clone().text()).toBeLessThan(300);
+    const sbx = (await res.json() as { sandbox: string }).sandbox;
+    // And on a live layer write (checked against what the sandbox holds, the base's guards among it).
+    const live = await SELF.fetch(`${BASE}/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", headers: { authorization: `Bearer ${c.token}`, "content-type": "application/json" },
+      body: JSON.stringify({ guards: [{ name: "no-delete", hosts: ["deb.debian.org"], scope: [{ methods: ["DELETE"] }] }] }) });
+    expect(live.status, await live.clone().text()).toBeLessThan(300);
+    const names = (await adminJson(`/v1/sandboxes/${sbx}/policy`)).guards.map((g: { name: string }) => g.name);
+    expect([names.slice(0, many.length), names.at(-1)]).toEqual([many.map((g) => g.name), "client:no-delete"]);
+  });
+
   it("tells at most one batch per alarm run, and picks notices a previous release's alarm dropped up again at start", async () => {
     const cell = uniqueCell();
     const fleet = fleetOf(cell);

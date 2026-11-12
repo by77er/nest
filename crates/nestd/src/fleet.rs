@@ -219,6 +219,8 @@ impl Shell {
                     last_command_seq: last_command_seq.map(Seq),
                     cgroup_delegation_error: p.cgroup_delegation_error.clone(),
                     brain_epochs: true,
+                    // nest-proxy ships with nestd: this release's bounds guarded requests.
+                    guard_bounds: true,
                     sandboxes,
                     agents,
                     capacity,

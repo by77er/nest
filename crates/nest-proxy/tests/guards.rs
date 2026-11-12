@@ -149,3 +149,30 @@ async fn a_guarded_host_is_never_spliced_or_a_tcp_exception() {
     let got = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap_or(0);
     assert_eq!(got, 0, "the exception's connection is closed, not echoed");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_target_past_the_guarded_bounds_is_refused_before_upstream() {
+    let mut env = env().await;
+    let p = guarded_policy(&env);
+    push(&mut env, p).await;
+    let long = format!("/mine/{}", "a/".repeat(300));
+    for h2 in [false, true] {
+        // On a guarded host a read is refused too: it can't be decided within the bounds.
+        let r = https_req(&env, HOST, "GET", &long, &[], b"", h2).await;
+        assert_eq!((r.status, r.body["error"].as_str()), (414, Some("request_target_too_long")), "{:?}", r.body);
+        assert!(r.body.get("body_len").is_none());
+        let query = format!("/mine/x?{}", vec!["a=1"; 300].join("&"));
+        let r = https_req(&env, HOST, "GET", &query, &[], b"", h2).await;
+        assert_eq!(r.status, 414, "{:?}", r.body);
+        // Within them it is decided as ever.
+        let r = https_req(&env, HOST, "GET", &format!("/mine/{}", "a/".repeat(200)), &[], b"", h2).await;
+        assert_eq!(r.status, 200, "{:?}", r.body);
+        // A host no guard names isn't bounded.
+        let r = https_req(&env, "api.stripe.test", "GET", &long, &[], b"", h2).await;
+        assert_eq!(r.status, 200, "{:?}", r.body);
+    }
+    env.conn
+        .wait(|e| matches!(e, ProxyEvent::Audit { records } if records.iter().any(|r|
+            r.verdict == EgressVerdict::Deny && r.reason.as_deref() == Some("guard_target_too_long"))))
+        .await;
+}
