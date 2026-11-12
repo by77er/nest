@@ -131,6 +131,17 @@ describe("asks are nest's, read when asked", () => {
     expect(await count(s)).toBe(2);
   });
 
+  it("`?local=1` answers the app's own items without reading nest", async () => {
+    const s = await setup();
+    holdAsk(s.worker, askId());
+    ok(await callTool("board", await nest.sign(agentClaims("board", s.manager, { project: s.id, role: "manager", start: "1" })), "block_task", { task: s.task, reason: "decide" }));
+    const before = fake.calls.length;
+    const r = await api(token, "GET", `/api/projects/${s.id}/attention?local=1`);
+    expect(r.status).toBe(200);
+    expect((r.body as { kind: string }[]).map((x) => x.kind)).toEqual(["blocked"]);
+    expect(fake.calls.slice(before).filter((c) => c.path.includes("/asks"))).toEqual([]);
+  });
+
   it("lists what was blocked while nest was being read (the app's own items are read after the await)", async () => {
     const s = await setup();
     let release!: () => void;

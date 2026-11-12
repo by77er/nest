@@ -449,6 +449,11 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       // Sends again a message nest refused for good; one still being sent is left as it is (README.md#outboxes).
       return done(await p.retryChat(Number(rest[1])));
     case "GET attention": {
+      // `?local=1`: the app's own items only, without reading nest (the page shows them while the asks load).
+      if (url.searchParams.get("local") === "1") {
+        const l = (await p.localAttention()) as Result<{ kind: string; at_ms: number }[]>;
+        return l.ok ? json([...l.value, ...(await reviewItems(env, pid))].sort((x, y) => x.at_ms - y.at_ms)) : err(l.status, l.error);
+      }
       const a = await attentionOf(env, pid);
       return a.ok ? json(a.value) : err(a.status, a.error);
     }

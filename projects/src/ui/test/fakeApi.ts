@@ -128,7 +128,8 @@ export class FakeApi {
     const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     if (method !== "GET") this.writes.push({ method, path: url.pathname, body });
     else this.reads.push(url.pathname);
-    for (const h of this.holds) if (h.match.test(`${method} ${url.pathname}`)) await h.until;
+    // Matched with the query too, so a hold can tell `…/attention?local=1` from `…/attention`.
+    for (const h of this.holds) if (h.match.test(`${method} ${url.pathname}${url.search}`)) await h.until;
     const f = this.failures.findIndex((x) => x.match.test(`${method} ${url.pathname}`));
     if (f >= 0) {
       const [x] = this.failures.splice(f, 1);
@@ -306,7 +307,8 @@ export class FakeApi {
       case "GET asks":
         return json(this.asks);
       case "GET attention":
-        return json(this.attention());
+        // `?local=1`: the app's own items only (nothing read from nest).
+        return json(this.url?.searchParams.get("local") === "1" ? this.attention().filter((x) => x.kind !== "ask" && x.kind !== "asks_unavailable") : this.attention());
       // Triage (README.md#triage).
       case "GET issues":
         return json(this.issues);

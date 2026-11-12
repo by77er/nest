@@ -2,7 +2,7 @@
 // the right), then its content `lg` below. `dense` is a panel's or a context column's: an h4 and `sm` below.
 
 import { Badge, Group, Stack, Text, Title } from "@mantine/core";
-import { type ReactNode, useId } from "react";
+import { type ReactNode, type Ref, useId } from "react";
 import { icon as iconSize, type Role } from "../theme";
 
 export interface SectionProps {
@@ -21,10 +21,12 @@ export interface SectionProps {
   region?: boolean;
   /** Takes a column's whole height, its content the rest below the heading (a trace beside a task). */
   fill?: boolean;
+  /** The heading, made focusable from script (`tabIndex={-1}`): where focus goes when the thing it was on leaves. */
+  headingRef?: Ref<HTMLHeadingElement>;
   children?: ReactNode;
 }
 
-export function Section({ title, count, actions, dense = false, order, region = true, icon: Icon, iconColor = "gray", fill = false, children }: SectionProps) {
+export function Section({ title, count, actions, dense = false, order, region = true, icon: Icon, iconColor = "gray", fill = false, headingRef, children }: SectionProps) {
   const id = useId();
   return (
     <Stack gap={dense ? "sm" : "lg"} component={region ? "section" : "div"} aria-labelledby={region ? id : undefined} data-ds="section" miw={0} style={fill ? { height: "100%", minHeight: 0 } : undefined}>
@@ -35,7 +37,7 @@ export function Section({ title, count, actions, dense = false, order, region = 
               <Icon size={iconSize.lg} aria-hidden />
             </Text>
           )}
-          <Title order={order ?? (dense ? 4 : 3)} id={id}>
+          <Title order={order ?? (dense ? 4 : 3)} id={id} ref={headingRef} tabIndex={headingRef ? -1 : undefined}>
             {title}
           </Title>
           {count !== undefined && (

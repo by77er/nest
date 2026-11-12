@@ -8,7 +8,7 @@ import { useAnswerAsk } from "../../api/queries";
 import type { Ask } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
-import { icon, MetaItem, MetaRow, Prose, Row, Stack, Toolbar } from "../../layout";
+import { ButtonBusy, icon, MetaItem, MetaRow, Prose, Row, Stack, Toolbar } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
 
 /** nest's approval: `{name, tool}` of the call it held (docs/agents/tools/#taint-and-sinks). */
@@ -18,11 +18,21 @@ export function approvalOf(a: Ask): { name: string; tool: string | null } | null
   return { name: x.name, tool: typeof x.tool === "string" ? x.tool : null };
 }
 
-export function AskItem({ projectId, ask }: { projectId: string; ask: Ask }) {
-  const answer = useAnswerAsk(projectId);
+/**
+ * `onSettled`: the answer was taken (`answered`) or refused as no longer open (`gone`: answered elsewhere, or
+ * its agent ended); either way the item leaves. A failure otherwise keeps it, and is announced as one.
+ */
+export function AskItem({ projectId, ask, onSettled }: { projectId: string; ask: Ask; onSettled?: (how: "answered" | "gone") => void }) {
+  const answer = useAnswerAsk(projectId, onSettled);
   const [text, setText] = useState("");
   const approval = approvalOf(ask);
-  const send = (a: string) => answer.mutate({ ask: ask.ask, answer: a });
+  const pending = answer.isPending;
+  // While one is out, the buttons stay focusable (`aria-disabled`, not `disabled`), so focus isn't lost; a press does nothing.
+  const send = (a: string) => {
+    if (pending) return;
+    answer.mutate({ ask: ask.ask, answer: a });
+  };
+  const busy = (which: string) => (pending && answer.variables?.answer === which ? <ButtonBusy /> : null);
 
   return (
     <Stack gap="sm" data-ask={ask.ask}>
@@ -52,10 +62,10 @@ export function AskItem({ projectId, ask }: { projectId: string; ask: Ask }) {
       {ask.question && (ask.role === "manager" && !ask.previous ? <RichMessage text={ask.question} projectId={projectId} /> : <Prose>{ask.question}</Prose>)}
       {approval ? (
         <Toolbar align="start">
-          <Button color="success" leftSection={<IconCheck size={icon.md} />} loading={answer.isPending && answer.variables?.answer === "approve"} disabled={answer.isPending} onClick={() => send("approve")}>
+          <Button color="success" leftSection={busy("approve") ?? <IconCheck size={icon.md} />} aria-disabled={pending || undefined} aria-busy={busy("approve") ? true : undefined} data-pending={pending || undefined} onClick={() => send("approve")}>
             Approve
           </Button>
-          <Button color="danger" leftSection={<IconX size={icon.md} />} loading={answer.isPending && answer.variables?.answer === "deny"} disabled={answer.isPending} onClick={() => send("deny")}>
+          <Button color="danger" leftSection={busy("deny") ?? <IconX size={icon.md} />} aria-disabled={pending || undefined} aria-busy={busy("deny") ? true : undefined} data-pending={pending || undefined} onClick={() => send("deny")}>
             Deny
           </Button>
         </Toolbar>
@@ -68,7 +78,7 @@ export function AskItem({ projectId, ask }: { projectId: string; ask: Ask }) {
         >
           <Row gap="sm" align="flex-end" wrap="nowrap">
             <Textarea flex={1} label="Your answer" autosize minRows={1} maxRows={6} maxLength={20000} value={text} onChange={(e) => setText(e.currentTarget.value)} />
-            <Button type="submit" loading={answer.isPending} disabled={!text.trim()}>
+            <Button type="submit" leftSection={pending ? <ButtonBusy /> : undefined} aria-disabled={pending || undefined} aria-busy={pending || undefined} data-pending={pending || undefined} disabled={!text.trim()}>
               Answer
             </Button>
           </Row>

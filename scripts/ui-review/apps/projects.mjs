@@ -720,6 +720,16 @@ const app = {
     { name: "board-keyboard-move", section: "project", path: "/projects/prj_demo/board", full: false, after: async (p) => { const g = p.getByRole("button", { name: "Move Cache gadget thumbnails" }); await g.scrollIntoViewIfNeeded(); await g.focus(); await p.keyboard.press("Space"); await p.waitForTimeout(150); await p.keyboard.press("ArrowDown"); await p.waitForTimeout(300); await p.keyboard.press("Space"); await p.waitForTimeout(400); }, check: keyboardMoved, checkName: "board-list" },
     { name: "board-long", section: "project", path: "/projects/prj_demo/board", fixture: "long" },
     { name: "board-needs-you-all", section: "project", path: "/projects/prj_demo/board", after: (p) => p.getByRole("button", { name: /Show all/ }).click() },
+    // "Needs you" read from nest (README.md#asks): loading, nest failing, and answering (focus, flicker, copy).
+    { name: "asks-loading", section: "project", path: "/projects/prj_demo/board", after: async (p) => { await asksHold(p); }, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-failed", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: async (p) => { await asksFail(p, true); }, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-failed-later", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: asksFailLater, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-answered", section: "project", path: "/projects/prj_demo/board", after: (p) => asksAnswer(p, 200), check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-answer-gone", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: (p) => asksAnswer(p, 409), check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-answer-failed", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: (p) => asksAnswer(p, 502), check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-question-failed", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: (p) => asksQuestion(p, 502), check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-question-answered", section: "project", path: "/projects/prj_demo/board", after: (p) => asksQuestion(p, 200), check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-projects-failed", section: "top", path: "/projects", httpErrors: true, after: async (p) => { await asksFail(p, true); }, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
     // The task drawer: details and the worker's trace (history and live), side by side from `xl`, tabs below.
     { name: "drawer", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, check: traceCheck, checkName: "trace" },
     { name: "drawer-trace-tab", section: "project", path: "/projects/prj_demo/board?task=tsk_demo7", full: false, widths: [1280, 390], after: traceTab, check: traceCheck, checkName: "trace" },
@@ -955,3 +965,170 @@ const app = {
   ],
 };
 export default app;
+
+// --- "Needs you" read from nest (README.md#asks): loading, nest failing, and answering -----------------
+// Each state's `check` reports what's wrong (an empty list passes): the panel and counts it should show, no
+// flicker of an answered item, and focus never dropped to the page.
+const ASKS_RE = /^\/api\/projects\/prj_demo\/(asks|attention)$/;
+const NEST_ERROR = "nest couldn't list the agents' asks: nest answered 503: internal (fixture)";
+const isLocal = (u) => u.searchParams.get("local") === "1";
+const panelOf = (p) => p.locator('section[aria-label="Needs you"]');
+/** The sidebar's own Board-row badges (not the switcher's list), by marker. */
+const sidebarBadges = (p, marker) => p.locator(`nav[aria-label="Main"] [data-marker=${marker}]`).filter({ hasNot: p.locator(".mantine-Combobox-dropdown") });
+const focusOf = (p) => p.evaluate(() => {
+  const a = document.activeElement;
+  if (!a || a === document.body) return "body";
+  return `${a.tagName.toLowerCase()}${a.getAttribute("aria-label") ? `[${a.getAttribute("aria-label")}]` : ""} "${(a.textContent ?? "").trim().slice(0, 40)}"`;
+});
+/** The projects list answering every project's count as unknown (nest unreadable). */
+async function countsUnknown(p) {
+  await p.route((u) => u.pathname === "/api/projects", (r) => r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ projects: fixed("demo", "/projects").projects.map((x) => ({ ...x, needs_you: x.id === "prj_demo" ? null : x.needs_you })) }) }));
+}
+async function asksHold(p) {
+  // The full read (asks from nest) never answers; the app's own items (`?local=1`) do.
+  await p.route((u) => ASKS_RE.test(u.pathname) && !isLocal(u), () => new Promise(() => {}));
+  await p.goto(p.url(), { waitUntil: "domcontentloaded" });
+  await p.locator("h1").first().waitFor();
+  await p.waitForTimeout(1500);
+  const notes = [];
+  if (!(await panelOf(p).count())) notes.push("loading: the app's own items aren't shown while nest's asks load");
+  else if (await panelOf(p).locator("[data-ask]").count()) notes.push("loading: an ask is shown before nest was read");
+  p.asksNotes = notes;
+}
+/** nest unreadable: the Worker lists the app's own items with the marker, `GET …/asks` is 502, the count unknown. */
+async function asksFail(p, reload) {
+  await p.route((u) => ASKS_RE.test(u.pathname), (r) => {
+    const u = new URL(r.request().url());
+    if (u.pathname.endsWith("/asks")) return r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: NEST_ERROR }) });
+    const own = fixed("demo", "/projects/prj_demo/attention").filter((x) => x.kind !== "ask");
+    return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(isLocal(u) ? own : [{ kind: "asks_unavailable", error: NEST_ERROR, at_ms: 0 }, ...own]) });
+  });
+  await countsUnknown(p);
+  if (reload) {
+    await p.goto(p.url(), { waitUntil: "domcontentloaded" });
+    await p.locator("h1").first().waitFor();
+  }
+  await p.waitForTimeout(reload ? 3000 : 13000);
+  const notes = [];
+  if (p.url().endsWith("/projects")) {
+    if (!(await p.locator("[data-marker=needs-you-unknown]").count())) notes.push("failed: the projects list doesn't say the count is unknown");
+    if (await p.locator("[data-marker=needs-you]").count()) notes.push("failed: the projects list shows a count it couldn't check");
+  } else {
+    const panel = panelOf(p);
+    if (!(await panel.count())) notes.push("failed: 'Needs you' is gone (the app's own items must stay)");
+    else {
+      if (!(await panel.locator("[data-asks-unavailable]").count())) notes.push("failed: 'Needs you' doesn't say the asks couldn't be read");
+      if (await panel.locator("[data-ask]").count()) notes.push("failed: an ask is shown though nest couldn't be read");
+    }
+    if (!(await sidebarBadges(p, "needs-you-unknown").count())) notes.push("failed: the Board row's badge doesn't say the count is unknown");
+    if (await sidebarBadges(p, "needs-you").count()) notes.push("failed: the Board row shows a count it couldn't check");
+  }
+  p.asksNotes = notes;
+}
+/** A good read, then the Worker itself failing (502) for "Needs you", and the count unknown: the panel says it shows that read. */
+async function asksFailLater(p) {
+  await p.getByRole("button", { name: /Show all/ }).click();
+  await p.route((u) => ASKS_RE.test(u.pathname) && !isLocal(u), (r) => r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "the Worker is unavailable (fixture)" }) }));
+  await countsUnknown(p);
+  await p.waitForTimeout(13000); // past a poll of each (5 s, 10 s), and their retries
+  const notes = [];
+  const panel = panelOf(p);
+  if (!(await panel.count())) notes.push("failed later: 'Needs you' vanished");
+  else if (!(await panel.locator("[data-stale]").count())) notes.push("failed later: 'Needs you' shows an earlier read without saying so");
+  if (await sidebarBadges(p, "needs-you").count()) notes.push("failed later: the Board row's count disagrees (it shows a number while the panel's read is stale)");
+  p.asksNotes = notes;
+}
+/** Serves asks and attention without `gone` from the moment `drop()` is called. */
+async function asksServe(p, ask) {
+  let dropped = false;
+  await p.route((u) => ASKS_RE.test(u.pathname), (r) => {
+    const u = new URL(r.request().url());
+    const body = fixed("demo", u.pathname.replace(/^\/api/, "")).filter((x) => !(dropped && x.ask === ask) && !(isLocal(u) && (x.kind === "ask" || x.kind === "asks_unavailable")));
+    return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  });
+  return () => { dropped = true; };
+}
+/** Watches the ask's item from now on: every time it appears or disappears. */
+async function watchAsk(p, ask) {
+  await p.evaluate((ask) => {
+    window.__askLog = [];
+    let was = !!document.querySelector(`[data-ask=${ask}]`);
+    new MutationObserver(() => {
+      const now = !!document.querySelector(`[data-ask=${ask}]`);
+      if (now !== was) { window.__askLog.push({ t: Math.round(performance.now()), present: now }); was = now; }
+    }).observe(document.body, { subtree: true, childList: true });
+  }, ask);
+}
+async function asksAnswer(p, status) {
+  await p.getByRole("button", { name: /Show all/ }).click();
+  await p.waitForTimeout(400);
+  const drop = await asksServe(p, "ask_A1");
+  await p.route((u) => u.pathname === "/api/projects/prj_demo/asks/ask_A1/answer", async (r) => {
+    await new Promise((res) => setTimeout(res, 600));
+    if (status === 200) { drop(); return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ delivered: "async" }) }); }
+    if (status === 409) { drop(); return r.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ error: "this ask isn't open any more: it was answered, or its agent ended" }) }); }
+    return r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "nest is unavailable (fixture)" }) });
+  });
+  const item = p.locator("[data-ask=ask_A1]");
+  await item.scrollIntoViewIfNeeded();
+  await watchAsk(p, "ask_A1");
+  const approve = item.getByRole("button", { name: "Approve" });
+  await approve.focus();
+  await p.keyboard.press("Enter");
+  await p.waitForTimeout(250);
+  const during = await focusOf(p);
+  // The native `disabled` (which drops focus), not `aria-disabled` (which Playwright's isDisabled also counts).
+  const disabled = await approve.evaluate((b) => b.disabled);
+  // The answer is back (600 ms): a failure's notification is up now (it closes itself after 4 s).
+  await p.waitForTimeout(1200);
+  const toast = await p.getByText("The answer wasn't sent").count();
+  await p.waitForTimeout(6000); // the re-read, and a poll after it
+  const log = await p.evaluate(() => window.__askLog);
+  const after = await focusOf(p);
+  const notes = [];
+  if (during === "body" || disabled) notes.push(`answer ${status}: focus dropped to the page while sending (disabled: ${disabled})`);
+  if (after === "body") notes.push(`answer ${status}: focus dropped to the page after the answer`);
+  if (status === 502) {
+    if (log.length !== 0) notes.push(`answer 502: the ask's item came and went (${JSON.stringify(log)}); it must stay`);
+    if (!after.includes("Approve")) notes.push(`answer 502: focus isn't back on Approve (${after})`);
+  } else if (log.length !== 1 || log[0].present) notes.push(`answer ${status}: the ask's item should leave once, it changed ${log.length} times (flicker): ${JSON.stringify(log)}`);
+  if (status === 409) {
+    if (!(await panelOf(p).locator("[data-note]").filter({ hasText: "Already answered" }).count())) notes.push("answer 409: no neutral 'Already answered' note in 'Needs you'");
+    if (toast) notes.push("answer 409: shown as a failure ('The answer wasn't sent')");
+  }
+  if (status === 502 && !toast) notes.push("answer 502: the failure isn't announced");
+  p.asksNotes = notes;
+}
+async function asksQuestion(p, status) {
+  await p.getByRole("button", { name: /Show all/ }).click();
+  await p.waitForTimeout(400);
+  const drop = await asksServe(p, "ask_A2");
+  await p.route((u) => u.pathname === "/api/projects/prj_demo/asks/ask_A2/answer", async (r) => {
+    await new Promise((res) => setTimeout(res, 600));
+    if (status === 200) { drop(); return r.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ delivered: "async" }) }); }
+    return r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "nest is unavailable (fixture)" }) });
+  });
+  const item = p.locator("[data-ask=ask_A2]");
+  await item.scrollIntoViewIfNeeded();
+  await watchAsk(p, "ask_A2");
+  const box = item.getByRole("textbox", { name: "Your answer" });
+  await box.click();
+  await box.fill("Prefix, please.");
+  await item.getByRole("button", { name: "Answer" }).focus();
+  await p.keyboard.press("Enter");
+  await p.waitForTimeout(250);
+  const during = await focusOf(p);
+  await p.waitForTimeout(7000);
+  const log = await p.evaluate(() => window.__askLog);
+  const after = await focusOf(p);
+  const notes = [];
+  if (during === "body") notes.push(`question ${status}: focus dropped to the page while sending`);
+  if (after === "body") notes.push(`question ${status}: focus dropped to the page after the answer`);
+  if (status === 200 && (log.length !== 1 || log[0].present)) notes.push(`question 200: the item should leave once, it changed ${log.length} times: ${JSON.stringify(log)}`);
+  if (status === 502) {
+    if (log.length) notes.push(`question 502: the item came and went (${JSON.stringify(log)})`);
+    const kept = (await item.count()) ? await box.inputValue() : "(item gone)";
+    if (kept !== "Prefix, please.") notes.push(`question 502: what was typed wasn't kept (${kept})`);
+  }
+  p.asksNotes = notes;
+}

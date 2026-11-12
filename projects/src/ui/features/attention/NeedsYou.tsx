@@ -6,8 +6,8 @@
 
 import { Button, Collapse, Divider, Text, Textarea } from "@mantine/core";
 import { IconAlertTriangle } from "@tabler/icons-react";
-import { useState } from "react";
-import { useAnswerBlocked, useAttention, useProject } from "../../api/queries";
+import { useLayoutEffect, useRef, useState } from "react";
+import { useAnswerBlocked, useAttention, useLocalAttention, useProject } from "../../api/queries";
 import { splitAttention, type Waiting } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
@@ -21,8 +21,8 @@ import { SecretRequestItem } from "./SecretRequestItem";
 
 type BlockedItem = Extract<Waiting, { kind: "blocked" }>;
 
-function BlockedTask({ projectId, item }: { projectId: string; item: BlockedItem }) {
-  const answer = useAnswerBlocked(projectId);
+function BlockedTask({ projectId, item, onAnswered }: { projectId: string; item: BlockedItem; onAnswered: () => void }) {
+  const answer = useAnswerBlocked(projectId, onAnswered);
   const [text, setText] = useState("");
   return (
     <Stack gap="sm" data-blocked={item.task}>
@@ -73,12 +73,12 @@ function BlockedTask({ projectId, item }: { projectId: string; item: BlockedItem
 /** How many items show before "Show all": enough to act on, without pushing the board below the fold. */
 export const SHOWN = 3;
 
-function Item({ projectId, x, first, explain }: { projectId: string; x: Waiting; first: boolean; explain: boolean }) {
+function Item({ projectId, x, first, explain, onFocus, onAskSettled }: { projectId: string; x: Waiting; first: boolean; explain: boolean; onFocus: () => void; onAskSettled: (how: "answered" | "gone") => void }) {
   const project = useProject(projectId);
   return (
-    <Stack gap="lg">
+    <Stack gap="lg" data-key={keyOf(x)} onFocusCapture={onFocus}>
       {!first && <Divider />}
-      {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} /> : x.kind === "blocked" ? <BlockedTask projectId={projectId} item={x} />
+      {x.kind === "ask" ? <AskItem projectId={projectId} ask={x} onSettled={onAskSettled} /> : x.kind === "blocked" ? <BlockedTask projectId={projectId} item={x} onAnswered={() => onAskSettled("answered")} />
         : x.kind === "review_backlog" ? <ReviewBacklogItem count={x.count} at_ms={x.at_ms} />
         : x.kind === "review" ? <HeldReviewItem projectId={projectId} repo={project.data?.repo} item={x} full={explain} />
         : x.kind === "triage" ? <TriageItem projectId={projectId} issues={x.count} proposals={x.proposals} at_ms={x.at_ms} /> : <SecretRequestItem projectId={projectId} item={x} />}
@@ -123,20 +123,61 @@ function TriageItem({ projectId, issues, proposals, at_ms }: { projectId: string
   );
 }
 
+/** What the item that had focus leaves it to: the next item's first control (or the one before), else the heading. */
+function refocus(panel: HTMLElement | null, heading: HTMLElement | null, prev: readonly string[], now: readonly string[], lost: string): void {
+  const active = document.activeElement;
+  if (active && active !== document.body && panel?.contains(active)) return; // focus is still somewhere in the panel
+  const at = prev.indexOf(lost);
+  const next = prev.slice(at + 1).find((k) => now.includes(k)) ?? prev.slice(0, at).reverse().find((k) => now.includes(k));
+  const target = next ? panel?.querySelector<HTMLElement>(`[data-key="${next}"] :is(button, textarea, a[href])`) : null;
+  target?.focus();
+  if (!target || document.activeElement !== target) heading?.focus();
+}
+
 export function NeedsYou({ projectId }: { projectId: string }) {
   const attention = useAttention(projectId);
+  // The app's own items, read without nest, show until the first full read (asks included) arrives.
+  const local = useLocalAttention(projectId, attention.data === undefined);
   const [all, setAll] = useState(false);
+  // What the owner's last answer here came to: a note for an ask answered elsewhere meanwhile; and once they've
+  // answered one, the panel stays (saying nothing else waits) so focus has somewhere to go.
+  const [note, setNote] = useState<string | null>(null);
+  const [answered, setAnswered] = useState(false);
+  const panel = useRef<HTMLDivElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
+  const focused = useRef<string | null>(null);
   // Oldest first, as the Worker answers; the rest behind "Show all", collapsing in 180 ms.
-  const split = splitAttention(attention.data);
+  const split = splitAttention(attention.data ?? local.data);
   const items = [...split.items].sort((a, b) => a.at_ms - b.at_ms);
-  if (items.length === 0 && split.asksError === null) return null;
+  const keys = items.map(keyOf);
+  const shownKeys = useRef<string[]>(keys);
+  // An item that had focus left (answered, or gone): focus goes on from where it was, never to the page.
+  useLayoutEffect(() => {
+    const prev = shownKeys.current;
+    shownKeys.current = keys;
+    const lost = focused.current;
+    if (lost && prev.includes(lost) && !keys.includes(lost)) {
+      focused.current = null;
+      refocus(panel.current, heading.current, prev, keys, lost);
+    }
+  });
+  const settled = (how: "answered" | "gone") => {
+    setAnswered(true);
+    setNote(how === "gone" ? "Already answered: it was answered elsewhere, or its agent ended." : null);
+  };
+  // A poll that failed after a good read: what's shown is that read, said so.
+  const stale = attention.isRefetchError ? attention.dataUpdatedAt : null;
+  if (items.length === 0 && split.asksError === null && stale === null && !answered) return null;
   // The held reviews' explanation is said once, on the first of them.
   const firstHeld = items.find((x) => x.kind === "review");
   const shown = items.slice(0, SHOWN);
   const rest = items.slice(SHOWN);
+  const item = (x: Waiting, first: boolean) => (
+    <Item key={keyOf(x)} projectId={projectId} x={x} first={first} explain={x === firstHeld} onFocus={() => (focused.current = keyOf(x))} onAskSettled={settled} />
+  );
   return (
-    <Panel tone="warning" component="section" aria-label="Needs you" aria-live="polite">
-      <Section title="Needs you" count={items.length} icon={IconAlertTriangle} iconColor="warning" region={false}>
+    <Panel ref={panel} tone="warning" component="section" aria-label="Needs you" aria-live="polite">
+      <Section title="Needs you" count={items.length} icon={IconAlertTriangle} iconColor="warning" region={false} headingRef={heading}>
         <Stack gap="lg">
           {/* nest couldn't be read for the agents' asks: what's listed is the rest, and the next poll tries again. */}
           {split.asksError !== null && (
@@ -144,17 +185,26 @@ export function NeedsYou({ projectId }: { projectId: string }) {
               The agents' asks couldn't be read from nest, so any they have aren't listed here. Trying again.
             </Text>
           )}
-          {shown.map((x, i) => (
-            <Item key={keyOf(x)} projectId={projectId} x={x} first={i === 0} explain={x === firstHeld} />
-          ))}
+          {stale !== null && (
+            <Text fz="sm" c="dimmed" data-stale title={exact(stale)}>
+              Couldn't refresh from nest; showing what was read {ago(stale)}. Trying again.
+            </Text>
+          )}
+          {note !== null && (
+            <Text fz="sm" c="dimmed" role="status" data-note>
+              {note}
+            </Text>
+          )}
+          {items.length === 0 && split.asksError === null && (
+            <Text fz="sm" c="dimmed">
+              Nothing else waits on you.
+            </Text>
+          )}
+          {shown.map((x, i) => item(x, i === 0))}
           {rest.length > 0 && (
             <>
               <Collapse expanded={all} transitionDuration={motion.base} id={`needs-you-rest-${projectId}`}>
-                <Stack gap="lg">
-                  {rest.map((x) => (
-                    <Item key={keyOf(x)} projectId={projectId} x={x} first={false} explain={x === firstHeld} />
-                  ))}
-                </Stack>
+                <Stack gap="lg">{rest.map((x) => item(x, false))}</Stack>
               </Collapse>
               <Row>
                 <Button variant="subtle" color="gray" onClick={() => setAll((a) => !a)} aria-expanded={all} aria-controls={`needs-you-rest-${projectId}`}>

@@ -8,6 +8,13 @@ import { renderApp } from "../../test/render";
 
 const panel = () => screen.findByRole("region", { name: "Needs you" });
 const gone = () => expect(screen.queryByRole("region", { name: "Needs you" })).toBeNull();
+/** The last item answered here: it leaves, the panel stays saying nothing else waits, and focus is on its heading. */
+const answeredLast = async () => {
+  const p = await panel();
+  await waitFor(() => expect(p.querySelector("[data-ask], [data-blocked]")).toBeNull());
+  expect(p).toHaveTextContent("Nothing else waits on you.");
+  expect(within(p).getByRole("heading", { name: "Needs you" })).toHaveFocus();
+};
 
 describe("asks", () => {
   it("an approval: approve is green and sends approve; the ask then leaves", async () => {
@@ -27,7 +34,7 @@ describe("asks", () => {
     expect(within(p).getByRole("button", { name: "Deny" }).getAttribute("style")).toContain("--mantine-color-danger-");
 
     await user.click(approve);
-    await waitFor(gone);
+    await answeredLast();
     expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/asks/${a.ask}/answer`, body: { answer: "approve" } }]);
   });
 
@@ -41,8 +48,74 @@ describe("asks", () => {
     api.asks = [];
     api.fail(/\/answer$/, 409, "this ask isn't open any more: it was answered, or its agent ended");
     await user.click(within(p).getByRole("button", { name: "Approve" }));
-    // Well before the next poll (5 s).
-    await waitFor(gone, { timeout: 1_500 });
+    // Well before the next poll (5 s); said in the panel, calmly, not as a failure.
+    await waitFor(() => expect(p.querySelector("[data-ask]")).toBeNull(), { timeout: 1_500 });
+    expect(within(p).getByRole("status")).toHaveTextContent("Already answered: it was answered elsewhere, or its agent ended.");
+    expect(screen.queryByText("The answer wasn't sent")).toBeNull();
+    expect(within(p).getByRole("heading", { name: "Needs you" })).toHaveFocus();
+  });
+
+  it("answering one moves focus to the next item, never to the page", async () => {
+    const api = new FakeApi();
+    const first = ask({ approval: { name: "brokered", tool: "WebFetch" }, at_ms: Date.now() - 2_000 });
+    const second = ask({ approval: { name: "brokered", tool: "WebSearch" }, at_ms: Date.now() - 1_000 });
+    api.asks = [first, second];
+    const { user } = renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    const approve = within(p.querySelector(`[data-ask="${first.ask}"]`) as HTMLElement).getByRole("button", { name: "Approve" });
+    approve.focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(p.querySelector(`[data-ask="${first.ask}"]`)).toBeNull());
+    expect(within(p.querySelector(`[data-ask="${second.ask}"]`) as HTMLElement).getByRole("button", { name: "Approve" })).toHaveFocus();
+  });
+
+  it("an answer that fails keeps focus on its button, which stays focusable while the answer is out", async () => {
+    const api = new FakeApi();
+    const a = ask({ approval: { name: "brokered", tool: "WebFetch" } });
+    api.asks = [a];
+    let release!: () => void;
+    api.holds.push({ match: /\/answer$/, until: new Promise((r) => (release = () => r(undefined))) });
+    api.fail(/\/answer$/, 502, "nest is unavailable");
+    const { user } = renderApp("/projects/prj_one/board", api);
+    const approve = within(await panel()).getByRole("button", { name: "Approve" });
+    approve.focus();
+    await user.keyboard("{Enter}");
+    await waitFor(() => expect(approve).toHaveAttribute("aria-disabled", "true"));
+    expect(approve).not.toBeDisabled();
+    expect(approve).toHaveFocus();
+    // A second press while it's out sends nothing more.
+    await user.keyboard("{Enter}");
+    release();
+    expect(await screen.findByText("nest is unavailable")).toBeInTheDocument();
+    await waitFor(() => expect(approve).not.toHaveAttribute("aria-disabled"));
+    expect(approve).toHaveFocus();
+    expect(api.writes).toHaveLength(1);
+  });
+
+  it("the app's own items show while nest's asks are still being read", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Later?" })];
+    api.tasks = [task({ title: "Pick a region", blocked: { at_ms: Date.now() - 1_000, by: "agt_w1", role: "worker", reason: "which region?", question: null, tainted: false } })];
+    let release!: () => void;
+    api.holds.push({ match: /^GET \/api\/projects\/prj_one\/attention$/, until: new Promise((r) => (release = () => r(undefined))) });
+    renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    expect(p).toHaveTextContent("Pick a region");
+    expect(p).not.toHaveTextContent("Later?");
+    release();
+    await waitFor(() => expect(p).toHaveTextContent("Later?"));
+  });
+
+  it("a poll that fails after a good read says it shows that read", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Still here?" })];
+    const { queryClient } = renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    expect(p).toHaveTextContent("Still here?");
+    api.fail(/GET .*\/attention$/, 502, "the Worker is unavailable");
+    await queryClient.refetchQueries({ queryKey: ["projects", "prj_one", "attention"], exact: true });
+    await waitFor(() => expect(p).toHaveTextContent(/Couldn't refresh from nest; showing what was read/));
+    expect(p).toHaveTextContent("Still here?");
   });
 
   it("nest unreadable: the rest is listed, with a line saying the asks couldn't be read", async () => {
@@ -114,7 +187,7 @@ describe("asks", () => {
     expect(await screen.findByText("nest is unavailable")).toBeInTheDocument();
     expect(within(await panel()).getByLabelText("Your answer")).toHaveValue("main");
     await user.click(within(await panel()).getByRole("button", { name: "Answer" }));
-    await waitFor(gone);
+    await answeredLast();
     expect(api.writes.map((w) => w.body)).toEqual([{ answer: "main" }, { answer: "main" }]);
   });
 
@@ -148,7 +221,7 @@ describe("asks", () => {
     const p = await panel();
     await user.type(within(p).getByLabelText(/Your answer/), "use eu-west-1");
     await user.click(within(p).getByRole("button", { name: "Answer" }));
-    await waitFor(gone);
+    await answeredLast();
     expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/tasks/${t.id}/answer`, body: { answer: "use eu-west-1" } }]);
   });
 
