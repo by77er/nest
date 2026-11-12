@@ -25,7 +25,7 @@ accept (listener ⇒ sandbox [, agent])
 - **Explicit proxy CONNECT:** every tunnel must carry TLS whose SNI matches the CONNECT authority. Plaintext tunnels are denied (plain HTTP goes as absolute-form requests, which get the same Host checks). A denied CONNECT is still accepted and answered *inside* the tunnel with the readable 403, because clients like curl hide a CONNECT error body.
 - **Guest-controlled names** (SNI, Host, CONNECT authority) are validated as DNS names or IP literals (≤253 bytes) before policy, and every string the proxy reports to nestd is length-capped. An oversized event is dropped, never sent: it would take down the control link for the whole host.
 - **Non-public addresses are refused** by the proxy before any policy applies ([policy](policy/#hard-deny)). A second refusal by a kernel rule on the proxy's uid, since the proxy runs where IMDS is reachable, is designed, not built ([steering](steering/#kernel-backstop)).
-- **One proxy, many sandboxes:** TLS handshakes and leaf signing are bounded per sandbox as well as globally, and (designed) request headers per connection, so one sandbox can't starve the others ([tls](tls/#shared-proxy-fairness), [inspection](inspection/)).
+- **One proxy, many sandboxes** (designed, not built): TLS handshakes and leaf signing are bounded per sandbox as well as globally, and request headers per connection, so one sandbox can't starve the others ([tls](tls/#shared-proxy-fairness), [inspection](inspection/)).
 
 | Component | Doc |
 |---|---|
