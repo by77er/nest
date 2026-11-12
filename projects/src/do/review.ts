@@ -259,6 +259,19 @@ export class ReviewDO extends DurableObject<Env> {
     return this.sql.exec("SELECT * FROM jobs ORDER BY created_ms DESC, pr DESC LIMIT 100").toArray().map((r) => this.toJob(r));
   }
 
+  /**
+   * The verdicts of the reviews done at these heads (README.md#pr-upkeep), by `<pr>/<sha>`: a head with no
+   * finished review (none yet, still running, failed without one) has none.
+   */
+  async verdictsAt(heads: readonly { pr: number; sha: string }[]): Promise<Record<string, Verdict>> {
+    const out: Record<string, Verdict> = {};
+    for (const h of heads) {
+      const r = this.jobRow(h.pr, h.sha);
+      if (r && r.state === "done" && r.verdict) out[`${h.pr}/${h.sha}`] = JSON.parse(r.verdict as string) as Verdict;
+    }
+    return out;
+  }
+
   /** The jobs held for the owner's approval, oldest first. */
   async held(): Promise<Job[]> {
     return this.sql.exec("SELECT * FROM jobs WHERE state = 'held' ORDER BY created_ms, pr").toArray().map((r) => this.toJob(r));

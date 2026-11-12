@@ -33,6 +33,8 @@ const str = (v: unknown): string | null => (typeof v === "string" ? v : null);
 const prNumber = (v: unknown): number | null => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null);
 
 const COMMENT_EVENTS = new Set(["issue_comment", "pull_request_review", "pull_request_review_comment"]);
+/** A `check_run` `completed` with one of these (GitHub's REST spelling) nudges the PR read (README.md#pr-upkeep). */
+const FAILED_CONCLUSIONS = new Set(["failure", "timed_out", "startup_failure"]);
 const ISSUE_ACTIONS = new Set(["opened", "reopened", "edited", "closed", "deleted", "transferred"]);
 /** A comment's text kept from the event; the message cuts it further (PR_COMMENT_MAX). */
 const BODY_MAX = 20_000;
@@ -239,6 +241,12 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
   } else if (COMMENT_EVENTS.has(event!)) {
     const c = prCommentOf(event!, payload, p.repo);
     if (c) await project(env, p.id).onPrComment(c);
+  } else if (event === "check_run" && action === "completed") {
+    // A check on one of the repo's PRs failed: a nudge to read the PRs sooner (README.md#pr-upkeep). What a
+    // worker is told is decided from that read, never from this event.
+    const run = obj(payload.check_run);
+    const prs = Array.isArray(run.pull_requests) ? run.pull_requests : [];
+    if (prs.length && FAILED_CONCLUSIONS.has(str(run.conclusion) ?? "")) await project(env, p.id).nudgePrRead();
   } else if (action === "rerequested") {
     const run = obj(payload.check_run);
     const id = prNumber(run.id);

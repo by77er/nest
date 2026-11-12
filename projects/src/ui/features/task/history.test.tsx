@@ -37,6 +37,9 @@ describe("a history entry's summary", () => {
     [row("cancel", undefined, "owner"), "Cancelled"],
     [row("progress", "Index built", "agt_w1"), "Progress: Index built"],
     [row("blocker", "Need a token", "agt_w1"), "Blocked: Need a token"],
+    // What a worker was told of its PR (README.md#pr-upkeep), in words, never the conditions' names.
+    [row("pr_upkeep", { pr: 12, head: "abc", told: ["conflict"] }, "app:github"), "Its worker was told PR #12 conflicts with its base"],
+    [row("pr_upkeep", { pr: 12, head: "abc", told: ["review_failed", "checks_failed", "conflict"] }, "app:github"), "Its worker was told PR #12 failed review, has failing checks and conflicts with its base"],
   ])("%#: %s", (h, want) => {
     expect(summarize(h)).toBe(want);
   });

@@ -199,6 +199,8 @@ export function data(variant = "demo", now = Date.now()) {
       h(190, "app:auto-assign", "assign"),
       h(189, "app:assign", "started", { agent: "agt_w1k7c2" }),
       h(150, "agt_w1k7c2", "pr_opened", { pr: 130 }, true),
+      // What its worker was told of its PR (projects/README.md#pr-upkeep).
+      h(140, "app:github", "pr_upkeep", { pr: 130, head: "4be1c0ffee5e7a0d2b9e1c3f5a7d9b1e3c5f7a9d", told: ["review_failed", "conflict"] }),
       h(120, "owner", "pr_comment", { pr: 130, to: "agt_w1k7c2" }),
       h(110, "app:nest", "worker_exited", { agent: "agt_w1k7c2", reason: "exited", text: null }),
       h(100, "app:board", "revise", { pr: 130 }),
