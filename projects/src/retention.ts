@@ -15,6 +15,8 @@ export const TRIAGED_PROPOSALS_KEEP_MS = 30 * DAY;
 export const ENDED_RUNS_KEEP_MS = 90 * DAY;
 /** A run's counted turns (only needed to drop a redelivered turn while it runs). */
 export const RUN_TURNS_KEEP_MS = DAY;
+/** That a worker was told of a condition on its PR at a head (README.md#pr-upkeep): long past any head it still has. */
+export const PR_TOLD_KEEP_MS = 30 * DAY;
 /** Exits that came before their start named the agent. */
 export const EARLY_EXITS_KEEP_MS = DAY;
 /** How often a Durable Object prunes, at most. */

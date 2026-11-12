@@ -199,6 +199,12 @@ export function data(variant = "demo", now = Date.now()) {
       h(190, "app:auto-assign", "assign"),
       h(189, "app:assign", "started", { agent: "agt_w1k7c2" }),
       h(150, "agt_w1k7c2", "pr_opened", { pr: 130 }, true),
+      // What its worker was told of its PR (projects/README.md#pr-upkeep).
+      h(140, "app:github", "pr_upkeep", { pr: 130, head: "4be1c0ffee5e7a0d2b9e1c3f5a7d9b1e3c5f7a9d", told: ["review_failed", "conflict"] }),
+      // At a later head, all three; then a reminder. (The app reminds 3 hours on; here it's minutes, to fit the
+      // history before the worker's exit: only the sentences are what the screen shows.)
+      h(130, "app:github", "pr_upkeep", { pr: 130, head: "9d2e4f6a8b0c1d3e5f7a9b1c3d5e7f9a1b3c5d7e", told: ["review_failed", "checks_failed", "conflict"] }),
+      h(125, "app:github", "pr_upkeep", { pr: 130, head: "9d2e4f6a8b0c1d3e5f7a9b1c3d5e7f9a1b3c5d7e", told: ["conflict"], again: true }),
       h(120, "owner", "pr_comment", { pr: 130, to: "agt_w1k7c2" }),
       h(110, "app:nest", "worker_exited", { agent: "agt_w1k7c2", reason: "exited", text: null }),
       h(100, "app:board", "revise", { pr: 130 }),
