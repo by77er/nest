@@ -7,7 +7,7 @@ A sandbox's state is a chain of immutable generations. Each generation is a mani
 ```
 gen    { id, sandbox, parent?, epoch, kind: disk_only | checkpoint, disk_manifest, mem_manifest?, reason, created_ms, cut_ms? }   SandboxDO's row adds state: ready | deleting
        designed, not built: restore_abi?, session: {offset, last_tool_use}?
-chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
+chunks s3://<cell>/chunks/<blake3>    disk: 4 MiB    memory: 2 MiB (one hugepage)
 ```
 
 - **Chunks are immutable.** Any host can upload them at any time without harm.
@@ -31,7 +31,7 @@ The cadence is the RPO: a lost host loses at most the work since its last commit
 
 ### One turn-end checkpoint at a time
 
-**Decided (2026-11-02).** Without the reflink cut ([disk](disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background); built, not deployed), a checkpoint pauses the VM while it reads a changed disk, so a second one queued right behind the first only doubles the pause (two back-to-back checkpoints of a 32 GiB disk held one VM paused 33–39 s each).
+**Decided (2026-11-02).** Without the reflink cut ([disk](disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background); built), a checkpoint pauses the VM while it reads a changed disk, so a second one queued right behind the first only doubles the pause (two back-to-back checkpoints of a 32 GiB disk held one VM paused 33–39 s each).
 - **At most one in flight.** SandboxDO records the `turn_end` checkpoint it asked for (kv `turn_checkpoint_inflight`: epoch, when, turns that ended meanwhile) until it **lands**: its `sandbox_checkpoint` command's result, ok or not (FleetDO passes it on, keyed by the command, so a late result of an older checkpoint lands nothing), or, sooner, its `turn_end` commit decided (any outcome, a replay of a stored one included). The command's result covers a checkpoint that sent no new commit: nestd asked again for an unanswered commit of another reason and found nothing new, or found no disk. One out longer than 5 min (its pause plus nestd's 60 s commit timeout, with room for a large disk) no longer counts.
 - **Turns that end while one is in flight share one follow-up,** 10 s after it lands, instead of each queueing a checkpoint behind it. One that never lands gets them theirs when its 5 min window ends.
 - **The follow-up is never skipped.** The in-flight checkpoint's cut is the guest's `sync` (`prepare_snapshot`; the guest freezes nothing), not the pause, so a call answered between the two may have left writes in the guest's page cache that it lacks.
@@ -85,7 +85,7 @@ Restore sources and turn ends are kept; everything else is thinned by age.
 
 SandboxDO runs retention from its alarm, in the same single writer that admits forks and destroys the sandbox, so a fork can't pin a generation that retention is deleting.
 
-**Turn ends are bounded** (decided 2026-11-01; the owner confirmed it 2026-11-02, with an orphan's non-head generations dropped at once and a sparse sandbox's newest 6 kept): kept "always", a sandbox that lives for months would root every turn's dirty chunks forever. A turn dirties whole 4 MB chunks, so a generation's own bytes are likely tens of MB (unverified); at Standard's $0.023/GB-month ([S3 pricing](https://aws.amazon.com/s3/pricing/), us-east-1, first 50 TB), 200 of 50 MB is about $0.23 a month per sandbox, where 50 turns a day kept for a year would be over $20 and growing. Rewinding isn't built, git keeps the code's history, and a week matches the commit records' retention. The newest 20 stay at any age, so a sandbox idle for a while keeps its recent turns.
+**Turn ends are bounded** (decided 2026-11-01; the owner confirmed it 2026-11-02, with an orphan's non-head generations dropped at once and a sparse sandbox's newest 6 kept): kept "always", a sandbox that lives for months would root every turn's dirty chunks forever. A turn dirties whole 4 MiB chunks, so a generation's own bytes are likely tens of MB (unverified); at Standard's $0.023/GB-month ([S3 pricing](https://aws.amazon.com/s3/pricing/), us-east-1, first 50 TB), 200 of 50 MB is about $0.23 a month per sandbox, where 50 turns a day kept for a year would be over $20 and growing. Rewinding isn't built, git keeps the code's history, and a week matches the commit records' retention. The newest 20 stay at any age, so a sandbox idle for a while keeps its recent turns.
 
 **The tiers** follow SPACE: each tier keeps its own newest slots and the tiers overlap. A slot is a wall-clock interval of the tier's spacing, aligned to the Unix epoch (so slots nest), represented by its newest generation; the slots counted are those with a generation. A busy sandbox keeps about 18 tier generations spanning 24 h; a sparse one keeps its newest 6 at any age. Orphans take no main-chain slot.
 
@@ -119,5 +119,5 @@ A **rebalance recommendation** (designed, not built: nestd polls only `spot/inst
 ## Components
 
 - [memory/](memory/): hugepages, UFFD, prefetch, tiers, restore ABI, base generations
-- [disk/](disk/): pausing only to read, the unchanged-disk check, reflink cuts in a brief pause (built, not deployed), extent diffs (designed), flush before commit, I/O limits, the ublk lazy disk (later)
+- [disk/](disk/): pausing only to read, the unchanged-disk check, reflink cuts in a brief pause (built), the shadow cut (built), extent diffs (designed), flush before commit, I/O limits, the ublk lazy disk (later)
 - [object-store/](object-store/): S3 per cell, costs, garbage collection

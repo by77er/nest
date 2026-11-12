@@ -3,6 +3,8 @@
 ## Corrections
 | doc | said | code says | evidence |
 |---|---|---|---|
+| sandbox/networking/egress/README.md | pipeline: "re-check policy" after guards; open connections re-checked on every policy version and closed once denied | built: each request is decided against the current policy before injection; the final re-check and closing denied connections are designed | crates/nest-proxy/src/http.rs:390-460 (policy doc audit) |
+| sandbox/state/README.md | chunks 4 MB / 2 MB; reflink cut "built, not deployed"; components omit the shadow cut | `DISK_CHUNK = 4 << 20`, `MEMORY_CHUNK = 2 << 20`; M2 built ("deploys on merge" in disk/), M3′ shadow cut merged (#159) and picked by `disk_cut: auto` | crates/nestd/src/storage.rs:21-23, config.rs:114-129 |
 | sandbox/networking/egress/steering/README.md | kernel backstop: nestd installs a root-namespace `meta skuid` reject rule for nest-proxy (as built) | not built: no such rule in nestd or deploy/ | grep -rn "skuid" crates/ deploy/ (none); crates/nestd/src/net.rs:204-230 is the only ruleset |
 | sandbox/networking/egress/steering/README.md | accept list: 53, explicit and TCP-exception ports to 172.16.0.1 | also redirects 53 to any other address, and accepts 80/443 on 172.16.0.1; port ranges 3128-3191, 20000-20999 | crates/nestd/src/net.rs:30-32,212-224 |
 | sandbox/networking/egress/README.md | "Non-public addresses are refused twice" (proxy and kernel rule); pipeline holds ≤30 s for an acknowledged policy; strips routing overrides and rejects smuggling | proxy check only; no policy → immediate 403 `egress_denied` "no policy"; no override stripping or smuggling checks | crates/nest-proxy/src/http.rs:390-394,840-846 |

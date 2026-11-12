@@ -13,12 +13,13 @@ accept (listener ⇒ sandbox [, agent])
                     no inspection)
       inspect     → terminate TLS → the request target and the single Host must name the routed
                     host (no domain fronting) → strip routing overrides, reject smuggling
-                    (both designed, not built) →
-                    credential injection → request guards → re-check policy → upstream with a Host
-                    the proxy sets
+                    (both designed, not built) → decide the request against the current policy →
+                    credential injection → request guards → final re-check (designed) → upstream
+                    with a Host the proxy sets
                     (proxy re-resolves the name, refuses non-public addresses and verifies the
                     upstream certificate)
-  open connections: re-checked on every policy version and grant expiry; closed once denied
+  open connections: each request decided again against the current policy; closing
+                    connections once denied is designed
 ```
 
 - **Explicit proxy CONNECT:** every tunnel must carry TLS whose SNI matches the CONNECT authority. Plaintext tunnels are denied (plain HTTP goes as absolute-form requests, which get the same Host checks). A denied CONNECT is still accepted and answered *inside* the tunnel with the readable 403, because clients like curl hide a CONNECT error body.
