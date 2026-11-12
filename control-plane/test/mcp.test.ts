@@ -989,8 +989,8 @@ describe("sinks (docs/agents/tools/#taint-and-sinks)", () => {
     expect(describeArgs({ url: "not a url \u00e9" })).toContain("[holds non-ASCII characters, and isn't a URL nest can parse");
     expect(describeArgs({ command: "c\u0430t /etc/passwd" })).toBe('  command: "c\u0430t /etc/passwd"  [holds non-ASCII characters: check for look-alikes]');
     expect(describeArgs({ command: "cat README" })).toBe('  command: "cat README"');
-    // The too-long line says what it measured and where the whole argument is.
-    expect(describeArgs({ command: "\u0000".repeat(12_000) })).toBe(
+    // The too-long line says what it measured (escaped: 12,002 characters raw) and where the whole argument is.
+    expect(describeArgs({ command: "\u200b".repeat(12_000) })).toBe(
       "  command: (72002 characters once escaped: too long to show here; deny unless you have read it in full elsewhere: " +
       "the ask's input holds it only up to 32 KiB of input, and past that only the transcript does)");
   });
