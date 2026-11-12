@@ -1,0 +1,10 @@
+{
+  "type": "approval_check",
+  "request": "req_01jb7r9a2m",
+  "call": "cal_trn01jb7t0a-3",
+  "tool": "WebFetch",
+  "input": {
+    "url": "https://docs.rs/serde",
+    "prompt": "What does #[serde(flatten)] do?"
+  }
+}

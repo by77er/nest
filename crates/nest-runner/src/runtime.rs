@@ -3,11 +3,11 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nest_protocol::control::{AgentCache, HandsBinding, HandsOutcome, InboxMessage, ToolDef, ToolOutcome, TurnInput};
+use nest_protocol::control::{AgentCache, ApprovalOutcome, HandsBinding, HandsOutcome, InboxMessage, ToolDef, ToolOutcome, TurnInput};
 use nest_protocol::gateway::HandsTarget;
 use nest_protocol::host::Secret;
 use nest_protocol::host::mcp::ToolCallResult;
@@ -204,6 +204,18 @@ impl Drop for PendingResolve<'_> {
     }
 }
 
+/// Removes an `approval_check` from the pending map when its waiter goes away.
+struct PendingCheck<'a> {
+    agent: &'a Agent,
+    req: RequestId,
+}
+
+impl Drop for PendingCheck<'_> {
+    fn drop(&mut self) {
+        self.agent.pending_checks.lock().unwrap().remove(&self.req);
+    }
+}
+
 /// Parent pid from `/proc/<pid>/stat` (the field after the `)` that ends the command name).
 fn parent_pid(pid: i32) -> Option<i32> {
     let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -238,6 +250,8 @@ pub enum Outbound {
     ToolsListRequest(RequestId),
     /// `hands_resolve`: where are the agent's hands now? Answered through [`Agent::resolve_hands`].
     HandsResolve(RequestId),
+    /// `approval_check`: may this call a rule holds run? Answered through [`Agent::resolve_check`].
+    ApprovalCheck { request: RequestId, call: CallId, tool: String, input: Value },
     /// Follow a different transcript file (SessionStart `transcript_path`, forks).
     SetTranscript(PathBuf),
     SetSession(SessionId),
@@ -252,6 +266,17 @@ pub enum Outbound {
 /// AgentDO did not answer `hands_resolve` in time (or the session channel was down).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolveTimeout;
+
+/// How an `approval_check` ended without AgentDO's decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckFailed {
+    /// No answer in time: the call is denied (if AgentDO spent an approval on it meanwhile, that
+    /// approval is lost: the call never ran, and the operator is asked again).
+    Timeout,
+    /// The connection it would go on doesn't take checks (AgentDO is of the previous release):
+    /// the runner escalates the call as that release expects.
+    Unsupported,
+}
 
 /// Mutable per-agent state shared with hooks and the MCP bridge.
 #[derive(Debug, Default)]
@@ -298,6 +323,12 @@ pub struct Agent {
     pub pending_calls: Mutex<HashMap<CallId, oneshot::Sender<ToolOutcome>>>,
     pub pending_lists: Mutex<HashMap<RequestId, oneshot::Sender<Vec<ToolDef>>>>,
     pub pending_resolves: Mutex<HashMap<RequestId, oneshot::Sender<HandsOutcome>>>,
+    /// `approval_check`s waiting for AgentDO's answer (`None`: it can't be asked, [`CheckFailed::Unsupported`]).
+    pub pending_checks: Mutex<HashMap<RequestId, oneshot::Sender<Option<ApprovalOutcome>>>>,
+    /// The last `hello_ack` said `rule_approvals`: a rule's `ask` is checked with AgentDO
+    /// (`approval_check`) instead of escalated. Kept across a disconnect (a check made meanwhile
+    /// waits for the next connection, which decides whether it is sent).
+    pub rule_approvals: AtomicBool,
     /// Held while one caller resolves the target, so N parallel first calls send one
     /// `hands_resolve` and the rest find the cached target.
     pub resolve_gate: tokio::sync::Mutex<()>,
@@ -341,6 +372,8 @@ impl Agent {
             pending_calls: Mutex::new(HashMap::new()),
             pending_lists: Mutex::new(HashMap::new()),
             pending_resolves: Mutex::new(HashMap::new()),
+            pending_checks: Mutex::new(HashMap::new()),
+            rule_approvals: AtomicBool::new(false),
             resolve_gate: tokio::sync::Mutex::new(()),
             hands_cancel: Mutex::new(CancellationToken::new()),
             tools_gen: tokio::sync::watch::Sender::new(0),
@@ -497,13 +530,44 @@ impl Agent {
         }
     }
 
-    /// Escalate a tool call that matched no grant rule: emits `AgentEventBody::Escalation`,
-    /// which AgentDO treats like an `ask` to the captain or user. Returns the request id quoted
-    /// in the deny reason; the answer arrives as the agent's next turn input.
+    /// Escalate a tool call a rule holds to an AgentDO that can't check approvals (the previous
+    /// release's): emits `AgentEventBody::Escalation`, which it holds as a plain question. Returns
+    /// the request id quoted in the deny reason; the answer arrives as the agent's next turn input.
     pub fn escalate(&self, tool: &str, input: Value) -> CallId {
         let call = self.next_call_id();
         self.emit(AgentEventBody::Escalation { call: call.clone(), tool: tool.into(), input });
         call
+    }
+
+    /// Whether the session channel's AgentDO checks approvals (its last `hello_ack`).
+    pub fn checks_approvals(&self) -> bool {
+        self.rule_approvals.load(Ordering::SeqCst)
+    }
+
+    /// One `approval_check` round trip for the call `call` a rule holds. Dropping the future
+    /// forgets the request, so a late answer is ignored (and the call was never let through).
+    pub async fn check_approval(&self, call: CallId, tool: &str, input: Value, timeout: Duration) -> Result<ApprovalOutcome, CheckFailed> {
+        let request = RequestId(format!("req_{}", uuid::Uuid::new_v4().simple()));
+        let (tx, rx) = oneshot::channel();
+        self.pending_checks.lock().unwrap().insert(request.clone(), tx);
+        let _guard = PendingCheck { agent: self, req: request.clone() };
+        self.send_out(Outbound::ApprovalCheck { request, call, tool: tool.into(), input });
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Some(outcome))) => Ok(outcome),
+            Ok(Ok(None)) => Err(CheckFailed::Unsupported),
+            _ => Err(CheckFailed::Timeout),
+        }
+    }
+
+    /// `approval_checked` arrived (`Some`), or the check can't be sent (`None`). An id nobody waits
+    /// for (the hook gave up) is ignored.
+    pub fn resolve_check(&self, req: &RequestId, outcome: Option<ApprovalOutcome>) {
+        match self.pending_checks.lock().unwrap().remove(req) {
+            Some(tx) => {
+                let _ = tx.send(outcome);
+            }
+            None => tracing::debug!(agent = %self.id, request = %req.0, "approval_checked for a request nobody awaits"),
+        }
     }
 
     /// Current platform tool list from AgentDO (falls back to the last one received).

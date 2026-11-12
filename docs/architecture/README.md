@@ -115,7 +115,7 @@ Bindings themselves are verified, never stored. Hosts hold only caches: page cac
 | Sandbox VM | Code and data being worked on | Untrusted. No credentials; egress only through nest-proxy. The only isolation primitive is a fork |
 | Gateway | The binding public keys | The only way into a guest's hands or ingress ports. Nothing is admitted without a binding SandboxDO issued, and the guest checks the epoch again |
 | Sandbox host | nestd, nest-proxy, cloudflared, the gateway, VMs | Trusted but fenced by leases, epochs and STONITH. Holds no subscription token and runs no brain |
-| Brain | The subscription token, in its process environment | No local exec or file tools; repo config never loads. It acts only through `nest` tools and the web built-ins (host-allowlisted, tainting) |
+| Brain | The subscription token, in its process environment | No local exec or file tools; repo config never loads. It acts only through `nest` tools and the web built-ins (tainting; not host-allowlisted: [brain hosts](../compute/brain-hosts/)) |
 | Brain host | Brains, session file caches | Trusted but fenced by its lease and the agent epoch. No KVM, no sandbox state; in S3 it may read the release (`releases/*`) only |
 | Control plane | All authority | Every platform tool call is checked against grants and taint here; hands calls are gated by the runner's local policy cache, pushed from AgentDO, and by the binding |
 | External input | Web pages, integrations' results, other agents' messages | Tainted; its content reaches models only as tool results |

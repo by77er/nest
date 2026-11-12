@@ -157,7 +157,8 @@ impl MockDo {
                         match msg {
                             RunnerToAgent::Hello(h) => {
                                 l.hellos.push(h);
-                                let _ = tx.send(AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None });
+                                // The previous release's AgentDO: rule asks escalate (e2e/ checks `approval_check`).
+                                let _ = tx.send(AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None, rule_approvals: false });
                             }
                             RunnerToAgent::Segment { offset, base, data_b64, session, .. } => {
                                 let data = base64::engine::general_purpose::STANDARD.decode(data_b64).unwrap();
@@ -206,6 +207,7 @@ impl MockDo {
                             RunnerToAgent::CancelCall { seq, .. } => {
                                 let _ = tx.send(AgentToRunner::Ack { up_to: seq });
                             }
+                            RunnerToAgent::ApprovalCheck { .. } => panic!("approval_check sent to an AgentDO that didn't say rule_approvals"),
                             RunnerToAgent::Ack { .. } => {}
                         }
                     }

@@ -5,7 +5,7 @@ use std::io::BufRead;
 use std::sync::Arc;
 use std::time::Duration;
 
-use nest_protocol::control::RuleDecision;
+use nest_protocol::control::{ApprovalOutcome, RuleDecision};
 use nest_protocol::host::hook::{
     HookDatagram, HookDecisionRequest, HookDecisionResponse, HookOutput, HookSpecificOutput, PermissionDecision,
     PermissionRequestDecision, TopLevelDecision,
@@ -17,7 +17,7 @@ use tokio::net::{UnixDatagram, UnixListener};
 use crate::framing;
 use crate::rules;
 use crate::mirror;
-use crate::runtime::{Agent, AgentCmd, Runtime};
+use crate::runtime::{Agent, AgentCmd, CheckFailed, Runtime};
 
 /// Serve async tracking datagrams forever.
 pub async fn serve_dgram(rt: Arc<Runtime>, sock: UnixDatagram) {
@@ -169,7 +169,7 @@ pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
     }
     let output = match event {
         "PreToolUse" => {
-            let (decision, reason) = permission(&agent, &req.input);
+            let (decision, reason) = permission(&agent, &req.input, rt.cfg.approval_check_timeout).await;
             HookOutput {
                 hook_specific_output: Some(HookSpecificOutput::PreToolUse {
                     permission_decision: Some(decision),
@@ -181,7 +181,7 @@ pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
             }
         }
         "PermissionRequest" => {
-            let (decision, reason) = permission(&agent, &req.input);
+            let (decision, reason) = permission(&agent, &req.input, rt.cfg.approval_check_timeout).await;
             let decision = match decision {
                 PermissionDecision::Allow => PermissionRequestDecision::Allow { updated_input: None },
                 _ => PermissionRequestDecision::Deny { message: reason, interrupt: None },
@@ -198,8 +198,9 @@ pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
     output.into()
 }
 
-/// PreToolUse / PermissionRequest: first matching rule; `ask` escalates and denies for now.
-fn permission(agent: &Agent, input: &Value) -> (PermissionDecision, Option<String>) {
+/// PreToolUse / PermissionRequest: the first matching rule; `ask` holds the call for the operator
+/// (`held`). Answered from the `AgentCache`, except an `ask`, which waits for AgentDO's check.
+async fn permission(agent: &Agent, input: &Value, check_timeout: Duration) -> (PermissionDecision, Option<String>) {
     let tool = input.get("tool_name").and_then(Value::as_str).unwrap_or_default();
     let tool_input = input.get("tool_input").cloned().unwrap_or(Value::Null);
     let rules = match agent.inner.lock().unwrap().cache.as_ref() {
@@ -211,9 +212,35 @@ fn permission(agent: &Agent, input: &Value) -> (PermissionDecision, Option<Strin
         RuleDecision::Allow => (PermissionDecision::Allow, v.reason),
         RuleDecision::Deny => (PermissionDecision::Deny, Some(v.reason.unwrap_or_else(|| format!("{tool} is not permitted")))),
         RuleDecision::Ask => {
-            let call = agent.escalate(tool, tool_input);
-            (PermissionDecision::Deny, Some(format!("pending approval (request {call}); end your turn and wait for the answer")))
+            let checked = if agent.checks_approvals() {
+                agent.check_approval(agent.next_call_id(), tool, tool_input.clone(), check_timeout).await
+            } else {
+                Err(CheckFailed::Unsupported)
+            };
+            if checked == Err(CheckFailed::Unsupported) {
+                // An AgentDO of the previous release: it holds the call as a plain question.
+                let call = agent.escalate(tool, tool_input);
+                return (PermissionDecision::Deny, Some(format!("pending approval (request {call}); end your turn and wait for the answer")));
+            }
+            held(tool, checked)
         }
+    }
+}
+
+/// The answer to a call a rule holds, from AgentDO's check: only an approval spent on this very
+/// call lets it through; anything else denies it. Pure.
+pub fn held(tool: &str, checked: Result<ApprovalOutcome, CheckFailed>) -> (PermissionDecision, Option<String>) {
+    match checked {
+        Ok(ApprovalOutcome::Approved { ask }) => (PermissionDecision::Allow, Some(format!("approved by the operator ({ask}), for this one call"))),
+        Ok(ApprovalOutcome::Pending { ask }) => (
+            PermissionDecision::Deny,
+            Some(format!(
+                "{tool} with these arguments needs the operator's approval ({ask}); end your turn: the decision arrives as your next \
+                 input, and once approved, the same call with exactly the same arguments runs once"
+            )),
+        ),
+        Ok(ApprovalOutcome::Error { error }) => (PermissionDecision::Deny, Some(format!("not checked: {}", error.message))),
+        Err(_) => (PermissionDecision::Deny, Some("couldn't reach nest to check this call's approval; try again shortly".into())),
     }
 }
 
@@ -341,6 +368,112 @@ mod tests {
         a.set_cache(old);
         let o = decide(&rt, &req(json!({"hook_event_name": "PreToolUse", "tool_name": "mcp__nest__Read", "tool_input": {"file_path": "/x"}}))).await.output;
         assert_eq!(pre(&o), PermissionDecision::Allow);
+    }
+
+    /// The model's call a rule holds, as the `PreToolUse` hook sends it.
+    fn web_fetch() -> HookDecisionRequest {
+        req(json!({"hook_event_name": "PreToolUse", "tool_name": "WebFetch", "tool_input": {"url": "https://x", "prompt": "p"}}))
+    }
+
+    /// The `approval_check` the hook sent, answered by "AgentDO" with `answer`; and every other
+    /// outbound message seen meanwhile.
+    async fn answer_check(a: &Agent, out: &mut mpsc::UnboundedReceiver<Outbound>, answer: Option<ApprovalOutcome>) -> (nest_protocol::model::CallId, Vec<Outbound>) {
+        let mut others = Vec::new();
+        loop {
+            match out.recv().await.expect("an outbound message") {
+                Outbound::ApprovalCheck { request, call, tool, input } => {
+                    assert_eq!((tool.as_str(), &input), ("WebFetch", &json!({"url": "https://x", "prompt": "p"})));
+                    a.resolve_check(&request, answer);
+                    return (call, others);
+                }
+                o => others.push(o),
+            }
+        }
+    }
+
+    fn escalations(out: &mut mpsc::UnboundedReceiver<Outbound>, seen: Vec<Outbound>) -> usize {
+        let mut all = seen;
+        while let Ok(o) = out.try_recv() {
+            all.push(o);
+        }
+        all.iter().filter(|o| matches!(o, Outbound::Event(AgentEvent { body: AgentEventBody::Escalation { .. }, .. }))).count()
+    }
+
+    /// With an AgentDO that checks approvals, a call a rule holds runs only on an approval AgentDO
+    /// spent on it; pending, refused or unanswered, it is denied, and nothing escalates. An AgentDO
+    /// of the previous release (the check unsupported) gets the escalation it expects.
+    #[tokio::test]
+    async fn a_held_call_runs_only_on_an_approval_spent_on_it() {
+        let (rt, a, mut out, _c) = setup();
+        a.set_cache(cache(vec![]));
+        a.rule_approvals.store(true, std::sync::atomic::Ordering::SeqCst);
+        let ask = |s: &str| nest_protocol::model::AskId(s.into());
+        let cases = [
+            (Some(ApprovalOutcome::Approved { ask: ask("ask_ok") }), PermissionDecision::Allow, 0),
+            (Some(ApprovalOutcome::Pending { ask: ask("ask_wait") }), PermissionDecision::Deny, 0),
+            (
+                Some(ApprovalOutcome::Error {
+                    error: nest_protocol::model::ErrorBody { code: "stale_epoch".into(), message: "stale".into(), retryable: false },
+                }),
+                PermissionDecision::Deny,
+                0,
+            ),
+            (None, PermissionDecision::Deny, 1),
+        ];
+        for (answer, want, escalated) in cases {
+            let hook = { let rt = rt.clone(); tokio::spawn(async move { decide(&rt, &web_fetch()).await.output }) };
+            let (call, seen) = answer_check(&a, &mut out, answer.clone()).await;
+            assert!(call.0.starts_with("cal_"));
+            let o = hook.await.unwrap();
+            assert_eq!(pre(&o), want, "{answer:?}");
+            if let Some(ApprovalOutcome::Pending { .. }) = &answer {
+                let Some(HookSpecificOutput::PreToolUse { permission_decision_reason: Some(r), .. }) = &o.hook_specific_output else { panic!() };
+                assert!(r.contains("ask_wait"), "{r}");
+            }
+            assert_eq!(escalations(&mut out, seen), escalated, "{answer:?}");
+        }
+        // Not checking approvals (no `hello_ack` said so): escalated, never checked.
+        a.rule_approvals.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(pre(&decide(&rt, &web_fetch()).await.output), PermissionDecision::Deny);
+        let mut seen = Vec::new();
+        while let Ok(o) = out.try_recv() {
+            assert!(!matches!(o, Outbound::ApprovalCheck { .. }), "checked with an AgentDO that doesn't take checks");
+            seen.push(o);
+        }
+        assert_eq!(escalations(&mut out, seen), 1);
+    }
+
+    /// No answer in time: denied, and the waiter is gone, so a late approval is ignored.
+    #[tokio::test]
+    async fn an_unanswered_check_denies_and_a_late_answer_is_ignored() {
+        let rt = Runtime::new(Config { approval_check_timeout: std::time::Duration::from_millis(100), ..Config::default() });
+        let (ctx, _c) = mpsc::unbounded_channel();
+        let (otx, mut out) = mpsc::unbounded_channel();
+        let a = Agent::new(AgentId("agt_h".into()), Epoch(1), std::env::temp_dir(), None, vec![], 0, ctx, otx);
+        assert!(rt.register(a.clone(), rt.fence_gen()).is_ok());
+        a.set_cache(cache(vec![]));
+        a.rule_approvals.store(true, std::sync::atomic::Ordering::SeqCst);
+        let o = decide(&rt, &web_fetch()).await.output;
+        assert_eq!(pre(&o), PermissionDecision::Deny);
+        let mut request = None;
+        while let Ok(o) = out.try_recv() {
+            if let Outbound::ApprovalCheck { request: r, .. } = o {
+                request = Some(r);
+            }
+        }
+        assert!(a.pending_checks.lock().unwrap().is_empty(), "the timed-out check is forgotten");
+        a.resolve_check(&request.expect("a check was sent"), Some(ApprovalOutcome::Approved { ask: nest_protocol::model::AskId("ask_late".into()) }));
+    }
+
+    #[test]
+    fn only_an_approval_lets_a_held_call_through() {
+        let ask = nest_protocol::model::AskId("ask_x".into());
+        assert_eq!(held("WebFetch", Ok(ApprovalOutcome::Approved { ask: ask.clone() })).0, PermissionDecision::Allow);
+        assert_eq!(held("WebFetch", Ok(ApprovalOutcome::Pending { ask })).0, PermissionDecision::Deny);
+        let error = nest_protocol::model::ErrorBody { code: "stale_epoch".into(), message: "m".into(), retryable: false };
+        assert_eq!(held("WebFetch", Ok(ApprovalOutcome::Error { error })).0, PermissionDecision::Deny);
+        assert_eq!(held("WebFetch", Err(CheckFailed::Timeout)).0, PermissionDecision::Deny);
+        assert_eq!(held("WebFetch", Err(CheckFailed::Unsupported)).0, PermissionDecision::Deny);
     }
 
     #[tokio::test]

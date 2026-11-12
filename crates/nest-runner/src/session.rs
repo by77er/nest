@@ -107,6 +107,11 @@ struct State {
     durable: u64,
     /// `hands_resolve` requests made while disconnected, sent right after the next `hello_ack`.
     resolves: Vec<model::RequestId>,
+    /// `approval_check`s made while disconnected: sent right after the next `hello_ack` if it says
+    /// `rule_approvals`, else answered unsupported (the hook escalates instead).
+    checks: Vec<RunnerToAgent>,
+    /// This connection's `hello_ack` said `rule_approvals`.
+    rule_approvals: bool,
     /// Set by `Close`: give up at this instant.
     close_deadline: Option<tokio::time::Instant>,
     /// When the current connection's hello was acked (cleared before each connection).
@@ -204,6 +209,7 @@ impl Session {
                 st.abandon(&call);
             }
             Outbound::HandsResolve(req) => st.resolves.push(req),
+            Outbound::ApprovalCheck { request, call, tool, input } => st.checks.push(RunnerToAgent::ApprovalCheck { request, call, tool, input }),
             Outbound::ToolsListRequest(_) | Outbound::Reconnect => {}
             Outbound::SetTranscript(p) => self.tailer.set_path(p),
             Outbound::SetSession(s) => self.session = Some(s),
@@ -261,8 +267,8 @@ impl Session {
                 Some(Err(e)) => return Err(e.into()),
             }
         };
-        let (durable, peer_last) = match ack {
-            AgentToRunner::HelloAck { durable_bytes, last_seq, .. } => (durable_bytes, last_seq.map(|s| s.0).unwrap_or(0)),
+        let (durable, peer_last, rule_approvals) = match ack {
+            AgentToRunner::HelloAck { durable_bytes, last_seq, rule_approvals, .. } => (durable_bytes, last_seq.map(|s| s.0).unwrap_or(0), rule_approvals),
             AgentToRunner::Error { error } => {
                 if error.code == error_codes::STALE_EPOCH {
                     self.agent.command(AgentCmd::StaleEpoch);
@@ -279,6 +285,11 @@ impl Session {
         }
         for request in std::mem::take(&mut st.resolves) {
             tx.send(text(&RunnerToAgent::HandsResolve { request })?).await?;
+        }
+        st.rule_approvals = rule_approvals;
+        self.agent.rule_approvals.store(rule_approvals, std::sync::atomic::Ordering::SeqCst);
+        for check in std::mem::take(&mut st.checks) {
+            self.send_check(st, &mut tx, check).await?;
         }
         if let Some(o) = self.opened.take() {
             let _ = o.send(());
@@ -342,6 +353,9 @@ impl Session {
                         }
                         Outbound::ToolsListRequest(request) => tx.send(text(&RunnerToAgent::ToolsListRequest { request })?).await?,
                         Outbound::HandsResolve(request) => tx.send(text(&RunnerToAgent::HandsResolve { request })?).await?,
+                        Outbound::ApprovalCheck { request, call, tool, input } => {
+                            self.send_check(st, &mut tx, RunnerToAgent::ApprovalCheck { request, call, tool, input }).await?;
+                        }
                         Outbound::SetTranscript(p) => self.tailer.set_path(p),
                         Outbound::SetSession(s) => self.session = Some(s),
                         Outbound::Reconnect => {
@@ -359,6 +373,22 @@ impl Session {
                 _ = tail_tick.tick() => self.flush_tail(&mut tx).await?,
             }
         }
+    }
+
+    /// Send an `approval_check` on a connection whose AgentDO takes them; on one that doesn't (a
+    /// previous release's), answer it unsupported instead, so the hook escalates the call: that
+    /// AgentDO would refuse the message as invalid and the runner would reconnect.
+    async fn send_check<S>(&self, st: &State, tx: &mut S, check: RunnerToAgent) -> anyhow::Result<()>
+    where
+        S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        let RunnerToAgent::ApprovalCheck { request, .. } = &check else { return Ok(()) };
+        if st.rule_approvals {
+            tx.send(text(&check)?).await?;
+        } else {
+            self.agent.resolve_check(request, None);
+        }
+        Ok(())
     }
 
     /// A protocol error on the session channel: logged, and reported to nestd (the channel can't go
@@ -416,6 +446,7 @@ impl Session {
                 });
                 a.resolve_hands(&request, outcome);
             }
+            AgentToRunner::ApprovalChecked { request, outcome } => a.resolve_check(&request, Some(outcome)),
             AgentToRunner::Ack { up_to } => st.acked(up_to.0),
             AgentToRunner::SegmentAck { durable_bytes, .. } => {
                 st.durable = st.durable.max(durable_bytes);
@@ -657,7 +688,7 @@ mod resolve_tests {
                 let Message::Text(t) = m else { continue };
                 match serde_json::from_str::<RunnerToAgent>(&t).unwrap() {
                     RunnerToAgent::Hello(_) => {
-                        let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None };
+                        let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None, rule_approvals: false };
                         wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
                     }
                     RunnerToAgent::HandsResolve { request } => {
@@ -700,6 +731,70 @@ mod resolve_tests {
         }
         assert!(server.await.unwrap(), "AgentDO received the queued hands_resolve");
     }
+    /// An `approval_check` made while the channel is down waits for the next `hello_ack`: sent if it
+    /// says `rule_approvals` (and AgentDO's answer reaches the hook), answered unsupported and never
+    /// sent if it doesn't (an AgentDO of the previous release would refuse it as invalid).
+    #[tokio::test]
+    async fn a_check_made_while_disconnected_goes_only_to_an_agentdo_that_takes_checks() {
+        use nest_protocol::control::ApprovalOutcome;
+        use nest_protocol::model::AskId;
+        for takes_checks in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}/v1/agents/agt_c/session", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                let (mut wtx, mut wrx) = ws.split();
+                let mut checks = Vec::new();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let m = tokio::select! {
+                        m = wrx.next() => m,
+                        _ = tokio::time::sleep_until(deadline) => break,
+                    };
+                    let Some(Ok(Message::Text(t))) = m else { break };
+                    match serde_json::from_str::<RunnerToAgent>(&t).unwrap() {
+                        RunnerToAgent::Hello(_) => {
+                            let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None, rule_approvals: takes_checks };
+                            wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
+                        }
+                        RunnerToAgent::ApprovalCheck { request, call, tool, .. } => {
+                            checks.push((call.0, tool));
+                            let m = AgentToRunner::ApprovalChecked { request, outcome: ApprovalOutcome::Approved { ask: AskId("ask_c".into()) } };
+                            wtx.send(Message::Text(serde_json::to_string(&m).unwrap().into())).await.unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+                checks
+            });
+            let rt = Runtime::new(Config { batch_interval: Duration::from_millis(50), tail_interval: Duration::from_millis(50), ..Config::default() });
+            let (ctx, _crx) = mpsc::unbounded_channel();
+            let (otx, orx) = mpsc::unbounded_channel();
+            let agent = Agent::new(AgentId("agt_c".into()), Epoch(1), std::env::temp_dir(), None, vec![], 0, ctx, otx);
+            let transcript = std::env::temp_dir().join(format!("nest-session-test-{}.jsonl", uuid::Uuid::new_v4().simple()));
+            let _opened = spawn(rt.clone(), agent.clone(), url, transcript, None, orx);
+            let waiter = {
+                let a = agent.clone();
+                tokio::spawn(async move {
+                    a.check_approval(model::CallId("cal_c-1".into()), "WebFetch", serde_json::json!({}), Duration::from_secs(10)).await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            rt.host_token.send_replace(Some(Secret("tok".into())));
+            let got = waiter.await.unwrap();
+            let checks = server.await.unwrap();
+            assert_eq!(agent.checks_approvals(), takes_checks);
+            if takes_checks {
+                assert_eq!(got, Ok(ApprovalOutcome::Approved { ask: AskId("ask_c".into()) }));
+                assert_eq!(checks, [("cal_c-1".to_string(), "WebFetch".to_string())]);
+            } else {
+                assert_eq!(got, Err(crate::runtime::CheckFailed::Unsupported));
+                assert!(checks.is_empty(), "sent to an AgentDO that doesn't take checks: {checks:?}");
+            }
+        }
+    }
+
     /// The hello says the runner acts on `tools_changed`, and AgentDO's `tools_changed` reaches
     /// the agent's watchers (each `nest mcp` connection), so Claude Code is told to list again.
     #[tokio::test]
@@ -713,7 +808,7 @@ mod resolve_tests {
             while let Some(Ok(m)) = wrx.next().await {
                 let Message::Text(t) = m else { continue };
                 if let RunnerToAgent::Hello(h) = serde_json::from_str::<RunnerToAgent>(&t).unwrap() {
-                    for m in [AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None }, AgentToRunner::ToolsChanged {}] {
+                    for m in [AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None, rule_approvals: false }, AgentToRunner::ToolsChanged {}] {
                         wtx.send(Message::Text(serde_json::to_string(&m).unwrap().into())).await.unwrap();
                     }
                     // Keep the connection open until the runner side has seen it.
@@ -767,7 +862,7 @@ mod resolve_tests {
                         let reply = match serde_json::from_str::<RunnerToAgent>(&t) {
                             Ok(RunnerToAgent::Hello(_)) => {
                                 h.fetch_add(1, Ordering::SeqCst);
-                                AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None }
+                                AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None, rule_approvals: false }
                             }
                             Ok(RunnerToAgent::Events { .. }) => AgentToRunner::Error {
                                 error: model::ErrorBody { code: error_codes::INVALID_MESSAGE.into(), message: "schema".into(), retryable: false },
@@ -823,7 +918,7 @@ mod resolve_tests {
                     match serde_json::from_str::<RunnerToAgent>(&t) {
                         Ok(RunnerToAgent::Hello(h)) => {
                             hello_last = h.last_seq.map(|s| s.0);
-                            let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None };
+                            let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None, rule_approvals: false };
                             wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
                             let seqs: &[u64] = if conn == 0 { &[1, 3] } else { &[2, 3] };
                             for seq in seqs {
@@ -890,7 +985,7 @@ mod resolve_tests {
                     match serde_json::from_str::<RunnerToAgent>(&t) {
                         Ok(RunnerToAgent::Hello(h)) => {
                             hello_last = h.last_seq.map(|s| s.0);
-                            let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None };
+                            let ack = AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None, rule_approvals: false };
                             wtx.send(Message::Text(serde_json::to_string(&ack).unwrap().into())).await.unwrap();
                             wtx.send(Message::Text(r#"{"type":"run_turn_v2","seq":1}"#.to_string().into())).await.unwrap();
                             wtx.send(Message::Text(r#"{"type":"interrupt","seq":2}"#.to_string().into())).await.unwrap();

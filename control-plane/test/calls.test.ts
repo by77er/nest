@@ -2,7 +2,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import {
-  APPROVAL_EVENTS, APPROVAL_STATUSES, approvalStep, approvalUsable, ASK_EVENTS, ASK_STATUSES, askRoute, askStep, CALL_EVENTS, CALL_STATUSES, CallLedger, callStep,
+  APPROVAL_EVENTS, APPROVAL_STATUSES, approvalExpiry, approvalStep, approvalUsable, ASK_EVENTS, ASK_STATUSES, askRoute, askStep, CALL_EVENTS, CALL_STATUSES, CallLedger, callStep,
 } from "../src/lib/calls";
 import type { ToolOutcome } from "../src/protocol/control";
 import { JOURNAL_EVENTS, JOURNAL_STATUSES, journalStep } from "../src/lib/brokered";
@@ -97,15 +97,27 @@ describe("the ledgers' steps: every status and event, and nothing leaves a final
   });
 
   it.each([
-    ["approved, unspent, unexpired", { status: "approved", expires_ms: 200, used_by: null }, true],
-    ["spent on this call (its redelivery)", { status: "approved", expires_ms: 200, used_by: "k" }, true],
-    ["spent on another call", { status: "approved", expires_ms: 200, used_by: "other" }, false],
-    ["expired at this instant", { status: "approved", expires_ms: 100, used_by: null }, false],
-    ["no expiry recorded", { status: "approved", expires_ms: null, used_by: null }, false],
-    ["pending", { status: "pending", expires_ms: 200, used_by: null }, false],
-    ["denied", { status: "denied", expires_ms: 200, used_by: null }, false],
+    ["a sink's: approved, unspent, unexpired", { status: "approved", kind: "sink", expires_ms: 200, used_by: null }, true],
+    ["a sink's: spent on this call (its redelivery)", { status: "approved", kind: "sink", expires_ms: 200, used_by: "k" }, true],
+    ["a sink's: spent on another call", { status: "approved", kind: "sink", expires_ms: 200, used_by: "other" }, false],
+    ["a sink's: expired at this instant", { status: "approved", kind: "sink", expires_ms: 100, used_by: null }, false],
+    ["a sink's: no expiry recorded", { status: "approved", kind: "sink", expires_ms: null, used_by: null }, false],
+    ["a sink's: pending", { status: "pending", kind: "sink", expires_ms: 200, used_by: null }, false],
+    ["a sink's: denied", { status: "denied", kind: "sink", expires_ms: 200, used_by: null }, false],
+    // A rule's never expires (the owner's decision, 2026-11-11), but is still spent on one call.
+    ["a rule's: approved, unspent, no expiry", { status: "approved", kind: "rule", expires_ms: null, used_by: null }, true],
+    ["a rule's: an expiry long past is ignored", { status: "approved", kind: "rule", expires_ms: 1, used_by: null }, true],
+    ["a rule's: spent on this call (its redelivery)", { status: "approved", kind: "rule", expires_ms: null, used_by: "k" }, true],
+    ["a rule's: spent on another call", { status: "approved", kind: "rule", expires_ms: null, used_by: "other" }, false],
+    ["a rule's: pending", { status: "pending", kind: "rule", expires_ms: null, used_by: null }, false],
+    ["a rule's: denied", { status: "denied", kind: "rule", expires_ms: null, used_by: null }, false],
   ] as const)("approvalUsable: %s", (_n, a, usable) => {
     expect(approvalUsable(a, "k", 100)).toBe(usable);
+  });
+
+  it("approvalExpiry: a sink's approval expires after the TTL, a rule's never", () => {
+    expect(approvalExpiry("sink", 1000, 60)).toBe(1060);
+    expect(approvalExpiry("rule", 1000, 60)).toBeNull();
   });
 });
 
@@ -154,32 +166,32 @@ describe("CallLedger: the guards are the ledger's", () => {
     await withLedger((l) => {
       l.requestApproval("ask_p", "notes_send", "d1", "mcp__nest__notes_send");
       // Undecided, it can't be spent.
-      expect(l.takeApproval("notes_send", "d1", "k1", 50)).toBe(false);
+      expect(l.takeApproval("notes_send", "d1", "k1", 50)).toBeUndefined();
       expect(l.decide("ask_p", true, 100)).toBe(true);
       // Decided, it stays: a later denial or a new expiry changes nothing.
       expect(l.decide("ask_p", false, 999)).toBe(false);
       expect(l.decide("ask_p", true, 999)).toBe(false);
       expect(l.approvalOf("ask_p")?.status).toBe("approved");
-      expect(l.takeApproval("notes_send", "other-digest", "k1", 50)).toBe(false);
-      expect(l.takeApproval("notes_send", "d1", "k1", 50)).toBe(true);
-      expect(l.takeApproval("notes_send", "d1", "k1", 60)).toBe(true); // its redelivery
-      expect(l.takeApproval("notes_send", "d1", "k2", 60)).toBe(false);
-      expect(l.takeApproval("notes_send", "d1", "k1", 100)).toBe(false); // expired (the first expiry stood)
+      expect(l.takeApproval("notes_send", "other-digest", "k1", 50)).toBeUndefined();
+      expect(l.takeApproval("notes_send", "d1", "k1", 50)).toBe("ask_p");
+      expect(l.takeApproval("notes_send", "d1", "k1", 60)).toBe("ask_p"); // its redelivery
+      expect(l.takeApproval("notes_send", "d1", "k2", 60)).toBeUndefined();
+      expect(l.takeApproval("notes_send", "d1", "k1", 100)).toBeUndefined(); // expired (the first expiry stood)
       // A denial can't be spent or reversed.
       l.requestApproval("ask_d", "notes_send", "d2");
       expect(l.decide("ask_d", false, 100)).toBe(true);
       expect(l.decide("ask_d", true, 100)).toBe(false);
-      expect(l.takeApproval("notes_send", "d2", "k3", 50)).toBe(false);
+      expect(l.takeApproval("notes_send", "d2", "k3", 50)).toBeUndefined();
       // Two approvals of the same call: each is spent on one call key.
       l.requestApproval("ask_1", "x", "d");
       l.decide("ask_1", true, 100);
       l.requestApproval("ask_2", "x", "d");
       l.decide("ask_2", true, 100);
-      expect(l.takeApproval("x", "d", "ka", 50)).toBe(true);
-      expect(l.takeApproval("x", "d", "ka", 50)).toBe(true); // a redelivery uses the one it spent, not the other
-      expect(l.takeApproval("x", "d", "kb", 50)).toBe(true);
-      expect(l.takeApproval("x", "d", "kc", 50)).toBe(false);
-      expect(l.takeApproval("x", "d", "ka", 50)).toBe(true);
+      expect(l.takeApproval("x", "d", "ka", 50)).toBe("ask_1");
+      expect(l.takeApproval("x", "d", "ka", 50)).toBe("ask_1"); // a redelivery uses the one it spent, not the other
+      expect(l.takeApproval("x", "d", "kb", 50)).toBe("ask_2");
+      expect(l.takeApproval("x", "d", "kc", 50)).toBeUndefined();
+      expect(l.takeApproval("x", "d", "ka", 50)).toBe("ask_1");
     });
   });
 
@@ -192,14 +204,146 @@ describe("CallLedger: the guards are the ledger's", () => {
       sql.exec("UPDATE approvals SET created_ms = 1 WHERE ask = 'ask_old'");
       sql.exec("UPDATE approvals SET created_ms = 2, used_by = 'ka' WHERE ask = 'ask_new'");
       const spentOn = (ask: string) => sql.exec<{ used_by: string | null }>("SELECT used_by FROM approvals WHERE ask = ?", ask).one().used_by;
-      expect(l.takeApproval("x", "d", "ka", 50)).toBe(true);
+      expect(l.takeApproval("x", "d", "ka", 50)).toBe("ask_new");
       // The older, unspent one is left for another call.
       expect(spentOn("ask_old")).toBeNull();
-      expect(l.takeApproval("x", "d", "kb", 50)).toBe(true);
+      expect(l.takeApproval("x", "d", "kb", 50)).toBe("ask_old");
       expect(spentOn("ask_old")).toBe("kb");
-      expect(l.takeApproval("x", "d", "kc", 50)).toBe(false);
+      expect(l.takeApproval("x", "d", "kc", 50)).toBeUndefined();
     });
   });
+
+  it("a rule's approval never expires, is spent on one call, and never crosses with a sink's of the same name and arguments", async () => {
+    await withLedger((l, sql) => {
+      expect(l.checkRule("WebFetch", "d", "k0", 10)).toBeUndefined();
+      l.requestApproval("ask_r", "WebFetch", "d", "WebFetch", "rule");
+      expect(l.checkRule("WebFetch", "d", "k0", 10)).toEqual({ status: "pending", ask: "ask_r" });
+      // A sink's approval of the same name and arguments neither answers it nor is spent by it.
+      l.requestApproval("ask_s", "WebFetch", "d", "WebFetch");
+      l.decide("ask_s", true, 1_000);
+      expect(l.checkRule("WebFetch", "d", "k1", 10)).toEqual({ status: "pending", ask: "ask_r" });
+      expect(l.decide("ask_r", true, approvalExpiry("rule", 10, 60))).toBe(true);
+      expect(sql.exec<{ e: number | null }>("SELECT expires_ms AS e FROM approvals WHERE ask = 'ask_r'").one().e).toBeNull();
+      expect(l.approvalOf("ask_r")?.kind).toBe("rule");
+      expect(l.approvalOf("ask_s")?.kind).toBe("sink");
+      // Answered whenever, used whenever: a century on, it lets one call through.
+      const later = 10 + 100 * 365 * 86_400_000;
+      expect(l.checkRule("WebFetch", "d", "k2", later)).toEqual({ status: "approved", ask: "ask_r" });
+      expect(l.checkRule("WebFetch", "d", "k2", later)).toEqual({ status: "approved", ask: "ask_r" }); // the same check again
+      expect(l.checkRule("WebFetch", "d", "k3", later)).toBeUndefined();
+      // The sink's approval is still unspent, for a sink call.
+      expect(l.takeApproval("WebFetch", "d", "ks", 50)).toBe("ask_s");
+      expect(l.pendingApproval("WebFetch", "d")).toBeUndefined();
+    });
+  });
+
+  it("an approvals row from before `kind` (the previous release's) reads as a sink's", async () => {
+    await withLedger((_l, sql) => {
+      // The previous release's table: no `kind` column.
+      sql.exec("DROP TABLE approvals");
+      sql.exec(`CREATE TABLE approvals (ask TEXT PRIMARY KEY, name TEXT NOT NULL, digest TEXT NOT NULL,
+        status TEXT NOT NULL, expires_ms INTEGER, used_by TEXT, created_ms INTEGER NOT NULL, tool TEXT)`);
+      sql.exec("INSERT INTO approvals (ask, name, digest, status, expires_ms, used_by, created_ms, tool) VALUES ('ask_old', 'x', 'd', 'approved', 100, NULL, 1, NULL)");
+      const l = new CallLedger(sql);
+      expect(l.approvalOf("ask_old")?.kind).toBe("sink");
+      expect(l.checkRule("x", "d", "k", 50)).toBeUndefined();
+      expect(l.takeApproval("x", "d", "k", 50)).toBe("ask_old");
+    });
+  });
+
+  it("one approval, one call: every sequence of checks, redeliveries, decisions, prunes and evictions (bounded exhaustive)", async () => {
+    // The steps AgentDO's `approvalCheck` and `answerAsk` take on the ledger, explored over every sequence
+    // of up to DEPTH actions on the real ledger and SQLite. `check` is a new call (a fresh key: another
+    // concurrent identical call, the model's retry, a restarted brain's or a new epoch's call); `again`
+    // repeats the last check's key; `prune` runs a century on, everything aged; `evict` builds the ledger
+    // anew on the same storage (an eviction or a new release); `sink` approves a sink call of the same name
+    // and arguments. Bounds: 7 actions, depth 5 (16,807 sequences), one call's arguments.
+    const ACTIONS = ["check", "again", "approve", "deny", "prune", "evict", "sink"] as const;
+    const DEPTH = 5;
+    const CENTURY = 100 * 365 * 86_400_000;
+    // Each kind of interesting state is reached, so the checks below aren't vacuous.
+    const reached = { afterPrune: 0, afterEvict: 0, besideSink: 0, refusedAfterGrant: 0, againGranted: 0 };
+    await withLedger((first, sql) => {
+      let n = 0;
+      const run = (seq: readonly (typeof ACTIONS)[number][]) => {
+        const tool = `T${++n}`;
+        for (const t of ["tool_calls", "asks", "approvals"]) sql.exec(`DELETE FROM ${t}`);
+        let l = first;
+        let now = Date.now();
+        let keys = 0;
+        let sinks = 0;
+        let asks = 0;
+        let pruned = false;
+        let evicted = false;
+        let last: string | undefined;
+        const granted = new Map<string, string>(); // key -> ask it was let through on
+        let approvedAsks = 0;
+        let open: string | undefined; // the ask awaiting the operator
+        const unspent = () => sql.exec<{ n: number }>(
+          "SELECT COUNT(*) AS n FROM approvals WHERE name = ? AND kind = 'rule' AND status = 'approved' AND used_by IS NULL", tool).one().n;
+        const check = (key: string) => {
+          const before = unspent();
+          const r = l.checkRule(tool, "d", key, now);
+          if (r?.status === "approved") {
+            const prior = granted.get(key);
+            if (prior !== undefined) reached.againGranted++;
+            if (pruned) reached.afterPrune++;
+            if (evicted) reached.afterEvict++;
+            expect(prior === undefined || prior === r.ask, `${seq}: a key keeps its approval`).toBe(true);
+            granted.set(key, r.ask);
+          } else {
+            // Not let through although an approval was waiting, and not because this key was let through before.
+            expect(before, `${seq}: an unspent approval let nothing through`).toBe(0);
+            if (granted.size > 0) reached.refusedAfterGrant++;
+            if (sinks > 0) reached.besideSink++;
+            if (r) expect(r.ask, `${seq}: the open ask is reused`).toBe(open);
+            else {
+              expect(open, `${seq}: a second ask while one is open`).toBeUndefined();
+              open = `ask_${tool}_${++asks}`;
+              l.recordAsk({ ask: open, call: `cal_${key}`, epoch: 1, question: "q", status: "async", deadline: 0 });
+              l.requestApproval(open, tool, "d", tool, "rule");
+            }
+          }
+        };
+        for (const a of seq) {
+          if (a === "check") check(last = `k${++keys}`);
+          else if (a === "again" && last) check(last);
+          else if ((a === "approve" || a === "deny") && open) {
+            expect(l.answer(open, a)).toBe(true);
+            expect(l.decide(open, a === "approve", approvalExpiry("rule", now, 60_000))).toBe(true);
+            if (a === "approve") approvedAsks++;
+            open = undefined;
+          } else if (a === "prune") {
+            now += CENTURY;
+            for (const t of ["tool_calls", "asks", "approvals"]) sql.exec(`UPDATE ${t} SET created_ms = 1`);
+            l.prune(now);
+            pruned = true;
+          } else if (a === "evict") {
+            l = new CallLedger(sql);
+            evicted = true;
+          }
+          else if (a === "sink") {
+            const ask = `ask_${tool}_sink${++sinks}`;
+            l.requestApproval(ask, tool, "d", tool);
+            l.decide(ask, true, now + 60_000);
+          }
+          // Safety: never more calls let through than approvals given, and each approval lets one through.
+          const distinct = new Set(granted.values());
+          expect(granted.size, `${seq}: calls let through`).toBeLessThanOrEqual(approvedAsks);
+          expect(distinct.size, `${seq}: one call per approval`).toBe(granted.size);
+          // Nothing lost: every approval given is spent on a call or still waiting for one.
+          expect(granted.size + unspent(), `${seq}: approvals kept`).toBe(approvedAsks);
+        }
+      };
+      const explore = (prefix: (typeof ACTIONS)[number][]) => {
+        if (prefix.length) run(prefix);
+        if (prefix.length < DEPTH) for (const a of ACTIONS) explore([...prefix, a]);
+      };
+      explore([]);
+      expect(n).toBe((7 ** (DEPTH + 1) - 7) / 6);
+    });
+    for (const [what, count] of Object.entries(reached)) expect(count, `reached: ${what}`).toBeGreaterThan(0);
+  }, 60_000); // ~20k sequences on SQLite: a few seconds here, more on a loaded CI runner
 
   it("a call dispatched again counts as begun then: the prune doesn't take it for an old one; a finished one is left as it is", async () => {
     await withLedger((l, sql) => {
@@ -242,7 +386,15 @@ describe("CallLedger: the guards are the ledger's", () => {
       l.requestApproval("ask_open", "x", "d");
       l.requestApproval("ask_spent", "x", "d2");
       l.decide("ask_spent", true, 5);
-      for (const a of ["ask_open", "ask_spent"]) age("approvals", "ask", a);
+      // A rule's approval stays until it is spent (it never expires); a spent or denied one goes.
+      l.requestApproval("ask_rule", "WebFetch", "d3", "WebFetch", "rule");
+      l.decide("ask_rule", true, null);
+      l.requestApproval("ask_rule_spent", "WebFetch", "d4", "WebFetch", "rule");
+      l.decide("ask_rule_spent", true, null);
+      l.checkRule("WebFetch", "d4", "k", 0);
+      l.requestApproval("ask_rule_denied", "WebFetch", "d5", "WebFetch", "rule");
+      l.decide("ask_rule_denied", false, null);
+      for (const a of ["ask_open", "ask_spent", "ask_rule", "ask_rule_spent", "ask_rule_denied"]) age("approvals", "ask", a);
 
       l.prune(cutoff);
       // Old calls go whatever their status: one that never finished can't any more.
@@ -259,6 +411,9 @@ describe("CallLedger: the guards are the ledger's", () => {
       expect(l.approvalOf("ask_open")?.status).toBe("pending");
       expect(l.ask("ask_answered")).toBeUndefined();
       expect(l.approvalOf("ask_spent")).toBeUndefined();
+      expect(l.approvalOf("ask_rule")?.status).toBe("approved");
+      expect(l.approvalOf("ask_rule_spent")).toBeUndefined();
+      expect(l.approvalOf("ask_rule_denied")).toBeUndefined();
       expect(l.open().map((a) => a.ask).sort()).toEqual(["ask_cli", "ask_open", "ask_sync", "ask_sync_new"]);
     });
   });

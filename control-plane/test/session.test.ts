@@ -257,6 +257,81 @@ describe("platform tool relay", () => {
     await adminJson("/v1/agents/agt_nobody00000000000000000000/asks", {}, 404);
   });
 
+  it("approval_check: a call a tool rule holds is asked once, and approving it lets exactly that call through once", async () => {
+    const s = await setup();
+    const { ws, ack } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    expect(ack.rule_approvals).toBe(true);
+    const check = async (request: string, input: unknown) => {
+      ws.send({ type: "approval_check", request, call: `cal_${request}`, tool: "WebFetch", input });
+      return (await ws.next("approval_checked", (m) => m.request === request)).outcome;
+    };
+    const answer = (ask: string, text: string) => adminJson(`/v1/agents/${s.agent}/asks/${ask}/answer`, { body: { answer: text } });
+    const lastTurn = async () => (await agentStub(s.agent).turns()).at(-1)!.input;
+    const docs = { url: "https://docs.rs/serde", prompt: "p" };
+
+    const first = await check("req_1", docs);
+    expect(first).toEqual({ status: "pending", ask: expect.stringMatching(/^ask_/) });
+    const asks = await adminJson(`/v1/agents/${s.agent}/asks`);
+    expect(asks).toEqual([{ ask: first.ask, question: expect.stringContaining("WebFetch"), created_ms: expect.any(Number), approval: { name: "WebFetch", tool: "WebFetch" } }]);
+    expect(asks[0].question).toContain("cal_req_1");
+    // The model tries again before the operator answers: the same ask (its arguments' keys in another order).
+    expect(await check("req_2", { prompt: "p", url: "https://docs.rs/serde" })).toEqual(first);
+    expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toHaveLength(1);
+
+    expect((await answer(first.ask, "approve")).delivered).toBe("async");
+    // No expiry for a rule's approval: the turn says so by not naming one.
+    expect(await lastTurn()).toEqual({ kind: "ask_answer", text: `Approved (${first.ask}): call WebFetch again with exactly the same arguments. The approval is for that one call.` });
+    // Other arguments aren't approved by it.
+    const other = await check("req_3", { url: "https://evil.test", prompt: "p" });
+    expect(other.status).toBe("pending");
+    expect(other.ask).not.toBe(first.ask);
+    // Two identical calls at once: one goes through on the approval, the other is asked again.
+    ws.send({ type: "approval_check", request: "req_4", call: "cal_req_4", tool: "WebFetch", input: docs });
+    ws.send({ type: "approval_check", request: "req_5", call: "cal_req_5", tool: "WebFetch", input: docs });
+    const both = await Promise.all(["req_4", "req_5"].map(async (r) => (await ws.next("approval_checked", (m) => m.request === r)).outcome));
+    expect(both.filter((o) => o.status === "approved")).toEqual([{ status: "approved", ask: first.ask }]);
+    const again = both.find((o) => o.status === "pending")!;
+    expect(again.ask).not.toBe(first.ask);
+    expect(await check("req_6", docs)).toEqual(again);
+    // A denial: the call isn't let through, and the model is told it won't run.
+    await answer(again.ask, "no");
+    expect((await lastTurn()).text).toBe(`Denied (${again.ask}): WebFetch with those arguments wasn't sent and won't be. The operator answered: no`);
+    expect((await check("req_7", docs)).status).toBe("pending");
+    ws.close();
+  });
+
+  it("approval_check: an approval outlives its brain, and a stale runner neither spends it nor asks", async () => {
+    const s = await setup();
+    const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
+    const check = async (w: Ws, request: string) => {
+      w.send({ type: "approval_check", request, call: `cal_${request}`, tool: "mcp__nest__Bash", input: { command: "git push" } });
+      return (await w.next("approval_checked", (m) => m.request === request)).outcome;
+    };
+    const held = await check(ws, "req_1");
+    await adminJson(`/v1/agents/${s.agent}/asks/${held.ask}/answer`, { body: { answer: "yes" } });
+    // An epoch change between the digest and the spend (a newer brain lands): this runner is stale and nothing is spent.
+    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+      inst.testHooks["approvalCheck:afterDigest"] = async () => {
+        delete inst.testHooks["approvalCheck:afterDigest"];
+        (inst as any).update((i: any) => {
+          i.agent_epoch = 2;
+          i.brain.epoch = 2;
+        });
+      };
+    });
+    expect(await check(ws, "req_2")).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
+    expect(await check(ws, "req_3")).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
+    expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toEqual([]);
+    ws.close();
+    // The new brain (epoch 2, another runner process, the session resumed) makes the call: the approval lets it through, once.
+    const next = await Ws.connect(`/v1/agents/${s.agent}/session`, s.host.host_token);
+    next.send({ type: "hello", protocol_version: 1, agent: s.agent, host: s.host.host, instance_id: "rin_two", epoch: 2, session: SESSION });
+    expect((await next.next("hello_ack")).rule_approvals).toBe(true);
+    expect(await check(next, "req_4")).toEqual({ status: "approved", ask: held.ask });
+    expect((await check(next, "req_5")).status).toBe("pending");
+    next.close();
+  });
+
   it("enforces roles, validates arguments, and reports unimplemented tools", async () => {
     const s = await setup();
     const { ws } = await connectRunner(s.agent, s.host.host, s.host.host_token);
