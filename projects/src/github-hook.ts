@@ -230,7 +230,7 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
   const owner = routed.anchored ? eventOwner(payload) : null;
   const repoOwner = owner?.type === "User" ? owner.id : null;
   // A default comments user that isn't the owner any more goes, before anything is decided by it (README.md#pr-comments).
-  if (owner) await project(env, p.id).repoOwnerSeen({ id: owner.id, login: owner.login });
+  if (owner) await project(env, p.id).repoOwnerSeen({ id: owner.id, login: owner.login }, routed.recorded_owner);
   const of = { project: p.id, repo: p.repo };
   const action = str(payload.action);
 

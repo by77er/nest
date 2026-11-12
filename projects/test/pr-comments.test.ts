@@ -173,7 +173,7 @@ describe("who is set", () => {
       sql.exec("DROP TABLE pr_told");
       for (const c of ["pr_read_next_ms", "pr_read_last_ms", "pr_read_attempts"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       // And the comments default's step (README.md#pr-comments).
-      for (const c of ["comments_default_id", "comments_cleared"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("UPDATE schema_version SET v = ?", step);
       migrate(st.storage, MIGRATIONS);
       expect(sql.exec("SELECT attach_next_ms FROM settings").one().attach_next_ms).toBe(0);
@@ -198,6 +198,11 @@ describe("who is set", () => {
     // The new owner's comments don't count either: nobody's do until the owner chooses.
     await deliverGithub("issue_comment", { ...issueComment(s, { user: { login: newOwner, id: ownerIdOf(newOwner), type: "User" } }), repository: moved });
     expect(said(s.worker)).toEqual([]);
+    // A comments user set behind this release's back (a rolled-back release's choice): the notice is answered.
+    const dob = env.PROJECT.get(env.PROJECT.idFromName(s.project));
+    await runInDurableObject(dob, (_o, st) => { st.storage.sql.exec("UPDATE settings SET comments_from_id = 4321"); });
+    expect(((await api(token, "GET", `/api/projects/${s.project}/attention`)).body as any[]).filter((x) => x.kind === "comments_cleared")).toEqual([]);
+    await runInDurableObject(dob, (_o, st) => { st.storage.sql.exec("UPDATE settings SET comments_from_id = NULL"); });
     // Left unset: the notice goes, nobody stays.
     expect((await api(token, "POST", `/api/projects/${s.project}/comments-cleared/dismiss`)).status).toBe(200);
     expect(((await api(token, "GET", `/api/projects/${s.project}/attention`)).body as any[]).filter((x) => x.kind === "comments_cleared")).toEqual([]);
@@ -211,13 +216,36 @@ describe("who is set", () => {
       const got = await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(s.project)), (_o, st) => {
         const sql = st.storage.sql;
         const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("comments_default_id")));
-        for (const c of ["comments_default_id", "comments_cleared"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+        for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
         sql.exec("UPDATE schema_version SET v = ?", step);
         migrate(st.storage, MIGRATIONS);
         return sql.exec("SELECT comments_default_id AS d FROM settings").one().d;
       });
       expect(got).toBe(want);
     }
+  });
+
+  it("a project from before, re-attached on the previous release after a transfer: its default is still told by the owner DirectoryDO recorded, and goes at the next transfer", async () => {
+    const s = await setup();
+    const dob = env.PROJECT.get(env.PROJECT.idFromName(s.project));
+    // The shape before this release's step, and ProjectDO's owner copy moved by a re-attach (another user owns
+    // the repo now): the comments user, the default from the first attach, no longer matches it.
+    const marked = await runInDurableObject(dob, (_o, st) => {
+      const sql = st.storage.sql;
+      const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("comments_default_id")));
+      for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      sql.exec("UPDATE settings SET repo_owner_id = 55501, repo_owner_login = 'interim'");
+      sql.exec("UPDATE schema_version SET v = ?", step);
+      migrate(st.storage, MIGRATIONS);
+      return sql.exec("SELECT comments_default_id AS d FROM settings").one().d;
+    });
+    expect(marked).toBeNull();
+    // DirectoryDO's last read still records the first owner: an event naming another tells the default apart, and it goes.
+    const to = `n-${rand()}/moved`;
+    fake.github.rename(s.repo, to);
+    await deliverGithub("issue_comment", { ...issueComment(s), repository: { full_name: to, id: repoIdOf(s.repo) } });
+    expect((await api(token, "GET", `/api/projects/${s.project}`)).body.settings.comments_from).toBeNull();
+    expect(said(s.worker)).toEqual([]);
   });
 
   it("a comments user the owner chose stays whoever owns the repo; a re-read clears a default one as an event does", async () => {

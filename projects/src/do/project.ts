@@ -615,6 +615,11 @@ export const MIGRATIONS = [
     "ALTER TABLE settings ADD COLUMN comments_default_id INTEGER",
     "UPDATE settings SET comments_default_id = comments_from_id WHERE comments_from_id IS NOT NULL AND comments_from_id = repo_owner_id",
     "ALTER TABLE settings ADD COLUMN comments_cleared TEXT",
+    // Whether a row from before is marked yet (0): its comments user is the default too when it's the owner
+    // DirectoryDO recorded at the binding's last read (`repoOwnerSeen`), since a re-attach on the previous
+    // release may have moved ProjectDO's copy. New rows, and any decision, are marked (1).
+    "ALTER TABLE settings ADD COLUMN comments_marked INTEGER NOT NULL DEFAULT 1",
+    "UPDATE settings SET comments_marked = 0",
   ],
 ] as const;
 
@@ -793,7 +798,7 @@ export class ProjectDO extends DurableObject<Env> {
       // The owner's own choice: never the attach's default, so a transfer doesn't clear it; any notice of a
       // cleared default is answered by it.
       const login = who?.login ?? (who && who.id === before.comments_from?.id ? before.comments_from.login : null);
-      this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1, comments_default_id = NULL, comments_cleared = NULL", who?.id ?? null, login);
+      this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1, comments_default_id = NULL, comments_cleared = NULL, comments_marked = 1", who?.id ?? null, login);
     }
     if (u.auto_assign !== undefined) this.sql.exec("UPDATE settings SET auto_assign = ?", u.auto_assign ? 1 : 0);
     if (u.max_workers !== undefined) this.sql.exec("UPDATE settings SET max_workers = ?", clampWorkers(u.max_workers));
@@ -1160,9 +1165,16 @@ export class ProjectDO extends DurableObject<Env> {
    * The repo's owner as GitHub has it now (a signed event routed by the bound id, or a read of the bound repo):
    * a PR comments user that is only the attach's default, and isn't that owner, goes (README.md#pr-comments).
    * Nobody's comments count then, and Needs you says so until the owner decides or dismisses it: the new owner
-   * is never taken by itself. A comments user the owner chose is never touched.
+   * is never taken by itself. A comments user the owner chose is never touched. `recorded`: the owner
+   * DirectoryDO recorded at the binding's last read, before this one: a row from before the default was
+   * marked counts its comments user as the default when it's that owner (once, the first time it's known).
    */
-  async repoOwnerSeen(owner: { id: number; login: string }): Promise<void> {
+  async repoOwnerSeen(owner: { id: number; login: string }, recorded: number | null = null): Promise<void> {
+    if (!this.settingsRow()) return;
+    if (recorded !== null) {
+      this.sql.exec("UPDATE settings SET comments_default_id = comments_from_id WHERE comments_marked = 0 AND comments_default_id IS NULL AND comments_from_id = ?", recorded);
+      this.sql.exec("UPDATE settings SET comments_marked = 1 WHERE comments_marked = 0");
+    }
     const r = this.settingsRow();
     if (!r || r.comments_default_id === null || r.comments_default_id === undefined || r.comments_from_id !== r.comments_default_id || r.comments_from_id === owner.id) return;
     const was = { id: r.comments_from_id as number, login: (r.comments_from_login as string | null) ?? null };
@@ -2341,7 +2353,9 @@ export class ProjectDO extends DurableObject<Env> {
     const pr = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(created_ms) AS at FROM proposals WHERE state = 'untriaged'").one();
     const oldest = [t.at, pr.at].filter((x): x is number => x !== null);
     const triage: Attention[] = t.n + pr.n ? [{ kind: "triage", count: t.n, proposals: pr.n, at_ms: oldest.length ? Math.min(...oldest) : Date.now() }] : [];
-    const c = this.settingsRow()?.comments_cleared;
+    // Listed only while nobody is the comments user: a choice since (the previous release's too) answers it.
+    const sr = this.settingsRow();
+    const c = sr && (sr.comments_from_id === null || sr.comments_from_id === undefined) ? sr.comments_cleared : null;
     const cleared: Attention[] = typeof c === "string" ? [{ kind: "comments_cleared", ...(JSON.parse(c) as CommentsCleared) }] : [];
     return ok([...open, ...blocked, ...secrets, ...triage, ...cleared].sort((a, b) => a.at_ms - b.at_ms));
   }
@@ -3993,6 +4007,7 @@ export class ProjectDO extends DurableObject<Env> {
       // One that doesn't bind (another project's, or another id) is shown on the Admin page; the attach goes on.
       // The token's installation only when GitHub's name for the repo is the one it was minted for (`ownInstallation`).
       // A binding not read from GitHub yet binds only a repo with the owner recorded at attach (`bindRepo`).
+      const prior = await directory(this.env).binding(s.id);
       const bound = await directory(this.env).bindRepo(s.id, { id: info.id, full_name: info.full_name, owner: { id: owner.id, login: owner.login, type: owner.type }, installation_id: ownInstallation(repo, info.full_name, gh.installationId) }, "fill", await this.attachedOwner());
       // The owner below is the bound repo's only: one GitHub answers for a name that's another repo's now isn't.
       if (bound.ok) {
@@ -4001,8 +4016,8 @@ export class ProjectDO extends DurableObject<Env> {
         // (trust is decided by each event's owner, README.md#the-review-gate). Removed the release after.
         this.sql.exec("UPDATE settings SET repo_owner_id = ?, repo_owner_login = ?", user ? owner.id : null, user ? owner.login : null);
         // The default, marked as one (`comments_default_id`): a transfer clears it, never a choice.
-        if (user) this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1, comments_default_id = ? WHERE comments_decided = 0", owner.id, owner.login, owner.id);
-        await this.repoOwnerSeen(owner);
+        if (user) this.sql.exec("UPDATE settings SET comments_from_id = ?, comments_from_login = ?, comments_decided = 1, comments_default_id = ?, comments_marked = 1 WHERE comments_decided = 0", owner.id, owner.login, owner.id);
+        await this.repoOwnerSeen(owner, prior?.owner?.id ?? null);
       }
       const detail: AttachDetail = { ...r, at_ms: Date.now() };
       this.sql.exec(

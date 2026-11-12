@@ -346,7 +346,7 @@ describe("the migration", () => {
       sql.exec("DROP TABLE pr_told");
       for (const c of ["pr_read_next_ms", "pr_read_last_ms", "pr_read_attempts"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       // And the comments default's step (README.md#pr-comments).
-      for (const c of ["comments_default_id", "comments_cleared"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       expect(step).toBe(MIGRATIONS.length - 18);
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, pr_node, am_status, created_ms, updated_ms) VALUES ('tsk_old', 't', '', 'in_review', 1, 7, 'PR_x', '{"state":"enabled"}', 1, 2)`);

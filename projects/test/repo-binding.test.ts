@@ -457,6 +457,17 @@ describe("a sync reads again what may have moved", () => {
     expect(await binding(b)).toMatchObject({ installation_id: reinstalled, refused: null });
   });
 
+  it("an owner the previous release wrote (without its kind) has no kind, so no sync copies it as a user's", async () => {
+    const p = await newProject();
+    const owner = p.repo.split("/")[0]!;
+    expect((await binding(p)).owner).toEqual({ id: ownerIdOf(owner), login: owner, type: "User" });
+    // A rolled-back release's read: another owner (an organization, say), its kind column left as it was.
+    await dirSql("UPDATE projects SET repo_owner_id = 55503, repo_owner_login = 'an-org' WHERE id = ?", p.id);
+    expect((await binding(p)).owner).toEqual({ id: 55503, login: "an-org", type: null });
+    expect((await sync()).status).toBe(200);
+    expect(await oldOwnerCopy(p)).toEqual({ repo_owner_id: ownerIdOf(owner), repo_owner_login: owner });
+  });
+
   it("attach takes a token's installation only for the name GitHub answers with: a redirected name's may be another account's", async () => {
     const from = `o-${rand()}/r-${rand()}`;
     const to = `elsewhere-${rand()}/moved`;
@@ -508,6 +519,15 @@ describe("a binding not read from GitHub yet (no id, or one from an event)", () 
     expect(rr.body.mismatch).toMatchObject({ bound: { id: null, owner: { id: ownerIdOf(p.repo.split("/")[0]!) } }, github: { id: taken, owner: { id: mallory.id }, same_owner: false } });
     expect((await binding(p)).repo_id).toBeNull();
     expect((await bind(p, taken)).body.binding).toMatchObject({ repo_id: taken });
+  });
+
+  it("Settings shows the owner of the bound repo only: GitHub's repo for the name being another, nobody", async () => {
+    const p = await newProject();
+    const owner = p.repo.split("/")[0]!;
+    expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.repo_owner).toEqual({ id: ownerIdOf(owner), login: owner });
+    // Bound to another id than GitHub's repo for the name (a fresh one, so nothing shown before is reused).
+    await dirSql("UPDATE projects SET repo_id = ? WHERE id = ?", repoIdOf(p.repo) + 7, p.id);
+    expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.repo_owner).toBeNull();
   });
 
   it("\"Use the repo owner\" and an import read the owner of the bound repo only: GitHub's repo for the name being another, they're refused", async () => {

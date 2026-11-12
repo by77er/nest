@@ -92,8 +92,10 @@ const MIGRATIONS = [
     // When a refused event last made the binding be read again, to follow nest's answer for the installation
     // (README.md#the-repos-binding): at most once a minute per project.
     "ALTER TABLE projects ADD COLUMN installation_checked_ms INTEGER",
-    // The bound repo's owner's kind as GitHub answered at the binding's last read (`User`, `Organization`):
-    // what the previous release's copy of the owner, rewritten at each sync, takes (a user's only).
+    // The bound repo's owner's kind as GitHub answered at the binding's last read, with the id it's of
+    // (`<id>:User`, `<id>:Organization`): the previous release writes the owner without it, so a kind whose
+    // id isn't the owner's now is unknown. What the previous release's owner copy, rewritten at each sync,
+    // takes (a user's only).
     "ALTER TABLE projects ADD COLUMN repo_owner_type TEXT",
   ],
 ] as const;
@@ -164,13 +166,19 @@ export const CREATE_POLICY: OutboxPolicy = { maxAttempts: 8 };
 const COLUMNS = "id, name, repo, created_ms, CASE WHEN pending IS NULL THEN 'ready' ELSE 'pending' END AS state";
 const BINDING = "id, name, repo, repo_id, repo_name, installation_id, repo_bound, repo_bound_ms, bind_error, repo_owner_id, repo_owner_login, repo_owner_type, refused_installation, refused_count, refused_ms";
 
+/** The owner's kind kept as `<id>:<kind>`: only while it's of the owner `id` (the previous release changes the owner without it). */
+function ownerKind(id: number, v: SqlStorageValue | undefined): string | null {
+  const prefix = `${id}:`;
+  return typeof v === "string" && v.startsWith(prefix) ? v.slice(prefix.length) : null;
+}
+
 function bindingOf(r: Record<string, SqlStorageValue>): RepoBinding {
   return {
     project: r.id as string, name: r.name as string, repo: r.repo as string, repo_id: (r.repo_id as number | null) ?? null,
     renamed_to: (r.repo_name as string | null) ?? null, installation_id: (r.installation_id as number | null) ?? null,
     bound: (r.repo_bound as "github" | "event" | null) ?? null, bound_ms: (r.repo_bound_ms as number | null) ?? null,
     error: (r.bind_error as string | null) ?? null,
-    owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: (r.repo_owner_login as string | null) ?? "", type: (r.repo_owner_type as string | null) ?? null },
+    owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: (r.repo_owner_login as string | null) ?? "", type: ownerKind(r.repo_owner_id as number, r.repo_owner_type) },
     refused: (r.refused_count as number | null) ? { installation: (r.refused_installation as number | null) ?? null, count: r.refused_count as number, last_ms: r.refused_ms as number } : null,
   };
 }
@@ -273,9 +281,9 @@ export class DirectoryDO extends DurableObject<Env> {
    * name taken): no project. A project whose App installation is known takes only events from that
    * installation (`installation.id`): any other, or none, is refused (README.md#the-repos-binding).
    */
-  async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null): Promise<{ project: ProjectRow; anchored: boolean } | { refused: string; project_id: string } | null> {
+  async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null): Promise<{ project: ProjectRow; anchored: boolean; recorded_owner: number | null } | { refused: string; project_id: string } | null> {
     const one = (where: string, v: SqlStorageValue) =>
-      this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS}, installation_id, repo_bound FROM projects WHERE ${where}`, v).toArray()[0] ?? null;
+      this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS}, installation_id, repo_bound, repo_owner_id FROM projects WHERE ${where}`, v).toArray()[0] ?? null;
     const row = (r: ProjectRow & Record<string, SqlStorageValue>): ProjectRow => ({ id: r.id, name: r.name, repo: r.repo, created_ms: r.created_ms, state: r.state });
     // Refused, and counted on the binding so the Admin page shows it: a reinstalled App's events would
     // otherwise all be dropped unseen (Re-read takes the new installation).
@@ -292,7 +300,8 @@ export class DirectoryDO extends DurableObject<Env> {
         // The name GitHub gives it now: a rename or transfer is noted (README.md#the-repos-binding).
         if (name) this.noteName(byId.id, name);
         // Anchored: routed by an id read from GitHub, so the event's repo is the project's (README.md#the-review-gate).
-        return { project: row(byId), anchored: byId.repo_bound === "github" };
+        // With the owner the binding's last read recorded (`repoOwnerSeen`'s marking of an old default).
+        return { project: row(byId), anchored: byId.repo_bound === "github", recorded_owner: (byId.repo_owner_id as number | null) ?? null };
       }
     }
     const byName = name ? one("repo = ? AND repo_id IS NULL", name.toLowerCase()) : null;
@@ -305,7 +314,7 @@ export class DirectoryDO extends DurableObject<Env> {
     }
     // Routed by its name alone: the repo under that name may be another's now (a login taken over), so
     // nothing of the event's repo (its owner) is trusted.
-    return { project: row(byName), anchored: false };
+    return { project: row(byName), anchored: false, recorded_owner: null };
   }
 
   /**
@@ -383,7 +392,7 @@ export class DirectoryDO extends DurableObject<Env> {
       `UPDATE projects SET repo_id = ?, repo_bound = 'github', repo_bound_ms = ?, bind_error = NULL, repo_name = CASE WHEN repo = ? THEN NULL ELSE ? END,
         repo_owner_id = ?, repo_owner_login = ?, repo_owner_type = ?,
         installation_id = CASE WHEN ? THEN ? ELSE COALESCE(?, installation_id) END WHERE id = ?`,
-      gh.id, Date.now(), name, name, gh.owner?.id ?? null, gh.owner?.login ?? null, gh.owner?.type ?? null,
+      gh.id, Date.now(), name, name, gh.owner?.id ?? null, gh.owner?.login ?? null, gh.owner?.type ? `${gh.owner.id}:${gh.owner.type}` : null,
       // Another repo chosen: its installation, whatever was stored. The same one: a nest that doesn't say keeps it.
       before.repo_id !== gh.id ? 1 : 0, installation, installation, project,
     );

@@ -48,7 +48,7 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
   const attached = b.bound === "github" ? null : await project(env, id).attachedOwner();
   const out = await dir.bindRepo(id, info, mode, attached);
   // The repo's owner as GitHub answers now, for the bound repo: a default comments user that isn't it any more goes.
-  if (out.ok && info.owner) await project(env, id).repoOwnerSeen(info.owner);
+  if (out.ok && info.owner) await project(env, id).repoOwnerSeen(info.owner, b.owner?.id ?? null);
   return out;
 }
 
