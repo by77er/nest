@@ -36,6 +36,8 @@ Per call, in AgentDO, in this order ([taint and sinks](../../tools/#taint-and-si
 6. **Run:** the epoch is checked and the journal row written `sending` in the same synchronous step as the request leaves.
 7. **Journal:** the outcome, durable before the result goes back.
 
+Each request an action sends (a retry, and a pull request's state read, included) is also an `outbound` event on the agent's live trace: the action, the host and path, the status or why there was none, sizes and duration, never the query, the credential or the body ([the live trace](../../../control-plane/api/#live-trace), 2026-11-12).
+
 ## Idempotency
 
 - **Natural keys:** a pull request is `(repo, head, base)` (GitHub keeps one open pull request per pair); a comment, issue or review comment is the call itself, found again by a hidden marker the posted text carries (`<!-- nest:<24 hex of SHA-256 of the call key> -->`), so no agent id is public; a request is the call.

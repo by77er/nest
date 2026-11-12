@@ -366,12 +366,12 @@ export async function revokeInstallationToken(api: GitHubApi, token: string): Pr
 }
 
 /** The client for this Worker: `GITHUB_API_URL` (a loopback fake only with `ALLOW_LOOPBACK_BROKERED=1`), else GitHub's. */
-export function githubApiOf(env: { GITHUB_API_URL?: string; ALLOW_LOOPBACK_BROKERED?: string }, timeoutMs?: number): GitHubApi {
+export function githubApiOf(env: { GITHUB_API_URL?: string; ALLOW_LOOPBACK_BROKERED?: string }, timeoutMs?: number, fetchFn?: typeof fetch): GitHubApi {
   const base = env.GITHUB_API_URL;
-  if (!base) return new GitHubApi(undefined, GITHUB_API, timeoutMs);
+  if (!base) return new GitHubApi(fetchFn, GITHUB_API, timeoutMs);
   const u = checkBaseUrl(base, env.ALLOW_LOOPBACK_BROKERED === "1");
   if (!u.ok) throw new NestError(ErrorCodes.INTERNAL, `GITHUB_API_URL: ${u.error}`, 500);
-  return new GitHubApi(undefined, base.replace(/\/+$/, ""), timeoutMs);
+  return new GitHubApi(fetchFn, base.replace(/\/+$/, ""), timeoutMs);
 }
 
 async function readCapped(res: Response): Promise<string> {

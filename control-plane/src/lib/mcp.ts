@@ -301,6 +301,8 @@ export interface RpcOptions {
   timeoutMs: number;
   /** The caller identity (`Nest-Identity`, lib/identity.ts), derived by the caller as the request leaves. */
   identity: string;
+  /** The fetch to send with (the platform's by default; a metered one records the request, lib/outbound.ts). */
+  fetchFn?: typeof fetch;
 }
 
 /** The caller identity for the next request, made ready as it leaves (each request asks again: the state it names may change between them). */
@@ -370,8 +372,9 @@ export async function rpc(url: string, message: { method: string; params?: unkno
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), o.timeoutMs);
   try {
-    // The global fetch, called as a plain function (as a method of another object it throws in workerd).
-    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", ...message }), signal: ctl.signal, redirect: "manual" });
+    // Called as a plain function (the global fetch as a method of another object throws in workerd).
+    const fetchFn = o.fetchFn ?? fetch;
+    const res = await fetchFn(url, { method: "POST", headers, body: JSON.stringify({ jsonrpc: "2.0", ...message }), signal: ctl.signal, redirect: "manual" });
     if (res.status === 404 && o.session) {
       await res.body?.cancel().catch(() => undefined);
       return { kind: "session_gone" };

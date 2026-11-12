@@ -284,6 +284,10 @@ const tainted = (agent: string) => runInDurableObject(agentStub(agent), (_: Agen
 const answer = (agent: string, ask: string, text: string) => adminJson(`/v1/agents/${agent}/asks/${ask}/answer`, { body: { answer: text } });
 const lastTurn = async (agent: string) => (await agentStub(agent).turns()).at(-1)!.input as { kind: string; text: string };
 const journal = (agent: string) => adminJson(`/v1/agents/${agent}/brokered`);
+/** Every event on the agent's trace ring, as stored. */
+const traceRows = (agent: string) => runInDurableObject(agentStub(agent), (_: AgentDO, st) =>
+  st.storage.sql.exec<{ body: string }>("SELECT body FROM trace ORDER BY seq").toArray().map((r) => JSON.parse(r.body) as Record<string, any>));
+const outbound = async (agent: string) => (await traceRows(agent)).filter((e) => e.type === "outbound");
 
 // --- Pure parts --------------------------------------------------------------------------------------------
 
@@ -377,6 +381,23 @@ describe("authority and the scan (pure)", () => {
 // --- GitHub actions through the pipeline -------------------------------------------------------------------
 
 describe("github actions", () => {
+  it("each request an action sends to GitHub is on the agent's trace, without the installation token or the body", async () => {
+    const r = repo();
+    const s = await setup([{ action: "github.comment", repos: [r] }]);
+    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 4, body: "comment-text-never-traced" })).status).toBe("ok");
+    const recs = await outbound(s.agent);
+    expect(recs).toContainEqual(expect.objectContaining({
+      type: "outbound", via: "brokered", name: "github.comment", method: "POST", host: "api.github.com", path: `/repos/${r}/issues/4/comments`, status: 201,
+      bytes_up: expect.any(Number), bytes_down: expect.any(Number), duration_ms: expect.any(Number),
+    }));
+    expect(recs.every((x) => x.name === "github.comment" && x.host === "api.github.com")).toBe(true);
+    const token = [...gh.tokens].find(([, v]) => v.repo === r.toLowerCase())?.[0];
+    expect(token).toBeTruthy();
+    const all = JSON.stringify(await traceRows(s.agent));
+    expect(all).not.toContain(token!);
+    expect(all).not.toContain("comment-text-never-traced");
+  });
+
   it("a comment goes out once through the App, with a token minted for that repo and those permissions only, audited without its value, cached, and journaled", async () => {
     const r = repo();
     const s = await setup([{ action: "github.comment", repos: [r] }]);
@@ -712,12 +733,30 @@ describe("http.request profiles", () => {
     expect(stub.requests.map((r) => r.path)).toEqual([`/${id}/a`, `/${id}/b`]);
   });
 
+  it("each request it sends is on the agent's trace: where, the outcome and the sizes; never a query value, the body or the injected credential", async () => {
+    const p = await profileSetup();
+    const body = JSON.stringify({ note: "body-text-never-traced" });
+    const o = await run(p.ws, "http_request", { profile: "p", method: "POST", path: "/v1/items", query: { q: "query-value-never-traced" }, body });
+    expect(o.status).toBe("ok");
+    const answer = o.content[0].text as string;
+    expect(await outbound(p.agent)).toEqual([expect.objectContaining({
+      type: "outbound", via: "brokered", name: "http.request", method: "POST", host: "http.test", path: `/${p.sid}/v1/items`, status: 200,
+      bytes_up: new TextEncoder().encode(body).length, bytes_down: new TextEncoder().encode(answer).length, duration_ms: expect.any(Number),
+    })]);
+    const all = JSON.stringify(await traceRows(p.agent));
+    // The stub echoes the credential back: the record has the answer's size, never its text.
+    expect(JSON.parse(answer).auth).toContain("*");
+    for (const never of [p.secret, "query-value-never-traced", "body-text-never-traced", "?q="]) expect(all).not.toContain(never);
+  });
+
   it("a lost answer is retried once for an idempotent method, never for POST", async () => {
     // vitest.config.ts: BROKERED_TIMEOUT_MS = 1500.
     const p = await profileSetup();
     p.stub.next.push({ delay: 2500 });
     expect((await run(p.ws, "http_request", { profile: "p", method: "GET", path: "/v1/items" })).status).toBe("ok");
     expect(p.stub.requests).toHaveLength(2);
+    // Each attempt is on the trace: the one that timed out without a status.
+    expect((await outbound(p.agent)).map((x) => [x.method, x.status ?? x.error])).toEqual([["GET", "aborted"], ["GET", 200]]);
     p.stub.next.push({ delay: 2500 });
     expect(await run(p.ws, "http_request", { profile: "p", method: "POST", path: "/v1/items", body: "{}" })).toMatchObject({ status: "error", error: { code: "outcome_unknown" } });
     expect(p.stub.requests).toHaveLength(3);
