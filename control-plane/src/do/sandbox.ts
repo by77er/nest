@@ -30,7 +30,7 @@ import { GITHUB_BINDING, GITHUB_READ_BINDING, githubEgress, GithubPush, readBind
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
 import { slotEnv } from "../lib/sandbox-env";
-import type { MintedInjection } from "./broker";
+import type { MintedInjection, SecretsChangedAnswer } from "./broker";
 import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 import {
   chainView, type ChainView, type GenRow, gcRootsOf, isRestoreSource, livePins, memoryToUnroot, type Pin, retention, retentionMode,
@@ -103,6 +103,10 @@ const AGENT_INJECT = "agent_inject";
 const AGENT_PUSH = "agent_github_push";
 /** A sandbox with client bindings pushes their secrets again this often, so a changed or deleted value reaches its proxy. */
 const CLIENT_SECRET_REFRESH_MS = 15 * 60_000;
+/** Failed pushes of a changed client secret in a row (`client_secrets`), for its backoff. */
+const CLIENT_PUSH_FAILS = "client_push_fails";
+/** A failed push of a changed client secret is tried again after 5 s, doubling, this many times; then the 15-minute push carries it. */
+const CLIENT_PUSH_ATTEMPTS = 8;
 /** Set once a read-only token was asked for, so a sandbox without any never asks BrokerDO to forget one. */
 const READ_MINTED = "read_token";
 /** A push allowlist, read-only repos, the push token's opt-ins and the client bindings, compared as one. */
@@ -921,6 +925,7 @@ export class SandboxDO extends DurableObject<Env> {
     await this.deadlines.clear("grants");
     await this.deadlines.clear("place");
     await this.deadlines.clear("inject_refresh");
+    await this.deadlines.clear("client_secrets");
     await this.deadlines.clear("expiry");
     await this.deadlines.clear("retention");
     await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).forgetInjections(before.sandbox);
@@ -1269,6 +1274,8 @@ export class SandboxDO extends DurableObject<Env> {
       } else if (key === "inject_refresh") {
         const info = this.info_();
         if (info.host && ACTIVE_STATES.includes(info.state)) await this.pushSecrets(true);
+      } else if (key === "client_secrets") {
+        await this.pushChangedClientSecrets();
       } else if (key === "turn_checkpoint") {
         await this.turnEndCheckpoint();
       } else if (key === "idle") {
@@ -1346,6 +1353,54 @@ export class SandboxDO extends DurableObject<Env> {
    * Checked twice: whatever arrives while BrokerDO minted (a fence, a move, an allowlist change) makes
    * this push stale, and it is dropped; the change that did it pushes again.
    */
+  /** The operator's and constructed bindings' names: a client binding never takes one (its secret would go out under that one). */
+  private builtBindingNames(): string[] {
+    const ws = this.operatorLayer();
+    const access = this.pushAccess();
+    return [...ws.inject, ...githubEgress(access.push, access.read, ws.inject).inject].map((b) => b.name);
+  }
+
+  /**
+   * BrokerDO: a secret of `client`'s that this sandbox asked for at its last push was written or deleted
+   * (docs/control-plane/durable-objects/broker/#client-secret-pushes). Arms the `client_secrets` deadline
+   * now, a key of its own so the push in flight (which re-arms `inject_refresh` for 15 minutes) can't
+   * swallow it; its alarm pushes the secrets again. Answers what BrokerDO keeps of the sandbox: `gone`
+   * (destroyed or never made) and `unbound` (none of the client's bindings apply now) let it forget it;
+   * `idle` (not on a host) needs nothing, since a placement pushes.
+   */
+  async clientSecretsChanged(client: string): Promise<SecretsChangedAnswer> {
+    const info = this.tryInfo();
+    if (!info || lease.gone(info.state)) return "gone";
+    if (!this.appliedClientInjections(this.builtBindingNames()).some((b) => b.client === client)) return "unbound";
+    if (!info.host || !ACTIVE_STATES.includes(info.state)) return "idle";
+    await this.deadlines.set("client_secrets", Date.now(), true);
+    return "push";
+  }
+
+  /**
+   * The `client_secrets` deadline: push the secrets again. A failure is tried again with backoff (5 s,
+   * doubling) up to `CLIENT_PUSH_ATTEMPTS` times; then it is left to `inject_refresh`, armed if it isn't.
+   */
+  private async pushChangedClientSecrets(): Promise<void> {
+    const info = this.info_();
+    if (!info.host || !ACTIVE_STATES.includes(info.state)) return;
+    try {
+      await this.pushSecrets(true);
+      this.del(CLIENT_PUSH_FAILS);
+    } catch (e) {
+      const fails = (this.get<number>(CLIENT_PUSH_FAILS) ?? 0) + 1;
+      if (fails >= CLIENT_PUSH_ATTEMPTS) {
+        console.warn(`sandbox ${info.sandbox}: pushing its changed client secrets failed ${fails} times; the 15-minute push will`, e);
+        this.del(CLIENT_PUSH_FAILS);
+        await this.deadlines.set("inject_refresh", Date.now() + CLIENT_SECRET_REFRESH_MS, true);
+        return;
+      }
+      console.warn(`sandbox ${info.sandbox}: pushing its changed client secrets failed; retrying`, e);
+      this.put(CLIENT_PUSH_FAILS, fails);
+      await this.deadlines.set("client_secrets", Date.now() + 5_000 * 2 ** (fails - 1));
+    }
+  }
+
   private async pushSecrets(force = false): Promise<void> {
     const before = this.info_();
     const ws = this.operatorLayer();
@@ -1353,8 +1408,7 @@ export class SandboxDO extends DurableObject<Env> {
     const own = (name: string) => ws.inject.some((b) => b.name === name);
     const mint = access.push.length > 0 && !own(GITHUB_BINDING);
     const mintRead = access.read.length > 0 && !own(GITHUB_READ_BINDING);
-    // Only those the policy carries: none under a name another binding has (its secret would go out under that one).
-    const built = [...ws.inject, ...githubEgress(access.push, access.read, ws.inject).inject].map((b) => b.name);
+    const built = this.builtBindingNames();
     const clientBindings = before.client ? this.appliedClientInjections(built) : [];
     if (!before.host || (!ws.inject.length && !mint && !mintRead && !clientBindings.length && !force)) return;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));

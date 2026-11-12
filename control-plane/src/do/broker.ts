@@ -60,6 +60,11 @@ const APP_IDENTITY_RETRY_MS = 10 * 60_000;
 const APP_LOOKUP_TIMEOUT_MS = 5_000;
 /** Values shorter than this aren't scanned for (they'd match ordinary text). */
 const SCAN_MIN_LENGTH = 8;
+/** Notices of a changed client secret delivered per alarm run, at once; the rest follow in the next run. */
+const SECRET_PUSH_BATCH = 50;
+/** Tries per notice: 1 s, doubling, about 8.5 minutes in all; past them the sandbox's 15-minute push carries the change. */
+const SECRET_PUSH_ATTEMPTS = 10;
+const secretPushBackoff = (attempts: number) => 1000 * 2 ** (attempts - 1);
 
 /** Who asked for a credential, for the issuance audit. */
 export interface CredentialCaller {
@@ -91,7 +96,14 @@ export interface ClientSecretView {
   updated_ms: number;
   /** When it was last handed to a sandbox's proxy (`clientInjectionRefs`), or null. */
   last_injected_ms: number | null;
+  /** When it stops being injected (its `expires_at`), or null: never. Past it, it is listed but never pushed. */
+  expires_ms: number | null;
+  /** How many sandboxes' proxies asked for it at their last push: those a write pushes to at once. */
+  sandboxes: number;
 }
+
+/** What a SandboxDO answered BrokerDO's notice that a client's secret changed (`clientSecretsChanged`). */
+export type SecretsChangedAnswer = "push" | "idle" | "unbound" | "gone";
 
 /** A client binding whose secret a sandbox's proxy should hold: its wire name, its secret's name, and its hosts (audited). */
 export interface ClientInjectionRequest {
@@ -181,6 +193,17 @@ export class BrokerDO extends DurableObject<Env> {
     // value is the secret `client-secret:<client>:<name>`, which only `secrets_update` resolves.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS client_secrets (client TEXT NOT NULL, name TEXT NOT NULL, description TEXT, size INTEGER NOT NULL,
       created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, injected_ms INTEGER, PRIMARY KEY (client, name))`);
+    // Which sandboxes asked for each client secret at their last push (`clientInjectionRefs`): those a
+    // write or delete of it pushes to at once (#client-secret-pushes). A row stays until that sandbox's
+    // next push names other secrets, or a notice finds it gone or no longer bound.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS client_secret_sandboxes (client TEXT NOT NULL, name TEXT NOT NULL, sandbox TEXT NOT NULL,
+      asked_ms INTEGER NOT NULL, PRIMARY KEY (client, name, sandbox))`);
+    // Notices owed to sandboxes that a client's secret changed, one per (sandbox, client), delivered from the
+    // alarm and deleted only once answered (`seq` matches, so an answer to an older notice leaves a newer one).
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS client_secret_pushes (sandbox TEXT NOT NULL, client TEXT NOT NULL, due_ms INTEGER NOT NULL,
+      attempts INTEGER NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (sandbox, client))`);
+    // Notices left waiting with no alarm (a previous release, without an alarm handler, ran one): arm it again.
+    if (this.sql.exec("SELECT 1 FROM client_secret_pushes LIMIT 1").toArray().length) void ctx.blockConcurrencyWhile(() => this.armSecretPushes());
     // Caller-identity signing keys (lib/identity.ts): the private JWK rests here and nowhere else.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS identity_keys (kid TEXT PRIMARY KEY, private_jwk TEXT NOT NULL, public_jwk TEXT NOT NULL,
       signs_from_ms INTEGER NOT NULL, created_ms INTEGER NOT NULL)`);
@@ -663,6 +686,18 @@ export class BrokerDO extends DurableObject<Env> {
    * both take the last place. Audited (never the value). Answers what anyone may see of it.
    */
   async putClientSecret(client: string, name: string, value: string, description: string | null, limit: { max_count: number; max_bytes: number }): Promise<ClientSecretView> {
+    return this.writeClientSecret(client, name, { value, description, expires_ms: null }, limit);
+  }
+
+  /**
+   * As `putClientSecret`, with an expiry (`expires_ms`, null: none): the value resolves to nothing from
+   * then on, and each push carries it so nest-proxy refuses the placeholder at that moment. A new method
+   * rather than a new argument, so a BrokerDO of the previous release refuses it (503) instead of storing
+   * the value without its expiry. The write is pushed at once to every sandbox that asked for it.
+   */
+  async writeClientSecret(client: string, name: string, input: { value: string; description: string | null; expires_ms: number | null },
+    limit: { max_count: number; max_bytes: number }): Promise<ClientSecretView> {
+    const { value, description } = input;
     if (!isClientId(client)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${client} is not a client`, 400);
     const size = new TextEncoder().encode(value).byteLength;
     if (size > limit.max_bytes) throw new NestError(ErrorCodes.FORBIDDEN, `outside ${client}'s grant: a secret of ${size} bytes (secrets.max_bytes is ${limit.max_bytes})`, 403);
@@ -675,16 +710,23 @@ export class BrokerDO extends DurableObject<Env> {
     this.sql.exec(`INSERT INTO client_secrets (client, name, description, size, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?)
       ON CONFLICT(client, name) DO UPDATE SET description = excluded.description, size = excluded.size, updated_ms = excluded.updated_ms`,
     client, name, description, size, cur?.created_ms ?? now, now);
-    await this.putSecret(clientSecretKey(client, name), value);
-    this.auditInBackground({ event: "client_secret_put", client, secret: name, size, replaced: !!cur });
+    await this.putSecret(clientSecretKey(client, name), value, input.expires_ms ?? undefined);
+    await this.queueSecretPushes(client, name);
+    this.auditInBackground({ event: "client_secret_put", client, secret: name, size, replaced: !!cur,
+      ...(input.expires_ms !== null ? { expires_ms: input.expires_ms } : {}) });
     return this.clientSecretView(client, name)!;
   }
 
-  /** Delete client `client`'s secret `name` (404 when it has none). A sandbox holding it loses it at its next push. */
+  /**
+   * Delete client `client`'s secret `name` (404 when it has none). Every sandbox that asked for it is
+   * pushed again at once, which takes it out of its proxy. Who asked stays recorded: a sandbox still
+   * bound to the name gets a value stored under it again the same way.
+   */
   async deleteClientSecret(client: string, name: string): Promise<void> {
     const n = this.sql.exec("DELETE FROM client_secrets WHERE client = ? AND name = ?", client, name).rowsWritten;
     this.sql.exec("DELETE FROM secrets WHERE name = ?", clientSecretKey(client, name));
     if (!n) throw new NestError(ErrorCodes.NOT_FOUND, `no secret ${name}`, 404);
+    await this.queueSecretPushes(client, name);
     this.auditInBackground({ event: "client_secret_deleted", client, secret: name });
   }
 
@@ -699,6 +741,9 @@ export class BrokerDO extends DurableObject<Env> {
     const names = this.sql.exec<{ name: string }>("SELECT name FROM client_secrets WHERE client = ?", client).toArray().map((r) => r.name);
     for (const name of names) this.sql.exec("DELETE FROM secrets WHERE name = ?", clientSecretKey(client, name));
     this.sql.exec("DELETE FROM client_secrets WHERE client = ?", client);
+    // Nothing of a deleted client lives (its delete is refused while anything does): no sandbox to push to.
+    this.sql.exec("DELETE FROM client_secret_sandboxes WHERE client = ?", client);
+    this.sql.exec("DELETE FROM client_secret_pushes WHERE client = ?", client);
     if (names.length) this.auditInBackground({ event: "client_secrets_deleted", client, secrets: names });
     return names.length;
   }
@@ -708,22 +753,103 @@ export class BrokerDO extends DurableObject<Env> {
    * binding whose secret it has (a binding naming one it doesn't have gets none, and nest-proxy refuses
    * its placeholder). Only that client's own secrets: the name is looked up under its id alone. Each
    * push is audited (the bindings, secrets and hosts, never a value) before any reference is answered,
-   * and marks each secret's `last_injected_ms`.
+   * and marks each secret's `last_injected_ms`. Each reference carries its secret's expiry, so nest-proxy
+   * refuses the placeholder from then on; an expired secret gets none.
+   *
+   * Records which secrets the sandbox asked for, held or not (`client_secret_sandboxes`), before any await:
+   * a write of one of them is pushed to it at once, a secret stored after its binding included.
    */
   async clientInjectionRefs(client: string, sandbox: string, bindings: ClientInjectionRequest[], caller: string): Promise<InjectionSecret[]> {
     if (!isClientId(client)) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${client} is not a client`, 400);
-    const held = bindings.filter((b) => this.clientSecretView(client, b.secret) && this.secret(clientSecretKey(client, b.secret)));
+    const asked = Date.now();
+    this.sql.exec("DELETE FROM client_secret_sandboxes WHERE client = ? AND sandbox = ?", client, sandbox);
+    for (const name of new Set(bindings.map((b) => b.secret))) {
+      this.sql.exec("INSERT INTO client_secret_sandboxes (client, name, sandbox, asked_ms) VALUES (?, ?, ?, ?)", client, name, sandbox, asked);
+    }
+    const held = bindings.flatMap((b) => {
+      const s = this.clientSecretView(client, b.secret) && this.secret(clientSecretKey(client, b.secret));
+      return s ? [{ ...b, expires_ms: s.expires_ms }] : [];
+    });
     if (!held.length) return [];
     await this.auditMint({ event: "client_secret_injected", client, sandbox, caller, bindings: held.map((b) => ({ binding: b.binding, secret: b.secret, hosts: b.hosts })) });
     const now = Date.now();
     for (const b of held) this.sql.exec("UPDATE client_secrets SET injected_ms = ? WHERE client = ? AND name = ?", now, client, b.secret);
-    return held.map((b) => ({ binding: b.binding, value: secretRef(clientSecretKey(client, b.secret)) }));
+    return held.map((b) => ({ binding: b.binding, value: secretRef(clientSecretKey(client, b.secret)), ...(b.expires_ms !== null ? { expires_ms: b.expires_ms } : {}) }));
+  }
+
+  /**
+   * A client's secret `name` changed (written or deleted): owe each sandbox that asked for it a notice,
+   * delivered from the alarm (`deliverSecretPushes`). One row per (sandbox, client), so a burst of writes
+   * is one push per sandbox. Armed in the step that queues it.
+   */
+  private async queueSecretPushes(client: string, name: string): Promise<void> {
+    const sandboxes = this.sql.exec<{ sandbox: string }>("SELECT sandbox FROM client_secret_sandboxes WHERE client = ? AND name = ?", client, name).toArray();
+    if (!sandboxes.length) return;
+    const now = Date.now();
+    for (const { sandbox } of sandboxes) {
+      this.sql.exec(`INSERT INTO client_secret_pushes (sandbox, client, due_ms, attempts, seq) VALUES (?, ?, ?, 0, 1)
+        ON CONFLICT(sandbox, client) DO UPDATE SET due_ms = excluded.due_ms, attempts = 0, seq = seq + 1`, sandbox, client, now);
+    }
+    await this.armSecretPushes();
+  }
+
+  private async armSecretPushes(): Promise<void> {
+    const next = this.sql.exec<{ at: number | null }>("SELECT MIN(due_ms) AS at FROM client_secret_pushes").one().at;
+    if (next === null) return;
+    const cur = await this.ctx.storage.getAlarm();
+    if (cur === null || cur > next) await this.ctx.storage.setAlarm(Math.max(next, 1));
+  }
+
+  /** BrokerDO's only alarm: the notices owed to sandboxes whose client secrets changed. */
+  override async alarm(): Promise<void> {
+    if (isHealthInstance(this.ctx, this.env.BROKER)) return;
+    await this.deliverSecretPushes();
+  }
+
+  /**
+   * Tell each sandbox owed a notice that its client's secrets changed, at most `SECRET_PUSH_BATCH` at a
+   * time; it pushes them again from its own alarm. A notice goes once answered, unless a newer write
+   * re-queued it meanwhile (`seq`). A failure backs off (1 s, doubling) and is dropped after
+   * `SECRET_PUSH_ATTEMPTS`: the sandbox's 15-minute push still carries the change. A sandbox gone, or no
+   * longer bound to the client's secrets, is forgotten (only what it asked for before the notice went).
+   */
+  private async deliverSecretPushes(): Promise<void> {
+    const sent = Date.now();
+    const due = this.sql.exec<{ sandbox: string; client: string; attempts: number; seq: number }>(
+      "SELECT sandbox, client, attempts, seq FROM client_secret_pushes WHERE due_ms <= ? ORDER BY due_ms LIMIT ?", sent, SECRET_PUSH_BATCH).toArray();
+    await Promise.all(due.map(async (r) => {
+      const match = [r.sandbox, r.client, r.seq] as const;
+      let answer: SecretsChangedAnswer;
+      try {
+        answer = await this.env.SANDBOX.get(this.env.SANDBOX.idFromName(r.sandbox)).clientSecretsChanged(r.client);
+      } catch (e) {
+        const attempts = r.attempts + 1;
+        if (attempts >= SECRET_PUSH_ATTEMPTS) {
+          console.warn(`BrokerDO: sandbox ${r.sandbox} didn't take client ${r.client}'s secret change after ${attempts} tries; its periodic push will`, e);
+          this.sql.exec("DELETE FROM client_secret_pushes WHERE sandbox = ? AND client = ? AND seq = ?", ...match);
+        } else {
+          console.warn(`BrokerDO: telling sandbox ${r.sandbox} of client ${r.client}'s secret change failed; retrying`, e);
+          this.sql.exec("UPDATE client_secret_pushes SET attempts = ?, due_ms = ? WHERE sandbox = ? AND client = ? AND seq = ?",
+            attempts, Date.now() + secretPushBackoff(attempts), ...match);
+        }
+        return;
+      }
+      this.sql.exec("DELETE FROM client_secret_pushes WHERE sandbox = ? AND client = ? AND seq = ?", ...match);
+      if (answer === "gone") this.sql.exec("DELETE FROM client_secret_sandboxes WHERE sandbox = ? AND asked_ms < ?", r.sandbox, sent);
+      else if (answer === "unbound") this.sql.exec("DELETE FROM client_secret_sandboxes WHERE sandbox = ? AND client = ? AND asked_ms < ?", r.sandbox, r.client, sent);
+    }));
+    await this.armSecretPushes();
   }
 
   private clientSecretView(client: string, name: string): ClientSecretView | undefined {
     const r = this.sql.exec<{ name: string; description: string | null; size: number; created_ms: number; updated_ms: number; injected_ms: number | null }>(
       "SELECT name, description, size, created_ms, updated_ms, injected_ms FROM client_secrets WHERE client = ? AND name = ?", client, name).toArray()[0];
-    return r && { name: r.name, description: r.description, size: r.size, created_ms: r.created_ms, updated_ms: r.updated_ms, last_injected_ms: r.injected_ms };
+    if (!r) return undefined;
+    // Read past `secret()`'s expiry filter: an expired one is still listed, with when it expired.
+    const expires = this.sql.exec<{ expires_ms: number | null }>("SELECT expires_ms FROM secrets WHERE name = ?", clientSecretKey(client, name)).toArray()[0];
+    const sandboxes = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM client_secret_sandboxes WHERE client = ? AND name = ?", client, name).one().n;
+    return { name: r.name, description: r.description, size: r.size, created_ms: r.created_ms, updated_ms: r.updated_ms, last_injected_ms: r.injected_ms,
+      expires_ms: expires?.expires_ms ?? null, sandboxes };
   }
 
   /** An audit record written in the background: its failure is logged, and doesn't fail what it records. */

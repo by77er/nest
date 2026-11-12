@@ -86,3 +86,17 @@ fn client_placeholders_and_the_github_one_never_contain_each_other() {
     h.insert(AUTHORIZATION, "Bearer nest-ph-github".parse().unwrap());
     assert_eq!(run("github.com", &secrets(), &mut h), Verdict::Substituted("github".into()));
 }
+
+#[test]
+fn a_client_secret_past_its_expiry_is_refused_untouched() {
+    // The control plane carries a client secret's `expires_at` as the push's `expires_ms`
+    // (BrokerDO `clientInjectionRefs`); the proxy fails closed from that moment, between pushes too.
+    let mut sec = secrets();
+    sec.get_mut("client:stripe").unwrap().expires_ms = Some(1000);
+    let mut h = HeaderMap::new();
+    h.insert(AUTHORIZATION, format!("Bearer {STRIPE}").parse().unwrap());
+    assert_eq!(run("api.stripe.com", &sec, &mut h), Verdict::Expired("client:stripe".into()), "now_ms == expires_ms");
+    assert_eq!(h[AUTHORIZATION], format!("Bearer {STRIPE}"), "untouched");
+    sec.get_mut("client:stripe").unwrap().expires_ms = Some(1001);
+    assert_eq!(run("api.stripe.com", &sec, &mut h), Verdict::Substituted("client:stripe".into()), "before it");
+}

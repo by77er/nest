@@ -12,7 +12,9 @@ import {
 } from "../src/lib/client-secrets";
 import { Grant } from "../src/lib/clients";
 import { GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER } from "../src/lib/rules/github";
-import { ADMIN, adminJson, BASE, connectHost, nextCommands, runDue, uniqueCell, type Ws } from "./helpers";
+import { ClientDO } from "../src/do/client";
+import { SandboxDO } from "../src/do/sandbox";
+import { ADMIN, adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueCell, type Ws } from "./helpers";
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 
@@ -139,6 +141,15 @@ async function clientSandbox(c: Client, body: Record<string, unknown>) {
   return { sandbox: sbx.sandbox as string, ws: host.ws, secrets: (cmds.find((x) => x.type === "secrets_update")?.secrets ?? []) as { binding: string; value: string }[] };
 }
 
+type Pushed = { binding: string; value: string; expires_ms?: number };
+/** The next `secrets_update` to `sandbox` matching `pred`, acknowledged; nothing forces it (no deadline is touched). */
+async function pushedTo(ws: Ws, sandbox: string, pred: (secrets: Pushed[]) => boolean, ms = 8_000): Promise<Pushed[]> {
+  const ok = (x: any) => x.type === "secrets_update" && x.sandbox === sandbox && pred(x.secrets);
+  const msg = await ws.next("commands", (m) => (m.commands as any[]).some(ok), ms);
+  ws.send({ type: "ack", up_to: msg.seq });
+  return (msg.commands as any[]).find(ok).secrets;
+}
+
 /** Run a sandbox's `inject_refresh` deadline now (its 15-minute push) and answer the secrets it pushed. */
 async function refreshed(sandbox: string, ws: Ws): Promise<{ binding: string; value: string }[]> {
   const stub = env.SANDBOX.get(env.SANDBOX.idFromName(sandbox));
@@ -155,7 +166,8 @@ describe("client secrets", () => {
     const c = await newClient();
     const value = fakeValue("w");
     const put = await asJson(c.token, `/v1/clients/self/secrets/stripe-key`, { method: "PUT", body: { value, description: "the test key" } });
-    expect(put).toEqual({ name: "stripe-key", description: "the test key", size: value.length, created_ms: put.created_ms, updated_ms: put.updated_ms, last_injected_ms: null });
+    expect(put).toEqual({ name: "stripe-key", description: "the test key", size: value.length, created_ms: put.created_ms, updated_ms: put.updated_ms, last_injected_ms: null,
+      expires_ms: null, sandboxes: 0 });
     const again = fakeValue("w2x");
     const replaced = await asJson(c.token, `/v1/clients/self/secrets/stripe-key`, { method: "PUT", body: { value: again } });
     expect(replaced).toMatchObject({ name: "stripe-key", description: null, size: again.length, created_ms: put.created_ms });
@@ -340,12 +352,16 @@ describe("client injection bindings", () => {
       st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'inject_refresh'").toArray()[0]?.at ?? 0);
     expect(at - Date.now()).toBeGreaterThan(14 * 60_000);
     expect(at - Date.now()).toBeLessThanOrEqual(15 * 60_000);
+    // Each write is pushed at once (below, "pushed on write"); the refresh after it carries the same.
     const second = fakeValue("v2");
     await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: second } });
+    await pushedTo(s.ws, s.sandbox, (x) => x.some((y) => y.value === second));
     expect(await refreshed(s.sandbox, s.ws)).toContainEqual({ binding: "client:stripe", value: second });
     await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "DELETE" });
+    await pushedTo(s.ws, s.sandbox, (x) => !x.some((y) => y.binding === "client:stripe"));
     expect((await refreshed(s.sandbox, s.ws)).map((x) => x.binding)).not.toContain("client:stripe");
     await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: first } });
+    await pushedTo(s.ws, s.sandbox, (x) => x.some((y) => y.value === first));
     expect(await refreshed(s.sandbox, s.ws)).toContainEqual({ binding: "client:stripe", value: first });
     await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { cells: [c.cell], credentials: ["claude_oauth_token"], max_sandboxes: 5, secrets: { max_count: 3 }, inject_hosts: [] } } });
     expect((await refreshed(s.sandbox, s.ws)).map((x) => x.binding)).not.toContain("client:stripe");
@@ -373,5 +389,168 @@ describe("client injection bindings", () => {
     await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { allow: [{ host: "api.stripe.com" }] } });
     const cmds = await nextCommands(s.ws, (x) => x.type === "secrets_update");
     expect(cmds.find((x) => x.type === "secrets_update")!.secrets.map((x: any) => x.binding)).not.toContain("client:stripe");
+  });
+});
+
+// docs/control-plane/durable-objects/broker/#client-secret-pushes: a write or delete reaches every sandbox
+// that asked for the secret at once, not at its 15-minute push; an expiry travels with the value.
+describe("client secrets pushed on write, and expiring", () => {
+  const stripe = () => ({ name: "stripe", secret: "stripe-key", hosts: ["api.stripe.com"], locations: BEARER });
+  const pushed = pushedTo;
+  const holds = (value: string) => (s: Pushed[]) => s.some((x) => x.binding === "client:stripe" && x.value === value);
+  const lacks = (s: Pushed[]) => !s.some((x) => x.binding === "client:stripe");
+  const sandboxIs = (sandbox: string) => function (this: { ctx: DurableObjectState }) {
+    return this.ctx.id.equals(env.SANDBOX.idFromName(sandbox));
+  };
+  async function refreshAt(sandbox: string): Promise<number> {
+    return runInDurableObject(env.SANDBOX.get(env.SANDBOX.idFromName(sandbox)), (_i, st) =>
+      st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'inject_refresh'").toArray()[0]?.at ?? 0);
+  }
+
+  it("a write reaches the sandbox's proxy at once, a secret stored after its binding too, and a delete takes it away", async () => {
+    const c = await newClient();
+    // Bound before the secret exists: the sandbox asks for it, and gets nothing yet.
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    expect(s.secrets).toEqual([]);
+    expect(await refreshAt(s.sandbox) - Date.now()).toBeGreaterThan(14 * 60_000);
+    const first = fakeValue("w1");
+    const view = await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: first } });
+    expect(view.sandboxes).toBe(1);
+    expect(await pushed(s.ws, s.sandbox, holds(first))).toContainEqual({ binding: "client:stripe", value: first });
+    const second = fakeValue("w2");
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: second } });
+    await pushed(s.ws, s.sandbox, holds(second));
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "DELETE" });
+    await pushed(s.ws, s.sandbox, lacks);
+    // Still bound: storing it again pushes it again.
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: first } });
+    await pushed(s.ws, s.sandbox, holds(first));
+    // None of it waited for the 15-minute push.
+    expect(await refreshAt(s.sandbox) - Date.now()).toBeGreaterThan(14 * 60_000);
+  });
+
+  it("an expiry travels with the value, an expired secret isn't injected, and an expiry already past is refused", async () => {
+    const c = await newClient();
+    const value = fakeValue("exp");
+    const at = new Date(Date.now() + 3_600_000);
+    const view = await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value, expires_at: at.toISOString() } });
+    expect(view.expires_ms).toBe(at.getTime());
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    expect(s.secrets).toContainEqual({ binding: "client:stripe", value, expires_ms: at.getTime() });
+    // An offset other than Z is the same instant.
+    const later = new Date(Date.now() + 7_200_000);
+    const offset = new Date(later.getTime() + 2 * 3_600_000).toISOString().replace("Z", "+02:00");
+    expect((await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value, expires_at: offset } })).expires_ms).toBe(later.getTime());
+    await pushed(s.ws, s.sandbox, (x) => x.some((y) => y.binding === "client:stripe" && y.expires_ms === later.getTime()));
+    // Replaced without one: it never expires, and the push says so.
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value } });
+    expect(await pushed(s.ws, s.sandbox, (x) => x.some((y) => y.binding === "client:stripe" && y.expires_ms === undefined)))
+      .toContainEqual({ binding: "client:stripe", value });
+    for (const bad of [new Date(Date.now() - 1000).toISOString(), "tomorrow", "2026-11-12T10:00:00"]) {
+      expect((await as(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value, expires_at: bad } })).status, bad).toBe(400);
+    }
+    // Once past its expiry, the next push carries none of it; the listing still shows it, and when it expired.
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value, expires_at: at.toISOString() } });
+    await pushed(s.ws, s.sandbox, (x) => x.some((y) => y.expires_ms === at.getTime()));
+    const past = Date.now() - 1;
+    await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), (_i, st) => {
+      st.storage.sql.exec("UPDATE secrets SET expires_ms = ? WHERE name = ?", past, `client-secret:${c.id}:stripe-key`);
+    });
+    expect((await refreshed(s.sandbox, s.ws)).map((x) => x.binding)).not.toContain("client:stripe");
+    // BrokerDO hands out no reference to it at all (FleetDO, resolving one, would find nothing either).
+    expect(await env.BROKER.get(env.BROKER.idFromName("broker")).clientInjectionRefs(c.id, s.sandbox,
+      [{ binding: "client:stripe", secret: "stripe-key", hosts: ["api.stripe.com"] }], "test")).toEqual([]);
+    expect((await asJson(c.token, "/v1/clients/self/secrets")).secrets).toEqual([expect.objectContaining({ name: "stripe-key", expires_ms: past })]);
+  });
+
+  it("a notice the sandbox fails to take is tried again until it does", async () => {
+    const c = await newClient();
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("n1") } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    const proto = SandboxDO.prototype as any;
+    const real = proto.clientSecretsChanged;
+    const mine = sandboxIs(s.sandbox);
+    let calls = 0;
+    proto.clientSecretsChanged = async function (this: any, ...args: unknown[]) {
+      if (mine.call(this) && ++calls === 1) throw new Error("SandboxDO unavailable");
+      return real.apply(this, args);
+    };
+    try {
+      const second = fakeValue("n2");
+      await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: second } });
+      await pushed(s.ws, s.sandbox, holds(second));
+      expect(calls).toBeGreaterThanOrEqual(2);
+    } finally {
+      proto.clientSecretsChanged = real;
+    }
+    expect(await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), (_i, st) =>
+      st.storage.sql.exec("SELECT 1 FROM client_secret_pushes WHERE sandbox = ?", s.sandbox).toArray().length)).toBe(0);
+  });
+
+  it("a push that fails in the sandbox is tried again with backoff", { timeout: 30_000 }, async () => {
+    const c = await newClient();
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("p1") } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    const proto = SandboxDO.prototype as any;
+    const real = proto.pushSecrets;
+    const mine = sandboxIs(s.sandbox);
+    let calls = 0;
+    proto.pushSecrets = async function (this: any, ...args: unknown[]) {
+      if (mine.call(this) && ++calls === 1) throw new Error("FleetDO unavailable");
+      return real.apply(this, args);
+    };
+    try {
+      const second = fakeValue("p2");
+      await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: second } });
+      await pushed(s.ws, s.sandbox, holds(second), 15_000);
+      expect(calls).toBeGreaterThanOrEqual(2);
+    } finally {
+      proto.pushSecrets = real;
+    }
+    expect(await refreshAt(s.sandbox) - Date.now()).toBeGreaterThan(14 * 60_000);
+  });
+
+  it("a write that lands while the sandbox's own refresh is in flight is pushed again after it", async () => {
+    const c = await newClient();
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: fakeValue("r1") } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    // Hold the refresh at its read of the client's grant (before it asks BrokerDO for the references).
+    const proto = ClientDO.prototype as any;
+    const real = proto.scope;
+    const clientId = env.CLIENT.idFromName(c.id);
+    // Flags, not promises: a promise the held DO resolved would run the test's continuation in its I/O context.
+    const hold = { armed: true, reached: false, released: false };
+    const release = () => { hold.released = true; };
+    proto.scope = async function (this: any, ...args: unknown[]) {
+      if (hold.armed && this.ctx.id.equals(clientId)) {
+        hold.armed = false;
+        hold.reached = true;
+        while (!hold.released) await new Promise((r) => setTimeout(r, 10));
+      }
+      return real.apply(this, args);
+    };
+    const injected = async () => (await auditTexts()).map((t) => JSON.parse(t)).filter((r) => r.event === "client_secret_injected" && r.sandbox === s.sandbox).length;
+    try {
+      const before = await injected();
+      await runInDurableObject(stub, (_i, st) => {
+        st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('inject_refresh', 0) ON CONFLICT(key) DO UPDATE SET at = 0");
+      });
+      const refresh = runDue(stub);
+      await eventually("the refresh to reach the hold", () => hold.reached);
+      const second = fakeValue("r2");
+      await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value: second } });
+      // BrokerDO's notice reached the sandbox while its refresh waited.
+      await eventually("the notice to land", () => runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), (_i, st) =>
+        st.storage.sql.exec("SELECT 1 FROM client_secret_pushes WHERE sandbox = ?", s.sandbox).toArray().length === 0));
+      release();
+      await refresh;
+      // The refresh pushed, and then the notice's own push: two, not one the refresh's re-arm swallowed.
+      await eventually("a push after the refresh", async () => (await injected()) >= before + 2);
+      await pushed(s.ws, s.sandbox, holds(second));
+    } finally {
+      release();
+      proto.scope = real;
+    }
   });
 });
