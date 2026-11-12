@@ -16,7 +16,7 @@ A task board for GitHub repos, run by agents on nest: an app with its own Worker
 
 | Piece | What it holds or does |
 |---|---|
-| Worker `projects` | The UI (Vite + React), the JSON API behind it, the MCP server agents call (`/mcp/<role>`), and two webhook endpoints: nest's (`/hooks/nest`) and GitHub's (`/hooks/github`) |
+| Worker `projects` | The UI (Vite + React), the JSON API behind it, the MCP servers agents call (`/mcp/board`, `/mcp/task`, `/mcp/review`, `/mcp/routine`), and two webhook endpoints: nest's (`/hooks/nest`) and GitHub's (`/hooks/github`) |
 | `DirectoryDO` (one) | Projects, repo → project, agent → project and role, the events and deliveries already handled, the app's catalog sync state, the GitHub App's id |
 | `ProjectDO` (one per project) | The project's settings and its repo's attachment, the board (tasks, specs, assignments, the history of each), the chat with the manager, PR → task, the routines and their runs, the memory notes |
 | `ReviewDO` (one per project) | The review queue: one job per PR head, its reviewer agent, its check run, its verdict. It's an asynchronous process of its own, with its own alarm and an optional concurrency cap (none by default) |
@@ -73,7 +73,7 @@ The owner's decision (2026-11-10): guidance is layered, and each layer owns its 
   - There is no bearer secret: the capabilities name no `auth`, so nest sends no `Authorization`, and the identity is the credential.
 - **Scope comes from the labels:**
   - The manager reads and writes the board of its `project`.
-  - A worker reads its `task`, posts progress on it, marks it blocked or clears that, and says when its PR is open. It sees no other task.
+  - A worker reads its `task`, posts progress on it, marks it blocked or clears that, says when its PR is open, asks for a secret it needs, and reads the project's memory. It sees no other task.
   - A reviewer reads its `pr` at its `sha`, and submits one verdict per dimension (correctness, quality, architectural cohesiveness) with a summary.
   - A routine run acts only while its `run` is live and is this very agent's (its `routine` and `run` labels): it reads the board and recent work, proposes tasks and keeps memory ([routines](#routines)).
 - **`tainted`** is recorded with each write and shown on the board. It gates nothing: a worker and a reviewer read repo content by design.
