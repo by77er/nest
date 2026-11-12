@@ -18,3 +18,4 @@
 ## Docs with no drift
 
 ## Docs done
+- sandbox/drivers/gvisor, lambda-microvm, sandbox/guest-agent (the rest confirmed: vsock ports and CID 2 check transport.rs:63; retention output.rs:18-21; env exec.rs:21-46; ingress order ingress.rs:63; exact protocol_version nestd guest.rs:276; busy before configure state.rs:124; SIGHUP on drop ingress.rs:246; 200 ms drain hands/bash.rs:141)
