@@ -16,6 +16,22 @@ Base: origin/main 6bbf64f.
 - credentials L12: intermediate CA key also in nestd's root-only `<state_dir>/host-credentials.json` (crates/nestd/src/credentials.rs:5-6,109-113; docs/compute/provisioning/ L49).
 - credentials L14: host token also persisted by nestd in that file, rewritten on rotation (credentials.rs:1-9,99-104).
 
+- credentials L20: `ADMIN_TOKEN` is compared as the token itself (control-plane/src/index.ts:95-98, timingSafeEqual against env.ADMIN_TOKEN), not a hash; doc's "not built" now says so.
+- credentials L24: `CLOUDFLARE_API_TOKEN` is also used by `.github/workflows/deploy-projects.yml:38`.
+- credentials L34: `cap:metrics` / `metrics_query` has no code (no `metrics_query` or `analytics_engine/sql` in control-plane/src); docs/control-plane/metrics/ L3 says not built -> row marked not built.
+
+## Confirmed (credentials L17-33)
+- L17 Worker secret put at deploy (dev/deploy-use1.sh:53-54, deploy.yml:119), daily sweep alarm (fleet.ts:279-280,1894-1899), tunnelConfig (lib/cloudflare.ts:27).
+- L18 credentials file 0600 (nestd credentials.rs:53), TUNNEL_TOKEN env not argv (cloudflared.rs:7,258).
+- L19 edge only for a tunnel target (sandbox.ts:1891-1895), access:gateway (broker.ts:613-625).
+- L21 token format and SHA-256 (lib/clients.ts:295-311). L22 whsec_ (do/client.ts:679), Nest-Signature (lib/client-events.ts:92).
+- L23 GET only (dashboard/src/worker.ts:96), RS256 Access JWT (dashboard/src/access.ts:65-80).
+- L25 CLOUDFLARE_ACCESS_API_TOKEN in deploy.yml and deploy-projects-infra.yml.
+- L26 nest-<cell>-deploy, OIDC sub repo:<repo>:environment: (Stack.lean:640-646).
+- L28 IAM user nest-<cell>-control-plane (Stack.lean:602), nest=true tag condition (Stack.lean:376), kms (Stack.lean:380), AWS_CELL_CREDENTIALS (lib/cells.ts:6).
+- L30 cap: never resolvable (broker.ts:1230), lib/mcp.ts:43. L31-32 oauth_grants/oauth_clients (lib/mcp-auth.ts:550,555), one refresh at a time (mcp-auth.ts:715-718), refused refresh -> markReauthorize (mcp-auth.ts:788), /v1/oauth/client.json auth none (index.ts:735).
+- L33 api-loop: no code, marked deferred.
+
 ## Confirmed (security/README)
 - L11 brain: `--tools` lists no Bash/Read/Write/Edit (crates/nest-protocol/src/host.rs:1000,1351), `--restricted` (host.rs:999), env cleared (crates/nest-runner/src/agent.rs:250); host allowlist marked not built on main.
 - L13 gateway as nest-gw, empty CapabilityBoundingSet, IPAddressAllow=localhost (deploy/host/install.sh:59-72,136-178); cloudflared as nest-cf (install.sh:55-56).
@@ -36,6 +52,7 @@ Base: origin/main 6bbf64f.
 - L16 claims + 1h (sandbox.ts:1886-1888, protocol/gateway.ts:13), detach/epoch (nest-gateway verify.rs:115-124).
 
 ## Unconfirmed
+- credentials L29 "no R2 S3 credentials exist", hosts use Worker-signed URLs only: blob signing found (lib/tokens.ts:77); absence of R2 keys not provable from code.
 - L5 "1 year, model requests only": property of Anthropic's token; no code.
 - L11 "non-exportable", "CloudTrail logs each issuance": AWS properties.
 - L9 "Per host and grant": lookup is per binding and sandbox/workstream/global (broker.ts:289-303); no per-host keying found.
