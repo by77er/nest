@@ -2,6 +2,8 @@
 
 Agents maintaining a code repository: they pick up work, change code, review each other's changes, merge through the repo's own gates, and watch what ships. Like every pattern, this is templates and prompts; no code knows about it.
 
+**Status:** designed. None of its templates (`maintainer`, `reviewer`, `monitor`) or capabilities (`coordination`, `authority`, `schedules`, `github_ro`, `metrics`, `web`) is seeded, and `github.review_check`, `github.dispatch_workflow`, `github.create_pr`'s `auto_merge`, sandbox forks and `report_schema` aren't built. **Built as a variant:** the [projects](../../../projects/README.md) app's manager, worker per task, and reviewer per PR head, which sets a required check with the app's own GitHub token; with the project's auto-merge on, the app enables GitHub's auto-merge on each task PR.
+
 ## Agents
 
 | Agent | Template | Lifetime | Capabilities |
@@ -18,7 +20,7 @@ I spawn the maintainer and the monitor; the maintainer spawns workers and review
 The App's webhooks reach agents through the coordination integration ([principle 9](../../README.md#principles)), which delivers each event, tainted, to the inboxes that asked for it:
 - **The maintainer:** issues, PR opens, updates and closes, and `deployment_status`, batched.
 - **Each worker:** its own branch's events only, so it sleeps at no cost while CI runs.
-- **The monitor:** `deployment_status`; it schedules its own checks with `wake_at`.
+- **The monitor:** `deployment_status`; it schedules its own checks with a [timer](../../agents/capabilities/timers/).
 
 ## The loop
 
@@ -76,4 +78,4 @@ report_schema: {pr: number, head: sha, verdict: [pass, fail], findings: number}
 budget: {depth: 0, concurrent: 1, spawns: 0, turns_per_day: 20}
 ```
 
-The `maintainer` template is the [`captain`](../captains/#the-captain-template) template plus `github_ro` and its brokered actions. Workers use the `worker` template without `web`.
+The `maintainer` template is the [`captain`](../captains/#the-captain-template) template plus `github_ro` and its brokered actions. Workers use a `worker` template without web access (the seeded `worker` launches with `WebSearch` and `WebFetch`).
