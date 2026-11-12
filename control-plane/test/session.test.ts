@@ -281,6 +281,9 @@ describe("platform tool relay", () => {
     expect((await answer(first.ask, "approve")).delivered).toBe("async");
     // No expiry for a rule's approval: the turn says so by not naming one.
     expect(await lastTurn()).toEqual({ kind: "ask_answer", text: `Approved (${first.ask}): call WebFetch again with exactly the same arguments. The approval is for that one call.` });
+    const decided = await runInDurableObject(agentStub(s.agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ status: string; expires_ms: number | null; kind: string }>("SELECT status, expires_ms, kind FROM approvals WHERE ask = ?", first.ask).one());
+    expect(decided).toEqual({ status: "approved", expires_ms: null, kind: "rule" });
     // Other arguments aren't approved by it.
     const other = await check("req_3", { url: "https://evil.test", prompt: "p" });
     expect(other.status).toBe("pending");
