@@ -5,9 +5,9 @@
 // reaches only its own subtree, within its grant.
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { AgentDO } from "../src/do/agent";
+import { AgentDO, RULES_RETRY_MS } from "../src/do/agent";
 import { CatalogDO } from "../src/do/catalog";
-import { SPAWNING_PROMPT_V5 } from "../src/lib/spec";
+import { SEED_CATALOG_V1, SPAWNING_PROMPT_V5 } from "../src/lib/spec";
 import type { ToolRule } from "../src/protocol/control";
 import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueCell, Ws } from "./helpers";
 
@@ -105,37 +105,44 @@ describe("live capability rules", () => {
     ws.close();
   });
 
-  it("a nudge the agent didn't take is sent again until it does", async () => {
+  it("a nudge the agent didn't take is sent again, after failing twice, until it does", async () => {
     const { cap, tpl } = await operatorEntries([]);
     const agent = await spawn(tpl);
     await rulesSettled(agent);
-    const proto = AgentDO.prototype as unknown as { rulesChanged: (this: AgentDO) => Promise<void> };
-    const real = proto.rulesChanged;
     let refused = 0;
-    proto.rulesChanged = async function (this: AgentDO) {
-      if ((this as unknown as { load(): { agent: string } }).load().agent === agent && refused === 0) {
+    const p = patch(AgentDO.prototype as unknown as { rulesChanged: () => Promise<void> }, "rulesChanged", (real) => async function (this: AgentDO) {
+      if (agentOf(this) === agent && refused < 2) {
         refused++;
         throw new Error("lost on the way");
       }
       return real.call(this);
+    });
+    const attempts = (n: number) => eventually(`failed nudge ${n} recorded`, () => runInDurableObject(catalogStub(), (_i: CatalogDO, st) =>
+      st.storage.sql.exec<{ attempts: number }>("SELECT attempts FROM rule_nudges WHERE agent = ?", agent).toArray().find((r) => r.attempts === n)));
+    /** Its retry made due now (it waits NUDGE_RETRY_MS, doubling). */
+    const retryNow = async () => {
+      await runInDurableObject(catalogStub(), (_i: CatalogDO, st) => {
+        st.storage.sql.exec("UPDATE rule_nudges SET next_ms = 0 WHERE agent = ?", agent);
+        st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'nudge'");
+      });
+      await runDue(catalogStub());
     };
     try {
       await putCap(cap, [ALLOW_WEB]);
-      // The failed delivery is kept, to be tried again.
-      const row = await eventually("the failed nudge recorded", () => runInDurableObject(catalogStub(), (_i: CatalogDO, st) =>
-        st.storage.sql.exec<{ attempts: number }>("SELECT attempts FROM rule_nudges WHERE agent = ?", agent).toArray().find((r) => r.attempts > 0)));
-      expect(row.attempts).toBe(1);
+      // Each failed delivery is kept, to be tried again, later each time.
+      await attempts(1);
+      const first = await runInDurableObject(catalogStub(), (_i: CatalogDO, st) =>
+        st.storage.sql.exec<{ next_ms: number }>("SELECT next_ms FROM rule_nudges WHERE agent = ?", agent).one().next_ms);
+      expect(first).toBeGreaterThan(Date.now());
+      await retryNow();
+      await attempts(2);
       expect(await rulesOf(agent)).toEqual([NEST_ALLOW]);
+      await retryNow();
+      await rulesBecome(agent, [NEST_ALLOW, ALLOW_WEB]);
+      expect(refused).toBe(2);
     } finally {
-      proto.rulesChanged = real;
+      p.restore();
     }
-    // Its retry made due now (it waits NUDGE_RETRY_MS): it lands, and the agent converges.
-    await runInDurableObject(catalogStub(), (_i: CatalogDO, st) => {
-      st.storage.sql.exec("UPDATE rule_nudges SET next_ms = 0 WHERE agent = ?", agent);
-      st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = 'nudge'");
-    });
-    await runDue(catalogStub());
-    await rulesBecome(agent, [NEST_ALLOW, ALLOW_WEB]);
   });
 
   it("a change no nudge reached (its watch lost) arrives at the agent's hourly read", async () => {
@@ -229,20 +236,253 @@ describe("live capability rules", () => {
   });
 });
 
-describe("a seed step", () => {
-  it("that edits a capability nudges the live agents reading it, and one that leaves it alone nudges nobody", async () => {
+/** Patch a DO class's method for one test (RPC finds it on the prototype); `restore` puts it back. */
+function patch<T extends object, K extends keyof T>(proto: T, key: K, impl: (real: T[K]) => T[K]) {
+  const real = proto[key];
+  proto[key] = impl(real);
+  return { restore: () => { proto[key] = real; } };
+}
+const agentOf = (inst: unknown) => (inst as { load(): { agent: string } }).load().agent;
+const makeDue = (stub: DurableObjectStub, key: string) =>
+  runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => st.storage.sql.exec("UPDATE deadlines SET at = 0 WHERE key = ?", key));
+
+describe("the nudge protocol's guards", () => {
+  it("a stale acknowledgement doesn't delete a newer nudge: the agent is told again and ends on the later write", async () => {
+    const { cap, tpl } = await operatorEntries([]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    let release!: () => void;
+    const released = new Promise<void>((r) => { release = r; });
+    let held = false;
+    let calls = 0;
+    const p = patch(AgentDO.prototype as unknown as { rulesChanged: () => Promise<void> }, "rulesChanged", (real) => async function (this: AgentDO) {
+      if (agentOf(this) === agent) {
+        calls++;
+        if (calls === 1) {
+          held = true;
+          await released;
+        }
+      }
+      return real.call(this);
+    });
+    try {
+      await putCap(cap, [ALLOW_WEB]);
+      await eventually("the first nudge held", () => held);
+      const rev1 = await runInDurableObject(catalogStub(), (_i: CatalogDO, st) =>
+        st.storage.sql.exec<{ rev: number }>("SELECT rev FROM rule_nudges WHERE agent = ?", agent).one().rev);
+      await putCap(cap, [DENY_WEB]);
+      const rev2 = await runInDurableObject(catalogStub(), (_i: CatalogDO, st) =>
+        st.storage.sql.exec<{ rev: number }>("SELECT rev FROM rule_nudges WHERE agent = ?", agent).one().rev);
+      expect(rev2).toBeGreaterThan(rev1);
+      release();
+      // The first nudge's answer is for rev1: the rev2 row stays and is sent too.
+      await eventually("the second nudge sent", () => calls >= 2);
+      await rulesBecome(agent, [NEST_ALLOW, DENY_WEB]);
+    } finally {
+      release();
+      p.restore();
+    }
+  });
+
+  it("successive capability changes each reach the agent (what it derived is kept current)", async () => {
+    const { cap, tpl } = await operatorEntries([]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    for (const rules of [[ALLOW_WEB], [DENY_WEB], [ALLOW_SEARCH]]) {
+      await putCap(cap, rules);
+      await rulesBecome(agent, [NEST_ALLOW, ...rules]);
+    }
+    expect((await adminJson(`/v1/agents/${agent}`)).rules_set).toBeUndefined();
+  });
+
+  it("a capability row this release can't read leaves the agent's rules as they are", async () => {
+    const { cap, tpl } = await operatorEntries([DENY_WEB]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    expect(await rulesOf(agent)).toEqual([NEST_ALLOW, DENY_WEB]);
+    // A later release's shape this release's schema refuses.
+    await runInDurableObject(catalogStub(), (_i: CatalogDO, st) =>
+      st.storage.sql.exec("UPDATE capabilities SET body = ? WHERE name = ?", JSON.stringify({ tools: [], rules: "v2", prompt: "" }), cap));
+    await runInDurableObject(agentStub(agent), async (_i: AgentDO, st) => {
+      st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('rules', 0) ON CONFLICT(key) DO UPDATE SET at = 0");
+    });
+    await runDue(agentStub(agent));
+    expect(await rulesOf(agent)).toEqual([NEST_ALLOW, DENY_WEB]);
+    // Read again later (hourly), not dropped.
+    const at = await runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
+      st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'rules'").one().at);
+    expect(at).toBeGreaterThan(Date.now() + 30 * 60_000);
+  });
+
+  it("a deleted client namespace nudges the agents watching its capabilities", async () => {
+    const { tpl } = await operatorEntries([]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    const ns = `lrns-${rand()}`;
+    // A watch on a capability of that namespace (as one an agent of its subtree left).
+    await runInDurableObject(catalogStub(), (_i: CatalogDO, st) => {
+      st.storage.sql.exec("INSERT INTO capabilities (name, body) VALUES (?, ?)", `${ns}/c`, JSON.stringify(capability([])));
+      st.storage.sql.exec("INSERT INTO rule_watch (capability, agent) VALUES (?, ?)", `${ns}/c`, agent);
+    });
+    await catalogStub().deleteNamespace(ns);
+    // Told, it reads again and sets its watch to what it reads.
+    await eventually("its stray watch gone", async () => !(await watched(agent)).includes(`${ns}/c`));
+  });
+
+  it("sources that change while its read is out are read again, never joined with the read made for the old ones", async () => {
+    const { cap, tpl } = await operatorEntries([DENY_WEB]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    const pushed: unknown[] = [];
+    let release!: () => void;
+    const released = new Promise<void>((r) => { release = r; });
+    let held = false;
+    const pw = patch(CatalogDO.prototype as unknown as { watchRules: (a: string, n: string[]) => Promise<unknown> }, "watchRules", (real) =>
+      async function (this: CatalogDO, a: string, n: string[]) {
+        if (a === agent && n.length === 0 && !held) {
+          held = true;
+          await released;
+        }
+        return real.call(this, a, n);
+      });
+    const pp = patch(AgentDO.prototype as unknown as { pushCache: (o?: unknown) => void }, "pushCache", (real) => function (this: AgentDO, o?: unknown) {
+      real.call(this, o);
+      if (agentOf(this) === agent) pushed.push((this as unknown as { load(): { rules: unknown } }).load().rules);
+    });
+    try {
+      // The operator's rules: its read leaves the watch, and is held there.
+      await adminJson(`/v1/agents/${agent}/rules`, { method: "PUT", body: [ALLOW_SEARCH] });
+      await eventually("the unwatch held", () => held);
+      // Cleared meanwhile: its sources are live again.
+      await adminJson(`/v1/agents/${agent}/rules`, { method: "DELETE" });
+      release();
+      await rulesBecome(agent, [NEST_ALLOW, DENY_WEB]);
+      await rulesSettled(agent);
+      // Never the sources joined with the empty read (the capability's deny missing).
+      expect(pushed).toEqual([[ALLOW_SEARCH], [NEST_ALLOW, DENY_WEB]]);
+      expect(await watched(agent)).toEqual([cap, "nest"].sort());
+    } finally {
+      release();
+      pw.restore();
+      pp.restore();
+    }
+  });
+
+  it("a watch out of date is set at the agent's next alarm, whatever deadline runs it", async () => {
+    const { cap, tpl } = await operatorEntries([]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    // As if a rolled-back release dropped the `rules` deadline: no record of its watch here or there.
+    await runInDurableObject(catalogStub(), (_i: CatalogDO, st) => st.storage.sql.exec("DELETE FROM rule_watch WHERE agent = ?", agent));
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("DELETE FROM kv WHERE key = 'rules_watched'");
+      // An unrelated deadline: the alarm runs, not the hourly read.
+      st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('lr-unrelated', 0)");
+    });
+    await runDue(agentStub(agent));
+    await eventually("its watch set again", async () => (await watched(agent)).length === 2);
+    expect(await watched(agent)).toEqual([cap, "nest"].sort());
+  });
+
+  it("the reap leaves a watch its end didn't", async () => {
+    const { cap, tpl } = await operatorEntries([]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    await adminJson(`/v1/agents/${agent}/stop`, { body: { end: true } });
+    await eventually("its end done", async () => !!(await adminJson(`/v1/agents/${agent}`)).ended?.done_ms);
+    await rulesSettled(agent);
+    // As if the end's unwatch never reached the catalog, and the record is past its retention.
+    await runInDurableObject(catalogStub(), (_i: CatalogDO, st) => st.storage.sql.exec("INSERT OR IGNORE INTO rule_watch (capability, agent) VALUES (?, ?)", cap, agent));
+    await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('rules_watched', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify(JSON.stringify([cap])));
+      const info = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value);
+      info.ended.ms = 1;
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'info'", JSON.stringify(info));
+      st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('reap', 0) ON CONFLICT(key) DO UPDATE SET at = 0");
+    });
+    await runDue(agentStub(agent));
+    await eventually("its watch left", async () => (await watched(agent)).length === 0);
+  });
+
+  it("a failed read is tried again after RULES_RETRY_MS, and lands", async () => {
+    const { cap, tpl } = await operatorEntries([]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    let failed = 0;
+    const pw = patch(CatalogDO.prototype as unknown as { watchRules: (a: string, n: string[]) => Promise<unknown> }, "watchRules", (real) =>
+      async function (this: CatalogDO, a: string, n: string[]) {
+        if (a === agent && failed === 0) {
+          failed++;
+          throw new Error("catalog unreachable");
+        }
+        return real.call(this, a, n);
+      });
+    let at: number;
+    try {
+      const t0 = Date.now();
+      await putCap(cap, [ALLOW_WEB]);
+      at = await eventually("the retry armed", () => runInDurableObject(agentStub(agent), (_i: AgentDO, st) =>
+        failed ? st.storage.sql.exec<{ at: number }>("SELECT at FROM deadlines WHERE key = 'rules'").toArray()[0]?.at : undefined));
+      expect(at).toBeGreaterThanOrEqual(t0 + RULES_RETRY_MS);
+      expect(await rulesOf(agent)).toEqual([NEST_ALLOW]);
+    } finally {
+      pw.restore();
+    }
+    await makeDue(agentStub(agent), "rules");
+    await runDue(agentStub(agent));
+    await rulesBecome(agent, [NEST_ALLOW, ALLOW_WEB]);
+  });
+
+  it("a nudge stored with no storage alarm (a rolled-back release ran the alarm) is still sent at the next write", async () => {
+    const { cap, tpl } = await operatorEntries([]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    // The previous release has no alarm handler: a nudge row and the `nudge` deadline row stay, the storage alarm is gone.
+    await runInDurableObject(catalogStub(), async (_i: CatalogDO, st) => {
+      st.storage.sql.exec("INSERT INTO rule_nudges (agent, rev, attempts, next_ms) VALUES ('agt_ghostprobe', 999999, 0, 1) ON CONFLICT(agent) DO NOTHING");
+      st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('nudge', 1) ON CONFLICT(key) DO UPDATE SET at = 1");
+      await st.storage.deleteAlarm();
+    });
+    await putCap(cap, [ALLOW_WEB]);
+    await rulesBecome(agent, [NEST_ALLOW, ALLOW_WEB]);
+  });
+
+  it("the same state found by a restarted catalog arms the alarm again", async () => {
     const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-lr-${rand()}`));
-    const nudged = await runInDurableObject(stub, async (_i: CatalogDO, st) => {
+    await runInDurableObject(stub, async (_i: CatalogDO, st) => {
+      st.storage.sql.exec("INSERT INTO rule_nudges (agent, rev, attempts, next_ms) VALUES ('agt_ghostrestart', 1, 0, ?)", Date.now() + 3_600_000);
+      st.storage.sql.exec("INSERT INTO deadlines (key, at) VALUES ('nudge', ?) ON CONFLICT(key) DO UPDATE SET at = excluded.at", Date.now() + 3_600_000);
+      await st.storage.deleteAlarm();
+      new CatalogDO(st, env as never);
+    });
+    await eventually("an alarm set", () => runInDurableObject(stub, async (_i: CatalogDO, st) => (await st.storage.getAlarm()) !== null));
+  });
+});
+
+describe("a seed step", () => {
+  it("nudges the watchers of exactly the capabilities it changed or deleted, however it changed them", async () => {
+    const stub = env.CATALOG.get(env.CATALOG.idFromName(`catalog-lr-${rand()}`));
+    const r = await runInDurableObject(stub, async (_i: CatalogDO, st) => {
       const sql = st.storage.sql;
-      // A catalog at version 6: version 7 replaces `spawning`'s prompt where it is still version 5's.
+      // A catalog at version 6, its seed entries as that version left them: version 7 replaces `spawning`'s
+      // prompt and deletes `channels`; every later step runs too.
       sql.exec("UPDATE kv SET value = '6' WHERE key = 'seed_version'");
       const spawning = JSON.parse(sql.exec<{ body: string }>("SELECT body FROM capabilities WHERE name = 'spawning'").one().body);
       sql.exec("UPDATE capabilities SET body = ? WHERE name = 'spawning'", JSON.stringify({ ...spawning, prompt: SPAWNING_PROMPT_V5 }));
-      sql.exec("INSERT INTO rule_watch (capability, agent) VALUES ('spawning', 'agt_reader'), ('hands', 'agt_other')");
+      sql.exec("UPDATE capabilities SET body = ? WHERE name = 'nest'", JSON.stringify(SEED_CATALOG_V1.capabilities.nest));
+      sql.exec("INSERT INTO capabilities (name, body) VALUES ('channels', ?)", JSON.stringify(capability([])));
+      const rows = () => new Map(sql.exec<{ name: string; body: string }>("SELECT name, body FROM capabilities").toArray().map((x) => [x.name, x.body]));
+      const before = rows();
+      // One watcher per capability.
+      for (const name of before.keys()) sql.exec("INSERT INTO rule_watch (capability, agent) VALUES (?, ?)", name, `agt_w-${name}`);
       new CatalogDO(st, env as never);
-      return sql.exec<{ agent: string }>("SELECT agent FROM rule_nudges ORDER BY agent").toArray().map((r) => r.agent);
+      const after = rows();
+      const changed = [...before.keys()].filter((n) => after.get(n) !== before.get(n)).map((n) => `agt_w-${n}`).sort();
+      const nudged = sql.exec<{ agent: string }>("SELECT agent FROM rule_nudges ORDER BY agent").toArray().map((x) => x.agent);
+      return { changed, nudged };
     });
-    expect(nudged).toEqual(["agt_reader"]);
+    expect(r.changed).toEqual(expect.arrayContaining(["agt_w-channels", "agt_w-spawning"]));
+    expect(r.nudged).toEqual(r.changed);
   });
 });
 

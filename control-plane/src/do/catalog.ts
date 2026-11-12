@@ -114,17 +114,41 @@ export class CatalogDO extends DurableObject<Env> {
       if (from < SEED_VERSION) {
         const names = (table: string) => this.sql.exec<{ name: string }>(`SELECT name FROM ${table}`).toArray().map((r) => r.name);
         const m = seedMigration({ capabilities: names("capabilities"), templates: names("templates") }, from);
+        // Every capability row the steps change, however they change it, is found by comparing the rows.
+        const before = this.capabilityRows();
         this.insertSeed(m);
-        const changed = [...this.removeSeed(m.removes), ...this.rewritePrompts(m.prompts)];
+        this.removeSeed(m.removes);
+        this.rewritePrompts(m.prompts);
         this.setSeedVersion(m.version);
-        // The live agents reading a capability the step changed are told, as for any write.
-        // The rows in this step; only arming the alarm is awaited.
+        const after = this.capabilityRows();
+        const changed = [...before.keys()].filter((n) => after.get(n) !== before.get(n));
+        // The live agents reading a capability the step changed or deleted are told, as for any write
+        // (the rows in this step; only arming the alarm is awaited).
         if (changed.length) {
           const armed = this.nudgeWatchers(changed);
           void ctx.blockConcurrencyWhile(() => armed);
         }
       }
     }
+    // A rolled-back release (no alarm handler) may have left nudges with no storage alarm: armed again.
+    void ctx.blockConcurrencyWhile(() => this.armNudges());
+  }
+
+  /** Every stored capability row, by name, as stored. */
+  private capabilityRows(): Map<string, string> {
+    return new Map(this.sql.exec<{ name: string; body: string }>("SELECT name, body FROM capabilities").toArray().map((r) => [r.name, r.body]));
+  }
+
+  /**
+   * Arm the `nudge` deadline for the first nudge due (or `at`, if sooner), and the storage alarm when none
+   * is set: a rolled-back release has no alarm handler, so its run may have consumed the alarm and left
+   * the deadline row, and `Deadlines.set` returns early for a row already armed earlier.
+   */
+  private async armNudges(at?: number): Promise<void> {
+    const next = this.sql.exec<{ at: number | null }>("SELECT MIN(next_ms) AS at FROM rule_nudges").one().at;
+    if (next === null) return;
+    await this.deadlines.set("nudge", Math.min(at ?? next, next), true);
+    if ((await this.ctx.storage.getAlarm()) === null) await this.deadlines.reschedule();
   }
 
   // --- Live rules (docs/control-plane/durable-objects/catalog/#live-rules) ----------------------------
@@ -149,7 +173,7 @@ export class CatalogDO extends DurableObject<Env> {
         any = true;
       }
     }
-    return any ? this.deadlines.set("nudge", now, true) : Promise.resolve();
+    return any ? this.armNudges(now) : Promise.resolve();
   }
 
   /**
@@ -162,10 +186,16 @@ export class CatalogDO extends DurableObject<Env> {
     if (!Array.isArray(names) || !names.every((n) => EntryName.safeParse(n).success)) {
       throw new NestError(ErrorCodes.INVALID_MESSAGE, "watchRules: capability names");
     }
-    this.sql.exec("DELETE FROM rule_watch WHERE agent = ?", agent);
+    const want = [...new Set(names)];
+    const have = this.sql.exec<{ capability: string }>("SELECT capability FROM rule_watch WHERE agent = ?", agent).toArray().map((r) => r.capability);
+    // The hourly read finds its watch as it was: nothing to write.
+    const same = have.length === want.length && want.every((n) => have.includes(n));
+    if (!same) {
+      this.sql.exec("DELETE FROM rule_watch WHERE agent = ?", agent);
+      for (const name of want) this.sql.exec("INSERT INTO rule_watch (capability, agent) VALUES (?, ?)", name, agent);
+    }
     const out: WatchedRules = { rules: {}, unreadable: [] };
-    for (const name of new Set(names)) {
-      this.sql.exec("INSERT INTO rule_watch (capability, agent) VALUES (?, ?)", name, agent);
+    for (const name of want) {
       const row = this.sql.exec<{ body: string }>("SELECT body FROM capabilities WHERE name = ?", name).toArray()[0];
       if (!row) {
         out.rules[name] = null;
@@ -183,7 +213,7 @@ export class CatalogDO extends DurableObject<Env> {
     // An agent that reads nothing needs no nudge.
     if (!names.length) this.sql.exec("DELETE FROM rule_nudges WHERE agent = ?", agent);
     // Nudges a rolled-back release left waiting (it has no alarm handler) are sent again.
-    if (!this.deadlines.has("nudge") && this.sql.exec("SELECT 1 FROM rule_nudges LIMIT 1").toArray().length) await this.deadlines.set("nudge", Date.now());
+    await this.armNudges();
     return out;
   }
 
@@ -243,28 +273,19 @@ export class CatalogDO extends DurableObject<Env> {
    * Delete the removed capabilities and prune them (and the parameters they read) from every template
    * row, and the removed tools and fields from every capability row.
    */
-  /** The capabilities deleted or edited. */
-  private removeSeed(removes: Removes): string[] {
-    const changed: string[] = [];
-    for (const name of removes.capabilities) {
-      if (this.sql.exec("DELETE FROM capabilities WHERE name = ?", name).rowsWritten) changed.push(name);
-    }
+  private removeSeed(removes: Removes): void {
+    for (const name of removes.capabilities) this.sql.exec("DELETE FROM capabilities WHERE name = ?", name);
     if (removes.capabilities.length) this.rewriteRows("templates", (body) => pruneTemplate(body, removes));
-    if (removes.tools?.length || removes.fields?.length) changed.push(...this.rewriteRows("capabilities", (body) => pruneCapability(body, removes)));
-    return changed;
+    if (removes.tools?.length || removes.fields?.length) this.rewriteRows("capabilities", (body) => pruneCapability(body, removes));
   }
 
-  /** Replace each seed prompt still as a step left it, in step order; the capabilities edited. */
-  private rewritePrompts(prompts: readonly PromptRewrite[]): string[] {
-    return prompts.flatMap((p) => this.rewriteRows("capabilities", (body) => rewritePrompt(body, p), p.capability));
+  /** Replace each seed prompt still as a step left it, in step order. */
+  private rewritePrompts(prompts: readonly PromptRewrite[]): void {
+    for (const p of prompts) this.rewriteRows("capabilities", (body) => rewritePrompt(body, p), p.capability);
   }
 
-  /**
-   * Each row of `table` (or only `only`) that `edit` changes (non-null), written back; the names written.
-   * A row that isn't JSON is left.
-   */
-  private rewriteRows(table: "templates" | "capabilities", edit: (body: unknown) => Record<string, unknown> | null, only?: string): string[] {
-    const written: string[] = [];
+  /** Each row of `table` (or only `only`) that `edit` changes (non-null), written back. A row that isn't JSON is left. */
+  private rewriteRows(table: "templates" | "capabilities", edit: (body: unknown) => Record<string, unknown> | null, only?: string): void {
     const rows = only === undefined
       ? this.sql.exec<{ name: string; body: string }>(`SELECT name, body FROM ${table}`).toArray()
       : this.sql.exec<{ name: string; body: string }>(`SELECT name, body FROM ${table} WHERE name = ?`, only).toArray();
@@ -276,12 +297,8 @@ export class CatalogDO extends DurableObject<Env> {
         continue; // `load()` logs and skips it, as before.
       }
       const edited = edit(body);
-      if (edited) {
-        this.sql.exec(`UPDATE ${table} SET body = ? WHERE name = ?`, JSON.stringify(edited), r.name);
-        written.push(r.name);
-      }
+      if (edited) this.sql.exec(`UPDATE ${table} SET body = ? WHERE name = ?`, JSON.stringify(edited), r.name);
     }
-    return written;
   }
 
   private setSeedVersion(v: number): void {
