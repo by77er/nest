@@ -19,7 +19,7 @@
 - Credentials stay outside VMs: [identity/](identity/)
 - Egress allowlist, hard deny of non-public addresses (in the proxy and the kernel), request sanitizing, live policy re-checks, scoped credential injection, reflected-secret masking, no raw ssh: [../sandbox/networking/egress/](../sandbox/networking/egress/)
 - Short-lived CA chain under a KMS root, since guests check no revocation: [../sandbox/networking/egress/tls/](../sandbox/networking/egress/tls/)
-- Every credential issuance, push and refusal is audited by BrokerDO (not built): [../control-plane/durable-objects/broker/](../control-plane/durable-objects/broker/)
+- Every credential issuance, push and refusal is audited by BrokerDO (built for GitHub mints, API clients' injected secrets and MCP OAuth; not built for the operator's secret pushes and binding mints): [../control-plane/durable-objects/broker/](../control-plane/durable-objects/broker/)
 - The harness runs on brain hosts, with a clean environment, restricted mode and managed settings: [../agents/runner/](../agents/runner/)
 - One door into every sandbox, with a signed binding per client and an edge check: [../sandbox/gateway/](../sandbox/gateway/)
 - Grants, attenuated from me (an agent passes on only what it holds), taint tracking with approval on sinks, brokered actions and approval gates: [../agents/tools/](../agents/tools/)
