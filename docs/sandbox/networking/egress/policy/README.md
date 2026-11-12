@@ -96,6 +96,8 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 
 ## Repo allowlists
 
+**Moving out (decided 2026-11-12, not built):** repo allowlists, read-only repos and the [GitHub](#github) constructor leave the kernel; an app builds the same from its own secrets, bindings and request guards in a sandbox's client layer, and the base layer's allowlist becomes operator data ([principle 10](../../../../README.md#principles)). Until then these sections describe what runs.
+
 **Built.** A sandbox may push only to repos explicitly on its **push allowlist**, enforced by nest-proxy whatever credential a push carries, so a prompt-injected agent can't push to an attacker's repo with the attacker's own token.
 
 - **What it is:** exact `owner/name` names, compared without case (`control-plane/src/lib/repos.ts`). **No `owner/*`:** a wildcard covers repos created later, forks an agent made included, and can't narrow a token (GitHub's token request names repos). No name ending in `.git` (git's URL suffix). Default: none, so no push anywhere.
