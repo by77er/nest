@@ -3,6 +3,10 @@
 ## Corrections
 | doc | said | code says | evidence |
 |---|---|---|---|
+| sandbox/networking/egress/inspection/README.md | routing overrides (`Fastly-*`, `Forwarded`, `X-Forwarded-Host`, …) stripped (no status) | not built: no such stripping anywhere in nest-proxy; only hop-by-hop headers are stripped | crates/nest-proxy/src/http.rs:46-56,693-710 (grep -i fastly crates/ finds nothing) |
+| sandbox/networking/egress/inspection/README.md | smuggling checks: protected fields named in `Connection`, TE other than `chunked`, `Trailer` naming protected fields → 400 `invalid_headers` | not built: no `invalid_headers`; hop-by-hop stripping, Host checks (`host_mismatch`, `duplicate_host`) and `te: trailers` on h2 are | crates/nest-proxy/src/http.rs:375-388,472-477,553-575 |
+| sandbox/networking/egress/inspection/README.md | ≤128 headers/32 KiB, ≤32 h2 streams | not configured: hyper builders use defaults | crates/nest-proxy/src/http.rs:95,227-230 |
+| sandbox/networking/egress/inspection/README.md | `limits.max_inspected_body_mb` | `limits.max_inspected_body_bytes` (default 512 MiB) | crates/nest-protocol/src/model.rs:393, control-plane/src/do/sandbox.ts:42 |
 | sandbox/networking/egress/dns/README.md | only A/AAAA (class IN) answered, else NOTIMP; AAAA always empty | NOTIMP only for a non-Query opcode or ≠1 question; an allowed name gets A and AAAA from getaddrinfo, other types NOERROR empty; class unchecked | crates/nest-proxy/src/dns.rs:36-72 |
 | sandbox/networking/egress/dns/README.md | answers filtered of hard-denied addresses, SERVFAIL `dns_non_public` (as built) | not built: dns.rs adds every resolved address; non-public addresses are refused at connect (`connect_addrs`, TCP exceptions included) | crates/nest-proxy/src/dns.rs:55-72, http.rs:113-129,840-846 |
 | sandbox/networking/egress/dns/README.md | ≤64 records, ≤4 KiB (listed as bounds) | no record cap; 60 s TTL cap built | crates/nest-proxy/src/state.rs:24, dns.rs:21-22 |

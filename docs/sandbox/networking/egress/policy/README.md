@@ -1,6 +1,6 @@
 # Policy
 
-Policy is layered and pushed by SandboxDO through nestd to nest-proxy. Changes apply live, to open connections too.
+Policy is layered and pushed by SandboxDO through nestd to nest-proxy. Changes apply live: every request, on an open connection too, is decided against the current policy (closing open connections the policy now denies is designed, not built: [changes](#changes)).
 
 ```yaml
 base:        # image defaults
@@ -12,17 +12,18 @@ sandbox:     # the operator's (designed: also the sandbox's owner); forks inheri
   passthrough: []
   tcp: []      # e.g. ["db.example.com:5432"]
   repos: [by77er/nest]   # the push allowlist: the GitHub constructor turns it into guards, a binding, a token
+  read_repos: []         # repos it may only read
   guards: []   # request guards written by hand, layered with the constructed ones
 grants:
   allow: [{host: example.com, expires: 2h}]   # temporary
-limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
+limits: {max_connections: 256, bandwidth_mbps: 200, max_inspected_body_bytes: 512 MiB}   # fixed defaults; no layer sets them
 ```
 
 **Built:** the `sandbox` layer is the operator's (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), and its rules reach hosts tagged `layer: workstream`, the layer's wire name, which hosts parse as a closed enum ([pending contract changes](../../../../interfaces/README.md#pending-contract-changes)); grants are tagged `sandbox`. **API clients' rules** (built 2026-11-02, [egress](../../../../control-plane/api/clients/#egress)) join the same layer on the wire: allow rules only, within the client's grant's `egress_hosts`, from its templates (while their agents are attached), its sandbox specs and the sandbox's client layer. Allow rules only add, so the guards below and the hard deny apply to whatever they open, and no client rule allows what the operator's policy refuses.
 
 ## Sources
 
-**Decided (2026-11-03):** the effective policy the API shows (`GET /v1/sandboxes/<id>/policy`, and the answers of `PUT …/policy` and `PUT …/client-policy`) marks each allow rule with its `source`. A reader no longer has to subtract one layer from another to tell them apart.
+**Decided (2026-11-03):** the effective policy the API shows (`GET /v1/sandboxes/<id>/policy`, and the answers of `PUT …/policy` and `PUT …/client-policy`) marks each allow rule with its `source`, so a reader needn't subtract one layer from another to tell them apart.
 
 | `source` | What it is |
 |---|---|
@@ -38,14 +39,14 @@ limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
 
 ## Hard deny
 
-**Non-public addresses are refused before policy is consulted.** No allow rule, grant, TCP exception or IP-literal host can override this:
+**Non-public addresses are refused whatever the policy says:** the proxy checks every address it is about to dial. No allow rule, grant, TCP exception or IP-literal host can override this:
 - loopback, private, link-local (including IMDS `169.254.169.254` and the ECS credentials endpoint `169.254.170.2`), CGNAT, `192.0.0.0/24`, documentation, benchmarking, multicast, reserved and unspecified
 - unique-local IPv6 (including IPv6 IMDS `fd00:ec2::254`, [EC2 docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html)), link-local and site-local IPv6, Teredo, discard-only
 - IPv6 forms that embed an IPv4 address (NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, IPv4-compatible `::a.b.c.d`, IPv4-mapped) are judged by the embedded address; local-use NAT64 `64:ff9b:1::/48` is always refused.
 
-It applies to every upstream connect (inspect, passthrough, TCP exceptions) and to [DNS answers](../dns/). nest-proxy runs on the host, where IMDS and the instance role's credentials are reachable, so a kernel rule on the proxy's uid backs it up ([steering](../steering/#kernel-backstop)). nest's list is broader than SPACE's ([`PLATFORM_EGRESS_HARD_DENY_CIDRS`](https://github.com/perplexityai/space/blob/main/crates/libs/net/common/src/lib.rs)).
+It applies to every upstream connect (inspect, passthrough, TCP exceptions; `is_public` in `crates/nest-proxy/src/http.rs`). Filtering [DNS answers](../dns/) by it is designed, not built: the proxy's DNS answers an allowed name with whatever addresses it resolves to. nest-proxy runs on the host, where IMDS and the instance role's credentials are reachable, so a kernel rule on the proxy's uid is to back it up ([steering](../steering/#kernel-backstop)); designed, not built. nest's list is broader than SPACE's ([`PLATFORM_EGRESS_HARD_DENY_CIDRS`](https://github.com/perplexityai/space/blob/main/crates/libs/net/common/src/lib.rs)).
 
-**Test:** with `169.254.169.254` explicitly allowed (as a host, a grant and a TCP exception), and with an allowed name that resolves to it, every request still fails; on a real host it fails at the kernel rule too, with the proxy's own check disabled. SPACE has the same case ([08-guardrails.toml](https://github.com/perplexityai/space/blob/main/scripts/netgtw/traffic/cases/08-guardrails.toml)).
+**Test** (designed; built: the `is_public` unit test and `private_upstream_addresses_are_refused` in `tests/egress.rs`, an allowed name resolving to loopback): with `169.254.169.254` explicitly allowed (as a host, a grant and a TCP exception), and with an allowed name that resolves to it, every request still fails; on a real host it fails at the kernel rule too, with the proxy's own check disabled. SPACE has the same case ([08-guardrails.toml](https://github.com/perplexityai/space/blob/main/scripts/netgtw/traffic/cases/08-guardrails.toml)).
 
 ## Changes
 
@@ -57,7 +58,7 @@ It applies to every upstream connect (inspect, passthrough, TCP exceptions) and 
   - TCP exceptions whose rule is gone
 - **The DNS record is pruned** to names the new policy still allows ([dns](../dns/)). Designed, not built.
 - **A final check runs just before request headers go upstream** ([inspection](../inspection/)). Designed, not built.
-- **While a policy loads** (listeners installed, no acknowledged policy), new connections are held for up to 30 s, then denied with `policy_pending`. SPACE holds them for 31 s, its 30 s policy-load deadline plus 1 s ([state.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/state.rs)).
+- **While a policy loads** (listeners installed, no acknowledged policy), new connections are held for up to 30 s, then denied with `policy_pending`. Designed, not built: a sandbox without a policy has a connection limit of 0, so its connections are refused at once (`connection_limit`) and its DNS queries get REFUSED. SPACE holds them for 31 s, its 30 s policy-load deadline plus 1 s ([state.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/state.rs)).
 
 Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/state/egress.rs) (`reconcile_policy`) and [egress/tcp.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/egress/tcp.rs) (`revalidate_tcp`).
 
@@ -68,7 +69,7 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 - **Inspected hosts can carry method and path rules** (e.g. `GET` only, or `/repos/me/*`), since the proxy already decrypts them. Vercel's sandbox firewall offers the same matchers ([docs](https://vercel.com/docs/vercel-sandbox/concepts/firewall)); its plain allow rules match SNI only, while nest-proxy also requires Host to equal SNI.
 - **Passthrough is SNI-only.** The proxy can't see `Host` inside a spliced connection, so a passthrough host on a shared CDN allows fronting to anything on that CDN that accepts a `Host` different from the SNI. Use it only for pinned clients that need it.
 - **TCP exceptions** each get their own listener port. The proxy connects only to IPs its own resolver returned for that host, and passes the bytes through uninspected. There's no raw ssh by default.
-- **Bandwidth** is shaped on the tap device. The other limits are enforced in the proxy, alongside the proxy-wide fairness bounds ([tls](../tls/#shared-proxy-fairness), [inspection](../inspection/)).
+- **Bandwidth** is to be shaped on the tap device (designed, not built: nothing reads `bandwidth_mbps`). The other limits are enforced in the proxy (`max_connections` per sandbox, `max_inspected_body_bytes` per request body), alongside the proxy-wide fairness bounds ([tls](../tls/#shared-proxy-fairness), [inspection](../inspection/)).
 
 **Policy is per sandbox:** forks inherit it, and an owner updates each of its sandboxes itself. There are no shared policy objects: the blast radius of an edit is one sandbox, and a loop over sandboxes is the agent's job.
 
@@ -144,7 +145,7 @@ The evaluator with made-up hosts (`guard.rs` unit tests, `tests/guards.rs` throu
   - when a new minute starts, a summary record (host `*`, reason `suppressed: …`) reports what was dropped
 
   Allowed traffic isn't aggregated; it's bounded by the connection limit.
-- **Reason values** in audit records include: `not_allowed`, `invalid_host`, `no_sni`, `not_tls`, `no_ca`, `dns_nxdomain`, `dns_non_public`, `connection_limit`, `handshake_limit`, `policy_pending`, `policy_changed`, `invalid_headers`, `host_mismatch` (plaintext), `host_sni_mismatch` and `duplicate_host` (inspected TLS, alert), `sni_mismatch` (CONNECT authority ≠ SNI, alert), `non_tls_tunnel`, `placeholder_wrong_host`, `injection_unavailable`, `injection_requires_tls`, `injection_out_of_scope`, `injection_upgrade`, `trace_with_credential`, `tcp_exception_not_in_policy`, `tcp_exception`, `upgraded`, `guard: <name>`, `suppressed: …`, plus `upstream: …` / `connect: …` / `resolve: …` errors. The wire list is in [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#audit-reason-values).
+- **Reason values** in audit records include: `not_allowed`, `invalid_host`, `no_sni`, `not_tls`, `no_ca`, `dns_nxdomain`, `connection_limit`, `host_mismatch` (plaintext), `host_sni_mismatch` and `duplicate_host` (inspected TLS, alert), `sni_mismatch` (CONNECT authority ≠ SNI, alert), `non_tls_tunnel`, `placeholder_wrong_host`, `injection_unavailable`, `injection_requires_tls`, `trace_with_credential`, `tcp_exception_not_in_policy`, `tcp_exception`, `upgraded`, `guard: <name>`, `suppressed: …`, plus `upstream: …` / `connect: …` / `resolve: …` errors. Designed, not emitted yet: `dns_non_public`, `handshake_limit`, `policy_pending`, `policy_changed`, `invalid_headers`, `injection_out_of_scope`, `injection_upgrade`. The wire list is in [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#audit-reason-values).
 
 ## Open questions
 
