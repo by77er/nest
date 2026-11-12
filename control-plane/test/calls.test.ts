@@ -261,6 +261,18 @@ describe("CallLedger: the guards are the ledger's", () => {
       expect(listed.ask_over).not.toHaveProperty("input");
       expect(listed.ask_wide).not.toHaveProperty("input");
       expect(listed.ask_wide!.input_bytes).toBe(INPUT_KEPT_BYTES + 10);
+      // Listed without inputs (`GET /v1/asks`), each keeps its size.
+      expect(l.open(undefined, { input: false }).map((a) => [a.ask, "input" in a, a.input_bytes]))
+        .toEqual([["ask_fits", false, INPUT_KEPT_BYTES], ["ask_over", false, INPUT_KEPT_BYTES + 1], ["ask_wide", false, INPUT_KEPT_BYTES + 10]]);
+      // Read apart, by ask: only the kept ones, of asks still open, and only those asked for.
+      l.recordAsk({ ask: "ask_small", call: "cal_small", epoch: 1, question: "q", status: "async", deadline: 0 });
+      l.requestApproval("ask_small", "WebFetch", "ds", "WebFetch", "rule", '{"url":"a"}');
+      l.recordAsk({ ask: "ask_plain", call: "cal_plain", epoch: 1, question: "q", status: "async", deadline: 0 });
+      const all = ["ask_fits", "ask_over", "ask_wide", "ask_small", "ask_plain", "ask_nonesuch"];
+      expect(Object.fromEntries(l.inputs(all))).toEqual({ ask_fits: JSON.parse(fits), ask_small: { url: "a" } });
+      expect([...l.inputs(["ask_small"]).keys()]).toEqual(["ask_small"]);
+      expect(l.answer("ask_small", "yes")).toBe(true);
+      expect([...l.inputs(all).keys()]).toEqual(["ask_fits"]);
     });
   });
 

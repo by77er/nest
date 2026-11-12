@@ -254,11 +254,15 @@ export class CallLedger {
     return this.applyAsk("answer", text, "ask = ?", ask) > 0;
   }
 
-  /** Asks not yet answered, oldest first, with the approval each one decides (if any); the first `limit` when given. */
-  open(limit?: number): OpenAsk[] {
+  /**
+   * Asks not yet answered, oldest first, with the approval each one decides (if any); the first `limit` when
+   * given. `input: false` leaves every `input` out (its `input_bytes` stays): `GET /v1/asks` reads inputs apart.
+   */
+  open(limit?: number, o: { input?: boolean } = {}): OpenAsk[] {
     const cap = limit !== undefined && Number.isSafeInteger(limit) && limit >= 0 ? limit : -1; // SQLite: LIMIT -1 is none
     return this.sql.exec<{ ask: string; question: string; created_ms: number; name: string | null; tool: string | null; input: string | null; input_bytes: number | null }>(
-      `SELECT a.ask, a.question, a.created_ms, p.name, p.tool, p.input, p.input_bytes FROM asks a LEFT JOIN approvals p ON p.ask = a.ask
+      `SELECT a.ask, a.question, a.created_ms, p.name, p.tool, ${o.input === false ? "NULL AS input" : "p.input"}, p.input_bytes
+        FROM asks a LEFT JOIN approvals p ON p.ask = a.ask
         WHERE a.status != '${ASK.answered}' ORDER BY a.created_ms, a.ask LIMIT ?`, cap).toArray()
       .map((r) => ({
         ask: r.ask, question: r.question, created_ms: r.created_ms,
@@ -266,6 +270,17 @@ export class CallLedger {
         ...(r.input !== null ? { input: JSON.parse(r.input) as unknown } : {}),
         ...(r.input_bytes !== null ? { input_bytes: r.input_bytes } : {}),
       }));
+  }
+
+  /**
+   * The kept inputs (parsed) of those of `asks` still open, by ask: an answered ask, one that isn't an
+   * approval, and one whose input wasn't kept (past `INPUT_KEPT_BYTES`, or from before it was) are left out.
+   */
+  inputs(asks: readonly string[]): Map<string, unknown> {
+    return new Map(this.sql.exec<{ ask: string; input: string }>(
+      `SELECT a.ask, p.input FROM asks a JOIN approvals p ON p.ask = a.ask
+        WHERE a.status != '${ASK.answered}' AND p.input IS NOT NULL AND a.ask IN (SELECT value FROM json_each(?))`, JSON.stringify(asks)).toArray()
+      .map((r) => [r.ask, JSON.parse(r.input) as unknown]));
   }
 
   /** Asks (approvals included) not yet answered: each answer would be a turn. */

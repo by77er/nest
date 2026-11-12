@@ -14,6 +14,8 @@ import {
 } from "../src/lib/clients";
 import { expandSpec, mcpPrefix } from "../src/lib/spec";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
+import { CallLedger } from "../src/lib/calls";
+import { INPUT_KEPT_BYTES } from "../src/lib/sinks";
 import { NestError } from "../src/lib/util";
 import { ErrorCodes } from "../src/protocol/model";
 import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueCell, Ws } from "./helpers";
@@ -345,14 +347,25 @@ describe("a client acts only on its subtree", () => {
 
 // --- Open asks across agents -----------------------------------------------------------------------------
 
-/** Hold an ask in `agent`'s ledger as a held call does (`recordAsk`): open, or `answered`; an approval when `tool` is given. */
-async function plantAsk(agent: string, ask: string, created_ms: number, o: { status?: "async" | "answered"; tool?: string } = {}): Promise<void> {
+/**
+ * Hold an ask in `agent`'s ledger as a held call does (`recordAsk`): open, or `answered`; an approval when `tool`
+ * is given, as the previous release wrote it (no input), or, given `input` (canonical JSON), as `requestApproval` does.
+ */
+async function plantAsk(agent: string, ask: string, created_ms: number, o: { status?: "async" | "answered"; tool?: string; input?: string } = {}): Promise<void> {
   await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
     st.storage.sql.exec("INSERT INTO asks (ask, call, epoch, question, status, deadline, created_ms) VALUES (?, ?, 1, ?, ?, 0, ?)",
       ask, `cal_${ask}`, `may ${ask}?`, o.status ?? "async", created_ms);
-    if (o.tool) st.storage.sql.exec("INSERT INTO approvals (ask, name, digest, status, created_ms, tool) VALUES (?, 'brokered', 'd', 'pending', ?, ?)", ask, created_ms, o.tool);
+    if (o.input !== undefined) new CallLedger(st.storage.sql).requestApproval(ask, "WebFetch", `d_${ask}`, o.tool ?? "WebFetch", "rule", o.input);
+    else if (o.tool) st.storage.sql.exec("INSERT INTO approvals (ask, name, digest, status, created_ms, tool) VALUES (?, 'brokered', 'd', 'pending', ?, ?)", ask, created_ms, o.tool);
   });
 }
+
+/** A call's canonical input of exactly `bytes` bytes. */
+const inputOf = (bytes: number): string => {
+  const s = JSON.stringify({ u: "x".repeat(bytes - 8) });
+  expect(s.length).toBe(bytes);
+  return s;
+};
 
 describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-asks-across-agents)", () => {
   it("lists the open asks of the caller's live agents matching its labels, oldest first, with each one's agent, owner and labels", async () => {
@@ -456,9 +469,9 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
     await clientStub(c.id).report({ kind: "agent", id: noObject, cell: c.cell, owner: c.id, labels: { project: "pr" }, ended_ms: null });
     const real = AgentDOClass.prototype.openAsks;
     let calls = 0;
-    AgentDOClass.prototype.openAsks = function (this: AgentDO, limit?: number) {
+    AgentDOClass.prototype.openAsks = function (this: AgentDO, limit?: number, o?: { input?: boolean }) {
       calls++;
-      return real.call(this, limit);
+      return real.call(this, limit, o);
     };
     try {
       const r = await asJson(c.token, "/v1/asks?label=project=pr");
@@ -495,6 +508,110 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
     const at20 = await asJson(c.token, "/v1/asks?label=project=pn");
     expect(at20.asks).toHaveLength(20);
     expect(at20.more).toEqual([]);
+  });
+
+  it("carries each held call's input only with ?include=input: whole up to 32 KiB, never past it or for an old ask", async () => {
+    const c = await newClient();
+    const w = await createAgent(c, { labels: { project: "pi" } });
+    const small = JSON.stringify({ command: "rm -rf build", description: "clean" });
+    await plantAsk(w.agent, "ask_inputsmal", 1000, { input: small });
+    await plantAsk(w.agent, "ask_inputkept", 1001, { input: inputOf(INPUT_KEPT_BYTES) });
+    await plantAsk(w.agent, "ask_inputover", 1002, { input: inputOf(INPUT_KEPT_BYTES + 1) });
+    await plantAsk(w.agent, "ask_oldapprov", 1003, { tool: "WebFetch" });
+    await plantAsk(w.agent, "ask_noapprova", 1004);
+    const fields = (r: any) => Object.fromEntries(r.asks.map((x: any) => [x.ask, { input: x.input, input_bytes: x.input_bytes }]));
+
+    // Without it: sizes, never inputs, and no `input_left_out`.
+    const plain = await asJson(c.token, "/v1/asks?label=project=pi");
+    expect(plain).not.toHaveProperty("input_left_out");
+    expect(fields(plain)).toEqual({
+      ask_inputsmal: { input_bytes: small.length }, ask_inputkept: { input_bytes: INPUT_KEPT_BYTES },
+      ask_inputover: { input_bytes: INPUT_KEPT_BYTES + 1 }, ask_oldapprov: {}, ask_noapprova: {},
+    });
+    for (const x of plain.asks) expect(x).not.toHaveProperty("input");
+
+    // With it: the parsed input as approved, up to 32 KiB; past it the size alone, as for an ask that never had one.
+    const withInput = await asJson(c.token, "/v1/asks?label=project=pi&include=input");
+    expect(fields(withInput)).toEqual({
+      ask_inputsmal: { input: JSON.parse(small), input_bytes: small.length },
+      ask_inputkept: { input: JSON.parse(inputOf(INPUT_KEPT_BYTES)), input_bytes: INPUT_KEPT_BYTES },
+      ask_inputover: { input_bytes: INPUT_KEPT_BYTES + 1 }, ask_oldapprov: {}, ask_noapprova: {},
+    });
+    for (const a of ["ask_inputover", "ask_oldapprov", "ask_noapprova"]) expect(withInput.asks.find((x: any) => x.ask === a)).not.toHaveProperty("input");
+    expect(withInput.input_left_out).toEqual([]);
+    // As the agent's own route gives it.
+    const own = await asJson(c.token, `/v1/agents/${w.agent}/asks`);
+    for (const x of withInput.asks) expect(own.find((o: any) => o.ask === x.ask)).toEqual(Object.fromEntries(Object.entries(x).filter(([k]) => !["agent", "cell", "client", "owner", "labels"].includes(k))));
+
+    // Only `input` may be included: anything else is refused, not ignored.
+    for (const inc of ["inputs", "input,bogus", ""]) await asJson(c.token, `/v1/asks?label=project=pi&include=${inc}`, {}, 400);
+    expect(fields(await asJson(c.token, "/v1/asks?label=project=pi&include=input,input")).ask_inputsmal.input).toEqual(JSON.parse(small));
+
+    // An AgentDO of the previous release answers inputs it wasn't asked for: still none without `include`.
+    const real = AgentDOClass.prototype.openAsks;
+    AgentDOClass.prototype.openAsks = function (this: AgentDO, limit?: number) {
+      return real.call(this, limit);
+    };
+    try {
+      for (const x of (await asJson(c.token, "/v1/asks?label=project=pi")).asks) expect(x).not.toHaveProperty("input");
+    } finally {
+      AgentDOClass.prototype.openAsks = real;
+    }
+  });
+
+  it("a page's inputs stay within 1 MiB, oldest first; the rest are named in `input_left_out`, and only the chosen are read", async () => {
+    const c = await newClient();
+    const first = await createAgent(c, { labels: { project: "pb" } });
+    const second = await createAgent(c, { labels: { project: "pb" } });
+    // 31 inputs of 32 KiB leave 32 KiB: then 20 000 bytes fit, a whole 32 KiB doesn't, and 100 bytes still do.
+    const sizes = [...Array(31).fill(INPUT_KEPT_BYTES), 20_000, INPUT_KEPT_BYTES, 100, 50];
+    const ids = sizes.map((_, i) => `ask_budget${String(i).padStart(2, "0")}`);
+    for (const [i, bytes] of sizes.entries()) await plantAsk(i % 2 ? second.agent : first.agent, ids[i]!, 1000 + i, { input: inputOf(bytes) });
+    const real = AgentDOClass.prototype.askInputs;
+    const read: string[] = [];
+    AgentDOClass.prototype.askInputs = function (this: AgentDO, asks: string[]) {
+      read.push(...asks);
+      return real.call(this, asks);
+    };
+    let r: any;
+    try {
+      r = await asJson(c.token, "/v1/asks?label=project=pb&include=input");
+    } finally {
+      AgentDOClass.prototype.askInputs = real;
+    }
+    expect(r.asks.map((x: any) => x.ask)).toEqual(ids);
+    expect(r.more).toEqual([]);
+    // 31 x 32 KiB + 20 000 + 100 + 50 = 1 MiB - 12 618: the 32 KiB one that would pass 1 MiB is left out, and named.
+    expect(r.input_left_out).toEqual(["ask_budget32"]);
+    const carried = r.asks.filter((x: any) => x.input !== undefined);
+    expect(carried.map((x: any) => x.ask)).toEqual(ids.filter((a) => a !== "ask_budget32"));
+    for (const x of carried) expect(JSON.stringify(x.input)).toBe(inputOf(x.input_bytes));
+    expect(carried.reduce((n: number, x: any) => n + x.input_bytes, 0)).toBeLessThanOrEqual(1024 * 1024);
+    expect(r.asks.find((x: any) => x.ask === "ask_budget32").input_bytes).toBe(INPUT_KEPT_BYTES);
+    // The left-out input was never read from its agent.
+    expect(read.sort()).toEqual(carried.map((x: any) => x.ask).sort());
+  });
+
+  it("an agent that can't give its inputs leaves them out, by name: its asks are still listed", async () => {
+    const c = await newClient();
+    const w = await createAgent(c, { labels: { project: "pq" } });
+    const ok = await createAgent(c, { labels: { project: "pq" } });
+    await plantAsk(w.agent, "ask_inputfail", 1000, { input: JSON.stringify({ url: "https://example.com" }) });
+    await plantAsk(ok.agent, "ask_inputgood", 1001, { input: JSON.stringify({ url: "https://example.org" }) });
+    const real = AgentDOClass.prototype.askInputs;
+    AgentDOClass.prototype.askInputs = async function (this: AgentDO, asks: string[]) {
+      if (asks.includes("ask_inputfail")) throw new Error("unreachable");
+      return real.call(this, asks);
+    };
+    try {
+      const r = await asJson(c.token, "/v1/asks?label=project=pq&include=input");
+      expect(r.asks.map((x: any) => x.ask)).toEqual(["ask_inputfail", "ask_inputgood"]);
+      expect(r.asks[0]).not.toHaveProperty("input");
+      expect(r.asks[1].input).toEqual({ url: "https://example.org" });
+      expect(r.input_left_out).toEqual(["ask_inputfail"]);
+    } finally {
+      AgentDOClass.prototype.askInputs = real;
+    }
   });
 
   it("an agent slower than the timeout fails the page (503, retryable), never drops its asks", async () => {
