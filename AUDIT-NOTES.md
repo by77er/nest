@@ -3,6 +3,7 @@
 Base: origin/main 6bbf64f.
 
 ## Suspected code bugs (doc left unchanged)
+- README L20 "request sanitizing": per #251, routing-override stripping and request-smuggling checks are not in the code; nest-proxy strips hop-by-hop headers only (crates/nest-proxy/src/http.rs:45-53,693-706). Not re-verified beyond that.
 - security/README L13 and L20, credentials L27, egress README L25, steering "Kernel backstop": "kernel rule on [nest-proxy's] uid" blocking IMDS and non-public addresses. No such rule exists: no `skuid` anywhere in crates/ or deploy/; nestd's nft ruleset (crates/nestd/src/net.rs:96-110) is the sandbox tap/netns one. And nest-proxy runs as root (deploy/host/install.sh:90-104: no `User=`), so a uid rule couldn't single it out from nestd. Only the proxy's own check remains (crates/nest-proxy/src/http.rs:859).
 - credentials L9 "Pushed with the policy hash": no policy hash on a secrets push. `InjectionSecret` is `{binding, value, expires_ms}` (crates/nest-protocol/src/model.rs:352-357); nestd forwards `SecretsUpdate` without one (crates/nestd/src/host.rs:1581-1584).
 - credentials L9 "the proxy refuses one whose binding isn't in the installed policy": the proxy stores every pushed secret (crates/nest-proxy/src/control.rs:169-177, state.rs:312-315); one with no binding just goes unused (inject.rs:52,62). No refusal.
@@ -68,6 +69,22 @@ Base: origin/main 6bbf64f.
 - L15 binding_key:<cell> (broker.ts:109,533), pushed over fleet channel (fleet.ts:2015-2018).
 - L16 claims + 1h (sandbox.ts:1886-1888, protocol/gateway.ts:13), detach/epoch (nest-gateway verify.rs:115-124).
 
+## Invariant-to-fence map (scripts/fences.toml unchanged)
+| Invariant (where stated) | Fence | Code that enforces it |
+|---|---|---|
+| The subscription token never enters a VM (AGENTS.md; model-access L17; credentials L5; README L11, L13) | `subscription-token` (only broker.ts, agent.ts, protocol/control.ts, nest-protocol control.rs/host.rs, nestd runner_link.rs, nest-runner may name it); `guest-holds-no-credentials`; `gateway-holds-no-token` | FleetDO refuses `agent_start` to a non-brain host (control-plane/src/do/fleet.ts:1596-1598); only `claude_oauth_token*` resolves into agent_start (broker.ts:1203-1220) |
+| Claude Code runs unmodified, with documented flags only (AGENTS.md; model-access L14-15) | `claude-launch` (only nest-runner spawns `claude`); `no-permission-bypass` | Args built in crates/nest-protocol/src/host.rs:994-1028; managed settings `disableBypassPermissionsMode` |
+| No proxy decrypts OAuth traffic (AGENTS.md; model-access L16) | `tls-interception` (only nest-proxy terminates TLS) | No nest-proxy on brain hosts (deploy/host/install.sh:110). The fence doesn't stop nest-proxy itself from intercepting an Anthropic host; that rests on brain hosts not having one |
+| Credentials never enter sandboxes: injected at the egress proxy (AGENTS.md; README L9, L19; identity L3-5, L19) | `guest-holds-no-credentials` covers only crates/nest-guest naming tokens; no fence on the image or on what reaches a VM | Placeholders in the image (control-plane/src/lib/rules/github.ts:28); substitution in crates/nest-proxy/src/inject.rs:50-70 |
+| Gateway / hands path holds no model credential (README L12) | `gateway-holds-no-token` | crates/nest-gateway, crates/nest-hands-client |
+| Agent logic lives only in the control plane (AGENTS.md) | none | — |
+| Runner reaches a sandbox only through the seam (AGENTS.md; README L12) | none (`claude-launch` only fences who spawns `claude`) | FleetDO refuses brains on sandbox hosts (fleet.ts:1596-1598); binding check in crates/nest-gateway/src/verify.rs:97-124 |
+| Nothing app-specific in the platform (AGENTS.md) | none | — |
+| Non-public destinations hard-denied by proxy and kernel (README L13, L20; credentials L27) | none | Proxy: crates/nest-proxy/src/http.rs:859. Kernel: missing (see suspected bugs) |
+| Every credential issuance, push and refusal audited (README L22; credentials L6, L9) | none | broker.ts `auditMint` (broker.ts:1150) |
+| Host roles / control plane hold no S3 for the control plane, cell-scoped KMS (README L13-15; credentials L27-28, L36) | none (IAM in deploy/lean/Cell/Stack.lean, proved there, not by fences) | Stack.lean:318-380 |
+| DO schema expand-only, metrics vocabulary, nestd-core purity | `do-schema-expand-only`, `metrics-vocabulary`, `nestd-core-purity` | not stated in docs/security/ |
+
 ## Unconfirmed
 - model-access L15 "Only documented flags": the CLI reference page (https://code.claude.com/docs/en/cli-reference) was too large to read through the fetch tool and curl from the sandbox got 403; flags listed above not each checked against it. `--restricted` and `--permission-prompts` in particular.
 - credentials L29 "no R2 S3 credentials exist", hosts use Worker-signed URLs only: blob signing found (lib/tokens.ts:77); absence of R2 keys not provable from code.
@@ -75,6 +92,9 @@ Base: origin/main 6bbf64f.
 - L9 "Per host and grant": lookup is per binding and sandbox/workstream/global (broker.ts:289-303); no per-host keying found.
 
 ## Outside drift
+- docs/architecture/README.md L60 (Guest agent: "the in-sandbox `nest` CLI") and crates/nest-cli/README.md:3 ("installed ... in guest images"): images/guest/build.sh installs no `nest` binary. Map / sandbox areas.
+- docs/sandbox/networking/egress/injection/ and steering/ still describe method/path scope and the kernel backstop; per #251 those are now marked designed; not re-checked here.
+- docs/control-plane/durable-objects/broker/ L49 "Not built: ... the audit of static secret pushes" vs L53 "Also audited: an API client's secret push": consistent once read as operator pushes; worth one wording pass by the broker owner.
 - docs/control-plane/durable-objects/broker/ L49/L53 say static secret pushes aren't audited and "Nothing else is audited yet", but API clients' secret injections are (broker.ts:717).
 
 ## TODO
