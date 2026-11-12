@@ -23,6 +23,7 @@ Base: origin/main 6bbf64f.
 | The manager lifecycle | "a manager that ended used to stay the project's manager" (tombstone) | stated as the rule | projects/src/manager.ts:85-101 |
 | Creating a project; Built: the review pipeline; The UI (task drawer) | change-history sentences ("used to be four awaited steps", "Before this, such a job failed…", "it was a third before…") | stated as current rules only | AGENTS.md Docs rules (no tombstones) |
 | Built: the core (Retries) | a worker refused for good is "a 4xx" | a 4xx that isn't retryable, 408 or 429 (`at_capacity`) | projects/src/nest.ts:27-30 |
+| Blocked; Task changes; PRs | change wording ("as before", "may now be", "It replaces the asks banner", "the old column … is still") | stated as current behaviour | projects/src/tasks.ts:89; api.ts:420 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
@@ -41,6 +42,9 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Blocked: no drift beyond wording (canBlock/canUnblock tasks.ts:234-245; answer api.ts:440; attention/needs_you api.ts:78-142,420).
+- Task changes: no drift beyond wording (NOTIFY_WINDOW_MS 10 s do/project.ts:4337, CHANGE_CLIP 600 :4339, request id :1680, worker_not_notified :1673-1685, task_changes :383).
+- PRs: no drift beyond wording (prsDone tasks.ts:222; pr_facts do/project.ts:523; routes api.ts:424-432).
 - The review gate: no drift (one wording trim, "as before the gate"); review-trust.ts:1-45 (MAX_HELD 50, MAX_OVERFLOW 500, HELD_CHECK_INTERVAL_MS 60 s), needs_approval do/review.ts:131, policy :246, title :1044, routes api.ts:354-356, requests.ts:34.
 - Auto-merge: no drift (automerge.ts; merge_method default do/project.ts:354,664; retry api.ts:318; once-a-minute read do/project.ts:1617-1627; records :3820-3828; RATE_LIMITED github.ts:252-260; permissions github.ts:33-41).
 - Built: the review pipeline: no drift beyond the tombstone above (ROOM_TELL_AFTER_MS do/review.ts:44, room_waits :160,556, "Waiting for room…" :1053, external_id :863-865, review key :887, MAX_RETRIES :34, review_waiting_for_room do/project.ts:2389, OUTPUT_MAX/TITLE_MAX github.ts:470-472, app_id -1 github.ts:369-381, JOB_STATES review-job.ts:34, REVIEW_DEADLINE_MS :60, SEEN_KEEP_MS do/directory.ts:39).

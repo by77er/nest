@@ -425,7 +425,7 @@ The owner's request (2026-11-02): "Agents might mark their tasks as blocked, whi
   - **The manager** (`unblock_task`) **or the task's worker** (`clear_blocked`) clears it when it's resolved another way.
 - **The manager is told** when a worker blocks, with the reason and the question. That text is relayed (`from: "projects/board"`) when the worker's session was tainted, as a brief from a tainted spec is.
 - **Delivery:** messages to agents' inboxes are owed in ProjectDO's `messages` table, posted once each (a request id) from the alarm, retried from 5 s doubling to 5 min, and kept with the reason when nest refuses for good.
-- **"Needs you"** is one area at the top of the board: open asks and blocked tasks together, oldest first (`GET /api/projects/:id/attention`). Each shows who, why, how long ago, and its answer (approve or deny, or words). It replaces the asks banner, and is calm: the surface with a warning rule down its left edge and a warning icon by its title, not a tinted fill.
+- **"Needs you"** is one area at the top of the board: open asks and blocked tasks together, oldest first (`GET /api/projects/:id/attention`). Each shows who, why, how long ago, and its answer (approve or deny, or words). It is calm: the surface with a warning rule down its left edge and a warning icon by its title, not a tinted fill.
 - **The count:** `GET /api/projects` gives each project `needs_you`: the number of items "Needs you" lists (`attentionOf` in `src/api.ts` makes both), so the projects list, the sidebar's badge and the panel agree. Triage and the review backlog are one item each, however many issues, proposals or PRs they hold.
 
 ## Task changes
@@ -434,8 +434,8 @@ The owner's request (2026-11-02): "Workers should be notified when their assigne
 
 - **What's told:** a new title, body or spec, its block cleared by the owner (answering it) or the manager, PRs attached or detached ([PRs](#prs)), and its dependencies added, removed or done ([dependencies](#dependencies)). What's wrong with its PR is told separately ([PR upkeep](#pr-upkeep)). It doesn't matter whether the owner made the change (the API), the manager (`/mcp/board`) or the app.
   - The worker's own changes aren't told back, nor is a block it raised and the owner answered: that answer reached it already.
-  - Cancelling stops the worker, as before.
-  - A task with a live worker (`assigned`, `in_progress`, or `in_review` while its worker lives) may now be re-specced, so the spec can change under a worker (`spec` loops on those states in `src/tasks.ts`).
+  - Cancelling stops the worker.
+  - A task with a live worker (`assigned`, `in_progress`, or `in_review` while its worker lives) may be re-specced, so the spec can change under a worker (`spec` loops on those states in `src/tasks.ts`).
 - **A reorder isn't told:** board order is priority among tasks not yet started, and a worker already on its task has nothing to do with that.
 - **To whom:** only a live worker (the task's assignee, still live). A task without one tells nobody, since a worker started later gets the task as it is in its brief.
 - **How:**
@@ -449,7 +449,7 @@ The owner's request (2026-11-02): "Workers should be notified when their assigne
 
 The owner's request (2026-11-03): "PRs should be attachable to tasks."
 
-- **A relation, not one field.** A task has any number of PRs (ProjectDO's `task_prs`), and a PR belongs to one task at a time. The migration made each task's single `pr` its first attached PR, with its auto-merge. `Task.pr` (and the old column) is still the first attached; `Task.prs` lists them all.
+- **A relation, not one field.** A task has any number of PRs (ProjectDO's `task_prs`), and a PR belongs to one task at a time. `Task.pr` is the first attached PR (a migration made each task's single `pr` that, with its auto-merge); `Task.prs` lists them all.
 - **Attaching:**
   - **the owner**, from the task's drawer: one of the repo's open PRs (`GET /api/projects/:id/prs/open`), or a number, `#n`, or the PR's URL (`POST /api/projects/:id/tasks/:task/prs`);
   - **the manager**, with `attach_pr` on `/mcp/board`;
