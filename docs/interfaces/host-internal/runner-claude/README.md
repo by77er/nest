@@ -48,7 +48,7 @@ Never `--bare` (ignores OAuth) or `--safe-mode` (drops MCP servers). The seeded 
 ```json
 { "forceLoginMethod": "claudeai", "allowedProviders": ["anthropic"], "allowManagedHooksOnly": true,
   "autoMemoryEnabled": false, "permissions": {"disableBypassPermissionsMode": "disable"},
-  "hooks": { "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "/usr/lib/nest/nest hook --sync", "timeout": 10, "onFailure": "block"}]}], "…": "see file" } }
+  "hooks": { "PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "/usr/lib/nest/nest hook --sync --event PreToolUse", "timeout": 10, "onFailure": "block"}]}], "…": "see file" } }
 ```
 
 `onFailure` requires Claude Code ≥ 2.1.295. **Checked on 2.1.301:** `CLAUDE_CODE_OAUTH_TOKEN` is accepted under `forceLoginMethod: "claudeai"`, `claude auth status` reports `authMethod: "oauth_token"` and the `configDirectory`, and `system/init.apiKeySource` is `"none"`.

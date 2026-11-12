@@ -236,7 +236,7 @@ class HarnessTest(unittest.TestCase):
                     self.assertEqual(hk["command"], "LOG")
                     self.assertEqual({k: v for k, v in hk.items() if k != "command"}, {k: v for k, v in rh.items() if k != "command"})
         s2 = h.managed_settings(lambda c: c.replace("/usr/lib/nest/nest", "/b/nest"))
-        self.assertEqual(s2["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "/b/nest hook --sync")
+        self.assertEqual(s2["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "/b/nest hook --sync --event PreToolUse")
         self.assertNotIn("sandbox", s2)
 
     def test_transcript_encodings_and_hash_guess(self):

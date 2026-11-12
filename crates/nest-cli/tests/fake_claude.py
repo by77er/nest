@@ -274,6 +274,17 @@ def scripted(path):
                 f.write(json.dumps({"label": step.get("label", "await_file"), "tool": "await_file", "text": "present" if ok else "timeout", "is_error": not ok}) + "\n")
                 f.flush()
             continue
+        if "builtin" in step:
+            # A built-in's call (WebFetch...) as Claude Code makes it: only its PreToolUse hook, whose decision is the result.
+            name, args = step["builtin"], step.get("args", {})
+            pre = hook({"hook_event_name": "PreToolUse", "tool_name": name, "tool_input": args, "tool_use_id": "toolu_" + uuid.uuid4().hex[:12]})
+            out = pre.get("hookSpecificOutput", {})
+            decision, reason = out.get("permissionDecision"), out.get("permissionDecisionReason")
+            log("builtin", name=name, args=args, decision=decision, reason=reason)
+            with open(sc["results"], "a") as f:
+                f.write(json.dumps({"label": step.get("label", name), "tool": name, "text": str(reason), "is_error": decision != "allow", "decision": decision}) + "\n")
+                f.flush()
+            continue
         name, args = step["tool"], step["args"]
         tool(name, args)
         last = RUN["events"][-1]

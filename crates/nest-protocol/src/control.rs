@@ -758,6 +758,21 @@ pub enum RunnerToAgent {
     /// `outcome_unknown` to the model). Reliable. AgentDO marks the call cancelled: if it hasn't
     /// started it never runs, a pending `ask` is withdrawn, and a late result is discarded.
     CancelCall { seq: Seq, call: CallId, reason: String },
+    /// A tool call a rule in `ask` mode holds (the `PreToolUse` hook waits on the answer): may it
+    /// run? AgentDO spends an approval of exactly this call (`tool` and canonical `input`) on it,
+    /// or holds it as an ask for the operator. Answered by `approval_checked`. Not reliable, like
+    /// `hands_resolve`: a check whose answer doesn't come in time is denied. Sent only on a
+    /// connection whose `hello_ack` has `rule_approvals`; otherwise the runner emits `escalation`.
+    ApprovalCheck {
+        request: RequestId,
+        /// The runner's id for the call, quoted to the model and recorded with its ask.
+        call: CallId,
+        tool: String,
+        input: serde_json::Value,
+        /// The `AgentCache` version whose rules held the call: AgentDO refuses (`conflict`) a check
+        /// against rules it has changed since, so a new `deny` wins over a check in flight.
+        cache_version: u64,
+    },
     /// Cumulative ack of reliable `AgentToRunner` messages.
     Ack { up_to: Seq },
 }
@@ -809,6 +824,11 @@ pub enum AgentToRunner {
         /// Highest reliable `RunnerToAgent` seq processed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_seq: Option<Seq>,
+        /// AgentDO answers `approval_check`: on this connection a rule's `ask` waits for its
+        /// answer instead of emitting `escalation`. Absent (false) from a control plane of the
+        /// previous release.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        rule_approvals: bool,
     },
     SegmentAck { session: SessionId, durable_bytes: u64 },
     /// Start a turn (written to the harness stdin as a user message).
@@ -846,7 +866,22 @@ pub enum AgentToRunner {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         retry_after_ms: Option<u64>,
     },
+    /// Answer to `approval_check`.
+    ApprovalChecked { request: RequestId, outcome: ApprovalOutcome },
     Ack { up_to: Seq },
+    Error { error: ErrorBody },
+}
+
+/// What `approval_check` decided for one call.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ApprovalOutcome {
+    /// The operator approved exactly this call in `ask`; the approval is now spent on it: allow.
+    Approved { ask: AskId },
+    /// Held for the operator as `ask` (an ask already open for the same call is reused): deny; the
+    /// decision comes as a turn.
+    Pending { ask: AskId },
+    /// Not decided (`stale_epoch`: not the current runner process or epoch): deny.
     Error { error: ErrorBody },
 }
 
@@ -1093,11 +1128,13 @@ mod tests {
             RunnerToAgent::ToolsListRequest { .. } => "tools_list_request",
             RunnerToAgent::HandsResolve { .. } => "hands_resolve",
             RunnerToAgent::CancelCall { .. } => "cancel_call",
+            RunnerToAgent::ApprovalCheck { .. } => "approval_check",
             RunnerToAgent::Ack { .. } => "ack",
         }
     }
-    const RUNNER_TO_AGENT: &[&str] =
-        &["hello", "segment", "events", "tool_call", "tools_list_request", "hands_resolve", "cancel_call", "ack"];
+    const RUNNER_TO_AGENT: &[&str] = &[
+        "hello", "segment", "events", "tool_call", "tools_list_request", "hands_resolve", "cancel_call", "approval_check", "ack",
+    ];
 
     fn agent_to_runner(m: &AgentToRunner) -> &'static str {
         match m {
@@ -1111,13 +1148,14 @@ mod tests {
             AgentToRunner::ToolsList { .. } => "tools_list",
             AgentToRunner::ToolsChanged {} => "tools_changed",
             AgentToRunner::HandsResolved { .. } => "hands_resolved",
+            AgentToRunner::ApprovalChecked { .. } => "approval_checked",
             AgentToRunner::Ack { .. } => "ack",
             AgentToRunner::Error { .. } => "error",
         }
     }
     const AGENT_TO_RUNNER: &[&str] = &[
         "hello_ack", "segment_ack", "run_turn", "inbox", "interrupt", "cache_update", "tool_result",
-        "tools_list", "tools_changed", "hands_resolved", "ack", "error",
+        "tools_list", "tools_changed", "hands_resolved", "approval_checked", "ack", "error",
     ];
 
     fn agent_event(e: &crate::model::AgentEvent) -> &'static str {
