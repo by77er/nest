@@ -89,3 +89,47 @@ describe("the repo's own guidance (README.md#the-repos-own-guidance)", () => {
     for (const t of Object.values(cat.templates)) expect(prompt(t)).not.toContain("acme/app");
   });
 });
+
+describe("built-in tools (README.md#built-in-tools)", () => {
+  type Rule = { pattern: string; decision: string };
+  // nest's runner (crates/nest-runner/src/rules.rs): `Tool` or `Tool(glob)`, `*` any run; first match wins, none ⇒ ask.
+  const glob = (p: string, t: string) => new RegExp(`^${p.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`).test(t);
+  const decide = (rules: readonly Rule[], tool: string, subject: string) => {
+    for (const r of rules) {
+      const m = /^([^(]*)\((.*)\)$/.exec(r.pattern);
+      if (m ? glob(m[1]!, tool) && glob(m[2]!, subject) : glob(r.pattern, tool)) return r.decision;
+    }
+    return "ask";
+  };
+  // nest joins a spec's rules from its capabilities in order (control-plane/src/lib/spec.ts). Only the app's
+  // are joined here: the operator's (`nest`, `hands`, `timers`) allow no built-in, and `subagents` allows `Agent`.
+  const rulesOf = (t: { capabilities: string[] }) =>
+    t.capabilities.flatMap((c) => ((cat.capabilities[c] as { rules?: Rule[] } | undefined)?.rules ?? []));
+  // A subject for each built-in: WebFetch's is its URL, any URL (http, an address, a port); the rest have none the rules read.
+  const subjects: Record<string, string[]> = { WebSearch: ["nest durable agents"], WebFetch: ["https://docs.example.org/a/b?q=1", "http://203.0.113.7:8080/x"] };
+  type Tpl = ReturnType<typeof tpl>;
+  const roles: [string, Tpl][] = [
+    ...["manager", "worker", "reviewer", "routine", "dreaming"].map((r): [string, Tpl] => [r, tpl(r)]),
+    // A project's own templates on its models (README.md#models) name the same capabilities.
+    ...(["manager", "worker"] as const).map((r): [string, Tpl] => [`${r} on its model`, roleTemplate(r, "prj_abc123", "Acme/App", "claude-opus-5-5").body as Tpl]),
+  ];
+
+  it("every built-in a role launches runs without asking, the web tools on any URL", () => {
+    for (const [role, t] of roles) {
+      expect(t.launch.builtin_tools, role).toEqual(expect.arrayContaining(["TaskCreate", "TaskGet", "TaskUpdate", "TaskList"]));
+      if (role !== "dreaming") expect(t.launch.builtin_tools, role).toEqual(expect.arrayContaining(["WebSearch", "WebFetch"]));
+      for (const tool of t.launch.builtin_tools.filter((b) => b !== "Agent")) {
+        for (const subject of subjects[tool] ?? [""]) expect(decide(rulesOf(t), tool, subject), `${role}: ${tool} ${subject}`).toBe("allow");
+      }
+    }
+  });
+
+  it("the synced capabilities carry the rules nest reads: an allow for each of the six built-ins by name, nothing else", () => {
+    const want = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"].map((pattern) => ({ pattern, decision: "allow" }));
+    for (const c of ["board", "task", "review", "routine"]) {
+      const rules = (cat.capabilities[`${NAMESPACE}/${c}`] as { rules: Rule[] }).rules;
+      expect(rules, c).toEqual(expect.arrayContaining(want));
+      expect(rules, c).toHaveLength(want.length);
+    }
+  });
+});

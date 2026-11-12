@@ -10,7 +10,7 @@ import { checkHealth, healthProbes } from "./lib/health";
 import { CONFIG_DIGEST } from "./lib/build";
 import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { Capability, CatalogName, EntryName, OperatorOverrides, type SpawnerOverrides, Template } from "./lib/spec";
-import { cellIdleTtlMs, MIN_IDLE_TTL_MS } from "./lib/lifetimes";
+import { cellIdleTtlMs, MIN_IDLE_TTL_MS, OPERATOR_ENDER } from "./lib/lifetimes";
 import {
   CLIENT_ID, ClientName, GithubTokenRequest, githubTokenOutsideGrant, githubTokenOwners, Grant, grantBoundIds, grantWildcardLogins, inGrantList, ownerLookups, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
   parseLabelFilters, tokenHash,
@@ -1016,7 +1016,8 @@ export const ROUTES: Route[] = [
   }),
   route({
     // A stop the agent's next input lifts; with `end`, for good (docs/agents/#lifetimes): its brain killed, its
-    // queued turns dropped, the agents it owns ended too, and with `destroy_sandbox` the sandbox created for it.
+    // queued turns dropped, the agents it owns ended too, and with `destroy_sandbox` its sandbox, if it was created
+    // for it or the caller may destroy it (lib/lifetimes.ts `endMayDestroy`) and no other agent is attached.
     method: "POST", path: "/v1/agents/:agent/stop", auth: "owner", optionalBody: true,
     body: z.strictObject({ end: z.boolean().optional(), destroy_sandbox: z.boolean().optional(), reason: z.string().max(500).optional() }),
     run: async (c) => {
@@ -1026,7 +1027,7 @@ export const ROUTES: Route[] = [
         if (r.destroy_sandbox) throw new NestError(ErrorCodes.INVALID_MESSAGE, "destroy_sandbox needs end: true");
         return a.stop("requested");
       }
-      const by = c.caller.kind === "client" ? c.caller.client : "user";
+      const by = c.caller.kind === "client" ? c.caller.client : OPERATOR_ENDER;
       return a.end({ by, reason: "stopped", kill: true, destroy_sandbox: r.destroy_sandbox ?? false, ...(r.reason ? { note: r.reason } : {}) });
     },
   }),

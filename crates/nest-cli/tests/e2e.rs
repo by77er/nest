@@ -157,7 +157,8 @@ impl MockDo {
                         match msg {
                             RunnerToAgent::Hello(h) => {
                                 l.hellos.push(h);
-                                let _ = tx.send(AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None });
+                                // The previous release's AgentDO: rule asks escalate (e2e/ checks `approval_check`).
+                                let _ = tx.send(AgentToRunner::HelloAck { protocol_version: 1, durable_bytes: 0, last_seq: None, rule_approvals: false });
                             }
                             RunnerToAgent::Segment { offset, base, data_b64, session, .. } => {
                                 let data = base64::engine::general_purpose::STANDARD.decode(data_b64).unwrap();
@@ -206,6 +207,7 @@ impl MockDo {
                             RunnerToAgent::CancelCall { seq, .. } => {
                                 let _ = tx.send(AgentToRunner::Ack { up_to: seq });
                             }
+                            RunnerToAgent::ApprovalCheck { .. } => panic!("approval_check sent to an AgentDO that didn't say rule_approvals"),
                             RunnerToAgent::Ack { .. } => {}
                         }
                     }
@@ -612,6 +614,82 @@ fn nest_hook(sync: bool, input: Value, env: &[(&str, &str)]) -> (i32, String) {
     child.stdin.take().unwrap().write_all(input.to_string().as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
     (out.status.code().unwrap(), String::from_utf8(out.stdout).unwrap())
+}
+
+/// `nest hook --sync [--event <event>]` with raw stdin; the exit code and stdout.
+fn nest_hook_raw(event: Option<&str>, raw: &[u8], env: &[(&str, &str)]) -> (i32, String) {
+    use std::io::Write;
+    let mut args = vec!["hook", "--sync"];
+    args.extend(event.map(|e| ["--event", e]).into_iter().flatten());
+    let mut child = std::process::Command::new(NEST_BIN)
+        .args(args)
+        .env_clear()
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(raw).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.code().unwrap(), String::from_utf8(out.stdout).unwrap())
+}
+
+/// Security review of #244: input serde_json can't read (a lone surrogate, nesting past 128) went to
+/// the runner as `null`, which answered nothing, and Claude Code ran the call. Now it never reaches
+/// the runner, and the event `--event` names gets its fallback: a `PreToolUse` deny, even with a
+/// runner that would allow it.
+#[test]
+fn unreadable_sync_hook_input_is_denied_not_passed_through() {
+    use nest_protocol::host::hook::{HookDecisionRequest, HookDecisionResponse, HookOutput, HookSpecificOutput, PermissionDecision};
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("hook.sock");
+    // A runner that allows everything, and counts what it was asked.
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n = asked.clone();
+    std::thread::spawn(move || {
+        for mut s in listener.incoming().map_while(Result::ok) {
+            let Ok(Some(_req)) = nest_protocol::host::frame::read::<_, HookDecisionRequest>(&mut s) else { continue };
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let output = HookOutput {
+                hook_specific_output: Some(HookSpecificOutput::PreToolUse {
+                    permission_decision: Some(PermissionDecision::Allow),
+                    permission_decision_reason: None,
+                    updated_input: None,
+                    additional_context: None,
+                }),
+                ..Default::default()
+            };
+            let _ = nest_protocol::host::frame::write(&mut s, &HookDecisionResponse { output });
+        }
+    });
+    let env = [("NEST_AGENT_ID", "agt_x"), ("NEST_HOOK_SOCK", sock.to_str().unwrap())];
+    let decision = |out: &str| serde_json::from_str::<Value>(out).unwrap()["hookSpecificOutput"]["permissionDecision"].clone();
+    // Readable input reaches the runner, which allows it: the denies below are the parse path's.
+    let ok = br#"{"hook_event_name":"PreToolUse","tool_name":"WebFetch","tool_input":{"url":"https://x.test","prompt":"p"}}"#;
+    let (code, out) = nest_hook_raw(Some("PreToolUse"), ok, &env);
+    assert_eq!((code, decision(&out)), (0, json!("allow")));
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    let surrogate = br#"{"hook_event_name":"PreToolUse","tool_name":"WebFetch","tool_input":{"url":"https://x.test","prompt":"\ud800"}}"#;
+    let deep = format!(
+        r#"{{"hook_event_name":"PreToolUse","tool_name":"WebFetch","tool_input":{{"url":"https://x.test","prompt":{}1{}}}}}"#,
+        "[".repeat(200),
+        "]".repeat(200)
+    );
+    for raw in [&surrogate[..], deep.as_bytes(), b"not json"] {
+        let (code, out) = nest_hook_raw(Some("PreToolUse"), raw, &env);
+        assert_eq!((code, decision(&out)), (0, json!("deny")), "{}", String::from_utf8_lossy(&raw[..raw.len().min(80)]));
+        let (code, out) = nest_hook_raw(Some("PermissionRequest"), raw, &env);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!((code, v["hookSpecificOutput"]["decision"]["behavior"].clone()), (0, json!("deny")));
+        // A fail-open event stays open.
+        assert_eq!(nest_hook_raw(Some("Stop"), raw, &env), (0, String::new()));
+        // No `--event` (settings older than this binary): denied as a `PreToolUse`, never passed through.
+        let (code, out) = nest_hook_raw(None, raw, &env);
+        assert_eq!((code, decision(&out)), (0, json!("deny")));
+    }
+    assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "unreadable input never reached the runner");
 }
 
 #[test]
