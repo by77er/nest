@@ -32,7 +32,7 @@ These are the runner's reports: AgentDO stores them as the agent's `activity`, a
 
 | Hook | Answered from |
 |---|---|
-| `PreToolUse` policy gate | Grant and policy cache in the runner, pushed down from AgentDO. A call no rule allows is held with `defer` and escalated as a question; it runs once approved (see [runner](../runner/#lifecycle)) |
+| `PreToolUse` policy gate | Grant and policy cache in the runner, pushed down from AgentDO. A call a rule holds (`ask`) is checked with AgentDO, the one exception to answering locally: denied and asked as an approval, it runs once the operator approves it, once (see [runner](../runner/#lifecycle)) |
 | `PermissionRequest` | Same cache |
 | `PostToolUse` | **Local inbox mirror,** mid-turn: messages pending at a tool boundary go to the model as `additionalContext` (verified on 2.1.316 for MCP and built-in tools, [runner-claude](../../interfaces/host-internal/runner-claude/#hooks-checked-on-21316); a subagent's tool call gives it to the subagent, which ignored it on 2.1.316: open, see [runner-hooks](../../interfaces/host-internal/runner-hooks/)) |
 | `Stop` | **Local inbox mirror:** messages still pending come back as `decision: "block"`, at most `max_stop_continuations` per stop chain (`stop_hook_active: false` starts a new chain) |

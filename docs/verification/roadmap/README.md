@@ -17,7 +17,7 @@ The hosts, gateway and reliable-channel inventories list more suspected bugs, ea
 
 ## Runtime assertions to add now
 
-Cheap, and they catch drift the models can't see. Each throws in tests and logs plus counts a metric in production ([metrics](../../control-plane/metrics/)). nestd's cores already assert theirs (`nestd_core::invariant`, [nestd/](../nestd/)); none of these control-plane or commit-client ones is built yet.
+Cheap, and they catch drift the models can't see. Each throws in tests and logs plus counts a metric in production ([metrics](../../control-plane/metrics/)). nestd's fleet link and result cache already assert theirs (`nestd_core::invariant`, [nestd/](../nestd/)); none of these control-plane or commit-client ones is built yet.
 
 | Assertion | Where | Property |
 |---|---|---|

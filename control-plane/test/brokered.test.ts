@@ -583,7 +583,7 @@ describe("the sink gate for brokered actions", () => {
     // Held for the operator: listed once, with the tool to call again.
     const asks = await adminJson(`/v1/agents/${s.agent}/asks`);
     expect(asks).toEqual([{ ask: p1.ask, question: expect.stringContaining(`github.create_issue on ${other}`), created_ms: expect.any(Number),
-      approval: { name: "github.create_issue", tool: "mcp__nest__github_create_issue" } }]);
+      approval: { name: "github.create_issue", tool: "mcp__nest__github_create_issue" }, input: expect.anything(), input_bytes: expect.any(Number) }]);
     expect(gh.issues.get(other) ?? []).toEqual([]);
 
     await answer(s.agent, p1.ask, "approve");
