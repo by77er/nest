@@ -24,6 +24,8 @@ Base: origin/main 6bbf64f.
 | Creating a project; Built: the review pipeline; The UI (task drawer) | change-history sentences ("used to be four awaited steps", "Before this, such a job failed…", "it was a third before…") | stated as current rules only | AGENTS.md Docs rules (no tombstones) |
 | Built: the core (Retries) | a worker refused for good is "a 4xx" | a 4xx that isn't retryable, 408 or 429 (`at_capacity`) | projects/src/nest.ts:27-30 |
 | Blocked; Task changes; PRs | change wording ("as before", "may now be", "It replaces the asks banner", "the old column … is still") | stated as current behaviour | projects/src/tasks.ts:89; api.ts:420 |
+| PR upkeep | a failed read backs off past a minute "from the sixth failure in a row" | from the fifth: `max(PR_READ_EVERY_MS, backoff(attempts))`, and backoff(5) = 80 s | projects/src/do/project.ts:1777-1778; nest.ts:332 |
+| PR upkeep | change wording ("before this", "as before", "now that", "this change leaves those as they are") | stated as current | projects/src/do/project.ts:584-611 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
@@ -42,6 +44,8 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- PR comments: no drift (CLAIM_LAPSE_MS do/directory.ts:158; once an hour do/project.ts:1175-1176; REVISE_MAX 3/hour :4486-4488; COMMENTS_SEEN_KEEP_MS 30 d :4484; PR_COMMENT_MAX 4000 :4494; pr_inputs :441).
+- PR upkeep: one number fixed, wording; the rest matches (FINDINGS_MAX pr-upkeep.ts:45, FAILING :21, PR_READ_BATCH pr-read.ts:47, PR_READ_EVERY_MS/GAP/RETELL/FLAP do/project.ts:606-611, pr_told :584, schedule columns :586-588, pr_read_failed once a day :1781, TRANSIENT_GRAPHQL github.ts:80).
 - Blocked: no drift beyond wording (canBlock/canUnblock tasks.ts:234-245; answer api.ts:440; attention/needs_you api.ts:78-142,420).
 - Task changes: no drift beyond wording (NOTIFY_WINDOW_MS 10 s do/project.ts:4337, CHANGE_CLIP 600 :4339, request id :1680, worker_not_notified :1673-1685, task_changes :383).
 - PRs: no drift beyond wording (prsDone tasks.ts:222; pr_facts do/project.ts:523; routes api.ts:424-432).
