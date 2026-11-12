@@ -14,7 +14,7 @@ import { SYSTEM_SENDER } from "../lib/senders";
 import { type Timer, TIMER_DEADLINE, TIMER_SENDER, timerDue, timerFiredText, TimerName, TimerSetArgs, TimerStore, TIMERS_MAX } from "../lib/timers";
 import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX, sameConnector } from "../lib/mcp";
-import { approves, argsDigest, gated, sessionTaint, type SinkCall } from "../lib/sinks";
+import { approves, argsDigest, canonicalJson, describeArgs, gated, sessionTaint, type SinkCall, visible } from "../lib/sinks";
 import {
   actionDef, actionOfTool, authorize, checkBaseUrl, type Authorized, BROKERED_ACTIONS, BROKERED_TOOL_NAMES, type BrokeredAction, BrokeredJournal, brokeredToolDefs,
   type GithubAction, type JournalEntry, type JournalRow, keyDigest, naturalKey, secretKinds, stringsOf,
@@ -43,14 +43,14 @@ import { signBlobUrl } from "../lib/tokens";
 import { asNestError, b64ToBytes, clip, compatWorkstream, concatBytes, errorBody, keyedId, NestError, newId } from "../lib/util";
 import type { EgressPolicy } from "../protocol/model";
 import { addColumn, storedEnum } from "../lib/stored";
-import { askRoute, CallLedger, type OpenAsk } from "../lib/calls";
+import { type ApprovalKind, approvalExpiry, askRoute, CallLedger, type OpenAsk } from "../lib/calls";
 import {
   agentState, type Brain, type BrainFields, type BrainPatch, brainRelease, epochlessExit, escalation, liveBrainStart, mergeIntent, NO_INTENT,
   phaseDeadlines, type PhaseDeadline, quietSinceStop, splitState, startFailure, type StartIntent, stoppedBrain, unresponsive, wakeDecision,
 } from "../lib/brain";
 import type { AgentFacts } from "../lib/abandoned";
 import {
-  type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, handsResolved, type InboxMessage,
+  type AgentCache, type AgentExitReason, type AgentStart, type AgentToRunner, type ApprovalOutcome, handsResolved, type InboxMessage,
   RunnerToAgent, type SegmentRef, type ToolDef, type ToolOutcome, type ToolRule, type TurnInput,
 } from "../protocol/control";
 import {
@@ -130,6 +130,12 @@ export interface AgentInfo extends AgentSpec, BrainFields {
   session: string | null;
   current_turn: string | null;
   cache_version: number;
+  /**
+   * The cache version that carries the agent's current rules (`pushCache({rulesChanged})`): a rule's check
+   * from a runner whose cache is older is refused, so a rule changed since (a new `deny`) wins. Absent:
+   * the rules haven't changed since the agent was made.
+   */
+  rules_version?: number;
   /** Committed base: its generation and the bytes durable in R2 (what resume and transcripts read). */
   base_gen: number;
   durable_bytes: number;
@@ -212,12 +218,10 @@ type AgentDeadline = PhaseDeadline | "flush" | "activity" | "wake" | "wake_after
  * platform. One it armed still ends its waiting call here (`askWindowLapsed`); dropped next release.
  */
 const ASK_DEADLINE = "ask:";
-/** An approved sink call may be made once within this long. */
+/** An approved sink call may be made once within this long (a rule's approval never expires: `approvalExpiry`). */
 const APPROVAL_TTL_MS = 60 * 60_000;
 /** How long until a failed delete of dropped segments is tried again. */
 const SEG_TRASH_RETRY_MS = 60_000;
-/** How much of a sink call's arguments the approval question shows. */
-const APPROVAL_ARGS_SHOWN = 2000;
 type AskDeadline = `${typeof ASK_DEADLINE}${string}`;
 /** A timer's deadline (lib/timers.ts), `timer:<name>`. */
 type TimerDeadline = `${typeof TIMER_DEADLINE}${string}`;
@@ -226,7 +230,7 @@ type TimerDeadline = `${typeof TIMER_DEADLINE}${string}`;
 export type HookPoint =
   | "intent:beforeCommit" | "resolveHands:afterResolve" | "dispatch:beforeWrite" | "sandboxMoved:enter" | "kill:beforeIssue"
   | "hostLost:enter" | "exited:enter" | "start:afterCommit" | "release:afterCommit" | "event:afterApply" | "escalate:afterProgress" | "escalate:afterStatus" | "pump:beforeSend"
-  | "flush:beforePut" | "segTrash:beforeDelete";
+  | "flush:beforePut" | "segTrash:beforeDelete" | "approvalCheck:afterDigest";
 
 export interface CreateAgent {
   agent: string;
@@ -1353,6 +1357,7 @@ export class AgentDO extends DurableObject<Env> {
     const now = Date.now();
     const ended: Ended = {
       ms: now, by: o.by, reason: o.reason, kill: o.kill, destroy_sandbox: o.destroy_sandbox || !!before.ephemeral,
+      ...(o.destroy_sandbox ? { destroy_asked: true as const } : {}),
       ...(o.note ? { note: clip(o.note, 500) } : {}),
     };
     let dropped = 0;
@@ -1405,7 +1410,10 @@ export class AgentDO extends DurableObject<Env> {
       return;
     }
     if (info.hands && !info.ended!.sandbox) {
-      const r = await this.sandboxStub(info.hands.sandbox).release(info.agent, info.ended!.destroy_sandbox);
+      // The ender's authority reaches only a destroy it asked for: an ephemeral agent's own default destroys
+      // only a sandbox made for it, whoever ended it.
+      const e = info.ended!;
+      const r = await this.sandboxStub(info.hands.sandbox).release(info.agent, e.destroy_sandbox, e.destroy_asked ? e.by : undefined);
       this.update((i) => {
         if (i.ended) i.ended.sandbox = r.destroyed ? "destroyed" : "detached";
       });
@@ -1442,6 +1450,8 @@ export class AgentDO extends DurableObject<Env> {
     const rows = this.sql.exec<{ agent: string }>("SELECT agent FROM children WHERE ended = 0 AND asked = 0").toArray();
     const results = await Promise.allSettled(rows.map(async ({ agent }) => {
       try {
+        // An ephemeral parent's default reaches its children as asked, with `by` this parent: harmless only because a
+        // sandbox this parent owns is its own hands, which it stays attached to until its children end. Don't rely on it.
         await this.agentStub(agent).end({ by: me, reason: "owner_ended", kill: true, destroy_sandbox: e.destroy_sandbox });
         this.sql.exec("UPDATE children SET asked = 1 WHERE agent = ?", agent);
       } catch (err) {
@@ -2194,6 +2204,10 @@ export class AgentDO extends DurableObject<Env> {
       this.send(ws, answer);
       return;
     }
+    if (msg.type === "approval_check") {
+      this.send(ws, { type: "approval_checked", request: msg.request, outcome: await this.approvalCheck(ws, msg) });
+      return;
+    }
     // Everything else is processed strictly one at a time, in arrival order.
     const m = msg;
     return this.inbound.run(async () => {
@@ -2489,6 +2503,8 @@ export class AgentDO extends DurableObject<Env> {
       protocol_version: PROTOCOL_VERSION,
       durable_bytes: info.recv_durable,
       ...(this.rel.lastIn(CHAN) !== undefined ? { last_seq: this.rel.lastIn(CHAN) } : {}),
+      // This AgentDO answers `approval_check`: the runner holds a rule's `ask` with it instead of `escalation`.
+      rule_approvals: true,
     });
     if (!newLineage && hello.last_seq !== undefined) this.rel.ack(CHAN, hello.last_seq);
     for (const m of this.rel.pendingAfter(CHAN, newLineage ? undefined : hello.last_seq)) this.send(ws, m as AgentToRunner);
@@ -2754,11 +2770,11 @@ export class AgentDO extends DurableObject<Env> {
     } else if (ev.type === "inbox_delivered") {
       if (this.queue.confirm(ev.message)) this.pushCache();
     } else if (ev.type === "escalation") {
-      // The runner denied the call as pending approval (a tool rule in `ask` mode): held for the
-      // operator, and the decision comes as the next turn.
-      const input = JSON.stringify(ev.input ?? null);
-      const question = `Allow ${ev.tool}? (request ${ev.call}) input: ${input.length > 500 ? `${input.slice(0, 500)}…` : input}`;
-      this.recordAsk(info, ev.call, ev.epoch, question);
+      // A runner that can't check approvals (a previous release's, or one whose AgentDO didn't say
+      // `rule_approvals`) denied the call as pending approval (a tool rule in `ask` mode): held for the
+      // operator as a plain question, whose answer comes as the next turn. Its approval can't let the
+      // call through (that runner asks again): `approvalCheck` is what can.
+      this.recordAsk(info, ev.call, ev.epoch, `Allow ${visible(ev.tool)}? (request ${visible(ev.call)})\n${describeArgs(ev.input ?? null)}`);
     }
     await this.syncActivity();
     if (completed) {
@@ -2970,17 +2986,23 @@ export class AgentDO extends DurableObject<Env> {
     this.update((i) => {
       i.rules = rules;
     });
-    this.pushCache();
+    this.pushCache({ rulesChanged: true });
   }
 
   private currentCache(info: AgentInfo): AgentCache {
     return { version: info.cache_version, rules: info.rules, inbox: this.queue.mirrored(), max_stop_continuations: 5 };
   }
 
-  /** Replace the runner's hook caches (rules + inbox mirror); the version only ever grows. */
-  private pushCache(): void {
+  /**
+   * Replace the runner's hook caches (rules + inbox mirror); the version only ever grows. `rulesChanged`:
+   * this cache carries rules that differ from the last one's, so it becomes `rules_version` in the same
+   * step, and a rule's check against an older cache is refused (`approvalCheck`). Every path that changes
+   * the rules a cache carries must say so here.
+   */
+  private pushCache(opts: { rulesChanged?: boolean } = {}): void {
     const info = this.update((i) => {
       i.cache_version += 1;
+      if (opts.rulesChanged) i.rules_version = i.cache_version;
     });
     const cache = this.currentCache(info);
     this.pushReliable((seq) => ({ type: "cache_update", seq, cache }));
@@ -3295,7 +3317,7 @@ export class AgentDO extends DurableObject<Env> {
    */
   private async sinkGate(info: AgentInfo, epoch: number, call: string, key: string, s: SinkCall, fence: number): Promise<ToolOutcome | null> {
     const digest = await argsDigest(s.args);
-    if (this.calls.takeApproval(s.name, digest, key, Date.now())) return null;
+    if (this.calls.takeApproval(s.name, digest, key, Date.now()) !== undefined) return null;
     return await this.askApproval(info, epoch, call, s, digest, fence);
   }
 
@@ -3308,16 +3330,45 @@ export class AgentDO extends DurableObject<Env> {
     const pending = this.calls.pendingApproval(s.name, digest);
     let ask = pending?.ask;
     if (!ask) {
-      const json = JSON.stringify(s.args);
-      const shown = json.length > APPROVAL_ARGS_SHOWN ? `${json.slice(0, APPROVAL_ARGS_SHOWN)}… (${json.length} bytes in all)` : json;
-      const question = `Approve ${s.what} from a tainted session? arguments: ${shown} (options: approve | deny)`;
+      const question = `Approve ${visible(s.what)} from a tainted session? (options: approve | deny)\n${describeArgs(s.args)}`;
       this.assertEpoch(fence);
-      ask = this.recordAsk(info, call, epoch, question, { name: s.name, digest, tool: s.tool });
+      ask = this.recordAsk(info, call, epoch, question, { name: s.name, digest, tool: s.tool, input: canonicalJson(s.args ?? null) });
     }
     return {
       status: "pending", ask,
       message: `Not sent: ${s.tool} from a tainted session needs the operator's approval (${ask}). End your turn; the decision arrives as your next input.`,
     };
+  }
+
+  /**
+   * `approval_check`: a call a tool rule in `ask` mode holds, its `PreToolUse` hook waiting on this answer.
+   * An approval of exactly this call (the Claude Code tool and its input's canonical digest) is spent on
+   * it, and the runner lets it through; otherwise it is held as an ask (the one already open for this
+   * call, if any), and the decision comes as a turn. One approval lets one call through: it is spent here,
+   * durably, before the runner allows anything, on a key unique to this check. Only the current runner
+   * process at the current epoch is answered, and only for rules as current as the agent's
+   * (`rules_version`: a rule changed since, say to `deny`, wins), checked in the same synchronous step as
+   * the spend.
+   */
+  private async approvalCheck(ws: WebSocket, m: Extract<RunnerToAgent, { type: "approval_check" }>): Promise<ApprovalOutcome> {
+    const digest = await argsDigest(m.input ?? null);
+    await this.hook("approvalCheck:afterDigest");
+    // From here on, synchronous: the guard, the spend and the ask are one step.
+    const att = ws.deserializeAttachment() as Attachment;
+    if (!this.exists() || !this.current(att)) {
+      return { status: "error", error: errorBody(ErrorCodes.STALE_EPOCH, "not the current runner process or epoch") };
+    }
+    if (m.cache_version < (this.load().rules_version ?? 0)) {
+      return { status: "error", error: errorBody(ErrorCodes.CONFLICT, "the agent's tool rules changed since this call was checked against them") };
+    }
+    const held = this.calls.checkRule(m.tool, digest, `rule/${att.epoch}/${m.request}`, Date.now());
+    if (held) {
+      if (held.status === "approved") console.log(`agent ${this.load().agent}: ${m.tool} call ${m.call} runs on approval ${held.ask}`);
+      return held;
+    }
+    const question = `Allow ${visible(m.tool)}? (request ${visible(m.call)}; options: approve | deny)\n${describeArgs(m.input ?? null)}`;
+    const ask = this.recordAsk(this.load(), m.call, att.epoch, question, { name: m.tool, digest, tool: m.tool, kind: "rule", input: canonicalJson(m.input ?? null) });
+    return { status: "pending", ask };
   }
 
   // Brokered actions and egress widening (docs/agents/tools/#taint-and-sinks)
@@ -3603,12 +3654,15 @@ export class AgentDO extends DurableObject<Env> {
    * `openAsks` (`GET /v1/agents/:agent/asks`) until `answerAsk`, whose decision comes as a turn. A re-run
    * for the same call holds the same ask. Synchronous: the ask (and its approval) is recorded in one step.
    */
-  private recordAsk(info: AgentInfo, call: string, epoch: number, question: string, approval?: { name: string; digest: string; tool: string }): string {
+  private recordAsk(
+    info: AgentInfo, call: string, epoch: number, question: string,
+    approval?: { name: string; digest: string; tool: string; kind?: ApprovalKind; input?: string },
+  ): string {
     const prior = this.calls.askOf(call, epoch);
     if (prior) return prior.ask;
     const ask = newId("ask_");
     this.calls.recordAsk({ ask, call, epoch, question, status: "async", deadline: 0 });
-    if (approval) this.calls.requestApproval(ask, approval.name, approval.digest, approval.tool);
+    if (approval) this.calls.requestApproval(ask, approval.name, approval.digest, approval.tool, approval.kind ?? "sink", approval.input);
     this.traceEmit({ type: "ask", ask, question: field(question) }, Date.now(), info.current_turn);
     this.emit(info, `${info.agent}/ask/${ask}`, {
       type: "agent.ask", agent: info.agent, ask, question, ...(approval ? { approval: { name: approval.name, tool: approval.tool } } : {}),
@@ -3687,13 +3741,14 @@ export class AgentDO extends DurableObject<Env> {
     const approval = this.calls.approvalOf(ask);
     if (approval) {
       const ok = approves(answer);
-      this.calls.decide(ask, ok, Date.now() + APPROVAL_TTL_MS);
+      this.calls.decide(ask, ok, approvalExpiry(approval.kind, Date.now(), APPROVAL_TTL_MS));
       // Rows written before `tool` was kept are remote MCP tools'.
       const tool = approval.tool ?? `${NEST_TOOL_PREFIX}${approval.name}`;
+      const within = approval.kind === "rule" ? "" : `, within ${APPROVAL_TTL_MS / 60_000} minutes`;
       await this.enqueueTurn({
         kind: "ask_answer",
         text: ok
-          ? `Approved (${ask}): call ${tool} again with exactly the same arguments. The approval is for that one call, within ${APPROVAL_TTL_MS / 60_000} minutes.`
+          ? `Approved (${ask}): call ${tool} again with exactly the same arguments. The approval is for that one call${within}.`
           : `Denied (${ask}): ${tool} with those arguments wasn't sent and won't be. The operator answered: ${answer}`,
       });
       return "async";

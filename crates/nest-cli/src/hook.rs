@@ -5,6 +5,9 @@
 //! - `--sync` (decisions): one `HookDecisionRequest` frame on `NEST_HOOK_SOCK`, print the
 //!   response's `output`. If the runner is unreachable or slow (8 s), print the spec'd fallback
 //!   (deny for `PreToolUse`/`PermissionRequest`, nothing for `SessionStart`/`Stop`).
+//!   `--event <name>` (the managed settings pass it) names the hook's event, so input that isn't
+//!   JSON serde can read (a lone surrogate, nesting past its depth limit) still gets that event's
+//!   fallback, a deny where one is due, rather than no decision at all.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixDatagram, UnixStream};
@@ -20,17 +23,23 @@ pub const SYNC_TIMEOUT: Duration = Duration::from_secs(8);
 
 pub fn main(args: &[String]) -> i32 {
     let sync = args.iter().any(|a| a == "--sync");
+    let event_arg = args.iter().position(|a| a == "--event").and_then(|i| args.get(i + 1)).cloned();
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
-    let input: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    let parsed = serde_json::from_str::<Value>(&raw);
     let agent = AgentId(std::env::var(env::AGENT_ID).unwrap_or_else(|_| "agt_unknown".into()));
     if sync {
-        let sock = std::env::var(env::HOOK_SOCK).unwrap_or_else(|_| paths::HOOK_SOCK.into());
-        let event = input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default().to_string();
-        let output = decide(&sock, agent, input, SYNC_TIMEOUT).unwrap_or_else(|e| {
-            eprintln!("nest hook: runner unavailable ({e}); using fallback for {event}");
-            hook::fallback_output(&event).unwrap_or_default()
-        });
+        let output = match (parsed, event_arg) {
+            (Ok(input), event_arg) => {
+                let sock = std::env::var(env::HOOK_SOCK).unwrap_or_else(|_| paths::HOOK_SOCK.into());
+                let event = event_arg.unwrap_or_else(|| input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default().to_string());
+                decide(&sock, agent, input, SYNC_TIMEOUT).unwrap_or_else(|e| {
+                    eprintln!("nest hook: runner unavailable ({e}); using fallback for {event}");
+                    hook::fallback_output(&event).unwrap_or_default()
+                })
+            }
+            (Err(e), event) => unreadable(event.as_deref(), &e),
+        };
         if output != HookOutput::default() {
             let mut out = std::io::stdout().lock();
             let _ = serde_json::to_writer(&mut out, &output);
@@ -39,9 +48,20 @@ pub fn main(args: &[String]) -> i32 {
     } else {
         let dgram = std::env::var(env::HOOK_DGRAM).unwrap_or_else(|_| paths::HOOK_DGRAM.into());
         let spool = std::env::var(env::HOOK_SPOOL).ok();
-        track(&dgram, spool.as_deref(), agent, input);
+        track(&dgram, spool.as_deref(), agent, parsed.unwrap_or(Value::Null));
     }
     0
+}
+
+/// A sync hook's input that isn't JSON serde can read: never sent to the runner (it would get
+/// `null` and answer nothing, and Claude Code would then let a tool call run). The event's fallback
+/// instead, from `--event`. Without it (only settings older than this binary, which ship with it,
+/// omit it), a `PreToolUse` deny: failing closed for the event that needs it; what Claude Code does
+/// with that output for another event is unverified.
+pub fn unreadable(event: Option<&str>, e: &serde_json::Error) -> HookOutput {
+    let event = event.unwrap_or("PreToolUse");
+    eprintln!("nest hook: unreadable hook input ({e}); using the fallback for {event}");
+    hook::fallback_output(event).unwrap_or_default()
 }
 
 fn decide(sock: &str, agent: AgentId, input: Value, timeout: Duration) -> std::io::Result<HookOutput> {

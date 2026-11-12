@@ -443,6 +443,12 @@ export const RunnerToAgentVariants = [
   z.object({ type: z.literal("hands_resolve"), request: RequestId }),
   /** The runner abandoned a platform call (timed out locally); never run it if it hasn't started. */
   z.object({ type: z.literal("cancel_call"), seq: Seq, call: CallId, reason: z.string() }),
+  /**
+   * A call a tool rule in `ask` mode holds (its `PreToolUse` hook waits): may it run? Spends an approval
+   * of exactly this call, or holds it as an ask. Not reliable; sent only after a `hello_ack` with `rule_approvals`.
+   */
+  /** `cache_version`: the `AgentCache` whose rules held the call; AgentDO refuses a check against rules changed since. */
+  z.object({ type: z.literal("approval_check"), request: RequestId, call: CallId, tool: z.string(), input: z.unknown(), cache_version: U64 }),
   z.object({ type: z.literal("ack"), up_to: Seq }),
 ] as const;
 export const RunnerToAgent = z.discriminatedUnion("type", RunnerToAgentVariants);
@@ -503,6 +509,14 @@ export const HandsOutcome = z.discriminatedUnion("status", [
 ]);
 export type HandsOutcome = z.output<typeof HandsOutcome>;
 
+/** What `approval_check` decided: an approval spent on this call (allow), an ask holding it (deny), or not decided. */
+export const ApprovalOutcome = z.discriminatedUnion("status", [
+  z.object({ status: z.literal("approved"), ask: AskId }),
+  z.object({ status: z.literal("pending"), ask: AskId }),
+  z.object({ status: z.literal("error"), error: ErrorBody }),
+]);
+export type ApprovalOutcome = z.output<typeof ApprovalOutcome>;
+
 /**
  * A `hands_resolved` carrying `outcome` and, for runners of the previous release (one release), the
  * same answer in their three-optional shape.
@@ -515,7 +529,8 @@ export function handsResolved(request: string, outcome: HandsOutcome): Extract<A
 }
 
 export const AgentToRunnerVariants = [
-  z.object({ type: z.literal("hello_ack"), protocol_version: z.number().int(), durable_bytes: U64, last_seq: Seq.optional() }),
+  /** `rule_approvals`: this AgentDO answers `approval_check` (absent from the previous release's). */
+  z.object({ type: z.literal("hello_ack"), protocol_version: z.number().int(), durable_bytes: U64, last_seq: Seq.optional(), rule_approvals: z.boolean().optional() }),
   z.object({ type: z.literal("segment_ack"), session: SessionId, durable_bytes: U64 }),
   z.object({ type: z.literal("run_turn"), seq: Seq, turn: TurnId, input: TurnInput }),
   z.object({ type: z.literal("inbox"), seq: Seq, message: InboxMessage }),
@@ -533,6 +548,8 @@ export const AgentToRunnerVariants = [
     type: z.literal("hands_resolved"), request: RequestId, outcome: HandsOutcome.optional(),
     hands: HandsTarget.optional(), error: ErrorBody.optional(), retry_after_ms: z.number().int().nonnegative().optional(),
   }),
+  /** Answer to `approval_check`. */
+  z.object({ type: z.literal("approval_checked"), request: RequestId, outcome: ApprovalOutcome }),
   z.object({ type: z.literal("ack"), up_to: Seq }),
   z.object({ type: z.literal("error"), error: ErrorBody }),
 ] as const;

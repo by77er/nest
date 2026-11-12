@@ -623,6 +623,13 @@ export interface FakePull {
   headRepo: string | null;
   /** GitHub's `updated_at` for it, when the test gives one. */
   updated_at?: string;
+  /** Its head commit, its base branch, and what GraphQL's PR read answers of it (README.md#pr-upkeep). */
+  sha?: string;
+  base?: string;
+  /** `UNKNOWN` (GitHub hasn't computed it yet) unless given. */
+  mergeable?: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  /** The check runs on its head, each in its app's suite. */
+  checks?: { name: string; status?: string; conclusion: string | null; url?: string; app?: string }[];
 }
 
 export interface FakeCheckRun {
@@ -908,6 +915,7 @@ export class FakeGitHub {
     const t = token ? this.tokens.get(token) : undefined;
     if (!t) return json(401, { message: "Bad credentials" });
     const query = String(body?.query ?? "");
+    if (/pullRequest\(number:/.test(query)) return this.readPulls(body, t, json);
     const name = /enablePullRequestAutoMerge|disablePullRequestAutoMerge/.exec(query)?.[0];
     const id = String(body?.variables?.id ?? "");
     const target = nodeTarget(id);
@@ -930,6 +938,47 @@ export class FakeGitHub {
       this.autoMerge.set(id, null);
     }
     return json(200, { data: { [name]: { pullRequest: { id } } } });
+  }
+
+  /** GraphQL reads of PRs by number (aliases `p<i>`, variables `n<i>`), as GitHub answers the app's query. */
+  readonly pullReads: { repo: string; numbers: number[] }[] = [];
+  /** Errors a PR read answers besides its data (each read, while set), as GitHub adds them to a partial answer. */
+  pullReadErrors: { type?: string; message: string }[] = [];
+
+  private readPulls(body: any, t: { repo: string; permissions: Record<string, string> }, json: (status: number, body: unknown) => Response): Response {
+    const v = body?.variables ?? {};
+    const repo = `${v.owner}/${v.name}`.toLowerCase();
+    if (repo !== t.repo) return json(200, { data: { repository: null }, errors: [{ type: "NOT_FOUND", message: `Could not resolve to a Repository with the name '${repo}'.` }] });
+    if (!levelWithin("read", t.permissions.pull_requests) || !levelWithin("read", t.permissions.checks)) {
+      return json(200, { data: null, errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }] });
+    }
+    const repository: Record<string, unknown> = {};
+    const errors: unknown[] = [];
+    const numbers: number[] = [];
+    for (let i = 0; v[`n${i}`] !== undefined; i++) {
+      const n = Number(v[`n${i}`]);
+      numbers.push(n);
+      const p = this.pulls.get(repo)?.get(n);
+      if (!p) {
+        repository[`p${i}`] = null;
+        errors.push({ type: "NOT_FOUND", path: ["repository", `p${i}`], message: `Could not resolve to a PullRequest with the number of ${n}.` });
+        continue;
+      }
+      const sha = p.sha ?? shaOf(`head${n}`);
+      const apps = [...new Set((p.checks ?? []).map((c) => c.app ?? "github-actions"))];
+      repository[`p${i}`] = {
+        number: n, state: p.merged ? "MERGED" : p.state === "open" ? "OPEN" : "CLOSED", title: p.title, headRefName: p.ref, headRefOid: sha, baseRefName: p.base ?? "main",
+        isCrossRepository: p.headRepo !== repo, mergeable: p.mergeable ?? "UNKNOWN", mergeStateStatus: p.mergeable === "CONFLICTING" ? "DIRTY" : "UNKNOWN",
+        autoMergeRequest: null,
+        commits: { nodes: [{ commit: { oid: sha, checkSuites: { nodes: apps.map((app) => ({
+          app: { slug: app },
+          checkRuns: { nodes: (p.checks ?? []).filter((c) => (c.app ?? "github-actions") === app).map((c) => ({ name: c.name, status: c.status ?? "COMPLETED", conclusion: c.conclusion, detailsUrl: c.url ?? null })) },
+        })) } } }] },
+      };
+    }
+    this.pullReads.push({ repo, numbers });
+    errors.push(...this.pullReadErrors);
+    return json(200, { data: { repository }, ...(errors.length ? { errors } : {}) });
   }
 
   /** The app that "recently provided" each check on the repo, as GitHub picks one for an omitted app_id. */

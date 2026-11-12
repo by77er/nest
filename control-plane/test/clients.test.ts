@@ -18,6 +18,7 @@ import { adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueC
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const clientStub = (id: string) => env.CLIENT.get(env.CLIENT.idFromName(id));
+const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
 
 async function as(token: string, path: string, init: { method?: string; body?: unknown } = {}): Promise<Response> {
   return SELF.fetch(`${BASE}${path}`, {
@@ -415,6 +416,41 @@ describe("the grant bounds everything in the subtree", () => {
     await asJson(c.token, `/v1/sandboxes/${s1.sandbox}`, { method: "DELETE" });
     await eventually("the destroyed sandbox's place", async () => (await adminJson(`/v1/admin/clients/${c.id}`)).live.sandboxes === 0);
     await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
+  });
+
+  it("ending its agent with destroy_sandbox destroys the client's own sandbox once no other agent is attached, and frees its place", async () => {
+    const c = await newClient({ max_sandboxes: 1 });
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/hands`, { method: "PUT", body: basic({ capabilities: ["nest", "hands"], hands: "required" }) });
+    const s = await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
+    const a1 = await createAgent(c, { template: `${c.name}/hands`, sandbox: s.sandbox });
+    const a2 = await createAgent(c, { template: `${c.name}/hands`, sandbox: s.sandbox });
+    const step = (agent: string) => eventually(`${agent}'s sandbox step`, async () => (await agentStub(agent).info()).ended?.sandbox);
+    const sbx = () => asJson(c.token, `/v1/sandboxes/${s.sandbox}`);
+    // Another agent is attached: detached, kept.
+    await asJson(c.token, `/v1/agents/${a1.agent}/stop`, { body: { end: true, destroy_sandbox: true } });
+    expect(await step(a1.agent)).toBe("detached");
+    expect(await sbx()).toMatchObject({ attached: [a2.agent] });
+    expect((await sbx()).state).not.toBe("destroyed");
+    // Alone in it: destroyed by the client's end, and its place in max_sandboxes is free again.
+    await asJson(c.token, `/v1/agents/${a2.agent}/stop`, { body: { end: true, destroy_sandbox: true } });
+    expect(await step(a2.agent)).toBe("destroyed");
+    expect((await agentStub(a2.agent).info()).ended).toMatchObject({ by: c.id, destroy_sandbox: true });
+    expect((await sbx()).state).toBe("destroyed");
+    // A retry of the release (AgentDO reset before recording it) finds it destroyed, and says so again.
+    expect(await sandboxStub(s.sandbox).release(a2.agent, true, c.id)).toEqual({ destroyed: true });
+    await eventually("the destroyed sandbox's place", async () => (await adminJson(`/v1/admin/clients/${c.id}`)).live.sandboxes === 0);
+    await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
+  });
+
+  it("an ephemeral agent's own default destroys only a sandbox made for it: the client's end without destroy_sandbox keeps the client's", async () => {
+    const c = await newClient();
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/eph`, { method: "PUT", body: basic({ capabilities: ["nest", "hands"], hands: "required", ephemeral: true }) });
+    const s = await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
+    const a = await createAgent(c, { template: `${c.name}/eph`, sandbox: s.sandbox });
+    await asJson(c.token, `/v1/agents/${a.agent}/stop`, { body: { end: true } });
+    expect(await eventually("its sandbox step", async () => (await agentStub(a.agent).info()).ended?.sandbox)).toBe("detached");
+    expect((await agentStub(a.agent).info()).ended).toMatchObject({ by: c.id, destroy_sandbox: true });
+    expect((await asJson(c.token, `/v1/sandboxes/${s.sandbox}`)).state).not.toBe("destroyed");
   });
 
   it("a reservation whose create never happened is dropped by the reconcile; one whose object exists stays counted", async () => {
