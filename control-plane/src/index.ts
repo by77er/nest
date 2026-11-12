@@ -24,11 +24,12 @@ import {
 } from "./lib/client-secrets";
 import { GithubPush } from "./lib/rules/github";
 import { ClientEgress, egressOutsideGrant } from "./lib/client-egress";
+import { ClientGuards } from "./lib/client-guards";
 import { SandboxEnv, unboundPlaceholders } from "./lib/sandbox-env";
 import { TimerName } from "./lib/timers";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { JWKS_MAX_AGE_S } from "./lib/identity";
-import { Port, SandboxPolicyLayer } from "./do/sandbox";
+import { EgressBaseInput, Port, SandboxPolicyLayer } from "./do/sandbox";
 import { type AgentDO, type CreateAgent, type RestartResult, TRACE_HEADER } from "./do/agent";
 import { withTimeout } from "./lib/reliable";
 import { INPUT_KEPT_BYTES } from "./lib/sinks";
@@ -344,9 +345,12 @@ const escapeHtml = (t: string) => t.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt
 
 /**
  * `PUT /v1/sandboxes/<id>/client-policy`'s body: the whole client layer (an absent part is emptied):
- * egress rules, injection bindings, environment, and the push token's opt-ins (`github_push`).
+ * egress rules, injection bindings, environment, the push token's opt-ins (`github_push`) and request guards.
  */
-const ClientLayer = z.strictObject({ egress: ClientEgress.optional(), inject: ClientInjections.optional(), env: SandboxEnv.optional(), github_push: GithubPush.optional() });
+const ClientLayer = z.strictObject({
+  egress: ClientEgress.optional(), inject: ClientInjections.optional(), env: SandboxEnv.optional(), github_push: GithubPush.optional(),
+  guards: ClientGuards.optional(),
+});
 
 /**
  * An environment's values: no placeholder that none of `bound` is, and no value of a secret the caller
@@ -719,6 +723,12 @@ export const ROUTES: Route[] = [
   } }),
   // The daily tunnel sweep, now (after a Cloudflare outage, or to see what the account holds).
   route({ method: "POST", path: "/v1/admin/tunnels/sweep", auth: "admin", run: ({ env, cell }) => fleet(env, cell).tunnelSweep() }),
+  // The cell's base egress layer (docs/sandbox/networking/egress/policy/#base-layer): the operator's, under
+  // the operator layer's allow and guard schemas; a write reaches every live sandbox of the cell.
+  route({ method: "GET", path: "/v1/admin/egress/base", auth: "admin", run: ({ env, cell }) =>
+    newMethod("FleetDO.egressBase", () => fleet(env, cell).egressBase()) }),
+  route({ method: "PUT", path: "/v1/admin/egress/base", auth: "admin", body: EgressBaseInput, run: ({ env, cell, body }) =>
+    newMethod("FleetDO.setEgressBase", () => fleet(env, cell).setEgressBase(body)) }),
   route({ method: "GET", path: "/v1/admin/gc", auth: "admin", run: ({ env, cell }) => fleet(env, cell).gcStatus() }),
   route({ method: "POST", path: "/v1/admin/gc/run", auth: "admin", run: async ({ env, cell }) => {
     await fleet(env, cell).gcRequest();
@@ -812,6 +822,8 @@ export const ROUTES: Route[] = [
       egress: ClientEgress.optional(),
       // Its processes' environment: literals, or placeholders of `inject` (docs/control-plane/api/clients/#environment).
       env: SandboxEnv.optional(),
+      // Request guards: they only refuse, so no grant covers them (docs/control-plane/api/clients/#request-guards).
+      guards: ClientGuards.optional(),
     }),
     run: (c) => createOnce(c, "sandbox", async (id, begin) => {
       const { env, body: r, caller } = c;
@@ -840,6 +852,7 @@ export const ROUTES: Route[] = [
         ...(r.policy ? { policy: r.policy } : {}), ...(r.idle_ttl_ms !== undefined ? { idle_ttl_ms: r.idle_ttl_ms } : {}),
         ...(inject.length ? { inject } : {}), ...(r.github_push?.workflows ? { github_push: { workflows: true as const } } : {}),
         ...(r.egress?.allow.length ? { egress: r.egress.allow } : {}), ...(r.env && Object.keys(r.env).length ? { env: r.env } : {}),
+        ...(r.guards?.length ? { guards: r.guards } : {}),
       }));
       // 202: accepted and waiting for a host (SandboxDO retries; an autoscaled cell launches one).
       return json(info, info.host ? 201 : 202);
@@ -847,7 +860,7 @@ export const ROUTES: Route[] = [
   }),
   route({ method: "GET", path: "/v1/sandboxes", auth: "owner", run: (c) => listing(c, "sandbox") }),
   // Its client layer (docs/control-plane/api/clients/#the-client-layer): egress rules, injection bindings,
-  // environment and the push token's opt-ins, replaced whole on a live sandbox within its client's grant,
+  // environment, the push token's opt-ins and request guards, replaced whole on a live sandbox within its client's grant,
   // through the usual policy and secrets push.
   route({ method: "GET", path: "/v1/sandboxes/:sandbox/client-policy", auth: "owner", run: async (c) =>
     newMethod("SandboxDO.clientLayer", async () => (await ownSandbox(c, c.p.sandbox)).clientLayer()) }),
@@ -872,7 +885,9 @@ export const ROUTES: Route[] = [
       const bound = [...inject.map((b) => b.placeholder),
         ...(await stub.policy()).inject.filter((b) => !b.name.startsWith(CLIENT_BINDING_PREFIX)).map((b) => b.placeholder)];
       await checkEnv(c.env, c.caller, r.env ?? {}, bound);
-      return newMethod("SandboxDO.setClientLayer", () => stub.setClientLayer({ egress: r.egress?.allow ?? [], inject, env: r.env ?? {}, workflows: r.github_push?.workflows === true }));
+      return newMethod("SandboxDO.setClientLayer", () => stub.setClientLayer({
+        egress: r.egress?.allow ?? [], inject, env: r.env ?? {}, workflows: r.github_push?.workflows === true, guards: r.guards ?? [],
+      }));
     },
   }),
   route({
@@ -1216,7 +1231,11 @@ export const ROUTES: Route[] = [
       const self = selfClient(c);
       const name = clientSecretName(c.p.name);
       const limit = { max_count: self.grant.secrets?.max_count ?? 0, max_bytes: self.grant.secrets?.max_bytes ?? SECRET_MAX_BYTES_DEFAULT };
-      return newMethod("BrokerDO.putClientSecret", () => broker(c.env).putClientSecret(self.client, name, c.body.value, c.body.description ?? null, limit));
+      // An expiry already past would store a value nothing can use: refused rather than silently dropped.
+      const expires = c.body.expires_at === undefined ? null : Date.parse(c.body.expires_at);
+      if (expires !== null && expires <= Date.now()) throw new NestError(ErrorCodes.INVALID_MESSAGE, `expires_at ${c.body.expires_at} has passed`);
+      return newMethod("BrokerDO.writeClientSecret", () => broker(c.env).writeClientSecret(self.client, name,
+        { value: c.body.value, description: c.body.description ?? null, expires_ms: expires }, limit));
     },
   }),
   route({ method: "DELETE", path: "/v1/clients/self/secrets/:name", auth: "owner", run: async (c) => {

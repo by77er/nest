@@ -104,6 +104,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      registry at a time (`next_cursor`): dormant sandboxes and when their TTL destroys them, sandboxes held only by
      agents nobody uses, quiet or stuck-ending agents with what they hold, the rest counted
      ([what counts](../docs/control-plane/dashboard/#abandoned); the dashboard reads it)
+   - `GET /v1/admin/egress/base?cell=<cell>` (`{allow, guards, version, pending}`) and `PUT …/egress/base?cell=<cell>
+     {allow, guards?}`: the cell's base egress layer, operator data seeded with the hosts nest had built in; a write
+     reaches every live sandbox of the cell as a new policy version (docs/sandbox/networking/egress/policy/#base-layer)
    - `POST /v1/admin/launched {instance_id, role, account_id?, region?, cell}`: record an instance we
      launched so it may enroll with its AWS identity document (as that role, from that account and region)
    - Injection secrets: `PUT /v1/admin/secrets/inject:<binding>` (or `inject:<binding>:<sandbox>`; `inject:<binding>:<ws_…>` is still read for older secrets)
@@ -133,8 +136,8 @@ client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a G
 within `secrets {max_count, max_bytes}`; bindings naming them (`inject` in its templates, overrides and `POST /v1/sandboxes`,
 hosts within `inject_hosts`) are injected by nest-proxy; `github_push: {workflows: true}` (within `github_push`) adds
 `workflows: write` to a sandbox's push token. Egress rules within `egress_hosts` (`egress {allow: [{host, ports?}]}` in its templates, overrides and
-`POST /v1/sandboxes`), env (`env {NAME: value}`), and the live sandbox's client layer, `GET|PUT /v1/sandboxes/<id>/client-policy {egress?, inject?, env?}`
-(`src/lib/client-egress.ts`, `src/lib/sandbox-env.ts`). An agent's timers (`src/lib/timers.ts`): `GET /v1/agents/<id>/timers`, `DELETE /v1/agents/<id>/timers/<name>`.
+`POST /v1/sandboxes`), env (`env {NAME: value}`), request guards that only refuse (`guards [...]`, sent as `client:<name>`), and the live sandbox's client layer,
+`GET|PUT /v1/sandboxes/<id>/client-policy {egress?, inject?, env?, github_push?, guards?}` (`src/lib/client-egress.ts`, `src/lib/sandbox-env.ts`, `src/lib/client-guards.ts`). An agent's timers (`src/lib/timers.ts`): `GET /v1/agents/<id>/timers`, `DELETE /v1/agents/<id>/timers/<name>`.
 Its events (`src/lib/client-events.ts`): `PUT /v1/clients/self/webhook {url}` (https; answers the signing secret once);
 its agents and sandboxes hand them to ClientDO from their alarms, and ClientDO POSTs each, signed (`Nest-Signature`), with
 retries; `GET /v1/clients/self` (the client) and `GET /v1/admin/clients/<cli>` show `events {webhook, backlog, dropped, failures, last_error}`.

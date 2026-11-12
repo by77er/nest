@@ -150,6 +150,8 @@ export function hostHello(host: string, cell: string, extra: Partial<Record<stri
     gateway_url: GATEWAY_URL,
     // A current nestd (keys brains by agent epoch); a test of the previous release passes `false`.
     brain_epochs: true,
+    // Its nest-proxy bounds guarded requests; a test of the previous release passes `false`.
+    guard_bounds: true,
     sandboxes: [],
     agents: [],
     capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: 8192, hugepages_mib_total: 8192, sandboxes: 0, agents: 0, warm: [] },
@@ -158,10 +160,10 @@ export function hostHello(host: string, cell: string, extra: Partial<Record<stri
 }
 
 /** Enroll a host and connect its fleet channel (hello acknowledged, the cell's binding keys received). */
-export async function connectHost(cell: string, role: "sandbox" | "brain" = "sandbox") {
+export async function connectHost(cell: string, role: "sandbox" | "brain" = "sandbox", hello: Partial<Record<string, unknown>> = {}) {
   const enrolled = await enrollHost(cell, role);
   const ws = await Ws.connect("/v1/fleet", enrolled.host_token);
-  ws.send(hostHello(enrolled.host, cell, { role }));
+  ws.send(hostHello(enrolled.host, cell, { role, ...hello }));
   const ack = await ws.next("hello_ack");
   const keys = (await ws.next("binding_key")).keys as { kid: string; public_key: string }[];
   return { ...enrolled, ws, ack, keys };

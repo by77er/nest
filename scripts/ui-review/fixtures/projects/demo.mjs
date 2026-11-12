@@ -114,8 +114,8 @@ export function data(variant = "demo", now = Date.now()) {
     { number: 128, title: "Docs: the export formats", head: "docs-export", fork: true, task: null },
   ];
   const asks = [
-    { ask: "ask_A1", agent: "agt_w8x2m4", role: "worker", task: "tsk_demo7", question: "Push to by77er/gadgets: open PR #118?", approval: { name: "github.create_pr", tool: "brokered" }, at_ms: now - 120_000, answered_ms: null },
-    { ask: "ask_A2", agent: "agt_mgr7k2", role: "manager", task: null, question: "Should search match tags by prefix or whole words only?", approval: null, at_ms: now - 60_000, answered_ms: null },
+    { ask: "ask_A1", agent: "agt_w8x2m4", role: "worker", task: "tsk_demo7", question: "Push to by77er/gadgets: open PR #118?", approval: { name: "github.create_pr", tool: "brokered" }, at_ms: now - 120_000 },
+    { ask: "ask_A2", agent: "agt_mgr7k2", role: "manager", task: null, question: "Should search match tags by prefix or whole words only?", approval: null, at_ms: now - 60_000 },
   ];
   const blocked = (task, title, by, role, mins, reason, question) => ({ kind: "blocked", task, title, state: "in_progress", at_ms: now - mins * 60_000, by, role, reason, question, tainted: false });
   // The repo's issues waiting for triage (README.md#triage): anyone's text, one with markup that must show as text.
@@ -539,6 +539,8 @@ const RICH = [
       "/routines": { routines, max_routine_runs: 1, live: noRoutines ? 0 : 1 }, "/routine-runs": runs, "/proposals": proposals, "/memory": notes };
     if (q === "/chat" && search.has("before")) return [200, variant === "chat-paged" ? page(Number(search.get("before")), Number(search.get("limit")) || 50) : []];
     if (q === "/manager/interrupt" && method === "POST") return [200, { ok: true }];
+    // "Needs you"'s own items without the asks (`?local=1`, README.md#asks).
+    if (q === "/attention" && search.get("local") === "1") return [200, attention.filter((x) => x.kind !== "ask" && x.kind !== "asks_unavailable")];
     if (q in routes) return [200, routes[q]];
     // A row moved on the board: its new order kept, so the next poll shows it where it was dropped.
     if (method === "PATCH" && /^\/tasks\/[^/]+$/.test(q) && typeof body?.ord === "number") {

@@ -104,6 +104,8 @@ try {
 
 const failures = [];
 const shots = [];
+/** The app's own checks (a state's `check`, by its `checkName`) that ran. */
+const appChecks = new Set();
 const fail = (check, shot, detail) => failures.push({ check, state: shot.state, width: shot.width, scheme: shot.scheme, detail });
 
 for (const scheme of schemes) {
@@ -138,6 +140,7 @@ for (const scheme of schemes) {
         const r = await page.evaluate(measure, { ...app.selectors, viewportOnly: state.full === false, touch: false });
         shot.frame = r.frame;
         for (const [check, list] of Object.entries(r.problems)) for (const d of list) fail(check, shot, d);
+        if (state.check) appChecks.add(state.checkName ?? "app");
         for (const d of (await state.check?.(page, { width, scheme })) ?? []) fail(state.checkName ?? "app", shot, d);
         if (app.errorText && (await page.getByText(app.errorText).count())) fail("page-error", shot, `the page shows "${app.errorText}"`);
         await page.screenshot({ path: join(out, shot.file), fullPage: state.full !== false });
@@ -182,7 +185,8 @@ for (const scheme of schemes) {
   }
 }
 
-const byCheck = Object.fromEntries([...new Set([...CHECKS, ...failures.map((f) => f.check)])].map((c) => [c, failures.filter((f) => f.check === c).length]));
+// Every check that ran, the app's own (a state's `check`) included, so a green summary names them too.
+const byCheck = Object.fromEntries([...new Set([...CHECKS, ...appChecks, ...failures.map((f) => f.check)])].map((c) => [c, failures.filter((f) => f.check === c).length]));
 const report = { app: appName, base, at: new Date().toISOString(), widths, schemes, passed: failures.length === 0, checks: byCheck, shots, failures };
 writeFileSync(join(out, "report.json"), JSON.stringify(report, null, 2) + "\n");
 

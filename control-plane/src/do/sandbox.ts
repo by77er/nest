@@ -26,11 +26,12 @@ import {
 import { canonicalRepos, readOnlyRepos, Repos, unionRepos } from "../lib/repos";
 import type { Labels } from "../lib/clients";
 import { ClientOutbox } from "../lib/client-events";
-import { GITHUB_BINDING, GITHUB_READ_BINDING, githubEgress, GithubPush, readBindings } from "../lib/rules/github";
+import { GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING, githubEgress, GithubPush, readBindings } from "../lib/rules/github";
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
-import { slotEnv } from "../lib/sandbox-env";
-import type { MintedInjection } from "./broker";
+import { githubEnvConflict, githubEnvRefusal, isGithubEnvName, slotEnv } from "../lib/sandbox-env";
+import { CLIENT_GUARD_PREFIX, type ClientGuard, distinctGuards, type HeldGuard, layerOverLimit, outsideOperatorRouting, sandboxGuardsOverLimit, wireGuard } from "../lib/client-guards";
+import type { MintedInjection, SecretsChangedAnswer } from "./broker";
 import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 import {
   chainView, type ChainView, type GenRow, gcRootsOf, isRestoreSource, livePins, memoryToUnroot, type Pin, retention, retentionMode,
@@ -40,7 +41,10 @@ import {
 export const DEFAULT_IMAGE = "nest-base:latest";
 export const DEFAULT_RESOURCES: Resources = { vcpus: 2, memory_mib: 4096, disk_gib: 32 };
 export const DEFAULT_LIMITS: EgressLimits = { max_connections: 256, bandwidth_mbps: 200, max_inspected_body_bytes: 512 * 1024 * 1024 };
-/** Base layer (docs/sandbox/networking/egress/policy/). */
+/**
+ * The base layer's hosts before the operator edits it (docs/sandbox/networking/egress/policy/#base-layer):
+ * its seed, and what a previous release hard-codes. Trimming it is the operator's (`PUT /v1/admin/egress/base`).
+ */
 export const BASE_ALLOW = [
   "registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "crates.io", "static.crates.io", "index.crates.io",
   "github.com", "*.githubusercontent.com", "deb.debian.org",
@@ -77,7 +81,9 @@ export const SandboxPolicyLayer = z.object({
   tcp: z.array(z.object({ host: z.string().min(1), port: Port })).default([]),
   repos: Repos.default([]),
   read_repos: Repos.default([]),
-  guards: z.array(RequestGuard).max(64).default([]),
+  // `client:` names are API clients' guards' (docs/control-plane/api/clients/#request-guards): the audit and the 403 tell them apart.
+  guards: z.array(RequestGuard.refine((g) => !g.name.startsWith(CLIENT_GUARD_PREFIX),
+    `a guard name starting ${CLIENT_GUARD_PREFIX} is an API client's`)).max(64).default([]),
   /** Opt-ins on its push token (`workflows: write`; docs/control-plane/api/clients/#workflow-files). */
   github_push: GithubPush.optional(),
 });
@@ -85,6 +91,24 @@ export type SandboxPolicyLayer = z.output<typeof SandboxPolicyLayer>;
 /** What a caller may pass: the fields with defaults may be left out. */
 export type SandboxPolicyInput = z.input<typeof SandboxPolicyLayer>;
 const EMPTY_LAYER: SandboxPolicyLayer = SandboxPolicyLayer.parse({});
+/** Whether an operator layer has nest inject a GitHub token: repos, read-only repos, `github_push`, or its own binding under a GitHub binding's name. */
+const layerGithub = (l: SandboxPolicyLayer): boolean => l.repos.length > 0 || l.read_repos.length > 0 || !!l.github_push?.workflows
+  || l.inject.some((b) => b.name === GITHUB_BINDING || b.name === GITHUB_READ_BINDING || b.name === GITHUB_READ_DEFAULT_BINDING);
+/**
+ * A cell's base egress layer as the operator writes it (`PUT /v1/admin/egress/base`): allow rules and
+ * request guards under the operator layer's own schemas. `allow` is required, so a body that forgets it
+ * can't empty the layer.
+ */
+export const EgressBaseInput = z.strictObject({ allow: SandboxPolicyLayer.shape.allow.unwrap(), guards: SandboxPolicyLayer.shape.guards });
+/** A cell's base layer as FleetDO stores it and each SandboxDO holds it: `version` 0 is the seed, never written. */
+export interface EgressBase {
+  version: number;
+  allow: SandboxPolicyLayer["allow"];
+  guards: SandboxPolicyLayer["guards"];
+}
+export const SEED_EGRESS_BASE: EgressBase = { version: 0, allow: BASE_ALLOW.map((host) => ({ host })), guards: [] };
+/** Its cell's base layer as last heard from FleetDO (`egressBaseChanged`, `registerSandbox`); absent: the seed. */
+const EGRESS_BASE = "egress_base";
 /**
  * The operator layer's rules on the wire: `workstream` is the layer's historical name, which hosts
  * parse as a closed enum (`PolicyLayer`), so it stays (docs/interfaces/#pending-contract-changes).
@@ -103,6 +127,11 @@ const AGENT_INJECT = "agent_inject";
 const AGENT_PUSH = "agent_github_push";
 /** A sandbox with client bindings pushes their secrets again this often, so a changed or deleted value reaches its proxy. */
 const CLIENT_SECRET_REFRESH_MS = 15 * 60_000;
+/** Failed pushes of a changed client secret in a row (`client_secrets`), for its backoff. */
+const CLIENT_PUSH_FAILS = "client_push_fails";
+/** A failed push of a changed client secret is tried again after 2 s, doubling, this many times (about 4 minutes); then the 15-minute push carries it. */
+const CLIENT_PUSH_ATTEMPTS = 8;
+const clientPushBackoff = (fails: number) => 2_000 * 2 ** (fails - 1);
 /** Set once a read-only token was asked for, so a sandbox without any never asks BrokerDO to forget one. */
 const READ_MINTED = "read_token";
 /** A push allowlist, read-only repos, the push token's opt-ins and the client bindings, compared as one. */
@@ -172,6 +201,8 @@ export interface AgentAccess {
   egress?: EgressRule[];
   /** Its processes' environment (`AgentSpec.env`). */
   env?: Record<string, string>;
+  /** Its request guards (`AgentSpec.guards`). */
+  guards?: HeldGuard[];
 }
 
 export interface CreateSandbox {
@@ -195,6 +226,8 @@ export interface CreateSandbox {
   egress?: EgressRule[];
   /** Its own environment (docs/control-plane/api/clients/#environment), checked by the caller. */
   env?: Record<string, string>;
+  /** Its own request guards (docs/control-plane/api/clients/#request-guards): they only refuse. */
+  guards?: ClientGuard[];
 }
 
 /** The sandbox's own egress rules (its create's, or `PUT …/client-policy`). */
@@ -205,6 +238,10 @@ const AGENT_EGRESS = "agent_egress";
 const OWN_ENV = "client_env";
 /** Each attached agent's environment, by agent (removed at detach). */
 const AGENT_ENV = "agent_env";
+/** Its own request guards (its create's, or its client layer's; docs/control-plane/api/clients/#request-guards). */
+const OWN_GUARDS = "client_guards";
+/** Each attached agent's request guards (its client's or the operator's), by agent (removed at detach). */
+const AGENT_GUARDS = "agent_guards";
 /** Its client's grant's `egress_hosts`, as last read: the ceiling its rules are applied within (absent: none). */
 const EGRESS_CEILING = "client_egress_hosts";
 /** A sandbox with client egress rules reads its client's `egress_hosts` again this often, so a missed grant change converges. */
@@ -440,13 +477,22 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** Create (idempotent) and place the sandbox; the first placement grants epoch 1. */
   async create(req: CreateSandbox): Promise<SandboxInfo> {
+    // Its own env beside its own GitHub access (docs/control-plane/api/clients/#environment); refused
+    // before anything is written. An attached agent's are checked at its attach.
+    const asked = req.policy ? SandboxPolicyLayer.parse(req.policy) : EMPTY_LAYER;
+    this.refuseGithubEnv(layerGithub(asked) || !!req.github_push?.workflows, req.env);
+    // Its own guards within what a sandbox applies: refused before anything is written (its caller gives its client's place back).
+    const over = req.guards?.length ? layerOverLimit(req.guards) : null;
+    if (over) throw new NestError(ErrorCodes.INVALID_MESSAGE, over);
+    if (req.guards?.length && !this.get<SandboxInfo>("info")) await this.requireGuardBounds(req.cell);
     // The cell's registry is the authority for which sandboxes exist (its GC roots): registered
     // before anything can be written for the sandbox, and again on a retried create, but never
     // again once destroyed (its registry row may already be pruned).
     const existing = this.get<SandboxInfo>("info");
     const labels = req.labels && Object.keys(req.labels).length ? req.labels : undefined;
     if (existing?.state !== "destroyed") {
-      await this.fleet(req.cell).registerSandbox(req.sandbox, req.client || labels ? { client: req.client ?? null, labels: labels ?? null } : undefined);
+      // Its answer is the cell's base layer (a FleetDO of the previous release answers nothing: the seed).
+      this.takeEgressBase(await this.fleet(req.cell).registerSandbox(req.sandbox, req.client || labels ? { client: req.client ?? null, labels: labels ?? null } : undefined));
     }
     if (existing) return this.view();
     const info: SandboxInfo = {
@@ -481,6 +527,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (req.github_push?.workflows) this.put(OWN_PUSH, { workflows: true });
     if (req.egress?.length) this.put(OWN_EGRESS, req.egress);
     if (req.env && Object.keys(req.env).length) this.put(OWN_ENV, req.env);
+    if (req.guards?.length) this.put(OWN_GUARDS, req.guards);
     // A client's sandbox applies client rules within its grant's `egress_hosts`, read now and at each change.
     if (req.client) await this.readEgressCeiling();
     try {
@@ -921,9 +968,15 @@ export class SandboxDO extends DurableObject<Env> {
     await this.deadlines.clear("grants");
     await this.deadlines.clear("place");
     await this.deadlines.clear("inject_refresh");
+    await this.deadlines.clear("client_secrets");
     await this.deadlines.clear("expiry");
     await this.deadlines.clear("retention");
-    await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).forgetInjections(before.sandbox);
+    const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
+    await broker.forgetInjections(before.sandbox);
+    // Not inside `forgetInjections`, which a push calls too. A BrokerDO of the previous release lacks it:
+    // the next notice to this sandbox answers `gone` and forgets it then.
+    await broker.forgetClientSecretSandbox(before.sandbox).catch((e: unknown) =>
+      console.warn(`sandbox ${before.sandbox}: BrokerDO didn't forget its client secrets; a notice will`, e));
   }
 
   /** `sandbox_create` for the current epoch, from the head if there is one. */
@@ -1166,8 +1219,9 @@ export class SandboxDO extends DurableObject<Env> {
     // Its client's bindings, under names of their own (`client:<name>`), never replacing another.
     const inject = [...built, ...this.appliedClientInjections(built.map((b) => b.name)).map(wireBinding)];
     const tag = (source: AllowSource) => (r: AllowRule): SourcedAllowRule => ({ ...r, source });
+    const base = this.egressBase();
     const allow: SourcedAllowRule[] = [
-      ...BASE_ALLOW.map((host) => ({ host, ports: WEB_PORTS, layer: "base" as const, source: "base" as const })),
+      ...base.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: "base" as const, source: "base" as const })),
       ...ws.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER, source: "operator" as const })),
       ...gh.allow.map((a) => ({ host: a.host, ports: a.ports ?? WEB_PORTS, layer: OPERATOR_LAYER, source: "repos" as const })),
       // Its own and its agents' egress rules (docs/control-plane/api/clients/#egress): allow rules only, so the
@@ -1188,8 +1242,39 @@ export class SandboxDO extends DurableObject<Env> {
       inject,
       tcp: ws.tcp,
       limits: DEFAULT_LIMITS,
-      guards: [...gh.guards, ...(ws.guards ?? [])],
+      // The base layer's and the operator's guards first (a request both refuse names theirs), then its
+      // client's: every guard must let a request through, so a client's can only refuse more.
+      guards: [...base.guards, ...gh.guards, ...(ws.guards ?? []), ...outsideOperatorRouting(this.clientGuards(), [...ws.passthrough, ...ws.tcp.map((t) => t.host)])],
     };
+  }
+
+  /** Its cell's base layer as last heard (absent: the seed, today's hosts). */
+  private egressBase(): EgressBase {
+    return this.get<EgressBase>(EGRESS_BASE) ?? SEED_EGRESS_BASE;
+  }
+
+  /** Hold `base` if it is newer than the one held (versions only grow); whether it was. */
+  private takeEgressBase(base: EgressBase | null | undefined | void): boolean {
+    if (!base || typeof base.version !== "number" || base.version <= this.egressBase().version) return false;
+    this.put(EGRESS_BASE, { version: base.version, allow: base.allow, guards: base.guards });
+    return true;
+  }
+
+  /**
+   * FleetDO: its cell's base layer changed (`PUT /v1/admin/egress/base`). Held at once (any policy built
+   * from now on has it) and sent as a new policy version from its own alarm (`egress_base`), so FleetDO's
+   * fan-out never waits on a command back into FleetDO. Held even before its create wrote anything (the
+   * create, registered, may be waiting on an answer FleetDO read before this version), so the older answer
+   * can't replace it. Sent whenever the version held is at least the one told, not only when this notice
+   * brought it: a retried create may have taken it from `registerSandbox`'s answer already, and sends
+   * nothing itself (a redundant send is a policy version the proxy takes again). A destroyed sandbox
+   * changes nothing.
+   */
+  async egressBaseChanged(base: EgressBase): Promise<void> {
+    const info = this.tryInfo();
+    if (info && lease.gone(info.state)) return;
+    this.takeEgressBase(base);
+    if (info && this.egressBase().version >= base.version) await this.deadlines.set("egress_base", Date.now());
   }
 
   /** The operator's layer; one stored before `repos`, `read_repos` and `guards` reads as having none. */
@@ -1210,6 +1295,7 @@ export class SandboxDO extends DurableObject<Env> {
   async setPolicy(input: SandboxPolicyInput): Promise<EgressPolicy> {
     this.info_();
     const layer = SandboxPolicyLayer.parse(input);
+    this.refuseGithubEnv(this.kernelGithub({ layer }), ...this.envs());
     this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos), read_repos: canonicalRepos(layer.read_repos) });
     await this.policyChanged(true);
     return this.policy();
@@ -1268,7 +1354,16 @@ export class SandboxDO extends DurableObject<Env> {
         if (lease.placeWanted(this.info_())) await this.placeCurrentEpoch();
       } else if (key === "inject_refresh") {
         const info = this.info_();
-        if (info.host && ACTIVE_STATES.includes(info.state)) await this.pushSecrets(true);
+        if (info.host && ACTIVE_STATES.includes(info.state)) {
+          await this.pushSecrets(true);
+          // A push that went through ends a run of failed ones: the next failure backs off from the start.
+          this.del(CLIENT_PUSH_FAILS);
+        }
+      } else if (key === "client_secrets") {
+        await this.pushChangedClientSecrets();
+      } else if (key === "egress_base") {
+        const info = this.tryInfo();
+        if (info && !lease.gone(info.state)) await this.policyChanged(false);
       } else if (key === "turn_checkpoint") {
         await this.turnEndCheckpoint();
       } else if (key === "idle") {
@@ -1335,6 +1430,56 @@ export class SandboxDO extends DurableObject<Env> {
     return policy;
   }
 
+  /** The operator's and constructed bindings' names: a client binding never takes one (its secret would go out under that one). */
+  private builtBindingNames(): string[] {
+    const ws = this.operatorLayer();
+    const access = this.pushAccess();
+    return [...ws.inject, ...githubEgress(access.push, access.read, ws.inject).inject].map((b) => b.name);
+  }
+
+  /**
+   * BrokerDO: a secret of `client`'s that this sandbox asked for at its last push was written or deleted
+   * (docs/control-plane/durable-objects/broker/#client-secret-pushes). Arms the `client_secrets` deadline
+   * now, a key of its own so the push in flight (which re-arms `inject_refresh` for 15 minutes) can't
+   * swallow it; its alarm pushes the secrets again. Answers what BrokerDO keeps of the sandbox: `gone`
+   * (destroyed or never made) and `unbound` (none of the client's bindings apply now) let it forget it;
+   * otherwise the client's secret names its bindings name now, so it forgets the rest. `idle` (not on a
+   * host) pushes nothing, since a placement pushes.
+   */
+  async clientSecretsChanged(client: string): Promise<SecretsChangedAnswer> {
+    const info = this.tryInfo();
+    if (!info || lease.gone(info.state)) return { status: "gone" };
+    const secrets = [...new Set(this.appliedClientInjections(this.builtBindingNames()).filter((b) => b.client === client).map((b) => b.secret))];
+    if (!secrets.length) return { status: "unbound" };
+    if (!info.host || !ACTIVE_STATES.includes(info.state)) return { status: "idle", secrets };
+    await this.deadlines.set("client_secrets", Date.now(), true);
+    return { status: "push", secrets };
+  }
+
+  /**
+   * The `client_secrets` deadline: push the secrets again. A failure is tried again with backoff (2 s,
+   * doubling) up to `CLIENT_PUSH_ATTEMPTS` times; then it is left to `inject_refresh`, armed if it isn't.
+   */
+  private async pushChangedClientSecrets(): Promise<void> {
+    const info = this.info_();
+    if (!info.host || !ACTIVE_STATES.includes(info.state)) return;
+    try {
+      await this.pushSecrets(true);
+      this.del(CLIENT_PUSH_FAILS);
+    } catch (e) {
+      const fails = (this.get<number>(CLIENT_PUSH_FAILS) ?? 0) + 1;
+      if (fails >= CLIENT_PUSH_ATTEMPTS) {
+        console.warn(`sandbox ${info.sandbox}: pushing its changed client secrets failed ${fails} times; the 15-minute push will`, e);
+        this.del(CLIENT_PUSH_FAILS);
+        await this.deadlines.set("inject_refresh", Date.now() + CLIENT_SECRET_REFRESH_MS, true);
+        return;
+      }
+      console.warn(`sandbox ${info.sandbox}: pushing its changed client secrets failed; retrying`, e);
+      this.put(CLIENT_PUSH_FAILS, fails);
+      await this.deadlines.set("client_secrets", Date.now() + clientPushBackoff(fails));
+    }
+  }
+
   /**
    * Injection secrets for the policy's bindings, as BrokerDO references (FleetDO resolves them when it
    * sends): the operator's static ones (`inject:<binding>[:<sandbox>]`), for a push allowlist a GitHub
@@ -1353,8 +1498,7 @@ export class SandboxDO extends DurableObject<Env> {
     const own = (name: string) => ws.inject.some((b) => b.name === name);
     const mint = access.push.length > 0 && !own(GITHUB_BINDING);
     const mintRead = access.read.length > 0 && !own(GITHUB_READ_BINDING);
-    // Only those the policy carries: none under a name another binding has (its secret would go out under that one).
-    const built = [...ws.inject, ...githubEgress(access.push, access.read, ws.inject).inject].map((b) => b.name);
+    const built = this.builtBindingNames();
     const clientBindings = before.client ? this.appliedClientInjections(built) : [];
     if (!before.host || (!ws.inject.length && !mint && !mintRead && !clientBindings.length && !force)) return;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
@@ -1447,7 +1591,16 @@ export class SandboxDO extends DurableObject<Env> {
       const now = this.info_();
       if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);
     }
-    // What its client bindings, push opt-ins and egress rules count is the attached agents': compared across the attach itself.
+    // Its guards need its cell's hosts to bound them, and must fit beside the sandbox's (checked in the step that records them).
+    if (this.countedGuards(extra.guards).length) {
+      await this.requireGuardBounds(cur.cell);
+      if (lease.gone(this.info_().state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${this.info_().state}`, 409);
+    }
+    if (extra.guards?.length) this.checkGuardLimit(undefined, { id: agent, guards: extra.guards });
+    // Its env and the sandbox's beside the GitHub access both bring, before anything is recorded.
+    this.refuseGithubEnv(this.kernelGithub({ except: agent }) || !!repos?.length || !!readRepos?.length || !!extra.workflows,
+      ...this.envs(agent), extra.env);
+    // What its client bindings, push opt-ins, egress rules and guards count is the attached agents': compared across the attach itself.
     const extrasBefore = this.extrasKey();
     this.setAgentExtras(agent, extra);
     if (cur.client && extra.egress?.length && !this.deadlines.has("egress_ceiling")) await this.deadlines.set("egress_ceiling", Date.now() + EGRESS_CEILING_REFRESH_MS);
@@ -1591,6 +1744,7 @@ export class SandboxDO extends DurableObject<Env> {
    */
   async allowAgentRepos(agent: string, repos: string[]): Promise<string[]> {
     if (!this.info_().attached.includes(agent)) return this.pushRepos();
+    if (repos.length) this.refuseGithubEnv(true, ...this.envs());
     const have = this.get<Record<string, string[]>>("agent_repos")?.[agent] ?? [];
     const read = this.get<Record<string, string[]>>(AGENT_READ_REPOS)?.[agent] ?? [];
     if (this.setAgentRepos(agent, [...have, ...repos], read)) await this.policyChanged(true);
@@ -1614,7 +1768,8 @@ export class SandboxDO extends DurableObject<Env> {
 
   /**
    * Record an attached agent's client bindings (only those of the sandbox's own client: an agent's
-   * spec names whose they are) whether it asks for `workflows`, and its egress rules.
+   * spec names whose they are) whether it asks for `workflows`, its egress rules and its request guards
+   * (its sandbox's client's or the operator's).
    */
   private setAgentExtras(agent: string, extra: AgentAccess): void {
     const client = this.info_().client;
@@ -1631,6 +1786,13 @@ export class SandboxDO extends DurableObject<Env> {
       if (extra.workflows) all[agent] = true;
       else delete all[agent];
       this.put(AGENT_PUSH, all);
+    }
+    const guards = this.countedGuards(extra.guards);
+    if (guards.length || this.get(AGENT_GUARDS)) {
+      const all = { ...(this.get<Record<string, HeldGuard[]>>(AGENT_GUARDS) ?? {}) };
+      if (guards.length) all[agent] = guards;
+      else delete all[agent];
+      this.put(AGENT_GUARDS, all);
     }
     const env = extra.env ?? {};
     if (Object.keys(env).length || this.get(AGENT_ENV)) {
@@ -1650,7 +1812,7 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** The push opt-ins, client bindings and egress rules the attached agents give, compared as one. */
   private extrasKey(): string {
-    return `${accessKey({ ...this.pushAccess(), inject: this.clientInjections() })}|${JSON.stringify(this.clientEgress())}`;
+    return `${accessKey({ ...this.pushAccess(), inject: this.clientInjections() })}|${JSON.stringify(this.clientEgress())}|${JSON.stringify(this.clientGuards())}`;
   }
 
   /**
@@ -1674,6 +1836,51 @@ export class SandboxDO extends DurableObject<Env> {
   private appliedClientInjections(taken: readonly string[]): HeldInjection[] {
     return this.clientInjections().filter((b) => !taken.includes(injectionWireName(b.name)));
 
+  }
+
+  // --- client request guards (docs/control-plane/api/clients/#request-guards) ---------------------------
+
+  /**
+   * The guards of an agent's spec that count here: its sandbox's own client's, or the operator's (held
+   * `null`). Another subtree's never do, so a guard's `injected` names only this sandbox's client's bindings.
+   */
+  private countedGuards(guards: readonly HeldGuard[] | undefined): HeldGuard[] {
+    const client = this.info_().client ?? null;
+    return (guards ?? []).filter((g) => g.client === null || g.client === client);
+  }
+
+  /**
+   * Its client guards as nest-proxy gets them (`client:<name>`): its own layer's, then each attached
+   * agent's in agent order, each distinct guard once. Never deduplicated by name: two guards under one
+   * name both refuse. `own`/`agent`: a layer or an agent's guards as they would be (what a write checks).
+   */
+  clientGuards(own?: readonly ClientGuard[], agent?: { id: string; guards: readonly HeldGuard[] }): RequestGuard[] {
+    const info = this.tryInfo();
+    if (!info) return [];
+    // Only agents attached now, as for client bindings (and the agent being attached).
+    const attached = new Set([...info.attached, ...(agent ? [agent.id] : [])]);
+    const agents: Record<string, readonly HeldGuard[]> = { ...(this.get<Record<string, HeldGuard[]>>(AGENT_GUARDS) ?? {}) };
+    if (agent) agents[agent.id] = this.countedGuards(agent.guards);
+    const all = [...(own ?? this.get<ClientGuard[]>(OWN_GUARDS) ?? []), ...Object.keys(agents).filter((a) => attached.has(a)).sort().flatMap((a) => agents[a]!)];
+    return distinctGuards(all.map(wireGuard));
+  }
+
+  /**
+   * Refuse (409) client guards while any sandbox host of its cell runs a nest-proxy that doesn't bound
+   * guarded requests (the previous release decodes per matcher, on targets of any length, on workers
+   * every sandbox on the host shares). Refused, never dropped: dropping a guard would fail open.
+   */
+  private async requireGuardBounds(cell: string): Promise<void> {
+    const old = await this.fleet(cell).hostsWithoutGuardBounds();
+    if (old.length) {
+      throw new NestError(ErrorCodes.CONFLICT, `request guards need every sandbox host of cell ${cell} to bound guarded requests; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
+    }
+  }
+
+  /** Refuse (400) a layer or an attach that would give the sandbox more client guards than it applies. */
+  private checkGuardLimit(own?: readonly ClientGuard[], agent?: { id: string; guards: readonly HeldGuard[] }): void {
+    const over = sandboxGuardsOverLimit(this.clientGuards(own, agent));
+    if (over) throw new NestError(ErrorCodes.INVALID_MESSAGE, over);
   }
 
   // --- client egress rules (docs/control-plane/api/clients/#egress) ------------------------------------
@@ -1738,12 +1945,26 @@ export class SandboxDO extends DurableObject<Env> {
    * reuses one minted without it, nor the other way round), and the attached agents' slots get the new
    * environment. Answers the effective policy.
    */
-  async setClientLayer(layer: { egress: EgressRule[]; inject: HeldInjection[]; env: Record<string, string>; workflows: boolean }): Promise<EgressPolicy> {
+  async setClientLayer(layer: { egress: EgressRule[]; inject: HeldInjection[]; env: Record<string, string>; workflows: boolean; guards?: ClientGuard[] }): Promise<EgressPolicy> {
     const info = this.info_();
     if (lease.gone(info.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${info.state}`, 409);
+    // Absent (a caller of the previous release): none, as for every other part of the layer.
+    const guards = layer.guards ?? [];
+    // A write that adds no guard (each one already stored) goes through while a host of the cell can't
+    // bound guards, so an app rewriting its whole layer never has to drop them to change the rest;
+    // placement keeps a guarded sandbox off such hosts. One that adds a guard needs every host to bound it.
+    const adds = (stored: readonly ClientGuard[]) => guards.some((g) => !stored.some((s) => JSON.stringify(s) === JSON.stringify(g)));
+    const known = !adds(this.get<ClientGuard[]>(OWN_GUARDS) ?? []);
+    if (!known) await this.requireGuardBounds(info.cell);
     if (info.client) await this.readEgressCeiling();
     const now = this.info_();
     if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);
+    // Let through as adding none: still so in the step that writes (another write may have replaced them meanwhile).
+    if (known && adds(this.get<ClientGuard[]>(OWN_GUARDS) ?? [])) {
+      throw new NestError(ErrorCodes.CONFLICT, "the sandbox's guards changed while this layer was written: read the layer again and retry", 409);
+    }
+    this.checkGuardLimit(guards);
+    this.refuseGithubEnv(this.kernelGithub({ ownPush: layer.workflows }), layer.env, ...this.envs().slice(1));
     const put = (key: string, v: unknown, has: boolean) => (has ? this.put(key, v) : this.del(key));
     const envBefore = JSON.stringify(this.get(OWN_ENV) ?? {});
     put(OWN_EGRESS, layer.egress, layer.egress.length > 0);
@@ -1751,6 +1972,7 @@ export class SandboxDO extends DurableObject<Env> {
     put(OWN_INJECT, inject, inject.length > 0);
     put(OWN_ENV, layer.env, Object.keys(layer.env).length > 0);
     put(OWN_PUSH, { workflows: true }, layer.workflows);
+    put(OWN_GUARDS, guards, guards.length > 0);
     if (this.hasClientEgress() && now.client && !this.deadlines.has("egress_ceiling")) await this.deadlines.set("egress_ceiling", Date.now() + EGRESS_CEILING_REFRESH_MS);
     await this.policyChanged(true);
     if (JSON.stringify(layer.env) !== envBefore && now.attached.length) await this.issueAttachCommands(now.attached);
@@ -1758,11 +1980,11 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /** Its own client layer, as its create or `PUT …/client-policy` set it (never a secret: bindings name theirs). */
-  async clientLayer(): Promise<{ egress: { allow: EgressRule[] }; inject: HeldInjection[]; env: Record<string, string>; github_push: { workflows: boolean } }> {
+  async clientLayer(): Promise<{ egress: { allow: EgressRule[] }; inject: HeldInjection[]; env: Record<string, string>; github_push: { workflows: boolean }; guards: ClientGuard[] }> {
     this.info_();
     return {
       egress: { allow: this.get<EgressRule[]>(OWN_EGRESS) ?? [] }, inject: this.get<HeldInjection[]>(OWN_INJECT) ?? [], env: this.get<Record<string, string>>(OWN_ENV) ?? {},
-      github_push: { workflows: !!this.get<{ workflows: true }>(OWN_PUSH)?.workflows },
+      github_push: { workflows: !!this.get<{ workflows: true }>(OWN_PUSH)?.workflows }, guards: this.get<ClientGuard[]>(OWN_GUARDS) ?? [],
     };
   }
 
@@ -1805,14 +2027,47 @@ export class SandboxDO extends DurableObject<Env> {
     return { ...this.repoAccess(), workflows: this.pushWorkflows() };
   }
 
+  /**
+   * Whether nest injects a GitHub token of its own here (`githubEnvConflict`): the operator's layer (its
+   * repos, read-only repos, `github_push`, or a binding of its own under a GitHub binding's name), its own
+   * `github_push`, or an attached agent's repos or `github_push`. `layer` and `ownPush` stand in for what
+   * a write would store; `except`: an agent whose part a write replaces.
+   */
+  private kernelGithub(change: { layer?: SandboxPolicyLayer; ownPush?: boolean; except?: string } = {}): boolean {
+    const attached = new Set((this.tryInfo()?.attached ?? []).filter((a) => a !== change.except));
+    const agents = (key: string) => Object.entries(this.get<Record<string, unknown>>(key) ?? {})
+      .some(([a, v]) => a !== change.except && (!Array.isArray(v) || v.length > 0));
+    return layerGithub(change.layer ?? this.operatorLayer())
+      || (change.ownPush ?? !!this.get<{ workflows: true }>(OWN_PUSH)?.workflows)
+      || agents("agent_repos") || agents(AGENT_READ_REPOS)
+      || Object.keys(this.get<Record<string, true>>(AGENT_PUSH) ?? {}).some((a) => attached.has(a));
+  }
+
+  /** Its own env, then each attached agent's but `except`'s: what its slots are made from. */
+  private envs(except?: string): Record<string, string>[] {
+    const agents = this.get<Record<string, Record<string, string>>>(AGENT_ENV) ?? {};
+    const attached = (this.tryInfo()?.attached ?? []).filter((a) => a !== except);
+    return [this.get<Record<string, string>>(OWN_ENV) ?? {}, ...attached.map((a) => agents[a] ?? {})];
+  }
+
+  /** Refuse (400) a write that would leave a GitHub env name (`isGithubEnvName`) where nest injects its own GitHub token. */
+  private refuseGithubEnv(kernelGithub: boolean, ...envs: (Readonly<Record<string, string>> | undefined)[]): void {
+    const names = githubEnvConflict(kernelGithub, ...envs);
+    if (names.length) throw new NestError(ErrorCodes.INVALID_MESSAGE, githubEnvRefusal(names));
+  }
+
   /** Send `agent_attach` for these agents, each as the agent's one in flight. */
   private async issueAttachCommands(agents: string[]): Promise<void> {
     const info = this.info_();
     if (!info.host || !agents.length) return;
+    const github = this.kernelGithub();
     const bodies = agents.map((agent): CommandBody => {
       const cwd = info.attach_cwd[agent];
       // Its slot's environment: the sandbox's, then the agent's (a nestd of the previous release ignores it).
-      const env = slotEnv(this.get<Record<string, string>>(OWN_ENV) ?? {}, this.get<Record<string, Record<string, string>>>(AGENT_ENV)?.[agent]);
+      // Where nest injects its own GitHub token the GitHub names stay its own: every write here refuses
+      // them then, but a previous release (after a rollback) did not.
+      const env = Object.fromEntries(Object.entries(slotEnv(this.get<Record<string, string>>(OWN_ENV) ?? {}, this.get<Record<string, Record<string, string>>>(AGENT_ENV)?.[agent]))
+        .filter(([k]) => !github || !isGithubEnvName(k)));
       return { type: "agent_attach", sandbox: info.sandbox, epoch: info.epoch, agent, ...(cwd ? { cwd } : {}), ...(Object.keys(env).length ? { env } : {}) };
     });
     const cmds = await this.fleet(info.cell).issueCommands(info.host, bodies);

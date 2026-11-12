@@ -29,6 +29,20 @@ describe("projects", () => {
     expect(within(screen.getByRole("article", { name: "Widgets" })).queryByText("Being created")).toBeNull();
   });
 
+  it("a list that fails to refresh after a good read shows the count as unknown (\"?\"), not the old number", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Which key?" })];
+    const { queryClient } = renderApp("/projects", api);
+    expect(await screen.findByRole("link", { name: /1 thing needs you/ })).toBeInTheDocument();
+    api.fail(/^GET \/api\/projects$/, 502, "the Worker is unavailable");
+    await queryClient.refetchQueries({ queryKey: ["projects"], exact: true });
+    const badge = await screen.findByRole("link", { name: /Couldn't check what needs you/ });
+    expect(badge).toHaveTextContent(/^\?$/);
+    expect(screen.queryByRole("link", { name: /1 thing needs you/ })).toBeNull();
+    // Said once, calmly: these cards are the last good read.
+    expect(screen.getByText(/Couldn't refresh; showing what was read at \d/)).toBeInTheDocument();
+  });
+
   it("a project's \"needs you\" goes to its Board, where asks are answered; the project opens on its Manager", async () => {
     const api = new FakeApi();
     api.asks = [ask({ question: "Which key?" })];
@@ -36,6 +50,18 @@ describe("projects", () => {
     const badge = await screen.findByRole("link", { name: /1 thing needs you/ });
     expect(badge).toHaveAttribute("href", "/projects/prj_one/board");
     expect(screen.getByRole("link", { name: "Widgets" })).toHaveAttribute("href", "/projects/prj_one/manager");
+  });
+
+  it("nest unreadable for the asks: the count is unknown, said so, never shown as nothing", async () => {
+    const api = new FakeApi();
+    api.asksError = "nest 503";
+    renderApp("/projects", api);
+    const badge = await screen.findByRole("link", { name: /Couldn't check what needs you/ });
+    // "?", as on the sidebar; the sentence is its name and tooltip.
+    expect(badge).toHaveTextContent(/^\?$/);
+    expect(badge).toHaveAttribute("title", "Couldn't check what needs you");
+    expect(badge).toHaveAttribute("href", "/projects/prj_one/board");
+    expect(document.querySelector("[data-marker=needs-you]")).toBeNull();
   });
 
   it("creates one with its settings, refusing a malformed repo first, then opens it", async () => {

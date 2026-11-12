@@ -67,6 +67,8 @@ export const api = {
   retryChat: (id: string, seq: number) => call<{ seq: number; delivered: boolean; status: OutboxState }>("POST", `${prj(id)}/chat/${seq}/retry`),
   asks: (id: string) => call<Ask[]>("GET", `${prj(id)}/asks`),
   attention: (id: string) => call<Attention[]>("GET", `${prj(id)}/attention`),
+  /** The app's own items only (no asks: nothing read from nest), for the page while the asks load. */
+  attentionLocal: (id: string) => call<Attention[]>("GET", `${prj(id)}/attention?local=1`),
   openPrs: (id: string) => call<OpenPr[]>("GET", `${prj(id)}/prs/open`),
   attachPr: (id: string, task: string, b: AttachPrBody) => call<Task>("POST", `${tsk(id, task)}/prs`, b),
   detachPr: (id: string, task: string, pr: number) => call<Task>("DELETE", `${tsk(id, task)}/prs/${pr}`),

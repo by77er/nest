@@ -117,16 +117,42 @@ async function rereadBinding(env: Env, id: string, shownId?: number): Promise<Re
 /**
  * What waits on the owner, as "Needs you" lists it: ProjectDO's (asks, blocked tasks, secret requests, and
  * triage as one item), with the reviews held for approval (ReviewDO's) and the review backlog as one item,
- * oldest first. The projects list's `needs_you` is its length.
+ * oldest first. The projects list's `needs_you` counts the same items without reading this (one nest read for every project).
  */
 async function attentionOf(env: Env, pid: string): Promise<Result<{ kind: string; at_ms: number }[]>> {
   const a = (await project(env, pid).attention()) as Result<{ kind: string; at_ms: number }[]>;
   if (!a.ok) return a;
+  return { ok: true, value: [...a.value, ...(await reviewItems(env, pid))].sort((x, y) => x.at_ms - y.at_ms) };
+}
+
+/** ReviewDO's items in "Needs you": the reviews held for approval, and the review backlog as one item. */
+async function reviewItems(env: Env, pid: string): Promise<{ kind: string; at_ms: number }[]> {
   const held = (await review(env, pid).held()).map((j) => ({ kind: "review" as const, pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
   // PRs past every cap, with no job yet: one item, their count.
   const skipped = await review(env, pid).skipped();
   const backlog = skipped.count ? [{ kind: "review_backlog" as const, count: skipped.count, at_ms: skipped.at_ms ?? Date.now() }] : [];
-  return { ok: true, value: [...a.value, ...held, ...backlog].sort((x, y) => x.at_ms - y.at_ms) };
+  return [...held, ...backlog];
+}
+
+/**
+ * The open asks of the app's agents counted per project (README.md#asks), from one read of nest for every
+ * project (`GET /v1/asks` over all the app's live agents): only agents the app made itself, by their
+ * `project` label, as each project's "Needs you" counts them. Null when nest can't be read: unknown.
+ */
+async function askCounts(env: Env): Promise<Map<string, number> | null> {
+  const nest = nestFrom(env);
+  if (!nest) return null;
+  const me = clientIdOf(env.NEST_CLIENT_TOKEN);
+  try {
+    const counts = new Map<string, number>();
+    for (const a of await nest.openAsks({})) {
+      const p = a.labels.project;
+      if (a.owner === me && p) counts.set(p, (counts.get(p) ?? 0) + 1);
+    }
+    return counts;
+  } catch {
+    return null;
+  }
 }
 
 const ID = {
@@ -175,13 +201,18 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
   }
   if (parts[0] !== "projects") return err(404, "unknown route");
   if (parts.length === 1) {
-    // Each with `needs_you`: how many asks and blocked tasks wait on the owner (README.md#blocked).
+    // Each with `needs_you`: how many things wait on the owner (README.md#blocked), or null when nest couldn't
+    // be read for the agents' asks (README.md#asks).
     if (m === "GET") {
       const rows = await directory(env).projects();
-      // The count is the length of the list "Needs you" shows (`attentionOf`), so the two always agree.
+      // The count is the length of the list "Needs you" shows: the app's own items (`localAttention`, the
+      // reviews) and the project's asks, read once for every project.
+      const asks = rows.some((r) => r.state === "ready") ? await askCounts(env) : new Map<string, number>();
       return json({ projects: await Promise.all(rows.map(async (r) => {
-        const a = r.state === "ready" ? await attentionOf(env, r.id) : null;
-        return { ...r, needs_you: a?.ok ? a.value.length : 0 };
+        if (r.state !== "ready") return { ...r, needs_you: 0 };
+        const local = (await project(env, r.id).localAttention()) as Result<unknown[]>;
+        const own = (local.ok ? local.value.length : 0) + (await reviewItems(env, r.id)).length;
+        return { ...r, needs_you: asks === null ? null : own + (asks.get(r.id) ?? 0) };
       })) });
     }
     if (m !== "POST") return err(405, "GET or POST");
@@ -463,6 +494,11 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       // Sends again a message nest refused for good; one still being sent is left as it is (README.md#outboxes).
       return done(await p.retryChat(Number(rest[1])));
     case "GET attention": {
+      // `?local=1`: the app's own items only, without reading nest (the page shows them while the asks load).
+      if (url.searchParams.get("local") === "1") {
+        const l = (await p.localAttention()) as Result<{ kind: string; at_ms: number }[]>;
+        return l.ok ? json([...l.value, ...(await reviewItems(env, pid))].sort((x, y) => x.at_ms - y.at_ms)) : err(l.status, l.error);
+      }
       const a = await attentionOf(env, pid);
       return a.ok ? json(a.value) : err(a.status, a.error);
     }

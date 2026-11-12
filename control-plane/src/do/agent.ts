@@ -614,12 +614,13 @@ export class AgentDO extends DurableObject<Env> {
       if (cur.cell !== req.cell) {
         throw new NestError(ErrorCodes.INVALID_MESSAGE, `${req.sandbox} is in cell ${cur.cell}; the agent must be too`, 409);
       }
-      // Its client's bindings, push-token opt-ins and egress rules join the sandbox's while attached
-      // (docs/control-plane/api/clients/#injection, #egress).
+      // Its client's bindings, push-token opt-ins, egress rules and request guards join the sandbox's while
+      // attached (docs/control-plane/api/clients/#injection, #egress, #request-guards).
       await stub.attach(req.agent, undefined, req.spec.repos ?? [], req.spec.read_repos ?? [], {
         ...(req.spec.inject?.length ? { inject: req.spec.inject } : {}), ...(req.spec.github_push?.workflows ? { workflows: true } : {}),
         ...(req.spec.egress?.allow.length ? { egress: req.spec.egress.allow } : {}),
         ...(req.spec.env && Object.keys(req.spec.env).length ? { env: req.spec.env } : {}),
+        ...(req.spec.guards?.length ? { guards: req.spec.guards } : {}),
       });
       hands = { sandbox: req.sandbox };
     }

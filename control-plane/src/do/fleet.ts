@@ -1,6 +1,7 @@
 // FleetDO: one per cell. Host enrollment, the fleet WebSocket (docs/interfaces/control-host/fleet/),
 // leases and their expiry, STONITH, placement, and command delivery with exactly-one results.
 import { DurableObject } from "cloudflare:workers";
+import { CLIENT_GUARD_PREFIX } from "../lib/client-guards";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
@@ -10,7 +11,7 @@ import { canonicalSpki, certificateSpki, createRootCertificate, generateDevRoot,
 import { AwsKms, type Kms } from "../lib/kms";
 import { AwsEc2, CapacityError, isDead, QuotaError, type Ec2 } from "../lib/ec2";
 import { AwsSsm, type Ssm } from "../lib/ssm";
-import { DEFAULT_IMAGE } from "./sandbox";
+import { DEFAULT_IMAGE, type EgressBase, EgressBaseInput, SEED_EGRESS_BASE } from "./sandbox";
 import {
   CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
   tunnelPrefix, type CloudflareApi,
@@ -19,7 +20,7 @@ import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type
 import { brainHostNeeded, idleStep, maxBrains, NO_ROOM_BACKOFF_BRAIN_MAX_MS, NO_ROOM_BACKOFF_MAX_MS, noRoomBackoffMs, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
 import { deathPlan, expiryVerdict, hostStep, type DeathCause, type HostTransition } from "../lib/host-lifecycle";
 import type { InstanceIdentity } from "../lib/aws-identity";
-import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
+import { Deadlines, ReliableChannels, SerialQueue, withTimeout } from "../lib/reliable";
 import { issueHostToken } from "../lib/tokens";
 import { bytesToB64, errorBody, NestError, newId, sha256, hex, asNestError } from "../lib/util";
 import { reassignRetry } from "../lib/retry";
@@ -146,6 +147,8 @@ interface HostRow {
   wedged_ms: number | null;
   /** Its nestd keys brains by agent epoch (1), or is of the previous release (0). */
   brain_epochs: number;
+  /** Its nest-proxy bounds guarded requests (1: its last hello said so), or not yet known or of the previous release (0). */
+  guard_bounds: number;
   /** When a drain was asked for (null: none). The status says whether it is serving; this survives an expiry and a return. */
   drain_ms: number | null;
   [key: string]: SqlStorageValue;
@@ -278,6 +281,15 @@ const ALARM_FOLLOWUPS = "followups";
 /** The daily pass that deletes tunnels and records whose host is gone (docs/sandbox/gateway/). */
 const ALARM_TUNNEL_SWEEP = "tunnel_sweep";
 const TUNNEL_SWEEP_INTERVAL_MS = 24 * 3_600_000;
+/** The cell's base egress layer (`PUT /v1/admin/egress/base`), in `kv`; absent: the seed. */
+const EGRESS_BASE_KEY = "egress_base";
+/** Telling live sandboxes their base layer changed (`egress_base_notices`): its own deadline. */
+const ALARM_EGRESS_BASE = "egress_base";
+/** Sandboxes told per alarm run, each call bounded; the next run follows at once while more are due. */
+const EGRESS_BASE_BATCH = 50;
+const EGRESS_BASE_CALL_MS = 10_000;
+/** A sandbox that didn't answer is told again after 2 s, doubling, at most every 10 minutes, until it answers. */
+const egressBaseBackoff = (attempts: number) => Math.min(2_000 * 2 ** (attempts - 1), 10 * 60_000);
 /** How long a tunnel this cell created may go without a hosts row (an enrollment still in flight). */
 const TUNNEL_INTENT_GRACE_MS = 3_600_000;
 /** GC: one run a day; a pass deletes only within 12 h of its mark; unmarked objects go after 24 h. */
@@ -404,6 +416,9 @@ export class FleetDO extends DurableObject<Env> {
     // The host's nestd keys brains by agent epoch (its hello says so; nestd of the previous release
     // doesn't): preferred for new brains, and the only kind escalation ever wedges.
     addColumn(this.sql, "hosts", "brain_epochs", "INTEGER NOT NULL DEFAULT 0");
+    // Its nest-proxy bounds guarded requests (its hello says so; a host of the previous release, or one
+    // not yet heard from, doesn't): API clients' request guards are refused in a cell with any host without it.
+    addColumn(this.sql, "hosts", "guard_bounds", "INTEGER NOT NULL DEFAULT 0");
     // A drain is an intent, not a liveness: a host that expires and comes back returns to `draining`.
     addColumn(this.sql, "hosts", "drain_ms", "INTEGER");
     addColumn(this.sql, "leases", "state", "TEXT");
@@ -448,11 +463,17 @@ export class FleetDO extends DurableObject<Env> {
     // Suspended sandboxes leaving a host that is going away; SandboxDO is told, with retries.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS evictions (sandbox TEXT NOT NULL, host TEXT NOT NULL, epoch INTEGER NOT NULL,
       PRIMARY KEY (sandbox, host, epoch))`);
+    // Live sandboxes not yet told the base layer's latest version (`egressBaseChanged`): a row goes on
+    // that version's answer, so a newer write's row stays.
+    this.sql.exec(`CREATE TABLE IF NOT EXISTS egress_base_notices (sandbox TEXT PRIMARY KEY, version INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, due_ms INTEGER NOT NULL)`);
     this.rel = new ReliableChannels(this.sql);
     this.deadlines = new Deadlines(this.sql, ctx.storage);
     // Retention runs at least daily, whether or not the cell is busy or has tunnels.
     ctx.blockConcurrencyWhile(async () => {
       if (!this.deadlines.has(ALARM_PRUNE)) await this.deadlines.set(ALARM_PRUNE, Date.now() + PRUNE_DAILY_MS);
+      // Notices a previous release's alarm dropped (it has no `egress_base` handler) are picked up again.
+      if (!this.deadlines.has(ALARM_EGRESS_BASE)) await this.armEgressBase();
     });
   }
 
@@ -970,11 +991,11 @@ export class FleetDO extends DurableObject<Env> {
           || this.sql.exec("SELECT 1 FROM commands WHERE cmd = ? AND result IS NOT NULL", c.cmd as string).toArray().length === 0);
       }
       const slots = (m.commands as Record<string, unknown>[] | undefined ?? []).flatMap((c) => commandRefSlots(c));
-      const values = new Map<RefPurpose, Record<string, string | null>>();
+      const values = new Map<RefPurpose, Record<string, { value: string; expires_ms?: number | null } | null>>();
       for (const purpose of new Set(slots.map((s) => s.purpose))) {
         const refs = [...new Set(slots.filter((s) => s.purpose === purpose).map((s) => s.ref))];
         try {
-          values.set(purpose, await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs(refs, REF_PURPOSES[purpose]));
+          values.set(purpose, await this.resolveRefs(refs, purpose));
         } catch (e) {
           console.error(`FleetDO: resolving secret references for batch ${m.seq} failed; holding it and the rest, closing`, e);
           this.closeRetryable(ws, "resolving secret references failed; reconnect and resend");
@@ -984,17 +1005,35 @@ export class FleetDO extends DurableObject<Env> {
       // Superseded or closing (meanwhile, or by an earlier failure): its successor's hello resends.
       if (this.socketFor(host) !== ws) return;
       for (const s of slots) {
-        const value = values.get(s.purpose)?.[s.ref];
-        if (value === null || value === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
+        const got = values.get(s.purpose)?.[s.ref];
+        if (got === null || got === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
         // A missing injection secret goes out as no secret at all, never an empty one: nest-proxy then
         // refuses its binding's placeholder (`injection_unavailable`) instead of substituting "".
-        s.set(value ?? (s.purpose === "secrets_update" ? DROPPED_SECRET : ""));
+        s.set(got?.value ?? (s.purpose === "secrets_update" ? DROPPED_SECRET : ""));
+        // The expiry read with the value (absent from a BrokerDO of the previous release: the entry's stands).
+        if (got && got.expires_ms !== undefined) s.setExpiry?.(got.expires_ms);
       }
       for (const c of (m.commands as Record<string, unknown>[] | undefined) ?? []) {
         if (c.type === "secrets_update" && Array.isArray(c.secrets)) c.secrets = (c.secrets as { value?: unknown }[]).filter((x) => x.value !== DROPPED_SECRET);
       }
       this.send(ws, m as FleetToHost);
       ws.serializeAttachment({ host, helloed: true, sent: m.seq } satisfies Attachment);
+    }
+  }
+
+  /**
+   * One purpose's references resolved by BrokerDO, each value with its expiry as stored now. A BrokerDO
+   * still on the previous release (minutes of a deploy) lacks `resolveRefsExpiring`: its `resolveRefs`,
+   * whose entries keep the expiry the command already carries.
+   */
+  private async resolveRefs(refs: string[], purpose: RefPurpose): Promise<Record<string, { value: string; expires_ms?: number | null } | null>> {
+    const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
+    try {
+      return await broker.resolveRefsExpiring(refs, REF_PURPOSES[purpose]);
+    } catch (e) {
+      if (!/RPC receiver does not implement/.test(e instanceof Error ? e.message : String(e))) throw e;
+      const plain = await broker.resolveRefs(refs, REF_PURPOSES[purpose]);
+      return Object.fromEntries(Object.entries(plain).map(([k, v]) => [k, v === null ? null : { value: v }]));
     }
   }
 
@@ -1051,8 +1090,8 @@ export class FleetDO extends DurableObject<Env> {
     const orphans = stored === undefined ? undefined : parseOrphans(stored);
     // The host has processed every command up to `last_command_seq`; the socket starts there.
     if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
-    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ? WHERE host = ?",
-      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, att.host);
+    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ?, guard_bounds = ? WHERE host = ?",
+      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, hello.guard_bounds ? 1 : 0, att.host);
     this.setTunnelState(att.host, hello.tunnel ?? "none", prior);
     if (hello.cgroup_delegation_error) {
       console.error(`FleetDO: ${att.host} runs its VMMs outside its unit cgroup (delegation failed: ${hello.cgroup_delegation_error})`);
@@ -1675,10 +1714,13 @@ export class FleetDO extends DurableObject<Env> {
       console.error(`FleetDO: placing ${req.sandbox}, which its SandboxDO never registered; registering it now`);
       this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
     }
-    // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts.
+    // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts. A sandbox with API
+    // clients' request guards goes only to a host whose nest-proxy bounds them (`guard_bounds`): none
+    // free means no placement yet (SandboxDO retries), never one that would decide them unbounded.
     const need = req.resources;
     const cfg = this.cellConfig();
-    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: "wedged_ms IS NULL" })
+    const guarded = (req.policy.guards ?? []).some((g) => g.name.startsWith(CLIENT_GUARD_PREFIX));
+    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: guarded ? "wedged_ms IS NULL AND guard_bounds = 1" : "wedged_ms IS NULL" })
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
       .map((h) => {
         const capacity = h.capacity ? (JSON.parse(h.capacity) as Capacity) : null;
@@ -1887,6 +1929,7 @@ export class FleetDO extends DurableObject<Env> {
     await this.deadlines.runDue(Date.now(), async (key) => {
       if (key === ALARM_TICK) await this.tick();
       if (key === ALARM_FOLLOWUPS) await this.followupsDue();
+      if (key === ALARM_EGRESS_BASE) await this.tellEgressBase();
       if (key === ALARM_PRUNE) {
         await this.deadlines.set(ALARM_PRUNE, Date.now() + PRUNE_DAILY_MS);
         await this.armLifetimes();
@@ -2497,10 +2540,74 @@ export class FleetDO extends DurableObject<Env> {
     this.sql.exec("DELETE FROM reassignments WHERE sandbox = ?", sandbox);
   }
 
-  /** SandboxDO's `create`, before anything is written for the sandbox. A destroyed one stays destroyed. */
-  async registerSandbox(sandbox: string, meta?: RegistryMeta): Promise<void> {
+  /**
+   * SandboxDO's `create`, before anything is written for the sandbox. A destroyed one stays destroyed.
+   * Answers the cell's base egress layer, read in the step that registers it: a later write finds it
+   * registered and tells it.
+   */
+  async registerSandbox(sandbox: string, meta?: RegistryMeta): Promise<EgressBase> {
     this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", sandbox, Date.now());
     if (meta) this.sql.exec("UPDATE sandboxes SET client = ?, labels = ? WHERE sandbox = ?", meta.client, meta.labels ? JSON.stringify(meta.labels) : null, sandbox);
+    return this.storedEgressBase();
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // The base egress layer (docs/sandbox/networking/egress/policy/#base-layer): operator data, one per
+  // cell, seeded with the hosts nest had built in. A write reaches every live sandbox of the cell.
+  // -------------------------------------------------------------------------------------------
+
+  private storedEgressBase(): EgressBase {
+    return this.kvValue<EgressBase>(EGRESS_BASE_KEY) ?? SEED_EGRESS_BASE;
+  }
+
+  /** `GET /v1/admin/egress/base`: the layer, its version (0: the seed) and how many live sandboxes haven't taken it yet. */
+  async egressBase(): Promise<EgressBase & { pending: number }> {
+    const pending = this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM egress_base_notices").one().n;
+    return { ...this.storedEgressBase(), pending };
+  }
+
+  /**
+   * `PUT /v1/admin/egress/base`: replace the layer (checked again here with the operator layer's schemas)
+   * as the next version, and queue a notice for every live sandbox in the registry, in the same step; the
+   * alarm tells them (`tellEgressBase`).
+   */
+  async setEgressBase(input: unknown): Promise<EgressBase & { pending: number }> {
+    const parsed = EgressBaseInput.safeParse(input);
+    if (!parsed.success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `egress base: ${parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ")}`);
+    const base: EgressBase = { version: this.storedEgressBase().version + 1, allow: parsed.data.allow, guards: parsed.data.guards };
+    this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", EGRESS_BASE_KEY, JSON.stringify(base));
+    this.sql.exec(`INSERT INTO egress_base_notices (sandbox, version, attempts, due_ms)
+      SELECT sandbox, ?, 0, ? FROM sandboxes WHERE destroyed_ms IS NULL
+      ON CONFLICT(sandbox) DO UPDATE SET version = excluded.version, attempts = 0, due_ms = excluded.due_ms`, base.version, Date.now());
+    await this.armEgressBase();
+    return this.egressBase();
+  }
+
+  /** Arm the notices' deadline for the earliest one due; none: nothing to arm. */
+  private async armEgressBase(): Promise<void> {
+    const next = this.sql.exec<{ at: number | null }>("SELECT MIN(due_ms) AS at FROM egress_base_notices").one().at;
+    if (next !== null) await this.deadlines.set(ALARM_EGRESS_BASE, next);
+  }
+
+  /**
+   * Tell up to `EGRESS_BASE_BATCH` due sandboxes the current layer, each call bounded. A row goes on its
+   * own version's answer; a failure backs off. A sandbox destroyed meanwhile answers too (it ignores it).
+   */
+  private async tellEgressBase(): Promise<void> {
+    const due = this.sql.exec<{ sandbox: string; version: number; attempts: number }>(
+      "SELECT sandbox, version, attempts FROM egress_base_notices WHERE due_ms <= ? ORDER BY due_ms LIMIT ?", Date.now(), EGRESS_BASE_BATCH).toArray();
+    const base = this.storedEgressBase();
+    await mapBounded(due, EGRESS_BASE_BATCH, async (n) => {
+      try {
+        await withTimeout(this.sandbox(n.sandbox).egressBaseChanged(base), EGRESS_BASE_CALL_MS, `sandbox ${n.sandbox}'s egress base`);
+        this.sql.exec("DELETE FROM egress_base_notices WHERE sandbox = ? AND version <= ?", n.sandbox, base.version);
+      } catch (e) {
+        console.warn(`FleetDO: telling ${n.sandbox} its egress base failed; retrying`, e);
+        this.sql.exec("UPDATE egress_base_notices SET attempts = attempts + 1, due_ms = ? WHERE sandbox = ? AND version = ?",
+          Date.now() + egressBaseBackoff(n.attempts + 1), n.sandbox, n.version);
+      }
+    });
+    await this.armEgressBase();
   }
 
   /** Operator: register sandboxes created before the registry existed, so GC keeps their data. */
@@ -3082,6 +3189,15 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /** Host rows matching typed filters (and an optional extra SQL condition), their enums checked. */
+  /**
+   * The cell's sandbox hosts that could hold a sandbox (any not dead) whose nest-proxy isn't known to
+   * bound guarded requests: of the previous release, or not heard from since enrolling. SandboxDO
+   * refuses API clients' request guards while there is one (docs/control-plane/api/clients/#request-guards).
+   */
+  async hostsWithoutGuardBounds(): Promise<string[]> {
+    return this.hostsBy({ role: SANDBOX_ROLE, status: ["active", "draining", "expired", "stonith_pending"], where: "guard_bounds = 0" }).map((h) => h.host);
+  }
+
   private hostsBy(
     f: { status?: HostStatus | readonly HostStatus[]; role?: HostKind; where?: string; order?: "role" | "enrolled_ms" }, ...args: SqlStorageValue[]
   ): HostRow[] {

@@ -74,7 +74,7 @@ export function TaskBlock({ projectId, lines }: { projectId: string; lines: stri
   const asks = useAsks(projectId).data ?? [];
   const jobs = useReviews(projectId).data ?? [];
   const repo = useProject(projectId).data?.repo ?? "";
-  const asksOf = (id: string) => asks.filter((a) => a.answered_ms === null && a.task === id).length;
+  const asksOf = (id: string) => asks.filter((a) => a.task === id).length;
   return (
     <TaskCards>
       {lines.map((line, i) => {

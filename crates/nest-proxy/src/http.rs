@@ -424,12 +424,26 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, req: Req
     }
     // Request guards (docs/sandbox/networking/egress/policy/#request-guards): generic rules, after
     // injection (a guard can ask whether a binding was substituted) and before anything goes upstream.
-    if !policy.guards.is_empty() {
+    // Only a host some guard names is decided, within bounds: its target is decoded once, and one past
+    // them is refused rather than decided (deciding costs time in its length per matcher).
+    if policy.guards.iter().any(|g| guard::covers(g, &target.host)) {
         let (method, path, query) = (req.method().as_str().to_owned(), uri.path().to_owned(), uri.query().map(str::to_owned));
         let greq = guard::Req { host: &target.host, method: &method, path: &path, query: query.as_deref(), injected: match &verdict {
             Verdict::Substituted(b) => Some(b.as_str()),
             _ => None,
         } };
+        let Ok(greq) = greq.prepare() else {
+            let mut a = mk_audit(&req, EgressVerdict::Deny).reason("guard_target_too_long");
+            a.binding = verdict.binding().map(str::to_string);
+            ctx.audit(a);
+            return deny_response(
+                StatusCode::URI_TOO_LONG,
+                "request_target_too_long",
+                &target.host,
+                target.port,
+                "this host's requests are checked by request guards, which decide paths of at most 4096 bytes and 256 segments and queries of at most 8192 bytes and 256 parameters",
+            );
+        };
         let json: Option<serde_json::Value>;
         let body_view = if guard::needs_body(&policy.guards, &greq) {
             let (parts, body) = req.into_parts();

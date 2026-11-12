@@ -189,7 +189,10 @@ export type Attention = ({ kind: "ask" } & Ask) | ({ kind: "blocked"; task: stri
   // (`count`) and the tasks routines proposed (`proposals`).
   | { kind: "triage"; count: number; proposals: number; at_ms: number }
   // The attach's default PR comments user, cleared because the repo's owner is another account now (README.md#pr-comments).
-  | ({ kind: "comments_cleared" } & CommentsCleared);
+  | ({ kind: "comments_cleared" } & CommentsCleared)
+  // nest couldn't be read for the agents' asks (README.md#asks): the rest is listed, and this says the asks
+  // are unknown. Not something waiting: never counted.
+  | { kind: "asks_unavailable"; error: string; at_ms: number };
 
 /** An issue of the repo in triage (README.md#triage): its title and body are anyone's, kept as data. */
 export interface Issue {
@@ -251,7 +254,10 @@ export interface ChatMessage {
   error: string | null;
 }
 
-/** An agent's ask (nest's `agent.ask`), open until `answered_ms`. */
+/**
+ * An open ask of one of the project's agents, as nest holds it (README.md#asks): read from nest when asked,
+ * never kept here. Its role and task are the agent's labels.
+ */
 export interface Ask {
   ask: string;
   agent: string;
@@ -261,7 +267,6 @@ export interface Ask {
   /** nest's `{name, tool}` for a held sink call; null for a plain question. */
   approval: unknown;
   at_ms: number;
-  answered_ms: number | null;
   /** A manager's ask from one that isn't the project's manager any more (README.md#the-manager-lifecycle): labelled so. */
   previous: boolean;
 }
@@ -622,6 +627,9 @@ export const MIGRATIONS = [
     "UPDATE settings SET comments_marked = 0",
   ],
 ] as const;
+
+/** The roles an ask's agent may carry in its labels (as the webhook routes them); any other reads as none. */
+const ASK_ROLES = new Set(["manager", "worker", "reviewer", "routine"]);
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
 const RECENT_WAITS = 10;
@@ -2340,14 +2348,30 @@ export class ProjectDO extends DurableObject<Env> {
     return ok(this.toTask(this.taskRow(id)!));
   }
 
-  /** What's waiting on the owner: open asks and blocked tasks, together, oldest first. */
+  /**
+   * What's waiting on the owner: open asks and the app's own items (`localAttention`), together, oldest
+   * first. nest not answering for the asks lists the rest with an `asks_unavailable` marker, never nothing.
+   */
   async attention(): Promise<Result<Attention[]>> {
+    const local = this.localAttention();
+    if (!local.ok) return local;
     const asks = await this.asks();
-    if (!asks.ok) return asks;
+    // Only an unknown project fails the list; nest unreadable (or not configured) leaves the rest, with the marker.
+    if (!asks.ok && asks.status === 404) return asks;
+    const open = asks.ok
+      ? asks.value.map((a): Attention => ({ kind: "ask", ...a }))
+      : [{ kind: "asks_unavailable", error: asks.error, at_ms: 0 } as Attention];
+    // Read again after the await: a block or request made meanwhile is listed too.
+    const now = this.localAttention();
+    return ok([...open, ...(now.ok ? now.value : local.value)].sort((a, b) => a.at_ms - b.at_ms));
+  }
+
+  /** The app's own items waiting on the owner, without nest: blocked tasks, secret requests, triage, a cleared default comments user. */
+  localAttention(): Result<Attention[]> {
+    if (!this.settings()) return fail(404, "unknown project");
     const blocked = this.sql.exec(`${TASK_SELECT} WHERE t.blocked_ms IS NOT NULL`).toArray().map((r): Attention => ({
       kind: "blocked", task: r.id as string, title: r.title as string, state: r.state as TaskState, ...blockedOf(r)!,
     }));
-    const open = asks.value.filter((a) => a.answered_ms === null).map((a): Attention => ({ kind: "ask", ...a }));
     const secrets = this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL").toArray().map((r): Attention => ({ kind: "secret", ...requestOf(r) }));
     const t = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(opened_ms) AS at FROM issues WHERE state = 'untriaged'").one();
     const pr = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(created_ms) AS at FROM proposals WHERE state = 'untriaged'").one();
@@ -2357,7 +2381,7 @@ export class ProjectDO extends DurableObject<Env> {
     const sr = this.settingsRow();
     const c = sr && (sr.comments_from_id === null || sr.comments_from_id === undefined) ? sr.comments_cleared : null;
     const cleared: Attention[] = typeof c === "string" ? [{ kind: "comments_cleared", ...(JSON.parse(c) as CommentsCleared) }] : [];
-    return ok([...open, ...blocked, ...secrets, ...triage, ...cleared].sort((a, b) => a.at_ms - b.at_ms));
+    return ok([...blocked, ...secrets, ...triage, ...cleared]);
   }
 
   // --- chat and approvals ----------------------------------------------------------------------------
@@ -2410,29 +2434,56 @@ export class ProjectDO extends DurableObject<Env> {
     return ok(this.chatStatus(seq));
   }
 
+  /**
+   * The open asks of the project's agents (README.md#asks), oldest first: nest's, read when asked
+   * (`GET /v1/asks` by the `project` label), so one answered anywhere or whose agent ended is simply gone.
+   * Only agents the app made itself count (owner and client both the app, as the webhook routes events):
+   * an agent one of its agents spawned could carry any labels. Role and task are its labels.
+   */
   async asks(): Promise<Result<Ask[]>> {
-    if (!this.settings()) return fail(404, "unknown project");
-    const manager = this.settings()!.manager;
-    return ok(this.sql.exec("SELECT * FROM asks ORDER BY at_ms").toArray().map((r) => ({
-      ask: r.ask as string, agent: r.agent as string, role: (r.role as string | null) ?? null, task: (r.task as string | null) ?? null,
-      question: (r.question as string | null) ?? null, approval: r.approval ? JSON.parse(r.approval as string) : null,
-      at_ms: r.at_ms as number, answered_ms: (r.answered_ms as number | null) ?? null,
-      previous: r.role === "manager" && r.agent !== manager,
-    })));
-  }
-
-  async answerAsk(ask: string, answer: string): Promise<Result<{ delivered: unknown }>> {
-    if (!this.settings()) return fail(404, "unknown project");
-    const r = this.sql.exec("SELECT agent, answered_ms FROM asks WHERE ask = ?", ask).toArray()[0];
-    if (!r) return fail(404, "unknown ask");
-    if (r.answered_ms !== null) return fail(409, "already answered");
+    const s = this.settings();
+    if (!s) return fail(404, "unknown project");
     const nest = nestFrom(this.env);
     if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
+    const me = clientIdOf(this.env.NEST_CLIENT_TOKEN);
+    let open;
     try {
-      const out = await nest.answerAsk(r.agent as string, ask, answer);
-      this.sql.exec("UPDATE asks SET answered_ms = ?, answer = ? WHERE ask = ?", Date.now(), answer, ask);
-      this.replyWaits(`answered ask ${ask}`);
-      await this.arm();
+      open = await nest.openAsks({ project: s.id });
+    } catch (e) {
+      return fail(502, `nest couldn't list the agents' asks: ${message(e)}`);
+    }
+    // The manager as it is now (an await passed): one that isn't the project's manager any more is labelled so.
+    const manager = this.settings()!.manager;
+    return ok(open.filter((a) => a.owner === me && a.labels.project === s.id).map((a): Ask => {
+      const role = ASK_ROLES.has(a.labels.role ?? "") ? a.labels.role! : null;
+      return {
+        ask: a.ask, agent: a.agent, role, task: a.labels.task ?? null, question: a.question ?? null, approval: a.approval ?? null,
+        at_ms: a.created_ms, previous: role === "manager" && a.agent !== manager,
+      };
+    }));
+  }
+
+  /**
+   * The owner answers an open ask: found among the project's (so an ask of another project's agent, or one
+   * no longer open, is refused), then answered in nest. A manager waiting for the owner's reply is woken only
+   * when the answer reached the ask, not when nest says it was answered already.
+   */
+  async answerAsk(ask: string, answer: string): Promise<Result<{ delivered: unknown }>> {
+    if (!this.settings()) return fail(404, "unknown project");
+    const nest = nestFrom(this.env);
+    if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
+    const open = await this.asks();
+    if (!open.ok) return open;
+    const a = open.value.find((x) => x.ask === ask);
+    if (!a) return fail(409, "this ask isn't open any more: it was answered, or its agent ended");
+    try {
+      const out = await nest.answerAsk(a.agent, ask, answer);
+      // Written for the release before, which reads this table (expand/contract, README.md#asks); never read here.
+      this.sql.exec("UPDATE asks SET answered_ms = COALESCE(answered_ms, ?), answer = COALESCE(answer, ?) WHERE ask = ?", Date.now(), answer, ask);
+      if (out.delivered !== "already_answered") {
+        this.replyWaits(`answered ask ${ask}`);
+        await this.arm();
+      }
       return ok(out);
     } catch (e) {
       return e instanceof NestError ? fail(e.status === 404 ? 404 : 502, e.message) : fail(502, String(e));
@@ -2472,6 +2523,9 @@ export class ProjectDO extends DurableObject<Env> {
         if (route.role === "worker") this.workerExited(e.agent, e.reason, e.text);
         this.sql.exec("DELETE FROM agent_secrets WHERE agent = ?", e.agent);
         break;
+      // An ask is nest's alone (README.md#asks): read from nest when "Needs you" is. Its row here is written
+      // and never read, for one release, so a rollback to the release before still lists asks raised meanwhile;
+      // a later release drops the write and the table.
       case "agent.ask":
         this.sql.exec(
           "INSERT OR IGNORE INTO asks (ask, agent, role, task, question, approval, at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",

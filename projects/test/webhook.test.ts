@@ -126,7 +126,7 @@ describe("routing nest's events", () => {
     const w = await projectWithWorker();
     await deliver({ id: eid(), type: "agent.ask", agent: w.worker, ask: "ask_abc123", question: "push?", approval: { name: "x", tool: "y" } });
     const asks = (await api(token, "GET", `/api/projects/${w.project}/asks`)).body;
-    expect(asks).toEqual([expect.objectContaining({ ask: "ask_abc123", agent: w.worker, role: "worker", task: w.task, question: "push?", answered_ms: null })]);
+    expect(asks).toEqual([expect.objectContaining({ ask: "ask_abc123", agent: w.worker, role: "worker", task: w.task, question: "push?", approval: { name: "x", tool: "y" } })]);
     const r = await api(token, "POST", `/api/projects/${w.project}/asks/ask_abc123/answer`, { answer: "yes" });
     expect(r.status).toBe(200);
     expect(fake.answers).toContainEqual({ agent: w.worker, ask: "ask_abc123", answer: "yes" });

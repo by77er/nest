@@ -2726,6 +2726,9 @@ fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
         assert_eq!(error_code(&p.fleet.result("cmd_again").await), Some(("stale_epoch".into(), false)));
         let hello = next_hello(&p.fleet, "cmd_poke").await;
         assert!(matches!(hello.sandboxes.as_slice(), [r] if r.sandbox == sbx && r.state == SandboxState::Fenced && !r.dirty), "the row stays fenced, now clean: {:?}", hello.sandboxes);
+        // What this release says of itself in every hello: the control plane gates on these.
+        assert!(hello.brain_epochs, "brain epochs");
+        assert!(hello.guard_bounds, "its nest-proxy bounds guarded requests");
         p.fleet.commands.send(vec![cmd("cmd_destroy", CommandBody::SandboxDestroy { sandbox: sbx.clone(), epoch: Epoch(1) })]).unwrap();
         assert!(is_ok(&p.fleet.result("cmd_destroy").await));
         assert_eq!(p.host.inner.fenced_epoch(&sbx), None, "a destroy at the fenced epoch prunes its tombstone");
