@@ -15,7 +15,7 @@ Boundary contracts between components. Each boundary has a spec here and Rust ty
 - **JSON, snake_case fields.** Message enums are internally tagged: `{"type": "snake_case_name", ...}`.
 - **IDs** are prefixed strings (`hst_`, `sbx_`, `agt_`, `gen_`, `ses_`, …: [models](control-host/models/)). Parsing checks the prefix on both sides.
 - **Absent, never null.** An unset optional field is left out; neither side sends `null` for it (Rust skips `None`, a test checks every field; TypeScript drops `undefined`). zod rejects `null` there; serde tolerates it.
-- **Open enums** for reasons that grow: `agent_exited.reason` and `egress_alert.reason` parse a member they don't know as `unknown`, so a new reason never rejects a message.
+- **Open enums** for reasons that grow: `agent_exited.reason`, `egress_alert.reason` and the gateway `error` frame's `reason` parse a member they don't know as `unknown`, so a new reason never rejects a message.
 - **Epoch** and **Seq** are u64. Timestamps are `*_ms` (Unix milliseconds).
 - **Binary data in JSON** is base64 (standard alphabet). Bulk byte streams use raw framed channels, never JSON.
 - **Errors:** `{code, message, retryable}`.
@@ -41,6 +41,7 @@ Each is dropped once every host and runner runs the release that made it optiona
 - **Session channel:** `hands_resolved` also carries the previous shape (`hands` / `error` / `retry_after_ms`), and `HandsTarget` unsigned `sandbox` / `epoch` copies; `HandsBinding.epoch` parses but isn't sent ([session](control-host/session/), [gateway](gateway/#resolve)). The runner's `tools_changed` hello flag is a capability, kept until every runner sends it. `hello_ack.rule_approvals` (2026-11-11) is AgentDO's capability: the runner sends `approval_check` only behind it, and the `escalation` event and AgentDO's plain-question handling of it stay for runners of the previous release and for a runner whose AgentDO was rolled back; both go once every runner checks approvals and no rollback reaches an AgentDO without the flag.
 - **Host kinds:** this release reads `sandbox | brain` as well as `burst | controller` in `hello`, enrollment and host tokens, and still writes `burst | controller`; the next writes `sandbox | brain` everywhere, and a sandbox host refuses `agent_start` ([deploy](../../dev/deploy.md#host-role-names-expandcontract)).
 - **Fleet hello `brain_epochs`:** a host without it never receives a brain ([fleet](control-host/fleet/#messages)).
+- **Fleet hello `guard_bounds`** (2026-11-12): a cell with a sandbox host without it refuses API clients' request guards ([request guards](../control-plane/api/clients/#request-guards)). The window ends when the last such host is replaced; the release after drops the gate.
 - **`EgressPolicy.guards`:** a proxy that predates it ignores the field (serde skips unknown fields), so pushes aren't guarded on that host. Not gated by a hello flag: an old proxy is today's behaviour, never a regression, and nestd and nest-proxy ship in one host image. The window closes when every sandbox host runs a nest-proxy with guards.
 
 ### Designed

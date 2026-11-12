@@ -1,6 +1,6 @@
 # Policy
 
-Policy is layered and pushed by SandboxDO through nestd to nest-proxy. Changes apply live, to open connections too.
+Policy is layered and pushed by SandboxDO through nestd to nest-proxy. Changes apply live: every request, on an open connection too, is decided against the current policy (closing open connections the policy now denies is designed, not built: [changes](#changes)).
 
 ```yaml
 base:        # image defaults
@@ -12,17 +12,18 @@ sandbox:     # the operator's (designed: also the sandbox's owner); forks inheri
   passthrough: []
   tcp: []      # e.g. ["db.example.com:5432"]
   repos: [by77er/nest]   # the push allowlist: the GitHub constructor turns it into guards, a binding, a token
+  read_repos: []         # repos it may only read
   guards: []   # request guards written by hand, layered with the constructed ones
 grants:
   allow: [{host: example.com, expires: 2h}]   # temporary
-limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
+limits: {max_connections: 256, bandwidth_mbps: 200, max_inspected_body_bytes: 512 MiB}   # fixed defaults; no layer sets them
 ```
 
-**Built:** the `sandbox` layer is the operator's (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), and its rules reach hosts tagged `layer: workstream`, the layer's wire name, which hosts parse as a closed enum ([pending contract changes](../../../../interfaces/README.md#pending-contract-changes)); grants are tagged `sandbox`. **API clients' rules** (built 2026-11-02, [egress](../../../../control-plane/api/clients/#egress)) join the same layer on the wire: allow rules only, within the client's grant's `egress_hosts`, from its templates (while their agents are attached), its sandbox specs and the sandbox's client layer. Allow rules only add, so the guards below and the hard deny apply to whatever they open, and no client rule allows what the operator's policy refuses.
+**Built:** the `sandbox` layer is the operator's (`POST /v1/sandboxes {policy}`, `PUT /v1/sandboxes/:id/policy`), and its rules reach hosts tagged `layer: workstream`, the layer's wire name, which hosts parse as a closed enum ([pending contract changes](../../../../interfaces/README.md#pending-contract-changes)); grants are tagged `sandbox`. **API clients' rules** (built 2026-11-02, [egress](../../../../control-plane/api/clients/#egress)) join the same layer on the wire: allow rules only, within the client's grant's `egress_hosts`, from its templates (while their agents are attached), its sandbox specs and the sandbox's client layer. Allow rules only add, so the guards below and the hard deny apply to whatever they open, and no client rule allows what the operator's policy refuses. **API clients' [request guards](#client-guards)** (built 2026-11-12) come from the same places and only refuse.
 
 ## Sources
 
-**Decided (2026-11-03):** the effective policy the API shows (`GET /v1/sandboxes/<id>/policy`, and the answers of `PUT …/policy` and `PUT …/client-policy`) marks each allow rule with its `source`. A reader no longer has to subtract one layer from another to tell them apart.
+**Decided (2026-11-03):** the effective policy the API shows (`GET /v1/sandboxes/<id>/policy`, and the answers of `PUT …/policy` and `PUT …/client-policy`) marks each allow rule with its `source`, so a reader needn't subtract one layer from another to tell them apart.
 
 | `source` | What it is |
 |---|---|
@@ -38,14 +39,14 @@ limits: {connections: 256, bandwidth_mbps: 200, max_inspected_body_mb: 512}
 
 ## Hard deny
 
-**Non-public addresses are refused before policy is consulted.** No allow rule, grant, TCP exception or IP-literal host can override this:
+**Non-public addresses are refused whatever the policy says:** the proxy checks every address it is about to dial. No allow rule, grant, TCP exception or IP-literal host can override this:
 - loopback, private, link-local (including IMDS `169.254.169.254` and the ECS credentials endpoint `169.254.170.2`), CGNAT, `192.0.0.0/24`, documentation, benchmarking, multicast, reserved and unspecified
 - unique-local IPv6 (including IPv6 IMDS `fd00:ec2::254`, [EC2 docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html)), link-local and site-local IPv6, Teredo, discard-only
 - IPv6 forms that embed an IPv4 address (NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, IPv4-compatible `::a.b.c.d`, IPv4-mapped) are judged by the embedded address; local-use NAT64 `64:ff9b:1::/48` is always refused.
 
-It applies to every upstream connect (inspect, passthrough, TCP exceptions) and to [DNS answers](../dns/). nest-proxy runs on the host, where IMDS and the instance role's credentials are reachable, so a kernel rule on the proxy's uid backs it up ([steering](../steering/#kernel-backstop)). nest's list is broader than SPACE's ([`PLATFORM_EGRESS_HARD_DENY_CIDRS`](https://github.com/perplexityai/space/blob/main/crates/libs/net/common/src/lib.rs)).
+It applies to every upstream connect (inspect, passthrough, TCP exceptions; `is_public` in `crates/nest-proxy/src/http.rs`). Filtering [DNS answers](../dns/) by it is designed, not built: the proxy's DNS answers an allowed name with whatever addresses it resolves to. nest-proxy runs on the host, where IMDS and the instance role's credentials are reachable, so a kernel rule on the proxy's uid is to back it up ([steering](../steering/#kernel-backstop)); designed, not built. nest's list is broader than SPACE's ([`PLATFORM_EGRESS_HARD_DENY_CIDRS`](https://github.com/perplexityai/space/blob/main/crates/libs/net/common/src/lib.rs)).
 
-**Test:** with `169.254.169.254` explicitly allowed (as a host, a grant and a TCP exception), and with an allowed name that resolves to it, every request still fails; on a real host it fails at the kernel rule too, with the proxy's own check disabled. SPACE has the same case ([08-guardrails.toml](https://github.com/perplexityai/space/blob/main/scripts/netgtw/traffic/cases/08-guardrails.toml)).
+**Test** (designed; built: the `is_public` unit test and `private_upstream_addresses_are_refused` in `tests/egress.rs`, an allowed name resolving to loopback): with `169.254.169.254` explicitly allowed (as a host, a grant and a TCP exception), and with an allowed name that resolves to it, every request still fails; on a real host it fails at the kernel rule too, with the proxy's own check disabled. SPACE has the same case ([08-guardrails.toml](https://github.com/perplexityai/space/blob/main/scripts/netgtw/traffic/cases/08-guardrails.toml)).
 
 ## Changes
 
@@ -57,7 +58,7 @@ It applies to every upstream connect (inspect, passthrough, TCP exceptions) and 
   - TCP exceptions whose rule is gone
 - **The DNS record is pruned** to names the new policy still allows ([dns](../dns/)). Designed, not built.
 - **A final check runs just before request headers go upstream** ([inspection](../inspection/)). Designed, not built.
-- **While a policy loads** (listeners installed, no acknowledged policy), new connections are held for up to 30 s, then denied with `policy_pending`. SPACE holds them for 31 s, its 30 s policy-load deadline plus 1 s ([state.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/state.rs)).
+- **While a policy loads** (listeners installed, no acknowledged policy), new connections are held for up to 30 s, then denied with `policy_pending`. Designed, not built. Today a sandbox without a policy has a connection limit of 0, so its connections are refused at once (`connection_limit`) and its DNS queries get REFUSED. SPACE holds them for 31 s, its 30 s policy-load deadline plus 1 s ([state.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/state.rs)).
 
 Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/state/egress.rs) (`reconcile_policy`) and [egress/tcp.rs](https://github.com/perplexityai/space/blob/main/crates/libs/net/gateway/server/src/egress/tcp.rs) (`revalidate_tcp`).
 
@@ -68,7 +69,7 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 - **Inspected hosts can carry method and path rules** (e.g. `GET` only, or `/repos/me/*`), since the proxy already decrypts them. Vercel's sandbox firewall offers the same matchers ([docs](https://vercel.com/docs/vercel-sandbox/concepts/firewall)); its plain allow rules match SNI only, while nest-proxy also requires Host to equal SNI.
 - **Passthrough is SNI-only.** The proxy can't see `Host` inside a spliced connection, so a passthrough host on a shared CDN allows fronting to anything on that CDN that accepts a `Host` different from the SNI. Use it only for pinned clients that need it.
 - **TCP exceptions** each get their own listener port. The proxy connects only to IPs its own resolver returned for that host, and passes the bytes through uninspected. There's no raw ssh by default.
-- **Bandwidth** is shaped on the tap device. The other limits are enforced in the proxy, alongside the proxy-wide fairness bounds ([tls](../tls/#shared-proxy-fairness), [inspection](../inspection/)).
+- **Bandwidth** is to be shaped on the tap device (designed, not built: nothing reads `bandwidth_mbps`). The other limits are enforced in the proxy (`max_connections` per sandbox, `max_inspected_body_bytes` per request body), alongside the proxy-wide fairness bounds ([tls](../tls/#shared-proxy-fairness), [inspection](../inspection/)).
 
 **Policy is per sandbox:** forks inherit it, and an owner updates each of its sandboxes itself. There are no shared policy objects: the blast radius of an edit is one sandbox, and a loop over sandboxes is the agent's job.
 
@@ -91,9 +92,25 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 - **Every guard must let a request through.** Guards only take away, so layers compose by intersection and no layer can undo another's guard.
 - **Scopes err towards refusing; exceptions towards not matching.** A scope matches the path as sent *or* decoded and normalized (percent-decoding up to three rounds, `\` as `/`, `;params` cut, empty and dot segments applied), and query names and values decoded. An exception matches only a clean path as sent ([injection](../injection/#scope)'s safe-path rules, plus no segment that decodes to a dot segment), compared as sent, so an encoded or `;`-suffixed name never equals a literal. A body the proxy can't read (encoded, over 64 KiB, slower than 30 s, not JSON, or the field missing) is in a `body_json` scope and never a `body_json` exception. The body is read only when a matcher on the request's host needs it, then replayed to the upstream whole.
 - **A guarded host is always inspected:** never spliced (a passthrough entry for it is ignored) and never a TCP exception, so no layer can route around a guard.
+- **Bounded per request (built 2026-11-12):** guards run on the proxy's workers, which every sandbox on the host shares. So a request to a guarded host is decoded and normalized once, not per matcher (`Req::prepare`), and one whose path is over 4096 bytes or 256 segments (as sent or normalized) or whose query is over 8192 bytes or 256 parameters is refused, not decided (414 `request_target_too_long`, audited `guard_target_too_long`). A pattern with one `**` tries only the split its tail fits (a tail without `**` matches exactly as many segments as it has), so each matcher costs time linear in the bounded target. The body pre-pass reads a body only for a guard whose scope can match the request whatever its body. `tests/guard_equivalence.rs` checks this decides exactly as the previous evaluator did, on 40,000 generated requests; unit tests pin that matching decodes nothing again and that one `**` tries one split.
+  - **Measured worst case** (`tests/guard_cost.rs`, release build, one request, the per-sandbox bounds on client guards below): **about 1 ms** (0.87 ms here; 0.80 ms in the review of 2026-11-12), 14 scope matchers of one query parameter with 16 values against 256 same-name pairs, every value a near miss, so every comparison runs to its end and none matches, ignoring case. Paths: 0.04 ms (64 scope matchers `/**/<literal>/<literal>/<literal>/b` against 255 near-matching segments). The previous evaluator, decoding per matcher on targets of any length, took about 0.2 s for one request at the longest URI hyper accepts (64 KiB; the review of 2026-11-12).
+  - **The bounds can refuse real requests:** percent-encoding triples a non-ASCII byte, so a `raw.githubusercontent.com` or contents-API path naming files with long non-ASCII names can pass 4096 bytes and get a 414.
+- **Who writes them:** the operator (its layer's `guards`), the rule constructors (below), and API clients for their own sandboxes ([client guards](#client-guards)). nest-proxy gets them all as one list: the constructed ones, the operator's, then the clients'.
 - **Decided (2026-11-01, the owner): rules are built by constructors that sit apart from the evaluator.** The proxy knows hosts, methods, paths, queries, one body field and bindings, never a service. What a service's rules mean is a constructor's: a pure function in the control plane (`control-plane/src/lib/rules/`) that turns an intent into generic guards, layered into the policy like any operator-written rule. **Why:** another git host or a registry's publish endpoint is a new constructor, with no change to the proxy; an operator can write the same rules by hand and get the same enforcement; and the evaluator is tested with made-up rules, the constructors from intent to rules, and one seam test through both ([testing](#tests)).
 
+### Client guards
+
+**Built (2026-11-12).** An API client writes request guards for its own sandboxes in the same shape, so an app expresses a service's rules (a push allowlist, a read-only API) as data, with no constructor in the kernel ([where and how](../../../../control-plane/api/clients/#request-guards)).
+- **They can only refuse.** nest-proxy refuses a request when any guard refuses it, and consults a guard's `allow` only for that guard's own scope (`refusing` in `guard.rs`). So a client's exception never exempts a request from the operator's guards, the constructed ones or another layer's: adding a client's guards to a policy never lets through a request the policy without them refused. Shown by `tests/client_guards.rs` on the fixture `egress_policy.client_guards.json`, which a vitest asserts the control plane produces.
+- **On the wire** a client's guard is an ordinary `RequestGuard` named `client:<name>`, after the operator's (a request both refuse names the operator's), and every `injected` in it names the client's own binding (`client:<binding>`). The operator's layer can't name a guard `client:…`. No host change.
+- **They never change routing the operator chose:** a guarded host is always inspected, never spliced and never a TCP exception, so a client's guard drops any host the operator marks passthrough or routes as a TCP exception (equal to, under or covering one). Otherwise the operator's splice or TCP exception would stop working, and an operator binding on a spliced host would become injectable.
+- **Bounded,** for nest-proxy's packet and its per-request work: at most one `**` in a path pattern and a few segments after it (nest-proxy tries every split of a path at a `**`), and per-list and per-sandbox bounds on guards, scope matchers and matcher work, exceptions with their query parameters, body fields and values included ([limits](../../../../control-plane/api/clients/#request-guards)). With the proxy's per-request bounds above, a sandbox's guards cost the shared proxy at most about a millisecond a request (measured above).
+- **Only where every host bounds them:** a cell with any sandbox host whose nest-proxy predates these bounds (its fleet hello lacks `guard_bounds`) refuses new client guards (409), never drops them, and a sandbox with client guards is placed only on a host that bounds them: with none free it waits, unplaced ([request guards](../../../../control-plane/api/clients/#request-guards)).
+- **Who else writes them:** guards in the operator's templates and spawn overrides are client guards too: named `client:<name>`, with `injected` naming the sandbox's client's binding (`client:<b>`), and applied in any sandbox.
+
 ## Repo allowlists
+
+**Moving out (decided 2026-11-12, not built):** repo allowlists, read-only repos and the [GitHub](#github) constructor leave the kernel; an app builds the same from its own secrets, bindings and request guards in a sandbox's client layer, and the base layer's allowlist becomes operator data ([principle 10](../../../../README.md#principles)). Until then these sections describe what runs.
 
 **Built.** A sandbox may push only to repos explicitly on its **push allowlist**, enforced by nest-proxy whatever credential a push carries, so a prompt-injected agent can't push to an attacker's repo with the attacker's own token.
 
@@ -144,7 +161,7 @@ The evaluator with made-up hosts (`guard.rs` unit tests, `tests/guards.rs` throu
   - when a new minute starts, a summary record (host `*`, reason `suppressed: …`) reports what was dropped
 
   Allowed traffic isn't aggregated; it's bounded by the connection limit.
-- **Reason values** in audit records include: `not_allowed`, `invalid_host`, `no_sni`, `not_tls`, `no_ca`, `dns_nxdomain`, `dns_non_public`, `connection_limit`, `handshake_limit`, `policy_pending`, `policy_changed`, `invalid_headers`, `host_mismatch` (plaintext), `host_sni_mismatch` and `duplicate_host` (inspected TLS, alert), `sni_mismatch` (CONNECT authority ≠ SNI, alert), `non_tls_tunnel`, `placeholder_wrong_host`, `injection_unavailable`, `injection_requires_tls`, `injection_out_of_scope`, `injection_upgrade`, `trace_with_credential`, `tcp_exception_not_in_policy`, `tcp_exception`, `upgraded`, `guard: <name>`, `suppressed: …`, plus `upstream: …` / `connect: …` / `resolve: …` errors. The wire list is in [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#audit-reason-values).
+- **Reason values** in audit records include: `not_allowed`, `invalid_host`, `no_sni`, `not_tls`, `no_ca`, `dns_nxdomain`, `connection_limit`, `host_mismatch` (plaintext), `host_sni_mismatch` and `duplicate_host` (inspected TLS, alert), `sni_mismatch` (CONNECT authority ≠ SNI, alert), `non_tls_tunnel`, `placeholder_wrong_host`, `injection_unavailable`, `injection_requires_tls`, `trace_with_credential`, `tcp_exception_not_in_policy`, `tcp_exception`, `upgraded`, `guard: <name>`, `guard_target_too_long`, `suppressed: …`, plus `upstream: …` / `connect: …` / `resolve: …` errors. Designed, not emitted yet: `dns_non_public`, `handshake_limit`, `policy_pending`, `policy_changed`, `invalid_headers`, `injection_out_of_scope`, `injection_upgrade`. The wire list is in [nestd-proxy](../../../../interfaces/host-internal/nestd-proxy/#audit-reason-values).
 
 ## Open questions
 
@@ -153,3 +170,4 @@ The evaluator with made-up hosts (`guard.rs` unit tests, `tests/guards.rs` throu
 - **GraphQL** writes rest on GitHub applying the installation token's repo scope to GraphQL mutations (unverified). Refusing mutations outright needs a GraphQL parser in the proxy.
 - **Ref-aware pushes:** the guards see a push's repo, never its refs or whether it's a fast-forward, so a sandbox that may push a repo may push or force-push every branch the repo doesn't protect. Apps whose agents force-push their own branches as routine (the projects app's workers rebase theirs: [PR upkeep](../../../../../projects/README.md#pr-upkeep)) rely on prompts to stay on them. A generic fix: a push allowlist naming refs (`owner/name:refs/heads/task/*`), checked against the ref updates in receive-pack's request, which the proxy would have to parse.
 - **LFS uploads** to an allowed repo: where GitHub's batch answer points them is unverified; if at `*.githubusercontent.com`, the content-host guard refuses them.
+- **The operator's guards** have no matcher-work bound (64 guards, any matchers), being trusted as the rest of the operator's policy is; whether to bound them too is open.

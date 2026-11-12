@@ -68,6 +68,7 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      and killed there, and this start (kept as the agent's intent, merged with any other start wanted meanwhile) runs
      once that brain's exit or its host's loss releases it
    - `POST /v1/agents/<id>/turns {text}` · `/inbox` · `/interrupt`
+   - `PUT /v1/agents/<id>/rules [ToolRule]` replaces an agent's rules until `DELETE /v1/agents/<id>/rules` clears them; otherwise an agent reads its capabilities' rules as they are now, after its spawner's narrowing, so a capability write reaches it ([rules](../docs/control-plane/durable-objects/agent/#rules))
    - `POST /v1/agents` and `POST /v1/sandboxes` take an `Idempotency-Key` header (`src/lib/idempotency.ts`): the same key and
      body within 24 h answer the first object (`Idempotent-Replayed: true`), another body 409 ([idempotency keys](../docs/control-plane/api/#idempotency-keys)).
      Only a cell's own routes read `?cell=` (the fleet, hosts, images, lifetimes, tunnels, GC, root CA, the operator's
@@ -78,8 +79,9 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
    - `GET /v1/agents/<id>/asks`: its calls held for the operator (sink approvals, tool rules in `ask` mode), oldest
      first, `{ask, question, created_ms, approval?: {name, tool}}`; `POST /v1/agents/<id>/asks/<ask>/answer {answer}`
      decides one, and the decision reaches the agent as an `ask_answer` turn
-   - `GET /v1/asks?label=k=v&limit=&cursor=`: the open asks of a page of live agents at once (20 each, `more`
-     names the rest), each with its agent, owner and labels, read from each AgentDO when asked ([open asks across agents](../docs/control-plane/api/#open-asks-across-agents))
+   - `GET /v1/asks?label=k=v&limit=&cursor=&include=input`: the open asks of a page of live agents at once (20 each, `more`
+     names the rest), each with its agent, owner and labels, read from each AgentDO when asked; held calls' inputs only
+     with `include=input`, at most 1 MiB a page (`input_left_out` names the rest) ([open asks across agents](../docs/control-plane/api/#open-asks-across-agents))
    - `POST /v1/sandboxes/<id>/grants {host, ttl_ms, ports?}`
    - `GET /v1/agents/<id>/transcript` (whole committed base) · `?since=<entry>&limit=<n>` (a page:
      `{lines, next_seq, more}`)
@@ -131,8 +133,8 @@ client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a G
 within `secrets {max_count, max_bytes}`; bindings naming them (`inject` in its templates, overrides and `POST /v1/sandboxes`,
 hosts within `inject_hosts`) are injected by nest-proxy; `github_push: {workflows: true}` (within `github_push`) adds
 `workflows: write` to a sandbox's push token. Egress rules within `egress_hosts` (`egress {allow: [{host, ports?}]}` in its templates, overrides and
-`POST /v1/sandboxes`), env (`env {NAME: value}`), and the live sandbox's client layer, `GET|PUT /v1/sandboxes/<id>/client-policy {egress?, inject?, env?}`
-(`src/lib/client-egress.ts`, `src/lib/sandbox-env.ts`). An agent's timers (`src/lib/timers.ts`): `GET /v1/agents/<id>/timers`, `DELETE /v1/agents/<id>/timers/<name>`.
+`POST /v1/sandboxes`), env (`env {NAME: value}`), request guards that only refuse (`guards [...]`, sent as `client:<name>`), and the live sandbox's client layer,
+`GET|PUT /v1/sandboxes/<id>/client-policy {egress?, inject?, env?, github_push?, guards?}` (`src/lib/client-egress.ts`, `src/lib/sandbox-env.ts`, `src/lib/client-guards.ts`). An agent's timers (`src/lib/timers.ts`): `GET /v1/agents/<id>/timers`, `DELETE /v1/agents/<id>/timers/<name>`.
 Its events (`src/lib/client-events.ts`): `PUT /v1/clients/self/webhook {url}` (https; answers the signing secret once);
 its agents and sandboxes hand them to ClientDO from their alarms, and ClientDO POSTs each, signed (`Nest-Signature`), with
 retries; `GET /v1/clients/self` (the client) and `GET /v1/admin/clients/<cli>` show `events {webhook, backlog, dropped, failures, last_error}`.

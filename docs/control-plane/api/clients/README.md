@@ -2,12 +2,14 @@
 
 **Decided (2026-11-02, the owner's):** external systems (an app with its own Worker and Durable Objects, such as a task board) use nest only through this interface. An app never gets the admin token, and nest gets nothing specific to any app. **An app that seems to need a special case in nest means this interface is wrong:** fix the interface, generically ([principle 9](../../../README.md#principles)).
 
-**Built (2026-11-02), all of it:** clients and grants (with [read-only repos](../../../sandbox/networking/egress/policy/#read-only-repos)), ownership and visibility, labels, the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`), [caller identity](#caller-identity-for-mcp-servers) (`control-plane/src/lib/identity.ts`), [events to the owner](#events-to-the-owner) (`control-plane/src/lib/client-events.ts`), the [live trace](#live-trace) (`control-plane/src/lib/trace.ts`), [GitHub tokens](#github-tokens), and `GET /v1/clients/self`. **Built (2026-11-02, later):** [secrets](#secrets), [injection](#injection) and [workflow files](#workflow-files).
+**Built (2026-11-02), all of it:** clients and grants (with [read-only repos](../../../sandbox/networking/egress/policy/#read-only-repos)), ownership and visibility, labels, the client's catalog ([ClientDO](../../durable-objects/client/), `control-plane/src/lib/clients.ts`), [caller identity](#caller-identity-for-mcp-servers) (`control-plane/src/lib/identity.ts`), [events to the owner](#events-to-the-owner) (`control-plane/src/lib/client-events.ts`), the [live trace](#live-trace) (`control-plane/src/lib/trace.ts`), [GitHub tokens](#github-tokens), and `GET /v1/clients/self`. **Built (2026-11-02, later):** [secrets](#secrets), [injection](#injection) and [workflow files](#workflow-files). **Built (2026-11-12):** [request guards](#request-guards).
+
+**Moving out (decided 2026-11-12, not built):** the GitHub parts of this interface (the grant's `repos`, `read_repos`, `github`, `repo_owners` and `github_push`, [owner-wide entries](#owner-wide-entries), [GitHub tokens](#github-tokens), `/grant/repos`, `github_app` and [workflow files](#workflow-files)) leave the kernel. An app does the same on generic primitives: its own GitHub App, its tokens as [secrets](#secrets) that expire and are pushed on write, and its own request guards ([principle 10](../../../README.md#principles)). Until then they describe what runs.
 
 **How the built parts read the grant** (each a choice the design left open):
 - **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. The model credential is checked again at each brain start against the grant as it is then, and a client's agent runs only on that credential: if it isn't stored (or has expired) the start is refused, never moved to the operator's default token ([BrokerDO](../../durable-objects/broker/), 2026-11-06). So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
 - **Brokered actions:** only GitHub actions scoped to repos in `repos` are within a grant. An http profile (a URL and a credential no field covers), a fork (it widens the push allowlist) and an unscoped GitHub action are refused.
-- **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's: a client's route that carries one refuses it (`policy` in `POST /v1/sandboxes`, `host` in `…/start`: 403), and their own routes (`PUT /v1/sandboxes/<id>/policy`, `PUT /v1/agents/<id>/rules`, `…/ports`) take only the admin token (401).
+- **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's: a client's route that carries one refuses it (`policy` in `POST /v1/sandboxes`, `host` in `…/start`: 403), and their own routes (`PUT /v1/sandboxes/<id>/policy`, `PUT|DELETE /v1/agents/<id>/rules`, `…/ports`) take only the admin token (401).
 - **Writes into a namespace are held to its client's grant, whoever writes them,** the operator included.
 - **An mcp capability's tools are named `<client>-<entry>_<tool>`** (tool names hold no `/`). A spec where two capabilities would give the same names is refused.
 - **Deleting a client is refused while anything in its subtree lives.** Then its token stops, and its namespace and record go. Its name is held for 15 minutes (the answer's `name_free_ms`), and the cleanup runs once more before the name is free, so a request that was in flight across the delete leaves nothing a later client of that name inherits ([names](../../durable-objects/client/)).
@@ -28,7 +30,7 @@
   - `github_push`: `{workflows}`, whether its specs may ask for [`workflows: write`](#workflow-files) on their sandboxes' push token. Default absent: no.
   - `egress_hosts`: the hosts its own [egress rules](#egress) may allow, named as `inject_hosts` are. Default none.
   - A grant stored before `secrets`, `inject_hosts`, `github_push` or `egress_hosts` reads as none of each.
-  - `max_agents`, `max_sandboxes`: live (not ended or destroyed) at once, across everything it owns.
+  - `max_agents`, `max_sandboxes`: live (not ended or destroyed) at once, across everything it owns. A create over one is refused with `429 at_capacity`, `retryable: true`, the message starting with the limit (`max_agents: …`): there is room once fewer than the maximum are live (more than one end, if the grant was lowered below the live count). A maximum of 0 is `403 forbidden`, as for anything else outside the grant.
 ### Owner-wide entries
 
 **Built 2026-11-10 (the owner approved the design):** `repos`, `read_repos` and `github.repos` may name `owner/*`, so a new repo of that account is in the grant without the operator adding it. Code: `inGrantList`, `ownerLookups` and `githubTokenOwners` in `control-plane/src/lib/clients.ts`; [BrokerDO](../../durable-objects/broker/)'s `githubAccountId`, `repoOwners` and owner-checked mint.
@@ -82,21 +84,21 @@ The checks:
 | `GET` | `/v1/asks` | Its own registry's live agents only, as for `GET /v1/agents` ([open asks across agents](../#open-asks-across-agents)). |
 | `GET` | `/v1/agents/<agent>/timers` | Subtree ([timers](#timers)). |
 | `DELETE` | `/v1/agents/<agent>/timers/<name>` | Subtree. |
-| `POST` | `/v1/sandboxes` | Within the grant (`cells`, `max_sandboxes`, `inject_hosts`, `egress_hosts`, `github_push`, its own secrets). `policy` is the operator's (403). |
+| `POST` | `/v1/sandboxes` | Within the grant (`cells`, `max_sandboxes`, `inject_hosts`, `egress_hosts`, `github_push`, its own secrets). `policy` is the operator's (403). `guards` need no grant, only the sandbox's bounds (400) ([request guards](#request-guards)). |
 | `GET` | `/v1/sandboxes` | Its own registry only, as for agents. |
 | `GET` | `/v1/sandboxes/<sandbox>` | Subtree. |
 | `DELETE` | `/v1/sandboxes/<sandbox>` | Subtree. Destroys it whatever is attached. |
 | `PUT` | `/v1/sandboxes/<sandbox>/lifetime` | Subtree. `idle_ttl_ms` is at least a minute, with no ceiling: `max_sandboxes` bounds what a client keeps. |
 | `GET` | `/v1/sandboxes/<sandbox>/policy` | Subtree. The effective policy, the operator's layer included: hosts, rules and bindings' placeholders, never a secret's value. |
 | `GET` | `/v1/sandboxes/<sandbox>/client-policy` | Subtree ([the client layer](#the-client-layer)). |
-| `PUT` | `/v1/sandboxes/<sandbox>/client-policy` | Subtree. Within its client's grant as it is now (`github_push.workflows` too). |
+| `PUT` | `/v1/sandboxes/<sandbox>/client-policy` | Subtree. Within its client's grant as it is now (`github_push.workflows` too). `guards` need no grant, only the sandbox's bounds (400). |
 | `GET` | `/v1/catalog` | The operator's entries and its own namespace's. |
 | `GET` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. |
 | `PUT` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. Within the grant, when written and again at spawn. Its `launch.model` and `launch.effort` are [plain tokens](../../durable-objects/catalog/) (400). |
 | `DELETE` | `/v1/catalog/templates/<ns>/<entry>` | Namespace. |
 | `GET` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. |
-| `PUT` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. Within the grant (`mcp_urls`, `credentials`, brokered actions). |
-| `DELETE` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. |
+| `PUT` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. Within the grant (`mcp_urls`, `credentials`, brokered actions). Its `rules` reach the live agents of its subtree that list it ([live rules](../../durable-objects/catalog/#live-rules)); a refused write reaches none. |
+| `DELETE` | `/v1/catalog/capabilities/<ns>/<entry>` | Namespace. The live agents that read its rules have none of them from then on. |
 | `GET` | `/v1/clients/self` | Self. |
 | `PUT` | `/v1/clients/self/webhook` | Self ([events](#events-to-the-owner)). |
 | `POST` | `/v1/clients/self/github-token` | Self. Within `github` ([GitHub tokens](#github-tokens)). |
@@ -140,6 +142,7 @@ POST /v1/agents
 ## The client's catalog
 
 - **A client writes templates and capabilities in its own namespace,** `<client-name>/<entry>` (`PUT /v1/catalog/templates/<client-name>/<entry>`, and the same for capabilities). It reads its own entries and the operator's; it never writes outside its namespace.
+- **Its capabilities' rules are read live** by the agents of its subtree, after their spawner's narrowing ([live rules](../../durable-objects/catalog/#live-rules)). Rules decide only whether a call the agent's spec already gives waits for an approval, which the client answers for its own subtree, so the grant doesn't limit them; an operator's agent spawned from the client's template outside the client's subtree keeps them as at spawn.
 - **Expansion applies the grant:** an mcp capability whose URL isn't in `mcp_urls`, a repo to push to outside `repos`, a repo to read outside `repos` and `read_repos`, or a credential outside `credentials` is refused when written and again at spawn. A client's `overrides.read_repos` narrows a template's read-only repos as `overrides.repos` narrows its allowlist, and may move a repo from the allowlist to the read list (less access), never back.
 
 ## Caller identity for MCP servers
@@ -216,13 +219,15 @@ POST /v1/agents
 
 **Decided (2026-11-02, the owner's):** credentials never enter a sandbox. What an agent sends itself gets its credential injected at the egress proxy ([injection](#injection)); what CI/CD needs is the owner's to populate (agents ask for it). So an app keeps its own credentials in nest, write-only, and names them in bindings.
 - **Routes,** with a client token only (the operator's has no `self`: 403):
-  - `PUT /v1/clients/self/secrets/<name> {"value": "…", "description"?: "…"}` stores or replaces one. Answers its metadata.
+  - `PUT /v1/clients/self/secrets/<name> {"value": "…", "description"?: "…", "expires_at"?: "…"}` stores or replaces one. Answers its metadata.
   - `DELETE /v1/clients/self/secrets/<name>`: 404 when there is none.
-  - `GET /v1/clients/self/secrets` answers `{"secrets": [{name, description, size, created_ms, updated_ms, last_injected_ms}]}`, by name. The operator reads the same with `GET /v1/admin/clients/<cli>/secrets`.
+  - `GET /v1/clients/self/secrets` answers `{"secrets": [{name, description, size, created_ms, updated_ms, last_injected_ms, expires_ms, sandboxes}]}`, by name. The operator reads the same with `GET /v1/admin/clients/<cli>/secrets`.
+- **Expiry** (built 2026-11-12): `expires_at` is an RFC 3339 time with an offset (GitHub's token `expires_at` as it comes); one already past is 400. From then on the value is never handed out, and each push carries it (`expires_ms`, read with the value when the push is sent), so nest-proxy refuses the placeholder at that moment (`injection_unavailable`), between pushes too. A write without it never expires, a replacement included: an app refreshing a short-lived token writes the new value and expiry together. An expired secret stays listed, with its `expires_ms`, and keeps its place in `max_count` until replaced or deleted.
+- **Pushed on write** (built 2026-11-12): a write or delete reaches every sandbox that asked for the secret at its last push (`sandboxes`, its binding's secret whether stored then or not) within seconds, through BrokerDO's [client secret pushes](../../durable-objects/broker/#client-secret-pushes). A destroyed sandbox stops counting at its destroy. The 15-minute push stays as the backstop.
 - **A name** is `[a-z][a-z0-9_-]{0,62}`. It lives under the client's id alone (BrokerDO's `client-secret:<cli>:<name>`), so no client can name another's secret, and nothing a client sends names an operator secret. The admin secrets route refuses the `client-secret:` prefix (403): the operator can't write one by name either.
 - **Values are write-only:** never answered, logged or audited. `size` is the value's UTF-8 bytes; `last_injected_ms` is when it was last handed to a sandbox's proxy (null before), not when a request used it.
 - **Within the grant:** at most `secrets.max_count` (a replacement takes no new place), each at most `secrets.max_bytes`; outside it, 403. Counted and written in one step of BrokerDO, so two writes can't both take the last place.
-- **Audited** (BrokerDO's [issuance audit](../../durable-objects/broker/#issuance-audit), never a value): `client_secret_put` (`client`, `secret`, `size`, `replaced`), `client_secret_deleted`, `client_secrets_deleted` (a client's delete), and every injection (below). A write's record is written in the background; an injection's is written before the reference is handed out.
+- **Audited** (BrokerDO's [issuance audit](../../durable-objects/broker/#issuance-audit), never a value): `client_secret_put` (`client`, `secret`, `size`, `replaced`, `expires_ms` when given), `client_secret_deleted`, `client_secrets_deleted` (a client's delete), and every injection (below). A write's record is written in the background; an injection's is written before the reference is handed out.
 - **Deleting the client** deletes its secrets.
 
 ## Injection
@@ -250,7 +255,7 @@ A client's bindings put its secrets into its own sandboxes' requests at nest-pro
   - The operator's layer can't name a binding `client:…` (400), and a binding under a name another binding already has is left out of the policy and pushed no secret, so no operator binding is ever handed a client's value. The operator can still reuse a client's placeholder (`nest-ph.<cli>.<name>.`) in a binding of its own, which nest-proxy checks first, and so deny that client's injection: an availability property, the operator's only, as the operator already controls the policy. The client's value is never handed to that binding (secrets are keyed by binding name).
   - In the policy (`GET /v1/sandboxes/<id>/policy`, the agent's `inject`), each binding is an ordinary binding named `client:<name>`, with its placeholder. A name declared twice keeps the first: the sandbox's own, else the earliest agent id's.
   - SandboxDO asks BrokerDO for references (`clientInjectionRefs`), which FleetDO resolves only in `secrets_update`. So the value reaches only nest-proxy's memory, for the binding's hosts only, and the egress audit names the binding (`binding: client:<name>`) like any injected request's. Each push is audited (`client_secret_injected`: `client`, `sandbox`, the bindings, secrets and hosts) before it goes.
-  - The sandbox pushes again every 15 minutes, so a replaced or deleted value, or a narrowed grant, reaches its proxy within that. A reference that resolves to nothing (a deleted secret) goes out as no secret at all, never an empty one, so nest-proxy refuses the placeholder.
+  - A written or deleted secret is pushed at once ([pushed on write](#secrets)). The sandbox also pushes again every 15 minutes, so a narrowed grant, or a write whose push failed, reaches its proxy within that. A reference that resolves to nothing (a deleted or expired secret) goes out as no secret at all, never an empty one, so nest-proxy refuses the placeholder.
 - **Reflection:** a host that echoes request headers back (a debugging endpoint, an error page quoting the request) shows the secret to the sandbox. nest-proxy masks the exact value, and the exact header, in a response it reads uncompressed; it doesn't see a compressed body (`content-encoding` other than identity) or a transformed echo (re-encoded, truncated, split across lines). Bind a secret only to hosts that don't reflect it.
 - **The egress policy still decides where a sandbox may connect:** a binding doesn't open a host. The operator's base or sandbox layer (or an approved `egress_policy` grant) must allow it.
 - **No host change:** on the wire a client's binding is an `InjectionBinding` like any other (`protocol/fixtures/control/egress_policy/egress_policy.client_inject.json`; nest-proxy's `tests/client_inject.rs`).
@@ -301,6 +306,50 @@ An agent with the [`timers`](../../../agents/capabilities/timers/) capability se
   - No host change.
 - **A binding opens no host:** an injection binding still needs a rule (the operator's, or one here) to reach its host.
 
+## Request guards
+
+**Decided (2026-11-12, the owner's plan to take service integrations out of the kernel):** a client writes request guards for its own sandboxes, so an app expresses a service's rules (a push allowlist, a read-only API, refused uploads) as data, in the generic shape nest-proxy already evaluates ([request guards](../../../sandbox/networking/egress/policy/#request-guards)), and nest needs no constructor of its own for that service.
+- **The shape** (`ClientGuard` in `control-plane/src/lib/client-guards.ts`), the operator's `RequestGuard`:
+
+  ```json
+  {"name": "push", "hosts": ["git.example.com"], "ignore_case": true,
+   "scope": [{"path": "/**/git-receive-pack"}, {"path": "/**/info/refs", "query": [{"name": "service", "values": ["git-receive-pack"]}]}],
+   "allow": [{"path": "/me/box/**"}, {"methods": ["POST"], "path": "/graphql", "injected": "gh"}],
+   "reason": "pushes only to me/box"}
+  ```
+
+  - On its `hosts`, a request a `scope` matcher covers is refused (403 `request_denied`, audited `guard: client:<name>`) unless an `allow` matcher covers it too. A matcher is `methods`, `methods_except`, `path`, `query`, `body_json` and `injected`, every field given must match, with the operator's semantics (scopes match a path however it's spelled; exceptions only a clean path as sent).
+  - `name`: `[a-z][a-z0-9_-]{0,47}`, unique in its list. `hosts`: 1-8, named as for [egress rules](#egress). `scope`: 1-8 matchers; `allow`: at most 64; `reason`: at most 300 characters.
+  - A `path` is at most 256 characters and 16 segments, starts with `/`, has no empty segment, whitespace, `?`, `#` or `\`, and at most one `**` with at most 4 segments after it (nest-proxy tries every split of a path at a `**`, so this keeps a scope's cost linear in a request's path). `query`: 1-4 parameters, each with at most 16 values. `body_json`: a pointer and 1-16 values. `methods` and `methods_except`: 1-8 each.
+  - `injected` is the name of one of the client's own [bindings](#injection) (as in its `inject`): on the wire `client:<name>`, so a guard can't name an operator's binding or another client's.
+  - Unknown fields are refused (400).
+- **Where** (lists of at most 16, each at most 16 KiB of JSON):
+  - `guards` in a **template**, joined to its agent's sandbox while attached.
+  - `overrides.guards` on **`POST /v1/agents`**, added to the template's: a spawn adds refusals and never drops one. The operator's overrides replace the template's.
+  - `guards` in **`POST /v1/sandboxes`**.
+  - The live sandbox's [client layer](#the-client-layer).
+
+  The operator's templates, overrides and sandboxes may set them too, as they may egress rules. Those are client guards as well: on the wire `client:<name>`, their `injected` naming the sandbox's client's binding (`client:<b>`), and applied in any sandbox (the operator's own guards go in a sandbox's `policy.guards`).
+- **No grant covers them:** a guard only takes away. **A sandbox applies** at most 32 client guards, 64 scope matchers, 512 matcher work (each matcher, scope or exception, counts 1; each query parameter 1 plus 1 per value, twice in a scope, which matches the query as sent and decoded; a body field 1 plus 1 per value) and 64 KiB of them, its own layer's and its attached agents', each distinct guard once. A create, a layer write or an agent's attach that would pass that is refused (400), and nothing is stored.
+- **An agent's guards count toward that budget** while it is attached, so agents spawned into a sandbox (an agent's `agent_spawn` sharing its own, or a spawn's `overrides.guards`) can fill it, after which the next attach or layer write that adds guards is refused. Keep a template's guards small where its agents share sandboxes.
+- **Only on hosts that bound them:** while any sandbox host of the sandbox's cell runs a nest-proxy of the previous release (its fleet hello lacks `guard_bounds`; one not heard from since enrolling, or expired and able to come back, counts too), a create, a layer write or an attach that brings client guards is refused (409 `conflict`; retry once the host is replaced). Refused, never dropped: a dropped guard fails open.
+  - **A layer write that adds no guard goes through:** each of its guards is already stored for the sandbox (a subset, compared exactly), so an app rewriting its whole layer can change env or egress without dropping its guards. If the stored guards change while such a write is in flight, it is refused (409) and is retried from a fresh read.
+  - Writes without guards, and templates (which apply only at attach), aren't affected.
+  - **Placement:** a sandbox whose policy carries a client guard is placed only on a host whose hello said `guard_bounds`. With none free it stays unplaced and SandboxDO retries (unavailable, never unbounded).
+- **nest-proxy bounds the request too:** on a host a guard names, a path over 4096 bytes or 256 segments or a query over 8192 bytes or 256 parameters is refused (414 `request_target_too_long`), whoever's guard names the host ([request guards](../../../sandbox/networking/egress/policy/#request-guards)). A client's guard on a host it uses with long URLs makes them fail there.
+- **They can only refuse.** nest-proxy refuses a request when any guard does, and a guard's `allow` applies only within its own scope, so a client's exception never exempts a request from the operator's guards, the GitHub rules or another layer's ([client guards](../../../sandbox/networking/egress/policy/#client-guards)).
+- **On the sandbox:**
+  - In the policy (`GET /v1/sandboxes/<id>/policy`, and what nest-proxy gets) each is an ordinary guard named `client:<name>`, after the operator's. The operator's layer can't name a guard `client:…` (400).
+  - An attached agent's guards count only when they are its sandbox's client's or the operator's (an operator template's, or the operator's overrides): another subtree's spec adds none, as for bindings. The spec shows whose each is (`client`: its client's id, or null).
+  - A guard drops any host the operator marks passthrough or routes as a TCP exception (equal to, under or covering one): a guarded host is always inspected, never spliced and never a TCP exception, so otherwise a client's guard would change how the operator routes it.
+- **No host change:** on the wire a client's guard is a `RequestGuard` like any other (`protocol/fixtures/control/egress_policy/egress_policy.client_guards.json`; nest-proxy's `tests/client_guards.rs`).
+- **Compatibility, and failing open on the previous release:** a control plane of the previous release (a rollback) handles `guards` two ways.
+  - **Refused (400, an unrecognized key):** `PUT …/client-policy` and a client's spawn overrides (`POST /v1/agents`).
+  - **Silently dropped, with a 2xx:** `POST /v1/sandboxes`, a template's write (`PUT /v1/catalog/templates/…`) and the operator's spawn overrides. The sandbox, template or agent is made without the guards, so their refusals don't apply.
+  - It also leaves stored guards out of each policy it pushes (it reads neither the sandbox's keys nor a spec's `guards`, and strips them from templates).
+
+  So an app that depends on a guard checks that it applies: `GET /v1/sandboxes/<id>/policy` shows each as `client:<name>`, and `GET …/client-policy` answers `guards` only on a control plane that has them. Send them only to one that does.
+
 ## Environment
 
 **Decided (2026-11-02):** a sandbox's processes get environment variables, so an agent's tools find `$CLOUDFLARE_API_TOKEN` (holding a placeholder) as they expect, and the brief doesn't have to carry it.
@@ -327,10 +376,10 @@ An agent with the [`timers`](../../../agents/capabilities/timers/) capability se
 
 ## The client layer
 
-A live sandbox's own egress rules, injection bindings, environment and push opt-in, in one place:
-- **`PUT /v1/sandboxes/<id>/client-policy {"egress"?: {"allow": […]}, "inject"?: […], "env"?: {…}, "github_push"?: {"workflows": bool}}`** (owner auth: the operator, or the API client of the sandbox's subtree) replaces the whole layer; a part left out is emptied (`github_push` left out is `workflows: false`). It is checked against the sandbox's client's grant as it is now (`egress_hosts`, `inject_hosts`, `github_push.workflows`, its own secrets only), whoever writes it.
+A live sandbox's own egress rules, injection bindings, environment, push opt-in and request guards, in one place:
+- **`PUT /v1/sandboxes/<id>/client-policy {"egress"?: {"allow": […]}, "inject"?: […], "env"?: {…}, "github_push"?: {"workflows": bool}, "guards"?: […]}`** (owner auth: the operator, or the API client of the sandbox's subtree) replaces the whole layer; a part left out is emptied (`github_push` left out is `workflows: false`; `guards` left out is none, so a client that sets guards sends them in every write). It is checked against the sandbox's client's grant as it is now (`egress_hosts`, `inject_hosts`, `github_push.workflows`, its own secrets only), whoever writes it, and its guards against the sandbox's [bounds](#request-guards).
 - **Compatibility:** a client of the previous release, which sends no `github_push`, turns off a create's `workflows` at its next layer write (the safe direction). One that sends it to a control plane of the previous release gets a 400 (an unrecognized key): read the layer first, and send `github_push` only when `GET` answers it.
 - **The operator's sandboxes** have no client: their layer takes egress and env, never bindings (400; the operator's go in `policy.inject`).
-- **It goes out through the usual path:** a new policy version, its secrets pushed first, and (for an env change) every attached agent's slot configured again. So a binding added live reaches the proxy, and one removed live goes.
-- **`GET /v1/sandboxes/<id>/client-policy`** answers the layer as set: rules, bindings (with their placeholders, never a secret), env and `github_push` (`{"workflows": bool}`: its create's or the last write's).
+- **It goes out through the usual path:** a new policy version, its secrets pushed first, and (for an env change) every attached agent's slot configured again. So a binding or guard added live reaches the proxy, and one removed live goes.
+- **`GET /v1/sandboxes/<id>/client-policy`** answers the layer as set: rules, bindings (with their placeholders, never a secret), env, `github_push` (`{"workflows": bool}`: its create's or the last write's) and `guards` (as written, without the `client:` prefix).
 - **It doesn't include** what the sandbox's attached agents' specs add, which comes and goes with them, nor the operator's layer (`/policy`, `GET` shows the effective result).

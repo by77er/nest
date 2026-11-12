@@ -12,6 +12,7 @@ import { canonicalRepos, narrowRepos, readOnlyRepos, Repos } from "./repos";
 import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
 import { GithubPush } from "./rules/github";
 import { ClientEgress, type EgressRule, narrowEgress } from "./client-egress";
+import { ClientGuards, type HeldGuard, holdGuards } from "./client-guards";
 import { SandboxEnv, unboundPlaceholders } from "./sandbox-env";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
@@ -86,6 +87,11 @@ export const Template = z.object({
    * literals, or placeholders of its own `inject` bindings.
    */
   env: SandboxEnv.optional(),
+  /**
+   * Request guards its agents' sandboxes get while they are attached (docs/control-plane/api/clients/#request-guards):
+   * they only refuse, so they need no grant.
+   */
+  guards: ClientGuards.optional(),
 });
 export type Template = z.output<typeof Template>;
 
@@ -112,6 +118,8 @@ export const OperatorOverrides = z.object({
   egress: ClientEgress.optional(),
   /** Set over the template's environment (a name in both takes this value). */
   env: SandboxEnv.optional(),
+  /** Replaces the template's request guards. */
+  guards: ClientGuards.optional(),
 });
 export type OperatorOverrides = z.output<typeof OperatorOverrides>;
 
@@ -146,6 +154,8 @@ export const SpawnerOverrides = z.strictObject({
   egress: ClientEgress.optional(),
   /** Set over the template's environment: values are literals or the spec's own placeholders, so this grants nothing. */
   env: SandboxEnv.optional(),
+  /** Request guards added to the template's (never replacing one): a guard only refuses, so this grants nothing. */
+  guards: ClientGuards.optional(),
 });
 export type SpawnerOverrides = z.output<typeof SpawnerOverrides>;
 
@@ -156,7 +166,19 @@ export interface AgentSpec {
   /** Platform tools, in registry order. */
   tools: string[];
   launch: LaunchConfig;
+  /**
+   * Its rules as last read (first match wins): what its runner's cache carries. With `rule_sources`
+   * (and no `rules_set`), derived from them; otherwise fixed (docs/control-plane/durable-objects/agent/#rules).
+   */
   rules: ToolRule[];
+  /**
+   * Where its rules come from, in order: rules of its own (a spawner's narrowing, or a capability outside
+   * its subtree's namespace, as it was at spawn) and the capabilities whose rules it reads as they are
+   * now. Absent: a spec from before them, whose `rules` stay as stored.
+   */
+  rule_sources?: RuleSource[];
+  /** The operator replaced its rules (a spawn's `overrides.rules`, `PUT /v1/agents/<id>/rules`): `rules` stay as set until cleared. */
+  rules_set?: true;
   credential: string;
   /** Its mcp capabilities' servers, in capability order; absent when it has none (as is every stored spec before them). */
   mcp?: McpGrant[];
@@ -180,6 +202,27 @@ export interface AgentSpec {
   egress?: { allow: EgressRule[] };
   /** Its processes' environment in its sandbox; absent when none. */
   env?: Record<string, string>;
+  /** Request guards its sandbox gets while it is attached, each with whose it is; absent when none (as in every spec before them). */
+  guards?: HeldGuard[];
+}
+
+/**
+ * One source of an agent's rules (docs/control-plane/durable-objects/agent/#rules): rules of its own,
+ * fixed, or a capability's, read as the capability is now.
+ */
+export type RuleSource = { rules: ToolRule[] } | { capability: string };
+
+/** The capabilities whose rules `sources` read as they are now, in order, each once. */
+export function liveCapabilities(sources: readonly RuleSource[]): string[] {
+  return [...new Set(sources.flatMap((s) => ("capability" in s ? [s.capability] : [])))];
+}
+
+/**
+ * An agent's rules from its sources, in order, each rule once (first occurrence kept): `current` holds
+ * each capability's rules as they are now; one absent or null (deleted) gives none.
+ */
+export function joinRules(sources: readonly RuleSource[], current: Readonly<Record<string, readonly ToolRule[] | null>>): ToolRule[] {
+  return dedupeRules(sources.flatMap((s) => ("rules" in s ? s.rules : Object.hasOwn(current, s.capability) ? current[s.capability] ?? [] : [])));
 }
 
 export interface Catalog {
@@ -286,6 +329,15 @@ export const SPAWNING_PROMPT_V5 = [
 export const WORKER_BUILTIN_TOOLS: readonly string[] = ["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"];
 
 /**
+ * The owner's decision (2026-11-11): the built-ins an agent launches, and the web, never ask. The seed's
+ * `nest` capability, which every seed template lists, allows each built-in a seed `worker` launches by exact
+ * name: {@link WORKER_BUILTIN_TOOLS}, and the first seed's `TodoWrite` and `WebSearch` (its `Task` is
+ * `subagents`'). No specifier: `WebFetch` alone matches every URL. One a template doesn't launch is inert.
+ */
+export const SEED_BUILTIN_RULES: readonly ToolRule[] = [...new Set([...WORKER_BUILTIN_TOOLS, "TodoWrite"])]
+  .map((pattern) => ({ pattern, decision: "allow" as const }));
+
+/**
  * Tools the registry no longer has: `delegate` (inspecting without hands is a pattern,
  * docs/orchestration/captains/), `spawn_agent` and `kill` (stubs, replaced by `agent_spawn` and
  * `agent_stop`). A stored capability or spec naming one is read without it.
@@ -305,12 +357,14 @@ export const MESSAGING_TOOLS_REMOVED: readonly string[] = [
 /**
  * The seed of an empty catalog (the current version). Beyond version 1 it adds the later steps'
  * capabilities, leaves out what they removed, and, for new catalogs only (a seed step never edits an
- * entry a catalog already holds): `management` without the {@link RETIRED_TOOLS}, `captain` with
- * `spawning`, and `worker` without `subagents` and with {@link WORKER_BUILTIN_TOOLS}.
+ * entry a catalog already holds, but for a seed prompt or rules still as the seed left them):
+ * `management` without the {@link RETIRED_TOOLS}, `captain` with `spawning`, `worker` without
+ * `subagents` and with {@link WORKER_BUILTIN_TOOLS}, and `nest` with {@link SEED_BUILTIN_RULES}.
  */
 export const SEED_CATALOG: Catalog = {
   capabilities: {
     ...Object.fromEntries(Object.entries(SEED_CATALOG_V1.capabilities).filter(([n]) => !MESSAGING_CAPABILITIES_REMOVED.includes(n))),
+    nest: { ...SEED_CATALOG_V1.capabilities.nest!, rules: [...SEED_CATALOG_V1.capabilities.nest!.rules, ...SEED_BUILTIN_RULES] },
     management: {
       ...SEED_CATALOG_V1.capabilities.management!,
       tools: SEED_CATALOG_V1.capabilities.management!.tools.filter((t) => !RETIRED_TOOLS.includes(t) && !MESSAGING_TOOLS_REMOVED.includes(t)),
@@ -366,12 +420,20 @@ export interface PromptRewrite {
   now: string;
 }
 
+/** A seed capability's rules a step replaces: only where the stored rules are still exactly `was` (an operator's edit stays). */
+export interface RulesRewrite {
+  capability: string;
+  was: readonly ToolRule[];
+  now: readonly ToolRule[];
+}
+
 export interface SeedStep {
   version: number;
   capabilities: Readonly<Record<string, Capability>>;
   templates: Readonly<Record<string, Template>>;
   removes?: Removes;
   prompts?: readonly PromptRewrite[];
+  rules?: readonly RulesRewrite[];
 }
 
 /**
@@ -399,6 +461,12 @@ export const SEED_STEPS: readonly SeedStep[] = [
   },
   { version: 8, capabilities: {}, templates: {}, removes: { capabilities: MESSAGING_CAPABILITIES_REMOVED, params: [], tools: MESSAGING_TOOLS_REMOVED } },
   { version: 9, capabilities: TIMER_CAPABILITIES, templates: {} },
+  // The built-ins a seed worker launches run without asking (`SEED_BUILTIN_RULES`), in catalogs whose
+  // `nest` is still the seed's.
+  {
+    version: 10, capabilities: {}, templates: {},
+    rules: [{ capability: "nest", was: SEED_CATALOG_V1.capabilities.nest!.rules, now: SEED_CATALOG.capabilities.nest!.rules }],
+  },
 ];
 export const SEED_VERSION = Math.max(1, ...SEED_STEPS.map((s) => s.version));
 
@@ -410,12 +478,13 @@ export const SEED_VERSION = Math.max(1, ...SEED_STEPS.map((s) => s.version));
  */
 export function seedMigration(have: { capabilities: readonly string[]; templates: readonly string[] }, from: number): {
   capabilities: Record<string, Capability>; templates: Record<string, Template>; version: number;
-  removes: { capabilities: string[]; params: string[]; tools: string[]; fields: string[] }; prompts: PromptRewrite[];
+  removes: { capabilities: string[]; params: string[]; tools: string[]; fields: string[] }; prompts: PromptRewrite[]; rules: RulesRewrite[];
 } {
   const capabilities: Record<string, Capability> = {};
   const templates: Record<string, Template> = {};
   const removes = { capabilities: [] as string[], params: [] as string[], tools: [] as string[], fields: [] as string[] };
   const prompts: PromptRewrite[] = [];
+  const rules: RulesRewrite[] = [];
   const add = (into: string[], items: readonly string[] | undefined) => {
     for (const x of items ?? []) if (!into.includes(x)) into.push(x);
   };
@@ -429,8 +498,9 @@ export function seedMigration(have: { capabilities: readonly string[]; templates
     add(removes.tools, step.removes?.tools);
     add(removes.fields, step.removes?.fields);
     prompts.push(...(step.prompts ?? []));
+    rules.push(...(step.rules ?? []));
   }
-  return { capabilities, templates, version: Math.max(from, SEED_VERSION), removes, prompts };
+  return { capabilities, templates, version: Math.max(from, SEED_VERSION), removes, prompts, rules };
 }
 
 /**
@@ -454,6 +524,19 @@ export function rewritePrompt(body: unknown, r: Pick<PromptRewrite, "was" | "now
   if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
   const c = body as Record<string, unknown>;
   return c.prompt === r.was ? { ...c, prompt: r.now } : null;
+}
+
+/**
+ * A stored capability's JSON with its rules replaced, if they are still exactly `r.was` (each rule's
+ * fields compared in canonical order); null otherwise.
+ */
+export function rewriteRules(body: unknown, r: Pick<RulesRewrite, "was" | "now">): Record<string, unknown> | null {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) return null;
+  const c = body as Record<string, unknown>;
+  const canon = (rules: unknown) => Array.isArray(rules)
+    ? JSON.stringify(rules.map((x) => (typeof x === "object" && x !== null ? Object.fromEntries(Object.entries(x).sort(([a], [b]) => a.localeCompare(b))) : x)))
+    : null;
+  return canon(c.rules) === canon(r.was) ? { ...c, rules: r.now.map((x) => ({ ...x })) } : null;
 }
 
 /**
@@ -583,10 +666,39 @@ function dedupeBy<T>(items: readonly T[], key: (t: T) => string): T[] {
 const dedupeRules = (rules: readonly ToolRule[]) => dedupeBy(rules, (r) => JSON.stringify([r.pattern, r.decision, r.reason ?? null]));
 
 /**
+ * Where a capability's rules come from for an agent in namespace `ns`'s subtree (null: the operator's):
+ * the operator's capabilities and its own namespace's are read as they are now; another namespace's (an
+ * operator's agent from a template naming a client's capability) is fixed as it is at spawn, since that
+ * client may not change what the operator's agent asks for.
+ */
+function ruleSource(name: string, cap: Capability, ns: string | null): RuleSource {
+  const own = name.includes("/") ? name.slice(0, name.indexOf("/")) : null;
+  return own === null || own === ns ? { capability: name } : { rules: cap.rules.map((r) => ({ ...r })) };
+}
+
+/**
+ * The rule sources template `name` gives an agent in namespace `ns`'s subtree, from the catalog as it is
+ * (`expandTemplate`'s, without the rest of the expansion).
+ */
+export function templateRuleSources(catalog: Catalog, name: string, ns: string | null): Result<RuleSource[]> {
+  if (!Object.hasOwn(catalog.templates, name)) return err(`unknown template ${name}`);
+  const out: RuleSource[] = [];
+  for (const c of catalog.templates[name]!.capabilities) {
+    if (!Object.hasOwn(catalog.capabilities, c)) return err(`template ${name}: unknown capability ${c}`);
+    out.push(ruleSource(c, catalog.capabilities[c]!, ns));
+  }
+  return ok(out);
+}
+
+/**
  * Template `name` expanded as it stands: no overrides, no hands check. `clients` maps a catalog namespace
  * to its client's id: an mcp capability in a mapped namespace is that client's (`McpGrant.client`).
+ * `ns`: the namespace of the client whose subtree the agent joins (null: the operator's), which decides
+ * which capabilities' rules it reads as they are now ({@link ruleSource}).
  */
-export function expandTemplate(catalog: Catalog, registry: readonly string[], name: string, clients: Readonly<Record<string, string>> = {}): Result<AgentSpec> {
+export function expandTemplate(
+  catalog: Catalog, registry: readonly string[], name: string, clients: Readonly<Record<string, string>> = {}, ns: string | null = null,
+): Result<AgentSpec> {
   if (!Object.hasOwn(catalog.templates, name)) return err(`unknown template ${name}`);
   const tpl = catalog.templates[name]!;
   const caps: Capability[] = [];
@@ -624,16 +736,26 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     if (!Object.hasOwn(clients, ns)) return err(`template ${name}: no client is named ${ns}`);
     inject = holdInjections(clients[ns]!, tpl.inject);
   }
+  // A template's guards are its namespace's client's (the operator's: null), which decides the sandboxes they count in.
+  let guards: HeldGuard[] = [];
+  if (tpl.guards?.length) {
+    const ns = name.includes("/") ? name.slice(0, name.indexOf("/")) : null;
+    if (ns !== null && !Object.hasOwn(clients, ns)) return err(`template ${name}: no client is named ${ns}`);
+    guards = holdGuards(ns === null ? null : clients[ns]!, tpl.guards);
+  }
   // Its model and effort become arguments of the brain's command: a template stored before the rule
   // (`launchProblem`) expands into no spec, so nothing spawns from it until it's written again.
   const badLaunch = launchProblem(tpl.launch);
   if (badLaunch) return err(`template ${name}: ${badLaunch}`);
+  const sources = templateRuleSources(catalog, name, ns);
+  if (!sources.ok) return sources;
   return withEnv({
     template: name,
     tools: registry.filter((t) => given.has(t)),
     launch: { ...tpl.launch, system_prompt: { ...tpl.launch.system_prompt, text: prompt } },
     // In capability order, each once (first occurrence kept).
     rules: dedupeRules(caps.flatMap((c) => c.rules)),
+    rule_sources: sources.value,
     credential: tpl.credential,
     ...(mcp.length ? { mcp } : {}),
     ...(brokered.length ? { brokered } : {}),
@@ -646,6 +768,7 @@ export function expandTemplate(catalog: Catalog, registry: readonly string[], na
     ...(tpl.github_push?.workflows ? { github_push: { workflows: true as const } } : {}),
     ...(tpl.egress?.allow.length ? { egress: { allow: tpl.egress.allow.map((r) => ({ ...r })) } } : {}),
     ...(tpl.env && Object.keys(tpl.env).length ? { env: { ...tpl.env } } : {}),
+    ...(guards.length ? { guards } : {}),
   }, name, undefined);
 }
 
@@ -720,13 +843,18 @@ export type SpawnSpec =
    */
   | { template: string; hands: boolean; by: "spawner"; share?: boolean; cell_idle_ttl_ms?: number; overrides?: SpawnerOverrides };
 
-/** Expand a spawn spec: the template's hands rule, the template, then the overrides its author may make (`clients`: as for `expandTemplate`). */
-export function expandSpec(catalog: Catalog, registry: readonly string[], spec: SpawnSpec, clients: Readonly<Record<string, string>> = {}): Result<AgentSpec> {
+/**
+ * Expand a spawn spec: the template's hands rule, the template, then the overrides its author may make
+ * (`clients` and `ns`: as for `expandTemplate`).
+ */
+export function expandSpec(
+  catalog: Catalog, registry: readonly string[], spec: SpawnSpec, clients: Readonly<Record<string, string>> = {}, ns: string | null = null,
+): Result<AgentSpec> {
   const tpl = Object.hasOwn(catalog.templates, spec.template) ? catalog.templates[spec.template]! : undefined;
   if (!tpl) return err(`unknown template ${spec.template}`);
   if (tpl.hands === "required" && !spec.hands) return err(`template ${spec.template} needs a sandbox`);
   if (tpl.hands === "forbidden" && spec.hands) return err(`template ${spec.template} has no hands`);
-  const base = expandTemplate(catalog, registry, spec.template, clients);
+  const base = expandTemplate(catalog, registry, spec.template, clients, ns);
   if (!base.ok) return base;
   if (spec.by === "spawner") {
     if (spec.share && !tpl.share_sandbox) return err(`template ${spec.template} doesn't share its spawner's sandbox`);
@@ -744,11 +872,14 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     if (!inject.ok) return err(`template ${spec.template}: ${inject.error}`);
     const egress = narrowEgress(base.value.egress?.allow ?? [], o.data.egress?.allow);
     if (!egress.ok) return err(`template ${spec.template}: ${egress.error}`);
-    const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, inject: _i, github_push: _g, egress: _x, ...rest } = base.value;
+    const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, inject: _i, github_push: _g, egress: _x, guards: _gd, ...rest } = base.value;
     const push = o.data.github_push?.workflows === false ? undefined : base.value.github_push;
+    // Its guards join the template's, held as its subtree's client's: a spawner adds refusals, never removes one.
+    if (o.data.guards?.length && ns !== null && !Object.hasOwn(clients, ns)) return err(`template ${spec.template}: no client is named ${ns}`);
+    const guards = [...(base.value.guards ?? []), ...holdGuards(ns === null ? null : clients[ns]!, o.data.guards ?? [])];
     const extras = {
       ...(inject.value.length ? { inject: inject.value } : {}), ...(push ? { github_push: push } : {}),
-      ...(egress.value.length ? { egress: { allow: egress.value } } : {}),
+      ...(egress.value.length ? { egress: { allow: egress.value } } : {}), ...(guards.length ? { guards } : {}),
     };
     // Lifetimes only shorten: ephemeral once set stays, and the shorter TTL wins.
     const ephemeral = base.value.ephemeral || o.data.ephemeral;
@@ -757,18 +888,24 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     const tplTtl = base.value.sandbox_idle_ttl_ms;
     const ttl = asked !== undefined ? narrowTtl(tplTtl ?? spec.cell_idle_ttl_ms ?? Infinity, asked) : tplTtl;
     const lifetimes = { ...(ephemeral ? { ephemeral: true as const } : {}), ...(ttl !== undefined ? { sandbox_idle_ttl_ms: ttl } : {}) };
-    return withEnv(withRepos({ ...rest, ...tools.value, ...lifetimes, ...extras, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]) }, repos.value, readRepos.value, true),
-      spec.template, o.data.env);
+    // Its narrowing first, kept apart from the capabilities' rules, which it reads as they are now.
+    const narrowing: RuleSource[] = o.data.rules?.length ? [{ rules: o.data.rules.map((r) => ({ ...r })) }] : [];
+    const rule_sources = [...narrowing, ...(base.value.rule_sources ?? [])];
+    return withEnv(withRepos({
+      ...rest, ...tools.value, ...lifetimes, ...extras, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), rule_sources,
+    }, repos.value, readRepos.value, true), spec.template, o.data.env);
   }
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value, o.tools);
   if (!tools.ok) return tools;
   const inject = narrowInjections(base.value.inject ?? [], o.inject);
   if (!inject.ok) return err(`template ${spec.template}: ${inject.error}`);
-  const { mcp: _mcp, brokered: _brokered, ephemeral: _ephemeral, inject: _i, github_push: _g, egress: _egress, ...rest } = base.value;
+  const { mcp: _mcp, brokered: _brokered, ephemeral: _ephemeral, inject: _i, github_push: _g, egress: _egress, guards: _gd, ...rest } = base.value;
   const ephemeral = o.ephemeral ?? base.value.ephemeral ?? false;
   const workflows = o.github_push ? o.github_push.workflows : !!base.value.github_push?.workflows;
   const egress = o.egress ? o.egress.allow : base.value.egress?.allow ?? [];
+  // The operator's replace the template's (the operator holds the root), held as the operator's.
+  const guards = o.guards ? holdGuards(null, o.guards) : base.value.guards ?? [];
   // The operator's own launch is held to the same rule where it's used.
   const badLaunch = launchProblem(o.launch);
   if (badLaunch) return err(badLaunch);
@@ -778,9 +915,12 @@ export function expandSpec(catalog: Catalog, registry: readonly string[], spec: 
     ...(inject.value.length ? { inject: inject.value } : {}),
     ...(workflows ? { github_push: { workflows: true as const } } : {}),
     ...(egress.length ? { egress: { allow: egress.map((r) => ({ ...r })) } } : {}),
+    ...(guards.length ? { guards } : {}),
     ...(ephemeral ? { ephemeral: true as const } : {}),
     launch: o.launch ?? base.value.launch,
     rules: o.rules ?? base.value.rules,
+    // The operator's rules replace the capabilities' (today's meaning) until cleared; the sources stay for then.
+    ...(o.rules ? { rules_set: true as const } : {}),
     credential: o.credential ?? base.value.credential,
   }, o.repos ?? base.value.repos ?? [], o.read_repos ?? base.value.read_repos ?? []), spec.template, o.env);
 }

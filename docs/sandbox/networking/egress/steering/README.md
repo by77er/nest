@@ -5,8 +5,9 @@
 1. Create netns `ns-<id>` with `tap0` = `172.16.0.1/30`. No veth, no default route.
 2. Install nft rules in the netns:
    - tcp/80 and tcp/443 from the guest → redirect to the transparent listeners on `172.16.0.1`
-   - udp/53 and tcp/53, the explicit listener ports and the TCP-exception ports to `172.16.0.1` → accept
-   - everything else → **reject**: TCP with a reset, anything else with ICMP port-unreachable. A rejected connection fails at once where a dropped one waits out a timeout; the guest is the only sender, so rejecting reveals nothing. In particular, UDP/443 (QUIC) is rejected, so HTTP/3 clients fall back to TCP immediately, as in [SPACE's guardrails](https://github.com/perplexityai/space/blob/main/docker/space/nftables/sandbox-pre-tproxy-guardrails.json).
+   - udp/53 and tcp/53 to any other address → redirect to the `:53` listeners
+   - udp/53 and tcp/53, tcp/80 and tcp/443, the explicit listener ports (3128–3191) and the TCP-exception ports (20000–20999) to `172.16.0.1` → accept
+   - everything else → **reject** (designed, not built: today the `input` and `forward` chains drop it): TCP with a reset, anything else with ICMP port-unreachable. A rejected connection fails at once where a dropped one waits out a timeout; the guest is the only sender, so rejecting reveals nothing. In particular, UDP/443 (QUIC) is rejected, so HTTP/3 clients fall back to TCP immediately, as in [SPACE's guardrails](https://github.com/perplexityai/space/blob/main/docker/space/nftables/sandbox-pre-tproxy-guardrails.json).
 3. Create the **listening sockets inside the netns** (a helper thread does `setns` → `socket`/`bind`/`listen` → switches back; a socket keeps the namespace it was created in):
    - `:53` udp+tcp (DNS)
    - `:80` and `:443` (transparent)
@@ -32,6 +33,8 @@
 - **Suspended sandboxes** keep their netns and listeners, which cost nothing. On restore elsewhere, the same steps run on the new host.
 
 ## Kernel backstop
+
+**Designed, not built:** no `meta skuid` rule exists, so only nest-proxy's own [hard-deny check](../policy/#hard-deny) keeps it from non-public addresses.
 
 nest-proxy runs in the host's root namespace, where IMDS and the instance role's credentials are reachable, so its [hard-deny check](../policy/#hard-deny) gets a kernel layer that a proxy bug can't bypass:
 - nestd installs an nft `output` rule in the root namespace that matches the proxy's uid (`meta skuid`) and **rejects** every non-public destination the kernel can express: `169.254.0.0/16` (IMDS, `169.254.170.2` and the rest of link-local), loopback, private, CGNAT, multicast and reserved IPv4, and loopback, link-local and unique-local IPv6 (`fc00::/7`, which holds IPv6 IMDS).

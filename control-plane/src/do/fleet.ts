@@ -1,6 +1,7 @@
 // FleetDO: one per cell. Host enrollment, the fleet WebSocket (docs/interfaces/control-host/fleet/),
 // leases and their expiry, STONITH, placement, and command delivery with exactly-one results.
 import { DurableObject } from "cloudflare:workers";
+import { CLIENT_GUARD_PREFIX } from "../lib/client-guards";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
@@ -146,6 +147,8 @@ interface HostRow {
   wedged_ms: number | null;
   /** Its nestd keys brains by agent epoch (1), or is of the previous release (0). */
   brain_epochs: number;
+  /** Its nest-proxy bounds guarded requests (1: its last hello said so), or not yet known or of the previous release (0). */
+  guard_bounds: number;
   /** When a drain was asked for (null: none). The status says whether it is serving; this survives an expiry and a return. */
   drain_ms: number | null;
   [key: string]: SqlStorageValue;
@@ -404,6 +407,9 @@ export class FleetDO extends DurableObject<Env> {
     // The host's nestd keys brains by agent epoch (its hello says so; nestd of the previous release
     // doesn't): preferred for new brains, and the only kind escalation ever wedges.
     addColumn(this.sql, "hosts", "brain_epochs", "INTEGER NOT NULL DEFAULT 0");
+    // Its nest-proxy bounds guarded requests (its hello says so; a host of the previous release, or one
+    // not yet heard from, doesn't): API clients' request guards are refused in a cell with any host without it.
+    addColumn(this.sql, "hosts", "guard_bounds", "INTEGER NOT NULL DEFAULT 0");
     // A drain is an intent, not a liveness: a host that expires and comes back returns to `draining`.
     addColumn(this.sql, "hosts", "drain_ms", "INTEGER");
     addColumn(this.sql, "leases", "state", "TEXT");
@@ -970,11 +976,11 @@ export class FleetDO extends DurableObject<Env> {
           || this.sql.exec("SELECT 1 FROM commands WHERE cmd = ? AND result IS NOT NULL", c.cmd as string).toArray().length === 0);
       }
       const slots = (m.commands as Record<string, unknown>[] | undefined ?? []).flatMap((c) => commandRefSlots(c));
-      const values = new Map<RefPurpose, Record<string, string | null>>();
+      const values = new Map<RefPurpose, Record<string, { value: string; expires_ms?: number | null } | null>>();
       for (const purpose of new Set(slots.map((s) => s.purpose))) {
         const refs = [...new Set(slots.filter((s) => s.purpose === purpose).map((s) => s.ref))];
         try {
-          values.set(purpose, await this.env.BROKER.get(this.env.BROKER.idFromName("broker")).resolveRefs(refs, REF_PURPOSES[purpose]));
+          values.set(purpose, await this.resolveRefs(refs, purpose));
         } catch (e) {
           console.error(`FleetDO: resolving secret references for batch ${m.seq} failed; holding it and the rest, closing`, e);
           this.closeRetryable(ws, "resolving secret references failed; reconnect and resend");
@@ -984,17 +990,35 @@ export class FleetDO extends DurableObject<Env> {
       // Superseded or closing (meanwhile, or by an earlier failure): its successor's hello resends.
       if (this.socketFor(host) !== ws) return;
       for (const s of slots) {
-        const value = values.get(s.purpose)?.[s.ref];
-        if (value === null || value === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
+        const got = values.get(s.purpose)?.[s.ref];
+        if (got === null || got === undefined) console.warn(`FleetDO: secret ${s.ref.slice(s.ref.indexOf(":") + 1)} is missing, expired or not allowed here`);
         // A missing injection secret goes out as no secret at all, never an empty one: nest-proxy then
         // refuses its binding's placeholder (`injection_unavailable`) instead of substituting "".
-        s.set(value ?? (s.purpose === "secrets_update" ? DROPPED_SECRET : ""));
+        s.set(got?.value ?? (s.purpose === "secrets_update" ? DROPPED_SECRET : ""));
+        // The expiry read with the value (absent from a BrokerDO of the previous release: the entry's stands).
+        if (got && got.expires_ms !== undefined) s.setExpiry?.(got.expires_ms);
       }
       for (const c of (m.commands as Record<string, unknown>[] | undefined) ?? []) {
         if (c.type === "secrets_update" && Array.isArray(c.secrets)) c.secrets = (c.secrets as { value?: unknown }[]).filter((x) => x.value !== DROPPED_SECRET);
       }
       this.send(ws, m as FleetToHost);
       ws.serializeAttachment({ host, helloed: true, sent: m.seq } satisfies Attachment);
+    }
+  }
+
+  /**
+   * One purpose's references resolved by BrokerDO, each value with its expiry as stored now. A BrokerDO
+   * still on the previous release (minutes of a deploy) lacks `resolveRefsExpiring`: its `resolveRefs`,
+   * whose entries keep the expiry the command already carries.
+   */
+  private async resolveRefs(refs: string[], purpose: RefPurpose): Promise<Record<string, { value: string; expires_ms?: number | null } | null>> {
+    const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
+    try {
+      return await broker.resolveRefsExpiring(refs, REF_PURPOSES[purpose]);
+    } catch (e) {
+      if (!/RPC receiver does not implement/.test(e instanceof Error ? e.message : String(e))) throw e;
+      const plain = await broker.resolveRefs(refs, REF_PURPOSES[purpose]);
+      return Object.fromEntries(Object.entries(plain).map(([k, v]) => [k, v === null ? null : { value: v }]));
     }
   }
 
@@ -1051,8 +1075,8 @@ export class FleetDO extends DurableObject<Env> {
     const orphans = stored === undefined ? undefined : parseOrphans(stored);
     // The host has processed every command up to `last_command_seq`; the socket starts there.
     if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
-    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ? WHERE host = ?",
-      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, att.host);
+    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ?, guard_bounds = ? WHERE host = ?",
+      now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, hello.guard_bounds ? 1 : 0, att.host);
     this.setTunnelState(att.host, hello.tunnel ?? "none", prior);
     if (hello.cgroup_delegation_error) {
       console.error(`FleetDO: ${att.host} runs its VMMs outside its unit cgroup (delegation failed: ${hello.cgroup_delegation_error})`);
@@ -1675,10 +1699,13 @@ export class FleetDO extends DurableObject<Env> {
       console.error(`FleetDO: placing ${req.sandbox}, which its SandboxDO never registered; registering it now`);
       this.sql.exec("INSERT OR IGNORE INTO sandboxes (sandbox, registered_ms) VALUES (?, ?)", req.sandbox, Date.now());
     }
-    // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts.
+    // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts. A sandbox with API
+    // clients' request guards goes only to a host whose nest-proxy bounds them (`guard_bounds`): none
+    // free means no placement yet (SandboxDO retries), never one that would decide them unbounded.
     const need = req.resources;
     const cfg = this.cellConfig();
-    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: "wedged_ms IS NULL" })
+    const guarded = (req.policy.guards ?? []).some((g) => g.name.startsWith(CLIENT_GUARD_PREFIX));
+    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where: guarded ? "wedged_ms IS NULL AND guard_bounds = 1" : "wedged_ms IS NULL" })
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
       .map((h) => {
         const capacity = h.capacity ? (JSON.parse(h.capacity) as Capacity) : null;
@@ -3082,6 +3109,15 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /** Host rows matching typed filters (and an optional extra SQL condition), their enums checked. */
+  /**
+   * The cell's sandbox hosts that could hold a sandbox (any not dead) whose nest-proxy isn't known to
+   * bound guarded requests: of the previous release, or not heard from since enrolling. SandboxDO
+   * refuses API clients' request guards while there is one (docs/control-plane/api/clients/#request-guards).
+   */
+  async hostsWithoutGuardBounds(): Promise<string[]> {
+    return this.hostsBy({ role: SANDBOX_ROLE, status: ["active", "draining", "expired", "stonith_pending"], where: "guard_bounds = 0" }).map((h) => h.host);
+  }
+
   private hostsBy(
     f: { status?: HostStatus | readonly HostStatus[]; role?: HostKind; where?: string; order?: "role" | "enrolled_ms" }, ...args: SqlStorageValue[]
   ): HostRow[] {

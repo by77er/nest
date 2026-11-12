@@ -96,8 +96,9 @@ FleetDO         nestd (root)                                      nest-proxy    
 | `invalid_headers` (designed) | deny | Smuggling-shaped request (`Connection` naming a protected field, a transfer coding other than `chunked`, a protected `Trailer`) or over the header limits |
 | `host_sni_mismatch` | alert | Decrypted `Host` ≠ SNI (domain fronting) |
 | `sni_mismatch` | alert | CONNECT tunnel's SNI ≠ the CONNECT authority (domain fronting) |
+| `host_mismatch` / `duplicate_host` | deny | Plain HTTP whose request target or `Host` names another host than the routed one / that carries more than one `Host` (over TLS, an alert: `host_sni_mismatch` / `duplicate_host`) |
 | `placeholder_wrong_host` | alert | A binding's placeholder sent to a host outside the binding |
-| `injection_unavailable` | deny | Placeholder present but its secret is missing, expired or fenced |
+| `injection_unavailable` | alert | Placeholder present but its secret is missing, expired or fenced; refused (403) and raised as `alert{injection_after_expiry}` |
 | `injection_requires_tls` | deny | Placeholder over plain HTTP |
 | `trace_with_credential` | deny | `TRACE` or `TRACK` with a placeholder substituted (the upstream would echo the secret) |
 | `injection_out_of_scope` (designed) | deny | Placeholder on a method or path outside the binding |
@@ -105,6 +106,7 @@ FleetDO         nestd (root)                                      nest-proxy    
 | `tcp_exception_not_in_policy` | deny | A TCP exception listener whose rule is no longer in policy |
 | `non_tls_tunnel` | deny | CONNECT tunnel to an inspected host that didn't start TLS |
 | `guard: <name>` | deny | A [request guard](../../../sandbox/networking/egress/policy/#request-guards) refused the request (403 `request_denied`, with `guard` and `reason`) |
+| `guard_target_too_long` | deny | A request to a guarded host whose path or query is past the bounds guards are decided within (414 `request_target_too_long`; [request guards](../../../sandbox/networking/egress/policy/#request-guards)) |
 | `upgraded` | allow | Connection upgraded (WebSocket) and spliced after the handshake |
 | `tcp_exception` | allow | Spliced TCP exception |
 | `upstream: …` / `connect: …` / `resolve: …` | deny | Upstream failure (TLS verification, connect or resolution), with detail |

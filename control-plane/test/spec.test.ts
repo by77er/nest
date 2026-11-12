@@ -8,7 +8,8 @@ import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import {
   type Capability, type Catalog, checkCapability, checkTemplate, expandSpec, expandTemplate, OperatorOverrides, ROLE_SPECS, SEED_CATALOG,
   SEED_CATALOG_V1, SEED_STEPS, SEED_VERSION, seedMigration, TIMER_CAPABILITIES, SpawnerOverrides, specFromRole, type Template, templatesUsing, CHANNEL_CAPABILITIES_REMOVED,
-  CHANNEL_TOOLS_REMOVED, EGRESS_CAPABILITIES, MESSAGING_CAPABILITIES_REMOVED, MESSAGING_TOOLS_REMOVED, pruneCapability, pruneTemplate, REMOVED_CAPABILITIES, rewritePrompt, SPAWNING_CAPABILITIES, SPAWNING_PROMPT_V5,
+  CHANNEL_TOOLS_REMOVED, EGRESS_CAPABILITIES, joinRules, liveCapabilities, rewriteRules, type RuleSource, SEED_BUILTIN_RULES, templateRuleSources, MESSAGING_CAPABILITIES_REMOVED,
+  MESSAGING_TOOLS_REMOVED, pruneCapability, pruneTemplate, REMOVED_CAPABILITIES, rewritePrompt, SPAWNING_CAPABILITIES, SPAWNING_PROMPT_V5,
 } from "../src/lib/spec";
 import { Credential, type ToolRule } from "../src/protocol/control";
 
@@ -40,6 +41,7 @@ describe("the first seed catalog is what the roles were", () => {
       tools: WORKER_TOOLS,
       launch: WORKER_LAUNCH,
       rules: [NEST_ALLOW, { pattern: "Agent", decision: "allow" }, { pattern: "Task", decision: "allow" }],
+      rule_sources: SEED_CATALOG_V1.templates.worker!.capabilities.map((capability) => ({ capability })),
       credential: "claude_oauth_token:worker",
     });
   });
@@ -50,6 +52,7 @@ describe("the first seed catalog is what the roles were", () => {
       tools: CAPTAIN_TOOLS,
       launch: CAPTAIN_LAUNCH,
       rules: [NEST_ALLOW],
+      rule_sources: SEED_CATALOG_V1.templates.captain!.capabilities.map((capability) => ({ capability })),
       credential: "claude_oauth_token:captain",
     });
   });
@@ -74,9 +77,45 @@ describe("the first seed catalog is what the roles were", () => {
 describe("records stored with a role read through a frozen table, not the seed", () => {
   it("the first seed still expands to what ROLE_SPECS freezes (so a seed edit can't change it unnoticed)", () => {
     for (const role of ["worker", "captain"] as const) {
-      const { launch: _l, rules: _r, ...rest } = expand(SEED_CATALOG_V1, role, role === "worker");
+      const { launch: _l, rules: _r, rule_sources: _s, ...rest } = expand(SEED_CATALOG_V1, role, role === "worker");
       expect(rest, role).toEqual(ROLE_SPECS[role]);
     }
+  });
+});
+
+describe("the seed's built-ins run without asking (the owner's decision, 2026-11-11)", () => {
+  /** The first rule matching a bare built-in call (exact name or `*`), as the runner's first-match rules read it. */
+  const decide = (rules: readonly ToolRule[], tool: string) =>
+    rules.find((r) => r.pattern === tool || r.pattern === "*" || r.pattern === `${tool}(*)`)?.decision ?? "ask";
+
+  it("every built-in a seed template launches, in either seed, is allowed by an exact-name rule", () => {
+    for (const [catalog, template, hands] of [
+      [SEED_CATALOG, "worker", true], [SEED_CATALOG, "captain", false], [SEED_CATALOG_V1, "worker", true], [SEED_CATALOG_V1, "captain", false],
+    ] as const) {
+      // A catalog seeded with the first seed and migrated: its `nest` rules are rewritten (version 10).
+      const migrated: Catalog = catalog === SEED_CATALOG_V1
+        ? { ...catalog, capabilities: { ...catalog.capabilities, nest: { ...catalog.capabilities.nest!, rules: [...SEED_CATALOG.capabilities.nest!.rules] } } }
+        : catalog;
+      const spec = expand(migrated, template, hands);
+      for (const t of spec.launch.builtin_tools) expect(decide(spec.rules, t), `${template}: ${t}`).toBe("allow");
+    }
+    // Exact names only: nothing else becomes allowed (`Agent` stays `subagents`').
+    expect(SEED_BUILTIN_RULES.every((r) => /^[A-Za-z]+$/.test(r.pattern) && r.decision === "allow")).toBe(true);
+    expect(decide(expand(SEED_CATALOG, "worker", true).rules, "Agent")).toBe("ask");
+  });
+
+  it("version 10 rewrites `nest`'s rules only where they are still the first seed's", () => {
+    const m = seedMigration({ capabilities: Object.keys(SEED_CATALOG.capabilities), templates: ["worker", "captain"] }, 9);
+    expect(m.rules).toEqual([{ capability: "nest", was: [NEST_ALLOW], now: [NEST_ALLOW, ...SEED_BUILTIN_RULES] }]);
+    const r = m.rules[0]!;
+    const seeded = { tools: [], rules: [{ decision: "allow", pattern: "mcp__nest__*" }], prompt: "", later_field: 1 };
+    expect(rewriteRules(seeded, r)).toEqual({ ...seeded, rules: [NEST_ALLOW, ...SEED_BUILTIN_RULES] });
+    // An operator's edit stays, and so does one already rewritten.
+    expect(rewriteRules({ ...seeded, rules: [NEST_ALLOW, { pattern: "WebFetch", decision: "deny" }] }, r)).toBeNull();
+    expect(rewriteRules({ ...seeded, rules: [] }, r)).toBeNull();
+    expect(rewriteRules({ ...seeded, rules: [NEST_ALLOW, ...SEED_BUILTIN_RULES] }, r)).toBeNull();
+    expect(rewriteRules("not an object", r)).toBeNull();
+    expect(seedMigration({ capabilities: [], templates: [] }, 10).rules).toEqual([]);
   });
 });
 
@@ -107,6 +146,57 @@ describe("a spawner's overrides can only narrow", () => {
     expect(r.value.rules).toEqual([{ pattern: "mcp__nest__Bash(rm *)", decision: "deny" }, { pattern: "WebSearch", decision: "ask" }, ...base.rules]);
     expect([r.value.launch, r.value.credential]).toEqual([base.launch, base.credential]);
     expect(spawn({ tools: ["merge"] }).ok).toBe(false);
+  });
+});
+
+describe("rule sources: an agent's own rules apart from its capabilities' (read as they are now)", () => {
+  const deny = { pattern: "WebFetch", decision: "deny" as const };
+  const ask = { pattern: "Bash(git push *)", decision: "ask" as const };
+  const allowWeb: ToolRule = { pattern: "WebFetch", decision: "allow" };
+  const LAUNCH = { builtin_tools: [], system_prompt: { mode: "append" as const, text: "" } };
+  const tpl = (capabilities: string[]): Template => ({ capabilities, launch: LAUNCH, hands: "forbidden", credential: "claude_oauth_token" });
+  const cat: Catalog = {
+    capabilities: { nest: { tools: [], rules: [NEST_ALLOW], prompt: "" }, web: { tools: [], rules: [allowWeb], prompt: "" }, "acme/tools": { tools: [], rules: [allowWeb, ask], prompt: "" } },
+    templates: { t: tpl(["nest", "web"]), "acme/t": tpl(["nest", "acme/tools"]) },
+  };
+
+  it("a spawner's narrowing is a source of its own, first; the capabilities follow, by name", () => {
+    const r = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "t", hands: false, by: "spawner", overrides: { rules: [deny] } });
+    if (!r.ok) throw new Error(r.error);
+    expect(r.value.rule_sources).toEqual([{ rules: [deny] }, { capability: "nest" }, { capability: "web" }]);
+    // At spawn the stored rules are what the sources give now: the narrowing wins over the capability's allow.
+    expect(r.value.rules).toEqual(joinRules(r.value.rule_sources!, { nest: [NEST_ALLOW], web: [allowWeb] }));
+    expect(r.value.rules).toEqual([deny, NEST_ALLOW, allowWeb]);
+    expect(r.value.rules_set).toBeUndefined();
+  });
+
+  it("joining reads each capability as it is now, keeps the narrowing first, and a deleted capability gives none", () => {
+    const sources: RuleSource[] = [{ rules: [deny] }, { capability: "nest" }, { capability: "web" }];
+    expect(joinRules(sources, { nest: [NEST_ALLOW], web: [allowWeb, ask] })).toEqual([deny, NEST_ALLOW, allowWeb, ask]);
+    expect(joinRules(sources, { nest: [NEST_ALLOW], web: null })).toEqual([deny, NEST_ALLOW]);
+    expect(joinRules(sources, { nest: [NEST_ALLOW] })).toEqual([deny, NEST_ALLOW]);
+    // Each rule once, the first kept: a capability can't move a rule ahead of the narrowing.
+    expect(joinRules(sources, { nest: [deny, NEST_ALLOW], web: [] })).toEqual([deny, NEST_ALLOW]);
+    expect(liveCapabilities([...sources, { capability: "nest" }])).toEqual(["nest", "web"]);
+  });
+
+  it("the operator's rules replace the capabilities' (rules_set), keeping the sources for when they're cleared", () => {
+    const r = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "t", hands: false, by: "operator", overrides: { rules: [ask] } });
+    if (!r.ok) throw new Error(r.error);
+    expect(r.value.rules).toEqual([ask]);
+    expect(r.value.rules_set).toBe(true);
+    expect(r.value.rule_sources).toEqual([{ capability: "nest" }, { capability: "web" }]);
+  });
+
+  it("a client's capability is read live only in that client's subtree; the operator's agent keeps it as at spawn", () => {
+    const inSubtree = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "acme/t", hands: false, by: "spawner" }, {}, "acme");
+    if (!inSubtree.ok) throw new Error(inSubtree.error);
+    expect(inSubtree.value.rule_sources).toEqual([{ capability: "nest" }, { capability: "acme/tools" }]);
+    const operators = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "acme/t", hands: false, by: "operator" });
+    if (!operators.ok) throw new Error(operators.error);
+    expect(operators.value.rule_sources).toEqual([{ capability: "nest" }, { rules: [allowWeb, ask] }]);
+    expect(templateRuleSources(cat, "acme/t", "other")).toEqual({ ok: true, value: [{ capability: "nest" }, { rules: [allowWeb, ask] }] });
+    expect(templateRuleSources(cat, "nope", null).ok).toBe(false);
   });
 });
 
@@ -171,10 +261,10 @@ describe("the current seed: spawning added, the task ledger, the channels and th
     // docs/agents/runner/: Claude Code's task and web tools, no `TodoWrite` and no `Agent` (nor its old
     // name `Task`), so no rule letting subagents run either.
     expect(w.launch.builtin_tools).toEqual(["TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "WebSearch", "WebFetch"]);
-    expect(w.rules).toEqual([NEST_ALLOW]);
+    expect(w.rules).toEqual([NEST_ALLOW, ...SEED_BUILTIN_RULES]);
     expect(c.launch.builtin_tools).toEqual([]);
     for (const [v1, v2] of [[v1w, w], [v1c, c]] as const) {
-      expect({ ...v2, tools: [], launch: null, rules: [], spawn: [] }).toEqual({ ...v1, tools: [], launch: null, rules: [], spawn: [] });
+      expect({ ...v2, tools: [], launch: null, rules: [], rule_sources: [], spawn: [] }).toEqual({ ...v1, tools: [], launch: null, rules: [], rule_sources: [], spawn: [] });
       expect(v2.launch.system_prompt.text.startsWith(v1.launch.system_prompt.text)).toBe(true);
     }
     for (const name of [...REMOVED_CAPABILITIES, ...CHANNEL_CAPABILITIES_REMOVED, ...MESSAGING_CAPABILITIES_REMOVED]) {
@@ -190,7 +280,7 @@ describe("the current seed: spawning added, the task ledger, the channels and th
 
   it("seed steps: versions strictly increase, the last is the seed version, and every step's entries are the current seed's", () => {
     const versions = SEED_STEPS.map((s) => s.version);
-    expect(versions).toEqual([2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(versions).toEqual([2, 3, 4, 5, 6, 7, 8, 9, 10]);
     for (let i = 1; i < versions.length; i++) expect(versions[i]!, String(i)).toBeGreaterThan(versions[i - 1]!);
     expect(SEED_VERSION).toBe(versions.at(-1));
     // No two steps name the same entry (one would never be applied to a catalog the other already reached).
@@ -209,25 +299,26 @@ describe("the current seed: spawning added, the task ledger, the channels and th
     };
     const removes = { ...channels, capabilities: ["tasks", "tasks-admin", ...channels.capabilities], params: ["ledger"] };
     const prompts = [{ capability: "spawning", was: SPAWNING_PROMPT_V5, now: SPAWNING_CAPABILITIES.spawning!.prompt }];
+    const rules = [{ capability: "nest", was: [NEST_ALLOW], now: [NEST_ALLOW, ...SEED_BUILTIN_RULES] }];
     const m = seedMigration(v2, 2);
-    expect(m).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES, ...TIMER_CAPABILITIES }, templates: {}, version: 9, removes, prompts });
+    expect(m).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES, ...TIMER_CAPABILITIES }, templates: {}, version: 10, removes, prompts, rules });
     const v3 = [...v2.capabilities, "tasks", "tasks-admin"];
-    expect(seedMigration({ ...v2, capabilities: v3 }, 3)).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES, ...TIMER_CAPABILITIES }, templates: {}, version: 9, removes, prompts });
-    expect(seedMigration({ ...v2, capabilities: [...v3, "egress"] }, 4)).toEqual({ capabilities: { ...SPAWNING_CAPABILITIES, ...TIMER_CAPABILITIES }, templates: {}, version: 9, removes, prompts });
-    expect(seedMigration({ ...v2, capabilities: [...v3, "egress", "spawning"] }, 5)).toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 9, removes, prompts });
+    expect(seedMigration({ ...v2, capabilities: v3 }, 3)).toEqual({ capabilities: { ...EGRESS_CAPABILITIES, ...SPAWNING_CAPABILITIES, ...TIMER_CAPABILITIES }, templates: {}, version: 10, removes, prompts, rules });
+    expect(seedMigration({ ...v2, capabilities: [...v3, "egress"] }, 4)).toEqual({ capabilities: { ...SPAWNING_CAPABILITIES, ...TIMER_CAPABILITIES }, templates: {}, version: 10, removes, prompts, rules });
+    expect(seedMigration({ ...v2, capabilities: [...v3, "egress", "spawning"] }, 5)).toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 10, removes, prompts, rules });
     expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "egress", "spawning"] }, 6))
-      .toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 9, removes: channels, prompts });
+      .toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 10, removes: channels, prompts, rules });
     expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "egress", "spawning"] }, 7))
-      .toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 9, removes: messaging, prompts: [] });
+      .toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 10, removes: messaging, prompts: [], rules });
     // The live catalog before this release: only `timers`, added.
     expect(seedMigration({ ...v2, capabilities: [...v2.capabilities, "egress", "spawning"] }, 8))
-      .toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 9, removes: { capabilities: [], params: [], tools: [], fields: [] }, prompts: [] });
+      .toEqual({ capabilities: TIMER_CAPABILITIES, templates: {}, version: 10, removes: { capabilities: [], params: [], tools: [], fields: [] }, prompts: [], rules });
     // Version 2's step adds nothing now (its channels would only be removed again), and doesn't run twice.
     expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 1).capabilities).sort()).toEqual(["egress", "spawning", "timers"]);
     expect(Object.keys(seedMigration({ ...v2, capabilities: Object.keys(SEED_CATALOG_V1.capabilities) }, 2).capabilities).sort()).toEqual(["egress", "spawning", "timers"]);
     // Once it reached a version it adds and removes nothing, whatever is missing: deleted entries stay deleted.
     expect(seedMigration({ capabilities: [], templates: [] }, SEED_VERSION))
-      .toEqual({ capabilities: {}, templates: {}, version: SEED_VERSION, removes: { capabilities: [], params: [], tools: [], fields: [] }, prompts: [] });
+      .toEqual({ capabilities: {}, templates: {}, version: SEED_VERSION, removes: { capabilities: [], params: [], tools: [], fields: [] }, prompts: [], rules: [] });
     // Every step's entries are what the current seed holds.
     for (const step of SEED_STEPS) {
       for (const [n, cap] of Object.entries(step.capabilities)) expect(SEED_CATALOG.capabilities[n], n).toEqual(cap);

@@ -65,20 +65,37 @@ def skip(name, why):
     log(f"SKIP {name} — {why}")
 
 
+# This text 500 is miniflare's, not the Worker's (whose every error is JSON, `errorResponse`): wrangler
+# dev's proxy lost its connection to the worker's runtime, and resends only a GET or HEAD itself. In this
+# harness the cause is a closing keep-alive: the proxy forwards on pooled connections, and the runtime
+# closes one idle for 5 s (both workerd's defaults), so a request sent on one it is closing is lost
+# (reproduced: the worker logged none). A busy runtime widens the race: after `start_control_plane`, the
+# redelivery scenario's next request came about 5 s after the health check (e2e/FINDINGS.md).
+DEV_PROXY_LOST = "Error: Network connection lost."
+DEV_PROXY_RESENDS = 2
+
+
 def api(method, path, body=None, raw=False, timeout=30):
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(BASE + path, data=data, method=method,
-                                 headers={"authorization": f"Bearer {ADMIN}", "content-type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            text = r.read().decode()
-            return r.status, (text if raw else (json.loads(text) if text else None))
-    except urllib.error.HTTPError as e:
-        text = e.read().decode()
+    for attempt in range(DEV_PROXY_RESENDS + 1):
+        req = urllib.request.Request(BASE + path, data=data, method=method,
+                                     headers={"authorization": f"Bearer {ADMIN}", "content-type": "application/json"})
         try:
-            return e.code, json.loads(text)
-        except ValueError:
-            return e.code, text
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                text = r.read().decode()
+                return r.status, (text if raw else (json.loads(text) if text else None))
+        except urllib.error.HTTPError as e:
+            text = e.read().decode()
+            if e.code == 500 and text.startswith(DEV_PROXY_LOST) and attempt < DEV_PROXY_RESENDS:
+                # The proxy's connection to the runtime failed; in this harness the cause is the closing
+                # keep-alive (above). The same request again, on a new connection.
+                log(f"{method} {path}: wrangler dev's proxy lost its connection to the worker; sending it again")
+                time.sleep(0.25)
+                continue
+            try:
+                return e.code, json.loads(text)
+            except ValueError:
+                return e.code, text
 
 
 def wait_for(fn, timeout, interval=0.25, what=""):
@@ -1116,21 +1133,22 @@ def pending_ask(text):
 
 
 def run_rule_approvals(ids):
-    """A built-in no tool rule allows (WebFetch: the worker's rules allow only `mcp__nest__*`) is held by the
+    """A built-in no tool rule allows (`Agent`: the seed worker's rules allow `mcp__nest__*` and the built-ins it
+    launches, and no `subagents` capability allows `Agent`) is held by the
     PreToolUse hook for the operator, through nest hook -> runner -> AgentDO (`approval_check`). Approved, that
     exact call runs once; the same call again is held again."""
     if REAL:
         skip("rule approvals", "fake mode only: the calls are scripted")
         return
     agid = ids["agent"]
-    fetch = {"url": "https://docs.rs/serde", "prompt": "what does flatten do?"}
-    reordered = {"prompt": "what does flatten do?", "url": "https://docs.rs/serde"}
+    fetch = {"description": "read the docs", "prompt": "what does serde's flatten do?"}
+    reordered = {"prompt": "what does serde's flatten do?", "description": "read the docs"}
 
     def rule_turn(name, steps):
         path = os.path.join(WORK, f"rule-{name}.json")
         out = os.path.join(WORK, f"rule-{name}.jsonl")
         with open(path, "w") as fh:
-            json.dump({"results": out, "steps": [{"label": l, "builtin": "WebFetch", "args": a} for l, a in steps]}, fh, indent=2)
+            json.dump({"results": out, "steps": [{"label": l, "builtin": "Agent", "args": a} for l, a in steps]}, fh, indent=2)
         st, t = api("POST", f"/v1/agents/{agid}/turns", {"text": f"E2E {path}"})
         check(f"rule approvals: {name} turn enqueued", st == 201, json.dumps(t)[:200])
         try:
@@ -1150,8 +1168,8 @@ def run_rule_approvals(ids):
     check("rule approvals: the same call again (keys reordered) holds the same ask", ask_of(res.get("again")) == ask, json.dumps(res.get("again"))[:200])
     st, asks = api("GET", f"/v1/agents/{agid}/asks")
     mine = [a for a in asks or [] if a.get("ask") == ask]
-    check("rule approvals: the ask is listed as an approval of WebFetch",
-          st == 200 and len(mine) == 1 and mine[0].get("approval") == {"name": "WebFetch", "tool": "WebFetch"}, json.dumps(asks)[:300])
+    check("rule approvals: the ask is listed as an approval of Agent",
+          st == 200 and len(mine) == 1 and mine[0].get("approval") == {"name": "Agent", "tool": "Agent"}, json.dumps(asks)[:300])
     if not ask:
         return
     st, r = api("POST", f"/v1/agents/{agid}/asks/{ask}/answer", {"answer": "approve"})

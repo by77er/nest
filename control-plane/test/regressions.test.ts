@@ -1121,6 +1121,12 @@ async function hookBroker(cell: string, hooks: BrokerHooks): Promise<void> {
       resolveRefs: async (refs: string[], allow: readonly string[]) => {
         return (await hooks.resolveRefs?.(refs)) ?? stub().resolveRefs(refs, allow);
       },
+      // What FleetDO calls: the same hook, its values with no expiry of their own (the entry's stands).
+      resolveRefsExpiring: async (refs: string[], allow: readonly string[]) => {
+        const hooked = await hooks.resolveRefs?.(refs);
+        if (!hooked) return stub().resolveRefsExpiring(refs, allow);
+        return Object.fromEntries(Object.entries(hooked).map(([k, v]) => [k, v === null ? null : { value: v }]));
+      },
     };
     self.env = Object.create(real, { BROKER: { value: { idFromName: () => undefined, get: () => broker } } }) as Cloudflare.Env;
   });

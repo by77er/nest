@@ -24,6 +24,7 @@ import {
 } from "./lib/client-secrets";
 import { GithubPush } from "./lib/rules/github";
 import { ClientEgress, egressOutsideGrant } from "./lib/client-egress";
+import { ClientGuards } from "./lib/client-guards";
 import { SandboxEnv, unboundPlaceholders } from "./lib/sandbox-env";
 import { TimerName } from "./lib/timers";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
@@ -31,6 +32,7 @@ import { JWKS_MAX_AGE_S } from "./lib/identity";
 import { Port, SandboxPolicyLayer } from "./do/sandbox";
 import { type AgentDO, type CreateAgent, type RestartResult, TRACE_HEADER } from "./do/agent";
 import { withTimeout } from "./lib/reliable";
+import { INPUT_KEPT_BYTES } from "./lib/sinks";
 import { type GrantParent, inScope, parseGrantRequests } from "./lib/grants";
 import { parseAppSecret } from "./lib/github";
 import { canonicalRepos, Repo } from "./lib/repos";
@@ -343,9 +345,12 @@ const escapeHtml = (t: string) => t.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt
 
 /**
  * `PUT /v1/sandboxes/<id>/client-policy`'s body: the whole client layer (an absent part is emptied):
- * egress rules, injection bindings, environment, and the push token's opt-ins (`github_push`).
+ * egress rules, injection bindings, environment, the push token's opt-ins (`github_push`) and request guards.
  */
-const ClientLayer = z.strictObject({ egress: ClientEgress.optional(), inject: ClientInjections.optional(), env: SandboxEnv.optional(), github_push: GithubPush.optional() });
+const ClientLayer = z.strictObject({
+  egress: ClientEgress.optional(), inject: ClientInjections.optional(), env: SandboxEnv.optional(), github_push: GithubPush.optional(),
+  guards: ClientGuards.optional(),
+});
 
 /**
  * An environment's values: no placeholder that none of `bound` is, and no value of a secret the caller
@@ -522,6 +527,21 @@ const ASKS_PAGE_MAX = 100;
 const ASKS_PER_AGENT = 20;
 /** How long one AgentDO may take to list its asks before the page fails (retryable). */
 const ASKS_AGENT_TIMEOUT_MS = 5_000;
+/**
+ * The most input bytes (`input_bytes`, summed) one page of `GET /v1/asks?include=input` carries: 32 inputs
+ * of the most kept (`INPUT_KEPT_BYTES`). Uncapped, a page could hold 100 agents x 20 asks x 32 KiB = 64 MiB.
+ */
+const ASKS_PAGE_INPUT_BYTES = 32 * INPUT_KEPT_BYTES;
+
+/** One row of `GET /v1/asks`. */
+type AskRow = { agent: string; cell: string; client: string | null; owner?: string | null; labels: Labels } & Awaited<ReturnType<AgentDO["openAsks"]>>[number];
+
+/** `?include=` of `GET /v1/asks`: a comma list, `input` its one member (anything else is 400, never silently ignored). */
+function asksIncludes(q: URLSearchParams): { input: boolean } {
+  const names = q.getAll("include").flatMap((v) => v.split(","));
+  for (const n of names) if (n !== "input") throw new NestError(ErrorCodes.INVALID_MESSAGE, `include is input (not ${JSON.stringify(n.slice(0, 40))})`);
+  return { input: names.length > 0 };
+}
 
 /**
  * `GET /v1/asks` (docs/control-plane/api/#open-asks-across-agents): the open asks of a page of live agents
@@ -532,30 +552,71 @@ const ASKS_AGENT_TIMEOUT_MS = 5_000;
  * object isn't made yet, or a create that failed) has none: asked like any other, since a member stays
  * `reserved` until its registration reports, which can lag an agent that exists. Any other failure, or an
  * agent slower than ASKS_AGENT_TIMEOUT_MS, fails the whole page, so a page never silently leaves out an ask.
+ * Inputs only with `?include=input`, within ASKS_PAGE_INPUT_BYTES (`pageInputs`).
  */
 async function openAsksPage(c: Ctx<string, unknown>): Promise<unknown> {
+  const include = asksIncludes(c.url.searchParams);
   const page = await registryPage(c, "agent", { liveOnly: true, limits: { default: ASKS_PAGE, max: ASKS_PAGE_MAX } });
   const more: string[] = [];
-  const per = await Promise.all(page.items.map(async (m) => {
+  const per = await Promise.all(page.items.map(async (m): Promise<AskRow[]> => {
     let asks: Awaited<ReturnType<AgentDO["openAsks"]>>;
     try {
-      // One more than shown, to know there are more (an AgentDO of the previous release ignores the limit and answers all).
-      asks = await withTimeout(agent(c.env, m.id).openAsks(ASKS_PER_AGENT + 1), ASKS_AGENT_TIMEOUT_MS, `agent ${m.id}'s asks`);
+      // One more than shown, to know there are more, and no inputs: those are read apart, within the page's budget.
+      // (An AgentDO of the previous release ignores both: it answers all, with inputs, which are dropped below.)
+      asks = await withTimeout(agent(c.env, m.id).openAsks(ASKS_PER_AGENT + 1, { input: false }), ASKS_AGENT_TIMEOUT_MS, `agent ${m.id}'s asks`);
     } catch (e) {
       if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) return [];
       if (asNestError(e)) throw e;
       throw new NestError(ErrorCodes.INTERNAL, `couldn't list agent ${m.id}'s asks: ${e instanceof Error ? e.message : String(e)}`, 503, true);
     }
     if (asks.length > ASKS_PER_AGENT) more.push(m.id);
-    return asks.slice(0, ASKS_PER_AGENT).map((a) => ({
+    return asks.slice(0, ASKS_PER_AGENT).map(({ input: _input, ...a }) => ({
       agent: m.id, cell: m.cell, client: m.client, ...(m.owner !== undefined ? { owner: m.owner } : {}), labels: m.labels, ...a,
     }));
   }));
+  const asks = per.flat().sort((a, b) => a.created_ms - b.created_ms || (a.ask < b.ask ? -1 : a.ask > b.ask ? 1 : 0));
   return {
-    asks: per.flat().sort((a, b) => a.created_ms - b.created_ms || (a.ask < b.ask ? -1 : a.ask > b.ask ? 1 : 0)),
+    asks,
     more: more.sort(),
     next_cursor: page.next_cursor,
+    ...(include.input ? { input_left_out: await pageInputs(c.env, asks) } : {}),
   };
+}
+
+/**
+ * Fill in `input` on a page of `GET /v1/asks` rows, oldest first, each whose kept input still fits in
+ * ASKS_PAGE_INPUT_BYTES; read from each agent's AgentDO (`askInputs`) only for the asks chosen, so neither
+ * the answer nor the Worker ever holds more. Answers the asks whose input was kept but isn't on the page:
+ * past the budget, answered between the two reads, or its agent couldn't give it (it failed, took longer
+ * than ASKS_AGENT_TIMEOUT_MS, or runs the previous release). Each is whole at `GET /v1/agents/<id>/asks`.
+ * The rows themselves are already read: a failure here leaves inputs out, by name, never an ask.
+ */
+async function pageInputs(env: Env, asks: AskRow[]): Promise<string[]> {
+  const leftOut = new Set<string>();
+  const chosen = new Map<string, AskRow[]>();
+  let budget = ASKS_PAGE_INPUT_BYTES;
+  for (const a of asks) {
+    if (a.input_bytes === undefined || a.input_bytes > INPUT_KEPT_BYTES) continue; // none kept: nothing to leave out
+    if (a.input_bytes > budget) {
+      leftOut.add(a.ask);
+      continue;
+    }
+    budget -= a.input_bytes;
+    chosen.set(a.agent, [...(chosen.get(a.agent) ?? []), a]);
+  }
+  await Promise.all([...chosen].map(async ([id, rows]) => {
+    let got: Record<string, unknown> = {};
+    try {
+      got = await withTimeout(agent(env, id).askInputs(rows.map((r) => r.ask)), ASKS_AGENT_TIMEOUT_MS, `agent ${id}'s ask inputs`);
+    } catch (e) {
+      console.warn(`GET /v1/asks: agent ${id}'s ask inputs are left out: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    for (const r of rows) {
+      if (Object.hasOwn(got, r.ask)) r.input = got[r.ask];
+      else leftOut.add(r.ask);
+    }
+  }));
+  return asks.filter((a) => leftOut.has(a.ask)).map((a) => a.ask);
 }
 
 /**
@@ -755,6 +816,8 @@ export const ROUTES: Route[] = [
       egress: ClientEgress.optional(),
       // Its processes' environment: literals, or placeholders of `inject` (docs/control-plane/api/clients/#environment).
       env: SandboxEnv.optional(),
+      // Request guards: they only refuse, so no grant covers them (docs/control-plane/api/clients/#request-guards).
+      guards: ClientGuards.optional(),
     }),
     run: (c) => createOnce(c, "sandbox", async (id, begin) => {
       const { env, body: r, caller } = c;
@@ -783,6 +846,7 @@ export const ROUTES: Route[] = [
         ...(r.policy ? { policy: r.policy } : {}), ...(r.idle_ttl_ms !== undefined ? { idle_ttl_ms: r.idle_ttl_ms } : {}),
         ...(inject.length ? { inject } : {}), ...(r.github_push?.workflows ? { github_push: { workflows: true as const } } : {}),
         ...(r.egress?.allow.length ? { egress: r.egress.allow } : {}), ...(r.env && Object.keys(r.env).length ? { env: r.env } : {}),
+        ...(r.guards?.length ? { guards: r.guards } : {}),
       }));
       // 202: accepted and waiting for a host (SandboxDO retries; an autoscaled cell launches one).
       return json(info, info.host ? 201 : 202);
@@ -790,7 +854,7 @@ export const ROUTES: Route[] = [
   }),
   route({ method: "GET", path: "/v1/sandboxes", auth: "owner", run: (c) => listing(c, "sandbox") }),
   // Its client layer (docs/control-plane/api/clients/#the-client-layer): egress rules, injection bindings,
-  // environment and the push token's opt-ins, replaced whole on a live sandbox within its client's grant,
+  // environment, the push token's opt-ins and request guards, replaced whole on a live sandbox within its client's grant,
   // through the usual policy and secrets push.
   route({ method: "GET", path: "/v1/sandboxes/:sandbox/client-policy", auth: "owner", run: async (c) =>
     newMethod("SandboxDO.clientLayer", async () => (await ownSandbox(c, c.p.sandbox)).clientLayer()) }),
@@ -815,7 +879,9 @@ export const ROUTES: Route[] = [
       const bound = [...inject.map((b) => b.placeholder),
         ...(await stub.policy()).inject.filter((b) => !b.name.startsWith(CLIENT_BINDING_PREFIX)).map((b) => b.placeholder)];
       await checkEnv(c.env, c.caller, r.env ?? {}, bound);
-      return newMethod("SandboxDO.setClientLayer", () => stub.setClientLayer({ egress: r.egress?.allow ?? [], inject, env: r.env ?? {}, workflows: r.github_push?.workflows === true }));
+      return newMethod("SandboxDO.setClientLayer", () => stub.setClientLayer({
+        egress: r.egress?.allow ?? [], inject, env: r.env ?? {}, workflows: r.github_push?.workflows === true, guards: r.guards ?? [],
+      }));
     },
   }),
   route({
@@ -1041,6 +1107,12 @@ export const ROUTES: Route[] = [
   } }),
   route({ method: "GET", path: "/v1/agents/:agent/children", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).children() }),
   route({ method: "PUT", path: "/v1/agents/:agent/rules", auth: "admin", body: z.array(ToolRule), run: ({ env, p, body }) => agent(env, p.agent).setRules(body) }),
+  // The operator's rules cleared: the agent's rules come from its capabilities, as they are now, again
+  // (docs/control-plane/durable-objects/agent/#rules).
+  route({ method: "DELETE", path: "/v1/agents/:agent/rules", auth: "admin", run: ({ env, p }) => {
+    const a = agent(env, p.agent);
+    return newMethod("AgentDO.clearRules", () => a.clearRules());
+  } }),
   // The agent's brokered-action journal, newest first; `before` pages by an earlier page's last created_ms.
   route({ method: "GET", path: "/v1/agents/:agent/brokered", auth: "owner", run: async (c) => {
     const q = c.url.searchParams;
@@ -1153,7 +1225,11 @@ export const ROUTES: Route[] = [
       const self = selfClient(c);
       const name = clientSecretName(c.p.name);
       const limit = { max_count: self.grant.secrets?.max_count ?? 0, max_bytes: self.grant.secrets?.max_bytes ?? SECRET_MAX_BYTES_DEFAULT };
-      return newMethod("BrokerDO.putClientSecret", () => broker(c.env).putClientSecret(self.client, name, c.body.value, c.body.description ?? null, limit));
+      // An expiry already past would store a value nothing can use: refused rather than silently dropped.
+      const expires = c.body.expires_at === undefined ? null : Date.parse(c.body.expires_at);
+      if (expires !== null && expires <= Date.now()) throw new NestError(ErrorCodes.INVALID_MESSAGE, `expires_at ${c.body.expires_at} has passed`);
+      return newMethod("BrokerDO.writeClientSecret", () => broker(c.env).writeClientSecret(self.client, name,
+        { value: c.body.value, description: c.body.description ?? null, expires_ms: expires }, limit));
     },
   }),
   route({ method: "DELETE", path: "/v1/clients/self/secrets/:name", auth: "owner", run: async (c) => {
