@@ -113,15 +113,23 @@ describe("the message", () => {
     expect(at("git push origin task/tsk_a:refs/heads/task/tsk_a")).toBeGreaterThan(-1);
     expect(at("git rev-parse origin/task/tsk_a")).toBeGreaterThan(at("git push origin task/tsk_a:refs/heads/task/tsk_a"));
     expect(at("git checkout -B task/tsk_a <lease>")).toBeGreaterThan(at("git rev-parse origin/task/tsk_a"));
-    expect(at("git rebase origin/develop")).toBeGreaterThan(at("git checkout -B task/tsk_a <lease>"));
-    expect(steps[at("git rebase origin/develop")]).toContain("rerere.enabled true");
-    expect(at("git push --force-with-lease=refs/heads/task/tsk_a:<lease> origin HEAD:refs/heads/task/tsk_a")).toBeGreaterThan(at("git rebase origin/develop"));
+    expect(at("rebase origin/develop")).toBeGreaterThan(at("git checkout -B task/tsk_a <lease>"));
+    expect(steps[at("rebase origin/develop")]).toContain("git -c rerere.enabled=true rebase origin/develop");
+    // rerere for those commands only, never kept in the clone.
+    expect(text).not.toContain("git config rerere");
+    expect(at("git push --force-with-lease=refs/heads/task/tsk_a:<lease> origin HEAD:refs/heads/task/tsk_a")).toBeGreaterThan(at("rebase origin/develop"));
     // Never the rebased branch rebased onto the pushed one (it would replay the base's commits).
     expect(text).not.toMatch(/git rebase <lease>|git rebase "?origin\/task/);
     // Refused: back to the fetch, never plain --force.
     expect(text).toMatch(/go back to step 2/);
     expect(text).toMatch(/never with plain `--force`/);
-    expect(text).toMatch(/merge origin\/develop into task\/tsk_a instead/);
+    // The repo's rules refusing a force-push: the merge is from the branch as pushed, not the rebase, and a plain push.
+    const fallback = steps.find((l) => l.includes("refuse any force-push"))!;
+    expect(fallback.indexOf("git checkout -B task/tsk_a <lease>")).toBeGreaterThan(-1);
+    expect(fallback.indexOf("git merge --no-edit origin/develop")).toBeGreaterThan(fallback.indexOf("git checkout -B task/tsk_a <lease>"));
+    expect(fallback.indexOf("git push origin HEAD:refs/heads/task/tsk_a")).toBeGreaterThan(fallback.indexOf("git merge --no-edit origin/develop"));
+    // Step 1's pull --rebase is finished, and pushed, before step 2.
+    expect(steps[at("git pull --rebase origin task/tsk_a")]).toMatch(/git rebase --continue[\s\S]*Finish this step \(pushed, no rebase in progress\) before step 2/);
     // A base name that isn't a plain ref isn't quoted, nor one that would read as an option.
     for (const bad of ["x`; rm -rf /", "--upload-pack=evil"]) {
       expect(upkeepMessage(pr({ head_ref: "task/tsk_a", base_ref: bad, mergeable: "CONFLICTING" }), ["conflict"], null, ctx)).not.toContain(bad);
@@ -136,8 +144,10 @@ describe("the message", () => {
       const at = (needle: string) => lines.findIndex((l) => l.includes(needle));
       expect(at(`git push origin ${p.head_ref}:refs/heads/${p.head_ref}`), p.head_ref).toBeGreaterThan(-1);
       expect(at(`git checkout -B ${p.head_ref} origin/${p.head_ref}`)).toBeGreaterThan(at(`git push origin ${p.head_ref}:refs/heads/${p.head_ref}`));
-      expect(at("git merge origin/main")).toBeGreaterThan(at(`git checkout -B ${p.head_ref}`));
-      expect(at(`git push origin HEAD:refs/heads/${p.head_ref}`)).toBeGreaterThan(at("git merge origin/main"));
+      expect(at("git merge --no-edit origin/main")).toBeGreaterThan(at(`git checkout -B ${p.head_ref}`));
+      expect(at(`git push origin HEAD:refs/heads/${p.head_ref}`)).toBeGreaterThan(at("git merge --no-edit origin/main"));
+      // Never a plain `git pull` (current git refuses it on divergent branches).
+      expect(text, p.head_ref).not.toMatch(/git pull (?!--no-rebase)/);
       expect(text, p.head_ref).toContain("never force-push it");
     }
     // A branch name that isn't a plain ref, or would read as an option, isn't quoted, in the steps or anywhere.
@@ -294,7 +304,7 @@ describe("telling the worker", () => {
     await readNow(s);
     const text = toldOf(s, n)[0]!.text;
     expect(text).not.toMatch(/--force|force-with-lease|git rebase/);
-    expect(text).toContain("git merge origin/main");
+    expect(text).toContain("git merge --no-edit origin/main");
     expect(text).toContain("git push origin HEAD:refs/heads/feature/owners-work");
   });
 

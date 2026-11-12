@@ -72,7 +72,8 @@ export const ownBranch = (pr: PrNow, task: string) => !pr.cross_repo && pr.head_
  *   GitHub or the owner's fix, is kept), rebased onto the base, and force-pushed with a lease on that very
  *   sha, by an explicit refspec. A push refused because the branch moved starts again from the fetch, which
  *   throws the refused rebase away rather than rebasing it onto the branch (that would replay the base's own
- *   commits); `rerere` replays the conflict resolutions.
+ *   commits); `rerere` (enabled for those commands only) replays the conflict resolutions. Where the repo's rules
+ *   refuse a force-push, the base is merged into the branch as pushed (not the rebase) and pushed plainly.
  * - Any other branch (an attached PR the owner or the manager chose): never forced or rebased. The worker's
  *   own unpushed commits on it pushed first, then the base merged in and a plain push.
  */
@@ -82,22 +83,22 @@ function updateSteps(pr: PrNow, task: string, base: string | null): string[] {
     const own = `task/${task}`;
     return [
       `Bring your branch ${own} up to date with ${b}, keeping any commit someone else pushed to it. Write each sha out in full: shell variables don't last from one command to the next.`,
-      `1. Push any commit of yours that isn't pushed yet, plainly: \`git push origin ${own}:refs/heads/${own}\`. If that's refused because the branch moved, \`git pull --rebase origin ${own}\` and push again. (Only here, before any rebase onto the base.)`,
+      `1. Push any commit of yours that isn't pushed yet, plainly: \`git push origin ${own}:refs/heads/${own}\`. If that's refused because the branch moved, \`git pull --rebase origin ${own}\`; if that stops on conflicts, resolve them and \`git rebase --continue\` until it's done; then push again. Finish this step (pushed, no rebase in progress) before step 2.`,
       `2. \`git fetch origin\`, then \`git rev-parse origin/${own}\`: that sha is <lease> below.`,
       `3. \`git checkout -B ${own} <lease>\`: your branch exactly as pushed, others' commits included.`,
-      `4. \`git config rerere.enabled true\`, then \`git rebase ${b}\`: resolve the conflicts (\`git rebase --continue\`), run the tests.`,
+      `4. \`git -c rerere.enabled=true rebase ${b}\`: resolve the conflicts, \`git -c rerere.enabled=true rebase --continue\` until it's done, run the tests.`,
       `5. \`git push --force-with-lease=refs/heads/${own}:<lease> origin HEAD:refs/heads/${own}\`, with <lease> the sha from step 2.`,
-      `Force-push only this branch, only with that lease, never with plain \`--force\`. If the push is refused because the branch moved, go back to step 2: step 3 throws this rebase away and starts from what's pushed now, and rerere replays your resolutions. If the repo's own rules refuse any force-push, merge ${b} into ${own} instead and push it plainly. The PR is squash-merged either way.`,
+      `Force-push only this branch, only with that lease, never with plain \`--force\`. If the push is refused because the branch moved, go back to step 2: step 3 throws this rebase away and starts from what's pushed now, and rerere replays your resolutions. If the repo's own rules refuse any force-push, merge instead, from the branch as pushed (not your rebase): \`git checkout -B ${own} <lease>\`, \`git merge --no-edit ${b}\`, resolve, run the tests, and \`git push origin HEAD:refs/heads/${own}\` (plain). The PR is squash-merged either way.`,
     ];
   }
   const ref = SAFE_REF.test(pr.head_ref) ? pr.head_ref : null;
   const r = ref ?? "<branch>";
   return [
     `This PR's branch is ${ref ?? "not a name this message quotes (read it with `gh pr view`)"}, not your task branch: never force-push it, and never rebase it. Merge the base into it and push plainly:`,
-    `1. If you have commits on it that aren't pushed, push them first, plainly (\`git push origin ${r}:refs/heads/${r}\`; if refused, \`git pull origin ${r}\` and push again): the next step resets your copy of it to what's pushed.`,
+    `1. If you have commits on it that aren't pushed, push them first, plainly (\`git push origin ${r}:refs/heads/${r}\`; if refused, \`git pull --no-rebase --no-edit origin ${r}\` and push again): the next step resets your copy of it to what's pushed.`,
     `2. \`git fetch origin\`, then \`git checkout -B ${r} origin/${r}\`.`,
-    `3. \`git merge ${b}\`: resolve the conflicts, run the tests.`,
-    `4. \`git push origin HEAD:refs/heads/${r}\`. If it's refused because the branch moved, \`git pull origin ${r}\` (a merge) and push again.`,
+    `3. \`git merge --no-edit ${b}\`: resolve the conflicts, run the tests.`,
+    `4. \`git push origin HEAD:refs/heads/${r}\`. If it's refused because the branch moved, \`git pull --no-rebase --no-edit origin ${r}\` (a merge) and push again.`,
   ];
 }
 
