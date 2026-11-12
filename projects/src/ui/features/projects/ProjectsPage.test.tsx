@@ -29,6 +29,18 @@ describe("projects", () => {
     expect(within(screen.getByRole("article", { name: "Widgets" })).queryByText("Being created")).toBeNull();
   });
 
+  it("a list that fails to refresh after a good read shows the count as unknown (\"?\"), not the old number", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Which key?" })];
+    const { queryClient } = renderApp("/projects", api);
+    expect(await screen.findByRole("link", { name: /1 thing needs you/ })).toBeInTheDocument();
+    api.fail(/^GET \/api\/projects$/, 502, "the Worker is unavailable");
+    await queryClient.refetchQueries({ queryKey: ["projects"], exact: true });
+    const badge = await screen.findByRole("link", { name: /Couldn't check what needs you/ });
+    expect(badge).toHaveTextContent(/^\?$/);
+    expect(screen.queryByRole("link", { name: /1 thing needs you/ })).toBeNull();
+  });
+
   it("a project's \"needs you\" goes to its Board, where asks are answered; the project opens on its Manager", async () => {
     const api = new FakeApi();
     api.asks = [ask({ question: "Which key?" })];

@@ -30,7 +30,8 @@ export function ProjectsPage() {
 
       {projects.isPending ? (
         <LoadingState label="Loading projects" />
-      ) : projects.isError ? (
+      ) : projects.isError && projects.data === undefined ? (
+        // Only a first load that failed: a refresh that fails keeps the list, its counts unknown ("?").
         <ErrorState title="The projects couldn't be loaded" error={projects.error} onRetry={() => void projects.refetch()} />
       ) : projects.data.length === 0 ? (
         <Panel>

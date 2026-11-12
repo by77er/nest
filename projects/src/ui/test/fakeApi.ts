@@ -157,6 +157,8 @@ export class FakeApi {
 
   /** nest couldn't be read for the agents' asks: attention lists the rest with the marker, the count is unknown. */
   asksError: string | null = null;
+  /** The projects list's `needs_you` per project, in place of what this fake lists. */
+  needsYou: Record<string, number | null> | null = null;
 
   attention(): Attention[] {
     const asks: Attention[] = this.asksError !== null ? [{ kind: "asks_unavailable", error: this.asksError, at_ms: 0 }] : this.asks.map((a): Attention => ({ kind: "ask", ...a }));
@@ -192,7 +194,7 @@ export class FakeApi {
       return json({ written: this.sync.written, repos: this.sync.repos });
     }
     if (parts.length === 1) {
-      if (m === "GET") return json({ projects: this.projects.map(({ settings: _s, ...row }) => ({ ...row, needs_you: row.id === "prj_one" ? (this.asksError !== null ? null : this.attention().length) : 0 })) });
+      if (m === "GET") return json({ projects: this.projects.map(({ settings: _s, ...row }) => ({ ...row, needs_you: this.needsYou?.[row.id] ?? (row.id === "prj_one" ? (this.asksError !== null ? null : this.attention().length) : 0) })) });
       const p = project({ id: `prj_new${++seq}`, name: body.name, repo: body.repo.toLowerCase() });
       this.projects.push(p);
       return json({ ...p, catalog_synced: true }, 201);

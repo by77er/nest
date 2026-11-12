@@ -217,6 +217,23 @@ describe("asks", () => {
     await queryClient.refetchQueries({ queryKey: ["projects", "prj_one", "attention"], exact: true });
     await waitFor(() => expect(p).toHaveTextContent(/Couldn't refresh; showing what was read at \d/));
     expect(p).toHaveTextContent("Still here?");
+    // Its count is unknown now, as the sidebar's: "?", never the old number.
+    expect(within(p).getByLabelText("An unknown number of items")).toHaveTextContent("?");
+  });
+
+  it("moving to another project counts its read's moment afresh: no early panel from the last one's wait", async () => {
+    const api = new FakeApi();
+    api.projects = [...api.projects, { ...api.projects[0]!, id: "prj_two", name: "Gadgets", repo: "owner/gadgets" }];
+    api.needsYou = { prj_one: 2, prj_two: 3 };
+    api.holds.push({ match: /^GET \/api\/projects\/prj_(one|two)\/attention$/, until: new Promise(() => {}) });
+    const { router } = renderApp("/projects/prj_one/board", api);
+    // prj_one's read is slow: after a moment the panel says so.
+    expect(await panel()).toHaveTextContent("Reading the agents' asks…");
+    await router.navigate({ to: "/projects/$projectId/board", params: { projectId: "prj_two" } });
+    await screen.findByRole("heading", { level: 1, name: "Gadgets" });
+    // prj_two's read has only just begun: no panel yet; it comes after its own moment.
+    gone();
+    expect(await panel()).toHaveTextContent("Reading the agents' asks…");
   });
 
   it("nest unreadable: the rest is listed, with a line saying the asks couldn't be read", async () => {

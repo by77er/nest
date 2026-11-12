@@ -175,11 +175,13 @@ export function NeedsYou({ projectId, after }: { projectId: string; after?: RefO
   // more waiting than the app's own items (the sidebar's count says so) once the read has taken a moment.
   const reading = list.asks === "reading" && (items.length > 0 || (late && typeof listed === "number" && listed > items.length));
   const shows = items.length > 0 || note !== null || list.asks === "unavailable" || list.stale || reading;
+  // Counted afresh for each project (the same panel shows another's when the route changes).
   useEffect(() => {
+    setLate(false);
     if (list.asks !== "reading") return;
     const t = setTimeout(() => setLate(true), READING_DELAY_MS);
     return () => clearTimeout(t);
-  }, [list.asks]);
+  }, [list.asks, projectId]);
   // An item that had focus left (answered, or gone): focus goes on from where it was, never to the page; with
   // nothing left in the panel, to the board's heading, and that's said.
   useLayoutEffect(() => {
@@ -234,7 +236,8 @@ export function NeedsYou({ projectId, after }: { projectId: string; after?: RefO
   const shown = items.slice(0, SHOWN);
   const rest = items.slice(SHOWN);
   // A count only for a whole list; unknown ("?") while the asks are read or can't be; none for a note alone.
-  const count = items.length === 0 && whole && !list.stale ? undefined : whole ? items.length : null;
+  // A stale read's count is unknown now too ("?", as the sidebar's): the stale line says what was read and when.
+  const count = items.length === 0 && whole && !list.stale ? undefined : whole && !list.stale ? items.length : null;
   return (
     <>
       {live}
