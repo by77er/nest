@@ -34,6 +34,7 @@ Base: origin/main 6bbf64f.
 | The UI (Routes) | omitted triage, secrets and network | routes exist | projects/src/ui/router.tsx:69-85 |
 | The UI (board) | "the columns' old order", "as before" | wording | — |
 | The live trace | the route serves the manager, a worker or a reviewer; mounts ManagerTrace, TaskTraces, ReviewTrace | routine runs are recorded too and have `RunTrace` | projects/src/do/project.ts:3168; trace.ts:16-20; ui/features/trace/AgentTraces.tsx:25 |
+| Design system (primitives) | `JumpPill`, `StreamText`, `ActivityLine` (chat) and `TouchTarget` | no `StreamText`, `ActivityLine` or `TouchTarget` in src/ui; `JumpPill` is private to `ComposerDock`; the chat's exported primitives are SpinnerSlot, WorkingLine, StepRow, StepField, StepList, StepsDisclosure, ComposerBox, ChatWelcome, Starter | projects/src/ui/layout/ChatLog.tsx:23-320 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
@@ -53,6 +54,9 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Descriptions: sampled (DescriptionField, RichEditor, editor-markdown.ts exist); no drift found. Not every interaction claim was exercised.
+- Rich messages: no drift (CODE_MAX_LINES 25 / CODE_SHOWN 20 ui/features/rich/RichMessage.tsx:46-47, HIGHLIGHT_MAX 20,000 ui/rich/highlight.ts:35, SVG_MAX_BYTES 200 KB ui/rich/svg.ts:13, headings +3 ui/rich/tasks.ts:75, CSP csp.ts).
+- Design system: one correction (primitives); tokens match theme.ts (colors :19-46, radii, motion 120/180/240 and curves :118-122, pageMax 90rem = 1440 px, sidebar 16.5rem = 264 px, readingMeasure 42rem :145); every other named primitive is exported from ui/layout.
 - The live trace: one correction; MAX_EVENTS 2000, reconnect 1 s→30 s, ping 25 s ui/features/trace/model.ts:51,187-189; routes trace.ts.
 - The UI (intro): corrections above; POLL chat 3 s / board 5 s / project 10 s ui/api/queries.ts:32 match.
 - The manager chat: CHAT_PAGE 50 / CHAT_PAGE_MAX 200 do/project.ts:317-318, interrupt api.ts:395, LIVE_SHOWN 4 and HOLD_MAX_MS 30 s ui/features/chat/ChatView.tsx:107,153, nest's ring 1,000 events/24 h and 16 KB/4 KB control-plane/src/lib/trace.ts:9-15 match.
