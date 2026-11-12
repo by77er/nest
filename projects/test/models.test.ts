@@ -437,6 +437,18 @@ describe("a project's models", () => {
       await stub(q).drain();
       expect(await settings(q)).toMatchObject({ manager_switch: null, manager_switch_given_up: null });
       expect((await row(q)).manager_running_model).toBe("claude-sonnet-5-5");
+
+      // A switch onto it that applies after all (owed however it came to be, the setting unchanged): cleared.
+      const r = await newProject();
+      const rm = fake.agents.get(r.manager)!;
+      await setModel(r, "claude-sonnet-5-5");
+      await giveUpThrice(r);
+      expect((await settings(r)).manager_switch_given_up).toBe("claude-sonnet-5-5");
+      await runInDurableObject(stub(r), (_o, st) => { st.storage.sql.exec("UPDATE settings SET switch_next_ms = 0"); });
+      await alarm(r);
+      expect(rm.restarts).toHaveLength(4);
+      expect(await settings(r)).toMatchObject({ manager_switch: null, manager_switch_given_up: null });
+      expect((await row(r)).manager_running_model).toBe("claude-sonnet-5-5");
     });
 
     it("another model isn't held back or counted by nest's give-ups of the last", async () => {
