@@ -22,7 +22,7 @@
 
 | Model action / choice | Rule | Code at 82396b3 | Conforms | Detail |
 |---|---|---|---|---|
-| `SessOK`, `Hello` | 1 | agent.ts:426-429, 1308-1311, 1320-1327 | yes | Epoch-0 exception for a hands-less previous-release runner (428). Since #62, `isCurrent` checks `epoch = brain.epoch` only, so `SessOK` matches the model exactly |
+| `SessOK`, `Hello` | 1 | agent.ts:426-429, 1308-1311, 1320-1327 | yes | Epoch-0 exception for a hands-less previous-release runner (428). Since #62, `isCurrent` checks only that the brain isn't condemned and `epoch = brain.epoch`, so `SessOK` matches the model exactly |
 | `ResolveReq`/`ResolveResp` | 1 | agent.ts:1216-1232 | yes | `current()` before and after the await; sandbox.ts unchanged since a38d3c0 |
 | (platform calls, events) | 1 | agent.ts:920-924, 1901, 2014, 1590-1597 | yes | Unchanged |
 | `RWake` | 2 | agent.ts:1031-1057, 2155-2166 | partly | As at 6073da7: a live brain without a session is condemned after 10 min |

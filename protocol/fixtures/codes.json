@@ -19,7 +19,8 @@
     "conflict",
     "not_found",
     "tool_error",
-    "busy"
+    "busy",
+    "at_capacity"
   ],
   "gateway_error_codes": [
     "unauthorized",

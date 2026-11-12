@@ -15,7 +15,7 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 ## Conventions
 
 - **SQLite holds metadata only:** heads, indexes, current state. Bulk data goes to R2 (through bindings) or S3 (written by hosts).
-- **Secret values live only in BrokerDO** (platform keys are Worker secrets). Other DOs store and pass secret *references* (`$nest-secret:<name>`). FleetDO resolves them when it sends a command to a host, so stored command bodies and the resend queue never hold a token or key.
+- **Secret values live only in BrokerDO** (platform keys are Worker secrets or in AWS KMS; an API client's webhook signing secret, which nest generates, is in its ClientDO). Other DOs store and pass secret *references* (`$nest-secret:<name>`). FleetDO resolves them when it sends a command to a host, so stored command bodies and the resend queue never hold a token or key.
 - **Everything from a host carries `(sandbox, epoch)`** and is checked against the current lease: the reporting host must hold it at that epoch. Stale or foreign reports are dropped.
 - **Reliable delivery is at least once and strictly in order.** Each inbound message is the next seq (processed and acked), a duplicate (re-acked), or a gap. A gap, or a failure while processing, closes the connection; the peer reconnects and resends after the last acked seq. A later message's ack never covers an earlier failed one. A new peer process (`instance_id`) starts a new lineage.
 - **No lost updates across awaits.** A DO's input gate opens while it awaits R2 or another DO, so state is never saved from a copy loaded before an await: mutations load, apply and save synchronously. Inbound WebSocket messages are processed one at a time per connection.

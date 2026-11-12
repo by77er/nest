@@ -162,12 +162,17 @@ pub mod error_codes {
     /// Refused because the agent is working now (a restart asked for only when idle, while a turn
     /// runs or is queued): ask again later. HTTP 409.
     pub const BUSY: &str = "busy";
+    /// A live-count limit is full (an API client's grant's `max_agents` or `max_sandboxes`, a
+    /// spawner's live children): there is room once fewer are live than the limit. The message
+    /// names the limit. HTTP 429, retryable.
+    pub const AT_CAPACITY: &str = "at_capacity";
 
     /// Every code above that is sent (the legacy alias is not).
     pub const ALL: &[&str] = &[
         STALE_EPOCH, PARENT_MISMATCH, UNKNOWN_SANDBOX, UNKNOWN_AGENT, UNAUTHORIZED, FORBIDDEN,
         UNSUPPORTED_VERSION, INVALID_MESSAGE, UNKNOWN_TOOL, CAPACITY_EXHAUSTED, RATE_LIMITED, NOT_BOUND,
         SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN, CONFLICT, NOT_FOUND, TOOL_ERROR, BUSY,
+        AT_CAPACITY,
     ];
 
     /// `unsupported_version` under either name.

@@ -43,7 +43,7 @@ pub const CAP_INTERRUPT: &str = "interrupt_receipt_v1";
 
 /// The only Claude Code built-ins a brain may have, none touching the host's files or running a
 /// command there: subagents (`Agent`, `Task` before 2.1), the task and todo tools (state in the
-/// config dir), the web tools (through the host's egress allowlist), and the MCP resource tools
+/// config dir), the web tools (the brain host's egress, 443 only; no host allowlist is built), and the MCP resource tools
 /// (the `nest` server only). A built-in Claude Code adds later is refused until listed here.
 pub const HOST_SAFE_BUILTINS: &[&str] = &[
     "Agent", "Task", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "TodoWrite", "WebSearch", "WebFetch",

@@ -41,6 +41,9 @@ pub struct Config {
     pub session_open_timeout: Duration,
     /// Hook spool drain interval.
     pub spool_interval: Duration,
+    /// How long a `PreToolUse` hook waits for AgentDO's `approval_check` answer: well inside the
+    /// 8 s `nest hook` gives the runner (Claude Code gives the hook 10 s).
+    pub approval_check_timeout: Duration,
 }
 
 impl Default for Config {
@@ -62,6 +65,7 @@ impl Default for Config {
             tools_list_timeout: Duration::from_secs(10),
             session_open_timeout: Duration::from_secs(10),
             spool_interval: Duration::from_secs(5),
+            approval_check_timeout: Duration::from_secs(5),
         }
     }
 }

@@ -113,6 +113,18 @@ export function summarize(h: HistoryRow): string {
       return str(o.title) ? `"${clip(str(o.title)!)}", which it waits on, is done` : str(o.blocker) ? `${str(o.blocker)}, which it waits on, is done` : "A dependency is done";
     case "worker_notified":
       return Array.isArray(o.fields) && o.fields.length ? `Its worker was told of the change (${o.fields.join(", ")})` : "Its worker was told of the change";
+    // A worker owns its PR until it merges (README.md#pr-upkeep): what it was told about it.
+    case "pr_upkeep": {
+      const said = { review_failed: "failed review", checks_failed: "has failing checks", conflict: "conflicts with its base" } as Record<string, string>;
+      const all = Array.isArray(o.told) ? o.told.map(String) : [];
+      // A condition this page doesn't know (a later release's) is still said, in general words.
+      const told = [...new Set(all.map((c) => said[c] ?? "needs work"))];
+      const pr = typeof o.pr === "number" ? `PR #${o.pr}` : "its PR";
+      // Told again (still so at the same head, hours on): a reminder.
+      const verb = o.again === true ? "reminded" : "told";
+      const what = told.length ? (told.length > 1 ? `${told.slice(0, -1).join(", ")} and ${told[told.length - 1]}` : told[0]) : "needs work";
+      return `Its worker was ${verb} ${pr} ${what}`;
+    }
     case "worker_not_notified":
       return "Its worker couldn't be told of the change";
     case "block_answered":
