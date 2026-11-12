@@ -1405,7 +1405,7 @@ export class AgentDO extends DurableObject<Env> {
       return;
     }
     if (info.hands && !info.ended!.sandbox) {
-      const r = await this.sandboxStub(info.hands.sandbox).release(info.agent, info.ended!.destroy_sandbox);
+      const r = await this.sandboxStub(info.hands.sandbox).release(info.agent, info.ended!.destroy_sandbox, info.ended!.by);
       this.update((i) => {
         if (i.ended) i.ended.sandbox = r.destroyed ? "destroyed" : "detached";
       });

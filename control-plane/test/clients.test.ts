@@ -417,6 +417,28 @@ describe("the grant bounds everything in the subtree", () => {
     await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
   });
 
+  it("ending its agent with destroy_sandbox destroys the client's own sandbox once no other agent is attached, and frees its place", async () => {
+    const c = await newClient({ max_sandboxes: 1 });
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/hands`, { method: "PUT", body: basic({ capabilities: ["nest", "hands"], hands: "required" }) });
+    const s = await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
+    const a1 = await createAgent(c, { template: `${c.name}/hands`, sandbox: s.sandbox });
+    const a2 = await createAgent(c, { template: `${c.name}/hands`, sandbox: s.sandbox });
+    const step = (agent: string) => eventually(`${agent}'s sandbox step`, async () => (await agentStub(agent).info()).ended?.sandbox);
+    const sbx = () => asJson(c.token, `/v1/sandboxes/${s.sandbox}`);
+    // Another agent is attached: detached, kept.
+    await asJson(c.token, `/v1/agents/${a1.agent}/stop`, { body: { end: true, destroy_sandbox: true } });
+    expect(await step(a1.agent)).toBe("detached");
+    expect(await sbx()).toMatchObject({ attached: [a2.agent] });
+    expect((await sbx()).state).not.toBe("destroyed");
+    // Alone in it: destroyed by the client's end, and its place in max_sandboxes is free again.
+    await asJson(c.token, `/v1/agents/${a2.agent}/stop`, { body: { end: true, destroy_sandbox: true } });
+    expect(await step(a2.agent)).toBe("destroyed");
+    expect((await agentStub(a2.agent).info()).ended).toMatchObject({ by: c.id, destroy_sandbox: true });
+    expect((await sbx()).state).toBe("destroyed");
+    await eventually("the destroyed sandbox's place", async () => (await adminJson(`/v1/admin/clients/${c.id}`)).live.sandboxes === 0);
+    await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell } }, 202);
+  });
+
   it("a reservation whose create never happened is dropped by the reconcile; one whose object exists stays counted", async () => {
     const c = await newClient({ max_agents: 2 });
     const real = await createAgent(c);
