@@ -2,6 +2,8 @@
 
 > **Study, not a decision.** Code on `main` (edf6829); every claim cites `file:line`. Contract: [control-host](../../interfaces/control-host/), [fleet](../../interfaces/control-host/fleet/), [session](../../interfaces/control-host/session/); settled rule in [docs/README.md](../../README.md) ("Reliable channels deliver strictly in order ... a new `instance_id` resets the lineage").
 
+**Pilot:** [pilot/](pilot/), the Stateright model of command delivery.
+
 > **Since:** the fleet direction is now checked over nestd's real core ([nestd/](../nestd/)). B1, B2 (with the pilot's F2 and F3), B3 and the pilot's F4 are fixed there (#39); the checker shows each fix holds, and each, removed, fails. B5 is open ([nestd/](../nestd/#open-questions)); B4 has not been re-checked. Since 2026-11-06 the runner's session receiver has a gap check and never skips a reliable message it can't read (`session.rs` `classify`, `unparsed_seq`): either is a protocol error that ends the connection, reported to nestd, before any ack. B6 is confirmed (a 100 ms reconnect loop) and now paced by a backoff that starts over only after a healthy connection; AgentDO's quarantine is still open.
 
 ## Scope and actors
