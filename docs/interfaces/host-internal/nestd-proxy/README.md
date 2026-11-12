@@ -96,8 +96,9 @@ FleetDO         nestd (root)                                      nest-proxy    
 | `invalid_headers` (designed) | deny | Smuggling-shaped request (`Connection` naming a protected field, a transfer coding other than `chunked`, a protected `Trailer`) or over the header limits |
 | `host_sni_mismatch` | alert | Decrypted `Host` ≠ SNI (domain fronting) |
 | `sni_mismatch` | alert | CONNECT tunnel's SNI ≠ the CONNECT authority (domain fronting) |
+| `host_mismatch` / `duplicate_host` | deny | Plain HTTP whose `Host` isn't the routed host / that carries more than one `Host` (over TLS, an alert: `host_sni_mismatch` / `duplicate_host`) |
 | `placeholder_wrong_host` | alert | A binding's placeholder sent to a host outside the binding |
-| `injection_unavailable` | deny | Placeholder present but its secret is missing, expired or fenced |
+| `injection_unavailable` | alert | Placeholder present but its secret is missing, expired or fenced; refused (403) and raised as `alert{injection_after_expiry}` |
 | `injection_requires_tls` | deny | Placeholder over plain HTTP |
 | `trace_with_credential` | deny | `TRACE` or `TRACK` with a placeholder substituted (the upstream would echo the secret) |
 | `injection_out_of_scope` (designed) | deny | Placeholder on a method or path outside the binding |
