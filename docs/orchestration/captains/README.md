@@ -22,7 +22,7 @@ priority: high
 credential: claude_oauth_token:captain   # revocable separately from workers
 ```
 
-**Built so far:** the seeded `captain` template ([CatalogDO](../../control-plane/durable-objects/catalog/)): the interim `transcripts`, `sandboxes`, `brokered`, `management` and `memory` capabilities (most of their tools answer `not_implemented`; see [tools](../../agents/tools/)), a replaced prompt with no built-ins, `hands: forbidden` and `credential: claude_oauth_token:captain`; a new catalog's also lists `spawning` (`agent_spawn` from `worker`, `agent_stop` on what it spawned: [lifetimes](../../agents/#lifetimes)), and a worker it spawns `ephemeral` ends itself when its task's turn is done. The other capabilities above aren't built.
+**Built so far:** the seeded `captain` template ([CatalogDO](../../control-plane/durable-objects/catalog/)): the interim `transcripts`, `sandboxes`, `brokered`, `management` and `memory` capabilities (most of their tools answer `not_implemented`; see [tools](../../agents/tools/)), a replaced prompt with no built-ins, `hands: forbidden` and `credential: claude_oauth_token:captain`; a new catalog's also lists `spawning` (`agent_spawn` from `worker`, `agent_stop` on what it spawned: [lifetimes](../../agents/#lifetimes)), and a worker it spawns `ephemeral` ends itself when its task's turn is done. The other capabilities above aren't built, nor are the `backend`, `priority` and `budget` fields; the built way to wake itself is the seeded [`timers`](../../agents/capabilities/timers/) capability, which no seed template lists.
 
 ## Conventions in its prompt
 
@@ -33,13 +33,13 @@ credential: claude_oauth_token:captain   # revocable separately from workers
 - **Grouping its work:** per piece of work, a shared log in its coordination app, plus the sandboxes and workers it owns; workers report there (blocked, PR open, done), and the app delivers what needs the captain to its inbox, batched. Nothing else tells it a worker finished, so every task names where to report; it can also read its workers' transcripts. Stopping the work means stopping the agents it owns for it and destroying their sandboxes.
 - **Attach or fork is its call:** the same sandbox for a reviewer watching an implementer or a tester hitting a live dev server (a captain reading their output becomes tainted); a fork for independent attempts and anything that might be thrown away.
 - **Staying clean:** a captain that reads worker output becomes [tainted](../../agents/tools/#taint-and-sinks), and its sink calls then need my approval. It can stay clean on **quarantined reports** (a `report_schema` of enums, numbers and ids).
-- **Inspection without hands is a pure pattern:** no inspection tool or reader template ships. Read-only forks and report schemas are the primitives; how it gets details is its own call.
+- **Inspection without hands is a pure pattern:** no inspection tool or reader template ships. Read-only forks and report schemas are the primitives (neither is built yet); how it gets details is its own call.
 - **Continuity:** its memory, read by key at each wake. The Claude Code session is a cache, so a fresh session or a backend switch loses nothing.
 - **Escalation:** it answers its workers' questions (through the coordination app) itself when it can, and leaves the rest to me. A sink approval a worker waits on is mine (or the API client's whose subtree it is in): no agent can answer an ask yet, though the design lets an untainted holder of the grant approve ([taint and sinks](../../agents/tools/#taint-and-sinks)).
 
 ## Safeguards
 
 - A captain acts only through tool calls bounded by its grants, its budget and its taint; all three are bounded by mine.
-- Its workers get only grants and budget it holds; the `worker` template gives agents with hands no management capabilities (no `spawning`, `management` or `authority`); its interim `sandboxes` lists only `fork_sandbox`, which answers `not_implemented`.
+- Its workers get what the `worker` template gives, narrowed by the captain's overrides and never widened: the spawn grant on the template (its capability's `spawn`) is the operator's authorization for it, so a captain that holds no repos still spawns workers that push. Budgets aren't built (fixed depth and live-children caps stand in). The `worker` template gives agents with hands no management capabilities (no `spawning`, `management` or `authority`); its interim `sandboxes` lists only `fork_sandbox`, which answers `not_implemented`.
 - It can use a separate setup token from workers (`credential` above).
-- `priority: high` reserves subscription headroom for it.
+- `priority: high` reserves subscription headroom for it (designed, not built: [scheduling](../scheduling/)).
