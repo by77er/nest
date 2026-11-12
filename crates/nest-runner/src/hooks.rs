@@ -159,7 +159,8 @@ impl Answer {
     }
 }
 
-/// Answer a sync hook, from local state only: it never waits on the network.
+/// Answer a sync hook from local state, except a call a rule holds, which waits for AgentDO's
+/// `approval_check` (bounded by `Config::approval_check_timeout`).
 pub async fn decide(rt: &Runtime, req: &HookDecisionRequest) -> Answer {
     let event = req.input.get("hook_event_name").and_then(Value::as_str).unwrap_or_default();
     let Some(agent) = rt.agent(&req.agent) else { return fallback(&req.input).into() };
@@ -380,7 +381,8 @@ mod tests {
     async fn answer_check(a: &Agent, out: &mut mpsc::UnboundedReceiver<Outbound>, answer: Option<ApprovalOutcome>) -> (nest_protocol::model::CallId, Vec<Outbound>) {
         let mut others = Vec::new();
         loop {
-            match out.recv().await.expect("an outbound message") {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv()).await;
+            match next.expect("an approval_check within 5 s").expect("an outbound message") {
                 Outbound::ApprovalCheck { request, call, tool, input } => {
                     assert_eq!((tool.as_str(), &input), ("WebFetch", &json!({"url": "https://x", "prompt": "p"})));
                     a.resolve_check(&request, answer);
@@ -462,7 +464,19 @@ mod tests {
             }
         }
         assert!(a.pending_checks.lock().unwrap().is_empty(), "the timed-out check is forgotten");
-        a.resolve_check(&request.expect("a check was sent"), Some(ApprovalOutcome::Approved { ask: nest_protocol::model::AskId("ask_late".into()) }));
+        let late = request.expect("a check was sent");
+        a.resolve_check(&late, Some(ApprovalOutcome::Approved { ask: nest_protocol::model::AskId("ask_late".into()) }));
+        // The late approval let nothing through: the model's retry is checked afresh, and is held.
+        let hook = { let rt = rt.clone(); tokio::spawn(async move { decide(&rt, &web_fetch()).await.output }) };
+        let fresh = loop {
+            let next = tokio::time::timeout(std::time::Duration::from_secs(5), out.recv()).await;
+            if let Outbound::ApprovalCheck { request, .. } = next.expect("a fresh check within 5 s").expect("an outbound message") {
+                break request;
+            }
+        };
+        assert_ne!(fresh, late);
+        a.resolve_check(&fresh, Some(ApprovalOutcome::Pending { ask: nest_protocol::model::AskId("ask_again".into()) }));
+        assert_eq!(pre(&hook.await.unwrap()), PermissionDecision::Deny);
     }
 
     #[test]

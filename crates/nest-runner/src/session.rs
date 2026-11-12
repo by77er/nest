@@ -375,14 +375,19 @@ impl Session {
         }
     }
 
-    /// Send an `approval_check` on a connection whose AgentDO takes them; on one that doesn't (a
-    /// previous release's), answer it unsupported instead, so the hook escalates the call: that
+    /// Send an `approval_check` whose hook still waits, on a connection whose AgentDO takes them; on
+    /// one that doesn't (a previous release's), answer it unsupported instead, so the hook escalates the call: that
     /// AgentDO would refuse the message as invalid and the runner would reconnect.
     async fn send_check<S>(&self, st: &State, tx: &mut S, check: RunnerToAgent) -> anyhow::Result<()>
     where
         S: futures_util::Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
     {
         let RunnerToAgent::ApprovalCheck { request, .. } = &check else { return Ok(()) };
+        // Its hook gave up (a check queued across a reconnect that outlasted the wait): never sent,
+        // or AgentDO would spend an approval, or hold an ask, for a call already denied.
+        if !self.agent.pending_checks.lock().unwrap().contains_key(request) {
+            return Ok(());
+        }
         if st.rule_approvals {
             tx.send(text(&check)?).await?;
         } else {
@@ -733,12 +738,14 @@ mod resolve_tests {
     }
     /// An `approval_check` made while the channel is down waits for the next `hello_ack`: sent if it
     /// says `rule_approvals` (and AgentDO's answer reaches the hook), answered unsupported and never
-    /// sent if it doesn't (an AgentDO of the previous release would refuse it as invalid).
+    /// sent if it doesn't (an AgentDO of the previous release would refuse it as invalid), and never
+    /// sent once its hook has given up.
     #[tokio::test]
     async fn a_check_made_while_disconnected_goes_only_to_an_agentdo_that_takes_checks() {
         use nest_protocol::control::ApprovalOutcome;
         use nest_protocol::model::AskId;
-        for takes_checks in [true, false] {
+        for (takes_checks, wait) in [(true, Duration::from_secs(10)), (false, Duration::from_secs(10)), (true, Duration::from_millis(50))] {
+            let gave_up = wait < Duration::from_secs(1);
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("ws://{}/v1/agents/agt_c/session", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
@@ -777,7 +784,7 @@ mod resolve_tests {
             let waiter = {
                 let a = agent.clone();
                 tokio::spawn(async move {
-                    a.check_approval(model::CallId("cal_c-1".into()), "WebFetch", serde_json::json!({}), Duration::from_secs(10)).await
+                    a.check_approval(model::CallId("cal_c-1".into()), "WebFetch", serde_json::json!({}), wait).await
                 })
             };
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -785,7 +792,11 @@ mod resolve_tests {
             let got = waiter.await.unwrap();
             let checks = server.await.unwrap();
             assert_eq!(agent.checks_approvals(), takes_checks);
-            if takes_checks {
+            if gave_up {
+                // Its hook gave up before the connection came: never sent, so nothing is spent on a call already denied.
+                assert_eq!(got, Err(crate::runtime::CheckFailed::Timeout));
+                assert!(checks.is_empty(), "a check whose hook gave up was sent: {checks:?}");
+            } else if takes_checks {
                 assert_eq!(got, Ok(ApprovalOutcome::Approved { ask: AskId("ask_c".into()) }));
                 assert_eq!(checks, [("cal_c-1".to_string(), "WebFetch".to_string())]);
             } else {

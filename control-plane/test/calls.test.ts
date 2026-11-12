@@ -257,7 +257,10 @@ describe("CallLedger: the guards are the ledger's", () => {
     // concurrent identical call, the model's retry, a restarted brain's or a new epoch's call); `again`
     // repeats the last check's key; `prune` runs a century on, everything aged; `evict` builds the ledger
     // anew on the same storage (an eviction or a new release); `sink` approves a sink call of the same name
-    // and arguments. Bounds: 7 actions, depth 5 (16,807 sequences), one call's arguments.
+    // and arguments. Bounds: 7 actions, every sequence of length 1 to 5 (19,607), one call's arguments.
+    // What it covers is the ledger (`checkRule`, `decide`, `prune`): the AgentDO glue around it (the
+    // epoch guard, the kind it records, the expiry `answerAsk` computes) is session.test.ts's. "None
+    // lost" is the ledger's: a check whose answer never reaches the runner still loses its approval.
     const ACTIONS = ["check", "again", "approve", "deny", "prune", "evict", "sink"] as const;
     const DEPTH = 5;
     const CENTURY = 100 * 365 * 86_400_000;

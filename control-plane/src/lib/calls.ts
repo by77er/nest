@@ -78,7 +78,7 @@ export function approvalStep(status: ApprovalStatus, event: ApprovalEvent): Appr
 
 /**
  * Whether an approval may be spent on the call key `key` at `nowMs`: approved, not expired (a rule's
- * never expires; a sink's has an expiry and is past it, or has none and is never usable), and not
+ * never expires; a sink's is usable only before its expiry, and one with none never is), and not
  * already spent on another call (its own redelivery may use it again). One approval, one call.
  */
 export function approvalUsable(
