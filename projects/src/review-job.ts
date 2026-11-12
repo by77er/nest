@@ -4,7 +4,8 @@
 //   queued ──start──▶ running ──verdict──▶ done
 //     │                │  ├──retry (an exit or a deadline, attempts left)──▶ running (a new reviewer)
 //     │                │  ├──give_up (an exit or a deadline, none left)────▶ failed
-//     │                │  └──refused (GitHub or nest, for good)────────────▶ failed
+//     │                │  ├──refused (GitHub or nest, for good)────────────▶ failed
+//     │ ◀──wait (nest at its grant's max_agents or max_sandboxes)──┘
 //     └──superseded / closed (a newer head, the PR closed)──────────────────▶ superseded / closed
 //   done, failed, superseded, closed ──requeue (rerequested, head back, reopened)──▶ queued
 //
@@ -21,6 +22,10 @@
 // job is never requeued by GitHub's events; ReviewDO also refuses to requeue any job whose head needed
 // approval and never got it, whatever its state.
 //
+// A running job whose reviewer nest won't start for capacity (its grant's max_agents or max_sandboxes,
+// src/nest.ts `atCapacity`) waits queued again (`wait`), as a job over max_concurrent_reviews does, and
+// starts once there's room. It was approved (or needed no approval) to run, so waiting changes nothing of that.
+//
 // While running, a job advances through its check run, its reviewer and the reviewer's brief (columns,
 // not states), and always has a deadline: a run that neither submits nor exits by then is an attempt
 // spent, like an exit without a verdict. So a running job always has a timed way out.
@@ -28,8 +33,8 @@
 export type JobState = "held" | "overflow" | "queued" | "running" | "done" | "failed" | "superseded" | "closed" | "dismissed";
 export const JOB_STATES: readonly JobState[] = ["held", "overflow", "queued", "running", "done", "failed", "superseded", "closed", "dismissed"];
 
-export type JobEvent = "start" | "verdict" | "retry" | "give_up" | "refused" | "superseded" | "closed" | "requeue" | "approve" | "dismiss" | "hold" | "park" | "trust";
-export const JOB_EVENTS: readonly JobEvent[] = ["start", "verdict", "retry", "give_up", "refused", "superseded", "closed", "requeue", "approve", "dismiss", "hold", "park", "trust"];
+export type JobEvent = "start" | "verdict" | "retry" | "give_up" | "refused" | "wait" | "superseded" | "closed" | "requeue" | "approve" | "dismiss" | "hold" | "park" | "trust";
+export const JOB_EVENTS: readonly JobEvent[] = ["start", "verdict", "retry", "give_up", "refused", "wait", "superseded", "closed", "requeue", "approve", "dismiss", "hold", "park", "trust"];
 
 /** The ends a job can reach: each owes its check's completion (once) and its reviewer's stop. */
 export const JOB_ENDS: ReadonlySet<JobState> = new Set(["done", "failed", "superseded", "closed", "dismissed"]);
@@ -38,7 +43,7 @@ const TABLE: Record<JobState, Partial<Record<JobEvent, JobState>>> = {
   held: { approve: "queued", trust: "queued", dismiss: "dismissed", superseded: "superseded", closed: "closed" },
   overflow: { approve: "queued", trust: "queued", hold: "held", superseded: "superseded", closed: "closed" },
   queued: { start: "running", superseded: "superseded", closed: "closed" },
-  running: { verdict: "done", retry: "running", give_up: "failed", refused: "failed", superseded: "superseded", closed: "closed" },
+  running: { verdict: "done", retry: "running", give_up: "failed", refused: "failed", wait: "queued", superseded: "superseded", closed: "closed" },
   done: { requeue: "queued" },
   failed: { requeue: "queued" },
   superseded: { requeue: "queued", hold: "held", park: "overflow" },

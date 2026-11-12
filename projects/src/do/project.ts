@@ -12,7 +12,7 @@ import { roleTemplate, TEMPLATE } from "../catalog";
 import { DEFAULT_MODEL, modelLabel, type ModelRole, modelProblem } from "../models";
 import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
-import { type AttachChange, DIMENSIONS, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
+import { type AttachChange, DIMENSIONS, GitHubError, githubFor, PERMISSIONS, requireReviewCheck, type Verdict } from "../github";
 import type { AgentCaller } from "../identity";
 import { type AgentView, backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras, stopRefused } from "../nest";
 import { envName, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
@@ -26,7 +26,9 @@ import { MAX_WAITS, type PrUntil, prVerdict, taskVerdict, timeoutProblem, type W
 import { MAX_NOTES, mayWriteMemory, NOTE_KEY, NOTE_MAX, type Note, preview } from "../memory";
 import type { RoutineKind, RoutinePreset } from "../requests";
 import { type Created, firedTrigger, MAX_PROPOSALS_PER_RUN, MAX_ROUTINES, MAX_START_ATTEMPTS, MAX_UNTRIAGED_PROPOSALS, nextTimerFire, type RoutineFields, routineSpawnExtras, runBrief, type RunOutcome, type RunState, startVerdict, type TriggerKind, type Triggers } from "../routines";
-import { EARLY_EXITS_KEEP_MS, ENDED_RUNS_KEEP_MS, ERRORS_KEEP_MS, PRUNE_EVERY_MS, RUN_TURNS_KEEP_MS, TRIAGED_PROPOSALS_KEEP_MS } from "../retention";
+import { EARLY_EXITS_KEEP_MS, ENDED_RUNS_KEEP_MS, ERRORS_KEEP_MS, PR_TOLD_KEEP_MS, PRUNE_EVERY_MS, RUN_TURNS_KEEP_MS, TRIAGED_PROPOSALS_KEEP_MS } from "../retention";
+import { type PrNow, readPrs } from "../pr-read";
+import { prConditions, UPKEEP_CONDITIONS, type UpkeepCondition, upkeepMessage } from "../pr-upkeep";
 import { randomId } from "./directory";
 import { type ManagerEvent, type ManagerLife, managerStep } from "../manager";
 import { OUTBOX, type OutboxEvent, type OutboxPolicy, type OutboxRow, type OutboxState, outboxState, outboxStep, pruneBefore, verdict } from "../outbox";
@@ -579,6 +581,17 @@ export const MIGRATIONS = [
     "ALTER TABLE settings ADD COLUMN refusal_check_ms INTEGER",
     "ALTER TABLE settings ADD COLUMN switch_gave_up_model TEXT",
   ],
+  [
+    // A worker owns its PR until it merges (README.md#pr-upkeep). The only record kept: that this worker was
+    // told of this condition on this PR at this head commit, so it's told once. The PRs themselves are read
+    // from GitHub each time; these columns only schedule that read (when next, when last, its failures).
+    // `cleared`: a read saw it not hold at that head since (so its return is told, but not within PR_FLAP_MS).
+    `CREATE TABLE pr_told (agent TEXT NOT NULL, pr INTEGER NOT NULL, head TEXT NOT NULL, cond TEXT NOT NULL, at_ms INTEGER NOT NULL,
+      cleared INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (agent, pr, head, cond))`,
+    "ALTER TABLE settings ADD COLUMN pr_read_next_ms INTEGER",
+    "ALTER TABLE settings ADD COLUMN pr_read_last_ms INTEGER",
+    "ALTER TABLE settings ADD COLUMN pr_read_attempts INTEGER NOT NULL DEFAULT 0",
+  ],
 ] as const;
 
 /** The roles an ask's agent may carry in its labels (as the webhook routes them); any other reads as none. */
@@ -596,6 +609,14 @@ const SWITCH_RECHECK_MS = 60_000;
 /** nest gave a switch's restart up: tried again after this, doubling, until it has given it up SWITCH_REFUSALS times. */
 const REFUSAL_BACKOFF_MS = 5 * 60_000;
 const SWITCH_REFUSALS = 3;
+
+/** How often the PRs live workers own are read from GitHub (README.md#pr-upkeep), and the least time between two reads (a nudge's). */
+export const PR_READ_EVERY_MS = 60_000;
+export const PR_READ_GAP_MS = 30_000;
+/** A condition still holding at the same head is told again after this (README.md#pr-upkeep): a message lost or ignored doesn't strand the PR. */
+export const PR_RETELL_MS = 3 * 3600_000;
+/** A condition that cleared and returned at the same head (a flapping check) is told again no sooner than this after its last telling. */
+export const PR_FLAP_MS = 30 * 60_000;
 
 /** A failed stop's `next_ms` (the column is NOT NULL): never due (9999-12-31), until the owner's Retry. */
 const NOT_DUE_MS = 253_402_300_799_000;
@@ -1695,6 +1716,118 @@ export class ProjectDO extends DurableObject<Env> {
     return secretFeeds(this.clientId(), this.secretRows().filter((m) => m.roles.includes(role)), injectHosts);
   }
 
+  // --- PR upkeep (README.md#pr-upkeep) -----------------------------------------------------------------
+
+  /**
+   * The open PRs from the repo itself that a live worker owns (its task's, the worker past its brief), oldest
+   * attached first. Not while its task is blocked: the worker waits on the owner, and being told of its PR
+   * would push it to work around the block.
+   */
+  private prOwners(): { pr: number; task: string; agent: string }[] {
+    return this.sql.exec(
+      `SELECT p.pr, p.task, t.assignee FROM task_prs p JOIN tasks t ON t.id = p.task
+        WHERE p.state = 'open' AND (p.fork IS NULL OR p.fork = 0) AND t.worker_live = 1 AND t.assignee IS NOT NULL
+          AND t.state IN ('in_progress', 'in_review') AND t.blocked_ms IS NULL ORDER BY p.attached_ms, p.pr`,
+    ).toArray().map((r) => ({ pr: r.pr as number, task: r.task as string, agent: r.assignee as string }));
+  }
+
+  /** When the PRs are read next: only while a live worker owns one; due now when no read is scheduled yet. */
+  private prReadDue(): number | null {
+    const r = this.settingsRow();
+    if (!r || !this.prOwners().length) return null;
+    return (r.pr_read_next_ms as number | null) ?? Date.now();
+  }
+
+  /**
+   * Something may have changed on these PRs (a review failed, a check failed): read soon, but never within
+   * PR_READ_GAP_MS of the last read, only for a PR a live worker owns, and never while reads are failing
+   * (their backoff stands).
+   */
+  private nudgePrs(prs: readonly number[]): void {
+    const r = this.settingsRow();
+    if (!r || (r.pr_read_attempts as number) > 0) return;
+    const owned = new Set(this.prOwners().map((o) => o.pr));
+    if (!prs.some((n) => owned.has(n))) return;
+    const at = Math.max(Date.now(), ((r.pr_read_last_ms as number | null) ?? 0) + PR_READ_GAP_MS);
+    this.sql.exec("UPDATE settings SET pr_read_next_ms = ? WHERE pr_read_next_ms IS NULL OR pr_read_next_ms > ?", at, at);
+  }
+
+  /** A webhook's nudge (a check run on these PRs failed): the read comes sooner. It decides nothing itself. */
+  async nudgePrRead(prs: number[]): Promise<void> {
+    if (!this.settings()) return;
+    this.nudgePrs(prs);
+    await this.arm();
+  }
+
+  /**
+   * Read the PRs live workers own from GitHub (one GraphQL query) and the app's verdicts at their heads, then
+   * tell each worker, in one step, the conditions it wasn't told of yet at its PR's head: a failed review, a
+   * failed check, a conflict with the base. The only thing written of it is that it was told (`pr_told`).
+   */
+  private async readPrUpkeep(nest: Nest): Promise<void> {
+    const s = this.settings()!;
+    const owned = this.prOwners();
+    if (!owned.length) {
+      this.sql.exec("UPDATE settings SET pr_read_next_ms = NULL");
+      return;
+    }
+    const started = Date.now();
+    // The next regular read; a nudge during this one may bring it forward.
+    this.sql.exec("UPDATE settings SET pr_read_next_ms = ?, pr_read_last_ms = ?", started + PR_READ_EVERY_MS, started);
+    let prs: Map<number, PrNow | null>;
+    let verdicts: Record<string, Verdict>;
+    try {
+      const gh = await githubFor(nest, s.repo, PERMISSIONS.prRead);
+      prs = await readPrs(gh, s.repo, owned.map((o) => o.pr));
+      const heads = [...prs.values()].filter((p): p is PrNow => p !== null && p.state === "OPEN" && !p.cross_repo).map((p) => ({ pr: p.number, sha: p.head_sha }));
+      verdicts = heads.length ? await review(this.env, s.id).verdictsAt(heads) : {};
+    } catch (e) {
+      const attempts = (this.settingsRow()!.pr_read_attempts as number) + 1;
+      this.sql.exec("UPDATE settings SET pr_read_attempts = ?, pr_read_next_ms = ?", attempts, Date.now() + Math.max(PR_READ_EVERY_MS, backoff(attempts)));
+      // One that will repeat (a permission the grant lacks, the App gone) is among the project's errors, once a day.
+      if ((e instanceof NestError || e instanceof GitHubError) && e.permanent) {
+        this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, 'app', NULL, NULL, 'pr_read_failed', ?)",
+          `pr_read:${new Date().toISOString().slice(0, 10)}`, Date.now(), `The app couldn't read its task PRs from GitHub, so workers aren't told of failed reviews, checks or conflicts: ${message(e)}`);
+      }
+      return;
+    }
+    this.sql.exec("UPDATE settings SET pr_read_attempts = 0");
+    const github: Actor = { kind: "app", what: "github" };
+    const now = Date.now();
+    // Who owns which PR now (the awaits let other steps run): a worker that went, or a PR that left, is told nothing.
+    for (const o of this.prOwners()) {
+      const pr = prs.get(o.pr);
+      if (!pr) continue;
+      const v = verdicts[`${pr.number}/${pr.head_sha}`] ?? null;
+      const holds = prConditions(pr, v);
+      // A condition seen not to hold at this head is marked cleared, so its return (a Re-run that fails again)
+      // is told, though not within PR_FLAP_MS of its last telling. A conflict GitHub hasn't computed yet
+      // (UNKNOWN) is neither.
+      for (const c of UPKEEP_CONDITIONS) {
+        if (holds.includes(c) || (c === "conflict" && pr.mergeable === "UNKNOWN")) continue;
+        this.sql.exec("UPDATE pr_told SET cleared = 1 WHERE agent = ? AND pr = ? AND head = ? AND cond = ?", o.agent, pr.number, pr.head_sha, c);
+      }
+      // Told once per condition at a head, and again every PR_RETELL_MS while it holds.
+      const last = (c: UpkeepCondition) =>
+        this.sql.exec("SELECT at_ms, cleared FROM pr_told WHERE agent = ? AND pr = ? AND head = ? AND cond = ?", o.agent, pr.number, pr.head_sha, c).toArray()[0];
+      const due = holds.map((c) => ({ c, row: last(c) })).filter(({ row }) =>
+        !row || (row.at_ms as number) <= now - (row.cleared === 1 ? PR_FLAP_MS : PR_RETELL_MS));
+      if (!due.length) continue;
+      for (const { c } of due) {
+        this.sql.exec("INSERT INTO pr_told (agent, pr, head, cond, at_ms) VALUES (?, ?, ?, ?, ?) ON CONFLICT (agent, pr, head, cond) DO UPDATE SET at_ms = excluded.at_ms, cleared = 0",
+          o.agent, pr.number, pr.head_sha, c, now);
+      }
+      const found = due.map((x) => x.c);
+      // A reminder only when every one was told and has held since; a return after clearing is news.
+      const again = due.every((x) => x.row && x.row.cleared === 0);
+      // Relayed: check names and links are the repo's CI's, the findings a tainted reviewer's.
+      this.oweMessage(o.agent, upkeepMessage(pr, found, v, { task: o.task, nonce: randomHex(8), again }), true);
+      this.record(o.task, github, "pr_upkeep", { pr: pr.number, head: pr.head_sha, told: found, ...(again ? { again: true } : {}) });
+      // Sent in this drain's next round.
+      this.again = true;
+    }
+  }
+
   /**
    * The nest name a secret's value goes under: its own (a replacement takes no new place in the grant's
    * `max_count`), or for a new secret a new generation, minted here and usable once (`saveSecretMeta`
@@ -2299,6 +2432,25 @@ export class ProjectDO extends DurableObject<Env> {
     this.autoAssign();
   }
 
+  /**
+   * A review has waited long for room in nest (README.md#built-the-review-pipeline): among the project's errors,
+   * once per PR head, until ReviewDO says the wait ended (`reviewRoomCleared`).
+   */
+  async reviewWaitingForRoom(e: { pr: number; sha: string; since_ms: number; why: string }): Promise<void> {
+    if (!this.settings()) return;
+    const mins = Math.max(1, Math.round((Date.now() - e.since_ms) / 60_000));
+    this.sql.exec(
+      "INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, 'app', 'reviewer', NULL, 'review_waiting_for_room', ?)",
+      `review_room:${e.pr}/${e.sha}`, Date.now(),
+      `The review of PR #${e.pr} (${e.sha.slice(0, 12)}) has waited ${mins} minutes for room in nest (${e.why.slice(0, 300)}). nest's grant for this app caps its live agents and sandboxes across every project (managers, workers, reviewers, routine runs), and a worker stays live until its PR merges, which needs its review, so a full grant can hold reviews back for good. Raise the grant's max_agents or max_sandboxes, or free a place: cancel a task whose worker can wait, or stop a routine run.`,
+    );
+  }
+
+  /** That review's wait for room ended (it started, or ended otherwise): its error goes. */
+  async reviewRoomCleared(pr: number, sha: string): Promise<void> {
+    this.sql.exec("DELETE FROM errors WHERE event_id = ?", `review_room:${pr}/${sha}`);
+  }
+
   async errors(): Promise<Result<unknown[]>> {
     if (!this.settings()) return fail(404, "unknown project");
     return ok(this.sql.exec("SELECT at_ms, agent, role, task, code, message FROM errors ORDER BY seq DESC LIMIT 100").toArray());
@@ -2426,6 +2578,8 @@ export class ProjectDO extends DurableObject<Env> {
   async onReviewEnded(e: { pr: number; sha: string; state: string; conclusion: string | null }): Promise<void> {
     if (!this.settings()) return;
     for (const w of this.pendingWaits("pr", String(e.pr))) this.prWaitOn(w, { kind: "review", conclusion: e.conclusion ?? e.state });
+    // A failed review is a nudge to read the PRs soon (README.md#pr-upkeep): its worker is told from that read.
+    if (e.conclusion === "failure") this.nudgePrs([e.pr]);
     await this.arm();
   }
 
@@ -3488,6 +3642,8 @@ export class ProjectDO extends DurableObject<Env> {
         UNION ALL SELECT last_start_ms + cooldown_min * 60000 FROM routines WHERE due IS NOT NULL AND due != 'manual' AND last_start_ms + cooldown_min * 60000 > ${Date.now()}
         UNION ALL SELECT next_ms FROM routine_runs WHERE state = 'starting' AND next_ms IS NOT NULL
         UNION ALL SELECT deadline_ms FROM routine_runs WHERE state = 'running' AND deadline_ms IS NOT NULL)`),
+      // The read of the PRs live workers own (README.md#pr-upkeep): due now when none is scheduled yet.
+      this.prReadDue(),
       // A routine run's exit grace, and its cleanup by labels.
       min(`SELECT MIN(t) AS t FROM (
         SELECT exited_ms + ${RUN_EXIT_GRACE_MS} AS t FROM routine_runs WHERE state = 'running' AND exited_ms IS NOT NULL
@@ -3585,6 +3741,7 @@ export class ProjectDO extends DurableObject<Env> {
     // An ended run with nothing owed for it (its clean-up done).
     this.sql.exec("DELETE FROM routine_runs WHERE state = 'ended' AND ended_ms < ? AND cleanup_next_ms IS NULL", now - ENDED_RUNS_KEEP_MS);
     this.sql.exec("DELETE FROM early_exits WHERE at_ms < ?", now - EARLY_EXITS_KEEP_MS);
+    this.sql.exec("DELETE FROM pr_told WHERE at_ms < ?", now - PR_TOLD_KEEP_MS);
   }
 
   private async drainOnce(): Promise<void> {
@@ -3651,6 +3808,8 @@ export class ProjectDO extends DurableObject<Env> {
     await this.sweepModelTemplates(nest);
     // A comment's key outlives any redelivery GitHub makes of it.
     this.sql.exec("DELETE FROM comments_seen WHERE at_ms < ?", now - COMMENTS_SEEN_KEEP_MS);
+    const prRead = this.prReadDue();
+    if (prRead !== null && prRead <= now) await this.readPrUpkeep(nest);
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT seq FROM messages WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverMessage(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT id FROM tasks WHERE notify_next_ms IS NOT NULL AND notify_next_ms <= ?", now).toArray()) await this.notifyWorker(nest, r.id as string);
@@ -4288,6 +4447,8 @@ function prAutoMerge(r: Row): TaskAutoMerge | null {
 }
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 500);
+/** `n` random bytes as hex: a marker no text written before it could know. */
+const randomHex = (n: number) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, "0")).join("");
 
 function managerBrief(s: Settings): string {
   return [
