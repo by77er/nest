@@ -1,13 +1,16 @@
 # LiveRules.tla: one line per config.  <spec> <config> <holds|violates:Name> <ci|full>
 # Each config checks one temporal property (Converges); TLC v1.7.4 prints its violation without the name.
 # ci: each under 30 s with 4 workers (TLC v1.7.4).
-# As built: every fault class with the hourly read; nudges alone (no hourly read, no lost watch, no write
-# under the rolled-back release); and finding 1's stall covered by the hourly read
-LiveRules.tla  MC_fixed.cfg       holds                 ci
-LiveRules.tla  MC_nudges.cfg      holds                 ci
-LiveRules.tla  MC_old_hourly.cfg  holds                 ci
+# As built, with the hourly read: every fault class, a rollback of both DOs included
+LiveRules.tla  MC_fixed.cfg           holds                 ci
+LiveRules.tla  MC_old_hourly.cfg      holds                 ci
+# As built, by nudges alone (no hourly read): lost replies and resets; a CatalogDO-only rollback
+LiveRules.tla  MC_nudges.cfg          holds                 ci
+LiveRules.tla  MC_old_fixed.cfg       holds                 ci
+# Without the hourly read, a rolled-back AgentDO drops a read it owed: the hourly read is load-bearing
+LiveRules.tla  MC_agent_rollback.cfg  violates:Converges    ci
 # Mutations and the bug before review: each must be caught
 # The answer deletes the row at any rev, so a stale answer drops a newer nudge
-LiveRules.tla  MC_mut_ack.cfg     violates:Converges    ci
-# Review finding 1: a rollback's run consumed the storage alarm, and nothing sets it again
-LiveRules.tla  MC_old_stall.cfg   violates:Converges    ci
+LiveRules.tla  MC_mut_ack.cfg         violates:Converges    ci
+# Review finding 1: a rollback's run consumed the storage alarm, and nothing sets it again (MC_old_fixed is its control)
+LiveRules.tla  MC_old_stall.cfg       violates:Converges    ci

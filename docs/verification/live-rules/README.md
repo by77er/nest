@@ -10,7 +10,7 @@ The protocol that carries a capability's rules to the live agents that read them
   - A rules push moves `rules_version` in the same step. This is the #244 invariant: a rule approval checked against older rules gets `conflict`.
   - A stale answer never deletes a newer nudge.
   - The operator's rules stand over capability changes.
-- **Liveness:** every live watcher's rules converge to the capability's latest write, given eventual delivery and the hourly read.
+- **Liveness:** every live watcher's rules converge to the capability's latest write, given eventual delivery and the hourly read. Without the hourly read, they converge only if no rollback reaches AgentDO.
 - **Past bugs:** review finding 1 of #249. A rolled-back CatalogDO's alarm run consumed the storage alarm and left the deadline row, and `Deadlines.set`'s early return never set the alarm again. `MC_old_stall` reproduces it.
 
 ## Conformance
@@ -19,14 +19,15 @@ The protocol that carries a capability's rules to the live agents that read them
 
 | Action | Code | Conforms | Notes |
 |---|---|---|---|
-| Write | `nudgeWatchers` `catalog.ts:164`, called from `putCapability` `376`, `deleteCapability` `385`, `deleteNamespace` `464` and the seed step `126` | yes | The rows, `rules_rev` and the deadline row are written in the write's synchronous step. `armNudges` (`149`) awaits only the alarm. |
-| AlarmStart / AlarmEnd | `deliverNudges` `catalog.ts:233`, its tail `254` | partly | One run sends up to 64 due rows. A row in backoff waits for a later run; in the model, a retry is just the next alarm. |
+| Write | `nudgeWatchers` `catalog.ts:165`, called from `putCapability` `377`, `deleteCapability` `386`, `deleteNamespace` `465` and the seed step `127` | yes | The rows, `rules_rev` and the deadline row are written in the write's synchronous step. `armNudges` (`150`) awaits only the alarm. |
+| AlarmStart / AlarmEnd | `deliverNudges` `catalog.ts:234`, its tail `255` | partly | One run sends up to 64 due rows. A row in backoff waits for a later run; in the model, a retry is just the next alarm. |
 | Take | `rulesChanged` `agent.ts:3053` | yes | The `rules` deadline is written before the answer. |
-| AckArrive | `catalog.ts:241` | yes | `AND rev = ?` (`AckByRev`). |
-| Lost | `catalog.ts:251` | yes | The row stays, with `attempts` + 1 and `next_ms` backed off. |
-| ReadStart | `refreshRules` `agent.ts:3073` → `watchRules` `catalog.ts:186` | yes | The watch is set and the rules read in one CatalogDO step, which also calls `armNudges`. |
+| AckArrive | `catalog.ts:242` | yes | `AND rev = ?` (`AckByRev`). |
+| Lost | `catalog.ts:252` | yes | The row stays, with `attempts` + 1 and `next_ms` backed off. |
+| ReadStart | `refreshRules` `agent.ts:3073` → `watchRules` `catalog.ts:187` | yes | The watch is set and the rules read in one CatalogDO step, which also calls `armNudges`. |
 | ReadEnd | `agent.ts:3083`–`3111` | yes | The sources are re-read after the await, and a change triggers another read. The push with `rulesChanged` happens in the step that stores the rules. |
 | Reset | `Deadlines.runDue` (`lib/reliable.ts`): the row is deleted only after the handler | yes | |
 | LoseWatch | none in the code | yes | It stands for any write the catalog made without a watch row, such as a rolled-back release's. |
 | Hourly | `prune` `agent.ts:3917` | yes | |
-| RollForward | the constructor's `armNudges`, `catalog.ts:136` | yes | `RearmAlarm`. |
+| OldDropDue | the previous AgentDO's alarm: no handler for `rules`, so the deadline is dropped (logged) | yes | After the roll-forward, the hourly read or a later nudge recovers it; `MC_agent_rollback` shows the hourly read is needed. |
+| RollForward | the constructor's `armNudges`, `catalog.ts:137` | yes | `RearmAlarm`. |

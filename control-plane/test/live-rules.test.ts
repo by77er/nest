@@ -186,6 +186,50 @@ describe("live capability rules", () => {
     expect((await adminJson(`/v1/agents/${agent}`)).rules_set).toBeUndefined();
   });
 
+  it("the operator's rules stand even when they equal what the agent derived", async () => {
+    const { cap, tpl } = await operatorEntries([]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    // Pinned exactly as they are: nothing tells them from derived rules but the operator's mark.
+    await adminJson(`/v1/agents/${agent}/rules`, { method: "PUT", body: [NEST_ALLOW] });
+    await rulesSettled(agent);
+    await putCap(cap, [ALLOW_WEB]);
+    await makeDue(agentStub(agent), "prune");
+    await runDue(agentStub(agent));
+    await rulesSettled(agent);
+    expect(await rulesOf(agent)).toEqual([NEST_ALLOW]);
+  });
+
+  it("the operator's rules set while a read after a clear is out stand (the immediate lever for tightening)", async () => {
+    const { tpl } = await operatorEntries([ALLOW_WEB]);
+    const agent = await spawn(tpl);
+    await rulesSettled(agent);
+    let release!: () => void;
+    const released = new Promise<void>((r) => { release = r; });
+    let held = false;
+    const pw = patch(CatalogDO.prototype as unknown as { watchRules: (a: string, n: string[]) => Promise<unknown> }, "watchRules", (real) =>
+      async function (this: CatalogDO, a: string, n: string[]) {
+        if (a === agent && n.length > 0 && !held) {
+          held = true;
+          await released;
+        }
+        return real.call(this, a, n);
+      });
+    try {
+      // A clear (nothing derived to compare against), its read held; then the operator denies WebFetch.
+      await adminJson(`/v1/agents/${agent}/rules`, { method: "DELETE" });
+      await eventually("the read held", () => held);
+      await adminJson(`/v1/agents/${agent}/rules`, { method: "PUT", body: [DENY_WEB] });
+      release();
+      await rulesSettled(agent);
+      expect(await rulesOf(agent)).toEqual([DENY_WEB]);
+      expect((await adminJson(`/v1/agents/${agent}`)).rules_set).toBe(true);
+    } finally {
+      release();
+      pw.restore();
+    }
+  });
+
   it("rules the previous release's operator set after a rollback (no rules_set) stand as the operator's", async () => {
     const { cap, tpl } = await operatorEntries([]);
     const agent = await spawn(tpl);
@@ -480,18 +524,21 @@ describe("a seed step", () => {
       sql.exec("UPDATE capabilities SET body = ? WHERE name = 'spawning'", JSON.stringify({ ...spawning, prompt: SPAWNING_PROMPT_V5 }));
       sql.exec("UPDATE capabilities SET body = ? WHERE name = 'nest'", JSON.stringify(SEED_CATALOG_V1.capabilities.nest));
       sql.exec("INSERT INTO capabilities (name, body) VALUES ('channels', ?)", JSON.stringify(capability([])));
+      // A capability a later step adds (version 9's `timers`) under a name some agent still watches, from
+      // before an operator deleted it.
+      sql.exec("DELETE FROM capabilities WHERE name = 'timers'");
       const rows = () => new Map(sql.exec<{ name: string; body: string }>("SELECT name, body FROM capabilities").toArray().map((x) => [x.name, x.body]));
       const before = rows();
       // One watcher per capability.
-      for (const name of before.keys()) sql.exec("INSERT INTO rule_watch (capability, agent) VALUES (?, ?)", name, `agt_w-${name}`);
+      for (const name of [...before.keys(), "timers"]) sql.exec("INSERT INTO rule_watch (capability, agent) VALUES (?, ?)", name, `agt_w-${name}`);
       new CatalogDO(st, env as never);
       const after = rows();
-      const changed = [...before.keys()].filter((n) => after.get(n) !== before.get(n)).map((n) => `agt_w-${n}`).sort();
+      const changed = [...new Set([...before.keys(), ...after.keys()])].filter((n) => after.get(n) !== before.get(n)).map((n) => `agt_w-${n}`).sort();
       const nudged = sql.exec<{ agent: string }>("SELECT agent FROM rule_nudges ORDER BY agent").toArray().map((x) => x.agent);
       return { changed, nudged };
     });
-    // A prompt rewrite (7), a deletion (7) and a rules rewrite (10, `nest` still the first seed's).
-    expect(r.changed).toEqual(expect.arrayContaining(["agt_w-channels", "agt_w-nest", "agt_w-spawning"]));
+    // A prompt rewrite (7), a deletion (7), an insertion (9) and a rules rewrite (10, `nest` still the first seed's).
+    expect(r.changed).toEqual(expect.arrayContaining(["agt_w-channels", "agt_w-nest", "agt_w-spawning", "agt_w-timers"]));
     expect(r.nudged).toEqual(r.changed);
   });
 });

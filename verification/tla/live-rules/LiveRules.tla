@@ -28,11 +28,14 @@
 (*                 deleted, so the read runs again                         *)
 (*   LoseWatch     a watch row lost (a write the catalog made without it)  *)
 (*   Hourly        AgentDO's `prune` arms the read hourly                  *)
-(*   Rollback, OldWrite, OldAlarm, RollForward  a `wrangler rollback` to   *)
-(*                 the release before: no alarm handler (its run consumes  *)
-(*                 the storage alarm, the deadline row stays), writes      *)
-(*                 without nudges, no watchRules; then forward again (the  *)
-(*                 constructor's armNudges)                                *)
+(*   Rollback, OldWrite, OldAlarm, OldDropDue, RollForward  a `wrangler   *)
+(*                 rollback` to the release before, of both DOs: CatalogDO *)
+(*                 has no alarm handler (its run consumes the storage      *)
+(*                 alarm, the deadline row stays), writes without nudges   *)
+(*                 and has no watchRules; AgentDO (AgentRollback) has no   *)
+(*                 `rules` handler (its alarm drops the deadline) and no   *)
+(*                 rulesChanged; then forward again (the constructor's     *)
+(*                 armNudges)                                              *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 
@@ -44,6 +47,7 @@ CONSTANTS
   AckByRev,       \* the answer deletes the row only at the rev sent. FALSE (mutation): whatever its rev
   RearmAlarm,     \* armNudges sets the storage alarm when none is (and the constructor calls it). FALSE: before review finding 1
   Hourly,         \* the agent's hourly read (FALSE: convergence by nudges alone)
+  AgentRollback,  \* a rollback covers AgentDO too (FALSE: CatalogDO alone, to isolate its own faults)
   OldWrites       \* the rolled-back release may write the capability (it nudges nobody)
 
 VARIABLES
@@ -98,6 +102,7 @@ AlarmStart ==
   /\ UNCHANGED <<cap, rev, watch, nudge, old, rules, due, reading, lost, resets, lostWatch, rollbacks>>
 
 Take(a, r) ==
+  /\ ~(old /\ AgentRollback)
   /\ <<a, r, "sent">> \in inflight
   /\ inflight' = (inflight \ {<<a, r, "sent">>}) \cup {<<a, r, "taken">>}
   /\ due' = [due EXCEPT ![a] = TRUE]
@@ -164,6 +169,12 @@ OldAlarm ==
   /\ alarm' = FALSE
   /\ UNCHANGED <<cap, rev, watch, nudge, dl, running, inflight, old, rules, due, reading, lost, resets, lostWatch, rollbacks>>
 
+\* The previous AgentDO's alarm finds no handler for `rules` and drops the deadline.
+OldDropDue(a) ==
+  /\ old /\ AgentRollback /\ due[a]
+  /\ due' = [due EXCEPT ![a] = FALSE]
+  /\ UNCHANGED <<cap, rev, watch, nudge, dl, alarm, running, inflight, old, rules, reading, lost, resets, lostWatch, rollbacks>>
+
 RollForward ==
   /\ old
   /\ old' = FALSE
@@ -172,7 +183,7 @@ RollForward ==
 
 Next ==
   \/ Write \/ AlarmStart \/ AlarmEnd \/ Rollback \/ OldWrite \/ OldAlarm \/ RollForward
-  \/ \E a \in Agents : ReadStart(a) \/ ReadEnd(a) \/ Reset(a) \/ LoseWatch(a) \/ HourlyRead(a)
+  \/ \E a \in Agents : ReadStart(a) \/ ReadEnd(a) \/ Reset(a) \/ LoseWatch(a) \/ HourlyRead(a) \/ OldDropDue(a)
   \/ \E e \in inflight : Take(e[1], e[2]) \/ AckArrive(e[1], e[2]) \/ Lost(e[1], e[2], e[3])
 
 \* Eventual delivery: alarms fire, RPCs are answered, reads finish, a rollback is rolled forward, and

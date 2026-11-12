@@ -123,7 +123,8 @@ export class CatalogDO extends DurableObject<Env> {
         this.rewriteRules(m.rules);
         this.setSeedVersion(m.version);
         const after = this.capabilityRows();
-        const changed = [...before.keys()].filter((n) => after.get(n) !== before.get(n));
+        // Changed, deleted or inserted (a name an agent may still watch from before a deletion).
+        const changed = [...new Set([...before.keys(), ...after.keys()])].filter((n) => after.get(n) !== before.get(n));
         // The live agents reading a capability the step changed or deleted are told, as for any write
         // (the rows in this step; only arming the alarm is awaited).
         if (changed.length) {
