@@ -33,6 +33,7 @@ Base: origin/main 6bbf64f.
 | The UI (Settings) | Workers and Auto-merge as two Panels in one row | seven Panels in a SectionGrid: Workers, Models, Auto-merge, Reviews, PR comments, Triage, CI workflows | projects/src/ui/features/settings/SettingsForm.tsx:133-274 |
 | The UI (Routes) | omitted triage, secrets and network | routes exist | projects/src/ui/router.tsx:69-85 |
 | The UI (board) | "the columns' old order", "as before" | wording | — |
+| The live trace | the route serves the manager, a worker or a reviewer; mounts ManagerTrace, TaskTraces, ReviewTrace | routine runs are recorded too and have `RunTrace` | projects/src/do/project.ts:3168; trace.ts:16-20; ui/features/trace/AgentTraces.tsx:25 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
@@ -52,6 +53,7 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- The live trace: one correction; MAX_EVENTS 2000, reconnect 1 s→30 s, ping 25 s ui/features/trace/model.ts:51,187-189; routes trace.ts.
 - The UI (intro): corrections above; POLL chat 3 s / board 5 s / project 10 s ui/api/queries.ts:32 match.
 - The manager chat: CHAT_PAGE 50 / CHAT_PAGE_MAX 200 do/project.ts:317-318, interrupt api.ts:395, LIVE_SHOWN 4 and HOLD_MAX_MS 30 s ui/features/chat/ChatView.tsx:107,153, nest's ring 1,000 events/24 h and 16 KB/4 KB control-plane/src/lib/trace.ts:9-15 match.
 - Secrets: one correction; SECRET_NAME secrets.ts:41, MAX_HOSTS/LOCATIONS/BINDINGS 16/3/16 :43-45, nest name :53, placeholder :56, ENV_NAME and reserved names :62-79, presets :186-195, request schema requests.ts:65-72, upkeep 10 min / sweep 5 min do/project.ts:4427,4431, "Outside the grant" ui/features/secrets/SecretsPage.tsx:56 match.
