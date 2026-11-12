@@ -171,7 +171,7 @@ M1 removes the wait for the store and the control plane from the pause, and the 
   - After 1 GiB of writes, the in-pause step took 2.2 s (820 ms walking in the kernel). The pre-copy took 15.7 s, 9.7 s of it the sync.
   - In Rust, the diff would cost little beside the walk (unverified). The pause would then be about the kernel's walk, roughly 0.8 µs a record warm: about 0.7–0.9 s at a month's ~1 M records. That is about 10× better than M2's 8.1 s, but still about 4× the 200 ms gate. Fewer records shrink it in proportion.
 - **The diff must treat an unwritten extent as a hole.** A clone maps it as one, so the first version re-cloned 8,978 ranges (421 MB, about 10 ms) at every pre-copy. Fixed in `m3.py`.
-- **Option 3's extent size hint doesn't help:** after 1 GiB of churn the records were 179 k with no hint, 173 k at 1 MiB and 190 k at 4 MiB, and the clone took 2.2–2.7 s in each case. Dropped.
+- **Option 3's extent size hint doesn't help:** after 1 GiB of churn the records were 179 k with no hint, 173 k at 1 MiB and 190 k at 4 MiB, and the clone took 1.6–2.7 s in each case. Dropped.
 - **Exchange-range works:** `mkfs.xfs -i exchange=1` is accepted (xfsprogs 6.12.0), and `XFS_IOC_EXCHANGE_RANGE` swapped 16 MiB in 0.18 ms while a writer ran on the same file (verified by content). Background defragmentation is possible on the hosts' stack. Its throughput, and how far it brings records down, are unmeasured.
 - **Other numbers:**
   - Reading a cut cold: 7.33 GB in 37.6 s, about 195 MB/s.
