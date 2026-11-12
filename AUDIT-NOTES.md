@@ -3,6 +3,7 @@
 ## Corrections
 | doc | said | code says | evidence |
 |---|---|---|---|
+| compute/provisioning/README.md | the host image contains gVisor (`runsc`) | install.sh installs no runsc (and the doc's own last bullet says gVisor isn't built) | deploy/host/install.sh:18,35-47 |
 | compute/autoscaling/README.md | tombstone "This changed on 2026-11-04: before, only the first type went on demand" | (history; dropped) | AGENTS.md no-tombstones rule |
 | compute/autoscaling/README.md | idle grace: host with "no lease and no agent" | busy = any lease not `suspended`, a brain, or an incarnation awaiting salvage | control-plane/src/do/fleet.ts:2356-2362 |
 | sandbox/README.md | after a fork the guest reseeds via VMGenID and resyncs via VMClock | nestd's `resume` on a fork's first boot: clock step to host wall clock, 64 B host entropy (RNDADDENTROPY), new machine-id and hostname; no VMGenID/VMClock code | crates/nestd/src/host.rs:1778-1780, guest.rs:297-302, crates/nest-guest/src/sys.rs:43-88 |
@@ -13,6 +14,7 @@
 | sandbox/guest-agent/README.md | `resume` after a restore; hands `busy` "while frozen" | `resume` only on a fork's first boot (restores cold-boot); nothing is ever frozen | crates/nestd/src/host.rs:1778-1780, crates/nest-guest/src/control.rs:107,115 |
 
 ## Unconfirmed
+- compute/provisioning/README.md: "Firecracker from the 1.17 line" and sandbox/drivers/firecracker (same): the repo records no Firecracker version (release carries the binaries; scripts/publish-release.sh checks SHA256SUMS). "Evidence: a rebooted EC2 host reconnected without re-enrolling": no record. "on EC2 the first turn-end commit hit its 60 s timeout" (compressed guest image rationale): no record.
 - compute/autoscaling/README.md: "Evidence: on EC2 (use1, 2026-10-17) a cell went from zero hosts to a running sandbox and back to zero" and the FIS spot run "within about 90 s of the notice": no record in dev/cloud-checks/, dev/measure-cut/ or e2e/FINDINGS.md. Also "each host is capped so a forced drain finishes in about 90 s at its measured upload bandwidth": no measurement or cap found tying `maxSandboxesPerHost` (Cells.lean:21, by disk and memory) to upload bandwidth.
 - compute/autoscaling/README.md: stopped warm host "about $2/mo for EBS": no record.
 - compute/README.md:49-52 prices: c8i.large spot ~$0.033/hr, DigitalOcean $42/mo, Lambda MicroVM ~$0.25/hr, "on-demand ~1.5× DO", "spot 60-70% less": no record in the repo (only on-demand prices in deploy/lean/Cell/Cells.lean:28-29).
@@ -28,5 +30,6 @@
 - compute/brain-hosts (cells.ts:16-33 idle 1_800_000 and max_hosts 3; placement.ts:101,108-111 2 per vCPU; control.ts:13-15 5 s/20 s/30 s; nest-runner config.rs:59 120 s; agent.ts:84,327 30 s→5 min; Stack.lean:99 t3a/t3.medium). Prices already marked unverified.
 
 ## Docs done
+- compute/provisioning (23 h resume grace credentials.rs:22-23; IMDSv2 hop 1 Stack.lean:518; 7844 Stack.lean:114-115,426-428; lifecycle policy Stack.lean:532-548; SandboxTypesOnly/ArnEqualsIfExists Stack.lean:347-370; cloudflared pin install.sh:17,81-87; Claude pin install.sh:13,74-79)
 - compute/autoscaling (numbers confirmed: placement.ts:155-160 backoff 60 s→15 min/5 min brain, 30 min decay; enroll-breaker.ts:8-11 3, 30 min, 6 h; fleet.ts:197 1 min image cache, :264 brain waits 12 min; cells.ts:44-48 idle 10 min, enroll 10 min, :28-31 brain 3 hosts, 30 min; host.rs:1473 spot poll 5 s)
 - sandbox/drivers/gvisor, lambda-microvm, sandbox/guest-agent (the rest confirmed: vsock ports and CID 2 check transport.rs:63; retention output.rs:18-21; env exec.rs:21-46; ingress order ingress.rs:63; exact protocol_version nestd guest.rs:276; busy before configure state.rs:124; SIGHUP on drop ingress.rs:246; 200 ms drain hands/bash.rs:141)
