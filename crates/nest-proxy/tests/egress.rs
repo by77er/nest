@@ -355,8 +355,30 @@ async fn websocket_upgrade_through_inspection() {
     let mut buf = [0u8; 11];
     tokio::time::timeout(Duration::from_secs(5), tls.read_exact(&mut buf)).await.unwrap().unwrap();
     assert_eq!(&buf, b"frame-bytes");
+    // Held open a while: the record's duration runs from the upgrade to the close, not from the close.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     drop(tls);
-    env.conn.wait(|e| audit_with(e, |r| r.status == Some(101) && r.reason.as_deref() == Some("upgraded"))).await;
+    let ev = env.conn.wait(|e| audit_with(e, |r| r.status == Some(101) && r.reason.as_deref() == Some("upgraded"))).await;
+    let ProxyEvent::Audit { records } = ev else { unreachable!() };
+    let rec = records.iter().find(|r| r.reason.as_deref() == Some("upgraded")).unwrap();
+    assert!(rec.duration_ms.is_some_and(|d| d >= 300), "{:?}", rec.duration_ms);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_spliced_connection_is_audited_with_its_whole_duration() {
+    let mut env = env().await;
+    let mut s = TcpStream::connect(env.net.tcp_exc.local_addr().unwrap()).await.unwrap();
+    s.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), s.read_exact(&mut buf)).await.unwrap().unwrap();
+    // Held open a while, then closed: the splice is audited at the close, timed from its start.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(s);
+    let ev = env.conn.wait(|e| audit_with(e, |r| r.reason.as_deref() == Some("tcp_exception"))).await;
+    let ProxyEvent::Audit { records } = ev else { unreachable!() };
+    let rec = records.iter().find(|r| r.reason.as_deref() == Some("tcp_exception")).unwrap();
+    assert_eq!((rec.bytes_up, rec.bytes_down), (4, 4));
+    assert!(rec.duration_ms.is_some_and(|d| d >= 300), "{:?}", rec.duration_ms);
 }
 
 #[tokio::test(flavor = "multi_thread")]
