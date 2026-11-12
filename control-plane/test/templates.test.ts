@@ -5,7 +5,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { CatalogDO } from "../src/do/catalog";
-import { MESSAGING_TOOLS_REMOVED, RETIRED_TOOLS, SEED_CATALOG, SEED_CATALOG_V1, SEED_VERSION, SPAWNING_PROMPT_V5 } from "../src/lib/spec";
+import { MESSAGING_TOOLS_REMOVED, RETIRED_TOOLS, SEED_BUILTIN_RULES, SEED_CATALOG, SEED_CATALOG_V1, SEED_VERSION, SPAWNING_PROMPT_V5 } from "../src/lib/spec";
 import { adminJson, connectHost, nextCommands, runDue, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -108,7 +108,7 @@ describe("an agent is its expanded spec", () => {
     expect(tools.every((t) => Array.isArray(t.roles) && (t.roles as unknown[]).length === 0)).toBe(true);
     ws.send({ type: "tool_call", seq: 1, call: "cal_tpl-1", turn: "trn_x", name: "fork_sandbox", arguments: { sandbox: s.sandbox } });
     expect((await ws.next("tool_result", (m) => m.call === "cal_tpl-1")).outcome.error.code).toBe("forbidden");
-    expect((await adminJson(`/v1/agents/${a.agent}`)).rules).toEqual([{ pattern: "mcp__nest__*", decision: "allow" }, { pattern: "Bash", decision: "ask" }]);
+    expect((await adminJson(`/v1/agents/${a.agent}`)).rules).toEqual([{ pattern: "mcp__nest__*", decision: "allow" }, ...SEED_BUILTIN_RULES, { pattern: "Bash", decision: "ask" }]);
   });
 
   it("an agent without hands starts where hand-less agents go, whatever its template is called", async () => {
@@ -491,4 +491,32 @@ describe("the messaging tools' removal", () => {
     }
     await adminJson(`/v1/admin/templates/${name}`, { method: "DELETE" });
   });
+});
+
+// The owner's decision (2026-11-11): the built-ins an agent launches never ask. Seed version 10 gives the
+// seed's `nest` an exact-name allow rule for each built-in a seed worker launches, in a stored catalog
+// only where `nest`'s rules are still the seed's.
+describe("the seed's built-in rules", () => {
+  const catalogStub = (name: string) => env.CATALOG.get(env.CATALOG.idFromName(name));
+  const NEST_ALLOW = { pattern: "mcp__nest__*", decision: "allow" };
+
+  for (const [what, stored, want] of [
+    ["unedited, gains them", { tools: [], rules: [NEST_ALLOW], prompt: "" }, [NEST_ALLOW, ...SEED_BUILTIN_RULES]],
+    ["edited by the operator, stays as it is", { tools: [], rules: [NEST_ALLOW, { pattern: "WebFetch", decision: "deny" }], prompt: "" },
+      [NEST_ALLOW, { pattern: "WebFetch", decision: "deny" }]],
+  ] as const) {
+    it(`a catalog at version 9 whose nest is ${what}`, async () => {
+      const stub = catalogStub(uniqueName("catalog-v9"));
+      await runInDurableObject(stub, async (_i: CatalogDO, st) => {
+        const sql = st.storage.sql;
+        sql.exec("UPDATE kv SET value = '9' WHERE key = 'seed_version'");
+        sql.exec("UPDATE capabilities SET body = ? WHERE name = 'nest'", JSON.stringify(stored));
+        new CatalogDO(st, env as never);
+      });
+      expect((await stub.catalog()).capabilities.nest!.rules).toEqual(want);
+      // The seeded worker then allows every built-in it launches, or not, as its nest says.
+      const spec = await stub.expand({ template: "worker", hands: true, by: "operator" });
+      expect(spec.rules.slice(0, want.length)).toEqual(want);
+    });
+  }
 });

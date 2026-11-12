@@ -1,5 +1,7 @@
 # Lambda MicroVM (rejected)
 
+Not built, by decision: nestd has no Lambda driver.
+
 AWS launched Lambda MicroVMs in June 2026. Each is a Firecracker VM per session, started from a snapshot of your image, that **resumes automatically on its next HTTPS request**.
 
 **Limits:**

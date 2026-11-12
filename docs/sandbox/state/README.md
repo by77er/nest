@@ -5,15 +5,16 @@
 A sandbox's state is a chain of immutable generations. Each generation is a manifest of content-addressed chunks.
 
 ```
-gen    { id, parent, epoch, disk_manifest, mem_manifest?, restore_abi?, session: {offset, last_tool_use}?, kind: disk-only | checkpoint, reason, state: ready | deleting, at }
-chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
+gen    { id, sandbox, parent?, epoch, kind: disk_only | checkpoint, disk_manifest, mem_manifest?, reason, created_ms, cut_ms? }   SandboxDO's row adds state: ready | deleting
+       designed, not built: restore_abi?, session: {offset, last_tool_use}?
+chunks s3://<cell>/chunks/<blake3>    disk: 4 MiB    memory: 2 MiB (one hugepage)
 ```
 
 - **Chunks are immutable.** Any host can upload them at any time without harm.
 - **Manifests are content-addressed in S3.** SandboxDO stores only `head = manifest hash`.
 - **Commit:** flush the guest ([disk](disk/#flush-before-commit)), read the disk while nothing writes it, upload and verify the chunks, upload the manifest, then `commit(epoch, parent, hash)` as a compare-and-set in the DO. How the read is cut and what it skips is [disk](disk/)'s.
 - **Verified before commit:** every chunk a generation adds over its parent must have been uploaded less than 12 h before the commit, by this commit's PUT or as a HEAD shows, with the manifest's length; anything older is uploaded again ([GC](object-store/#garbage-collection)). The rule is applied to every non-zero chunk of the file, not only to those that differ from the parent (`storage.rs` `scan_file` and `publish`, `s3.rs` `recent`), so a commit never relies on its parent still being a GC root: retention may have dropped it (a salvage's parent may even be pruned). A committed generation is therefore `ready`: every chunk is present.
-- **`reason`:** `turn_end`, `periodic`, `pressure`, `pause`, `suspend`, `drain`, `spot`, `fork` or `salvage`. Retention and rollback notices read it.
+- **`reason`:** `turn_end`, `timer`, `dirty_threshold`, `suspend`, `drain`, `spot_notice`, `checkpoint`, `fork`, `salvage` or `archive`. Retention reads it, and so will rollback notices.
 - **`deleting` is one-way.** A generation is marked `deleting` before any of its bytes can go, and never returns to `ready`, because a previous pass may already have removed some of them.
 - **A manifest is self-contained.** It lists every chunk of its file (`null` for an all-zero one), not a delta over its parent, and a restore reads only that manifest (`storage.rs` `scan_file`, `restore_file`). So a kept generation never needs its parent: retention can drop a parent and keep the child.
 
@@ -26,11 +27,11 @@ chunks s3://<cell>/chunks/<blake3>    disk: 4 MB    memory: 2 MB (one hugepage)
 
 **Built:** turn-end commits (SandboxDO asks for a `turn_end` checkpoint when an agent's turn completes, [one at a time](#one-turn-end-checkpoint-at-a-time); one sooner than 10 s after the last landed is deferred, not dropped), and suspend, drain and spot notice. **Not built:** the 60 s timer and the 256 MB threshold, so for now the recovery point is the last turn end. A sandbox's first commit uploads its base image's chunks (about 700 MB for `nest-base`, roughly 30 s), until base generations exist.
 
-The cadence is the RPO: a lost host loses at most the work since its last commit, and the loss is recorded ([SandboxDO](../../control-plane/durable-objects/sandbox/#losses)).
+The cadence is the RPO: a lost host loses at most the work since its last commit, and the loss is to be recorded ([SandboxDO](../../control-plane/durable-objects/sandbox/#losses); not built).
 
 ### One turn-end checkpoint at a time
 
-**Decided (2026-11-02).** Without the reflink cut ([disk](disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background); built, not deployed), a checkpoint pauses the VM while it reads a changed disk, so a second one queued right behind the first only doubles the pause (two back-to-back checkpoints of a 32 GiB disk held one VM paused 33–39 s each).
+**Decided (2026-11-02).** Without the reflink cut ([disk](disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background); built), a checkpoint pauses the VM while it reads a changed disk, so a second one queued right behind the first only doubles the pause (two back-to-back checkpoints of a 32 GiB disk held one VM paused 33–39 s each).
 - **At most one in flight.** SandboxDO records the `turn_end` checkpoint it asked for (kv `turn_checkpoint_inflight`: epoch, when, turns that ended meanwhile) until it **lands**: its `sandbox_checkpoint` command's result, ok or not (FleetDO passes it on, keyed by the command, so a late result of an older checkpoint lands nothing), or, sooner, its `turn_end` commit decided (any outcome, a replay of a stored one included). The command's result covers a checkpoint that sent no new commit: nestd asked again for an unanswered commit of another reason and found nothing new, or found no disk. One out longer than 5 min (its pause plus nestd's 60 s commit timeout, with room for a large disk) no longer counts.
 - **Turns that end while one is in flight share one follow-up,** 10 s after it lands, instead of each queueing a checkpoint behind it. One that never lands gets them theirs when its 5 min window ends.
 - **The follow-up is never skipped.** The in-flight checkpoint's cut is the guest's `sync` (`prepare_snapshot`; the guest freezes nothing), not the pause, so a call answered between the two may have left writes in the guest's page cache that it lacks.
@@ -67,7 +68,7 @@ A memory snapshot is valid **only when it belongs to the head generation**. Rest
 - **Head is a checkpoint:** do a memory restore (the fast path) on a host that loads its [restore ABI](memory/#restore-abi).
 - **Head is disk-only** (after a crash): cold-boot with the newest disk and run `--resume`. Running processes are lost; at most 60 s of file changes are lost.
 - **Head is a checkpoint no host can load** (its ABI is gone, or its memory restore failed): cold-boot the same generation's disk. Files are intact; process state is lost.
-- **Rollback notice:** each generation records the session position it covers (`session`). After a disk-only restore, the agent's recovery context says the workspace went back to that point, which tool calls after it may be undone, and whether process state was lost, so the model checks (e.g. `git status`) instead of trusting its transcript.
+- **Rollback notice** (designed, not built): each generation records the session position it covers (`session`). After a disk-only restore, the agent's recovery context says the workspace went back to that point, which tool calls after it may be undone, and whether process state was lost, so the model checks (e.g. `git status`) instead of trusting its transcript.
 
 ## Retention
 
@@ -84,7 +85,7 @@ Restore sources and turn ends are kept; everything else is thinned by age.
 
 SandboxDO runs retention from its alarm, in the same single writer that admits forks and destroys the sandbox, so a fork can't pin a generation that retention is deleting.
 
-**Turn ends are bounded** (decided 2026-11-01; the owner confirmed it 2026-11-02, with an orphan's non-head generations dropped at once and a sparse sandbox's newest 6 kept): kept "always", a sandbox that lives for months would root every turn's dirty chunks forever. A turn dirties whole 4 MB chunks, so a generation's own bytes are likely tens of MB (unverified); at Standard's $0.023/GB-month ([S3 pricing](https://aws.amazon.com/s3/pricing/), us-east-1, first 50 TB), 200 of 50 MB is about $0.23 a month per sandbox, where 50 turns a day kept for a year would be over $20 and growing. Rewinding isn't built, git keeps the code's history, and a week matches the commit records' retention. The newest 20 stay at any age, so a sandbox idle for a while keeps its recent turns.
+**Turn ends are bounded** (decided 2026-11-01; the owner confirmed it 2026-11-02, with an orphan's non-head generations dropped at once and a sparse sandbox's newest 6 kept): kept "always", a sandbox that lives for months would root every turn's dirty chunks forever. A turn dirties whole 4 MiB chunks, so a generation's own bytes are likely tens of MB (unverified); at Standard's $0.023/GB-month ([S3 pricing](https://aws.amazon.com/s3/pricing/), us-east-1, first 50 TB), 200 of 50 MB is about $0.23 a month per sandbox, where 50 turns a day kept for a year would be over $20 and growing. Rewinding isn't built, git keeps the code's history, and a week matches the commit records' retention. The newest 20 stay at any age, so a sandbox idle for a while keeps its recent turns.
 
 **The tiers** follow SPACE: each tier keeps its own newest slots and the tiers overlap. A slot is a wall-clock interval of the tier's spacing, aligned to the Unix epoch (so slots nest), represented by its newest generation; the slots counted are those with a generation. A busy sandbox keeps about 18 tier generations spanning 24 h; a sparse one keeps its newest 6 at any age. Orphans take no main-chain slot.
 
@@ -102,13 +103,15 @@ SandboxDO runs retention from its alarm, in the same single writer that admits f
 
 **Built:** the notice suspends every running sandbox, in no order ([autoscaling](../../compute/autoscaling/)). **Designed, not built:** the order below.
 
-1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then reflink-cut every disk in a brief pause each ([disk](disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot`).
+1. **Cut the disk of every sandbox first:** flush all guests in parallel with a 5 s budget, then reflink-cut every disk in a brief pause each ([disk](disk/#m2-a-reflink-cut-in-a-brief-pause-committed-in-the-background)) whether or not its flush finished, so none loses more than the notice's worth of file changes. A cut without a flush is crash-consistent (`reason: spot_notice`).
 2. Then, in order of recent activity: pause, write a full memory snapshot to NVMe (`sync_snapshot_files=false`), upload with zstd compression, commit.
 3. Anything that doesn't finish falls back to its disk-only generation, and the loss is recorded.
 
-A **rebalance recommendation** can arrive with the notice rather than before it, so it's polled every 5 s and means: stop placing on the host and flush idle sandboxes, not a full drain ([AWS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/rebalance-recommendations.html)).
+A **rebalance recommendation** (designed, not built: nestd polls only `spot/instance-action`) can arrive with the notice rather than before it, so it's to be polled every 5 s and mean: stop placing on the host and flush idle sandboxes, not a full drain ([AWS](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/rebalance-recommendations.html)).
 
 ## Volumes
+
+**Built:** one disk per sandbox, committed whole. **Designed, not built:**
 
 - **Durable:** `/workspace` and `$HOME`.
 - **Local only, never written back:** `/scratch`, package caches, build output. This removes most of the write churn.
@@ -116,5 +119,5 @@ A **rebalance recommendation** can arrive with the notice rather than before it,
 ## Components
 
 - [memory/](memory/): hugepages, UFFD, prefetch, tiers, restore ABI, base generations
-- [disk/](disk/): pausing only to read, the unchanged-disk check, reflink cuts in a brief pause (built, not deployed), extent diffs (designed), flush before commit, I/O limits, the ublk lazy disk (later)
+- [disk/](disk/): pausing only to read, the unchanged-disk check, reflink cuts in a brief pause (built), the shadow cut (built), extent diffs (designed), flush before commit, I/O limits, the ublk lazy disk (later)
 - [object-store/](object-store/): S3 per cell, costs, garbage collection

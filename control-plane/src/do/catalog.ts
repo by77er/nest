@@ -8,7 +8,7 @@ import type { Env } from "../env";
 import { PLATFORM_TOOL_NAMES } from "../lib/registry";
 import {
   type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, expandSpec, type PromptRewrite, pruneCapability, pruneTemplate, type Removes,
-  expandTemplate, mcpPrefix, rewritePrompt, SEED_CATALOG, SEED_VERSION, seedMigration, type SpawnSpec, Template, templatesUsing,
+  expandTemplate, mcpPrefix, rewritePrompt, rewriteRules, type RulesRewrite, SEED_CATALOG, SEED_VERSION, seedMigration, type SpawnSpec, Template, templatesUsing,
 } from "../lib/spec";
 import {
   capabilityOutsideGrant, capabilityRepos, grantBoundIds, REPO_OWNERS_PER_CALL, entryVisible, type Grant, grantRefusal, namespaceOf, ownerLookups, type RepoOwners, specOutsideGrant, specRepos,
@@ -95,6 +95,7 @@ export class CatalogDO extends DurableObject<Env> {
         this.insertSeed(m);
         this.removeSeed(m.removes);
         this.rewritePrompts(m.prompts);
+        this.rewriteRules(m.rules);
         this.setSeedVersion(m.version);
       }
     }
@@ -122,6 +123,11 @@ export class CatalogDO extends DurableObject<Env> {
   /** Replace each seed prompt still as a step left it, in step order. */
   private rewritePrompts(prompts: readonly PromptRewrite[]): void {
     for (const p of prompts) this.rewriteRows("capabilities", (body) => rewritePrompt(body, p), p.capability);
+  }
+
+  /** Replace each seed capability's rules still exactly as the seed left them, in step order (an operator's edit stays). */
+  private rewriteRules(rules: readonly RulesRewrite[]): void {
+    for (const r of rules) this.rewriteRows("capabilities", (body) => rewriteRules(body, r), r.capability);
   }
 
   /** Each row of `table` (or only `only`) that `edit` changes (non-null), written back. A row that isn't JSON is left. */

@@ -17,6 +17,7 @@ prompt:  |                                  # added to the system prompt
 
 - **Data, not code:** capabilities are stored in the control plane ([CatalogDO](../../control-plane/durable-objects/catalog/)) and edited by me, like templates. Adding an MCP server or an API is data too; only a new *platform* tool needs code (the tool registry).
 - **Attenuation:** a spawn spec can enable a capability only if the spawner holds every grant it expands to, with parameters no wider than its own.
+- **Rule order is template order** (first match wins). The seed's `nest` (the operator's) allows the task tools, `TodoWrite`, `WebSearch` and `WebFetch` by exact name, so a template that lists `nest` before its own capability can't make those built-ins `ask` or `deny` through that capability: it lists its capability before `nest`, or its spawns narrow them (`overrides.rules`, which come first).
 - **Parameters (designed, not built):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them.
 - **Always present, not capabilities:** an agent's own input queue and inbox, and `exit`.
 - **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).
