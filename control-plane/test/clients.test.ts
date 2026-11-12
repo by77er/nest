@@ -4,6 +4,7 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
+import { AgentDO as AgentDOClass } from "../src/do/agent";
 import type { ClientDO } from "../src/do/client";
 import { ClientDO as ClientDOClass, RESERVE_CHECK_MS } from "../src/do/client";
 import { MEMBER_EVENTS, MEMBER_STATES, memberStep } from "../src/lib/members";
@@ -336,6 +337,123 @@ describe("a client acts only on its subtree", () => {
     const spawner = await runInDurableObject(agentStub(a.agent), (i: AgentDO) => i.postInbox("worker:agt_x", "task").then(() => "posted", (e: Error) => e.message));
     expect(spawner).toContain("has ended");
     await runInDurableObject(agentStub(a.agent), (i: AgentDO) => (i as any).systemNote("moved"));
+  });
+});
+
+// --- Open asks across agents -----------------------------------------------------------------------------
+
+/** Hold an ask in `agent`'s ledger as a held call does (`recordAsk`): open, or `answered`; an approval when `tool` is given. */
+async function plantAsk(agent: string, ask: string, created_ms: number, o: { status?: "async" | "answered"; tool?: string } = {}): Promise<void> {
+  await runInDurableObject(agentStub(agent), (_i: AgentDO, st) => {
+    st.storage.sql.exec("INSERT INTO asks (ask, call, epoch, question, status, deadline, created_ms) VALUES (?, ?, 1, ?, ?, 0, ?)",
+      ask, `cal_${ask}`, `may ${ask}?`, o.status ?? "async", created_ms);
+    if (o.tool) st.storage.sql.exec("INSERT INTO approvals (ask, name, digest, status, created_ms, tool) VALUES (?, 'brokered', 'd', 'pending', ?, ?)", ask, created_ms, o.tool);
+  });
+}
+
+describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-asks-across-agents)", () => {
+  it("lists the open asks of the caller's live agents matching its labels, oldest first, with each one's agent, owner and labels", async () => {
+    const a = await newClient();
+    const b = await newClient({ cells: [a.cell] });
+    const w1 = await createAgent(a, { labels: { project: "p1", role: "worker", task: "t1" } });
+    const w2 = await createAgent(a, { labels: { project: "p1", role: "manager" } });
+    const other = await createAgent(a, { labels: { project: "p2", role: "worker" } });
+    const theirs = await createAgent(b, { cell: a.cell, labels: { project: "p1", role: "worker" } });
+    await plantAsk(w1.agent, "ask_w1late", 3000);
+    await plantAsk(w1.agent, "ask_w1done", 1000, { status: "answered" });
+    await plantAsk(w2.agent, "ask_w2early", 2000, { tool: "WebFetch" });
+    await plantAsk(other.agent, "ask_otherp2", 1500);
+    await plantAsk(theirs.agent, "ask_theirs1", 1200);
+
+    const r = await asJson(a.token, "/v1/asks?label=project=p1");
+    expect(r).toEqual({
+      asks: [
+        { agent: w2.agent, cell: a.cell, client: a.id, owner: a.id, labels: { project: "p1", role: "manager" }, ask: "ask_w2early", question: "may ask_w2early?", created_ms: 2000, approval: { name: "brokered", tool: "WebFetch" } },
+        { agent: w1.agent, cell: a.cell, client: a.id, owner: a.id, labels: { project: "p1", role: "worker", task: "t1" }, ask: "ask_w1late", question: "may ask_w1late?", created_ms: 3000 },
+      ],
+      next_cursor: null,
+    });
+    // Every label must match; another client's agents never show, whatever their labels.
+    expect((await asJson(a.token, "/v1/asks?label=project=p1&label=role=worker")).asks.map((x: any) => x.ask)).toEqual(["ask_w1late"]);
+    expect((await asJson(a.token, "/v1/asks")).asks.map((x: any) => x.ask)).toEqual(["ask_otherp2", "ask_w2early", "ask_w1late"]);
+    expect((await asJson(b.token, "/v1/asks?label=project=p1")).asks.map((x: any) => x.ask)).toEqual(["ask_theirs1"]);
+    // The operator reads a client's (`?client=`).
+    expect((await adminJson(`/v1/asks?client=${a.id}&label=project=p1`)).asks.map((x: any) => x.ask)).toEqual(["ask_w2early", "ask_w1late"]);
+  });
+
+  it("reads nest's record when asked: an ask answered anywhere, or of an agent that ended, is gone from the next read", async () => {
+    const c = await newClient();
+    const w = await createAgent(c, { labels: { project: "px" } });
+    const gone = await createAgent(c, { labels: { project: "px" } });
+    await plantAsk(w.agent, "ask_answerme", 1000);
+    await plantAsk(w.agent, "ask_stays001", 1001);
+    await plantAsk(gone.agent, "ask_ofended1", 1002);
+    const listed = async () => (await asJson(c.token, "/v1/asks?label=project=px")).asks.map((x: any) => x.ask);
+    expect(await listed()).toEqual(["ask_answerme", "ask_stays001", "ask_ofended1"]);
+    // Answered by the operator, not by the client: the client's next read doesn't list it.
+    await adminJson(`/v1/agents/${w.agent}/asks/ask_answerme/answer`, { body: { answer: "yes" } });
+    expect(await listed()).toEqual(["ask_stays001", "ask_ofended1"]);
+    await asJson(c.token, `/v1/agents/${gone.agent}/stop`, { body: { end: true } });
+    await eventually("the end reaches the registry", async () => (await clientStub(c.id).list("agent", { state: "ended" })).items.some((m) => m.id === gone.agent));
+    expect(await listed()).toEqual(["ask_stays001"]);
+    // Live agents only, whatever `state` asks for.
+    expect((await asJson(c.token, "/v1/asks?label=project=px&state=all")).asks.map((x: any) => x.ask)).toEqual(["ask_stays001"]);
+  });
+
+  it("pages by agent: `limit` agents a page (at most 100), and `next_cursor` goes on from the last", async () => {
+    const c = await newClient();
+    const agents = [];
+    for (let i = 0; i < 3; i++) agents.push((await createAgent(c, { labels: { project: "pg" } })).agent);
+    for (const [i, id] of agents.entries()) await plantAsk(id, `ask_page${i}xx`, 1000 + i);
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+    do {
+      const r: any = await asJson(c.token, `/v1/asks?label=project=pg&limit=2${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+      expect(r.asks.length).toBeLessThanOrEqual(2);
+      seen.push(...r.asks.map((x: any) => x.ask));
+      cursor = r.next_cursor;
+      pages++;
+    } while (cursor && pages < 5);
+    expect(pages).toBe(2);
+    expect(seen).toEqual(["ask_page0xx", "ask_page1xx", "ask_page2xx"]);
+    // A limit past the most is the most, not an error; a bad one is refused.
+    expect((await asJson(c.token, "/v1/asks?label=project=pg&limit=1000")).asks).toHaveLength(3);
+    await asJson(c.token, "/v1/asks?limit=0", {}, 400);
+    // What the registry is asked for: 50 agents by default, 100 at most (each is a call to its AgentDO).
+    const real = ClientDOClass.prototype.list;
+    const limits: (number | undefined)[] = [];
+    ClientDOClass.prototype.list = function (this: ClientDO, kind, q) {
+      limits.push(q?.limit);
+      return real.call(this, kind, q);
+    };
+    try {
+      await asJson(c.token, "/v1/asks?label=project=pg");
+      await asJson(c.token, "/v1/asks?label=project=pg&limit=1000");
+      await asJson(c.token, "/v1/asks?label=project=pg&limit=7");
+    } finally {
+      ClientDOClass.prototype.list = real;
+    }
+    expect(limits).toEqual([50, 100, 7]);
+    await asJson(c.token, "/v1/asks?label=nokey", {}, 400);
+  });
+
+  it("an agent that can't answer fails the page: an ask is never left out silently", async () => {
+    const c = await newClient();
+    const w = await createAgent(c, { labels: { project: "pf" } });
+    await plantAsk(w.agent, "ask_failpage", 1000);
+    const real = AgentDOClass.prototype.openAsks;
+    AgentDOClass.prototype.openAsks = async function () {
+      throw new Error("unreachable");
+    };
+    try {
+      const res = await as(c.token, "/v1/asks?label=project=pf");
+      expect(res.status).toBeGreaterThanOrEqual(500);
+      await res.text();
+    } finally {
+      AgentDOClass.prototype.openAsks = real;
+    }
+    expect((await asJson(c.token, "/v1/asks?label=project=pf")).asks.map((x: any) => x.ask)).toEqual(["ask_failpage"]);
   });
 });
 

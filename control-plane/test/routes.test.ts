@@ -26,7 +26,7 @@ const NOT_ADMIN = {
     "POST /v1/agents", "GET /v1/agents", "GET /v1/agents/:agent", "GET /v1/agents/:agent/turns", "GET /v1/agents/:agent/transcript", "GET /v1/agents/:agent/trace", "GET /v1/agents/:agent/trace/history",
     "POST /v1/agents/:agent/turns", "POST /v1/agents/:agent/inbox", "POST /v1/agents/:agent/interrupt", "POST /v1/agents/:agent/start",
     "POST /v1/agents/:agent/stop", "GET /v1/agents/:agent/children", "GET /v1/agents/:agent/brokered", "GET /v1/agents/:agent/asks",
-    "POST /v1/agents/:agent/asks/:ask/answer", "GET /v1/agents/:agent/timers", "DELETE /v1/agents/:agent/timers/:name",
+    "POST /v1/agents/:agent/asks/:ask/answer", "GET /v1/asks", "GET /v1/agents/:agent/timers", "DELETE /v1/agents/:agent/timers/:name",
     "POST /v1/sandboxes", "GET /v1/sandboxes", "GET /v1/sandboxes/:sandbox", "DELETE /v1/sandboxes/:sandbox", "PUT /v1/sandboxes/:sandbox/lifetime",
     "GET /v1/sandboxes/:sandbox/policy", "GET /v1/sandboxes/:sandbox/client-policy", "PUT /v1/sandboxes/:sandbox/client-policy",
     "GET /v1/catalog",
