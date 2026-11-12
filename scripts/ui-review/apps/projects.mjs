@@ -1107,6 +1107,8 @@ async function asksAnswer(p, status) {
   // The answer is back (600 ms): a failure's notification is up now (it closes itself after 4 s).
   await p.waitForTimeout(1200);
   const toast = await p.getByText("The answer wasn't sent").count();
+  // The 409's note, while it's up (it goes once a poll after the re-read has come).
+  const noted = await panelOf(p).locator("[data-note]").filter({ hasText: "Already answered" }).count();
   await p.waitForTimeout(6000); // the re-read, and a poll after it
   const log = await p.evaluate(() => window.__askLog);
   const after = await focusOf(p);
@@ -1118,7 +1120,7 @@ async function asksAnswer(p, status) {
     if (!after.includes("Approve")) notes.push(`answer 502: focus isn't back on Approve (${after})`);
   } else if (log.length !== 1 || log[0].present) notes.push(`answer ${status}: the ask's item should leave once, it changed ${log.length} times (flicker): ${JSON.stringify(log)}`);
   if (status === 409) {
-    if (!(await panelOf(p).locator("[data-note]").filter({ hasText: "Already answered" }).count())) notes.push("answer 409: no neutral 'Already answered' note in 'Needs you'");
+    if (!noted) notes.push("answer 409: no neutral 'Already answered' note in 'Needs you'");
     if (toast) notes.push("answer 409: shown as a failure ('The answer wasn't sent')");
   }
   if (status === 502 && !toast) notes.push("answer 502: the failure isn't announced");
