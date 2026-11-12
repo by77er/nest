@@ -8,7 +8,7 @@
   - using subscription OAuth tokens in other products or tools, or routing requests through them
   - third parties collecting, storing or intermediating Claude.ai credentials
 
-  Anthropic has enforced this server-side since early 2026 (unverified: the terms say only that Anthropic may enforce them without notice).
+  Anthropic has enforced this server-side since early 2026 (unverified).
 
 **How nest complies:**
 - One OAuth token from `setup-token`, used only by unmodified Claude Code.

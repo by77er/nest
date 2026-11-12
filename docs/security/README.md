@@ -6,7 +6,7 @@
 
 | Boundary | Guarantee |
 |---|---|
-| Sandbox VM | Hard isolation (Firecracker; gVisor, not built, only in cells without KVM). **Holds no credentials,** only placeholders. Anything that needs isolation gets its own sandbox. |
+| Sandbox VM | Hard isolation (Firecracker; gVisor in cells without KVM, not built). **Holds no credentials,** only placeholders. Anything that needs isolation gets its own sandbox. |
 | Agents within one sandbox | One shared trust domain. Grants give attribution only. |
 | Brain (Claude Code process on a brain host) | Holds the subscription token in its process environment. It has no local exec or file tools, and repo config can't load. A prompt injection can only act through `nest` tools and the web built-ins (tainting; **not built:** a host allowlist for them, so they reach any host on port 443, the only port the brain hosts' security group opens). |
 | Gateway (on each sandbox host) | The only way into a sandbox's hands, terminals and ports. Admits a connection only with a binding SandboxDO signed for that sandbox, epoch, client and scope, behind an Access service token at the edge; the guest checks the epoch again. |
