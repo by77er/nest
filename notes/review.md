@@ -23,4 +23,4 @@ Injection: wildcard checked only for client bindings (control-plane/src/lib/clie
 DNS 32 in flight per sandbox / 64 lookups / 128 denials per min (nest-proxy/src/state.rs:28-37); header read 30 s (http.rs:43); guard body 64 KiB (http.rs:968); leaves <= 24 h, capped at intermediate expiry (tls.rs:24,76); CA renew at 48 h (nestd-core/src/ca.rs:14); proxy link 2 s send / 15 s pong, 0660 + SO_PEERCRED, resync_ack mismatch (nestd/src/proxy_link.rs:16-19,46-50,130); TCP exceptions dial only recorded/own-resolved IPs (http.rs:104-131); S3 6 attempts, 200 ms-5 s, 16 parallel, 8 MiB parts x4, 80 % trim (nestd/src/s3.rs:25-57); 64 MiB hold-back budget path (storage.rs:204-222); cut prices 15,000 ns / 180 MB/s (config.rs:104-110); proxy CA required for sandbox enrollment (enroll.rs:135-140); `gateway-user` feature (nestd/src/lib.rs:30); egress_policy ttl_s 60-86400, default 3600 (protocol/schemas/control/platform-tools.json:360-364); bootstrap refuses without /dev/kvm/firecracker/jailer and shuts down (deploy/host/bootstrap.sh:55-57); `launch_types_sound`, `refused_sandbox_role` exist.
 
 ## Counts
-high 2, medium 3, low 9
+high 2, medium 3, low 8

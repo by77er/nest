@@ -27,7 +27,7 @@ chunks s3://<cell>/chunks/<blake3>    disk: 4 MiB    memory: 2 MiB (one hugepage
 
 **Built:** turn-end commits (SandboxDO asks for a `turn_end` checkpoint when an agent's turn completes, [one at a time](#one-turn-end-checkpoint-at-a-time); one sooner than 10 s after the last landed is deferred, not dropped), and suspend, drain and spot notice. **Not built:** the 60 s timer and the 256 MB threshold, so for now the recovery point is the last turn end. A sandbox's first commit uploads its base image's chunks (about 700 MB for `nest-base`, roughly 30 s), until base generations exist.
 
-The cadence is the RPO: a lost host loses at most the work since its last commit, and the loss is recorded ([SandboxDO](../../control-plane/durable-objects/sandbox/#losses)).
+The cadence is the RPO: a lost host loses at most the work since its last commit, and the loss is to be recorded ([SandboxDO](../../control-plane/durable-objects/sandbox/#losses); not built).
 
 ### One turn-end checkpoint at a time
 
@@ -111,7 +111,7 @@ A **rebalance recommendation** (designed, not built: nestd polls only `spot/inst
 
 ## Volumes
 
-**Designed, not built:** a sandbox has one disk, committed whole.
+**Built:** one disk per sandbox, committed whole. **Designed, not built:**
 
 - **Durable:** `/workspace` and `$HOME`.
 - **Local only, never written back:** `/scratch`, package caches, build output. This removes most of the write churn.
