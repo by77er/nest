@@ -14,7 +14,7 @@ import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, DIMENSIONS, GitHubError, githubFor, PERMISSIONS, requireReviewCheck } from "../github";
 import type { AgentCaller } from "../identity";
-import { backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras, stopRefused } from "../nest";
+import { type AgentView, backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras, stopRefused } from "../nest";
 import { envName, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
@@ -62,6 +62,12 @@ export interface Settings {
    * (`after_turn`) once the turn it's in ends. Null when it runs on the setting's model, or there's none.
    */
   manager_switch: { from: string | null; to: string; after_turn: boolean } | null;
+  /**
+   * The model nest gave the running manager's switch up onto, at the last try (README.md#models): nest
+   * stored it, so it takes effect when the manager next starts, and the manager runs its old one till then.
+   * Null otherwise: cleared by that start, a change of the setting, or a switch applied.
+   */
+  manager_switch_given_up: string | null;
   /**
    * The GitHub user whose PR comments reach workers (README.md#pr-comments), by id (immutable): the
    * repo's owner when it's a user, recorded at attach; an org's repo needs it set. Null: nobody's do.
@@ -559,6 +565,15 @@ export const MIGRATIONS = [
     "ALTER TABLE settings ADD COLUMN switch_after_turn INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE settings ADD COLUMN switch_attempts INTEGER NOT NULL DEFAULT 0",
   ],
+  [
+    // nest giving a switch's restart up (README.md#models): its give-ups of the setting's model so far, the
+    // last one counted (nest's `restart_error.ms`), when to read nest's record after a `restart_refused`, and
+    // the model given up on at the last (it takes effect at the manager's next start).
+    "ALTER TABLE settings ADD COLUMN switch_refusals INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE settings ADD COLUMN refusal_seen_ms INTEGER",
+    "ALTER TABLE settings ADD COLUMN refusal_check_ms INTEGER",
+    "ALTER TABLE settings ADD COLUMN switch_gave_up_model TEXT",
+  ],
 ] as const;
 
 /** The resolved waits kept (and shown on the page): older ones are pruned as new ones resolve. */
@@ -570,6 +585,9 @@ type Row = Record<string, SqlStorageValue>;
 const MID_TURN = new Set(["working", "waiting_permission", "compacting", "quota_parked", "stalled"]);
 /** While a switch waits for the manager's turn to end, it looks again this often (its `turn_completed` may be missed). */
 const SWITCH_RECHECK_MS = 60_000;
+/** nest gave a switch's restart up: tried again after this, doubling, until it has given it up SWITCH_REFUSALS times. */
+const REFUSAL_BACKOFF_MS = 5 * 60_000;
+const SWITCH_REFUSALS = 3;
 
 /** A failed stop's `next_ms` (the column is NOT NULL): never due (9999-12-31), until the owner's Retry. */
 const NOT_DUE_MS = 253_402_300_799_000;
@@ -645,6 +663,7 @@ export class ProjectDO extends DurableObject<Env> {
       manager_model: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, worker_model: (r.worker_model as string | null) ?? DEFAULT_MODEL.worker,
       manager_switch: r.switch_next_ms === null || r.switch_next_ms === undefined ? null
         : { from: (r.manager_running_model as string | null) ?? null, to: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, after_turn: r.switch_after_turn === 1 },
+      manager_switch_given_up: (r.switch_gave_up_model as string | null) ?? null,
       comments_from: r.comments_from_id === null || r.comments_from_id === undefined ? null : { id: r.comments_from_id as number, login: (r.comments_from_login as string | null) ?? null },
       repo_owner: r.repo_owner_id === null || r.repo_owner_id === undefined ? null : { id: r.repo_owner_id as number, login: r.repo_owner_login as string },
       repo_auto_merge: repoAutoMerge({
@@ -713,7 +732,12 @@ export class ProjectDO extends DurableObject<Env> {
     if (u.max_workers !== undefined) this.sql.exec("UPDATE settings SET max_workers = ?", clampWorkers(u.max_workers));
     if (u.merge_method !== undefined) this.sql.exec("UPDATE settings SET merge_method = ?", u.merge_method);
     if (u.manager_model !== undefined) {
+      const was = this.settingsRow()!.manager_model;
       this.sql.exec("UPDATE settings SET manager_model = ?", u.manager_model);
+      // Another model: nest's give-ups of the last one neither count against it nor hold it back.
+      if (was !== u.manager_model) {
+        this.sql.exec("UPDATE settings SET switch_next_ms = CASE WHEN switch_refusals > 0 AND switch_next_ms IS NOT NULL THEN ? ELSE switch_next_ms END, switch_refusals = 0, switch_gave_up_model = NULL", Date.now());
+      }
       // The running manager moves onto it now, keeping its conversation (README.md#models).
       this.oweManagerSwitch();
     }
@@ -2191,10 +2215,14 @@ export class ProjectDO extends DurableObject<Env> {
           e.ask, e.agent, route.role, route.task, e.question ?? null, e.approval === undefined ? null : JSON.stringify(e.approval), Date.now(),
         );
         break;
-      case "agent.error":
+      case "agent.error": {
         this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, ?, ?, ?, ?, ?)",
           e.id, Date.now(), e.agent, route.role, route.task, e.code ?? null, e.message ?? null);
+        // nest accepted a switch's restart, then gave it up (README.md#models): its record says which, read
+        // in the drain (`checkRefusal`).
+        if (e.code === "restart_refused" && route.role === "manager" && s.manager === e.agent) this.sql.exec("UPDATE settings SET refusal_check_ms = ?", Date.now());
         break;
+      }
     }
     await this.arm();
   }
@@ -3389,6 +3417,7 @@ export class ProjectDO extends DurableObject<Env> {
       this.templateDeleteDue(),
       // A switch of the running manager onto the setting's model (README.md#models).
       min("SELECT MIN(switch_next_ms) AS t FROM settings WHERE switch_next_ms IS NOT NULL AND manager IS NOT NULL"),
+      min("SELECT MIN(refusal_check_ms) AS t FROM settings WHERE refusal_check_ms IS NOT NULL AND manager IS NOT NULL"),
       // Auto-merge: the repo's setting to write or read, and each task PR's change (an enable only once
       // the repo allows it).
       min(`SELECT MIN(t) AS t FROM (
@@ -3532,7 +3561,10 @@ export class ProjectDO extends DurableObject<Env> {
       await this.cleanRun(nest, r.id as string);
     }
     if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo(nest);
-    if (s.switch_next_ms !== null && s.switch_next_ms !== undefined && (s.switch_next_ms as number) <= now && s.manager !== null) await this.switchManager(nest);
+    if (s.refusal_check_ms !== null && (s.refusal_check_ms as number) <= now && s.manager !== null) await this.checkRefusal(nest);
+    // Read again: a refusal just counted puts the switch off.
+    const sw = this.settingsRow()!;
+    if (sw.switch_next_ms !== null && sw.switch_next_ms !== undefined && (sw.switch_next_ms as number) <= now && sw.manager !== null) await this.switchManager(nest);
     if (s.secrets_next_ms !== null && (s.secrets_next_ms as number) <= now) await this.secretsUpkeep(nest);
     for (const r of this.sql.exec("SELECT task, start FROM abandoned WHERE next_ms <= ?", now).toArray()) await this.cleanAbandoned(nest, r.task as string, r.start as number);
     for (const r of this.sql.exec("SELECT task FROM issue_closes WHERE next_ms IS NOT NULL AND next_ms <= ?", now).toArray()) await this.closeIssue(nest, r.task as string);
@@ -3709,7 +3741,7 @@ export class ProjectDO extends DurableObject<Env> {
       for (const w of this.sql.exec<{ id: string }>("SELECT id FROM waits WHERE resolved_ms IS NULL").toArray()) this.resolveWait(w.id, "ended", "the manager was replaced", false);
     }
     // A new manager starts on the setting's model (its start freezes it): no switch is owed to the old one.
-    this.sql.exec("UPDATE settings SET manager_running_model = NULL, switch_next_ms = NULL, switch_after_turn = 0, switch_attempts = 0");
+    this.sql.exec("UPDATE settings SET manager_running_model = NULL, switch_next_ms = NULL, switch_after_turn = 0, switch_attempts = 0, switch_refusals = 0, refusal_check_ms = NULL, switch_gave_up_model = NULL");
     const note = event.kind === "restart" ? "The manager is restarting." : l.next_ms !== null ? "A new manager is starting." : "It isn't started again by itself: restart it when you're ready.";
     this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), note);
     return true;
@@ -3724,7 +3756,8 @@ export class ProjectDO extends DurableObject<Env> {
   private oweManagerSwitch(): void {
     const r = this.settingsRow()!;
     const want = (r.manager_model as string | null) ?? DEFAULT_MODEL.manager;
-    if (r.manager === null || r.manager_running_model === want) {
+    // Given up on (nest has it stored for the next start): not tried again until the setting changes.
+    if (r.manager === null || r.manager_running_model === want || r.switch_gave_up_model === want) {
       this.sql.exec("UPDATE settings SET switch_next_ms = NULL, switch_after_turn = 0, switch_attempts = 0");
       return;
     }
@@ -3751,14 +3784,29 @@ export class ProjectDO extends DurableObject<Env> {
       const now = this.settingsRow();
       return !!now && now.manager === agent && now.manager_starts === base && now.switch_next_ms !== null;
     };
+    const waitForTurn = () => this.sql.exec("UPDATE settings SET switch_after_turn = 1, switch_next_ms = ?", Date.now() + SWITCH_RECHECK_MS);
     try {
-      const view = await nest.getAgent(agent);
-      if (!current()) return;
-      if (MID_TURN.has(String(view.state ?? ""))) {
-        this.sql.exec("UPDATE settings SET switch_after_turn = 1, switch_next_ms = ?", Date.now() + SWITCH_RECHECK_MS);
-        return;
+      let answer: { launch?: { model?: string } };
+      try {
+        // Only between turns, as nest decides it: a turn running is a 409 `busy`, and nothing is cut.
+        answer = await nest.restartAgent(agent, { model: to }, "idle");
+      } catch (e) {
+        if (!current()) return;
+        if (e instanceof NestError && e.status === 409 && e.code === "busy") {
+          waitForTurn();
+          return;
+        }
+        // A nest before `when` refuses the field (400): the app looks at the manager's state itself, then
+        // restarts. If a turn starts just as it switches, that turn starts again on the new model.
+        if (!(e instanceof NestError && e.status === 400 && /\bwhen\b/.test(e.message))) throw e;
+        const view = await nest.getAgent(agent);
+        if (!current()) return;
+        if (MID_TURN.has(String(view.state ?? ""))) {
+          waitForTurn();
+          return;
+        }
+        answer = await nest.restartAgent(agent, { model: to });
       }
-      const answer = await nest.restartAgent(agent, { model: to });
       // The same manager (no move of its lifecycle meanwhile): what nest now runs is recorded whether or not
       // the switch is still owed (the setting may have changed back while the restart was out), and any
       // switch onto the setting as it is now is owed afresh.
@@ -3771,7 +3819,7 @@ export class ProjectDO extends DurableObject<Env> {
         this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `The manager couldn't be switched to ${modelLabel(to)}: nest didn't apply the model (its release can't switch a running agent yet). It runs on until its next start, which takes the new model.`);
         return;
       }
-      this.sql.exec("UPDATE settings SET manager_running_model = ?, switch_after_turn = 0, switch_attempts = 0, switch_next_ms = NULL", ran);
+      this.sql.exec("UPDATE settings SET manager_running_model = ?, switch_after_turn = 0, switch_attempts = 0, switch_next_ms = NULL, switch_gave_up_model = NULL", ran);
       this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `Switched to ${modelLabel(ran)}.`);
       // Changed again (or back) while this one was out: the setting as it is now is owed.
       this.oweManagerSwitch();
@@ -3786,6 +3834,54 @@ export class ProjectDO extends DurableObject<Env> {
       const attempts = (r.switch_attempts as number) + 1;
       this.sql.exec("UPDATE settings SET switch_attempts = ?, switch_next_ms = ?", attempts, Date.now() + backoff(attempts));
     }
+  }
+
+  /**
+   * nest sent `restart_refused` for the manager (README.md#models): it gave an accepted restart up, and the
+   * brain runs on its old model. The event names no restart, so nest's record says which: its
+   * `restart_error` is cleared by the next restart asked for, so a refusal of an earlier switch, read after
+   * a later one was asked, finds none and changes nothing; and a give-up is counted once (its `ms`),
+   * however many events name it. Counted, the switch is tried again after REFUSAL_BACKOFF_MS (doubling);
+   * at SWITCH_REFUSALS it's given up: the model nest stored takes effect at the manager's next start.
+   */
+  private async checkRefusal(nest: Nest): Promise<void> {
+    const r = this.settingsRow()!;
+    const agent = r.manager as string;
+    const base = r.manager_starts as number;
+    const seen = r.refusal_check_ms as number;
+    const same = () => {
+      const now = this.settingsRow();
+      return !!now && now.manager === agent && now.manager_starts === base;
+    };
+    let view: AgentView;
+    try {
+      view = await nest.getAgent(agent);
+    } catch (e) {
+      if (!same()) return;
+      // Gone for good (its end moves the lifecycle on its own): nothing to count. Else read again later.
+      this.sql.exec("UPDATE settings SET refusal_check_ms = ? WHERE refusal_check_ms = ?", e instanceof NestError && e.permanent ? null : Date.now() + SWITCH_RECHECK_MS, seen);
+      return;
+    }
+    if (!same()) return;
+    // An event seen while the read was out is read for again.
+    this.sql.exec("UPDATE settings SET refusal_check_ms = NULL WHERE refusal_check_ms = ?", seen);
+    const err = view.restart_error as { ms?: unknown } | null | undefined;
+    const ms = typeof err?.ms === "number" ? err.ms : null;
+    const now = this.settingsRow()!;
+    if (ms === null || ms === now.refusal_seen_ms) return;
+    const want = (now.manager_model as string | null) ?? DEFAULT_MODEL.manager;
+    const n = (now.switch_refusals as number) + 1;
+    this.sql.exec("UPDATE settings SET refusal_seen_ms = ?", ms);
+    if (n >= SWITCH_REFUSALS) {
+      // nest stored the model: the manager's next start takes it, so no switch is owed until the setting
+      // changes. It runs its old one till then (unknown here), as Settings says.
+      this.sql.exec("UPDATE settings SET manager_running_model = NULL, switch_gave_up_model = ?, switch_next_ms = NULL, switch_after_turn = 0, switch_attempts = 0, switch_refusals = 0", want);
+      this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `Couldn't switch to ${modelLabel(want)}: it takes effect when the manager next starts.`);
+      return;
+    }
+    const wait = REFUSAL_BACKOFF_MS * 2 ** (n - 1);
+    this.sql.exec("UPDATE settings SET manager_running_model = NULL, switch_next_ms = ?, switch_after_turn = 0, switch_attempts = 0, switch_refusals = ?", Date.now() + wait, n);
+    this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `The switch to ${modelLabel(want)} didn't complete (nest couldn't restart the manager): trying again in ${wait / 60_000} minutes.`);
   }
 
   /** The owner's Restart: the manager (if any) goes, a new one starts now. Asked while one is starting, nothing changes. */

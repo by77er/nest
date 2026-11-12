@@ -205,6 +205,18 @@ describe("the manager's model, switched now", () => {
     expect(switchText({ from: null, to: "claude-sonnet-5-5", after_turn: true })).toBe("Switches to Sonnet 5.5 after this turn.");
     expect(switchText({ from: null, to: "claude-sonnet-5-5", after_turn: false })).toBe("Switching to Sonnet 5.5…");
   });
+
+  it("a switch nest gave up says it takes effect at the manager's next start, while that model is chosen", async () => {
+    const api = new FakeApi();
+    api.projects[0]!.settings = { ...api.projects[0]!.settings!, manager_model: "claude-sonnet-5-5", manager_switch_given_up: "claude-sonnet-5-5" };
+    const { user, dialog } = await openSettings(api);
+    expect(dialog.querySelector("[data-slot=manager-switch]")).toHaveTextContent("Takes effect when the manager next starts.");
+    // Another model picked: that one would be switched to now, so the line goes.
+    const field = within(dialog).getAllByLabelText("Manager's model").find((e) => e.tagName === "INPUT" && (e as HTMLInputElement).type !== "hidden")!;
+    await user.click(field);
+    await user.click(await screen.findByRole("option", { name: "Haiku 5.5" }));
+    expect(dialog.querySelector("[data-slot=manager-switch]")).toBeNull();
+  });
 });
 
 describe("the models in the settings", () => {
@@ -215,7 +227,8 @@ describe("the models in the settings", () => {
     const { user, dialog } = await openSettings(api);
     expect(select(dialog, "Manager's model")).toHaveValue("Fable 5.2");
     expect(select(dialog, "Workers' model")).toHaveValue("Opus 5.5");
-    expect(dialog).toHaveTextContent("A change applies now: the running manager switches between turns, keeping its conversation. A turn it starts at the moment of the switch is cut and redone.");
+    expect(dialog).toHaveTextContent("A change applies now: the running manager switches between turns, keeping its conversation.");
+    expect(dialog).not.toHaveTextContent("cut and redone");
     expect(dialog.querySelector("[data-slot=manager-switch]")).toBeNull();
     expect(dialog).toHaveTextContent("workers started from now on; running ones keep theirs");
     expect(dialog).toHaveTextContent("Reviewers and routine runs keep nest's default model.");

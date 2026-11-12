@@ -152,12 +152,17 @@ export function data(variant = "demo", now = Date.now()) {
   const chat = [
     { seq: 1, at_ms: now - 3_600_000, sender: "owner", text: "Plan the search work and split it into tasks.", delivered: true, status: "done", error: null },
     { seq: 2, at_ms: now - 3_500_000, sender: "manager", text: PLAN_REPLY, delivered: true, status: "done", error: null },
-    // The manager switched to another model (README.md#models; manager-switched), or ended.
-    variant === "manager-switched"
+    // The manager switched to another model (README.md#models; manager-switched), nest gave the switch up
+    // (switch-refused: the manager runs on), or it ended.
+    variant === "switch-gave-up"
+      ? { seq: 3, at_ms: now - 900_000, sender: "app", text: "Couldn't switch to Sonnet 5.5: it takes effect when the manager next starts.", delivered: true, status: "done", error: null }
+      : variant === "switch-refused"
+      ? { seq: 3, at_ms: now - 900_000, sender: "app", text: "The switch to Sonnet 5.5 didn't complete (nest couldn't restart the manager): trying again in 5 minutes.", delivered: true, status: "done", error: null }
+      : variant === "manager-switched"
       ? { seq: 3, at_ms: now - 900_000, sender: "app", text: "Switched to Sonnet 5.5.", delivered: true, status: "done", error: null }
       : { seq: 3, at_ms: now - 900_000, sender: "app", text: "The manager ended (exited).", delivered: true, status: "done", error: null },
-    // Delivered to the switched manager (manager-switched); else refused, the manager having ended.
-    variant === "manager-switched"
+    // Delivered to the running manager (manager-switched, switch-refused); else refused, the manager having ended.
+    variant === "manager-switched" || variant === "switch-refused" || variant === "switch-gave-up"
       ? { seq: 4, at_ms: now - 300_000, sender: "owner", text: "Can you also look at the auth migration? It stalled.", delivered: true, status: "done", error: null }
       : { seq: 4, at_ms: now - 300_000, sender: "owner", text: "Can you also look at the auth migration? It stalled.", delivered: false, status: "failed", error: "nest answered 409: the agent has ended" },
   ];
@@ -314,8 +319,11 @@ const RICH = [
     // A switch of the running manager waiting for its turn to end (manager-switching).
     // manager-switching-now: due now, between turns.
     ...(variant === "manager-switching" || variant === "manager-switching-now"
-      ? { manager_model: "claude-sonnet-5-5", manager_switch: { from: "claude-fable-5-2", to: "claude-sonnet-5-5", after_turn: variant === "manager-switching" } }
-      : { manager_switch: null }),
+      ? { manager_model: "claude-sonnet-5-5", manager_switch: { from: "claude-fable-5-2", to: "claude-sonnet-5-5", after_turn: variant === "manager-switching" }, manager_switch_given_up: null }
+      // switch-gave-up: nest gave the switch up at the last try; it takes effect at the manager's next start.
+      : variant === "switch-gave-up"
+      ? { manager_model: "claude-sonnet-5-5", manager_switch: null, manager_switch_given_up: "claude-sonnet-5-5" }
+      : { manager_switch: null, manager_switch_given_up: null }),
   };
   const demo = { id: "prj_demo", name, repo, created_ms: now - DAY * 3, settings };
   const other = { id: "prj_other", name: "Widgets", repo: "by77er/widgets", created_ms: now - DAY * 9 };
@@ -348,7 +356,7 @@ const RICH = [
   const { messages: allMessages, pages: historyPages } = trace(now, { busy: variant === "turn-busy" });
   // "connecting": the trace's socket opens but nothing arrives yet (the log's loading state).
   // "chat-empty" is a new conversation: no turn running either (its starters show); "chat-heavy" ends on its reply; "chat-sending" ends on the owner's messages being sent.
-  const traceMessages = variant === "connecting" || variant === "chat-empty" || variant === "chat-heavy" || variant === "chat-code" || variant === "chat-sending" || variant === "manager-ended" || variant === "manager-switched" ? [] : allMessages;
+  const traceMessages = variant === "connecting" || variant === "chat-empty" || variant === "chat-heavy" || variant === "chat-code" || variant === "chat-sending" || variant === "manager-ended" || variant === "manager-switched" || variant === "switch-refused" || variant === "switch-gave-up" ? [] : allMessages;
   const projects = variant === "empty" ? [] : [{ id: demo.id, name, repo, created_ms: demo.created_ms, needs_you: attention.length, state: "ready" }, { ...other, needs_you: 0, state: "ready" },
     // One still being created (README.md#creating-a-project): nothing to open yet.
     ...(variant === "creating" ? [{ id: "prj_new4k2", name: "Thingamajigs", repo: "by77er/thingamajigs", created_ms: now - 20_000, needs_you: 0, state: "pending" }] : [])];
