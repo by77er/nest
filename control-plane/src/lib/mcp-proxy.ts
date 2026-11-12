@@ -510,7 +510,8 @@ export class McpProxy {
       if (!this.recordForward(ctx, g, tool, attempts)) return this.forward(ctx.key)!.outcome!;
       const meta = { "nest/agent": ctx.agent, "nest/epoch": ctx.epoch, "nest/call": ctx.key, "nest/taint": tainted };
       const name = `${g.capability}.${tool}`;
-      const fetchFn = this.d.outbound ? meteredFetch((m) => this.d.outbound!({ type: "outbound", via: "mcp", name, ...m })) : undefined;
+      // The host only: the server's URL is configuration, and a hosted server's path may carry a key.
+      const fetchFn = this.d.outbound ? meteredFetch(({ path: _path, ...m }) => this.d.outbound!({ type: "outbound", via: "mcp", name, ...m })) : undefined;
       const a = await rpc(this.url(g), { id: 100 + attempts, method: "tools/call", params: { name: tool, arguments: args, _meta: meta } },
         { token: bearer.value, session: s.session, version: s.version, timeoutMs: this.d.callTimeoutMs, identity, fetchFn });
       if ((a.kind === "result" || a.kind === "rpc_error") && a.list_changed) {

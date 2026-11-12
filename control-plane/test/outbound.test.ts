@@ -37,6 +37,21 @@ describe("meteredFetch", () => {
     expect(got).toMatchObject([{ method: "GET", host: "h.example", path: "/a", status: 200, bytes_up: 0, bytes_down: 10 }]);
   });
 
+  it("records once when the body is cancelled while a read is pending and that read then ends", async () => {
+    const got: Metered[] = [];
+    // An upstream whose next chunk never comes: a read waits until the cancel ends it (done).
+    const upstream = (async () => new Response(new ReadableStream({ pull: () => new Promise<void>(() => {}) }))) as typeof fetch;
+    const res = await meteredFetch((m) => got.push(m), upstream)("https://h.example/p");
+    const reader = res.body!.getReader();
+    const pending = reader.read();
+    await new Promise((r) => setTimeout(r, 10));
+    await reader.cancel();
+    expect((await pending).done).toBe(true);
+    await new Promise((r) => setTimeout(r, 10));
+    expect(got).toHaveLength(1);
+    expect(got[0]).toMatchObject({ path: "/p", status: 200, bytes_down: 0 });
+  });
+
   it("records a request with no response: aborted (the caller's timeout) or network, and the error still reaches the caller", async () => {
     const got: Metered[] = [];
     const failing = (async () => {

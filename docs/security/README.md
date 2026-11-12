@@ -24,7 +24,7 @@
 - One door into every sandbox, with a signed binding per client and an edge check: [../sandbox/gateway/](../sandbox/gateway/)
 - Grants, attenuated from me (an agent passes on only what it holds), taint tracking with approval on sinks, brokered actions and approval gates: [../agents/tools/](../agents/tools/)
 - Epoch fencing of side effects: [../sandbox/fencing/](../sandbox/fencing/)
-- Every outbound request recorded: the control plane's for an agent's tools on its live trace, a sandbox's in nest-proxy's audit (host, method, path, outcome, sizes; never a query, header or body): [../control-plane/api/](../control-plane/api/#live-trace)
+- Outbound requests recorded (host, method, path, outcome, sizes; never a query, header or body): a sandbox's in nest-proxy's audit, and those the control plane sends for an agent's brokered actions and MCP tool calls on its live trace. Not recorded: MCP session setup, the connector's tool listing, webhook deliveries and the brain's `WebFetch` and `WebSearch`; BrokerDO's mints are in its own audit: [../control-plane/api/](../control-plane/api/#live-trace)
 
 ## Components
 

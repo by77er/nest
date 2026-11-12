@@ -16,8 +16,8 @@ export interface OutboundRecord {
   name: string;
   method: string;
   host: string;
-  /** The URL's path: never its query or fragment. */
-  path: string;
+  /** The URL's path: never its query or fragment. Absent for an MCP server, whose URL is fixed configuration and may hold a key. */
+  path?: string;
   /** The HTTP status; absent when no response came (`error`). */
   status?: number;
   /** No response, or the body broke off: `aborted` (the caller's timeout) or `network`. */

@@ -649,6 +649,10 @@ describe("github.fork", () => {
       fork: "operator/lib", url: "https://github.com/Operator/lib", compare: `https://github.com/${up}/compare/trunk...operator:lib:<branch>`, push_allowed: true,
     });
     expect(gh.forks.filter((f) => f.upstream === up)).toEqual([{ upstream: up, body: { default_branch_only: true } }]);
+    // The fork's request is on the agent's trace; the operator's token isn't.
+    expect(await outbound(s.agent)).toEqual([expect.objectContaining({
+      via: "brokered", name: "github.fork", method: "POST", host: "api.github.com", path: `/repos/${up}/forks`, status: 202 })]);
+    expect(JSON.stringify(await traceRows(s.agent))).not.toContain(GITHUB_USER_TOKEN);
     const sbx = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox!));
     expect(await sbx.pushRepos()).toContain("operator/lib");
     const policy = await sbx.policy();
