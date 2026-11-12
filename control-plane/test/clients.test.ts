@@ -563,8 +563,10 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
     const c = await newClient();
     const first = await createAgent(c, { labels: { project: "pb" } });
     const second = await createAgent(c, { labels: { project: "pb" } });
-    // 31 inputs of 32 KiB leave 32 KiB: then 20 000 bytes fit, a whole 32 KiB doesn't, and 100 bytes still do.
-    const sizes = [...Array(31).fill(INPUT_KEPT_BYTES), 20_000, INPUT_KEPT_BYTES, 100, 50];
+    // 31 inputs of 32 KiB leave 32 KiB: then 20 000 bytes fit, a whole 32 KiB doesn't, 100 bytes still do, and
+    // the last is exactly what is left: it fits, and the page holds exactly 1 MiB.
+    const exact = 1024 * 1024 - 31 * INPUT_KEPT_BYTES - 20_000 - 100;
+    const sizes = [...Array(31).fill(INPUT_KEPT_BYTES), 20_000, INPUT_KEPT_BYTES, 100, exact];
     const ids = sizes.map((_, i) => `ask_budget${String(i).padStart(2, "0")}`);
     for (const [i, bytes] of sizes.entries()) await plantAsk(i % 2 ? second.agent : first.agent, ids[i]!, 1000 + i, { input: inputOf(bytes) });
     const real = AgentDOClass.prototype.askInputs;
@@ -581,15 +583,25 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
     }
     expect(r.asks.map((x: any) => x.ask)).toEqual(ids);
     expect(r.more).toEqual([]);
-    // 31 x 32 KiB + 20 000 + 100 + 50 = 1 MiB - 12 618: the 32 KiB one that would pass 1 MiB is left out, and named.
+    // The 32 KiB one that would pass 1 MiB is left out, and named; the one that fits exactly is not.
     expect(r.input_left_out).toEqual(["ask_budget32"]);
     const carried = r.asks.filter((x: any) => x.input !== undefined);
     expect(carried.map((x: any) => x.ask)).toEqual(ids.filter((a) => a !== "ask_budget32"));
     for (const x of carried) expect(JSON.stringify(x.input)).toBe(inputOf(x.input_bytes));
-    expect(carried.reduce((n: number, x: any) => n + x.input_bytes, 0)).toBeLessThanOrEqual(1024 * 1024);
+    expect(carried.reduce((n: number, x: any) => n + x.input_bytes, 0)).toBe(1024 * 1024);
     expect(r.asks.find((x: any) => x.ask === "ask_budget32").input_bytes).toBe(INPUT_KEPT_BYTES);
     // The left-out input was never read from its agent.
     expect(read.sort()).toEqual(carried.map((x: any) => x.ask).sort());
+  });
+
+  it("one askInputs call reads at most 32 asks' inputs (a page's whole budget), the first asked for", async () => {
+    const c = await newClient();
+    const w = await createAgent(c, { labels: { project: "pc" } });
+    const ids = Array.from({ length: 40 }, (_, i) => `ask_capped${String(i).padStart(2, "0")}`);
+    for (const [i, id] of ids.entries()) await plantAsk(w.agent, id, 1000 + i, { input: JSON.stringify({ n: i }) });
+    const got = await agentStub(w.agent).askInputs(ids);
+    expect(Object.keys(got).sort()).toEqual(ids.slice(0, 32));
+    expect(got[ids[31]!]).toEqual({ n: 31 });
   });
 
   it("an agent that can't give its inputs leaves them out, by name: its asks are still listed", async () => {

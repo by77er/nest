@@ -26,7 +26,7 @@
   - **How:** the asks are listed without inputs; then each agent is asked (`askInputs`, 5 s) for the inputs chosen, and only those, so the Worker never holds more than the budget.
   - **`input_left_out`** (with `?include=input` only) names, in page order, the asks whose input was kept but isn't on the page: past the budget, answered between the two reads, or its agent failed or was slow to give it. These fail no page: the asks are already read. Each is whole at `GET /v1/agents/<id>/asks`. An ask with `input_bytes` past 32 KiB, or without it (an older ask, or not an approval), has no input anywhere and isn't named.
 - **Read from each agent's AgentDO when asked,** one call each, in parallel: there is no index of asks to drift. An agent that fails, or takes more than 5 s, fails the whole page (its error, or `503 internal` retryable), so a page never leaves an ask out silently.
-- **What to trust:** `question` is agent-written text (a tainted agent's included): show it as data. `labels` are the creator's: a row whose `owner` is an agent has the labels that agent gave its child, so an app treats labels as its own provenance only where `owner` is the app itself.
+- **What to trust:** `question` is agent-written text (a tainted agent's included): show it as data. So is `input`, the held call's arguments as the agent wrote them; they may also hold sensitive values (a token, a file's content), so show them as data and only to whoever may answer the ask. `labels` are the creator's: a row whose `owner` is an agent has the labels that agent gave its child, so an app treats labels as its own provenance only where `owner` is the app itself.
 
 ## Restarting on another model
 
