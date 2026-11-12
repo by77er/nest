@@ -21,6 +21,7 @@ Base: origin/main 6bbf64f.
 | Outboxes | "Stops used to retry everything forever. ReviewDO's queues used to …" (tombstone) | dropped; the table states the current policies | projects/src/outbox.ts:95-113 |
 | Outboxes | one-off cleanup "which deleting a draft left before the task machine. Nothing updates them now" | the migration drops orphaned PR rows | projects/src/do/project.ts:516 |
 | The manager lifecycle | "a manager that ended used to stay the project's manager" (tombstone) | stated as the rule | projects/src/manager.ts:85-101 |
+| Creating a project; Built: the review pipeline; The UI (task drawer) | change-history sentences ("used to be four awaited steps", "Before this, such a job failed…", "it was a third before…") | stated as current rules only | AGENTS.md Docs rules (no tombstones) |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
