@@ -14,6 +14,11 @@ describe("a capacity refusal, told apart", () => {
   it("is nest's 403 forbidden in ClientDO's words, for agents or sandboxes; nothing else is", () => {
     const err = (status: number, code: string, message: string, retryable = false) => new NestError(status, code, message, retryable);
     const cases: [string, unknown, boolean][] = [
+      // nest from nest#248 on: its own code, whatever the words.
+      ["at_capacity (nest#248)", err(429, "at_capacity", "max_sandboxes: cli_x has 20 live sandboxes", true), true],
+      ["at_capacity, a spawner's children", err(429, "at_capacity", "max_live_children: 8 live", true), true],
+      ["another 429", err(429, "rate_limited", "cli_x has 20 live sandboxes, its grant's max_sandboxes", true), false],
+      // A nest from before it: ClientDO's words under 403 forbidden.
       ["max_sandboxes", err(403, "forbidden", "cli_x has 20 live sandboxes, its grant's max_sandboxes"), true],
       ["max_agents", err(403, "forbidden", "cli_x has 4 live agents, its grant's max_agents"), true],
       ["another refusal of the grant", err(403, "forbidden", "outside cli_x's grant: cell local"), false],
@@ -526,6 +531,55 @@ describe("a review nest has no room for", () => {
         expect(await errorsOf(p)).toEqual([]);
       } finally {
         fake.maxSandboxes = null;
+      }
+    });
+  });
+
+  describe("nest#248's own code (429 at_capacity, retryable)", () => {
+    it("a review waits the same, and the sandbox made for it goes", async () => {
+      const p = await newProject();
+      fake.capacityCode = true;
+      fake.maxAgents = liveAgents();
+      try {
+        const s = sha();
+        await push(p, 1, s);
+        await run(p);
+        expect(await job(p, 1, s)).toMatchObject({ state: "queued", error: expect.stringMatching(/at_capacity/) });
+        expect(liveSandboxesOf(p, 1)).toEqual([]);
+        expect(checkOf(p, s).output.title).toBe("Waiting for room to start a reviewer");
+        fake.maxAgents = null;
+        await dueNow(p);
+        await run(p);
+        expect((await job(p, 1, s)).state).toBe("running");
+      } finally {
+        fake.maxAgents = null;
+        fake.capacityCode = false;
+      }
+    });
+
+    it("a worker's start, retried under the same keys, keeps its sandbox and starts in it once there's room", async () => {
+      const repo = `o-${rand()}/r-${rand()}`;
+      const proj = (await api(token, "POST", "/api/projects", { name: repo, repo })).body;
+      const t = (await api(token, "POST", `/api/projects/${proj.id}/tasks`, { title: "t" })).body;
+      await api(token, "PUT", `/api/projects/${proj.id}/tasks/${t.id}/spec`, { goal: "g", acceptance_criteria: [], files: [], test_plan: "p" });
+      fake.capacityCode = true;
+      fake.maxAgents = liveAgents();
+      try {
+        await api(token, "POST", `/api/projects/${proj.id}/tasks/${t.id}/assign`, {});
+        const project = env.PROJECT.get(env.PROJECT.idFromName(proj.id));
+        await project.drain();
+        const sandboxes = () => [...fake.sandboxes.values()].filter((x) => x.labels.project === proj.id && x.labels.task === t.id);
+        expect(sandboxes()).toHaveLength(1);
+        expect(sandboxes()[0]!.ended).toBe(false);
+        fake.maxAgents = null;
+        await runInDurableObject(project, (_o, st) => { st.storage.sql.exec("UPDATE tasks SET start_next_ms = 0 WHERE start_next_ms IS NOT NULL"); });
+        await project.drain();
+        const worker = [...fake.agents.values()].find((a) => a.labels.project === proj.id && a.labels.task === t.id);
+        expect(worker?.sandbox).toBe(sandboxes()[0]!.sandbox);
+        expect(sandboxes()).toHaveLength(1);
+      } finally {
+        fake.maxAgents = null;
+        fake.capacityCode = false;
       }
     });
   });

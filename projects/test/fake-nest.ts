@@ -97,6 +97,8 @@ export class FakeNest {
    */
   maxAgents: number | null = null;
   maxSandboxes: number | null = null;
+  /** Answer the maxima as nest from nest#248 on does (429 `at_capacity`, retryable), not as a nest from before it (403 `forbidden` in ClientDO's words). */
+  capacityCode = false;
   /** Play a nest before `when: "idle"` (#232): its `start` refuses the field (400). */
   whenUnsupported = false;
   /** Play a nest whose `start` ignores `launch` (a rolled-back Worker): its answer names none. */
@@ -195,7 +197,10 @@ export class FakeNest {
     const kind = route === "POST /v1/agents" ? "agents" : "sandboxes";
     const max = kind === "agents" ? this.maxAgents : this.maxSandboxes;
     const live = kind === "agents" ? [...this.agents.values()].filter((a) => !a.ended && a.client === CLIENT).length : [...this.sandboxes.values()].filter((x) => !x.ended).length;
-    if (max !== null && live >= max) return nestErr(403, "forbidden", `${CLIENT} has ${live} live ${kind}, its grant's max_${kind}`);
+    if (max !== null && live >= max) {
+      // nest#248's own code, or the words of a nest from before it.
+      return this.capacityCode ? nestErr(429, "at_capacity", `max_${kind}: ${CLIENT} has ${live} live ${kind}, its grant's limit`, true) : nestErr(403, "forbidden", `${CLIENT} has ${live} live ${kind}, its grant's max_${kind}`);
+    }
     const res = await this.route(req, u, call);
     if (res.ok) this.keys.set(key, { digest, status: res.status, body: await res.clone().text() });
     const lose = this.lost.find((x) => x.times > 0 && x.match.test(route));

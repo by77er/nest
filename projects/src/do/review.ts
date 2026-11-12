@@ -875,7 +875,7 @@ export class ReviewDO extends DurableObject<Env> {
         // The project's secrets for reviewers, frozen per attempt (ProjectDO keeps them).
         const spec = await projectStub(this.env, project).reviewerSpec(key);
         try {
-          agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, key, spec.extras);
+          agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, key, spec.extras, {}, { newAttemptOnCapacity: true });
         } catch (e) {
           // No room in nest for now: the job waits, queued, and starts again once there is.
           const r = atCapacity(e) ? current() : null;
