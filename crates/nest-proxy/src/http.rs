@@ -535,9 +535,10 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, req: Req
             let mut c = TokioIo::new(c);
             let mut u = TokioIo::new(u);
             let drop = ctx2.sandbox.drop.clone();
+            let started = std::time::Instant::now();
             let r = tokio::select! { _ = drop.cancelled() => Ok((0, 0)), r = tokio::io::copy_bidirectional(&mut c, &mut u) => r };
             let (a, b) = r.unwrap_or((0, 0));
-            let mut au = Audit::new(&host, port, EgressVerdict::Allow).reason("upgraded");
+            let mut au = Audit::new(&host, port, EgressVerdict::Allow).reason("upgraded").since(started);
             au.bytes_up = a;
             au.bytes_down = b;
             au.status = Some(101);
@@ -930,12 +931,13 @@ where
     B: AsyncRead + AsyncWrite + Unpin,
 {
     let drop = ctx.sandbox.drop.clone();
+    let started = std::time::Instant::now();
     let r = tokio::select! {
         _ = drop.cancelled() => Ok((0, 0)),
         r = tokio::io::copy_bidirectional(&mut a, &mut b) => r,
     };
     let (up, down) = r.unwrap_or((0, 0));
-    let mut au = Audit::new(host, port, verdict);
+    let mut au = Audit::new(host, port, verdict).since(started);
     au.bytes_up = up;
     au.bytes_down = down;
     au.reason = reason.map(str::to_string);

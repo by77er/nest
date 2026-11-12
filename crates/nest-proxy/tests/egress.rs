@@ -49,6 +49,7 @@ async fn inspect_injects_bearer_over_h1_and_h2() {
     let rec = records.iter().find(|r| r.binding.is_some()).unwrap();
     assert_eq!((rec.verdict, rec.status, rec.path.as_deref()), (EgressVerdict::Allow, Some(200), Some("/x")));
     assert!(rec.bytes_down > 0 && rec.bytes_up == 5);
+    assert!(rec.duration_ms.is_some_and(|d| d < 30_000), "{:?}", rec.duration_ms);
     assert!(matches!(rec.via, Some(EgressVia::HttpsTransparent | EgressVia::Explicit)), "{:?}", rec.via);
 }
 
