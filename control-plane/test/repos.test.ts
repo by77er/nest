@@ -131,6 +131,37 @@ describe("push allowlists in specs", () => {
   });
 });
 
+describe("GitHub env names in specs", () => {
+  const worker = SEED_CATALOG.templates.worker!;
+  const catalog: Catalog = {
+    capabilities: SEED_CATALOG.capabilities,
+    templates: {
+      plain: { ...worker, env: { GH_TOKEN: "x" } },
+      pushes: { ...worker, repos: ["me/app"], read_repos: ["me/lib"] },
+      workflows: { ...worker, github_push: { workflows: true } },
+    },
+  };
+  const expand = (template: string, by: "operator" | "spawner", overrides: Record<string, unknown> = {}) =>
+    expandSpec(catalog, PLATFORM_TOOL_NAMES, { template, hands: true, by, overrides } as never);
+  const refused = (names: string) => ({ ok: false, error: expect.stringContaining(`env ${names}: reserved where nest injects its own GitHub token`) });
+
+  it("are a spec's own without repos or github_push, and refused beside them, whichever of template and overrides brings either", () => {
+    expect(expand("plain", "operator")).toMatchObject({ ok: true, value: { env: { GH_TOKEN: "x" } } });
+    expect(expand("plain", "spawner", { env: { GIT_CONFIG_COUNT: "1" } })).toMatchObject({ ok: true, value: { env: { GH_TOKEN: "x", GIT_CONFIG_COUNT: "1" } } });
+    expect(expand("plain", "operator", { repos: ["me/app"] })).toEqual(refused("GH_TOKEN"));
+    expect(expand("plain", "operator", { read_repos: ["me/app"] })).toEqual(refused("GH_TOKEN"));
+    expect(expand("plain", "operator", { github_push: { workflows: true } })).toEqual(refused("GH_TOKEN"));
+    expect(expand("pushes", "operator", { env: { GIT_ASKPASS: "x", GITHUB_TOKEN: "y" } })).toEqual(refused("GITHUB_TOKEN, GIT_ASKPASS"));
+    expect(expand("pushes", "spawner", { env: { GH_ENTERPRISE_TOKEN: "x" } })).toEqual(refused("GH_ENTERPRISE_TOKEN"));
+    expect(expand("workflows", "spawner", { env: { GIT_CONFIG_GLOBAL: "/x" } })).toEqual(refused("GIT_CONFIG_GLOBAL"));
+    // Narrowed to no repos and no opt-in, the spawn's env may name them.
+    expect(expand("pushes", "spawner", { repos: [], read_repos: [], env: { GH_TOKEN: "x" } })).toMatchObject({ ok: true, value: { env: { GH_TOKEN: "x" } } });
+    expect(expand("workflows", "spawner", { github_push: { workflows: false }, env: { GH_TOKEN: "x" } })).toMatchObject({ ok: true });
+    // Any other name beside repos, as before.
+    expect(expand("pushes", "operator", { env: { GH_REPO: "me/app" } })).toMatchObject({ ok: true });
+  });
+});
+
 describe("read-only repos in specs", () => {
   const catalog: Catalog = {
     capabilities: { ...SEED_CATALOG.capabilities, gh: { tools: [], rules: [], prompt: "", brokered: [{ action: "github.comment" }] } },
