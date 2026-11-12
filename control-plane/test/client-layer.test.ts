@@ -8,6 +8,7 @@ import { describe, expect, it } from "vitest";
 import { compileEgress, egressOutsideGrant, narrowEgress } from "../src/lib/client-egress";
 import { EnvName, githubEnvConflict, unboundPlaceholders } from "../src/lib/sandbox-env";
 import { SandboxDO } from "../src/do/sandbox";
+import { FleetDO } from "../src/do/fleet";
 import { hostPatternMatches } from "../src/protocol/model";
 import { ClientDO } from "../src/do/client";
 import { admin, adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueCell, type Ws } from "./helpers";
@@ -355,6 +356,49 @@ describe("the live client layer: bindings and environment", () => {
     // Once it is detached, the sandbox's own env may name them.
     await stub.detach(pusher.agent);
     await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { GIT_CONFIG_COUNT: "1" } } });
+  });
+
+  it("an operator binding under a GitHub binding's name, and an agent's push-token opt-in, are nest's own GitHub access too", async () => {
+    const cell = uniqueCell();
+    for (const name of ["github", "github_read", "github_read_default"]) {
+      const inject = [{ name, hosts: ["api.github.com"], placeholder: `nest-ph-${name}-op`, locations: [{ type: "authorization_bearer" }] }];
+      expect((await adminJson("/v1/sandboxes", { body: { cell, policy: { inject }, env: { GH_TOKEN: "x" } } }, 400)).error.message, name).toContain("GH_TOKEN");
+      const s = await adminJson("/v1/sandboxes", { body: { cell, env: { GH_TOKEN: "x" } } }, 202);
+      expect((await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { inject } }, 400)).error.message, name).toContain("GH_TOKEN");
+    }
+    // An agent asking for `workflows: write` on the push token, attaching beside the sandbox's GH_TOKEN.
+    const s = await adminJson("/v1/sandboxes", { body: { cell, env: { GH_TOKEN: "x" } } }, 202);
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    await expect(Promise.resolve().then(() => stub.attach("agt_workflows", undefined, [], [], { workflows: true }))).rejects.toThrow(/GH_TOKEN/);
+    expect((await stub.info()).attached).toEqual([]);
+  });
+
+  it("an attach that waits on its cell's guard bounds is checked after the wait: an operator's repos written meanwhile refuse its GH_TOKEN", async () => {
+    const cell = uniqueCell();
+    const s = await adminJson("/v1/sandboxes", { body: { cell } }, 202);
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    // FleetDO's guard-bounds answer held until the operator's write is in.
+    const proto = FleetDO.prototype as unknown as { hostsWithoutGuardBounds: () => Promise<string[]> };
+    const real = proto.hostsWithoutGuardBounds;
+    let state: "idle" | "held" | "go" = "idle";
+    proto.hostsWithoutGuardBounds = async function () {
+      state = "held";
+      while (state === "held") await new Promise((r) => setTimeout(r, 10));
+      return [];
+    };
+    let attached: Promise<unknown>;
+    try {
+      attached = Promise.resolve().then(() => stub.attach("agt_waits", undefined, [], [], {
+        env: { GH_TOKEN: "client" }, guards: [{ name: "g", hosts: ["x.example.org"], scope: [{ methods: ["PUT"] }], client: null }] }))
+        .then(() => null, (e: unknown) => e);
+      await eventually("the attach waiting on guard bounds", () => state === "held");
+      await stub.setPolicy({ repos: ["o/r"] });
+    } finally {
+      state = "go";
+      proto.hostsWithoutGuardBounds = real;
+    }
+    expect(String(await attached)).toContain("GH_TOKEN");
+    expect([(await stub.pushRepos()), (await stub.info()).attached]).toEqual([["o/r"], []]);
   });
 
   it("a sandbox a previous release left with GitHub names beside nest's own GitHub token never sends them to a slot", async () => {
