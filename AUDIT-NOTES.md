@@ -27,6 +27,7 @@ Base: origin/main 6bbf64f.
 | PR upkeep | a failed read backs off past a minute "from the sixth failure in a row" | from the fifth: `max(PR_READ_EVERY_MS, backoff(attempts))`, and backoff(5) = 80 s | projects/src/do/project.ts:1777-1778; nest.ts:332 |
 | PR upkeep | change wording ("before this", "as before", "now that", "this change leaves those as they are") | stated as current | projects/src/do/project.ts:584-611 |
 | Routines (the page) | badges: Running, Queued, Cooling down, Off | also Starting | projects/src/ui/features/routines/describe.ts:45-48 |
+| Secrets | the Secrets page sits between Reviews and Settings | the sidebar is Manager, Board, Triage, Reviews, Routines, Secrets, Network, Settings | projects/src/ui/features/shell/Sidebar.test.tsx:98 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
@@ -45,6 +46,7 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Secrets: one correction; SECRET_NAME secrets.ts:41, MAX_HOSTS/LOCATIONS/BINDINGS 16/3/16 :43-45, nest name :53, placeholder :56, ENV_NAME and reserved names :62-79, presets :186-195, request schema requests.ts:65-72, upkeep 10 min / sweep 5 min do/project.ts:4427,4431, "Outside the grant" ui/features/secrets/SecretsPage.tsx:56 match.
 - Triage: no drift (MAX_UNTRIAGED_ISSUES 200 issues.ts:9; ISSUES_FROM :5; title/body 300/20,000 do/project.ts:189-190; import 300 :1317; PREVIEW_LINES/CHARS ui/features/triage/TriagePage.tsx:27-28; requests.ts:39).
 - Routines: one correction; limits requests.ts:101-128 (15 min-7 d, cooldown, 5-120 min, 1-20 turns), max_routine_runs 1-3 requests.ts:47, MAX_PROPOSALS_PER_RUN 5 / MAX_UNTRIAGED_PROPOSALS 50 routines.ts:49-50, MAX_START_ATTEMPTS 8 :54, dream window 7/30 d and 200 entries :171-175, labels and keys do/project.ts:3131,3161, declined block 30 d :4557, routes api.ts:479-506, RUNS/NOTES/PROPOSALS_SHOWN 10.
 - Presets: no drift (routines.ts:155-169).
