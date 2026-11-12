@@ -87,6 +87,19 @@ describe("the switcher", () => {
     expect(screen.getByRole("option", { name: "Gadgets" })).toBeInTheDocument();
   });
 
+  it("a projects list that fails to refresh after a good read makes the count unknown, not the old number", async () => {
+    const api = twoProjects();
+    api.asks = [ask({ question: "q1" })];
+    const { queryClient } = renderApp("/projects/prj_one/manager", api);
+    await waitFor(() => expect(switcher()).toHaveAccessibleName("Project: Widgets. Switch project"));
+    const badges = (m: string) => [...sidebar().querySelectorAll(`[data-marker=${m}]`)].filter((b) => !b.closest(".mantine-Combobox-dropdown"));
+    await waitFor(() => expect(badges("needs-you")).toHaveLength(1));
+    api.fail(/^GET \/api\/projects$/, 502, "the Worker is unavailable");
+    await queryClient.refetchQueries({ queryKey: ["projects"], exact: true });
+    await waitFor(() => expect(badges("needs-you-unknown")).toHaveLength(1));
+    expect(badges("needs-you")).toHaveLength(0);
+  });
+
   it("an unknown count (nest unreadable for the asks) is a \"?\" on Board, and said in the list", async () => {
     const api = twoProjects();
     api.asksError = "nest 503";

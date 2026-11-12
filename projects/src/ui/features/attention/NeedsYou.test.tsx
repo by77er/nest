@@ -90,6 +90,9 @@ describe("asks", () => {
     await waitFor(() => expect(approve).not.toHaveAttribute("aria-disabled"));
     expect(approve).toHaveFocus();
     expect(api.writes).toHaveLength(1);
+    // A failure isn't "answered elsewhere": no such note, and the ask stays.
+    expect(document.querySelector("[data-note]")).toBeNull();
+    expect(document.querySelector(`[data-ask="${a.ask}"]`)).not.toBeNull();
   });
 
   it("the app's own items show while nest's asks are still being read", async () => {
@@ -102,8 +105,43 @@ describe("asks", () => {
     const p = await panel();
     expect(p).toHaveTextContent("Pick a region");
     expect(p).not.toHaveTextContent("Later?");
+    // Said to be partial, and not counted as if it were all.
+    expect(p).toHaveTextContent("Reading the agents' asks…");
+    expect(p.querySelector("[data-slot=count]")).toBeNull();
     release();
     await waitFor(() => expect(p).toHaveTextContent("Later?"));
+    expect(p).not.toHaveTextContent("Reading the agents' asks…");
+    expect(within(p).getByLabelText("2 items")).toBeInTheDocument();
+  });
+
+  it("the first full read failing: the app's own items, said to be without the asks, never a whole count", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "Hidden?" })];
+    api.tasks = [task({ title: "Pick a region", blocked: { at_ms: Date.now() - 1_000, by: "agt_w1", role: "worker", reason: "which region?", question: null, tainted: false } })];
+    api.fail(/^GET \/api\/projects\/prj_one\/attention$/, 500, "the Worker is unavailable");
+    renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    await waitFor(() => expect(p).toHaveTextContent("The agents' asks couldn't be read"));
+    expect(p).toHaveTextContent("Pick a region");
+    expect(p).not.toHaveTextContent("Reading the agents' asks…");
+    expect(p.querySelector("[data-slot=count]")).toBeNull();
+  });
+
+  it("the 'Already answered' note goes once a read after the one that dropped the ask has come", async () => {
+    const api = new FakeApi();
+    const a = ask({ approval: { name: "brokered", tool: "WebFetch" } });
+    const b = ask({ question: "Still open?" });
+    api.asks = [a, b];
+    const { user, queryClient } = renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    api.asks = [b];
+    api.fail(/\/answer$/, 409, "this ask isn't open any more");
+    await user.click(within(p.querySelector(`[data-ask="${a.ask}"]`) as HTMLElement).getByRole("button", { name: "Approve" }));
+    await waitFor(() => expect(p.querySelector("[data-note]")).not.toBeNull());
+    await waitFor(() => expect(p.querySelector(`[data-ask="${a.ask}"]`)).toBeNull());
+    // The next poll: the note has done its job.
+    await queryClient.refetchQueries({ queryKey: ["projects", "prj_one", "attention"], exact: true });
+    await waitFor(() => expect(p.querySelector("[data-note]")).toBeNull());
   });
 
   it("a poll that fails after a good read says it shows that read", async () => {
@@ -114,7 +152,7 @@ describe("asks", () => {
     expect(p).toHaveTextContent("Still here?");
     api.fail(/GET .*\/attention$/, 502, "the Worker is unavailable");
     await queryClient.refetchQueries({ queryKey: ["projects", "prj_one", "attention"], exact: true });
-    await waitFor(() => expect(p).toHaveTextContent(/Couldn't refresh from nest; showing what was read/));
+    await waitFor(() => expect(p).toHaveTextContent(/Couldn't refresh; showing what was read/));
     expect(p).toHaveTextContent("Still here?");
   });
 
@@ -125,18 +163,18 @@ describe("asks", () => {
     api.tasks = [task({ title: "Pick a region", blocked: { at_ms: Date.now() - 1_000, by: "agt_w1", role: "worker", reason: "which region?", question: null, tainted: false } })];
     renderApp("/projects/prj_one/board", api);
     const p = await panel();
-    expect(p).toHaveTextContent("The agents' asks couldn't be read from nest");
+    expect(p).toHaveTextContent("The agents' asks couldn't be read");
     expect(p).toHaveTextContent("Pick a region");
     expect(p).not.toHaveTextContent("hidden?");
-    // Counted: the blocked task only.
-    expect(within(p).getByText("1")).toBeInTheDocument();
+    // No count: the blocked task alone isn't all that waits.
+    expect(p.querySelector("[data-slot=count]")).toBeNull();
   });
 
   it("nest unreadable and nothing else waiting: the panel still says so, never empty", async () => {
     const api = new FakeApi();
     api.asksError = "nest 503";
     renderApp("/projects/prj_one/board", api);
-    expect(await panel()).toHaveTextContent("The agents' asks couldn't be read from nest");
+    expect(await panel()).toHaveTextContent("The agents' asks couldn't be read");
   });
 
   it("an approval denied sends deny", async () => {

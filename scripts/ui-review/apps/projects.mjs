@@ -723,6 +723,7 @@ const app = {
     // "Needs you" read from nest (README.md#asks): loading, nest failing, and answering (focus, flicker, copy).
     { name: "asks-loading", section: "project", path: "/projects/prj_demo/board", after: async (p) => { await asksHold(p); }, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
     { name: "asks-failed", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: async (p) => { await asksFail(p, true); }, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
+    { name: "asks-first-failed", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: asksFirstFail, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
     { name: "asks-failed-later", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: asksFailLater, check: async (p) => p.asksNotes ?? [], checkName: "asks" },
     { name: "asks-answered", section: "project", path: "/projects/prj_demo/board", after: (p) => asksAnswer(p, 200), check: async (p) => p.asksNotes ?? [], checkName: "asks" },
     { name: "asks-answer-gone", section: "project", path: "/projects/prj_demo/board", httpErrors: true, after: (p) => asksAnswer(p, 409), check: async (p) => p.asksNotes ?? [], checkName: "asks" },
@@ -991,8 +992,28 @@ async function asksHold(p) {
   await p.locator("h1").first().waitFor();
   await p.waitForTimeout(1500);
   const notes = [];
-  if (!(await panelOf(p).count())) notes.push("loading: the app's own items aren't shown while nest's asks load");
-  else if (await panelOf(p).locator("[data-ask]").count()) notes.push("loading: an ask is shown before nest was read");
+  const panel = panelOf(p);
+  if (!(await panel.count())) notes.push("loading: the app's own items aren't shown while nest's asks load");
+  else {
+    if (await panel.locator("[data-ask]").count()) notes.push("loading: an ask is shown before nest was read");
+    if (!(await panel.locator("[data-asks-reading]").count())) notes.push("loading: the list doesn't say the asks are still being read");
+    if (await panel.locator("[data-slot=count]").count()) notes.push("loading: the app's own items are counted as if they were all that waits");
+  }
+  p.asksNotes = notes;
+}
+/** The first full read failing (the Worker), the app's own items read: listed, said to be without the asks, not counted. */
+async function asksFirstFail(p) {
+  await p.route((u) => ASKS_RE.test(u.pathname) && !isLocal(u), (r) => r.fulfill({ status: 500, contentType: "application/json", body: JSON.stringify({ error: "the Worker is unavailable (fixture)" }) }));
+  await p.goto(p.url(), { waitUntil: "domcontentloaded" });
+  await p.locator("h1").first().waitFor();
+  await p.waitForTimeout(6000); // past the query's retries
+  const notes = [];
+  const panel = panelOf(p);
+  if (!(await panel.count())) notes.push("first read failed: 'Needs you' is gone (the app's own items must stay)");
+  else {
+    if (!(await panel.locator("[data-asks-unavailable]").count())) notes.push("first read failed: 'Needs you' doesn't say the asks couldn't be read");
+    if (await panel.locator("[data-slot=count]").count()) notes.push("first read failed: the app's own items are counted as if they were all that waits");
+  }
   p.asksNotes = notes;
 }
 /** nest unreadable: the Worker lists the app's own items with the marker, `GET …/asks` is 502, the count unknown. */
@@ -1025,11 +1046,15 @@ async function asksFail(p, reload) {
   }
   p.asksNotes = notes;
 }
-/** A good read, then the Worker itself failing (502) for "Needs you", and the count unknown: the panel says it shows that read. */
+/**
+ * A good read, then the Worker itself failing (502) for "Needs you" and for the projects list: the panel says it
+ * shows that read, and the Board row's count goes unknown (the app's doing: the fixture never answers null here).
+ */
 async function asksFailLater(p) {
   await p.getByRole("button", { name: /Show all/ }).click();
-  await p.route((u) => ASKS_RE.test(u.pathname) && !isLocal(u), (r) => r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "the Worker is unavailable (fixture)" }) }));
-  await countsUnknown(p);
+  const down = (r) => r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "the Worker is unavailable (fixture)" }) });
+  await p.route((u) => ASKS_RE.test(u.pathname) && !isLocal(u), down);
+  await p.route((u) => u.pathname === "/api/projects", down);
   await p.waitForTimeout(13000); // past a poll of each (5 s, 10 s), and their retries
   const notes = [];
   const panel = panelOf(p);

@@ -103,6 +103,9 @@ describe("a PR the project doesn't trust is held", () => {
     expect(runs[0]).toMatchObject({ name: CHECK_NAME, status: "completed", conclusion: "action_required" });
     expect(runs[0]!.output?.title).toMatch(/owner's approval/);
     expect(await attention(p)).toEqual([expect.objectContaining({ kind: "review", pr: 7, sha: s, author: "mallory", fork: true })]);
+    // The page's first, nest-free read (`?local=1`) has it too: it's the app's own, not nest's.
+    const local = (await api(token, "GET", `/api/projects/${p.id}/attention?local=1`)).body as any[];
+    expect(local).toEqual([expect.objectContaining({ kind: "review", pr: 7, sha: s })]);
     const listed = (await api(token, "GET", "/api/projects")).body.projects.find((x: any) => x.id === p.id);
     expect(listed.needs_you).toBe(1);
   });

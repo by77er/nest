@@ -8,6 +8,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { useProjects } from "../../api/queries";
 import { Switcher } from "../../layout/Switcher";
 import type { View } from "./views";
+import { unknownIfStale } from "./attention";
 
 const ALL = "__all";
 const needs = (n: number | null | undefined) => (n === null ? ", couldn't check what needs you" : n ? `, ${n} need you` : "");
@@ -59,7 +60,10 @@ export function ProjectSwitcher({ projectId, view, onNavigate }: { projectId: st
       current={{ label: name, ariaLabel: `Project: ${name}. Switch project` }}
       items={[
         { value: ALL, label: "All projects" },
-        ...list.map((p) => ({ value: p.id, label: p.name, keywords: p.repo, end: <NeedsYouBadge count={p.needs_you} />, ariaLabel: `${p.name}${needs(p.needs_you)}` })),
+        ...list.map((p) => {
+          const n = unknownIfStale(projects.isRefetchError, p.needs_you);
+          return { value: p.id, label: p.name, keywords: p.repo, end: <NeedsYouBadge count={n} />, ariaLabel: `${p.name}${needs(n)}` };
+        }),
       ]}
       active={current?.id ?? ALL}
       searchLabel="Find a project"

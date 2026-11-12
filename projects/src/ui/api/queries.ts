@@ -4,7 +4,8 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api } from "./client";
 import type { CreateRoutineBody, PutSecretBody, UpdateRoutineBody } from "./types";
-import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
+import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody, Waiting } from "./types";
+import { splitAttention } from "./types";
 
 export const keys = {
   projects: ["projects"] as const,
@@ -125,6 +126,23 @@ export function useSetNetwork(id: string) {
 }
 
 export const useAttention = (id: string) => useQuery({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks });
+
+/**
+ * What "Needs you" can say, from the full read and (until it first arrives) the app's own items:
+ * - `asks: "read"`: the list is whole (`stale`: a later poll failed, so this is the read of `readAt`);
+ * - `"reading"`: nest's asks aren't in yet, only the app's own items are listed;
+ * - `"unavailable"`: the asks couldn't be read (nest, or the first full read failed), only the app's own are listed.
+ * Never a local-only list taken for the whole: its count isn't the count.
+ */
+export function useNeedsYouList(id: string): { items: Waiting[]; asks: "read" | "reading" | "unavailable"; stale: boolean; readAt: number } {
+  const full = useAttention(id);
+  const local = useLocalAttention(id, full.data === undefined);
+  if (full.data !== undefined) {
+    const split = splitAttention(full.data);
+    return { items: split.items, asks: split.asksError !== null ? "unavailable" : "read", stale: full.isRefetchError, readAt: full.dataUpdatedAt };
+  }
+  return { items: splitAttention(local.data).items, asks: full.isError ? "unavailable" : "reading", stale: false, readAt: 0 };
+}
 
 /** "Needs you"'s own items without the asks (no nest read), only until the full read first arrives. */
 export const useLocalAttention = (id: string, enabled: boolean) =>

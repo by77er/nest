@@ -5,8 +5,8 @@
 // status is in the page's header, not here.
 
 import { Text } from "@mantine/core";
-import { useAttention, useTasks } from "../../api/queries";
-import { splitAttention, type Waiting } from "../../api/types";
+import { useNeedsYouList, useTasks } from "../../api/queries";
+import type { Waiting } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { MetaItem, MetaRow, Section, Stack } from "../../layout";
@@ -36,11 +36,15 @@ export function gist(x: Waiting): string {
   return line.length > GIST ? `${line.slice(0, GIST - 1).trimEnd()}…` : line;
 }
 
-/** nest couldn't be read for the agents' asks: said, rather than claim nothing waits. */
-function AsksUnavailable() {
+/** What isn't whole about the list: the asks still being read, unreadable, or an earlier read shown. Nothing when whole. */
+function AsksState({ list }: { list: ReturnType<typeof useNeedsYouList> }) {
+  const text = list.asks === "reading" ? "Reading the agents' asks…"
+    : list.asks === "unavailable" ? "The agents' asks couldn't be read. Trying again."
+    : list.stale ? `Couldn't refresh; showing what was read ${ago(list.readAt)}. Trying again.` : null;
+  if (text === null) return null;
   return (
-    <Text fz="sm" c="dimmed" data-asks-unavailable>
-      The agents' asks couldn't be read from nest. Trying again.
+    <Text fz="sm" c="dimmed" data-asks-state={list.asks === "read" ? "stale" : list.asks}>
+      {text}
     </Text>
   );
 }
@@ -59,8 +63,8 @@ function More({ projectId, n }: { projectId: string; n: number }) {
 
 export function ManagerContext({ projectId }: { projectId: string }) {
   const tasks = useTasks(projectId).data ?? [];
-  const split = splitAttention(useAttention(projectId).data);
-  const waiting = [...split.items].sort((a, b) => a.at_ms - b.at_ms);
+  const list = useNeedsYouList(projectId);
+  const waiting = [...list.items].sort((a, b) => a.at_ms - b.at_ms);
   const active = tasks.filter((t) => ACTIVE.has(t.state)).sort((a, b) => b.updated_ms - a.updated_ms);
   const on = active.slice(0, SHOWN);
   const asks = waiting.slice(0, ASKS_SHOWN);
@@ -101,10 +105,10 @@ export function ManagerContext({ projectId }: { projectId: string }) {
               </Stack>
             ))}
             {waiting.length > asks.length && <More projectId={projectId} n={waiting.length - asks.length} />}
-            {split.asksError !== null && <AsksUnavailable />}
+            <AsksState list={list} />
           </Stack>
-        ) : split.asksError !== null ? (
-          <AsksUnavailable />
+        ) : list.asks !== "read" || list.stale ? (
+          <AsksState list={list} />
         ) : (
           <Text fz="sm" c="dimmed">
             Nothing waits on you.

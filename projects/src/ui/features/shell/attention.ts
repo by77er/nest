@@ -3,5 +3,10 @@
 import { useProjects } from "../../api/queries";
 
 export function useNeedsYou(projectId: string): number | null | undefined {
-  return useProjects().data?.find((p) => p.id === projectId)?.needs_you;
+  const projects = useProjects();
+  // A refresh that failed after a good read: the count is unknown now, not what it was.
+  return unknownIfStale(projects.isRefetchError, projects.data?.find((p) => p.id === projectId)?.needs_you);
 }
+
+/** A count from a list whose last refresh failed is unknown (null), not the old number. */
+export const unknownIfStale = <T extends number | null | undefined>(stale: boolean, n: T): T | null => (stale && n !== undefined ? null : n);

@@ -6,9 +6,9 @@
 
 import { Button, Collapse, Divider, Text, Textarea } from "@mantine/core";
 import { IconAlertTriangle } from "@tabler/icons-react";
-import { useLayoutEffect, useRef, useState } from "react";
-import { useAnswerBlocked, useAttention, useLocalAttention, useProject } from "../../api/queries";
-import { splitAttention, type Waiting } from "../../api/types";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useAnswerBlocked, useAttention, useNeedsYouList, useProject } from "../../api/queries";
+import type { Waiting } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
@@ -136,19 +136,18 @@ function refocus(panel: HTMLElement | null, heading: HTMLElement | null, prev: r
 
 export function NeedsYou({ projectId }: { projectId: string }) {
   const attention = useAttention(projectId);
-  // The app's own items, read without nest, show until the first full read (asks included) arrives.
-  const local = useLocalAttention(projectId, attention.data === undefined);
+  const list = useNeedsYouList(projectId);
   const [all, setAll] = useState(false);
-  // What the owner's last answer here came to: a note for an ask answered elsewhere meanwhile; and once they've
-  // answered one, the panel stays (saying nothing else waits) so focus has somewhere to go.
-  const [note, setNote] = useState<string | null>(null);
+  // What the owner's last answer here came to: a note for an ask answered elsewhere meanwhile (cleared once a
+  // read has come and gone after the one that dropped it); and once they've answered one, the panel stays
+  // (saying nothing else waits) so focus has somewhere to go.
+  const [note, setNote] = useState<{ text: string; reads: number } | null>(null);
   const [answered, setAnswered] = useState(false);
   const panel = useRef<HTMLDivElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
   const focused = useRef<string | null>(null);
   // Oldest first, as the Worker answers; the rest behind "Show all", collapsing in 180 ms.
-  const split = splitAttention(attention.data ?? local.data);
-  const items = [...split.items].sort((a, b) => a.at_ms - b.at_ms);
+  const items = [...list.items].sort((a, b) => a.at_ms - b.at_ms);
   const keys = items.map(keyOf);
   const shownKeys = useRef<string[]>(keys);
   // An item that had focus left (answered, or gone): focus goes on from where it was, never to the page.
@@ -161,13 +160,21 @@ export function NeedsYou({ projectId }: { projectId: string }) {
       refocus(panel.current, heading.current, prev, keys, lost);
     }
   });
+  // Each read after the note counts: the re-read that drops the ask, then a poll; after that the note goes.
+  const readAt = attention.dataUpdatedAt;
+  const lastRead = useRef(readAt);
+  useEffect(() => {
+    if (readAt === lastRead.current) return;
+    lastRead.current = readAt;
+    setNote((n) => (n === null ? null : n.reads >= 1 ? null : { ...n, reads: n.reads + 1 }));
+  }, [readAt]);
   const settled = (how: "answered" | "gone") => {
     setAnswered(true);
-    setNote(how === "gone" ? "Already answered: it was answered elsewhere, or its agent ended." : null);
+    setNote(how === "gone" ? { text: "Already answered: it was answered elsewhere, or its agent ended.", reads: 0 } : null);
   };
-  // A poll that failed after a good read: what's shown is that read, said so.
-  const stale = attention.isRefetchError ? attention.dataUpdatedAt : null;
-  if (items.length === 0 && split.asksError === null && stale === null && !answered) return null;
+  const whole = list.asks === "read";
+  // Nothing to show yet, or nothing waits: no panel. Reading with the app's own items, it shows them, saying the asks are to come.
+  if (items.length === 0 && !answered && !list.stale && (whole || list.asks === "reading")) return null;
   // The held reviews' explanation is said once, on the first of them.
   const firstHeld = items.find((x) => x.kind === "review");
   const shown = items.slice(0, SHOWN);
@@ -177,25 +184,31 @@ export function NeedsYou({ projectId }: { projectId: string }) {
   );
   return (
     <Panel ref={panel} tone="warning" component="section" aria-label="Needs you" aria-live="polite">
-      <Section title="Needs you" count={items.length} icon={IconAlertTriangle} iconColor="warning" region={false} headingRef={heading}>
+      {/* A count only for a whole list: the app's own items alone aren't all that waits. */}
+      <Section title="Needs you" count={whole ? items.length : undefined} icon={IconAlertTriangle} iconColor="warning" region={false} headingRef={heading}>
         <Stack gap="lg">
-          {/* nest couldn't be read for the agents' asks: what's listed is the rest, and the next poll tries again. */}
-          {split.asksError !== null && (
-            <Text fz="sm" c="dimmed" data-asks-unavailable>
-              The agents' asks couldn't be read from nest, so any they have aren't listed here. Trying again.
+          {list.asks === "reading" && (
+            <Text fz="sm" c="dimmed" data-asks-reading>
+              Reading the agents' asks…
             </Text>
           )}
-          {stale !== null && (
-            <Text fz="sm" c="dimmed" data-stale title={exact(stale)}>
-              Couldn't refresh from nest; showing what was read {ago(stale)}. Trying again.
+          {/* The asks couldn't be read: what's listed is the rest, and the next poll tries again. */}
+          {list.asks === "unavailable" && (
+            <Text fz="sm" c="dimmed" data-asks-unavailable>
+              The agents' asks couldn't be read, so any they have aren't listed here. Trying again.
+            </Text>
+          )}
+          {list.stale && (
+            <Text fz="sm" c="dimmed" data-stale title={exact(list.readAt)}>
+              Couldn't refresh; showing what was read {ago(list.readAt)}. Trying again.
             </Text>
           )}
           {note !== null && (
             <Text fz="sm" c="dimmed" role="status" data-note>
-              {note}
+              {note.text}
             </Text>
           )}
-          {items.length === 0 && split.asksError === null && (
+          {items.length === 0 && whole && (
             <Text fz="sm" c="dimmed">
               Nothing else waits on you.
             </Text>

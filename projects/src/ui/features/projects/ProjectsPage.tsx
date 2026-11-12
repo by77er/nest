@@ -10,6 +10,7 @@ import { AnchorLink, BadgeLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { CardGrid, EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Page, PageHeader, Panel, Row, Stack, weight } from "../../layout";
 import { CreateProjectForm } from "./CreateProjectForm";
+import { unknownIfStale } from "../shell/attention";
 
 export function ProjectsPage() {
   const projects = useProjects();
@@ -42,7 +43,7 @@ export function ProjectsPage() {
         </Panel>
       ) : (
         <CardGrid>
-          {projects.data.map((p) => (
+          {projects.data.map(({ needs_you: listed, ...rest }) => ({ ...rest, needs_you: unknownIfStale(projects.isRefetchError, listed) })).map((p) => (
             <Panel key={p.id} component="article" aria-label={p.name}>
               {/* Two rows of controls (the title and its badge, the repo): a touch pitch apart. */}
               <Stack gap="sm" data-touch-pitch>
