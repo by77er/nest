@@ -1353,6 +1353,7 @@ export class AgentDO extends DurableObject<Env> {
     const now = Date.now();
     const ended: Ended = {
       ms: now, by: o.by, reason: o.reason, kill: o.kill, destroy_sandbox: o.destroy_sandbox || !!before.ephemeral,
+      ...(o.destroy_sandbox ? { destroy_asked: true as const } : {}),
       ...(o.note ? { note: clip(o.note, 500) } : {}),
     };
     let dropped = 0;
@@ -1405,7 +1406,10 @@ export class AgentDO extends DurableObject<Env> {
       return;
     }
     if (info.hands && !info.ended!.sandbox) {
-      const r = await this.sandboxStub(info.hands.sandbox).release(info.agent, info.ended!.destroy_sandbox);
+      // The ender's authority reaches only a destroy it asked for: an ephemeral agent's own default destroys
+      // only a sandbox made for it, whoever ended it.
+      const e = info.ended!;
+      const r = await this.sandboxStub(info.hands.sandbox).release(info.agent, e.destroy_sandbox, e.destroy_asked ? e.by : undefined);
       this.update((i) => {
         if (i.ended) i.ended.sandbox = r.destroyed ? "destroyed" : "detached";
       });
@@ -1442,6 +1446,8 @@ export class AgentDO extends DurableObject<Env> {
     const rows = this.sql.exec<{ agent: string }>("SELECT agent FROM children WHERE ended = 0 AND asked = 0").toArray();
     const results = await Promise.allSettled(rows.map(async ({ agent }) => {
       try {
+        // An ephemeral parent's default reaches its children as asked, with `by` this parent: harmless only because a
+        // sandbox this parent owns is its own hands, which it stays attached to until its children end. Don't rely on it.
         await this.agentStub(agent).end({ by: me, reason: "owner_ended", kill: true, destroy_sandbox: e.destroy_sandbox });
         this.sql.exec("UPDATE children SET asked = 1 WHERE agent = ?", agent);
       } catch (err) {
