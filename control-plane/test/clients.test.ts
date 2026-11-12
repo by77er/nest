@@ -441,14 +441,16 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
     await asJson(c.token, "/v1/asks?label=nokey", {}, 400);
   });
 
-  it("a member not made yet (reserved), or one its object doesn't know, has no asks: the page still lists the rest", async () => {
+  it("a member whose object isn't made (reserved, or a create that failed) has no asks: the page still lists the rest", async () => {
     const c = await newClient();
     const w = await createAgent(c, { labels: { project: "pr" } });
     await plantAsk(w.agent, "ask_besideres", 1000);
     // Admitted and never created (a create in flight, or one that failed retryably), labelled to match.
-    await clientStub(c.id).admit({ kind: "agent", id: `agt_reserved${rand()}${rand()}`, cell: c.cell, owner: w.agent, labels: { project: "pr" } });
+    const reserved = `agt_reserved${rand()}${rand()}`;
+    await clientStub(c.id).admit({ kind: "agent", id: reserved, cell: c.cell, owner: w.agent, labels: { project: "pr" } });
     // Live in the registry, its object never made.
-    await clientStub(c.id).report({ kind: "agent", id: `agt_noobject${rand()}${rand()}`, cell: c.cell, owner: c.id, labels: { project: "pr" }, ended_ms: null });
+    const noObject = `agt_noobject${rand()}${rand()}`;
+    await clientStub(c.id).report({ kind: "agent", id: noObject, cell: c.cell, owner: c.id, labels: { project: "pr" }, ended_ms: null });
     const real = AgentDOClass.prototype.openAsks;
     let calls = 0;
     AgentDOClass.prototype.openAsks = function (this: AgentDO, limit?: number) {
@@ -461,8 +463,15 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
     } finally {
       AgentDOClass.prototype.openAsks = real;
     }
-    // The reserved member's object isn't asked at all; the live one and the unknown one are.
-    expect(calls).toBe(2);
+    // Every member is asked, the reserved one too (reserved can outlast an agent's own create).
+    expect(calls).toBe(3);
+    // Asking an object never made leaves no record and no alarm in it: a create of that id later starts clean.
+    for (const id of [reserved, noObject]) {
+      const left = await runInDurableObject(agentStub(id), async (_i: AgentDO, st) => ({
+        kv: st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM kv").one().n, alarm: await st.storage.getAlarm(),
+      }));
+      expect(left).toEqual({ kv: 0, alarm: null });
+    }
   });
 
   it("at most 20 asks an agent a page, oldest first; `more` names an agent with more", async () => {
@@ -477,6 +486,12 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
     expect(r.more).toEqual([busy.agent]);
     // Its own route still lists them all.
     expect(await asJson(c.token, `/v1/agents/${busy.agent}/asks`)).toHaveLength(22);
+    // Exactly 20 is all of them: none more.
+    const full = await createAgent(c, { labels: { project: "pn" } });
+    for (let i = 0; i < 20; i++) await plantAsk(full.agent, `ask_twenty${String(i).padStart(2, "0")}`, 1000 + i);
+    const at20 = await asJson(c.token, "/v1/asks?label=project=pn");
+    expect(at20.asks).toHaveLength(20);
+    expect(at20.more).toEqual([]);
   });
 
   it("an agent slower than the timeout fails the page (503, retryable), never drops its asks", async () => {

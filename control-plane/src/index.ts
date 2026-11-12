@@ -470,8 +470,6 @@ interface ListedMember {
   labels: Labels;
   created_ms: number;
   ended_ms: number | null;
-  /** A client's registry's state (`reserved` before its object is made); absent from the cell's. */
-  state?: string;
 }
 
 /**
@@ -498,7 +496,7 @@ async function registryPage(c: Ctx<string, unknown>, kind: "agent" | "sandbox", 
   if (client !== null) {
     if (!CLIENT_ID.test(client)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "client is a cli_ id");
     const r = await clientDO(c.env, client).list(kind, { ...page, ...(q.has("cell") ? { cell: c.cell } : {}) });
-    return { items: r.items.map((m) => ({ id: m.id, cell: m.cell, client, owner: m.owner, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms, state: m.state })), next_cursor: r.next_cursor };
+    return { items: r.items.map((m) => ({ id: m.id, cell: m.cell, client, owner: m.owner, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms })), next_cursor: r.next_cursor };
   }
   const r = await fleet(c.env, c.cell).listRegistry(kind, page);
   return { items: r.items.map((m) => ({ id: m.id, cell: c.cell, client: m.client, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms })), next_cursor: r.next_cursor };
@@ -512,7 +510,7 @@ async function registryPage(c: Ctx<string, unknown>, kind: "agent" | "sandbox", 
 async function listing(c: Ctx<string, unknown>, kind: "agent" | "sandbox"): Promise<unknown> {
   const r = await registryPage(c, kind);
   return {
-    [kind === "agent" ? "agents" : "sandboxes"]: r.items.map(({ id, state: _s, ...m }) => ({ [kind]: id, ...m })),
+    [kind === "agent" ? "agents" : "sandboxes"]: r.items.map(({ id, ...m }) => ({ [kind]: id, ...m })),
     next_cursor: r.next_cursor,
   };
 }
@@ -530,14 +528,15 @@ export const ASKS_AGENT_TIMEOUT_MS = 5_000;
  * the caller may see, filtered by their labels, with each one's agent, owner and labels. Read from each
  * AgentDO when asked (the one record of an ask), never from a copy: an ask answered anywhere is gone from
  * the next read. Paged by agent (`limit` agents, default 50, at most 100), at most ASKS_PER_AGENT asks each
- * (`more` names the agents with more). A member still `reserved` (its object not made yet, or a create that
- * failed) has none, as has an agent its object doesn't know; any other failure, or an agent slower than
- * ASKS_AGENT_TIMEOUT_MS, fails the whole page, so a page never silently leaves out an ask.
+ * (`more` names the agents with more). An agent its AgentDO doesn't know (a member still `reserved` whose
+ * object isn't made yet, or a create that failed) has none: asked like any other, since a member stays
+ * `reserved` until its registration reports, which can lag an agent that exists. Any other failure, or an
+ * agent slower than ASKS_AGENT_TIMEOUT_MS, fails the whole page, so a page never silently leaves out an ask.
  */
 async function openAsksPage(c: Ctx<string, unknown>): Promise<unknown> {
   const page = await registryPage(c, "agent", { liveOnly: true, limits: { default: ASKS_PAGE, max: ASKS_PAGE_MAX } });
   const more: string[] = [];
-  const per = await Promise.all(page.items.filter((m) => m.state !== "reserved").map(async (m) => {
+  const per = await Promise.all(page.items.map(async (m) => {
     let asks: Awaited<ReturnType<AgentDO["openAsks"]>>;
     try {
       // One more than shown, to know there are more (an AgentDO of the previous release ignores the limit and answers all).
@@ -1049,7 +1048,7 @@ export const ROUTES: Route[] = [
   // Its approvals (and questions) waiting for the operator or its client, oldest first; each is answered below
   // and the decision reaches the agent as its next turn (docs/agents/tools/#taint-and-sinks).
   route({ method: "GET", path: "/v1/agents/:agent/asks", auth: "owner", run: async (c) => (await ownAgent(c, c.p.agent)).openAsks() }),
-  // Every live agent's of a page at once, filtered by labels (a client's own only).
+  // A page of live agents' asks at once, filtered by labels: a client's own; the operator's, a client's (`?client=`) or the cell's.
   route({ method: "GET", path: "/v1/asks", auth: "owner", run: openAsksPage }),
   route({ method: "POST", path: "/v1/agents/:agent/asks/:ask/answer", auth: "owner", body: z.object({ answer: z.string() }),
     run: async (c) => ({ delivered: await (await ownAgent(c, c.p.agent)).answerAsk(c.p.ask, c.body.answer) }) }),
