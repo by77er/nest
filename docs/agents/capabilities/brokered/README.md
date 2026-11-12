@@ -22,7 +22,7 @@ prompt: Open PRs and comment on me/app; file issues anywhere the App is installe
 
 ## Tools
 
-**Decided (2026-10-31): one tool per granted action, plus the generic `brokered{action, args}`.** `tools_list` lists `github_comment`, `github_create_issue`, `github_create_pr`, `github_review_comment` and `http_request` for the actions the spec grants, each with its own schema, narrowed to the grants (the `repo` enum is the scoped repos; the `profile` enum the agent's profiles, each described with its base URL and methods). **Why:** the model gets a schema per action and sees what it may do; the names are the design's with `_` for `.`, because an API tool name matches `^[a-zA-Z0-9_-]{1,128}$`, with no `.` ([define tools](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools), read 2026-10-31; unverified for Claude Code's MCP names). `brokered` (a registry tool) reaches the same actions under the same checks, for a backend that wants one entry point. No mcp capability may make a name a brokered tool has (`github_…` from an mcp capability named `github` is refused).
+**Decided (2026-10-31): one tool per granted action, plus the generic `brokered{action, args}`.** `tools_list` lists `github_comment`, `github_create_issue`, `github_create_pr`, `github_review_comment`, `github_fork` and `http_request` for the actions the spec grants, each with its own schema, narrowed to the grants (the `repo` enum is the scoped repos; the `profile` enum the agent's profiles, each described with its base URL and methods). **Why:** the model gets a schema per action and sees what it may do; the names are the design's with `_` for `.`, because an API tool name matches `^[a-zA-Z0-9_-]{1,128}$`, with no `.` ([define tools](https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools), read 2026-10-31; unverified for Claude Code's MCP names). `brokered` (a registry tool) reaches the same actions under the same checks, for a backend that wants one entry point. No mcp capability may make a name a brokered tool has (`github_…` from an mcp capability named `github` is refused).
 
 ## The pipeline
 
@@ -66,7 +66,7 @@ Each action's installation token is minted for its one repo and only: `github.co
 
 ## Journal
 
-AgentDO's `brokered_journal`, one row per call key: action, target (repo or profile), natural key, arguments digest, the arguments (4 KiB; withheld for a refusal), `sending`, `done`, `failed`, `unknown` or `refused`, attempts, what it came to, the session's taint, created and settled times. Pruned after 7 days with the call ledger. The operator reads it with `GET /v1/agents/:agent/brokered?limit=&before=` (newest first).
+AgentDO's `brokered_journal`, one row per call key: action, target (repo or profile), natural key, arguments digest, the arguments (4 KiB; withheld for a refusal), `sending`, `done`, `failed`, `unknown` or `refused`, attempts, what it came to, the session's taint, created and settled times. Pruned after 7 days with the call ledger. The owner (the operator, or the API client of the agent's subtree) reads it with `GET /v1/agents/:agent/brokered?limit=&before=` (newest first, `limit` at most 500).
 
 ## Not built
 

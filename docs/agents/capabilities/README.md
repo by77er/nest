@@ -16,13 +16,13 @@ prompt:  |                                  # added to the system prompt
 ```
 
 - **Data, not code:** capabilities are stored in the control plane ([CatalogDO](../../control-plane/durable-objects/catalog/)) and edited by me, like templates. Adding an MCP server or an API is data too; only a new *platform* tool needs code (the tool registry).
-- **Attenuation:** a spawn spec can enable a capability only if the spawner holds every grant it expands to, with parameters no wider than its own.
+- **Attenuation (designed):** a spawn spec can enable a capability only if the spawner holds every grant it expands to, with parameters no wider than its own. Built: capabilities expand to no grants; a spawner spawns only from its capabilities' `spawn` templates, its overrides only narrow the template, and grants it passes must attenuate its own ([spawning](../#spawning)).
 - **Rules are read live:** an agent's permission rules are its capabilities' rules as they are now, after its spawner's narrowing, so editing a capability's rules reaches running agents (2026-11-11; [AgentDO](../../control-plane/durable-objects/agent/#rules), [CatalogDO](../../control-plane/durable-objects/catalog/#live-rules)). Tools, prompts and every other part of a capability are copied at spawn.
 - **Rule order is template order** (first match wins). The seed's `nest` (the operator's, read live by every agent that lists it) allows the task tools, `TodoWrite`, `WebSearch` and `WebFetch` by exact name, so a template that lists `nest` before its own capability can't make those built-ins `ask` or `deny` through that capability: it lists its capability before `nest`, or its spawns narrow them (`overrides.rules`, which come first).
 - **Parameters (designed, not built):** a capability declares the parameters its tools read; the template gives defaults and the operator gives values at spawn, and the agent's spec records them.
 - **Always present, not capabilities:** an agent's own input queue and inbox, and `exit`.
-- **Prompt sections** are part of the launch config, so edits reach resumed brains (`--system-prompt-snapshot off`, see [runner](../runner/)).
-- **Built so far:** `builtin` tools ([CatalogDO](../../control-plane/durable-objects/catalog/)), the `mcp` source ([mcp/](mcp/): a bearer token or none, the allowlist, idempotency overrides, the trust flag and per-server caps; AgentDO is the MCP client, and a connector per server shares the tool list and admits calls) and the `brokered` source ([brokered/](brokered/): GitHub actions scoped to repos, `http.request` profiles). `api` isn't built. The seed catalog's capabilities: `nest`, `hands`, `subagents`, `transcripts`, `sandboxes`, `brokered`, `management` (`attach`, `approve`, `deny`, all `not_implemented`), `memory`, `egress`, `spawning` and [`timers`](timers/) (named timers that wake the agent) (`control-plane/src/lib/spec.ts`).
+- **Prompt sections** are part of the launch config, copied at spawn and written at each brain start. Edits are to reach resumed brains with `--system-prompt-snapshot off` (designed, not passed yet: [runner](../runner/)); until then a resumed session keeps its first prompt until compaction.
+- **Built so far:** `builtin` tools ([CatalogDO](../../control-plane/durable-objects/catalog/)), the `mcp` source ([mcp/](mcp/): a bearer token or none, the allowlist, idempotency overrides, the trust flag and per-server caps; AgentDO is the MCP client, and a connector per server shares the tool list and admits calls) and the `brokered` source ([brokered/](brokered/): GitHub actions scoped to repos, `http.request` profiles). `api` isn't built. The seed catalog's capabilities: `nest`, `hands`, `subagents`, `transcripts`, `sandboxes`, `brokered`, `management` (`attach`, `approve`, `deny`), `memory`, `egress`, `spawning` and [`timers`](timers/) (`control-plane/src/lib/spec.ts`). `management`'s tools, `memory`'s (`memory_read`, `memory_write`), `sandboxes`' `fork_sandbox` and `hands`' `checkpoint` answer `not_implemented`. The seed templates list `spawning` (in `captain`) but not `egress` or `timers`.
 
 ## Sources
 
@@ -66,7 +66,9 @@ prompt: The issue tracker: read freely; comment only when asked.
 | `web` | `WebSearch`, `WebFetch` (Claude Code built-ins) | none; results set [taint](../tools/#taint-and-sinks) |
 | `metrics` | `metrics_query(sql)` over nest's own [runtime metrics](../../control-plane/metrics/) | reading them; results hold only numbers, enums and ids, so they don't taint |
 
-**Templates compose them,** with any `mcp` or `api` capability alongside. For example:
+**Built:** `spawning`, `transcripts` (also reading agents a [transcript grant](../tools/#built-transcript-grants-2026-11-06) covers), `brokered`, and of `sandboxes` only `egress_policy` (and `expose_port`, seeded in `hands`). `memory` is seeded with tools that answer `not_implemented`, and its key index and weekly wake aren't built. `schedules`, `authority` and `metrics` aren't built; [`timers`](timers/) is the built way to wake itself. `web` isn't a capability: the seeded `worker` launches with the `WebSearch` and `WebFetch` built-ins.
+
+**Templates compose them,** with any `mcp` or `api` capability alongside. For example (design: only `worker` and `captain` are seeded, and `github_ro` needs the `api` source):
 
 ```yaml
 worker:    [hands, web, github_ro, brokered{actions: [github.create_pr]}]   # ephemeral: no memory
@@ -81,7 +83,7 @@ Messaging between agents is an external integration ([principle 9](../../README.
 
 ## Schedules
 
-**Designed, not built.** `wake_at(at | every, note)` queues a turn on the agent itself: once at a time, or repeating at an interval. It's how monitors keep their own cadence and how assistants remind me of things. `wake_cancel(id)` stops one.
+**Designed, not built;** what's built is [`timers`](timers/): named one-shot timers (`timer_set`) that wake the agent through its inbox, without repeats, carried taint or a turn budget. `wake_at(at | every, note)` queues a turn on the agent itself: once at a time, or repeating at an interval. It's how monitors keep their own cadence and how assistants remind me of things. `wake_cancel(id)` stops one.
 
 - **Durable:** wakes are AgentDO alarms, so they survive restarts and moves, and cost nothing while waiting.
 - **A due wake is a turn** carrying the note, and it starts a brain like any other input (see [continuity](../#continuity)).

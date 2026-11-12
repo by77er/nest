@@ -18,7 +18,7 @@ Also: [tools/](tools/) (the platform tool catalog and call semantics) and [model
 - **Hosts always dial out,** sandbox hosts and brain hosts alike. WebSocket upgrades carry `Authorization: Bearer <host_token>`. The first frame is a hello carrying `protocol_version` (currently `1`, `model::PROTOCOL_VERSION`). A version mismatch gets `error{unsupported_version}` and the socket closes.
 - **Reliable messages** carry a per-direction `seq` (from 1, never reused: a sender's counter keeps rising across a lineage reset, so a receiver takes a lineage's first message as its baseline) and are acknowledged with a **cumulative** `ack{up_to}`. The sender keeps unacknowledged messages and resends them after reconnect, starting after the `last_*_seq` the peer reported in its hello or hello-ack. Receivers deduplicate by `seq`. Delivery is **at least once, in order**.
 - **Unreliable messages:** `heartbeat` and its ack (a missed heartbeat is just a missed renewal), `segment` (ordered and deduplicated by byte offset instead), and `tools_list_request` / `tools_list` (retried by the caller).
-- **Batching:** hosts flush `events` every 1–2 s, or sooner when a batch reaches 100 entries. FleetDO batches `commands` the same way.
+- **Batching:** hosts flush `events` every 1–2 s, or sooner when a batch reaches 100 entries. FleetDO sends the commands of one issue as one `commands` batch, at once.
 - **Epoch fencing:** every sandbox-scoped command, event, commit, tool call and session hello carries the epoch. A mismatch gets `stale_epoch`; the host must treat that as a fence for the sandbox.
 - **Errors:** `ErrorBody{code, message, retryable}`. Codes are in `model::error_codes` ([models](models/)).
 

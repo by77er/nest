@@ -21,4 +21,4 @@ The prompt file holds the spawn spec's prompt; the MCP config points `nest mcp` 
 - **`--tools ""`** removes every built-in. `--tools "WebSearch"` brings back only web search.
 - **`--system-prompt-file`** (`system_prompt.mode: replace`) swaps the coding prompt for the template's prompt, which is the same text an `api-loop` backend would use as `system`.
 - **The MCP bridge is generic:** `tools/list` and `tools/call` are forwarded to the agent's AgentDO, and it contains no tool logic.
-- **Mapping to canonical events:** the runner maps stream-json output to canonical events. Rate limits become `rate_limited`, and the scheduler applies the agent's priority.
+- **Mapping to canonical events:** the runner maps stream-json output to canonical events. Rate limits become `rate_limited` and `quota_parked`; the scheduler applying the agent's priority is designed, not built ([scheduling](../../../orchestration/scheduling/)).
