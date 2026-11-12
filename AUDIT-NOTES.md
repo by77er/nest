@@ -28,12 +28,18 @@ Base: origin/main 6bbf64f.
 | PR upkeep | change wording ("before this", "as before", "now that", "this change leaves those as they are") | stated as current | projects/src/do/project.ts:584-611 |
 | Routines (the page) | badges: Running, Queued, Cooling down, Off | also Starting | projects/src/ui/features/routines/describe.ts:45-48 |
 | Secrets | the Secrets page sits between Reviews and Settings | the sidebar is Manager, Board, Triage, Reviews, Routines, Secrets, Network, Settings | projects/src/ui/features/shell/Sidebar.test.tsx:98 |
+| The UI | features list omitted `manager`, `triage`, `reviews`, `secrets`, `network`, `rich` | those folders exist | `ls projects/src/ui/features` |
+| The UI (shell) | sidebar rows: Manager, Board, Reviews, Settings | Manager, Board, Triage, Reviews, Routines, Secrets, Network, Settings | projects/src/ui/features/shell/Sidebar.test.tsx:98 |
+| The UI (Settings) | Workers and Auto-merge as two Panels in one row | seven Panels in a SectionGrid: Workers, Models, Auto-merge, Reviews, PR comments, Triage, CI workflows | projects/src/ui/features/settings/SettingsForm.tsx:133-274 |
+| The UI (Routes) | omitted triage, secrets and network | routes exist | projects/src/ui/router.tsx:69-85 |
+| The UI (board) | "the columns' old order", "as before" | wording | — |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
 - `/mcp/task`: `report_progress` (described as "posts progress").
 
 ## Unconfirmed
+- The manager chat (~line 724): "nest keeps a result's first 200 characters". control-plane/src/lib/trace.ts:8-11 clips string fields to 4 KB and texts to 16 KB, and stores `tool_result.summary` as given; the 200-character summary would be the runner's, which I didn't find in crates/.
 - The repo's binding (~line 281): that GitHub redirects every call nest makes under a transferred repo's old name. Already marked unverified in the doc; nothing in the repo shows it either way.
 - Models (~lines 242, 264): whether nest reads a live agent's template again, and how a wrong model id surfaces. Already marked unverified; not traced in control-plane.
 - Setup steps 5-8 (lines ~837-840): the live GitHub App's subscriptions/permissions and the live client's grant (dated 2026-11-02/06) are cloud state; not checkable from the repo.
@@ -46,6 +52,8 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- The UI (intro): corrections above; POLL chat 3 s / board 5 s / project 10 s ui/api/queries.ts:32 match.
+- The manager chat: CHAT_PAGE 50 / CHAT_PAGE_MAX 200 do/project.ts:317-318, interrupt api.ts:395, LIVE_SHOWN 4 and HOLD_MAX_MS 30 s ui/features/chat/ChatView.tsx:107,153, nest's ring 1,000 events/24 h and 16 KB/4 KB control-plane/src/lib/trace.ts:9-15 match.
 - Secrets: one correction; SECRET_NAME secrets.ts:41, MAX_HOSTS/LOCATIONS/BINDINGS 16/3/16 :43-45, nest name :53, placeholder :56, ENV_NAME and reserved names :62-79, presets :186-195, request schema requests.ts:65-72, upkeep 10 min / sweep 5 min do/project.ts:4427,4431, "Outside the grant" ui/features/secrets/SecretsPage.tsx:56 match.
 - Triage: no drift (MAX_UNTRIAGED_ISSUES 200 issues.ts:9; ISSUES_FROM :5; title/body 300/20,000 do/project.ts:189-190; import 300 :1317; PREVIEW_LINES/CHARS ui/features/triage/TriagePage.tsx:27-28; requests.ts:39).
 - Routines: one correction; limits requests.ts:101-128 (15 min-7 d, cooldown, 5-120 min, 1-20 turns), max_routine_runs 1-3 requests.ts:47, MAX_PROPOSALS_PER_RUN 5 / MAX_UNTRIAGED_PROPOSALS 50 routines.ts:49-50, MAX_START_ATTEMPTS 8 :54, dream window 7/30 d and 200 entries :171-175, labels and keys do/project.ts:3131,3161, declined block 30 d :4557, routes api.ts:479-506, RUNS/NOTES/PROPOSALS_SHOWN 10.
