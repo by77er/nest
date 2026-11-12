@@ -19,9 +19,10 @@
 ## Open asks across agents
 
 **Decided (2026-11-11):** `GET /v1/asks` lists the open asks of many agents in one call, so an owner showing what waits on it (an app's "needs you") reads nest's record instead of keeping a copy that goes stale when an ask is answered elsewhere or its agent ends.
-- **Which agents:** the live ones of the caller's registry, as `GET /v1/agents` pages them: a client's own (ClientDO); the operator's, a client's (`?client=`) or else the cell's. `?label=key=value` filters (each must match), `?limit` agents per page (default 50, at most 100), `?cursor` the previous page's `next_cursor`. An ended agent's asks aren't listed: it takes no more turns.
-- **The answer:** `{asks: [{agent, cell, client, owner?, labels, ask, question, created_ms, approval?}], next_cursor}`, oldest first within the page; `owner` from a client's registry only. Every open ask of each agent on the page is listed (as `GET /v1/agents/<id>/asks` lists them).
-- **Read from each agent's AgentDO when asked,** one call each, in parallel: there is no index of asks to drift. An agent that can't answer fails the whole page (its error), so a page never leaves an ask out silently.
+- **Which agents:** the live ones of the caller's registry, as `GET /v1/agents` pages them: a client's own (ClientDO), whatever `?client=` says; the operator's, a client's (`?client=`) or else the cell's (`?cell=`). `?label=key=value` filters (each must match), `?limit` agents per page (default 50, at most 100), `?cursor` the previous page's `next_cursor`. `?state` may only be `live` (anything else is 400): an ended agent takes no more turns, so its asks aren't listed. A member still `reserved` (its AgentDO not made yet, or a create that failed retryably and awaits its recheck) has none, nor has one its AgentDO doesn't know.
+- **The answer:** `{asks: [{agent, cell, client, owner?, labels, ask, question, created_ms, approval?}], more, next_cursor}`, oldest first within the page; `owner` from a client's registry only. At most 20 asks per agent, its oldest; `more` names the agents on the page that have more, whose whole list is `GET /v1/agents/<id>/asks`. Asks are uncapped per agent in AgentDO, an open question of its own ([AgentDO](../durable-objects/agent/)); the cap keeps one agent's from swelling every page it's on.
+- **Read from each agent's AgentDO when asked,** one call each, in parallel: there is no index of asks to drift. An agent that fails, or takes more than 5 s, fails the whole page (its error, or `503 internal` retryable), so a page never leaves an ask out silently.
+- **What to trust:** `question` is agent-written text (a tainted agent's included): show it as data. `labels` are the creator's: a row whose `owner` is an agent has the labels that agent gave its child, so an app treats labels as its own provenance only where `owner` is the app itself.
 
 ## Restarting on another model
 
@@ -87,7 +88,7 @@
 ## Which routes take a cell
 
 **Decided (2026-11-02):** only a route about one cell's FleetDO reads `?cell=`. It is checked when that route reads it (default `local`), never by the router for every route (`Ctx.cell` in `control-plane/src/index.ts`), so in a deployment whose `CELLS` doesn't name `local` an external app needs no cell on the others.
-- **About a cell** (`?cell=`): the fleet, hosts, images, lifetimes, tunnels, GC and the root certificate (`/v1/admin/…`), and the operator's `GET /v1/agents` and `GET /v1/sandboxes` without `?client=` (FleetDO's registry). A client's listing, and the operator's with `?client=`, take `?cell=` only as a filter.
+- **About a cell** (`?cell=`): the fleet, hosts, images, lifetimes, tunnels, GC and the root certificate (`/v1/admin/…`), and the operator's `GET /v1/agents`, `GET /v1/sandboxes` and `GET /v1/asks` without `?client=` (FleetDO's registry). A client's listing, and the operator's with `?client=`, take `?cell=` only as a filter.
 - **In the body:** `POST /v1/agents` and `POST /v1/sandboxes` take `cell` (an agent with a sandbox takes the sandbox's).
 - **No cell:** everything reached by an agent's or sandbox's id (its DO's record knows its cell), the catalog (one CatalogDO for every cell), clients and `/v1/clients/self/…`, and secrets (one BrokerDO). These accept a `?cell=` and ignore it, so callers that send one keep working.
 

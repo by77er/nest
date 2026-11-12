@@ -29,7 +29,8 @@ import { TimerName } from "./lib/timers";
 import { clientMetadataDocument, Scopes } from "./lib/mcp-auth";
 import { JWKS_MAX_AGE_S } from "./lib/identity";
 import { Port, SandboxPolicyLayer } from "./do/sandbox";
-import { type CreateAgent, type RestartResult, TRACE_HEADER } from "./do/agent";
+import { type AgentDO, type CreateAgent, type RestartResult, TRACE_HEADER } from "./do/agent";
+import { withTimeout } from "./lib/reliable";
 import { type GrantParent, inScope, parseGrantRequests } from "./lib/grants";
 import { parseAppSecret } from "./lib/github";
 import { canonicalRepos, Repo } from "./lib/repos";
@@ -460,11 +461,6 @@ async function namespaceScope(c: { env: Env; caller: Caller }, ns: string): Prom
   return clientDO(c.env, id).scope();
 }
 
-/**
- * `GET /v1/agents` and `GET /v1/sandboxes`: a client's subtree from its registry (ClientDO), or, for the
- * operator, a client's (`?client=`) or the cell's (`?cell=`, FleetDO's registries). Filters: `label=k=v`
- * (repeated: each must hold), `state=live|ended|all` (default live); paged by `limit` and `cursor`.
- */
 /** One row of a registry listing, as `GET /v1/agents` and `GET /v1/sandboxes` answer it (`owner` only from a client's registry). */
 interface ListedMember {
   id: string;
@@ -474,6 +470,8 @@ interface ListedMember {
   labels: Labels;
   created_ms: number;
   ended_ms: number | null;
+  /** A client's registry's state (`reserved` before its object is made); absent from the cell's. */
+  state?: string;
 }
 
 /**
@@ -489,7 +487,8 @@ async function registryPage(c: Ctx<string, unknown>, kind: "agent" | "sandbox", 
   } catch (e) {
     throw new NestError(ErrorCodes.INVALID_MESSAGE, (e as Error).message);
   }
-  const state = o.liveOnly ? "live" : q.get("state") ?? "live";
+  const state = q.get("state") ?? "live";
+  if (o.liveOnly && state !== "live") throw new NestError(ErrorCodes.INVALID_MESSAGE, "state is live here (only live agents are listed)");
   if (state !== "live" && state !== "ended" && state !== "all") throw new NestError(ErrorCodes.INVALID_MESSAGE, "state is live, ended or all");
   const asked = q.has("limit") ? Number(q.get("limit")) : undefined;
   if (asked !== undefined && (!Number.isSafeInteger(asked) || asked < 1)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "limit must be a positive integer");
@@ -499,16 +498,21 @@ async function registryPage(c: Ctx<string, unknown>, kind: "agent" | "sandbox", 
   if (client !== null) {
     if (!CLIENT_ID.test(client)) throw new NestError(ErrorCodes.INVALID_MESSAGE, "client is a cli_ id");
     const r = await clientDO(c.env, client).list(kind, { ...page, ...(q.has("cell") ? { cell: c.cell } : {}) });
-    return { items: r.items.map((m) => ({ id: m.id, cell: m.cell, client, owner: m.owner, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms })), next_cursor: r.next_cursor };
+    return { items: r.items.map((m) => ({ id: m.id, cell: m.cell, client, owner: m.owner, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms, state: m.state })), next_cursor: r.next_cursor };
   }
   const r = await fleet(c.env, c.cell).listRegistry(kind, page);
   return { items: r.items.map((m) => ({ id: m.id, cell: c.cell, client: m.client, labels: m.labels, created_ms: m.created_ms, ended_ms: m.ended_ms })), next_cursor: r.next_cursor };
 }
 
+/**
+ * `GET /v1/agents` and `GET /v1/sandboxes`: a client's subtree from its registry (ClientDO), or, for the
+ * operator, a client's (`?client=`) or the cell's (`?cell=`, FleetDO's registries). Filters: `label=k=v`
+ * (repeated: each must hold), `state=live|ended|all` (default live); paged by `limit` and `cursor`.
+ */
 async function listing(c: Ctx<string, unknown>, kind: "agent" | "sandbox"): Promise<unknown> {
   const r = await registryPage(c, kind);
   return {
-    [kind === "agent" ? "agents" : "sandboxes"]: r.items.map(({ id, ...m }) => ({ [kind]: id, ...m })),
+    [kind === "agent" ? "agents" : "sandboxes"]: r.items.map(({ id, state: _s, ...m }) => ({ [kind]: id, ...m })),
     next_cursor: r.next_cursor,
   };
 }
@@ -516,20 +520,43 @@ async function listing(c: Ctx<string, unknown>, kind: "agent" | "sandbox"): Prom
 /** Agents per page of `GET /v1/asks`: each is one call to its AgentDO. */
 const ASKS_PAGE = 50;
 const ASKS_PAGE_MAX = 100;
+/** Asks shown per agent on a page of `GET /v1/asks`; an agent with more is named in `more`. */
+export const ASKS_PER_AGENT = 20;
+/** How long one AgentDO may take to list its asks before the page fails (retryable). */
+export const ASKS_AGENT_TIMEOUT_MS = 5_000;
 
 /**
- * `GET /v1/asks` (docs/control-plane/api/#approvals): the open asks of a page of live agents the caller may
- * see, filtered by their labels, with each one's agent, owner and labels. Read from each AgentDO when asked
- * (the one record of an ask), never from a copy: an ask answered anywhere is gone from the next read. Paged
- * by agent (`limit` agents, default 50, at most 100); an agent that can't answer fails the whole page, so a
- * page never silently leaves out an ask.
+ * `GET /v1/asks` (docs/control-plane/api/#open-asks-across-agents): the open asks of a page of live agents
+ * the caller may see, filtered by their labels, with each one's agent, owner and labels. Read from each
+ * AgentDO when asked (the one record of an ask), never from a copy: an ask answered anywhere is gone from
+ * the next read. Paged by agent (`limit` agents, default 50, at most 100), at most ASKS_PER_AGENT asks each
+ * (`more` names the agents with more). A member still `reserved` (its object not made yet, or a create that
+ * failed) has none, as has an agent its object doesn't know; any other failure, or an agent slower than
+ * ASKS_AGENT_TIMEOUT_MS, fails the whole page, so a page never silently leaves out an ask.
  */
 async function openAsksPage(c: Ctx<string, unknown>): Promise<unknown> {
   const page = await registryPage(c, "agent", { liveOnly: true, limits: { default: ASKS_PAGE, max: ASKS_PAGE_MAX } });
-  const per = await Promise.all(page.items.map(async (m) => (await agent(c.env, m.id).openAsks()).map((a) => ({
-    agent: m.id, cell: m.cell, client: m.client, ...(m.owner !== undefined ? { owner: m.owner } : {}), labels: m.labels, ...a,
-  }))));
-  return { asks: per.flat().sort((a, b) => a.created_ms - b.created_ms || (a.ask < b.ask ? -1 : a.ask > b.ask ? 1 : 0)), next_cursor: page.next_cursor };
+  const more: string[] = [];
+  const per = await Promise.all(page.items.filter((m) => m.state !== "reserved").map(async (m) => {
+    let asks: Awaited<ReturnType<AgentDO["openAsks"]>>;
+    try {
+      // One more than shown, to know there are more (an AgentDO of the previous release ignores the limit and answers all).
+      asks = await withTimeout(agent(c.env, m.id).openAsks(ASKS_PER_AGENT + 1), ASKS_AGENT_TIMEOUT_MS, `agent ${m.id}'s asks`);
+    } catch (e) {
+      if (asNestError(e)?.code === ErrorCodes.UNKNOWN_AGENT) return [];
+      if (asNestError(e)) throw e;
+      throw new NestError(ErrorCodes.INTERNAL, `couldn't list agent ${m.id}'s asks: ${e instanceof Error ? e.message : String(e)}`, 503, true);
+    }
+    if (asks.length > ASKS_PER_AGENT) more.push(m.id);
+    return asks.slice(0, ASKS_PER_AGENT).map((a) => ({
+      agent: m.id, cell: m.cell, client: m.client, ...(m.owner !== undefined ? { owner: m.owner } : {}), labels: m.labels, ...a,
+    }));
+  }));
+  return {
+    asks: per.flat().sort((a, b) => a.created_ms - b.created_ms || (a.ask < b.ask ? -1 : a.ask > b.ask ? 1 : 0)),
+    more: more.sort(),
+    next_cursor: page.next_cursor,
+  };
 }
 
 /**

@@ -371,14 +371,16 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
         { agent: w2.agent, cell: a.cell, client: a.id, owner: a.id, labels: { project: "p1", role: "manager" }, ask: "ask_w2early", question: "may ask_w2early?", created_ms: 2000, approval: { name: "brokered", tool: "WebFetch" } },
         { agent: w1.agent, cell: a.cell, client: a.id, owner: a.id, labels: { project: "p1", role: "worker", task: "t1" }, ask: "ask_w1late", question: "may ask_w1late?", created_ms: 3000 },
       ],
+      more: [],
       next_cursor: null,
     });
     // Every label must match; another client's agents never show, whatever their labels.
     expect((await asJson(a.token, "/v1/asks?label=project=p1&label=role=worker")).asks.map((x: any) => x.ask)).toEqual(["ask_w1late"]);
     expect((await asJson(a.token, "/v1/asks")).asks.map((x: any) => x.ask)).toEqual(["ask_otherp2", "ask_w2early", "ask_w1late"]);
     expect((await asJson(b.token, "/v1/asks?label=project=p1")).asks.map((x: any) => x.ask)).toEqual(["ask_theirs1"]);
-    // The operator reads a client's (`?client=`).
+    // The operator reads a client's (`?client=`); a client naming another is still shown only its own.
     expect((await adminJson(`/v1/asks?client=${a.id}&label=project=p1`)).asks.map((x: any) => x.ask)).toEqual(["ask_w2early", "ask_w1late"]);
+    expect((await asJson(a.token, `/v1/asks?client=${b.id}&label=project=p1`)).asks.map((x: any) => x.ask)).toEqual(["ask_w2early", "ask_w1late"]);
   });
 
   it("reads nest's record when asked: an ask answered anywhere, or of an agent that ended, is gone from the next read", async () => {
@@ -396,8 +398,9 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
     await asJson(c.token, `/v1/agents/${gone.agent}/stop`, { body: { end: true } });
     await eventually("the end reaches the registry", async () => (await clientStub(c.id).list("agent", { state: "ended" })).items.some((m) => m.id === gone.agent));
     expect(await listed()).toEqual(["ask_stays001"]);
-    // Live agents only, whatever `state` asks for.
-    expect((await asJson(c.token, "/v1/asks?label=project=px&state=all")).asks.map((x: any) => x.ask)).toEqual(["ask_stays001"]);
+    // Live agents only: `state` may say so, and nothing else (400, not silently ignored).
+    expect((await asJson(c.token, "/v1/asks?label=project=px&state=live")).asks.map((x: any) => x.ask)).toEqual(["ask_stays001"]);
+    for (const st of ["all", "ended", "bogus"]) await asJson(c.token, `/v1/asks?label=project=px&state=${st}`, {}, 400);
   });
 
   it("pages by agent: `limit` agents a page (at most 100), and `next_cursor` goes on from the last", async () => {
@@ -437,6 +440,59 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
     expect(limits).toEqual([50, 100, 7]);
     await asJson(c.token, "/v1/asks?label=nokey", {}, 400);
   });
+
+  it("a member not made yet (reserved), or one its object doesn't know, has no asks: the page still lists the rest", async () => {
+    const c = await newClient();
+    const w = await createAgent(c, { labels: { project: "pr" } });
+    await plantAsk(w.agent, "ask_besideres", 1000);
+    // Admitted and never created (a create in flight, or one that failed retryably), labelled to match.
+    await clientStub(c.id).admit({ kind: "agent", id: `agt_reserved${rand()}${rand()}`, cell: c.cell, owner: w.agent, labels: { project: "pr" } });
+    // Live in the registry, its object never made.
+    await clientStub(c.id).report({ kind: "agent", id: `agt_noobject${rand()}${rand()}`, cell: c.cell, owner: c.id, labels: { project: "pr" }, ended_ms: null });
+    const real = AgentDOClass.prototype.openAsks;
+    let calls = 0;
+    AgentDOClass.prototype.openAsks = function (this: AgentDO, limit?: number) {
+      calls++;
+      return real.call(this, limit);
+    };
+    try {
+      const r = await asJson(c.token, "/v1/asks?label=project=pr");
+      expect(r.asks.map((x: any) => x.ask)).toEqual(["ask_besideres"]);
+    } finally {
+      AgentDOClass.prototype.openAsks = real;
+    }
+    // The reserved member's object isn't asked at all; the live one and the unknown one are.
+    expect(calls).toBe(2);
+  });
+
+  it("at most 20 asks an agent a page, oldest first; `more` names an agent with more", async () => {
+    const c = await newClient();
+    const busy = await createAgent(c, { labels: { project: "pm" } });
+    const calm = await createAgent(c, { labels: { project: "pm" } });
+    for (let i = 0; i < 22; i++) await plantAsk(busy.agent, `ask_many${String(i).padStart(2, "0")}x`, 1000 + i);
+    await plantAsk(calm.agent, "ask_calmonly", 5000);
+    const r = await asJson(c.token, "/v1/asks?label=project=pm");
+    expect(r.asks.filter((x: any) => x.agent === busy.agent).map((x: any) => x.ask)).toEqual(Array.from({ length: 20 }, (_, i) => `ask_many${String(i).padStart(2, "0")}x`));
+    expect(r.asks.filter((x: any) => x.agent === calm.agent).map((x: any) => x.ask)).toEqual(["ask_calmonly"]);
+    expect(r.more).toEqual([busy.agent]);
+    // Its own route still lists them all.
+    expect(await asJson(c.token, `/v1/agents/${busy.agent}/asks`)).toHaveLength(22);
+  });
+
+  it("an agent slower than the timeout fails the page (503, retryable), never drops its asks", async () => {
+    const c = await newClient();
+    const w = await createAgent(c, { labels: { project: "pt" } });
+    await plantAsk(w.agent, "ask_slowagnt", 1000);
+    const real = AgentDOClass.prototype.openAsks;
+    AgentDOClass.prototype.openAsks = () => new Promise(() => {});
+    try {
+      const res = await as(c.token, "/v1/asks?label=project=pt");
+      expect(res.status).toBe(503);
+      expect((await res.json() as any).error.retryable).toBe(true);
+    } finally {
+      AgentDOClass.prototype.openAsks = real;
+    }
+  }, 15_000);
 
   it("an agent that can't answer fails the page: an ask is never left out silently", async () => {
     const c = await newClient();
