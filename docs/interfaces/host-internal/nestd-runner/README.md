@@ -43,7 +43,6 @@ Reported in `RunnerEvent::Error` (to nestd) or in an `AgentEventBody::Error` (on
 | Code | Where | Meaning |
 |---|---|---|
 | `no_lease` | `RunnerEvent::Error` | `agent_start` refused: no valid host lease (none received yet, or it lapsed). Retryable once a `lease_update` arrives. |
-| `already_running` | `RunnerEvent::Error` | A duplicate `agent_start` for a live brain. The running brain is untouched. |
 | `forbidden_tool` | `RunnerEvent::Error` | `launch.builtin_tools`, or `system/init.tools`, includes a built-in outside the runner's host-safe allowlist ([runner-claude](../runner-claude/)). The start is refused, or the brain is killed. |
 | `invalid_message` | `RunnerEvent::Error` | An undecodable `RunnerCommand` from nestd. It's skipped; the connection stays up. |
 | `agent_start_failed` | `RunnerEvent::Error` | A startup step failed or timed out (materialize, auth check, spawn). Retryable. |
