@@ -1446,6 +1446,8 @@ export class AgentDO extends DurableObject<Env> {
     const rows = this.sql.exec<{ agent: string }>("SELECT agent FROM children WHERE ended = 0 AND asked = 0").toArray();
     const results = await Promise.allSettled(rows.map(async ({ agent }) => {
       try {
+        // An ephemeral parent's default reaches its children as asked, with `by` this parent: harmless only because a
+        // sandbox this parent owns is its own hands, which it stays attached to until its children end. Don't rely on it.
         await this.agentStub(agent).end({ by: me, reason: "owner_ended", kill: true, destroy_sandbox: e.destroy_sandbox });
         this.sql.exec("UPDATE children SET asked = 1 WHERE agent = ?", agent);
       } catch (err) {
