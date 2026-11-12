@@ -2,7 +2,7 @@
 
 - **Worker HTTP API,** authenticated by [operator tokens](#operator-tokens), or by an [API client](clients/)'s token: an external system's scoped principal, which sees and acts only on what it created, within the operator's grant. The read-only [dashboard](../dashboard/) is a Worker of its own behind Cloudflare Access.
 - **External events** (webhooks, email) are external integrations, not platform routes ([principle 9](../../README.md#principles)): one delivers to an agent through its inbox. Agents schedule their own wakes with `wake_at`.
-- **Approvals:** a call the sink gate or a tool rule in `ask` mode holds is listed by `GET /v1/agents/<id>/asks` (`{ask, question, created_ms, approval?: {name, tool}}`, oldest first) and answered by `POST /v1/agents/<id>/asks/<ask>/answer {answer}`; the decision reaches the agent as an `ask_answer` turn. An API client answers its own subtree's. Agent events reach an API client's webhook ([events to the owner](clients/#events-to-the-owner)); the operator has no webhook yet.
+- **Approvals:** a call the sink gate or a tool rule in `ask` mode holds is listed by `GET /v1/agents/<id>/asks` (`{ask, question, created_ms, approval?: {name, tool}}`, oldest first) and answered by `POST /v1/agents/<id>/asks/<ask>/answer {answer}`; the decision reaches the agent as an `ask_answer` turn. An API client answers its own subtree's. Agent events reach an API client's webhook ([events to the owner](clients/#events-to-the-owner)); the operator has no webhook yet. Many agents' at once: [open asks across agents](#open-asks-across-agents).
 - **`nest` CLI on my machine:** `login` (the Access service token, and a binding per sandbox from SandboxDO's `resolve`), `attach` (a terminal: a WebSocket to the sandbox host's [gateway](../../sandbox/gateway/), then vsock), `logs -f`, `port-forward` (TCP over the same path), `diff <a> <b>`. The CLI reaches a sandbox the way a brain does, by hostname and binding. Not built: these commands (the CLI has only `hook`, `mcp` and the in-sandbox commands).
 - **Host authentication:**
   - A signed instance identity document (or a one-time enrollment token) is exchanged for a rotating host token. See [../../compute/provisioning/](../../compute/provisioning/).
@@ -15,6 +15,13 @@
   - **Agents:** `POST /v1/agents` takes an agent's cell from its sandbox when it has one; a cell that differs from the sandbox's is refused (409).
   - **Creates take an [`Idempotency-Key`](#idempotency-keys).**
   - **Compat (one release):** `POST /v1/sandboxes` and `POST /v1/agents` accept a `workstream` field and ignore it (old clients and scripts send it); the operator's `POST /v1/agents` refuses `overrides.params` with a 400 rather than drop it silently.
+
+## Open asks across agents
+
+**Decided (2026-11-11):** `GET /v1/asks` lists the open asks of many agents in one call, so an owner showing what waits on it (an app's "needs you") reads nest's record instead of keeping a copy that goes stale when an ask is answered elsewhere or its agent ends.
+- **Which agents:** the live ones of the caller's registry, as `GET /v1/agents` pages them: a client's own (ClientDO); the operator's, a client's (`?client=`) or else the cell's. `?label=key=value` filters (each must match), `?limit` agents per page (default 50, at most 100), `?cursor` the previous page's `next_cursor`. An ended agent's asks aren't listed: it takes no more turns.
+- **The answer:** `{asks: [{agent, cell, client, owner?, labels, ask, question, created_ms, approval?}], next_cursor}`, oldest first within the page; `owner` from a client's registry only. Every open ask of each agent on the page is listed (as `GET /v1/agents/<id>/asks` lists them).
+- **Read from each agent's AgentDO when asked,** one call each, in parallel: there is no index of asks to drift. An agent that can't answer fails the whole page (its error), so a page never leaves an ask out silently.
 
 ## Restarting on another model
 

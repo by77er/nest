@@ -79,6 +79,7 @@ The checks:
 | `GET` | `/v1/agents/<agent>/brokered` | Subtree. |
 | `GET` | `/v1/agents/<agent>/asks` | Subtree. |
 | `POST` | `/v1/agents/<agent>/asks/<ask>/answer` | Subtree. |
+| `GET` | `/v1/asks` | Its own registry's live agents only, as for `GET /v1/agents` ([open asks across agents](../#open-asks-across-agents)). |
 | `GET` | `/v1/agents/<agent>/timers` | Subtree ([timers](#timers)). |
 | `DELETE` | `/v1/agents/<agent>/timers/<name>` | Subtree. |
 | `POST` | `/v1/sandboxes` | Within the grant (`cells`, `max_sandboxes`, `inject_hosts`, `egress_hosts`, `github_push`, its own secrets). `policy` is the operator's (403). |
