@@ -65,20 +65,36 @@ def skip(name, why):
     log(f"SKIP {name} — {why}")
 
 
+# wrangler dev's proxy forwards each request to the worker on a pooled keep-alive connection, and the
+# worker's runtime closes one idle for 5 s (both workerd's defaults). A request the proxy sends on one the
+# worker is closing is lost before the worker reads it, and the proxy resends only a GET or HEAD itself:
+# any other method comes back as this text 500, from miniflare, never from the Worker (whose every error
+# is JSON, `errorResponse`). A busy runtime widens the race: after `start_control_plane`, the redelivery
+# scenario's next request came about 5 s after the health check, while the new runtime was busy.
+DEV_PROXY_LOST = "Error: Network connection lost."
+DEV_PROXY_RESENDS = 2
+
+
 def api(method, path, body=None, raw=False, timeout=30):
     data = None if body is None else json.dumps(body).encode()
-    req = urllib.request.Request(BASE + path, data=data, method=method,
-                                 headers={"authorization": f"Bearer {ADMIN}", "content-type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            text = r.read().decode()
-            return r.status, (text if raw else (json.loads(text) if text else None))
-    except urllib.error.HTTPError as e:
-        text = e.read().decode()
+    for attempt in range(DEV_PROXY_RESENDS + 1):
+        req = urllib.request.Request(BASE + path, data=data, method=method,
+                                     headers={"authorization": f"Bearer {ADMIN}", "content-type": "application/json"})
         try:
-            return e.code, json.loads(text)
-        except ValueError:
-            return e.code, text
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                text = r.read().decode()
+                return r.status, (text if raw else (json.loads(text) if text else None))
+        except urllib.error.HTTPError as e:
+            text = e.read().decode()
+            if e.code == 500 and text.startswith(DEV_PROXY_LOST) and attempt < DEV_PROXY_RESENDS:
+                # Never reached the Worker (DEV_PROXY_LOST): the same request again, on a new connection.
+                log(f"{method} {path}: lost in wrangler dev's proxy before the worker read it; sending it again")
+                time.sleep(0.25)
+                continue
+            try:
+                return e.code, json.loads(text)
+            except ValueError:
+                return e.code, text
 
 
 def wait_for(fn, timeout, interval=0.25, what=""):
