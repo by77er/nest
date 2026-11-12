@@ -41,6 +41,8 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- The review gate: no drift (one wording trim, "as before the gate"); review-trust.ts:1-45 (MAX_HELD 50, MAX_OVERFLOW 500, HELD_CHECK_INTERVAL_MS 60 s), needs_approval do/review.ts:131, policy :246, title :1044, routes api.ts:354-356, requests.ts:34.
+- Auto-merge: no drift (automerge.ts; merge_method default do/project.ts:354,664; retry api.ts:318; once-a-minute read do/project.ts:1617-1627; records :3820-3828; RATE_LIMITED github.ts:252-260; permissions github.ts:33-41).
 - Built: the review pipeline: no drift beyond the tombstone above (ROOM_TELL_AFTER_MS do/review.ts:44, room_waits :160,556, "Waiting for room…" :1053, external_id :863-865, review key :887, MAX_RETRIES :34, review_waiting_for_room do/project.ts:2389, OUTPUT_MAX/TITLE_MAX github.ts:470-472, app_id -1 github.ts:369-381, JOB_STATES review-job.ts:34, REVIEW_DEADLINE_MS :60, SEEN_KEEP_MS do/directory.ts:39).
 - Built: the core: one correction; client id nest.ts:97-102, keys do/project.ts:4075,4132 + nest.ts:162-165, backoff 5 s→5 min nest.ts:332, relayed brief do/project.ts:1680, call keys 24 h do/project.ts:320,3408, events 7 days do/directory.ts:39, no sessions mcp.ts:2, read_repos catalog.ts:123-137, deps test test/deps.test.ts:18 match.
 - The task machine: table and invariants match tasks.ts:4-143 and test/machine.test.ts:120-131 (only the B2/B3 wording changed); deleteTask do/project.ts:877-900.
