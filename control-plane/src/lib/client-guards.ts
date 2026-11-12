@@ -100,17 +100,36 @@ export const ClientGuards = z.array(ClientGuard).max(MAX_LIST_GUARDS).superRefin
 
 /**
  * What one sandbox applies of every client guard (its own layer's and its attached agents'), at most:
- * the policy goes to nest-proxy in one packet, and its guards are evaluated on every request to their hosts.
+ * the policy goes to nest-proxy in one packet, and its guards are evaluated on every request to their
+ * hosts, on workers the proxy shares with every sandbox on the host.
  */
 export const SANDBOX_MAX_GUARDS = 32;
 export const SANDBOX_MAX_SCOPE_MATCHERS = 64;
 export const SANDBOX_MAX_GUARD_BYTES = 64 * 1024;
+/**
+ * The matcher work a sandbox's client guards may ask of the proxy per request: each matcher (scope or
+ * exception) counts one, plus one per query parameter it names and one for a body field. nest-proxy
+ * bounds the request (`MAX_GUARDED_*` in crates/nest-proxy/src/guard.rs), and this bounds the matchers.
+ */
+export const SANDBOX_MAX_GUARD_WORK = 512;
+
+/** Why a sandbox's own layer alone is more than it applies (its create's, before any agent attaches); null when within. */
+export const layerOverLimit = (guards: readonly ClientGuard[]): string | null => sandboxGuardsOverLimit(distinctGuards(guards.map(wireGuard)));
+
+/** A guard's matcher work: each matcher one, plus its query parameters and its body field. */
+export function guardWork(g: Pick<RequestGuard, "scope" | "allow">): number {
+  return [...g.scope, ...(g.allow ?? [])].reduce((n, m) => n + 1 + (m.query?.length ?? 0) + (m.body_json ? 1 : 0), 0);
+}
 
 /** Why `guards` (wire form) are more than one sandbox applies; null when within. */
 export function sandboxGuardsOverLimit(guards: readonly RequestGuard[]): string | null {
   if (guards.length > SANDBOX_MAX_GUARDS) return `a sandbox applies at most ${SANDBOX_MAX_GUARDS} client guards (this would be ${guards.length})`;
   const scope = guards.reduce((n, g) => n + g.scope.length, 0);
   if (scope > SANDBOX_MAX_SCOPE_MATCHERS) return `a sandbox applies at most ${SANDBOX_MAX_SCOPE_MATCHERS} client guard scope matchers (this would be ${scope})`;
+  const work = guards.reduce((n, g) => n + guardWork(g), 0);
+  if (work > SANDBOX_MAX_GUARD_WORK) {
+    return `a sandbox's client guards ask at most ${SANDBOX_MAX_GUARD_WORK} matcher work (a matcher 1, plus 1 per query parameter and body field; this would be ${work})`;
+  }
   if (bytes(guards) > SANDBOX_MAX_GUARD_BYTES) return `a sandbox applies at most ${SANDBOX_MAX_GUARD_BYTES} bytes of client guards`;
   return null;
 }
@@ -158,13 +177,14 @@ export function wireGuard(g: ClientGuard): RequestGuard {
 }
 
 /**
- * The guards with no host the operator lets through uninspected (passthrough), and a guard left with no
- * host dropped. nest-proxy inspects every guarded host, so a client's guard on a passthrough host would
- * change how the operator routes it (and make an operator binding there injectable); the operator's
- * choice stands, as for a client's egress rules.
+ * The guards with no host the operator routes around inspection (`routed`: its passthrough entries and
+ * its TCP exceptions' hosts), and a guard left with no host dropped. nest-proxy inspects every guarded
+ * host, never splices it and refuses its TCP exceptions, so a client's guard there would change how the
+ * operator routes it (and make an operator binding on a spliced host injectable); the operator's choice
+ * stands, as for a client's egress rules.
  */
-export function outsidePassthrough(guards: readonly RequestGuard[], passthrough: readonly string[]): RequestGuard[] {
-  const spliced = (h: string) => passthrough.some((p) => p === h || hostPatternMatches(p, h) || hostPatternMatches(h, p));
+export function outsideOperatorRouting(guards: readonly RequestGuard[], routed: readonly string[]): RequestGuard[] {
+  const spliced = (h: string) => routed.some((p) => p === h || hostPatternMatches(p, h) || hostPatternMatches(h, p));
   return guards.flatMap((g) => {
     const hosts = g.hosts.filter((h) => !spliced(h));
     if (!hosts.length) return [];

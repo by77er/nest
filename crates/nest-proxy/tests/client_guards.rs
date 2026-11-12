@@ -24,7 +24,7 @@ fn decide(p: &EgressPolicy, host: &str, method: &str, target: &str, body: Option
         (Some(_), Some(v)) => BodyView::Json(v),
         (Some(_), None) => BodyView::Unknown,
     };
-    refusing(&p.guards, &req, &view).map(|g| g.name.clone())
+    refusing(&p.guards, &req.prepare().unwrap(), &view).map(|g| g.name.clone())
 }
 
 #[test]

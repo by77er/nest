@@ -875,7 +875,8 @@ export function expandSpec(
     const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, inject: _i, github_push: _g, egress: _x, guards: _gd, ...rest } = base.value;
     const push = o.data.github_push?.workflows === false ? undefined : base.value.github_push;
     // Its guards join the template's, held as its subtree's client's: a spawner adds refusals, never removes one.
-    const guards = [...(base.value.guards ?? []), ...holdGuards(ns === null ? null : clients[ns] ?? null, o.data.guards ?? [])];
+    if (o.data.guards?.length && ns !== null && !Object.hasOwn(clients, ns)) return err(`template ${spec.template}: no client is named ${ns}`);
+    const guards = [...(base.value.guards ?? []), ...holdGuards(ns === null ? null : clients[ns]!, o.data.guards ?? [])];
     const extras = {
       ...(inject.value.length ? { inject: inject.value } : {}), ...(push ? { github_push: push } : {}),
       ...(egress.value.length ? { egress: { allow: egress.value } } : {}), ...(guards.length ? { guards } : {}),

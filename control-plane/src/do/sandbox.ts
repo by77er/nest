@@ -30,7 +30,7 @@ import { GITHUB_BINDING, GITHUB_READ_BINDING, githubEgress, GithubPush, readBind
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
 import { slotEnv } from "../lib/sandbox-env";
-import { CLIENT_GUARD_PREFIX, type ClientGuard, distinctGuards, type HeldGuard, outsidePassthrough, sandboxGuardsOverLimit, wireGuard } from "../lib/client-guards";
+import { CLIENT_GUARD_PREFIX, type ClientGuard, distinctGuards, type HeldGuard, layerOverLimit, outsideOperatorRouting, sandboxGuardsOverLimit, wireGuard } from "../lib/client-guards";
 import type { MintedInjection } from "./broker";
 import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
 import {
@@ -451,6 +451,9 @@ export class SandboxDO extends DurableObject<Env> {
 
   /** Create (idempotent) and place the sandbox; the first placement grants epoch 1. */
   async create(req: CreateSandbox): Promise<SandboxInfo> {
+    // Its own guards within what a sandbox applies: refused before anything is written (its caller gives its client's place back).
+    const over = req.guards?.length ? layerOverLimit(req.guards) : null;
+    if (over) throw new NestError(ErrorCodes.INVALID_MESSAGE, over);
     // The cell's registry is the authority for which sandboxes exist (its GC roots): registered
     // before anything can be written for the sandbox, and again on a retried create, but never
     // again once destroyed (its registry row may already be pruned).
@@ -1202,7 +1205,7 @@ export class SandboxDO extends DurableObject<Env> {
       limits: DEFAULT_LIMITS,
       // The operator's guards first (a request both refuse names the operator's), then its client's:
       // every guard must let a request through, so a client's can only refuse more.
-      guards: [...gh.guards, ...(ws.guards ?? []), ...outsidePassthrough(this.clientGuards(), ws.passthrough)],
+      guards: [...gh.guards, ...(ws.guards ?? []), ...outsideOperatorRouting(this.clientGuards(), [...ws.passthrough, ...ws.tcp.map((t) => t.host)])],
     };
   }
 

@@ -4,13 +4,15 @@
 // named `client:<name>`, after the operator's, its `injected` naming the client's own bindings. A guard
 // only refuses: nest-proxy's evaluator (crates/nest-proxy/tests/client_guards.rs, on the same fixture)
 // shows a client's exceptions never exempt a request from the operator's guards. The pure checks first.
-import { env, SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import fixture from "../../protocol/fixtures/control/egress_policy/egress_policy.client_guards.json";
 import {
-  ClientGuard, ClientGuards, distinctGuards, holdGuards, MAX_LIST_BYTES, outsidePassthrough, PathPattern, SANDBOX_MAX_GUARDS, sandboxGuardsOverLimit,
-  wireGuard, type ClientGuard as ClientGuardT,
+  ClientGuard, ClientGuards, distinctGuards, guardWork, holdGuards, MAX_LIST_BYTES, outsideOperatorRouting, PathPattern, SANDBOX_MAX_GUARDS,
+  sandboxGuardsOverLimit, wireGuard, type ClientGuard as ClientGuardT,
 } from "../src/lib/client-guards";
+import { expandSpec, type Template } from "../src/lib/spec";
+import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { SandboxPolicyLayer } from "../src/do/sandbox";
 import type { RequestGuard } from "../src/protocol/model";
 import { adminJson, BASE, connectHost, nextCommands, uniqueCell, type Ws } from "./helpers";
@@ -92,16 +94,36 @@ describe("client request guards (pure)", () => {
     expect(sandboxGuardsOverLimit(wire(SANDBOX_MAX_GUARDS + 1))).toContain("at most 32 client guards");
     expect(sandboxGuardsOverLimit(wire(16, 4))).toBeNull();
     expect(sandboxGuardsOverLimit(wire(17, 4))).toContain("scope matchers");
+    // Exceptions count too, with their query parameters and body fields: the review's 534 exceptions of
+    // four query names and a body field each, in a few guards, is far past it.
+    const heavy = (n: number) => wireGuard({ ...writes(`h${n}`), allow: Array.from({ length: 60 }, () => ({ query: [1, 2, 3, 4].map((i) => ({ name: `q${i}` })), body_json: { pointer: "/op", values: ["read"] } })) });
+    expect(guardWork(heavy(0))).toBe(1 + 60 * 6);
+    expect(sandboxGuardsOverLimit([heavy(0)])).toBeNull();
+    expect(sandboxGuardsOverLimit([heavy(0), heavy(1)])).toContain("matcher work");
+    expect(sandboxGuardsOverLimit(wire(32))).toBeNull();
   });
 
-  it("a guard on a host the operator splices loses that host (the operator's routing stands); identical guards count once, same names don't merge", () => {
+  it("a guard on a host the operator splices or routes as TCP loses that host (the operator's routing stands); identical guards count once, same names don't merge", () => {
     const g = (hosts: string[]): RequestGuard => ({ name: "client:g", hosts, scope: [{}] });
-    expect(outsidePassthrough([g(["a.example.com", "b.example.com"])], ["a.example.com"])).toEqual([g(["b.example.com"])]);
-    expect(outsidePassthrough([g(["*.example.com"])], ["x.example.com"])).toEqual([]);
-    expect(outsidePassthrough([g(["x.example.com"])], ["*.example.com"])).toEqual([]);
-    expect(outsidePassthrough([g(["x.example.com"])], [])).toEqual([g(["x.example.com"])]);
+    expect(outsideOperatorRouting([g(["a.example.com", "b.example.com"])], ["a.example.com"])).toEqual([g(["b.example.com"])]);
+    expect(outsideOperatorRouting([g(["*.example.com"])], ["x.example.com"])).toEqual([]);
+    expect(outsideOperatorRouting([g(["x.example.com"])], ["*.example.com"])).toEqual([]);
+    expect(outsideOperatorRouting([g(["x.example.com"])], [])).toEqual([g(["x.example.com"])]);
     expect(distinctGuards([g(["a.example.com"]), g(["a.example.com"]), g(["b.example.com"])])).toEqual([g(["a.example.com"]), g(["b.example.com"])]);
     expect(holdGuards("cli_x", [writes("w")])).toEqual([{ ...writes("w"), client: "cli_x" }]);
+  });
+
+  it("a spawn's guards are held as its subtree's client's, and a subtree with no client is refused", () => {
+    const tpl = { capabilities: [], launch: LAUNCH, hands: "optional", credential: "claude_oauth_token" } as unknown as Template;
+    const catalog = { capabilities: {}, templates: { t: tpl } };
+    const spawn = { template: "t", hands: false, by: "spawner" as const, overrides: { guards: [writes("w")] } };
+    const held = expandSpec(catalog, PLATFORM_TOOL_NAMES, spawn, { acme: "cli_acme" }, "acme");
+    expect(held.ok && held.value.guards).toEqual([{ ...writes("w"), client: "cli_acme" }]);
+    const none = expandSpec(catalog, PLATFORM_TOOL_NAMES, spawn, {}, "ghost");
+    expect(none.ok ? "expanded" : none.error).toContain("no client is named ghost");
+    // The operator's subtree: the operator's.
+    const op = expandSpec(catalog, PLATFORM_TOOL_NAMES, spawn, {}, null);
+    expect(op.ok && op.value.guards).toEqual([{ ...writes("w"), client: null }]);
   });
 });
 
@@ -228,10 +250,39 @@ describe("client request guards on a sandbox", () => {
     expect(names(await stub.policy())).toEqual(before);
   });
 
-  it("a client's guard never changes how the operator routes a passthrough host", async () => {
+  it("a create past the sandbox's bound is refused (400) and creates nothing", async () => {
     const c = await newClient();
-    const s = await placed(c, { guards: [{ ...writes("w"), hosts: ["pinned.example.com", "files.example.com"] }] });
-    await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { allow: [{ host: "pinned.example.com" }], passthrough: ["pinned.example.com"] } });
+    const eight = (i: number): ClientGuardT => ({ ...writes(`g${i}`), scope: Array.from({ length: 8 }, (_, j) => ({ methods: [`M${"ABCDEFGH"[j]}`] })) });
+    const r = await as(c.token, "/v1/sandboxes", { body: { cell: c.cell, guards: Array.from({ length: 16 }, (_, i) => eight(i)) } });
+    expect(r.status).toBe(400);
+    expect(r.body.error.message).toContain("scope matchers");
+    // Its client admitted no place for it: the registry is as empty as before, and a create within the bound still goes.
+    expect((await ok(c.token, "/v1/sandboxes")).sandboxes).toEqual([]);
+    expect((await as(c.token, "/v1/sandboxes", { body: { cell: c.cell, guards: Array.from({ length: 8 }, (_, i) => eight(i)) } })).status).toBeLessThan(300);
+    // And SandboxDO refuses it too, whoever calls it.
+    const id = `sbx_${rand()}`;
+    await expect(Promise.resolve().then(() => env.SANDBOX.get(env.SANDBOX.idFromName(id)).create({
+      sandbox: id, cell: c.cell, client: c.id, guards: Array.from({ length: 16 }, (_, i) => eight(i)),
+    }))).rejects.toThrow(/scope matchers/);
+  });
+
+  it("an agent's guards leave the sandbox's store at its detach", async () => {
+    const c = await newClient();
+    const s = await placed(c);
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    await stub.attach("agt_kept", undefined, [], [], { guards: holdGuards(c.id, [PUSH]) });
+    await stub.attach("agt_gone", undefined, [], [], { guards: holdGuards(c.id, [API_WRITE]) });
+    await stub.detach("agt_gone");
+    const stored = await runInDurableObject(stub, (_i, st) =>
+      JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'agent_guards'").one().value) as Record<string, unknown>);
+    expect(Object.keys(stored)).toEqual(["agt_kept"]);
+  });
+
+  it("a client's guard never changes how the operator routes a passthrough host or a TCP exception", async () => {
+    const c = await newClient();
+    const s = await placed(c, { guards: [{ ...writes("w"), hosts: ["pinned.example.com", "db.example.com", "files.example.com"] }] });
+    await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: {
+      allow: [{ host: "pinned.example.com" }], passthrough: ["pinned.example.com"], tcp: [{ host: "db.example.com", port: 5432 }] } });
     const g = (await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`)).guards.find((x: RequestGuard) => x.name === "client:w");
     expect(g.hosts).toEqual(["files.example.com"]);
   });

@@ -82,7 +82,7 @@ The checks:
 | `GET` | `/v1/asks` | Its own registry's live agents only, as for `GET /v1/agents` ([open asks across agents](../#open-asks-across-agents)). |
 | `GET` | `/v1/agents/<agent>/timers` | Subtree ([timers](#timers)). |
 | `DELETE` | `/v1/agents/<agent>/timers/<name>` | Subtree. |
-| `POST` | `/v1/sandboxes` | Within the grant (`cells`, `max_sandboxes`, `inject_hosts`, `egress_hosts`, `github_push`, its own secrets). `policy` is the operator's (403). `guards` need no grant ([request guards](#request-guards)). |
+| `POST` | `/v1/sandboxes` | Within the grant (`cells`, `max_sandboxes`, `inject_hosts`, `egress_hosts`, `github_push`, its own secrets). `policy` is the operator's (403). `guards` need no grant, only the sandbox's bounds (400) ([request guards](#request-guards)). |
 | `GET` | `/v1/sandboxes` | Its own registry only, as for agents. |
 | `GET` | `/v1/sandboxes/<sandbox>` | Subtree. |
 | `DELETE` | `/v1/sandboxes/<sandbox>` | Subtree. Destroys it whatever is attached. |
@@ -325,15 +325,22 @@ An agent with the [`timers`](../../../agents/capabilities/timers/) capability se
   - `guards` in **`POST /v1/sandboxes`**.
   - The live sandbox's [client layer](#the-client-layer).
 
-  The operator's templates and sandboxes may set them too, as they may egress rules.
-- **No grant covers them:** a guard only takes away. **A sandbox applies** at most 32 client guards, 64 scope matchers and 64 KiB of them (its own layer's and its attached agents', each distinct guard once); a layer write or an agent's attach that would pass that is refused (400), and nothing is stored.
+  The operator's templates, overrides and sandboxes may set them too, as they may egress rules. Those are client guards as well: on the wire `client:<name>`, their `injected` naming the sandbox's client's binding (`client:<b>`), and applied in any sandbox (the operator's own guards go in a sandbox's `policy.guards`).
+- **No grant covers them:** a guard only takes away. **A sandbox applies** at most 32 client guards, 64 scope matchers, 512 matcher work (each matcher, scope or exception, counts 1, plus 1 per query parameter and 1 for a body field) and 64 KiB of them, its own layer's and its attached agents', each distinct guard once. A create, a layer write or an agent's attach that would pass that is refused (400), and nothing is stored.
+- **An agent's guards count toward that budget** while it is attached, so agents spawned into a sandbox (an agent's `agent_spawn` sharing its own, or a spawn's `overrides.guards`) can fill it, after which the next attach or layer write that adds guards is refused. Keep a template's guards small where its agents share sandboxes.
+- **nest-proxy bounds the request too:** on a host a guard names, a path over 4096 bytes or 256 segments or a query over 8192 bytes or 256 parameters is refused (414 `request_target_too_long`), whoever's guard names the host ([request guards](../../../sandbox/networking/egress/policy/#request-guards)). A client's guard on a host it uses with long URLs makes them fail there.
 - **They can only refuse.** nest-proxy refuses a request when any guard does, and a guard's `allow` applies only within its own scope, so a client's exception never exempts a request from the operator's guards, the GitHub rules or another layer's ([client guards](../../../sandbox/networking/egress/policy/#client-guards)).
 - **On the sandbox:**
   - In the policy (`GET /v1/sandboxes/<id>/policy`, and what nest-proxy gets) each is an ordinary guard named `client:<name>`, after the operator's. The operator's layer can't name a guard `client:…` (400).
   - An attached agent's guards count only when they are its sandbox's client's or the operator's (an operator template's, or the operator's overrides): another subtree's spec adds none, as for bindings. The spec shows whose each is (`client`: its client's id, or null).
-  - A guard drops any host the operator marks passthrough (equal to, under or covering an entry): a guarded host is always inspected, so otherwise a client's guard would change how the operator routes it.
+  - A guard drops any host the operator marks passthrough or routes as a TCP exception (equal to, under or covering one): a guarded host is always inspected, never spliced and never a TCP exception, so otherwise a client's guard would change how the operator routes it.
 - **No host change:** on the wire a client's guard is a `RequestGuard` like any other (`protocol/fixtures/control/egress_policy/egress_policy.client_guards.json`; nest-proxy's `tests/client_guards.rs`).
-- **Compatibility:** a control plane of the previous release refuses `guards` (400, an unrecognized key) in a client layer, a sandbox spec and spawn overrides, and drops them from a stored template when it reads it. Send them only to a control plane whose `GET …/client-policy` answers `guards`.
+- **Compatibility, and failing open on the previous release:** a control plane of the previous release (a rollback) handles `guards` two ways.
+  - **Refused (400, an unrecognized key):** `PUT …/client-policy` and a client's spawn overrides (`POST /v1/agents`).
+  - **Silently dropped, with a 2xx:** `POST /v1/sandboxes`, a template's write (`PUT /v1/catalog/templates/…`) and the operator's spawn overrides. The sandbox, template or agent is made without the guards, so their refusals don't apply.
+  - It also leaves stored guards out of each policy it pushes (it reads neither the sandbox's keys nor a spec's `guards`, and strips them from templates).
+
+  So an app that depends on a guard checks that it applies: `GET /v1/sandboxes/<id>/policy` shows each as `client:<name>`, and `GET …/client-policy` answers `guards` only on a control plane that has them. Send them only to one that does.
 
 ## Environment
 
