@@ -7,6 +7,7 @@ Base: origin/main 6bbf64f.
 |---|---|---|---|
 | Pieces | MCP server at `/mcp/<role>` | the path segment is the server's name (board, task, review, routine), not the role | projects/src/tools.ts:8, projects/src/mcp.ts:31 |
 | The MCP server | a worker reads its task, posts progress, blocks/clears, reports its PR | the task server also has `request_secret`, `memory_list`, `memory_get` | projects/src/tools.ts:145,153 |
+| Retention | ReviewDO keeps an ended job whose check update is still owed | it also keeps one whose waiting-for-room error's clearing is still owed (`room_told_ms IS NULL` in the prune) | projects/src/do/review.ts:788-791 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
@@ -21,4 +22,5 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Retention: one correction. Agents that exit before they're named: no drift (early_exits in project.ts:545,3095,3170,4151; review.ts:144,635).
 - MCP tools across the whole doc (names, servers, parameters, limits): all match except the above.
