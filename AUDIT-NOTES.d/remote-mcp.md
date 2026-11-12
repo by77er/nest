@@ -1,0 +1,3 @@
+## No drift: docs/interfaces/remote-mcp/README.md
+Versions (control-plane/src/lib/mcp.ts:14-15), 1 MiB (mcp.ts:26), 10 pages (mcp.ts:447), redirect manual (mcp.ts:374, mcp-auth.ts:197), clientInfo (mcp.ts:435), `nest-connector` and 60 s relist (control-plane/src/do/mcp-connector.ts:26,170), `_meta` keys (control-plane/src/lib/mcp-proxy.ts:508), identity TTL 300 s, reuse 4 min, JWKS max-age 300 (control-plane/src/lib/identity.ts:16-27), routes /.well-known/jwks.json, /v1/oauth/client.json, /v1/oauth/callback auth none (control-plane/src/index.ts:720-735). External links fetched: MCP transports spec 2025-11-25 resolves and defines the headers used.
+STATUS: DONE
