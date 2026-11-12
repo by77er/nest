@@ -31,6 +31,8 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Network: no drift (presets network.ts:39-46, ports :24, OUTSIDE :54, clientLayerFor :152; PUT network 403/400 api.ts:454-475; frozen_egress/network_rev do/project.ts:412-415; sidebar order ui/features/shell/Sidebar.test.tsx:98; strings NetworkPage.tsx:123,178,298; sources :370-373; nest's /policy route control-plane/src/index.ts:836).
+- Built-in tools: no drift (catalog.ts:19-38,106-107,130-134,178-182; control-plane/src/lib/grants.ts has no rules check).
 - Models: one wording fix; settings/defaults/ids (models.ts:10-31, requests.ts:49-50), templates (models.ts:56-60, catalog.ts:126-151), sweep (do/project.ts:1945-2014, outbox.ts:103), switch (nest.ts:197-199, do/project.ts:598-603,3951-4043), nest's 5 failures (control-plane/src/do/agent.ts:85-90) match.
 - The repo's binding: no drift (do/directory.ts:65-112,255-356; binding.ts:19-95; api.ts:58-115; ui/features/admin/BindingsSection.tsx).
 - Creating a project: one correction; steps creation.ts:51-65, 503 api.ts:181, grace do/directory.ts:139 match.
