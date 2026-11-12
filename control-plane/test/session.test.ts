@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { bytesToB64 } from "../src/lib/util";
 import type { AgentDO } from "../src/do/agent";
 import { CallLedger } from "../src/lib/calls";
+import { SEED_BUILTIN_RULES } from "../src/lib/spec";
 import { admin, adminJson, connectHost, eventually, nextCommands, received, runDue, sessionGone, sleep, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
@@ -62,8 +63,9 @@ describe("session channel", () => {
     const { ws, ack } = await connectRunner(s.agent, s.host.host, s.host.host_token);
     expect(ack).toMatchObject({ durable_bytes: 0 });
     const cache = await ws.next("cache_update");
-    // A seeded worker's rules: its nest tools without a prompt (it launches without `Agent`, so no subagent rule).
-    expect(cache.cache.rules).toEqual([{ pattern: "mcp__nest__*", decision: "allow" }]);
+    // A seeded worker's rules: its nest tools and the built-ins it launches without a prompt (it launches
+    // without `Agent`, so no subagent rule).
+    expect(cache.cache.rules).toEqual([{ pattern: "mcp__nest__*", decision: "allow" }, ...SEED_BUILTIN_RULES]);
 
     const t1 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "first" } }, 201)).turn;
     const t2 = (await adminJson(`/v1/agents/${s.agent}/turns`, { body: { text: "second" } }, 201)).turn;
