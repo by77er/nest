@@ -22,6 +22,7 @@ Base: origin/main 6bbf64f.
 | Outboxes | one-off cleanup "which deleting a draft left before the task machine. Nothing updates them now" | the migration drops orphaned PR rows | projects/src/do/project.ts:516 |
 | The manager lifecycle | "a manager that ended used to stay the project's manager" (tombstone) | stated as the rule | projects/src/manager.ts:85-101 |
 | Creating a project; Built: the review pipeline; The UI (task drawer) | change-history sentences ("used to be four awaited steps", "Before this, such a job failed…", "it was a third before…") | stated as current rules only | AGENTS.md Docs rules (no tombstones) |
+| Built: the core (Retries) | a worker refused for good is "a 4xx" | a 4xx that isn't retryable, 408 or 429 (`at_capacity`) | projects/src/nest.ts:27-30 |
 
 ## Tools the README never names
 - `/mcp/board`: `list_tasks`, `get_task`, `create_task`, `write_spec`, `update_task`, `cancel_task` (no README list is meant to be complete for the manager's tools; listed here, not added).
@@ -40,6 +41,7 @@ Base: origin/main 6bbf64f.
 - projects/src/mcp.ts:1 header comment lists /mcp/board, /mcp/task, /mcp/review but not /mcp/routine (code comment; not changed).
 
 ## Sections done
+- Built: the core: one correction; client id nest.ts:97-102, keys do/project.ts:4075,4132 + nest.ts:162-165, backoff 5 s→5 min nest.ts:332, relayed brief do/project.ts:1680, call keys 24 h do/project.ts:320,3408, events 7 days do/directory.ts:39, no sessions mcp.ts:2, read_repos catalog.ts:123-137, deps test test/deps.test.ts:18 match.
 - The task machine: table and invariants match tasks.ts:4-143 and test/machine.test.ts:120-131 (only the B2/B3 wording changed); deleteTask do/project.ts:877-900.
 - Outboxes: table matches OUTBOX (outbox.ts:95-113), states/events outbox.ts:9-26, stopRefused nest.ts:350-356, routes api.ts:413-417, chat_request do/project.ts:510, SPINNER_AFTER_MS ui/features/chat/ChatView.tsx:210; two tombstones removed.
 - The manager lifecycle: MANAGER_RESTARTS=3/hour manager.ts:63-64, restart route api.ts:348, "The previous manager" ui/features/attention/AskItem.tsx:32, 'manager replaced' stop do/project.ts:3899; one tombstone removed.
