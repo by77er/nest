@@ -167,7 +167,10 @@ export interface Blocked {
 export type Attention = ({ kind: "ask" } & Ask) | ({ kind: "blocked"; task: string; title: string; state: TaskState } & Blocked) | ({ kind: "secret" } & SecretRequest)
   // What waits for triage (README.md#triage): one item, as old as the oldest of them: the repo's issues
   // (`count`) and the tasks routines proposed (`proposals`).
-  | { kind: "triage"; count: number; proposals: number; at_ms: number };
+  | { kind: "triage"; count: number; proposals: number; at_ms: number }
+  // nest couldn't be read for the agents' asks (README.md#asks): the rest is listed, and this says the asks
+  // are unknown. Not something waiting: never counted.
+  | { kind: "asks_unavailable"; error: string; at_ms: number };
 
 /** An issue of the repo in triage (README.md#triage): its title and body are anyone's, kept as data. */
 export interface Issue {
@@ -2086,20 +2089,35 @@ export class ProjectDO extends DurableObject<Env> {
     return ok(this.toTask(this.taskRow(id)!));
   }
 
-  /** What's waiting on the owner: open asks and blocked tasks, together, oldest first. */
+  /**
+   * What's waiting on the owner: open asks and the app's own items (`localAttention`), together, oldest
+   * first. nest not answering for the asks lists the rest with an `asks_unavailable` marker, never nothing.
+   */
   async attention(): Promise<Result<Attention[]>> {
+    const local = this.localAttention();
+    if (!local.ok) return local;
     const asks = await this.asks();
-    if (!asks.ok) return asks;
+    if (!asks.ok && asks.status !== 502) return asks;
+    const open = asks.ok
+      ? asks.value.map((a): Attention => ({ kind: "ask", ...a }))
+      : [{ kind: "asks_unavailable", error: asks.error, at_ms: 0 } as Attention];
+    // Read again after the await: a block or request made meanwhile is listed too.
+    const now = this.localAttention();
+    return ok([...open, ...(now.ok ? now.value : local.value)].sort((a, b) => a.at_ms - b.at_ms));
+  }
+
+  /** The app's own items waiting on the owner, without nest: blocked tasks, secret requests, triage. */
+  localAttention(): Result<Attention[]> {
+    if (!this.settings()) return fail(404, "unknown project");
     const blocked = this.sql.exec(`${TASK_SELECT} WHERE t.blocked_ms IS NOT NULL`).toArray().map((r): Attention => ({
       kind: "blocked", task: r.id as string, title: r.title as string, state: r.state as TaskState, ...blockedOf(r)!,
     }));
-    const open = asks.value.map((a): Attention => ({ kind: "ask", ...a }));
     const secrets = this.sql.exec("SELECT * FROM secret_requests WHERE done_ms IS NULL").toArray().map((r): Attention => ({ kind: "secret", ...requestOf(r) }));
     const t = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(opened_ms) AS at FROM issues WHERE state = 'untriaged'").one();
     const pr = this.sql.exec<{ n: number; at: number | null }>("SELECT COUNT(*) AS n, MIN(created_ms) AS at FROM proposals WHERE state = 'untriaged'").one();
     const oldest = [t.at, pr.at].filter((x): x is number => x !== null);
     const triage: Attention[] = t.n + pr.n ? [{ kind: "triage", count: t.n, proposals: pr.n, at_ms: oldest.length ? Math.min(...oldest) : Date.now() }] : [];
-    return ok([...open, ...blocked, ...secrets, ...triage].sort((a, b) => a.at_ms - b.at_ms));
+    return ok([...blocked, ...secrets, ...triage]);
   }
 
   // --- chat and approvals ----------------------------------------------------------------------------
@@ -2178,7 +2196,7 @@ export class ProjectDO extends DurableObject<Env> {
         ask: a.ask, agent: a.agent, role, task: a.labels.task ?? null, question: a.question ?? null, approval: a.approval ?? null,
         at_ms: a.created_ms, previous: role === "manager" && a.agent !== manager,
       };
-    }).sort((x, y) => x.at_ms - y.at_ms));
+    }));
   }
 
   /**
@@ -2239,9 +2257,14 @@ export class ProjectDO extends DurableObject<Env> {
         if (route.role === "worker") this.workerExited(e.agent, e.reason, e.text);
         this.sql.exec("DELETE FROM agent_secrets WHERE agent = ?", e.agent);
         break;
-      // An ask is nest's alone (README.md#asks): read from nest when "Needs you" is, never kept here, so its
-      // event changes nothing. (The `asks` table is no longer read or written; a later release drops it.)
+      // An ask is nest's alone (README.md#asks): read from nest when "Needs you" is. Its row here is written
+      // and never read, for one release, so a rollback to the release before still lists asks raised meanwhile;
+      // a later release drops the write and the table.
       case "agent.ask":
+        this.sql.exec(
+          "INSERT OR IGNORE INTO asks (ask, agent, role, task, question, approval, at_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+          e.ask, e.agent, route.role, route.task, e.question ?? null, e.approval === undefined ? null : JSON.stringify(e.approval), Date.now(),
+        );
         break;
       case "agent.error": {
         this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, ?, ?, ?, ?, ?)",

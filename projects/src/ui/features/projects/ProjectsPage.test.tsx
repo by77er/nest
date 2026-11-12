@@ -38,6 +38,15 @@ describe("projects", () => {
     expect(screen.getByRole("link", { name: "Widgets" })).toHaveAttribute("href", "/projects/prj_one/manager");
   });
 
+  it("nest unreadable for the asks: the count is unknown, said so, never shown as nothing", async () => {
+    const api = new FakeApi();
+    api.asksError = "nest 503";
+    renderApp("/projects", api);
+    const badge = await screen.findByRole("link", { name: /Couldn't check what needs you/ });
+    expect(badge).toHaveAttribute("href", "/projects/prj_one/board");
+    expect(document.querySelector("[data-marker=needs-you]")).toBeNull();
+  });
+
   it("creates one with its settings, refusing a malformed repo first, then opens it", async () => {
     const api = new FakeApi();
     api.projects = [];

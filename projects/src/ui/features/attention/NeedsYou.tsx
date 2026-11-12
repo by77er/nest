@@ -8,7 +8,7 @@ import { Button, Collapse, Divider, Text, Textarea } from "@mantine/core";
 import { IconAlertTriangle } from "@tabler/icons-react";
 import { useState } from "react";
 import { useAnswerBlocked, useAttention, useProject } from "../../api/queries";
-import type { Attention } from "../../api/types";
+import { splitAttention, type Waiting } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
@@ -19,7 +19,7 @@ import { triageSource, triageWaits } from "../triage/words";
 import { AskItem } from "./AskItem";
 import { SecretRequestItem } from "./SecretRequestItem";
 
-type BlockedItem = Extract<Attention, { kind: "blocked" }>;
+type BlockedItem = Extract<Waiting, { kind: "blocked" }>;
 
 function BlockedTask({ projectId, item }: { projectId: string; item: BlockedItem }) {
   const answer = useAnswerBlocked(projectId);
@@ -73,7 +73,7 @@ function BlockedTask({ projectId, item }: { projectId: string; item: BlockedItem
 /** How many items show before "Show all": enough to act on, without pushing the board below the fold. */
 export const SHOWN = 3;
 
-function Item({ projectId, x, first, explain }: { projectId: string; x: Attention; first: boolean; explain: boolean }) {
+function Item({ projectId, x, first, explain }: { projectId: string; x: Waiting; first: boolean; explain: boolean }) {
   const project = useProject(projectId);
   return (
     <Stack gap="lg">
@@ -86,7 +86,7 @@ function Item({ projectId, x, first, explain }: { projectId: string; x: Attentio
   );
 }
 
-const keyOf = (x: Attention) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.kind === "triage" ? "triage" : x.kind === "review" ? `review-${x.pr}-${x.sha}` : x.kind === "review_backlog" ? "review-backlog" : x.id);
+const keyOf = (x: Waiting) => (x.kind === "ask" ? x.ask : x.kind === "blocked" ? `blocked-${x.task}` : x.kind === "triage" ? "triage" : x.kind === "review" ? `review-${x.pr}-${x.sha}` : x.kind === "review_backlog" ? "review-backlog" : x.id);
 
 /** PRs past the review queue's limits, with no job yet: how many, and what frees them (README.md#the-review-gate). */
 function ReviewBacklogItem({ count, at_ms }: { count: number; at_ms: number }) {
@@ -127,8 +127,9 @@ export function NeedsYou({ projectId }: { projectId: string }) {
   const attention = useAttention(projectId);
   const [all, setAll] = useState(false);
   // Oldest first, as the Worker answers; the rest behind "Show all", collapsing in 180 ms.
-  const items = [...(attention.data ?? [])].sort((a, b) => a.at_ms - b.at_ms);
-  if (items.length === 0) return null;
+  const split = splitAttention(attention.data);
+  const items = [...split.items].sort((a, b) => a.at_ms - b.at_ms);
+  if (items.length === 0 && split.asksError === null) return null;
   // The held reviews' explanation is said once, on the first of them.
   const firstHeld = items.find((x) => x.kind === "review");
   const shown = items.slice(0, SHOWN);
@@ -137,6 +138,12 @@ export function NeedsYou({ projectId }: { projectId: string }) {
     <Panel tone="warning" component="section" aria-label="Needs you" aria-live="polite">
       <Section title="Needs you" count={items.length} icon={IconAlertTriangle} iconColor="warning" region={false}>
         <Stack gap="lg">
+          {/* nest couldn't be read for the agents' asks: what's listed is the rest, and the next poll tries again. */}
+          {split.asksError !== null && (
+            <Text fz="sm" c="dimmed" data-asks-unavailable>
+              The agents' asks couldn't be read from nest, so any they have aren't listed here. Trying again.
+            </Text>
+          )}
           {shown.map((x, i) => (
             <Item key={keyOf(x)} projectId={projectId} x={x} first={i === 0} explain={x === firstHeld} />
           ))}

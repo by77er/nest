@@ -37,6 +37,10 @@ async function setup() {
 type S = Awaited<ReturnType<typeof setup>>;
 const stub = (s: S) => env.PROJECT.get(env.PROJECT.idFromName(s.id));
 
+const ok = (r: { status: number; result?: any }) => {
+  expect(r.result?.isError, JSON.stringify(r.result)).toBeFalsy();
+  return r.result;
+};
 const askId = () => `ask_${rand()}`;
 const asks = async (s: S) => (await api(token, "GET", `/api/projects/${s.id}/asks`)).body as { ask: string; agent: string; role: string | null; task: string | null; at_ms: number; previous: boolean }[];
 const attention = async (s: S) => (await api(token, "GET", `/api/projects/${s.id}/attention`)).body as { kind: string; ask?: string }[];
@@ -94,6 +98,8 @@ describe("asks are nest's, read when asked", () => {
     const theirs = askId();
     holdAsk(other.worker, theirs);
     expect(await askIds(s)).toEqual([]);
+    // Nor in the projects list's count, which reads every project's at once.
+    expect(await count(s)).toBe(0);
     // Answering another project's ask through this one is refused before nest is asked.
     const before = fake.answers.length;
     expect((await answer(s, theirs)).status).toBe(409);
@@ -101,13 +107,50 @@ describe("asks are nest's, read when asked", () => {
     expect(await askIds(other)).toEqual([theirs]);
   });
 
-  it("nest not answering fails the read (502), never an empty Needs you", async () => {
+  it("nest not answering: Needs you lists the app's own items and says the asks are unknown; the count is unknown, not 0", async () => {
     const s = await setup();
     holdAsk(s.worker, askId());
-    fake.fail(/^GET \/v1\/asks$/, 500, { times: 2 });
-    expect((await api(token, "GET", `/api/projects/${s.id}/attention`)).status).toBe(502);
+    ok(await callTool("board", await nest.sign(agentClaims("board", s.manager, { project: s.id, role: "manager", start: "1" })), "block_task", { task: s.task, reason: "decide" }));
+    fake.fail(/^GET \/v1\/asks$/, 500, { times: 3 });
+    const a = (await api(token, "GET", `/api/projects/${s.id}/attention`));
+    expect(a.status).toBe(200);
+    expect(a.body.map((x: { kind: string }) => x.kind)).toEqual(["asks_unavailable", "blocked"]);
+    expect(a.body[0].error).toContain("nest couldn't list the agents' asks");
     expect((await api(token, "GET", `/api/projects/${s.id}/asks`)).status).toBe(502);
-    expect(await askIds(s)).toHaveLength(1);
+    expect(await count(s)).toBeNull();
+    // nest back: the ask is there again, and the count has it.
+    expect((await attention(s)).map((x) => x.kind).sort()).toEqual(["ask", "blocked"]);
+    expect(await count(s)).toBe(2);
+  });
+
+  it("pages through every page of nest's answer, oldest first across pages, and reads an agent's whole list past 20", async () => {
+    const s = await setup();
+    const extra = fake.plant({ labels: { project: s.id, role: "worker", task: s.task } });
+    // Agents in creation order: the manager, the worker, then `extra`; the oldest ask is on the last page.
+    holdAsk(s.manager, `ask_mgr${rand()}`, { created_ms: 3000 });
+    holdAsk(extra.agent, `ask_xtr${rand()}`, { created_ms: 1000 });
+    const many = Array.from({ length: 22 }, (_, i) => holdAsk(s.worker, `ask_w${String(i).padStart(2, "0")}${rand()}`, { created_ms: 2000 + i }).ask);
+    fake.asksPageMax = 1;
+    try {
+      const calls = fake.calls.length;
+      const got = await asks(s);
+      expect(got.map((x) => x.at_ms)).toEqual([1000, ...many.map((_, i) => 2000 + i), 3000]);
+      expect(got.filter((x) => x.agent === s.worker).map((x) => x.ask)).toEqual(many);
+      const pages = fake.calls.slice(calls).filter((c) => c.path === "/v1/asks");
+      expect(pages.map((c) => c.query.get("cursor"))).toEqual([null, "1", "2"]);
+      // The worker's 22 come from its own list (the page showed 20 and named it in `more`).
+      expect(fake.calls.slice(calls).filter((c) => c.path === `/v1/agents/${s.worker}/asks`)).toHaveLength(1);
+    } finally {
+      fake.asksPageMax = 100;
+    }
+    {
+      // The projects list counts all 24, from one read for every project (no project label).
+      const before = fake.calls.length;
+      expect(await count(s)).toBe(24);
+      const listing = fake.calls.slice(before).filter((c) => c.path === "/v1/asks");
+      expect(listing.length).toBeGreaterThan(0);
+      expect(listing.every((c) => c.query.getAll("label").length === 0)).toBe(true);
+    }
   });
 
   it("on a control plane without GET /v1/asks, reads each agent's asks instead", async () => {
@@ -190,11 +233,14 @@ describe("answering", () => {
     expect(told(s)).toEqual([]);
   });
 
-  it("an agent.ask event writes nothing: the app's old asks table stays as it was", async () => {
+  it("an agent.ask event is still written to the old asks table (never read here), so a rollback lists asks raised meanwhile", async () => {
     const s = await setup();
-    await deliver({ id: `evt-${rand()}`, type: "agent.ask", agent: s.worker, ask: askId(), question: "push?" });
-    const n = await runInDurableObject(stub(s), (_o, st) => st.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM asks").one().n);
-    expect(n).toBe(0);
-    expect(await askIds(s)).toHaveLength(1);
+    const a = askId();
+    await deliver({ id: `evt-${rand()}`, type: "agent.ask", agent: s.worker, ask: a, question: "push?" });
+    const rows = await runInDurableObject(stub(s), (_o, st) => st.storage.sql.exec("SELECT ask, agent, role, task, question, answered_ms FROM asks").toArray());
+    expect(rows).toEqual([{ ask: a, agent: s.worker, role: "worker", task: s.task, question: "push?", answered_ms: null }]);
+    // Nothing reads it: answered in nest, it's gone from Needs you though its row stays.
+    answerInNest(s.worker, a);
+    expect(await askIds(s)).toEqual([]);
   });
 });

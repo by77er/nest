@@ -200,8 +200,11 @@ describe("the board", () => {
     expect(needs.closest(".mantine-Badge-root")?.getAttribute("style")).toContain("--mantine-color-warning-");
     expect(within(card).getByRole("link", { name: /#42/ })).toHaveAttribute("href", "https://github.com/owner/widgets/pull/42");
     expect(within(card).getByText("agt_w1")).toBeInTheDocument();
+    // The badges and "Needs you" come from one read (each is a nest read on the Worker), never a second.
+    expect(api.reads).not.toContain("/api/projects/prj_one/asks");
+    expect(api.reads).toContain("/api/projects/prj_one/attention");
 
-    // An answered ask and an untainted task carry no marker.
+    // A task with no open ask and an untainted one carry no marker.
     const other = screen.getByRole("article", { name: "plain" });
     expect(within(other).queryByText("Tainted")).toBeNull();
     expect(within(other).queryByText("Needs input")).toBeNull();

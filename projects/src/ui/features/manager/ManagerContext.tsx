@@ -6,7 +6,7 @@
 
 import { Text } from "@mantine/core";
 import { useAttention, useTasks } from "../../api/queries";
-import type { Attention } from "../../api/types";
+import { splitAttention, type Waiting } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { MetaItem, MetaRow, Section, Stack } from "../../layout";
@@ -22,7 +22,7 @@ const SHOWN = 5;
 const GIST = 120;
 
 /** A line of what an ask, a block or a secret request wants: its question, the call it holds, the reason, or the credential. */
-export function gist(x: Attention): string {
+export function gist(x: Waiting): string {
   let text: string;
   if (x.kind === "ask") {
     const a = approvalOf(x);
@@ -34,6 +34,15 @@ export function gist(x: Attention): string {
   else text = x.question ?? x.reason;
   const line = text.replace(/\s+/g, " ").trim();
   return line.length > GIST ? `${line.slice(0, GIST - 1).trimEnd()}…` : line;
+}
+
+/** nest couldn't be read for the agents' asks: said, rather than claim nothing waits. */
+function AsksUnavailable() {
+  return (
+    <Text fz="sm" c="dimmed" data-asks-unavailable>
+      The agents' asks couldn't be read from nest. Trying again.
+    </Text>
+  );
 }
 
 function More({ projectId, n }: { projectId: string; n: number }) {
@@ -50,7 +59,8 @@ function More({ projectId, n }: { projectId: string; n: number }) {
 
 export function ManagerContext({ projectId }: { projectId: string }) {
   const tasks = useTasks(projectId).data ?? [];
-  const waiting = [...(useAttention(projectId).data ?? [])].sort((a, b) => a.at_ms - b.at_ms);
+  const split = splitAttention(useAttention(projectId).data);
+  const waiting = [...split.items].sort((a, b) => a.at_ms - b.at_ms);
   const active = tasks.filter((t) => ACTIVE.has(t.state)).sort((a, b) => b.updated_ms - a.updated_ms);
   const on = active.slice(0, SHOWN);
   const asks = waiting.slice(0, ASKS_SHOWN);
@@ -91,7 +101,10 @@ export function ManagerContext({ projectId }: { projectId: string }) {
               </Stack>
             ))}
             {waiting.length > asks.length && <More projectId={projectId} n={waiting.length - asks.length} />}
+            {split.asksError !== null && <AsksUnavailable />}
           </Stack>
+        ) : split.asksError !== null ? (
+          <AsksUnavailable />
         ) : (
           <Text fz="sm" c="dimmed">
             Nothing waits on you.

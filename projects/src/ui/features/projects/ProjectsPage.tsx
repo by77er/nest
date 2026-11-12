@@ -62,7 +62,21 @@ export function ProjectsPage() {
                       Being created
                     </Badge>
                   )}
-                  {p.needs_you > 0 && (
+                  {p.needs_you === null && (
+                    // nest couldn't be read for the agents' asks: unknown, not none.
+                    <BadgeLink
+                      to="/projects/$projectId/board"
+                      params={{ projectId: p.id }}
+                      search={{}}
+                      color="warning"
+                      variant="light"
+                      data-marker="needs-you-unknown"
+                      aria-label="Couldn't check what needs you: open the board"
+                    >
+                      Couldn't check what needs you
+                    </BadgeLink>
+                  )}
+                  {p.needs_you !== null && p.needs_you > 0 && (
                     // Asks are answered on the Board; the project itself opens on its Manager.
                     <BadgeLink
                       to="/projects/$projectId/board"

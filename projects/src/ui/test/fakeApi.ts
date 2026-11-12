@@ -154,8 +154,11 @@ export class FakeApi {
     this.network = { ...this.network, rev: this.network.rev + 1, agents: this.network.agents.map((a) => ({ ...a, state: "pending" as const })) };
   }
 
+  /** nest couldn't be read for the agents' asks: attention lists the rest with the marker, the count is unknown. */
+  asksError: string | null = null;
+
   attention(): Attention[] {
-    const asks = this.asks.map((a): Attention => ({ kind: "ask", ...a }));
+    const asks: Attention[] = this.asksError !== null ? [{ kind: "asks_unavailable", error: this.asksError, at_ms: 0 }] : this.asks.map((a): Attention => ({ kind: "ask", ...a }));
     const blocked = this.tasks.filter((t) => t.blocked).map((t): Attention => ({ kind: "blocked", task: t.id, title: t.title, state: t.state, ...t.blocked! }));
     const secrets = this.secretRequests.map((r): Attention => ({ kind: "secret", ...r }));
     const held = this.reviews.filter((j) => j.state === "held").map((j): Attention => ({ kind: "review", pr: j.pr, sha: j.sha, title: j.title, author: j.author, fork: j.fork, at_ms: j.created_ms }));
@@ -188,7 +191,7 @@ export class FakeApi {
       return json({ written: this.sync.written, repos: this.sync.repos });
     }
     if (parts.length === 1) {
-      if (m === "GET") return json({ projects: this.projects.map(({ settings: _s, ...row }) => ({ ...row, needs_you: row.id === "prj_one" ? this.attention().length : 0 })) });
+      if (m === "GET") return json({ projects: this.projects.map(({ settings: _s, ...row }) => ({ ...row, needs_you: row.id === "prj_one" ? (this.asksError !== null ? null : this.attention().length) : 0 })) });
       const p = project({ id: `prj_new${++seq}`, name: body.name, repo: body.repo.toLowerCase() });
       this.projects.push(p);
       return json({ ...p, catalog_synced: true }, 201);

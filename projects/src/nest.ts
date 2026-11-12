@@ -34,7 +34,12 @@ export interface NestConfig {
   base: string;
   token: string;
   cell: string;
+  /** How long one request may take before it's abandoned (an error, as nest not answering); default CALL_TIMEOUT_MS. */
+  timeoutMs?: number;
 }
+
+/** One request to nest is abandoned after this (each attempt of a retried one): nothing the app asks of nest takes longer. */
+export const CALL_TIMEOUT_MS = 15_000;
 
 export type Labels = Record<string, string>;
 
@@ -142,6 +147,7 @@ export class Nest {
           ...(o.idempotencyKey ? { "idempotency-key": o.idempotencyKey } : {}),
         },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        signal: AbortSignal.timeout(this.config.timeoutMs ?? CALL_TIMEOUT_MS),
       });
       const text = await res.text();
       if (res.ok) return (text ? JSON.parse(text) : {}) as T;
@@ -270,15 +276,18 @@ export class Nest {
   }
 
   /**
-   * Every open ask of the app's live agents carrying every label in `labels`, in the app's cell, read from
-   * nest when asked (`GET /v1/asks`, all its pages). A control plane from before that route (one release back)
-   * answers a client's unknown route 401: then each agent's own (`GET /v1/agents/<id>/asks`), as before.
+   * Every open ask of the app's live agents carrying every label in `labels` (none: all of them), in the
+   * app's cell, oldest first, read from nest when asked: `GET /v1/asks`, all its pages, and the whole list
+   * of each agent a page names in `more` (it shows 20 an agent). A control plane from before that route (one
+   * release back) answers a client's unknown route 401: then each agent's own (`GET /v1/agents/<id>/asks`).
    */
   async openAsks(labels: Labels): Promise<OpenAsk[]> {
     const out: OpenAsk[] = [];
+    const more = new Set<string>();
     let cursor: string | null = null;
-    for (let page = 0; page < ASK_PAGES; page++) {
-      let r: { asks: OpenAsk[]; next_cursor: string | null };
+    for (let page = 0; ; page++) {
+      if (page === ASK_PAGES) throw new Error(`more than ${ASK_PAGES * 100} agents to list asks of`);
+      let r: { asks: OpenAsk[]; more?: string[]; next_cursor: string | null };
       try {
         r = await this.call("GET", "/v1/asks", undefined, { query: { label: labelFilters(labels), cell: this.config.cell, limit: "100", ...(cursor ? { cursor } : {}) } });
       } catch (e) {
@@ -286,10 +295,17 @@ export class Nest {
         throw e;
       }
       out.push(...r.asks);
+      for (const a of r.more ?? []) more.add(a);
       cursor = r.next_cursor;
-      if (!cursor) return out;
+      if (!cursor) break;
     }
-    throw new Error(`more than ${ASK_PAGES * 100} agents to list asks of`);
+    // An agent with more than a page shows: its whole list, in place of its rows.
+    const whole = await Promise.all([...more].map(async (agent) => {
+      const row = out.find((x) => x.agent === agent);
+      const asks = (await this.listAsks(agent)) as Omit<OpenAsk, "agent" | "owner" | "labels">[];
+      return row ? asks.map((x) => ({ ...x, agent, owner: row.owner, labels: row.labels })) : [];
+    }));
+    return [...out.filter((x) => !more.has(x.agent)), ...whole.flat()].sort((a, b) => a.created_ms - b.created_ms);
   }
 
   /** `openAsks` on a control plane without `GET /v1/asks`: the agents by their labels, then each one's asks. */

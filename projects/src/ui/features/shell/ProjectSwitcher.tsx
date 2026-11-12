@@ -10,9 +10,17 @@ import { Switcher } from "../../layout/Switcher";
 import type { View } from "./views";
 
 const ALL = "__all";
-const needs = (n: number | undefined) => (n ? `, ${n} need you` : "");
+const needs = (n: number | null | undefined) => (n === null ? ", couldn't check what needs you" : n ? `, ${n} need you` : "");
 
-export function NeedsYouBadge({ count }: { count: number | undefined }) {
+/** How many things need the owner; `null`: unknown (nest couldn't be read for the agents' asks), shown as "?". */
+export function NeedsYouBadge({ count }: { count: number | null | undefined }) {
+  if (count === null) {
+    return (
+      <Badge size="sm" color="warning" variant="light" aria-label="Couldn't check what needs you" data-marker="needs-you-unknown">
+        ?
+      </Badge>
+    );
+  }
   if (!count) return null;
   return (
     <Badge size="sm" color="warning" variant="filled" aria-label={`${count} ${count === 1 ? "thing needs" : "things need"} you`} data-marker="needs-you">

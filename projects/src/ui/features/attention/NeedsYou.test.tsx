@@ -31,6 +31,41 @@ describe("asks", () => {
     expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/asks/${a.ask}/answer`, body: { answer: "approve" } }]);
   });
 
+  it("one answered elsewhere meanwhile (refused as no longer open) leaves at once: the asks are read again", async () => {
+    const api = new FakeApi();
+    const a = ask({ approval: { name: "brokered", tool: "WebFetch" } });
+    api.asks = [a];
+    const { user } = renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    // nest has it answered (the operator) before the owner clicks: the Worker refuses, and lists it no more.
+    api.asks = [];
+    api.fail(/\/answer$/, 409, "this ask isn't open any more: it was answered, or its agent ended");
+    await user.click(within(p).getByRole("button", { name: "Approve" }));
+    // Well before the next poll (5 s).
+    await waitFor(gone, { timeout: 1_500 });
+  });
+
+  it("nest unreadable: the rest is listed, with a line saying the asks couldn't be read", async () => {
+    const api = new FakeApi();
+    api.asks = [ask({ question: "hidden?" })];
+    api.asksError = "nest couldn't list the agents' asks: nest 503";
+    api.tasks = [task({ title: "Pick a region", blocked: { at_ms: Date.now() - 1_000, by: "agt_w1", role: "worker", reason: "which region?", question: null, tainted: false } })];
+    renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    expect(p).toHaveTextContent("The agents' asks couldn't be read from nest");
+    expect(p).toHaveTextContent("Pick a region");
+    expect(p).not.toHaveTextContent("hidden?");
+    // Counted: the blocked task only.
+    expect(within(p).getByText("1")).toBeInTheDocument();
+  });
+
+  it("nest unreadable and nothing else waiting: the panel still says so, never empty", async () => {
+    const api = new FakeApi();
+    api.asksError = "nest 503";
+    renderApp("/projects/prj_one/board", api);
+    expect(await panel()).toHaveTextContent("The agents' asks couldn't be read from nest");
+  });
+
   it("an approval denied sends deny", async () => {
     const api = new FakeApi();
     const a = ask({ approval: { name: "email.send", tool: "brokered" } });

@@ -143,6 +143,8 @@ export class FakeNest {
   tokenInstallation: number | null = GH_INSTALLATION_ID;
   /** Play a control plane from before `GET /v1/asks`: a client's unknown route answers 401. */
   asksRouteMissing = false;
+  /** The most agents a page of `GET /v1/asks` holds, below what the app asks for (to make it page). */
+  asksPageMax = 100;
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
   holds: { match: RegExp; release: Promise<void>; reached: boolean }[] = [];
   /** Creates that are made but whose answer is lost (a 500 instead), as after a timeout. */
@@ -344,10 +346,20 @@ export class FakeNest {
     }
     if (r === "GET /v1/asks") {
       if (this.asksRouteMissing) return nestErr(401, "unauthorized", "admin token required");
-      // nest's own: the client's live agents matching every label, each one's open asks, oldest first.
+      // As nest: a page of the client's live agents matching every label (in creation order, `limit` of them,
+      // after `cursor`), each one's oldest 20 open asks; `more` names an agent with more.
+      if (u.searchParams.has("state") && u.searchParams.get("state") !== "live") return nestErr(400, "invalid_message", "state is live here");
       const rows = [...this.agents.values()].filter((a) => a.client === CLIENT && !a.ended && labelsMatch(a.labels));
-      const asks = rows.flatMap((a) => (HELD.get(a.agent) ?? []).map((x) => ({ agent: a.agent, cell: CELL, client: a.client, owner: a.owner, labels: a.labels, ...x })));
-      return json(200, { asks: asks.sort((x, y) => x.created_ms - y.created_ms), next_cursor: null });
+      const from = Number(u.searchParams.get("cursor") ?? 0);
+      const size = Math.min(Number(u.searchParams.get("limit") ?? 50), 100, this.asksPageMax);
+      const page = rows.slice(from, from + size);
+      const more: string[] = [];
+      const asks = page.flatMap((a) => {
+        const held = [...(HELD.get(a.agent) ?? [])].sort((x, y) => x.created_ms - y.created_ms);
+        if (held.length > 20) more.push(a.agent);
+        return held.slice(0, 20).map((x) => ({ agent: a.agent, cell: CELL, client: a.client, owner: a.owner, labels: a.labels, ...x }));
+      });
+      return json(200, { asks: asks.sort((x, y) => x.created_ms - y.created_ms), more, next_cursor: from + size < rows.length ? String(from + size) : null });
     }
     if (r === "GET /v1/agents") {
       const rows = [...this.agents.values()].filter((a) => !a.ended && labelsMatch(a.labels));

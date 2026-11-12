@@ -59,7 +59,9 @@ export function useInterruptManager(id: string) {
   return useMutation({ mutationFn: () => api.interruptManager(id), meta: { failure: "The manager wasn't stopped" } });
 }
 
-export const useAsks = (id: string) => useQuery({ queryKey: keys.asks(id), queryFn: () => api.asks(id), refetchInterval: POLL.asks });
+/** The project's open asks: "Needs you"'s, from the same read (one nest read serves both). */
+export const useAsks = (id: string) =>
+  useQuery({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks, select: (xs: Attention[]) => xs.filter((x): x is Extract<Attention, { kind: "ask" }> => x.kind === "ask") });
 
 /** The manager's status for its page (nest's agent record, read through the app). */
 export const useManager = (id: string) => useQuery({ queryKey: keys.manager(id), queryFn: () => api.manager(id), refetchInterval: POLL.manager });
@@ -412,12 +414,11 @@ export function useAnswerAsk(id: string) {
     meta: { failure: "The answer wasn't sent" },
     onSuccess: (_d, v) => {
       // nest lists open asks only: an answered one is gone.
-      qc.setQueryData<Ask[]>(keys.asks(id), (old) => old?.filter((a) => a.ask !== v.ask));
       qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "ask" && x.ask === v.ask)));
     },
     // Either way, read nest's again: one refused as no longer open (answered elsewhere, its agent ended) goes at once.
     onSettled: () => Promise.all([
-      qc.invalidateQueries({ queryKey: keys.attention(id) }), qc.invalidateQueries({ queryKey: keys.projects, exact: true }), qc.invalidateQueries({ queryKey: keys.asks(id) }),
+      qc.invalidateQueries({ queryKey: keys.attention(id) }), qc.invalidateQueries({ queryKey: keys.projects, exact: true }),
     ]),
   });
 }
