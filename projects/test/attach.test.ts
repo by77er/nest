@@ -61,9 +61,11 @@ describe("attaching a repo", () => {
     expect(prot.restrictions).toBeUndefined();
     expect(managersOf(p.id)).toHaveLength(1);
     // Its token: for this one repo, with administration and metadata, nothing more, minted from the App's
-    // installation on it. (The other, metadata alone, is the create's answer reading the repo's owner to show.)
+    // installation on it. (The others, metadata alone: the create's check that the App reaches the repo, revoked
+    // after, and the answer's read of the repo's owner.)
     const name = repo.split("/")[1]!;
-    expect(gh.mints().filter((m) => m.repositories[0] === name)).toEqual([
+    expect(gh.mints().filter((m) => m.repositories?.[0] === name)).toEqual([
+      { installation: GH_INSTALLATION_ID, repositories: [name], permissions: { metadata: "read" } },
       { installation: GH_INSTALLATION_ID, repositories: [name], permissions: { administration: "write", metadata: "read" } },
       { installation: GH_INSTALLATION_ID, repositories: [name], permissions: { metadata: "read" } },
     ]);

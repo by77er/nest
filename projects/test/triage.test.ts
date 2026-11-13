@@ -7,7 +7,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { MAX_UNTRIAGED_ISSUES } from "../src/do/project";
-import { AccessTeam, api, deliverGithub, FakeNest, GRANT_PERMISSIONS, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf } from "./fake-nest";
+import { AccessTeam, api, deliverGithub, FakeNest, GH_INSTALLATION_ID, GRANT_PERMISSIONS, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf, withNestTokens } from "./fake-nest";
 
 const fake = new FakeNest();
 let restore: () => void;
@@ -356,10 +356,13 @@ describe("a task made of an issue", () => {
     expect(d.issue.comments).toEqual([`Done in #${d.pr}.`]);
   });
 
-  it("a close GitHub refuses for good (no issues: write in the grant) is recorded on the task, not dropped silently", async () => {
+  /** The App's default installation, whose permissions a test narrows (the owner's grant of them to the App). */
+  const installation = () => fake.github.installations.find((i) => i.id === GH_INSTALLATION_ID)!;
+
+  it("a close GitHub refuses for good (the App's installation has no issues: write) is recorded on the task, not dropped silently", async () => {
     const p = await newProject();
-    const saved = GRANT_PERMISSIONS.issues;
-    delete GRANT_PERMISSIONS.issues;
+    const saved = installation().permissions.issues;
+    delete installation().permissions.issues;
     try {
       const d = await doneTask(p, 32);
       expect(d.issue.state).toBe("open");
@@ -372,7 +375,7 @@ describe("a task made of an issue", () => {
       await retryDue(p);
       expect((await getTask(p, d.task)).issue.close).toBe("failed");
     } finally {
-      GRANT_PERMISSIONS.issues = saved!;
+      installation().permissions.issues = saved!;
     }
   });
 
@@ -383,7 +386,8 @@ describe("a task made of an issue", () => {
   };
   const failures = async (p: P, task: string) => (await getTask(p, task)).history.filter((h: { action: string }) => h.action === "issue_close_failed").length;
 
-  it("a refused close is tried again when the grant gains issues: write (the grant never read before the refusal)", async () => {
+  // The grant's `issues` permission decides only nest's tokens: the fallback's.
+  it("with nest's tokens (the fallback): a refused close is tried again when the grant gains issues: write (the grant never read before the refusal)", () => withNestTokens(async () => {
     const p = await newProject();
     const saved = GRANT_PERMISSIONS.issues;
     delete GRANT_PERMISSIONS.issues;
@@ -399,9 +403,9 @@ describe("a task made of an issue", () => {
     expect(d.issue.state).toBe("closed");
     expect(d.issue.comments).toEqual([`Done in #${d.pr}.`]);
     expect((await getTask(p, d.task)).issue).toEqual({ number: 35, close: "closed", error: null });
-  });
+  }));
 
-  it("a grant that loses issues: write, or doesn't change, tries nothing again", async () => {
+  it("with nest's tokens (the fallback): a grant that loses issues: write, or doesn't change, tries nothing again", () => withNestTokens(async () => {
     const p = await newProject();
     // Seen with issues: write first; then narrowed, and the close refused.
     await readGrant(p);
@@ -417,17 +421,17 @@ describe("a task made of an issue", () => {
     } finally {
       GRANT_PERMISSIONS.issues = saved!;
     }
-  });
+  }));
 
-  it("the owner can retry a refused close", async () => {
+  it("the owner can retry a refused close (once the App's installation has issues: write)", async () => {
     const p = await newProject();
-    const saved = GRANT_PERMISSIONS.issues;
-    delete GRANT_PERMISSIONS.issues;
+    const saved = installation().permissions.issues;
+    delete installation().permissions.issues;
     let d: Awaited<ReturnType<typeof doneTask>>;
     try {
       d = await doneTask(p, 36);
     } finally {
-      GRANT_PERMISSIONS.issues = saved!;
+      installation().permissions.issues = saved!;
     }
     const r = await api(token, "POST", `/api/projects/${p.id}/tasks/${d.task}/issue/close`);
     expect(r.status).toBe(200);

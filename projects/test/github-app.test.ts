@@ -93,16 +93,16 @@ describe("the App's JWT", () => {
 
   it("is what GitHub takes: the fake checks it with the run's public key", async () => {
     const repo = newRepo();
-    await new AppTokens(appEnv, nest()).token(repo, PERMISSIONS.metadata);
+    await new AppTokens(appEnv).token(repo, PERMISSIONS.metadata);
     expect(gh.jwts.at(-1)).toMatchObject({ iss: String(GH_APP_ID) });
   });
 
   it("missing secrets, or a key GitHub refuses, fail as an outage (retried), never a refusal, and say which secret", async () => {
     const repo = newRepo();
-    const unset = new AppTokens({ ...appEnv, GITHUB_APP_ID: undefined }, nest());
+    const unset = new AppTokens({ ...appEnv, GITHUB_APP_ID: undefined });
     await expect(unset.token(repo, PERMISSIONS.metadata)).rejects.toMatchObject({ status: 503, permanent: false, message: expect.stringContaining("GITHUB_APP_ID") });
     const other = await newKey();
-    const wrong = new AppTokens({ ...appEnv, GITHUB_APP_PRIVATE_KEY: other.pem }, nest());
+    const wrong = new AppTokens({ ...appEnv, GITHUB_APP_PRIVATE_KEY: other.pem });
     const e = await wrong.token(repo, PERMISSIONS.metadata).catch((x: unknown) => x);
     expect(e).toMatchObject({ status: 503, permanent: false, message: expect.stringContaining("GITHUB_APP_PRIVATE_KEY") });
     // Nothing of the key in what it says.
@@ -132,7 +132,7 @@ describe("installation tokens", () => {
 
   it("are reused per installation, repo and permissions while more than 10 minutes are left, and minted again after", async () => {
     const repo = newRepo();
-    const src = new AppTokens(appEnv, nest());
+    const src = new AppTokens(appEnv);
     const before = gh.mints().length;
     gh.tokenLifeMs = TOKEN_REUSE_MS + 60_000;
     const a = await src.token(repo, { issues: "read", pull_requests: "read" });
@@ -150,7 +150,7 @@ describe("installation tokens", () => {
 
   it("look the repo's installation up again after 10 minutes, and at once when a binding asks (fresh)", async () => {
     const repo = newRepo();
-    const src = new AppTokens(appEnv, nest());
+    const src = new AppTokens(appEnv);
     await src.token(repo, PERMISSIONS.metadata);
     await src.token(repo, PERMISSIONS.checks);
     expect(lookups(repo)).toBe(1);
@@ -166,7 +166,7 @@ describe("installation tokens", () => {
     const repo = newRepo();
     const account = repo.split("/")[0]!;
     gh.install({ id: 9_101, account });
-    const src = new AppTokens(appEnv, nest());
+    const src = new AppTokens(appEnv);
     const old = await src.token(repo, PERMISSIONS.checks);
     await src.token(repo, PERMISSIONS.metadata);
     expect(appTokenCache().tokens.filter((t) => t.installation === 9_101)).toHaveLength(2);
@@ -195,7 +195,7 @@ describe("installation tokens", () => {
   it("an installation GitHub no longer has (uninstalled): the lookup says so, and nothing cached for it is handed out", async () => {
     const repo = newRepo();
     gh.install({ id: 9_201, account: repo.split("/")[0]! });
-    const src = new AppTokens(appEnv, nest());
+    const src = new AppTokens(appEnv);
     await src.token(repo, PERMISSIONS.metadata);
     // Uninstalled, and on no other installation (the default one gone too).
     gh.uninstall(9_201);
@@ -204,39 +204,26 @@ describe("installation tokens", () => {
     expect(appTokenCache().tokens.filter((t) => t.installation === 9_201)).toEqual([]);
   });
 
-  it("are refused, as nest refused its own, for a repo or a permission outside nest's grant: before any GitHub call", async () => {
+  it("are GitHub's to refuse, not nest's grant: nest isn't asked, and a permission the installation wasn't granted is GitHub's refusal", async () => {
     const repo = newRepo();
-    const src = new AppTokens(appEnv, nest());
-    const before = gh.mints().length;
+    const account = repo.split("/")[0]!;
+    const src = new AppTokens(appEnv);
     fake.grantRepos = ["someone/else"];
-    await expect(src.token(repo, PERMISSIONS.metadata)).rejects.toSatisfy((e) => e instanceof NestError && e.status === 403 && e.permanent);
-    expect(lookups(repo)).toBe(0);
-    fake.grantRepos = null;
-    const saved = GRANT_PERMISSIONS.issues;
-    delete GRANT_PERMISSIONS.issues;
-    try {
-      await expect(src.token(repo, PERMISSIONS.issuesWrite)).rejects.toMatchObject({ status: 403, message: expect.stringContaining("issues: write") });
-    } finally {
-      GRANT_PERMISSIONS.issues = saved!;
-    }
-    expect(gh.mints().length).toBe(before);
-    // A binding's read checks the grant even with a token cached, before looking anything up or dropping anything.
-    await src.token(repo, PERMISSIONS.metadata);
-    const looked = lookups(repo);
-    fake.grantRepos = ["someone/else"];
-    await expect(src.token(repo, PERMISSIONS.metadata, { fresh: true })).rejects.toMatchObject({ status: 403 });
-    expect(lookups(repo)).toBe(looked);
-    expect(appTokenCache().tokens.filter((t) => t.key.startsWith(repo))).toHaveLength(1);
-    // A call that isn't a binding's read takes the cached token without asking nest (README.md#github-tokens: the window).
     const asked = fake.calls.length;
-    await src.token(repo, PERMISSIONS.metadata);
+    await src.token(repo, PERMISSIONS.metadata, { fresh: true });
     expect(fake.calls.length).toBe(asked);
+    // An installation granted no issues permission: GitHub refuses the mint (422), a refusal that will repeat.
+    gh.install({ id: 9_301, account, permissions: { metadata: "read" } });
+    await expect(src.token(repo, PERMISSIONS.issuesWrite, { fresh: true })).rejects.toMatchObject({ status: 422, permanent: true });
+    // A repo its installation doesn't select: the same.
+    gh.install({ id: 9_301, account, repos: [], permissions: { metadata: "read" } });
+    await expect(src.token(repo, PERMISSIONS.metadata, { fresh: true })).rejects.toMatchObject({ status: 404 });
   });
 
   it("a mint GitHub answers 404 (the installation gone) drops the installation and its tokens: the next call looks it up again", async () => {
     const repo = newRepo();
     gh.install({ id: 9_401, account: repo.split("/")[0]! });
-    const src = new AppTokens(appEnv, nest());
+    const src = new AppTokens(appEnv);
     await src.token(repo, PERMISSIONS.metadata);
     expect(lookups(repo)).toBe(1);
     gh.fail(/^POST \/app\/installations\/9401\/access_tokens$/, 404);
@@ -248,7 +235,7 @@ describe("installation tokens", () => {
 
   it("a token minted while the repo's lookup moved to another installation isn't kept", async () => {
     const repo = newRepo();
-    const src = new AppTokens(appEnv, nest());
+    const src = new AppTokens(appEnv);
     let release!: () => void;
     const hold = { match: new RegExp(`^POST /app/installations/${GH_INSTALLATION_ID}/access_tokens$`), release: new Promise<void>((r) => { release = r; }), reached: false };
     gh.holds.push(hold);
@@ -273,7 +260,42 @@ describe("installation tokens", () => {
   });
 
   it("the App's slug is GitHub's own answer", async () => {
-    expect(await new AppTokens(appEnv, nest()).appSlug()).toBe("nest-test");
+    expect(await new AppTokens(appEnv).appSlug()).toBe("nest-test");
+  });
+});
+
+describe("the App's installations and their repos", () => {
+  it("lists every installation (paged) and each one's own repos (paged, capped), with a token for the installation's repos and metadata only", async () => {
+    const acct = `many-${rand()}`;
+    for (let n = 0; n < 150; n++) gh.repo(`${acct}/r${String(n).padStart(3, "0")}`);
+    gh.installations = [
+      ...Array.from({ length: 120 }, (_, n) => ({ id: 20_000 + n, account: `filler-${n}-${rand()}`, repos: new Set<string>(), permissions: { ...GRANT_PERMISSIONS } })),
+      { id: 30_001, account: acct, repos: "all" as const, permissions: { ...GRANT_PERMISSIONS } },
+    ];
+    const src = new AppTokens(appEnv);
+    const list = await src.installationsList();
+    expect(list).toHaveLength(121);
+    expect(list.at(-1)).toEqual({ id: 30_001, account: acct });
+    const whole = await src.installationRepos(30_001);
+    expect(whole).toMatchObject({ complete: true });
+    expect(whole.repos).toHaveLength(150);
+    expect(whole.repos[0]).toBe(`${acct}/r000`);
+    const capped = await src.installationRepos(30_001, 120);
+    expect(capped.repos).toHaveLength(120);
+    expect(capped.complete).toBe(false);
+    // A token per listing: no repo named, metadata only, revoked after (GitHub no longer knows it).
+    const listing = { installation: 30_001, repositories: undefined, permissions: { metadata: "read" } };
+    expect(gh.mints().filter((m) => m.installation === 30_001)).toEqual([listing, listing]);
+    const listed = gh.callsTo("GET", /^\/installation\/repositories$/);
+    expect(listed.length).toBeGreaterThan(0);
+    for (const c of listed) {
+      expect(gh.calls.some((d) => d.method === "DELETE" && d.path === "/installation/token" && d.token === c.token)).toBe(true);
+      expect(gh.tokens.has(c.token!)).toBe(false);
+    }
+    // Only this installation's own repos.
+    const other = newRepo();
+    gh.repo(other);
+    expect((await src.installationRepos(30_001)).repos).not.toContain(other);
   });
 });
 

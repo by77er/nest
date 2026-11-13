@@ -537,21 +537,22 @@ export class FakeNest {
   }
 }
 
-/**
- * Run `fn` with the app's GitHub tokens from nest (`GITHUB_TOKEN_SOURCE=nest`, the fallback), as the Worker and
- * its objects read the env they share with the tests; the App's own after.
- */
-export async function withNestTokens<T>(fn: () => Promise<T>): Promise<T> {
-  const e = env as { GITHUB_TOKEN_SOURCE?: string };
-  const had = e.GITHUB_TOKEN_SOURCE;
-  e.GITHUB_TOKEN_SOURCE = "nest";
+/** Run `fn` with one of the env's values set (undefined: unset), as the Worker and its objects read the env they share with the tests. */
+export async function withEnv<T>(name: "GITHUB_TOKEN_SOURCE" | "GITHUB_ACCOUNTS", value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const e = env as unknown as Record<string, unknown>;
+  const had = e[name];
+  if (value === undefined) delete e[name];
+  else e[name] = value;
   try {
     return await fn();
   } finally {
-    if (had === undefined) delete e.GITHUB_TOKEN_SOURCE;
-    else e.GITHUB_TOKEN_SOURCE = had;
+    if (had === undefined) delete e[name];
+    else e[name] = had;
   }
 }
+
+/** Run `fn` with the app's GitHub tokens from nest (`GITHUB_TOKEN_SOURCE=nest`, the fallback); the App's own after. */
+export const withNestTokens = <T>(fn: () => Promise<T>): Promise<T> => withEnv("GITHUB_TOKEN_SOURCE", "nest", fn);
 
 /** Install `fake` as nest (and Cloudflare Access's certs, when given) for the Worker and its objects. */
 /** The fake GitHub the installed fetch answers from: events name their repo's owner as it answers (`deliverGithub`). */
@@ -692,6 +693,8 @@ export async function eventually<T>(f: () => T | Promise<T>, what: string): Prom
 
 /** The GitHub App's id, as GitHub answers it in a check run's `app.id`. */
 export const GH_APP_ID = 4242;
+/** The account that owns the App (`GET /app`'s `owner`): the one account the app acts for by default. */
+export const GH_APP_OWNER = "app-owner";
 /** The App's slug: its bot is `nest-test[bot]`. */
 export const GH_APP_SLUG = "nest-test";
 /** The fake's default installation of the App: on every account that has none of its own (FakeGitHub.install). */
@@ -758,11 +761,14 @@ export const repoIdOf = (name: string) => 500_000_000 + [...name.toLowerCase()].
 /**
  * One installation of the App: on one account (`account`), or, the fake's shorthand, on every account that
  * has none of its own (`account: null`); on all its repos or a selection; with the permissions the owner
- * granted the App.
+ * granted the App. The account's id, as GitHub answers it (`account.id`), is the App owner's unless a test gives
+ * another (`accountId`): the tests' repos are under many made-up logins, and the app acts only for the App
+ * owner's account (README.md#repo-authority), so a stranger's installation is one a test names as such.
  */
 export interface FakeInstallation {
   id: number;
   account: string | null;
+  accountId?: number;
   repos: "all" | Set<string>;
   permissions: Record<string, string>;
 }
@@ -770,11 +776,13 @@ export interface FakeInstallation {
 /**
  * A token, as GitHub keeps it: for one repo (`repo`, a full name: nest's tokens in the fallback, or an
  * account's installation's), or for a repo by name alone (`name`: the default installation's, whose account
- * the fake doesn't pin), from an installation (null: nest's, not modelled), until it expires.
+ * the fake doesn't pin), or for every repo of its installation (`all`), from an installation (null: nest's, not
+ * modelled), until it expires.
  */
 export interface FakeToken {
   repo: string | null;
   name: string | null;
+  all?: boolean;
   permissions: Record<string, string>;
   installation: number | null;
   expires_ms: number;
@@ -790,6 +798,13 @@ export class FakeGitHub {
   installations: FakeInstallation[] = [{ id: GH_INSTALLATION_ID, account: null, repos: "all", permissions: { ...GRANT_PERMISSIONS } }];
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
   holds: { match: RegExp; release: Promise<void>; reached: boolean }[] = [];
+  /**
+   * Answer a repo's installation lookup with its account's installation even when that installation doesn't select
+   * the repo (whether GitHub does is unverified): then only the mint narrowed to it refuses (422).
+   */
+  lookupIgnoresSelection = false;
+  /** Answer `GET /app` without its `owner` (as a malformed answer would). */
+  appOwnerMissing = false;
   /** How long an installation token lives (GitHub's: an hour). */
   tokenLifeMs = 3_600_000;
   /** The claims of each App JWT GitHub accepted, in order. */
@@ -826,8 +841,11 @@ export class FakeGitHub {
   }
 
   /** Install the App on an account (replacing one with the same id): that account's repos go to it, not the default one. */
-  install(i: { id: number; account: string; repos?: string[]; permissions?: Record<string, string> }): FakeInstallation {
-    const full: FakeInstallation = { id: i.id, account: i.account.toLowerCase(), repos: i.repos ? new Set(i.repos.map((r) => r.toLowerCase())) : "all", permissions: i.permissions ?? { ...GRANT_PERMISSIONS } };
+  install(i: { id: number; account: string; accountId?: number; repos?: string[]; permissions?: Record<string, string> }): FakeInstallation {
+    const full: FakeInstallation = {
+      id: i.id, account: i.account.toLowerCase(), ...(i.accountId === undefined ? {} : { accountId: i.accountId }),
+      repos: i.repos ? new Set(i.repos.map((r) => r.toLowerCase())) : "all", permissions: i.permissions ?? { ...GRANT_PERMISSIONS },
+    };
     this.installations = [...this.installations.filter((x) => x.id !== i.id), full];
     return full;
   }
@@ -853,9 +871,15 @@ export class FakeGitHub {
     return this.installations.find((i) => i.account === null && covers(i)) ?? null;
   }
 
+  /** The repos an installation reaches, sorted: of the ones the fake knows, those it covers (its account's own, or the default one's). */
+  reposOf(installation: number): string[] {
+    return [...this.repos.keys()].filter((r) => this.installationFor(r)?.id === installation).sort();
+  }
+
   /** Whether `t` reaches `repoName` (the repo, by its name now) asked for as `asked`. */
   private reaches(t: FakeToken, repoName: string, asked: string): boolean {
     if (t.installation !== null && this.installationFor(repoName)?.id !== t.installation) return false;
+    if (t.all) return t.installation !== null;
     if (t.repo !== null) return (this.renamed.get(t.repo) ?? t.repo) === repoName;
     // By name alone: the repo asked for, or one renamed to it (a token minted for its old name reaches it).
     const name = (r: string) => r.split("/")[1];
@@ -901,21 +925,41 @@ export class FakeGitHub {
     const route = `${req.method} ${u.pathname}`;
     const inst = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/installation$/);
     const mint = u.pathname.match(/^\/app\/installations\/(\d+)\/access_tokens$/);
-    if (!(route === "GET /app" || (inst && req.method === "GET") || (mint && req.method === "POST"))) return null;
+    if (!(route === "GET /app" || route === "GET /app/installations" || (inst && req.method === "GET") || (mint && req.method === "POST"))) return null;
     if (!(await this.jwtOk(token))) return json(401, { message: "A JSON web token could not be decoded" });
     const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
     if (f) {
       f.times--;
       return json(f.status, { message: f.message ?? "injected" });
     }
-    if (route === "GET /app") return json(200, { id: GH_APP_ID, slug: GH_APP_SLUG, name: "nest test" });
+    if (route === "GET /app") return json(200, { id: GH_APP_ID, slug: GH_APP_SLUG, name: "nest test", ...(this.appOwnerMissing ? {} : { owner: { login: GH_APP_OWNER, id: ownerIdOf(GH_APP_OWNER), type: "User" } }) });
+    if (route === "GET /app/installations") {
+      const page = Number(u.searchParams.get("page") ?? "1");
+      const per = Number(u.searchParams.get("per_page") ?? "30");
+      return json(200, this.installations.slice((page - 1) * per, page * per).map((i) => ({
+        id: i.id, app_id: GH_APP_ID, account: i.account ? { login: i.account, id: i.accountId ?? ownerIdOf(GH_APP_OWNER) } : null, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected",
+      })));
+    }
     if (inst) {
-      const i = this.installationFor(inst[1]!);
-      return i ? json(200, { id: i.id, app_id: GH_APP_ID, account: i.account ? { login: i.account, id: ownerIdOf(i.account) } : null, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected" }) : json(404, { message: "Not Found" });
+      // The repo by its name now (GitHub redirects an old one), and its account: the installation's login, or for the
+      // default one (on every account) the repo owner's; its id the App owner's unless the test gave another.
+      const k = this.renamed.get(inst[1]!.toLowerCase()) ?? inst[1]!.toLowerCase();
+      const i = this.installationFor(k) ?? (this.lookupIgnoresSelection ? this.installations.find((x) => x.account === k.split("/")[0]) ?? null : null);
+      const owner = this.ownerOf(k);
+      return i ? json(200, { id: i.id, app_id: GH_APP_ID, account: { login: i.account ?? owner.login, id: i.accountId ?? ownerIdOf(GH_APP_OWNER) }, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected" }) : json(404, { message: "Not Found" });
     }
     const i = this.installations.find((x) => x.id === Number(mint![1]));
     if (!i) return json(404, { message: "Not Found" });
     const names: unknown = body?.repositories;
+    const permissions = (body?.permissions ?? {}) as Record<string, string>;
+    for (const [k, v] of Object.entries(permissions)) {
+      if (!levelWithin(v, i.permissions[k])) return json(422, { message: "The permissions requested are not granted to this installation." });
+    }
+    // No repos named: every repo of the installation.
+    if (names === undefined) {
+      const t: FakeToken = { repo: null, name: null, all: true, permissions, installation: i.id, expires_ms: Date.now() + this.tokenLifeMs };
+      return json(201, { token: this.issued(t, undefined), expires_at: new Date(t.expires_ms).toISOString(), permissions, repository_selection: i.repos === "all" ? "all" : "selected" });
+    }
     // One repo by name, as the app asks (an installation is one account's; the default one's names aren't pinned to one).
     if (!Array.isArray(names) || names.length !== 1 || typeof names[0] !== "string") return json(422, { message: "the fake mints for exactly one repo by name" });
     const name = (names[0] as string).toLowerCase();
@@ -923,12 +967,8 @@ export class FakeGitHub {
     // old name as its API redirects one (unverified for a mint).
     const full = i.account === null ? null : this.repos.has(`${i.account}/${name}`) ? `${i.account}/${name}` : [...this.renamed].find(([from, to]) => from.split("/")[1] === name && to.split("/")[0] === i.account)?.[1] ?? `${i.account}/${name}`;
     if (full !== null && this.installationFor(full)?.id !== i.id) return json(422, { message: `There is at least one repository that does not exist or is not accessible to the parent installation.` });
-    const permissions = (body?.permissions ?? {}) as Record<string, string>;
-    for (const [k, v] of Object.entries(permissions)) {
-      if (!levelWithin(v, i.permissions[k])) return json(422, { message: "The permissions requested are not granted to this installation." });
-    }
     const t: FakeToken = { repo: full, name: i.account === null ? name : null, permissions, installation: i.id, expires_ms: Date.now() + this.tokenLifeMs };
-    return json(201, { token: this.issue(t), expires_at: new Date(t.expires_ms).toISOString(), permissions, repository_selection: "selected" });
+    return json(201, { token: this.issued(t, [name]), expires_at: new Date(t.expires_ms).toISOString(), permissions, repository_selection: "selected" });
   }
 
   /** A PR on `repo` (open, from the repo itself, unless `o` says otherwise). */
@@ -984,6 +1024,15 @@ export class FakeGitHub {
     return this.calls.filter((c) => c.method === method && path.test(c.path));
   }
 
+  /** Each token the App's mints were answered with, in order: which installation, repos and permissions. */
+  readonly minted: { token: string; installation: number; repositories: string[] | undefined; permissions: Record<string, string> }[] = [];
+
+  private issued(t: FakeToken, repositories: string[] | undefined): string {
+    const token = this.issue(t);
+    this.minted.push({ token, installation: t.installation!, repositories, permissions: t.permissions });
+    return token;
+  }
+
   /** The App's mints (`POST /app/installations/<id>/access_tokens`): the installation, and the body's repos and permissions. */
   mints(): { installation: number; repositories: string[]; permissions: Record<string, string> }[] {
     return this.callsTo("POST", /^\/app\/installations\/\d+\/access_tokens$/).map((c) => ({ installation: Number(c.path.split("/")[3]), repositories: c.body?.repositories, permissions: c.body?.permissions }));
@@ -1004,6 +1053,25 @@ export class FakeGitHub {
     }
     const app = await this.appRoute(req, u, call.body, token, json);
     if (app) return app;
+    if (route === "DELETE /installation/token") {
+      // Revoked by itself (https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token).
+      if (!this.live(token)) return json(401, { message: "Bad credentials" });
+      this.tokens.delete(token!);
+      return new Response(null, { status: 204 });
+    }
+    if (route === "GET /installation/repositories") {
+      const t = this.live(token);
+      if (!t || t.installation === null) return json(401, { message: "Bad credentials" });
+      const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
+      if (f) {
+        f.times--;
+        return json(f.status, { message: f.message ?? "injected" });
+      }
+      const mine = this.reposOf(t.installation);
+      const page = Number(u.searchParams.get("page") ?? "1");
+      const per = Number(u.searchParams.get("per_page") ?? "30");
+      return json(200, { total_count: mine.length, repositories: mine.slice((page - 1) * per, page * per).map((r) => ({ id: this.repo(r).id, full_name: r, owner: this.ownerOf(r) })) });
+    }
     if (route === "POST /graphql") {
       const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
       if (f) {

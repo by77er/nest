@@ -7,14 +7,6 @@
 // a few times; anything else is the caller's to handle. The token is never logged or put in an error.
 
 /** nest's error body: `{error: {code, message, retryable}}`. */
-/** A repo as nest's grant answers for it: pushed to (`push`), read (`read`), and minted GitHub tokens for (`github`). */
-export interface GrantRepo {
-  repo: string;
-  push: boolean;
-  read: boolean;
-  github: boolean;
-}
-
 export class NestError extends Error {
   constructor(
     readonly status: number,
@@ -361,21 +353,6 @@ export class Nest {
     };
   }> {
     return this.call("GET", "/v1/clients/self");
-  }
-
-  /**
-   * The repos nest's grant for the app covers that nest can list (`GET /v1/clients/self/grant/repos`,
-   * docs/control-plane/api/clients/#owner-wide-entries): its exact entries and the repos of each
-   * owner-wide entry's account the App is installed on, each with what the grant allows there. nest
-   * decides membership (by the owner's GitHub id for an owner-wide entry); the app never copies the rule.
-   */
-  grantRepos(): Promise<{ repos: GrantRepo[]; unlisted: string[]; complete: boolean }> {
-    return this.call("GET", "/v1/clients/self/grant/repos");
-  }
-
-  /** Whether the grant covers each of these repos (`POST /v1/clients/self/grant/repos`), decided by nest. */
-  grantMembership(repos: string[]): Promise<{ repos: GrantRepo[] }> {
-    return this.call("POST", "/v1/clients/self/grant/repos", { repos });
   }
 
   /** Store or replace a write-only secret (docs/control-plane/api/clients/#secrets); answers its metadata, never the value. */

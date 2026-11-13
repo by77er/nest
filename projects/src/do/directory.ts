@@ -279,17 +279,24 @@ export class DirectoryDO extends DurableObject<Env> {
    * named now. A project with no id yet is found by the name it was created with, and takes the event's
    * id from then on. A name whose project has another id is another repo's now (ours was renamed, and the
    * name taken): no project. A project whose App installation is known takes only events from that
-   * installation (`installation.id`): any other, or none, is refused (README.md#the-repos-binding).
+   * installation (`installation.id`): any other, or none, is refused (README.md#the-repos-binding). One with none
+   * known yet refuses an event whose repo owner isn't an account the app acts for (`ownerAllowed` false, the
+   * Worker's answer; null: not checked, the fallback's).
    */
-  async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null): Promise<{ project: ProjectRow; anchored: boolean; recorded_owner: number | null } | { refused: string; project_id: string } | null> {
+  async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null, ownerAllowed: boolean | null = null): Promise<{ project: ProjectRow; anchored: boolean; recorded_owner: number | null } | { refused: string; project_id: string } | null> {
     const one = (where: string, v: SqlStorageValue) =>
       this.sql.exec<ProjectRow & Record<string, SqlStorageValue>>(`SELECT ${COLUMNS}, installation_id, repo_bound, repo_owner_id FROM projects WHERE ${where}`, v).toArray()[0] ?? null;
     const row = (r: ProjectRow & Record<string, SqlStorageValue>): ProjectRow => ({ id: r.id, name: r.name, repo: r.repo, created_ms: r.created_ms, state: r.state });
     // Refused, and counted on the binding so the Admin page shows it: a reinstalled App's events would
     // otherwise all be dropped unseen (Re-read takes the new installation).
     const wrongInstallation = (r: Record<string, SqlStorageValue>) => {
-      if (r.installation_id === null || r.installation_id === installation) return null;
+      // No installation known yet: the event's repo owner must be an account the app acts for (README.md#repo-authority),
+      // whatever installation the event names (or none).
+      if (r.installation_id === null) {
+        if (ownerAllowed !== false) return null;
+      } else if (r.installation_id === installation) return null;
       this.sql.exec("UPDATE projects SET refused_installation = ?, refused_count = refused_count + 1, refused_ms = ? WHERE id = ?", installation, Date.now(), r.id);
+      if (r.installation_id === null) return `the event's repo owner isn't an account the app acts for, and the project has no installation yet`;
       return `the event's installation (${installation ?? "none"}) isn't the project's (${r.installation_id as number})`;
     };
     if (repoId !== null) {

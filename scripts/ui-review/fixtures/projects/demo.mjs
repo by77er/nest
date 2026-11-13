@@ -489,22 +489,26 @@ const RICH = [
     if (variant === "error") return [500, { error: "internal error (fixture)" }];
     if (path === "/projects") return [200, { projects }];
     if (path === "/admin/sync-state") return [200, sync];
-    // The repos a new project may be attached to (README.md#flows): nest's answer, each with the project on it.
+    // The repos a new project may be attached to (README.md#repo-authority): the GitHub App's installations', each
+    // with the project on it, and the App by name.
     if (path === "/repos") {
-      if (variant === "repos-failed") return [502, { error: "nest couldn't say which repos the app may attach: no answer within 20000 ms (fixture)" }];
-      if (variant === "repos-none") return [200, { complete: true, unlisted: [], repos: [] }];
+      const app = { slug: "nest-by77er", install_url: "https://github.com/apps/nest-by77er/installations/new" };
+      if (variant === "repos-failed") return [502, { error: "GitHub couldn't say which repos the app's GitHub App reaches: GitHub 502: no answer within 20000 ms (fixture)" }];
+      if (variant === "repos-none") return [200, { complete: true, unlisted: [], repos: [], app }];
+      // GitHub didn't name the App: the way to it is the account's installed-Apps settings.
+      if (variant === "repos-noapp") return [200, { complete: true, unlisted: [], repos: [{ repo, project: demo.id }, { repo: "by77er/sprockets", project: null }], app: null }];
       const attached = [{ repo, project: demo.id }, { repo: other.repo, project: other.id }];
       if (variant === "repos-many") {
-        return [200, { complete: true, unlisted: [], repos: [...attached,
+        return [200, { complete: true, unlisted: [], app, repos: [...attached,
           { repo: "by77er/gadgets-platform-customer-facing-catalogue-and-search-with-a-very-long-name", project: null },
           ...Array.from({ length: 30 }, (_, k) => ({ repo: `by77er/repo-${String(k).padStart(2, "0")}`, project: null })),
           { repo: "by77er/gadget-docs", project: null }] }];
       }
       if (variant === "repos-unlisted") {
-        return [200, { complete: false, unlisted: ["acme-industries-holding-company-international/*", "someone-else/*"],
+        return [200, { complete: false, unlisted: ["acme-industries-holding-company-international", "someone-else"], app,
           repos: [...attached, { repo: "by77er/sprockets", project: null }, { repo: "by77er/cogs", project: null }] }];
       }
-      return [200, { complete: true, unlisted: [], repos: [...attached, { repo: "by77er/sprockets", project: null }, { repo: "by77er/cogs", project: null }] }];
+      return [200, { complete: true, unlisted: [], app, repos: [...attached, { repo: "by77er/sprockets", project: null }, { repo: "by77er/cogs", project: null }] }];
     }
     if (path === "/admin/sync" && method === "POST") return [200, { written: sync.written.slice(0, 2), repos: ["by77er/gadgets"] }];
     // Each project's repo binding (README.md#the-repos-binding): read from GitHub; learned from an event, renamed

@@ -678,7 +678,8 @@ const app = {
     { name: "projects-error", section: "top", path: "/projects", fixture: "error", httpErrors: true, ready: shown("[data-ds=error]") },
     { name: "new-project", section: "top", path: "/projects", full: false, after: (p) => p.getByRole("button", { name: "New project" }).first().click() },
     // The create form's repo picker (README.md#flows): open, with repos already a project's; searched, with a
-    // long name; owners nest couldn't list; nothing to attach; and the list failing, so the name is typed.
+    // long name; searched, matching nothing; installations GitHub couldn't list, and typing a repo then; the App not named;
+    // nothing to attach; and the list failing, so the name is typed.
     { name: "new-project-picker", section: "top", path: "/projects", full: false, after: async (p) => {
       await p.getByRole("button", { name: "New project" }).first().click();
       await p.getByRole("dialog").getByLabel(/^Repository/).first().click();
@@ -689,7 +690,21 @@ const app = {
       await f.click();
       await f.fill("gadg");
     } },
+    // A search that matches nothing: how to add the repo on GitHub.
+    { name: "new-project-picker-nomatch", section: "top", path: "/projects", full: false, after: async (p) => {
+      await p.getByRole("button", { name: "New project" }).first().click();
+      const f = p.getByRole("dialog").getByLabel(/^Repository/).first();
+      await f.click();
+      await f.fill("no-such-repo");
+      await p.getByText(/No repo matches/).first().waitFor();
+    } },
+    // Typing a repo the list may not show (an installation it couldn't read, or past its cap).
+    { name: "new-project-picker-typed", section: "top", path: "/projects", fixture: "repos-unlisted", full: false, after: async (p) => {
+      await p.getByRole("button", { name: "New project" }).first().click();
+      await p.getByRole("dialog").getByRole("button", { name: "Type a repo instead" }).click();
+    } },
     { name: "new-project-picker-unlisted", section: "top", path: "/projects", fixture: "repos-unlisted", full: false, after: (p) => p.getByRole("button", { name: "New project" }).first().click() },
+    { name: "new-project-picker-noapp", section: "top", path: "/projects", fixture: "repos-noapp", full: false, after: (p) => p.getByRole("button", { name: "New project" }).first().click() },
     { name: "new-project-picker-none", section: "top", path: "/projects", fixture: "repos-none", full: false, after: (p) => p.getByRole("button", { name: "New project" }).first().click() },
     { name: "new-project-repos-failed", section: "top", path: "/projects", fixture: "repos-failed", httpErrors: true, full: false, after: async (p) => {
       await p.getByRole("button", { name: "New project" }).first().click();
