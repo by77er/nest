@@ -104,7 +104,9 @@ describe("attaching PRs", () => {
     expect((await attach(p, w.id, 15)).body.error).toMatch(/is closed/);
     expect((await attach(p, w.id, 99)).status).toBe(404);
     // Its token reads PRs only.
-    expect(fake.calls.filter((c) => c.path === "/v1/clients/self/github-token" && c.body.permissions.pull_requests === "read").at(-1)!.body.permissions).toEqual({ pull_requests: "read" });
+    const reads = fake.github.calls.filter((c) => c.method === "GET" && /^\/repos\/[^/]+\/[^/]+\/pulls(\/\d+)?$/.test(c.path));
+    expect(reads.length).toBeGreaterThan(0);
+    for (const c of reads) expect(c.permissions).toEqual({ pull_requests: "read" });
   });
 
   it("a PR attached to one task is refused for another, by the owner and by a branch alike", async () => {

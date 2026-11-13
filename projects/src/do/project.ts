@@ -792,7 +792,7 @@ export class ProjectDO extends DurableObject<Env> {
         const nest = nestFrom(this.env);
         if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
         try {
-          const found = await (await githubFor(nest, await this.repo(), PERMISSIONS.metadata)).user(u.comments_from_login);
+          const found = await (await githubFor(this.env, nest, await this.repo(), PERMISSIONS.metadata)).user(u.comments_from_login);
           if (!found) return fail(400, `GitHub has no user ${u.comments_from_login}`);
           if (found.type !== "User") return fail(400, `${found.login} is ${found.type === "Organization" ? "an organization" : "a bot"}, not a person: its comments can't be the owner's`);
           who = { id: found.id, login: found.login };
@@ -1208,7 +1208,7 @@ export class ProjectDO extends DurableObject<Env> {
     const b = await directory(this.env).binding(this.settingsRow()!.id as string);
     if (!b) throw new Error("the project isn't in the directory");
     if (b.bound !== "github" || b.repo_id === null) return { problem: "the repo's binding isn't read from GitHub yet: Re-read it on the Admin page", unbound: true };
-    const info = await (await githubFor(nest, b.repo, PERMISSIONS.metadata)).repoInfo(b.repo);
+    const info = await (await githubFor(this.env, nest, b.repo, PERMISSIONS.metadata)).repoInfo(b.repo);
     if (info.id !== b.repo_id) return { problem: `GitHub's ${b.repo} is repo ${info.id}, not the bound repo ${b.repo_id}: Re-read the binding on the Admin page` };
     return { owner: info.owner };
   }
@@ -1452,7 +1452,7 @@ export class ProjectDO extends DurableObject<Env> {
       const bound = await this.boundOwner(nest);
       if ("problem" in bound && !bound.unbound) return fail(409, `the issues weren't imported: ${bound.problem}`);
       owner = "owner" in bound && bound.owner.type === "User" ? bound.owner.id : null;
-      const gh = await githubFor(nest, repo, PERMISSIONS.issuesRead);
+      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.issuesRead);
       list = await gh.openIssues(repo);
     } catch (e) {
       return fail(e instanceof NestError || e instanceof GitHubError ? (e.status === 403 ? 403 : 502) : 502, `the issues couldn't be read: ${message(e)}`);
@@ -1494,7 +1494,7 @@ export class ProjectDO extends DurableObject<Env> {
     const line = row.pr !== null ? `Done in #${row.pr as number}.` : "Done.";
     try {
       const repo = await this.repo();
-      const gh = await githubFor(nest, repo, PERMISSIONS.issuesWrite);
+      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.issuesWrite);
       // The comment once: not again on a retry after it landed (the close failed), nor when it landed but
       // its answer was lost (it's among the issue's comments since the close was owed).
       if (row.commented !== 1) {
@@ -1628,7 +1628,7 @@ export class ProjectDO extends DurableObject<Env> {
     let repo = "the repo";
     try {
       repo = await this.repo();
-      p = await (await githubFor(nest, repo, PERMISSIONS.pullsRead)).pull(repo, pr);
+      p = await (await githubFor(this.env, nest, repo, PERMISSIONS.pullsRead)).pull(repo, pr);
     } catch (e) {
       return fail(e instanceof GitHubError && e.status === 404 ? 404 : 502, e instanceof GitHubError && e.status === 404 ? `no PR #${pr} on ${repo}` : message(e));
     }
@@ -1661,7 +1661,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
     try {
       const repo = await this.repo();
-      const list = await (await githubFor(nest, repo, PERMISSIONS.pullsRead)).openPulls(repo);
+      const list = await (await githubFor(this.env, nest, repo, PERMISSIONS.pullsRead)).openPulls(repo);
       return ok(list.map((p) => {
         const row = this.prRow(p.number);
         return { number: p.number, title: p.title, head: p.head_ref, fork: p.fork, task: row && row.state !== "detached" ? (row.task as string) : null };
@@ -1902,7 +1902,7 @@ export class ProjectDO extends DurableObject<Env> {
     let verdicts: Record<string, Verdict>;
     try {
       const repo = await this.repo();
-      const gh = await githubFor(nest, repo, PERMISSIONS.prRead);
+      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.prRead);
       prs = await readPrs(gh, repo, owned.map((o) => o.pr));
       const heads = [...prs.values()].filter((p): p is PrNow => p !== null && p.state === "OPEN" && !p.cross_repo).map((p) => ({ pr: p.number, sha: p.head_sha }));
       verdicts = heads.length ? await review(this.env, s.id).verdictsAt(heads) : {};
@@ -3971,7 +3971,7 @@ export class ProjectDO extends DurableObject<Env> {
     const want = s.auto_merge;
     try {
       const repo = await this.repo();
-      const gh = await githubFor(nest, repo, PERMISSIONS.repoSettings);
+      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.repoSettings);
       const after = await gh.setAllowAutoMerge(repo, want);
       const now = Date.now();
       const seen = JSON.stringify({ value: want, at_ms: now } satisfies Seen);
@@ -3994,7 +3994,7 @@ export class ProjectDO extends DurableObject<Env> {
   private async readRepoAutoMerge(nest: Nest): Promise<void> {
     try {
       const repo = await this.repo();
-      const gh = await githubFor(nest, repo, PERMISSIONS.repoRead);
+      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.repoRead);
       const value = await gh.allowAutoMerge(repo);
       this.sql.exec("UPDATE settings SET am_observed = ?, am_read_next_ms = NULL, am_read_attempts = 0", JSON.stringify({ value, at_ms: Date.now() } satisfies Seen));
     } catch (e) {
@@ -4015,7 +4015,7 @@ export class ProjectDO extends DurableObject<Env> {
     const github: Actor = { kind: "app", what: "github" };
     const still = () => this.prRow(pr)?.am_owed === what;
     try {
-      const gh = await githubFor(nest, await this.repo(), PERMISSIONS.autoMerge);
+      const gh = await githubFor(this.env, nest, await this.repo(), PERMISSIONS.autoMerge);
       if (what === "enable") await gh.enableAutoMerge(before.node as string, GRAPHQL_METHOD[method]);
       else await gh.disableAutoMerge(before.node as string);
       const status: TaskAutoMerge = { state: what === "enable" ? "enabled" : "disabled", method: what === "enable" ? method : null, error: null, at_ms: Date.now() };
@@ -4048,8 +4048,9 @@ export class ProjectDO extends DurableObject<Env> {
     const gen = this.settingsRow()!.attach_gen as number;
     try {
       const repo = await this.repo();
-      const gh = await githubFor(nest, repo, PERMISSIONS.attach);
-      // The App's id from nest's token answer; else one a check run told, if any has yet.
+      // The installation looked up now (the binding stores it), never a cached one.
+      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.attach, { fresh: true });
+      // The App's id (the App's own, or nest's token answer in the fallback); else one a check run told, if any has yet.
       const appId = gh.appId ?? (await directory(this.env).githubAppId());
       if (gh.appId !== null) await directory(this.env).recordGithubAppId(gh.appId);
       const r = await requireReviewCheck(gh, repo, appId);

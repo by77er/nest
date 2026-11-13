@@ -6,7 +6,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { ENDED_RUNS_KEEP_MS, ERRORS_KEEP_MS, REVIEW_JOBS_KEEP_MS, TRIAGED_PROPOSALS_KEEP_MS } from "../src/retention";
 import { RUN_EXIT_GRACE_MS } from "../src/do/project";
-import { PERMISSIONS } from "../src/github";
 import { AccessTeam, api, deliver, deliverGithub, FakeNest, installFetch, prEvent, Signer } from "./fake-nest";
 
 const fake = new FakeNest();
@@ -108,13 +107,12 @@ describe("B12: an exit that overtakes its create's answer", () => {
 describe("B14: an attach owed while one runs", () => {
   it("stays owed when the running one succeeds", async () => {
     const p = await newProject();
-    // Each attach asks nest for one token with the attach's permissions.
-    const attaches = () => fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/clients/self/github-token"
-      && c.body?.repo === p.repo && JSON.stringify(c.body?.permissions) === JSON.stringify(PERMISSIONS.attach)).length;
+    // Each attach looks the App's installation on the repo up afresh, then reads its required checks.
+    const attaches = () => gh.callsTo("GET", new RegExp(`^/repos/${p.repo}/branches/[^/]+/protection/required_status_checks$`)).length;
     const before = attaches();
     let release!: () => void;
-    const hold = { match: /^POST \/v1\/clients\/self\/github-token$/, release: new Promise<void>((r) => (release = r)), reached: false };
-    fake.holds.push(hold);
+    const hold = { match: new RegExp(`^GET /repos/${p.repo}/installation$`), release: new Promise<void>((r) => (release = r)), reached: false };
+    gh.holds.push(hold);
     const retrying = api(token, "POST", `/api/projects/${p.id}/attach`);
     await until(() => hold.reached);
     // The App's id is learned meanwhile (a check run told it): the project must attach again.
@@ -128,22 +126,22 @@ describe("B14: an attach owed while one runs", () => {
 
   it("stays owed when the running one fails for good", async () => {
     const p = await newProject();
-    const attaches = () => fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/clients/self/github-token"
-      && c.body?.repo === p.repo && JSON.stringify(c.body?.permissions) === JSON.stringify(PERMISSIONS.attach)).length;
+    const attaches = () => gh.callsTo("GET", new RegExp(`^/repos/${p.repo}/branches/[^/]+/protection/required_status_checks$`)).length;
     const before = attaches();
     let release!: () => void;
-    const hold = { match: /^POST \/v1\/clients\/self\/github-token$/, release: new Promise<void>((r) => (release = r)), reached: false };
-    fake.holds.push(hold);
-    // The held token call is then refused for good (a 403): the running attach fails permanently.
-    fake.fail(/^POST \/v1\/clients\/self\/github-token$/, 403);
+    const hold = { match: new RegExp(`^GET /repos/${p.repo}/installation$`), release: new Promise<void>((r) => (release = r)), reached: false };
+    gh.holds.push(hold);
+    // The held lookup then answers that the App isn't installed there (a 404): the running attach fails for good.
+    gh.fail(new RegExp(`^GET /repos/${p.repo}/installation$`), 404);
     const retrying = api(token, "POST", `/api/projects/${p.id}/attach`);
     await until(() => hold.reached);
     await projectStub(p).appIdLearned(999_002);
     release();
     await retrying;
     await projectStub(p).drain();
-    // The attach owed meanwhile still ran (the failure's "for good" didn't clear it), and succeeded.
-    expect(attaches() - before).toBe(2);
+    // The attach owed meanwhile still ran (the failure's "for good" didn't clear it), and succeeded: the refused
+    // one never reached the required checks, so this read is the owed one's.
+    expect(attaches() - before).toBe(1);
     expect(await inProject(p, (sql) => sql.exec("SELECT attach_error FROM settings").one().attach_error)).toBeNull();
   });
 });

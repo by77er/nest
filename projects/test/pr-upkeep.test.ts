@@ -427,8 +427,8 @@ describe("telling the worker", () => {
   it("a worker that exits while the read is out is told nothing (who owns what is read again after it)", async () => {
     const s = await setup({ mergeable: "CONFLICTING" });
     let release!: () => void;
-    const hold = { match: /^POST \/v1\/clients\/self\/github-token$/, release: new Promise<void>((r) => { release = r; }), reached: false };
-    fake.holds.push(hold);
+    const hold = { match: /^POST \/graphql$/, release: new Promise<void>((r) => { release = r; }), reached: false };
+    fake.github.holds.push(hold);
     await sql(s, "UPDATE settings SET pr_read_next_ms = 0, pr_read_last_ms = 0");
     const draining = stub(s).drain();
     await vi.waitFor(() => expect(hold.reached).toBe(true));

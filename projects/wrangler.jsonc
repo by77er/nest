@@ -44,4 +44,7 @@
   // - NEST_CLIENT_TOKEN: the `projects` API client's token (`POST /v1/admin/clients`, shown once).
   // - NEST_WEBHOOK_SECRET: the secret `PUT /v1/clients/self/webhook` showed (signs /hooks/nest).
   // - GITHUB_WEBHOOK_SECRET: the GitHub App webhook's secret (signs /hooks/github).
+  // Put by hand (`wrangler secret put`, README.md#setup-the-operators), not by the workflow:
+  // - GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY: the app's own GitHub App, its id and its PKCS#1 PEM (README.md#github-tokens).
+  // - GITHUB_TOKEN_SOURCE: `nest` only to take GitHub tokens from nest again (the fallback, for one release).
 }

@@ -6,7 +6,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { CHECK_NAME } from "../src/github";
-import { AccessTeam, api, deliverGithub, FakeNest, GH_APP_ID, installFetch, prEvent } from "./fake-nest";
+import { AccessTeam, api, deliverGithub, FakeNest, GH_APP_ID, GH_INSTALLATION_ID, installFetch, prEvent, withNestTokens } from "./fake-nest";
 
 const fake = new FakeNest();
 const gh = fake.github;
@@ -60,10 +60,16 @@ describe("attaching a repo", () => {
     expect(prot.required_pull_request_reviews).toBeUndefined();
     expect(prot.restrictions).toBeUndefined();
     expect(managersOf(p.id)).toHaveLength(1);
-    // Its token: administration and metadata, nothing more. (The second, metadata alone, is the create's answer
-    // reading the repo's owner to show.)
-    const minted = fake.calls.filter((c) => c.path === "/v1/clients/self/github-token" && c.body.repo.toLowerCase() === repo.toLowerCase());
-    expect(minted.map((c) => c.body.permissions)).toEqual([{ administration: "write", metadata: "read" }, { metadata: "read" }]);
+    // Its token: for this one repo, with administration and metadata, nothing more, minted from the App's
+    // installation on it. (The other, metadata alone, is the create's answer reading the repo's owner to show.)
+    const name = repo.split("/")[1]!;
+    expect(gh.mints().filter((m) => m.repositories[0] === name)).toEqual([
+      { installation: GH_INSTALLATION_ID, repositories: [name], permissions: { administration: "write", metadata: "read" } },
+      { installation: GH_INSTALLATION_ID, repositories: [name], permissions: { metadata: "read" } },
+    ]);
+    const used = gh.calls.filter((c) => c.path.startsWith(`/repos/${repo}/branches/`));
+    expect(used.length).toBeGreaterThan(0);
+    for (const c of used) expect(c.permissions).toEqual({ administration: "write", metadata: "read" });
   });
 
   it("adds the check to existing required checks once, keeping every other setting", async () => {
@@ -107,25 +113,36 @@ describe("attaching a repo", () => {
     expect(patches.map((c) => c.body)).toEqual([{ checks: [{ context: "ci/build", app_id: 15368 }, { context: "lint", app_id: -1 }, { context: CHECK_NAME, app_id: GH_APP_ID }] }]);
   });
 
-  it("without the App's id in nest's answer, requires the check from any source, then pins it once a check run tells the id", async () => {
+  it("with nest's tokens (the fallback) and no App id in nest's answer, requires the check from any source, then pins it once a check run tells the id", async () => {
     fake.githubApp = null;
     try {
-      await forgetAppId();
-      const repo = `o-${rand()}/r-${rand()}`;
-      gh.repo(repo).protection = protectedBranch();
-      const p = await create(repo);
-      expect(p.settings.attach.app_id).toBeNull();
-      expect(gh.repo(repo).protection!.required_status_checks.checks.at(-1)).toEqual({ context: CHECK_NAME, app_id: null });
-      await deliverGithub("pull_request", prEvent({ repo, number: 1, sha: sha(), action: "opened" }));
-      await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
-      await env.PROJECT.get(env.PROJECT.idFromName(p.id)).drain();
-      const s = (await api(token, "GET", `/api/projects/${p.id}/settings`)).body;
-      expect(s.attach).toMatchObject({ change: "pinned", app_id: GH_APP_ID });
-      const checks = gh.repo(repo).protection!.required_status_checks.checks;
-      expect(checks).toEqual([{ context: "ci/build", app_id: 15368 }, { context: "lint", app_id: null }, { context: CHECK_NAME, app_id: GH_APP_ID }]);
+      await withNestTokens(async () => {
+        await forgetAppId();
+        const repo = `o-${rand()}/r-${rand()}`;
+        gh.repo(repo).protection = protectedBranch();
+        const p = await create(repo);
+        expect(p.settings.attach.app_id).toBeNull();
+        expect(gh.repo(repo).protection!.required_status_checks.checks.at(-1)).toEqual({ context: CHECK_NAME, app_id: null });
+        await deliverGithub("pull_request", prEvent({ repo, number: 1, sha: sha(), action: "opened" }));
+        await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
+        await env.PROJECT.get(env.PROJECT.idFromName(p.id)).drain();
+        const s = (await api(token, "GET", `/api/projects/${p.id}/settings`)).body;
+        expect(s.attach).toMatchObject({ change: "pinned", app_id: GH_APP_ID });
+        const checks = gh.repo(repo).protection!.required_status_checks.checks;
+        expect(checks).toEqual([{ context: "ci/build", app_id: 15368 }, { context: "lint", app_id: null }, { context: CHECK_NAME, app_id: GH_APP_ID }]);
+      });
     } finally {
       fake.githubApp = { app_id: GH_APP_ID, app_slug: "nest-test" };
     }
+  });
+
+  it("with the App's own tokens, pins the check to the App at once: its id is the app's own, before any check run tells it", async () => {
+    await forgetAppId();
+    const repo = `o-${rand()}/r-${rand()}`;
+    gh.repo(repo).protection = protectedBranch();
+    const p = await create(repo);
+    expect(p.settings.attach).toMatchObject({ change: "added", app_id: GH_APP_ID });
+    expect(gh.repo(repo).protection!.required_status_checks.checks.at(-1)).toEqual({ context: CHECK_NAME, app_id: GH_APP_ID });
   });
 
   it("a refusal is shown, the manager waits, and the owner's retry attaches and starts it", async () => {

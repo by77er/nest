@@ -139,9 +139,10 @@ describe("a PR's review", () => {
     for (const part of [p.repo.toLowerCase(), "#3", s, "develop", "submit_review"]) expect(brief).toContain(part);
     const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels.role === "reviewer" && c.body.labels.project === p.id);
     expect(creates.map((c) => c.idempotencyKey)).toEqual([`${p.id}/review/3/${s}/1/agent`]);
-    // The check's token asked for checks only.
-    const minted = fake.calls.filter((c) => c.path === "/v1/clients/self/github-token" && c.body.permissions.checks);
-    expect(minted.at(-1)!.body.permissions).toEqual({ checks: "write" });
+    // The check's token: checks only.
+    const made = fake.github.callsTo("POST", new RegExp(`^/repos/${p.repo.toLowerCase()}/check-runs$`));
+    expect(made.length).toBeGreaterThan(0);
+    for (const c of made) expect(c.permissions).toEqual({ checks: "write" });
     const r = toolOk(await callTool("review", await reviewerToken(p, reviewer, 3, s), "review_get"));
     expect(r).toMatchObject({ repo: p.repo.toLowerCase(), pr: 3, sha: s, base: "develop", title: "PR 3" });
   });

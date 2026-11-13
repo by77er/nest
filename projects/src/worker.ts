@@ -1,7 +1,7 @@
 // The projects app's Worker (README.md): the page and its JSON API behind Cloudflare Access, the MCP
 // servers agents call (authenticated by Nest-Identity), and the webhooks of nest and of the GitHub App
 // (each authenticated by its signature). It reaches nest only through the client interface (src/nest.ts),
-// and GitHub with the tokens nest mints it (src/github.ts); it imports nothing from the control plane
+// and GitHub with its own App's tokens (src/github.ts, src/github-app.ts); it imports nothing from the control plane
 // (test/deps.test.ts).
 
 import { verifyAccessJwt } from "./access";

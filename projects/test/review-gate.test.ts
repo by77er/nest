@@ -157,12 +157,10 @@ describe("a PR the project doesn't trust is held", () => {
     const bot = { id: ownerIdOf("nest-test[bot]"), login: "nest-test[bot]", type: "Bot" };
     const dir = env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
     await dir.recordGithubAppBotId(424_242);
-    // nest's token answer names no App just now: the lookup finds nothing.
-    const app = fake.githubApp;
-    fake.githubApp = null;
+    // GitHub fails the bot's lookup just now.
+    fake.github.fail(/^GET \/users\//, 502);
     const s1 = sha();
     await push(p, 1, s1, "opened", { user: bot });
-    fake.githubApp = app;
     expect((await job(p, 1, s1)).state).toBe("held");
     const s2 = sha();
     await push(p, 2, s2, "opened", { user: bot });

@@ -1,7 +1,8 @@
 // A project's repo binding (README.md#the-repos-binding): the repo's GitHub id, read from GitHub (at
 // attach, at a catalog sync for a project that has none, or at the operator's re-read) rather than taken
 // from the first event; and a rename or transfer applied once nest's grant names the repo's new name.
-// Only nest's client interface: a GitHub token for the project's repo (metadata: read), and the grant.
+// A token of the app's own App for the project's repo (metadata: read), its installation looked up afresh
+// (src/github-app.ts), and nest's grant.
 
 import { directory, type Env, project, review } from "./env";
 import { githubFor, ownInstallation, PERMISSIONS } from "./github";
@@ -27,17 +28,18 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
     // Whether the token is for the repo's current name: only then is its installation the repo's.
     let current = true;
     try {
-      gh = await githubFor(nest, name, PERMISSIONS.metadata);
+      // The installation looked up now, never a cached one: the binding follows a reinstall at once.
+      gh = await githubFor(env, nest, name, PERMISSIONS.metadata, { fresh: true });
     } catch (e) {
       // The new name isn't in nest's grant yet (403): a token for the name the grant holds reads the same repo.
       if (!(b.renamed_to && e instanceof NestError && e.status === 403)) throw e;
-      gh = await githubFor(nest, b.repo, PERMISSIONS.metadata);
+      gh = await githubFor(env, nest, b.repo, PERMISSIONS.metadata, { fresh: true });
       current = false;
     }
     const r = await gh.repoInfo(name);
-    // A token for the old name may come from another installation (the name taken since, by a repo the App
-    // is installed on): its installation is never stored, so the one stored stays. Nor is one for a name
-    // GitHub redirects (moved since, no event naming the new one yet): it may be another account's.
+    // The installation for the old name may be another (the name taken since, by a repo the App is installed
+    // on): it's never stored, so the one stored stays. Nor is one for a name GitHub redirects (moved since, no
+    // event naming the new one yet): it may be another account's.
     info = { id: r.id, full_name: r.full_name, owner: { id: r.owner.id, login: r.owner.login, type: r.owner.type }, installation_id: current ? ownInstallation(name, r.full_name, gh.installationId) : null };
   } catch (e) {
     return { ok: false, error: `GitHub couldn't be read: ${message(e)}`, binding: b };
@@ -98,9 +100,10 @@ export async function writeOldCopies(env: Env, id: string, name: string, b?: Rep
 
 /**
  * An event refused for coming from another App installation than the binding's (README.md#the-repos-binding):
- * the binding is read again (at most once a minute per project), so it follows nest's answer, the
- * installation nest mints the repo's tokens from now (the App reinstalled, or the repo moved to an account
- * nest's grant covers). nest's grant decides which installation is the repo's, never the event. True when
+ * the binding is read again (at most once a minute per project), so it follows GitHub's answer, the App's
+ * installation on the repo as looked up now (the App reinstalled, or the repo moved to an account nest's
+ * grant covers). GitHub's lookup decides which installation is the repo's, within nest's grant, never the
+ * event. True when
  * the binding's installation changed, so the event is to be routed again (and refused again, and counted,
  * if the binding took another one than the event's).
  */
@@ -114,8 +117,8 @@ export async function followInstallation(env: Env, nest: Nest, id: string): Prom
 
 /**
  * A catalog sync's pass over the bindings: an id read for each project with none (or bound from an event),
- * each one that has a rename noted or events refused read again (its owner and installation as GitHub and
- * nest answer now), each rename applied that can be, and the previous release's copies of the name written
+ * each one that has a rename noted or events refused read again (its owner and installation as GitHub
+ * answers now), each rename applied that can be, and the previous release's copies of the name written
  * again. Never fails the sync: what didn't bind is kept on the binding.
  */
 export async function bindAll(env: Env, nest: Nest): Promise<void> {
