@@ -298,6 +298,8 @@ export const EgressAuditRecord = z.object({
   status: U16.optional(),
   bytes_up: U64,
   bytes_down: U64,
+  /** From the decision (or the connection's start) to the record; absent from an aggregated record and an older proxy's. */
+  duration_ms: U64.optional(),
   verdict: EgressVerdict,
   binding: z.string().optional(),
   reason: z.string().optional(),

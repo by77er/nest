@@ -3385,6 +3385,7 @@ mod tests {
             status: None,
             bytes_up: 0,
             bytes_down: 0,
+            duration_ms: None,
             verdict,
             binding: None,
             reason: Some(reason.into()),
