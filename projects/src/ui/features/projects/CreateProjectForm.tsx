@@ -1,7 +1,7 @@
 // A new project: its name, its GitHub repo, and how it assigns work. Checked with the Worker's own
-// schema (src/requests.ts) before it's sent. The repo is picked from those nest's grant lets the app
-// attach (GET /api/repos: nest decides, owner-wide entries included); a repo already a project's is
-// shown but can't be picked. If the list can't be had, the name is typed, as before.
+// schema (src/requests.ts) before it's sent. The repo is picked from those the app's GitHub App reaches
+// (GET /api/repos: GitHub decides, each installation's own repos); a repo already a project's is shown but
+// can't be picked. If the list can't be had, the name is typed, as before.
 
 import { Button, NumberInput, Select, Switch, TextInput } from "@mantine/core";
 import { schemaResolver, useForm } from "@mantine/form";
@@ -12,19 +12,19 @@ import { FieldGroup, Notice } from "../../layout";
 
 /** What the picker says under its label: where the repos come from (and, when there are none, why). */
 function pickerDescription(r: AttachableRepos): string {
-  const said = "Repos nest's grant lets the app work in, on which nest's GitHub App is installed.";
-  return r.repos.length ? said : `${said} None yet: the operator adds repos to the app's grant in nest.`;
+  const said = "Repos the app's GitHub App is installed on.";
+  return r.repos.length ? said : `${said} None yet: install the App on an account, with the repos it may work in.`;
 }
 
-/** What nest couldn't list, said apart from the field's description: owners the App isn't on, and the cap. */
+/** What GitHub couldn't list, said apart from the field's description: installations whose repos it didn't answer, and the cap. */
 function unlistedNote(r: AttachableRepos): string[] {
   const said: string[] = [];
-  if (r.unlisted.length) said.push(`${r.unlisted.map((e) => e.replace(/\/\*$/, "")).join(", ")}: nest's GitHub App isn't installed there, so their repos can't be listed.`);
-  if (!r.complete) said.push("Only an owner's first 1000 repos are listed.");
+  if (r.unlisted.length) said.push(`${r.unlisted.join(", ")}: the App's repos there couldn't be listed just now.`);
+  if (!r.complete) said.push("Only an installation's first 1000 repos are listed.");
   return said;
 }
 
-/** The picker's options: repos that can be picked first, then those already a project's (shown, disabled); each group in nest's order. */
+/** The picker's options: repos that can be picked first, then those already a project's (shown, disabled); each group in the Worker's order. */
 function pickerOptions(r: AttachableRepos | undefined) {
   const repos = r?.repos ?? [];
   return [...repos.filter((x) => x.project === null), ...repos.filter((x) => x.project !== null)]
@@ -61,7 +61,7 @@ export function CreateProjectForm({ onCreated, onCancel }: { onCreated: (p: Crea
         {repos.isError ? (
           <TextInput
             label="Repository"
-            description="On GitHub, as owner/name. nest's GitHub App must be installed on it. (The repos nest's grant covers couldn't be listed.)"
+            description="On GitHub, as owner/name. The app's GitHub App must be installed on it. (Its repos couldn't be listed.)"
             placeholder="owner/name"
             withAsterisk
             autoComplete="off"
@@ -72,7 +72,7 @@ export function CreateProjectForm({ onCreated, onCancel }: { onCreated: (p: Crea
         ) : (
           <Select
             label="Repository"
-            description={repos.data ? pickerDescription(repos.data) : "Loading the repos nest's grant covers…"}
+            description={repos.data ? pickerDescription(repos.data) : "Loading the repos the App is installed on…"}
             placeholder={repos.data ? "Pick a repo" : "Loading…"}
             withAsterisk
             searchable

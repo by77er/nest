@@ -89,11 +89,11 @@ describe("projects", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Gadgets" })).toBeInTheDocument();
   });
 
-  it("picks the repo from those nest's grant lets the app attach; one already a project's is shown but can't be picked", async () => {
+  it("picks the repo from those the App reaches; one already a project's is shown but can't be picked", async () => {
     const api = new FakeApi();
     api.attachable = {
       repos: [{ repo: "owner/widgets", project: "prj_one" }, { repo: "owner/gadgets", project: null }],
-      unlisted: ["elsewhere/*"], complete: true,
+      unlisted: ["elsewhere"], complete: true,
     };
     const { user } = renderApp("/projects", api);
     await user.click(await screen.findByRole("button", { name: "New project" }));
@@ -101,9 +101,9 @@ describe("projects", () => {
     await user.type(within(d).getByLabelText(/Name/), "Gadgets");
     const picker = await repoPicker(d);
     await waitFor(() => expect(picker).toBeEnabled());
-    // What nest couldn't list is a note of its own under the field.
+    // What GitHub couldn't list is a note of its own under the field.
     expect(within(d).getByText("Some repos aren't listed")).toBeInTheDocument();
-    expect(within(d).getByText(/elsewhere: nest's GitHub App isn't installed there/)).toBeInTheDocument();
+    expect(within(d).getByText(/elsewhere: the App's repos there couldn't be listed just now/)).toBeInTheDocument();
     await user.click(picker);
     const taken = await screen.findByRole("option", { name: "owner/widgets (already a project)" });
     expect(taken).toHaveAttribute("data-combobox-disabled", "true");
@@ -120,7 +120,7 @@ describe("projects", () => {
     const { user } = renderApp("/projects", api);
     await user.click(await screen.findByRole("button", { name: "New project" }));
     const d = screen.getByRole("dialog", { name: "New project" });
-    expect(await within(d).findByText(/None yet: the operator adds repos to the app's grant in nest/)).toBeInTheDocument();
+    expect(await within(d).findByText(/None yet: install the App on an account, with the repos it may work in/)).toBeInTheDocument();
     expect(await repoPicker(d)).toBeDisabled();
     expect(within(d).getByRole("button", { name: "Create project" })).toBeDisabled();
     expect(within(d).queryByText("Some repos aren't listed")).toBeNull();

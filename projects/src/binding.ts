@@ -1,13 +1,13 @@
 // A project's repo binding (README.md#the-repos-binding): the repo's GitHub id, read from GitHub (at
 // attach, at a catalog sync for a project that has none, or at the operator's re-read) rather than taken
-// from the first event; and a rename or transfer applied once nest's grant names the repo's new name.
-// A token of the app's own App for the project's repo (metadata: read), its installation looked up afresh
-// (src/github-app.ts), and nest's grant.
+// from the first event; and a rename or transfer applied once the App's installation reaches the repo's new
+// name. A token of the app's own App for the project's repo (metadata: read), its installation looked up
+// afresh (src/github-app.ts, README.md#repo-authority).
 
 import { directory, type Env, project, review } from "./env";
 import { githubFor, ownInstallation, PERMISSIONS } from "./github";
-import { repoAttachable } from "./grant-repos";
-import { type Nest, NestError } from "./nest";
+import { notCovered, repoAttachable } from "./installations";
+import type { Nest } from "./nest";
 import type { BindOutcome, GithubRepo, RepoBinding } from "./do/directory";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 500);
@@ -15,7 +15,7 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).sli
 /**
  * Read the repo from GitHub and bind the project to it (`fill`: only where there's no id; `replace`: the
  * operator's re-read). Read by the name GitHub last gave it, so an old name taken by another repo since
- * isn't read; with a token for that name, or (outside nest's grant yet) for the name the project has.
+ * isn't read; with a token for that name, or (the App not on it yet) for the name the project has.
  */
 export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill" | "check" | "replace", shownId?: number): Promise<BindOutcome> {
   const dir = directory(env);
@@ -31,8 +31,9 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
       // The installation looked up now, never a cached one: the binding follows a reinstall at once.
       gh = await githubFor(env, nest, name, PERMISSIONS.metadata, { fresh: true });
     } catch (e) {
-      // The new name isn't in nest's grant yet (403): a token for the name the grant holds reads the same repo.
-      if (!(b.renamed_to && e instanceof NestError && e.status === 403)) throw e;
+      // The App doesn't reach the new name yet (not installed, or not in its installation's repos; nest's 403 in
+      // the fallback): a token for the name the project has reads the same repo.
+      if (!(b.renamed_to && notCovered(e))) throw e;
       gh = await githubFor(env, nest, b.repo, PERMISSIONS.metadata, { fresh: true });
       current = false;
     }
@@ -60,14 +61,14 @@ export type RenameOutcome = { applied: string } | { blocked: string } | null;
 /**
  * Apply a rename GitHub told (`renamed_to`): the directory's guarded rename (never onto another project's
  * name) is the whole change. The directory is the name's one owner: ProjectDO, ReviewDO and the Worker read
- * it from there, so a rename reaches them all at once and they can't disagree. Only once nest's grant names
- * the new name (it mints tokens for the repos it names).
+ * it from there, so a rename reaches them all at once and they can't disagree. Only once the App's
+ * installation reaches the new name (README.md#repo-authority).
  */
 export async function applyRename(env: Env, nest: Nest, b: RepoBinding): Promise<RenameOutcome> {
   const to = b.renamed_to;
   if (!to) return null;
-  // nest decides whether its grant covers the new name (an owner-wide entry by the owner's id, too).
-  if (!(await repoAttachable(nest, to))) return { blocked: `nest's grant for the app doesn't cover ${to} yet: add it, then re-read` };
+  // GitHub decides whether the App reaches the new name: its installation there, and that installation's repos.
+  if (!(await repoAttachable(env, nest, to))) return { blocked: `the app's GitHub App doesn't reach ${to} yet (not installed there, or not among its installation's repos): add it, then re-read` };
   const dir = directory(env);
   if (await dir.projectByName(to, b.project)) return { blocked: `${to} is another project's repo` };
   if (!(await dir.renameRepo(b.project, to))) return { blocked: "the rename changed while it was applied: re-read" };
@@ -101,11 +102,10 @@ export async function writeOldCopies(env: Env, id: string, name: string, b?: Rep
 /**
  * An event refused for coming from another App installation than the binding's (README.md#the-repos-binding):
  * the binding is read again (at most once a minute per project), so it follows GitHub's answer, the App's
- * installation on the repo as looked up now (the App reinstalled, or the repo moved to an account nest's
- * grant covers). GitHub's lookup decides which installation is the repo's, within nest's grant, never the
- * event. True when
- * the binding's installation changed, so the event is to be routed again (and refused again, and counted,
- * if the binding took another one than the event's).
+ * installation on the repo as looked up now (the App reinstalled, or the repo moved to an account the App is
+ * installed on). GitHub's lookup decides which installation is the repo's, never the event. True when the
+ * binding's installation changed, so the event is to be routed again (and refused again, and counted, if the
+ * binding took another one than the event's).
  */
 export async function followInstallation(env: Env, nest: Nest, id: string): Promise<boolean> {
   const dir = directory(env);

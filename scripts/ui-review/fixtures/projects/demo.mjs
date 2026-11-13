@@ -501,7 +501,7 @@ const RICH = [
           { repo: "by77er/gadget-docs", project: null }] }];
       }
       if (variant === "repos-unlisted") {
-        return [200, { complete: false, unlisted: ["acme-industries-holding-company-international/*", "someone-else/*"],
+        return [200, { complete: false, unlisted: ["acme-industries-holding-company-international", "someone-else"],
           repos: [...attached, { repo: "by77er/sprockets", project: null }, { repo: "by77er/cogs", project: null }] }];
       }
       return [200, { complete: true, unlisted: [], repos: [...attached, { repo: "by77er/sprockets", project: null }, { repo: "by77er/cogs", project: null }] }];

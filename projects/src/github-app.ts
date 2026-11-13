@@ -9,11 +9,12 @@
 // - a repo's installation: https://docs.github.com/en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
 // - an installation token: https://docs.github.com/en/rest/apps/apps#create-an-installation-access-token-for-an-app
 // - the App itself: https://docs.github.com/en/rest/apps/apps#get-the-authenticated-app
+// - its installations: https://docs.github.com/en/rest/apps/apps#list-installations-for-the-authenticated-app
+// - an installation's repos: https://docs.github.com/en/rest/apps/installations#list-repositories-accessible-to-the-app-installation
 
 import type { Env } from "./env";
 import { GitHub, GitHubError } from "./github";
-import { githubCovers } from "./grant-repos";
-import { type Nest, NestError } from "./nest";
+import type { Nest } from "./nest";
 
 /** A cached token with less than this left is minted again (as nest's own reuse). */
 export const TOKEN_REUSE_MS = 10 * 60_000;
@@ -45,12 +46,8 @@ export interface TokenSource {
 
 /** The source the Worker's env picks: nest's only when `GITHUB_TOKEN_SOURCE` is `nest`, else the App's own. */
 export function tokenSource(env: Pick<Env, "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY" | "GITHUB_TOKEN_SOURCE">, nest: Nest): TokenSource {
-  return env.GITHUB_TOKEN_SOURCE?.trim().toLowerCase() === "nest" ? new NestTokens(nest) : new AppTokens(env, nest);
+  return env.GITHUB_TOKEN_SOURCE?.trim().toLowerCase() === "nest" ? new NestTokens(nest) : new AppTokens(env);
 }
-
-const RANK: Record<string, number> = { read: 1, write: 2, admin: 3 };
-/** Whether `want` is at most `have` (read < write < admin), as nest compares a token's permissions to its grant. */
-const levelWithin = (want: string, have: string | undefined) => have !== undefined && RANK[want] !== undefined && RANK[have] !== undefined && RANK[want]! <= RANK[have]!;
 
 const positiveId = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null);
 
@@ -152,11 +149,7 @@ const permissionsKey = (p: Record<string, string>) => Object.keys(p).sort().map(
 export class AppTokens implements TokenSource {
   readonly kind = "app";
 
-  constructor(
-    private readonly env: Pick<Env, "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY">,
-    /** nest, whose grant still names the repos the app may act on (until its own installations do). */
-    private readonly nest: Nest,
-  ) {}
+  constructor(private readonly env: Pick<Env, "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY">) {}
 
   private app(): AppCache {
     const appId = this.env.GITHUB_APP_ID?.trim() ?? "";
@@ -237,38 +230,84 @@ export class AppTokens implements TokenSource {
       app.tokens.get(installation)?.delete(key);
       if (app.installations.get(k)?.id === installation) app.installations.delete(k);
     };
-    // nest's grant still bounds the app's GitHub calls (README.md#github-tokens): the repo, and each permission
-    // within its `github.permissions`. Checked before each mint and each binding's read, and refused as nest
-    // refused a token outside it.
-    const covered = async () => {
-      const [repoIn, self] = await Promise.all([githubCovers(this.nest, repo), this.nest.self()]);
-      if (!repoIn) throw new NestError(403, "forbidden", `nest's grant for the app doesn't cover ${repo}`, false);
-      const have = self.grant?.github?.permissions ?? {};
-      for (const [p, level] of Object.entries(permissions)) {
-        if (!levelWithin(level, have[p])) throw new NestError(403, "forbidden", `${p}: ${level} is outside nest's grant for the app`, false);
-      }
-    };
-    if (o.fresh) await covered();
+    // Which repos the app acts on is GitHub's to say (README.md#repo-authority): the App's installation's own
+    // selection, which the lookup and the mint narrowed to the repo enforce. nest's grant isn't asked.
     const have = app.tokens.get(installation)?.get(key);
     if (have && have.expires_ms - Date.now() > TOKEN_REUSE_MS) return { token: have.token, appId, installationId: installation, stale };
-    if (!o.fresh) await covered();
+    // One repo (by name: an installation is one account's) and these permissions only.
+    const t = await this.mint(app, installation, repo.split("/")[1]!, permissions);
+    // Stored only while the repo's lookup still answers this installation (another may have replaced it meanwhile).
+    if (app.installations.get(k)?.id === installation) this.keep(app, installation, key, t);
+    return { token: t.token, appId, installationId: installation, stale };
+  }
+
+  private keep(app: AppCache, installation: number, key: string, t: { token: string; expires_ms: number }): void {
+    if (!app.tokens.has(installation)) app.tokens.set(installation, new Map());
+    app.tokens.get(installation)!.set(key, t);
+  }
+
+  /** An installation token: for one repo by name, or (`null`) every repo of the installation, with these permissions only. */
+  private async mint(app: AppCache, installation: number, repoName: string | null, permissions: Record<string, string>): Promise<{ token: string; expires_ms: number }> {
     let r: { token?: unknown; expires_at?: unknown } | null;
     try {
-      // One repo (by name: an installation is one account's) and these permissions only.
-      r = await this.withJwt(app, "POST", `/app/installations/${installation}/access_tokens`, { repositories: [repo.split("/")[1]], permissions });
+      r = await this.withJwt(app, "POST", `/app/installations/${installation}/access_tokens`, repoName === null ? { permissions } : { repositories: [repoName], permissions });
     } catch (e) {
       // The installation is gone (uninstalled, or reinstalled under another id): looked up again next time.
       if (e instanceof GitHubError && e.status === 404) this.dropInstallation(app, installation);
+      // GitHub's refusal names no permission: say which were asked for (the installation may lack one).
+      if (e instanceof GitHubError && e.status === 422) throw new GitHubError(422, `${e.message.replace(/^GitHub \d+: /, "")} (asked for ${permissionsKey(permissions).replace(/:/g, ": ").replace(/,/g, ", ")})`, e.rateLimited);
       throw e;
     }
     const expires = typeof r?.expires_at === "string" ? Date.parse(r.expires_at) : NaN;
     if (typeof r?.token !== "string" || !r.token || !Number.isFinite(expires)) throw new GitHubError(502, "GitHub's answer names no installation token", false);
-    // Stored only while the repo's lookup still answers this installation (another may have replaced it meanwhile).
-    if (app.installations.get(k)?.id === installation) {
-      if (!app.tokens.has(installation)) app.tokens.set(installation, new Map());
-      app.tokens.get(installation)!.set(key, { token: r.token, expires_ms: expires });
+    return { token: r.token, expires_ms: expires };
+  }
+
+  /** The App's installations (`GET /app/installations` with its JWT): each one's id and account, 100 a page, at most 10 pages. */
+  async installationsList(): Promise<{ id: number; account: string | null }[]> {
+    const app = this.app();
+    const out: { id: number; account: string | null }[] = [];
+    for (let page = 1; page <= 10; page++) {
+      const list = await this.withJwt<{ id?: unknown; account?: { login?: unknown } | null }[]>(app, "GET", `/app/installations?per_page=100&page=${page}`);
+      if (!Array.isArray(list)) throw new GitHubError(502, "GitHub's answer for the App's installations isn't a list", false);
+      for (const i of list) {
+        const id = positiveId(i?.id);
+        if (id !== null) out.push({ id, account: typeof i.account?.login === "string" ? i.account.login.toLowerCase() : null });
+      }
+      if (list.length < 100) break;
     }
-    return { token: r.token, appId, installationId: installation, stale };
+    return out;
+  }
+
+  /**
+   * The repos one installation reaches, its own selection (`GET /installation/repositories`), lowercased, 100 a
+   * page, at most `max`; `complete` false when there were more. Read with a token of the installation for all its
+   * repos and `metadata: read` alone, minted for this listing, never kept or handed out, and revoked after
+   * (`DELETE /installation/token`, https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token).
+   */
+  async installationRepos(installation: number, max = 1000): Promise<{ repos: string[]; complete: boolean }> {
+    const app = this.app();
+    const t = await this.mint(app, installation, null, { metadata: "read" });
+    const gh = new GitHub(t.token, Number(app.appId), installation);
+    try {
+      const repos: string[] = [];
+      for (let page = 1; repos.length < max; page++) {
+        const r = await gh.call<{ repositories?: { full_name?: unknown }[] }>("GET", `/installation/repositories?per_page=100&page=${page}`);
+        const list = r?.repositories;
+        if (!Array.isArray(list)) throw new GitHubError(502, "GitHub's answer for an installation's repos isn't a list", false);
+        for (const x of list) if (typeof x?.full_name === "string") repos.push(x.full_name.toLowerCase());
+        // The last page: complete unless it went past `max`.
+        if (list.length < 100) return { repos: repos.slice(0, max), complete: repos.length <= max };
+      }
+      return { repos: repos.slice(0, max), complete: false };
+    } finally {
+      try {
+        await gh.call("DELETE", "/installation/token");
+      } catch (e) {
+        // It expires within the hour by itself; it was never kept.
+        console.warn(`installation ${installation}'s listing token wasn't revoked: ${String(e).slice(0, 200)}`);
+      }
+    }
   }
 
   async appSlug(): Promise<string | null> {

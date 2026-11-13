@@ -770,11 +770,13 @@ export interface FakeInstallation {
 /**
  * A token, as GitHub keeps it: for one repo (`repo`, a full name: nest's tokens in the fallback, or an
  * account's installation's), or for a repo by name alone (`name`: the default installation's, whose account
- * the fake doesn't pin), from an installation (null: nest's, not modelled), until it expires.
+ * the fake doesn't pin), or for every repo of its installation (`all`), from an installation (null: nest's, not
+ * modelled), until it expires.
  */
 export interface FakeToken {
   repo: string | null;
   name: string | null;
+  all?: boolean;
   permissions: Record<string, string>;
   installation: number | null;
   expires_ms: number;
@@ -853,9 +855,15 @@ export class FakeGitHub {
     return this.installations.find((i) => i.account === null && covers(i)) ?? null;
   }
 
+  /** The repos an installation reaches, sorted: of the ones the fake knows, those it covers (its account's own, or the default one's). */
+  reposOf(installation: number): string[] {
+    return [...this.repos.keys()].filter((r) => this.installationFor(r)?.id === installation).sort();
+  }
+
   /** Whether `t` reaches `repoName` (the repo, by its name now) asked for as `asked`. */
   private reaches(t: FakeToken, repoName: string, asked: string): boolean {
     if (t.installation !== null && this.installationFor(repoName)?.id !== t.installation) return false;
+    if (t.all) return t.installation !== null;
     if (t.repo !== null) return (this.renamed.get(t.repo) ?? t.repo) === repoName;
     // By name alone: the repo asked for, or one renamed to it (a token minted for its old name reaches it).
     const name = (r: string) => r.split("/")[1];
@@ -901,7 +909,7 @@ export class FakeGitHub {
     const route = `${req.method} ${u.pathname}`;
     const inst = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/installation$/);
     const mint = u.pathname.match(/^\/app\/installations\/(\d+)\/access_tokens$/);
-    if (!(route === "GET /app" || (inst && req.method === "GET") || (mint && req.method === "POST"))) return null;
+    if (!(route === "GET /app" || route === "GET /app/installations" || (inst && req.method === "GET") || (mint && req.method === "POST"))) return null;
     if (!(await this.jwtOk(token))) return json(401, { message: "A JSON web token could not be decoded" });
     const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
     if (f) {
@@ -909,6 +917,13 @@ export class FakeGitHub {
       return json(f.status, { message: f.message ?? "injected" });
     }
     if (route === "GET /app") return json(200, { id: GH_APP_ID, slug: GH_APP_SLUG, name: "nest test" });
+    if (route === "GET /app/installations") {
+      const page = Number(u.searchParams.get("page") ?? "1");
+      const per = Number(u.searchParams.get("per_page") ?? "30");
+      return json(200, this.installations.slice((page - 1) * per, page * per).map((i) => ({
+        id: i.id, app_id: GH_APP_ID, account: i.account ? { login: i.account, id: ownerIdOf(i.account) } : null, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected",
+      })));
+    }
     if (inst) {
       const i = this.installationFor(inst[1]!);
       return i ? json(200, { id: i.id, app_id: GH_APP_ID, account: i.account ? { login: i.account, id: ownerIdOf(i.account) } : null, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected" }) : json(404, { message: "Not Found" });
@@ -916,6 +931,15 @@ export class FakeGitHub {
     const i = this.installations.find((x) => x.id === Number(mint![1]));
     if (!i) return json(404, { message: "Not Found" });
     const names: unknown = body?.repositories;
+    const permissions = (body?.permissions ?? {}) as Record<string, string>;
+    for (const [k, v] of Object.entries(permissions)) {
+      if (!levelWithin(v, i.permissions[k])) return json(422, { message: "The permissions requested are not granted to this installation." });
+    }
+    // No repos named: every repo of the installation.
+    if (names === undefined) {
+      const t: FakeToken = { repo: null, name: null, all: true, permissions, installation: i.id, expires_ms: Date.now() + this.tokenLifeMs };
+      return json(201, { token: this.issue(t), expires_at: new Date(t.expires_ms).toISOString(), permissions, repository_selection: i.repos === "all" ? "all" : "selected" });
+    }
     // One repo by name, as the app asks (an installation is one account's; the default one's names aren't pinned to one).
     if (!Array.isArray(names) || names.length !== 1 || typeof names[0] !== "string") return json(422, { message: "the fake mints for exactly one repo by name" });
     const name = (names[0] as string).toLowerCase();
@@ -923,10 +947,6 @@ export class FakeGitHub {
     // old name as its API redirects one (unverified for a mint).
     const full = i.account === null ? null : this.repos.has(`${i.account}/${name}`) ? `${i.account}/${name}` : [...this.renamed].find(([from, to]) => from.split("/")[1] === name && to.split("/")[0] === i.account)?.[1] ?? `${i.account}/${name}`;
     if (full !== null && this.installationFor(full)?.id !== i.id) return json(422, { message: `There is at least one repository that does not exist or is not accessible to the parent installation.` });
-    const permissions = (body?.permissions ?? {}) as Record<string, string>;
-    for (const [k, v] of Object.entries(permissions)) {
-      if (!levelWithin(v, i.permissions[k])) return json(422, { message: "The permissions requested are not granted to this installation." });
-    }
     const t: FakeToken = { repo: full, name: i.account === null ? name : null, permissions, installation: i.id, expires_ms: Date.now() + this.tokenLifeMs };
     return json(201, { token: this.issue(t), expires_at: new Date(t.expires_ms).toISOString(), permissions, repository_selection: "selected" });
   }
@@ -1004,6 +1024,25 @@ export class FakeGitHub {
     }
     const app = await this.appRoute(req, u, call.body, token, json);
     if (app) return app;
+    if (route === "DELETE /installation/token") {
+      // Revoked by itself (https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token).
+      if (!this.live(token)) return json(401, { message: "Bad credentials" });
+      this.tokens.delete(token!);
+      return new Response(null, { status: 204 });
+    }
+    if (route === "GET /installation/repositories") {
+      const t = this.live(token);
+      if (!t || t.installation === null) return json(401, { message: "Bad credentials" });
+      const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
+      if (f) {
+        f.times--;
+        return json(f.status, { message: f.message ?? "injected" });
+      }
+      const mine = this.reposOf(t.installation);
+      const page = Number(u.searchParams.get("page") ?? "1");
+      const per = Number(u.searchParams.get("per_page") ?? "30");
+      return json(200, { total_count: mine.length, repositories: mine.slice((page - 1) * per, page * per).map((r) => ({ id: this.repo(r).id, full_name: r, owner: this.ownerOf(r) })) });
+    }
     if (route === "POST /graphql") {
       const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
       if (f) {
