@@ -46,7 +46,7 @@ async function shownOwner(env: Env, b: RepoBinding): Promise<{ id: number; login
   if (!nest) return null;
   let owner: { id: number; login: string } | null = null;
   try {
-    const info = await (await githubFor(nest, b.repo, PERMISSIONS.metadata)).repoInfo(b.repo);
+    const info = await (await githubFor(env, nest, b.repo, PERMISSIONS.metadata)).repoInfo(b.repo);
     owner = info.id === b.repo_id && info.owner.type === "User" ? { id: info.owner.id, login: info.owner.login } : null;
   } catch (e) {
     console.warn(`the owner of ${b.repo} couldn't be read: ${String(e).slice(0, 200)}`);

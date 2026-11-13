@@ -24,6 +24,12 @@ export interface Env {
   NEST_WEBHOOK_SECRET?: string;
   /** Secret: signs the GitHub App's webhooks to /hooks/github. */
   GITHUB_WEBHOOK_SECRET?: string;
+  /** Secret: the app's GitHub App's id (README.md#github-tokens). */
+  GITHUB_APP_ID?: string;
+  /** Secret: the App's private key, a PKCS#1 PEM (`BEGIN RSA PRIVATE KEY`) as GitHub hands it out. */
+  GITHUB_APP_PRIVATE_KEY?: string;
+  /** `nest`: the app's GitHub tokens come from nest's `POST /v1/clients/self/github-token` (the fallback, for one release); anything else, or unset: from the App. */
+  GITHUB_TOKEN_SOURCE?: string;
 }
 
 export const directory = (env: Env) => env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));

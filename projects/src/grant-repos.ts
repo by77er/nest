@@ -28,6 +28,22 @@ export async function repoAttachable(nest: Nest, repo: string): Promise<boolean>
   }
 }
 
+/**
+ * Whether nest's grant names `repo` for the app's GitHub calls (`github.repos`, owner-wide entries included), as
+ * nest answers it: what the app's own App tokens are checked against before each mint (README.md#github-tokens),
+ * as nest checked its own.
+ */
+export async function githubCovers(nest: Nest, repo: string): Promise<boolean> {
+  try {
+    const r = await nest.grantMembership([repo]);
+    return r.repos.some((x) => x.repo === repo.toLowerCase() && x.github);
+  } catch (e) {
+    if (!(e instanceof NestError && e.status === 404)) throw e;
+    const exact = (await nest.self()).grant?.github?.repos ?? [];
+    return exact.some((r) => r.toLowerCase() === repo.toLowerCase());
+  }
+}
+
 const attachable = (r: GrantRepo) => r.push && r.github;
 
 /** A nest from before the grant routes: the repos named exactly in both lists (no owner-wide entry). */

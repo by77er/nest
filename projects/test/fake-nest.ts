@@ -1,4 +1,4 @@
-// A fake of nest's client interface and of the GitHub API the app calls with the tokens nest mints it: as docs/control-plane/api/clients/ and docs/interfaces/remote-mcp/
+// A fake of nest's client interface and of the GitHub API the app calls with its own App's tokens (or, in the fallback, nest's): as docs/control-plane/api/clients/ and docs/interfaces/remote-mcp/
 // describe it: the routes the app calls (answering as nest does: a create's cell in its body, refused
 // outside the grant's; a create's Idempotency-Key replayed, conflicting or in progress), the JWKS behind Nest-Identity, and helpers that sign identity tokens, Access tokens and
 // webhooks the way nest and Cloudflare do. It replaces the global fetch, which the Worker and its Durable
@@ -6,6 +6,7 @@
 
 import { env, SELF } from "cloudflare:test";
 import { GITHUB_API, signGithub } from "../src/github";
+import { resetAppTokens } from "../src/github-app";
 import { sign as signWebhook } from "../src/webhook";
 
 export const NEST = "https://nest.test";
@@ -93,7 +94,7 @@ const id = (prefix: string) => `${prefix}${(++seq).toString(36)}${crypto.randomU
 export class FakeNest {
   readonly github = new FakeGitHub();
   /** The App nest's token answers name; null: nest can't tell, and the answers leave it out. */
-  githubApp: { app_id: number; app_slug: string } | null = { app_id: GH_APP_ID, app_slug: "nest-test" };
+  githubApp: { app_id: number; app_slug: string } | null = { app_id: GH_APP_ID, app_slug: GH_APP_SLUG };
   readonly calls: Call[] = [];
   readonly agents = new Map<string, FakeAgent>();
   readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean; github_push?: { workflows: boolean } | null; layer: { egress: { allow: unknown[] }; inject: unknown[]; env: Record<string, string> } }>();
@@ -536,6 +537,22 @@ export class FakeNest {
   }
 }
 
+/**
+ * Run `fn` with the app's GitHub tokens from nest (`GITHUB_TOKEN_SOURCE=nest`, the fallback), as the Worker and
+ * its objects read the env they share with the tests; the App's own after.
+ */
+export async function withNestTokens<T>(fn: () => Promise<T>): Promise<T> {
+  const e = env as { GITHUB_TOKEN_SOURCE?: string };
+  const had = e.GITHUB_TOKEN_SOURCE;
+  e.GITHUB_TOKEN_SOURCE = "nest";
+  try {
+    return await fn();
+  } finally {
+    if (had === undefined) delete e.GITHUB_TOKEN_SOURCE;
+    else e.GITHUB_TOKEN_SOURCE = had;
+  }
+}
+
 /** Install `fake` as nest (and Cloudflare Access's certs, when given) for the Worker and its objects. */
 /** The fake GitHub the installed fetch answers from: events name their repo's owner as it answers (`deliverGithub`). */
 let liveGithub: FakeGitHub | null = null;
@@ -543,6 +560,8 @@ let liveGithub: FakeGitHub | null = null;
 export function installFetch(fake: FakeNest, access?: () => unknown): () => void {
   const real = globalThis.fetch;
   liveGithub = fake.github;
+  // The App's cache holds another fake's tokens and installations: none of it is this one's.
+  resetAppTokens();
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input as RequestInfo, init);
     const u = new URL(req.url);
@@ -673,7 +692,9 @@ export async function eventually<T>(f: () => T | Promise<T>, what: string): Prom
 
 /** The GitHub App's id, as GitHub answers it in a check run's `app.id`. */
 export const GH_APP_ID = 4242;
-/** The installation the fake's App tokens are minted from. */
+/** The App's slug: its bot is `nest-test[bot]`. */
+export const GH_APP_SLUG = "nest-test";
+/** The fake's default installation of the App: on every account that has none of its own (FakeGitHub.install). */
 export const GH_INSTALLATION_ID = 777001;
 
 /** The app's grant's `github.permissions` (README.md#how-it-uses-nest). */
@@ -734,11 +755,45 @@ export const ownerIdOf = (login: string) => 10_000 + [...login].reduce((h, c) =>
 /** A repo's GitHub id, as the fake gives it (from its first name: a rename keeps it). */
 export const repoIdOf = (name: string) => 500_000_000 + [...name.toLowerCase()].reduce((h, c) => (h * 31 + c.charCodeAt(0)) % 100_000_000, 11);
 
+/**
+ * One installation of the App: on one account (`account`), or, the fake's shorthand, on every account that
+ * has none of its own (`account: null`); on all its repos or a selection; with the permissions the owner
+ * granted the App.
+ */
+export interface FakeInstallation {
+  id: number;
+  account: string | null;
+  repos: "all" | Set<string>;
+  permissions: Record<string, string>;
+}
+
+/**
+ * A token, as GitHub keeps it: for one repo (`repo`, a full name: nest's tokens in the fallback, or an
+ * account's installation's), or for a repo by name alone (`name`: the default installation's, whose account
+ * the fake doesn't pin), from an installation (null: nest's, not modelled), until it expires.
+ */
+export interface FakeToken {
+  repo: string | null;
+  name: string | null;
+  permissions: Record<string, string>;
+  installation: number | null;
+  expires_ms: number;
+}
+
 export class FakeGitHub {
   /** Accounts that are organizations (a repo's owner is a user otherwise). */
   readonly orgs = new Set<string>();
-  readonly calls: { method: string; path: string; body: any; token: string | null }[] = [];
-  readonly tokens = new Map<string, { repo: string; permissions: Record<string, string> }>();
+  /** Every call, with the permissions of the installation token it carried (none for the App's JWT). */
+  readonly calls: { method: string; path: string; body: any; token: string | null; permissions?: Record<string, string> }[] = [];
+  readonly tokens = new Map<string, FakeToken>();
+  /** The App's installations (https://docs.github.com/en/rest/apps/installations): the default one, on every account. */
+  installations: FakeInstallation[] = [{ id: GH_INSTALLATION_ID, account: null, repos: "all", permissions: { ...GRANT_PERMISSIONS } }];
+  /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
+  holds: { match: RegExp; release: Promise<void>; reached: boolean }[] = [];
+  /** How long an installation token lives (GitHub's: an hour). */
+  tokenLifeMs = 3_600_000;
+  /** The claims of each App JWT GitHub accepted, in order. */
+  readonly jwts: { iss: unknown; iat: number; exp: number }[] = [];
   readonly repos = new Map<string, { id: number; default_branch: string; protection: Record<string, any> | null; allow_auto_merge: boolean; owner_id?: number }>();
   /** Renamed or transferred repos, old name to new: the old name answers with the repo, as GitHub's redirect does, until it's taken. */
   readonly renamed = new Map<string, string>();
@@ -757,11 +812,123 @@ export class FakeGitHub {
   lost: { match: RegExp; times: number }[] = [];
   private nextId = 1000;
 
+  /** A token for `repo` (nest's, in the fallback; or a test's own). */
   mint(repo: string, permissions: Record<string, string>): string {
-    // Low in entropy and made at run time (dev/review-lessons.md 9).
-    const token = `ghs_fake${(++this.nextId).toString().padStart(8, "0")}`;
-    this.tokens.set(token, { repo: repo.toLowerCase(), permissions });
+    return this.issue({ repo: repo.toLowerCase(), name: null, permissions, installation: null, expires_ms: Date.now() + this.tokenLifeMs });
+  }
+
+  private issue(t: FakeToken): string {
+    // Low in entropy and made at run time (dev/review-lessons.md 9); unique across files, so a token another
+    // file's fake minted is unknown here.
+    const token = `ghs_fake${(++this.nextId).toString().padStart(8, "0")}${crypto.randomUUID().slice(0, 8)}`;
+    this.tokens.set(token, t);
     return token;
+  }
+
+  /** Install the App on an account (replacing one with the same id): that account's repos go to it, not the default one. */
+  install(i: { id: number; account: string; repos?: string[]; permissions?: Record<string, string> }): FakeInstallation {
+    const full: FakeInstallation = { id: i.id, account: i.account.toLowerCase(), repos: i.repos ? new Set(i.repos.map((r) => r.toLowerCase())) : "all", permissions: i.permissions ?? { ...GRANT_PERMISSIONS } };
+    this.installations = [...this.installations.filter((x) => x.id !== i.id), full];
+    return full;
+  }
+
+  /** Uninstall: the installation's tokens stop working at once (401), and its account falls back to the default one, if any. */
+  uninstall(id: number): void {
+    this.installations = this.installations.filter((x) => x.id !== id);
+  }
+
+  /** The App reinstalled on an account: the old installation gone, a new one with a new id. */
+  reinstall(account: string, id: number): FakeInstallation {
+    for (const i of this.installations.filter((x) => x.account === account.toLowerCase())) this.uninstall(i.id);
+    return this.install({ id, account });
+  }
+
+  /** The installation covering a repo (by its name now, as GitHub redirects an old one), or null when none does. */
+  installationFor(name: string): FakeInstallation | null {
+    const k = this.renamed.get(name.toLowerCase()) ?? name.toLowerCase();
+    const account = k.split("/")[0]!;
+    const covers = (i: FakeInstallation) => i.repos === "all" || i.repos.has(k);
+    const own = this.installations.filter((i) => i.account === account);
+    if (own.length) return own.find(covers) ?? null;
+    return this.installations.find((i) => i.account === null && covers(i)) ?? null;
+  }
+
+  /** Whether `t` reaches `repoName` (the repo, by its name now) asked for as `asked`. */
+  private reaches(t: FakeToken, repoName: string, asked: string): boolean {
+    if (t.installation !== null && this.installationFor(repoName)?.id !== t.installation) return false;
+    if (t.repo !== null) return (this.renamed.get(t.repo) ?? t.repo) === repoName;
+    // By name alone: the repo asked for, or one renamed to it (a token minted for its old name reaches it).
+    const name = (r: string) => r.split("/")[1];
+    return t.name === name(asked) || t.name === name(repoName) || [...this.renamed].some(([from, to]) => to === repoName && name(from) === t.name);
+  }
+
+  /** The token a request carries, if GitHub would take it: known, not expired, its installation still there. */
+  private live(token: string | null): FakeToken | null {
+    const t = token ? this.tokens.get(token) : undefined;
+    if (!t || t.expires_ms <= Date.now()) return null;
+    if (t.installation !== null && !this.installations.some((i) => i.id === t.installation)) return null;
+    return t;
+  }
+
+  private publicKey: Promise<CryptoKey> | null = null;
+
+  /**
+   * The App's JWT checked as GitHub checks it: RS256 under the App's key (the public half made for this run,
+   * vitest.config.ts), `iss` the App's id, issued at most 10 minutes before it expires, not expired.
+   */
+  private async jwtOk(token: string | null): Promise<boolean> {
+    const parts = token?.split(".") ?? [];
+    if (parts.length !== 3) return false;
+    const dec = (x: string) => Uint8Array.from(atob(x.replace(/-/g, "+").replace(/_/g, "/") + "=".repeat((4 - (x.length % 4)) % 4)), (c) => c.charCodeAt(0));
+    try {
+      const header = JSON.parse(new TextDecoder().decode(dec(parts[0]!)));
+      const claims = JSON.parse(new TextDecoder().decode(dec(parts[1]!)));
+      if (header.alg !== "RS256") return false;
+      this.publicKey ??= crypto.subtle.importKey("spki", dec(env.TEST_GITHUB_APP_PUBLIC_KEY.replace(/-----(BEGIN|END) [^-]+-----/g, "").replace(/\s+/g, "")), { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+      if (!(await crypto.subtle.verify("RSASSA-PKCS1-v1_5", await this.publicKey, dec(parts[2]!), new TextEncoder().encode(`${parts[0]}.${parts[1]}`)))) return false;
+      const now = Math.floor(Date.now() / 1000);
+      if (String(claims.iss) !== String(GH_APP_ID) || typeof claims.iat !== "number" || typeof claims.exp !== "number") return false;
+      if (claims.exp <= now || claims.exp - claims.iat > 600 || claims.iat > now + 60) return false;
+      this.jwts.push({ iss: claims.iss, iat: claims.iat, exp: claims.exp });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** The App's own routes, with its JWT (https://docs.github.com/en/rest/apps/apps); null for any other route. */
+  private async appRoute(req: Request, u: URL, body: any, token: string | null, json: (status: number, body: unknown) => Response): Promise<Response | null> {
+    const route = `${req.method} ${u.pathname}`;
+    const inst = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/installation$/);
+    const mint = u.pathname.match(/^\/app\/installations\/(\d+)\/access_tokens$/);
+    if (!(route === "GET /app" || (inst && req.method === "GET") || (mint && req.method === "POST"))) return null;
+    if (!(await this.jwtOk(token))) return json(401, { message: "A JSON web token could not be decoded" });
+    const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
+    if (f) {
+      f.times--;
+      return json(f.status, { message: f.message ?? "injected" });
+    }
+    if (route === "GET /app") return json(200, { id: GH_APP_ID, slug: GH_APP_SLUG, name: "nest test" });
+    if (inst) {
+      const i = this.installationFor(inst[1]!);
+      return i ? json(200, { id: i.id, app_id: GH_APP_ID, account: i.account ? { login: i.account, id: ownerIdOf(i.account) } : null, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected" }) : json(404, { message: "Not Found" });
+    }
+    const i = this.installations.find((x) => x.id === Number(mint![1]));
+    if (!i) return json(404, { message: "Not Found" });
+    const names: unknown = body?.repositories;
+    // One repo by name, as the app asks (an installation is one account's; the default one's names aren't pinned to one).
+    if (!Array.isArray(names) || names.length !== 1 || typeof names[0] !== "string") return json(422, { message: "the fake mints for exactly one repo by name" });
+    const name = (names[0] as string).toLowerCase();
+    // The account's repo by that name, or one moved to the account from that name: GitHub is taken to resolve an
+    // old name as its API redirects one (unverified for a mint).
+    const full = i.account === null ? null : this.repos.has(`${i.account}/${name}`) ? `${i.account}/${name}` : [...this.renamed].find(([from, to]) => from.split("/")[1] === name && to.split("/")[0] === i.account)?.[1] ?? `${i.account}/${name}`;
+    if (full !== null && this.installationFor(full)?.id !== i.id) return json(422, { message: `There is at least one repository that does not exist or is not accessible to the parent installation.` });
+    const permissions = (body?.permissions ?? {}) as Record<string, string>;
+    for (const [k, v] of Object.entries(permissions)) {
+      if (!levelWithin(v, i.permissions[k])) return json(422, { message: "The permissions requested are not granted to this installation." });
+    }
+    const t: FakeToken = { repo: full, name: i.account === null ? name : null, permissions, installation: i.id, expires_ms: Date.now() + this.tokenLifeMs };
+    return json(201, { token: this.issue(t), expires_at: new Date(t.expires_ms).toISOString(), permissions, repository_selection: "selected" });
   }
 
   /** A PR on `repo` (open, from the repo itself, unless `o` says otherwise). */
@@ -817,14 +984,26 @@ export class FakeGitHub {
     return this.calls.filter((c) => c.method === method && path.test(c.path));
   }
 
+  /** The App's mints (`POST /app/installations/<id>/access_tokens`): the installation, and the body's repos and permissions. */
+  mints(): { installation: number; repositories: string[]; permissions: Record<string, string> }[] {
+    return this.callsTo("POST", /^\/app\/installations\/\d+\/access_tokens$/).map((c) => ({ installation: Number(c.path.split("/")[3]), repositories: c.body?.repositories, permissions: c.body?.permissions }));
+  }
+
   async handle(req: Request): Promise<Response> {
     const u = new URL(req.url);
     const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
     const text = await req.text();
     const token = req.headers.get("authorization")?.replace(/^Bearer /, "") ?? null;
-    const call = { method: req.method, path: u.pathname, body: text ? JSON.parse(text) : undefined, token };
+    const call = { method: req.method, path: u.pathname, body: text ? JSON.parse(text) : undefined, token, permissions: token ? this.tokens.get(token)?.permissions : undefined };
     this.calls.push(call);
     const route = `${req.method} ${u.pathname}`;
+    const hold = this.holds.find((x) => !x.reached && x.match.test(route));
+    if (hold) {
+      hold.reached = true;
+      await hold.release;
+    }
+    const app = await this.appRoute(req, u, call.body, token, json);
+    if (app) return app;
     if (route === "POST /graphql") {
       const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
       if (f) {
@@ -836,7 +1015,12 @@ export class FakeGitHub {
     // A public account by login: anyone's token reads it ("ghost-" logins don't exist).
     const um = u.pathname.match(/^\/users\/([^/]+)$/);
     if (um && req.method === "GET") {
-      if (!token || !this.tokens.has(token)) return json(401, { message: "Bad credentials" });
+      if (!this.live(token)) return json(401, { message: "Bad credentials" });
+      const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
+      if (f) {
+        f.times--;
+        return json(f.status, { message: f.message ?? "injected" });
+      }
       const login = decodeURIComponent(um[1]!);
       if (login.startsWith("ghost-")) return json(404, { message: "Not Found" });
       return json(200, { login, id: ownerIdOf(login.toLowerCase()), type: login.endsWith("[bot]") ? "Bot" : this.orgs.has(login.toLowerCase()) ? "Organization" : "User" });
@@ -847,9 +1031,9 @@ export class FakeGitHub {
     const asked = m[1]!.toLowerCase();
     const repoName = this.renamed.get(asked) ?? asked;
     const sub = m[2] ?? "";
-    const t = token ? this.tokens.get(token) : undefined;
+    const t = this.live(token);
     if (!t) return json(401, { message: "Bad credentials" });
-    if ((this.renamed.get(t.repo) ?? t.repo) !== repoName) return json(404, { message: "Not Found" });
+    if (!this.reaches(t, repoName, asked)) return json(404, { message: "Not Found" });
     const need = (perm: string, level: string) => levelWithin(level, t.permissions[perm]);
     const denied = () => json(403, { message: "Resource not accessible by integration" });
     const f = this.failures.find((x) => x.times > 0 && x.match.test(route));
@@ -993,7 +1177,7 @@ export class FakeGitHub {
 
   /** GraphQL's auto-merge mutations, on a PR named by its node id (`prNode`), for a token of its repo. */
   private graphql(body: any, token: string | null, json: (status: number, body: unknown) => Response): Response {
-    const t = token ? this.tokens.get(token) : undefined;
+    const t = this.live(token);
     if (!t) return json(401, { message: "Bad credentials" });
     const query = String(body?.query ?? "");
     if (/pullRequest\(number:/.test(query)) return this.readPulls(body, t, json);
@@ -1001,7 +1185,7 @@ export class FakeGitHub {
     const id = String(body?.variables?.id ?? "");
     const target = nodeTarget(id);
     if (!name || !target) return json(200, { errors: [{ type: "NOT_FOUND", message: `Could not resolve to a node with the global id of '${id}'` }] });
-    if (target.repo !== t.repo) return json(200, { errors: [{ type: "NOT_FOUND", message: `Could not resolve to a node with the global id of '${id}'` }] });
+    if (!this.reaches(t, this.renamed.get(target.repo) ?? target.repo, target.repo)) return json(200, { errors: [{ type: "NOT_FOUND", message: `Could not resolve to a node with the global id of '${id}'` }] });
     if (!levelWithin("write", t.permissions.pull_requests) || !levelWithin("write", t.permissions.contents)) {
       return json(200, { errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }] });
     }
@@ -1026,10 +1210,10 @@ export class FakeGitHub {
   /** Errors a PR read answers besides its data (each read, while set), as GitHub adds them to a partial answer. */
   pullReadErrors: { type?: string; message: string }[] = [];
 
-  private readPulls(body: any, t: { repo: string; permissions: Record<string, string> }, json: (status: number, body: unknown) => Response): Response {
+  private readPulls(body: any, t: FakeToken, json: (status: number, body: unknown) => Response): Response {
     const v = body?.variables ?? {};
     const repo = `${v.owner}/${v.name}`.toLowerCase();
-    if (repo !== t.repo) return json(200, { data: { repository: null }, errors: [{ type: "NOT_FOUND", message: `Could not resolve to a Repository with the name '${repo}'.` }] });
+    if (!this.reaches(t, this.renamed.get(repo) ?? repo, repo)) return json(200, { data: { repository: null }, errors: [{ type: "NOT_FOUND", message: `Could not resolve to a Repository with the name '${repo}'.` }] });
     if (!levelWithin("read", t.permissions.pull_requests) || !levelWithin("read", t.permissions.checks)) {
       return json(200, { data: null, errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }] });
     }
@@ -1114,7 +1298,7 @@ export async function deliverGithub(event: string, payload: unknown, o: { secret
   const user = issue && typeof issue.user === "object" && issue.user !== null ? (issue.user as Record<string, unknown>) : null;
   if (user && !("id" in user) && repo && typeof repo.full_name === "string") user.id = ownerIdOf(repo.full_name.split("/")[0]!.toLowerCase());
   // And the App installation it came from: the fake's, unless the test gives one (or `installation: undefined`, none).
-  if (payload && typeof payload === "object" && !("installation" in payload)) (payload as Record<string, unknown>).installation = { id: GH_INSTALLATION_ID };
+  if (payload && typeof payload === "object" && !("installation" in payload)) (payload as Record<string, unknown>).installation = { id: installationOf(typeof repo?.full_name === "string" ? repo.full_name : null) };
   const body = o.raw ?? JSON.stringify(payload);
   const signature = o.signature === undefined ? await signGithub(o.secret ?? env.GITHUB_WEBHOOK_SECRET!, new TextEncoder().encode(body)) : o.signature;
   const delivery = o.delivery === undefined ? crypto.randomUUID() : o.delivery;
@@ -1146,9 +1330,12 @@ export function prEvent(o: {
       base: { ref: o.base ?? "main", repo: { full_name: o.repo } },
     },
     repository: { full_name: o.repo },
-    installation: { id: GH_INSTALLATION_ID },
+    installation: { id: installationOf(o.repo) },
   };
 }
+
+/** The installation GitHub sends a repo's events from: the fake GitHub's for it, else the default one. */
+const installationOf = (repo: string | null) => (repo && liveGithub?.installationFor(repo)?.id) || GH_INSTALLATION_ID;
 
 /** A 40-hex commit id. */
 export const shaOf = (seed: string) => [...seed].map((c) => c.charCodeAt(0).toString(16)).join("").padEnd(40, "0").slice(0, 40);

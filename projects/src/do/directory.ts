@@ -1,6 +1,6 @@
 // DirectoryDO, one instance (README.md#pieces): the projects, repo → project, agent → {project, role,
 // task, pr}, the nest events and GitHub deliveries already handled (deduplicated by id), the catalog
-// sync's state, and the GitHub App's id once nest's token answer or a check run has told it.
+// sync's state, and the GitHub App's id once a token's source or a check run has told it.
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
@@ -69,7 +69,7 @@ const MIGRATIONS = [
     // The repo's binding (README.md#the-repos-binding): how its id was learned (`github`: read from GitHub
     // at attach, a sync or the operator's re-read; `event`: from the first event, before ids were read) and
     // when; the name GitHub last gave it, when that isn't the name the project calls it by (a rename not
-    // yet applied); and the App installation's id, filled once nest's token answer names it.
+    // yet applied); and the App installation's id, filled once a token's source names it.
     "ALTER TABLE projects ADD COLUMN repo_bound TEXT",
     "ALTER TABLE projects ADD COLUMN repo_bound_ms INTEGER",
     "ALTER TABLE projects ADD COLUMN repo_name TEXT",
@@ -109,7 +109,7 @@ export interface RepoBinding {
   repo_id: number | null;
   /** The name GitHub last gave the repo, when it isn't `repo`: renamed or transferred, not yet applied. */
   renamed_to: string | null;
-  /** The App installation's id: null until nest's token answer names it. */
+  /** The App installation's id: null until a token's source (the App's lookup, or nest's answer) names it. */
   installation_id: number | null;
   /** How the id was learned: read from GitHub, or taken from the first event; null while there's none. */
   bound: "github" | "event" | null;
@@ -431,7 +431,7 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.sql.exec("UPDATE projects SET repo = ?, repo_name = NULL WHERE id = ? AND repo_name = ?", n, project, n).rowsWritten > 0;
   }
 
-  /** nest's GitHub App's id, as nest's token answer (`app_id`) or a check run it made (`app.id`) last told it; null until one has. */
+  /** The GitHub App's id, as a token's source (the App's own secret, or nest's `app_id`) or a check run it made (`app.id`) last told it; null until one has. */
   async githubAppId(): Promise<number | null> {
     const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'github_app_id'").toArray()[0];
     return row ? Number(row.v) : null;
@@ -442,7 +442,7 @@ export class DirectoryDO extends DurableObject<Env> {
     this.sql.exec("INSERT INTO sync (k, v) VALUES ('github_app_id', ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v", String(id));
   }
 
-  /** The GitHub id of nest's App's bot account (`<slug>[bot]`), the author of workers' PRs; null until looked up (src/github.ts `appBotId`). */
+  /** The GitHub id of the App's bot account (`<slug>[bot]`), the author of workers' PRs; null until looked up (src/github.ts `appBotId`). */
   async githubAppBotId(): Promise<number | null> {
     const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'github_app_bot_id'").toArray()[0];
     return row ? Number(row.v) : null;

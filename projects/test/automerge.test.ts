@@ -47,7 +47,10 @@ const patch = async (p: P, body: unknown) => {
 };
 const task = async (p: P, id: string) => (await api(token, "GET", `/api/projects/${p.id}/tasks/${id}`)).body;
 const repoWrites = (p: P) => gh.calls.filter((c) => c.method === "PATCH" && c.path === `/repos/${p.repo}`);
-const mintsFor = (p: P) => fake.calls.filter((c) => c.path === "/v1/clients/self/github-token" && c.body.repo.toLowerCase() === p.repo).map((c) => c.body.permissions);
+/** The permissions of the token each GitHub call matching `method` and `path` carried, in order. */
+const tokensOf = (method: string, path: string | RegExp) => gh.calls.filter((c) => c.method === method && (typeof path === "string" ? c.path === path : path.test(c.path))).map((c) => c.permissions);
+/** The auto-merge mutations GitHub was sent for a PR (by its node id), with their tokens' permissions. */
+const autoMergeTokens = (node: string) => gh.callsTo("POST", /^\/graphql$/).filter((c) => /PullRequestAutoMerge/.test(c.body?.query ?? "") && c.body?.variables?.id === node).map((c) => c.permissions);
 
 async function taskWithWorker(p: P) {
   const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "t" })).body;
@@ -76,7 +79,7 @@ describe("the repo's setting", () => {
     expect(gh.repo(p.repo).allow_auto_merge).toBe(false);
     expect(repoWrites(p).map((c) => c.body)).toEqual([{ allow_auto_merge: true }, { allow_auto_merge: false }]);
     // Each write's token: administration only.
-    expect(mintsFor(p).filter((x) => !x.checks && !x.metadata)).toEqual([{ administration: "write" }, { administration: "write" }]);
+    expect(tokensOf("PATCH", `/repos/${p.repo}`)).toEqual([{ administration: "write" }, { administration: "write" }]);
   });
 
   it("is written when a project is created with auto-merge on", async () => {
@@ -128,7 +131,7 @@ describe("the repo's setting", () => {
     await stub(p).drain();
     expect((await settings(p)).repo_auto_merge).toMatchObject({ state: "drifted", want: true, repo: false });
     // The read's token: what GitHub shows merge settings to.
-    expect(mintsFor(p).at(-1)).toEqual({ metadata: "read", contents: "write" });
+    expect(tokensOf("GET", `/repos/${p.repo}`).at(-1)).toEqual({ metadata: "read", contents: "write" });
     const r = await api(token, "POST", `/api/projects/${p.id}/auto-merge/retry`);
     expect(r.body.repo_auto_merge).toMatchObject({ state: "applied", repo: true });
     expect(gh.repo(p.repo).allow_auto_merge).toBe(true);
@@ -144,10 +147,8 @@ describe("a PR's auto-merge", () => {
     const t = await task(p, id);
     expect(t.prs[0]?.auto_merge ?? null).toMatchObject({ state: "enabled", method: "rebase", error: null });
     expect(t.history.at(-1)).toMatchObject({ action: "auto_merge_enabled", actor: "app:github" });
-    // Its token, exactly (the review's check-run token may be minted before or after it: two objects' alarms).
-    expect(mintsFor(p)).toContainEqual({ pull_requests: "write", contents: "write" });
-    // (The PR upkeep's read mints its own, reading only: README.md#pr-upkeep.)
-    expect(mintsFor(p).filter((m) => m.pull_requests === "write")).toEqual([{ pull_requests: "write", contents: "write" }]);
+    // Its token, exactly. (The PR upkeep's read has its own, reading only: README.md#pr-upkeep.)
+    expect(autoMergeTokens(prNode(p.repo, 7))).toEqual([{ pull_requests: "write", contents: "write" }]);
     // Not a task's PR; a fork's branch named like the task's.
     await pr(p, 8, { ref: "feature/x" });
     const other = await taskWithWorker(p);

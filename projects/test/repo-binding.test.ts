@@ -1,7 +1,7 @@
 // A project's repo binding (README.md#the-repos-binding): the repo's GitHub id read from GitHub at attach,
 // a sync backfilling projects that have none, the operator's re-read from the Admin page, and a rename or
-// transfer applied once nest's grant names the new name. Only nest's client interface: a token for the
-// repo, and the grant.
+// transfer applied once nest's grant names the new name. A token of the app's own App for the repo, its
+// installation looked up from GitHub (or nest's token, in the fallback), and nest's grant.
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
@@ -9,7 +9,7 @@ import { applyRename } from "../src/binding";
 import type { RepoBinding } from "../src/do/directory";
 import type { Env } from "../src/env";
 import { nestFrom } from "../src/nest";
-import { AccessTeam, api, deliverGithub, FakeNest, GH_INSTALLATION_ID, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf } from "./fake-nest";
+import { AccessTeam, api, deliverGithub, FakeNest, GH_INSTALLATION_ID, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf, withNestTokens } from "./fake-nest";
 
 const fake = new FakeNest();
 const gh = fake.github;
@@ -30,6 +30,8 @@ beforeEach(() => {
   fake.grantListing = null;
   fake.tokenInstallation = GH_INSTALLATION_ID;
   gh.failures = [];
+  // The default installation only: each test installs on its own accounts.
+  gh.installations = gh.installations.filter((i) => i.account === null);
 });
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 10);
@@ -60,7 +62,7 @@ const reviewRepo = (p: P) => runInDurableObject(env.REVIEW.get(env.REVIEW.idFrom
   st.storage.sql.exec<{ v: string }>("SELECT v FROM settings WHERE k = 'repo'").one().v);
 
 describe("read from GitHub, not taken from an event", () => {
-  it("attach binds the repo's id from GitHub, and the installation nest minted its token from, so no event's id binds it", async () => {
+  it("attach binds the repo's id from GitHub, and the App's installation on it as GitHub answers, so no event's id binds it", async () => {
     const p = await newProject();
     expect(await binding(p)).toMatchObject({ repo: p.repo, repo_id: repoIdOf(p.repo), bound: "github", renamed_to: null, installation_id: GH_INSTALLATION_ID, error: null });
     // Another repo's id under this name (or an event with none) reaches nothing.
@@ -182,25 +184,57 @@ describe("the App installation", () => {
     expect(await numbers(p)).toEqual([4]);
   });
 
-  it("an App reinstalled: the right repo's events from the new installation are refused, counted on the binding for the owner to see, until Re-read takes it", async () => {
+  it("an App reinstalled: the binding follows GitHub's lookup at once, its first event is taken; a token cached from the old installation is never used again", async () => {
     const p = await newProject();
+    const account = p.repo.split("/")[0]!;
+    // A token from the installation the project was bound to, cached by the import.
+    gh.issues.set(p.repo, new Map());
+    expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).status).toBe(200);
+    const before = gh.mints().length;
+    // Reinstalled on the repo's account: the old installation is gone, and GitHub sends events from the new one.
     const reinstalled = GH_INSTALLATION_ID + 100;
+    gh.reinstall(account, reinstalled);
+    const r = await deliverGithub("issues", issue(1, { id: repoIdOf(p.repo), full_name: p.repo }));
+    expect(await r.json()).toEqual({ ok: true });
+    expect(await numbers(p)).toEqual([1]);
+    expect(await binding(p)).toMatchObject({ installation_id: reinstalled, refused: null });
+    // The import again: its token minted from the new installation, not the one cached from the old.
+    expect((await api(token, "POST", `/api/projects/${p.id}/issues/import`)).status).toBe(200);
+    expect(gh.mints().slice(before).map((m) => m.installation)).toContain(reinstalled);
+    expect(gh.mints().slice(before).map((m) => m.installation)).not.toContain(GH_INSTALLATION_ID);
+    const reads = gh.callsTo("GET", new RegExp(`^/repos/${p.repo}/issues$`));
+    expect(gh.tokens.get(reads.at(-1)!.token!)!.installation).toBe(reinstalled);
+  });
+
+  it("an event from an installation GitHub doesn't answer for the repo is refused and counted, and a Re-read changes nothing; GitHub reads it at most once a minute", async () => {
+    const p = await newProject();
+    const reads = () => gh.callsTo("GET", new RegExp(`^/repos/${p.repo}$`)).length;
     for (const n of [1, 2]) {
-      const r = await deliverGithub("issues", { ...issue(n, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: reinstalled } });
-      expect(((await r.json()) as { ignored: string }).ignored).toContain(`installation (${reinstalled}) isn't the project's (${GH_INSTALLATION_ID})`);
+      const r = await deliverGithub("issues", { ...issue(n, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: 999 } });
+      expect(((await r.json()) as { ignored: string }).ignored).toContain(`installation (999) isn't the project's (${GH_INSTALLATION_ID})`);
     }
     expect(await numbers(p)).toEqual([]);
     // Shown on the Admin page's binding: how many, from which installation, when.
-    expect((await binding(p)).refused).toEqual({ installation: reinstalled, count: 2, last_ms: expect.any(Number) });
-    // A re-read while nest still names the old installation changes nothing.
+    expect((await binding(p)).refused).toEqual({ installation: 999, count: 2, last_ms: expect.any(Number) });
+    const before = reads();
+    await deliverGithub("issues", { ...issue(3, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: 999 } });
+    expect(reads()).toBe(before);
     expect((await reread(p)).status).toBe(200);
-    expect(await binding(p)).toMatchObject({ installation_id: GH_INSTALLATION_ID, refused: { count: 2 } });
-    // nest mints from the new installation now: Re-read takes it, the refusals are over, its events act.
-    fake.tokenInstallation = reinstalled;
-    expect((await reread(p)).status).toBe(200);
-    expect(await binding(p)).toMatchObject({ installation_id: reinstalled, refused: null });
-    await deliverGithub("issues", { ...issue(3, { full_name: p.repo }), installation: { id: reinstalled } });
-    expect(await numbers(p)).toEqual([3]);
+    expect(await binding(p)).toMatchObject({ installation_id: GH_INSTALLATION_ID, refused: { installation: 999, count: 3 } });
+  });
+
+  it("with nest's tokens (the fallback): a re-read while nest names the old installation changes nothing, then takes the one nest names", async () => {
+    await withNestTokens(async () => {
+      const p = await newProject();
+      const reinstalled = GH_INSTALLATION_ID + 150;
+      const r = await deliverGithub("issues", { ...issue(1, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: reinstalled } });
+      expect(((await r.json()) as { ignored: string }).ignored).toContain(`installation (${reinstalled}) isn't the project's (${GH_INSTALLATION_ID})`);
+      expect((await reread(p)).status).toBe(200);
+      expect(await binding(p)).toMatchObject({ installation_id: GH_INSTALLATION_ID, refused: { count: 1 } });
+      fake.tokenInstallation = reinstalled;
+      expect((await reread(p)).status).toBe(200);
+      expect(await binding(p)).toMatchObject({ installation_id: reinstalled, refused: null });
+    });
   });
 
   it("a project with none yet takes events as before, until a sync reads it; then it's held to it", async () => {
@@ -224,35 +258,14 @@ describe("the App installation", () => {
     expect(await numbers(p)).toEqual([]);
   });
 
-  it("a reinstalled App: once nest mints from the new installation, its events are taken by themselves, no Re-read; one nest doesn't name is still refused", async () => {
-    const p = await newProject();
-    const reinstalled = GH_INSTALLATION_ID + 200;
-    fake.tokenInstallation = reinstalled;
-    const r = await deliverGithub("issues", { ...issue(1, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: reinstalled } });
-    expect(await r.json()).toEqual({ ok: true });
-    expect(await numbers(p)).toEqual([1]);
-    expect(await binding(p)).toMatchObject({ installation_id: reinstalled, refused: null });
-    // Another installation, which nest doesn't mint from: refused and counted, the binding as it was, and
-    // GitHub read at most once a minute for it however many come.
-    const reads = () => gh.callsTo("GET", new RegExp(`^/repos/${p.repo}$`)).length;
-    const before = reads();
-    for (const n of [2, 3]) {
-      const x = await deliverGithub("issues", { ...issue(n, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: 999 } });
-      expect(((await x.json()) as { ignored: string }).ignored).toContain("installation (999)");
-    }
-    expect(await numbers(p)).toEqual([1]);
-    expect(await binding(p)).toMatchObject({ installation_id: reinstalled, refused: { installation: 999, count: 2 } });
-    expect(reads()).toBe(before);
-  });
-
-  it("a token for a name GitHub redirects (moved, no event naming the new name yet) never stores its installation", async () => {
+  it("an installation looked up by a name GitHub redirects (moved, no event naming the new name yet) is never stored", async () => {
     const p = await newProject();
     const to = `elsewhere-${rand()}/moved`;
     gh.rename(p.repo, to);
-    // nest mints for the old name from the installation on the account the repo moved to (and its grant
-    // doesn't name the new one, so the rename waits).
+    // GitHub answers the old name with the installation on the account the repo moved to (and nest's grant
+    // doesn't name the new name, so the rename waits).
+    gh.install({ id: 31_337, account: to.split("/")[0]! });
     fake.grantRepos = [p.repo];
-    fake.tokenInstallation = 31_337;
     expect((await reread(p)).status).toBe(200);
     expect(await binding(p)).toMatchObject({ repo_id: repoIdOf(p.repo), installation_id: GH_INSTALLATION_ID, renamed_to: to });
     // So that account's events are still refused.
@@ -260,40 +273,54 @@ describe("the App installation", () => {
     expect(((await r.json()) as { ignored: string }).ignored).toContain("isn't the project's");
   });
 
-  it("a token minted for the old name (the new one not in nest's grant yet) never stores its installation", async () => {
+  it("an installation looked up by the old name (the new one not in nest's grant yet) is never stored", async () => {
     const p = await newProject();
     const to = `${p.repo}-renamed`;
     gh.rename(p.repo, to);
     await deliverGithub("issues", issue(1, { id: repoIdOf(p.repo), full_name: to }));
     expect((await binding(p)).renamed_to).toBe(to);
-    // The grant names only the old name, whose token comes from another installation (the name's owner now).
+    // The grant names only the old name, which GitHub now answers with another installation.
+    gh.install({ id: 31_337, account: p.repo.split("/")[0]! });
     fake.grantRepos = [p.repo];
-    fake.tokenInstallation = 31_337;
     expect((await reread(p)).status).toBe(200);
     expect((await sync()).status).toBe(200);
     expect(await binding(p)).toMatchObject({ repo_id: repoIdOf(p.repo), installation_id: GH_INSTALLATION_ID });
-    // The real repo's events still reach the project.
+    // The real repo's events from the bound installation still reach the project.
     fake.grantRepos = null;
-    await deliverGithub("issues", issue(2, { id: repoIdOf(p.repo), full_name: to }));
+    await deliverGithub("issues", { ...issue(2, { id: repoIdOf(p.repo), full_name: to }), installation: { id: GH_INSTALLATION_ID } });
     expect(await numbers(p)).toEqual([1, 2]);
   });
 
-  it("a nest that doesn't name it keeps the stored one; another repo chosen takes its own", async () => {
+  it("with nest's tokens (the fallback), a nest that doesn't name it keeps the stored one; another repo chosen takes its own", async () => {
+    await withNestTokens(async () => {
+      const p = await newProject();
+      fake.tokenInstallation = null;
+      expect((await reread(p)).status).toBe(200);
+      expect((await binding(p)).installation_id).toBe(GH_INSTALLATION_ID);
+      // The repo replaced on GitHub, and the operator binds the new one: the installation is the one nest names for it now.
+      gh.rename(p.repo, `${p.repo}-gone`);
+      const impostor = gh.take(p.repo);
+      expect((await reread(p)).body.mismatch.github.id).toBe(impostor);
+      expect((await binding(p)).installation_id).toBe(GH_INSTALLATION_ID);
+      // Chosen while nest names none: the old repo's installation isn't kept for the new one.
+      await bind(p, impostor);
+      expect(await binding(p)).toMatchObject({ repo_id: impostor, installation_id: null });
+      // Read again with nest naming it: that one.
+      fake.tokenInstallation = 4_242_424;
+      await reread(p);
+      expect(await binding(p)).toMatchObject({ repo_id: impostor, installation_id: 4_242_424 });
+    });
+  });
+
+  it("another repo chosen takes the installation GitHub answers for it", async () => {
     const p = await newProject();
-    fake.tokenInstallation = null;
-    expect((await reread(p)).status).toBe(200);
-    expect((await binding(p)).installation_id).toBe(GH_INSTALLATION_ID);
-    // The repo replaced on GitHub, and the operator binds the new one: the installation is the one nest names for it now.
     gh.rename(p.repo, `${p.repo}-gone`);
-    const impostor = gh.take(p.repo);
+    // The name is another account's repo now (its login taken over), on that account's own installation.
+    gh.install({ id: 4_242_424, account: p.repo.split("/")[0]! });
+    const impostor = gh.take(p.repo, 31_337);
     expect((await reread(p)).body.mismatch.github.id).toBe(impostor);
     expect((await binding(p)).installation_id).toBe(GH_INSTALLATION_ID);
-    // Chosen while nest names none: the old repo's installation isn't kept for the new one.
     await bind(p, impostor);
-    expect(await binding(p)).toMatchObject({ repo_id: impostor, installation_id: null });
-    // Read again with nest naming it: that one.
-    fake.tokenInstallation = 4_242_424;
-    await reread(p);
     expect(await binding(p)).toMatchObject({ repo_id: impostor, installation_id: 4_242_424 });
   });
 });
@@ -424,8 +451,9 @@ describe("a renamed or transferred repo", () => {
     await deliverGithub("issues", issue(1, { id: repoIdOf(p.repo), full_name: to }));
     const impostor = gh.take(p.repo);
     expect(impostor).not.toBe(repoIdOf(p.repo));
-    // nest's grant covers only the old name, so the rename itself waits (this test is about the read).
-    fake.grantListing = { repos: [{ repo: p.repo, push: true, read: true, github: true }], unlisted: [], complete: true };
+    // nest's grant covers the new name for GitHub calls but not for pushes, so the rename itself waits (this test
+    // is about the read).
+    fake.grantListing = { repos: [{ repo: p.repo, push: true, read: true, github: true }, { repo: to.toLowerCase(), push: false, read: true, github: true }], unlisted: [], complete: true };
     const r = await reread(p);
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ changed: false, binding: { repo_id: repoIdOf(p.repo), renamed_to: to } });
@@ -446,13 +474,13 @@ describe("a sync reads again what may have moved", () => {
     expect((await binding(a)).owner).toMatchObject({ id: ownerIdOf(newOwner), login: newOwner });
     // The copy a rolled-back release trusts is the owner now, not the one at attach.
     expect(await oldOwnerCopy(a)).toEqual({ repo_owner_id: ownerIdOf(newOwner), repo_owner_login: newOwner });
-    // Events refused while nest still answered the old installation (the minute's read spent on that).
+    // Events refused while GitHub still answered the old installation (the minute's read spent on that).
     fake.grantRepos = null;
     const b = await newProject();
     const reinstalled = GH_INSTALLATION_ID + 300;
     await deliverGithub("issues", { ...issue(1, { id: repoIdOf(b.repo), full_name: b.repo }), installation: { id: reinstalled } });
     expect(await binding(b)).toMatchObject({ installation_id: GH_INSTALLATION_ID, refused: { count: 1 } });
-    fake.tokenInstallation = reinstalled;
+    gh.reinstall(b.repo.split("/")[0]!, reinstalled);
     expect((await sync()).status).toBe(200);
     expect(await binding(b)).toMatchObject({ installation_id: reinstalled, refused: null });
   });
@@ -468,14 +496,14 @@ describe("a sync reads again what may have moved", () => {
     expect(await oldOwnerCopy(p)).toEqual({ repo_owner_id: ownerIdOf(owner), repo_owner_login: owner });
   });
 
-  it("attach takes a token's installation only for the name GitHub answers with: a redirected name's may be another account's", async () => {
+  it("attach takes the installation it looked up only for the name GitHub answers with: a redirected name's may be another account's", async () => {
     const from = `o-${rand()}/r-${rand()}`;
     const to = `elsewhere-${rand()}/moved`;
     gh.repo(from);
     gh.rename(from, to);
-    // nest's grant names the old name only, and mints for it from the installation on the account it moved to.
+    // nest's grant names the old name only, and GitHub answers it with the installation on the account it moved to.
     fake.grantRepos = [from];
-    fake.tokenInstallation = 31_337;
+    gh.install({ id: 31_337, account: to.split("/")[0]! });
     const p = (await api(token, "POST", "/api/projects", { name: from, repo: from })).body;
     expect(p.settings).toMatchObject({ attached: true });
     expect((await api(token, "GET", "/api/admin/bindings")).body.find((b: RepoBinding) => b.project === p.id)).toMatchObject({ repo_id: repoIdOf(from), installation_id: null, renamed_to: to });
@@ -503,10 +531,10 @@ describe("a binding not read from GitHub yet (no id, or one from an event)", () 
     const mallory = { id: 987_654, login: "mallory" };
     // No id yet, and none of the binding's own owner (learned from an event): the owner recorded at attach decides.
     await dirSql("UPDATE projects SET repo_id = NULL, repo_bound = NULL, repo_owner_id = NULL, repo_owner_login = NULL WHERE id = ?", p.id);
-    // The name is another repo now, mallory's, on mallory's installation, and nest mints for it from there.
+    // The name is another repo now, mallory's (the login taken over), on mallory's installation, which GitHub answers for it.
     gh.rename(p.repo, `${p.repo}-gone`);
     const taken = gh.take(p.repo, mallory.id);
-    fake.tokenInstallation = 777;
+    gh.install({ id: 777, account: p.repo.split("/")[0]! });
     const r = await deliverGithub("issues", { ...issue(1, { id: taken, full_name: p.repo, owner: { ...mallory, type: "User" } }), installation: { id: 777 } });
     expect(((await r.json()) as { ignored: string }).ignored).toContain("isn't the project's");
     expect(await binding(p)).toMatchObject({ repo_id: null, installation_id: GH_INSTALLATION_ID, error: expect.stringContaining("the owner recorded for the project") });

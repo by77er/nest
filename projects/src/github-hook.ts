@@ -154,7 +154,7 @@ async function trustedIds(env: Env, projectId: string, repo: string, botAuthor: 
   // before it's held (the App was replaced, or the id recorded was stale).
   if (botAuthor !== null && bot !== botAuthor && nest) {
     try {
-      bot = await appBotId(nest, repo);
+      bot = await appBotId(env, nest, repo);
       if (bot !== null) await dir.recordGithubAppBotId(bot);
     } catch (e) {
       console.warn(`the App's bot couldn't be looked up; a bot's PR is held meanwhile: ${String(e).slice(0, 200)}`);
@@ -203,8 +203,8 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
   const installation = repoId(payload.installation);
   const route = () => dir.projectForRepo(repoId(payload.repository), str(obj(payload.repository).full_name) ?? null, installation);
   let routed = await route();
-  // Another installation than the binding's: the binding is read again, to follow the installation nest mints
-  // the repo's tokens from now (a reinstalled App), and the event routed again if the binding's changed.
+  // Another installation than the binding's: the binding is read again, to follow the App's installation on the
+  // repo as GitHub answers it now (a reinstalled App), and the event routed again if the binding's changed.
   const nest = nestFrom(env);
   if (routed && "refused" in routed && installation !== null && nest) {
     let followed = false;

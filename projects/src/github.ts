@@ -1,9 +1,9 @@
 // GitHub, as the review pipeline uses it (README.md#built-the-review-pipeline): the webhook's signature, a thin client of
 // the REST API for check runs, the repo and branch protection, and the pure rules that keep the
 // owner's branch protection while adding the review check. Every call carries a short-lived token of
-// nest's GitHub App, minted for one repo with exactly the permissions it needs
-// (`POST /v1/clients/self/github-token`, docs/control-plane/api/clients/#github-tokens). The token is
-// never logged or put in an error.
+// the app's own GitHub App, minted for one repo with exactly the permissions it needs (src/github-app.ts,
+// README.md#github-tokens; nest's `POST /v1/clients/self/github-token` is the fallback for one release). The
+// token is never logged or put in an error.
 //
 // GitHub's docs this follows:
 // - webhook signatures: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
@@ -13,6 +13,8 @@
 // - which conclusions a required check accepts (success, skipped, neutral):
 //   https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches
 
+import type { Env } from "./env";
+import { tokenSource } from "./github-app";
 import type { Nest } from "./nest";
 
 export const GITHUB_API = "https://api.github.com";
@@ -120,10 +122,12 @@ export interface StatusChecks {
 export class GitHub {
   constructor(
     private readonly token: string,
-    /** The GitHub App the token is from, as nest's answer names it; null when it doesn't. */
+    /** The GitHub App the token is from; null when its source doesn't say (nest's answer may not). */
     readonly appId: number | null = null,
-    /** The App installation the token was minted from, as nest's answer names it; null when it doesn't (a nest from before). */
+    /** The App installation the token was minted from; null when its source doesn't say (a nest from before). */
     readonly installationId: number | null = null,
+    /** Called when GitHub answers the token 401 or 404: its source drops it and looks the installation up again. */
+    private readonly onStale: () => void = () => {},
   ) {}
 
   /** One call: the JSON answer, or GitHubError. A 404 is answered as null where `nullOn404`. */
@@ -142,6 +146,9 @@ export class GitHub {
     });
     const text = await res.text();
     if (res.ok) return (text ? JSON.parse(text) : {}) as T;
+    // A token GitHub refuses, or a repo it doesn't show the token (its installation gone, the repo no longer
+    // selected): not handed out again (README.md#github-tokens), even where a 404 is the answer.
+    if (res.status === 401 || res.status === 404) this.onStale();
     if (res.status === 404 && o.nullOn404) return null;
     let message = text.slice(0, 200);
     try {
@@ -335,11 +342,14 @@ function pullOf(p: Record<string, unknown>, repo: string): Pull {
   };
 }
 
-/** A client with a token for `repo` with exactly `permissions`, knowing the App it's from when nest says. */
-export async function githubFor(nest: Nest, repo: string, permissions: Record<string, string>): Promise<GitHub> {
-  const t = await nest.githubToken(repo, permissions);
-  const id = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null);
-  return new GitHub(t.token, id(t.app_id), id(t.installation_id));
+/**
+ * A client with a token for `repo` with exactly `permissions`, from the app's own App (or nest's, the
+ * fallback), knowing the App and the installation it's from. `fresh`: the repo's installation looked up now,
+ * not from the cache (a binding's read, README.md#the-repos-binding).
+ */
+export async function githubFor(env: Env, nest: Nest, repo: string, permissions: Record<string, string>, o: { fresh?: boolean } = {}): Promise<GitHub> {
+  const t = await tokenSource(env, nest).token(repo, permissions, o);
+  return new GitHub(t.token, t.appId, t.installationId, t.stale);
 }
 
 /**
@@ -354,14 +364,15 @@ export function ownInstallation(minted: string, fullName: string, installation: 
 }
 
 /**
- * The GitHub id of nest's App's bot account, `<app_slug>[bot]` (the author of what the App's tokens
- * create, workers' PRs among them), by the slug nest's token answer names; null when nest names none or
- * GitHub has no such bot. https://docs.github.com/en/rest/users/users#get-a-user
+ * The GitHub id of the App's bot account, `<app_slug>[bot]` (the author of what the App's tokens create,
+ * workers' PRs among them), by the App's slug (`GET /app`, or nest's token answer in the fallback); null when
+ * the slug isn't known or GitHub has no such bot. https://docs.github.com/en/rest/users/users#get-a-user
  */
-export async function appBotId(nest: Nest, repo: string): Promise<number | null> {
-  const t = await nest.githubToken(repo, PERMISSIONS.metadata);
-  if (typeof t.app_slug !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(t.app_slug)) return null;
-  const u = await new GitHub(t.token).call<{ id?: unknown; type?: unknown }>("GET", `/users/${t.app_slug}%5Bbot%5D`, undefined, { nullOn404: true });
+export async function appBotId(env: Env, nest: Nest, repo: string): Promise<number | null> {
+  const slug = await tokenSource(env, nest).appSlug(repo);
+  if (typeof slug !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(slug)) return null;
+  const gh = await githubFor(env, nest, repo, PERMISSIONS.metadata);
+  const u = await gh.call<{ id?: unknown; type?: unknown }>("GET", `/users/${slug}%5Bbot%5D`, undefined, { nullOn404: true });
   return u && u.type === "Bot" && typeof u.id === "number" && Number.isSafeInteger(u.id) && u.id > 0 ? u.id : null;
 }
 
