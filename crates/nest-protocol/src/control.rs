@@ -173,6 +173,12 @@ pub struct HostHello {
     /// previous release, on whose cell the control plane refuses API clients' request guards.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guard_bounds: bool,
+    /// This host's nest-proxy reads a request guard's `injected: "*"` as any binding's credential
+    /// (docs/sandbox/networking/egress/policy/#any-injected-credential). Absent (false) from a host of
+    /// the previous release, which reads `*` as a binding's name: on whose cell the control plane refuses
+    /// guards naming it, and on which it places no sandbox whose guards name it in a scope.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guard_injected_any: bool,
     /// Everything this host currently holds; FleetDO reconciles against it.
     pub sandboxes: Vec<SandboxReport>,
     pub agents: Vec<AgentReport>,

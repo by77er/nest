@@ -17,7 +17,7 @@ mirroring `crates/nest-protocol`). Every fixture in `protocol/fixtures/control/`
 | `src/do/client.ts` | **ClientDO** (one per API client, plus the `directory` of names): the record, grant and token hash, the registry of its subtree that its maximums count and it lists, and its webhook with the backlog of events it delivers (`src/lib/client-events.ts`); grants, tokens and labels are `src/lib/clients.ts` (pure) (docs/control-plane/durable-objects/client/) |
 | `src/do/channel.ts` | **ChannelDO** (stub): channels left the platform; the class stays declared, serving only health and re-arming a previous release's alarm, until stage 4 deletes it |
 | `src/do/tasks.ts` | **TaskLedgerDO** (stub): the task ledger left the platform; the class stays declared, serving only health, until stage 4 deletes it |
-| `src/lib/` | Reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry, repo allowlists (`repos.ts`) and the egress rule constructors (`rules/`: GitHub's push allowlist to request guards; docs/sandbox/networking/egress/policy/#request-guards) |
+| `src/lib/` | Reliable channels (strict in-order inbound, serial queue) and deadlines, host tokens, AWS identity (CMS RSA) verifier, CA signing, EC2 STONITH, tool registry, repo allowlists (`repos.ts`) and the egress rule constructors (`rules/`: GitHub's push allowlist to request guards; docs/sandbox/networking/egress/policy/#request-guards), and where guards name `injected: "*"` and its host gate (`injected-any.ts`) |
 | `test/regressions.test.ts` | One regression test per finding of the control-plane review |
 
 ## Commands

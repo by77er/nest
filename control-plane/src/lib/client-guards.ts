@@ -7,9 +7,11 @@
 // exceptions are consulted only for that guard's own scope (`refusing` in crates/nest-proxy/src/guard.rs),
 // so a client's exception never exempts a request from the operator's guards or another layer's. On the
 // wire a client's guard is named `client:<name>`, and its `injected` matchers name the client's own
-// bindings (`client:<binding>`), never an operator's. Pure.
+// bindings (`client:<binding>`), never an operator's by name; an exception's `*` holds for any binding
+// nest injected, which only narrows when that exception holds. Pure.
 import { z } from "zod";
-import { hostPatternMatches, type RequestGuard, type RequestMatch } from "../protocol/model";
+import { hostPatternMatches, INJECTED_ANY, type RequestGuard, type RequestMatch } from "../protocol/model";
+import { scopeNamesInjectedAny } from "./injected-any";
 import { EgressHost } from "./client-egress";
 import { CLIENT_BINDING_PREFIX, InjectionName } from "./client-secrets";
 
@@ -51,6 +53,9 @@ export const PathPattern = z.string().max(256).superRefine((p, ctx) => {
 
 const QueryText = (max: number) => z.string().max(max).regex(PRINTABLE, "printable ASCII without spaces");
 
+/** An HTTP header name (RFC 9110 token), at most 64 characters. */
+const HeaderName = z.string().regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$/, "a header name: 1-64 token characters");
+
 /** One matcher, the operator's `RequestMatch` with bounds: every field given must match (none: anything). */
 export const ClientRequestMatch = z.strictObject({
   methods: Methods.optional(),
@@ -61,8 +66,19 @@ export const ClientRequestMatch = z.strictObject({
     pointer: z.string().max(128).regex(/^(?:\/[^/]*)*$/, "an RFC 6901 pointer: empty, or /-separated tokens"),
     values: z.array(z.string().max(128)).min(1).max(16),
   }).optional(),
-  /** One of the client's own bindings (its name, as in its `inject`): on the wire `client:<name>`. */
-  injected: InjectionName.optional(),
+  /**
+   * One of the client's own bindings (its name, as in its `inject`): on the wire `client:<name>`. Or `*`
+   * (`INJECTED_ANY`), in an exception only: any credential nest injected, an operator binding's included.
+   * It only narrows when the exception holds; in a scope a previous release would fail open (`ClientGuard`).
+   */
+  injected: z.string().refine((v) => v === INJECTED_ANY || InjectionName.safeParse(v).success,
+    `a binding name (1-32 lowercase letters, digits and '_', starting with a letter), or "${INJECTED_ANY}" for any`).optional(),
+  /**
+   * A header name: the request carries one field of it, whose whole value nest's substitution wrote (of
+   * `injected`'s binding, or any binding's when absent or `*`). Without it, `injected` holds for a
+   * substitution anywhere in the request.
+   */
+  at: HeaderName.optional(),
 });
 export type ClientRequestMatch = z.output<typeof ClientRequestMatch>;
 
@@ -82,6 +98,12 @@ export const ClientGuard = z.strictObject({
   ignore_case: z.boolean().optional(),
 }).superRefine((g, ctx) => {
   if (new Set(g.hosts).size !== g.hosts.length) ctx.addIssue({ code: "custom", message: `guard ${g.name}: a host is listed twice` });
+  // A previous release's Worker (after a rollback) sends a client's `*` as the binding `client:*`, and a
+  // previous release's nest-proxy reads `*` as a name: either way it matches nothing. In an exception that
+  // refuses more; in a scope the guard would stop refusing, so a client names `*` in exceptions only.
+  if (scopeNamesInjectedAny([g])) {
+    ctx.addIssue({ code: "custom", message: `guard ${g.name}: injected "${INJECTED_ANY}" (any credential nest injected) is for exceptions (allow), not scope` });
+  }
 });
 export type ClientGuard = z.output<typeof ClientGuard>;
 
@@ -169,10 +191,14 @@ const copyGuard = (g: ClientGuard): ClientGuard => ({
   ...(g.ignore_case !== undefined ? { ignore_case: g.ignore_case } : {}),
 });
 
-/** A matcher on the wire: `injected` names the client's own binding (`client:<name>`), whatever it was written as. */
+/**
+ * A matcher on the wire: `injected` names the client's own binding (`client:<name>`), whatever it was
+ * written as; `*` stays `*` (any binding's: it names none).
+ */
 function wireMatch(m: ClientRequestMatch): RequestMatch {
   const { injected, ...rest } = copyMatch(m);
-  return { ...rest, ...(injected !== undefined ? { injected: `${CLIENT_BINDING_PREFIX}${injected}` } : {}) };
+  if (injected === undefined) return rest;
+  return { ...rest, injected: injected === INJECTED_ANY ? INJECTED_ANY : `${CLIENT_BINDING_PREFIX}${injected}` };
 }
 
 /** A client's guard as nest-proxy gets it: an ordinary `RequestGuard` named `client:<name>` (no host change). */

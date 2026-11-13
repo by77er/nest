@@ -17,7 +17,7 @@ fn policy() -> EgressPolicy {
 /// The name of the guard that refuses the request, if any.
 fn decide(p: &EgressPolicy, host: &str, method: &str, target: &str, body: Option<&str>, injected: Option<&str>) -> Option<String> {
     let (path, query) = target.split_once('?').map_or((target, None), |(a, b)| (a, Some(b)));
-    let req = Req { host, method, path, query, injected };
+    let req = Req { host, method, path, query, injected, whole: &[] };
     let json = body.and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok());
     let view = match (body, &json) {
         (None, _) => BodyView::Unread,

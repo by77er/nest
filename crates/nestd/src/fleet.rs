@@ -221,6 +221,8 @@ impl Shell {
                     brain_epochs: true,
                     // nest-proxy ships with nestd: this release's bounds guarded requests.
                     guard_bounds: true,
+                    // ...and reads a guard's `injected: "*"` as any binding.
+                    guard_injected_any: true,
                     sandboxes,
                     agents,
                     capacity,

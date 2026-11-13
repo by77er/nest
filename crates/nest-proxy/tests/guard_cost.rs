@@ -100,7 +100,7 @@ fn same_name_query() -> String {
 /// Prepare, the body pre-pass and the decision, as the proxy runs them; how long it took.
 fn decide(guards: &[RequestGuard], path: &str, query: &str) -> (Result<bool, TooLong>, Duration) {
     let t = Instant::now();
-    let req = Req { host: "h.test", method: "POST", path, query: Some(query), injected: None };
+    let req = Req { host: "h.test", method: "POST", path, query: Some(query), injected: None, whole: &[] };
     let out = req.prepare().map(|p| {
         let nb = guard::needs_body(guards, &p);
         let body = serde_json::json!({"op": "write"});

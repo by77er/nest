@@ -120,7 +120,7 @@ fn check(p: &EgressPolicy, cases: &[Case]) {
             (Some(_), Some(v)) => BodyView::Json(v),
             (Some(_), None) => BodyView::Unknown,
         };
-        let req = Req { host, method, path, query, injected };
+        let req = Req { host, method, path, query, injected, whole: &[] };
         let got = refusing(&p.guards, &req.prepare().unwrap(), &view).map(|g| g.name.clone());
         assert_eq!(got.is_some(), want, "{method} {host}{target}: {got:?}");
     }

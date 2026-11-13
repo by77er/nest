@@ -21,7 +21,7 @@ import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
 import {
   type AllowRule, type EgressLimits, type EgressPolicy, type ErrorBody, ErrorCodes, type GenerationRecord,
-  hostPatternMatches, InjectionBinding, type InjectionSecret, RequestGuard, type Resources, SandboxState,
+  hostPatternMatches, INJECTED_ANY, InjectionBinding, type InjectionSecret, RequestGuard, type Resources, SandboxState,
 } from "../protocol/model";
 import { canonicalRepos, readOnlyRepos, Repos, unionRepos } from "../lib/repos";
 import type { Labels } from "../lib/clients";
@@ -30,6 +30,7 @@ import { GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING, githu
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
 import { githubEnvConflict, githubEnvRefusal, isGithubEnvName, slotEnv } from "../lib/sandbox-env";
+import { freshInjectedAny, injectedAnyConflict } from "../lib/injected-any";
 import { CLIENT_GUARD_PREFIX, type ClientGuard, distinctGuards, type HeldGuard, layerOverLimit, outsideOperatorRouting, sandboxGuardsOverLimit, wireGuard } from "../lib/client-guards";
 import type { MintedInjection, SecretsChangedAnswer } from "./broker";
 import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
@@ -76,8 +77,10 @@ export const SandboxPolicyLayer = z.object({
   passthrough: z.array(z.string().min(1)).default([]),
   // `client:` names are API clients' bindings' (docs/control-plane/api/clients/#injection): an operator binding
   // under one would be pushed its client's secret.
+  // `*` is a guard matcher's "any binding" (`injected: "*"`), so no binding takes it as its name; nor the empty name.
   inject: z.array(InjectionBinding.refine((b) => !b.name.startsWith(CLIENT_BINDING_PREFIX),
-    `a binding name starting ${CLIENT_BINDING_PREFIX} is an API client's`)).default([]),
+    `a binding name starting ${CLIENT_BINDING_PREFIX} is an API client's`)
+    .refine((b) => b.name !== "" && b.name !== INJECTED_ANY, `a binding's name is neither empty nor "${INJECTED_ANY}" (a guard's "any binding")`)).default([]),
   tcp: z.array(z.object({ host: z.string().min(1), port: Port })).default([]),
   repos: Repos.default([]),
   read_repos: Repos.default([]),
@@ -485,6 +488,8 @@ export class SandboxDO extends DurableObject<Env> {
     const over = req.guards?.length ? layerOverLimit(req.guards) : null;
     if (over) throw new NestError(ErrorCodes.INVALID_MESSAGE, over);
     if (req.guards?.length && !this.get<SandboxInfo>("info")) await this.requireGuardBounds(req.cell);
+    // Its operator layer's guards and its own naming `injected: "*"` need every host to read it as any binding.
+    if (!this.get<SandboxInfo>("info")) await this.requireInjectedAny(req.cell, [...freshInjectedAny(asked.guards, []), ...freshInjectedAny(req.guards ?? [], [])]);
     // The cell's registry is the authority for which sandboxes exist (its GC roots): registered
     // before anything can be written for the sandbox, and again on a retried create, but never
     // again once destroyed (its registry row may already be pruned).
@@ -1293,8 +1298,11 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   async setPolicy(input: SandboxPolicyInput): Promise<EgressPolicy> {
-    this.info_();
+    const info = this.info_();
     const layer = SandboxPolicyLayer.parse(input);
+    // A guard newly naming `injected: "*"` needs every host to read it as any binding; one already stored
+    // stays writable. Before the checks below, so nothing they read goes stale across the await.
+    await this.requireInjectedAny(info.cell, freshInjectedAny(layer.guards, this.operatorLayer().guards));
     this.refuseGithubEnv(this.kernelGithub({ layer }), ...this.envs());
     this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos), read_repos: canonicalRepos(layer.read_repos) });
     await this.policyChanged(true);
@@ -1592,8 +1600,11 @@ export class SandboxDO extends DurableObject<Env> {
       if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);
     }
     // Its guards need its cell's hosts to bound them, and must fit beside the sandbox's (checked in the step that records them).
-    if (this.countedGuards(extra.guards).length) {
+    const counted = this.countedGuards(extra.guards);
+    if (counted.length) {
       await this.requireGuardBounds(cur.cell);
+      // Those newly naming `injected: "*"` (not already held for this agent) need every host to read it as any binding.
+      await this.requireInjectedAny(cur.cell, freshInjectedAny(counted, this.get<Record<string, HeldGuard[]>>(AGENT_GUARDS)?.[agent] ?? []));
       if (lease.gone(this.info_().state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${this.info_().state}`, 409);
     }
     if (extra.guards?.length) this.checkGuardLimit(undefined, { id: agent, guards: extra.guards });
@@ -1877,6 +1888,18 @@ export class SandboxDO extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Refuse (409) guards newly naming `injected: "*"` (`fresh`; none: nothing to check) while any sandbox host
+   * of its cell reads `*` as a binding's name (docs/sandbox/networking/egress/policy/#any-injected-credential).
+   * Such a host fails a scope's `*` open, so a write naming it waits for every host; placement keeps a
+   * sandbox whose scopes name it off such hosts that join later.
+   */
+  private async requireInjectedAny(cell: string, fresh: readonly { name: string }[]): Promise<void> {
+    if (!fresh.length) return;
+    const old = await this.fleet(cell).hostsWithoutInjectedAny();
+    if (old.length) throw injectedAnyConflict(cell, fresh.map((g) => g.name), old);
+  }
+
   /** Refuse (400) a layer or an attach that would give the sandbox more client guards than it applies. */
   private checkGuardLimit(own?: readonly ClientGuard[], agent?: { id: string; guards: readonly HeldGuard[] }): void {
     const over = sandboxGuardsOverLimit(this.clientGuards(own, agent));
@@ -1956,11 +1979,14 @@ export class SandboxDO extends DurableObject<Env> {
     const adds = (stored: readonly ClientGuard[]) => guards.some((g) => !stored.some((s) => JSON.stringify(s) === JSON.stringify(g)));
     const known = !adds(this.get<ClientGuard[]>(OWN_GUARDS) ?? []);
     if (!known) await this.requireGuardBounds(info.cell);
+    // Likewise a guard newly naming `injected: "*"` needs every host to read it as any binding.
+    const freshAny = freshInjectedAny(guards, this.get<ClientGuard[]>(OWN_GUARDS) ?? []);
+    await this.requireInjectedAny(info.cell, freshAny);
     if (info.client) await this.readEgressCeiling();
     const now = this.info_();
     if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);
     // Let through as adding none: still so in the step that writes (another write may have replaced them meanwhile).
-    if (known && adds(this.get<ClientGuard[]>(OWN_GUARDS) ?? [])) {
+    if ((known && adds(this.get<ClientGuard[]>(OWN_GUARDS) ?? [])) || (!freshAny.length && freshInjectedAny(guards, this.get<ClientGuard[]>(OWN_GUARDS) ?? []).length)) {
       throw new NestError(ErrorCodes.CONFLICT, "the sandbox's guards changed while this layer was written: read the layer again and retry", 409);
     }
     this.checkGuardLimit(guards);

@@ -104,10 +104,11 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
     - {path: /store/mine/**}
     - {methods: [POST], path: /batch, body_json: {pointer: /op, values: [read]}}
     - {methods: [POST], path: /query, injected: svc}   # only with the proxy's own credential for binding `svc`
+    - {methods: [POST], path: /upload, injected: "*", at: authorization}  # only when Authorization is nest's, any binding's
   ignore_case: true
 ```
 
-- **A matcher** is `methods`, `methods_except`, `path` (segments: a literal, `*` for one segment, `**` for any number), `query` (`[{name, values}]`), `body_json` (`{pointer, values}`, RFC 6901) and `injected` (the binding whose credential the proxy substituted). Every field given must match.
+- **A matcher** is `methods`, `methods_except`, `path` (segments: a literal, `*` for one segment, `**` for any number), `query` (`[{name, values}]`), `body_json` (`{pointer, values}`, RFC 6901) `injected` (the binding whose credential the proxy substituted, or `*` for any binding's) and `at` (the header that substitution must have written whole): [below](#any-injected-credential). Every field given must match.
 - **Every guard must let a request through.** Guards only take away, so layers compose by intersection and no layer can undo another's guard.
 - **Scopes err towards refusing; exceptions towards not matching.** A scope matches the path as sent *or* decoded and normalized (percent-decoding up to three rounds, `\` as `/`, `;params` cut, empty and dot segments applied), and query names and values decoded. An exception matches only a clean path as sent ([injection](../injection/#scope)'s safe-path rules, plus no segment that decodes to a dot segment), compared as sent, so an encoded or `;`-suffixed name never equals a literal. A body the proxy can't read (encoded, over 64 KiB, slower than 30 s, not JSON, or the field missing) is in a `body_json` scope and never a `body_json` exception. The body is read only when a matcher on the request's host needs it, then replayed to the upstream whole.
 - **A guarded host is always inspected:** never spliced (a passthrough entry for it is ignored) and never a TCP exception, so no layer can route around a guard.
@@ -121,11 +122,47 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 
 **Built (2026-11-12).** An API client writes request guards for its own sandboxes in the same shape, so an app expresses a service's rules (a push allowlist, a read-only API) as data, with no constructor in the kernel ([where and how](../../../../control-plane/api/clients/#request-guards)).
 - **They can only refuse.** nest-proxy refuses a request when any guard refuses it, and consults a guard's `allow` only for that guard's own scope (`refusing` in `guard.rs`). So a client's exception never exempts a request from the operator's guards, the constructed ones or another layer's: adding a client's guards to a policy never lets through a request the policy without them refused. Shown by `tests/client_guards.rs` on the fixture `egress_policy.client_guards.json`, which a vitest asserts the control plane produces.
-- **On the wire** a client's guard is an ordinary `RequestGuard` named `client:<name>`, after the operator's (a request both refuse names the operator's), and every `injected` in it names the client's own binding (`client:<binding>`). The operator's layer can't name a guard `client:…`. No host change.
+- **On the wire** a client's guard is an ordinary `RequestGuard` named `client:<name>`, after the operator's (a request both refuse names the operator's), and every named `injected` in it names the client's own binding (`client:<binding>`). An exception's `injected: "*"` stays `*`: [any injected credential](#any-injected-credential). The operator's layer can't name a guard `client:…`. No host change.
 - **They never change routing the operator chose:** a guarded host is always inspected, never spliced and never a TCP exception, so a client's guard drops any host the operator marks passthrough or routes as a TCP exception (equal to, under or covering one). Otherwise the operator's splice or TCP exception would stop working, and an operator binding on a spliced host would become injectable.
 - **Bounded,** for nest-proxy's packet and its per-request work: at most one `**` in a path pattern and a few segments after it (nest-proxy tries every split of a path at a `**`), and per-list and per-sandbox bounds on guards, scope matchers and matcher work, exceptions with their query parameters, body fields and values included ([limits](../../../../control-plane/api/clients/#request-guards)). With the proxy's per-request bounds above, a sandbox's guards cost the shared proxy at most about a millisecond a request (measured above).
 - **Only where every host bounds them:** a cell with any sandbox host whose nest-proxy predates these bounds (its fleet hello lacks `guard_bounds`) refuses new client guards (409), never drops them, and a sandbox with client guards is placed only on a host that bounds them: with none free it waits, unplaced ([request guards](../../../../control-plane/api/clients/#request-guards)).
 - **Who else writes them:** guards in the operator's templates and spawn overrides are client guards too: named `client:<name>`, with `injected` naming the sandbox's client's binding (`client:<b>`), and applied in any sandbox.
+
+### Any injected credential
+
+**Built (2026-11-12, [principle 10](../../../../README.md#principles)).** Two matcher fields let a guard ask about nest's own credentials without naming any app's binding (`injected_matches` in `guard.rs`; `INJECTED_ANY` in both protocol copies; what the injector wrote whole is `inject::apply_whole`):
+- **`injected: "*"`** holds when the proxy substituted a credential anywhere in the request, whichever binding's (the operator's, a client's or a constructed one), and never when it substituted none. Only `*` itself: any other value is a binding's name. The operator layer refuses a binding named `*` or the empty name.
+- **`at: <header>`** (owner's decision, 2026-11-12) names where that credential must be. It holds only when the request as forwarded carries exactly one field of that header (any case), and the proxy's substitution wrote that field's whole value: `Bearer <secret>` or `Basic <user:secret>` in `Authorization`, or a named header that was exactly the placeholder. The substitution must be by `injected`'s binding, or any binding when `injected` is absent or `*`. It works with a named binding too: `{injected: svc, at: x-api-key}`.
+
+**What each form guarantees:**
+
+| Matcher | Holds when | Doesn't guarantee |
+|---|---|---|
+| `{injected: "*"}` | some binding's credential was substituted somewhere in the request | anything about the request's other headers: a request with nest's credential in one header (say a client binding at `x-app-key`) and a credential the sandbox planted in `Authorization` passes, and the planted one goes upstream |
+| `{injected: "*", at: authorization}` | the one `Authorization` field the upstream gets was written whole by nest's substitution, whichever binding's | other places a service may also take a credential (a second header, a cookie, the query): name each one the service authenticates by |
+| `{injected: svc, at: <h>}` | as above, by binding `svc` only | as above |
+
+- **Cases it is checked on** (`inject.rs` tests, `tests/guards.rs` through the real proxy on h1 and h2):
+  - a substituted `Authorization` with a second, planted `Authorization` field after it: the substitution replaces every field, so the upstream gets nest's alone;
+  - the planted field first: nothing replaces it, so `at` doesn't hold;
+  - one field naming both (`Bearer <ph>, Bearer planted`), or the placeholder beside other text in a named header (partly substituted): not whole;
+  - h2 sends repeated `authorization` fields, decided as the h1 case.
+
+  A later substitution into a field another binding wrote whole unmakes it.
+- **The guards see what is forwarded.** Hop-by-hop headers, including any the `Connection` header names (so `Connection: authorization` drops `Authorization`), are taken out before injection and the guards decide. Injection still looks for placeholders there, to block or alert on them, but never substitutes into them. A guarded host gets no request trailers, since a trailer (an `Authorization` one, say) would reach it undecided. An h2 upstream would otherwise get them; hyper's h1 client sends none here.
+- **What it's for:** an operator floor in the [base layer](#base-layer), for example `scope: [{path: /**/git-receive-pack}]`, `allow: [{injected: "*", at: authorization}]`: a push passes only when its `Authorization` is nest's credential, never one planted in the sandbox. This replaces the GitHub constructor's `injected: github` exception once apps bind their own tokens. Without `at`, the floor is the weaker first row. The seam is the fixture `egress_policy.injected_any.json`: a base floor with `at`, an operator scope, and a client exception. A vitest asserts the control plane produces it, and `tests/injected_any.rs` evaluates it.
+- **"Came through nest" includes apps' bindings** (owner's decision, 2026-11-12). A client's own binding satisfies an operator's `*`. What `*` guarantees is that the credential came through nest's injection: the operator's own, or a client's on a host the operator granted that client in `inject_hosts`. An operator who wants only their own bindings names each one (`injected: <binding>`, with `at`).
+- **Who writes it:**
+  - The operator, in the base and operator layers, in a scope or an exception.
+  - An API client: `at` anywhere, and `*` in an exception (`allow`) only, where it means any binding, the operator's included. A guard only refuses, and its exceptions apply only within its own scope. So `*` there only narrows when the client's own guard lets a request through; it never exempts a request from another guard (`tests/injected_any.rs`). In a client's scope `*` is refused (400): a control plane rolled back to the previous release sends a client's `*` as `client:*`, which matches nothing, and a scope that matches nothing fails open.
+- **Mixed versions, gated by one fleet hello flag** (`guard_injected_any`, [fleet](../../../../interfaces/control-host/fleet/#messages)), which covers `at` too. Both are new in this release, so no host advertises the flag without knowing both. A nest-proxy of the previous release reads `*` as a binding's name and ignores `at` (an unknown field). So with a named `injected` it compares against the last binding substituted, not the header's writer. With no binding named `*`, `tests/guard_equivalence.rs` shows on generated guards and requests against the previous evaluator:
+  - **fail closed** (refuses at least what this release refuses): `*` in an exception, with or without `at` (the floor's form); `at` with no binding named, in a scope;
+  - **fail open** (can let through what this release refuses): `*` in a scope; `at` with a binding named, in a scope; `at` without `*`, in an exception. Each is shown to occur, and so is a binding named `*` opening even the fail-closed positions.
+
+  So:
+  - **Writes wait for every host:** a guard newly using `*` or `at` is refused (409) while any sandbox host of the cell, any not dead, lacks the flag. This covers the base layer, the operator layer, a client's layer or create, and an attaching agent's spec. A write whose such guards are all already stored goes through. This keeps a floor from silently failing closed, or a scope open, on part of the cell.
+  - **Placement keeps fail-open positions off old hosts:** a sandbox whose guards hold one is placed only on a host with the flag; with none free it waits, unplaced. FleetDO checks its own copy of the base layer as well as the sandbox's policy, which may predate a base-layer write. Fail-closed positions are placed anywhere: on an old host (one launched later, say by a host rollback) the floor only refuses more, so a push needing nest's credential fails there rather than passing without one.
+- **Rollout:** [the rule](../../../../../dev/rollout/2026-11-12-injected-any.md).
 
 ## Repo allowlists
 
@@ -169,7 +206,7 @@ The constructor's guards (`githubGuards`), each with `ignore_case`:
 
 ### Tests
 
-The evaluator with made-up hosts (`guard.rs` unit tests, `tests/guards.rs` through the real proxy: refusals before the upstream, body replay, the injected-credential exception, passthrough and TCP); the constructor from allowlist to rules (`test/repos.test.ts`); the seam: the constructor's output for two repos is the fixture `egress_policy.github.json`, and with a read-only repo `egress_policy.github_read.json`, which a vitest asserts the constructor still produces and `tests/github_rules.rs` evaluates against GitHub's real request shapes; and the e2e harness's `run_repos` (a refused `git push` and receive-pack, an allowed discovery reaching GitHub, the audit record).
+The evaluator with made-up hosts (`guard.rs` unit tests, `tests/guards.rs` through the real proxy: refusals before the upstream, body replay, the injected-credential exceptions, named and `*`, passthrough and TCP); the constructor from allowlist to rules (`test/repos.test.ts`); the seam: the constructor's output for two repos is the fixture `egress_policy.github.json`, and with a read-only repo `egress_policy.github_read.json`, which a vitest asserts the constructor still produces and `tests/github_rules.rs` evaluates against GitHub's real request shapes; and the e2e harness's `run_repos` (a refused `git push` and receive-pack, an allowed discovery reaching GitHub, the audit record).
 
 ## Audit
 

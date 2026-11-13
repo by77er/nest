@@ -5,9 +5,18 @@
 //! literals, `*` and `**`, query and body matchers. Within the guarded bounds the two must agree on
 //! every request, the body pre-pass aside: `needs_body` may now say no where the old one said yes
 //! (a guard none of whose scope can match), never the other way round.
+//!
+//! `injected: "*"` (any substituted binding) and `at` (a header a substitution wrote whole) came later.
+//! The new evaluator decides a guard naming them as the previous one decides that guard with `*`
+//! replaced by the binding the request carries, and each `at` matcher resolved by the headers written
+//! whole: it holds (and is dropped) or it can't (and names no binding). The previous evaluator is also
+//! the previous release's nest-proxy (equal to it within the bounds, above): it reads `*` as a binding's
+//! name and ignores `at`. `an_old_proxy_reads_any_as_a_name_and_ignores_at` shows where that refuses at
+//! least as much (fails closed) and where it can refuse less (fails open): why the control plane gates
+//! both on hosts that know them, and places by position.
 
-use nest_protocol::model::{HostPattern, JsonFieldMatch, QueryMatch, RequestGuard, RequestMatch};
-use nest_proxy::guard;
+use nest_protocol::model::{HostPattern, INJECTED_ANY, JsonFieldMatch, QueryMatch, RequestGuard, RequestMatch};
+use nest_proxy::guard::{self, Whole};
 
 #[allow(dead_code, clippy::all)]
 mod reference {
@@ -324,9 +333,23 @@ fn matcher(r: &mut Rng) -> RequestMatch {
         m.body_json = Some(JsonFieldMatch { pointer: "/op".into(), values: vec!["read".into()] });
     }
     if r.below(5) == 0 {
-        m.injected = Some(["svc", "other"][r.below(2)].into());
+        m.injected = Some(["svc", "other", "*"][r.below(3)].into());
+    }
+    if r.below(6) == 0 {
+        m.at = Some(["authorization", "Authorization", "x-key"][r.below(3)].into());
     }
     m
+}
+
+/// The binding the request had substituted (a binding named `*` among them, which the operator's schema
+/// now refuses but a stored layer may hold), and the headers substitutions wrote whole.
+fn injection(r: &mut Rng) -> (Option<&'static str>, Vec<Whole>) {
+    let injected = [None, Some("svc"), Some("other"), Some("client:svc"), Some("*")][r.below(5)];
+    let Some(b) = injected else { return (None, vec![]) };
+    let whole = (0..r.below(3))
+        .map(|_| Whole { header: ["authorization", "x-key"][r.below(2)].into(), binding: [b, "svc", "other"][r.below(3)].into() })
+        .collect();
+    (injected, whole)
 }
 
 fn guard_(r: &mut Rng, i: usize) -> RequestGuard {
@@ -345,18 +368,23 @@ fn decides_as_the_evaluator_before_it_did() {
     let mut r = Rng(0x9E37_79B9_7F4A_7C15);
     let read = serde_json::json!({"op": "read"});
     let write = serde_json::json!({"op": "write"});
+    let mut at_held = 0;
     for case in 0..40_000 {
         let guards: Vec<RequestGuard> = (0..1 + r.below(3)).map(|i| guard_(&mut r, i)).collect();
         let (p, q) = (path(&mut r), query(&mut r));
         let host = ["h.test", "x.h.test", "other.test"][r.below(3)];
         let method = ["GET", "POST", "PUT", "get"][r.below(4)];
-        let injected = [None, Some("svc"), Some("other")][r.below(3)];
+        let (injected, whole) = injection(&mut r);
         let old = reference::Req { host, method, path: &p, query: q.as_deref(), injected };
-        let new = guard::Req { host, method, path: &p, query: q.as_deref(), injected };
+        let new = guard::Req { host, method, path: &p, query: q.as_deref(), injected, whole: &whole };
         let prep = new.prepare().expect("small requests are within the bounds");
-        let ctx = format!("case {case}: {method} {host}{p}?{q:?} injected {injected:?} guards {guards:#?}");
-        let old_nb = reference::needs_body(&guards, &old);
-        let new_nb = guard::needs_body(&guards, &prep);
+        let ctx = format!("case {case}: {method} {host}{p}?{q:?} injected {injected:?} whole {whole:?} guards {guards:#?}");
+        let resolved = resolve(&guards, injected, &whole);
+        at_held += resolved.iter().flat_map(|g| g.scope.iter().chain(&g.allow)).filter(|m| m.injected.as_deref() == Some(HELD)).count();
+        let resolved: Vec<RequestGuard> = resolved.into_iter().map(unheld).collect();
+        let guards = &guards;
+        let old_nb = reference::needs_body(&resolved, &old);
+        let new_nb = guard::needs_body(guards, &prep);
         assert!(old_nb || !new_nb, "needs_body widened: {ctx}");
         for (ob, nb) in [
             (reference::BodyView::Unread, guard::BodyView::Unread),
@@ -364,17 +392,139 @@ fn decides_as_the_evaluator_before_it_did() {
             (reference::BodyView::Json(&read), guard::BodyView::Json(&read)),
             (reference::BodyView::Json(&write), guard::BodyView::Json(&write)),
         ] {
-            let o = reference::refusing(&guards, &old, &ob).map(|g| g.name.clone());
-            let n = guard::refusing(&guards, &prep, &nb).map(|g| g.name.clone());
+            let o = reference::refusing(&resolved, &old, &ob).map(|g| g.name.clone());
+            let n = guard::refusing(guards, &prep, &nb).map(|g| g.name.clone());
             assert_eq!(o, n, "{ctx}");
         }
         // Where the new pre-pass reads no body, the decision can't depend on it.
         if !new_nb {
             let decisions: Vec<_> = [guard::BodyView::Unread, guard::BodyView::Unknown, guard::BodyView::Json(&read), guard::BodyView::Json(&write)]
                 .iter()
-                .map(|b| guard::refusing(&guards, &prep, b).map(|g| g.name.clone()))
+                .map(|b| guard::refusing(guards, &prep, b).map(|g| g.name.clone()))
                 .collect();
             assert!(decisions.windows(2).all(|w| w[0] == w[1]), "body read skipped but it decides: {ctx}");
         }
     }
+    assert!(at_held > 0, "no `at` matcher ever held");
+}
+
+/// Marks a resolved `at` matcher that holds (before [`unheld`] drops the mark), so the test can count them.
+const HELD: &str = "\0held";
+/// A binding name no request carries.
+const NONE: &str = "\0none";
+
+/// What `*` and `at` mean, in the previous evaluator's terms. `*` without `at`: the binding the request
+/// carries (left as it is with none: the previous evaluator matches no name against a request that
+/// carries none). `at`: whether a header of that name (any case) was written whole by the binding
+/// `injected` names (any, when absent or `*`); if so the matcher holds whatever was substituted (marked
+/// [`HELD`]), and if not it names a binding no request carries.
+fn resolve(guards: &[RequestGuard], injected: Option<&str>, whole: &[Whole]) -> Vec<RequestGuard> {
+    let fix = |m: &RequestMatch| {
+        let mut m = m.clone();
+        if let Some(h) = m.at.take() {
+            let by = |b: &str| m.injected.as_deref().is_none_or(|want| want == INJECTED_ANY || want == b);
+            let holds = whole.iter().any(|w| w.header.eq_ignore_ascii_case(&h) && by(&w.binding));
+            m.injected = Some(if holds { HELD } else { NONE }.into());
+        } else if m.injected.as_deref() == Some(INJECTED_ANY) {
+            m.injected = Some(injected.unwrap_or(INJECTED_ANY).into());
+        }
+        m
+    };
+    guards.iter().map(|g| RequestGuard { scope: g.scope.iter().map(fix).collect(), allow: g.allow.iter().map(fix).collect(), ..g.clone() }).collect()
+}
+
+/// A resolved guard with each held `at` matcher's mark dropped (it then holds whatever was substituted).
+fn unheld(g: RequestGuard) -> RequestGuard {
+    let fix = |mut m: RequestMatch| {
+        if m.injected.as_deref() == Some(HELD) {
+            m.injected = None;
+        }
+        m
+    };
+    RequestGuard { scope: g.scope.into_iter().map(fix).collect(), allow: g.allow.into_iter().map(fix).collect(), ..g }
+}
+
+/// A scope matcher where an old proxy fails closed: `at` with no binding named (it ignores `at` and so
+/// matches more), and no `*` without `at` (it becomes the name `svc`).
+fn scope_closed(m: &RequestMatch) -> RequestMatch {
+    if m.at.is_some() {
+        return RequestMatch { injected: None, ..m.clone() };
+    }
+    RequestMatch { injected: m.injected.as_deref().map(|b| if b == INJECTED_ANY { "svc" } else { b }.to_string()), ..m.clone() }
+}
+
+/// An exception matcher where an old proxy fails closed: `at` only with `*` (its `injected` becomes `*`).
+fn allow_closed(m: &RequestMatch) -> RequestMatch {
+    RequestMatch { injected: if m.at.is_some() { Some(INJECTED_ANY.into()) } else { m.injected.clone() }, ..m.clone() }
+}
+
+fn with(guards: &[RequestGuard], scope: fn(&RequestMatch) -> RequestMatch, allow: fn(&RequestMatch) -> RequestMatch) -> Vec<RequestGuard> {
+    guards.iter().map(|g| RequestGuard { scope: g.scope.iter().map(scope).collect(), allow: g.allow.iter().map(allow).collect(), ..g.clone() }).collect()
+}
+
+/// A previous-release nest-proxy given `injected: "*"` (it reads `*` as a binding's name) and `at` (it
+/// ignores it, so a named `injected` is again compared with the last binding substituted, not the
+/// header's writer). With no binding named `*`, it fails closed (refuses at least what a new one
+/// refuses) for: `*` in an exception, with or without `at`; `at` in a scope with no binding named. It
+/// can fail open (let through what a new one refuses) for: `*` in a scope; `at` with a named binding in
+/// a scope; `at` in an exception without `*`. So the control plane places a sandbox whose guards hold any
+/// of those only on a host that says `guard_injected_any`, and refuses binding names `*`.
+#[test]
+fn an_old_proxy_reads_any_as_a_name_and_ignores_at() {
+    let mut r = Rng(0xD1B5_4A32_D192_ED03);
+    let read = serde_json::json!({"op": "read"});
+    let (mut stricter, mut open_scope_any, mut open_scope_at, mut open_allow_at, mut open_star_binding) = (0, 0, 0, 0, 0);
+    let keep = |m: &RequestMatch| m.clone();
+    let scope_any_only = |m: &RequestMatch| if m.at.is_some() { RequestMatch { injected: None, ..m.clone() } } else { m.clone() };
+    let scope_at_only = |m: &RequestMatch| {
+        if m.at.is_none() && m.injected.as_deref() == Some(INJECTED_ANY) { RequestMatch { injected: Some("svc".into()), ..m.clone() } } else { m.clone() }
+    };
+    for case in 0..40_000 {
+        let generated: Vec<RequestGuard> = (0..1 + r.below(3)).map(|i| guard_(&mut r, i)).collect();
+        let (p, q) = (path(&mut r), query(&mut r));
+        let host = ["h.test", "x.h.test"][r.below(2)];
+        let method = ["GET", "POST", "PUT"][r.below(3)];
+        let (injected, whole) = injection(&mut r);
+        let old = reference::Req { host, method, path: &p, query: q.as_deref(), injected };
+        let prep = guard::Req { host, method, path: &p, query: q.as_deref(), injected, whole: &whole }
+            .prepare()
+            .expect("small requests are within the bounds");
+        for body in [reference::BodyView::Unread, reference::BodyView::Unknown, reference::BodyView::Json(&read)] {
+            let new_body = match body {
+                reference::BodyView::Unread => guard::BodyView::Unread,
+                reference::BodyView::Unknown => guard::BodyView::Unknown,
+                reference::BodyView::Json(v) => guard::BodyView::Json(v),
+            };
+            let decide =
+                |guards: &[RequestGuard]| (reference::refusing(guards, &old, &body).is_some(), guard::refusing(guards, &prep, &new_body).is_some());
+            let opened = |guards: &[RequestGuard]| {
+                let (o, n) = decide(guards);
+                usize::from(!o && n)
+            };
+            // Fail-closed positions only: whatever the new proxy refuses, the old one refuses too, unless a
+            // binding is named `*` (which the operator's schema refuses).
+            let guards = with(&generated, scope_closed, allow_closed);
+            let (o, n) = decide(&guards);
+            if injected == Some(INJECTED_ANY) {
+                open_star_binding += usize::from(!o && n);
+                continue;
+            }
+            assert!(
+                o || !n,
+                "case {case}: an old proxy let through what a new one refuses, in fail-closed positions: {method} {host}{p}?{q:?} injected {injected:?} whole {whole:?} guards {guards:#?}"
+            );
+            stricter += usize::from(o && !n);
+            // Each fail-open position alone lets through some request a new proxy refuses.
+            open_scope_any += opened(&with(&generated, scope_any_only, allow_closed));
+            open_scope_at += opened(&with(&generated, scope_at_only, allow_closed));
+            open_allow_at += opened(&with(&generated, scope_closed, keep));
+        }
+    }
+    // None is vacuous: fail-closed positions let requests through on a new proxy that an old one refuses;
+    // each fail-open position refuses on a new proxy what an old one lets through; and a binding named `*`
+    // opens even the fail-closed positions.
+    assert!(
+        stricter > 0 && open_scope_any > 0 && open_scope_at > 0 && open_allow_at > 0 && open_star_binding > 0,
+        "stricter {stricter}, open: scope * {open_scope_any}, scope at {open_scope_at}, allow at {open_allow_at}, binding named * {open_star_binding}"
+    );
 }

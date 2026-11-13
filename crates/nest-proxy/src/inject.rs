@@ -46,28 +46,60 @@ pub struct Input<'a> {
     pub now_ms: i64,
 }
 
+/// A header the proxy wrote whole by substituting a binding's credential: the request as forwarded
+/// carries exactly one field of it, and that field's whole value is what the substitution produced
+/// (`Bearer <secret>`, `Basic <user:secret>`, or a named header that was exactly the placeholder).
+/// "As forwarded": the shell takes hop-by-hop headers (those `Connection` names among them) out before
+/// injection, so none of these is dropped afterwards, and a guarded host gets no request trailers.
+/// What a guard's `at` asks about (docs/sandbox/networking/egress/policy/#any-injected-credential).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Whole {
+    /// The header's name, lowercase.
+    pub header: String,
+    pub binding: String,
+}
+
 /// Inspect (and, when allowed, rewrite) request headers. The first blocking verdict wins.
 pub fn apply(input: &Input<'_>, headers: &mut HeaderMap, uri: &Uri) -> Verdict {
+    apply_whole(input, headers, &HeaderMap::new(), uri).0
+}
+
+/// [`apply`], and the headers it wrote whole that are still so once every binding is done.
+/// `headers` are the ones forwarded; `dropped` are the request's hop-by-hop ones, already taken out:
+/// a placeholder there is seen (and blocked or alerted on as anywhere else), never substituted.
+pub fn apply_whole(input: &Input<'_>, headers: &mut HeaderMap, dropped: &HeaderMap, uri: &Uri) -> (Verdict, Vec<Whole>) {
     let mut substituted: Option<String> = None;
+    let mut written: Vec<(http::HeaderName, String, HeaderValue)> = Vec::new();
     for b in input.bindings {
-        if b.placeholder.is_empty() || !present(&b.placeholder, headers, uri) {
+        if b.placeholder.is_empty() || !(present(&b.placeholder, headers, uri) || in_headers(&b.placeholder, dropped)) {
             continue;
         }
         if !b.hosts.iter().any(|h| h.matches(input.host)) {
-            return Verdict::WrongHost(b.name.clone());
+            return (Verdict::WrongHost(b.name.clone()), vec![]);
         }
         if !input.tls {
-            return Verdict::Plaintext(b.name.clone());
+            return (Verdict::Plaintext(b.name.clone()), vec![]);
         }
         let secret = input.secrets.get(&b.name).filter(|s| s.expires_ms.is_none_or(|e| input.now_ms < e));
         let Some(secret) = secret.filter(|_| input.live) else {
-            return Verdict::Expired(b.name.clone());
+            return (Verdict::Expired(b.name.clone()), vec![]);
         };
-        if substitute(b, &secret.value, headers) {
+        let mut wrote = Vec::new();
+        if substitute(b, &secret.value, headers, &mut wrote) {
             substituted = Some(b.name.clone());
         }
+        written.extend(wrote.into_iter().map(|(name, value)| (name, b.name.clone(), value)));
     }
-    substituted.map_or(Verdict::Clean, Verdict::Substituted)
+    // Whole only if nothing later changed it: still the one field of its header, with the value written.
+    let whole = written
+        .into_iter()
+        .filter(|(name, _, value)| {
+            let mut all = headers.get_all(name).iter();
+            all.next() == Some(value) && all.next().is_none()
+        })
+        .map(|(name, binding, _)| Whole { header: name.as_str().to_string(), binding })
+        .collect();
+    (substituted.map_or(Verdict::Clean, Verdict::Substituted), whole)
 }
 
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -76,10 +108,12 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 /// Is the placeholder anywhere we can see: any header value (raw or basic-decoded) or the URI?
 fn present(ph: &str, headers: &HeaderMap, uri: &Uri) -> bool {
+    contains(uri.to_string().as_bytes(), ph.as_bytes()) || in_headers(ph, headers)
+}
+
+/// Is the placeholder in any header value (raw, or basic-decoded in a credential header)?
+fn in_headers(ph: &str, headers: &HeaderMap) -> bool {
     let needle = ph.as_bytes();
-    if contains(uri.to_string().as_bytes(), needle) {
-        return true;
-    }
     headers.iter().any(|(name, v)| {
         contains(v.as_bytes(), needle)
             || (name == AUTHORIZATION || name.as_str().eq_ignore_ascii_case("proxy-authorization"))
@@ -96,7 +130,8 @@ fn basic_decode(v: &HeaderValue) -> Option<Vec<u8>> {
     B64.decode(rest.trim()).ok()
 }
 
-fn substitute(b: &InjectionBinding, secret: &str, headers: &mut HeaderMap) -> bool {
+/// Substitute `b`'s secret at its locations; `wrote` gets each header field it wrote whole, with its value.
+fn substitute(b: &InjectionBinding, secret: &str, headers: &mut HeaderMap, wrote: &mut Vec<(http::HeaderName, HeaderValue)>) -> bool {
     let mut done = false;
     for loc in &b.locations {
         match loc {
@@ -107,7 +142,10 @@ fn substitute(b: &InjectionBinding, secret: &str, headers: &mut HeaderMap) -> bo
                     && token.trim() == b.placeholder
                     && let Ok(nv) = HeaderValue::from_str(&format!("{scheme} {secret}"))
                 {
-                    headers.insert(AUTHORIZATION, sensitive(nv));
+                    // `insert` replaces every Authorization field: the request then carries this one only.
+                    let nv = sensitive(nv);
+                    headers.insert(AUTHORIZATION, nv.clone());
+                    wrote.push((AUTHORIZATION, nv));
                     done = true;
                 }
             }
@@ -119,7 +157,9 @@ fn substitute(b: &InjectionBinding, secret: &str, headers: &mut HeaderMap) -> bo
                 {
                     let enc = B64.encode(format!("{user}:{secret}"));
                     if let Ok(nv) = HeaderValue::from_str(&format!("Basic {enc}")) {
-                        headers.insert(AUTHORIZATION, sensitive(nv));
+                        let nv = sensitive(nv);
+                        headers.insert(AUTHORIZATION, nv.clone());
+                        wrote.push((AUTHORIZATION, nv));
                         done = true;
                     }
                 }
@@ -136,6 +176,12 @@ fn substitute(b: &InjectionBinding, secret: &str, headers: &mut HeaderMap) -> bo
                             }
                             _ => v,
                         };
+                        // Whole only when the field is now exactly the secret (it was exactly the
+                        // placeholder): a value with anything beside the placeholder is partly the
+                        // sandbox's. One field of several is dropped when `apply_whole` checks.
+                        if nv.as_bytes() == secret.as_bytes() {
+                            wrote.push((hn.clone(), nv.clone()));
+                        }
                         headers.append(&hn, nv);
                     }
                     done = true;
@@ -234,6 +280,112 @@ mod tests {
         assert_eq!(run("github.com", true, false, &secrets(None), &mut h.clone(), "/"), Verdict::Expired("github".into()));
         assert_eq!(run("github.com", true, true, &HashMap::new(), &mut h.clone(), "/"), Verdict::Expired("github".into()));
         assert_eq!(run("github.com", false, true, &secrets(None), &mut h, "/"), Verdict::Plaintext("github".into()));
+    }
+
+    fn whole(host: &str, h: &mut HeaderMap) -> Vec<Whole> {
+        let b = [binding()];
+        apply_whole(&Input { bindings: &b, secrets: &secrets(None), host, tls: true, live: true, now_ms: 1000 }, h, &HeaderMap::new(), &"/".parse().unwrap()).1
+    }
+
+    fn at(header: &str) -> Vec<Whole> {
+        vec![Whole { header: header.into(), binding: "github".into() }]
+    }
+
+    #[test]
+    fn a_header_is_whole_only_when_the_substitution_wrote_all_of_it() {
+        // Bearer and Basic replace the Authorization header whole.
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
+        assert_eq!(whole("github.com", &mut h), at("authorization"));
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, format!("Basic {}", B64.encode("x-access-token:nest-ph-github-7f3a")).parse().unwrap());
+        assert_eq!(whole("github.com", &mut h), at("authorization"));
+        // A named header that was exactly the placeholder.
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "nest-ph-github-7f3a".parse().unwrap());
+        assert_eq!(whole("github.com", &mut h), at("x-api-key"));
+        // Partly substituted: the rest of the value is the sandbox's.
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "planted nest-ph-github-7f3a".parse().unwrap());
+        assert_eq!(whole("github.com", &mut h), vec![]);
+        assert_eq!(h["x-api-key"], "planted ghs_REAL");
+        // A second field of the header beside the placeholder's: not whole.
+        let mut h = HeaderMap::new();
+        h.append("x-api-key", "nest-ph-github-7f3a".parse().unwrap());
+        h.append("x-api-key", "planted".parse().unwrap());
+        assert_eq!(whole("github.com", &mut h), vec![]);
+        // Only the substituted field is marked never-indexed; the other one is passed on as it was.
+        let fields: Vec<_> = h.get_all("x-api-key").iter().map(|v| (v.to_str().unwrap().to_string(), v.is_sensitive())).collect();
+        assert_eq!(fields, [("ghs_REAL".to_string(), true), ("planted".to_string(), false)]);
+        // The reviewer's probe: the placeholder in another header, a planted Authorization. Substituted,
+        // but Authorization isn't nest's.
+        let mut h = HeaderMap::new();
+        h.insert("x-api-key", "nest-ph-github-7f3a".parse().unwrap());
+        h.insert(AUTHORIZATION, "Bearer planted".parse().unwrap());
+        assert_eq!(whole("github.com", &mut h), at("x-api-key"));
+        assert_eq!(h[AUTHORIZATION], "Bearer planted");
+    }
+
+    #[test]
+    fn repeated_authorization_fields_are_whole_only_when_the_placeholder_comes_first() {
+        // The placeholder's field first: Bearer substitution replaces every field, the planted one dropped.
+        let mut h = HeaderMap::new();
+        h.append(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
+        h.append(AUTHORIZATION, "Bearer planted".parse().unwrap());
+        assert_eq!(whole("github.com", &mut h), at("authorization"));
+        assert_eq!(h.get_all(AUTHORIZATION).iter().collect::<Vec<_>>(), ["Bearer ghs_REAL"]);
+        // The planted field first: nothing replaces it, so Authorization isn't nest's.
+        let mut h = HeaderMap::new();
+        h.append(AUTHORIZATION, "Bearer planted".parse().unwrap());
+        h.append(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
+        assert_eq!(whole("github.com", &mut h), vec![]);
+        // One field naming two credentials (a comma-joined list): no substitution, not whole.
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a, Bearer planted".parse().unwrap());
+        assert_eq!(whole("github.com", &mut h), vec![]);
+    }
+
+    #[test]
+    fn a_later_write_into_a_whole_header_unmakes_it() {
+        // The first binding writes Authorization whole; the second, at a named-header location
+        // `authorization`, then substitutes inside that value (here its placeholder is in the first's
+        // secret): what the request carries is no longer what the first wrote.
+        let first = InjectionBinding { locations: vec![InjectionLocation::AuthorizationBearer], ..binding() };
+        let second = InjectionBinding {
+            name: "other".into(),
+            placeholder: "nest-ph-other".into(),
+            locations: vec![InjectionLocation::Header { name: "authorization".into() }],
+            ..binding()
+        };
+        let sec: HashMap<String, InjectionSecret> = [
+            ("github".to_string(), InjectionSecret { binding: "github".into(), value: "A-nest-ph-other".into(), expires_ms: None }),
+            ("other".to_string(), InjectionSecret { binding: "other".into(), value: "OTHER".into(), expires_ms: None }),
+        ]
+        .into();
+        let run = |b: &[InjectionBinding]| {
+            let mut h = HeaderMap::new();
+            h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
+            let (_, w) =
+                apply_whole(&Input { bindings: b, secrets: &sec, host: "github.com", tls: true, live: true, now_ms: 1000 }, &mut h, &HeaderMap::new(), &"/".parse().unwrap());
+            (w, h[AUTHORIZATION].to_str().unwrap().to_string())
+        };
+        assert_eq!(run(std::slice::from_ref(&first)), (at("authorization"), "Bearer A-nest-ph-other".to_string()));
+        assert_eq!(run(&[first, second]), (vec![], "Bearer A-OTHER".to_string()));
+    }
+
+    #[test]
+    fn a_placeholder_in_a_dropped_header_is_seen_never_substituted() {
+        let b = [binding()];
+        let mut dropped = HeaderMap::new();
+        dropped.insert("proxy-authorization", format!("Basic {}", B64.encode("u:nest-ph-github-7f3a")).parse().unwrap());
+        let run = |host: &str, dropped: &HeaderMap| {
+            let mut h = HeaderMap::new();
+            apply_whole(&Input { bindings: &b, secrets: &secrets(None), host, tls: true, live: true, now_ms: 1000 }, &mut h, dropped, &"/".parse().unwrap())
+        };
+        // Sent to another host: blocked, as anywhere in the request.
+        assert_eq!(run("evil.com", &dropped).0, Verdict::WrongHost("github".into()));
+        // To its own host: nothing forwarded carries it, so nothing is substituted and nothing is whole.
+        assert_eq!(run("github.com", &dropped), (Verdict::Clean, vec![]));
     }
 
     #[test]

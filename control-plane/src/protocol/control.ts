@@ -128,6 +128,8 @@ export const HostHello = z.object({
   brain_epochs: z.boolean().optional(),
   /** This host's nest-proxy bounds guarded requests (absent from a host of the previous release, whose cell refuses client guards). */
   guard_bounds: z.boolean().optional(),
+  /** This host's nest-proxy reads a guard's `injected: "*"` as any binding (absent from a host of the previous release, which reads it as a name). */
+  guard_injected_any: z.boolean().optional(),
   sandboxes: z.array(SandboxReport),
   agents: z.array(AgentReport),
   capacity: Capacity,

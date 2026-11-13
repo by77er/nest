@@ -152,15 +152,19 @@ async fn echo(mut req: hyper::Request<hyper::body::Incoming>) -> Result<hyper::R
         // Hex-encoded too: the proxy masks injected secrets that upstreams echo back, so tests
         // read what the upstream *received* from this field.
         "authorization_hex": req.headers().get("authorization").map(|h| hex(h.as_bytes())),
+        "authorization_fields": req.headers().get_all("authorization").iter().count(),
         "host_headers": req.headers().get_all("host").iter().map(|h| h.to_str().unwrap().to_string()).collect::<Vec<_>>(),
         "te": req.headers().get("te").map(|h| h.to_str().unwrap().to_string()),
         "method": req.method().as_str(),
         "version": format!("{:?}", req.version()),
         "proxy_authorization": req.headers().get("proxy-authorization").is_some(),
     });
-    let body = req.into_body().collect().await.map(|b| b.to_bytes().len()).unwrap_or(0);
+    let collected = req.into_body().collect().await.ok();
+    let trailers: Vec<String> = collected.as_ref().and_then(|c| c.trailers()).map(|t| t.keys().map(|k| k.to_string()).collect()).unwrap_or_default();
+    let body = collected.map(|b| b.to_bytes().len()).unwrap_or(0);
     let mut v = v;
     v["body_len"] = body.into();
+    v["trailers"] = trailers.into();
     Ok(hyper::Response::new(Full::new(Bytes::from(v.to_string()))))
 }
 
@@ -460,6 +464,15 @@ pub async fn http_over_body<S>(io: S, h2: bool, method: &str, host: &str, path: 
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    http_over_trailers(io, h2, method, host, path, headers, body, &[]).await
+}
+
+/// [`http_over_body`] with request trailers after the body.
+#[allow(clippy::too_many_arguments)]
+pub async fn http_over_trailers<S>(io: S, h2: bool, method: &str, host: &str, path: &str, headers: &[(&str, &str)], body: Bytes, trailers: &[(&str, &str)]) -> Resp
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let mut b = hyper::Request::builder().method(method);
     if h2 {
         b = b.uri(format!("https://{host}{path}"));
@@ -469,7 +482,12 @@ where
     for (k, v) in headers {
         b = b.header(*k, *v);
     }
-    let req = b.body(Full::new(body)).unwrap();
+    let mut t = http::HeaderMap::new();
+    for (k, v) in trailers {
+        t.append(http::HeaderName::from_bytes(k.as_bytes()).unwrap(), v.parse().unwrap());
+    }
+    let trailers = (!t.is_empty()).then_some(t);
+    let req = b.body(Full::new(body).with_trailers(Box::pin(async move { trailers.map(Ok::<_, std::convert::Infallible>) }))).unwrap();
     let resp = if h2 {
         let (mut s, conn) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(io)).await.unwrap();
         tokio::spawn(conn);
@@ -521,6 +539,13 @@ pub async fn connect_tunnel(env: &Env, authority: &str) -> (TcpStream, String) {
 }
 
 /// One transparent HTTPS request with any method, path and body.
+/// [`https_req`] with request trailers.
+pub async fn https_req_trailers(env: &Env, host: &str, path: &str, headers: &[(&str, &str)], trailers: &[(&str, &str)], h2: bool) -> Resp {
+    let alpn: &[&[u8]] = if h2 { &[b"h2"] } else { &[b"http/1.1"] };
+    let tls = tls_connect(env.net.https_addr(), host, std::slice::from_ref(&env.pki.proxy_root), alpn).await.expect("tls to proxy");
+    http_over_trailers(tls, h2, "POST", host, path, headers, Bytes::from_static(b"data"), trailers).await
+}
+
 pub async fn https_req(env: &Env, host: &str, method: &str, path: &str, headers: &[(&str, &str)], body: &[u8], h2: bool) -> Resp {
     let alpn: &[&[u8]] = if h2 { &[b"h2"] } else { &[b"http/1.1"] };
     let tls = tls_connect(env.net.https_addr(), host, std::slice::from_ref(&env.pki.proxy_root), alpn).await.expect("tls to proxy");
