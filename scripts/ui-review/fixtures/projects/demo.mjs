@@ -316,7 +316,8 @@ const RICH = [
     untrusted_reviews: variant === "reviews-open" ? "review" : "hold",
     comments_from: variant === "comments-set" ? { id: 5839471, login: "by77er" } : variant === "comments-id-only" ? { id: 5839471, login: null } : null,
     // An organization's repo with no comments user (issues-no-one): no one's issues come into triage.
-    repo_owner: variant === "issues-no-one" ? null : { id: 5839471, login: "by77er" },
+    // The comments-cleared variant: another account owns the repo now (README.md#pr-comments), the default comments user gone.
+    repo_owner: variant === "issues-no-one" ? null : variant === "comments-cleared" ? { id: 2002, login: "gadgets-collective" } : { id: 5839471, login: "by77er" },
     max_routine_runs: 1,
     // Whose issues come into triage (README.md#triage), and (triage-dropped) how many the cap left out.
     issues_from: variant === "issues-anyone" || variant === "triage-dropped" ? "anyone" : "trusted",

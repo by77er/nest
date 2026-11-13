@@ -904,6 +904,8 @@ const app = {
     { name: "reviews-held-many", section: "project", path: "/projects/prj_demo/reviews", fixture: "held-many" },
     { name: "board-held-many", section: "project", path: "/projects/prj_demo/board", fixture: "held-many", after: async (p) => { await p.getByRole("button", { name: /Show all/ }).click(); } },
     { name: "board-comments-cleared", section: "project", path: "/projects/prj_demo/board", fixture: "comments-cleared" },
+    // Leave it unset answered with a 502: focus stays on the button while it's out and after (README.md#pr-comments).
+    { name: "comments-cleared-unset-failed", section: "project", path: "/projects/prj_demo/board", fixture: "comments-cleared", httpErrors: true, after: commentsUnsetFailed, check: async (p) => p.commentsNotes ?? [], checkName: "link-targets" },
     // The gate turned off: the switch off, with what that means.
     { name: "settings-reviews-open", section: "project", path: "/projects/prj_demo/settings", fixture: "reviews-open" },
     { name: "secret-delete", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Delete cloudflare_token" }).click() },
@@ -958,7 +960,9 @@ const app = {
     { name: "settings-issues-no-one", section: "project", path: "/projects/prj_demo/settings", fixture: "issues-no-one" },
     { name: "triage-issues-no-one", section: "project", path: "/projects/prj_demo/triage", fixture: "issues-no-one" },
     // Arriving by its Open Settings: the Triage panel scrolled to just below the phone's top bar, its heading focused.
-    { name: "settings-from-triage-link", section: "project", path: "/projects/prj_demo/settings#triage", fixture: "issues-no-one", full: false },
+    { name: "settings-from-triage-link", section: "project", path: "/projects/prj_demo/settings#triage", fixture: "issues-no-one", full: false, check: linkTargetCheck("triage"), checkName: "link-targets" },
+    // Needs you's Choose someone… (README.md#pr-comments): the PR comments panel in view, its heading focused with the theme's ring.
+    { name: "settings-pr-comments-link", section: "project", path: "/projects/prj_demo/settings#pr-comments", fixture: "comments-cleared", full: false, check: linkTargetCheck("pr-comments"), checkName: "link-targets" },
     // The models (README.md#models): a custom id shown with its field; the list open.
     { name: "settings-models-custom", section: "project", path: "/projects/prj_demo/settings", fixture: "models-custom" },
     // A manager model switch waiting for the manager's turn to end, and its chat line once done (README.md#models).
@@ -986,6 +990,60 @@ const isLocal = (u) => u.searchParams.get("local") === "1";
 const panelOf = (p) => p.locator('section[aria-label="Needs you"]');
 /** The sidebar's own Board-row badges (not the switcher's list), by marker. */
 const sidebarBadges = (p, marker) => p.locator(`nav[aria-label="Main"] [data-marker=${marker}]`).filter({ hasNot: p.locator(".mantine-Combobox-dropdown") });
+/**
+ * A Settings Panel arrived at by its `#id`: in the viewport (its top within it), and focus on its own heading
+ * with the theme's ring (2 px solid), never the browser's default outline.
+ */
+function linkTargetCheck(id) {
+  return async (p) => {
+  await p.waitForTimeout(300);
+  const r = await p.evaluate((id) => {
+    const panel = document.getElementById(id);
+    const a = document.activeElement;
+    const box = panel?.getBoundingClientRect();
+    const cs = a ? getComputedStyle(a) : null;
+    return {
+      top: box ? Math.round(box.top) : null, height: window.innerHeight,
+      onHeading: !!panel && !!a && panel.contains(a) && /^H[1-6]$/.test(a.tagName),
+      focused: a ? `${a.tagName.toLowerCase()} "${(a.textContent ?? "").trim().slice(0, 30)}"` : "none",
+      ring: cs ? `${cs.outlineStyle} ${cs.outlineWidth}` : "none",
+    };
+  }, id);
+  const notes = [];
+  if (r.top === null) notes.push(`#${id}: no such panel`);
+  else if (r.top < -1 || r.top >= r.height) notes.push(`#${id}: the panel is out of view (its top at ${r.top} px, the viewport ${r.height} px)`);
+  if (!r.onHeading) notes.push(`#${id}: focus isn't on the panel's heading (it's on ${r.focused})`);
+  else if (r.ring !== "solid 2px") notes.push(`#${id}: the focused heading's outline is "${r.ring}", not the theme's ring (solid 2px)`);
+  return notes;
+  };
+}
+
+/** Needs you's Leave it unset, answered with a 502 after 600 ms: focus never leaves the button, which is never natively disabled, and the item stays. */
+async function commentsUnsetFailed(p) {
+  await p.route((u) => u.pathname === "/api/projects/prj_demo/comments-cleared/dismiss", async (r) => {
+    await new Promise((res) => setTimeout(res, 600));
+    return r.fulfill({ status: 502, contentType: "application/json", body: JSON.stringify({ error: "nest projects is unavailable (fixture)" }) });
+  });
+  const item = panelOf(p).locator("[data-comments-cleared]");
+  await item.scrollIntoViewIfNeeded();
+  const button = item.getByRole("button", { name: "Leave it unset" });
+  await button.focus();
+  await p.keyboard.press("Enter");
+  await p.waitForTimeout(250);
+  const during = await focusOf(p);
+  const busy = await button.getAttribute("aria-busy");
+  const disabled = await button.evaluate((b) => b.disabled);
+  await p.waitForTimeout(1200);
+  const after = await focusOf(p);
+  const onButton = await button.evaluate((b) => document.activeElement === b);
+  const notes = [];
+  if (during === "body" || disabled) notes.push(`Leave it unset: focus dropped to the page while sending (disabled: ${disabled})`);
+  if (busy !== "true") notes.push("Leave it unset: not marked busy (aria-busy) while sending");
+  if (!onButton) notes.push(`Leave it unset 502: focus isn't on the button after the failure (it's on ${after})`);
+  if (!(await item.count())) notes.push("Leave it unset 502: the item went, though nothing was saved");
+  p.commentsNotes = notes;
+}
+
 const focusOf = (p) => p.evaluate(() => {
   const a = document.activeElement;
   if (!a || a === document.body) return "body";

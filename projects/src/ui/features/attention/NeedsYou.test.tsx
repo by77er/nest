@@ -462,8 +462,8 @@ describe("the default PR comments user cleared by a transfer (README.md#pr-comme
     api.commentsCleared = { kind: "comments_cleared", was: { id: 1001, login: "owner" }, owner: { id: 2002, login: "new-owner" }, at_ms: Date.now() - 60_000 };
     const { user } = renderApp("/projects/prj_one/board", api);
     const p = await panel();
-    await waitFor(() => expect(p).toHaveTextContent("The repo's owner is new-owner now, so owner is no longer the PR comments user"));
-    expect(within(p).getByRole("link", { name: "Open Settings" }).getAttribute("href")).toBe("/projects/prj_one/settings#pr-comments");
+    await waitFor(() => expect(p).toHaveTextContent("new-owner owns the repo now, so owner is no longer the PR comments user."));
+    expect(within(p).getByRole("link", { name: "Choose someone…" }).getAttribute("href")).toBe("/projects/prj_one/settings#pr-comments");
     // Counted with the rest; the last item left here: focus goes on to the board's heading, and that's said.
     await waitFor(() => expect(p.querySelector("[data-slot=count]")).toHaveTextContent("1"));
     await user.click(within(p).getByRole("button", { name: "Leave it unset" }));

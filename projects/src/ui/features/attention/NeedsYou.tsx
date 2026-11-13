@@ -11,7 +11,7 @@ import { useAnswerBlocked, useAttention, useDismissCommentsCleared, useNeedsYouL
 import type { Waiting } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { ago, clock, exact } from "../../common/time";
-import { MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
+import { ButtonBusy, MetaItem, MetaRow, Panel, Prose, Row, Section, Stack, weight } from "../../layout";
 import { motion } from "../../theme";
 import { HeldReviewItem } from "../reviews/HeldReview";
 import { RichMessage } from "../rich/RichMessage";
@@ -99,20 +99,26 @@ type CommentsCleared = Extract<Waiting, { kind: "comments_cleared" }>;
  */
 function CommentsClearedItem({ projectId, item, onDone }: { projectId: string; item: CommentsCleared; onDone: () => void }) {
   const dismiss = useDismissCommentsCleared(projectId, onDone);
+  const pending = dismiss.isPending;
+  // While it's out, the button stays focusable (`aria-disabled`, not `disabled`), so focus isn't lost; a press does nothing.
+  const leave = () => {
+    if (!pending) dismiss.mutate();
+  };
   return (
     <Stack gap="sm" data-comments-cleared>
       <MetaRow>
         <MetaItem>PR comments</MetaItem>
         <MetaItem title={exact(item.at_ms)}>{ago(item.at_ms)}</MetaItem>
       </MetaRow>
-      <Text fz="md">
-        {commentsCleared(item)}: it was only the default from when the repo was attached. Nobody's comments reach workers, and nobody is trusted as the comments user for reviews and triage, until you choose someone.
+      <Text fz="md">{commentsCleared(item)}.</Text>
+      <Text fz="sm" c="dimmed">
+        It was only the default from when the repo was attached. Until you choose someone, nobody's PR comments reach workers, and nobody is trusted as the comments user for reviews and triage.
       </Text>
       <Row>
         <Button variant="default" renderRoot={(props) => <AnchorLink {...props} to="/projects/$projectId/settings" params={{ projectId }} hash="pr-comments" />}>
-          Open Settings
+          Choose someone…
         </Button>
-        <Button variant="subtle" color="gray" onClick={() => dismiss.mutate()} loading={dismiss.isPending}>
+        <Button variant="subtle" color="gray" leftSection={pending ? <ButtonBusy /> : undefined} aria-disabled={pending || undefined} aria-busy={pending || undefined} data-pending={pending || undefined} onClick={leave}>
           Leave it unset
         </Button>
       </Row>

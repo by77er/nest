@@ -19,7 +19,7 @@ import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, 
 import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
 import { MODELS, modelLabel, modelProblem } from "../../../models";
 import { useLocation, useNavigate } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { type RefObject, useEffect, useRef, useState } from "react";
 
 const CUSTOM = "custom";
 
@@ -81,26 +81,33 @@ const values = (s: Settings) => ({
 
 /** The editable settings as Panels in a row, saved together by the one Save right under them. */
 /**
- * Arriving at a Panel by its `#id` (the Triage page's Open Settings): focus moves to its heading, so
- * keyboard and screen-reader users land there too, not only the scroll.
+ * Arriving at a Panel by its `#id` (the Triage page's Open Settings, Needs you's Choose someone…): focus moves
+ * to its heading (`targets`, given to its Section as `headingRef`, so it takes the theme's ring), so keyboard
+ * and screen-reader users land there too; and the Panel is scrolled to the top of the view once the router's
+ * own scroll restoration is done (two frames on), since focusing alone leaves a page opened at its top.
  */
-function useFocusLinkTarget() {
+function useFocusLinkTarget(targets: Record<string, RefObject<HTMLHeadingElement | null>>) {
   const hash = useLocation({ select: (l) => l.hash });
   const navigate = useNavigate();
   useEffect(() => {
     if (!hash) return;
-    const heading = document.getElementById(hash)?.querySelector<HTMLElement>("h1, h2, h3, h4, h5, h6");
-    if (!heading) return;
-    heading.tabIndex = -1;
-    heading.focus();
+    const heading = targets[hash]?.current;
+    const panel = document.getElementById(hash);
+    if (!heading || !panel) return;
+    heading.focus({ preventScroll: true });
+    // Not cancelled when the hash leaves the URL (below), which re-runs this effect; the Panel looked up again then.
+    requestAnimationFrame(() => requestAnimationFrame(() => document.getElementById(hash)?.scrollIntoView?.({ block: "start" })));
     // Once per arrival: the hash leaves the URL, so a remount of the form (a Save of some settings) doesn't
     // move focus there again.
     void navigate({ to: ".", hash: "", replace: true });
+    // `targets` holds refs: stable.
   }, [hash, navigate]);
 }
 
 export function SettingsForm({ projectId, settings, onDone }: { projectId: string; settings: Settings; onDone?: () => void }) {
-  useFocusLinkTarget();
+  const prCommentsHeading = useRef<HTMLHeadingElement>(null);
+  const triageHeading = useRef<HTMLHeadingElement>(null);
+  useFocusLinkTarget({ "pr-comments": prCommentsHeading, triage: triageHeading });
   const update = useUpdateSettings(projectId);
   const form = useForm({
     initialValues: values(settings),
@@ -221,7 +228,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
             </Section>
           </Panel>
           <Panel id="pr-comments">
-            <Section title="PR comments" order={4} region={false}>
+            <Section title="PR comments" order={4} region={false} headingRef={prCommentsHeading}>
               <CommentsFrom
                 settings={settings}
                 draft={form.getValues().comments_from_login}
@@ -250,7 +257,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
           </Panel>
           {/* The Triage page's "No one's issues come in yet" links here. */}
           <Panel id="triage">
-            <Section title="Triage" order={4} region={false}>
+            <Section title="Triage" order={4} region={false} headingRef={triageHeading}>
               <FieldGroup>
                 <Select
                   label="Issues from"
