@@ -387,6 +387,18 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, req: Req
         return deny_response(StatusCode::FORBIDDEN, "host_mismatch", &target.host, target.port, "the request target and Host header must name the host this connection is for, exactly once");
     }
 
+    // Hop-by-hop headers (RFC 9110 §7.6.1, those the Connection header names among them) never go
+    // upstream: taken out before injection and the request guards decide anything, so both see the
+    // headers that are forwarded. Injection still looks for placeholders in what was taken out.
+    let upgrading = !up.h2 && req.headers().contains_key(UPGRADE);
+    // gRPC over h2 requires `te: trailers` (the only TE value h2 permits); keep exactly that.
+    let te_trailers = up.h2
+        && req.headers().get_all(TE).iter().any(|v| v.to_str().is_ok_and(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case("trailers"))));
+    let dropped = strip_hop_by_hop(req.headers_mut(), upgrading);
+    if te_trailers {
+        req.headers_mut().insert(TE, http::HeaderValue::from_static("trailers"));
+    }
+
     // Credential injection (or blocking).
     let view = ctx.view();
     let Some(policy) = view.policy.clone() else {
@@ -403,6 +415,7 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, req: Req
             now_ms: now_ms(),
         },
         req.headers_mut(),
+        &dropped,
         &uri,
     );
     match &verdict {
@@ -426,7 +439,8 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, req: Req
     // injection (a guard can ask whether a binding was substituted) and before anything goes upstream.
     // Only a host some guard names is decided, within bounds: its target is decoded once, and one past
     // them is refused rather than decided (deciding costs time in its length per matcher).
-    if policy.guards.iter().any(|g| guard::covers(g, &target.host)) {
+    let guarded = policy.guards.iter().any(|g| guard::covers(g, &target.host));
+    if guarded {
         let (method, path, query) = (req.method().as_str().to_owned(), uri.path().to_owned(), uri.query().map(str::to_owned));
         let greq = guard::Req {
             host: &target.host,
@@ -486,17 +500,9 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, req: Req
     audit.binding = verdict.binding().map(str::to_string);
 
     // Upgrades (WebSocket etc., HTTP/1.1 only).
-    let upgrading = !up.h2 && req.headers().contains_key(UPGRADE);
     let client_upgrade = upgrading.then(|| hyper::upgrade::on(&mut req));
 
     let (mut parts, body) = req.into_parts();
-    // gRPC over h2 requires `te: trailers` (the only TE value h2 permits); keep exactly that.
-    let te_trailers = up.h2
-        && parts.headers.get_all(TE).iter().any(|v| v.to_str().is_ok_and(|s| s.split(',').any(|t| t.trim().eq_ignore_ascii_case("trailers"))));
-    strip_hop_by_hop(&mut parts.headers, upgrading);
-    if te_trailers {
-        parts.headers.insert(TE, http::HeaderValue::from_static("trailers"));
-    }
     parts.uri = upstream_uri(&parts.uri, target, up.h2);
     if !up.h2 {
         // Always our own Host (replacing whatever the client sent) for h1 upstreams.
@@ -516,6 +522,10 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, req: Req
     }
     let up_bytes = Arc::new(AtomicU64::new(0));
     let limit = policy.limits.max_inspected_body_bytes.min(usize::MAX as u64) as usize;
+    // A guarded host gets no request trailers: guards decide on the headers, and a trailer (an
+    // `Authorization` one, say) would reach the upstream undecided. hyper's h1 client sends none here
+    // (`te` and `trailer` are hop-by-hop); an h2 upstream would get them.
+    let body: Body = if guarded { body.map_frame(|f| if f.is_trailers() { Frame::data(Bytes::new()) } else { f }).boxed() } else { body };
     let body: Body = Counted { inner: Limited::new(body, limit), n: up_bytes.clone() }.boxed();
     let out = Request::from_parts(parts, body);
 
@@ -711,7 +721,16 @@ fn upstream_uri(uri: &Uri, target: &Target, h2: bool) -> Uri {
     }
 }
 
-fn strip_hop_by_hop(h: &mut HeaderMap, keep_upgrade: bool) {
+/// Remove the hop-by-hop headers (and those Connection names), answering what was removed.
+fn strip_hop_by_hop(h: &mut HeaderMap, keep_upgrade: bool) -> HeaderMap {
+    let mut removed = HeaderMap::new();
+    let mut take = |h: &mut HeaderMap, n: &str| {
+        let Ok(name) = http::HeaderName::from_bytes(n.as_bytes()) else { return };
+        for v in h.get_all(&name).iter() {
+            removed.append(name.clone(), v.clone());
+        }
+        h.remove(&name);
+    };
     // Also drop headers named in Connection.
     let named: Vec<String> = h
         .get_all(CONNECTION)
@@ -721,17 +740,18 @@ fn strip_hop_by_hop(h: &mut HeaderMap, keep_upgrade: bool) {
         .filter(|n| !(keep_upgrade && n == "upgrade"))
         .collect();
     for n in named {
-        h.remove(n.as_str());
+        take(h, &n);
     }
     for n in HOP_BY_HOP {
         if keep_upgrade && (*n == "upgrade" || *n == "connection") {
             continue;
         }
-        h.remove(*n);
+        take(h, n);
     }
     if keep_upgrade {
         h.insert(CONNECTION, http::HeaderValue::from_static("upgrade"));
     }
+    removed
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1173,14 +1193,23 @@ mod tests {
         h.insert("proxy-authorization", "Basic abc".parse().unwrap());
         h.insert("keep-alive", "timeout=5".parse().unwrap());
         h.insert("accept", "*/*".parse().unwrap());
-        strip_hop_by_hop(&mut h, false);
+        let removed = strip_hop_by_hop(&mut h, false);
         assert_eq!(h.len(), 1);
+        // What was taken out is answered, every field of it (injection still looks there for placeholders).
+        let mut names: Vec<&str> = removed.keys().map(|k| k.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["connection", "keep-alive", "proxy-authorization", "x-secret-hop"]);
         let mut h = HeaderMap::new();
-        h.insert(CONNECTION, "Upgrade".parse().unwrap());
+        h.insert(CONNECTION, "Upgrade, x-hop".parse().unwrap());
         h.insert(UPGRADE, "websocket".parse().unwrap());
+        h.insert("x-hop", "1".parse().unwrap());
+        h.insert("proxy-authorization", "Basic abc".parse().unwrap());
+        h.insert("te", "trailers".parse().unwrap());
         strip_hop_by_hop(&mut h, true);
         assert_eq!(h[UPGRADE], "websocket");
         assert_eq!(h[CONNECTION], "upgrade");
+        // An upgrade keeps Upgrade and Connection only: the rest of the hop-by-hop headers still go.
+        assert_eq!(h.len(), 2, "{h:?}");
     }
 
     #[test]

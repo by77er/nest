@@ -192,6 +192,44 @@ async fn a_floor_at_authorization_needs_that_header_to_be_nests() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_header_connection_names_is_gone_before_injection_and_guards_decide() {
+    // Connection names Authorization, so it is hop-by-hop: never forwarded. The guards decide on what is
+    // forwarded, so `at: authorization` doesn't hold (the reviewer's probe: before, it held and the
+    // upstream got no Authorization at all).
+    let mut env = env().await;
+    let p = floor_policy(&env, RequestMatch { injected: Some(INJECTED_ANY.into()), at: Some("authorization".into()), ..Default::default() });
+    push(&mut env, p).await;
+    let ours = format!("Bearer {PLACEHOLDER}");
+    for connection in ["authorization", "close, authorization", "Authorization"] {
+        let r = https_req(&env, HOST, "POST", "/anything", &[("authorization", &ours), ("connection", connection)], b"{}", false).await;
+        assert_eq!((r.status, r.body["guard"].as_str()), (403, Some("floor")), "connection: {connection}: {:?}", r.body);
+    }
+    // Naming another header leaves Authorization nest's: through, with it.
+    let r = https_req(&env, HOST, "POST", "/anything", &[("authorization", &ours), ("connection", "x-other"), ("x-other", "1")], b"{}", false).await;
+    assert_eq!(r.status, 200, "{:?}", r.body);
+    assert_eq!(received_auth(&r.body), format!("Bearer {SECRET}"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guarded_host_gets_no_request_trailers() {
+    // Guards decide on the request's headers; a trailer (an Authorization one, say) would reach the
+    // upstream undecided, so a guarded host gets none. An unguarded host gets them as sent.
+    let mut env = env().await;
+    let p = floor_policy(&env, RequestMatch { injected: Some(INJECTED_ANY.into()), at: Some("authorization".into()), ..Default::default() });
+    push(&mut env, p).await;
+    let ours = format!("Bearer {PLACEHOLDER}");
+    for h2 in [false, true] {
+        let r = https_req_trailers(&env, HOST, "/anything", &[("authorization", &ours), ("te", "trailers")], &[("authorization", "Bearer planted")], h2).await;
+        assert_eq!(r.status, 200, "h2 {h2}: {:?}", r.body);
+        assert_eq!(r.body["trailers"], serde_json::json!([]), "h2 {h2}: {:?}", r.body);
+        // Unguarded: an h2 upstream gets them (so the check above isn't vacuous); hyper's h1 client sends none.
+        let r = https_req_trailers(&env, "api.stripe.test", "/anything", &[("te", "trailers")], &[("x-checksum", "1")], h2).await;
+        assert_eq!(r.status, 200, "h2 {h2}: {:?}", r.body);
+        assert_eq!(r.body["trailers"], if h2 { serde_json::json!(["x-checksum"]) } else { serde_json::json!([]) }, "h2 {h2}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_floor_without_at_needs_only_some_substitution_anywhere() {
     // `injected: "*"` alone is the weaker form: some credential nest injected, anywhere in the request.
     // It refuses a request carrying none, and lets the reviewer's probe through (documented).

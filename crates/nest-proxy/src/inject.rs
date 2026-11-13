@@ -49,6 +49,8 @@ pub struct Input<'a> {
 /// A header the proxy wrote whole by substituting a binding's credential: the request as forwarded
 /// carries exactly one field of it, and that field's whole value is what the substitution produced
 /// (`Bearer <secret>`, `Basic <user:secret>`, or a named header that was exactly the placeholder).
+/// "As forwarded": the shell takes hop-by-hop headers (those `Connection` names among them) out before
+/// injection, so none of these is dropped afterwards, and a guarded host gets no request trailers.
 /// What a guard's `at` asks about (docs/sandbox/networking/egress/policy/#any-injected-credential).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Whole {
@@ -59,15 +61,17 @@ pub struct Whole {
 
 /// Inspect (and, when allowed, rewrite) request headers. The first blocking verdict wins.
 pub fn apply(input: &Input<'_>, headers: &mut HeaderMap, uri: &Uri) -> Verdict {
-    apply_whole(input, headers, uri).0
+    apply_whole(input, headers, &HeaderMap::new(), uri).0
 }
 
 /// [`apply`], and the headers it wrote whole that are still so once every binding is done.
-pub fn apply_whole(input: &Input<'_>, headers: &mut HeaderMap, uri: &Uri) -> (Verdict, Vec<Whole>) {
+/// `headers` are the ones forwarded; `dropped` are the request's hop-by-hop ones, already taken out:
+/// a placeholder there is seen (and blocked or alerted on as anywhere else), never substituted.
+pub fn apply_whole(input: &Input<'_>, headers: &mut HeaderMap, dropped: &HeaderMap, uri: &Uri) -> (Verdict, Vec<Whole>) {
     let mut substituted: Option<String> = None;
     let mut written: Vec<(http::HeaderName, String, HeaderValue)> = Vec::new();
     for b in input.bindings {
-        if b.placeholder.is_empty() || !present(&b.placeholder, headers, uri) {
+        if b.placeholder.is_empty() || !(present(&b.placeholder, headers, uri) || in_headers(&b.placeholder, dropped)) {
             continue;
         }
         if !b.hosts.iter().any(|h| h.matches(input.host)) {
@@ -104,10 +108,12 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
 
 /// Is the placeholder anywhere we can see: any header value (raw or basic-decoded) or the URI?
 fn present(ph: &str, headers: &HeaderMap, uri: &Uri) -> bool {
+    contains(uri.to_string().as_bytes(), ph.as_bytes()) || in_headers(ph, headers)
+}
+
+/// Is the placeholder in any header value (raw, or basic-decoded in a credential header)?
+fn in_headers(ph: &str, headers: &HeaderMap) -> bool {
     let needle = ph.as_bytes();
-    if contains(uri.to_string().as_bytes(), needle) {
-        return true;
-    }
     headers.iter().any(|(name, v)| {
         contains(v.as_bytes(), needle)
             || (name == AUTHORIZATION || name.as_str().eq_ignore_ascii_case("proxy-authorization"))
@@ -278,7 +284,7 @@ mod tests {
 
     fn whole(host: &str, h: &mut HeaderMap) -> Vec<Whole> {
         let b = [binding()];
-        apply_whole(&Input { bindings: &b, secrets: &secrets(None), host, tls: true, live: true, now_ms: 1000 }, h, &"/".parse().unwrap()).1
+        apply_whole(&Input { bindings: &b, secrets: &secrets(None), host, tls: true, live: true, now_ms: 1000 }, h, &HeaderMap::new(), &"/".parse().unwrap()).1
     }
 
     fn at(header: &str) -> Vec<Whole> {
@@ -359,11 +365,27 @@ mod tests {
         let run = |b: &[InjectionBinding]| {
             let mut h = HeaderMap::new();
             h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
-            let (_, w) = apply_whole(&Input { bindings: b, secrets: &sec, host: "github.com", tls: true, live: true, now_ms: 1000 }, &mut h, &"/".parse().unwrap());
+            let (_, w) =
+                apply_whole(&Input { bindings: b, secrets: &sec, host: "github.com", tls: true, live: true, now_ms: 1000 }, &mut h, &HeaderMap::new(), &"/".parse().unwrap());
             (w, h[AUTHORIZATION].to_str().unwrap().to_string())
         };
         assert_eq!(run(std::slice::from_ref(&first)), (at("authorization"), "Bearer A-nest-ph-other".to_string()));
         assert_eq!(run(&[first, second]), (vec![], "Bearer A-OTHER".to_string()));
+    }
+
+    #[test]
+    fn a_placeholder_in_a_dropped_header_is_seen_never_substituted() {
+        let b = [binding()];
+        let mut dropped = HeaderMap::new();
+        dropped.insert("proxy-authorization", format!("Basic {}", B64.encode("u:nest-ph-github-7f3a")).parse().unwrap());
+        let run = |host: &str, dropped: &HeaderMap| {
+            let mut h = HeaderMap::new();
+            apply_whole(&Input { bindings: &b, secrets: &secrets(None), host, tls: true, live: true, now_ms: 1000 }, &mut h, dropped, &"/".parse().unwrap())
+        };
+        // Sent to another host: blocked, as anywhere in the request.
+        assert_eq!(run("evil.com", &dropped).0, Verdict::WrongHost("github".into()));
+        // To its own host: nothing forwarded carries it, so nothing is substituted and nothing is whole.
+        assert_eq!(run("github.com", &dropped), (Verdict::Clean, vec![]));
     }
 
     #[test]
