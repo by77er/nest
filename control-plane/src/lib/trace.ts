@@ -3,6 +3,7 @@
 // and kept in a bounded ring so a client can resume. Nothing here knows any one client, and nothing
 // here sends: AgentDO writes a row in the step of the change and hands the row to its trace sockets.
 import type { AgentEvent, AgentState, TurnInputKind } from "../protocol/model";
+import type { OutboundRecord } from "./outbound";
 import { clip } from "./util";
 
 /** Each string field (a tool's input, a result's summary, a question, a message) is cut to this many UTF-8 bytes. */
@@ -36,7 +37,9 @@ export type TraceBody =
   | { type: "ended"; reason: string }
   | { type: "timer_set"; name: string; at_ms: number; note: string }
   | { type: "timer_fired"; name: string; note: string }
-  | { type: "timer_cancelled"; name: string; by: string };
+  | { type: "timer_cancelled"; name: string; by: string }
+  /** A request AgentDO sent for one of the agent's tools (lib/outbound.ts). */
+  | OutboundRecord;
 export type TraceUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number };
 export type TraceEvent = { seq: number; ts_ms: number; turn?: string } & TraceBody;
 /**

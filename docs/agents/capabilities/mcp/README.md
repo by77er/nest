@@ -69,6 +69,7 @@ A server's changed list reaches a live brain without a restart:
   - A lost answer (timeout, network, HTTP 5xx, an unparseable body) is `outcome_unknown`, retried once only when the tool is idempotent. At most two forwards per call in all.
 - **Errors:** a tool's `isError: true` is a tool error to the model with its text (code `tool_error`). Everything else is a platform error from the existing table: a JSON-RPC error `invalid_message`, HTTP 401 `unauthorized`, 403 `forbidden`, 429 `rate_limited` (retryable), other 4xx and a too-large answer `invalid_message`, no credential stored `forbidden`, a failed `initialize` `internal` (retryable: nothing was sent) or `unsupported_version`.
 - **`_meta`** on every `tools/call`: `nest/agent`, `nest/epoch`, `nest/call` (the call key `<agent>/<epoch>/<call>`, the same on a retry) and `nest/taint` (the session's taint as the request leaves).
+- **Traced:** each `tools/call` request that leaves is an `outbound` event on the agent's live trace (`<capability>.<tool>`, the server's host but not its path, which may hold a key, the status or `aborted`/`network`, sizes, duration), never the bearer or the arguments ([the live trace](../../../control-plane/api/#live-trace), 2026-11-12).
 
 ## Sinks
 
