@@ -741,7 +741,7 @@ describe("the accounts the app acts for (the App's owner, and GITHUB_ACCOUNTS)",
     gh.repo(theirs);
     gh.installations = [
       { id: 8_001, account: GH_APP_OWNER, repos: "all", permissions: all },
-      { id: 8_002, account: stranger, repos: "all", permissions: all },
+      { id: 8_002, account: stranger, accountId: ownerIdOf(stranger), repos: "all", permissions: all },
     ];
     const listed = (await api(token, "GET", "/api/repos")).body.repos.map((x: { repo: string }) => x.repo);
     expect(listed).toContain(mine);
@@ -751,6 +751,10 @@ describe("the accounts the app acts for (the App's owner, and GITHUB_ACCOUNTS)",
     expect(refused.body.error).toContain(theirs);
     expect((await create(mine)).status).toBe(201);
     expect(gh.mints().filter((m) => m.installation === 8_002)).toEqual([]);
+    // There's no wildcard: `*` names no account.
+    await withEnv("GITHUB_ACCOUNTS", "*", async () => {
+      expect((await create(theirs)).status).toBe(403);
+    });
     // The operator adds the account: listed and attachable.
     await withEnv("GITHUB_ACCOUNTS", String(ownerIdOf(stranger)), async () => {
       expect((await api(token, "GET", "/api/repos")).body.repos.map((x: { repo: string }) => x.repo)).toContain(theirs);
@@ -763,7 +767,7 @@ describe("the accounts the app acts for (the App's owner, and GITHUB_ACCOUNTS)",
     expect((await binding(p)).installation_id).toBe(GH_INSTALLATION_ID);
     const stranger = `stranger-${rand()}`;
     const to = `${stranger}/moved`;
-    gh.install({ id: 8_102, account: stranger });
+    gh.install({ id: 8_102, account: stranger, accountId: ownerIdOf(stranger) });
     gh.rename(p.repo, to);
     const r = await deliverGithub("issues", { ...issue(1, { id: repoIdOf(p.repo), full_name: to }), installation: { id: 8_102 } });
     expect(((await r.json()) as { ignored: string }).ignored).toContain("isn't the project's");

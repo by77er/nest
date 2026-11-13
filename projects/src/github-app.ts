@@ -210,12 +210,12 @@ export class AppTokens implements TokenSource {
 
   /**
    * Whether the app may act on an installation on account `id` (README.md#repo-authority): the account owning the
-   * App, and the ids `GITHUB_ACCOUNTS` adds (`*`: any account). An installation naming no account is never one.
+   * App, and the ids `GITHUB_ACCOUNTS` adds. An installation naming no account is never one; nothing turns the
+   * check off.
    */
   private async accountAllowed(app: AppCache, id: number | null): Promise<boolean> {
-    const extra = (this.env.GITHUB_ACCOUNTS ?? "").split(/[\s,]+/).filter(Boolean);
-    if (extra.includes("*")) return true;
     if (id === null) return false;
+    const extra = (this.env.GITHUB_ACCOUNTS ?? "").split(/[\s,]+/).filter(Boolean);
     if (extra.some((x) => positiveId(Number(x)) === id)) return true;
     return (await this.identity(app)).owner === id;
   }

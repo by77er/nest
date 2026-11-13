@@ -761,11 +761,14 @@ export const repoIdOf = (name: string) => 500_000_000 + [...name.toLowerCase()].
 /**
  * One installation of the App: on one account (`account`), or, the fake's shorthand, on every account that
  * has none of its own (`account: null`); on all its repos or a selection; with the permissions the owner
- * granted the App.
+ * granted the App. The account's id, as GitHub answers it (`account.id`), is the App owner's unless a test gives
+ * another (`accountId`): the tests' repos are under many made-up logins, and the app acts only for the App
+ * owner's account (README.md#repo-authority), so a stranger's installation is one a test names as such.
  */
 export interface FakeInstallation {
   id: number;
   account: string | null;
+  accountId?: number;
   repos: "all" | Set<string>;
   permissions: Record<string, string>;
 }
@@ -836,8 +839,11 @@ export class FakeGitHub {
   }
 
   /** Install the App on an account (replacing one with the same id): that account's repos go to it, not the default one. */
-  install(i: { id: number; account: string; repos?: string[]; permissions?: Record<string, string> }): FakeInstallation {
-    const full: FakeInstallation = { id: i.id, account: i.account.toLowerCase(), repos: i.repos ? new Set(i.repos.map((r) => r.toLowerCase())) : "all", permissions: i.permissions ?? { ...GRANT_PERMISSIONS } };
+  install(i: { id: number; account: string; accountId?: number; repos?: string[]; permissions?: Record<string, string> }): FakeInstallation {
+    const full: FakeInstallation = {
+      id: i.id, account: i.account.toLowerCase(), ...(i.accountId === undefined ? {} : { accountId: i.accountId }),
+      repos: i.repos ? new Set(i.repos.map((r) => r.toLowerCase())) : "all", permissions: i.permissions ?? { ...GRANT_PERMISSIONS },
+    };
     this.installations = [...this.installations.filter((x) => x.id !== i.id), full];
     return full;
   }
@@ -929,16 +935,16 @@ export class FakeGitHub {
       const page = Number(u.searchParams.get("page") ?? "1");
       const per = Number(u.searchParams.get("per_page") ?? "30");
       return json(200, this.installations.slice((page - 1) * per, page * per).map((i) => ({
-        id: i.id, app_id: GH_APP_ID, account: i.account ? { login: i.account, id: ownerIdOf(i.account) } : null, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected",
+        id: i.id, app_id: GH_APP_ID, account: i.account ? { login: i.account, id: i.accountId ?? ownerIdOf(GH_APP_OWNER) } : null, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected",
       })));
     }
     if (inst) {
-      // The repo by its name now (GitHub redirects an old one), and its account: the installation's, or for the
-      // default one (on every account), the repo's owner's.
+      // The repo by its name now (GitHub redirects an old one), and its account: the installation's login, or for the
+      // default one (on every account) the repo owner's; its id the App owner's unless the test gave another.
       const k = this.renamed.get(inst[1]!.toLowerCase()) ?? inst[1]!.toLowerCase();
       const i = this.installationFor(k) ?? (this.lookupIgnoresSelection ? this.installations.find((x) => x.account === k.split("/")[0]) ?? null : null);
       const owner = this.ownerOf(k);
-      return i ? json(200, { id: i.id, app_id: GH_APP_ID, account: { login: i.account ?? owner.login, id: owner.id }, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected" }) : json(404, { message: "Not Found" });
+      return i ? json(200, { id: i.id, app_id: GH_APP_ID, account: { login: i.account ?? owner.login, id: i.accountId ?? ownerIdOf(GH_APP_OWNER) }, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected" }) : json(404, { message: "Not Found" });
     }
     const i = this.installations.find((x) => x.id === Number(mint![1]));
     if (!i) return json(404, { message: "Not Found" });
