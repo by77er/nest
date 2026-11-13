@@ -54,3 +54,10 @@ description = "Test fixtures, not credentials: an AWS-key-id shape and a curl be
 condition = "AND"
 paths = ['''^control-plane/test/trace\.test\.ts$''']
 regexes = ['''^AKIAABCDEFGHIJKLMNOP$''', '''^abcdefghijk$''']
+
+[[allowlists]]
+targetRules = ["private-key"]
+description = "Not a key: a PEM template around a key the projects app's App-token test generates at run time, written as a literal in one earlier commit (ca42e7e7, PR #269); the file now builds the armor from a label"
+condition = "AND"
+paths = ['''^projects/test/github-app\.test\.ts$''']
+regexes = ['''\$\{btoa\(String\.fromCharCode\(\.\.\.pkcs1\)\)''']
