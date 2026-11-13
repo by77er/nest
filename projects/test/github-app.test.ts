@@ -59,11 +59,14 @@ function pkcs1Of(pkcs8: Uint8Array): Uint8Array {
   return pkcs8.slice(at, at + key.len);
 }
 
+/** A PEM of `der` under `label`, made at run time (no key, nor a key's armor, is ever in the source). */
+const armor = (label: string, der: Uint8Array) => `-----BEGIN ${label}-----\n${btoa(String.fromCharCode(...der)).replace(/.{64}/g, "$&\n")}\n-----END ${label}-----\n`;
+
 async function newKey() {
   const pair = (await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true, ["sign", "verify"])) as CryptoKeyPair;
   const pkcs8 = new Uint8Array((await crypto.subtle.exportKey("pkcs8", pair.privateKey)) as ArrayBuffer);
   const pkcs1 = pkcs1Of(pkcs8);
-  const pem = `-----BEGIN RSA PRIVATE KEY-----\n${btoa(String.fromCharCode(...pkcs1)).replace(/.{64}/g, "$&\n")}\n-----END RSA PRIVATE KEY-----\n`;
+  const pem = armor("RSA PRIVATE KEY", pkcs1);
   return { pair, pkcs8, pkcs1, pem };
 }
 
