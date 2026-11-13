@@ -16,3 +16,7 @@ export function ago(ms: number, now = Date.now()): string {
 }
 
 export const exact = (ms: number) => full.format(ms);
+
+const clockFormat = new Intl.DateTimeFormat(undefined, { timeStyle: "medium" });
+/** The time of day, to the second ("1:47:05 AM"): for "as of" a moment that's recent but not now. */
+export const clock = (ms: number) => clockFormat.format(ms);

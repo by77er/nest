@@ -1,7 +1,7 @@
 //! Audit records: one per proxied request (inspected) or connection (deny/passthrough/tcp),
 //! batched to nestd every ≤1 s or 128 records. Never contains secret values or query strings.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -38,6 +38,8 @@ pub struct Audit {
     pub reason: Option<String>,
     /// Aggregated records: how many requests this record stands for.
     pub count: Option<u32>,
+    /// When the request or connection began: the record's `duration_ms` runs from here.
+    pub started: Instant,
 }
 
 impl Audit {
@@ -54,7 +56,14 @@ impl Audit {
             binding: None,
             reason: None,
             count: None,
+            started: Instant::now(),
         }
+    }
+
+    /// The record's duration runs from `started` instead of now (a tunnel audited when it closes).
+    pub fn since(mut self, started: Instant) -> Self {
+        self.started = started;
+        self
     }
 
     pub fn reason(mut self, r: impl Into<String>) -> Self {
@@ -87,6 +96,8 @@ impl Audit {
             status: self.status,
             bytes_up: self.bytes_up,
             bytes_down: self.bytes_down,
+            // An aggregated record stands for many requests: no one duration.
+            duration_ms: self.count.is_none().then(|| u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)),
             verdict: self.verdict,
             binding: self.binding.map(|b| clip(&b, MAX_SHORT)),
             reason: self.reason.map(|r| clip(&r, MAX_DETAIL)),
@@ -217,6 +228,19 @@ mod tests {
         let mut a = Audit::new("github.com", 443, EgressVerdict::Allow);
         a.path = Some("/".repeat(path_len));
         a.into_record(&SandboxId("sbx_1".into()), Epoch(1), None, None)
+    }
+
+    #[test]
+    fn duration_runs_from_the_start_and_an_aggregate_has_none() {
+        let started = Instant::now().checked_sub(Duration::from_millis(250)).unwrap();
+        let r = Audit::new("h.example", 443, EgressVerdict::Allow).since(started).into_record(&SandboxId("sbx_1".into()), Epoch(1), None, None);
+        let d = r.duration_ms.unwrap();
+        assert!((250..60_000).contains(&d), "{d}");
+        // Made now: a decision recorded at once.
+        assert!(rec(1).duration_ms.unwrap() < 250);
+        let mut agg = Audit::new("*", 0, EgressVerdict::Deny).since(started);
+        agg.count = Some(7);
+        assert_eq!(agg.into_record(&SandboxId("sbx_1".into()), Epoch(1), None, None).duration_ms, None);
     }
 
     #[test]

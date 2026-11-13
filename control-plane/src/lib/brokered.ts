@@ -377,24 +377,12 @@ export function naturalKey(action: BrokeredAction, args: Record<string, unknown>
   }
 }
 
-// --- The secret scan's patterns -------------------------------------------------------------------------------
+// --- The exact-value scan's input -----------------------------------------------------------------------------
 
 /**
- * Credential shapes refused in a brokered action's arguments, whoever's they are. BrokerDO adds its own
- * stored values (`scanSecrets`). Sources: GitHub's token prefixes (github.blog, 2021-04-05, "Behind
- * GitHub's new authentication token formats"), AWS access key ids (docs.aws.amazon.com, IAM identifiers),
- * PEM private keys (RFC 7468); the others are the providers' documented prefixes (unverified here).
+ * Every string in `v` (object keys too), for BrokerDO's `scanSecrets`, which compares them with its stored
+ * secrets' exact values. No credential shapes are looked for (the owner, 2026-11-12: nest assumes no services).
  */
-const SECRET_PATTERNS: readonly [string, RegExp][] = [
-  ["a GitHub token", /\b(?:gh[pousr]_[A-Za-z0-9_]{30,}|github_pat_[A-Za-z0-9_]{40,})/],
-  ["an Anthropic key or token", /\bsk-ant-[A-Za-z0-9_-]{20,}/],
-  ["an AWS access key id", /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/],
-  ["a private key", /-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----/],
-  ["a Slack token", /\bxox[abposr]-[A-Za-z0-9-]{10,}/],
-  ["a Stripe secret key", /\b[rs]k_live_[A-Za-z0-9]{20,}/],
-];
-
-/** Every string in `v` (object keys too), for the scan. */
 export function stringsOf(v: unknown, out: string[] = []): string[] {
   if (typeof v === "string") out.push(v);
   else if (Array.isArray(v)) for (const x of v) stringsOf(x, out);
@@ -403,11 +391,6 @@ export function stringsOf(v: unknown, out: string[] = []): string[] {
     stringsOf(x, out);
   }
   return out;
-}
-
-/** The kinds of credential the strings hold (empty: none recognized). */
-export function secretKinds(strings: readonly string[]): string[] {
-  return SECRET_PATTERNS.filter(([, re]) => strings.some((s) => re.test(s))).map(([k]) => k);
 }
 
 // --- The journal ---------------------------------------------------------------------------------------------

@@ -29,14 +29,30 @@ export type { Dimension, Verdict } from "../../github";
 
 /** `GET /api/projects/<id>`. */
 export type Project = ProjectRow & { settings: Settings };
-/** A row of the projects list: with `needs_you`, how many asks and blocked tasks wait on the owner. */
-export type ListedProject = ProjectRow & { needs_you: number };
+/**
+ * A row of the projects list: with `needs_you`, how many things wait on the owner ("Needs you"'s items), or
+ * null when nest couldn't be read for the agents' asks (unknown, not none).
+ */
+export type ListedProject = ProjectRow & { needs_you: number | null };
 export type { Blocked, Issue, SecretRequest, SecretView, TaskIssue, TaskPr, TaskRef } from "../../do/project";
 /** One thing waiting on the owner: ProjectDO's (asks, blocked tasks, secret requests, triage), or a review held for approval (README.md#the-review-gate). */
 export type Attention = import("../../do/project").Attention
   | { kind: "review"; pr: number; sha: string; title: string | null; author: string | null; fork: boolean; at_ms: number }
   // PRs from authors the project doesn't trust that got no review job yet: too many already wait.
   | { kind: "review_backlog"; count: number; at_ms: number };
+/** What "Needs you" lists: everything but the marker saying the asks couldn't be read. */
+export type Waiting = Exclude<Attention, { kind: "asks_unavailable" }>;
+
+/** "Needs you"'s items, and why nest's asks couldn't be read (null: they were). */
+export function splitAttention(xs: readonly Attention[] | undefined): { items: Waiting[]; asksError: string | null } {
+  const items: Waiting[] = [];
+  let asksError: string | null = null;
+  for (const x of xs ?? []) {
+    if (x.kind === "asks_unavailable") asksError = x.error;
+    else items.push(x);
+  }
+  return { items, asksError };
+}
 export type { AcceptIssueBody, DeclineIssueBody } from "../../requests";
 export type { SecretGrant, SecretLocation, SecretRole } from "../../secrets";
 /** `GET /api/projects/:id/secrets`: the project's secrets with nest's facts, and the grant's limits. */

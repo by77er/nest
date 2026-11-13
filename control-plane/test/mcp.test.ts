@@ -366,6 +366,31 @@ describe("calls", () => {
     expect(s.stub.calls[0]!._meta).toEqual({ "nest/agent": s.agent, "nest/epoch": 1, "nest/call": `${s.agent}/1/cal_m1`, "nest/taint": false });
   });
 
+  it("each tools/call request is on the agent's trace: the capability and tool, the server's host and path, the outcome and sizes; never the bearer or the arguments", async () => {
+    const s = await setup({ trusted: true });
+    call(s.ws, "cal_mo1", s.t("echo"), { text: "argument-text-never-traced" });
+    expect((await result(s.ws, "cal_mo1")).status).toBe("ok");
+    call(s.ws, "cal_mo2", s.t("fails"), {});
+    expect((await result(s.ws, "cal_mo2")).status).toBe("error");
+    const rows = await runInDurableObject(agentStub(s.agent), (_: AgentDO, st) =>
+      st.storage.sql.exec<{ body: string }>("SELECT body FROM trace ORDER BY seq").toArray().map((r) => JSON.parse(r.body) as Record<string, any>));
+    const recs = rows.filter((e) => e.type === "outbound");
+    const all = (x: unknown) => JSON.stringify(x);
+    // Only the calls: the session's initialize isn't a tool call.
+    expect(recs).toEqual([
+      expect.objectContaining({ via: "mcp", name: `${s.cap}.echo`, method: "POST", host: "mcp.test", status: 200,
+        bytes_up: expect.any(Number), bytes_down: expect.any(Number), duration_ms: expect.any(Number) }),
+      expect.objectContaining({ via: "mcp", name: `${s.cap}.fails`, status: 200 }),
+    ]);
+    // The host only: a hosted server's URL path may carry a key.
+    expect(recs.every((x) => !("path" in x))).toBe(true);
+    expect(all(rows)).not.toContain(`/${s.id}/mcp`);
+    expect(recs[0]!.bytes_up).toBeGreaterThan("argument-text-never-traced".length);
+    expect(recs[0]!.bytes_down).toBeGreaterThan(0);
+    expect(all(rows)).not.toContain(`tok-${s.id}`);
+    expect(all(rows)).not.toContain("argument-text-never-traced");
+  });
+
   it("initializes again when the server ended the session, and the call reaches it once", async () => {
     const s = await setup({ whenTainted: "allow" });
     call(s.ws, "cal_s1", s.t("echo"), { text: "a" });

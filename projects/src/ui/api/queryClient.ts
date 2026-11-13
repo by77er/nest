@@ -7,8 +7,11 @@ import { ApiError } from "./client";
 
 declare module "@tanstack/react-query" {
   interface Register {
-    /** `failure`: the notification's title; `inline`: the view shows the error itself, so no notification. */
-    mutationMeta: { failure?: string; inline?: boolean };
+    /**
+     * `failure`: the notification's title; `inline`: the view shows the error itself, so no notification;
+     * `inlineStatus`: the same, for answers with these statuses only.
+     */
+    mutationMeta: { failure?: string; inline?: boolean; inlineStatus?: number[] };
   }
 }
 
@@ -17,6 +20,7 @@ export function createQueryClient(): QueryClient {
     mutationCache: new MutationCache({
       onError: (error, _vars, _result, mutation) => {
         if (mutation.meta?.inline) return;
+        if (error instanceof ApiError && mutation.meta?.inlineStatus?.includes(error.status)) return;
         notifications.show({ color: "danger", title: mutation.meta?.failure ?? "That didn't work", message: error.message });
       },
     }),

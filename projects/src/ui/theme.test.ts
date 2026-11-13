@@ -153,6 +153,13 @@ describe("tooltips", () => {
   });
 });
 
+describe("notifications", () => {
+  it("say their message in the muted gray (AA), not Mantine's dimmed (3.3:1 on white)", () => {
+    const styles = theme.components?.Notification?.styles as { description?: { color?: string } } | undefined;
+    expect(styles?.description?.color).toBe("var(--nest-muted)");
+  });
+});
+
 describe("contrast, in both schemes", () => {
   const vars = cssVariablesResolver(full);
   const schemes = ["light", "dark"] as const;

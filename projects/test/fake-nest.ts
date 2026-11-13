@@ -18,6 +18,41 @@ export const AUD = "aud-of-the-projects-application";
 const b64url = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 export const b64urlJson = (v: unknown) => b64url(new TextEncoder().encode(JSON.stringify(v)));
 
+/** An ask nest holds for an agent, open until answered (`GET /v1/agents/<id>/asks`'s row). */
+export interface HeldAsk {
+  ask: string;
+  question: string;
+  created_ms: number;
+  approval?: { name: string; tool: string | null };
+}
+
+/**
+ * nest's record of asks, by agent, across every FakeNest (agent ids are unique): what `GET /v1/asks` and
+ * `GET /v1/agents/<id>/asks` list. An `agent.ask` event `deliver` sends is held here first, as nest records an
+ * ask before it emits its event; `holdAsk` holds one without an event. Answered ones are kept apart (`already_answered`).
+ */
+const HELD = new Map<string, HeldAsk[]>();
+const ANSWERED = new Set<string>();
+
+/** Hold an ask in nest's record for `agent` (no event: the app reads asks from nest). */
+export function holdAsk(agent: string, ask: string, o: { question?: string; created_ms?: number; approval?: { name: string; tool: string | null } } = {}): HeldAsk {
+  const row: HeldAsk = { ask, question: o.question ?? `may ${ask}?`, created_ms: o.created_ms ?? Date.now(), ...(o.approval ? { approval: o.approval } : {}) };
+  const rows = HELD.get(agent) ?? [];
+  if (!rows.some((r) => r.ask === ask) && !ANSWERED.has(ask)) HELD.set(agent, [...rows, row]);
+  return row;
+}
+
+/** Answer an ask in nest's record, as nest does for any caller: the operator's API, another path. */
+export function answerInNest(agent: string, ask: string): "async" | "already_answered" | "unknown" {
+  const rows = HELD.get(agent) ?? [];
+  if (rows.some((r) => r.ask === ask)) {
+    HELD.set(agent, rows.filter((r) => r.ask !== ask));
+    ANSWERED.add(ask);
+    return "async";
+  }
+  return ANSWERED.has(ask) ? "already_answered" : "unknown";
+}
+
 export interface FakeAgent {
   agent: string;
   owner: string;
@@ -115,6 +150,10 @@ export class FakeNest {
   grantListing: { repos: { repo: string; push: boolean; read: boolean; github: boolean }[]; unlisted: string[]; complete: boolean } | null | "missing" = null;
   /** The installation nest's token answer names (`installation_id`); null: none, as a nest from before #219. */
   tokenInstallation: number | null = GH_INSTALLATION_ID;
+  /** Play a control plane from before `GET /v1/asks`: a client's unknown route answers 401. */
+  asksRouteMissing = false;
+  /** The most agents a page of `GET /v1/asks` holds, below what the app asks for (to make it page). */
+  asksPageMax = 100;
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
   holds: { match: RegExp; release: Promise<void>; reached: boolean }[] = [];
   /** Creates that are made but whose answer is lost (a 500 instead), as after a timeout. */
@@ -322,6 +361,23 @@ export class FakeNest {
       this.agents.set(a.agent, a);
       return json(201, { ...this.view(a), started: null });
     }
+    if (r === "GET /v1/asks") {
+      if (this.asksRouteMissing) return nestErr(401, "unauthorized", "admin token required");
+      // As nest: a page of the client's live agents matching every label (in creation order, `limit` of them,
+      // after `cursor`), each one's oldest 20 open asks; `more` names an agent with more.
+      if (u.searchParams.has("state") && u.searchParams.get("state") !== "live") return nestErr(400, "invalid_message", "state is live here");
+      const rows = [...this.agents.values()].filter((a) => a.client === CLIENT && !a.ended && labelsMatch(a.labels));
+      const from = Number(u.searchParams.get("cursor") ?? 0);
+      const size = Math.min(Number(u.searchParams.get("limit") ?? 50), 100, this.asksPageMax);
+      const page = rows.slice(from, from + size);
+      const more: string[] = [];
+      const asks = page.flatMap((a) => {
+        const held = [...(HELD.get(a.agent) ?? [])].sort((x, y) => x.created_ms - y.created_ms);
+        if (held.length > 20) more.push(a.agent);
+        return held.slice(0, 20).map((x) => ({ agent: a.agent, cell: CELL, client: a.client, owner: a.owner, labels: a.labels, ...x }));
+      });
+      return json(200, { asks: asks.sort((x, y) => x.created_ms - y.created_ms), more, next_cursor: from + size < rows.length ? String(from + size) : null });
+    }
     if (r === "GET /v1/agents") {
       const rows = [...this.agents.values()].filter((a) => !a.ended && labelsMatch(a.labels));
       return json(200, { agents: rows.map((a) => ({ agent: a.agent, cell: CELL, client: a.client, owner: a.owner, labels: a.labels, created_ms: 1, ended_ms: null })), next_cursor: null });
@@ -396,9 +452,12 @@ export class FakeNest {
         if (!was && a.ended && call.body?.destroy_sandbox && a.sandbox) this.sandboxes.get(a.sandbox)!.ended = true;
         return json(200, { status: "stopped" });
       }
+      if (req.method === "GET" && sub === "/asks") return json(200, [...(HELD.get(a.agent) ?? [])].sort((x, y) => x.created_ms - y.created_ms));
       if (req.method === "POST" && (m = sub.match(/^\/asks\/(ask_[A-Za-z0-9]+)\/answer$/))) {
+        const delivered = answerInNest(a.agent, m[1]!);
+        if (delivered === "unknown") return nestErr(404, "invalid_message", "unknown ask");
         this.answers.push({ agent: a.agent, ask: m[1]!, answer: call.body.answer });
-        return json(200, { delivered: true });
+        return json(200, { delivered });
       }
     }
     if (req.method === "DELETE" && (m = u.pathname.match(/^\/v1\/catalog\/(templates|capabilities)\/([a-z][a-z0-9-]+)\/([a-z][a-z0-9-]*)$/))) {
@@ -584,6 +643,10 @@ export async function api(token: string, method: string, path: string, body?: un
 
 /** POST one event to /hooks/nest, signed as nest signs it (or with what `o` changes). */
 export async function deliver(event: Record<string, unknown>, o: { secret?: string; t?: number; header?: string } = {}): Promise<Response> {
+  // nest holds an ask before it sends its event.
+  if (event.type === "agent.ask" && typeof event.agent === "string" && typeof event.ask === "string") {
+    holdAsk(event.agent, event.ask, { question: typeof event.question === "string" ? event.question : "", ...(event.approval ? { approval: event.approval as HeldAsk["approval"] } : {}) });
+  }
   const body = JSON.stringify(event);
   const t = o.t ?? Date.now();
   const header = o.header ?? `t=${t},v1=${await signWebhook(o.secret ?? env.NEST_WEBHOOK_SECRET!, t, body)}`;

@@ -7,7 +7,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { secretNeedles } from "../src/do/broker";
-import { authorize, grantOfEntry, keyDigest, pathCovered, safePath, secretKinds, stringsOf } from "../src/lib/brokered";
+import { authorize, grantOfEntry, keyDigest, pathCovered, safePath } from "../src/lib/brokered";
 import { appJwt, GitHubApi, importAppKey, pkcs1ToPkcs8 } from "../src/lib/github";
 import { CallLedger } from "../src/lib/calls";
 import { b64url, b64urlToBytes, bytesToB64 } from "../src/lib/util";
@@ -284,6 +284,10 @@ const tainted = (agent: string) => runInDurableObject(agentStub(agent), (_: Agen
 const answer = (agent: string, ask: string, text: string) => adminJson(`/v1/agents/${agent}/asks/${ask}/answer`, { body: { answer: text } });
 const lastTurn = async (agent: string) => (await agentStub(agent).turns()).at(-1)!.input as { kind: string; text: string };
 const journal = (agent: string) => adminJson(`/v1/agents/${agent}/brokered`);
+/** Every event on the agent's trace ring, as stored. */
+const traceRows = (agent: string) => runInDurableObject(agentStub(agent), (_: AgentDO, st) =>
+  st.storage.sql.exec<{ body: string }>("SELECT body FROM trace ORDER BY seq").toArray().map((r) => JSON.parse(r.body) as Record<string, any>));
+const outbound = async (agent: string) => (await traceRows(agent)).filter((e) => e.type === "outbound");
 
 // --- Pure parts --------------------------------------------------------------------------------------------
 
@@ -359,12 +363,7 @@ describe("authority and the scan (pure)", () => {
     expect(safePath("/a/./b")).toBe(false);
   });
 
-  it("the scan finds credential shapes in any string (keys too), and a stored value raw, base64'd, inside JSON, or as a PEM's body", () => {
-    const token = `ghp_${"a1".repeat(18)}`;
-    expect(secretKinds(stringsOf({ body: `here: ${token}` }))).toEqual(["a GitHub token"]);
-    expect(secretKinds(stringsOf({ [`AKIA${"A".repeat(16)}`]: 1 }))).toEqual(["an AWS access key id"]);
-    expect(secretKinds(stringsOf({ x: ["-----BEGIN RSA PRIVATE KEY-----"] }))).toEqual(["a private key"]);
-    expect(secretKinds(stringsOf({ body: "ghp_short, sk-ant-, an ordinary comment" }))).toEqual([]);
+  it("the scan looks for a stored value raw, base64'd, inside JSON, or as a PEM's body", () => {
     const n = secretNeedles(JSON.stringify({ client_id: "short", client_secret: "aaaaaaaaaaaaaaaa-secret" }));
     expect(n).toContain("aaaaaaaaaaaaaaaa-secret");
     expect(n).not.toContain("short");
@@ -377,6 +376,23 @@ describe("authority and the scan (pure)", () => {
 // --- GitHub actions through the pipeline -------------------------------------------------------------------
 
 describe("github actions", () => {
+  it("each request an action sends to GitHub is on the agent's trace, without the installation token or the body", async () => {
+    const r = repo();
+    const s = await setup([{ action: "github.comment", repos: [r] }]);
+    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 4, body: "comment-text-never-traced" })).status).toBe("ok");
+    const recs = await outbound(s.agent);
+    expect(recs).toContainEqual(expect.objectContaining({
+      type: "outbound", via: "brokered", name: "github.comment", method: "POST", host: "api.github.com", path: `/repos/${r}/issues/4/comments`, status: 201,
+      bytes_up: expect.any(Number), bytes_down: expect.any(Number), duration_ms: expect.any(Number),
+    }));
+    expect(recs.every((x) => x.name === "github.comment" && x.host === "api.github.com")).toBe(true);
+    const token = [...gh.tokens].find(([, v]) => v.repo === r.toLowerCase())?.[0];
+    expect(token).toBeTruthy();
+    const all = JSON.stringify(await traceRows(s.agent));
+    expect(all).not.toContain(token!);
+    expect(all).not.toContain("comment-text-never-traced");
+  });
+
   it("a comment goes out once through the App, with a token minted for that repo and those permissions only, audited without its value, cached, and journaled", async () => {
     const r = repo();
     const s = await setup([{ action: "github.comment", repos: [r] }]);
@@ -533,7 +549,9 @@ describe("github actions", () => {
   it("an action is capped per hour; refused calls don't count", async () => {
     const r = repo();
     const s = await setup([{ action: "github.comment", repos: [r], per_hour: 2 }]);
-    await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: `ghp_${"x".repeat(36)}` }); // refused by the scan
+    const stored = `s3cr3t-${rand()}-value`;
+    await adminJson(`/v1/admin/secrets/http:cap${s.id}`, { method: "PUT", body: { value: stored } });
+    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: stored })).status).toBe("error"); // refused by the scan
     expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "1" })).status).toBe("ok");
     expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "2" })).status).toBe("ok");
     expect(await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "3" })).toMatchObject({ status: "error", error: { code: "rate_limited", retryable: true } });
@@ -544,25 +562,40 @@ describe("github actions", () => {
 // --- The secret scan -------------------------------------------------------------------------------------
 
 describe("the secret scan", () => {
-  it("arguments holding a credential shape or any stored secret's value are refused before anything is asked or sent, without the value in the error; the journal names what matched", async () => {
+  it("arguments holding any stored secret's value are refused before anything is asked or sent, without the value in the error; the journal names which secret", async () => {
     const r = repo();
     const s = await setup([{ action: "github.comment" }]); // unscoped: a tainted call would be asked
     await taint(s.agent);
     const stored = `s3cr3t-${rand()}-value`;
     await adminJson(`/v1/admin/secrets/http:leak${s.id}`, { method: "PUT", body: { value: stored } });
-    const pat = `ghp_${"Ab1".repeat(12)}`;
-    for (const body of [`token ${pat}`, `look: ${stored}`, `b64 ${btoa(stored)}`]) {
+    for (const body of [`look: ${stored}`, `b64 ${btoa(stored)}`]) {
       const o = await run(s.ws, "github_comment", { repo: r, issue_number: 2, body });
-      expect(o).toMatchObject({ status: "error", error: { code: "forbidden", message: expect.stringContaining("Not sent: the arguments contain") } });
+      expect(o).toMatchObject({ status: "error", error: { code: "forbidden", message: "Not sent: the arguments contain a credential nest holds. Remove it and call again." } });
       expect(JSON.stringify(o)).not.toContain(stored);
-      expect(JSON.stringify(o)).not.toContain(pat);
     }
     expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toEqual([]); // the operator was never asked to approve a leak
     expect(gh.writes.some((w) => w.path.includes(r))).toBe(false);
     const j = await journal(s.agent);
-    expect(j.map((e: any) => e.status)).toEqual(["refused", "refused", "refused"]);
-    expect(j.map((e: any) => e.detail)).toEqual([`the value of http:leak${s.id}`, `the value of http:leak${s.id}`, "a GitHub token"]);
+    expect(j.map((e: any) => e.status)).toEqual(["refused", "refused"]);
+    expect(j.map((e: any) => e.detail)).toEqual([`the value of http:leak${s.id}`, `the value of http:leak${s.id}`]);
     expect(JSON.stringify(j)).not.toContain(stored);
+  });
+});
+
+describe("the secret scan: tokens nest minted", () => {
+  it("a GitHub installation token nest minted and holds is refused as a credential nest holds, by its exact value", async () => {
+    const r = repo();
+    const s = await setup([{ action: "github.comment", repos: [r] }]);
+    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 3, body: "first" })).status).toBe("ok");
+    const token = [...gh.tokens].find(([, v]) => v.repo === r)?.[0];
+    expect(token).toBeTruthy();
+    const o = await run(s.ws, "github_comment", { repo: r, issue_number: 3, body: `leak ${token}` });
+    expect(o).toMatchObject({ status: "error", error: { code: "forbidden", message: "Not sent: the arguments contain a credential nest holds. Remove it and call again." } });
+    expect(JSON.stringify(o)).not.toContain(token!);
+    expect(gh.comments.get(`${r}#3`)).toHaveLength(1);
+    const j = await journal(s.agent);
+    expect(j[0]).toMatchObject({ status: "refused", detail: expect.stringContaining("the value of minted GitHub token") });
+    expect(JSON.stringify(j)).not.toContain(token!);
   });
 });
 
@@ -628,6 +661,10 @@ describe("github.fork", () => {
       fork: "operator/lib", url: "https://github.com/Operator/lib", compare: `https://github.com/${up}/compare/trunk...operator:lib:<branch>`, push_allowed: true,
     });
     expect(gh.forks.filter((f) => f.upstream === up)).toEqual([{ upstream: up, body: { default_branch_only: true } }]);
+    // The fork's request is on the agent's trace; the operator's token isn't.
+    expect(await outbound(s.agent)).toEqual([expect.objectContaining({
+      via: "brokered", name: "github.fork", method: "POST", host: "api.github.com", path: `/repos/${up}/forks`, status: 202 })]);
+    expect(JSON.stringify(await traceRows(s.agent))).not.toContain(GITHUB_USER_TOKEN);
     const sbx = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox!));
     expect(await sbx.pushRepos()).toContain("operator/lib");
     const policy = await sbx.policy();
@@ -688,6 +725,17 @@ describe("http.request profiles", () => {
     expect(p.stub.requests).toHaveLength(2);
   });
 
+  it("no credential shapes are looked for: a call carrying strings shaped like other services' tokens and keys goes out, unrefused", async () => {
+    const p = await profileSetup();
+    // Built at run time: shaped like a GitHub token, an AWS access key id and a PEM private key's armour, none of them stored in nest.
+    const shaped = [`ghp_${"Ab1".repeat(12)}`, `AKIA${"Q".repeat(16)}`, ["-----BEGIN", "PRIVATE", "KEY-----"].join(" ")];
+    const o = await run(p.ws, "http_request", { profile: "p", method: "POST", path: "/v1/items", body: JSON.stringify({ note: shaped.join(" ") }) });
+    expect(o, JSON.stringify(o)).toMatchObject({ status: "ok" });
+    expect(p.stub.requests).toHaveLength(1);
+    for (const x of shaped) expect(p.stub.requests[0]!.body).toContain(x);
+    expect((await journal(p.agent)).map((e: any) => e.status)).toEqual(["done"]);
+  });
+
   it("an http request settled by another delivery just before it would leave isn't sent", async () => {
     const p = await profileSetup();
     await settleBeforeSend(p.agent, "cal_hs1", "http.request", "p");
@@ -712,12 +760,30 @@ describe("http.request profiles", () => {
     expect(stub.requests.map((r) => r.path)).toEqual([`/${id}/a`, `/${id}/b`]);
   });
 
+  it("each request it sends is on the agent's trace: where, the outcome and the sizes; never a query value, the body or the injected credential", async () => {
+    const p = await profileSetup();
+    const body = JSON.stringify({ note: "body-text-never-traced" });
+    const o = await run(p.ws, "http_request", { profile: "p", method: "POST", path: "/v1/items", query: { q: "query-value-never-traced" }, body });
+    expect(o.status).toBe("ok");
+    const answer = o.content[0].text as string;
+    expect(await outbound(p.agent)).toEqual([expect.objectContaining({
+      type: "outbound", via: "brokered", name: "http.request", method: "POST", host: "http.test", path: `/${p.sid}/v1/items`, status: 200,
+      bytes_up: new TextEncoder().encode(body).length, bytes_down: new TextEncoder().encode(answer).length, duration_ms: expect.any(Number),
+    })]);
+    const all = JSON.stringify(await traceRows(p.agent));
+    // The stub echoes the credential back: the record has the answer's size, never its text.
+    expect(JSON.parse(answer).auth).toContain("*");
+    for (const never of [p.secret, "query-value-never-traced", "body-text-never-traced", "?q="]) expect(all).not.toContain(never);
+  });
+
   it("a lost answer is retried once for an idempotent method, never for POST", async () => {
     // vitest.config.ts: BROKERED_TIMEOUT_MS = 1500.
     const p = await profileSetup();
     p.stub.next.push({ delay: 2500 });
     expect((await run(p.ws, "http_request", { profile: "p", method: "GET", path: "/v1/items" })).status).toBe("ok");
     expect(p.stub.requests).toHaveLength(2);
+    // Each attempt is on the trace: the one that timed out without a status.
+    expect((await outbound(p.agent)).map((x) => [x.method, x.status ?? x.error])).toEqual([["GET", "aborted"], ["GET", 200]]);
     p.stub.next.push({ delay: 2500 });
     expect(await run(p.ws, "http_request", { profile: "p", method: "POST", path: "/v1/items", body: "{}" })).toMatchObject({ status: "error", error: { code: "outcome_unknown" } });
     expect(p.stub.requests).toHaveLength(3);

@@ -59,5 +59,7 @@
     margin-block: calc(var(--nest-hit-pad) * -1);
     position: relative;
     z-index: 1;
+    /* A badge narrower than a finger (a "?") is still a 44 px target across. */
+    min-width: var(--nest-hit-touch);
   }
 }

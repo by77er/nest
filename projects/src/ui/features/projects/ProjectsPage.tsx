@@ -7,9 +7,10 @@ import { IconBrandGithub, IconFolders, IconPlus } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
 import { useProjects } from "../../api/queries";
 import { AnchorLink, BadgeLink } from "../../common/links";
-import { ago, exact } from "../../common/time";
+import { ago, clock, exact } from "../../common/time";
 import { CardGrid, EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Page, PageHeader, Panel, Row, Stack, weight } from "../../layout";
 import { CreateProjectForm } from "./CreateProjectForm";
+import { unknownIfStale } from "../shell/attention";
 
 export function ProjectsPage() {
   const projects = useProjects();
@@ -27,71 +28,96 @@ export function ProjectsPage() {
         }
       />
 
-      {projects.isPending ? (
-        <LoadingState label="Loading projects" />
-      ) : projects.isError ? (
-        <ErrorState title="The projects couldn't be loaded" error={projects.error} onRetry={() => void projects.refetch()} />
-      ) : projects.data.length === 0 ? (
-        <Panel>
-          <EmptyState
-            icon={IconFolders}
-            title="No projects yet"
-            description="A project is one GitHub repo, with a manager agent that keeps its board."
-            action={<Button onClick={open}>Create the first project</Button>}
-          />
-        </Panel>
-      ) : (
-        <CardGrid>
-          {projects.data.map((p) => (
-            <Panel key={p.id} component="article" aria-label={p.name}>
-              {/* Two rows of controls (the title and its badge, the repo): a touch pitch apart. */}
-              <Stack gap="sm" data-touch-pitch>
-                <Row gap="sm" justify="space-between" wrap="nowrap">
-                  {/* Still being created (README.md#creating-a-project): nothing to open yet. */}
-                  {p.state === "pending" ? (
-                    <Text fw={weight.bold} fz="lg">
-                      {p.name}
+      {/* The stale line sits with the cards it describes (lg), not a page section away (2xl). */}
+      <Stack gap="lg">
+        {/* A refresh that failed after a good read: the cards are that read, said so (their counts "?"). */}
+        {projects.isRefetchError && (
+          <Text fz="sm" c="dimmed" data-stale title={exact(projects.dataUpdatedAt)}>
+            Couldn't refresh; showing what was read at {clock(projects.dataUpdatedAt)}. Trying again.
+          </Text>
+        )}
+        {projects.isPending ? (
+          <LoadingState label="Loading projects" />
+        ) : projects.isError && projects.data === undefined ? (
+          // Only a first load that failed: a refresh that fails keeps the list, its counts unknown ("?").
+          <ErrorState title="The projects couldn't be loaded" error={projects.error} onRetry={() => void projects.refetch()} />
+        ) : projects.data.length === 0 ? (
+          <Panel>
+            <EmptyState
+              icon={IconFolders}
+              title="No projects yet"
+              description="A project is one GitHub repo, with a manager agent that keeps its board."
+              action={<Button onClick={open}>Create the first project</Button>}
+            />
+          </Panel>
+        ) : (
+          <CardGrid>
+            {projects.data.map(({ needs_you: listed, ...rest }) => ({ ...rest, needs_you: unknownIfStale(projects.isRefetchError, listed) })).map((p) => (
+              <Panel key={p.id} component="article" aria-label={p.name}>
+                {/* Two rows of controls (the title and its badge, the repo): a touch pitch apart. */}
+                <Stack gap="sm" data-touch-pitch>
+                  <Row gap="sm" justify="space-between" wrap="nowrap">
+                    {/* Still being created (README.md#creating-a-project): nothing to open yet. */}
+                    {p.state === "pending" ? (
+                      <Text fw={weight.bold} fz="lg">
+                        {p.name}
+                      </Text>
+                    ) : (
+                      <AnchorLink to="/projects/$projectId/manager" params={{ projectId: p.id }} search={{}} c="bright" fw={weight.bold} fz="lg">
+                        {p.name}
+                      </AnchorLink>
+                    )}
+                    {p.state === "pending" && (
+                      <Badge color="gray" variant="light" data-marker="creating">
+                        Being created
+                      </Badge>
+                    )}
+                    {p.needs_you === null && (
+                      // Unknown, not none (the agents' asks couldn't be read, or the list couldn't refresh): "?", as on the sidebar.
+                      <BadgeLink
+                        to="/projects/$projectId/board"
+                        params={{ projectId: p.id }}
+                        search={{}}
+                        color="warning"
+                        variant="light"
+                        data-marker="needs-you-unknown"
+                        aria-label="Couldn't check what needs you: open the board"
+                        title="Couldn't check what needs you"
+                      >
+                        ?
+                      </BadgeLink>
+                    )}
+                    {p.needs_you !== null && p.needs_you > 0 && (
+                      // Asks are answered on the Board; the project itself opens on its Manager.
+                      <BadgeLink
+                        to="/projects/$projectId/board"
+                        params={{ projectId: p.id }}
+                        search={{}}
+                        color="warning"
+                        variant="filled"
+                        data-marker="needs-you"
+                        aria-label={`${p.needs_you} ${p.needs_you === 1 ? "thing needs" : "things need"} you: open the board`}
+                      >
+                        {p.needs_you} {p.needs_you === 1 ? "needs" : "need"} you
+                      </BadgeLink>
+                    )}
+                  </Row>
+                  <MetaRow>
+                    <MetaItem icon={IconBrandGithub}>
+                      <Anchor href={`https://github.com/${p.repo}`} target="_blank" rel="noreferrer" inherit c="dimmed">
+                        {p.repo}
+                      </Anchor>
+                    </MetaItem>
+                    <Text component="span" fz="xs" c="dimmed" title={exact(p.created_ms)}>
+                      Created {ago(p.created_ms)}
                     </Text>
-                  ) : (
-                    <AnchorLink to="/projects/$projectId/manager" params={{ projectId: p.id }} search={{}} c="bright" fw={weight.bold} fz="lg">
-                      {p.name}
-                    </AnchorLink>
-                  )}
-                  {p.state === "pending" && (
-                    <Badge color="gray" variant="light" data-marker="creating">
-                      Being created
-                    </Badge>
-                  )}
-                  {p.needs_you > 0 && (
-                    // Asks are answered on the Board; the project itself opens on its Manager.
-                    <BadgeLink
-                      to="/projects/$projectId/board"
-                      params={{ projectId: p.id }}
-                      search={{}}
-                      color="warning"
-                      variant="filled"
-                      data-marker="needs-you"
-                      aria-label={`${p.needs_you} ${p.needs_you === 1 ? "thing needs" : "things need"} you: open the board`}
-                    >
-                      {p.needs_you} {p.needs_you === 1 ? "needs" : "need"} you
-                    </BadgeLink>
-                  )}
-                </Row>
-                <MetaRow>
-                  <MetaItem icon={IconBrandGithub}>
-                    <Anchor href={`https://github.com/${p.repo}`} target="_blank" rel="noreferrer" inherit c="dimmed">
-                      {p.repo}
-                    </Anchor>
-                  </MetaItem>
-                  <Text component="span" fz="xs" c="dimmed" title={exact(p.created_ms)}>
-                    Created {ago(p.created_ms)}
-                  </Text>
-                </MetaRow>
-              </Stack>
-            </Panel>
-          ))}
-        </CardGrid>
-      )}
+                  </MetaRow>
+                </Stack>
+              </Panel>
+            ))}
+          </CardGrid>
+        )}
+      </Stack>
 
       <Modal opened={creating} onClose={close} title="New project">
         <CreateProjectForm

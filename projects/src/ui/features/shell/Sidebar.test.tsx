@@ -86,6 +86,47 @@ describe("the switcher", () => {
     expect(await screen.findByRole("option", { name: "Widgets, 2 need you" })).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Gadgets" })).toBeInTheDocument();
   });
+
+  it("a projects list that fails to refresh after a good read makes the count unknown, not the old number", async () => {
+    const api = twoProjects();
+    api.asks = [ask({ question: "q1" })];
+    const { queryClient, user } = renderApp("/projects/prj_one/manager", api);
+    await waitFor(() => expect(switcher()).toHaveAccessibleName("Project: Widgets. Switch project"));
+    const badges = (m: string) => [...sidebar().querySelectorAll(`[data-marker=${m}]`)].filter((b) => !b.closest(".mantine-Combobox-dropdown"));
+    await waitFor(() => expect(badges("needs-you")).toHaveLength(1));
+    api.fail(/^GET \/api\/projects$/, 502, "the Worker is unavailable");
+    await queryClient.refetchQueries({ queryKey: ["projects"], exact: true });
+    await waitFor(() => expect(badges("needs-you-unknown")).toHaveLength(1));
+    expect(badges("needs-you")).toHaveLength(0);
+    // The list is kept, so the sidebar says nothing failed (only a first load that failed does).
+    expect(within(sidebar()).queryByText("The projects couldn't be loaded.")).toBeNull();
+    // The switcher's list says the same of every project.
+    await user.click(switcher());
+    expect(await screen.findByRole("option", { name: "Widgets, couldn't check what needs you" })).toBeInTheDocument();
+  });
+
+  it("a projects list that fails its first load says so, on the rows' left edge", async () => {
+    const api = new FakeApi();
+    for (let i = 0; i < 3; i++) api.fail(/^GET \/api\/projects$/, 502, "the Worker is unavailable");
+    renderApp("/admin", api);
+    const note = await within(await screen.findByRole("navigation", { name: "Main" })).findByText("The projects couldn't be loaded.");
+    expect(note.closest("[data-ds=nav-note]")).not.toBeNull();
+  });
+
+  it("an unknown count (nest unreadable for the asks) is a \"?\" on Board, and said in the list", async () => {
+    const api = twoProjects();
+    api.asksError = "nest 503";
+    const { user } = renderApp("/projects/prj_one/manager", api);
+    await waitFor(() => expect(switcher()).toHaveAccessibleName("Project: Widgets. Switch project"));
+    const unknowns = () => [...sidebar().querySelectorAll("[data-marker=needs-you-unknown]")].filter((b) => !b.closest(".mantine-Combobox-dropdown"));
+    await waitFor(() => expect(unknowns()).toHaveLength(1));
+    const unknown = unknowns()[0]!;
+    expect(unknown).toHaveAccessibleName("Couldn't check what needs you");
+    expect(unknown).toHaveTextContent("?");
+    expect(unknown.closest("a")).toHaveAttribute("href", "/projects/prj_one/board");
+    await user.click(switcher());
+    expect(await screen.findByRole("option", { name: "Widgets, couldn't check what needs you" })).toBeInTheDocument();
+  });
 });
 
 describe("the views", () => {

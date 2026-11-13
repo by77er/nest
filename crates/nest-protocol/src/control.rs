@@ -717,6 +717,10 @@ pub struct EgressAuditRecord {
     pub status: Option<u16>,
     pub bytes_up: u64,
     pub bytes_down: u64,
+    /// From the decision (or the connection's start) to the record: a request's response body ending,
+    /// a tunnel closing. Absent from an aggregated record and from an older proxy's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     pub verdict: EgressVerdict,
     /// Name (never value) of the injection binding used or violated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
