@@ -182,7 +182,7 @@ export class FakeApi {
   }
 
   private route(m: string, parts: string[], body: any): Response {
-    if (parts[0] === "repos" && m === "GET") return this.attachable ? json(this.attachable) : json({ error: "nest couldn't say which repos the app may attach" }, 502);
+    if (parts[0] === "repos" && m === "GET") return this.attachable ? json(this.attachable) : json({ error: "GitHub couldn't say which repos the app's GitHub App reaches" }, 502);
     if (parts[0] === "admin") {
       if (parts[1] === "sync-state") return json(this.sync);
       if (parts[1] === "bindings" && !parts[2]) return json(this.bindings);

@@ -537,21 +537,22 @@ export class FakeNest {
   }
 }
 
-/**
- * Run `fn` with the app's GitHub tokens from nest (`GITHUB_TOKEN_SOURCE=nest`, the fallback), as the Worker and
- * its objects read the env they share with the tests; the App's own after.
- */
-export async function withNestTokens<T>(fn: () => Promise<T>): Promise<T> {
-  const e = env as { GITHUB_TOKEN_SOURCE?: string };
-  const had = e.GITHUB_TOKEN_SOURCE;
-  e.GITHUB_TOKEN_SOURCE = "nest";
+/** Run `fn` with one of the env's values set (undefined: unset), as the Worker and its objects read the env they share with the tests. */
+export async function withEnv<T>(name: "GITHUB_TOKEN_SOURCE" | "GITHUB_ACCOUNTS", value: string | undefined, fn: () => Promise<T>): Promise<T> {
+  const e = env as unknown as Record<string, unknown>;
+  const had = e[name];
+  if (value === undefined) delete e[name];
+  else e[name] = value;
   try {
     return await fn();
   } finally {
-    if (had === undefined) delete e.GITHUB_TOKEN_SOURCE;
-    else e.GITHUB_TOKEN_SOURCE = had;
+    if (had === undefined) delete e[name];
+    else e[name] = had;
   }
 }
+
+/** Run `fn` with the app's GitHub tokens from nest (`GITHUB_TOKEN_SOURCE=nest`, the fallback); the App's own after. */
+export const withNestTokens = <T>(fn: () => Promise<T>): Promise<T> => withEnv("GITHUB_TOKEN_SOURCE", "nest", fn);
 
 /** Install `fake` as nest (and Cloudflare Access's certs, when given) for the Worker and its objects. */
 /** The fake GitHub the installed fetch answers from: events name their repo's owner as it answers (`deliverGithub`). */
@@ -692,6 +693,8 @@ export async function eventually<T>(f: () => T | Promise<T>, what: string): Prom
 
 /** The GitHub App's id, as GitHub answers it in a check run's `app.id`. */
 export const GH_APP_ID = 4242;
+/** The account that owns the App (`GET /app`'s `owner`): the one account the app acts for by default. */
+export const GH_APP_OWNER = "app-owner";
 /** The App's slug: its bot is `nest-test[bot]`. */
 export const GH_APP_SLUG = "nest-test";
 /** The fake's default installation of the App: on every account that has none of its own (FakeGitHub.install). */
@@ -792,6 +795,11 @@ export class FakeGitHub {
   installations: FakeInstallation[] = [{ id: GH_INSTALLATION_ID, account: null, repos: "all", permissions: { ...GRANT_PERMISSIONS } }];
   /** Calls held until released (a slow answer), each once: `reached` once one is waiting. */
   holds: { match: RegExp; release: Promise<void>; reached: boolean }[] = [];
+  /**
+   * Answer a repo's installation lookup with its account's installation even when that installation doesn't select
+   * the repo (whether GitHub does is unverified): then only the mint narrowed to it refuses (422).
+   */
+  lookupIgnoresSelection = false;
   /** How long an installation token lives (GitHub's: an hour). */
   tokenLifeMs = 3_600_000;
   /** The claims of each App JWT GitHub accepted, in order. */
@@ -916,7 +924,7 @@ export class FakeGitHub {
       f.times--;
       return json(f.status, { message: f.message ?? "injected" });
     }
-    if (route === "GET /app") return json(200, { id: GH_APP_ID, slug: GH_APP_SLUG, name: "nest test" });
+    if (route === "GET /app") return json(200, { id: GH_APP_ID, slug: GH_APP_SLUG, name: "nest test", owner: { login: GH_APP_OWNER, id: ownerIdOf(GH_APP_OWNER), type: "User" } });
     if (route === "GET /app/installations") {
       const page = Number(u.searchParams.get("page") ?? "1");
       const per = Number(u.searchParams.get("per_page") ?? "30");
@@ -925,8 +933,12 @@ export class FakeGitHub {
       })));
     }
     if (inst) {
-      const i = this.installationFor(inst[1]!);
-      return i ? json(200, { id: i.id, app_id: GH_APP_ID, account: i.account ? { login: i.account, id: ownerIdOf(i.account) } : null, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected" }) : json(404, { message: "Not Found" });
+      // The repo by its name now (GitHub redirects an old one), and its account: the installation's, or for the
+      // default one (on every account), the repo's owner's.
+      const k = this.renamed.get(inst[1]!.toLowerCase()) ?? inst[1]!.toLowerCase();
+      const i = this.installationFor(k) ?? (this.lookupIgnoresSelection ? this.installations.find((x) => x.account === k.split("/")[0]) ?? null : null);
+      const owner = this.ownerOf(k);
+      return i ? json(200, { id: i.id, app_id: GH_APP_ID, account: { login: i.account ?? owner.login, id: owner.id }, permissions: i.permissions, repository_selection: i.repos === "all" ? "all" : "selected" }) : json(404, { message: "Not Found" });
     }
     const i = this.installations.find((x) => x.id === Number(mint![1]));
     if (!i) return json(404, { message: "Not Found" });

@@ -89,11 +89,13 @@ describe("projects", () => {
     expect(await screen.findByRole("heading", { level: 1, name: "Gadgets" })).toBeInTheDocument();
   });
 
-  it("picks the repo from those the App reaches; one already a project's is shown but can't be picked", async () => {
+  const app = { slug: "nest-test", install_url: "https://github.com/apps/nest-test/installations/new" };
+
+  it("picks the repo from those the App reaches; one already a project's is shown but can't be picked; a missing one is added on GitHub", async () => {
     const api = new FakeApi();
     api.attachable = {
       repos: [{ repo: "owner/widgets", project: "prj_one" }, { repo: "owner/gadgets", project: null }],
-      unlisted: ["elsewhere"], complete: true,
+      unlisted: [], complete: true, app,
     };
     const { user } = renderApp("/projects", api);
     await user.click(await screen.findByRole("button", { name: "New project" }));
@@ -101,9 +103,11 @@ describe("projects", () => {
     await user.type(within(d).getByLabelText(/Name/), "Gadgets");
     const picker = await repoPicker(d);
     await waitFor(() => expect(picker).toBeEnabled());
-    // What GitHub couldn't list is a note of its own under the field.
-    expect(within(d).getByText("Some repos aren't listed")).toBeInTheDocument();
-    expect(within(d).getByText(/elsewhere: the App's repos there couldn't be listed just now/)).toBeInTheDocument();
+    // The App by name, and where on GitHub a missing repo is added.
+    expect(within(d).getByText(/Repos the GitHub App nest-test is installed on/)).toBeInTheDocument();
+    expect(within(d).getByText(/Missing one\? Add it to the App's installation/)).toBeInTheDocument();
+    expect(within(d).getByRole("link", { name: /^on\sGitHub$/ })).toHaveAttribute("href", app.install_url);
+    expect(within(d).queryByText("Some repos aren't listed")).toBeNull();
     await user.click(picker);
     const taken = await screen.findByRole("option", { name: "owner/widgets (already a project)" });
     expect(taken).toHaveAttribute("data-combobox-disabled", "true");
@@ -114,13 +118,47 @@ describe("projects", () => {
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects", body: { name: "Gadgets", repo: "owner/gadgets", auto_assign: false, max_workers: 2 } }]));
   });
 
-  it("with nothing to attach, the picker says why and can't be opened", async () => {
+  it("a search that matches nothing says how to add the repo", async () => {
     const api = new FakeApi();
-    api.attachable = { repos: [], unlisted: [], complete: true };
+    api.attachable = { repos: [{ repo: "owner/gadgets", project: null }], unlisted: [], complete: true, app };
     const { user } = renderApp("/projects", api);
     await user.click(await screen.findByRole("button", { name: "New project" }));
     const d = screen.getByRole("dialog", { name: "New project" });
-    expect(await within(d).findByText(/None yet: install the App on an account, with the repos it may work in/)).toBeInTheDocument();
+    const picker = await repoPicker(d);
+    await waitFor(() => expect(picker).toBeEnabled());
+    await user.type(picker, "sprockets");
+    expect(await screen.findByText(/No repo matches/)).toBeInTheDocument();
+    const links = screen.getAllByRole("link", { name: /^on\sGitHub$/ });
+    expect(links.length).toBeGreaterThan(1);
+    expect(links.every((a) => a.getAttribute("href") === app.install_url)).toBe(true);
+  });
+
+  it("what GitHub couldn't list is said line by line, and a repo it may not show can be typed", async () => {
+    const api = new FakeApi();
+    api.attachable = { repos: [{ repo: "owner/gadgets", project: null }], unlisted: ["elsewhere"], complete: false, app };
+    const { user } = renderApp("/projects", api);
+    await user.click(await screen.findByRole("button", { name: "New project" }));
+    const d = screen.getByRole("dialog", { name: "New project" });
+    await user.type(within(d).getByLabelText(/Name/), "Far");
+    await repoPicker(d);
+    expect(within(d).getByText("Some repos aren't listed")).toBeInTheDocument();
+    expect(within(d).getByText(/The App's repos on elsewhere couldn't be listed just now: reopen this form to try again/)).toBeInTheDocument();
+    expect(within(d).getByText(/Only an installation's first 1000 repos are listed/)).toBeInTheDocument();
+    await user.click(within(d).getByRole("button", { name: "Type a repo instead" }));
+    const typed = within(d).getByRole("textbox", { name: /Repository/ });
+    await user.type(typed, "elsewhere/far");
+    await user.click(within(d).getByRole("button", { name: "Create project" }));
+    await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects", body: { name: "Far", repo: "elsewhere/far", auto_assign: false, max_workers: 2 } }]));
+  });
+
+  it("with nothing to attach, the picker says why and where to install the App, and can't be opened", async () => {
+    const api = new FakeApi();
+    api.attachable = { repos: [], unlisted: [], complete: true, app };
+    const { user } = renderApp("/projects", api);
+    await user.click(await screen.findByRole("button", { name: "New project" }));
+    const d = screen.getByRole("dialog", { name: "New project" });
+    expect(await within(d).findByText(/Install the App on an account, or add repos to an installation it already has/)).toBeInTheDocument();
+    expect(within(d).getByRole("link", { name: /^on\sGitHub$/ })).toHaveAttribute("href", app.install_url);
     expect(await repoPicker(d)).toBeDisabled();
     expect(within(d).getByRole("button", { name: "Create project" })).toBeDisabled();
     expect(within(d).queryByText("Some repos aren't listed")).toBeNull();

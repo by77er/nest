@@ -28,6 +28,11 @@ export interface Env {
   GITHUB_APP_ID?: string;
   /** Secret: the App's private key, a PKCS#1 PEM (`BEGIN RSA PRIVATE KEY`) as GitHub hands it out. */
   GITHUB_APP_PRIVATE_KEY?: string;
+  /**
+   * The GitHub account ids, besides the App owner's, whose installations of the App the app acts on (comma or space
+   * separated; `*`: any account, only for an App nobody else can install). README.md#repo-authority.
+   */
+  GITHUB_ACCOUNTS?: string;
   /** `nest`: the app's GitHub tokens come from nest's `POST /v1/clients/self/github-token` (the fallback, for one release); anything else, or unset: from the App. */
   GITHUB_TOKEN_SOURCE?: string;
 }

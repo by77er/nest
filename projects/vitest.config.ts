@@ -61,6 +61,9 @@ export default defineConfig({
                 // The fake GitHub's App (test/fake-nest.ts GH_APP_ID).
                 GITHUB_APP_ID: "4242",
                 GITHUB_APP_PRIVATE_KEY: appKey.privateKey,
+                // Any account's installation: the tests' repos are under many made-up accounts. The tests of the
+                // account allowlist unset it (test/fake-nest.ts withEnv).
+                GITHUB_ACCOUNTS: "*",
                 TEST_GITHUB_APP_PUBLIC_KEY: appKey.publicKey,
               },
             },

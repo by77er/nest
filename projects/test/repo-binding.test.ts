@@ -8,8 +8,10 @@ import { resetAccessKeys } from "../src/access";
 import { applyRename } from "../src/binding";
 import type { RepoBinding } from "../src/do/directory";
 import type { Env } from "../src/env";
+import { PERMISSIONS } from "../src/github";
+import { AppTokens } from "../src/github-app";
 import { nestFrom } from "../src/nest";
-import { AccessTeam, api, deliverGithub, FakeNest, GH_INSTALLATION_ID, GRANT_PERMISSIONS, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf, withNestTokens } from "./fake-nest";
+import { AccessTeam, api, deliverGithub, FakeNest, GH_APP_OWNER, GH_APP_SLUG, GH_INSTALLATION_ID, GRANT_PERMISSIONS, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf, withEnv, withNestTokens } from "./fake-nest";
 
 const fake = new FakeNest();
 const gh = fake.github;
@@ -32,11 +34,11 @@ beforeEach(() => {
   gh.failures = [];
   // The default installation only: each test installs on its own accounts.
   gh.installations = [{ id: GH_INSTALLATION_ID, account: null, repos: "all", permissions: { ...GRANT_PERMISSIONS } }];
+  gh.lookupIgnoresSelection = false;
 });
 
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 10);
-async function newProject() {
-  const repo = `o-${rand()}/r-${rand()}`.toLowerCase();
+async function newProject(repo = `o-${rand()}/r-${rand()}`.toLowerCase()) {
   const p = (await api(token, "POST", "/api/projects", { name: repo, repo })).body;
   // Issues from anyone: these tests route events, renamed and transferred repos' among them.
   await api(token, "PATCH", `/api/projects/${p.id}/settings`, { issues_from: "anyone" });
@@ -637,7 +639,11 @@ describe("the repos the owner may attach (GET /api/repos)", () => {
     const before = grantCalls().length;
     const r = await api(token, "GET", "/api/repos");
     expect(r.status).toBe(200);
-    expect(r.body).toEqual({ repos: [{ repo: `${acct}/picked`, project: null }, { repo: p.repo, project: p.id }], unlisted: [], complete: true });
+    expect(r.body).toEqual({
+      repos: [{ repo: `${acct}/picked`, project: null }, { repo: p.repo, project: p.id }], unlisted: [], complete: true,
+      // The App by name, and where it's installed or its repos chosen.
+      app: { slug: GH_APP_SLUG, install_url: `https://github.com/apps/${GH_APP_SLUG}/installations/new` },
+    });
     expect(grantCalls().length).toBe(before);
     expect((await api(token, "POST", "/api/repos")).status).toBe(405);
   });
@@ -684,3 +690,90 @@ describe("the repos the owner may attach (GET /api/repos)", () => {
     expect(r.body.error).toContain("GitHub couldn't say");
   });
 });
+
+describe("creating a project asks GitHub now", () => {
+  const create = (repo: string) => api(token, "POST", "/api/projects", { name: `n-${rand()}`, repo });
+
+  it("looks the installation up afresh and mints a token for the repo, never a cached one, and revokes it", async () => {
+    const acct = `fresh-${rand()}`;
+    const repo = `${acct}/r`;
+    gh.install({ id: 8_201, account: acct });
+    // A lookup and a token cached from an installation since replaced.
+    await new AppTokens(env as unknown as Env).token(repo, PERMISSIONS.metadata);
+    gh.reinstall(acct, 8_202);
+    const before = gh.mints().length;
+    expect((await create(repo)).status).toBe(201);
+    const check = gh.mints().slice(before)[0]!;
+    expect(check).toEqual({ installation: 8_202, repositories: ["r"], permissions: { metadata: "read" } });
+    expect(gh.callsTo("DELETE", /^\/installation\/token$/).length).toBeGreaterThan(0);
+  });
+
+  it("a repo its account's installation doesn't select is refused (GitHub's 422 at the mint), even with a token cached for it", async () => {
+    const acct = `sel422-${rand()}`;
+    const repo = `${acct}/r`;
+    gh.install({ id: 8_301, account: acct, repos: [repo] });
+    await new AppTokens(env as unknown as Env).token(repo, PERMISSIONS.metadata);
+    // Dropped from the selection; the lookup still answers the account's installation, so only the mint refuses.
+    gh.lookupIgnoresSelection = true;
+    gh.install({ id: 8_301, account: acct, repos: [] });
+    const r = await create(repo);
+    expect(r.status).toBe(403);
+    expect(r.body.error).toContain(repo);
+  });
+
+  it("GitHub's outage is said as one (502), never a refusal", async () => {
+    gh.fail(/^GET \/repos\/[^/]+\/[^/]+\/installation$/, 502, { times: 5 });
+    const r = await create(`out-${rand()}/r`);
+    expect(r.status).toBe(502);
+    expect(r.body.error).toContain("GitHub couldn't say");
+  });
+});
+
+describe("the accounts the app acts for (the App's owner, and GITHUB_ACCOUNTS)", () => {
+  const all = { ...GRANT_PERMISSIONS };
+  const create = (repo: string) => api(token, "POST", "/api/projects", { name: `n-${rand()}`, repo });
+
+  it("by default the App owner's account only: another account's installation isn't listed, attachable, or ever minted for; GITHUB_ACCOUNTS widens it", () => withEnv("GITHUB_ACCOUNTS", undefined, async () => {
+    const mine = `${GH_APP_OWNER}/r-${rand()}`;
+    const stranger = `stranger-${rand()}`;
+    const theirs = `${stranger}/r`;
+    gh.repo(mine);
+    gh.repo(theirs);
+    gh.installations = [
+      { id: 8_001, account: GH_APP_OWNER, repos: "all", permissions: all },
+      { id: 8_002, account: stranger, repos: "all", permissions: all },
+    ];
+    const listed = (await api(token, "GET", "/api/repos")).body.repos.map((x: { repo: string }) => x.repo);
+    expect(listed).toContain(mine);
+    expect(listed).not.toContain(theirs);
+    const refused = await create(theirs);
+    expect(refused.status).toBe(403);
+    expect(refused.body.error).toContain(theirs);
+    expect((await create(mine)).status).toBe(201);
+    expect(gh.mints().filter((m) => m.installation === 8_002)).toEqual([]);
+    // The operator adds the account: listed and attachable.
+    await withEnv("GITHUB_ACCOUNTS", String(ownerIdOf(stranger)), async () => {
+      expect((await api(token, "GET", "/api/repos")).body.repos.map((x: { repo: string }) => x.repo)).toContain(theirs);
+      expect((await create(theirs)).status).toBe(201);
+    });
+  }));
+
+  it("a repo transferred to another account's installation isn't followed: its events are refused, its reads too, and nothing is minted there", () => withEnv("GITHUB_ACCOUNTS", undefined, async () => {
+    const p = await newProject(`${GH_APP_OWNER}/r-${rand()}`);
+    expect((await binding(p)).installation_id).toBe(GH_INSTALLATION_ID);
+    const stranger = `stranger-${rand()}`;
+    const to = `${stranger}/moved`;
+    gh.install({ id: 8_102, account: stranger });
+    gh.rename(p.repo, to);
+    const r = await deliverGithub("issues", { ...issue(1, { id: repoIdOf(p.repo), full_name: to }), installation: { id: 8_102 } });
+    expect(((await r.json()) as { ignored: string }).ignored).toContain("isn't the project's");
+    const rr = await reread(p);
+    expect(rr.status).toBe(409);
+    expect(rr.body.error).toContain("not one the app acts for");
+    expect((await sync()).status).toBe(200);
+    expect(await binding(p)).toMatchObject({ repo: p.repo, installation_id: GH_INSTALLATION_ID });
+    expect(await numbers(p)).toEqual([]);
+    expect(gh.mints().filter((m) => m.installation === 8_102)).toEqual([]);
+  }));
+});
+

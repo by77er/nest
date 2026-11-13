@@ -76,12 +76,14 @@ export interface OpenPr {
 /**
  * `GET /api/repos`: the repos the owner may attach a project to (those the app's GitHub App's installations
  * reach, as GitHub answers), each with the project already on it; the accounts whose installation's repos
- * couldn't be listed just now (`unlisted`), and whether every listing was whole (`complete`).
+ * couldn't be listed just now (`unlisted`), whether every listing was whole (`complete`), and the App (`app`).
  */
 export interface AttachableRepos {
   repos: { repo: string; project: string | null }[];
   unlisted: string[];
   complete: boolean;
+  /** The GitHub App by its slug, and its installation page (install it, or choose an installation's repos); null when GitHub didn't name it. */
+  app: { slug: string; install_url: string } | null;
 }
 /** `POST /api/projects`. */
 export type CreatedProject = ProjectRow & { settings: Settings | null; catalog_synced: boolean };

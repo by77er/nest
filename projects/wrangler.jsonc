@@ -47,4 +47,6 @@
   // Put by hand (`wrangler secret put`, README.md#setup-the-operators), not by the workflow:
   // - GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY: the app's own GitHub App, its id and its PKCS#1 PEM (README.md#github-tokens).
   // - GITHUB_TOKEN_SOURCE: `nest` only to take GitHub tokens from nest again (the fallback, for one release).
+  // Optional var: GITHUB_ACCOUNTS, account ids besides the App owner's whose installations the app acts on
+  // (README.md#repo-authority). Unset: the App owner's account only.
 }

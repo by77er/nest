@@ -192,7 +192,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     try {
       const r = await attachableRepos(env);
       const byRepo = new Map((await directory(env).projects()).map((p) => [p.repo.toLowerCase(), p.id]));
-      return json({ repos: r.repos.map((repo) => ({ repo, project: byRepo.get(repo) ?? null })), unlisted: r.unlisted, complete: r.complete });
+      return json({ repos: r.repos.map((repo) => ({ repo, project: byRepo.get(repo) ?? null })), unlisted: r.unlisted, complete: r.complete, app: r.app });
     } catch (e) {
       return err(502, `GitHub couldn't say which repos the app's GitHub App reaches: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -226,7 +226,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       } catch (e) {
         return err(502, `GitHub couldn't say whether the app's GitHub App reaches ${b.value.repo}: ${e instanceof Error ? e.message : String(e)}`);
       }
-      if (!ok) return err(403, `the app's GitHub App doesn't reach ${b.value.repo}: install it on the repo's account, with the repo among its installation's repos`);
+      if (!ok) return err(403, `the GitHub App doesn't reach ${b.value.repo}: install it on the repo's account (one the app acts for), with the repo among its installation's repos`);
     }
     // Pending first, then finished here; should this request fail or die half-way, DirectoryDO's alarm
     // finishes it (README.md#creating-a-project). The same repo asked for again while pending resumes it.
