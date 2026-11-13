@@ -17,6 +17,7 @@ import { followInstallation } from "./binding";
 import { issueEventOf, type PrComment } from "./do/project";
 import { directory, type Env, project, review } from "./env";
 import { appBotId, CHECK_NAME, verifyGithubSignature } from "./github";
+import { AppTokens, tokenSource } from "./github-app";
 import { nestFrom } from "./nest";
 import type { TrustedIds } from "./review-trust";
 
@@ -196,12 +197,30 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
   }
 }
 
+/**
+ * Whether the event's repo owner is an account the app acts for (README.md#repo-authority), for a binding with no
+ * installation known yet: the App's answer (its owner, or GITHUB_ACCOUNTS); false when that can't be had (fails
+ * closed); null in the fallback (nest's tokens), where nest's grant decides.
+ */
+async function repoOwnerAllowed(env: Env, payload: Obj): Promise<boolean | null> {
+  const nest = nestFrom(env);
+  if (!nest || !(tokenSource(env, nest) instanceof AppTokens)) return null;
+  try {
+    return await new AppTokens(env).allows(prNumber(obj(obj(payload.repository).owner).id));
+  } catch (e) {
+    console.warn(`the accounts the app acts for couldn't be read: ${String(e).slice(0, 200)}`);
+    return false;
+  }
+}
+
 async function handle(env: Env, event: string, payload: Obj, seenId: string): Promise<Response> {
   const dir = directory(env);
   // By the repo's id (README.md#built-the-review-pipeline): a rename or a transfer changes the name, never the id.
   // And by the App installation the event came from, once the project's is known (README.md#the-repos-binding).
   const installation = repoId(payload.installation);
-  const route = () => dir.projectForRepo(repoId(payload.repository), str(obj(payload.repository).full_name) ?? null, installation);
+  // With no installation known for the project yet, the repo's owner must be an account the app acts for.
+  const ownerAllowed = await repoOwnerAllowed(env, payload);
+  const route = () => dir.projectForRepo(repoId(payload.repository), str(obj(payload.repository).full_name) ?? null, installation, ownerAllowed);
   let routed = await route();
   // Another installation than the binding's: the binding is read again, to follow the App's installation on the
   // repo as GitHub answers it now (a reinstalled App), and the event routed again if the binding's changed.

@@ -2,25 +2,34 @@
 // schema (src/requests.ts) before it's sent. The repo is picked from those the GitHub App reaches
 // (GET /api/repos: GitHub decides, each installation's own repos, on the accounts the app acts for); a repo
 // already a project's is shown but can't be picked. A repo missing from the list is added on GitHub (the App's
-// installation page, linked); one the list may not show (an installation it couldn't read, or past its cap) can be
+// installation page, a button under the field; GitHub's installed-Apps settings when the App isn't named); one the
+// list may not show (an installation it couldn't read, or past its cap) can be
 // typed, and the Worker checks it at create. If the list can't be had at all, the name is typed.
 
 import { Anchor, Button, NumberInput, Select, Switch, Text, TextInput } from "@mantine/core";
+import { IconExternalLink } from "@tabler/icons-react";
 import { schemaResolver, useForm } from "@mantine/form";
-import { type ReactNode, useState } from "react";
+import { useState } from "react";
 import { CreateProject } from "../../../requests";
 import { useAttachableRepos, useCreateProject } from "../../api/queries";
 import type { AttachableRepos, CreatedProject } from "../../api/types";
-import { FieldGroup, Notice, Stack } from "../../layout";
+import { FieldGroup, icon, Notice, Stack } from "../../layout";
 
 /**
- * "on GitHub", linking the App's installation page there (where it's installed on an account, or an installation's
- * repos are chosen): short and unbroken, so it's one tap target on a phone. Plain words when the App isn't named.
+ * Where on GitHub the App is installed on an account, or an installation's repos are chosen: its installation page,
+ * or, when GitHub didn't name the App, the account's installed-Apps settings (an organization's are under its own
+ * settings).
+ */
+const GITHUB_INSTALLATIONS = "https://github.com/settings/installations";
+const installUrl = (r: AttachableRepos) => r.app?.install_url ?? GITHUB_INSTALLATIONS;
+
+/**
+ * "on GitHub" in a sentence (the no-match message), linking the same place as the "Open on GitHub" button under the
+ * field, its large-target equivalent: short and unbroken, so it's one tap target on a phone.
  */
 function OnGitHub({ r }: { r: AttachableRepos }) {
-  if (!r.app) return <>on&nbsp;GitHub</>;
   return (
-    <Anchor href={r.app.install_url} target="_blank" rel="noreferrer" inherit lh="lg" data-inline>
+    <Anchor href={installUrl(r)} target="_blank" rel="noreferrer" inherit lh="lg" data-inline>
       on&nbsp;GitHub
     </Anchor>
   );
@@ -35,16 +44,25 @@ function pickerDescription(r: AttachableRepos): string {
   return r.repos.length ? said : `${said} None yet.`;
 }
 
-/** The line under the picker: how a repo that's missing (or, with none, the first one) gets added, on GitHub. */
-function addRepoLine(r: AttachableRepos): ReactNode {
-  return r.repos.length ? (
-    <>
-      Missing one? Add it to the App&apos;s installation <OnGitHub r={r} />, then reopen this form.
-    </>
-  ) : (
-    <>
-      Install the App on an account, or add repos to an installation it already has (<OnGitHub r={r} />), then reopen this form.
-    </>
+/** The help under the picker: how a repo that's missing (or, with none, the first one) gets added on GitHub. */
+function addRepoLine(r: AttachableRepos): string {
+  const where = r.app ? "the App's installation" : "the App's installation (under Installed GitHub Apps in the account's settings)";
+  return r.repos.length
+    ? `Missing one? Add it to ${where}, then reopen this form.`
+    : `Install the App on an account, or add repos to ${r.app ? "an installation it already has" : where}, then reopen this form.`;
+}
+
+/** The help under the picker, with the way to GitHub as a real control beside it. */
+function AddRepoHelp({ r }: { r: AttachableRepos }) {
+  return (
+    <Stack gap="xs" align="flex-start">
+      <Text size="xs" c="dimmed">
+        {addRepoLine(r)}
+      </Text>
+      <Button variant="default" component="a" href={installUrl(r)} target="_blank" rel="noreferrer" leftSection={<IconExternalLink size={icon.md} />}>
+        Open on GitHub
+      </Button>
+    </Stack>
   );
 }
 
@@ -98,8 +116,8 @@ export function CreateProjectForm({ onCreated, onCancel }: { onCreated: (p: Crea
             label="Repository"
             description={
               repos.isError
-                ? "The repos couldn't be listed just now. Type it as owner/name: the GitHub App must be installed on it."
-                : "As owner/name. The GitHub App must reach it; that's checked when the project is created."
+                ? "The repos couldn't be listed just now. Type it as owner/name: the GitHub App must be installed on it, with it among the installation's repos."
+                : "As owner/name. The GitHub App must be installed on it, with it among the installation's repos; that's checked when the project is created."
             }
             placeholder="owner/name"
             withAsterisk
@@ -109,31 +127,29 @@ export function CreateProjectForm({ onCreated, onCancel }: { onCreated: (p: Crea
             {...form.getInputProps("repo")}
           />
         ) : (
-          <Select
-            label="Repository"
-            description={repos.data ? pickerDescription(repos.data) : "Loading the repos the GitHub App is installed on…"}
-            placeholder={repos.data ? "Pick a repo" : "Loading…"}
-            withAsterisk
-            searchable
-            nothingFoundMessage={
-              repos.data ? (
-                <>
-                  No repo matches. Add it to the App&apos;s installation <OnGitHub r={repos.data} />, then reopen this form.
-                </>
-              ) : (
-                "No repo matches"
-              )
-            }
-            disabled={!repos.data || repos.data.repos.length === 0}
-            data={pickerOptions(repos.data)}
-            key={form.key("repo")}
-            {...form.getInputProps("repo")}
-          />
-        )}
-        {repos.data && !typing && (
-          <Text size="sm" lh="lg">
-            {addRepoLine(repos.data)}
-          </Text>
+          <Stack gap="xs">
+            <Select
+              label="Repository"
+              description={repos.data ? pickerDescription(repos.data) : "Loading the repos the GitHub App is installed on…"}
+              placeholder={repos.data ? "Pick a repo" : "Loading…"}
+              withAsterisk
+              searchable
+              nothingFoundMessage={
+                repos.data ? (
+                  <>
+                    No repo matches. Add it to the App&apos;s installation <OnGitHub r={repos.data} />, then reopen this form.
+                  </>
+                ) : (
+                  "No repo matches"
+                )
+              }
+              disabled={!repos.data || repos.data.repos.length === 0}
+              data={pickerOptions(repos.data)}
+              key={form.key("repo")}
+              {...form.getInputProps("repo")}
+            />
+            {repos.data && <AddRepoHelp r={repos.data} />}
+          </Stack>
         )}
         {repos.data && partial && (
           <Notice tone="info" title="Some repos aren't listed">

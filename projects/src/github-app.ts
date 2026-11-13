@@ -122,7 +122,7 @@ interface AppCache {
   key: Promise<CryptoKey> | null;
   jwt: { value: string; exp_s: number } | null;
   /** The App itself (`GET /app`): its slug, and the id of the account that owns it. */
-  identity: { slug: string | null; owner: number | null } | null;
+  identity: { slug: string | null; owner: number } | null;
   /** Each repo's installation as last looked up: its id, its account's id, and when. */
   installations: Map<string, { id: number; account: number | null; at_ms: number }>;
   tokens: Map<number, Map<string, { token: string; expires_ms: number }>>;
@@ -200,12 +200,22 @@ export class AppTokens implements TokenSource {
     for (const [repo, i] of app.installations) if (i.id === id) app.installations.delete(repo);
   }
 
-  /** The App itself (`GET /app` with its JWT), kept for the isolate: its slug, and the id of the account owning it. */
-  private async identity(app: AppCache): Promise<{ slug: string | null; owner: number | null }> {
+  /**
+   * The App itself (`GET /app` with its JWT), kept for the isolate: its slug, and the id of the account owning it.
+   * An answer naming no owner is GitHub's trouble (502), never kept: the allowlist can't be had without it.
+   */
+  private async identity(app: AppCache): Promise<{ slug: string | null; owner: number }> {
     if (app.identity) return app.identity;
     const r = await this.withJwt<{ slug?: unknown; owner?: { id?: unknown } | null }>(app, "GET", "/app");
-    app.identity = { slug: typeof r?.slug === "string" && r.slug ? r.slug : null, owner: positiveId(r?.owner?.id) };
+    const owner = positiveId(r?.owner?.id);
+    if (owner === null) throw new GitHubError(502, "GitHub's answer for the App (GET /app) names no owner", false);
+    app.identity = { slug: typeof r?.slug === "string" && r.slug ? r.slug : null, owner };
     return app.identity;
+  }
+
+  /** Whether the app acts for account `id` (README.md#repo-authority): for an event's repo owner, where no installation decides. */
+  async allows(id: number | null): Promise<boolean> {
+    return this.accountAllowed(this.app(), id);
   }
 
   /**

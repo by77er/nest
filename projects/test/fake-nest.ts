@@ -803,6 +803,8 @@ export class FakeGitHub {
    * the repo (whether GitHub does is unverified): then only the mint narrowed to it refuses (422).
    */
   lookupIgnoresSelection = false;
+  /** Answer `GET /app` without its `owner` (as a malformed answer would). */
+  appOwnerMissing = false;
   /** How long an installation token lives (GitHub's: an hour). */
   tokenLifeMs = 3_600_000;
   /** The claims of each App JWT GitHub accepted, in order. */
@@ -930,7 +932,7 @@ export class FakeGitHub {
       f.times--;
       return json(f.status, { message: f.message ?? "injected" });
     }
-    if (route === "GET /app") return json(200, { id: GH_APP_ID, slug: GH_APP_SLUG, name: "nest test", owner: { login: GH_APP_OWNER, id: ownerIdOf(GH_APP_OWNER), type: "User" } });
+    if (route === "GET /app") return json(200, { id: GH_APP_ID, slug: GH_APP_SLUG, name: "nest test", ...(this.appOwnerMissing ? {} : { owner: { login: GH_APP_OWNER, id: ownerIdOf(GH_APP_OWNER), type: "User" } }) });
     if (route === "GET /app/installations") {
       const page = Number(u.searchParams.get("page") ?? "1");
       const per = Number(u.searchParams.get("per_page") ?? "30");
@@ -956,7 +958,7 @@ export class FakeGitHub {
     // No repos named: every repo of the installation.
     if (names === undefined) {
       const t: FakeToken = { repo: null, name: null, all: true, permissions, installation: i.id, expires_ms: Date.now() + this.tokenLifeMs };
-      return json(201, { token: this.issue(t), expires_at: new Date(t.expires_ms).toISOString(), permissions, repository_selection: i.repos === "all" ? "all" : "selected" });
+      return json(201, { token: this.issued(t, undefined), expires_at: new Date(t.expires_ms).toISOString(), permissions, repository_selection: i.repos === "all" ? "all" : "selected" });
     }
     // One repo by name, as the app asks (an installation is one account's; the default one's names aren't pinned to one).
     if (!Array.isArray(names) || names.length !== 1 || typeof names[0] !== "string") return json(422, { message: "the fake mints for exactly one repo by name" });
@@ -966,7 +968,7 @@ export class FakeGitHub {
     const full = i.account === null ? null : this.repos.has(`${i.account}/${name}`) ? `${i.account}/${name}` : [...this.renamed].find(([from, to]) => from.split("/")[1] === name && to.split("/")[0] === i.account)?.[1] ?? `${i.account}/${name}`;
     if (full !== null && this.installationFor(full)?.id !== i.id) return json(422, { message: `There is at least one repository that does not exist or is not accessible to the parent installation.` });
     const t: FakeToken = { repo: full, name: i.account === null ? name : null, permissions, installation: i.id, expires_ms: Date.now() + this.tokenLifeMs };
-    return json(201, { token: this.issue(t), expires_at: new Date(t.expires_ms).toISOString(), permissions, repository_selection: "selected" });
+    return json(201, { token: this.issued(t, [name]), expires_at: new Date(t.expires_ms).toISOString(), permissions, repository_selection: "selected" });
   }
 
   /** A PR on `repo` (open, from the repo itself, unless `o` says otherwise). */
@@ -1020,6 +1022,15 @@ export class FakeGitHub {
 
   callsTo(method: string, path: RegExp) {
     return this.calls.filter((c) => c.method === method && path.test(c.path));
+  }
+
+  /** Each token the App's mints were answered with, in order: which installation, repos and permissions. */
+  readonly minted: { token: string; installation: number; repositories: string[] | undefined; permissions: Record<string, string> }[] = [];
+
+  private issued(t: FakeToken, repositories: string[] | undefined): string {
+    const token = this.issue(t);
+    this.minted.push({ token, installation: t.installation!, repositories, permissions: t.permissions });
+    return token;
   }
 
   /** The App's mints (`POST /app/installations/<id>/access_tokens`): the installation, and the body's repos and permissions. */

@@ -106,7 +106,7 @@ describe("projects", () => {
     // The App by name, and where on GitHub a missing repo is added.
     expect(within(d).getByText(/Repos the GitHub App nest-test is installed on/)).toBeInTheDocument();
     expect(within(d).getByText(/Missing one\? Add it to the App's installation/)).toBeInTheDocument();
-    expect(within(d).getByRole("link", { name: /^on\sGitHub$/ })).toHaveAttribute("href", app.install_url);
+    expect(within(d).getByRole("link", { name: "Open on GitHub" })).toHaveAttribute("href", app.install_url);
     expect(within(d).queryByText("Some repos aren't listed")).toBeNull();
     await user.click(picker);
     const taken = await screen.findByRole("option", { name: "owner/widgets (already a project)" });
@@ -128,9 +128,9 @@ describe("projects", () => {
     await waitFor(() => expect(picker).toBeEnabled());
     await user.type(picker, "sprockets");
     expect(await screen.findByText(/No repo matches/)).toBeInTheDocument();
-    const links = screen.getAllByRole("link", { name: /^on\sGitHub$/ });
-    expect(links.length).toBeGreaterThan(1);
-    expect(links.every((a) => a.getAttribute("href") === app.install_url)).toBe(true);
+    // The sentence's link, and the button under the field: the same place.
+    expect(screen.getByRole("link", { name: /^on\sGitHub$/ })).toHaveAttribute("href", app.install_url);
+    expect(within(d).getByRole("link", { name: "Open on GitHub" })).toHaveAttribute("href", app.install_url);
   });
 
   it("what GitHub couldn't list is said line by line, and a repo it may not show can be typed", async () => {
@@ -158,10 +158,21 @@ describe("projects", () => {
     await user.click(await screen.findByRole("button", { name: "New project" }));
     const d = screen.getByRole("dialog", { name: "New project" });
     expect(await within(d).findByText(/Install the App on an account, or add repos to an installation it already has/)).toBeInTheDocument();
-    expect(within(d).getByRole("link", { name: /^on\sGitHub$/ })).toHaveAttribute("href", app.install_url);
+    expect(within(d).getByRole("link", { name: "Open on GitHub" })).toHaveAttribute("href", app.install_url);
     expect(await repoPicker(d)).toBeDisabled();
     expect(within(d).getByRole("button", { name: "Create project" })).toBeDisabled();
     expect(within(d).queryByText("Some repos aren't listed")).toBeNull();
+  });
+
+  it("with the App not named, the way to GitHub is the account's installed-Apps settings", async () => {
+    const api = new FakeApi();
+    api.attachable = { repos: [{ repo: "owner/gadgets", project: null }], unlisted: [], complete: true, app: null };
+    const { user } = renderApp("/projects", api);
+    await user.click(await screen.findByRole("button", { name: "New project" }));
+    const d = screen.getByRole("dialog", { name: "New project" });
+    expect(await within(d).findByText(/Repos the GitHub App is installed on/)).toBeInTheDocument();
+    expect(within(d).getByText(/under Installed GitHub Apps in the account's settings/)).toBeInTheDocument();
+    expect(within(d).getByRole("link", { name: "Open on GitHub" })).toHaveAttribute("href", "https://github.com/settings/installations");
   });
 
   it("says when the list can't be loaded", async () => {

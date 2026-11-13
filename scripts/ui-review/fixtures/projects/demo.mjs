@@ -495,6 +495,8 @@ const RICH = [
       const app = { slug: "nest-by77er", install_url: "https://github.com/apps/nest-by77er/installations/new" };
       if (variant === "repos-failed") return [502, { error: "GitHub couldn't say which repos the app's GitHub App reaches: GitHub 502: no answer within 20000 ms (fixture)" }];
       if (variant === "repos-none") return [200, { complete: true, unlisted: [], repos: [], app }];
+      // GitHub didn't name the App: the way to it is the account's installed-Apps settings.
+      if (variant === "repos-noapp") return [200, { complete: true, unlisted: [], repos: [{ repo, project: demo.id }, { repo: "by77er/sprockets", project: null }], app: null }];
       const attached = [{ repo, project: demo.id }, { repo: other.repo, project: other.id }];
       if (variant === "repos-many") {
         return [200, { complete: true, unlisted: [], app, repos: [...attached,

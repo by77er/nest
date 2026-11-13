@@ -9,7 +9,7 @@ import { applyRename } from "../src/binding";
 import type { RepoBinding } from "../src/do/directory";
 import type { Env } from "../src/env";
 import { PERMISSIONS } from "../src/github";
-import { AppTokens } from "../src/github-app";
+import { AppTokens, resetAppTokens } from "../src/github-app";
 import { nestFrom } from "../src/nest";
 import { AccessTeam, api, deliverGithub, FakeNest, GH_APP_OWNER, GH_APP_SLUG, GH_INSTALLATION_ID, GRANT_PERMISSIONS, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf, withEnv, withNestTokens } from "./fake-nest";
 
@@ -239,8 +239,8 @@ describe("the App installation", () => {
     });
   });
 
-  it("a project with none yet takes events as before, until a sync reads it; then it's held to it", async () => {
-    const p = await newProject();
+  it("a project with none yet takes events as before (its repo owner the App's), until a sync reads it; then it's held to it", async () => {
+    const p = await newProject(`${GH_APP_OWNER}/r-${rand()}`);
     await dirSql("UPDATE projects SET installation_id = NULL WHERE id = ?", p.id);
     await deliverGithub("issues", { ...issue(1, { full_name: p.repo }), installation: { id: 5 } });
     expect(await numbers(p)).toEqual([1]);
@@ -248,6 +248,31 @@ describe("the App installation", () => {
     expect((await binding(p)).installation_id).toBe(GH_INSTALLATION_ID);
     await deliverGithub("issues", { ...issue(2, { full_name: p.repo }), installation: { id: 5 } });
     expect(await numbers(p)).toEqual([1]);
+  });
+
+  it("a project with none yet refuses its events while the accounts the app acts for can't be read (GET /app failing): fails closed", async () => {
+    const p = await newProject(`${GH_APP_OWNER}/r-${rand()}`);
+    await dirSql("UPDATE projects SET installation_id = NULL WHERE id = ?", p.id);
+    resetAppTokens();
+    gh.fail(/^GET \/app$/, 502, { times: 20 });
+    const r = await deliverGithub("issues", { ...issue(1, { full_name: p.repo }), installation: { id: 5 } });
+    expect(((await r.json()) as { ignored: string }).ignored).toContain("repo owner isn't an account the app acts for");
+    expect(await numbers(p)).toEqual([]);
+  });
+
+  it("a project with none yet refuses an event whose repo owner isn't an account the app acts for, until GITHUB_ACCOUNTS names it", async () => {
+    const p = await newProject();
+    await dirSql("UPDATE projects SET installation_id = NULL WHERE id = ?", p.id);
+    // Its installation can't be read meanwhile (so the refused event's re-read binds none).
+    gh.fail(new RegExp(`^GET /repos/${p.repo}/installation$`), 502, { times: 10 });
+    const r = await deliverGithub("issues", { ...issue(1, { full_name: p.repo }), installation: { id: 5 } });
+    expect(((await r.json()) as { ignored: string }).ignored).toContain("repo owner isn't an account the app acts for");
+    expect(await numbers(p)).toEqual([]);
+    expect((await binding(p)).refused).toMatchObject({ count: 1 });
+    await withEnv("GITHUB_ACCOUNTS", String(ownerIdOf(p.repo.split("/")[0]!)), async () => {
+      await deliverGithub("issues", { ...issue(2, { full_name: p.repo }), installation: { id: 5 } });
+    });
+    expect(await numbers(p)).toEqual([2]);
   });
 
   it("a project bound from an event (name only) is held to a stored installation too", async () => {
@@ -510,7 +535,8 @@ describe("a sync reads again what may have moved", () => {
 
 describe("a binding not read from GitHub yet (no id, or one from an event)", () => {
   it("an event routed by the repo's name alone trusts nobody by owning it", async () => {
-    const p = await newProject();
+    // A repo of the App owner's account: a binding with no installation takes only its events.
+    const p = await newProject(`${GH_APP_OWNER}/r-${rand()}`);
     // Someone else is the comments user, so only ownership is tested.
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { comments_from_id: 4321, issues_from: "trusted" });
     await dirSql("UPDATE projects SET repo_id = NULL, repo_bound = NULL, installation_id = NULL WHERE id = ?", p.id);
@@ -701,11 +727,60 @@ describe("creating a project asks GitHub now", () => {
     // A lookup and a token cached from an installation since replaced.
     await new AppTokens(env as unknown as Env).token(repo, PERMISSIONS.metadata);
     gh.reinstall(acct, 8_202);
-    const before = gh.mints().length;
+    const before = gh.minted.length;
     expect((await create(repo)).status).toBe(201);
-    const check = gh.mints().slice(before)[0]!;
-    expect(check).toEqual({ installation: 8_202, repositories: ["r"], permissions: { metadata: "read" } });
-    expect(gh.callsTo("DELETE", /^\/installation\/token$/).length).toBeGreaterThan(0);
+    const check = gh.minted.slice(before)[0]!;
+    expect(check).toMatchObject({ installation: 8_202, repositories: ["r"], permissions: { metadata: "read" } });
+    // That very token revoked: GitHub was asked to, with it, and knows it no more.
+    expect(gh.callsTo("DELETE", /^\/installation\/token$/).some((c) => c.token === check.token)).toBe(true);
+    expect(gh.tokens.has(check.token)).toBe(false);
+  });
+
+  it("a failing GET /app (the App's owner unknown) fails closed: nothing minted, a create is GitHub's outage (502), and the listing isn't widened", () => withEnv("GITHUB_ACCOUNTS", undefined, async () => {
+    // Nothing known of the App yet in this isolate.
+    resetAppTokens();
+    const acct = `noapp-${rand()}`;
+    const repo = `${acct}/r`;
+    gh.install({ id: 8_401, account: acct, accountId: ownerIdOf(acct) });
+    gh.fail(/^GET \/app$/, 502, { times: 20 });
+    const before = gh.minted.length;
+    const r = await create(repo);
+    expect(r.status).toBe(502);
+    expect(gh.minted.length).toBe(before);
+    const listed = await api(token, "GET", "/api/repos");
+    expect(listed.status).toBe(502);
+    expect(gh.minted.length).toBe(before);
+    gh.failures = [];
+  }));
+
+  it("an answer from GET /app naming no owner isn't kept: refused as GitHub's trouble (502), and the next answer counts", () => withEnv("GITHUB_ACCOUNTS", undefined, async () => {
+    resetAppTokens();
+    const repo = `${GH_APP_OWNER}/r-${rand()}`;
+    gh.appOwnerMissing = true;
+    try {
+      const r = await create(repo);
+      expect(r.status).toBe(502);
+      expect(r.body.error).toContain("names no owner");
+    } finally {
+      gh.appOwnerMissing = false;
+    }
+    expect((await create(repo)).status).toBe(201);
+  }));
+
+  it("a cached lookup is checked again against the accounts the app acts for: one narrowed out since is refused, nothing minted", async () => {
+    const acct = `narrowed-${rand()}`;
+    const repo = `${acct}/r`;
+    gh.install({ id: 8_501, account: acct, accountId: ownerIdOf(acct) });
+    const src = new AppTokens(env as unknown as Env);
+    await withEnv("GITHUB_ACCOUNTS", String(ownerIdOf(acct)), () => src.token(repo, PERMISSIONS.metadata));
+    const lookups = gh.callsTo("GET", new RegExp(`^/repos/${repo}/installation$`)).length;
+    const before = gh.minted.length;
+    await withEnv("GITHUB_ACCOUNTS", undefined, async () => {
+      await expect(src.token(repo, PERMISSIONS.checks)).rejects.toMatchObject({ status: 404, message: expect.stringContaining("not one the app acts for") });
+    });
+    expect(gh.minted.length).toBe(before);
+    // Refused at the lookup GitHub answered again (the cached one no longer counts).
+    expect(gh.callsTo("GET", new RegExp(`^/repos/${repo}/installation$`)).length).toBe(lookups + 1);
   });
 
   it("a repo its account's installation doesn't select is refused (GitHub's 422 at the mint), even with a token cached for it", async () => {
