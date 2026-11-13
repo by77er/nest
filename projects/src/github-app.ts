@@ -224,21 +224,29 @@ export class AppTokens implements TokenSource {
     const app = this.app();
     const appId = Number(app.appId);
     const k = repo.toLowerCase();
-    const installation = await this.installation(repo, o.fresh === true);
     const key = `${k}|${permissionsKey(permissions)}`;
-    const stale = () => {
-      app.tokens.get(installation)?.delete(key);
-      if (app.installations.get(k)?.id === installation) app.installations.delete(k);
+    const reusable = (installation: number) => {
+      const t = app.tokens.get(installation)?.get(key);
+      return t && t.expires_ms - Date.now() > TOKEN_REUSE_MS ? t : null;
     };
+    const minted = (token: string, installation: number): Minted => ({
+      token, appId, installationId: installation,
+      stale: () => {
+        app.tokens.get(installation)?.delete(key);
+        if (app.installations.get(k)?.id === installation) app.installations.delete(k);
+      },
+    });
     // Which repos the app acts on is GitHub's to say (README.md#repo-authority): the App's installation's own
-    // selection, which the lookup and the mint narrowed to the repo enforce. nest's grant isn't asked.
-    const have = app.tokens.get(installation)?.get(key);
-    if (have && have.expires_ms - Date.now() > TOKEN_REUSE_MS) return { token: have.token, appId, installationId: installation, stale };
+    // selection, on an account the app may act on, which the lookup (its account checked) and the mint narrowed to
+    // the repo enforce. nest's grant isn't asked.
+    const installation = await this.installation(repo, o.fresh === true);
+    const cached = reusable(installation);
+    if (cached) return minted(cached.token, installation);
     // One repo (by name: an installation is one account's) and these permissions only.
     const t = await this.mint(app, installation, repo.split("/")[1]!, permissions);
     // Stored only while the repo's lookup still answers this installation (another may have replaced it meanwhile).
     if (app.installations.get(k)?.id === installation) this.keep(app, installation, key, t);
-    return { token: t.token, appId, installationId: installation, stale };
+    return minted(t.token, installation);
   }
 
   private keep(app: AppCache, installation: number, key: string, t: { token: string; expires_ms: number }): void {
