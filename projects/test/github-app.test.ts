@@ -204,12 +204,13 @@ describe("installation tokens", () => {
     expect(appTokenCache().tokens.filter((t) => t.installation === 9_201)).toEqual([]);
   });
 
-  it("are refused, as nest refused its own, for a repo or a permission outside nest's grant: nothing minted", async () => {
+  it("are refused, as nest refused its own, for a repo or a permission outside nest's grant: before any GitHub call", async () => {
     const repo = newRepo();
     const src = new AppTokens(appEnv, nest());
     const before = gh.mints().length;
     fake.grantRepos = ["someone/else"];
     await expect(src.token(repo, PERMISSIONS.metadata)).rejects.toSatisfy((e) => e instanceof NestError && e.status === 403 && e.permanent);
+    expect(lookups(repo)).toBe(0);
     fake.grantRepos = null;
     const saved = GRANT_PERMISSIONS.issues;
     delete GRANT_PERMISSIONS.issues;
@@ -219,10 +220,56 @@ describe("installation tokens", () => {
       GRANT_PERMISSIONS.issues = saved!;
     }
     expect(gh.mints().length).toBe(before);
-    // A binding's read checks the grant even with a token cached.
+    // A binding's read checks the grant even with a token cached, before looking anything up or dropping anything.
     await src.token(repo, PERMISSIONS.metadata);
+    const looked = lookups(repo);
     fake.grantRepos = ["someone/else"];
     await expect(src.token(repo, PERMISSIONS.metadata, { fresh: true })).rejects.toMatchObject({ status: 403 });
+    expect(lookups(repo)).toBe(looked);
+    expect(appTokenCache().tokens.filter((t) => t.key.startsWith(repo))).toHaveLength(1);
+    // A call that isn't a binding's read takes the cached token without asking nest (README.md#github-tokens: the window).
+    const asked = fake.calls.length;
+    await src.token(repo, PERMISSIONS.metadata);
+    expect(fake.calls.length).toBe(asked);
+  });
+
+  it("a mint GitHub answers 404 (the installation gone) drops the installation and its tokens: the next call looks it up again", async () => {
+    const repo = newRepo();
+    gh.install({ id: 9_401, account: repo.split("/")[0]! });
+    const src = new AppTokens(appEnv, nest());
+    await src.token(repo, PERMISSIONS.metadata);
+    expect(lookups(repo)).toBe(1);
+    gh.fail(/^POST \/app\/installations\/9401\/access_tokens$/, 404);
+    await expect(src.token(repo, PERMISSIONS.checks)).rejects.toMatchObject({ status: 404 });
+    expect(appTokenCache().tokens.filter((t) => t.installation === 9_401)).toEqual([]);
+    await src.token(repo, PERMISSIONS.metadata);
+    expect(lookups(repo)).toBe(2);
+  });
+
+  it("a token minted while the repo's lookup moved to another installation isn't kept", async () => {
+    const repo = newRepo();
+    const src = new AppTokens(appEnv, nest());
+    let release!: () => void;
+    const hold = { match: new RegExp(`^POST /app/installations/${GH_INSTALLATION_ID}/access_tokens$`), release: new Promise<void>((r) => { release = r; }), reached: false };
+    gh.holds.push(hold);
+    const first = src.token(repo, PERMISSIONS.checks);
+    await vi.waitFor(() => expect(hold.reached).toBe(true));
+    // Meanwhile the repo's account gets an installation of its own, and a binding's read sees it.
+    gh.install({ id: 9_501, account: repo.split("/")[0]! });
+    expect((await src.token(repo, PERMISSIONS.metadata, { fresh: true })).installationId).toBe(9_501);
+    release();
+    expect((await first).installationId).toBe(GH_INSTALLATION_ID);
+    expect(appTokenCache().tokens.filter((t) => t.key.startsWith(repo))).toEqual([expect.objectContaining({ installation: 9_501 })]);
+  });
+
+  it("an expected 404 (no such user) is the answer, not the token's trouble: nothing dropped, nothing looked up or minted again", async () => {
+    const repo = newRepo();
+    const g = await githubFor(appEnv, nest(), repo, PERMISSIONS.metadata);
+    expect(await g.user("ghost-nobody")).toBeNull();
+    const mints = gh.mints().length;
+    await githubFor(appEnv, nest(), repo, PERMISSIONS.metadata);
+    expect(lookups(repo)).toBe(1);
+    expect(gh.mints().length).toBe(mints);
   });
 
   it("the App's slug is GitHub's own answer", async () => {

@@ -146,10 +146,11 @@ export class GitHub {
     });
     const text = await res.text();
     if (res.ok) return (text ? JSON.parse(text) : {}) as T;
-    // A token GitHub refuses, or a repo it doesn't show the token (its installation gone, the repo no longer
-    // selected): not handed out again (README.md#github-tokens), even where a 404 is the answer.
-    if (res.status === 401 || res.status === 404) this.onStale();
+    // An expected 404 is the answer (an unprotected branch, no such user or PR), not the token's trouble.
     if (res.status === 404 && o.nullOn404) return null;
+    // A token GitHub refuses, or a repo it doesn't show the token (its installation gone, the repo no longer
+    // selected): not handed out again (README.md#github-tokens).
+    if (res.status === 401 || res.status === 404) this.onStale();
     let message = text.slice(0, 200);
     try {
       const m = (JSON.parse(text) as { message?: unknown }).message;

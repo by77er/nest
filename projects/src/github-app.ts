@@ -231,27 +231,37 @@ export class AppTokens implements TokenSource {
     const app = this.app();
     const appId = Number(app.appId);
     const k = repo.toLowerCase();
-    const installation = await this.installation(repo, o.fresh === true);
     const key = `${k}|${permissionsKey(permissions)}`;
-    const stale = () => {
-      app.tokens.get(installation)?.delete(key);
-      if (app.installations.get(k)?.id === installation) app.installations.delete(k);
+    const reusable = (installation: number) => {
+      const t = app.tokens.get(installation)?.get(key);
+      return t && t.expires_ms - Date.now() > TOKEN_REUSE_MS ? t : null;
     };
+    const minted = (token: string, installation: number): Minted => ({
+      token, appId, installationId: installation,
+      stale: () => {
+        app.tokens.get(installation)?.delete(key);
+        if (app.installations.get(k)?.id === installation) app.installations.delete(k);
+      },
+    });
+    // A cached token, under a cached lookup, is handed out without asking nest or GitHub: a grant narrowed since
+    // reaches it only at its next mint (README.md#github-tokens). Never for a binding's read (`fresh`).
+    const known = app.installations.get(k);
+    if (!o.fresh && known && Date.now() - known.at_ms < INSTALLATION_LOOKUP_MS) {
+      const t = reusable(known.id);
+      if (t) return minted(t.token, known.id);
+    }
     // nest's grant still bounds the app's GitHub calls (README.md#github-tokens): the repo, and each permission
-    // within its `github.permissions`. Checked before each mint and each binding's read, and refused as nest
-    // refused a token outside it.
-    const covered = async () => {
-      const [repoIn, self] = await Promise.all([githubCovers(this.nest, repo), this.nest.self()]);
-      if (!repoIn) throw new NestError(403, "forbidden", `nest's grant for the app doesn't cover ${repo}`, false);
-      const have = self.grant?.github?.permissions ?? {};
-      for (const [p, level] of Object.entries(permissions)) {
-        if (!levelWithin(level, have[p])) throw new NestError(403, "forbidden", `${p}: ${level} is outside nest's grant for the app`, false);
-      }
-    };
-    if (o.fresh) await covered();
-    const have = app.tokens.get(installation)?.get(key);
-    if (have && have.expires_ms - Date.now() > TOKEN_REUSE_MS) return { token: have.token, appId, installationId: installation, stale };
-    if (!o.fresh) await covered();
+    // within its `github.permissions`. Asked before any GitHub call (the lookup and the mint), and refused as
+    // nest refused a token outside it.
+    const [repoIn, self] = await Promise.all([githubCovers(this.nest, repo), this.nest.self()]);
+    if (!repoIn) throw new NestError(403, "forbidden", `nest's grant for the app doesn't cover ${repo}`, false);
+    const have = self.grant?.github?.permissions ?? {};
+    for (const [p, level] of Object.entries(permissions)) {
+      if (!levelWithin(level, have[p])) throw new NestError(403, "forbidden", `${p}: ${level} is outside nest's grant for the app`, false);
+    }
+    const installation = await this.installation(repo, o.fresh === true);
+    const cached = reusable(installation);
+    if (cached) return minted(cached.token, installation);
     let r: { token?: unknown; expires_at?: unknown } | null;
     try {
       // One repo (by name: an installation is one account's) and these permissions only.
@@ -268,7 +278,7 @@ export class AppTokens implements TokenSource {
       if (!app.tokens.has(installation)) app.tokens.set(installation, new Map());
       app.tokens.get(installation)!.set(key, { token: r.token, expires_ms: expires });
     }
-    return { token: r.token, appId, installationId: installation, stale };
+    return minted(r.token, installation);
   }
 
   async appSlug(): Promise<string | null> {
