@@ -11,7 +11,7 @@
 // nest injected, which only narrows when that exception holds. Pure.
 import { z } from "zod";
 import { hostPatternMatches, INJECTED_ANY, type RequestGuard, type RequestMatch } from "../protocol/model";
-import { namesInjectedAny } from "./injected-any";
+import { scopeNamesInjectedAny } from "./injected-any";
 import { EgressHost } from "./client-egress";
 import { CLIENT_BINDING_PREFIX, InjectionName } from "./client-secrets";
 
@@ -53,6 +53,9 @@ export const PathPattern = z.string().max(256).superRefine((p, ctx) => {
 
 const QueryText = (max: number) => z.string().max(max).regex(PRINTABLE, "printable ASCII without spaces");
 
+/** An HTTP header name (RFC 9110 token), at most 64 characters. */
+const HeaderName = z.string().regex(/^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,64}$/, "a header name: 1-64 token characters");
+
 /** One matcher, the operator's `RequestMatch` with bounds: every field given must match (none: anything). */
 export const ClientRequestMatch = z.strictObject({
   methods: Methods.optional(),
@@ -70,6 +73,12 @@ export const ClientRequestMatch = z.strictObject({
    */
   injected: z.string().refine((v) => v === INJECTED_ANY || InjectionName.safeParse(v).success,
     `a binding name (1-32 lowercase letters, digits and '_', starting with a letter), or "${INJECTED_ANY}" for any`).optional(),
+  /**
+   * A header name: the request carries one field of it, whose whole value nest's substitution wrote (of
+   * `injected`'s binding, or any binding's when absent or `*`). Without it, `injected` holds for a
+   * substitution anywhere in the request.
+   */
+  at: HeaderName.optional(),
 });
 export type ClientRequestMatch = z.output<typeof ClientRequestMatch>;
 
@@ -92,7 +101,7 @@ export const ClientGuard = z.strictObject({
   // A previous release's Worker (after a rollback) sends a client's `*` as the binding `client:*`, and a
   // previous release's nest-proxy reads `*` as a name: either way it matches nothing. In an exception that
   // refuses more; in a scope the guard would stop refusing, so a client names `*` in exceptions only.
-  if (namesInjectedAny([g], "scope")) {
+  if (scopeNamesInjectedAny([g])) {
     ctx.addIssue({ code: "custom", message: `guard ${g.name}: injected "${INJECTED_ANY}" (any credential nest injected) is for exceptions (allow), not scope` });
   }
 });

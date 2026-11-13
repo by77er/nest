@@ -1,22 +1,28 @@
 //! The seam for `injected: "*"` (docs/sandbox/networking/egress/policy/#any-injected-credential): a
 //! matcher that holds when the proxy substituted a credential, whichever binding's. The fixture
 //! `protocol/fixtures/control/egress_policy/egress_policy.injected_any.json` is what the control plane
-//! produces from a base-layer floor (a push passes only with a credential nest injected), an operator
-//! guard with `*` in its scope, and a client guard with `*` in an exception (a vitest asserts it); here
-//! the proxy's own evaluator decides requests against it.
+//! produces from a base-layer floor (a push passes only when its Authorization header is one nest's
+//! substitution wrote whole: `at`), an operator guard with `*` in its scope, and a client guard with `*`
+//! in an exception (a vitest asserts it); here the proxy's own evaluator decides requests against it.
 
 use nest_protocol::model::EgressPolicy;
-use nest_proxy::guard::{BodyView, Req, refusing};
+use nest_proxy::guard::{BodyView, Req, Whole, refusing};
 
 fn policy() -> EgressPolicy {
     let p = format!("{}/../../protocol/fixtures/control/egress_policy/egress_policy.injected_any.json", env!("CARGO_MANIFEST_DIR"));
     serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap()
 }
 
-/// The name of the guard that refuses the request, if any.
+/// The name of the guard that refuses the request, if any. `injected`: the binding substituted, which
+/// wrote Authorization whole.
 fn decide(p: &EgressPolicy, host: &str, method: &str, target: &str, injected: Option<&str>) -> Option<String> {
+    let whole: Vec<Whole> = injected.map(|b| Whole { header: "authorization".into(), binding: b.into() }).into_iter().collect();
+    decide_whole(p, host, method, target, injected, &whole)
+}
+
+fn decide_whole(p: &EgressPolicy, host: &str, method: &str, target: &str, injected: Option<&str>, whole: &[Whole]) -> Option<String> {
     let (path, query) = target.split_once('?').map_or((target, None), |(a, b)| (a, Some(b)));
-    let req = Req { host, method, path, query, injected };
+    let req = Req { host, method, path, query, injected, whole };
     refusing(&p.guards, &req.prepare().unwrap(), &BodyView::Unread).map(|g| g.name.clone())
 }
 
@@ -36,6 +42,12 @@ fn a_floor_lets_a_push_through_only_with_a_credential_nest_injected() {
     );
     // Fetches are out of its scope.
     assert_eq!(push("/them/repo.git/git-upload-pack", None), None);
+    // nest's credential substituted into another header, Authorization planted: refused.
+    let x_app_key = [Whole { header: "x-app-key".into(), binding: "client:push".into() }];
+    assert_eq!(
+        decide_whole(&p, "git.example.com", "POST", "/me/box.git/git-receive-pack", Some("client:push"), &x_app_key).as_deref(),
+        Some("push-floor")
+    );
 }
 
 #[test]

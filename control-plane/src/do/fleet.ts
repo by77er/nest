@@ -2,7 +2,7 @@
 // leases and their expiry, STONITH, placement, and command delivery with exactly-one results.
 import { DurableObject } from "cloudflare:workers";
 import { CLIENT_GUARD_PREFIX } from "../lib/client-guards";
-import { freshInjectedAny, injectedAnyConflict, namesInjectedAny } from "../lib/injected-any";
+import { failsOpenOnOldProxy, freshInjectedAny, injectedAnyConflict } from "../lib/injected-any";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
@@ -1723,15 +1723,18 @@ export class FleetDO extends DurableObject<Env> {
     }
     // Packing: `pickSandboxHost`, over the connected, active, unwedged sandbox hosts. A sandbox with API
     // clients' request guards goes only to a host whose nest-proxy bounds them (`guard_bounds`), and one
-    // with a guard whose scope names `injected: "*"` only to a host that reads it as any binding
-    // (`guard_injected_any`; another reads it as a name, and the scope would match nothing: fail open). One
-    // naming it only in exceptions goes anywhere: there such a host only refuses more. None free means no
-    // placement yet (SandboxDO retries), never one that would decide them unbounded or open.
+    // with a guard where a previous release's nest-proxy fails open (`failsOpenOnOldProxy`: `*` in a
+    // scope, `at` with a binding named in a scope, `at` without `*` in an exception) only to a host that
+    // knows `*` and `at` (`guard_injected_any`). The cell's base layer is read here too, FleetDO's own
+    // copy: the policy is built from the sandbox's, which a newer base layer may not have reached yet.
+    // Fail-closed positions (`*` in an exception, the floor's form) go anywhere: there such a host only
+    // refuses more. None free means no placement yet (SandboxDO retries), never one that would decide
+    // them unbounded or open.
     const need = req.resources;
     const cfg = this.cellConfig();
     const guarded = (req.policy.guards ?? []).some((g) => g.name.startsWith(CLIENT_GUARD_PREFIX));
-    const anyScope = namesInjectedAny(req.policy.guards ?? [], "scope");
-    const where = ["wedged_ms IS NULL", ...(guarded ? ["guard_bounds = 1"] : []), ...(anyScope ? ["guard_injected_any = 1"] : [])].join(" AND ");
+    const opens = failsOpenOnOldProxy([...(req.policy.guards ?? []), ...this.storedEgressBase().guards]);
+    const where = ["wedged_ms IS NULL", ...(guarded ? ["guard_bounds = 1"] : []), ...(opens ? ["guard_injected_any = 1"] : [])].join(" AND ");
     const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where })
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
       .map((h) => {

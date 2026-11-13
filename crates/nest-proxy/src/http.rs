@@ -393,7 +393,7 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, req: Req
         return deny_response(StatusCode::FORBIDDEN, "egress_denied", &target.host, target.port, "no policy");
     };
     let uri = req.uri().clone();
-    let verdict = inject::apply(
+    let (verdict, whole) = inject::apply_whole(
         &inject::Input {
             bindings: &policy.inject,
             secrets: &view.secrets,
@@ -428,10 +428,17 @@ async fn forward(ctx: Arc<ConnCtx>, target: &Target, up: &UpstreamConn, req: Req
     // them is refused rather than decided (deciding costs time in its length per matcher).
     if policy.guards.iter().any(|g| guard::covers(g, &target.host)) {
         let (method, path, query) = (req.method().as_str().to_owned(), uri.path().to_owned(), uri.query().map(str::to_owned));
-        let greq = guard::Req { host: &target.host, method: &method, path: &path, query: query.as_deref(), injected: match &verdict {
-            Verdict::Substituted(b) => Some(b.as_str()),
-            _ => None,
-        } };
+        let greq = guard::Req {
+            host: &target.host,
+            method: &method,
+            path: &path,
+            query: query.as_deref(),
+            injected: match &verdict {
+                Verdict::Substituted(b) => Some(b.as_str()),
+                _ => None,
+            },
+            whole: &whole,
+        };
         let Ok(greq) = greq.prepare() else {
             let mut a = mk_audit(&req, EgressVerdict::Deny).reason("guard_target_too_long");
             a.binding = verdict.binding().map(str::to_string);

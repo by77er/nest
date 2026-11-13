@@ -21,7 +21,7 @@ import type { CommandBody, CommitOutcome, CommitRequestEvent, HostEvent } from "
 import { BINDING_LIFETIME_MS, type GuestInfo, type HandsTarget } from "../protocol/gateway";
 import {
   type AllowRule, type EgressLimits, type EgressPolicy, type ErrorBody, ErrorCodes, type GenerationRecord,
-  hostPatternMatches, InjectionBinding, type InjectionSecret, RequestGuard, type Resources, SandboxState,
+  hostPatternMatches, INJECTED_ANY, InjectionBinding, type InjectionSecret, RequestGuard, type Resources, SandboxState,
 } from "../protocol/model";
 import { canonicalRepos, readOnlyRepos, Repos, unionRepos } from "../lib/repos";
 import type { Labels } from "../lib/clients";
@@ -77,8 +77,10 @@ export const SandboxPolicyLayer = z.object({
   passthrough: z.array(z.string().min(1)).default([]),
   // `client:` names are API clients' bindings' (docs/control-plane/api/clients/#injection): an operator binding
   // under one would be pushed its client's secret.
+  // `*` is a guard matcher's "any binding" (`injected: "*"`), so no binding takes it as its name; nor the empty name.
   inject: z.array(InjectionBinding.refine((b) => !b.name.startsWith(CLIENT_BINDING_PREFIX),
-    `a binding name starting ${CLIENT_BINDING_PREFIX} is an API client's`)).default([]),
+    `a binding name starting ${CLIENT_BINDING_PREFIX} is an API client's`)
+    .refine((b) => b.name !== "" && b.name !== INJECTED_ANY, `a binding's name is neither empty nor "${INJECTED_ANY}" (a guard's "any binding")`)).default([]),
   tcp: z.array(z.object({ host: z.string().min(1), port: Port })).default([]),
   repos: Repos.default([]),
   read_repos: Repos.default([]),

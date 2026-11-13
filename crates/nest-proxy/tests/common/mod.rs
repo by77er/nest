@@ -152,6 +152,7 @@ async fn echo(mut req: hyper::Request<hyper::body::Incoming>) -> Result<hyper::R
         // Hex-encoded too: the proxy masks injected secrets that upstreams echo back, so tests
         // read what the upstream *received* from this field.
         "authorization_hex": req.headers().get("authorization").map(|h| hex(h.as_bytes())),
+        "authorization_fields": req.headers().get_all("authorization").iter().count(),
         "host_headers": req.headers().get_all("host").iter().map(|h| h.to_str().unwrap().to_string()).collect::<Vec<_>>(),
         "te": req.headers().get("te").map(|h| h.to_str().unwrap().to_string()),
         "method": req.method().as_str(),

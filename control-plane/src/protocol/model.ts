@@ -185,9 +185,15 @@ export const RequestMatch = z.object({
   body_json: JsonFieldMatch.optional(),
   /**
    * The proxy substituted this binding's credential into the request; `INJECTED_ANY` (`*`): any binding's.
-   * A host whose fleet hello lacks `guard_injected_any` reads `*` as a binding's name.
+   * Without `at`, anywhere in it. A host whose fleet hello lacks `guard_injected_any` reads `*` as a binding's name.
    */
   injected: z.string().optional(),
+  /**
+   * A header name (any case): the request carries one field of it, whose whole value the proxy's
+   * substitution wrote (`injected`'s binding's, or any binding's when absent or `*`). A host whose fleet
+   * hello lacks `guard_injected_any` ignores it.
+   */
+  at: z.string().optional(),
 });
 export type RequestMatch = z.output<typeof RequestMatch>;
 

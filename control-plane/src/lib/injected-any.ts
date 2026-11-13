@@ -1,29 +1,47 @@
-// `injected: "*"` in a request guard's matcher (docs/sandbox/networking/egress/policy/#any-injected-credential):
-// a credential nest injected was substituted, whichever binding's. A host whose fleet hello lacks
-// `guard_injected_any` reads `*` as a binding's name, which no binding has, so there the matcher matches
-// nothing: in an exception the guard only refuses more (fail closed), in a scope it refuses less (fail
-// open; crates/nest-proxy/tests/guard_equivalence.rs shows both). So a guard newly naming it is refused
-// while any sandbox host of the cell lacks the flag, and FleetDO places a sandbox whose guards name it in
-// a scope only on a host with it. Pure.
+// `injected: "*"` and `at` in a request guard's matcher (docs/sandbox/networking/egress/policy/#any-injected-credential):
+// `*` is a credential nest injected, whichever binding's; `at` names the header such a credential must
+// have been written whole into. A host whose fleet hello lacks `guard_injected_any` reads `*` as a
+// binding's name (which the operator's schema refuses, so no binding has it) and ignores `at`. Where that
+// fails closed and where open is proven in crates/nest-proxy/tests/guard_equivalence.rs. So a guard newly
+// naming either is refused while any sandbox host of the cell lacks the flag, and FleetDO places a sandbox
+// whose guards hold a fail-open position (`failsOpenOnOldProxy`) only on a host with it. Pure.
 import { ErrorCodes, INJECTED_ANY } from "../protocol/model";
 import { NestError } from "./util";
 
-type Matchers = readonly { injected?: string }[] | undefined;
+type Matcher = { injected?: string; at?: string };
+type Matchers = readonly Matcher[] | undefined;
+type Guardish = { scope: Matchers; allow?: Matchers };
 
-/** Whether any of `guards` names `injected: "*"`: in a scope (`"scope"`), or anywhere (`"any"`). */
-export function namesInjectedAny(guards: readonly { scope: Matchers; allow?: Matchers }[], where: "scope" | "any"): boolean {
-  const any = (ms: Matchers) => (ms ?? []).some((m) => m.injected === INJECTED_ANY);
-  return guards.some((g) => any(g.scope) || (where === "any" && any(g.allow)));
+/** Whether any of `guards` names `injected: "*"` in a scope. */
+export function scopeNamesInjectedAny(guards: readonly Guardish[]): boolean {
+  return guards.some((g) => (g.scope ?? []).some((m) => m.injected === INJECTED_ANY));
 }
 
-/** Those of `guards` that name `*` and aren't in `held` (compared whole): what a write newly brings. */
-export function freshInjectedAny<G extends { scope: Matchers; allow?: Matchers }>(guards: readonly G[], held: readonly unknown[]): G[] {
+/** Whether a guard uses what a previous release's nest-proxy doesn't know: `injected: "*"` or `at`, anywhere. */
+export function usesInjectedMatchers(g: Guardish): boolean {
+  return [...(g.scope ?? []), ...(g.allow ?? [])].some((m) => m.injected === INJECTED_ANY || m.at !== undefined);
+}
+
+/**
+ * Whether any of `guards` holds a position where a previous release's nest-proxy fails open (can let
+ * through what this release refuses): in a scope, `*`, or `at` with a binding named (it compares the name
+ * with the last binding substituted, not the header's writer); in an exception, `at` without `*` (it drops
+ * the header condition). `*` in an exception, and `at` with no binding in a scope, fail closed there.
+ */
+export function failsOpenOnOldProxy(guards: readonly Guardish[]): boolean {
+  return guards.some((g) =>
+    (g.scope ?? []).some((m) => m.injected === INJECTED_ANY || (m.at !== undefined && m.injected !== undefined))
+    || (g.allow ?? []).some((m) => m.at !== undefined && m.injected !== INJECTED_ANY));
+}
+
+/** Those of `guards` that use `*` or `at` and aren't in `held` (compared whole): what a write newly brings. */
+export function freshInjectedAny<G extends Guardish>(guards: readonly G[], held: readonly unknown[]): G[] {
   const known = new Set(held.map((h) => JSON.stringify(h)));
-  return guards.filter((g) => namesInjectedAny([g], "any") && !known.has(JSON.stringify(g)));
+  return guards.filter((g) => usesInjectedMatchers(g) && !known.has(JSON.stringify(g)));
 }
 
-/** The refusal (409) of guards naming `*` while sandbox hosts of the cell (`old`) read it as a name. */
+/** The refusal (409) of guards using `*` or `at` while sandbox hosts of the cell (`old`) don't know them. */
 export function injectedAnyConflict(cell: string, guards: readonly string[], old: readonly string[]): NestError {
-  return new NestError(ErrorCodes.CONFLICT, `guard(s) ${guards.slice(0, 3).join(", ")} name injected "${INJECTED_ANY}" (any credential nest injected), which needs every `
-    + `sandbox host of cell ${cell} to read it so; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
+  return new NestError(ErrorCodes.CONFLICT, `guard(s) ${guards.slice(0, 3).join(", ")} name injected "${INJECTED_ANY}" or "at" (where a credential nest injected `
+    + `must be), which needs every sandbox host of cell ${cell} to know them; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
 }

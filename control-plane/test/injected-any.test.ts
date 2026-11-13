@@ -1,14 +1,15 @@
-// `injected: "*"` in a request guard (docs/sandbox/networking/egress/policy/#any-injected-credential): a
-// matcher that holds when nest-proxy substituted a credential, whichever binding's. The operator's layers
-// (base and operator) name it anywhere; a client names it in exceptions only. A host of the previous release
-// reads `*` as a binding's name, which fails a scope open, so a guard newly naming it is refused (409) while
-// any sandbox host of the cell lacks `guard_injected_any`, and a sandbox whose scopes name it is placed only
-// on a host with it. nest-proxy's side is crates/nest-proxy/tests/injected_any.rs, on the same fixture.
+// `injected: "*"` and `at` in a request guard (docs/sandbox/networking/egress/policy/#any-injected-credential):
+// `*` holds when nest-proxy substituted a credential, whichever binding's; `at` when it wrote a named
+// header whole. The operator's layers (base and operator) use them anywhere; a client names `*` in
+// exceptions only. A host of the previous release reads `*` as a binding's name and ignores `at`, which
+// fails some positions open, so a guard newly using either is refused (409) while any sandbox host of the
+// cell lacks `guard_injected_any`, and a sandbox whose guards hold a fail-open position is placed only on a
+// host with it. nest-proxy's side is crates/nest-proxy/tests/injected_any.rs, on the same fixture.
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import fixture from "../../protocol/fixtures/control/egress_policy/egress_policy.injected_any.json";
 import { ClientGuard, ClientGuards, holdGuards, wireGuard, type ClientGuard as ClientGuardT } from "../src/lib/client-guards";
-import { freshInjectedAny, namesInjectedAny } from "../src/lib/injected-any";
+import { failsOpenOnOldProxy, freshInjectedAny, scopeNamesInjectedAny, usesInjectedMatchers } from "../src/lib/injected-any";
 import { EgressBaseInput, SandboxPolicyLayer } from "../src/do/sandbox";
 import { INJECTED_ANY, type RequestGuard } from "../src/protocol/model";
 import { ClientDO } from "../src/do/client";
@@ -32,6 +33,22 @@ describe("injected: \"*\" (pure)", () => {
     // SandboxDO's order: the base layer's, the operator's, then the client's.
     expect([...base, ...operator, ...ClientGuards.parse([API_WRITE]).map(wireGuard)]).toEqual(fixture.guards);
     expect(CLIENT_WIRE!.allow![0]!.injected).toBe("*");
+    expect(FLOOR!.allow).toEqual([{ injected: "*", at: "authorization" }]);
+  });
+
+  it("a client's matcher may name the header (at), in a scope or an exception, sent as written", () => {
+    const ok = (g: unknown) => ClientGuard.safeParse(g).success;
+    const at = { ...API_WRITE, allow: [{ injected: "*", at: "authorization" }, { injected: "svc", at: "X-Api-Key" }] };
+    expect(ok(at)).toBe(true);
+    expect(wireGuard(ClientGuard.parse(at)).allow).toEqual([{ injected: "*", at: "authorization" }, { injected: "client:svc", at: "X-Api-Key" }]);
+    expect(ok({ ...API_WRITE, scope: [{ injected: "svc", at: "authorization" }] })).toBe(true);
+    for (const h of ["", "two words", "a:b", "x".repeat(65)]) expect(ok({ ...API_WRITE, allow: [{ at: h }] }), h).toBe(false);
+  });
+
+  it("the operator names no binding * or the empty name (a guard's * means any binding)", () => {
+    const binding = (name: string) => ({ inject: [{ name, hosts: ["x.org"], placeholder: "nest-ph-x", locations: [{ type: "authorization_bearer" }] }] });
+    expect(SandboxPolicyLayer.safeParse(binding("svc")).success).toBe(true);
+    for (const name of ["*", ""]) expect(SandboxPolicyLayer.safeParse(binding(name)).success, name).toBe(false);
   });
 
   it("a client names * in an exception, where it stays *, never in a scope; a named binding stays its own", () => {
@@ -45,12 +62,21 @@ describe("injected: \"*\" (pure)", () => {
       { injected: "client:svc" }, { injected: "*" }]);
   });
 
-  it("knows where a guard names it, and which of a write's guards newly do", () => {
-    expect(namesInjectedAny([FLOOR!], "scope")).toBe(false);
-    expect(namesInjectedAny([FLOOR!], "any")).toBe(true);
-    expect(namesInjectedAny([NO_UPLOADS!], "scope")).toBe(true);
-    const named: RequestGuard = { name: "n", hosts: [], scope: [{ injected: "svc" }], allow: [{ injected: "svc" }] };
-    expect(namesInjectedAny([named], "any")).toBe(false);
+  it("knows where a guard uses them, which positions fail open on an old proxy, and which of a write's guards are new", () => {
+    expect(scopeNamesInjectedAny([FLOOR!])).toBe(false);
+    expect(scopeNamesInjectedAny([NO_UPLOADS!])).toBe(true);
+    const g = (scope: RequestGuard["scope"], allow: RequestGuard["allow"] = []): RequestGuard => ({ name: "n", hosts: [], scope, allow });
+    expect(usesInjectedMatchers(g([{ injected: "svc" }], [{ injected: "svc" }]))).toBe(false);
+    expect(usesInjectedMatchers(g([{}], [{ at: "x" }]))).toBe(true);
+    expect(usesInjectedMatchers(FLOOR!)).toBe(true);
+    // Fail open on an old proxy (crates/nest-proxy/tests/guard_equivalence.rs): `*` in a scope, `at` with a
+    // binding named in a scope, `at` without `*` in an exception.
+    for (const open of [g([{ injected: "*" }]), g([{ injected: "svc", at: "authorization" }]), g([{}], [{ at: "authorization" }]),
+      g([{}], [{ injected: "svc", at: "authorization" }])]) expect(failsOpenOnOldProxy([open]), JSON.stringify(open)).toBe(true);
+    // Fail closed: `*` in an exception (the floor's form, with or without `at`), `at` alone in a scope, named bindings.
+    for (const closed of [FLOOR!, g([{}], [{ injected: "*" }]), g([{ at: "authorization" }]), g([{ injected: "svc" }], [{ injected: "svc" }])]) {
+      expect(failsOpenOnOldProxy([closed]), JSON.stringify(closed)).toBe(false);
+    }
     const plain = { name: "plain", hosts: ["x.org"], scope: [{}] };
     expect(freshInjectedAny([FLOOR!, NO_UPLOADS!, plain], [FLOOR])).toEqual([NO_UPLOADS]);
     expect(freshInjectedAny([{ ...FLOOR!, reason: "changed" }], [FLOOR])).toHaveLength(1);
@@ -196,7 +222,7 @@ describe("injected: \"*\" through the control plane", () => {
     await adminJson(base(cell), { method: "PUT", body: { allow: [], guards: [FLOOR] } });
   });
 
-  it("a sandbox whose scopes name * is placed only on a host that reads it as any binding; one naming it only in exceptions goes anywhere", async () => {
+  it("a sandbox whose guards fail open on an old proxy is placed only on a host that knows * and at; fail-closed ones go anywhere", async () => {
     const cell = uniqueCell();
     const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
     const old = await connectHost(cell, "sandbox", { guard_injected_any: false });
@@ -208,10 +234,37 @@ describe("injected: \"*\" through the control plane", () => {
     });
     // A scope's `*` there would match nothing (fail open): no placement while that host is all there is.
     expect(await place([NO_UPLOADS!])).toBeNull();
-    // An exception's `*` there only refuses more (fail closed), and a named binding is as before.
+    // An exception's `at` without `*` there loses its header condition (fail open), as does a scope's `at` with a binding named.
+    expect(await place([{ ...FLOOR!, allow: [{ injected: "svc", at: "authorization" }] }])).toBeNull();
+    expect(await place([{ ...NO_UPLOADS!, scope: [{ injected: "svc", at: "authorization" }] }])).toBeNull();
+    // An exception's `*` there only refuses more (fail closed), with `at` (the floor) or without, and a named binding is as before.
     expect(await place([FLOOR!])).toBe(old.host);
+    expect(await place([{ ...FLOOR!, allow: [{ injected: "*" }] }])).toBe(old.host);
     expect(await place([{ ...NO_UPLOADS!, scope: [{ injected: "svc" }] }])).toBe(old.host);
     const current = await connectHost(cell);
     expect(await place([NO_UPLOADS!])).toBe(current.host);
+  });
+
+  it("placement reads the cell's base layer from FleetDO, not only the policy the sandbox built from its own copy", async () => {
+    const cell = uniqueCell();
+    const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
+    // A base-layer guard that fails open on an old proxy, written while every host knows `*`.
+    await adminJson(base(cell), { method: "PUT", body: { allow: [], guards: [{ ...NO_UPLOADS!, name: "base-scope" }] } });
+    const old = await connectHost(cell, "sandbox", { guard_injected_any: false });
+    // A sandbox whose policy predates the write (its own copy of the base layer has no guard): still not there.
+    const place = () => fleet.place({
+      sandbox: `sbx_${rand()}`, workstream: "ws_test", epoch: 1, image: "x", resources: { vcpus: 1, memory_mib: 1, disk_gib: 1 },
+      policy: { version: 1, allow: [], passthrough: [], inject: [], tcp: [], guards: [], limits: { max_connections: 1, bandwidth_mbps: 1, max_inspected_body_bytes: 1 } },
+    });
+    expect(await place()).toBeNull();
+    // A floor in exceptions only (fail closed there) doesn't keep it off.
+    await runInDurableObject(fleet, (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET guard_injected_any = 1 WHERE host = ?", old.host);
+    });
+    await adminJson(base(cell), { method: "PUT", body: { allow: [], guards: [FLOOR] } });
+    await runInDurableObject(fleet, (_i, st) => {
+      st.storage.sql.exec("UPDATE hosts SET guard_injected_any = 0 WHERE host = ?", old.host);
+    });
+    expect(await place()).toBe(old.host);
   });
 });

@@ -83,7 +83,8 @@
       ],
       "allow": [
         {
-          "injected": "*"
+          "injected": "*",
+          "at": "authorization"
         }
       ],
       "reason": "the cell's: a push carries a credential nest injected",

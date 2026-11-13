@@ -21,6 +21,8 @@
 
 use nest_protocol::model::{INJECTED_ANY, JsonFieldMatch, QueryMatch, RequestGuard, RequestMatch};
 
+pub use crate::inject::Whole;
+
 /// The longest request path an exception can match (the injection safe-path limit).
 const MAX_PATH: usize = 2048;
 /// Decoding rounds for scope matching (`%252e` → `%2e` → `.`).
@@ -44,6 +46,8 @@ pub struct Req<'a> {
     pub query: Option<&'a str>,
     /// The binding whose credential the proxy substituted into this request, if any.
     pub injected: Option<&'a str>,
+    /// The headers the proxy's substitution wrote whole (`inject::apply_whole`).
+    pub whole: &'a [Whole],
 }
 
 /// A request target over the bounds a guarded host's requests are decided within: refused, never
@@ -57,6 +61,7 @@ pub struct Prepared<'a> {
     host: &'a str,
     method: &'a str,
     injected: Option<&'a str>,
+    whole: &'a [Whole],
     raw: Vec<&'a str>,
     norm: Vec<String>,
     clean: bool,
@@ -86,6 +91,7 @@ impl<'a> Req<'a> {
             host: self.host,
             method: self.method,
             injected: self.injected,
+            whole: self.whole,
             raw,
             norm,
             clean: clean_path(self.path),
@@ -145,9 +151,7 @@ fn matches(m: &RequestMatch, req: &Prepared<'_>, body: Option<&BodyView<'_>>, ic
     if m.methods_except.iter().any(|x| x.eq_ignore_ascii_case(req.method)) {
         return false;
     }
-    if let Some(b) = &m.injected
-        && !injected_matches(b, req.injected)
-    {
+    if !injected_matches(m.injected.as_deref(), m.at.as_deref(), req) {
         return false;
     }
     if let Some(p) = &m.path {
@@ -168,10 +172,17 @@ fn matches(m: &RequestMatch, req: &Prepared<'_>, body: Option<&BodyView<'_>>, ic
     }
 }
 
-/// `injected`: the request had that binding's credential substituted, or any binding's for
-/// [`INJECTED_ANY`]. Never when nothing was substituted.
-fn injected_matches(want: &str, substituted: Option<&str>) -> bool {
-    substituted.is_some_and(|b| want == INJECTED_ANY || want == b)
+/// `injected` and `at`. Without `at`: the request had `injected`'s binding's credential substituted
+/// (any binding's for [`INJECTED_ANY`]), anywhere in it. With `at`: the header `at` names is one field
+/// whose whole value a substitution wrote, by `injected`'s binding (any binding's when it is absent or
+/// `*`). Neither holds when nothing was substituted.
+fn injected_matches(injected: Option<&str>, at: Option<&str>, req: &Prepared<'_>) -> bool {
+    let binding = |b: &str| injected.is_none_or(|want| want == INJECTED_ANY || want == b);
+    match (injected, at) {
+        (None, None) => true,
+        (Some(_), None) => req.injected.is_some_and(binding),
+        (_, Some(h)) => req.whole.iter().any(|w| w.header.eq_ignore_ascii_case(h) && binding(&w.binding)),
+    }
 }
 
 // --- paths ---------------------------------------------------------------------------------------
@@ -349,7 +360,7 @@ mod tests {
     }
 
     fn req<'a>(host: &'a str, method: &'a str, path: &'a str) -> Req<'a> {
-        Req { host, method, path, query: None, injected: None }
+        Req { host, method, path, query: None, injected: None, whole: &[] }
     }
 
     fn refused(g: &RequestGuard, r: &Req<'_>) -> bool {
@@ -450,7 +461,7 @@ mod tests {
     #[test]
     fn query_scope_decodes_and_any_pair_counts() {
         let g = push_guard();
-        let q = |query: &'static str| Req { host: "vault.test", method: "GET", path: "/them/box/info", query: Some(query), injected: None };
+        let q = |query: &'static str| Req { host: "vault.test", method: "GET", path: "/them/box/info", query: Some(query), injected: None, whole: &[] };
         for (query, want) in [
             ("op=deposit", true),
             ("OP=Deposit", true),
@@ -462,7 +473,7 @@ mod tests {
         ] {
             assert_eq!(refused(&g, &q(query)), want, "{query}");
         }
-        let mine = Req { host: "vault.test", method: "GET", path: "/me/box/info", query: Some("op=deposit"), injected: None };
+        let mine = Req { host: "vault.test", method: "GET", path: "/me/box/info", query: Some("op=deposit"), injected: None, whole: &[] };
         assert!(!refused(&g, &mine));
     }
 
@@ -476,7 +487,7 @@ mod tests {
             reason: String::new(),
             ignore_case: false,
         };
-        let q = |query: &'static str| Req { host: "q.test", method: "GET", path: "/", query: Some(query), injected: None };
+        let q = |query: &'static str| Req { host: "q.test", method: "GET", path: "/", query: Some(query), injected: None, whole: &[] };
         assert!(!refused(&g, &q("mode=read")));
         assert!(refused(&g, &q("mode=re%61d")));
         assert!(refused(&g, &q("mode=write")));
@@ -547,7 +558,7 @@ mod tests {
             reason: String::new(),
             ignore_case: false,
         };
-        let r = |injected: Option<&'static str>| Req { host: "api.test", method: "POST", path: "/query", query: None, injected };
+        let r = |injected: Option<&'static str>| Req { host: "api.test", method: "POST", path: "/query", query: None, injected, whole: &[] };
         assert!(!refused(&g, &r(Some("svc"))));
         assert!(refused(&g, &r(Some("other"))));
         assert!(refused(&g, &r(None)));
@@ -556,7 +567,7 @@ mod tests {
     #[test]
     fn injected_any_needs_some_binding_substituted() {
         let any = || RequestMatch { injected: Some(INJECTED_ANY.into()), ..m(&["POST"], None) };
-        let r = |injected: Option<&'static str>| Req { host: "api.test", method: "POST", path: "/query", query: None, injected };
+        let r = |injected: Option<&'static str>| Req { host: "api.test", method: "POST", path: "/query", query: None, injected, whole: &[] };
         // In an exception: any substituted binding lets the write through; none doesn't.
         let floor = RequestGuard {
             name: "floor".into(),
@@ -577,6 +588,42 @@ mod tests {
         // Only `*` itself is the wildcard: a pattern-looking name is a name.
         let named = RequestGuard { allow: vec![RequestMatch { injected: Some("s*".into()), ..m(&["POST"], None) }], ..floor };
         assert!(refused(&named, &r(Some("svc"))));
+    }
+
+    #[test]
+    fn at_needs_that_header_written_whole_by_the_binding_named() {
+        let floor = |injected: Option<&str>, at: &str| RequestGuard {
+            name: "floor".into(),
+            hosts: vec![HostPattern("api.test".into())],
+            scope: vec![m(&["POST"], None)],
+            allow: vec![RequestMatch { injected: injected.map(str::to_string), at: Some(at.into()), ..Default::default() }],
+            reason: String::new(),
+            ignore_case: false,
+        };
+        let w = |header: &str, binding: &str| Whole { header: header.into(), binding: binding.into() };
+        let decide = |g: &RequestGuard, injected: Option<&str>, whole: &[Whole]| {
+            let r = Req { host: "api.test", method: "POST", path: "/x", query: None, injected, whole };
+            refusing(std::slice::from_ref(g), &r.prepare().unwrap(), &BodyView::Unread).is_some()
+        };
+        let any = floor(Some(INJECTED_ANY), "authorization");
+        // Authorization written whole by any binding: through. Any case of the header's name.
+        assert!(!decide(&any, Some("svc"), &[w("authorization", "svc")]));
+        assert!(!decide(&any, Some("client:x"), &[w("authorization", "client:x")]));
+        assert!(!decide(&floor(Some(INJECTED_ANY), "Authorization"), Some("svc"), &[w("authorization", "svc")]));
+        // A substitution elsewhere (the reviewer's probe: x-app-key nest's, Authorization planted): refused.
+        assert!(decide(&any, Some("svc"), &[w("x-app-key", "svc")]));
+        assert!(decide(&any, Some("svc"), &[]));
+        assert!(decide(&any, None, &[]));
+        // A named binding: only that binding's whole write.
+        let named = floor(Some("svc"), "authorization");
+        assert!(!decide(&named, Some("svc"), &[w("authorization", "svc")]));
+        assert!(decide(&named, Some("other"), &[w("authorization", "other")]));
+        // Without `injected`: any binding's, as `*`.
+        assert!(!decide(&floor(None, "x-app-key"), Some("svc"), &[w("x-app-key", "svc")]));
+        assert!(decide(&floor(None, "x-app-key"), Some("svc"), &[w("authorization", "svc")]));
+        // `injected` alone keeps its meaning: some substitution, anywhere.
+        let loose = RequestGuard { allow: vec![RequestMatch { injected: Some(INJECTED_ANY.into()), ..Default::default() }], ..any };
+        assert!(!decide(&loose, Some("svc"), &[w("x-app-key", "svc")]));
     }
 
     #[test]
@@ -602,7 +649,7 @@ mod tests {
             allow: (0..50).map(|_| RequestMatch { query: vec![QueryMatch { name: "op".into(), values: vec![] }], ..Default::default() }).collect(),
             ..push_guard()
         };
-        let r = Req { host: "vault.test", method: "POST", path: "/a%2e/b%2Fc/withdraw", query: Some("op=with%64raw&x=%2541"), injected: None };
+        let r = Req { host: "vault.test", method: "POST", path: "/a%2e/b%2Fc/withdraw", query: Some("op=with%64raw&x=%2541"), injected: None, whole: &[] };
         let before = DECODES.with(|d| d.get());
         let p = r.prepare().unwrap();
         let prepared = DECODES.with(|d| d.get()) - before;
@@ -616,19 +663,19 @@ mod tests {
     fn one_double_star_tries_only_the_split_its_tail_fits() {
         let g = RequestGuard { scope: vec![m(&[], Some("/**/a/*/a/b"))], allow: vec![], ..push_guard() };
         let path = "/a".repeat(MAX_GUARDED_SEGMENTS - 1);
-        let r = Req { host: "vault.test", method: "GET", path: &path, query: None, injected: None }.prepare().unwrap();
+        let r = Req { host: "vault.test", method: "GET", path: &path, query: None, injected: None, whole: &[] }.prepare().unwrap();
         let before = GLOB_STEPS.with(|d| d.get());
         assert!(refusing(std::slice::from_ref(&g), &r, &BodyView::Unread).is_none());
         // Two forms (as sent and normalized), each one split of at most five steps.
         assert!(GLOB_STEPS.with(|d| d.get()) - before <= 12, "{}", GLOB_STEPS.with(|d| d.get()) - before);
         let hit = format!("{path}/b");
-        let r = Req { host: "vault.test", method: "GET", path: &hit, query: None, injected: None }.prepare().unwrap();
+        let r = Req { host: "vault.test", method: "GET", path: &hit, query: None, injected: None, whole: &[] }.prepare().unwrap();
         assert!(refusing(std::slice::from_ref(&g), &r, &BodyView::Unread).is_some());
     }
 
     #[test]
     fn targets_past_the_guarded_bounds_are_not_decided() {
-        let ok = |path: &str, query: Option<&str>| Req { host: "h.test", method: "GET", path, query, injected: None }.prepare().is_ok();
+        let ok = |path: &str, query: Option<&str>| Req { host: "h.test", method: "GET", path, query, injected: None, whole: &[] }.prepare().is_ok();
         assert!(ok(&format!("/{}", "a".repeat(MAX_GUARDED_PATH - 1)), None));
         assert!(!ok(&format!("/{}", "a".repeat(MAX_GUARDED_PATH)), None));
         assert!(ok(&"/a".repeat(MAX_GUARDED_SEGMENTS), None));
