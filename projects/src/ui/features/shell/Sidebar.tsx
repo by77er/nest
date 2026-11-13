@@ -7,7 +7,7 @@ import { IconFolders, IconTool } from "@tabler/icons-react";
 import { useParams, useRouterState } from "@tanstack/react-router";
 import { useProjects } from "../../api/queries";
 import { NavRowLink } from "../../common/links";
-import { NavGroup, NavGroups } from "../../layout/Nav";
+import { NavGroup, NavGroups, NavNote } from "../../layout/Nav";
 import { useNeedsYou } from "./attention";
 import { useUnread } from "./unread";
 import { NeedsYouBadge, ProjectSwitcher } from "./ProjectSwitcher";
@@ -23,10 +23,9 @@ export function SidebarNav({ onNavigate }: { onNavigate: () => void }) {
     <NavGroups>
       <NavGroup label="Project">
         <ProjectSwitcher projectId={projectId} view={viewOf(pathname)} onNavigate={onNavigate} />
-        {projects.isError && (
-          <Text fz="xs" c="danger">
-            The projects couldn't be loaded.
-          </Text>
+        {/* Only when there's no list at all: a refresh that fails keeps it (its counts "?"; the projects page says so). */}
+        {projects.isError && projects.data === undefined && (
+          <NavNote tone="danger">The projects couldn't be loaded.</NavNote>
         )}
       </NavGroup>
       {projectId ? (

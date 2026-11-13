@@ -195,3 +195,11 @@ export const TriggerBadge = forwardRef<HTMLSpanElement, TriggerBadgeProps & Reac
 export function Grow({ children }: { children: ReactNode }) {
   return <Box className={classes.grow}>{children}</Box>;
 }
+
+/**
+ * A button's working spinner, in the button's own text color, for a button that stays focusable while its
+ * action is out (`aria-disabled`, not Mantine's `loading`, which disables it and drops focus to the page).
+ */
+export function ButtonBusy() {
+  return <Loader size="xs" color="currentColor" aria-hidden />;
+}

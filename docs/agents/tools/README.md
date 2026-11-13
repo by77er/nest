@@ -60,7 +60,7 @@ An agent that reads untrusted content, holds private data and can send data out 
   - **Quarantined reports:** a spawn spec can declare a `report_schema` of enums, numbers and ids. A child's final report that validates against it reaches the spawner untainted, even from a tainted child. This is the dual-LLM / map-reduce pattern from [Design Patterns for Securing LLM Agents](https://arxiv.org/abs/2506.08837) (2025-06), and how a captain stays clean while its workers read code.
 - **Template defaults ("balanced", tuned from experience):** widening egress and granting sinks are `approve`. Brokered actions already scoped by their binding (e.g. `github.create_pr` to the binding's repos) are `allow`. Management grants stay off agents with hands.
 
-**Brokered actions** run one pipeline in AgentDO (grant, cap, secret scan, sink gate, current external state, a natural idempotency key, journal): see [brokered](../capabilities/brokered/#the-pipeline).
+**Brokered actions** run one pipeline in AgentDO (grant, cap, stored-value scan, sink gate, current external state, a natural idempotency key, journal): see [brokered](../capabilities/brokered/#the-pipeline).
 
 - **Identity:** the runner knows which agent each MCP process belongs to and authenticates to the control plane with its host token. Stale agent epochs are rejected.
 - **Never block on a human:** an approval answers `pending` at once, the turn ends, and the decision arrives as a later turn.

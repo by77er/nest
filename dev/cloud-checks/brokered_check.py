@@ -16,13 +16,14 @@ capability taints from its start:
                 through the Git Data API (blob, tree, commit, ref).
   3. turn     - one agent, one turn: create the issue (held: the session is tainted and the grant says
                 approve; the check approves it from the agent's open asks), comment on it,
-                open a draft pull request from the branch to main, then comment a random fake credential shaped
-                like a GitHub token (`ghp_` + 36), which nest must refuse.
+                open a draft pull request from the branch to main, then comment a random throwaway value this run
+                stored as the BrokerDO secret `http:brokered-check-scan`, which nest must refuse (it scans for stored
+                secrets' exact values, not credential shapes).
   4. verify   - through GitHub (the script's own token): the issue exists, was made by the App's bot and carries
                 nest's marker; the comment exists, by the bot; the pull request exists from that head, by the
-                bot, a draft; no comment on the issue holds the fake token. The agent's journal
+                bot, a draft; no comment on the issue holds the stored value. The agent's journal
                 (`GET /v1/agents/<id>/brokered`): done rows for the three actions, a refused row for the scan
-                with its arguments withheld, no row holding the fake token, the issue's row tainted and written
+                with its arguments withheld, no row holding the stored value, the issue's row tainted and written
                 after the approval that held it was asked for (server clocks), and no approval asked for
                 anything but the issue.
   5. sleep    - until the brain has idle-exited (BROKERED_IDLE_S).
@@ -103,9 +104,12 @@ TEMPLATE = {
 MARKER = "<!-- nest:"
 
 
+SCAN_SECRET = "http:brokered-check-scan"
+
+
 def fake_token():
-    """A random string shaped like a classic GitHub token (`ghp_` + 36): nest's scan must refuse it."""
-    return "ghp_" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(36))
+    """A random throwaway value, stored as SCAN_SECRET before the turn: nest's scan of stored values must refuse it."""
+    return "nest-check-" + "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(32))
 
 
 def turn_text(fake):
@@ -118,7 +122,7 @@ def turn_text(fake):
             f"3. Call {t('create_pr')} with repo \"{REPO}\", title \"{TITLE}\", head \"{BRANCH}\", base \"main\", "
             f"body \"Opened by nest's brokered check {RUN}; the check closes it.\" and draft true.\n"
             f"4. Call {t('comment')} with repo \"{REPO}\", the same issue_number, and body \"scan check: {fake}\" "
-            "(a random test value, not a real credential; the call is expected to be refused).\n"
+            "(a random test value nest holds as a secret, not a real credential; the call is expected to be refused).\n"
             "Then reply with one line: the issue's number and the pull request's URL.")
 
 
@@ -195,10 +199,10 @@ def journal_checks(rows, fake):
     out.append(("the journal has a done row for github.comment", len(by("github.comment", "done")) >= 1, ""))
     out.append(("the journal has a done row for github.create_pr", len(by("github.create_pr", "done")) == 1, ""))
     refused = by("github.comment", "refused")
-    out.append(("the fake credential's comment was refused by the scan, its arguments withheld",
-                len(refused) == 1 and refused[0].get("args") == "(withheld)" and "GitHub token" in (refused[0].get("detail") or ""),
+    out.append(("the stored value's comment was refused by the scan, its arguments withheld",
+                len(refused) == 1 and refused[0].get("args") == "(withheld)" and f"the value of {SCAN_SECRET}" in (refused[0].get("detail") or ""),
                 short(refused)))
-    out.append(("no journal row holds the fake credential", fake not in json.dumps(rows), ""))
+    out.append(("no journal row holds the stored value", fake not in json.dumps(rows), ""))
     issue = by("github.create_issue", "done")
     out.append(("the issue's call came from a tainted session", bool(issue) and issue[0].get("tainted") is True, short(issue)))
     return out
@@ -338,6 +342,8 @@ def main():
 
         # 3. One agent, one turn; the check approves the issue's call when it's asked for.
         fake = fake_token()
+        s, _ = api("PUT", f"/v1/admin/secrets/{SCAN_SECRET}", {"value": fake})
+        expect(s in (200, 204), f"store this run's throwaway value as {SCAN_SECRET}", {"status": s})
         s, v = api("POST", "/v1/agents", {"template": TEMPLATE_NAME, "cell": CELL, "start": False})
         expect(s == 201, "create agent", v)
         agent = made["agent"] = v["agent"]
@@ -394,7 +400,7 @@ def main():
             mine = [c for c in comments if (c.get("user") or {}).get("login") == bot and f"Comment from nest's brokered check {RUN}" in (c.get("body") or "")]
             results.append(("the comment exists, by the App's bot, with nest's marker", len(mine) == 1 and MARKER in mine[0].get("body", ""),
                             short([((c.get("user") or {}).get("login"), (c.get("body") or "")[:60]) for c in comments])))
-            results.append(("no comment holds the fake credential", all(fake not in (c.get("body") or "") for c in comments), ""))
+            results.append(("no comment holds the stored value", all(fake not in (c.get("body") or "") for c in comments), ""))
         else:
             results.append(("the issue's journal row names its number", False, short(issue_row)))
         owner = REPO.split("/")[0]

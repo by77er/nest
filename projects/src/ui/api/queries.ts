@@ -2,9 +2,10 @@
 // asks) poll while the tab is visible; TanStack Query stops polling a hidden tab by default.
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api } from "./client";
+import { ApiError, api } from "./client";
 import type { CreateRoutineBody, PutSecretBody, UpdateRoutineBody } from "./types";
-import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody } from "./types";
+import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody, Waiting } from "./types";
+import { splitAttention } from "./types";
 
 export const keys = {
   projects: ["projects"] as const,
@@ -59,7 +60,9 @@ export function useInterruptManager(id: string) {
   return useMutation({ mutationFn: () => api.interruptManager(id), meta: { failure: "The manager wasn't stopped" } });
 }
 
-export const useAsks = (id: string) => useQuery({ queryKey: keys.asks(id), queryFn: () => api.asks(id), refetchInterval: POLL.asks });
+/** The project's open asks: "Needs you"'s, from the same read (one nest read serves both). */
+export const useAsks = (id: string) =>
+  useQuery({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks, select: (xs: Attention[]) => xs.filter((x): x is Extract<Attention, { kind: "ask" }> => x.kind === "ask") });
 
 /** The manager's status for its page (nest's agent record, read through the app). */
 export const useManager = (id: string) => useQuery({ queryKey: keys.manager(id), queryFn: () => api.manager(id), refetchInterval: POLL.manager });
@@ -124,13 +127,36 @@ export function useSetNetwork(id: string) {
 
 export const useAttention = (id: string) => useQuery({ queryKey: keys.attention(id), queryFn: () => api.attention(id), refetchInterval: POLL.asks });
 
+/**
+ * What "Needs you" can say, from the full read and (until it first arrives) the app's own items:
+ * - `asks: "read"`: the list is whole (`stale`: a later poll failed, so this is the read of `readAt`);
+ * - `"reading"`: nest's asks aren't in yet, only the app's own items are listed;
+ * - `"unavailable"`: the asks couldn't be read (nest, or the first full read failed), only the app's own are listed.
+ * Never a local-only list taken for the whole: its count isn't the count.
+ */
+export function useNeedsYouList(id: string): { items: Waiting[]; asks: "read" | "reading" | "unavailable"; stale: boolean; readAt: number } {
+  const full = useAttention(id);
+  const local = useLocalAttention(id, full.data === undefined);
+  if (full.data !== undefined) {
+    const split = splitAttention(full.data);
+    return { items: split.items, asks: split.asksError !== null ? "unavailable" : "read", stale: full.isRefetchError, readAt: full.dataUpdatedAt };
+  }
+  return { items: splitAttention(local.data).items, asks: full.isError ? "unavailable" : "reading", stale: false, readAt: 0 };
+}
+
+/** "Needs you"'s own items without the asks (no nest read), only until the full read first arrives. */
+export const useLocalAttention = (id: string, enabled: boolean) =>
+  useQuery({ queryKey: ["projects", id, "attention-local"], queryFn: () => api.attentionLocal(id), enabled });
+
 /** The owner answers a blocked task: its block clears, and the answer reaches the agents' inboxes. */
-export function useAnswerBlocked(id: string) {
+/** `onAnswered`: called before the block leaves the list (a callback given to `mutate` wouldn't be: its item is gone by then). */
+export function useAnswerBlocked(id: string, onAnswered?: () => void) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (v: { task: string; answer: string }) => api.answerBlocked(id, v.task, { answer: v.answer }),
     meta: { failure: "The answer wasn't sent" },
     onSuccess: (t) => {
+      onAnswered?.();
       qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "blocked" && x.task === t.id)));
       qc.setQueryData<Task[]>(keys.tasks(id), (old) => old?.map((x) => (x.id === t.id ? t : x)));
       void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
@@ -405,18 +431,29 @@ export function useRetryChat(id: string) {
  * Answer an ask. Not optimistic: an approval is a decision, so the ask stays (its buttons busy) until
  * nest has taken the answer, and an answer nest refuses leaves it as it was, typed text and all.
  */
-export function useAnswerAsk(id: string) {
+/**
+ * `onOutcome`: the answer was taken (`answered`), or refused as no longer open (`gone`: answered elsewhere, or
+ * its agent ended), called before the ask leaves the list (a callback given to `mutate` wouldn't be: its item
+ * is gone by then).
+ */
+export function useAnswerAsk(id: string, onOutcome?: (how: "answered" | "gone") => void) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (v: { ask: string; answer: string }) => api.answerAsk(id, v.ask, { answer: v.answer }),
-    meta: { failure: "The answer wasn't sent" },
-    onSuccess: (_d, v) => {
-      qc.setQueryData<Ask[]>(keys.asks(id), (old) => old?.map((a) => (a.ask === v.ask ? { ...a, answered_ms: Date.now() } : a)));
-      qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "ask" && x.ask === v.ask)));
-      void qc.invalidateQueries({ queryKey: keys.attention(id) });
-      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
-      return qc.invalidateQueries({ queryKey: keys.asks(id) });
+    // A 409 (answered elsewhere, or its agent ended) is said in "Needs you" itself, not as a failure.
+    meta: { failure: "The answer wasn't sent", inlineStatus: [409] },
+    onError: (e) => {
+      if (e instanceof ApiError && e.status === 409) onOutcome?.("gone");
     },
+    onSuccess: (_d, v) => {
+      onOutcome?.("answered");
+      // nest lists open asks only: an answered one is gone.
+      qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "ask" && x.ask === v.ask)));
+    },
+    // Either way, read nest's again: one refused as no longer open (answered elsewhere, its agent ended) goes at once.
+    onSettled: () => Promise.all([
+      qc.invalidateQueries({ queryKey: keys.attention(id) }), qc.invalidateQueries({ queryKey: keys.projects, exact: true }),
+    ]),
   });
 }
 

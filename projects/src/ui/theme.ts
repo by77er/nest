@@ -10,7 +10,7 @@
 
 import {
   ActionIcon, Alert, Badge, Burger, Button, CloseButton, Code, Collapse, createTheme, type CSSVariablesResolver, defaultVariantColorsResolver, Drawer, InputWrapper,
-  type MantineColorsTuple, Modal, NumberInput, Paper, parseThemeColor, Popover, Text, Timeline, Title, Tooltip, type VariantColorsResolver,
+  type MantineColorsTuple, Modal, Notification, NumberInput, Paper, parseThemeColor, Popover, Text, Timeline, Title, Tooltip, type VariantColorsResolver,
 } from "@mantine/core";
 import themeClasses from "./theme.module.css";
 
@@ -315,5 +315,7 @@ export const theme = createTheme({
     Popover: Popover.extend({ defaultProps: { shadow: "overlay", transitionProps: transition(motion.base) } }),
     Timeline: Timeline.extend({ defaultProps: { bulletSize: 12, lineWidth: 2 } }),
     Collapse: Collapse.extend({ defaultProps: { transitionDuration: motion.slow, transitionTimingFunction: motion.enter } }),
+    // A notification's message in the palette's muted gray (AA on the surface in both schemes), not Mantine's dimmed (3.3:1).
+    Notification: Notification.extend({ styles: { description: { color: "var(--nest-muted)" } } }),
   },
 });
