@@ -455,3 +455,34 @@ describe("asks", () => {
     expect(within(p).queryByRole("button", { name: /Show all/ })).toBeNull();
   });
 });
+
+describe("the default PR comments user cleared by a transfer (README.md#pr-comments)", () => {
+  it("says whose it was and who owns the repo now, links to Settings, and Leave it unset dismisses it", async () => {
+    const api = new FakeApi();
+    api.commentsCleared = { kind: "comments_cleared", was: { id: 1001, login: "owner" }, owner: { id: 2002, login: "new-owner" }, at_ms: Date.now() - 60_000 };
+    const { user } = renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    await waitFor(() => expect(p).toHaveTextContent("new-owner owns the repo now, so owner is no longer the PR comments user."));
+    expect(within(p).getByRole("link", { name: "Choose someone…" }).getAttribute("href")).toBe("/projects/prj_one/settings#pr-comments");
+    // Counted with the rest; the last item left here: focus goes on to the board's heading, and that's said.
+    await waitFor(() => expect(p.querySelector("[data-slot=count]")).toHaveTextContent("1"));
+    await user.click(within(p).getByRole("button", { name: "Leave it unset" }));
+    await answeredLast();
+    expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/comments-cleared/dismiss", body: undefined }]);
+    cleanup();
+  });
+
+  it("left unset with something else waiting: focus goes on to the next item's first control", async () => {
+    const api = new FakeApi();
+    api.commentsCleared = { kind: "comments_cleared", was: { id: 1001, login: "owner" }, owner: { id: 2002, login: "new-owner" }, at_ms: Date.now() - 60_000 };
+    const a = ask({ approval: { name: "github.create_pr", tool: "brokered" }, at_ms: Date.now() - 1_000 });
+    api.asks = [a];
+    const { user } = renderApp("/projects/prj_one/board", api);
+    const p = await panel();
+    await waitFor(() => expect(p.querySelector("[data-comments-cleared]")).not.toBeNull());
+    await user.click(within(p).getByRole("button", { name: "Leave it unset" }));
+    await waitFor(() => expect(p.querySelector("[data-comments-cleared]")).toBeNull());
+    expect(within(p.querySelector(`[data-ask="${a.ask}"]`) as HTMLElement).getByRole("button", { name: "Approve" })).toHaveFocus();
+    cleanup();
+  });
+});

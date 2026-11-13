@@ -109,6 +109,21 @@ describe("who 'you' is for issues", () => {
     expect(heading.closest("#triage")).not.toBeNull();
   });
 
+  it("arriving by Needs you's Choose someone… (#pr-comments), focus lands on that panel's heading, and the panel is scrolled into view", async () => {
+    const api = new FakeApi();
+    const scrolled: Element[] = [];
+    const was = HTMLElement.prototype.scrollIntoView;
+    HTMLElement.prototype.scrollIntoView = function (this: HTMLElement) { scrolled.push(this); };
+    try {
+      renderApp("/projects/prj_one/settings#pr-comments", api);
+      const heading = await screen.findByRole("heading", { name: "PR comments" });
+      await waitFor(() => expect(heading).toHaveFocus());
+      await waitFor(() => expect(scrolled.map((e) => e.id)).toContain("pr-comments"));
+    } finally {
+      HTMLElement.prototype.scrollIntoView = was;
+    }
+  });
+
   it("focus moves there once per arrival: a Save after it (which remounts the form) leaves focus on Save", async () => {
     const api = new FakeApi();
     const { user, router } = renderApp("/projects/prj_one/settings#triage", api);

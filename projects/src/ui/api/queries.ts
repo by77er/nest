@@ -237,6 +237,25 @@ function useHeldReview(id: string, act: (pr: number, sha: string) => Promise<unk
 export const useApproveReview = (id: string) => useHeldReview(id, (pr, sha) => api.approveReview(id, pr, sha), "The review wasn't started");
 export const useDismissReview = (id: string) => useHeldReview(id, (pr, sha) => api.dismissReview(id, pr, sha), "The review wasn't dismissed");
 
+/**
+ * Needs you's notice that the default PR comments user was cleared (README.md#pr-comments), seen. `onDone`:
+ * called before the notice leaves the list, as `useAnswerBlocked`'s `onAnswered`.
+ */
+export function useDismissCommentsCleared(id: string, onDone?: () => void) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.dismissCommentsCleared(id),
+    meta: { failure: "It wasn't dismissed" },
+    onSuccess: () => {
+      onDone?.();
+      qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => x.kind !== "comments_cleared"));
+      qc.setQueryData<Attention[]>(["projects", id, "attention-local"], (old) => old?.filter((x) => x.kind !== "comments_cleared"));
+      void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
+      return qc.invalidateQueries({ queryKey: keys.attention(id) });
+    },
+  });
+}
+
 export function useSecretRequestDone(id: string) {
   const qc = useQueryClient();
   return useMutation({

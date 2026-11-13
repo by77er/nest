@@ -225,7 +225,8 @@ describe("B20: terminal history-like rows pruned by age", () => {
       sql.exec("INSERT INTO jobs (pr, sha, state, attempts, created_ms, updated_ms) VALUES (8, ?, 'superseded', 0, 0, ?), (8, ?, 'done', 0, 0, ?)", sha(), old, sha(), Date.now());
       // An old ended job whose check's completion is still owed to GitHub: kept.
       sql.exec("INSERT INTO jobs (pr, sha, state, attempts, check_run, created_ms, updated_ms) VALUES (7, ?, 'closed', 0, 4711, 0, ?)", sha(), old);
-      sql.exec("INSERT INTO check_updates (check_run, body, next_ms) VALUES (4711, '{}', ?)", Date.now());
+      // (Due later: an alarm's drain meanwhile would send it, and the row would go as it should.)
+      sql.exec("INSERT INTO check_updates (check_run, body, next_ms) VALUES (4711, '{}', ?)", Date.now() + 3_600_000);
       // The review gate's states (README.md#the-review-gate): one the owner dismissed long ago goes like any
       // ended job; one still waiting for approval never does, however old.
       sql.exec("INSERT INTO jobs (pr, sha, state, attempts, created_ms, updated_ms) VALUES (6, ?, 'dismissed', 0, 0, ?), (5, ?, 'held', 0, 0, ?), (4, ?, 'overflow', 0, 0, ?)", sha(), old, sha(), old, sha(), old);

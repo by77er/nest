@@ -83,6 +83,8 @@ export class FakeApi {
   reviews: Job[] = [];
   /** PRs past the review queue's limits, with no job yet. */
   reviewBacklog = 0;
+  /** The default PR comments user cleared by a transfer (README.md#pr-comments), as Needs you lists it. */
+  commentsCleared: Extract<Attention, { kind: "comments_cleared" }> | null = null;
   waits: Waits = { pending: [], recent: [] };
   workflowWorkers: string[] = [];
   /** `PUT network`'s answer instead of saving: a refusal (403 with `problems`, say). */
@@ -168,7 +170,7 @@ export class FakeApi {
     const waiting = [...this.issues.map((i) => i.opened_ms), ...this.proposals.map((p) => p.created_ms)];
     const triage: Attention[] = waiting.length ? [{ kind: "triage", count: this.issues.length, proposals: this.proposals.length, at_ms: Math.min(...waiting) }] : [];
     const backlog: Attention[] = this.reviewBacklog ? [{ kind: "review_backlog", count: this.reviewBacklog, at_ms: Date.now() - 60_000 }] : [];
-    return [...asks, ...blocked, ...secrets, ...held, ...backlog, ...triage].sort((a, b) => a.at_ms - b.at_ms);
+    return [...asks, ...blocked, ...secrets, ...held, ...backlog, ...triage, ...(this.commentsCleared ? [this.commentsCleared] : [])].sort((a, b) => a.at_ms - b.at_ms);
   }
 
   private move(t: Task, event: TaskEvent): Response | null {
@@ -254,6 +256,9 @@ export class FakeApi {
       }
       case "GET manager":
         return json(this.manager);
+      case "POST comments-cleared/dismiss":
+        this.commentsCleared = null;
+        return json({ dismissed: true });
       case "POST attach":
         this.manager = { ...this.manager, phase: "starting", error: null };
         return json(p.settings);

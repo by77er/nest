@@ -9,7 +9,7 @@ import { applyRename } from "../src/binding";
 import type { RepoBinding } from "../src/do/directory";
 import type { Env } from "../src/env";
 import { nestFrom } from "../src/nest";
-import { AccessTeam, api, deliverGithub, FakeNest, GH_INSTALLATION_ID, installFetch, repoIdOf } from "./fake-nest";
+import { AccessTeam, api, deliverGithub, FakeNest, GH_INSTALLATION_ID, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf } from "./fake-nest";
 
 const fake = new FakeNest();
 const gh = fake.github;
@@ -54,6 +54,8 @@ const issue = (n: number, repository: Record<string, unknown>) => ({
 });
 const numbers = async (p: P) => ((await api(token, "GET", `/api/projects/${p.id}/issues`)).body as { number: number }[]).map((i) => i.number);
 const settingsRepo = async (p: P) => (await api(token, "GET", `/api/projects/${p.id}`)).body.repo as string;
+const oldOwnerCopy = (p: P) => runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) =>
+  st.storage.sql.exec<{ repo_owner_id: number | null; repo_owner_login: string | null }>("SELECT repo_owner_id, repo_owner_login FROM settings").one());
 const reviewRepo = (p: P) => runInDurableObject(env.REVIEW.get(env.REVIEW.idFromName(p.id)), (_o, st) =>
   st.storage.sql.exec<{ v: string }>("SELECT v FROM settings WHERE k = 'repo'").one().v);
 
@@ -140,7 +142,7 @@ describe("a re-read never rebinds by itself", () => {
     const r = await reread(p);
     expect(r.status).toBe(200);
     expect(r.body.mismatch).toEqual({
-      bound: { full_name: p.repo, id: repoIdOf(p.repo), owner: before.owner },
+      bound: { full_name: p.repo, id: repoIdOf(p.repo), owner: { id: before.owner!.id, login: before.owner!.login } },
       github: { full_name: p.repo, id: impostor, owner: { id: 31_337, login: owner }, same_owner: false },
     });
     // Nothing written: still the owner's repo, and its events still reach the project.
@@ -217,7 +219,45 @@ describe("the App installation", () => {
     await dirSql("UPDATE projects SET repo_id = NULL, repo_bound = NULL WHERE id = ?", p.id);
     const r = await deliverGithub("issues", { ...issue(1, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: 5 } });
     expect(((await r.json()) as { ignored: string }).ignored).toContain("isn't the project's");
-    expect((await binding(p)).repo_id).toBeNull();
+    // The refused event's id isn't taken (the binding read again for its installation reads the id from GitHub).
+    expect((await binding(p)).bound).not.toBe("event");
+    expect(await numbers(p)).toEqual([]);
+  });
+
+  it("a reinstalled App: once nest mints from the new installation, its events are taken by themselves, no Re-read; one nest doesn't name is still refused", async () => {
+    const p = await newProject();
+    const reinstalled = GH_INSTALLATION_ID + 200;
+    fake.tokenInstallation = reinstalled;
+    const r = await deliverGithub("issues", { ...issue(1, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: reinstalled } });
+    expect(await r.json()).toEqual({ ok: true });
+    expect(await numbers(p)).toEqual([1]);
+    expect(await binding(p)).toMatchObject({ installation_id: reinstalled, refused: null });
+    // Another installation, which nest doesn't mint from: refused and counted, the binding as it was, and
+    // GitHub read at most once a minute for it however many come.
+    const reads = () => gh.callsTo("GET", new RegExp(`^/repos/${p.repo}$`)).length;
+    const before = reads();
+    for (const n of [2, 3]) {
+      const x = await deliverGithub("issues", { ...issue(n, { id: repoIdOf(p.repo), full_name: p.repo }), installation: { id: 999 } });
+      expect(((await x.json()) as { ignored: string }).ignored).toContain("installation (999)");
+    }
+    expect(await numbers(p)).toEqual([1]);
+    expect(await binding(p)).toMatchObject({ installation_id: reinstalled, refused: { installation: 999, count: 2 } });
+    expect(reads()).toBe(before);
+  });
+
+  it("a token for a name GitHub redirects (moved, no event naming the new name yet) never stores its installation", async () => {
+    const p = await newProject();
+    const to = `elsewhere-${rand()}/moved`;
+    gh.rename(p.repo, to);
+    // nest mints for the old name from the installation on the account the repo moved to (and its grant
+    // doesn't name the new one, so the rename waits).
+    fake.grantRepos = [p.repo];
+    fake.tokenInstallation = 31_337;
+    expect((await reread(p)).status).toBe(200);
+    expect(await binding(p)).toMatchObject({ repo_id: repoIdOf(p.repo), installation_id: GH_INSTALLATION_ID, renamed_to: to });
+    // So that account's events are still refused.
+    const r = await deliverGithub("issues", { ...issue(1, { id: repoIdOf(p.repo), full_name: to }), installation: { id: 31_337 } });
+    expect(((await r.json()) as { ignored: string }).ignored).toContain("isn't the project's");
   });
 
   it("a token minted for the old name (the new one not in nest's grant yet) never stores its installation", async () => {
@@ -329,23 +369,38 @@ describe("a renamed or transferred repo", () => {
     expect(await settingsRepo(a)).toBe(to);
   });
 
-  it("a rename ReviewDO can't follow is taken back everywhere: the directory and ProjectDO keep the old name, and it's tried again", async () => {
+  it("a rename reaches every reader at once: the directory holds the one name, and ProjectDO, ReviewDO and the Worker read it, whatever their old copies say", async () => {
     const p = await newProject();
     const to = `${p.repo}-renamed`;
     gh.rename(p.repo, to);
     await deliverGithub("issues", issue(1, { id: repoIdOf(p.repo), full_name: to }));
     fake.grantRepos = [p.repo, to];
+    // ReviewDO's old copy (the previous release's) can't be written: the rename is applied all the same.
     const rv = env.REVIEW.get(env.REVIEW.idFromName(p.id));
     await runInDurableObject(rv, (_o, st) => { st.storage.sql.exec("ALTER TABLE settings RENAME TO settings_hidden"); });
-    const r = await reread(p);
-    expect(r.body.rename).toEqual({ blocked: expect.stringContaining("couldn't be applied") });
-    await runInDurableObject(rv, (_o, st) => { st.storage.sql.exec("ALTER TABLE settings_hidden RENAME TO settings"); });
-    expect(await binding(p)).toMatchObject({ repo: p.repo, renamed_to: to });
-    expect(await settingsRepo(p)).toBe(p.repo);
-    expect(await reviewRepo(p)).toBe(p.repo);
     expect((await reread(p)).body.rename).toEqual({ applied: to });
+    await runInDurableObject(rv, (_o, st) => { st.storage.sql.exec("ALTER TABLE settings_hidden RENAME TO settings"); });
+    expect(await reviewRepo(p)).toBe(p.repo);
+    // ProjectDO's old copy says the old name too.
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => { st.storage.sql.exec("UPDATE settings SET repo = ?", p.repo); });
+    // The Worker answers the new name.
     expect(await settingsRepo(p)).toBe(to);
+    expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.repo).toBe(to);
+    // ProjectDO calls GitHub by it.
+    await api(token, "POST", `/api/projects/${p.id}/issues/import`);
+    expect(gh.callsTo("GET", new RegExp(`^/repos/${to}/issues`)).length).toBeGreaterThan(0);
+    expect(gh.callsTo("GET", new RegExp(`^/repos/${p.repo}/issues`))).toEqual([]);
+    // ReviewDO makes its check runs under it.
+    const head = shaOf("renamed-head");
+    const e = prEvent({ repo: to, number: 3, sha: head, action: "opened" });
+    await deliverGithub("pull_request", { ...e, repository: { ...e.repository, id: repoIdOf(p.repo) } });
+    await rv.drain();
+    expect(gh.runsOf(to, head)).toHaveLength(1);
+    expect(gh.callsTo("POST", new RegExp(`^/repos/${p.repo}/check-runs`))).toEqual([]);
+    // The next sync writes the old copies again, for a rollback to find.
+    expect((await sync()).status).toBe(200);
     expect(await reviewRepo(p)).toBe(to);
+    expect(await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => st.storage.sql.exec<{ repo: string }>("SELECT repo FROM settings").one().repo)).toBe(to);
   });
 
   it("a directory rename that's refused (its state moved after the name check) renames neither ProjectDO nor ReviewDO", async () => {
@@ -374,6 +429,168 @@ describe("a renamed or transferred repo", () => {
     const r = await reread(p);
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ changed: false, binding: { repo_id: repoIdOf(p.repo), renamed_to: to } });
+  });
+});
+
+describe("a sync reads again what may have moved", () => {
+  it("a binding with a rename noted, or events refused: its owner and installation as GitHub and nest answer now, and the previous release's owner copy with them", async () => {
+    // Transferred: its events name the new name; the rename waits (not in nest's grant), the read doesn't.
+    const a = await newProject();
+    const newOwner = `n-${rand()}`;
+    const to = `${newOwner}/moved`;
+    gh.rename(a.repo, to);
+    await deliverGithub("issues", issue(1, { id: repoIdOf(a.repo), full_name: to }));
+    expect(await binding(a)).toMatchObject({ renamed_to: to, owner: { login: a.repo.split("/")[0] } });
+    fake.grantRepos = [a.repo];
+    expect((await sync()).status).toBe(200);
+    expect((await binding(a)).owner).toMatchObject({ id: ownerIdOf(newOwner), login: newOwner });
+    // The copy a rolled-back release trusts is the owner now, not the one at attach.
+    expect(await oldOwnerCopy(a)).toEqual({ repo_owner_id: ownerIdOf(newOwner), repo_owner_login: newOwner });
+    // Events refused while nest still answered the old installation (the minute's read spent on that).
+    fake.grantRepos = null;
+    const b = await newProject();
+    const reinstalled = GH_INSTALLATION_ID + 300;
+    await deliverGithub("issues", { ...issue(1, { id: repoIdOf(b.repo), full_name: b.repo }), installation: { id: reinstalled } });
+    expect(await binding(b)).toMatchObject({ installation_id: GH_INSTALLATION_ID, refused: { count: 1 } });
+    fake.tokenInstallation = reinstalled;
+    expect((await sync()).status).toBe(200);
+    expect(await binding(b)).toMatchObject({ installation_id: reinstalled, refused: null });
+  });
+
+  it("an owner the previous release wrote (without its kind) has no kind, so no sync copies it as a user's", async () => {
+    const p = await newProject();
+    const owner = p.repo.split("/")[0]!;
+    expect((await binding(p)).owner).toEqual({ id: ownerIdOf(owner), login: owner, type: "User" });
+    // A rolled-back release's read: another owner (an organization, say), its kind column left as it was.
+    await dirSql("UPDATE projects SET repo_owner_id = 55503, repo_owner_login = 'an-org' WHERE id = ?", p.id);
+    expect((await binding(p)).owner).toEqual({ id: 55503, login: "an-org", type: null });
+    expect((await sync()).status).toBe(200);
+    expect(await oldOwnerCopy(p)).toEqual({ repo_owner_id: ownerIdOf(owner), repo_owner_login: owner });
+  });
+
+  it("attach takes a token's installation only for the name GitHub answers with: a redirected name's may be another account's", async () => {
+    const from = `o-${rand()}/r-${rand()}`;
+    const to = `elsewhere-${rand()}/moved`;
+    gh.repo(from);
+    gh.rename(from, to);
+    // nest's grant names the old name only, and mints for it from the installation on the account it moved to.
+    fake.grantRepos = [from];
+    fake.tokenInstallation = 31_337;
+    const p = (await api(token, "POST", "/api/projects", { name: from, repo: from })).body;
+    expect(p.settings).toMatchObject({ attached: true });
+    expect((await api(token, "GET", "/api/admin/bindings")).body.find((b: RepoBinding) => b.project === p.id)).toMatchObject({ repo_id: repoIdOf(from), installation_id: null, renamed_to: to });
+  });
+});
+
+describe("a binding not read from GitHub yet (no id, or one from an event)", () => {
+  it("an event routed by the repo's name alone trusts nobody by owning it", async () => {
+    const p = await newProject();
+    // Someone else is the comments user, so only ownership is tested.
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { comments_from_id: 4321, issues_from: "trusted" });
+    await dirSql("UPDATE projects SET repo_id = NULL, repo_bound = NULL, installation_id = NULL WHERE id = ?", p.id);
+    // The repo under the name now (its owner's, as far as the event says): routed by the name.
+    const owner = { id: ownerIdOf(p.repo.split("/")[0]!), login: p.repo.split("/")[0]!, type: "User" };
+    await deliverGithub("issues", { ...issue(1, { id: repoIdOf(p.repo), full_name: p.repo, owner }), issue: { ...issue(1, {}).issue, user: { login: owner.login, id: owner.id } } });
+    expect(await numbers(p)).toEqual([]);
+    // Bound from GitHub (a sync), the same owner's events count.
+    expect((await sync()).status).toBe(200);
+    await deliverGithub("issues", { ...issue(2, { full_name: p.repo }), issue: { ...issue(2, {}).issue, user: { login: owner.login, id: owner.id } } });
+    expect(await numbers(p)).toEqual([2]);
+  });
+
+  it("is bound to GitHub's repo for its name only with the owner recorded at attach: a name taken over isn't bound by a sync, a refused event or attach; Re-read shows both", async () => {
+    const p = await newProject();
+    const mallory = { id: 987_654, login: "mallory" };
+    // No id yet, and none of the binding's own owner (learned from an event): the owner recorded at attach decides.
+    await dirSql("UPDATE projects SET repo_id = NULL, repo_bound = NULL, repo_owner_id = NULL, repo_owner_login = NULL WHERE id = ?", p.id);
+    // The name is another repo now, mallory's, on mallory's installation, and nest mints for it from there.
+    gh.rename(p.repo, `${p.repo}-gone`);
+    const taken = gh.take(p.repo, mallory.id);
+    fake.tokenInstallation = 777;
+    const r = await deliverGithub("issues", { ...issue(1, { id: taken, full_name: p.repo, owner: { ...mallory, type: "User" } }), installation: { id: 777 } });
+    expect(((await r.json()) as { ignored: string }).ignored).toContain("isn't the project's");
+    expect(await binding(p)).toMatchObject({ repo_id: null, installation_id: GH_INSTALLATION_ID, error: expect.stringContaining("the owner recorded for the project") });
+    expect((await sync()).status).toBe(200);
+    expect(await binding(p)).toMatchObject({ repo_id: null, installation_id: GH_INSTALLATION_ID });
+    expect((await api(token, "POST", `/api/projects/${p.id}/attach`)).status).toBe(200);
+    expect((await binding(p)).repo_id).toBeNull();
+    // The operator's Re-read: both, and nothing written; their choice binds it.
+    const rr = await reread(p);
+    expect(rr.body.mismatch).toMatchObject({ bound: { id: null, owner: { id: ownerIdOf(p.repo.split("/")[0]!) } }, github: { id: taken, owner: { id: mallory.id }, same_owner: false } });
+    expect((await binding(p)).repo_id).toBeNull();
+    expect((await bind(p, taken)).body.binding).toMatchObject({ repo_id: taken });
+  });
+
+  it("Settings shows the owner of the bound repo only: GitHub's repo for the name being another, nobody", async () => {
+    const p = await newProject();
+    const owner = p.repo.split("/")[0]!;
+    expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.repo_owner).toEqual({ id: ownerIdOf(owner), login: owner });
+    // Bound to another id than GitHub's repo for the name (a fresh one, so nothing shown before is reused).
+    await dirSql("UPDATE projects SET repo_id = ? WHERE id = ?", repoIdOf(p.repo) + 7, p.id);
+    expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.repo_owner).toBeNull();
+  });
+
+  it("\"Use the repo owner\" and an import read the owner of the bound repo only: GitHub's repo for the name being another, they're refused", async () => {
+    const p = await newProject();
+    gh.rename(p.repo, `${p.repo}-gone`);
+    gh.take(p.repo, 987_654);
+    const use = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { comments_from_repo_owner: true });
+    expect(use.status).toBe(409);
+    expect(use.body.error).toContain("not the bound repo");
+    const imp = await api(token, "POST", `/api/projects/${p.id}/issues/import`);
+    expect(imp.status).toBe(409);
+    expect(imp.body.error).toContain("not the bound repo");
+  });
+});
+
+describe("DirectoryDO not answering", () => {
+  /** DirectoryDO's projects unreadable for `f`'s length, as when it doesn't answer. */
+  const directoryDown = async <T>(f: () => Promise<T>): Promise<T> => {
+    await dirSql("ALTER TABLE projects RENAME TO projects_hidden");
+    try {
+      return await f();
+    } finally {
+      await dirSql("ALTER TABLE projects_hidden RENAME TO projects");
+    }
+  };
+
+  it("ProjectDO's drain goes on: a routine run that needs the repo's name is retried, a stop owed still goes", async () => {
+    const p = await newProject();
+    const routine = (await api(token, "POST", `/api/projects/${p.id}/routines`, {
+      name: "R", kind: "custom", prompt: "Look around.", enabled: true, triggers: { timer: null, tasks_done: null, prs_merged: null },
+      cooldown_min: 0, max_minutes: 30, max_turns: 3, proposals: "triage",
+    })).body.id as string;
+    // Its first start fails (nest), so it waits to be tried again.
+    fake.failures.push({ match: /^POST \/v1\/sandboxes$/, status: 503, retryable: true, times: 50 });
+    expect((await api(token, "POST", `/api/projects/${p.id}/routines/${routine}/run`)).status).toBe(200);
+    fake.failures = [];
+    const stub = env.PROJECT.get(env.PROJECT.idFromName(p.id));
+    await runInDurableObject(stub, (_o, st) => {
+      st.storage.sql.exec("UPDATE routine_runs SET next_ms = 0, spawn = NULL WHERE state = 'starting'");
+      st.storage.sql.exec("INSERT INTO stops (agent, task, reason, next_ms) VALUES ('agt_owed', NULL, 'test', 0)");
+    });
+    await directoryDown(() => stub.drain());
+    expect(fake.calls.some((c) => c.path === "/v1/agents/agt_owed/stop")).toBe(true);
+    const run = await runInDurableObject(stub, (_o, st) => st.storage.sql.exec("SELECT state, error, next_ms FROM routine_runs").one());
+    expect(run).toMatchObject({ state: "starting", error: expect.stringContaining("projects") });
+    expect(run.next_ms as number).toBeGreaterThan(Date.now());
+  });
+
+  it("ReviewDO's drain goes on: a reviewer's stop owed still goes, and the rest is tried again shortly", async () => {
+    const p = await newProject();
+    const rv = env.REVIEW.get(env.REVIEW.idFromName(p.id));
+    await runInDurableObject(rv, (_o, st) => {
+      st.storage.sql.exec("INSERT INTO stops (agent, reason, next_ms) VALUES ('agt_review_owed', 'test', 0)");
+      // A check's update owed to GitHub, which needs the name.
+      st.storage.sql.exec("INSERT INTO check_updates (check_run, body, next_ms) VALUES (4712, '{}', 0)");
+    });
+    const before = gh.calls.length;
+    await directoryDown(() => rv.drain());
+    expect(fake.calls.some((c) => c.path === "/v1/agents/agt_review_owed/stop")).toBe(true);
+    expect(gh.calls.length).toBe(before);
+    // Tried again shortly, not at once (no spinning on a DirectoryDO that doesn't answer).
+    const alarm = await runInDurableObject(rv, (_o, st) => st.storage.getAlarm());
+    expect(alarm).toBeGreaterThan(Date.now() + 1_000);
   });
 });
 

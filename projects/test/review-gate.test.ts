@@ -7,7 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { CHECK_NAME } from "../src/github";
 import { MAX_HELD, MAX_OVERFLOW, reviewDecision, trustedAuthor } from "../src/review-trust";
-import { AccessTeam, api, deliverGithub, FakeNest, installFetch, ownerIdOf, prEvent, Signer } from "./fake-nest";
+import { AccessTeam, api, deliverGithub, FakeNest, installFetch, ownerIdOf, prEvent, repoIdOf, Signer } from "./fake-nest";
 
 describe("who is trusted (pure)", () => {
   const ids = { comments_from: 11, repo_owner: 22, app_bot: 33 };
@@ -78,8 +78,11 @@ const attention = async (p: P) => ((await api(token, "GET", `/api/projects/${p.i
 const going = (state: string) => (state === "queued" || state === "running" ? "going" : state);
 const stranger = { id: 987_654, login: "mallory", type: "User" };
 
-function push(p: P, number: number, s: string, action = "opened", o: Record<string, unknown> = {}) {
-  return deliverGithub("pull_request", prEvent({ repo: p.repo, number, sha: s, action, updated_at: later(), ...o }));
+function push(p: P, number: number, s: string, action = "opened", o: Record<string, unknown> & { owner?: Record<string, unknown> } = {}) {
+  const { owner, ...rest } = o;
+  const e = prEvent({ repo: p.repo, number, sha: s, action, updated_at: later(), ...rest });
+  // The repo's owner as the event names it, when the test gives one (else GitHub's answer for the name).
+  return deliverGithub("pull_request", owner ? { ...e, repository: { ...e.repository, owner } } : e);
 }
 const approve = (p: P, pr: number, s: string) => api(token, "POST", `/api/projects/${p.id}/reviews/${pr}/${s}/approve`);
 const dismiss = (p: P, pr: number, s: string) => api(token, "POST", `/api/projects/${p.id}/reviews/${pr}/${s}/dismiss`);
@@ -456,6 +459,50 @@ describe("the owner's approval is for one head commit", () => {
     await push(p, 3, sha(), "opened");
     expect(going((await job(p, 1, own)).state)).toBe("going");
     expect((await job(p, 2, forked)).state).toBe("held");
+  });
+
+  it("the repo's owner is the one the signed event names, never the one the project saw at attach", async () => {
+    const p = await newProject();
+    // Someone else is the comments user (the owner's own choice), so only ownership is tested here.
+    expect((await api(token, "PATCH", `/api/projects/${p.id}/settings`, { comments_from_id: stranger.id })).status).toBe(200);
+    const atAttach = { id: ownerIdOf(p.owner), login: p.owner, type: "User" };
+    const named = { id: 55_501, login: "named-owner", type: "User" };
+    // An event naming another user as the repo's owner: that user's PR is trusted, the attach-time owner's isn't.
+    const a = sha();
+    const b = sha();
+    await push(p, 1, a, "opened", { user: named, owner: named });
+    await push(p, 2, b, "opened", { user: atAttach, owner: named });
+    expect(going((await job(p, 1, a)).state)).toBe("going");
+    expect((await job(p, 2, b)).state).toBe("held");
+    // An organization named as the owner trusts no one by ownership, even an account with its id.
+    const c = sha();
+    await push(p, 3, c, "opened", { user: { ...named, id: 55_502 }, owner: { id: 55_502, login: "an-org", type: "Organization" } });
+    expect((await job(p, 3, c)).state).toBe("held");
+  });
+
+  it("after a transfer, the account the repo left is no longer trusted by having owned it; the new owner is", async () => {
+    const p = await newProject();
+    expect((await api(token, "PATCH", `/api/projects/${p.id}/settings`, { comments_from_id: stranger.id })).status).toBe(200);
+    const old = { id: ownerIdOf(p.owner), login: p.owner, type: "User" };
+    const before = sha();
+    await push(p, 1, before, "opened", { user: old });
+    expect(going((await job(p, 1, before)).state)).toBe("going");
+    // Transferred on GitHub: its events name the new owner (and name) from now on; the project's binding
+    // hasn't been read again, so the repo's id routes them.
+    const newOwner = `n-${rand()}`;
+    const to = `${newOwner}/moved`;
+    gh.rename(p.repo, to);
+    const after = sha();
+    const theirs = sha();
+    // Named by its new name, with its id (the fake's, from its first name), as is its PRs' head repo (not a fork).
+    const moved = (e: ReturnType<typeof prEvent>) => ({
+      ...e, repository: { ...e.repository, id: repoIdOf(p.repo) },
+      pull_request: { ...e.pull_request, head: { ...e.pull_request.head, repo: { ...e.pull_request.head.repo, id: repoIdOf(p.repo) } } },
+    });
+    await deliverGithub("pull_request", moved(prEvent({ repo: to, number: 2, sha: after, action: "opened", updated_at: later(), user: old })));
+    await deliverGithub("pull_request", moved(prEvent({ repo: to, number: 3, sha: theirs, action: "opened", updated_at: later(), user: { id: ownerIdOf(newOwner), login: newOwner, type: "User" } })));
+    expect((await job(p, 2, after)).state).toBe("held");
+    expect(going((await job(p, 3, theirs)).state)).toBe("going");
   });
 
   it("one held check per PR per interval: fast pushes cost GitHub one check, and a superseded held head no update", async () => {

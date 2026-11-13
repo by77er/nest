@@ -27,5 +27,13 @@ export function issuesFromWho(s: { comments_from: { id: number; login: string | 
   return who.map((w) => w.name);
 }
 
+/**
+ * Why the default PR comments user went (README.md#pr-comments), said the same way in "Needs you" and in
+ * the Manager page's context: the repo's owner is another account now.
+ */
+export function commentsCleared(x: { was: { id: number; login: string | null }; owner: { login: string } }): string {
+  return `${x.owner.login} owns the repo now, so ${x.was.login ?? `user ${x.was.id}`} is no longer the PR comments user`;
+}
+
 /** "by77er", "by77er and alice". */
 export const names = (who: string[]) => (who.length > 1 ? `${who.slice(0, -1).join(", ")} and ${who.at(-1)}` : (who[0] ?? ""));

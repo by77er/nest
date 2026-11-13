@@ -88,6 +88,8 @@ describe("a review nest has no room for", () => {
       const s = sha();
       await push(p, 1, s);
       await run(p);
+      // Again: the check's update owed by the first is sent (not left to the alarm's timing).
+      await run(p);
       let j = await job(p, 1, s);
       expect(j).toMatchObject({ state: "queued", error: expect.stringMatching(/waiting for room in nest to start a reviewer: .*max_sandboxes/) });
       expect(live(p, 1)).toEqual([]);
@@ -112,6 +114,7 @@ describe("a review nest has no room for", () => {
       // Room: it starts, and its check says it's reviewing again.
       fake.maxSandboxes = null;
       await dueNow(p);
+      await run(p);
       await run(p);
       j = await job(p, 1, s);
       expect(j).toMatchObject({ state: "running" });
