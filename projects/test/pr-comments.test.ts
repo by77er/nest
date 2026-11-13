@@ -395,6 +395,10 @@ describe("delivery", () => {
     expect((await taskOf(s)).history.at(-1)).toMatchObject({ action: "pr_comment" });
     await dueNow(s);
     await drain(s);
+    // The comment is owed (a message, due now) once the brief is sent, so it goes at the drain's next pass: a
+    // pass reads what's due as of its start, and the start's awaits (DirectoryDO's name, real I/O) move
+    // workerd's clock past it. That pass is the alarm's, racing this read; the test's own makes it certain.
+    await drain(s);
     const t = await taskOf(s);
     const theirs = fake.inbox.filter((m) => m.agent === t.assignee).map((m) => m.text);
     expect(theirs).toHaveLength(2);
