@@ -5,6 +5,7 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github.json";
+import noneFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github_none.json";
 import readFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github_read.json";
 import { grantOfEntry } from "../src/lib/brokered";
 import { SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS } from "../src/lib/github";
@@ -27,16 +28,34 @@ describe("the GitHub rule constructor", () => {
     expect(f.allow).toEqual([{ host: "api.github.com" }]);
   });
 
-  it("an empty allowlist still refuses every push: the guards stay, with no repo exceptions, no token, no GraphQL", () => {
+  it("no token of nest's own: writes pass only with a credential nest injected whole in Authorization, as in the fixture nest-proxy evaluates", () => {
     const f = githubEgress([]);
-    expect(f.guards.map((g) => g.name)).toEqual(["github-push", "github-write", "github-api-write", "gist-write", "githubusercontent-write"]);
-    const push = f.guards.find((g) => g.name === "github-push")!;
-    expect(push.allow).toBeUndefined();
-    expect(f.guards.find((g) => g.name === "github-api-write")!.allow).toBeUndefined();
-    // Fetches stay open with no allowlist.
-    expect(f.guards.find((g) => g.name === "github-write")!.allow!.map((a) => a.path)).toEqual(["/**/git-upload-pack", "/**/info/lfs/objects/batch"]);
+    expect(f.guards).toEqual(noneFixture.guards);
+    const allow = (name: string) => f.guards.find((g) => g.name === name)!.allow ?? [];
+    const VIA_NEST = { injected: "*", at: "authorization" };
+    // Each write guard excepts nest's credential, and push discovery (git asks for one only after its 401) goes bare.
+    expect(allow("github-push")).toEqual([{ methods: ["GET", "HEAD"], path: "/**/info/refs", query: [{ name: "service", values: ["git-receive-pack"] }] }, VIA_NEST]);
+    expect(allow("github-write").at(-1)).toEqual(VIA_NEST);
+    expect(allow("github-api-write")).toEqual([VIA_NEST]);
+    // Gists and the content hosts still take no write at all.
+    expect(allow("gist-write")).toEqual([]);
+    expect(allow("githubusercontent-write")).toEqual([]);
     expect(f.inject).toEqual([]);
     expect(f.allow).toEqual([]);
+  });
+
+  it("nest's own GitHub token anywhere (repos, read-only repos, an operator binding by a GitHub name or placeholder) keeps the old guards, with no exception for any credential", () => {
+    const viaNest = (f: ReturnType<typeof githubEgress>) => f.guards.some((g) => (g.allow ?? []).some((m) => m.injected === "*"));
+    expect(viaNest(githubEgress(["a/b"]))).toBe(false);
+    expect(viaNest(githubEgress([], ["a/b"]))).toBe(false);
+    for (const b of [{ ...githubBinding(), name: "github" }, { ...githubBinding(), name: "github_read" }, { ...githubBinding(), name: "github_read_default" },
+      { ...githubBinding(), name: "pat" }, { ...githubBinding(), name: "pat", placeholder: GITHUB_READ_PLACEHOLDER }]) {
+      const f = githubEgress([], [], [b]);
+      expect(viaNest(f), b.name).toBe(false);
+      expect(f.guards.find((g) => g.name === "github-push")!.allow, b.name).toBeUndefined();
+    }
+    // An operator binding under another name and placeholder is no token of nest's GitHub.
+    expect(viaNest(githubEgress([], [], [{ ...githubBinding(), name: "stripe", placeholder: "ph-stripe", hosts: ["api.stripe.com"] }]))).toBe(true);
   });
 
   it("uses the placeholder the guest image's credential helper and GITHUB_TOKEN carry", () => {
@@ -347,7 +366,9 @@ describe("a sandbox's push allowlist", () => {
     // Emptied: the proxy's set is replaced without it, the policy has no binding, and BrokerDO forgot it.
     const policy = await stub.setPolicy({ repos: [] });
     expect(policy.inject).toEqual([]);
-    expect(policy.guards!.find((g) => g.name === "github-push")!.allow).toBeUndefined();
+    // No repo of its own left: a push passes only with a credential nest injects, and none is bound here.
+    expect(policy.guards!.find((g) => g.name === "github-push")!.allow!.some((m) => "path" in m && m.path!.includes(mine))).toBe(false);
+    expect(policy.guards!.find((g) => g.name === "github-push")!.allow!.at(-1)).toEqual({ injected: "*", at: "authorization" });
     cmds = await nextCommands(ws, (c) => c.type === "secrets_update");
     expect(cmds.find((c) => c.type === "secrets_update").secrets).toEqual([]);
     const left = await runInDurableObject(env.BROKER.get(env.BROKER.idFromName("broker")), async (_i, st) =>

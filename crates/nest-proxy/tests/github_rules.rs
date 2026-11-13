@@ -1,11 +1,13 @@
 //! The seam between the control plane's GitHub rule constructor (`control-plane/src/lib/rules/github.ts`)
 //! and the proxy's generic evaluator: the constructor's output for `by77er/nest` and `by77er/nest-fork`
 //! is the fixture `protocol/fixtures/control/egress_policy/egress_policy.github.json` (a vitest asserts
-//! the constructor still produces it), and with read-only repos `egress_policy.github_read.json`; here
-//! the proxy evaluates real GitHub request shapes against them.
+//! the constructor still produces it), with read-only repos `egress_policy.github_read.json`, and in a
+//! sandbox where nest injects no GitHub token of its own `egress_policy.github_none.json`; here the
+//! proxy evaluates real GitHub request shapes against them.
 
 use nest_protocol::model::EgressPolicy;
 use nest_proxy::guard::{BodyView, Req, refusing};
+use nest_proxy::inject::Whole;
 
 fn fixture(name: &str) -> EgressPolicy {
     let p = format!("{}/../../protocol/fixtures/control/egress_policy/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -109,6 +111,45 @@ fn read_only_repos_are_fetched_never_written() {
         ("api.github.com", "POST", "/graphql", Some(r#"{"query":"mutation{}"}"#), Some("other"), true),
     ];
     check(&p, cases);
+}
+
+/// The constructor's output where nest injects no GitHub token of its own (no repos, no operator GitHub
+/// binding): `egress_policy.github_none.json`. A write passes only when its one `Authorization` field is a
+/// credential nest's injection wrote whole (an app's own binding, say `client:gh`); push discovery goes
+/// bare, as git sends it before its 401; gists and the content hosts take no write at all.
+#[test]
+fn without_nests_own_token_writes_need_a_credential_nest_injected() {
+    let p = fixture("egress_policy.github_none.json");
+    let auth = [Whole { header: "authorization".into(), binding: "client:gh".into() }];
+    let other = [Whole { header: "x-api-key".into(), binding: "client:gh".into() }];
+    // `(host, method, target, injected, whole, refused)`.
+    let cases: &[(&str, &str, &str, Option<&str>, &[Whole], bool)] = &[
+        // git: discovery bare (git's first request), the push itself only with nest's credential in Authorization
+        ("github.com", "GET", "/me/box.git/info/refs?service=git-receive-pack", None, &[], false),
+        ("github.com", "POST", "/me/box.git/git-receive-pack", Some("client:gh"), &auth, false),
+        ("github.com", "POST", "/me/box.git/git-receive-pack", None, &[], true),
+        ("github.com", "POST", "/me/box.git/git-receive-pack", Some("client:gh"), &[], true),
+        ("github.com", "POST", "/me/box.git/git-receive-pack", Some("client:gh"), &other, true),
+        ("github.com", "POST", "/me/box.git/info/lfs/objects/batch", None, &[], true),
+        // fetches stay open
+        ("github.com", "POST", "/torvalds/linux.git/git-upload-pack", None, &[], false),
+        // the API, REST and GraphQL alike
+        ("api.github.com", "POST", "/graphql", Some("client:gh"), &auth, false),
+        ("api.github.com", "POST", "/graphql", None, &[], true),
+        ("api.github.com", "POST", "/repos/me/box/pulls", Some("client:gh"), &auth, false),
+        ("api.github.com", "POST", "/gists", None, &[], true),
+        ("uploads.github.com", "POST", "/repos/me/box/releases/1/assets", Some("client:gh"), &other, true),
+        ("api.github.com", "GET", "/repos/me/box", None, &[], false),
+        // gists and the content hosts: never written, whatever the credential
+        ("gist.github.com", "POST", "/0123abcd.git/git-receive-pack", Some("client:gh"), &auth, true),
+        ("objects.githubusercontent.com", "PUT", "/upload/x", Some("client:gh"), &auth, true),
+    ];
+    for &(host, method, target, injected, whole, want) in cases {
+        let (path, query) = target.split_once('?').map_or((target, None), |(p, q)| (p, Some(q)));
+        let req = Req { host, method, path, query, injected, whole };
+        let got = refusing(&p.guards, &req.prepare().unwrap(), &BodyView::Unread).map(|g| g.name.clone());
+        assert_eq!(got.is_some(), want, "{method} {host}{target} {injected:?}: {got:?}");
+    }
 }
 
 fn check(p: &EgressPolicy, cases: &[Case]) {
