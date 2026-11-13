@@ -910,9 +910,14 @@ export class BrokerDO extends DurableObject<Env> {
    * The names of stored secrets whose value appears in any of `strings` (a brokered action's
    * arguments): the value itself, its base64, or (for a JSON value) any string in it of 16 characters
    * or more. Names only: no value leaves here. Values under 8 characters aren't looked for.
+   * Exact values only, no credential shapes (2026-11-12). The GitHub installation tokens nest minted
+   * and cached (`github_tokens`) count as held values too, until the kernel's GitHub code goes (C3).
    */
   async scanSecrets(strings: string[]): Promise<string[]> {
     const rows = this.sql.exec<{ name: string; value: string }>("SELECT name, value FROM secrets").toArray();
+    for (const t of this.sql.exec<{ key: string; token: string }>("SELECT key, token FROM github_tokens")) {
+      rows.push({ name: `minted GitHub token ${t.key}`, value: t.token });
+    }
     const hits: string[] = [];
     for (const { name, value } of rows) {
       if (secretNeedles(value).some((n) => strings.some((s) => s.includes(n)))) hits.push(name);

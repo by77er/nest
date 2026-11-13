@@ -17,10 +17,11 @@ import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NE
 import { approves, argsDigest, canonicalJson, describeArgs, gated, sessionTaint, type SinkCall, visible } from "../lib/sinks";
 import {
   actionDef, actionOfTool, authorize, checkBaseUrl, type Authorized, BROKERED_ACTIONS, BROKERED_TOOL_NAMES, type BrokeredAction, BrokeredJournal, brokeredToolDefs,
-  type GithubAction, type JournalEntry, type JournalRow, keyDigest, naturalKey, secretKinds, stringsOf,
+  type GithubAction, type JournalEntry, type JournalRow, keyDigest, naturalKey, stringsOf,
 } from "../lib/brokered";
 import { actionRequest, createdOf, foundInState, type GhMade, ghError, githubApiOf, stateQuery } from "../lib/github";
 import { type McpConnector, McpProxy, mcpToken } from "../lib/mcp-proxy";
+import { meteredFetch, type OutboundRecord } from "../lib/outbound";
 import { type IdentitySubject, IdentityTokens } from "../lib/identity";
 import { Repo } from "../lib/repos";
 import { isAgentId, Labels } from "../lib/clients";
@@ -432,6 +433,7 @@ export class AgentDO extends DurableObject<Env> {
         current: (aud, epoch, tainted) => this.identities.current(this.identitySubject(aud, epoch, tainted)),
       },
       background: (p) => ctx.waitUntil(p),
+      outbound: (r) => this.outbound(r),
       callTimeoutMs: num(env.MCP_CALL_TIMEOUT_MS, 45_000),
       admitWaitMs: num(env.MCP_ADMIT_WAIT_MS, 10_000),
       allowLoopback: env.ALLOW_LOOPBACK_MCP === "1",
@@ -3503,9 +3505,19 @@ export class AgentDO extends DurableObject<Env> {
     return this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
   }
 
+  /** A request sent for one of its tools, on its live trace (lib/outbound.ts): where, the outcome, sizes, never a query or body. */
+  private outbound(r: OutboundRecord): void {
+    this.traceEmit(r, Date.now(), this.exists() ? this.load().current_turn : null);
+  }
+
+  /** The fetch a brokered action sends with: each request it makes is recorded (`outbound`). */
+  private brokeredFetch(action: string): typeof fetch {
+    return meteredFetch((m) => this.outbound({ type: "outbound", via: "brokered", name: action, ...m }));
+  }
+
   /**
    * A brokered action, through the pipeline: the grant (an action its spec's capabilities give, for the
-   * repo or profile asked for) → the hourly cap → the secret scan → the sink gate → the current
+   * repo or profile asked for) → the hourly cap → the stored-value scan → the sink gate → the current
    * external state → the request under the action's natural idempotency key → the journal. Never from
    * a sandbox. A redelivered call key skips the checks it passed already and reads the provider first.
    */
@@ -3533,14 +3545,11 @@ export class AgentDO extends DurableObject<Env> {
         const frees = (this.journal.oldestSince(action, since) ?? Date.now()) + 3_600_000;
         throw new NestError(ErrorCodes.RATE_LIMITED, `${action}: at most ${auth.value.per_hour} an hour for this agent; the next one is free at ${iso(frees)}`, 429, true);
       }
-      const strings = stringsOf(a);
-      const kinds = secretKinds(strings);
-      const names = await this.broker().scanSecrets(strings);
-      if (kinds.length || names.length) {
-        // The journal names what matched (for the operator); the model is told only the kind.
-        const why = [...kinds, ...names.map((n) => `the value of ${n}`)].join(", ");
-        this.journal.refuse(row, why);
-        throw secretRefusal(kinds.length ? kinds.join(", ") : "a credential nest holds");
+      // A stored secret's exact value (no credential shapes): the journal names which, the model isn't told.
+      const names = await this.broker().scanSecrets(stringsOf(a));
+      if (names.length) {
+        this.journal.refuse(row, names.map((n) => `the value of ${n}`).join(", "));
+        throw secretRefusal("a credential nest holds");
       }
       // A fork widens the push allowlist: the operator approves it from any session, tainted or not.
       if (def.kind === "github_user" || gated({ sink: auth.value.sink, when_tainted: auth.value.when_tainted, tainted: this.tainted(this.load()) })) {
@@ -3571,7 +3580,7 @@ export class AgentDO extends DurableObject<Env> {
     const upstream = auth.target;
     if (!Repo.safeParse(upstream).success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${upstream} isn't owner/name`);
     const token = await this.broker().githubUserToken();
-    const api = githubApiOf(this.env, num(this.env.BROKERED_TIMEOUT_MS, 30_000));
+    const api = githubApiOf(this.env, num(this.env.BROKERED_TIMEOUT_MS, 30_000), this.brokeredFetch("github.fork"));
     let r: Awaited<ReturnType<typeof api.request>> = { kind: "lost", why: "not sent" };
     for (let attempt = 1; attempt <= 2 && r.kind !== "ok" && !(r.kind === "refused"); attempt++) {
       await live();
@@ -3604,7 +3613,7 @@ export class AgentDO extends DurableObject<Env> {
     live: () => Promise<void>,
   ): Promise<ToolOutcome> {
     const { token } = await this.broker().githubToken(auth.target, BROKERED_ACTIONS[action].permissions, { agent: info.agent, call: row.key });
-    const api = githubApiOf(this.env, num(this.env.BROKERED_TIMEOUT_MS, 30_000));
+    const api = githubApiOf(this.env, num(this.env.BROKERED_TIMEOUT_MS, 30_000), this.brokeredFetch(action));
     const made = (m: GhMade): ToolOutcome => {
       const what = m.existing ? `Already open: ${m.url}` : `Done: ${m.url}`;
       const outcome: ToolOutcome = { status: "ok", content: [{ type: "text", text: what }, { type: "json", value: m }] };
@@ -3699,6 +3708,7 @@ export class AgentDO extends DurableObject<Env> {
     if (g.auth && secret !== null) headers[g.auth.header.toLowerCase()] = g.auth.scheme ? `${g.auth.scheme} ${secret}` : secret;
     if (g.idempotency_header) headers[g.idempotency_header.toLowerCase()] = kd;
     const timeoutMs = num(this.env.BROKERED_TIMEOUT_MS, 30_000);
+    const send = this.brokeredFetch("http.request");
     let why = "";
     for (let attempt = 1; attempt <= 2; attempt++) {
       await live();
@@ -3707,8 +3717,8 @@ export class AgentDO extends DurableObject<Env> {
       const ctl = new AbortController();
       const timer = setTimeout(() => ctl.abort(), timeoutMs);
       try {
-        // The global fetch, called as a plain function (as a method of another object it throws in workerd).
-        const res = await fetch(url, { method, headers, ...(body !== undefined ? { body } : {}), redirect: "manual", signal: ctl.signal });
+        // Metered (the platform's fetch underneath), called as a plain function: as a method of another object it throws in workerd.
+        const res = await send(url, { method, headers, ...(body !== undefined ? { body } : {}), redirect: "manual", signal: ctl.signal });
         const answer = await readText(res, HTTP_ANSWER_MAX);
         const text = { text: mask(answer.text, secret), truncated: answer.truncated };
         if (!g.trusted) this.kvPut("read_tainted", true);
@@ -4050,7 +4060,7 @@ function spawnRefused(r: { message: string; full: boolean }): NestError {
   return r.full ? new NestError(ErrorCodes.AT_CAPACITY, `can't spawn: ${r.message}`, 429, true) : new NestError(ErrorCodes.FORBIDDEN, `can't spawn: ${r.message}`, 403);
 }
 
-/** The refusal of a call whose arguments hold a credential: names the kind, never the value. */
+/** The refusal of a call whose arguments hold a stored secret's value: never the value or which secret. */
 function secretRefusal(kind: string): NestError {
   return new NestError(ErrorCodes.FORBIDDEN, `Not sent: the arguments contain ${kind}. Remove it and call again.`, 403);
 }

@@ -17,7 +17,7 @@ const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const utf8 = (s: string) => new TextEncoder().encode(s).length;
 const SESSION = "ses_0b7e7a52-3c1d-4e8f-9a6b-1d2c3e4f5a6b";
 /** A credential-shaped value built from pieces (no literal matches a secret scanner's rule). */
-const ghToken = ["ghp", "Z".repeat(36)].join("_");
+const nestToken = ["nest", "cli", "Z".repeat(36)].join("_");
 
 // --- Claude Code transcript entries ----------------------------------------------------------------------
 
@@ -56,12 +56,12 @@ describe("an entry (pure)", () => {
   });
 
   it("redacts and bounds as the live path does", () => {
-    const call = normalizeEntry(use(1, "toolu_r", "Bash", { command: `echo ${ghToken}`, token: "plain", body: "y".repeat(20_000) }), 0)!.bodies[0] as any;
-    expect(call.input).not.toContain(ghToken);
+    const call = normalizeEntry(use(1, "toolu_r", "Bash", { command: `echo ${nestToken}`, token: "plain", body: "y".repeat(20_000) }), 0)!.bodies[0] as any;
+    expect(call.input).not.toContain(nestToken);
     expect(call.input).toContain(`"token":"${REDACTED}"`);
     expect(utf8(call.input)).toBeLessThanOrEqual(TRACE_FIELD_MAX);
-    expect((normalizeEntry(result(1, "toolu_r", `got ${ghToken}`), 0)!.bodies[0] as any).summary).toBe(`got ${REDACTED}`);
-    expect((normalizeEntry(say(1, `key ${ghToken}`), 0)!.bodies[0] as any).text).toBe(`key ${REDACTED}`);
+    expect((normalizeEntry(result(1, "toolu_r", `got ${nestToken}`), 0)!.bodies[0] as any).summary).toBe(`got ${REDACTED}`);
+    expect((normalizeEntry(say(1, `key ${nestToken}`), 0)!.bodies[0] as any).text).toBe(`key ${REDACTED}`);
   });
 });
 

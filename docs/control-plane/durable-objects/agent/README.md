@@ -101,7 +101,7 @@ The owner's decision (2026-11-11): an agent's rules are read from its capabiliti
 
 ## Live trace
 
-The [live trace](../../api/#live-trace) (2026-11-02): `control-plane/src/lib/trace.ts` holds the shape, the redaction and the ring; AgentDO writes and sends.
+The [live trace](../../api/#live-trace) (2026-11-02): `control-plane/src/lib/trace.ts` holds the shape, the redaction and the ring; AgentDO writes and sends. `control-plane/src/lib/outbound.ts` meters the requests its brokered actions and MCP calls send (2026-11-12): each is an `outbound` event.
 - **Two kinds of socket, kept apart by tag:** the runner's is `session`, a trace client's `trace`. Nothing on the session path lists or reads a trace socket (fencing, the current socket, superseding), and a frame or close from a trace socket returns before any session handling. The runner sends only JSON objects, so the `ping` auto-response never answers it.
 - **Written in the step of the change:** a runner event's trace row is written right after its dedup check, before the state it changes and before any await, keyed by the runner's own stamp (`<epoch>.<seq>.<ts_ms>.<type>`), so a batch applied again after a throw records it once. `state` is written by `update()` whenever the agent's state changes; `ask` with the ask's record, `ask_answered` with the answer, `ended` with `done_ms`.
 - **The ring:** `trace` (`seq`, `at_ms`, `src`, `body`) and `trace_head` (the last seq given, so a pruned seq is never reused). Each append prunes past the newest 1,000 rows or 24 h; a connect prunes by age too.

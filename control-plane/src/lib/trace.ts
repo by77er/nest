@@ -3,6 +3,7 @@
 // and kept in a bounded ring so a client can resume. Nothing here knows any one client, and nothing
 // here sends: AgentDO writes a row in the step of the change and hands the row to its trace sockets.
 import type { AgentEvent, AgentState, TurnInputKind } from "../protocol/model";
+import type { OutboundRecord } from "./outbound";
 import { clip } from "./util";
 
 /** Each string field (a tool's input, a result's summary, a question, a message) is cut to this many UTF-8 bytes. */
@@ -36,7 +37,9 @@ export type TraceBody =
   | { type: "ended"; reason: string }
   | { type: "timer_set"; name: string; at_ms: number; note: string }
   | { type: "timer_fired"; name: string; note: string }
-  | { type: "timer_cancelled"; name: string; by: string };
+  | { type: "timer_cancelled"; name: string; by: string }
+  /** A request AgentDO sent for one of the agent's tools (lib/outbound.ts). */
+  | OutboundRecord;
 export type TraceUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number };
 export type TraceEvent = { seq: number; ts_ms: number; turn?: string } & TraceBody;
 /**
@@ -57,24 +60,19 @@ export const TRANSCRIPT_TYPES = new Set(["turn_started", "assistant_text", "tool
 /** An object key whose value is never shown (tool inputs): it names a credential. */
 const SECRET_KEY = /secret|token|passw(or)?d|passwd|authori[sz]ation|api[-_]?key|credential|cookie|private[-_]?key|session[-_]?key/i;
 /**
- * Credential shapes redacted from every string field: nest's own client tokens and webhook secrets,
- * Anthropic keys and OAuth tokens, GitHub tokens, Slack tokens, AWS access key ids, PEM private keys
- * and bearer headers. A value of another shape passes, bounded: the live path has no list of secrets.
+ * What is redacted from every string field: nest's own credentials (its client tokens and webhook
+ * secrets, by the prefixes nest itself issues) and an HTTP `Bearer`/`Basic` value. No other service's
+ * credential shapes (the owner, 2026-11-12: nest assumes no services): the live path has no list of
+ * secrets, and a value of another shape passes, bounded, as it does in the stored transcript.
  */
 const SECRET_SHAPES: RegExp[] = [
   /nest_(?:cli|obs|apr|adm)_[A-Za-z0-9_]{8,}/g,
   /whsec_[0-9a-f]{16,}/g,
-  /sk-ant-[A-Za-z0-9_-]{8,}/g,
-  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
-  /\bxox[abposr]-[A-Za-z0-9-]{10,}/g,
-  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g,
   /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
 ];
 export const REDACTED = "[redacted]";
 
-/** `text` with every credential shape replaced by `[redacted]` (a bearer header keeps its scheme). */
+/** `text` with nest's credentials and auth header values replaced by `[redacted]` (a bearer header keeps its scheme). */
 export function redactText(text: string): string {
   let out = text;
   for (const re of SECRET_SHAPES) {
@@ -83,7 +81,7 @@ export function redactText(text: string): string {
   return out;
 }
 
-/** A JSON value with credential-named keys' values and credential-shaped strings redacted. */
+/** A JSON value with credential-named keys' values redacted, and every string as `redactText`. */
 export function redactValue(v: unknown, depth = 0): unknown {
   if (typeof v === "string") return redactText(v);
   if (v === null || typeof v !== "object") return v;

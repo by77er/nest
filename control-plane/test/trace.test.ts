@@ -15,7 +15,7 @@ const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
 const utf8 = (s: string) => new TextEncoder().encode(s).length;
 /**
  * Credential-shaped samples, built at run time from pieces so no literal in this file matches a secret
- * scanner's rule (the repo's convention): each has the shape the redaction looks for, and no value.
+ * scanner's rule (the repo's convention): nest's own (redacted) and other services' (passed), none a value.
  */
 const fake = {
   client: ["nest", "cli", "abc123", "a".repeat(64)].join("_"),
@@ -113,12 +113,13 @@ async function world() {
 // --- Pure ------------------------------------------------------------------------------------------------
 
 describe("redaction and bounds (pure)", () => {
-  it("redacts credential shapes in text, keeping a bearer header's scheme", () => {
-    const secrets = [fake.client, fake.webhook, fake.anthropic, fake.github, fake.githubPat, fake.slack, fake.aws, fake.pem];
-    for (const s of secrets) {
+  it("redacts nest's own credentials in text, keeping a bearer header's scheme, and no other service's shapes", () => {
+    for (const s of [fake.client, fake.webhook]) {
       const out = redactText(`before ${s} after`);
       expect(out, s).toBe(`before ${REDACTED} after`);
     }
+    // No credential shapes of other services (the owner, 2026-11-12): they pass, as any other text.
+    for (const s of [fake.anthropic, fake.github, fake.githubPat, fake.slack, fake.aws, fake.pem]) expect(redactText(`before ${s} after`), s).toBe(`before ${s} after`);
     expect(redactText(`Authorization: ${fake.bearer("abcdefgh.ijk")}`)).toBe(`Authorization: ${fake.bearer(REDACTED)}`);
     // Ordinary text passes.
     expect(redactText("git push origin main; the token count is 12")).toBe("git push origin main; the token count is 12");
@@ -148,9 +149,9 @@ describe("redaction and bounds (pure)", () => {
     expect(utf8(t.text)).toBeLessThanOrEqual(TRACE_TEXT_MAX);
     expect(utf8(t.text)).toBeGreaterThan(TRACE_FIELD_MAX);
     // A secret is redacted before the cut, so a cut can't leave it half-matched.
-    // Placed so a cut first would keep "ghp_" and 19 of its characters, one short of the shape.
-    const cut = traceOf({ ...base, type: "error", error: { code: "x", message: `${"z".repeat(TRACE_FIELD_MAX - 3 - 24)} ${["ghp", "Q".repeat(36)].join("_")}`, retryable: false } }) as { message: string };
-    expect(cut.message).not.toMatch(/ghp_|QQQ/);
+    // Placed so a cut first would keep "nest_cli_" and 7 of its characters, one short of the shape.
+    const cut = traceOf({ ...base, type: "error", error: { code: "x", message: `${"z".repeat(TRACE_FIELD_MAX - 3 - 17)} ${["nest", "cli", "Q".repeat(36)].join("_")}`, retryable: false } }) as { message: string };
+    expect(cut.message).not.toMatch(/nest_cli|QQQ/);
   });
 
   it("streams what the trace shows and nothing else", () => {
@@ -336,7 +337,7 @@ describe("what streams", () => {
     const s = await w.session();
     const t = await trace(s.agent, w.c.token);
     const turn = await s.turn(w.c.token, "work");
-    const pat = ["ghp", "x".repeat(36)].join("_");
+    const pat = fake.client;
     await s.events([
       { type: "tool_call", turn, call_id: "toolu_2", name: "WebFetch", input: { url: "https://x", headers: { Authorization: fake.bearer("abcdefghijkl") }, body: "y".repeat(20_000) } },
       { type: "tool_result", turn, call_id: "toolu_2", is_error: false, summary: `got ${pat}` },

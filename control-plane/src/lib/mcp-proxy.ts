@@ -16,6 +16,7 @@ import { ErrorCodes } from "../protocol/model";
 import { asNestError, errorBody, NestError } from "./util";
 import { storedEnum } from "./stored";
 import { bearerChallenge, mcpBearer } from "./mcp-auth";
+import { meteredFetch, type OutboundRecord } from "./outbound";
 import {
   callResultContent, checkMcpUrl, isIdempotent, type ListedTool, MCP_DEFAULT_MAX_CONCURRENT, MCP_DEFAULT_PER_MINUTE, MCP_SUPPORTED_VERSIONS,
   type McpGrant, openSession, rpc, type RpcAnswer,
@@ -103,6 +104,8 @@ export interface ProxyDeps {
   };
   /** Work that outlives the call (a release, a change report). */
   background(p: Promise<unknown>): void;
+  /** Each `tools/call` request that left, as the agent's trace records it (lib/outbound.ts). */
+  outbound?(r: OutboundRecord): void;
   callTimeoutMs: number;
   /** How long a call waits for admission before it is refused (`rate_limited`, nothing sent). */
   admitWaitMs: number;
@@ -506,8 +509,11 @@ export class McpProxy {
       // Settled while this delivery waited (another delivery of the call finished): its outcome, nothing sent.
       if (!this.recordForward(ctx, g, tool, attempts)) return this.forward(ctx.key)!.outcome!;
       const meta = { "nest/agent": ctx.agent, "nest/epoch": ctx.epoch, "nest/call": ctx.key, "nest/taint": tainted };
+      const name = `${g.capability}.${tool}`;
+      // The host only: the server's URL is configuration, and a hosted server's path may carry a key.
+      const fetchFn = this.d.outbound ? meteredFetch(({ path: _path, ...m }) => this.d.outbound!({ type: "outbound", via: "mcp", name, ...m })) : undefined;
       const a = await rpc(this.url(g), { id: 100 + attempts, method: "tools/call", params: { name: tool, arguments: args, _meta: meta } },
-        { token: bearer.value, session: s.session, version: s.version, timeoutMs: this.d.callTimeoutMs, identity });
+        { token: bearer.value, session: s.session, version: s.version, timeoutMs: this.d.callTimeoutMs, identity, fetchFn });
       if ((a.kind === "result" || a.kind === "rpc_error") && a.list_changed) {
         this.d.background(this.d.connector(g).changed(g).catch((e) => console.warn(`mcp ${g.capability}: reporting a changed tool list failed`, e)));
       }
