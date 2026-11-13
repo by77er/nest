@@ -17,7 +17,7 @@ import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NE
 import { approves, argsDigest, canonicalJson, describeArgs, gated, sessionTaint, type SinkCall, visible } from "../lib/sinks";
 import {
   actionDef, actionOfTool, authorize, checkBaseUrl, type Authorized, BROKERED_ACTIONS, BROKERED_TOOL_NAMES, type BrokeredAction, BrokeredJournal, brokeredToolDefs,
-  type GithubAction, type JournalEntry, type JournalRow, keyDigest, naturalKey, secretKinds, stringsOf,
+  type GithubAction, type JournalEntry, type JournalRow, keyDigest, naturalKey, stringsOf,
 } from "../lib/brokered";
 import { actionRequest, createdOf, foundInState, type GhMade, ghError, githubApiOf, stateQuery } from "../lib/github";
 import { type McpConnector, McpProxy, mcpToken } from "../lib/mcp-proxy";
@@ -3505,7 +3505,7 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * A brokered action, through the pipeline: the grant (an action its spec's capabilities give, for the
-   * repo or profile asked for) → the hourly cap → the secret scan → the sink gate → the current
+   * repo or profile asked for) → the hourly cap → the stored-value scan → the sink gate → the current
    * external state → the request under the action's natural idempotency key → the journal. Never from
    * a sandbox. A redelivered call key skips the checks it passed already and reads the provider first.
    */
@@ -3533,14 +3533,11 @@ export class AgentDO extends DurableObject<Env> {
         const frees = (this.journal.oldestSince(action, since) ?? Date.now()) + 3_600_000;
         throw new NestError(ErrorCodes.RATE_LIMITED, `${action}: at most ${auth.value.per_hour} an hour for this agent; the next one is free at ${iso(frees)}`, 429, true);
       }
-      const strings = stringsOf(a);
-      const kinds = secretKinds(strings);
-      const names = await this.broker().scanSecrets(strings);
-      if (kinds.length || names.length) {
-        // The journal names what matched (for the operator); the model is told only the kind.
-        const why = [...kinds, ...names.map((n) => `the value of ${n}`)].join(", ");
-        this.journal.refuse(row, why);
-        throw secretRefusal(kinds.length ? kinds.join(", ") : "a credential nest holds");
+      // A stored secret's exact value (no credential shapes): the journal names which, the model isn't told.
+      const names = await this.broker().scanSecrets(stringsOf(a));
+      if (names.length) {
+        this.journal.refuse(row, names.map((n) => `the value of ${n}`).join(", "));
+        throw secretRefusal("a credential nest holds");
       }
       // A fork widens the push allowlist: the operator approves it from any session, tainted or not.
       if (def.kind === "github_user" || gated({ sink: auth.value.sink, when_tainted: auth.value.when_tainted, tainted: this.tainted(this.load()) })) {
@@ -4050,7 +4047,7 @@ function spawnRefused(r: { message: string; full: boolean }): NestError {
   return r.full ? new NestError(ErrorCodes.AT_CAPACITY, `can't spawn: ${r.message}`, 429, true) : new NestError(ErrorCodes.FORBIDDEN, `can't spawn: ${r.message}`, 403);
 }
 
-/** The refusal of a call whose arguments hold a credential: names the kind, never the value. */
+/** The refusal of a call whose arguments hold a stored secret's value: never the value or which secret. */
 function secretRefusal(kind: string): NestError {
   return new NestError(ErrorCodes.FORBIDDEN, `Not sent: the arguments contain ${kind}. Remove it and call again.`, 403);
 }

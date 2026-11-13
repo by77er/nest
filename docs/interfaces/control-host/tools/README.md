@@ -33,4 +33,4 @@ The seed column is a new catalog's; an existing catalog's `worker` and `captain`
 - `agent_spawn`, `agent_stop` and `exit` are refused from inside a sandbox (the guest `nest` CLI).
 - `requires_approval` tools always go through the approval gate.
 
-**Brokered action pipeline:** check the grant → rate limit → scan arguments for secrets → approval gate → run with idempotency key `(agent, epoch, call)` → write to the journal.
+**Brokered action pipeline:** check the grant → rate limit → refuse arguments holding a stored secret's exact value → approval gate → run with idempotency key `(agent, epoch, call)` → write to the journal.
