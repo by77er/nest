@@ -269,6 +269,10 @@ describe("the App installation", () => {
     expect(((await r.json()) as { ignored: string }).ignored).toContain("repo owner isn't an account the app acts for");
     expect(await numbers(p)).toEqual([]);
     expect((await binding(p)).refused).toMatchObject({ count: 1 });
+    // An event naming no installation is refused all the same.
+    const none = await deliverGithub("issues", { ...issue(3, { full_name: p.repo }), installation: undefined });
+    expect(((await none.json()) as { ignored: string }).ignored).toContain("repo owner isn't an account the app acts for");
+    expect(await numbers(p)).toEqual([]);
     await withEnv("GITHUB_ACCOUNTS", String(ownerIdOf(p.repo.split("/")[0]!)), async () => {
       await deliverGithub("issues", { ...issue(2, { full_name: p.repo }), installation: { id: 5 } });
     });

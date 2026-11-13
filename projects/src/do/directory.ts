@@ -290,9 +290,11 @@ export class DirectoryDO extends DurableObject<Env> {
     // Refused, and counted on the binding so the Admin page shows it: a reinstalled App's events would
     // otherwise all be dropped unseen (Re-read takes the new installation).
     const wrongInstallation = (r: Record<string, SqlStorageValue>) => {
-      if (r.installation_id === installation) return null;
-      // No installation known yet: the event's repo owner must be an account the app acts for (README.md#repo-authority).
-      if (r.installation_id === null && ownerAllowed !== false) return null;
+      // No installation known yet: the event's repo owner must be an account the app acts for (README.md#repo-authority),
+      // whatever installation the event names (or none).
+      if (r.installation_id === null) {
+        if (ownerAllowed !== false) return null;
+      } else if (r.installation_id === installation) return null;
       this.sql.exec("UPDATE projects SET refused_installation = ?, refused_count = refused_count + 1, refused_ms = ? WHERE id = ?", installation, Date.now(), r.id);
       if (r.installation_id === null) return `the event's repo owner isn't an account the app acts for, and the project has no installation yet`;
       return `the event's installation (${installation ?? "none"}) isn't the project's (${r.installation_id as number})`;
