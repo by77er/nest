@@ -113,6 +113,9 @@ fn read_only_repos_are_fetched_never_written() {
     check(&p, cases);
 }
 
+/// `(host, method, target, injected, whole, refused)`.
+type WholeCase<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, &'a [Whole], bool);
+
 /// The constructor's output where nest injects no GitHub token of its own (no repos, no operator GitHub
 /// binding): `egress_policy.github_none.json`. A write passes only when its one `Authorization` field is a
 /// credential nest's injection wrote whole (an app's own binding, say `client:gh`); push discovery goes
@@ -122,8 +125,7 @@ fn without_nests_own_token_writes_need_a_credential_nest_injected() {
     let p = fixture("egress_policy.github_none.json");
     let auth = [Whole { header: "authorization".into(), binding: "client:gh".into() }];
     let other = [Whole { header: "x-api-key".into(), binding: "client:gh".into() }];
-    // `(host, method, target, injected, whole, refused)`.
-    let cases: &[(&str, &str, &str, Option<&str>, &[Whole], bool)] = &[
+    let cases: &[WholeCase] = &[
         // git: discovery bare (git's first request), the push itself only with nest's credential in Authorization
         ("github.com", "GET", "/me/box.git/info/refs?service=git-receive-pack", None, &[], false),
         ("github.com", "POST", "/me/box.git/git-receive-pack", Some("client:gh"), &auth, false),
