@@ -290,6 +290,9 @@ describe("the outboxes' migration", () => {
       for (const c of ["pr_read_next_ms", "pr_read_last_ms", "pr_read_attempts"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       // And the comments default's step (README.md#pr-comments).
       for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      // And the GitHub access step's (README.md#repo-authority).
+      for (const t of ["gh_access", "gh_tokens"]) sql.exec(`DROP TABLE ${t}`);
+      sql.exec("ALTER TABLE layers DROP COLUMN github");
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec("INSERT INTO task_prs (pr, task, state, attached_by, attached_ms) VALUES (61, 'tsk_gone', 'open', 'owner', 1), (62, 'tsk_gone', 'detached', 'owner', 1), (63, ?, 'open', 'owner', 1)", t.id);
       migrate(st.storage, MIGRATIONS);

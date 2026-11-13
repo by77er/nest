@@ -66,13 +66,24 @@ const RESERVED_ENV = new Set([
   "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO",
 ]);
 
-/** Not nest's, but read by gh and other GitHub tools ahead of GITHUB_TOKEN: one set here would take over the brokered token. */
-const GITHUB_ENV = new Set(["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"]);
+/**
+ * Read by gh and git ahead of anything else: the app sets `GH_TOKEN` and git's credential helper (`GIT_CONFIG_*`)
+ * for the repo's own token (src/github-access.ts), and the enterprise tokens and `GIT_ASKPASS` would take
+ * gh's or git's credential over. One set here would take over the sandbox's GitHub token.
+ */
+const GITHUB_ENV = new Set(["GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GIT_ASKPASS"]);
+
+/** The bindings of the project's own GitHub tokens (src/github-access.ts): no secret of the owner's takes their names. */
+export const APP_BINDINGS = { push: "gh_push", read: "gh_read" } as const;
+export const isAppBinding = (name: string) => (Object.values(APP_BINDINGS) as string[]).includes(name);
+/** The variables the app sets for git and gh beside its GitHub binding (src/github-access.ts). */
+export const APP_ENV = ["GH_TOKEN", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_KEY_1", "GIT_CONFIG_VALUE_1"] as const;
+export const isAppEnv = (name: string) => (APP_ENV as readonly string[]).includes(name);
 
 /** Why `name` can't be a secret's variable, or null. `taken`: the variables of the project's other secrets. */
 export function envProblem(name: string, taken: readonly string[] = []): string | null {
   if (!ENV_NAME.test(name)) return "Capital letters, digits and _, not starting with a digit, at most 64";
-  if (GITHUB_ENV.has(name)) return `${name} would take over the sandbox's brokered GitHub token`;
+  if (GITHUB_ENV.has(name) || name.startsWith("GIT_CONFIG")) return `${name} would take over the sandbox's GitHub token`;
   if (RESERVED_ENV.has(name) || name.startsWith("NEST_")) return `${name} is set by nest or the sandbox`;
   if (taken.includes(name)) return `Another secret uses ${name}`;
   return null;
@@ -100,6 +111,7 @@ export function secretProblems(
 ): Record<string, string> {
   const out: Record<string, string> = {};
   if (!SECRET_NAME.test(m.name)) out.name = "Lowercase letters, digits and _, starting with a letter, at most 31";
+  else if (isAppBinding(m.name)) out.name = `${m.name} is the app's own GitHub binding: choose another name`;
   const env = envProblem(m.env, takenEnv);
   if (env) out.env = env;
   if (m.hosts.length < 1 || m.hosts.length > MAX_HOSTS) out.hosts = `1 to ${MAX_HOSTS} hosts`;
@@ -149,16 +161,18 @@ export const outsideGrant = (m: Pick<SecretMeta, "hosts">, injectHosts: readonly
 
 /**
  * What a role's secrets make of a sandbox's client layer: a binding each, and its variable holding the
- * binding's placeholder (nest's limit of bindings: the first by name). Fed to `clientLayerFor`, and sent
+ * binding's placeholder (`max` of them, nest's limit of bindings less the app's GitHub one where it has it:
+ * the first by name). Fed to `clientLayerFor`, and sent
  * the same at a sandbox's create. Given the grant's `inject_hosts`, only what's inside it: a host outside
  * is left out, and a secret with none left is too (`outside`), so nest never refuses the layer for it,
  * and a refusal of one secret never holds back another's removal.
  */
 export function secretFeeds(
-  client: string, secrets: readonly SecretMeta[], injectHosts: readonly string[] | null = null,
+  client: string, secrets: readonly SecretMeta[], injectHosts: readonly string[] | null = null, max = MAX_BINDINGS,
 ): { inject: Binding[]; env: Record<string, string>; secrets: SecretMeta[]; outside: string[] } {
-  const inside = secrets.map((m) => ({ ...m, hosts: m.hosts.filter((h) => !outsideGrant({ hosts: [h] }, injectHosts).length) }));
-  const mine = inside.filter((m) => m.hosts.length).slice(0, MAX_BINDINGS);
+  // A secret named as the app's own GitHub bindings (saved before they were reserved) is never bound: the GitHub one is.
+  const inside = secrets.filter((m) => !isAppBinding(m.name)).map((m) => ({ ...m, hosts: m.hosts.filter((h) => !outsideGrant({ hosts: [h] }, injectHosts).length) }));
+  const mine = inside.filter((m) => m.hosts.length).slice(0, max);
   return {
     inject: mine.map(bindingOf), env: Object.fromEntries(mine.map((m) => [m.env, placeholder(client, m.name)])), secrets: mine,
     outside: inside.filter((m) => !m.hosts.length).map((m) => m.name),
@@ -181,7 +195,7 @@ export function secretsBrief(secrets: readonly Pick<SecretMeta, "description" | 
 
 /**
  * Presets for the form's host picker (README.md#secrets), with the variable their tools read (`null`: the
- * name's, upper-cased; for GitHub, so `GH_TOKEN` doesn't take over the brokered token).
+ * name's, upper-cased; for GitHub, since `GH_TOKEN` is the app's own token for the repo).
  */
 export const SECRET_PRESETS = [
   { value: "cloudflare", label: "Cloudflare API", hosts: ["api.cloudflare.com"], location: { type: "authorization_bearer" } as SecretLocation, env: "CLOUDFLARE_API_TOKEN", note: null },
@@ -189,7 +203,7 @@ export const SECRET_PRESETS = [
   { value: "pypi", label: "PyPI upload", hosts: ["upload.pypi.org"], location: { type: "authorization_basic_password" } as SecretLocation, env: "TWINE_PASSWORD", note: "PyPI takes a token as the password, with the user name __token__ (TWINE_USERNAME)." },
   {
     value: "github", label: "GitHub API", hosts: ["api.github.com"], location: { type: "authorization_bearer" } as SecretLocation, env: null,
-    note: "nest already brokers GitHub for the project's repo: its sandboxes push and read through it with a token of their own. Add one only for another account's API, and prefer the brokered one.",
+    note: "The app already gives every sandbox a token for the project's repo (GH_TOKEN): workers push with it, the other roles read. Add one only for another account's API.",
   },
   { value: "custom", label: "Custom", hosts: [], location: { type: "authorization_bearer" } as SecretLocation, env: null, note: null },
 ] as const;

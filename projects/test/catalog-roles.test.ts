@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { catalogFor, NAMESPACE, REPO_GUIDANCE, REVIEWER_GUIDANCE, roleTemplate } from "../src/catalog";
 
 const NEST_SPAWNING = ["management", "sandboxes", "spawning"];
-const cat = catalogFor("https://projects.test", ["acme/app"]);
+const cat = catalogFor("https://projects.test");
 const tpl = (role: string) => cat.templates[`${NAMESPACE}/${role}`] as { capabilities: string[]; launch: { builtin_tools: string[] }; repos?: string[]; read_repos?: string[]; ephemeral?: boolean; hands: string };
 
 describe("role templates: spawning", () => {
@@ -28,13 +28,22 @@ describe("role templates: spawning", () => {
 });
 
 describe("the routine template (README.md#routines)", () => {
-  it("reads the repo and never pushes, ends itself, and has no timers", () => {
+  it("names no repo (each run brings its read-only GitHub access), ends itself, and has no timers", () => {
     const t = tpl("routine");
-    expect(t.read_repos).toEqual(["acme/app"]);
+    expect(t.read_repos).toBeUndefined();
     expect(t.repos).toBeUndefined();
     expect(t.ephemeral).toBe(true);
     expect(t.capabilities).not.toContain("timers");
     expect(t.capabilities).toContain(`${NAMESPACE}/routine`);
+  });
+});
+
+describe("the shared templates (README.md#repo-authority)", () => {
+  it("name no repo: nest's repos never come from a template, every start brings the app's own GitHub access", () => {
+    for (const role of ["manager", "worker", "reviewer", "routine", "dreaming"]) {
+      expect(tpl(role).repos, role).toBeUndefined();
+      expect(tpl(role).read_repos, role).toBeUndefined();
+    }
   });
 });
 

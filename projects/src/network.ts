@@ -4,6 +4,8 @@
 // sandbox's whole client layer (`PUT /v1/sandboxes/<id>/client-policy` replaces it whole) from every
 // page that feeds it. Pure, so the API, ProjectDO and the page share them.
 
+import { isAppBinding, isAppEnv } from "./secrets";
+
 export const NETWORK_ROLES = ["worker", "manager"] as const;
 export type NetworkRole = (typeof NETWORK_ROLES)[number];
 /** The roles with a live client layer: the network's, and reviewers (no rules of their own; secrets only). */
@@ -139,8 +141,20 @@ export function asBinding(b: HeldBinding): Binding {
 export interface LayerFeeds {
   inject?: Binding[];
   env?: Record<string, string>;
-  /** The push token's opt-ins (Settings' workflows toggle, for workers). */
+  /** nest's push token's opt-ins (Settings' workflows toggle, for workers on nest's repos). */
   github_push?: GithubPush;
+  /**
+   * The app's own GitHub part (src/github-access.ts), for a sandbox started with it: its binding and
+   * environment (null: outside the grant now, so neither) and its egress, kept beside the owner's secrets
+   * and the role's rules. Absent: a sandbox on nest's repos, which has none.
+   */
+  github?: GithubFeed;
+}
+
+export interface GithubFeed {
+  inject: Binding | null;
+  env: Record<string, string> | null;
+  egress: EgressRule[];
 }
 
 /**
@@ -150,12 +164,24 @@ export interface LayerFeeds {
  * binding goes back in the PUT's shape, its placeholder (nest's, and unchanged) left for nest to assign.
  */
 export function clientLayerFor(rules: RoleRules, role: LayerRole, feeds: LayerFeeds, current: HeldClientLayer | null): ClientLayer {
+  const allow = role === "reviewer" ? [] : normalizeRules(rules[role]);
+  const inject = (feeds.inject ?? current?.inject ?? []).map(asBinding);
+  const env = feeds.env ?? current?.env ?? {};
+  const gh = feeds.github;
+  if (!gh) {
+    return {
+      egress: { allow }, inject, env,
+      // Only where nest answers it (an older control plane refuses the key): the feed's, else as it is.
+      ...(current?.github_push ? { github_push: { ...(feeds.github_push ?? current.github_push) } } : {}),
+    };
+  }
+  // The app's GitHub part, in place of whatever of it the sandbox has now: so neither page's change drops it.
   return {
-    egress: { allow: role === "reviewer" ? [] : normalizeRules(rules[role]) },
-    inject: (feeds.inject ?? current?.inject ?? []).map(asBinding),
-    env: feeds.env ?? current?.env ?? {},
-    // Only where nest answers it (an older control plane refuses the key): the feed's, else as it is.
-    ...(current?.github_push ? { github_push: { ...(feeds.github_push ?? current.github_push) } } : {}),
+    egress: { allow: [...allow, ...gh.egress.filter((g) => !allow.some((r) => r.host === g.host))] },
+    inject: [...inject.filter((b) => !isAppBinding(b.name)), ...(gh.inject ? [asBinding(gh.inject)] : [])],
+    env: { ...Object.fromEntries(Object.entries(env).filter(([k]) => !isAppEnv(k))), ...(gh.env ?? {}) },
+    // Never nest's push token here: it would make nest inject its own, and refuse the app's GH_TOKEN.
+    ...(current?.github_push ? { github_push: { workflows: false } } : {}),
   };
 }
 

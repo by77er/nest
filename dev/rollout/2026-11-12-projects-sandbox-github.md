@@ -1,0 +1,27 @@
+# The projects app gives its sandboxes their GitHub access itself (2026-11-12)
+
+A release's rollout rule ([Rollout rules](../deploy.md#rollout-rules)), for the projects app ([the sandboxes' GitHub access](../../projects/README.md#the-sandboxes-github-access)): phase B3 of the plan to take service integrations out of nest's kernel ([decisions](../../docs/README.md#settled-decisions)). It needs B1 and B2 deployed (the App's own key and installations).
+
+**Ordering constraints, all before the deploy:**
+1. **nest's #271 live** (the GitHub constructor's guards let a credential nest injected write where nest has no token of its own). Without it, nest refuses every push and API write of a new spawn's sandbox: workers can't push or open PRs.
+2. **The operator widens the projects client's grant** (`PATCH /v1/admin/clients/<id>`, the whole grant):
+   - `inject_hosts` += `github.com`, `api.github.com` (the tokens' binding);
+   - `egress_hosts` += `api.github.com` (required: nest's base layer doesn't open it), `github.com`, `*.githubusercontent.com` (the base layer opens these today; listed so trimming it, phase D1, takes nothing away);
+   - `secrets.max_count`: at least two per project (each project's push and read tokens) plus the owner's own secrets. The live grant had 50 and no secrets stored (read 2026-11-12), so it's enough for 25 projects.
+
+   Widening is harmless before the deploy: nothing uses it yet.
+3. **The App's installations** grant `contents: write` and `pull_requests: write` (they do: auto-merge needs them), and `workflows: write` if "Workers may change CI workflows" is to work (without it the push token is written without, the error says so).
+
+Deployed before them, every new start (manager, worker, reviewer, routine run) waits, its error naming what the grant lacks or the token write's failure; nothing is refused for good, and live agents keep running as they are.
+
+- **What changes at deploy:**
+  - **New starts** send no repo of nest's (`overrides.repos: []`, `read_repos: []` narrow a template not yet synced to none) and no `github_push`. Their sandbox gets the project's token of its role as a client binding (`gh_push` or `gh_read`), `GH_TOKEN` and git's credential helper (`GIT_CONFIG_*`) pointing at it, and the GitHub hosts; the spawn adds the app's guards (`overrides.guards`, using `at`: nest refuses them, 409, while a sandbox host of the cell lacks `guard_bounds` or `guard_injected_any`, and the start waits, saying so). `use1` had no sandbox host when this was written; the next one runs the current release.
+  - **ProjectDO** mints the tokens from the App (`contents: write` and `pull_requests: write`, `workflows: write` with the setting; `contents: read` and `metadata: read`), writes them as client secrets `gh-push-<project>` and `gh-read-<project>` with `expires_at`, and writes each again 30 minutes before it expires, from its alarm. It keeps each token until it expires, only to revoke it (workflows off, the repo out of reach, the project removed).
+  - **New tables and a column** (expand only): `gh_access`, `gh_tokens`, `layers.github`.
+  - **Templates:** the next catalog sync (Admin, **Sync catalog**, or a project's creation) writes them without repos. Press it when convenient.
+- **Starts in flight across the deploy** (frozen before it) keep nest's repos: their retries send the same request. A reviewer's or a routine run's so frozen fails once the catalog sync has taken the shared templates' repos away (the review spends an attempt, the run fails, shown), and its next attempt is the app's. A worker's or the manager's writes its own template with the repo.
+- **Live agents** started before keep nest's repos and token (phase B4 converges them). A Network, Secrets or workflows change still reaches them as before.
+- **Cloud check after the deploy:** a new worker's sandbox (`GET /v1/sandboxes/<id>/client-policy`) has the `gh_push` binding and `GH_TOKEN`; its policy (`GET …/policy`) has the guards as `client:github-push` and the rest; `GET /v1/clients/self/secrets` lists `gh-push-<project>` with an `expires_ms` an hour out, written again before it. A worker's `git push` to `task/<id>` and `gh pr create` work; a push to another repo is refused 403 (`client:github-push`).
+- **Untested live** (as of this PR): a real `git clone`/`fetch`/`push` and `gh pr create`/`gh api` through nest-proxy with a client binding. The guards are evaluated by nest-proxy's evaluator on GitHub's request shapes (`tests/app_github_guards.rs`), and the environment by the real git and gh (`test-node/`); the e2e harness doesn't run it.
+- **What a `wrangler rollback` does:** the previous release (B2) sends nest's repos again and reads none of the new tables: its new starts are as before. The tokens it wrote stop being refreshed: each expires within the hour, and then nest refuses its placeholder, so agents started by this release lose GitHub within the hour (they keep running). The secrets stay listed (two per project, counting against `max_count`) until deleted by hand (`DELETE /v1/clients/self/secrets/gh-{push,read}-<project>`) or rolling forward. Its catalog sync writes the templates with repos again.
+- **Contract, with phase C:** the `repos: []`/`read_repos: []` narrowing, the frozen-before-B3 path (`spawnOverrides` without `github`, `roleTemplate`'s `nestRepos`, nest's `github_push` in layers and Settings) and the grant's `repos` and `github_push`.

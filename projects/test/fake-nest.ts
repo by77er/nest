@@ -7,6 +7,7 @@
 import { env, SELF } from "cloudflare:test";
 import { GITHUB_API, signGithub } from "../src/github";
 import { resetAppTokens } from "../src/github-app";
+import { githubBinding, githubEnv, kindOf } from "../src/github-access";
 import { sign as signWebhook } from "../src/webhook";
 
 export const NEST = "https://nest.test";
@@ -99,7 +100,7 @@ export class FakeNest {
   readonly agents = new Map<string, FakeAgent>();
   readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean; github_push?: { workflows: boolean } | null; layer: { egress: { allow: unknown[] }; inject: unknown[]; env: Record<string, string> } }>();
   /** The grant's `egress_hosts` (docs/control-plane/api/clients/#egress), as `GET /v1/clients/self` answers it. */
-  egressHosts: string[] = ["registry.npmjs.org", "nodejs.org", "*.pythonhosted.org", "pypi.org"];
+  egressHosts: string[] = ["registry.npmjs.org", "nodejs.org", "*.pythonhosted.org", "pypi.org", "github.com", "api.github.com", "*.githubusercontent.com"];
   /** nest's defaults, as each sandbox's effective policy shows them (layer `base`). */
   baseRules: { host: string; ports: number[] }[] = [{ host: "github.com", ports: [443] }];
   /** The operator's own layer, which the effective policy labels `workstream`, as it does the client's own rules. */
@@ -112,10 +113,15 @@ export class FakeNest {
   grantRules: { host: string; ports: number[]; expires_ms: number }[] = [{ host: "approved.example.com", ports: [443], expires_ms: Date.now() + 3_600_000 }];
   /** The client's grant, in the parts the app reads (`GET /v1/clients/self`). */
   grant: { inject_hosts: string[]; secrets: { max_count: number; max_bytes: number }; github_push?: { workflows: boolean } } = {
-    inject_hosts: ["api.cloudflare.com", "registry.npmjs.org", "*.example.com"], secrets: { max_count: 50, max_bytes: 4096 }, github_push: { workflows: true },
+    inject_hosts: ["api.cloudflare.com", "registry.npmjs.org", "*.example.com", "github.com", "api.github.com"], secrets: { max_count: 1000, max_bytes: 4096 }, github_push: { workflows: true },
   };
-  /** The client's secrets, values and all: nest's, the only place a value may be. */
-  readonly secrets = new Map<string, { value: string; description: string | null; created_ms: number; updated_ms: number; last_injected_ms: number | null }>();
+  /** The client's secrets, values and all: nest's, the only place a value may be; `expires_ms` from `expires_at`. */
+  readonly secrets = new Map<string, { value: string; description: string | null; created_ms: number; updated_ms: number; last_injected_ms: number | null; expires_ms?: number | null }>();
+  /**
+   * Agent creates bringing request guards refused (409, nest's words) while this many sandbox hosts of the cell
+   * don't apply them yet (docs/control-plane/api/clients/#request-guards); `at` (A5's `guard_injected_any`) the same.
+   */
+  hostsBehind = 0;
   readonly inbox: { agent: string; text: string; from?: string; request_id?: string }[] = [];
   readonly catalog = new Map<string, unknown>();
   readonly answers: { agent: string; ask: string; answer: string }[] = [];
@@ -355,6 +361,24 @@ export class FakeNest {
       return json(200, { sandboxes: rows.map((s) => ({ sandbox: s.sandbox, cell: CELL, client: CLIENT, owner: s.owner, labels: s.labels, created_ms: 1, ended_ms: null })), next_cursor: null });
     }
     if (r === "POST /v1/agents") {
+      // Guards wait for every sandbox host of the cell (nest's SandboxDO.requireGuardBounds, its words).
+      const guards = (call.body.overrides?.guards ?? []) as unknown[];
+      if (guards.length && this.hostsBehind > 0) {
+        return nestErr(409, "conflict", `request guards need every sandbox host of cell ${CELL} to bound guarded requests; ${this.hostsBehind} host(s) don't yet (sh_old): retry once they are replaced`);
+      }
+      // A spawn only narrows the template's repos (nest's SpawnerOverrides): none to narrow, refused.
+      const tpl = this.catalog.get(`templates/${call.body.template}`) as { repos?: string[]; read_repos?: string[] } | undefined;
+      for (const k of ["repos", "read_repos"] as const) {
+        const asked = (call.body.overrides?.[k] ?? []) as string[];
+        const has = [...(tpl?.repos ?? []), ...(tpl?.read_repos ?? [])];
+        if (tpl && asked.some((x) => !has.includes(x.toLowerCase()))) return nestErr(400, "invalid_message", `template ${call.body.template}: overrides.${k} names a repo it doesn't`);
+      }
+      // nest's own GitHub token for the agent's repos (the template's, unless the spawn narrows them) refuses a
+      // sandbox's GitHub variables beside it (nest's githubEnvConflict).
+      const kernel = [...(call.body.overrides?.repos ?? tpl?.repos ?? []), ...(call.body.overrides?.read_repos ?? tpl?.read_repos ?? [])];
+      const sbEnv = (call.body.sandbox ? this.sandboxes.get(call.body.sandbox)?.layer.env : undefined) ?? {};
+      const clash = Object.keys(sbEnv).filter((k) => k === "GH_TOKEN" || k.startsWith("GIT_CONFIG"));
+      if (kernel.length && clash.length) return nestErr(400, "invalid_message", `env ${clash.sort().join(", ")}: reserved where nest injects its own GitHub token`);
       const a: FakeAgent = {
         agent: id("agt_"), owner: CLIENT, client: CLIENT, labels: call.body.labels ?? {}, template: call.body.template,
         sandbox: call.body.sandbox ?? null, overrides: call.body.overrides, ended: false,
@@ -488,13 +512,16 @@ export class FakeNest {
       if (!/^[a-z][a-z0-9_-]{0,62}$/.test(name)) return nestErr(400, "invalid", "a secret's name is [a-z][a-z0-9_-]{0,62}");
       if (req.method === "DELETE") return this.secrets.delete(name) ? json(200, { ok: true }) : nestErr(404, "not_found", "no such secret");
       if (req.method === "PUT") {
-        const { value, description } = call.body as { value: string; description?: string };
+        const { value, description, expires_at } = call.body as { value: string; description?: string; expires_at?: string };
+        // RFC 3339 with an offset, not past (nest's `ClientSecretPut`).
+        const expires = expires_at === undefined ? null : /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/.test(expires_at) ? Date.parse(expires_at) : NaN;
+        if (expires !== null && !(expires > Date.now())) return nestErr(400, "invalid_message", `expires_at ${expires_at} isn't a time to come`);
         const size = new TextEncoder().encode(value).length;
         if (size > this.grant.secrets.max_bytes) return nestErr(403, "forbidden", "larger than the grant's secrets.max_bytes");
         const had = this.secrets.get(name);
         if (!had && this.secrets.size >= this.grant.secrets.max_count) return nestErr(403, "forbidden", "the grant's secrets.max_count is reached");
         const now = Date.now();
-        this.secrets.set(name, { value, description: description ?? null, created_ms: had?.created_ms ?? now, updated_ms: now, last_injected_ms: had?.last_injected_ms ?? null });
+        this.secrets.set(name, { value, description: description ?? null, created_ms: had?.created_ms ?? now, updated_ms: now, last_injected_ms: had?.last_injected_ms ?? null, expires_ms: expires });
         return json(200, { name, description: description ?? null, size, created_ms: had?.created_ms ?? now, updated_ms: now, last_injected_ms: had?.last_injected_ms ?? null });
       }
     }
@@ -1421,4 +1448,14 @@ function nodeTarget(id: string): { repo: string; number: number } | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * The app's own GitHub part of a sandbox's client layer (README.md#repo-authority) for a role, as the layer
+ * tests expect it beside the role's rules and the owner's secrets: built by src/github-access.ts, which
+ * test/github-access.test.ts checks against literal values.
+ */
+export function githubPart(project: string, role: "worker" | "manager" | "reviewer" | "routine") {
+  const kind = kindOf(role);
+  return { binding: githubBinding(project, kind), env: githubEnv(CLIENT, kind), egress: [{ host: "github.com" }, { host: "api.github.com" }, { host: "*.githubusercontent.com" }] };
 }

@@ -174,6 +174,9 @@ describe("who is set", () => {
       for (const c of ["pr_read_next_ms", "pr_read_last_ms", "pr_read_attempts"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       // And the comments default's step (README.md#pr-comments).
       for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      // And the GitHub access step's (README.md#repo-authority).
+      for (const t of ["gh_access", "gh_tokens"]) sql.exec(`DROP TABLE ${t}`);
+      sql.exec("ALTER TABLE layers DROP COLUMN github");
       sql.exec("UPDATE schema_version SET v = ?", step);
       migrate(st.storage, MIGRATIONS);
       expect(sql.exec("SELECT attach_next_ms FROM settings").one().attach_next_ms).toBe(0);
@@ -217,6 +220,9 @@ describe("who is set", () => {
         const sql = st.storage.sql;
         const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("comments_default_id")));
         for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+        // And the GitHub access step's (README.md#repo-authority).
+        for (const t of ["gh_access", "gh_tokens"]) sql.exec(`DROP TABLE ${t}`);
+        sql.exec("ALTER TABLE layers DROP COLUMN github");
         sql.exec("UPDATE schema_version SET v = ?", step);
         migrate(st.storage, MIGRATIONS);
         return sql.exec("SELECT comments_default_id AS d FROM settings").one().d;
@@ -234,6 +240,9 @@ describe("who is set", () => {
       const sql = st.storage.sql;
       const step = MIGRATIONS.findIndex((m) => m.some((q) => q.includes("comments_default_id")));
       for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      // And the GitHub access step's (README.md#repo-authority).
+      for (const t of ["gh_access", "gh_tokens"]) sql.exec(`DROP TABLE ${t}`);
+      sql.exec("ALTER TABLE layers DROP COLUMN github");
       sql.exec("UPDATE settings SET repo_owner_id = 55501, repo_owner_login = 'interim'");
       sql.exec("UPDATE schema_version SET v = ?", step);
       migrate(st.storage, MIGRATIONS);

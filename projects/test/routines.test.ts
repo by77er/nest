@@ -4,6 +4,7 @@
 // triage, never on the board unless the routine says so. Memory is written by the manager and routines
 // only. The pure rules first.
 import { env, runInDurableObject } from "cloudflare:test";
+import { githubGuards } from "../src/github-access";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { MAX_START_ATTEMPTS } from "../src/routines";
@@ -181,7 +182,7 @@ describe("firing", () => {
     // A sandbox of its own, to read the repo.
     expect(a.sandbox).toMatch(/^sbx_/);
     expect(a.labels).toEqual({ project: s.id, role: "routine", routine: id, run: run.id });
-    expect(a.overrides).toEqual({ read_repos: [s.repo] });
+    expect(a.overrides).toEqual({ guards: githubGuards(s.repo, "read"), repos: [], read_repos: [] });
     // A custom routine reads no transcripts.
     expect(fake.calls.find((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id)!.body.grants).toBeUndefined();
     const brief = fake.inbox.filter((m) => m.agent === run.agent);
@@ -400,6 +401,35 @@ describe("cost guards", () => {
     expect(boxes().filter((sb) => !sb.ended)).toEqual([]);
     // Ended by its own stop, with its sandbox: destroying a sandbox alone doesn't end an agent.
     expect(stopsOf(made()[0]!.agent).map((c) => c.body)).toEqual([expect.objectContaining({ end: true, destroy_sandbox: true })]);
+  });
+
+  it("a run waiting on nest's hosts to apply its guards waits past its attempts, saying so, then starts (README.md#repo-authority)", async () => {
+    const s = await setup();
+    const id = await create(s);
+    fake.hostsBehind = 1;
+    try {
+      await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+      for (let k = 0; k < MAX_START_ATTEMPTS + 1; k++) {
+        await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+          st.storage.sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE state = 'starting'");
+        });
+        await settle(s);
+      }
+      const r = (await runs(s, id))[0];
+      expect(r).toMatchObject({ state: "starting", agent: null });
+      expect(r.error).toMatch(/waiting for every sandbox host/);
+      // Each try the same request: the read guards, never dropped.
+      const tries = fake.callsTo("POST", /^\/v1\/agents$/).filter((c) => c.body.labels?.run === r.id);
+      expect(tries.length).toBeGreaterThan(MAX_START_ATTEMPTS);
+      for (const c of tries) expect(c.body.overrides).toEqual({ guards: githubGuards(s.repo, "read"), repos: [], read_repos: [] });
+    } finally {
+      fake.hostsBehind = 0;
+    }
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE state = 'starting'");
+    });
+    await settle(s);
+    expect((await runs(s, id))[0]).toMatchObject({ state: "running" });
   });
 
   it("B16: a run the owner stops while its first create's answer was lost: the agent that create made is found and ended", async () => {

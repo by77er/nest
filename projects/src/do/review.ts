@@ -19,7 +19,8 @@ import { TEMPLATE } from "../catalog";
 import { directory, type Env, project as projectStub } from "../env";
 import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, type Verdict, verdictCheck } from "../github";
 import type { AgentCaller } from "../identity";
-import { atCapacity, backoff, NestError, nestFrom, type Nest, stopRefused } from "../nest";
+import { atCapacity, backoff, HOSTS_WAIT, NestError, nestFrom, type Nest, stopRefused } from "../nest";
+import { spawnOverrides, startEgress } from "../github-access";
 import { OUTBOX, type OutboxPolicy, type OutboxRow, outboxStep } from "../outbox";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
@@ -926,7 +927,7 @@ export class ReviewDO extends DurableObject<Env> {
         // The project's secrets for reviewers, frozen per attempt (ProjectDO keeps them).
         const spec = await projectStub(this.env, project).reviewerSpec(key);
         try {
-          agent = await nest.startAgent(TEMPLATE.reviewer, labels, { read: repo }, key, spec.extras, {}, { newAttemptOnCapacity: true });
+          agent = await nest.startAgent(TEMPLATE.reviewer, labels, spawnOverrides(spec, repo, false), key, { ...startEgress([], spec), ...spec.extras }, {}, { newAttemptOnCapacity: true });
         } catch (e) {
           // No room in nest for now: the job waits, queued, and starts again once there is.
           const r = atCapacity(e) ? current() : null;
@@ -1097,7 +1098,7 @@ const OVERFLOW_OUTPUT: CheckOutput = {
   summary: "This pull request isn't from someone the project trusts, and too many such reviews already wait for the owner's approval. It will be listed for the owner once some of those are approved, dismissed or closed.",
 };
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 500);
+const message = (e: unknown) => (e instanceof NestError && e.hostsNotReady ? `${HOSTS_WAIT}: ${e.message}` : e instanceof Error ? e.message : String(e)).slice(0, 500);
 
 /** A branch name the brief may quote; anything else is left to review_get. */
 const SAFE_REF = /^[A-Za-z0-9._/-]{1,200}$/;

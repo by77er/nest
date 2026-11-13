@@ -2,6 +2,7 @@
 // interface (docs/control-plane/api/clients/): a fake nest records every call, and a key pair made here
 // plays Cloudflare Access.
 import { modelTemplateEntry } from "../src/models";
+import { githubGuards } from "../src/github-access";
 import { env, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
@@ -77,19 +78,16 @@ describe("the Access check", () => {
 });
 
 describe("projects", () => {
-  it("creating one records it, writes the catalog with its repo and starts its manager", async () => {
+  it("creating one records it, writes the catalog and starts its manager", async () => {
     const p = await newProject();
     expect(p.body.repo).toBe(p.repo.toLowerCase());
     expect(p.body.catalog_synced).toBe(true);
-    // The manager and the reviewer only read the repos; the worker pushes to them.
-    for (const role of ["manager", "reviewer"]) {
+    // The templates name no repo: each start brings the project's GitHub access (README.md#repo-authority).
+    for (const role of ["manager", "worker", "reviewer", "routine"]) {
       const tmpl = fake.catalog.get(`templates/projects/${role}`) as { repos?: string[]; read_repos?: string[] };
-      expect(tmpl.read_repos, role).toContain(p.repo.toLowerCase());
+      expect(tmpl.read_repos, role).toBeUndefined();
       expect(tmpl.repos, role).toBeUndefined();
     }
-    const worker = fake.catalog.get("templates/projects/worker") as { repos?: string[]; read_repos?: string[] };
-    expect(worker.repos).toContain(p.repo.toLowerCase());
-    expect(worker.read_repos).toBeUndefined();
     const managers = [...fake.agents.values()].filter((a) => a.labels.project === p.id && a.labels.role === "manager");
     expect(managers).toHaveLength(1);
     const m = managers[0]!;
@@ -97,8 +95,8 @@ describe("projects", () => {
     expect(m.template).toBe(`projects/${modelTemplateEntry("manager", p.id, "claude-fable-5-2")}`);
     expect(m.sandbox).toMatch(/^sbx_/);
     expect(fake.sandboxes.get(m.sandbox!)!.labels).toEqual(m.labels);
-    // It reads its project's repo and pushes to none.
-    expect(m.overrides).toEqual({ read_repos: [p.repo.toLowerCase()] });
+    // It reads its project's repo and pushes to none: the read guards, none of nest's repos.
+    expect(m.overrides).toEqual({ guards: githubGuards(p.repo, "read"), repos: [], read_repos: [] });
     expect(p.body.settings.manager).toBe(m.agent);
     expect(fake.inbox.find((x) => x.agent === m.agent)?.text).toContain(p.repo.toLowerCase());
     // The cell goes where nest takes it: in each create's body, which carries an Idempotency-Key.
@@ -202,7 +200,7 @@ describe("tasks", () => {
     const w = ws[0]!;
     expect(w.labels).toEqual({ project: p.id, role: "worker", task: t.id, start: "1" });
     expect(w.template).toBe(`projects/${modelTemplateEntry("worker", p.id, "claude-opus-5-5")}`);
-    expect(w.overrides).toEqual({ repos: [p.repo.toLowerCase()] });
+    expect(w.overrides).toEqual({ guards: githubGuards(p.repo, "push"), repos: [], read_repos: [] });
     expect(fake.sandboxes.get(w.sandbox!)!.labels).toEqual(w.labels);
     expect(r.body.assignee).toBe(w.agent);
     const brief = fake.inbox.filter((x) => x.agent === w.agent);

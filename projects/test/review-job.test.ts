@@ -34,7 +34,7 @@ describe("the job table (pure)", () => {
   });
 
   it("the reviewer ends itself once its turn is done (ephemeral)", () => {
-    const t = catalogFor("https://projects.test", ["acme/app"]).templates[`${NAMESPACE}/reviewer`] as { ephemeral?: boolean };
+    const t = catalogFor("https://projects.test").templates[`${NAMESPACE}/reviewer`] as { ephemeral?: boolean };
     expect(t.ephemeral).toBe(true);
   });
 });

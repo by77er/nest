@@ -2,6 +2,7 @@
 // project's ReviewDO queue and its alarm, the reviewer's tools on /mcp/review, and the check runs and
 // agents it makes, against a fake GitHub and a fake nest (test/fake-nest.ts).
 import { env, runInDurableObject } from "cloudflare:test";
+import { githubGuards } from "../src/github-access";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { CHECK_NAME, signGithub } from "../src/github";
@@ -134,7 +135,7 @@ describe("a PR's review", () => {
     expect(a.labels).toMatchObject({ project: p.id, role: "reviewer", pr: "3", sha: s });
     expect(a.sandbox).toMatch(/^sbx_/);
     // It reads the repo and pushes to none.
-    expect(a.overrides).toEqual({ read_repos: [p.repo.toLowerCase()] });
+    expect(a.overrides).toEqual({ guards: githubGuards(p.repo, "read"), repos: [], read_repos: [] });
     const brief = fake.inbox.find((x) => x.agent === reviewer)!.text;
     for (const part of [p.repo.toLowerCase(), "#3", s, "develop", "submit_review"]) expect(brief).toContain(part);
     const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels.role === "reviewer" && c.body.labels.project === p.id);

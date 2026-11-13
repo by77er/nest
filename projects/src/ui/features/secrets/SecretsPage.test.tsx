@@ -156,13 +156,13 @@ describe("the Secrets page", () => {
     expect(api.writes).toEqual([]);
   });
 
-  it("steers away from the GitHub API preset: nest brokers GitHub already", async () => {
+  it("steers away from the GitHub API preset: every sandbox has the app's token for the repo already", async () => {
     const api = new FakeApi();
     const { user } = renderApp("/projects/prj_one/secrets", api);
     await user.click(await screen.findByRole("button", { name: "Add the first secret" }));
     await user.click(service(sheet()));
     await user.click(await screen.findByRole("option", { name: "GitHub API" }));
-    expect(within(sheet()).getByText(/nest already brokers GitHub/)).toBeInTheDocument();
+    expect(within(sheet()).getByText(/already gives every sandbox a token for the project's repo/)).toBeInTheDocument();
   });
 
   it("deleting confirms, naming the agents that lose it", async () => {

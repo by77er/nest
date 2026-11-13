@@ -271,6 +271,31 @@ export class AppTokens implements TokenSource {
     await this.revoke(new GitHub(t.token, Number(app.appId), installation), installation);
   }
 
+  /**
+   * A token for a sandbox (src/github-access.ts): for `repo` only, with exactly `permissions`, minted afresh
+   * (never one cached, nor kept here: the caller writes it to nest and keeps it only to revoke it), from the
+   * repo's installation as looked up (its account checked). GitHub's refusals are thrown as for `token`.
+   */
+  async sandboxToken(repo: string, permissions: Record<string, string>): Promise<{ token: string; expires_ms: number }> {
+    const app = this.app();
+    const installation = await this.installation(repo);
+    return this.mint(app, installation, repo.split("/")[1]!, permissions);
+  }
+
+  /**
+   * Revoke an installation token (`DELETE /installation/token` with the token itself,
+   * https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token). Done when GitHub
+   * answers 204, or 401 (expired or revoked already); anything else is thrown, for the caller to retry.
+   */
+  async revokeToken(token: string): Promise<void> {
+    try {
+      await new GitHub(token).call("DELETE", "/installation/token");
+    } catch (e) {
+      if (e instanceof GitHubError && e.status === 401) return;
+      throw e;
+    }
+  }
+
   private async revoke(gh: GitHub, installation: number): Promise<void> {
     try {
       await gh.call("DELETE", "/installation/token");

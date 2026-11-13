@@ -64,11 +64,14 @@ describe("attaching a repo", () => {
     // installation on it. (The others, metadata alone: the create's check that the App reaches the repo, revoked
     // after, and the answer's read of the repo's owner.)
     const name = repo.split("/")[1]!;
-    expect(gh.mints().filter((m) => m.repositories?.[0] === name)).toEqual([
+    // The manager's sandbox token (README.md#repo-authority) aside: it reads the code, and no call here carries it.
+    const mints = gh.mints().filter((m) => m.repositories?.[0] === name);
+    expect(mints.filter((m) => !("contents" in m.permissions))).toEqual([
       { installation: GH_INSTALLATION_ID, repositories: [name], permissions: { metadata: "read" } },
       { installation: GH_INSTALLATION_ID, repositories: [name], permissions: { administration: "write", metadata: "read" } },
       { installation: GH_INSTALLATION_ID, repositories: [name], permissions: { metadata: "read" } },
     ]);
+    expect(mints.filter((m) => "contents" in m.permissions)).toEqual([{ installation: GH_INSTALLATION_ID, repositories: [name], permissions: { contents: "read", metadata: "read" } }]);
     const used = gh.calls.filter((c) => c.path.startsWith(`/repos/${repo}/branches/`));
     expect(used.length).toBeGreaterThan(0);
     for (const c of used) expect(c.permissions).toEqual({ administration: "write", metadata: "read" });
