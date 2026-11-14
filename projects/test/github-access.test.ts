@@ -66,8 +66,8 @@ describe("the access (pure)", () => {
       {
         name: "github-write", hosts: ["github.com"], scope: [{ methods_except: ["GET", "HEAD"] }],
         allow: [
-          { methods: ["POST"], path: "/**/git-upload-pack" },
-          { methods: ["POST"], path: "/**/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
+          { methods: ["POST"], path: "/*/*/git-upload-pack" },
+          { methods: ["POST"], path: "/*/*/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
           { path: "/owner/repo/**" }, { path: "/owner/repo.git/**" },
         ],
         reason: "writes to GitHub reach only owner/repo", ignore_case: true,
@@ -103,8 +103,8 @@ describe("the access (pure)", () => {
     const by = (n: string) => g.find((x) => x.name === n)!;
     expect(by("github-push").allow).toBeUndefined();
     expect(by("github-write").allow).toEqual([
-      { methods: ["POST"], path: "/**/git-upload-pack" },
-      { methods: ["POST"], path: "/**/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
+      { methods: ["POST"], path: "/*/*/git-upload-pack" },
+      { methods: ["POST"], path: "/*/*/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
     ]);
     expect(by("github-api-write").allow).toEqual([{ methods: ["POST"], path: "/graphql", injected: "gh_read", at: "authorization" }]);
     expect(g.map((x) => x.name)).toEqual(["github-push", "github-write", "github-api-write", "gist-write", "githubusercontent-write"]);

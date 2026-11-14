@@ -132,8 +132,10 @@ export function githubGuards(repo: string, kind: GithubKind): Guard[] {
     {
       name: "github-write", hosts: ["github.com"], scope: [writes()],
       allow: [
-        { methods: ["POST"], path: "/**/git-upload-pack" },
-        { methods: ["POST"], path: "/**/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
+        // A fetch, anchored at the repo as git sends it: an open front would take the web editor's routes, which end
+        // in a path the user chooses (`/<o>/<r>/tree-save/<branch>/git-upload-pack`) and a cookie authenticates.
+        { methods: ["POST"], path: "/*/*/git-upload-pack" },
+        { methods: ["POST"], path: "/*/*/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
         ...web,
       ],
       reason, ignore_case: true,
