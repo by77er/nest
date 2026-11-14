@@ -275,7 +275,8 @@ impl Rng {
 }
 
 const SEGS: &[&str] = &["a", "A", "b", "mine", "MINE", "x", "", ".", "..", "%2e", "%2E%2e", "%252e%252e", "a%2Fb", "%61", "a;p=1", "a\\b", "%5c", "deposit", "dep%6fsit"];
-const PATS: &[&str] = &["a", "A", "b", "mine", "x", "*", "**", "deposit", "%61"];
+// "" and "/" make empty literals (`/`, `/a/`, `//`): none may take a sealed segment.
+const PATS: &[&str] = &["a", "A", "b", "mine", "x", "*", "**", "deposit", "%61", "", "/"];
 const KEYS: &[&str] = &["op", "OP", "o%70", "x", "op+", "", "a"];
 const VALS: &[&str] = &["read", "READ", "re%61d", "write", "", "w+r", "%2B"];
 

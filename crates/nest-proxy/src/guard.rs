@@ -63,7 +63,7 @@ pub struct Prepared<'a> {
     injected: Option<&'a str>,
     whole: &'a [Whole],
     raw: Vec<&'a str>,
-    /// `raw` as an exception sees it: a segment holding `/` or `\\` once decoded is blank (`sealed`).
+    /// `raw` as an exception sees it: a segment holding `/` or `\\` once decoded is [`SEALED`].
     sealed: Vec<&'a str>,
     norm: Vec<String>,
     clean: bool,
@@ -89,7 +89,7 @@ impl<'a> Req<'a> {
             return Err(TooLong);
         }
         let decoded = pairs.iter().map(|(k, v)| (decode_repeatedly(k, true), decode_repeatedly(v, true))).collect();
-        let sealed = raw.iter().map(|s| if decode_repeatedly(s, false).contains(['/', '\\']) { "" } else { *s }).collect();
+        let sealed = raw.iter().map(|s| if decode_repeatedly(s, false).contains(['/', '\\']) { SEALED } else { *s }).collect();
         Ok(Prepared {
             host: self.host,
             method: self.method,
@@ -225,7 +225,7 @@ fn glob<S: AsRef<str>>(pat: &[Seg<'_>], segs: &[S], ic: bool) -> bool {
             segs.len() >= rest.len() && glob(rest, &segs[segs.len() - rest.len()..], ic)
         }
         Some((Seg::Any, rest)) => (0..=segs.len()).any(|i| glob(rest, &segs[i..], ic)),
-        Some((Seg::One, rest)) => segs.split_first().is_some_and(|(s, tail)| !s.as_ref().is_empty() && glob(rest, tail, ic)),
+        Some((Seg::One, rest)) => segs.split_first().is_some_and(|(s, tail)| !s.as_ref().is_empty() && s.as_ref() != SEALED && glob(rest, tail, ic)),
         Some((Seg::Lit(l), rest)) => segs.split_first().is_some_and(|(s, tail)| {
             let s = s.as_ref();
             (if ic { s.eq_ignore_ascii_case(l) } else { s == *l }) && glob(rest, tail, ic)
@@ -239,6 +239,10 @@ fn path_in_scope(p: &str, req: &Prepared<'_>, ic: bool) -> bool {
     let Some(pat) = pattern(p) else { return true };
     glob(&pat, &req.raw, ic) || glob(&pat, &req.norm, ic)
 }
+
+/// What a sealed segment reads as: `/`, which no segment of a path split on `/` is, and so no literal of a
+/// pattern equals (an empty literal included), and `*` refuses; only `**` takes it.
+const SEALED: &str = "/";
 
 /// An exception matches only a clean path, as sent; and a segment holding a separator once decoded (`%2F`,
 /// `%5C`) only under `**`, never as a `*` or a literal. A server that decodes it reads more segments there
@@ -426,6 +430,13 @@ mod tests {
         assert!(refused(&g, &req("files.test", "POST", "/store%5Cmine/read")));
         assert!(refused(&g, &req("files.test", "POST", "/store%252Fmine/read")));
         assert!(!refused(&g, &req("files.test", "POST", "/store/read")));
+        // An empty literal never takes one either (`/`, `/api/`).
+        let roots = RequestGuard { allow: vec![m(&[], Some("/")), m(&[], Some("/api/"))], ..store_guard(false) };
+        for path in ["/admin%2Fdelete", "/%5Cadmin", "/api/x%2Fy", "/api/%2F"] {
+            assert!(refused(&roots, &req("files.test", "PUT", path)), "{path}");
+        }
+        assert!(!refused(&roots, &req("files.test", "PUT", "/")));
+        assert!(!refused(&roots, &req("files.test", "PUT", "/api/")));
         let long = format!("/store/mine/{}", "a".repeat(MAX_PATH));
         assert!(refused(&g, &req("files.test", "PUT", &long)));
     }
