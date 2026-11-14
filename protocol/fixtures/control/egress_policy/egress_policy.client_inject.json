@@ -21,6 +21,13 @@
         443
       ],
       "layer": "workstream"
+    },
+    {
+      "host": "git.example.org",
+      "ports": [
+        443
+      ],
+      "layer": "workstream"
     }
   ],
   "passthrough": [],
@@ -66,6 +73,19 @@
         },
         {
           "type": "authorization_basic_password"
+        }
+      ]
+    },
+    {
+      "name": "client:git",
+      "hosts": [
+        "git.example.org"
+      ],
+      "placeholder": "nest-ph.cli_01JTESTCLIENT.git.",
+      "locations": [
+        {
+          "type": "authorization_basic_password",
+          "username": "x-access-token"
         }
       ]
     }

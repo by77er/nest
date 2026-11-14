@@ -74,10 +74,14 @@ const reservedHeader = (h: string) => RESERVED_HEADERS.has(h) || (h.startsWith("
 const HeaderName = z.string().regex(/^[A-Za-z0-9!#$%&'*+.^_`|~-]{1,64}$/, "a header name is an HTTP token of 1-64 characters")
   .refine((h) => !reservedHeader(h.toLowerCase()), "that header is reserved: a credential can't go there");
 
+/** A Basic username a binding names: no `:` (it ends the username), printable, at most 64 characters. */
+const BasicUsername = z.string().regex(/^[A-Za-z0-9._~+-]{1,64}$/, "a Basic username is 1-64 letters, digits and . _ ~ + -");
+
 /** Where the credential goes: the existing locations (`protocol/model.ts` `InjectionLocation`), a header's name checked. */
 export const ClientInjectionLocation = z.discriminatedUnion("type", [
   z.strictObject({ type: z.literal("authorization_bearer") }),
-  z.strictObject({ type: z.literal("authorization_basic_password") }),
+  // `username`: the one nest-proxy writes with the secret (a guard's `at` holds for a Basic field only then).
+  z.strictObject({ type: z.literal("authorization_basic_password"), username: BasicUsername.optional() }),
   z.strictObject({ type: z.literal("header"), name: HeaderName }),
 ]);
 export type ClientInjectionLocation = z.output<typeof ClientInjectionLocation>;
@@ -103,7 +107,8 @@ export type ClientInjection = z.output<typeof ClientInjection>;
 /** A spec's list: at most 16, each name once. */
 export const ClientInjections = z.array(ClientInjection).max(16).refine((l) => new Set(l.map((b) => b.name)).size === l.length, "a binding name is listed twice");
 
-const locationKey = (l: ClientInjectionLocation) => (l.type === "header" ? `header:${l.name.toLowerCase()}` : l.type);
+const locationKey = (l: ClientInjectionLocation) =>
+  l.type === "header" ? `header:${l.name.toLowerCase()}` : l.type === "authorization_basic_password" && l.username !== undefined ? `${l.type}:${l.username}` : l.type;
 
 /** A binding as a spec or sandbox keeps it: whose it is (the client whose namespace declared it) and its placeholder. */
 export interface HeldInjection extends ClientInjection {

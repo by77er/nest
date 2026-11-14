@@ -166,13 +166,17 @@ pub mod error_codes {
     /// spawner's live children): there is room once fewer are live than the limit. The message
     /// names the limit. HTTP 429, retryable.
     pub const AT_CAPACITY: &str = "at_capacity";
+    /// Refused because a sandbox host of the cell doesn't apply what the request brings yet (an API
+    /// client's request guards, `injected: "*"` or `at`); the same request goes through once every such
+    /// host is replaced. The message names the hosts. HTTP 409, not retryable soon.
+    pub const HOSTS_NOT_READY: &str = "hosts_not_ready";
 
     /// Every code above that is sent (the legacy alias is not).
     pub const ALL: &[&str] = &[
         STALE_EPOCH, PARENT_MISMATCH, UNKNOWN_SANDBOX, UNKNOWN_AGENT, UNAUTHORIZED, FORBIDDEN,
         UNSUPPORTED_VERSION, INVALID_MESSAGE, UNKNOWN_TOOL, CAPACITY_EXHAUSTED, RATE_LIMITED, NOT_BOUND,
         SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN, CONFLICT, NOT_FOUND, TOOL_ERROR, BUSY,
-        AT_CAPACITY,
+        AT_CAPACITY, HOSTS_NOT_READY,
     ];
 
     /// `unsupported_version` under either name.
@@ -334,8 +338,16 @@ impl AllowRule {
 pub enum InjectionLocation {
     /// `Authorization: Bearer <placeholder>` (also `token <placeholder>`).
     AuthorizationBearer,
-    /// `Authorization: Basic base64(user:<placeholder>)`; git's credential helper uses this.
-    AuthorizationBasicPassword,
+    /// `Authorization: Basic base64(user:<placeholder>)`; git's credential helper uses this. With
+    /// `username`, nest-proxy writes that username with the secret, whatever the request's was, and only
+    /// then has it written the field whole (a guard's `at`): a username the sandbox chose can be a
+    /// credential of its own, which some services take (GitHub reads a token as the Basic username).
+    /// Absent: the request's username is kept, and the field is never whole. A proxy of the previous
+    /// release ignores `username` (fleet hello `guard_basic_user` says this one doesn't).
+    AuthorizationBasicPassword {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        username: Option<String>,
+    },
     /// Any named header whose value equals or contains the placeholder.
     Header { name: String },
 }
@@ -757,6 +769,27 @@ pub struct Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Basic location's `username` is optional and absent from the wire when unset, so a binding
+    /// without one is the bytes the previous release sent and read.
+    #[test]
+    fn a_basic_location_names_a_username_only_when_set() {
+        let plain: InjectionLocation = serde_json::from_str(r#"{"type":"authorization_basic_password"}"#).unwrap();
+        assert_eq!(plain, InjectionLocation::AuthorizationBasicPassword { username: None });
+        assert_eq!(serde_json::to_string(&plain).unwrap(), r#"{"type":"authorization_basic_password"}"#);
+        let named: InjectionLocation = serde_json::from_str(r#"{"type":"authorization_basic_password","username":"x-access-token"}"#).unwrap();
+        assert_eq!(named, InjectionLocation::AuthorizationBasicPassword { username: Some("x-access-token".into()) });
+        assert_eq!(serde_json::to_string(&named).unwrap(), r#"{"type":"authorization_basic_password","username":"x-access-token"}"#);
+        // The previous release's unit variant reads a location naming one, ignoring it (its proxy then
+        // keeps the request's username: the control plane places such sandboxes off it, `guard_basic_user`).
+        #[derive(Deserialize, Debug, PartialEq)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum Previous {
+            AuthorizationBasicPassword,
+        }
+        let old: Previous = serde_json::from_str(r#"{"type":"authorization_basic_password","username":"x-access-token"}"#).unwrap();
+        assert_eq!(old, Previous::AuthorizationBasicPassword);
+    }
 
     #[test]
     fn host_pattern_matching() {

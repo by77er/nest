@@ -369,7 +369,7 @@ pub fn policy(version: u64, db_port: u16) -> EgressPolicy {
             name: "github".into(),
             hosts: vec![HostPattern("api.github.test".into())],
             placeholder: PLACEHOLDER.into(),
-            locations: vec![InjectionLocation::AuthorizationBearer, InjectionLocation::AuthorizationBasicPassword],
+            locations: vec![InjectionLocation::AuthorizationBearer, InjectionLocation::AuthorizationBasicPassword { username: None }],
         }],
         tcp: vec![TcpException { host: "db.test".into(), port: db_port }],
         limits: EgressLimits { max_connections: 64, bandwidth_mbps: 100, max_inspected_body_bytes: 1 << 20 },

@@ -2730,6 +2730,7 @@ fn a_restarted_nestd_reports_salvages_and_deletes_what_it_left() {
         assert!(hello.brain_epochs, "brain epochs");
         assert!(hello.guard_bounds, "its nest-proxy bounds guarded requests");
         assert!(hello.guard_injected_any, "its nest-proxy reads injected: \"*\" as any binding");
+        assert!(hello.guard_basic_user, "its nest-proxy writes a binding's Basic username, whole only then");
         p.fleet.commands.send(vec![cmd("cmd_destroy", CommandBody::SandboxDestroy { sandbox: sbx.clone(), epoch: Epoch(1) })]).unwrap();
         assert!(is_ok(&p.fleet.result("cmd_destroy").await));
         assert_eq!(p.host.inner.fenced_epoch(&sbx), None, "a destroy at the fenced epoch prunes its tombstone");

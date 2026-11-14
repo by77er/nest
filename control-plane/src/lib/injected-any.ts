@@ -34,6 +34,39 @@ export function failsOpenOnOldProxy(guards: readonly Guardish[]): boolean {
     || (g.allow ?? []).some((m) => m.at !== undefined && m.injected !== INJECTED_ANY));
 }
 
+/** Whether any of `guards` uses `at`, in a scope or an exception. */
+export function usesAt(guards: readonly Guardish[]): boolean {
+  return guards.some((g) => [...(g.scope ?? []), ...(g.allow ?? [])].some((m) => m.at !== undefined));
+}
+
+/** Whether any of `inject` has a Basic password location. */
+export function hasBasicBinding(inject: readonly { locations: readonly { type: string }[] }[]): boolean {
+  return inject.some((b) => b.locations.some((l) => l.type === "authorization_basic_password"));
+}
+
+/**
+ * The pair a nest-proxy without `guard_basic_user` must never hold (docs/sandbox/networking/egress/policy/#any-injected-credential):
+ * a Basic password binding (from any source, nest's own included) and a guard using `at`. Such a proxy keeps
+ * the request's username and takes any Basic substitution as written whole, so a username the sandbox chose
+ * (a credential of its own) would satisfy the `at`.
+ */
+export function basicAtPair(policy: { inject?: readonly { locations: readonly { type: string }[] }[]; guards?: readonly Guardish[] }): boolean {
+  return hasBasicBinding(policy.inject ?? []) && usesAt(policy.guards ?? []);
+}
+
+/**
+ * `guards` as a host that can't decide `at` beside a Basic binding gets them: failing closed. An exception
+ * using `at` goes (it only let requests through); a scope matcher keeps its other conditions without `at`
+ * (it covers more, so the guard refuses more).
+ */
+export function guardsWithoutAt<G extends Guardish>(guards: readonly G[]): G[] {
+  return guards.map((g) => {
+    const allow = (g.allow ?? []).filter((m) => m.at === undefined);
+    const scope = (g.scope ?? []).map((m) => (m.at === undefined ? m : (({ at: _a, ...rest }) => rest)(m)));
+    return { ...g, scope, ...(g.allow ? { allow } : {}) } as G;
+  });
+}
+
 /** Those of `guards` that use `*` or `at` and aren't in `held` (compared whole): what a write newly brings. */
 export function freshInjectedAny<G extends Guardish>(guards: readonly G[], held: readonly unknown[]): G[] {
   const known = new Set(held.map((h) => JSON.stringify(h)));
@@ -42,6 +75,6 @@ export function freshInjectedAny<G extends Guardish>(guards: readonly G[], held:
 
 /** The refusal (409) of guards using `*` or `at` while sandbox hosts of the cell (`old`) don't know them. */
 export function injectedAnyConflict(cell: string, guards: readonly string[], old: readonly string[]): NestError {
-  return new NestError(ErrorCodes.CONFLICT, `guard(s) ${guards.slice(0, 3).join(", ")} name injected "${INJECTED_ANY}" or "at" (where a credential nest injected `
+  return new NestError(ErrorCodes.HOSTS_NOT_READY, `guard(s) ${guards.slice(0, 3).join(", ")} name injected "${INJECTED_ANY}" or "at" (where a credential nest injected `
     + `must be), which needs every sandbox host of cell ${cell} to know them; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
 }

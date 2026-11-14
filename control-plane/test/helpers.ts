@@ -154,6 +154,8 @@ export function hostHello(host: string, cell: string, extra: Partial<Record<stri
     guard_bounds: true,
     // ...and reads a guard's `injected: "*"` as any binding; a test of the previous release passes `false`.
     guard_injected_any: true,
+    // ...and writes a binding's Basic username itself; a test of the previous release passes `false`.
+    guard_basic_user: true,
     sandboxes: [],
     agents: [],
     capacity: { vcpus_free: 8, memory_mib_free: 16384, hugepages_mib_free: 8192, hugepages_mib_total: 8192, sandboxes: 0, agents: 0, warm: [] },
