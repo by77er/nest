@@ -30,7 +30,7 @@ import { GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING, githu
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
 import { githubEnvConflict, githubEnvRefusal, isGithubEnvName, slotEnv } from "../lib/sandbox-env";
-import { freshInjectedAny, injectedAnyConflict } from "../lib/injected-any";
+import { basicAtPair, freshInjectedAny, guardsWithoutAt, hasBasicBinding, injectedAnyConflict, usesAt } from "../lib/injected-any";
 import { CLIENT_GUARD_PREFIX, type ClientGuard, distinctGuards, type HeldGuard, layerOverLimit, outsideOperatorRouting, sandboxGuardsOverLimit, wireGuard } from "../lib/client-guards";
 import type { MintedInjection, SecretsChangedAnswer } from "./broker";
 import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
@@ -112,6 +112,8 @@ export interface EgressBase {
 export const SEED_EGRESS_BASE: EgressBase = { version: 0, allow: BASE_ALLOW.map((host) => ({ host })), guards: [] };
 /** Its cell's base layer as last heard from FleetDO (`egressBaseChanged`, `registerSandbox`); absent: the seed. */
 const EGRESS_BASE = "egress_base";
+/** Whether its host's nest-proxy writes a binding's Basic username itself (`guard_basic_user`), as FleetDO last said: `{host, ok}`. */
+const HOST_BASIC_USER = "host_basic_user";
 /**
  * The operator layer's rules on the wire: `workstream` is the layer's historical name, which hosts
  * parse as a closed enum (`PolicyLayer`), so it stays (docs/interfaces/#pending-contract-changes).
@@ -624,14 +626,19 @@ export class SandboxDO extends DurableObject<Env> {
     await this.deadlines.set("place", now + lease.PLACING_STALE_MS, true);
     let answer: lease.PlaceAnswer;
     let failure: unknown = null;
+    let placedWithFlag = false;
     try {
+      const placing = this.effectivePolicy(Date.now(), true);
+      // FleetDO places a Basic binding or `at` only on a host with `guard_basic_user`: placed so, its host has it.
+      placedWithFlag = hasBasicBinding(placing.inject) || usesAt(placing.guards ?? []);
       const host = await this.fleet(before.cell).place({
         sandbox: before.sandbox,
         workstream: wireWorkstream(before),
         epoch,
         image: before.image,
         resources: before.resources,
-        policy: this.effectivePolicy(),
+        // As built: FleetDO places a Basic binding or `at` only on a host with `guard_basic_user`.
+        policy: placing,
         ...(from ? { from } : {}),
         ...(excludeHost ? { excludeHost } : {}),
       });
@@ -645,6 +652,7 @@ export class SandboxDO extends DurableObject<Env> {
     const [r, after] = this.decide((i) => placedStep(i, lease.placeAnswered(i, epoch, answer, from !== undefined), "placed"));
     const owed = r === "placed" ? this.owePlaced() : undefined;
     if (r === "placed") this.recordEpoch(epoch, after.host!);
+    if (r === "placed" && placedWithFlag) this.put(HOST_BASIC_USER, { host: after.host!, ok: true });
     await owed;
     switch (r) {
       case "stale":
@@ -899,6 +907,8 @@ export class SandboxDO extends DurableObject<Env> {
     }
     if (r === "reissue") {
       if (!reissued) {
+        // Its host's answer first, as at every push (`forHost`).
+        await this.readHostBasicUser().catch((e) => console.warn(`sandbox ${info.sandbox}: its host's guard_basic_user wasn't read`, e));
         await this.fleet(info.cell).issueCommands(host, [this.createBody(info)]);
         if (cmd !== undefined) this.put("create_failure", { cmd, r, reissued: true, done: false } satisfies CreateFailure);
       }
@@ -1209,13 +1219,13 @@ export class SandboxDO extends DurableObject<Env> {
    * `layer` hosts parse as a closed enum (`base`, `workstream`, `sandbox`). Where each rule came from is
    * `policyView`'s `source`, which never goes to a host.
    */
-  private effectivePolicy(now = Date.now()): EgressPolicy {
-    const p = this.sourcedPolicy(now);
+  private effectivePolicy(now = Date.now(), raw = false): EgressPolicy {
+    const p = this.sourcedPolicy(now, raw);
     return { ...p, allow: p.allow.map(({ source: _s, ...rule }) => rule) };
   }
 
   /** The effective policy with each allow rule's `source` (docs/sandbox/networking/egress/policy/#sources). */
-  private sourcedPolicy(now = Date.now()): Omit<EgressPolicy, "allow"> & { allow: SourcedAllowRule[] } {
+  private sourcedPolicy(now = Date.now(), raw = false): Omit<EgressPolicy, "allow"> & { allow: SourcedAllowRule[] } {
     const info = this.info_();
     const ws = this.operatorLayer();
     const access = this.repoAccess();
@@ -1249,8 +1259,39 @@ export class SandboxDO extends DurableObject<Env> {
       limits: DEFAULT_LIMITS,
       // The base layer's and the operator's guards first (a request both refuse names theirs), then its
       // client's: every guard must let a request through, so a client's can only refuse more.
-      guards: [...base.guards, ...gh.guards, ...(ws.guards ?? []), ...outsideOperatorRouting(this.clientGuards(), [...ws.passthrough, ...ws.tcp.map((t) => t.host)])],
+      guards: this.forHost(inject, [...base.guards, ...gh.guards, ...(ws.guards ?? []), ...outsideOperatorRouting(this.clientGuards(), [...ws.passthrough, ...ws.tcp.map((t) => t.host)])], raw),
     };
+  }
+
+  /**
+   * The guards as its host gets them: unless FleetDO said its host has `guard_basic_user` (lacking, or not known:
+   * unplaced, unread, no row), a policy with a Basic binding beside a guard using `at` gets them without `at`,
+   * failing closed (`guardsWithoutAt`). Every write
+   * that would bring the pair there is refused first (`requireBasicUser`); a detach can't be, and is the case
+   * this keeps closed (repos going away can turn GitHub's guards' `at` on). `raw`: as built, for the judgment.
+   */
+  private forHost<G extends RequestGuard>(inject: readonly InjectionBinding[], guards: G[], raw: boolean): G[] {
+    if (raw || this.hostBasicUser() === true || !basicAtPair({ inject, guards })) return guards;
+    return guardsWithoutAt(guards);
+  }
+
+  /** Whether its host writes a binding's Basic username itself, as FleetDO last said; null: unplaced, or not asked yet. */
+  private hostBasicUser(): boolean | null {
+    const host = this.tryInfo()?.host;
+    const held = this.get<{ host: string; ok: boolean }>(HOST_BASIC_USER);
+    return host && held?.host === host ? held.ok : null;
+  }
+
+  /** Ask FleetDO whether its host writes a binding's Basic username itself, and hold the answer. */
+  private async readHostBasicUser(): Promise<boolean | null> {
+    const info = this.info_();
+    if (!info.host) return null;
+    const ok = await this.fleet(info.cell).hostBasicUser(info.host);
+    if (this.tryInfo()?.host !== info.host) return ok;
+    // No row for it: not known, so closed.
+    if (ok === null) this.del(HOST_BASIC_USER);
+    else this.put(HOST_BASIC_USER, { host: info.host, ok });
+    return ok;
   }
 
   /** Its cell's base layer as last heard (absent: the seed, today's hosts). */
@@ -1303,6 +1344,7 @@ export class SandboxDO extends DurableObject<Env> {
     // A guard newly naming `injected: "*"` needs every host to read it as any binding; one already stored
     // stays writable. Before the checks below, so nothing they read goes stale across the await.
     await this.requireInjectedAny(info.cell, freshInjectedAny(layer.guards, this.operatorLayer().guards));
+    await this.requireBasicUser(() => this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos), read_repos: canonicalRepos(layer.read_repos) }));
     this.refuseGithubEnv(this.kernelGithub({ layer }), ...this.envs());
     this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos), read_repos: canonicalRepos(layer.read_repos) });
     await this.policyChanged(true);
@@ -1415,6 +1457,8 @@ export class SandboxDO extends DurableObject<Env> {
    * sent meanwhile is left as the host's.
    */
   private async policyChanged(injectionChanged: boolean): Promise<EgressPolicy> {
+    // Its host's answer first, so what it gets is decided for it (`forHost`); unanswered, the last one held.
+    await this.readHostBasicUser().catch((e) => console.warn(`sandbox ${this.tryInfo()?.sandbox}: its host's guard_basic_user wasn't read`, e));
     const info = this.update((i) => {
       i.policy_version += 1;
     });
@@ -1608,6 +1652,14 @@ export class SandboxDO extends DurableObject<Env> {
       if (lease.gone(this.info_().state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${this.info_().state}`, 409);
     }
     if (extra.guards?.length) this.checkGuardLimit(undefined, { id: agent, guards: extra.guards });
+    // Its bindings, guards and repos (nest's own binding) newly bringing the pair to a host that can't decide it.
+    await this.requireBasicUser(() => {
+      this.setAgentExtras(agent, extra);
+      this.setAgentRepos(agent, repos ?? [], readRepos ?? []);
+      const i = this.info_();
+      if (!i.attached.includes(agent)) this.put("info", { ...i, attached: [...i.attached, agent] });
+    });
+    if (lease.gone(this.info_().state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${this.info_().state}`, 409);
     // Its env and the sandbox's beside the GitHub access both bring, before anything is recorded.
     this.refuseGithubEnv(this.kernelGithub({ except: agent }) || !!repos?.length || !!readRepos?.length || !!extra.workflows,
       ...this.envs(agent), extra.env);
@@ -1758,6 +1810,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (repos.length) this.refuseGithubEnv(true, ...this.envs());
     const have = this.get<Record<string, string[]>>("agent_repos")?.[agent] ?? [];
     const read = this.get<Record<string, string[]>>(AGENT_READ_REPOS)?.[agent] ?? [];
+    await this.requireBasicUser(() => this.setAgentRepos(agent, [...have, ...repos], read));
     if (this.setAgentRepos(agent, [...have, ...repos], read)) await this.policyChanged(true);
     return this.pushRepos();
   }
@@ -1894,10 +1947,45 @@ export class SandboxDO extends DurableObject<Env> {
    * Such a host fails a scope's `*` open, so a write naming it waits for every host; placement keeps a
    * sandbox whose scopes name it off such hosts that join later.
    */
-  private async requireInjectedAny(cell: string, fresh: readonly { name: string }[]): Promise<void> {
+  private async requireInjectedAny(cell: string, fresh: readonly { name: string; scope: readonly { at?: string }[]; allow?: readonly { at?: string }[] }[]): Promise<void> {
     if (!fresh.length) return;
-    const old = await this.fleet(cell).hostsWithoutInjectedAny();
+    // `at` also waits for every host to write a binding's Basic username itself (`guard_basic_user`).
+    const old = await this.fleet(cell).hostsWithoutInjectedAny(usesAt(fresh));
     if (old.length) throw injectedAnyConflict(cell, fresh.map((g) => g.name), old);
+  }
+
+  /** Whether its policy as built holds the pair (`basicAtPair`): a Basic binding, any source, beside a guard using `at`. */
+  private basicOpen(): boolean {
+    return basicAtPair(this.sourcedPolicy(Date.now(), true));
+  }
+
+  /**
+   * The one gate for the invariant (docs/sandbox/networking/egress/policy/#any-injected-credential): a sandbox on
+   * a host without `guard_basic_user` never holds a Basic binding (nest's own included) beside a guard using
+   * `at`. `change` stores a write as it would be (a client's layer, an attach with its repos and extras, the
+   * operator's layer and repos, an agent's repos added); it's applied, judged and undone in one synchronous
+   * transaction. A write that newly brings the pair is refused (409 `hosts_not_ready`) when its own host lacks
+   * the flag (asked of FleetDO now); unplaced, placement decides. A detach can't be refused: its host gets the
+   * guards without `at` instead (`forHost`).
+   */
+  private async requireBasicUser(change: () => void): Promise<void> {
+    if (this.basicOpen()) return;
+    let after = false;
+    const undo = new Error("undo");
+    try {
+      this.ctx.storage.transactionSync(() => {
+        change();
+        after = this.basicOpen();
+        throw undo;
+      });
+    } catch (e) {
+      if (e !== undo) throw e;
+    }
+    if (!after) return;
+    if ((await this.readHostBasicUser()) === false) {
+      const info = this.info_();
+      throw new NestError(ErrorCodes.HOSTS_NOT_READY, `this write puts a binding with a Basic password beside a guard using "at", which sandbox ${info.sandbox}'s host ${info.host} can't decide (its nest-proxy doesn't write a binding's Basic username itself): retry once it's on a host that does`, 409);
+    }
   }
 
   /** Refuse (400) a layer or an attach that would give the sandbox more client guards than it applies. */
@@ -1982,6 +2070,14 @@ export class SandboxDO extends DurableObject<Env> {
     // Likewise a guard newly naming `injected: "*"` needs every host to read it as any binding.
     const freshAny = freshInjectedAny(guards, this.get<ClientGuard[]>(OWN_GUARDS) ?? []);
     await this.requireInjectedAny(info.cell, freshAny);
+    // And never a Basic binding beside `at` on a host that can't decide it (a binding or a guard of this write's).
+    await this.requireBasicUser(() => {
+      const mine = layer.inject.filter((b) => b.client === info.client);
+      if (mine.length) this.put(OWN_INJECT, mine);
+      else this.del(OWN_INJECT);
+      if (guards.length) this.put(OWN_GUARDS, guards);
+      else this.del(OWN_GUARDS);
+    });
     if (info.client) await this.readEgressCeiling();
     const now = this.info_();
     if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);

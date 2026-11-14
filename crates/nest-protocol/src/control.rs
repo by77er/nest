@@ -179,6 +179,14 @@ pub struct HostHello {
     /// guards naming it, and on which it places no sandbox whose guards name it in a scope.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guard_injected_any: bool,
+    /// This host's nest-proxy writes a binding's Basic `username` with its secret, and takes a Basic
+    /// substitution as written whole (a guard's `at`) only then
+    /// (docs/sandbox/networking/egress/policy/#any-injected-credential). Absent (false) from a host of the
+    /// previous release, which keeps the request's username and takes any Basic substitution as whole: on
+    /// whose cell the control plane refuses guards newly using `at`, and on which it places no sandbox whose
+    /// guards use `at` beside a Basic binding.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guard_basic_user: bool,
     /// Everything this host currently holds; FleetDO reconciles against it.
     pub sandboxes: Vec<SandboxReport>,
     pub agents: Vec<AgentReport>,

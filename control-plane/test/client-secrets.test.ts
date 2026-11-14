@@ -28,6 +28,8 @@ describe("client injection bindings (pure)", () => {
     const held = holdInjections("cli_01JTESTCLIENT", [
       stripe,
       { name: "search", secret: "search-key", hosts: ["*.example.com"], wildcard: true, locations: [{ type: "header", name: "X-Api-Key" }, { type: "authorization_basic_password" }] },
+      // A Basic username the binding names: the proxy writes it, so the header is written whole.
+      { name: "git", secret: "git-key", hosts: ["git.example.org"], locations: [{ type: "authorization_basic_password", username: "x-access-token" }] },
     ]);
     expect([fixture.inject[0], ...held.map(wireBinding)]).toEqual(fixture.inject);
   });
@@ -260,6 +262,12 @@ describe("client injection bindings", () => {
     expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/bad`, { method: "PUT", body: tpl([stripe({ hosts: ["evil.net"] })]) }, 403)).error.message)
       .toContain("inject host evil.net");
     await asJson(c.token, `/v1/catalog/templates/${c.name}/coder`, { method: "PUT", body: tpl([stripe({ hosts: ["api.stripe.com", "x.example.com"] })]) });
+    // A Basic username isn't held in a catalog template yet (the previous release's CatalogDO would drop the
+    // template); a Basic location without one is.
+    const named = { type: "authorization_basic_password", username: "x-access-token" };
+    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/basic`, { method: "PUT", body: tpl([stripe({ locations: [named] })]) }, 400)).error.message)
+      .toContain("binding stripe names a Basic username, which a catalog template can't hold yet");
+    await asJson(c.token, `/v1/catalog/templates/${c.name}/basic`, { method: "PUT", body: tpl([stripe({ locations: [{ type: "authorization_basic_password" }] })]) });
     // Only a client's template declares bindings: the operator's go in a sandbox's policy.
     await adminJson(`/v1/admin/templates/opbind-${rand()}`, { method: "PUT", body: tpl([stripe()]) }, 400);
     const value = fakeValue("tpl");

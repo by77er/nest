@@ -94,7 +94,7 @@ export function githubGuards(allowlist: readonly string[], readOnly: readonly st
     },
     {
       name: "github-api-write", hosts: ["*.github.com"], scope: [writes()],
-      allow: [...apiRepo(repos), ...tokens.map((injected) => ({ methods: ["POST"], path: "/graphql", injected }))],
+      allow: [...apiRepo(repos), ...tokens.map((injected) => ({ methods: ["POST"], path: "/graphql", injected, at: "authorization" }))],
       reason: `${writeReason}; GraphQL writes go only with the sandbox's own GitHub token`, ignore_case: true,
     },
     { name: "gist-write", hosts: ["gist.github.com"], scope: [writes(), RECEIVE_DISCOVERY], reason: "gists are read-only from a sandbox", ignore_case: true },
@@ -104,11 +104,15 @@ export function githubGuards(allowlist: readonly string[], readOnly: readonly st
   return guards.map(({ allow, ...g }) => (allow?.length ? { ...g, allow } : g));
 }
 
-/** The injection binding for a sandbox's installation token: git over HTTPS (Basic) and the API (Bearer). */
+/**
+ * The injection binding for a sandbox's installation token: git over HTTPS (Basic) and the API (Bearer). Its
+ * Basic username is the one GitHub documents for an installation token (`x-access-token`), written by nest-proxy
+ * whatever git sent, so the field is nest's whole and a guard's `at` holds for it.
+ */
 export function githubBinding(): InjectionBinding {
   return {
     name: GITHUB_BINDING, hosts: ["github.com", "api.github.com"], placeholder: GITHUB_PLACEHOLDER,
-    locations: [{ type: "authorization_bearer" }, { type: "authorization_basic_password" }],
+    locations: [{ type: "authorization_bearer" }, { type: "authorization_basic_password", username: "x-access-token" }],
   };
 }
 

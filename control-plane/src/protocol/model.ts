@@ -149,7 +149,13 @@ export type AllowRule = z.output<typeof AllowRule>;
 
 export const InjectionLocation = z.discriminatedUnion("type", [
   z.object({ type: z.literal("authorization_bearer") }),
-  z.object({ type: z.literal("authorization_basic_password") }),
+  /**
+   * `username`: nest-proxy writes it with the secret, whatever the request's was, and only then has written the
+   * field whole (a guard's `at`). Absent: the request's username stays, and the field is never whole. A host
+   * whose fleet hello lacks `guard_basic_user` ignores it (and takes any Basic substitution as whole).
+   */
+  // No `:` (it ends the username) and no control character: the operator's layer is checked here too.
+  z.object({ type: z.literal("authorization_basic_password"), username: z.string().regex(/^[^:\x00-\x1f\x7f]{1,256}$/, "a Basic username has no ':' or control character, 1-256 characters").optional() }),
   z.object({ type: z.literal("header"), name: z.string() }),
 ]);
 

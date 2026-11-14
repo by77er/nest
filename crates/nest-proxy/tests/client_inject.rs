@@ -10,10 +10,11 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use http::{HeaderMap, header::AUTHORIZATION};
 use nest_protocol::model::{EgressPolicy, InjectionSecret};
-use nest_proxy::inject::{Input, Verdict, apply};
+use nest_proxy::inject::{Input, Verdict, apply, apply_whole};
 
 const STRIPE: &str = "nest-ph.cli_01JTESTCLIENT.stripe.";
 const SEARCH: &str = "nest-ph.cli_01JTESTCLIENT.search.";
+const GIT: &str = "nest-ph.cli_01JTESTCLIENT.git.";
 
 fn policy() -> EgressPolicy {
     let p = format!("{}/../../protocol/fixtures/control/egress_policy/egress_policy.client_inject.json", env!("CARGO_MANIFEST_DIR"));
@@ -21,7 +22,7 @@ fn policy() -> EgressPolicy {
 }
 
 fn secrets() -> HashMap<String, InjectionSecret> {
-    [("client:stripe", "sk_live_REAL"), ("client:search", "search-REAL"), ("github", "ghs_REAL")]
+    [("client:stripe", "sk_live_REAL"), ("client:search", "search-REAL"), ("client:git", "git-REAL"), ("github", "ghs_REAL")]
         .into_iter()
         .map(|(b, v)| (b.to_string(), InjectionSecret { binding: b.into(), value: v.into(), expires_ms: None }))
         .collect()
@@ -99,4 +100,31 @@ fn a_client_secret_past_its_expiry_is_refused_untouched() {
     assert_eq!(h[AUTHORIZATION], format!("Bearer {STRIPE}"), "untouched");
     sec.get_mut("client:stripe").unwrap().expires_ms = Some(1001);
     assert_eq!(run("api.stripe.com", &sec, &mut h), Verdict::Substituted("client:stripe".into()), "before it");
+}
+
+#[test]
+fn a_basic_username_the_binding_names_replaces_the_requests_and_counts_as_whole() {
+    // `client:git` names `x-access-token`: whatever username the sandbox sent (a token of its own
+    // included, which GitHub would read as the credential), the proxy writes the binding's, so the
+    // header it forwards is all nest's and a guard's `at: authorization` holds.
+    let p = policy();
+    let whole = |user: &str| {
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, format!("Basic {}", B64.encode(format!("{user}:{GIT}"))).parse().unwrap());
+        let input = Input { bindings: &p.inject, secrets: &secrets(), host: "git.example.org", tls: true, live: true, now_ms: 1000 };
+        let (v, whole) = apply_whole(&input, &mut h, &HeaderMap::new(), &"/o/r.git/git-receive-pack".parse().unwrap());
+        assert_eq!(v, Verdict::Substituted("client:git".into()));
+        let sent = B64.decode(h[AUTHORIZATION].to_str().unwrap().strip_prefix("Basic ").unwrap()).unwrap();
+        (String::from_utf8(sent).unwrap(), whole.iter().map(|w| (w.header.clone(), w.binding.clone())).collect::<Vec<_>>())
+    };
+    let nest_wrote = vec![("authorization".to_string(), "client:git".to_string())];
+    assert_eq!(whole("x-access-token"), ("x-access-token:git-REAL".to_string(), nest_wrote.clone()));
+    assert_eq!(whole("ghp_PLANTED"), ("x-access-token:git-REAL".to_string(), nest_wrote));
+    // `client:search` names none: the request's username stays, and the header isn't nest's whole.
+    let mut h = HeaderMap::new();
+    h.insert(AUTHORIZATION, format!("Basic {}", B64.encode(format!("ghp_PLANTED:{SEARCH}"))).parse().unwrap());
+    let input = Input { bindings: &p.inject, secrets: &secrets(), host: "a.example.com", tls: true, live: true, now_ms: 1000 };
+    let (v, whole) = apply_whole(&input, &mut h, &HeaderMap::new(), &"/v1/x".parse().unwrap());
+    assert_eq!(v, Verdict::Substituted("client:search".into()));
+    assert!(whole.is_empty(), "{whole:?}");
 }
