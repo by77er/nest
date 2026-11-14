@@ -1740,8 +1740,9 @@ export class FleetDO extends DurableObject<Env> {
     const guarded = (req.policy.guards ?? []).some((g) => g.name.startsWith(CLIENT_GUARD_PREFIX));
     const all = [...(req.policy.guards ?? []), ...this.storedEgressBase().guards];
     const opens = failsOpenOnOldProxy(all);
-    // A Basic binding: a proxy without `guard_basic_user` takes a username the sandbox chose as nest's, for any `at`.
-    const basic = hasBasicBinding(req.policy.inject ?? []);
+    // A Basic binding or a guard using `at`: on a host without `guard_basic_user` the two must never meet, and
+    // a later change could bring the other (the sandbox's own host is judged then).
+    const basic = hasBasicBinding(req.policy.inject ?? []) || usesAt(all);
     const where = ["wedged_ms IS NULL", ...(guarded ? ["guard_bounds = 1"] : []), ...(opens ? ["guard_injected_any = 1"] : []), ...(basic ? ["guard_basic_user = 1"] : [])].join(" AND ");
     const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where })
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
@@ -3237,13 +3238,15 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * The cell's sandbox hosts (any not dead) whose nest-proxy takes any Basic substitution as whole, keeping the
-   * request's username (no `guard_basic_user`): a layer write newly bringing a Basic binding is
-   * refused while there is one (docs/sandbox/networking/egress/policy/#any-injected-credential).
+   * Whether `host`'s nest-proxy writes a binding's Basic username itself (`guard_basic_user`); null: no such host.
+   * SandboxDO asks for its own host, to keep a Basic binding and `at` from meeting there
+   * (docs/sandbox/networking/egress/policy/#any-injected-credential).
    */
-  async hostsWithoutBasicUser(): Promise<string[]> {
-    return this.hostsBy({ role: SANDBOX_ROLE, status: ["active", "draining", "expired", "stonith_pending"], where: "guard_basic_user = 0" }).map((h) => h.host);
+  async hostBasicUser(host: string): Promise<boolean | null> {
+    const r = this.sql.exec<{ b: number }>("SELECT guard_basic_user AS b FROM hosts WHERE host = ?", host).toArray()[0];
+    return r ? r.b === 1 : null;
   }
+
 
   /** `at`: also those whose nest-proxy takes any Basic substitution as whole (no `guard_basic_user`). */
   private withoutInjectedAny(at = false): string[] {

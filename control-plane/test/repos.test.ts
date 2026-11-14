@@ -62,7 +62,7 @@ describe("the GitHub rule constructor", () => {
     expect(f.guards.find((g) => g.name === "github-write")!.allow!.map((a) => a.path)).toEqual(["/**/git-upload-pack", "/**/info/lfs/objects/batch"]);
     // Never `github`: a push token the proxy still holds under it has no binding and no exception.
     expect(f.guards.find((g) => g.name === "github-api-write")!.allow).toEqual([
-      { methods: ["POST"], path: "/graphql", injected: "github_read" }, { methods: ["POST"], path: "/graphql", injected: "github_read_default" },
+      { methods: ["POST"], path: "/graphql", injected: "github_read", at: "authorization" }, { methods: ["POST"], path: "/graphql", injected: "github_read_default", at: "authorization" },
     ]);
     expect(f.inject.map((b) => [b.name, b.placeholder])).toEqual([["github_read", GITHUB_READ_PLACEHOLDER], ["github_read_default", GITHUB_PLACEHOLDER]]);
     expect(f.allow).toEqual([{ host: "api.github.com" }]);
@@ -77,7 +77,7 @@ describe("the GitHub rule constructor", () => {
     const pat = { ...githubBinding(), name: "github" };
     // The operator's `github` (a credential nest didn't mint) and no allowlist: GraphQL stays refused for it.
     const f = githubEgress([], ["a/b"], [pat]);
-    expect(f.guards.find((g) => g.name === "github-api-write")!.allow).toEqual([{ methods: ["POST"], path: "/graphql", injected: "github_read" }]);
+    expect(f.guards.find((g) => g.name === "github-api-write")!.allow).toEqual([{ methods: ["POST"], path: "/graphql", injected: "github_read", at: "authorization" }]);
     expect(f.inject.map((b) => b.name)).toEqual(["github_read"]);
     // Nor for an operator's binding named `github_read`, or one taking the default placeholder under another name.
     const theirs = githubEgress([], ["a/b"], [{ ...pat, name: "github_read", placeholder: "x" }]);
@@ -314,7 +314,7 @@ describe("a sandbox's push allowlist", () => {
     const policy = await sandboxStub(sandbox).policy() as any;
     expect(policy.guards.find((g: any) => g.name === "github-push").allow).toEqual([{ path: `/${r}/**` }, { path: `/${r}.git/**` }]);
     expect(policy.inject).toEqual([{ name: "github", hosts: ["github.com", "api.github.com"], placeholder: GITHUB_PLACEHOLDER,
-      locations: [{ type: "authorization_bearer" }, { type: "authorization_basic_password" }] }]);
+      locations: [{ type: "authorization_bearer" }, { type: "authorization_basic_password", username: "x-access-token" }] }]);
     expect(policy.allow.some((a: any) => a.host === "api.github.com")).toBe(true);
     const mint = gh.mints.slice(before);
     expect(mint.map((m) => ({ repositories: m.repositories, permissions: m.permissions }))).toEqual([{ repositories: [r.split("/")[1]], permissions: SANDBOX_TOKEN_PERMISSIONS }]);

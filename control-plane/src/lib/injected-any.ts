@@ -39,15 +39,32 @@ export function usesAt(guards: readonly Guardish[]): boolean {
   return guards.some((g) => [...(g.scope ?? []), ...(g.allow ?? [])].some((m) => m.at !== undefined));
 }
 
-/**
- * Whether any of `inject` has a Basic password location: such a binding needs a nest-proxy with
- * `guard_basic_user`, at placement and at every write that adds one, whether or not a guard uses `at` now.
- * A proxy without it keeps the request's username and takes any Basic substitution as written whole, so a
- * username the sandbox chose (a credential of its own) would satisfy an `at` that arrives later by a path
- * no write gates: an agent's detach, a narrowing, a release whose guards add one.
- */
+/** Whether any of `inject` has a Basic password location. */
 export function hasBasicBinding(inject: readonly { locations: readonly { type: string }[] }[]): boolean {
   return inject.some((b) => b.locations.some((l) => l.type === "authorization_basic_password"));
+}
+
+/**
+ * The pair a nest-proxy without `guard_basic_user` must never hold (docs/sandbox/networking/egress/policy/#any-injected-credential):
+ * a Basic password binding (from any source, nest's own included) and a guard using `at`. Such a proxy keeps
+ * the request's username and takes any Basic substitution as written whole, so a username the sandbox chose
+ * (a credential of its own) would satisfy the `at`.
+ */
+export function basicAtPair(policy: { inject?: readonly { locations: readonly { type: string }[] }[]; guards?: readonly Guardish[] }): boolean {
+  return hasBasicBinding(policy.inject ?? []) && usesAt(policy.guards ?? []);
+}
+
+/**
+ * `guards` as a host that can't decide `at` beside a Basic binding gets them: failing closed. An exception
+ * using `at` goes (it only let requests through); a scope matcher keeps its other conditions without `at`
+ * (it covers more, so the guard refuses more).
+ */
+export function guardsWithoutAt<G extends Guardish>(guards: readonly G[]): G[] {
+  return guards.map((g) => {
+    const allow = (g.allow ?? []).filter((m) => m.at === undefined);
+    const scope = (g.scope ?? []).map((m) => (m.at === undefined ? m : (({ at: _a, ...rest }) => rest)(m)));
+    return { ...g, scope, ...(g.allow ? { allow } : {}) } as G;
+  });
 }
 
 /** Those of `guards` that use `*` or `at` and aren't in `held` (compared whole): what a write newly brings. */
