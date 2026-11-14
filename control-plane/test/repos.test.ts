@@ -35,7 +35,15 @@ describe("the GitHub rule constructor", () => {
     const VIA_NEST = { injected: "*", at: "authorization" };
     // Each write guard excepts nest's credential, and push discovery (git asks for one only after its 401) goes bare.
     expect(allow("github-push")).toEqual([{ methods: ["GET", "HEAD"], path: "/**/info/refs", query: [{ name: "service", values: ["git-receive-pack"] }] }, VIA_NEST]);
-    expect(allow("github-write").at(-1)).toEqual(VIA_NEST);
+    // On github.com only its token-authenticated writes take it: git's receive-pack and LFS's API, never the web routes a cookie authenticates.
+    expect(allow("github-write").filter((m) => m.injected)).toEqual([
+      { methods: ["POST"], path: "/**/git-receive-pack", ...VIA_NEST },
+      { methods: ["POST"], path: "/**/info/lfs/objects/batch", ...VIA_NEST },
+      { methods: ["POST"], path: "/**/info/lfs/locks", ...VIA_NEST },
+      { methods: ["POST"], path: "/**/info/lfs/locks/verify", ...VIA_NEST },
+      { methods: ["POST"], path: "/**/info/lfs/locks/*/unlock", ...VIA_NEST },
+    ]);
+    expect(allow("github-write").some((m) => m.injected && !m.path)).toBe(false);
     expect(allow("github-api-write")).toEqual([VIA_NEST]);
     // Gists and the content hosts still take no write at all.
     expect(allow("gist-write")).toEqual([]);
@@ -44,18 +52,27 @@ describe("the GitHub rule constructor", () => {
     expect(f.allow).toEqual([]);
   });
 
-  it("nest's own GitHub token anywhere (repos, read-only repos, an operator binding by a GitHub name or placeholder) keeps the old guards, with no exception for any credential", () => {
+  it("nest's own GitHub token anywhere (repos, read-only repos, an operator binding by a GitHub name, placeholder or host) keeps the old guards, with no exception for any credential", () => {
     const viaNest = (f: ReturnType<typeof githubEgress>) => f.guards.some((g) => (g.allow ?? []).some((m) => m.injected === "*"));
     expect(viaNest(githubEgress(["a/b"]))).toBe(false);
     expect(viaNest(githubEgress([], ["a/b"]))).toBe(false);
-    for (const b of [{ ...githubBinding(), name: "github" }, { ...githubBinding(), name: "github_read" }, { ...githubBinding(), name: "github_read_default" },
-      { ...githubBinding(), name: "pat" }, { ...githubBinding(), name: "pat", placeholder: GITHUB_READ_PLACEHOLDER }]) {
+    const elsewhere = { placeholder: "ph-other", hosts: ["api.example.com"] };
+    for (const b of [
+      // By name alone (on no GitHub host, with a placeholder of its own).
+      { ...githubBinding(), ...elsewhere, name: "github" }, { ...githubBinding(), ...elsewhere, name: "github_read" }, { ...githubBinding(), ...elsewhere, name: "github_read_default" },
+      // By placeholder alone.
+      { ...githubBinding(), hosts: ["api.example.com"], name: "pat" }, { ...githubBinding(), name: "pat", hosts: ["api.example.com"], placeholder: GITHUB_READ_PLACEHOLDER },
+      // By host alone: an operator's PAT under any name, on github.com or any *.github.com host.
+      { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["github.com"] }, { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["api.github.com"] },
+      { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["*.github.com"], wildcard: true }, { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["UPLOADS.GitHub.com"] },
+    ]) {
       const f = githubEgress([], [], [b]);
       expect(viaNest(f), b.name).toBe(false);
       expect(f.guards.find((g) => g.name === "github-push")!.allow, b.name).toBeUndefined();
     }
-    // An operator binding under another name and placeholder is no token of nest's GitHub.
+    // An operator binding under another name and placeholder, on no GitHub host, is no GitHub credential of nest's.
     expect(viaNest(githubEgress([], [], [{ ...githubBinding(), name: "stripe", placeholder: "ph-stripe", hosts: ["api.stripe.com"] }]))).toBe(true);
+    expect(viaNest(githubEgress([], [], [{ ...githubBinding(), name: "gh_lookalike", placeholder: "ph-x", hosts: ["github.com.example.net", "notgithub.com"] }]))).toBe(true);
   });
 
   it("uses the placeholder the guest image's credential helper and GITHUB_TOKEN carry", () => {

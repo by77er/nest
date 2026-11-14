@@ -54,9 +54,27 @@ const READS = ["GET", "HEAD"];
  */
 const NEST_CREDENTIAL: RequestMatch[] = [{ injected: INJECTED_ANY, at: "authorization" }];
 const NEST_CREDENTIAL_REASON = "writes to GitHub go only with a credential nest injected (this sandbox has no repos of nest's own)";
-/** An operator binding nest's own GitHub token would go out under (by name or placeholder). */
+/**
+ * An operator binding that is a GitHub credential of nest's side: by a GitHub binding's name or placeholder,
+ * or by injecting into github.com or any `*.github.com` host (an operator's PAT under any name). Where one
+ * is, the guards stay as they were: `*` would accept it too, wherever it reaches.
+ */
 const ownsGithub = (b: InjectionBinding) =>
-  [GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING].includes(b.name) || b.placeholder === GITHUB_PLACEHOLDER || b.placeholder === GITHUB_READ_PLACEHOLDER;
+  [GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING].includes(b.name) || b.placeholder === GITHUB_PLACEHOLDER || b.placeholder === GITHUB_READ_PLACEHOLDER
+  || b.hosts.some((h) => { const x = h.toLowerCase(); return x === "github.com" || x.endsWith(".github.com"); });
+/**
+ * github.com's writes that authenticate by the request's own credential (`Authorization`), not by a session
+ * cookie: git's receive-pack and Git LFS's API (batch and locks: github.com/git-lfs/git-lfs/blob/main/docs/api/).
+ * Only these take nest's credential as an exception on github.com: every other write there is a web route a
+ * planted `Cookie` would authenticate, which `at` never sees.
+ */
+const TOKEN_WRITES: RequestMatch[] = [
+  { methods: ["POST"], path: "/**/git-receive-pack" },
+  { methods: ["POST"], path: "/**/info/lfs/objects/batch" },
+  { methods: ["POST"], path: "/**/info/lfs/locks" },
+  { methods: ["POST"], path: "/**/info/lfs/locks/verify" },
+  { methods: ["POST"], path: "/**/info/lfs/locks/*/unlock" },
+];
 const RECEIVE_DISCOVERY: RequestMatch = { path: "/**/info/refs", query: [{ name: "service", values: ["git-receive-pack"] }] };
 const writes = (): RequestMatch => ({ methods_except: [...READS] });
 
@@ -78,10 +96,13 @@ const apiRepo = (repos: readonly string[]): RequestMatch[] => repos.map((r) => (
  *   target isn't in the path);
  * - `gist-write`: no writes to gists (each is a git repo);
  * - `githubusercontent-write`: no writes to `*.githubusercontent.com` (signed upload URLs).
- * Where nest injects no GitHub token of its own (no repos of either kind, no `operator` binding under a
- * GitHub name or placeholder), the first three except a credential nest injected whole in `Authorization`
- * instead (`NEST_CREDENTIAL`), and push discovery goes bare: an app's own binding writes, its own client
- * guards narrow where, and a credential planted in the sandbox writes nowhere.
+ * Where nest injects no GitHub token of its own (no repos of either kind, no `operator` binding that is a
+ * GitHub credential: `ownsGithub`), the first three except a credential nest injected whole in `Authorization`
+ * instead (`NEST_CREDENTIAL`): on github.com only for its token-authenticated writes (`TOKEN_WRITES`), and
+ * push discovery goes bare. An app's own binding writes, its own client guards narrow where, and a
+ * credential planted in the sandbox (a token, or a cookie for github.com's web routes) writes nowhere. On
+ * the other `*.github.com` hosts the exception holds only where a binding injects (nest-proxy refuses a
+ * placeholder on a host its binding doesn't name), so on the hosts the operator granted an app.
  */
 export function githubGuards(allowlist: readonly string[], readOnly: readonly string[] = [], operator: readonly InjectionBinding[] = []): RequestGuard[] {
   const repos = canonicalRepos(allowlist);
@@ -110,7 +131,7 @@ export function githubGuards(allowlist: readonly string[], readOnly: readonly st
         { methods: ["POST"], path: "/**/git-upload-pack" },
         { methods: ["POST"], path: "/**/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
         ...webRepo(repos),
-        ...viaNest,
+        ...(viaNest.length ? TOKEN_WRITES.map((m) => ({ ...m, ...viaNest[0] })) : []),
       ],
       reason: viaNest.length ? NEST_CREDENTIAL_REASON : writeReason, ignore_case: true,
     },

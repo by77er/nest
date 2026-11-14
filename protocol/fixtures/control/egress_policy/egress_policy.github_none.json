@@ -105,6 +105,42 @@
           }
         },
         {
+          "methods": [
+            "POST"
+          ],
+          "path": "/**/git-receive-pack",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/**/info/lfs/objects/batch",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/**/info/lfs/locks",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/**/info/lfs/locks/verify",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/**/info/lfs/locks/*/unlock",
           "injected": "*",
           "at": "authorization"
         }

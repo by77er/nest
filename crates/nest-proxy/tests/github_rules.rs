@@ -133,6 +133,18 @@ fn without_nests_own_token_writes_need_a_credential_nest_injected() {
         ("github.com", "POST", "/me/box.git/git-receive-pack", Some("client:gh"), &[], true),
         ("github.com", "POST", "/me/box.git/git-receive-pack", Some("client:gh"), &other, true),
         ("github.com", "POST", "/me/box.git/info/lfs/objects/batch", None, &[], true),
+        // LFS's API with nest's credential: in Authorization, through; whole in another header, refused
+        ("github.com", "POST", "/me/box.git/info/lfs/objects/batch", Some("client:gh"), &auth, false),
+        ("github.com", "POST", "/me/box.git/info/lfs/locks", Some("client:gh"), &auth, false),
+        ("github.com", "POST", "/me/box.git/info/lfs/locks/12/unlock", Some("client:gh"), &auth, false),
+        ("github.com", "POST", "/me/box.git/info/lfs/locks", Some("client:gh"), &other, true),
+        ("github.com", "POST", "/me/box.git/info/lfs/objects/batch", Some("client:gh"), &other, true),
+        // github.com's web routes authenticate by cookie, which `at` never sees: refused whatever Authorization carries
+        ("github.com", "POST", "/me/box/tree-save/main/README.md", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/upload/policies/assets", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/_graphql", Some("client:gh"), &auth, true),
+        ("github.com", "DELETE", "/anything", Some("client:gh"), &auth, true),
+        ("github.com", "PUT", "/me/box.git/git-receive-pack", Some("client:gh"), &auth, true),
         // fetches stay open
         ("github.com", "POST", "/torvalds/linux.git/git-upload-pack", None, &[], false),
         // the API, REST and GraphQL alike
