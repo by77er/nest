@@ -248,6 +248,20 @@ const dueNow = (p: P, kind: "push" | "read") => sql(p, (s) => s.exec("UPDATE gh_
  * Run `f` inside the project's object with its alarm held (none armed, none runs): an alarm's own refresh can't
  * run beside the one a test drives, and mask an interleaving.
  */
+/**
+ * Bind the project to another repo in DirectoryDO (the operator's rebind, its notice to ProjectDO not sent): a
+ * repo the binding's installation reaches, under another name. Its name.
+ */
+async function rebindInDirectory(p: P): Promise<string> {
+  const to = `n-${rand()}/x-${rand()}`.toLowerCase();
+  const id = fake.github.repo(to).id;
+  await runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => {
+    st.storage.sql.exec("UPDATE projects SET repo = ?, repo_id = ? WHERE id = ?", to, id, p.id);
+  });
+  return to;
+}
+const layerGuards = (agent: string) => fake.sandboxes.get(fake.agents.get(agent)!.sandbox!)!.layer.guards;
+
 async function alarmHeld<T>(p: P, f: (o: any, st: DurableObjectState) => Promise<T>): Promise<T> {
   const run = runInDurableObject as unknown as (s: unknown, g: (o: any, st: DurableObjectState) => Promise<T>) => Promise<T>;
   return run(stub(p), async (o: any, st: DurableObjectState) => {
@@ -589,6 +603,7 @@ describe("refreshing", () => {
         const p1 = o.refreshGithub(nest, "push");
         await inMint;
         proto.sandboxToken = origMint;
+        await rebindInDirectory(p);
         const r = o.githubRebound();
         setTimeout(() => open(), 50);
         await Promise.all([p1, r]);
@@ -617,6 +632,7 @@ describe("refreshing", () => {
       const p1 = o.refreshGithub(nest, "push");
       for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
       const inflight = st.storage.sql.exec("SELECT token FROM gh_tokens WHERE kind = 'push' ORDER BY seq DESC LIMIT 1").one().token as string;
+      await rebindInDirectory(p);
       const r = o.githubRebound();
       release();
       await Promise.all([p1, r]);
@@ -646,10 +662,17 @@ describe("refreshing", () => {
   it("workflows on where the App can't grant it: the token is written without it, and the error says why", async () => {
     const p = await newProject();
     await assigned(p);
+    const before = secret(p, "push")!.value;
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
     await drain(p);
+    // A new token, minted again without it once the App refused it.
+    expect(secret(p, "push")!.value).not.toBe(before);
     expect(tokenOf(secret(p, "push")!.value)!.permissions).toEqual({ contents: "write", pull_requests: "write" });
     expect((await ghRow(p, "push"))!.error).toMatch(/can't grant workflows: write/);
+    // A start takes it: refused, not missing.
+    const w2 = await assigned(p);
+    expect(w2.state, JSON.stringify(w2)).not.toBe("failed");
+    expect(w2.start_error).toBeNull();
     // Shown on Settings (under the toggle, beside each live worker), and told once in the chat.
     const view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
     expect(view.workflow_workers).toEqual([]);
@@ -661,6 +684,42 @@ describe("refreshing", () => {
     // Off: nothing refuses.
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: false });
     expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.workflows_refused).toBeNull();
+  });
+
+  it("workflows turned on while a start's refresh is being written: the start doesn't go on with the token that toggle revokes", async () => {
+    const inst = fake.github.installations[0]!;
+    const saved = { ...inst.permissions };
+    inst.permissions = { ...saved, workflows: "write" };
+    try {
+      const p = await newProject();
+      const w0 = await assigned(p);
+      await deliver({ id: `evt-${crypto.randomUUID()}`, type: "agent.exited", agent: w0.assignee!, reason: "done" });
+      await dueNow(p, "push");
+      await drain(p);
+      expect((await ghRow(p, "push"))!.next_ms).toBeNull();
+      // Unexpired, though not fresh enough for a start.
+      await sql(p, (s) => s.exec("UPDATE gh_access SET expires_ms = ? WHERE kind = 'push'", Date.now() + 5 * 60_000));
+      let release!: () => void;
+      const hold = { match: /^PUT \/v1\/clients\/self\/secrets\/gh-push-/, release: new Promise<void>((r) => { release = r; }), reached: false };
+      fake.holds.push(hold);
+      const out = await alarmHeld(p, async (o: any) => {
+        const nest = nestFrom(env as any)!;
+        const e = o.ensureGithub(nest, "push").then(() => "ok", (x: Error) => `threw: ${x.message}`);
+        for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+        const u = o.updateSettings({ workers_edit_workflows: true });
+        release();
+        const [res] = await Promise.all([e, u]);
+        return res as string;
+      });
+      expect(out).toMatch(/^threw: the project's GitHub push token couldn't be written: a setting or the repo's binding changed/);
+      // What it wrote is owed its revoke: had the start gone on, its worker would hold a dead token.
+      const written = secret(p, "push")!.value;
+      expect(await sql(p, (s) => s.exec("SELECT revoke FROM gh_tokens WHERE token = ?", written).one().revoke)).toBe(1);
+      await drain(p);
+      expect(tokenOf(written)).toBeUndefined();
+    } finally {
+      inst.permissions = saved;
+    }
   });
 
   it("workflows turned on while the push token's refresh has lapsed: the next worker gets one with it", async () => {
@@ -711,7 +770,8 @@ describe("going away", () => {
       // One message for both tokens, naming the repo and what to do.
       const chat = JSON.stringify((await api(token, "GET", `/api/projects/${p.id}/chat`)).body);
       expect(chat.match(/The GitHub App can't reach/g)).toHaveLength(1);
-      expect(chat).toContain(`The GitHub App can't reach ${p.repo} (GitHub 404`);
+      expect(chat).toContain(`The GitHub App can't reach ${p.repo}: the App isn't installed on it, so agents' GitHub tokens were revoked`);
+      expect(chat).not.toMatch(/GitHub 404|asked for/);
       expect(chat).toMatch(/Install the App on the repo, or give its installation access to it\. The app checks again every 30 minutes and will tell you when it's back\./);
       // A start meanwhile waits, its error saying why.
       const t = await assigned(p);
@@ -746,24 +806,112 @@ describe("going away", () => {
       expect(secret(p, "push")!.value).toBe(had);
       expect(tokenOf(had)).toBeDefined();
       const chat = JSON.stringify((await api(token, "GET", `/api/projects/${p.id}/chat`)).body);
-      expect(chat).toContain("The GitHub App's installation doesn't grant everything the workers' push token needs (contents: write, pull_requests: write; GitHub doesn't say which is missing). Accept the App's requested permissions in its installation settings on GitHub. Agents keep their current token until it expires; the app tries again every 30 minutes.");
+      expect(chat).toContain("The GitHub App's installation doesn't grant everything the workers' push token needs (contents: write, pull_requests: write; GitHub doesn't say which is missing). Give the GitHub App those permissions in its settings if it lacks them, then accept them in its installation settings on GitHub. Agents keep their current token until it expires; the app tries again every 30 minutes.");
       expect(chat).not.toMatch(/can't reach|asked for/);
     } finally {
       inst.permissions = saved;
     }
   });
 
-  it("the repo rebound to another repo: every token of the old one revoked, both written again for the new one, by its id", async () => {
+  it("the repo rebound to another repo under another name: the old one's tokens revoked, both written for the new one, and live layers' guards name it", async () => {
+    const p = await newProject();
+    const w = await assigned(p);
+    expect(layerGuards(w.assignee!)).toEqual(githubGuards(p.repo, "push"));
+    const old = [secret(p, "read")!.value, secret(p, "push")!.value];
+    const to = await rebindInDirectory(p);
+    await stub(p).githubRebound();
+    await drain(p);
+    await drain(p);
+    for (const t of old) expect(tokenOf(t)).toBeUndefined();
+    expect(tokenOf(secret(p, "push")!.value)!.repo).toBe(to);
+    expect(tokenOf(secret(p, "read")!.value)!.repo).toBe(to);
+    expect(layerGuards(w.assignee!), "the worker's").toEqual(githubGuards(to, "push"));
+    expect(layerGuards(p.manager!), "the manager's").toEqual(githubGuards(to, "read"));
+    // Told again (a sync's read, the operator's retry): nothing more happens.
+    const now = [secret(p, "read")!.value, secret(p, "push")!.value];
+    await stub(p).githubRebound();
+    await drain(p);
+    expect([secret(p, "read")!.value, secret(p, "push")!.value]).toEqual(now);
+    for (const t of now) expect(tokenOf(t)).toBeDefined();
+  });
+
+  it("a rebind whose notice to ProjectDO failed is followed at the operator's retry (the binding unchanged by then)", async () => {
     const p = await newProject();
     await assigned(p);
     const old = [secret(p, "read")!.value, secret(p, "push")!.value];
-    const stub2 = stub(p);
-    await stub2.githubRebound();
+    fake.github.rename(p.repo, `${p.repo}-old`);
+    const newId = fake.github.take(p.repo);
+    const { ProjectDO } = await import("../src/do/project");
+    const proto = ProjectDO.prototype as any;
+    const orig = proto.githubRebound;
+    proto.githubRebound = async function () { throw new Error("ProjectDO unreachable for now"); };
+    let first: number | string;
+    try {
+      first = await api(token, "POST", `/api/admin/bindings/${p.id}/bind`, { repo_id: newId }).then((r) => r.status, (e) => `threw ${e}`);
+    } finally {
+      proto.githubRebound = orig;
+    }
+    // The bind landed in DirectoryDO; ProjectDO never heard.
+    const bound = await runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => st.storage.sql.exec("SELECT repo_id FROM projects WHERE id = ?", p.id).one());
+    expect(bound.repo_id).toBe(newId);
+    for (const t of old) expect(tokenOf(t), `first bind ${first}`).toBeDefined();
+    const again = await api(token, "POST", `/api/admin/bindings/${p.id}/bind`, { repo_id: newId });
+    expect(again.status).toBe(200);
     await drain(p);
-    for (const t of old) expect(tokenOf(t)).toBeUndefined();
-    expect(secret(p, "read")!.value).not.toBe(old[0]);
-    expect(secret(p, "push")!.value).not.toBe(old[1]);
+    for (const t of old) expect(tokenOf(t), "an old repo's token left valid").toBeUndefined();
     expect(tokenOf(secret(p, "push")!.value)!.repo).toBe(p.repo);
+  });
+
+  it("a rebind no notice reached is followed at the next start, which never takes the old repo's token", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const old = [secret(p, "read")!.value, secret(p, "push")!.value];
+    const to = await rebindInDirectory(p);
+    const w = await assigned(p);
+    expect(w.state, JSON.stringify(w)).not.toBe("failed");
+    expect(tokenOf(secret(p, "push")!.value)!.repo).toBe(to);
+    expect(layerGuards(w.assignee!)).toEqual(githubGuards(to, "push"));
+    await drain(p);
+    for (const t of old) expect(tokenOf(t), "an old repo's token left valid").toBeUndefined();
+  });
+
+  it("a rename applied (the same repo id): live layers' guards follow the new name", async () => {
+    const p = await newProject();
+    const w = await assigned(p);
+    const to = `${p.repo}-moved`;
+    fake.github.rename(p.repo, to);
+    const r = await api(token, "POST", `/api/admin/bindings/${p.id}`);
+    expect(r.status, JSON.stringify(r.body)).toBe(200);
+    expect(r.body.rename).toEqual({ applied: to });
+    await drain(p);
+    expect(layerGuards(w.assignee!), "the worker's").toEqual(githubGuards(to, "push"));
+    expect(layerGuards(p.manager!), "the manager's").toEqual(githubGuards(to, "read"));
+  });
+
+  it("a start right after a rebind, before its refresh: never takes the old repo's token, still unexpired", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const old = secret(p, "push")!.value;
+    const out = await alarmHeld(p, async (o: any) => {
+      const to = await rebindInDirectory(p);
+      await o.githubRebound();
+      await o.ensureGithub(nestFrom(env as any)!, "push");
+      return to;
+    });
+    expect(secret(p, "push")!.value).not.toBe(old);
+    expect(tokenOf(secret(p, "push")!.value)!.repo).toBe(out);
+  });
+
+  it("a rebind no notice reached is followed at the next refresh", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const old = secret(p, "push")!.value;
+    const to = await rebindInDirectory(p);
+    await dueNow(p, "push");
+    await drain(p);
+    await drain(p);
+    expect(tokenOf(old)).toBeUndefined();
+    expect(tokenOf(secret(p, "push")!.value)!.repo).toBe(to);
   });
 
   it("the binding's installation not the one answering for the repo now: no token minted from it, the error says to re-read", async () => {

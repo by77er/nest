@@ -371,16 +371,21 @@ function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: 
     <Stack gap="sm">
       <Switch
         label="Workers may change CI workflows"
-        description="Their pushes may add or change files under .github/workflows/; off, GitHub refuses those pushes. The GitHub App's installation must grant workflows: write. Saved, it reaches live workers in a moment too."
+        description={
+          <>
+            Their pushes may add or change files under .github/workflows/; off, GitHub refuses those pushes. The GitHub App's installation must grant workflows: write. Saved, it reaches live workers in a moment too.
+            {/* Part of the description, so it reads as one: its size and line height. */}
+            {checked && refused && (
+              <Text component="span" inherit display="block" mt="xs" c="warning" data-slot="workflows-refused">
+                Not in effect: {refused}. Give the GitHub App Workflows: read and write in its settings if it lacks it, then accept it in its installation settings on GitHub; the app asks for it again at the next token.
+              </Text>
+            )}
+          </>
+        }
         checked={checked}
         onChange={onChange}
         error={error}
       />
-      {checked && refused && (
-        <Text fz="xs" c="warning" data-slot="workflows-refused">
-          Not in effect: {refused}. Accept that permission in the App's installation settings on GitHub; the app asks for it again at the next token.
-        </Text>
-      )}
       {checked && (
         <Notice tone="warning" title="A pushed workflow runs before anyone reviews it">
           <Text fz="sm" lh="lg">
@@ -408,10 +413,11 @@ function LiveWorkers({ projectId, saved }: { projectId: string; saved: boolean }
   const refused = saved ? (secrets.data?.workflows_refused ?? null) : null;
   if (!workers.length) return null;
   // A token that disagrees with the saved setting is out of date, whatever its layer's last state: never Applied.
-  // One the App's installation refuses won't catch up by waiting: Failed, with why.
-  const shown = workers.map((a) => (can.has(a.agent) !== saved && a.state === "applied"
-    ? refused ? { ...a, state: "failed" as const, error: null } : { ...a, state: "pending" as const }
-    : a));
+  // One the App's installation refuses won't catch up by waiting: Failed, with why, whatever its layer's state (its
+  // own error line kept).
+  const shown = workers.map((a) => (can.has(a.agent) === saved ? a
+    : refused ? { ...a, state: "failed" as const }
+    : a.state === "applied" ? { ...a, state: "pending" as const } : a));
   return (
     <Panel data-slot="live-workers">
       <Section title="Live workers" order={4} count={workers.length} region={false}>
@@ -426,7 +432,7 @@ function LiveWorkers({ projectId, saved }: { projectId: string; saved: boolean }
             const why = refused ?? (saved && !allowed ? "nest's grant doesn't allow it" : "until it catches up");
             return (
               <Text component="span" fz="xs" c="warning" data-slot="workflows" data-matches="false">
-                {has ? "Still may change workflows" : "Can't change workflows yet"} · {why}
+                {has ? "Still may change workflows" : refused ? "Can't change workflows" : "Can't change workflows yet"} · {why}
               </Text>
             );
           }}

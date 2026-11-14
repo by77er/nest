@@ -425,7 +425,8 @@ const RICH = [
       { name: "npm_token", env: "NPM_TOKEN", description: "Publishing @gadgets packages", hosts: ["registry.npmjs.org"], locations: bearer, roles: ["worker"], size: 36, created_ms: now - 4 * 86_400_000, updated_ms: now - 4 * 86_400_000, holders: [{ agent: "agt_w8x2m4", role: "worker" }], last_injected_ms: now - 600_000, in_nest: true, outside_hosts: [] },
       { name: "uploads_key", env: "GADGETS_UPLOAD_KEY", description: "", hosts: ["uploads.gadgets.example.com", "*.cdn.gadgets.example.com", "uploads.legacy-gadgets.example.net"], locations: [{ type: "header", name: "X-Upload-Key" }], roles: ["reviewer"], size: 64, created_ms: now - 2 * 86_400_000, updated_ms: now - 2 * 86_400_000, holders: [{ agent: "agt_rv5n2p", role: "reviewer" }], last_injected_ms: now - 90_000, in_nest: true, outside_hosts: ["uploads.legacy-gadgets.example.net"] },
     ],
-    grant: { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org", "upload.pypi.org", "*.gadgets.example.com"], max_count: 20, max_bytes: 4096, workflows: true, used: 3 },
+    // The project's own GitHub tokens take two places beside the owner's secrets, on GitHub's hosts.
+    grant: { inject_hosts: ["github.com", "api.github.com", "api.cloudflare.com", "registry.npmjs.org", "upload.pypi.org", "*.gadgets.example.com"], max_count: 20, max_bytes: 4096, workflows: true, used: variant === "secrets-empty" ? 2 : 5 },
     client: "cli_demo",
     agents: variant === "secrets-empty" ? [] : network.agents,
     // Saved off: the applied layers match it; agt_w3f9q1, its layer pending, still has it. "workflows-refused": saved

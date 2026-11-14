@@ -829,7 +829,7 @@ export class FakeGitHub {
   /** Accounts that are organizations (a repo's owner is a user otherwise). */
   readonly orgs = new Set<string>();
   /** Every call, with the permissions of the installation token it carried (none for the App's JWT). */
-  readonly calls: { method: string; path: string; body: any; token: string | null; permissions?: Record<string, string> }[] = [];
+  readonly calls: { method: string; path: string; body: any; token: string | null; permissions?: Record<string, string>; tokenRepo?: string | null }[] = [];
   readonly tokens = new Map<string, FakeToken>();
   /** The App's installations (https://docs.github.com/en/rest/apps/installations): the default one, on every account. */
   installations: FakeInstallation[] = [{ id: GH_INSTALLATION_ID, account: null, repos: "all", permissions: { ...GRANT_PERMISSIONS } }];
@@ -1089,12 +1089,18 @@ export class FakeGitHub {
   }
 
   /**
-   * The calls since `before` besides sandbox-token upkeep: earlier tests' projects refresh (a mint by repo
-   * id) and revoke their sandboxes' tokens on their own alarms, whenever those fire.
+   * The calls since `before` besides other repos' sandbox-token upkeep: earlier tests' projects refresh (a mint
+   * by repo id) and revoke their sandboxes' tokens on their own alarms, whenever those fire. A mint or a revoke
+   * for one of `repos` stays.
    */
-  callsBesideUpkeep(before: number) {
-    return this.calls.slice(before).filter((c) =>
-      !(c.method === "DELETE" && c.path === "/installation/token") && !(c.method === "POST" && /\/access_tokens$/.test(c.path) && c.body?.repository_ids !== undefined));
+  callsBesideUpkeep(before: number, repos: readonly string[]) {
+    const mine = new Set(repos.map((r) => r.toLowerCase()));
+    const ids = new Set([...mine].map((r) => this.repos.get(r)?.id).filter((x) => x !== undefined));
+    return this.calls.slice(before).filter((c) => {
+      if (c.method === "DELETE" && c.path === "/installation/token") return c.tokenRepo != null && mine.has(c.tokenRepo);
+      if (c.method === "POST" && /\/access_tokens$/.test(c.path) && Array.isArray(c.body?.repository_ids)) return c.body.repository_ids.some((id: number) => ids.has(id));
+      return true;
+    });
   }
 
   async handle(req: Request): Promise<Response> {
@@ -1102,7 +1108,8 @@ export class FakeGitHub {
     const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
     const text = await req.text();
     const token = req.headers.get("authorization")?.replace(/^Bearer /, "") ?? null;
-    const call = { method: req.method, path: u.pathname, body: text ? JSON.parse(text) : undefined, token, permissions: token ? this.tokens.get(token)?.permissions : undefined };
+    const held = token ? this.tokens.get(token) : undefined;
+    const call = { method: req.method, path: u.pathname, body: text ? JSON.parse(text) : undefined, token, permissions: held?.permissions, tokenRepo: held?.repo };
     this.calls.push(call);
     const route = `${req.method} ${u.pathname}`;
     const hold = this.holds.find((x) => !x.reached && x.match.test(route));

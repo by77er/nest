@@ -452,6 +452,7 @@ describe("cost guards", () => {
       const sql = st.storage.sql;
       for (const t of ["gh_access", "gh_tokens", "sandbox_ends"]) sql.exec(`DROP TABLE ${t}`);
       sql.exec("ALTER TABLE settings DROP COLUMN gh_unreachable");
+      sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_id");
       sql.exec("ALTER TABLE layers DROP COLUMN github");
       sql.exec("ALTER TABLE routine_runs DROP COLUMN nest_repos");
       sql.exec("DELETE FROM start_specs");

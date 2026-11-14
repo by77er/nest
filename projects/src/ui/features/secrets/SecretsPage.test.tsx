@@ -244,13 +244,22 @@ describe("workers changing CI workflows", () => {
     api.projects[0]!.settings.workers_edit_workflows = true;
     api.workflowsRefused = "the GitHub App's installation doesn't grant workflows: write";
     api.workflowWorkers = [];
-    api.network = { ...api.network, agents: [{ agent: "agt_w1", role: "worker", sandbox: "sbx_1", state: "applied", error: null, rev: 2, at_ms: now - 60_000 }] };
+    api.network = { ...api.network, agents: [
+      { agent: "agt_w1", role: "worker", sandbox: "sbx_1", state: "applied", error: null, rev: 2, at_ms: now - 60_000 },
+      // Its layer pending or failed itself: Failed all the same (waiting won't help), its own error kept.
+      { agent: "agt_w2", role: "worker", sandbox: "sbx_2", state: "pending", error: null, rev: 1, at_ms: now - 60_000 },
+      { agent: "agt_w3", role: "worker", sandbox: "sbx_3", state: "failed", error: "nest 409: the sandbox is suspended", rev: 1, at_ms: now - 60_000 },
+    ] };
     renderApp("/projects/prj_one/settings", api);
-    expect(await screen.findByText(/Not in effect: the GitHub App's installation doesn't grant workflows: write/)).toBeInTheDocument();
+    expect(await screen.findByText(/Not in effect: the GitHub App's installation doesn't grant workflows: write\. Give the GitHub App Workflows: read and write in its settings if it lacks it, then accept it in its installation settings on GitHub/)).toBeInTheDocument();
     const list = await screen.findByRole("list", { name: "Live workers' push tokens" });
-    const w1 = within(list).getByText("agt_w1").closest("[data-agent]") as HTMLElement;
-    expect(w1).toHaveTextContent("Can't change workflows yet · the GitHub App's installation doesn't grant workflows: write");
-    expect(w1.querySelector("[data-slot=state]")).toHaveTextContent("Failed");
+    for (const id of ["agt_w1", "agt_w2", "agt_w3"]) {
+      const w = within(list).getByText(id).closest("[data-agent]") as HTMLElement;
+      expect(w, id).toHaveTextContent("Can't change workflows · the GitHub App's installation doesn't grant workflows: write");
+      expect(w, id).not.toHaveTextContent("yet");
+      expect(w.querySelector("[data-slot=state]"), id).toHaveTextContent("Failed");
+    }
+    expect(within(list).getByText("agt_w3").closest("[data-agent]")).toHaveTextContent("nest 409: the sandbox is suspended");
   });
 
   it("lists the live workers under a heading, each against the saved setting: one that differs says so until its layer applies", async () => {

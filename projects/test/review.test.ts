@@ -119,10 +119,11 @@ describe("/hooks/github", () => {
     expect((await deliverGithub("pull_request", prEvent({ repo: `nobody/${rand()}`, number: 1, sha: sha(), action: "opened" }))).status).toBe(200);
     const before = gh.calls.length;
     const agents = fake.agents.size;
-    expect(await (await deliverGithub("pull_request", prEvent({ repo: `nobody/${rand()}`, number: 1, sha: sha(), action: "opened" }))).json()).toEqual({ ignored: "no project for this repo" });
+    const nobody = `nobody/${rand()}`;
+    expect(await (await deliverGithub("pull_request", prEvent({ repo: nobody, number: 1, sha: sha(), action: "opened" }))).json()).toEqual({ ignored: "no project for this repo" });
     expect((await deliverGithub("ping", { zen: "Keep it logically awesome.", hook_id: 1 })).status).toBe(200);
     expect((await deliverGithub("issues", { action: "opened", repository: { full_name: "o/r" } })).status).toBe(200);
-    expect(gh.callsBesideUpkeep(before)).toEqual([]);
+    expect(gh.callsBesideUpkeep(before, [nobody, "o/r"])).toEqual([]);
     expect(fake.agents.size).toBe(agents);
   });
 });
