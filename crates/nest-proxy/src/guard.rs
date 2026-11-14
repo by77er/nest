@@ -63,6 +63,8 @@ pub struct Prepared<'a> {
     injected: Option<&'a str>,
     whole: &'a [Whole],
     raw: Vec<&'a str>,
+    /// `raw` as an exception sees it: a segment holding `/` or `\\` once decoded is blank (`sealed`).
+    sealed: Vec<&'a str>,
     norm: Vec<String>,
     clean: bool,
     pairs: Vec<(&'a str, &'a str)>,
@@ -87,12 +89,14 @@ impl<'a> Req<'a> {
             return Err(TooLong);
         }
         let decoded = pairs.iter().map(|(k, v)| (decode_repeatedly(k, true), decode_repeatedly(v, true))).collect();
+        let sealed = raw.iter().map(|s| if decode_repeatedly(s, false).contains(['/', '\\']) { "" } else { *s }).collect();
         Ok(Prepared {
             host: self.host,
             method: self.method,
             injected: self.injected,
             whole: self.whole,
             raw,
+            sealed,
             norm,
             clean: clean_path(self.path),
             pairs,
@@ -236,10 +240,13 @@ fn path_in_scope(p: &str, req: &Prepared<'_>, ic: bool) -> bool {
     glob(&pat, &req.raw, ic) || glob(&pat, &req.norm, ic)
 }
 
-/// An exception matches only a clean path, as sent.
+/// An exception matches only a clean path, as sent; and a segment holding a separator once decoded (`%2F`,
+/// `%5C`) only under `**`, never as a `*` or a literal. A server that decodes it reads more segments there
+/// than the pattern was matched against (`/o/r%2Ftree-save%2Fmain/git-receive-pack` is
+/// `/o/r/tree-save/main/git-receive-pack` to it), while an API's encoded parameter under `**` stays one.
 fn path_excepted(p: &str, req: &Prepared<'_>, ic: bool) -> bool {
     let Some(pat) = pattern(p) else { return false };
-    req.clean && glob(&pat, &req.raw, ic)
+    req.clean && glob(&pat, &req.sealed, ic)
 }
 
 /// The injection safe-path rules, plus no segment that decodes to a dot segment.
@@ -412,8 +419,13 @@ mod tests {
         ] {
             assert!(refused(&g, &req("files.test", "PUT", path)), "{path}");
         }
-        // Encodings under a wildcard are fine (APIs encode their parameters).
+        // Encodings under `**` are fine (APIs encode their parameters)...
         assert!(!refused(&g, &req("files.test", "PUT", "/store/mine/refs%2Fheads%2Fmain")));
+        // ...but a separator, once decoded, is never one `*` or a literal: a server may read it as two segments.
+        assert!(refused(&g, &req("files.test", "POST", "/store%2Fmine/read")));
+        assert!(refused(&g, &req("files.test", "POST", "/store%5Cmine/read")));
+        assert!(refused(&g, &req("files.test", "POST", "/store%252Fmine/read")));
+        assert!(!refused(&g, &req("files.test", "POST", "/store/read")));
         let long = format!("/store/mine/{}", "a".repeat(MAX_PATH));
         assert!(refused(&g, &req("files.test", "PUT", &long)));
     }

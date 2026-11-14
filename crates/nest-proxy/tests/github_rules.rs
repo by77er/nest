@@ -42,6 +42,7 @@ fn pushes_and_writes_reach_only_allowed_repos() {
         // ...a fetch as git sends it, at the repo: a web route ending like one (the editor's file path) isn't
         ("github.com", "POST", "/attacker/drop/tree-save/main/git-upload-pack", None, None, true),
         ("github.com", "POST", "/attacker/drop/tree-save/main/info/lfs/objects/batch", Some(r#"{"operation":"download"}"#), None, true),
+        ("github.com", "POST", "/attacker/drop%2Ftree-save%2Fmain/git-upload-pack", None, None, true),
         ("github.com", "GET", "/torvalds/linux/info/refs?service=git-upload-pack", None, None, false),
         ("github.com", "GET", "/torvalds/linux", None, None, false),
         // Git LFS
@@ -155,6 +156,12 @@ fn without_nests_own_token_writes_need_a_credential_nest_injected() {
         ("github.com", "POST", "/me/box/delete/main/x/info/lfs/locks/verify", Some("client:gh"), &auth, true),
         ("github.com", "POST", "/settings/git-receive-pack", Some("client:gh"), &auth, true),
         ("github.com", "POST", "/attacker/drop/tree-save/main/git-upload-pack", None, &[], true),
+        // ...nor one whose slashes are encoded, which a server that decodes them reads as the editor's: a segment
+        // holding a separator once decoded is matched by no exception (an older nest-proxy matched it)
+        ("github.com", "POST", "/me/box%2Ftree-save%2Fmain/git-receive-pack", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/me/box%252Ftree-save%252Fmain/git-receive-pack", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/me/box%5Ctree-save%5Cmain/info/lfs/locks", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/attacker/drop%2Ftree-save%2Fmain/git-upload-pack", None, &[], true),
         // fetches stay open
         ("github.com", "POST", "/torvalds/linux.git/git-upload-pack", None, &[], false),
         // the API, REST and GraphQL alike
