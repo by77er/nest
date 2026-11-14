@@ -348,6 +348,7 @@ describe("a Basic binding beside at, on a live sandbox", () => {
     const r = await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [binding("authorization_basic_password")] } });
     expect(r.status, JSON.stringify(r.body)).toBe(409);
     expect(r.body.error.message).toContain("Basic username itself");
+    expect(r.body.error.code).toBe("hosts_not_ready");
     expect((await as(c.token, `/v1/sandboxes/${sbx}/client-policy`)).body.inject).toEqual([]);
     expect((await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [binding("authorization_bearer")] } })).status).toBe(200);
     // An attach bringing one.
@@ -358,5 +359,6 @@ describe("a Basic binding beside at, on a live sandbox", () => {
     // The operator's layer.
     const op = await admin(`/v1/sandboxes/${sbx}/policy`, { method: "PUT", body: { inject: [{ name: "pat", hosts: ["api.example.com"], placeholder: "nest-ph-pat", locations: [{ type: "authorization_basic_password" }] }] } });
     expect(op.status).toBe(409);
+    expect(((await op.json()) as { error: { code: string } }).error.code).toBe("hosts_not_ready");
   });
 });

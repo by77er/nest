@@ -1942,7 +1942,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (!after) return;
     const old = await this.fleet(cell).hostsWithoutBasicUser();
     if (old.length) {
-      throw new NestError(ErrorCodes.CONFLICT, `a binding with a Basic password beside a guard using "at" needs every sandbox host of cell ${cell} to write a binding's Basic username itself; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
+      throw new NestError(ErrorCodes.HOSTS_NOT_READY, `a binding with a Basic password beside a guard using "at" needs every sandbox host of cell ${cell} to write a binding's Basic username itself; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
     }
   }
 
