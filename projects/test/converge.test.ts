@@ -11,7 +11,7 @@ import { resetAccessKeys } from "../src/access";
 import { CONVERGE_NOTE, CONVERGE_QUIET_MS, MIGRATIONS } from "../src/do/project";
 import { githubGuards } from "../src/github-access";
 import { migrate } from "../src/sql";
-import { AccessTeam, agentClaims, api, callTool, CLIENT, deliver, deliverGithub, FakeNest, installFetch, prEvent, Signer } from "./fake-nest";
+import { AccessTeam, agentClaims, api, callTool, CLIENT, deliver, deliverGithub, eventually, FakeNest, installFetch, prEvent, Signer } from "./fake-nest";
 
 const fake = new FakeNest();
 let restore: () => void;
@@ -62,6 +62,27 @@ async function replaced(p: P) {
   expect(stops(p.manager)).toHaveLength(1);
 }
 
+/**
+ * What an abandoned start attempt made is gone after the first pass; a create of its landing after that (past nest's
+ * idempotency lease) goes at the second, and then its row.
+ */
+async function sweptTwice(p: P, first: Record<string, string>) {
+  const key = JSON.stringify(Object.fromEntries(Object.entries(first).sort(([a], [b]) => (a < b ? -1 : 1))));
+  const row = () => sql(p, (x) => x.exec("SELECT passes FROM abandoned_starts WHERE labels = ?", key).toArray()[0]);
+  await sql(p, (x) => x.exec("UPDATE abandoned_starts SET next_ms = 0 WHERE passes = 0"));
+  await drain(p);
+  expect(live(first)).toEqual([]);
+  expect(await row()).toEqual({ passes: 1 });
+  const [old] = [...fake.sandboxes.values()].filter((x) => Object.entries(first).every(([k, v]) => x.labels[k] === v));
+  const late = `sbx_late${rand()}`;
+  fake.sandboxes.set(late, { ...old!, sandbox: late, ended: false });
+  expect(live(first)).toHaveLength(1);
+  await sql(p, (x) => x.exec("UPDATE abandoned_starts SET next_ms = 0"));
+  await drain(p);
+  expect(live(first)).toEqual([]);
+  expect(await row()).toBeUndefined();
+}
+
 /** The manager as a release before B3 left it: its sandbox on nest's repos (its layer without the app's part), its check due. */
 const onNestRepos = (p: P) => sql(p, (s) => {
   s.exec("UPDATE layers SET github = 0 WHERE agent = ?", p.manager);
@@ -99,7 +120,7 @@ describe("a manager on nest's repos", () => {
     expect((create.body.inject as { name: string }[]).map((b) => b.name)).toEqual(["gh_read"]);
     expect(create.body.guards).toEqual(githubGuards(p.repo, "read"));
     expect(create.body.env.GH_TOKEN).toBe(`nest-ph.${CLIENT}.gh_read.`);
-    expect(fake.agents.get(next)!.overrides).toEqual({});
+    expect(fake.agents.get(next)!.overrides).toEqual({ repos: [], read_repos: [] });
     expect(await sql(p, (x) => x.exec("SELECT github FROM layers WHERE agent = ?", next).one().github)).toBe(1);
     // Told, in the chat and in its brief; the waits the app holds are the new one's.
     expect(await appChat(p)).toContain(CONVERGE_NOTE);
@@ -181,6 +202,110 @@ describe("a manager on nest's repos", () => {
     expect(fake.inbox.filter((m) => m.agent === p.manager && m.text === "One more thing.")).toHaveLength(1);
   });
 
+  it("make before break: while nest can't make its successor's sandbox (a host doesn't apply guards yet), the old one keeps running; then its successor takes the sandbox made for it", async () => {
+    const p = await newProject();
+    await onNestRepos(p);
+    fake.hostsBehind = 1;
+    try {
+      await drain(p);
+      const s = await settingsOf(p);
+      expect(s.manager).toBe(p.manager);
+      expect(s.manager_next_ms).toBeNull();
+      expect(s.converge_next_ms).toBeGreaterThan(Date.now());
+      expect(stops(p.manager)).toEqual([]);
+      expect(fake.sandboxes.get(fake.agents.get(p.manager)!.sandbox!)!.ended).toBe(false);
+      expect(live({ project: p.id, role: "manager" })).toHaveLength(1);
+    } finally {
+      fake.hostsBehind = 0;
+    }
+    await due(p);
+    await drain(p);
+    await replaced(p);
+    const next = (await settingsOf(p)).manager as string;
+    // One sandbox for it: made before the old one went, then its start's, by the same key.
+    const mine = fake.callsTo("POST", /^\/v1\/sandboxes$/).filter((c) => c.body.labels?.project === p.id && c.body.labels?.start === fake.agents.get(next)!.labels.start);
+    expect(mine.length).toBeGreaterThanOrEqual(2);
+    expect(new Set(mine.map((c) => c.idempotencyKey)).size).toBe(1);
+    expect(fake.calls.indexOf(mine[0]!)).toBeLessThan(fake.calls.indexOf(stops(p.manager)[0]!));
+    expect(live({ project: p.id, role: "manager" }).map((x) => x.sandbox)).toEqual([fake.agents.get(next)!.sandbox]);
+  });
+
+  it("the old one is stopped right after nest's state is read, before anything else the drain owes nest", async () => {
+    const p = await newProject();
+    // A worker's start is owed in the same drain.
+    const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "t" })).body;
+    await api(token, "PUT", `/api/projects/${p.id}/tasks/${t.id}/spec`, spec);
+    fake.fail(/^POST \/v1\/sandboxes$/, 503, { retryable: true, times: 3 });
+    await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`);
+    expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body.state).toBe("assigned");
+    await sql(p, (x) => x.exec("UPDATE tasks SET start_next_ms = 0 WHERE start_next_ms IS NOT NULL"));
+    await onNestRepos(p);
+    const mark = fake.calls.length;
+    await drain(p);
+    await replaced(p);
+    expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body.state).toBe("in_progress");
+    const stop = fake.calls.indexOf(stops(p.manager)[0]!);
+    const worker = fake.calls.findIndex((c, i) => i >= mark && c.method === "POST" && c.path === "/v1/sandboxes" && c.body.labels?.task === t.id);
+    expect(worker).toBeGreaterThan(stop);
+  });
+
+  it("not while the App can't reach the repo, nor while a message of the app's waits for it, nor within the quiet time after its own last turn", async () => {
+    const p = await newProject();
+    await onNestRepos(p);
+    const kept = async (why: string) => {
+      await due(p);
+      await drain(p);
+      expect((await settingsOf(p)).manager, why).toBe(p.manager);
+      expect(stops(p.manager), why).toEqual([]);
+    };
+    await sql(p, (x) => x.exec("UPDATE settings SET gh_unreachable = 1"));
+    await kept("unreachable");
+    await sql(p, (x) => x.exec("UPDATE settings SET gh_unreachable = 0"));
+    await sql(p, (x) => x.exec("INSERT INTO messages (to_agent, text, relayed, at_ms, next_ms) VALUES (?, 'a note', 0, 1, ?)", p.manager, Date.now() + 3_600_000));
+    await kept("a message owed");
+    await sql(p, (x) => x.exec("UPDATE messages SET next_ms = NULL"));
+    await deliver({ id: `evt-${rand()}`, type: "agent.turn_completed", agent: p.manager, turn: 2, text: "Done for now." });
+    await kept("its own turn just now");
+    await sql(p, (x) => x.exec("UPDATE chat SET at_ms = ?", Date.now() - CONVERGE_QUIET_MS - 1000));
+    await due(p);
+    await drain(p);
+    await replaced(p);
+  });
+
+  it("what the app owes the manager while none runs (a wait resolved, a worker's block) is kept for its successor, after its brief", async () => {
+    const p = await newProject();
+    const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "w" })).body;
+    const old = await signer.sign(agentClaims("board", p.manager, { project: p.id, role: "manager", start: "1" }));
+    expect((await callTool("board", old, "await_task", { task: t.id, states: ["done"], timeout_s: 600 })).result?.isError).toBeFalsy();
+    // A worker at work on another task.
+    const w = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "x" })).body;
+    await api(token, "PUT", `/api/projects/${p.id}/tasks/${w.id}/spec`, spec);
+    const worker = (await api(token, "POST", `/api/projects/${p.id}/tasks/${w.id}/assign`)).body.assignee as string;
+    expect(worker).toMatch(/^agt_/);
+    await onNestRepos(p);
+    // The successor's agent can't be made for now: the old one is gone, its successor not started.
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
+    await drain(p);
+    expect((await settingsOf(p)).manager).toBeNull();
+    expect(stops(p.manager)).toHaveLength(1);
+    // Meanwhile the wait resolves, and the worker reports its task blocked.
+    expect((await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/done`)).status).toBe(200);
+    const wt = await signer.sign(agentClaims("task", worker, { project: p.id, role: "worker", task: w.id, start: "1" }));
+    expect((await callTool("task", wt, "report_blocked", { reason: "No staging credentials" })).result?.isError).toBeFalsy();
+    await drain(p);
+    expect(fake.inbox.filter((m) => m.agent === p.manager && /No staging credentials|^await/.test(m.text))).toEqual([]);
+    fake.failures = [];
+    await sql(p, (x) => x.exec("UPDATE settings SET manager_next_ms = 0 WHERE manager_next_ms IS NOT NULL"));
+    await drain(p);
+    await drain(p);
+    const next = (await settingsOf(p)).manager as string;
+    expect(next).toMatch(/^agt_/);
+    const told = fake.inbox.filter((m) => m.agent === next).map((m) => m.text);
+    expect(told[0]).toContain("You manage project");
+    expect(told.slice(1).some((x) => x.includes(`task ${t.id}`) && x.startsWith("await"))).toBe(true);
+    expect(told.slice(1).some((x) => x.includes(`blocked task ${w.id}`) && x.includes("No staging credentials"))).toBe(true);
+  });
+
   it("not while the grant lacks the GitHub hosts: the old one keeps running, rather than none", async () => {
     const p = await newProject();
     await onNestRepos(p);
@@ -232,6 +357,38 @@ describe("a manager on nest's repos", () => {
     expect(stops(p.manager)).toEqual([]);
   });
 
+  it("after a deploy, the project's first use (whatever it is) arms the look, with no alarm set: the manager is replaced", async () => {
+    const p = await newProject();
+    // As B4's migration leaves a project at the deploy: the look owed, no alarm for it, and a new instance.
+    await runInDurableObject(stub(p), async (_o, st) => {
+      st.storage.sql.exec("UPDATE layers SET github = 0 WHERE agent = ?", p.manager);
+      st.storage.sql.exec("UPDATE settings SET converge_next_ms = 0");
+      await st.storage.deleteAlarm();
+    });
+    await runInDurableObject(stub(p), (_o, st) => st.abort("deployed")).catch(() => {});
+    // A read that drains nothing.
+    expect((await api(token, "GET", `/api/projects/${p.id}/waits`)).status).toBe(200);
+    await eventually(async () => {
+      const s = await settingsOf(p);
+      return s.manager && s.manager !== p.manager ? s.manager : null;
+    }, "the manager replaced by the alarm the constructor armed");
+    await replaced(p);
+  });
+
+  it("a live manager's layer made anew (none kept for it) takes its access from its start's frozen spec: the app's, or with none found, nest's repos", async () => {
+    const p = await newProject();
+    const github = () => sql(p, (x) => x.exec("SELECT github FROM layers WHERE agent = ?", p.manager).toArray()[0]?.github);
+    await sql(p, (x) => x.exec("DELETE FROM layers WHERE agent = ?", p.manager));
+    expect((await api(token, "PUT", `/api/projects/${p.id}/network`, { worker: [], manager: [{ host: "pypi.org" }] })).status).toBe(200);
+    expect(await github()).toBe(1);
+    await sql(p, (x) => {
+      x.exec("DELETE FROM layers WHERE agent = ?", p.manager);
+      x.exec("DELETE FROM start_specs");
+    });
+    expect((await api(token, "PUT", `/api/projects/${p.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }] })).status).toBe(200);
+    expect(await github()).toBe(0);
+  });
+
   it("the migration owes the look to a project with a manager, from the release before it", async () => {
     const p = await newProject();
     await runInDurableObject(stub(p), (_o, st) => {
@@ -263,7 +420,7 @@ describe("a start frozen on nest's repos", () => {
     const now = (await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body;
     expect(now.state).toBe("in_progress");
     expect(fake.agents.get(now.assignee)!.labels.start).toBe("2");
-    expect(fake.agents.get(now.assignee)!.overrides).toEqual({});
+    expect(fake.agents.get(now.assignee)!.overrides).toEqual({ repos: [], read_repos: [] });
     expect(fake.sandboxes.get(fake.agents.get(now.assignee)!.sandbox!)!.layer.guards).toEqual(githubGuards(p.repo, "push"));
     expect((now.history as { action: string }[]).some((h) => h.action === "restarted_on_app_access")).toBe(true);
     // What the old attempt made is gone; looked for once more past nest's idempotency lease (a create still in
@@ -295,19 +452,17 @@ describe("a start frozen on nest's repos", () => {
     expect(after.manager).toMatch(/^agt_/);
     expect(fake.agents.get(after.manager as string)!.labels.start).not.toBe(first.start);
     expect(await sql(p, (x) => x.exec("SELECT github FROM layers WHERE agent = ?", after.manager).one().github)).toBe(1);
-    await sql(p, (x) => x.exec("UPDATE abandoned_starts SET next_ms = 0"));
-    await drain(p);
-    expect(live(first)).toEqual([]);
-    expect(await sql(p, (x) => x.exec("SELECT COUNT(*) AS n FROM abandoned_starts").one().n)).toBe(0);
+    await sweptTwice(p, first);
   });
 
   it("a reviewer's is begun again as a new attempt, none of the job's attempts spent; what the old one made goes", async () => {
     const p = await newProject();
     fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
-    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 7, sha: sha(), action: "opened" }));
+    const head = sha();
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 7, sha: head, action: "opened" }));
     const review = env.REVIEW.get(env.REVIEW.idFromName(p.id));
     await review.drain();
-    const first = { project: p.id, role: "reviewer", pr: "7", start: "1" };
+    const first = { project: p.id, role: "reviewer", pr: "7", sha: head, start: "1" };
     expect(live(first)).toHaveLength(1);
     await frozenBefore(p);
     fake.failures = [];
@@ -319,12 +474,8 @@ describe("a start frozen on nest's repos", () => {
     expect(job.attempts).toBe(0);
     const a = fake.agents.get(job.agent as string)!;
     expect(a.labels.start).toBe("2");
-    expect(a.overrides).toEqual({});
+    expect(a.overrides).toEqual({ repos: [], read_repos: [] });
     expect(fake.sandboxes.get(a.sandbox!)!.layer.guards).toEqual(githubGuards(p.repo, "read"));
-    await sql(p, (x) => x.exec("UPDATE abandoned_starts SET next_ms = 0"));
-    await drain(p);
-    await sql(p, (x) => x.exec("UPDATE abandoned_starts SET next_ms = 0"));
-    await drain(p);
-    expect(live(first)).toEqual([]);
+    await sweptTwice(p, first);
   });
 });

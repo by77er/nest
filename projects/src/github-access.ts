@@ -195,13 +195,17 @@ export interface FrozenGithub {
 }
 
 /**
- * What a start's spawn sends as its overrides, frozen with the attempt like the rest of its request (its
- * Idempotency-Key binds it): none, since every template the app starts from names no repo of nest's
- * (README.md#converging-onto-the-apps-own-access). One frozen by the release before (B3, `overrides` absent)
- * narrowed nest's repos to none, for a shared template not synced since: its retries send that again.
+ * nest's repos narrowed to none: what every start's spawn sends as its overrides, as B3 did. Every template the app
+ * starts from names no repo of nest's now (each is written before its start, README.md#converging-onto-the-apps-own-access),
+ * so this narrows nothing, and fits any grant, one without repos too. Still sent so that a start frozen by this
+ * release and resent by B3 after a rollback is the same request under its Idempotency-Key (nest binds a key to its
+ * first request for 24 h). Sending none waits for phase C.
  */
+export const NARROWED: SpawnOverrides = Object.freeze({ repos: [], read_repos: [] }) as SpawnOverrides;
+
+/** What a start's spawn sends as its overrides: as its start froze them (one frozen by B3 has none frozen: `NARROWED`, as B3 sent). */
 export function spawnOverrides(spec: FrozenGithub & { overrides?: SpawnOverrides }): SpawnOverrides {
-  return spec.overrides ?? { repos: [], read_repos: [] };
+  return spec.overrides ?? NARROWED;
 }
 
 /** A start's sandbox egress: its role's rules as frozen, then the GitHub hosts its spec adds that no rule names. */

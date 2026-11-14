@@ -139,7 +139,7 @@ describe("a PR's review", () => {
     expect(a.labels).toMatchObject({ project: p.id, role: "reviewer", pr: "3", sha: s });
     expect(a.sandbox).toMatch(/^sbx_/);
     // It reads the repo and pushes to none.
-    expect(a.overrides).toEqual({});
+    expect(a.overrides).toEqual({ repos: [], read_repos: [] });
     expect(fake.sandboxes.get(a.sandbox!)!.layer.guards).toEqual(githubGuards(p.repo, "read"));
     const brief = fake.inbox.find((x) => x.agent === reviewer)!.text;
     for (const part of [p.repo.toLowerCase(), "#3", s, "develop", "submit_review"]) expect(brief).toContain(part);

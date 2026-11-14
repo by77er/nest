@@ -17,7 +17,7 @@ import type { AgentCaller } from "../identity";
 import { type AgentView, backoff, clientIdOf, HOSTS_WAIT, NestError, nestFrom, type Nest, type SandboxExtras, type SpawnOverrides, stopRefused } from "../nest";
 import { envName, MAX_BINDINGS, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
 import { AppTokens } from "../github-app";
-import { GITHUB_EGRESS_HOSTS, GITHUB_INJECT_HOSTS, githubGrantMissing, githubGuards, GITHUB_KINDS, githubAccess, githubBinding, githubEgress, githubEnv, type GithubKind, githubPermissions, type GithubRole, githubSecretName, type Guard, kindOf, REFRESH_BEFORE_MS, spawnOverrides, startEgress } from "../github-access";
+import { GITHUB_EGRESS_HOSTS, GITHUB_INJECT_HOSTS, githubGrantMissing, githubGuards, GITHUB_KINDS, githubAccess, githubBinding, githubEgress, githubEnv, type GithubKind, githubPermissions, type GithubRole, githubSecretName, type Guard, kindOf, NARROWED, REFRESH_BEFORE_MS, spawnOverrides, startEgress } from "../github-access";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { canBlock, canUnblock, dependencyError, pickForAssignment, type Spec, step, taskBranch, type TaskEvent, type TaskFacts, type TaskState, TERMINAL, waitingOn, WORKER_STATES } from "../tasks";
@@ -681,6 +681,9 @@ const ASK_ROLES = new Set(["manager", "worker", "reviewer", "routine"]);
 const RECENT_WAITS = 10;
 
 type Row = Record<string, SqlStorageValue>;
+
+/** A message's `to_agent` while it's kept for the next manager (`oweManager`): not an agent id, never due until it's that manager's. */
+const NEXT_MANAGER = "manager:next";
 
 /** A manager in one of these states is in a turn: a model switch waits for it to end (README.md#models). */
 const MID_TURN = new Set(["working", "waiting_permission", "compacting", "quota_parked", "stalled"]);
@@ -2155,7 +2158,7 @@ export class ProjectDO extends DurableObject<Env> {
       const model = role === "manager" ? s.manager_model : role === "worker" ? s.worker_model : undefined;
       frozen = {
         extras, names: mine.map((m) => m.name), brief: secretsBrief(mine) + githubBrief(github.kind, github.repo), rev: this.rules().rev,
-        ...(model ? { model } : {}), github: { egress: github.egress, guards: github.guards }, overrides: {},
+        ...(model ? { model } : {}), github: { egress: github.egress, guards: github.guards }, overrides: NARROWED,
       };
       this.sql.exec("INSERT INTO start_specs (key, spec, at_ms) VALUES (?, ?, ?)", key, JSON.stringify(frozen), Date.now());
       this.sql.exec("DELETE FROM start_specs WHERE at_ms < ?", Date.now() - 7 * 24 * 3600 * 1000);
@@ -2279,7 +2282,7 @@ export class ProjectDO extends DurableObject<Env> {
    */
   async reviewerSpec(key: string, o: { ensure?: boolean } = {}): Promise<StartSpec & { legacy?: true }> {
     const nest = nestFrom(this.env);
-    if (!this.settings() || !nest) return { extras: {}, names: [], brief: "", rev: 0, overrides: {} };
+    if (!this.settings() || !nest) return { extras: {}, names: [], brief: "", rev: 0, overrides: NARROWED };
     const spec = await this.sandboxSpec(nest, "reviewer", key, o);
     return spec.github ? spec : { ...spec, legacy: true };
   }
@@ -2437,6 +2440,17 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
+   * Owe the manager a message (a wait resolved, a worker's block, a stop nest refused): the current one's, or,
+   * while none runs (one replaced and its successor not started yet: README.md#converging-onto-the-apps-own-access),
+   * the next one's, kept (`to_agent` NEXT_MANAGER, not due) until its start is done and sent after its brief.
+   */
+  private oweManager(text: string, relayed: boolean): void {
+    const manager = this.settings()?.manager;
+    if (manager) return this.oweMessage(manager, text, relayed);
+    this.sql.exec("INSERT INTO messages (to_agent, text, relayed, at_ms, next_ms) VALUES (?, ?, ?, ?, NULL)", NEXT_MANAGER, text, relayed ? 1 : 0, Date.now());
+  }
+
+  /**
    * An agent marks a task blocked (README.md#blocked): the manager any task, a worker its own (the
    * caller passes its labels' task). A worker's block is told to the manager.
    */
@@ -2451,9 +2465,8 @@ export class ProjectDO extends DurableObject<Env> {
       Date.now(), caller.agent, by, reason, question, caller.tainted ? 1 : 0, Date.now(), id,
     );
     this.record(id, { kind: "agent", agent: caller.agent, tainted: caller.tainted }, "blocked", { reason, ...(question ? { question } : {}) });
-    const manager = this.settings()!.manager;
-    if (by === "worker" && manager) {
-      this.oweMessage(manager, [
+    if (by === "worker") {
+      this.oweManager([
         `Worker ${caller.agent} blocked task ${id} ("${r.title as string}"). The owner sees it on the board.`,
         `Reason: ${reason}`, ...(question ? [`Question for the owner: ${question}`] : []),
       ].join("\n"), caller.tainted);
@@ -2777,8 +2790,7 @@ export class ProjectDO extends DurableObject<Env> {
     const now = Date.now();
     const done = this.sql.exec("UPDATE waits SET resolved_ms = ?, outcome = ?, detail = ? WHERE id = ? AND resolved_ms IS NULL", now, outcome, detail, id).rowsWritten;
     if (!done) return false;
-    const manager = this.settings()?.manager;
-    if (notify && manager) this.oweMessage(manager, waitMessage(w, outcome, detail, now), false);
+    if (notify) this.oweManager(waitMessage(w, outcome, detail, now), false);
     // Resolved waits beyond the RECENT_WAITS the page shows go.
     this.sql.exec("DELETE FROM waits WHERE resolved_ms IS NOT NULL AND id NOT IN (SELECT id FROM waits WHERE resolved_ms IS NOT NULL ORDER BY resolved_ms DESC, rowid DESC LIMIT ?)", RECENT_WAITS);
     return true;
@@ -2929,6 +2941,23 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
+   * Whether a live agent's start was frozen with the app's own GitHub access (its spec's `github`): the manager's
+   * start (the one done, or the one being briefed) or a worker's task's current assignment. Reviewers always have
+   * their row (ReviewDO's `reviewerStarted`).
+   */
+  private startedWithAccess(a: { agent: string; role: LayerRole }): boolean {
+    const s = this.settingsRow()!;
+    let key: string | null = null;
+    if (a.role === "manager" && s.manager === a.agent) {
+      key = `${s.id as string}/manager/${(s.manager_starts as number) + (s.manager_next_ms === null ? 0 : 1)}`;
+    } else if (a.role === "worker") {
+      const t = this.sql.exec<{ id: string; assignments: number }>("SELECT id, assignments FROM tasks WHERE assignee = ?", a.agent).toArray()[0];
+      if (t) key = `${s.id as string}/${t.id}/${t.assignments}`;
+    }
+    return !!(key && this.frozenSpec(key)?.github);
+  }
+
+  /**
    * Something a client layer is built from changed for `roles` (their rules, or their secrets): a new
    * revision, owed to each live agent of those roles. One revision for both, so each agent has one status.
    */
@@ -2938,10 +2967,12 @@ export class ProjectDO extends DurableObject<Env> {
     this.sql.exec("UPDATE settings SET network_rev = ?", rev);
     for (const a of this.liveAgents()) {
       if (!roles.includes(a.role)) continue;
+      // A row it has keeps its `github`. One it lacks (an agent started before layers were kept) takes it from its
+      // start's frozen spec; none found (pruned after a week, or never frozen): nest's repos, as before B3.
       this.sql.exec(
-        `INSERT INTO layers (agent, role, want_rev, next_ms) VALUES (?, ?, ?, ?)
+        `INSERT INTO layers (agent, role, want_rev, next_ms, github) VALUES (?, ?, ?, ?, ?)
           ON CONFLICT (agent) DO UPDATE SET want_rev = excluded.want_rev, next_ms = excluded.next_ms, attempts = 0, error = NULL`,
-        a.agent, a.role, rev, Date.now(),
+        a.agent, a.role, rev, Date.now(), this.startedWithAccess(a) ? 1 : 0,
       );
     }
     await this.arm();
@@ -4945,14 +4976,31 @@ export class ProjectDO extends DurableObject<Env> {
     }
     const later = () => this.sql.exec("UPDATE settings SET converge_next_ms = ?", Date.now() + CONVERGE_RECHECK_MS);
     if (r.manager_next_ms !== null || r.gh_unreachable === 1 || !this.chatQuiet()) return void later();
-    const grant = await this.readGrant(nest);
+    // Stale (a move of the lifecycle meanwhile), or not now: looked at again later, whichever manager it is then
+    // (one on the app's access is then left as it is), never at once, so the alarm doesn't spin on it.
     const same = () => {
       const now = this.settingsRow();
       return !!now && now.manager === agent && now.manager_starts === base && now.manager_next_ms === null;
     };
-    // Stale (a move of the lifecycle meanwhile), or not now: looked at again later, whichever manager it is then
-    // (one on the app's access is then left as it is), never at once, so the alarm doesn't spin on it.
-    if (!same() || grant === null || githubGrantMissing(grant)) return void later();
+    // Make before break: the successor's start (the next one, `startManager`'s, after this move) is frozen and its
+    // sandbox made now, under the keys that start uses, so it goes on with them (its creates answer the same
+    // sandbox by Idempotency-Key). Anything that would hold the successor back (the grant lacking the GitHub hosts,
+    // `sandboxSpec`'s GrantWait; the token's write; nest refusing the sandbox while a host can't apply its guards)
+    // keeps the old one running instead. A sandbox
+    // made for a move that then doesn't happen is the next try's (the same keys while nothing else moves the
+    // lifecycle; after a move of one, its start's), else nest's idle TTL ends it.
+    const n = base + 2;
+    const key = `${r.id as string}/manager/${n}`;
+    try {
+      const frozen = await this.frozenEgress(nest, key, "manager");
+      const spec = await this.sandboxSpec(nest, "manager", key);
+      if (!same() || !spec.github) return void later();
+      await nest.createSandbox({ labels: { project: r.id as string, role: "manager", start: String(n) }, ...managerExtras(frozen, spec) }, `${key}/sandbox`);
+    } catch (e) {
+      console.warn(`project ${r.id as string}: the manager's successor on the app's GitHub access can't start yet; the manager stays`, message(e));
+      return void later();
+    }
+    if (!same()) return void later();
     let view: AgentView;
     try {
       view = await nest.getAgent(agent);
@@ -4964,7 +5012,10 @@ export class ProjectDO extends DurableObject<Env> {
     if (!same() || !onNestRepos(agent) || view.ended || !BETWEEN_TURNS.has(String(view.state ?? "")) || !this.chatQuiet()) return void later();
     this.managerMove({ kind: "converge", agent });
     this.sql.exec("UPDATE settings SET converge_next_ms = NULL");
-    // Its stop, then its successor's start, in this drain: both are due from now, after this pass's clock.
+    // Stopped at once, not later in the drain: a turn that starts between nest's read and this stop is cut (an
+    // accepted risk, README.md#converging-onto-the-apps-own-access), so that window is kept as short as it can be.
+    await this.stop(nest, agent);
+    // Its successor's start, in this drain: due from now, after this pass's clock.
     this.again = true;
   }
 
@@ -5011,7 +5062,7 @@ export class ProjectDO extends DurableObject<Env> {
       }
       const from = s.manager ? null : await this.templateFor(nest, "manager", spec);
       const repo = await this.repo();
-      const agent = s.manager ?? (await nest.startAgent(from!, labels, spawnOverrides(spec), key, { ...startEgress(frozen.egress, spec), ...spec.extras }));
+      const agent = s.manager ?? (await nest.startAgent(from!, labels, spawnOverrides(spec), key, managerExtras(frozen, spec)));
       if (from) this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       if (!current()) {
@@ -5039,8 +5090,12 @@ export class ProjectDO extends DurableObject<Env> {
         // turns (README.md#converging-onto-the-apps-own-access). On the app's access: nothing to look at.
         this.sql.exec("UPDATE settings SET converge_next_ms = ?", spec.github ? null : Date.now());
       }
-      // The owner's messages that waited for a manager go now, not at their next retry.
-      if (done) this.sql.exec("UPDATE chat SET next_ms = ? WHERE next_ms IS NOT NULL", Date.now());
+      // The owner's messages that waited for a manager go now, not at their next retry, and what the app kept for
+      // the next manager (`oweManager`) after its brief.
+      if (done) {
+        this.sql.exec("UPDATE chat SET next_ms = ? WHERE next_ms IS NOT NULL", Date.now());
+        this.sql.exec("UPDATE messages SET to_agent = ?, next_ms = ? WHERE to_agent = ?", agent, Date.now(), NEXT_MANAGER);
+      }
     } catch (e) {
       if (!current()) return;
       // Made, but its brief refused for good (nest has ended it, or never will take it): replaced.
@@ -5181,8 +5236,7 @@ export class ProjectDO extends DurableObject<Env> {
     this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, ?, ?, ?, 'stop_failed', ?)",
       `stop/${agent}/${now}`, now, agent, task ? "worker" : null, task, what);
     if (task) this.record(task, { kind: "app", what: "nest" }, "stop_failed", { agent, error: r.error });
-    const manager = this.settings()?.manager;
-    if (manager && manager !== agent) this.oweMessage(manager, `${what} The owner can retry or dismiss it on the Network page.`, false);
+    if (this.settings()?.manager !== agent) this.oweManager(`${what} The owner can retry or dismiss it on the Network page.`, false);
   }
 
   /** The owner's Retry of a stop nest refused: owed again now (asked again while it's owed, nothing changes). */
@@ -5371,6 +5425,15 @@ function managerBrief(s: ProjectSettings, repo: string, after = false): string {
   ].join("\n");
 }
 
+/**
+ * A manager start's sandbox extras as frozen: what its sandbox's create sends beside its labels, the same for the
+ * start and for the successor a convergence makes before it (README.md#converging-onto-the-apps-own-access), so
+ * both creates are one request under the start's Idempotency-Key.
+ */
+function managerExtras(frozen: { egress: EgressRule[] }, spec: StartSpec): SandboxExtras {
+  return { ...startEgress(frozen.egress, spec), ...spec.extras };
+}
+
 /** A start attempt's labels as one key: JSON, keys sorted. */
 function labelsKey(labels: Record<string, string>): string {
   return JSON.stringify(Object.fromEntries(Object.entries(labels).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))));
@@ -5518,7 +5581,10 @@ export interface StartSpec {
    * A new start waits for the grant instead: it never freezes without.
    */
   github?: { egress: EgressRule[]; guards: Guard[] };
-  /** Its spawn's overrides (`spawnOverrides`): none. Absent: frozen by the release before, which narrowed nest's repos to none. */
+  /**
+   * Its spawn's overrides (`spawnOverrides`), frozen with it: nest's repos narrowed to none (`NARROWED`), as B3 sent
+   * them, so a rollback to B3 resends the same request under its Idempotency-Key. Absent: frozen by B3 (the same).
+   */
   overrides?: SpawnOverrides;
 }
 

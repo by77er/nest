@@ -96,7 +96,7 @@ describe("projects", () => {
     expect(m.sandbox).toMatch(/^sbx_/);
     expect(fake.sandboxes.get(m.sandbox!)!.labels).toEqual(m.labels);
     // It reads its project's repo and pushes to none: the read guards, none of nest's repos.
-    expect(m.overrides).toEqual({});
+    expect(m.overrides).toEqual({ repos: [], read_repos: [] });
     expect(fake.sandboxes.get(m.sandbox!)!.layer.guards).toEqual(githubGuards(p.repo, "read"));
     expect(p.body.settings.manager).toBe(m.agent);
     expect(fake.inbox.find((x) => x.agent === m.agent)?.text).toContain(p.repo.toLowerCase());
@@ -201,7 +201,7 @@ describe("tasks", () => {
     const w = ws[0]!;
     expect(w.labels).toEqual({ project: p.id, role: "worker", task: t.id, start: "1" });
     expect(w.template).toBe(`projects/${modelTemplateEntry("worker", p.id, "claude-opus-5-5")}`);
-    expect(w.overrides).toEqual({});
+    expect(w.overrides).toEqual({ repos: [], read_repos: [] });
     expect(fake.sandboxes.get(w.sandbox!)!.layer.guards).toEqual(githubGuards(p.repo, "push"));
     expect(fake.sandboxes.get(w.sandbox!)!.labels).toEqual(w.labels);
     expect(r.body.assignee).toBe(w.agent);

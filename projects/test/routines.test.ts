@@ -184,7 +184,7 @@ describe("firing", () => {
     // A sandbox of its own, to read the repo.
     expect(a.sandbox).toMatch(/^sbx_/);
     expect(a.labels).toEqual({ project: s.id, role: "routine", routine: id, run: run.id });
-    expect(a.overrides).toEqual({});
+    expect(a.overrides).toEqual({ repos: [], read_repos: [] });
     expect(fake.sandboxes.get(a.sandbox!)!.layer.guards).toEqual(githubGuards(s.repo, "read"));
     // A custom routine reads no transcripts.
     expect(fake.calls.find((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels?.run === run.id)!.body.grants).toBeUndefined();
@@ -436,7 +436,7 @@ describe("cost guards", () => {
     const made = fake.callsTo("POST", /^\/v1\/sandboxes$/).filter((c) => c.body.labels?.run === r.id);
     expect(made).toHaveLength(1);
     expect(made[0]!.body.guards).toEqual(githubGuards(s.repo, "read"));
-    expect(fake.agents.get(r.agent)!.overrides).toEqual({});
+    expect(fake.agents.get(r.agent)!.overrides).toEqual({ repos: [], read_repos: [] });
   });
 
   it("a run already tried on nest's repos when B3 came (marked by its migration) ends, failed, what it made destroyed; the next run is the app's (README.md#converging-onto-the-apps-own-access)", async () => {

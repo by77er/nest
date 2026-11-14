@@ -11,7 +11,7 @@ import { resetAccessKeys } from "../src/access";
 import { DirectoryDO } from "../src/do/directory";
 import { AppTokens } from "../src/github-app";
 import {
-  CREDENTIAL_HELPER, githubAccess, githubGrantMissing, githubGuards, githubPermissions, githubSecretName, REFRESH_BEFORE_MS, spawnOverrides, startEgress,
+  CREDENTIAL_HELPER, githubAccess, githubGrantMissing, githubGuards, githubPermissions, githubSecretName, NARROWED, REFRESH_BEFORE_MS, spawnOverrides, startEgress,
 } from "../src/github-access";
 import { clientLayerFor, NO_RULES, shrinkLayer } from "../src/network";
 import { HOSTS_WAIT, HOSTS_WORDS, NestError, nestFrom } from "../src/nest";
@@ -111,11 +111,12 @@ describe("the access (pure)", () => {
     expect(g.map((x) => x.name)).toEqual(["github-push", "github-write", "github-api-write", "gist-write", "githubusercontent-write"]);
   });
 
-  it("a start's spawn sends the overrides it froze (none since B4; one frozen by B3, nest's repos narrowed to none, sent again), and adds the GitHub hosts no rule names", () => {
+  it("a start's spawn sends the overrides it froze (one frozen by B3 froze none: nest's repos narrowed to none, as B3 sent), and adds the GitHub hosts no rule names", () => {
     const spec = { github: { egress: [{ host: "github.com" }, { host: "api.github.com" }], guards: githubGuards("o/r", "read") } };
     expect(spawnOverrides({ ...spec, overrides: {} })).toEqual({});
-    // Its retries send the request its Idempotency-Key is bound to.
+    // Its retries send the request its Idempotency-Key is bound to: B3's, so a rollback to B3 resends the same.
     expect(spawnOverrides(spec)).toEqual({ repos: [], read_repos: [] });
+    expect(NARROWED).toEqual({ repos: [], read_repos: [] });
     expect(startEgress([{ host: "github.com", ports: [443] }, { host: "pypi.org" }], spec)).toEqual({ egress: { allow: [{ host: "github.com", ports: [443] }, { host: "pypi.org" }, { host: "api.github.com" }] } });
     expect(startEgress([], {})).toEqual({});
   });
@@ -300,7 +301,7 @@ describe("the sandbox of each role", () => {
     expect(create!.body.egress).toEqual({ allow: [{ host: "github.com" }, { host: "api.github.com" }, { host: "*.githubusercontent.com" }] });
     expect(create!.body).not.toHaveProperty("github_push");
     const [agent] = agentCreateOf({ project: p.id, role: "manager" });
-    expect(agent!.body.overrides).toEqual({});
+    expect(agent!.body.overrides).toEqual({ repos: [], read_repos: [] });
     expect(fake.sandboxes.get(fake.agents.get(p.manager!)!.sandbox!)!.layer.guards).toEqual(githubGuards(p.repo, "read"));
     // Its brief says git and gh are set up, never the placeholder.
     const brief = fake.inbox.find((m) => m.agent === p.manager)!.text;
@@ -319,7 +320,7 @@ describe("the sandbox of each role", () => {
     expect(create!.body.env.GH_TOKEN).toBe(`nest-ph.${CLIENT}.gh_push.`);
     expect(create!.body).not.toHaveProperty("github_push");
     const [agent] = agentCreateOf({ project: p.id, role: "worker", task: t.id });
-    expect(agent!.body.overrides).toEqual({});
+    expect(agent!.body.overrides).toEqual({ repos: [], read_repos: [] });
     expect(create!.body.guards).toEqual(githubGuards(p.repo, "push"));
     expect(fake.inbox.find((m) => m.agent === t.assignee)!.text).toContain(`They push only to ${p.repo}.`);
     // A second worker shares the project's push token: no second mint.
@@ -335,11 +336,11 @@ describe("the sandbox of each role", () => {
     expect((create!.body.inject as { name: string }[]).map((b) => b.name)).toEqual(["gh_read"]);
     expect(create!.body.egress.allow).toContainEqual({ host: "api.github.com" });
     const [agent] = agentCreateOf({ project: p.id, role: "reviewer" });
-    expect(agent!.body.overrides).toEqual({});
+    expect(agent!.body.overrides).toEqual({ repos: [], read_repos: [] });
     expect(create!.body.guards).toEqual(githubGuards(p.repo, "read"));
   });
 
-  it("a shared template not synced since the deploy, still naming every repo, is written again before a start from it: nest gives the agent no token of its own, with no narrowing", async () => {
+  it("a shared template not synced since the deploy, still naming every repo, is written again before a start from it: it names no repo of nest's, whatever the spawn narrows", async () => {
     const p = await newProject();
     const names = ["templates/projects/reviewer", "templates/projects/routine"];
     const synced = names.map((n) => fake.catalog.get(n));
@@ -350,7 +351,7 @@ describe("the sandbox of each role", () => {
       await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
       expect(fake.catalog.get(names[0]!)).toEqual(synced[0]);
       const [agent] = agentCreateOf({ project: p.id, role: "reviewer" });
-      expect(agent!.body.overrides).toEqual({});
+      expect(agent!.body.overrides).toEqual({ repos: [], read_repos: [] });
       expect([...fake.agents.values()].filter((a) => a.labels.project === p.id && a.labels.role === "reviewer")).toHaveLength(1);
       // A routine run's too.
       const routine = (await api(token, "POST", `/api/projects/${p.id}/routines`, {
@@ -361,7 +362,7 @@ describe("the sandbox of each role", () => {
       await drain(p);
       expect(fake.catalog.get(names[1]!)).toEqual(synced[1]);
       const [run] = agentCreateOf({ project: p.id, role: "routine" });
-      expect(run!.body.overrides).toEqual({});
+      expect(run!.body.overrides).toEqual({ repos: [], read_repos: [] });
       expect([...fake.agents.values()].filter((a) => a.labels.project === p.id && a.labels.role === "routine")).toHaveLength(1);
     } finally {
       names.forEach((n, i) => fake.catalog.set(n, synced[i]));
@@ -1035,7 +1036,7 @@ describe("going away", () => {
       const old = secret(p, "push")!.value;
       proto.binding = async function (this: unknown, ...a: unknown[]) {
         const r = await orig.apply(this, a);
-        if (hold) { hold = false; reached(); await gate; }
+        if (hold && a[0] === p.id) { hold = false; reached(); await gate; }
         return r;
       };
       let e: Promise<unknown>;
@@ -1097,7 +1098,8 @@ describe("going away", () => {
       // The refresh's first read answers Y; Z is bound right after it, so its read after following answers Z.
       proto.binding = async function (this: any, ...a: unknown[]) {
         const r = await orig.apply(this, a);
-        if (++reads === 1) this.ctx.storage.sql.exec("UPDATE projects SET repo = ?, repo_id = ? WHERE id = ?", z, idZ, p.id);
+        // Only this project's reads count: another test's project reading its binding (its own alarm) isn't this refresh's.
+        if (a[0] === p.id && ++reads === 1) this.ctx.storage.sql.exec("UPDATE projects SET repo = ?, repo_id = ? WHERE id = ?", z, idZ, p.id);
         return r;
       };
       try {
@@ -1164,7 +1166,10 @@ describe("going away", () => {
     const proto = DirectoryDO.prototype as any;
     const orig = proto.binding;
     const before = fake.github.mints().length;
-    proto.binding = async function () { throw new Error("DirectoryDO down"); };
+    proto.binding = async function (this: unknown, ...a: unknown[]) {
+      if (a[0] === p.id) throw new Error("DirectoryDO down");
+      return orig.apply(this, a);
+    };
     try {
       const r = await alarmHeld(p, async (o: any) => o.ensureGithub(nestFrom(env as any)!, "push").then(() => "ok", (x: unknown) => `threw ${x}`));
       expect(r).toMatch(/threw/);

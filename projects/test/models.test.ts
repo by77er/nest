@@ -718,7 +718,9 @@ describe("a project's models", () => {
   /** Hold the next template delete; `during` runs once it's waiting at nest, then it's let go. */
   async function duringDelete(p: P, run: () => Promise<unknown>, during: () => Promise<unknown>) {
     let release!: () => void;
-    const hold = { match: /^DELETE \/v1\/catalog\/templates\//, release: new Promise<void>((r) => { release = r; }), reached: false };
+    // This project's templates only: another test's project sweeping its own (on its own alarm) mustn't take the hold.
+    const mine = new RegExp(`^DELETE /v1/catalog/templates/projects/(manager|worker)-${p.id.replace(/^prj_/, "")}-`);
+    const hold = { match: mine, release: new Promise<void>((r) => { release = r; }), reached: false };
     fake.holds.push(hold);
     const running = run();
     await vi.waitFor(() => expect(hold.reached).toBe(true));
