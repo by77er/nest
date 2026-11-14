@@ -176,6 +176,7 @@ describe("who is set", () => {
       for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       // And the GitHub access step's (README.md#repo-authority).
       for (const t of ["gh_access", "gh_tokens", "sandbox_ends"]) sql.exec(`DROP TABLE ${t}`);
+      sql.exec("ALTER TABLE settings DROP COLUMN gh_unreachable");
       sql.exec("ALTER TABLE layers DROP COLUMN github");
       sql.exec("UPDATE schema_version SET v = ?", step);
       migrate(st.storage, MIGRATIONS);
@@ -222,6 +223,7 @@ describe("who is set", () => {
         for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
         // And the GitHub access step's (README.md#repo-authority).
         for (const t of ["gh_access", "gh_tokens", "sandbox_ends"]) sql.exec(`DROP TABLE ${t}`);
+      sql.exec("ALTER TABLE settings DROP COLUMN gh_unreachable");
       sql.exec("ALTER TABLE routine_runs DROP COLUMN nest_repos");
         sql.exec("ALTER TABLE layers DROP COLUMN github");
         sql.exec("UPDATE schema_version SET v = ?", step);
@@ -243,6 +245,7 @@ describe("who is set", () => {
       for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       // And the GitHub access step's (README.md#repo-authority).
       for (const t of ["gh_access", "gh_tokens", "sandbox_ends"]) sql.exec(`DROP TABLE ${t}`);
+      sql.exec("ALTER TABLE settings DROP COLUMN gh_unreachable");
       sql.exec("ALTER TABLE routine_runs DROP COLUMN nest_repos");
       sql.exec("ALTER TABLE layers DROP COLUMN github");
       sql.exec("UPDATE settings SET repo_owner_id = 55501, repo_owner_login = 'interim'");

@@ -5,7 +5,7 @@
 // Made-up ids and repos only. `variant` is "demo", "long" (overlong names and titles), "empty" (no
 // projects), "error" (the API fails), "connecting" (a trace that sends nothing yet), "rich" (a manager
 // message with every kind of rich content), "chat-empty", "chat-sending" (the owner's messages still being sent), "chat-long" (thirty messages), "chat-paged"
-// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors), "manager-ended" (past its automatic restarts), "creating" (a project still being created), "models-custom" (a custom model id for the workers),
+// (120, paged by `before`) "chat-arriving" (a reply lands a few seconds in), "secrets-empty" (no secrets or live agents), "stops-failed" / "stops-long" (agents nest refused to stop; long titles and errors), "manager-ended" (past its automatic restarts), "creating" (a project still being created), "models-custom" (a custom model id for the workers), "workflows-refused" (workers may change workflows, which the App's installation doesn't grant),
 // "board-many" (forty more tasks in every state, long titles), "board-empty" (a project with no tasks),
 // "chat-code" (a reply with every syntax token), "chat-heavy" (a reply with a 60-line code block and a ten-column table), "turn-busy" (the live turn
 // a dozen tool calls in), "secret-requests" (agents asking for credentials, one tainted), or "comments-set" / "comments-id-only" (whose
@@ -325,6 +325,7 @@ const RICH = [
     // The models (README.md#models): the defaults, or (models-custom) a long custom id for the workers.
     manager_model: "claude-fable-5-2",
     worker_model: variant === "models-custom" ? "us.anthropic.claude-opus-5-5-20260915-v1:0[1m]" : "claude-opus-5-5",
+    ...(variant === "workflows-refused" ? { workers_edit_workflows: true } : {}),
     // A switch of the running manager waiting for its turn to end (manager-switching).
     // manager-switching-now: due now, between turns.
     ...(variant === "manager-switching" || variant === "manager-switching-now"
@@ -427,8 +428,10 @@ const RICH = [
     grant: { inject_hosts: ["api.cloudflare.com", "registry.npmjs.org", "upload.pypi.org", "*.gadgets.example.com"], max_count: 20, max_bytes: 4096, workflows: true, used: 3 },
     client: "cli_demo",
     agents: variant === "secrets-empty" ? [] : network.agents,
-    // Saved off: the applied layers match it; agt_w3f9q1, its layer pending, still has it.
-    workflow_workers: ["agt_w3f9q1"],
+    // Saved off: the applied layers match it; agt_w3f9q1, its layer pending, still has it. "workflows-refused": saved
+    // on, but the GitHub App's installation doesn't grant workflows: write, so no worker has it.
+    workflow_workers: variant === "workflows-refused" ? [] : ["agt_w3f9q1"],
+    workflows_refused: variant === "workflows-refused" ? "the GitHub App's installation doesn't grant workflows: write" : null,
   };
 
   // Routines (README.md#routines): the two presets (review running, dreaming cooling down), a custom one

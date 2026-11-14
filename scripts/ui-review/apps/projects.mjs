@@ -986,6 +986,8 @@ const app = {
     { name: "settings-pr-comments-link", section: "project", path: "/projects/prj_demo/settings#pr-comments", fixture: "comments-cleared", full: false, check: linkTargetCheck("pr-comments"), checkName: "link-targets" },
     // The models (README.md#models): a custom id shown with its field; the list open.
     { name: "settings-models-custom", section: "project", path: "/projects/prj_demo/settings", fixture: "models-custom" },
+    // On, but the GitHub App's installation doesn't grant workflows: write: said under the toggle and by each live worker.
+    { name: "settings-workflows-refused", section: "project", path: "/projects/prj_demo/settings", fixture: "workflows-refused", checkName: "workflows", check: (p) => p.evaluate(workflowsAgree) },
     // A manager model switch waiting for the manager's turn to end, and its chat line once done (README.md#models).
     { name: "settings-manager-switching", section: "project", path: "/projects/prj_demo/settings", fixture: "manager-switching" },
     { name: "settings-manager-switching-now", section: "project", path: "/projects/prj_demo/settings", fixture: "manager-switching-now" },

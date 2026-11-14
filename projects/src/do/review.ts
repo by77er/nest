@@ -957,7 +957,7 @@ export class ReviewDO extends DurableObject<Env> {
       }
       const j = current()!;
       if (j.briefed !== 1) {
-        const spec = await projectStub(this.env, project).reviewerSpec(`${project}/review/${pr}/${sha}/${runs}`);
+        const spec = await projectStub(this.env, project).reviewerSpec(`${project}/review/${pr}/${sha}/${runs}`, { ensure: false });
         await nest.postInbox(agent, reviewerBrief(repo, pr, sha, j.base as string | null) + spec.brief, { requestId: `${project}/review/${pr}/${sha}/${runs}/brief` });
         if (!current()) return;
       }

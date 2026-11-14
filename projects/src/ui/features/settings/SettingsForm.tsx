@@ -359,34 +359,33 @@ export function RepoAutoMergeStatus({ projectId, status }: { projectId: string; 
 }
 
 /**
- * "Workers may change CI workflows" (README.md#secrets): off by default; on, workers' push tokens get
- * `workflows: write`, which the grant must allow, live workers' too (through their sandbox's client
- * layer), each shown applied, pending or failed with whether it has it. With the security note: a
- * pushed workflow runs with the repo's Actions secrets before anyone reviews it.
+ * "Workers may change CI workflows" (README.md#secrets): off by default; on, the project's push token gets
+ * `workflows: write`, which the GitHub App's installation must grant, live workers' too (they share the
+ * token), each shown with whether it has it. With the security note: a pushed workflow runs with the repo's
+ * Actions secrets before anyone reviews it.
  */
 function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: string; checked?: boolean; onChange?: (e: React.ChangeEvent<HTMLInputElement>) => void; error?: React.ReactNode }) {
   const secrets = useSecrets(projectId);
-  const allowed = secrets.data?.grant?.workflows;
+  const refused = secrets.data?.workflows_refused ?? null;
   return (
     <Stack gap="sm">
       <Switch
         label="Workers may change CI workflows"
-        description="Their pushes may add or change files under .github/workflows/; off, GitHub refuses those pushes. Saved, it reaches live workers in a moment too, through their sandbox."
+        description="Their pushes may add or change files under .github/workflows/; off, GitHub refuses those pushes. The GitHub App's installation must grant workflows: write. Saved, it reaches live workers in a moment too."
         checked={checked}
         onChange={onChange}
         error={error}
-        disabled={allowed === false && !checked}
       />
-      {allowed === false && (
-        <Text fz="xs" c="dimmed">
-          The app's grant doesn't allow it: the operator sets github_push.workflows in its grant first.
+      {checked && refused && (
+        <Text fz="xs" c="warning" data-slot="workflows-refused">
+          Not in effect: {refused}. Accept that permission in the App's installation settings on GitHub; the app asks for it again at the next token.
         </Text>
       )}
       {checked && (
         <Notice tone="warning" title="A pushed workflow runs before anyone reviews it">
-          <Text fz="sm">
+          <Text fz="sm" lh="lg">
             It runs with the repo's Actions secrets as soon as it's pushed. Keep CI secrets in an environment with required reviewers, so a job that reads them waits for a person.{" "}
-            <Anchor href="https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment" target="_blank" rel="noreferrer" inherit>
+            <Anchor href="https://docs.github.com/en/actions/managing-workflow-runs-and-deployments/managing-deployments/managing-environments-for-deployment" target="_blank" rel="noreferrer" inherit c="bright" underline="always" lh="lg" data-inline>
               GitHub: environments
             </Anchor>
           </Text>
@@ -406,9 +405,13 @@ function LiveWorkers({ projectId, saved }: { projectId: string; saved: boolean }
   const workers = (secrets.data?.agents ?? []).filter((a) => a.role === "worker");
   const can = new Set(secrets.data?.workflow_workers ?? []);
   const allowed = secrets.data?.grant?.workflows !== false;
+  const refused = saved ? (secrets.data?.workflows_refused ?? null) : null;
   if (!workers.length) return null;
   // A token that disagrees with the saved setting is out of date, whatever its layer's last state: never Applied.
-  const shown = workers.map((a) => (can.has(a.agent) !== saved && a.state === "applied" ? { ...a, state: "pending" as const } : a));
+  // One the App's installation refuses won't catch up by waiting: Failed, with why.
+  const shown = workers.map((a) => (can.has(a.agent) !== saved && a.state === "applied"
+    ? refused ? { ...a, state: "failed" as const, error: null } : { ...a, state: "pending" as const }
+    : a));
   return (
     <Panel data-slot="live-workers">
       <Section title="Live workers" order={4} count={workers.length} region={false}>
@@ -420,7 +423,7 @@ function LiveWorkers({ projectId, saved }: { projectId: string; saved: boolean }
           detail={(a) => {
             const has = can.has(a.agent);
             if (has === saved) return <span data-slot="workflows" data-matches="true">{has ? "Its pushes may change workflows" : "Its pushes may not change workflows"}</span>;
-            const why = saved && !allowed ? "the grant doesn't allow it" : "until its layer applies";
+            const why = refused ?? (saved && !allowed ? "nest's grant doesn't allow it" : "until it catches up");
             return (
               <Text component="span" fz="xs" c="warning" data-slot="workflows" data-matches="false">
                 {has ? "Still may change workflows" : "Can't change workflows yet"} · {why}

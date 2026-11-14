@@ -64,6 +64,8 @@ export interface SecretsAnswer {
   agents: import("../../do/project").LayerStatus[];
   /** Live workers whose push token may change workflows: theirs until they end, whatever the setting says now. */
   workflow_workers: string[];
+  /** Why none may though the setting says so (the GitHub App's installation doesn't grant `workflows: write`); null when nothing refuses. */
+  workflows_refused?: string | null;
 }
 /** One of the repo's open PRs, for attaching: the task it's attached to, if any. */
 export interface OpenPr {

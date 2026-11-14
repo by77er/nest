@@ -275,12 +275,9 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       const b = await body(req, SettingsBody);
       if (!b.ok) return b.res;
       const { max_concurrent_reviews, untrusted_reviews, ...rest } = b.value;
-      // Workers editing CI workflows needs the grant to allow it: refused here rather than at every spawn.
-      if (rest.workers_edit_workflows === true) {
-        const g = await grantOf(env);
-        if (!g.ok) return err(g.status, g.error);
-        if (!g.value.workflows) return err(409, "the app's grant doesn't allow workflows on push tokens: the operator must set github_push.workflows in its grant");
-      }
+      // Workers editing CI workflows: the project's push token carries it when the GitHub App's installation grants
+      // `workflows: write` (README.md#the-sandboxes-github-access); nest's grant decides it only for workers started on
+      // nest's repos, within its `github_push.workflows` at each layer write. Not refused here either way.
       // All or nothing: ProjectDO's part first (its refusals, a GitHub lookup among them, come before it
       // writes anything), then ReviewDO's, only if that went through.
       const updated = await p.updateSettings(rest);
@@ -315,6 +312,8 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
         agents: layers.ok ? layers.value.agents : [],
         // Live workers whose push token may change workflows (README.md#secrets): theirs until they end.
         workflow_workers: await p.workflowWorkers(),
+        // Why none may though the setting says so: the App's installation doesn't grant workflows: write.
+        workflows_refused: await p.workflowsRefused(),
       });
     }
     case "PUT secrets/:name": {

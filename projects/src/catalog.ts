@@ -120,7 +120,7 @@ function mcpCapability(base: string, server: Server, prompt: string) {
 
 /**
  * A role's template. Its sandbox's GitHub access is the app's own, sent with each start (README.md#repo-authority):
- * a binding of the project's token, its environment, and guards in the spawn's overrides, so the shared
+ * a binding of the project's token, its environment and the app's guards, all in its sandbox's create, so the shared
  * templates name no repo. `repos` only in a project's own template written for a start frozen before that
  * (nest's repos: `access` `push`, the worker's, or `read`), which its spawn narrows to the project's.
  */

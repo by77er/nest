@@ -63,15 +63,17 @@ export interface AccessGrant {
 
 /**
  * What the grant lacks for the app's own GitHub access, as the start's error says it, or null: the binding
- * injects into both GitHub hosts (`inject_hosts`), and the app opens the API (`egress_hosts`; nest's base
- * layer doesn't).
+ * injects into both GitHub hosts (`inject_hosts`), and the app opens every host the guards and git use
+ * (`egress_hosts`: the API, which nest's base layer doesn't, github.com and the content hosts, which it does
+ * today but the operator may trim).
  */
 export function githubGrantMissing(grant: AccessGrant): string | null {
   const inject = GITHUB_INJECT_HOSTS.filter((h) => !hostAllowed(h, grant.inject_hosts ?? []));
-  const egress = hostAllowed("api.github.com", grant.egress_hosts ?? []) ? [] : ["api.github.com"];
+  const egress = GITHUB_EGRESS_HOSTS.filter((h) => !hostAllowed(h, grant.egress_hosts ?? []));
   if (!inject.length && !egress.length) return null;
+  const list = (hosts: readonly string[]) => (hosts.length > 1 ? `${hosts.slice(0, -1).join(", ")} and ${hosts.at(-1)}` : hosts[0]!);
   return `waiting for nest's grant for this app to cover its GitHub access: the operator must add ${[
-    ...(inject.length ? [`${inject.join(" and ")} to inject_hosts`] : []), ...(egress.length ? ["api.github.com to egress_hosts"] : []),
+    ...(inject.length ? [`${list(inject)} to inject_hosts`] : []), ...(egress.length ? [`${list(egress)} to egress_hosts`] : []),
   ].join(", and ")}`;
 }
 

@@ -605,7 +605,7 @@ describe("workers editing CI workflows", () => {
     expect(await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM abandoned").one().n)).toBe(0);
   });
 
-  it("is off by default; on, a start frozen on nest's repos asks nest's opt-in for worker sandboxes only; refused when the grant doesn't allow it", async () => {
+  it("is off by default; on, a start frozen on nest's repos asks nest's opt-in for worker sandboxes only, within the grant", async () => {
     const p = await newProject();
     expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.workers_edit_workflows).toBe(false);
     const before = await legacyWorker(p);
@@ -623,9 +623,15 @@ describe("workers editing CI workflows", () => {
     const saved = fake.grant.github_push;
     fake.grant.github_push = { workflows: false };
     try {
+      // Not refused: the GitHub App's installation decides for the project's own token; a worker on nest's repos
+      // gets nest's opt-in only within the grant, so it goes from its layer.
       const r = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
-      expect(r.status).toBe(409);
-      expect(r.body.error).toMatch(/github_push\.workflows/);
+      expect(r.status).toBe(200);
+      await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => { st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0"); });
+      await drain(p);
+      await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => { st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0"); });
+      await drain(p);
+      expect(sandboxOf(after.worker).github_push).toBeNull();
     } finally {
       fake.grant.github_push = saved;
     }

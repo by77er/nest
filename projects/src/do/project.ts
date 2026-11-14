@@ -635,7 +635,9 @@ export const MIGRATIONS = [
     // is kept only to revoke it (`revoke` 1: owed), until it expires.
     `CREATE TABLE gh_access (kind TEXT PRIMARY KEY, nest_name TEXT NOT NULL, expires_ms INTEGER, workflows INTEGER NOT NULL DEFAULT 0,
       next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, gone INTEGER NOT NULL DEFAULT 0,
-      del_next_ms INTEGER, del_attempts INTEGER NOT NULL DEFAULT 0, refusals INTEGER NOT NULL DEFAULT 0)`,
+      del_next_ms INTEGER, del_attempts INTEGER NOT NULL DEFAULT 0, refusals INTEGER NOT NULL DEFAULT 0, wf_refused INTEGER NOT NULL DEFAULT 0)`,
+    // The owner was told the GitHub App can't reach the repo (1), and not yet that it's back.
+    "ALTER TABLE settings ADD COLUMN gh_unreachable INTEGER NOT NULL DEFAULT 0",
     `CREATE TABLE gh_tokens (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, token TEXT NOT NULL, expires_ms INTEGER NOT NULL,
       workflows INTEGER NOT NULL DEFAULT 0, revoke INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER)`,
     // A live agent whose sandbox has the app's GitHub part (its layer keeps it), not nest's repos.
@@ -856,6 +858,10 @@ export class ProjectDO extends DurableObject<Env> {
     if (u.workers_edit_workflows !== undefined && u.workers_edit_workflows !== before.workers_edit_workflows) {
       // A refresh in flight minted with the setting as it was: the next one is a new one, after it.
       this.ghGen++;
+      // Off: every push token that had it is revoked at once, and the next start writes one without (even with
+      // its refresh lapsed); on: the next start writes one with it.
+      if (!u.workers_edit_workflows) this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE kind = 'push' AND workflows = 1 AND revoke = 0", Date.now());
+      this.sql.exec("UPDATE gh_access SET expires_ms = CASE WHEN workflows = 1 AND ? = 0 THEN NULL ELSE expires_ms END WHERE kind = 'push'", u.workers_edit_workflows ? 1 : 0);
       this.sql.exec("UPDATE gh_access SET next_ms = ? WHERE kind = 'push' AND gone != 1 AND next_ms IS NOT NULL", Date.now());
     }
     // Live workers too, both ways, through their sandbox's client layer (README.md#secrets).
@@ -2071,13 +2077,14 @@ export class ProjectDO extends DurableObject<Env> {
    * attempt's first try is owed to the agent's layer once it's live (`trackLayer`). The brief names the
    * variables.
    */
-  private async sandboxSpec(nest: Nest, role: SecretRole | "routine", key: string): Promise<StartSpec> {
+  private async sandboxSpec(nest: Nest, role: SecretRole | "routine", key: string, o: { ensure?: boolean } = {}): Promise<StartSpec> {
     const had = this.frozenSpec(key);
     let frozen: StartSpec;
     if (had) {
       frozen = had;
-      // Each try of a start frozen with the app's access holds its token: written again if it expires soon.
-      if (had.github) await this.ensureGithub(nest, kindOf(role as GithubRole));
+      // Each try of a start frozen with the app's access holds its token: written again if it expires soon. Not
+      // once its agent exists (a brief's retry): that agent's layer holds it.
+      if (had.github && o.ensure !== false) await this.ensureGithub(nest, kindOf(role as GithubRole));
     } else {
       // Inside the grant as it is now, or not at all: a binding nest would refuse fails the start (its read failing retries it).
       const grant = (await nest.self()).grant ?? {};
@@ -2221,10 +2228,10 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** A reviewer's sandbox spec (ReviewDO starts reviewers): as a worker's, without workflows. */
-  async reviewerSpec(key: string): Promise<StartSpec> {
+  async reviewerSpec(key: string, o: { ensure?: boolean } = {}): Promise<StartSpec> {
     const nest = nestFrom(this.env);
     if (!this.settings() || !nest) return { extras: {}, names: [], brief: "", rev: 0 };
-    return this.sandboxSpec(nest, "reviewer", key);
+    return this.sandboxSpec(nest, "reviewer", key, o);
   }
 
   /**
@@ -2255,6 +2262,17 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** The live workers whose push token may change workflows, as their layer was last applied (or their start made it). */
+  /**
+   * Why workers' pushes can't change workflows though Settings says they may (README.md#the-sandboxes-github-access):
+   * the App's installation doesn't grant `workflows: write`, so the project's push token was written without it.
+   * Null when the setting is off, or the token has it.
+   */
+  workflowsRefused(): string | null {
+    if (!this.settings()?.workers_edit_workflows) return null;
+    const r = this.ghRow("push");
+    return r && r.wf_refused === 1 && r.gone === 0 ? WORKFLOWS_REFUSED : null;
+  }
+
   workflowWorkers(): string[] {
     const live = new Set(this.liveAgents().filter((a) => a.role === "worker").map((a) => a.agent));
     // A worker on the app's own GitHub access pushes with the project's push token: it may while the token
@@ -3132,8 +3150,13 @@ export class ProjectDO extends DurableObject<Env> {
       this.sql.exec("DELETE FROM sandbox_ends WHERE agent = ?", agent);
     } catch (e) {
       const attempts = (r.attempts as number) + 1;
-      if (attempts >= SANDBOX_END_ATTEMPTS) console.error(`agent ${agent}'s sandbox wasn't destroyed (given up; nest's idle TTL ends it): ${message(e)}`);
-      this.sql.exec("UPDATE sandbox_ends SET attempts = ?, error = ?, next_ms = ? WHERE agent = ?", attempts, message(e), attempts >= SANDBOX_END_ATTEMPTS ? null : Date.now() + backoff(attempts), agent);
+      if (attempts >= SANDBOX_END_ATTEMPTS) {
+        // Given up: logged, and its row goes (nest's idle TTL ends the sandbox).
+        console.error(`agent ${agent}'s sandbox wasn't destroyed (given up; nest's idle TTL ends it): ${message(e)}`);
+        this.sql.exec("DELETE FROM sandbox_ends WHERE agent = ?", agent);
+        return;
+      }
+      this.sql.exec("UPDATE sandbox_ends SET attempts = ?, error = ?, next_ms = ? WHERE agent = ?", attempts, message(e), Date.now() + backoff(attempts), agent);
     }
   }
 
@@ -3157,13 +3180,23 @@ export class ProjectDO extends DurableObject<Env> {
   /** The token secret of `kind` holds a token with more than a few minutes left (written now if not), or this throws. */
   private async ensureGithub(nest: Nest, kind: GithubKind): Promise<void> {
     this.sql.exec("INSERT INTO gh_access (kind, nest_name, next_ms) VALUES (?, ?, ?) ON CONFLICT (kind) DO NOTHING", kind, githubSecretName(this.settings()!.id, kind), Date.now());
-    const r = this.ghRow(kind)!;
-    if (r.gone === 0 && r.expires_ms !== null && (r.expires_ms as number) - Date.now() > FRESH_ENOUGH_MS) return;
+    if (this.githubFresh(kind)) return;
     await this.refreshGithub(nest, kind);
     const after = this.ghRow(kind)!;
     if (after.gone !== 0 || after.expires_ms === null || (after.expires_ms as number) <= Date.now()) {
       throw new Error(`the project's GitHub ${kind} token couldn't be written: ${(after.error as string | null) ?? "unknown"}`);
     }
+  }
+
+  /**
+   * Whether the secret of `kind` holds a token a start may take: not gone, with more than FRESH_ENOUGH_MS left,
+   * and with `workflows: write` as the setting has it now (or the App can't grant it: `wf_refused`).
+   */
+  private githubFresh(kind: GithubKind): boolean {
+    const r = this.ghRow(kind);
+    if (!r || r.gone !== 0 || r.expires_ms === null || (r.expires_ms as number) - Date.now() <= FRESH_ENOUGH_MS) return false;
+    const want = kind === "push" && this.settings()!.workers_edit_workflows;
+    return (r.workflows === 1) === want || (want && r.wf_refused === 1);
   }
 
   /**
@@ -3205,7 +3238,10 @@ export class ProjectDO extends DurableObject<Env> {
     // Its delete still owed: written only after it, or the delete could land on the new one.
     if (!this.settingsRow() || this.ghRow(kind)?.gone === 1) return;
     const app = new AppTokens(this.env);
+    // A workflows toggle or a rebind after this point makes what it mints stale (`ghGen`).
+    const gen = this.ghGen;
     let seq: number | null = null;
+    let nestName: string | null = null;
     try {
       const id = this.settings()!.id;
       const b = await directory(this.env).binding(id);
@@ -3231,23 +3267,41 @@ export class ProjectDO extends DurableObject<Env> {
       }
       seq = this.sql.exec<{ seq: number }>("INSERT INTO gh_tokens (kind, token, expires_ms, workflows) VALUES (?, ?, ?, ?) RETURNING seq",
         kind, minted.token, minted.expires_ms, workflows ? 1 : 0).one().seq;
-      const row = this.ghRow(kind)!;
-      // Inside the grant's secrets limits, checked first where a new secret would take a place.
-      await this.secretRoom(nest, row.nest_name as string, minted.token, row.expires_ms !== null && row.gone === 0);
-      await nest.putSecret(row.nest_name as string, minted.token, `the project's GitHub ${kind} token for ${b.repo}`, new Date(minted.expires_ms).toISOString());
-      // The project removed while it was written: deleted again now (the teardown's delete may have gone first).
-      if (!this.settingsRow()) {
-        this.githubGone(kind, null, "the project was removed");
-        await this.githubCleanup(nest);
-        await this.armTemplateDeletes();
+      // Stale before it's written (a toggle, a rebind: their own refresh runs after this one): never written.
+      if (this.ghGen !== gen) {
+        this.githubStale(kind, seq);
         return;
       }
-      // The setting changed while this one was written: it holds the setting as it was, so it's written again now.
-      const stale = (kind === "push" && this.settings()!.workers_edit_workflows) !== want;
+      const row = this.ghRow(kind)!;
+      nestName = row.nest_name as string;
+      // Inside the grant's secrets limits, checked first where a new secret would take a place.
+      await this.secretRoom(nest, nestName, minted.token, row.expires_ms !== null && row.gone === 0);
+      await nest.putSecret(nestName, minted.token, `the project's GitHub ${kind} token for ${b.repo}`, new Date(minted.expires_ms).toISOString());
+      // The project removed while it was written: its secret deleted again now, whatever is left of its rows.
+      if (!this.settingsRow()) {
+        await this.githubOrphan(nest, kind, nestName, seq);
+        return;
+      }
+      // Stale once written: revoked (the secret holds a dead token until the refresh due now writes the new one).
+      if (this.ghGen !== gen) {
+        this.githubStale(kind, seq);
+        return;
+      }
+      const wasGone = row.gone === 2;
       this.sql.exec(
-        "UPDATE gh_access SET expires_ms = ?, workflows = ?, next_ms = ?, attempts = 0, refusals = 0, error = ?, gone = 0, del_next_ms = NULL WHERE kind = ?",
-        minted.expires_ms, workflows ? 1 : 0, stale ? Date.now() : Math.max(minted.expires_ms - REFRESH_BEFORE_MS, Date.now() + MIN_REFRESH_MS), note, kind,
+        "UPDATE gh_access SET expires_ms = ?, workflows = ?, wf_refused = ?, next_ms = ?, attempts = 0, refusals = 0, error = ?, gone = 0, del_next_ms = NULL WHERE kind = ?",
+        minted.expires_ms, workflows ? 1 : 0, note ? 1 : 0, Math.max(minted.expires_ms - REFRESH_BEFORE_MS, Date.now() + MIN_REFRESH_MS), note, kind,
       );
+      if (note && row.wf_refused !== 1) {
+        this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(),
+          "The GitHub App's installation doesn't grant workflows: write, so workers' pushes can't change .github/workflows/. Accept that permission in the App's installation settings on GitHub; the app asks for it again at the next token.");
+      }
+      // Back in reach after the owner was told it wasn't: told once.
+      if (wasGone || this.settingsRow()!.gh_unreachable === 1) {
+        if (this.sql.exec("UPDATE settings SET gh_unreachable = 0 WHERE gh_unreachable = 1").rowsWritten) {
+          this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `The GitHub App reaches ${b.repo} again: agents' GitHub tokens are back, and new agents start as usual.`);
+        }
+      }
       // A push token without workflows replaced one with them: theirs are revoked, not left valid until they expire.
       if (!workflows) this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE kind = ? AND workflows = 1 AND seq != ? AND revoke = 0", Date.now(), kind, seq);
     } catch (e) {
@@ -3257,10 +3311,15 @@ export class ProjectDO extends DurableObject<Env> {
       const row = this.ghRow(kind)!;
       if (e instanceof GitHubError && e.status === 422 && /permissions requested|not granted/i.test(e.message)) {
         // The installation lacks a permission the token needs: the owner's to grant; the token written last stays.
-        const told = typeof row.error === "string" && /lacks a permission/.test(row.error);
-        const why = `the GitHub App's installation lacks a permission the ${kind} token needs (${Object.keys(githubPermissions(kind, false)).join(", ")}): ${message(e)}`;
+        const told = typeof row.error === "string" && row.error.startsWith(PERMISSION_ERROR);
+        const perms = Object.entries(githubPermissions(kind, false)).map(([k, v]) => `${k}: ${v}`).join(", ");
+        const whose = kind === "push" ? "the workers' push token" : "the read token (the manager's, reviewers' and routine runs')";
+        const why = `${PERMISSION_ERROR} ${whose} needs (${perms}; GitHub doesn't say which is missing)`;
         this.sql.exec("UPDATE gh_access SET error = ?, next_ms = ? WHERE kind = ?", why, Date.now() + GONE_RECHECK_MS, kind);
-        if (!told) this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `${why[0]!.toUpperCase()}${why.slice(1)}. Agents keep the token written last until it expires; it's tried again every ${GONE_RECHECK_MS / 60_000} minutes.`);
+        if (!told) {
+          this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(),
+            `${why}. Accept the App's requested permissions in its installation settings on GitHub. Agents keep their current token until it expires; the app tries again every ${GONE_RECHECK_MS / 60_000} minutes.`);
+        }
         return;
       }
       if (e instanceof GitHubError && (e.status === 404 || e.status === 422)) {
@@ -3270,11 +3329,12 @@ export class ProjectDO extends DurableObject<Env> {
           this.sql.exec("UPDATE gh_access SET refusals = ?, error = ?, next_ms = ? WHERE kind = ?", refusals, message(e), Date.now() + backoff(2), kind);
           return;
         }
-        const was = row.gone;
         this.githubGone(kind, Date.now() + GONE_RECHECK_MS, message(e));
-        if (was === 0) {
+        // One message for both tokens, until it's back.
+        if (this.sql.exec("UPDATE settings SET gh_unreachable = 1 WHERE gh_unreachable = 0").rowsWritten) {
+          const repo = (await directory(this.env).binding(this.settings()!.id).catch(() => null))?.repo ?? "the repo";
           this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(),
-            `The GitHub App doesn't reach this project's repo now, so its agents' GitHub ${kind} access was taken away: ${message(e)}. It's looked for again every ${GONE_RECHECK_MS / 60_000} minutes.`);
+            `The GitHub App can't reach ${repo} (${message(e).replace(/ \(asked for [^)]*\)$/, "")}), so agents' GitHub tokens were revoked and new agents wait to start. Install the App on the repo, or give its installation access to it. The app checks again every ${GONE_RECHECK_MS / 60_000} minutes and will tell you when it's back.`);
         }
         return;
       }
@@ -3292,7 +3352,36 @@ export class ProjectDO extends DurableObject<Env> {
     this.ghGen++;
     this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE revoke = 0", Date.now());
     this.sql.exec("UPDATE gh_access SET next_ms = ?, expires_ms = NULL WHERE gone != 1", Date.now());
+    // The guards follow the repo's name now, in every live sandbox's layer.
+    await this.oweLayers(LAYER_ROLES);
     await this.arm();
+  }
+
+  /** A token minted by a refresh a toggle or a rebind overtook: revoked, and the next refresh due now. */
+  private githubStale(kind: GithubKind, seq: number): void {
+    this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE seq = ?", Date.now(), seq);
+    this.sql.exec("UPDATE gh_access SET next_ms = ? WHERE kind = ? AND gone != 1 AND next_ms IS NOT NULL", Date.now(), kind);
+  }
+
+  /**
+   * A secret written after the project went (its teardown's delete may have run first, its rows gone with it):
+   * deleted now; failing that, a row owing its delete is made again and the alarm armed for it.
+   */
+  private async githubOrphan(nest: Nest, kind: GithubKind, nestName: string, seq: number): Promise<void> {
+    this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE seq = ?", Date.now(), seq);
+    try {
+      await nest.deleteSecret(nestName);
+    } catch (e) {
+      if (!(e instanceof NestError && e.status === 404)) {
+        this.sql.exec(
+          `INSERT INTO gh_access (kind, nest_name, gone, del_next_ms) VALUES (?, ?, 1, ?)
+            ON CONFLICT (kind) DO UPDATE SET gone = 1, del_next_ms = excluded.del_next_ms, next_ms = NULL, expires_ms = NULL`,
+          kind, nestName, Date.now() + backoff(1),
+        );
+      }
+    }
+    await this.githubCleanup(nest);
+    await this.armTemplateDeletes();
   }
 
   /**
@@ -4699,7 +4788,7 @@ export class ProjectDO extends DurableObject<Env> {
       const key = `${s.id}/manager/${n}`;
       const frozen = await this.frozenEgress(nest, key, "manager");
       // Its bindings, env and workflows, frozen with the same key (README.md#secrets).
-      const spec = await this.sandboxSpec(nest, "manager", key);
+      const spec = await this.sandboxSpec(nest, "manager", key, { ensure: !s.manager });
       const from = s.manager ? null : await this.templateFor(nest, "manager", spec);
       const repo = await this.repo();
       const agent = s.manager ?? (await nest.startAgent(from!, labels, spawnOverrides(spec, repo, false), key, { ...startEgress(frozen.egress, spec), ...spec.extras }));
@@ -5080,6 +5169,10 @@ const MIN_REFRESH_MS = 60_000;
 const GONE_RECHECK_MS = 30 * 60_000;
 /** GitHub refusing the repo this many times running makes it gone for the app (its secrets deleted, tokens revoked). */
 const GONE_AFTER = 2;
+/** How a missing installation permission is told (and recognised, so it's told once). */
+const PERMISSION_ERROR = "The GitHub App's installation doesn't grant everything";
+/** Settings' reason, under the toggle and beside each live worker, when the App can't grant `workflows: write`. */
+export const WORKFLOWS_REFUSED = "the GitHub App's installation doesn't grant workflows: write";
 /** When an abandoned start attempt is looked for again: past nest's 60 s idempotency lease, with room. */
 const ABANDON_RECHECK_MS = 2 * 60_000;
 /** How often the secrets' upkeep (the grant read, the sweep) runs while the project has secrets. */
