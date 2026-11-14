@@ -30,7 +30,7 @@ import { GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING, githu
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
 import { githubEnvConflict, githubEnvRefusal, isGithubEnvName, slotEnv } from "../lib/sandbox-env";
-import { freshInjectedAny, injectedAnyConflict, usesAt } from "../lib/injected-any";
+import { basicAtFailsOpen, freshInjectedAny, injectedAnyConflict, usesAt } from "../lib/injected-any";
 import { CLIENT_GUARD_PREFIX, type ClientGuard, distinctGuards, type HeldGuard, layerOverLimit, outsideOperatorRouting, sandboxGuardsOverLimit, wireGuard } from "../lib/client-guards";
 import type { MintedInjection, SecretsChangedAnswer } from "./broker";
 import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
@@ -1303,6 +1303,7 @@ export class SandboxDO extends DurableObject<Env> {
     // A guard newly naming `injected: "*"` needs every host to read it as any binding; one already stored
     // stays writable. Before the checks below, so nothing they read goes stale across the await.
     await this.requireInjectedAny(info.cell, freshInjectedAny(layer.guards, this.operatorLayer().guards));
+    await this.requireBasicUser(info.cell, () => this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos), read_repos: canonicalRepos(layer.read_repos) }));
     this.refuseGithubEnv(this.kernelGithub({ layer }), ...this.envs());
     this.put(LAYER_KEY, { ...layer, repos: canonicalRepos(layer.repos), read_repos: canonicalRepos(layer.read_repos) });
     await this.policyChanged(true);
@@ -1608,6 +1609,15 @@ export class SandboxDO extends DurableObject<Env> {
       if (lease.gone(this.info_().state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${this.info_().state}`, 409);
     }
     if (extra.guards?.length) this.checkGuardLimit(undefined, { id: agent, guards: extra.guards });
+    // Its bindings or guards newly putting `at` beside a Basic binding: every host must write its username.
+    if (extra.inject?.length || counted.length) {
+      await this.requireBasicUser(cur.cell, () => {
+        this.setAgentExtras(agent, extra);
+        const i = this.info_();
+        if (!i.attached.includes(agent)) this.put("info", { ...i, attached: [...i.attached, agent] });
+      });
+      if (lease.gone(this.info_().state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${this.info_().state}`, 409);
+    }
     // Its env and the sandbox's beside the GitHub access both bring, before anything is recorded.
     this.refuseGithubEnv(this.kernelGithub({ except: agent }) || !!repos?.length || !!readRepos?.length || !!extra.workflows,
       ...this.envs(agent), extra.env);
@@ -1901,6 +1911,41 @@ export class SandboxDO extends DurableObject<Env> {
     if (old.length) throw injectedAnyConflict(cell, fresh.map((g) => g.name), old);
   }
 
+  /**
+   * Whether its effective policy has `at` beside a Basic binding (`basicAtFailsOpen`): a nest-proxy without
+   * `guard_basic_user` would take a username the sandbox chose as nest's.
+   */
+  private basicOpen(): boolean {
+    const p = this.sourcedPolicy();
+    return basicAtFailsOpen(p.guards ?? [], p.inject ?? []);
+  }
+
+  /**
+   * Refuse (409) a write that newly gives the sandbox `at` beside a Basic binding while any sandbox host of its
+   * cell lacks `guard_basic_user` (docs/sandbox/networking/egress/policy/#any-injected-credential). Placement
+   * keeps such a sandbox off those hosts only when it's placed; a live one may already be on one. `change`
+   * stores the write as it would be: it's applied, judged and undone in one synchronous transaction.
+   */
+  private async requireBasicUser(cell: string, change: () => void): Promise<void> {
+    if (this.basicOpen()) return;
+    let after = false;
+    const undo = new Error("undo");
+    try {
+      this.ctx.storage.transactionSync(() => {
+        change();
+        after = this.basicOpen();
+        throw undo;
+      });
+    } catch (e) {
+      if (e !== undo) throw e;
+    }
+    if (!after) return;
+    const old = await this.fleet(cell).hostsWithoutBasicUser();
+    if (old.length) {
+      throw new NestError(ErrorCodes.CONFLICT, `a binding with a Basic password beside a guard using "at" needs every sandbox host of cell ${cell} to write a binding's Basic username itself; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
+    }
+  }
+
   /** Refuse (400) a layer or an attach that would give the sandbox more client guards than it applies. */
   private checkGuardLimit(own?: readonly ClientGuard[], agent?: { id: string; guards: readonly HeldGuard[] }): void {
     const over = sandboxGuardsOverLimit(this.clientGuards(own, agent));
@@ -1983,6 +2028,14 @@ export class SandboxDO extends DurableObject<Env> {
     // Likewise a guard newly naming `injected: "*"` needs every host to read it as any binding.
     const freshAny = freshInjectedAny(guards, this.get<ClientGuard[]>(OWN_GUARDS) ?? []);
     await this.requireInjectedAny(info.cell, freshAny);
+    // And `at` newly beside a Basic binding, every host to write its username (a binding or a guard of this write's).
+    await this.requireBasicUser(info.cell, () => {
+      const mine = layer.inject.filter((b) => b.client === info.client);
+      if (mine.length) this.put(OWN_INJECT, mine);
+      else this.del(OWN_INJECT);
+      if (guards.length) this.put(OWN_GUARDS, guards);
+      else this.del(OWN_GUARDS);
+    });
     if (info.client) await this.readEgressCeiling();
     const now = this.info_();
     if (lease.gone(now.state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${now.state}`, 409);

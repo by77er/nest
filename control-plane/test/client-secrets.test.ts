@@ -28,6 +28,8 @@ describe("client injection bindings (pure)", () => {
     const held = holdInjections("cli_01JTESTCLIENT", [
       stripe,
       { name: "search", secret: "search-key", hosts: ["*.example.com"], wildcard: true, locations: [{ type: "header", name: "X-Api-Key" }, { type: "authorization_basic_password" }] },
+      // A Basic username the binding names: the proxy writes it, so the header is written whole.
+      { name: "git", secret: "git-key", hosts: ["git.example.org"], locations: [{ type: "authorization_basic_password", username: "x-access-token" }] },
     ]);
     expect([fixture.inject[0], ...held.map(wireBinding)]).toEqual(fixture.inject);
   });

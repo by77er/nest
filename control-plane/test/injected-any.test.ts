@@ -330,3 +330,31 @@ describe("a Basic username of the binding's", () => {
     expect(await runInDurableObject(fleet, (_i, st) => st.storage.sql.exec("SELECT host, guard_basic_user AS b FROM hosts ORDER BY b").toArray().map((r) => r.b))).toEqual([0, 1]);
   });
 });
+
+describe("a Basic binding beside at, on a live sandbox", () => {
+  it("is refused (409) while a host of the cell keeps the request's Basic username, at a client's layer write, an attach and the operator's layer; a Bearer one isn't", async () => {
+    const c = await newClient();
+    const current = await connectHost(c.cell);
+    // The floor (`at`) written while every host writes the username itself; then a sandbox with no binding.
+    await adminJson(base(c.cell), { method: "PUT", body: { allow: [], guards: [FLOOR] } });
+    const sbx = (await as(c.token, "/v1/sandboxes", { body: { cell: c.cell } })).body.sandbox as string;
+    await nextCommands(current.ws, (x) => x.type === "sandbox_create");
+    await connectHost(c.cell, "sandbox", { guard_basic_user: false });
+    const binding = (type: "authorization_basic_password" | "authorization_bearer") =>
+      ({ name: "gh", secret: "gh-push", hosts: ["api.example.com"], locations: [type === "authorization_basic_password" ? { type, username: "x-access-token" } : { type }] });
+    // A client's layer.
+    const r = await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [binding("authorization_basic_password")] } });
+    expect(r.status, JSON.stringify(r.body)).toBe(409);
+    expect(r.body.error.message).toContain("Basic username itself");
+    expect((await as(c.token, `/v1/sandboxes/${sbx}/client-policy`)).body.inject).toEqual([]);
+    expect((await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [binding("authorization_bearer")] } })).status).toBe(200);
+    // An attach bringing one.
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(sbx));
+    const held = { ...binding("authorization_basic_password"), name: "gh2", client: c.id, placeholder: `nest-ph.${c.id}.gh2.` };
+    await expect(Promise.resolve().then(() => stub.attach("agt_basic", undefined, [], [], { inject: [held] as never }))).rejects.toThrow(/Basic username itself/);
+    expect((await stub.info()).attached).not.toContain("agt_basic");
+    // The operator's layer.
+    const op = await admin(`/v1/sandboxes/${sbx}/policy`, { method: "PUT", body: { inject: [{ name: "pat", hosts: ["api.example.com"], placeholder: "nest-ph-pat", locations: [{ type: "authorization_basic_password" }] }] } });
+    expect(op.status).toBe(409);
+  });
+});

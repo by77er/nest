@@ -3236,6 +3236,15 @@ export class FleetDO extends DurableObject<Env> {
     return this.withoutInjectedAny(at);
   }
 
+  /**
+   * The cell's sandbox hosts (any not dead) whose nest-proxy takes any Basic substitution as whole, keeping the
+   * request's username (no `guard_basic_user`): a sandbox whose policy newly has `at` beside a Basic binding is
+   * refused while there is one (docs/sandbox/networking/egress/policy/#any-injected-credential).
+   */
+  async hostsWithoutBasicUser(): Promise<string[]> {
+    return this.hostsBy({ role: SANDBOX_ROLE, status: ["active", "draining", "expired", "stonith_pending"], where: "guard_basic_user = 0" }).map((h) => h.host);
+  }
+
   /** `at`: also those whose nest-proxy takes any Basic substitution as whole (no `guard_basic_user`). */
   private withoutInjectedAny(at = false): string[] {
     const where = at ? "(guard_injected_any = 0 OR guard_basic_user = 0)" : "guard_injected_any = 0";
