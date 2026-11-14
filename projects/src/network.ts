@@ -4,6 +4,7 @@
 // sandbox's whole client layer (`PUT /v1/sandboxes/<id>/client-policy` replaces it whole) from every
 // page that feeds it. Pure, so the API, ProjectDO and the page share them.
 
+import type { Guard } from "./github-access";
 import { isAppBinding, isAppEnv } from "./secrets";
 
 export const NETWORK_ROLES = ["worker", "manager"] as const;
@@ -82,8 +83,8 @@ export function normalizeRules(rules: readonly EgressRule[]): EgressRule[] {
   });
 }
 
-/** Where a binding's credential goes (nest's `ClientInjectionLocation`). */
-export type BindingLocation = { type: "authorization_bearer" } | { type: "authorization_basic_password" } | { type: "header"; name: string };
+/** Where a binding's credential goes (nest's `ClientInjectionLocation`; a Basic `username` nest-proxy writes itself, nest #273). */
+export type BindingLocation = { type: "authorization_bearer" } | { type: "authorization_basic_password"; username?: string } | { type: "header"; name: string };
 
 /** A client's injection binding as `PUT …/client-policy` takes it (nest's `ClientInjection`, a strict object). */
 export interface Binding {
@@ -118,6 +119,8 @@ export interface ClientLayer {
   inject: Binding[];
   env: Record<string, string>;
   github_push?: GithubPush;
+  /** Its request guards (nest replaces them with the layer: a write without them drops them). */
+  guards?: Guard[];
 }
 
 /** A sandbox's client layer as `GET …/client-policy` answers it (`github_push`: absent from an older control plane). */
@@ -126,6 +129,8 @@ export interface HeldClientLayer {
   inject: HeldBinding[];
   env: Record<string, string>;
   github_push?: GithubPush;
+  /** As written (without nest's `client:` prefix); absent from a control plane without them. */
+  guards?: Guard[];
 }
 
 /** A held binding back in the PUT's shape: nest's strict schema refuses `client` and `placeholder`. */
@@ -155,6 +160,8 @@ export interface GithubFeed {
   inject: Binding | null;
   env: Record<string, string> | null;
   egress: EgressRule[];
+  /** The app's guards for the repo: the sandbox's for as long as it lives, whatever the grant (they only refuse). */
+  guards: Guard[];
 }
 
 /**
@@ -168,11 +175,14 @@ export function clientLayerFor(rules: RoleRules, role: LayerRole, feeds: LayerFe
   const inject = (feeds.inject ?? current?.inject ?? []).map(asBinding);
   const env = feeds.env ?? current?.env ?? {};
   const gh = feeds.github;
+  // Guards as the sandbox has them (nest replaces them with the layer): never dropped by a page's change.
+  const kept = current?.guards?.length ? { guards: current.guards.map((g) => structuredClone(g)) } : {};
   if (!gh) {
     return {
       egress: { allow }, inject, env,
       // Only where nest answers it (an older control plane refuses the key): the feed's, else as it is.
       ...(current?.github_push ? { github_push: { ...(feeds.github_push ?? current.github_push) } } : {}),
+      ...kept,
     };
   }
   // The app's GitHub part, in place of whatever of it the sandbox has now: so neither page's change drops it.
@@ -182,6 +192,8 @@ export function clientLayerFor(rules: RoleRules, role: LayerRole, feeds: LayerFe
     env: { ...Object.fromEntries(Object.entries(env).filter(([k]) => !isAppEnv(k))), ...(gh.env ?? {}) },
     // Never nest's push token here: it would make nest inject its own, and refuse the app's GH_TOKEN.
     ...(current?.github_push ? { github_push: { workflows: false } } : {}),
+    // The app's guards for the repo (a rename's new name, say), with any other the sandbox has.
+    guards: [...gh.guards, ...(current?.guards ?? []).filter((g) => !gh.guards.some((x) => x.name === g.name))].map((g) => structuredClone(g)),
   };
 }
 
@@ -268,5 +280,7 @@ export function shrinkLayer(current: HeldClientLayer | null, desired: ClientLaye
     desired.env[k] === v && (!v.includes("nest-ph.") || inject.some((x) => v.endsWith(`.${x.name}.`)))));
   // An opt-in stays only if both have it: turning it off is a removal, and goes through.
   const push = current?.github_push ? { github_push: { workflows: current.github_push.workflows && desired.github_push?.workflows === true } } : {};
-  return { egress: { allow }, inject, env, ...push };
+  // Guards only refuse: what applies the removals keeps every one the sandbox has (so it adds none, and goes through).
+  const guards = current?.guards?.length ? { guards: current.guards.map((g) => structuredClone(g)) } : {};
+  return { egress: { allow }, inject, env, ...push, ...guards };
 }

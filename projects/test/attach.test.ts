@@ -71,7 +71,10 @@ describe("attaching a repo", () => {
       { installation: GH_INSTALLATION_ID, repositories: [name], permissions: { administration: "write", metadata: "read" } },
       { installation: GH_INSTALLATION_ID, repositories: [name], permissions: { metadata: "read" } },
     ]);
-    expect(mints.filter((m) => "contents" in m.permissions)).toEqual([{ installation: GH_INSTALLATION_ID, repositories: [name], permissions: { contents: "read", metadata: "read" } }]);
+    // By the bound repo's id (README.md#the-sandboxes-github-access).
+    expect(gh.mints().filter((m) => m.repository_ids?.[0] === gh.repo(repo).id)).toEqual([
+      { installation: GH_INSTALLATION_ID, repositories: undefined, repository_ids: [gh.repo(repo).id], permissions: { contents: "read", metadata: "read" } },
+    ]);
     const used = gh.calls.filter((c) => c.path.startsWith(`/repos/${repo}/branches/`));
     expect(used.length).toBeGreaterThan(0);
     for (const c of used) expect(c.permissions).toEqual({ administration: "write", metadata: "read" });

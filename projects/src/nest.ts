@@ -22,14 +22,19 @@ export class NestError extends Error {
   }
   /**
    * nest refused request guards (409) because a sandbox host of the cell doesn't apply them yet
-   * (docs/control-plane/api/clients/#request-guards: `guard_bounds`, and `guard_injected_any` for `at`): it
-   * goes through once the host is replaced, so the start waits and tries again, never dropping the guards.
-   * Told apart only by nest's words ("needs every sandbox host of cell …"): nest gives it no code of its own.
+   * (docs/control-plane/api/clients/#request-guards: `guard_bounds`; `guard_injected_any` and
+   * `guard_basic_user` for `*` and `at`): it goes through once the host is replaced, so the start waits and
+   * tries again, never dropping the guards. nest's own code, `hosts_not_ready` (nest #274); a nest from
+   * before it said `conflict`, told apart by its words ("needs every sandbox host of cell …"): that fallback
+   * goes a release after #274.
    */
   get hostsNotReady(): boolean {
-    return this.status === 409 && this.code === "conflict" && /\bneeds? every sandbox host of cell\b/.test(this.message);
+    return this.status === 409 && (this.code === "hosts_not_ready" || (this.code === "conflict" && HOSTS_WORDS.test(this.message)));
   }
 }
+
+/** nest's words for that refusal before its code (`SandboxDO.requireGuardBounds`, `injectedAnyConflict`). */
+export const HOSTS_WORDS = /\bneeds? every sandbox host of cell\b/;
 
 /** A start waiting on nest's hosts (`hostsNotReady`), as its error says it. */
 export const HOSTS_WAIT = "waiting for every sandbox host of nest's cell to apply request guards (retried until they do)";
@@ -96,9 +101,11 @@ const ASK_PAGES = 10;
  */
 export interface SandboxExtras {
   egress?: { allow: { host: string; ports?: number[] }[] };
-  inject?: { name: string; secret: string; hosts: string[]; locations: ({ type: "authorization_bearer" } | { type: "authorization_basic_password" } | { type: "header"; name: string })[]; wildcard?: boolean }[];
+  inject?: { name: string; secret: string; hosts: string[]; locations: ({ type: "authorization_bearer" } | { type: "authorization_basic_password"; username?: string } | { type: "header"; name: string })[]; wildcard?: boolean }[];
   env?: Record<string, string>;
   github_push?: { workflows: boolean };
+  /** Request guards of the sandbox's own (docs/control-plane/api/clients/#request-guards): they hold for as long as it lives. */
+  guards?: Guard[];
 }
 
 /** A sandbox's client layer (docs/control-plane/api/clients/#the-client-layer), as `GET …/client-policy` answers it. */
@@ -112,8 +119,7 @@ export interface SpawnOverrides {
   /** nest's own repos (its kernel token): only for a start frozen before the app's own GitHub access (README.md#repo-authority). */
   repos?: string[];
   read_repos?: string[];
-  /** Request guards added to the template's (docs/control-plane/api/clients/#request-guards). */
-  guards?: Guard[];
+
   ephemeral?: true;
   sandbox_idle_ttl_ms?: number;
 }

@@ -12,15 +12,16 @@ import {
   CREDENTIAL_HELPER, githubAccess, githubGrantMissing, githubGuards, githubPermissions, githubSecretName, REFRESH_BEFORE_MS, spawnOverrides, startEgress,
 } from "../src/github-access";
 import { clientLayerFor, NO_RULES, shrinkLayer } from "../src/network";
-import { HOSTS_WAIT } from "../src/nest";
+import { HOSTS_WAIT, HOSTS_WORDS, NestError, nestFrom } from "../src/nest";
 import { secretFeeds, secretProblems } from "../src/secrets";
-import { AccessTeam, api, CLIENT, deliverGithub, eventually, FakeNest, GH_INSTALLATION_ID, installFetch, prEvent } from "./fake-nest";
+import { AccessTeam, api, CLIENT, deliver, deliverGithub, eventually, FakeNest, GH_INSTALLATION_ID, installFetch, prEvent } from "./fake-nest";
 
 describe("the access (pure)", () => {
   it("a worker's push access: its binding on both GitHub hosts, GH_TOKEN and git's helper, the GitHub hosts within the grant", () => {
     const a = githubAccess({ client: "cli_x", project: "prj_1", repo: "Owner/Repo", role: "worker", egressHosts: ["api.github.com", "*.githubusercontent.com", "npmjs.org"] });
     expect(a.kind).toBe("push");
-    expect(a.inject).toEqual({ name: "gh_push", secret: "gh-push-prj_1", hosts: ["github.com", "api.github.com"], locations: [{ type: "authorization_bearer" }, { type: "authorization_basic_password" }] });
+    // The Basic username nest-proxy writes itself (nest #273): only then is the field nest's whole for the guards' `at`.
+    expect(a.inject).toEqual({ name: "gh_push", secret: "gh-push-prj_1", hosts: ["github.com", "api.github.com"], locations: [{ type: "authorization_bearer" }, { type: "authorization_basic_password", username: "x-access-token" }] });
     expect(a.env).toEqual({
       GH_TOKEN: "nest-ph.cli_x.gh_push.",
       GIT_CONFIG_COUNT: "2",
@@ -108,14 +109,28 @@ describe("the access (pure)", () => {
     expect(g.map((x) => x.name)).toEqual(["github-push", "github-write", "github-api-write", "gist-write", "githubusercontent-write"]);
   });
 
-  it("a start frozen with the access sends its guards and adds the GitHub hosts no rule names; one frozen before it, nest's repos", () => {
+  it("a start frozen with the access narrows nest's repos to none (its guards are the sandbox's) and adds the GitHub hosts no rule names; one frozen before it, nest's repos", () => {
     const spec = { github: { egress: [{ host: "github.com" }, { host: "api.github.com" }], guards: githubGuards("o/r", "read") } };
-    // With nest's repos narrowed to none, whatever a shared template not synced since still names.
-    expect(spawnOverrides(spec, "o/r", false)).toEqual({ guards: spec.github.guards, repos: [], read_repos: [] });
+    // nest's repos narrowed to none, whatever a shared template not synced since still names.
+    expect(spawnOverrides(spec, "o/r", false)).toEqual({ repos: [], read_repos: [] });
     expect(spawnOverrides({}, "o/r", true)).toEqual({ repos: ["o/r"] });
     expect(spawnOverrides({}, "o/r", false)).toEqual({ read_repos: ["o/r"] });
     expect(startEgress([{ host: "github.com", ports: [443] }, { host: "pypi.org" }], spec)).toEqual({ egress: { allow: [{ host: "github.com", ports: [443] }, { host: "pypi.org" }, { host: "api.github.com" }] } });
     expect(startEgress([], {})).toEqual({});
+  });
+
+  it("tells nest's refusal while hosts don't apply guards by its code, or by the words both of nest's refusals use (control-plane's own source)", () => {
+    const src = import.meta.glob(["../../control-plane/src/do/sandbox.ts", "../../control-plane/src/lib/injected-any.ts"], { eager: true, query: "?raw", import: "default" }) as Record<string, string>;
+    const sentences = Object.values(src).flatMap((t) => t.split("\n").filter((l) => l.includes("every sandbox host of cell") && /NestError|`/.test(l)));
+    // requireGuardBounds' and injectedAnyConflict's.
+    expect(sentences.length).toBeGreaterThanOrEqual(2);
+    for (const l of sentences) expect(HOSTS_WORDS.test(l), l).toBe(true);
+    const err = (code: string, msg: string) => new NestError(409, code, msg, false);
+    expect(err("hosts_not_ready", "anything").hostsNotReady).toBe(true);
+    expect(err("conflict", "request guards need every sandbox host of cell use1 to bound guarded requests").hostsNotReady).toBe(true);
+    expect(err("conflict", "this Idempotency-Key was used for a different request").hostsNotReady).toBe(false);
+    expect(err("conflict", "this Idempotency-Key was used for a different request").permanent).toBe(true);
+    expect(err("hosts_not_ready", "x").permanent).toBe(false);
   });
 
   it("names what the grant lacks for it, or nothing", () => {
@@ -128,8 +143,8 @@ describe("the access (pure)", () => {
 
   it("the owner's secrets can't take its binding names or variables, and one saved under such a name is never bound", () => {
     const base = { hosts: ["api.example.com"], locations: [{ type: "authorization_bearer" as const }], roles: ["worker" as const] };
-    expect(secretProblems({ ...base, name: "gh_push", env: "X" }, null).name).toMatch(/app's own GitHub binding/);
-    expect(secretProblems({ ...base, name: "gh_read", env: "X" }, null).name).toMatch(/app's own GitHub binding/);
+    expect(secretProblems({ ...base, name: "gh_push", env: "X" }, null).name).toBe("gh_push is reserved for the app's own GitHub token: choose another name");
+    expect(secretProblems({ ...base, name: "gh_read", env: "X" }, null).name).toBe("gh_read is reserved for the app's own GitHub token: choose another name");
     for (const v of ["GH_TOKEN", "GIT_CONFIG_COUNT", "GIT_CONFIG_VALUE_1", "GIT_CONFIG_PARAMETERS", "GIT_ASKPASS"]) {
       expect(secretProblems({ ...base, name: "x", env: v }, null).env, v).toMatch(/GitHub token/);
     }
@@ -138,31 +153,40 @@ describe("the access (pure)", () => {
   });
 
   it("a live layer keeps the GitHub part beside the owner's secrets and rules, never nest's push opt-in; outside the grant, it goes", () => {
+    const other = { name: "mine", hosts: ["x.example.com"], scope: [{ methods: ["DELETE"] }] };
     const gh = githubAccess({ client: "cli_x", project: "prj_1", repo: "o/r", role: "worker", egressHosts: ["github.com", "api.github.com"] });
     const own = { name: "npm_token", secret: "prj_1-npm_token-aaaaaa", hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" as const }] };
     const held = {
       egress: { allow: [{ host: "pypi.org" }, { host: "github.com" }, { host: "api.github.com" }] },
       inject: [{ ...own, client: "cli_x", placeholder: "nest-ph.cli_x.npm_token." }, { ...gh.inject, client: "cli_x", placeholder: gh.env.GH_TOKEN! }],
-      env: { NPM_TOKEN: "nest-ph.cli_x.npm_token.", ...gh.env }, github_push: { workflows: false },
+      env: { NPM_TOKEN: "nest-ph.cli_x.npm_token.", ...gh.env }, github_push: { workflows: false }, guards: [githubGuards("o/old-name", "push")[0]!, other],
     };
     const rules = { worker: [{ host: "nodejs.org" }, { host: "github.com", ports: [443] }], manager: [] };
-    const feed = { inject: gh.inject, env: gh.env, egress: gh.egress };
+    const feed = { inject: gh.inject, env: gh.env, egress: gh.egress, guards: gh.guards };
     // The Secrets page's feed (its binding dropped) and the role's rules: the GitHub part stays, once each.
     expect(clientLayerFor(rules, "worker", { inject: [], env: {}, github_push: { workflows: true }, github: feed }, held)).toEqual({
       egress: { allow: [{ host: "nodejs.org" }, { host: "github.com", ports: [443] }, { host: "api.github.com" }] },
       inject: [gh.inject], env: gh.env, github_push: { workflows: false },
+      // The app's guards for the repo's name now in place of the old ones of those names, any other kept.
+      guards: [...gh.guards, other],
     });
     // No feed of the page's: the owner's kept as held, the GitHub part as fed.
     expect(clientLayerFor(NO_RULES, "worker", { github: feed }, held)).toEqual({
       egress: { allow: gh.egress }, inject: [own, gh.inject], env: { NPM_TOKEN: "nest-ph.cli_x.npm_token.", ...gh.env }, github_push: { workflows: false },
+      guards: [...gh.guards, other],
     });
     // Outside the grant now: the binding and its variables go (nest refuses a placeholder no binding has).
-    const out = clientLayerFor(NO_RULES, "worker", { github: { inject: null, env: null, egress: [] } }, held);
+    const out = clientLayerFor(NO_RULES, "worker", { github: { inject: null, env: null, egress: [], guards: gh.guards } }, held);
     expect(out.inject).toEqual([own]);
     expect(out.env).toEqual({ NPM_TOKEN: "nest-ph.cli_x.npm_token." });
+    // ...but never its guards: they only refuse, and hold while the sandbox lives.
+    expect(out.guards).toEqual([...gh.guards, other]);
+    // A sandbox on nest's repos (no GitHub feed): a page's change keeps whatever guards it has.
+    expect(clientLayerFor(NO_RULES, "worker", { inject: [], env: {} }, held).guards).toEqual(held.guards);
     // And a refusal's fallback (what the change removes) keeps the GitHub part the new layer keeps.
     const desired = clientLayerFor(NO_RULES, "worker", { inject: [], env: {}, github: feed }, held);
-    expect(shrinkLayer(held, desired)).toEqual({ egress: { allow: gh.egress }, inject: [gh.inject], env: gh.env, github_push: { workflows: false } });
+    // Guards only refuse: it keeps every one the sandbox has (so it adds none, and goes through while hosts lag).
+    expect(shrinkLayer(held, desired)).toEqual({ egress: { allow: gh.egress }, inject: [gh.inject], env: gh.env, github_push: { workflows: false }, guards: held.guards });
   });
 });
 
@@ -208,9 +232,9 @@ const createOf = (labels: Record<string, string>) =>
   fake.callsTo("POST", /^\/v1\/sandboxes$/).filter((c) => Object.entries(labels).every(([k, v]) => c.body.labels?.[k] === v));
 const agentCreateOf = (labels: Record<string, string>) =>
   fake.callsTo("POST", /^\/v1\/agents$/).filter((c) => Object.entries(labels).every(([k, v]) => c.body.labels?.[k] === v));
-/** The App's mints for one repo and these permissions. */
+/** The App's mints for one repo, by its id (the binding's), and these permissions. */
 const mintsOf = (repo: string, permissions: Record<string, string>) =>
-  fake.github.mints().filter((m) => m.repositories?.[0] === repo.split("/")[1] && JSON.stringify(m.permissions) === JSON.stringify(permissions));
+  fake.github.mints().filter((m) => m.repository_ids?.[0] === fake.github.repo(repo).id && JSON.stringify(m.permissions) === JSON.stringify(permissions));
 const secret = (p: P, kind: "push" | "read") => fake.secrets.get(githubSecretName(p.id, kind));
 /** A token as the fake GitHub holds it: its permissions, or undefined once revoked. */
 const tokenOf = (t: string) => fake.github.tokens.get(t);
@@ -221,19 +245,22 @@ describe("the sandbox of each role", () => {
   it("the manager reads: the read token minted for its repo alone, written with its expiry; its binding, variables, GitHub hosts and read guards; none of nest's repos", async () => {
     const p = await newProject();
     expect(p.manager).toMatch(/^agt_/);
-    expect(mintsOf(p.repo, { contents: "read", metadata: "read" })).toEqual([{ installation: GH_INSTALLATION_ID, repositories: [p.repo.split("/")[1]], permissions: { contents: "read", metadata: "read" } }]);
+    expect(mintsOf(p.repo, { contents: "read", metadata: "read" })).toEqual([{ installation: GH_INSTALLATION_ID, repositories: undefined, repository_ids: [fake.github.repo(p.repo).id], permissions: { contents: "read", metadata: "read" } }]);
     const s = secret(p, "read")!;
     expect(tokenOf(s.value)).toMatchObject({ permissions: { contents: "read", metadata: "read" }, installation: GH_INSTALLATION_ID });
     expect(s.expires_ms).toBe(tokenOf(s.value)!.expires_ms);
     expect(secret(p, "push")).toBeUndefined();
     const [create] = createOf({ project: p.id, role: "manager" });
-    expect(create!.body.inject).toEqual([{ name: "gh_read", secret: `gh-read-${p.id}`, hosts: ["github.com", "api.github.com"], locations: [{ type: "authorization_bearer" }, { type: "authorization_basic_password" }] }]);
+    expect(create!.body.inject).toEqual([{ name: "gh_read", secret: `gh-read-${p.id}`, hosts: ["github.com", "api.github.com"], locations: [{ type: "authorization_bearer" }, { type: "authorization_basic_password", username: "x-access-token" }] }]);
+    // The guards with the sandbox: they hold before its agent is made and after it ends.
+    expect(create!.body.guards).toEqual(githubGuards(p.repo, "read"));
     expect(create!.body.env.GH_TOKEN).toBe(`nest-ph.${CLIENT}.gh_read.`);
     expect(create!.body.env.GIT_CONFIG_VALUE_1).toBe(CREDENTIAL_HELPER);
     expect(create!.body.egress).toEqual({ allow: [{ host: "github.com" }, { host: "api.github.com" }, { host: "*.githubusercontent.com" }] });
     expect(create!.body).not.toHaveProperty("github_push");
     const [agent] = agentCreateOf({ project: p.id, role: "manager" });
-    expect(agent!.body.overrides).toEqual({ guards: githubGuards(p.repo, "read"), repos: [], read_repos: [] });
+    expect(agent!.body.overrides).toEqual({ repos: [], read_repos: [] });
+    expect(fake.sandboxes.get(fake.agents.get(p.manager!)!.sandbox!)!.layer.guards).toEqual(githubGuards(p.repo, "read"));
     // Its brief says git and gh are set up, never the placeholder.
     const brief = fake.inbox.find((m) => m.agent === p.manager)!.text;
     expect(brief).toContain(`already signed in to ${p.repo} for reading`);
@@ -251,7 +278,8 @@ describe("the sandbox of each role", () => {
     expect(create!.body.env.GH_TOKEN).toBe(`nest-ph.${CLIENT}.gh_push.`);
     expect(create!.body).not.toHaveProperty("github_push");
     const [agent] = agentCreateOf({ project: p.id, role: "worker", task: t.id });
-    expect(agent!.body.overrides).toEqual({ guards: githubGuards(p.repo, "push"), repos: [], read_repos: [] });
+    expect(agent!.body.overrides).toEqual({ repos: [], read_repos: [] });
+    expect(create!.body.guards).toEqual(githubGuards(p.repo, "push"));
     expect(fake.inbox.find((m) => m.agent === t.assignee)!.text).toContain(`They push only to ${p.repo}.`);
     // A second worker shares the project's push token: no second mint.
     await assigned(p);
@@ -266,7 +294,8 @@ describe("the sandbox of each role", () => {
     expect((create!.body.inject as { name: string }[]).map((b) => b.name)).toEqual(["gh_read"]);
     expect(create!.body.egress.allow).toContainEqual({ host: "api.github.com" });
     const [agent] = agentCreateOf({ project: p.id, role: "reviewer" });
-    expect(agent!.body.overrides).toEqual({ guards: githubGuards(p.repo, "read"), repos: [], read_repos: [] });
+    expect(agent!.body.overrides).toEqual({ repos: [], read_repos: [] });
+    expect(create!.body.guards).toEqual(githubGuards(p.repo, "read"));
   });
 
   it("a shared template not synced since the deploy, still naming every repo, is narrowed to none: nest gives the agent no token of its own", async () => {
@@ -332,12 +361,55 @@ describe("the grant", () => {
       expect(secret(p, "push")).toBeUndefined();
       // Checked before the write: nest wasn't asked to store it, and the token minted for it was revoked.
       expect(fake.callsTo("PUT", new RegExp(`/v1/clients/self/secrets/gh-push-${p.id}$`))).toEqual([]);
-      const minted = fake.github.calls.filter((c) => c.path.endsWith("/access_tokens") && c.body?.permissions?.pull_requests === "write" && c.body?.repositories?.[0] === p.repo.split("/")[1]);
+      const minted = fake.github.calls.filter((c) => c.path.endsWith("/access_tokens") && c.body?.permissions?.pull_requests === "write" && c.body?.repository_ids?.[0] === fake.github.repo(p.repo).id);
       expect(minted).toHaveLength(1);
       await drain(p);
       expect((await sql(p, (s) => s.exec("SELECT COUNT(*) AS n FROM gh_tokens WHERE kind = 'push'").one().n))).toBe(0);
     } finally {
       fake.grant.secrets.max_count = saved;
+    }
+  });
+});
+
+describe("the grant, live", () => {
+  it("a token over the grant's max_bytes isn't written, and the start says the operator must raise it", async () => {
+    const p = await newProject();
+    const saved = fake.grant.secrets.max_bytes;
+    fake.grant.secrets.max_bytes = 8;
+    try {
+      const t = await assigned(p);
+      expect(t.state).toBe("assigned");
+      expect(t.start_error).toMatch(/over the grant's secrets\.max_bytes \(8\): the operator must raise it/);
+      expect(secret(p, "push")).toBeUndefined();
+    } finally {
+      fake.grant.secrets.max_bytes = saved;
+    }
+  });
+
+  it("the grant narrowed away from the GitHub hosts: live layers drop the binding and its variables, keep the guards; widened, they come back", async () => {
+    const p = await newProject();
+    const sb = fake.sandboxes.get(fake.agents.get(p.manager!)!.sandbox!)!;
+    const has = () => (sb.layer.inject as { name: string }[]).some((b) => b.name === "gh_read");
+    expect(has()).toBe(true);
+    const saved = [...fake.grant.inject_hosts];
+    const upkeep = async () => {
+      await sql(p, (s) => s.exec("UPDATE settings SET secrets_next_ms = 0"));
+      await drain(p);
+    };
+    try {
+      // The grant as first seen, then narrowed: a change owes every live layer.
+      await upkeep();
+      fake.grant.inject_hosts = saved.filter((h) => h !== "api.github.com");
+      await upkeep();
+      expect(has()).toBe(false);
+      expect(Object.keys(sb.layer.env).filter((k) => k === "GH_TOKEN" || k.startsWith("GIT_CONFIG"))).toEqual([]);
+      expect(sb.layer.guards).toEqual(githubGuards(p.repo, "read"));
+      fake.grant.inject_hosts = saved;
+      await upkeep();
+      expect(has()).toBe(true);
+      expect(sb.layer.env.GH_TOKEN).toBe(`nest-ph.${CLIENT}.gh_read.`);
+    } finally {
+      fake.grant.inject_hosts = saved;
     }
   });
 });
@@ -413,6 +485,50 @@ describe("refreshing", () => {
     }
   });
 
+  it("workflows turned off while a refresh minted with them is in flight: written as it was, then again at once without them, and those revoked", async () => {
+    const inst = fake.github.installations[0]!;
+    const saved = { ...inst.permissions };
+    inst.permissions = { ...saved, workflows: "write" };
+    try {
+      const p = await newProject();
+      await assigned(p);
+      await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
+      await drain(p);
+      const run = runInDurableObject as unknown as (s: unknown, f: (o: any, st: DurableObjectState) => Promise<{ row: Record<string, unknown> }>) => Promise<{ row: Record<string, unknown> }>;
+      const out = await run(stub(p), async (o: any, st: DurableObjectState) => {
+        const nest = nestFrom(env as any)!;
+        const orig = o.secretRoom.bind(o);
+        let open!: () => void;
+        const gate = new Promise<void>((r) => { open = r; });
+        let entered!: () => void;
+        const inRoom = new Promise<void>((r) => { entered = r; });
+        o.secretRoom = async (...args: unknown[]) => { entered(); await gate; return orig(...args); };
+        try {
+          // Minted with workflows (the setting on), held before its write.
+          const p1 = o.refreshGithub(nest, "push");
+          await inRoom;
+          o.secretRoom = orig;
+          const u = o.updateSettings({ workers_edit_workflows: false });
+          setTimeout(() => open(), 50);
+          await Promise.all([p1, u]);
+          // The toggle's own refresh runs after the stale one, not merged into it.
+          await o.drain();
+        } finally {
+          o.secretRoom = orig;
+        }
+        return { row: st.storage.sql.exec("SELECT workflows, next_ms FROM gh_access WHERE kind = 'push'").one() };
+      });
+      expect(out.row.workflows).toBe(0);
+      const now = secret(p, "push")!.value;
+      expect(tokenOf(now)!.permissions).toEqual({ contents: "write", pull_requests: "write" });
+      // Every push token that had workflows is revoked.
+      await drain(p);
+      for (const [t, v] of fake.github.tokens) if (v.permissions.workflows && v.repo === p.repo) expect(t, "a workflows token left live").toBe("revoked");
+    } finally {
+      inst.permissions = saved;
+    }
+  });
+
   it("workflows on where the App can't grant it: the token is written without it, and the error says why", async () => {
     const p = await newProject();
     await assigned(p);
@@ -433,6 +549,13 @@ describe("going away", () => {
     const inst = fake.github.installations.find((i) => i.id === GH_INSTALLATION_ID)!;
     fake.github.uninstall(GH_INSTALLATION_ID);
     try {
+      // One refusal takes nothing away (a lookup's moment): retried soon, the tokens kept.
+      await sql(p, (s) => s.exec("UPDATE gh_access SET next_ms = 0"));
+      await drain(p);
+      expect(secret(p, "read")!.value).toBe(tokens[0]);
+      expect(await ghRow(p, "read")).toMatchObject({ refusals: 1, gone: 0 });
+      expect(fake.github.calls.filter((c) => c.method === "DELETE" && c.path === "/installation/token" && tokens.includes(c.token!))).toEqual([]);
+      // Twice running: gone.
       await sql(p, (s) => s.exec("UPDATE gh_access SET next_ms = 0"));
       await drain(p);
       expect(secret(p, "read")).toBeUndefined();
@@ -454,7 +577,104 @@ describe("going away", () => {
     await sql(p, (s) => s.exec("UPDATE gh_access SET next_ms = 0"));
     await drain(p);
     expect(tokenOf(secret(p, "push")!.value)).toBeDefined();
-    expect(await ghRow(p, "push")).toMatchObject({ gone: 0, error: null });
+    expect(await ghRow(p, "push")).toMatchObject({ gone: 0, error: null, refusals: 0 });
+  });
+
+  it("the installation lacking a permission the token needs: the owner told as such, retried later, nothing revoked", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const had = secret(p, "push")!.value;
+    const inst = fake.github.installations.find((i) => i.id === GH_INSTALLATION_ID)!;
+    const saved = { ...inst.permissions };
+    inst.permissions = { ...saved, pull_requests: "read" };
+    try {
+      await dueNow(p, "push");
+      await drain(p);
+      const row = await ghRow(p, "push");
+      expect(row).toMatchObject({ gone: 0, refusals: 0 });
+      expect(row!.error).toMatch(/lacks a permission the push token needs \(contents, pull_requests\)/);
+      expect(row!.next_ms as number).toBeGreaterThan(Date.now() + 20 * 60_000);
+      expect(secret(p, "push")!.value).toBe(had);
+      expect(tokenOf(had)).toBeDefined();
+      const chat = JSON.stringify((await api(token, "GET", `/api/projects/${p.id}/chat`)).body);
+      expect(chat).toMatch(/lacks a permission the push token needs/);
+      expect(chat).not.toMatch(/doesn't reach this project's repo/);
+    } finally {
+      inst.permissions = saved;
+    }
+  });
+
+  it("the repo rebound to another repo: every token of the old one revoked, both written again for the new one, by its id", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const old = [secret(p, "read")!.value, secret(p, "push")!.value];
+    const stub2 = stub(p);
+    await stub2.githubRebound();
+    await drain(p);
+    for (const t of old) expect(tokenOf(t)).toBeUndefined();
+    expect(secret(p, "read")!.value).not.toBe(old[0]);
+    expect(secret(p, "push")!.value).not.toBe(old[1]);
+    expect(tokenOf(secret(p, "push")!.value)!.repo).toBe(p.repo);
+  });
+
+  it("the binding's installation not the one answering for the repo now: no token minted from it, the error says to re-read", async () => {
+    const p = await newProject();
+    await runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => {
+      st.storage.sql.exec("UPDATE projects SET installation_id = ? WHERE id = ?", 990_001, p.id);
+    });
+    const before = fake.github.mints().length;
+    const t = await assigned(p);
+    expect(t.state).toBe("assigned");
+    expect(fake.github.mints().filter((m) => m.permissions?.pull_requests === "write").length).toBe(fake.github.mints().slice(0, before).filter((m) => m.permissions?.pull_requests === "write").length);
+    expect((await ghRow(p, "push"))!.error).toMatch(/not the bound 990001: re-read the binding/);
+  });
+
+  it("only while something holds it: an idle project's token lapses; a new holder schedules it again", async () => {
+    const p = await newProject();
+    const w = await assigned(p);
+    // The worker ends: nothing holds the push token, so its refresh lapses.
+    await deliver({ id: `evt-${crypto.randomUUID()}`, type: "agent.exited", agent: w.assignee!, reason: "done" });
+    const before = mintsOf(p.repo, { contents: "write", pull_requests: "write" }).length;
+    await dueNow(p, "push");
+    await drain(p);
+    expect(mintsOf(p.repo, { contents: "write", pull_requests: "write" }).length).toBe(before);
+    expect((await ghRow(p, "push"))!.next_ms).toBeNull();
+    // The manager still holds the read token: refreshed.
+    await dueNow(p, "read");
+    const reads = mintsOf(p.repo, { contents: "read", metadata: "read" }).length;
+    await drain(p);
+    expect(mintsOf(p.repo, { contents: "read", metadata: "read" }).length).toBe(reads + 1);
+    // A new worker holds it again: its start writes it if it expires soon, and it's scheduled.
+    await sql(p, (s) => s.exec("UPDATE gh_access SET expires_ms = ? WHERE kind = 'push'", Date.now() + 60_000));
+    await assigned(p);
+    expect(mintsOf(p.repo, { contents: "write", pull_requests: "write" }).length).toBe(before + 1);
+    expect((await ghRow(p, "push"))!.next_ms).not.toBeNull();
+  });
+
+  it("an ended agent's sandbox is destroyed, whatever its role: its binding and guards go with it", async () => {
+    const p = await newProject();
+    const w = await assigned(p);
+    const sbx = fake.agents.get(w.assignee!)!.sandbox!;
+    await deliver({ id: `evt-${crypto.randomUUID()}`, type: "agent.exited", agent: w.assignee!, reason: "done" });
+    await drain(p);
+    expect(fake.sandboxes.get(sbx)!.ended).toBe(true);
+    // A reviewer's too (ReviewDO's stop of an ended agent destroys nothing).
+    await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 11, sha: sha(), action: "opened" }));
+    await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
+    const r = [...fake.agents.values()].find((a) => a.labels.project === p.id && a.labels.role === "reviewer")!;
+    await deliver({ id: `evt-${crypto.randomUUID()}`, type: "agent.exited", agent: r.agent, reason: "done" });
+    await drain(p);
+    expect(fake.sandboxes.get(r.sandbox!)!.ended).toBe(true);
+    // A destroy nest can't take now is retried.
+    const m = fake.agents.get((await assigned(p)).assignee!)!;
+    fake.fail(/^DELETE \/v1\/sandboxes\//, 503, { times: 1 });
+    await deliver({ id: `evt-${crypto.randomUUID()}`, type: "agent.exited", agent: m.agent, reason: "done" });
+    await drain(p);
+    expect(fake.sandboxes.get(m.sandbox!)!.ended).toBe(false);
+    expect(await sql(p, (s) => s.exec("SELECT attempts FROM sandbox_ends WHERE agent = ?", m.agent).one().attempts)).toBe(1);
+    await sql(p, (s) => s.exec("UPDATE sandbox_ends SET next_ms = 0 WHERE next_ms IS NOT NULL"));
+    await drain(p);
+    expect(fake.sandboxes.get(m.sandbox!)!.ended).toBe(true);
   });
 
   it("a project removed: every token revoked and every token secret deleted, retried until nest takes it", async () => {
@@ -468,9 +688,12 @@ describe("going away", () => {
     for (const t of tokens) expect(tokenOf(t)).toBeUndefined();
     expect(secret(p, "read")).toBeUndefined();
     expect(secret(p, "push")).toBeDefined();
-    // The object's own alarm, the project gone, deletes what's left (armed for it, due at once: the pool runs it).
-    await eventually(() => !secret(p, "push"), "the push secret deleted by the alarm");
-    await eventually(async () => (await sql(p, (s) => s.exec("SELECT COUNT(*) AS n FROM gh_access").one().n)) === 0, "nothing left to keep");
+    // Armed for its retry: the object's own alarm, the project gone, deletes what's left.
+    expect(await runInDurableObject(stub(p), (_o, st) => st.storage.getAlarm())).not.toBeNull();
+    await sql(p, (s) => s.exec("UPDATE gh_access SET del_next_ms = 0 WHERE gone = 1"));
+    await runInDurableObject(stub(p), (o) => (o as unknown as { alarm(): Promise<void> }).alarm());
+    expect(secret(p, "push")).toBeUndefined();
+    expect(await sql(p, (s) => s.exec("SELECT COUNT(*) AS n FROM gh_access").one().n)).toBe(0);
   });
 });
 
@@ -482,12 +705,14 @@ describe("hosts that don't apply guards yet", () => {
       const t = await assigned(p);
       expect(t.state).toBe("assigned");
       expect(t.start_error).toContain(HOSTS_WAIT);
-      // Retried, the guards each time; its sandbox kept for the same attempt.
+      // Retried, the guards in its sandbox's create each time, refused there: nothing made, no window without them.
       await sql(p, (s) => s.exec("UPDATE tasks SET start_next_ms = 0 WHERE id = ?", t.id));
       await drain(p);
-      const tries = agentCreateOf({ project: p.id, task: t.id });
+      const tries = createOf({ project: p.id, task: t.id });
       expect(tries.length).toBeGreaterThanOrEqual(2);
-      for (const c of tries) expect(c.body.overrides).toEqual({ guards: githubGuards(p.repo, "push"), repos: [], read_repos: [] });
+      for (const c of tries) expect(c.body.guards).toEqual(githubGuards(p.repo, "push"));
+      expect([...fake.sandboxes.values()].filter((x) => x.labels.task === t.id)).toEqual([]);
+      expect(agentCreateOf({ project: p.id, task: t.id })).toEqual([]);
       expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body).toMatchObject({ state: "assigned" });
     } finally {
       fake.hostsBehind = 0;
@@ -510,6 +735,20 @@ describe("hosts that don't apply guards yet", () => {
       expect(job.error).toContain(HOSTS_WAIT);
     } finally {
       fake.hostsBehind = 0;
+    }
+  });
+
+  it("a nest from before its code (conflict, in its words) is told apart the same; another conflict isn't", async () => {
+    const p = await newProject();
+    fake.hostsBehind = 1;
+    fake.hostsCode = "conflict";
+    try {
+      const t = await assigned(p);
+      expect(t.state).toBe("assigned");
+      expect(t.start_error).toContain(HOSTS_WAIT);
+    } finally {
+      fake.hostsBehind = 0;
+      fake.hostsCode = "hosts_not_ready";
     }
   });
 

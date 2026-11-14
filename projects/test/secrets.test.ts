@@ -586,7 +586,8 @@ describe("workers editing CI workflows", () => {
     expect(fresh[0]!.labels.start).not.toBe(first);
     expect(fresh[0]!.github_push).toBeNull();
     // The new attempt is frozen now: the app's own GitHub access, not nest's repos.
-    expect([...fake.agents.values()].find((a) => a.sandbox === fresh[0]!.sandbox)!.overrides).toHaveProperty("guards");
+    expect(fresh[0]!.layer.guards?.length).toBeGreaterThan(0);
+    expect([...fake.agents.values()].find((a) => a.sandbox === fresh[0]!.sandbox)!.overrides).toEqual({ repos: [], read_repos: [] });
     const task = (await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body;
     expect(task.state).toBe("in_progress");
     expect(task.history.some((h: { action: string }) => h.action === "start_abandoned")).toBe(true);

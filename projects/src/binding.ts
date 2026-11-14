@@ -50,6 +50,8 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
   // A binding not read from GitHub yet is bound only to a repo with the owner recorded at attach (bindRepo).
   const attached = b.bound === "github" ? null : await project(env, id).attachedOwner();
   const out = await dir.bindRepo(id, info, mode, attached);
+  // Bound to another repo now: the project's GitHub tokens for the old one go, and new ones are written (README.md#the-sandboxes-github-access).
+  if (out.ok && out.changed && out.previous_id !== null) await project(env, id).githubRebound();
   // The repo's owner as GitHub answers now, for the bound repo: a default comments user that isn't it any more goes.
   if (out.ok && info.owner) await project(env, id).repoOwnerSeen(info.owner, b.owner?.id ?? null);
   return out;

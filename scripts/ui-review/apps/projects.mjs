@@ -911,6 +911,12 @@ const app = {
     { name: "secrets", section: "project", path: "/projects/prj_demo/secrets" },
     { name: "secrets-empty", section: "project", path: "/projects/prj_demo/secrets", fixture: "secrets-empty" },
     { name: "secret-form", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Add a secret" }).click() },
+    { name: "secret-form-github", section: "project", path: "/projects/prj_demo/secrets", full: false, after: async (p) => {
+      await p.getByRole("button", { name: "Add a secret" }).click();
+      await p.getByLabel("Service", { exact: true }).first().click();
+      await p.getByRole("option", { name: "GitHub API" }).click();
+      await p.getByText(/already gives every sandbox a token/).waitFor();
+    } },
     { name: "secret-edit", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Edit uploads_key" }).click() },
     { name: "board-secret-requests", section: "project", path: "/projects/prj_demo/board", fixture: "secret-requests" },
     // Reviews held for approval in "Needs you" (README.md#the-review-gate); the Reviews page's own rows are in `reviews`.

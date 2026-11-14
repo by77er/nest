@@ -111,7 +111,7 @@ export function secretProblems(
 ): Record<string, string> {
   const out: Record<string, string> = {};
   if (!SECRET_NAME.test(m.name)) out.name = "Lowercase letters, digits and _, starting with a letter, at most 31";
-  else if (isAppBinding(m.name)) out.name = `${m.name} is the app's own GitHub binding: choose another name`;
+  else if (isAppBinding(m.name)) out.name = `${m.name} is reserved for the app's own GitHub token: choose another name`;
   const env = envProblem(m.env, takenEnv);
   if (env) out.env = env;
   if (m.hosts.length < 1 || m.hosts.length > MAX_HOSTS) out.hosts = `1 to ${MAX_HOSTS} hosts`;
@@ -203,7 +203,7 @@ export const SECRET_PRESETS = [
   { value: "pypi", label: "PyPI upload", hosts: ["upload.pypi.org"], location: { type: "authorization_basic_password" } as SecretLocation, env: "TWINE_PASSWORD", note: "PyPI takes a token as the password, with the user name __token__ (TWINE_USERNAME)." },
   {
     value: "github", label: "GitHub API", hosts: ["api.github.com"], location: { type: "authorization_bearer" } as SecretLocation, env: null,
-    note: "The app already gives every sandbox a token for the project's repo (GH_TOKEN): workers push with it, the other roles read. Add one only for another account's API.",
+    note: "The app already gives every sandbox a token for the project's repo (GH_TOKEN): workers push with it, the other roles read. Add one only to read another account's API.",
   },
   { value: "custom", label: "Custom", hosts: [], location: { type: "authorization_bearer" } as SecretLocation, env: null, note: null },
 ] as const;

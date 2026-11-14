@@ -849,7 +849,8 @@ describe("a project's models", () => {
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { worker_model: "claude-sonnet-5-5" });
     await stub(p).drain();
     expect(fake.catalog.has(`templates/${entry(p, "worker", "claude-haiku-5-5")}`)).toBe(true);
-    expect(fake.catalog.has(`templates/${entry(p, "worker", "claude-opus-5-5")}`)).toBe(true);
+    // (Opus's may have gone already: its worker ended before the start was owed, and the exit's sandbox
+    // destroy runs a drain, whose sweep takes it then.)
   });
 
   it("a project that's gone takes all its model templates with it", async () => {

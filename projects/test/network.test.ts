@@ -59,7 +59,7 @@ const spec = { goal: "g", acceptance_criteria: [], files: [], test_plan: "p" };
 async function setup() {
   const repo = `o-${rand()}/r-${rand()}`;
   const p = (await api(token, "POST", "/api/projects", { name: repo, repo })).body;
-  return { id: p.id as string, manager: p.settings.manager as string };
+  return { id: p.id as string, manager: p.settings.manager as string, repo: repo.toLowerCase() };
 }
 /** nest's name for a project's secret: `<project>-<name>-<generation>`, the generation new at each creation. */
 const nestKey = (p: { id: string }, name: string) => [...fake.secrets.keys()].find((k) => new RegExp(`^${p.id}-${name}-[a-z0-9]{6}$`).test(k));
@@ -174,8 +174,8 @@ describe("applying the rules", () => {
     expect(put.path).toBe(`/v1/sandboxes/${sb.sandbox}/client-policy`);
     // Sent in the PUT's strict shape (nest refuses a held binding's `client` and `placeholder`), so it applied;
     // the app's GitHub part kept beside it.
-    const gh = githubPart(s.id, "manager");
-    const layer = { egress: { allow: [{ host: "nodejs.org" }, ...gh.egress] }, inject: [binding, gh.binding], env: { ...vars, ...gh.env } };
+    const gh = githubPart(s.id, "manager", s.repo);
+    const layer = { egress: { allow: [{ host: "nodejs.org" }, ...gh.egress] }, inject: [binding, gh.binding], env: { ...vars, ...gh.env }, guards: gh.guards };
     expect(put.body).toEqual({ ...layer, github_push: { workflows: false } });
     expect(sb.layer).toEqual(layer);
     expect(r.body.agents).toEqual([expect.objectContaining({ agent: s.manager, role: "manager", state: "applied", sandbox: sb.sandbox })]);
@@ -199,13 +199,13 @@ describe("applying the rules", () => {
       { name: "npm_token", secret: nestKey(s, "npm_token")!, hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] },
       { name: "upload", secret: nestKey(s, "upload")!, hosts: ["*.uploads.example.com"], locations: [{ type: "header", name: "X-Upload-Token" }, { type: "authorization_basic_password" }], wildcard: true },
     ];
-    const gh = githubPart(s.id, "worker");
+    const gh = githubPart(s.id, "worker", s.repo);
     const vars = { NPM_TOKEN: `nest-ph.${CLIENT}.npm_token.`, UPLOAD_TOKEN: `nest-ph.${CLIENT}.upload.`, ...gh.env };
-    expect(sb.layer).toEqual({ egress: { allow: gh.egress }, inject: [...bindings, gh.binding], env: vars });
+    expect(sb.layer).toEqual({ egress: { allow: gh.egress }, inject: [...bindings, gh.binding], env: vars, guards: gh.guards });
     for (const worker_rules of [[{ host: "pypi.org" }], [{ host: "nodejs.org", ports: [443] }], []]) {
       const r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: worker_rules, manager: [] });
       expect(r.status).toBe(200);
-      const layer = { egress: { allow: [...worker_rules, ...gh.egress] }, inject: [...bindings, gh.binding], env: vars };
+      const layer = { egress: { allow: [...worker_rules, ...gh.egress] }, inject: [...bindings, gh.binding], env: vars, guards: gh.guards };
       expect(fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${sb.sandbox}/client-policy$`)).at(-1)!.body).toEqual({ ...layer, github_push: { workflows: false } });
       expect(sb.layer).toEqual(layer);
       expect(r.body.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: worker, state: "applied", error: null })]));

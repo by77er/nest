@@ -160,7 +160,9 @@ export interface GithubAccess {
 /** The binding of the project's token of `kind` (nest names its placeholder `nest-ph.<client>.<binding>.`). */
 export const githubBinding = (project: string, kind: GithubKind): Binding => ({
   name: GITHUB_BINDINGS[kind], secret: githubSecretName(project, kind), hosts: [...GITHUB_INJECT_HOSTS],
-  locations: [{ type: "authorization_bearer" }, { type: "authorization_basic_password" }],
+  // nest-proxy writes this username itself (nest #273), so a Basic field is nest's whole only with it: git sends
+  // whatever its helper answers, and GitHub takes a token as the username too.
+  locations: [{ type: "authorization_bearer" }, { type: "authorization_basic_password", username: "x-access-token" }],
 });
 
 /** `GH_TOKEN` holding the binding's placeholder, and git's credential helper answering with it. */
@@ -189,13 +191,14 @@ export interface FrozenGithub {
 }
 
 /**
- * What a start sends: the app's guards, or (`github` absent: frozen before it) nest's repos narrowed to the
- * project's, pushed or read. With the guards, nest's repos narrowed to none: a shared template the catalog
- * sync hasn't rewritten since the deploy still names every project's repo, and nest would otherwise give the
- * agent its own GitHub token for them (and refuse the app's `GH_TOKEN` beside it). Goes with nest's repos (phase C).
+ * What a start's spawn sends: with the app's access (its guards are the sandbox's own, `startExtras`), nest's
+ * repos narrowed to none, since a shared template the catalog sync hasn't rewritten since the deploy still
+ * names every project's repo, and nest would otherwise give the agent its own GitHub token for them (and refuse
+ * the app's `GH_TOKEN` beside it): goes with nest's repos (phase C). Frozen before it (`github` absent): nest's
+ * repos narrowed to the project's, pushed or read.
  */
 export function spawnOverrides(spec: FrozenGithub, repo: string, push: boolean): SpawnOverrides {
-  if (spec.github) return { guards: spec.github.guards, repos: [], read_repos: [] };
+  if (spec.github) return { repos: [], read_repos: [] };
   return push ? { repos: [repo] } : { read_repos: [repo] };
 }
 
