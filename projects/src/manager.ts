@@ -78,8 +78,11 @@ export interface ManagerLife {
  * - `ended`: the manager `agent` ended (nest's `agent.exited`, nest no longer having it, or its brief
  *   refused for good). One that isn't the current manager changes nothing.
  * - `restart`: the owner's Restart: the current one (if any) goes, a new one starts now.
+ * - `converge`: the manager `agent` runs on nest's repos (README.md#converging-onto-the-apps-own-access): it goes,
+ *   and one on the app's own access starts now. Not one of the automatic restarts it counts. One that isn't the
+ *   current manager changes nothing.
  */
-export type ManagerEvent = { kind: "ended"; agent: string; reason: string } | { kind: "restart" };
+export type ManagerEvent = { kind: "ended"; agent: string; reason: string } | { kind: "restart" } | { kind: "converge"; agent: string };
 
 /** Where `event` takes the manager's lifecycle at `now`, and the agent to stop (its sandbox destroyed), if any. */
 export function managerStep(l: ManagerLife, e: ManagerEvent, now: number, backoff: (n: number) => number): { life: ManagerLife; stop: string | null; changed: boolean } {
@@ -96,6 +99,10 @@ export function managerStep(l: ManagerLife, e: ManagerEvent, now: number, backof
       life: { manager: null, next_ms: null, restarts: recent, error: `The manager ended (${e.reason}), ${recent.length + 1} times within an hour: restart it when you're ready.` },
       stop: e.agent, changed: true,
     };
+  }
+  if (e.kind === "converge") {
+    if (l.manager !== e.agent) return { life: l, stop: null, changed: false };
+    return { life: { manager: null, next_ms: now, restarts: l.restarts, error: null }, stop: e.agent, changed: true };
   }
   // A restart while one is already starting changes nothing: asking twice starts one.
   if (l.manager === null && l.next_ms !== null && l.error === null) return { life: l, stop: null, changed: false };

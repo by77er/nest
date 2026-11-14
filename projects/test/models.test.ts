@@ -40,16 +40,16 @@ describe("model ids", () => {
     expect(modelTemplateEntry("worker", "prj_other", "opus")).not.toBe(modelTemplateEntry("worker", "prj_abc123", "opus"));
   });
 
-  it("a role's template carries the model as launch.model, and nest's repos (only its project's) only for a start frozen before the app's GitHub access", () => {
-    const w = roleTemplate("worker", "prj_abc123", "Owner/Repo", "claude-haiku-5-5");
+  it("a role's template carries the model as launch.model, and never a repo of nest's", () => {
+    const w = roleTemplate("worker", "prj_abc123", "claude-haiku-5-5");
     expect(w.name).toBe("projects/worker-abc123-claude-haiku-5-5");
     expect(w.body).toMatchObject({ launch: { model: "claude-haiku-5-5" } });
-    expect(w.body).not.toHaveProperty("repos");
-    expect(w.body).not.toHaveProperty("read_repos");
-    expect(roleTemplate("worker", "prj_abc123", "Owner/Repo", "claude-haiku-5-5", true).body).toMatchObject({ repos: ["owner/repo"] });
-    const m = roleTemplate("manager", "prj_abc123", "owner/repo", "claude-fable-5-2", true);
-    expect(m.body).toMatchObject({ launch: { model: "claude-fable-5-2" }, read_repos: ["owner/repo"] });
-    expect((m.body as { repos?: unknown }).repos).toBeUndefined();
+    const m = roleTemplate("manager", "prj_abc123", "claude-fable-5-2");
+    expect(m.body).toMatchObject({ launch: { model: "claude-fable-5-2" } });
+    for (const t of [w, m]) {
+      expect(t.body).not.toHaveProperty("repos");
+      expect(t.body).not.toHaveProperty("read_repos");
+    }
   });
 });
 

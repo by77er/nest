@@ -120,11 +120,10 @@ function mcpCapability(base: string, server: Server, prompt: string) {
 
 /**
  * A role's template. Its sandbox's GitHub access is the app's own, sent with each start (README.md#repo-authority):
- * a binding of the project's token, its environment and the app's guards, all in its sandbox's create, so the shared
- * templates name no repo. `repos` only in a project's own template written for a start frozen before that
- * (nest's repos: `access` `push`, the worker's, or `read`), which its spawn narrows to the project's.
+ * a binding of the project's token, its environment and the app's guards, all in its sandbox's create, so no
+ * template names a repo of nest's.
  */
-const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read", subagents = false, timers = false, ephemeral = false, model?: string, guidance = REPO_GUIDANCE) => ({
+const template = (capability: Server, prompt: string, subagents = false, timers = false, ephemeral = false, model?: string, guidance = REPO_GUIDANCE) => ({
   // `nest` allows the nest tools without a prompt and `hands` gives the sandbox's tools: the operator's
   // capabilities, which a client's templates may name. `timers` (nest's timer_set, timer_cancel and
   // timer_list) is the manager's only: workers have nothing to wait for that their task doesn't bring.
@@ -135,20 +134,18 @@ const template = (capability: Server, prompt: string, repos: readonly string[], 
   launch: { ...(model ? { model } : {}), builtin_tools: [...BUILTIN_TOOLS, ...(subagents ? WORKER_EXTRA.builtin_tools : [])], system_prompt: { mode: "append", text: `${prompt}\n${guidance}` } },
   hands: "required",
   credential: CREDENTIAL,
-  ...(repos.length ? { [access === "push" ? "repos" : "read_repos"]: [...repos] } : {}),
   // A routine run ends itself once its turn is done (nest's ephemeral agents, docs/agents/#lifetimes).
   ...(ephemeral ? { ephemeral: true } : {}),
 });
 
 /**
  * A project's own template for its manager or its workers on `model` (README.md#models): the role's
- * template, reaching only that project's repo, with `launch.model`. Its name is `modelTemplateEntry`'s.
+ * template with `launch.model`. Its name is `modelTemplateEntry`'s.
  */
-export function roleTemplate(role: ModelRole, project: string, repo: string, model: string, nestRepos = false): { name: string; body: unknown } {
-  const repos = nestRepos ? [repo.toLowerCase()] : [];
+export function roleTemplate(role: ModelRole, project: string, model: string): { name: string; body: unknown } {
   const body = role === "manager"
-    ? template("board", PROMPTS.manager, repos, "read", false, true, false, model)
-    : template("task", PROMPTS.worker, repos, "push", true, false, false, model);
+    ? template("board", PROMPTS.manager, false, true, false, model)
+    : template("task", PROMPTS.worker, true, false, false, model);
   return { name: `${NAMESPACE}/${modelTemplateEntry(role, project, model)}`, body };
 }
 
@@ -171,14 +168,15 @@ export function catalogFor(base: string): CatalogEntries {
     },
     templates: {
       // The manager's and the worker's on the default models (README.md#models). A project's own starts use
-      // its own entries (`roleTemplate`), on the models its settings name; these stay for a start frozen
-      // before those existed.
-      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, [], "read", false, true, false, DEFAULT_MODEL.manager),
-      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, [], "push", true, false, false, DEFAULT_MODEL.worker),
+      // its own entries (`roleTemplate`), on the models its settings name. A start frozen before those existed
+      // was frozen before the app's own GitHub access too, so it's begun again (README.md#converging-onto-the-apps-own-access):
+      // no start names these now; they stay for a rollback's.
+      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, false, true, false, DEFAULT_MODEL.manager),
+      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, true, false, false, DEFAULT_MODEL.worker),
       // Ephemeral: a reviewer ends itself once its turn is done, verdict or not (its job's deadline covers one that doesn't).
-      [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, [], "read", false, false, true, undefined, REVIEWER_GUIDANCE),
+      [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, false, false, true, undefined, REVIEWER_GUIDANCE),
       // Reads only, like the manager and reviewers: a routine never pushes.
-      [`${NAMESPACE}/routine`]: template("routine", PROMPTS.routine, [], "read", false, false, true),
+      [`${NAMESPACE}/routine`]: template("routine", PROMPTS.routine, false, false, true),
       // A dreaming run has no hands (no sandbox, no repo, no web): it needs only the board, recent work,
       // memory and the transcripts nest's grant lets it read (README.md#routines).
       [`${NAMESPACE}/dreaming`]: {
@@ -208,6 +206,18 @@ export async function syncCatalog(nest: Nest, base: string): Promise<{ written: 
     written.push(`templates/${name}`);
   }
   return { written };
+}
+
+/**
+ * Write one shared template as this release has it, before a start names it (README.md#converging-onto-the-apps-own-access):
+ * the same body every time, so writing it again changes nothing. So a start never depends on a catalog sync since
+ * the deploy: the sync of a release before B3 wrote the templates naming nest's repos, which a spawn would
+ * otherwise have had to narrow away.
+ */
+export async function writeSharedTemplate(nest: Nest, base: string, name: string): Promise<void> {
+  const body = catalogFor(base).templates[name];
+  if (body === undefined) throw new Error(`no shared template ${name}`);
+  await nest.putCatalog("templates", name, body);
 }
 
 export const TEMPLATE = { manager: `${NAMESPACE}/manager`, worker: `${NAMESPACE}/worker`, reviewer: `${NAMESPACE}/reviewer`, routine: `${NAMESPACE}/routine`, dreaming: `${NAMESPACE}/dreaming` } as const;

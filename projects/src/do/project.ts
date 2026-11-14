@@ -8,13 +8,13 @@
 
 import { type IssuesFrom, MAX_UNTRIAGED_ISSUES } from "../issues";
 import { DurableObject } from "cloudflare:workers";
-import { roleTemplate, TEMPLATE } from "../catalog";
+import { roleTemplate, TEMPLATE, writeSharedTemplate } from "../catalog";
 import { DEFAULT_MODEL, modelLabel, type ModelRole, modelProblem } from "../models";
 import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, DIMENSIONS, GitHubError, githubFor, ownInstallation, PERMISSIONS, requireReviewCheck, type Verdict } from "../github";
 import type { AgentCaller } from "../identity";
-import { type AgentView, backoff, clientIdOf, HOSTS_WAIT, NestError, nestFrom, type Nest, type SandboxExtras, stopRefused } from "../nest";
+import { type AgentView, backoff, clientIdOf, HOSTS_WAIT, NestError, nestFrom, type Nest, type SandboxExtras, type SpawnOverrides, stopRefused } from "../nest";
 import { envName, MAX_BINDINGS, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
 import { AppTokens } from "../github-app";
 import { GITHUB_EGRESS_HOSTS, GITHUB_INJECT_HOSTS, githubGrantMissing, githubGuards, GITHUB_KINDS, githubAccess, githubBinding, githubEgress, githubEnv, type GithubKind, githubPermissions, type GithubRole, githubSecretName, type Guard, kindOf, REFRESH_BEFORE_MS, spawnOverrides, startEgress } from "../github-access";
@@ -456,8 +456,9 @@ export const MIGRATIONS = [
     // nest names minted for a value write and not yet recorded (each is used once), the grant as last
     // seen (a change owes every layer), and when the secrets' upkeep runs next.
     "CREATE TABLE minted (nest_name TEXT PRIMARY KEY, at_ms INTEGER NOT NULL)",
-    // Start attempts abandoned (the workflows setting turned off mid-start): what they may have made,
-    // found by their labels and destroyed, twice (the second after a create still in flight has landed).
+    // A worker's start attempts abandoned (the workflows setting turned off mid-start, before B4; frozen on nest's
+    // repos, since): what they may have made, found by their labels and destroyed, twice (the second after a
+    // create still in flight has landed).
     `CREATE TABLE abandoned (task TEXT NOT NULL, start INTEGER NOT NULL, passes INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0, error TEXT, PRIMARY KEY (task, start))`,
     "ALTER TABLE settings ADD COLUMN grant_seen TEXT",
@@ -653,9 +654,23 @@ export const MIGRATIONS = [
     // known at the exit), the next try, and the failures.
     `CREATE TABLE sandbox_ends (agent TEXT PRIMARY KEY, sandbox TEXT, next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT)`,
     // A routine run already tried on nest's repos when this release came (its sandbox's Idempotency-Key binds
-    // that request): its retries send it again. Every run after is the app's.
+    // that request): B3 sent it again; since B4 it ends instead (README.md#converging-onto-the-apps-own-access).
+    // Every run after is the app's.
     "ALTER TABLE routine_runs ADD COLUMN nest_repos INTEGER NOT NULL DEFAULT 0",
     "UPDATE routine_runs SET nest_repos = 1 WHERE state = 'starting' AND spawn IS NOT NULL AND agent IS NULL",
+  ],
+  [
+    // Converging onto the app's own GitHub access (README.md#converging-onto-the-apps-own-access, phase B4): when
+    // the manager is next looked at, to replace it between turns if its sandbox is on nest's repos. Owed now to
+    // every project with a manager (each one started before B3 is); a manager whose layer has the app's part is
+    // left as it is.
+    "ALTER TABLE settings ADD COLUMN converge_next_ms INTEGER",
+    "UPDATE settings SET converge_next_ms = 0 WHERE manager IS NOT NULL",
+    // A start attempt frozen on nest's repos and begun again as a new one (the manager's, a reviewer's): what
+    // it may have made, found by its labels (JSON, keys sorted) and ended, twice (the second after a create still
+    // in flight has landed). A worker's are `abandoned`'s, as before.
+    `CREATE TABLE abandoned_starts (labels TEXT PRIMARY KEY, reason TEXT NOT NULL, passes INTEGER NOT NULL DEFAULT 0, next_ms INTEGER NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0, error TEXT)`,
   ],
 ] as const;
 
@@ -671,6 +686,19 @@ type Row = Record<string, SqlStorageValue>;
 const MID_TURN = new Set(["working", "waiting_permission", "compacting", "quota_parked", "stalled"]);
 /** While a switch waits for the manager's turn to end, it looks again this often (its `turn_completed` may be missed). */
 const SWITCH_RECHECK_MS = 60_000;
+/**
+ * A manager on nest's repos is replaced only once the chat has been quiet this long (README.md#converging-onto-the-apps-own-access):
+ * no message of the owner's or turn of its own in it, so its conversation is at a pause.
+ */
+export const CONVERGE_QUIET_MS = 30 * 60_000;
+/**
+ * nest's states of an agent known to be between turns (docs/control-plane/api/): only in one of these is a manager
+ * on nest's repos replaced. Not `starting` (a turn may be about to run), `waiting_input` (an ask of its is open),
+ * `errored`, `needs_attention`, or a state this release doesn't know.
+ */
+const BETWEEN_TURNS = new Set(["idle", "ready", "detached"]);
+/** A manager on nest's repos not replaced yet (in a turn, the chat not quiet, the app's access not startable) is looked at again this often. */
+const CONVERGE_RECHECK_MS = 5 * 60_000;
 /** nest gave a switch's restart up: tried again after this, doubling, until it has given it up SWITCH_REFUSALS times. */
 const REFUSAL_BACKOFF_MS = 5 * 60_000;
 const SWITCH_REFUSALS = 3;
@@ -719,6 +747,13 @@ export class ProjectDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     migrate(ctx.storage, MIGRATIONS);
+    // A manager to look at that no alarm is set for (B4's migration owed it, README.md#converging-onto-the-apps-own-access):
+    // armed at the object's first use, whatever the use is.
+    if (this.sql.exec("SELECT 1 FROM settings WHERE converge_next_ms IS NOT NULL AND manager IS NOT NULL").toArray().length) {
+      void ctx.blockConcurrencyWhile(async () => {
+        if ((await ctx.storage.getAlarm()) === null) await ctx.storage.setAlarm(Date.now());
+      });
+    }
   }
 
   private get sql() {
@@ -859,7 +894,6 @@ export class ProjectDO extends DurableObject<Env> {
       this.sql.exec("UPDATE settings SET routine_cap = ?", u.max_routine_runs);
       this.routinesTick(Date.now());
     }
-    if (u.workers_edit_workflows === false && before.workers_edit_workflows) this.abandonWorkflowStarts();
     // The project's own push token is written again now with or without `workflows: write`; turned off, every
     // one that had it is then revoked (README.md#repo-authority).
     if (u.workers_edit_workflows !== undefined && u.workers_edit_workflows !== before.workers_edit_workflows) {
@@ -2121,7 +2155,7 @@ export class ProjectDO extends DurableObject<Env> {
       const model = role === "manager" ? s.manager_model : role === "worker" ? s.worker_model : undefined;
       frozen = {
         extras, names: mine.map((m) => m.name), brief: secretsBrief(mine) + githubBrief(github.kind, github.repo), rev: this.rules().rev,
-        ...(model ? { model } : {}), github: { egress: github.egress, guards: github.guards },
+        ...(model ? { model } : {}), github: { egress: github.egress, guards: github.guards }, overrides: {},
       };
       this.sql.exec("INSERT INTO start_specs (key, spec, at_ms) VALUES (?, ?, ?)", key, JSON.stringify(frozen), Date.now());
       this.sql.exec("DELETE FROM start_specs WHERE at_ms < ?", Date.now() - 7 * 24 * 3600 * 1000);
@@ -2133,14 +2167,15 @@ export class ProjectDO extends DurableObject<Env> {
    * The template a manager or worker starts from (README.md#models): the project's own for the role on
    * the model its start froze, written to the app's catalog here (the same body every time, so writing
    * it again changes nothing). A client's spawn can't override a template's launch, so the model is the
-   * template's. A start frozen before models were chosen keeps the role's shared template.
+   * template's. A start frozen before models were chosen keeps the role's shared template (written too).
    */
   private async templateFor(nest: Nest, role: ModelRole, spec: StartSpec): Promise<string> {
-    if (!spec.model) return TEMPLATE[role];
-    const repo = await this.repo();
+    if (!spec.model) {
+      await writeSharedTemplate(nest, this.env.PUBLIC_BASE_URL, TEMPLATE[role]);
+      return TEMPLATE[role];
+    }
     const s = this.settings()!;
-    // Nest's repos in the template only for a start frozen before the app's own GitHub access (its spawn narrows them).
-    const t = roleTemplate(role, s.id, repo, spec.model, !spec.github);
+    const t = roleTemplate(role, s.id, spec.model);
     // Recorded before it's written: one written and never recorded would be left in nest for good. A new
     // `at_ms` each time, so a sweep whose delete was in flight sees the row is this start's now.
     this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = MAX(excluded.at_ms, model_templates.at_ms + 1), del_next_ms = NULL, del_attempts = 0, del_error = NULL", t.name, role, spec.model, Date.now());
@@ -2238,11 +2273,49 @@ export class ProjectDO extends DurableObject<Env> {
     return had ? (JSON.parse(had.spec) as StartSpec) : null;
   }
 
-  /** A reviewer's sandbox spec (ReviewDO starts reviewers): as a worker's, without workflows. */
-  async reviewerSpec(key: string, o: { ensure?: boolean } = {}): Promise<StartSpec> {
+  /**
+   * A reviewer's sandbox spec (ReviewDO starts reviewers): as a worker's, without workflows. `legacy`: frozen on
+   * nest's repos (README.md#converging-onto-the-apps-own-access), so ReviewDO begins the attempt again instead.
+   */
+  async reviewerSpec(key: string, o: { ensure?: boolean } = {}): Promise<StartSpec & { legacy?: true }> {
     const nest = nestFrom(this.env);
-    if (!this.settings() || !nest) return { extras: {}, names: [], brief: "", rev: 0 };
-    return this.sandboxSpec(nest, "reviewer", key, o);
+    if (!this.settings() || !nest) return { extras: {}, names: [], brief: "", rev: 0, overrides: {} };
+    const spec = await this.sandboxSpec(nest, "reviewer", key, o);
+    return spec.github ? spec : { ...spec, legacy: true };
+  }
+
+  /**
+   * A start attempt frozen on nest's repos is begun again as a new one (README.md#converging-onto-the-apps-own-access):
+   * what it may have made (a sandbox, an agent whose create's answer was lost) is found by its `labels` and ended,
+   * twice, the second after a create still in flight has landed (`cleanAbandonedStart`). Idempotent.
+   */
+  async abandonStart(labels: Record<string, string>, reason: string): Promise<void> {
+    if (!this.settings()) return;
+    this.sql.exec("INSERT INTO abandoned_starts (labels, reason, next_ms) VALUES (?, ?, ?) ON CONFLICT (labels) DO NOTHING", labelsKey(labels), reason, Date.now());
+    await this.arm();
+  }
+
+  /** End and destroy what an abandoned start attempt made, by its labels; tried again until nest answers. */
+  private async cleanAbandonedStart(nest: Nest, key: string): Promise<void> {
+    const row = this.sql.exec("SELECT reason, passes FROM abandoned_starts WHERE labels = ?", key).toArray()[0];
+    if (!row) return;
+    const labels = JSON.parse(key) as Record<string, string>;
+    try {
+      for (const a of (await nest.listAgents(labels)).agents) if (a.agent) await nest.stopAgent(a.agent, { end: true, destroySandbox: true, reason: `start abandoned: ${row.reason as string}` });
+      for (const x of (await nest.listSandboxes(labels)).sandboxes) {
+        if (!x.sandbox) continue;
+        await nest.destroySandbox(x.sandbox).catch((e) => {
+          if (!(e instanceof NestError && e.status === 404)) throw e;
+        });
+      }
+      const passes = (row.passes as number) + 1;
+      // Again once a create still in flight can no longer land (nest's idempotency lease is 60 s).
+      if (passes >= 2) this.sql.exec("DELETE FROM abandoned_starts WHERE labels = ?", key);
+      else this.sql.exec("UPDATE abandoned_starts SET passes = ?, attempts = 0, error = NULL, next_ms = ? WHERE labels = ?", passes, Date.now() + ABANDON_RECHECK_MS, key);
+    } catch (e) {
+      const attempts = (this.sql.exec<{ attempts: number }>("SELECT attempts FROM abandoned_starts WHERE labels = ?", key).toArray()[0]?.attempts ?? 0) + 1;
+      this.sql.exec("UPDATE abandoned_starts SET attempts = ?, error = ?, next_ms = ? WHERE labels = ?", attempts, message(e), Date.now() + backoff(attempts), key);
+    }
   }
 
   /**
@@ -2281,6 +2354,12 @@ export class ProjectDO extends DurableObject<Env> {
     if (!this.settings()?.workers_edit_workflows) return null;
     const r = this.ghRow("push");
     return r && r.wf_refused === 1 && r.gone === 0 ? WORKFLOWS_REFUSED : null;
+  }
+
+  /** Whether a live worker runs on nest's repos (its layer without the app's part): only such a one has nest's push opt-in. */
+  workersOnNestRepos(): boolean {
+    const live = new Set(this.liveAgents().filter((a) => a.role === "worker").map((a) => a.agent));
+    return this.sql.exec<{ agent: string }>("SELECT agent FROM layers WHERE role = 'worker' AND github = 0").toArray().some((r) => live.has(r.agent));
   }
 
   workflowWorkers(): string[] {
@@ -3054,22 +3133,17 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /**
-   * The workflows setting turned off: each worker start in flight whose spec was frozen with it (no agent
-   * yet: its create may have been made, its answer lost) is abandoned for a new attempt, frozen afresh
-   * without it. Resending the old spec without it would be refused (its Idempotency-Key binds the
-   * request), and the task would stall. What the old attempt made is found by its labels and destroyed
-   * (`cleanAbandoned`); one still being made lands on a stale attempt, which stops it (`startWorker`).
+   * Begin a worker's start attempt frozen on nest's repos again as a new one (src/tasks.ts `step`), frozen
+   * afresh with the app's access (README.md#converging-onto-the-apps-own-access); what this one may have made
+   * goes (`cleanAbandoned`). Comments queued for it wait for the new one's brief. Recorded in its history as
+   * `restarted_on_app_access` (the page words an action it doesn't know by its name), not `start_abandoned`,
+   * which the page words as the workflows setting turned off: the one way a start was begun again before B4,
+   * for a start frozen with nest's push opt-in, which only a start on nest's repos had.
    */
-  private abandonWorkflowStarts(): void {
-    const s = this.settings()!;
-    for (const t of this.sql.exec<{ id: string; assignments: number }>("SELECT id, assignments FROM tasks WHERE state = 'assigned' AND assignee IS NULL").toArray()) {
-      const spec = this.frozenSpec(`${s.id}/${t.id}/${t.assignments}`);
-      if (!spec?.extras.github_push?.workflows) continue;
-      this.sql.exec("INSERT OR IGNORE INTO abandoned (task, start, next_ms) VALUES (?, ?, ?)", t.id, t.assignments, Date.now());
-      // A new start attempt (src/tasks.ts `step`); comments queued for it wait for this one's brief.
-      if (!this.move(t.id, "start_abandoned", { kind: "app", what: "assign" }).ok) continue;
-      this.record(t.id, { kind: "app", what: "assign" }, "start_abandoned", { start: t.assignments, reason: "workflows turned off" });
-    }
+  private abandonWorkerStart(task: string, start: number): void {
+    this.sql.exec("INSERT OR IGNORE INTO abandoned (task, start, next_ms) VALUES (?, ?, ?)", task, start, Date.now());
+    if (!this.move(task, "start_abandoned", { kind: "app", what: "assign" }).ok) return;
+    this.record(task, { kind: "app", what: "assign" }, "restarted_on_app_access", { start, reason: "frozen on nest's repos" });
   }
 
   /** Destroy what an abandoned start attempt made: its agents (and their sandboxes), then any sandbox left, by labels. */
@@ -3077,7 +3151,7 @@ export class ProjectDO extends DurableObject<Env> {
     const s = this.settings()!;
     const labels = { project: s.id, role: "worker", task, start: String(start) };
     try {
-      for (const a of (await nest.listAgents(labels)).agents) if (a.agent) await nest.stopAgent(a.agent, { end: true, destroySandbox: true, reason: "start abandoned: workflows turned off" });
+      for (const a of (await nest.listAgents(labels)).agents) if (a.agent) await nest.stopAgent(a.agent, { end: true, destroySandbox: true, reason: "start abandoned" });
       for (const x of (await nest.listSandboxes(labels)).sandboxes) {
         if (!x.sandbox) continue;
         await nest.destroySandbox(x.sandbox).catch((e) => {
@@ -3856,6 +3930,13 @@ export class ProjectDO extends DurableObject<Env> {
       return;
     }
     const labels = { project: s.id, role: "routine", routine: routine.id as string, run: id };
+    // Tried on nest's repos before the app's own GitHub access (marked so by B3's migration), with no agent yet:
+    // its key binds that request, so it ends (README.md#converging-onto-the-apps-own-access); what its attempts
+    // made is found by its labels and ended (`cleanRun`). The routine's next run is the app's.
+    if (before.nest_repos === 1 && before.agent === null) {
+      this.endRun(id, "failed", "it was started on nest's own GitHub access, which the app no longer uses: the routine's next run uses the app's", null);
+      return;
+    }
     // Its deadline, its template, its spawn's extra fields (a dreaming run's transcript grant, which expires
     // at that deadline) and its brief, decided at its first attempt and kept: a retry sends the requests its
     // keys were bound to, however the routine was edited meanwhile.
@@ -3903,17 +3984,15 @@ export class ProjectDO extends DurableObject<Env> {
       let agent = (before.agent as string | null) ?? null;
       if (!agent) {
         // No secrets and no egress beyond nest's own and the repo's: a routine reads the repo and the board.
-        // A start frozen before its spec was (a run started before the app's GitHub access) has none: nest's repos.
         // A dreaming run has no hands (no sandbox, no repo): the board, recent work, memory and transcripts are all it reads.
         if (template === TEMPLATE.dreaming) {
           agent = (await nest.createAgent({ ...spawn, template: TEMPLATE.dreaming, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent;
         } else {
           // Its GitHub access only (README.md#repo-authority): no secrets of the owner's, no egress beyond the repo's.
-          // A run already tried on nest's repos when this release came (marked by its migration) keeps them: its
-          // sandbox's Idempotency-Key binds the request it sent.
-          const legacy = before.nest_repos === 1;
-          const spec: StartSpec = legacy ? { extras: {}, names: [], brief: "", rev: 0 } : await this.sandboxSpec(nest, "routine", `${s.id}/routine/${id}`);
-          agent = await nest.startAgent(TEMPLATE.routine, labels, spawnOverrides(spec, repo!, false), `${s.id}/routine/${id}`, { ...startEgress([], spec), ...spec.extras }, spawn);
+          const spec = await this.sandboxSpec(nest, "routine", `${s.id}/routine/${id}`);
+          // The shared template as this release has it, naming no repo of nest's, whatever the last catalog sync wrote.
+          await writeSharedTemplate(nest, this.env.PUBLIC_BASE_URL, TEMPLATE.routine);
+          agent = await nest.startAgent(TEMPLATE.routine, labels, spawnOverrides(spec), `${s.id}/routine/${id}`, { ...startEgress([], spec), ...spec.extras }, spawn);
         }
         // Named on the run in the step the create's answer came, before any other await, so its exit finds it.
         this.sql.exec("UPDATE routine_runs SET agent = ? WHERE id = ? AND agent IS NULL", agent, id);
@@ -4323,6 +4402,10 @@ export class ProjectDO extends DurableObject<Env> {
       // A switch of the running manager onto the setting's model (README.md#models).
       min("SELECT MIN(switch_next_ms) AS t FROM settings WHERE switch_next_ms IS NOT NULL AND manager IS NOT NULL"),
       min("SELECT MIN(refusal_check_ms) AS t FROM settings WHERE refusal_check_ms IS NOT NULL AND manager IS NOT NULL"),
+      // A manager on nest's repos, to look at (README.md#converging-onto-the-apps-own-access), and what start
+      // attempts begun again may have made.
+      min("SELECT MIN(converge_next_ms) AS t FROM settings WHERE converge_next_ms IS NOT NULL AND manager IS NOT NULL"),
+      min("SELECT MIN(next_ms) AS t FROM abandoned_starts"),
       // Auto-merge: the repo's setting to write or read, and each task PR's change (an enable only once
       // the repo allows it).
       min(`SELECT MIN(t) AS t FROM (
@@ -4486,6 +4569,7 @@ export class ProjectDO extends DurableObject<Env> {
     const gh = this.githubDue();
     if (gh !== null && gh <= now) await this.githubUpkeep(nest);
     for (const r of this.sql.exec("SELECT task, start FROM abandoned WHERE next_ms <= ?", now).toArray()) await this.cleanAbandoned(nest, r.task as string, r.start as number);
+    for (const r of this.sql.exec("SELECT labels FROM abandoned_starts WHERE next_ms <= ?", now).toArray()) await this.cleanAbandonedStart(nest, r.labels as string);
     for (const r of this.sql.exec("SELECT task FROM issue_closes WHERE next_ms IS NOT NULL AND next_ms <= ?", now).toArray()) await this.closeIssue(nest, r.task as string);
     if (s.am_write_next_ms !== null && (s.am_write_next_ms as number) <= now) await this.writeRepoAutoMerge(nest);
     if (s.am_read_next_ms !== null && (s.am_read_next_ms as number) <= now) await this.readRepoAutoMerge(nest);
@@ -4495,6 +4579,10 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT pr, am_owed FROM task_prs WHERE am_next_ms IS NOT NULL AND am_next_ms <= ?", now).toArray()) {
       if (r.am_owed === "disable" || repoReady) await this.prAutoMerge(nest, r.pr as number);
     }
+    // A manager on nest's repos is replaced between turns (README.md#converging-onto-the-apps-own-access); its
+    // successor's start is due at once, below.
+    const c = this.settingsRow()!;
+    if (c.converge_next_ms !== null && (c.converge_next_ms as number) <= now && c.manager !== null) await this.convergeManager(nest);
     // The manager starts once the repo is attached (README.md#flows), and a replaced one only after the
     // old one's stop has been tried (README.md#the-manager-lifecycle): two managers never run at once,
     // unless nest refuses that stop (then the board answers only the new one).
@@ -4673,11 +4761,17 @@ export class ProjectDO extends DurableObject<Env> {
     );
     if (st.stop) {
       this.sql.exec("INSERT OR IGNORE INTO stops (agent, task, reason, next_ms) VALUES (?, NULL, 'manager replaced', ?)", st.stop, Date.now());
-      for (const w of this.sql.exec<{ id: string }>("SELECT id FROM waits WHERE resolved_ms IS NULL").toArray()) this.resolveWait(w.id, "ended", "the manager was replaced", false);
+      // Kept when it moves onto the app's access (README.md#converging-onto-the-apps-own-access): the waits are the
+      // app's, and its successor carries on the same work (its brief points it at them).
+      if (event.kind !== "converge") {
+        for (const w of this.sql.exec<{ id: string }>("SELECT id FROM waits WHERE resolved_ms IS NULL").toArray()) this.resolveWait(w.id, "ended", "the manager was replaced", false);
+      }
     }
     // A new manager starts on the setting's model (its start freezes it): no switch is owed to the old one.
     this.sql.exec("UPDATE settings SET manager_running_model = NULL, switch_next_ms = NULL, switch_after_turn = 0, switch_attempts = 0, switch_refusals = 0, refusal_check_ms = NULL, switch_gave_up_model = NULL");
-    const note = event.kind === "restart" ? "The manager is restarting." : l.next_ms !== null ? "A new manager is starting." : "It isn't started again by itself: restart it when you're ready.";
+    const note = event.kind === "restart" ? "The manager is restarting."
+      : event.kind === "converge" ? CONVERGE_NOTE
+      : l.next_ms !== null ? "A new manager is starting." : "It isn't started again by itself: restart it when you're ready.";
     this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), note);
     return true;
   }
@@ -4828,6 +4922,60 @@ export class ProjectDO extends DurableObject<Env> {
     return ok(this.settings()!);
   }
 
+  /**
+   * Replace a manager whose sandbox is on nest's repos with one on the app's own GitHub access
+   * (README.md#converging-onto-the-apps-own-access). A layer write can't do it: nest attaches an agent's repos
+   * to its sandbox from the agent's own spawn, and refuses the app's `GH_TOKEN` beside them; nor can an agent
+   * move to another sandbox. So it's a new manager, on a fresh sandbox, only when that costs least:
+   * - the old one fully started (its brief given), and the app's access startable now (the grant covers its
+   *   hosts, the App reaches the repo): else the old one keeps running rather than none;
+   * - between turns (nest's state, read last), with no message of the owner's waiting for it and none in the
+   *   chat, nor a turn of its own, for CONVERGE_QUIET_MS: its conversation is at a pause.
+   * Otherwise it's looked at again after CONVERGE_RECHECK_MS. Generation-guarded as a switch is: a move of the
+   * lifecycle meanwhile (an exit, the owner's Restart) makes it stale.
+   */
+  private async convergeManager(nest: Nest): Promise<void> {
+    const r = this.settingsRow()!;
+    const agent = r.manager as string | null;
+    const base = r.manager_starts as number;
+    const onNestRepos = (a: string) => this.sql.exec("SELECT 1 FROM layers WHERE agent = ? AND github = 1", a).toArray().length === 0;
+    if (!agent || !onNestRepos(agent)) {
+      this.sql.exec("UPDATE settings SET converge_next_ms = NULL");
+      return;
+    }
+    const later = () => this.sql.exec("UPDATE settings SET converge_next_ms = ?", Date.now() + CONVERGE_RECHECK_MS);
+    if (r.manager_next_ms !== null || r.gh_unreachable === 1 || !this.chatQuiet()) return void later();
+    const grant = await this.readGrant(nest);
+    const same = () => {
+      const now = this.settingsRow();
+      return !!now && now.manager === agent && now.manager_starts === base && now.manager_next_ms === null;
+    };
+    // Stale (a move of the lifecycle meanwhile), or not now: looked at again later, whichever manager it is then
+    // (one on the app's access is then left as it is), never at once, so the alarm doesn't spin on it.
+    if (!same() || grant === null || githubGrantMissing(grant)) return void later();
+    let view: AgentView;
+    try {
+      view = await nest.getAgent(agent);
+    } catch {
+      // Gone (its end moves the lifecycle on its own) or unread.
+      return void later();
+    }
+    // Everything again after the read, in the step that moves: nothing of the owner's arrived meanwhile.
+    if (!same() || !onNestRepos(agent) || view.ended || !BETWEEN_TURNS.has(String(view.state ?? "")) || !this.chatQuiet()) return void later();
+    this.managerMove({ kind: "converge", agent });
+    this.sql.exec("UPDATE settings SET converge_next_ms = NULL");
+    // Its stop, then its successor's start, in this drain: both are due from now, after this pass's clock.
+    this.again = true;
+  }
+
+  /** No message of the owner's waits for the manager, and none, nor a turn of the manager's, in the last CONVERGE_QUIET_MS. */
+  private chatQuiet(): boolean {
+    if (this.sql.exec("SELECT 1 FROM chat WHERE next_ms IS NOT NULL LIMIT 1").toArray().length) return false;
+    const m = this.settingsRow()!.manager as string | null;
+    if (m && this.sql.exec("SELECT 1 FROM messages WHERE to_agent = ? AND next_ms IS NOT NULL LIMIT 1", m).toArray().length) return false;
+    return this.sql.exec("SELECT 1 FROM chat WHERE sender != 'app' AND at_ms > ? LIMIT 1", Date.now() - CONVERGE_QUIET_MS).toArray().length === 0;
+  }
+
   /** nest no longer has the manager, or has ended it (the page's lookup found it so): as its exit, missed or not. */
   async managerGone(agent: string, reason: string): Promise<boolean> {
     if (!this.settings()) return false;
@@ -4852,9 +5000,18 @@ export class ProjectDO extends DurableObject<Env> {
       const frozen = await this.frozenEgress(nest, key, "manager");
       // Its bindings, env and workflows, frozen with the same key (README.md#secrets).
       const spec = await this.sandboxSpec(nest, "manager", key, { ensure: !s.manager });
+      if (!s.manager && !spec.github) {
+        // Frozen on nest's repos before the app's own GitHub access, with no agent yet: begun again as a new start,
+        // frozen afresh (README.md#converging-onto-the-apps-own-access); what this one may have made goes by its labels.
+        if (!current()) return;
+        this.sql.exec("INSERT INTO abandoned_starts (labels, reason, next_ms) VALUES (?, ?, ?) ON CONFLICT (labels) DO NOTHING", labelsKey(labels), "frozen on nest's repos", Date.now());
+        this.sql.exec("UPDATE settings SET manager_starts = manager_starts + 1, manager_next_ms = ? WHERE manager_starts = ? AND manager IS NULL", Date.now(), base);
+        this.again = true;
+        return;
+      }
       const from = s.manager ? null : await this.templateFor(nest, "manager", spec);
       const repo = await this.repo();
-      const agent = s.manager ?? (await nest.startAgent(from!, labels, spawnOverrides(spec, repo, false), key, { ...startEgress(frozen.egress, spec), ...spec.extras }));
+      const agent = s.manager ?? (await nest.startAgent(from!, labels, spawnOverrides(spec), key, { ...startEgress(frozen.egress, spec), ...spec.extras }));
       if (from) this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       if (!current()) {
@@ -4865,7 +5022,9 @@ export class ProjectDO extends DurableObject<Env> {
       this.sql.exec("UPDATE settings SET manager = ?", agent);
       this.trackLayer(agent, "manager", frozen.rev, !!spec.github);
       this.recordHolder(agent, "manager", spec.names);
-      await nest.postInbox(agent, managerBrief(s, repo) + spec.brief, { requestId: `${s.id}/manager/${n}/brief` });
+      // A manager before it said something in the chat: its conversation didn't carry over, and this one is told so.
+      const after = this.sql.exec("SELECT 1 FROM chat WHERE sender = 'manager' LIMIT 1").toArray().length > 0;
+      await nest.postInbox(agent, managerBrief(s, repo, after) + spec.brief, { requestId: `${s.id}/manager/${n}/brief` });
       // Done only if nothing moved meanwhile (it exited during its brief, the owner restarted it): else
       // that move's own start stands.
       const done = this.sql.exec(
@@ -4876,6 +5035,9 @@ export class ProjectDO extends DurableObject<Env> {
         // The model it runs on, as its start froze it: one frozen before the setting changed is switched now.
         this.sql.exec("UPDATE settings SET manager_running_model = ?", spec.model ?? null);
         this.oweManagerSwitch();
+        // Made on nest's repos (a start frozen so whose agent was made before this release): replaced between
+        // turns (README.md#converging-onto-the-apps-own-access). On the app's access: nothing to look at.
+        this.sql.exec("UPDATE settings SET converge_next_ms = ?", spec.github ? null : Date.now());
       }
       // The owner's messages that waited for a manager go now, not at their next retry.
       if (done) this.sql.exec("UPDATE chat SET next_ms = ? WHERE next_ms IS NOT NULL", Date.now());
@@ -4909,8 +5071,16 @@ export class ProjectDO extends DurableObject<Env> {
         const key = `${s.id}/${id}/${n}`;
         const frozen = await this.frozenEgress(nest, key, "worker");
         const spec = await this.sandboxSpec(nest, "worker", key);
+        if (!spec.github) {
+          // Frozen on nest's repos before the app's own GitHub access: begun again as a new attempt, frozen afresh
+          // (README.md#converging-onto-the-apps-own-access); what this one may have made goes (`cleanAbandoned`).
+          if (!current()) return;
+          this.abandonWorkerStart(id, n);
+          this.again = true;
+          return;
+        }
         const from = await this.templateFor(nest, "worker", spec);
-        agent = await nest.startAgent(from, labels, spawnOverrides(spec, await this.repo(), true), key, { ...startEgress(frozen.egress, spec), ...spec.extras });
+        agent = await nest.startAgent(from, labels, spawnOverrides(spec), key, { ...startEgress(frozen.egress, spec), ...spec.extras });
         // In the step the create's answer came (no await): the template it started from, for the sweep.
         this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
         if (!current()) {
@@ -5188,12 +5358,22 @@ function githubBrief(kind: GithubKind, repo: string): string {
   ].join("\n");
 }
 
-function managerBrief(s: ProjectSettings, repo: string): string {
+/** The chat's word when a manager on nest's repos is replaced by one on the app's access (README.md#converging-onto-the-apps-own-access). */
+export const CONVERGE_NOTE = "The manager is moving to a fresh sandbox with the app's own GitHub access: a new manager is starting. The board, this chat and the project's memory stay; its conversation starts afresh.";
+
+/** `after`: a manager ran the project before (it said something in the chat), so this one is told its conversation didn't carry over. */
+function managerBrief(s: ProjectSettings, repo: string, after = false): string {
   return [
     `You manage project "${s.name}" (${s.id}) for the GitHub repo ${repo}.`,
     `Clone it in your sandbox to read it (\`gh repo clone ${repo}\` or git over https), then list the board with projects-board list_tasks and spec any task that has no spec yet.`,
+    ...(after ? ["A manager ran this project before you, and its conversation didn't carry over: the board, its tasks' histories and the project's memory (memory_list) are where things stand, and list_waits shows any wait still pending."] : []),
     "The owner's messages come next, in your inbox.",
   ].join("\n");
+}
+
+/** A start attempt's labels as one key: JSON, keys sorted. */
+function labelsKey(labels: Record<string, string>): string {
+  return JSON.stringify(Object.fromEntries(Object.entries(labels).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))));
 }
 
 function workerBrief(repo: string, t: Task): string {
@@ -5334,9 +5514,12 @@ export interface StartSpec {
   /**
    * The app's own GitHub access (README.md#the-sandboxes-github-access): the egress the API needs and the guards,
    * which (with its binding and environment) are also in `extras`, the sandbox's own. Absent: frozen before this
-   * release, so the start keeps nest's repos (a new start waits for the grant instead: it never freezes without).
+   * release, so the start was on nest's repos: it's begun again as a new attempt instead (README.md#converging-onto-the-apps-own-access).
+   * A new start waits for the grant instead: it never freezes without.
    */
   github?: { egress: EgressRule[]; guards: Guard[] };
+  /** Its spawn's overrides (`spawnOverrides`): none. Absent: frozen by the release before, which narrowed nest's repos to none. */
+  overrides?: SpawnOverrides;
 }
 
 

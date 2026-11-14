@@ -297,6 +297,9 @@ describe("the outboxes' migration", () => {
       sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_gen");
       sql.exec("ALTER TABLE routine_runs DROP COLUMN nest_repos");
       sql.exec("ALTER TABLE layers DROP COLUMN github");
+      // And the convergence step's (README.md#converging-onto-the-apps-own-access).
+      sql.exec("ALTER TABLE settings DROP COLUMN converge_next_ms");
+      sql.exec("DROP TABLE abandoned_starts");
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec("INSERT INTO task_prs (pr, task, state, attached_by, attached_ms) VALUES (61, 'tsk_gone', 'open', 'owner', 1), (62, 'tsk_gone', 'detached', 'owner', 1), (63, ?, 'open', 'owner', 1)", t.id);
       migrate(st.storage, MIGRATIONS);

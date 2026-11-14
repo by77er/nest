@@ -111,12 +111,11 @@ describe("the access (pure)", () => {
     expect(g.map((x) => x.name)).toEqual(["github-push", "github-write", "github-api-write", "gist-write", "githubusercontent-write"]);
   });
 
-  it("a start frozen with the access narrows nest's repos to none (its guards are the sandbox's) and adds the GitHub hosts no rule names; one frozen before it, nest's repos", () => {
+  it("a start's spawn sends the overrides it froze (none since B4; one frozen by B3, nest's repos narrowed to none, sent again), and adds the GitHub hosts no rule names", () => {
     const spec = { github: { egress: [{ host: "github.com" }, { host: "api.github.com" }], guards: githubGuards("o/r", "read") } };
-    // nest's repos narrowed to none, whatever a shared template not synced since still names.
-    expect(spawnOverrides(spec, "o/r", false)).toEqual({ repos: [], read_repos: [] });
-    expect(spawnOverrides({}, "o/r", true)).toEqual({ repos: ["o/r"] });
-    expect(spawnOverrides({}, "o/r", false)).toEqual({ read_repos: ["o/r"] });
+    expect(spawnOverrides({ ...spec, overrides: {} })).toEqual({});
+    // Its retries send the request its Idempotency-Key is bound to.
+    expect(spawnOverrides(spec)).toEqual({ repos: [], read_repos: [] });
     expect(startEgress([{ host: "github.com", ports: [443] }, { host: "pypi.org" }], spec)).toEqual({ egress: { allow: [{ host: "github.com", ports: [443] }, { host: "pypi.org" }, { host: "api.github.com" }] } });
     expect(startEgress([], {})).toEqual({});
   });
@@ -301,7 +300,7 @@ describe("the sandbox of each role", () => {
     expect(create!.body.egress).toEqual({ allow: [{ host: "github.com" }, { host: "api.github.com" }, { host: "*.githubusercontent.com" }] });
     expect(create!.body).not.toHaveProperty("github_push");
     const [agent] = agentCreateOf({ project: p.id, role: "manager" });
-    expect(agent!.body.overrides).toEqual({ repos: [], read_repos: [] });
+    expect(agent!.body.overrides).toEqual({});
     expect(fake.sandboxes.get(fake.agents.get(p.manager!)!.sandbox!)!.layer.guards).toEqual(githubGuards(p.repo, "read"));
     // Its brief says git and gh are set up, never the placeholder.
     const brief = fake.inbox.find((m) => m.agent === p.manager)!.text;
@@ -320,7 +319,7 @@ describe("the sandbox of each role", () => {
     expect(create!.body.env.GH_TOKEN).toBe(`nest-ph.${CLIENT}.gh_push.`);
     expect(create!.body).not.toHaveProperty("github_push");
     const [agent] = agentCreateOf({ project: p.id, role: "worker", task: t.id });
-    expect(agent!.body.overrides).toEqual({ repos: [], read_repos: [] });
+    expect(agent!.body.overrides).toEqual({});
     expect(create!.body.guards).toEqual(githubGuards(p.repo, "push"));
     expect(fake.inbox.find((m) => m.agent === t.assignee)!.text).toContain(`They push only to ${p.repo}.`);
     // A second worker shares the project's push token: no second mint.
@@ -336,24 +335,36 @@ describe("the sandbox of each role", () => {
     expect((create!.body.inject as { name: string }[]).map((b) => b.name)).toEqual(["gh_read"]);
     expect(create!.body.egress.allow).toContainEqual({ host: "api.github.com" });
     const [agent] = agentCreateOf({ project: p.id, role: "reviewer" });
-    expect(agent!.body.overrides).toEqual({ repos: [], read_repos: [] });
+    expect(agent!.body.overrides).toEqual({});
     expect(create!.body.guards).toEqual(githubGuards(p.repo, "read"));
   });
 
-  it("a shared template not synced since the deploy, still naming every repo, is narrowed to none: nest gives the agent no token of its own", async () => {
+  it("a shared template not synced since the deploy, still naming every repo, is written again before a start from it: nest gives the agent no token of its own, with no narrowing", async () => {
     const p = await newProject();
-    const name = "templates/projects/reviewer";
-    const synced = fake.catalog.get(name);
-    // As the catalog sync before this release wrote it.
-    fake.catalog.set(name, { ...(synced as object), read_repos: ["someone/else", p.repo] });
+    const names = ["templates/projects/reviewer", "templates/projects/routine"];
+    const synced = names.map((n) => fake.catalog.get(n));
+    // As the catalog sync of a release before B3 wrote them.
+    names.forEach((n, i) => fake.catalog.set(n, { ...(synced[i] as object), read_repos: ["someone/else", p.repo] }));
     try {
       await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 5, sha: sha(), action: "opened" }));
       await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
+      expect(fake.catalog.get(names[0]!)).toEqual(synced[0]);
       const [agent] = agentCreateOf({ project: p.id, role: "reviewer" });
-      expect(agent!.body.overrides).toMatchObject({ repos: [], read_repos: [] });
+      expect(agent!.body.overrides).toEqual({});
       expect([...fake.agents.values()].filter((a) => a.labels.project === p.id && a.labels.role === "reviewer")).toHaveLength(1);
+      // A routine run's too.
+      const routine = (await api(token, "POST", `/api/projects/${p.id}/routines`, {
+        name: "R", kind: "custom", prompt: "Look around.", enabled: true, triggers: { timer: null, tasks_done: null, prs_merged: null },
+        cooldown_min: 0, max_minutes: 30, max_turns: 3, proposals: "triage",
+      })).body.id as string;
+      await api(token, "POST", `/api/projects/${p.id}/routines/${routine}/run`);
+      await drain(p);
+      expect(fake.catalog.get(names[1]!)).toEqual(synced[1]);
+      const [run] = agentCreateOf({ project: p.id, role: "routine" });
+      expect(run!.body.overrides).toEqual({});
+      expect([...fake.agents.values()].filter((a) => a.labels.project === p.id && a.labels.role === "routine")).toHaveLength(1);
     } finally {
-      fake.catalog.set(name, synced);
+      names.forEach((n, i) => fake.catalog.set(n, synced[i]));
     }
   });
 

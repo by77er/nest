@@ -50,21 +50,19 @@ async function assignedWorker(p: P) {
   return { task: t.id as string, worker: a.assignee as string };
 }
 /**
- * A worker whose start was frozen before the app's own GitHub access (README.md#repo-authority): on nest's repos,
- * with nest's push opt-in as the settings had it, as a start in flight across that release is. Its template is
- * written with the repo, and its layer keeps nest's opt-in (B4 converges such workers).
+ * A live worker started before the app's own GitHub access (README.md#repo-authority): on nest's repos, with nest's
+ * push opt-in as the settings had it, as B3 left one it started from a spec frozen before it. Since B4 nothing
+ * starts so, so it's planted: a worker started now, its layer then made one without the app's part, its sandbox
+ * with nest's opt-in. Its layer keeps nest's opt-in until it ends (README.md#converging-onto-the-apps-own-access).
  */
-async function legacyWorker(p: P, o: { workflows?: boolean; assign?: boolean } = {}) {
-  const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "t" })).body;
-  await api(token, "PUT", `/api/projects/${p.id}/tasks/${t.id}/spec`, spec);
-  const frozen = { extras: o.workflows ? { github_push: { workflows: true } } : {}, names: [], brief: "", rev: 0, model: "claude-opus-5-5" };
+async function legacyWorker(p: P, o: { workflows?: boolean } = {}) {
+  const w = await assignedWorker(p);
   await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => {
-    st.storage.sql.exec("INSERT INTO start_specs (key, spec, at_ms) VALUES (?, ?, ?)", `${p.id}/${t.id}/1`, JSON.stringify(frozen), Date.now());
+    st.storage.sql.exec("UPDATE layers SET github = 0 WHERE agent = ?", w.worker);
+    st.storage.sql.exec("UPDATE agent_secrets SET workflows = ? WHERE agent = ?", o.workflows ? 1 : 0, w.worker);
   });
-  if (o.assign === false) return { task: t.id as string, worker: "" };
-  const a = (await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`)).body;
-  expect(fake.agents.get(a.assignee)!.overrides).toEqual({ repos: [p.repo] });
-  return { task: t.id as string, worker: a.assignee as string };
+  fake.sandboxes.get(fake.agents.get(w.worker)!.sandbox!)!.github_push = o.workflows ? { workflows: true } : null;
+  return w;
 }
 /** nest's name for a project's secret: `<project>-<name>-<generation>`, the generation new at each creation. */
 const nestKey = (p: { id: string }, name: string) => [...fake.secrets.keys()].find((k) => new RegExp(`^${p.id}-${name}-[a-z0-9]{6}$`).test(k));
@@ -564,55 +562,26 @@ describe("workers editing CI workflows", () => {
     }
   });
 
-  it("off mid-start (one frozen on nest's repos): the attempt is abandoned for a new one without it, and what the old one made is destroyed", async () => {
+  it("off: a live worker on nest's repos that had nest's opt-in loses it, through its layer", async () => {
     const p = await newProject();
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
     const live = await legacyWorker(p, { workflows: true });
-    // A start whose sandbox was made with workflows, its answer lost: in flight.
-    fake.lost.push({ match: /^POST \/v1\/sandboxes$/, times: 1 });
-    const t = { id: (await legacyWorker(p, { workflows: true, assign: false })).task };
-    await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`);
-    const made = [...fake.sandboxes.values()].filter((x) => x.labels.task === t.id);
-    expect(made).toHaveLength(1);
-    expect(made[0]!.github_push).toEqual({ workflows: true });
-    const first = made[0]!.labels.start;
+    expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.workflow_workers).toEqual([live.worker]);
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: false });
-    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => { st.storage.sql.exec("UPDATE tasks SET start_next_ms = 0 WHERE start_next_ms IS NOT NULL"); });
     await drain(p);
-    // The old attempt's sandbox, found by its labels, is gone; a new attempt started without workflows.
-    expect(made[0]!.ended).toBe(true);
-    const fresh = [...fake.sandboxes.values()].filter((x) => x.labels.task === t.id && !x.ended);
-    expect(fresh).toHaveLength(1);
-    expect(fresh[0]!.labels.start).not.toBe(first);
-    expect(fresh[0]!.github_push).toBeNull();
-    // The new attempt is frozen now: the app's own GitHub access, not nest's repos.
-    expect(fresh[0]!.layer.guards?.length).toBeGreaterThan(0);
-    expect([...fake.agents.values()].find((a) => a.sandbox === fresh[0]!.sandbox)!.overrides).toEqual({ repos: [], read_repos: [] });
-    const task = (await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body;
-    expect(task.state).toBe("in_progress");
-    expect(task.history.some((h: { action: string }) => h.action === "start_abandoned")).toBe(true);
-    // Nothing of the old attempt's was resent with its key: no 409.
-    expect(fake.calls.filter((c) => c.path === "/v1/sandboxes" && c.method === "POST" && c.body.labels?.task === t.id && c.body.labels?.start === first)).toHaveLength(1);
-    // The live worker that had it loses it too, through its layer.
     expect(sandboxOf(live.worker).github_push).toBeNull();
     expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.workflow_workers).toEqual([]);
-    // Looked for once more after the lease (a create still in flight may land late), then forgotten.
-    const late = { ...made[0]!, sandbox: "sbx_late1", ended: false };
-    fake.sandboxes.set(late.sandbox, late);
-    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => { st.storage.sql.exec("UPDATE abandoned SET next_ms = 0"); });
-    await drain(p);
-    expect(fake.sandboxes.get("sbx_late1")!.ended).toBe(true);
-    expect(await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM abandoned").one().n)).toBe(0);
   });
 
-  it("is off by default; on, a start frozen on nest's repos asks nest's opt-in for worker sandboxes only, within the grant", async () => {
+  it("is off by default; no start asks nest's opt-in; a live worker on nest's repos keeps it only within the grant", async () => {
     const p = await newProject();
     expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.workers_edit_workflows).toBe(false);
     const before = await legacyWorker(p);
     expect(sandboxOf(before.worker).github_push).toBeNull();
     expect((await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true })).body.workers_edit_workflows).toBe(true);
+    await drain(p);
+    expect(sandboxOf(before.worker).github_push).toEqual({ workflows: true });
     const after = await legacyWorker(p, { workflows: true });
-    expect(sandboxOf(after.worker).github_push).toEqual({ workflows: true });
     // A start frozen now never asks it: the project's push token carries workflows itself.
     expect(sandboxOf((await assignedWorker(p)).worker).github_push).toBeNull();
     await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 2, sha: sha(), action: "opened" }));
@@ -632,6 +601,23 @@ describe("workers editing CI workflows", () => {
       await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => { st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0"); });
       await drain(p);
       expect(sandboxOf(after.worker).github_push).toBeNull();
+      // The Secrets page hears nest's grant bounds them.
+      expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.grant.workflows).toBe(false);
+    } finally {
+      fake.grant.github_push = saved;
+    }
+  });
+
+  it("with no live worker on nest's repos, nest's grant bounds no worker's workflows, whatever its github_push says", async () => {
+    const p = await newProject();
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
+    await assignedWorker(p);
+    const saved = fake.grant.github_push;
+    fake.grant.github_push = undefined;
+    try {
+      expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.grant.workflows).toBe(true);
+      await legacyWorker(p);
+      expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.grant.workflows).toBe(false);
     } finally {
       fake.grant.github_push = saved;
     }

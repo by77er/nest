@@ -288,8 +288,11 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     }
     case "GET secrets": {
       // Metadata only: the app's, with nest's last injection and size; never a value.
-      const [mine, g, layers] = await Promise.all([p.secrets(), grantOf(env), p.network()]);
+      const [mine, g, layers, legacy] = await Promise.all([p.secrets(), grantOf(env), p.network(), p.workersOnNestRepos()]);
       if (!mine.ok) return done(mine);
+      // nest's grant bounds workflows only for a live worker on nest's repos (its push opt-in): with none, it bounds
+      // nothing, whatever its `github_push` says (README.md#converging-onto-the-apps-own-access).
+      if (g.ok && !legacy) g.value.workflows = true;
       const nest = nestFrom(env);
       let theirs: Map<string, { size: number; last_injected_ms: number | null }> = new Map();
       if (nest) {

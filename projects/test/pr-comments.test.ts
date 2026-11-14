@@ -180,6 +180,9 @@ describe("who is set", () => {
       sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_id");
       sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_gen");
       sql.exec("ALTER TABLE layers DROP COLUMN github");
+      // And the convergence step's (README.md#converging-onto-the-apps-own-access).
+      sql.exec("ALTER TABLE settings DROP COLUMN converge_next_ms");
+      sql.exec("DROP TABLE abandoned_starts");
       sql.exec("UPDATE schema_version SET v = ?", step);
       migrate(st.storage, MIGRATIONS);
       expect(sql.exec("SELECT attach_next_ms FROM settings").one().attach_next_ms).toBe(0);
@@ -230,6 +233,9 @@ describe("who is set", () => {
       sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_gen");
       sql.exec("ALTER TABLE routine_runs DROP COLUMN nest_repos");
         sql.exec("ALTER TABLE layers DROP COLUMN github");
+        // And the convergence step's (README.md#converging-onto-the-apps-own-access).
+        sql.exec("ALTER TABLE settings DROP COLUMN converge_next_ms");
+        sql.exec("DROP TABLE abandoned_starts");
         sql.exec("UPDATE schema_version SET v = ?", step);
         migrate(st.storage, MIGRATIONS);
         return sql.exec("SELECT comments_default_id AS d FROM settings").one().d;
@@ -254,6 +260,9 @@ describe("who is set", () => {
       sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_gen");
       sql.exec("ALTER TABLE routine_runs DROP COLUMN nest_repos");
       sql.exec("ALTER TABLE layers DROP COLUMN github");
+      // And the convergence step's (README.md#converging-onto-the-apps-own-access).
+      sql.exec("ALTER TABLE settings DROP COLUMN converge_next_ms");
+      sql.exec("DROP TABLE abandoned_starts");
       sql.exec("UPDATE settings SET repo_owner_id = 55501, repo_owner_login = 'interim'");
       sql.exec("UPDATE schema_version SET v = ?", step);
       migrate(st.storage, MIGRATIONS);
