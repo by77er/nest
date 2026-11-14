@@ -38,7 +38,8 @@
           "type": "authorization_bearer"
         },
         {
-          "type": "authorization_basic_password"
+          "type": "authorization_basic_password",
+          "username": "x-access-token"
         }
       ]
     }
@@ -163,7 +164,8 @@
             "POST"
           ],
           "path": "/graphql",
-          "injected": "github"
+          "injected": "github",
+          "at": "authorization"
         }
       ]
     },

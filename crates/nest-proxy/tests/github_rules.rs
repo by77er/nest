@@ -5,7 +5,7 @@
 //! the proxy evaluates real GitHub request shapes against them.
 
 use nest_protocol::model::EgressPolicy;
-use nest_proxy::guard::{BodyView, Req, refusing};
+use nest_proxy::guard::{BodyView, Req, Whole, refusing};
 
 fn fixture(name: &str) -> EgressPolicy {
     let p = format!("{}/../../protocol/fixtures/control/egress_policy/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -16,7 +16,8 @@ fn policy() -> EgressPolicy {
     fixture("egress_policy.github.json")
 }
 
-/// `(host, method, path?query, body, injected, refused)`.
+/// `(host, method, path?query, body, injected, refused)`; `injected` wrote `Authorization` whole (a bearer token,
+/// or a Basic one with the binding's username).
 type Case = (&'static str, &'static str, &'static str, Option<&'static str>, Option<&'static str>, bool);
 
 #[test]
@@ -120,8 +121,24 @@ fn check(p: &EgressPolicy, cases: &[Case]) {
             (Some(_), Some(v)) => BodyView::Json(v),
             (Some(_), None) => BodyView::Unknown,
         };
-        let req = Req { host, method, path, query, injected, whole: &[] };
+        let whole: Vec<Whole> = injected.map(|b| Whole { header: "authorization".into(), binding: b.into() }).into_iter().collect();
+        let req = Req { host, method, path, query, injected, whole: &whole };
         let got = refusing(&p.guards, &req.prepare().unwrap(), &view).map(|g| g.name.clone());
         assert_eq!(got.is_some(), want, "{method} {host}{target}: {got:?}");
     }
+}
+
+/// GraphQL's exception needs the sandbox's own token written whole into `Authorization` (`at`): substituted as a
+/// Basic password beside a username the sandbox chose, it isn't, so a credential of its own can't ride along.
+#[test]
+fn graphql_needs_the_sandboxs_own_token_whole() {
+    let p = policy();
+    let body = serde_json::json!({"query": "mutation{}"});
+    let decide = |whole: &[Whole]| {
+        let req = Req { host: "api.github.com", method: "POST", path: "/graphql", query: None, injected: Some("github"), whole };
+        refusing(&p.guards, &req.prepare().unwrap(), &BodyView::Json(&body)).map(|g| g.name.clone())
+    };
+    assert_eq!(decide(&[Whole { header: "authorization".into(), binding: "github".into() }]), None);
+    assert_eq!(decide(&[]).as_deref(), Some("github-api-write"));
+    assert_eq!(decide(&[Whole { header: "x-other".into(), binding: "github".into() }]).as_deref(), Some("github-api-write"));
 }

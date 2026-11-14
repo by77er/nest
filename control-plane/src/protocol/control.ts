@@ -130,6 +130,12 @@ export const HostHello = z.object({
   guard_bounds: z.boolean().optional(),
   /** This host's nest-proxy reads a guard's `injected: "*"` as any binding (absent from a host of the previous release, which reads it as a name). */
   guard_injected_any: z.boolean().optional(),
+  /**
+   * Its nest-proxy writes a binding's Basic `username` with the secret and takes a Basic substitution as whole
+   * (`at`) only then (docs/sandbox/networking/egress/policy/#any-injected-credential). Absent: the previous
+   * release, which keeps the request's username and takes any Basic substitution as whole.
+   */
+  guard_basic_user: z.boolean().optional(),
   sandboxes: z.array(SandboxReport),
   agents: z.array(AgentReport),
   capacity: Capacity,
