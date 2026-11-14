@@ -6,6 +6,7 @@ A release's rollout rule ([Rollout rules](../deploy.md#rollout-rules)), for the 
 1. **nest's #271 and #273 live, #274 preferably:**
    - #271: the GitHub constructor's guards let a credential nest injected write where nest has no token of its own. Without it, nest refuses every push and API write of a new spawn's sandbox: workers can't push or open PRs.
    - #273: a Basic location's `username`, which the app's bindings name (`x-access-token`). Without it, nest refuses each start's sandbox create for good (400, an unknown key): workers' tasks stall, reviews fail and the manager retries, each with the error shown. So it must be live first.
+   - Sandbox hosts that enforce `at` (their hello says `guard_basic_user` and `guard_sealed_segments`, the host release from #271 on): every new spawn's sandbox holds no repos, so GitHub's guards use `at` and FleetDO places it only on such a host. With none, starts wait unplaced (nest's placement), shown as the start's error.
    - #274: `hosts_not_ready`, the code the app waits on; until it's live, nest's `conflict` in its words is matched instead.
 2. **The operator widens the projects client's grant** (approved by the owner, 2026-11-13; `PATCH /v1/admin/clients/<id>`, the whole grant):
    - `inject_hosts` += `github.com`, `api.github.com` (the tokens' binding);
