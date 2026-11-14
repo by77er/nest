@@ -294,6 +294,8 @@ describe("client request guards on a sandbox", () => {
     await connectHost(c.cell, "sandbox", { guard_bounds: false });
     const layer = await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { guards: [NO_DELETE] } });
     expect(layer.status).toBe(409);
+    // A code of its own, so a client tells it from another conflict without reading the message.
+    expect(layer.body.error).toMatchObject({ code: "hosts_not_ready", retryable: false });
     expect(layer.body.error.message).toContain("bound guarded requests");
     expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`)).guards).toEqual([]);
     // A layer without guards still goes through.
