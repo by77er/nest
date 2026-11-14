@@ -30,7 +30,7 @@ import { GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING, githu
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
 import { githubEnvConflict, githubEnvRefusal, isGithubEnvName, slotEnv } from "../lib/sandbox-env";
-import { basicAtFailsOpen, freshInjectedAny, injectedAnyConflict, usesAt } from "../lib/injected-any";
+import { freshInjectedAny, hasBasicBinding, injectedAnyConflict, usesAt } from "../lib/injected-any";
 import { CLIENT_GUARD_PREFIX, type ClientGuard, distinctGuards, type HeldGuard, layerOverLimit, outsideOperatorRouting, sandboxGuardsOverLimit, wireGuard } from "../lib/client-guards";
 import type { MintedInjection, SecretsChangedAnswer } from "./broker";
 import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
@@ -1609,8 +1609,8 @@ export class SandboxDO extends DurableObject<Env> {
       if (lease.gone(this.info_().state)) throw new NestError(ErrorCodes.FORBIDDEN, `sandbox is ${this.info_().state}`, 409);
     }
     if (extra.guards?.length) this.checkGuardLimit(undefined, { id: agent, guards: extra.guards });
-    // Its bindings or guards newly putting `at` beside a Basic binding: every host must write its username.
-    if (extra.inject?.length || counted.length) {
+    // Its bindings newly bringing a Basic one: every host must write its username.
+    if (extra.inject?.length) {
       await this.requireBasicUser(cur.cell, () => {
         this.setAgentExtras(agent, extra);
         const i = this.info_();
@@ -1912,19 +1912,24 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * Whether its effective policy has `at` beside a Basic binding (`basicAtFailsOpen`): a nest-proxy without
-   * `guard_basic_user` would take a username the sandbox chose as nest's.
+   * Whether a binding of its layers (the operator's, its client's, its agents') has a Basic password location
+   * (`hasBasicBinding`): a nest-proxy without `guard_basic_user` would take a username the sandbox chose as
+   * nest's for any `at`, now or later. The binding nest builds from its repos isn't a layer's: it comes and goes
+   * with them (docs/sandbox/networking/egress/policy/#any-injected-credential).
    */
   private basicOpen(): boolean {
-    const p = this.sourcedPolicy();
-    return basicAtFailsOpen(p.guards ?? [], p.inject ?? []);
+    const ws = this.operatorLayer();
+    const access = this.repoAccess();
+    const built = [...ws.inject, ...githubEgress(access.push, access.read, ws.inject).inject.filter((b) => !ws.inject.some((w) => w.name === b.name))];
+    return hasBasicBinding([...ws.inject, ...this.appliedClientInjections(built.map((b) => b.name)).map(wireBinding)]);
   }
 
   /**
-   * Refuse (409) a write that newly gives the sandbox `at` beside a Basic binding while any sandbox host of its
-   * cell lacks `guard_basic_user` (docs/sandbox/networking/egress/policy/#any-injected-credential). Placement
-   * keeps such a sandbox off those hosts only when it's placed; a live one may already be on one. `change`
-   * stores the write as it would be: it's applied, judged and undone in one synchronous transaction.
+   * Refuse (409) a write that newly gives a layer of the sandbox a Basic password binding while any sandbox host
+   * of its cell lacks `guard_basic_user` (docs/sandbox/networking/egress/policy/#any-injected-credential),
+   * whether or not a guard uses `at` now. Placement keeps such a sandbox off those hosts only when it's placed;
+   * a live one may already be on one. `change` stores the write as it would be: it's applied, judged and undone
+   * in one synchronous transaction.
    */
   private async requireBasicUser(cell: string, change: () => void): Promise<void> {
     if (this.basicOpen()) return;
@@ -1942,7 +1947,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (!after) return;
     const old = await this.fleet(cell).hostsWithoutBasicUser();
     if (old.length) {
-      throw new NestError(ErrorCodes.HOSTS_NOT_READY, `a binding with a Basic password beside a guard using "at" needs every sandbox host of cell ${cell} to write a binding's Basic username itself; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
+      throw new NestError(ErrorCodes.HOSTS_NOT_READY, `a binding with a Basic password needs every sandbox host of cell ${cell} to write a binding's Basic username itself; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
     }
   }
 

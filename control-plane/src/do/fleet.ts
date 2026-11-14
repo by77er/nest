@@ -2,7 +2,7 @@
 // leases and their expiry, STONITH, placement, and command delivery with exactly-one results.
 import { DurableObject } from "cloudflare:workers";
 import { CLIENT_GUARD_PREFIX } from "../lib/client-guards";
-import { basicAtFailsOpen, failsOpenOnOldProxy, freshInjectedAny, injectedAnyConflict, usesAt } from "../lib/injected-any";
+import { failsOpenOnOldProxy, hasBasicBinding, freshInjectedAny, injectedAnyConflict, usesAt } from "../lib/injected-any";
 import { healthRead, isHealthInstance } from "../lib/health";
 import { rekeyHostAgents } from "./fleet-rekey";
 import { z } from "zod";
@@ -1740,8 +1740,8 @@ export class FleetDO extends DurableObject<Env> {
     const guarded = (req.policy.guards ?? []).some((g) => g.name.startsWith(CLIENT_GUARD_PREFIX));
     const all = [...(req.policy.guards ?? []), ...this.storedEgressBase().guards];
     const opens = failsOpenOnOldProxy(all);
-    // `at` beside a Basic binding: a proxy without `guard_basic_user` takes a username the sandbox chose as nest's.
-    const basic = basicAtFailsOpen(all, req.policy.inject ?? []);
+    // A Basic binding: a proxy without `guard_basic_user` takes a username the sandbox chose as nest's, for any `at`.
+    const basic = hasBasicBinding(req.policy.inject ?? []);
     const where = ["wedged_ms IS NULL", ...(guarded ? ["guard_bounds = 1"] : []), ...(opens ? ["guard_injected_any = 1"] : []), ...(basic ? ["guard_basic_user = 1"] : [])].join(" AND ");
     const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where })
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
@@ -3238,7 +3238,7 @@ export class FleetDO extends DurableObject<Env> {
 
   /**
    * The cell's sandbox hosts (any not dead) whose nest-proxy takes any Basic substitution as whole, keeping the
-   * request's username (no `guard_basic_user`): a sandbox whose policy newly has `at` beside a Basic binding is
+   * request's username (no `guard_basic_user`): a layer write newly bringing a Basic binding is
    * refused while there is one (docs/sandbox/networking/egress/policy/#any-injected-credential).
    */
   async hostsWithoutBasicUser(): Promise<string[]> {

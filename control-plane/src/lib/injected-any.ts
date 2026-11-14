@@ -40,13 +40,14 @@ export function usesAt(guards: readonly Guardish[]): boolean {
 }
 
 /**
- * Whether a policy with these guards and bindings fails open on a nest-proxy without `guard_basic_user`: a
- * guard's `at` beside a binding with a Basic password location. Such a proxy keeps the request's username
- * and takes any Basic substitution as written whole, so a username the sandbox chose (a credential of its
- * own) would satisfy `at`.
+ * Whether any of `inject` has a Basic password location: such a binding needs a nest-proxy with
+ * `guard_basic_user`, at placement and at every write that adds one, whether or not a guard uses `at` now.
+ * A proxy without it keeps the request's username and takes any Basic substitution as written whole, so a
+ * username the sandbox chose (a credential of its own) would satisfy an `at` that arrives later by a path
+ * no write gates: an agent's detach, a narrowing, a release whose guards add one.
  */
-export function basicAtFailsOpen(guards: readonly Guardish[], inject: readonly { locations: readonly { type: string }[] }[]): boolean {
-  return usesAt(guards) && inject.some((b) => b.locations.some((l) => l.type === "authorization_basic_password"));
+export function hasBasicBinding(inject: readonly { locations: readonly { type: string }[] }[]): boolean {
+  return inject.some((b) => b.locations.some((l) => l.type === "authorization_basic_password"));
 }
 
 /** Those of `guards` that use `*` or `at` and aren't in `held` (compared whole): what a write newly brings. */
