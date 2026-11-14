@@ -333,47 +333,87 @@ describe("a Basic username of the binding's", () => {
     expect(await place([binding("authorization_basic_password")])).toBeNull();
     expect(await place([binding("authorization_bearer")])).toBe(old.host);
     expect(await place([binding("authorization_bearer")], [FLOOR!])).toBeNull();
+    // Writing the Basic username isn't enough: `at` also needs exceptions sealed against encoded separators.
+    await connectHost(cell, "sandbox", { guard_sealed_segments: false });
+    expect(await place([binding("authorization_bearer")], [FLOOR!])).toBeNull();
+    expect(await place([binding("authorization_basic_password")])).toBeNull();
     const current = await connectHost(cell);
     expect(await place([binding("authorization_basic_password")])).toBe(current.host);
     // Its hello is recorded per host.
-    expect(await runInDurableObject(fleet, (_i, st) => st.storage.sql.exec("SELECT host, guard_basic_user AS b FROM hosts ORDER BY b").toArray().map((r) => r.b))).toEqual([0, 1]);
+    expect(await runInDurableObject(fleet, (_i, st) => st.storage.sql.exec("SELECT guard_basic_user AS b, guard_sealed_segments AS s FROM hosts ORDER BY b, s").toArray().map((r) => [r.b, r.s]))).toEqual([[0, 1], [1, 0], [1, 1]]);
   });
 });
 
-describe("a Basic binding and at, never together on a host that can't decide them", () => {
-  /** A client's sandbox on a host whose nest-proxy keeps the request's Basic username (the only host of its cell). */
+describe("at only on a host that enforces it, and never a Basic binding beside it elsewhere", () => {
+  /**
+   * A client's sandbox on a host that doesn't enforce `at` (no `guard_basic_user`, no `guard_sealed_segments`).
+   * GitHub's guards use `at` in every sandbox without repos, so placement puts none there now: the sandbox is
+   * placed on a current host, whose row FleetDO then holds as an older one's (seeded state).
+   */
   async function onOldHost() {
     const c = await newClient();
-    const old = await connectHost(c.cell, "sandbox", { guard_basic_user: false });
+    const old = await connectHost(c.cell);
     const sbx = (await as(c.token, "/v1/sandboxes", { body: { cell: c.cell } })).body.sandbox as string;
     await nextCommands(old.ws, (x) => x.type === "sandbox_create");
-    return { c, old, sbx, stub: env.SANDBOX.get(env.SANDBOX.idFromName(sbx)) };
+    await runInDurableObject(env.FLEET.get(env.FLEET.idFromName(c.cell)), (_o, st) => {
+      st.storage.sql.exec("UPDATE hosts SET guard_basic_user = 0, guard_sealed_segments = 0 WHERE host = ?", old.host);
+    });
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(sbx));
+    await runInDurableObject(stub, (_o, st) => { st.storage.sql.exec("DELETE FROM kv WHERE key = 'host_enforces_at'"); });
+    return { c, old, sbx, stub };
   }
   const basicBinding = { name: "gh", secret: "gh-push", hosts: ["api.example.com"], locations: [{ type: "authorization_basic_password", username: "x-access-token" }] };
 
-  it("a write bringing the pair to its own host is refused (409): a repo attach (nest's own binding and GraphQL's at), the operator's repos, an agent's repos added", async () => {
+  it("a write bringing the pair to its own host is refused (409): a client's Basic binding beside GitHub's at, a repo attach, the operator's repos, an agent's repos added", async () => {
     const { c, sbx, stub } = await onOldHost();
-    // A Basic binding alone is no pair.
-    expect((await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [basicBinding] } })).status).toBe(200);
+    // Without repos, GitHub's guards use at: a Basic binding beside them is the pair; a Bearer one isn't.
+    const basic = await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [basicBinding] } });
+    expect(basic.status).toBe(409);
+    expect(basic.body.error.code).toBe("hosts_not_ready");
+    expect((await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [{ ...basicBinding, locations: [{ type: "authorization_bearer" }] }] } })).status).toBe(200);
     // Repos bring nest's own Basic binding and GraphQL's exception with at: the pair, on this host.
-    await expect(Promise.resolve().then(() => stub.attach("agt_repos", undefined, ["o/r"], []))).rejects.toThrow(/can't decide/);
+    await expect(Promise.resolve().then(() => stub.attach("agt_repos", undefined, ["o/r"], []))).rejects.toThrow(/can't enforce/);
     expect((await stub.info()).attached).not.toContain("agt_repos");
     const op = await admin(`/v1/sandboxes/${sbx}/policy`, { method: "PUT", body: { repos: ["o/r"] } });
     expect(op.status).toBe(409);
     expect(((await op.json()) as { error: { code: string } }).error.code).toBe("hosts_not_ready");
     // An attached agent's repos widened later (a fork the operator approved).
     await stub.attach("agt_plain", undefined, [], []);
-    await expect(Promise.resolve().then(() => stub.allowAgentRepos("agt_plain", ["o/fork"]))).rejects.toThrow(/can't decide/);
+    await expect(Promise.resolve().then(() => stub.allowAgentRepos("agt_plain", ["o/fork"]))).rejects.toThrow(/can't enforce/);
     expect((await stub.policy()).inject.map((b) => b.name)).not.toContain("github");
   });
 
-  it("the same writes go through on a host that writes the username itself, and the base layer stays cell-wide", async () => {
+  it("at alone, newly brought to its own host, is refused too; what it holds is pushed there without at", async () => {
+    const { old, sbx, stub } = await onOldHost();
+    // An operator binding of nest's GitHub credential: GitHub's guards then use no `at` (nest's own token is there).
+    const own = { name: "github", hosts: ["github.com", "api.github.com"], placeholder: "nest-ph-ops", locations: [{ type: "authorization_bearer" }] };
+    expect((await admin(`/v1/sandboxes/${sbx}/policy`, { method: "PUT", body: { inject: [own] } })).status).toBe(200);
+    expect(JSON.stringify((await stub.policy()).guards)).not.toContain('"at"');
+    // Taking it away turns GitHub's `at` on (no Basic binding anywhere): refused on this host.
+    const off = await admin(`/v1/sandboxes/${sbx}/policy`, { method: "PUT", body: { inject: [] } });
+    expect(off.status).toBe(409);
+    expect(((await off.json()) as { error: { code: string } }).error.code).toBe("hosts_not_ready");
+    // What it held from its create (GitHub's guards with `at`, no Basic binding) goes to this host without it.
+    await runInDurableObject(stub, (_o, st) => {
+      const l = JSON.parse((st.storage.sql.exec("SELECT value FROM kv WHERE key = 'ws_layer'").toArray()[0]?.value as string | undefined) ?? "{}");
+      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('ws_layer', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ ...l, inject: [], allow: [{ host: "x.example.com" }] }));
+    });
+    // As built it has GitHub's `at` (no repos, no binding of nest's); as this host gets it, none.
+    const inside = runInDurableObject as unknown as (s: unknown, f: (o: any) => string) => Promise<string>;
+    const rawGuards = await inside(stub, (o) => JSON.stringify(o.effectivePolicy(Date.now(), true).guards));
+    expect(rawGuards).toContain('"at"');
+    expect(JSON.stringify((await stub.policy()).guards)).not.toContain('"at"');
+    void old;
+  });
+
+  it("the same writes go through on a host that enforces at, and the base layer stays cell-wide", async () => {
     const c = await newClient();
     const current = await connectHost(c.cell);
     const sbx = (await as(c.token, "/v1/sandboxes", { body: { cell: c.cell } })).body.sandbox as string;
     await nextCommands(current.ws, (x) => x.type === "sandbox_create");
-    // An old host joins: this sandbox isn't on it, so its own writes are judged against its own host.
-    await connectHost(c.cell, "sandbox", { guard_basic_user: false });
+    // A host that writes the Basic username but matches exceptions on encoded separators joins: this sandbox
+    // isn't on it, so its own writes are judged against its own host.
+    await connectHost(c.cell, "sandbox", { guard_sealed_segments: false });
     const stub = env.SANDBOX.get(env.SANDBOX.idFromName(sbx));
     await stub.attach("agt_repos", undefined, ["o/r"], []);
     expect((await stub.policy()).inject.map((b) => b.name)).toContain("github");
@@ -392,17 +432,17 @@ describe("a Basic binding and at, never together on a host that can't decide the
       const l = JSON.parse((st.storage.sql.exec("SELECT value FROM kv WHERE key = 'ws_layer'").toArray()[0]?.value as string | undefined) ?? "{}");
       const pat = { name: "pat", hosts: ["api.example.com"], placeholder: "nest-ph-pat", locations: [{ type: "authorization_basic_password" }] };
       st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('ws_layer', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ ...l, inject: [pat], guards: [floor] }));
-      st.storage.sql.exec("DELETE FROM kv WHERE key = 'host_basic_user'");
+      st.storage.sql.exec("DELETE FROM kv WHERE key = 'host_enforces_at'");
     });
     const { FleetDO } = await import("../src/do/fleet");
-    const proto = FleetDO.prototype as unknown as { hostBasicUser: (h: string) => Promise<boolean | null> };
-    const orig = proto.hostBasicUser;
-    proto.hostBasicUser = async () => { throw new Error("FleetDO unreachable"); };
+    const proto = FleetDO.prototype as unknown as { hostEnforcesAt: (h: string) => Promise<boolean | null> };
+    const orig = proto.hostEnforcesAt;
+    proto.hostEnforcesAt = async () => { throw new Error("FleetDO unreachable"); };
     try {
       const bearer = { name: "gh", secret: "gh-push", hosts: ["api.example.com"], locations: [{ type: "authorization_bearer" }] };
       expect((await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [bearer] } })).status).toBe(200);
     } finally {
-      proto.hostBasicUser = orig;
+      proto.hostEnforcesAt = orig;
     }
     const cmds = await nextCommands(current.ws, (x) => x.type === "policy_update" && x.policy.inject.some((b: { name: string }) => b.name === "client:gh"));
     const update = cmds.findLast((x) => x.type === "policy_update");
@@ -441,7 +481,7 @@ describe("a Basic binding and at, never together on a host that can't decide the
       const pat = { name: "pat", hosts: ["api.example.com"], placeholder: "nest-ph-pat", locations: [{ type: "authorization_basic_password" }] };
       st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('ws_layer', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ ...l, inject: [pat], guards: [floor] }));
       // Nothing known of its host yet (a sandbox placed before this release): the push asks FleetDO first.
-      st.storage.sql.exec("DELETE FROM kv WHERE key = 'host_basic_user'");
+      st.storage.sql.exec("DELETE FROM kv WHERE key = 'host_enforces_at'");
     });
     // Any write pushes the policy (the pair was there before it: not this write's to refuse).
     const bearer = { ...basicBinding, locations: [{ type: "authorization_bearer" }] };
