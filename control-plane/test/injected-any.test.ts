@@ -9,7 +9,8 @@ import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import fixture from "../../protocol/fixtures/control/egress_policy/egress_policy.injected_any.json";
 import { ClientGuard, ClientGuards, holdGuards, wireGuard, type ClientGuard as ClientGuardT } from "../src/lib/client-guards";
-import { failsOpenOnOldProxy, freshInjectedAny, scopeNamesInjectedAny, usesInjectedMatchers } from "../src/lib/injected-any";
+import { basicAtFailsOpen, failsOpenOnOldProxy, freshInjectedAny, scopeNamesInjectedAny, usesInjectedMatchers } from "../src/lib/injected-any";
+import { ClientInjection } from "../src/lib/client-secrets";
 import { EgressBaseInput, SandboxPolicyLayer } from "../src/do/sandbox";
 import { INJECTED_ANY, type RequestGuard } from "../src/protocol/model";
 import { ClientDO } from "../src/do/client";
@@ -266,5 +267,66 @@ describe("injected: \"*\" through the control plane", () => {
       st.storage.sql.exec("UPDATE hosts SET guard_injected_any = 0 WHERE host = ?", old.host);
     });
     expect(await place()).toBe(old.host);
+  });
+});
+
+// A binding's Basic `username` (docs/sandbox/networking/egress/policy/#any-injected-credential): nest-proxy
+// writes it with the secret, and only then is the Basic field nest's whole. A host of the previous release
+// (no `guard_basic_user`) keeps the request's username and takes any Basic substitution as whole, so `at`
+// beside a Basic binding fails open there: such guards wait for every host, and such sandboxes are placed
+// only on a host that says it. nest-proxy's side is inject.rs's unit tests.
+describe("a Basic username of the binding's", () => {
+  it("a client names it on its Basic location (a username, no colon); a narrowing can't change it", () => {
+    const binding = (loc: unknown) => ClientInjection.safeParse({ name: "gh", secret: "gh-push", hosts: ["github.com"], locations: [loc] });
+    expect(binding({ type: "authorization_basic_password", username: "x-access-token" }).success).toBe(true);
+    expect(binding({ type: "authorization_basic_password" }).success).toBe(true);
+    for (const u of ["", "a:b", "two words", "x".repeat(65)]) expect(binding({ type: "authorization_basic_password", username: u }).success, u).toBe(false);
+    // Two Basic locations differing by username are two locations.
+    expect(ClientInjection.safeParse({ name: "gh", secret: "gh-push", hosts: ["github.com"], locations: [
+      { type: "authorization_basic_password", username: "a" }, { type: "authorization_basic_password", username: "b" }] }).success).toBe(true);
+    expect(ClientInjection.safeParse({ name: "gh", secret: "gh-push", hosts: ["github.com"], locations: [
+      { type: "authorization_basic_password", username: "a" }, { type: "authorization_basic_password", username: "a" }] }).success).toBe(false);
+  });
+
+  it("knows a policy where at beside a Basic binding fails open on such a host", () => {
+    const at: RequestGuard = { name: "n", hosts: ["github.com"], scope: [{}], allow: [{ injected: "*", at: "authorization" }] };
+    const plain: RequestGuard = { name: "n", hosts: ["github.com"], scope: [{}], allow: [{ injected: "*" }] };
+    const basic = [{ locations: [{ type: "authorization_basic_password" }] }];
+    const bearer = [{ locations: [{ type: "authorization_bearer" }] }];
+    expect(basicAtFailsOpen([at], basic)).toBe(true);
+    expect(basicAtFailsOpen([{ ...at, scope: [{ at: "authorization" }], allow: [] }], basic)).toBe(true);
+    expect(basicAtFailsOpen([at], bearer)).toBe(false);
+    expect(basicAtFailsOpen([plain], basic)).toBe(false);
+  });
+
+  it("a guard newly using at is refused (409) while a host of the cell keeps the request's Basic username; * without at isn't", async () => {
+    const c = await newClient();
+    const current = await connectHost(c.cell);
+    const sbx = (await as(c.token, "/v1/sandboxes", { body: { cell: c.cell } })).body.sandbox as string;
+    await nextCommands(current.ws, (x) => x.type === "sandbox_create");
+    await connectHost(c.cell, "sandbox", { guard_basic_user: false });
+    const withAt: ClientGuardT = { ...API_WRITE, allow: [{ injected: "*", at: "authorization" }] };
+    const r = await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { guards: [withAt] } });
+    expect(r.status).toBe(409);
+    expect((await admin(base(c.cell), { method: "PUT", body: { allow: [], guards: [FLOOR] } })).status).toBe(409);
+    // `*` alone needs only `guard_injected_any`, which that host has.
+    expect((await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { guards: [API_WRITE] } })).status).toBe(200);
+  });
+
+  it("a sandbox with at beside a Basic binding is placed only on a host that writes the username itself", async () => {
+    const cell = uniqueCell();
+    const fleet = env.FLEET.get(env.FLEET.idFromName(cell));
+    const old = await connectHost(cell, "sandbox", { guard_basic_user: false });
+    const binding = (type: string) => ({ name: "client:gh", hosts: ["github.com"], placeholder: "nest-ph.cli_x.gh.", locations: [{ type }] });
+    const place = (inject: unknown[]) => fleet.place({
+      sandbox: `sbx_${rand()}`, workstream: "ws_test", epoch: 1, image: "x", resources: { vcpus: 1, memory_mib: 1, disk_gib: 1 },
+      policy: { version: 1, allow: [], passthrough: [], inject: inject as never, tcp: [], guards: [FLOOR!], limits: { max_connections: 1, bandwidth_mbps: 1, max_inspected_body_bytes: 1 } },
+    });
+    expect(await place([binding("authorization_basic_password")])).toBeNull();
+    expect(await place([binding("authorization_bearer")])).toBe(old.host);
+    const current = await connectHost(cell);
+    expect(await place([binding("authorization_basic_password")])).toBe(current.host);
+    // Its hello is recorded per host.
+    expect(await runInDurableObject(fleet, (_i, st) => st.storage.sql.exec("SELECT host, guard_basic_user AS b FROM hosts ORDER BY b").toArray().map((r) => r.b))).toEqual([0, 1]);
   });
 });

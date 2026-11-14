@@ -30,7 +30,7 @@ import { GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING, githu
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
 import { githubEnvConflict, githubEnvRefusal, isGithubEnvName, slotEnv } from "../lib/sandbox-env";
-import { freshInjectedAny, injectedAnyConflict } from "../lib/injected-any";
+import { freshInjectedAny, injectedAnyConflict, usesAt } from "../lib/injected-any";
 import { CLIENT_GUARD_PREFIX, type ClientGuard, distinctGuards, type HeldGuard, layerOverLimit, outsideOperatorRouting, sandboxGuardsOverLimit, wireGuard } from "../lib/client-guards";
 import type { MintedInjection, SecretsChangedAnswer } from "./broker";
 import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
@@ -1894,9 +1894,10 @@ export class SandboxDO extends DurableObject<Env> {
    * Such a host fails a scope's `*` open, so a write naming it waits for every host; placement keeps a
    * sandbox whose scopes name it off such hosts that join later.
    */
-  private async requireInjectedAny(cell: string, fresh: readonly { name: string }[]): Promise<void> {
+  private async requireInjectedAny(cell: string, fresh: readonly { name: string; scope: readonly { at?: string }[]; allow?: readonly { at?: string }[] }[]): Promise<void> {
     if (!fresh.length) return;
-    const old = await this.fleet(cell).hostsWithoutInjectedAny();
+    // `at` also waits for every host to write a binding's Basic username itself (`guard_basic_user`).
+    const old = await this.fleet(cell).hostsWithoutInjectedAny(usesAt(fresh));
     if (old.length) throw injectedAnyConflict(cell, fresh.map((g) => g.name), old);
   }
 

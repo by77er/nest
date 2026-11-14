@@ -34,6 +34,21 @@ export function failsOpenOnOldProxy(guards: readonly Guardish[]): boolean {
     || (g.allow ?? []).some((m) => m.at !== undefined && m.injected !== INJECTED_ANY));
 }
 
+/** Whether any of `guards` uses `at`, in a scope or an exception. */
+export function usesAt(guards: readonly Guardish[]): boolean {
+  return guards.some((g) => [...(g.scope ?? []), ...(g.allow ?? [])].some((m) => m.at !== undefined));
+}
+
+/**
+ * Whether a policy with these guards and bindings fails open on a nest-proxy without `guard_basic_user`: a
+ * guard's `at` beside a binding with a Basic password location. Such a proxy keeps the request's username
+ * and takes any Basic substitution as written whole, so a username the sandbox chose (a credential of its
+ * own) would satisfy `at`.
+ */
+export function basicAtFailsOpen(guards: readonly Guardish[], inject: readonly { locations: readonly { type: string }[] }[]): boolean {
+  return usesAt(guards) && inject.some((b) => b.locations.some((l) => l.type === "authorization_basic_password"));
+}
+
 /** Those of `guards` that use `*` or `at` and aren't in `held` (compared whole): what a write newly brings. */
 export function freshInjectedAny<G extends Guardish>(guards: readonly G[], held: readonly unknown[]): G[] {
   const known = new Set(held.map((h) => JSON.stringify(h)));

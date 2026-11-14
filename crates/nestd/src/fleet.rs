@@ -223,6 +223,8 @@ impl Shell {
                     guard_bounds: true,
                     // ...and reads a guard's `injected: "*"` as any binding.
                     guard_injected_any: true,
+                    // ...and writes a binding's Basic username itself, a Basic field whole only then.
+                    guard_basic_user: true,
                     sandboxes,
                     agents,
                     capacity,

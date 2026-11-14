@@ -149,17 +149,22 @@ fn substitute(b: &InjectionBinding, secret: &str, headers: &mut HeaderMap, wrote
                     done = true;
                 }
             }
-            InjectionLocation::AuthorizationBasicPassword => {
+            InjectionLocation::AuthorizationBasicPassword { username } => {
                 if let Some(decoded) = headers.get(AUTHORIZATION).and_then(basic_decode)
                     && let Ok(decoded) = String::from_utf8(decoded)
                     && let Some((user, pass)) = decoded.split_once(':')
                     && pass == b.placeholder
                 {
-                    let enc = B64.encode(format!("{user}:{secret}"));
+                    // The binding's username, when it names one, whatever the request's was: then nest wrote
+                    // the whole `user:secret`. Otherwise the request's username stays, and it may be a
+                    // credential the sandbox chose, so the field is never whole (a guard's `at`).
+                    let enc = B64.encode(format!("{}:{secret}", username.as_deref().unwrap_or(user)));
                     if let Ok(nv) = HeaderValue::from_str(&format!("Basic {enc}")) {
                         let nv = sensitive(nv);
                         headers.insert(AUTHORIZATION, nv.clone());
-                        wrote.push((AUTHORIZATION, nv));
+                        if username.is_some() {
+                            wrote.push((AUTHORIZATION, nv));
+                        }
                         done = true;
                     }
                 }
@@ -209,7 +214,7 @@ mod tests {
             placeholder: "nest-ph-github-7f3a".into(),
             locations: vec![
                 InjectionLocation::AuthorizationBearer,
-                InjectionLocation::AuthorizationBasicPassword,
+                InjectionLocation::AuthorizationBasicPassword { username: None },
                 InjectionLocation::Header { name: "X-Api-Key".into() },
             ],
         }
@@ -245,6 +250,32 @@ mod tests {
         );
         let dec = B64.decode(h[AUTHORIZATION].to_str().unwrap().strip_prefix("Basic ").unwrap()).unwrap();
         assert_eq!(dec, b"x-access-token:ghs_REAL");
+    }
+
+    /// A binding naming its Basic username writes it with the secret, whatever the request's was: a
+    /// username the sandbox chose (a planted token, as GitHub reads one there) never goes upstream beside
+    /// nest's secret, and only then is the field nest's whole.
+    #[test]
+    fn a_basic_username_the_binding_names_is_written_and_whole() {
+        let named = |user: &str| InjectionBinding {
+            locations: vec![InjectionLocation::AuthorizationBasicPassword { username: Some(user.into()) }],
+            ..binding()
+        };
+        for sent in ["x-access-token", "ghp_PLANTED", ""] {
+            let mut h = HeaderMap::new();
+            h.insert(AUTHORIZATION, format!("Basic {}", B64.encode(format!("{sent}:nest-ph-github-7f3a"))).parse().unwrap());
+            let b = [named("x-access-token")];
+            let (v, w) = apply_whole(
+                &Input { bindings: &b, secrets: &secrets(None), host: "github.com", tls: true, live: true, now_ms: 1000 },
+                &mut h,
+                &HeaderMap::new(),
+                &"/".parse().unwrap(),
+            );
+            assert_eq!(v, Verdict::Substituted("github".into()), "{sent}");
+            assert_eq!(w, at("authorization"), "{sent}");
+            let dec = B64.decode(h[AUTHORIZATION].to_str().unwrap().strip_prefix("Basic ").unwrap()).unwrap();
+            assert_eq!(dec, b"x-access-token:ghs_REAL", "{sent}");
+        }
     }
 
     #[test]
@@ -293,13 +324,16 @@ mod tests {
 
     #[test]
     fn a_header_is_whole_only_when_the_substitution_wrote_all_of_it() {
-        // Bearer and Basic replace the Authorization header whole.
+        // Bearer replaces the Authorization header whole.
         let mut h = HeaderMap::new();
         h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
         assert_eq!(whole("github.com", &mut h), at("authorization"));
+        // Basic, with no username of the binding's: substituted, but the username is the sandbox's, never whole.
         let mut h = HeaderMap::new();
         h.insert(AUTHORIZATION, format!("Basic {}", B64.encode("x-access-token:nest-ph-github-7f3a")).parse().unwrap());
-        assert_eq!(whole("github.com", &mut h), at("authorization"));
+        assert_eq!(whole("github.com", &mut h), vec![]);
+        let dec = B64.decode(h[AUTHORIZATION].to_str().unwrap().strip_prefix("Basic ").unwrap()).unwrap();
+        assert_eq!(dec, b"x-access-token:ghs_REAL");
         // A named header that was exactly the placeholder.
         let mut h = HeaderMap::new();
         h.insert("x-api-key", "nest-ph-github-7f3a".parse().unwrap());
