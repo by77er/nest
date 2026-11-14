@@ -1036,13 +1036,115 @@ describe("going away", () => {
       }
       await bindTo(p, y, idY);
       await o.githubRebound();
+      const gen = o.ghGen;
+      const revokes = () => st.storage.sql.exec("SELECT COUNT(*) AS n FROM gh_tokens WHERE revoke = 1").one().n as number;
+      const revoked = revokes();
       open();
       const res = await e!;
-      return { old, now: secret(p, "push")!.value, res, follows: st.storage.sql.exec("SELECT gh_repo_id FROM settings").one().gh_repo_id };
+      // The read from before the notice was ignored: no rebind back to X (nothing more revoked, no new generation).
+      return { old, now: secret(p, "push")!.value, res, follows: st.storage.sql.exec("SELECT gh_repo_id FROM settings").one().gh_repo_id, genMoved: o.ghGen - gen, revokedAfter: revokes() - revoked };
     });
     expect(out.follows).toBe(idY);
+    expect(out.genMoved).toBe(0);
+    expect(out.revokedAfter).toBe(0);
     expect(out.now, "the start took the old repo's token").not.toBe(out.old);
     if (out.res === "ok") expect(tokenOf(out.now)!.repo).toBe(y);
+  });
+
+  it("a rebind followed by a refresh alone, then another's notice: followed (the refresh held the binding's own generation)", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const y = await rebindInDirectory(p);
+    // No notice: the refresh's own read follows Y (nothing else reads the binding meanwhile).
+    await alarmHeld(p, async (o: any) => {
+      await o.refreshGithub(nestFrom(env as any)!, "push");
+    });
+    expect(tokenOf(secret(p, "push")!.value)!.repo).toBe(y);
+    expect(await sql(p, (s) => s.exec("SELECT gh_repo_gen FROM settings").one().gh_repo_gen)).toBe((await boundRow(p)).repo_gen);
+    // Then another rebind, told by its notice.
+    const z = `n-${rand()}/z-${rand()}`.toLowerCase();
+    await bindTo(p, z, fake.github.repo(z).id);
+    await stub(p).githubRebound();
+    expect(await sql(p, (s) => s.exec("SELECT gh_repo_id FROM settings").one().gh_repo_id)).toBe(fake.github.repo(z).id);
+    await drain(p);
+    expect(tokenOf(secret(p, "push")!.value)!.repo).toBe(z);
+  });
+
+  it("a refresh that, having followed Y, mints for Z bound meanwhile: no start takes that token while the access follows Y", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const y = `n-${rand()}/y-${rand()}`.toLowerCase();
+    const z = `n-${rand()}/z-${rand()}`.toLowerCase();
+    const idY = fake.github.repo(y).id;
+    const idZ = fake.github.repo(z).id;
+    await bindTo(p, y, idY);
+    const proto = DirectoryDO.prototype as any;
+    const orig = proto.binding;
+    let reads = 0;
+    const out = await alarmHeld(p, async (o: any, st: DurableObjectState) => {
+      const nest = nestFrom(env as any)!;
+      // The refresh's first read answers Y; Z is bound right after it, so its read after following answers Z.
+      proto.binding = async function (this: any, ...a: unknown[]) {
+        const r = await orig.apply(this, a);
+        if (++reads === 1) this.ctx.storage.sql.exec("UPDATE projects SET repo = ?, repo_id = ? WHERE id = ?", z, idZ, p.id);
+        return r;
+      };
+      try {
+        await o.refreshGithub(nest, "push");
+      } finally {
+        proto.binding = orig;
+      }
+      const row = st.storage.sql.exec("SELECT repo_id FROM gh_access WHERE kind = 'push'").one();
+      return { minted: row.repo_id, follows: st.storage.sql.exec("SELECT gh_repo_id FROM settings").one().gh_repo_id, fresh: o.githubFresh("push") };
+    });
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(out).toEqual({ minted: idZ, follows: idY, fresh: false });
+  });
+
+  it("a write to nest whose answer was lost (it landed): its token, revoked, is no start's", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const { Nest } = await import("../src/nest");
+    const nproto = Nest.prototype as any;
+    const origPut = nproto.putSecret;
+    const out = await alarmHeld(p, async (o: any, st: DurableObjectState) => {
+      const nest = nestFrom(env as any)!;
+      nproto.putSecret = async function (this: unknown, ...a: unknown[]) {
+        await origPut.apply(this, a);
+        throw new Error("nest's answer was lost");
+      };
+      try {
+        await dueNow(p, "push");
+        await o.refreshGithub(nest, "push");
+      } finally {
+        nproto.putSecret = origPut;
+      }
+      const lost = secret(p, "push")!.value;
+      await o.githubCleanup(nest);
+      await o.ensureGithub(nest, "push");
+      return { lost, now: secret(p, "push")!.value };
+    });
+    expect(tokenOf(out.lost)).toBeUndefined();
+    expect(out.now).not.toBe(out.lost);
+    expect(tokenOf(out.now), "the start took the revoked token").toBeDefined();
+  });
+
+  it("a read without a generation (a DirectoryDO of the previous release): followed only to another repo, the generation held kept", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const y = `n-${rand()}/y-${rand()}`.toLowerCase();
+    const idY = fake.github.repo(y).id;
+    const out = await alarmHeld(p, async (o: any, st: DurableObjectState) => {
+      const before = st.storage.sql.exec("SELECT gh_repo_id, gh_repo_gen FROM settings").one();
+      const gen = o.ghGen;
+      await o.githubRebound({ repo_id: before.gh_repo_id });
+      const same = { gen: o.ghGen - gen, row: st.storage.sql.exec("SELECT gh_repo_id, gh_repo_gen FROM settings").one() };
+      await o.githubRebound({ repo_id: idY });
+      return { before, same, after: st.storage.sql.exec("SELECT gh_repo_id, gh_repo_gen FROM settings").one(), moved: o.ghGen - gen };
+    });
+    expect(out.same).toEqual({ gen: 0, row: out.before });
+    expect(out.after).toEqual({ gh_repo_id: idY, gh_repo_gen: out.before.gh_repo_gen });
+    expect(out.moved).toBe(1);
   });
 
   it("DirectoryDO unreachable at a start: the start throws, nothing minted", async () => {

@@ -3261,6 +3261,8 @@ export class ProjectDO extends DurableObject<Env> {
     const gen = this.ghGen;
     let seq: number | null = null;
     let nestName: string | null = null;
+    // The write to nest was sent: it may have landed though its answer was lost.
+    let sent = false;
     try {
       const id = this.settings()!.id;
       const b = await directory(this.env).binding(id);
@@ -3301,6 +3303,7 @@ export class ProjectDO extends DurableObject<Env> {
       nestName = row.nest_name as string;
       // Inside the grant's secrets limits, checked first where a new secret would take a place.
       await this.secretRoom(nest, nestName, minted.token, row.expires_ms !== null && row.gone === 0);
+      sent = true;
       await nest.putSecret(nestName, minted.token, `the project's GitHub ${kind} token for ${b.repo}`, new Date(minted.expires_ms).toISOString());
       // The project removed while it was written: its secret deleted again now, whatever is left of its rows.
       if (!this.settingsRow()) {
@@ -3332,8 +3335,12 @@ export class ProjectDO extends DurableObject<Env> {
       // A push token without workflows replaced one with them: theirs are revoked, not left valid until they expire.
       if (!workflows) this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE kind = ? AND workflows = 1 AND seq != ? AND revoke = 0", Date.now(), kind, seq);
     } catch (e) {
-      // A token minted and not written is revoked: nothing holds it.
-      if (seq !== null) this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE seq = ?", Date.now(), seq);
+      // A token minted and not written is revoked: nothing holds it. Its write sent, the secret may hold it now:
+      // named as the one held (`seq`), so no start takes it once revoked.
+      if (seq !== null) {
+        if (sent) this.sql.exec("UPDATE gh_access SET seq = ? WHERE kind = ?", seq, kind);
+        this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE seq = ?", Date.now(), seq);
+      }
       if (!this.settingsRow() || !this.ghRow(kind)) return;
       const row = this.ghRow(kind)!;
       if (e instanceof GitHubError && e.status === 422 && /permissions requested|not granted/i.test(e.message)) {
@@ -3383,23 +3390,26 @@ export class ProjectDO extends DurableObject<Env> {
    * across a newer notice) is never followed, so access never moves back to a repo it left. Without a read
    * (`seen` absent), DirectoryDO's binding is read now.
    */
-  async githubRebound(seen?: { repo_id: number | null; gen: number }): Promise<void> {
+  async githubRebound(seen?: { repo_id: number | null; gen?: number }): Promise<void> {
     const s = this.settingsRow();
     if (!s) return;
     if (seen === undefined) {
       const b = await directory(this.env).binding(s.id as string);
-      seen = { repo_id: b?.repo_id ?? null, gen: b?.repo_gen ?? 0 };
+      seen = { repo_id: b?.repo_id ?? null, gen: b?.repo_gen };
     }
     const repoId = seen.repo_id;
     const now = this.settingsRow();
     if (repoId === null || !now) return;
+    // A read without a generation (a DirectoryDO of the previous release) is unordered: followed only when its id
+    // differs, and the generation held is kept.
+    const gen = typeof seen.gen === "number" ? seen.gen : null;
     const held = now.gh_repo_gen as number | null;
-    if (held !== null && seen.gen < held) return;
+    if (gen !== null && held !== null && gen < held) return;
     if (now.gh_repo_id === repoId) {
-      if (held === null || seen.gen > held) this.sql.exec("UPDATE settings SET gh_repo_gen = ?", seen.gen);
+      if (gen !== null && (held === null || gen > held)) this.sql.exec("UPDATE settings SET gh_repo_gen = ?", gen);
       return;
     }
-    this.sql.exec("UPDATE settings SET gh_repo_id = ?, gh_repo_gen = ?", repoId, seen.gen);
+    this.sql.exec("UPDATE settings SET gh_repo_id = ?, gh_repo_gen = COALESCE(?, gh_repo_gen)", repoId, gen);
     // The project's first binding read: nothing minted yet (a refresh follows the binding before it mints).
     if (now.gh_repo_id === null) return;
     this.ghGen++;
