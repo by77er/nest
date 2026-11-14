@@ -1285,11 +1285,18 @@ export class SandboxDO extends DurableObject<Env> {
     return host && held?.host === host ? held.ok : null;
   }
 
-  /** Ask FleetDO whether its host enforces `at`, and hold the answer. */
+  /** Ask FleetDO whether its host enforces `at`, and hold the answer; unanswered (no row, a failed read), nothing is held. */
   private async readHostEnforcesAt(): Promise<boolean | null> {
     const info = this.info_();
     if (!info.host) return null;
-    const ok = await this.fleet(info.cell).hostEnforcesAt(info.host);
+    let ok: boolean | null;
+    try {
+      ok = await this.fleet(info.cell).hostEnforcesAt(info.host);
+    } catch (e) {
+      // Unread: not known, so closed, never the answer held before.
+      if (this.tryInfo()?.host === info.host) this.del(HOST_ENFORCES_AT);
+      throw e;
+    }
     if (this.tryInfo()?.host !== info.host) return ok;
     // No row for it: not known, so closed.
     if (ok === null) this.del(HOST_ENFORCES_AT);
@@ -1460,7 +1467,7 @@ export class SandboxDO extends DurableObject<Env> {
    * sent meanwhile is left as the host's.
    */
   private async policyChanged(injectionChanged: boolean): Promise<EgressPolicy> {
-    // Its host's answer first, so what it gets is decided for it (`forHost`); unanswered, the last one held.
+    // Its host's answer first, so what it gets is decided for it (`forHost`); unanswered, not known: closed.
     await this.readHostEnforcesAt().catch((e) => console.warn(`sandbox ${this.tryInfo()?.sandbox}: its host's flags weren't read`, e));
     const info = this.update((i) => {
       i.policy_version += 1;

@@ -62,7 +62,8 @@ const NEST_CREDENTIAL_REASON = "writes to GitHub go only with a credential nest 
 const ownsGithub = (b: InjectionBinding) =>
   [GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING].includes(b.name) || b.placeholder === GITHUB_PLACEHOLDER || b.placeholder === GITHUB_READ_PLACEHOLDER
   || b.hosts.some((h) => {
-    const x = h.toLowerCase();
+    // As nest-proxy matches it: without case, and without trailing dots (`api.github.com.` is api.github.com).
+    const x = h.toLowerCase().replace(/\.+$/, "");
     // github.com or a host under it, or a pattern reaching either (`*.com`, `*.github.com`).
     return x === "github.com" || x.endsWith(".github.com") || hostPatternMatches(x, "github.com") || hostPatternMatches(x, "nest-probe.github.com");
   });

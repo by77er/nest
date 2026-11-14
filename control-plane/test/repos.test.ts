@@ -65,6 +65,9 @@ describe("the GitHub rule constructor", () => {
       // By host alone: an operator's PAT under any name, on github.com or any *.github.com host.
       { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["github.com"] }, { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["api.github.com"] },
       { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["*.github.com"], wildcard: true }, { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["UPLOADS.GitHub.com"] },
+      // With trailing dots, which nest-proxy trims: the same hosts.
+      { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["api.github.com."] }, { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["uploads.github.com."] },
+      { ...githubBinding(), name: "pat", placeholder: "ph-pat", hosts: ["API.GITHUB.COM.."] },
     ]) {
       const f = githubEgress([], [], [b]);
       expect(viaNest(f), b.name).toBe(false);
