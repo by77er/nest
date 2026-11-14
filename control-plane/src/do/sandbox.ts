@@ -1894,7 +1894,7 @@ export class SandboxDO extends DurableObject<Env> {
   private async requireGuardBounds(cell: string): Promise<void> {
     const old = await this.fleet(cell).hostsWithoutGuardBounds();
     if (old.length) {
-      throw new NestError(ErrorCodes.CONFLICT, `request guards need every sandbox host of cell ${cell} to bound guarded requests; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
+      throw new NestError(ErrorCodes.HOSTS_NOT_READY, `request guards need every sandbox host of cell ${cell} to bound guarded requests; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
     }
   }
 

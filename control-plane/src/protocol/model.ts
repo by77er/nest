@@ -67,6 +67,12 @@ export const ErrorCodes = {
    * children): there is room once fewer are live than the limit. The message names the limit. HTTP 429, retryable.
    */
   AT_CAPACITY: "at_capacity",
+  /**
+   * Refused because a sandbox host of the cell doesn't apply what the request brings yet (an API client's
+   * request guards, `injected: "*"` or `at`: its fleet hello lacks the flag); it goes through once every such
+   * host is replaced, the same request. The message names the hosts. HTTP 409, not retryable soon.
+   */
+  HOSTS_NOT_READY: "hosts_not_ready",
 } as const;
 /** What the control-host channels sent for `unsupported_version` before the names merged: read, never sent. */
 export const LEGACY_UNSUPPORTED_VERSION = "unsupported_protocol_version";

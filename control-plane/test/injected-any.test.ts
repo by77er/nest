@@ -134,7 +134,9 @@ describe("injected: \"*\" through the control plane", () => {
     // The base layer.
     const b = await admin(base(c.cell), { method: "PUT", body: { allow: [], guards: [FLOOR] } });
     expect(b.status).toBe(409);
-    expect((await b.json() as { error: { message: string } }).error.message).toContain("injected \"*\"");
+    const body = await b.json() as { error: { code: string; message: string } };
+    expect(body.error.code).toBe("hosts_not_ready");
+    expect(body.error.message).toContain("injected \"*\"");
     expect((await adminJson(base(c.cell))).version).toBe(0);
     await adminJson(base(c.cell), { method: "PUT", body: { allow: [], guards: [named] } });
     // The operator layer, live and at create.

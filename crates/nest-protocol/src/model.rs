@@ -166,13 +166,17 @@ pub mod error_codes {
     /// spawner's live children): there is room once fewer are live than the limit. The message
     /// names the limit. HTTP 429, retryable.
     pub const AT_CAPACITY: &str = "at_capacity";
+    /// Refused because a sandbox host of the cell doesn't apply what the request brings yet (an API
+    /// client's request guards, `injected: "*"` or `at`); the same request goes through once every such
+    /// host is replaced. The message names the hosts. HTTP 409, not retryable soon.
+    pub const HOSTS_NOT_READY: &str = "hosts_not_ready";
 
     /// Every code above that is sent (the legacy alias is not).
     pub const ALL: &[&str] = &[
         STALE_EPOCH, PARENT_MISMATCH, UNKNOWN_SANDBOX, UNKNOWN_AGENT, UNAUTHORIZED, FORBIDDEN,
         UNSUPPORTED_VERSION, INVALID_MESSAGE, UNKNOWN_TOOL, CAPACITY_EXHAUSTED, RATE_LIMITED, NOT_BOUND,
         SANDBOX_NOT_READY, INTERNAL, NOT_IMPLEMENTED, OUTCOME_UNKNOWN, CONFLICT, NOT_FOUND, TOOL_ERROR, BUSY,
-        AT_CAPACITY,
+        AT_CAPACITY, HOSTS_NOT_READY,
     ];
 
     /// `unsupported_version` under either name.

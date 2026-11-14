@@ -57,6 +57,6 @@ export function freshInjectedAny<G extends Guardish>(guards: readonly G[], held:
 
 /** The refusal (409) of guards using `*` or `at` while sandbox hosts of the cell (`old`) don't know them. */
 export function injectedAnyConflict(cell: string, guards: readonly string[], old: readonly string[]): NestError {
-  return new NestError(ErrorCodes.CONFLICT, `guard(s) ${guards.slice(0, 3).join(", ")} name injected "${INJECTED_ANY}" or "at" (where a credential nest injected `
+  return new NestError(ErrorCodes.HOSTS_NOT_READY, `guard(s) ${guards.slice(0, 3).join(", ")} name injected "${INJECTED_ANY}" or "at" (where a credential nest injected `
     + `must be), which needs every sandbox host of cell ${cell} to know them; ${old.length} host(s) don't yet (${old.slice(0, 3).join(", ")}): retry once they are replaced`, 409);
 }

@@ -20,7 +20,8 @@
     "not_found",
     "tool_error",
     "busy",
-    "at_capacity"
+    "at_capacity",
+    "hosts_not_ready"
   ],
   "gateway_error_codes": [
     "unauthorized",
