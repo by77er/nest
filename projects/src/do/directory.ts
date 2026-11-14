@@ -98,6 +98,14 @@ const MIGRATIONS = [
     // takes (a user's only).
     "ALTER TABLE projects ADD COLUMN repo_owner_type TEXT",
   ],
+  [
+    // The binding's generation (README.md#the-sandboxes-github-access): bumped by every write that changes the
+    // repo id, whichever code (or release) writes it, so a reader can tell an older read from a newer one even
+    // when the id comes back (X, Y, X).
+    "ALTER TABLE projects ADD COLUMN repo_gen INTEGER NOT NULL DEFAULT 0",
+    `CREATE TRIGGER projects_repo_gen AFTER UPDATE OF repo_id ON projects WHEN OLD.repo_id IS NOT NEW.repo_id
+      BEGIN UPDATE projects SET repo_gen = repo_gen + 1 WHERE id = NEW.id; END`,
+  ],
 ] as const;
 
 /** A project's repo binding (README.md#the-repos-binding), as the Admin page shows it. */
@@ -107,6 +115,8 @@ export interface RepoBinding {
   /** The name the project calls the repo by (GitHub, nest's grant, its agents). */
   repo: string;
   repo_id: number | null;
+  /** Bumped by every change of `repo_id`: which of two reads is newer, whatever the ids. */
+  repo_gen: number;
   /** The name GitHub last gave the repo, when it isn't `repo`: renamed or transferred, not yet applied. */
   renamed_to: string | null;
   /** The App installation's id: null until a token's source (the App's lookup, or nest's answer) names it. */
@@ -164,7 +174,7 @@ export const CREATE_GRACE_MS = 60_000;
 export const CREATE_POLICY: OutboxPolicy = { maxAttempts: 8 };
 
 const COLUMNS = "id, name, repo, created_ms, CASE WHEN pending IS NULL THEN 'ready' ELSE 'pending' END AS state";
-const BINDING = "id, name, repo, repo_id, repo_name, installation_id, repo_bound, repo_bound_ms, bind_error, repo_owner_id, repo_owner_login, repo_owner_type, refused_installation, refused_count, refused_ms";
+const BINDING = "id, name, repo, repo_id, repo_gen, repo_name, installation_id, repo_bound, repo_bound_ms, bind_error, repo_owner_id, repo_owner_login, repo_owner_type, refused_installation, refused_count, refused_ms";
 
 /** The owner's kind kept as `<id>:<kind>`: only while it's of the owner `id` (the previous release changes the owner without it). */
 function ownerKind(id: number, v: SqlStorageValue | undefined): string | null {
@@ -174,7 +184,7 @@ function ownerKind(id: number, v: SqlStorageValue | undefined): string | null {
 
 function bindingOf(r: Record<string, SqlStorageValue>): RepoBinding {
   return {
-    project: r.id as string, name: r.name as string, repo: r.repo as string, repo_id: (r.repo_id as number | null) ?? null,
+    project: r.id as string, name: r.name as string, repo: r.repo as string, repo_id: (r.repo_id as number | null) ?? null, repo_gen: (r.repo_gen as number | null) ?? 0,
     renamed_to: (r.repo_name as string | null) ?? null, installation_id: (r.installation_id as number | null) ?? null,
     bound: (r.repo_bound as "github" | "event" | null) ?? null, bound_ms: (r.repo_bound_ms as number | null) ?? null,
     error: (r.bind_error as string | null) ?? null,

@@ -630,18 +630,21 @@ export const MIGRATIONS = [
   ],
   [
     // The project's own GitHub tokens in its sandboxes (README.md#repo-authority, phase B3): one client secret
-    // per kind (`push`, `read`), its expiry, the repo id its token was minted for, and when it's written again;
+    // per kind (`push`, `read`), its expiry, the repo id its token was minted for, which token it holds (`seq`,
+    // `gh_tokens`'), and when it's written again;
     // `gone` 1 while its delete from nest is owed (the repo or the project went away; next tried at
     // `del_next_ms`), 2 once deleted. Each token minted is kept only to revoke it (`revoke` 1: owed), until it
     // expires.
     `CREATE TABLE gh_access (kind TEXT PRIMARY KEY, nest_name TEXT NOT NULL, expires_ms INTEGER, workflows INTEGER NOT NULL DEFAULT 0,
       next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, gone INTEGER NOT NULL DEFAULT 0,
       del_next_ms INTEGER, del_attempts INTEGER NOT NULL DEFAULT 0, refusals INTEGER NOT NULL DEFAULT 0, wf_refused INTEGER NOT NULL DEFAULT 0,
-      repo_id INTEGER)`,
+      repo_id INTEGER, seq INTEGER)`,
     // The owner was told the GitHub App can't reach the repo (1), and not yet that it's back.
     "ALTER TABLE settings ADD COLUMN gh_unreachable INTEGER NOT NULL DEFAULT 0",
-    // The repo id (DirectoryDO's binding) the project's GitHub access was last made to follow (`githubRebound`).
+    // The repo id (DirectoryDO's binding) the project's GitHub access was last made to follow (`githubRebound`),
+    // and that binding's generation (DirectoryDO's `repo_gen`): a read older than it is never followed.
     "ALTER TABLE settings ADD COLUMN gh_repo_id INTEGER",
+    "ALTER TABLE settings ADD COLUMN gh_repo_gen INTEGER",
     `CREATE TABLE gh_tokens (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, token TEXT NOT NULL, expires_ms INTEGER NOT NULL,
       workflows INTEGER NOT NULL DEFAULT 0, revoke INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER)`,
     // A live agent whose sandbox has the app's GitHub part (its layer keeps it), not nest's repos.
@@ -3200,7 +3203,8 @@ export class ProjectDO extends DurableObject<Env> {
 
   /**
    * Whether the secret of `kind` holds a token a start may take: not gone, with more than FRESH_ENOUGH_MS left,
-   * for the repo id the access follows (`gh_repo_id`), and with `workflows: write` as the setting has it now (or
+   * for the repo id the access follows (`gh_repo_id`), the token the secret holds not revoked, and with
+   * `workflows: write` as the setting has it now (or
    * the App can't grant it: `wf_refused`).
    */
   private githubFresh(kind: GithubKind): boolean {
@@ -3208,6 +3212,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (!r || r.gone !== 0 || r.expires_ms === null || (r.expires_ms as number) - Date.now() <= FRESH_ENOUGH_MS) return false;
     // Minted for the repo the project's access follows now.
     if (r.repo_id === null || r.repo_id !== this.settingsRow()?.gh_repo_id) return false;
+    // The token the secret holds, not revoked (a rebind, a toggle, a stale refresh's write): judged by itself.
+    if (r.seq === null || this.sql.exec("SELECT 1 FROM gh_tokens WHERE seq = ? AND revoke = 0", r.seq).toArray().length === 0) return false;
     const want = kind === "push" && this.settings()!.workers_edit_workflows;
     return (r.workflows === 1) === want || (want && r.wf_refused === 1);
   }
@@ -3264,7 +3270,7 @@ export class ProjectDO extends DurableObject<Env> {
       // Bound to another repo than the access follows (a rebind whose notice never came): followed first, then
       // this refresh made again, as one after it.
       if (this.settingsRow()!.gh_repo_id !== b.repo_id && !followed) {
-        await this.githubRebound(b.repo_id);
+        await this.githubRebound({ repo_id: b.repo_id, gen: b.repo_gen });
         return await this.refreshGithubOnce(nest, kind, true);
       }
       const want = kind === "push" && this.settings()!.workers_edit_workflows;
@@ -3301,19 +3307,21 @@ export class ProjectDO extends DurableObject<Env> {
         await this.githubOrphan(nest, kind, nestName, seq);
         return;
       }
-      // Stale once written: revoked (the secret holds a dead token until the refresh due now writes the new one).
+      // Stale once written: revoked (the secret holds a dead token until the refresh due now writes the new one;
+      // `seq` says which, so no start takes it).
       if (this.ghGen !== gen) {
+        this.sql.exec("UPDATE gh_access SET seq = ? WHERE kind = ?", seq, kind);
         this.githubStale(kind, seq);
         return;
       }
       const wasGone = row.gone === 2;
       this.sql.exec(
-        "UPDATE gh_access SET expires_ms = ?, workflows = ?, wf_refused = ?, next_ms = ?, attempts = 0, refusals = 0, error = ?, gone = 0, del_next_ms = NULL, repo_id = ? WHERE kind = ?",
-        minted.expires_ms, workflows ? 1 : 0, note ? 1 : 0, Math.max(minted.expires_ms - REFRESH_BEFORE_MS, Date.now() + MIN_REFRESH_MS), note, bound.repoId, kind,
+        "UPDATE gh_access SET expires_ms = ?, workflows = ?, wf_refused = ?, next_ms = ?, attempts = 0, refusals = 0, error = ?, gone = 0, del_next_ms = NULL, repo_id = ?, seq = ? WHERE kind = ?",
+        minted.expires_ms, workflows ? 1 : 0, note ? 1 : 0, Math.max(minted.expires_ms - REFRESH_BEFORE_MS, Date.now() + MIN_REFRESH_MS), note, bound.repoId, seq, kind,
       );
       if (note && row.wf_refused !== 1) {
         this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(),
-          "The GitHub App's installation doesn't grant workflows: write, so workers' pushes can't change .github/workflows/. Give the GitHub App Workflows: read and write in its settings if it lacks it, then accept it in its installation settings on GitHub; the app asks for it again at the next token.");
+          "The GitHub App's installation doesn't grant workflows: write, so workers' pushes can't change .github/workflows/. Give the GitHub App Workflows: read and write in the App's own settings (Permissions & events) if it lacks it, then accept it in its installation settings on GitHub; the app asks for it again at the next token.");
       }
       // Back in reach after the owner was told it wasn't: told once.
       if (wasGone || this.settingsRow()!.gh_unreachable === 1) {
@@ -3333,11 +3341,13 @@ export class ProjectDO extends DurableObject<Env> {
         const told = typeof row.error === "string" && row.error.startsWith(PERMISSION_ERROR);
         const perms = Object.entries(githubPermissions(kind, false)).map(([k, v]) => `${k}: ${v}`).join(", ");
         const whose = kind === "push" ? "the workers' push token" : "the read token (the manager's, reviewers' and routine runs')";
+        // As GitHub's App settings page names them.
+        const named = kind === "push" ? "Contents: read and write and Pull requests: read and write" : "Contents: read";
         const why = `${PERMISSION_ERROR} ${whose} needs (${perms}; GitHub doesn't say which is missing)`;
         this.sql.exec("UPDATE gh_access SET error = ?, next_ms = ? WHERE kind = ?", why, Date.now() + GONE_RECHECK_MS, kind);
         if (!told) {
           this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(),
-            `${why}. Give the GitHub App those permissions in its settings if it lacks them, then accept them in its installation settings on GitHub. Agents keep their current token until it expires; the app tries again every ${GONE_RECHECK_MS / 60_000} minutes.`);
+            `${why}. Give the GitHub App ${named} in the App's own settings (Permissions & events) if it lacks them, then accept them in its installation settings on GitHub. Agents keep their current token until it expires; the app tries again every ${GONE_RECHECK_MS / 60_000} minutes.`);
         }
         return;
       }
@@ -3353,7 +3363,7 @@ export class ProjectDO extends DurableObject<Env> {
         if (this.sql.exec("UPDATE settings SET gh_unreachable = 1 WHERE gh_unreachable = 0").rowsWritten) {
           const repo = (await directory(this.env).binding(this.settings()!.id).catch(() => null))?.repo ?? "the repo";
           this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(),
-            `The GitHub App can't reach ${repo}: ${e.status === 404 ? "the App isn't installed on it" : "the repo isn't selected in its installation"}, so agents' GitHub tokens were revoked and new agents wait to start. Install the App on the repo, or give its installation access to it. The app checks again every ${GONE_RECHECK_MS / 60_000} minutes and will tell you when it's back.`);
+            `The GitHub App can't reach ${repo}: ${e.status === 404 ? "the App isn't installed on it" : "the repo isn't selected in its installation"}, so agents' GitHub tokens were revoked and new agents wait to start. ${e.status === 404 ? "Install the App on the repo." : "Select the repo in the App's installation settings."} The app checks again every ${GONE_RECHECK_MS / 60_000} minutes and will tell you when it's back.`);
         }
         return;
       }
@@ -3369,20 +3379,32 @@ export class ProjectDO extends DurableObject<Env> {
    * one; `githubFresh` takes no token of another repo meanwhile), and every live layer is applied again (the
    * guards name the repo). Idempotent, so every read of the binding calls it: the operator's bind and each
    * catalog sync's (`readBinding`), each start (`ensureGithub`) and each refresh (`refreshGithubOnce`). Nothing
-   * waits on one notice arriving.
+   * waits on one notice arriving. A read older than the one followed (its `repo_gen` lower: a read in flight
+   * across a newer notice) is never followed, so access never moves back to a repo it left. Without a read
+   * (`seen` absent), DirectoryDO's binding is read now.
    */
-  async githubRebound(repoId?: number | null): Promise<void> {
+  async githubRebound(seen?: { repo_id: number | null; gen: number }): Promise<void> {
     const s = this.settingsRow();
     if (!s) return;
-    if (repoId === undefined) repoId = (await directory(this.env).binding(s.id as string))?.repo_id ?? null;
+    if (seen === undefined) {
+      const b = await directory(this.env).binding(s.id as string);
+      seen = { repo_id: b?.repo_id ?? null, gen: b?.repo_gen ?? 0 };
+    }
+    const repoId = seen.repo_id;
     const now = this.settingsRow();
-    if (repoId === null || !now || now.gh_repo_id === repoId) return;
-    this.sql.exec("UPDATE settings SET gh_repo_id = ?", repoId);
+    if (repoId === null || !now) return;
+    const held = now.gh_repo_gen as number | null;
+    if (held !== null && seen.gen < held) return;
+    if (now.gh_repo_id === repoId) {
+      if (held === null || seen.gen > held) this.sql.exec("UPDATE settings SET gh_repo_gen = ?", seen.gen);
+      return;
+    }
+    this.sql.exec("UPDATE settings SET gh_repo_id = ?, gh_repo_gen = ?", repoId, seen.gen);
     // The project's first binding read: nothing minted yet (a refresh follows the binding before it mints).
     if (now.gh_repo_id === null) return;
     this.ghGen++;
     this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE revoke = 0", Date.now());
-    this.sql.exec("UPDATE gh_access SET next_ms = ? WHERE gone != 1", Date.now());
+    this.sql.exec("UPDATE gh_access SET next_ms = ?, expires_ms = NULL WHERE gone != 1", Date.now());
     // The guards follow the repo's name now, in every live sandbox's layer.
     await this.oweLayers(LAYER_ROLES);
     await this.arm();

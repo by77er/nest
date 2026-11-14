@@ -53,7 +53,7 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
   // The project's GitHub access follows the bound repo (README.md#the-sandboxes-github-access): bound to another
   // now, its tokens for the old one go and new ones are written. Told at every read, not only a change, so a
   // notice that failed (this one's, the operator then retrying) is made good; each start and refresh checks too.
-  if (out.ok && out.binding.repo_id !== null) await project(env, id).githubRebound(out.binding.repo_id);
+  if (out.ok && out.binding.repo_id !== null) await project(env, id).githubRebound({ repo_id: out.binding.repo_id, gen: out.binding.repo_gen });
   // The repo's owner as GitHub answers now, for the bound repo: a default comments user that isn't it any more goes.
   if (out.ok && info.owner) await project(env, id).repoOwnerSeen(info.owner, b.owner?.id ?? null);
   return out;

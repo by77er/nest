@@ -251,7 +251,7 @@ describe("workers changing CI workflows", () => {
       { agent: "agt_w3", role: "worker", sandbox: "sbx_3", state: "failed", error: "nest 409: the sandbox is suspended", rev: 1, at_ms: now - 60_000 },
     ] };
     renderApp("/projects/prj_one/settings", api);
-    expect(await screen.findByText(/Not in effect: the GitHub App's installation doesn't grant workflows: write\. Give the GitHub App Workflows: read and write in its settings if it lacks it, then accept it in its installation settings on GitHub/)).toBeInTheDocument();
+    expect(await screen.findByText(/Not in effect: the GitHub App's installation doesn't grant workflows: write\. Give the GitHub App Workflows: read and write in the App's own settings \(Permissions & events\) if it lacks it, then accept it in its installation settings on GitHub/)).toBeInTheDocument();
     const list = await screen.findByRole("list", { name: "Live workers' push tokens" });
     for (const id of ["agt_w1", "agt_w2", "agt_w3"]) {
       const w = within(list).getByText(id).closest("[data-agent]") as HTMLElement;

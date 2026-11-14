@@ -377,7 +377,7 @@ function WorkflowsSetting({ projectId, checked, onChange, error }: { projectId: 
             {/* Part of the description, so it reads as one: its size and line height. */}
             {checked && refused && (
               <Text component="span" inherit display="block" mt="xs" c="warning" data-slot="workflows-refused">
-                Not in effect: {refused}. Give the GitHub App Workflows: read and write in its settings if it lacks it, then accept it in its installation settings on GitHub; the app asks for it again at the next token.
+                Not in effect: {refused}. Give the GitHub App Workflows: read and write in the App's own settings (Permissions & events) if it lacks it, then accept it in its installation settings on GitHub; the app asks for it again at the next token.
               </Text>
             )}
           </>

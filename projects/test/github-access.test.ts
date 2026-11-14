@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import pushFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.app_github_push.json";
 import readFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.app_github_read.json";
 import { resetAccessKeys } from "../src/access";
+import { DirectoryDO } from "../src/do/directory";
 import { AppTokens } from "../src/github-app";
 import {
   CREDENTIAL_HELPER, githubAccess, githubGrantMissing, githubGuards, githubPermissions, githubSecretName, REFRESH_BEFORE_MS, spawnOverrides, startEgress,
@@ -260,6 +261,12 @@ async function rebindInDirectory(p: P): Promise<string> {
   });
   return to;
 }
+const dirStub = () => env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
+/** Bind the project to `repo` (its id `id`) in DirectoryDO, as a rebind writes it. */
+async function bindTo(p: P, repo: string, id: number) {
+  await runInDurableObject(dirStub(), (_o, st) => { st.storage.sql.exec("UPDATE projects SET repo = ?, repo_id = ? WHERE id = ?", repo, id, p.id); });
+}
+const boundRow = (p: P) => runInDurableObject(dirStub(), (_o, st) => st.storage.sql.exec("SELECT repo_id, repo_gen FROM projects WHERE id = ?", p.id).one() as { repo_id: number; repo_gen: number });
 const layerGuards = (agent: string) => fake.sandboxes.get(fake.agents.get(agent)!.sandbox!)!.layer.guards;
 
 async function alarmHeld<T>(p: P, f: (o: any, st: DurableObjectState) => Promise<T>): Promise<T> {
@@ -743,6 +750,26 @@ describe("refreshing", () => {
 });
 
 describe("going away", () => {
+  it("the repo not selected in the App's installation (422): the owner is told to select it, and nothing else", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const inst = fake.github.installations.find((i) => i.id === GH_INSTALLATION_ID)!;
+    const saved = inst.repos;
+    inst.repos = new Set();
+    try {
+      for (let i = 0; i < 2; i++) {
+        await sql(p, (s) => s.exec("UPDATE gh_access SET next_ms = 0"));
+        await drain(p);
+      }
+      expect(await ghRow(p, "push")).toMatchObject({ gone: 2 });
+      const chat = JSON.stringify((await api(token, "GET", `/api/projects/${p.id}/chat`)).body);
+      expect(chat).toContain(`The GitHub App can't reach ${p.repo}: the repo isn't selected in its installation, so agents' GitHub tokens were revoked and new agents wait to start. Select the repo in the App's installation settings. The app checks again every 30 minutes`);
+      expect(chat).not.toMatch(/Install the App|GitHub 422|not accessible/);
+    } finally {
+      inst.repos = saved;
+    }
+  });
+
   it("the repo out of the App's reach: its secrets deleted, its tokens revoked, the owner told; back in reach, written again", async () => {
     const p = await newProject();
     await assigned(p);
@@ -772,7 +799,8 @@ describe("going away", () => {
       expect(chat.match(/The GitHub App can't reach/g)).toHaveLength(1);
       expect(chat).toContain(`The GitHub App can't reach ${p.repo}: the App isn't installed on it, so agents' GitHub tokens were revoked`);
       expect(chat).not.toMatch(/GitHub 404|asked for/);
-      expect(chat).toMatch(/Install the App on the repo, or give its installation access to it\. The app checks again every 30 minutes and will tell you when it's back\./);
+      expect(chat).toMatch(/so agents' GitHub tokens were revoked and new agents wait to start\. Install the App on the repo\. The app checks again every 30 minutes and will tell you when it's back\./);
+      expect(chat).not.toMatch(/Select the repo/);
       // A start meanwhile waits, its error saying why.
       const t = await assigned(p);
       expect(t.state).toBe("assigned");
@@ -806,7 +834,7 @@ describe("going away", () => {
       expect(secret(p, "push")!.value).toBe(had);
       expect(tokenOf(had)).toBeDefined();
       const chat = JSON.stringify((await api(token, "GET", `/api/projects/${p.id}/chat`)).body);
-      expect(chat).toContain("The GitHub App's installation doesn't grant everything the workers' push token needs (contents: write, pull_requests: write; GitHub doesn't say which is missing). Give the GitHub App those permissions in its settings if it lacks them, then accept them in its installation settings on GitHub. Agents keep their current token until it expires; the app tries again every 30 minutes.");
+      expect(chat).toContain("The GitHub App's installation doesn't grant everything the workers' push token needs (contents: write, pull_requests: write; GitHub doesn't say which is missing). Give the GitHub App Contents: read and write and Pull requests: read and write in the App's own settings (Permissions & events) if it lacks them, then accept them in its installation settings on GitHub. Agents keep their current token until it expires; the app tries again every 30 minutes.");
       expect(chat).not.toMatch(/can't reach|asked for/);
     } finally {
       inst.permissions = saved;
@@ -900,6 +928,191 @@ describe("going away", () => {
     });
     expect(secret(p, "push")!.value).not.toBe(old);
     expect(tokenOf(secret(p, "push")!.value)!.repo).toBe(out);
+  });
+
+  it("a rebind there and back (X, Y, X) before Y's token is written: a start doesn't take X's revoked token", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const x = await boundRow(p);
+    const y = `n-${rand()}/x-${rand()}`.toLowerCase();
+    const out = await alarmHeld(p, async (o: any) => {
+      const nest = nestFrom(env as any)!;
+      const old = secret(p, "push")!.value;
+      await bindTo(p, y, fake.github.repo(y).id);
+      await o.githubRebound();
+      // Y's refresh hasn't written; the revokes owed run.
+      await o.githubCleanup(nest);
+      await bindTo(p, p.repo, x.repo_id);
+      await o.githubRebound();
+      await o.ensureGithub(nest, "push");
+      return { old, now: secret(p, "push")!.value };
+    });
+    expect(tokenOf(out.old)).toBeUndefined();
+    expect(out.now).not.toBe(out.old);
+    expect(tokenOf(out.now), "the start took a revoked token").toBeDefined();
+  });
+
+  it("X, Y, X with no live worker: the next worker's token is a live one, refreshed before it expires", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const x = await boundRow(p);
+    const y = `n-${rand()}/x-${rand()}`.toLowerCase();
+    const out = await alarmHeld(p, async (o: any, st: DurableObjectState) => {
+      const nest = nestFrom(env as any)!;
+      await bindTo(p, y, fake.github.repo(y).id);
+      await o.githubRebound();
+      await o.githubCleanup(nest);
+      await bindTo(p, p.repo, x.repo_id);
+      await o.githubRebound();
+      // The alarm's upkeep with no worker live: the push refresh lapses.
+      st.storage.sql.exec("UPDATE gh_access SET next_ms = NULL WHERE kind = 'push'");
+      await o.ensureGithub(nest, "push");
+      // The new worker's layer holds it.
+      o.githubHolds("push");
+      const r = st.storage.sql.exec("SELECT next_ms, expires_ms FROM gh_access WHERE kind = 'push'").one();
+      return { next: r.next_ms as number, expires: r.expires_ms as number, valid: tokenOf(secret(p, "push")!.value) !== undefined };
+    });
+    expect(out.valid).toBe(true);
+    expect(out.next).toBeLessThanOrEqual(out.expires - REFRESH_BEFORE_MS + 1000);
+  });
+
+  it("a toggle across a refresh's write with no live worker: the next start doesn't take the token written and revoked", async () => {
+    // The App can't grant workflows: on, the push token is written without it (`wf_refused`), fresh either way.
+    const p = await newProject();
+    const w = await assigned(p);
+    await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
+    await drain(p);
+    expect((await ghRow(p, "push"))!.wf_refused).toBe(1);
+    await deliver({ id: `evt-${crypto.randomUUID()}`, type: "agent.exited", agent: w.assignee!, reason: "done" });
+    let release!: () => void;
+    const hold = { match: /^PUT \/v1\/clients\/self\/secrets\/gh-push-/, release: new Promise<void>((r) => { release = r; }), reached: false };
+    fake.holds.push(hold);
+    const out = await alarmHeld(p, async (o: any, st: DurableObjectState) => {
+      const nest = nestFrom(env as any)!;
+      // A refresh in flight; turned off meanwhile: what it writes is stale, revoked at once, and nothing holds
+      // the token to write it again.
+      const r = o.refreshGithub(nest, "push");
+      for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((x) => setTimeout(x, 5));
+      const inflight = st.storage.sql.exec("SELECT token FROM gh_tokens WHERE kind = 'push' ORDER BY seq DESC LIMIT 1").one().token as string;
+      const u = o.updateSettings({ workers_edit_workflows: false });
+      release();
+      await Promise.all([r, u]);
+      const held = secret(p, "push")!.value;
+      await o.githubCleanup(nest);
+      await o.ensureGithub(nest, "push");
+      return { inflight, held, now: secret(p, "push")!.value };
+    });
+    expect(out.held).toBe(out.inflight);
+    expect(tokenOf(out.inflight)).toBeUndefined();
+    expect(tokenOf(out.now), "the start took the revoked token").toBeDefined();
+  });
+
+  it("a start's binding read in flight across a rebind's notice: never moves the access back to the old repo", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const y = `n-${rand()}/x-${rand()}`.toLowerCase();
+    const idY = fake.github.repo(y).id;
+    const proto = DirectoryDO.prototype as any;
+    const orig = proto.binding;
+    let open!: () => void;
+    const gate = new Promise<void>((r) => { open = r; });
+    let reached!: () => void;
+    const inRead = new Promise<void>((r) => { reached = r; });
+    let hold = true;
+    const out = await alarmHeld(p, async (o: any, st: DurableObjectState) => {
+      const nest = nestFrom(env as any)!;
+      const old = secret(p, "push")!.value;
+      proto.binding = async function (this: unknown, ...a: unknown[]) {
+        const r = await orig.apply(this, a);
+        if (hold) { hold = false; reached(); await gate; }
+        return r;
+      };
+      let e: Promise<unknown>;
+      try {
+        e = o.ensureGithub(nest, "push").then(() => "ok", (x: unknown) => `threw ${x}`);
+        await inRead;
+      } finally {
+        proto.binding = orig;
+      }
+      await bindTo(p, y, idY);
+      await o.githubRebound();
+      open();
+      const res = await e!;
+      return { old, now: secret(p, "push")!.value, res, follows: st.storage.sql.exec("SELECT gh_repo_id FROM settings").one().gh_repo_id };
+    });
+    expect(out.follows).toBe(idY);
+    expect(out.now, "the start took the old repo's token").not.toBe(out.old);
+    if (out.res === "ok") expect(tokenOf(out.now)!.repo).toBe(y);
+  });
+
+  it("DirectoryDO unreachable at a start: the start throws, nothing minted", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const proto = DirectoryDO.prototype as any;
+    const orig = proto.binding;
+    const before = fake.github.mints().length;
+    proto.binding = async function () { throw new Error("DirectoryDO down"); };
+    try {
+      const r = await alarmHeld(p, async (o: any) => o.ensureGithub(nestFrom(env as any)!, "push").then(() => "ok", (x: unknown) => `threw ${x}`));
+      expect(r).toMatch(/threw/);
+    } finally {
+      proto.binding = orig;
+    }
+    expect(fake.github.mints().length).toBe(before);
+  });
+
+  it("a stale notice (a read from before the rebind) landing after it: ignored, no old-repo token minted after", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const x = await boundRow(p);
+    const y = `n-${rand()}/x-${rand()}`.toLowerCase();
+    const idY = fake.github.repo(y).id;
+    const olds = [secret(p, "push")!.value, secret(p, "read")!.value];
+    const out = await alarmHeld(p, async (o: any, st: DurableObjectState) => {
+      await bindTo(p, y, idY);
+      await o.githubRebound();
+      const mintsBefore = fake.github.mints().length;
+      const revokesBefore = st.storage.sql.exec("SELECT COUNT(*) AS n FROM gh_tokens WHERE revoke = 1").one().n;
+      // A sync's read from before the rebind, delivered late: older than the one followed, so ignored at once
+      // (not followed back to X, revoking Y's, then forward again).
+      await o.githubRebound({ repo_id: x.repo_id, gen: x.repo_gen });
+      expect(st.storage.sql.exec("SELECT gh_repo_id FROM settings").one().gh_repo_id).toBe(idY);
+      expect(st.storage.sql.exec("SELECT COUNT(*) AS n FROM gh_tokens WHERE revoke = 1").one().n).toBe(revokesBefore);
+      await o.drain();
+      await o.drain();
+      const xMints = fake.github.mints().slice(mintsBefore).filter((m: any) => m.repository_ids?.[0] === x.repo_id).length;
+      return { xMints, follows: st.storage.sql.exec("SELECT gh_repo_id FROM settings").one().gh_repo_id };
+    });
+    expect(out.xMints).toBe(0);
+    expect(out.follows).toBe(idY);
+    for (const t of olds) expect(tokenOf(t)).toBeUndefined();
+    expect(tokenOf(secret(p, "push")!.value)!.repo).toBe(y);
+    expect(tokenOf(secret(p, "read")!.value)!.repo).toBe(y);
+  });
+
+  it("the project removed while a refresh follows a rebind: no secret left, every token revoked", async () => {
+    const p = await newProject();
+    await assigned(p);
+    const y = `n-${rand()}/x-${rand()}`.toLowerCase();
+    await bindTo(p, y, fake.github.repo(y).id);
+    let release!: () => void;
+    const hold = { match: /^PUT \/v1\/clients\/self\/secrets\/gh-push-/, release: new Promise<void>((r) => { release = r; }), reached: false };
+    fake.holds.push(hold);
+    const toks = await alarmHeld(p, async (o: any, st: DurableObjectState) => {
+      const nest = nestFrom(env as any)!;
+      st.storage.sql.exec("UPDATE gh_access SET next_ms = 0 WHERE kind = 'push'");
+      const r = o.refreshGithub(nest, "push").catch(() => {});
+      for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((x) => setTimeout(x, 5));
+      st.storage.sql.exec("DELETE FROM settings");
+      await o.githubTeardown(nest);
+      release();
+      await r;
+      await o.githubCleanup(nest);
+      return st.storage.sql.exec("SELECT token FROM gh_tokens").toArray().map((x: any) => x.token as string);
+    });
+    expect(hold.reached).toBe(true);
+    expect(secret(p, "push")).toBeUndefined();
+    for (const t of toks) expect(tokenOf(t)).toBeUndefined();
   });
 
   it("a rebind no notice reached is followed at the next refresh", async () => {
