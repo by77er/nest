@@ -60,6 +60,13 @@ describe("the manager's lifecycle (managerStep)", () => {
     // After it ended for good (an error, nothing owed): a Restart starts one.
     expect(managerStep({ manager: null, next_ms: null, restarts: [], error: "ended" }, { kind: "restart" }, NOW, bo)).toMatchObject({ changed: true, stop: null, life: { next_ms: NOW } });
   });
+
+  it("moving onto the app's access stops the current one and starts now, its automatic restarts kept as they were; another agent's changes nothing", () => {
+    const l = { ...live, restarts: [NOW - 1, NOW - 2] };
+    expect(managerStep(l, { kind: "converge", agent: "agt_m" }, NOW, bo)).toEqual({ life: { manager: null, next_ms: NOW, restarts: [NOW - 1, NOW - 2], error: null }, stop: "agt_m", changed: true });
+    expect(managerStep(l, { kind: "converge", agent: "agt_old" }, NOW, bo)).toEqual({ life: l, stop: null, changed: false });
+    expect(managerStep({ manager: null, next_ms: NOW, restarts: [], error: null }, { kind: "converge", agent: "agt_m" }, NOW, bo).changed).toBe(false);
+  });
 });
 
 describe("GET /api/projects/:id/manager", () => {

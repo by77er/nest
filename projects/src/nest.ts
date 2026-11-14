@@ -116,7 +116,7 @@ export type { ClientPolicy, HeldClientLayer };
 /** The overrides a client may give a spawn (nest only narrows, and adds guards: `SpawnerOverrides`). */
 export interface SpawnOverrides {
   tools?: string[];
-  /** nest's own repos (its kernel token): only for a start frozen before the app's own GitHub access (README.md#repo-authority). */
+  /** nest's own repos (its kernel token): only narrowed to none, by a start frozen by the release before (README.md#converging-onto-the-apps-own-access). */
   repos?: string[];
   read_repos?: string[];
 
@@ -174,8 +174,8 @@ export class Nest {
     }
   }
 
-  /** Create a sandbox in the app's cell. The same `idempotencyKey` with the same request answers the same sandbox. */
-  createSandbox(r: { labels: Labels; idle_ttl_ms?: number } & SandboxExtras, idempotencyKey: string): Promise<{ sandbox: string }> {
+  /** Create a sandbox in the app's cell. The same `idempotencyKey` with the same request answers the same sandbox, as it is now (a replay: `state` `destroyed` once it's gone). */
+  createSandbox(r: { labels: Labels; idle_ttl_ms?: number } & SandboxExtras, idempotencyKey: string): Promise<{ sandbox: string; state?: string }> {
     return this.call("POST", "/v1/sandboxes", { ...r, cell: this.config.cell }, { idempotencyKey });
   }
 
@@ -185,8 +185,7 @@ export class Nest {
   }
 
   /**
-   * A new agent with a sandbox of its own, both labelled, with `overrides` (the app's GitHub guards; a start
-   * frozen before them: nest's repos narrowed to the project's, to push to or only to read).
+   * A new agent with a sandbox of its own, both labelled, with `overrides` (as its start froze them).
    * `key` names this start attempt: a retry after a lost answer sends the same Idempotency-Keys
    * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back. An agent create refused for
    * good destroys the sandbox made for it (not on a 409: the key's create may have landed). `agent` adds fields to the

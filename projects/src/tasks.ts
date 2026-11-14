@@ -12,7 +12,7 @@ export type TaskState = (typeof TASK_STATES)[number];
  * - `assign`: by the owner, the manager or auto-assign; a worker is owed (started from the alarm);
  * - `started`: its worker exists and has its brief; the comments queued for it follow;
  * - `start_failed`: nest refused the worker for good (a stalled task is reassigned by hand);
- * - `start_abandoned`: a start in flight is begun again (a setting it was frozen with changed);
+ * - `start_abandoned`: a start in flight is begun again (it was frozen on nest's repos, README.md#converging-onto-the-apps-own-access);
  * - `worker_exited`: its worker ended (nest's `agent.exited`, or a stop the app owed went through);
  * - `pr_attached`: a PR was attached (its worker's report, its branch, the owner's or the manager's);
  * - `pr_merged`: one of its open attached PRs merged; the last one makes it done;

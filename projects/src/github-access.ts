@@ -195,15 +195,17 @@ export interface FrozenGithub {
 }
 
 /**
- * What a start's spawn sends: with the app's access (its guards are the sandbox's own, `startExtras`), nest's
- * repos narrowed to none, since a shared template the catalog sync hasn't rewritten since the deploy still
- * names every project's repo, and nest would otherwise give the agent its own GitHub token for them (and refuse
- * the app's `GH_TOKEN` beside it): goes with nest's repos (phase C). Frozen before it (`github` absent): nest's
- * repos narrowed to the project's, pushed or read.
+ * nest's repos narrowed to none: what every start's spawn sends as its overrides, as B3 did. Every template the app
+ * starts from names no repo of nest's now (each is written before its start, README.md#converging-onto-the-apps-own-access),
+ * so this narrows nothing, and fits any grant, one without repos too. Still sent so that a start frozen by this
+ * release and resent by B3 after a rollback is the same request under its Idempotency-Key (nest binds a key to its
+ * first request for 24 h). Sending none waits for phase C.
  */
-export function spawnOverrides(spec: FrozenGithub, repo: string, push: boolean): SpawnOverrides {
-  if (spec.github) return { repos: [], read_repos: [] };
-  return push ? { repos: [repo] } : { read_repos: [repo] };
+export const NARROWED: SpawnOverrides = Object.freeze({ repos: [], read_repos: [] }) as SpawnOverrides;
+
+/** What a start's spawn sends as its overrides: as its start froze them (one frozen by B3 has none frozen: `NARROWED`, as B3 sent). */
+export function spawnOverrides(spec: FrozenGithub & { overrides?: SpawnOverrides }): SpawnOverrides {
+  return spec.overrides ?? NARROWED;
 }
 
 /** A start's sandbox egress: its role's rules as frozen, then the GitHub hosts its spec adds that no rule names. */

@@ -15,7 +15,7 @@
 // until the owner approves that head commit, or dismisses it (`dismissed`).
 
 import { DurableObject } from "cloudflare:workers";
-import { TEMPLATE } from "../catalog";
+import { TEMPLATE, writeSharedTemplate } from "../catalog";
 import { directory, type Env, project as projectStub } from "../env";
 import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, type Verdict, verdictCheck } from "../github";
 import type { AgentCaller } from "../identity";
@@ -926,8 +926,22 @@ export class ReviewDO extends DurableObject<Env> {
         const key = `${project}/review/${pr}/${sha}/${runs}`;
         // The project's secrets for reviewers, frozen per attempt (ProjectDO keeps them).
         const spec = await projectStub(this.env, project).reviewerSpec(key);
+        if (spec.legacy) {
+          // Frozen on nest's repos before the app's own GitHub access (README.md#converging-onto-the-apps-own-access):
+          // a new attempt, frozen afresh, none of the job's attempts spent; what this one may have made goes by its
+          // labels (ProjectDO records it first, so it's never left unrecorded).
+          await projectStub(this.env, project).abandonStart(labels, "frozen on nest's repos");
+          const r = current();
+          if (!r || r.agent !== null || !this.move(pr, sha, "running", "retry")) return;
+          this.sql.exec("UPDATE jobs SET agent = NULL, briefed = 0, runs = runs + 1, next_ms = ?, deadline_ms = ? WHERE pr = ? AND sha = ? AND runs = ?",
+            Date.now(), Date.now() + REVIEW_DEADLINE_MS, pr, sha, runs);
+          return;
+        }
+        // The shared template as this release has it, naming no repo of nest's, whatever the last catalog sync wrote.
+        await writeSharedTemplate(nest, this.env.PUBLIC_BASE_URL, TEMPLATE.reviewer);
+        if (!current()) return;
         try {
-          agent = await nest.startAgent(TEMPLATE.reviewer, labels, spawnOverrides(spec, repo, false), key, { ...startEgress([], spec), ...spec.extras }, {}, { newAttemptOnCapacity: true });
+          agent = await nest.startAgent(TEMPLATE.reviewer, labels, spawnOverrides(spec), key, { ...startEgress([], spec), ...spec.extras }, {}, { newAttemptOnCapacity: true });
         } catch (e) {
           // No room in nest for now: the job waits, queued, and starts again once there is.
           const r = atCapacity(e) ? current() : null;

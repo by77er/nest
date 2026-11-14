@@ -439,48 +439,43 @@ describe("cost guards", () => {
     expect(fake.agents.get(r.agent)!.overrides).toEqual({ repos: [], read_repos: [] });
   });
 
-  it("a run already tried on nest's repos when this release came (marked by its migration) sends that request again", async () => {
+  it("a run already tried on nest's repos when B3 came (marked by its migration) ends, failed, what it made destroyed; the next run is the app's (README.md#converging-onto-the-apps-own-access)", async () => {
     const s = await setup();
     const id = await create(s);
-    // Its first try failed for now (nest busy), as before this release (nothing made: no key bound to this release's request).
-    fake.fail(/^POST \/v1\/sandboxes$/, 503, { retryable: true, times: 3 });
+    // Its first try made its sandbox, its agent's create failing for now, as before B3 (on nest's repos).
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 3 });
     await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
     const r0 = (await runs(s, id))[0];
     expect(r0).toMatchObject({ state: "starting", agent: null });
-    // As the previous release left it: none of this release's step, then the step.
+    const made = () => [...fake.sandboxes.values()].filter((sb) => sb.labels.run === r0.id && !sb.ended);
+    expect(made()).toHaveLength(1);
+    // As the release before B3 left it: none of B3's step or later, then the steps.
     await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
       const sql = st.storage.sql;
-      for (const t of ["gh_access", "gh_tokens", "sandbox_ends"]) sql.exec(`DROP TABLE ${t}`);
-      sql.exec("ALTER TABLE settings DROP COLUMN gh_unreachable");
-      sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_id");
-      sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_gen");
+      for (const t of ["gh_access", "gh_tokens", "sandbox_ends", "abandoned_starts"]) sql.exec(`DROP TABLE ${t}`);
+      for (const c of ["gh_unreachable", "gh_repo_id", "gh_repo_gen", "converge_next_ms"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("ALTER TABLE layers DROP COLUMN github");
       sql.exec("ALTER TABLE routine_runs DROP COLUMN nest_repos");
       sql.exec("DELETE FROM start_specs");
-      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 1);
+      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 2);
       migrate(st.storage, MIGRATIONS);
       expect(sql.exec("SELECT nest_repos FROM routine_runs WHERE id = ?", r0.id).one().nest_repos).toBe(1);
       sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE state = 'starting'");
     });
-    const tried = fake.callsTo("POST", /^\/v1\/sandboxes$/).length;
-    // The shared template as the previous release's sync wrote it, naming the repo.
-    const name = "templates/projects/routine";
-    const synced = fake.catalog.get(name);
-    fake.catalog.set(name, { ...(synced as object), read_repos: [s.repo.toLowerCase()] });
-    try {
-      await settle(s);
-    } finally {
-      fake.catalog.set(name, synced);
-    }
+    const tried = fake.callsTo("POST", /^\/v1\/(sandboxes|agents)$/).length;
+    await settle(s);
     const r = (await runs(s, id))[0];
-    expect(r, JSON.stringify(r)).toMatchObject({ state: "running" });
-    expect(fake.agents.get(r.agent)!.overrides).toEqual({ read_repos: [s.repo] });
-    const creates = fake.callsTo("POST", /^\/v1\/sandboxes$/).slice(tried).filter((c) => c.body.labels?.run === r.id);
-    expect(creates).toHaveLength(1);
-    for (const c of creates) {
-      expect(c.body.guards).toBeUndefined();
-      expect(c.body.inject).toBeUndefined();
-    }
+    expect(r, JSON.stringify(r)).toMatchObject({ state: "ended", outcome: "failed", agent: null });
+    expect(r.error).toMatch(/nest's own GitHub access, which the app no longer uses/);
+    // Nothing sent again on nest's repos, and what it made is gone.
+    expect(fake.callsTo("POST", /^\/v1\/(sandboxes|agents)$/).slice(tried).filter((c) => c.body.labels?.run === r0.id)).toEqual([]);
+    expect(made()).toEqual([]);
+    // The next run is the app's.
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    await settle(s);
+    const next = (await runs(s, id)).find((x) => x.id !== r0.id)!;
+    expect(next).toMatchObject({ state: "running" });
+    expect(fake.sandboxes.get(fake.agents.get(next.agent)!.sandbox!)!.layer.guards).toEqual(githubGuards(s.repo, "read"));
   });
 
   it("a run waiting on nest's hosts to apply its guards waits past its attempts, saying so, then starts (README.md#repo-authority)", async () => {
