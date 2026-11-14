@@ -275,7 +275,8 @@ impl Rng {
 }
 
 const SEGS: &[&str] = &["a", "A", "b", "mine", "MINE", "x", "", ".", "..", "%2e", "%2E%2e", "%252e%252e", "a%2Fb", "%61", "a;p=1", "a\\b", "%5c", "deposit", "dep%6fsit"];
-const PATS: &[&str] = &["a", "A", "b", "mine", "x", "*", "**", "deposit", "%61"];
+// "" and "/" make empty literals (`/`, `/a/`, `//`): none may take a sealed segment.
+const PATS: &[&str] = &["a", "A", "b", "mine", "x", "*", "**", "deposit", "%61", "", "/"];
 const KEYS: &[&str] = &["op", "OP", "o%70", "x", "op+", "", "a"];
 const VALS: &[&str] = &["read", "READ", "re%61d", "write", "", "w+r", "%2B"];
 
@@ -363,6 +364,36 @@ fn guard_(r: &mut Rng, i: usize) -> RequestGuard {
     }
 }
 
+/// Whether a segment of `path` holds `/` or `\\` once percent-decoded (up to three rounds, as the evaluator).
+fn encoded_separator(path: &str) -> bool {
+    fn decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(b.len());
+        let mut i = 0;
+        while i < b.len() {
+            let hex = |c: u8| (c as char).to_digit(16);
+            if b[i] == b'%'
+                && i + 2 < b.len()
+                && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+            {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+    path.strip_prefix('/').unwrap_or(path).split('/').any(|s| {
+        let mut d = s.to_string();
+        for _ in 0..3 {
+            d = decode(&d);
+        }
+        d.contains(['/', '\\'])
+    })
+}
+
 #[test]
 fn decides_as_the_evaluator_before_it_did() {
     let mut r = Rng(0x9E37_79B9_7F4A_7C15);
@@ -394,7 +425,13 @@ fn decides_as_the_evaluator_before_it_did() {
         ] {
             let o = reference::refusing(&resolved, &old, &ob).map(|g| g.name.clone());
             let n = guard::refusing(guards, &prep, &nb).map(|g| g.name.clone());
-            assert_eq!(o, n, "{ctx}");
+            // A segment holding a separator once decoded matches an exception only under `**` now: there the
+            // new evaluator refuses at least what the old one did.
+            if encoded_separator(&p) {
+                assert!(o.is_none() || n.is_some(), "an encoded separator refused less: {ctx}");
+            } else {
+                assert_eq!(o, n, "{ctx}");
+            }
         }
         // Where the new pre-pass reads no body, the decision can't depend on it.
         if !new_nb {
@@ -485,6 +522,11 @@ fn an_old_proxy_reads_any_as_a_name_and_ignores_at() {
         let host = ["h.test", "x.h.test"][r.below(2)];
         let method = ["GET", "POST", "PUT"][r.below(3)];
         let (injected, whole) = injection(&mut r);
+        // An encoded separator is its own difference (an old proxy matches it as a `*` or a literal in an
+        // exception, a new one only under `**`), checked in `decides_as_the_evaluator_before_it_did`.
+        if encoded_separator(&p) {
+            continue;
+        }
         let old = reference::Req { host, method, path: &p, query: q.as_deref(), injected };
         let prep = guard::Req { host, method, path: &p, query: q.as_deref(), injected, whole: &whole }
             .prepare()

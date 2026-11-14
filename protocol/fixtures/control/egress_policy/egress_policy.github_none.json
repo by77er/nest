@@ -1,0 +1,215 @@
+{
+  "version": 9,
+  "allow": [
+    {
+      "host": "github.com",
+      "ports": [
+        443
+      ],
+      "layer": "base"
+    },
+    {
+      "host": "*.githubusercontent.com",
+      "ports": [
+        443
+      ],
+      "layer": "base"
+    }
+  ],
+  "passthrough": [],
+  "inject": [],
+  "tcp": [],
+  "limits": {
+    "max_connections": 256,
+    "bandwidth_mbps": 200,
+    "max_inspected_body_bytes": 536870912
+  },
+  "guards": [
+    {
+      "name": "github-push",
+      "hosts": [
+        "github.com"
+      ],
+      "scope": [
+        {
+          "path": "/**/git-receive-pack"
+        },
+        {
+          "path": "/**/info/refs",
+          "query": [
+            {
+              "name": "service",
+              "values": [
+                "git-receive-pack"
+              ]
+            }
+          ]
+        }
+      ],
+      "reason": "writes to GitHub go only with a credential nest injected (this sandbox has no repos of nest's own)",
+      "ignore_case": true,
+      "allow": [
+        {
+          "methods": [
+            "GET",
+            "HEAD"
+          ],
+          "path": "/**/info/refs",
+          "query": [
+            {
+              "name": "service",
+              "values": [
+                "git-receive-pack"
+              ]
+            }
+          ]
+        },
+        {
+          "injected": "*",
+          "at": "authorization"
+        }
+      ]
+    },
+    {
+      "name": "github-write",
+      "hosts": [
+        "github.com"
+      ],
+      "scope": [
+        {
+          "methods_except": [
+            "GET",
+            "HEAD"
+          ]
+        }
+      ],
+      "reason": "writes to GitHub go only with a credential nest injected (this sandbox has no repos of nest's own)",
+      "ignore_case": true,
+      "allow": [
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/git-upload-pack"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/info/lfs/objects/batch",
+          "body_json": {
+            "pointer": "/operation",
+            "values": [
+              "download"
+            ]
+          }
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/git-receive-pack",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/info/lfs/objects/batch",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/info/lfs/locks",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/info/lfs/locks/verify",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/info/lfs/locks/*/unlock",
+          "injected": "*",
+          "at": "authorization"
+        }
+      ]
+    },
+    {
+      "name": "github-api-write",
+      "hosts": [
+        "*.github.com"
+      ],
+      "scope": [
+        {
+          "methods_except": [
+            "GET",
+            "HEAD"
+          ]
+        }
+      ],
+      "reason": "writes to GitHub go only with a credential nest injected (this sandbox has no repos of nest's own)",
+      "ignore_case": true,
+      "allow": [
+        {
+          "injected": "*",
+          "at": "authorization"
+        }
+      ]
+    },
+    {
+      "name": "gist-write",
+      "hosts": [
+        "gist.github.com"
+      ],
+      "scope": [
+        {
+          "methods_except": [
+            "GET",
+            "HEAD"
+          ]
+        },
+        {
+          "path": "/**/info/refs",
+          "query": [
+            {
+              "name": "service",
+              "values": [
+                "git-receive-pack"
+              ]
+            }
+          ]
+        }
+      ],
+      "reason": "gists are read-only from a sandbox",
+      "ignore_case": true
+    },
+    {
+      "name": "githubusercontent-write",
+      "hosts": [
+        "*.githubusercontent.com"
+      ],
+      "scope": [
+        {
+          "methods_except": [
+            "GET",
+            "HEAD"
+          ]
+        }
+      ],
+      "reason": "GitHub's content hosts are read-only from a sandbox",
+      "ignore_case": true
+    }
+  ]
+}

@@ -1,11 +1,13 @@
 //! The seam between the control plane's GitHub rule constructor (`control-plane/src/lib/rules/github.ts`)
 //! and the proxy's generic evaluator: the constructor's output for `by77er/nest` and `by77er/nest-fork`
 //! is the fixture `protocol/fixtures/control/egress_policy/egress_policy.github.json` (a vitest asserts
-//! the constructor still produces it), and with read-only repos `egress_policy.github_read.json`; here
-//! the proxy evaluates real GitHub request shapes against them.
+//! the constructor still produces it), with read-only repos `egress_policy.github_read.json`, and in a
+//! sandbox where nest injects no GitHub token of its own `egress_policy.github_none.json`; here the
+//! proxy evaluates real GitHub request shapes against them.
 
 use nest_protocol::model::EgressPolicy;
-use nest_proxy::guard::{BodyView, Req, Whole, refusing};
+use nest_proxy::guard::{BodyView, Req, refusing};
+use nest_proxy::inject::Whole;
 
 fn fixture(name: &str) -> EgressPolicy {
     let p = format!("{}/../../protocol/fixtures/control/egress_policy/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -38,6 +40,10 @@ fn pushes_and_writes_reach_only_allowed_repos() {
         ("github.com", "POST", "/by77er/nest-fork.git/git-receive-pack", None, None, false),
         // fetches of anything stay open
         ("github.com", "POST", "/torvalds/linux.git/git-upload-pack", None, None, false),
+        // ...a fetch as git sends it, at the repo: a web route ending like one (the editor's file path) isn't
+        ("github.com", "POST", "/attacker/drop/tree-save/main/git-upload-pack", None, None, true),
+        ("github.com", "POST", "/attacker/drop/tree-save/main/info/lfs/objects/batch", Some(r#"{"operation":"download"}"#), None, true),
+        ("github.com", "POST", "/attacker/drop%2Ftree-save%2Fmain/git-upload-pack", None, None, true),
         ("github.com", "GET", "/torvalds/linux/info/refs?service=git-upload-pack", None, None, false),
         ("github.com", "GET", "/torvalds/linux", None, None, false),
         // Git LFS
@@ -110,6 +116,72 @@ fn read_only_repos_are_fetched_never_written() {
         ("api.github.com", "POST", "/graphql", Some(r#"{"query":"mutation{}"}"#), Some("other"), true),
     ];
     check(&p, cases);
+}
+
+/// `(host, method, target, injected, whole, refused)`.
+type WholeCase<'a> = (&'a str, &'a str, &'a str, Option<&'a str>, &'a [Whole], bool);
+
+/// The constructor's output where nest injects no GitHub token of its own (no repos, no operator GitHub
+/// binding): `egress_policy.github_none.json`. A write passes only when its one `Authorization` field is a
+/// credential nest's injection wrote whole (an app's own binding, say `client:gh`); push discovery goes
+/// bare, as git sends it before its 401; gists and the content hosts take no write at all.
+#[test]
+fn without_nests_own_token_writes_need_a_credential_nest_injected() {
+    let p = fixture("egress_policy.github_none.json");
+    let auth = [Whole { header: "authorization".into(), binding: "client:gh".into() }];
+    let other = [Whole { header: "x-api-key".into(), binding: "client:gh".into() }];
+    let cases: &[WholeCase] = &[
+        // git: discovery bare (git's first request), the push itself only with nest's credential in Authorization
+        ("github.com", "GET", "/me/box.git/info/refs?service=git-receive-pack", None, &[], false),
+        ("github.com", "POST", "/me/box.git/git-receive-pack", Some("client:gh"), &auth, false),
+        ("github.com", "POST", "/me/box.git/git-receive-pack", None, &[], true),
+        ("github.com", "POST", "/me/box.git/git-receive-pack", Some("client:gh"), &[], true),
+        ("github.com", "POST", "/me/box.git/git-receive-pack", Some("client:gh"), &other, true),
+        ("github.com", "POST", "/me/box.git/info/lfs/objects/batch", None, &[], true),
+        // LFS's API with nest's credential: in Authorization, through; whole in another header, refused
+        ("github.com", "POST", "/me/box.git/info/lfs/objects/batch", Some("client:gh"), &auth, false),
+        ("github.com", "POST", "/me/box.git/info/lfs/locks", Some("client:gh"), &auth, false),
+        ("github.com", "POST", "/me/box.git/info/lfs/locks/12/unlock", Some("client:gh"), &auth, false),
+        ("github.com", "POST", "/me/box.git/info/lfs/locks", Some("client:gh"), &other, true),
+        ("github.com", "POST", "/me/box.git/info/lfs/objects/batch", Some("client:gh"), &other, true),
+        // github.com's web routes authenticate by cookie, which `at` never sees: refused whatever Authorization carries
+        ("github.com", "POST", "/me/box/tree-save/main/README.md", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/upload/policies/assets", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/_graphql", Some("client:gh"), &auth, true),
+        ("github.com", "DELETE", "/anything", Some("client:gh"), &auth, true),
+        ("github.com", "PUT", "/me/box.git/git-receive-pack", Some("client:gh"), &auth, true),
+        // The web editor's routes end in a path the user chooses: never taken for git's or LFS's, whatever they end in
+        ("github.com", "POST", "/me/box/tree-save/main/git-receive-pack", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/me/box/tree-save/main/info/lfs/locks", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/me/box/create/main/info/lfs/objects/batch", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/me/box/delete/main/x/info/lfs/locks/verify", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/settings/git-receive-pack", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/attacker/drop/tree-save/main/git-upload-pack", None, &[], true),
+        // ...nor one whose slashes are encoded, which a server that decodes them reads as the editor's: a segment
+        // holding a separator once decoded is matched by no exception (an older nest-proxy matched it)
+        ("github.com", "POST", "/me/box%2Ftree-save%2Fmain/git-receive-pack", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/me/box%252Ftree-save%252Fmain/git-receive-pack", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/me/box%5Ctree-save%5Cmain/info/lfs/locks", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/attacker/drop%2Ftree-save%2Fmain/git-upload-pack", None, &[], true),
+        // fetches stay open
+        ("github.com", "POST", "/torvalds/linux.git/git-upload-pack", None, &[], false),
+        // the API, REST and GraphQL alike
+        ("api.github.com", "POST", "/graphql", Some("client:gh"), &auth, false),
+        ("api.github.com", "POST", "/graphql", None, &[], true),
+        ("api.github.com", "POST", "/repos/me/box/pulls", Some("client:gh"), &auth, false),
+        ("api.github.com", "POST", "/gists", None, &[], true),
+        ("uploads.github.com", "POST", "/repos/me/box/releases/1/assets", Some("client:gh"), &other, true),
+        ("api.github.com", "GET", "/repos/me/box", None, &[], false),
+        // gists and the content hosts: never written, whatever the credential
+        ("gist.github.com", "POST", "/0123abcd.git/git-receive-pack", Some("client:gh"), &auth, true),
+        ("objects.githubusercontent.com", "PUT", "/upload/x", Some("client:gh"), &auth, true),
+    ];
+    for &(host, method, target, injected, whole, want) in cases {
+        let (path, query) = target.split_once('?').map_or((target, None), |(p, q)| (p, Some(q)));
+        let req = Req { host, method, path, query, injected, whole };
+        let got = refusing(&p.guards, &req.prepare().unwrap(), &BodyView::Unread).map(|g| g.name.clone());
+        assert_eq!(got.is_some(), want, "{method} {host}{target} {injected:?}: {got:?}");
+    }
 }
 
 fn check(p: &EgressPolicy, cases: &[Case]) {

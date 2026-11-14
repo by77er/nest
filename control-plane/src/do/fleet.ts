@@ -154,6 +154,7 @@ interface HostRow {
   guard_injected_any: number;
   /** Its nest-proxy writes a binding's Basic username itself, a Basic field whole only then (1: its last hello said so), or not yet known or of the previous release (0). */
   guard_basic_user: number;
+  guard_sealed_segments: number;
   /** When a drain was asked for (null: none). The status says whether it is serving; this survives an expiry and a return. */
   drain_ms: number | null;
   [key: string]: SqlStorageValue;
@@ -215,6 +216,13 @@ function parseOrphans(value: string): Orphans {
   const v = JSON.parse(value) as Orphans | string[];
   return Array.isArray(v) ? { cmds: v } : v;
 }
+
+/**
+ * A host whose nest-proxy enforces a guard's `at` (docs/sandbox/networking/egress/policy/#any-injected-credential):
+ * it writes a binding's Basic username itself, so a Basic field is nest's whole only then (`guard_basic_user`),
+ * and it matches no exception on a segment holding an encoded separator (`guard_sealed_segments`).
+ */
+const ENFORCES_AT = "guard_basic_user = 1 AND guard_sealed_segments = 1";
 
 export interface PlaceRequest {
   sandbox: string;
@@ -430,6 +438,9 @@ export class FleetDO extends DurableObject<Env> {
     // Its nest-proxy writes a binding's Basic username itself and takes a Basic field as whole (`at`) only
     // then (its hello says so; one of the previous release takes any Basic substitution as whole).
     addColumn(this.sql, "hosts", "guard_basic_user", "INTEGER NOT NULL DEFAULT 0");
+    // Its nest-proxy matches no guard exception on a segment holding an encoded separator (its hello says so).
+    // With `guard_basic_user`: the host enforces `at` (`ENFORCES_AT`).
+    addColumn(this.sql, "hosts", "guard_sealed_segments", "INTEGER NOT NULL DEFAULT 0");
     // A drain is an intent, not a liveness: a host that expires and comes back returns to `draining`.
     addColumn(this.sql, "hosts", "drain_ms", "INTEGER");
     addColumn(this.sql, "leases", "state", "TEXT");
@@ -1101,9 +1112,9 @@ export class FleetDO extends DurableObject<Env> {
     const orphans = stored === undefined ? undefined : parseOrphans(stored);
     // The host has processed every command up to `last_command_seq`; the socket starts there.
     if (hello.last_command_seq !== undefined) this.rel.ack(att.host, hello.last_command_seq);
-    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ?, guard_bounds = ?, guard_injected_any = ?, guard_basic_user = ? WHERE host = ?",
+    this.sql.exec("UPDATE hosts SET last_rx = ?, capacity = ?, nestd_instance = ?, gateway_url = ?, brain_epochs = ?, guard_bounds = ?, guard_injected_any = ?, guard_basic_user = ?, guard_sealed_segments = ? WHERE host = ?",
       now, JSON.stringify(hello.capacity), hello.instance_id, hello.gateway_url ?? null, hello.brain_epochs ? 1 : 0, hello.guard_bounds ? 1 : 0,
-      hello.guard_injected_any ? 1 : 0, hello.guard_basic_user ? 1 : 0, att.host);
+      hello.guard_injected_any ? 1 : 0, hello.guard_basic_user ? 1 : 0, hello.guard_sealed_segments ? 1 : 0, att.host);
     this.setTunnelState(att.host, hello.tunnel ?? "none", prior);
     if (hello.cgroup_delegation_error) {
       console.error(`FleetDO: ${att.host} runs its VMMs outside its unit cgroup (delegation failed: ${hello.cgroup_delegation_error})`);
@@ -1740,10 +1751,10 @@ export class FleetDO extends DurableObject<Env> {
     const guarded = (req.policy.guards ?? []).some((g) => g.name.startsWith(CLIENT_GUARD_PREFIX));
     const all = [...(req.policy.guards ?? []), ...this.storedEgressBase().guards];
     const opens = failsOpenOnOldProxy(all);
-    // A Basic binding or a guard using `at`: on a host without `guard_basic_user` the two must never meet, and
-    // a later change could bring the other (the sandbox's own host is judged then).
+    // A Basic binding or a guard using `at`: only on a host that enforces `at` (`ENFORCES_AT`), since a later
+    // change could bring the other (the sandbox's own host is judged then).
     const basic = hasBasicBinding(req.policy.inject ?? []) || usesAt(all);
-    const where = ["wedged_ms IS NULL", ...(guarded ? ["guard_bounds = 1"] : []), ...(opens ? ["guard_injected_any = 1"] : []), ...(basic ? ["guard_basic_user = 1"] : [])].join(" AND ");
+    const where = ["wedged_ms IS NULL", ...(guarded ? ["guard_bounds = 1"] : []), ...(opens ? ["guard_injected_any = 1"] : []), ...(basic ? [ENFORCES_AT] : [])].join(" AND ");
     const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where })
       .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
       .map((h) => {
@@ -3238,19 +3249,18 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Whether `host`'s nest-proxy writes a binding's Basic username itself (`guard_basic_user`); null: no such host.
-   * SandboxDO asks for its own host, to keep a Basic binding and `at` from meeting there
-   * (docs/sandbox/networking/egress/policy/#any-injected-credential).
+   * Whether `host`'s nest-proxy enforces `at` (`ENFORCES_AT`); null: no such host. SandboxDO asks for its own
+   * host before each push (docs/sandbox/networking/egress/policy/#any-injected-credential).
    */
-  async hostBasicUser(host: string): Promise<boolean | null> {
-    const r = this.sql.exec<{ b: number }>("SELECT guard_basic_user AS b FROM hosts WHERE host = ?", host).toArray()[0];
+  async hostEnforcesAt(host: string): Promise<boolean | null> {
+    const r = this.sql.exec<{ b: number }>(`SELECT (${ENFORCES_AT}) AS b FROM hosts WHERE host = ?`, host).toArray()[0];
     return r ? r.b === 1 : null;
   }
 
 
-  /** `at`: also those whose nest-proxy takes any Basic substitution as whole (no `guard_basic_user`). */
+  /** `at`: also those whose nest-proxy doesn't enforce it (`ENFORCES_AT`). */
   private withoutInjectedAny(at = false): string[] {
-    const where = at ? "(guard_injected_any = 0 OR guard_basic_user = 0)" : "guard_injected_any = 0";
+    const where = at ? `(guard_injected_any = 0 OR NOT (${ENFORCES_AT}))` : "guard_injected_any = 0";
     return this.hostsBy({ role: SANDBOX_ROLE, status: ["active", "draining", "expired", "stonith_pending"], where }).map((h) => h.host);
   }
 

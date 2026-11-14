@@ -136,6 +136,11 @@ export const HostHello = z.object({
    * release, which keeps the request's username and takes any Basic substitution as whole.
    */
   guard_basic_user: z.boolean().optional(),
+  /**
+   * Its nest-proxy matches a guard's exception against no path segment holding `/` or `\` once decoded, other
+   * than under `**`. With `guard_basic_user`, what makes `at` trusted on this host. Absent: an earlier release.
+   */
+  guard_sealed_segments: z.boolean().optional(),
   sandboxes: z.array(SandboxReport),
   agents: z.array(AgentReport),
   capacity: Capacity,
