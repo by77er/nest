@@ -90,13 +90,13 @@
           "methods": [
             "POST"
           ],
-          "path": "/**/git-upload-pack"
+          "path": "/*/*/git-upload-pack"
         },
         {
           "methods": [
             "POST"
           ],
-          "path": "/**/info/lfs/objects/batch",
+          "path": "/*/*/info/lfs/objects/batch",
           "body_json": {
             "pointer": "/operation",
             "values": [
@@ -108,7 +108,7 @@
           "methods": [
             "POST"
           ],
-          "path": "/**/git-receive-pack",
+          "path": "/*/*/git-receive-pack",
           "injected": "*",
           "at": "authorization"
         },
@@ -116,7 +116,7 @@
           "methods": [
             "POST"
           ],
-          "path": "/**/info/lfs/objects/batch",
+          "path": "/*/*/info/lfs/objects/batch",
           "injected": "*",
           "at": "authorization"
         },
@@ -124,7 +124,7 @@
           "methods": [
             "POST"
           ],
-          "path": "/**/info/lfs/locks",
+          "path": "/*/*/info/lfs/locks",
           "injected": "*",
           "at": "authorization"
         },
@@ -132,7 +132,7 @@
           "methods": [
             "POST"
           ],
-          "path": "/**/info/lfs/locks/verify",
+          "path": "/*/*/info/lfs/locks/verify",
           "injected": "*",
           "at": "authorization"
         },
@@ -140,7 +140,7 @@
           "methods": [
             "POST"
           ],
-          "path": "/**/info/lfs/locks/*/unlock",
+          "path": "/*/*/info/lfs/locks/*/unlock",
           "injected": "*",
           "at": "authorization"
         }

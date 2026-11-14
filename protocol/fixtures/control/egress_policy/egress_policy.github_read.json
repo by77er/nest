@@ -118,13 +118,13 @@
           "methods": [
             "POST"
           ],
-          "path": "/**/git-upload-pack"
+          "path": "/*/*/git-upload-pack"
         },
         {
           "methods": [
             "POST"
           ],
-          "path": "/**/info/lfs/objects/batch",
+          "path": "/*/*/info/lfs/objects/batch",
           "body_json": {
             "pointer": "/operation",
             "values": [

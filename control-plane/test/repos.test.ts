@@ -37,11 +37,11 @@ describe("the GitHub rule constructor", () => {
     expect(allow("github-push")).toEqual([{ methods: ["GET", "HEAD"], path: "/**/info/refs", query: [{ name: "service", values: ["git-receive-pack"] }] }, VIA_NEST]);
     // On github.com only its token-authenticated writes take it: git's receive-pack and LFS's API, never the web routes a cookie authenticates.
     expect(allow("github-write").filter((m) => m.injected)).toEqual([
-      { methods: ["POST"], path: "/**/git-receive-pack", ...VIA_NEST },
-      { methods: ["POST"], path: "/**/info/lfs/objects/batch", ...VIA_NEST },
-      { methods: ["POST"], path: "/**/info/lfs/locks", ...VIA_NEST },
-      { methods: ["POST"], path: "/**/info/lfs/locks/verify", ...VIA_NEST },
-      { methods: ["POST"], path: "/**/info/lfs/locks/*/unlock", ...VIA_NEST },
+      { methods: ["POST"], path: "/*/*/git-receive-pack", ...VIA_NEST },
+      { methods: ["POST"], path: "/*/*/info/lfs/objects/batch", ...VIA_NEST },
+      { methods: ["POST"], path: "/*/*/info/lfs/locks", ...VIA_NEST },
+      { methods: ["POST"], path: "/*/*/info/lfs/locks/verify", ...VIA_NEST },
+      { methods: ["POST"], path: "/*/*/info/lfs/locks/*/unlock", ...VIA_NEST },
     ]);
     expect(allow("github-write").some((m) => m.injected && !m.path)).toBe(false);
     expect(allow("github-api-write")).toEqual([VIA_NEST]);
@@ -73,6 +73,10 @@ describe("the GitHub rule constructor", () => {
     // An operator binding under another name and placeholder, on no GitHub host, is no GitHub credential of nest's.
     expect(viaNest(githubEgress([], [], [{ ...githubBinding(), name: "stripe", placeholder: "ph-stripe", hosts: ["api.stripe.com"] }]))).toBe(true);
     expect(viaNest(githubEgress([], [], [{ ...githubBinding(), name: "gh_lookalike", placeholder: "ph-x", hosts: ["github.com.example.net", "notgithub.com"] }]))).toBe(true);
+    // A pattern reaching github.com or a host under it is a GitHub host too.
+    for (const h of ["*.com", "*.github.com"]) {
+      expect(viaNest(githubEgress([], [], [{ ...githubBinding(), name: "wide", placeholder: "ph-w", hosts: [h] }])), h).toBe(false);
+    }
   });
 
   it("uses the placeholder the guest image's credential helper and GITHUB_TOKEN carry", () => {
@@ -95,7 +99,7 @@ describe("the GitHub rule constructor", () => {
   it("read-only repos alone: no push or REST write exception for them, no `github` binding, GraphQL only with the read-only bindings", () => {
     const f = githubEgress([], ["a/b"]);
     expect(f.guards.find((g) => g.name === "github-push")!.allow).toBeUndefined();
-    expect(f.guards.find((g) => g.name === "github-write")!.allow!.map((a) => a.path)).toEqual(["/**/git-upload-pack", "/**/info/lfs/objects/batch"]);
+    expect(f.guards.find((g) => g.name === "github-write")!.allow!.map((a) => a.path)).toEqual(["/*/*/git-upload-pack", "/*/*/info/lfs/objects/batch"]);
     // Never `github`: a push token the proxy still holds under it has no binding and no exception.
     expect(f.guards.find((g) => g.name === "github-api-write")!.allow).toEqual([
       { methods: ["POST"], path: "/graphql", injected: "github_read" }, { methods: ["POST"], path: "/graphql", injected: "github_read_default" },

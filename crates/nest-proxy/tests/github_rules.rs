@@ -39,6 +39,9 @@ fn pushes_and_writes_reach_only_allowed_repos() {
         ("github.com", "POST", "/by77er/nest-fork.git/git-receive-pack", None, None, false),
         // fetches of anything stay open
         ("github.com", "POST", "/torvalds/linux.git/git-upload-pack", None, None, false),
+        // ...a fetch as git sends it, at the repo: a web route ending like one (the editor's file path) isn't
+        ("github.com", "POST", "/attacker/drop/tree-save/main/git-upload-pack", None, None, true),
+        ("github.com", "POST", "/attacker/drop/tree-save/main/info/lfs/objects/batch", Some(r#"{"operation":"download"}"#), None, true),
         ("github.com", "GET", "/torvalds/linux/info/refs?service=git-upload-pack", None, None, false),
         ("github.com", "GET", "/torvalds/linux", None, None, false),
         // Git LFS
@@ -145,6 +148,13 @@ fn without_nests_own_token_writes_need_a_credential_nest_injected() {
         ("github.com", "POST", "/_graphql", Some("client:gh"), &auth, true),
         ("github.com", "DELETE", "/anything", Some("client:gh"), &auth, true),
         ("github.com", "PUT", "/me/box.git/git-receive-pack", Some("client:gh"), &auth, true),
+        // The web editor's routes end in a path the user chooses: never taken for git's or LFS's, whatever they end in
+        ("github.com", "POST", "/me/box/tree-save/main/git-receive-pack", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/me/box/tree-save/main/info/lfs/locks", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/me/box/create/main/info/lfs/objects/batch", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/me/box/delete/main/x/info/lfs/locks/verify", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/settings/git-receive-pack", Some("client:gh"), &auth, true),
+        ("github.com", "POST", "/attacker/drop/tree-save/main/git-upload-pack", None, &[], true),
         // fetches stay open
         ("github.com", "POST", "/torvalds/linux.git/git-upload-pack", None, &[], false),
         // the API, REST and GraphQL alike

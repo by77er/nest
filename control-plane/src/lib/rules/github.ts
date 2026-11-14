@@ -8,7 +8,7 @@
 //   LFS locks:       github.com/git-lfs/git-lfs/blob/main/docs/api/locking.md
 //   REST:            /en/rest (repository endpoints under /repos/{owner}/{repo})
 //   GraphQL:         /en/graphql/guides/forming-calls-with-graphql (one endpoint, POST /graphql)
-import { type InjectionBinding, INJECTED_ANY, type RequestGuard, type RequestMatch } from "../../protocol/model";
+import { hostPatternMatches, type InjectionBinding, INJECTED_ANY, type RequestGuard, type RequestMatch } from "../../protocol/model";
 import { canonicalRepos, readOnlyRepos } from "../repos";
 import type { PolicyFragment } from "./fragment";
 import { z } from "zod";
@@ -61,19 +61,25 @@ const NEST_CREDENTIAL_REASON = "writes to GitHub go only with a credential nest 
  */
 const ownsGithub = (b: InjectionBinding) =>
   [GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING].includes(b.name) || b.placeholder === GITHUB_PLACEHOLDER || b.placeholder === GITHUB_READ_PLACEHOLDER
-  || b.hosts.some((h) => { const x = h.toLowerCase(); return x === "github.com" || x.endsWith(".github.com"); });
+  || b.hosts.some((h) => {
+    const x = h.toLowerCase();
+    // github.com or a host under it, or a pattern reaching either (`*.com`, `*.github.com`).
+    return x === "github.com" || x.endsWith(".github.com") || hostPatternMatches(x, "github.com") || hostPatternMatches(x, "nest-probe.github.com");
+  });
 /**
  * github.com's writes that authenticate by the request's own credential (`Authorization`), not by a session
- * cookie: git's receive-pack and Git LFS's API (batch and locks: github.com/git-lfs/git-lfs/blob/main/docs/api/).
- * Only these take nest's credential as an exception on github.com: every other write there is a web route a
- * planted `Cookie` would authenticate, which `at` never sees.
+ * cookie: git's receive-pack and Git LFS's API (batch and locks: github.com/git-lfs/git-lfs/blob/main/docs/api/),
+ * anchored at the repo (`/<owner>/<repo>/…`): the web editor's routes end in a path the user chooses
+ * (`/<o>/<r>/tree-save/<branch>/<path>`), so a pattern open in front would take them. Only these take nest's
+ * credential as an exception on github.com: every other write there is a web route a planted `Cookie` would
+ * authenticate, which `at` never sees.
  */
 const TOKEN_WRITES: RequestMatch[] = [
-  { methods: ["POST"], path: "/**/git-receive-pack" },
-  { methods: ["POST"], path: "/**/info/lfs/objects/batch" },
-  { methods: ["POST"], path: "/**/info/lfs/locks" },
-  { methods: ["POST"], path: "/**/info/lfs/locks/verify" },
-  { methods: ["POST"], path: "/**/info/lfs/locks/*/unlock" },
+  { methods: ["POST"], path: "/*/*/git-receive-pack" },
+  { methods: ["POST"], path: "/*/*/info/lfs/objects/batch" },
+  { methods: ["POST"], path: "/*/*/info/lfs/locks" },
+  { methods: ["POST"], path: "/*/*/info/lfs/locks/verify" },
+  { methods: ["POST"], path: "/*/*/info/lfs/locks/*/unlock" },
 ];
 const RECEIVE_DISCOVERY: RequestMatch = { path: "/**/info/refs", query: [{ name: "service", values: ["git-receive-pack"] }] };
 const writes = (): RequestMatch => ({ methods_except: [...READS] });
@@ -128,8 +134,9 @@ export function githubGuards(allowlist: readonly string[], readOnly: readonly st
     {
       name: "github-write", hosts: ["github.com"], scope: [writes()],
       allow: [
-        { methods: ["POST"], path: "/**/git-upload-pack" },
-        { methods: ["POST"], path: "/**/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
+        // A fetch, anchored at the repo as git sends it: an open front would take the web editor's routes too.
+        { methods: ["POST"], path: "/*/*/git-upload-pack" },
+        { methods: ["POST"], path: "/*/*/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
         ...webRepo(repos),
         ...(viaNest.length ? TOKEN_WRITES.map((m) => ({ ...m, ...viaNest[0] })) : []),
       ],
