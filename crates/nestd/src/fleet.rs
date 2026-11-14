@@ -225,6 +225,8 @@ impl Shell {
                     guard_injected_any: true,
                     // ...and writes a binding's Basic username itself, a Basic field whole only then.
                     guard_basic_user: true,
+                    // ...and matches no exception on a segment holding an encoded separator.
+                    guard_sealed_segments: true,
                     sandboxes,
                     agents,
                     capacity,

@@ -103,7 +103,8 @@ describe("client egress", () => {
     expect(allowed(policy)).toContain("api.github.com");
     const guard = policy.guards.find((g: any) => g.name === "github-api-write");
     expect(guard.hosts.some((h: string) => hostPatternMatches(h, "api.github.com"))).toBe(true);
-    expect(guard.allow ?? []).toEqual([]);
+    // No repo of nest's here: a write passes only with a credential nest injected, never on the client's rule alone.
+    expect(guard.allow ?? []).toEqual([{ injected: "*", at: "authorization" }]);
   });
 
   it("a template's rules join its agent's sandbox while attached; a spawn may only narrow them; detach takes them away", async () => {

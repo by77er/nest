@@ -112,8 +112,11 @@ export interface EgressBase {
 export const SEED_EGRESS_BASE: EgressBase = { version: 0, allow: BASE_ALLOW.map((host) => ({ host })), guards: [] };
 /** Its cell's base layer as last heard from FleetDO (`egressBaseChanged`, `registerSandbox`); absent: the seed. */
 const EGRESS_BASE = "egress_base";
-/** Whether its host's nest-proxy writes a binding's Basic username itself (`guard_basic_user`), as FleetDO last said: `{host, ok}`. */
-const HOST_BASIC_USER = "host_basic_user";
+/**
+ * Whether its host's nest-proxy enforces `at` (`guard_basic_user` and `guard_sealed_segments`), as FleetDO last
+ * said: `{host, ok}`. Its own key: the previous one (`host_basic_user`) said less, and is never read.
+ */
+const HOST_ENFORCES_AT = "host_enforces_at";
 /**
  * The operator layer's rules on the wire: `workstream` is the layer's historical name, which hosts
  * parse as a closed enum (`PolicyLayer`), so it stays (docs/interfaces/#pending-contract-changes).
@@ -629,7 +632,7 @@ export class SandboxDO extends DurableObject<Env> {
     let placedWithFlag = false;
     try {
       const placing = this.effectivePolicy(Date.now(), true);
-      // FleetDO places a Basic binding or `at` only on a host with `guard_basic_user`: placed so, its host has it.
+      // FleetDO places a Basic binding or `at` only on a host that enforces `at`: placed so, its host does.
       placedWithFlag = hasBasicBinding(placing.inject) || usesAt(placing.guards ?? []);
       const host = await this.fleet(before.cell).place({
         sandbox: before.sandbox,
@@ -637,7 +640,7 @@ export class SandboxDO extends DurableObject<Env> {
         epoch,
         image: before.image,
         resources: before.resources,
-        // As built: FleetDO places a Basic binding or `at` only on a host with `guard_basic_user`.
+        // As built: FleetDO places a Basic binding or `at` only on a host that enforces `at`.
         policy: placing,
         ...(from ? { from } : {}),
         ...(excludeHost ? { excludeHost } : {}),
@@ -652,7 +655,7 @@ export class SandboxDO extends DurableObject<Env> {
     const [r, after] = this.decide((i) => placedStep(i, lease.placeAnswered(i, epoch, answer, from !== undefined), "placed"));
     const owed = r === "placed" ? this.owePlaced() : undefined;
     if (r === "placed") this.recordEpoch(epoch, after.host!);
-    if (r === "placed" && placedWithFlag) this.put(HOST_BASIC_USER, { host: after.host!, ok: true });
+    if (r === "placed" && placedWithFlag) this.put(HOST_ENFORCES_AT, { host: after.host!, ok: true });
     await owed;
     switch (r) {
       case "stale":
@@ -908,7 +911,7 @@ export class SandboxDO extends DurableObject<Env> {
     if (r === "reissue") {
       if (!reissued) {
         // Its host's answer first, as at every push (`forHost`).
-        await this.readHostBasicUser().catch((e) => console.warn(`sandbox ${info.sandbox}: its host's guard_basic_user wasn't read`, e));
+        await this.readHostEnforcesAt().catch((e) => console.warn(`sandbox ${info.sandbox}: its host's flags weren't read`, e));
         await this.fleet(info.cell).issueCommands(host, [this.createBody(info)]);
         if (cmd !== undefined) this.put("create_failure", { cmd, r, reissued: true, done: false } satisfies CreateFailure);
       }
@@ -1264,33 +1267,40 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * The guards as its host gets them: unless FleetDO said its host has `guard_basic_user` (lacking, or not known:
-   * unplaced, unread, no row), a policy with a Basic binding beside a guard using `at` gets them without `at`,
-   * failing closed (`guardsWithoutAt`). Every write
-   * that would bring the pair there is refused first (`requireBasicUser`); a detach can't be, and is the case
-   * this keeps closed (repos going away can turn GitHub's guards' `at` on). `raw`: as built, for the judgment.
+   * The guards as its host gets them: unless FleetDO said its host enforces `at` (`guard_basic_user` and
+   * `guard_sealed_segments`; lacking either, or not known: unplaced, unread, no row), guards using `at` go
+   * without it, failing closed (`guardsWithoutAt`). Every write that would newly bring `at`, or a Basic binding
+   * beside it, there is refused first (`requireBasicUser`); a detach can't be, and is the case this keeps closed
+   * (repos going away turn GitHub's guards' `at` on). `raw`: as built, for the judgment.
    */
-  private forHost<G extends RequestGuard>(inject: readonly InjectionBinding[], guards: G[], raw: boolean): G[] {
-    if (raw || this.hostBasicUser() === true || !basicAtPair({ inject, guards })) return guards;
+  private forHost<G extends RequestGuard>(_inject: readonly InjectionBinding[], guards: G[], raw: boolean): G[] {
+    if (raw || this.hostEnforcesAt() === true || !usesAt(guards)) return guards;
     return guardsWithoutAt(guards);
   }
 
-  /** Whether its host writes a binding's Basic username itself, as FleetDO last said; null: unplaced, or not asked yet. */
-  private hostBasicUser(): boolean | null {
+  /** Whether its host enforces `at`, as FleetDO last said; null: unplaced, or not asked yet. */
+  private hostEnforcesAt(): boolean | null {
     const host = this.tryInfo()?.host;
-    const held = this.get<{ host: string; ok: boolean }>(HOST_BASIC_USER);
+    const held = this.get<{ host: string; ok: boolean }>(HOST_ENFORCES_AT);
     return host && held?.host === host ? held.ok : null;
   }
 
-  /** Ask FleetDO whether its host writes a binding's Basic username itself, and hold the answer. */
-  private async readHostBasicUser(): Promise<boolean | null> {
+  /** Ask FleetDO whether its host enforces `at`, and hold the answer; unanswered (no row, a failed read), nothing is held. */
+  private async readHostEnforcesAt(): Promise<boolean | null> {
     const info = this.info_();
     if (!info.host) return null;
-    const ok = await this.fleet(info.cell).hostBasicUser(info.host);
+    let ok: boolean | null;
+    try {
+      ok = await this.fleet(info.cell).hostEnforcesAt(info.host);
+    } catch (e) {
+      // Unread: not known, so closed, never the answer held before.
+      if (this.tryInfo()?.host === info.host) this.del(HOST_ENFORCES_AT);
+      throw e;
+    }
     if (this.tryInfo()?.host !== info.host) return ok;
     // No row for it: not known, so closed.
-    if (ok === null) this.del(HOST_BASIC_USER);
-    else this.put(HOST_BASIC_USER, { host: info.host, ok });
+    if (ok === null) this.del(HOST_ENFORCES_AT);
+    else this.put(HOST_ENFORCES_AT, { host: info.host, ok });
     return ok;
   }
 
@@ -1457,8 +1467,8 @@ export class SandboxDO extends DurableObject<Env> {
    * sent meanwhile is left as the host's.
    */
   private async policyChanged(injectionChanged: boolean): Promise<EgressPolicy> {
-    // Its host's answer first, so what it gets is decided for it (`forHost`); unanswered, the last one held.
-    await this.readHostBasicUser().catch((e) => console.warn(`sandbox ${this.tryInfo()?.sandbox}: its host's guard_basic_user wasn't read`, e));
+    // Its host's answer first, so what it gets is decided for it (`forHost`); unanswered, not known: closed.
+    await this.readHostEnforcesAt().catch((e) => console.warn(`sandbox ${this.tryInfo()?.sandbox}: its host's flags weren't read`, e));
     const info = this.update((i) => {
       i.policy_version += 1;
     });
@@ -1954,37 +1964,40 @@ export class SandboxDO extends DurableObject<Env> {
     if (old.length) throw injectedAnyConflict(cell, fresh.map((g) => g.name), old);
   }
 
-  /** Whether its policy as built holds the pair (`basicAtPair`): a Basic binding, any source, beside a guard using `at`. */
-  private basicOpen(): boolean {
-    return basicAtPair(this.sourcedPolicy(Date.now(), true));
+  /** What its policy as built asks of its host: a guard using `at`, and a Basic binding (any source) beside one (`basicAtPair`). */
+  private atNeeds(): { at: boolean; pair: boolean } {
+    const p = this.sourcedPolicy(Date.now(), true);
+    return { at: usesAt(p.guards ?? []), pair: basicAtPair(p) };
   }
 
   /**
    * The one gate for the invariant (docs/sandbox/networking/egress/policy/#any-injected-credential): a sandbox on
-   * a host without `guard_basic_user` never holds a Basic binding (nest's own included) beside a guard using
-   * `at`. `change` stores a write as it would be (a client's layer, an attach with its repos and extras, the
-   * operator's layer and repos, an agent's repos added); it's applied, judged and undone in one synchronous
-   * transaction. A write that newly brings the pair is refused (409 `hosts_not_ready`) when its own host lacks
-   * the flag (asked of FleetDO now); unplaced, placement decides. A detach can't be refused: its host gets the
-   * guards without `at` instead (`forHost`).
+   * a host that doesn't enforce `at` (`guard_basic_user` and `guard_sealed_segments`) is never given a guard
+   * using `at`, nor a Basic binding (nest's own included) beside one. `change` stores a write as it would be (a
+   * client's layer, an attach with its repos and extras, the operator's layer and repos, an agent's repos
+   * added); it's applied, judged and undone in one synchronous transaction. A write that newly brings either is
+   * refused (409 `hosts_not_ready`) when its own host is known not to enforce `at` (asked of FleetDO now);
+   * unplaced, placement decides, and unknown, the push fails closed. A detach can't be refused: its host gets
+   * the guards without `at` instead (`forHost`).
    */
   private async requireBasicUser(change: () => void): Promise<void> {
-    if (this.basicOpen()) return;
-    let after = false;
+    const before = this.atNeeds();
+    if (before.at && before.pair) return;
+    let after = before;
     const undo = new Error("undo");
     try {
       this.ctx.storage.transactionSync(() => {
         change();
-        after = this.basicOpen();
+        after = this.atNeeds();
         throw undo;
       });
     } catch (e) {
       if (e !== undo) throw e;
     }
-    if (!after) return;
-    if ((await this.readHostBasicUser()) === false) {
+    if (!(after.at && !before.at) && !(after.pair && !before.pair)) return;
+    if ((await this.readHostEnforcesAt()) === false) {
       const info = this.info_();
-      throw new NestError(ErrorCodes.HOSTS_NOT_READY, `this write puts a binding with a Basic password beside a guard using "at", which sandbox ${info.sandbox}'s host ${info.host} can't decide (its nest-proxy doesn't write a binding's Basic username itself): retry once it's on a host that does`, 409);
+      throw new NestError(ErrorCodes.HOSTS_NOT_READY, `this write gives sandbox ${info.sandbox} a guard using "at"${after.pair ? " beside a binding with a Basic password" : ""}, which its host ${info.host} can't enforce (its nest-proxy lacks guard_basic_user or guard_sealed_segments): retry once it's on a host that does`, 409);
     }
   }
 

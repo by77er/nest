@@ -187,6 +187,14 @@ pub struct HostHello {
     /// guards use `at` beside a Basic binding.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub guard_basic_user: bool,
+    /// This host's nest-proxy matches a guard's exception against no path segment that holds `/` or `\`
+    /// once decoded, other than under `**` (docs/sandbox/networking/egress/policy/#request-guards). With
+    /// `guard_basic_user`, what makes the control plane trust `at` on this host. Absent (false) from a host
+    /// of an earlier release, which matches such a segment as one `*` or a literal: on which the control
+    /// plane places no sandbox whose guards use `at` (or that has a Basic binding), and which gets a policy's
+    /// guards without `at`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guard_sealed_segments: bool,
     /// Everything this host currently holds; FleetDO reconciles against it.
     pub sandboxes: Vec<SandboxReport>,
     pub agents: Vec<AgentReport>,

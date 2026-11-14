@@ -8,7 +8,7 @@
 //   LFS locks:       github.com/git-lfs/git-lfs/blob/main/docs/api/locking.md
 //   REST:            /en/rest (repository endpoints under /repos/{owner}/{repo})
 //   GraphQL:         /en/graphql/guides/forming-calls-with-graphql (one endpoint, POST /graphql)
-import type { InjectionBinding, RequestGuard, RequestMatch } from "../../protocol/model";
+import { hostPatternMatches, type InjectionBinding, INJECTED_ANY, type RequestGuard, type RequestMatch } from "../../protocol/model";
 import { canonicalRepos, readOnlyRepos } from "../repos";
 import type { PolicyFragment } from "./fragment";
 import { z } from "zod";
@@ -45,6 +45,43 @@ export const GITHUB_READ_PLACEHOLDER = "nest-ph-read-github";
 export const GITHUB_READ_DEFAULT_BINDING = "github_read_default";
 
 const READS = ["GET", "HEAD"];
+/**
+ * Where nest injects no GitHub token of its own (no push allowlist, no read-only repos, no operator binding
+ * under a GitHub name or placeholder), the exception that lets a write through: the request's one
+ * `Authorization` field is a credential nest's injection wrote whole, whichever binding's
+ * (docs/sandbox/networking/egress/policy/#any-injected-credential). So an app's own GitHub binding works and
+ * its own guards narrow where it reaches, and a credential planted in the sandbox still writes nowhere.
+ */
+const NEST_CREDENTIAL: RequestMatch[] = [{ injected: INJECTED_ANY, at: "authorization" }];
+const NEST_CREDENTIAL_REASON = "writes to GitHub go only with a credential nest injected (this sandbox has no repos of nest's own)";
+/**
+ * An operator binding that is a GitHub credential of nest's side: by a GitHub binding's name or placeholder,
+ * or by injecting into github.com or any `*.github.com` host (an operator's PAT under any name). Where one
+ * is, the guards stay as they were: `*` would accept it too, wherever it reaches.
+ */
+const ownsGithub = (b: InjectionBinding) =>
+  [GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING].includes(b.name) || b.placeholder === GITHUB_PLACEHOLDER || b.placeholder === GITHUB_READ_PLACEHOLDER
+  || b.hosts.some((h) => {
+    // As nest-proxy matches it: without case, and without trailing dots (`api.github.com.` is api.github.com).
+    const x = h.toLowerCase().replace(/\.+$/, "");
+    // github.com or a host under it, or a pattern reaching either (`*.com`, `*.github.com`).
+    return x === "github.com" || x.endsWith(".github.com") || hostPatternMatches(x, "github.com") || hostPatternMatches(x, "nest-probe.github.com");
+  });
+/**
+ * github.com's writes that authenticate by the request's own credential (`Authorization`), not by a session
+ * cookie: git's receive-pack and Git LFS's API (batch and locks: github.com/git-lfs/git-lfs/blob/main/docs/api/),
+ * anchored at the repo (`/<owner>/<repo>/…`): the web editor's routes end in a path the user chooses
+ * (`/<o>/<r>/tree-save/<branch>/<path>`), so a pattern open in front would take them. Only these take nest's
+ * credential as an exception on github.com: every other write there is a web route a planted `Cookie` would
+ * authenticate, which `at` never sees.
+ */
+const TOKEN_WRITES: RequestMatch[] = [
+  { methods: ["POST"], path: "/*/*/git-receive-pack" },
+  { methods: ["POST"], path: "/*/*/info/lfs/objects/batch" },
+  { methods: ["POST"], path: "/*/*/info/lfs/locks" },
+  { methods: ["POST"], path: "/*/*/info/lfs/locks/verify" },
+  { methods: ["POST"], path: "/*/*/info/lfs/locks/*/unlock" },
+];
 const RECEIVE_DISCOVERY: RequestMatch = { path: "/**/info/refs", query: [{ name: "service", values: ["git-receive-pack"] }] };
 const writes = (): RequestMatch => ({ methods_except: [...READS] });
 
@@ -66,10 +103,20 @@ const apiRepo = (repos: readonly string[]): RequestMatch[] => repos.map((r) => (
  *   target isn't in the path);
  * - `gist-write`: no writes to gists (each is a git repo);
  * - `githubusercontent-write`: no writes to `*.githubusercontent.com` (signed upload URLs).
+ * Where nest injects no GitHub token of its own (no repos of either kind, no `operator` binding that is a
+ * GitHub credential: `ownsGithub`), the first three except a credential nest injected whole in `Authorization`
+ * instead (`NEST_CREDENTIAL`): on github.com only for its token-authenticated writes (`TOKEN_WRITES`), and
+ * push discovery goes bare. An app's own binding writes, its own client guards narrow where, and a
+ * credential planted in the sandbox (a token, or a cookie for github.com's web routes) writes nowhere. On
+ * the other `*.github.com` hosts the exception holds only where a binding injects (nest-proxy refuses a
+ * placeholder on a host its binding doesn't name), so on the hosts the operator granted an app.
  */
 export function githubGuards(allowlist: readonly string[], readOnly: readonly string[] = [], operator: readonly InjectionBinding[] = []): RequestGuard[] {
   const repos = canonicalRepos(allowlist);
   const read = readOnlyRepos(repos, readOnly);
+  // No GitHub token of nest's own here: a write passes with a credential nest injected in its Authorization
+  // (an app's own binding, or the operator's under another name), never one the sandbox planted.
+  const viaNest = repos.length || read.length || operator.some(ownsGithub) ? [] : NEST_CREDENTIAL;
   const named = repos.length ? ` (${repos.join(", ")})` : "";
   const readNamed = read.length ? `; ${read.join(", ")} ${read.length > 1 ? "are" : "is"} read-only` : "";
   const pushReason = `git pushes reach only the repos on this sandbox's push allowlist${named || " (none)"}${readNamed}`;
@@ -80,22 +127,26 @@ export function githubGuards(allowlist: readonly string[], readOnly: readonly st
   const tokens = [...(repos.length ? [GITHUB_BINDING] : []), ...readBindings(repos, read, operator).filter((b) => !operator.some((o) => o.name === b))];
   const guards: RequestGuard[] = [
     {
-      name: "github-push", hosts: ["github.com"], scope: [{ path: "/**/git-receive-pack" }, RECEIVE_DISCOVERY], allow: webRepo(repos),
-      reason: pushReason, ignore_case: true,
+      name: "github-push", hosts: ["github.com"], scope: [{ path: "/**/git-receive-pack" }, RECEIVE_DISCOVERY],
+      // git asks for a credential only once discovery is answered 401: that GET goes without one.
+      allow: [...webRepo(repos), ...(viaNest.length ? [{ methods: [...READS], ...RECEIVE_DISCOVERY }] : []), ...viaNest],
+      reason: viaNest.length ? NEST_CREDENTIAL_REASON : pushReason, ignore_case: true,
     },
     {
       name: "github-write", hosts: ["github.com"], scope: [writes()],
       allow: [
-        { methods: ["POST"], path: "/**/git-upload-pack" },
-        { methods: ["POST"], path: "/**/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
+        // A fetch, anchored at the repo as git sends it: an open front would take the web editor's routes too.
+        { methods: ["POST"], path: "/*/*/git-upload-pack" },
+        { methods: ["POST"], path: "/*/*/info/lfs/objects/batch", body_json: { pointer: "/operation", values: ["download"] } },
         ...webRepo(repos),
+        ...(viaNest.length ? TOKEN_WRITES.map((m) => ({ ...m, ...viaNest[0] })) : []),
       ],
-      reason: writeReason, ignore_case: true,
+      reason: viaNest.length ? NEST_CREDENTIAL_REASON : writeReason, ignore_case: true,
     },
     {
       name: "github-api-write", hosts: ["*.github.com"], scope: [writes()],
-      allow: [...apiRepo(repos), ...tokens.map((injected) => ({ methods: ["POST"], path: "/graphql", injected, at: "authorization" }))],
-      reason: `${writeReason}; GraphQL writes go only with the sandbox's own GitHub token`, ignore_case: true,
+      allow: [...apiRepo(repos), ...tokens.map((injected) => ({ methods: ["POST"], path: "/graphql", injected, at: "authorization" })), ...viaNest],
+      reason: viaNest.length ? NEST_CREDENTIAL_REASON : `${writeReason}; GraphQL writes go only with the sandbox's own GitHub token`, ignore_case: true,
     },
     { name: "gist-write", hosts: ["gist.github.com"], scope: [writes(), RECEIVE_DISCOVERY], reason: "gists are read-only from a sandbox", ignore_case: true },
     { name: "githubusercontent-write", hosts: ["*.githubusercontent.com"], scope: [writes()], reason: "GitHub's content hosts are read-only from a sandbox", ignore_case: true },
@@ -135,8 +186,8 @@ export function readBindings(allowlist: readonly string[], readOnly: readonly st
 }
 
 /**
- * What a push allowlist and read-only repos add to a sandbox's policy: the guards always (an empty
- * allowlist refuses every push), and with any repo the API host (for `gh`) and the bindings its tokens
+ * What a push allowlist and read-only repos add to a sandbox's policy: the guards always (with no repo,
+ * writes pass only with a credential nest injected), and with any repo the API host (for `gh`) and the bindings its tokens
  * are injected under (`operator`: the operator's layer's bindings, which win over these by name).
  */
 export function githubEgress(allowlist: readonly string[], readOnly: readonly string[] = [], operator: readonly InjectionBinding[] = []): PolicyFragment {
