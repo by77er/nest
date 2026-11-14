@@ -2,7 +2,7 @@ import { cloudflareTest } from "@cloudflare/vitest-plugin";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
 
-// Two projects:
+// Three projects:
 // - `worker`: the Worker and its Durable Objects, in workerd with the app's bindings (wrangler.jsonc),
 //   without the Vite plugin (vite.config.ts). nest is a fake: each test file swaps the global fetch the
 //   Worker and its objects call (test/fake-nest.ts), and signs Nest-Identity tokens and webhooks with
@@ -10,6 +10,7 @@ import { defineConfig } from "vitest/config";
 //   The GitHub App's key is made for each run (a PKCS#1 PEM, as GitHub hands it out): the Worker signs its
 //   JWT with the private half, and the fake GitHub checks it with the public half (TEST_GITHUB_APP_PUBLIC_KEY).
 // - `ui`: the page's components (src/ui/), in jsdom with Testing Library, against a stubbed fetch.
+// - `node`: the real git and gh, against the sandbox environment the app builds (test-node/).
 /** The `RSAPrivateKey` (PKCS#1) inside a PKCS#8 `PrivateKeyInfo`: its last field, an OCTET STRING (RFC 5208). */
 function pkcs8ToPkcs1(der: Uint8Array): Uint8Array {
   let at = 0;
@@ -72,6 +73,8 @@ export default defineConfig({
         plugins: [react()],
         test: { name: "ui", environment: "jsdom", include: ["src/ui/**/*.test.{ts,tsx}"], setupFiles: ["src/ui/test/setup.ts"], testTimeout: 15_000 },
       },
+      // `node`: what runs the real git and gh against the environment the app gives a sandbox (test-node/).
+      { test: { name: "node", environment: "node", include: ["test-node/**/*.test.ts"], testTimeout: 15_000 } },
     ],
   },
 });

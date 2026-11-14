@@ -1,5 +1,5 @@
 // The state-machine sweep's lower-severity fixes (sm-inventory-projects.md): an agent's exit that overtakes
-// its create's answer (B12), an attach owed while one runs (B14), two catalog syncs at once (B15),
+// its create's answer (B12), an attach owed while one runs (B14) (B15, two catalog syncs at once, went with the templates' repos),
 // `PATCH settings` all or nothing (B18), and pruning terminal history-like rows by age (B20).
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -143,24 +143,6 @@ describe("B14: an attach owed while one runs", () => {
     // one never reached the required checks, so this read is the owed one's.
     expect(attaches() - before).toBe(1);
     expect(await inProject(p, (sql) => sql.exec("SELECT attach_error FROM settings").one().attach_error)).toBeNull();
-  });
-});
-
-describe("B15: two catalog syncs at once", () => {
-  it("the catalog ends with both projects' repos, though the older snapshot's writes land last", async () => {
-    let release!: () => void;
-    // The first project's sync is held at its first write, after it read the repos (its own only).
-    const hold = { match: /^PUT \/v1\/catalog\/capabilities\/projects\/board$/, release: new Promise<void>((r) => (release = r)), reached: false };
-    fake.holds.push(hold);
-    const a = `o-${rand()}/a-${rand()}`;
-    const creatingA = api(token, "POST", "/api/projects", { name: a, repo: a });
-    await until(() => hold.reached);
-    const b = `o-${rand()}/b-${rand()}`;
-    expect((await api(token, "POST", "/api/projects", { name: b, repo: b })).status).toBe(201);
-    release();
-    expect((await creatingA).status).toBe(201);
-    const worker = fake.catalog.get("templates/projects/worker") as { repos: string[] };
-    expect(worker.repos).toEqual(expect.arrayContaining([a.toLowerCase(), b.toLowerCase()]));
   });
 });
 

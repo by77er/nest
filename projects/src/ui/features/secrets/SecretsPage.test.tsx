@@ -156,13 +156,13 @@ describe("the Secrets page", () => {
     expect(api.writes).toEqual([]);
   });
 
-  it("steers away from the GitHub API preset: nest brokers GitHub already", async () => {
+  it("steers away from the GitHub API preset: every sandbox has the app's token for the repo already", async () => {
     const api = new FakeApi();
     const { user } = renderApp("/projects/prj_one/secrets", api);
     await user.click(await screen.findByRole("button", { name: "Add the first secret" }));
     await user.click(service(sheet()));
     await user.click(await screen.findByRole("option", { name: "GitHub API" }));
-    expect(within(sheet()).getByText(/nest already brokers GitHub/)).toBeInTheDocument();
+    expect(within(sheet()).getByText(/already gives every sandbox a token for the project's repo/)).toBeInTheDocument();
   });
 
   it("deleting confirms, naming the agents that lose it", async () => {
@@ -226,7 +226,7 @@ describe("a secret outside the grant", () => {
 });
 
 describe("workers changing CI workflows", () => {
-  it("shows the security note when on, and can't be turned on when the grant doesn't allow it", async () => {
+  it("shows the security note when on; on where the GitHub App's installation refuses it, says it's not in effect and why", async () => {
     const api = new FakeApi();
     const { user } = renderApp("/projects/prj_one/settings", api);
     const toggle = await screen.findByRole("switch", { name: /Workers may change CI workflows/ });
@@ -235,11 +235,31 @@ describe("workers changing CI workflows", () => {
     await user.click(toggle);
     expect(screen.getByText("A pushed workflow runs before anyone reviews it")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "GitHub: environments" })).toHaveAttribute("href", expect.stringContaining("managing-environments-for-deployment"));
-    const denied = new FakeApi();
-    denied.grant = { ...denied.grant!, workflows: false };
-    renderApp("/projects/prj_one/settings", denied);
-    await waitFor(() => expect(screen.getAllByRole("switch", { name: /Workers may change CI workflows/ }).at(-1)).toBeDisabled());
-    expect(screen.getByText(/The app's grant doesn't allow it/)).toBeInTheDocument();
+    // Not gated on nest's grant any more: the App's installation decides.
+    expect(screen.queryByText(/grant doesn't allow it/)).toBeNull();
+  });
+
+  it("on, but the GitHub App's installation doesn't grant workflows: write: under the toggle, and each live worker Failed with why", async () => {
+    const api = new FakeApi();
+    api.projects[0]!.settings.workers_edit_workflows = true;
+    api.workflowsRefused = "the GitHub App's installation doesn't grant workflows: write";
+    api.workflowWorkers = [];
+    api.network = { ...api.network, agents: [
+      { agent: "agt_w1", role: "worker", sandbox: "sbx_1", state: "applied", error: null, rev: 2, at_ms: now - 60_000 },
+      // Its layer pending or failed itself: Failed all the same (waiting won't help), its own error kept.
+      { agent: "agt_w2", role: "worker", sandbox: "sbx_2", state: "pending", error: null, rev: 1, at_ms: now - 60_000 },
+      { agent: "agt_w3", role: "worker", sandbox: "sbx_3", state: "failed", error: "nest 409: the sandbox is suspended", rev: 1, at_ms: now - 60_000 },
+    ] };
+    renderApp("/projects/prj_one/settings", api);
+    expect(await screen.findByText(/Not in effect: the GitHub App's installation doesn't grant workflows: write\. Give the GitHub App Workflows: read and write in the App's own settings \(Permissions & events\) if it lacks it, then accept it in its installation settings on GitHub/)).toBeInTheDocument();
+    const list = await screen.findByRole("list", { name: "Live workers' push tokens" });
+    for (const id of ["agt_w1", "agt_w2", "agt_w3"]) {
+      const w = within(list).getByText(id).closest("[data-agent]") as HTMLElement;
+      expect(w, id).toHaveTextContent("Can't change workflows · the GitHub App's installation doesn't grant workflows: write");
+      expect(w, id).not.toHaveTextContent("yet");
+      expect(w.querySelector("[data-slot=state]"), id).toHaveTextContent("Failed");
+    }
+    expect(within(list).getByText("agt_w3").closest("[data-agent]")).toHaveTextContent("nest 409: the sandbox is suspended");
   });
 
   it("lists the live workers under a heading, each against the saved setting: one that differs says so until its layer applies", async () => {
@@ -260,10 +280,10 @@ describe("workers changing CI workflows", () => {
     expect(w1).toHaveTextContent("Its pushes may not change workflows");
     expect(w1.querySelector("[data-slot=state]")).toHaveTextContent("Applied");
     const w2 = within(list).getByText("agt_w2").closest("[data-agent]") as HTMLElement;
-    expect(w2).toHaveTextContent("Still may change workflows · until its layer applies");
+    expect(w2).toHaveTextContent("Still may change workflows · until it catches up");
     expect(w2.querySelector("[data-slot=state]")).toHaveTextContent("Pending");
     const w3 = within(list).getByText("agt_w3").closest("[data-agent]") as HTMLElement;
-    expect(w3).toHaveTextContent("Still may change workflows · until its layer applies");
+    expect(w3).toHaveTextContent("Still may change workflows · until it catches up");
     expect(w3.querySelector("[data-slot=state]")).toHaveTextContent("Pending");
     expect(within(list).queryByText("agt_m")).toBeNull();
     expect(screen.queryByText(/keep it until/)).toBeNull();

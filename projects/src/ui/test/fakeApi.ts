@@ -87,6 +87,8 @@ export class FakeApi {
   commentsCleared: Extract<Attention, { kind: "comments_cleared" }> | null = null;
   waits: Waits = { pending: [], recent: [] };
   workflowWorkers: string[] = [];
+  /** Why workers' pushes can't change workflows though the setting says so (the App's installation refuses it). */
+  workflowsRefused: string | null = null;
   /** `PUT network`'s answer instead of saving: a refusal (403 with `problems`, say). */
   networkRefusal: { status: number; body: unknown } | null = null;
   network: NetworkView = { rules: { worker: [], manager: [] }, rev: 0, agents: [], egress_hosts: ["registry.npmjs.org", "nodejs.org", "pypi.org", "files.pythonhosted.org"], base: [{ host: "github.com", ports: [443], source: "base" }, { host: "mirror.internal.example", ports: [8443], source: "operator" }, { host: "api.github.com", ports: [443], source: "repos" }], failed_stops: [] };
@@ -283,7 +285,7 @@ export class FakeApi {
       case "GET reviews":
         return json(this.reviews);
       case "GET secrets":
-        return json({ secrets: this.secrets, grant: this.grant, client: "cli_app", agents: this.network.agents, workflow_workers: this.workflowWorkers });
+        return json({ secrets: this.secrets, grant: this.grant, client: "cli_app", agents: this.network.agents, workflow_workers: this.workflowWorkers, workflows_refused: this.workflowsRefused });
       case "GET prs/open":
         return json(this.openPrs);
       case "GET chat": {

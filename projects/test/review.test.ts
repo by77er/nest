@@ -2,6 +2,7 @@
 // project's ReviewDO queue and its alarm, the reviewer's tools on /mcp/review, and the check runs and
 // agents it makes, against a fake GitHub and a fake nest (test/fake-nest.ts).
 import { env, runInDurableObject } from "cloudflare:test";
+import { githubGuards } from "../src/github-access";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { CHECK_NAME, signGithub } from "../src/github";
@@ -113,12 +114,16 @@ describe("/hooks/github", () => {
   });
 
   it("acknowledges and ignores a repo no project is attached to, ping and other events", async () => {
+    // Whether the app acts for an event's account is read once per isolate (GET /app): an earlier test may
+    // have read it already or not, so it's read here first.
+    expect((await deliverGithub("pull_request", prEvent({ repo: `nobody/${rand()}`, number: 1, sha: sha(), action: "opened" }))).status).toBe(200);
     const before = gh.calls.length;
     const agents = fake.agents.size;
-    expect(await (await deliverGithub("pull_request", prEvent({ repo: `nobody/${rand()}`, number: 1, sha: sha(), action: "opened" }))).json()).toEqual({ ignored: "no project for this repo" });
+    const nobody = `nobody/${rand()}`;
+    expect(await (await deliverGithub("pull_request", prEvent({ repo: nobody, number: 1, sha: sha(), action: "opened" }))).json()).toEqual({ ignored: "no project for this repo" });
     expect((await deliverGithub("ping", { zen: "Keep it logically awesome.", hook_id: 1 })).status).toBe(200);
     expect((await deliverGithub("issues", { action: "opened", repository: { full_name: "o/r" } })).status).toBe(200);
-    expect(gh.calls.length).toBe(before);
+    expect(gh.callsBesideUpkeep(before, [nobody, "o/r"])).toEqual([]);
     expect(fake.agents.size).toBe(agents);
   });
 });
@@ -134,7 +139,8 @@ describe("a PR's review", () => {
     expect(a.labels).toMatchObject({ project: p.id, role: "reviewer", pr: "3", sha: s });
     expect(a.sandbox).toMatch(/^sbx_/);
     // It reads the repo and pushes to none.
-    expect(a.overrides).toEqual({ read_repos: [p.repo.toLowerCase()] });
+    expect(a.overrides).toEqual({ repos: [], read_repos: [] });
+    expect(fake.sandboxes.get(a.sandbox!)!.layer.guards).toEqual(githubGuards(p.repo, "read"));
     const brief = fake.inbox.find((x) => x.agent === reviewer)!.text;
     for (const part of [p.repo.toLowerCase(), "#3", s, "develop", "submit_review"]) expect(brief).toContain(part);
     const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels.role === "reviewer" && c.body.labels.project === p.id);

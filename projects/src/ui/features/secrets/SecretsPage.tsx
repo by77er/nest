@@ -138,7 +138,7 @@ export function SecretsPage() {
               <MetaRow>
                 <MetaItem>Injects into {secrets.data.grant.inject_hosts.join(", ") || "no hosts yet: the operator sets the grant's inject_hosts"}</MetaItem>
                 <MetaItem>
-                  {secrets.data.grant.used} of {secrets.data.grant.max_count} secrets used, across the app's projects
+                  {secrets.data.grant.used} of {secrets.data.grant.max_count} secrets used, across the app's projects (each project's GitHub tokens take 2)
                 </MetaItem>
                 <MetaItem>Each up to {secrets.data.grant.max_bytes} bytes</MetaItem>
               </MetaRow>

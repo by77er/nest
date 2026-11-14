@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { clientLayerFor, hostAllowed, NO_RULES, normalizeRules, rulesProblems } from "../src/network";
 import { env, runInDurableObject } from "cloudflare:test";
-import { AccessTeam, api, CLIENT, FakeNest, installFetch } from "./fake-nest";
+import { AccessTeam, api, CLIENT, FakeNest, githubPart, installFetch } from "./fake-nest";
 
 describe("the rules (pure)", () => {
   it("refuses hosts outside the grant, saying the operator must add them; and malformed rules", () => {
@@ -59,7 +59,7 @@ const spec = { goal: "g", acceptance_criteria: [], files: [], test_plan: "p" };
 async function setup() {
   const repo = `o-${rand()}/r-${rand()}`;
   const p = (await api(token, "POST", "/api/projects", { name: repo, repo })).body;
-  return { id: p.id as string, manager: p.settings.manager as string };
+  return { id: p.id as string, manager: p.settings.manager as string, repo: repo.toLowerCase() };
 }
 /** nest's name for a project's secret: `<project>-<name>-<generation>`, the generation new at each creation. */
 const nestKey = (p: { id: string }, name: string) => [...fake.secrets.keys()].find((k) => new RegExp(`^${p.id}-${name}-[a-z0-9]{6}$`).test(k));
@@ -90,10 +90,11 @@ describe("the network page's API", () => {
       const r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }] });
       expect(r.status).toBe(200);
       expect(r.body.rules).toEqual({ worker: [], manager: [{ host: "nodejs.org" }] });
-      // The narrowing reached the live layer: what's still in the grant (here nothing), never the revoked host.
+      // The narrowing reached the live layer: what's still in the grant (here only the app's GitHub hosts), never the revoked host.
       await drain(s.id);
-      expect(sb.layer.egress.allow).toEqual([]);
-      expect(fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${sb.sandbox}/client-policy$`)).at(-1)!.body.egress).toEqual({ allow: [] });
+      const gh = githubPart(s.id, "manager").egress;
+      expect(sb.layer.egress.allow).toEqual(gh);
+      expect(fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${sb.sandbox}/client-policy$`)).at(-1)!.body.egress).toEqual({ allow: gh });
       // A host newly added outside the grant is still refused, whole.
       const added = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: [{ host: "nodejs.org" }], manager: [{ host: "nodejs.org" }] });
       expect(added.status).toBe(403);
@@ -151,10 +152,11 @@ describe("applying the rules", () => {
     await api(token, "PUT", `/api/projects/${s.id}/tasks/${t}/spec`, spec);
     const worker = (await api(token, "POST", `/api/projects/${s.id}/tasks/${t}/assign`)).body.assignee as string;
     const create = fake.callsTo("POST", /^\/v1\/sandboxes$/).find((c) => c.body.labels?.task === t)!;
-    expect(create.body.egress).toEqual({ allow: [{ host: "registry.npmjs.org" }, { host: "pypi.org", ports: [443] }] });
+    // The role's rules, then the app's GitHub hosts (README.md#repo-authority).
+    expect(create.body.egress).toEqual({ allow: [{ host: "registry.npmjs.org" }, { host: "pypi.org", ports: [443] }, ...githubPart(s.id, "worker").egress] });
     expect(sandboxOf(worker).layer.egress.allow).toEqual(create.body.egress.allow);
-    // The manager's role had none: its sandbox's create carried no egress.
-    expect(fake.callsTo("POST", /^\/v1\/sandboxes$/).find((c) => c.body.labels?.role === "manager" && c.body.labels?.project === s.id)!.body.egress).toBeUndefined();
+    // The manager's role had none: its sandbox's create carried the GitHub hosts alone.
+    expect(fake.callsTo("POST", /^\/v1\/sandboxes$/).find((c) => c.body.labels?.role === "manager" && c.body.labels?.project === s.id)!.body.egress).toEqual({ allow: githubPart(s.id, "manager").egress });
   });
 
   it("live agents get them through their sandbox's client layer, which keeps its bindings and env", async () => {
@@ -170,9 +172,12 @@ describe("applying the rules", () => {
     expect(r.status).toBe(200);
     const put = fake.callsTo("PUT", /\/client-policy$/).at(-1)!;
     expect(put.path).toBe(`/v1/sandboxes/${sb.sandbox}/client-policy`);
-    // Sent in the PUT's strict shape (nest refuses a held binding's `client` and `placeholder`), so it applied.
-    expect(put.body).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [binding], env: vars, github_push: { workflows: false } });
-    expect(sb.layer).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [binding], env: vars });
+    // Sent in the PUT's strict shape (nest refuses a held binding's `client` and `placeholder`), so it applied;
+    // the app's GitHub part kept beside it.
+    const gh = githubPart(s.id, "manager", s.repo);
+    const layer = { egress: { allow: [{ host: "nodejs.org" }, ...gh.egress] }, inject: [binding, gh.binding], env: { ...vars, ...gh.env }, guards: gh.guards };
+    expect(put.body).toEqual({ ...layer, github_push: { workflows: false } });
+    expect(sb.layer).toEqual(layer);
     expect(r.body.agents).toEqual([expect.objectContaining({ agent: s.manager, role: "manager", state: "applied", sandbox: sb.sandbox })]);
     // A change to the other role's rules writes nothing to this one's sandbox.
     const before = fake.callsTo("PUT", /\/client-policy$/).length;
@@ -194,13 +199,15 @@ describe("applying the rules", () => {
       { name: "npm_token", secret: nestKey(s, "npm_token")!, hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] },
       { name: "upload", secret: nestKey(s, "upload")!, hosts: ["*.uploads.example.com"], locations: [{ type: "header", name: "X-Upload-Token" }, { type: "authorization_basic_password" }], wildcard: true },
     ];
-    const vars = { NPM_TOKEN: `nest-ph.${CLIENT}.npm_token.`, UPLOAD_TOKEN: `nest-ph.${CLIENT}.upload.` };
-    expect(sb.layer).toEqual({ egress: { allow: [] }, inject: bindings, env: vars });
+    const gh = githubPart(s.id, "worker", s.repo);
+    const vars = { NPM_TOKEN: `nest-ph.${CLIENT}.npm_token.`, UPLOAD_TOKEN: `nest-ph.${CLIENT}.upload.`, ...gh.env };
+    expect(sb.layer).toEqual({ egress: { allow: gh.egress }, inject: [...bindings, gh.binding], env: vars, guards: gh.guards });
     for (const worker_rules of [[{ host: "pypi.org" }], [{ host: "nodejs.org", ports: [443] }], []]) {
       const r = await api(token, "PUT", `/api/projects/${s.id}/network`, { worker: worker_rules, manager: [] });
       expect(r.status).toBe(200);
-      expect(fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${sb.sandbox}/client-policy$`)).at(-1)!.body).toEqual({ egress: { allow: worker_rules }, inject: bindings, env: vars, github_push: { workflows: false } });
-      expect(sb.layer).toEqual({ egress: { allow: worker_rules }, inject: bindings, env: vars });
+      const layer = { egress: { allow: [...worker_rules, ...gh.egress] }, inject: [...bindings, gh.binding], env: vars, guards: gh.guards };
+      expect(fake.callsTo("PUT", new RegExp(`/v1/sandboxes/${sb.sandbox}/client-policy$`)).at(-1)!.body).toEqual({ ...layer, github_push: { workflows: false } });
+      expect(sb.layer).toEqual(layer);
       expect(r.body.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: worker, state: "applied", error: null })]));
     }
   });
@@ -232,6 +239,6 @@ describe("applying the rules", () => {
     await drain(s.id);
     r = await api(token, "GET", `/api/projects/${s.id}/network`);
     expect(r.body.agents[0]).toMatchObject({ state: "applied" });
-    expect(sandboxOf(s.manager).layer.egress.allow).toEqual([{ host: "pypi.org" }]);
+    expect(sandboxOf(s.manager).layer.egress.allow).toEqual([{ host: "pypi.org" }, ...githubPart(s.id, "manager").egress]);
   });
 });

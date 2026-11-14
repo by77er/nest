@@ -7,7 +7,7 @@ import { rereadText, statusBadges } from "./BindingsSection";
 import { renderApp } from "../../test/render";
 
 const binding = (o: Partial<RepoBinding> = {}): RepoBinding => ({
-  project: "prj_one", name: "Widgets", repo: "owner/widgets", repo_id: 1, renamed_to: null, installation_id: null, bound: "github", bound_ms: null, error: null, owner: null, refused: null, ...o,
+  project: "prj_one", name: "Widgets", repo: "owner/widgets", repo_id: 1, repo_gen: 1, renamed_to: null, installation_id: null, bound: "github", bound_ms: null, error: null, owner: null, refused: null, ...o,
 });
 
 describe("the admin page", () => {

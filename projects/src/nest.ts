@@ -18,9 +18,26 @@ export class NestError extends Error {
   }
   /** A refusal that will repeat: retrying the same call can't succeed. */
   get permanent(): boolean {
-    return this.status >= 400 && this.status < 500 && !this.retryable && this.status !== 408 && this.status !== 429;
+    return this.status >= 400 && this.status < 500 && !this.retryable && this.status !== 408 && this.status !== 429 && !this.hostsNotReady;
+  }
+  /**
+   * nest refused request guards (409) because a sandbox host of the cell doesn't apply them yet
+   * (docs/control-plane/api/clients/#request-guards: `guard_bounds`; `guard_injected_any` and
+   * `guard_basic_user` for `*` and `at`): it goes through once the host is replaced, so the start waits and
+   * tries again, never dropping the guards. nest's own code, `hosts_not_ready` (nest #274); a nest from
+   * before it said `conflict`, told apart by its words ("needs every sandbox host of cell …"): that fallback
+   * goes a release after #274.
+   */
+  get hostsNotReady(): boolean {
+    return this.status === 409 && (this.code === "hosts_not_ready" || (this.code === "conflict" && HOSTS_WORDS.test(this.message)));
   }
 }
+
+/** nest's words for that refusal before its code (`SandboxDO.requireGuardBounds`, `injectedAnyConflict`). */
+export const HOSTS_WORDS = /\bneeds? every sandbox host of cell\b/;
+
+/** A start waiting on nest's hosts (`hostsNotReady`), as its error says it. */
+export const HOSTS_WAIT = "waiting for every sandbox host of nest's cell to apply request guards (retried until they do)";
 
 export interface NestConfig {
   base: string;
@@ -84,20 +101,25 @@ const ASK_PAGES = 10;
  */
 export interface SandboxExtras {
   egress?: { allow: { host: string; ports?: number[] }[] };
-  inject?: { name: string; secret: string; hosts: string[]; locations: ({ type: "authorization_bearer" } | { type: "authorization_basic_password" } | { type: "header"; name: string })[]; wildcard?: boolean }[];
+  inject?: { name: string; secret: string; hosts: string[]; locations: ({ type: "authorization_bearer" } | { type: "authorization_basic_password"; username?: string } | { type: "header"; name: string })[]; wildcard?: boolean }[];
   env?: Record<string, string>;
   github_push?: { workflows: boolean };
+  /** Request guards of the sandbox's own (docs/control-plane/api/clients/#request-guards): they hold for as long as it lives. */
+  guards?: Guard[];
 }
 
 /** A sandbox's client layer (docs/control-plane/api/clients/#the-client-layer), as `GET …/client-policy` answers it. */
+import type { Guard } from "./github-access";
 import type { ClientLayer as ClientPolicy, HeldClientLayer, PolicyAllow } from "./network";
 export type { ClientPolicy, HeldClientLayer };
 
-/** The overrides a client may give a spawn (nest only narrows: `SpawnerOverrides`). */
+/** The overrides a client may give a spawn (nest only narrows, and adds guards: `SpawnerOverrides`). */
 export interface SpawnOverrides {
   tools?: string[];
+  /** nest's own repos (its kernel token): only for a start frozen before the app's own GitHub access (README.md#repo-authority). */
   repos?: string[];
   read_repos?: string[];
+
   ephemeral?: true;
   sandbox_idle_ttl_ms?: number;
 }
@@ -163,16 +185,15 @@ export class Nest {
   }
 
   /**
-   * A new agent with a sandbox of its own, both labelled, its repos narrowed to `repo`: to push to
-   * (`overrides.repos`), or only to read (`overrides.read_repos`), as its template has them.
+   * A new agent with a sandbox of its own, both labelled, with `overrides` (the app's GitHub guards; a start
+   * frozen before them: nest's repos narrowed to the project's, to push to or only to read).
    * `key` names this start attempt: a retry after a lost answer sends the same Idempotency-Keys
    * (`<key>/sandbox`, `<key>/agent`) and gets the same sandbox and agent back. An agent create refused for
    * good destroys the sandbox made for it (not on a 409: the key's create may have landed). `agent` adds fields to the
    * agent's spawn (README.md#routines: a routine's grants).
    */
-  async startAgent(template: string, labels: Labels, repo: { push: string } | { read: string }, key: string, extras: SandboxExtras = {}, agent: AgentExtras = {}, o: { newAttemptOnCapacity?: boolean } = {}): Promise<string> {
+  async startAgent(template: string, labels: Labels, overrides: SpawnOverrides, key: string, extras: SandboxExtras = {}, agent: AgentExtras = {}, o: { newAttemptOnCapacity?: boolean } = {}): Promise<string> {
     const sandbox = (await this.createSandbox({ labels, ...extras }, `${key}/sandbox`)).sandbox;
-    const overrides: SpawnOverrides = "push" in repo ? { repos: [repo.push] } : { read_repos: [repo.read] };
     try {
       return (await this.createAgent({ ...agent, template, sandbox, labels, overrides, start: true }, `${key}/agent`)).agent;
     } catch (e) {
@@ -355,9 +376,12 @@ export class Nest {
     return this.call("GET", "/v1/clients/self");
   }
 
-  /** Store or replace a write-only secret (docs/control-plane/api/clients/#secrets); answers its metadata, never the value. */
-  putSecret(name: string, value: string, description: string): Promise<{ name: string; size: number; created_ms: number; updated_ms: number; last_injected_ms: number | null }> {
-    return this.call("PUT", `/v1/clients/self/secrets/${encodeURIComponent(name)}`, { value, ...(description ? { description } : {}) });
+  /**
+   * Store or replace a write-only secret (docs/control-plane/api/clients/#secrets); answers its metadata, never
+   * the value. `expiresAt` (RFC 3339): nest stops injecting it then; without it, it never expires.
+   */
+  putSecret(name: string, value: string, description: string, expiresAt?: string): Promise<{ name: string; size: number; created_ms: number; updated_ms: number; last_injected_ms: number | null }> {
+    return this.call("PUT", `/v1/clients/self/secrets/${encodeURIComponent(name)}`, { value, ...(description ? { description } : {}), ...(expiresAt ? { expires_at: expiresAt } : {}) });
   }
 
   async deleteSecret(name: string): Promise<void> {

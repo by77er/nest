@@ -119,9 +119,10 @@ function mcpCapability(base: string, server: Server, prompt: string) {
 }
 
 /**
- * A role's template. `access` is what its sandbox may do with every attached project's repo: `push`
- * (`repos`, the worker's) or only `read` (`read_repos`: the manager and the reviewer, which nest refuses
- * to push). Each spawn narrows it to its own project's (`overrides.repos` or `overrides.read_repos`).
+ * A role's template. Its sandbox's GitHub access is the app's own, sent with each start (README.md#repo-authority):
+ * a binding of the project's token, its environment and the app's guards, all in its sandbox's create, so the shared
+ * templates name no repo. `repos` only in a project's own template written for a start frozen before that
+ * (nest's repos: `access` `push`, the worker's, or `read`), which its spawn narrows to the project's.
  */
 const template = (capability: Server, prompt: string, repos: readonly string[], access: "push" | "read", subagents = false, timers = false, ephemeral = false, model?: string, guidance = REPO_GUIDANCE) => ({
   // `nest` allows the nest tools without a prompt and `hands` gives the sandbox's tools: the operator's
@@ -143,10 +144,11 @@ const template = (capability: Server, prompt: string, repos: readonly string[], 
  * A project's own template for its manager or its workers on `model` (README.md#models): the role's
  * template, reaching only that project's repo, with `launch.model`. Its name is `modelTemplateEntry`'s.
  */
-export function roleTemplate(role: ModelRole, project: string, repo: string, model: string): { name: string; body: unknown } {
+export function roleTemplate(role: ModelRole, project: string, repo: string, model: string, nestRepos = false): { name: string; body: unknown } {
+  const repos = nestRepos ? [repo.toLowerCase()] : [];
   const body = role === "manager"
-    ? template("board", PROMPTS.manager, [repo.toLowerCase()], "read", false, true, false, model)
-    : template("task", PROMPTS.worker, [repo.toLowerCase()], "push", true, false, false, model);
+    ? template("board", PROMPTS.manager, repos, "read", false, true, false, model)
+    : template("task", PROMPTS.worker, repos, "push", true, false, false, model);
   return { name: `${NAMESPACE}/${modelTemplateEntry(role, project, model)}`, body };
 }
 
@@ -155,9 +157,11 @@ export interface CatalogEntries {
   templates: Record<string, unknown>;
 }
 
-/** The catalog for this deployment: MCP URLs under `base`, templates reaching `repos` (the worker's to push). */
-export function catalogFor(base: string, repos: readonly string[]): CatalogEntries {
-  const sorted = [...new Set(repos.map((r) => r.toLowerCase()))].sort();
+/**
+ * The catalog for this deployment: MCP URLs under `base`. The templates name no repo: each start brings its
+ * project's GitHub access itself (README.md#repo-authority).
+ */
+export function catalogFor(base: string): CatalogEntries {
   return {
     capabilities: {
       [`${NAMESPACE}/board`]: mcpCapability(base, "board", "The projects-board tools read and write your project's board."),
@@ -169,12 +173,12 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
       // The manager's and the worker's on the default models (README.md#models). A project's own starts use
       // its own entries (`roleTemplate`), on the models its settings name; these stay for a start frozen
       // before those existed.
-      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, sorted, "read", false, true, false, DEFAULT_MODEL.manager),
-      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, sorted, "push", true, false, false, DEFAULT_MODEL.worker),
+      [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, [], "read", false, true, false, DEFAULT_MODEL.manager),
+      [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, [], "push", true, false, false, DEFAULT_MODEL.worker),
       // Ephemeral: a reviewer ends itself once its turn is done, verdict or not (its job's deadline covers one that doesn't).
-      [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, sorted, "read", false, false, true, undefined, REVIEWER_GUIDANCE),
-      // Reads only, like the manager and reviewers (`read_repos`): a routine never pushes.
-      [`${NAMESPACE}/routine`]: template("routine", PROMPTS.routine, sorted, "read", false, false, true),
+      [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, [], "read", false, false, true, undefined, REVIEWER_GUIDANCE),
+      // Reads only, like the manager and reviewers: a routine never pushes.
+      [`${NAMESPACE}/routine`]: template("routine", PROMPTS.routine, [], "read", false, false, true),
       // A dreaming run has no hands (no sandbox, no repo, no web): it needs only the board, recent work,
       // memory and the transcripts nest's grant lets it read (README.md#routines).
       [`${NAMESPACE}/dreaming`]: {
@@ -192,8 +196,8 @@ export function catalogFor(base: string, repos: readonly string[]): CatalogEntri
  * Write every entry: capabilities first, since the templates name them. Each PUT replaces the entry
  * whole, so a second sync with the same inputs writes the same bodies and changes nothing.
  */
-export async function syncCatalog(nest: Nest, base: string, repos: readonly string[]): Promise<{ written: string[] }> {
-  const c = catalogFor(base, repos);
+export async function syncCatalog(nest: Nest, base: string): Promise<{ written: string[] }> {
+  const c = catalogFor(base);
   const written: string[] = [];
   for (const [name, body] of Object.entries(c.capabilities)) {
     await nest.putCatalog("capabilities", name, body);

@@ -40,11 +40,14 @@ describe("model ids", () => {
     expect(modelTemplateEntry("worker", "prj_other", "opus")).not.toBe(modelTemplateEntry("worker", "prj_abc123", "opus"));
   });
 
-  it("a role's template carries the model as launch.model and reaches only its project's repo", () => {
+  it("a role's template carries the model as launch.model, and nest's repos (only its project's) only for a start frozen before the app's GitHub access", () => {
     const w = roleTemplate("worker", "prj_abc123", "Owner/Repo", "claude-haiku-5-5");
     expect(w.name).toBe("projects/worker-abc123-claude-haiku-5-5");
-    expect(w.body).toMatchObject({ launch: { model: "claude-haiku-5-5" }, repos: ["owner/repo"] });
-    const m = roleTemplate("manager", "prj_abc123", "owner/repo", "claude-fable-5-2");
+    expect(w.body).toMatchObject({ launch: { model: "claude-haiku-5-5" } });
+    expect(w.body).not.toHaveProperty("repos");
+    expect(w.body).not.toHaveProperty("read_repos");
+    expect(roleTemplate("worker", "prj_abc123", "Owner/Repo", "claude-haiku-5-5", true).body).toMatchObject({ repos: ["owner/repo"] });
+    const m = roleTemplate("manager", "prj_abc123", "owner/repo", "claude-fable-5-2", true);
     expect(m.body).toMatchObject({ launch: { model: "claude-fable-5-2" }, read_repos: ["owner/repo"] });
     expect((m.body as { repos?: unknown }).repos).toBeUndefined();
   });
@@ -89,11 +92,14 @@ describe("a project's models", () => {
     expect(p.settings).toMatchObject({ manager_model: "claude-fable-5-2", worker_model: "claude-opus-5-5" });
     const m = entry(p, "manager", "claude-fable-5-2");
     expect(fake.agents.get(p.manager)!.template).toBe(m);
-    expect(written(m)).toMatchObject({ launch: { model: "claude-fable-5-2" }, read_repos: [p.repo] });
+    expect(written(m)).toMatchObject({ launch: { model: "claude-fable-5-2" } });
+    // No repo: the start brings the app's own GitHub access (README.md#repo-authority).
+    expect(written(m)!.read_repos).toBeUndefined();
     const w = await assign(p);
     const wt = entry(p, "worker", "claude-opus-5-5");
     expect(fake.agents.get(w.assignee)!.template).toBe(wt);
-    expect(written(wt)).toMatchObject({ launch: { model: "claude-opus-5-5" }, repos: [p.repo] });
+    expect(written(wt)).toMatchObject({ launch: { model: "claude-opus-5-5" } });
+    expect(written(wt)!.repos).toBeUndefined();
   });
 
   it("the owner's choice applies to workers started after it; the running manager keeps its agent and template (it's switched, below)", async () => {
@@ -843,7 +849,8 @@ describe("a project's models", () => {
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { worker_model: "claude-sonnet-5-5" });
     await stub(p).drain();
     expect(fake.catalog.has(`templates/${entry(p, "worker", "claude-haiku-5-5")}`)).toBe(true);
-    expect(fake.catalog.has(`templates/${entry(p, "worker", "claude-opus-5-5")}`)).toBe(true);
+    // (Opus's may have gone already: its worker ended before the start was owed, and the exit's sandbox
+    // destroy runs a drain, whose sweep takes it then.)
   });
 
   it("a project that's gone takes all its model templates with it", async () => {

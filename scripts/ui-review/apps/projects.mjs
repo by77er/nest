@@ -320,6 +320,17 @@ export function workflowsAgree() {
   return out;
 }
 
+/** The note under the workflows toggle reads as part of its description: the same size and line height. */
+export function refusedNoteMatches() {
+  const note = document.querySelector("[data-slot=workflows-refused]");
+  if (!note) return ["no \"Not in effect\" note under the workflows toggle"];
+  const sw = [...document.querySelectorAll(".mantine-Switch-root")].find((r) => r.textContent?.includes("Workers may change CI workflows"));
+  const desc = sw?.querySelector(".mantine-Switch-description");
+  if (!desc) return ["the workflows toggle has no description"];
+  const a = getComputedStyle(note), b = getComputedStyle(desc);
+  return a.lineHeight === b.lineHeight && a.fontSize === b.fontSize ? [] : [`the note's font ${a.fontSize}/${a.lineHeight} differs from the toggle description's ${b.fontSize}/${b.lineHeight}`];
+}
+
 // --- rhythm: measured on what's painted (text and badges), never on the grown hit boxes ---------------
 // Each measure is self-contained (it runs in the page, and in the selftest on planted pages).
 
@@ -911,6 +922,12 @@ const app = {
     { name: "secrets", section: "project", path: "/projects/prj_demo/secrets" },
     { name: "secrets-empty", section: "project", path: "/projects/prj_demo/secrets", fixture: "secrets-empty" },
     { name: "secret-form", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Add a secret" }).click() },
+    { name: "secret-form-github", section: "project", path: "/projects/prj_demo/secrets", full: false, after: async (p) => {
+      await p.getByRole("button", { name: "Add a secret" }).click();
+      await p.getByLabel("Service", { exact: true }).first().click();
+      await p.getByRole("option", { name: "GitHub API" }).click();
+      await p.getByText(/already gives every sandbox a token/).waitFor();
+    } },
     { name: "secret-edit", section: "project", path: "/projects/prj_demo/secrets", full: false, after: (p) => p.getByRole("button", { name: "Edit uploads_key" }).click() },
     { name: "board-secret-requests", section: "project", path: "/projects/prj_demo/board", fixture: "secret-requests" },
     // Reviews held for approval in "Needs you" (README.md#the-review-gate); the Reviews page's own rows are in `reviews`.
@@ -980,6 +997,8 @@ const app = {
     { name: "settings-pr-comments-link", section: "project", path: "/projects/prj_demo/settings#pr-comments", fixture: "comments-cleared", full: false, check: linkTargetCheck("pr-comments"), checkName: "link-targets" },
     // The models (README.md#models): a custom id shown with its field; the list open.
     { name: "settings-models-custom", section: "project", path: "/projects/prj_demo/settings", fixture: "models-custom" },
+    // On, but the GitHub App's installation doesn't grant workflows: write: said under the toggle and by each live worker.
+    { name: "settings-workflows-refused", section: "project", path: "/projects/prj_demo/settings", fixture: "workflows-refused", checkName: "workflows", check: async (p) => [...await p.evaluate(workflowsAgree), ...await p.evaluate(refusedNoteMatches)] },
     // A manager model switch waiting for the manager's turn to end, and its chat line once done (README.md#models).
     { name: "settings-manager-switching", section: "project", path: "/projects/prj_demo/settings", fixture: "manager-switching" },
     { name: "settings-manager-switching-now", section: "project", path: "/projects/prj_demo/settings", fixture: "manager-switching-now" },

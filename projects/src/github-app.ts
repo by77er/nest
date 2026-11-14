@@ -271,6 +271,37 @@ export class AppTokens implements TokenSource {
     await this.revoke(new GitHub(t.token, Number(app.appId), installation), installation);
   }
 
+  /**
+   * A token for a sandbox (src/github-access.ts): for `repo` only, with exactly `permissions`, minted afresh
+   * (never one cached, nor kept here: the caller writes it to nest and keeps it only to revoke it), from the
+   * repo's installation as looked up (its account checked). GitHub's refusals are thrown as for `token`.
+   */
+  async sandboxToken(b: { repo: string; repoId: number; installationId: number | null }, permissions: Record<string, string>): Promise<{ token: string; expires_ms: number }> {
+    const app = this.app();
+    const installation = await this.installation(b.repo);
+    // The binding's installation, when it names one (README.md#the-repos-binding): another answering for the
+    // name now (a reinstall, a transfer) waits for the binding to be read again, never minted from.
+    if (b.installationId !== null && installation !== b.installationId) {
+      throw new Error(`the App's installation for ${b.repo} is ${installation} now, not the bound ${b.installationId}: re-read the binding on the Admin page`);
+    }
+    // By the bound repo's id: whatever repo holds its name now, the token reaches that one only.
+    return this.mint(app, installation, { id: b.repoId }, permissions);
+  }
+
+  /**
+   * Revoke an installation token (`DELETE /installation/token` with the token itself,
+   * https://docs.github.com/en/rest/apps/installations#revoke-an-installation-access-token). Done when GitHub
+   * answers 204, or 401 (expired or revoked already); anything else is thrown, for the caller to retry.
+   */
+  async revokeToken(token: string): Promise<void> {
+    try {
+      await new GitHub(token).call("DELETE", "/installation/token");
+    } catch (e) {
+      if (e instanceof GitHubError && e.status === 401) return;
+      throw e;
+    }
+  }
+
   private async revoke(gh: GitHub, installation: number): Promise<void> {
     try {
       await gh.call("DELETE", "/installation/token");
@@ -315,10 +346,11 @@ export class AppTokens implements TokenSource {
   }
 
   /** An installation token: for one repo by name, or (`null`) every repo of the installation, with these permissions only. */
-  private async mint(app: AppCache, installation: number, repoName: string | null, permissions: Record<string, string>): Promise<{ token: string; expires_ms: number }> {
+  private async mint(app: AppCache, installation: number, repo: string | { id: number } | null, permissions: Record<string, string>): Promise<{ token: string; expires_ms: number }> {
     let r: { token?: unknown; expires_at?: unknown } | null;
+    const body = repo === null ? { permissions } : typeof repo === "string" ? { repositories: [repo], permissions } : { repository_ids: [repo.id], permissions };
     try {
-      r = await this.withJwt(app, "POST", `/app/installations/${installation}/access_tokens`, repoName === null ? { permissions } : { repositories: [repoName], permissions });
+      r = await this.withJwt(app, "POST", `/app/installations/${installation}/access_tokens`, body);
     } catch (e) {
       // The installation is gone (uninstalled, or reinstalled under another id): looked up again next time.
       if (e instanceof GitHubError && e.status === 404) this.dropInstallation(app, installation);

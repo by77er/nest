@@ -14,14 +14,16 @@ import { directory, type Env, review } from "../env";
 import { GRAPHQL_METHOD, type MergeMethod, type RepoAutoMerge, repoAutoMerge, type Seen, type TaskAutoMerge } from "../automerge";
 import { type AttachChange, DIMENSIONS, GitHubError, githubFor, ownInstallation, PERMISSIONS, requireReviewCheck, type Verdict } from "../github";
 import type { AgentCaller } from "../identity";
-import { type AgentView, backoff, clientIdOf, NestError, nestFrom, type Nest, type SandboxExtras, stopRefused } from "../nest";
-import { envName, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
+import { type AgentView, backoff, clientIdOf, HOSTS_WAIT, NestError, nestFrom, type Nest, type SandboxExtras, stopRefused } from "../nest";
+import { envName, MAX_BINDINGS, nestSecretName, SECRET_NAME, secretFeeds, type SecretLocation, type SecretMeta, type SecretRole, secretsBrief } from "../secrets";
+import { AppTokens } from "../github-app";
+import { GITHUB_EGRESS_HOSTS, GITHUB_INJECT_HOSTS, githubGrantMissing, githubGuards, GITHUB_KINDS, githubAccess, githubBinding, githubEgress, githubEnv, type GithubKind, githubPermissions, type GithubRole, githubSecretName, type Guard, kindOf, REFRESH_BEFORE_MS, spawnOverrides, startEgress } from "../github-access";
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { canBlock, canUnblock, dependencyError, pickForAssignment, type Spec, step, taskBranch, type TaskEvent, type TaskFacts, type TaskState, TERMINAL, waitingOn, WORKER_STATES } from "../tasks";
 import { type Server, toolOf } from "../tools";
 import type { NestEvent } from "../webhook";
-import { asBinding, type ClientLayer, clientLayerFor, type EgressRule, egressWithinGrant, hostAllowed, LAYER_ROLES, type LayerRole, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules, shrinkLayer } from "../network";
+import { asBinding, type ClientLayer, clientLayerFor, type GithubFeed, type EgressRule, egressWithinGrant, hostAllowed, LAYER_ROLES, type LayerRole, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules, shrinkLayer } from "../network";
 import { MAX_WAITS, type PrUntil, prVerdict, taskVerdict, timeoutProblem, type Wait, type WaitKind, waitKey, waitMessage, type WaitOutcome } from "../waits";
 import { MAX_NOTES, mayWriteMemory, NOTE_KEY, NOTE_MAX, type Note, preview } from "../memory";
 import type { RoutineKind, RoutinePreset } from "../requests";
@@ -626,6 +628,35 @@ export const MIGRATIONS = [
     "ALTER TABLE settings ADD COLUMN comments_marked INTEGER NOT NULL DEFAULT 1",
     "UPDATE settings SET comments_marked = 0",
   ],
+  [
+    // The project's own GitHub tokens in its sandboxes (README.md#repo-authority, phase B3): one client secret
+    // per kind (`push`, `read`), its expiry, the repo id its token was minted for, which token it holds (`seq`,
+    // `gh_tokens`'), and when it's written again;
+    // `gone` 1 while its delete from nest is owed (the repo or the project went away; next tried at
+    // `del_next_ms`), 2 once deleted. Each token minted is kept only to revoke it (`revoke` 1: owed), until it
+    // expires.
+    `CREATE TABLE gh_access (kind TEXT PRIMARY KEY, nest_name TEXT NOT NULL, expires_ms INTEGER, workflows INTEGER NOT NULL DEFAULT 0,
+      next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT, gone INTEGER NOT NULL DEFAULT 0,
+      del_next_ms INTEGER, del_attempts INTEGER NOT NULL DEFAULT 0, refusals INTEGER NOT NULL DEFAULT 0, wf_refused INTEGER NOT NULL DEFAULT 0,
+      repo_id INTEGER, seq INTEGER)`,
+    // The owner was told the GitHub App can't reach the repo (1), and not yet that it's back.
+    "ALTER TABLE settings ADD COLUMN gh_unreachable INTEGER NOT NULL DEFAULT 0",
+    // The repo id (DirectoryDO's binding) the project's GitHub access was last made to follow (`githubRebound`),
+    // and that binding's generation (DirectoryDO's `repo_gen`): a read older than it is never followed.
+    "ALTER TABLE settings ADD COLUMN gh_repo_id INTEGER",
+    "ALTER TABLE settings ADD COLUMN gh_repo_gen INTEGER",
+    `CREATE TABLE gh_tokens (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, token TEXT NOT NULL, expires_ms INTEGER NOT NULL,
+      workflows INTEGER NOT NULL DEFAULT 0, revoke INTEGER NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER)`,
+    // A live agent whose sandbox has the app's GitHub part (its layer keeps it), not nest's repos.
+    "ALTER TABLE layers ADD COLUMN github INTEGER NOT NULL DEFAULT 0",
+    // An ended agent's sandbox, owed its destroy (README.md#the-sandboxes-github-access): its sandbox (when
+    // known at the exit), the next try, and the failures.
+    `CREATE TABLE sandbox_ends (agent TEXT PRIMARY KEY, sandbox TEXT, next_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0, error TEXT)`,
+    // A routine run already tried on nest's repos when this release came (its sandbox's Idempotency-Key binds
+    // that request): its retries send it again. Every run after is the app's.
+    "ALTER TABLE routine_runs ADD COLUMN nest_repos INTEGER NOT NULL DEFAULT 0",
+    "UPDATE routine_runs SET nest_repos = 1 WHERE state = 'starting' AND spawn IS NOT NULL AND agent IS NULL",
+  ],
 ] as const;
 
 /** The roles an ask's agent may carry in its labels (as the webhook routes them); any other reads as none. */
@@ -829,6 +860,17 @@ export class ProjectDO extends DurableObject<Env> {
       this.routinesTick(Date.now());
     }
     if (u.workers_edit_workflows === false && before.workers_edit_workflows) this.abandonWorkflowStarts();
+    // The project's own push token is written again now with or without `workflows: write`; turned off, every
+    // one that had it is then revoked (README.md#repo-authority).
+    if (u.workers_edit_workflows !== undefined && u.workers_edit_workflows !== before.workers_edit_workflows) {
+      // A refresh in flight minted with the setting as it was: the next one is a new one, after it.
+      this.ghGen++;
+      // Off: every push token that had it is revoked at once, and the next start writes one without (even with
+      // its refresh lapsed); on: the next start writes one with it.
+      if (!u.workers_edit_workflows) this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE kind = 'push' AND workflows = 1 AND revoke = 0", Date.now());
+      this.sql.exec("UPDATE gh_access SET expires_ms = CASE WHEN workflows = 1 AND ? = 0 THEN NULL ELSE expires_ms END WHERE kind = 'push'", u.workers_edit_workflows ? 1 : 0);
+      this.sql.exec("UPDATE gh_access SET next_ms = ? WHERE kind = 'push' AND gone != 1 AND next_ms IS NOT NULL", Date.now());
+    }
     // Live workers too, both ways, through their sandbox's client layer (README.md#secrets).
     if (u.workers_edit_workflows !== undefined && u.workers_edit_workflows !== before.workers_edit_workflows) await this.oweLayers(["worker"]);
     if (u.auto_merge !== undefined && u.auto_merge !== before.auto_merge) this.setAutoMerge(u.auto_merge);
@@ -1150,7 +1192,11 @@ export class ProjectDO extends DurableObject<Env> {
    * at every sync, for a rollback to find. This release reads the name through from DirectoryDO (`repo()`).
    */
   async repoRenamed(name: string): Promise<void> {
-    if (!this.settings()) return;
+    const before = this.settingsRow()?.repo as string | undefined;
+    if (before === undefined) return;
+    // The app's guards in live sandboxes name the repo: applied again under the new name. Owed before the copy
+    // changes, so one that fails here is owed again at the next sync's write.
+    if (before !== name.toLowerCase()) await this.oweLayers(LAYER_ROLES);
     this.sql.exec("UPDATE settings SET repo = ?", name.toLowerCase());
   }
 
@@ -1836,8 +1882,8 @@ export class ProjectDO extends DurableObject<Env> {
    * A role's secrets as its sandboxes' bindings and variables, inside the grant's `inject_hosts`
    * (README.md#secrets); `null`, the grant unknown: all of them (only ever the target a removal is cut from).
    */
-  private secretFeeds(role: SecretRole, injectHosts: readonly string[] | null): ReturnType<typeof secretFeeds> {
-    return secretFeeds(this.clientId(), this.secretRows().filter((m) => m.roles.includes(role)), injectHosts);
+  private secretFeeds(role: SecretRole, injectHosts: readonly string[] | null, max = MAX_BINDINGS): ReturnType<typeof secretFeeds> {
+    return secretFeeds(this.clientId(), this.secretRows().filter((m) => m.roles.includes(role)), injectHosts, max);
   }
 
   // --- PR upkeep (README.md#pr-upkeep) -----------------------------------------------------------------
@@ -2042,27 +2088,41 @@ export class ProjectDO extends DurableObject<Env> {
    * attempt's first try is owed to the agent's layer once it's live (`trackLayer`). The brief names the
    * variables.
    */
-  private async sandboxSpec(nest: Nest, role: SecretRole, key: string): Promise<StartSpec> {
+  private async sandboxSpec(nest: Nest, role: SecretRole | "routine", key: string, o: { ensure?: boolean } = {}): Promise<StartSpec> {
     const had = this.frozenSpec(key);
     let frozen: StartSpec;
-    if (had) frozen = had;
-    else {
+    if (had) {
+      frozen = had;
+      // Each try of a start frozen with the app's access holds its token: written again if it expires soon. Not
+      // once its agent exists (a brief's retry): that agent's layer holds it.
+      if (had.github && o.ensure !== false) await this.ensureGithub(nest, kindOf(role as GithubRole));
+    } else {
       // Inside the grant as it is now, or not at all: a binding nest would refuse fails the start (its read failing retries it).
-      const injectHosts = (await nest.self()).grant?.inject_hosts ?? [];
+      const grant = (await nest.self()).grant ?? {};
+      const injectHosts = grant.inject_hosts ?? [];
+      // The app's own GitHub access (README.md#repo-authority): within the grant, or the start waits (retried,
+      // its error shown) until the operator widens it; its token secret written first, so the binding names a
+      // secret that holds a token.
+      const missing = githubGrantMissing(grant);
+      if (missing) throw new GrantWait(missing);
+      const github = await this.githubFor(nest, role, grant);
       const again = this.frozenSpec(key);
       if (again) return again;
       // Everything else as it is now, after the await: a setting changed meanwhile (workflows turned
       // off, when nothing was frozen yet for that change to act on) must not freeze as it was before.
       const s = this.settings()!;
-      const { inject, env, secrets: mine } = this.secretFeeds(role, injectHosts);
-      const extras: SandboxExtras = {
-        ...(inject.length ? { inject, env } : {}),
-        ...(role === "worker" && s.workers_edit_workflows ? { github_push: { workflows: true } } : {}),
-      };
+      // With the GitHub binding, one place fewer for the owner's (nest's limit is MAX_BINDINGS a list).
+      const { inject, env, secrets: mine } = role === "routine" ? { inject: [], env: {}, secrets: [] } : this.secretFeeds(role, injectHosts, MAX_BINDINGS - 1);
+      // No `github_push`: that's nest's own push token's opt-in; the project's push token carries `workflows` itself.
+      // The guards with the sandbox: they hold while it lives, before its agent is made and after it ends.
+      const extras: SandboxExtras = { inject: [...inject, github.inject], env: { ...env, ...github.env }, guards: github.guards };
       // The role's model as the settings have it now (README.md#models): frozen with the attempt, so its
       // retries name the same template, whatever the settings say by then.
       const model = role === "manager" ? s.manager_model : role === "worker" ? s.worker_model : undefined;
-      frozen = { extras, names: mine.map((m) => m.name), brief: secretsBrief(mine), rev: this.rules().rev, ...(model ? { model } : {}) };
+      frozen = {
+        extras, names: mine.map((m) => m.name), brief: secretsBrief(mine) + githubBrief(github.kind, github.repo), rev: this.rules().rev,
+        ...(model ? { model } : {}), github: { egress: github.egress, guards: github.guards },
+      };
       this.sql.exec("INSERT INTO start_specs (key, spec, at_ms) VALUES (?, ?, ?)", key, JSON.stringify(frozen), Date.now());
       this.sql.exec("DELETE FROM start_specs WHERE at_ms < ?", Date.now() - 7 * 24 * 3600 * 1000);
     }
@@ -2079,7 +2139,8 @@ export class ProjectDO extends DurableObject<Env> {
     if (!spec.model) return TEMPLATE[role];
     const repo = await this.repo();
     const s = this.settings()!;
-    const t = roleTemplate(role, s.id, repo, spec.model);
+    // Nest's repos in the template only for a start frozen before the app's own GitHub access (its spawn narrows them).
+    const t = roleTemplate(role, s.id, repo, spec.model, !spec.github);
     // Recorded before it's written: one written and never recorded would be left in nest for good. A new
     // `at_ms` each time, so a sweep whose delete was in flight sees the row is this start's now.
     this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = MAX(excluded.at_ms, model_templates.at_ms + 1), del_next_ms = NULL, del_attempts = 0, del_error = NULL", t.name, role, spec.model, Date.now());
@@ -2178,10 +2239,10 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** A reviewer's sandbox spec (ReviewDO starts reviewers): as a worker's, without workflows. */
-  async reviewerSpec(key: string): Promise<StartSpec> {
+  async reviewerSpec(key: string, o: { ensure?: boolean } = {}): Promise<StartSpec> {
     const nest = nestFrom(this.env);
     if (!this.settings() || !nest) return { extras: {}, names: [], brief: "", rev: 0 };
-    return this.sandboxSpec(nest, "reviewer", key);
+    return this.sandboxSpec(nest, "reviewer", key, o);
   }
 
   /**
@@ -2192,7 +2253,7 @@ export class ProjectDO extends DurableObject<Env> {
     const spec = this.frozenSpec(key);
     if (!this.settings() || !spec) return;
     this.recordHolder(agent, "reviewer", spec.names);
-    this.trackLayer(agent, "reviewer", spec.rev ?? 0);
+    this.trackLayer(agent, "reviewer", spec.rev ?? 0, !!spec.github);
     await this.arm();
   }
 
@@ -2211,10 +2272,26 @@ export class ProjectDO extends DurableObject<Env> {
     );
   }
 
-  /** The live workers whose push token may change workflows, as their layer was last applied (or their start made it). */
+  /**
+   * Why workers' pushes can't change workflows though Settings says they may (README.md#the-sandboxes-github-access):
+   * the App's installation doesn't grant `workflows: write`, so the project's push token was written without it.
+   * Null when the setting is off, or the token has it.
+   */
+  workflowsRefused(): string | null {
+    if (!this.settings()?.workers_edit_workflows) return null;
+    const r = this.ghRow("push");
+    return r && r.wf_refused === 1 && r.gone === 0 ? WORKFLOWS_REFUSED : null;
+  }
+
   workflowWorkers(): string[] {
     const live = new Set(this.liveAgents().filter((a) => a.role === "worker").map((a) => a.agent));
-    return this.sql.exec<{ agent: string }>("SELECT agent FROM agent_secrets WHERE workflows = 1 ORDER BY at_ms").toArray().map((r) => r.agent).filter((a) => live.has(a));
+    // A worker on the app's own GitHub access pushes with the project's push token: it may while the token
+    // written last has `workflows: write` (README.md#repo-authority).
+    const app = this.sql.exec("SELECT 1 FROM gh_access WHERE kind = 'push' AND workflows = 1 AND gone = 0 AND expires_ms > ?", Date.now()).toArray().length > 0;
+    return this.sql.exec<{ agent: string }>(
+      `SELECT a.agent FROM agent_secrets a LEFT JOIN layers l ON l.agent = a.agent
+        WHERE (l.github = 1 AND ?) OR (COALESCE(l.github, 0) = 0 AND a.workflows = 1) ORDER BY a.at_ms`, app ? 1 : 0,
+    ).toArray().map((r) => r.agent).filter((a) => live.has(a));
   }
 
   /**
@@ -2512,6 +2589,9 @@ export class ProjectDO extends DurableObject<Env> {
         // Not a replaced manager's: that stop also destroys its sandbox, which an agent's own exit leaves
         // up, so it stays owed (a failed one is owed again) until the sandbox is gone.
         this.sql.exec("DELETE FROM stops WHERE agent = ? AND reason != 'manager replaced'", e.agent);
+        // Its sandbox goes too, whatever its role (README.md#the-sandboxes-github-access): nest leaves it up after
+        // its agent ends, with its bindings and guards, and nothing of the app's uses it again.
+        this.sql.exec("INSERT OR IGNORE INTO sandbox_ends (agent, sandbox, next_ms) VALUES (?, (SELECT sandbox FROM layers WHERE agent = ?), ?)", e.agent, e.agent, Date.now());
         this.sql.exec("UPDATE stops SET failed_ms = NULL, next_ms = ?, attempts = 0, error = NULL WHERE agent = ? AND reason = 'manager replaced'", Date.now(), e.agent);
         if (route.role === "manager" && s.manager === e.agent) {
           this.sql.exec("INSERT OR IGNORE INTO chat (at_ms, sender, text, event_id) VALUES (?, 'app', ?, ?)", Date.now(), `The manager ended (${e.reason ?? "exited"}).`, e.id);
@@ -2811,13 +2891,14 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** A new agent's layer: applied as of its start's rules; owed again if the rules moved on since. */
-  private trackLayer(agent: string, role: LayerRole, rev: number): void {
+  private trackLayer(agent: string, role: LayerRole, rev: number, github: boolean): void {
     const want = this.rules().rev;
     this.sql.exec(
-      `INSERT INTO layers (agent, role, rev, want_rev, next_ms, at_ms) VALUES (?, ?, ?, ?, ?, ?)
+      `INSERT INTO layers (agent, role, rev, want_rev, next_ms, at_ms, github) VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (agent) DO NOTHING`,
-      agent, role, rev, want, rev === want ? null : Date.now(), Date.now(),
+      agent, role, rev, want, rev === want ? null : Date.now(), Date.now(), github ? 1 : 0,
     );
+    if (github) this.githubHolds(kindOf(role));
   }
 
   /**
@@ -2836,12 +2917,18 @@ export class ProjectDO extends DurableObject<Env> {
     let current: Awaited<ReturnType<Nest["getClientPolicy"]>> | null = null;
     let desired: ClientLayer | null = null;
     // The layer for a grant: inside it; for none (unread), everything, as the target a removal is cut from.
+    // Started with the app's own GitHub access (README.md#repo-authority): its layer keeps it, within the grant,
+    // and the guards for the repo's name now (read first: unread, the layer waits, its guards as they are).
+    const github = row.github === 1;
+    let repo: string | null = null;
     const build = (g: Grant | null) => {
-      const feeds = this.secretFeeds(role, g ? (g.inject_hosts ?? []) : null);
+      const feeds = this.secretFeeds(role, g ? (g.inject_hosts ?? []) : null, github ? MAX_BINDINGS - 1 : MAX_BINDINGS);
       // A worker's push token may change workflows while Settings says so, within the grant (unread: the
       // setting alone, as the target a removal is cut from, so turning it off goes through regardless).
-      const push = role === "worker" ? { github_push: { workflows: this.settings()!.workers_edit_workflows && (g ? g.github_push?.workflows === true : true) } } : {};
-      const layer = egressWithinGrant(clientLayerFor(this.rules().rules, role, { inject: feeds.inject, env: feeds.env, ...push }, current), g ? (g.egress_hosts ?? []) : null);
+      // Not for the app's own: its token carries `workflows` itself.
+      const push = role === "worker" && !github ? { github_push: { workflows: this.settings()!.workers_edit_workflows && (g ? g.github_push?.workflows === true : true) } } : {};
+      const gh = github && repo !== null ? this.githubFeed(role, repo, g) : undefined;
+      const layer = egressWithinGrant(clientLayerFor(this.rules().rules, role, { inject: feeds.inject, env: feeds.env, ...push, ...(gh ? { github: gh } : {}) }, current), g ? (g.egress_hosts ?? []) : null);
       return { layer, names: feeds.secrets.map((m) => m.name) };
     };
     try {
@@ -2852,6 +2939,7 @@ export class ProjectDO extends DurableObject<Env> {
         this.sql.exec("UPDATE layers SET sandbox = ? WHERE agent = ?", sandbox, agent);
       }
       current = await nest.getClientPolicy(sandbox);
+      if (github) repo = await this.repo();
       let grant = await this.readGrant(nest);
       let built = build(grant);
       desired = built.layer;
@@ -2885,6 +2973,7 @@ export class ProjectDO extends DurableObject<Env> {
         const asIs: ClientLayer = {
           egress: { allow: normalizeRules(current.egress.allow) }, inject: current.inject.map(asBinding), env: current.env,
           ...(current.github_push ? { github_push: { workflows: current.github_push.workflows } } : {}),
+          ...(current.guards?.length ? { guards: current.guards } : {}),
         };
         if (JSON.stringify(safe) !== JSON.stringify(asIs)) {
           try {
@@ -2903,6 +2992,21 @@ export class ProjectDO extends DurableObject<Env> {
       const st = outboxStep(outboxRow(row), { kind: "failed", error: message(e) + note, permanent: verdict(e).permanent }, Date.now(), OUTBOX.layers);
       if (st.ok) this.sql.exec("UPDATE layers SET attempts = ?, error = ?, next_ms = ? WHERE agent = ? AND want_rev = ?", st.row.attempts, st.row.error, st.row.next_ms, agent, want);
     }
+  }
+
+  /**
+   * A live sandbox's GitHub part, as the grant has room for it now (null: unread, so everything, as the target a
+   * removal is cut from): the binding and its environment only while both GitHub hosts are in `inject_hosts`
+   * (nest refuses a variable naming a placeholder no binding has), the egress as `egressWithinGrant` then filters
+   * it, and the guards for the repo by its name now, whatever the grant (they only refuse).
+   */
+  private githubFeed(role: LayerRole, repo: string, g: Grant | null): GithubFeed {
+    const kind = kindOf(role);
+    const inside = g === null || GITHUB_INJECT_HOSTS.every((h) => hostAllowed(h, g.inject_hosts ?? []));
+    return {
+      inject: inside ? githubBinding(this.settings()!.id, kind) : null, env: inside ? githubEnv(this.clientId(), kind) : null,
+      egress: githubEgress(GITHUB_EGRESS_HOSTS), guards: githubGuards(repo, kind),
+    };
   }
 
   /** The grant, or null when it can't be read; a change from the one last seen owes every live layer. */
@@ -3029,6 +3133,435 @@ export class ProjectDO extends DurableObject<Env> {
     }
     const more = this.secretRows().length > 0 || this.sql.exec("SELECT 1 FROM minted").toArray().length > 0;
     this.sql.exec("UPDATE settings SET secrets_next_ms = ?", more ? now + UPKEEP_EVERY_MS : null);
+  }
+
+  /**
+   * Destroy an ended agent's sandbox (`DELETE /v1/sandboxes/<id>`): known from its layer at the exit, else from
+   * nest's view of the agent (`hands`). Gone already (404, or 409 destroyed) is done. Retried with backoff, given
+   * up (logged, the row kept as failed) after SANDBOX_END_ATTEMPTS: nest's idle TTL ends it then.
+   */
+  private async endSandbox(nest: Nest, agent: string): Promise<void> {
+    const r = this.sql.exec("SELECT * FROM sandbox_ends WHERE agent = ?", agent).toArray()[0];
+    if (!r) return;
+    try {
+      let sandbox = (r.sandbox as string | null) ?? null;
+      if (!sandbox) {
+        try {
+          sandbox = ((await nest.getAgent(agent)).hands as { sandbox?: string } | null | undefined)?.sandbox ?? null;
+        } catch (e) {
+          if (!(e instanceof NestError && e.status === 404)) throw e;
+        }
+      }
+      if (sandbox) {
+        await nest.destroySandbox(sandbox).catch((e) => {
+          if (!(e instanceof NestError && (e.status === 404 || e.status === 409))) throw e;
+        });
+      }
+      this.sql.exec("DELETE FROM sandbox_ends WHERE agent = ?", agent);
+    } catch (e) {
+      const attempts = (r.attempts as number) + 1;
+      if (attempts >= SANDBOX_END_ATTEMPTS) {
+        // Given up: logged, and its row goes (nest's idle TTL ends the sandbox).
+        console.error(`agent ${agent}'s sandbox wasn't destroyed (given up; nest's idle TTL ends it): ${message(e)}`);
+        this.sql.exec("DELETE FROM sandbox_ends WHERE agent = ?", agent);
+        return;
+      }
+      this.sql.exec("UPDATE sandbox_ends SET attempts = ?, error = ?, next_ms = ? WHERE agent = ?", attempts, message(e), Date.now() + backoff(attempts), agent);
+    }
+  }
+
+  // --- the project's own GitHub access (README.md#repo-authority, phase B3) ----------------------------------
+
+  private ghRow(kind: GithubKind): Row | undefined {
+    return this.sql.exec("SELECT * FROM gh_access WHERE kind = ?", kind).toArray()[0];
+  }
+
+  /**
+   * A new start's GitHub part for `role` (src/github-access.ts), its token secret written and fresh first, or
+   * thrown (the start retries, its error shown).
+   */
+  private async githubFor(nest: Nest, role: SecretRole | "routine", grant: { egress_hosts?: string[] }) {
+    const kind = kindOf(role as GithubRole);
+    await this.ensureGithub(nest, kind);
+    const repo = await this.repo();
+    return { ...githubAccess({ client: this.clientId(), project: this.settings()!.id, repo, role: role as GithubRole, egressHosts: grant.egress_hosts ?? [] }), repo };
+  }
+
+  /** The token secret of `kind` holds a token with more than a few minutes left (written now if not), or this throws. */
+  private async ensureGithub(nest: Nest, kind: GithubKind): Promise<void> {
+    this.sql.exec("INSERT INTO gh_access (kind, nest_name, next_ms) VALUES (?, ?, ?) ON CONFLICT (kind) DO NOTHING", kind, githubSecretName(this.settings()!.id, kind), Date.now());
+    // The binding as DirectoryDO has it now: a rebind whose notice never came is followed here.
+    await this.githubRebound();
+    if (this.githubFresh(kind)) return;
+    await this.refreshGithub(nest, kind);
+    // Fresh as it's judged now: a refresh a toggle or a rebind overtook wrote nothing a start may take.
+    if (!this.githubFresh(kind)) {
+      const after = this.ghRow(kind);
+      throw new Error(`the project's GitHub ${kind} token couldn't be written: ${(after?.error as string | null) ?? "a setting or the repo's binding changed while it was written"}`);
+    }
+  }
+
+  /**
+   * Whether the secret of `kind` holds a token a start may take: not gone, with more than FRESH_ENOUGH_MS left,
+   * for the repo id the access follows (`gh_repo_id`), the token the secret holds not revoked, and with
+   * `workflows: write` as the setting has it now (or
+   * the App can't grant it: `wf_refused`).
+   */
+  private githubFresh(kind: GithubKind): boolean {
+    const r = this.ghRow(kind);
+    if (!r || r.gone !== 0 || r.expires_ms === null || (r.expires_ms as number) - Date.now() <= FRESH_ENOUGH_MS) return false;
+    // Minted for the repo the project's access follows now.
+    if (r.repo_id === null || r.repo_id !== this.settingsRow()?.gh_repo_id) return false;
+    // The token the secret holds, not revoked (a rebind, a toggle, a stale refresh's write): judged by itself.
+    if (r.seq === null || this.sql.exec("SELECT 1 FROM gh_tokens WHERE seq = ? AND revoke = 0", r.seq).toArray().length === 0) return false;
+    const want = kind === "push" && this.settings()!.workers_edit_workflows;
+    return (r.workflows === 1) === want || (want && r.wf_refused === 1);
+  }
+
+  /**
+   * One refresh of `kind` at a time (a start's and the alarm's share it), per generation: a workflows toggle or a
+   * rebind (`ghGen`) never reuses a refresh that predates it, but runs after it.
+   */
+  private readonly ghInflight = new Map<GithubKind, { gen: number; p: Promise<void> }>();
+  private ghGen = 0;
+
+  private refreshGithub(nest: Nest, kind: GithubKind): Promise<void> {
+    const had = this.ghInflight.get(kind);
+    if (had && had.gen === this.ghGen) return had.p;
+    const gen = this.ghGen;
+    const p: Promise<void> = (had ? had.p.catch(() => {}) : Promise.resolve())
+      .then(() => this.refreshGithubOnce(nest, kind))
+      .finally(() => {
+        if (this.ghInflight.get(kind)?.p === p) this.ghInflight.delete(kind);
+      });
+    this.ghInflight.set(kind, { gen, p });
+    return p;
+  }
+
+  /**
+   * Mint a token of `kind` for the bound repo (by its id, from the binding's installation) with its permissions as
+   * the settings have them now, write it to nest with its expiry (nest pushes it to every sandbox bound to it),
+   * and schedule the next write REFRESH_BEFORE_MS before it expires. The token is kept (`gh_tokens`) before it's
+   * written, so it can always be revoked.
+   * - The push token without `workflows: write` once that's off: every earlier one that had it is revoked. The
+   *   setting changed while this one was written: written as it was, and due again at once.
+   * - The App refused `workflows: write` (422): the token is minted without it, and the error says so.
+   * - GitHub refusing the installation a permission the token needs (422): told, retried later; nothing revoked.
+   * - GitHub refusing the repo (404: not installed, another account's; 422: not selected) twice running: the repo
+   *   is gone for the app, so the secret is deleted and every token of its kind revoked; looked for again later.
+   * - Anything else (GitHub or nest down, the grant's secrets full, the binding unread): retried with backoff, the
+   *   error kept; the secret written last still works until it expires, then nest refuses its placeholder.
+   * Nothing is recorded once the project is gone (`settings` deleted), and a secret it wrote then is deleted.
+   */
+  private async refreshGithubOnce(nest: Nest, kind: GithubKind, followed = false): Promise<void> {
+    // Its delete still owed: written only after it, or the delete could land on the new one.
+    if (!this.settingsRow() || this.ghRow(kind)?.gone === 1) return;
+    const app = new AppTokens(this.env);
+    // A workflows toggle or a rebind after this point makes what it mints stale (`ghGen`).
+    const gen = this.ghGen;
+    let seq: number | null = null;
+    let nestName: string | null = null;
+    // The write to nest was sent: it may have landed though its answer was lost.
+    let sent = false;
+    try {
+      const id = this.settings()!.id;
+      const b = await directory(this.env).binding(id);
+      if (!b || b.repo_id === null) throw new Error("the repo's binding isn't read from GitHub yet: re-read it on the Admin page");
+      const bound = { repo: b.repo, repoId: b.repo_id, installationId: b.installation_id };
+      if (!this.settingsRow()) return;
+      // Bound to another repo than the access follows (a rebind whose notice never came): followed first, then
+      // this refresh made again, as one after it.
+      if (this.settingsRow()!.gh_repo_id !== b.repo_id && !followed) {
+        await this.githubRebound({ repo_id: b.repo_id, gen: b.repo_gen });
+        return await this.refreshGithubOnce(nest, kind, true);
+      }
+      const want = kind === "push" && this.settings()!.workers_edit_workflows;
+      let workflows = want;
+      let minted: { token: string; expires_ms: number };
+      let note: string | null = null;
+      try {
+        minted = await app.sandboxToken(bound, githubPermissions(kind, workflows));
+      } catch (e) {
+        if (!(workflows && e instanceof GitHubError && e.status === 422)) throw e;
+        workflows = false;
+        minted = await app.sandboxToken(bound, githubPermissions(kind, false));
+        note = `the GitHub App's installation can't grant workflows: write, so workers' pushes can't change .github/workflows/ (${message(e)})`;
+      }
+      // Gone meanwhile: never kept, and revoked at once.
+      if (!this.settingsRow() || !this.ghRow(kind)) {
+        await app.revokeToken(minted.token).catch(() => {});
+        return;
+      }
+      seq = this.sql.exec<{ seq: number }>("INSERT INTO gh_tokens (kind, token, expires_ms, workflows) VALUES (?, ?, ?, ?) RETURNING seq",
+        kind, minted.token, minted.expires_ms, workflows ? 1 : 0).one().seq;
+      // Stale before it's written (a toggle, a rebind: their own refresh runs after this one): never written.
+      if (this.ghGen !== gen) {
+        this.githubStale(kind, seq);
+        return;
+      }
+      const row = this.ghRow(kind)!;
+      nestName = row.nest_name as string;
+      // Inside the grant's secrets limits, checked first where a new secret would take a place.
+      await this.secretRoom(nest, nestName, minted.token, row.expires_ms !== null && row.gone === 0);
+      sent = true;
+      await nest.putSecret(nestName, minted.token, `the project's GitHub ${kind} token for ${b.repo}`, new Date(minted.expires_ms).toISOString());
+      // The project removed while it was written: its secret deleted again now, whatever is left of its rows.
+      if (!this.settingsRow()) {
+        await this.githubOrphan(nest, kind, nestName, seq);
+        return;
+      }
+      // Stale once written: revoked (the secret holds a dead token until the refresh due now writes the new one;
+      // `seq` says which, so no start takes it).
+      if (this.ghGen !== gen) {
+        this.sql.exec("UPDATE gh_access SET seq = ? WHERE kind = ?", seq, kind);
+        this.githubStale(kind, seq);
+        return;
+      }
+      const wasGone = row.gone === 2;
+      this.sql.exec(
+        "UPDATE gh_access SET expires_ms = ?, workflows = ?, wf_refused = ?, next_ms = ?, attempts = 0, refusals = 0, error = ?, gone = 0, del_next_ms = NULL, repo_id = ?, seq = ? WHERE kind = ?",
+        minted.expires_ms, workflows ? 1 : 0, note ? 1 : 0, Math.max(minted.expires_ms - REFRESH_BEFORE_MS, Date.now() + MIN_REFRESH_MS), note, bound.repoId, seq, kind,
+      );
+      if (note && row.wf_refused !== 1) {
+        this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(),
+          "The GitHub App's installation doesn't grant workflows: write, so workers' pushes can't change .github/workflows/. Give the GitHub App Workflows: read and write in the App's own settings (Permissions & events) if it lacks it, then accept it in its installation settings on GitHub; the app asks for it again at the next token.");
+      }
+      // Back in reach after the owner was told it wasn't: told once.
+      if (wasGone || this.settingsRow()!.gh_unreachable === 1) {
+        if (this.sql.exec("UPDATE settings SET gh_unreachable = 0 WHERE gh_unreachable = 1").rowsWritten) {
+          this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(), `The GitHub App reaches ${b.repo} again: agents' GitHub tokens are back, and new agents start as usual.`);
+        }
+      }
+      // A push token without workflows replaced one with them: theirs are revoked, not left valid until they expire.
+      if (!workflows) this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE kind = ? AND workflows = 1 AND seq != ? AND revoke = 0", Date.now(), kind, seq);
+    } catch (e) {
+      // A token minted and not written is revoked: nothing holds it. Its write sent, the secret may hold it now:
+      // named as the one held (`seq`), so no start takes it once revoked.
+      if (seq !== null) {
+        if (sent) this.sql.exec("UPDATE gh_access SET seq = ? WHERE kind = ?", seq, kind);
+        this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE seq = ?", Date.now(), seq);
+      }
+      if (!this.settingsRow() || !this.ghRow(kind)) return;
+      const row = this.ghRow(kind)!;
+      if (e instanceof GitHubError && e.status === 422 && /permissions requested|not granted/i.test(e.message)) {
+        // The installation lacks a permission the token needs: the owner's to grant; the token written last stays.
+        const told = typeof row.error === "string" && row.error.startsWith(PERMISSION_ERROR);
+        const perms = Object.entries(githubPermissions(kind, false)).map(([k, v]) => `${k}: ${v}`).join(", ");
+        const whose = kind === "push" ? "the workers' push token" : "the read token (the manager's, reviewers' and routine runs')";
+        // As GitHub's App settings page names them.
+        const named = kind === "push" ? "Contents: read and write and Pull requests: read and write" : "Contents: read";
+        const why = `${PERMISSION_ERROR} ${whose} needs (${perms}; GitHub doesn't say which is missing)`;
+        this.sql.exec("UPDATE gh_access SET error = ?, next_ms = ? WHERE kind = ?", why, Date.now() + GONE_RECHECK_MS, kind);
+        if (!told) {
+          this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(),
+            `${why}. Give the GitHub App ${named} in the App's own settings (Permissions & events) if it lacks them, then accept them in its installation settings on GitHub. Agents keep their current token until it expires; the app tries again every ${GONE_RECHECK_MS / 60_000} minutes.`);
+        }
+        return;
+      }
+      if (e instanceof GitHubError && (e.status === 404 || e.status === 422)) {
+        // Twice running before it counts as gone: one refusal (a lookup's moment) takes nothing away.
+        const refusals = (row.refusals as number) + 1;
+        if (refusals < GONE_AFTER) {
+          this.sql.exec("UPDATE gh_access SET refusals = ?, error = ?, next_ms = ? WHERE kind = ?", refusals, message(e), Date.now() + backoff(2), kind);
+          return;
+        }
+        this.githubGone(kind, Date.now() + GONE_RECHECK_MS, message(e));
+        // One message for both tokens, until it's back.
+        if (this.sql.exec("UPDATE settings SET gh_unreachable = 1 WHERE gh_unreachable = 0").rowsWritten) {
+          const repo = (await directory(this.env).binding(this.settings()!.id).catch(() => null))?.repo ?? "the repo";
+          this.sql.exec("INSERT INTO chat (at_ms, sender, text) VALUES (?, 'app', ?)", Date.now(),
+            `The GitHub App can't reach ${repo}: ${e.status === 404 ? "the App isn't installed on it" : "the repo isn't selected in its installation"}, so agents' GitHub tokens were revoked and new agents wait to start. ${e.status === 404 ? "Install the App on the repo." : "Select the repo in the App's installation settings."} The app checks again every ${GONE_RECHECK_MS / 60_000} minutes and will tell you when it's back.`);
+        }
+        return;
+      }
+      const attempts = (row.attempts as number) + 1;
+      this.sql.exec("UPDATE gh_access SET attempts = ?, error = ?, next_ms = ? WHERE kind = ?", attempts, message(e), Date.now() + backoff(attempts), kind);
+    }
+  }
+
+  /**
+   * Make the project's GitHub access follow the repo id DirectoryDO binds (`repoId`, or read from it now): when
+   * that's another repo than the access follows (`gh_repo_id`), every token minted before is revoked, both
+   * secrets are due to be written again at once for it (a refresh in flight runs to its end first, then this
+   * one; `githubFresh` takes no token of another repo meanwhile), and every live layer is applied again (the
+   * guards name the repo). Idempotent, so every read of the binding calls it: the operator's bind and each
+   * catalog sync's (`readBinding`), each start (`ensureGithub`) and each refresh (`refreshGithubOnce`). Nothing
+   * waits on one notice arriving. A read older than the one followed (its `repo_gen` lower: a read in flight
+   * across a newer notice) is never followed, so access never moves back to a repo it left. Without a read
+   * (`seen` absent), DirectoryDO's binding is read now.
+   */
+  async githubRebound(seen?: { repo_id: number | null; gen?: number }): Promise<void> {
+    const s = this.settingsRow();
+    if (!s) return;
+    if (seen === undefined) {
+      const b = await directory(this.env).binding(s.id as string);
+      seen = { repo_id: b?.repo_id ?? null, gen: b?.repo_gen };
+    }
+    const repoId = seen.repo_id;
+    const now = this.settingsRow();
+    if (repoId === null || !now) return;
+    // A read without a generation (a DirectoryDO of the previous release) is unordered: followed only when its id
+    // differs, and the generation held is kept.
+    const gen = typeof seen.gen === "number" ? seen.gen : null;
+    const held = now.gh_repo_gen as number | null;
+    if (gen !== null && held !== null && gen < held) return;
+    if (now.gh_repo_id === repoId) {
+      if (gen !== null && (held === null || gen > held)) this.sql.exec("UPDATE settings SET gh_repo_gen = ?", gen);
+      return;
+    }
+    this.sql.exec("UPDATE settings SET gh_repo_id = ?, gh_repo_gen = COALESCE(?, gh_repo_gen)", repoId, gen);
+    // The project's first binding read: nothing minted yet (a refresh follows the binding before it mints).
+    if (now.gh_repo_id === null) return;
+    this.ghGen++;
+    this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE revoke = 0", Date.now());
+    this.sql.exec("UPDATE gh_access SET next_ms = ?, expires_ms = NULL WHERE gone != 1", Date.now());
+    // The guards follow the repo's name now, in every live sandbox's layer.
+    await this.oweLayers(LAYER_ROLES);
+    await this.arm();
+  }
+
+  /** A token minted by a refresh a toggle or a rebind overtook: revoked, and the next refresh due now. */
+  private githubStale(kind: GithubKind, seq: number): void {
+    this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE seq = ?", Date.now(), seq);
+    this.sql.exec("UPDATE gh_access SET next_ms = ? WHERE kind = ? AND gone != 1 AND next_ms IS NOT NULL", Date.now(), kind);
+  }
+
+  /**
+   * A secret written after the project went (its teardown's delete may have run first, its rows gone with it):
+   * deleted now; failing that, a row owing its delete is made again and the alarm armed for it.
+   */
+  private async githubOrphan(nest: Nest, kind: GithubKind, nestName: string, seq: number): Promise<void> {
+    this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE seq = ?", Date.now(), seq);
+    try {
+      await nest.deleteSecret(nestName);
+    } catch (e) {
+      if (!(e instanceof NestError && e.status === 404)) {
+        this.sql.exec(
+          `INSERT INTO gh_access (kind, nest_name, gone, del_next_ms) VALUES (?, ?, 1, ?)
+            ON CONFLICT (kind) DO UPDATE SET gone = 1, del_next_ms = excluded.del_next_ms, next_ms = NULL, expires_ms = NULL`,
+          kind, nestName, Date.now() + backoff(1),
+        );
+      }
+    }
+    await this.githubCleanup(nest);
+    await this.armTemplateDeletes();
+  }
+
+  /**
+   * Whether anything holds `kind` now: a live agent started with the app's access (its layer: the manager,
+   * workers, reviewers), or a routine run of the app's going. A start owed ensures it itself (`sandboxSpec`), so
+   * an idle project's tokens lapse.
+   */
+  private githubHeld(kind: GithubKind): boolean {
+    const roles = kind === "push" ? ["worker"] : ["manager", "reviewer"];
+    const live = this.sql.exec(`SELECT 1 FROM layers WHERE github = 1 AND role IN (${roles.map(() => "?").join(", ")}) LIMIT 1`, ...roles).toArray().length > 0;
+    if (live || kind === "push") return live;
+    return this.sql.exec("SELECT 1 FROM routine_runs WHERE state IN ('starting', 'running') AND nest_repos = 0 AND agent IS NOT NULL LIMIT 1").toArray().length > 0;
+  }
+
+  /** A holder of `kind` appeared: its refresh is scheduled again if it lapsed. */
+  private githubHolds(kind: GithubKind): void {
+    this.sql.exec("UPDATE gh_access SET next_ms = MAX(?, COALESCE(expires_ms, 0) - ?) WHERE kind = ? AND next_ms IS NULL AND gone = 0", Date.now(), REFRESH_BEFORE_MS, kind);
+  }
+
+  /** The repo (or the project) went away for `kind`: its secret's delete owed, every token of it revoked. */
+  private githubGone(kind: GithubKind, nextMs: number | null, error: string): void {
+    this.sql.exec(
+      "UPDATE gh_access SET gone = CASE WHEN gone = 2 THEN 2 ELSE 1 END, del_next_ms = CASE WHEN gone = 2 THEN NULL ELSE ? END, del_attempts = 0, expires_ms = NULL, next_ms = ?, error = ? WHERE kind = ?",
+      Date.now(), nextMs, error, kind,
+    );
+    this.sql.exec("UPDATE gh_tokens SET revoke = 1, next_ms = ? WHERE kind = ? AND revoke = 0", Date.now(), kind);
+  }
+
+  /**
+   * Room for the secret in the grant (`GET /v1/clients/self`'s `secrets`): its size within `max_bytes`, and, when
+   * it isn't stored yet (`known` false), a place left in `max_count`. nest checks both again.
+   */
+  private async secretRoom(nest: Nest, name: string, value: string, known: boolean): Promise<void> {
+    const limits = (await nest.self()).grant?.secrets ?? {};
+    const bytes = new TextEncoder().encode(value).length;
+    const max = limits.max_bytes ?? 4096;
+    if (bytes > max) throw new Error(`a GitHub token of ${bytes} bytes is over the grant's secrets.max_bytes (${max}): the operator must raise it`);
+    if (known) return;
+    const stored = await nest.listSecrets();
+    if (!stored.some((x) => x.name === name) && stored.length >= (limits.max_count ?? 0)) {
+      throw new Error(`the grant's secrets.max_count (${limits.max_count ?? 0}) is used up: the operator must raise it (each project's GitHub access takes two)`);
+    }
+  }
+
+  /**
+   * Each GitHub token secret due (refreshed), each token whose revoke is owed (revoked: GitHub's 401 means
+   * expired or revoked already), each secret whose delete is owed (deleted), and expired tokens forgotten.
+   */
+  private async githubUpkeep(nest: Nest): Promise<void> {
+    const now = Date.now();
+    if (this.settingsRow()) {
+      for (const r of this.sql.exec<{ kind: string }>("SELECT kind FROM gh_access WHERE next_ms IS NOT NULL AND next_ms <= ?", now).toArray()) {
+        const kind = r.kind as GithubKind;
+        if (this.ghRow(kind)!.gone === 1) continue;
+        // Nothing holds it: it lapses (nest refuses its placeholder once it expires); a holder schedules it again.
+        if (!this.githubHeld(kind)) {
+          this.sql.exec("UPDATE gh_access SET next_ms = NULL WHERE kind = ? AND gone != 1", kind);
+          continue;
+        }
+        await this.refreshGithub(nest, kind);
+      }
+    }
+    await this.githubCleanup(nest);
+  }
+
+  /** Revokes and deletes owed (also once the project is gone). */
+  private async githubCleanup(nest: Nest): Promise<void> {
+    const now = Date.now();
+    this.sql.exec("DELETE FROM gh_tokens WHERE expires_ms <= ?", now);
+    const app = new AppTokens(this.env);
+    for (const t of this.sql.exec<{ seq: number; token: string; attempts: number }>("SELECT seq, token, attempts FROM gh_tokens WHERE revoke = 1 AND next_ms <= ?", now).toArray()) {
+      try {
+        await app.revokeToken(t.token);
+        this.sql.exec("DELETE FROM gh_tokens WHERE seq = ?", t.seq);
+      } catch (e) {
+        console.error(`a GitHub token of the project wasn't revoked (retried): ${message(e)}`);
+        this.sql.exec("UPDATE gh_tokens SET attempts = ?, next_ms = ? WHERE seq = ?", t.attempts + 1, Date.now() + backoff(t.attempts + 1), t.seq);
+      }
+    }
+    for (const r of this.sql.exec<{ kind: string; nest_name: string; del_attempts: number }>("SELECT kind, nest_name, del_attempts FROM gh_access WHERE gone = 1 AND del_next_ms <= ?", now).toArray()) {
+      try {
+        await nest.deleteSecret(r.nest_name);
+      } catch (e) {
+        if (!(e instanceof NestError && e.status === 404)) {
+          console.error(`the project's GitHub ${r.kind} secret wasn't deleted (retried): ${message(e)}`);
+          // Retried from the alarm, with backoff; a refresh waits for it.
+          this.sql.exec("UPDATE gh_access SET del_attempts = ?, del_next_ms = ? WHERE kind = ? AND gone = 1", r.del_attempts + 1, Date.now() + backoff(r.del_attempts + 1), r.kind);
+          continue;
+        }
+      }
+      // Deleted, unless a refresh wrote it again meanwhile.
+      this.sql.exec("UPDATE gh_access SET gone = 2, del_next_ms = NULL WHERE kind = ? AND gone = 1", r.kind);
+    }
+    // The project is gone and nothing is owed: nothing's left to keep.
+    if (!this.settingsRow() && !this.githubCleanupDue()) {
+      this.sql.exec("DELETE FROM gh_access");
+    }
+  }
+
+  /** When GitHub work is next due (a refresh, a revoke or a delete), or null. */
+  private githubDue(): number | null {
+    const t = this.sql.exec<{ t: number | null }>(`SELECT MIN(t) AS t FROM (
+      SELECT next_ms AS t FROM gh_access WHERE next_ms IS NOT NULL
+      UNION ALL SELECT del_next_ms FROM gh_access WHERE gone = 1
+      UNION ALL SELECT next_ms FROM gh_tokens WHERE revoke = 1)`).one().t;
+    return t ?? null;
+  }
+
+  /** Whether a revoke or a delete is still owed (what a gone project's alarm keeps doing). */
+  private githubCleanupDue(): boolean {
+    return this.sql.exec("SELECT 1 FROM gh_access WHERE gone = 1 UNION ALL SELECT 1 FROM gh_tokens WHERE revoke = 1").toArray().length > 0;
+  }
+
+  /** The project went away: every token revoked and every token secret deleted (retried from the alarm until done). */
+  private async githubTeardown(nest: Nest): Promise<void> {
+    for (const kind of GITHUB_KINDS) if (this.ghRow(kind)) this.githubGone(kind, null, "the project was removed");
+    await this.githubCleanup(nest);
   }
 
   // --- routines (README.md#routines) --------------------------------------------------------------------
@@ -3329,6 +3862,12 @@ export class ProjectDO extends DurableObject<Env> {
     const current = () => this.runRow(id)?.state === "starting";
     const failed = (e: unknown) => {
       if (!current()) return;
+      // Waiting on nest's hosts to apply its guards, or on the grant to cover its GitHub access: tried again, not
+      // counted (its time budget still runs).
+      if ((e instanceof NestError && e.hostsNotReady) || e instanceof GrantWait) {
+        this.sql.exec("UPDATE routine_runs SET next_ms = ?, error = ? WHERE id = ?", Date.now() + HOSTS_RECHECK_MS, message(e), id);
+        return;
+      }
       const attempts = (this.runRow(id)!.attempts as number) + 1;
       if ((e instanceof NestError && e.permanent) || attempts >= MAX_START_ATTEMPTS) {
         // No agent recorded (every answer lost, or refused): endRun has what its attempts made found by its labels.
@@ -3364,10 +3903,18 @@ export class ProjectDO extends DurableObject<Env> {
       let agent = (before.agent as string | null) ?? null;
       if (!agent) {
         // No secrets and no egress beyond nest's own and the repo's: a routine reads the repo and the board.
+        // A start frozen before its spec was (a run started before the app's GitHub access) has none: nest's repos.
         // A dreaming run has no hands (no sandbox, no repo): the board, recent work, memory and transcripts are all it reads.
-        agent = template === TEMPLATE.dreaming
-          ? (await nest.createAgent({ ...spawn, template: TEMPLATE.dreaming, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent
-          : await nest.startAgent(TEMPLATE.routine, labels, { read: repo! }, `${s.id}/routine/${id}`, {}, spawn);
+        if (template === TEMPLATE.dreaming) {
+          agent = (await nest.createAgent({ ...spawn, template: TEMPLATE.dreaming, labels, start: true }, `${s.id}/routine/${id}/agent`)).agent;
+        } else {
+          // Its GitHub access only (README.md#repo-authority): no secrets of the owner's, no egress beyond the repo's.
+          // A run already tried on nest's repos when this release came (marked by its migration) keeps them: its
+          // sandbox's Idempotency-Key binds the request it sent.
+          const legacy = before.nest_repos === 1;
+          const spec: StartSpec = legacy ? { extras: {}, names: [], brief: "", rev: 0 } : await this.sandboxSpec(nest, "routine", `${s.id}/routine/${id}`);
+          agent = await nest.startAgent(TEMPLATE.routine, labels, spawnOverrides(spec, repo!, false), `${s.id}/routine/${id}`, { ...startEgress([], spec), ...spec.extras }, spawn);
+        }
         // Named on the run in the step the create's answer came, before any other await, so its exit finds it.
         this.sql.exec("UPDATE routine_runs SET agent = ? WHERE id = ? AND agent IS NULL", agent, id);
         if (!current()) {
@@ -3379,11 +3926,13 @@ export class ProjectDO extends DurableObject<Env> {
         const early = this.sql.exec("DELETE FROM early_exits WHERE agent = ? RETURNING reason", agent).toArray()[0];
         if (early) this.routineEvent({ id: `early/${agent}`, type: "agent.exited", agent, reason: (early.reason as string | null) ?? "exited" } as NestEvent);
       }
-      const brief = (frozen.brief as string | null) ?? briefOf(spawn);
+      // And its GitHub line (README.md#the-sandboxes-github-access), from its start's frozen spec: a dreaming run has none.
+      const brief = ((frozen.brief as string | null) ?? briefOf(spawn)) + (this.frozenSpec(`${s.id}/routine/${id}`)?.brief ?? "");
       await nest.postInbox(agent, brief, { requestId: `${id}/brief` });
       if (!current()) return;
       // Its time budget counts from its first attempt (the deadline its grant expires at).
       this.sql.exec("UPDATE routine_runs SET state = 'running', started_ms = ?, next_ms = NULL, error = NULL WHERE id = ?", Date.now(), id);
+      if (before.nest_repos !== 1) this.githubHolds("read");
     } catch (e) {
       failed(e);
     }
@@ -3796,6 +4345,10 @@ export class ProjectDO extends DurableObject<Env> {
       min(`SELECT MIN(t) AS t FROM (
         SELECT exited_ms + ${RUN_EXIT_GRACE_MS} AS t FROM routine_runs WHERE state = 'running' AND exited_ms IS NOT NULL
         UNION ALL SELECT cleanup_next_ms FROM routine_runs WHERE cleanup_next_ms IS NOT NULL)`),
+      // The project's GitHub tokens: a refresh, a revoke or a delete (README.md#repo-authority).
+      this.githubDue(),
+      // An ended agent's sandbox to destroy.
+      min("SELECT MIN(next_ms) AS t FROM sandbox_ends WHERE next_ms IS NOT NULL"),
     ].filter((t): t is number => t !== null);
     const next = times.length ? Math.min(...times) : null;
     if (next === null) return;
@@ -3805,8 +4358,9 @@ export class ProjectDO extends DurableObject<Env> {
 
   /** A gone project's only alarm: the next backed-off template delete, if one is left (never one failed for good). */
   private async armTemplateDeletes(): Promise<void> {
-    const due = this.templateDeleteDue();
-    if (due !== null) await this.ctx.storage.setAlarm(Math.max(due, Date.now()));
+    // And the GitHub revokes and deletes still owed (README.md#repo-authority).
+    const due = [this.templateDeleteDue(), this.githubCleanupDue() ? this.githubDue() : null].filter((t): t is number => t !== null);
+    if (due.length) await this.ctx.storage.setAlarm(Math.max(Math.min(...due), Date.now()));
   }
 
   override async alarm(): Promise<void> {
@@ -3819,6 +4373,9 @@ export class ProjectDO extends DurableObject<Env> {
         const nest = nestFrom(this.env);
         if (nest) await this.sweepModelTemplates(nest, true);
         this.sql.exec("DELETE FROM settings");
+        // Its GitHub tokens revoked and their secrets deleted (README.md#repo-authority), after `settings`
+        // goes, so no refresh writes one again.
+        if (nest) await this.githubTeardown(nest);
         // A delete nest couldn't take is tried again from this alarm, though the project is gone.
         if (nest) await this.armTemplateDeletes();
         return;
@@ -3833,6 +4390,7 @@ export class ProjectDO extends DurableObject<Env> {
       // Without a nest client nothing was tried, so nothing is armed: the object rests.
       if (!nest) return;
       await this.sweepModelTemplates(nest, true);
+      if (this.githubCleanupDue()) await this.githubCleanup(nest);
       await this.armTemplateDeletes();
       return;
     }
@@ -3925,6 +4483,8 @@ export class ProjectDO extends DurableObject<Env> {
     const sw = this.settingsRow()!;
     if (sw.switch_next_ms !== null && sw.switch_next_ms !== undefined && (sw.switch_next_ms as number) <= now && sw.manager !== null) await this.switchManager(nest);
     if (s.secrets_next_ms !== null && (s.secrets_next_ms as number) <= now) await this.secretsUpkeep(nest);
+    const gh = this.githubDue();
+    if (gh !== null && gh <= now) await this.githubUpkeep(nest);
     for (const r of this.sql.exec("SELECT task, start FROM abandoned WHERE next_ms <= ?", now).toArray()) await this.cleanAbandoned(nest, r.task as string, r.start as number);
     for (const r of this.sql.exec("SELECT task FROM issue_closes WHERE next_ms IS NOT NULL AND next_ms <= ?", now).toArray()) await this.closeIssue(nest, r.task as string);
     if (s.am_write_next_ms !== null && (s.am_write_next_ms as number) <= now) await this.writeRepoAutoMerge(nest);
@@ -3947,6 +4507,7 @@ export class ProjectDO extends DurableObject<Env> {
       await this.startWorker(nest, r.id as string);
     }
     for (const r of this.sql.exec("SELECT agent FROM stops WHERE failed_ms IS NULL AND next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
+    for (const r of this.sql.exec("SELECT agent FROM sandbox_ends WHERE next_ms IS NOT NULL AND next_ms <= ?", now).toArray()) await this.endSandbox(nest, r.agent as string);
     // The old manager's stop went (or failed for good): its successor starts in this drain.
     if (held && !replacing()) this.again = true;
     // Ended rows past their queue's keep (README.md#outboxes): messages sent or failed a week ago (a failed stop is kept until resolved).
@@ -4290,10 +4851,10 @@ export class ProjectDO extends DurableObject<Env> {
       const key = `${s.id}/manager/${n}`;
       const frozen = await this.frozenEgress(nest, key, "manager");
       // Its bindings, env and workflows, frozen with the same key (README.md#secrets).
-      const spec = await this.sandboxSpec(nest, "manager", key);
+      const spec = await this.sandboxSpec(nest, "manager", key, { ensure: !s.manager });
       const from = s.manager ? null : await this.templateFor(nest, "manager", spec);
       const repo = await this.repo();
-      const agent = s.manager ?? (await nest.startAgent(from!, labels, { read: repo }, key, { ...egressExtras(frozen.egress), ...spec.extras }));
+      const agent = s.manager ?? (await nest.startAgent(from!, labels, spawnOverrides(spec, repo, false), key, { ...startEgress(frozen.egress, spec), ...spec.extras }));
       if (from) this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
       await directory(this.env).recordAgent({ agent, project: s.id, role: "manager", task: null, pr: null });
       if (!current()) {
@@ -4302,7 +4863,7 @@ export class ProjectDO extends DurableObject<Env> {
         return;
       }
       this.sql.exec("UPDATE settings SET manager = ?", agent);
-      this.trackLayer(agent, "manager", frozen.rev);
+      this.trackLayer(agent, "manager", frozen.rev, !!spec.github);
       this.recordHolder(agent, "manager", spec.names);
       await nest.postInbox(agent, managerBrief(s, repo) + spec.brief, { requestId: `${s.id}/manager/${n}/brief` });
       // Done only if nothing moved meanwhile (it exited during its brief, the owner restarted it): else
@@ -4349,7 +4910,7 @@ export class ProjectDO extends DurableObject<Env> {
         const frozen = await this.frozenEgress(nest, key, "worker");
         const spec = await this.sandboxSpec(nest, "worker", key);
         const from = await this.templateFor(nest, "worker", spec);
-        agent = await nest.startAgent(from, labels, { push: await this.repo() }, key, { ...egressExtras(frozen.egress), ...spec.extras });
+        agent = await nest.startAgent(from, labels, spawnOverrides(spec, await this.repo(), true), key, { ...startEgress(frozen.egress, spec), ...spec.extras });
         // In the step the create's answer came (no await): the template it started from, for the sweep.
         this.sql.exec("INSERT OR REPLACE INTO agent_templates (agent, name) VALUES (?, ?)", agent, from);
         if (!current()) {
@@ -4358,7 +4919,7 @@ export class ProjectDO extends DurableObject<Env> {
           return;
         }
         // Named on the task in the step the create's answer came, before any other await, so its exit finds it.
-        this.trackLayer(agent, "worker", frozen.rev);
+        this.trackLayer(agent, "worker", frozen.rev, !!spec.github);
         this.recordHolder(agent, "worker", spec.names, spec.extras.github_push?.workflows === true);
         this.sql.exec("UPDATE tasks SET assignee = ? WHERE id = ?", agent, id);
         this.record(id, { kind: "app", what: "assign" }, "worker", { agent });
@@ -4612,9 +5173,20 @@ function prAutoMerge(r: Row): TaskAutoMerge | null {
   return status;
 }
 
-const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 500);
+const message = (e: unknown) => (e instanceof NestError && e.hostsNotReady ? `${HOSTS_WAIT}: ${e.message}` : e instanceof Error ? e.message : String(e)).slice(0, 500);
 /** `n` random bytes as hex: a marker no text written before it could know. */
 const randomHex = (n: number) => [...crypto.getRandomValues(new Uint8Array(n))].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+/** The brief's line on the repo's GitHub access (README.md#repo-authority): what git and gh are set up to do, never a placeholder. */
+function githubBrief(kind: GithubKind, repo: string): string {
+  return [
+    "",
+    kind === "push"
+      ? `GitHub: git and gh in your sandbox are already signed in to ${repo} ($GH_TOKEN, and git's credential helper for github.com): push your task branch and open your PR with them. They push only to ${repo}.`
+      : `GitHub: git and gh in your sandbox are already signed in to ${repo} for reading ($GH_TOKEN, and git's credential helper for github.com): clone and fetch with them. They can't push.`,
+    "Don't set other GitHub credentials or change git's credential helper.",
+  ].join("\n");
+}
 
 function managerBrief(s: ProjectSettings, repo: string): string {
   return [
@@ -4645,6 +5217,25 @@ function workerBrief(repo: string, t: Task): string {
 type Grant = NonNullable<Awaited<ReturnType<Nest["self"]>>["grant"]>;
 /** How long a retired or orphaned nest secret is kept, so layers naming it have moved on first. */
 const SWEEP_GRACE_MS = 5 * 60_000;
+/** A start waiting for nest's grant to cover the app's GitHub access: retried, never counted as a failure. */
+class GrantWait extends Error {}
+
+/** An ended agent's sandbox's destroy is given up after this many tries (nest's idle TTL ends it then). */
+const SANDBOX_END_ATTEMPTS = 12;
+/** A start waiting on nest's hosts to apply its guards (`hostsNotReady`) tries again this often. */
+const HOSTS_RECHECK_MS = 60_000;
+/** A start takes the project's GitHub token secret as it is when it has more than this left (else it's written now). */
+const FRESH_ENOUGH_MS = 10 * 60_000;
+/** A token's next write is never sooner than this after one (a short-lived token GitHub answered). */
+const MIN_REFRESH_MS = 60_000;
+/** The repo gone for the app (GitHub refused the token): looked for again this often. */
+const GONE_RECHECK_MS = 30 * 60_000;
+/** GitHub refusing the repo this many times running makes it gone for the app (its secrets deleted, tokens revoked). */
+const GONE_AFTER = 2;
+/** How a missing installation permission is told (and recognised, so it's told once). */
+const PERMISSION_ERROR = "The GitHub App's installation doesn't grant everything";
+/** Settings' reason, under the toggle and beside each live worker, when the App can't grant `workflows: write`. */
+export const WORKFLOWS_REFUSED = "the GitHub App's installation doesn't grant workflows: write";
 /** When an abandoned start attempt is looked for again: past nest's 60 s idempotency lease, with room. */
 const ABANDON_RECHECK_MS = 2 * 60_000;
 /** How often the secrets' upkeep (the grant read, the sweep) runs while the project has secrets. */
@@ -4740,7 +5331,14 @@ export interface StartSpec {
   rev: number;
   /** The model the manager or worker starts on (README.md#models). Absent: frozen before models were chosen (the role's shared template then). */
   model?: string;
+  /**
+   * The app's own GitHub access (README.md#the-sandboxes-github-access): the egress the API needs and the guards,
+   * which (with its binding and environment) are also in `extras`, the sandbox's own. Absent: frozen before this
+   * release, so the start keeps nest's repos (a new start waits for the grant instead: it never freezes without).
+   */
+  github?: { egress: EgressRule[]; guards: Guard[] };
 }
+
 
 /** A live agent's client layer, as the Network page shows it. */
 export interface LayerStatus {
@@ -4763,7 +5361,6 @@ function toWait(r: Row): Wait {
 }
 
 /** A start's sandbox extras for its frozen rules: none when there are none (the request as before). */
-const egressExtras = (egress: EgressRule[]) => (egress.length ? { egress: { allow: egress } } : {});
 
 /** A review job's end, in a word: its verdict's conclusion, or that it failed. */
 function reviewConclusion(j: { state: string; verdict: unknown }): string {

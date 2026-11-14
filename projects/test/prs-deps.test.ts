@@ -349,7 +349,12 @@ describe("the migration", () => {
       for (const c of ["pr_read_next_ms", "pr_read_last_ms", "pr_read_attempts"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       // And the comments default's step (README.md#pr-comments).
       for (const c of ["comments_default_id", "comments_cleared", "comments_marked"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
-      expect(step).toBe(MIGRATIONS.length - 18);
+      // And the GitHub access step's (README.md#repo-authority).
+      for (const t of ["gh_access", "gh_tokens", "sandbox_ends"]) sql.exec(`DROP TABLE ${t}`);
+      sql.exec("ALTER TABLE settings DROP COLUMN gh_unreachable");
+      sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_id");
+      sql.exec("ALTER TABLE settings DROP COLUMN gh_repo_gen");
+      expect(step).toBe(MIGRATIONS.length - 19);
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, pr_node, am_status, created_ms, updated_ms) VALUES ('tsk_old', 't', '', 'in_review', 1, 7, 'PR_x', '{"state":"enabled"}', 1, 2)`);
       sql.exec(`INSERT INTO tasks (id, title, body, state, ord, pr, created_ms, updated_ms) VALUES ('tsk_done', 't', '', 'done', 2, 8, 1, 2)`);

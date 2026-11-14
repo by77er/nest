@@ -6,7 +6,7 @@
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
-import { AccessTeam, agentClaims, api, callTool, CLIENT, deliverGithub, FakeNest, installFetch, prEvent, Signer } from "./fake-nest";
+import { AccessTeam, agentClaims, api, callTool, CLIENT, deliverGithub, FakeNest, githubPart, installFetch, prEvent, Signer } from "./fake-nest";
 
 const fake = new FakeNest();
 let restore: () => void;
@@ -49,9 +49,39 @@ async function assignedWorker(p: P) {
   const a = (await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`)).body;
   return { task: t.id as string, worker: a.assignee as string };
 }
+/**
+ * A worker whose start was frozen before the app's own GitHub access (README.md#repo-authority): on nest's repos,
+ * with nest's push opt-in as the settings had it, as a start in flight across that release is. Its template is
+ * written with the repo, and its layer keeps nest's opt-in (B4 converges such workers).
+ */
+async function legacyWorker(p: P, o: { workflows?: boolean; assign?: boolean } = {}) {
+  const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "t" })).body;
+  await api(token, "PUT", `/api/projects/${p.id}/tasks/${t.id}/spec`, spec);
+  const frozen = { extras: o.workflows ? { github_push: { workflows: true } } : {}, names: [], brief: "", rev: 0, model: "claude-opus-5-5" };
+  await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => {
+    st.storage.sql.exec("INSERT INTO start_specs (key, spec, at_ms) VALUES (?, ?, ?)", `${p.id}/${t.id}/1`, JSON.stringify(frozen), Date.now());
+  });
+  if (o.assign === false) return { task: t.id as string, worker: "" };
+  const a = (await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`)).body;
+  expect(fake.agents.get(a.assignee)!.overrides).toEqual({ repos: [p.repo] });
+  return { task: t.id as string, worker: a.assignee as string };
+}
 /** nest's name for a project's secret: `<project>-<name>-<generation>`, the generation new at each creation. */
 const nestKey = (p: { id: string }, name: string) => [...fake.secrets.keys()].find((k) => new RegExp(`^${p.id}-${name}-[a-z0-9]{6}$`).test(k));
 const sandboxOf = (agent: string) => fake.sandboxes.get(fake.agents.get(agent)!.sandbox!)!;
+/**
+ * A sandbox's client layer less the app's own GitHub part (README.md#repo-authority: its binding, variables and
+ * hosts, test/github-access.test.ts), which these tests about the owner's secrets keep beside it.
+ */
+const ownerLayer = (agent: string) => {
+  const l = sandboxOf(agent).layer;
+  const gh = new Set(githubPart("x", "worker").egress.map((r) => r.host));
+  return {
+    egress: { allow: (l.egress.allow as { host: string }[]).filter((r) => !gh.has(r.host)) },
+    inject: (l.inject as { name: string }[]).filter((b) => !["gh_push", "gh_read"].includes(b.name)),
+    env: Object.fromEntries(Object.entries(l.env).filter(([k]) => k !== "GH_TOKEN" && !k.startsWith("GIT_CONFIG"))),
+  };
+};
 
 /** Every value in every table of an object, as text. */
 const dump = (stub: DurableObjectStub) =>
@@ -110,8 +140,8 @@ describe("injection", () => {
     await put(p, "npm_token", npm(valueOf("w"), ["worker"]));
     await put(p, "cf_token", { value: valueOf("r"), description: "", hosts: ["api.cloudflare.com"], locations: [{ type: "header", name: "X-Auth-Key" }], roles: ["reviewer"], env: "CF_AUTH_KEY" });
     const w = await assignedWorker(p);
-    expect(sandboxOf(w.worker).layer.inject).toEqual([{ name: "npm_token", secret: nestKey(p, "npm_token")!, hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] }]);
-    expect(sandboxOf(w.worker).layer.env).toEqual({ NPM_TOKEN: `nest-ph.${CLIENT}.npm_token.` });
+    expect(ownerLayer(w.worker).inject).toEqual([{ name: "npm_token", secret: nestKey(p, "npm_token")!, hosts: ["registry.npmjs.org"], locations: [{ type: "authorization_bearer" }] }]);
+    expect(ownerLayer(w.worker).env).toEqual({ NPM_TOKEN: `nest-ph.${CLIENT}.npm_token.` });
     const brief = fake.inbox.find((m) => m.agent === w.worker)!.text;
     expect(brief).toContain("- $NPM_TOKEN (npm publish): registry.npmjs.org, as a bearer token.");
     expect(brief).not.toContain("nest-ph.");
@@ -120,11 +150,11 @@ describe("injection", () => {
     await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 1, sha: sha(), action: "opened" }));
     await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
     const reviewer = [...fake.agents.values()].find((a) => a.labels.project === p.id && a.labels.role === "reviewer")!;
-    expect((sandboxOf(reviewer.agent).layer.inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
-    expect(sandboxOf(reviewer.agent).layer.env).toEqual({ CF_AUTH_KEY: `nest-ph.${CLIENT}.cf_token.` });
+    expect((ownerLayer(reviewer.agent).inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
+    expect(ownerLayer(reviewer.agent).env).toEqual({ CF_AUTH_KEY: `nest-ph.${CLIENT}.cf_token.` });
     expect(fake.inbox.find((m) => m.agent === reviewer.agent)!.text).toContain("- $CF_AUTH_KEY: api.cloudflare.com, as the X-Auth-Key header.");
     // The manager, started before either, has none.
-    expect(sandboxOf(p.manager).layer.inject).toEqual([]);
+    expect(ownerLayer(p.manager).inject).toEqual([]);
   });
 
   it("a start attempt's sandbox is the same request on a retry, though the secrets changed meanwhile", async () => {
@@ -142,9 +172,10 @@ describe("injection", () => {
     expect([...fake.sandboxes.values()].filter((x) => x.labels.task === t.id)).toHaveLength(1);
     // Created as first asked, with the binding; the change since is owed to its layer once it's live.
     const worker = task.assignee as string;
-    expect(fake.callsTo("POST", /^\/v1\/sandboxes$/).filter((c) => c.body.labels?.task === t.id).every((c) => c.body.inject?.length === 1)).toBe(true);
+    // (Its binding, and the app's GitHub one.)
+    expect(fake.callsTo("POST", /^\/v1\/sandboxes$/).filter((c) => c.body.labels?.task === t.id).every((c) => c.body.inject?.map((b: { name: string }) => b.name).join() === "npm_token,gh_push")).toBe(true);
     await drain(p);
-    expect(sandboxOf(worker).layer).toMatchObject({ inject: [], env: {} });
+    expect(ownerLayer(worker)).toMatchObject({ inject: [], env: {} });
   });
 
   it("deleting a secret names the live agents that had it, and takes it out of their layers", async () => {
@@ -154,7 +185,7 @@ describe("injection", () => {
     expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.secrets[0].holders).toEqual([{ agent: w.worker, role: "worker" }]);
     expect((await api(token, "DELETE", `/api/projects/${p.id}/secrets/npm_token`)).body).toEqual({ deleted: "npm_token", holders: [{ agent: w.worker, role: "worker" }] });
     await drain(p);
-    expect(sandboxOf(w.worker).layer).toMatchObject({ inject: [], env: {} });
+    expect(ownerLayer(w.worker)).toMatchObject({ inject: [], env: {} });
     const view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
     expect(view.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: w.worker, state: "applied" })]));
   });
@@ -170,7 +201,7 @@ describe("live agents", () => {
     expect((await put(p, "cf_token", cf(valueOf("c")))).status).toBe(200);
     await drain(p);
     const binding = { name: "cf_token", secret: nestKey(p, "cf_token")!, hosts: ["api.cloudflare.com"], locations: [{ type: "authorization_bearer" }] };
-    expect(sandboxOf(p.manager).layer).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [binding], env: { CLOUDFLARE_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` } });
+    expect(ownerLayer(p.manager)).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [binding], env: { CLOUDFLARE_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` } });
     // Not for workers: nothing written to theirs.
     expect(layerPuts(w.worker).length).toBe(workerPuts);
     let view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
@@ -179,14 +210,14 @@ describe("live agents", () => {
     // Moved to workers: it leaves the manager's layer (its rules kept) and joins the worker's.
     await put(p, "cf_token", cf(undefined, ["worker"]));
     await drain(p);
-    expect(sandboxOf(p.manager).layer).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [], env: {} });
-    expect(sandboxOf(w.worker).layer).toMatchObject({ inject: [binding], env: { CLOUDFLARE_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` } });
+    expect(ownerLayer(p.manager)).toEqual({ egress: { allow: [{ host: "nodejs.org" }] }, inject: [], env: {} });
+    expect(ownerLayer(w.worker)).toMatchObject({ inject: [binding], env: { CLOUDFLARE_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` } });
     view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
     expect(view.secrets[0].holders).toEqual([{ agent: w.worker, role: "worker" }]);
     // A new variable name reaches it too.
     await put(p, "cf_token", { ...cf(undefined, ["worker"]), env: "CF_API_TOKEN" });
     await drain(p);
-    expect(sandboxOf(w.worker).layer.env).toEqual({ CF_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` });
+    expect(ownerLayer(w.worker).env).toEqual({ CF_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` });
     // A new value, or a new description, changes no layer: nest pushes the value to the proxies itself.
     const before = fake.callsTo("PUT", /\/client-policy$/).length;
     await put(p, "cf_token", { ...cf(valueOf("c2"), ["worker"]), env: "CF_API_TOKEN", description: "renamed" });
@@ -194,7 +225,7 @@ describe("live agents", () => {
     expect(fake.callsTo("PUT", /\/client-policy$/).length).toBe(before);
     // And a network change afterwards keeps the secrets in the layer (one feed each, one layer).
     await api(token, "PUT", `/api/projects/${p.id}/network`, { worker: [{ host: "pypi.org" }], manager: [{ host: "nodejs.org" }] });
-    expect(sandboxOf(w.worker).layer).toEqual({ egress: { allow: [{ host: "pypi.org" }] }, inject: [binding], env: { CF_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` } });
+    expect(ownerLayer(w.worker)).toEqual({ egress: { allow: [{ host: "pypi.org" }] }, inject: [binding], env: { CF_API_TOKEN: `nest-ph.${CLIENT}.cf_token.` } });
   });
 
   it("a layer nest refuses shows as failed on the Secrets page; a retry after a transient one applies it", async () => {
@@ -216,7 +247,7 @@ describe("live agents", () => {
     await drain(p);
     agents = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.agents;
     expect(agents[0]).toMatchObject({ state: "applied", error: null });
-    expect(sandboxOf(p.manager).layer.env).toEqual({ CF_TOKEN: `nest-ph.${CLIENT}.cf_token.` });
+    expect(ownerLayer(p.manager).env).toEqual({ CF_TOKEN: `nest-ph.${CLIENT}.cf_token.` });
   });
 
   it("a grant narrowed away from one secret never holds back another's removal; the narrowed one is left out and shown", async () => {
@@ -224,14 +255,14 @@ describe("live agents", () => {
     await put(p, "cf_token", cf(valueOf("a")));
     await put(p, "npm_token", npm(valueOf("b"), ["manager"]));
     await drain(p);
-    expect((sandboxOf(p.manager).layer.inject as { name: string }[]).map((b) => b.name).sort()).toEqual(["cf_token", "npm_token"]);
+    expect((ownerLayer(p.manager).inject as { name: string }[]).map((b) => b.name).sort()).toEqual(["cf_token", "npm_token"]);
     const saved = [...fake.grant.inject_hosts];
     fake.grant.inject_hosts = saved.filter((h) => h !== "api.cloudflare.com");
     try {
       expect((await api(token, "DELETE", `/api/projects/${p.id}/secrets/npm_token`)).status).toBe(200);
       await drain(p);
       // npm_token is gone; cf_token, outside the grant now, is left out rather than refused with it.
-      expect(sandboxOf(p.manager).layer).toMatchObject({ inject: [], env: {} });
+      expect(ownerLayer(p.manager)).toMatchObject({ inject: [], env: {} });
       const view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
       expect(view.agents).toEqual([expect.objectContaining({ agent: p.manager, state: "applied", error: null })]);
       expect(view.secrets.find((x: { name: string }) => x.name === "cf_token").outside_hosts).toEqual(["api.cloudflare.com"]);
@@ -249,8 +280,8 @@ describe("live agents", () => {
     fake.fail(/PUT \/v1\/sandboxes\/.*\/client-policy/, 403, { times: 2 });
     await api(token, "DELETE", `/api/projects/${p.id}/secrets/npm_token`);
     await drain(p);
-    expect((sandboxOf(p.manager).layer.inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
-    expect(Object.keys(sandboxOf(p.manager).layer.env)).toEqual(["CLOUDFLARE_API_TOKEN"]);
+    expect((ownerLayer(p.manager).inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
+    expect(Object.keys(ownerLayer(p.manager).env)).toEqual(["CLOUDFLARE_API_TOKEN"]);
     const view = (await api(token, "GET", `/api/projects/${p.id}/secrets`)).body;
     expect(view.agents[0]).toMatchObject({ state: "failed", error: expect.stringContaining("what it removes is applied") });
     expect(view.secrets.find((x: { name: string }) => x.name === "cf_token").holders).toEqual([{ agent: p.manager, role: "manager" }]);
@@ -269,8 +300,8 @@ describe("live agents", () => {
       await api(token, "DELETE", `/api/projects/${p.id}/secrets/npm_token`);
       await drain(p);
       // npm_token went; cf_token, unchanged, stays (an unknown grant isn't an empty one).
-      expect((sandboxOf(p.manager).layer.inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
-      expect(Object.keys(sandboxOf(p.manager).layer.env)).toEqual(["CLOUDFLARE_API_TOKEN"]);
+      expect((ownerLayer(p.manager).inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
+      expect(Object.keys(ownerLayer(p.manager).env)).toEqual(["CLOUDFLARE_API_TOKEN"]);
       expect((await api(token, "GET", `/api/projects/${p.id}/network`)).body.agents[0]).toMatchObject({ state: "pending", error: expect.stringContaining("grant couldn't be read") });
     } finally {
       fake.failures = fake.failures.filter((f) => !f.match.test("GET /v1/clients/self"));
@@ -286,7 +317,7 @@ describe("live agents", () => {
     await put(p, "npm_token", npm(valueOf("b"), ["manager"]));
     await drain(p);
     expect(layerPuts(p.manager).length).toBe(before + 2);
-    expect((sandboxOf(p.manager).layer.inject as { name: string }[]).map((b) => b.name).sort()).toEqual(["cf_token", "npm_token"]);
+    expect((ownerLayer(p.manager).inject as { name: string }[]).map((b) => b.name).sort()).toEqual(["cf_token", "npm_token"]);
     expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.agents[0]).toMatchObject({ state: "applied", error: null });
   });
 
@@ -302,10 +333,10 @@ describe("live agents", () => {
     try {
       fake.grant.inject_hosts = saved.filter((h) => h !== "api.cloudflare.com");
       await upkeep();
-      expect(sandboxOf(p.manager).layer.inject).toEqual([]);
+      expect(ownerLayer(p.manager).inject).toEqual([]);
       fake.grant.inject_hosts = saved;
       await upkeep();
-      expect((sandboxOf(p.manager).layer.inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
+      expect((ownerLayer(p.manager).inject as { name: string }[]).map((b) => b.name)).toEqual(["cf_token"]);
     } finally {
       fake.grant.inject_hosts = saved;
     }
@@ -359,11 +390,11 @@ describe("live agents", () => {
     await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 7, sha: sha(), action: "opened" }));
     await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
     const reviewer = [...fake.agents.values()].find((a) => a.labels.project === p.id && a.labels.role === "reviewer")!.agent;
-    expect(sandboxOf(reviewer).layer.inject).toEqual([expect.objectContaining({ name: "up_key", secret: first })]);
+    expect(ownerLayer(reviewer).inject).toEqual([expect.objectContaining({ name: "up_key", secret: first })]);
     // Taken off reviewers: it leaves the live reviewer's layer.
     await put(p, "up_key", { ...cf(undefined, ["worker"]), hosts: ["api.cloudflare.com"], env: "UP_KEY" });
     await drain(p);
-    expect(sandboxOf(reviewer).layer).toMatchObject({ inject: [], env: {} });
+    expect(ownerLayer(reviewer)).toMatchObject({ inject: [], env: {} });
     expect((await api(token, "GET", `/api/projects/${p.id}/secrets`)).body.agents).toEqual(expect.arrayContaining([expect.objectContaining({ agent: reviewer, role: "reviewer", state: "applied" })]));
     // Deleted and made again under its name: another nest secret, so a binding from before reaches nothing.
     await api(token, "DELETE", `/api/projects/${p.id}/secrets/up_key`);
@@ -376,7 +407,7 @@ describe("live agents", () => {
 
   it("refuses a variable nest sets, a malformed one, or one another secret uses", async () => {
     const p = await newProject();
-    for (const [v, re] of [["PATH", /set by nest/], ["NEST_AGENT", /set by nest/], ["HTTPS_PROXY", /set by nest/], ["GH_TOKEN", /take over the sandbox's brokered GitHub token/], ["GITHUB_ENTERPRISE_TOKEN", /brokered GitHub/], ["lower", /Capital letters/], ["1X", /Capital letters/]] as const) {
+    for (const [v, re] of [["PATH", /set by nest/], ["NEST_AGENT", /set by nest/], ["HTTPS_PROXY", /set by nest/], ["GH_TOKEN", /take over the sandbox's GitHub token/], ["GITHUB_ENTERPRISE_TOKEN", /sandbox's GitHub token/], ["GIT_CONFIG_COUNT", /sandbox's GitHub token/], ["GIT_CONFIG_KEY_7", /sandbox's GitHub token/], ["GIT_ASKPASS", /sandbox's GitHub token/], ["lower", /Capital letters/], ["1X", /Capital letters/]] as const) {
       const r = await put(p, "x_token", { ...npm(valueOf("v")), env: v });
       expect(r.status, v).toBe(400);
       expect(r.body.problems.env).toMatch(re);
@@ -391,7 +422,7 @@ describe("the grant", () => {
     const outside = await put(p, "x_token", { ...npm(valueOf("o")), hosts: ["api.stripe.com"] });
     expect(Object.keys(outside.body.problems)).toEqual(["hosts"]);
     expect(outside.status).toBe(400);
-    expect(outside.body.problems.hosts).toMatch(/api\.stripe\.com is outside the hosts this app may inject into \(api\.cloudflare\.com, registry\.npmjs\.org, \*\.example\.com\): the operator must widen the grant's inject_hosts/);
+    expect(outside.body.problems.hosts).toMatch(/api\.stripe\.com is outside the hosts this app may inject into \(api\.cloudflare\.com, registry\.npmjs\.org, \*\.example\.com, github\.com, api\.github\.com\): the operator must widen the grant's inject_hosts/);
     // A wildcard within the grant's.
     expect((await put(p, "wild", { ...npm(valueOf("w")), hosts: ["*.api.example.com"] })).status).toBe(200);
     expect((await put(p, "big", npm("y".repeat(5000), ["worker"], "BIG"))).body.problems.value).toMatch(/at most 4096/);
@@ -481,9 +512,9 @@ describe("workers editing CI workflows", () => {
     expect((await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body.state).toBe("in_progress");
   });
 
-  it("reaches live workers both ways through their layer, each shown applied; within the grant; off goes through a refusal", async () => {
+  it("reaches live workers on nest's repos both ways through their layer, each shown applied; within the grant; off goes through a refusal", async () => {
     const p = await newProject();
-    const w = await assignedWorker(p);
+    const w = await legacyWorker(p);
     expect(sandboxOf(w.worker).github_push).toBeNull();
     // On: the live worker's push token may change workflows now, not only workers started from now on.
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
@@ -520,7 +551,7 @@ describe("workers editing CI workflows", () => {
 
   it("to a control plane from before the push opt-in, the layer goes without it, and still applies", async () => {
     const p = await newProject();
-    const w = await assignedWorker(p);
+    const w = await legacyWorker(p);
     fake.layerWithoutPush = true;
     try {
       await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
@@ -533,14 +564,13 @@ describe("workers editing CI workflows", () => {
     }
   });
 
-  it("off mid-start: the attempt is abandoned for a new one without it, and what the old one made is destroyed", async () => {
+  it("off mid-start (one frozen on nest's repos): the attempt is abandoned for a new one without it, and what the old one made is destroyed", async () => {
     const p = await newProject();
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
-    const live = await assignedWorker(p);
+    const live = await legacyWorker(p, { workflows: true });
     // A start whose sandbox was made with workflows, its answer lost: in flight.
     fake.lost.push({ match: /^POST \/v1\/sandboxes$/, times: 1 });
-    const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "t2" })).body;
-    await api(token, "PUT", `/api/projects/${p.id}/tasks/${t.id}/spec`, spec);
+    const t = { id: (await legacyWorker(p, { workflows: true, assign: false })).task };
     await api(token, "POST", `/api/projects/${p.id}/tasks/${t.id}/assign`);
     const made = [...fake.sandboxes.values()].filter((x) => x.labels.task === t.id);
     expect(made).toHaveLength(1);
@@ -555,6 +585,9 @@ describe("workers editing CI workflows", () => {
     expect(fresh).toHaveLength(1);
     expect(fresh[0]!.labels.start).not.toBe(first);
     expect(fresh[0]!.github_push).toBeNull();
+    // The new attempt is frozen now: the app's own GitHub access, not nest's repos.
+    expect(fresh[0]!.layer.guards?.length).toBeGreaterThan(0);
+    expect([...fake.agents.values()].find((a) => a.sandbox === fresh[0]!.sandbox)!.overrides).toEqual({ repos: [], read_repos: [] });
     const task = (await api(token, "GET", `/api/projects/${p.id}/tasks/${t.id}`)).body;
     expect(task.state).toBe("in_progress");
     expect(task.history.some((h: { action: string }) => h.action === "start_abandoned")).toBe(true);
@@ -572,14 +605,16 @@ describe("workers editing CI workflows", () => {
     expect(await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => st.storage.sql.exec("SELECT COUNT(*) AS n FROM abandoned").one().n)).toBe(0);
   });
 
-  it("is off by default; on, it reaches worker sandboxes only; refused when the grant doesn't allow it", async () => {
+  it("is off by default; on, a start frozen on nest's repos asks nest's opt-in for worker sandboxes only, within the grant", async () => {
     const p = await newProject();
     expect((await api(token, "GET", `/api/projects/${p.id}`)).body.settings.workers_edit_workflows).toBe(false);
-    const before = await assignedWorker(p);
+    const before = await legacyWorker(p);
     expect(sandboxOf(before.worker).github_push).toBeNull();
     expect((await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true })).body.workers_edit_workflows).toBe(true);
-    const after = await assignedWorker(p);
+    const after = await legacyWorker(p, { workflows: true });
     expect(sandboxOf(after.worker).github_push).toEqual({ workflows: true });
+    // A start frozen now never asks it: the project's push token carries workflows itself.
+    expect(sandboxOf((await assignedWorker(p)).worker).github_push).toBeNull();
     await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 2, sha: sha(), action: "opened" }));
     await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
     const reviewer = [...fake.agents.values()].find((a) => a.labels.project === p.id && a.labels.role === "reviewer")!;
@@ -588,9 +623,15 @@ describe("workers editing CI workflows", () => {
     const saved = fake.grant.github_push;
     fake.grant.github_push = { workflows: false };
     try {
+      // Not refused: the GitHub App's installation decides for the project's own token; a worker on nest's repos
+      // gets nest's opt-in only within the grant, so it goes from its layer.
       const r = await api(token, "PATCH", `/api/projects/${p.id}/settings`, { workers_edit_workflows: true });
-      expect(r.status).toBe(409);
-      expect(r.body.error).toMatch(/github_push\.workflows/);
+      expect(r.status).toBe(200);
+      await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => { st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0"); });
+      await drain(p);
+      await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_i: unknown, st: DurableObjectState) => { st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0"); });
+      await drain(p);
+      expect(sandboxOf(after.worker).github_push).toBeNull();
     } finally {
       fake.grant.github_push = saved;
     }
