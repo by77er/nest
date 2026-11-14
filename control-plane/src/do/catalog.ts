@@ -396,7 +396,7 @@ export class CatalogDO extends DurableObject<Env> {
     // whole template after a rollback. Taken in a template from the release after (docs/interfaces/#pending-contract-changes).
     const basicUser = (tpl.inject ?? []).find((b) => b.locations.some((l) => l.type === "authorization_basic_password" && l.username !== undefined));
     if (basicUser) {
-      throw new NestError(ErrorCodes.INVALID_MESSAGE, `template ${name}: binding ${basicUser.name} names a Basic username, which a catalog template can't hold yet (a rollback would drop the template): name it in a sandbox's or a spawn's own bindings instead`);
+      throw new NestError(ErrorCodes.INVALID_MESSAGE, `template ${name}: binding ${basicUser.name} names a Basic username, which a catalog template can't hold yet (a rollback would drop the template): name it in a sandbox's own client layer instead (a spawn only narrows the template's)`);
     }
     // GitHub's answer for repos only an owner-wide entry could cover, from a first expansion; everything
     // below runs again from the catalog as it is after this await, in one step.

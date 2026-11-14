@@ -30,7 +30,7 @@ import { GITHUB_BINDING, GITHUB_READ_BINDING, GITHUB_READ_DEFAULT_BINDING, githu
 import { CLIENT_BINDING_PREFIX, type HeldInjection, injectionsOutsideGrant, injectionWireName, wireBinding } from "../lib/client-secrets";
 import { compileEgress, type EgressRule, egressWithin } from "../lib/client-egress";
 import { githubEnvConflict, githubEnvRefusal, isGithubEnvName, slotEnv } from "../lib/sandbox-env";
-import { basicAtPair, freshInjectedAny, guardsWithoutAt, injectedAnyConflict, usesAt } from "../lib/injected-any";
+import { basicAtPair, freshInjectedAny, guardsWithoutAt, hasBasicBinding, injectedAnyConflict, usesAt } from "../lib/injected-any";
 import { CLIENT_GUARD_PREFIX, type ClientGuard, distinctGuards, type HeldGuard, layerOverLimit, outsideOperatorRouting, sandboxGuardsOverLimit, wireGuard } from "../lib/client-guards";
 import type { MintedInjection, SecretsChangedAnswer } from "./broker";
 import { cellIdleTtlMs, dormant, endMayDestroy, EXPIRY_GAP_MS, expiryStep } from "../lib/lifetimes";
@@ -626,7 +626,11 @@ export class SandboxDO extends DurableObject<Env> {
     await this.deadlines.set("place", now + lease.PLACING_STALE_MS, true);
     let answer: lease.PlaceAnswer;
     let failure: unknown = null;
+    let placedWithFlag = false;
     try {
+      const placing = this.effectivePolicy(Date.now(), true);
+      // FleetDO places a Basic binding or `at` only on a host with `guard_basic_user`: placed so, its host has it.
+      placedWithFlag = hasBasicBinding(placing.inject) || usesAt(placing.guards ?? []);
       const host = await this.fleet(before.cell).place({
         sandbox: before.sandbox,
         workstream: wireWorkstream(before),
@@ -634,7 +638,7 @@ export class SandboxDO extends DurableObject<Env> {
         image: before.image,
         resources: before.resources,
         // As built: FleetDO places a Basic binding or `at` only on a host with `guard_basic_user`.
-        policy: this.effectivePolicy(Date.now(), true),
+        policy: placing,
         ...(from ? { from } : {}),
         ...(excludeHost ? { excludeHost } : {}),
       });
@@ -648,6 +652,7 @@ export class SandboxDO extends DurableObject<Env> {
     const [r, after] = this.decide((i) => placedStep(i, lease.placeAnswered(i, epoch, answer, from !== undefined), "placed"));
     const owed = r === "placed" ? this.owePlaced() : undefined;
     if (r === "placed") this.recordEpoch(epoch, after.host!);
+    if (r === "placed" && placedWithFlag) this.put(HOST_BASIC_USER, { host: after.host!, ok: true });
     await owed;
     switch (r) {
       case "stale":
@@ -902,6 +907,8 @@ export class SandboxDO extends DurableObject<Env> {
     }
     if (r === "reissue") {
       if (!reissued) {
+        // Its host's answer first, as at every push (`forHost`).
+        await this.readHostBasicUser().catch((e) => console.warn(`sandbox ${info.sandbox}: its host's guard_basic_user wasn't read`, e));
         await this.fleet(info.cell).issueCommands(host, [this.createBody(info)]);
         if (cmd !== undefined) this.put("create_failure", { cmd, r, reissued: true, done: false } satisfies CreateFailure);
       }
@@ -1257,13 +1264,14 @@ export class SandboxDO extends DurableObject<Env> {
   }
 
   /**
-   * The guards as its host gets them: on a host FleetDO said lacks `guard_basic_user`, a policy with a Basic
-   * binding beside a guard using `at` gets them without `at`, failing closed (`guardsWithoutAt`). Every write
+   * The guards as its host gets them: unless FleetDO said its host has `guard_basic_user` (lacking, or not known:
+   * unplaced, unread, no row), a policy with a Basic binding beside a guard using `at` gets them without `at`,
+   * failing closed (`guardsWithoutAt`). Every write
    * that would bring the pair there is refused first (`requireBasicUser`); a detach can't be, and is the case
    * this keeps closed (repos going away can turn GitHub's guards' `at` on). `raw`: as built, for the judgment.
    */
   private forHost<G extends RequestGuard>(inject: readonly InjectionBinding[], guards: G[], raw: boolean): G[] {
-    if (raw || this.hostBasicUser() !== false || !basicAtPair({ inject, guards })) return guards;
+    if (raw || this.hostBasicUser() === true || !basicAtPair({ inject, guards })) return guards;
     return guardsWithoutAt(guards);
   }
 
@@ -1279,7 +1287,10 @@ export class SandboxDO extends DurableObject<Env> {
     const info = this.info_();
     if (!info.host) return null;
     const ok = await this.fleet(info.cell).hostBasicUser(info.host);
-    if (ok !== null && this.tryInfo()?.host === info.host) this.put(HOST_BASIC_USER, { host: info.host, ok });
+    if (this.tryInfo()?.host !== info.host) return ok;
+    // No row for it: not known, so closed.
+    if (ok === null) this.del(HOST_BASIC_USER);
+    else this.put(HOST_BASIC_USER, { host: info.host, ok });
     return ok;
   }
 

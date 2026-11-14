@@ -381,6 +381,48 @@ describe("a Basic binding and at, never together on a host that can't decide the
     expect((await admin(base(c.cell), { method: "PUT", body: { allow: [], guards: [FLOOR] } })).status).toBe(409);
   });
 
+  it("its host's flag not known (FleetDO unreadable at the push), the pair is pushed without at even to a host with it: closed", async () => {
+    const c = await newClient();
+    const current = await connectHost(c.cell);
+    const sbx = (await as(c.token, "/v1/sandboxes", { body: { cell: c.cell } })).body.sandbox as string;
+    await nextCommands(current.ws, (x) => x.type === "sandbox_create");
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(sbx));
+    const floor: RequestGuard = { name: "floor", hosts: ["api.example.com"], scope: [{ path: "/up/**" }], allow: [{ injected: "*", at: "authorization" }] };
+    await runInDurableObject(stub, (_o, st) => {
+      const l = JSON.parse((st.storage.sql.exec("SELECT value FROM kv WHERE key = 'ws_layer'").toArray()[0]?.value as string | undefined) ?? "{}");
+      const pat = { name: "pat", hosts: ["api.example.com"], placeholder: "nest-ph-pat", locations: [{ type: "authorization_basic_password" }] };
+      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('ws_layer', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ ...l, inject: [pat], guards: [floor] }));
+      st.storage.sql.exec("DELETE FROM kv WHERE key = 'host_basic_user'");
+    });
+    const { FleetDO } = await import("../src/do/fleet");
+    const proto = FleetDO.prototype as unknown as { hostBasicUser: (h: string) => Promise<boolean | null> };
+    const orig = proto.hostBasicUser;
+    proto.hostBasicUser = async () => { throw new Error("FleetDO unreachable"); };
+    try {
+      const bearer = { name: "gh", secret: "gh-push", hosts: ["api.example.com"], locations: [{ type: "authorization_bearer" }] };
+      expect((await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [bearer] } })).status).toBe(200);
+    } finally {
+      proto.hostBasicUser = orig;
+    }
+    const cmds = await nextCommands(current.ws, (x) => x.type === "policy_update" && x.policy.inject.some((b: { name: string }) => b.name === "client:gh"));
+    const update = cmds.findLast((x) => x.type === "policy_update");
+    expect(update.policy.guards.find((g: RequestGuard) => g.name === "floor").allow ?? []).toEqual([]);
+    // Read again (FleetDO back): its host has the flag, so the next push keeps at.
+    expect((await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [] } })).status).toBe(200);
+    const again = (await nextCommands(current.ws, (x) => x.type === "policy_update" && !x.policy.inject.some((b: { name: string }) => b.name === "client:gh"))).findLast((x) => x.type === "policy_update");
+    expect(again.policy.guards.find((g: RequestGuard) => g.name === "floor").allow).toEqual([{ injected: "*", at: "authorization" }]);
+  });
+
+  it("an operator's Basic username with a ':' or a control character is refused", async () => {
+    const c = await newClient();
+    const current = await connectHost(c.cell);
+    const sbx = (await as(c.token, "/v1/sandboxes", { body: { cell: c.cell } })).body.sandbox as string;
+    await nextCommands(current.ws, (x) => x.type === "sandbox_create");
+    const put = (username: string) => admin(`/v1/sandboxes/${sbx}/policy`, { method: "PUT", body: { inject: [{ name: "pat", hosts: ["api.example.com"], placeholder: "nest-ph-pat", locations: [{ type: "authorization_basic_password", username }] }] } });
+    for (const bad of ["a:b", "a\nb", "", "x".repeat(257)]) expect((await put(bad)).status, JSON.stringify(bad)).toBe(400);
+    expect((await put("x-access-token")).status).toBe(200);
+  });
+
   it("where the pair is there anyway (a detach, a release's guards), its host gets the guards without at: closed", async () => {
     const { c, old, sbx, stub } = await onOldHost();
     // `at` arrives by no write the gate sees (as a detach turns GitHub's at on where repos go away).
