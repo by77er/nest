@@ -243,7 +243,13 @@ export class FakeNest {
       return nestErr(409, "conflict", "a request with this Idempotency-Key is still being handled", true);
     }
     if (had) {
-      return new Response(had.body, { status: had.status, headers: { "content-type": "application/json", "idempotent-replayed": "true" } });
+      // As nest replays a create: the object as it is now (its info), so a sandbox destroyed since says so.
+      let body = had.body;
+      if (route === "POST /v1/sandboxes") {
+        const was = JSON.parse(had.body) as { sandbox: string };
+        if (this.sandboxes.get(was.sandbox)?.ended) body = JSON.stringify({ ...was, state: "destroyed" });
+      }
+      return new Response(body, { status: had.status, headers: { "content-type": "application/json", "idempotent-replayed": "true" } });
     }
     // The grant's maximum, as ClientDO.admit words its refusal (control-plane/src/do/client.ts).
     const kind = route === "POST /v1/agents" ? "agents" : "sandboxes";

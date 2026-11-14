@@ -4972,6 +4972,7 @@ export class ProjectDO extends DurableObject<Env> {
     const onNestRepos = (a: string) => this.sql.exec("SELECT 1 FROM layers WHERE agent = ? AND github = 1", a).toArray().length === 0;
     if (!agent || !onNestRepos(agent)) {
       this.sql.exec("UPDATE settings SET converge_next_ms = NULL");
+      this.sql.exec("DELETE FROM errors WHERE code = 'converge_failed'");
       return;
     }
     const later = () => this.sql.exec("UPDATE settings SET converge_next_ms = ?", Date.now() + CONVERGE_RECHECK_MS);
@@ -4982,41 +4983,79 @@ export class ProjectDO extends DurableObject<Env> {
       const now = this.settingsRow();
       return !!now && now.manager === agent && now.manager_starts === base && now.manager_next_ms === null;
     };
+    // nest's state: between turns, or nothing is prepared (a manager busy for days would otherwise get a successor's
+    // sandbox, agentless, every time its key's lease ran out). Read again, last, before the move.
+    const between = async (): Promise<boolean> => {
+      try {
+        const view = await nest.getAgent(agent);
+        return !view.ended && BETWEEN_TURNS.has(String(view.state ?? ""));
+      } catch {
+        // Gone (its end moves the lifecycle on its own) or unread.
+        return false;
+      }
+    };
+    if (!(await between()) || !same()) return void later();
     // Make before break: the successor's start (the next one, `startManager`'s, after this move) is frozen and its
     // sandbox made now, under the keys that start uses, so it goes on with them (its creates answer the same
     // sandbox by Idempotency-Key). Anything that would hold the successor back (the grant lacking the GitHub hosts,
     // `sandboxSpec`'s GrantWait; the token's write; nest refusing the sandbox while a host can't apply its guards)
-    // keeps the old one running instead. A sandbox
-    // made for a move that then doesn't happen is the next try's (the same keys while nothing else moves the
-    // lifecycle; after a move of one, its start's), else nest's idle TTL ends it.
+    // keeps the old one running instead, shown among the project's errors (`converge_failed`). A sandbox made for a
+    // move that then doesn't happen is the next try's (the same keys while nothing else moves the lifecycle; after a
+    // move of one, its start's), else nest's idle TTL ends it. Keys that can't serve a successor any more (nest
+    // refusing its frozen spec for good, or replaying a sandbox since destroyed: an idle TTL shorter than the key's
+    // 24 h) are left for fresh ones (`freshManagerKeys`), so the next try freezes again.
     const n = base + 2;
     const key = `${r.id as string}/manager/${n}`;
     try {
       const frozen = await this.frozenEgress(nest, key, "manager");
       const spec = await this.sandboxSpec(nest, "manager", key);
       if (!same() || !spec.github) return void later();
-      await nest.createSandbox({ labels: { project: r.id as string, role: "manager", start: String(n) }, ...managerExtras(frozen, spec) }, `${key}/sandbox`);
+      const made = await nest.createSandbox({ labels: { project: r.id as string, role: "manager", start: String(n) }, ...managerExtras(frozen, spec) }, `${key}/sandbox`);
+      if (made.state === "destroyed") {
+        this.freshManagerKeys(base);
+        this.convergeFailed(agent, `the sandbox made for its successor earlier (${made.sandbox}) was destroyed since: a new one is made at the next try`);
+        return void later();
+      }
     } catch (e) {
-      console.warn(`project ${r.id as string}: the manager's successor on the app's GitHub access can't start yet; the manager stays`, message(e));
+      if (e instanceof NestError && e.permanent) this.freshManagerKeys(base);
+      this.convergeFailed(agent, message(e));
       return void later();
     }
     if (!same()) return void later();
-    let view: AgentView;
-    try {
-      view = await nest.getAgent(agent);
-    } catch {
-      // Gone (its end moves the lifecycle on its own) or unread.
-      return void later();
-    }
+    const idle = await between();
     // Everything again after the read, in the step that moves: nothing of the owner's arrived meanwhile.
-    if (!same() || !onNestRepos(agent) || view.ended || !BETWEEN_TURNS.has(String(view.state ?? "")) || !this.chatQuiet()) return void later();
+    if (!same() || !onNestRepos(agent) || !idle || !this.chatQuiet()) return void later();
     this.managerMove({ kind: "converge", agent });
     this.sql.exec("UPDATE settings SET converge_next_ms = NULL");
+    this.sql.exec("DELETE FROM errors WHERE code = 'converge_failed'");
     // Stopped at once, not later in the drain: a turn that starts between nest's read and this stop is cut (an
     // accepted risk, README.md#converging-onto-the-apps-own-access), so that window is kept as short as it can be.
     await this.stop(nest, agent);
     // Its successor's start, in this drain: due from now, after this pass's clock.
     this.again = true;
+  }
+
+  /**
+   * The manager's start keys after `base` are spent for a successor (refused for good, or replaying a destroyed
+   * sandbox): its start number moves on one, so the next convergence (and any start a move owes) freezes and makes
+   * its own under new keys. Only while nothing moved meanwhile and no start is owed (none uses the keys then).
+   */
+  private freshManagerKeys(base: number): void {
+    this.sql.exec("UPDATE settings SET manager_starts = manager_starts + 1 WHERE manager_starts = ? AND manager_next_ms IS NULL", base);
+  }
+
+  /**
+   * A manager on nest's repos that can't move onto the app's access yet, among the project's errors (one row, its
+   * latest reason), so it's seen: it holds the operator's narrowing of the grant back. Gone once it moves.
+   */
+  private convergeFailed(agent: string, why: string): void {
+    console.warn(`project ${this.settings()!.id}: the manager's successor on the app's GitHub access can't start yet; the manager stays`, why);
+    this.sql.exec(
+      `INSERT INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, ?, 'manager', NULL, 'converge_failed', ?)
+        ON CONFLICT (event_id) DO UPDATE SET at_ms = excluded.at_ms, message = excluded.message`,
+      `converge/${agent}`, Date.now(), agent,
+      `The manager runs on nest's own GitHub access and can't move to the app's yet (${why.slice(0, 500)}). It keeps running; tried again every ${CONVERGE_RECHECK_MS / 60_000} minutes. Until it moves, the operator can't drop the grant's GitHub fields.`,
+    );
   }
 
   /** No message of the owner's waits for the manager, and none, nor a turn of the manager's, in the last CONVERGE_QUIET_MS. */

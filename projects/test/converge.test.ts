@@ -145,6 +145,8 @@ describe("a manager on nest's repos", () => {
       expect(s.manager, state).toBe(p.manager);
       expect(s.converge_next_ms, state).toBeGreaterThan(Date.now());
       expect(stops(p.manager), state).toEqual([]);
+      // Nothing prepared for a successor while it's busy: no sandbox but its own.
+      expect(live({ project: p.id, role: "manager" }), state).toHaveLength(1);
     }
     fake.agents.get(p.manager)!.state = "idle";
     await due(p);
@@ -215,6 +217,10 @@ describe("a manager on nest's repos", () => {
       expect(stops(p.manager)).toEqual([]);
       expect(fake.sandboxes.get(fake.agents.get(p.manager)!.sandbox!)!.ended).toBe(false);
       expect(live({ project: p.id, role: "manager" })).toHaveLength(1);
+      // Shown among the project's errors, with nest's reason; the same keys kept (not refused for good).
+      const errors = (await api(token, "GET", `/api/projects/${p.id}/errors`)).body as { code: string; message: string }[];
+      expect(errors.filter((e) => e.code === "converge_failed").map((e) => e.message)).toEqual([expect.stringMatching(/every sandbox host of cell/)]);
+      expect((await settingsOf(p)).manager_starts).toBe(s.manager_starts);
     } finally {
       fake.hostsBehind = 0;
     }
@@ -228,6 +234,61 @@ describe("a manager on nest's repos", () => {
     expect(new Set(mine.map((c) => c.idempotencyKey)).size).toBe(1);
     expect(fake.calls.indexOf(mine[0]!)).toBeLessThan(fake.calls.indexOf(stops(p.manager)[0]!));
     expect(live({ project: p.id, role: "manager" }).map((x) => x.sandbox)).toEqual([fake.agents.get(next)!.sandbox]);
+  });
+
+  it("a successor's sandbox made earlier and destroyed since (its idle TTL shorter than its key's): no move, shown; the next try makes one under fresh keys", async () => {
+    const p = await newProject();
+    await onNestRepos(p);
+    // The first try makes the successor's sandbox, then finds the manager in a turn: no move.
+    let release!: () => void;
+    const hold = { match: /^POST \/v1\/sandboxes$/, release: new Promise<void>((r) => (release = r)), reached: false };
+    fake.holds.push(hold);
+    const draining = drain(p);
+    for (let i = 0; i < 400 && !hold.reached; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(hold.reached).toBe(true);
+    fake.agents.get(p.manager)!.state = "working";
+    release();
+    await draining;
+    const before = await settingsOf(p);
+    expect(before.manager).toBe(p.manager);
+    const made = live({ project: p.id, role: "manager", start: String((before.manager_starts as number) + 2) });
+    expect(made).toHaveLength(1);
+    // Destroyed since, as nest's idle TTL would: its key replays it so.
+    made[0]!.ended = true;
+    fake.agents.get(p.manager)!.state = "idle";
+    await due(p);
+    await drain(p);
+    const s = await settingsOf(p);
+    expect(s.manager).toBe(p.manager);
+    expect(stops(p.manager)).toEqual([]);
+    expect(s.manager_starts).toBe((before.manager_starts as number) + 1);
+    const errors = (await api(token, "GET", `/api/projects/${p.id}/errors`)).body as { code: string; message: string }[];
+    expect(errors.filter((e) => e.code === "converge_failed").map((e) => e.message)).toEqual([expect.stringMatching(/was destroyed since/)]);
+    // The next try: fresh keys, a new sandbox, and the move; the error goes.
+    await due(p);
+    await drain(p);
+    await replaced(p);
+    const next = (await settingsOf(p)).manager as string;
+    expect(fake.sandboxes.get(fake.agents.get(next)!.sandbox!)!.ended).toBe(false);
+    expect(fake.agents.get(next)!.labels.start).toBe(String((before.manager_starts as number) + 3));
+    expect(((await api(token, "GET", `/api/projects/${p.id}/errors`)).body as { code: string }[]).filter((e) => e.code === "converge_failed")).toEqual([]);
+  });
+
+  it("a successor's sandbox nest refuses for good: shown, and frozen again under fresh keys at the next try", async () => {
+    const p = await newProject();
+    await onNestRepos(p);
+    const before = await settingsOf(p);
+    fake.fail(/^POST \/v1\/sandboxes$/, 400, { times: 1 });
+    await drain(p);
+    const s = await settingsOf(p);
+    expect(s.manager).toBe(p.manager);
+    expect(stops(p.manager)).toEqual([]);
+    expect(s.manager_starts).toBe((before.manager_starts as number) + 1);
+    expect(((await api(token, "GET", `/api/projects/${p.id}/errors`)).body as { code: string }[]).filter((e) => e.code === "converge_failed")).toHaveLength(1);
+    await due(p);
+    await drain(p);
+    await replaced(p);
+    expect(fake.agents.get((await settingsOf(p)).manager as string)!.labels.start).toBe(String((before.manager_starts as number) + 3));
   });
 
   it("the old one is stopped right after nest's state is read, before anything else the drain owes nest", async () => {
@@ -387,6 +448,16 @@ describe("a manager on nest's repos", () => {
     });
     expect((await api(token, "PUT", `/api/projects/${p.id}/network`, { worker: [], manager: [{ host: "nodejs.org" }] })).status).toBe(200);
     expect(await github()).toBe(0);
+  });
+
+  it("a manager's layer made anew while its brief is still owed takes its access from the start being briefed", async () => {
+    // Its brief can't be delivered for now: made, its start not done (`manager_starts` not moved on to it yet).
+    fake.fail(/^POST \/v1\/agents\/[^/]+\/inbox$/, 503, { retryable: true, times: 1000 });
+    const p = await newProject();
+    expect((await settingsOf(p)).manager_next_ms).not.toBeNull();
+    await sql(p, (x) => x.exec("DELETE FROM layers WHERE agent = ?", p.manager));
+    expect((await api(token, "PUT", `/api/projects/${p.id}/network`, { worker: [], manager: [{ host: "pypi.org" }] })).status).toBe(200);
+    expect(await sql(p, (x) => x.exec("SELECT github FROM layers WHERE agent = ?", p.manager).one().github)).toBe(1);
   });
 
   it("the migration owes the look to a project with a manager, from the release before it", async () => {

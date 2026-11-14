@@ -174,8 +174,8 @@ export class Nest {
     }
   }
 
-  /** Create a sandbox in the app's cell. The same `idempotencyKey` with the same request answers the same sandbox. */
-  createSandbox(r: { labels: Labels; idle_ttl_ms?: number } & SandboxExtras, idempotencyKey: string): Promise<{ sandbox: string }> {
+  /** Create a sandbox in the app's cell. The same `idempotencyKey` with the same request answers the same sandbox, as it is now (a replay: `state` `destroyed` once it's gone). */
+  createSandbox(r: { labels: Labels; idle_ttl_ms?: number } & SandboxExtras, idempotencyKey: string): Promise<{ sandbox: string; state?: string }> {
     return this.call("POST", "/v1/sandboxes", { ...r, cell: this.config.cell }, { idempotencyKey });
   }
 
