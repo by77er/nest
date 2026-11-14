@@ -114,12 +114,15 @@ describe("/hooks/github", () => {
   });
 
   it("acknowledges and ignores a repo no project is attached to, ping and other events", async () => {
+    // Whether the app acts for an event's account is read once per isolate (GET /app): an earlier test may
+    // have read it already or not, so it's read here first.
+    expect((await deliverGithub("pull_request", prEvent({ repo: `nobody/${rand()}`, number: 1, sha: sha(), action: "opened" }))).status).toBe(200);
     const before = gh.calls.length;
     const agents = fake.agents.size;
     expect(await (await deliverGithub("pull_request", prEvent({ repo: `nobody/${rand()}`, number: 1, sha: sha(), action: "opened" }))).json()).toEqual({ ignored: "no project for this repo" });
     expect((await deliverGithub("ping", { zen: "Keep it logically awesome.", hook_id: 1 })).status).toBe(200);
     expect((await deliverGithub("issues", { action: "opened", repository: { full_name: "o/r" } })).status).toBe(200);
-    expect(gh.calls.length).toBe(before);
+    expect(gh.callsBesideUpkeep(before)).toEqual([]);
     expect(fake.agents.size).toBe(agents);
   });
 });

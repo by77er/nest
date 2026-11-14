@@ -643,7 +643,7 @@ describe("DirectoryDO not answering", () => {
     const before = gh.calls.length;
     await directoryDown(() => rv.drain());
     expect(fake.calls.some((c) => c.path === "/v1/agents/agt_review_owed/stop")).toBe(true);
-    expect(gh.calls.length).toBe(before);
+    expect(gh.callsBesideUpkeep(before)).toEqual([]);
     // Tried again shortly, not at once (no spinning on a DirectoryDO that doesn't answer).
     const alarm = await runInDurableObject(rv, (_o, st) => st.storage.getAlarm());
     expect(alarm).toBeGreaterThan(Date.now() + 1_000);

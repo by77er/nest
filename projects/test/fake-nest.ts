@@ -1088,6 +1088,15 @@ export class FakeGitHub {
     }));
   }
 
+  /**
+   * The calls since `before` besides sandbox-token upkeep: earlier tests' projects refresh (a mint by repo
+   * id) and revoke their sandboxes' tokens on their own alarms, whenever those fire.
+   */
+  callsBesideUpkeep(before: number) {
+    return this.calls.slice(before).filter((c) =>
+      !(c.method === "DELETE" && c.path === "/installation/token") && !(c.method === "POST" && /\/access_tokens$/.test(c.path) && c.body?.repository_ids !== undefined));
+  }
+
   async handle(req: Request): Promise<Response> {
     const u = new URL(req.url);
     const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
