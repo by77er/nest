@@ -7,10 +7,12 @@ Cloudflare Access in front of the projects app (projects/README.md): the `projec
 not part of nest, so neither is this stack: it imports nothing from nest's `deploy/`. The provider
 reads its token from `CLOUDFLARE_API_TOKEN` (Account › Access: Apps and Policies › Edit).
 
-Three self-hosted applications, each with one inline policy, described as data (`apps`) and then
+Three self-hosted applications and their inline policies, described as data (`apps`) and then
 rendered, so `Projects.Test` can prove things about the data for every spec and check the rendering:
-- the app, `<hostname>`: Allow for the owner's login, a 24 h session, in the App Launcher. The
-  Worker checks the token against this application's audience (`projects_aud`, its `PROJECTS_AUD`);
+- the app, `<hostname>`: Allow for the owner's login, a 24 h session, in the App Launcher; and Service
+  Auth for one service token, the one nest's cloud checks use (dev/cloud-checks/, the owner's
+  decision of 2026-11-15), so a check can wake a project. The Worker checks either token against
+  this application's audience (`projects_aud`, its `PROJECTS_AUD`);
 - `<hostname>/hooks` and `<hostname>/mcp`: Bypass for everyone. The Worker authenticates those paths
   itself, webhooks by their signatures and MCP calls by nest's `Nest-Identity` JWT, and asks for no
   Access token there (`projects/src/worker.ts`).
@@ -41,41 +43,55 @@ structure ProjectsSpec where
   name : String
   /-- The one login the app's Allow policy admits. -/
   ownerEmail : String
+  /-- The id (not a secret) of the one service token the app's Service Auth policy admits: nest's
+  cloud checks'. -/
+  checksServiceTokenId : String
 
 def hostname (spec : ProjectsSpec) : String := s!"{spec.name}.{spec.zone}"
 
-/-- What a policy matches: one login, or everyone. -/
+/-- What a policy matches: one login, one service token, or everyone. -/
 inductive Who where
   | email (address : String)
+  | serviceToken (id : String)
   | everyone
   deriving DecidableEq, Repr
 
 inductive Decision where
   | allow
+  /-- Service Auth: a service token, no login. -/
+  | serviceAuth
   | bypass
   deriving DecidableEq, Repr
 
 def Decision.wire : Decision → String
   | .allow => "allow"
+  | .serviceAuth => "non_identity"
   | .bypass => "bypass"
 
-/-- A self-hosted application and its one inline policy. -/
-structure App where
-  domain : String
+/-- An inline policy: its decision and what it includes. -/
+structure Rule where
   decision : Decision
   admits : List Who
+  deriving DecidableEq, Repr
+
+/-- A self-hosted application and its inline policies, in precedence order. -/
+structure App where
+  domain : String
+  rules : List Rule
   launcherVisible : Bool
   sessionDuration : Option String
   deriving Repr
 
-/-- The app: the owner's login, nobody else. -/
+/-- The app: the owner's login, and nest's cloud checks by their service token; nobody else. -/
 def app (spec : ProjectsSpec) : App :=
-  { domain := hostname spec, decision := .allow, admits := [.email spec.ownerEmail]
+  { domain := hostname spec
+    rules := [{ decision := .allow, admits := [.email spec.ownerEmail] },
+              { decision := .serviceAuth, admits := [.serviceToken spec.checksServiceTokenId] }]
     launcherVisible := true, sessionDuration := some "24h" }
 
 /-- A path the Worker authenticates itself: Access lets everyone through. -/
 def bypass (spec : ProjectsSpec) (path : String) : App :=
-  { domain := hostname spec ++ path, decision := .bypass, admits := [.everyone]
+  { domain := hostname spec ++ path, rules := [{ decision := .bypass, admits := [.everyone] }]
     launcherVisible := false, sessionDuration := none }
 
 def hooks (spec : ProjectsSpec) : App := bypass spec "/hooks"
@@ -86,14 +102,16 @@ def apps (spec : ProjectsSpec) : List App := [app spec, hooks spec, mcp spec]
 
 def Who.args : Who → ZeroTrustAccessApplication.PoliciesExcludeArgs
   | .email address => { email := some { email := lit address } }
+  | .serviceToken id => { serviceToken := some { tokenId := lit id } }
   | .everyone => { everyone := some {} }
 
 def App.args (spec : ProjectsSpec) (a : App) : ZeroTrustAccessApplication.Args :=
   { accountId := some (lit spec.accountId), name := some (lit a.domain), type := some "self_hosted"
     domain := some (lit a.domain)
     sessionDuration := a.sessionDuration.map lit, appLauncherVisible := some (lit a.launcherVisible)
-    policies := some [{ name := some (lit a.decision.wire), decision := some (lit a.decision.wire), precedence := some 1
-                        include_ := some (a.admits.map Who.args) }] }
+    policies := some (a.rules.zipIdx.map fun (r, i) =>
+      { name := some (lit r.decision.wire), decision := some (lit r.decision.wire), precedence := some (lit (Lean.JsonNumber.fromNat (i + 1)))
+        include_ := some (r.admits.map Who.args) }) }
 
 def projects (spec : ProjectsSpec) : Infra Unit := do
   let _ ← Provider.configure {}
