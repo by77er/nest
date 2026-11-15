@@ -341,7 +341,7 @@ pub enum InjectionLocation {
     /// `Authorization: Basic base64(user:<placeholder>)`; git's credential helper uses this. With
     /// `username`, nest-proxy writes that username with the secret, whatever the request's was, and only
     /// then has it written the field whole (a guard's `at`): a username the sandbox chose can be a
-    /// credential of its own, which some services take (they read a token given as the Basic username).
+    /// credential of its own, which some services take (docs/sandbox/networking/egress/policy/).
     /// Absent: the request's username is kept, and the field is never whole. A proxy of the previous
     /// release ignores `username` (fleet hello `guard_basic_user` says this one doesn't).
     AuthorizationBasicPassword {
