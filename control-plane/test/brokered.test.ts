@@ -215,6 +215,9 @@ describe("the brokered pipeline", () => {
     expect(p.stub.requests).toEqual([]);
     const put = (name: string, body: unknown, status: number) => adminJson(`/v1/admin/capabilities/${name}`, { method: "PUT", body }, status);
     expect((await put("http", { mcp: { url: "https://mcp.example.com/mcp", auth: "cap:x" } }, 400)).error.message).toContain("http_request");
+    // A removed action's tool stays reserved while stored grants of it may exist (a rollback runs them again).
+    expect((await put("github", { mcp: { url: "https://mcp.example.com/mcp", auth: "cap:x" } }, 400)).error.message).toContain("github_comment");
+    expect((await put("email", { mcp: { url: "https://mcp.example.com/mcp", auth: "cap:x" } }, 400)).error.message).toContain("email_send");
   });
 
   it("a call whose brain stopped being current before it left never reaches the profile", async () => {

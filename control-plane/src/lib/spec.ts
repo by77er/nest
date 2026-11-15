@@ -7,7 +7,7 @@ import { z } from "zod";
 import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protocol/control";
 import { capabilityNameClash, checkMcpUrl, grantOf, type McpGrant, McpSource } from "./mcp";
 import { ClientInjections, type HeldInjection, holdInjections, narrowInjections } from "./client-secrets";
-import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, type BrokeredGrant, checkBrokered, grantOfEntry, StoredBrokeredSource } from "./brokered";
+import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, REMOVED_TOOL_NAMES, type BrokeredGrant, checkBrokered, grantOfEntry, StoredBrokeredSource } from "./brokered";
 import { canonicalRepos, narrowRepos, readOnlyRepos, Repos } from "./repos";
 import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
 import { GithubPush } from "./rules/github";
@@ -48,7 +48,7 @@ export const Capability = z.object({
 export type Capability = z.output<typeof Capability>;
 /**
  * A capability as CatalogDO reads it back: as written, except that `brokered` entries naming a removed
- * action (written before it went) are dropped rather than failing the whole row (docs/agents/capabilities/brokered/#removed-actions).
+ * action (written before it went) are dropped rather than failing the whole row (docs/agents/capabilities/brokered/#actions).
  */
 export const StoredCapability = Capability.extend({ brokered: StoredBrokeredSource.optional() });
 
@@ -581,8 +581,8 @@ export function checkCapability(
     if (!mcp) return err("an mcp capability is checked with its name");
     const url = checkMcpUrl(cap.mcp.url, mcp.allowLoopback);
     if (!url.ok) return err(`mcp.url: ${url.error}`);
-    // Brokered actions' tools (`http_request`) are platform tools too.
-    const clash = capabilityNameClash(mcp.name, [...registry, ...BROKERED_TOOL_NAMES]);
+    // Brokered actions' tools (`http_request`) are platform tools too, and the removed ones' stay reserved.
+    const clash = capabilityNameClash(mcp.name, [...registry, ...BROKERED_TOOL_NAMES, ...REMOVED_TOOL_NAMES]);
     if (clash) return err(clash);
     const tools = cap.mcp.tools ?? [];
     if (new Set(tools).size !== tools.length) return err("mcp.tools lists a tool twice");

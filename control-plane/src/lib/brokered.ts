@@ -55,6 +55,11 @@ export const actionOfTool = (tool: string): BrokeredAction | undefined => BROKER
 export const REMOVED_ACTIONS: readonly string[] = [
   "github.comment", "github.create_issue", "github.create_pr", "github.review_comment", "github.fork", "email.send",
 ];
+/**
+ * The removed actions' model-facing tools: still no mcp capability may make one while a stored grant of the
+ * action may exist (a rollback routes the name to the action again, and rules written for it would match).
+ */
+export const REMOVED_TOOL_NAMES: readonly string[] = REMOVED_ACTIONS.map((a) => a.replace(".", "_"));
 const removedEntry = (e: unknown): boolean =>
   typeof e === "object" && e !== null && REMOVED_ACTIONS.includes(String((e as { action?: unknown }).action));
 

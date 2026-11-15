@@ -60,6 +60,8 @@ TEMPLATE_NAME = "brokered-check"
 PROFILE_SECRET = "http:brokered-check"
 SCAN_SECRET = "http:brokered-check-scan"
 ALLOW, APPROVE = "check-allow", "check-approve"
+# How nest's sink gate opens the question it holds a check-approve call with (the arguments follow it).
+HELD = f"Approve http.request on {APPROVE} from a tainted session?"
 TOOL_A, TOOL_B = f"extra_{RUN}_a", f"extra_{RUN}_b"
 # The capability mcp_check.py defines (kept the same, so either check may overwrite it): an untrusted
 # server, whose tool list taints the session from the brain's start.
@@ -155,7 +157,7 @@ def journal_checks(rows, fake):
 def approval_checks(asks, rows):
     """The approvals: asked for check-approve only, before its call went out (both server times)."""
     out = []
-    held = [e for e in asks if f"http.request on {APPROVE}" in (e.get("question") or "")]
+    held = [e for e in asks if (e.get("question") or "").startswith(HELD)]
     others = [e for e in asks if e not in held]
     out.append((f"an approval was asked for {APPROVE}", len(held) >= 1, short([e.get("question", "")[:120] for e in asks])))
     out.append((f"no approval was asked for anything else ({ALLOW} is allow)", not others, short([e.get("question", "")[:120] for e in others])))
@@ -267,7 +269,7 @@ def main():
                 if ask in answered:
                     continue
                 q = e.get("question") or ""
-                verdict = "approve" if f"http.request on {APPROVE}" in q else f"deny: this check approves only {APPROVE}"
+                verdict = "approve" if q.startswith(HELD) else f"deny: this check approves only {APPROVE}"
                 s, _ = api("POST", f"/v1/agents/{agent}/asks/{ask}/answer", {"answer": verdict})
                 if s == 200:
                     answered[ask] = {"verdict": verdict, "question": q, "created_ms": e.get("created_ms")}
