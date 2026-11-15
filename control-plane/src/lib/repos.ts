@@ -1,12 +1,12 @@
-// Repo allowlists (docs/sandbox/networking/egress/policy/#repo-allowlists): the repos a sandbox may push to
-// and an agent's brokered actions may reach, and those it may only read, as exact `owner/name` names.
+// Repo allowlists (docs/sandbox/networking/egress/policy/#repo-allowlists): the repos a sandbox may push to,
+// and those it may only read, as exact `owner/name` names.
 // Generic: a set of names that only narrows. What a name means on a forge (the guards, the tokens) is
 // that forge's constructor's (lib/rules/github.ts). Pure.
 import { z } from "zod";
 
 /**
  * `owner/name`, exact, compared without case (GitHub's names are case-insensitive). No `*`: a wildcard
- * would cover repos created later, including forks an agent made, and can't narrow a token. No name
+ * would cover repos created later, and can't narrow a token. No name
  * ending in `.git`, which a git URL adds (`owner/name.git` means `owner/name`).
  */
 export const Repo = z.string().regex(/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/, "a repo is owner/name")

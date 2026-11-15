@@ -8,7 +8,7 @@
 
 **How the built parts read the grant** (each a choice the design left open):
 - **`credentials`** covers every BrokerDO secret a spec names: the model credential, an mcp capability's `auth` (and its OAuth client record), exactly. The model credential is checked again at each brain start against the grant as it is then, and a client's agent runs only on that credential: if it isn't stored (or has expired) the start is refused, never moved to the operator's default token ([BrokerDO](../../durable-objects/broker/), 2026-11-06). So a client can't point the operator's secret for one server at a server of its own. A capability with [no bearer](../../../agents/capabilities/mcp/#no-bearer) names no secret, so it needs none here (2026-11-02).
-- **Brokered actions:** none is within a grant. An http profile names a URL and a credential no field covers, and a GitHub action a repo no field covers.
+- **Brokered actions:** none is within a grant. An http profile names a URL and a credential no field covers.
 - **A client's overrides only narrow,** as an agent's spawn does (`SpawnerOverrides`): a different launch, rules or credential is a template in its namespace. A sandbox's policy layer, a brain's host, an agent's rules and share links stay the operator's: a client's route that carries one refuses it (`policy` in `POST /v1/sandboxes`, `host` in `…/start`: 403), and their own routes (`PUT /v1/sandboxes/<id>/policy`, `PUT|DELETE /v1/agents/<id>/rules`, `…/ports`) take only the admin token (401).
 - **Writes into a namespace are held to its client's grant, whoever writes them,** the operator included.
 - **An mcp capability's tools are named `<client>-<entry>_<tool>`** (tool names hold no `/`). A spec where two capabilities would give the same names is refused.

@@ -65,7 +65,7 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 3. **Build the minimum platform slice.** Each step is a PR through the gates above, with me as reviewer until step 4:
    1. Grants. Taint, spawn specs, templates and capabilities are built; grants (attenuated down the chain) only for `read_transcript`.
    2. Coordination as an app on the [API clients](../docs/control-plane/api/clients/) interface: the [projects](../projects/README.md) task board (a manager, a worker per task, a reviewer per PR, auto-merge) is built. `wake_at` isn't.
-   3. BrokerDO's GitHub App minting and the `github.*` brokered actions. Built.
+   3. BrokerDO's GitHub App minting for sandboxes' pushes. Built; it moves to the projects app (phase C of taking GitHub out of the kernel).
    4. A dev sandbox image with git, `gh`, Rust, Node, Python and nftables, and a warm build cache. `nest-base` adds git, `gh`, Python and build-essential to Firecracker's CI rootfs (`images/guest/build.sh`), and no Rust, Node or nftables.
    5. Metrics emitters, the `metrics` capability, and the rest of `deploy.yml` (the health window).
 4. **Hand over:** spawn the maintainer and the monitor. From then on, agents build the rest (such as versioned host rollout), and I review only `CODEOWNERS` paths.

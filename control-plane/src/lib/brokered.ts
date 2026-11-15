@@ -302,7 +302,7 @@ export type JournalEvent = (typeof JOURNAL_EVENTS)[number];
  * - `done` and `refused` are final. `unknown` may still become `done` or `failed`, and `failed` may still
  *   become `done`: another delivery of the same call learned that it took effect (two deliveries can both
  *   reach the provider; the one it refused as a duplicate must not hide the one it accepted).
- * - A call can settle with no attempt recorded (found already made, by an action that looks first).
+ * - A call can settle with no attempt recorded (another delivery of it settled it first).
  */
 export function journalStep(status: JournalStatus | "none", event: JournalEvent): JournalStatus | "refuse" {
   const settled = event === "done" ? "done" : event === "fail" ? "failed" : event === "unknown" ? "unknown" : null;
@@ -371,7 +371,7 @@ export class BrokeredJournal {
   }
 
   /**
-   * What the call came to (a row for it if it never went out: found already made).
+   * What the call came to (a row for it if it never went out).
    * False when the row keeps what it has: a settled call keeps its outcome (`journalStep`).
    */
   settle(e: JournalRow, status: "done" | "failed" | "unknown", outcome: ToolOutcome, detail: string): boolean {

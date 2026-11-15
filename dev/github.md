@@ -26,8 +26,8 @@ One App, owned by me and installed only on `by77er/nest`.
 | Binding | Used by | Permissions |
 |---|---|---|
 | `github:dev` | Workers, injected in their sandboxes | contents, pull requests, workflows: write; checks, actions, issues: read |
-| `github:review` | Reviewers, through brokered actions | checks, pull requests: write; contents: read |
-| `github:ops` | The maintainer and the monitor, through brokered actions and `github_ro` | issues, pull requests, actions: write; contents, checks, deployments: read |
+| `github:review` | Reviewers, through the app's own GitHub writes (`gh_write`, [repo maintenance](../docs/orchestration/repo-maintenance/)) | checks, pull requests: write; contents: read |
+| `github:ops` | The maintainer and the monitor, through the app's own GitHub writes and `github_ro` | issues, pull requests, actions: write; contents, checks, deployments: read |
 
 ## Repo settings
 
