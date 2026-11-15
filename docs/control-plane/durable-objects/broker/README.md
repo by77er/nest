@@ -22,7 +22,7 @@ The only DO that stores secret values, apart from each API client's webhook sign
 
 The Cloudflare API token that creates and deletes per-host tunnels and DNS records is a Worker secret, like the other platform keys, not a BrokerDO secret.
 
-**Moving out (decided 2026-11-12; clients' GitHub tokens and owner lookups gone 2026-11-15):** the rest of the GitHub parts (the App and its minting, [injection minting](#injection-minting), the operator's `github_user`) leave the kernel for the projects app, which keeps its tokens as API clients' secrets ([principle 10](../../../README.md#principles)). Until then they describe what runs.
+**Moving out (decided 2026-11-12, not built):** the GitHub parts (the App and its minting, [injection minting](#injection-minting), the operator's `github_user`) leave the kernel for the projects app, which keeps its tokens as API clients' secrets ([principle 10](../../../README.md#principles)). Until then they describe what runs.
 
 ## Caller identity keys
 

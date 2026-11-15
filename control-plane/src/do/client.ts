@@ -371,9 +371,10 @@ export class ClientDO extends DurableObject<Env> {
   }
 
   private save(r: ClientRecord): void {
-    // With `repos: []`, which the previous release reads without a default (it runs again after a rollback).
+    // Without the removed fields, whoever handed the grant in (a Worker of the previous release, mid-deploy),
+    // and with `repos: []`, which the previous release reads without a default (it runs again after a rollback).
     this.sql.exec("INSERT INTO kv (key, value) VALUES ('record', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-      JSON.stringify({ ...r, grant: grantForPreviousRelease(r.grant) }));
+      JSON.stringify({ ...r, grant: grantForPreviousRelease(storedGrant(r.grant)) }));
   }
 
   private count(kind: MemberKind): number {
@@ -395,7 +396,8 @@ export class ClientDO extends DurableObject<Env> {
       if (cur.name !== req.name || cur.deleted_ms) throw new NestError(ErrorCodes.CONFLICT, `${req.client} exists`, 409);
       return this.view(cur);
     }
-    const r: ClientRecord = { client: req.client, name: req.name, grant: req.grant, token_hash: req.token_hash, created_ms: Date.now() };
+    // What the Worker sends for the previous release (`repos: []`) is dropped, as on every read.
+    const r: ClientRecord = { client: req.client, name: req.name, grant: storedGrant(req.grant), token_hash: req.token_hash, created_ms: Date.now() };
     this.save(r);
     await this.deadlines.set("prune", Date.now() + PRUNE_EVERY_MS, true);
     return this.view(r);
@@ -450,7 +452,7 @@ export class ClientDO extends DurableObject<Env> {
   /** Replace the grant. What runs keeps running; every later create, spawn and expansion is held to the new one. */
   async setGrant(grant: Grant): Promise<ClientView> {
     const r = this.live();
-    r.grant = grant;
+    r.grant = storedGrant(grant);
     this.revisioned(r);
     r.grant_rev = r.grant_rev! + 1;
     this.save(r);

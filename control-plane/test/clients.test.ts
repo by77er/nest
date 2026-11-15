@@ -136,6 +136,10 @@ describe("grants, tokens and labels (pure)", () => {
     const granting: [string, unknown][] = [
       ["repos", ["acme/app"]], ["read_repos", ["acme/*"]], ["github", { repos: ["acme/app"] }], ["github", { permissions: { checks: "read" } }],
       ["github_push", { workflows: true }],
+      // `repo_owners` is dropped only in the shape it always had.
+      ["repo_owners", null], ["repo_owners", { acme: -1 }],
+      // Nested past the removed fields' own shape: refused, never recursed into.
+      ["github", JSON.parse(`${"{\"a\":".repeat(100_000)}{}${"}".repeat(100_000)}`)],
     ];
     for (const [k, v] of granting) {
       const r = GrantInput.safeParse({ cells: ["c1"], [k]: v });
@@ -741,12 +745,31 @@ describe("the grant bounds everything in the subtree", () => {
     expect((await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true } } }, 403)).error.message).toContain("github_push.workflows");
     await createAgent(c);
     // Written back as the operator read it, with what the previous release's GET showed for no GitHub authority: taken.
-    const patched = await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { ...view.grant, repos: [], read_repos: [], repo_owners: { acme: 7 } } } });
+    // The Worker hands ClientDO the grant with `repos: []`, so a ClientDO still on the previous release (the
+    // minutes of a deploy), which stores what it is given, stores a grant it can read.
+    const proto = ClientDOClass.prototype as unknown as { setGrant: (g: unknown) => Promise<unknown> };
+    const realSetGrant = proto.setGrant;
+    const sent: unknown[] = [];
+    proto.setGrant = function (this: unknown, g: unknown) {
+      sent.push(g);
+      return realSetGrant.call(this, g);
+    };
+    let patched: any;
+    try {
+      patched = await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { ...view.grant, repos: [], read_repos: [], repo_owners: { acme: 7 } } } });
+    } finally {
+      proto.setGrant = realSetGrant;
+    }
+    expect(sent).toEqual([{ ...view.grant, repos: [] }]);
     expect(removed.filter((k) => Object.hasOwn(patched.grant, k))).toEqual([]);
     // Stored without them but `repos: []`, which the previous release reads with no default.
     expect(await recordGrant()).toEqual({ ...view.grant, repos: [] });
+    // A Worker of the previous release (mid-deploy) hands ClientDO a grant with them: stored and answered without them.
+    const fromOld = await stub.setGrant({ ...view.grant, ...github } as never);
+    expect(removed.filter((k) => Object.hasOwn(fromOld.grant, k))).toEqual([]);
+    expect(await recordGrant()).toEqual({ ...view.grant, repos: [] });
     // A write that would grant any of them is refused, naming it, and stores nothing.
-    for (const [k, v] of Object.entries(github).filter(([k]) => k !== "repo_owners")) {
+    for (const [k, v] of [...Object.entries(github).filter(([k]) => k !== "repo_owners"), ["repo_owners", "acme"], ["repo_owners", { acme: "7" }]] as [string, unknown][]) {
       const e = await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { ...view.grant, max_agents: 1, [k]: v } } }, 400);
       expect(e.error.message, k).toContain(`${k} is no longer a grant field`);
     }

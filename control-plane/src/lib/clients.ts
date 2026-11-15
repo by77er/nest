@@ -135,8 +135,12 @@ export function capabilityOutsideGrant(name: string, cap: Capability, grant: Gra
 export const REMOVED_GRANT_FIELDS = ["repos", "read_repos", "github", "github_push", "repo_owners"] as const;
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-/** A value that grants nothing: `false`, an empty list, or an object of such values (`{}`, `{workflows: false}`). */
-const grantsNothing = (v: unknown): boolean => v === false || (Array.isArray(v) && v.length === 0) || (isPlainObject(v) && Object.values(v).every(grantsNothing));
+/**
+ * A value that grants nothing: `false`, an empty list, or an object of such values (`{}`, `{workflows: false}`),
+ * nested at most `depth` deep (the removed fields were two deep; anything deeper is refused, never recursed into).
+ */
+const grantsNothing = (v: unknown, depth = 3): boolean => v === false || (Array.isArray(v) && v.length === 0)
+  || (depth > 0 && isPlainObject(v) && Object.values(v).every((x) => grantsNothing(x, depth - 1)));
 
 /** A stored grant as this release reads it: the removed fields dropped, whatever they held. */
 export function storedGrant(raw: unknown): Grant {
@@ -154,17 +158,20 @@ export const grantForPreviousRelease = (g: Grant): Grant & { repos: never[] } =>
 /**
  * A grant as the operator writes it (`POST /v1/admin/clients`, `PATCH /v1/admin/clients/<id>`): `Grant`,
  * where a removed field that grants nothing is accepted and dropped (`repos: []` and `read_repos: []`,
- * which every grant the previous release showed held; `repo_owners`, which nest always ignored on a
- * write), so a grant read back from before is written again as it was. One that grants anything is
+ * which every grant the previous release showed held; `repo_owners` of the shape it always had, which
+ * nest always ignored on a write), so a grant read back from before is written again as it was. One that grants anything is
  * refused (400): it asks for authority nest no longer holds, and dropping it silently would leave the
  * operator thinking it was granted.
  */
+/** `repo_owners` as the previous release took it (and ignored): login → account id. */
+const REPO_OWNERS_SHAPE = z.record(z.string(), z.number().int().positive());
+
 export const GrantInput = z.preprocess((raw, ctx) => {
   if (!isPlainObject(raw)) return raw;
   const g = { ...raw };
   for (const k of REMOVED_GRANT_FIELDS) {
     if (!Object.hasOwn(g, k)) continue;
-    if (k !== "repo_owners" && !grantsNothing(g[k])) {
+    if (k === "repo_owners" ? !REPO_OWNERS_SHAPE.safeParse(g[k]).success : !grantsNothing(g[k])) {
       ctx.addIssue({ code: "custom", path: [k], message: `${k} is no longer a grant field: nest holds no GitHub authority for a client (its app holds its own); leave it out` });
     }
     delete g[k];

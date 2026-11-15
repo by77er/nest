@@ -12,7 +12,7 @@ import { EnrollRequest, LaunchConfig, ToolRule } from "./protocol/control";
 import { Capability, CatalogName, EntryName, OperatorOverrides, type SpawnerOverrides, Template } from "./lib/spec";
 import { cellIdleTtlMs, MIN_IDLE_TTL_MS, OPERATOR_ENDER } from "./lib/lifetimes";
 import {
-  CLIENT_ID, ClientName, GrantInput, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
+  CLIENT_ID, ClientName, grantForPreviousRelease, GrantInput, grantRefusal, isAgentId, Labels, newClientToken, parseClientToken,
   parseLabelFilters, tokenHash,
 } from "./lib/clients";
 import type { ClientScope } from "./do/catalog";
@@ -1102,7 +1102,8 @@ export const ROUTES: Route[] = [
     method: "POST", path: "/v1/admin/clients", auth: "admin", status: 201, body: z.strictObject({ name: ClientName, grant: GrantInput }),
     run: async ({ env, body: r }) => {
       for (const cell of r.grant.cells) checkCell(env, cell);
-      const grant = r.grant;
+      // With `repos: []`: a ClientDO still on the previous release (the minutes of a deploy) stores it as given and reads it with no default.
+      const grant = grantForPreviousRelease(r.grant);
       const id = newId("cli_");
       const token = newClientToken(id);
       // The name first, reserved (409 when taken), then the record, then the name confirmed live: only
@@ -1148,7 +1149,7 @@ export const ROUTES: Route[] = [
     method: "PATCH", path: "/v1/admin/clients/:client", auth: "admin", body: z.strictObject({ grant: GrantInput }),
     run: async ({ env, p, body: r }) => {
       for (const cell of r.grant.cells) checkCell(env, cell);
-      const view = await clientDO(env, p.client).setGrant(r.grant);
+      const view = await clientDO(env, p.client).setGrant(grantForPreviousRelease(r.grant));
       // Its live sandboxes apply the new `egress_hosts` at once (a narrowed one takes rules away).
       const failed = await fanOutGrant(env, p.client);
       if (failed) throw new NestError(ErrorCodes.INTERNAL, `the grant is saved, but ${failed} of its sandboxes didn't take it yet: PATCH again`, 503, true);
