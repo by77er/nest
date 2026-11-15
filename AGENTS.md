@@ -20,7 +20,7 @@ A Cloudflare control plane holds the state.
 - Where an agent loop runs and where its sandbox runs are unrelated and opaque to each other. A runner reaches a sandbox only through the seam: the SandboxDO control API and the gateway's hands data plane, by hostname and binding, never by sharing a host with it.
 - Nothing app-specific is in the platform, including roles, boards and workstreams. Structures like captains are templates and conventions built from primitives and grants (`docs/orchestration/`).
 
-`scripts/fences.toml` turns these into checks; never widen it without the owner.
+`scripts/fences.toml` turns these into checks, and `scripts/boundaries.toml` holds which modules and crates may import which; never widen either without the owner.
 
 ## Repo
 

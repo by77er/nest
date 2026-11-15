@@ -9,7 +9,7 @@ description: Use before claiming that a nest change works, is safe, or is verifi
    - Rust: `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test -p <crate>`;
    - control plane: `cd control-plane && npm run typecheck && npm test`;
    - an app (`dashboard/`, `projects/`): `npm ci && npm run typecheck && npm test && npm run build` in it; for a UI change also `scripts/ui-review/` (its README);
-   - repo guards: `python3 -I scripts/check-doc-links.py`, `python3 -I scripts/check-fences.py`, and `python3 -m unittest discover -s scripts/tests`;
+   - repo guards: `python3 -I scripts/check-doc-links.py`, `python3 -I scripts/check-fences.py`, `python3 -I scripts/check-boundaries.py`, and `python3 -m unittest discover -s scripts/tests`;
    - the subsystem's own checks (model checks, Kani, mutants, fuzz replay, `inframe test`, the bootstrap test): `nest-control-plane`, `nest-host`, `nest-wire`, `nest-infra`, `nest-verification`.
 
    Read each command's exit code, not its counts: a vitest run can report every test passed and still exit 1.

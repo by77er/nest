@@ -2,7 +2,7 @@
 // servers agents call (authenticated by Nest-Identity), and the webhooks of nest and of the GitHub App
 // (each authenticated by its signature). It reaches nest only through the client interface (src/nest.ts),
 // and GitHub with its own App's tokens (src/github.ts, src/github-app.ts); it imports nothing from the control plane
-// (test/deps.test.ts).
+// (scripts/boundaries.toml).
 
 import { verifyAccessJwt } from "./access";
 import { handleApi } from "./api";

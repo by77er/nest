@@ -74,7 +74,7 @@ name; `NEST_CONTROL_PLANE`, `NEST_CELLS`, `ACCESS_TEAM_DOMAIN` and `DASHBOARD_AU
 
 `src/api.ts` re-exports the admin view contract (`protocol/admin/view.ts`, a module with no
 imports, which the control plane is typed by too) as types only, so the build carries no code from
-outside `dashboard/`; `test/api.test.ts` holds that nothing imports the control plane and every
+outside `dashboard/`; `scripts/boundaries.toml` holds that nothing imports the control plane and every
 import from `protocol/` is type-only.
 `fixtures/admin.ts` holds responses recorded from the control plane's test pool and must satisfy
 those types (`npm run typecheck`): re-record it when `fleetView`, `images` or `lifetimes` change. Its `agent`,

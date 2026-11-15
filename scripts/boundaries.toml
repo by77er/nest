@@ -1,0 +1,233 @@
+# Module boundaries: which code may import which, checked by scripts/check-boundaries.py (its
+# docstring has the semantics) with tests in scripts/tests/ proving each rule can fail. The fences
+# (fences.toml) say which text may appear where; these say which modules and crates may depend on
+# which. Like the fences, loosening a rule or adding an `allow` entry is invisible to the check
+# itself, so this file needs the owner's review (CODEOWNERS covers scripts/).
+#
+# Targets are repo paths, or `pkg:<name>` for a package (`pkg:cloudflare:*` is the Workers runtime).
+
+# Files whose dynamic imports name a computed path, which no rule could check.
+[dynamic_imports]
+allow = [
+  { file = "scripts/ui-review/review.mjs", why = "loads the app config named on its command line (scripts/ui-review/apps/)" },
+]
+
+# --- The apps are separate systems on nest's public interface (docs/README.md, principle 9) -------
+
+[[imports]]
+name = "projects-imports-only-itself"
+why = "The projects app is a separate system on nest's public interface: nothing in it imports the control plane, the hosts or another app, only its own modules and its own packages (projects/README.md)."
+from = ["projects/**"]
+only = ["projects/**", "pkg:**"]
+allow = [
+  { from = "projects/test/**", to = "protocol/fixtures/**", why = "the wire fixtures are nest's published contract: the app's tests check the policies it builds against them" },
+  { from = "projects/test/github-access.test.ts", to = "control-plane/src/{do/sandbox,lib/injected-any}.ts", why = "read as text (a raw glob) so the app's matcher for nest's 'hosts not ready' refusals (from releases before the hosts_not_ready code) covers both sentences nest sends" },
+]
+example = { from = "projects/src/worker.ts", to = "control-plane/src/lib/spec.ts" }
+
+[[imports]]
+name = "dashboard-imports-only-itself-and-the-admin-view"
+why = "The dashboard is an independent Worker over the admin API: besides its own modules and packages it imports only the admin view contract, protocol/admin/view.ts (docs/control-plane/dashboard/)."
+from = ["dashboard/**"]
+only = ["dashboard/**", "protocol/admin/view.ts", "pkg:**"]
+allow = [
+  { from = "dashboard/test/ui/status.test.ts", to = "control-plane/src/lib/brain.ts", why = "read as text (?raw) to sweep a brain's phases, so the page's colors cover every one" },
+  { from = "dashboard/test/ui/status.test.ts", to = "control-plane/src/protocol/model.ts", why = "read as text (?raw) to sweep the agent states' zod enums" },
+  { from = "dashboard/test/ui/theme.test.ts", to = ".claude/skills/nest-ui-design/SKILL.md", why = "read as text (?raw): the theme's source of truth" },
+]
+example = { from = "dashboard/src/worker.ts", to = "control-plane/src/do/fleet.ts" }
+
+[[imports]]
+name = "dashboard-takes-only-types-from-protocol"
+why = "The dashboard's build carries no outside code: what it takes from protocol/ is erased at build time (`import type` / `export type`)."
+from = ["dashboard/src/**"]
+deny = ["protocol/**"]
+types_ok = true
+example = { from = "dashboard/src/api.ts", to = "protocol/admin/view.ts" }
+
+[[imports]]
+name = "dashboard-is-typed-by-the-admin-view"
+why = "The dashboard reads the admin views through the shared contract, so a field it reads but the view lacks fails its typecheck; src/api.ts takes its types from protocol/admin/view.ts rather than restating them."
+from = ["dashboard/src/api.ts"]
+requires = ["protocol/admin/view.ts"]
+
+[[imports]]
+name = "mcp-test-imports-only-itself"
+why = "The MCP test server stands in for an outside MCP server, so it shares no code with nest."
+from = ["mcp-test/**"]
+only = ["mcp-test/**", "pkg:**"]
+example = { from = "mcp-test/src/index.ts", to = "control-plane/src/lib/mcp.ts" }
+
+[[imports]]
+name = "admin-view-imports-nothing"
+why = "The admin view contract imports nothing, so the dashboard can type itself by it without pulling in any other code (docs/data/#closed-sets)."
+from = ["protocol/admin/view.ts"]
+only = []
+example = { from = "protocol/admin/view.ts", to = "pkg:zod" }
+
+# --- Inside an app: what ships to the browser never holds worker code, and the reverse -------------
+
+[[imports]]
+name = "projects-browser-code-holds-no-worker-code"
+why = "The projects UI is bundled for the browser: what it imports at run time, directly or through a shared module, stays in the UI and the pure modules it shares with the Worker (listed here), never a Durable Object, a route, nest's or GitHub's client, or a Workers or Node runtime module. Types are erased, so `import type` is fine; sharing another module is a change to this list."
+from = ["projects/src/ui/**", "projects/src/main.tsx"]
+exclude = ["**/*.test.ts", "**/*.test.tsx", "projects/src/ui/test/**"]
+only = [
+  "projects/src/ui/**",
+  "projects/src/main.tsx",
+  # The pure modules the UI shares with the Worker: state machines, validation and presets.
+  "projects/src/automerge.ts",
+  "projects/src/issues.ts",
+  "projects/src/memory.ts",
+  "projects/src/models.ts",
+  "projects/src/network.ts",
+  "projects/src/prs.ts",
+  "projects/src/requests.ts",
+  "projects/src/routines.ts",
+  "projects/src/secrets.ts",
+  "projects/src/tasks.ts",
+  "projects/src/waits.ts",
+  "pkg:**",
+]
+deny = ["pkg:cloudflare:*", "pkg:node:*"]
+types_ok = true
+transitive = true
+example = { from = "projects/src/tasks.ts", to = "projects/src/nest.ts" }
+
+[[imports]]
+name = "projects-worker-code-holds-no-browser-code"
+why = "The projects Worker and its Durable Objects never import the UI: browser code in the Worker bundle is dead weight at best, and the UI may then grow a dependency on server state."
+from = ["projects/src/**"]
+exclude = ["projects/src/ui/**", "projects/src/main.tsx"]
+deny = ["projects/src/ui/**", "projects/src/main.tsx"]
+example = { from = "projects/src/worker.ts", to = "projects/src/ui/App.tsx" }
+
+[[imports]]
+name = "dashboard-browser-code-holds-no-worker-code"
+why = "The dashboard UI is bundled for the browser: what it imports at run time, directly or through a shared module, stays in the UI and the modules it shares with the Worker (the response types and their normalizers in src/api.ts and src/agents.ts), never the Worker entry, its Access check, its lifetimes collector or a Workers or Node runtime module."
+from = ["dashboard/src/ui/**", "dashboard/src/main.tsx"]
+exclude = ["**/*.test.ts", "**/*.test.tsx"]
+only = ["dashboard/src/ui/**", "dashboard/src/main.tsx", "dashboard/src/api.ts", "dashboard/src/agents.ts", "protocol/admin/view.ts", "pkg:**"]
+deny = ["pkg:cloudflare:*", "pkg:node:*"]
+types_ok = true
+transitive = true
+example = { from = "dashboard/src/agents.ts", to = "dashboard/src/lifetimes.ts" }
+
+[[imports]]
+name = "dashboard-worker-code-holds-no-browser-code"
+why = "The dashboard Worker never imports the UI."
+from = ["dashboard/src/**"]
+exclude = ["dashboard/src/ui/**", "dashboard/src/main.tsx"]
+deny = ["dashboard/src/ui/**", "dashboard/src/main.tsx"]
+example = { from = "dashboard/src/worker.ts", to = "dashboard/src/ui/App.tsx" }
+
+# --- The control plane's layers: protocol < lib < do < index.ts -----------------------------------
+
+[[imports]]
+name = "kernel-imports-no-app"
+why = "The kernel knows nothing of what is built on it: the control plane imports only itself, the wire contracts in protocol/ and its packages, never an app, the e2e harness or repo tooling (AGENTS.md, nest is a microkernel)."
+from = ["control-plane/**"]
+only = ["control-plane/**", "protocol/**", "pkg:**"]
+allow = [
+  { from = "control-plane/test/routes.test.ts", to = "docs/control-plane/api/clients/README.md", why = "read as text (?raw) to check the documented client routes against the router" },
+  { from = "control-plane/test/repos.test.ts", to = "images/guest/{git-credential-nest,build.sh}", why = "read as text (a raw glob): the guest's git credential helper against the kernel's placeholders; both go in phase C4 of the plan taking GitHub out of the kernel" },
+]
+example = { from = "control-plane/src/index.ts", to = "projects/src/nest.ts" }
+
+[[imports]]
+name = "wire-schemas-import-only-the-wire"
+why = "control-plane/src/protocol/ is the control plane's half of the wire contracts: it imports only itself, protocol/ and zod, so a contract never depends on how the control plane happens to work."
+from = ["control-plane/src/protocol/**"]
+only = ["control-plane/src/protocol/**", "protocol/**", "pkg:zod"]
+example = { from = "control-plane/src/protocol/model.ts", to = "control-plane/src/lib/util.ts" }
+
+[[imports]]
+name = "lib-is-below-the-durable-objects"
+why = "control-plane/src/lib/ holds the logic the Durable Objects compose; it never imports a Durable Object, so it can be tested and reused without one."
+from = ["control-plane/src/lib/**"]
+deny = ["control-plane/src/do/**"]
+example = { from = "control-plane/src/lib/placement.ts", to = "control-plane/src/do/fleet.ts" }
+
+[[imports]]
+name = "nothing-imports-the-worker-entry"
+why = "control-plane/src/index.ts is the Worker's entry and router; nothing in the control plane imports it, so routing stays at the top and no module can reach a route handler."
+from = ["control-plane/src/**"]
+exclude = ["control-plane/src/index.ts"]
+deny = ["control-plane/src/index.ts"]
+example = { from = "control-plane/src/do/agent.ts", to = "control-plane/src/index.ts" }
+
+[[imports]]
+name = "pure-decisions-stay-pure"
+why = "The control plane's decisions are pure functions (docs/verification/), tested by tables and seeded random walks: what they import at run time, directly or not, stays among the decision modules, the small helpers in util.ts and stored.ts, the wire types and zod, never a Durable Object, the env, or a client of AWS, Cloudflare, GitHub or an MCP server. (An import rule can't see globals such as Date.now(); the modules take the time as an argument where it matters.)"
+from = [
+  "control-plane/src/lib/sandbox-lease.ts",
+  "control-plane/src/lib/host-lifecycle.ts",
+  "control-plane/src/lib/brain.ts",
+  "control-plane/src/lib/turns.ts",
+  "control-plane/src/lib/slots.ts",
+  "control-plane/src/lib/retention.ts",
+]
+only = [
+  "control-plane/src/lib/sandbox-lease.ts",
+  "control-plane/src/lib/host-lifecycle.ts",
+  "control-plane/src/lib/brain.ts",
+  "control-plane/src/lib/turns.ts",
+  "control-plane/src/lib/slots.ts",
+  "control-plane/src/lib/retention.ts",
+  "control-plane/src/lib/util.ts",
+  "control-plane/src/lib/stored.ts",
+  "control-plane/src/protocol/**",
+  "protocol/**",
+  "pkg:zod",
+]
+types_ok = true
+transitive = true
+example = { from = "control-plane/src/lib/slots.ts", to = "control-plane/src/lib/aws.ts" }
+
+# --- The Rust crates: the two systems, the seam and the guest (docs/architecture/) ----------------
+
+[[crates]]
+name = "leaf-crates-depend-on-no-crate"
+why = "nest-protocol holds the wire types every side shares and nestd-core the pure cores; neither depends on another workspace crate, so the contracts and the verified cores carry no one side's code."
+from = ["nest-protocol", "nestd-core"]
+only = []
+example = { from = "nest-protocol", to = "nestd-core" }
+
+[[crates]]
+name = "sandbox-binaries-link-only-the-protocol"
+why = "nest-guest runs inside the VM, and nest-cli's `nest` binary runs there too (for programs in the sandbox) as well as beside Claude Code: their builds link only the wire types, so no host, proxy or agent code ships into a sandbox."
+from = ["nest-guest", "nest-cli"]
+kinds = ["normal", "build"]
+only = ["nest-protocol"]
+example = { from = "nest-guest", to = "nestd-core" }
+
+[[crates]]
+name = "seam-crates-link-only-the-protocol"
+why = "The gateway and the hands client are the two ends of the seam between the systems: their builds link only the wire types, never code from either side."
+from = ["nest-gateway", "nest-hands-client"]
+kinds = ["normal", "build"]
+only = ["nest-protocol"]
+example = { from = "nest-hands-client", to = "nest-runner" }
+
+[[crates]]
+name = "agent-system-links-no-sandbox-host-code"
+why = "Where an agent loop runs and where its sandbox runs are opaque to each other (AGENTS.md): the runner and its hands client reach a sandbox only through the seam, so they never depend on nestd, its cores, the proxy or the guest."
+from = ["nest-runner", "nest-hands-client", "nest-cli"]
+deny = ["nestd", "nestd-core", "nest-proxy", "nest-guest"]
+example = { from = "nest-runner", to = "nestd" }
+
+[[crates]]
+name = "runner-carries-no-gateway"
+why = "The runner must not carry the gateway's code or its verification key: nest-gateway is only an optional dependency behind `test-support`, which no default feature enables (crates/nest-runner/Cargo.toml)."
+from = ["nest-runner"]
+kinds = ["normal", "build"]
+deny = ["nest-gateway"]
+optional_ok = true
+example = { from = "nest-runner", to = "nest-gateway" }
+
+[[crates]]
+name = "sandbox-system-links-no-agent-code"
+why = "The sandbox system runs machines and knows nothing of the agent loops that use them: nestd, its cores, the proxy, the guest and the gateway never depend on the runner, the hands client or the CLI."
+from = ["nestd", "nestd-core", "nest-proxy", "nest-guest", "nest-gateway"]
+deny = ["nest-runner", "nest-hands-client", "nest-cli"]
+example = { from = "nestd", to = "nest-runner" }

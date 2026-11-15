@@ -13,8 +13,15 @@ What makes this repo safe for agents to change and to review. The checks are the
   - metrics writes;
   - nestd-core's purity (no I/O, clock, randomness or runtime dependency in the cores);
   - Durable Object schemas expand-only (no rename or drop).
-- **Fence lists only shrink:** an allow entry whose files no longer match is stale and fails.
-- **Every guard can fail.** Each fence carries an example line, which `scripts/tests/` plants outside the allowed files and expects to be rejected. The doc-link, core-manifest and workflow checkers get the same treatment. A guard that only ever passes can't be told apart from one that never looks.
+- **Module boundaries** (`scripts/boundaries.toml`, checked by `scripts/check-boundaries.py`) say which code may import which, over the TypeScript import graph and the Cargo workspace's crate graph:
+  - each app (`projects/`, `dashboard/`, `mcp-test/`) imports only itself and its packages (the dashboard also the admin view contract, as types), and the control plane imports no app;
+  - an app's browser code reaches only its UI and the pure modules it shares with its Worker (listed), even through a shared module, and its Worker never imports its UI;
+  - the control plane's layers: `src/protocol/` imports only the wire, `lib/` never imports a Durable Object, nothing imports `index.ts`, and the pure decision modules reach only modules that do no I/O;
+  - the crates: `nest-protocol` and `nestd-core` depend on no crate; the guest, the CLI, the gateway and the hands client link only `nest-protocol`; the agent system and the sandbox system depend on neither's code, directly or through another crate; the runner carries the gateway only behind `test-support`;
+  - every package an import names is declared in the nearest `package.json`, from a registry, so nothing resolves through a hoisted or neighbouring `node_modules` or a local path;
+  - a dynamic import names a literal, so it can be checked, except in the listed files.
+- **Fence and boundary lists only shrink:** an allow entry that no longer excuses anything is stale and fails.
+- **Every guard can fail.** Each fence carries an example line, which `scripts/tests/` plants outside the allowed files and expects to be rejected; each boundary carries an example edge, which they add to the real graph. The doc-link, core-manifest and workflow checkers get the same treatment. A guard that only ever passes can't be told apart from one that never looks.
 - **Loosening a guard is invisible to the guard,** so `scripts/` is in `CODEOWNERS`.
 
 ## Tests
