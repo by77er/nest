@@ -75,11 +75,12 @@ DEV_PROXY_LOST = "Error: Network connection lost."
 DEV_PROXY_RESENDS = 2
 
 
-def api(method, path, body=None, raw=False, timeout=30):
+def api(method, path, body=None, raw=False, timeout=30, token=ADMIN):
+    """A request with the operator's token, or an API client's (`token`)."""
     data = None if body is None else json.dumps(body).encode()
     for attempt in range(DEV_PROXY_RESENDS + 1):
         req = urllib.request.Request(BASE + path, data=data, method=method,
-                                     headers={"authorization": f"Bearer {ADMIN}", "content-type": "application/json"})
+                                     headers={"authorization": f"Bearer {token}", "content-type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 text = r.read().decode()
@@ -1253,12 +1254,13 @@ def run_brokered(ids):
 
 
 # ---------------------------------------------------------------------------------- push guards
-# A sandbox may push only where its request guards let it (docs/sandbox/networking/egress/policy/#request-guards):
-# here an operator guard, written as data, that refuses git's receive-pack and its discovery on github.com except
-# for one repo, and nest-proxy refuses a push anywhere else before anything reaches GitHub, whatever credential it
-# carries. nest builds no GitHub guard of its own (#no-repo-tokens): an app writes its own as client guards
-# (the plan's phase C6 moves this check onto one). No real push: the refused ones never leave the proxy, and the
-# allowed one is only git's discovery request, which GitHub answers itself (401 without a credential).
+# A sandbox may push only where its request guards let it (docs/sandbox/networking/egress/policy/#request-guards).
+# nest builds no GitHub guard of its own (#no-repo-tokens): an app writes its own as client guards, as the
+# projects app does. Here an API client puts one in its sandbox's client layer (`PUT …/client-policy`,
+# docs/control-plane/api/clients/#the-client-layer) that refuses git's receive-pack and its discovery on
+# github.com except for one repo, and nest-proxy refuses a push anywhere else before anything reaches GitHub,
+# whatever credential it carries. No real push: the refused ones never leave the proxy, and the allowed one is
+# only git's discovery request, which GitHub answers itself (401 without a credential).
 E2E_ATTACKER_REPO = "nest-e2e-not-allowed/x"
 E2E_PUSH_GUARD = {
     "name": "push-allowlist", "hosts": ["github.com"], "ignore_case": True,
@@ -1266,17 +1268,71 @@ E2E_PUSH_GUARD = {
     "allow": [{"path": "/by77er/nest/**"}, {"path": "/by77er/nest.git/**"}],
     "reason": "git pushes reach only by77er/nest",
 }
+E2E_PUSH_WIRE = f"client:{E2E_PUSH_GUARD['name']}"  # the guard's name on the wire and in the audit
+E2E_APP = "e2e-app"
+
+
+def push_client():
+    """An API client with its own sandbox and an agent on it, as an app makes them: (token, sandbox, agent)."""
+    st, c = api("POST", "/v1/admin/clients", {"name": E2E_APP, "grant": {
+        "cells": ["local"], "credentials": ["claude_oauth_token"], "max_agents": 1, "max_sandboxes": 1}})
+    if not check("push guard: an API client created", st == 201 and (c or {}).get("token"), json.dumps(c)[:200]):
+        return None
+    tok = c["token"]
+    st, r = api("PUT", f"/v1/catalog/templates/{E2E_APP}/pusher", {
+        "capabilities": ["nest", "hands"], "hands": "required", "credential": "claude_oauth_token",
+        "launch": {"builtin_tools": [], "system_prompt": {"mode": "append", "text": ""}}}, token=tok)
+    if not check("push guard: the client writes its template", st == 200, json.dumps(r)[:200]):
+        return None
+    st, sbx = api("POST", "/v1/sandboxes", {"cell": "local"}, token=tok)
+    if not check("push guard: the client creates its sandbox", st == 201 and (sbx or {}).get("sandbox"), json.dumps(sbx)[:200]):
+        return None
+    sid = sbx["sandbox"]
+    try:
+        wait_for(lambda: (api("GET", f"/v1/sandboxes/{sid}", token=tok)[1] or {}).get("host"), 60, 0.5, "the client's sandbox placed")
+    except TimeoutError as e:
+        check("push guard: the client's sandbox is placed", False, str(e)[:200])
+        return None
+    st, ag = api("POST", "/v1/agents", {"template": f"{E2E_APP}/pusher", "sandbox": sid}, token=tok)
+    if not check("push guard: the client spawns an agent on it", st == 201 and (ag or {}).get("agent"), json.dumps(ag)[:200]):
+        return None
+    return tok, sid, ag["agent"]
+
 
 def run_repos(ids):
     if REAL:
         skip("push guards", "fake mode only: the calls are scripted")
         return
-    agid, sbx = ids["agent"], ids["sandbox"]
+    before = live_sandboxes()
+    made = push_client()
+    if not made:
+        return
+    tok, sbx, agid = made
+    try:
+        push_guard_checks(tok, sbx, agid)
+    finally:
+        # The client ends its agent and destroys its sandbox, so the checks after this one count sandboxes as before.
+        st, r = api("POST", f"/v1/agents/{agid}/stop", {"end": True, "destroy_sandbox": True}, token=tok)
+        check("push guard: the client ends its agent and destroys its sandbox", st in (200, 202), json.dumps(r)[:200])
+        try:
+            wait_for(lambda: (api("GET", f"/v1/sandboxes/{sbx}", token=tok)[1] or {}).get("state") == "destroyed"
+                     and live_sandboxes() == before or None, 90, 0.5, "the client's sandbox destroyed")
+            check("push guard: the client's sandbox is gone", True)
+        except TimeoutError as e:
+            check("push guard: the client's sandbox is gone", False, str(e)[:200])
+
+
+def push_guard_checks(tok, sbx, agid):
     ca = os.path.join(WORK, "root-ca.pem")
-    st, p = api("PUT", f"/v1/sandboxes/{sbx}/policy", {**E2E_POLICY, "guards": [*E2E_POLICY.get("guards", []), E2E_PUSH_GUARD]})
+    st, r = api("PUT", f"/v1/sandboxes/{sbx}/client-policy", {"guards": [E2E_PUSH_GUARD]}, token=tok)
+    check("push guard: the client writes its guard into the sandbox's client layer", st == 200, json.dumps(r)[:200])
+    st, layer = api("GET", f"/v1/sandboxes/{sbx}/client-policy", token=tok)
+    check("push guard: the client layer reads it back as written", st == 200 and (layer or {}).get("guards") == [E2E_PUSH_GUARD],
+          json.dumps(layer)[:300])
+    st, p = api("GET", f"/v1/sandboxes/{sbx}/policy", token=tok)
     names = [g.get("name") for g in (p or {}).get("guards", [])] if st == 200 else []
-    check("push guard: the operator's guard is the sandbox's, and nest adds no GitHub guard of its own",
-          "push-allowlist" in names and not any(n.startswith("github-") for n in names), f"{st} {names}")
+    check("push guard: the sandbox's policy has it as a client guard, and nest adds no GitHub guard of its own",
+          E2E_PUSH_WIRE in names and not any(n.startswith("github-") for n in names), f"{st} {names}")
     # The policy reaches nest-proxy a moment after the API answers: each request tries for up to 10 s.
     def until_guarded(url, method="GET"):
         return {"command": f"for i in $(seq 10); do out=$(curl -s -m 15 --cacert {ca} -X {method} '{url}' -w '\nhttp=%{{http_code}}'); "
@@ -1292,18 +1348,18 @@ def run_repos(ids):
         ("git", "Bash", {"command": git}),
     ])
     for label in ("receive", "discovery"):
-        check(f"push guard: nest-proxy refuses a {label} request for a repo the guard doesn't allow (403, push-allowlist)",
-              "http=403" in text(label) and '"guard":"push-allowlist"' in text(label).replace(" ", ""), text(label).replace("\n", " | ")[:300])
+        check(f"push guard: nest-proxy refuses a {label} request for a repo the client's guard doesn't allow (403, {E2E_PUSH_WIRE})",
+              "http=403" in text(label) and f'"guard":"{E2E_PUSH_WIRE}"' in text(label).replace(" ", ""), text(label).replace("\n", " | ")[:300])
     code = re.search(r"http=(\d+)", text("allowed"))
-    check("push guard: the allowed repo's push discovery passes the guard and reaches GitHub",
+    check("push guard: the allowed repo's push discovery passes the client's guard and reaches GitHub",
           code and code.group(1) not in ("000", "403") and text("allowed").strip().endswith("0"), text("allowed").replace("\n", " | ")[:200])
-    check("push guard: a real `git push` to a repo the guard doesn't allow fails at the proxy",
+    check("push guard: a real `git push` to a repo the client's guard doesn't allow fails at the proxy",
           "403" in text("git") and "rc=0" not in text("git"), text("git").replace("\n", " | ")[:300])
     try:
-        wait_for(lambda: any("guard: push-allowlist" in b for b in r2_blobs()) or None, 20, 1.0, "guard refusal in the egress audit")
-        check("push guard: the refusal is in the egress audit (reason guard: push-allowlist)", True)
+        wait_for(lambda: any(f"guard: {E2E_PUSH_WIRE}" in b for b in r2_blobs()) or None, 20, 1.0, "guard refusal in the egress audit")
+        check(f"push guard: the refusal is in the egress audit (reason guard: {E2E_PUSH_WIRE})", True)
     except TimeoutError as e:
-        check("push guard: the refusal is in the egress audit (reason guard: push-allowlist)", False, str(e)[:200])
+        check(f"push guard: the refusal is in the egress audit (reason guard: {E2E_PUSH_WIRE})", False, str(e)[:200])
 
 
 # ---------------------------------------------------------------------------------- checkpoints

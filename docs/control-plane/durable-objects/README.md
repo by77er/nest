@@ -7,7 +7,7 @@ Each entity has exactly one DO, and that DO is the only writer for it.
 | [fleet/](fleet/) | Hosts of both kinds, enrollment and tunnels, leases, sandbox placement, drains, STONITH, desired versions, the binding verification key, base generations, command delivery |
 | [sandbox/](sandbox/) | Placement claims and epochs, the generation chain (pins, retention, losses), attachments and bindings (`attach`, `resolve`, `detach`), activity and holds, policy, ports |
 | [agent/](agent/) | Turn queue and inbox, scheduled wakes, brain placement and the agent epoch, hands setup through SandboxDO, session stream, state, spec, grants, taint and budget, tool relay |
-| [broker/](broker/) | Claude setup tokens, injected secrets, capability credentials, GitHub App token minting |
+| [broker/](broker/) | Claude setup tokens, injected secrets (the operator's and API clients'), capability credentials, the binding signing key |
 | [catalog/](catalog/) | Templates and capabilities (data I edit), and expanding a spawn spec against them |
 | [mcp-connector/](mcp-connector/) | One remote MCP server and credential (and API client namespace): the shared tool list, its change notices to agents, and call admission |
 | [client/](client/) | One API client: its record, grant and token hash, and the registry of its subtree (what its maximums count and it lists); plus the directory of client names |

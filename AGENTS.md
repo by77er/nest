@@ -6,7 +6,7 @@ Durable Claude Code agents with isolated hands, on my own subscription. nest is 
 
 A Cloudflare control plane holds the state.
 
-**nest is a microkernel.** The kernel keeps sandboxes, agents, the broker (credentials, injection, the GitHub App), egress policy and MCP attachment. It exposes a generic client interface: API clients and grants, labels, caller identity, webhooks, live traces. Everything else is built outside it on that interface, such as the projects app in `projects/`. If something outside seems to need a special case inside, the interface is wrong: fix it generically ([principle 9](docs/README.md#principles)).
+**nest is a microkernel.** The kernel keeps sandboxes, agents, the broker (credentials and injection), generic egress policy and MCP attachment, and knows no service it doesn't run on, GitHub included ([principle 10](docs/README.md#principles)). It exposes a generic client interface: API clients and grants, labels, caller identity, webhooks, live traces. Everything else is built outside it on that interface, such as the projects app in `projects/`. If something outside seems to need a special case inside, the interface is wrong: fix it generically ([principle 9](docs/README.md#principles)).
 
 **Status:** early implementation. Test with `cargo test --workspace`, `npm test` in `control-plane/` and each app, and `e2e/run.sh`. **Stack:** TypeScript for the control plane (Workers and Durable Objects); Rust on hosts and in guests. **Scope:** Claude Code is the only harness.
 

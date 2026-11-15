@@ -25,10 +25,9 @@
 | Monitor | A long-lived agent with memory, fed what it watches by an app (CI webhooks into its inbox) or polling with a [timer](../agents/capabilities/timers/) |
 | Repo maintenance | A maintainer spawning a worker per task and a clean-context reviewer per PR, merging through the repo's own gates |
 
-**Built:** one app, [projects](../../projects/README.md), builds a board with a manager per project, a worker per task and a reviewer per PR head that sets a required check: a variant of [repo maintenance](repo-maintenance/). The other structures are patterns; no seeded template but `captain` and `worker` exists.
+**Built:** one app, [projects](../../projects/README.md), builds a board with a manager per project, a worker per task and a reviewer per PR head that sets a required check: a variant of repo maintenance, whose plan for this repo is a use of nest and lives with developing it ([dev/repo-maintenance.md](../../dev/repo-maintenance.md)). The other structures are patterns; no seeded template but `captain` and `worker` exists.
 
 ## Components
 
 - [captains/](captains/): the `captain` template, and the conventions in its prompt
-- [repo-maintenance/](repo-maintenance/): agents that propose, review and merge changes to a repo and watch what ships
 - [scheduling/](scheduling/): subscription quota as a resource. This one is platform mechanism.

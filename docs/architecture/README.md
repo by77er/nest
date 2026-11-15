@@ -102,7 +102,7 @@ Details: [sandbox/fencing/](../sandbox/fencing/), [sandbox/gateway/](../sandbox/
 | Session transcripts | DO SQLite until flushed, then R2 | AgentDO |
 | Audit logs | R2 | FleetDO (hosts'), BrokerDO (credential issuance) |
 | Sandbox disk and memory chunks, manifests | S3, per cell | nestd; the head moves only through SandboxDO |
-| Secrets | BrokerDO (platform keys: Worker secrets) | Me, or minted by BrokerDO |
+| Secrets | BrokerDO (platform keys: Worker secrets) | Me; API clients, their own; BrokerDO, its own keys and MCP OAuth tokens |
 | The binding key | BrokerDO (private, per cell; it signs); FleetDO pushes the public keys to each sandbox host's gateway over the fleet channel | BrokerDO |
 | Runtime metrics (designed, not built) | Workers Analytics Engine | The Worker and DOs; hosts' through FleetDO ([metrics](../control-plane/metrics/)) |
 

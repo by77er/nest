@@ -209,9 +209,9 @@ mod tests {
 
     fn binding() -> InjectionBinding {
         InjectionBinding {
-            name: "github".into(),
-            hosts: vec![HostPattern("github.com".into()), HostPattern("*.githubusercontent.com".into())],
-            placeholder: "nest-ph-github-7f3a".into(),
+            name: "forge".into(),
+            hosts: vec![HostPattern("forge.example".into()), HostPattern("*.content.forge.example".into())],
+            placeholder: "nest-ph-forge-7f3a".into(),
             locations: vec![
                 InjectionLocation::AuthorizationBearer,
                 InjectionLocation::AuthorizationBasicPassword { username: None },
@@ -221,7 +221,7 @@ mod tests {
     }
 
     fn secrets(expires: Option<i64>) -> HashMap<String, InjectionSecret> {
-        [("github".to_string(), InjectionSecret { binding: "github".into(), value: "ghs_REAL".into(), expires_ms: expires })]
+        [("forge".to_string(), InjectionSecret { binding: "forge".into(), value: "forge_REAL".into(), expires_ms: expires })]
             .into()
     }
 
@@ -233,27 +233,27 @@ mod tests {
     #[test]
     fn bearer_substituted_for_matching_host() {
         let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
-        assert_eq!(run("github.com", true, true, &secrets(None), &mut h, "/"), Verdict::Substituted("github".into()));
-        assert_eq!(h[AUTHORIZATION], "Bearer ghs_REAL");
+        h.insert(AUTHORIZATION, "Bearer nest-ph-forge-7f3a".parse().unwrap());
+        assert_eq!(run("forge.example", true, true, &secrets(None), &mut h, "/"), Verdict::Substituted("forge".into()));
+        assert_eq!(h[AUTHORIZATION], "Bearer forge_REAL");
         assert!(h[AUTHORIZATION].is_sensitive());
     }
 
     #[test]
     fn basic_password_substituted() {
         let mut h = HeaderMap::new();
-        let enc = B64.encode("x-access-token:nest-ph-github-7f3a");
+        let enc = B64.encode("x-access-token:nest-ph-forge-7f3a");
         h.insert(AUTHORIZATION, format!("Basic {enc}").parse().unwrap());
         assert_eq!(
-            run("raw.githubusercontent.com", true, true, &secrets(None), &mut h, "/"),
-            Verdict::Substituted("github".into())
+            run("raw.content.forge.example", true, true, &secrets(None), &mut h, "/"),
+            Verdict::Substituted("forge".into())
         );
         let dec = B64.decode(h[AUTHORIZATION].to_str().unwrap().strip_prefix("Basic ").unwrap()).unwrap();
-        assert_eq!(dec, b"x-access-token:ghs_REAL");
+        assert_eq!(dec, b"x-access-token:forge_REAL");
     }
 
     /// A binding naming its Basic username writes it with the secret, whatever the request's was: a
-    /// username the sandbox chose (a planted token, as GitHub reads one there) never goes upstream beside
+    /// username the sandbox chose (a planted token, which some services read as the credential) never goes upstream beside
     /// nest's secret, and only then is the field nest's whole.
     #[test]
     fn a_basic_username_the_binding_names_is_written_and_whole() {
@@ -261,56 +261,56 @@ mod tests {
             locations: vec![InjectionLocation::AuthorizationBasicPassword { username: Some(user.into()) }],
             ..binding()
         };
-        for sent in ["x-access-token", "ghp_PLANTED", ""] {
+        for sent in ["x-access-token", "PLANTED_TOKEN", ""] {
             let mut h = HeaderMap::new();
-            h.insert(AUTHORIZATION, format!("Basic {}", B64.encode(format!("{sent}:nest-ph-github-7f3a"))).parse().unwrap());
+            h.insert(AUTHORIZATION, format!("Basic {}", B64.encode(format!("{sent}:nest-ph-forge-7f3a"))).parse().unwrap());
             let b = [named("x-access-token")];
             let (v, w) = apply_whole(
-                &Input { bindings: &b, secrets: &secrets(None), host: "github.com", tls: true, live: true, now_ms: 1000 },
+                &Input { bindings: &b, secrets: &secrets(None), host: "forge.example", tls: true, live: true, now_ms: 1000 },
                 &mut h,
                 &HeaderMap::new(),
                 &"/".parse().unwrap(),
             );
-            assert_eq!(v, Verdict::Substituted("github".into()), "{sent}");
+            assert_eq!(v, Verdict::Substituted("forge".into()), "{sent}");
             assert_eq!(w, at("authorization"), "{sent}");
             let dec = B64.decode(h[AUTHORIZATION].to_str().unwrap().strip_prefix("Basic ").unwrap()).unwrap();
-            assert_eq!(dec, b"x-access-token:ghs_REAL", "{sent}");
+            assert_eq!(dec, b"x-access-token:forge_REAL", "{sent}");
         }
     }
 
     #[test]
     fn custom_header_substituted() {
         let mut h = HeaderMap::new();
-        h.insert("x-api-key", "k=nest-ph-github-7f3a".parse().unwrap());
-        assert_eq!(run("github.com", true, true, &secrets(None), &mut h, "/"), Verdict::Substituted("github".into()));
-        assert_eq!(h["x-api-key"], "k=ghs_REAL");
+        h.insert("x-api-key", "k=nest-ph-forge-7f3a".parse().unwrap());
+        assert_eq!(run("forge.example", true, true, &secrets(None), &mut h, "/"), Verdict::Substituted("forge".into()));
+        assert_eq!(h["x-api-key"], "k=forge_REAL");
     }
 
     #[test]
     fn wrong_host_blocks_even_in_url_or_basic() {
         let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
-        assert_eq!(run("evil.com", true, true, &secrets(None), &mut h, "/"), Verdict::WrongHost("github".into()));
-        assert_eq!(h[AUTHORIZATION], "Bearer nest-ph-github-7f3a", "untouched");
+        h.insert(AUTHORIZATION, "Bearer nest-ph-forge-7f3a".parse().unwrap());
+        assert_eq!(run("evil.com", true, true, &secrets(None), &mut h, "/"), Verdict::WrongHost("forge".into()));
+        assert_eq!(h[AUTHORIZATION], "Bearer nest-ph-forge-7f3a", "untouched");
 
         let mut h = HeaderMap::new();
         assert_eq!(
-            run("evil.com", true, true, &secrets(None), &mut h, "https://evil.com/x?t=nest-ph-github-7f3a"),
-            Verdict::WrongHost("github".into())
+            run("evil.com", true, true, &secrets(None), &mut h, "https://evil.com/x?t=nest-ph-forge-7f3a"),
+            Verdict::WrongHost("forge".into())
         );
         let mut h = HeaderMap::new();
-        h.insert("proxy-authorization", format!("Basic {}", B64.encode("u:nest-ph-github-7f3a")).parse().unwrap());
+        h.insert("proxy-authorization", format!("Basic {}", B64.encode("u:nest-ph-forge-7f3a")).parse().unwrap());
         assert!(run("evil.com", true, true, &secrets(None), &mut h, "/").blocks());
     }
 
     #[test]
     fn expired_fenced_or_plaintext_blocks() {
         let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
-        assert_eq!(run("github.com", true, true, &secrets(Some(500)), &mut h.clone(), "/"), Verdict::Expired("github".into()));
-        assert_eq!(run("github.com", true, false, &secrets(None), &mut h.clone(), "/"), Verdict::Expired("github".into()));
-        assert_eq!(run("github.com", true, true, &HashMap::new(), &mut h.clone(), "/"), Verdict::Expired("github".into()));
-        assert_eq!(run("github.com", false, true, &secrets(None), &mut h, "/"), Verdict::Plaintext("github".into()));
+        h.insert(AUTHORIZATION, "Bearer nest-ph-forge-7f3a".parse().unwrap());
+        assert_eq!(run("forge.example", true, true, &secrets(Some(500)), &mut h.clone(), "/"), Verdict::Expired("forge".into()));
+        assert_eq!(run("forge.example", true, false, &secrets(None), &mut h.clone(), "/"), Verdict::Expired("forge".into()));
+        assert_eq!(run("forge.example", true, true, &HashMap::new(), &mut h.clone(), "/"), Verdict::Expired("forge".into()));
+        assert_eq!(run("forge.example", false, true, &secrets(None), &mut h, "/"), Verdict::Plaintext("forge".into()));
     }
 
     fn whole(host: &str, h: &mut HeaderMap) -> Vec<Whole> {
@@ -319,44 +319,44 @@ mod tests {
     }
 
     fn at(header: &str) -> Vec<Whole> {
-        vec![Whole { header: header.into(), binding: "github".into() }]
+        vec![Whole { header: header.into(), binding: "forge".into() }]
     }
 
     #[test]
     fn a_header_is_whole_only_when_the_substitution_wrote_all_of_it() {
         // Bearer replaces the Authorization header whole.
         let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
-        assert_eq!(whole("github.com", &mut h), at("authorization"));
+        h.insert(AUTHORIZATION, "Bearer nest-ph-forge-7f3a".parse().unwrap());
+        assert_eq!(whole("forge.example", &mut h), at("authorization"));
         // Basic, with no username of the binding's: substituted, but the username is the sandbox's, never whole.
         let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, format!("Basic {}", B64.encode("x-access-token:nest-ph-github-7f3a")).parse().unwrap());
-        assert_eq!(whole("github.com", &mut h), vec![]);
+        h.insert(AUTHORIZATION, format!("Basic {}", B64.encode("x-access-token:nest-ph-forge-7f3a")).parse().unwrap());
+        assert_eq!(whole("forge.example", &mut h), vec![]);
         let dec = B64.decode(h[AUTHORIZATION].to_str().unwrap().strip_prefix("Basic ").unwrap()).unwrap();
-        assert_eq!(dec, b"x-access-token:ghs_REAL");
+        assert_eq!(dec, b"x-access-token:forge_REAL");
         // A named header that was exactly the placeholder.
         let mut h = HeaderMap::new();
-        h.insert("x-api-key", "nest-ph-github-7f3a".parse().unwrap());
-        assert_eq!(whole("github.com", &mut h), at("x-api-key"));
+        h.insert("x-api-key", "nest-ph-forge-7f3a".parse().unwrap());
+        assert_eq!(whole("forge.example", &mut h), at("x-api-key"));
         // Partly substituted: the rest of the value is the sandbox's.
         let mut h = HeaderMap::new();
-        h.insert("x-api-key", "planted nest-ph-github-7f3a".parse().unwrap());
-        assert_eq!(whole("github.com", &mut h), vec![]);
-        assert_eq!(h["x-api-key"], "planted ghs_REAL");
+        h.insert("x-api-key", "planted nest-ph-forge-7f3a".parse().unwrap());
+        assert_eq!(whole("forge.example", &mut h), vec![]);
+        assert_eq!(h["x-api-key"], "planted forge_REAL");
         // A second field of the header beside the placeholder's: not whole.
         let mut h = HeaderMap::new();
-        h.append("x-api-key", "nest-ph-github-7f3a".parse().unwrap());
+        h.append("x-api-key", "nest-ph-forge-7f3a".parse().unwrap());
         h.append("x-api-key", "planted".parse().unwrap());
-        assert_eq!(whole("github.com", &mut h), vec![]);
+        assert_eq!(whole("forge.example", &mut h), vec![]);
         // Only the substituted field is marked never-indexed; the other one is passed on as it was.
         let fields: Vec<_> = h.get_all("x-api-key").iter().map(|v| (v.to_str().unwrap().to_string(), v.is_sensitive())).collect();
-        assert_eq!(fields, [("ghs_REAL".to_string(), true), ("planted".to_string(), false)]);
+        assert_eq!(fields, [("forge_REAL".to_string(), true), ("planted".to_string(), false)]);
         // The reviewer's probe: the placeholder in another header, a planted Authorization. Substituted,
         // but Authorization isn't nest's.
         let mut h = HeaderMap::new();
-        h.insert("x-api-key", "nest-ph-github-7f3a".parse().unwrap());
+        h.insert("x-api-key", "nest-ph-forge-7f3a".parse().unwrap());
         h.insert(AUTHORIZATION, "Bearer planted".parse().unwrap());
-        assert_eq!(whole("github.com", &mut h), at("x-api-key"));
+        assert_eq!(whole("forge.example", &mut h), at("x-api-key"));
         assert_eq!(h[AUTHORIZATION], "Bearer planted");
     }
 
@@ -364,19 +364,19 @@ mod tests {
     fn repeated_authorization_fields_are_whole_only_when_the_placeholder_comes_first() {
         // The placeholder's field first: Bearer substitution replaces every field, the planted one dropped.
         let mut h = HeaderMap::new();
-        h.append(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
+        h.append(AUTHORIZATION, "Bearer nest-ph-forge-7f3a".parse().unwrap());
         h.append(AUTHORIZATION, "Bearer planted".parse().unwrap());
-        assert_eq!(whole("github.com", &mut h), at("authorization"));
-        assert_eq!(h.get_all(AUTHORIZATION).iter().collect::<Vec<_>>(), ["Bearer ghs_REAL"]);
+        assert_eq!(whole("forge.example", &mut h), at("authorization"));
+        assert_eq!(h.get_all(AUTHORIZATION).iter().collect::<Vec<_>>(), ["Bearer forge_REAL"]);
         // The planted field first: nothing replaces it, so Authorization isn't nest's.
         let mut h = HeaderMap::new();
         h.append(AUTHORIZATION, "Bearer planted".parse().unwrap());
-        h.append(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
-        assert_eq!(whole("github.com", &mut h), vec![]);
+        h.append(AUTHORIZATION, "Bearer nest-ph-forge-7f3a".parse().unwrap());
+        assert_eq!(whole("forge.example", &mut h), vec![]);
         // One field naming two credentials (a comma-joined list): no substitution, not whole.
         let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a, Bearer planted".parse().unwrap());
-        assert_eq!(whole("github.com", &mut h), vec![]);
+        h.insert(AUTHORIZATION, "Bearer nest-ph-forge-7f3a, Bearer planted".parse().unwrap());
+        assert_eq!(whole("forge.example", &mut h), vec![]);
     }
 
     #[test]
@@ -392,15 +392,15 @@ mod tests {
             ..binding()
         };
         let sec: HashMap<String, InjectionSecret> = [
-            ("github".to_string(), InjectionSecret { binding: "github".into(), value: "A-nest-ph-other".into(), expires_ms: None }),
+            ("forge".to_string(), InjectionSecret { binding: "forge".into(), value: "A-nest-ph-other".into(), expires_ms: None }),
             ("other".to_string(), InjectionSecret { binding: "other".into(), value: "OTHER".into(), expires_ms: None }),
         ]
         .into();
         let run = |b: &[InjectionBinding]| {
             let mut h = HeaderMap::new();
-            h.insert(AUTHORIZATION, "Bearer nest-ph-github-7f3a".parse().unwrap());
+            h.insert(AUTHORIZATION, "Bearer nest-ph-forge-7f3a".parse().unwrap());
             let (_, w) =
-                apply_whole(&Input { bindings: b, secrets: &sec, host: "github.com", tls: true, live: true, now_ms: 1000 }, &mut h, &HeaderMap::new(), &"/".parse().unwrap());
+                apply_whole(&Input { bindings: b, secrets: &sec, host: "forge.example", tls: true, live: true, now_ms: 1000 }, &mut h, &HeaderMap::new(), &"/".parse().unwrap());
             (w, h[AUTHORIZATION].to_str().unwrap().to_string())
         };
         assert_eq!(run(std::slice::from_ref(&first)), (at("authorization"), "Bearer A-nest-ph-other".to_string()));
@@ -411,22 +411,22 @@ mod tests {
     fn a_placeholder_in_a_dropped_header_is_seen_never_substituted() {
         let b = [binding()];
         let mut dropped = HeaderMap::new();
-        dropped.insert("proxy-authorization", format!("Basic {}", B64.encode("u:nest-ph-github-7f3a")).parse().unwrap());
+        dropped.insert("proxy-authorization", format!("Basic {}", B64.encode("u:nest-ph-forge-7f3a")).parse().unwrap());
         let run = |host: &str, dropped: &HeaderMap| {
             let mut h = HeaderMap::new();
             apply_whole(&Input { bindings: &b, secrets: &secrets(None), host, tls: true, live: true, now_ms: 1000 }, &mut h, dropped, &"/".parse().unwrap())
         };
         // Sent to another host: blocked, as anywhere in the request.
-        assert_eq!(run("evil.com", &dropped).0, Verdict::WrongHost("github".into()));
+        assert_eq!(run("evil.com", &dropped).0, Verdict::WrongHost("forge".into()));
         // To its own host: nothing forwarded carries it, so nothing is substituted and nothing is whole.
-        assert_eq!(run("github.com", &dropped), (Verdict::Clean, vec![]));
+        assert_eq!(run("forge.example", &dropped), (Verdict::Clean, vec![]));
     }
 
     #[test]
     fn clean_requests_untouched() {
         let mut h = HeaderMap::new();
         h.insert(AUTHORIZATION, "Bearer user-own-token".parse().unwrap());
-        assert_eq!(run("github.com", true, true, &secrets(None), &mut h, "/"), Verdict::Clean);
+        assert_eq!(run("forge.example", true, true, &secrets(None), &mut h, "/"), Verdict::Clean);
         assert_eq!(h[AUTHORIZATION], "Bearer user-own-token");
     }
 }

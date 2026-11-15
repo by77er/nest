@@ -26,7 +26,7 @@ One App, owned by me and installed only on `by77er/nest`.
 | Binding | Used by | Permissions |
 |---|---|---|
 | `github:dev` | Workers, injected in their sandboxes | contents, pull requests, workflows: write; checks, actions, issues: read |
-| `github:review` | Reviewers, through the app's own GitHub writes (`gh_write`, [repo maintenance](../docs/orchestration/repo-maintenance/)) | checks, pull requests: write; contents: read |
+| `github:review` | Reviewers, through the app's own GitHub writes (`gh_write`, [repo maintenance](repo-maintenance.md)) | checks, pull requests: write; contents: read |
 | `github:ops` | The maintainer and the monitor, through the app's own GitHub writes and `github_ro` | issues, pull requests, actions: write; contents, checks, deployments: read |
 
 ## Repo settings
@@ -54,5 +54,5 @@ One App, owned by me and installed only on `by77er/nest`.
   - nest-proxy, the runner, and Claude Code's launch config and managed settings;
   - sandbox networking and drivers;
   - `docs/security/` and `dev/`.
-- **"Low-risk" isn't "can't leak":** any control-plane module runs with every binding, and host code runs as root. Agent review is enough there only because nothing from outside reaches this repo's workers (see [why auto-merge is safe enough](../docs/orchestration/repo-maintenance/#why-auto-merge-is-safe-enough)). CI, the health window and rollback cover honest mistakes.
+- **"Low-risk" isn't "can't leak":** any control-plane module runs with every binding, and host code runs as root. Agent review is enough there only because nothing from outside reaches this repo's workers (see [why auto-merge is safe enough](repo-maintenance.md#why-auto-merge-is-safe-enough)). CI, the health window and rollback cover honest mistakes.
 - **Widening:** I move paths out of `CODEOWNERS` as trust grows, and that change itself needs me.

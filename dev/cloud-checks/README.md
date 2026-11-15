@@ -144,10 +144,6 @@ python3 -I dev/cloud-checks/brokered_check.py
 
 **Checked offline (2026-11-15):** the journal and approval checks pass a well-formed run and fail on a missing refusal, the throwaway value in a row, an untainted approved call, an approval asked after the call went out, an extra approval (one whose arguments name the held call included), a profile call sent twice, and no approval; with nothing set it exits naming the missing settings. It has not been run against the cloud.
 
-## `push_check.py`
-
-**Retired** (2026-11-15): nest mints no repo tokens and builds no push allowlist ([no repo tokens](../../docs/sandbox/networking/egress/policy/#no-repo-tokens)), so the script exits 2 at once without touching the cell. Phase C6 deletes it and checks pushes through a client guard instead.
-
 ## `lifecycle_check.py`
 
 [Agent and sandbox lifetimes](../../docs/agents/#lifetimes) end to end: a real Claude Code parent spawns children with `agent_spawn`, and their sandboxes go when they end.
