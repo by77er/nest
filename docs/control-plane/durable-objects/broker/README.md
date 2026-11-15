@@ -20,7 +20,7 @@ The only DO that stores secret values, apart from each API client's webhook sign
 
 The Cloudflare API token that creates and deletes per-host tunnels and DNS records is a Worker secret, like the other platform keys, not a BrokerDO secret.
 
-**No GitHub App** (decided 2026-11-12, [principle 10](../../../README.md#principles); built 2026-11-15): BrokerDO mints nothing. The projects app holds its own App and keeps the tokens it mints as API clients' secrets. What the kernel's minting stored stays for one release, read and written by nothing: the `github_*` tables and `injections`. BrokerDO empties `injections` at each start, with the secrets `inject:<binding>:<sandbox>` it names (a sandbox's destroy, `forgetInjections`, does it for that sandbox), so an operator binding of that name never resolves to a token minted before, the sandbox placed or not. A later release drops them ([rollout](../../../../dev/rollout/2026-11-15-kernel-github-minting.md)).
+**No GitHub App** (decided 2026-11-12, [principle 10](../../../README.md#principles); built 2026-11-15): BrokerDO mints nothing. The projects app holds its own App and keeps the tokens it mints as API clients' secrets. What the kernel's minting stored stays for one release, read and written by nothing: the `github_*` tables and `injections`. BrokerDO empties `github_tokens`, and `injections` with the secrets `inject:<binding>:<sandbox>` it names, at each start (a sandbox's destroy, `forgetInjections`, does it for that sandbox), so an operator binding of that name never resolves to a token minted before, the sandbox placed or not. A later release drops them ([rollout](../../../../dev/rollout/2026-11-15-kernel-github-minting.md)).
 
 ## Caller identity keys
 

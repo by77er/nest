@@ -97,7 +97,7 @@ const ASK_PAGES = 10;
 /**
  * What a client may add to its own sandbox's spec: its egress rules (docs/control-plane/api/clients/#egress),
  * its secrets' bindings and the environment that names their placeholders (#injection, #environment),
- * and `workflows: write` on the push token (#workflow-files), each within its grant.
+ * and `github_push` (nest's former push-token opt-in, which a control plane from before 2026-11-15 answers), each within its grant.
  */
 export interface SandboxExtras {
   egress?: { allow: { host: string; ports?: number[] }[] };

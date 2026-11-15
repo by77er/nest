@@ -114,6 +114,8 @@ export class BrokerDO extends DurableObject<Env> {
     // it looks up), placed or not (dev/rollout/2026-11-15-kernel-github-minting.md).
     this.sql.exec("DELETE FROM secrets WHERE name IN (SELECT 'inject:' || binding || ':' || sandbox FROM injections)");
     this.sql.exec("DELETE FROM injections");
+    // The installation tokens it cached (live for up to an hour after the previous release): read by nothing now.
+    this.sql.exec("DELETE FROM github_tokens");
     // API clients' secrets (docs/control-plane/api/clients/#secrets): what anyone may see of each. The
     // value is the secret `client-secret:<client>:<name>`, which only `secrets_update` resolves.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS client_secrets (client TEXT NOT NULL, name TEXT NOT NULL, description TEXT, size INTEGER NOT NULL,

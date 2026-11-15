@@ -397,6 +397,57 @@ describe("client injection bindings", () => {
     const cmds = await nextCommands(s.ws, (x) => x.type === "secrets_update");
     expect(cmds.find((x) => x.type === "secrets_update")!.secrets.map((x: any) => x.binding)).not.toContain("client:stripe");
   });
+
+  it("a binding taken away leaves the proxy before the policy without it holds: its secrets_update comes first", async () => {
+    const c = await newClient();
+    const value = fakeValue("order");
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    await asJson(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { inject: [] } });
+    // The secrets come first, in the same batch as the policy or an earlier one.
+    const first = await nextCommands(s.ws, (x) => x.type === "policy_update" || x.type === "secrets_update");
+    const si = first.findIndex((x) => x.type === "secrets_update");
+    const pi = first.findIndex((x) => x.type === "policy_update");
+    expect(si, "a secrets_update before the policy_update").toBeGreaterThanOrEqual(0);
+    expect(pi === -1 || si < pi, "secrets_update before policy_update").toBe(true);
+    expect(JSON.stringify(first[si].secrets)).not.toContain(value);
+    const policy = pi >= 0 ? first[pi].policy : (await nextCommands(s.ws, (x) => x.type === "policy_update")).find((x) => x.type === "policy_update")!.policy;
+    expect(policy.inject.map((b: { name: string }) => b.name)).not.toContain("client:stripe");
+  });
+
+  it("a push overtaken by a change of its client's bindings while ClientDO answered is dropped (the change pushes again)", async () => {
+    const c = await newClient();
+    const value = fakeValue("stale");
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    // Hold the push's read of the client's grant, after it read the bindings it pushes for.
+    const real = ClientDO.prototype.scope;
+    let reached = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    ClientDO.prototype.scope = async function (this: ClientDO) {
+      const r = await real.call(this);
+      if (!reached) {
+        reached = true;
+        await gate;
+      }
+      return r;
+    };
+    let push: Promise<unknown> | undefined;
+    try {
+      push = runInDurableObject(stub, (inst: SandboxDO) => (inst as unknown as { pushSecrets(f: boolean): Promise<void> }).pushSecrets(true));
+      await eventually("the push holds on ClientDO", () => reached);
+      // Meanwhile its bindings change (the step a layer write takes before it pushes again itself).
+      await runInDurableObject(stub, (_i: SandboxDO, st) => { st.storage.sql.exec("DELETE FROM kv WHERE key = 'client_inject'"); });
+    } finally {
+      release();
+      ClientDO.prototype.scope = real;
+    }
+    await push;
+    // The held push, made for the old bindings, sends nothing: 2 s for one to arrive if it would.
+    await expect(s.ws.next("commands", (m) => (m.commands as any[]).some((x) => x.type === "secrets_update"), 2_000)).rejects.toThrow(/timed out/);
+  });
 });
 
 // docs/control-plane/durable-objects/broker/#client-secret-pushes: a write or delete reaches every sandbox
