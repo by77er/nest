@@ -1,4 +1,4 @@
-// A fake of nest's client interface and of the GitHub API the app calls with its own App's tokens (or, in the fallback, nest's): as docs/control-plane/api/clients/ and docs/interfaces/remote-mcp/
+// A fake of nest's client interface and of the GitHub API the app calls with its own App's tokens: as docs/control-plane/api/clients/ and docs/interfaces/remote-mcp/
 // describe it: the routes the app calls (answering as nest does: a create's cell in its body, refused
 // outside the grant's; a create's Idempotency-Key replayed, conflicting or in progress), the JWKS behind Nest-Identity, and helpers that sign identity tokens, Access tokens and
 // webhooks the way nest and Cloudflare do. It replaces the global fetch, which the Worker and its Durable
@@ -149,10 +149,6 @@ export class FakeNest {
   whenUnsupported = false;
   /** Play a nest whose `start` ignores `launch` (a rolled-back Worker): its answer names none. */
   launchIgnored = false;
-  /** The repos the client's grant names, lowercased (`github.repos`); null: any (the grant isn't what a test is about). */
-  grantRepos: string[] | null = null;
-  /** The grant's `repos` (push) when a test needs it to differ from `github.repos`; null: the same as `grantRepos`. */
-  pushRepos: string[] | null = null;
   /** Play a control plane from before `GET /v1/asks`: a client's unknown route answers 401. */
   asksRouteMissing = false;
   /** The most agents a page of `GET /v1/asks` holds, below what the app asks for (to make it page). */
@@ -501,7 +497,7 @@ export class FakeNest {
       this.catalog.set(`${m[1]}/${m[2]}/${m[3]}`, call.body);
       return json(200, { ok: true });
     }
-    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts, repos: this.pushRepos ?? this.grantRepos ?? [], github: { repos: this.grantRepos ?? [], permissions: { ...GRANT_PERMISSIONS } } }, created_ms: 1 });
+    if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts, repos: [] }, created_ms: 1 });
     if (r === "GET /v1/clients/self/secrets") {
       return json(200, { secrets: [...this.secrets].sort(([a], [b]) => a.localeCompare(b)).map(([name, x]) => ({ name, description: x.description, size: new TextEncoder().encode(x.value).length, created_ms: x.created_ms, updated_ms: x.updated_ms, last_injected_ms: x.last_injected_ms })) });
     }
@@ -547,7 +543,7 @@ export class FakeNest {
 }
 
 /** Run `fn` with one of the env's values set (undefined: unset), as the Worker and its objects read the env they share with the tests. */
-export async function withEnv<T>(name: "GITHUB_ACCOUNTS", value: string | undefined, fn: () => Promise<T>): Promise<T> {
+export async function withEnv<T>(name: "GITHUB_ACCOUNTS" | "NEST_CLIENT_TOKEN", value: string | undefined, fn: () => Promise<T>): Promise<T> {
   const e = env as unknown as Record<string, unknown>;
   const had = e[name];
   if (value === undefined) delete e[name];
@@ -780,10 +776,10 @@ export interface FakeInstallation {
 }
 
 /**
- * A token, as GitHub keeps it: for one repo (`repo`, a full name: nest's tokens in the fallback, or an
- * account's installation's), or for a repo by name alone (`name`: the default installation's, whose account
- * the fake doesn't pin), or for every repo of its installation (`all`), from an installation (null: nest's, not
- * modelled), until it expires.
+ * A token, as GitHub keeps it: for one repo (`repo`, a full name: an account's installation's, or a test's
+ * own), or for a repo by name alone (`name`: the default installation's, whose account the fake doesn't pin),
+ * or for every repo of its installation (`all`), from an installation (null: a test's own, not modelled),
+ * until it expires.
  */
 export interface FakeToken {
   repo: string | null;
@@ -833,7 +829,7 @@ export class FakeGitHub {
   lost: { match: RegExp; times: number }[] = [];
   private nextId = 1000;
 
-  /** A token for `repo` (nest's, in the fallback; or a test's own). */
+  /** A token for `repo`: a test's own. */
   mint(repo: string, permissions: Record<string, string>): string {
     return this.issue({ repo: repo.toLowerCase(), name: null, permissions, installation: null, expires_ms: Date.now() + this.tokenLifeMs });
   }

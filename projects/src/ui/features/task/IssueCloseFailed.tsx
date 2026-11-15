@@ -1,5 +1,5 @@
 // A done task's issue that GitHub refused to close (README.md#triage): why, and a retry once the cause is
-// fixed (the grant given `issues: write`, say). A grant that changes retries it on its own as well.
+// fixed (the App's installation given Issues: write, say).
 
 import { Button, Text } from "@mantine/core";
 import { useRetryIssueClose } from "../../api/queries";

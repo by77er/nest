@@ -89,7 +89,7 @@ const MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN refused_ms INTEGER",
   ],
   [
-    // When a refused event last made the binding be read again, to follow nest's answer for the installation
+    // When a refused event last made the binding be read again, to follow the App's lookup of the installation
     // (README.md#the-repos-binding): at most once a minute per project.
     "ALTER TABLE projects ADD COLUMN installation_checked_ms INTEGER",
     // The bound repo's owner's kind as GitHub answered at the binding's last read, with the id it's of
@@ -119,7 +119,7 @@ export interface RepoBinding {
   repo_gen: number;
   /** The name GitHub last gave the repo, when it isn't `repo`: renamed or transferred, not yet applied. */
   renamed_to: string | null;
-  /** The App installation's id: null until a token's source (the App's lookup, or nest's answer) names it. */
+  /** The App installation's id: null until the App's lookup by the repo's own name gives it. */
   installation_id: number | null;
   /** How the id was learned: read from GitHub, or taken from the first event; null while there's none. */
   bound: "github" | "event" | null;
@@ -291,7 +291,7 @@ export class DirectoryDO extends DurableObject<Env> {
    * name taken): no project. A project whose App installation is known takes only events from that
    * installation (`installation.id`): any other, or none, is refused (README.md#the-repos-binding). One with none
    * known yet refuses an event whose repo owner isn't an account the app acts for (`ownerAllowed` false, the
-   * Worker's answer; null: not checked).
+   * Worker's answer; null, the default: not checked).
    */
   async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null, ownerAllowed: boolean | null = null): Promise<{ project: ProjectRow; anchored: boolean; recorded_owner: number | null } | { refused: string; project_id: string } | null> {
     const one = (where: string, v: SqlStorageValue) =>

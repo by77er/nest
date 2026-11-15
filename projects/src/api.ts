@@ -92,7 +92,7 @@ async function sync(env: Env): Promise<Response> {
 
 /**
  * The operator's re-read of a project's repo binding (README.md#the-repos-binding): the repo's id from
- * GitHub. No id yet: bound. The same id: confirmed, and a rename applied when nest's grant names the new
+ * GitHub. No id yet: bound. The same id: confirmed, and a rename applied when the App reaches the new
  * name (then the catalog is synced, so its templates name it). Another id: nothing written, and both repos
  * answered (`mismatch`), each with its owner, and whether GitHub's has the bound one's owner; the operator
  * binds it only by `bind` with the id they were shown.

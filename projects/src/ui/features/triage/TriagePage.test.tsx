@@ -252,11 +252,11 @@ describe("the Triage page", () => {
 describe("a task made of an issue, whose close GitHub refused", () => {
   it("says so in its drawer, with a retry", async () => {
     const api = new FakeApi();
-    const t = task({ state: "done", title: "Fix the crash", issue: { number: 12, close: "failed", error: "nest 403: issues: write is outside the grant" } });
+    const t = task({ state: "done", title: "Fix the crash", issue: { number: 12, close: "failed", error: "GitHub 403: Resource not accessible by integration" } });
     api.tasks = [t];
     const { user } = renderApp(`/projects/prj_one/board?task=${t.id}`, api);
     const notice = (await screen.findByText("Issue #12 wasn't closed on GitHub")).closest("[data-ds=notice]") as HTMLElement;
-    expect(notice).toHaveTextContent("issues: write is outside the grant");
+    expect(notice).toHaveTextContent("Resource not accessible by integration");
     await user.click(within(notice).getByRole("button", { name: "Retry closing the issue" }));
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: `/api/projects/prj_one/tasks/${t.id}/issue/close`, body: undefined }]));
     await waitFor(() => expect(screen.queryByText("Issue #12 wasn't closed on GitHub")).toBeNull());

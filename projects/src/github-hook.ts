@@ -200,10 +200,9 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
 /**
  * Whether the event's repo owner is an account the app acts for (README.md#repo-authority), for a binding with no
  * installation known yet: the App's answer (its owner, or GITHUB_ACCOUNTS); false when that can't be had (fails
- * closed); null without nest's token (NEST_CLIENT_TOKEN unset), when nothing is checked.
+ * closed).
  */
-async function repoOwnerAllowed(env: Env, payload: Obj): Promise<boolean | null> {
-  if (!nestFrom(env)) return null;
+async function repoOwnerAllowed(env: Env, payload: Obj): Promise<boolean> {
   try {
     return await new AppTokens(env).allows(prNumber(obj(obj(payload.repository).owner).id));
   } catch (e) {

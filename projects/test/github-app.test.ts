@@ -20,7 +20,6 @@ beforeEach(() => {
   gh.installations = [{ id: GH_INSTALLATION_ID, account: null, repos: "all", permissions: { ...GRANT_PERMISSIONS } }];
   gh.tokenLifeMs = 3_600_000;
   gh.failures = [];
-  fake.grantRepos = null;
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -201,11 +200,10 @@ describe("installation tokens", () => {
     expect(appTokenCache().tokens.filter((t) => t.installation === 9_201)).toEqual([]);
   });
 
-  it("are GitHub's to refuse, not nest's grant: nest isn't asked, and a permission the installation wasn't granted is GitHub's refusal", async () => {
+  it("are GitHub's to refuse: nest isn't asked, and a permission the installation wasn't granted is GitHub's refusal", async () => {
     const repo = newRepo();
     const account = repo.split("/")[0]!;
     const src = new AppTokens(appEnv);
-    fake.grantRepos = ["someone/else"];
     const asked = fake.calls.length;
     await src.token(repo, PERMISSIONS.metadata, { fresh: true });
     expect(fake.calls.length).toBe(asked);
