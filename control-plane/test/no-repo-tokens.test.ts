@@ -21,6 +21,9 @@ const has = (v: object) => REMOVED.filter((k) => Object.hasOwn(v, k));
 const sandboxStub = (id: string) => env.SANDBOX.get(env.SANDBOX.idFromName(id));
 const catalogStub = () => env.CATALOG.get(env.CATALOG.idFromName("catalog"));
 const broker = () => env.BROKER.get(env.BROKER.idFromName("broker"));
+/** An agent's record as AgentDO stores it (its view leaves the fields out whatever the record holds). */
+const storedSpec = (agent: string) => runInDurableObject(env.AGENT.get(env.AGENT.idFromName(agent)), (_i, st) =>
+  JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value) as object);
 
 async function placed(policy: Record<string, unknown> = {}): Promise<{ sandbox: string; cell: string; ws: Ws }> {
   const cell = uniqueCell();
@@ -57,7 +60,7 @@ describe("specs and templates", () => {
     expect(cat.templates[name]).toEqual(TPL);
     const { sandbox } = await placed();
     const a = await adminJson("/v1/agents", { body: { template: name, sandbox, start: false } }, 201);
-    expect(has(a)).toEqual([]);
+    expect(has(await storedSpec(a.agent))).toEqual([]);
     const policy = await adminJson(`/v1/sandboxes/${sandbox}/policy`);
     expect(policy.inject).toEqual([]);
     expect(policy.allow.filter((r: any) => r.host === "api.github.com")).toEqual([]);

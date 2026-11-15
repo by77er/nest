@@ -335,7 +335,11 @@ describe("the live client layer: bindings and environment", () => {
     await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { GH_TOKEN: "x" }, github_push: { workflows: false } } });
     const a = await ok(c.token, "/v1/agents", { body: { template: `${c.name}/x`, sandbox: s.sandbox, start: false, overrides: { repos: [], read_repos: [] } } });
     const b = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, start: false, overrides: none } }, 201);
-    for (const view of [a, b]) expect(["repos", "read_repos", "github_push"].filter((k) => Object.hasOwn(view, k)), view.agent).toEqual([]);
+    for (const { agent } of [a, b]) {
+      const stored = await runInDurableObject(env.AGENT.get(env.AGENT.idFromName(agent)), (_i, st) =>
+        JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value) as object);
+      expect(["repos", "read_repos", "github_push"].filter((k) => Object.hasOwn(stored, k)), agent).toEqual([]);
+    }
     expect(Object.hasOwn(await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`), "github_push")).toBe(false);
     const policy = await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`);
     expect(policy.inject.map((b: any) => b.name)).toEqual([]);
