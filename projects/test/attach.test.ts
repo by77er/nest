@@ -6,7 +6,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { CHECK_NAME } from "../src/github";
-import { AccessTeam, api, FakeNest, GH_APP_ID, GH_INSTALLATION_ID, installFetch } from "./fake-nest";
+import { AccessTeam, api, deliverGithub, FakeNest, GH_APP_ID, GH_INSTALLATION_ID, installFetch, prEvent } from "./fake-nest";
 
 const fake = new FakeNest();
 const gh = fake.github;
@@ -29,8 +29,7 @@ async function create(repo: string) {
   expect(r.status, JSON.stringify(r.body)).toBe(201);
   return r.body as { id: string; settings: any };
 }
-/** Forget the App id a check run told the directory, as before any check run. */
-const forgetAppId = () => runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => { st.storage.sql.exec("DELETE FROM sync WHERE k = 'github_app_id'"); });
+const sha = () => [...crypto.getRandomValues(new Uint8Array(20))].map((b) => b.toString(16).padStart(2, "0")).join("");
 const managersOf = (id: string) => [...fake.agents.values()].filter((a) => a.labels.project === id && a.labels.role === "manager");
 const writes = (repo: string) => gh.calls.filter((c) => c.method !== "GET" && c.path.startsWith(`/repos/${repo}/branches/`));
 
@@ -109,8 +108,6 @@ describe("attaching a repo", () => {
   });
 
   it("pins the check to the App from the first attach, by the App's own id, before any check run tells it", async () => {
-    // No check run has told the id (none of the app's has run).
-    await forgetAppId();
     const repo = `o-${rand()}/r-${rand()}`;
     gh.repo(repo).protection = protectedBranch();
     const p = await create(repo);
@@ -121,7 +118,6 @@ describe("attaching a repo", () => {
   });
 
   it("a check an earlier attach required from any source (the App's id not known then) is pinned to the App", async () => {
-    await forgetAppId();
     const repo = `o-${rand()}/r-${rand()}`;
     const protection = protectedBranch();
     protection.required_status_checks.checks.push({ context: CHECK_NAME, app_id: null });
@@ -129,6 +125,25 @@ describe("attaching a repo", () => {
     gh.repo(repo).protection = protection;
     const p = await create(repo);
     expect(p.settings.attach).toMatchObject({ change: "pinned", app_id: GH_APP_ID });
+    expect(gh.repo(repo).protection!.required_status_checks.checks).toEqual([{ context: "ci/build", app_id: 15368 }, { context: "lint", app_id: null }, { context: CHECK_NAME, app_id: GH_APP_ID }]);
+  });
+
+  it("a project an older release attached unpinned is pinned once a check run of the App's names its id", async () => {
+    const repo = `o-${rand()}/r-${rand()}`;
+    gh.repo(repo).protection = protectedBranch();
+    const p = await create(repo);
+    // As an older release left it: the check required from any source, the attach not knowing the App, no id told.
+    const unpinned = protectedBranch();
+    unpinned.required_status_checks.checks.push({ context: CHECK_NAME, app_id: null });
+    unpinned.required_status_checks.contexts.push(CHECK_NAME);
+    gh.repo(repo).protection = unpinned;
+    await runInDurableObject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (_o, st) => { st.storage.sql.exec("UPDATE settings SET attach_detail = json_set(attach_detail, '$.app_id', NULL)"); });
+    await runInDurableObject(env.REVIEW.get(env.REVIEW.idFromName(p.id)), (_o, st) => { st.storage.sql.exec("DELETE FROM settings WHERE k = 'github_app_id'"); });
+    expect((await api(token, "GET", `/api/projects/${p.id}/settings`)).body.attach.app_id).toBeNull();
+    await deliverGithub("pull_request", prEvent({ repo, number: 1, sha: sha(), action: "opened" }));
+    await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
+    await env.PROJECT.get(env.PROJECT.idFromName(p.id)).drain();
+    expect((await api(token, "GET", `/api/projects/${p.id}/settings`)).body.attach).toMatchObject({ change: "pinned", app_id: GH_APP_ID });
     expect(gh.repo(repo).protection!.required_status_checks.checks).toEqual([{ context: "ci/build", app_id: 15368 }, { context: "lint", app_id: null }, { context: CHECK_NAME, app_id: GH_APP_ID }]);
   });
 

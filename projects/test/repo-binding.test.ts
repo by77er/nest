@@ -455,7 +455,7 @@ describe("a renamed or transferred repo", () => {
 });
 
 describe("a sync reads again what may have moved", () => {
-  it("a binding with a rename noted, or events refused: its owner and installation as GitHub and nest answer now, and the previous release's owner copy with them", async () => {
+  it("a binding with a rename noted, or events refused: its owner and installation as GitHub answers now, and the previous release's owner copy with them", async () => {
     // Transferred: its events name the new name, and a sync reads it there.
     const a = await newProject();
     const newOwner = `n-${rand()}`;

@@ -1990,7 +1990,7 @@ export class ProjectDO extends DurableObject<Env> {
     } catch (e) {
       const attempts = (this.settingsRow()!.pr_read_attempts as number) + 1;
       this.sql.exec("UPDATE settings SET pr_read_attempts = ?, pr_read_next_ms = ?", attempts, Date.now() + Math.max(PR_READ_EVERY_MS, backoff(attempts)));
-      // One that will repeat (a permission the grant lacks, the App gone) is among the project's errors, once a day.
+      // One that will repeat (a permission the App's installation lacks, the App gone) is among the project's errors, once a day.
       if ((e instanceof NestError || e instanceof GitHubError) && e.permanent) {
         this.sql.exec("INSERT OR IGNORE INTO errors (event_id, at_ms, agent, role, task, code, message) VALUES (?, ?, 'app', NULL, NULL, 'pr_read_failed', ?)",
           `pr_read:${new Date().toISOString().slice(0, 10)}`, Date.now(), `The app couldn't read its task PRs from GitHub, so workers aren't told of failed reviews, checks or conflicts: ${message(e)}`);
