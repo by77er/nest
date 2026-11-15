@@ -149,10 +149,10 @@ mod tests {
 
     #[test]
     fn authority_parsing() {
-        assert_eq!(strip_port("github.com:443"), "github.com");
-        assert_eq!(strip_port("github.com"), "github.com");
+        assert_eq!(strip_port("forge.example:443"), "forge.example");
+        assert_eq!(strip_port("forge.example"), "forge.example");
         assert_eq!(strip_port("[::1]:8080"), "::1");
-        assert_eq!(norm_host("GitHub.COM.:443"), "github.com");
+        assert_eq!(norm_host("Forge.EXAMPLE.:443"), "forge.example");
         assert_eq!(split_authority("example.com:8443", 443), ("example.com".into(), 8443));
         assert_eq!(split_authority("example.com", 80), ("example.com".into(), 80));
         assert_eq!(split_authority("[::1]:22", 80), ("::1".into(), 22));
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn host_validation_and_clipping() {
-        assert!(valid_host("api.github.com"));
+        assert!(valid_host("api.forge.example"));
         assert!(valid_host("_dmarc.example.com"));
         assert!(valid_host("10.0.0.1") && valid_host("::1"));
         assert!(!valid_host(""));

@@ -195,10 +195,10 @@ mod tests {
 
     #[test]
     fn parses_sni_and_alpn() {
-        let hello = client_hello("API.GitHub.com", &[b"h2", b"http/1.1"]);
+        let hello = client_hello("API.Forge.Example", &[b"h2", b"http/1.1"]);
         match parse_client_hello(&hello) {
             Parse::Hello(info) => {
-                assert_eq!(info.sni.as_deref(), Some("api.github.com"));
+                assert_eq!(info.sni.as_deref(), Some("api.forge.example"));
                 assert_eq!(info.alpn, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
             }
             other => panic!("{other:?}"),

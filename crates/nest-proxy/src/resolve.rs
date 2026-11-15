@@ -28,8 +28,8 @@ impl Resolve for SystemResolver {
 }
 
 /// Fixed name → address table (tests, or pinned private upstreams). The table's port wins over
-/// the requested one when set (non-zero), so tests can map `api.github.test:443` to an ephemeral
-/// local server.
+/// the requested one when set (non-zero), so tests can map a test name (say `api.forge.test:443`)
+/// to an ephemeral local server.
 #[derive(Default)]
 pub struct StaticResolver {
     entries: HashMap<String, Vec<SocketAddr>>,

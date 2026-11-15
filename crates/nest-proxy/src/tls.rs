@@ -230,17 +230,17 @@ mod tests {
     fn minted_leaf_chains_to_root() {
         let pki = testca::proxy_pki();
         let ca = Ca::from_install(&pki.install, &pki.key_pem).unwrap();
-        let ck = ca.leaf("api.github.com").unwrap();
+        let ck = ca.leaf("api.forge.example").unwrap();
         assert_eq!(ck.cert.len(), 3, "leaf + intermediate + root");
         let mut roots = RootCertStore::empty();
         roots.add(CertificateDer::from_pem_slice(pki.root_pem.as_bytes()).unwrap()).unwrap();
         let verifier = WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider()).build().unwrap();
-        let name = ServerName::try_from("api.github.com").unwrap();
+        let name = ServerName::try_from("api.forge.example").unwrap();
         verifier.verify_server_cert(&ck.cert[0], &ck.cert[1..], &name, &[], UnixTime::now()).unwrap();
         let wrong = ServerName::try_from("evil.com").unwrap();
         assert!(verifier.verify_server_cert(&ck.cert[0], &ck.cert[1..], &wrong, &[], UnixTime::now()).is_err());
         // Cached.
-        assert!(Arc::ptr_eq(&ck, &ca.leaf("API.github.com").unwrap()));
+        assert!(Arc::ptr_eq(&ck, &ca.leaf("API.forge.example").unwrap()));
         // IP literal hosts get IP SANs.
         ca.leaf("10.1.2.3").unwrap();
     }

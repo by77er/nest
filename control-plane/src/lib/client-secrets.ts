@@ -15,7 +15,7 @@ export const ClientSecretPut = z.strictObject({
   value: z.string().min(1),
   description: z.string().max(500).optional(),
   /**
-   * When the value stops being injected: an RFC 3339 time with an offset (e.g. GitHub's `expires_at`).
+   * When the value stops being injected: an RFC 3339 time with an offset (e.g. an issued token's `expires_at`).
    * nest-proxy refuses the binding's placeholder from then on. Absent: it never expires.
    */
   expires_at: z.iso.datetime({ offset: true }).optional(),

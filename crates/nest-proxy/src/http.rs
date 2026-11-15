@@ -1257,10 +1257,10 @@ mod tests {
 
     #[test]
     fn uri_forms() {
-        let t = Target { host: "api.github.com".into(), port: 443, tls: true };
+        let t = Target { host: "api.forge.example".into(), port: 443, tls: true };
         let u: Uri = "/repos?x=1".parse().unwrap();
         assert_eq!(upstream_uri(&u, &t, false), "/repos?x=1");
-        assert_eq!(upstream_uri(&u, &t, true), "https://api.github.com/repos?x=1");
+        assert_eq!(upstream_uri(&u, &t, true), "https://api.forge.example/repos?x=1");
         let t = Target { host: "x.test".into(), port: 8080, tls: false };
         let u: Uri = "http://x.test:8080/a".parse().unwrap();
         assert_eq!(upstream_uri(&u, &t, false), "/a");
