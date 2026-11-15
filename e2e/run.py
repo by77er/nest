@@ -1292,9 +1292,11 @@ def push_client():
         wait_for(lambda: (api("GET", f"/v1/sandboxes/{sid}", token=tok)[1] or {}).get("host"), 60, 0.5, "the client's sandbox placed")
     except TimeoutError as e:
         check("push guard: the client's sandbox is placed", False, str(e)[:200])
+        api("DELETE", f"/v1/sandboxes/{sid}", token=tok)
         return None
     st, ag = api("POST", "/v1/agents", {"template": f"{E2E_APP}/pusher", "sandbox": sid}, token=tok)
     if not check("push guard: the client spawns an agent on it", st == 201 and (ag or {}).get("agent"), json.dumps(ag)[:200]):
+        api("DELETE", f"/v1/sandboxes/{sid}", token=tok)  # no agent to end it with: the client destroys its sandbox
         return None
     return tok, sid, ag["agent"]
 
@@ -1304,6 +1306,8 @@ def run_repos(ids):
         skip("push guards", "fake mode only: the calls are scripted")
         return
     before = live_sandboxes()
+    if not check("push guard: the live sandboxes counted first", before is not None):
+        return
     made = push_client()
     if not made:
         return
