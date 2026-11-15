@@ -241,13 +241,13 @@ describe("the App installation", () => {
     expect(await numbers(p)).toEqual([]);
   });
 
-  it("a project with none yet refuses an event whose repo owner isn't an account the app acts for, nest's client token unset too", () => withEnv("NEST_CLIENT_TOKEN", undefined, async () => {
+  it("a project with none yet refuses an event whose repo owner isn't an account the app acts for, nest's client token unset too", async () => {
     const p = await newProject();
     await dirSql("UPDATE projects SET installation_id = NULL WHERE id = ?", p.id);
-    const r = await deliverGithub("issues", { ...issue(1, { full_name: p.repo }), installation: { id: 5 } });
+    const r = await withEnv("NEST_CLIENT_TOKEN", undefined, () => deliverGithub("issues", { ...issue(1, { full_name: p.repo }), installation: { id: 5 } }));
     expect(((await r.json()) as { ignored: string }).ignored).toContain("repo owner isn't an account the app acts for");
     expect(await numbers(p)).toEqual([]);
-  }));
+  });
 
   it("a project with none yet refuses an event whose repo owner isn't an account the app acts for, until GITHUB_ACCOUNTS names it", async () => {
     const p = await newProject();

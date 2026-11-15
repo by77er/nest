@@ -112,7 +112,7 @@ const MIGRATIONS = [
 export interface RepoBinding {
   project: string;
   name: string;
-  /** The name the project calls the repo by (GitHub, nest's grant, its agents). */
+  /** The name the project calls the repo by (GitHub, its agents). */
   repo: string;
   repo_id: number | null;
   /** Bumped by every change of `repo_id`: which of two reads is newer, whatever the ids. */
@@ -336,8 +336,8 @@ export class DirectoryDO extends DurableObject<Env> {
 
   /**
    * The name GitHub gives the repo now, from an event routed by its id: kept when it isn't the name the
-   * project calls it by (renamed or transferred; applied by a sync or the operator's re-read, once nest's
-   * grant names it), cleared when it is again.
+   * project calls it by (renamed or transferred; applied by a sync or the operator's re-read, once the App
+   * reaches it), cleared when it is again.
    */
   private noteName(project: string, name: string): void {
     const n = name.toLowerCase();
@@ -448,7 +448,7 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.sql.exec("UPDATE projects SET repo = ?, repo_name = NULL WHERE id = ? AND repo_name = ?", n, project, n).rowsWritten > 0;
   }
 
-  /** The GitHub App's id, as a token's source (the App's own secret, or nest's `app_id`) or a check run it made (`app.id`) last told it; null until one has. */
+  /** The GitHub App's id, as the App's own token or a check run it made (`app.id`) last told it; null until one has. Read only by the previous release's attach (kept for its deploy gap). */
   async githubAppId(): Promise<number | null> {
     const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'github_app_id'").toArray()[0];
     return row ? Number(row.v) : null;

@@ -120,9 +120,9 @@ export interface StatusChecks {
 export class GitHub {
   constructor(
     private readonly token: string,
-    /** The GitHub App the token is from; null for a token not of an installation (the App's JWT). */
+    /** The GitHub App the token is from; null when the caller doesn't name it (the App's JWT, a revoke). */
     readonly appId: number | null = null,
-    /** The App installation the token was minted from; null for a token not of an installation. */
+    /** The App installation the token was minted from; null when the caller doesn't name it. */
     readonly installationId: number | null = null,
     /** Called when GitHub answers the token 401 or 404: its source drops it and looks the installation up again. */
     private readonly onStale: () => void = () => {},
