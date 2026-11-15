@@ -1569,7 +1569,8 @@ export class SandboxDO extends DurableObject<Env> {
    * Attach an agent's hands: its slot is configured with `agent_attach`, and no binding is minted before its
    * `ok`. `extra`: what its spec adds while it is attached (everything in one sandbox shares a trust domain).
    * The third and fourth parameters were its repos (a push allowlist, read-only repos), which a caller of
-   * the previous release still passes: ignored (dev/rollout/2026-11-15-kernel-github-minting.md).
+   * the previous release still passes: ignored, and the shape kept until a renamed method replaces it, so no
+   * deploy gap ever has the extras read as repos (dev/rollout/2026-11-15-kernel-github-minting.md).
    */
   async attach(agent: string, cwd?: string, _repos?: unknown, _readRepos?: unknown, extra: AgentAccess = {}): Promise<SandboxInfo> {
     const cur = this.info_();

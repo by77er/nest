@@ -123,7 +123,7 @@ export interface HeldInjection extends ClientInjection {
  * (`InjectionName`) or a client id holds no `.` or `-`.
  */
 export const injectionPlaceholder = (client: string, name: string) => `nest-ph.${client}.${name}.`;
-/** Its name in the wire policy: apart from the operator's and the constructed ones (`github`, …). */
+/** Its name in the wire policy: apart from the operator's. */
 export const CLIENT_BINDING_PREFIX = "client:";
 export const injectionWireName = (name: string) => `${CLIENT_BINDING_PREFIX}${name}`;
 

@@ -15,7 +15,7 @@ import { scopeNamesInjectedAny } from "./injected-any";
 import { EgressHost } from "./client-egress";
 import { CLIENT_BINDING_PREFIX, InjectionName } from "./client-secrets";
 
-/** A client guard's name on the wire (and in the 403 and the audit): apart from the operator's and the constructed ones. */
+/** A client guard's name on the wire (and in the 403 and the audit): apart from the base layer's and the operator's. */
 export const CLIENT_GUARD_PREFIX = "client:";
 
 /** A guard's name: unique in its list, at most 48 characters so `client:<name>` fits the proxy's 64-character audit field. */

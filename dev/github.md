@@ -1,6 +1,6 @@
 # GitHub
 
-How nest's agents reach this repo, and the repo settings that bound what they can merge. **Decided:** a GitHub App from the start, with tokens minted by [BrokerDO](../docs/control-plane/durable-objects/broker/); low-risk changes auto-merge, and `CODEOWNERS` paths need me. Built: `CODEOWNERS`, the repo settings and branch protection below, the `production` environment, the App, installed on `by77er/nest`, BrokerDO's minting of its installation tokens, and the reviewer: the [projects](../projects/README.md) app's `nest-projects/review` check. Not built: the bindings below.
+How nest's agents reach this repo, and the repo settings that bound what they can merge. **Decided:** a GitHub App from the start, whose tokens the [projects](../projects/README.md) app mints (nest's kernel mints none: [no repo tokens](../docs/sandbox/networking/egress/policy/#no-repo-tokens)); low-risk changes auto-merge, and `CODEOWNERS` paths need me. Built: `CODEOWNERS`, the repo settings and branch protection below, the `production` environment, the App, installed on `by77er/nest`, and the reviewer: the [projects](../projects/README.md) app's `nest-projects/review` check. Not built: the bindings below.
 
 ## The App
 
@@ -21,7 +21,7 @@ One App, owned by me and installed only on `by77er/nest`.
 - **No Administration permission:** the App can't change branch protection, environments or secrets.
 - **Commits** are authored as the App's bot user, so history shows which changes agents made.
 
-**Bindings** (BrokerDO narrows each token to these):
+**Bindings** (the app narrows each token to these):
 
 | Binding | Used by | Permissions |
 |---|---|---|

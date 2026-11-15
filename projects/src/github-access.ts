@@ -6,8 +6,8 @@
 // - Per role, a binding of one of them on github.com and api.github.com (workers push; the manager, reviewers
 //   and routine runs only read), the environment that points git and gh at its placeholder, and the egress the
 //   API needs.
-// - The app's own request guards, a port of nest's kernel constructor (`githubGuards` in
-//   control-plane/src/lib/rules/github.ts): pushes and API writes reach only the project's repo, GraphQL only
+// - The app's own request guards, a port of the guards nest's kernel once built (docs/sandbox/networking/egress/
+//   policy/#no-repo-tokens): pushes and API writes reach only the project's repo, GraphQL only
 //   with the sandbox's own token written whole into Authorization, and no gist or content-host writes.
 // Pure, so ProjectDO, ReviewDO and the tests share it.
 //
