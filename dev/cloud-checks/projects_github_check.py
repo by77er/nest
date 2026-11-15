@@ -42,6 +42,8 @@ def request(url: str, headers: dict[str, str]) -> dict:
             body = res.read()
     except urllib.error.HTTPError as e:
         raise Failed(f"{e.code} from {url.split('?')[0]}: {e.read()[:300].decode(errors='replace')}") from None
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise Failed(f"no answer from {url.split('?')[0]}: {e}") from None
     try:
         return json.loads(body)
     except json.JSONDecodeError:
