@@ -6,6 +6,12 @@
 #
 # Targets are repo paths, or `pkg:<name>` for a package (`pkg:cloudflare:*` is the Workers runtime).
 
+# Files whose dynamic imports name a computed path, which no rule could check.
+[dynamic_imports]
+allow = [
+  { file = "scripts/ui-review/review.mjs", why = "loads the app config named on its command line (scripts/ui-review/apps/)" },
+]
+
 # --- The apps are separate systems on nest's public interface (docs/README.md, principle 9) -------
 
 [[imports]]
@@ -15,6 +21,7 @@ from = ["projects/**"]
 only = ["projects/**", "pkg:**"]
 allow = [
   { from = "projects/test/**", to = "protocol/fixtures/**", why = "the wire fixtures are nest's published contract: the app's tests check the policies it builds against them" },
+  { from = "projects/test/github-access.test.ts", to = "control-plane/src/{do/sandbox,lib/injected-any}.ts", why = "read as text (a raw glob) so the app's matcher for nest's 'hosts not ready' refusals (from releases before the hosts_not_ready code) covers both sentences nest sends" },
 ]
 example = { from = "projects/src/worker.ts", to = "control-plane/src/lib/spec.ts" }
 
@@ -39,6 +46,12 @@ types_ok = true
 example = { from = "dashboard/src/api.ts", to = "protocol/admin/view.ts" }
 
 [[imports]]
+name = "dashboard-is-typed-by-the-admin-view"
+why = "The dashboard reads the admin views through the shared contract, so a field it reads but the view lacks fails its typecheck; src/api.ts takes its types from protocol/admin/view.ts rather than restating them."
+from = ["dashboard/src/api.ts"]
+requires = ["protocol/admin/view.ts"]
+
+[[imports]]
 name = "mcp-test-imports-only-itself"
 why = "The MCP test server stands in for an outside MCP server, so it shares no code with nest."
 from = ["mcp-test/**"]
@@ -56,13 +69,30 @@ example = { from = "protocol/admin/view.ts", to = "pkg:zod" }
 
 [[imports]]
 name = "projects-browser-code-holds-no-worker-code"
-why = "The projects UI is bundled for the browser: it may share pure modules with the Worker, but no import it makes, directly or through a shared module, may reach a Durable Object, the Worker entry or a Workers or Node runtime module (types are erased, so `import type` is fine)."
+why = "The projects UI is bundled for the browser: what it imports at run time, directly or through a shared module, stays in the UI and the pure modules it shares with the Worker (listed here), never a Durable Object, a route, nest's or GitHub's client, or a Workers or Node runtime module. Types are erased, so `import type` is fine; sharing another module is a change to this list."
 from = ["projects/src/ui/**", "projects/src/main.tsx"]
 exclude = ["**/*.test.ts", "**/*.test.tsx", "projects/src/ui/test/**"]
-deny = ["projects/src/do/**", "projects/src/worker.ts", "pkg:cloudflare:*", "pkg:node:*"]
+only = [
+  "projects/src/ui/**",
+  "projects/src/main.tsx",
+  # The pure modules the UI shares with the Worker: state machines, validation and presets.
+  "projects/src/automerge.ts",
+  "projects/src/issues.ts",
+  "projects/src/memory.ts",
+  "projects/src/models.ts",
+  "projects/src/network.ts",
+  "projects/src/prs.ts",
+  "projects/src/requests.ts",
+  "projects/src/routines.ts",
+  "projects/src/secrets.ts",
+  "projects/src/tasks.ts",
+  "projects/src/waits.ts",
+  "pkg:**",
+]
+deny = ["pkg:cloudflare:*", "pkg:node:*"]
 types_ok = true
 transitive = true
-example = { from = "projects/src/tasks.ts", to = "projects/src/do/project.ts" }
+example = { from = "projects/src/tasks.ts", to = "projects/src/nest.ts" }
 
 [[imports]]
 name = "projects-worker-code-holds-no-browser-code"
@@ -74,13 +104,14 @@ example = { from = "projects/src/worker.ts", to = "projects/src/ui/App.tsx" }
 
 [[imports]]
 name = "dashboard-browser-code-holds-no-worker-code"
-why = "The dashboard UI is bundled for the browser: no import it makes, directly or through a shared module, may reach the Worker entry, its Access JWT check or a Workers or Node runtime module."
+why = "The dashboard UI is bundled for the browser: what it imports at run time, directly or through a shared module, stays in the UI and the modules it shares with the Worker (the response types and their normalizers in src/api.ts and src/agents.ts), never the Worker entry, its Access check, its lifetimes collector or a Workers or Node runtime module."
 from = ["dashboard/src/ui/**", "dashboard/src/main.tsx"]
 exclude = ["**/*.test.ts", "**/*.test.tsx"]
-deny = ["dashboard/src/worker.ts", "dashboard/src/access.ts", "pkg:cloudflare:*", "pkg:node:*"]
+only = ["dashboard/src/ui/**", "dashboard/src/main.tsx", "dashboard/src/api.ts", "dashboard/src/agents.ts", "protocol/admin/view.ts", "pkg:**"]
+deny = ["pkg:cloudflare:*", "pkg:node:*"]
 types_ok = true
 transitive = true
-example = { from = "dashboard/src/api.ts", to = "dashboard/src/worker.ts" }
+example = { from = "dashboard/src/agents.ts", to = "dashboard/src/lifetimes.ts" }
 
 [[imports]]
 name = "dashboard-worker-code-holds-no-browser-code"
@@ -99,6 +130,7 @@ from = ["control-plane/**"]
 only = ["control-plane/**", "protocol/**", "pkg:**"]
 allow = [
   { from = "control-plane/test/routes.test.ts", to = "docs/control-plane/api/clients/README.md", why = "read as text (?raw) to check the documented client routes against the router" },
+  { from = "control-plane/test/repos.test.ts", to = "images/guest/{git-credential-nest,build.sh}", why = "read as text (a raw glob): the guest's git credential helper against the kernel's placeholders; both go in phase C4 of the plan taking GitHub out of the kernel" },
 ]
 example = { from = "control-plane/src/index.ts", to = "projects/src/nest.ts" }
 
@@ -126,7 +158,7 @@ example = { from = "control-plane/src/do/agent.ts", to = "control-plane/src/inde
 
 [[imports]]
 name = "pure-decisions-stay-pure"
-why = "The control plane's decisions are pure functions (docs/verification/), tested by tables and seeded random walks; what they import at run time, directly or not, stays among the modules that do no I/O, so a decision can't read a clock, the network or storage."
+why = "The control plane's decisions are pure functions (docs/verification/), tested by tables and seeded random walks: what they import at run time, directly or not, stays among the decision modules, the small helpers in util.ts and stored.ts, the wire types and zod, never a Durable Object, the env, or a client of AWS, Cloudflare, GitHub or an MCP server. (An import rule can't see globals such as Date.now(); the modules take the time as an argument where it matters.)"
 from = [
   "control-plane/src/lib/sandbox-lease.ts",
   "control-plane/src/lib/host-lifecycle.ts",

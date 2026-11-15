@@ -59,7 +59,7 @@ jobs:
           fetch-depth: 0
       - id: tree
         run: echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
-      # Guards: doc links, source fences for the CLAUDE.md invariants, module boundaries, and tests
+      # Guards: doc links, source fences for the AGENTS.md invariants, module boundaries, and tests
       # proving each guard can fail.
       - run: python3 -I scripts/check-doc-links.py
       - run: python3 -I scripts/check-fences.py
