@@ -126,6 +126,6 @@ The setup agent creates these itself, so none are needed from me:
 
 - **Claude:** revoke the setup token(s). Where tokens are revoked isn't in the public docs (unverified); stage 1 checks it.
 - **Cloudflare:** delete the API tokens; `wrangler delete` removes the Worker.
-- **GitHub:** revoke the `github_user` token if one was made; an app's GitHub App is that app's to delete.
+- **GitHub:** nest holds no GitHub credential of its own; revoke any `github_user` token a release before used (`DELETE /v1/admin/secrets/github_user` removes nest's copy). An app's GitHub App is that app's to delete.
 - **AWS:** terminate every instance tagged `nest=true`, delete the stacks or resources, schedule the root CA key's deletion in KMS, and deactivate the `nest-provisioner` key. Closing a dedicated account removes everything.
 - **Environment settings:** remove the variables.

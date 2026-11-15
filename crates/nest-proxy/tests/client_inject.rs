@@ -2,7 +2,7 @@
 //! they are ordinary `InjectionBinding`s, named `client:<name>` with the placeholder nest assigns
 //! (`nest-ph.<client>.<name>.`). The fixture `protocol/fixtures/control/egress_policy/egress_policy.client_inject.json`
 //! is what the control plane's constructor produces (a vitest asserts it); here the proxy substitutes
-//! each client secret on its binding's own hosts only, beside the operator's GitHub binding.
+//! each client secret on its binding's own hosts only, beside an operator binding.
 
 use std::collections::HashMap;
 
@@ -22,7 +22,7 @@ fn policy() -> EgressPolicy {
 }
 
 fn secrets() -> HashMap<String, InjectionSecret> {
-    [("client:stripe", "sk_live_REAL"), ("client:search", "search-REAL"), ("client:git", "git-REAL"), ("github", "ghs_REAL")]
+    [("client:stripe", "sk_live_REAL"), ("client:search", "search-REAL"), ("client:git", "git-REAL"), ("forge", "forge_REAL")]
         .into_iter()
         .map(|(b, v)| (b.to_string(), InjectionSecret { binding: b.into(), value: v.into(), expires_ms: None }))
         .collect()
@@ -55,7 +55,7 @@ fn a_client_secret_is_substituted_on_its_own_hosts() {
 
 #[test]
 fn a_client_placeholder_anywhere_else_is_blocked_untouched() {
-    for host in ["evil.com", "github.com", "example.com", "api.stripe.com.evil.com"] {
+    for host in ["evil.com", "forge.example", "example.com", "api.stripe.com.evil.com"] {
         let mut h = HeaderMap::new();
         h.insert(AUTHORIZATION, format!("Bearer {STRIPE}").parse().unwrap());
         h.insert("x-api-key", SEARCH.parse().unwrap());
@@ -72,7 +72,7 @@ fn a_client_placeholder_anywhere_else_is_blocked_untouched() {
 }
 
 #[test]
-fn client_placeholders_and_the_github_one_never_contain_each_other() {
+fn client_placeholders_and_the_operators_never_contain_each_other() {
     // nest-proxy finds a placeholder as a substring before it checks the host: one inside another would
     // block (or substitute) the wrong binding.
     let p = policy();
@@ -82,10 +82,10 @@ fn client_placeholders_and_the_github_one_never_contain_each_other() {
             assert!(a == b || !a.contains(b), "{a} contains {b}");
         }
     }
-    // The GitHub placeholder is substituted for its own binding, with client bindings beside it.
+    // The operator's placeholder is substituted for its own binding, with client bindings beside it.
     let mut h = HeaderMap::new();
-    h.insert(AUTHORIZATION, "Bearer nest-ph-github".parse().unwrap());
-    assert_eq!(run("github.com", &secrets(), &mut h), Verdict::Substituted("github".into()));
+    h.insert(AUTHORIZATION, "Bearer nest-ph-forge".parse().unwrap());
+    assert_eq!(run("forge.example", &secrets(), &mut h), Verdict::Substituted("forge".into()));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # Developing nest
 
-How this repo is built, tested and shipped, and how nest's own agents will maintain it. **This is about the project, not the platform.** Running nest on its own repo is one use of the [repo maintenance](../docs/orchestration/repo-maintenance/) pattern, so it lives here, outside `docs/`.
+How this repo is built, tested and shipped, and how nest's own agents will maintain it. **This is about the project, not the platform.** Running nest on its own repo is one use of [repo maintenance](repo-maintenance.md), so both live here, outside `docs/`.
 
 > Built:
 > - CI (`.github/workflows/ci.yml`), `.github/CODEOWNERS`, branch protection on `main` (`ci-ok` and `nest-projects/review`) and the `production` environment;
@@ -40,6 +40,7 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 | Agents auto-merge PRs that pass CI and the reviewer's check, except changes to `CODEOWNERS` paths, which need me | [github.md](github.md) |
 | Merges deploy the control plane to production; a health window rolls back on regression, and deploys pause until a fix or my say-so | [deploy.md](deploy.md) |
 | nest's agents reach this repo through a GitHub App from the start | [github.md](github.md) |
+| Repo maintenance is a pattern: a maintainer, a worker per task, a clean-context reviewer per PR and a monitor, merging through the repo's own GitHub gates (required checks, the review check pinned to the App, `CODEOWNERS`) | [repo-maintenance.md](repo-maintenance.md) |
 
 ## Files
 
@@ -49,6 +50,7 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 | [deploy.md](deploy.md) | `deploy.yml`, the health window, `rollback.yml` |
 | [rollout/](rollout/README.md) | each release's rollout rule, one file per change |
 | [github.md](github.md) | The App's permissions and bindings for this repo, branch protection, merge policy |
+| [repo-maintenance.md](repo-maintenance.md) | How nest's agents maintain a repo: the maintainer, workers, reviewers and the monitor, and the gates they merge through |
 | [setup.md](setup.md) | What I set up on GitHub and Cloudflare for all of the above |
 | [practices.md](practices.md) | Guards, test rules, evidence tiers, review and supply chain: what keeps agent-written changes safe |
 | [review-lessons.md](review-lessons.md) | Standalone lessons from real findings, checked on every review |
@@ -65,7 +67,7 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 3. **Build the minimum platform slice.** Each step is a PR through the gates above, with me as reviewer until step 4:
    1. Grants. Taint, spawn specs, templates and capabilities are built; grants (attenuated down the chain) only for `read_transcript`.
    2. Coordination as an app on the [API clients](../docs/control-plane/api/clients/) interface: the [projects](../projects/README.md) task board (a manager, a worker per task, a reviewer per PR, auto-merge) is built. `wake_at` isn't.
-   3. BrokerDO's GitHub App minting for sandboxes' pushes. Built; it moves to the projects app (phase C of taking GitHub out of the kernel).
+   3. GitHub tokens for sandboxes' pushes. Built in the [projects](../projects/README.md#github-tokens) app, from its own GitHub App; the kernel mints none (phase C of taking GitHub out of the kernel).
    4. A dev sandbox image with git, `gh`, Rust, Node, Python and nftables, and a warm build cache. `nest-base` adds git, `gh`, Python and build-essential to Firecracker's CI rootfs (`images/guest/build.sh`), and no Rust, Node or nftables.
    5. Metrics emitters, the `metrics` capability, and the rest of `deploy.yml` (the health window).
 4. **Hand over:** spawn the maintainer and the monitor. From then on, agents build the rest (such as versioned host rollout), and I review only `CODEOWNERS` paths.

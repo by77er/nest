@@ -2,7 +2,7 @@
   "version": 3,
   "allow": [
     {
-      "host": "github.com",
+      "host": "forge.example",
       "ports": [
         443
       ],
@@ -33,12 +33,12 @@
   "passthrough": [],
   "inject": [
     {
-      "name": "github",
+      "name": "forge",
       "hosts": [
-        "github.com",
-        "api.github.com"
+        "forge.example",
+        "api.forge.example"
       ],
-      "placeholder": "nest-ph-github",
+      "placeholder": "nest-ph-forge",
       "locations": [
         {
           "type": "authorization_bearer"

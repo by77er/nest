@@ -180,7 +180,7 @@ Sources for the re-check: [SPACE's state/egress.rs](https://github.com/perplexit
 
 ### Tests
 
-The evaluator with made-up hosts (`guard.rs` unit tests, `tests/guards.rs` through the real proxy: refusals before the upstream, body replay, the injected-credential exceptions, named and `*`, passthrough and TCP); seam fixtures the control plane produces and nest-proxy evaluates (`egress_policy.injected_any.json`, `egress_policy.client_guards.json`; and an operator's floor written as data, `egress_policy.base_floor.json`: the base layer carries it to a sandbox as written (`egress-base.test.ts`) and `tests/base_floor.rs` evaluates GitHub's request shapes against it); and the e2e harness's `run_repos`: an operator guard written as data refuses a `git push` and receive-pack to another repo and lets one repo's discovery reach GitHub, with the audit record.
+The evaluator with made-up hosts (`guard.rs` unit tests, `tests/guards.rs` through the real proxy: refusals before the upstream, body replay, the injected-credential exceptions, named and `*`, passthrough and TCP); seam fixtures the control plane produces and nest-proxy evaluates (`egress_policy.injected_any.json`, `egress_policy.client_guards.json`; and an operator's floor written as data, `egress_policy.base_floor.json`: the base layer carries it to a sandbox as written (`egress-base.test.ts`) and `tests/base_floor.rs` evaluates GitHub's request shapes against it); and the e2e harness's `run_repos`: an API client's guard in its sandbox's client layer (`client:push-allowlist`, as an app writes one) refuses a `git push`, and receive-pack and its discovery, to another repo and lets one repo's discovery reach GitHub, with the audit record.
 
 ## Audit
 

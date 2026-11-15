@@ -34,7 +34,7 @@ accept (listener ⇒ sandbox [, agent])
 | CA chain (root in KMS), on-the-fly leaf certificates, handshake fairness, upstream verification | [tls/](tls/) |
 | Request checks after decryption: routed name, routing overrides, smuggling, limits, final re-check | [inspection/](inspection/) |
 | Hard deny, policy layers, live re-checks, temporary grants, TCP exceptions, request guards, no repo tokens, limits, audit | [policy/](policy/) |
-| Placeholder credential injection, binding scope, GitHub App | [injection/](injection/) |
+| Placeholder credential injection, binding scope, API clients' bindings | [injection/](injection/) |
 
 **Late pushes can't revive a dropped sandbox:** the proxy remembers `sandbox_drop` per epoch and refuses policy, secrets and listeners for that epoch or older, so a fence racing sandbox setup stays fenced. A newer epoch (re-placement) is accepted.
 
