@@ -7,7 +7,7 @@ description: Use when reviewing a nest pull request or diff (code, docs, tests, 
 
 Review from the diff, the task and the repo, never the author's transcript. Run the checks yourself (`nest-validation`). Pass, or fail with specific reasons; don't approve "with nits", list them as comments. A frontend change also needs a design review PASS (`nest-design-review`); this review doesn't judge design.
 
-1. **Invariants:** every invariant in `AGENTS.md` still holds. A change near them keeps `scripts/check-fences.py` passing without widening `scripts/fences.toml`; a widened fence needs the owner.
+1. **Invariants:** every invariant in `AGENTS.md` still holds. A change near them keeps `scripts/check-fences.py` and `scripts/check-boundaries.py` passing without widening `scripts/fences.toml` or `scripts/boundaries.toml`; a widened fence or boundary needs the owner.
 2. **Kernel scope:** nothing app-specific enters the platform. A client, app or provider that seems to need a special case means the generic interface is wrong: fix the interface, don't add the case ([principle 9](../../../docs/README.md#principles)).
 3. **Docs** follow `AGENTS.md`'s Docs rules: the decision in the lowest owning doc with its summaries updated, open questions also in `docs/README.md`, external facts sourced or marked unverified, no tombstones, this repo's process in `dev/`.
 4. **Tests** follow `nest-tests`: each can fail, the PR says what was mutation-checked, claims name their evidence tier, skipped tests are called out.
