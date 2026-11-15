@@ -310,10 +310,6 @@ describe("the live client layer: bindings and environment", () => {
     const op = await admin("/v1/agents", { method: "POST", body: { template: "worker", sandbox: s.sandbox, start: false, overrides: { repos: ["o/r"] } } });
     expect(op.status).toBe(400);
     expect((await op.json() as any).error.message).toContain("GIT_CONFIG_COUNT");
-    // Nor a fork the operator approved for an attached agent (`github.fork`).
-    const sstub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
-    await expect(Promise.resolve().then(() => sstub.allowAgentRepos(a.agent, ["o/fork"]))).rejects.toThrow(/GH_TOKEN/);
-    expect(await sstub.pushRepos()).toEqual([]);
     // Nothing of the refused writes stuck: still no GitHub access, and the env as it was.
     expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`)).inject.map((b: any) => b.name)).not.toContain("github");
     expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`)).github_push).toEqual({ workflows: false });

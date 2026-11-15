@@ -117,8 +117,8 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
      `POST /v1/admin/capabilities/<name>/oauth {scopes?}` (answers `authorize_url`: open it and approve), which lands on the public
      `GET /v1/oauth/callback`; `GET /v1/admin/capabilities/<name>/oauth` shows the state, never a token. nest's client ID metadata
      document is the public `GET /v1/oauth/client.json` (`docs/agents/capabilities/mcp/#oauth`)
-   - Brokered actions (`docs/agents/capabilities/brokered/`): the GitHub App with `PUT /v1/admin/secrets/github_app {"value": "{\"app_id\": \"…\", \"private_key\": \"-----BEGIN RSA PRIVATE KEY-----…\"}"}`,
-     a profile's credential with `PUT /v1/admin/secrets/http:<name>`, then a capability `{"brokered": [{"action": "github.create_pr", "repos": ["owner/name"]}, …]}`
+   - Brokered actions (`docs/agents/capabilities/brokered/`): a profile's credential with `PUT /v1/admin/secrets/http:<name>`, then a capability
+     `{"brokered": [{"action": "http.request", "profile": "<name>", "base_url": "https://…", "methods": ["GET"], "auth": {"secret": "http:<name>"}}, …]}`
      added to a template. `GET /v1/agents/<id>/brokered?limit=&before=` is the agent's journal, newest first
 
 ## API clients
@@ -155,7 +155,7 @@ retries; `GET /v1/clients/self` (the client) and `GET /v1/admin/clients/<cli>` s
 | `SANDBOX_RETENTION` | Generation retention (`src/lib/retention.ts`; docs/sandbox/state/#retention): `on` (the default: marks generations `deleting` and non-source memory unrooted; GC's first run after it turns on is dry) or `off` (an emergency stop) |
 | `ALLOW_LOOPBACK_MCP` | `1` lets an mcp capability name a loopback URL (`http://127.0.0.1:…`): tests and local dev (the e2e harness) only; never set in a deploy |
 | `ALLOW_LOOPBACK_BROKERED` | `1` lets an http profile and `GITHUB_API_URL` name a loopback URL: tests and local dev only; never set in a deploy |
-| `GITHUB_API_URL`, `BROKERED_TIMEOUT_MS` | The REST API GitHub actions use (default `https://api.github.com`; a fake in e2e) and one brokered request's budget (default 30000) |
+| `GITHUB_API_URL`, `BROKERED_TIMEOUT_MS` | The REST API the GitHub App's mints use (default `https://api.github.com`; a fake, for local development) and one brokered request's budget (default 30000) |
 | `MCP_CALL_TIMEOUT_MS`, `MCP_LIST_TIMEOUT_MS` | The MCP proxy's budget for one forwarded `tools/call` (default 45000) and the connector's for listing one server's tools, `initialize` included (default 4000) |
 | `MCP_ADMIT_WAIT_MS`, `MCP_RELIST_MS` | How long an MCP call waits for a slot on its server (default 10000), and how often a connector lists again while brains use its list (default 60000) |
 | `NEST_DOMAIN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_TUNNEL_API_TOKEN` | Per-host tunnels (`src/lib/cloudflare.ts`): with all three set, a sandbox host's enrollment creates a Cloudflare Tunnel `<label>-<host>`, its ingress to the gateway on loopback and a proxied CNAME `<host>-gw-<label>.<zone>`, and `resolve` targets `wss://` that hostname (a tunnel host that serves none is not ready, never its loopback `gateway_url`). `NEST_DOMAIN` also names previews (`<port>-<sandbox>-preview-<label>.<zone>`) and share links (`<token>-share-<label>.<zone>`). The token needs Account › Cloudflare One Connector: cloudflared › Edit and Zone › DNS › Edit. Unset: no tunnels; `resolve` uses the host's own `gateway_url`, and preview names use `nest.localhost` |
@@ -220,8 +220,8 @@ Secret values exist only in BrokerDO. Command bodies stored in FleetDO (and its 
 - **Built: placement** packs (`test/placement.test.ts`): on regular pages by `memory_mib_free` with a per-sandbox
   reserve and an optional per-host cap, on a hugepage host by the pool; an empty host always takes one.
 - **Platform tools without implementations** return `not_implemented`: `fork_sandbox`,
-  `attach`, `checkpoint`, and the seeded `management` and `memory` capabilities' tools; of the brokered actions, `email.send`.
-- **GitHub App installation tokens** are minted for brokered actions and for a sandbox's push allowlist (`docs/control-plane/durable-objects/broker/#injection-minting`); the rule constructors are in `src/lib/rules/` (GitHub's only).
+  `attach`, `checkpoint`, and the seeded `management` and `memory` capabilities' tools.
+- **GitHub App installation tokens** are minted for a sandbox's push allowlist and read-only repos (`docs/control-plane/durable-objects/broker/#injection-minting`); the rule constructors are in `src/lib/rules/` (GitHub's only).
 - **Metrics** (`docs/control-plane/metrics/`): no Analytics Engine writes or `metrics_query`. Built: `/v1/health` makes one read-only round trip to each DO class (`src/lib/health.ts`).
 - **Catalogs seeded before this release** keep `delegate`, `spawn_agent` and `kill` in `management` (ignored on expansion: the registry no longer has them), get the `spawning` capability without a template listing it, and the old `worker` (`subagents`, `TodoWrite`, `Task`, `WebSearch`) until the operator edits them; a new catalog gets the design's (`docs/control-plane/durable-objects/catalog/`).
 - **Security design** (`docs/control-plane/api/`, `docs/sandbox/networking/egress/tls/`): one `ADMIN_TOKEN` stands in for scoped, hashed operator tokens; there's no revocation counter; the CSR shape isn't enforced; BrokerDO audits GitHub mints only (not secret pushes or binding mints).

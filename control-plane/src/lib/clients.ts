@@ -76,25 +76,24 @@ export function mcpUrlAllowed(grant: Pick<Grant, "mcp_urls">, url: string): bool
 }
 
 /**
- * What a capability or expanded spec reaches that no grant field covers: GitHub repos to push to or read
- * (`repos`, `read_repos`), a push token's `workflows: write` (`github_push`), and brokered actions. A
- * grant holds no GitHub authority (docs/control-plane/api/clients/#no-github-authority): an app holds its own.
+ * What an expanded spec reaches of GitHub, which no grant field covers: repos to push to or read (`repos`,
+ * `read_repos`) and a push token's `workflows: write` (`github_push`). A grant holds no GitHub authority
+ * (docs/control-plane/api/clients/#no-github-authority): an app holds its own.
  */
-function githubOutside(spec: Pick<AgentSpec, "repos" | "read_repos" | "brokered" | "github_push">): string[] {
+function githubOutside(spec: Pick<AgentSpec, "repos" | "read_repos" | "github_push">): string[] {
   const out: string[] = [];
   const repos = canonicalRepos(spec.repos ?? []);
   if (repos.length) out.push(`repos ${repos.join(", ")}`);
   const read = canonicalRepos(spec.read_repos ?? []);
   if (read.length) out.push(`read_repos ${read.join(", ")}`);
-  for (const b of spec.brokered ?? []) out.push(`brokered action ${b.action} (${b.capability})`);
   if (spec.github_push?.workflows) out.push("github_push.workflows");
   return out;
 }
 
 /**
  * Everything an expanded spec reaches outside the grant: its credential, each mcp server and the
- * secrets it authenticates with, its injections and egress, and whatever no grant field covers
- * (`githubOutside`). Empty: within it.
+ * secrets it authenticates with, its injections and egress, and what no grant field covers: brokered
+ * actions and GitHub (`githubOutside`). Empty: within it.
  */
 export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "brokered" | "repos" | "read_repos" | "inject" | "github_push" | "egress">, grant: Grant): string[] {
   const out: string[] = [];
@@ -106,6 +105,7 @@ export function specOutsideGrant(spec: Pick<AgentSpec, "credential" | "mcp" | "b
     if (m.auth !== undefined && !creds.has(m.auth)) out.push(`credential ${m.auth} (${m.capability})`);
     if (m.oauth?.client && !creds.has(m.oauth.client)) out.push(`credential ${m.oauth.client} (${m.capability})`);
   }
+  for (const b of spec.brokered ?? []) out.push(`brokered action ${b.action} (${b.capability})`);
   out.push(...githubOutside(spec));
   out.push(...injectionsOutsideGrant(spec.inject ?? [], grant.inject_hosts ?? []));
   out.push(...egressOutsideGrant(spec.egress?.allow ?? [], grant.egress_hosts ?? []));

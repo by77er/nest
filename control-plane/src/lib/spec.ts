@@ -7,7 +7,7 @@ import { z } from "zod";
 import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protocol/control";
 import { capabilityNameClash, checkMcpUrl, grantOf, type McpGrant, McpSource } from "./mcp";
 import { ClientInjections, type HeldInjection, holdInjections, narrowInjections } from "./client-secrets";
-import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, type BrokeredGrant, checkBrokered, grantOfEntry, scopeToRepos } from "./brokered";
+import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, REMOVED_TOOL_NAMES, type BrokeredGrant, checkBrokered, grantOfEntry, StoredBrokeredSource } from "./brokered";
 import { canonicalRepos, narrowRepos, readOnlyRepos, Repos } from "./repos";
 import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
 import { GithubPush } from "./rules/github";
@@ -40,12 +40,17 @@ export const Capability = z.object({
   prompt: z.string().default(""),
   /** A remote MCP server whose tools it gives, as `<capability>_<tool>` (docs/agents/capabilities/mcp/). */
   mcp: McpSource.optional(),
-  /** Brokered actions it grants, each scoped (docs/agents/capabilities/#brokered-actions): GitHub actions to repos, http profiles. */
+  /** Brokered actions it grants, each scoped (docs/agents/capabilities/brokered/): http profiles. */
   brokered: BrokeredSource.optional(),
   /** The templates its `agent_spawn` may spawn from (the spawn grant; docs/agents/#spawning). */
   spawn: z.array(EntryName).optional(),
 });
 export type Capability = z.output<typeof Capability>;
+/**
+ * A capability as CatalogDO reads it back: as written, except that `brokered` entries naming a removed
+ * action (written before it went) are dropped rather than failing the whole row (docs/agents/capabilities/brokered/#actions).
+ */
+export const StoredCapability = Capability.extend({ brokered: StoredBrokeredSource.optional() });
 
 export const Template = z.object({
   capabilities: z.array(EntryName),
@@ -56,7 +61,7 @@ export const Template = z.object({
   credential: Credential,
   /**
    * The repos its agents may push to (docs/sandbox/networking/egress/policy/#repo-allowlists): joined to
-   * its sandbox's allowlist while attached, and the scope of its unscoped GitHub brokered actions.
+   * its sandbox's allowlist while attached.
    */
   repos: Repos.optional(),
   /**
@@ -576,8 +581,8 @@ export function checkCapability(
     if (!mcp) return err("an mcp capability is checked with its name");
     const url = checkMcpUrl(cap.mcp.url, mcp.allowLoopback);
     if (!url.ok) return err(`mcp.url: ${url.error}`);
-    // Brokered actions' tools (`github_comment`, …) are platform tools too.
-    const clash = capabilityNameClash(mcp.name, [...registry, ...BROKERED_TOOL_NAMES]);
+    // Brokered actions' tools (`http_request`) are platform tools too, and the removed ones' stay reserved.
+    const clash = capabilityNameClash(mcp.name, [...registry, ...BROKERED_TOOL_NAMES, ...REMOVED_TOOL_NAMES]);
     if (clash) return err(clash);
     const tools = cap.mcp.tools ?? [];
     if (new Set(tools).size !== tools.length) return err("mcp.tools lists a tool twice");
@@ -716,10 +721,7 @@ export function expandTemplate(
       mcp.push(g);
     }
     for (const t of cap.spawn ?? []) if (!spawn.includes(t)) spawn.push(t);
-    for (const e of cap.brokered ?? []) {
-      const g = grantOfEntry(c, e);
-      if (g) brokered.push(g);
-    }
+    for (const e of cap.brokered ?? []) brokered.push(grantOfEntry(c, e));
   }
   // A stored capability may name a tool the registry no longer has (`delegate`, in catalogs seeded
   // before it went): ignored, not a failed spawn. Writes still refuse one (`checkCapability`).
@@ -787,26 +789,17 @@ function withEnv(spec: AgentSpec, name: string, over: Readonly<Record<string, st
   return ok({ ...rest, ...(Object.keys(env).length ? { env } : {}) });
 }
 
-/**
- * The spec with this push allowlist and these read-only repos: recorded (a repo on both is pushable),
- * and its unscoped GitHub grants narrowed to the allowlist (`scopeToRepos`; read-only repos scope no
- * action). `narrowed`: the allowlist narrows the template's, so an unscoped grant narrowed to none
- * reaches nothing and goes, rather than reaching every repo as an unscoped grant does.
- */
-function withRepos(spec: AgentSpec, repos: readonly string[], readRepos: readonly string[], narrowed = false): AgentSpec {
-  const { repos: _, read_repos: _read, brokered, ...rest } = spec;
+/** The spec with this push allowlist and these read-only repos, recorded (a repo on both is pushable). */
+function withRepos(spec: AgentSpec, repos: readonly string[], readRepos: readonly string[]): AgentSpec {
+  const { repos: _, read_repos: _read, ...rest } = spec;
   const r = canonicalRepos(repos);
   const read = readOnlyRepos(r, readRepos);
-  const kept = narrowed && !r.length && spec.repos?.length
-    ? brokered?.filter((g) => g.action === "http.request" || g.action === "github.fork" || g.repos !== null)
-    : brokered;
-  const scoped = kept ? scopeToRepos(kept, r) : undefined;
-  return { ...rest, ...(scoped?.length ? { brokered: scoped } : {}), ...(r.length ? { repos: r } : {}), ...(read.length ? { read_repos: read } : {}) };
+  return { ...rest, ...(r.length ? { repos: r } : {}), ...(read.length ? { read_repos: read } : {}) };
 }
 
 /**
  * A spec's tools narrowed to `subset`, which must not name a tool the spec lacks: platform tools by
- * name, a remote tool as `<capability>_<tool>`, a brokered action by its tool (`github_comment`). A
+ * name, a remote tool as `<capability>_<tool>`, a brokered action by its tool (`http_request`). A
  * given subset narrows each mcp grant's allowlist to the remote tools it names, and drops a grant it
  * names none of; it keeps only the brokered grants of the actions it names.
  */
@@ -899,7 +892,7 @@ export function expandSpec(
     const rule_sources = [...narrowing, ...(base.value.rule_sources ?? [])];
     return withEnv(withRepos({
       ...rest, ...tools.value, ...lifetimes, ...extras, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), rule_sources,
-    }, repos.value, readRepos.value, true), spec.template, o.data.env);
+    }, repos.value, readRepos.value), spec.template, o.data.env);
   }
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value, o.tools);

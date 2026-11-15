@@ -1,167 +1,20 @@
 // Brokered actions and egress widening (docs/agents/tools/#taint-and-sinks): the pipeline end to end
-// inside the pool. A runner session calls `github_*`, `http_request`, `brokered` or `egress_policy`; a
-// fake GitHub (a fetch handler for https://api.github.com, installed over the global fetch BrokerDO and
-// AgentDO call) checks the App's JWT against the App's public key, scopes every installation token to
-// what it was minted for, and records every request. Each guarantee has a test that fails without it.
+// inside the pool. A runner session calls `http_request`, `brokered` or `egress_policy`; each profile's
+// server is a stub (a fetch handler for https://http.test/<id>/…, installed over the global fetch AgentDO
+// calls) that records every request. Each guarantee has a test that fails without it.
 import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { secretNeedles } from "../src/do/broker";
-import { authorize, grantOfEntry, keyDigest, pathCovered, safePath } from "../src/lib/brokered";
-import { appJwt, GitHubApi, importAppKey, pkcs1ToPkcs8 } from "../src/lib/github";
+import { actionDef, authorize, type BrokeredGrant, brokeredToolDefs, grantOfEntry, pathCovered, REMOVED_ACTIONS, safePath } from "../src/lib/brokered";
 import { CallLedger } from "../src/lib/calls";
-import { b64url, b64urlToBytes, bytesToB64 } from "../src/lib/util";
+import { bytesToB64 } from "../src/lib/util";
 import { adminJson, connectHost, nextCommands, uniqueCell, Ws } from "./helpers";
 
 const SESSION = "ses_5f0c1a2e-8b7d-4c3e-9a10-2f6d4b8e1c73";
-/** The operator's GitHub user token, as `github.fork` uses it (low entropy: not a real token's shape). */
-const GITHUB_USER_TOKEN = "operator-user-token-for-tests";
-const APP_ID = "424242";
 const agentStub = (id: string) => env.AGENT.get(env.AGENT.idFromName(id));
+const catalogStub = () => env.CATALOG.get(env.CATALOG.idFromName("catalog"));
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 8);
-
-// --- The App's key -------------------------------------------------------------------------------------
-
-/** The inner `RSAPrivateKey` of a PKCS#8 RSA key: what GitHub hands out (`BEGIN RSA PRIVATE KEY`). */
-function pkcs1Of(pkcs8: Uint8Array): Uint8Array {
-  // PrivateKeyInfo ::= SEQUENCE { INTEGER 0, AlgorithmIdentifier, OCTET STRING { RSAPrivateKey } }
-  const len = (o: number): [number, number] => {
-    const b = pkcs8[o]!;
-    if (b < 0x80) return [b, o + 1];
-    const n = b & 0x7f;
-    let v = 0;
-    for (let i = 0; i < n; i++) v = v * 256 + pkcs8[o + 1 + i]!;
-    return [v, o + 1 + n];
-  };
-  let [, o] = len(1); // outer SEQUENCE
-  o += 3; // INTEGER 0
-  const [algLen, algBody] = len(o + 1);
-  o = algBody + algLen;
-  const [keyLen, keyBody] = len(o + 1); // OCTET STRING
-  return pkcs8.slice(keyBody, keyBody + keyLen);
-}
-const pem = (label: string, der: Uint8Array) => `-----BEGIN ${label}-----\n${bytesToB64(der).match(/.{1,64}/g)!.join("\n")}\n-----END ${label}-----\n`;
-
-let appKeys: CryptoKeyPair;
-let appPkcs1Pem: string;
-
-async function verifyJwt(jwt: string): Promise<{ iat: number; exp: number; iss: string } | null> {
-  const [h, p, sig] = jwt.split(".");
-  if (!h || !p || !sig) return null;
-  const ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", appKeys.publicKey, b64urlToBytes(sig), new TextEncoder().encode(`${h}.${p}`));
-  if (!ok || JSON.parse(new TextDecoder().decode(b64urlToBytes(h))).alg !== "RS256") return null;
-  return JSON.parse(new TextDecoder().decode(b64urlToBytes(p)));
-}
-
-// --- The fake GitHub -------------------------------------------------------------------------------------
-
-interface Item { id: number; number?: number; body: string; html_url: string; head?: string; base?: string; state?: string }
-type Behaviour = { status?: number; applyThenFail?: boolean };
-
-class FakeGitHub {
-  /** repo (lowercase) → installation id. */
-  readonly installs = new Map<string, number>();
-  readonly mints: { installation: number; repositories: string[]; permissions: Record<string, string> }[] = [];
-  readonly tokens = new Map<string, { repo: string; permissions: Record<string, string> }>();
-  readonly forks: { upstream: string; body: unknown }[] = [];
-  /** Every write (non-GET) request: method and path. */
-  readonly writes: { method: string; path: string; body: any }[] = [];
-  readonly comments = new Map<string, Item[]>();
-  readonly issues = new Map<string, Item[]>();
-  readonly pulls = new Map<string, Item[]>();
-  readonly reviews = new Map<string, Item[]>();
-  /** The next write requests' behaviour, in order. */
-  readonly next: Behaviour[] = [];
-  /** The next pull request listings show nothing (one made meanwhile, not yet listed). */
-  hidePulls = 0;
-  private n = 0;
-
-  async handle(req: Request): Promise<Response> {
-    const u = new URL(req.url);
-    const json = (status: number, body: unknown) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
-    if (req.headers.get("accept") !== "application/vnd.github+json" || !req.headers.get("user-agent")) return json(400, { message: "headers" });
-    const auth = (req.headers.get("authorization") ?? "").replace(/^Bearer /, "");
-    const body = req.method === "GET" ? null : await req.json() as any;
-    let m: RegExpMatchArray | null;
-    if ((m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)\/installation$/)) && req.method === "GET") {
-      const c = await verifyJwt(auth);
-      if (!c || c.iss !== APP_ID || c.exp - c.iat > 660) return json(401, { message: "A JSON web token could not be decoded" });
-      const id = this.installs.get(m[1]!.toLowerCase());
-      return id ? json(200, { id }) : json(404, { message: "Not Found" });
-    }
-    if ((m = u.pathname.match(/^\/app\/installations\/(\d+)\/access_tokens$/)) && req.method === "POST") {
-      const c = await verifyJwt(auth);
-      if (!c || c.iss !== APP_ID) return json(401, { message: "bad JWT" });
-      this.mints.push({ installation: Number(m[1]), repositories: body.repositories, permissions: body.permissions });
-      const repo = [...this.installs].find(([r, i]) => i === Number(m![1]) && r.endsWith(`/${body.repositories[0]}`))?.[0];
-      if (!repo) return json(422, { message: "There is at least one repository that does not exist or is not accessible to the parent installation." });
-      const token = `ghs_fake${String(++this.n).padStart(32, "0")}`;
-      this.tokens.set(token, { repo, permissions: body.permissions });
-      return json(201, { token, expires_at: new Date(Date.now() + 3_600_000).toISOString(), permissions: body.permissions });
-    }
-    // A fork, with the operator's own token (the App can't fork from an account it isn't on).
-    if ((m = u.pathname.match(/^\/repos\/([^/]+)\/([^/]+)\/forks$/)) && req.method === "POST") {
-      if (auth !== GITHUB_USER_TOKEN) return json(401, { message: "Bad credentials" });
-      this.forks.push({ upstream: `${m[1]}/${m[2]}`, body });
-      return json(202, { full_name: `Operator/${m[2]}`, html_url: `https://github.com/Operator/${m[2]}`, default_branch: "trunk", parent: { default_branch: "trunk" } });
-    }
-    // Everything else needs an installation token for exactly this repo.
-    const r = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)$/);
-    const t = this.tokens.get(auth);
-    if (!r || !t || t.repo !== r[1]!.toLowerCase()) return json(403, { message: "Resource not accessible by integration" });
-    const repo = r[1]!.toLowerCase();
-    const rest = r[2]!;
-    if (req.method !== "GET") this.writes.push({ method: req.method, path: u.pathname, body });
-    const b = req.method !== "GET" ? this.next.shift() ?? {} : {};
-    if (b.status && !b.applyThenFail) return json(b.status, { message: "scripted" });
-    const done = (status: number, item: Item) => (b.applyThenFail ? json(b.status ?? 502, { message: "scripted after applying" }) : json(status, item));
-    const list = (map: Map<string, Item[]>, k: string) => map.get(k) ?? (map.set(k, []), map.get(k)!);
-    if ((m = rest.match(/^\/issues\/(\d+)\/comments$/))) {
-      const items = list(this.comments, `${repo}#${m[1]}`);
-      if (req.method === "GET") return json(200, items);
-      if (!t.permissions.issues && !t.permissions.pull_requests) return json(403, { message: "permissions" });
-      const it = { id: ++this.n, body: body.body, html_url: `https://github.com/${repo}/issues/${m[1]}#issuecomment-${this.n}` };
-      items.push(it);
-      return done(201, it);
-    }
-    if (rest === "/issues") {
-      const items = list(this.issues, repo);
-      if (req.method === "GET") return json(200, [...items].reverse());
-      const it = { id: ++this.n, number: this.n, body: body.body, html_url: `https://github.com/${repo}/issues/${this.n}` };
-      items.push(it);
-      return done(201, it);
-    }
-    if (rest === "/pulls") {
-      const items = list(this.pulls, repo);
-      if (req.method === "GET" && this.hidePulls > 0) {
-        this.hidePulls--;
-        return json(200, []);
-      }
-      if (req.method === "GET") {
-        const head = u.searchParams.get("head");
-        const base = u.searchParams.get("base");
-        return json(200, items.filter((p) => p.state === "open" && (!head || `${repo.split("/")[0]}:${p.head}` === head.toLowerCase() || p.head === head) && (!base || p.base === base)));
-      }
-      if (t.permissions.pull_requests !== "write") return json(403, { message: "permissions" });
-      // GitHub reads both refs with the token: without contents read it answers this (observed 2026-10-31).
-      if (!t.permissions.contents) return json(422, { message: "Validation Failed", errors: [{ message: "not all refs are readable" }] });
-      if (items.some((p) => p.state === "open" && p.head === body.head && p.base === body.base)) {
-        return json(422, { message: "Validation Failed", errors: [{ message: `A pull request already exists for ${body.head}.` }] });
-      }
-      const it = { id: ++this.n, number: this.n, body: body.body ?? "", head: body.head, base: body.base, state: "open", html_url: `https://github.com/${repo}/pull/${this.n}` };
-      items.push(it);
-      return done(201, it);
-    }
-    if ((m = rest.match(/^\/pulls\/(\d+)\/comments$/))) {
-      const items = list(this.reviews, `${repo}#${m[1]}`);
-      if (req.method === "GET") return json(200, [...items].reverse());
-      const it = { id: ++this.n, body: body.body, html_url: `https://github.com/${repo}/pull/${m[1]}#discussion_r${this.n}` };
-      items.push(it);
-      return done(201, it);
-    }
-    return json(404, { message: "Not Found" });
-  }
-}
 
 // --- An http profile's server ----------------------------------------------------------------------------
 
@@ -190,18 +43,12 @@ class HttpStub {
   }
 }
 
-const gh = new FakeGitHub();
 const stubs = new Map<string, HttpStub>();
 const realFetch = globalThis.fetch;
-beforeAll(async () => {
-  appKeys = await crypto.subtle.generateKey({ name: "RSASSA-PKCS1-v1_5", modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: "SHA-256" }, true,
-    ["sign", "verify"]) as CryptoKeyPair;
-  appPkcs1Pem = pem("RSA PRIVATE KEY", pkcs1Of(new Uint8Array(await crypto.subtle.exportKey("pkcs8", appKeys.privateKey) as ArrayBuffer)));
-  await adminJson("/v1/admin/secrets/github_app", { method: "PUT", body: { value: JSON.stringify({ app_id: APP_ID, private_key: appPkcs1Pem }) } });
+beforeAll(() => {
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const req = new Request(input as RequestInfo, init);
     const u = new URL(req.url);
-    if (u.hostname === "api.github.com") return gh.handle(req);
     if (u.hostname === "http.test") return stubs.get(u.pathname.split("/")[1]!)?.handle(req) ?? new Response("no stub", { status: 503 });
     return realFetch(input as RequestInfo, init);
   }) as typeof fetch;
@@ -243,13 +90,6 @@ async function setup(brokered: unknown[], opts: { tools?: string[]; hands?: bool
   return { id, agent: ag.agent as string, ws, sandbox, sbxHost };
 }
 
-/** A fresh repo the App is installed on (each test its own: tokens are cached per repo). */
-function repo(): string {
-  const r = `o${rand()}/r${rand()}`;
-  gh.installs.set(r, 1000 + gh.installs.size);
-  return r;
-}
-
 const seqs = new WeakMap<Ws, number>();
 function call(ws: Ws, callId: string, name: string, args: unknown) {
   const seq = (seqs.get(ws) ?? 0) + 1;
@@ -288,73 +128,33 @@ const journal = (agent: string) => adminJson(`/v1/agents/${agent}/brokered`);
 const traceRows = (agent: string) => runInDurableObject(agentStub(agent), (_: AgentDO, st) =>
   st.storage.sql.exec<{ body: string }>("SELECT body FROM trace ORDER BY seq").toArray().map((r) => JSON.parse(r.body) as Record<string, any>));
 const outbound = async (agent: string) => (await traceRows(agent)).filter((e) => e.type === "outbound");
+/**
+ * An agent granted profile `p` (`GET`/`POST` under `/v1/items`, its credential `http:p<id>`, `allow` when
+ * tainted unless `extra` says otherwise) on its own stub, plus the entries in `more`.
+ */
+async function profileSetup(extra: Record<string, unknown> = {}, more: unknown[] = [], opts: { tools?: string[] } = {}) {
+  const id = rand();
+  const stub = new HttpStub();
+  stubs.set(id, stub);
+  const secret = `prof-${rand()}-credential`;
+  await adminJson(`/v1/admin/secrets/http:p${id}`, { method: "PUT", body: { value: secret } });
+  const s = await setup([{ action: "http.request", profile: "p", base_url: `https://http.test/${id}`, methods: ["GET", "POST"], paths: ["/v1/items"],
+    // Its answers taint the session; the gate on its calls is tested on its own below.
+    auth: { secret: `http:p${id}` }, when_tainted: "allow", ...extra }, ...more], opts);
+  return { ...s, stub, secret, sid: id };
+}
 
 // --- Pure parts --------------------------------------------------------------------------------------------
 
-describe("the GitHub App's JWT and client", () => {
-  it("a PKCS#1 key (what GitHub hands out) and its PKCS#8 form both sign a JWT that verifies with the App's public key, within GitHub's limits", async () => {
-    const pkcs8 = new Uint8Array(await crypto.subtle.exportKey("pkcs8", appKeys.privateKey) as ArrayBuffer);
-    // The wrapper is exactly the PKCS#8 WebCrypto exports (an independent encoder of the same key).
-    expect(b64url(pkcs1ToPkcs8(pkcs1Of(pkcs8)))).toBe(b64url(pkcs8));
-    const now = Date.UTC(2026, 9, 31, 12);
-    for (const p of [appPkcs1Pem, pem("PRIVATE KEY", pkcs8)]) {
-      const c = await verifyJwt(await appJwt(APP_ID, await importAppKey(p), now));
-      expect(c).toEqual({ iat: now / 1000 - 60, exp: now / 1000 + 540, iss: APP_ID });
-      // GitHub: exp at most 10 minutes ahead.
-      expect(c!.exp - now / 1000).toBeLessThanOrEqual(600);
-    }
-  });
-
-  it("mints a token narrowed to one repo and the action's permissions, with GitHub's headers; a repo without the App is null", async () => {
-    const seen: { url: string; init: RequestInit }[] = [];
-    const fake = (async (url: string, init: RequestInit) => {
-      seen.push({ url, init });
-      if (url.endsWith("/installation")) return new Response(url.includes("/nope/") ? "{}" : JSON.stringify({ id: 7 }), { status: url.includes("/nope/") ? 404 : 200 });
-      return new Response(JSON.stringify({ token: "ghs_x", expires_at: "2026-10-31T13:00:00Z" }), { status: 201 });
-    }) as unknown as typeof fetch;
-    const api = new GitHubApi(fake, "https://gh.example");
-    expect(await api.installation("jwt", "me/app")).toBe(7);
-    expect(await api.installation("jwt", "nope/x")).toBeNull();
-    expect(await api.mint("jwt", 7, "app", { issues: "write" })).toEqual({ token: "ghs_x", expires_ms: Date.UTC(2026, 9, 31, 13) });
-    const mint = seen.at(-1)!;
-    expect(mint.url).toBe("https://gh.example/app/installations/7/access_tokens");
-    expect(JSON.parse(String(mint.init.body))).toEqual({ repositories: ["app"], permissions: { issues: "write" } });
-    expect(mint.init.headers).toMatchObject({ authorization: "Bearer jwt", accept: "application/vnd.github+json", "x-github-api-version": "2022-11-28" });
-    // A redirect is a refusal, never followed with the token.
-    expect(mint.init.redirect).toBe("manual");
-  });
-
-  it("the default fetch works under workerd (no incorrect `this`: Illegal invocation)", async () => {
-    // Every other client test injects a fake fetch, which binds nothing (review lesson 8). Nothing
-    // listens at the discard port, so a correctly invoked fetch fails on the connection instead.
-    const r = await new GitHubApi(undefined, "http://127.0.0.1:9").request("t", "GET", "/x");
-    expect(r.kind).toBe("lost");
-    expect((r as { why: string }).why).not.toMatch(/Illegal invocation/);
-    expect((r as { why: string }).why).toMatch(/^network: /);
-  });
-});
-
 describe("authority and the scan (pure)", () => {
-  const g = (e: unknown) => grantOfEntry("c", e as any)!;
-  it("a GitHub grant covers its repos (any case) or, unscoped, any repo; the balanced defaults: scoped allow, unscoped approve; http profiles by method and path", () => {
-    const scoped = g({ action: "github.comment", repos: ["Me/App"] });
-    const unscoped = g({ action: "github.comment" });
-    expect(scoped).toMatchObject({ repos: ["me/app"], when_tainted: "allow", per_hour: 30 });
-    expect(unscoped).toMatchObject({ repos: null, when_tainted: "approve" });
-    const args = (repo: string) => ({ repo, issue_number: 1, body: "x" });
-    expect(authorize([scoped], "github.comment", args("me/APP"))).toMatchObject({ ok: true, value: { target: "me/app", sink: true, when_tainted: "allow" } });
-    expect(authorize([scoped], "github.comment", args("me/other")).ok).toBe(false);
-    expect(authorize([scoped], "github.create_issue", { repo: "me/app", title: "t" }).ok).toBe(false);
-    // Two covering grants: any that allows, the higher cap.
-    const strict = g({ action: "github.comment", repos: ["me/app"], when_tainted: "approve", per_hour: 90 });
-    expect(authorize([strict, unscoped], "github.comment", args("me/app"))).toMatchObject({ value: { when_tainted: "approve", per_hour: 90 } });
-    expect(authorize([strict, scoped], "github.comment", args("me/app"))).toMatchObject({ value: { when_tainted: "allow" } });
-
+  const g = (e: unknown) => grantOfEntry("c", e as any);
+  it("a profile covers its methods and whole-segment paths; read-only is no sink; the balanced default is approve", () => {
     const rw = g({ action: "http.request", profile: "p", base_url: "https://api.example.com/", methods: ["GET", "POST"], paths: ["/v1/items"] });
-    const ro = g({ action: "http.request", profile: "q", base_url: "https://api.example.com", methods: ["GET", "HEAD"] });
+    const ro = g({ action: "http.request", profile: "q", base_url: "https://api.example.com", methods: ["GET", "HEAD"], per_hour: 5 });
+    expect(rw).toMatchObject({ base_url: "https://api.example.com", when_tainted: "approve", per_hour: 60, trusted: false });
     const req = (profile: string, method: string, path: string) => authorize([rw, ro], "http.request", { profile, method, path });
-    expect(req("p", "POST", "/v1/items/3")).toMatchObject({ ok: true, value: { sink: true, when_tainted: "approve" } });
-    expect(req("q", "GET", "/anything")).toMatchObject({ ok: true, value: { sink: false } });
+    expect(req("p", "POST", "/v1/items/3")).toMatchObject({ ok: true, value: { target: "p", sink: true, when_tainted: "approve", per_hour: 60 } });
+    expect(req("q", "GET", "/anything")).toMatchObject({ ok: true, value: { target: "q", sink: false, per_hour: 5 } });
     for (const [profile, method, path] of [["p", "DELETE", "/v1/items"], ["p", "GET", "/v1/itemsx"], ["p", "GET", "/v1/items/../x"], ["p", "GET", "/v1/items/%2e%2e"],
       ["p", "GET", "/v1/items//x"], ["q", "GET", "x"], ["r", "GET", "/"]] as const) {
       expect(req(profile, method, path).ok, `${profile} ${method} ${path}`).toBe(false);
@@ -363,145 +163,71 @@ describe("authority and the scan (pure)", () => {
     expect(safePath("/a/./b")).toBe(false);
   });
 
+  it("a stored grant of a removed action (a spec from before it went) covers nothing and makes no tool: no removed action is back in the registry", () => {
+    const rw = g({ action: "http.request", profile: "p", base_url: "https://api.example.com", methods: ["GET"] });
+    // As the previous release stored them: unscoped, so they would cover any repo.
+    const stale = REMOVED_ACTIONS.map((action) => ({ capability: "old", action, repos: null, when_tainted: "allow", per_hour: 30 }) as unknown as BrokeredGrant);
+    expect(brokeredToolDefs([...stale, rw]).map((t) => t.name)).toEqual(["http_request"]);
+    expect(brokeredToolDefs(stale)).toEqual([]);
+    for (const action of REMOVED_ACTIONS) expect(actionDef(action), action).toBeUndefined();
+  });
+
   it("the scan looks for a stored value raw, base64'd, inside JSON, or as a PEM's body", () => {
     const n = secretNeedles(JSON.stringify({ client_id: "short", client_secret: "aaaaaaaaaaaaaaaa-secret" }));
     expect(n).toContain("aaaaaaaaaaaaaaaa-secret");
     expect(n).not.toContain("short");
     expect(secretNeedles("tiny")).toEqual([]);
     expect(secretNeedles("a-long-enough-value")).toContain(btoa("a-long-enough-value"));
-    expect(secretNeedles(appPkcs1Pem).some((x) => /^[A-Za-z0-9+/=]{64}$/.test(x))).toBe(true);
+    // A PEM-armoured value (built at run time: no key block in the source) yields its 64-character body lines.
+    const body = bytesToB64(crypto.getRandomValues(new Uint8Array(96))).match(/.{1,64}/g)!;
+    const armor = (edge: string) => `-----${edge} ${"PRIVATE KEY"}-----`;
+    const needles = secretNeedles([armor("BEGIN"), ...body, armor("END"), ""].join("\n"));
+    expect(needles).toContain(body[0]);
   });
 });
 
-// --- GitHub actions through the pipeline -------------------------------------------------------------------
+// --- The pipeline, through profiles -----------------------------------------------------------------------------
 
-describe("github actions", () => {
-  it("each request an action sends to GitHub is on the agent's trace, without the installation token or the body", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment", repos: [r] }]);
-    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 4, body: "comment-text-never-traced" })).status).toBe("ok");
-    const recs = await outbound(s.agent);
-    expect(recs).toContainEqual(expect.objectContaining({
-      type: "outbound", via: "brokered", name: "github.comment", method: "POST", host: "api.github.com", path: `/repos/${r}/issues/4/comments`, status: 201,
-      bytes_up: expect.any(Number), bytes_down: expect.any(Number), duration_ms: expect.any(Number),
-    }));
-    expect(recs.every((x) => x.name === "github.comment" && x.host === "api.github.com")).toBe(true);
-    const token = [...gh.tokens].find(([, v]) => v.repo === r.toLowerCase())?.[0];
-    expect(token).toBeTruthy();
-    const all = JSON.stringify(await traceRows(s.agent));
-    expect(all).not.toContain(token!);
-    expect(all).not.toContain("comment-text-never-traced");
+describe("the brokered pipeline", () => {
+  it("lists one tool per granted action, narrowed to the profiles; a call goes out once and is journaled", async () => {
+    const p = await profileSetup({}, [{ action: "http.request", profile: "other", base_url: "https://http.test/none", methods: ["GET"] }]);
+    const tools = (p.ws.send({ type: "tools_list_request", request: `req_${rand()}` }), (await p.ws.next("tools_list")).tools as any[]);
+    const brokered = tools.filter((t) => t.name === "http_request" || t.name.startsWith("github_") || t.name === "email_send");
+    expect(brokered.map((t) => t.name)).toEqual(["http_request"]);
+    expect(brokered[0].input_schema.properties.profile.enum).toEqual(["p", "other"]);
+    expect((await run(p.ws, "http_request", { profile: "p", method: "POST", path: "/v1/items", body: "{}" })).status).toBe("ok");
+    expect(p.stub.requests).toHaveLength(1);
+    const j = await journal(p.agent);
+    expect(j).toHaveLength(1);
+    expect(j[0]).toMatchObject({ action: "http.request", target: "p", status: "done", attempts: 1, tainted: false, detail: "HTTP 200" });
+    expect(j[0].idem).toMatch(/^http:p:[0-9a-f]{24}$/);
   });
 
-  it("a comment goes out once through the App, with a token minted for that repo and those permissions only, audited without its value, cached, and journaled", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment", repos: [r] }]);
-    const tools = (s.ws.send({ type: "tools_list_request", request: `req_${rand()}` }), (await s.ws.next("tools_list")).tools as any[]);
-    const def = tools.find((t) => t.name === "github_comment");
-    expect(def.input_schema.properties.repo.enum).toEqual([r]);
-    expect(tools.some((t) => t.name === "github_create_pr")).toBe(false);
-
-    const before = gh.mints.length;
-    const o = await run(s.ws, "github_comment", { repo: r, issue_number: 7, body: "LGTM" });
-    expect(o).toMatchObject({ status: "ok" });
-    expect(o.content[0]).toMatchObject({ type: "text", text: expect.stringContaining(`https://github.com/${r}/issues/7#issuecomment-`) });
-    const posted = gh.comments.get(`${r}#7`)!;
-    expect(posted).toHaveLength(1);
-    expect(posted[0]!.body).toMatch(/^LGTM\n\n<!-- nest:[0-9a-f]{24} -->$/);
-    expect(gh.mints.slice(before)).toEqual([{ installation: gh.installs.get(r), repositories: [r.split("/")[1]], permissions: { issues: "write", pull_requests: "write" } }]);
-    // A second call reuses the token: no second mint.
-    await run(s.ws, "github_comment", { repo: r, issue_number: 7, body: "again" });
-    expect(gh.mints.length).toBe(before + 1);
-    expect(gh.comments.get(`${r}#7`)).toHaveLength(2);
-
-    // The mint is audited: repo, permissions, the caller's call key; never the token.
-    const listed = await env.BUCKET.list({ prefix: "audit/broker/" });
-    const records = await Promise.all(listed.objects.map(async (o) => (await env.BUCKET.get(o.key))!.text()));
-    const mine = records.filter((t) => t.includes(`"${r}"`));
-    expect(mine).toHaveLength(1);
-    const rec = JSON.parse(mine[0]!);
-    expect(rec).toMatchObject({ event: "github_installation_token", repos: [r], permissions: { issues: "write", pull_requests: "write" }, installation: gh.installs.get(r) });
-    expect(rec.caller.call).toMatch(new RegExp(`^${s.agent}/1/cal_`));
-    expect(mine[0]).not.toContain("ghs_");
-
-    const j = await journal(s.agent);
-    expect(j).toHaveLength(2);
-    expect(j[1]).toMatchObject({ action: "github.comment", target: r, status: "done", attempts: 1, tainted: false });
-    expect(j[1].idem).toMatch(new RegExp(`^comment:${r}#7:[0-9a-f]{24}$`));
-  });
-
-  it("refuses a repo the grant doesn't cover, an action it doesn't grant, a repo without the App (audited), and email.send; the catalog refuses email.send and a clashing mcp name", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment", repos: [r] }, { action: "github.create_issue" }], { tools: ["brokered"] });
-    expect(await run(s.ws, "github_comment", { repo: `${r}x`, issue_number: 1, body: "x" })).toMatchObject({ status: "error", error: { code: "forbidden" } });
-    expect(await run(s.ws, "github_create_pr", { repo: r, title: "t", head: "h", base: "main" })).toMatchObject({ status: "error", error: { code: "unknown_tool" } });
-    expect(await run(s.ws, "brokered", { action: "github.create_pr", args: { repo: r, title: "t", head: "h", base: "main" } }))
+  it("refuses an action it doesn't grant, a profile it doesn't grant and an action that isn't one; an mcp capability may not shadow a brokered tool", async () => {
+    // No brokered grant at all: the action's own tool doesn't exist for it, and `brokered` reaches nothing.
+    const none = await setup([], { tools: ["brokered"] });
+    const req = { profile: "p", method: "GET", path: "/v1/items" };
+    expect(await run(none.ws, "http_request", req)).toMatchObject({ status: "error", error: { code: "unknown_tool" } });
+    expect(await run(none.ws, "brokered", { action: "http.request", args: req }))
+      .toMatchObject({ status: "error", error: { code: "forbidden", message: expect.stringContaining("http.request isn't granted to this agent") } });
+    expect(await journal(none.agent)).toEqual([]);
+    const p = await profileSetup({}, [], { tools: ["brokered"] });
+    expect(await run(p.ws, "brokered", { action: "http.request", args: { profile: "nope", method: "GET", path: "/v1/items" } }))
       .toMatchObject({ status: "error", error: { code: "forbidden" } });
-    expect(await run(s.ws, "brokered", { action: "email.send", args: {} })).toMatchObject({ status: "error", error: { code: "not_implemented" } });
-    const missing = `o${rand()}/none`;
-    expect(await run(s.ws, "github_create_issue", { repo: missing, title: "t" })).toMatchObject({ status: "error", error: { code: "forbidden", message: expect.stringContaining("isn't installed") } });
-    const listed = await env.BUCKET.list({ prefix: "audit/broker/" });
-    const texts = await Promise.all(listed.objects.map(async (o) => (await env.BUCKET.get(o.key))!.text()));
-    expect(texts.some((t) => t.includes(missing) && t.includes("refused"))).toBe(true);
-    expect(gh.writes.some((w) => w.path.includes(r))).toBe(false);
-
+    for (const action of ["email.send", "github.create_pr", "nothing.here"]) {
+      expect(await run(p.ws, "brokered", { action, args: {} }), action).toMatchObject({ status: "error", error: { code: "invalid_message" } });
+    }
+    expect(p.stub.requests).toEqual([]);
     const put = (name: string, body: unknown, status: number) => adminJson(`/v1/admin/capabilities/${name}`, { method: "PUT", body }, status);
-    expect((await put(`e${rand()}`, { brokered: [{ action: "email.send" }] }, 400)).error.message).toContain("email.send isn't implemented");
+    expect((await put("http", { mcp: { url: "https://mcp.example.com/mcp", auth: "cap:x" } }, 400)).error.message).toContain("http_request");
+    // A removed action's tool stays reserved while stored grants of it may exist (a rollback runs them again).
     expect((await put("github", { mcp: { url: "https://mcp.example.com/mcp", auth: "cap:x" } }, 400)).error.message).toContain("github_comment");
+    expect((await put("email", { mcp: { url: "https://mcp.example.com/mcp", auth: "cap:x" } }, 400)).error.message).toContain("email_send");
   });
 
-  it("a pull request already open from that head to that base is returned, not made twice; a 422 for one made meanwhile finds it", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.create_pr", repos: [r] }]);
-    const args = { repo: r, title: "Fix", head: "fix-1", base: "main", body: "why" };
-    const first = await run(s.ws, "github_create_pr", args);
-    expect(first.content[1].value).toMatchObject({ number: expect.any(Number), url: expect.stringContaining(`/${r}/pull/`) });
-    const second = await run(s.ws, "github_create_pr", { ...args, title: "Fix (retry)" });
-    expect(second.content[1].value).toEqual({ ...first.content[1].value, existing: true });
-    expect(gh.writes.filter((w) => w.path === `/repos/${r}/pulls`)).toHaveLength(1);
-    // Not listed yet when read, refused with 422 when made: read again, it's that one.
-    gh.hidePulls = 1;
-    const third = await run(s.ws, "github_create_pr", args);
-    expect(third.content[1].value).toEqual({ ...first.content[1].value, existing: true });
-    expect(gh.writes.filter((w) => w.path === `/repos/${r}/pulls`)).toHaveLength(2);
-    expect(gh.pulls.get(r)).toHaveLength(1);
-  });
-
-  it("an answer lost after GitHub made it is found by its marker (one comment); lost before, the outcome is unknown; a redelivered call reads GitHub before sending", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment", repos: [r] }, { action: "github.create_issue", repos: [r] }]);
-    gh.next.push({ applyThenFail: true, status: 502 });
-    expect(await run(s.ws, "github_comment", { repo: r, issue_number: 3, body: "made" })).toMatchObject({ status: "ok" });
-    expect(gh.comments.get(`${r}#3`)).toHaveLength(1);
-    gh.next.push({ status: 502 });
-    expect(await run(s.ws, "github_comment", { repo: r, issue_number: 3, body: "lost" })).toMatchObject({ status: "error", error: { code: "outcome_unknown" } });
-    expect(gh.comments.get(`${r}#3`)).toHaveLength(1);
-
-    // A call an earlier incarnation sent and never settled (its tool_calls row still dispatching): redelivered,
-    // it finds its own marker and sends nothing; one whose marker isn't there is sent.
-    const plant = async (callId: string, issue: number, withMarker: boolean) => {
-      const key = `${s.agent}/1/${callId}`;
-      if (withMarker) gh.issues.set(r, [...(gh.issues.get(r) ?? []), { id: 1, number: issue, body: `x\n\n<!-- nest:${await keyDigest(key)} -->`, html_url: `https://github.com/${r}/issues/${issue}` }]);
-      await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
-        (inst as any).calls.begin(1, callId, "github_create_issue");
-        (inst as any).journal.sending({ key, action: "github.create_issue", target: r, idem: "i", digest: "d", args: "{}", tainted: false });
-      });
-    };
-    await plant("cal_redo1", 901, true);
-    call(s.ws, "cal_redo1", "github_create_issue", { repo: r, title: "t" });
-    expect((await result(s.ws, "cal_redo1")).content[1].value).toEqual({ number: 901, id: 1, url: `https://github.com/${r}/issues/901` });
-    expect(gh.writes.filter((w) => w.path === `/repos/${r}/issues`)).toHaveLength(0);
-    await plant("cal_redo2", 0, false);
-    call(s.ws, "cal_redo2", "github_create_issue", { repo: r, title: "t2" });
-    expect((await result(s.ws, "cal_redo2")).status).toBe("ok");
-    expect(gh.writes.filter((w) => w.path === `/repos/${r}/issues`)).toHaveLength(1);
-    expect((await journal(s.agent)).find((e: any) => e.key.endsWith("/cal_redo2"))).toMatchObject({ status: "done", attempts: 2 });
-  });
-
-  it("a call whose brain stopped being current before it left never reaches GitHub", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment", repos: [r] }]);
-    await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => {
+  it("a call whose brain stopped being current before it left never reaches the profile", async () => {
+    const p = await profileSetup();
+    await runInDurableObject(agentStub(p.agent), (inst: AgentDO) => {
       inst.testHooks["dispatch:beforeWrite"] = async () => {
         delete inst.testHooks["dispatch:beforeWrite"];
         (inst as any).update((i: any) => {
@@ -510,30 +236,38 @@ describe("github actions", () => {
         });
       };
     });
-    call(s.ws, "cal_f1", "github_comment", { repo: r, issue_number: 1, body: "x" });
-    await s.ws.next("ack", (m) => m.up_to >= 1);
-    const outcome = await runInDurableObject(agentStub(s.agent), (inst: AgentDO) => (inst as any).calls.call("cal_f1")?.outcome);
+    call(p.ws, "cal_f1", "http_request", { profile: "p", method: "POST", path: "/v1/items", body: "{}" });
+    await p.ws.next("ack", (m) => m.up_to >= 1);
+    const outcome = await runInDurableObject(agentStub(p.agent), (inst: AgentDO) => (inst as any).calls.call("cal_f1")?.outcome);
     expect(outcome).toMatchObject({ status: "error", error: { code: "stale_epoch" } });
-    expect(gh.comments.get(`${r}#1`) ?? []).toEqual([]);
+    expect(p.stub.requests).toEqual([]);
   });
 
-  it("a GitHub call settled by another delivery just before it would leave isn't sent: it answers with the outcome that stands", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment", repos: [r] }]);
-    await settleBeforeSend(s.agent, "cal_gs1", "github.comment", r);
-    call(s.ws, "cal_gs1", "github_comment", { repo: r, issue_number: 1, body: "x" });
-    expect(await result(s.ws, "cal_gs1")).toEqual(STANDING);
-    expect(gh.comments.get(`${r}#1`) ?? []).toEqual([]);
-    expect(gh.writes.some((w) => w.path.includes(r))).toBe(false);
-    expect((await journal(s.agent)).find((e: any) => e.key.endsWith("/cal_gs1"))).toMatchObject({ status: "done", attempts: 0, detail: "by the other delivery" });
+  it("a redelivered call that left before reads as unknown unless the request is retryable: a POST isn't sent again, a GET is", async () => {
+    const p = await profileSetup();
+    // A call an earlier incarnation sent and never settled (its tool_calls row still dispatching, its journal row `sending`).
+    const plant = (callId: string) => runInDurableObject(agentStub(p.agent), (inst: AgentDO) => {
+      (inst as any).calls.begin(1, callId, "http_request");
+      (inst as any).journal.sending({ key: `${p.agent}/1/${callId}`, action: "http.request", target: "p", idem: "i", digest: "d", args: "{}", tainted: false });
+    });
+    await plant("cal_redo1");
+    call(p.ws, "cal_redo1", "http_request", { profile: "p", method: "POST", path: "/v1/items", body: "{}" });
+    expect(await result(p.ws, "cal_redo1")).toMatchObject({ status: "error", error: { code: "outcome_unknown" } });
+    expect(p.stub.requests).toEqual([]);
+    await plant("cal_redo2");
+    call(p.ws, "cal_redo2", "http_request", { profile: "p", method: "GET", path: "/v1/items" });
+    expect((await result(p.ws, "cal_redo2")).status).toBe("ok");
+    expect(p.stub.requests).toHaveLength(1);
+    const j = await journal(p.agent);
+    expect(j.find((e: any) => e.key.endsWith("/cal_redo1"))).toMatchObject({ status: "unknown", attempts: 1 });
+    expect(j.find((e: any) => e.key.endsWith("/cal_redo2"))).toMatchObject({ status: "done", attempts: 2 });
   });
 
   it("a call first begun over a week ago and redelivered now gets its result, even when the hourly prune runs under its dispatch", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment", repos: [r] }]);
+    const p = await profileSetup();
     // An earlier incarnation began the call and never finished it; its row is past the retention.
-    await runInDurableObject(agentStub(s.agent), (inst: AgentDO, st) => {
-      (inst as any).calls.begin(1, "cal_old1", "github_comment");
+    await runInDurableObject(agentStub(p.agent), (inst: AgentDO, st) => {
+      (inst as any).calls.begin(1, "cal_old1", "http_request");
       st.storage.sql.exec("UPDATE tool_calls SET created_ms = ? WHERE call = 'cal_old1'", Date.now() - 8 * 86_400_000);
       // The prune fires while the redelivered call is out.
       inst.testHooks["dispatch:beforeWrite"] = async () => {
@@ -541,21 +275,21 @@ describe("github actions", () => {
         (inst as any).prune();
       };
     });
-    call(s.ws, "cal_old1", "github_comment", { repo: r, issue_number: 1, body: "late" });
-    expect((await result(s.ws, "cal_old1")).status).toBe("ok");
-    expect(gh.comments.get(`${r}#1`)).toHaveLength(1);
+    call(p.ws, "cal_old1", "http_request", { profile: "p", method: "POST", path: "/v1/items", body: "{}" });
+    expect((await result(p.ws, "cal_old1")).status).toBe("ok");
+    expect(p.stub.requests).toHaveLength(1);
   });
 
   it("an action is capped per hour; refused calls don't count", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment", repos: [r], per_hour: 2 }]);
+    const p = await profileSetup({ per_hour: 2 });
     const stored = `s3cr3t-${rand()}-value`;
-    await adminJson(`/v1/admin/secrets/http:cap${s.id}`, { method: "PUT", body: { value: stored } });
-    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: stored })).status).toBe("error"); // refused by the scan
-    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "1" })).status).toBe("ok");
-    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "2" })).status).toBe("ok");
-    expect(await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "3" })).toMatchObject({ status: "error", error: { code: "rate_limited", retryable: true } });
-    expect(gh.comments.get(`${r}#1`)).toHaveLength(2);
+    await adminJson(`/v1/admin/secrets/http:cap${p.id}`, { method: "PUT", body: { value: stored } });
+    const post = (body: string) => run(p.ws, "http_request", { profile: "p", method: "POST", path: "/v1/items", body });
+    expect((await post(stored)).status).toBe("error"); // refused by the scan
+    expect((await post("1")).status).toBe("ok");
+    expect((await post("2")).status).toBe("ok");
+    expect(await post("3")).toMatchObject({ status: "error", error: { code: "rate_limited", retryable: true } });
+    expect(p.stub.requests).toHaveLength(2);
   });
 });
 
@@ -563,148 +297,133 @@ describe("github actions", () => {
 
 describe("the secret scan", () => {
   it("arguments holding any stored secret's value are refused before anything is asked or sent, without the value in the error; the journal names which secret", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment" }]); // unscoped: a tainted call would be asked
-    await taint(s.agent);
+    const p = await profileSetup({ when_tainted: "approve" }); // a tainted call would be asked
+    await taint(p.agent);
     const stored = `s3cr3t-${rand()}-value`;
-    await adminJson(`/v1/admin/secrets/http:leak${s.id}`, { method: "PUT", body: { value: stored } });
-    for (const body of [`look: ${stored}`, `b64 ${btoa(stored)}`]) {
-      const o = await run(s.ws, "github_comment", { repo: r, issue_number: 2, body });
+    await adminJson(`/v1/admin/secrets/http:leak${p.id}`, { method: "PUT", body: { value: stored } });
+    for (const args of [{ body: `look: ${stored}` }, { query: { q: `b64 ${btoa(stored)}` } }]) {
+      const o = await run(p.ws, "http_request", { profile: "p", method: "POST", path: "/v1/items", ...args });
       expect(o).toMatchObject({ status: "error", error: { code: "forbidden", message: "Not sent: the arguments contain a credential nest holds. Remove it and call again." } });
       expect(JSON.stringify(o)).not.toContain(stored);
     }
-    expect(await adminJson(`/v1/agents/${s.agent}/asks`)).toEqual([]); // the operator was never asked to approve a leak
-    expect(gh.writes.some((w) => w.path.includes(r))).toBe(false);
-    const j = await journal(s.agent);
+    expect(await adminJson(`/v1/agents/${p.agent}/asks`)).toEqual([]); // the operator was never asked to approve a leak
+    expect(p.stub.requests).toEqual([]);
+    const j = await journal(p.agent);
     expect(j.map((e: any) => e.status)).toEqual(["refused", "refused"]);
-    expect(j.map((e: any) => e.detail)).toEqual([`the value of http:leak${s.id}`, `the value of http:leak${s.id}`]);
+    expect(j.map((e: any) => e.detail)).toEqual([`the value of http:leak${p.id}`, `the value of http:leak${p.id}`]);
+    expect(j.map((e: any) => e.args)).toEqual(["(withheld)", "(withheld)"]);
     expect(JSON.stringify(j)).not.toContain(stored);
-  });
-});
-
-describe("the secret scan: tokens nest minted", () => {
-  it("a GitHub installation token nest minted and holds is refused as a credential nest holds, by its exact value", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment", repos: [r] }]);
-    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 3, body: "first" })).status).toBe("ok");
-    const token = [...gh.tokens].find(([, v]) => v.repo === r)?.[0];
-    expect(token).toBeTruthy();
-    const o = await run(s.ws, "github_comment", { repo: r, issue_number: 3, body: `leak ${token}` });
-    expect(o).toMatchObject({ status: "error", error: { code: "forbidden", message: "Not sent: the arguments contain a credential nest holds. Remove it and call again." } });
-    expect(JSON.stringify(o)).not.toContain(token!);
-    expect(gh.comments.get(`${r}#3`)).toHaveLength(1);
-    const j = await journal(s.agent);
-    expect(j[0]).toMatchObject({ status: "refused", detail: expect.stringContaining("the value of minted GitHub token") });
-    expect(JSON.stringify(j)).not.toContain(token!);
   });
 });
 
 // --- The sink gate ---------------------------------------------------------------------------------------
 
 describe("the sink gate for brokered actions", () => {
-  it("tainted: a scoped write goes (allow), an unscoped one waits for the operator once per exact call; an approval lets that one call through once, by either tool; a denial never", async () => {
-    const scoped = repo();
-    const other = repo();
-    const s = await setup([{ action: "github.comment", repos: [scoped] }, { action: "github.create_issue" }], { tools: ["brokered"] });
-    await taint(s.agent);
-    expect((await run(s.ws, "github_comment", { repo: scoped, issue_number: 1, body: "ok" })).status).toBe("ok");
-    const args = { repo: other, title: "Bug", body: "details" };
-    const p1 = await run(s.ws, "github_create_issue", args);
-    expect(p1).toMatchObject({ status: "pending", ask: expect.stringMatching(/^ask_/), message: expect.stringContaining("mcp__nest__github_create_issue") });
+  it("tainted: an allow profile goes, an approve one waits for the operator once per exact call; an approval lets that one call through once, by either tool; a denial never", async () => {
+    const gid = rand();
+    const gated = new HttpStub();
+    stubs.set(gid, gated);
+    const p = await profileSetup({}, [{ action: "http.request", profile: "gated", base_url: `https://http.test/${gid}`, methods: ["POST"] }], { tools: ["brokered"] });
+    // Untainted: not gated, approve or not.
+    expect((await run(p.ws, "http_request", { profile: "gated", method: "POST", path: "/x", body: "a" })).status).toBe("ok");
+    await taint(p.agent);
+    expect((await run(p.ws, "http_request", { profile: "p", method: "POST", path: "/v1/items", body: "ok" })).status).toBe("ok");
+    const args = { profile: "gated", method: "POST", path: "/x", body: "details" };
+    const p1 = await run(p.ws, "http_request", args);
+    expect(p1).toMatchObject({ status: "pending", ask: expect.stringMatching(/^ask_/), message: expect.stringContaining("mcp__nest__http_request") });
     // Asked again before a decision (keys in another order, through `brokered`): the same ask.
-    expect((await run(s.ws, "brokered", { action: "github.create_issue", args: { body: "details", title: "Bug", repo: other } })).ask).toBe(p1.ask);
+    expect((await run(p.ws, "brokered", { action: "http.request", args: { body: "details", path: "/x", method: "POST", profile: "gated" } })).ask).toBe(p1.ask);
     // Held for the operator: listed once, with the tool to call again.
-    const asks = await adminJson(`/v1/agents/${s.agent}/asks`);
-    expect(asks).toEqual([{ ask: p1.ask, question: expect.stringContaining(`github.create_issue on ${other}`), created_ms: expect.any(Number),
-      approval: { name: "github.create_issue", tool: "mcp__nest__github_create_issue" }, input: expect.anything(), input_bytes: expect.any(Number) }]);
-    expect(gh.issues.get(other) ?? []).toEqual([]);
+    const asks = await adminJson(`/v1/agents/${p.agent}/asks`);
+    expect(asks).toEqual([{ ask: p1.ask, question: expect.stringContaining("http.request on gated"), created_ms: expect.any(Number),
+      approval: { name: "http.request", tool: "mcp__nest__http_request" }, input: expect.anything(), input_bytes: expect.any(Number) }]);
+    expect(gated.requests).toHaveLength(1);
 
-    await answer(s.agent, p1.ask, "approve");
-    expect(await lastTurn(s.agent)).toMatchObject({ kind: "ask_answer", text: expect.stringContaining("call mcp__nest__github_create_issue again") });
-    expect((await run(s.ws, "github_create_issue", { ...args, title: "Other" })).status).toBe("pending");
-    expect((await run(s.ws, "brokered", { action: "github.create_issue", args })).status).toBe("ok");
-    expect(gh.issues.get(other)).toHaveLength(1);
-    const p2 = await run(s.ws, "github_create_issue", args);
+    await answer(p.agent, p1.ask, "approve");
+    expect(await lastTurn(p.agent)).toMatchObject({ kind: "ask_answer", text: expect.stringContaining("call mcp__nest__http_request again") });
+    expect((await run(p.ws, "http_request", { ...args, body: "other" })).status).toBe("pending");
+    expect((await run(p.ws, "brokered", { action: "http.request", args })).status).toBe("ok");
+    expect(gated.requests).toHaveLength(2);
+    const p2 = await run(p.ws, "http_request", args);
     expect(p2.status).toBe("pending");
-    await answer(s.agent, p2.ask, "no");
-    expect((await run(s.ws, "github_create_issue", args)).status).toBe("pending");
-    expect(gh.issues.get(other)).toHaveLength(1);
-  });
-
-  it("an untainted session isn't gated; a scoped grant set to approve is", async () => {
-    const r = repo();
-    const s = await setup([{ action: "github.comment", repos: [r], when_tainted: "approve" }]);
-    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "a" })).status).toBe("ok");
-    await taint(s.agent);
-    expect((await run(s.ws, "github_comment", { repo: r, issue_number: 1, body: "b" })).status).toBe("pending");
+    await answer(p.agent, p2.ask, "no");
+    expect((await run(p.ws, "http_request", args)).status).toBe("pending");
+    expect(gated.requests).toHaveLength(2);
   });
 });
 
-describe("github.fork", () => {
-  it("always waits for the operator, even untainted; then forks with the operator's token and puts the fork on the sandbox's push allowlist", async () => {
-    await adminJson("/v1/admin/secrets/github_user", { method: "PUT", body: { value: GITHUB_USER_TOKEN } });
-    const up = `up${rand()}/lib`;
-    // Untainted (no hands): still asked.
-    const plain = await setup([{ action: "github.fork" }]);
-    expect(await tainted(plain.agent)).toBe(false);
-    expect((await run(plain.ws, "github_fork", { repo: up })).status).toBe("pending");
-    expect(gh.forks.filter((f) => f.upstream === up)).toEqual([]);
+// --- Removed actions --------------------------------------------------------------------------------------------
 
-    const s = await setup([{ action: "github.fork", repos: [up] }], { hands: true });
-    expect((await run(s.ws, "github_fork", { repo: `other${rand()}/x` })).status).toBe("error");
-    const p = await run(s.ws, "github_fork", { repo: up });
-    expect(p.status).toBe("pending");
-    await answer(s.agent, p.ask, "approve");
-    const done = await run(s.ws, "github_fork", { repo: up });
-    expect(done.status, JSON.stringify(done)).toBe("ok");
-    expect(done.content[1].value).toEqual({
-      fork: "operator/lib", url: "https://github.com/Operator/lib", compare: `https://github.com/${up}/compare/trunk...operator:lib:<branch>`, push_allowed: true,
+describe("removed actions (stored before they went)", () => {
+  /** A capability row as the previous release stored it, beside a profile this release runs. */
+  async function plantCapability(name: string, profile: unknown): Promise<void> {
+    const body = {
+      tools: [], rules: [{ pattern: "Bash", decision: "allow" }], prompt: "old",
+      brokered: [{ action: "github.create_issue", repos: ["o/r"], when_tainted: "approve" }, { action: "github.comment" }, { action: "github.fork" }, profile],
+    };
+    await runInDurableObject(catalogStub(), (_i, st) => {
+      st.storage.sql.exec("INSERT INTO capabilities (name, body) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET body = excluded.body", name, JSON.stringify(body));
     });
-    expect(gh.forks.filter((f) => f.upstream === up)).toEqual([{ upstream: up, body: { default_branch_only: true } }]);
-    // The fork's request is on the agent's trace; the operator's token isn't.
-    expect(await outbound(s.agent)).toEqual([expect.objectContaining({
-      via: "brokered", name: "github.fork", method: "POST", host: "api.github.com", path: `/repos/${up}/forks`, status: 202 })]);
-    expect(JSON.stringify(await traceRows(s.agent))).not.toContain(GITHUB_USER_TOKEN);
-    const sbx = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox!));
-    expect(await sbx.pushRepos()).toContain("operator/lib");
-    const policy = await sbx.policy();
-    expect(policy.guards!.find((g) => g.name === "github-push")!.allow).toEqual([{ path: "/operator/lib/**" }, { path: "/operator/lib.git/**" }]);
+  }
+
+  it("a write naming one is refused by name; a stored capability naming one reads, and spawns, without it", async () => {
+    for (const action of REMOVED_ACTIONS) {
+      const r = await adminJson(`/v1/admin/capabilities/w${rand()}`, { method: "PUT", body: { brokered: [{ action }] } }, 400);
+      expect(r.error.message, action).toContain(`${action} is no longer a brokered action`);
+    }
+    // Handed to CatalogDO by a previous release's Worker (whose schema still took them): refused there too.
+    await expect(Promise.resolve().then(() => catalogStub().putCapability(`w${rand()}`, { tools: [], rules: [], prompt: "", brokered: [{ action: "github.comment" }] } as never)))
+      .rejects.toThrow(/github.comment is no longer a brokered action/);
+    const id = rand();
+    const stub = new HttpStub();
+    stubs.set(id, stub);
+    const cap = `old${id}`;
+    await plantCapability(cap, { action: "http.request", profile: "p", base_url: `https://http.test/${id}`, methods: ["GET"] });
+    const read = (await adminJson("/v1/admin/catalog")).capabilities[cap];
+    expect(read).toMatchObject({ prompt: "old", brokered: [{ action: "http.request", profile: "p" }] });
+    expect(read.brokered).toHaveLength(1);
+    // Its rules are read, not `unreadable` (an agent watching it keeps them).
+    expect(await catalogStub().watchRules("agt_watchold", [cap])).toEqual({ rules: { [cap]: [{ pattern: "Bash", decision: "allow" }] }, unreadable: [] });
+    await catalogStub().watchRules("agt_watchold", []);
+    // A template listing it is written and spawns; the agent has the profile only.
+    await adminJson(`/v1/admin/templates/t-${id}`, { method: "PUT", body: {
+      capabilities: ["nest", cap], launch: { builtin_tools: [], system_prompt: { mode: "append", text: "" } }, hands: "forbidden", credential: "claude_oauth_token",
+    } });
+    const ag = await adminJson("/v1/agents", { body: { template: `t-${id}`, cell: uniqueCell(), start: false } }, 201);
+    expect((await adminJson(`/v1/agents/${ag.agent}`)).brokered.map((g: any) => g.action)).toEqual(["http.request"]);
   });
 
-  it("a fork settled by another delivery just before it would leave isn't sent", async () => {
-    await adminJson("/v1/admin/secrets/github_user", { method: "PUT", body: { value: GITHUB_USER_TOKEN } });
-    const up = `up${rand()}/lib`;
-    const s = await setup([{ action: "github.fork", repos: [up] }], { hands: true });
-    const p = await run(s.ws, "github_fork", { repo: up });
-    expect(p.status).toBe("pending");
-    await answer(s.agent, p.ask, "approve");
-    await settleBeforeSend(s.agent, "cal_fs1", "github.fork", up);
-    call(s.ws, "cal_fs1", "github_fork", { repo: up });
-    expect(await result(s.ws, "cal_fs1")).toEqual(STANDING);
-    expect(gh.forks.filter((f) => f.upstream === up)).toEqual([]);
-  });
-
-  it("the operator's token never resolves into a host command", async () => {
-    const r = await env.BROKER.get(env.BROKER.idFromName("broker")).resolveRefs(["$nest-secret:github_user"], ["github_user", "inject:"]);
-    expect(r).toEqual({ "$nest-secret:github_user": null });
+  it("a spec's stored grants of one stay in its record (a rollback runs them) but are neither shown, listed nor callable; its journal rows stay readable", async () => {
+    const p = await profileSetup({}, [], { tools: ["brokered"] });
+    const stale = { capability: "old", action: "github.comment", repos: null, when_tainted: "allow", per_hour: 30 };
+    await runInDurableObject(agentStub(p.agent), (inst: AgentDO) => {
+      (inst as any).update((i: any) => {
+        i.brokered = [stale, ...i.brokered];
+      });
+      (inst as any).journal.settle({ key: `${p.agent}/1/cal_gh_old`, action: "github.comment", target: "o/r", idem: "comment:o/r#1:x", digest: "d", args: "{\"body\":\"hi\"}", tainted: false },
+        "done", { status: "ok", content: [{ type: "text", text: "Done: https://github.com/o/r/issues/1#issuecomment-1" }] }, "{\"url\":\"…\"}");
+    });
+    // Shown without it.
+    expect((await adminJson(`/v1/agents/${p.agent}`)).brokered.map((g: any) => g.action)).toEqual(["http.request"]);
+    // Kept in the record, for a rollback.
+    const stored = await runInDurableObject(agentStub(p.agent), (_: AgentDO, st) =>
+      JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'info'").one().value).brokered);
+    expect(stored[0]).toEqual(stale);
+    // Not listed, and not callable by either tool.
+    const tools = (p.ws.send({ type: "tools_list_request", request: `req_${rand()}` }), (await p.ws.next("tools_list")).tools as any[]);
+    expect(tools.map((t) => t.name)).not.toContain("github_comment");
+    expect(await run(p.ws, "github_comment", { repo: "o/r", issue_number: 1, body: "x" })).toMatchObject({ status: "error", error: { code: "unknown_tool" } });
+    expect(await run(p.ws, "brokered", { action: "github.comment", args: { repo: "o/r", issue_number: 1, body: "x" } }))
+      .toMatchObject({ status: "error", error: { code: "invalid_message" } });
+    // The journal still reads its past call.
+    expect((await journal(p.agent)).find((e: any) => e.key.endsWith("/cal_gh_old"))).toMatchObject({ action: "github.comment", target: "o/r", status: "done" });
   });
 });
+
 
 // --- http.request -----------------------------------------------------------------------------------------
 
 describe("http.request profiles", () => {
-  async function profileSetup(extra: Record<string, unknown> = {}, more: unknown[] = []) {
-    const id = rand();
-    const stub = new HttpStub();
-    stubs.set(id, stub);
-    const secret = `prof-${rand()}-credential`;
-    await adminJson(`/v1/admin/secrets/http:p${id}`, { method: "PUT", body: { value: secret } });
-    const s = await setup([{ action: "http.request", profile: "p", base_url: `https://http.test/${id}`, methods: ["GET", "POST"], paths: ["/v1/items"],
-      // Its answers taint the session; the gate on its calls is tested on its own below.
-      auth: { secret: `http:p${id}` }, when_tainted: "allow", ...extra }, ...more]);
-    return { ...s, stub, secret, sid: id };
-  }
-
   it("attaches the profile's credential, masks it if reflected, follows no redirect, keeps to its methods and paths, and its answer taints", async () => {
     const p = await profileSetup();
     const o = await run(p.ws, "http_request", { profile: "p", method: "GET", path: "/v1/items/3", query: { x: 1, y: "a b" } });

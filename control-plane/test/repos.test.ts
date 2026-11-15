@@ -7,7 +7,6 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import fixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github.json";
 import noneFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github_none.json";
 import readFixture from "../../protocol/fixtures/control/egress_policy/egress_policy.github_read.json";
-import { grantOfEntry } from "../src/lib/brokered";
 import { SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS } from "../src/lib/github";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { canonicalRepos, narrowRepos, Repo } from "../src/lib/repos";
@@ -144,17 +143,16 @@ describe("push allowlists in specs", () => {
   const catalog: Catalog = {
     capabilities: {
       ...SEED_CATALOG.capabilities,
-      gh: { tools: [], rules: [], prompt: "", brokered: [{ action: "github.create_pr" }, { action: "github.comment", repos: ["other/repo"] }] },
+      gh: { tools: [], rules: [], prompt: "" },
     },
     templates: { coder: { ...SEED_CATALOG.templates.worker!, capabilities: ["nest", "hands", "gh"], repos: ["Me/App", "me/lib"] } },
   };
   const expand = (by: "operator" | "spawner", overrides: Record<string, unknown> = {}) =>
     expandSpec(catalog, PLATFORM_TOOL_NAMES, { template: "coder", hands: true, by, overrides } as never);
 
-  it("comes from the template, scopes the unscoped GitHub grants to it, and leaves scoped ones as the catalog named them", () => {
+  it("comes from the template", () => {
     const r = expand("operator");
     expect(r.ok && r.value.repos).toEqual(["me/app", "me/lib"]);
-    expect(r.ok && r.value.brokered!.map((g) => (g.action === "http.request" ? null : g.repos))).toEqual([["me/app", "me/lib"], ["other/repo"]]);
   });
 
   it("the operator replaces it; a spawner may only narrow it", () => {
@@ -166,11 +164,10 @@ describe("push allowlists in specs", () => {
     expect(narrowRepos(["a/b"], [])).toEqual({ ok: true, value: [] });
   });
 
-  it("no allowlist: unscoped grants stay unscoped and the spec has no repos (as before)", () => {
+  it("no allowlist: the spec has no repos (as before)", () => {
     const { repos: _, ...tpl } = catalog.templates.coder!;
     const r = expandSpec({ ...catalog, templates: { coder: tpl } }, PLATFORM_TOOL_NAMES, { template: "coder", hands: true, by: "operator" });
     expect(r.ok && r.value.repos).toBeUndefined();
-    expect(r.ok && r.value.brokered![0]).toEqual(grantOfEntry("gh", { action: "github.create_pr" }));
   });
 });
 
@@ -207,17 +204,16 @@ describe("GitHub env names in specs", () => {
 
 describe("read-only repos in specs", () => {
   const catalog: Catalog = {
-    capabilities: { ...SEED_CATALOG.capabilities, gh: { tools: [], rules: [], prompt: "", brokered: [{ action: "github.comment" }] } },
+    capabilities: { ...SEED_CATALOG.capabilities, gh: { tools: [], rules: [], prompt: "" } },
     templates: { reviewer: { ...SEED_CATALOG.templates.worker!, capabilities: ["nest", "hands", "gh"], repos: ["me/app"], read_repos: ["Me/Lib", "me/docs", "ME/APP"] } },
   };
   const expand = (by: "operator" | "spawner", overrides: Record<string, unknown> = {}) =>
     expandSpec(catalog, PLATFORM_TOOL_NAMES, { template: "reviewer", hands: true, by, overrides } as never);
 
-  it("come from the template, less its push allowlist, and scope no brokered action", () => {
+  it("come from the template, less its push allowlist", () => {
     const r = expand("operator");
     expect(r.ok && r.value.repos).toEqual(["me/app"]);
     expect(r.ok && r.value.read_repos).toEqual(["me/docs", "me/lib"]);
-    expect(r.ok && r.value.brokered!.map((g) => (g.action === "http.request" ? null : g.repos))).toEqual([["me/app"]]);
   });
 
   it("the operator replaces them; a spawner (or a client) may only narrow them, to the template's read-only repos or its push allowlist", () => {
@@ -240,17 +236,6 @@ describe("read-only repos in specs", () => {
       const r = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "reviewer", hands: true, by, overrides: { repos: [] } } as never) as any;
       expect([by, r.value.repos, r.value.read_repos]).toEqual([by, undefined, ["me/app", "me/lib"]]);
     }
-  });
-
-  it("a spawner narrowing the allowlist to none drops the unscoped GitHub grants it scoped, rather than leaving them on any repo", () => {
-    const r = expand("spawner", { repos: [], read_repos: ["me/app"] }) as any;
-    expect(r.value.brokered).toBeUndefined();
-    // Scoped grants keep the repos the catalog named; the operator (the root) may still leave them unscoped.
-    const cat: Catalog = { ...catalog, capabilities: { ...catalog.capabilities, gh: { ...catalog.capabilities.gh!, brokered: [{ action: "github.comment" }, { action: "github.create_pr", repos: ["me/app"] }] } } };
-    const s = expandSpec(cat, PLATFORM_TOOL_NAMES, { template: "reviewer", hands: true, by: "spawner", overrides: { repos: [] } }) as any;
-    expect(s.value.brokered.map((g: any) => [g.action, g.repos])).toEqual([["github.create_pr", ["me/app"]]]);
-    const o = expand("operator", { repos: [] }) as any;
-    expect(o.value.brokered.map((g: any) => g.repos)).toEqual([null]);
   });
 
   it("a template without them expands to a spec without them, as before", () => {

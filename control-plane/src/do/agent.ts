@@ -16,14 +16,12 @@ import { PLATFORM_TOOL_NAMES, toolDef, toolDefs } from "../lib/registry";
 import { connectorName, type McpGrant, mcpTarget, mcpToolDefs, needsApproval, NEST_TOOL_PREFIX, sameConnector } from "../lib/mcp";
 import { approves, argsDigest, canonicalJson, describeArgs, gated, sessionTaint, type SinkCall, visible } from "../lib/sinks";
 import {
-  actionDef, actionOfTool, authorize, checkBaseUrl, type Authorized, BROKERED_ACTIONS, BROKERED_TOOL_NAMES, type BrokeredAction, BrokeredJournal, brokeredToolDefs,
-  type GithubAction, type JournalEntry, type JournalRow, keyDigest, naturalKey, stringsOf,
+  actionDef, actionOfTool, authorize, checkBaseUrl, type Authorized, BROKERED_TOOL_NAMES, type BrokeredAction, BrokeredJournal, brokeredToolDefs,
+  type JournalEntry, type JournalRow, keyDigest, liveGrants, naturalKey, stringsOf,
 } from "../lib/brokered";
-import { actionRequest, createdOf, foundInState, type GhMade, ghError, githubApiOf, stateQuery } from "../lib/github";
 import { type McpConnector, McpProxy, mcpToken } from "../lib/mcp-proxy";
 import { meteredFetch, type OutboundRecord } from "../lib/outbound";
 import { type IdentitySubject, IdentityTokens } from "../lib/identity";
-import { Repo } from "../lib/repos";
 import { isAgentId, Labels } from "../lib/clients";
 import {
   AGENT_ID, attenuates, entryWithin, type HeldGrant, inScope, parseGrantRequests, reaches, type Resource, type ResolvedGrant, resolveChain, storedGrant,
@@ -671,10 +669,12 @@ export class AgentDO extends DurableObject<Env> {
 
   /** The record as the API shows it (without the compat `workstream`), plus its brain host and state. */
   async info(): Promise<AgentView> {
-    const { workstream: _, ...info } = this.load();
+    const { workstream: _, brokered: stored, ...info } = this.load();
     const grants = this.heldGrants();
+    // Grants of a removed action stay in the record (a rollback runs them again), never in the view.
+    const brokered = liveGrants(stored);
     return {
-      ...info, client: info.client ?? null, labels: info.labels ?? {}, host: info.brain?.host ?? null, state: agentState(info),
+      ...info, ...(brokered.length ? { brokered } : {}), client: info.client ?? null, labels: info.labels ?? {}, host: info.brain?.host ?? null, state: agentState(info),
       ...(grants.length ? { grants } : {}),
     };
   }
@@ -3517,15 +3517,14 @@ export class AgentDO extends DurableObject<Env> {
 
   /**
    * A brokered action, through the pipeline: the grant (an action its spec's capabilities give, for the
-   * repo or profile asked for) → the hourly cap → the stored-value scan → the sink gate → the current
-   * external state → the request under the action's natural idempotency key → the journal. Never from
-   * a sandbox. A redelivered call key skips the checks it passed already and reads the provider first.
+   * profile asked for) → the hourly cap → the stored-value scan → the sink gate → the request under the
+   * action's natural idempotency key → the journal. Never from a sandbox. A redelivered call key skips
+   * the checks it passed already.
    */
   private async brokeredTool(info: AgentInfo, epoch: number, call: string, action: string, args: unknown, guest: boolean, fence: number): Promise<ToolOutcome> {
     if (guest) throw new NestError(ErrorCodes.FORBIDDEN, "brokered actions aren't callable from a sandbox", 403);
     const def = actionDef(action);
     if (!def) throw new NestError(ErrorCodes.INVALID_MESSAGE, `unknown brokered action ${action}`);
-    if (def.kind === "none") throw new NestError(ErrorCodes.NOT_IMPLEMENTED, `${action} is not implemented: no provider is configured`, 501);
     const a = validateArgs(def.input_schema, args);
     const auth = authorize(info.brokered ?? [], action as BrokeredAction, a);
     if (!auth.ok) throw new NestError(ErrorCodes.FORBIDDEN, auth.error, 403);
@@ -3551,8 +3550,7 @@ export class AgentDO extends DurableObject<Env> {
         this.journal.refuse(row, names.map((n) => `the value of ${n}`).join(", "));
         throw secretRefusal("a credential nest holds");
       }
-      // A fork widens the push allowlist: the operator approves it from any session, tainted or not.
-      if (def.kind === "github_user" || gated({ sink: auth.value.sink, when_tainted: auth.value.when_tainted, tainted: this.tainted(this.load()) })) {
+      if (gated({ sink: auth.value.sink, when_tainted: auth.value.when_tainted, tainted: this.tainted(this.load()) })) {
         const held = await this.sinkGate(info, epoch, call, key, {
           name: action, tool: `${NEST_TOOL_PREFIX}${def.tool}`, what: `${action} on ${auth.value.target}`, args: a,
         }, fence);
@@ -3563,92 +3561,7 @@ export class AgentDO extends DurableObject<Env> {
       await this.hook("dispatch:beforeWrite");
       this.assertEpoch(fence);
     };
-    if (def.kind === "github_user") return await this.runFork(info, auth.value, row, live);
-    return def.kind === "github"
-      ? await this.runGithub(info, action as GithubAction, a, auth.value, row, kd, !!prior, live)
-      : await this.runHttp(a, auth.value, row, kd, !!prior, live);
-  }
-
-  /**
-   * `github.fork` (docs/agents/capabilities/brokered/#forks): forks a public upstream into the operator's
-   * account with their own token (`github_user`; the App can't fork from an account it isn't installed
-   * on), then adds the fork to its sandbox's push allowlist while it is attached. The upstream pull
-   * request is the operator's: the result carries the compare link. GitHub answers an existing fork
-   * for a repeated request (unverified), so a lost answer or a redelivery asks again.
-   */
-  private async runFork(info: AgentInfo, auth: Authorized, row: JournalRow, live: () => Promise<void>): Promise<ToolOutcome> {
-    const upstream = auth.target;
-    if (!Repo.safeParse(upstream).success) throw new NestError(ErrorCodes.INVALID_MESSAGE, `${upstream} isn't owner/name`);
-    const token = await this.broker().githubUserToken();
-    const api = githubApiOf(this.env, num(this.env.BROKERED_TIMEOUT_MS, 30_000), this.brokeredFetch("github.fork"));
-    let r: Awaited<ReturnType<typeof api.request>> = { kind: "lost", why: "not sent" };
-    for (let attempt = 1; attempt <= 2 && r.kind !== "ok" && !(r.kind === "refused"); attempt++) {
-      await live();
-      const settled = this.journalSend(row);
-      if (settled) return settled;
-      r = await api.request(token, "POST", `/repos/${upstream}/forks`, { default_branch_only: true });
-    }
-    if (r.kind !== "ok") {
-      if (r.kind === "lost") return this.unknownOutcome(row, `github.fork ${upstream}: ${r.why}`);
-      const e = ghError(r, "github.fork");
-      const outcome: ToolOutcome = { status: "error", error: e.body() };
-      return this.journalSettle(row, "failed", outcome, e.detail);
-    }
-    const j = (r.json ?? {}) as { full_name?: unknown; html_url?: unknown; default_branch?: unknown; parent?: { default_branch?: unknown } };
-    const fork = typeof j.full_name === "string" && Repo.safeParse(j.full_name).success ? j.full_name.toLowerCase() : null;
-    if (!fork || typeof j.html_url !== "string") return this.unknownOutcome(row, `github.fork ${upstream}: GitHub answered HTTP ${r.status} without the fork`);
-    if (info.hands) await this.sandboxStub(info.hands.sandbox).allowAgentRepos(info.agent, [fork]);
-    const base = typeof j.parent?.default_branch === "string" ? j.parent.default_branch : typeof j.default_branch === "string" ? j.default_branch : "main";
-    const [fo, fn] = fork.split("/");
-    const value = { fork, url: j.html_url, compare: `https://github.com/${upstream}/compare/${encodeURIComponent(base)}...${fo}:${fn}:<branch>`, push_allowed: !!info.hands };
-    const outcome: ToolOutcome = {
-      status: "ok", content: [{ type: "text", text: `Forked ${upstream} to ${fork}${info.hands ? "; it's on your sandbox's push allowlist" : ""}.` }, { type: "json", value }],
-    };
-    return this.journalSettle(row, "done", outcome, fork);
-  }
-
-  /** A `github.*` action with an installation token narrowed to its repo and permissions (BrokerDO). */
-  private async runGithub(
-    info: AgentInfo, action: GithubAction, a: Record<string, unknown>, auth: Authorized, row: JournalRow, kd: string, redelivered: boolean,
-    live: () => Promise<void>,
-  ): Promise<ToolOutcome> {
-    const { token } = await this.broker().githubToken(auth.target, BROKERED_ACTIONS[action].permissions, { agent: info.agent, call: row.key });
-    const api = githubApiOf(this.env, num(this.env.BROKERED_TIMEOUT_MS, 30_000), this.brokeredFetch(action));
-    const made = (m: GhMade): ToolOutcome => {
-      const what = m.existing ? `Already open: ${m.url}` : `Done: ${m.url}`;
-      const outcome: ToolOutcome = { status: "ok", content: [{ type: "text", text: what }, { type: "json", value: m }] };
-      return this.journalSettle(row, "done", outcome, JSON.stringify(m));
-    };
-    const look = async (): Promise<GhMade | null | "unreadable"> => {
-      const r = await api.request(token, "GET", stateQuery(action, a));
-      return r.kind === "ok" ? foundInState(action, r.json, kd) : "unreadable";
-    };
-    // The current external state: a pull request from the same head to the same base, or what an
-    // earlier attempt of this very call posted (its marker).
-    if (action === "github.create_pr" || redelivered) {
-      const found = await look();
-      if (found && found !== "unreadable") return made(found);
-      if (found === "unreadable" && redelivered) return this.unknownOutcome(row, `${action}: an earlier attempt's result couldn't be checked on GitHub`);
-    }
-    const req = actionRequest(action, a, kd);
-    await live();
-    const settled = this.journalSend(row);
-    if (settled) return settled;
-    const r = await api.request(token, req.method, req.path, req.body);
-    if (r.kind === "ok") {
-      const m = createdOf(r.json);
-      if (m) return made(m);
-      return this.unknownOutcome(row, `${action}: GitHub answered HTTP ${r.status} without the created resource`);
-    }
-    if (r.kind === "lost" || (r.kind === "refused" && r.status === 422 && action === "github.create_pr")) {
-      // Lost: it may have been made. 422 on a pull request: often one from that head to that base already exists.
-      const found = await look();
-      if (found && found !== "unreadable") return made(found);
-      if (r.kind === "lost") return this.unknownOutcome(row, `${action}: ${r.why}`);
-    }
-    const e = ghError(r, action);
-    const outcome: ToolOutcome = { status: "error", error: e.body() };
-    return this.journalSettle(row, "failed", outcome, e.detail);
+    return await this.runHttp(a, auth.value, row, kd, !!prior, live);
   }
 
   private unknownOutcome(row: JournalRow, why: string): ToolOutcome {
@@ -3685,7 +3598,7 @@ export class AgentDO extends DurableObject<Env> {
    * profile with an idempotency header). Its answer taints unless the profile is trusted.
    */
   private async runHttp(a: Record<string, unknown>, auth: Authorized, row: JournalRow, kd: string, redelivered: boolean, live: () => Promise<void>): Promise<ToolOutcome> {
-    const g = auth.profile!;
+    const g = auth.profile;
     // Checked again at each use, as when the capability was written.
     const base = checkBaseUrl(g.base_url, this.env.ALLOW_LOOPBACK_BROKERED === "1");
     if (!base.ok) throw new NestError(ErrorCodes.FORBIDDEN, `profile ${g.profile}: ${base.error}`, 403);

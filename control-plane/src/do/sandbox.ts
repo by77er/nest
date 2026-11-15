@@ -1811,20 +1811,6 @@ export class SandboxDO extends DurableObject<Env> {
     return this.view();
   }
 
-  /**
-   * Add repos to an attached agent's part of the allowlist (a fork it made, approved by the operator:
-   * AgentDO's `github.fork`). Ignored for an agent that isn't attached.
-   */
-  async allowAgentRepos(agent: string, repos: string[]): Promise<string[]> {
-    if (!this.info_().attached.includes(agent)) return this.pushRepos();
-    if (repos.length) this.refuseGithubEnv(true, ...this.envs());
-    const have = this.get<Record<string, string[]>>("agent_repos")?.[agent] ?? [];
-    const read = this.get<Record<string, string[]>>(AGENT_READ_REPOS)?.[agent] ?? [];
-    await this.requireBasicUser(() => this.setAgentRepos(agent, [...have, ...repos], read));
-    if (this.setAgentRepos(agent, [...have, ...repos], read)) await this.policyChanged(true);
-    return this.pushRepos();
-  }
-
   /** Record an attached agent's push allowlist and read-only repos; whether the sandbox's changed. */
   private setAgentRepos(agent: string, repos: string[], readRepos: string[]): boolean {
     const before = accessKey(this.repoAccess());

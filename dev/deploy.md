@@ -50,7 +50,7 @@ Built so far: the trigger, the environment, serialized runs, step 3 and a smoke 
 
 ## `rollback.yml` (designed)
 
-`workflow_dispatch` with inputs `version?` and `reason`, in the `production` environment: rolls back and pauses. I can run it, and so can the monitor through `github.dispatch_workflow{workflow: rollback.yml}`, without either of us holding a Cloudflare credential.
+`workflow_dispatch` with inputs `version?` and `reason`, in the `production` environment: rolls back and pauses. I can run it, and so can the monitor through a GitHub write that dispatches `rollback.yml`, without either of us holding a Cloudflare credential.
 
 ## Hosts
 

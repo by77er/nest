@@ -2423,6 +2423,11 @@ describe("secret references resolve only in their slot", () => {
     expect((await broker.resolveRefs(refs, ["inject:"]))[refs[0]!]).toBe("ghs_x");
     // Even a caller that asks for them gets nothing.
     expect(await broker.resolveRefs(refs.slice(2), ["access:", "binding_key:"])).toEqual({ [refs[2]!]: null, [refs[3]!]: null });
+    // Nor the control plane's own credentials, stored and asked for by name: an mcp capability's, a hook's, an
+    // http profile's, the GitHub App's, and the operator's GitHub user token (no reader since the brokered fork went).
+    const own = ["cap:seams", "hook:seams", "http:seams", "github_app", "github_user"];
+    for (const name of own) await broker.putSecret(name, `value-of-${name}-seams`);
+    expect(await broker.resolveRefs(own.map((n) => `$nest-secret:${n}`), own)).toEqual(Object.fromEntries(own.map((n) => [`$nest-secret:${n}`, null])));
   });
 });
 

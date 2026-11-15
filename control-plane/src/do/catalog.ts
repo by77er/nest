@@ -7,9 +7,9 @@ import { healthRead, isHealthInstance } from "../lib/health";
 import type { Env } from "../env";
 import { PLATFORM_TOOL_NAMES } from "../lib/registry";
 import {
-  type AgentSpec, Capability, type Catalog, checkCapability, checkTemplate, EntryName, expandSpec, type PromptRewrite, pruneCapability, pruneTemplate, type Removes,
+  type AgentSpec, type Capability, type Catalog, checkCapability, checkTemplate, EntryName, expandSpec, type PromptRewrite, pruneCapability, pruneTemplate, type Removes,
   expandTemplate, mcpPrefix, rewritePrompt, rewriteRules, type RuleSource, type RulesRewrite, SEED_CATALOG, templateRuleSources, SEED_VERSION, seedMigration, type SpawnSpec, Template,
-  templatesUsing,
+  StoredCapability, templatesUsing,
 } from "../lib/spec";
 import type { ToolRule } from "../protocol/control";
 import { Deadlines } from "../lib/reliable";
@@ -204,9 +204,9 @@ export class CatalogDO extends DurableObject<Env> {
         out.rules[name] = null;
         continue;
       }
-      let parsed: ReturnType<typeof Capability.safeParse> | undefined;
+      let parsed: ReturnType<typeof StoredCapability.safeParse> | undefined;
       try {
-        parsed = Capability.safeParse(JSON.parse(row.body));
+        parsed = StoredCapability.safeParse(JSON.parse(row.body));
       } catch {
         parsed = undefined;
       }
@@ -332,7 +332,7 @@ export class CatalogDO extends DurableObject<Env> {
       }
       return out;
     };
-    return { capabilities: rows("capabilities", Capability), templates: rows("templates", Template) };
+    return { capabilities: rows("capabilities", StoredCapability), templates: rows("templates", Template) };
   }
 
   /** The catalog, or what a client sees of it: the operator's entries and its own. */
