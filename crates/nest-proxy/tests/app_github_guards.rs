@@ -3,8 +3,8 @@
 //! a worker's guards (`egress_policy.app_github_push.json`) and a reader's (`…_read.json`), in wire form
 //! (`client:<name>`, `injected: client:<binding>`), which a projects vitest asserts the app still builds.
 //! Here nest-proxy's own evaluator decides GitHub's real request shapes against them. These are the
-//! client's guards alone: every other guard of the policy (the operator's, the constructor's) refuses on
-//! its own besides.
+//! client's guards alone: every other guard of the policy (the base layer's floor, the operator's) refuses
+//! on its own besides.
 
 use nest_protocol::model::EgressPolicy;
 use nest_proxy::guard::{BodyView, Req, refusing};
@@ -77,7 +77,7 @@ fn a_worker_pushes_and_writes_only_to_its_project_repo() {
         ("github.com", "POST", "/attacker/x/issues/new", None, Cred::None, true),
         // the web editor's routes end in a path the user chooses: never a fetch's or a push's, whatever they end in
         ("github.com", "POST", "/attacker/drop/tree-save/main/git-upload-pack", None, Cred::None, true),
-        // (a web write into the repo itself is the repo's for the app's guards; nest's own constructor refuses it there)
+        // (a web write into the repo itself is the repo's for the app's guards; an operator's floor may refuse it, as base_floor.json does)
         ("github.com", "POST", "/by77er/nest/tree-save/main/README.md", None, Cred::Auth(PUSH), false),
         // the REST API: the repo's own paths (gh pr create's REST forms, a branch delete)
         ("api.github.com", "POST", "/repos/by77er/nest/pulls", None, Cred::Auth(PUSH), false),

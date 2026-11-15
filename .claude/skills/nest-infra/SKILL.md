@@ -63,7 +63,7 @@ description: Use when changing nest's cloud infrastructure or delivery: the infr
   2. **`worker`:** `dev/deploy-use1.sh`, which merges every cell's `AWS_CELLS` parameter, writes the tunnel secret, and deploys. Then `/v1/health` is polled for 2 min, and a failure runs `wrangler rollback` to the previous version.
   3. **`release`:** `scripts/publish-release.sh` builds static musl host binaries into `releases/current/`; when they changed, it starts a host AMI build.
 - **Not in the pipeline:**
-  - the guest image is rebuilt by hand (`images/guest/build-on-ec2.sh`) when `nest-guest` changes;
+  - the guest image is rebuilt by hand (`images/guest/build-on-ec2.sh`) when `nest-guest` or `images/guest/` changes;
   - the apps deploy from their own workflows, `deploy-dashboard.yml` and `deploy-projects.yml`;
   - the projects app's Access stack (`projects/deploy/`) applies from `deploy-projects-infra.yml`, only on its own changes;
   - the health window, the deploy pause and `rollback.yml` aren't built.

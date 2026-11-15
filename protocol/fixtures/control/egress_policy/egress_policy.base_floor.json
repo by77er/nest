@@ -46,7 +46,7 @@
           ]
         }
       ],
-      "reason": "the cell's floor: writes to GitHub go only with a credential nest injected",
+      "reason": "writes to GitHub go only with a credential nest injected",
       "ignore_case": true,
       "allow": [
         {
@@ -83,7 +83,7 @@
           ]
         }
       ],
-      "reason": "the cell's floor: writes to GitHub go only with a credential nest injected",
+      "reason": "writes to GitHub go only with a credential nest injected",
       "ignore_case": true,
       "allow": [
         {
@@ -159,7 +159,7 @@
           ]
         }
       ],
-      "reason": "the cell's floor: writes to GitHub go only with a credential nest injected",
+      "reason": "writes to GitHub go only with a credential nest injected",
       "ignore_case": true,
       "allow": [
         {
