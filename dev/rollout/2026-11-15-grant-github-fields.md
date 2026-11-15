@@ -2,7 +2,7 @@
 
 A release's rollout rule ([Rollout rules](../deploy.md#rollout-rules)), for API clients ([no GitHub authority](../../docs/control-plane/api/clients/README.md#no-github-authority)): phase C1 of the plan to take service integrations out of nest's kernel ([decisions](../../docs/README.md#settled-decisions)). It needs B4 (`2026-11-14-projects-converge-github.md`) done: nothing of a client runs on nest's repos, and no deployed app calls the routes below.
 
-**Not a one-way deploy, and no ordering constraint.** No Durable Object class, table, column or wire change; routes and DO methods go.
+**Not a one-way deploy. Ordering constraint:** B4 done and the projects app's fallback off before the Worker deploys (both checked below). No Durable Object class, table, column or wire change; routes and DO methods go.
 
 - **Checked before the merge:** the live grants (`GET /v1/admin/clients`): one client, `projects`, holding `repos: []` and `read_repos: []` and none of `github`, `github_push`, `repo_owners`. Its Worker has no `GITHUB_TOKEN_SOURCE` (`wrangler secret list --name nest-projects`; not a var in its `wrangler.jsonc`), so its fallback to nest's tokens is off, and it no longer calls `/grant/repos` (B2).
 - **What changes at deploy:**

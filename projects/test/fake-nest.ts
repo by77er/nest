@@ -550,7 +550,7 @@ export class FakeNest {
       }
       if (this.grantRepos && !this.grantRepos.includes(repo.toLowerCase())) return nestErr(403, "forbidden", `${repo} is outside the grant`);
       const token = this.github.mint(repo, permissions);
-      // The App it's from (docs/control-plane/api/clients/#github-tokens), unless nest can't tell.
+      // The App it's from, unless nest could tell none (the answer of nest's route before it went).
       const app = this.githubApp ? { app_id: this.githubApp.app_id, app_slug: this.githubApp.app_slug } : {};
       // And the installation it was minted from (one installation in this fake).
       // The installation it's minted from, unless the test plays a nest from before it was named.

@@ -42,7 +42,7 @@ Only the client interface. One client, `projects`, has this grant:
 | Approvals | `GET /v1/asks?label=project=<id>` when "Needs you" is read, answered by `POST /v1/agents/<id>/asks/…` ([asks](#asks)) |
 | Ending a worker or reviewer | `POST /v1/agents/<id>/stop {end: true, destroy_sandbox: true}` |
 | Knowing what agents did | Signed webhooks to `/hooks/nest`, deduplicated by event `id`. After a gap (the dropped count rises), it re-reads `GET /v1/agents?label=project=<id>` |
-| Check runs, branch protection and every other GitHub call | Its own GitHub App's installation tokens ([GitHub tokens](#github-tokens)); nest's `POST /v1/clients/self/github-token` only in the fallback |
+| Check runs, branch protection and every other GitHub call | Its own GitHub App's installation tokens ([GitHub tokens](#github-tokens)) |
 | Which repos may be attached | Its own GitHub App's installations, as GitHub answers ([repo authority](#repo-authority)); nest isn't asked |
 | GitHub's events | The GitHub App's webhook, pointed at `/hooks/github` by the operator (nest consumes none of it) |
 | Telling which agent calls the MCP server | The `Nest-Identity` JWT on every request, checked against nest's JWKS |
@@ -458,7 +458,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 - **Attaching:**
   - **Required checks that exist** change only their lists (`PATCH …/required_status_checks`), and only when the check is missing or not yet pinned to the App; `strict` and everything else stay. A second attach writes nothing.
   - **A branch protected without required checks** gets its protection written back whole with them (`PUT`, from what `GET` answers). Required signatures aren't in that body (unverified that `PUT` leaves them).
-  - **The App's id:** the check is required from the App (`checks: [{context, app_id}]`) from the first attach, so no other app or commit status can pass it. The id is the App's own (`GITHUB_APP_ID`, [GitHub tokens](#github-tokens)); in the fallback, the `app_id` of nest's token answer. If that has none (nest can't tell), the check is required from any source (`contexts`, or `checks` without `app_id` where other entries are pinned, which keeps their pins), and the first check run's `app.id` then pins it: the project attaches again. Another entry's `app_id: null` (any source) is sent back as `-1`, GitHub's "any app".
+  - **The App's id:** the check is required from the App (`checks: [{context, app_id}]`) from the first attach, so no other app or commit status can pass it. The id is the App's own (`GITHUB_APP_ID`, [GitHub tokens](#github-tokens)). If that has none (nest can't tell), the check is required from any source (`contexts`, or `checks` without `app_id` where other entries are pinned, which keeps their pins), and the first check run's `app.id` then pins it: the project attaches again. Another entry's `app_id: null` (any source) is sent back as `-1`, GitHub's "any app".
   - Rulesets aren't read or changed: a repo protected by rulesets alone gets branch protection besides.
 - **Tasks and PRs:** a `pull_request` from the repo's own branch `task/<id>` (not a fork's) links the PR to its task (`pr_opened`) if the worker hadn't reported it. Merged, the task is `done` (through `pr_opened` first if it was still `in_progress`) and its worker ended.
 

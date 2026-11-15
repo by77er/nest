@@ -768,6 +768,26 @@ describe("the grant bounds everything in the subtree", () => {
     const fromOld = await stub.setGrant({ ...view.grant, ...github } as never);
     expect(removed.filter((k) => Object.hasOwn(fromOld.grant, k))).toEqual([]);
     expect(await recordGrant()).toEqual({ ...view.grant, repos: [] });
+    // Likewise a client a Worker of the previous release creates: answered without them, stored with `repos: []` only.
+    const oldId = `cli_${rand()}${rand()}`;
+    const created = await clientStub(oldId).create({ client: oldId, name: `old-${rand()}`, grant: { ...view.grant, ...github } as never, token_hash: "0".repeat(64) });
+    expect(removed.filter((k) => Object.hasOwn(created.grant, k))).toEqual([]);
+    expect(await runInDurableObject(clientStub(oldId), (_i: ClientDO, st) =>
+      (JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'record'").one().value) as { grant: unknown }).grant)).toEqual({ ...view.grant, repos: [] });
+    // This release's Worker creates a client with `repos: []` in what it hands ClientDO, as it patches (above).
+    const createProto = ClientDOClass.prototype as unknown as { create: (req: { grant: unknown }) => Promise<unknown> };
+    const realCreate = createProto.create;
+    const handed: unknown[] = [];
+    createProto.create = function (this: unknown, req: { grant: unknown }) {
+      handed.push(req.grant);
+      return realCreate.call(this, req);
+    };
+    try {
+      await adminJson("/v1/admin/clients", { body: { name: `gh-${rand()}`, grant: { cells: [c.cell], repos: [] } } }, 201);
+    } finally {
+      createProto.create = realCreate;
+    }
+    expect(handed).toEqual([{ ...Grant.parse({ cells: [c.cell] }), repos: [] }]);
     // A write that would grant any of them is refused, naming it, and stores nothing.
     for (const [k, v] of [...Object.entries(github).filter(([k]) => k !== "repo_owners"), ["repo_owners", "acme"], ["repo_owners", { acme: "7" }]] as [string, unknown][]) {
       const e = await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { ...view.grant, max_agents: 1, [k]: v } } }, 400);
