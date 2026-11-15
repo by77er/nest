@@ -9,8 +9,8 @@ import type { ClientDO } from "../src/do/client";
 import { ClientDO as ClientDOClass, RESERVE_CHECK_MS } from "../src/do/client";
 import { MEMBER_EVENTS, MEMBER_STATES, memberStep } from "../src/lib/members";
 import {
-  capabilityOutsideGrant, entryVisible, Grant, Labels, labelsMatch, mcpUrlAllowed, newClientToken, parseClientToken, parseLabelFilters, specOutsideGrant,
-  tokenHash,
+  capabilityOutsideGrant, entryVisible, Grant, GrantInput, grantForPreviousRelease, Labels, labelsMatch, mcpUrlAllowed, newClientToken, parseClientToken, parseLabelFilters,
+  REMOVED_GRANT_FIELDS, specOutsideGrant, storedGrant, tokenHash,
 } from "../src/lib/clients";
 import { expandSpec, mcpPrefix } from "../src/lib/spec";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
@@ -63,7 +63,7 @@ const createAgent = (c: Client, body: Record<string, unknown> = {}, status = 201
 
 describe("grants, tokens and labels (pure)", () => {
   const grant = Grant.parse({
-    cells: ["c1"], credentials: ["claude_oauth_token", "cap:board"], repos: ["Acme/App"],
+    cells: ["c1"], credentials: ["claude_oauth_token", "cap:board"],
     mcp_urls: ["https://board.example.com/mcp", "https://tools.example.com/v1/"],
   });
 
@@ -82,11 +82,10 @@ describe("grants, tokens and labels (pure)", () => {
     expect(Grant.safeParse({ unknown_field: 1 }).success).toBe(false);
   });
 
-  it("a spec is outside the grant by its credential, mcp servers and their secrets, repos, and brokered actions", () => {
-    const within = { credential: "claude_oauth_token", repos: ["acme/app"] };
+  it("a spec is outside the grant by its credential, mcp servers and their secrets; no grant covers repos, a push token's workflows or a brokered action", () => {
+    const within = { credential: "claude_oauth_token", repos: [], read_repos: [] };
     expect(specOutsideGrant(within, grant)).toEqual([]);
     expect(specOutsideGrant({ ...within, credential: "claude_oauth_token:worker" }, grant)).toEqual(["credential claude_oauth_token:worker"]);
-    expect(specOutsideGrant({ ...within, repos: ["acme/app", "acme/other"] }, grant)).toEqual(["repos acme/other"]);
     const mcp = (url: string, auth: string, client?: string) => ({
       capability: "x", url, auth, tools: null, idempotent: {}, trusted: false, ...(client ? { oauth: { client, scopes: null } } : {}),
     });
@@ -94,29 +93,61 @@ describe("grants, tokens and labels (pure)", () => {
     expect(specOutsideGrant({ ...within, mcp: [mcp("https://evil.example.com/mcp", "cap:board")] }, grant)).toHaveLength(1);
     expect(specOutsideGrant({ ...within, mcp: [mcp("https://board.example.com/mcp", "cap:github")] }, grant)).toEqual(["credential cap:github (x)"]);
     expect(specOutsideGrant({ ...within, mcp: [mcp("https://board.example.com/mcp", "cap:board", "cap:other-client")] }, grant)).toHaveLength(1);
-    const gh = (action: string, repos: string[] | null) => ({ capability: "b", action, repos, when_tainted: "approve", per_hour: 30 }) as any;
-    expect(specOutsideGrant({ ...within, brokered: [gh("github.comment", ["acme/app"])] }, grant)).toEqual([]);
-    expect(specOutsideGrant({ ...within, brokered: [gh("github.comment", null)] }, grant)).toHaveLength(1);
-    expect(specOutsideGrant({ ...within, brokered: [gh("github.comment", ["acme/other"])] }, grant)).toHaveLength(1);
-    expect(specOutsideGrant({ ...within, brokered: [gh("github.fork", ["acme/app"])] }, grant)).toHaveLength(1);
-    expect(specOutsideGrant({ ...within, brokered: [{ capability: "h", action: "http.request" } as any] }, grant)).toHaveLength(1);
+    // Whatever a stored grant once said of GitHub: read, it covers none of these.
+    const old = storedGrant({ ...grant, repos: ["acme/app"], read_repos: ["acme/lib"], github_push: { workflows: true }, github: { repos: ["acme/app"], permissions: { checks: "write" } } });
+    for (const g of [grant, old]) {
+      expect(specOutsideGrant({ ...within, repos: ["Acme/App"] }, g)).toEqual(["repos acme/app"]);
+      expect(specOutsideGrant({ ...within, read_repos: ["acme/lib"] }, g)).toEqual(["read_repos acme/lib"]);
+      expect(specOutsideGrant({ ...within, github_push: { workflows: true } }, g)).toEqual(["github_push.workflows"]);
+      expect(specOutsideGrant({ ...within, github_push: { workflows: false } as never }, g)).toEqual([]);
+      const gh = (action: string, repos: string[] | null) => ({ capability: "b", action, repos, when_tainted: "approve", per_hour: 30 }) as any;
+      for (const b of [gh("github.comment", ["acme/app"]), gh("github.comment", null), gh("github.fork", ["acme/app"]), { capability: "h", action: "http.request" } as any]) {
+        expect(specOutsideGrant({ ...within, brokered: [b] }, g)).toEqual([`brokered action ${b.action} (${b.capability})`]);
+        expect(capabilityOutsideGrant("n/b", { tools: [], rules: [], prompt: "", brokered: [{ ...b, capability: undefined }] } as any, g)).toEqual([`brokered action ${b.action} (n/b)`]);
+      }
+    }
     // A capability on its own, as a client writes it.
     expect(capabilityOutsideGrant("n/x", { tools: [], rules: [], prompt: "", mcp: { url: "https://board.example.com/mcp", auth: "cap:board" } as any }, grant)).toEqual([]);
     expect(capabilityOutsideGrant("n/x", { tools: [], rules: [], prompt: "", mcp: { url: "https://board.example.com/mcp", auth: { oauth: "cap:board", client: "cap:z" } } as any }, grant))
       .toEqual(["credential cap:z"]);
   });
 
-  it("read_repos: a spec may read a repo in repos or read_repos, push only to repos; a grant stored before read_repos reads none", () => {
-    const g2 = Grant.parse({ credentials: ["c"], repos: ["acme/app"], read_repos: ["Acme/Lib"] });
-    const spec = (repos: string[], read_repos: string[]) => ({ credential: "c", repos, read_repos });
-    expect(specOutsideGrant(spec(["acme/app"], ["acme/lib"]), g2)).toEqual([]);
-    expect(specOutsideGrant(spec([], ["ACME/APP", "acme/lib"]), g2)).toEqual([]);
-    // Reading is no licence to push.
-    expect(specOutsideGrant(spec(["acme/lib"], []), g2)).toEqual(["repos acme/lib"]);
-    expect(specOutsideGrant(spec([], ["acme/lib", "acme/secret"]), g2)).toEqual(["read_repos acme/secret"]);
-    const { read_repos: _, ...old } = g2;
-    expect(specOutsideGrant(spec([], ["acme/lib"]), old as never)).toEqual(["read_repos acme/lib"]);
-    expect(specOutsideGrant(spec([], ["acme/app"]), old as never)).toEqual([]);
+  it("a grant holds no GitHub fields: read, a stored one's are dropped; written, one that grants nothing is dropped and one that grants anything refused", () => {
+    expect([...REMOVED_GRANT_FIELDS]).toEqual(["repos", "read_repos", "github", "github_push", "repo_owners"]);
+    // The canonical grant has none of them (strict: each is an unknown field).
+    for (const k of REMOVED_GRANT_FIELDS) expect(Grant.safeParse({ [k]: [] }).success, k).toBe(false);
+    // Stored by the previous release: every field it held, read back without the removed ones and the rest intact.
+    const stored = {
+      ...Grant.parse({ cells: ["c1"], credentials: ["c"], egress_hosts: ["x.example.com"], max_agents: 3 }),
+      repos: ["acme/app", "acme/*"], read_repos: ["acme/lib"], github: { repos: ["acme/app"], permissions: { checks: "write" } },
+      github_push: { workflows: true }, repo_owners: { acme: 7 },
+    };
+    const read = storedGrant(stored);
+    for (const k of REMOVED_GRANT_FIELDS) expect(Object.hasOwn(read, k), k).toBe(false);
+    expect(read).toEqual(Grant.parse({ cells: ["c1"], credentials: ["c"], egress_hosts: ["x.example.com"], max_agents: 3 }));
+    // Written for the previous release: `repos: []`, which it reads with no default; the rest as given.
+    expect(grantForPreviousRelease(read)).toEqual({ ...read, repos: [] });
+    // Written by the operator: what the previous release's GET showed for a grant with no GitHub authority is taken, and dropped.
+    const nothing = { cells: ["c1"], repos: [], read_repos: [], github_push: { workflows: false }, github: { repos: [], permissions: {} }, repo_owners: { acme: 7 } };
+    const ok = GrantInput.safeParse(nothing);
+    expect(ok.success, JSON.stringify(ok.error?.issues)).toBe(true);
+    expect(ok.data).toEqual(Grant.parse({ cells: ["c1"] }));
+    // Anything that would grant GitHub authority is refused, by name.
+    const granting: [string, unknown][] = [
+      ["repos", ["acme/app"]], ["read_repos", ["acme/*"]], ["github", { repos: ["acme/app"] }], ["github", { permissions: { checks: "read" } }],
+      ["github_push", { workflows: true }],
+      // `repo_owners` is dropped only in the shape it always had.
+      ["repo_owners", null], ["repo_owners", { acme: -1 }],
+      // Nested past the removed fields' own shape: refused, never recursed into.
+      ["github", JSON.parse(`${"{\"a\":".repeat(100_000)}{}${"}".repeat(100_000)}`)],
+    ];
+    for (const [k, v] of granting) {
+      const r = GrantInput.safeParse({ cells: ["c1"], [k]: v });
+      expect(r.success, `${k} ${JSON.stringify(v)}`).toBe(false);
+      expect(r.error!.issues.map((i) => [i.path.join("."), i.message.includes("no longer a grant field")]), k).toEqual([[k, true]]);
+    }
+    // Any other unknown field is still refused.
+    expect(GrantInput.safeParse({ unknown_field: 1 }).success).toBe(false);
   });
 
   it("a client token names its client; anything else is no client token", async () => {
@@ -663,8 +694,8 @@ describe("GET /v1/asks: open asks across agents (docs/control-plane/api/#open-as
 // --- The grant -----------------------------------------------------------------------------------------
 
 describe("the grant bounds everything in the subtree", () => {
-  it("refuses a cell, a credential and repos outside it, through the client's templates and the operator's", async () => {
-    const c = await newClient({ repos: ["acme/app"] });
+  it("refuses a cell, a credential and any repo, through the client's templates and the operator's", async () => {
+    const c = await newClient();
     // A cell not in the grant.
     expect((await createAgent(c, { cell: uniqueCell() }, 403)).error.message).toContain("cell");
     // The operator's captain runs on claude_oauth_token:captain, which the grant doesn't name.
@@ -672,33 +703,99 @@ describe("the grant bounds everything in the subtree", () => {
     // Another client's namespace isn't visible.
     const other = await newClient();
     expect((await createAgent(c, { template: other.tpl }, 400)).error.message).toContain("unknown template");
-    // Repos: a template naming one outside is refused when written; a narrower one spawns.
-    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/wide`, { method: "PUT", body: basic({ repos: ["acme/app", "acme/secret"] }) }, 403)).error.message)
-      .toContain("repos acme/secret");
-    await asJson(c.token, `/v1/catalog/templates/${c.name}/pusher`, { method: "PUT", body: basic({ repos: ["Acme/App"] }) });
-    expect((await createAgent(c, { template: `${c.name}/pusher` })).repos).toEqual(["acme/app"]);
-    // An entry the operator wrote into the namespace is held to the same grant at spawn.
-    await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { cells: [c.cell], credentials: ["claude_oauth_token"], max_agents: 10 } } });
-    expect((await createAgent(c, { template: `${c.name}/pusher` }, 403)).error.message).toContain("repos acme/app");
+    // Repos: no grant covers one, to push or to read, whoever writes the template into the namespace.
+    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/pusher`, { method: "PUT", body: basic({ repos: ["Acme/App"] }) }, 403)).error.message)
+      .toContain("repos acme/app");
+    expect((await adminJson(`/v1/catalog/templates/${c.name}/reader`, { method: "PUT", body: basic({ read_repos: ["acme/lib"] }) }, 403)).error.message)
+      .toContain("read_repos acme/lib");
+    // One stored before (a grant that had repos then) is refused at spawn.
+    await runInDurableObject(env.CATALOG.get(env.CATALOG.idFromName("catalog")), (_i, st) => {
+      st.storage.sql.exec("INSERT OR REPLACE INTO templates (name, body) VALUES (?, ?)", `${c.name}/old`, JSON.stringify(basic({ repos: ["acme/app"], read_repos: ["acme/lib"] })));
+    });
+    expect((await createAgent(c, { template: `${c.name}/old` }, 403)).error.message).toMatch(/repos acme\/app; read_repos acme\/lib/);
   });
 
-  it("read_repos: within the grant when written and again at spawn, and a client's overrides only narrow them", async () => {
-    const c = await newClient({ repos: ["acme/app"], read_repos: ["acme/lib", "acme/docs"] });
-    // Outside both lists, refused when written; a read-only repo can't be made pushable.
-    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/peek`, { method: "PUT", body: basic({ read_repos: ["acme/lib", "acme/secret"] }) }, 403)).error.message)
-      .toContain("read_repos acme/secret");
-    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/sneak`, { method: "PUT", body: basic({ repos: ["acme/lib"] }) }, 403)).error.message)
-      .toContain("repos acme/lib");
-    await asJson(c.token, `/v1/catalog/templates/${c.name}/reader`, { method: "PUT", body: basic({ repos: ["acme/app"], read_repos: ["Acme/Lib", "acme/docs"] }) });
-    const a = await createAgent(c, { template: `${c.name}/reader` });
-    expect([a.repos, a.read_repos]).toEqual([["acme/app"], ["acme/docs", "acme/lib"]]);
-    // A client's overrides narrow, never widen: to a subset, or down from push to read.
-    const n = await createAgent(c, { template: `${c.name}/reader`, overrides: { repos: [], read_repos: ["acme/app"] } });
-    expect([n.repos, n.read_repos]).toEqual([undefined, ["acme/app"]]);
-    expect((await createAgent(c, { template: `${c.name}/reader`, overrides: { read_repos: ["acme/other"] } }, 400)).error.message).toContain("can't widen the repos it may read with acme/other");
-    // The operator narrowing the grant refuses the same template at spawn.
-    await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { cells: [c.cell], credentials: ["claude_oauth_token"], repos: ["acme/app"], read_repos: ["acme/docs"], max_agents: 10 } } });
-    expect((await createAgent(c, { template: `${c.name}/reader` }, 403)).error.message).toContain("read_repos acme/lib");
+  it("a grant stored with GitHub fields reads without them, is held to none of them, and is written back without them", async () => {
+    const c = await newClient();
+    const stub = clientStub(c.id);
+    const recordGrant = () => runInDurableObject(stub, (_i: ClientDO, st) =>
+      (JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'record'").one().value) as { grant: Record<string, unknown> }).grant);
+    // As the previous release stored it, with every GitHub field it had.
+    const github = {
+      repos: ["acme/app", "acme/*"], read_repos: ["acme/lib"], github: { repos: ["acme/app"], permissions: { checks: "write" } },
+      github_push: { workflows: true }, repo_owners: { acme: 7 },
+    };
+    await runInDurableObject(stub, (_i: ClientDO, st) => {
+      const r = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'record'").one().value) as { grant: Record<string, unknown> };
+      r.grant = { ...r.grant, ...github };
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'record'", JSON.stringify(r));
+    });
+    const removed = ["repos", "read_repos", "github", "github_push", "repo_owners"];
+    // Read: none of them, in the operator's view, the client's own, or the scope other Durable Objects get (but `repos: []`, for the previous release).
+    const view = await adminJson(`/v1/admin/clients/${c.id}`);
+    const self = await asJson(c.token, "/v1/clients/self");
+    expect(removed.filter((k) => Object.hasOwn(view.grant, k) || Object.hasOwn(self.grant, k))).toEqual([]);
+    expect(Object.hasOwn(self, "github_app")).toBe(false);
+    expect(view.grant).toEqual({ cells: [c.cell], credentials: ["claude_oauth_token"], mcp_urls: [], secrets: { max_count: 0, max_bytes: 4096 }, inject_hosts: [], egress_hosts: [], max_agents: 10, max_sandboxes: 10 });
+    const scope = await stub.scope();
+    expect(removed.filter((k) => Object.hasOwn(scope.grant, k))).toEqual(["repos"]);
+    expect((scope.grant as { repos?: unknown }).repos).toEqual([]);
+    // Held to none: what they once allowed is refused; what never needed them still runs.
+    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/pusher`, { method: "PUT", body: basic({ repos: ["acme/app"] }) }, 403)).error.message).toContain("repos acme/app");
+    expect((await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true } } }, 403)).error.message).toContain("github_push.workflows");
+    await createAgent(c);
+    // Written back as the operator read it, with what the previous release's GET showed for no GitHub authority: taken.
+    // The Worker hands ClientDO the grant with `repos: []`, so a ClientDO still on the previous release (the
+    // minutes of a deploy), which stores what it is given, stores a grant it can read.
+    const proto = ClientDOClass.prototype as unknown as { setGrant: (g: unknown) => Promise<unknown> };
+    const realSetGrant = proto.setGrant;
+    const sent: unknown[] = [];
+    proto.setGrant = function (this: unknown, g: unknown) {
+      sent.push(g);
+      return realSetGrant.call(this, g);
+    };
+    let patched: any;
+    try {
+      patched = await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { ...view.grant, repos: [], read_repos: [], repo_owners: { acme: 7 } } } });
+    } finally {
+      proto.setGrant = realSetGrant;
+    }
+    expect(sent).toEqual([{ ...view.grant, repos: [] }]);
+    expect(removed.filter((k) => Object.hasOwn(patched.grant, k))).toEqual([]);
+    // Stored without them but `repos: []`, which the previous release reads with no default.
+    expect(await recordGrant()).toEqual({ ...view.grant, repos: [] });
+    // A Worker of the previous release (mid-deploy) hands ClientDO a grant with them: stored and answered without them.
+    const fromOld = await stub.setGrant({ ...view.grant, ...github } as never);
+    expect(removed.filter((k) => Object.hasOwn(fromOld.grant, k))).toEqual([]);
+    expect(await recordGrant()).toEqual({ ...view.grant, repos: [] });
+    // Likewise a client a Worker of the previous release creates: answered without them, stored with `repos: []` only.
+    const oldId = `cli_${rand()}${rand()}`;
+    const created = await clientStub(oldId).create({ client: oldId, name: `old-${rand()}`, grant: { ...view.grant, ...github } as never, token_hash: "0".repeat(64) });
+    expect(removed.filter((k) => Object.hasOwn(created.grant, k))).toEqual([]);
+    expect(await runInDurableObject(clientStub(oldId), (_i: ClientDO, st) =>
+      (JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'record'").one().value) as { grant: unknown }).grant)).toEqual({ ...view.grant, repos: [] });
+    // This release's Worker creates a client with `repos: []` in what it hands ClientDO, as it patches (above).
+    const createProto = ClientDOClass.prototype as unknown as { create: (req: { grant: unknown }) => Promise<unknown> };
+    const realCreate = createProto.create;
+    const handed: unknown[] = [];
+    createProto.create = function (this: unknown, req: { grant: unknown }) {
+      handed.push(req.grant);
+      return realCreate.call(this, req);
+    };
+    try {
+      await adminJson("/v1/admin/clients", { body: { name: `gh-${rand()}`, grant: { cells: [c.cell], repos: [] } } }, 201);
+    } finally {
+      createProto.create = realCreate;
+    }
+    expect(handed).toEqual([{ ...Grant.parse({ cells: [c.cell] }), repos: [] }]);
+    // A write that would grant any of them is refused, naming it, and stores nothing.
+    for (const [k, v] of [...Object.entries(github).filter(([k]) => k !== "repo_owners"), ["repo_owners", "acme"], ["repo_owners", { acme: "7" }]] as [string, unknown][]) {
+      const e = await adminJson(`/v1/admin/clients/${c.id}`, { method: "PATCH", body: { grant: { ...view.grant, max_agents: 1, [k]: v } } }, 400);
+      expect(e.error.message, k).toContain(`${k} is no longer a grant field`);
+    }
+    expect((await adminJson(`/v1/admin/clients/${c.id}`)).grant.max_agents).toBe(10);
+    expect((await adminJson("/v1/admin/clients", { body: { name: `gh-${rand()}`, grant: { cells: [c.cell], repos: ["acme/app"] } } }, 400)).error.message)
+      .toContain("repos is no longer a grant field");
   });
 
   it("mcp capabilities: the URL in mcp_urls and its auth in credentials, when written and again at spawn", async () => {

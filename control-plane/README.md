@@ -126,16 +126,15 @@ npm run dev        # wrangler dev --local, state persisted in .wrangler/state
 External systems (docs/control-plane/api/clients/): `POST /v1/admin/clients {name, grant}` (answers the token once:
 `nest_cli_<id>_<secret>`) · `GET /v1/admin/clients` · `GET|PATCH /v1/admin/clients/<cli> {grant}` ·
 `POST /v1/admin/clients/<cli>/rotate` · `DELETE /v1/admin/clients/<cli>` (409 while its subtree lives). A grant is
-`{cells, credentials, repos, mcp_urls, github?, max_agents, max_sandboxes}`. With its token a client calls the owner routes
+`{cells, credentials, mcp_urls, secrets, inject_hosts, egress_hosts, max_agents, max_sandboxes}` (no GitHub fields: a stored grant's are dropped on read). With its token a client calls the owner routes
 (`auth: "owner"` in `src/index.ts`: create, list, read, turns, inbox, interrupt, start, stop and end, children, transcript, live trace and its history,
 brokered journal, asks and answers; sandbox create, list, read, destroy, lifetime and effective policy) on its own subtree only
 (anything else answers as an unknown id, 404), with `SpawnerOverrides`, and writes its catalog namespace:
 `GET /v1/catalog` · `GET|PUT|DELETE /v1/catalog/templates/<client-name>/<entry>` and `…/capabilities/…`. Its own, with a
-client token only: `POST /v1/clients/self/github-token {repo, permissions}` (a GitHub App token within `github`; BrokerDO mints it). Its secrets (`src/lib/client-secrets.ts`): `PUT|DELETE /v1/clients/self/secrets/<name> {value, description?}` and
+client token only: its secrets (`src/lib/client-secrets.ts`): `PUT|DELETE /v1/clients/self/secrets/<name> {value, description?}` and
 `GET /v1/clients/self/secrets` (names and metadata, never a value; the operator's `GET /v1/admin/clients/<cli>/secrets`),
 within `secrets {max_count, max_bytes}`; bindings naming them (`inject` in its templates, overrides and `POST /v1/sandboxes`,
-hosts within `inject_hosts`) are injected by nest-proxy; `github_push: {workflows: true}` (within `github_push`) adds
-`workflows: write` to a sandbox's push token. Egress rules within `egress_hosts` (`egress {allow: [{host, ports?}]}` in its templates, overrides and
+hosts within `inject_hosts`) are injected by nest-proxy. Egress rules within `egress_hosts` (`egress {allow: [{host, ports?}]}` in its templates, overrides and
 `POST /v1/sandboxes`), env (`env {NAME: value}`), request guards that only refuse (`guards [...]`, sent as `client:<name>`), and the live sandbox's client layer,
 `GET|PUT /v1/sandboxes/<id>/client-policy {egress?, inject?, env?, github_push?, guards?}` (`src/lib/client-egress.ts`, `src/lib/sandbox-env.ts`, `src/lib/client-guards.ts`). An agent's timers (`src/lib/timers.ts`): `GET /v1/agents/<id>/timers`, `DELETE /v1/agents/<id>/timers/<name>`.
 Its events (`src/lib/client-events.ts`): `PUT /v1/clients/self/webhook {url}` (https; answers the signing secret once);
