@@ -14,7 +14,7 @@ Two graphs are checked:
 
 Sources are read twice, as written and with comments blanked out, and the edges of both readings
 count: comments can't hide an import, and a misread comment can't hide one either. A dynamic import
-of anything but a literal fails, since nothing could check where it goes, unless its file is listed
+(or `require`) of anything but a literal fails, since nothing could check where it goes, unless its file is listed
 under `[dynamic_imports] allow` with a reason.
 
 A rule names the code it covers (`from`, minus `exclude`) and what that code may reach: never
@@ -68,7 +68,7 @@ STATIC = re.compile(
 )
 SIDE_EFFECT = re.compile(r"""(?m)(?:^|;)[ \t]*import\s*(['"])([^'"\n]+)\1""")
 DYNAMIC = re.compile(r"""(typeof\s+)?(?<![.\w$])import\s*\(\s*(['"`])([^'"`\n$]+)\2\s*\)(\s*\.\s*(\w+))?""")
-DYNAMIC_ANY = re.compile(r"""(?<![.\w$])import\s*\(\s*(?!['"])(?!`[^`$]*`)""")
+DYNAMIC_ANY = re.compile(r"""(?<![.\w$])(?:import|require)\s*\(\s*(?!['"])(?!`[^`$]*`)""")
 REQUIRE = re.compile(r"""(?<![.\w$])require\s*\(\s*(['"])([^'"\n]+)\1\s*\)""")
 URL = re.compile(r"""\bnew\s+URL\s*\(\s*(['"])([^'"\n]+)\1\s*,\s*import\.meta\.url\s*\)""")
 GLOB = re.compile(r"""import\.meta\.glob\s*(?:<[^>()]*>)?\s*\(\s*(\[[^\]]*\]|""" + STR + r"""|`[^`$]*`)\s*(?:,\s*(\{[^}]*\}))?""")
@@ -249,10 +249,21 @@ def package_of(spec):
 
 def resolve(root, importer, spec):
     """A relative specifier as a repo path: the file it names, else the normalized path itself."""
-    norm = Path(os.path.normpath(root / Path(importer).parent / spec.split("?", 1)[0]))
+    norm = Path(os.path.normpath(base_of(root, importer, spec) / spec.split("?", 1)[0].lstrip("/")))
     cands = [Path(str(norm) + ext) for ext in RESOLVE]
     cands += [norm.with_suffix(ext) for ext in JS_TO_TS.get(norm.suffix, ())]
     return rel_to(root, next((c for c in cands if c.is_file()), norm))
+
+
+def base_of(root, importer, spec):
+    """Where a path specifier starts: the importer's directory, or for `/x` the app's root (Vite's,
+    the nearest directory with a package.json), else the repo root."""
+    if not spec.startswith("/"):
+        return root / Path(importer).parent
+    d = (root / importer).parent
+    while d != root and not (d / "package.json").is_file():
+        d = d.parent
+    return d
 
 
 def rel_to(root, path):
@@ -281,12 +292,12 @@ def import_graph(root):
                 errors.append(f"{rel}: [dynamic-imports] imports a non-literal specifier, so where it goes can't be checked; "
                               "import a literal path")
             elif kind.startswith("glob"):
-                pattern = rel_to(root, Path(os.path.normpath(root / Path(rel).parent / spec.split("?", 1)[0])))
+                pattern = rel_to(root, Path(os.path.normpath(base_of(root, rel, spec) / spec.split("?", 1)[0].lstrip("/"))))
                 kind = "raw" if kind == "glob-raw" else "value"
                 hits = [p for p in paths if glob_re(pattern).match(p)] if spec.startswith((".", "/")) else []
                 edges += [(p, kind, spec) for p in hits] or [(pattern if spec.startswith((".", "/")) else "pkg:" + package_of(spec), kind, spec)]
             else:
-                target = resolve(root, rel, spec) if spec.startswith(".") else "pkg:" + package_of(spec)
+                target = resolve(root, rel, spec) if spec.startswith((".", "/")) else "pkg:" + package_of(spec)
                 edges.append((target, kind, spec))
         graph[rel] = edges
     return graph, errors
@@ -438,6 +449,8 @@ class Rule:
 def check_imports(rule, graph):
     errors = []
     roots = [f for f in graph if rule.applies(f)]
+    if rule.requires and not roots:
+        errors.append(f"boundaries.toml: [{rule.name}] requires imports of files that match none; fix its `from`")
     for f in roots:
         for need in rule.requires:
             if not any(t == need for t, _, _ in graph[f]):

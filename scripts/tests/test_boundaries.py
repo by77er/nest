@@ -159,6 +159,8 @@ class Imports(Scratch):
             'const m = import.meta.glob("../srv/*.ts");',
             'const m = import.meta.glob<string>(["../x/*.ts", "../srv/{a,b}.ts"], { query: "?raw", import: "default" });',
             'const m = import.meta.glob("../**/a.ts", { eager: true });',
+            'const m = import.meta.glob("/app/srv/*.ts");',
+            'import { a } from "/app/srv/a";',
         ]
         for src in value:
             with self.subTest(src=src):
@@ -168,7 +170,7 @@ class Imports(Scratch):
                 self.assertIn("[ui-no-server]", out)
 
     def test_a_non_literal_dynamic_import_fails_unless_listed(self):
-        for src in ("const m = await import(path);", "const m = await import(`./${name}`);"):
+        for src in ("const m = await import(path);", "const m = await import(`./${name}`);", "const m = require(name);"):
             with self.subTest(src=src):
                 self.plant("app/ui/x.ts", src + "\n")
                 code, out = self.check(DENY_SRV)
@@ -215,6 +217,10 @@ class Imports(Scratch):
         code, out = self.check(config)
         self.assertEqual(code, 1, out)
         self.assertIn("doesn't import app/view.ts", out)
+        (self.root / "app/ui/api.ts").unlink()
+        code, out = self.check(config)
+        self.assertEqual(code, 1, out)
+        self.assertIn("match none", out)
 
     def test_specifiers_resolve_to_files(self):
         self.plant("app/srv/dir/index.ts", "export const a = 1;\n")
