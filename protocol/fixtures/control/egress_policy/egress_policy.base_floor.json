@@ -14,53 +14,10 @@
         443
       ],
       "layer": "base"
-    },
-    {
-      "host": "api.github.com",
-      "ports": [
-        80,
-        443
-      ],
-      "layer": "workstream"
     }
   ],
   "passthrough": [],
-  "inject": [
-    {
-      "name": "github",
-      "hosts": [
-        "github.com",
-        "api.github.com"
-      ],
-      "placeholder": "nest-ph-github",
-      "locations": [
-        {
-          "type": "authorization_bearer"
-        },
-        {
-          "type": "authorization_basic_password",
-          "username": "x-access-token"
-        }
-      ]
-    },
-    {
-      "name": "github_read",
-      "hosts": [
-        "github.com",
-        "api.github.com"
-      ],
-      "placeholder": "nest-ph-read-github",
-      "locations": [
-        {
-          "type": "authorization_bearer"
-        },
-        {
-          "type": "authorization_basic_password",
-          "username": "x-access-token"
-        }
-      ]
-    }
-  ],
+  "inject": [],
   "tcp": [],
   "limits": {
     "max_connections": 256,
@@ -89,14 +46,27 @@
           ]
         }
       ],
-      "reason": "git pushes reach only the repos on this sandbox's push allowlist (by77er/nest); by77er/private-lib is read-only",
+      "reason": "writes to GitHub go only with a credential nest injected",
       "ignore_case": true,
       "allow": [
         {
-          "path": "/by77er/nest/**"
+          "methods": [
+            "GET",
+            "HEAD"
+          ],
+          "path": "/**/info/refs",
+          "query": [
+            {
+              "name": "service",
+              "values": [
+                "git-receive-pack"
+              ]
+            }
+          ]
         },
         {
-          "path": "/by77er/nest.git/**"
+          "injected": "*",
+          "at": "authorization"
         }
       ]
     },
@@ -113,7 +83,7 @@
           ]
         }
       ],
-      "reason": "writes to GitHub reach only the repos on this sandbox's push allowlist (by77er/nest); by77er/private-lib is read-only",
+      "reason": "writes to GitHub go only with a credential nest injected",
       "ignore_case": true,
       "allow": [
         {
@@ -135,10 +105,44 @@
           }
         },
         {
-          "path": "/by77er/nest/**"
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/git-receive-pack",
+          "injected": "*",
+          "at": "authorization"
         },
         {
-          "path": "/by77er/nest.git/**"
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/info/lfs/objects/batch",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/info/lfs/locks",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/info/lfs/locks/verify",
+          "injected": "*",
+          "at": "authorization"
+        },
+        {
+          "methods": [
+            "POST"
+          ],
+          "path": "/*/*/info/lfs/locks/*/unlock",
+          "injected": "*",
+          "at": "authorization"
         }
       ]
     },
@@ -155,26 +159,11 @@
           ]
         }
       ],
-      "reason": "writes to GitHub reach only the repos on this sandbox's push allowlist (by77er/nest); by77er/private-lib is read-only; GraphQL writes go only with the sandbox's own GitHub token",
+      "reason": "writes to GitHub go only with a credential nest injected",
       "ignore_case": true,
       "allow": [
         {
-          "path": "/repos/by77er/nest/**"
-        },
-        {
-          "methods": [
-            "POST"
-          ],
-          "path": "/graphql",
-          "injected": "github",
-          "at": "authorization"
-        },
-        {
-          "methods": [
-            "POST"
-          ],
-          "path": "/graphql",
-          "injected": "github_read",
+          "injected": "*",
           "at": "authorization"
         }
       ]

@@ -66,7 +66,7 @@ Hosts are replaced, never updated in place. The two host kinds roll separately, 
   | Change | Kind | Gate | One-way when |
   |---|---|---|---|
   | nestd, nest-proxy, the gateway, cloudflared, Firecracker, the host kernel | Sandbox host | The probe sandbox | The restore ABI changes, once memory snapshots exist |
-  | The guest image `nest-base` (guest agent, rootfs, packages) | Sandbox host, as the image version | The probe sandbox. Cold boots use the new image, so a sandbox picks it up at its next cold boot; the host serves a range of guest versions ([host-guest](../../interfaces/host-guest/)), so old and new guests coexist | Raising the guest `min_supported`; harmless with disk-only restores |
+  | The guest image `nest-base` (guest agent, rootfs, packages) | Sandbox host, as the image version | The probe sandbox. A fresh sandbox's disk is a copy of the image, so new sandboxes get the new image; one with a committed generation boots its own disk, image files included ([disk](../../sandbox/state/disk/)); the host serves a range of guest versions ([host-guest](../../interfaces/host-guest/)), so old and new guests coexist | Raising the guest `min_supported`; harmless with disk-only restores |
   | The agent runner, the hands client, `nest mcp` | Brain host | The probe turn | Raising the gateway protocol's `min_supported` |
   | The Claude Code baseline (version and SHA-256) | Brain host | The existing gate: `claude-verify` probes, the hands fidelity eval, resuming sessions written by the previous baseline ([runner](../../agents/runner/)) | Rolling back may leave sessions the newer binary wrote unreadable; those agents start fresh from memory |
   | Worker and Durable Objects | Cloudflare | The health window | A Durable Object class change |

@@ -5,6 +5,7 @@ import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { FleetDO } from "../src/do/fleet";
 import { SandboxDO } from "../src/do/sandbox";
+import floor from "../../protocol/fixtures/control/egress_policy/egress_policy.base_floor.json";
 import { admin, adminJson, BASE, connectHost, eventually, nextCommands, runDue, uniqueCell } from "./helpers";
 
 /** The base layer's hosts before this release made it data, written out here as the oracle (not imported). */
@@ -53,6 +54,17 @@ describe("the base egress layer", () => {
     expect(baseRules(later.create.policy).map((a) => a.host)).toEqual(["deb.debian.org", "mirror.example.org"]);
     // The layer is per cell.
     expect((await adminJson(base(uniqueCell()))).allow).toEqual(TODAYS_BASE.map((host) => ({ host })));
+  });
+
+  it("carries an operator's floor as written: the fixture nest-proxy's base_floor test evaluates reaches a sandbox's proxy", async () => {
+    const cell = uniqueCell();
+    const s = await placed(cell);
+    // The operator's write: the fixture's base hosts and its guards, nothing nest builds beside them.
+    const allow = baseRules(floor).map(({ host, ports }) => ({ host, ports }));
+    await adminJson(base(cell), { method: "PUT", body: { allow, guards: floor.guards } });
+    const [update] = await nextCommands(s.ws, (c) => c.type === "policy_update");
+    expect(baseRules(update.policy)).toEqual(baseRules(floor));
+    expect(update.policy.guards).toEqual(floor.guards);
   });
 
   it("is the operator's: an API client's token can neither read nor write it", async () => {

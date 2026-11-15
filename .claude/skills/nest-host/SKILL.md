@@ -76,7 +76,7 @@ Bounds and results are recorded in the verification doc. Say which bound a claim
 - **Commands:** `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test -p <crate>`. Run nestd's with `NEST_CI_REQUIRE_USERNS=1` so a netns test can't skip (it needs `ip`, `nft` and unprivileged user namespaces).
 - **Waits, parallel safety and flakes** follow `nest-tests`.
 - **Cross-component changes** (runner, nestd, proxy, gateway, guest, control plane) run e2e (`nest-validation`).
-- **Evidence tiers:** the process driver proves no Firecracker, snapshot, real vsock or tunnel behaviour. `nest-guest` changes need a hand rebuild of the guest image (`images/guest/build-on-ec2.sh`, [dev/deploy.md](../../../dev/deploy.md)); say so in the PR.
+- **Evidence tiers:** the process driver proves no Firecracker, snapshot, real vsock or tunnel behaviour. `nest-guest` and `images/guest/` changes need a hand rebuild of the guest image (`images/guest/build-on-ec2.sh`, [dev/deploy.md](../../../dev/deploy.md)); say so in the PR.
 
 ## Done
 

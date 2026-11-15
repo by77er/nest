@@ -358,7 +358,7 @@ pub enum InjectionLocation {
 pub struct InjectionBinding {
     pub name: String,
     pub hosts: Vec<HostPattern>,
-    /// Unique per binding, e.g. `nest-ph-github-7f3a`. Seen by the sandbox; worthless outside.
+    /// Unique per binding, e.g. `nest-ph-stripe-91c2`. Seen by the sandbox; worthless outside.
     pub placeholder: String,
     pub locations: Vec<InjectionLocation>,
 }
