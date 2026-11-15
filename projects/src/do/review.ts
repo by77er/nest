@@ -905,8 +905,7 @@ export class ReviewDO extends DurableObject<Env> {
         }))!;
         const appId = made.app?.id;
         if (typeof appId === "number" && this.setting("github_app_id") !== String(appId)) {
-          // The App's id as its check run names it (none recorded yet, or another App's): the project pins its required check to it.
-          await directory(this.env).recordGithubAppId(appId);
+          // The App's id as its check run names it: a project whose attach didn't pin it (an older release's) attaches again.
           await projectStub(this.env, project).appIdLearned(appId);
           this.setSetting("github_app_id", String(appId));
         }

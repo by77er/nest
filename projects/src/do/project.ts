@@ -111,7 +111,7 @@ export { MAX_UNTRIAGED_ISSUES };
 export interface AttachDetail {
   branch: string;
   change: AttachChange;
-  /** The GitHub App the check is required from; null: from any source, until the App's id is known. */
+  /** The GitHub App the check is required from: the App's own; null (from any source) only in an older release's attach. */
   app_id: number | null;
   at_ms: number;
 }
@@ -1296,7 +1296,7 @@ export class ProjectDO extends DurableObject<Env> {
     return { owner: info.owner };
   }
 
-  /** The App's id is known (from a check run it made): attach again to require the check from it. */
+  /** A check run of the App's named an id the last attach didn't pin (an older attach's any source): attach again, pinning the App's own. */
   async appIdLearned(appId: number): Promise<void> {
     const s = this.settings();
     if (!s?.attached || s.attach?.app_id === appId) return;
@@ -1568,7 +1568,7 @@ export class ProjectDO extends DurableObject<Env> {
    * is recorded on the task and waits for the owner's retry (`retryIssueClose`). Anything else is retried
    * from the alarm.
    */
-  private async closeIssue(nest: Nest, task: string): Promise<void> {
+  private async closeIssue(task: string): Promise<void> {
     const s = this.settings()!;
     const row = this.sql.exec("SELECT * FROM issue_closes WHERE task = ?", task).toArray()[0];
     if (!row) return;
@@ -1594,8 +1594,6 @@ export class ProjectDO extends DurableObject<Env> {
       if (!now) return;
       if (this.outbox("issue_closes", "task", task, now, { kind: "failed", ...verdict(e) }, OUTBOX.issue_closes) === "failed") {
         this.record(task, app, "issue_close_failed", { issue: n, error: message(e) });
-        // The grant as it is now, so its widening later is seen as a change, and the close tried again.
-        await this.readGrant(nest);
       }
     }
   }
@@ -4588,7 +4586,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (gh !== null && gh <= now) await this.githubUpkeep(nest);
     for (const r of this.sql.exec("SELECT task, start FROM abandoned WHERE next_ms <= ?", now).toArray()) await this.cleanAbandoned(nest, r.task as string, r.start as number);
     for (const r of this.sql.exec("SELECT labels FROM abandoned_starts WHERE next_ms <= ?", now).toArray()) await this.cleanAbandonedStart(nest, r.labels as string);
-    for (const r of this.sql.exec("SELECT task FROM issue_closes WHERE next_ms IS NOT NULL AND next_ms <= ?", now).toArray()) await this.closeIssue(nest, r.task as string);
+    for (const r of this.sql.exec("SELECT task FROM issue_closes WHERE next_ms IS NOT NULL AND next_ms <= ?", now).toArray()) await this.closeIssue(r.task as string);
     if (s.am_write_next_ms !== null && (s.am_write_next_ms as number) <= now) await this.writeRepoAutoMerge();
     if (s.am_read_next_ms !== null && (s.am_read_next_ms as number) <= now) await this.readRepoAutoMerge();
     // A PR's auto-merge is enabled only once the repo allows it; disabling needn't wait.
@@ -4707,7 +4705,7 @@ export class ProjectDO extends DurableObject<Env> {
   /**
    * Require the review check on the repo's default branch, keeping the rest of its protection
    * (src/github.ts `requireReviewCheck`). A refusal that will repeat (the App not installed, the repo
-   * outside the grant, no admin) waits for the owner's retry; anything else is retried from the alarm.
+   * not among its installation's, no admin) waits for the owner's retry; anything else is retried from the alarm.
    */
   private async attachRepo(): Promise<void> {
     const s = this.settings()!;
@@ -4717,8 +4715,6 @@ export class ProjectDO extends DurableObject<Env> {
       const repo = await this.repo();
       // The installation looked up now (the binding stores it), never a cached one.
       const gh = await githubFor(this.env, repo, PERMISSIONS.attach, { fresh: true });
-      // The App's own id (its token names it), kept for the previous release's attach.
-      await directory(this.env).recordGithubAppId(gh.appId);
       const r = await requireReviewCheck(gh, repo, gh.appId);
       // Whose PR comments count (README.md#pr-comments): the repo's owner, when it's a user; never changed once set.
       // Once only: after that (the owner's choice, nobody included), an attach never changes it.

@@ -1,6 +1,6 @@
 // DirectoryDO, one instance (README.md#pieces): the projects, repo → project, agent → {project, role,
 // task, pr}, the nest events and GitHub deliveries already handled (deduplicated by id), the catalog
-// sync's state, and the GitHub App's id once a token's source or a check run has told it.
+// sync's state, and the GitHub App's id an older release recorded.
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
@@ -69,7 +69,7 @@ const MIGRATIONS = [
     // The repo's binding (README.md#the-repos-binding): how its id was learned (`github`: read from GitHub
     // at attach, a sync or the operator's re-read; `event`: from the first event, before ids were read) and
     // when; the name GitHub last gave it, when that isn't the name the project calls it by (a rename not
-    // yet applied); and the App installation's id, filled once a token's source names it.
+    // yet applied); and the App installation's id, filled once the App's lookup names it.
     "ALTER TABLE projects ADD COLUMN repo_bound TEXT",
     "ALTER TABLE projects ADD COLUMN repo_bound_ms INTEGER",
     "ALTER TABLE projects ADD COLUMN repo_name TEXT",
@@ -291,7 +291,7 @@ export class DirectoryDO extends DurableObject<Env> {
    * name taken): no project. A project whose App installation is known takes only events from that
    * installation (`installation.id`): any other, or none, is refused (README.md#the-repos-binding). One with none
    * known yet refuses an event whose repo owner isn't an account the app acts for (`ownerAllowed` false, the
-   * Worker's answer; null, the default: not checked).
+   * Worker's answer; null, only from the previous release's Worker: not checked).
    */
   async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null, ownerAllowed: boolean | null = null): Promise<{ project: ProjectRow; anchored: boolean; recorded_owner: number | null } | { refused: string; project_id: string } | null> {
     const one = (where: string, v: SqlStorageValue) =>
@@ -448,7 +448,7 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.sql.exec("UPDATE projects SET repo = ?, repo_name = NULL WHERE id = ? AND repo_name = ?", n, project, n).rowsWritten > 0;
   }
 
-  /** The GitHub App's id, as the App's own token or a check run it made (`app.id`) last told it; null until one has. Read only by the previous release's attach (kept for its deploy gap). */
+  /** The GitHub App's id an older release recorded; null if none. Unread and unwritten now: kept with `recordGithubAppId` for the previous release's calls in the deploy gap. */
   async githubAppId(): Promise<number | null> {
     const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'github_app_id'").toArray()[0];
     return row ? Number(row.v) : null;
