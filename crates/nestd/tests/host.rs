@@ -563,6 +563,8 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
                                 // A held answer is logged with its request, under one lock: a test that
                                 // sees the request then finds its answer held (logged apart, across the
                                 // ack's await, a test could read the request before the answer was held).
+                                // `hold` is read under the same lock, so a concurrent `release_commit_answers`
+                                // either finds the answer held or the answer goes out below.
                                 {
                                     let mut l = log2.lock().unwrap();
                                     l.events.extend(events);
