@@ -216,15 +216,13 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     if (!b.ok) return b.res;
     // Only a repo the App reaches, as GitHub answers (README.md#repo-authority): a name outside its installations
     // (typed, or sent straight to the API) would make a project that can never attach, and holds its name.
-    if (nestFrom(env)) {
-      let ok: boolean;
-      try {
-        ok = await repoAttachable(env, b.value.repo);
-      } catch (e) {
-        return err(502, `GitHub couldn't say whether the app's GitHub App reaches ${b.value.repo}: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      if (!ok) return err(403, `the GitHub App doesn't reach ${b.value.repo}: install it on the repo's account (one the app acts for), with the repo among its installation's repos`);
+    let ok: boolean;
+    try {
+      ok = await repoAttachable(env, b.value.repo);
+    } catch (e) {
+      return err(502, `GitHub couldn't say whether the app's GitHub App reaches ${b.value.repo}: ${e instanceof Error ? e.message : String(e)}`);
     }
+    if (!ok) return err(403, `the GitHub App doesn't reach ${b.value.repo}: install it on the repo's account (one the app acts for), with the repo among its installation's repos`);
     // Pending first, then finished here; should this request fail or die half-way, DirectoryDO's alarm
     // finishes it (README.md#creating-a-project). The same repo asked for again while pending resumes it.
     const created = await directory(env).createProject({ name: b.value.name, repo: b.value.repo }, b.value);

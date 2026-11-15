@@ -368,7 +368,6 @@ export class Nest {
     client?: string;
     grant?: {
       egress_hosts?: string[]; inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean };
-      repos?: string[];
     };
   }> {
     return this.call("GET", "/v1/clients/self");

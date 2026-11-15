@@ -30,18 +30,16 @@ describe("the webhook signature", () => {
 });
 
 describe("the review check among the required checks", () => {
-  it("is added to the contexts when nothing is pinned to an app and the App's id isn't known", () => {
-    expect(withReviewCheck({ strict: true, contexts: ["ci"], checks: [{ context: "ci", app_id: null }] }, null)).toEqual({ contexts: ["ci", CHECK_NAME] });
+  it("is added from the App, a context-only list read as entries from any source", () => {
+    expect(withReviewCheck({ strict: true, contexts: ["ci"] }, 7)).toEqual({ checks: [{ context: "ci", app_id: -1 }, { context: CHECK_NAME, app_id: 7 }] });
   });
 
   it("keeps other entries' app pins, sending any source back as -1", () => {
     const have = { checks: [{ context: "ci", app_id: 15368 }, { context: "lint", app_id: null }] };
-    expect(withReviewCheck(have, null)).toEqual({ checks: [{ context: "ci", app_id: 15368 }, { context: "lint", app_id: -1 }, { context: CHECK_NAME }] });
     expect(withReviewCheck(have, 7)).toEqual({ checks: [{ context: "ci", app_id: 15368 }, { context: "lint", app_id: -1 }, { context: CHECK_NAME, app_id: 7 }] });
   });
 
   it("is left alone once there, and pinned to the App once its id is known", () => {
-    expect(withReviewCheck({ checks: [{ context: CHECK_NAME, app_id: null }] }, null)).toBeNull();
     expect(withReviewCheck({ checks: [{ context: CHECK_NAME, app_id: 7 }] }, 7)).toBeNull();
     expect(withReviewCheck({ checks: [{ context: CHECK_NAME, app_id: null }] }, 7)).toEqual({ checks: [{ context: CHECK_NAME, app_id: 7 }] });
   });

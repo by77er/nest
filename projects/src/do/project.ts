@@ -4717,10 +4717,9 @@ export class ProjectDO extends DurableObject<Env> {
       const repo = await this.repo();
       // The installation looked up now (the binding stores it), never a cached one.
       const gh = await githubFor(this.env, repo, PERMISSIONS.attach, { fresh: true });
-      // The App's own id (its token names it).
-      const appId = gh.appId;
-      if (appId !== null) await directory(this.env).recordGithubAppId(appId);
-      const r = await requireReviewCheck(gh, repo, appId);
+      // The App's own id (its token names it), kept for the previous release's attach.
+      await directory(this.env).recordGithubAppId(gh.appId);
+      const r = await requireReviewCheck(gh, repo, gh.appId);
       // Whose PR comments count (README.md#pr-comments): the repo's owner, when it's a user; never changed once set.
       // Once only: after that (the owner's choice, nobody included), an attach never changes it.
       const info = await gh.repoInfo(repo);

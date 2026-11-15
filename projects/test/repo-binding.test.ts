@@ -668,6 +668,9 @@ describe("the repos the owner may attach (GET /api/repos)", () => {
     // Selected later: the same name is created at once (no project stuck on it from the refused try).
     gh.install({ id: 7_001, account: acct, repos: [`${acct}/in`, `${acct}/out`] });
     expect((await api(token, "POST", "/api/projects", { name: `n-${rand()}`, repo: `${acct}/out` })).status).toBe(201);
+    // nest's client token isn't what the check needs: unset, a repo the App doesn't reach is refused all the same.
+    const unset = await withEnv("NEST_CLIENT_TOKEN", undefined, () => api(token, "POST", "/api/projects", { name: `n-${rand()}`, repo: `nobody-${rand()}/x` }));
+    expect(unset.status).toBe(403);
   });
 
   it("GitHub's failure is said, not an empty list", async () => {

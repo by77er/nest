@@ -346,9 +346,9 @@ function pullOf(p: Record<string, unknown>, repo: string): Pull {
  * the installation it's from. `fresh`: the repo's installation looked up now,
  * not from the cache (a binding's read, README.md#the-repos-binding).
  */
-export async function githubFor(env: Env, repo: string, permissions: Record<string, string>, o: { fresh?: boolean } = {}): Promise<GitHub> {
+export async function githubFor(env: Env, repo: string, permissions: Record<string, string>, o: { fresh?: boolean } = {}): Promise<GitHub & { readonly appId: number; readonly installationId: number }> {
   const t = await new AppTokens(env).token(repo, permissions, o);
-  return new GitHub(t.token, t.appId, t.installationId, t.stale);
+  return new GitHub(t.token, t.appId, t.installationId, t.stale) as GitHub & { readonly appId: number; readonly installationId: number };
 }
 
 /**
@@ -380,34 +380,28 @@ export async function appBotId(env: Env, repo: string): Promise<number | null> {
 /**
  * The required checks with the review check in them, or null when they already have it as wanted.
  *
- * - With the App's id known, the check is required from the App (`checks: [{context, app_id}]`): no
- *   other app, nor a commit status anyone with write access may post, can pass it. An entry already
- *   there from any source, or another app, is pinned to the App.
- * - Without it (nest's token answer didn't name the App), from any source: `contexts` when no entry
- *   is pinned to an app, so nothing changes form; `checks` with the review check's `app_id` left out
- *   (GitHub then takes the app that recently set it) when some entry is pinned, so that pin survives.
- *   The App's first check run then tells its id, and the project attaches again to pin it.
+ * - The check is required from the App (`checks: [{context, app_id}]`): no other app, nor a commit
+ *   status anyone with write access may post, can pass it. An entry already there from any source, or
+ *   another app, is pinned to the App.
  * - Every other entry is kept as it was: an `app_id` of null (any source) is sent back as -1, GitHub's
  *   "any app".
  */
-export function withReviewCheck(have: StatusChecks, appId: number | null): { contexts: string[] } | { checks: { context: string; app_id?: number }[] } | null {
+export function withReviewCheck(have: StatusChecks, appId: number): { checks: { context: string; app_id: number }[] } | null {
   const checks = have.checks ?? (have.contexts ?? []).map((context) => ({ context, app_id: null }));
   const ours = checks.find((c) => c.context === CHECK_NAME);
-  if (ours && (appId === null || ours.app_id === appId)) return null;
+  if (ours && ours.app_id === appId) return null;
   const others = checks.filter((c) => c.context !== CHECK_NAME);
-  const pinned = others.some((c) => c.app_id !== null && c.app_id !== -1);
-  if (appId === null && !pinned) return { contexts: [...others.map((c) => c.context), CHECK_NAME] };
   return {
     checks: [
       ...others.map((c) => ({ context: c.context, app_id: c.app_id === null ? -1 : c.app_id })),
-      appId === null ? { context: CHECK_NAME } : { context: CHECK_NAME, app_id: appId },
+      { context: CHECK_NAME, app_id: appId },
     ],
   };
 }
 
 /** The required status checks for a branch that has none: the review check alone, not strict. */
-export function onlyReviewCheck(appId: number | null) {
-  return appId === null ? { strict: false, contexts: [CHECK_NAME] } : { strict: false, checks: [{ context: CHECK_NAME, app_id: appId }] };
+export function onlyReviewCheck(appId: number) {
+  return { strict: false, checks: [{ context: CHECK_NAME, app_id: appId }] };
 }
 
 const enabled = (v: unknown): boolean => typeof v === "object" && v !== null && (v as { enabled?: unknown }).enabled === true;
@@ -452,7 +446,7 @@ export function protectionKeeping(get: Record<string, unknown>, statusChecks: un
 }
 
 /** The minimal protection for an unprotected branch: the review check required, and nothing else. */
-export function minimalProtection(appId: number | null) {
+export function minimalProtection(appId: number) {
   return { required_status_checks: onlyReviewCheck(appId), enforce_admins: false, required_pull_request_reviews: null, restrictions: null };
 }
 
@@ -466,7 +460,7 @@ export type AttachChange = "created" | "added" | "pinned" | "unchanged";
  * - unprotected: the minimal protection (the check, `strict: false`, nothing else).
  * Running it again changes nothing.
  */
-export async function requireReviewCheck(gh: GitHub, repo: string, appId: number | null): Promise<{ branch: string; change: AttachChange; app_id: number | null }> {
+export async function requireReviewCheck(gh: GitHub, repo: string, appId: number): Promise<{ branch: string; change: AttachChange; app_id: number }> {
   const branch = await gh.defaultBranch(repo);
   const have = await gh.statusChecks(repo, branch);
   if (have) {
