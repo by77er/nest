@@ -4,6 +4,7 @@
 // minted never resolve again. The writes that refuse or drop the fields are in client-layer.test.ts.
 import { env, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { BrokerDO } from "../src/do/broker";
 import { CatalogDO } from "../src/do/catalog";
 import { SandboxDO } from "../src/do/sandbox";
 import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
@@ -128,17 +129,26 @@ describe("a sandbox", () => {
     expect(update.policy.guards).toEqual([mine]);
   });
 
-  it("a token a release before this one minted for it never resolves under an operator binding of the same name: a full push forgets it first", async () => {
+  it("a token a release before this one minted for it never resolves under an operator binding of the same name: BrokerDO forgets them all at its start", async () => {
     const { sandbox, ws } = await placed();
     const b = `gh${rand()}`;
-    // What the previous release left: a minted token under the sandbox's most specific name, and its row.
+    // What the previous release left: a minted token under the sandbox's most specific name, its row, and another
+    // sandbox's (one not placed, say); then BrokerDO starts on this release.
     await broker().putSecret(`inject:${b}:${sandbox}`, "minted-token-value", Date.now() + 3_600_000);
+    await broker().putSecret(`inject:${b}:sbx_unplaced`, "minted-token-value", Date.now() + 3_600_000);
+    await broker().putSecret(`inject:${b}:sbx_static`, "an operator's own static value");
     await runInDurableObject(broker(), (_i, st) => {
-      st.storage.sql.exec("INSERT OR REPLACE INTO injections (sandbox, binding, source, covers, expires_ms, minted_ms) VALUES (?, ?, 'k', '[]', ?, 0)",
-        sandbox, b, Date.now() + 3_600_000);
+      for (const s of [sandbox, "sbx_unplaced"]) {
+        st.storage.sql.exec("INSERT OR REPLACE INTO injections (sandbox, binding, source, covers, expires_ms, minted_ms) VALUES (?, ?, 'k', '[]', ?, 0)",
+          s, b, Date.now() + 3_600_000);
+      }
+      new BrokerDO(st as never, env as never);
     });
     // The operator's own static binding of that name, and its value.
     await broker().putSecret(`inject:${b}`, "operator-value");
+    expect((await broker().injectionSecretRefs([b], { sandbox: "sbx_unplaced" }))[0]!.value).toBe(`$nest-secret:inject:${b}`);
+    // A static value the operator stored under a sandbox's name is the operator's, never a minted one: kept.
+    expect((await broker().injectionSecretRefs([b], { sandbox: "sbx_static" }))[0]!.value).toBe(`$nest-secret:inject:${b}:sbx_static`);
     await sandboxStub(sandbox).setPolicy({ inject: [{ name: b, hosts: ["api.example.com"], placeholder: `nest-ph-${b}`, locations: [{ type: "authorization_bearer" }] }] });
     const secrets = (await nextCommands(ws, (c) => c.type === "secrets_update")).find((c) => c.type === "secrets_update")!.secrets;
     expect(secrets).toEqual([{ binding: b, value: "operator-value" }]);

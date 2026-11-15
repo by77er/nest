@@ -85,7 +85,7 @@ export class BrokerDO extends DurableObject<Env> {
     this.sql.exec(`CREATE TABLE IF NOT EXISTS secrets (name TEXT PRIMARY KEY, value TEXT NOT NULL,
       expires_ms INTEGER, updated_ms INTEGER NOT NULL)`);
     // The tables of the kernel's GitHub minting, gone since (docs/control-plane/durable-objects/broker/):
-    // read and written by nothing here (`injections` aside, which `forgetInjections` empties), still created
+    // read and written by nothing here (`injections` aside, which this constructor empties), still created
     // for the previous release after a rollback, and dropped in a later release. Installation tokens, by
     // repo and permissions:
     this.sql.exec(`CREATE TABLE IF NOT EXISTS github_tokens (key TEXT PRIMARY KEY, token TEXT NOT NULL, expires_ms INTEGER NOT NULL,
@@ -109,6 +109,11 @@ export class BrokerDO extends DurableObject<Env> {
     // Sandboxes' minted tokens, one per (sandbox, binding); the value is the secret `inject:<binding>:<sandbox>`.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS injections (sandbox TEXT NOT NULL, binding TEXT NOT NULL, source TEXT NOT NULL,
       covers TEXT NOT NULL, expires_ms INTEGER NOT NULL, minted_ms INTEGER NOT NULL, PRIMARY KEY (sandbox, binding))`);
+    // Nothing mints now: what a release before this one minted for sandboxes goes at each start, so an operator's
+    // static binding of the same name never resolves to one (`inject:<binding>:<sandbox>` is the most specific name
+    // it looks up), placed or not (dev/rollout/2026-11-15-kernel-github-minting.md).
+    this.sql.exec("DELETE FROM secrets WHERE name IN (SELECT 'inject:' || binding || ':' || sandbox FROM injections)");
+    this.sql.exec("DELETE FROM injections");
     // API clients' secrets (docs/control-plane/api/clients/#secrets): what anyone may see of each. The
     // value is the secret `client-secret:<client>:<name>`, which only `secrets_update` resolves.
     this.sql.exec(`CREATE TABLE IF NOT EXISTS client_secrets (client TEXT NOT NULL, name TEXT NOT NULL, description TEXT, size INTEGER NOT NULL,
@@ -247,9 +252,8 @@ export class BrokerDO extends DurableObject<Env> {
 
   /**
    * Forget the tokens a release before this one minted for a sandbox (`injections`, and each one's secret
-   * `inject:<binding>:<sandbox>`): SandboxDO's destroy and every full push of its secrets, so an operator's
-   * static binding of the same name never resolves to one. Nothing writes `injections` now; the table goes in
-   * a later release (dev/rollout/2026-11-15-kernel-github-minting.md).
+   * `inject:<binding>:<sandbox>`): SandboxDO's destroy, here and in the release before. Nothing writes
+   * `injections` now (the constructor empties it); the table goes in a later release.
    */
   async forgetInjections(sandbox: string): Promise<void> {
     for (const { binding } of this.sql.exec<{ binding: string }>("SELECT binding FROM injections WHERE sandbox = ?", sandbox).toArray()) {
@@ -505,7 +509,7 @@ export class BrokerDO extends DurableObject<Env> {
     if (cur === null || cur > next) await this.ctx.storage.setAlarm(Math.max(next, 1));
   }
 
-  /** A destroyed sandbox asks for no client secret: SandboxDO's destroy, beside `forgetInjections` (which a push calls too). */
+  /** A destroyed sandbox asks for no client secret: SandboxDO's destroy, beside `forgetInjections`. */
   async forgetClientSecretSandbox(sandbox: string): Promise<void> {
     this.sql.exec("DELETE FROM client_secret_sandboxes WHERE sandbox = ?", sandbox);
     this.sql.exec("DELETE FROM client_secret_pushes WHERE sandbox = ?", sandbox);

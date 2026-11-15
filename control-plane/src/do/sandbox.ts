@@ -978,7 +978,7 @@ export class SandboxDO extends DurableObject<Env> {
     await this.deadlines.clear("retention");
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
     await broker.forgetInjections(before.sandbox);
-    // Not inside `forgetInjections`, which a push calls too. A BrokerDO of the previous release lacks it:
+    // Not inside `forgetInjections`. A BrokerDO of the previous release lacks it:
     // the next notice to this sandbox answers `gone` and forgets it then.
     await broker.forgetClientSecretSandbox(before.sandbox).catch((e: unknown) =>
       console.warn(`sandbox ${before.sandbox}: BrokerDO didn't forget its client secrets; a notice will`, e));
@@ -1533,10 +1533,6 @@ export class SandboxDO extends DurableObject<Env> {
     const clientBindings = before.client ? this.appliedClientInjections(built) : [];
     if (!before.host || (!ws.inject.length && !clientBindings.length && !force)) return;
     const broker = this.env.BROKER.get(this.env.BROKER.idFromName("broker"));
-    // Tokens a release before this one minted for this sandbox (`inject:<binding>:<sandbox>`, the most specific
-    // name a static binding looks up) go first, so an operator's binding of the same name never resolves to one.
-    // Until the table that lists them is dropped (dev/rollout/2026-11-15-kernel-github-minting.md).
-    if (force) await broker.forgetInjections(before.sandbox);
     const secrets: InjectionSecret[] = ws.inject.length
       ? await broker.injectionSecretRefs(ws.inject.map((b) => b.name), { sandbox: before.sandbox, ...(before.workstream ? { workstream: before.workstream } : {}) })
       : [];
