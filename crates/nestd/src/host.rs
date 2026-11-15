@@ -3402,7 +3402,7 @@ mod tests {
         assert!(is_request_denial(&record("x.example", 53, EgressVerdict::Deny, "dns_nxdomain", None)));
         assert!(!is_request_denial(&record("*", 0, EgressVerdict::Deny, "suppressed: 9 duplicate or excess deny records", Some(9))), "summary");
         assert!(!is_request_denial(&record("", 0, EgressVerdict::Deny, "connection_limit", None)), "connection limit");
-        assert!(!is_request_denial(&record("github.com", 443, EgressVerdict::Allow, "", None)));
+        assert!(!is_request_denial(&record("forge.example", 443, EgressVerdict::Allow, "", None)));
     }
 
     /// A base image extended to a sandbox's disk size gets a filesystem that fills it.

@@ -513,7 +513,7 @@ pub(crate) mod tests {
     pub fn policy(version: u64) -> EgressPolicy {
         EgressPolicy {
             version,
-            allow: vec![AllowRule { host: HostPattern("github.com".into()), ports: vec![443], layer: PolicyLayer::Base, expires_ms: None }],
+            allow: vec![AllowRule { host: HostPattern("forge.example".into()), ports: vec![443], layer: PolicyLayer::Base, expires_ms: None }],
             passthrough: vec![],
             inject: vec![],
             tcp: vec![],

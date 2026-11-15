@@ -225,7 +225,7 @@ mod tests {
     use super::*;
 
     fn rec(path_len: usize) -> EgressAuditRecord {
-        let mut a = Audit::new("github.com", 443, EgressVerdict::Allow);
+        let mut a = Audit::new("forge.example", 443, EgressVerdict::Allow);
         a.path = Some("/".repeat(path_len));
         a.into_record(&SandboxId("sbx_1".into()), Epoch(1), None, None)
     }
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn path_has_no_query() {
-        let uri: http::Uri = "https://api.github.com/repos/x?token=secret".parse().unwrap();
+        let uri: http::Uri = "https://api.forge.example/repos/x?token=secret".parse().unwrap();
         assert_eq!(path_only(&uri), "/repos/x");
     }
 }

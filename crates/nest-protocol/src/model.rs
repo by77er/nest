@@ -280,7 +280,7 @@ pub enum AgentState {
 
 // --- Egress policy ------------------------------------------------------------------------------
 
-/// Host pattern: an exact hostname (`github.com`) or a wildcard suffix (`*.githubusercontent.com`,
+/// Host pattern: an exact hostname (`forge.example`) or a wildcard suffix (`*.content.forge.example`,
 /// which matches subdomains but not the apex). Case-insensitive; a trailing dot is ignored.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -300,7 +300,7 @@ impl HostPattern {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, strum::EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum PolicyLayer {
-    /// Image defaults (package registries, GitHub, distro mirrors).
+    /// Image defaults (package registries, code hosts, distro mirrors).
     Base,
     /// The operator's own layer for the sandbox (allow rules, passthrough, injection, repos). Its
     /// wire name is `workstream` (historical: the layer was once set per workstream); a rename is
@@ -341,7 +341,7 @@ pub enum InjectionLocation {
     /// `Authorization: Basic base64(user:<placeholder>)`; git's credential helper uses this. With
     /// `username`, nest-proxy writes that username with the secret, whatever the request's was, and only
     /// then has it written the field whole (a guard's `at`): a username the sandbox chose can be a
-    /// credential of its own, which some services take (GitHub reads a token as the Basic username).
+    /// credential of its own, which some services take (they read a token given as the Basic username).
     /// Absent: the request's username is kept, and the field is never whole. A proxy of the previous
     /// release ignores `username` (fleet hello `guard_basic_user` says this one doesn't).
     AuthorizationBasicPassword {
@@ -793,14 +793,14 @@ mod tests {
 
     #[test]
     fn host_pattern_matching() {
-        let w = HostPattern("*.githubusercontent.com".into());
-        assert!(w.matches("raw.githubusercontent.com"));
-        assert!(w.matches("RAW.githubusercontent.com."));
-        assert!(!w.matches("githubusercontent.com"));
-        assert!(!w.matches("evilgithubusercontent.com"));
-        let e = HostPattern("github.com".into());
-        assert!(e.matches("github.com"));
-        assert!(!e.matches("api.github.com"));
+        let w = HostPattern("*.content.forge.example".into());
+        assert!(w.matches("raw.content.forge.example"));
+        assert!(w.matches("RAW.content.forge.example."));
+        assert!(!w.matches("content.forge.example"));
+        assert!(!w.matches("evilcontent.forge.example"));
+        let e = HostPattern("forge.example".into());
+        assert!(e.matches("forge.example"));
+        assert!(!e.matches("api.forge.example"));
     }
 
     #[test]
@@ -808,7 +808,7 @@ mod tests {
         let p = EgressPolicy {
             version: 1,
             allow: vec![
-                AllowRule { host: HostPattern("github.com".into()), ports: vec![443], layer: PolicyLayer::Base, expires_ms: None },
+                AllowRule { host: HostPattern("forge.example".into()), ports: vec![443], layer: PolicyLayer::Base, expires_ms: None },
                 AllowRule { host: HostPattern("example.com".into()), ports: vec![443], layer: PolicyLayer::Sandbox, expires_ms: Some(1_000) },
                 AllowRule { host: HostPattern("pinned.example.net".into()), ports: vec![443], layer: PolicyLayer::Workstream, expires_ms: None },
             ],
@@ -818,8 +818,8 @@ mod tests {
             limits: EgressLimits { max_connections: 256, bandwidth_mbps: 200, max_inspected_body_bytes: 512 << 20 },
             guards: vec![],
         };
-        assert_eq!(p.decide("github.com", 443, 0), EgressDecision::Inspect);
-        assert_eq!(p.decide("github.com", 80, 0), EgressDecision::Deny);
+        assert_eq!(p.decide("forge.example", 443, 0), EgressDecision::Inspect);
+        assert_eq!(p.decide("forge.example", 80, 0), EgressDecision::Deny);
         assert_eq!(p.decide("example.com", 443, 999), EgressDecision::Inspect);
         assert_eq!(p.decide("example.com", 443, 1_000), EgressDecision::Deny);
         assert_eq!(p.decide("pinned.example.net", 443, 0), EgressDecision::Passthrough);
@@ -831,7 +831,7 @@ mod tests {
         let p = EgressPolicy {
             version: 1,
             allow: vec![
-                AllowRule { host: HostPattern("*.githubusercontent.com".into()), ports: vec![443], layer: PolicyLayer::Base, expires_ms: None },
+                AllowRule { host: HostPattern("*.content.forge.example".into()), ports: vec![443], layer: PolicyLayer::Base, expires_ms: None },
                 AllowRule { host: HostPattern("old.example".into()), ports: vec![443], layer: PolicyLayer::Sandbox, expires_ms: Some(10) },
             ],
             passthrough: vec![],
@@ -841,8 +841,8 @@ mod tests {
             guards: vec![],
         };
         for (name, now, resolves) in [
-            ("raw.githubusercontent.com", 0, true),
-            ("githubusercontent.com", 0, false),
+            ("raw.content.forge.example", 0, true),
+            ("content.forge.example", 0, false),
             ("db.example.com", 0, true),
             ("old.example", 9, true),
             ("old.example", 10, false),
@@ -852,6 +852,6 @@ mod tests {
         }
         assert!(p.tcp_exception("db.example.com", 5432));
         assert!(!p.tcp_exception("db.example.com", 5433));
-        assert!(!p.tcp_exception("raw.githubusercontent.com", 443));
+        assert!(!p.tcp_exception("raw.content.forge.example", 443));
     }
 }
