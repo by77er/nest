@@ -40,7 +40,7 @@ export const Capability = z.object({
   prompt: z.string().default(""),
   /** A remote MCP server whose tools it gives, as `<capability>_<tool>` (docs/agents/capabilities/mcp/). */
   mcp: McpSource.optional(),
-  /** Brokered actions it grants, each scoped (docs/agents/capabilities/#brokered-actions): http profiles. */
+  /** Brokered actions it grants, each scoped (docs/agents/capabilities/brokered/): http profiles. */
   brokered: BrokeredSource.optional(),
   /** The templates its `agent_spawn` may spawn from (the spawn grant; docs/agents/#spawning). */
   spawn: z.array(EntryName).optional(),

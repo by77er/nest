@@ -1,5 +1,5 @@
 // The GitHub App's JWT and REST client (lib/github.ts), which BrokerDO mints sandboxes' installation tokens
-// with (docs/control-plane/durable-objects/broker/#github-app). Pure: a fake fetch stands in for GitHub.
+// with (docs/control-plane/durable-objects/broker/). Pure: a fake fetch stands in for GitHub.
 import { beforeAll, describe, expect, it } from "vitest";
 import { appJwt, GitHubApi, importAppKey, pkcs1ToPkcs8 } from "../src/lib/github";
 import { b64url, b64urlToBytes, bytesToB64 } from "../src/lib/util";

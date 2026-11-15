@@ -1,4 +1,4 @@
-// BrokerDO's GitHub installation tokens (docs/control-plane/durable-objects/broker/#github-app): which
+// BrokerDO's GitHub installation tokens (docs/control-plane/durable-objects/broker/): which
 // installation a token is minted from, and the installation cache behind every mint (exercised through
 // `githubToken`; a sandbox's own tokens look installations up through the same cache). A fake GitHub (as in
 // repos.test.ts: a fetch handler for https://api.github.com over the global fetch BrokerDO calls) records

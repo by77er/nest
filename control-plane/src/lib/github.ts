@@ -1,4 +1,4 @@
-// The GitHub App (docs/control-plane/durable-objects/broker/#github-app): the App's JWT and the REST
+// The GitHub App (docs/control-plane/durable-objects/broker/): the App's JWT and the REST
 // client BrokerDO mints sandboxes' installation tokens with. Sources (all docs.github.com, read 2026-10-31):
 //   JWT:          /en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
 //   installation: /en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
@@ -14,7 +14,7 @@ export type GithubPermissions = Readonly<Record<string, "read" | "write" | "admi
 export const GITHUB_API = "https://api.github.com";
 /**
  * What a sandbox's injected token may do in its allowed repos: push (`contents: write`, which includes
- * the `contents: read` pull requests need: docs/control-plane/durable-objects/broker/#github-app) and
+ * the `contents: read` pull requests need: docs/control-plane/durable-objects/broker/) and
  * open pull requests (`gh pr create`).
  */
 export const SANDBOX_TOKEN_PERMISSIONS: GithubPermissions = { contents: "write", pull_requests: "write" };
