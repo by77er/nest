@@ -181,3 +181,21 @@ python3 -I dev/cloud-checks/lifecycle_check.py
 | **Costs** | a few minutes of a spot sandbox host and brain host from a cold cell, and five short Haiku turns (three for the parent, one per child) |
 
 **Run (2026-11-01, `use1`, after #82's deploy):** 20/20 passed in under three minutes; live sandboxes 0 before and after.
+
+## `projects_github_check.py`
+
+Phase B4 of taking GitHub out of nest's kernel ([rollout](../rollout/2026-11-14-projects-converge-github.md)): whether every live sandbox of the projects client has left nest's own GitHub access for the app's. A pass is the gate for narrowing the client's grant ([projects setup, step 11](../../projects/README.md#setup-the-operators)).
+
+```bash
+CHECK_WAKE=1 python3 -I dev/cloud-checks/projects_github_check.py
+```
+
+| | |
+|---|---|
+| **Settings** | `NEST_ADMIN_TOKEN`; `NEST_ACCESS_CLIENT_ID` and `NEST_ACCESS_CLIENT_SECRET`, which the projects app's Access application also admits (a Service Auth policy); `NEST_BASE_URL`, `NEST_CELL`, `CHECK_CLIENT_NAME` (`projects`), `PROJECTS_BASE_URL` (`https://projects-nest.bitcru.sh`), `CHECK_WAKE` (`1` to wake each project first) |
+| **Reads** | the client's grant (`GET /v1/admin/clients`), its live sandboxes and each one's `policy`; with `CHECK_WAKE=1`, each project's manager through the app (`GET /api/projects/<id>/manager`), which wakes the project |
+| **Reports** | per sandbox: its labels, and whether it's given nest's GitHub bindings (`github`, `github_read`, `github_read_default`), the app's own (`client:` guards) or none. Then which of the grant's GitHub fields remain |
+| **Passes when** | no live sandbox of the client is given nest's GitHub bindings. It can't see the projects Worker's `GITHUB_TOKEN_SOURCE`, which must also be unset (`projects/wrangler.jsonc`) |
+| **Creates, changes** | nothing in nest. A woken project replaces a manager still on nest's repos at its next quiet pause (30 minutes without chat), which starts a sandbox host in a cold cell: run it again after that |
+
+**Run (2026-11-15, `use1`):** before waking, 2 of 3 managers were on nest's GitHub bindings; woken, both were replaced within minutes (a new sandbox host came up), and the check passed. The grant was narrowed after it.
