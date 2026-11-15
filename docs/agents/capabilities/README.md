@@ -33,7 +33,7 @@ Every capability's tools run in the control plane or behind it, so credentials s
 | `builtin` | Platform tools from the registry (below) | None | Per tool |
 | `mcp{url, auth?, tools?, idempotent?, read_only?, trusted?, when_tainted?, max_concurrent?, per_minute?}` | A remote MCP server's tools ([Streamable HTTP](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports)), listed by the control plane and filtered by an allowlist; see [mcp/](mcp/) | A bearer token or [OAuth](mcp/#oauth) tokens in BrokerDO, or [none](mcp/#no-bearer) (the signed caller identity alone); the control plane is the MCP client | A tool is a sink unless the operator marks it `read_only`, or a `trusted` server marks it `readOnlyHint` ([tool annotations](https://modelcontextprotocol.io/specification/2025-11-25/server/tools), which clients must treat as untrusted from an untrusted server); see [mcp/](mcp/#sinks) |
 | `api{base_url, mode, paths?, auth}` | One tool, `<capability>_request(method, path, query?, body?)` | In BrokerDO; the control plane attaches it to each request | `mode: ro` allows only `GET` and `HEAD` and isn't a sink; `mode: rw` is |
-| `brokered[{action, repos? \| profile…, when_tainted?, per_hour?}]` | One tool per granted action (`github_comment`, `http_request`, …) and `brokered{action, args}`; see [brokered/](brokered/) | The GitHub App (`github_app`) mints a token per call's repo; a profile's `http:<name>` secret is attached by the control plane | GitHub writes are sinks: `allow` when tainted if scoped to repos, `approve` if not (the defaults); a profile is a sink unless it allows only `GET`/`HEAD` |
+| `brokered[{action: http.request, profile…, when_tainted?, per_hour?}]` | One tool per granted action (`http_request`) and `brokered{action, args}`; see [brokered/](brokered/) | A profile's `http:<name>` secret, attached by the control plane | A profile is a sink unless it allows only `GET`/`HEAD`; `approve` when tainted by default |
 
 ```yaml
 capability: github_ro
@@ -62,7 +62,7 @@ prompt: The issue tracker: read freely; comment only when asked.
 | `authority` | `grant`, `revoke` | granting what it holds; sink grants are `approve` when tainted |
 | `transcripts` | `read_transcript` | agents it owns |
 | `schedules` | `wake_at(at \| every, note)` → id, `wake_cancel(id)` | waking itself, within its turn budget |
-| `brokered{actions}` | e.g. `github.create_pr` | each action, scoped by its binding; built as the `brokered` source ([brokered/](brokered/)) |
+| `brokered{actions}` | e.g. `http.request` through a profile | each action, scoped by its profile; built as the `brokered` source ([brokered/](brokered/)) |
 | `web` | `WebSearch`, `WebFetch` (Claude Code built-ins) | none; results set [taint](../tools/#taint-and-sinks) |
 | `metrics` | `metrics_query(sql)` over nest's own [runtime metrics](../../control-plane/metrics/) | reading them; results hold only numbers, enums and ids, so they don't taint |
 
@@ -71,7 +71,7 @@ prompt: The issue tracker: read freely; comment only when asked.
 **Templates compose them,** with any `mcp` or `api` capability alongside. For example (design: only `worker` and `captain` are seeded, and `github_ro` needs the `api` source):
 
 ```yaml
-worker:    [hands, web, github_ro, brokered{actions: [github.create_pr]}]   # ephemeral: no memory
+worker:    [hands, web, github_ro, brokered{actions: [http.request]}]   # ephemeral: no memory
 captain:   [spawning{budget}, sandboxes, authority, transcripts, memory, schedules]
 monitor:   [memory, schedules, web]   # long-lived: watches the web; add `metrics` to watch nest itself
 assistant: [spawning{budget}, memory, schedules, web]  # long-lived

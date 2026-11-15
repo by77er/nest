@@ -368,7 +368,7 @@ describe("at only on a host that enforces it, and never a Basic binding beside i
   }
   const basicBinding = { name: "gh", secret: "gh-push", hosts: ["api.example.com"], locations: [{ type: "authorization_basic_password", username: "x-access-token" }] };
 
-  for (const row of OLD_ROWS) it(`a write bringing the pair to its own host is refused (409): a client's Basic binding beside GitHub's at, a repo attach, the operator's repos, an agent's repos added (${row.name})`, async () => {
+  for (const row of OLD_ROWS) it(`a write bringing the pair to its own host is refused (409): a client's Basic binding beside GitHub's at, a repo attach, the operator's repos (${row.name})`, async () => {
     const { c, sbx, stub } = await onOldHost(row);
     // Without repos, GitHub's guards use at: a Basic binding beside them is the pair; a Bearer one isn't.
     const basic = await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [basicBinding] } });
@@ -381,10 +381,6 @@ describe("at only on a host that enforces it, and never a Basic binding beside i
     const op = await admin(`/v1/sandboxes/${sbx}/policy`, { method: "PUT", body: { repos: ["o/r"] } });
     expect(op.status).toBe(409);
     expect(((await op.json()) as { error: { code: string } }).error.code).toBe("hosts_not_ready");
-    // An attached agent's repos widened later (a fork the operator approved).
-    await stub.attach("agt_plain", undefined, [], []);
-    await expect(Promise.resolve().then(() => stub.allowAgentRepos("agt_plain", ["o/fork"]))).rejects.toThrow(/can't enforce/);
-    expect((await stub.policy()).inject.map((b) => b.name)).not.toContain("github");
   });
 
   for (const row of OLD_ROWS) it(`at alone, newly brought to its own host, is refused too; what it holds is pushed there without at (${row.name})`, async () => {

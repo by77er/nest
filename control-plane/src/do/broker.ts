@@ -7,13 +7,12 @@ import { generateBindingKey, importPrivateJwk, signBinding as signBindingToken }
 import { type OAuthAudit, type OAuthStatus, OAuthStore, type ServerRevocation, type StartAnswer, type StartInput } from "../lib/mcp-auth";
 import { b64url, bytesToB64, NestError, newId } from "../lib/util";
 import {
-  appJwt, type GitHubApi, githubApiOf, installationVerdict, retryMintFresh, importAppKey, parseAppSecret, revokeInstallationToken, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
+  appJwt, type GitHubApi, githubApiOf, type GithubPermissions, installationVerdict, retryMintFresh, importAppKey, parseAppSecret, revokeInstallationToken, SANDBOX_READ_TOKEN_PERMISSIONS, SANDBOX_TOKEN_PERMISSIONS,
 } from "../lib/github";
 import { isClientId } from "../lib/clients";
 import { CLIENT_SECRET_PREFIX, clientSecretKey } from "../lib/client-secrets";
 import { canonicalRepos } from "../lib/repos";
 import { addColumn } from "../lib/stored";
-import type { GithubPermissions } from "../lib/brokered";
 import { canonicalJson } from "../lib/sinks";
 import { credentialFor, type CredentialPrincipal } from "../lib/credentials";
 import { BINDING_VERSION, type BindingClaims, type BindingKey } from "../protocol/gateway";
@@ -637,16 +636,6 @@ export class BrokerDO extends DurableObject<Env> {
   }
 
   /**
-   * The operator's own GitHub token (`github_user`), for AgentDO's `github.fork`, the only caller: the
-   * App can't fork from an account it isn't installed on. Never resolvable into a host command.
-   */
-  async githubUserToken(): Promise<string> {
-    const s = this.secret("github_user");
-    if (!s) throw new NestError(ErrorCodes.FORBIDDEN, "no GitHub user token is configured (github_user): forks need one", 409);
-    return s.value;
-  }
-
-  /**
    * An http profile's credential (`http:<name>`, docs/agents/capabilities/#brokered-actions), for
    * AgentDO's brokered pipeline, the only caller. Never resolvable into a host command. Null when none is stored.
    */
@@ -896,7 +885,9 @@ export class BrokerDO extends DurableObject<Env> {
   /**
    * An installation token for one repo with exactly these permissions, minted with the GitHub App
    * (`github_app`: `{"app_id", "private_key"}`) and cached until it has 10 minutes left. Every mint and
-   * every refusal is audited to R2 before the token is handed out (never the value).
+   * every refusal is audited to R2 before the token is handed out (never the value). No production
+   * caller since the brokered `github.*` actions went (C2): kept, with its cache, as the installation
+   * cache's test path until BrokerDO's GitHub minting goes (C3).
    */
   async githubToken(repo: string, permissions: GithubPermissions, caller: CredentialCaller): Promise<MintedGithubToken> {
     const r = repo.toLowerCase();
@@ -1073,7 +1064,11 @@ export function commandRefSlots(cmd: Record<string, unknown>): RefSlot[] {
   return slots;
 }
 
-/** Never resolvable into a command, whatever the purpose: they never leave the control plane. */
+/**
+ * Never resolvable into a command, whatever the purpose: they never leave the control plane. `github_user`
+ * has had no use since the brokered `github.fork` went, but a stored value may remain until the operator
+ * deletes it, so it stays here.
+ */
 export const NEVER_RESOLVED = ["binding_key:", "access:", "cap:", "hook:", "http:", "github_app", "github_user"] as const;
 
 /** An entry ending in `:` admits that prefix; any other admits the name itself and `<name>:…`. */

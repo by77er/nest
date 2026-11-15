@@ -20,7 +20,7 @@
 | `checkpoint` | `hands` (worker) | `not_implemented` |
 | `expose_port` | `hands` (worker) | `share: true` is `forbidden` for agents: a public link bypasses Access, so only the operator mints one |
 | `egress_policy` | `egress` (no seed template) | Widening is a sink: `pending` from a tainted session until approved; `revoke` is never gated |
-| `brokered` | `brokered` (worker, captain) | The actions are the spec's `brokered` grants ([brokered](../../../agents/capabilities/brokered/)). `tools_list` also lists each granted action as its own tool (`github_comment`, `github_create_issue`, `github_create_pr`, `github_review_comment`, `http_request`), not in this file, with schemas from `control-plane/src/lib/brokered.ts` narrowed to the grants. `email.send` answers `not_implemented` |
+| `brokered` | `brokered` (worker, captain) | The actions are the spec's `brokered` grants ([brokered](../../../agents/capabilities/brokered/)). `tools_list` also lists each granted action as its own tool (`http_request`), not in this file, with schemas from `control-plane/src/lib/brokered.ts` narrowed to the grants. An action nest doesn't have is `invalid_message` |
 | `approve`, `deny` | `management` (captain) | `not_implemented` |
 | `memory_read`, `memory_write` | `memory` (captain) | `not_implemented` |
 | `timer_set`, `timer_cancel`, `timer_list` | `timers` (no seed template) | A named timer fires as an inbox message, 10 s to 30 days ahead; setting a name again replaces its timer; at most 32 live per agent ([timers](../../../agents/capabilities/timers/)) |

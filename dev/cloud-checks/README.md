@@ -123,35 +123,35 @@ python3 -I dev/cloud-checks/list_changed_check.py      # LC_GAP_S=75: the wait b
 
 ## `brokered_check.py`
 
-[Brokered actions](../../docs/agents/capabilities/brokered/) end to end, **posting on a real repo** (`REPO`, default `by77er/nest`; run it only with the owner's OK): a real Claude Code agent opens an issue, comments on it and opens a draft pull request through nest's GitHub App, from a session the untrusted `mcp-check` capability taints, and nest refuses a comment holding a fake credential.
+[Brokered actions](../../docs/agents/capabilities/brokered/) end to end, with no external service: a real Claude Code agent calls `http_request` through two operator-defined profiles on the MCP test server's own `/tools` route (nest attaches the server's token; the agent never sees it), from a session the untrusted `mcp-check` capability taints. One profile is `allow` when tainted and goes; the other is `approve` and waits for the check's approval; a call holding a value nest stores as a secret is refused by the stored-value scan.
 
 ```bash
-# NEST_ADMIN_TOKEN, MCP_TEST_URL and MCP_TEST_TOKEN as for mcp_check.py; the App's id and its PEM key (never echo them):
-export NEST_GITHUB_APP_ID=<app id>
-read -rs NEST_GITHUB_APP_PRIVATE_KEY && export NEST_GITHUB_APP_PRIVATE_KEY   # the PEM, with `\n` escapes if on one line
+# NEST_ADMIN_TOKEN, MCP_TEST_URL and MCP_TEST_TOKEN as for mcp_check.py
 python3 -I dev/cloud-checks/brokered_check.py
 ```
 
 | | |
 |---|---|
-| **Settings** | `NEST_ADMIN_TOKEN`, `NEST_GITHUB_APP_ID`, `NEST_GITHUB_APP_PRIVATE_KEY`, `MCP_TEST_URL`, `MCP_TEST_TOKEN` (all required; no token or key is printed), `REPO` (`by77er/nest`), `NEST_BASE_URL`, `NEST_CELL` (`use1`), `BROKERED_MODEL` (`haiku`), `BROKERED_TIMEOUT_S` (1200, for the turns), `BROKERED_IDLE_S` (900, for the brain to exit), `BROKERED_OUT` (`brokered-check-<run>.jsonl`: the marks, the decision, the journal rows and the checks). Needs `openssl` (it signs the App's JWT; the key is written to a `0600` file in a private temporary directory, removed on exit) and nothing beyond the standard library |
-| **Creates** | the BrokerDO secrets `github_app` (`{app_id, private_key}`, built in the script), `cap:mcp-check` and `http:brokered-check-scan` (a random throwaway value, replaced each run); the capability `mcp-check` (as `mcp_check.py` defines it); the capability `gh-check` (`brokered`: `github.create_issue` on `REPO` with `when_tainted: approve`, `github.comment` and `github.create_pr` on `REPO` with the default, `allow`); the template `gh-check` (`nest`, `mcp-check`, `gh-check`; no hands); on GitHub, with an installation token the script mints itself (contents, issues and pull requests write on `REPO` only), the branch `nest-check/brokered-<run>` with one commit adding `dev/cloud-checks/.scratch/<run>.md` on main's head; one agent given one turn: create the issue `nest brokered check <run>` (held: the check approves it from the agent's open asks, `GET /v1/agents/<id>/asks`), comment on it, open a draft pull request from the branch to main, and comment `scan check: <the throwaway value>`, which nest's scan of stored values refuses |
-| **Passes when** | every turn is `done` with the approval answered; the journal (`GET /v1/agents/<id>/brokered`) has done rows for the issue, the comment and the pull request, one refused row for the throwaway value (naming `http:brokered-check-scan`) with its arguments withheld, no row holding the value, and the issue's row tainted; an approval was asked for the issue only (none for the scoped `allow` grants), and the issue's row was written after it was asked (server times); on GitHub, the issue has the run's title, the App's bot as its author and nest's marker, the comment is the bot's with the marker, the pull request is the bot's draft from the branch, and no comment holds the throwaway value; the brain idle-exits within `BROKERED_IDLE_S` |
-| **Exit** | 0 on PASS, 1 on FAIL. The last line is the JSON of the run, repo, branch, agent, issue and pull request numbers |
-| **Cleans up** | on every exit path (SIGINT and SIGTERM too): every open issue and pull request on `REPO` by the App's bot whose title names the run gets the comment "closed by nest's brokered check" and is closed; the branch is deleted; the agent is stopped |
-| **Leaves** | the closed issue and pull request (GitHub can't delete them through the API), the capabilities, the template and the three secrets (kept for reruns), the stopped agent's record, and the brain host it caused to launch, which retires after the cell's idle grace |
-| **Costs** | a few minutes of one spot brain host from a cold cell, one or two short Haiku turns on the subscription, and a dozen GitHub API calls. Opening the draft pull request may start the repo's CI (its paths are under `dev/cloud-checks/.scratch/`) |
+| **Settings** | `NEST_ADMIN_TOKEN`, `MCP_TEST_URL`, `MCP_TEST_TOKEN` (all required; no token is printed), `NEST_BASE_URL`, `NEST_CELL` (`use1`), `BROKERED_MODEL` (`haiku`), `BROKERED_TIMEOUT_S` (1200, for the turns), `BROKERED_IDLE_S` (900, for the brain to exit), `BROKERED_OUT` (`brokered-check-<run>.jsonl`: the marks, the decision, the journal rows and the checks). Nothing beyond the standard library |
+| **Creates** | the BrokerDO secrets `cap:mcp-check` and `http:brokered-check` (both the server's token) and `http:brokered-check-scan` (a random throwaway value, replaced each run); the capability `mcp-check` (as `mcp_check.py` defines it); the capability `brokered-check` (`brokered`: profiles `check-allow` and `check-approve`, each `http.request` to the server's origin with `POST` and `DELETE` under `/tools` and `auth` `http:brokered-check`, `when_tainted` `allow` and `approve`); the template `brokered-check` (`nest`, `mcp-check`, `brokered-check`; no hands); one agent given one turn: add the server tool `extra_<run>_a` through `check-allow`, `extra_<run>_b` through `check-approve` (held: the check approves it from the agent's open asks, `GET /v1/agents/<id>/asks`), and a third with the throwaway value in its query, which nest's scan of stored values refuses |
+| **Passes when** | every turn is `done` with the approval answered; the journal (`GET /v1/agents/<id>/brokered`) has one done row per profile, each sent once, one refused row for the throwaway value (naming `http:brokered-check-scan`) with its arguments withheld, no row holding the value, and the `check-approve` row tainted; an approval was asked for `check-approve` only, and its row was written after it was asked (server times); removing each of the two tools from the server answers `changed: true` (the requests reached it); the brain idle-exits within `BROKERED_IDLE_S` |
+| **Exit** | 0 on PASS, 1 on FAIL. The last line is the JSON of the run, the agent and the tool names |
+| **Cleans up** | on every exit path (SIGINT and SIGTERM too): the run's tools are removed from the server; the agent is stopped |
+| **Leaves** | the capabilities, the template and the three secrets (kept for reruns), the stopped agent's record, and the brain host it caused to launch, which retires after the cell's idle grace |
+| **Costs** | a few minutes of one spot brain host from a cold cell, and one or two short Haiku turns on the subscription |
 
-**Leftovers after an interrupted run:** search the repo's issues and pull requests for `nest brokered check <run>`, close them, delete `nest-check/brokered-<run>`, and stop the agent from the last line.
+**Leftovers after an interrupted run:** `DELETE /tools?name=extra_<run>_a` (and `_b`) on the server with its token, and stop the agent from the last line.
 
-**Checked offline (2026-10-31):** the JWT the script signs with `openssl` verifies with the key's public half and has GitHub's claims; the throwaway value no longer needs a credential shape (nest stopped scanning for shapes, 2026-11-12: it refuses stored values only); the journal and approval checks pass a well-formed run and fail on a missing refusal, the fake value in a row, an untainted issue call, an approval asked after the issue went out, and an extra approval; with nothing set it exits naming the missing settings. It has not been run against GitHub or the cloud.
+**Checked offline (2026-11-15):** the journal and approval checks pass a well-formed run and fail on a missing refusal, the throwaway value in a row, an untainted approved call, an approval asked after the call went out, an extra approval, a profile call sent twice, and no approval; with nothing set it exits naming the missing settings. It has not been run against the cloud.
 
 ## `push_check.py`
 
 [Push allowlists](../../docs/sandbox/networking/egress/) end to end on the current guest image: a real Claude Code worker on a fresh sandbox allowed to push only to `REPO` pushes a throwaway branch there, and nest-proxy refuses push requests to any other repo. The probes to other repos carry no data and no real credential.
 
 ```bash
-# NEST_ADMIN_TOKEN as above; the App's id and PEM key as for brokered_check.py (never echo them)
+# NEST_ADMIN_TOKEN as above; the App's id and its PEM key (never echo them):
+export NEST_GITHUB_APP_ID=<app id>
+read -rs NEST_GITHUB_APP_PRIVATE_KEY && export NEST_GITHUB_APP_PRIVATE_KEY   # the PEM, with `\n` escapes if on one line
 REPO=by77er/nest OTHER_REPO=by77er/<another repo the App is installed on> python3 -I dev/cloud-checks/push_check.py
 ```
 

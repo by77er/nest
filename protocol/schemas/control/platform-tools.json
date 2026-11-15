@@ -378,13 +378,13 @@
   },
   {
     "name": "brokered",
-    "description": "Run a brokered action (github.comment, github.create_issue, github.create_pr, github.review_comment, http.request) outside the sandbox, with credentials you never see. Your grants say which actions, repos and profiles; each action is also its own tool (github_comment, ..., http_request) with its schema.",
+    "description": "Run a brokered action (http.request) outside the sandbox, with credentials you never see. Your grants say which actions and profiles; each action is also its own tool (http_request) with its schema.",
     "input_schema": {
       "type": "object",
       "properties": {
         "action": {
           "type": "string",
-          "description": "Action name, e.g. github.create_pr."
+          "description": "Action name, e.g. http.request."
         },
         "args": {
           "type": "object",

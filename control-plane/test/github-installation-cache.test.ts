@@ -1,6 +1,6 @@
 // BrokerDO's GitHub installation tokens (docs/control-plane/durable-objects/broker/#github-app): which
-// installation a token is minted from, and the installation cache behind every mint (`githubToken`, the
-// path brokered actions take; a sandbox's own tokens go through the same mint). A fake GitHub (as in
+// installation a token is minted from, and the installation cache behind every mint (exercised through
+// `githubToken`; a sandbox's own tokens look installations up through the same cache). A fake GitHub (as in
 // repos.test.ts: a fetch handler for https://api.github.com over the global fetch BrokerDO calls) records
 // every mint.
 import { env, runInDurableObject } from "cloudflare:test";
@@ -82,7 +82,7 @@ function repo(): string {
 }
 
 const CALLER = { agent: "agt_cachetest", call: "agt_cachetest/1/1" };
-/** A token as BrokerDO mints it for a brokered action. */
+/** A token from the mint the installation cache serves (`githubToken`). */
 const mint = (r: string, permissions: Record<string, string>) =>
   brokerStub().githubToken(r, permissions as Record<string, "read">, CALLER);
 /** A mint that must be refused: the refusal's message. */
@@ -282,5 +282,16 @@ describe("the installation cache", () => {
     } finally {
       await adminJson("/v1/admin/secrets/github_app", { method: "PUT", body: { value: was } });
     }
+  });
+});
+
+describe("the stored-value scan", () => {
+  it("a GitHub installation token nest minted and holds counts as a held credential, by its exact value, named without it", async () => {
+    const t = await mint(repo(), { contents: "read" });
+    const hits = await brokerStub().scanSecrets([`leak ${t.token}`]);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]).toMatch(/^minted GitHub token /);
+    expect(hits[0]).not.toContain(t.token);
+    expect(await brokerStub().scanSecrets(["nothing held here"])).toEqual([]);
   });
 });

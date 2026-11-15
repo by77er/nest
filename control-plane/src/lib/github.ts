@@ -1,22 +1,20 @@
-// The GitHub App (docs/control-plane/durable-objects/broker/#github-app): the App's JWT, the REST client,
-// and the requests each `github.*` brokered action makes. BrokerDO mints installation tokens with it;
-// AgentDO runs actions with them. Sources (all docs.github.com, read 2026-10-31):
+// The GitHub App (docs/control-plane/durable-objects/broker/#github-app): the App's JWT and the REST
+// client BrokerDO mints sandboxes' installation tokens with. Sources (all docs.github.com, read 2026-10-31):
 //   JWT:          /en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
 //   installation: /en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
 //   token:        /en/rest/apps/apps#create-an-installation-access-token-for-an-app
-//   comments:     /en/rest/issues/comments#create-an-issue-comment, #list-issue-comments
-//   issues:       /en/rest/issues/issues#create-an-issue, #list-repository-issues
-//   pulls:        /en/rest/pulls/pulls#create-a-pull-request, #list-pull-requests
-//   review:       /en/rest/pulls/comments#create-a-review-comment-for-a-pull-request
 //   permissions:  /en/rest/authentication/permissions-required-for-github-apps
 import { b64url, concatBytes, NestError, pemToDer } from "./util";
 import { ErrorCodes } from "../protocol/model";
-import { checkBaseUrl, type GithubAction, type GithubPermissions, marker } from "./brokered";
+import { checkBaseUrl } from "./brokered";
+
+/** GitHub repository permissions an installation token is narrowed to (docs.github.com, "Permissions required for GitHub Apps"). */
+export type GithubPermissions = Readonly<Record<string, "read" | "write" | "admin">>;
 
 export const GITHUB_API = "https://api.github.com";
 /**
  * What a sandbox's injected token may do in its allowed repos: push (`contents: write`, which includes
- * the `contents: read` pull requests need: docs/agents/capabilities/brokered/#github-permissions) and
+ * the `contents: read` pull requests need: docs/control-plane/durable-objects/broker/#github-app) and
  * open pull requests (`gh pr create`).
  */
 export const SANDBOX_TOKEN_PERMISSIONS: GithubPermissions = { contents: "write", pull_requests: "write" };
@@ -252,83 +250,4 @@ export function retryMintFresh(e: unknown, fromCache: boolean, attempt: number):
  */
 export function installationVerdict(cached: number, fresh: readonly (number | null)[]): "stale" | "same" {
   return fresh.every((f) => f === cached) ? "same" : "stale";
-}
-
-// --- The actions -------------------------------------------------------------------------------------------
-
-/** One action's request, as GitHub's REST API takes it. */
-export interface GhRequest {
-  method: "POST";
-  path: string;
-  body: Record<string, unknown>;
-}
-
-/** The request `action` makes; text it posts carries the call's marker (`markerDigest`). */
-export function actionRequest(action: GithubAction, a: Record<string, unknown>, markerDigest: string): GhRequest {
-  const repo = String(a.repo);
-  const withMarker = (t: unknown) => `${typeof t === "string" ? t : ""}\n\n${marker(markerDigest)}`;
-  switch (action) {
-    case "github.comment":
-      return { method: "POST", path: `/repos/${repo}/issues/${Number(a.issue_number)}/comments`, body: { body: withMarker(a.body) } };
-    case "github.create_issue":
-      return { method: "POST", path: `/repos/${repo}/issues`, body: { title: String(a.title), body: withMarker(a.body), ...(Array.isArray(a.labels) ? { labels: a.labels } : {}) } };
-    case "github.create_pr":
-      return {
-        method: "POST", path: `/repos/${repo}/pulls`,
-        body: { title: String(a.title), head: String(a.head), base: String(a.base), ...(typeof a.body === "string" ? { body: a.body } : {}), ...(a.draft === true ? { draft: true } : {}) },
-      };
-    case "github.review_comment":
-      return {
-        method: "POST", path: `/repos/${repo}/pulls/${Number(a.pull_number)}/comments`,
-        body: { body: withMarker(a.body), commit_id: String(a.commit_id), path: String(a.path), line: Number(a.line), side: a.side === "LEFT" ? "LEFT" : "RIGHT" },
-      };
-  }
-}
-
-/**
- * Where to look for what an earlier attempt of this call may have made ("read current external
- * state"): an open pull request from the same head to the same base, else the call's marker among the
- * newest comments or issues. Paths for a GET with the installation token.
- */
-export function stateQuery(action: GithubAction, a: Record<string, unknown>): string {
-  const repo = String(a.repo);
-  switch (action) {
-    case "github.create_pr": {
-      const head = String(a.head).includes(":") ? String(a.head) : `${repo.split("/")[0]}:${String(a.head)}`;
-      return `/repos/${repo}/pulls?state=open&head=${encodeURIComponent(head)}&base=${encodeURIComponent(String(a.base))}&per_page=1`;
-    }
-    case "github.comment":
-      // Oldest first; a marker this call posted is within the last 100 an hour after it (one page).
-      return `/repos/${repo}/issues/${Number(a.issue_number)}/comments?since=${new Date(Date.now() - 3_600_000).toISOString()}&per_page=100`;
-    case "github.create_issue":
-      return `/repos/${repo}/issues?state=all&sort=created&direction=desc&per_page=50`;
-    case "github.review_comment":
-      return `/repos/${repo}/pulls/${Number(a.pull_number)}/comments?sort=created&direction=desc&per_page=100`;
-  }
-}
-
-/** What an action made, as the model sees it: ids and URLs only (GitHub's text is someone's text: it would taint). */
-export interface GhMade {
-  number?: number;
-  id?: number;
-  url: string;
-  /** create_pr: the open pull request was already there (this call made nothing). */
-  existing?: boolean;
-}
-
-const made = (j: unknown, existing = false): GhMade | null => {
-  const o = (j ?? {}) as { number?: unknown; id?: unknown; html_url?: unknown };
-  if (typeof o.html_url !== "string") return null;
-  return { ...(typeof o.number === "number" ? { number: o.number } : {}), ...(typeof o.id === "number" ? { id: o.id } : {}), url: o.html_url, ...(existing ? { existing: true } : {}) };
-};
-
-/** A created resource from the action's answer. */
-export const createdOf = (j: unknown): GhMade | null => made(j);
-
-/** What `stateQuery`'s answer shows this call (or, for a PR, the same head and base) already made. */
-export function foundInState(action: GithubAction, json: unknown, markerDigest: string): GhMade | null {
-  const items = Array.isArray(json) ? (json as { body?: unknown }[]) : [];
-  if (action === "github.create_pr") return items[0] ? made(items[0], true) : null;
-  const hit = items.find((x) => typeof x?.body === "string" && x.body.includes(marker(markerDigest)));
-  return hit ? made(hit) : null;
 }
