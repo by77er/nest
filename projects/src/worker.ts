@@ -23,7 +23,9 @@ const json = (body: unknown, status = 200) =>
 
 /**
  * Who Access let through: `owner`, a login (its token carries the login's email); `service`, a service
- * token (Service Auth: no email); `null`, no valid token for the app's application. Fails closed.
+ * token (Service Auth: no email, its client id as `common_name`, an empty `sub`); `null`, anything else,
+ * including no valid token for the app's application. Fails closed.
+ * https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/application-token/
  */
 async function admitted(request: Request, env: Env): Promise<"owner" | "service" | null> {
   // `vite dev` only: there is no Access in front of localhost. `vite build` replaces the flag with
@@ -38,12 +40,14 @@ async function admitted(request: Request, env: Env): Promise<"owner" | "service"
     return null; // the team's keys could not be fetched
   }
   if (!claims) return null;
-  return typeof claims.email === "string" && claims.email !== "" ? "owner" : "service";
+  if (typeof claims.email === "string" && claims.email !== "") return "owner";
+  if (claims.email === undefined && typeof claims.common_name === "string" && claims.common_name !== "" && claims.sub === "") return "service";
+  return null;
 }
 
 /**
- * What a service token may do (README.md#setup-the-operators): wake projects by reading them, for nest's
- * cloud checks (dev/cloud-checks/projects_github_check.py). Nothing else: no page, no write, no other read.
+ * What a service token may do (README.md#setup-the-operators): read the projects and their managers, which
+ * wakes them, for nest's cloud checks (dev/cloud-checks/). Nothing else: no page, no write, no other read.
  */
 export function serviceMayCall(method: string, path: string): boolean {
   return method === "GET" && (path === "/api/projects" || /^\/api\/projects\/prj_[a-z0-9]+\/manager$/.test(path));

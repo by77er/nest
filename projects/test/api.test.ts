@@ -70,14 +70,14 @@ describe("the Access check", () => {
   });
 
   it("lets a service token (no email) only read the projects and their managers", async () => {
-    const service = await team.token({ email: undefined, common_name: "checks.access" });
+    const service = await team.token({ email: undefined, common_name: "checks.access", sub: "" });
     // No such project (creating one here would reorder the next tests' calls): past the gate, it's the API's 404.
     const id = "prj_nosuch";
     expect((await api(service, "GET", "/api/projects")).status).toBe(200);
     expect((await api(service, "GET", `/api/projects/${id}/manager`)).status).toBe(404);
     const refused: [string, string][] = [
       ["GET", "/"], ["GET", "/index.html"], ["GET", `/api/projects/${id}`], ["GET", `/api/projects/${id}/chat`],
-      ["GET", `/api/projects/${id}/manager/x`], ["GET", `/api/projects/${id}/managerx`], ["GET", "/api/projects/"],
+      ["GET", `/api/projects/${id}/manager/x`], ["GET", `/api/projects/${id}/managerx`], ["GET", "/api/projects/"], ["GET", `/x/api/projects/${id}/manager`],
       ["GET", "/api/admin/bindings"], ["POST", "/api/projects"], ["POST", `/api/projects/${id}/manager/restart`],
       ["PUT", `/api/projects/${id}/settings`], ["POST", "/api/admin/sync"], ["HEAD", "/api/projects"],
     ];
@@ -85,8 +85,10 @@ describe("the Access check", () => {
       const res = await SELF.fetch(`${APP}${path}`, { method: m, headers: { "cf-access-jwt-assertion": service } });
       expect(res.status, `${m} ${path}`).toBe(403);
     }
-    // An empty email is no login either.
-    expect((await api(await team.token({ email: "" }), "POST", "/api/projects", {})).status).toBe(403);
+    // Neither a login nor a service token (an empty email; no common_name; a subject): nothing at all.
+    for (const over of [{ email: "", common_name: "checks.access", sub: "" }, { email: undefined, sub: "" }, { email: undefined, common_name: "checks.access", sub: "someone" }]) {
+      expect((await api(await team.token(over), "GET", "/api/projects")).status, JSON.stringify(over)).toBe(403);
+    }
     // The owner's login still reaches the rest.
     expect((await api(token, "GET", `/api/projects/${id}`)).status).toBe(404);
   });
