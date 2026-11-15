@@ -27,7 +27,8 @@ PROJECTS = os.environ.get("PROJECTS_BASE_URL", "https://projects-nest.bitcru.sh"
 NEST_GITHUB = {"github", "github_read", "github_read_default"}
 APP_GITHUB_GUARD = "client:github-"
 GRANT_FIELDS = ["repos", "read_repos", "github", "github_push", "repo_owners"]
-ACCESS = (("NEST_ACCESS_CLIENT_ID", "CF-Access-Client-Id"), ("NEST_ACCESS_CLIENT_SECRET", "CF-Access-Client-Secret"))
+# The checks' own service token for the projects app: never nest's gateway token (`access:gateway`), which runners hold.
+ACCESS = (("PROJECTS_ACCESS_CLIENT_ID", "CF-Access-Client-Id"), ("PROJECTS_ACCESS_CLIENT_SECRET", "CF-Access-Client-Secret"))
 
 
 class Failed(Exception):

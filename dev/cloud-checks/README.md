@@ -192,7 +192,7 @@ CHECK_WAKE=1 python3 -I dev/cloud-checks/projects_github_check.py
 
 | | |
 |---|---|
-| **Settings** | `NEST_ADMIN_TOKEN`; `NEST_ACCESS_CLIENT_ID` and `NEST_ACCESS_CLIENT_SECRET` for `CHECK_WAKE=1` (the projects app's Access application admits that service token: `projects/deploy/`); `NEST_BASE_URL`, `NEST_CELL`, `CHECK_CLIENT_NAME` (`projects`), `PROJECTS_BASE_URL` (`https://projects-nest.bitcru.sh`), `CHECK_WAKE` (`1` to wake each project first) |
+| **Settings** | `NEST_ADMIN_TOKEN`; `PROJECTS_ACCESS_CLIENT_ID` and `PROJECTS_ACCESS_CLIENT_SECRET` for `CHECK_WAKE=1`: the checks' own service token, which the projects app's Access application admits (`projects/deploy/`) and its Worker lets only read the projects and their managers (never nest's gateway token, which every runner holds); `NEST_BASE_URL`, `NEST_CELL`, `CHECK_CLIENT_NAME` (`projects`), `PROJECTS_BASE_URL` (`https://projects-nest.bitcru.sh`), `CHECK_WAKE` (`1` to wake each project first) |
 | **Reads** | the client's grant (`GET /v1/admin/clients`), its live sandboxes and each one's `policy`; with `CHECK_WAKE=1`, each project's manager through the app (`GET /api/projects/<id>/manager`), which wakes the project |
 | **Reports** | per sandbox: its labels, and whether it's given nest's GitHub bindings (`github`, `github_read`, `github_read_default`), the app's own (`client:github-*` guards) or none. Then which of the grant's GitHub fields remain |
 | **Passes when** | no live sandbox of the client is given nest's GitHub bindings. It can't see the projects Worker's `GITHUB_TOKEN_SOURCE`, which must also be unset (`projects/wrangler.jsonc`) |
