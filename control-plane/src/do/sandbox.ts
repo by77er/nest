@@ -1247,7 +1247,8 @@ export class SandboxDO extends DurableObject<Env> {
    * The guards as its host gets them: unless FleetDO said its host enforces `at` (`guard_basic_user` and
    * `guard_sealed_segments`; lacking either, or not known: unplaced, unread, no row), guards using `at` go
    * without it, failing closed (`guardsWithoutAt`). Every write that would newly bring `at`, or a Basic binding
-   * beside it, there is refused first (`requireBasicUser`); a detach can't be, and is the case this keeps closed.
+   * beside it, there is refused first (`requireBasicUser`); what no write brought (a layer a previous release stored,
+   * a host whose flags aren't known) is the case this keeps closed.
    * `raw`: as built, for the judgment.
    */
   private forHost<G extends RequestGuard>(_inject: readonly InjectionBinding[], guards: G[], raw: boolean): G[] {
@@ -1866,8 +1867,8 @@ export class SandboxDO extends DurableObject<Env> {
    * (a client's layer, an attach with its extras, the operator's layer); it's applied, judged and undone in one
    * synchronous transaction. A write that newly brings either is
    * refused (409 `hosts_not_ready`) when its own host is known not to enforce `at` (asked of FleetDO now);
-   * unplaced, placement decides, and unknown, the push fails closed. A detach can't be refused: its host gets
-   * the guards without `at` instead (`forHost`).
+   * unplaced, placement decides, and unknown, the push fails closed. What no write brought gets its host the
+   * guards without `at` instead (`forHost`).
    */
   private async requireBasicUser(change: () => void): Promise<void> {
     const before = this.atNeeds();

@@ -375,6 +375,10 @@ describe("at only on a host that enforces it, and never a Basic binding beside i
   for (const row of OLD_ROWS) it(`a write bringing the pair to its own host is refused (409): a client's Basic binding, or the operator's, beside a guard's at (${row.name})`, async () => {
     const { c, sbx, stub } = await onOldHost(row);
     await plantLayer(stub, { guards: [atFloor] });
+    // An attaching agent whose spec brings its client's Basic binding: the pair, refused, and not attached.
+    const held = { ...basicBinding, client: c.id, placeholder: `nest-ph.${c.id}.gh.` };
+    await expect(Promise.resolve().then(() => stub.attach("agt_basic", undefined, [], [], { inject: [held] as never }))).rejects.toThrow(/can't enforce/);
+    expect((await stub.info()).attached).not.toContain("agt_basic");
     // A Basic binding beside the guard using at is the pair; a Bearer one isn't.
     const basic = await as(c.token, `/v1/sandboxes/${sbx}/client-policy`, { method: "PUT", body: { inject: [basicBinding] } });
     expect(basic.status).toBe(409);

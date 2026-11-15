@@ -33,10 +33,10 @@ describe("client injection bindings (pure)", () => {
     expect([fixture.inject[0], ...held.map(wireBinding)]).toEqual(fixture.inject);
   });
 
-  it("no placeholder nest assigns contains another, nor the guest image's GitHub ones (nest-proxy finds placeholders as substrings)", () => {
+  it("no placeholder nest assigns contains another, nor the guest image's GitHub one (nest-proxy finds placeholders as substrings)", () => {
     const names = ["a", "ab", "a_b", "b", "abc_1"];
     // The guest image's `GITHUB_TOKEN` and git credential helper still carry `nest-ph-github`, which an operator's binding may take.
-    const all = [...["cli_1", "cli_12", "cli_2"].flatMap((c) => names.map((n) => injectionPlaceholder(c, n))), "nest-ph-github", "nest-ph-read-github"];
+    const all = [...["cli_1", "cli_12", "cli_2"].flatMap((c) => names.map((n) => injectionPlaceholder(c, n))), "nest-ph-github"];
     for (const x of all) for (const y of all) expect(x === y || !x.includes(y), `${x} contains ${y}`).toBe(true);
     // A name that could break that is refused.
     for (const bad of ["a-b", "a.b", "A", "_a", ""]) expect(ClientInjection.safeParse({ ...stripe, name: bad }).success, bad).toBe(false);

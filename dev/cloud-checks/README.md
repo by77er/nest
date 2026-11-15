@@ -146,25 +146,7 @@ python3 -I dev/cloud-checks/brokered_check.py
 
 ## `push_check.py`
 
-**Retired** (2026-11-15): nest mints no repo tokens and builds no push allowlist ([no repo tokens](../../docs/sandbox/networking/egress/policy/#no-repo-tokens)), so the script exits 2 at once without touching the cell. Phase C6 replaces it with a client-guard check. What it checked:
-
-[Push allowlists](../../docs/sandbox/networking/egress/) end to end on the current guest image: a real Claude Code worker on a fresh sandbox allowed to push only to `REPO` pushes a throwaway branch there, and nest-proxy refuses push requests to any other repo. The probes to other repos carry no data and no real credential.
-
-```bash
-# NEST_ADMIN_TOKEN as above; the App's id and its PEM key (never echo them):
-export NEST_GITHUB_APP_ID=<app id>
-read -rs NEST_GITHUB_APP_PRIVATE_KEY && export NEST_GITHUB_APP_PRIVATE_KEY   # the PEM, with `\n` escapes if on one line
-REPO=by77er/nest OTHER_REPO=by77er/<another repo the App is installed on> python3 -I dev/cloud-checks/push_check.py
-```
-
-| | |
-|---|---|
-| **Creates** | the template `push-check` (`nest`, `hands`; Haiku); one sandbox and one agent with `overrides.repos: [REPO]`, given one turn that writes and runs a script: clone `REPO`, commit `dev/cloud-checks/.scratch/<run>.md` on `nest-check/push-<run>`, `git push`, then three `curl` probes (push discovery for `OTHER_REPO` and for a repo that doesn't exist, and a `git-receive-pack` POST to `OTHER_REPO` with a dummy Basic credential), and `gh api repos/<REPO>` |
-| **Passes when** | the sandbox reports a hostname; `gh` and `git-credential-nest` are in the image and `GITHUB_TOKEN` is the placeholder; the push exits 0 and GitHub has the branch; all three probes answer 403 from the proxy; `OTHER_REPO` has no such branch; `gh api` answers through the placeholder |
-| **Cleans up** | deletes the branch (with an installation token it mints itself), ends the agent and destroys the sandbox, on every exit path |
-| **Costs** | a few minutes of a spot sandbox host and brain host from a cold cell, one short Haiku turn |
-
-**Run (2026-11-01, `use1`, guest build `20261101092412`):** 9/9 passed.
+**Retired** (2026-11-15): nest mints no repo tokens and builds no push allowlist ([no repo tokens](../../docs/sandbox/networking/egress/policy/#no-repo-tokens)), so the script exits 2 at once without touching the cell. Phase C6 deletes it and checks pushes through a client guard instead.
 
 ## `lifecycle_check.py`
 

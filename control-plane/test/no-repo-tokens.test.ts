@@ -142,7 +142,10 @@ describe("a sandbox", () => {
         st.storage.sql.exec("INSERT OR REPLACE INTO injections (sandbox, binding, source, covers, expires_ms, minted_ms) VALUES (?, ?, 'k', '[]', ?, 0)",
           s, b, Date.now() + 3_600_000);
       }
+      st.storage.sql.exec("INSERT OR REPLACE INTO github_tokens (key, token, expires_ms, installation, minted_ms) VALUES ('k', 'cached-token', ?, 1, 0)", Date.now() + 3_600_000);
       new BrokerDO(st as never, env as never);
+      // The installation tokens it cached go too: nothing reads them now.
+      expect(st.storage.sql.exec("SELECT 1 FROM github_tokens").toArray()).toEqual([]);
     });
     // The operator's own static binding of that name, and its value.
     await broker().putSecret(`inject:${b}`, "operator-value");
