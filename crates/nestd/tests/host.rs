@@ -560,11 +560,17 @@ async fn mock_fleet_with(lease: LeaseTiming) -> MockFleet {
                                         answers.push(Command { cmd: CommandId(format!("cmd_cr_{}", request.0)), issued_ms: 0, body: CommandBody::CommitResult { request: request.clone(), sandbox: sandbox.clone(), outcome } });
                                     }
                                 }
-                                log2.lock().unwrap().events.extend(events);
-                                let _ = ws.send(send(FleetToHost::Ack { up_to: es })).await;
-                                if !answers.is_empty() && hold.load(Ordering::SeqCst) {
-                                    log2.lock().unwrap().held.append(&mut answers);
+                                // A held answer is logged with its request, under one lock: a test that
+                                // sees the request then finds its answer held (logged apart, across the
+                                // ack's await, a test could read the request before the answer was held).
+                                {
+                                    let mut l = log2.lock().unwrap();
+                                    l.events.extend(events);
+                                    if !answers.is_empty() && hold.load(Ordering::SeqCst) {
+                                        l.held.append(&mut answers);
+                                    }
                                 }
+                                let _ = ws.send(send(FleetToHost::Ack { up_to: es })).await;
                                 if !answers.is_empty() {
                                     seq += 1;
                                     unacked.insert(seq, answers.clone());
