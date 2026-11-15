@@ -6,7 +6,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { AgentDO } from "../src/do/agent";
 import { secretNeedles } from "../src/do/broker";
-import { authorize, type BrokeredGrant, brokeredToolDefs, grantOfEntry, pathCovered, REMOVED_ACTIONS, safePath } from "../src/lib/brokered";
+import { actionDef, authorize, type BrokeredGrant, brokeredToolDefs, grantOfEntry, pathCovered, REMOVED_ACTIONS, safePath } from "../src/lib/brokered";
 import { CallLedger } from "../src/lib/calls";
 import { bytesToB64 } from "../src/lib/util";
 import { adminJson, connectHost, nextCommands, uniqueCell, Ws } from "./helpers";
@@ -169,9 +169,7 @@ describe("authority and the scan (pure)", () => {
     const stale = REMOVED_ACTIONS.map((action) => ({ capability: "old", action, repos: null, when_tainted: "allow", per_hour: 30 }) as unknown as BrokeredGrant);
     expect(brokeredToolDefs([...stale, rw]).map((t) => t.name)).toEqual(["http_request"]);
     expect(brokeredToolDefs(stale)).toEqual([]);
-    for (const action of REMOVED_ACTIONS) {
-      expect(authorize(stale, action as "http.request", { repo: "o/r", profile: "p", method: "GET", path: "/" }).ok, action).toBe(false);
-    }
+    for (const action of REMOVED_ACTIONS) expect(actionDef(action), action).toBeUndefined();
   });
 
   it("the scan looks for a stored value raw, base64'd, inside JSON, or as a PEM's body", () => {

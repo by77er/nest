@@ -140,7 +140,7 @@ python3 -I dev/cloud-checks/brokered_check.py
 | **Leaves** | the capabilities, the template and the three secrets (kept for reruns), the stopped agent's record, and the brain host it caused to launch, which retires after the cell's idle grace |
 | **Costs** | a few minutes of one spot brain host from a cold cell, and one or two short Haiku turns on the subscription |
 
-**Leftovers after an interrupted run:** `DELETE /tools?name=extra_<run>_a` (and `_b`) on the server with its token, and stop the agent from the last line.
+**Leftovers after an interrupted run:** `DELETE /tools?name=extra_<run>_a` (and `_b`, `_c`) on the server with its token, and stop the agent from the last line.
 
 **Checked offline (2026-11-15):** the journal and approval checks pass a well-formed run and fail on a missing refusal, the throwaway value in a row, an untainted approved call, an approval asked after the call went out, an extra approval (one whose arguments name the held call included), a profile call sent twice, and no approval; with nothing set it exits naming the missing settings. It has not been run against the cloud.
 
