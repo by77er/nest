@@ -21,18 +21,36 @@ export type { Env };
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", "cache-control": "no-store" } });
 
-/** Whether the request carries a valid Access token for the app's application; fails closed. */
-async function admitted(request: Request, env: Env): Promise<boolean> {
+/**
+ * Who Access let through: `owner`, a login (its token carries the login's email); `service`, a service
+ * token (Service Auth: no email, its client id as `common_name`, an empty `sub`); `null`, anything else,
+ * including no valid token for the app's application. Fails closed.
+ * https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/authorization-cookie/application-token/
+ */
+async function admitted(request: Request, env: Env): Promise<"owner" | "service" | null> {
   // `vite dev` only: there is no Access in front of localhost. `vite build` replaces the flag with
   // `false`, so the deployed Worker has no such branch.
-  if (import.meta.env.DEV) return true;
+  if (import.meta.env.DEV) return "owner";
   const token = request.headers.get("cf-access-jwt-assertion");
-  if (!token || !env.ACCESS_TEAM_DOMAIN || !env.PROJECTS_AUD) return false;
+  if (!token || !env.ACCESS_TEAM_DOMAIN || !env.PROJECTS_AUD) return null;
+  let claims: Record<string, unknown> | null;
   try {
-    return (await verifyAccessJwt(token, { teamDomain: env.ACCESS_TEAM_DOMAIN, aud: env.PROJECTS_AUD })) !== null;
+    claims = await verifyAccessJwt(token, { teamDomain: env.ACCESS_TEAM_DOMAIN, aud: env.PROJECTS_AUD });
   } catch {
-    return false; // the team's keys could not be fetched
+    return null; // the team's keys could not be fetched
   }
+  if (!claims) return null;
+  if (typeof claims.email === "string" && claims.email !== "") return "owner";
+  if (claims.email === undefined && typeof claims.common_name === "string" && claims.common_name !== "" && claims.sub === "") return "service";
+  return null;
+}
+
+/**
+ * What a service token may do (README.md#setup-the-operators): read the projects and their managers, which
+ * wakes them, for nest's cloud checks (dev/cloud-checks/). Nothing else: no page, no write, no other read.
+ */
+export function serviceMayCall(method: string, path: string): boolean {
+  return method === "GET" && (path === "/api/projects" || /^\/api\/projects\/prj_[a-z0-9]+\/manager$/.test(path));
 }
 
 /**
@@ -98,7 +116,9 @@ export default {
     if (path === "/hooks/github") return githubHook(request, env);
     if (path.startsWith("/hooks/")) return new Response(null, { status: 404 });
 
-    if (!(await admitted(request, env))) return json({ error: "a Cloudflare Access login for this app is required" }, 403);
+    const who = await admitted(request, env);
+    if (!who) return json({ error: "a Cloudflare Access login for this app is required" }, 403);
+    if (who === "service" && !serviceMayCall(request.method, path)) return json({ error: "a service token may only read the projects and their managers" }, 403);
     if (path.startsWith("/api/")) return handleApi(request, env, url);
     const asset = await env.ASSETS.fetch(request);
     // `vite build` replaces the flag with `false`: the deployed Worker always sends them.
