@@ -53,7 +53,7 @@ export function data(variant = "demo", now = Date.now()) {
     t("Add search by tag", "in_review", { assignee: "agt_w8x2m4", pr: 118, tainted: true, body: SEARCH_BODY }),
     t("Migrate to the new auth library", "stalled", { assignee: "agt_w1k7c2", start_error: "nest refused the worker: max_agents reached (403)" }),
     // Made of an issue whose close GitHub refused (README.md#triage).
-    t("Write the 0.5 changelog", "done", { pr: 112, issue: { number: 38, close: "failed", error: "nest 403: issues: write is outside the grant" } }),
+    t("Write the 0.5 changelog", "done", { pr: 112, issue: { number: 38, close: "failed", error: "GitHub 403: Resource not accessible by integration" } }),
     t("Drop the legacy XML export", "cancelled"),
   ];
   // "board-many": a long board, every state several times over, long titles, workers and PRs.
