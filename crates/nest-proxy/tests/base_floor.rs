@@ -3,7 +3,8 @@
 //! writes with `PUT /v1/admin/egress/base`, here for GitHub's hosts (a vitest asserts the control plane
 //! carries them to a sandbox's policy as written). nest builds none of them; here the proxy's own evaluator
 //! decides real request shapes against them: `injected: "*"` with `at`, path anchoring and encoded
-//! separators, on data an operator actually writes.
+//! separators, on data an operator actually writes. Only its guards are the base layer's; its `allow` is
+//! an example (the live layer allows more hosts, on ports 80 and 443).
 
 use nest_protocol::model::EgressPolicy;
 use nest_proxy::guard::{BodyView, Req, refusing};

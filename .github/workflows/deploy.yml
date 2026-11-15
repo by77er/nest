@@ -204,7 +204,7 @@ jobs:
       - name: Guest image
         if: steps.publish.outputs.changed == 'true'
         run: |
-          echo "The guest image isn't rebuilt here: if nest-guest or images/guest/ changed, run images/guest/build-on-ec2.sh (dev/deploy.md)." >> "$GITHUB_STEP_SUMMARY"
+          echo "The guest image isn't rebuilt here: if nest-guest changed, run images/guest/build-on-ec2.sh (dev/deploy.md)." >> "$GITHUB_STEP_SUMMARY"
       - if: steps.seen.outputs.cache-hit != 'true'
         run: mkdir -p ~/release-inputs && echo "$SHA" > ~/release-inputs/published-by
       - name: Remember these inputs as published
