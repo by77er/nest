@@ -19,7 +19,7 @@
 // this object's alarm after `RESERVE_CHECK_MS` and dropped when the object doesn't exist.
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
-import { type Grant, labelWhere, type Labels } from "../lib/clients";
+import { type Grant, grantForPreviousRelease, labelWhere, type Labels, storedGrant } from "../lib/clients";
 import {
   BACKLOG_MAX, checkWebhookUrl, type Delivery, type DeliveryEvent, deliveryStep, EVENT_MAX_AGE_MS, signature, type StampedEvent, WEBHOOK_TIMEOUT_MS,
 } from "../lib/client-events";
@@ -356,7 +356,11 @@ export class ClientDO extends DurableObject<Env> {
   private record(): ClientRecord | null {
     this.requireClient();
     const row = this.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'record'").toArray()[0];
-    return row ? JSON.parse(row.value) as ClientRecord : null;
+    if (!row) return null;
+    const r = JSON.parse(row.value) as ClientRecord;
+    // A grant stored before its GitHub fields went still holds them: dropped here, for every reader.
+    r.grant = storedGrant(r.grant);
+    return r;
   }
 
   /** The record of a client that exists and isn't deleted (404 otherwise). */
@@ -367,7 +371,9 @@ export class ClientDO extends DurableObject<Env> {
   }
 
   private save(r: ClientRecord): void {
-    this.sql.exec("INSERT INTO kv (key, value) VALUES ('record', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify(r));
+    // With `repos: []`, which the previous release reads without a default (it runs again after a rollback).
+    this.sql.exec("INSERT INTO kv (key, value) VALUES ('record', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+      JSON.stringify({ ...r, grant: grantForPreviousRelease(r.grant) }));
   }
 
   private count(kind: MemberKind): number {
@@ -409,14 +415,22 @@ export class ClientDO extends DurableObject<Env> {
     if (!r || r.deleted_ms || !timingSafeEqual(enc.encode(tokenHashHex), enc.encode(r.token_hash))) {
       throw new NestError(ErrorCodes.UNAUTHORIZED, "admin or client token required", 401);
     }
-    return { client: r.client, name: r.name, grant: r.grant, ...this.revisioned(r) };
+    return this.scoped(r);
   }
 
   /** Its name and grant, for a spawn in its subtree (403 once deleted: nothing more is created for it). */
   async scope(): Promise<ClientScope> {
     const r = this.record();
     if (!r || r.deleted_ms) throw new NestError(ErrorCodes.FORBIDDEN, "the client this agent belongs to was deleted", 403);
-    return { client: r.client, name: r.name, grant: r.grant, ...this.revisioned(r) };
+    return this.scoped(r);
+  }
+
+  /**
+   * A scope for other Durable Objects and the Worker: its grant with `repos: []` for one release, since a
+   * CatalogDO or Worker of the previous release (the minutes of a deploy) reads it without a default.
+   */
+  private scoped(r: ClientRecord): ClientScope {
+    return { client: r.client, name: r.name, grant: grantForPreviousRelease(r.grant), ...this.revisioned(r) };
   }
 
   /**

@@ -4,7 +4,6 @@
 //   JWT:          /en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
 //   installation: /en/rest/apps/apps#get-a-repository-installation-for-the-authenticated-app
 //   token:        /en/rest/apps/apps#create-an-installation-access-token-for-an-app
-//   the App:      /en/rest/apps/apps#get-the-authenticated-app
 //   comments:     /en/rest/issues/comments#create-an-issue-comment, #list-issue-comments
 //   issues:       /en/rest/issues/issues#create-an-issue, #list-repository-issues
 //   pulls:        /en/rest/pulls/pulls#create-a-pull-request, #list-pull-requests
@@ -12,7 +11,6 @@
 //   permissions:  /en/rest/authentication/permissions-required-for-github-apps
 import { b64url, concatBytes, NestError, pemToDer } from "./util";
 import { ErrorCodes } from "../protocol/model";
-import { z } from "zod";
 import { checkBaseUrl, type GithubAction, type GithubPermissions, marker } from "./brokered";
 
 export const GITHUB_API = "https://api.github.com";
@@ -29,59 +27,6 @@ export const SANDBOX_TOKEN_PERMISSIONS: GithubPermissions = { contents: "write",
  * No write of any kind, so GraphQL with it can't change anything.
  */
 export const SANDBOX_READ_TOKEN_PERMISSIONS: GithubPermissions = { contents: "read", metadata: "read" };
-/**
- * Every repository permission an installation token may be asked for, with the levels GitHub offers
- * for each: the `app-permissions` schema of GitHub's REST description
- * (github.com/github/rest-api-description, `descriptions/api.github.com`, read 2026-11-02), its
- * repository block. Organization and account permissions are left out on purpose: a token minted for
- * one repo would still carry them, reaching past that repo.
- */
-export const GITHUB_REPO_PERMISSIONS = {
-  actions: ["read", "write"],
-  administration: ["read", "write"],
-  artifact_metadata: ["read", "write"],
-  attestations: ["read", "write"],
-  checks: ["read", "write"],
-  code_quality: ["read", "write"],
-  codespaces: ["read", "write"],
-  contents: ["read", "write"],
-  dependabot_secrets: ["read", "write"],
-  deployments: ["read", "write"],
-  discussions: ["read", "write"],
-  environments: ["read", "write"],
-  issues: ["read", "write"],
-  merge_queues: ["read", "write"],
-  metadata: ["read", "write"],
-  packages: ["read", "write"],
-  pages: ["read", "write"],
-  pull_requests: ["read", "write"],
-  repository_custom_properties: ["read", "write"],
-  repository_hooks: ["read", "write"],
-  repository_projects: ["read", "write", "admin"],
-  secret_scanning_alerts: ["read", "write"],
-  secrets: ["read", "write"],
-  security_events: ["read", "write"],
-  single_file: ["read", "write"],
-  statuses: ["read", "write"],
-  vulnerability_alerts: ["read", "write"],
-  workflows: ["write"],
-} as const satisfies Record<string, readonly ["read" | "write", ...("read" | "write" | "admin")[]]>;
-export type GithubPermissionLevel = "read" | "write" | "admin";
-
-const LEVEL_RANK: Readonly<Record<string, number>> = { read: 1, write: 2, admin: 3 };
-/** Whether `want` is at most `have` (`read` < `write` < `admin`); a level outside the three is never within. */
-export const levelWithin = (want: string, have: string): boolean =>
-  Object.hasOwn(LEVEL_RANK, want) && Object.hasOwn(LEVEL_RANK, have) && LEVEL_RANK[want]! <= LEVEL_RANK[have]!;
-
-/**
- * Repository permissions, as a grant or a token request names them: only names in
- * {@link GITHUB_REPO_PERMISSIONS}, exactly (no other case, no look-alike characters), each at a level
- * GitHub offers for it.
- */
-export const GithubRepoPermissions = z.strictObject(Object.fromEntries(Object.entries(GITHUB_REPO_PERMISSIONS)
-  .map(([name, levels]) => [name, z.enum(levels as unknown as [GithubPermissionLevel, ...GithubPermissionLevel[]]).optional()])))
-  .transform((p) => p as Readonly<Record<string, GithubPermissionLevel>>);
-
 /** GitHub's REST version header (docs.github.com/en/rest/about-the-rest-api/api-versions). */
 const API_VERSION = "2022-11-28";
 /** An answer's body is read up to this many bytes. */
@@ -153,16 +98,9 @@ export class GitHubApi {
 
   /** Requests this client has made. */
   requests = 0;
-  /**
-   * Called synchronously before each request leaves, with nothing awaited in between: a budget reserves
-   * its unit here, and refuses (throws) to stop the request before it is sent.
-   */
-  beforeRequest: (() => void) | null = null;
 
   /** One request with `auth` as the bearer (the App's JWT or an installation token; null: none, a public read). Never throws. */
   async request(auth: string | null, method: string, path: string, body?: unknown): Promise<GhAnswer> {
-    // Before the try: a budget's refusal is the caller's to see, not a lost answer.
-    this.beforeRequest?.();
     this.requests++;
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), this.timeoutMs);
@@ -217,142 +155,17 @@ export class GitHubApi {
   }
 
   /**
-   * The App's installation on `owner/repo` and the account it belongs to (the repo's owner); null when it
-   * isn't installed there (404). `account` null when GitHub's answer doesn't carry one.
-   */
-  async installationOwner(jwt: string, repo: string): Promise<{ id: number; account: number | null } | null> {
-    const r = await this.request(jwt, "GET", `/repos/${repo}/installation`);
-    if (r.kind === "refused" && r.status === 404) return null;
-    const j = r.kind === "ok" ? (r.json as { id?: unknown; account?: unknown } | null) : null;
-    if (j && typeof j.id === "number") return { id: j.id, account: accountId(j.account) };
-    throw ghError(r, `looking up the App's installation on ${repo}`);
-  }
-
-  /**
-   * The numeric id of the GitHub account that owns `owner/repo`, as GitHub answers it now
-   * (docs/control-plane/api/clients/#owner-wide-entries): the account of the App's installation on it
-   * (`GET /repos/{repo}/installation` with the App's JWT; `jwt` null when no App is configured), else,
-   * for a public repo the App isn't on, the repo's `owner.id` (`GET /repos/{repo}`, unauthenticated).
-   * Null when neither says (not found, private and not installed, a redirect for a renamed repo, a
-   * malformed answer): never a guess from the name. Throws (retryable) only when GitHub gave no answer.
-   */
-  async repoOwnerId(jwt: string | null, repo: string): Promise<number | null> {
-    if (jwt !== null) {
-      const i = await this.request(jwt, "GET", `/repos/${repo}/installation`);
-      if (i.kind === "lost") throw ghError(i, `looking up who owns ${repo}`);
-      const id = i.kind === "ok" ? accountId((i.json as { account?: unknown } | null)?.account) : null;
-      if (id !== null) return id;
-    }
-    const r = await this.request(null, "GET", `/repos/${repo}`);
-    if (r.kind === "lost") throw ghError(r, `looking up who owns ${repo}`);
-    return r.kind === "ok" ? accountId((r.json as { owner?: unknown } | null)?.owner) : null;
-  }
-
-  /**
-   * The numeric id of GitHub account `login` (a user or an organization), for an owner-wide grant entry:
-   * the account of the App's installation on it (`GET /users/{login}/installation`, the App's JWT), else
-   * the public profile (`GET /users/{login}`, which answers organizations too). Null when GitHub knows
-   * no such account. Throws (retryable) only when GitHub gave no answer.
-   */
-  async accountId(jwt: string | null, login: string): Promise<number | null> {
-    if (jwt !== null) {
-      const i = await this.request(jwt, "GET", `/users/${encodeURIComponent(login)}/installation`);
-      if (i.kind === "lost") throw ghError(i, `looking up GitHub account ${login}`);
-      const id = i.kind === "ok" ? accountId((i.json as { account?: unknown } | null)?.account, login) : null;
-      if (id !== null) return id;
-    }
-    const r = await this.request(null, "GET", `/users/${encodeURIComponent(login)}`);
-    if (r.kind === "ok") return accountId(r.json, login);
-    if (r.kind === "refused" && r.status === 404) return null;
-    // No answer, or refused (the unauthenticated rate limit is 60 an hour): not known either way.
-    throw new NestError(ErrorCodes.INTERNAL, `GitHub couldn't confirm account ${login} now (${r.kind === "lost" ? r.why : `HTTP ${r.status}`}): try again later`, 503, true);
-  }
-
-  /**
-   * The current login of the account with id `account` (lowercase): from the App's installations when the
-   * App is on it (the App's JWT), else its public profile (`GET /user/{id}`). Null when GitHub knows no
-   * such account. Throws (retryable) when GitHub gave no answer or refused (rate limited).
-   */
-  async accountLogin(jwt: string | null, account: number): Promise<string | null> {
-    if (jwt !== null) {
-      // A page of 100 at a time, at most 10 pages (as `installationOfAccount`).
-      for (let n = 1; n <= 10; n++) {
-        const page = await this.request(jwt, "GET", `/app/installations?per_page=100&page=${n}`);
-        if (page.kind !== "ok" || !Array.isArray(page.json)) break;
-        const hit = (page.json as { account?: { id?: unknown; login?: unknown } }[]).find((i) => i?.account?.id === account);
-        if (typeof hit?.account?.login === "string") return hit.account.login.toLowerCase();
-        if (page.json.length < 100) break;
-      }
-    }
-    const r = await this.request(null, "GET", `/user/${account}`);
-    const o = r.kind === "ok" ? (r.json as { id?: unknown; login?: unknown } | null) : null;
-    if (o && o.id === account && typeof o.login === "string") return o.login.toLowerCase();
-    if (r.kind === "refused" && r.status === 404) return null;
-    throw new NestError(ErrorCodes.INTERNAL, `GitHub couldn't say account ${account}'s login now: try again later`, 503, true);
-  }
-
-  /**
-   * The App's installation on the account with id `account` (`GET /app/installations` with the App's JWT,
-   * read a page of 100 at a time, at most 10 pages); null when the App isn't installed on it.
-   */
-  async installationOfAccount(jwt: string, account: number): Promise<number | null> {
-    for (let page = 1; page <= 10; page++) {
-      const r = await this.request(jwt, "GET", `/app/installations?per_page=100&page=${page}`);
-      if (r.kind !== "ok" || !Array.isArray(r.json)) throw ghError(r, "listing the App's installations");
-      const hit = (r.json as unknown[]).find((i) => accountId((i as { account?: unknown } | null)?.account) === account);
-      if (hit) return (hit as { id: number }).id;
-      if (r.json.length < 100) return null;
-    }
-    return null;
-  }
-
-  /**
-   * The repos (lowercase `owner/name`) an installation token reaches (`GET /installation/repositories`,
-   * 100 a page), each with its owner's account id; at most `max`. `complete` false when there were more.
-   */
-  async installationRepos(token: string, max = 1000): Promise<{ repos: { repo: string; owner: number | null }[]; complete: boolean }> {
-    const repos: { repo: string; owner: number | null }[] = [];
-    for (let page = 1; repos.length < max; page++) {
-      const r = await this.request(token, "GET", `/installation/repositories?per_page=100&page=${page}`);
-      const list = r.kind === "ok" ? (r.json as { repositories?: unknown } | null)?.repositories : undefined;
-      if (!Array.isArray(list)) throw ghError(r, "listing an installation's repos");
-      for (const x of list as { full_name?: unknown; owner?: unknown }[]) {
-        if (typeof x?.full_name === "string") repos.push({ repo: x.full_name.toLowerCase(), owner: accountId(x.owner) });
-      }
-      if (list.length < 100) return { repos: repos.slice(0, max), complete: true };
-    }
-    return { repos: repos.slice(0, max), complete: false };
-  }
-
-  /** The App itself (`GET /app` with its JWT): its numeric id and its slug. */
-  async app(jwt: string): Promise<{ id: number; slug: string }> {
-    const r = await this.request(jwt, "GET", "/app");
-    const j = r.kind === "ok" ? (r.json as { id?: unknown; slug?: unknown } | null) : null;
-    if (j && Number.isSafeInteger(j.id) && (j.id as number) > 0 && typeof j.slug === "string" && j.slug) return { id: j.id as number, slug: j.slug };
-    throw ghError(r, "reading the App (GET /app)");
-  }
-
-  /**
    * An installation token for these repos (by name, without the owner: one installation is one account)
    * with these permissions only.
    */
-  async mint(jwt: string, installation: number, repoNames: string | readonly string[] | null, permissions: GithubPermissions): Promise<{ token: string; expires_ms: number }> {
-    // Null: every repo of the installation (only `installationRepos`' listing asks for that, with `metadata: read`).
-    const repositories = repoNames === null ? [] : typeof repoNames === "string" ? [repoNames] : [...repoNames];
-    const r = await this.request(jwt, "POST", `/app/installations/${installation}/access_tokens`, repoNames === null ? { permissions } : { repositories, permissions });
+  async mint(jwt: string, installation: number, repoNames: string | readonly string[], permissions: GithubPermissions): Promise<{ token: string; expires_ms: number }> {
+    const repositories = typeof repoNames === "string" ? [repoNames] : [...repoNames];
+    const r = await this.request(jwt, "POST", `/app/installations/${installation}/access_tokens`, { repositories, permissions });
     const j = r.kind === "ok" ? (r.json as { token?: unknown; expires_at?: unknown } | null) : null;
     const expires = typeof j?.expires_at === "string" ? Date.parse(j.expires_at) : NaN;
     if (j && typeof j.token === "string" && Number.isFinite(expires)) return { token: j.token, expires_ms: expires };
-    throw ghError(r, `minting an installation token for ${repoNames === null ? `installation ${installation}` : repositories.join(", ")}`);
+    throw ghError(r, `minting an installation token for ${repositories.join(", ")}`);
   }
-}
-
-/** An account object's `id` (a positive integer), only if its `login` is `login` when one is given (case-insensitive); else null. */
-function accountId(a: unknown, login?: string): number | null {
-  const o = a as { id?: unknown; login?: unknown } | null | undefined;
-  if (!o || !Number.isSafeInteger(o.id) || (o.id as number) <= 0) return null;
-  if (login !== undefined && (typeof o.login !== "string" || o.login.toLowerCase() !== login.toLowerCase())) return null;
-  return o.id as number;
 }
 
 /**

@@ -37,10 +37,6 @@ const NOT_ADMIN = {
     // Its own secrets (test/client-secrets.test.ts): write-only values, a listing of names.
     "GET /v1/clients/self/secrets", "PUT /v1/clients/self/secrets/:name", "DELETE /v1/clients/self/secrets/:name",
   ].map((r) => [r, "owner"])),
-  // A client's own: only a client token has a self, the operator's is refused (test/client-github-token.test.ts).
-  "POST /v1/clients/self/github-token": "owner",
-  "GET /v1/clients/self/grant/repos": "owner",
-  "POST /v1/clients/self/grant/repos": "owner",
 };
 /** A concrete path for a pattern: each parameter as an id of its kind. */
 const concrete = (path: string) => path.replace(/[:*]([a-z]+)/g, (_m, k: string) =>
@@ -115,10 +111,14 @@ describe("?cell= (a multi-cell config: CELLS names two cells, neither of them th
     await ok(c.token, "GET", `/v1/agents/${a.agent}/asks`);
     await ok(c.token, "GET", "/v1/agents");
     await ok(c.token, "GET", "/v1/clients/self");
-    // Refused by its grant, not by a cell: the route reached its own check.
-    const gh = await call(c.token, "POST", "/v1/clients/self/github-token", { repo: "o/r", permissions: { contents: "read" } });
-    expect(gh.status).toBe(403);
-    expect(gh.text).toContain("outside");
+    // A grant holds no GitHub authority, so the routes that answered from it are gone (docs/control-plane/api/clients/#no-github-authority).
+    for (const [m, path, body] of [["POST", "/v1/clients/self/github-token", { repo: "o/r", permissions: { contents: "read" } }],
+      ["GET", "/v1/clients/self/grant/repos", undefined], ["POST", "/v1/clients/self/grant/repos", { repos: ["o/r"] }]] as const) {
+      // A client's token for a path nest doesn't serve is refused as for any operator route; the operator's finds no route.
+      expect((await call(c.token, m, path, body)).status, `${m} ${path}`).toBe(401);
+      const r = await call(ADMIN, m, path, body);
+      expect([r.status, JSON.parse(r.text).error.code], `${m} ${path}`).toEqual([404, "invalid_message"]);
+    }
     // The operator's routes that aren't about a cell.
     await ok(ADMIN, "PUT", `/v1/admin/secrets/x-${rand()}`, { value: "v" });
     await ok(ADMIN, "GET", "/v1/admin/catalog");

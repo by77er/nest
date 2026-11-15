@@ -288,7 +288,8 @@ describe("the live client layer: bindings and environment", () => {
   });
 
   it("GitHub env names are a client's where nest injects no GitHub token of its own, and refused where it does (create, layer, attach, policy)", async () => {
-    const c = await newClient({ github_push: { workflows: true } });
+    const c = await newClient();
+    const ADMIN = "test-admin-token";
     const takeover = Object.fromEntries(GITHUB_TAKEOVER.map((n) => [n, "anything"]));
     // No kernel GitHub token here: every name goes through, on create and live, and reaches the slots.
     const s = await placed(c, { env: takeover });
@@ -304,7 +305,8 @@ describe("the live client layer: bindings and environment", () => {
       expect(r.status, JSON.stringify(body)).toBe(400);
       expect((await r.json() as any).error.message).toContain("GH_TOKEN");
     }
-    expect((await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: takeover, github_push: { workflows: true } } })).status).toBe(400);
+    // A client's layer asking for it is refused by the grant before the names are looked at (no grant has it).
+    expect((await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: takeover, github_push: { workflows: true } } })).status).toBe(403);
     const op = await admin("/v1/agents", { method: "POST", body: { template: "worker", sandbox: s.sandbox, start: false, overrides: { repos: ["o/r"] } } });
     expect(op.status).toBe(400);
     expect((await op.json() as any).error.message).toContain("GIT_CONFIG_COUNT");
@@ -320,13 +322,14 @@ describe("the live client layer: bindings and environment", () => {
     const opBody = { cell: c.cell, policy: { repos: ["o/r"] } };
     for (const name of GITHUB_TAKEOVER) {
       expect((await admin("/v1/sandboxes", { method: "POST", body: { ...opBody, env: { [name]: "x" } } })).status, `create ${name}`).toBe(400);
-      expect((await as(c.token, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true }, env: { [name]: "x" } } })).status, `client create ${name}`).toBe(400);
+      expect((await as(ADMIN, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true }, env: { [name]: "x" } } })).status, `own opt-in create ${name}`).toBe(400);
     }
-    const gh = await ok(c.token, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true } } });
-    const live = await as(c.token, `/v1/sandboxes/${gh.sandbox}/client-policy`, { method: "PUT", body: { github_push: { workflows: true }, env: { GH_TOKEN: "x" } } });
+    // The operator's own sandbox: its client layer is held to no grant, so the opt-in there reserves the names.
+    const gh = await ok(ADMIN, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true } } });
+    const live = await as(ADMIN, `/v1/sandboxes/${gh.sandbox}/client-policy`, { method: "PUT", body: { github_push: { workflows: true }, env: { GH_TOKEN: "x" } } });
     expect([live.status, live.body.error.message]).toEqual([400, expect.stringContaining("reserved where nest injects its own GitHub token")]);
     // Dropping the opt-in in the same write frees them.
-    await ok(c.token, `/v1/sandboxes/${gh.sandbox}/client-policy`, { method: "PUT", body: { env: { GH_TOKEN: "x" } } });
+    await ok(ADMIN, `/v1/sandboxes/${gh.sandbox}/client-policy`, { method: "PUT", body: { env: { GH_TOKEN: "x" } } });
     const tpl = { capabilities: ["nest", "hands"], launch: LAUNCH, hands: "required", credential: "claude_oauth_token" };
     expect((await as(c.token, `/v1/catalog/templates/${c.name}/push`, { method: "PUT", body: { ...tpl, github_push: { workflows: true }, env: { GH_TOKEN: "x" } } })).status).toBe(400);
     const sbx = await adminJson("/v1/sandboxes", { body: opBody });

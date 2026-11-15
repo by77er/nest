@@ -13,7 +13,7 @@ import { PLATFORM_TOOL_NAMES } from "../src/lib/registry";
 import { canonicalRepos, narrowRepos, Repo } from "../src/lib/repos";
 import { GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER, githubBinding, githubEgress, githubGuards } from "../src/lib/rules/github";
 import { BrokerDO } from "../src/do/broker";
-import { Grant, specOutsideGrant } from "../src/lib/clients";
+import { Grant, specOutsideGrant, storedGrant } from "../src/lib/clients";
 import { type Catalog, expandSpec, SEED_CATALOG } from "../src/lib/spec";
 import { bytesToB64 } from "../src/lib/util";
 import { adminJson, connectHost, nextCommands, runDue, type Ws, uniqueCell } from "./helpers";
@@ -704,7 +704,7 @@ describe("workflows: write on a sandbox's push token", () => {
   const expand = (by: "operator" | "spawner", overrides: Record<string, unknown> = {}) =>
     expandSpec(catalog, PLATFORM_TOOL_NAMES, { template: "ci", hands: true, by, overrides } as never);
 
-  it("comes from the template; a spawner may only turn it off, the operator either way, and a client's grant must allow it", () => {
+  it("comes from the template; a spawner may only turn it off, the operator either way, and no client's grant allows it", () => {
     expect((expand("operator") as any).value.github_push).toEqual({ workflows: true });
     expect((expand("spawner") as any).value.github_push).toEqual({ workflows: true });
     expect((expand("spawner", { github_push: { workflows: false } }) as any).value.github_push).toBeUndefined();
@@ -714,8 +714,9 @@ describe("workflows: write on a sandbox's push token", () => {
     const off = expandSpec({ ...catalog, templates: { ci: plain } }, PLATFORM_TOOL_NAMES, { template: "ci", hands: true, by: "operator" }) as any;
     expect("github_push" in off.value).toBe(false);
     const spec = (expand("operator") as any).value;
-    expect(specOutsideGrant(spec, Grant.parse({ credentials: [spec.credential], repos: ["me/app"] }))).toEqual(["github_push.workflows"]);
-    expect(specOutsideGrant(spec, Grant.parse({ credentials: [spec.credential], repos: ["me/app"], github_push: { workflows: true } }))).toEqual([]);
+    expect(specOutsideGrant(spec, Grant.parse({ credentials: [spec.credential] }))).toEqual(["repos me/app", "github_push.workflows"]);
+    // Nor one stored when grants had `github_push`: read, it has none.
+    expect(specOutsideGrant(spec, storedGrant({ credentials: [spec.credential], repos: ["me/app"], github_push: { workflows: true } }))).toEqual(["repos me/app", "github_push.workflows"]);
   });
 
   it("is minted exactly {contents, pull_requests, workflows: write} only when asked; the read-only token never has it", async () => {
@@ -755,7 +756,7 @@ describe("workflows: write on a sandbox's push token", () => {
     expect(gh.mints.slice(before).map((m) => [m.repositories, m.permissions])).toEqual([[[r.split("/")[1]], WITH_WORKFLOWS]]);
   });
 
-  it("a client gets it at sandbox create only within its grant's github_push", async () => {
+  it("a client never gets it at sandbox create; the operator does", async () => {
     const cell = uniqueCell();
     const asClient = async (token: string, path: string, body: unknown, status: number) => {
       const res = await SELF.fetch(`http://cp.test${path}`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify(body) });
@@ -764,16 +765,15 @@ describe("workflows: write on a sandbox's push token", () => {
       return JSON.parse(text);
     };
     const mk = async (grant: Record<string, unknown>) => (await adminJson("/v1/admin/clients", { body: { name: `wf-${rand()}`, grant: { cells: [cell], max_sandboxes: 2, ...grant } } }, 201)).token as string;
-    const without = await mk({});
-    expect((await asClient(without, "/v1/sandboxes", { cell, github_push: { workflows: true } }, 403)).error.message).toContain("github_push.workflows");
-    const withIt = await mk({ github_push: { workflows: true } });
-    const sbx = await asClient(withIt, "/v1/sandboxes", { cell, github_push: { workflows: true } }, 202);
+    const client = await mk({});
+    expect((await asClient(client, "/v1/sandboxes", { cell, github_push: { workflows: true } }, 403)).error.message).toContain("github_push.workflows");
+    const off = await asClient(client, "/v1/sandboxes", { cell, github_push: { workflows: false } }, 202);
+    expect(await sandboxStub(off.sandbox).pushWorkflows()).toBe(false);
+    const sbx = await asClient("test-admin-token", "/v1/sandboxes", { cell, github_push: { workflows: true } }, 202);
     expect(await sandboxStub(sbx.sandbox).pushWorkflows()).toBe(true);
-    const plain = await asClient(withIt, "/v1/sandboxes", { cell }, 202);
-    expect(await sandboxStub(plain.sandbox).pushWorkflows()).toBe(false);
   });
 
-  it("a client's live layer turns it on and off: the next mint has it or not, the one with it revoked; within the grant only", async () => {
+  it("a sandbox's live layer turns it on and off: the next mint has it or not, the one with it revoked; never a client's", async () => {
     const cell = uniqueCell();
     const h = await connectHost(cell);
     const call = async (token: string, method: string, path: string, body: unknown, status: number) => {
@@ -783,7 +783,8 @@ describe("workflows: write on a sandbox's push token", () => {
       return text ? JSON.parse(text) : null;
     };
     const mk = async (grant: Record<string, unknown>) => (await adminJson("/v1/admin/clients", { body: { name: `wf-${rand()}`, grant: { cells: [cell], max_sandboxes: 2, ...grant } } }, 201)).token as string;
-    const token = await mk({ github_push: { workflows: true } });
+    // The operator's own sandbox: its client layer is held to no grant.
+    const token = "test-admin-token";
     const sbx = await call(token, "POST", "/v1/sandboxes", { cell }, 201);
     const layer = `/v1/sandboxes/${sbx.sandbox}/client-policy`;
     expect((await call(token, "GET", layer, undefined, 200)).github_push).toEqual({ workflows: false });
@@ -818,11 +819,12 @@ describe("workflows: write on a sandbox's push token", () => {
     expect(off.token).not.toBe(on.token);
     expect(gh.revoked).toContain(on.token);
     expect(await stub.pushWorkflows()).toBe(false);
-    // A client whose grant lacks it: refused (403) live, as at create; off still goes through.
+    // A client's sandbox: refused (403) live, as at create, whoever writes it; off still goes through.
     const without = await mk({});
     const other = await call(without, "POST", "/v1/sandboxes", { cell }, 201);
     const refused = await call(without, "PUT", `/v1/sandboxes/${other.sandbox}/client-policy`, { github_push: { workflows: true } }, 403);
     expect(refused.error.message).toContain("github_push.workflows");
+    expect((await call(token, "PUT", `/v1/sandboxes/${other.sandbox}/client-policy`, { github_push: { workflows: true } }, 403)).error.message).toContain("github_push.workflows");
     expect(await sandboxStub(other.sandbox).pushWorkflows()).toBe(false);
     await call(without, "PUT", `/v1/sandboxes/${other.sandbox}/client-policy`, { github_push: { workflows: false } }, 200);
   });
