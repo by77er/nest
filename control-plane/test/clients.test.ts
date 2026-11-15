@@ -100,8 +100,7 @@ describe("grants, tokens and labels (pure)", () => {
       expect(specOutsideGrant({ ...within, read_repos: ["acme/lib"] }, g)).toEqual(["read_repos acme/lib"]);
       expect(specOutsideGrant({ ...within, github_push: { workflows: true } }, g)).toEqual(["github_push.workflows"]);
       expect(specOutsideGrant({ ...within, github_push: { workflows: false } as never }, g)).toEqual([]);
-      const gh = (action: string, repos: string[] | null) => ({ capability: "b", action, repos, when_tainted: "approve", per_hour: 30 }) as any;
-      for (const b of [gh("github.comment", ["acme/app"]), gh("github.comment", null), gh("github.fork", ["acme/app"]), { capability: "h", action: "http.request" } as any]) {
+      for (const b of [{ capability: "h", action: "http.request", profile: "p" } as any]) {
         expect(specOutsideGrant({ ...within, brokered: [b] }, g)).toEqual([`brokered action ${b.action} (${b.capability})`]);
         expect(capabilityOutsideGrant("n/b", { tools: [], rules: [], prompt: "", brokered: [{ ...b, capability: undefined }] } as any, g)).toEqual([`brokered action ${b.action} (n/b)`]);
       }

@@ -3292,7 +3292,7 @@ export class AgentDO extends DurableObject<Env> {
     if (!def) {
       // A brokered action's own tool, when its spec grants that action; else a remote MCP tool.
       const action = actionOfTool(name);
-      if (action && liveGrants(info.brokered).some((g) => g.action === action)) return await this.brokeredTool(info, epoch, call, action, args, guest, fence);
+      if (action && (info.brokered ?? []).some((g) => g.action === action)) return await this.brokeredTool(info, epoch, call, action, args, guest, fence);
       return await this.mcpTool(info, epoch, call, name, args, guest, fence);
     }
     // Checked again here (docs/agents/tools/#grants): the list the brain holds may predate a grant's expiry.

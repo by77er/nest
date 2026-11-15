@@ -886,8 +886,7 @@ export class BrokerDO extends DurableObject<Env> {
    * An installation token for one repo with exactly these permissions, minted with the GitHub App
    * (`github_app`: `{"app_id", "private_key"}`) and cached until it has 10 minutes left. Every mint and
    * every refusal is audited to R2 before the token is handed out (never the value). No production
-   * caller since the brokered `github.*` actions went (C2): kept, with its cache, as the installation
-   * cache's test path until BrokerDO's GitHub minting goes (C3).
+   * caller: the installation cache's tests mint through it, until BrokerDO's GitHub minting goes (C3).
    */
   async githubToken(repo: string, permissions: GithubPermissions, caller: CredentialCaller): Promise<MintedGithubToken> {
     const r = repo.toLowerCase();
@@ -1066,8 +1065,7 @@ export function commandRefSlots(cmd: Record<string, unknown>): RefSlot[] {
 
 /**
  * Never resolvable into a command, whatever the purpose: they never leave the control plane. `github_user`
- * has had no use since the brokered `github.fork` went, but a stored value may remain until the operator
- * deletes it, so it stays here.
+ * is the operator's own GitHub token, which nothing reads: a stored value may remain until the operator deletes it.
  */
 export const NEVER_RESOLVED = ["binding_key:", "access:", "cap:", "hook:", "http:", "github_app", "github_user"] as const;
 

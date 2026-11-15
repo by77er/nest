@@ -127,9 +127,9 @@ export interface BrokeredGrant {
 }
 
 /**
- * The grants of a stored spec this release runs: those of actions it knows. A spec stored before an
- * action was removed (`REMOVED_ACTIONS`) may still hold its grants; they are kept in the record (a
- * rollback runs them again) and ignored here.
+ * A stored spec's grants as shown: those of actions this release knows. A spec stored before an action
+ * was removed (`REMOVED_ACTIONS`) may still hold its grants; they stay in the record (a rollback runs them
+ * again). Nothing else needs this: every other reader looks a grant up by a known action's name.
  */
 export const liveGrants = (grants: readonly BrokeredGrant[] | undefined): BrokeredGrant[] =>
   (grants ?? []).filter((g) => actionDef((g as { action: string }).action) !== undefined);
@@ -217,10 +217,10 @@ export interface Authorized {
 
 /**
  * Which of the spec's grants covers this call (`args` already validated against the action's schema):
- * the profile it names, its methods and paths. A grant of an action this release doesn't know covers nothing.
+ * the profile it names, its methods and paths.
  */
 export function authorize(grants: readonly BrokeredGrant[], action: BrokeredAction, args: Record<string, unknown>): Result<Authorized> {
-  const mine = liveGrants(grants).filter((g) => g.action === action);
+  const mine = grants.filter((g) => g.action === action);
   if (!mine.length) return { ok: false, error: `${action} isn't granted to this agent` };
   const g = mine.find((x) => x.profile === args.profile);
   if (!g) return { ok: false, error: `no http profile ${String(args.profile)} is granted to this agent` };
@@ -239,9 +239,8 @@ export function authorize(grants: readonly BrokeredGrant[], action: BrokeredActi
  */
 export function brokeredToolDefs(grants: readonly BrokeredGrant[]): ToolDef[] {
   const out: ToolDef[] = [];
-  const live = liveGrants(grants);
   for (const action of BROKERED_ACTION_NAMES) {
-    const ps = live.filter((g) => g.action === action);
+    const ps = grants.filter((g) => g.action === action);
     if (!ps.length) continue;
     const def = BROKERED_ACTIONS[action];
     const schema = structuredClone(def.input_schema) as { properties: Record<string, Record<string, unknown>> };
@@ -303,7 +302,7 @@ export type JournalEvent = (typeof JOURNAL_EVENTS)[number];
  * - `done` and `refused` are final. `unknown` may still become `done` or `failed`, and `failed` may still
  *   become `done`: another delivery of the same call learned that it took effect (two deliveries can both
  *   reach the provider; the one it refused as a duplicate must not hide the one it accepted).
- * - A call can settle with no attempt recorded (a pull request that was already open).
+ * - A call can settle with no attempt recorded (found already made, by an action that looks first).
  */
 export function journalStep(status: JournalStatus | "none", event: JournalEvent): JournalStatus | "refuse" {
   const settled = event === "done" ? "done" : event === "fail" ? "failed" : event === "unknown" ? "unknown" : null;
@@ -372,7 +371,7 @@ export class BrokeredJournal {
   }
 
   /**
-   * What the call came to (a row for it if it never went out: a pull request that was already open).
+   * What the call came to (a row for it if it never went out: found already made).
    * False when the row keeps what it has: a settled call keeps its outcome (`journalStep`).
    */
   settle(e: JournalRow, status: "done" | "failed" | "unknown", outcome: ToolOutcome, detail: string): boolean {

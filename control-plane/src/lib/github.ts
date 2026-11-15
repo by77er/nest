@@ -177,12 +177,12 @@ export async function revokeInstallationToken(api: GitHubApi, token: string): Pr
 }
 
 /** The client for this Worker: `GITHUB_API_URL` (a loopback fake only with `ALLOW_LOOPBACK_BROKERED=1`), else GitHub's. */
-export function githubApiOf(env: { GITHUB_API_URL?: string; ALLOW_LOOPBACK_BROKERED?: string }, timeoutMs?: number, fetchFn?: typeof fetch): GitHubApi {
+export function githubApiOf(env: { GITHUB_API_URL?: string; ALLOW_LOOPBACK_BROKERED?: string }): GitHubApi {
   const base = env.GITHUB_API_URL;
-  if (!base) return new GitHubApi(fetchFn, GITHUB_API, timeoutMs);
+  if (!base) return new GitHubApi(undefined, GITHUB_API);
   const u = checkBaseUrl(base, env.ALLOW_LOOPBACK_BROKERED === "1");
   if (!u.ok) throw new NestError(ErrorCodes.INTERNAL, `GITHUB_API_URL: ${u.error}`, 500);
-  return new GitHubApi(fetchFn, base.replace(/\/+$/, ""), timeoutMs);
+  return new GitHubApi(undefined, base.replace(/\/+$/, ""));
 }
 
 async function readCapped(res: Response): Promise<string> {
@@ -204,7 +204,7 @@ async function readCapped(res: Response): Promise<string> {
 }
 
 /** A failed App request as a NestError: GitHub's refusal, or a retryable lost answer. */
-export function ghError(r: GhAnswer, what: string): NestError {
+function ghError(r: GhAnswer, what: string): NestError {
   if (r.kind === "lost") return new NestError(ErrorCodes.INTERNAL, `GitHub: ${what}: ${r.why}`, 502, true);
   if (r.kind === "refused") {
     const code = r.status === 401 ? ErrorCodes.UNAUTHORIZED : r.status === 403 || r.status === 404 ? ErrorCodes.FORBIDDEN

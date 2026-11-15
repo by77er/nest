@@ -2,18 +2,18 @@
 
 Agents maintaining a code repository: they pick up work, change code, review each other's changes, merge through the repo's own gates, and watch what ships. Like every pattern, this is templates and prompts; no code knows about it.
 
-**Status:** designed. None of its templates (`maintainer`, `reviewer`, `monitor`) or capabilities (`coordination`, `authority`, `schedules`, `github_ro`, `metrics`, `web`) is seeded, and `github.review_check`, `github.dispatch_workflow`, `github.create_pr`'s `auto_merge`, sandbox forks and `report_schema` aren't built. **Built as a variant:** the [projects](../../../projects/README.md) app's manager, worker per task, and reviewer per PR head, which sets a required check with a GitHub token nest mints for the app; with the project's auto-merge on, the app enables GitHub's auto-merge on each task PR.
+**Status:** designed. None of its templates (`maintainer`, `reviewer`, `monitor`) or capabilities (`coordination`, `authority`, `schedules`, `github_ro`, `metrics`, `web`) is seeded, and the `gh_write` capability, sandbox forks and `report_schema` aren't built. **Built as a variant:** the [projects](../../../projects/README.md) app's manager, worker per task, and reviewer per PR head, which sets a required check with the app's own GitHub token; with the project's auto-merge on, the app enables GitHub's auto-merge on each task PR.
 
 ## Agents
 
 | Agent | Template | Lifetime | Capabilities |
 |---|---|---|---|
-| **Maintainer** | `maintainer` (a [captain](../captains/) plus GitHub) | Long-lived, no hands | coordination, spawning{budget}, sandboxes, authority, memory, schedules, `github_ro`, brokered{`github.create_issue`, `github.comment`} |
-| **Worker** | `worker` | One task, until its PR merges or closes | hands on a fork of the repo sandbox, with a GitHub binding injected; coordination, `github_ro`, brokered{`github.create_pr`}. **No `web`.** |
-| **Reviewer** | `reviewer` | One PR head, fresh session | hands on a fork at the PR head, `github_ro`, brokered{`github.review_check`, `github.review_comment`} |
-| **Monitor** | `monitor` | Long-lived, no hands | what it watches (e.g. `metrics`, or the deployed app's metrics API as an `api` capability), coordination, memory, schedules, `github_ro`, brokered{`github.dispatch_workflow{<rollback>}`, `github.create_issue`} |
+| **Maintainer** | `maintainer` (a [captain](../captains/) plus GitHub) | Long-lived, no hands | coordination, spawning{budget}, sandboxes, authority, memory, schedules, `github_ro`, `gh_write{create_issue, comment}` |
+| **Worker** | `worker` | One task, until its PR merges or closes | hands on a fork of the repo sandbox, with a GitHub binding injected; coordination, `github_ro`, `gh_write{create_pr}`. **No `web`.** |
+| **Reviewer** | `reviewer` | One PR head, fresh session | hands on a fork at the PR head, `github_ro`, `gh_write{review_check, review_comment}` |
+| **Monitor** | `monitor` | Long-lived, no hands | what it watches (e.g. `metrics`, or the deployed app's metrics API as an `api` capability), coordination, memory, schedules, `github_ro`, `gh_write{dispatch_workflow{<rollback>}, create_issue}` |
 
-I spawn the maintainer and the monitor; the maintainer spawns workers and reviewers. GitHub access is a GitHub App whose tokens [BrokerDO](../../control-plane/durable-objects/broker/) narrows per binding: workers can push and open PRs, only reviewers can post the review check, and only the maintainer and monitor can file issues and dispatch workflows.
+I spawn the maintainer and the monitor; the maintainer spawns workers and reviewers. `gh_write{…}` is a capability giving those GitHub writes through the app's own GitHub App (an mcp server, or `http.request` profiles holding the app's tokens), never the kernel's ([brokered actions](../../agents/capabilities/brokered/#actions)). The app narrows each token per use: workers can push and open PRs, only reviewers can post the review check, and only the maintainer and monitor can file issues and dispatch workflows.
 
 ## GitHub events
 
@@ -26,7 +26,7 @@ The App's webhooks reach agents through the coordination integration ([principle
 
 1. **Work arrives:** an issue I label `agent`, a monitor finding, a failure on the default branch, or the maintainer's own scheduled sweep.
 2. **The maintainer** writes a task (goal, constraints, and done = PR open, CI green, review passed) and spawns a worker on a fresh fork of the `repo` sandbox: a clone with the toolchains and a warm build cache, which the maintainer keeps current.
-3. **The worker** changes code, runs the repo's checks in its sandbox, pushes a branch and calls `github.create_pr{auto_merge: true}`. Then it waits on its branch's events:
+3. **The worker** changes code, runs the repo's checks in its sandbox, pushes a branch and opens a PR with auto-merge on. Then it waits on its branch's events:
    - CI failed: it fixes and pushes;
    - the review failed: it addresses each point, or answers it in a comment;
    - merged or closed: it reports and exits.
@@ -73,9 +73,9 @@ launch: {system_prompt: {mode: append, text: <reviewer prompt>}}
 hands: {sandbox: <fork at the PR head>}
 capabilities:
   - github_ro
-  - brokered{actions: [github.review_check, github.review_comment]}   # scoped to the PR it was spawned for
+  - gh_write{actions: [review_check, review_comment]}   # scoped to the PR it was spawned for
 report_schema: {pr: number, head: sha, verdict: [pass, fail], findings: number}
 budget: {depth: 0, concurrent: 1, spawns: 0, turns_per_day: 20}
 ```
 
-The `maintainer` template is the [`captain`](../captains/#the-captain-template) template plus `github_ro` and its brokered actions. Workers use a `worker` template without web access (the seeded `worker` launches with `WebSearch` and `WebFetch`).
+The `maintainer` template is the [`captain`](../captains/#the-captain-template) template plus `github_ro` and its GitHub writes. Workers use a `worker` template without web access (the seeded `worker` launches with `WebSearch` and `WebFetch`).

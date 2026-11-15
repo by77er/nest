@@ -61,7 +61,7 @@ export interface Env {
   MCP_LIST_TIMEOUT_MS?: string;
   /** "1" lets a brokered http profile, and `GITHUB_API_URL`, name a loopback URL: tests and local development only. */
   ALLOW_LOOPBACK_BROKERED?: string;
-  /** The GitHub REST API the App's mints use (default https://api.github.com); a local fake in tests. */
+  /** The GitHub REST API the App's mints use (default https://api.github.com); a fake, for local development. */
   GITHUB_API_URL?: string;
   /** How long one brokered request may take (default 30 s; below the runner's 150 s platform call timeout). */
   BROKERED_TIMEOUT_MS?: string;

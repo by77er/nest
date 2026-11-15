@@ -163,7 +163,7 @@ describe("authority and the scan (pure)", () => {
     expect(safePath("/a/./b")).toBe(false);
   });
 
-  it("a stored grant of a removed action (a spec from before it went) covers nothing and makes no tool", () => {
+  it("a stored grant of a removed action (a spec from before it went) covers nothing and makes no tool: no removed action is back in the registry", () => {
     const rw = g({ action: "http.request", profile: "p", base_url: "https://api.example.com", methods: ["GET"] });
     // As the previous release stored them: unscoped, so they would cover any repo.
     const stale = REMOVED_ACTIONS.map((action) => ({ capability: "old", action, repos: null, when_tainted: "allow", per_hour: 30 }) as unknown as BrokeredGrant);
@@ -205,7 +205,14 @@ describe("the brokered pipeline", () => {
     expect(j[0].idem).toMatch(/^http:p:[0-9a-f]{24}$/);
   });
 
-  it("refuses a profile it doesn't grant and an action that isn't one; an mcp capability may not shadow a brokered tool", async () => {
+  it("refuses an action it doesn't grant, a profile it doesn't grant and an action that isn't one; an mcp capability may not shadow a brokered tool", async () => {
+    // No brokered grant at all: the action's own tool doesn't exist for it, and `brokered` reaches nothing.
+    const none = await setup([], { tools: ["brokered"] });
+    const req = { profile: "p", method: "GET", path: "/v1/items" };
+    expect(await run(none.ws, "http_request", req)).toMatchObject({ status: "error", error: { code: "unknown_tool" } });
+    expect(await run(none.ws, "brokered", { action: "http.request", args: req }))
+      .toMatchObject({ status: "error", error: { code: "forbidden", message: expect.stringContaining("http.request isn't granted to this agent") } });
+    expect(await journal(none.agent)).toEqual([]);
     const p = await profileSetup({}, [], { tools: ["brokered"] });
     expect(await run(p.ws, "brokered", { action: "http.request", args: { profile: "nope", method: "GET", path: "/v1/items" } }))
       .toMatchObject({ status: "error", error: { code: "forbidden" } });
