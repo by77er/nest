@@ -71,7 +71,7 @@ prompt: The issue tracker: read freely; comment only when asked.
 **Templates compose them,** with any `mcp` or `api` capability alongside. For example (design: only `worker` and `captain` are seeded, and `github_ro` needs the `api` source):
 
 ```yaml
-worker:    [hands, web, github_ro, brokered{actions: [http.request]}]   # ephemeral: no memory
+worker:    [hands, github_ro, brokered{actions: [http.request]}]   # ephemeral: no memory, no web
 captain:   [spawning{budget}, sandboxes, authority, transcripts, memory, schedules]
 monitor:   [memory, schedules, web]   # long-lived: watches the web; add `metrics` to watch nest itself
 assistant: [spawning{budget}, memory, schedules, web]  # long-lived

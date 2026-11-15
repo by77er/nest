@@ -112,7 +112,7 @@ export const BrokeredSource = z.preprocess((raw, ctx) => {
       });
     }
   });
-  // Refused above; left out so the union's own error doesn't repeat it.
+  // Refused above; left out so they don't also fail the http.request entry's schema.
   return raw.filter((e) => !removedEntry(e));
 }, Entries);
 
