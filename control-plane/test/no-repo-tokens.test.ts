@@ -105,6 +105,19 @@ describe("a sandbox", () => {
     });
   });
 
+  it("an operator layer a Worker of the previous release hands it with them is refused if they grant anything, else stored without them", async () => {
+    const { sandbox } = await placed();
+    const stub = sandboxStub(sandbox);
+    for (const layer of [{ repos: ["acme/app"] }, { read_repos: ["acme/lib"] }, { github_push: { workflows: true } }]) {
+      await expect(Promise.resolve().then(() => stub.setPolicy(layer as never)), JSON.stringify(layer)).rejects.toThrow(/is no longer accepted/);
+    }
+    await stub.setPolicy({ allow: [{ host: "api.example.com" }], repos: [], read_repos: [], github_push: { workflows: false } } as never);
+    await runInDurableObject(stub, (_i: SandboxDO, st) => {
+      const stored = JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'ws_layer'").one().value);
+      expect([has(stored), stored.allow]).toEqual([[], [{ host: "api.example.com" }]]);
+    });
+  });
+
   it("guards are only the base layer's, the operator's and its client's: nest constructs none of its own", async () => {
     const { sandbox, ws } = await placed({});
     expect((await adminJson(`/v1/sandboxes/${sandbox}/policy`)).guards).toEqual([]);
