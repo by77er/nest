@@ -2,8 +2,7 @@
 // the REST API for check runs, the repo and branch protection, and the pure rules that keep the
 // owner's branch protection while adding the review check. Every call carries a short-lived token of
 // the app's own GitHub App, minted for one repo with exactly the permissions it needs (src/github-app.ts,
-// README.md#github-tokens; nest's `POST /v1/clients/self/github-token` is the fallback for one release). The
-// token is never logged or put in an error.
+// README.md#github-tokens). The token is never logged or put in an error.
 //
 // GitHub's docs this follows:
 // - webhook signatures: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
@@ -14,8 +13,7 @@
 //   https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches
 
 import type { Env } from "./env";
-import { tokenSource } from "./github-app";
-import type { Nest } from "./nest";
+import { AppTokens } from "./github-app";
 
 export const GITHUB_API = "https://api.github.com";
 /** GitHub's REST version header (https://docs.github.com/en/rest/about-the-rest-api/api-versions). */
@@ -344,12 +342,12 @@ function pullOf(p: Record<string, unknown>, repo: string): Pull {
 }
 
 /**
- * A client with a token for `repo` with exactly `permissions`, from the app's own App (or nest's, the
- * fallback), knowing the App and the installation it's from. `fresh`: the repo's installation looked up now,
+ * A client with a token for `repo` with exactly `permissions`, from the app's own App, knowing the App and
+ * the installation it's from. `fresh`: the repo's installation looked up now,
  * not from the cache (a binding's read, README.md#the-repos-binding).
  */
-export async function githubFor(env: Env, nest: Nest, repo: string, permissions: Record<string, string>, o: { fresh?: boolean } = {}): Promise<GitHub> {
-  const t = await tokenSource(env, nest).token(repo, permissions, o);
+export async function githubFor(env: Env, repo: string, permissions: Record<string, string>, o: { fresh?: boolean } = {}): Promise<GitHub> {
+  const t = await new AppTokens(env).token(repo, permissions, o);
   return new GitHub(t.token, t.appId, t.installationId, t.stale);
 }
 
@@ -366,13 +364,13 @@ export function ownInstallation(minted: string, fullName: string, installation: 
 
 /**
  * The GitHub id of the App's bot account, `<app_slug>[bot]` (the author of what the App's tokens create,
- * workers' PRs among them), by the App's slug (`GET /app`, or nest's token answer in the fallback); null when
- * the slug isn't known or GitHub has no such bot. https://docs.github.com/en/rest/users/users#get-a-user
+ * workers' PRs among them), by the App's slug (`GET /app`); null when the slug isn't known or GitHub has no
+ * such bot. https://docs.github.com/en/rest/users/users#get-a-user
  */
-export async function appBotId(env: Env, nest: Nest, repo: string): Promise<number | null> {
-  const slug = await tokenSource(env, nest).appSlug(repo);
+export async function appBotId(env: Env, repo: string): Promise<number | null> {
+  const slug = await new AppTokens(env).appSlug();
   if (typeof slug !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(slug)) return null;
-  const gh = await githubFor(env, nest, repo, PERMISSIONS.metadata);
+  const gh = await githubFor(env, repo, PERMISSIONS.metadata);
   const u = await gh.call<{ id?: unknown; type?: unknown }>("GET", `/users/${slug}%5Bbot%5D`, undefined, { nullOn404: true });
   return u && u.type === "Bot" && typeof u.id === "number" && Number.isSafeInteger(u.id) && u.id > 0 ? u.id : null;
 }

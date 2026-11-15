@@ -1,0 +1,7 @@
+# The projects app drops its fallback to nest's GitHub tokens (2026-11-15)
+
+A release's rollout rule ([Rollout rules](../deploy.md#rollout-rules)), for the projects app ([GitHub tokens](../../projects/README.md#github-tokens)): B1's contract (`2026-11-12-projects-own-app-tokens.md`), after nest's C1 (`2026-11-15-grant-github-fields.md`) removed the routes the fallback called.
+
+**Not a one-way deploy, and no ordering constraint.** No Durable Object class, table, column, route or wire change.
+- **What changes at deploy:** the Worker secret `GITHUB_TOKEN_SOURCE` is no longer read: every GitHub token is the app's own App's, as it already was with the secret unset (C1's file checked it unset in production). ProjectDO's `settings.grant_seen` is written without `issues`: the grant's `issues` permission only re-tried refused issue closes for nest's tokens, and nest's grant no longer has it. A stored value with `issues` is compared by its layers part, as before, so it owes nothing.
+- **What a `wrangler rollback` does:** the previous release reads `GITHUB_TOKEN_SOURCE` again (unset: the App's tokens), and a `grant_seen` without `issues` as `issues: null`, which nest's grant also gives it now, so no issue close is retried and no layer is owed.

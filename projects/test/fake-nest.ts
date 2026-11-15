@@ -94,8 +94,6 @@ const id = (prefix: string) => `${prefix}${(++seq).toString(36)}${crypto.randomU
 
 export class FakeNest {
   readonly github = new FakeGitHub();
-  /** The App nest's token answers name; null: nest can't tell, and the answers leave it out. */
-  githubApp: { app_id: number; app_slug: string } | null = { app_id: GH_APP_ID, app_slug: GH_APP_SLUG };
   readonly calls: Call[] = [];
   readonly agents = new Map<string, FakeAgent>();
   readonly sandboxes = new Map<string, { sandbox: string; owner: string; labels: Record<string, string>; ended: boolean; github_push?: { workflows: boolean } | null; layer: { egress: { allow: unknown[] }; inject: unknown[]; env: Record<string, string>; guards?: unknown[] } }>();
@@ -155,14 +153,6 @@ export class FakeNest {
   grantRepos: string[] | null = null;
   /** The grant's `repos` (push) when a test needs it to differ from `github.repos`; null: the same as `grantRepos`. */
   pushRepos: string[] | null = null;
-  /**
-   * nest's answer for the grant's repos (`GET`/`POST /v1/clients/self/grant/repos`), as nest decides it
-   * (owner-wide entries included). Null: the grant isn't what a test is about, so it covers `grantRepos`
-   * (every repo while that's null too). `"missing"`: a nest from before those routes (404).
-   */
-  grantListing: { repos: { repo: string; push: boolean; read: boolean; github: boolean }[]; unlisted: string[]; complete: boolean } | null | "missing" = null;
-  /** The installation nest's token answer names (`installation_id`); null: none, as a nest from before #219. */
-  tokenInstallation: number | null = GH_INSTALLATION_ID;
   /** Play a control plane from before `GET /v1/asks`: a client's unknown route answers 401. */
   asksRouteMissing = false;
   /** The most agents a page of `GET /v1/asks` holds, below what the app asks for (to make it page). */
@@ -511,14 +501,6 @@ export class FakeNest {
       this.catalog.set(`${m[1]}/${m[2]}/${m[3]}`, call.body);
       return json(200, { ok: true });
     }
-    if ((r === "GET /v1/clients/self/grant/repos" || r === "POST /v1/clients/self/grant/repos") && this.grantListing === "missing") return nestErr(404, "not_found", "no route");
-    const all = (repo: string) => ({ repo, push: true, read: true, github: true });
-    const listing = this.grantListing === "missing" ? null : this.grantListing ?? { repos: (this.grantRepos ?? []).map(all), unlisted: [], complete: true };
-    if (r === "GET /v1/clients/self/grant/repos") return json(200, listing);
-    if (r === "POST /v1/clients/self/grant/repos") {
-      const covered = (x: string) => listing!.repos.find((l) => l.repo === x) ?? (this.grantListing === null && this.grantRepos === null ? all(x) : { repo: x, push: false, read: false, github: false });
-      return json(200, { repos: (call.body as { repos: string[] }).repos.map((x) => covered(x.toLowerCase())) });
-    }
     if (r === "GET /v1/clients/self") return json(200, { client: CLIENT, name: "projects", grant: { ...this.grant, egress_hosts: this.egressHosts, repos: this.pushRepos ?? this.grantRepos ?? [], github: { repos: this.grantRepos ?? [], permissions: { ...GRANT_PERMISSIONS } } }, created_ms: 1 });
     if (r === "GET /v1/clients/self/secrets") {
       return json(200, { secrets: [...this.secrets].sort(([a], [b]) => a.localeCompare(b)).map(([name, x]) => ({ name, description: x.description, size: new TextEncoder().encode(x.value).length, created_ms: x.created_ms, updated_ms: x.updated_ms, last_injected_ms: x.last_injected_ms })) });
@@ -540,22 +522,6 @@ export class FakeNest {
         this.secrets.set(name, { value, description: description ?? null, created_ms: had?.created_ms ?? now, updated_ms: now, last_injected_ms: had?.last_injected_ms ?? null, expires_ms: expires });
         return json(200, { name, description: description ?? null, size, created_ms: had?.created_ms ?? now, updated_ms: now, last_injected_ms: had?.last_injected_ms ?? null });
       }
-    }
-    if (r === "POST /v1/clients/self/github-token") {
-      // Within the grant (README.md#how-it-uses-nest), as nest checks it: the repo and each permission.
-      const { repo, permissions } = call.body as { repo: string; permissions: Record<string, string> };
-      if (!Object.keys(permissions ?? {}).length) return nestErr(400, "invalid", "name at least one permission");
-      for (const [k, v] of Object.entries(permissions)) {
-        if (!levelWithin(v, GRANT_PERMISSIONS[k])) return nestErr(403, "forbidden", `${k}: ${v} is outside the grant`);
-      }
-      if (this.grantRepos && !this.grantRepos.includes(repo.toLowerCase())) return nestErr(403, "forbidden", `${repo} is outside the grant`);
-      const token = this.github.mint(repo, permissions);
-      // The App it's from, unless nest could tell none (the answer of nest's route before it went).
-      const app = this.githubApp ? { app_id: this.githubApp.app_id, app_slug: this.githubApp.app_slug } : {};
-      // And the installation it was minted from (one installation in this fake).
-      // The installation it's minted from, unless the test plays a nest from before it was named.
-      const installation = this.tokenInstallation === null ? {} : { installation_id: this.tokenInstallation };
-      return json(200, { token, expires_at: new Date(Date.now() + 3600_000).toISOString(), repo: repo.toLowerCase(), permissions, ...installation, ...app });
     }
     return nestErr(404, "not_found", `no route for ${r}`);
   }
@@ -581,7 +547,7 @@ export class FakeNest {
 }
 
 /** Run `fn` with one of the env's values set (undefined: unset), as the Worker and its objects read the env they share with the tests. */
-export async function withEnv<T>(name: "GITHUB_TOKEN_SOURCE" | "GITHUB_ACCOUNTS", value: string | undefined, fn: () => Promise<T>): Promise<T> {
+export async function withEnv<T>(name: "GITHUB_ACCOUNTS", value: string | undefined, fn: () => Promise<T>): Promise<T> {
   const e = env as unknown as Record<string, unknown>;
   const had = e[name];
   if (value === undefined) delete e[name];
@@ -593,9 +559,6 @@ export async function withEnv<T>(name: "GITHUB_TOKEN_SOURCE" | "GITHUB_ACCOUNTS"
     else e[name] = had;
   }
 }
-
-/** Run `fn` with the app's GitHub tokens from nest (`GITHUB_TOKEN_SOURCE=nest`, the fallback); the App's own after. */
-export const withNestTokens = <T>(fn: () => Promise<T>): Promise<T> => withEnv("GITHUB_TOKEN_SOURCE", "nest", fn);
 
 /** Install `fake` as nest (and Cloudflare Access's certs, when given) for the Worker and its objects. */
 /** The fake GitHub the installed fetch answers from: events name their repo's owner as it answers (`deliverGithub`). */

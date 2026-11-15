@@ -22,7 +22,7 @@ export async function syncRepos(env: Env): Promise<{ ok: true; written: string[]
   if (!nest) return { ok: false, status: 503, error: "NEST_CLIENT_TOKEN is not set" };
   try {
     // Each project's repo binding first (README.md#the-repos-binding): an id for one with none, a rename applied.
-    await bindAll(env, nest);
+    await bindAll(env);
     const r = await syncCatalog(nest, env.PUBLIC_BASE_URL);
     const repos = await directory(env).repos();
     await directory(env).recordSync({ written: r.written, repos });

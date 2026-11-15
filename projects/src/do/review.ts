@@ -861,9 +861,9 @@ export class ReviewDO extends DurableObject<Env> {
     }
     this.repoRetryAt = 0;
     if (!repo) return;
-    // One token per run, minted when first needed (nest caches it besides).
+    // One token per run, minted when first needed (the App's tokens are cached besides).
     let gh: Promise<GitHub> | null = null;
-    const github = () => (gh ??= githubFor(this.env, nest, repo, PERMISSIONS.checks));
+    const github = () => (gh ??= githubFor(this.env, repo, PERMISSIONS.checks));
     const now = Date.now();
     for (const r of this.sql.exec("SELECT check_run FROM check_updates WHERE next_ms <= ?", now).toArray()) await this.sendCheck(github, repo, r.check_run as number);
     for (const r of this.sql.exec("SELECT agent FROM stops WHERE failed_ms IS NULL AND next_ms <= ?", now).toArray()) await this.stop(nest, r.agent as string);
@@ -905,7 +905,7 @@ export class ReviewDO extends DurableObject<Env> {
         }))!;
         const appId = made.app?.id;
         if (typeof appId === "number" && this.setting("github_app_id") !== String(appId)) {
-          // The App's id, if the token's source didn't name it: the project pins its required check to it.
+          // The App's id as its check run names it (none recorded yet, or another App's): the project pins its required check to it.
           await directory(this.env).recordGithubAppId(appId);
           await projectStub(this.env, project).appIdLearned(appId);
           this.setSetting("github_app_id", String(appId));

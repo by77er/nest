@@ -845,7 +845,7 @@ export class ProjectDO extends DurableObject<Env> {
       if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
       try {
         // The bound repo's: never whoever holds its name now, if that's another repo.
-        const bound = await this.boundOwner(nest);
+        const bound = await this.boundOwner();
         if ("problem" in bound) return fail(409, bound.problem);
         const owner = bound.owner;
         if (owner.type !== "User") return fail(400, `the repo's owner, ${owner.login}, is an organization: set a person's login`);
@@ -861,7 +861,7 @@ export class ProjectDO extends DurableObject<Env> {
         const nest = nestFrom(this.env);
         if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
         try {
-          const found = await (await githubFor(this.env, nest, await this.repo(), PERMISSIONS.metadata)).user(u.comments_from_login);
+          const found = await (await githubFor(this.env, await this.repo(), PERMISSIONS.metadata)).user(u.comments_from_login);
           if (!found) return fail(400, `GitHub has no user ${u.comments_from_login}`);
           if (found.type !== "User") return fail(400, `${found.login} is ${found.type === "Organization" ? "an organization" : "a bot"}, not a person: its comments can't be the owner's`);
           who = { id: found.id, login: found.login };
@@ -1287,11 +1287,11 @@ export class ProjectDO extends DurableObject<Env> {
    * the repo's name, and refused when GitHub's repo for it isn't the one bound, or the binding isn't read from
    * GitHub yet (the name may be another account's repo now).
    */
-  private async boundOwner(nest: Nest): Promise<{ owner: { id: number; login: string; type: string } } | { problem: string; unbound?: true }> {
+  private async boundOwner(): Promise<{ owner: { id: number; login: string; type: string } } | { problem: string; unbound?: true }> {
     const b = await directory(this.env).binding(this.settingsRow()!.id as string);
     if (!b) throw new Error("the project isn't in the directory");
     if (b.bound !== "github" || b.repo_id === null) return { problem: "the repo's binding isn't read from GitHub yet: Re-read it on the Admin page", unbound: true };
-    const info = await (await githubFor(this.env, nest, b.repo, PERMISSIONS.metadata)).repoInfo(b.repo);
+    const info = await (await githubFor(this.env, b.repo, PERMISSIONS.metadata)).repoInfo(b.repo);
     if (info.id !== b.repo_id) return { problem: `GitHub's ${b.repo} is repo ${info.id}, not the bound repo ${b.repo_id}: Re-read the binding on the Admin page` };
     return { owner: info.owner };
   }
@@ -1532,10 +1532,10 @@ export class ProjectDO extends DurableObject<Env> {
     let owner: number | null;
     try {
       const repo = await this.repo();
-      const bound = await this.boundOwner(nest);
+      const bound = await this.boundOwner();
       if ("problem" in bound && !bound.unbound) return fail(409, `the issues weren't imported: ${bound.problem}`);
       owner = "owner" in bound && bound.owner.type === "User" ? bound.owner.id : null;
-      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.issuesRead);
+      const gh = await githubFor(this.env, repo, PERMISSIONS.issuesRead);
       list = await gh.openIssues(repo);
     } catch (e) {
       return fail(e instanceof NestError || e instanceof GitHubError ? (e.status === 403 ? 403 : 502) : 502, `the issues couldn't be read: ${message(e)}`);
@@ -1564,9 +1564,9 @@ export class ProjectDO extends DurableObject<Env> {
 
   /**
    * Close a done task's issue on GitHub (Issues: write): a comment naming the PR, then closed as
-   * completed. A refusal that will repeat (the grant lacks `issues: write`, the issue is gone) is
-   * recorded on the task and waits: for the grant to change (`grantSeen`), or the owner's retry
-   * (`retryIssueClose`). Anything else is retried from the alarm.
+   * completed. A refusal that will repeat (the App's installation lacks `issues: write`, the issue is gone)
+   * is recorded on the task and waits for the owner's retry (`retryIssueClose`). Anything else is retried
+   * from the alarm.
    */
   private async closeIssue(nest: Nest, task: string): Promise<void> {
     const s = this.settings()!;
@@ -1577,7 +1577,7 @@ export class ProjectDO extends DurableObject<Env> {
     const line = row.pr !== null ? `Done in #${row.pr as number}.` : "Done.";
     try {
       const repo = await this.repo();
-      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.issuesWrite);
+      const gh = await githubFor(this.env, repo, PERMISSIONS.issuesWrite);
       // The comment once: not again on a retry after it landed (the close failed), nor when it landed but
       // its answer was lost (it's among the issue's comments since the close was owed).
       if (row.commented !== 1) {
@@ -1711,7 +1711,7 @@ export class ProjectDO extends DurableObject<Env> {
     let repo = "the repo";
     try {
       repo = await this.repo();
-      p = await (await githubFor(this.env, nest, repo, PERMISSIONS.pullsRead)).pull(repo, pr);
+      p = await (await githubFor(this.env, repo, PERMISSIONS.pullsRead)).pull(repo, pr);
     } catch (e) {
       return fail(e instanceof GitHubError && e.status === 404 ? 404 : 502, e instanceof GitHubError && e.status === 404 ? `no PR #${pr} on ${repo}` : message(e));
     }
@@ -1744,7 +1744,7 @@ export class ProjectDO extends DurableObject<Env> {
     if (!nest) return fail(503, "NEST_CLIENT_TOKEN is not set");
     try {
       const repo = await this.repo();
-      const list = await (await githubFor(this.env, nest, repo, PERMISSIONS.pullsRead)).openPulls(repo);
+      const list = await (await githubFor(this.env, repo, PERMISSIONS.pullsRead)).openPulls(repo);
       return ok(list.map((p) => {
         const row = this.prRow(p.number);
         return { number: p.number, title: p.title, head: p.head_ref, fork: p.fork, task: row && row.state !== "detached" ? (row.task as string) : null };
@@ -1971,7 +1971,7 @@ export class ProjectDO extends DurableObject<Env> {
    * tell each worker, in one step, the conditions it wasn't told of yet at its PR's head: a failed review, a
    * failed check, a conflict with the base. The only thing written of it is that it was told (`pr_told`).
    */
-  private async readPrUpkeep(nest: Nest): Promise<void> {
+  private async readPrUpkeep(): Promise<void> {
     const s = this.settings()!;
     const owned = this.prOwners();
     if (!owned.length) {
@@ -1985,7 +1985,7 @@ export class ProjectDO extends DurableObject<Env> {
     let verdicts: Record<string, Verdict>;
     try {
       const repo = await this.repo();
-      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.prRead);
+      const gh = await githubFor(this.env, repo, PERMISSIONS.prRead);
       prs = await readPrs(gh, repo, owned.map((o) => o.pr));
       const heads = [...prs.values()].filter((p): p is PrNow => p !== null && p.state === "OPEN" && !p.cross_repo).map((p) => ({ pr: p.number, sha: p.head_sha }));
       verdicts = heads.length ? await review(this.env, s.id).verdictsAt(heads) : {};
@@ -3129,32 +3129,19 @@ export class ProjectDO extends DurableObject<Env> {
   /**
    * The grant as read (here, or by the Worker): when its hosts changed since last seen, every live layer
    * is owed again, so a secret left out for a narrowed grant comes back once it's widened, and goes
-   * once it's narrowed, without anyone saving anything. When its `issues` permission changed to one
-   * that can close an issue, each issue close GitHub refused for good is tried again.
+   * once it's narrowed, without anyone saving anything.
    */
   async grantSeen(g: Grant): Promise<void> {
     const layers = { inject: [...(g.inject_hosts ?? [])].sort(), egress: g.egress_hosts ? [...g.egress_hosts].sort() : null, workflows: g.github_push?.workflows === true };
-    const issues = typeof g.github?.permissions?.issues === "string" ? g.github.permissions.issues : null;
-    const seen = JSON.stringify({ ...layers, issues });
+    const seen = JSON.stringify(layers);
     const before = this.settingsRow()?.grant_seen as string | null | undefined;
     if (before === undefined || before === seen) return;
     this.sql.exec("UPDATE settings SET grant_seen = ?", seen);
     if (before === null) return;
-    // Seen before `issues` was kept (an earlier release): its layers part compares as it was.
-    const was = JSON.parse(before) as typeof layers & { issues?: string | null };
-    let owed = false;
-    if (JSON.stringify({ inject: was.inject, egress: was.egress, workflows: was.workflows }) !== JSON.stringify(layers)) {
-      await this.oweLayers(LAYER_ROLES);
-      owed = true;
-    }
-    if ((was.issues ?? null) !== issues && (issues === "write" || issues === "admin")) {
-      // Each failed one is asked again, as the owner's Retry would (README.md#outboxes).
-      for (const r of this.sql.exec("SELECT * FROM issue_closes WHERE next_ms IS NULL AND closed_ms IS NULL").toArray()) {
-        this.outbox("issue_closes", "task", r.task as string, r, { kind: "retry" }, OUTBOX.issue_closes);
-      }
-      owed = true;
-    }
-    if (!owed) return;
+    // Its layers part only: an earlier release's kept `issues` too.
+    const was = JSON.parse(before) as typeof layers;
+    if (JSON.stringify({ inject: was.inject, egress: was.egress, workflows: was.workflows }) === JSON.stringify(layers)) return;
+    await this.oweLayers(LAYER_ROLES);
     // Applied in this drain, not the next alarm's; once per drain, so a flapping grant can't loop it.
     if (this.draining && !this.reowed) {
       this.reowed = true;
@@ -4591,7 +4578,7 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT id FROM routine_runs WHERE cleanup_next_ms IS NOT NULL AND cleanup_next_ms <= ?", now).toArray()) {
       await this.cleanRun(nest, r.id as string);
     }
-    if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo(nest);
+    if (s.attach_next_ms !== null && (s.attach_next_ms as number) <= now) await this.attachRepo();
     if (s.refusal_check_ms !== null && (s.refusal_check_ms as number) <= now && s.manager !== null) await this.checkRefusal(nest);
     // Read again: a refusal just counted puts the switch off.
     const sw = this.settingsRow()!;
@@ -4602,13 +4589,13 @@ export class ProjectDO extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT task, start FROM abandoned WHERE next_ms <= ?", now).toArray()) await this.cleanAbandoned(nest, r.task as string, r.start as number);
     for (const r of this.sql.exec("SELECT labels FROM abandoned_starts WHERE next_ms <= ?", now).toArray()) await this.cleanAbandonedStart(nest, r.labels as string);
     for (const r of this.sql.exec("SELECT task FROM issue_closes WHERE next_ms IS NOT NULL AND next_ms <= ?", now).toArray()) await this.closeIssue(nest, r.task as string);
-    if (s.am_write_next_ms !== null && (s.am_write_next_ms as number) <= now) await this.writeRepoAutoMerge(nest);
-    if (s.am_read_next_ms !== null && (s.am_read_next_ms as number) <= now) await this.readRepoAutoMerge(nest);
+    if (s.am_write_next_ms !== null && (s.am_write_next_ms as number) <= now) await this.writeRepoAutoMerge();
+    if (s.am_read_next_ms !== null && (s.am_read_next_ms as number) <= now) await this.readRepoAutoMerge();
     // A PR's auto-merge is enabled only once the repo allows it; disabling needn't wait.
     const w = this.settingsRow()!;
     const repoReady = w.am_write_next_ms === null && w.am_write_error === null;
     for (const r of this.sql.exec("SELECT pr, am_owed FROM task_prs WHERE am_next_ms IS NOT NULL AND am_next_ms <= ?", now).toArray()) {
-      if (r.am_owed === "disable" || repoReady) await this.prAutoMerge(nest, r.pr as number);
+      if (r.am_owed === "disable" || repoReady) await this.prAutoMerge(r.pr as number);
     }
     // A manager on nest's repos is replaced between turns (README.md#converging-onto-the-apps-own-access); its
     // successor's start is due at once, below.
@@ -4637,7 +4624,7 @@ export class ProjectDO extends DurableObject<Env> {
     // A comment's key outlives any redelivery GitHub makes of it.
     this.sql.exec("DELETE FROM comments_seen WHERE at_ms < ?", now - COMMENTS_SEEN_KEEP_MS);
     const prRead = this.prReadDue();
-    if (prRead !== null && prRead <= now) await this.readPrUpkeep(nest);
+    if (prRead !== null && prRead <= now) await this.readPrUpkeep();
     for (const r of this.sql.exec("SELECT seq FROM chat WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverChat(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT seq FROM messages WHERE next_ms IS NOT NULL AND next_ms <= ? ORDER BY seq", now).toArray()) await this.deliverMessage(nest, r.seq as number);
     for (const r of this.sql.exec("SELECT id FROM tasks WHERE notify_next_ms IS NOT NULL AND notify_next_ms <= ?", now).toArray()) await this.notifyWorker(nest, r.id as string);
@@ -4646,12 +4633,12 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** Write the repo's "Allow auto-merge" to the setting's value (`PATCH /repos/{o}/{r}`). */
-  private async writeRepoAutoMerge(nest: Nest): Promise<void> {
+  private async writeRepoAutoMerge(): Promise<void> {
     const s = this.settings()!;
     const want = s.auto_merge;
     try {
       const repo = await this.repo();
-      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.repoSettings);
+      const gh = await githubFor(this.env, repo, PERMISSIONS.repoSettings);
       const after = await gh.setAllowAutoMerge(repo, want);
       const now = Date.now();
       const seen = JSON.stringify({ value: want, at_ms: now } satisfies Seen);
@@ -4671,10 +4658,10 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** Read the repo's "Allow auto-merge" (`GET /repos/{o}/{r}`), to show a change made by hand. */
-  private async readRepoAutoMerge(nest: Nest): Promise<void> {
+  private async readRepoAutoMerge(): Promise<void> {
     try {
       const repo = await this.repo();
-      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.repoRead);
+      const gh = await githubFor(this.env, repo, PERMISSIONS.repoRead);
       const value = await gh.allowAutoMerge(repo);
       this.sql.exec("UPDATE settings SET am_observed = ?, am_read_next_ms = NULL, am_read_attempts = 0", JSON.stringify({ value, at_ms: Date.now() } satisfies Seen));
     } catch (e) {
@@ -4685,7 +4672,7 @@ export class ProjectDO extends DurableObject<Env> {
   }
 
   /** Enable or disable GitHub's auto-merge on a PR, as owed, recording the result on its task. */
-  private async prAutoMerge(nest: Nest, pr: number): Promise<void> {
+  private async prAutoMerge(pr: number): Promise<void> {
     const before = this.prRow(pr);
     if (!before?.am_owed || !before.node) return;
     const id = before.task as string;
@@ -4695,7 +4682,7 @@ export class ProjectDO extends DurableObject<Env> {
     const github: Actor = { kind: "app", what: "github" };
     const still = () => this.prRow(pr)?.am_owed === what;
     try {
-      const gh = await githubFor(this.env, nest, await this.repo(), PERMISSIONS.autoMerge);
+      const gh = await githubFor(this.env, await this.repo(), PERMISSIONS.autoMerge);
       if (what === "enable") await gh.enableAutoMerge(before.node as string, GRAPHQL_METHOD[method]);
       else await gh.disableAutoMerge(before.node as string);
       const status: TaskAutoMerge = { state: what === "enable" ? "enabled" : "disabled", method: what === "enable" ? method : null, error: null, at_ms: Date.now() };
@@ -4722,15 +4709,15 @@ export class ProjectDO extends DurableObject<Env> {
    * (src/github.ts `requireReviewCheck`). A refusal that will repeat (the App not installed, the repo
    * outside the grant, no admin) waits for the owner's retry; anything else is retried from the alarm.
    */
-  private async attachRepo(nest: Nest): Promise<void> {
+  private async attachRepo(): Promise<void> {
     const s = this.settings()!;
     // An attach owed again while this one runs (a new generation) stays owed, whatever this one's outcome.
     const gen = this.settingsRow()!.attach_gen as number;
     try {
       const repo = await this.repo();
       // The installation looked up now (the binding stores it), never a cached one.
-      const gh = await githubFor(this.env, nest, repo, PERMISSIONS.attach, { fresh: true });
-      // The App's id (the App's own, or nest's token answer in the fallback); else one a check run told, if any has yet.
+      const gh = await githubFor(this.env, repo, PERMISSIONS.attach, { fresh: true });
+      // The App's id; else one a check run told, if any has yet.
       const appId = gh.appId ?? (await directory(this.env).githubAppId());
       if (gh.appId !== null) await directory(this.env).recordGithubAppId(gh.appId);
       const r = await requireReviewCheck(gh, repo, appId);

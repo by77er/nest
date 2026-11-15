@@ -1,8 +1,7 @@
 // The app's own GitHub App (README.md#github-tokens): the tokens every call to GitHub carries. The App's id and
 // private key are the Worker's secrets (`GITHUB_APP_ID`, `GITHUB_APP_PRIVATE_KEY`, a PKCS#1 PEM). Its JWT is
 // signed here with WebCrypto; each token is an installation token for one repo with exactly the permissions
-// its call needs. nest's `POST /v1/clients/self/github-token` is the fallback for one release
-// (`GITHUB_TOKEN_SOURCE=nest`). A token, the JWT and the key are never logged or put in an error.
+// its call needs. A token, the JWT and the key are never logged or put in an error.
 //
 // GitHub's docs this follows:
 // - the JWT: https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/generating-a-json-web-token-jwt-for-a-github-app
@@ -14,7 +13,6 @@
 
 import type { Env } from "./env";
 import { GitHub, GitHubError } from "./github";
-import type { Nest } from "./nest";
 
 /** A cached token with less than this left is minted again (as nest's own reuse). */
 export const TOKEN_REUSE_MS = 10 * 60_000;
@@ -27,26 +25,12 @@ const JWT_SLACK_S = 60;
 /** One token for one call, with what it came from. */
 export interface Minted {
   token: string;
-  /** The App the token is from; null when the source can't tell. */
-  appId: number | null;
-  /** The installation it was minted from; null when the source can't tell. */
-  installationId: number | null;
+  /** The App the token is from. */
+  appId: number;
+  /** The installation it was minted from. */
+  installationId: number;
   /** GitHub refused the token (a 401 or 404): drop it, and the repo's installation, so the next call looks again. */
   stale: () => void;
-}
-
-/** Where the app's GitHub tokens come from: its own App, or nest's (the fallback). */
-export interface TokenSource {
-  readonly kind: "app" | "nest";
-  /** `fresh`: look the repo's installation up now, not from the cache (a binding's read). */
-  token(repo: string, permissions: Record<string, string>, o?: { fresh?: boolean }): Promise<Minted>;
-  /** The App's slug (its bot is `<slug>[bot]`); null when the source can't tell. */
-  appSlug(repo: string): Promise<string | null>;
-}
-
-/** The source the Worker's env picks: nest's only when `GITHUB_TOKEN_SOURCE` is `nest`, else the App's own. */
-export function tokenSource(env: Pick<Env, "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY" | "GITHUB_ACCOUNTS" | "GITHUB_TOKEN_SOURCE">, nest: Nest): TokenSource {
-  return env.GITHUB_TOKEN_SOURCE?.trim().toLowerCase() === "nest" ? new NestTokens(nest) : new AppTokens(env);
 }
 
 const positiveId = (v: unknown) => (typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? v : null);
@@ -148,16 +132,14 @@ export function appTokenCache(): { installations: Record<string, number>; tokens
 const permissionsKey = (p: Record<string, string>) => Object.keys(p).sort().map((k) => `${k}:${p[k]}`).join(",");
 
 /** The App's own tokens, from its id and key in the Worker's env. */
-export class AppTokens implements TokenSource {
-  readonly kind = "app";
-
+export class AppTokens {
   constructor(private readonly env: Pick<Env, "GITHUB_APP_ID" | "GITHUB_APP_PRIVATE_KEY" | "GITHUB_ACCOUNTS">) {}
 
   private app(): AppCache {
     const appId = this.env.GITHUB_APP_ID?.trim() ?? "";
     const pem = this.env.GITHUB_APP_PRIVATE_KEY ?? "";
     if (!/^[1-9][0-9]{0,15}$/.test(appId) || !pem.includes("PRIVATE KEY")) {
-      // Not a refusal: retried, as an outage is, while the operator sets the secrets (or GITHUB_TOKEN_SOURCE=nest).
+      // Not a refusal: retried, as an outage is, while the operator sets the secrets.
       throw new GitHubError(503, "the App's secrets GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY aren't set", false);
     }
     if (!cache || cache.appId !== appId || cache.pem !== pem) {
@@ -411,22 +393,5 @@ export class AppTokens implements TokenSource {
 
   async appSlug(): Promise<string | null> {
     return (await this.identity(this.app())).slug;
-  }
-}
-
-/** nest's tokens (`POST /v1/clients/self/github-token`): the fallback for one release. nest caches them. */
-export class NestTokens implements TokenSource {
-  readonly kind = "nest";
-
-  constructor(private readonly nest: Nest) {}
-
-  async token(repo: string, permissions: Record<string, string>): Promise<Minted> {
-    const t = await this.nest.githubToken(repo, permissions);
-    return { token: t.token, appId: positiveId(t.app_id), installationId: positiveId(t.installation_id), stale: () => {} };
-  }
-
-  async appSlug(repo: string): Promise<string | null> {
-    const t = await this.nest.githubToken(repo, { metadata: "read" });
-    return typeof t.app_slug === "string" ? t.app_slug : null;
   }
 }

@@ -291,7 +291,7 @@ export class DirectoryDO extends DurableObject<Env> {
    * name taken): no project. A project whose App installation is known takes only events from that
    * installation (`installation.id`): any other, or none, is refused (README.md#the-repos-binding). One with none
    * known yet refuses an event whose repo owner isn't an account the app acts for (`ownerAllowed` false, the
-   * Worker's answer; null: not checked, the fallback's).
+   * Worker's answer; null: not checked).
    */
   async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null, ownerAllowed: boolean | null = null): Promise<{ project: ProjectRow; anchored: boolean; recorded_owner: number | null } | { refused: string; project_id: string } | null> {
     const one = (where: string, v: SqlStorageValue) =>

@@ -33,8 +33,6 @@ export interface Env {
    * separated; ids only, nothing turns the check off). README.md#repo-authority.
    */
   GITHUB_ACCOUNTS?: string;
-  /** `nest`: the app's GitHub tokens come from nest's `POST /v1/clients/self/github-token` (the fallback, for one release); anything else, or unset: from the App. */
-  GITHUB_TOKEN_SOURCE?: string;
 }
 
 export const directory = (env: Env) => env.DIRECTORY.get(env.DIRECTORY.idFromName("directory"));
