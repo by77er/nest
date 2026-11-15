@@ -204,7 +204,7 @@ function BoundDetail({ b, s, card = false }: { b: RepoBinding; s: ReturnType<typ
           <Text component="span" ff="monospace" inherit>
             {b.renamed_to}
           </Text>
-          : applied once nest&apos;s grant names it
+          : applied once the GitHub App reaches it
         </Text>
       )}
       {b.refused && (

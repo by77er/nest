@@ -340,6 +340,25 @@ describe("live agents", () => {
     }
   });
 
+  it("a grant last seen by the previous release (its `issues` kept too) owes no layer when its hosts are unchanged", async () => {
+    const p = await newProject();
+    await put(p, "cf_token", cf(valueOf("a")));
+    await drain(p);
+    const stub = env.PROJECT.get(env.PROJECT.idFromName(p.id));
+    const upkeep = () => runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0");
+    }).then(() => drain(p));
+    await upkeep();
+    await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => {
+      const seen = JSON.parse(st.storage.sql.exec("SELECT grant_seen FROM settings").one().grant_seen as string);
+      st.storage.sql.exec("UPDATE settings SET grant_seen = ?", JSON.stringify({ ...seen, issues: "write" }));
+    });
+    const before = layerPuts(p.manager).length;
+    await upkeep();
+    expect(layerPuts(p.manager).length).toBe(before);
+    expect(await runInDurableObject(stub, (_i: unknown, st: DurableObjectState) => JSON.parse(st.storage.sql.exec("SELECT grant_seen FROM settings").one().grant_seen as string))).not.toHaveProperty("issues");
+  });
+
   it("a value write racing a delete can't record the deleted generation's name again", async () => {
     const p = await newProject();
     await put(p, "cf_token", cf(valueOf("a")));

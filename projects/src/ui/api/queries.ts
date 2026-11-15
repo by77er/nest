@@ -296,7 +296,7 @@ export const useImportIssues = (id: string) => useTriageWrite(id, () => api.impo
 
 export const useSyncState = () => useQuery({ queryKey: keys.syncState, queryFn: api.syncState });
 
-/** The repos a new project may be attached to (nest's answer), read when the form opens. */
+/** The repos a new project may be attached to (the App's installations'), read when the form opens. */
 export const useAttachableRepos = () => useQuery({ queryKey: keys.attachableRepos, queryFn: api.attachableRepos });
 
 // --- writes -----------------------------------------------------------------------------------------

@@ -7,7 +7,6 @@
 import { directory, type Env, project, review } from "./env";
 import { githubFor, ownInstallation, PERMISSIONS } from "./github";
 import { notCovered, repoAttachable } from "./installations";
-import type { Nest } from "./nest";
 import type { BindOutcome, GithubRepo, RepoBinding } from "./do/directory";
 
 const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 500);
@@ -17,7 +16,7 @@ const message = (e: unknown) => (e instanceof Error ? e.message : String(e)).sli
  * operator's re-read). Read by the name GitHub last gave it, so an old name taken by another repo since
  * isn't read; with a token for that name, or (the App not on it yet) for the name the project has.
  */
-export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill" | "check" | "replace", shownId?: number): Promise<BindOutcome> {
+export async function readBinding(env: Env, id: string, mode: "fill" | "check" | "replace", shownId?: number): Promise<BindOutcome> {
   const dir = directory(env);
   const b = await dir.binding(id);
   if (!b) return { ok: false, error: "unknown project", binding: null };
@@ -29,12 +28,12 @@ export async function readBinding(env: Env, nest: Nest, id: string, mode: "fill"
     let current = true;
     try {
       // The installation looked up now, never a cached one: the binding follows a reinstall at once.
-      gh = await githubFor(env, nest, name, PERMISSIONS.metadata, { fresh: true });
+      gh = await githubFor(env, name, PERMISSIONS.metadata, { fresh: true });
     } catch (e) {
-      // The App doesn't reach the new name yet (not installed, or not in its installation's repos; nest's 403 in
-      // the fallback): a token for the name the project has reads the same repo.
+      // The App doesn't reach the new name yet (not installed, or not in its installation's repos): a token for
+      // the name the project has reads the same repo.
       if (!(b.renamed_to && notCovered(e))) throw e;
-      gh = await githubFor(env, nest, b.repo, PERMISSIONS.metadata, { fresh: true });
+      gh = await githubFor(env, b.repo, PERMISSIONS.metadata, { fresh: true });
       current = false;
     }
     const r = await gh.repoInfo(name);
@@ -68,11 +67,11 @@ export type RenameOutcome = { applied: string } | { blocked: string } | null;
  * it from there, so a rename reaches them all at once and they can't disagree. Only once the App's
  * installation reaches the new name (README.md#repo-authority).
  */
-export async function applyRename(env: Env, nest: Nest, b: RepoBinding): Promise<RenameOutcome> {
+export async function applyRename(env: Env, b: RepoBinding): Promise<RenameOutcome> {
   const to = b.renamed_to;
   if (!to) return null;
   // GitHub decides whether the App reaches the new name: its installation there, and that installation's repos.
-  if (!(await repoAttachable(env, nest, to))) return { blocked: `the app's GitHub App doesn't reach ${to} yet (not installed there, or not among its installation's repos): add it, then re-read` };
+  if (!(await repoAttachable(env, to))) return { blocked: `the app's GitHub App doesn't reach ${to} yet (not installed there, or not among its installation's repos): add it, then re-read` };
   const dir = directory(env);
   if (await dir.projectByName(to, b.project)) return { blocked: `${to} is another project's repo` };
   if (!(await dir.renameRepo(b.project, to))) return { blocked: "the rename changed while it was applied: re-read" };
@@ -111,11 +110,11 @@ export async function writeOldCopies(env: Env, id: string, name: string, b?: Rep
  * binding's installation changed, so the event is to be routed again (and refused again, and counted, if the
  * binding took another one than the event's).
  */
-export async function followInstallation(env: Env, nest: Nest, id: string): Promise<boolean> {
+export async function followInstallation(env: Env, id: string): Promise<boolean> {
   const dir = directory(env);
   if (!(await dir.claimInstallationCheck(id))) return false;
   const before = (await dir.binding(id))?.installation_id ?? null;
-  const r = await readBinding(env, nest, id, "fill");
+  const r = await readBinding(env, id, "fill");
   return r.binding !== null && r.binding.installation_id !== before;
 }
 
@@ -125,17 +124,17 @@ export async function followInstallation(env: Env, nest: Nest, id: string): Prom
  * answers now), each rename applied that can be, and the previous release's copies of the name written
  * again. Never fails the sync: what didn't bind is kept on the binding.
  */
-export async function bindAll(env: Env, nest: Nest): Promise<void> {
+export async function bindAll(env: Env): Promise<void> {
   for (const b of await directory(env).bindings()) {
     try {
       let now: RepoBinding | null = b;
       // No id, one taken from an event, no installation yet (bound before nest named it), a rename or
       // transfer noted, or events refused (another installation): read from GitHub.
       if (b.repo_id === null || b.bound !== "github" || b.installation_id === null || b.renamed_to !== null || b.refused !== null) {
-        const r = await readBinding(env, nest, b.project, "fill");
+        const r = await readBinding(env, b.project, "fill");
         now = r.binding;
       }
-      if (now?.renamed_to) await applyRename(env, nest, now);
+      if (now?.renamed_to) await applyRename(env, now);
       const after = await directory(env).binding(b.project);
       if (after) await writeOldCopies(env, b.project, after.repo, after);
     } catch (e) {

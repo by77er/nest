@@ -2,8 +2,7 @@
 // the REST API for check runs, the repo and branch protection, and the pure rules that keep the
 // owner's branch protection while adding the review check. Every call carries a short-lived token of
 // the app's own GitHub App, minted for one repo with exactly the permissions it needs (src/github-app.ts,
-// README.md#github-tokens; nest's `POST /v1/clients/self/github-token` is the fallback for one release). The
-// token is never logged or put in an error.
+// README.md#github-tokens). The token is never logged or put in an error.
 //
 // GitHub's docs this follows:
 // - webhook signatures: https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
@@ -14,8 +13,7 @@
 //   https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches
 
 import type { Env } from "./env";
-import { tokenSource } from "./github-app";
-import type { Nest } from "./nest";
+import { AppTokens } from "./github-app";
 
 export const GITHUB_API = "https://api.github.com";
 /** GitHub's REST version header (https://docs.github.com/en/rest/about-the-rest-api/api-versions). */
@@ -122,9 +120,9 @@ export interface StatusChecks {
 export class GitHub {
   constructor(
     private readonly token: string,
-    /** The GitHub App the token is from; null when its source doesn't say (nest's answer may not). */
+    /** The GitHub App the token is from; null when the caller doesn't name it (the App's JWT, a revoke). */
     readonly appId: number | null = null,
-    /** The App installation the token was minted from; null when its source doesn't say (a nest from before). */
+    /** The App installation the token was minted from; null when the caller doesn't name it. */
     readonly installationId: number | null = null,
     /** Called when GitHub answers the token 401 or 404: its source drops it and looks the installation up again. */
     private readonly onStale: () => void = () => {},
@@ -344,13 +342,13 @@ function pullOf(p: Record<string, unknown>, repo: string): Pull {
 }
 
 /**
- * A client with a token for `repo` with exactly `permissions`, from the app's own App (or nest's, the
- * fallback), knowing the App and the installation it's from. `fresh`: the repo's installation looked up now,
+ * A client with a token for `repo` with exactly `permissions`, from the app's own App, knowing the App and
+ * the installation it's from. `fresh`: the repo's installation looked up now,
  * not from the cache (a binding's read, README.md#the-repos-binding).
  */
-export async function githubFor(env: Env, nest: Nest, repo: string, permissions: Record<string, string>, o: { fresh?: boolean } = {}): Promise<GitHub> {
-  const t = await tokenSource(env, nest).token(repo, permissions, o);
-  return new GitHub(t.token, t.appId, t.installationId, t.stale);
+export async function githubFor(env: Env, repo: string, permissions: Record<string, string>, o: { fresh?: boolean } = {}): Promise<GitHub & { readonly appId: number; readonly installationId: number }> {
+  const t = await new AppTokens(env).token(repo, permissions, o);
+  return new GitHub(t.token, t.appId, t.installationId, t.stale) as GitHub & { readonly appId: number; readonly installationId: number };
 }
 
 /**
@@ -366,13 +364,13 @@ export function ownInstallation(minted: string, fullName: string, installation: 
 
 /**
  * The GitHub id of the App's bot account, `<app_slug>[bot]` (the author of what the App's tokens create,
- * workers' PRs among them), by the App's slug (`GET /app`, or nest's token answer in the fallback); null when
- * the slug isn't known or GitHub has no such bot. https://docs.github.com/en/rest/users/users#get-a-user
+ * workers' PRs among them), by the App's slug (`GET /app`); null when the slug isn't known or GitHub has no
+ * such bot. https://docs.github.com/en/rest/users/users#get-a-user
  */
-export async function appBotId(env: Env, nest: Nest, repo: string): Promise<number | null> {
-  const slug = await tokenSource(env, nest).appSlug(repo);
+export async function appBotId(env: Env, repo: string): Promise<number | null> {
+  const slug = await new AppTokens(env).appSlug();
   if (typeof slug !== "string" || !/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(slug)) return null;
-  const gh = await githubFor(env, nest, repo, PERMISSIONS.metadata);
+  const gh = await githubFor(env, repo, PERMISSIONS.metadata);
   const u = await gh.call<{ id?: unknown; type?: unknown }>("GET", `/users/${slug}%5Bbot%5D`, undefined, { nullOn404: true });
   return u && u.type === "Bot" && typeof u.id === "number" && Number.isSafeInteger(u.id) && u.id > 0 ? u.id : null;
 }
@@ -382,34 +380,28 @@ export async function appBotId(env: Env, nest: Nest, repo: string): Promise<numb
 /**
  * The required checks with the review check in them, or null when they already have it as wanted.
  *
- * - With the App's id known, the check is required from the App (`checks: [{context, app_id}]`): no
- *   other app, nor a commit status anyone with write access may post, can pass it. An entry already
- *   there from any source, or another app, is pinned to the App.
- * - Without it (nest's token answer didn't name the App), from any source: `contexts` when no entry
- *   is pinned to an app, so nothing changes form; `checks` with the review check's `app_id` left out
- *   (GitHub then takes the app that recently set it) when some entry is pinned, so that pin survives.
- *   The App's first check run then tells its id, and the project attaches again to pin it.
+ * - The check is required from the App (`checks: [{context, app_id}]`): no other app, nor a commit
+ *   status anyone with write access may post, can pass it. An entry already there from any source, or
+ *   another app, is pinned to the App.
  * - Every other entry is kept as it was: an `app_id` of null (any source) is sent back as -1, GitHub's
  *   "any app".
  */
-export function withReviewCheck(have: StatusChecks, appId: number | null): { contexts: string[] } | { checks: { context: string; app_id?: number }[] } | null {
+export function withReviewCheck(have: StatusChecks, appId: number): { checks: { context: string; app_id: number }[] } | null {
   const checks = have.checks ?? (have.contexts ?? []).map((context) => ({ context, app_id: null }));
   const ours = checks.find((c) => c.context === CHECK_NAME);
-  if (ours && (appId === null || ours.app_id === appId)) return null;
+  if (ours && ours.app_id === appId) return null;
   const others = checks.filter((c) => c.context !== CHECK_NAME);
-  const pinned = others.some((c) => c.app_id !== null && c.app_id !== -1);
-  if (appId === null && !pinned) return { contexts: [...others.map((c) => c.context), CHECK_NAME] };
   return {
     checks: [
       ...others.map((c) => ({ context: c.context, app_id: c.app_id === null ? -1 : c.app_id })),
-      appId === null ? { context: CHECK_NAME } : { context: CHECK_NAME, app_id: appId },
+      { context: CHECK_NAME, app_id: appId },
     ],
   };
 }
 
 /** The required status checks for a branch that has none: the review check alone, not strict. */
-export function onlyReviewCheck(appId: number | null) {
-  return appId === null ? { strict: false, contexts: [CHECK_NAME] } : { strict: false, checks: [{ context: CHECK_NAME, app_id: appId }] };
+export function onlyReviewCheck(appId: number) {
+  return { strict: false, checks: [{ context: CHECK_NAME, app_id: appId }] };
 }
 
 const enabled = (v: unknown): boolean => typeof v === "object" && v !== null && (v as { enabled?: unknown }).enabled === true;
@@ -454,7 +446,7 @@ export function protectionKeeping(get: Record<string, unknown>, statusChecks: un
 }
 
 /** The minimal protection for an unprotected branch: the review check required, and nothing else. */
-export function minimalProtection(appId: number | null) {
+export function minimalProtection(appId: number) {
   return { required_status_checks: onlyReviewCheck(appId), enforce_admins: false, required_pull_request_reviews: null, restrictions: null };
 }
 
@@ -468,7 +460,7 @@ export type AttachChange = "created" | "added" | "pinned" | "unchanged";
  * - unprotected: the minimal protection (the check, `strict: false`, nothing else).
  * Running it again changes nothing.
  */
-export async function requireReviewCheck(gh: GitHub, repo: string, appId: number | null): Promise<{ branch: string; change: AttachChange; app_id: number | null }> {
+export async function requireReviewCheck(gh: GitHub, repo: string, appId: number): Promise<{ branch: string; change: AttachChange; app_id: number }> {
   const branch = await gh.defaultBranch(repo);
   const have = await gh.statusChecks(repo, branch);
   if (have) {

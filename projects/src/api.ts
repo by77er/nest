@@ -42,11 +42,10 @@ async function shownOwner(env: Env, b: RepoBinding): Promise<{ id: number; login
   const k = `${b.repo}#${b.repo_id}`;
   const had = ownersShown.get(k);
   if (had && Date.now() - had.at_ms < OWNER_SHOWN_MS) return had.owner;
-  const nest = nestFrom(env);
-  if (!nest) return null;
+  if (!nestFrom(env)) return null;
   let owner: { id: number; login: string } | null = null;
   try {
-    const info = await (await githubFor(env, nest, b.repo, PERMISSIONS.metadata)).repoInfo(b.repo);
+    const info = await (await githubFor(env, b.repo, PERMISSIONS.metadata)).repoInfo(b.repo);
     owner = info.id === b.repo_id && info.owner.type === "User" ? { id: info.owner.id, login: info.owner.login } : null;
   } catch (e) {
     console.warn(`the owner of ${b.repo} couldn't be read: ${String(e).slice(0, 200)}`);
@@ -93,15 +92,14 @@ async function sync(env: Env): Promise<Response> {
 
 /**
  * The operator's re-read of a project's repo binding (README.md#the-repos-binding): the repo's id from
- * GitHub. No id yet: bound. The same id: confirmed, and a rename applied when nest's grant names the new
+ * GitHub. No id yet: bound. The same id: confirmed, and a rename applied when the App reaches the new
  * name (then the catalog is synced, so its templates name it). Another id: nothing written, and both repos
  * answered (`mismatch`), each with its owner, and whether GitHub's has the bound one's owner; the operator
  * binds it only by `bind` with the id they were shown.
  */
 async function rereadBinding(env: Env, id: string, shownId?: number): Promise<Response> {
-  const nest = nestFrom(env);
-  if (!nest) return err(503, "NEST_CLIENT_TOKEN is not set");
-  const r = await readBinding(env, nest, id, shownId === undefined ? "check" : "replace", shownId);
+  if (!nestFrom(env)) return err(503, "NEST_CLIENT_TOKEN is not set");
+  const r = await readBinding(env, id, shownId === undefined ? "check" : "replace", shownId);
   if (!r.ok && "mismatch" in r) {
     // The bound repo's owner as GitHub answered at the binding's last read (none for one learned from an event).
     const known = r.mismatch.bound.owner?.id ?? null;
@@ -109,7 +107,7 @@ async function rereadBinding(env: Env, id: string, shownId?: number): Promise<Re
     return json({ binding: r.binding, mismatch: { bound: r.mismatch.bound, github: { ...r.mismatch.github, same_owner: known === null || owner === null ? null : known === owner } } });
   }
   if (!r.ok) return r.binding === null ? err(404, r.error) : json({ error: r.error, binding: r.binding }, 409);
-  const rename = await applyRename(env, nest, r.binding);
+  const rename = await applyRename(env, r.binding);
   if (rename && "applied" in rename) await syncRepos(env);
   return json({ binding: (await directory(env).binding(id))!, changed: r.changed, previous_id: r.previous_id, rename });
 }
@@ -218,16 +216,13 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     if (!b.ok) return b.res;
     // Only a repo the App reaches, as GitHub answers (README.md#repo-authority): a name outside its installations
     // (typed, or sent straight to the API) would make a project that can never attach, and holds its name.
-    const nest = nestFrom(env);
-    if (nest) {
-      let ok: boolean;
-      try {
-        ok = await repoAttachable(env, nest, b.value.repo);
-      } catch (e) {
-        return err(502, `GitHub couldn't say whether the app's GitHub App reaches ${b.value.repo}: ${e instanceof Error ? e.message : String(e)}`);
-      }
-      if (!ok) return err(403, `the GitHub App doesn't reach ${b.value.repo}: install it on the repo's account (one the app acts for), with the repo among its installation's repos`);
+    let ok: boolean;
+    try {
+      ok = await repoAttachable(env, b.value.repo);
+    } catch (e) {
+      return err(502, `GitHub couldn't say whether the app's GitHub App reaches ${b.value.repo}: ${e instanceof Error ? e.message : String(e)}`);
     }
+    if (!ok) return err(403, `the GitHub App doesn't reach ${b.value.repo}: install it on the repo's account (one the app acts for), with the repo among its installation's repos`);
     // Pending first, then finished here; should this request fail or die half-way, DirectoryDO's alarm
     // finishes it (README.md#creating-a-project). The same repo asked for again while pending resumes it.
     const created = await directory(env).createProject({ name: b.value.name, repo: b.value.repo }, b.value);

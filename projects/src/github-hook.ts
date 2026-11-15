@@ -17,7 +17,7 @@ import { followInstallation } from "./binding";
 import { issueEventOf, type PrComment } from "./do/project";
 import { directory, type Env, project, review } from "./env";
 import { appBotId, CHECK_NAME, verifyGithubSignature } from "./github";
-import { AppTokens, tokenSource } from "./github-app";
+import { AppTokens } from "./github-app";
 import { nestFrom } from "./nest";
 import type { TrustedIds } from "./review-trust";
 
@@ -155,7 +155,7 @@ async function trustedIds(env: Env, projectId: string, repo: string, botAuthor: 
   // before it's held (the App was replaced, or the id recorded was stale).
   if (botAuthor !== null && bot !== botAuthor && nest) {
     try {
-      bot = await appBotId(env, nest, repo);
+      bot = await appBotId(env, repo);
       if (bot !== null) await dir.recordGithubAppBotId(bot);
     } catch (e) {
       console.warn(`the App's bot couldn't be looked up; a bot's PR is held meanwhile: ${String(e).slice(0, 200)}`);
@@ -200,11 +200,9 @@ export async function githubHook(request: Request, env: Env): Promise<Response> 
 /**
  * Whether the event's repo owner is an account the app acts for (README.md#repo-authority), for a binding with no
  * installation known yet: the App's answer (its owner, or GITHUB_ACCOUNTS); false when that can't be had (fails
- * closed); null in the fallback (nest's tokens), where nest's grant decides.
+ * closed).
  */
-async function repoOwnerAllowed(env: Env, payload: Obj): Promise<boolean | null> {
-  const nest = nestFrom(env);
-  if (!nest || !(tokenSource(env, nest) instanceof AppTokens)) return null;
+async function repoOwnerAllowed(env: Env, payload: Obj): Promise<boolean> {
   try {
     return await new AppTokens(env).allows(prNumber(obj(obj(payload.repository).owner).id));
   } catch (e) {
@@ -228,7 +226,7 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
   if (routed && "refused" in routed && installation !== null && nest) {
     let followed = false;
     try {
-      followed = await followInstallation(env, nest, routed.project_id);
+      followed = await followInstallation(env, routed.project_id);
     } catch (e) {
       console.warn(`the binding of ${routed.project_id} couldn't be read again: ${String(e).slice(0, 200)}`);
     }

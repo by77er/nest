@@ -49,7 +49,7 @@ describe("the admin page", () => {
     expect(row("prj_two").querySelector("[data-slot=refused]")).toBeNull();
     expect(row("prj_two")).toHaveTextContent("From its first event yesterday, not read from GitHub yet");
     expect(within(row("prj_two")).getByText("Rename pending")).toBeInTheDocument();
-    expect(row("prj_two").querySelector('[data-tone="warning"]')).toHaveTextContent("Renamed on GitHub to neworg/gadgets: applied once nest's grant names it");
+    expect(row("prj_two").querySelector('[data-tone="warning"]')).toHaveTextContent("Renamed on GitHub to neworg/gadgets: applied once the GitHub App reaches it");
     expect(row("prj_three")).toHaveTextContent("None");
     expect(within(row("prj_three")).getByText("Not bound")).toBeInTheDocument();
     expect(row("prj_three")).toHaveTextContent("Found by its name until it's read from GitHub");

@@ -7,7 +7,7 @@ import { env, runInDurableObject } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
 import { MAX_UNTRIAGED_ISSUES } from "../src/do/project";
-import { AccessTeam, api, deliverGithub, FakeNest, GH_INSTALLATION_ID, GRANT_PERMISSIONS, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf, withNestTokens } from "./fake-nest";
+import { AccessTeam, api, deliverGithub, FakeNest, GH_INSTALLATION_ID, installFetch, ownerIdOf, prEvent, repoIdOf, shaOf } from "./fake-nest";
 
 const fake = new FakeNest();
 let restore: () => void;
@@ -378,50 +378,6 @@ describe("a task made of an issue", () => {
       installation().permissions.issues = saved!;
     }
   });
-
-  /** The grant read again, as the secrets' upkeep reads it. */
-  const readGrant = async (p: P) => {
-    await runInDurableObject(stub(p), (_o, st) => { st.storage.sql.exec("UPDATE settings SET secrets_next_ms = 0"); });
-    await stub(p).drain();
-  };
-  const failures = async (p: P, task: string) => (await getTask(p, task)).history.filter((h: { action: string }) => h.action === "issue_close_failed").length;
-
-  // The grant's `issues` permission decides only nest's tokens: the fallback's.
-  it("with nest's tokens (the fallback): a refused close is tried again when the grant gains issues: write (the grant never read before the refusal)", () => withNestTokens(async () => {
-    const p = await newProject();
-    const saved = GRANT_PERMISSIONS.issues;
-    delete GRANT_PERMISSIONS.issues;
-    let d: Awaited<ReturnType<typeof doneTask>>;
-    try {
-      d = await doneTask(p, 35);
-      expect((await getTask(p, d.task)).issue.close).toBe("failed");
-    } finally {
-      GRANT_PERMISSIONS.issues = saved!;
-    }
-    // Widened: the next read of the grant tries the close again, in the same drain.
-    await readGrant(p);
-    expect(d.issue.state).toBe("closed");
-    expect(d.issue.comments).toEqual([`Done in #${d.pr}.`]);
-    expect((await getTask(p, d.task)).issue).toEqual({ number: 35, close: "closed", error: null });
-  }));
-
-  it("with nest's tokens (the fallback): a grant that loses issues: write, or doesn't change, tries nothing again", () => withNestTokens(async () => {
-    const p = await newProject();
-    // Seen with issues: write first; then narrowed, and the close refused.
-    await readGrant(p);
-    const saved = GRANT_PERMISSIONS.issues;
-    delete GRANT_PERMISSIONS.issues;
-    try {
-      const d = await doneTask(p, 38);
-      expect((await getTask(p, d.task)).issue.close).toBe("failed");
-      expect(await failures(p, d.task)).toBe(1);
-      await readGrant(p);
-      expect((await getTask(p, d.task)).issue.close).toBe("failed");
-      expect(await failures(p, d.task)).toBe(1);
-    } finally {
-      GRANT_PERMISSIONS.issues = saved!;
-    }
-  }));
 
   it("the owner can retry a refused close (once the App's installation has issues: write)", async () => {
     const p = await newProject();

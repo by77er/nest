@@ -5,8 +5,7 @@ import { env } from "cloudflare:test";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Env } from "../src/env";
 import { githubFor, PERMISSIONS } from "../src/github";
-import { appJwt, appTokenCache, AppTokens, importAppKey, pkcs1ToPkcs8, resetAppTokens, TOKEN_REUSE_MS, tokenSource } from "../src/github-app";
-import { NestError, nestFrom } from "../src/nest";
+import { appJwt, appTokenCache, AppTokens, importAppKey, pkcs1ToPkcs8, resetAppTokens, TOKEN_REUSE_MS } from "../src/github-app";
 import { FakeNest, GH_APP_ID, GH_INSTALLATION_ID, GRANT_PERMISSIONS, installFetch } from "./fake-nest";
 
 const fake = new FakeNest();
@@ -21,13 +20,10 @@ beforeEach(() => {
   gh.installations = [{ id: GH_INSTALLATION_ID, account: null, repos: "all", permissions: { ...GRANT_PERMISSIONS } }];
   gh.tokenLifeMs = 3_600_000;
   gh.failures = [];
-  fake.grantRepos = null;
-  fake.grantListing = null;
 });
 afterEach(() => vi.restoreAllMocks());
 
 const appEnv = env as unknown as Env;
-const nest = () => nestFrom(appEnv)!;
 const rand = () => crypto.randomUUID().replace(/-/g, "").slice(0, 10);
 const newRepo = () => `o-${rand()}/r-${rand()}`;
 const lookups = (repo: string) => gh.callsTo("GET", new RegExp(`^/repos/${repo}/installation$`)).length;
@@ -118,8 +114,8 @@ describe("installation tokens", () => {
     const account = repo.split("/")[0]!;
     gh.install({ id: 9_001, account });
     const before = gh.mints().length;
-    const a = await githubFor(appEnv, nest(), repo, PERMISSIONS.checks);
-    const b = await githubFor(appEnv, nest(), repo, PERMISSIONS.repoSettings);
+    const a = await githubFor(appEnv, repo, PERMISSIONS.checks);
+    const b = await githubFor(appEnv, repo, PERMISSIONS.repoSettings);
     expect(gh.mints().slice(before)).toEqual([
       { installation: 9_001, repositories: [repo.split("/")[1]], permissions: { checks: "write" } },
       { installation: 9_001, repositories: [repo.split("/")[1]], permissions: { administration: "write" } },
@@ -181,12 +177,12 @@ describe("installation tokens", () => {
 
   it.each([401, 404])("a token GitHub answers %i is dropped, and the repo's installation looked up again", async (status) => {
     const repo = newRepo();
-    const gh1 = await githubFor(appEnv, nest(), repo, PERMISSIONS.metadata);
+    const gh1 = await githubFor(appEnv, repo, PERMISSIONS.metadata);
     expect(lookups(repo)).toBe(1);
     gh.fail(new RegExp(`^GET /repos/${repo}$`), status);
     await expect(gh1.repoInfo(repo)).rejects.toMatchObject({ status });
     const mints = gh.mints().length;
-    const gh2 = await githubFor(appEnv, nest(), repo, PERMISSIONS.metadata);
+    const gh2 = await githubFor(appEnv, repo, PERMISSIONS.metadata);
     expect(lookups(repo)).toBe(2);
     expect(gh.mints().length).toBe(mints + 1);
     expect((await gh2.repoInfo(repo)).full_name).toBe(repo);
@@ -204,11 +200,10 @@ describe("installation tokens", () => {
     expect(appTokenCache().tokens.filter((t) => t.installation === 9_201)).toEqual([]);
   });
 
-  it("are GitHub's to refuse, not nest's grant: nest isn't asked, and a permission the installation wasn't granted is GitHub's refusal", async () => {
+  it("are GitHub's to refuse: nest isn't asked, and a permission the installation wasn't granted is GitHub's refusal", async () => {
     const repo = newRepo();
     const account = repo.split("/")[0]!;
     const src = new AppTokens(appEnv);
-    fake.grantRepos = ["someone/else"];
     const asked = fake.calls.length;
     await src.token(repo, PERMISSIONS.metadata, { fresh: true });
     expect(fake.calls.length).toBe(asked);
@@ -251,10 +246,10 @@ describe("installation tokens", () => {
 
   it("an expected 404 (no such user) is the answer, not the token's trouble: nothing dropped, nothing looked up or minted again", async () => {
     const repo = newRepo();
-    const g = await githubFor(appEnv, nest(), repo, PERMISSIONS.metadata);
+    const g = await githubFor(appEnv, repo, PERMISSIONS.metadata);
     expect(await g.user("ghost-nobody")).toBeNull();
     const mints = gh.mints().length;
-    await githubFor(appEnv, nest(), repo, PERMISSIONS.metadata);
+    await githubFor(appEnv, repo, PERMISSIONS.metadata);
     expect(lookups(repo)).toBe(1);
     expect(gh.mints().length).toBe(mints);
   });
@@ -296,24 +291,5 @@ describe("the App's installations and their repos", () => {
     const other = newRepo();
     gh.repo(other);
     expect((await src.installationRepos(30_001)).repos).not.toContain(other);
-  });
-});
-
-describe("the fallback: nest's tokens", () => {
-  it("GITHUB_TOKEN_SOURCE=nest takes every token from nest, none from the App; unset, the App's", async () => {
-    const repo = newRepo();
-    expect(tokenSource({ ...appEnv, GITHUB_TOKEN_SOURCE: undefined }, nest()).kind).toBe("app");
-    expect(tokenSource({ ...appEnv, GITHUB_TOKEN_SOURCE: "app" }, nest()).kind).toBe("app");
-    const fallback = { ...appEnv, GITHUB_TOKEN_SOURCE: "nest" };
-    expect(tokenSource(fallback, nest()).kind).toBe("nest");
-    const asked = fake.callsTo("POST", /^\/v1\/clients\/self\/github-token$/).length;
-    const minted = gh.mints().length;
-    const g = await githubFor(fallback, nest(), repo, PERMISSIONS.checks);
-    expect(fake.callsTo("POST", /^\/v1\/clients\/self\/github-token$/).at(-1)!.body).toEqual({ repo, permissions: { checks: "write" } });
-    expect(fake.callsTo("POST", /^\/v1\/clients\/self\/github-token$/).length).toBe(asked + 1);
-    expect(gh.mints().length).toBe(minted);
-    expect([g.appId, g.installationId]).toEqual([GH_APP_ID, GH_INSTALLATION_ID]);
-    // Works with no App secrets at all: the way out of a key problem.
-    await githubFor({ ...fallback, GITHUB_APP_ID: undefined, GITHUB_APP_PRIVATE_KEY: undefined }, nest(), repo, PERMISSIONS.metadata);
   });
 });

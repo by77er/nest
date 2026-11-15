@@ -1,6 +1,6 @@
 // DirectoryDO, one instance (README.md#pieces): the projects, repo → project, agent → {project, role,
 // task, pr}, the nest events and GitHub deliveries already handled (deduplicated by id), the catalog
-// sync's state, and the GitHub App's id once a token's source or a check run has told it.
+// sync's state, and the GitHub App's id an older release recorded.
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "../env";
@@ -69,7 +69,7 @@ const MIGRATIONS = [
     // The repo's binding (README.md#the-repos-binding): how its id was learned (`github`: read from GitHub
     // at attach, a sync or the operator's re-read; `event`: from the first event, before ids were read) and
     // when; the name GitHub last gave it, when that isn't the name the project calls it by (a rename not
-    // yet applied); and the App installation's id, filled once a token's source names it.
+    // yet applied); and the App installation's id, filled once the App's lookup names it.
     "ALTER TABLE projects ADD COLUMN repo_bound TEXT",
     "ALTER TABLE projects ADD COLUMN repo_bound_ms INTEGER",
     "ALTER TABLE projects ADD COLUMN repo_name TEXT",
@@ -89,7 +89,7 @@ const MIGRATIONS = [
     "ALTER TABLE projects ADD COLUMN refused_ms INTEGER",
   ],
   [
-    // When a refused event last made the binding be read again, to follow nest's answer for the installation
+    // When a refused event last made the binding be read again, to follow the App's lookup of the installation
     // (README.md#the-repos-binding): at most once a minute per project.
     "ALTER TABLE projects ADD COLUMN installation_checked_ms INTEGER",
     // The bound repo's owner's kind as GitHub answered at the binding's last read, with the id it's of
@@ -112,14 +112,14 @@ const MIGRATIONS = [
 export interface RepoBinding {
   project: string;
   name: string;
-  /** The name the project calls the repo by (GitHub, nest's grant, its agents). */
+  /** The name the project calls the repo by (GitHub, its agents). */
   repo: string;
   repo_id: number | null;
   /** Bumped by every change of `repo_id`: which of two reads is newer, whatever the ids. */
   repo_gen: number;
   /** The name GitHub last gave the repo, when it isn't `repo`: renamed or transferred, not yet applied. */
   renamed_to: string | null;
-  /** The App installation's id: null until a token's source (the App's lookup, or nest's answer) names it. */
+  /** The App installation's id: null until the App's lookup by the repo's own name gives it. */
   installation_id: number | null;
   /** How the id was learned: read from GitHub, or taken from the first event; null while there's none. */
   bound: "github" | "event" | null;
@@ -291,7 +291,7 @@ export class DirectoryDO extends DurableObject<Env> {
    * name taken): no project. A project whose App installation is known takes only events from that
    * installation (`installation.id`): any other, or none, is refused (README.md#the-repos-binding). One with none
    * known yet refuses an event whose repo owner isn't an account the app acts for (`ownerAllowed` false, the
-   * Worker's answer; null: not checked, the fallback's).
+   * Worker's answer; null, only from the previous release's Worker: not checked).
    */
   async projectForRepo(repoId: number | null, name: string | null, installation: number | null = null, ownerAllowed: boolean | null = null): Promise<{ project: ProjectRow; anchored: boolean; recorded_owner: number | null } | { refused: string; project_id: string } | null> {
     const one = (where: string, v: SqlStorageValue) =>
@@ -336,8 +336,8 @@ export class DirectoryDO extends DurableObject<Env> {
 
   /**
    * The name GitHub gives the repo now, from an event routed by its id: kept when it isn't the name the
-   * project calls it by (renamed or transferred; applied by a sync or the operator's re-read, once nest's
-   * grant names it), cleared when it is again.
+   * project calls it by (renamed or transferred; applied by a sync or the operator's re-read, once the App
+   * reaches it), cleared when it is again.
    */
   private noteName(project: string, name: string): void {
     const n = name.toLowerCase();
@@ -448,7 +448,7 @@ export class DirectoryDO extends DurableObject<Env> {
     return this.sql.exec("UPDATE projects SET repo = ?, repo_name = NULL WHERE id = ? AND repo_name = ?", n, project, n).rowsWritten > 0;
   }
 
-  /** The GitHub App's id, as a token's source (the App's own secret, or nest's `app_id`) or a check run it made (`app.id`) last told it; null until one has. */
+  /** The GitHub App's id an older release recorded; null if none. Unread and unwritten now: kept with `recordGithubAppId` for the previous release's calls in the deploy gap. */
   async githubAppId(): Promise<number | null> {
     const row = this.sql.exec<{ v: string }>("SELECT v FROM sync WHERE k = 'github_app_id'").toArray()[0];
     return row ? Number(row.v) : null;

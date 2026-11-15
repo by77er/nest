@@ -368,8 +368,6 @@ export class Nest {
     client?: string;
     grant?: {
       egress_hosts?: string[]; inject_hosts?: string[]; secrets?: { max_count?: number; max_bytes?: number }; github_push?: { workflows?: boolean };
-      repos?: string[];
-      github?: { repos?: string[]; permissions?: Record<string, string> };
     };
   }> {
     return this.call("GET", "/v1/clients/self");
@@ -389,16 +387,6 @@ export class Nest {
 
   async listSecrets(): Promise<{ name: string; size: number; created_ms?: number; updated_ms?: number; last_injected_ms: number | null }[]> {
     return (await this.call<{ secrets?: { name: string; size: number; created_ms?: number; updated_ms?: number; last_injected_ms: number | null }[] }>("GET", "/v1/clients/self/secrets")).secrets ?? [];
-  }
-
-  /**
-   * A short-lived GitHub App token for one repo of the grant, with exactly these permissions, and the
-   * App it's from (`app_id`, `app_slug`: absent when nest can't tell) and the App's installation it was
-   * minted from (`installation_id`: absent from a nest of the previous release). The fallback only
-   * (`GITHUB_TOKEN_SOURCE=nest`, README.md#github-tokens): the app mints its own otherwise.
-   */
-  githubToken(repo: string, permissions: Record<string, string>): Promise<{ token: string; expires_at: string; repo: string; permissions: Record<string, string>; installation_id?: number; app_id?: number; app_slug?: string }> {
-    return this.call("POST", "/v1/clients/self/github-token", { repo, permissions });
   }
 }
 
