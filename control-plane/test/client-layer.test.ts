@@ -6,7 +6,7 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { compileEgress, egressOutsideGrant, narrowEgress } from "../src/lib/client-egress";
-import { EnvName, githubEnvConflict, unboundPlaceholders } from "../src/lib/sandbox-env";
+import { EnvName, unboundPlaceholders } from "../src/lib/sandbox-env";
 import { SandboxDO } from "../src/do/sandbox";
 import { FleetDO } from "../src/do/fleet";
 import { hostPatternMatches } from "../src/protocol/model";
@@ -33,20 +33,15 @@ describe("client egress rules and env (pure)", () => {
       "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO", "lower", "1A", "A-B", ""]) {
       expect(EnvName.safeParse(bad).success, bad).toBe(false);
     }
-    // The GitHub names are a name like any other; only beside nest's own GitHub token are they reserved.
-    for (const name of GITHUB_TAKEOVER) {
-      expect(EnvName.safeParse(name).success, name).toBe(true);
-      expect(githubEnvConflict(false, { [name]: "x" }), name).toEqual([]);
-      expect(githubEnvConflict(true, { A: "x" }, { [name]: "x" }), name).toEqual([name]);
-    }
-    expect(githubEnvConflict(true, { GH_REPO: "o/r", GIT_SSH_COMMAND: "ssh" })).toEqual([]);
+    // GitHub's and git's names are names like any other: nest injects no GitHub token of its own to reserve them for.
+    for (const name of GITHUB_NAMES) expect(EnvName.safeParse(name).success, name).toBe(true);
     expect(unboundPlaceholders({ A: "nest-ph.cli_x.api.", B: "literal" }, ["nest-ph.cli_x.api."])).toEqual([]);
     expect(unboundPlaceholders({ A: "Bearer nest-ph.cli_y.api." }, ["nest-ph.cli_x.api."])).toEqual(["env A: a placeholder no binding here has"]);
   });
 });
 
-/** Env names that would take nest's own GitHub token over (`gh` prefers `GH_TOKEN`; git config from the env). */
-const GITHUB_TAKEOVER = ["GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GIT_ASKPASS", "GIT_CONFIG", "GIT_CONFIG_COUNT",
+/** Env names nest reserved while it injected a GitHub token of its own (`gh` prefers `GH_TOKEN`; git config from the env). */
+const GITHUB_NAMES = ["GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GIT_ASKPASS", "GIT_CONFIG", "GIT_CONFIG_COUNT",
   "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM"];
 
 async function as(token: string, path: string, init: { method?: string; body?: unknown } = {}) {
@@ -96,15 +91,17 @@ describe("client egress", () => {
     expect(policy.allow).toContainEqual({ host: "registry.npmjs.com", ports: [443], layer: "workstream", source: "client" });
   });
 
-  it("never takes away a guard: a client allowing api.github.com still gets the operator's GitHub write guards", async () => {
+  it("never takes away a guard: a client allowing api.github.com still gets the operator's write guard there", async () => {
     const c = await newClient();
     const s = await placed(c, { egress: { allow: [{ host: "api.github.com" }] } });
+    const mine = { name: "api-write", hosts: ["*.github.com"], scope: [{ methods_except: ["GET", "HEAD"] }], reason: "read-only", ignore_case: true };
+    await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { guards: [mine] } });
     const policy = await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`);
     expect(allowed(policy)).toContain("api.github.com");
-    const guard = policy.guards.find((g: any) => g.name === "github-api-write");
+    const guard = policy.guards.find((g: any) => g.name === "api-write");
     expect(guard.hosts.some((h: string) => hostPatternMatches(h, "api.github.com"))).toBe(true);
-    // No repo of nest's here: a write passes only with a credential nest injected, never on the client's rule alone.
-    expect(guard.allow ?? []).toEqual([{ injected: "*", at: "authorization" }]);
+    // The client's rule opens the host; the operator's guard still refuses its writes.
+    expect(guard).toEqual(mine);
   });
 
   it("a template's rules join its agent's sandbox while attached; a spawn may only narrow them; detach takes them away", async () => {
@@ -145,19 +142,19 @@ describe("client egress", () => {
 });
 
 describe("where each allow rule came from", () => {
-  it("the API's policy marks each rule's source (base, operator, repos, client, grant); the host's policy carries none", async () => {
+  it("the API's policy marks each rule's source (base, operator, client, grant); the host's policy carries none", async () => {
     const c = await newClient();
     const value = `value-src-${rand()}`;
     await ok(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value } });
     const s = await placed(c, { egress: { allow: [{ host: "nodejs.org" }] }, inject: [{ name: "stripe", secret: "stripe-key", hosts: ["api.stripe.com"], locations: BEARER }] });
-    await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { allow: [{ host: "api.stripe.com" }], repos: ["o/r"] } });
+    await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { allow: [{ host: "api.stripe.com" }] } });
     const wire = await nextPolicy(s.ws);
     await adminJson(`/v1/sandboxes/${s.sandbox}/grants`, { body: { host: "example.org", ttl_ms: 600_000 } });
     const view = await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`);
     const source = (host: string) => (view.allow as { host: string; source: string }[]).filter((a) => a.host === host).map((a) => a.source);
     expect(source("registry.npmjs.org")).toEqual(["base"]);
     expect(source("api.stripe.com")).toEqual(["operator"]);
-    expect(source("api.github.com")).toEqual(["repos"]);
+    expect(new Set((view.allow as { source: string }[]).map((a) => a.source))).toEqual(new Set(["base", "operator", "client", "grant"]));
     expect(source("nodejs.org")).toEqual(["client"]);
     expect(source("example.org")).toEqual(["grant"]);
     // `layer` stays as the wire has it, for one release.
@@ -287,11 +284,9 @@ describe("the live client layer: bindings and environment", () => {
     expect((await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { inject: [{ ...stripe, hosts: ["evil.net"] }] } })).status).toBe(403);
   });
 
-  it("GitHub env names are a client's where nest injects no GitHub token of its own, and refused where it does (create, layer, attach, policy)", async () => {
+  it("GitHub's env names are a client's everywhere: nest injects no GitHub token of its own to reserve them for (create, layer, template, slot)", async () => {
     const c = await newClient();
-    const ADMIN = "test-admin-token";
-    const takeover = Object.fromEntries(GITHUB_TAKEOVER.map((n) => [n, "anything"]));
-    // No kernel GitHub token here: every name goes through, on create and live, and reaches the slots.
+    const takeover = Object.fromEntries(GITHUB_NAMES.map((n) => [n, "anything"]));
     const s = await placed(c, { env: takeover });
     await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { ...takeover, GH_TOKEN: "other" } } });
     await ok(c.token, `/v1/catalog/templates/${c.name}/w`, { method: "PUT", body: {
@@ -299,125 +294,86 @@ describe("the live client layer: bindings and environment", () => {
     const a = await ok(c.token, "/v1/agents", { body: { template: `${c.name}/w`, sandbox: s.sandbox, start: false } });
     const attach = (await nextCommands(s.ws, (x) => x.type === "agent_attach" && x.agent === a.agent)).find((x) => x.type === "agent_attach")!;
     expect(attach.env).toEqual({ ...takeover, GH_TOKEN: "other", GIT_CONFIG_COUNT: "0" });
-    // Then nothing may give it one: the operator's repos or read-only repos, its own `workflows` opt-in, an agent with repos.
-    for (const body of [{ repos: ["o/r"] }, { read_repos: ["o/r"] }, { github_push: { workflows: true } }]) {
-      const r = await admin(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body });
-      expect(r.status, JSON.stringify(body)).toBe(400);
-      expect((await r.json() as any).error.message).toContain("GH_TOKEN");
-    }
-    // A client's layer asking for it is refused by the grant before the names are looked at (no grant has it).
-    expect((await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: takeover, github_push: { workflows: true } } })).status).toBe(403);
-    const op = await admin("/v1/agents", { method: "POST", body: { template: "worker", sandbox: s.sandbox, start: false, overrides: { repos: ["o/r"] } } });
-    expect(op.status).toBe(400);
-    expect((await op.json() as any).error.message).toContain("GIT_CONFIG_COUNT");
-    // Nothing of the refused writes stuck: still no GitHub access, and the env as it was.
-    expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`)).inject.map((b: any) => b.name)).not.toContain("github");
-    expect((await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`)).github_push).toEqual({ workflows: false });
-
-    // Where nest injects its own token, the names are refused: on create, on the layer, and in a template or spawn beside repos.
-    const opBody = { cell: c.cell, policy: { repos: ["o/r"] } };
-    for (const name of GITHUB_TAKEOVER) {
-      expect((await admin("/v1/sandboxes", { method: "POST", body: { ...opBody, env: { [name]: "x" } } })).status, `create ${name}`).toBe(400);
-      expect((await as(ADMIN, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true }, env: { [name]: "x" } } })).status, `own opt-in create ${name}`).toBe(400);
-    }
-    // The operator's own sandbox: its client layer is held to no grant, so the opt-in there reserves the names.
-    const gh = await ok(ADMIN, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true } } });
-    const live = await as(ADMIN, `/v1/sandboxes/${gh.sandbox}/client-policy`, { method: "PUT", body: { github_push: { workflows: true }, env: { GH_TOKEN: "x" } } });
-    expect([live.status, live.body.error.message]).toEqual([400, expect.stringContaining("reserved where nest injects its own GitHub token")]);
-    // Dropping the opt-in in the same write frees them.
-    await ok(ADMIN, `/v1/sandboxes/${gh.sandbox}/client-policy`, { method: "PUT", body: { env: { GH_TOKEN: "x" } } });
-    const tpl = { capabilities: ["nest", "hands"], launch: LAUNCH, hands: "required", credential: "claude_oauth_token" };
-    expect((await as(c.token, `/v1/catalog/templates/${c.name}/push`, { method: "PUT", body: { ...tpl, github_push: { workflows: true }, env: { GH_TOKEN: "x" } } })).status).toBe(400);
-    const sbx = await adminJson("/v1/sandboxes", { body: opBody });
-    const free = await adminJson("/v1/sandboxes", { body: { cell: c.cell } });
-    // The spec's own repos beside its env: refused at its expansion, before any sandbox is asked.
-    expect((await adminJson("/v1/agents", { body: { template: "worker", sandbox: free.sandbox, start: false, overrides: { repos: ["o/r"], env: { GIT_ASKPASS: "x" } } } }, 400))
-      .error.message).toContain("template worker: env GIT_ASKPASS: reserved");
-    // An agent with GitHub names joining a sandbox with repos: refused, and not attached.
-    expect((await adminJson("/v1/agents", { body: { template: "worker", sandbox: sbx.sandbox, start: false, overrides: { env: { GH_TOKEN: "x" } } } }, 400))
-      .error.message).toContain("GH_TOKEN");
-    expect((await adminJson(`/v1/sandboxes/${sbx.sandbox}`)).attached).toEqual([]);
+    // An operator binding under GitHub's old binding name is the operator's like any other: the names stay the client's.
+    const inject = [{ name: "github", hosts: ["api.github.com"], placeholder: "nest-ph-github-op", locations: BEARER }];
+    await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { inject } });
+    await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { GH_TOKEN: "again" } } });
   });
 
-  it("an attached agent's repos reserve the GitHub names for the whole sandbox while it is attached; its own attach again replaces its part", async () => {
+  it("the removed repo fields: taken only when they grant nothing (and dropped), refused otherwise, at every write that took them", async () => {
     const c = await newClient();
     const s = await placed(c);
-    const pusher = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, start: false, overrides: { read_repos: ["o/r"] } } }, 201);
-    expect((await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, start: false, overrides: { env: { GH_TOKEN: "x" } } } }, 400))
-      .error.message).toContain("GH_TOKEN");
-    expect((await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { GIT_CONFIG_COUNT: "1" } } })).status).toBe(400);
-    // The same agent attached again with no repos replaces its part: nothing else gives the sandbox GitHub access.
-    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
-    await stub.attach(pusher.agent, undefined, [], [], { env: { GH_TOKEN: "x" } });
-    expect((await stub.repoAccess()).read).toEqual([]);
-    // And back: its repos again, its env (the GitHub names) replaced by none.
-    await stub.attach(pusher.agent, undefined, [], ["o/r"], {});
-    expect((await stub.repoAccess()).read).toEqual(["o/r"]);
-    // Once it is detached, the sandbox's own env may name them.
-    await stub.detach(pusher.agent);
-    await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { GIT_CONFIG_COUNT: "1" } } });
-  });
-
-  it("an operator binding under a GitHub binding's name, and an agent's push-token opt-in, are nest's own GitHub access too", async () => {
-    const cell = uniqueCell();
-    for (const name of ["github", "github_read", "github_read_default"]) {
-      const inject = [{ name, hosts: ["api.github.com"], placeholder: `nest-ph-${name}-op`, locations: [{ type: "authorization_bearer" }] }];
-      expect((await adminJson("/v1/sandboxes", { body: { cell, policy: { inject }, env: { GH_TOKEN: "x" } } }, 400)).error.message, name).toContain("GH_TOKEN");
-      const s = await adminJson("/v1/sandboxes", { body: { cell, env: { GH_TOKEN: "x" } } }, 202);
-      expect((await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { inject } }, 400)).error.message, name).toContain("GH_TOKEN");
-    }
-    // An agent asking for `workflows: write` on the push token, attaching beside the sandbox's GH_TOKEN.
-    const s = await adminJson("/v1/sandboxes", { body: { cell, env: { GH_TOKEN: "x" } } }, 202);
-    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
-    await expect(Promise.resolve().then(() => stub.attach("agt_workflows", undefined, [], [], { workflows: true }))).rejects.toThrow(/GH_TOKEN/);
-    expect((await stub.info()).attached).toEqual([]);
-  });
-
-  it("an attach that waits on its cell's guard bounds is checked after the wait: an operator's repos written meanwhile refuse its GH_TOKEN", async () => {
-    const cell = uniqueCell();
-    const s = await adminJson("/v1/sandboxes", { body: { cell } }, 202);
-    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
-    // FleetDO's guard-bounds answer held until the operator's write is in.
-    const proto = FleetDO.prototype as unknown as { hostsWithoutGuardBounds: () => Promise<string[]> };
-    const real = proto.hostsWithoutGuardBounds;
-    let state: "idle" | "held" | "go" = "idle";
-    proto.hostsWithoutGuardBounds = async function () {
-      state = "held";
-      while (state === "held") await new Promise((r) => setTimeout(r, 10));
-      return [];
+    const tpl = { capabilities: ["nest", "hands"], launch: LAUNCH, hands: "required", credential: "claude_oauth_token" };
+    const refused = async (r: Response | { status: number; body: any }, field: string) => {
+      const [status, body] = r instanceof Response ? [r.status, await r.json() as any] : [r.status, r.body];
+      expect([status, body.error.message], field).toEqual([400, expect.stringContaining(`${field} is no longer accepted`)]);
     };
-    let attached: Promise<unknown>;
-    try {
-      attached = Promise.resolve().then(() => stub.attach("agt_waits", undefined, [], [], {
-        env: { GH_TOKEN: "client" }, guards: [{ name: "g", hosts: ["x.example.org"], scope: [{ methods: ["PUT"] }], client: null }] }))
-        .then(() => null, (e: unknown) => e);
-      await eventually("the attach waiting on guard bounds", () => state === "held");
-      await stub.setPolicy({ repos: ["o/r"] });
-    } finally {
-      state = "go";
-      proto.hostsWithoutGuardBounds = real;
+    // The operator's layer and its sandbox create.
+    for (const [field, value] of [["repos", ["o/r"]], ["read_repos", ["o/r"]], ["github_push", { workflows: true }]] as const) {
+      const name = field === "github_push" ? "github_push.workflows" : field;
+      await refused(await admin(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { [field]: value } }), name);
+      await refused(await admin("/v1/sandboxes", { method: "POST", body: { cell: c.cell, policy: { [field]: value } } }), name);
+      // A template, the operator's or a client's, and a spawn's overrides, the operator's or a client's.
+      await refused(await admin("/v1/admin/templates/removed-fields", { method: "PUT", body: { ...tpl, [field]: value } }), name);
+      await refused(await as(c.token, `/v1/catalog/templates/${c.name}/removed`, { method: "PUT", body: { ...tpl, [field]: value } }), name);
+      await refused(await admin("/v1/agents", { method: "POST", body: { template: "worker", sandbox: s.sandbox, start: false, overrides: { [field]: value } } }), name);
     }
-    expect(String(await attached)).toContain("GH_TOKEN");
-    expect([(await stub.pushRepos()), (await stub.info()).attached]).toEqual([["o/r"], []]);
+    await ok(c.token, `/v1/catalog/templates/${c.name}/x`, { method: "PUT", body: tpl });
+    for (const [field, value] of [["repos", ["o/r"]], ["read_repos", ["o/r"]], ["github_push", { workflows: true }]] as const) {
+      const r = await as(c.token, "/v1/agents", { body: { template: `${c.name}/x`, sandbox: s.sandbox, start: false, overrides: { [field]: value } } });
+      await refused(r, field === "github_push" ? "github_push.workflows" : field);
+    }
+    // The client layer and a client's sandbox create: `github_push` only.
+    await refused(await as(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { github_push: { workflows: true } } }), "github_push.workflows");
+    await refused(await as(c.token, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true } } }), "github_push.workflows");
+
+    // What grants nothing goes through, and is dropped: what an app narrowing to none (or an old client) sends.
+    const none = { repos: [], read_repos: [], github_push: { workflows: false } };
+    await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { allow: [{ host: "api.stripe.com" }], ...none } });
+    expect(await adminJson("/v1/admin/templates/removed-fields", { method: "PUT", body: { ...tpl, ...none } })).toEqual(tpl);
+    expect(await ok(c.token, `/v1/catalog/templates/${c.name}/x`, { method: "PUT", body: { ...tpl, ...none } })).toEqual(tpl);
+    await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { env: { GH_TOKEN: "x" }, github_push: { workflows: false } } });
+    const a = await ok(c.token, "/v1/agents", { body: { template: `${c.name}/x`, sandbox: s.sandbox, start: false, overrides: { repos: [], read_repos: [] } } });
+    const b = await adminJson("/v1/agents", { body: { template: "worker", sandbox: s.sandbox, start: false, overrides: none } }, 201);
+    for (const view of [a, b]) expect(["repos", "read_repos", "github_push"].filter((k) => Object.hasOwn(view, k)), view.agent).toEqual([]);
+    expect(Object.hasOwn(await ok(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`), "github_push")).toBe(false);
+    const policy = await ok(c.token, `/v1/sandboxes/${s.sandbox}/policy`);
+    expect(policy.inject.map((b: any) => b.name)).toEqual([]);
+    expect(policy.guards.map((g: any) => g.name)).toEqual([]);
+    expect(allowed(policy)).not.toContain("api.github.com");
   });
 
-  it("a sandbox a previous release left with GitHub names beside nest's own GitHub token never sends them to a slot", async () => {
+  it("what a previous release stored or sends of them is ignored: no binding, guard, host or token from it, and GitHub's env names reach the slot", async () => {
     const c = await newClient();
     const s = await placed(c, { env: { GH_TOKEN: "client", APP_ENV: "staging" } });
     await ok(c.token, `/v1/catalog/templates/${c.name}/w`, { method: "PUT", body: {
       capabilities: ["nest", "hands"], launch: LAUNCH, hands: "required", credential: "claude_oauth_token", env: { GIT_CONFIG_COUNT: "1", ROLE: "w" } } });
     const a = await ok(c.token, "/v1/agents", { body: { template: `${c.name}/w`, sandbox: s.sandbox, start: false } });
     await nextCommands(s.ws, (x) => x.type === "agent_attach" && x.agent === a.agent);
-    // What a previous release (which checks none of this) can store: the operator's repos beside that env.
     const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    // The operator's layer as the previous release stored it, with repos, read-only repos and the push opt-in.
     await runInDurableObject(stub, async (inst: SandboxDO, st) => {
       const row = st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'ws_layer'").one();
-      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'ws_layer'", JSON.stringify({ ...JSON.parse(row.value), repos: ["o/r"] }));
+      st.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'ws_layer'", JSON.stringify({ ...JSON.parse(row.value), repos: ["o/r"], read_repos: ["o/s"], github_push: { workflows: true } }));
       // A slot configured again (as a move or a new placement does).
       await (inst as unknown as { issueAttachCommands(a: string[]): Promise<void> }).issueAttachCommands([a.agent]);
     });
     const again = (await nextCommands(s.ws, (x) => x.type === "agent_attach" && x.agent === a.agent)).find((x) => x.type === "agent_attach")!;
-    expect(again.env).toEqual({ APP_ENV: "staging", ROLE: "w" });
+    expect(again.env).toEqual({ GH_TOKEN: "client", APP_ENV: "staging", GIT_CONFIG_COUNT: "1", ROLE: "w" });
+    // An attach from an AgentDO of the previous release, which still passes an agent's repos and push opt-in.
+    await stub.attach("agt_previous", undefined, ["o/r"], ["o/s"], { workflows: true } as never);
+    expect((await stub.info()).attached).toContain("agt_previous");
+    // And a client layer from its Worker, with the opt-in.
+    await stub.setClientLayer({ egress: [], inject: [], env: { GH_TOKEN: "client" }, guards: [], workflows: true } as never);
+    const policy = await stub.policy();
+    expect(policy.inject.map((b) => b.name)).toEqual([]);
+    expect(policy.guards!.map((g) => g.name)).toEqual([]);
+    expect(policy.allow.filter((r) => r.host === "api.github.com")).toEqual([]);
+    expect(Object.hasOwn(await stub.clientLayer(), "github_push")).toBe(false);
+    // The layer reads without them, and keeps them stored (a rollback reads them again).
+    await runInDurableObject(stub, (_i: SandboxDO, st) => {
+      expect(JSON.parse(st.storage.sql.exec<{ value: string }>("SELECT value FROM kv WHERE key = 'ws_layer'").one().value).repos).toEqual(["o/r"]);
+    });
   });
 
   it("env reaches each attached agent's slot: the sandbox's and the agent's, placeholders bound beside it, never a secret's value", async () => {

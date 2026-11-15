@@ -1252,24 +1252,31 @@ def run_brokered(ids):
           f"{text('revoke')[:100]!r} {text('curl2')[:100]!r}")
 
 
-# ---------------------------------------------------------------------------------- push allowlists
-# A sandbox may push only to repos on its allowlist (docs/sandbox/networking/egress/policy/#repo-allowlists):
-# SandboxDO's GitHub rule constructor turns the allowlist into generic request guards, and nest-proxy refuses
-# a push anywhere else before anything reaches GitHub, whatever credential it carries. No real push: the
-# refused ones never leave the proxy, and the allowed one is only git's discovery request, which GitHub
-# answers itself (401 without a credential: the harness has no GitHub App, so no token is minted).
+# ---------------------------------------------------------------------------------- push guards
+# A sandbox may push only where its request guards let it (docs/sandbox/networking/egress/policy/#request-guards):
+# here an operator guard, written as data, that refuses git's receive-pack and its discovery on github.com except
+# for one repo, and nest-proxy refuses a push anywhere else before anything reaches GitHub, whatever credential it
+# carries. nest builds no GitHub guard of its own (#no-repo-tokens): an app writes its own as client guards
+# (the plan's phase C6 moves this check onto one). No real push: the refused ones never leave the proxy, and the
+# allowed one is only git's discovery request, which GitHub answers itself (401 without a credential).
 E2E_ATTACKER_REPO = "nest-e2e-not-allowed/x"
+E2E_PUSH_GUARD = {
+    "name": "push-allowlist", "hosts": ["github.com"], "ignore_case": True,
+    "scope": [{"path": "/**/git-receive-pack"}, {"path": "/**/info/refs", "query": [{"name": "service", "values": ["git-receive-pack"]}]}],
+    "allow": [{"path": "/by77er/nest/**"}, {"path": "/by77er/nest.git/**"}],
+    "reason": "git pushes reach only by77er/nest",
+}
 
 def run_repos(ids):
     if REAL:
-        skip("push allowlists", "fake mode only: the calls are scripted")
+        skip("push guards", "fake mode only: the calls are scripted")
         return
     agid, sbx = ids["agent"], ids["sandbox"]
     ca = os.path.join(WORK, "root-ca.pem")
-    st, p = api("PUT", f"/v1/sandboxes/{sbx}/policy", {**E2E_POLICY, "repos": ["by77er/nest"]})
-    push = next((g for g in (p or {}).get("guards", []) if g.get("name") == "github-push"), {}) if st == 200 else {}
-    check("repos: the push allowlist becomes a github-push guard excepting by77er/nest",
-          {"path": "/by77er/nest/**"} in push.get("allow", []), json.dumps(push)[:300])
+    st, p = api("PUT", f"/v1/sandboxes/{sbx}/policy", {**E2E_POLICY, "guards": [*E2E_POLICY.get("guards", []), E2E_PUSH_GUARD]})
+    names = [g.get("name") for g in (p or {}).get("guards", [])] if st == 200 else []
+    check("push guard: the operator's guard is the sandbox's, and nest adds no GitHub guard of its own",
+          "push-allowlist" in names and not any(n.startswith("github-") for n in names), f"{st} {names}")
     # The policy reaches nest-proxy a moment after the API answers: each request tries for up to 10 s.
     def until_guarded(url, method="GET"):
         return {"command": f"for i in $(seq 10); do out=$(curl -s -m 15 --cacert {ca} -X {method} '{url}' -w '\nhttp=%{{http_code}}'); "
@@ -1285,18 +1292,18 @@ def run_repos(ids):
         ("git", "Bash", {"command": git}),
     ])
     for label in ("receive", "discovery"):
-        check(f"repos: nest-proxy refuses a {label} request for a repo not on the allowlist (403, github-push)",
-              "http=403" in text(label) and '"guard":"github-push"' in text(label).replace(" ", ""), text(label).replace("\n", " | ")[:300])
+        check(f"push guard: nest-proxy refuses a {label} request for a repo the guard doesn't allow (403, push-allowlist)",
+              "http=403" in text(label) and '"guard":"push-allowlist"' in text(label).replace(" ", ""), text(label).replace("\n", " | ")[:300])
     code = re.search(r"http=(\d+)", text("allowed"))
-    check("repos: the allowed repo's push discovery passes the guard and reaches GitHub",
+    check("push guard: the allowed repo's push discovery passes the guard and reaches GitHub",
           code and code.group(1) not in ("000", "403") and text("allowed").strip().endswith("0"), text("allowed").replace("\n", " | ")[:200])
-    check("repos: a real `git push` to a repo not on the allowlist fails at the proxy",
+    check("push guard: a real `git push` to a repo the guard doesn't allow fails at the proxy",
           "403" in text("git") and "rc=0" not in text("git"), text("git").replace("\n", " | ")[:300])
     try:
-        wait_for(lambda: any("guard: github-push" in b for b in r2_blobs()) or None, 20, 1.0, "guard refusal in the egress audit")
-        check("repos: the refusal is in the egress audit (reason guard: github-push)", True)
+        wait_for(lambda: any("guard: push-allowlist" in b for b in r2_blobs()) or None, 20, 1.0, "guard refusal in the egress audit")
+        check("push guard: the refusal is in the egress audit (reason guard: push-allowlist)", True)
     except TimeoutError as e:
-        check("repos: the refusal is in the egress audit (reason guard: github-push)", False, str(e)[:200])
+        check("push guard: the refusal is in the egress audit (reason guard: push-allowlist)", False, str(e)[:200])
 
 
 # ---------------------------------------------------------------------------------- checkpoints

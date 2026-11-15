@@ -146,6 +146,8 @@ python3 -I dev/cloud-checks/brokered_check.py
 
 ## `push_check.py`
 
+**Retired** (2026-11-15): nest mints no repo tokens and builds no push allowlist ([no repo tokens](../../docs/sandbox/networking/egress/policy/#no-repo-tokens)), so the script exits 2 at once without touching the cell. Phase C6 replaces it with a client-guard check. What it checked:
+
 [Push allowlists](../../docs/sandbox/networking/egress/) end to end on the current guest image: a real Claude Code worker on a fresh sandbox allowed to push only to `REPO` pushes a throwaway branch there, and nest-proxy refuses push requests to any other repo. The probes to other repos carry no data and no real credential.
 
 ```bash

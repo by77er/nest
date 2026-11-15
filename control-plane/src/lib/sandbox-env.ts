@@ -23,19 +23,6 @@ const RESERVED = new Set(["PATH", "HOME", "USER", "LOGNAME", "SHELL", "PWD", "OL
   // they could only break TLS through the proxy.
   "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR", "CURL_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "GIT_SSL_CAINFO"]);
 
-/**
- * What git and `gh` would use over the GitHub token nest itself injects (the image's `GITHUB_TOKEN`
- * placeholder, which nest-proxy swaps for the token minted for a sandbox's repos): `gh` prefers `GH_TOKEN`
- * to `GITHUB_TOKEN`, the enterprise tokens are its others, git asks `GIT_ASKPASS` where no helper answers,
- * and takes config from `GIT_CONFIG*` (`GIT_CONFIG_COUNT`/`_KEY_<n>`/`_VALUE_<n>`, `_PARAMETERS`, `_GLOBAL`,
- * `_SYSTEM`, `_NOSYSTEM`: a credential helper or an `http.extraHeader` of its own over the image's).
- * Reserved only in a sandbox where nest injects a GitHub token of its own (`githubEnvConflict`): a client's
- * value there would take that access over. Elsewhere they are a client's to set (its own token's
- * placeholder, its own credential helper). Goes when the kernel's GitHub token does (docs/README.md, principle 10).
- */
-const GITHUB_ENV = new Set(["GITHUB_TOKEN", "GH_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GIT_ASKPASS"]);
-export const isGithubEnvName = (n: string): boolean => GITHUB_ENV.has(n) || n.startsWith("GIT_CONFIG");
-
 export const EnvName = z.string().regex(/^[A-Z_][A-Z0-9_]{0,63}$/, "an env name is 1-64 of A-Z, 0-9 and '_', not starting with a digit")
   .refine((n) => !RESERVED.has(n) && !n.startsWith("NEST_"),
     "that env name is nest's or the guest's own (PATH, HOME, NEST_*, the proxy and CA variables, …)");
@@ -56,17 +43,3 @@ export function unboundPlaceholders(env: Readonly<Record<string, string>>, bound
 /** A slot's environment: the sandbox's, then the agent's (which wins on a name both set). */
 export const slotEnv = (sandbox: Readonly<Record<string, string>>, agent: Readonly<Record<string, string>> | undefined): Record<string, string> =>
   ({ ...sandbox, ...(agent ?? {}) });
-
-/**
- * Where nest injects a GitHub token of its own (`kernelGithub`: a push allowlist, read-only repos or a
- * `github_push` opt-in, in the sandbox or an attached agent's spec), the names in any of `envs` that
- * `isGithubEnvName` reserves there, sorted; empty: no conflict.
- */
-export function githubEnvConflict(kernelGithub: boolean, ...envs: (Readonly<Record<string, string>> | undefined)[]): string[] {
-  if (!kernelGithub) return [];
-  return [...new Set(envs.flatMap((e) => Object.keys(e ?? {})).filter(isGithubEnvName))].sort();
-}
-
-/** The refusal for `githubEnvConflict`'s names. */
-export const githubEnvRefusal = (names: readonly string[]): string =>
-  `env ${names.join(", ")}: reserved where nest injects its own GitHub token (repos, read_repos or github_push here, or in an attached agent's spec)`;

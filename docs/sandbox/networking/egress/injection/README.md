@@ -3,21 +3,9 @@
 Sandboxes only ever see **placeholders**. nest-proxy swaps in real credentials on inspected traffic.
 
 ```yaml
-github:
-  hosts: [github.com, api.github.com]       # exact names
-  placeholder: nest-ph-github               # unique per binding
-  where: [authorization.bearer, authorization.basic.password]
-  source: github-app{repos: <the push allowlist>, permissions: {contents: write, pull_requests: write}}   # BrokerDO mints a 1-hour token
-github_read:                                # only with read-only repos
-  hosts: [github.com, api.github.com]
-  placeholder: nest-ph-read-github
-  where: [authorization.bearer, authorization.basic.password]
-  source: github-app{repos: <the read-only repos>, permissions: {contents: read, metadata: read}}
-github_read_default:                        # the same token, with read-only repos and no allowlist
-  placeholder: nest-ph-github               # the guest's default
 stripe-read:
-  hosts: [api.stripe.com]
-  placeholder: nest-ph-stripe-91c2
+  hosts: [api.stripe.com]                   # exact names
+  placeholder: nest-ph-stripe-91c2          # unique per binding
   where: [authorization.bearer]
   methods: [GET]                            # optional; designed, not built
   path_prefix: /v1/charges                  # optional, whole segments; designed, not built
@@ -63,15 +51,4 @@ stripe-read:
 
 ## GitHub
 
-**Moving out (decided 2026-11-12, not built):** the GitHub bindings, their minting and the image's credential helper and `GITHUB_TOKEN` leave the kernel; an app binds its own tokens as [API clients' secrets](#api-clients-bindings) ([principle 10](../../../../README.md#principles)). `git` and `gh` stay in the image. Until then this section describes what runs.
-
-- **GitHub uses a GitHub App (built).** A sandbox with a [push allowlist](../policy/#repo-allowlists) gets the binding `github` from the GitHub rule constructor; BrokerDO mints its installation token narrowed to exactly the allowed repos with `contents: write` (which includes the `contents: read` pull requests need) and `pull_requests: write`, valid for one hour, and SandboxDO pushes it again 15 minutes before it expires ([BrokerDO](../../../../control-plane/durable-objects/broker/#injection-minting)). An operator binding named `github` in the sandbox layer replaces the constructed one (and its static secret is used instead).
-- **`workflows: write` on the push token only when asked** (`github_push: {workflows: true}` in a template, a sandbox spec or the operator's layer; never an API client's, whose grant can't cover it): GitHub refuses a push that changes `.github/workflows/` without it. A pushed workflow runs with the repo's Actions secrets before review, so CI secrets belong in an approval-gated environment ([workflow files](../../../../control-plane/api/clients/#workflow-files)).
-- **Read-only repos get a token of their own** under the binding `github_read`, which can only read, and under `github_read_default` (the default placeholder) when the sandbox has no allowlist ([read-only repos](../policy/#read-only-repos)). An operator binding named `github_read` replaces that one the same way.
-- **The token doesn't decide where a push may go:** the [request guards](../policy/#github) do, whatever credential a request carries.
-- **Defaults in the image (built, `images/guest/`):**
-  - a git credential helper (`git-credential-nest`, set for `https://github.com`) that returns `x-access-token` / the placeholder
-  - `GITHUB_TOKEN=nest-ph-github` (in `/etc/environment`, which init exports into nest-guest's environment), and `gh`
-
-  So `git push` over HTTPS and `gh` work without a real token in the sandbox. The placeholder is fixed in the image, not per sandbox: it is worthless outside nest-proxy, which refuses it to any other host. A test keeps it in step with the constructor's.
-- **Nothing in a sandbox's or agent's `env` may take that over where nest injects it:** the names `gh` and git would prefer to the image's (`GH_TOKEN`, `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, `GIT_ASKPASS`, every `GIT_CONFIG*`) and `GITHUB_TOKEN` are refused in a sandbox with a push allowlist, read-only repos, `github_push` or an operator `github` binding (its own or an attached agent's). A sandbox with none of those is a client's to point at its own token ([environment](../../../../control-plane/api/clients/#environment)).
+nest constructs no GitHub binding and mints no GitHub token ([no repo tokens](../policy/#no-repo-tokens)): an app binds its own tokens as [API clients' secrets](#api-clients-bindings), with its own environment (`GH_TOKEN`, a git credential helper through `GIT_CONFIG_*`) and its own [guards](../policy/#client-guards). `git` and `gh` stay in the image as ordinary tools. **Until phase C4** the guest image still carries a git credential helper (`git-credential-nest`, for `https://github.com`, answering `x-access-token` and `nest-ph-github`) and `GITHUB_TOKEN=nest-ph-github`: nothing fills that placeholder unless an operator binding takes it, so without one it goes to GitHub as an ordinary credential, which GitHub refuses. An app overrides them in its own environment (`GH_TOKEN`, which `gh` prefers to `GITHUB_TOKEN`, and git's configuration through `GIT_CONFIG_*`).

@@ -11,7 +11,6 @@ import {
   ClientInjection, holdInjections, injectHostAllowed, InjectHost, injectionPlaceholder, injectionsOutsideGrant, narrowInjections, wireBinding,
 } from "../src/lib/client-secrets";
 import { Grant } from "../src/lib/clients";
-import { GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER } from "../src/lib/rules/github";
 import { ClientDO } from "../src/do/client";
 import { SandboxDO } from "../src/do/sandbox";
 import { BrokerDO } from "../src/do/broker";
@@ -34,9 +33,10 @@ describe("client injection bindings (pure)", () => {
     expect([fixture.inject[0], ...held.map(wireBinding)]).toEqual(fixture.inject);
   });
 
-  it("no placeholder nest assigns contains another, nor the GitHub ones (nest-proxy finds placeholders as substrings)", () => {
+  it("no placeholder nest assigns contains another, nor the guest image's GitHub ones (nest-proxy finds placeholders as substrings)", () => {
     const names = ["a", "ab", "a_b", "b", "abc_1"];
-    const all = [...["cli_1", "cli_12", "cli_2"].flatMap((c) => names.map((n) => injectionPlaceholder(c, n))), GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER];
+    // The guest image's `GITHUB_TOKEN` and git credential helper still carry `nest-ph-github`, which an operator's binding may take.
+    const all = [...["cli_1", "cli_12", "cli_2"].flatMap((c) => names.map((n) => injectionPlaceholder(c, n))), "nest-ph-github", "nest-ph-read-github"];
     for (const x of all) for (const y of all) expect(x === y || !x.includes(y), `${x} contains ${y}`).toBe(true);
     // A name that could break that is refused.
     for (const bad of ["a-b", "a.b", "A", "_a", ""]) expect(ClientInjection.safeParse({ ...stripe, name: bad }).success, bad).toBe(false);
@@ -344,10 +344,8 @@ describe("client injection bindings", () => {
     await runInDurableObject(stub, (_i, st) => {
       const held = [{ ...stripe(), client: c.id, placeholder: `nest-ph.${c.id}.stripe.` }];
       st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('agent_inject', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ [ag.agent]: held }));
-      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('agent_github_push', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ [ag.agent]: true }));
     });
     expect(await stub.clientInjections()).toEqual([]);
-    expect(await stub.pushWorkflows()).toBe(false);
   });
 
   it("the refresh carries a replaced value, takes a deleted one away, and applies a narrowed grant, with no policy change", async () => {

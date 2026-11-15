@@ -130,7 +130,6 @@ from = ["control-plane/**"]
 only = ["control-plane/**", "protocol/**", "pkg:**"]
 allow = [
   { from = "control-plane/test/routes.test.ts", to = "docs/control-plane/api/clients/README.md", why = "read as text (?raw) to check the documented client routes against the router" },
-  { from = "control-plane/test/repos.test.ts", to = "images/guest/{git-credential-nest,build.sh}", why = "read as text (a raw glob): the guest's git credential helper against the kernel's placeholders; both go in phase C4 of the plan taking GitHub out of the kernel" },
 ]
 example = { from = "control-plane/src/index.ts", to = "projects/src/nest.ts" }
 
