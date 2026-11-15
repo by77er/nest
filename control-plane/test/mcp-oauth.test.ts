@@ -787,26 +787,6 @@ describe("deleting an operator's secret", () => {
     expect(records[0]).toMatchObject({ event: "secret_deleted", name, deleted: true, caller: "operator" });
     expect(JSON.stringify(records)).not.toContain(value);
 
-    // Deleting the GitHub App drops every installation token minted with it (restored for the other tests).
-    const was = await runInDurableObject(broker(), (_: BrokerDO, st) =>
-      st.storage.sql.exec<{ value: string }>("SELECT value FROM secrets WHERE name = 'github_app'").toArray()[0]?.value ?? null);
-    const tokens = () => runInDurableObject(broker(), (_: BrokerDO, st) =>
-      st.storage.sql.exec("SELECT 1 FROM github_tokens WHERE key = 'k-del'").toArray().length);
-    await runInDurableObject(broker(), (_: BrokerDO, st) => {
-      st.storage.sql.exec("INSERT OR REPLACE INTO github_tokens (key, token, expires_ms, installation, minted_ms) VALUES ('k-del', 't', ?, 1, 0)", Date.now() + 3_600_000);
-      st.storage.sql.exec("INSERT OR IGNORE INTO secrets (name, value, updated_ms) VALUES ('github_app', 'x', 0)");
-    });
-    try {
-      await adminJson(`/v1/admin/secrets/${name}x`, { method: "DELETE" });
-      expect(await tokens()).toBe(1);
-      expect(await adminJson("/v1/admin/secrets/github_app", { method: "DELETE" })).toEqual({ deleted: true });
-      expect(await tokens()).toBe(0);
-    } finally {
-      await runInDurableObject(broker(), (_: BrokerDO, st) => {
-        if (was !== null) st.storage.sql.exec("INSERT OR REPLACE INTO secrets (name, value, updated_ms) VALUES ('github_app', ?, 0)", was);
-      });
-    }
-
     expect((await adminJson("/v1/admin/secrets/binding_key:use1", { method: "DELETE" }, 403)).error.code).toBe("forbidden");
     expect((await adminJson("/v1/admin/secrets/client-secret:cli_x:name", { method: "DELETE" }, 403)).error.code).toBe("forbidden");
   });

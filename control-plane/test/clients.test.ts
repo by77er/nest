@@ -82,8 +82,8 @@ describe("grants, tokens and labels (pure)", () => {
     expect(Grant.safeParse({ unknown_field: 1 }).success).toBe(false);
   });
 
-  it("a spec is outside the grant by its credential, mcp servers and their secrets; no grant covers repos, a push token's workflows or a brokered action", () => {
-    const within = { credential: "claude_oauth_token", repos: [], read_repos: [] };
+  it("a spec is outside the grant by its credential, mcp servers and their secrets; no grant covers a brokered action", () => {
+    const within = { credential: "claude_oauth_token" };
     expect(specOutsideGrant(within, grant)).toEqual([]);
     expect(specOutsideGrant({ ...within, credential: "claude_oauth_token:worker" }, grant)).toEqual(["credential claude_oauth_token:worker"]);
     const mcp = (url: string, auth: string, client?: string) => ({
@@ -96,10 +96,6 @@ describe("grants, tokens and labels (pure)", () => {
     // Whatever a stored grant once said of GitHub: read, it covers none of these.
     const old = storedGrant({ ...grant, repos: ["acme/app"], read_repos: ["acme/lib"], github_push: { workflows: true }, github: { repos: ["acme/app"], permissions: { checks: "write" } } });
     for (const g of [grant, old]) {
-      expect(specOutsideGrant({ ...within, repos: ["Acme/App"] }, g)).toEqual(["repos acme/app"]);
-      expect(specOutsideGrant({ ...within, read_repos: ["acme/lib"] }, g)).toEqual(["read_repos acme/lib"]);
-      expect(specOutsideGrant({ ...within, github_push: { workflows: true } }, g)).toEqual(["github_push.workflows"]);
-      expect(specOutsideGrant({ ...within, github_push: { workflows: false } as never }, g)).toEqual([]);
       for (const b of [{ capability: "h", action: "http.request", profile: "p" } as any]) {
         expect(specOutsideGrant({ ...within, brokered: [b] }, g)).toEqual([`brokered action ${b.action} (${b.capability})`]);
         expect(capabilityOutsideGrant("n/b", { tools: [], rules: [], prompt: "", brokered: [{ ...b, capability: undefined }] } as any, g)).toEqual([`brokered action ${b.action} (n/b)`]);
@@ -702,16 +698,11 @@ describe("the grant bounds everything in the subtree", () => {
     // Another client's namespace isn't visible.
     const other = await newClient();
     expect((await createAgent(c, { template: other.tpl }, 400)).error.message).toContain("unknown template");
-    // Repos: no grant covers one, to push or to read, whoever writes the template into the namespace.
-    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/pusher`, { method: "PUT", body: basic({ repos: ["Acme/App"] }) }, 403)).error.message)
-      .toContain("repos acme/app");
-    expect((await adminJson(`/v1/catalog/templates/${c.name}/reader`, { method: "PUT", body: basic({ read_repos: ["acme/lib"] }) }, 403)).error.message)
-      .toContain("read_repos acme/lib");
-    // One stored before (a grant that had repos then) is refused at spawn.
-    await runInDurableObject(env.CATALOG.get(env.CATALOG.idFromName("catalog")), (_i, st) => {
-      st.storage.sql.exec("INSERT OR REPLACE INTO templates (name, body) VALUES (?, ?)", `${c.name}/old`, JSON.stringify(basic({ repos: ["acme/app"], read_repos: ["acme/lib"] })));
-    });
-    expect((await createAgent(c, { template: `${c.name}/old` }, 403)).error.message).toMatch(/repos acme\/app; read_repos acme\/lib/);
+    // Repos: no template holds one now, whoever writes it into the namespace (docs/sandbox/networking/egress/policy/#no-repo-tokens).
+    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/pusher`, { method: "PUT", body: basic({ repos: ["Acme/App"] }) }, 400)).error.message)
+      .toContain("repos is no longer accepted");
+    expect((await adminJson(`/v1/catalog/templates/${c.name}/reader`, { method: "PUT", body: basic({ read_repos: ["acme/lib"] }) }, 400)).error.message)
+      .toContain("read_repos is no longer accepted");
   });
 
   it("a grant stored with GitHub fields reads without them, is held to none of them, and is written back without them", async () => {
@@ -740,8 +731,8 @@ describe("the grant bounds everything in the subtree", () => {
     expect(removed.filter((k) => Object.hasOwn(scope.grant, k))).toEqual(["repos"]);
     expect((scope.grant as { repos?: unknown }).repos).toEqual([]);
     // Held to none: what they once allowed is refused; what never needed them still runs.
-    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/pusher`, { method: "PUT", body: basic({ repos: ["acme/app"] }) }, 403)).error.message).toContain("repos acme/app");
-    expect((await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true } } }, 403)).error.message).toContain("github_push.workflows");
+    expect((await asJson(c.token, `/v1/catalog/templates/${c.name}/pusher`, { method: "PUT", body: basic({ repos: ["acme/app"] }) }, 400)).error.message).toContain("repos is no longer accepted");
+    expect((await asJson(c.token, "/v1/sandboxes", { body: { cell: c.cell, github_push: { workflows: true } } }, 400)).error.message).toContain("github_push.workflows is no longer accepted");
     await createAgent(c);
     // Written back as the operator read it, with what the previous release's GET showed for no GitHub authority: taken.
     // The Worker hands ClientDO the grant with `repos: []`, so a ClientDO still on the previous release (the

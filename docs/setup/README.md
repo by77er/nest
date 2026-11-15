@@ -94,7 +94,6 @@ Nothing new to provide. Brain hosts live in the same account and cell, launched 
 
 | What | Needed for | Environment variables |
 |---|---|---|
-| **GitHub App:** the repository permissions its agents need (at least Contents and Pull requests: read and write), installed on every repo a sandbox may push to or read: chosen repos (or "All repositories") | Credential injection for `git push` to a sandbox's push allowlist ([BrokerDO](../control-plane/durable-objects/broker/#injection-minting)) | `NEST_GITHUB_APP_ID`, `NEST_GITHUB_APP_PRIVATE_KEY` (the PEM) |
 | **An analytics read token:** a custom Cloudflare API token with Account → Account Analytics → Read | The `metrics` capability ([metrics](../control-plane/metrics/); designed, not built: nothing reads the token yet) | `CLOUDFLARE_ANALYTICS_TOKEN` |
 | **The `bitcru.sh` zone on Cloudflare,** plus a Zero Trust team for Access | The tunnel path to every sandbox host (hands; terminals, previews and share links designed), and Access in front of the gateways, previews and dashboard ([hostnames](#hostnames), [gateway](../sandbox/gateway/), [ingress](../sandbox/networking/ingress/)) | The Worker var `NEST_DOMAIN=nest.bitcru.sh` (its first label is the nest label, the rest is the zone; `dev/deploy-use1.sh` passes it) and the Worker var `CLOUDFLARE_ACCOUNT_ID`, which the deploy reads from the SSM parameter `/nest/control-plane/vars/CLOUDFLARE_ACCOUNT_ID`: create it once by hand (`dev/setup.md`) |
 | **A tunnel token:** a custom Cloudflare API token with Account → Cloudflare One Connector: cloudflared (Cloudflare Tunnel) → Edit and Zone → DNS → Edit for the `bitcru.sh` zone | FleetDO creates one tunnel (`nest-<host>`) and one DNS record (`<host>-gw-nest.bitcru.sh`) per sandbox host at enrollment, deletes them when the host dies, and sweeps leaks daily ([gateway](../sandbox/gateway/), [FleetDO](../control-plane/durable-objects/fleet/), [remote tunnel API](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel-api/)) | A secret on the GitHub `production` environment, `CLOUDFLARE_TUNNEL_API_TOKEN`; the deploy writes it to the Worker as a secret of the same name |
@@ -127,6 +126,6 @@ The setup agent creates these itself, so none are needed from me:
 
 - **Claude:** revoke the setup token(s). Where tokens are revoked isn't in the public docs (unverified); stage 1 checks it.
 - **Cloudflare:** delete the API tokens; `wrangler delete` removes the Worker.
-- **GitHub:** delete the App; its key goes with it. Revoke the `github_user` token if one was made.
+- **GitHub:** revoke the `github_user` token if one was made; an app's GitHub App is that app's to delete.
 - **AWS:** terminate every instance tagged `nest=true`, delete the stacks or resources, schedule the root CA key's deletion in KMS, and deactivate the `nest-provisioner` key. Closing a dedicated account removes everything.
 - **Environment settings:** remove the variables.

@@ -59,10 +59,8 @@ export interface Env {
   MCP_CALL_TIMEOUT_MS?: string;
   /** The budget of listing one MCP server's tools, initialize included (default 4 s; the runner waits 10 s for a tool list). */
   MCP_LIST_TIMEOUT_MS?: string;
-  /** "1" lets a brokered http profile, and `GITHUB_API_URL`, name a loopback URL: tests and local development only. */
+  /** "1" lets a brokered http profile name a loopback URL: tests and local development only. */
   ALLOW_LOOPBACK_BROKERED?: string;
-  /** The GitHub REST API the App's mints use (default https://api.github.com); a fake, for local development. */
-  GITHUB_API_URL?: string;
   /** How long one brokered request may take (default 30 s; below the runner's 150 s platform call timeout). */
   BROKERED_TIMEOUT_MS?: string;
   /** How long an MCP call waits for one of its server's call slots before `rate_limited` (default 10 s). */

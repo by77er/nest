@@ -40,6 +40,6 @@ credential: claude_oauth_token:captain   # revocable separately from workers
 ## Safeguards
 
 - A captain acts only through tool calls bounded by its grants, its budget and its taint; all three are bounded by mine.
-- Its workers get what the `worker` template gives, narrowed by the captain's overrides and never widened: the spawn grant on the template (its capability's `spawn`) is the operator's authorization for it, so a captain that holds no repos still spawns workers that push. Budgets aren't built (fixed depth and live-children caps stand in). The `worker` template gives agents with hands no management capabilities (no `spawning`, `management` or `authority`); its interim `sandboxes` lists only `fork_sandbox`, which answers `not_implemented`.
+- Its workers get what the `worker` template gives, narrowed by the captain's overrides and never widened: the spawn grant on the template (its capability's `spawn`) is the operator's authorization for it, so a captain that holds no hands tools still spawns workers that have them. Budgets aren't built (fixed depth and live-children caps stand in). The `worker` template gives agents with hands no management capabilities (no `spawning`, `management` or `authority`); its interim `sandboxes` lists only `fork_sandbox`, which answers `not_implemented`.
 - It can use a separate setup token from workers (`credential` above).
 - `priority: high` reserves subscription headroom for it (designed, not built: [scheduling](../scheduling/)).

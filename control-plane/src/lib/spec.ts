@@ -8,12 +8,10 @@ import { Credential, LaunchConfig, setupTokenSecret, ToolRule } from "../protoco
 import { capabilityNameClash, checkMcpUrl, grantOf, type McpGrant, McpSource } from "./mcp";
 import { ClientInjections, type HeldInjection, holdInjections, narrowInjections } from "./client-secrets";
 import { actionOfTool, BROKERED_TOOL_NAMES, BrokeredSource, REMOVED_TOOL_NAMES, type BrokeredGrant, checkBrokered, grantOfEntry, StoredBrokeredSource } from "./brokered";
-import { canonicalRepos, narrowRepos, readOnlyRepos, Repos } from "./repos";
 import { MIN_IDLE_TTL_MS, narrowTtl } from "./lifetimes";
-import { GithubPush } from "./rules/github";
 import { ClientEgress, type EgressRule, narrowEgress } from "./client-egress";
 import { ClientGuards, type HeldGuard, holdGuards } from "./client-guards";
-import { githubEnvConflict, githubEnvRefusal, SandboxEnv, unboundPlaceholders } from "./sandbox-env";
+import { SandboxEnv, unboundPlaceholders } from "./sandbox-env";
 
 /** A catalog entry's name: lowercase, digits and `-`. */
 export const CatalogName = z.string().regex(/^[a-z][a-z0-9-]{0,62}$/, "names are lowercase letters, digits and '-'");
@@ -52,6 +50,41 @@ export type Capability = z.output<typeof Capability>;
  */
 export const StoredCapability = Capability.extend({ brokered: StoredBrokeredSource.optional() });
 
+/** Why a field that left with nest's own repo tokens is refused when it would still grant something. */
+const goneField = (field: string) =>
+  `${field} is no longer accepted: nest mints no repo tokens (an app injects its own credential and guards its own writes); leave it out`;
+
+/**
+ * The fields templates, spawn overrides and sandbox layers held while the kernel minted GitHub tokens
+ * (docs/sandbox/networking/egress/policy/#no-repo-tokens): a push allowlist (`repos`), read-only repos
+ * (`read_repos`) and a push token's opt-ins (`github_push`). For one release a write may still name one
+ * that grants nothing (an empty list, `workflows: false`: what an app narrowing to none sends), which is
+ * dropped; one that grants anything is refused. A stored entry holding them reads without them.
+ */
+export const RemovedRepoFields = {
+  repos: z.array(z.unknown()).max(0, goneField("repos")).optional(),
+  read_repos: z.array(z.unknown()).max(0, goneField("read_repos")).optional(),
+  github_push: z.object({ workflows: z.literal(false, { error: goneField("github_push.workflows") }).optional() }).optional(),
+};
+export type RemovedRepoField = keyof typeof RemovedRepoFields;
+const REMOVED_REPO_FIELDS = Object.keys(RemovedRepoFields) as RemovedRepoField[];
+
+/** `v` without the removed fields (`RemovedRepoFields`), as stored and used. */
+export function withoutRemovedRepoFields<T extends object>(v: T): Omit<T, RemovedRepoField> {
+  const out = { ...v } as Record<string, unknown>;
+  for (const k of REMOVED_REPO_FIELDS) delete out[k];
+  return out as Omit<T, RemovedRepoField>;
+}
+
+/**
+ * The refusal for an object a caller of the previous release handed over unchecked (its schema still took
+ * the fields): null when its removed fields grant nothing.
+ */
+export function removedRepoFieldsRefusal(v: unknown): string | null {
+  const r = z.object(RemovedRepoFields).safeParse(v);
+  return r.success ? null : r.error.issues.map((i) => i.message).join("; ");
+}
+
 export const Template = z.object({
   capabilities: z.array(EntryName),
   /** Model, effort, built-in tools and the base system prompt; capability prompts are appended to its text. */
@@ -59,16 +92,6 @@ export const Template = z.object({
   /** Whether a spawn from it takes a sandbox. */
   hands: HandsRule,
   credential: Credential,
-  /**
-   * The repos its agents may push to (docs/sandbox/networking/egress/policy/#repo-allowlists): joined to
-   * its sandbox's allowlist while attached.
-   */
-  repos: Repos.optional(),
-  /**
-   * The repos its agents may only read (docs/sandbox/networking/egress/policy/#read-only-repos): joined to
-   * its sandbox's read-only repos while attached, never pushed to. A repo also in `repos` may be pushed to.
-   */
-  read_repos: Repos.optional(),
   /** Its agents stop themselves once their work is done (docs/agents/#lifetimes); a spawn may set it, never clear it. */
   ephemeral: z.boolean().optional(),
   /** The idle TTL of a sandbox `agent_spawn` creates for its agents (a spawn may only shorten it); absent: the cell default. */
@@ -80,8 +103,6 @@ export const Template = z.object({
    * only a template in a client's namespace declares them. Joined to the sandbox's bindings while attached.
    */
   inject: ClientInjections.optional(),
-  /** What its agents' sandboxes' GitHub push token carries beyond the default (docs/control-plane/api/clients/#workflow-files). */
-  github_push: GithubPush.optional(),
   /**
    * Allow rules its agents' sandboxes get while they are attached (docs/control-plane/api/clients/#egress):
    * in a client's subtree, within its grant's `egress_hosts`.
@@ -99,6 +120,8 @@ export const Template = z.object({
   guards: ClientGuards.optional(),
 });
 export type Template = z.output<typeof Template>;
+/** A template as a route takes it: {@link Template}, and the removed fields only when they grant nothing (dropped). */
+export const TemplateInput = Template.extend(RemovedRepoFields).transform((t): Template => withoutRemovedRepoFields(t));
 
 /**
  * What the operator may change at spawn (the admin API only; it holds the root): replace the launch
@@ -109,16 +132,11 @@ export const OperatorOverrides = z.object({
   rules: z.array(ToolRule).optional(),
   tools: z.array(z.string()).optional(),
   credential: Credential.optional(),
-  /** The push allowlist, replacing the template's. */
-  repos: Repos.optional(),
-  /** The read-only repos, replacing the template's. */
-  read_repos: Repos.optional(),
+  ...RemovedRepoFields,
   /** Replaces the template's. */
   ephemeral: z.boolean().optional(),
   /** A narrowing of the template's injection bindings (see `narrowInjections`): the operator holds no client's secrets either. */
   inject: ClientInjections.optional(),
-  /** Replaces the template's. */
-  github_push: GithubPush.optional(),
   /** Replaces the template's egress rules. */
   egress: ClientEgress.optional(),
   /** Set over the template's environment (a name in both takes this value). */
@@ -138,23 +156,11 @@ export type OperatorOverrides = z.output<typeof OperatorOverrides>;
 export const SpawnerOverrides = z.strictObject({
   tools: z.array(z.string()).optional(),
   rules: z.array(ToolRule.extend({ decision: z.enum(["deny", "ask"]) })).optional(),
-  /**
-   * A subset of the template's push allowlist. Narrowed against the template, not the spawner's own:
-   * the spawn grant on the template (a capability's `spawn`) is the operator's authorization for what
-   * it gives, as for tools (a captain holds no repos, yet spawns workers that push).
-   */
-  repos: Repos.optional(),
-  /**
-   * A subset of the repos the template lets its agents read: its read-only repos, or its push allowlist
-   * (read access to a repo it may push to is less). Narrowed against the template, as `repos` is.
-   */
-  read_repos: Repos.optional(),
+  ...RemovedRepoFields,
   ephemeral: z.literal(true).optional(),
   sandbox_idle_ttl_ms: z.number().int().min(MIN_IDLE_TTL_MS).optional(),
   /** A narrowing of the template's injection bindings: each one of its, with a subset of its hosts and locations. */
   inject: ClientInjections.optional(),
-  /** Only off: a spawner can drop the template's `workflows`, never ask for it. */
-  github_push: z.strictObject({ workflows: z.literal(false) }).optional(),
   /** A narrowing of the template's egress rules: its hosts only, a subset of their ports. */
   egress: ClientEgress.optional(),
   /** Set over the template's environment: values are literals or the spec's own placeholders, so this grants nothing. */
@@ -189,10 +195,6 @@ export interface AgentSpec {
   mcp?: McpGrant[];
   /** Its brokered action grants, in capability order; absent when it has none (as is every stored spec before them). */
   brokered?: BrokeredGrant[];
-  /** Its push allowlist, canonical; absent when empty (as is every stored spec before it). */
-  repos?: string[];
-  /** Its read-only repos, canonical and none of them in `repos`; absent when empty (as is every stored spec before them). */
-  read_repos?: string[];
   /** The templates it may spawn from: the union of its capabilities' `spawn`; absent when none. */
   spawn?: string[];
   /** It stops itself once its work is done (docs/agents/#lifetimes); absent: it doesn't. */
@@ -201,8 +203,6 @@ export interface AgentSpec {
   sandbox_idle_ttl_ms?: number;
   /** Its client's injection bindings, joined to its sandbox's while attached; absent when none (as in every spec before them). */
   inject?: HeldInjection[];
-  /** Its sandbox's push token also carries `workflows: write`; absent: it doesn't. */
-  github_push?: { workflows: true };
   /** Allow rules its sandbox gets while it is attached; absent when none (as in every spec before them). */
   egress?: { allow: EgressRule[] };
   /** Its processes' environment in its sandbox; absent when none. */
@@ -727,9 +727,6 @@ export function expandTemplate(
   // before it went): ignored, not a failed spawn. Writes still refuse one (`checkCapability`).
   const given = new Set(caps.flatMap((c) => c.tools).filter((t) => registry.includes(t)));
   const prompt = [tpl.launch.system_prompt.text, ...caps.map((c) => c.prompt)].filter((t) => t.length > 0).join("\n\n");
-  // Kept whole here (a repo also in `repos` included), so an override that drops it from the
-  // allowlist leaves it readable; `withRepos` subtracts the final allowlist.
-  const readOnly = canonicalRepos(tpl.read_repos ?? []);
   // A template's bindings name its own namespace's secrets, so only a client's template has them.
   let inject: HeldInjection[] = [];
   if (tpl.inject?.length) {
@@ -761,40 +758,23 @@ export function expandTemplate(
     credential: tpl.credential,
     ...(mcp.length ? { mcp } : {}),
     ...(brokered.length ? { brokered } : {}),
-    ...(tpl.repos?.length ? { repos: canonicalRepos(tpl.repos) } : {}),
-    ...(readOnly.length ? { read_repos: readOnly } : {}),
     ...(spawn.length ? { spawn } : {}),
     ...(tpl.ephemeral ? { ephemeral: true as const } : {}),
     ...(tpl.sandbox_idle_ttl_ms !== undefined ? { sandbox_idle_ttl_ms: tpl.sandbox_idle_ttl_ms } : {}),
     ...(inject.length ? { inject } : {}),
-    ...(tpl.github_push?.workflows ? { github_push: { workflows: true as const } } : {}),
     ...(tpl.egress?.allow.length ? { egress: { allow: tpl.egress.allow.map((r) => ({ ...r })) } } : {}),
     ...(tpl.env && Object.keys(tpl.env).length ? { env: { ...tpl.env } } : {}),
     ...(guards.length ? { guards } : {}),
   }, name, undefined);
 }
 
-/**
- * The spec with `env` set over its own; refused when a value holds a placeholder none of its bindings
- * has, or when it sets a GitHub name (`isGithubEnvName`) beside repos or a `github_push` that make nest
- * inject its own GitHub token.
- */
+/** The spec with `env` set over its own; refused when a value holds a placeholder none of its bindings has. */
 function withEnv(spec: AgentSpec, name: string, over: Readonly<Record<string, string>> | undefined): Result<AgentSpec> {
   const env = { ...(spec.env ?? {}), ...(over ?? {}) };
   const unbound = unboundPlaceholders(env, (spec.inject ?? []).map((b) => b.placeholder));
   if (unbound.length) return err(`template ${name}: ${unbound.join("; ")}`);
-  const github = githubEnvConflict(!!spec.repos?.length || !!spec.read_repos?.length || !!spec.github_push?.workflows, env);
-  if (github.length) return err(`template ${name}: ${githubEnvRefusal(github)}`);
   const { env: _e, ...rest } = spec;
   return ok({ ...rest, ...(Object.keys(env).length ? { env } : {}) });
-}
-
-/** The spec with this push allowlist and these read-only repos, recorded (a repo on both is pushable). */
-function withRepos(spec: AgentSpec, repos: readonly string[], readRepos: readonly string[]): AgentSpec {
-  const { repos: _, read_repos: _read, ...rest } = spec;
-  const r = canonicalRepos(repos);
-  const read = readOnlyRepos(r, readRepos);
-  return { ...rest, ...(r.length ? { repos: r } : {}), ...(read.length ? { read_repos: read } : {}) };
 }
 
 /**
@@ -862,22 +842,16 @@ export function expandSpec(
     if (!o.success) return err(`a spawner can only narrow tools and add deny or ask rules: ${o.error.issues.map((i) => i.message).join("; ")}`);
     const tools = narrowTools(spec.template, base.value, o.data.tools);
     if (!tools.ok) return tools;
-    const repos = narrowRepos(base.value.repos ?? [], o.data.repos ?? base.value.repos ?? []);
-    if (!repos.ok) return err(`template ${spec.template}: ${repos.error}`);
-    const readable = [...(base.value.repos ?? []), ...(base.value.read_repos ?? [])];
-    const readRepos = narrowRepos(readable, o.data.read_repos ?? base.value.read_repos ?? [], "the repos it may read");
-    if (!readRepos.ok) return err(`template ${spec.template}: ${readRepos.error}`);
     const inject = narrowInjections(base.value.inject ?? [], o.data.inject);
     if (!inject.ok) return err(`template ${spec.template}: ${inject.error}`);
     const egress = narrowEgress(base.value.egress?.allow ?? [], o.data.egress?.allow);
     if (!egress.ok) return err(`template ${spec.template}: ${egress.error}`);
-    const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, inject: _i, github_push: _g, egress: _x, guards: _gd, ...rest } = base.value;
-    const push = o.data.github_push?.workflows === false ? undefined : base.value.github_push;
+    const { mcp: _mcp, brokered: _brokered, ephemeral: _e, sandbox_idle_ttl_ms: _t, inject: _i, egress: _x, guards: _gd, ...rest } = base.value;
     // Its guards join the template's, held as its subtree's client's: a spawner adds refusals, never removes one.
     if (o.data.guards?.length && ns !== null && !Object.hasOwn(clients, ns)) return err(`template ${spec.template}: no client is named ${ns}`);
     const guards = [...(base.value.guards ?? []), ...holdGuards(ns === null ? null : clients[ns]!, o.data.guards ?? [])];
     const extras = {
-      ...(inject.value.length ? { inject: inject.value } : {}), ...(push ? { github_push: push } : {}),
+      ...(inject.value.length ? { inject: inject.value } : {}),
       ...(egress.value.length ? { egress: { allow: egress.value } } : {}), ...(guards.length ? { guards } : {}),
     };
     // Lifetimes only shorten: ephemeral once set stays, and the shorter TTL wins.
@@ -890,29 +864,27 @@ export function expandSpec(
     // Its narrowing first, kept apart from the capabilities' rules, which it reads as they are now.
     const narrowing: RuleSource[] = o.data.rules?.length ? [{ rules: o.data.rules.map((r) => ({ ...r })) }] : [];
     const rule_sources = [...narrowing, ...(base.value.rule_sources ?? [])];
-    return withEnv(withRepos({
+    return withEnv({
       ...rest, ...tools.value, ...lifetimes, ...extras, rules: dedupeRules([...(o.data.rules ?? []), ...base.value.rules]), rule_sources,
-    }, repos.value, readRepos.value), spec.template, o.data.env);
+    }, spec.template, o.data.env);
   }
   const o = spec.overrides ?? {};
   const tools = narrowTools(spec.template, base.value, o.tools);
   if (!tools.ok) return tools;
   const inject = narrowInjections(base.value.inject ?? [], o.inject);
   if (!inject.ok) return err(`template ${spec.template}: ${inject.error}`);
-  const { mcp: _mcp, brokered: _brokered, ephemeral: _ephemeral, inject: _i, github_push: _g, egress: _egress, guards: _gd, ...rest } = base.value;
+  const { mcp: _mcp, brokered: _brokered, ephemeral: _ephemeral, inject: _i, egress: _egress, guards: _gd, ...rest } = base.value;
   const ephemeral = o.ephemeral ?? base.value.ephemeral ?? false;
-  const workflows = o.github_push ? o.github_push.workflows : !!base.value.github_push?.workflows;
   const egress = o.egress ? o.egress.allow : base.value.egress?.allow ?? [];
   // The operator's replace the template's (the operator holds the root), held as the operator's.
   const guards = o.guards ? holdGuards(null, o.guards) : base.value.guards ?? [];
   // The operator's own launch is held to the same rule where it's used.
   const badLaunch = launchProblem(o.launch);
   if (badLaunch) return err(badLaunch);
-  return withEnv(withRepos({
+  return withEnv({
     ...rest,
     ...tools.value,
     ...(inject.value.length ? { inject: inject.value } : {}),
-    ...(workflows ? { github_push: { workflows: true as const } } : {}),
     ...(egress.length ? { egress: { allow: egress.map((r) => ({ ...r })) } } : {}),
     ...(guards.length ? { guards } : {}),
     ...(ephemeral ? { ephemeral: true as const } : {}),
@@ -921,7 +893,7 @@ export function expandSpec(
     // The operator's rules replace the capabilities' (today's meaning) until cleared; the sources stay for then.
     ...(o.rules ? { rules_set: true as const } : {}),
     credential: o.credential ?? base.value.credential,
-  }, o.repos ?? base.value.repos ?? [], o.read_repos ?? base.value.read_repos ?? []), spec.template, o.env);
+  }, spec.template, o.env);
 }
 
 // --- Records stored with a role (the previous release) ----------------------------------------------

@@ -35,6 +35,7 @@ import { decodeCursor, encodeCursor, HISTORY_DEFAULT_LIMIT, type HistoryCursor, 
 import { Deadlines, ReliableChannels, SerialQueue } from "../lib/reliable";
 import {
   type AgentSpec, changedLaunch, joinRules, type LaunchChange, launchProblem, liveCapabilities, type RoleRecord, type RuleSource, type SpawnerOverrides, specFromRole,
+  withoutRemovedRepoFields,
 } from "../lib/spec";
 import {
   AGENT_RECORD_RETENTION_MS, cellIdleTtlMs, END_GRACE_MS, END_RETRY_MS, type Ended, type EndReason, ephemeralDone, MAX_OWNER_HOPS, narrowTtl, ownsVia,
@@ -614,10 +615,11 @@ export class AgentDO extends DurableObject<Env> {
       if (cur.cell !== req.cell) {
         throw new NestError(ErrorCodes.INVALID_MESSAGE, `${req.sandbox} is in cell ${cur.cell}; the agent must be too`, 409);
       }
-      // Its client's bindings, push-token opt-ins, egress rules and request guards join the sandbox's while
-      // attached (docs/control-plane/api/clients/#injection, #egress, #request-guards).
-      await stub.attach(req.agent, undefined, req.spec.repos ?? [], req.spec.read_repos ?? [], {
-        ...(req.spec.inject?.length ? { inject: req.spec.inject } : {}), ...(req.spec.github_push?.workflows ? { workflows: true } : {}),
+      // Its client's bindings, egress rules and request guards join the sandbox's while attached
+      // (docs/control-plane/api/clients/#injection, #egress, #request-guards). The two empty lists are the
+      // previous release's repo parameters, which a SandboxDO of that release reads positionally.
+      await stub.attach(req.agent, undefined, [], [], {
+        ...(req.spec.inject?.length ? { inject: req.spec.inject } : {}),
         ...(req.spec.egress?.allow.length ? { egress: req.spec.egress.allow } : {}),
         ...(req.spec.env && Object.keys(req.spec.env).length ? { env: req.spec.env } : {}),
         ...(req.spec.guards?.length ? { guards: req.spec.guards } : {}),
@@ -669,7 +671,9 @@ export class AgentDO extends DurableObject<Env> {
 
   /** The record as the API shows it (without the compat `workstream`), plus its brain host and state. */
   async info(): Promise<AgentView> {
-    const { workstream: _, brokered: stored, ...info } = this.load();
+    // A spec stored while nest minted repo tokens may hold `repos`, `read_repos` and `github_push`: they stay in
+    // the record (a rollback reads them again) and mean nothing here, so the view leaves them out.
+    const { workstream: _, brokered: stored, ...info } = withoutRemovedRepoFields(this.load());
     const grants = this.heldGrants();
     // Grants of a removed action stay in the record (a rollback runs them again), never in the view.
     const brokered = liveGrants(stored);
@@ -1756,8 +1760,6 @@ export class AgentDO extends DurableObject<Env> {
     }
     const overrides: SpawnerOverrides = {
       ...(Array.isArray(a.tools) ? { tools: a.tools.map(String) } : {}),
-      ...(Array.isArray(a.repos) ? { repos: a.repos.map(String) } : {}),
-      ...(Array.isArray(a.read_repos) ? { read_repos: a.read_repos.map(String) } : {}),
       ...(a.ephemeral === true ? { ephemeral: true as const } : {}),
       ...(typeof a.sandbox_idle_ttl_s === "number" ? { sandbox_idle_ttl_ms: a.sandbox_idle_ttl_s * 1000 } : {}),
     };

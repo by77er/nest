@@ -11,7 +11,6 @@ import {
   ClientInjection, holdInjections, injectHostAllowed, InjectHost, injectionPlaceholder, injectionsOutsideGrant, narrowInjections, wireBinding,
 } from "../src/lib/client-secrets";
 import { Grant } from "../src/lib/clients";
-import { GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER } from "../src/lib/rules/github";
 import { ClientDO } from "../src/do/client";
 import { SandboxDO } from "../src/do/sandbox";
 import { BrokerDO } from "../src/do/broker";
@@ -34,9 +33,10 @@ describe("client injection bindings (pure)", () => {
     expect([fixture.inject[0], ...held.map(wireBinding)]).toEqual(fixture.inject);
   });
 
-  it("no placeholder nest assigns contains another, nor the GitHub ones (nest-proxy finds placeholders as substrings)", () => {
+  it("no placeholder nest assigns contains another, nor the guest image's GitHub one (nest-proxy finds placeholders as substrings)", () => {
     const names = ["a", "ab", "a_b", "b", "abc_1"];
-    const all = [...["cli_1", "cli_12", "cli_2"].flatMap((c) => names.map((n) => injectionPlaceholder(c, n))), GITHUB_PLACEHOLDER, GITHUB_READ_PLACEHOLDER];
+    // The guest image's `GITHUB_TOKEN` and git credential helper still carry `nest-ph-github`, which an operator's binding may take.
+    const all = [...["cli_1", "cli_12", "cli_2"].flatMap((c) => names.map((n) => injectionPlaceholder(c, n))), "nest-ph-github"];
     for (const x of all) for (const y of all) expect(x === y || !x.includes(y), `${x} contains ${y}`).toBe(true);
     // A name that could break that is refused.
     for (const bad of ["a-b", "a.b", "A", "_a", ""]) expect(ClientInjection.safeParse({ ...stripe, name: bad }).success, bad).toBe(false);
@@ -344,10 +344,8 @@ describe("client injection bindings", () => {
     await runInDurableObject(stub, (_i, st) => {
       const held = [{ ...stripe(), client: c.id, placeholder: `nest-ph.${c.id}.stripe.` }];
       st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('agent_inject', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ [ag.agent]: held }));
-      st.storage.sql.exec("INSERT INTO kv (key, value) VALUES ('agent_github_push', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", JSON.stringify({ [ag.agent]: true }));
     });
     expect(await stub.clientInjections()).toEqual([]);
-    expect(await stub.pushWorkflows()).toBe(false);
   });
 
   it("the refresh carries a replaced value, takes a deleted one away, and applies a narrowed grant, with no policy change", async () => {
@@ -398,6 +396,57 @@ describe("client injection bindings", () => {
     await adminJson(`/v1/sandboxes/${s.sandbox}/policy`, { method: "PUT", body: { allow: [{ host: "api.stripe.com" }] } });
     const cmds = await nextCommands(s.ws, (x) => x.type === "secrets_update");
     expect(cmds.find((x) => x.type === "secrets_update")!.secrets.map((x: any) => x.binding)).not.toContain("client:stripe");
+  });
+
+  it("a binding taken away leaves the proxy before the policy without it holds: its secrets_update comes first", async () => {
+    const c = await newClient();
+    const value = fakeValue("order");
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    await asJson(c.token, `/v1/sandboxes/${s.sandbox}/client-policy`, { method: "PUT", body: { inject: [] } });
+    // The secrets come first, in the same batch as the policy or an earlier one.
+    const first = await nextCommands(s.ws, (x) => x.type === "policy_update" || x.type === "secrets_update");
+    const si = first.findIndex((x) => x.type === "secrets_update");
+    const pi = first.findIndex((x) => x.type === "policy_update");
+    expect(si, "a secrets_update before the policy_update").toBeGreaterThanOrEqual(0);
+    expect(pi === -1 || si < pi, "secrets_update before policy_update").toBe(true);
+    expect(JSON.stringify(first[si].secrets)).not.toContain(value);
+    const policy = pi >= 0 ? first[pi].policy : (await nextCommands(s.ws, (x) => x.type === "policy_update")).find((x) => x.type === "policy_update")!.policy;
+    expect(policy.inject.map((b: { name: string }) => b.name)).not.toContain("client:stripe");
+  });
+
+  it("a push overtaken by a change of its client's bindings while ClientDO answered is dropped (the change pushes again)", async () => {
+    const c = await newClient();
+    const value = fakeValue("stale");
+    await asJson(c.token, "/v1/clients/self/secrets/stripe-key", { method: "PUT", body: { value } });
+    const s = await clientSandbox(c, { inject: [stripe()] });
+    const stub = env.SANDBOX.get(env.SANDBOX.idFromName(s.sandbox));
+    // Hold the push's read of the client's grant, after it read the bindings it pushes for.
+    const real = ClientDO.prototype.scope;
+    let reached = false;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    ClientDO.prototype.scope = async function (this: ClientDO) {
+      const r = await real.call(this);
+      if (!reached) {
+        reached = true;
+        await gate;
+      }
+      return r;
+    };
+    let push: Promise<unknown> | undefined;
+    try {
+      push = runInDurableObject(stub, (inst: SandboxDO) => (inst as unknown as { pushSecrets(f: boolean): Promise<void> }).pushSecrets(true));
+      await eventually("the push holds on ClientDO", () => reached);
+      // Meanwhile its bindings change (the step a layer write takes before it pushes again itself).
+      await runInDurableObject(stub, (_i: SandboxDO, st) => { st.storage.sql.exec("DELETE FROM kv WHERE key = 'client_inject'"); });
+    } finally {
+      release();
+      ClientDO.prototype.scope = real;
+    }
+    await push;
+    // The held push, made for the old bindings, sends nothing: 2 s for one to arrive if it would.
+    await expect(s.ws.next("commands", (m) => (m.commands as any[]).some((x) => x.type === "secrets_update"), 2_000)).rejects.toThrow(/timed out/);
   });
 });
 

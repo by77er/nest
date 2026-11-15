@@ -9,7 +9,7 @@ import { PLATFORM_TOOL_NAMES } from "../lib/registry";
 import {
   type AgentSpec, type Capability, type Catalog, checkCapability, checkTemplate, EntryName, expandSpec, type PromptRewrite, pruneCapability, pruneTemplate, type Removes,
   expandTemplate, mcpPrefix, rewritePrompt, rewriteRules, type RuleSource, type RulesRewrite, SEED_CATALOG, templateRuleSources, SEED_VERSION, seedMigration, type SpawnSpec, Template,
-  StoredCapability, templatesUsing,
+  StoredCapability, templatesUsing, removedRepoFieldsRefusal, withoutRemovedRepoFields,
 } from "../lib/spec";
 import type { ToolRule } from "../protocol/control";
 import { Deadlines } from "../lib/reliable";
@@ -388,7 +388,12 @@ export class CatalogDO extends DurableObject<Env> {
    * Create or replace a template. Its capabilities must exist. A client's (`scope`) lists only
    * capabilities it sees, and expands within its grant.
    */
-  async putTemplate(name: string, tpl: Template, scope?: ClientScope): Promise<Template> {
+  async putTemplate(name: string, given: Template, scope?: ClientScope): Promise<Template> {
+    // A Worker of the previous release hands over a template its schema checked with the removed repo
+    // fields: refused if they grant anything, else dropped (as this release's route does).
+    const removed = removedRepoFieldsRefusal(given);
+    if (removed) throw new NestError(ErrorCodes.INVALID_MESSAGE, `template ${name}: ${removed}`);
+    const tpl: Template = withoutRemovedRepoFields(given);
     refuseHidden(tpl.capabilities, scope, `template ${name}`);
     // Expand first (nest-wire): the previous release's CatalogDO parses a location strictly and would skip the
     // whole template after a rollback. Taken in a template from the release after (docs/interfaces/#pending-contract-changes).

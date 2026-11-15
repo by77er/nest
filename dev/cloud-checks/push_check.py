@@ -3,6 +3,12 @@
 Env: NEST_ADMIN_TOKEN, REPO, OTHER_REPO (the owner's, the App installed on both), NEST_GITHUB_APP_ID, NEST_GITHUB_APP_PRIVATE_KEY (for cleanup and verification). Never prints a token."""
 import base64, json, os, subprocess, sys, tempfile, time, urllib.error, urllib.request
 
+# Retired: nest mints no repo tokens and builds no push allowlist since phase C3 of taking GitHub out of the
+# kernel (dev/rollout/2026-11-15-kernel-github-minting.md), so `overrides.repos` is refused and nothing here can
+# pass. It fails at once, never silently; phase C6 deletes it (the push check becomes a client-guard check).
+print("push_check.py is retired: nest no longer mints GitHub tokens or builds push allowlists (phase C3); see dev/cloud-checks/README.md", file=sys.stderr)
+sys.exit(2)
+
 BASE, CELL = os.environ.get("NEST_BASE_URL", "https://nest.bitcru.sh"), os.environ.get("NEST_CELL", "use1")
 ADMIN = os.environ["NEST_ADMIN_TOKEN"]
 ALLOWED, OTHER = os.environ.get("REPO", "by77er/nest"), os.environ.get("OTHER_REPO", "by77er/randomc")

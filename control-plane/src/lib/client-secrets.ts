@@ -118,12 +118,12 @@ export interface HeldInjection extends ClientInjection {
 
 /**
  * The placeholder of client `client`'s binding `name`: `nest-ph.<client>.<name>.`. Fixed, so a client
- * knows it before the sandbox exists. No assigned placeholder contains another, nor the GitHub ones
- * (`nest-ph-github`, `nest-ph-read-github`): nest-proxy finds a placeholder as a substring, and a name
+ * knows it before the sandbox exists. No assigned placeholder contains another, nor the guest image's
+ * `nest-ph-github`: nest-proxy finds a placeholder as a substring, and a name
  * (`InjectionName`) or a client id holds no `.` or `-`.
  */
 export const injectionPlaceholder = (client: string, name: string) => `nest-ph.${client}.${name}.`;
-/** Its name in the wire policy: apart from the operator's and the constructed ones (`github`, …). */
+/** Its name in the wire policy: apart from the operator's. */
 export const CLIENT_BINDING_PREFIX = "client:";
 export const injectionWireName = (name: string) => `${CLIENT_BINDING_PREFIX}${name}`;
 
