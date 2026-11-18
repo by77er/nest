@@ -702,12 +702,18 @@ describe("the chat", () => {
     expect(within(c).getByRole("button", { name: "Bash npm test, done" })).toHaveAttribute("aria-expanded", "true");
     expect(read()).toHaveAttribute("aria-expanded", "true");
 
-    // The reply lands where the last part was; the stream goes, its steps behind the reply.
+    // The reply lands where the last part was, its steps behind it. The reader opened rows (reading back,
+    // not following): the part before the message stays, so the log doesn't shrink under their line…
     api.chat.push({ seq: 3, at_ms: AT + 3_000, sender: "manager", text: "Both look fine.", delivered: true, status: "done" as const, error: null });
     await queryClient.refetchQueries();
     const reply = (await within(c).findByRole("button", { name: "Used 2 tools" })).closest("[data-sender=manager]")!;
     expect(reply).toHaveAttribute("data-seq", "3");
     expect(below(mine(), reply)).toBe(true);
+    await waitFor(() => expect(c.querySelectorAll("[data-sender=stream]")).toHaveLength(1));
+    expect(below(read(), mine())).toBe(true);
+    expect(seqs()).toEqual(["1", "2", "3"]);
+    // …until they're back at the end: then it goes.
+    await user.click(within(c).getByRole("button", { name: /^Jump to latest/ }));
     await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
     expect(seqs()).toEqual(["1", "2", "3"]);
   });

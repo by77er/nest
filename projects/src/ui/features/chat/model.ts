@@ -244,9 +244,10 @@ export function stepsBySeq(messages: ChatMessage[], turns: FinishedTurn[]): Map<
  * shown. The manager's own messages never split it: each is a turn's reply, timed when nest reported it,
  * which can be after a later turn has begun. Messages nest never took (`failed`, a negative seq) stay
  * last, after the stream. Only the last part is live: it carries the working line (`running` and no call
- * running); a part with nothing to show is left out.
+ * running); a part with nothing to show is left out. A turn whose reply has `landed` (kept while the reader
+ * reads back) shows only its earlier parts: the last one's place is its reply's.
  */
-export function timeline(messages: ChatMessage[], turn: (LiveTurn & { running: boolean }) | null, now = Date.now()): LogItem[] {
+export function timeline(messages: ChatMessage[], turn: (LiveTurn & { running: boolean; landed?: boolean }) | null, now = Date.now()): LogItem[] {
   if (!turn) return groupLog(messages, now);
   const local = (m: ChatMessage) => m.seq < 0 && (m.status ?? (m.error ? "failed" : "owed")) === "failed";
   const kept = messages.filter((m) => !local(m));
@@ -269,7 +270,7 @@ export function timeline(messages: ChatMessage[], turn: (LiveTurn & { running: b
     }
     entries.push(m);
   }
-  part(cut, steps.length, true);
+  if (!turn.landed) part(cut, steps.length, true);
   return grouped([...entries, ...messages.filter(local)], now);
 }
 

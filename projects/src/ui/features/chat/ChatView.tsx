@@ -371,17 +371,19 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const heldEnd = !live && held ? (finished.find((t) => t.turn === held.turn) ?? null) : null;
   // Let go once its message is in the log (by what it says; by seq if the ring has lost the turn), at
   // once if it ended without a reply (stopped), and after HOLD_MAX_MS whatever happens. Landed, it isn't
-  // shown again (under its own reply) while the release waits for the effect.
+  // shown again (under its own reply) while the release waits for the effect. Reading back, its parts
+  // before the messages sent during it stay until the reader is back at the end: the log doesn't shrink
+  // under their line (their steps are behind the reply too).
   const landed = !!held && !live && (heldEnd ? !heldEnd.reply || messages.some((m) => m.sender === "manager" && m.text.trim() === heldEnd.reply) : lastManagerSeq > held.sinceSeq);
   useEffect(() => {
     if (!held || live) return;
     if (landed) {
-      setHeld(null);
+      if (atBottom) setHeld(null);
       return;
     }
     const t = setTimeout(() => setHeld(null), HOLD_MAX_MS);
     return () => clearTimeout(t);
-  }, [held, live, landed]);
+  }, [held, live, landed, atBottom]);
 
   // The reader opened something: the end is no longer followed (scroll anchoring holds their line).
   const stopFollowing = useCallback(() => {
@@ -525,7 +527,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const phone = usePhone();
   // The turn in the log where it is in time (README.md#the-manager-chat): split by the messages sent
   // during it; a held one keeps its split until its reply lands.
-  const turn = live ? { ...live, running } : held && !landed ? { turn: held.turn, steps: heldEnd?.steps ?? held.steps, running: false } : null;
+  const turn = live ? { ...live, running } : held && !(landed && atBottom) ? { turn: held.turn, steps: heldEnd?.steps ?? held.steps, running: false, landed } : null;
   const items = timeline(messages, turn);
   const replySteps = stepsBySeq(messages, finished);
   // One spinner in the log: the most recent of the owner's messages in flight.
