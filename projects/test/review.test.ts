@@ -289,6 +289,12 @@ describe("a PR's review", () => {
     await run(p);
     expect((await job(p, 1, first.sha)).state).toBe("superseded");
     expect(live(p, 1)).toEqual([]);
+    // Its cancelled check re-run from GitHub while it's a draft: nothing starts.
+    const cancelled = gh.runsOf(p.repo, first.sha)[0] as any;
+    expect((await deliverGithub("check_run", { action: "rerequested", check_run: { id: cancelled.id, name: CHECK_NAME, head_sha: first.sha, pull_requests: [{ number: 1 }] }, repository: { full_name: p.repo } })).status).toBe(200);
+    await run(p);
+    expect((await job(p, 1, first.sha)).state).toBe("superseded");
+    expect(live(p, 1)).toEqual([]);
     // Marked ready again: the same head is reviewed again, with a new check.
     expect((await push(p, 1, first.sha, "ready_for_review")).status).toBe(200);
     await run(p);
