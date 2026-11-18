@@ -43,8 +43,9 @@ export function ModelField<V extends string | null>({ label, description, value,
   const listed = value === null || MODELS.some((m) => m.id === value);
   const [custom, setCustom] = useState(!listed);
   const problem = custom ? modelProblem(value ?? "") : null;
+  // The id field close under its own dropdown (proximity), the fields apart at the group's gap.
   return (
-    <FieldGroup>
+    <Stack gap="sm">
       <Select
         label={label}
         description={description}
@@ -76,7 +77,7 @@ export function ModelField<V extends string | null>({ label, description, value,
           error={value && problem ? `A model id is ${problem}` : error}
         />
       )}
-    </FieldGroup>
+    </Stack>
   );
 }
 
@@ -212,7 +213,7 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                 <ModelField
                   unset
                   label="Routines' model"
-                  description="For every routine run, dreaming too. A change applies to runs started from now on."
+                  description="For every routine run, including dreaming runs. A change applies to runs started from now on."
                   value={form.getValues().routine_model}
                   onChange={(v) => form.setFieldValue("routine_model", v)}
                   error={form.errors.routine_model}

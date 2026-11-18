@@ -287,7 +287,7 @@ describe("the models in the settings", () => {
     expect(select(dialog, "Reviewers' model")).toHaveValue("Claude Code's default");
     expect(select(dialog, "Routines' model")).toHaveValue("Claude Code's default");
     expect(dialog).toHaveTextContent("A change applies to reviews started from now on; running ones keep theirs.");
-    expect(dialog).toHaveTextContent("For every routine run, dreaming too. A change applies to runs started from now on.");
+    expect(dialog).toHaveTextContent("For every routine run, including dreaming runs. A change applies to runs started from now on.");
     for (const label of ["Manager's model", "Workers' model"]) {
       await user.click(select(dialog, label));
       const options = (await screen.findAllByRole("option")).map((o) => o.textContent);
