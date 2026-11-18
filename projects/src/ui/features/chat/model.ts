@@ -242,7 +242,7 @@ export function stepsBySeq(messages: ChatMessage[], turns: FinishedTurn[]): Map<
  * so the stream is split into parts around those sent during it, and what the turn does afterwards
  * follows them. One in flight here (a negative seq, not yet given a time by nest) follows every step
  * shown. The manager's own messages never split it: each is a turn's reply, timed when nest reported it,
- * which can be after a later turn has begun. Messages nest never took (`failed`, a negative seq) stay
+ * which can be after a later turn has begun. Messages the app never took (`failed`, a negative seq) stay
  * last, after the stream. Only the last part is live: it carries the working line (`running` and no call
  * running); a part with nothing to show is left out. A turn whose reply has landed (`landed`: its seq; the
  * turn kept while the reader reads back) shows only its earlier parts: the last one's place is its reply's,
