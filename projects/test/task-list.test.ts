@@ -155,16 +155,16 @@ async function seed(p: P) {
 /** The list as it was before summaries (`before`), read in the object. */
 const fullTasks = (p: P) => runInDurableObject(stub(p), (o: ProjectDO) => before(inner(o).ctx.storage.sql));
 
-/** `sql.exec` calls `f` makes in the object. */
-async function statements<T>(p: P, f: (o: ProjectDO) => Promise<T>): Promise<{ n: number; value: T }> {
+/** The `sql.exec` calls `f` makes in the object: how many, and their statements. */
+async function statements<T>(p: P, f: (o: ProjectDO) => Promise<T>): Promise<{ n: number; sent: string[]; value: T }> {
   return runInDurableObject(stub(p), async (o: ProjectDO) => {
     const sql = inner(o).ctx.storage.sql;
     const exec = sql.exec;
-    let n = 0;
-    sql.exec = ((...a: Parameters<typeof exec>) => (n++, exec.apply(sql, a))) as typeof exec;
+    const sent: string[] = [];
+    sql.exec = ((...a: Parameters<typeof exec>) => (sent.push(a[0]), exec.apply(sql, a))) as typeof exec;
     try {
       const value = await f(o);
-      return { n, value };
+      return { n: sent.length, sent, value };
     } finally {
       sql.exec = exec;
     }
@@ -252,13 +252,18 @@ describe("the board's list", () => {
       return r.n;
     };
     const few = await count(6);
+    // Counted at all (the patch reaches the object's calls), and the same for 300.
+    expect(few).toBeGreaterThan(0);
     expect(await count(300)).toBe(few);
   }, 60_000);
 
-  it("reads which tasks are tainted through the index of tainted history rows, not the whole history", async () => {
+  it("reads the history only through the index of tainted history rows", async () => {
     const p = await newProject();
+    const { sent } = await statements(p, (o) => o.listTasks());
+    const reads = sent.filter((q) => /\bhistory\b/.test(q));
+    expect(reads).toHaveLength(1);
     const plan = await runInDurableObject(stub(p), (o: ProjectDO) =>
-      inner(o).ctx.storage.sql.exec("EXPLAIN QUERY PLAN SELECT DISTINCT task FROM history WHERE tainted = 1").toArray().map((r) => r.detail as string).join("\n"));
+      inner(o).ctx.storage.sql.exec(`EXPLAIN QUERY PLAN ${reads[0]}`).toArray().map((r) => r.detail as string).join("\n"));
     expect(plan).toMatch(/USING (COVERING )?INDEX history_tainted/);
   });
 });

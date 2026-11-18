@@ -1028,7 +1028,7 @@ export class ProjectDO extends DurableObject<Env> {
 
   /**
    * A task's PRs and dependencies, as Task carries them. Dependencies added in the same ms: its blockers by id,
-   * the tasks waiting on it as added (`taskSummaries` orders them the same).
+   * the tasks waiting on it by rowid, as added (`taskSummaries` orders them the same).
    */
   private relations(id: string): Relations {
     const prs = this.sql.exec("SELECT * FROM task_prs WHERE task = ? AND state != 'detached' ORDER BY attached_ms, pr", id).toArray().map(taskPr);
