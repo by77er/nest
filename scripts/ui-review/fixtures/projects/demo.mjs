@@ -358,7 +358,8 @@ const RICH = [
     ],
     summary: ok ? "Nothing found." : "Remove the key.",
   });
-  const verdict = (ok, o = {}) => ({ reviews: [codeReview(ok, o.tainted), ...(variant === "reviewers-several" ? [securityReview(o.secure ?? true, o.tainted)] : [])] });
+  // `tainted`: both sessions; `securityTainted`: only the second reviewer's.
+  const verdict = (ok, o = {}) => ({ reviews: [codeReview(ok, o.tainted), ...(variant === "reviewers-several" ? [securityReview(o.secure ?? true, o.tainted || o.securityTainted)] : [])] });
   const job = (pr, title, state, o = {}) => ({ pr, sha: (pr * 7919).toString(16).padEnd(40, "a"), state, title, base: "main", agent: state === "running" ? "agt_r9k2" : null, check_run: 1000 + pr, verdict: null, tainted: null, attempts: 0, runs: 1, error: null, author: null, fork: false, approved_ms: null, created_ms: now - pr * 60_000, updated_ms: now - pr * 30_000, ...o });
   // "held-many": a dozen reviews waiting for approval, with long titles and logins, one past the cap, among the rest.
   const LONG = "Rework the gadget importer so that malformed rows are reported per line, the rest of the file still loads, and the summary names every column that was skipped";
@@ -378,7 +379,7 @@ const RICH = [
     job(121, "Search: tag suggestions in the filter bar", "done", { verdict: verdict(false), runs: 2 }),
     job(119, "Search: build the tag index", "done", { verdict: verdict(true) }),
     job(118, "Add search by tag", "running"),
-    job(117, "Paginate the gadget list", "done", { verdict: verdict(true, { tainted: true, secure: false }), tainted: true }),
+    job(117, "Paginate the gadget list", "done", { verdict: verdict(true, { tainted: variant !== "reviewers-several", securityTainted: true, secure: false }), tainted: true }),
     job(116, "Cache gadget thumbnails", "done", { verdict: verdict(false, { tainted: true }), tainted: true, runs: 2 }),
     job(115, "Rate-limit the public API", "failed", { error: "The reviewer exited three times without a verdict.", runs: 3 }),
     job(114, "Write the 0.5 changelog", "superseded"),

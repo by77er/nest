@@ -112,12 +112,15 @@ describe("the Reviews page", () => {
     RecordingSocket.opened = [];
     vi.stubGlobal("WebSocket", RecordingSocket);
     const api = new FakeApi();
-    api.reviews = [job(1, { state: "done", verdict: verdict("fail"), runs: 2, tainted: true }), job(3, { state: "running", agent: "agt_rev3" })];
+    api.reviews = [
+      job(1, { state: "done", verdict: verdict("fail", true), runs: 2, tainted: true }), job(3, { state: "running", agent: "agt_rev3" }),
+      job(0, { state: "done", verdict: { reviews: [codeReview("pass"), security("fail", true)] }, tainted: true }),
+    ];
     const { user } = renderApp("/projects/prj_one/reviews", api);
     const list = await screen.findByRole("list", { name: "Review jobs" });
     expect(screen.queryByRole("table")).toBeNull();
     const cards = within(list).getAllByRole("listitem");
-    expect(cards.map((c) => within(c).getAllByRole("link")[0]!.textContent)).toEqual(["#3 PR 3", "#1 PR 1"]);
+    expect(cards.map((c) => within(c).getAllByRole("link")[0]!.textContent)).toEqual(["#3 PR 3", "#1 PR 1", "#0 PR 0"]);
     const done = cards[1]!;
     // Everything the table's row has, in one column: the sha, the verdicts, the runs and when.
     expect(done).toHaveTextContent("1000000 → main");
@@ -127,6 +130,10 @@ describe("the Reviews page", () => {
     const stateRow = within(done).getByText("Tainted").parentElement!.parentElement!;
     expect(stateRow).toHaveTextContent(/Changes needed\s*Tainted/);
     expect(within(cards[0]!).getByRole("button", { name: "Show the trace of #3" })).toHaveTextContent("Show trace");
+    // Several reviewers: Tainted follows the tainted one's badges, so the card says whose; not on its state row.
+    const several = cards.find((c) => c.querySelector("[data-reviewer]"))!;
+    expect(within(several.querySelector('[data-reviewer="rv_sec"]') as HTMLElement).getByText("Tainted")).toBeInTheDocument();
+    expect(within(several).getAllByText("Tainted")).toHaveLength(1);
     // Its trace opens under it.
     await user.click(within(cards[0]!).getByRole("button", { name: "Show the trace of #3" }));
     await waitFor(() => expect(cards[0]!.querySelector("[data-trace]")).not.toBeNull());

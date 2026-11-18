@@ -76,8 +76,9 @@ function DimensionBadges({ review, who, children }: { review: Review; who?: stri
 }
 
 /**
- * The verdict: one reviewer's dimension badges, or with several, each reviewer's name over its own. `tainted`
- * (the table's) puts Tainted after the badges of the review whose session was; a card puts it on its state row.
+ * The verdict: one reviewer's dimension badges, or with several, each reviewer's name over its own. With one,
+ * `tainted` (the table's) puts Tainted after its badges, and a card puts it on its state row; with several,
+ * Tainted always follows the badges of the review whose session was, so it says whose.
  */
 function Verdicts({ job, tainted = true, projectId }: { job: Job; tainted?: boolean; projectId: string }) {
   // Waiting for the owner (held, or past the cap on held ones), or dismissed by them: who it's from, and what the owner can do.
@@ -105,7 +106,7 @@ function Verdicts({ job, tainted = true, projectId }: { job: Job; tainted?: bool
             {r.reviewer.name}
           </Text>
           <DimensionBadges review={r} who={r.reviewer.name}>
-            {tainted && r.tainted && <TaintedBadge />}
+            {r.tainted && <TaintedBadge />}
           </DimensionBadges>
         </Stack>
       ))}
@@ -154,7 +155,7 @@ function ReviewCard({ projectId, repo, j, open, onToggle }: { projectId: string;
         <PrTitle repo={repo} j={j} />
         <Row gap="sm">
           <JobState job={j} />
-          {j.tainted && <TaintedBadge />}
+          {j.tainted && (j.verdict?.reviews.length ?? 0) < 2 && <TaintedBadge />}
         </Row>
         <Verdicts job={j} tainted={false} projectId={projectId} />
         <Row justify="space-between" wrap="nowrap">
