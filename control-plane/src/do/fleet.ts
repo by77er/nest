@@ -17,8 +17,8 @@ import {
   CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
   tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
-import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type CellAws } from "../lib/cells";
-import { brainHostNeeded, idleStep, maxBrains, NO_ROOM_BACKOFF_BRAIN_MAX_MS, NO_ROOM_BACKOFF_MAX_MS, noRoomBackoffMs, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
+import { awsCell, cellAws, DEFAULT_HOST_RESERVE_MIB, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type CellAws } from "../lib/cells";
+import { brainHostNeeded, evictionsFor, idleStep, largestSandboxMib, maxBrains, typeHolds, NO_ROOM_BACKOFF_BRAIN_MAX_MS, NO_ROOM_BACKOFF_MAX_MS, noRoomBackoffMs, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
 import { deathPlan, expiryVerdict, hostStep, type DeathCause, type HostTransition } from "../lib/host-lifecycle";
 import type { InstanceIdentity } from "../lib/aws-identity";
 import { Deadlines, ReliableChannels, SerialQueue, withTimeout } from "../lib/reliable";
@@ -1755,18 +1755,50 @@ export class FleetDO extends DurableObject<Env> {
     // change could bring the other (the sandbox's own host is judged then).
     const basic = hasBasicBinding(req.policy.inject ?? []) || usesAt(all);
     const where = ["wedged_ms IS NULL", ...(guarded ? ["guard_bounds = 1"] : []), ...(opens ? ["guard_injected_any = 1"] : []), ...(basic ? [ENFORCES_AT] : [])].join(" AND ");
-    const hosts = this.hostsBy({ role: SANDBOX_ROLE, status: "active", where })
-      .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
-      .map((h) => {
-        const capacity = h.capacity ? (JSON.parse(h.capacity) as Capacity) : null;
-        return { host: h.host, capacity, capacity_seq: h.capacity_seq, leases: this.leasesOf(h.host), warm: !!req.from && !!capacity?.warm.includes(req.from.id) };
-      });
-    const host = pickSandboxHost(hosts, need, {
+    // A sandbox whose resume is in flight still reads `suspended` (nestd reports `running` once the
+    // guest is up): it isn't moved to make room.
+    const resuming = () => new Set(this.sql.exec<{ sandbox: string }>(
+      "SELECT sandbox FROM commands WHERE type = 'sandbox_resume' AND result IS NULL AND sandbox IS NOT NULL").toArray().map((r) => r.sandbox));
+    const facts = () => {
+      const waking = resuming();
+      return this.hostsBy({ role: SANDBOX_ROLE, status: "active", where })
+        .filter((h) => h.host !== req.excludeHost && this.socketFor(h.host))
+        .map((h) => {
+          const capacity = h.capacity ? (JSON.parse(h.capacity) as Capacity) : null;
+          const leases = this.leasesOf(h.host).map((l) => ({ ...l, movable: l.state === "suspended" && !l.expired && !waking.has(l.sandbox) }));
+          return { host: h.host, capacity, capacity_seq: h.capacity_seq, leases, warm: !!req.from && !!capacity?.warm.includes(req.from.id) };
+        });
+    };
+    const pack = {
       reserve_mib: cfg?.sandbox_reserve_mib ?? DEFAULT_SANDBOX_RESERVE_MIB, max_per_host: cfg?.max_sandboxes_per_host ?? 0,
-    });
+      host_reserve_mib: cfg?.host_reserve_mib ?? DEFAULT_HOST_RESERVE_MIB, commit_pct: cfg?.memory_commit_pct ?? 0,
+    };
+    const hosts = facts();
+    let host = pickSandboxHost(hosts, need, pack);
     if (!host) {
-      // SandboxDO retries placement on its own alarm; by then the new host may have enrolled.
-      await this.scaleUp();
+      // Under the commit rule, a sandbox no host this cell launches could hold alone: a host launched
+      // for it would refuse it too, so nothing is launched and the placement is refused with why
+      // (SandboxDO's create asks first, `largestSandbox`; this is the backstop).
+      const largest = this.largestSandbox();
+      if (largest !== null && need.memory_mib > largest) {
+        throw new NestError(ErrorCodes.FORBIDDEN, `sandbox ${req.sandbox} asks for ${need.memory_mib} MiB of memory: no host this cell launches holds more than ${largest} MiB in one sandbox`, 409);
+      }
+      // Room that suspended sandboxes hold: they move off (each wakes wherever there is room). Their
+      // leases go and their evictions are recorded in this same step, with no await before this
+      // sandbox's lease is written; SandboxDO is told afterwards, and again from the tick until it answers.
+      const room = evictionsFor(hosts, need, pack);
+      if (room) {
+        console.log(`FleetDO: moving ${room.sandboxes.length} suspended sandbox(es) off ${room.host} to place ${req.sandbox}`);
+        this.recordEvictions(room.host, room.sandboxes);
+        host = pickSandboxHost(facts(), need, pack);
+        this.ctx.waitUntil(this.processEvictions().catch((e) => console.error("FleetDO: telling evicted sandboxes failed; the tick retries", e)));
+      }
+    }
+    if (!host) {
+      // SandboxDO retries placement on its own alarm; by then the new host may have enrolled. Only a
+      // type that could hold this sandbox alone is launched for it.
+      const types = cfg?.instance_memory_mib;
+      await this.scaleUp(SANDBOX_ROLE, true, (type) => typeHolds(types?.[type], need.memory_mib, pack));
       return null;
     }
     this.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired, vcpus, memory_mib) VALUES (?, ?, ?, 0, ?, ?)",
@@ -2185,7 +2217,7 @@ export class FleetDO extends DurableObject<Env> {
    * ([idempotency](https://docs.aws.amazon.com/ec2/latest/devguide/ec2-api-idempotency.html)). Only
    * demand (`onDemand`) plans a new launch; the tick only repeats.
    */
-  private async scaleUp(role: HostKind = SANDBOX_ROLE, onDemand = true): Promise<void> {
+  private async scaleUp(role: HostKind = SANDBOX_ROLE, onDemand = true, fits?: (type: string) => boolean): Promise<void> {
     const cfg = this.cellConfig();
     const ec2 = this.ec2();
     const s = cfg ? this.scaleSettings(cfg, role) : null;
@@ -2221,7 +2253,9 @@ export class FleetDO extends DurableObject<Env> {
       console.error(`FleetDO: every ${role} instance type's enrolment breaker is open (launches kept ending enroll_timeout): no ${role} host is launched before ${new Date(allowed.role_open_until_ms).toISOString()}`);
       return;
     }
-    plan.launch = allowed.launch;
+    // For one sandbox: only the types that could hold it (a host of another would refuse it and sit empty).
+    plan.launch = fits ? allowed.launch.filter((a) => fits(a.type)) : allowed.launch;
+    if (!plan.launch.length) return;
     // A pass with no room anywhere waits before the next (each waiting sandbox and brain is demand).
     const noRoom = this.noRoom(role);
     if (noRoom && now < noRoom.until_ms) return;
@@ -2241,6 +2275,8 @@ export class FleetDO extends DurableObject<Env> {
       if (r === "quota" && a.spot) spotQuota = true;
       else if (r === "quota") break;
     }
+    // A pass narrowed to the types one sandbox fits didn't try every type: it starts no backoff for the kind.
+    if (fits && plan.launch.length < allowed.launch.length) return;
     const wait = noRoomBackoffMs(noRoom, now, role === BRAIN_ROLE ? NO_ROOM_BACKOFF_BRAIN_MAX_MS : NO_ROOM_BACKOFF_MAX_MS);
     this.sql.exec("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)", noRoomKey(role), JSON.stringify({ until_ms: now + wait, wait_ms: wait }));
     console.warn(`FleetDO: no room for a ${role} host anywhere; the next launch pass waits ${wait / 1000} s`);
@@ -2549,17 +2585,35 @@ export class FleetDO extends DurableObject<Env> {
   }
 
   /**
-   * Take suspended sandboxes (head in the object store) off a host going away: lease dropped, SandboxDO
-   * told until it answers. The host fences what it still has when its heartbeat's leases are revoked.
+   * Take suspended sandboxes (head in the object store) off a host: one going away, or one whose
+   * room a placement needs (the commit rule). Lease dropped, SandboxDO told until it answers. The host fences what it still has when its heartbeat's leases are revoked.
    */
   private async evict(host: string, sandboxes: string[]): Promise<void> {
+    this.recordEvictions(host, sandboxes);
+    await this.processEvictions();
+  }
+
+  /** The synchronous half of [`evict`]: the leases go and the evictions are owed, in one step. */
+  private recordEvictions(host: string, sandboxes: string[]): void {
     for (const sandbox of sandboxes) {
       const lease = this.lease(sandbox);
       if (!lease || lease.host !== host) continue;
       this.sql.exec("DELETE FROM leases WHERE sandbox = ? AND host = ?", sandbox, host);
       this.sql.exec("INSERT OR IGNORE INTO evictions (sandbox, host, epoch) VALUES (?, ?, ?)", sandbox, host, lease.epoch);
     }
-    await this.processEvictions();
+  }
+
+  /**
+   * Under the commit rule, the most memory one sandbox may declare and still fit a host this cell
+   * launches (`largestSandboxMib`); null when that can't be told. SandboxDO asks before it creates.
+   */
+  largestSandbox(): number | null {
+    const cfg = this.cellConfig();
+    if (!cfg) return null;
+    return largestSandboxMib([...new Set([...cfg.instance_types, ...(cfg.on_demand_types ?? [])])], cfg.instance_memory_mib, {
+      reserve_mib: cfg.sandbox_reserve_mib, max_per_host: cfg.max_sandboxes_per_host,
+      host_reserve_mib: cfg.host_reserve_mib ?? DEFAULT_HOST_RESERVE_MIB, commit_pct: cfg.memory_commit_pct ?? 0,
+    });
   }
 
   /** Mark an instance for termination (retried from the alarm until EC2 reports it gone). */

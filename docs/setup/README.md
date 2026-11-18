@@ -13,7 +13,7 @@ What I provide, where it goes, and what each piece unlocks, in the order testing
 
 | Decision | Default | Why it matters |
 |---|---|---|
-| AWS region | `us-east-1` | It hosts the first cell: the sandbox hosts, the brain hosts and the cell's S3 bucket. It must offer 8i instances (for spot, `c8id` first, then `m8id`, `r8id`, `c8i-flex`, `c8i`, `m8i`). |
+| AWS region | `us-east-1` | It hosts the first cell: the sandbox hosts, the brain hosts and the cell's S3 bucket. It must offer 8i instances (for spot, `r8id` first, then `m8id`, `m8i`). |
 | Monthly spend cap | $25 | Becomes an AWS Budgets alarm. Testing costs a few dollars. |
 | Dedicated AWS account | Yes | Keeps the blast radius of broad testing credentials to nest. |
 | Separate Claude token for captains | Optional | A template's `credential` names its BrokerDO setup token (`claude_oauth_token:captain` for the `captain` template, falling back to `claude_oauth_token` while unset; an API client's agents never fall back). Needed only to verify that two setup tokens can be revoked independently. |
@@ -116,7 +116,7 @@ The setup agent creates these itself, so none are needed from me:
 - **Claude:** subscription quota only.
 - **Cloudflare:** $5/month for Workers Paid; usage stays inside what's included.
 - **AWS:**
-  - a c8i.large spot sandbox host is about $0.03/hour, plus about $0.005/hour for its public IPv4;
+  - an r8id.large spot sandbox host is about $0.05/hour (2026-11-18, unverified since), plus about $0.005/hour for its public IPv4;
   - a `t3a.medium` brain host is about $27/month on demand (unverified), less on spot, and it terminates 30 min after its last brain ([brain hosts](../compute/brain-hosts/));
   - S3 is cents;
   - the KMS root key is $1/month, plus $0.15 per 10,000 `Sign` calls (one per host enrollment or renewal; not in the free tier, [pricing](https://aws.amazon.com/kms/pricing/));
