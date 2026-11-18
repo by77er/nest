@@ -1,6 +1,6 @@
 // A project's routines (README.md#routines): background runs on a timer or the board's counters. Top to
-// bottom: the routines (each with its triggers, where it stands, its next and last run; Run now and Edit,
-// the editor in a Sheet), the tasks they proposed waiting for the owner, their recent runs (each with its
+// bottom: the routines (each with its triggers, where it stands, its next and last run, who wrote it when
+// that's the manager and "Tainted" when a tainted session did; Run now and Edit, the editor in a Sheet), the tasks they proposed waiting for the owner, their recent runs (each with its
 // report, what it made and its agent's trace), and the project's memory (README.md#memory).
 
 import { Badge, Button, Menu, Text, Title } from "@mantine/core";
@@ -19,6 +19,7 @@ import { MemorySection } from "./MemorySection";
 import { ProposalsSection } from "./ProposalsSection";
 import { RoutineForm } from "./RoutineForm";
 import { RunsSection, StatusBadge } from "./RunsSection";
+import { sourceText, UntrustedBadge } from "./Untrusted";
 
 const PRESET_ICON = { review: IconRepeat, dreaming: IconBrain } as const;
 
@@ -67,6 +68,7 @@ function RoutineCard({ projectId, r, cap, onEdit }: { projectId: string; r: Rout
                 {status.label}
               </Badge>
             )}
+            {r.tainted && <UntrustedBadge what={`the routine ${r.name}`} />}
           </Row>
           <Row gap="xs" wrap="nowrap">
             <Button variant="subtle" color="gray" size="xs" onClick={onEdit} aria-label={`Edit ${r.name}`}>
@@ -87,6 +89,8 @@ function RoutineCard({ projectId, r, cap, onEdit }: { projectId: string; r: Rout
         </Row>
         <Text fz="sm">{triggerPhrases(r.triggers).join(" · ")}</Text>
         <MetaRow>
+          {/* Only the manager's: an owner-written routine says nothing of who wrote it. */}
+          {r.source === "manager" && <MetaItem>By {sourceText(r.source)}</MetaItem>}
           {r.next_timer_ms !== null && <MetaItem title={exact(r.next_timer_ms)}>Timer {ago(r.next_timer_ms)}</MetaItem>}
           {counterProgress(r).map((c) => (
             <MetaItem key={c}>{c}</MetaItem>

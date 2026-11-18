@@ -83,6 +83,65 @@ describe("the Routines page", () => {
     await waitFor(() => expect(api.writes.find((w) => w.method === "PATCH")?.body).toMatchObject({ triggers: { timer: { kind: "interval", minutes: 90 }, tasks_done: 4, prs_merged: null } }));
   });
 
+  it("who last wrote a routine: nothing new for the owner's, \"By the manager\" for the manager's, \"Tainted\" (explained, by keyboard) for a tainted one", async () => {
+    const api = new FakeApi();
+    api.routines = [
+      routine({ id: "rtn_o", name: "Mine" }),
+      routine({ id: "rtn_m", name: "Clean audit", source: "manager" }),
+      routine({ id: "rtn_t", name: "Issue sweep", source: "manager", tainted: true }),
+    ];
+    const { user } = renderApp("/projects/prj_one/routines", api);
+    const card = async (name: string) => (await screen.findByText(name)).closest("[data-routine]") as HTMLElement;
+    const mine = await card("Mine");
+    expect(mine).not.toHaveTextContent(/By |manager|Tainted/);
+    expect(mine.querySelector("[data-marker=tainted]")).toBeNull();
+    const clean = await card("Clean audit");
+    expect(clean).toHaveTextContent("By the manager");
+    expect(clean.querySelector("[data-marker=tainted]")).toBeNull();
+    const tainted = await card("Issue sweep");
+    expect(tainted).toHaveTextContent("By the manager");
+    const mark = within(tainted).getByLabelText(/^Tainted: the routine Issue sweep — Written by an agent that read untrusted text/);
+    expect(mark).toHaveTextContent("Tainted");
+    // Reached by Tab from the page's first control; focus opens its explanation.
+    await user.click(document.body);
+    for (let i = 0; i < 40 && document.activeElement !== mark; i++) await user.tab();
+    expect(mark).toHaveFocus();
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Written by an agent that read untrusted text (an issue, a PR, the web).");
+  });
+
+  it("the editor flags a tainted routine's text, saving makes it the owner's; others are unchanged", async () => {
+    const api = new FakeApi();
+    api.routines = [routine({ id: "rtn_m", name: "Clean audit", source: "manager" }), routine({ id: "rtn_t", name: "Issue sweep", source: "manager", tainted: true })];
+    const { user } = renderApp("/projects/prj_one/routines", api);
+    await user.click(await screen.findByRole("button", { name: "Edit Clean audit" }));
+    const cleanSheet = await screen.findByRole("dialog", { name: "Edit Clean audit" });
+    expect(cleanSheet).not.toHaveTextContent(/untrusted|Tainted/);
+    await user.click(within(cleanSheet).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "Edit Clean audit" })).toBeNull());
+    await user.click(screen.getByRole("button", { name: "Edit Issue sweep" }));
+    const sheet = await screen.findByRole("dialog", { name: "Edit Issue sweep" });
+    expect(sheet).toHaveTextContent("Its name or instructions were last written by the manager, in a session that read untrusted text (an issue, a PR, the web). Check them: saving makes them yours.");
+  });
+
+  it("the list follows the manager's changes without a reload; saving a routine it deleted shows the Worker's refusal", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const api = new FakeApi();
+      api.routines = [routine({ id: "rtn_a", name: "A" })];
+      const { user } = renderApp("/projects/prj_one/routines", api);
+      await user.click(await screen.findByRole("button", { name: "Edit A" }));
+      const sheet = await screen.findByRole("dialog", { name: "Edit A" });
+      // The manager deletes A and adds a tainted routine of its own; the next poll shows it.
+      api.routines = [routine({ id: "rtn_b", name: "Issue sweep", source: "manager", tainted: true })];
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(await screen.findByText("Issue sweep")).toBeInTheDocument();
+      await user.click(within(sheet).getByRole("button", { name: "Save" }));
+      expect(await within(sheet).findByRole("alert")).toHaveTextContent("unknown routine");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("a proposed task's text is plain text; Accept makes it a draft, Decline drops it", async () => {
     const api = new FakeApi();
     api.proposals = [

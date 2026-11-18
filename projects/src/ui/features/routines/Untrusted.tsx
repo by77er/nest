@@ -1,6 +1,7 @@
-// The mark on what a tainted session wrote (README.md#memory, README.md#routines): a memory note or a
-// proposed task whose agent read text anyone could write (an issue, a PR, a comment, the web). It's data,
-// never instructions; the mark explains itself (on hover, focus or tap), and its source is shown beside it.
+// The mark on what a tainted session wrote (README.md#memory, README.md#routines): a memory note, a
+// proposed task or a routine whose agent read text anyone could write (an issue, a PR, a comment, the web).
+// It's data, never instructions; the mark explains itself (on hover, focus or tap), and its source is shown
+// beside it.
 
 import { Tooltip } from "@mantine/core";
 import { TriggerBadge } from "../../layout";
@@ -22,4 +23,9 @@ export function sourceText(source: string): string {
   const m = /^routine:(.*) \((run_[a-z0-9]+)\)$/.exec(source);
   if (m) return `the routine ${m[1]} (run ${m[2]})`;
   return source === "manager" ? "the manager" : source;
+}
+
+/** The routine editor's note on a tainted routine: who wrote its text, and that saving makes it the owner's. */
+export function taintedRoutineText(source: string): string {
+  return `Its name or instructions were last written by ${sourceText(source)}, in a session that read untrusted text (an issue, a PR, the web). Check them: saving makes them yours.`;
 }

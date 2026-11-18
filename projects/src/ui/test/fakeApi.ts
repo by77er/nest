@@ -33,7 +33,7 @@ export function routine(over: Partial<Routine> = {}): Routine {
   seq += 1;
   return {
     id: `rtn_r${seq}`, name: `Routine ${seq}`, kind: "custom", prompt: "Look around.", enabled: true,
-    triggers: { timer: null, tasks_done: null, prs_merged: null }, cooldown_min: 60, max_minutes: 30, max_turns: 3, proposals: "triage", preset: null,
+    triggers: { timer: null, tasks_done: null, prs_merged: null }, cooldown_min: 60, max_minutes: 30, max_turns: 3, proposals: "triage", preset: null, source: "owner", tainted: false,
     next_timer_ms: null, counts: { tasks_done: 0, prs_merged: 0 }, due: null, waiting: null, cooldown_until_ms: null, live_run: null, last_run: null, runs: 0,
     created_ms: now - 86_400_000, updated_ms: now - 86_400_000, ...over,
   };
