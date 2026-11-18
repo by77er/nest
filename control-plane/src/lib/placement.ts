@@ -8,15 +8,108 @@ export interface SandboxHostFacts {
   capacity: Capacity | null;
   /** The `mark` of the capacity report (null: before marks existed). */
   capacity_seq: number | null;
-  leases: readonly { state: string | null; state_seq: number | null; vcpus: number | null; memory_mib: number | null }[];
+  leases: readonly {
+    sandbox?: string; state: string | null; state_seq: number | null; vcpus: number | null; memory_mib: number | null;
+    /** It may be moved off to make room (`evictionsFor`): suspended, its lease live, and no resume of it in flight. */
+    movable?: boolean;
+  }[];
   /** It holds a warm snapshot of what the sandbox is created from. */
   warm: boolean;
 }
 
-/** `AWS_CELLS` packing: what a sandbox reserves against `memory_mib_free`; a per-host cap (0: none). */
+/**
+ * `AWS_CELLS` packing: what a sandbox reserves against `memory_mib_free`; a per-host cap (0: none);
+ * and the commit rule: how much of a host's memory, less `host_reserve_mib` for the host itself, its
+ * sandboxes' declared sizes may add up to, in percent (0 or absent: no such rule).
+ */
 export interface PackSettings {
   reserve_mib: number;
   max_per_host: number;
+  host_reserve_mib?: number;
+  commit_pct?: number;
+}
+
+/** What a VM costs its host beyond the guest's declared memory: nestd's default jailer margin (`vm_memory_overhead_mib`). */
+export const VMM_OVERHEAD_MIB = 128;
+
+/**
+ * The commit rule (regular pages): whether `h` may take one more sandbox of `need_mib`, counting
+ * what every sandbox on it may grow to, not what it uses now. Guest memory is demand-paged, so an
+ * idle guest costs little and free memory admits far more than a host can hold once they work: the
+ * kernel then kills a VMM. Two conditions, each on declared size plus the VMM's overhead:
+ * - **alone:** the sandbox fits the host's memory less the host's own reserve, so no host takes a
+ *   guest it could never hold (an empty host included);
+ * - **together:** with every lease already there, it stays within `commit_pct` of that.
+ *
+ * A host that doesn't say its size (a nestd before `memory_mib_total`) takes nothing more: what its
+ * guests may grow to can't be bounded. Off (`commit_pct` 0 or absent), every host passes.
+ */
+export function withinCommit(h: SandboxHostFacts, need_mib: number, cfg: PackSettings): boolean {
+  const pct = cfg.commit_pct ?? 0;
+  if (pct <= 0) return true;
+  const total = h.capacity?.memory_mib_total ?? 0;
+  if (total <= 0) return false;
+  const usable = total - (cfg.host_reserve_mib ?? 0);
+  const cost = (mib: number) => mib + VMM_OVERHEAD_MIB;
+  const committed = h.leases.reduce((sum, l) => sum + cost(l.memory_mib ?? need_mib), 0);
+  return cost(need_mib) <= usable && (committed + cost(need_mib)) * 100 <= usable * pct;
+}
+
+/**
+ * Making room under the commit rule: a suspended sandbox still counts toward its host's commit (it
+ * resumes in place, with no placement in between), so a host of mostly suspended sandboxes would be
+ * full for good. When no host takes `need`, the suspended sandboxes to move off one host so that it
+ * does: their heads are in the object store, and each wakes wherever there is room. Only a lease
+ * marked `movable` goes: not an expired one (its host's fence is still owed), nor one being resumed. The host that
+ * needs the fewest moved (then the first given); the biggest suspended ones first. Null when the
+ * rule is off, or no host would take `need` even with every suspended sandbox gone.
+ */
+export function evictionsFor(hosts: readonly SandboxHostFacts[], need: { vcpus: number; memory_mib: number }, cfg: PackSettings): { host: string; sandboxes: string[] } | null {
+  if ((cfg.commit_pct ?? 0) <= 0) return null;
+  let best: { host: string; sandboxes: string[] } | null = null;
+  for (const h of hosts) {
+    const movable = h.leases.filter((l) => l.movable === true && l.state === "suspended" && l.sandbox !== undefined)
+      .sort((a, b) => (b.memory_mib ?? need.memory_mib) - (a.memory_mib ?? need.memory_mib));
+    const moved: string[] = [];
+    let leases = [...h.leases];
+    for (const l of movable) {
+      if (pickSandboxHost([{ ...h, leases }], need, cfg)) break;
+      leases = leases.filter((x) => x !== l);
+      moved.push(l.sandbox!);
+    }
+    if (moved.length && pickSandboxHost([{ ...h, leases }], need, cfg) && (!best || moved.length < best.sandboxes.length)) best = { host: h.host, sandboxes: moved };
+  }
+  return best;
+}
+
+/**
+ * What a host is assumed to report of its instance's nominal memory (`MemTotal`), in percent, when
+ * judging a launch type before any host of it exists. Unverified on r8id and m8i (an idle m8id
+ * reported 7359 MiB available of 8192 on 2026-11-18, so at least 89.8%); set low on purpose, since
+ * an estimate above what hosts report would admit a sandbox every launched host then refuses.
+ */
+export const MEMTOTAL_PCT = 90;
+
+/**
+ * Whether a host of a launch type (`type_mib`: its nominal memory) would hold a sandbox of `need_mib`
+ * alone under the commit rule. True when that can't be told: the rule off, or the type's size unknown.
+ */
+export function typeHolds(type_mib: number | undefined, need_mib: number, cfg: PackSettings): boolean {
+  if ((cfg.commit_pct ?? 0) <= 0 || !(type_mib! > 0)) return true;
+  return need_mib + VMM_OVERHEAD_MIB <= Math.floor(type_mib! * MEMTOTAL_PCT / 100) - (cfg.host_reserve_mib ?? 0);
+}
+
+/**
+ * Under the commit rule, the most memory a sandbox may declare and still fit, alone, the largest
+ * host the cell launches (`type_memory_mib`: each launch type's nominal memory), or null when that
+ * can't be told (the rule off, or a launch type of unknown size). A bigger sandbox fits nowhere:
+ * every host launched for it would refuse it.
+ */
+export function largestSandboxMib(types: readonly string[], type_memory_mib: Readonly<Record<string, number>> | undefined, cfg: PackSettings): number | null {
+  if ((cfg.commit_pct ?? 0) <= 0 || !type_memory_mib || !types.length) return null;
+  if (types.some((t) => !(type_memory_mib[t]! > 0))) return null;
+  const largest = Math.max(...types.map((t) => type_memory_mib[t]!));
+  return Math.floor(largest * MEMTOTAL_PCT / 100) - (cfg.host_reserve_mib ?? 0) - VMM_OVERHEAD_MIB;
 }
 
 /**
@@ -25,13 +118,15 @@ export interface PackSettings {
  * state after the report: capacity is reported at most every 30 s). Regular pages: `reserve_mib` each
  * against `memory_mib_free` (the declared size is a jailer ceiling), capped by `max_per_host`. A
  * hugepage host: the declared size against `hugepages_mib_free`, vCPUs against `vcpus_free`. An empty
- * host always takes one. Preferred: warm, then least room left, then most leases.
+ * host always takes one, unless the commit rule ([`withinCommit`], regular pages only) refuses it.
+ * Preferred: warm, then least room left, then most leases.
  */
 export function pickSandboxHost(hosts: readonly SandboxHostFacts[], need: { vcpus: number; memory_mib: number }, cfg: PackSettings): string | null {
   const fit = (h: SandboxHostFacts): { room: number; fits: boolean } => {
     const n = h.leases.length;
     const cap = h.capacity;
-    if (!cap) return { room: n ? 0 : Infinity, fits: n === 0 };
+    // No report yet: its size is unknown, so the commit rule (when on) refuses it.
+    if (!cap) return { room: n ? 0 : Infinity, fits: n === 0 && withinCommit(h, need.memory_mib, cfg) };
     // A lease that reported before marks existed (state set, no state_seq) is counted.
     const pending = h.leases.filter((l) => l.state === null || (l.state_seq !== null && (h.capacity_seq ?? 0) <= l.state_seq));
     const hugepageHost = (cap.hugepages_mib_total ?? 0) > 0;
@@ -42,7 +137,7 @@ export function pickSandboxHost(hosts: readonly SandboxHostFacts[], need: { vcpu
     }
     const mem = cap.memory_mib_free - pending.length * cfg.reserve_mib;
     const underCap = cfg.max_per_host === 0 || n < cfg.max_per_host;
-    return { room: mem - cfg.reserve_mib, fits: n === 0 || (underCap && mem >= cfg.reserve_mib) };
+    return { room: mem - cfg.reserve_mib, fits: withinCommit(h, need.memory_mib, cfg) && (n === 0 || (underCap && mem >= cfg.reserve_mib)) };
   };
   const fitting = hosts.map((h) => ({ h, ...fit(h) })).filter((c) => c.fits);
   fitting.sort((a, b) => Number(b.h.warm) - Number(a.h.warm) || a.room - b.room || b.h.leases.length - a.h.leases.length);

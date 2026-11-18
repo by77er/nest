@@ -112,10 +112,10 @@ launch never fails on `SandboxTypesOnly`. -/
 theorem launch_types_within_iam : use1.launchTypesAllowed = true := by decide
 
 /-- Every type has an on-demand price, and the on-demand order is cheapest first: an on-demand
-sandbox host is `c8i-flex.large` when it has room, never dearer than one that does. -/
+sandbox host is `m8i.large` when it has room, never dearer than one that does. -/
 theorem on_demand_types_priced : use1.onDemandPriced = true := by decide
 
-example : use1.onDemandTypes.map (·.toList) = ["c8i-flex.large", "c8i.large", "m8i.large", "c8id.large", "m8id.large", "r8id.large"].map (·.toList)
+example : use1.onDemandTypes.map (·.toList) = ["m8i.large", "m8id.large", "r8id.large"].map (·.toList)
     ∧ use1.brainOnDemandTypes.map (·.toList) = ["t3a.medium", "t3.medium"].map (·.toList) := by decide
 /-- Every sandbox type has nested virtualization (Firecracker needs KVM), and the instance-store
 types come first, so FleetDO tries every one of them before an EBS-only type. -/
@@ -141,6 +141,16 @@ placement packs by memory, which on `m8id` and `r8id` would fit 2-4× `c8id`'s s
 118 GB. -/
 theorem sandboxes_fit_their_disk : use1.sandboxesFitStore = true := by decide
 
+/-- The commit rule is on in `use1`, and every type it may launch holds a default sandbox under
+it: no host is launched that placement would then refuse. The 4 GiB types (every `c` family
+`.large`) hold none, which is why they are no longer launched. -/
+theorem launch_types_hold_a_sandbox : use1.memoryCommitPct > 0 ∧ use1.launchTypesHoldASandbox = true := by decide
+
+/-- What the rule allows per host: five default sandboxes on 16 GiB, two on 8, none on 4. -/
+example : use1.defaultSandboxesOn "r8id.large" = 5 ∧ use1.defaultSandboxesOn "m8id.large" = 2
+    ∧ use1.defaultSandboxesOn "m8i.large" = 2 ∧ use1.defaultSandboxesOn "c8id.large" = 0
+    ∧ use1.defaultSandboxesOn "c8i-flex.large" = 0 := by decide
+
 /-- `AWS_CELLS` is JSON keyed by the cell, carrying the stack's template, subnets and proxy root CA
 key and the spec's instance types (the shape control-plane/src/lib/cells.ts parses). -/
 def awsCellsHolds (spec : CellSpec) : Bool :=
@@ -160,6 +170,10 @@ def awsCellsHolds (spec : CellSpec) : Bool :=
         && cell.getObjValAs? Nat "enroll_timeout_ms" == .ok spec.enrollTimeoutMs
         && cell.getObjValAs? Nat "sandbox_reserve_mib" == .ok spec.sandboxReserveMib
         && cell.getObjValAs? Nat "max_sandboxes_per_host" == .ok spec.maxSandboxesPerHost
+        && cell.getObjValAs? Nat "memory_commit_pct" == .ok spec.memoryCommitPct
+        && cell.getObjValAs? Nat "host_reserve_mib" == .ok spec.hostReserveMib
+        && spec.launchTypes.all (fun t =>
+            ((cell.getObjVal? "instance_memory_mib").bind (·.getObjValAs? Nat t)) == .ok (instanceMemoryMib t) && instanceMemoryMib t > 0)
         && cell.getObjValAs? String "proxy_root_key_arn" == .ok key
         && (match cell.getObjVal? "brain" with
             | .ok brain =>
