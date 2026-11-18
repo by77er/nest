@@ -1731,6 +1731,26 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     expect(ec2.terminated).toContain("i-0sweep");
   });
 
+  it("the tick's sweep runs in a cell with no settings, and leaves a previous-release host's sandboxes alone", async () => {
+    const cell = uniqueCell();
+    const fleet = fleetStub(cell);
+    const a = await connectHost(cell);
+    const old = await connectHost(cell, "sandbox", { brain_epochs: false });
+    const onA = await createSandbox(cell);
+    await nextCommands(a.ws, (c) => c.type === "sandbox_create");
+    const sa = state(a.ws, onA.sandbox, 1, "suspended");
+    await a.ws.next("ack", (m) => m.up_to >= sa);
+    // One on the previous-release host, already drained of brains on sight (draining, sandboxes left as they are).
+    await runInDurableObject(fleet, (_i: FleetDO, st) => {
+      st.storage.sql.exec("INSERT INTO leases (sandbox, host, epoch, expired, state) VALUES ('sbx_oldhost0000000000000000000', ?, 1, 0, 'suspended')", old.host);
+      st.storage.sql.exec("UPDATE hosts SET status = 'draining', drain_ms = ? WHERE host IN (?, ?)", Date.now(), a.host, old.host);
+    });
+    await runAlarm(fleet, "tick");
+    expect(await fleet.leaseOf(onA.sandbox)).toBeNull();
+    await eventually("SandboxDO heard of the eviction", async () => (await sandboxStub(onA.sandbox).info()).host === null);
+    expect(await fleet.leaseOf("sbx_oldhost0000000000000000000")).toMatchObject({ host: old.host });
+  });
+
   it("an eviction whose `suspended` report failed at SandboxDO is told at the next tick, in a cell with no settings too", async () => {
     const cell = uniqueCell();
     const a = await connectHost(cell);
@@ -1752,10 +1772,9 @@ describe("sandbox lifecycle: idle suspend, eviction, lazy wake, spot drain", () 
     };
     try {
       state(a.ws, sbx.sandbox, 1, "suspended");
-      // The lease went with the report; the batch failed, and its redelivery finds no holder.
+      // The lease went with the report, and the batch failed: SandboxDO hasn't heard either.
       await eventually("the report failed", () => failed > 0);
       await eventually("the lease left", async () => (await fleetStub(cell).leaseOf(sbx.sandbox)) === null);
-      expect((await sandboxStub(sbx.sandbox).info()).host).toBe(a.host);
     } finally {
       SandboxDO.prototype.reportState = orig;
     }

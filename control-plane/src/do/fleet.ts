@@ -1465,7 +1465,7 @@ export class FleetDO extends DurableObject<Env> {
         this.recordStale(ev.sandbox, host, ev.epoch, true);
         this.reapStale();
         return;
-      case "sandbox_state":
+      case "sandbox_state": {
         // Only the lease holder's reports reach SandboxDO; a stale incarnation's `fenced` is noted
         // for cleanup on that host.
         if (!this.holds(host, ev.sandbox, ev.epoch)) {
@@ -1485,6 +1485,7 @@ export class FleetDO extends DurableObject<Env> {
         if (ev.state === "fenced") await this.holderFenced(host, ev.sandbox, ev.epoch, false);
         else if (leaving) await this.processEvictions();
         return;
+      }
       case "commit_request":
         return this.onCommitRequest(host, ev);
       case "workstream": {
@@ -2097,8 +2098,12 @@ export class FleetDO extends DurableObject<Env> {
       if (ws && h.token_exp - now < TOKEN_ROTATE_BEFORE_MS) await this.rotateToken(ws, h.host);
     }
     await this.processReassign();
-    // Evictions SandboxDO hasn't been told (its call failed, or the event that owed it was redelivered
-    // after the lease was gone): here, whatever the cell's settings.
+    // Leases that can leave a forced drain (a failed resume's result left one reading `suspended`), and
+    // evictions SandboxDO hasn't been told (its call failed, or the event that owed it was redelivered
+    // after the lease was gone): here, whatever the cell's settings. Each host re-read after the awaits.
+    for (const { host } of this.hostsBy({ status: "draining" })) {
+      if (this.forcedDrain(this.host(host))) this.evictSuspendedOf(host);
+    }
     await this.processEvictions();
     // Brains of a lost host whose agent wasn't told yet (its call failed), and owed exits of brains a
     // hello no longer reported.
@@ -2554,9 +2559,10 @@ export class FleetDO extends DurableObject<Env> {
     }
     // A draining host of any kind goes once empty, rather than at its deadline: never with a lease,
     // an indexed brain (alive until its exit), or a stale incarnation not yet salvaged.
-    for (const h of this.hostsBy({ status: "draining" })) {
-      // What became evictable since a forced drain (a failed resume's result): told below, with the rest.
-      if (this.forcedDrain(h)) this.evictSuspendedOf(h.host);
+    for (const { host } of this.hostsBy({ status: "draining" })) {
+      // Re-read after the previous host's awaits (N1): one confirmed dead meanwhile isn't retired again.
+      const h = this.host(host);
+      if (h?.status !== "draining") continue;
       if (this.leasesOf(h.host).length) continue;
       if (this.sql.exec("SELECT 1 FROM host_agents WHERE host = ?", h.host).toArray().length) continue;
       if (this.sql.exec("SELECT 1 FROM stale_incarnations WHERE host = ? AND cmd IS NULL", h.host).toArray().length) continue;
