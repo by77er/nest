@@ -937,11 +937,14 @@ export class ReviewDO extends DurableObject<Env> {
           return;
         }
         // Its template as this release has it, naming no repo of nest's, whatever the last catalog sync wrote: the
-        // project's own on the model the attempt froze (README.md#models), or the shared one. ProjectDO writes it.
-        const template = await projectStub(this.env, project).reviewerTemplate(key);
+        // project's own on the model the attempt froze (README.md#models, recorded by ProjectDO first), or the shared one.
+        const model = await projectStub(this.env, project).reviewerModel(key);
+        const own = model ? roleTemplate("reviewer", project, model) : null;
+        if (own) await nest.putCatalog("templates", own.name, own.body);
+        else await writeSharedTemplate(nest, this.env.PUBLIC_BASE_URL, TEMPLATE.reviewer);
         if (!current()) return;
         try {
-          agent = await nest.startAgent(template, labels, spawnOverrides(spec), key, { ...startEgress([], spec), ...spec.extras }, {}, { newAttemptOnCapacity: true });
+          agent = await nest.startAgent(own?.name ?? TEMPLATE.reviewer, labels, spawnOverrides(spec), key, { ...startEgress([], spec), ...spec.extras }, {}, { newAttemptOnCapacity: true });
         } catch (e) {
           // No room in nest for now: the job waits, queued, and starts again once there is.
           const r = atCapacity(e) ? current() : null;
