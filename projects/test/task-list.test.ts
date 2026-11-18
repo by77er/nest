@@ -202,15 +202,22 @@ describe("the board's list", () => {
 describe("the list's size", () => {
   it("on 300 tasks", async () => {
     const p = await newProject();
-    const body = "b".repeat(1024);
-    const big = { goal: "g".repeat(500), acceptance_criteria: Array.from({ length: 5 }, () => "a".repeat(300)), files: ["projects/src/do/project.ts"], test_plan: "p".repeat(1000) };
+    // Text that compresses as prose does, not as one repeated letter: words picked by a fixed generator.
+    const words = "the task list board poll worker manager spec body drawer review merge branch query cache index statement summary page owner agent sandbox".split(" ");
+    let x = 1;
+    const prose = (bytes: number) => {
+      let t = "";
+      while (t.length < bytes) t += `${words[(x = (x * 1103515245 + 12345) % 2 ** 31) % words.length]}${x % 11 === 0 ? ". " : " "}`;
+      return t.slice(0, bytes);
+    };
+    const big = () => ({ goal: prose(500), acceptance_criteria: Array.from({ length: 5 }, () => prose(300)), files: ["projects/src/do/project.ts"], test_plan: prose(1000) });
     await runInDurableObject(stub(p), async (o: ProjectDO) => {
       const ids: string[] = [];
       for (let i = 0; i < 300; i++) {
-        const r = await o.createTask({ title: `Task number ${i}`, body }, owner);
+        const r = await o.createTask({ title: `Task number ${i}`, body: prose(1024) }, owner);
         if (!r.ok) throw new Error(r.error);
         ids.push(r.value.id);
-        await o.writeSpec(r.value.id, big);
+        await o.writeSpec(r.value.id, big());
       }
       for (let i = 0; i < 300; i += 3) {
         await o.onPullRequest({ pr: 1000 + i, task: ids[i]!, action: "opened", merged: false, title: `PR for ${i}` });
