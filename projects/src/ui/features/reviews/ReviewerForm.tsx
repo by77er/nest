@@ -36,12 +36,13 @@ function problems(d: Draft): Record<string, string> {
   const out: Record<string, string> = {};
   for (const i of r.error.issues) {
     const [field, at] = i.path;
-    if (field === "dimensions" && typeof at === "number") out[`dimension.${at}`] ??= i.message;
+    const message = i.message.charAt(0).toUpperCase() + i.message.slice(1);
+    if (field === "dimensions" && typeof at === "number") out[`dimension.${at}`] ??= message;
     else if (field === "dimensions") {
       const names = d.dimensions.map((x) => x.name.trim().toLowerCase());
       const again = names.findIndex((k, n) => k !== "" && names.indexOf(k) < n);
-      out[again >= 0 ? `dimension.${again}` : "dimensions"] ??= i.message;
-    } else out[String(field)] ??= i.message;
+      out[again >= 0 ? `dimension.${again}` : "dimensions"] ??= message;
+    } else out[String(field)] ??= message;
   }
   return out;
 }

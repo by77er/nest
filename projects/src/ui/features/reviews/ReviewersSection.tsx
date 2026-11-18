@@ -1,7 +1,7 @@
 // The project's reviewers (README.md#reviewers), on the Reviews page under its reviews: how they run, said
 // once; a warning when none is on (PRs then aren't reviewed, and the required check passes without a review);
-// each reviewer as a Panel, as the Routines page shows a routine (its name, "Off", "Tainted", its dimensions
-// and instructions, "By the manager" when the manager last wrote it; Edit at the top right); "Add reviewer"
+// each reviewer as a Panel, as the Routines page shows a routine (its name, "Off", "Tainted", its dimensions,
+// "By the manager" when the manager last wrote it; Edit at the top right); "Add reviewer"
 // (the built-in Code review in one click while the project doesn't have it, or a custom one); the editor in
 // a Sheet, its Delete last, set apart and confirmed.
 
@@ -68,9 +68,6 @@ function ReviewerCard({ r, onEdit }: { r: Reviewer; onEdit: () => void }) {
         />
         <Text fz="sm" data-slot="dimensions">
           {r.dimensions.join(" · ")}
-        </Text>
-        <Text fz="sm" c="dimmed" lineClamp={2} data-slot="instructions">
-          {r.instructions}
         </Text>
         <MetaRow>
           {/* Only the manager's: an owner-written reviewer says nothing of who wrote it. */}

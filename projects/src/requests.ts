@@ -164,9 +164,11 @@ export const REVIEWER_PRESET_REFS: Record<ReviewerPreset, { id: string; name: st
 const RL = REVIEWER_LIMITS;
 /** A project's reviewer (README.md#reviewers): what it judges (its dimensions) and how (its instructions). */
 const ReviewerFields = {
-  name: z.string().trim().min(1).max(RL.name).describe(`The reviewer's name (at most ${RL.name} characters).`),
-  instructions: z.string().trim().min(1).max(RL.instructions).describe(`What it judges and how: its brief carries them (at most ${RL.instructions} characters).`),
-  dimensions: z.array(z.string().trim().min(1).max(RL.dimension)).min(1).max(RL.dimensions)
+  // Each bound in words, as the page shows a draft's problems and the API its refusal.
+  name: z.string().trim().min(1, "a name is needed").max(RL.name, `at most ${RL.name} characters`).describe(`The reviewer's name (at most ${RL.name} characters).`),
+  instructions: z.string().trim().min(1, "instructions are needed").max(RL.instructions, `at most ${RL.instructions} characters`).describe(`What it judges and how: its brief carries them (at most ${RL.instructions} characters).`),
+  dimensions: z.array(z.string().trim().min(1, "a dimension needs a name").max(RL.dimension, `at most ${RL.dimension} characters`))
+    .min(1, "at least one dimension").max(RL.dimensions, `at most ${RL.dimensions} dimensions`)
     .superRefine((ds, ctx) => {
       const bad = dimensionsProblem(ds);
       if (bad) ctx.addIssue({ code: "custom", message: bad });

@@ -280,6 +280,7 @@ describe("the Reviewers section", () => {
     await user.type(within(sheet).getByRole("textbox", { name: "Dimension 2" }), " secrets ");
     await user.click(within(sheet).getByRole("button", { name: "Add reviewer" }));
     await waitFor(() => expect(within(sheet).getByRole("textbox", { name: "Name" })).toHaveAttribute("aria-invalid", "true"));
+    expect(within(sheet).getByRole("textbox", { name: "Name" })).toHaveAccessibleDescription("A name is needed");
     expect(within(sheet).getByRole("textbox", { name: "Dimension 1" })).not.toHaveAttribute("aria-invalid", "true");
     expect(within(sheet).getByRole("textbox", { name: "Dimension 2" })).toHaveAccessibleDescription(/is there twice/);
     expect(api.writes).toEqual([]);

@@ -898,7 +898,7 @@ const app = {
     { name: "reviewers-none-on", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-none-on" },
     { name: "reviewers-empty", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-empty" },
     { name: "reviewers-full", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-full" },
-    { name: "reviewers-error", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-error" },
+    { name: "reviewers-error", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-error", httpErrors: true },
     { name: "reviewers-add", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-empty", full: false, after: async (p) => { const b = p.getByRole("button", { name: "Add reviewer" }); await b.scrollIntoViewIfNeeded(); await b.click(); await p.getByRole("menuitem", { name: /Custom reviewer/ }).waitFor(); } },
     { name: "reviewer-edit-tainted", section: "project", path: "/projects/prj_demo/reviews", full: false, after: (p) => p.getByRole("button", { name: "Edit Security" }).click() },
     { name: "reviewer-new-invalid", section: "project", path: "/projects/prj_demo/reviews", full: false, after: async (p) => {
