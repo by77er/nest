@@ -821,10 +821,11 @@ describe("the routine runs' model (README.md#models)", () => {
     const s = await setup();
     await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-haiku-5-5" });
     const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
-    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1 });
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
     await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
     const first = (await runs(s, d.id))[0];
     expect(first.state).toBe("starting");
+    fake.failures = [];
     // As the migration leaves a row frozen before the column: no model.
     await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
       st.storage.sql.exec("UPDATE routine_runs SET model = NULL, next_ms = 0 WHERE id = ?", first.id);
