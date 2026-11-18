@@ -281,22 +281,20 @@ describe("the models in the settings", () => {
     expect(within(dialog).queryByLabelText("Manager's model: model id")).toBeNull();
   });
 
-  it("the reviewers' and the routines' start on Claude Code's default, which the manager's and the workers' don't offer", async () => {
+  it("the reviewers' and the routines' start on Opus 5.5, and offer what the manager's and the workers' do", async () => {
     const api = new FakeApi();
     const { user, dialog } = await openSettings(api);
-    expect(select(dialog, "Reviewers' model")).toHaveValue("Claude Code's default");
-    expect(select(dialog, "Routines' model")).toHaveValue("Claude Code's default");
+    expect(select(dialog, "Reviewers' model")).toHaveValue("Opus 5.5");
+    expect(select(dialog, "Routines' model")).toHaveValue("Opus 5.5");
     expect(dialog).toHaveTextContent("A change applies to reviews started from now on; running ones keep theirs.");
     expect(dialog).toHaveTextContent("For every routine run, including dreaming runs. A change applies to runs started from now on.");
-    for (const label of ["Manager's model", "Workers' model"]) {
+    expect(dialog).not.toHaveTextContent("Claude Code's default");
+    for (const label of ["Manager's model", "Workers' model", "Reviewers' model", "Routines' model"]) {
       await user.click(select(dialog, label));
       const options = (await screen.findAllByRole("option")).map((o) => o.textContent);
       expect(options, label).toEqual(["Fable 5.2", "Opus 5.5", "Sonnet 5.5", "Haiku 5.5", "Custom…"]);
       await user.keyboard("{Escape}");
     }
-    await user.click(select(dialog, "Reviewers' model"));
-    expect((await screen.findAllByRole("option")).map((o) => o.textContent)).toEqual(["Claude Code's default", "Fable 5.2", "Opus 5.5", "Sonnet 5.5", "Haiku 5.5", "Custom…"]);
-    await user.keyboard("{Escape}");
     // Untouched, neither is sent.
     await user.click(select(dialog, "Workers' model"));
     await user.click(await screen.findByRole("option", { name: "Sonnet 5.5" }));
@@ -307,7 +305,7 @@ describe("the models in the settings", () => {
     expect(api.writes[0]!.body).not.toHaveProperty("routine_model");
   });
 
-  it("sends a listed model, a custom id, and the default again as null", async () => {
+  it("sends a listed model, a custom id, and Opus 5.5 again", async () => {
     const api = new FakeApi();
     const { user, dialog } = await openSettings(api);
     const save = async (n: number) => {
@@ -320,34 +318,35 @@ describe("the models in the settings", () => {
     const first = await save(1);
     expect(first).toMatchObject({ reviewer_model: "claude-haiku-5-5" });
     expect(first).not.toHaveProperty("routine_model");
-    // From the default, Custom starts empty, and an empty id isn't saved.
+    // Custom starts from the id it had, and a bad id isn't saved.
     await user.click(select(dialog, "Routines' model"));
     await user.click(await screen.findByRole("option", { name: "Custom…" }));
     const id = within(dialog).getByLabelText("Routines' model: model id");
-    expect(id).toHaveValue("");
-    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
-    expect(api.writes).toHaveLength(1);
+    expect(id).toHaveValue("claude-opus-5-5");
+    await user.clear(id);
     await user.type(id, "--bad");
     expect(dialog).toHaveTextContent("A model id is letters, digits");
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    expect(api.writes).toHaveLength(1);
     await user.clear(id);
     await user.type(id, "my-org-model-v2");
     expect(await save(2)).toMatchObject({ reviewer_model: "claude-haiku-5-5", routine_model: "my-org-model-v2" });
     await user.click(select(dialog, "Reviewers' model"));
-    await user.click(await screen.findByRole("option", { name: "Claude Code's default" }));
+    await user.click(await screen.findByRole("option", { name: "Opus 5.5" }));
     await user.click(select(dialog, "Routines' model"));
-    await user.click(await screen.findByRole("option", { name: "Claude Code's default" }));
+    await user.click(await screen.findByRole("option", { name: "Opus 5.5" }));
     expect(within(dialog).queryByLabelText("Routines' model: model id")).toBeNull();
-    expect(await save(3)).toMatchObject({ reviewer_model: null, routine_model: null });
+    expect(await save(3)).toMatchObject({ reviewer_model: "claude-opus-5-5", routine_model: "claude-opus-5-5" });
   });
 
-  it("a reviewers' or routines' model the server leaves out reads as the default, and isn't sent unless changed", async () => {
+  it("a reviewers' or routines' model the server leaves out reads as Opus 5.5, and isn't sent unless changed", async () => {
     const api = new FakeApi();
     const settings = api.projects[0]!.settings as Partial<typeof api.projects[0]["settings"]>;
     delete settings.reviewer_model;
     delete settings.routine_model;
     const { user, dialog } = await openSettings(api);
-    expect(select(dialog, "Reviewers' model")).toHaveValue("Claude Code's default");
-    expect(select(dialog, "Routines' model")).toHaveValue("Claude Code's default");
+    expect(select(dialog, "Reviewers' model")).toHaveValue("Opus 5.5");
+    expect(select(dialog, "Routines' model")).toHaveValue("Opus 5.5");
     await user.click(select(dialog, "Workers' model"));
     await user.click(await screen.findByRole("option", { name: "Sonnet 5.5" }));
     await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
