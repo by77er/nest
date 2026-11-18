@@ -33,12 +33,15 @@ def use1 : CellSpec :=
     -- -04): FleetDO tries on demand cheapest first.
     onDemandPrices := [("c8i-flex.large", 89020), ("c8i.large", 93710), ("m8i.large", 105840), ("c8id.large", 110880),
       ("m8id.large", 130520), ("r8id.large", 166320), ("t3a.medium", 37600), ("t3.medium", 41600)]
-    -- Under the commit rule an r8id.large holds five default sandboxes, so 4 hosts take 20 placed at
-    -- once (suspended ones move off when room is needed). 16 Haiku brains ran on a t3a.medium in the
-    -- stress test (dev/cloud-checks/stress-2026-10-31.md; about 105 MB each,
-    -- CPU peaking near 60%), so 12 leaves room for heavier sessions, and 3 hosts hold 36. 14 vCPU in
-    -- all, under the account's 32 spot vCPUs.
-    maxHosts := 4
+    -- 12 hosts take 24 default sandboxes placed at once on the 8 GiB types and 60 on r8id.large
+    -- (suspended ones move off when room is needed). 4 was sized for r8id.large alone: with none on
+    -- spot (2026-11-18) the cell filled at 8 sandboxes on four 8 GiB hosts, and the rest waited
+    -- unplaced. 24 vCPU, with the brain hosts' 6 under the account's 32 spot vCPUs; its 16 on-demand
+    -- vCPUs stop the fallback at 8 hosts (Service Quotas, 2026-11-18).
+    -- 16 Haiku brains ran on a t3a.medium in the stress test (dev/cloud-checks/stress-2026-10-31.md;
+    -- about 105 MB each, CPU peaking near 60%), so 12 leaves room for heavier sessions, and 3 hosts
+    -- hold 36.
+    maxHosts := 12
     maxBrainsPerHost := 12 }
 
 end Cell
