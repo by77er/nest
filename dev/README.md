@@ -49,6 +49,7 @@ nest's guardrails (grants, taint, nest-proxy, the runner's hygiene rules) are co
 | [ci.md](ci.md) | The checks every change must pass |
 | [deploy.md](deploy.md) | `deploy.yml`, the health window, `rollback.yml` |
 | [rollout/](rollout/README.md) | each release's rollout rule, one file per change |
+| [upkeep.md](upkeep.md) | The weekly upstream check: Claude Code, cloudflared, Firecracker, the guest kernel and image, the host AMI |
 | [github.md](github.md) | The App's permissions and bindings for this repo, branch protection, merge policy |
 | [repo-maintenance.md](repo-maintenance.md) | How nest's agents maintain a repo: the maintainer, workers, reviewers and the monitor, and the gates they merge through |
 | [setup.md](setup.md) | What I set up on GitHub and Cloudflare for all of the above |
