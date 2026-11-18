@@ -72,9 +72,6 @@ describe("the conditions", () => {
       ["two reviews, the first failed", pr(), { reviews: [codeReview("pass", "fail", "pass"), security("pass")] }, ["review_failed"]],
     ];
     for (const [name, p, v, want] of cases) expect(prConditions(p, v), name).toEqual(want);
-    // While the head's review is in flight, a conflict waits; the other conditions don't.
-    expect(prConditions(pr({ mergeable: "CONFLICTING" }), null, true)).toEqual([]);
-    expect(prConditions(pr({ mergeable: "CONFLICTING", checks: [check("ci", "FAILURE")] }), null, true)).toEqual(["checks_failed"]);
   });
 
   it("the read's checks are its head's: a last commit that isn't the head has none", () => {
@@ -223,7 +220,7 @@ const later = () => new Date((clock += 1000)).toISOString();
  * first read (due as soon as a worker owns a PR, so its alarm's) is done before the PR is set as `o` says,
  * so each test's reads are its own.
  */
-async function setup(o: { mergeable?: "MERGEABLE" | "CONFLICTING" | "UNKNOWN"; reviewing?: boolean } = {}) {
+async function setup(o: { mergeable?: "MERGEABLE" | "CONFLICTING" | "UNKNOWN" } = {}) {
   const repo = `o-${rand()}/r-${rand()}`.toLowerCase();
   const p = (await api(token, "POST", "/api/projects", { name: repo, repo })).body;
   const t = (await api(token, "POST", `/api/projects/${p.id}/tasks`, { title: "t" })).body;
@@ -234,16 +231,10 @@ async function setup(o: { mergeable?: "MERGEABLE" | "CONFLICTING" | "UNKNOWN"; r
   const pull = fake.github.pull(repo, n, { ref: `task/${t.id}`, sha, mergeable: "MERGEABLE" });
   await deliverGithub("pull_request", prEvent({ repo, number: n, sha, action: "opened", ref: `task/${t.id}`, updated_at: later() }));
   const s = { project: p.id as string, repo, task: t.id as string, worker, pr: n, sha };
-  // The head's review is over (no verdict: nothing to tell of it) unless the test wants it in flight.
-  if (!o.reviewing) await reviewEnded(s);
   await readNow(s);
   pull.mergeable = o.mergeable ?? "MERGEABLE";
   return s;
 }
-const reviewEnded = (s: { project: string; pr: number; sha: string }) =>
-  runInDurableObject(env.REVIEW.get(env.REVIEW.idFromName(s.project)), (_o, st) => {
-    st.storage.sql.exec("UPDATE jobs SET state = 'failed' WHERE pr = ? AND sha = ?", s.pr, s.sha);
-  });
 type S = { project: string; repo: string; task: string; worker: string; pr: number; sha: string };
 const stub = (s: S) => env.PROJECT.get(env.PROJECT.idFromName(s.project));
 /** The next read due now, as its minute passing would make it, then the alarm's work. */
@@ -290,18 +281,6 @@ describe("telling the worker", () => {
     fake.github.pulls.get(s.repo)!.get(s.pr)!.sha = shaOf("rebased badly");
     await readNow(s);
     expect(told(s)).toHaveLength(2);
-  });
-
-  it("a conflict waits while the head's review is in flight, and is told once it ends", async () => {
-    const s = await setup({ mergeable: "CONFLICTING", reviewing: true });
-    await readNow(s);
-    await readNow(s);
-    expect(reads(s).length).toBeGreaterThanOrEqual(2);
-    expect(told(s)).toHaveLength(0);
-    await reviewEnded(s);
-    await readNow(s);
-    expect(told(s)).toHaveLength(1);
-    expect(told(s)[0]!.text).toContain("It conflicts with its base branch main");
   });
 
   it("still so at the same head: told again once PR_RETELL_MS has passed, saying so; not before", async () => {
@@ -414,7 +393,7 @@ describe("telling the worker", () => {
   });
 
   it("a failed review: the reviewer's findings, framed as data, for the head it reviewed only, nudged by the review's end", async () => {
-    const s = await setup({ reviewing: true });
+    const s = await setup();
     const reviews = env.REVIEW.get(env.REVIEW.idFromName(s.project));
     await reviews.drain();
     const reviewer = [...fake.agents.values()].find((a) => a.labels.project === s.project && a.labels.role === "reviewer" && a.labels.sha === s.sha)!;
@@ -446,7 +425,7 @@ describe("telling the worker", () => {
   });
 
   it("a review that passed doesn't nudge the read", async () => {
-    const s = await setup({ reviewing: true });
+    const s = await setup();
     const reviews = env.REVIEW.get(env.REVIEW.idFromName(s.project));
     await reviews.drain();
     const reviewer = [...fake.agents.values()].find((a) => a.labels.project === s.project && a.labels.role === "reviewer" && a.labels.sha === s.sha)!;

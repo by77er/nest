@@ -32,17 +32,13 @@ export const verdictFailed = (v: Verdict) => !verdictPassed(v);
 /**
  * The conditions that hold for an open PR at its head: `review` is the app's verdict on that head
  * commit, if its review is done. A PR that isn't open, or is a fork's, has none.
- *
- * A conflict is told only once the head's review is over (`reviewing`: its job queued or running). A
- * rebase pushes a new head, which cancels the review in flight and starts another; told after it, the
- * worker fixes the findings and the conflict in one push, so one review is spent, not two.
  */
-export function prConditions(pr: PrNow, review: Verdict | null, reviewing = false): UpkeepCondition[] {
+export function prConditions(pr: PrNow, review: Verdict | null): UpkeepCondition[] {
   if (pr.state !== "OPEN" || pr.cross_repo) return [];
   const out: UpkeepCondition[] = [];
   if (review && verdictFailed(review)) out.push("review_failed");
   if (failedChecks(pr).length) out.push("checks_failed");
-  if (pr.mergeable === "CONFLICTING" && !reviewing) out.push("conflict");
+  if (pr.mergeable === "CONFLICTING") out.push("conflict");
   return out;
 }
 

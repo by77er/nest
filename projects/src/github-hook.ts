@@ -7,7 +7,7 @@
 //   failed delivery by itself (unverified: its docs offer manual redelivery only), so a lost
 //   `pull_request` leaves the head without the required check, which blocks merging until the next push.
 // - Events (https://docs.github.com/en/webhooks/webhook-events-and-payloads): `pull_request`
-//   (`opened`, `reopened`, `synchronize`, `ready_for_review`, `converted_to_draft`, `closed`) and `check_run` `rerequested` for the app's own
+//   (`opened`, `reopened`, `synchronize`, `closed`) and `check_run` `rerequested` for the app's own
 //   check; the owner's comments on a PR (README.md#pr-comments): `issue_comment` `created` on a PR,
 //   `pull_request_review` `submitted` (with text, or requesting changes) and `pull_request_review_comment`
 //   `created`; `issues` (README.md#triage: opened, reopened, edited, closed, deleted, transferred), never a
@@ -264,26 +264,17 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
     // The task its branch names, only for a branch of the repo itself (a fork may name any branch).
     const fromRepo = sameRepo(head.repo, payload.repository, p.repo);
     const task = fromRepo ? (TASK_BRANCH.exec(str(head.ref) ?? "")?.[1] ?? null) : null;
-    if (action === "opened" || action === "reopened" || action === "synchronize" || action === "ready_for_review" || action === "converted_to_draft") {
+    if (action === "opened" || action === "reopened" || action === "synchronize") {
+      // Whose PR, from where (README.md#the-review-gate): one the project doesn't trust is held, not reviewed.
       const author = prAuthor(pr);
-      const head = {
+      const trust = await trustedIds(env, p.id, p.repo, fromRepo && author.bot ? author.id : null, repoOwner);
+      await review(env, p.id).onHead(of, {
         pr: number, sha, base: (str(obj(pr.base).ref) ?? "").slice(0, 255), title: (str(pr.title) ?? "").slice(0, 1000), updated_at,
         fork: !fromRepo, author_id: author.id, author: author.login,
-      };
-      // A draft isn't reviewed (README.md, the review queue): its head is recorded, and its review starts when it's
-      // marked ready. GitHub sends `draft` on every `pull_request` payload; one without it is no draft.
-      if (pr.draft === true) {
-        await review(env, p.id).onDraft(of, head);
-      } else {
-        // Whose PR, from where (README.md#the-review-gate): one the project doesn't trust is held, not reviewed.
-        const trust = await trustedIds(env, p.id, p.repo, fromRepo && author.bot ? author.id : null, repoOwner);
-        await review(env, p.id).onHead(of, head, trust);
-      }
+      }, trust);
       // Its node id, for GraphQL's auto-merge on a task's PR.
       const node = str(pr.node_id);
-      // Marked ready: as an `opened` delivered again, so auto-merge is enabled now if it wasn't on yet (GitHub
-      // may refuse it on a draft: unverified).
-      if (action === "opened" || action === "reopened" || action === "ready_for_review") {
+      if (action !== "synchronize") {
         await project(env, p.id).onPullRequest({
           pr: number, task, action: "opened", merged: false, node: node && NODE.test(node) ? node : null, fork: !fromRepo, title: (str(pr.title) ?? "").slice(0, 300),
           updated_at: str(pr.updated_at) ?? null, reopened: action === "reopened",

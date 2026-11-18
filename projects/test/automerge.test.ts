@@ -61,7 +61,7 @@ async function taskWithWorker(p: P) {
 }
 
 /** A PR opened (or another action), then the project's alarm work done. */
-async function pr(p: P, number: number, o: { ref?: string; headRepo?: string; action?: string; merged?: boolean; draft?: boolean } = {}) {
+async function pr(p: P, number: number, o: { ref?: string; headRepo?: string; action?: string; merged?: boolean } = {}) {
   expect((await deliverGithub("pull_request", prEvent({ repo: p.repo, number, sha: sha(), action: o.action ?? "opened", updated_at: later(), ...o }))).status).toBe(200);
   await stub(p).drain();
 }
@@ -193,17 +193,6 @@ describe("a PR's auto-merge", () => {
     await pr(p, 5, { ref: `task/${id}`, action: "closed" });
     await pr(p, 5, { ref: `task/${id}`, action: "reopened" });
     expect((await task(p, id)).prs[0]?.auto_merge ?? null).toMatchObject({ state: "enabled" });
-  });
-
-  it("refused on a draft, it's enabled when the PR is marked ready", async () => {
-    const p = await newProject({ auto_merge: true });
-    const id = await taskWithWorker(p);
-    gh.gqlErrors.push({ match: /enablePullRequestAutoMerge/, message: "Pull request is in draft state", times: 1 });
-    await pr(p, 6, { ref: `task/${id}`, draft: true });
-    expect((await task(p, id)).prs[0]?.auto_merge ?? null).toMatchObject({ state: "failed" });
-    await pr(p, 6, { ref: `task/${id}`, action: "ready_for_review" });
-    expect((await task(p, id)).prs[0]?.auto_merge ?? null).toMatchObject({ state: "enabled" });
-    expect(gh.autoMerge.has(prNode(p.repo, 6))).toBe(true);
   });
 
   it("a failure for now is retried from the alarm", async () => {

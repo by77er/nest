@@ -2100,14 +2100,12 @@ export class ProjectDO extends DurableObject<Env> {
     this.sql.exec("UPDATE settings SET pr_read_next_ms = ?, pr_read_last_ms = ?", started + PR_READ_EVERY_MS, started);
     let prs: Map<number, PrNow | null>;
     let verdicts: Record<string, Verdict>;
-    let reviewing: Set<string>;
     try {
       const repo = await this.repo();
       const gh = await githubFor(this.env, repo, PERMISSIONS.prRead);
       prs = await readPrs(gh, repo, owned.map((o) => o.pr));
       const heads = [...prs.values()].filter((p): p is PrNow => p !== null && p.state === "OPEN" && !p.cross_repo).map((p) => ({ pr: p.number, sha: p.head_sha }));
       verdicts = heads.length ? await review(this.env, s.id).verdictsAt(heads) : {};
-      reviewing = new Set(heads.length ? await review(this.env, s.id).reviewingAt(heads) : []);
     } catch (e) {
       const attempts = (this.settingsRow()!.pr_read_attempts as number) + 1;
       this.sql.exec("UPDATE settings SET pr_read_attempts = ?, pr_read_next_ms = ?", attempts, Date.now() + Math.max(PR_READ_EVERY_MS, backoff(attempts)));
@@ -2126,14 +2124,12 @@ export class ProjectDO extends DurableObject<Env> {
       const pr = prs.get(o.pr);
       if (!pr) continue;
       const v = verdicts[`${pr.number}/${pr.head_sha}`] ?? null;
-      const inFlight = reviewing.has(`${pr.number}/${pr.head_sha}`);
-      const holds = prConditions(pr, v, inFlight);
+      const holds = prConditions(pr, v);
       // A condition seen not to hold at this head is marked cleared, so its return (a Re-run that fails again)
       // is told, though not within PR_FLAP_MS of its last telling. A conflict GitHub hasn't computed yet
       // (UNKNOWN) is neither.
       for (const c of UPKEEP_CONDITIONS) {
-        // Nor is a conflict held back while the head's review is in flight: it's told when that ends.
-        if (holds.includes(c) || (c === "conflict" && (pr.mergeable === "UNKNOWN" || (pr.mergeable === "CONFLICTING" && inFlight)))) continue;
+        if (holds.includes(c) || (c === "conflict" && pr.mergeable === "UNKNOWN")) continue;
         this.sql.exec("UPDATE pr_told SET cleared = 1 WHERE agent = ? AND pr = ? AND head = ? AND cond = ?", o.agent, pr.number, pr.head_sha, c);
       }
       // Told once per condition at a head, and again every PR_RETELL_MS while it holds.
