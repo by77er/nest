@@ -704,9 +704,9 @@ const MID_TURN = new Set(["working", "waiting_permission", "compacting", "quota_
 /** While a switch waits for the manager's turn to end, it looks again this often (its `turn_completed` may be missed). */
 const SWITCH_RECHECK_MS = 60_000;
 /**
- * A reviewer's model template is kept this long after each write (README.md#models): ReviewDO starts reviewers,
- * so a start between its write and its request is out of ProjectDO's sight. Far longer than the two requests
- * of a start (CALL_TIMEOUT_MS each).
+ * A reviewer's model template is kept this long after each time it's recorded (README.md#models, `reviewerModel`):
+ * ReviewDO writes it and starts reviewers, out of ProjectDO's sight. Far longer than the write and the two requests
+ * of a start (CALL_TIMEOUT_MS each, tried at most three times).
  */
 export const START_LEASE_MS = 10 * 60_000;
 /**
@@ -2251,7 +2251,7 @@ export class ProjectDO extends DurableObject<Env> {
    * (README.md#models): not the role's current setting, and not the one a live agent started from (nest
    * may read an agent's template again; unverified, so it's kept while that agent lives). Nothing is
    * swept while a manager's or worker's start is owed (it may be about to name one); a routine run's is
-   * kept from its first attempt until it has ended, and a reviewer's for START_LEASE_MS after each write
+   * kept from its first attempt until it has ended, and a reviewer's for START_LEASE_MS after each time it's recorded
    * (ReviewDO's starts are out of sight here). `all`: every one (the project is gone).
    * A delete nest can't take now is tried again with backoff (from the alarm, not at every drain); one it
    * refuses for good is recorded among the project's errors and not tried again.
