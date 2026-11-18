@@ -594,6 +594,29 @@ export class ReviewDO extends DurableObject<Env> {
     return ok(this.toJob(this.jobRow(pr, sha)!));
   }
 
+  /**
+   * A draft PR's head, from `pull_request` `opened`, `reopened`, `synchronize` or `converted_to_draft`
+   * with `draft: true`: not reviewed. The head is recorded (so an older event delivered late is ignored,
+   * as for `onHead`), and any job of the PR still waiting or running ends (superseded): its reviewer is
+   * stopped and its check cancelled. `ready_for_review` queues the head then (`onHead`).
+   */
+  async onDraft(p: ReviewOf, e: HeadEvent): Promise<void> {
+    this.bind(p);
+    const prev = this.sql.exec("SELECT updated_at FROM prs WHERE pr = ?", e.pr).toArray()[0];
+    if (prev && e.updated_at < (prev.updated_at as string)) return;
+    this.sql.exec(
+      `INSERT INTO prs (pr, sha, base, title, updated_at, open, author, author_id, fork) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+        ON CONFLICT (pr) DO UPDATE SET sha = excluded.sha, base = excluded.base, title = excluded.title, updated_at = excluded.updated_at, open = 1,
+          author = excluded.author, author_id = excluded.author_id, fork = excluded.fork, skipped_ms = NULL`,
+      e.pr, e.sha, e.base, e.title, e.updated_at, e.author, e.author_id, e.fork ? 1 : 0,
+    );
+    for (const j of this.sql.exec("SELECT * FROM jobs WHERE pr = ? AND state IN ('held', 'overflow', 'queued', 'running')", e.pr).toArray()) {
+      this.end(j, "superseded", ENDED, { title: "Draft", summary: "The PR is a draft: it's reviewed once it's marked ready for review." });
+    }
+    this.fillHeld();
+    await this.arm();
+  }
+
   /** `pull_request` `closed`: the PR's running and queued jobs end. */
   async onClosed(p: ReviewOf, e: { pr: number; updated_at: string }): Promise<void> {
     this.bind(p);

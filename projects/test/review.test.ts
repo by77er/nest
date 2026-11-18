@@ -257,6 +257,45 @@ describe("a PR's review", () => {
     expect((await job(p, 1, s2)).state).toBe("running");
   });
 
+  it("a draft isn't reviewed: no job, check or reviewer for its pushes, and its head is reviewed once it's marked ready", async () => {
+    const p = await newProject();
+    const s1 = sha();
+    const s2 = sha();
+    expect((await push(p, 1, s1, "opened", { draft: true })).status).toBe(200);
+    expect((await push(p, 1, s2, "synchronize", { draft: true })).status).toBe(200);
+    await run(p);
+    expect((await jobs(p)).filter((j) => j.pr === 1)).toEqual([]);
+    expect(gh.runsOf(p.repo, s1)).toEqual([]);
+    expect(gh.runsOf(p.repo, s2)).toEqual([]);
+    expect(reviewers(p, 1)).toEqual([]);
+
+    expect((await push(p, 1, s2, "ready_for_review")).status).toBe(200);
+    await run(p);
+    expect((await job(p, 1, s2)).state).toBe("running");
+    expect(gh.runsOf(p.repo, s2)[0]).toMatchObject({ status: "in_progress" });
+    expect(live(p, 1).map((a) => a.labels.sha)).toEqual([s2]);
+  });
+
+  it("a PR turned back into a draft ends its review: the reviewer stopped, the check cancelled; an older event delivered late starts nothing", async () => {
+    const p = await newProject();
+    const first = await opened(p, 1);
+    expect((await push(p, 1, first.sha, "converted_to_draft", { draft: true })).status).toBe(200);
+    await run(p);
+    expect(fake.agents.get(first.reviewer)!.ended).toBe(true);
+    expect(gh.runsOf(p.repo, first.sha)[0]).toMatchObject({ status: "completed", conclusion: "cancelled" });
+    expect((await job(p, 1, first.sha)).state).toBe("superseded");
+    // The `opened` (not a draft then) delivered again late: older than the draft, so ignored.
+    expect((await deliverGithub("pull_request", prEvent({ repo: p.repo, number: 1, sha: first.sha, action: "opened", updated_at: "2020-01-01T00:00:00Z" }))).status).toBe(200);
+    await run(p);
+    expect((await job(p, 1, first.sha)).state).toBe("superseded");
+    expect(live(p, 1)).toEqual([]);
+    // Marked ready again: the same head is reviewed again, with a new check.
+    expect((await push(p, 1, first.sha, "ready_for_review")).status).toBe(200);
+    await run(p);
+    expect((await job(p, 1, first.sha)).state).toBe("running");
+    expect(live(p, 1).map((a) => a.labels.sha)).toEqual([first.sha]);
+  });
+
   it("a new head replaces a job still queued", async () => {
     const p = await newProject({ max_concurrent_reviews: 0 });
     const s1 = sha();
