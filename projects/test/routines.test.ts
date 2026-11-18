@@ -816,6 +816,25 @@ describe("the routine runs' model (README.md#models)", () => {
     expect(stopsOf(running.agent)).toEqual([]);
     expect(fake.agents.get(running.agent)!.template).toBe(roleTemplate("routine", s.id, "claude-haiku-5-5").name);
   });
+
+  it("a run frozen before runs had a model (none in its row) starts from the shared template, a dreaming run's still without hands", async () => {
+    const s = await setup();
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-haiku-5-5" });
+    const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
+    const first = (await runs(s, d.id))[0];
+    expect(first.state).toBe("starting");
+    // As the migration leaves a row frozen before the column: no model.
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET model = NULL, next_ms = 0 WHERE id = ?", first.id);
+    });
+    await settle(s);
+    const dream = await liveRun(s, d.id);
+    expect(dream.state).toBe("running");
+    expect(fake.agents.get(dream.agent)!.template).toBe("projects/dreaming");
+    expect(sandboxesCreated(dream.id)).toEqual([]);
+  });
 });
 
 describe("presets", () => {

@@ -1023,6 +1023,9 @@ describe("a project's models", () => {
       fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
       await api(token, "POST", `/api/projects/${p.id}/routines/${r.id}/run`);
       expect(fake.catalog.has(`templates/${dreaming}`)).toBe(true);
+      // Frozen as the shared template's name and the model: the release before reads it as a dreaming run still.
+      expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT template, model FROM routine_runs").one()))
+        .toEqual({ template: "projects/dreaming", model: "claude-haiku-5-5" });
       await api(token, "PATCH", `/api/projects/${p.id}/settings`, { routine_model: null });
       await stub(p).drain();
       expect(deletesOf(dreaming)).toBe(0);
@@ -1032,6 +1035,7 @@ describe("a project's models", () => {
       const run = (await api(token, "GET", `/api/projects/${p.id}/routines/${r.id}/runs`)).body[0];
       expect(run.state).toBe("running");
       expect(fake.agents.get(run.agent)!.template).toBe(dreaming);
+      expect(fake.agents.get(run.agent)!.sandbox).toBeFalsy();
       await stub(p).drain();
       expect(fake.catalog.has(`templates/${dreaming}`)).toBe(true);
       // The run ends (its agent ends itself): its template goes.
