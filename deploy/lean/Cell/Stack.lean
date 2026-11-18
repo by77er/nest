@@ -79,6 +79,14 @@ structure CellSpec where
   enrollTimeoutMs : Nat := 600000
   /-- What a sandbox on regular pages is expected to use, reserved until the host counts it. -/
   sandboxReserveMib : Nat := 768
+  /-- The commit rule (control-plane/src/lib/placement.ts, `withinCommit`): a host's sandboxes'
+  declared sizes, each plus the VMM's overhead, may add up to this percent of its memory less
+  `hostReserveMib`. 0 turns the rule off: placement then packs by free memory alone, which admits
+  far more idle guests than a host holds once they work. -/
+  memoryCommitPct : Nat := 0
+  /-- What a sandbox host keeps for itself in the commit rule (the OS and nest's services): an
+  empty host uses about 650 MiB (dev/cloud-checks/stress-2026-10-31.md). -/
+  hostReserveMib : Nat := 768
   /-- The sandbox hosts' root volume, GB (gp3). An EBS-only host, or one whose bootstrap fell back
   from its instance store, keeps every sandbox's state there, so it must hold `maxSandboxesPerHost`
   sandboxes besides the OS, the base images and the chunk cache (`sandboxes_fit_their_disk`). -/
@@ -181,6 +189,37 @@ def instanceStoreGb (type : String) : Nat :=
   else if type.toList == "i7i.large".toList then 468
   else 0
 
+/-- Memory per listed type, MiB: every `.large` of the C families has 4 GiB, of the M families 8,
+of the R families 16 (https://aws.amazon.com/ec2/instance-types/; `describe-instance-types` gave
+4096 for c8i-flex.large and 8192 for m8id.large on 2026-11-18). 0: a type this table doesn't know. -/
+def instanceMemoryMib (type : String) : Nat :=
+  if type.toList.dropWhile (· ≠ '.') != ".large".toList then 0
+  else match type.toList.head? with
+    | some 'c' => 4096
+    | some 'm' => 8192
+    | some 'r' => 16384
+    | _ => 0
+
+/-- A sandbox's declared memory when its creator names none (control-plane/src/do/sandbox.ts,
+`DEFAULT_RESOURCES`). -/
+def defaultSandboxMib : Nat := 4096
+
+/-- What a VM costs its host beyond the guest's memory (nestd's `vm_memory_overhead_mib` default;
+control-plane/src/lib/placement.ts, `VMM_OVERHEAD_MIB`). -/
+def vmmOverheadMib : Nat := 128
+
+/-- How many default sandboxes the commit rule lets a host of `type` hold. The kernel reports a
+little less than an instance's nominal memory (`MemTotal`), so this counts 95% of it. -/
+def CellSpec.defaultSandboxesOn (spec : CellSpec) (type : String) : Nat :=
+  let usable := instanceMemoryMib type * 95 / 100 - spec.hostReserveMib
+  if defaultSandboxMib + vmmOverheadMib > usable then 0
+  else usable * spec.memoryCommitPct / 100 / (defaultSandboxMib + vmmOverheadMib)
+
+/-- With the commit rule on, every type the autoscaler may launch holds at least one default
+sandbox: a host that could take none would be launched, sit empty and be launched again. -/
+def CellSpec.launchTypesHoldASandbox (spec : CellSpec) : Bool :=
+  spec.memoryCommitPct == 0 || spec.launchTypes.all (fun t => spec.defaultSandboxesOn t ≥ 1)
+
 /-- What one sandbox is allowed of an instance store, in GB: its sparse 32 GiB disk shares
 `nest-base`'s blocks by reflink, so it holds what the guest wrote plus a cut's copies (an
 assumption, unmeasured on a used host). -/
@@ -256,6 +295,8 @@ def awsCellsWith {α : Type} [HAppend α α α] (str : String → α) (spec : Ce
     , field "enroll_timeout_ms" (number spec.enrollTimeoutMs)
     , field "sandbox_reserve_mib" (number spec.sandboxReserveMib)
     , field "max_sandboxes_per_host" (number spec.maxSandboxesPerHost)
+    , field "memory_commit_pct" (number spec.memoryCommitPct)
+    , field "host_reserve_mib" (number spec.hostReserveMib)
     , field "proxy_root_key_arn" (quote proxyRootKeyArn)
     , field "brain" (str "{" ++ join
         [ field "launch_template_id" (quote brainTemplateId)

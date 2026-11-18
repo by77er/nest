@@ -75,6 +75,30 @@ describe("placement packs", () => {
   });
 });
 
+describe("placement under the commit rule", () => {
+  // The cell's `memory_commit_pct` reaches the packing: FleetDO counts what a host's sandboxes may
+  // grow to (declared size + 128 MiB each) against the size the host reports, less its reserve.
+  it("a host takes sandboxes up to the cell's percent of its memory, and one that doesn't say its size takes none", async () => {
+    const cell = uniqueCell();
+    await runInDurableObject(fleetStub(cell), async (inst: FleetDO) => {
+      inst.cellConfigOverride = {
+        region: "us-east-1", launch_template_id: "lt-0abc", subnet_ids: ["subnet-0a"], instance_types: ["m8id.large"], spot: true,
+        // No host is launched here: the cell is at its maximum.
+        max_hosts: 0, idle_grace_ms: 60_000, enroll_timeout_ms: 600_000, sandbox_reserve_mib: 768, max_sandboxes_per_host: 0,
+        memory_commit_pct: 100, host_reserve_mib: 768,
+      };
+    });
+    const regular = { hugepages_mib_free: 0, hugepages_mib_total: 0, vcpus_free: 2 };
+    // Plenty free, but it is a nestd from before `memory_mib_total`: nothing bounds its guests.
+    await hostWithCapacity(cell, { ...regular, memory_mib_free: 15000 });
+    expect((await place(cell, 202)).host, "a host that doesn't say its size takes none").toBeNull();
+    // 8 GiB: one default sandbox (4096 + 128 <= 7900 - 768), not two (8448 > 7132), whatever is free.
+    const sized = await hostWithCapacity(cell, { ...regular, memory_mib_free: 7200, memory_mib_total: 7900 });
+    expect((await place(cell)).host).toBe(sized.host);
+    expect((await place(cell, 202)).host, "a second would commit 8448 MiB of 7132").toBeNull();
+  });
+});
+
 describe("placement on regular pages", () => {
   // No hugepage pool: a sandbox reserves the cell's `sandbox_reserve_mib` (768 by default)
   // against the host's free memory until the host counts it; its declared 4096 MiB is a ceiling.
@@ -209,6 +233,83 @@ describe("pickSandboxHost", () => {
     // A hugepage host counts declared sizes against its pool.
     expect(pickSandboxHost([host("hst_a", { capacity: cap(16384, 2047), leases: [lease()] })], need, cfg)).toBeNull();
     expect(pickSandboxHost([host("hst_a", { capacity: cap(16384, 2048), leases: [lease()] })], need, cfg)).toBe("hst_a");
+  });
+
+  describe("the commit rule", () => {
+    // 150% of a host's memory less 768 MiB for the host; a guest costs its declared size + 128 MiB.
+    const rule = { ...cfg, host_reserve_mib: 768, commit_pct: 150 };
+    const sized = (total: number, free = total - 700) => ({ ...cap(free), memory_mib_total: total });
+    const guest = (memory_mib: number | null = 4096) => ({ state: "running", state_seq: 1, vcpus: 2, memory_mib });
+    const big = { vcpus: 2, memory_mib: 4096 };
+
+    it("refuses what free memory admits: six 4 GiB guests on a 4 GiB host (2026-11-18)", () => {
+      // Idle guests touch little, so the host still reports room; without the rule it takes more.
+      const packed = host("hst_a", { capacity: sized(3900, 1351), leases: Array.from({ length: 6 }, () => guest()) });
+      expect(pickSandboxHost([packed], big, cfg)).toBe("hst_a");
+      expect(pickSandboxHost([packed], big, rule)).toBeNull();
+    });
+
+    it("alone: an empty host never takes a guest it could not hold", () => {
+      const small = host("hst_a", { capacity: sized(3900) });
+      expect(pickSandboxHost([small], big, cfg)).toBe("hst_a");
+      expect(pickSandboxHost([small], big, rule)).toBeNull(); // 4224 > 3900 - 768
+      expect(pickSandboxHost([small], need, rule)).toBe("hst_a"); // 2176 <= 3132
+      // The boundary: the guest and its overhead exactly fill the host less its reserve.
+      expect(pickSandboxHost([host("hst_a", { capacity: sized(4096 + 128 + 768) })], big, rule)).toBe("hst_a");
+      expect(pickSandboxHost([host("hst_a", { capacity: sized(4096 + 128 + 768 - 1) })], big, rule)).toBeNull();
+    });
+
+    it("together: declared sizes add up to the cell's percent of the host and no further", () => {
+      // 16 GiB: (15900 - 768) * 1.5 = 22698, and 5 * 4224 = 21120 fit where 6 * 4224 = 25344 don't.
+      const with_ = (n: number) => host("hst_a", { capacity: sized(15900), leases: Array.from({ length: n }, () => guest()) });
+      expect(pickSandboxHost([with_(4)], big, rule)).toBe("hst_a");
+      expect(pickSandboxHost([with_(5)], big, rule)).toBeNull();
+      // At 100% the same host holds three: 3 * 4224 = 12672 <= 15132 < 4 * 4224.
+      expect(pickSandboxHost([with_(2)], big, { ...rule, commit_pct: 100 })).toBe("hst_a");
+      expect(pickSandboxHost([with_(3)], big, { ...rule, commit_pct: 100 })).toBeNull();
+      // A lease with no recorded size (from before sizes were stored) counts as the one being placed.
+      const unsized = host("hst_a", { capacity: sized(15900), leases: Array.from({ length: 5 }, () => guest(null)) });
+      expect(pickSandboxHost([unsized], big, rule)).toBeNull();
+      expect(pickSandboxHost([unsized], need, rule)).toBe("hst_a"); // 6 * 2176 = 13056
+      // A smaller guest still fits beside five big ones: 21120 + 1152 <= 22698.
+      expect(pickSandboxHost([with_(5)], { vcpus: 1, memory_mib: 1024 }, rule)).toBe("hst_a");
+    });
+
+    it("a host that doesn't say its size takes nothing more, empty or not", () => {
+      expect(pickSandboxHost([host("hst_old")], big, rule)).toBeNull();
+      expect(pickSandboxHost([host("hst_old", { capacity: null })], big, rule)).toBeNull();
+      expect(pickSandboxHost([host("hst_old", { capacity: { ...cap(16384), memory_mib_total: 0 } })], big, rule)).toBeNull();
+      // Another host that does say takes it.
+      expect(pickSandboxHost([host("hst_old"), host("hst_new", { capacity: sized(15900) })], big, rule)).toBe("hst_new");
+    });
+
+    it("free memory and the per-host cap still count", () => {
+      const full = host("hst_a", { capacity: sized(15900, 700), leases: [guest()] });
+      expect(pickSandboxHost([full], big, rule)).toBeNull(); // 700 MiB free < the 768 reserve
+      expect(pickSandboxHost([host("hst_a", { capacity: sized(15900), leases: [guest()] })], big, { ...rule, max_per_host: 1 })).toBeNull();
+    });
+
+    it("property: no pick ever commits a host beyond the rule, and off changes nothing", () => {
+      for (let seed = 1; seed <= 500; seed++) {
+        const r = rng(seed);
+        const hosts = Array.from({ length: 1 + Math.floor(r() * 4) }, (_, i) => host(`hst_${i}`, {
+          capacity: r() < 0.1 ? null : { ...cap(Math.floor(r() * 16000)), ...(r() < 0.2 ? {} : { memory_mib_total: 2000 + Math.floor(r() * 30000) }) },
+          leases: Array.from({ length: Math.floor(r() * 7) }, () => guest(r() < 0.2 ? null : 1024 * (1 + Math.floor(r() * 8)))),
+        }));
+        const want = { vcpus: 2, memory_mib: 1024 * (1 + Math.floor(r() * 8)) };
+        const c = { ...cfg, host_reserve_mib: Math.floor(r() * 1500), commit_pct: 50 + Math.floor(r() * 200) };
+        const picked = pickSandboxHost(hosts, want, c);
+        if (picked) {
+          const h = hosts.find((x) => x.host === picked)!;
+          const usable = h.capacity!.memory_mib_total! - c.host_reserve_mib;
+          const committed = h.leases.reduce((sum, l) => sum + (l.memory_mib ?? want.memory_mib) + 128, 0) + want.memory_mib + 128;
+          expect(want.memory_mib + 128, `seed ${seed}`).toBeLessThanOrEqual(usable);
+          expect(committed * 100, `seed ${seed}`).toBeLessThanOrEqual(usable * c.commit_pct);
+        }
+        // Off (0, or the setting absent), the pick is the one without the rule.
+        expect(pickSandboxHost(hosts, want, { ...c, commit_pct: 0 }), `seed ${seed}`).toBe(pickSandboxHost(hosts, want, cfg));
+      }
+    });
   });
 
   it("property: an empty host always fits, a pick always fits, and no pick means none fits", () => {

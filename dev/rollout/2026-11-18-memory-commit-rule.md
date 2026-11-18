@@ -1,0 +1,11 @@
+# The commit rule for sandbox placement (2026-11-18)
+
+Not a one-way deploy. **One ordering constraint: after the release whose nestd reports `memory_mib_total`** (the PR before this one) is published, so hosts launched from then on say their size.
+
+- **What changes:** `use1` turns the commit rule on (`memory_commit_pct` 150, `host_reserve_mib` 768 in `AWS_CELLS`): a sandbox host takes a sandbox only while its sandboxes' declared memory, plus 128 MiB each, stays within 150% of its memory less 768 MiB, and only a sandbox it could hold alone. The cell launches `r8id.large` (16 GiB), then `m8id.large` and `m8i.large` (8 GiB); the 4 GiB types (`c8id`, `c8i-flex`, `c8i`) are no longer launched, since they hold no default sandbox under the rule.
+- **Why:** free memory admitted six 4 GiB sandboxes to a 4 GiB host; the kernel killed their VMMs under load.
+- **Cost:** a sandbox host is an `r8id.large` (on demand $0.16632/h; spot about $0.05/h on 2026-11-18, unverified since) holding five default sandboxes, where a `c8i-flex.large` ($0.08902/h) nominally held fourteen idle ones. On demand the order is `m8i.large`, `m8id.large`, `r8id.large`. With `maxHosts` 4 the cell holds 20 default sandboxes on `r8id`, 8 on 8 GiB hosts.
+- **Hosts already running** report no size (the previous nestd), so from the Worker's deploy they take no new sandbox. Their sandboxes run on; each host retires once idle. They count toward `maxHosts` until then, so right after the deploy the cell may have room for fewer new sandboxes than usual: a placement with no room waits and is retried (SandboxDO's alarm), as at capacity.
+- **Order within the deploy:** inframe writes the two fields into `AWS_CELLS`; then the Worker reads them. A Worker of the previous release ignores them (zod strips unknown keys). A new Worker with an `AWS_CELLS` that lacks them runs with the rule off.
+- **If the Worker deploys before hosts report their size** (the constraint broken): every host is refused, the cell launches hosts up to `maxHosts` that are refused too, and placements wait until hosts with the new nestd enrol. Recover by publishing the release; nothing is lost.
+- **What a rollback does:** `wrangler rollback` brings back packing by free memory alone on every host; the stack still launches the 8 and 16 GiB types. A forward revert of the stack brings the 4 GiB types back.

@@ -53,6 +53,13 @@ const AwsCell = z.object({
   sandbox_reserve_mib: z.number().int().positive().default(768),
   /** At most this many sandboxes per host on regular pages; 0 is no cap (memory decides). */
   max_sandboxes_per_host: z.number().int().nonnegative().default(0),
+  /**
+   * The commit rule (`withinCommit`, lib/placement.ts): a host's sandboxes' declared sizes may add up
+   * to this percent of its memory less `host_reserve_mib`. Absent (an entry from before the rule) or 0: off.
+   */
+  memory_commit_pct: z.number().int().nonnegative().optional(),
+  /** What a sandbox host keeps for itself (the OS and nest's services), out of its sandboxes' reach in the commit rule. */
+  host_reserve_mib: z.number().int().nonnegative().optional(),
   /** The cell's proxy root CA key (the stack's own KMS key), in the cell's region; without one, the development root. */
   proxy_root_key_arn: z.string().regex(KMS_KEY_ARN).optional(),
   /** Optional for one release: an entry written before brain hosts has none. */
@@ -65,6 +72,8 @@ const AwsCell = z.object({
 });
 
 export const DEFAULT_SANDBOX_RESERVE_MIB = 768;
+/** `host_reserve_mib` when a cell that turns the commit rule on doesn't say: about what an empty host uses (dev/cloud-checks/stress-2026-10-31.md). */
+export const DEFAULT_HOST_RESERVE_MIB = 768;
 
 export type AwsCellConfig = z.infer<typeof AwsCell>;
 

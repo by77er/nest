@@ -17,7 +17,7 @@ import {
   CloudflareError, CloudflareHttp, gatewayHostname, hostOfHostname, hostOfTunnelName, hostnameSuffix, splitDomain, tunnelConfig, tunnelName,
   tunnelPrefix, type CloudflareApi,
 } from "../lib/cloudflare";
-import { awsCell, cellAws, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type CellAws } from "../lib/cells";
+import { awsCell, cellAws, DEFAULT_HOST_RESERVE_MIB, DEFAULT_SANDBOX_RESERVE_MIB, type AwsCellConfig, type CellAws } from "../lib/cells";
 import { brainHostNeeded, idleStep, maxBrains, NO_ROOM_BACKOFF_BRAIN_MAX_MS, NO_ROOM_BACKOFF_MAX_MS, noRoomBackoffMs, pickBrainHost, pickSandboxHost, scaleUpPlan, type BrainHostFacts, type ScaleSettings } from "../lib/placement";
 import { deathPlan, expiryVerdict, hostStep, type DeathCause, type HostTransition } from "../lib/host-lifecycle";
 import type { InstanceIdentity } from "../lib/aws-identity";
@@ -1763,6 +1763,7 @@ export class FleetDO extends DurableObject<Env> {
       });
     const host = pickSandboxHost(hosts, need, {
       reserve_mib: cfg?.sandbox_reserve_mib ?? DEFAULT_SANDBOX_RESERVE_MIB, max_per_host: cfg?.max_sandboxes_per_host ?? 0,
+      host_reserve_mib: cfg?.host_reserve_mib ?? DEFAULT_HOST_RESERVE_MIB, commit_pct: cfg?.memory_commit_pct ?? 0,
     });
     if (!host) {
       // SandboxDO retries placement on its own alarm; by then the new host may have enrolled.

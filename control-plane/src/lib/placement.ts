@@ -13,10 +13,42 @@ export interface SandboxHostFacts {
   warm: boolean;
 }
 
-/** `AWS_CELLS` packing: what a sandbox reserves against `memory_mib_free`; a per-host cap (0: none). */
+/**
+ * `AWS_CELLS` packing: what a sandbox reserves against `memory_mib_free`; a per-host cap (0: none);
+ * and the commit rule: how much of a host's memory, less `host_reserve_mib` for the host itself, its
+ * sandboxes' declared sizes may add up to, in percent (0 or absent: no such rule).
+ */
 export interface PackSettings {
   reserve_mib: number;
   max_per_host: number;
+  host_reserve_mib?: number;
+  commit_pct?: number;
+}
+
+/** What a VM costs its host beyond the guest's declared memory: nestd's default jailer margin (`vm_memory_overhead_mib`). */
+export const VMM_OVERHEAD_MIB = 128;
+
+/**
+ * The commit rule (regular pages): whether `h` may take one more sandbox of `need_mib`, counting
+ * what every sandbox on it may grow to, not what it uses now. Guest memory is demand-paged, so an
+ * idle guest costs little and free memory admits far more than a host can hold once they work: the
+ * kernel then kills a VMM. Two conditions, each on declared size plus the VMM's overhead:
+ * - **alone:** the sandbox fits the host's memory less the host's own reserve, so no host takes a
+ *   guest it could never hold (an empty host included);
+ * - **together:** with every lease already there, it stays within `commit_pct` of that.
+ *
+ * A host that doesn't say its size (a nestd before `memory_mib_total`) takes nothing more: what its
+ * guests may grow to can't be bounded. Off (`commit_pct` 0 or absent), every host passes.
+ */
+export function withinCommit(h: SandboxHostFacts, need_mib: number, cfg: PackSettings): boolean {
+  const pct = cfg.commit_pct ?? 0;
+  if (pct <= 0) return true;
+  const total = h.capacity?.memory_mib_total ?? 0;
+  if (total <= 0) return false;
+  const usable = total - (cfg.host_reserve_mib ?? 0);
+  const cost = (mib: number) => mib + VMM_OVERHEAD_MIB;
+  const committed = h.leases.reduce((sum, l) => sum + cost(l.memory_mib ?? need_mib), 0);
+  return cost(need_mib) <= usable && (committed + cost(need_mib)) * 100 <= usable * pct;
 }
 
 /**
@@ -25,13 +57,15 @@ export interface PackSettings {
  * state after the report: capacity is reported at most every 30 s). Regular pages: `reserve_mib` each
  * against `memory_mib_free` (the declared size is a jailer ceiling), capped by `max_per_host`. A
  * hugepage host: the declared size against `hugepages_mib_free`, vCPUs against `vcpus_free`. An empty
- * host always takes one. Preferred: warm, then least room left, then most leases.
+ * host always takes one, unless the commit rule ([`withinCommit`], regular pages only) refuses it.
+ * Preferred: warm, then least room left, then most leases.
  */
 export function pickSandboxHost(hosts: readonly SandboxHostFacts[], need: { vcpus: number; memory_mib: number }, cfg: PackSettings): string | null {
   const fit = (h: SandboxHostFacts): { room: number; fits: boolean } => {
     const n = h.leases.length;
     const cap = h.capacity;
-    if (!cap) return { room: n ? 0 : Infinity, fits: n === 0 };
+    // No report yet: its size is unknown, so the commit rule (when on) refuses it.
+    if (!cap) return { room: n ? 0 : Infinity, fits: n === 0 && withinCommit(h, need.memory_mib, cfg) };
     // A lease that reported before marks existed (state set, no state_seq) is counted.
     const pending = h.leases.filter((l) => l.state === null || (l.state_seq !== null && (h.capacity_seq ?? 0) <= l.state_seq));
     const hugepageHost = (cap.hugepages_mib_total ?? 0) > 0;
@@ -42,7 +76,7 @@ export function pickSandboxHost(hosts: readonly SandboxHostFacts[], need: { vcpu
     }
     const mem = cap.memory_mib_free - pending.length * cfg.reserve_mib;
     const underCap = cfg.max_per_host === 0 || n < cfg.max_per_host;
-    return { room: mem - cfg.reserve_mib, fits: n === 0 || (underCap && mem >= cfg.reserve_mib) };
+    return { room: mem - cfg.reserve_mib, fits: withinCommit(h, need.memory_mib, cfg) && (n === 0 || (underCap && mem >= cfg.reserve_mib)) };
   };
   const fitting = hosts.map((h) => ({ h, ...fit(h) })).filter((c) => c.fits);
   fitting.sort((a, b) => Number(b.h.warm) - Number(a.h.warm) || a.room - b.room || b.h.leases.length - a.h.leases.length);
