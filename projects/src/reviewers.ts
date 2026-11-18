@@ -160,19 +160,21 @@ export function parseVerdict(stored: string, job: { agent: string | null; tainte
 }
 
 /**
- * A verdict as stored: its reviews, and, while the release before may run on these rows again (a
- * rollback), its three keys and summary from the "Code review" review, which is all that release reads.
+ * A verdict with the release before's three keys and summary besides, from the "Code review" review: all
+ * that release reads (its rows after a rollback, its page in a tab not reloaded yet). Another reviewer's
+ * failure fails its correctness, so that release never reads a failed verdict as passed.
  */
-export function storedVerdict(v: Verdict): string {
+export function legacyView(v: Verdict): Verdict & Partial<LegacyVerdict> {
   const code = v.reviews.find((r) => r.reviewer.id === CODE_REVIEW.id);
-  const legacy = code
-    ? {
-        ...Object.fromEntries(LEGACY.map(([k, d]) => {
-          const x = code.dimensions.find((y) => y.name === d);
-          return [k, { verdict: x?.verdict ?? "fail", notes: x?.notes ?? "" }];
-        })),
-        summary: code.summary,
-      }
-    : {};
-  return JSON.stringify({ reviews: v.reviews, ...legacy });
+  if (!code) return { reviews: v.reviews };
+  const others = v.reviews.filter((r) => r !== code && !reviewPassed(r)).map((r) => r.reviewer.name);
+  const legacy = Object.fromEntries(LEGACY.map(([k, d]) => {
+    const x = code.dimensions.find((y) => y.name === d);
+    return [k, { verdict: x?.verdict ?? "fail", notes: x?.notes ?? "" }];
+  })) as Omit<LegacyVerdict, "summary">;
+  if (others.length) legacy.correctness = { verdict: "fail", notes: `${legacy.correctness.notes}\n\nFailed by another reviewer: ${others.join(", ")}.`.trim() };
+  return { reviews: v.reviews, ...legacy, summary: code.summary };
 }
+
+/** A verdict as stored (`jobs.verdict`): its reviews, and the release before's keys while that release may run on these rows again. */
+export const storedVerdict = (v: Verdict): string => JSON.stringify(legacyView(v));

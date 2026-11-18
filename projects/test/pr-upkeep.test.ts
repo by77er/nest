@@ -135,6 +135,10 @@ describe("the message", () => {
       "Secrets: fail", hostile, "", "summary: security summary",
     ].join("\n"));
     expect(lines.indexOf(`END FINDINGS ${ctx.nonce}`)).toBe(lines.length - 1);
+    // A reviewer other than the built-in one, alone: named too.
+    const alone = upkeepMessage(pr(), ["review_failed"], { reviews: [security("fail")] }, ctx);
+    expect(alone).toContain("The reviewer's findings follow, under its name,");
+    expect(alone).toContain(`BEGIN FINDINGS ${ctx.nonce}\nSecurity: failed\n\nSecrets: fail`);
   });
 
   it("cuts long findings, and keeps each check's name and link to one line", () => {

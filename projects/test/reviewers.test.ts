@@ -82,10 +82,12 @@ describe("a stored verdict", () => {
       const stored = storedVerdict(v);
       expect(parseVerdict(stored, { agent: null, tainted: null })).toEqual(v);
       // The release before: `JSON.parse(row.verdict)` and its three keys, failed if any isn't "pass".
-      const before = JSON.parse(stored) as typeof old;
-      expect(before).toMatchObject(old);
-      expect(["correctness", "quality", "architecture"].some((d) => before[d as "quality"].verdict !== "pass")).toBe(true);
+      expect(JSON.parse(stored)).toMatchObject(v.reviews.length === 1 ? old : { ...old, correctness: { verdict: "fail", notes: "c\n\nFailed by another reviewer: Security." } });
     }
+    // Another reviewer failing alone: the release before reads it failed (its correctness), never passed.
+    const passed = { ...code, dimensions: code.dimensions.map((d) => ({ ...d, verdict: "pass" as const })) };
+    expect(JSON.parse(storedVerdict({ reviews: [passed, security] }))).toMatchObject({ correctness: { verdict: "fail" }, quality: { verdict: "pass" }, architecture: { verdict: "pass" } });
+    expect(JSON.parse(storedVerdict({ reviews: [passed] }))).toMatchObject({ correctness: { verdict: "pass", notes: "c" } });
     // Without a Code review review, no such keys (no verdict like that is written in this release).
     expect(Object.keys(JSON.parse(storedVerdict({ reviews: [security] })))).toEqual(["reviews"]);
   });

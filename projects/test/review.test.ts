@@ -385,7 +385,7 @@ describe("the verdict", () => {
     expect(toolOk(await callTool("review", t, "submit_review", { verdicts: loose, summary: "the summary" })).conclusion).toBe("failure");
     await run(p);
     expect(gh.runsOf(p.repo, s)[0]!.output!.title).toBe("Review failed: quality");
-    expect((await job(p, 1, s)).verdict).toEqual({ reviews: [review(reviewer, false, "pass", "fail", "pass")] });
+    expect((await job(p, 1, s)).verdict.reviews).toEqual([review(reviewer, false, "pass", "fail", "pass")]);
   });
 
   it("a reviewer started by the release before submits in its form: accepted as the built-in reviewer's review", async () => {
@@ -398,7 +398,7 @@ describe("the verdict", () => {
     toolOk(await callTool("review", t, "submit_review", { correctness: dim("fail"), quality: dim("pass"), architecture: dim("pass"), summary: "the summary" }));
     await run(p);
     expect(gh.runsOf(p.repo, s)[0]!.output!.title).toBe("Review failed: correctness");
-    expect((await job(p, 1, s)).verdict).toEqual({ reviews: [review(reviewer, true, "fail", "pass", "pass")] });
+    expect((await job(p, 1, s)).verdict.reviews).toEqual([review(reviewer, true, "fail", "pass", "pass")]);
     // Stored with the release before's keys too, which is all it reads after a rollback.
     const stored = await runInDurableObject(reviews(p), (_o, st) => JSON.parse(st.storage.sql.exec("SELECT verdict FROM jobs WHERE sha = ?", s).one().verdict as string));
     expect(stored).toMatchObject({ correctness: dim("fail"), quality: dim("pass"), architecture: dim("pass"), summary: "the summary" });
@@ -413,7 +413,8 @@ describe("the verdict", () => {
       st.storage.sql.exec("UPDATE jobs SET state = 'done', verdict = ?, tainted = 1 WHERE sha = ?", JSON.stringify(old), s);
     });
     const want = { reviews: [review(reviewer, true, "pass", "fail", "pass")] };
-    expect((await job(p, 1, s)).verdict).toEqual(want);
+    // The API answers the release before's keys besides, for a page still running its bundle.
+    expect((await job(p, 1, s)).verdict).toEqual({ ...want, ...old });
     expect((await reviews(p).jobs()).find((j) => j.sha === s)!.verdict).toEqual(want);
     expect(await reviews(p).verdictsAt([{ pr: 1, sha: s }])).toEqual({ [`1/${s}`]: want });
   });

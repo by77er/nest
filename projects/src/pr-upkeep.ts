@@ -8,7 +8,7 @@
 //   computed, tells nothing, and the next read sees it).
 
 import { CHECK_NAME } from "./github";
-import { type Review, reviewPassed, type Verdict, verdictPassed } from "./reviewers";
+import { builtInAlone, type Review, reviewPassed, type Verdict, verdictPassed } from "./reviewers";
 import type { PrCheck, PrNow } from "./pr-read";
 
 export const UPKEEP_CONDITIONS = ["review_failed", "checks_failed", "conflict"] as const;
@@ -131,9 +131,11 @@ export function upkeepMessage(pr: PrNow, found: readonly UpkeepCondition[], revi
     );
   }
   if (found.includes("review_failed") && review) {
-    const findings = review.reviews.length === 1 ? findingsOf(review.reviews[0]!)
+    const findings = builtInAlone(review) ? findingsOf(review.reviews[0]!)
       : review.reviews.map((r) => `${r.reviewer.name}: ${reviewPassed(r) ? "passed" : "failed"}\n\n${findingsOf(r)}`).join("\n\n");
-    const whose = review.reviews.length === 1 ? "The reviewer's findings follow" : `The ${review.reviews.length} reviewers' findings follow, each under its reviewer's name`;
+    const whose = builtInAlone(review) ? "The reviewer's findings follow"
+      : review.reviews.length === 1 ? "The reviewer's findings follow, under its name"
+      : `The ${review.reviews.length} reviewers' findings follow, each under its reviewer's name`;
     const clipped = findings.length > FINDINGS_MAX ? `${findings.slice(0, FINDINGS_MAX)}\n… (cut here: the rest is on the PR's ${CHECK_NAME} check)` : findings;
     lines.push(
       "",
