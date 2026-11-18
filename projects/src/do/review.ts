@@ -433,6 +433,14 @@ export class ReviewDO extends DurableObject<Env> {
     return out;
   }
 
+  /** Of `heads`, those whose review is in flight (its job queued or running), as `<pr>/<sha>`. */
+  async reviewingAt(heads: readonly { pr: number; sha: string }[]): Promise<string[]> {
+    return heads.filter((h) => {
+      const s = this.jobRow(h.pr, h.sha)?.state;
+      return s === "queued" || s === "running";
+    }).map((h) => `${h.pr}/${h.sha}`);
+  }
+
   /** The jobs held for the owner's approval, oldest first. */
   async held(): Promise<Job[]> {
     return this.sql.exec("SELECT * FROM jobs WHERE state = 'held' ORDER BY created_ms, pr").toArray().map((r) => this.toJob(r));
