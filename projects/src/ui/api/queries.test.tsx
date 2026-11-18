@@ -1,10 +1,10 @@
 // Reordering is optimistic: the board shows the move before the Worker answers, writes only the moved
 // task's `ord`, and puts the card back if the Worker refuses.
 import { QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { act, render, renderHook, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { FakeApi, task } from "../test/fakeApi";
-import { keys, useReorderTask } from "./queries";
+import { keys, useChat, useReorderTask, useTasks } from "./queries";
 import { createQueryClient } from "./queryClient";
 import type { Task } from "./types";
 
@@ -44,5 +44,44 @@ describe("reordering", () => {
     act(() => s.result.current.mutate({ task: s.tasks[0]!.id, ord: 9 }));
     await waitFor(() => expect(s.result.current.isError).toBe(true));
     expect(s.titles()).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("a poll that finds nothing new", () => {
+  it("renders nothing again: the 304 hands back the same tasks and chat", async () => {
+    const answers: Record<string, unknown> = { "/api/projects/prj_poll/tasks": [task({ title: "a" })], "/api/projects/prj_poll/chat": [{ seq: 1, sender: "manager", text: "hi" }] };
+    const statuses: number[] = [];
+    vi.stubGlobal("fetch", async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      const etag = `"${path.length}"`;
+      const res = new Headers(init?.headers).get("if-none-match") === etag
+        ? new Response(null, { status: 304, headers: { etag } })
+        : new Response(JSON.stringify(answers[path]), { headers: { "content-type": "application/json", etag } });
+      statuses.push(res.status);
+      return res;
+    });
+    const qc = createQueryClient();
+    const renders = { tasks: 0, chat: 0 };
+    function Tasks() {
+      renders.tasks++;
+      return <p>{useTasks("prj_poll").data?.length ?? "…"} tasks</p>;
+    }
+    function Chat() {
+      renders.chat++;
+      return <p>{useChat("prj_poll").data?.length ?? "…"} messages</p>;
+    }
+    const view = render(<QueryClientProvider client={qc}><Tasks /><Chat /></QueryClientProvider>);
+    await view.findByText("1 tasks");
+    await view.findByText("1 messages");
+    const before = { ...renders };
+    const data = { tasks: qc.getQueryData(keys.tasks("prj_poll")), chat: qc.getQueryData(keys.chat("prj_poll")) };
+    await act(() => qc.refetchQueries({ queryKey: ["projects", "prj_poll"] }));
+    // The poll was answered 304 (TanStack's structural sharing would keep an equal 200's reference too;
+    // client.test.ts shows the 304's value is the one remembered, no body read).
+    expect(statuses).toEqual([200, 200, 304, 304]);
+    expect(renders).toEqual(before);
+    expect(Object.is(qc.getQueryData(keys.tasks("prj_poll")), data.tasks)).toBe(true);
+    expect(Object.is(qc.getQueryData(keys.chat("prj_poll")), data.chat)).toBe(true);
+    qc.clear();
   });
 });
