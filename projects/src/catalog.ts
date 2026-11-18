@@ -128,7 +128,7 @@ const template = (capability: Server, prompt: string, subagents = false, timers 
   // capabilities, which a client's templates may name. `timers` (nest's timer_set, timer_cancel and
   // timer_list) is the manager's only: workers have nothing to wait for that their task doesn't bring.
   capabilities: ["nest", "hands", ...(subagents ? WORKER_EXTRA.capabilities : []), ...(timers ? ["timers"] : []), `${NAMESPACE}/${capability}`],
-  // `model` becomes Claude Code's `--model` (README.md#models); without one, nest's and Claude Code's default.
+  // `model` becomes Claude Code's `--model` (README.md#models).
   // Every role with hands works on the repo's code (manager, worker, reviewer, routine): each reads the repo's
   // own guidance; the reviewer from the PR's base branch (REVIEWER_GUIDANCE).
   launch: { ...(model ? { model } : {}), builtin_tools: [...BUILTIN_TOOLS, ...(subagents ? WORKER_EXTRA.builtin_tools : [])], system_prompt: { mode: "append", text: `${prompt}\n${guidance}` } },

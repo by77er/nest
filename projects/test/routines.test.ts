@@ -819,9 +819,9 @@ describe("the routine runs' model (README.md#models)", () => {
     expect(fake.agents.get(running.agent)!.template).toBe(roleTemplate("routine", s.id, "claude-haiku-5-5").name);
   });
 
-  it("a run frozen before runs had a model (none in its row) starts from the shared template, a dreaming run's still without hands", async () => {
+  it("a run frozen before runs had a model (none in its row) starts from the shared template, written first; a dreaming run's still without hands", async () => {
     const s = await setup();
-    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-haiku-5-5" });
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { routine_model: "claude-haiku-5-5", max_routine_runs: 2 });
     const d = (await api(token, "POST", `/api/projects/${s.id}/routines`, { preset: "dreaming" })).body;
     fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
     await api(token, "POST", `/api/projects/${s.id}/routines/${d.id}/run`);
@@ -837,6 +837,22 @@ describe("the routine runs' model (README.md#models)", () => {
     expect(dream.state).toBe("running");
     expect(fake.agents.get(dream.agent)!.template).toBe("projects/dreaming");
     expect(sandboxesCreated(dream.id)).toEqual([]);
+    // A routine run's: the shared template, written as this release has it whatever the catalog held.
+    const id = await create(s);
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    const r0 = (await runs(s, id))[0];
+    expect(r0.state).toBe("starting");
+    fake.failures = [];
+    const shared = fake.catalog.get("templates/projects/routine") as Record<string, unknown>;
+    fake.catalog.set("templates/projects/routine", { ...shared, read_repos: ["someone/else"] });
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET model = NULL, next_ms = 0 WHERE id = ?", r0.id);
+    });
+    await settle(s);
+    const run = await liveRun(s, id);
+    expect(fake.agents.get(run.agent)!.template).toBe("projects/routine");
+    expect(fake.catalog.get("templates/projects/routine")).toEqual(shared);
   });
 });
 
