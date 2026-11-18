@@ -61,7 +61,7 @@ fi
 
 for b in "${BINS[@]}"; do install -m 0755 "target/$TARGET/release/$b" "$STAGE/$b"; done
 install -m 0644 protocol/claude-code/managed-settings.json "$STAGE/managed-settings.json"
-aws s3 cp --region "$REGION" --only-show-errors "$CURRENT/SHA256SUMS" "$STAGE/current.sha256sums"
+aws s3 cp --region "$REGION" --only-show-errors "$CURRENT/SHA256SUMS" "$STAGE/current.sha256sums" >&2
 for f in "${CARRIED[@]}"; do
   aws s3 cp --region "$REGION" --only-show-errors "$CURRENT/$f" "$STAGE/$f" >&2
 done

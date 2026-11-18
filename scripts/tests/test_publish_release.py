@@ -112,17 +112,20 @@ class PublishRelease(unittest.TestCase):
         self.archive = self.tmp / "fc.tgz"
         self.archive.write_bytes(fake_archive(pinned_version(), self.FIRECRACKER, self.JAILER))
 
-    def current_release(self, firecracker: bytes, jailer: bytes, vmlinux_listed: bytes = b"kernel"):
-        """The bucket's current release: today's stub binaries, the given Firecracker, and carried
-        files; SHA256SUMS lists vmlinux as `vmlinux_listed` (which may not be what's stored)."""
+    def current_release(self, firecracker: bytes, jailer: bytes, listed: dict | None = None, nestd: bytes = b""):
+        """The bucket's current release: today's stub binaries (or another `nestd`), the given
+        Firecracker, and carried files; SHA256SUMS lists any file in `listed` with those bytes
+        instead of what's stored."""
         cur = self.s3 / BUCKET / "releases/current"
         cur.mkdir(parents=True)
         files = {**stub_bins(), "managed-settings.json": (self.work / "protocol/claude-code/managed-settings.json").read_bytes(),
                  "VERSION": b"0ld1234\n", "firecracker": firecracker, "jailer": jailer,
                  "vmlinux": b"kernel", "nest-base.ext4.zst": b"base image"}
+        if nestd:
+            files["nestd"] = nestd
         for name, data in files.items():
             (cur / name).write_bytes(data)
-        listed = {**files, "vmlinux": vmlinux_listed}
+        listed = {**files, **(listed or {})}
         (cur / "SHA256SUMS").write_text("".join(f"{sha(d)}  {n}\n" for n, d in listed.items()))
         return cur
 
@@ -173,7 +176,7 @@ class PublishRelease(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout, "changed=false\n")
         self.assertEqual(self.uploads(), [])
-        self.assertIn(pinned_version(), r.stderr)
+        self.assertIn(f"already ships {pinned_version()}", r.stderr)
 
     def test_a_different_firecracker_publishes_it_with_sha256sums_last(self):
         cur = self.current_release(b"old firecracker", b"old jailer")
@@ -185,7 +188,8 @@ class PublishRelease(unittest.TestCase):
         self.assertIn("jailer", uploads)
         self.assertEqual(uploads[-1], "SHA256SUMS", uploads)
         self.assertEqual(uploads.count("SHA256SUMS"), 1, uploads)
-        self.assertIn(pinned_version(), r.stderr)
+        self.assertNotIn("vmlinux", uploads)
+        self.assertIn(f"changes to {pinned_version()}", r.stderr)
         # What a host gets: the archive's binaries, and a SHA256SUMS that vouches for every file in it.
         self.assertEqual((cur / "firecracker").read_bytes(), self.FIRECRACKER)
         self.assertEqual((cur / "jailer").read_bytes(), self.JAILER)
@@ -194,12 +198,30 @@ class PublishRelease(unittest.TestCase):
         listed = sorted(line.split()[1] for line in (cur / "SHA256SUMS").read_text().splitlines())
         self.assertEqual(listed, sorted(BINS + ["managed-settings.json", "VERSION", "firecracker", "jailer", "vmlinux", "nest-base.ext4.zst"]))
 
-    def test_a_carried_file_the_current_release_doesnt_vouch_for_fails(self):
-        self.current_release(self.FIRECRACKER, self.JAILER, vmlinux_listed=b"another kernel")
+    def test_new_host_binaries_alone_publish_without_firecracker(self):
+        cur = self.current_release(self.FIRECRACKER, self.JAILER, nestd=b"#!/bin/sh\necho an older nestd\n")
         r = self.run_script()
-        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertEqual(self.uploads(), [])
-        self.assertIn("vmlinux", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout, "changed=true\n")
+        uploads = self.uploads()
+        self.assertIn("nestd", uploads)
+        self.assertNotIn("firecracker", uploads)
+        self.assertNotIn("jailer", uploads)
+        self.assertEqual(uploads[-1], "SHA256SUMS", uploads)
+        self.assertEqual(uploads.count("SHA256SUMS"), 1, uploads)
+        check = subprocess.run(["sha256sum", "-c", "--quiet", "SHA256SUMS"], cwd=cur, capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+
+    def test_a_carried_file_the_current_release_doesnt_vouch_for_fails(self):
+        for carried in ["vmlinux", "nest-base.ext4.zst"]:
+            with self.subTest(carried):
+                shutil.rmtree(self.s3, ignore_errors=True)
+                self.uploads_log.unlink(missing_ok=True)
+                self.current_release(self.FIRECRACKER, self.JAILER, listed={carried: b"another file"})
+                r = self.run_script()
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(self.uploads(), [])
+                self.assertIn(f"{carried} doesn't match", r.stderr)
 
 
 @unittest.skipUnless(shutil.which("shellcheck") or os.environ.get("CI") == "true", "shellcheck is not installed (required on CI)")
