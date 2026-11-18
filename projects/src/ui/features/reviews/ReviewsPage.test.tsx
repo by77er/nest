@@ -175,7 +175,7 @@ describe("the Reviews page", () => {
     // In the reviewers' order, each named once, over its own dimensions only (both have a Quality).
     expect([...failedRow!.querySelectorAll("[data-reviewer]")].map((g) => g.getAttribute("data-reviewer"))).toEqual(["code-review", "rv_sec"]);
     expect(within(code).getByText("Code review")).toBeInTheDocument();
-    expect(within(code).getAllByRole("button").map((b) => b.getAttribute("aria-label"))).toEqual(["Code review, Correctness: passed", "Code review, Quality: passed", "Code review, Architectural cohesiveness: passed"]);
+    expect([...code.querySelectorAll("[aria-label][data-verdict]")].map((b) => b.getAttribute("aria-label"))).toEqual(["Code review, Correctness: passed", "Code review, Quality: passed", "Code review, Architectural cohesiveness: passed"]);
     expect(within(sec).getByText("Security")).toBeInTheDocument();
     const secrets = within(sec).getByLabelText("Security, Secrets: failed");
     expect(secrets.querySelector(".mantine-Badge-root")!.getAttribute("style")).toContain("--mantine-color-danger-");
