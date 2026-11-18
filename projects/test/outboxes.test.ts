@@ -303,6 +303,9 @@ describe("the outboxes' migration", () => {
       // And the reviewers' and routine runs' models' step (README.md#models).
       for (const c of ["reviewer_model", "routine_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("ALTER TABLE routine_runs DROP COLUMN model");
+      // And the routines' writers' step (README.md#routines).
+      for (const c of ["source", "name_tainted", "prompt_tainted"]) sql.exec(`ALTER TABLE routines DROP COLUMN ${c}`);
+      sql.exec("ALTER TABLE routine_runs DROP COLUMN brief_tainted");
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec("INSERT INTO task_prs (pr, task, state, attached_by, attached_ms) VALUES (61, 'tsk_gone', 'open', 'owner', 1), (62, 'tsk_gone', 'detached', 'owner', 1), (63, ?, 'open', 'owner', 1)", t.id);
       migrate(st.storage, MIGRATIONS);
