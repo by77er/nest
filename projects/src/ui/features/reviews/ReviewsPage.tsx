@@ -194,8 +194,9 @@ export function ReviewsPage() {
     <ProjectFrame projectId={projectId}>
       {(p) => (
         <Stack gap="2xl">
+          {/* Not a live region: the section's own warning is the one announced. */}
           {noneOn && (
-            <Notice tone="warning" title="No reviewer is on" role="status">
+            <Notice tone="warning" title="No reviewer is on">
               <Stack gap="sm">
                 <Text fz="sm">{NONE_ON}</Text>
                 <Row>

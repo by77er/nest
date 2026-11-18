@@ -5,7 +5,7 @@
 
 import { ActionIcon, Button, Switch, Text, Textarea, TextInput } from "@mantine/core";
 import { IconPlus, IconX } from "@tabler/icons-react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { NewReviewer, REVIEWER_LIMITS } from "../../../requests";
 import { ApiError } from "../../api/client";
 import { useCreateReviewer, useUpdateReviewer } from "../../api/queries";
@@ -16,26 +16,30 @@ import { taintedText } from "../routines/Untrusted";
 interface Draft {
   name: string;
   instructions: string;
-  dimensions: string[];
+  /** Each with a key of its own, so a row removed or added keeps the others' (and focus can be put on one). */
+  dimensions: { key: number; name: string }[];
   enabled: boolean;
 }
 
-const draftOf = (r?: Reviewer): Draft => ({ name: r?.name ?? "", instructions: r?.instructions ?? "", dimensions: r ? [...r.dimensions] : [""], enabled: r?.enabled ?? true });
+let keys = 0;
+const dimension = (name = "") => ({ key: ++keys, name });
+const draftOf = (r?: Reviewer): Draft => ({ name: r?.name ?? "", instructions: r?.instructions ?? "", dimensions: r ? r.dimensions.map((x) => dimension(x)) : [dimension()], enabled: r?.enabled ?? true });
+const bodyOf = (d: Draft) => ({ name: d.name, instructions: d.instructions, dimensions: d.dimensions.map((x) => x.name), enabled: d.enabled });
 
 /**
  * What's wrong with a draft, by field, in the Worker's words: `name`, `instructions`, `dimension.<i>` for one
  * dimension (a repeated name on its second use), and `dimensions` for the list as a whole.
  */
-export function problems(d: Draft): Record<string, string> {
-  const r = NewReviewer.safeParse(d);
+function problems(d: Draft): Record<string, string> {
+  const r = NewReviewer.safeParse(bodyOf(d));
   if (r.success) return {};
   const out: Record<string, string> = {};
   for (const i of r.error.issues) {
     const [field, at] = i.path;
     if (field === "dimensions" && typeof at === "number") out[`dimension.${at}`] ??= i.message;
     else if (field === "dimensions") {
-      const keys = d.dimensions.map((x) => x.trim().toLowerCase());
-      const again = keys.findIndex((k, n) => k !== "" && keys.indexOf(k) < n);
+      const names = d.dimensions.map((x) => x.name.trim().toLowerCase());
+      const again = names.findIndex((k, n) => k !== "" && names.indexOf(k) < n);
       out[again >= 0 ? `dimension.${again}` : "dimensions"] ??= i.message;
     } else out[String(field)] ??= i.message;
   }
@@ -47,17 +51,37 @@ export function ReviewerForm({ projectId, editing, onDone }: { projectId: string
   const update = useUpdateReviewer(projectId);
   const [d, setD] = useState<Draft>(() => draftOf(editing));
   const [tried, setTried] = useState(false);
+  // The dimension to focus once it's rendered: one just added, or the neighbour of one just removed.
+  const inputs = useRef(new Map<number, HTMLInputElement>());
+  const [focusOn, setFocusOn] = useState<number | null>(null);
+  useEffect(() => {
+    if (focusOn === null) return;
+    inputs.current.get(focusOn)?.focus();
+    setFocusOn(null);
+  }, [focusOn]);
   const errs = tried ? problems(d) : {};
   const saving = create.isPending || update.isPending;
   const failed = create.error ?? update.error;
   const max = REVIEWER_LIMITS.dimensions;
-  const setDimension = (i: number, v: string) => setD((x) => ({ ...x, dimensions: x.dimensions.map((y, n) => (n === i ? v : y)) }));
+  const setDimension = (key: number, name: string) => setD((x) => ({ ...x, dimensions: x.dimensions.map((y) => (y.key === key ? { key, name } : y)) }));
+  const add = () => {
+    const n = dimension();
+    setD((x) => ({ ...x, dimensions: [...x.dimensions, n] }));
+    setFocusOn(n.key);
+  };
+  const remove = (i: number) => {
+    setFocusOn((d.dimensions[i + 1] ?? d.dimensions[i - 1])?.key ?? null);
+    setD((x) => ({ ...x, dimensions: x.dimensions.filter((_, n) => n !== i) }));
+  };
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
     setTried(true);
+    // A refusal from an earlier save no longer stands beside what's wrong now.
+    create.reset();
+    update.reset();
     if (Object.keys(problems(d)).length) return;
-    const body = { name: d.name, instructions: d.instructions, dimensions: d.dimensions, enabled: d.enabled };
+    const body = bodyOf(d);
     if (editing) update.mutate({ reviewer: editing.id, ...body }, { onSuccess: onDone });
     else create.mutate(body, { onSuccess: onDone });
   };
@@ -72,7 +96,7 @@ export function ReviewerForm({ projectId, editing, onDone }: { projectId: string
         )}
         <Section title="Reviewer" order={4} region={false}>
           <FieldGroup>
-            <TextInput label="Name" required maxLength={REVIEWER_LIMITS.name} value={d.name} onChange={(e) => setD({ ...d, name: e.currentTarget.value })} error={errs.name} data-autofocus />
+            <TextInput label="Name" required value={d.name} onChange={(e) => setD({ ...d, name: e.currentTarget.value })} error={errs.name} data-autofocus />
             <Textarea
               label="Instructions"
               description="What it judges and how. Its brief carries them; it reads the PR's diff and the repo."
@@ -106,21 +130,24 @@ export function ReviewerForm({ projectId, editing, onDone }: { projectId: string
             </Text>
             <Stack gap="sm" role="list" aria-label="Dimensions">
               {d.dimensions.map((x, i) => (
-                <Row key={i} gap="xs" wrap="nowrap" align="flex-start" role="listitem">
+                <Row key={x.key} gap="xs" wrap="nowrap" align="flex-start" role="listitem">
                   <TextInput
                     flex={1}
+                    ref={(el) => {
+                      if (el) inputs.current.set(x.key, el);
+                      else inputs.current.delete(x.key);
+                    }}
                     aria-label={`Dimension ${i + 1}`}
-                    maxLength={REVIEWER_LIMITS.dimension}
-                    value={x}
-                    onChange={(e) => setDimension(i, e.currentTarget.value)}
+                    value={x.name}
+                    onChange={(e) => setDimension(x.key, e.currentTarget.value)}
                     error={errs[`dimension.${i}`]}
                   />
                   <ActionIcon
                     variant="subtle"
                     color="gray"
-                    aria-label={`Remove dimension ${i + 1}${x.trim() ? ` (${x.trim()})` : ""}`}
+                    aria-label={`Remove dimension ${i + 1}${x.name.trim() ? ` (${x.name.trim()})` : ""}`}
                     disabled={d.dimensions.length === 1}
-                    onClick={() => setD({ ...d, dimensions: d.dimensions.filter((_, n) => n !== i) })}
+                    onClick={() => remove(i)}
                   >
                     <IconX size={icon.md} />
                   </ActionIcon>
@@ -133,7 +160,7 @@ export function ReviewerForm({ projectId, editing, onDone }: { projectId: string
               </Text>
             )}
             <Row gap="sm">
-              <Button variant="default" size="xs" leftSection={<IconPlus size={icon.sm} />} disabled={d.dimensions.length >= max} onClick={() => setD({ ...d, dimensions: [...d.dimensions, ""] })}>
+              <Button variant="default" size="xs" leftSection={<IconPlus size={icon.sm} />} disabled={d.dimensions.length >= max} onClick={add}>
                 Add dimension
               </Button>
               {d.dimensions.length >= max && (

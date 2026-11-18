@@ -7,7 +7,7 @@
 // still written with those keys besides (`storedVerdict`), so that release reads what this one writes; and a
 // reviewer started under it submits in that form, accepted and converted (`legacySubmit`).
 
-import { NewReviewer, problems, REVIEWER_PRESET_IDS, ReviewerFromPreset, type ReviewerPreset } from "./requests";
+import { NewReviewer, problems, REVIEWER_PRESET_REFS, ReviewerFromPreset, type ReviewerPreset } from "./requests";
 import { invalid } from "./schema";
 
 export { dimensionsProblem, MAX_REVIEWERS, REVIEWER_LIMITS } from "./requests";
@@ -23,15 +23,12 @@ export interface Reviewer {
 
 /** The built-in reviewer: a project's one reviewer until someone changes that, and its preset `code`. */
 export const CODE_REVIEW: Reviewer = {
-  ...REVIEWER_PRESET_IDS.code,
-  dimensions: ["Correctness", "Quality", "Architectural cohesiveness"],
+  ...REVIEWER_PRESET_REFS.code,
   instructions:
     "Judge three things separately: correctness (does it do what it claims, without bugs or regressions), quality (clear, tested, no needless code) and architectural cohesiveness (does it fit the repo's design; read its own docs, READMEs and conventions to judge that).",
 };
 
 // --- a project's reviewers -------------------------------------------------------------------------------
-
-// Reviewers a project holds: `MAX_REVIEWERS`. Each field's bounds and the dimensions' rule: `REVIEWER_LIMITS`, `dimensionsProblem`.
 
 /** Who last wrote a reviewer: the owner (the API) or the manager (its tools). */
 export type ReviewerSource = "owner" | "manager";

@@ -3,16 +3,16 @@
 // that's the manager and "Tainted" when a tainted session did; Run now and Edit, the editor in a Sheet), the tasks they proposed waiting for the owner, their recent runs (each with its
 // report, what it made and its agent's trace), and the project's memory (README.md#memory).
 
-import { Badge, Button, Menu, Text, Title } from "@mantine/core";
-import { modals } from "@mantine/modals";
+import { Badge, Button, Menu, Text } from "@mantine/core";
 import { IconBrain, IconChevronDown, IconPlayerPlay, IconPlus, IconRepeat } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
 import { useState } from "react";
 import { PRESETS } from "../../../routines";
 import { useAddPreset, useDeleteRoutine, useRoutines, useRunRoutine } from "../../api/queries";
 import type { Routine } from "../../api/types";
+import { confirmDelete, EditButton, EditorSheet, ThingHead } from "../../common/editing";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, SectionGrid, Sheet, Stack } from "../../layout";
+import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Section, SectionGrid, Stack } from "../../layout";
 import { ProjectFrame } from "../project/ProjectFrame";
 import { counterProgress, routineStatus, triggerPhrases, waitingText } from "./describe";
 import { MemorySection } from "./MemorySection";
@@ -60,33 +60,35 @@ function RoutineCard({ projectId, r, cap, onEdit }: { projectId: string; r: Rout
   return (
     <Panel data-routine={r.id}>
       <Stack gap="sm">
-        <Row justify="space-between" wrap="nowrap" align="flex-start">
-          <Row gap="sm">
-            <Title order={4}>{r.name}</Title>
-            {status && (
-              <Badge size="sm" variant={status.color === "gray" ? "outline" : "light"} color={status.color} data-slot="status">
-                {status.label}
-              </Badge>
-            )}
-            {r.tainted && <UntrustedBadge what={`the routine ${r.name}`} />}
-          </Row>
-          <Row gap="xs" wrap="nowrap">
-            <Button variant="subtle" color="gray" size="xs" onClick={onEdit} aria-label={`Edit ${r.name}`}>
-              Edit
-            </Button>
-            <Button
-              variant="default"
-              size="xs"
-              leftSection={<IconPlayerPlay size={icon.sm} />}
-              disabled={r.live_run !== null || r.due?.trigger === "manual"}
-              loading={run.isPending}
-              onClick={() => run.mutate(r.id)}
-              aria-label={`Run ${r.name} now`}
-            >
-              Run now
-            </Button>
-          </Row>
-        </Row>
+        <ThingHead
+          name={r.name}
+          badges={
+            <>
+              {status && (
+                <Badge size="sm" variant={status.color === "gray" ? "outline" : "light"} color={status.color} data-slot="status">
+                  {status.label}
+                </Badge>
+              )}
+              {r.tainted && <UntrustedBadge what={`the routine ${r.name}`} />}
+            </>
+          }
+          actions={
+            <>
+              <EditButton name={r.name} onClick={onEdit} />
+              <Button
+                variant="default"
+                size="xs"
+                leftSection={<IconPlayerPlay size={icon.sm} />}
+                disabled={r.live_run !== null || r.due?.trigger === "manual"}
+                loading={run.isPending}
+                onClick={() => run.mutate(r.id)}
+                aria-label={`Run ${r.name} now`}
+              >
+                Run now
+              </Button>
+            </>
+          }
+        />
         <Text fz="sm">{triggerPhrases(r.triggers).join(" · ")}</Text>
         <MetaRow>
           {/* Only the manager's: an owner-written routine says nothing of who wrote it. */}
@@ -123,15 +125,8 @@ export function RoutinesPage() {
   const close = () => setEditing(null);
   const editingRoutine = editing && editing !== "new" ? list.find((r) => r.id === editing.id) ?? editing : undefined;
 
-  const confirmDelete = (r: Routine) =>
-    modals.openConfirmModal({
-      title: `Delete ${r.name}?`,
-      children: <Text fz="md">Its runs' history goes with it. Tasks it proposed and notes it wrote stay.</Text>,
-      labels: { confirm: "Delete", cancel: "Keep it" },
-      confirmProps: { color: "danger" },
-      cancelProps: { variant: "default", "data-autofocus": true },
-      onConfirm: () => del.mutate(r.id, { onSuccess: close }),
-    });
+  const askDelete = (r: Routine) =>
+    confirmDelete({ title: `Delete ${r.name}?`, body: "Its runs' history goes with it. Tasks it proposed and notes it wrote stay.", onConfirm: () => del.mutate(r.id, { onSuccess: close }) });
 
   return (
     <ProjectFrame projectId={projectId}>
@@ -165,27 +160,19 @@ export function RoutinesPage() {
           <ProposalsSection projectId={projectId} />
           <RunsSection projectId={projectId} routines={list} />
           <MemorySection projectId={projectId} />
-          <Sheet opened={editing !== null} onClose={close} title={editingRoutine ? `Edit ${editingRoutine.name}` : "New routine"} closeOnEscape>
-            {editing !== null && (
-              <Stack gap="2xl">
-                <RoutineForm key={editingRoutine?.id ?? "new"} projectId={projectId} editing={editingRoutine} onDone={close} />
-                {editingRoutine && (
-                  <Section title="Delete" order={4} region={false}>
-                    <Stack gap="sm">
-                      <Text fz="sm" c="dimmed">
-                        {editingRoutine.live_run ? "Stop its run first: a routine with a run going isn't deleted." : "Its runs' history goes with it."}
-                      </Text>
-                      <Row>
-                        <Button variant="default" color="danger" disabled={editingRoutine.live_run !== null} onClick={() => confirmDelete(editingRoutine)}>
-                          Delete routine
-                        </Button>
-                      </Row>
-                    </Stack>
-                  </Section>
-                )}
-              </Stack>
-            )}
-          </Sheet>
+          <EditorSheet
+            opened={editing !== null}
+            onClose={close}
+            title={editingRoutine ? `Edit ${editingRoutine.name}` : "New routine"}
+            del={editingRoutine && {
+              note: editingRoutine.live_run ? "Stop its run first: a routine with a run going isn't deleted." : "Its runs' history goes with it.",
+              label: "Delete routine",
+              disabled: editingRoutine.live_run !== null,
+              onClick: () => askDelete(editingRoutine),
+            }}
+          >
+            <RoutineForm key={editingRoutine?.id ?? "new"} projectId={projectId} editing={editingRoutine} onDone={close} />
+          </EditorSheet>
         </Stack>
       )}
     </ProjectFrame>

@@ -3,7 +3,7 @@
 
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api } from "./client";
-import type { CreateReviewerBody, CreateRoutineBody, PutSecretBody, UpdateReviewerBody, UpdateRoutineBody } from "./types";
+import type { CreateReviewerBody, CreateRoutineBody, PutSecretBody, ReviewerPreset, UpdateReviewerBody, UpdateRoutineBody } from "./types";
 import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody, Waiting } from "./types";
 import { splitAttention } from "./types";
 
@@ -254,7 +254,7 @@ function useReviewerWrite<V, R>(id: string, fn: (v: V) => Promise<R>, failure: s
 }
 
 export const useCreateReviewer = (id: string) => useReviewerWrite(id, (b: CreateReviewerBody) => api.createReviewer(id, b), null);
-export const useAddReviewerPreset = (id: string) => useReviewerWrite(id, (preset: "code") => api.createReviewer(id, { preset }), "The reviewer wasn't added");
+export const useAddReviewerPreset = (id: string) => useReviewerWrite(id, (preset: ReviewerPreset) => api.createReviewer(id, { preset }), "The reviewer wasn't added");
 export const useUpdateReviewer = (id: string) =>
   useReviewerWrite(id, (v: { reviewer: string } & UpdateReviewerBody) => {
     const { reviewer, ...b } = v;

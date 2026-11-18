@@ -157,8 +157,10 @@ export function dimensionsProblem(dimensions: readonly string[]): string | null 
 /** The presets a reviewer can be added from: `code`, the built-in "Code review" (src/reviewers.ts). */
 export const REVIEWER_PRESETS = ["code"] as const;
 export type ReviewerPreset = (typeof REVIEWER_PRESETS)[number];
-/** Each preset's id (a project has it once) and name, which the page offers it by. */
-export const REVIEWER_PRESET_IDS: Record<ReviewerPreset, { id: string; name: string }> = { code: { id: "code-review", name: "Code review" } };
+/** Each preset's id (a project has it once), name and dimensions, which the page offers it by (src/reviewers.ts adds its instructions). */
+export const REVIEWER_PRESET_REFS: Record<ReviewerPreset, { id: string; name: string; dimensions: readonly string[] }> = {
+  code: { id: "code-review", name: "Code review", dimensions: ["Correctness", "Quality", "Architectural cohesiveness"] },
+};
 const RL = REVIEWER_LIMITS;
 /** A project's reviewer (README.md#reviewers): what it judges (its dimensions) and how (its instructions). */
 const ReviewerFields = {

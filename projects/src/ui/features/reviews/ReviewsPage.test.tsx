@@ -279,16 +279,19 @@ describe("the Reviewers section", () => {
     await user.click(within(sheet).getByRole("button", { name: "Add dimension" }));
     await user.type(within(sheet).getByRole("textbox", { name: "Dimension 2" }), " secrets ");
     await user.click(within(sheet).getByRole("button", { name: "Add reviewer" }));
-    expect(await within(sheet).findByText("Too small: expected string to have >=1 characters")).toBeInTheDocument();
+    await waitFor(() => expect(within(sheet).getByRole("textbox", { name: "Name" })).toHaveAttribute("aria-invalid", "true"));
+    expect(within(sheet).getByRole("textbox", { name: "Dimension 1" })).not.toHaveAttribute("aria-invalid", "true");
     expect(within(sheet).getByRole("textbox", { name: "Dimension 2" })).toHaveAccessibleDescription(/is there twice/);
     expect(api.writes).toEqual([]);
     await user.type(within(sheet).getByRole("textbox", { name: "Name" }), "Security");
     await user.clear(within(sheet).getByRole("textbox", { name: "Dimension 2" }));
     await user.type(within(sheet).getByRole("textbox", { name: "Dimension 2" }), "Injection");
     // Up to six: then Add dimension is off and says why; a removed one makes room again.
+    // A new dimension takes focus, so it's typed into straight away.
     for (let i = 3; i <= 6; i++) {
       await user.click(within(sheet).getByRole("button", { name: "Add dimension" }));
-      await user.type(within(sheet).getByRole("textbox", { name: `Dimension ${i}` }), `D${i}`);
+      expect(within(sheet).getByRole("textbox", { name: `Dimension ${i}` })).toHaveFocus();
+      await user.keyboard(`D${i}`);
     }
     expect(within(sheet).getByRole("button", { name: "Add dimension" })).toBeDisabled();
     expect(sheet).toHaveTextContent("At most 6: remove one to add another.");
@@ -296,6 +299,9 @@ describe("the Reviewers section", () => {
     expect(within(sheet).getByRole("button", { name: "Add dimension" })).toBeEnabled();
     await user.click(within(sheet).getByRole("button", { name: "Remove dimension 5 (D5)" }));
     await user.click(within(sheet).getByRole("button", { name: "Remove dimension 3 (D3)" }));
+    // Focus goes to the one that took its place, not the page.
+    expect(within(sheet).getByRole("textbox", { name: "Dimension 3" })).toHaveFocus();
+    expect(within(sheet).getByRole("textbox", { name: "Dimension 3" })).toHaveValue("D4");
     await user.click(within(sheet).getByRole("button", { name: "Add reviewer" }));
     await waitFor(() => expect(api.writes).toEqual([{ method: "POST", path: "/api/projects/prj_one/reviewers", body: { name: "Security", instructions: "Look for leaked secrets.", dimensions: ["Secrets", "Injection", "D4"], enabled: true } }]));
     expect(await card("Security")).toHaveTextContent("Secrets · Injection · D4");
@@ -338,6 +344,8 @@ describe("the Reviewers section", () => {
     await user.click(within(await screen.findByRole("dialog", { name: "Delete Code review?" })).getByRole("button", { name: "Delete" }));
     await waitFor(() => expect(api.writes).toEqual([{ method: "DELETE", path: "/api/projects/prj_one/reviewers/code-review", body: undefined }]));
     expect(await screen.findByText("No reviewers")).toBeInTheDocument();
+    // Its card and Edit are gone: focus is on the section's heading.
+    await waitFor(() => expect(screen.getByRole("heading", { name: "Reviewers" })).toHaveFocus());
   });
 
   it("at the limit, Add reviewer is off and says why", async () => {
@@ -352,9 +360,14 @@ describe("the Reviewers section", () => {
 
   it("loading and error, as the Routines page has them", async () => {
     const api = new FakeApi();
+    let answer = () => {};
+    api.holds.push({ match: /GET .*\/reviewers$/, until: new Promise<void>((r) => (answer = r)) });
     api.fail(/GET .*\/reviewers$/, 500, "ReviewDO is down");
     const { user } = renderApp("/projects/prj_one/reviews", api);
     const section = await screen.findByRole("region", { name: /^Reviewers/ });
+    expect(await within(section).findByText("Loading the reviewers")).toBeInTheDocument();
+    api.holds.length = 0;
+    answer();
     expect(await within(section).findByText("The reviewers couldn't be loaded")).toBeInTheDocument();
     expect(within(section).queryByText("No reviewer is on")).toBeNull();
     await user.click(within(section).getByRole("button", { name: /Retry|Try again/ }));

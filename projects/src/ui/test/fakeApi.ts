@@ -306,7 +306,8 @@ export class FakeApi {
       case "PATCH reviewers/:reviewer": {
         const r = this.reviewers.find((x) => x.id === parts[3]);
         if (!r) return json({ error: "unknown reviewer" }, 404);
-        Object.assign(r, body, { source: "owner", tainted: false, updated_ms: now });
+        // As ReviewDO: the owner's change clears a taint only by writing all of its text.
+        Object.assign(r, body, { source: "owner", tainted: r.tainted && !(body.name !== undefined && body.instructions !== undefined && body.dimensions !== undefined), updated_ms: now });
         return json(r);
       }
       case "DELETE reviewers/:reviewer":

@@ -5,20 +5,20 @@
 // (the built-in Code review in one click while the project doesn't have it, or a custom one); the editor in
 // a Sheet, its Delete last, set apart and confirmed.
 
-import { Badge, Button, Menu, Text, Title } from "@mantine/core";
-import { modals } from "@mantine/modals";
+import { Badge, Button, Menu, Text } from "@mantine/core";
 import { IconChevronDown, IconPlus, IconShieldCheck } from "@tabler/icons-react";
 import type { UseQueryResult } from "@tanstack/react-query";
 import { type RefObject, useId, useState } from "react";
-import { MAX_REVIEWERS, REVIEWER_PRESET_IDS } from "../../../requests";
+import { MAX_REVIEWERS, REVIEWER_PRESET_REFS } from "../../../requests";
 import { useAddReviewerPreset, useDeleteReviewer } from "../../api/queries";
 import type { Reviewer } from "../../api/types";
+import { confirmDelete, EditButton, EditorSheet, ThingHead } from "../../common/editing";
 import { ago, exact } from "../../common/time";
-import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Row, Section, SectionGrid, Sheet, Stack } from "../../layout";
+import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Notice, Panel, Section, SectionGrid, Stack } from "../../layout";
 import { sourceText, UntrustedBadge } from "../routines/Untrusted";
 import { ReviewerForm } from "./ReviewerForm";
 
-const BUILT_IN = REVIEWER_PRESET_IDS.code;
+const BUILT_IN = REVIEWER_PRESET_REFS.code;
 
 /** What no reviewer on means: said in the section, and at the top of the page while reviews push it down. */
 export const NONE_ON = "PRs aren't reviewed, and the required check passes without a review.";
@@ -52,20 +52,20 @@ function ReviewerCard({ r, onEdit }: { r: Reviewer; onEdit: () => void }) {
   return (
     <Panel data-reviewer={r.id}>
       <Stack gap="sm">
-        <Row justify="space-between" wrap="nowrap" align="flex-start">
-          <Row gap="sm">
-            <Title order={4}>{r.name}</Title>
-            {!r.enabled && (
-              <Badge size="sm" variant="outline" color="gray" data-slot="status">
-                Off
-              </Badge>
-            )}
-            {r.tainted && <UntrustedBadge what={`the reviewer ${r.name}`} />}
-          </Row>
-          <Button variant="subtle" color="gray" size="xs" onClick={onEdit} aria-label={`Edit ${r.name}`}>
-            Edit
-          </Button>
-        </Row>
+        <ThingHead
+          name={r.name}
+          badges={
+            <>
+              {!r.enabled && (
+                <Badge size="sm" variant="outline" color="gray" data-slot="status">
+                  Off
+                </Badge>
+              )}
+              {r.tainted && <UntrustedBadge what={`the reviewer ${r.name}`} />}
+            </>
+          }
+          actions={<EditButton name={r.name} onClick={onEdit} />}
+        />
         <Text fz="sm" data-slot="dimensions">
           {r.dimensions.join(" · ")}
         </Text>
@@ -93,19 +93,12 @@ export function ReviewersSection({ projectId, reviewers, headingRef }: { project
   const close = () => setEditing(null);
   const editingReviewer = editing && editing !== "new" ? list.find((r) => r.id === editing.id) ?? editing : undefined;
 
-  const confirmDelete = (r: Reviewer) =>
-    modals.openConfirmModal({
+  const askDelete = (r: Reviewer) =>
+    confirmDelete({
       title: `Delete ${r.name}?`,
-      children: (
-        <Text fz="md">
-          Reviews already under way keep it; no PR head after this gets its review.
-          {r.enabled && on.length === 1 ? ` It's the only reviewer on: without it, PRs aren't reviewed, and the required check passes without a review.` : ""}
-        </Text>
-      ),
-      labels: { confirm: "Delete", cancel: "Keep it" },
-      confirmProps: { color: "danger" },
-      cancelProps: { variant: "default", "data-autofocus": true },
-      onConfirm: () => del.mutate(r.id, { onSuccess: close }),
+      body: `Reviews already under way keep it; no PR head after this gets its review.${r.enabled && on.length === 1 ? " It's the only reviewer on: without it, PRs aren't reviewed, and the required check passes without a review." : ""}`,
+      // Its card and Edit go with it: focus goes to the section's heading.
+      onConfirm: () => del.mutate(r.id, { onSuccess: () => { close(); headingRef?.current?.focus(); } }),
     });
 
   return (
@@ -135,7 +128,7 @@ export function ReviewersSection({ projectId, reviewers, headingRef }: { project
           <ErrorState title="The reviewers couldn't be loaded" error={reviewers.error} onRetry={() => void reviewers.refetch()} />
         ) : list.length === 0 ? (
           <Panel>
-            <EmptyState icon={IconShieldCheck} title="No reviewers" description={`Add the built-in ${BUILT_IN.name}, which judges correctness, quality and architectural cohesiveness, or a reviewer of your own.`} />
+            <EmptyState icon={IconShieldCheck} title="No reviewers" description={`Add the built-in ${BUILT_IN.name} (${BUILT_IN.dimensions.join(", ")}) or a reviewer of your own.`} />
           </Panel>
         ) : (
           <SectionGrid>
@@ -145,27 +138,14 @@ export function ReviewersSection({ projectId, reviewers, headingRef }: { project
           </SectionGrid>
         )}
       </Stack>
-      <Sheet opened={editing !== null} onClose={close} title={editingReviewer ? `Edit ${editingReviewer.name}` : "New reviewer"} closeOnEscape>
-        {editing !== null && (
-          <Stack gap="2xl">
-            <ReviewerForm key={editingReviewer?.id ?? "new"} projectId={projectId} editing={editingReviewer} onDone={close} />
-            {editingReviewer && (
-              <Section title="Delete" order={4} region={false}>
-                <Stack gap="sm">
-                  <Text fz="sm" c="dimmed">
-                    Reviews already under way keep it.
-                  </Text>
-                  <Row>
-                    <Button variant="default" color="danger" onClick={() => confirmDelete(editingReviewer)}>
-                      Delete reviewer
-                    </Button>
-                  </Row>
-                </Stack>
-              </Section>
-            )}
-          </Stack>
-        )}
-      </Sheet>
+      <EditorSheet
+        opened={editing !== null}
+        onClose={close}
+        title={editingReviewer ? `Edit ${editingReviewer.name}` : "New reviewer"}
+        del={editingReviewer && { note: "Reviews already under way keep it.", label: "Delete reviewer", onClick: () => askDelete(editingReviewer) }}
+      >
+        <ReviewerForm key={editingReviewer?.id ?? "new"} projectId={projectId} editing={editingReviewer} onDone={close} />
+      </EditorSheet>
     </Section>
   );
 }
