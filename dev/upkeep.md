@@ -1,6 +1,6 @@
 # Upkeep: the weekly upstream check
 
-The owner's request (2026-11-18): keep Claude Code, Firecracker, and the kernels in the VMs and on the hosts up to date. This file is the standing procedure: what each upstream component is, where nest pins it, which version to move to, and how a move reaches hosts and sandboxes; then [the check](#the-check), which turns "behind" into one task per component.
+The owner's request (2026-11-18): keep Claude Code, Firecracker, and the kernels in the VMs and on the hosts up to date. This file is the standing procedure: what each upstream component is, where nest pins it, which version to move to, and how a move reaches hosts and sandboxes; then [the check](#the-check), which turns "behind" into one task per move.
 
 **No versions are recorded here.** Pins are named by file and variable and read on `main` at check time; a version below is evidence for a decision, with its date.
 
@@ -62,11 +62,9 @@ Whoever runs it follows [the check](#the-check) as written. A change to a rule b
 ### The guest kernel and guest image (`nest-base`)
 
 - **Pins:** `images/guest/build.sh`: `CI` (the URL of one Firecracker CI build, `…/firecracker-ci/<build id>/x86_64`), `KERNEL` and `KERNEL_SHA256`, `ROOTFS` and `ROOTFS_SHA256`. The kernel is Firecracker's prebuilt CI build on the 6.18 longterm line (decided 2026-10-22, [firecracker driver](../docs/sandbox/drivers/firecracker/README.md)); the rootfs is its Ubuntu 24.04 squashfs, plus packages apt installs at build time from `noble`, `noble-updates` and `noble-security` (`MIRROR`).
-- **Upstream:** Firecracker's CI bucket. Build ids start with their date (`YYYYMMDD-<commit>-<n>`), so the newest is the last dated prefix of (two builds can share a date; which of those is newer is unverified, so compare their files' `LastModified`)
-  `https://s3.amazonaws.com/spec.ccfc.min?list-type=2&prefix=firecracker-ci/&delimiter=/`
-  and its files are listed by
-  `https://s3.amazonaws.com/spec.ccfc.min?list-type=2&prefix=firecracker-ci/<build id>/x86_64/`
-  (the kernel is the key `x86_64/vmlinux-6.18.<n>` itself, not its `.config` or `debug/` copies; the rootfs is `x86_64/ubuntu-24.04.squashfs`). A project sandbox's egress refuses `s3.amazonaws.com` (403, seen 2026-11-18): read the listings with `WebFetch`.
+- **Upstream:** Firecracker's CI bucket.
+  - **Builds:** `https://s3.amazonaws.com/spec.ccfc.min?list-type=2&prefix=firecracker-ci/&delimiter=/`. Build ids start with their date (`YYYYMMDD-<commit>-<n>`), so the newest is the last dated prefix; two builds can share a date, and which of those is newer is unverified, so compare their files' `LastModified`.
+  - **A build's files:** `https://s3.amazonaws.com/spec.ccfc.min?list-type=2&prefix=firecracker-ci/<build id>/x86_64/` (the kernel is the key `x86_64/vmlinux-6.18.<n>` itself, not its `.config` or `debug/` copies; the rootfs is `x86_64/ubuntu-24.04.squashfs`). A project sandbox's egress refuses `s3.amazonaws.com` (403, seen 2026-11-18): read the listings with `WebFetch`.
 - **What sandboxes run** (for the report, not the rules): inside a sandbox created from the live image, `uname -r` is its kernel, and the last `End-Date` in `/var/log/apt/history.log` is when its packages were installed (unless that sandbox has run apt since). A sandbox with a committed generation keeps its own older disk.
 - **Rule:**
   - **Kernel:** behind when the newest CI build's `vmlinux-6.18.<n>` is newer than `KERNEL`; the target is that build. Staying on the 6.18 line; moving off it is a decision for the driver doc, not this check.
