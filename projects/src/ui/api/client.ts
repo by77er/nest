@@ -13,17 +13,45 @@ export class ApiError extends Error {
   }
 }
 
+/** How many GET answers `call` remembers (by URL, least recently used dropped first): a project's pages poll about 20. */
+export const REMEMBERED = 64;
+/** The last answer with an `ETag` to each GET, parsed: a `304` hands back the very same value. */
+const remembered = new Map<string, { etag: string; value: unknown }>();
+
+function remember(url: string, etag: string, value: unknown): void {
+  remembered.delete(url);
+  remembered.set(url, { etag, value });
+  if (remembered.size > REMEMBERED) remembered.delete(remembered.keys().next().value!);
+}
+
 async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
-  let res: Response;
-  try {
-    res = await fetch(`/api${path}`, {
-      method,
-      credentials: "same-origin",
-      headers: body === undefined ? { accept: "application/json" } : { accept: "application/json", "content-type": "application/json" },
-      body: body === undefined ? undefined : JSON.stringify(body),
-    });
-  } catch (e) {
-    throw new ApiError(0, `the app can't be reached (${e instanceof Error ? e.message : String(e)})`);
+  const url = `/api${path}`;
+  // A GET names the answer it has (README.md#the-ui): unchanged, the Worker answers 304 with no body.
+  const had = method === "GET" ? remembered.get(url) : undefined;
+  const send = async (conditional: boolean) => {
+    try {
+      return await fetch(url, {
+        method,
+        credentials: "same-origin",
+        headers: {
+          accept: "application/json",
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+          ...(conditional && had ? { "if-none-match": had.etag } : {}),
+        },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+    } catch (e) {
+      throw new ApiError(0, `the app can't be reached (${e instanceof Error ? e.message : String(e)})`);
+    }
+  };
+  let res = await send(true);
+  if (res.status === 304 && method === "GET") {
+    if (had) {
+      remember(url, had.etag, had.value);
+      return had.value as T;
+    }
+    // A 304 to an answer this page doesn't have: asked once more, unconditionally.
+    res = await send(false);
   }
   const text = await res.text();
   let data: unknown;
@@ -37,6 +65,8 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
     const error = typeof data === "object" && data !== null && typeof (data as { error?: unknown }).error === "string" ? (data as { error: string }).error : null;
     throw new ApiError(res.status, error ?? `${res.status} ${res.statusText}`.trim(), data);
   }
+  const etag = method === "GET" && res.status === 200 ? res.headers.get("etag") : null;
+  if (etag) remember(url, etag, data);
   return data as T;
 }
 

@@ -1,12 +1,13 @@
 // The manager's messages the owner hasn't seen: those after the read mark this browser keeps (set when
-// the Manager page shows them). Read from the chat's latest page, the query the Manager page polls.
+// the Manager page shows them). Read from the chat's latest page, the query the Manager page polls: every
+// `POLL.unread` off that page; on it, the page's own 3 s poll alone.
 import { useEffect, useState } from "react";
-import { useChat } from "../../api/queries";
+import { POLL, useChat } from "../../api/queries";
 import { readMark } from "../chat/model";
 
 export function useUnread(projectId: string | undefined, onManager: boolean): number {
   // Outside a project there's no chat to ask for.
-  const chat = useChat(projectId ?? "", !!projectId);
+  const chat = useChat(projectId ?? "", !!projectId, onManager ? false : POLL.unread);
   const [mark, setMark] = useState(() => (projectId ? readMark(projectId) : 0));
   useEffect(() => {
     const update = () => setMark(projectId ? readMark(projectId) : 0);
