@@ -48,16 +48,25 @@ Whoever runs it follows [the check](#the-check) as written. A change to a rule b
 
 ### Firecracker and the jailer (sandbox hosts)
 
-- **Pin: none in the repo.** `scripts/publish-release.sh` carries `firecracker` and `jailer` (with `vmlinux` and `nest-base.ext4.zst`, its `CARRIED`) unchanged from the cell bucket's `releases/current/`: "they change by hand". Hosts report no Firecracker version. The decision is "the 1.17 line, pinned by binary digest, patch level included", verified on 1.17.0 ([firecracker driver](../docs/sandbox/drivers/firecracker/README.md), which also says why a patch release can change the snapshot format). So the pinned version is the one that doc's "Version" bullet records as installed, or else the one it says was verified; each upgrade's PR records the version it promoted there. Only the owner can read the bucket's binaries.
+- **Pin:** `scripts/publish-release.sh`, `FIRECRACKER_VERSION` (upstream's tag, with its `v`) and `FIRECRACKER_SHA256` (the SHA-256 of upstream's `firecracker-<FIRECRACKER_VERSION>-x86_64.tgz`). The release job downloads that archive from the GitHub release, checks the digest before unpacking, and publishes its `firecracker` and `jailer`. The line, and why the patch level is pinned (a patch release can change the snapshot format), are the [firecracker driver](../docs/sandbox/drivers/firecracker/README.md)'s decision.
 - **Upstream:** [releases](https://github.com/firecracker-microvm/firecracker/releases), each with `firecracker-v<V>-x86_64.tgz` and `firecracker-v<V>-x86_64.tgz.sha256.txt`; the newest: `gh api repos/firecracker-microvm/firecracker/releases --jq '[.[] | select(.prerelease | not) | .tag_name] | .[:5]'`. [Changelog](https://github.com/firecracker-microvm/firecracker/blob/main/CHANGELOG.md).
 - **Rule** (the manager's decision, 2026-11-18; the owner's to change):
   - **a newer patch release of the pinned line** is a task to move to it;
   - **a new minor line** (1.17 → 1.18) **is the owner's decision.** Its task reads the changelog against the driver doc (the snapshot format, the API fields nestd sends, the host and guest kernels in Firecracker's [kernel policy](https://github.com/firecracker-microvm/firecracker/blob/main/docs/kernel-policy.md)), reports, and stops for the owner's go.
   - Either way it changes the [restore ABI](../docs/compute/provisioning/README.md#upgrades): dormant memory generations can't load on the new hosts. Harmless while cold boot is the only restore. The guest and host kernels change it too.
-- **The upgrade:** the tarball holds `release-v<V>-x86_64/firecracker-v<V>-x86_64` and `release-v<V>-x86_64/jailer-v<V>-x86_64`. A worker's PR updates the driver doc's "Version" bullet to the exact version promoted (and the line, for a new minor). The owner checks the tarball against its `.sha256.txt` and promotes the two binaries into `releases/current/` as `firecracker` and `jailer` by the [promotion](#promotion-into-releasescurrent). **The PR is opened as a draft and stays one until the owner has promoted:** its path isn't a `CODEOWNERS` one, so it could merge on green checks without the owner, and its merge (which marks the task done and moves the version step 1 reads) must mean it's installed. The task tells the worker so and that only the owner marks it ready; after promoting, the owner marks it ready and merges it if auto-merge isn't armed (the app arms it only when a PR opens; whether GitHub arms it on a draft is unverified).
-- **How it reaches hosts:** each sandbox host launched after the promotion installs it (`install.sh` installs the release at boot). The next AMI build bakes it in.
-- **Who:** the doc PR is a worker's; the promotion is the owner's (AWS credentials on the cell's bucket).
-- **Gates:** on a sandbox host launched after the promotion, a sandbox boots and serves hands calls ([hands_probe_check.py](cloud-checks/README.md#hands_probe_checkpy)) and a real turn runs in one ([brain_hosts_check.py](cloud-checks/README.md#brain_hosts_checkpy)); both the owner's. No test in the repo runs a real Firecracker (it needs KVM).
+- **The upgrade:** a worker's PR that changes `FIRECRACKER_VERSION` and `FIRECRACKER_SHA256`, and the doc lines that name the pinned version (`git grep -n '<major>\.<minor>'`: `dev/deploy.md`'s "Pinned" bullet, the driver doc's "Version" bullet; for a new line also [provisioning](../docs/compute/provisioning/README.md) and the line's other mentions; links to upstream's docs at a tag, dated observations, rollouts and the test's fixtures are records, not pins). `scripts/tests/test_publish_release.py` reads the pin from the script (it requires the `v`) and needs no change. The digest, in a new empty directory (GitHub's downloads are reachable from a project sandbox, seen 2026-11-18):
+
+  ```bash
+  V=<tag>; u=https://github.com/firecracker-microvm/firecracker/releases/download/$V/firecracker-$V-x86_64.tgz
+  curl -fsSLO "$u" && curl -fsSLO "$u.sha256.txt"
+  sha256sum firecracker-$V-x86_64.tgz && sha256sum -c firecracker-$V-x86_64.tgz.sha256.txt
+  ```
+
+  The archive's digest (`sha256sum`'s output) goes into `FIRECRACKER_SHA256`; nothing is unpacked or run. **A mismatch stops the task:** the worker reports it and opens no PR.
+- **How it reaches hosts:** the merge's CI run on `main` starts `deploy.yml`, whose `release` job (after `infra` and `worker`) runs `scripts/publish-release.sh`. The script is among the job's release inputs (the `Inputs` step's `git ls-tree` digest), so a change to the pin alone builds; the new archive's binaries differ from the current release's, so the script publishes (`changed=true`) and the job starts a host AMI build. Each host launched after the publish installs the release at boot (`install.sh`, when the bucket's `SHA256SUMS` differs from the installed one); running hosts keep the old binaries until they are replaced ([upgrades](../docs/compute/provisioning/README.md#upgrades)).
+- **Who:** the PR is a worker's. `/scripts/` is a `CODEOWNERS` path, so the owner approves it.
+- **Gates:** the worker runs `python3 -m unittest discover -s scripts/tests -p test_publish_release.py`. After the merge's release, on a sandbox host launched after it, a sandbox boots and serves hands calls ([hands_probe_check.py](cloud-checks/README.md#hands_probe_checkpy)) and a real turn runs in one ([brain_hosts_check.py](cloud-checks/README.md#brain_hosts_checkpy)); both the owner's. No test in the repo runs a real Firecracker (it needs KVM).
+- **Rolling back:** revert the pin's PR. The release job then downloads and checks the previous pin's archive and publishes its binaries (they differ from the current release's), starting a host AMI build. If the revert's release inputs match a deploy whose marker is still in the Actions cache (nothing else among the inputs changed since), the job builds nothing: dispatch `deploy.yml`, which always builds ([the pin's rollout](rollout/2026-11-18-firecracker-pin.md)).
 
 ### The guest kernel and guest image (`nest-base`)
 
@@ -102,11 +111,11 @@ Whoever runs it follows [the check](#the-check) as written. A change to a rule b
 
 ### Promotion into `releases/current/`
 
-Firecracker, the jailer, the guest kernel and the guest image reach hosts only through the release, and the pipeline carries them over unchanged, so the owner swaps them in by hand. Read from `scripts/publish-release.sh`, `scripts/prune-images.sh` and `deploy/host/install.sh`, as in [the guest rollout of 2026-11-15](rollout/2026-11-15-guest-github.md); not yet run as written (unverified as a whole):
+The guest kernel and the guest image reach hosts only through the release, and `scripts/publish-release.sh` carries them over unchanged (its `CARRIED`), so the owner swaps them in by hand. Read from `scripts/publish-release.sh`, `scripts/prune-images.sh` and `deploy/host/install.sh`, as in [the guest rollout of 2026-11-15](rollout/2026-11-15-guest-github.md); not yet run as written (unverified as a whole):
 
-1. **Not while a deploy runs, nor while a merge to `main` may start one.** `publish-release.sh` reads `releases/current/SHA256SUMS` and the carried files first and writes `SHA256SUMS` last, so a swap in between leaves hashes no host can verify.
+1. **Not while a deploy runs, nor while a merge to `main` may start one.** `publish-release.sh` reads `releases/current/SHA256SUMS` and the carried files after its build and writes `SHA256SUMS` last, so a swap in between leaves hashes no host can verify.
 2. **Back up:** copy `releases/current/<each file being replaced>` and `releases/current/SHA256SUMS` to `images/guest/previous-<date>/` (`prune-images.sh` keeps every `previous-*`).
-3. **Copy the new files** into `releases/current/` under the release's names (`firecracker`, `jailer`, `vmlinux`, `nest-base.ext4.zst`).
+3. **Copy the new files** into `releases/current/` under the release's names (`vmlinux`, `nest-base.ext4.zst`).
 4. **Last, `releases/current/SHA256SUMS`,** with only those files' lines replaced by the new files' digests. Hosts install nothing that fails it (`install.sh`), and `publish-release.sh` refuses a carried file it doesn't vouch for. Never replace the whole file: a release published since would fail verification.
 5. **Prune:** `DRY_RUN=1 scripts/prune-images.sh use1 <bucket>`, then without `DRY_RUN`, with credentials that may deregister images: it also prunes host AMIs and their snapshots and removes `builder/` ([pruning](deploy.md#pruning-images)). It keeps the two newest finished guest builds and every `previous-*`.
 
@@ -116,7 +125,7 @@ Firecracker, the jailer, the guest kernel and the guest image reach hosts only t
 
 Needs read access to the repo and the web; nothing here changes anything but the board.
 
-1. **Read the pins on `main`** (`git fetch origin` first): `CLAUDE_VERSION`, `CLOUDFLARED_VERSION` in `deploy/host/install.sh`; the Firecracker line and patch level as [its section](#firecracker-and-the-jailer-sandbox-hosts) says (or its pin, if the repo has one by then); `CI` and `KERNEL` in `images/guest/build.sh`.
+1. **Read the pins on `main`** (`git fetch origin` first): `CLAUDE_VERSION`, `CLOUDFLARED_VERSION` in `deploy/host/install.sh`; `FIRECRACKER_VERSION` in `scripts/publish-release.sh`; `CI` and `KERNEL` in `images/guest/build.sh`.
 2. **Read upstream** for each, as its section says, and the last host AMI build.
 3. **Apply each rule.** A component is behind when its rule names a version newer than the pin, or (guest packages, host AMI) when its rule's dates say so.
 4. **Look for its task** for each component behind, with `list_tasks`, by the component's title prefix below:
@@ -139,4 +148,4 @@ Needs read access to the repo and the web; nothing here changes anything but the
 | Guest packages | `Upkeep: rebuild the guest image (<YYYY-MM>)` |
 | Host AMI | `Upkeep: rebuild the host AMI (<YYYY-MM-DD of the AL2023 release>)` |
 
-Versions are written as the pin writes them, without a leading `v` (`CLAUDE_VERSION`, `CLOUDFLARED_VERSION`, Firecracker `<major>.<minor>.<patch>`, `KERNEL` without `vmlinux-`); `<line>` is `<major>.<minor>`. Titles compare ignoring case, punctuation and spacing, as the app compares declined proposals. The prefix is everything before the first version, date or arrow (`Upkeep: Claude Code`, `Upkeep: Firecracker patch`, `Upkeep: guest kernel`). There are seven kinds, so a routine run (at most 5 proposals) that finds more behind proposes the rest the next week.
+Versions are written as the pin writes them, without a leading `v` (`CLAUDE_VERSION`, `CLOUDFLARED_VERSION`, `FIRECRACKER_VERSION` as `<major>.<minor>.<patch>`, `KERNEL` without `vmlinux-`); `<line>` is `<major>.<minor>`. Titles compare ignoring case, punctuation and spacing, as the app compares declined proposals. The prefix is everything before the first version, date or arrow (`Upkeep: Claude Code`, `Upkeep: Firecracker patch`, `Upkeep: guest kernel`). There are seven kinds, so a routine run (at most 5 proposals) that finds more behind proposes the rest the next week.
