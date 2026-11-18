@@ -140,10 +140,12 @@ describe("timeline", () => {
     expect(shape(timeline([asked, msg(2, "owner", T0 + 5_000)], turn([said("a", T0 + 1_000), call("b", T0 + 2_000, "running")]), NOW))).toEqual(["owner 1", "stream a,b", "owner 2"]);
   });
 
-  it("splits at each of several messages; one straight after another is the same group, with no empty part between", () => {
+  it("splits at each of several messages, the app's notes too; one straight after another is the same group, with no empty part between", () => {
     const steps = [call("a", T0 + 1_000), call("b", T0 + 3_000), call("c", T0 + 5_000)];
-    expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000), msg(3, "owner", T0 + 4_000)], turn(steps), NOW))).toEqual(["owner 1", "stream a", "owner 2", "stream b", "owner 3", "stream c,working"]);
+    expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000), msg(3, "app", T0 + 4_000)], turn(steps), NOW))).toEqual(["owner 1", "stream a", "owner 2", "stream b", "app 3", "stream c,working"]);
     expect(shape(timeline([asked, msg(2, "owner", T0 + 2_000), msg(3, "owner", T0 + 2_500)], turn(steps), NOW))).toEqual(["owner 1", "stream a", "owner 2,3", "stream b,c,working"]);
+    // A later message timed earlier (a clock stepping back) never goes back above steps already placed.
+    expect(shape(timeline([asked, msg(2, "owner", T0 + 4_000), msg(3, "owner", T0 + 2_000)], turn(steps), NOW))).toEqual(["owner 1", "stream a,b", "owner 2,3", "stream c,working"]);
   });
 
   it("keeps a message from before the turn's first step above the whole stream, the one that started it too", () => {
