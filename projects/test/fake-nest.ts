@@ -1466,3 +1466,13 @@ export function githubPart(project: string, role: "worker" | "manager" | "review
     guards: githubGuards(repo, kind),
   };
 }
+
+/** `submit_review`'s arguments for the built-in "Code review": its three dimensions, in its order, and a summary. */
+export const submitArgs = (c: "pass" | "fail" = "pass", q: "pass" | "fail" = "pass", a: "pass" | "fail" = "pass", notes = "fine", summary = "ok") => ({
+  verdicts: [
+    { dimension: "Correctness", verdict: c, notes },
+    { dimension: "Quality", verdict: q, notes },
+    { dimension: "Architectural cohesiveness", verdict: a, notes },
+  ],
+  summary,
+});

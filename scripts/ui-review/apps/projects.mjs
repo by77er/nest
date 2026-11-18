@@ -934,6 +934,8 @@ const app = {
     { name: "board-held-reviews", section: "project", path: "/projects/prj_demo/board", fixture: "held-reviews", after: async (p) => { await p.getByRole("button", { name: /Show all/ }).click(); } },
     // Many, with long titles and logins: pinned first on Reviews, and all of them in "Needs you".
     { name: "reviews-held-many", section: "project", path: "/projects/prj_demo/reviews", fixture: "held-many" },
+    // Verdicts of two reviewers, grouped by reviewer: passed, failed by one or the other, tainted.
+    { name: "reviews-several", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-several" },
     { name: "board-held-many", section: "project", path: "/projects/prj_demo/board", fixture: "held-many", after: async (p) => { await p.getByRole("button", { name: /Show all/ }).click(); } },
     { name: "board-comments-cleared", section: "project", path: "/projects/prj_demo/board", fixture: "comments-cleared" },
     // Leave it unset answered with a 502: focus stays on the button while it's out and after (README.md#pr-comments).

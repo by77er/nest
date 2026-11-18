@@ -2,6 +2,9 @@
 // one sandbox; no role gets nest-level spawning (new agents or sandboxes).
 import { describe, expect, it } from "vitest";
 import { catalogFor, NAMESPACE, PROMPTS, REPO_GUIDANCE, REVIEWER_GUIDANCE, roleTemplate } from "../src/catalog";
+import { CODE_REVIEW } from "../src/reviewers";
+import { invalid } from "../src/schema";
+import { toolOf } from "../src/tools";
 
 const NEST_SPAWNING = ["management", "sandboxes", "spawning"];
 const cat = catalogFor("https://projects.test");
@@ -156,5 +159,25 @@ describe("the manager's routine tools (README.md#routines)", () => {
     const line = PROMPTS.manager.split("\n").find((l) => l.includes("list_routines"))!;
     for (const tool of ["list_routines", "create_routine", "update_routine", "delete_routine"]) expect(line).toContain(tool);
     expect(line).toMatch(/tell the owner what you made or changed/);
+  });
+});
+
+describe("the reviewer: one template for every reviewer", () => {
+  it("its prompt names no dimension: it reviews as the reviewer its brief names, each dimension apart, and submits once", () => {
+    const p = PROMPTS.reviewer.toLowerCase();
+    for (const d of [...CODE_REVIEW.dimensions, "architecture"]) expect(p).not.toContain(d.toLowerCase());
+    expect(PROMPTS.reviewer).toContain("as the reviewer your brief names");
+    expect(PROMPTS.reviewer).toContain("judge each of its dimensions separately");
+    expect(PROMPTS.reviewer).toContain("Submit exactly once with submit_review");
+  });
+
+  it("submit_review takes a list of dimensions and a summary, nothing fixed per dimension", () => {
+    const schema = toolOf("review", "submit_review")!.inputSchema;
+    const one = { dimension: "Anything", verdict: "fail", notes: "why" };
+    expect(invalid(schema, { verdicts: [one], summary: "s" })).toBeNull();
+    expect(invalid(schema, { verdicts: [{ ...one, verdict: "maybe" }], summary: "s" })).toMatch(/one of pass, fail/);
+    expect(invalid(schema, { verdicts: [{ dimension: "x", verdict: "pass" }], summary: "s" })).toMatch(/notes is required/);
+    expect(invalid(schema, { verdicts: [one] })).toMatch(/summary is required/);
+    expect(invalid(schema, { verdicts: [one], summary: "s", correctness: { verdict: "pass", notes: "" } })).toMatch(/not an argument/);
   });
 });

@@ -8,6 +8,7 @@ import { resetAccessKeys } from "../src/access";
 import { CHECK_NAME, signGithub } from "../src/github";
 import { MAX_RETRIES } from "../src/do/review";
 import { roleTemplate } from "../src/catalog";
+import { CODE_REVIEW } from "../src/reviewers";
 import { AccessTeam, agentClaims, api, callTool, deliver, deliverGithub, FakeNest, installFetch, prEvent, Signer } from "./fake-nest";
 
 const fake = new FakeNest();
@@ -70,8 +71,17 @@ async function opened(p: P, number = 1, o: Record<string, unknown> = {}) {
 const reviewerToken = (p: P, agent: string, pr: number, s: string, over: Record<string, unknown> = {}) =>
   nest.sign(agentClaims("review", agent, { project: p.id, role: "reviewer", pr: String(pr), sha: s, start: "1" }, over));
 
-const dim = (verdict: "pass" | "fail", notes = `${verdict} because`) => ({ verdict, notes });
-const verdict = (c: "pass" | "fail", q: "pass" | "fail", a: "pass" | "fail") => ({ correctness: dim(c), quality: dim(q), architecture: dim(a), summary: "the summary" });
+type P2 = "pass" | "fail";
+/** `submit_review`'s arguments for the built-in reviewer, each dimension's notes saying its verdict. */
+const verdict = (c: P2, q: P2, a: P2) => ({
+  verdicts: ([["Correctness", c], ["Quality", q], ["Architectural cohesiveness", a]] as const).map(([dimension, v]) => ({ dimension, verdict: v, notes: `${v} because` })),
+  summary: "the summary",
+});
+/** The review those arguments make, as the API answers it. */
+const review = (agent: string, tainted: boolean, c: P2, q: P2, a: P2) => ({
+  reviewer: { id: CODE_REVIEW.id, name: CODE_REVIEW.name }, agent, tainted,
+  dimensions: verdict(c, q, a).verdicts.map((d) => ({ name: d.dimension, verdict: d.verdict, notes: d.notes })), summary: "the summary",
+});
 
 const toolOk = (r: { status: number; result?: any }) => {
   expect(r.status).toBe(200);
@@ -147,6 +157,9 @@ describe("a PR's review", () => {
     expect(fake.sandboxes.get(a.sandbox!)!.layer.guards).toEqual(githubGuards(p.repo, "read"));
     const brief = fake.inbox.find((x) => x.agent === reviewer)!.text;
     for (const part of [p.repo.toLowerCase(), "#3", s, "develop", "submit_review"]) expect(brief).toContain(part);
+    // The reviewer it reviews as: its name, its dimensions and its instructions; none of the PR's own text.
+    for (const part of [`"${CODE_REVIEW.name}"`, ...CODE_REVIEW.dimensions.map((d) => `"${d}"`), CODE_REVIEW.instructions]) expect(brief).toContain(part);
+    expect(brief).not.toContain("PR 3");
     const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels.role === "reviewer" && c.body.labels.project === p.id);
     expect(creates.map((c) => c.idempotencyKey)).toEqual([`${p.id}/review/3/${s}/1/agent`]);
     // The check's token: checks only.
@@ -155,6 +168,7 @@ describe("a PR's review", () => {
     for (const c of made) expect(c.permissions).toEqual({ checks: "write" });
     const r = toolOk(await callTool("review", await reviewerToken(p, reviewer, 3, s), "review_get"));
     expect(r).toMatchObject({ repo: p.repo.toLowerCase(), pr: 3, sha: s, base: "develop", title: "PR 3" });
+    expect(r.reviewer).toEqual({ name: "Code review", dimensions: ["Correctness", "Quality", "Architectural cohesiveness"], instructions: CODE_REVIEW.instructions });
   });
 
   it("on the project's reviewers' model: the project's own template, written before the start names it", async () => {
@@ -312,7 +326,7 @@ describe("the verdict", () => {
     expect(check.output!.text).toContain("## Correctness: pass\n\npass because");
     expect(check.output!.text).toContain("Tainted: no");
     expect(fake.agents.get(reviewer)!.ended).toBe(true);
-    expect((await job(p, 1, s))).toMatchObject({ state: "done", tainted: false, verdict: verdict("pass", "pass", "pass") });
+    expect((await job(p, 1, s))).toMatchObject({ state: "done", tainted: false, verdict: { reviews: [review(reviewer, false, "pass", "pass", "pass")] } });
   });
 
   it("any one failing fails the check, naming it; a tainted session's verdict says so", async () => {
@@ -346,7 +360,85 @@ describe("the verdict", () => {
     await run(p);
     expect(gh.runsOf(p.repo, one.sha)[0]!.conclusion).toBe("failure");
     expect(gh.runsOf(p.repo, two.sha)[0]!.status).toBe("in_progress");
-    expect(toolError(await callTool("review", t, "submit_review", { ...verdict("pass", "pass", "pass"), correctness: { verdict: "maybe", notes: "" } }))).toMatch(/one of pass, fail/);
+    const maybe = verdict("pass", "pass", "pass");
+    maybe.verdicts[0] = { ...maybe.verdicts[0]!, verdict: "maybe" as P2 };
+    expect(toolError(await callTool("review", t, "submit_review", maybe))).toMatch(/one of pass, fail/);
+  });
+
+  it("is refused, recording nothing, unless it names each of its reviewer's dimensions once; then accepted", async () => {
+    const p = await newProject();
+    const { sha: s, reviewer } = await opened(p);
+    const t = await reviewerToken(p, reviewer, 1, s);
+    const all = verdict("pass", "fail", "pass").verdicts;
+    const missing = toolError(await callTool("review", t, "submit_review", { verdicts: all.slice(0, 2), summary: "s" }));
+    expect(missing).toMatch(/Missing: "Architectural cohesiveness"\./);
+    expect(missing).toContain(`"Correctness", "Quality", "Architectural cohesiveness"`);
+    expect(toolError(await callTool("review", t, "submit_review", { verdicts: [...all, { dimension: "Style", verdict: "pass", notes: "" }], summary: "s" }))).toMatch(/Not its dimensions: "Style"\./);
+    expect(toolError(await callTool("review", t, "submit_review", { verdicts: [...all, all[1]!], summary: "s" }))).toMatch(/Named more than once: "Quality"\./);
+    expect(toolError(await callTool("review", t, "submit_review", { verdicts: [], summary: "s" }))).toMatch(/Missing: "Correctness", "Quality", "Architectural cohesiveness"\./);
+    // Nothing was recorded: the job still runs, its check in progress.
+    expect(await job(p, 1, s)).toMatchObject({ state: "running", verdict: null });
+    await run(p);
+    expect(gh.runsOf(p.repo, s)[0]!.status).toBe("in_progress");
+    // Names as the reviewer wrote them, case and spaces aside, in any order: recorded in the reviewer's own.
+    const loose = [{ ...all[2]!, dimension: " architectural Cohesiveness" }, { ...all[0]!, dimension: "correctness" }, all[1]!];
+    expect(toolOk(await callTool("review", t, "submit_review", { verdicts: loose, summary: "the summary" })).conclusion).toBe("failure");
+    await run(p);
+    expect(gh.runsOf(p.repo, s)[0]!.output!.title).toBe("Review failed: quality");
+    expect((await job(p, 1, s)).verdict).toEqual({ reviews: [review(reviewer, false, "pass", "fail", "pass")] });
+  });
+
+  it("a reviewer started by the release before submits in its form: accepted as the built-in reviewer's review", async () => {
+    const p = await newProject();
+    const { sha: s, reviewer } = await opened(p);
+    const t = await reviewerToken(p, reviewer, 1, s, { tainted: true });
+    const dim = (v: P2) => ({ verdict: v, notes: `${v} because` });
+    // That form gone wrong is refused as it was.
+    expect(toolError(await callTool("review", t, "submit_review", { correctness: dim("pass"), quality: dim("pass"), summary: "s" }))).toMatch(/architecture is required/);
+    toolOk(await callTool("review", t, "submit_review", { correctness: dim("fail"), quality: dim("pass"), architecture: dim("pass"), summary: "the summary" }));
+    await run(p);
+    expect(gh.runsOf(p.repo, s)[0]!.output!.title).toBe("Review failed: correctness");
+    expect((await job(p, 1, s)).verdict).toEqual({ reviews: [review(reviewer, true, "fail", "pass", "pass")] });
+    // Stored with the release before's keys too, which is all it reads after a rollback.
+    const stored = await runInDurableObject(reviews(p), (_o, st) => JSON.parse(st.storage.sql.exec("SELECT verdict FROM jobs WHERE sha = ?", s).one().verdict as string));
+    expect(stored).toMatchObject({ correctness: dim("fail"), quality: dim("pass"), architecture: dim("pass"), summary: "the summary" });
+  });
+
+  it("a verdict the release before stored reads as one Code review review, through the API and verdictsAt", async () => {
+    const p = await newProject();
+    const { sha: s, reviewer } = await opened(p);
+    const dim = (v: P2) => ({ verdict: v, notes: `${v} because` });
+    const old = { correctness: dim("pass"), quality: dim("fail"), architecture: dim("pass"), summary: "the summary" };
+    await runInDurableObject(reviews(p), (_o, st) => {
+      st.storage.sql.exec("UPDATE jobs SET state = 'done', verdict = ?, tainted = 1 WHERE sha = ?", JSON.stringify(old), s);
+    });
+    const want = { reviews: [review(reviewer, true, "pass", "fail", "pass")] };
+    expect((await job(p, 1, s)).verdict).toEqual(want);
+    expect((await reviews(p).jobs()).find((j) => j.sha === s)!.verdict).toEqual(want);
+    expect(await reviews(p).verdictsAt([{ pr: 1, sha: s }])).toEqual({ [`1/${s}`]: want });
+  });
+
+  it("a routine's recent_activity gives each review by its reviewer, with its dimensions, from either release's rows", async () => {
+    const p = await newProject();
+    const one = await opened(p, 1);
+    const two = await opened(p, 2);
+    toolOk(await callTool("review", await reviewerToken(p, one.reviewer, 1, one.sha), "submit_review", { ...verdict("pass", "fail", "pass"), summary: "x".repeat(3000) }));
+    const dim = (v: P2) => ({ verdict: v, notes: "n".repeat(1500) });
+    await runInDurableObject(reviews(p), (_o, st) => {
+      st.storage.sql.exec("UPDATE jobs SET state = 'done', verdict = ?, tainted = 0 WHERE sha = ?", JSON.stringify({ correctness: dim("pass"), quality: dim("pass"), architecture: dim("pass"), summary: "old" }), two.sha);
+    });
+    const project = env.PROJECT.get(env.PROJECT.idFromName(p.id));
+    const activity = await runInDurableObject(project, (o) => (o as unknown as { recentActivity(d: number): Promise<{ reviews: any[] }> }).recentActivity(7));
+    const of = (sha: string) => activity.reviews.find((r) => r.sha === sha)!.verdict;
+    expect(of(one.sha)).toEqual({
+      passed: false,
+      reviews: [{
+        reviewer: "Code review", passed: false, summary: "x".repeat(2000),
+        dimensions: [{ name: "Correctness", verdict: "pass", notes: "pass because" }, { name: "Quality", verdict: "fail", notes: "fail because" }, { name: "Architectural cohesiveness", verdict: "pass", notes: "pass because" }],
+      }],
+    });
+    expect(of(two.sha)).toMatchObject({ passed: true, reviews: [{ reviewer: "Code review", passed: true, summary: "old" }] });
+    expect(of(two.sha).reviews[0].dimensions.map((d: { name: string; notes: string }) => [d.name, d.notes.length])).toEqual([["Correctness", 1000], ["Quality", 1000], ["Architectural cohesiveness", 1000]]);
   });
 
   it("a reviewer that exits without one is started again, then the check completes without passing", async () => {

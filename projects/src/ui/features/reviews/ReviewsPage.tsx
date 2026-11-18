@@ -1,14 +1,14 @@
 // A project's reviews: every review job ReviewDO knows, newest first, with its PR, where it is, and the
-// verdict on each dimension once there is one. Read-only, but for a review held for the owner's approval
+// verdict once there is one: each reviewer's dimensions, grouped by reviewer when there are several. Read-only, but for a review held for the owner's approval
 // (README.md#the-review-gate), which is approved or dismissed here. A table, or below `sm` a card per review (its
 // PR and title, its sha, its state, its verdicts, when, and its trace), so nothing starts off screen.
 
 import { Anchor, Badge, Button, Table, Text, Tooltip } from "@mantine/core";
 import { IconCheck, IconChevronDown, IconChevronRight, IconShieldCheck, IconX } from "@tabler/icons-react";
 import { useParams } from "@tanstack/react-router";
-import { Fragment, useState } from "react";
+import { Fragment, type ReactNode, useState } from "react";
 import { useReviews } from "../../api/queries";
-import type { Dimension, Job } from "../../api/types";
+import type { Job, Review, Verdict } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { EmptyState, ErrorState, icon, LoadingState, MetaItem, MetaRow, Panel, Row, Section, Stack, TableFrame, Token, TriggerBadge, usePhone, weight } from "../../layout";
 import { REVIEW_STATE } from "../../status";
@@ -16,11 +16,11 @@ import { ProjectFrame } from "../project/ProjectFrame";
 import { ReviewTrace } from "../trace/AgentTraces";
 import { HeldActions, heldFrom } from "./HeldReview";
 
-const DIMENSIONS = [
-  ["correctness", "Correctness"],
-  ["quality", "Quality"],
-  ["architecture", "Architecture"],
-] as const satisfies readonly (readonly [Dimension, string])[];
+/** Whether a verdict failed: any dimension of any review (src/reviewers.ts's `verdictPassed`, negated). */
+const failed = (v: Verdict) => v.reviews.length === 0 || v.reviews.some((r) => r.dimensions.length === 0 || r.dimensions.some((d) => d.verdict !== "pass"));
+
+/** Whether a job is done with a verdict that failed: "Changes needed", here and on a task's PRs. */
+export const changesNeeded = (job: Job) => job.state === "done" && job.verdict !== null && failed(job.verdict);
 
 /** Reviews waiting for the owner's approval first (the longest waiting on top), then those waiting their turn, then the rest, newest first. */
 export function byHeldThenNewest(a: Job, b: Job): number {
@@ -31,8 +31,7 @@ export function byHeldThenNewest(a: Job, b: Job): number {
 
 /** A review job's state, or "Changes needed" for a verdict that failed a dimension (also on a task's PRs). */
 export function JobState({ job, size = "md" }: { job: Job; size?: "sm" | "md" }) {
-  const failedVerdict = job.state === "done" && job.verdict && DIMENSIONS.some(([d]) => job.verdict![d].verdict !== "pass");
-  const s = failedVerdict ? { label: "Changes needed", color: "danger" as const } : REVIEW_STATE[job.state];
+  const s = changesNeeded(job) ? { label: "Changes needed", color: "danger" as const } : REVIEW_STATE[job.state];
   return (
     <Badge color={s.color} variant="light" size={size} data-state={job.state}>
       {s.label}
@@ -48,7 +47,38 @@ function TaintedBadge() {
   );
 }
 
-/** The verdict badges; `tainted` (the table's) puts Tainted after them, a card puts it on its state row. */
+/** One review's dimensions as badges that open their notes; `who` names its reviewer when there are several. */
+function DimensionBadges({ review, who, children }: { review: Review; who?: string; children?: ReactNode }) {
+  return (
+    // Wrapping into rows: a 44 px pitch between rows on touch.
+    <Row gap="xs" data-touch-pitch>
+      {review.dimensions.map((d) => {
+        // Pass and fail are status: their roles, and an icon each, so color isn't the only cue.
+        const pass = d.verdict === "pass";
+        return (
+          <Tooltip key={d.name} label={d.notes || d.name} multiline maw="var(--nest-side-panel)">
+            <TriggerBadge
+              size="sm"
+              variant="light"
+              color={pass ? "success" : "danger"}
+              leftSection={pass ? <IconCheck size={icon.sm} aria-hidden /> : <IconX size={icon.sm} aria-hidden />}
+              aria-label={`${who ? `${who}, ` : ""}${d.name}: ${pass ? "passed" : "failed"}`}
+              data-verdict={pass ? "pass" : "fail"}
+            >
+              {d.name}
+            </TriggerBadge>
+          </Tooltip>
+        );
+      })}
+      {children}
+    </Row>
+  );
+}
+
+/**
+ * The verdict: one reviewer's dimension badges, or with several, each reviewer's name over its own. `tainted`
+ * (the table's) puts Tainted after the badges of the review whose session was; a card puts it on its state row.
+ */
 function Verdicts({ job, tainted = true, projectId }: { job: Job; tainted?: boolean; projectId: string }) {
   // Waiting for the owner (held, or past the cap on held ones), or dismissed by them: who it's from, and what the owner can do.
   if (job.state === "held" || job.state === "overflow" || job.state === "dismissed") {
@@ -63,29 +93,23 @@ function Verdicts({ job, tainted = true, projectId }: { job: Job; tainted?: bool
     );
   }
   if (!job.verdict) return <Text fz="sm" c="dimmed">{job.error ?? "No verdict yet"}</Text>;
+  const reviews = job.verdict.reviews;
+  if (reviews.length === 1) {
+    return <DimensionBadges review={reviews[0]!}>{tainted && reviews[0]!.tainted && <TaintedBadge />}</DimensionBadges>;
+  }
   return (
-    // Badges that open their notes, wrapping into rows: a 44 px pitch between rows on touch.
-    <Row gap="xs" data-touch-pitch>
-      {DIMENSIONS.map(([d, label]) => {
-        // Pass and fail are status: their roles, and an icon each, so color isn't the only cue.
-        const pass = job.verdict![d].verdict === "pass";
-        return (
-          <Tooltip key={d} label={job.verdict![d].notes || label} multiline maw="var(--nest-side-panel)">
-            <TriggerBadge
-              size="sm"
-              variant="light"
-              color={pass ? "success" : "danger"}
-              leftSection={pass ? <IconCheck size={icon.sm} aria-hidden /> : <IconX size={icon.sm} aria-hidden />}
-              aria-label={`${label}: ${pass ? "passed" : "failed"}`}
-              data-verdict={pass ? "pass" : "fail"}
-            >
-              {label}
-            </TriggerBadge>
-          </Tooltip>
-        );
-      })}
-      {tainted && job.tainted && <TaintedBadge />}
-    </Row>
+    <Stack gap="sm">
+      {reviews.map((r) => (
+        <Stack key={r.reviewer.id} gap="2xs" data-reviewer={r.reviewer.id}>
+          <Text fz="xs" c="dimmed" fw={weight.medium}>
+            {r.reviewer.name}
+          </Text>
+          <DimensionBadges review={r} who={r.reviewer.name}>
+            {tainted && r.tainted && <TaintedBadge />}
+          </DimensionBadges>
+        </Stack>
+      ))}
+    </Stack>
   );
 }
 
