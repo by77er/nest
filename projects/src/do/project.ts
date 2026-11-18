@@ -2212,29 +2212,37 @@ export class ProjectDO extends DurableObject<Env> {
    * catalog: the same body every time, so writing it again changes nothing.
    */
   private async writeModelTemplate(nest: Nest, role: ModelRole, model: string): Promise<string> {
-    const t = roleTemplate(role, this.settings()!.id, model);
-    // Recorded before it's written: one written and never recorded would be left in nest for good. A new
-    // `at_ms` each time, so a sweep whose delete was in flight sees the row is this start's now (and a
-    // reviewer's is kept for START_LEASE_MS from it).
-    this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = MAX(excluded.at_ms, model_templates.at_ms + 1), del_next_ms = NULL, del_attempts = 0, del_error = NULL", t.name, role, model, Date.now());
-    // A delete of it already at nest is answered first, so it can't land after this write.
-    await this.templateDeletes.get(t.name);
+    const t = await this.recordModelTemplate(role, model);
     await nest.putCatalog("templates", t.name, t.body);
     return t.name;
   }
 
   /**
-   * The template a reviewer's start attempt (`key`, its spec frozen by `reviewerSpec`) names, written first
-   * (ReviewDO starts reviewers): the project's own on the model the attempt froze, or the shared one (Claude
-   * Code's default) for an attempt frozen with none.
+   * The project's own template for `role` on `model`, recorded as about to be written (`writeModelTemplate`,
+   * or ReviewDO for a reviewer's), once no delete of it is in flight at nest.
    */
-  async reviewerTemplate(key: string): Promise<string> {
-    const nest = nestFrom(this.env);
-    if (!nest) throw new Error("NEST_CLIENT_TOKEN is not set");
+  private async recordModelTemplate(role: ModelRole, model: string): Promise<{ name: string; body: unknown }> {
+    const t = roleTemplate(role, this.settings()!.id, model);
+    // Recorded before it's written: one written and never recorded would be left in nest for good. A new
+    // `at_ms` each time, so a sweep whose delete was in flight sees the row is this start's now (and a
+    // reviewer's is kept for START_LEASE_MS from it).
+    this.sql.exec("INSERT INTO model_templates (name, role, model, at_ms) VALUES (?, ?, ?, ?) ON CONFLICT (name) DO UPDATE SET at_ms = MAX(excluded.at_ms, model_templates.at_ms + 1), del_next_ms = NULL, del_attempts = 0, del_error = NULL", t.name, role, model, Date.now());
+    // A delete of it already at nest is answered first, so it can't land after the write.
+    await this.templateDeletes.get(t.name);
+    return t;
+  }
+
+  /**
+   * The model a reviewer's start attempt (`key`, its spec frozen by `reviewerSpec`) froze, its template
+   * recorded first: ReviewDO writes the template (the project's own on it, `roleTemplate`) and starts the
+   * reviewer, so nest's refusal of the write reaches the job as one. Null: frozen with none (Claude Code's
+   * default, the shared template).
+   */
+  async reviewerModel(key: string): Promise<string | null> {
     const model = this.settings() ? this.frozenSpec(key)?.model : undefined;
-    if (model) return this.writeModelTemplate(nest, "reviewer", model);
-    await writeSharedTemplate(nest, this.env.PUBLIC_BASE_URL, TEMPLATE.reviewer);
-    return TEMPLATE.reviewer;
+    if (!model) return null;
+    await this.recordModelTemplate("reviewer", model);
+    return model;
   }
 
   /**

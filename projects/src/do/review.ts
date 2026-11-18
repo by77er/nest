@@ -15,6 +15,7 @@
 // until the owner approves that head commit, or dismisses it (`dismissed`).
 
 import { DurableObject } from "cloudflare:workers";
+import { roleTemplate, TEMPLATE, writeSharedTemplate } from "../catalog";
 import { directory, type Env, project as projectStub } from "../env";
 import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, type Verdict, verdictCheck } from "../github";
 import type { AgentCaller } from "../identity";
