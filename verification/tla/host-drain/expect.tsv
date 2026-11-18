@@ -1,0 +1,31 @@
+# HostDrain.tla: one line per config.  <spec> <config> <holds|violates:Name> <ci|full>
+# Bounds (every config): one host, two sandboxes, Deadline 2 ticks, Window 4, the clock to 6, two writes,
+# at most one failed suspend, one wake and one repeated operator drain. ci: each under 10 s with 4 workers (TLC v1.7.4).
+# The code as read at e655ace: a spot drain and an operator's, with a failed suspend
+HostDrain.tla  MC_spot.cfg                 holds                          ci
+HostDrain.tla  MC_spot_fail.cfg            holds                          ci
+HostDrain.tla  MC_operator.cfg             holds                          ci
+# A stale incarnation whose retirement FleetDO hears of: reaped at once, the host retired in time
+HostDrain.tla  MC_spot_stale_reported.cfg  holds                          ci
+# One it never hears of (use1, 2026-11-18 16:03): the salvage window outlasts the notice, and AWS takes an empty host
+HostDrain.tla  MC_spot_stale.cfg           violates:DrainsInTime          ci
+HostDrain.tla  MC_spot_stale_safe.cfg      holds                          ci
+# Suspected: a wake between a suspended lease's eviction and SandboxDO hearing of it resumes the VM off its lease
+HostDrain.tla  MC_wake.cfg                 violates:NoLossByRetire        ci
+HostDrain.tla  MC_wake_refused.cfg         violates:NoRefusedLoss         ci
+# Fix shapes: counting an unanswered resume as busy doesn't close it; recording the evicted incarnation stale does,
+# for the retirement (the refused salvage stays)
+HostDrain.tla  MC_wake_busy.cfg            violates:NoLossByRetire        ci
+HostDrain.tla  MC_wake_stale.cfg           holds                          ci
+HostDrain.tla  MC_wake_stale_refused.cfg   violates:NoRefusedLoss         ci
+# Mutations: each guard removed must be caught
+HostDrain.tla  MC_mut_evict_all.cfg        violates:NoLossByRetire        ci
+HostDrain.tla  MC_mut_report_early.cfg     violates:NoLossByRetire        ci
+HostDrain.tla  MC_mut_retire_leases.cfg    violates:NoLossByRetire        ci
+HostDrain.tla  MC_mut_retire_stale.cfg     violates:NoLossByRetire        ci
+# Reachability: each state happens (so the configs above aren't vacuous)
+HostDrain.tla  MC_reach_retired.cfg        violates:NeverRetired          ci
+HostDrain.tla  MC_reach_kill_holding.cfg   violates:NeverKilledHolding    ci
+HostDrain.tla  MC_reach_kill_loss.cfg      violates:NeverKillLoss         ci
+HostDrain.tla  MC_reach_replaced.cfg       violates:NeverReplaced         ci
+HostDrain.tla  MC_reach_resumed.cfg        violates:NeverResumedOffLease  ci
