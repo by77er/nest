@@ -5651,7 +5651,6 @@ const COMMENTS_SEEN_KEEP_MS = 30 * 86_400_000;
 export const REVISE_MAX = 3;
 const REVISE_WINDOW_MS = 3_600_000;
 
-/** A line of text that can't add lines of its own to the frame: control characters (newlines too) go. */
 /**
  * The template a routine run starts from (README.md#models): the project's own on the model it froze, or the
  * shared one. `routine_runs.template` keeps the shared name (a previous release starts a dreaming run by it,
@@ -5660,6 +5659,7 @@ const REVISE_WINDOW_MS = 3_600_000;
 const runTemplate = (project: string, dreaming: boolean, model: string | null): string =>
   model ? roleTemplate(dreaming ? "dreaming" : "routine", project, model).name : dreaming ? TEMPLATE.dreaming : TEMPLATE.routine;
 
+/** A line of text that can't add lines of its own to the frame: control characters (newlines too) go. */
 const oneLine = (s: string) => s.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, " ").slice(0, 300);
 
 /** How long a comment's text may be in the message (the rest is behind its link). */
