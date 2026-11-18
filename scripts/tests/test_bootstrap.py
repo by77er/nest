@@ -26,8 +26,9 @@ SYSTEMCTL = shutil.which("systemctl")
 # Absolute prefixes the scripts write under (never /dev, /proc or /sys, which they only read).
 PREFIXES = r"(?<![\w.:/$-])/(opt|etc|run|var|usr/lib/nest|root|srv)(?=[/\s\"'.]|$)"
 
-# Units only a sandbox host may run (none reachable on a brain host).
-SANDBOX_ONLY = {"nest-proxy.service", "nest-gateway.service"}
+# Units only a sandbox host may run (none reachable on a brain host; its role can't write the
+# bucket, so it ships no logs).
+SANDBOX_ONLY = {"nest-proxy.service", "nest-gateway.service", "nest-logship.service"}
 DEPENDENCY = re.compile(r"^(Wants|Requires|BindsTo|Requisite|Upholds)=(.*)$", re.M)
 
 
@@ -49,14 +50,28 @@ def reachable(units_dir: Path, start: set) -> set:
 # What each launch template's user data must enable, and nothing else (the agent runner stays on
 # sandbox hosts for this release only: expand/contract, dev/deploy.md).
 ENABLED = {
-    "burst": {"nest-proxy.service", "nestd.service", "nest-gateway.service", "nest-runner.service"},
+    "burst": {"nest-proxy.service", "nestd.service", "nest-gateway.service", "nest-runner.service", "nest-logship.service"},
     "controller": {"nestd.service", "nest-runner.service"},
 }
 
 
+def log_prefix() -> str:
+    """The stack's `logPrefix`: what its lifecycle rule expires (`logs-expire`), and what it renders
+    into install.sh as `@LOG_PREFIX@`."""
+    stack = (ROOT / "deploy/lean/Cell/Stack.lean").read_text()
+    assert '.replace "@LOG_PREFIX@" logPrefix' in stack, "the stack no longer renders its log prefix into install.sh"
+    return re.search(r'^def logPrefix : String := "([^"]+)"$', stack, re.M).group(1)
+
+
+def install_rendered() -> str:
+    """install.sh as `Cell.install` renders it (deploy/lean/Cell/Stack.lean)."""
+    text = (HOST / "install.sh").read_text().replace("@BUCKET@", "nest-test-1").replace("@REGION@", "us-east-1")
+    return text.replace("@LOG_PREFIX@", log_prefix())
+
+
 def rendered(role: str) -> str:
     """bootstrap.sh as `Cell.bootstrap` renders it (deploy/lean/Cell/Stack.lean)."""
-    install = (HOST / "install.sh").read_text().replace("@BUCKET@", "nest-test-1").replace("@REGION@", "us-east-1")
+    install = install_rendered()
     text = (HOST / "bootstrap.sh").read_text().replace("@BUCKET@", "nest-test-1").replace("@CELL@", "test")
     text = text.replace("@INSTALL@\n", install).replace("@REGION@", "us-east-1").replace("@CONTROL_URL@", "https://cp.test")
     return text.replace("@ROLE@", role)
@@ -321,6 +336,94 @@ exec {SYSTEMCTL} --root={fake} "${{args[@]}}"
         self.assertEqual(proc.returncode, 0)
         r = subprocess.run([SYSTEMCTL, f"--root={fake}", "mask", "nest-proxy.service"], capture_output=True, text=True)
         self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
+class LogShipping(unittest.TestCase):
+    """`nest-logship` (written by install.sh) run for real against stubs of the journal, IMDS and
+    the AWS CLI: what it uploads and where, and that the journal cursor moves only past what landed."""
+
+    def start(self, fail_first_upload: bool = False, cursor: str | None = None):
+        fake = Path(tempfile.mkdtemp(prefix="nest-logship-"))
+        self.addCleanup(shutil.rmtree, fake, ignore_errors=True)
+        bin_dir = fake / "stub-bin"
+        bin_dir.mkdir()
+        install = install_rendered()
+        self.assertNotIn("@", re.sub(r"\$@|\"\$@\"", "", re.search(r"<<'LOGSHIP'\n(.*?)\nLOGSHIP\n", install, re.S).group(1)), "a placeholder was left unrendered")
+        body = re.search(r"<<'LOGSHIP'\n(.*?)\nLOGSHIP\n", install, re.S).group(1)
+        script = fake / "nest-logship"
+        script.write_text(re.sub(PREFIXES, lambda m: f"{fake}/{m.group(1)}", body))
+        if cursor is not None:
+            (fake / "var/lib/nest/logship").mkdir(parents=True)
+            (fake / "var/lib/nest/logship/cursor").write_text(cursor)
+        # The journal: two lines after no cursor, one more after each `more` file, else nothing; a
+        # cursor it doesn't know fails, as journalctl does (`Failed to seek to cursor`).
+        stub(bin_dir, "journalctl", f"""for a in "$@"; do f="$a"; done
+[ -f "$f" ] && at=$(cat "$f") || at=0
+case "$at" in *[!0-9]*) echo "Failed to seek to cursor" >&2; exit 1;; esac
+[ "$at" != 0 ] || [ "$1" = -b ] || {{ echo "the first export isn't limited to this boot" >&2; exit 1; }}
+if [ "$at" = 0 ]; then echo "line 1"; echo "line 2"; echo 2 > "$f"
+elif [ -f {fake}/more ]; then rm {fake}/more; echo "line $((at + 1))"; echo $((at + 1)) > "$f"; fi
+""")
+        stub(bin_dir, "curl", 'case "$*" in *api/token*) echo tok;; *"token: tok"*instance-id) echo i-0test;; *) exit 1;; esac\n')
+        uploads = fake / "uploads"
+        uploads.mkdir()
+        fail = fake / "fail-upload"
+        if fail_first_upload:
+            fail.write_text("")
+        stub(bin_dir, "aws", f"""[ "$1 $2 $3 $4 $5" = "s3 cp --region us-east-1 --only-show-errors" ] || exit 2
+if [ -f {fail} ]; then rm {fail}; echo attempt >> {fake}/failed; exit 1; fi
+n=$(ls {uploads} | wc -l)
+cp "$6" {fake}/upload.tmp && mv {fake}/upload.tmp {uploads}/$n.gz && echo "$7" >> {fake}/keys
+""")
+        stub(bin_dir, "sleep", "exec /bin/sleep 0.05\n")
+        proc = subprocess.Popen(["bash", str(script)], env={"PATH": f"{bin_dir}:/usr/bin:/bin"}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        self.addCleanup(lambda: (proc.kill(), proc.wait(), proc.stdout.close()))
+        return fake, proc
+
+    def wait_for(self, what: str, cond):
+        import time
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            if cond():
+                return
+            time.sleep(0.02)
+        self.fail(f"timed out waiting for {what}")
+
+    def uploaded(self, fake: Path) -> list:
+        return [gzip.decompress(p.read_bytes()).decode() for p in sorted((fake / "uploads").iterdir(), key=lambda p: int(p.stem))]
+
+    def test_each_batch_goes_up_once_under_the_instances_prefix_and_a_stop_sends_the_rest(self):
+        fake, proc = self.start()
+        self.wait_for("the first upload", lambda: len(list((fake / "uploads").iterdir())) == 1)
+        (fake / "more").write_text("")
+        self.wait_for("the second upload", lambda: len(list((fake / "uploads").iterdir())) == 2)
+        # Rounds with nothing new upload nothing; what the journal gains before a stop goes with it.
+        (fake / "more").write_text("")
+        proc.terminate()
+        self.assertEqual(proc.wait(timeout=20), 0, proc.stdout.read())
+        self.assertEqual(self.uploaded(fake), ["line 1\nline 2\n", "line 3\n", "line 4\n"])
+        for key in (fake / "keys").read_text().split():
+            self.assertRegex(key, r"^s3://nest-test-1/" + re.escape(log_prefix()) + r"i-0test/\d{4}-\d\d-\d\d/\d{6}-\d{9}\.log\.gz$")
+        self.assertEqual(len(set((fake / "keys").read_text().split())), 3, "each batch has a key of its own")
+        self.assertEqual((fake / "var/lib/nest/logship/cursor").read_text().strip(), "4")
+
+    def test_a_failed_upload_is_sent_again_and_the_cursor_waits_for_it(self):
+        fake, proc = self.start(fail_first_upload=True)
+        self.wait_for("the failed attempt", lambda: (fake / "failed").exists())
+        self.wait_for("the retry", lambda: len(list((fake / "uploads").iterdir())) == 1)
+        self.assertEqual(self.uploaded(fake), ["line 1\nline 2\n"], "the batch whose upload failed went up with the next round")
+        self.wait_for("the cursor", lambda: (fake / "var/lib/nest/logship/cursor").exists())
+        self.assertEqual((fake / "var/lib/nest/logship/cursor").read_text().strip(), "2")
+
+
+    def test_a_cursor_the_journal_no_longer_has_starts_over(self):
+        """It used to fail every minute for good, saying nothing."""
+        fake, proc = self.start(cursor="gone\n")
+        self.wait_for("the upload after starting over", lambda: len(list((fake / "uploads").iterdir())) == 1)
+        self.assertEqual(self.uploaded(fake), ["line 1\nline 2\n"])
+        proc.terminate()
+        proc.wait(timeout=20)
+        self.assertIn("journalctl failed: starting over", proc.stdout.read())
 
 
 @unittest.skipUnless(shutil.which("shellcheck") or os.environ.get("CI") == "true", "shellcheck is not installed (required on CI)")

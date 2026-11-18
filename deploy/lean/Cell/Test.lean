@@ -358,9 +358,58 @@ def amiPruning : Policy :=
       if n < Lean.JsonNumber.fromNat 2 then some "the lifecycle policy must keep at least two images" else none
     | _, _, _ => some "the lifecycle policy must delete by count with literal values"
 
+/-- The longest host logs may be kept. -/
+def maxLogRetentionDays : Nat := 30
+
+/-- Whether a lifecycle rule (one element of `rule`) expires everything under the log prefix
+within `maxLogRetentionDays`: enabled, filtered by exactly that prefix, with literal days. -/
+def expiresLogs : ExprNode → Bool
+  | .object fields =>
+    let field? (block name : String) : Option Value :=
+      match fields.lookup block with
+      | some (.array [.object inner]) => (inner.lookup name).bind ExprNode.literal?
+      | _ => none
+    match (fields.lookup "status").bind ExprNode.literal?, field? "filter" "prefix", field? "expiration" "days" with
+    | some (.string "Enabled"), some (.string p), some (.number d) =>
+      p == logPrefix && Lean.JsonNumber.fromNat 0 < d && d < Lean.JsonNumber.fromNat (maxLogRetentionDays + 1)
+    | _, _, _ => false
+  | _ => false
+
+/-- Whether a lifecycle rule removes noncurrent versions of everything in the bucket within a
+week: enabled, with an empty filter. The bucket is versioned, so an expiry only hides an object
+behind a delete marker; this is the rule that deletes its bytes. -/
+def removesNoncurrent : ExprNode → Bool
+  | .object fields =>
+    let days : Option Value :=
+      match fields.lookup "noncurrent_version_expiration" with
+      | some (.array [.object inner]) => (inner.lookup "noncurrent_days").bind ExprNode.literal?
+      | _ => none
+    match (fields.lookup "status").bind ExprNode.literal?, fields.lookup "filter", days with
+    | some (.string "Enabled"), some (.array [.object []]), some (.number d) =>
+      Lean.JsonNumber.fromNat 0 < d && d < Lean.JsonNumber.fromNat 8
+    | _, _, _ => false
+  | _ => false
+
+/-- Host logs are never kept for good: the cell's bucket has exactly one lifecycle configuration,
+with a rule that expires the log prefix within `maxLogRetentionDays` and one that then deletes the
+expired versions. Without them every host's journal would pile up for ever. -/
+def logsExpire : Policy :=
+  Policy.graph "logs-expire" fun g =>
+    match g.resources.filter (·.resourceType == "aws_s3_bucket_lifecycle_configuration") with
+    | [r] =>
+      if (r.argument? "bucket").bind ExprNode.referencedAddress? != some (.resource "aws_s3_bucket" "cell") then
+        some "the lifecycle configuration must be the cell bucket's"
+      else match r.argument? "rule" with
+        | some (.array rules) =>
+          if !rules.any expiresLogs then some s!"no enabled rule expires {logPrefix} within {maxLogRetentionDays} days"
+          else if !rules.any removesNoncurrent then some "no enabled rule deletes noncurrent versions bucket-wide: expired logs would keep their bytes"
+          else none
+        | _ => some "the lifecycle rules must be a literal list"
+    | _ => some "the cell needs exactly one bucket lifecycle configuration"
+
 def policies : Policy :=
   Policy.all "cell" [Policy.validGraph, noIngress, egressAllowList, imdsV2, amiPruning, brainRoleExact use1, brainRoleNowhereElse,
-    brainTemplateShape, templateProfiles]
+    brainTemplateShape, templateProfiles, logsExpire]
 
 #assert_policy policies (buildGraph (cell use1))
 

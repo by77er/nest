@@ -164,3 +164,4 @@ EOF
 # only (expand/contract): this Worker never sends a sandbox host a brain, but a Worker rolled back
 # to the previous release starts workers' brains on their sandbox's host. The next release drops it.
 systemctl enable --now nest-proxy.service nestd.service nest-gateway.service nest-runner.service
+systemctl enable --now nest-logship.service || echo "no log shipping: this host's logs stay on it"
