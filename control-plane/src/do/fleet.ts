@@ -1465,7 +1465,7 @@ export class FleetDO extends DurableObject<Env> {
         this.setTunnelState(host, ev.state, this.host(host));
         return;
       case "spot_notice":
-        return this.drain(host, ev.deadline_ms);
+        return this.drain(host, `spot interruption at ${new Date(ev.deadline_ms).toISOString()}`);
       case "agent_exited": {
         // AgentDO is told first and the row moves on only after: a failed call fails the batch, and
         // its redelivery computes the same epoch.
@@ -2489,10 +2489,26 @@ export class FleetDO extends DurableObject<Env> {
     }
   }
 
-  /** Forced drain (spot notice): suspended sandboxes leave now, the rest once suspended to the object store. */
-  private async drain(host: string, deadlineMs: number): Promise<void> {
+  /**
+   * An operator's drain (`POST /v1/admin/hosts/<id>/drain`): the forced drain a spot notice starts,
+   * asked for by hand, to replace a host without losing what its sandboxes wrote (a terminated host
+   * loses everything since each sandbox's last commit). The host takes no new work; its sandboxes
+   * are suspended to the object store and leave, its brains move, and the tick retires it once
+   * empty. Asked again of a draining host, it sends the suspends again. Only a host that can still
+   * be told: active or already draining.
+   */
+  async drainHost(host: string): Promise<NonNullable<Awaited<ReturnType<FleetDO["hostStatus"]>>>> {
+    const h = this.host(host);
+    if (!h) throw new NestError(ErrorCodes.NOT_FOUND, `no host ${host} in this cell`, 404);
+    if (h.status !== "active" && h.status !== "draining") throw new NestError(ErrorCodes.FORBIDDEN, `host ${host} is ${h.status}: only an active host can be drained`, 409);
+    await this.drain(host, "an operator's request");
+    return (await this.hostStatus(host))!;
+  }
+
+  /** Forced drain (a spot notice, or an operator): suspended sandboxes leave now, the rest once suspended to the object store. */
+  private async drain(host: string, why: string): Promise<void> {
     this.move(host, "drain");
-    console.warn(`FleetDO: ${host} draining (spot interruption at ${new Date(deadlineMs).toISOString()})`);
+    console.warn(`FleetDO: ${host} draining (${why})`);
     const leases = this.leasesOf(host).filter((l) => !l.expired);
     await this.evict(host, leases.filter((l) => l.state === "suspended").map((l) => l.sandbox));
     const running = leases.filter((l) => l.state !== "suspended");
