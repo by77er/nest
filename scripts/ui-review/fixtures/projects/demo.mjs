@@ -439,7 +439,7 @@ const RICH = [
   };
 
   // Routines (README.md#routines): the two presets (review running, dreaming cooling down), a custom one
-  // off; their runs in each outcome; proposals waiting; memory notes (one written by a routine, tainted).
+  // off, and the manager's (tainted); their runs in each outcome; proposals waiting; memory notes (one written by a routine, tainted).
   const noRoutines = variant === "routines-empty";
   const rrun = (id, routine, n, trigger, o = {}) => ({
     id, routine, n, trigger, count: null, state: "ended", outcome: "done", agent: `agt_${id.slice(4)}`, error: null, note: null, turns: 1, max_turns: 3,
@@ -453,7 +453,7 @@ const RICH = [
     rrun("run_dr1x4f", "rtn_dream", 9, "tasks_done", { count: 10, outcome: "failed", error: "it ended before finishing a turn (exited)", turns: 0 }),
   ];
   const routine = (id, o) => ({
-    id, prompt: "Look around.", enabled: true, cooldown_min: 360, max_minutes: 30, max_turns: 3, proposals: "triage", preset: null, next_timer_ms: null,
+    id, prompt: "Look around.", enabled: true, cooldown_min: 360, max_minutes: 30, max_turns: 3, proposals: "triage", preset: null, source: "owner", tainted: false, next_timer_ms: null,
     counts: { tasks_done: 0, prs_merged: 0 }, due: null, waiting: null, cooldown_until_ms: null, live_run: null, last_run: null, runs: 3, created_ms: now - 9 * DAY, updated_ms: now - DAY, ...o,
   });
   const routines = noRoutines ? [] : [
@@ -462,6 +462,9 @@ const RICH = [
     routine("rtn_dream", { name: "Dreaming", kind: "dreaming", preset: "dreaming", cooldown_min: 720, triggers: { timer: { kind: "daily", time: "03:00", tz: "Europe/London" }, tasks_done: 10, prs_merged: null },
       next_timer_ms: now + 13 * 3_600_000, counts: { tasks_done: 7, prs_merged: 0 }, due: { trigger: "tasks_done", at_ms: now - 600_000 }, waiting: "cap", last_run: runs[1] }),
     routine("rtn_custom", { name: "Dependency audit", kind: "custom", enabled: false, triggers: { timer: { kind: "interval", minutes: 1440 }, tasks_done: null, prs_merged: null }, last_run: runs[3] }),
+    // The manager's, written in a session that read an issue: "By the manager" and "Tainted".
+    routine("rtn_sweep", { name: "Stale issue sweep", kind: "custom", source: "manager", tainted: true, prompt: "Find issues with no activity for 30 days and propose closing or reviving each.",
+      triggers: { timer: { kind: "daily", time: "07:30", tz: "Europe/London" }, tasks_done: null, prs_merged: null }, next_timer_ms: now + 9 * 3_600_000, runs: 0 }),
   ];
   const proposals = noRoutines || variant === "triage-empty" ? [] : [
     { id: "prp_a1b2", routine: "rtn_review", routine_name: "Spontaneous review", run: "run_rv2b7d", title: "Handle a missing thumbnail in the gadget list", body: "src/routes/gadgets.ts:84 reads `thumb.url` without checking that the thumbnail exists; a gadget created without an image renders a broken list row.\n\nFix: fall back to the placeholder, and add a test for a gadget with no image.", state: "untriaged", task: null, reason: null, created_ms: now - 3 * 3_600_000 },

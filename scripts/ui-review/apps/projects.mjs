@@ -900,6 +900,7 @@ const app = {
     { name: "routines-long", section: "project", path: "/projects/prj_demo/routines", fixture: "routines-long" },
     { name: "routines-add", section: "project", path: "/projects/prj_demo/routines", full: false, after: (p) => p.getByRole("button", { name: "Add routine" }).click() },
     { name: "routine-edit", section: "project", path: "/projects/prj_demo/routines", full: false, after: (p) => p.getByRole("button", { name: "Edit Dreaming" }).click() },
+    { name: "routine-edit-tainted", section: "project", path: "/projects/prj_demo/routines", full: false, after: (p) => p.getByRole("button", { name: "Edit Stale issue sweep" }).click() },
     { name: "routine-new", section: "project", path: "/projects/prj_demo/routines", full: false, after: async (p) => { await p.getByRole("button", { name: "Add routine" }).click(); await p.getByRole("menuitem", { name: /Custom routine/ }).click(); } },
     { name: "routines-run-open", section: "project", path: "/projects/prj_demo/routines", after: async (p) => { const b = p.getByRole("button", { name: "Show run 2 of Dreaming" }); await b.scrollIntoViewIfNeeded(); await b.click(); await p.locator("[data-ds=terminal]").first().waitFor(); }, check: traceCheck, checkName: "trace" },
     // The Network page (README.md#network): rules per role, live agents applied, pending and failed; empty; a host refused.

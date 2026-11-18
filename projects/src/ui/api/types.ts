@@ -118,13 +118,14 @@ export interface NetworkView {
 }
 
 // Routines and memory (README.md#routines, README.md#memory).
-export type { Proposal, Routine, RoutineRun } from "../../do/project";
+// A routine as the API answers it: with who last wrote it (`source`) and its taint.
+export type { Proposal, RoutineRun, WrittenRoutine as Routine } from "../../do/project";
 export type { Created, RunOutcome, RunState, Timer, TriggerKind, Triggers } from "../../routines";
 export type { Note } from "../../memory";
 export type { CreateRoutineBody, DeclineProposalBody, RoutineKind, RoutinePreset, UpdateRoutineBody } from "../../requests";
 /** `GET /api/projects/<id>/routines`. */
 export interface RoutinesAnswer {
-  routines: import("../../do/project").Routine[];
+  routines: import("../../do/project").WrittenRoutine[];
   max_routine_runs: number;
   live: number;
 }

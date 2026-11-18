@@ -1,6 +1,7 @@
 // Adding or editing a routine (README.md#routines), in a Sheet: its name, kind and instructions; its
 // triggers (a timer, and the board's counters); its limits (cooldown, time and turn budget); and where its
-// proposed tasks go. Checked with the Worker's own schema before it's sent.
+// proposed tasks go. Checked with the Worker's own schema before it's sent. A tainted routine's text is
+// flagged at the top: saving makes it the owner's.
 
 import { Button, NumberInput, SegmentedControl, Select, Switch, Text, Textarea, TextInput } from "@mantine/core";
 import { useState } from "react";
@@ -10,6 +11,7 @@ import { useCreateRoutine, useUpdateRoutine } from "../../api/queries";
 import type { Routine, RoutineKind, Timer, UpdateRoutineBody } from "../../api/types";
 import { FieldGroup, Notice, Section, Stack } from "../../layout";
 import { WEEKDAYS } from "./describe";
+import { taintedRoutineText } from "./Untrusted";
 
 const KIND_LABEL: Record<RoutineKind, string> = { review: "Review", dreaming: "Dreaming", custom: "Custom" };
 type TimerKind = "none" | Timer["kind"];
@@ -117,6 +119,11 @@ export function RoutineForm({ projectId, editing, onDone }: { projectId: string;
   return (
     <form onSubmit={submit} noValidate>
       <Stack gap="2xl">
+        {editing?.tainted && (
+          <Notice tone="warning" title="Tainted">
+            {taintedRoutineText(editing.source)}
+          </Notice>
+        )}
         <Section title="Routine" order={4} region={false}>
           <FieldGroup>
             <TextInput label="Name" required value={d.name} onChange={(e) => set("name")(e.currentTarget.value)} error={errs.name} data-autofocus />
