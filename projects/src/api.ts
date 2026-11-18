@@ -1,7 +1,7 @@
 // The JSON API the board's UI reads (behind Cloudflare Access, src/worker.ts). The state is the app's
 // own Durable Objects'; the only calls out are to nest's client interface (src/nest.ts).
 
-import type { z } from "zod";
+import { z } from "zod";
 import { applyRename, readBinding } from "./binding";
 import { finishProject, syncRepos } from "./creation";
 import { verdict } from "./outbox";
@@ -12,11 +12,11 @@ import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSID
 import { prNumberOf } from "./prs";
 import { attachableRepos, repoAttachable } from "./installations";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
-import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, NewReviewer, problems, PutSecret, ReviewerFromPreset, Settings as SettingsBody, Spec, UpdateReviewer, UpdateRoutine, UpdateTask } from "./requests";
+import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, problems, PutSecret, Settings as SettingsBody, Spec, UpdateReviewer, UpdateRoutine, UpdateTask } from "./requests";
 import type { RepoBinding } from "./do/directory";
 import type { ProjectSettings, Settings } from "./do/project";
 import { githubFor, PERMISSIONS } from "./github";
-import { legacyView, PRESET_REVIEWERS } from "./reviewers";
+import { legacyView, toCreate } from "./reviewers";
 import { PRESETS } from "./routines";
 import type { UntrustedPolicy } from "./review-trust";
 import type { Result } from "./sql";
@@ -433,16 +433,11 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
     case "GET reviewers":
       return json(await review(env, pid).reviewers());
     case "POST reviewers": {
-      // A preset alone, or every field: the body is checked against the form it means, so a refusal names the field at fault.
-      const preset = await req.clone().json().then((v: unknown) => typeof v === "object" && v !== null && "preset" in v, () => false);
-      if (preset) {
-        const b = await body(req, ReviewerFromPreset);
-        if (!b.ok) return b.res;
-        const rv = PRESET_REVIEWERS[b.value.preset];
-        return done(await review(env, pid).createReviewer({ name: rv.name, instructions: rv.instructions, dimensions: [...rv.dimensions], enabled: true }, { preset: rv }), 201);
-      }
-      const b = await body(req, NewReviewer);
-      return b.ok ? done(await review(env, pid).createReviewer(b.value), 201) : b.res;
+      // A preset alone, or every field (`toCreate`, as the manager's `create_reviewer` reads it).
+      const b = await body(req, z.unknown());
+      if (!b.ok) return b.res;
+      const c = toCreate(b.value);
+      return c.ok ? done(await review(env, pid).createReviewer(c.fields, { preset: c.preset }), 201) : err(400, c.error);
     }
     case "GET reviewers/:reviewer":
       return done(await review(env, pid).getReviewer(rest[1]!));

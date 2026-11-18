@@ -7,7 +7,7 @@
 // still written with those keys besides (`storedVerdict`), so that release reads what this one writes; and a
 // reviewer started under it submits in that form, accepted and converted (`legacySubmit`).
 
-import { type ReviewerPreset } from "./requests";
+import { NewReviewer, problems, ReviewerFromPreset, type ReviewerPreset } from "./requests";
 import { invalid } from "./schema";
 
 export { dimensionsProblem, REVIEWER_LIMITS } from "./requests";
@@ -59,8 +59,37 @@ export interface FrozenReviewer extends Reviewer {
   tainted: boolean;
 }
 
+/**
+ * Whether the manager's session may change, disable or delete this reviewer (README.md#reviewers): a tainted
+ * session only one whose text a tainted session wrote. The check passes only if every reviewer passes, so
+ * what a tainted session adds can only make the gate stricter, and what the owner (or a clean session) wrote
+ * keeps judging as written. A clean session may do all the owner's API does. Only the manager's tools ask.
+ */
+export function mayChangeReviewer(reviewer: { name: string; tainted: boolean }, session: { tainted: boolean }): { ok: true } | { ok: false; error: string } {
+  if (!session.tainted || reviewer.tainted) return { ok: true };
+  return {
+    ok: false,
+    error: `"${reviewer.name}" was written by the owner (or an untainted session) and your session is tainted (it has read text anyone could write), so you can't change, disable or delete it: it is kept as it is. The owner can change it on the Reviews page.`,
+  };
+}
+
 /** The reviewers `POST …/reviewers {preset}` adds, each once, under its own id. */
 export const PRESET_REVIEWERS: Record<ReviewerPreset, Reviewer> = { code: CODE_REVIEW };
+
+/**
+ * A new reviewer's body (`POST …/reviewers`, the manager's `create_reviewer`) as what to add, or why not: checked
+ * against the form it means, a preset alone or every field, so a refusal names the field at fault.
+ */
+export function toCreate(body: unknown): { ok: true; fields: ReviewerFields; preset?: Reviewer } | { ok: false; error: string } {
+  if (typeof body === "object" && body !== null && "preset" in body) {
+    const b = ReviewerFromPreset.safeParse(body);
+    if (!b.success) return { ok: false, error: problems(b.error) };
+    const rv = PRESET_REVIEWERS[b.data.preset];
+    return { ok: true, fields: { name: rv.name, instructions: rv.instructions, dimensions: [...rv.dimensions], enabled: true }, preset: rv };
+  }
+  const b = NewReviewer.safeParse(body);
+  return b.success ? { ok: true, fields: b.data } : { ok: false, error: problems(b.error) };
+}
 
 /** The reviewers a job runs, of a project's: the enabled ones in creation order, as they are now. */
 export const freeze = (rs: readonly ProjectReviewer[]): FrozenReviewer[] =>
