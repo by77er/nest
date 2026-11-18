@@ -5,6 +5,7 @@ import { z } from "zod";
 import { ISSUES_FROM } from "./issues";
 import { MODEL_ID } from "./models";
 import { MERGE_METHODS } from "./automerge";
+import { dimensionsProblem, REVIEWER_LIMITS as RL, REVIEWER_PRESETS, type ReviewerPreset } from "./reviewers";
 
 /** A GitHub repo, `owner/name`. */
 /** `POST /api/admin/bindings/<project>/bind`: the repo id a re-read showed, which the operator chose. */
@@ -137,6 +138,24 @@ export const CreateRoutine = z.union([z.strictObject({ preset: z.enum(ROUTINE_PR
 export const UpdateRoutine = z.strictObject(Object.fromEntries(Object.entries(RoutineFields).map(([k, v]) => [k, v.optional()])) as {
   [K in keyof typeof RoutineFields]: z.ZodOptional<(typeof RoutineFields)[K]>;
 });
+/** A project's reviewer (README.md#reviewers): what it judges (its dimensions) and how (its instructions). */
+const ReviewerFields = {
+  name: z.string().trim().min(1).max(RL.name).describe(`The reviewer's name (at most ${RL.name} characters).`),
+  instructions: z.string().trim().min(1).max(RL.instructions).describe(`What it judges and how: its brief carries them (at most ${RL.instructions} characters).`),
+  dimensions: z.array(z.string().trim().min(1).max(RL.dimension)).min(1).max(RL.dimensions)
+    .superRefine((ds, ctx) => {
+      const bad = dimensionsProblem(ds);
+      if (bad) ctx.addIssue({ code: "custom", message: bad });
+    })
+    .describe(`What it gives a verdict on, pass or fail each: 1 to ${RL.dimensions} names of at most ${RL.dimension} characters, different without case.`),
+  enabled: z.boolean().describe("Whether it reviews PR heads: each enabled reviewer reviews every head, one after another."),
+};
+const REVIEWER_PRESET_NAMES = Object.keys(REVIEWER_PRESETS) as [ReviewerPreset, ...ReviewerPreset[]];
+/** A new reviewer: a preset alone (the built-in "Code review", once) or every field. */
+export const CreateReviewer = z.union([z.strictObject({ preset: z.enum(REVIEWER_PRESET_NAMES) }), z.strictObject(ReviewerFields)]);
+export const UpdateReviewer = z.strictObject(Object.fromEntries(Object.entries(ReviewerFields).map(([k, v]) => [k, v.optional()])) as {
+  [K in keyof typeof ReviewerFields]: z.ZodOptional<(typeof ReviewerFields)[K]>;
+});
 /** A body's refusal in words: each issue's path and message, as the API answers it and the manager's tools do. */
 export const problems = (e: z.ZodError): string => e.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; ");
 /** Declining a routine's proposed task: an optional reason, kept on it. */
@@ -158,5 +177,7 @@ export type TriggersBody = z.input<typeof Triggers>;
 export type CreateRoutineBody = z.input<typeof CreateRoutine>;
 export type UpdateRoutineBody = z.input<typeof UpdateRoutine>;
 export type DeclineProposalBody = z.input<typeof DeclineProposal>;
+export type CreateReviewerBody = z.input<typeof CreateReviewer>;
+export type UpdateReviewerBody = z.input<typeof UpdateReviewer>;
 export type RoutineKind = (typeof ROUTINE_KINDS)[number];
 export type RoutinePreset = (typeof ROUTINE_PRESETS)[number];
