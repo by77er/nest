@@ -21,7 +21,7 @@ import {
 } from "../../layout";
 import { RichMessage } from "../rich/RichMessage";
 import { useTrace } from "../trace/useTrace";
-import { finishedTurns, groupLog, liveTurn, loadDraft, markRead, quote, saveDraft, type Step, stepsBySeq, type ToolStep } from "./model";
+import { finishedTurns, liveTurn, type LogItem, loadDraft, markRead, quote, saveDraft, type Step, stepsBySeq, timeline, type ToolStep } from "./model";
 
 /** A message of the owner's the page couldn't post (its answer never came): kept with its request id, so Retry posts the same message. */
 type Unsent = ChatMessage & { request_id: string };
@@ -344,13 +344,15 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   // Nothing said yet and no turn running: nothing to follow (its welcome is read from the top).
   const emptyRef = useRef(true);
   // The last stream, kept until the turn's message lands, so the swap doesn't jump.
-  const [held, setHeld] = useState<{ turn: string; steps: Step[]; sinceSeq: number } | null>(null);
+  const [held, setHeld] = useState<{ turn: string; started_ms: number; steps: Step[]; sinceSeq: number } | null>(null);
 
   const latest = useMemo(() => chat.data ?? [], [chat.data]);
   const messages = useMemo(() => {
     const bySeq = new Map<number, ChatMessage>();
     for (const m of [...older, ...latest]) bySeq.set(m.seq, m);
-    return [...[...bySeq.values()].sort((a, b) => a.seq - b.seq), ...failed];
+    // One in flight (a negative seq until nest gives it one) is the newest: after every one nest has.
+    const all = [...bySeq.values()];
+    return [...all.filter((m) => m.seq > 0).sort((a, b) => a.seq - b.seq), ...all.filter((m) => m.seq < 0).sort((a, b) => a.at_ms - b.at_ms), ...failed];
   }, [older, latest, failed]);
   const maxSeq = messages.reduce((n, m) => Math.max(n, m.seq), 0);
   const lastManagerSeq = messages.reduce((n, m) => (m.sender === "manager" ? Math.max(n, m.seq) : n), 0);
@@ -363,22 +365,23 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
 
   // Hold the stream until its message lands (a manager message newer than when it began).
   useEffect(() => {
-    if (live && live.steps.length) setHeld((h) => ({ turn: live.turn, steps: live.steps, sinceSeq: h?.turn === live.turn ? h.sinceSeq : lastManagerSeq }));
+    if (live && live.steps.length) setHeld((h) => ({ turn: live.turn, started_ms: live.started_ms, steps: live.steps, sinceSeq: h?.turn === live.turn ? h.sinceSeq : lastManagerSeq }));
   }, [live]); // `lastManagerSeq` is read at each turn's start only
   // The held turn as it ended (a call it never answered reads stopped), while the ring has it.
   const heldEnd = !live && held ? (finished.find((t) => t.turn === held.turn) ?? null) : null;
   // Let go once its message is in the log (by what it says; by seq if the ring has lost the turn), at
-  // once if it ended without a reply (stopped), and after HOLD_MAX_MS whatever happens.
+  // once if it ended without a reply (stopped), and after HOLD_MAX_MS whatever happens. Landed, it isn't
+  // shown again (under its own reply) while the release waits for the effect.
+  const landed = !!held && !live && (heldEnd ? !heldEnd.reply || messages.some((m) => m.sender === "manager" && m.text.trim() === heldEnd.reply) : lastManagerSeq > held.sinceSeq);
   useEffect(() => {
     if (!held || live) return;
-    const landed = heldEnd ? !heldEnd.reply || messages.some((m) => m.sender === "manager" && m.text.trim() === heldEnd.reply) : lastManagerSeq > held.sinceSeq;
     if (landed) {
       setHeld(null);
       return;
     }
     const t = setTimeout(() => setHeld(null), HOLD_MAX_MS);
     return () => clearTimeout(t);
-  }, [held, live, heldEnd, messages, lastManagerSeq]);
+  }, [held, live, landed]);
 
   // The reader opened something: the end is no longer followed (scroll anchoring holds their line).
   const stopFollowing = useCallback(() => {
@@ -512,7 +515,6 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     }, 0);
   };
 
-  const items = groupLog(messages);
   // The manager ended or errored (README.md#the-manager-lifecycle): said where the composer is (a phone
   // lands here, far below the page's notice), with its Restart, and nothing to Stop.
   const manager = useManager(projectId);
@@ -521,20 +523,51 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
   const running = !!live && !down;
   // On a phone only: wider, the page's notice (with its own Restart) stays in view above the log.
   const phone = usePhone();
-  const streamSteps = live?.steps ?? (held ? (heldEnd?.steps ?? held.steps) : []);
+  // The turn in the log where it is in time (README.md#the-manager-chat): split by the messages sent
+  // during it; a held one keeps its split until its reply lands.
+  const turn = live ? { ...live, running } : held && !landed ? { turn: held.turn, started_ms: held.started_ms, steps: heldEnd?.steps ?? held.steps, running: false } : null;
+  const items = timeline(messages, turn);
   const replySteps = stepsBySeq(messages, finished);
   // One spinner in the log: the most recent of the owner's messages in flight.
   const spinSeq = messages.filter((m) => m.sender === "owner" && (statusOf(m) === "owed" || statusOf(m) === "retrying")).at(-1)?.seq;
-  const stream = running || streamSteps.length > 0;
-  // A tool running shows itself; otherwise the turn is between steps (thinking, writing): a working line.
+  const stream = items.some((it) => it.kind === "stream");
   emptyRef.current = messages.length === 0 && !stream;
-  const toolRunning = streamSteps.some((st) => st.kind === "tool" && st.status === "running");
   // A starter fills the composer and focuses it at once (setting the value puts the caret at its end),
   // so typing straight after the click continues it.
   const fillStarter = (st: string) => {
     setText(st);
     composer.current?.focus();
   };
+
+  const item = (it: LogItem) =>
+    it.kind === "day" ? (
+      <DaySeparator key={it.key} label={it.label} />
+    ) : it.kind === "stream" ? (
+      // A part of the turn in progress: only the last is live (its working line, its running call).
+      <MessageGroup key={it.key} side="manager" name="Manager" avatar={MANAGER_MARK}>
+        <MessageRow side="manager" quiet data-sender="stream" data-live={it.live ? "" : undefined}>
+          <Stack gap="sm">
+            {it.steps.length > 0 && <LiveSteps steps={it.steps} projectId={projectId} />}
+            {it.working && <WorkingLine>Working…</WorkingLine>}
+          </Stack>
+        </MessageRow>
+      </MessageGroup>
+    ) : (
+      <MessageGroup key={it.key} side={it.sender === "owner" ? "owner" : it.sender === "manager" ? "manager" : "note"} name={it.sender === "manager" ? "Manager" : undefined} avatar={MANAGER_MARK}>
+        {it.messages.map((m) => (
+          <Message
+            key={m.seq}
+            m={m}
+            projectId={projectId}
+            appear={!!seen.current && m.seq > 0 && !seen.current.has(m.seq)}
+            steps={replySteps.get(m.seq)}
+            spin={m.seq === spinSeq}
+            onQuote={quoteReply}
+            onRetry={retry}
+          />
+        ))}
+      </MessageGroup>
+    );
 
   return (
     <OpenedContext.Provider value={stopFollowing}>
@@ -543,7 +576,10 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
           <ChatLog ref={log} onScroll={onScroll} label="Conversation with the manager" following={atBottom && !emptyRef.current}>
             {loadingOlder && <LoadingState label="Loading older messages" />}
             {chat.isPending ? (
-              <LoadingState label="Loading the chat" />
+              <>
+                <LoadingState label="Loading the chat" />
+                {items.map(item)}
+              </>
             ) : chat.isError ? (
               <ErrorState title="The chat couldn't be loaded" error={chat.error} onRetry={() => void chat.refetch()} />
             ) : messages.length === 0 && !stream ? (
@@ -561,36 +597,7 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
                 The manager keeps this project's board: it specs tasks, assigns them, and tells you what's blocked.
               </ChatWelcome>
             ) : (
-              items.map((it) =>
-                it.kind === "day" ? (
-                  <DaySeparator key={it.key} label={it.label} />
-                ) : (
-                  <MessageGroup key={it.key} side={it.sender === "owner" ? "owner" : it.sender === "manager" ? "manager" : "note"} name={it.sender === "manager" ? "Manager" : undefined} avatar={MANAGER_MARK}>
-                    {it.messages.map((m) => (
-                      <Message
-                        key={m.seq}
-                        m={m}
-                        projectId={projectId}
-                        appear={!!seen.current && m.seq > 0 && !seen.current.has(m.seq)}
-                        steps={replySteps.get(m.seq)}
-                      spin={m.seq === spinSeq}
-                        onQuote={quoteReply}
-                        onRetry={retry}
-                      />
-                    ))}
-                  </MessageGroup>
-                ),
-              )
-            )}
-            {stream && !chat.isError && (
-              <MessageGroup side="manager" name="Manager" avatar={MANAGER_MARK}>
-                <MessageRow side="manager" quiet data-sender="stream">
-                  <Stack gap="sm">
-                    {streamSteps.length > 0 && <LiveSteps steps={streamSteps} projectId={projectId} />}
-                    {running && !toolRunning && <WorkingLine>Working…</WorkingLine>}
-                  </Stack>
-                </MessageRow>
-              </MessageGroup>
+              items.map(item)
             )}
           </ChatLog>
         </ChatFrame>
