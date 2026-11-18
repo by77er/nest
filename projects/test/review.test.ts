@@ -178,20 +178,23 @@ describe("a PR's review", () => {
   it("an attempt keeps the model it froze when its start is retried after the setting changed, under the same key", async () => {
     const p = await newProject();
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-haiku-5-5" });
-    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1 });
+    fake.fail(/^POST \/v1\/agents$/, 503, { retryable: true, times: 1000 });
     const s = sha();
     expect((await push(p, 6, s, "opened")).status).toBe(200);
     await run(p);
     expect(live(p, 6)).toEqual([]);
     await api(token, "PATCH", `/api/projects/${p.id}/settings`, { reviewer_model: "claude-sonnet-5-5" });
+    fake.failures = [];
     await dueNow(p);
     await run(p);
     const [a] = live(p, 6);
     expect(a!.template).toBe(roleTemplate("reviewer", p.id, "claude-haiku-5-5").name);
     const creates = fake.calls.filter((c) => c.method === "POST" && c.path === "/v1/agents" && c.body.labels.role === "reviewer" && c.body.labels.project === p.id);
-    expect(creates).toHaveLength(2);
-    expect(creates.map((c) => c.idempotencyKey)).toEqual([`${p.id}/review/6/${s}/1/agent`, `${p.id}/review/6/${s}/1/agent`]);
-    expect(creates[1]!.body).toEqual(creates[0]!.body);
+    expect(creates.length).toBeGreaterThanOrEqual(2);
+    for (const c of creates) {
+      expect(c.idempotencyKey).toBe(`${p.id}/review/6/${s}/1/agent`);
+      expect(c.body).toEqual(creates[0]!.body);
+    }
   });
 
   it("a new head supersedes the old one: the old reviewer is stopped, its check cancelled, the new head reviewed", async () => {

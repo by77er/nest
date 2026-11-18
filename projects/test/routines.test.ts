@@ -457,8 +457,10 @@ describe("cost guards", () => {
       for (const c of ["gh_unreachable", "gh_repo_id", "gh_repo_gen", "converge_next_ms"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("ALTER TABLE layers DROP COLUMN github");
       sql.exec("ALTER TABLE routine_runs DROP COLUMN nest_repos");
+      for (const c of ["reviewer_model", "routine_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      sql.exec("ALTER TABLE routine_runs DROP COLUMN model");
       sql.exec("DELETE FROM start_specs");
-      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 2);
+      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 3);
       migrate(st.storage, MIGRATIONS);
       expect(sql.exec("SELECT nest_repos FROM routine_runs WHERE id = ?", r0.id).one().nest_repos).toBe(1);
       sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE state = 'starting'");

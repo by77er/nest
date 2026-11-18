@@ -300,6 +300,9 @@ describe("the outboxes' migration", () => {
       // And the convergence step's (README.md#converging-onto-the-apps-own-access).
       sql.exec("ALTER TABLE settings DROP COLUMN converge_next_ms");
       sql.exec("DROP TABLE abandoned_starts");
+      // And the reviewers' and routine runs' models' step (README.md#models).
+      for (const c of ["reviewer_model", "routine_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
+      sql.exec("ALTER TABLE routine_runs DROP COLUMN model");
       sql.exec("UPDATE schema_version SET v = ?", step);
       sql.exec("INSERT INTO task_prs (pr, task, state, attached_by, attached_ms) VALUES (61, 'tsk_gone', 'open', 'owner', 1), (62, 'tsk_gone', 'detached', 'owner', 1), (63, ?, 'open', 'owner', 1)", t.id);
       migrate(st.storage, MIGRATIONS);

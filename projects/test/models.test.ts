@@ -951,8 +951,10 @@ describe("a project's models", () => {
       await leaseOver(p);
       await stub(p).drain();
       expect(fake.catalog.has(`templates/${haiku}`)).toBe(true);
-      // Its reviewer gone: deleted at the next sweep.
+      // Its reviewer gone (ReviewDO stops it, with its sandbox, and says so): deleted at the next sweep.
       await deliver({ id: `evt-${rand()}`, type: "agent.exited", agent: reviewer!.agent, reason: "exited" });
+      await env.REVIEW.get(env.REVIEW.idFromName(p.id)).drain();
+      expect(fake.agents.get(reviewer!.agent)!.ended).toBe(true);
       await stub(p).drain();
       expect(fake.catalog.has(`templates/${haiku}`)).toBe(false);
       expect(await runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT name FROM model_templates WHERE role = 'reviewer'").toArray())).toEqual([]);
