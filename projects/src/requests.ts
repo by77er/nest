@@ -110,33 +110,35 @@ export const Timer = z.discriminatedUnion("kind", [
 ]);
 /** What fires a routine, any of them: its timer, or N tasks done or N task PRs merged since its last run. */
 export const Triggers = z.strictObject({
-  timer: Timer.nullable(),
-  tasks_done: z.number().int().min(1).max(1000).nullable(),
-  prs_merged: z.number().int().min(1).max(1000).nullable(),
+  timer: Timer.nullable().describe("{kind: interval, minutes} (15 to 10080), {kind: daily, time: HH:MM, tz} or {kind: weekly, day (0 is Sunday), time, tz}, tz an IANA time zone; null for none."),
+  tasks_done: z.number().int().min(1).max(1000).nullable().describe("Fire after this many tasks reached done since its last run; null for none."),
+  prs_merged: z.number().int().min(1).max(1000).nullable().describe("Fire after this many task PRs merged since its last run; null for none."),
 });
 export const ROUTINE_KINDS = ["review", "dreaming", "custom"] as const;
 export const ROUTINE_PRESETS = ["review", "dreaming"] as const;
 const RoutineFields = {
-  name: z.string().trim().min(1).max(80),
-  kind: z.enum(ROUTINE_KINDS),
-  /** The owner's instructions for each run (the brief carries them, untainted). */
-  prompt: z.string().trim().min(1).max(8000),
-  enabled: z.boolean(),
-  triggers: Triggers,
+  name: z.string().trim().min(1).max(80).describe("The routine's name (at most 80 characters)."),
+  kind: z.enum(ROUTINE_KINDS).describe("review (reviews recent merges), dreaming (consolidates memory: no sandbox, reads transcripts) or custom."),
+  /** The instructions for each run (its brief carries them; relayed when a tainted session wrote them). */
+  prompt: z.string().trim().min(1).max(8000).describe("The instructions each run gets in its brief (at most 8000 characters)."),
+  enabled: z.boolean().describe("Whether its triggers fire it."),
+  triggers: Triggers.describe("What fires it, any of them: a timer, N tasks done or N task PRs merged since its last run. All three keys, each null for none."),
   /** At least this long between two runs' starts (a manual run skips it). */
-  cooldown_min: z.number().int().min(0).max(7 * 24 * 60),
+  cooldown_min: z.number().int().min(0).max(7 * 24 * 60).describe("At least this many minutes between two runs' starts (0 to 10080)."),
   /** The run is stopped after this long (its cost guard). */
-  max_minutes: z.number().int().min(5).max(120),
+  max_minutes: z.number().int().min(5).max(120).describe("A run is stopped after this many minutes (5 to 120)."),
   /** The run is stopped after this many turns. */
-  max_turns: z.number().int().min(1).max(20),
+  max_turns: z.number().int().min(1).max(20).describe("A run is stopped after this many turns (1 to 20)."),
   /** Where its proposed tasks go: the triage queue (the owner accepts them), or the board as drafts. */
-  proposals: z.enum(["triage", "draft"]),
+  proposals: z.enum(["triage", "draft"]).describe("Where its proposed tasks go: triage (the owner accepts them) or draft (onto the board as drafts)."),
 };
 /** A new routine: a preset (README.md#presets) or every field. */
 export const CreateRoutine = z.union([z.strictObject({ preset: z.enum(ROUTINE_PRESETS) }), z.strictObject(RoutineFields)]);
 export const UpdateRoutine = z.strictObject(Object.fromEntries(Object.entries(RoutineFields).map(([k, v]) => [k, v.optional()])) as {
   [K in keyof typeof RoutineFields]: z.ZodOptional<(typeof RoutineFields)[K]>;
 });
+/** A body's refusal in words: each issue's path and message, as the API answers it and the manager's tools do. */
+export const problems = (e: z.ZodError): string => e.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; ");
 /** Declining a routine's proposed task: an optional reason, kept on it. */
 export const DeclineProposal = z.strictObject({ reason: z.string().max(500).optional() });
 

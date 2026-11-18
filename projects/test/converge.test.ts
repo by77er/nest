@@ -470,7 +470,10 @@ describe("a manager on nest's repos", () => {
       for (const c of ["reviewer_model", "routine_model"]) x.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       x.exec("ALTER TABLE routine_runs DROP COLUMN model");
       x.exec("ALTER TABLE settings DROP COLUMN converge_next_ms");
-      x.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 2);
+      // And the routines' writers' step (README.md#routines).
+      for (const c of ["source", "name_tainted", "prompt_tainted"]) x.exec(`ALTER TABLE routines DROP COLUMN ${c}`);
+      x.exec("ALTER TABLE routine_runs DROP COLUMN brief_tainted");
+      x.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 3);
       migrate(st.storage, MIGRATIONS);
       expect(x.exec("SELECT converge_next_ms FROM settings").one().converge_next_ms).toBe(0);
     });

@@ -26,8 +26,8 @@ import type { NestEvent } from "../webhook";
 import { asBinding, type ClientLayer, clientLayerFor, type GithubFeed, type EgressRule, egressWithinGrant, hostAllowed, LAYER_ROLES, type LayerRole, NETWORK_ROLES, type NetworkRole, NO_RULES, normalizeRules, type RoleRules, shrinkLayer } from "../network";
 import { MAX_WAITS, type PrUntil, prVerdict, taskVerdict, timeoutProblem, type Wait, type WaitKind, waitKey, waitMessage, type WaitOutcome } from "../waits";
 import { MAX_NOTES, mayWriteMemory, NOTE_KEY, NOTE_MAX, type Note, preview } from "../memory";
-import type { RoutineKind, RoutinePreset } from "../requests";
-import { type Created, firedTrigger, MAX_PROPOSALS_PER_RUN, MAX_ROUTINES, MAX_START_ATTEMPTS, MAX_UNTRIAGED_PROPOSALS, nextTimerFire, type RoutineFields, routineSpawnExtras, runBrief, type RunOutcome, type RunState, startVerdict, type TriggerKind, type Triggers } from "../routines";
+import { CreateRoutine, problems, type RoutineKind, type RoutinePreset, UpdateRoutine } from "../requests";
+import { type Created, firedTrigger, MAX_PROPOSALS_PER_RUN, MAX_ROUTINES, MAX_START_ATTEMPTS, MAX_UNTRIAGED_PROPOSALS, nextTimerFire, PRESETS, type RoutineFields, routineSpawnExtras, runBrief, type RunOutcome, type RunState, startVerdict, type TriggerKind, type Triggers } from "../routines";
 import { EARLY_EXITS_KEEP_MS, ENDED_RUNS_KEEP_MS, ERRORS_KEEP_MS, PR_TOLD_KEEP_MS, PRUNE_EVERY_MS, RUN_TURNS_KEEP_MS, TRIAGED_PROPOSALS_KEEP_MS } from "../retention";
 import { type PrNow, readPrs } from "../pr-read";
 import { prConditions, UPKEEP_CONDITIONS, type UpkeepCondition, upkeepMessage } from "../pr-upkeep";
@@ -282,6 +282,9 @@ export interface Ask {
 /** Who did something: the owner (from the board), the app itself, or an agent over MCP (with its taint). */
 export type Actor = { kind: "owner" } | { kind: "app"; what: string } | { kind: "agent"; agent: string; tainted: boolean };
 
+/** A routine's writer as it records it: only the owner (the API) and the manager (the board's tools) write one. */
+const sourceOf = (by: Actor): "owner" | "manager" => (by.kind === "agent" ? "manager" : "owner");
+
 /** A routine (README.md#routines), with what the page shows: its next timer fire, its counters, why it waits, its live and last runs. */
 export interface Routine extends RoutineFields {
   id: string;
@@ -299,6 +302,14 @@ export interface Routine extends RoutineFields {
   runs: number;
   created_ms: number;
   updated_ms: number;
+}
+
+/** A routine as the API and the manager's `list_routines` answer it: with who last wrote it and its taint. */
+export interface WrittenRoutine extends Routine {
+  /** Who last wrote it: the owner (the API) or the manager (its tools). */
+  source: "owner" | "manager";
+  /** Its name or prompt (its runs' brief) was last written by a tainted session: its runs' briefs are relayed. */
+  tainted: boolean;
 }
 
 /** One run of a routine: why it started, its agent (whose trace the page shows), how it ended and what it made. */
@@ -685,6 +696,15 @@ export const MIGRATIONS = [
     "ALTER TABLE settings ADD COLUMN reviewer_model TEXT",
     "ALTER TABLE settings ADD COLUMN routine_model TEXT",
     "ALTER TABLE routine_runs ADD COLUMN model TEXT",
+  ],
+  [
+    // Who last wrote a routine (README.md#routines): `source` null for the owner, as every routine before it
+    // was; and whether a tainted session last wrote its name or its prompt, the text its runs' briefs carry.
+    // A run's brief's taint, frozen with the brief (null: frozen before, so the owner's text: untainted).
+    "ALTER TABLE routines ADD COLUMN source TEXT",
+    "ALTER TABLE routines ADD COLUMN name_tainted INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE routines ADD COLUMN prompt_tainted INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE routine_runs ADD COLUMN brief_tainted INTEGER",
   ],
 ] as const;
 
@@ -3814,7 +3834,7 @@ export class ProjectDO extends DurableObject<Env> {
     };
   }
 
-  private toRoutine(r: Row): Routine {
+  private toRoutine(r: Row): WrittenRoutine {
     const id = r.id as string;
     const live = this.sql.exec("SELECT * FROM routine_runs WHERE routine = ? AND state != 'ended' ORDER BY queued_ms DESC LIMIT 1", id).toArray()[0];
     const last = this.sql.exec("SELECT * FROM routine_runs WHERE routine = ? AND state = 'ended' ORDER BY ended_ms DESC LIMIT 1", id).toArray()[0];
@@ -3834,6 +3854,7 @@ export class ProjectDO extends DurableObject<Env> {
       id, name: r.name as string, kind: r.kind as RoutineKind, prompt: r.prompt as string, enabled: r.enabled === 1, triggers,
       cooldown_min: r.cooldown_min as number, max_minutes: r.max_minutes as number, max_turns: r.max_turns as number,
       proposals: r.proposals as "triage" | "draft", preset: (r.preset as RoutinePreset | null) ?? null,
+      source: r.source === "manager" ? "manager" : "owner", tainted: r.name_tainted === 1 || r.prompt_tainted === 1,
       next_timer_ms: r.enabled === 1 ? ((r.timer_next_ms as number | null) ?? null) : null, counts: this.countsSince(r),
       due: r.due === null ? null : { trigger: r.due as TriggerKind, at_ms: r.due_ms as number }, waiting,
       cooldown_until_ms: cooldownUntil !== null && cooldownUntil > Date.now() ? cooldownUntil : null,
@@ -3842,7 +3863,7 @@ export class ProjectDO extends DurableObject<Env> {
     };
   }
 
-  async routines(): Promise<Result<{ routines: Routine[]; max_routine_runs: number; live: number }>> {
+  async routines(): Promise<Result<{ routines: WrittenRoutine[]; max_routine_runs: number; live: number }>> {
     const s = this.settingsRow();
     if (!s) return fail(404, "unknown project");
     return ok({
@@ -3851,24 +3872,33 @@ export class ProjectDO extends DurableObject<Env> {
     });
   }
 
-  async getRoutine(id: string): Promise<Result<Routine>> {
+  async getRoutine(id: string): Promise<Result<WrittenRoutine>> {
     if (!this.settings()) return fail(404, "unknown project");
     const r = this.routineRow(id);
     return r ? ok(this.toRoutine(r)) : fail(404, "unknown routine");
   }
 
-  /** A new routine: a preset's fields (README.md#presets) or the owner's. Its counters start from now, its timer from now. */
-  async createRoutine(f: RoutineFields, preset: RoutinePreset | null = null): Promise<Result<Routine>> {
+  /**
+   * A new routine: a preset's fields (README.md#presets), each preset once, or the writer's. Its counters start
+   * from now, its timer from now. The writer is the owner (the API) or the manager (its tools): a tainted
+   * session's name and prompt are tainted, a preset's are the app's.
+   */
+  async createRoutine(f: RoutineFields, preset: RoutinePreset | null = null, by: Actor = { kind: "owner" }): Promise<Result<WrittenRoutine>> {
     const s = this.settingsRow();
     if (!s) return fail(404, "unknown project");
     if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM routines").one().n >= MAX_ROUTINES) return fail(409, `a project holds at most ${MAX_ROUTINES} routines`);
+    if (preset !== null && this.sql.exec("SELECT 1 FROM routines WHERE preset = ?", preset).toArray().length > 0) {
+      return fail(409, `the project has the ${preset} preset already: change that routine instead`);
+    }
     const id = `rtn_${randomId()}`;
     const now = Date.now();
+    const tainted = preset === null && by.kind === "agent" && by.tainted ? 1 : 0;
     this.sql.exec(
       `INSERT INTO routines (id, name, kind, prompt, enabled, triggers, cooldown_min, max_minutes, max_turns, proposals, preset, timer_next_ms,
-        done_mark, merged_mark, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        done_mark, merged_mark, created_ms, updated_ms, source, name_tainted, prompt_tainted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       id, f.name, f.kind, f.prompt, f.enabled ? 1 : 0, JSON.stringify(f.triggers), f.cooldown_min, f.max_minutes, f.max_turns, f.proposals, preset,
       f.enabled && f.triggers.timer ? nextTimerFire(f.triggers.timer, now) : null, s.tasks_done_total, s.prs_merged_total, now, now,
+      sourceOf(by), tainted, tainted,
     );
     await this.arm();
     return ok(this.toRoutine(this.routineRow(id)!));
@@ -3877,9 +3907,11 @@ export class ProjectDO extends DurableObject<Env> {
   /**
    * Change a routine. A new timer counts from now; enabling it counts its counters from now (so a long
    * pause doesn't fire it at once); disabling it drops a due trigger (not the owner's "Run now") and its
-   * timer. A live run keeps going with what it started with.
+   * timer. A live run keeps going with what it started with. Its name's and prompt's taint: the owner's
+   * write of one makes it theirs (untainted); the manager's change of one takes its session's taint; one
+   * not changed keeps its own.
    */
-  async updateRoutine(id: string, u: Partial<RoutineFields>): Promise<Result<Routine>> {
+  async updateRoutine(id: string, u: Partial<RoutineFields>, by: Actor = { kind: "owner" }): Promise<Result<WrittenRoutine>> {
     const s = this.settingsRow();
     if (!s) return fail(404, "unknown project");
     const r = this.routineRow(id);
@@ -3890,14 +3922,17 @@ export class ProjectDO extends DurableObject<Env> {
       triggers: u.triggers ?? before.triggers, cooldown_min: u.cooldown_min ?? before.cooldown_min, max_minutes: u.max_minutes ?? before.max_minutes,
       max_turns: u.max_turns ?? before.max_turns, proposals: u.proposals ?? before.proposals,
     };
+    const taint = (k: "name" | "prompt", was: number) =>
+      by.kind !== "agent" ? (u[k] !== undefined ? 0 : was) : f[k] !== before[k] ? (by.tainted ? 1 : 0) : was;
     const now = Date.now();
     const timerChanged = JSON.stringify(f.triggers.timer) !== JSON.stringify(before.triggers.timer);
     const timerNext = !f.enabled || !f.triggers.timer ? null
       : timerChanged || !before.enabled || r.timer_next_ms === null ? nextTimerFire(f.triggers.timer, now) : (r.timer_next_ms as number);
     this.sql.exec(
       `UPDATE routines SET name = ?, kind = ?, prompt = ?, enabled = ?, triggers = ?, cooldown_min = ?, max_minutes = ?, max_turns = ?, proposals = ?,
-        timer_next_ms = ?, updated_ms = ? WHERE id = ?`,
-      f.name, f.kind, f.prompt, f.enabled ? 1 : 0, JSON.stringify(f.triggers), f.cooldown_min, f.max_minutes, f.max_turns, f.proposals, timerNext, now, id,
+        timer_next_ms = ?, updated_ms = ?, source = ?, name_tainted = ?, prompt_tainted = ? WHERE id = ?`,
+      f.name, f.kind, f.prompt, f.enabled ? 1 : 0, JSON.stringify(f.triggers), f.cooldown_min, f.max_minutes, f.max_turns, f.proposals, timerNext, now,
+      sourceOf(by), taint("name", r.name_tainted as number), taint("prompt", r.prompt_tainted as number), id,
     );
     if (f.enabled && !before.enabled) this.sql.exec("UPDATE routines SET done_mark = ?, merged_mark = ? WHERE id = ?", s.tasks_done_total, s.prs_merged_total, id);
     if (!f.enabled) this.sql.exec("UPDATE routines SET due = NULL, due_ms = NULL WHERE id = ? AND due != 'manual'", id);
@@ -3923,7 +3958,7 @@ export class ProjectDO extends DurableObject<Env> {
    * The owner's "Run now": due at once, skipping the cooldown but not the one-at-a-time rule or the
    * project's cap (it waits for a free place, shown as queued). Disabled routines may run too.
    */
-  async runRoutineNow(id: string): Promise<Result<Routine>> {
+  async runRoutineNow(id: string): Promise<Result<WrittenRoutine>> {
     if (!this.settings()) return fail(404, "unknown project");
     if (!this.routineRow(id)) return fail(404, "unknown routine");
     if (this.liveRuns(id) > 0) return fail(409, "the routine has a run going already");
@@ -4071,8 +4106,10 @@ export class ProjectDO extends DurableObject<Env> {
       const kind = routine.kind as RoutineKind;
       const extras = routineSpawnExtras({ kind, project: s.id, deadline_ms: deadline, last_start_ms: (routine.prev_start_ms as number | null) ?? null, now });
       // Its model as the settings have it now (README.md#models), beside the shared template's name (`runTemplate`).
-      this.sql.exec("UPDATE routine_runs SET spawn = ?, deadline_ms = ?, template = ?, model = ?, brief = ? WHERE id = ? AND spawn IS NULL",
-        JSON.stringify(extras), deadline, kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine, s.routine_model, briefOf(extras), id);
+      // With its taint: relayed if a tainted session wrote the routine's name or prompt (README.md#routines).
+      this.sql.exec("UPDATE routine_runs SET spawn = ?, deadline_ms = ?, template = ?, model = ?, brief = ?, brief_tainted = ? WHERE id = ? AND spawn IS NULL",
+        JSON.stringify(extras), deadline, kind === "dreaming" ? TEMPLATE.dreaming : TEMPLATE.routine, s.routine_model, briefOf(extras),
+        routine.name_tainted === 1 || routine.prompt_tainted === 1 ? 1 : 0, id);
     }
     const frozen = this.runRow(id)!;
     const spawn = JSON.parse(frozen.spawn as string) as Record<string, unknown>;
@@ -4111,7 +4148,9 @@ export class ProjectDO extends DurableObject<Env> {
       }
       // And its GitHub line (README.md#the-sandboxes-github-access), from its start's frozen spec: a dreaming run has none.
       const brief = ((frozen.brief as string | null) ?? briefOf(spawn)) + (this.frozenSpec(`${s.id}/routine/${id}`)?.brief ?? "");
-      await nest.postInbox(agent, brief, { requestId: `${id}/brief` });
+      // Frozen before briefs were (none in its row): the routine's text now, and its taint now.
+      const relayed = frozen.brief === null ? routine.name_tainted === 1 || routine.prompt_tainted === 1 : frozen.brief_tainted === 1;
+      await nest.postInbox(agent, brief, { requestId: `${id}/brief`, ...(relayed ? { from: "projects/board" } : {}) });
       if (!current()) return;
       // Its time budget counts from its first attempt (the deadline its grant expires at).
       this.sql.exec("UPDATE routine_runs SET state = 'running', started_ms = ?, next_ms = NULL, error = NULL WHERE id = ?", Date.now(), id);
@@ -4409,6 +4448,22 @@ export class ProjectDO extends DurableObject<Env> {
         }
         case "list_waits":
           return ok({ waits: this.pendingWaits() });
+        // The routines (README.md#routines), by the API's own bodies and methods: the same rules and refusals.
+        case "list_routines":
+          return this.routines();
+        case "create_routine": {
+          const b = CreateRoutine.safeParse(a);
+          if (!b.success) return fail(400, problems(b.error));
+          return "preset" in b.data ? this.createRoutine(PRESETS[b.data.preset], b.data.preset, actor) : this.createRoutine(b.data, null, actor);
+        }
+        case "update_routine": {
+          const { routine, ...fields } = a;
+          const b = UpdateRoutine.safeParse(fields);
+          if (!b.success) return fail(400, problems(b.error));
+          return this.updateRoutine(routine as string, b.data, actor);
+        }
+        case "delete_routine":
+          return this.deleteRoutine(a.routine as string);
       }
     }
     if (server === "task") {

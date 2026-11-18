@@ -12,7 +12,7 @@ import { NETWORK_ROLES, normalizeRules, type OperatorRule, operatorRules, OUTSID
 import { prNumberOf } from "./prs";
 import { attachableRepos, repoAttachable } from "./installations";
 import { outsideGrant, type SecretGrant, secretProblems, valueProblem } from "./secrets";
-import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, PutSecret, Settings as SettingsBody, Spec, UpdateRoutine, UpdateTask } from "./requests";
+import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, CreateProject, CreateRoutine, CreateTask, DeclineIssue, DeclineProposal, Network, problems, PutSecret, Settings as SettingsBody, Spec, UpdateRoutine, UpdateTask } from "./requests";
 import type { RepoBinding } from "./do/directory";
 import type { ProjectSettings, Settings } from "./do/project";
 import { githubFor, PERMISSIONS } from "./github";
@@ -81,7 +81,7 @@ async function body<S extends z.ZodType>(req: Request, schema: S): Promise<{ ok:
     return { ok: false, res: err(400, "the body isn't JSON") };
   }
   const r = schema.safeParse(raw);
-  return r.success ? { ok: true, value: r.data } : { ok: false, res: err(400, r.error.issues.map((i) => `${i.path.join(".") || "body"}: ${i.message}`).join("; ")) };
+  return r.success ? { ok: true, value: r.data } : { ok: false, res: err(400, problems(r.error)) };
 }
 
 /** Write the catalog for every project's repo, and remember that it did. */

@@ -406,7 +406,7 @@ describe("the catalog sync", () => {
     await api(token, "POST", "/api/admin/sync");
     const cap = (n: string) => fake.catalog.get(`capabilities/projects/${n}`) as { mcp: { url: string; tools: string[]; read_only: string[] } };
     for (const n of ["board", "task", "review", "routine"]) expect(cap(n).mcp.url).toBe(`${APP}/mcp/${n}`);
-    expect(cap("board").mcp.read_only.sort()).toEqual(["get_task", "list_tasks", "list_waits", "memory_get", "memory_list"]);
+    expect(cap("board").mcp.read_only.sort()).toEqual(["get_task", "list_routines", "list_tasks", "list_waits", "memory_get", "memory_list"]);
     // A routine's writes are proposals and memory: everything else it has only reads (README.md#routines).
     expect(cap("routine").mcp.tools.filter((t) => !cap("routine").mcp.read_only.includes(t)).sort()).toEqual(["memory_delete", "memory_write", "propose_task"]);
     const tmpl = (n: string) => fake.catalog.get(`templates/projects/${n}`) as { capabilities: string[]; hands: string; credential: string };

@@ -241,6 +241,9 @@ describe("who is set", () => {
         // And the reviewers' and routine runs' models' step (README.md#models).
         for (const c of ["reviewer_model", "routine_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
         sql.exec("ALTER TABLE routine_runs DROP COLUMN model");
+        // And the routines' writers' step (README.md#routines).
+        for (const c of ["source", "name_tainted", "prompt_tainted"]) sql.exec(`ALTER TABLE routines DROP COLUMN ${c}`);
+        sql.exec("ALTER TABLE routine_runs DROP COLUMN brief_tainted");
         sql.exec("UPDATE schema_version SET v = ?", step);
         migrate(st.storage, MIGRATIONS);
         return sql.exec("SELECT comments_default_id AS d FROM settings").one().d;
@@ -271,6 +274,9 @@ describe("who is set", () => {
       // And the reviewers' and routine runs' models' step (README.md#models).
       for (const c of ["reviewer_model", "routine_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("ALTER TABLE routine_runs DROP COLUMN model");
+      // And the routines' writers' step (README.md#routines).
+      for (const c of ["source", "name_tainted", "prompt_tainted"]) sql.exec(`ALTER TABLE routines DROP COLUMN ${c}`);
+      sql.exec("ALTER TABLE routine_runs DROP COLUMN brief_tainted");
       sql.exec("UPDATE settings SET repo_owner_id = 55501, repo_owner_login = 'interim'");
       sql.exec("UPDATE schema_version SET v = ?", step);
       migrate(st.storage, MIGRATIONS);
