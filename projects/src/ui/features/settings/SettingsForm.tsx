@@ -17,13 +17,11 @@ import type { Settings } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { FieldGroup, MetaItem, Notice, Panel, Row, Section, SectionGrid, Stack, Toolbar, weight } from "../../layout";
 import { MERGE_METHODS, type MergeMethod, type RepoAutoMerge } from "../../../automerge";
-import { MODELS, modelLabel, modelProblem } from "../../../models";
+import { DEFAULT_MODEL, MODELS, modelLabel, modelProblem } from "../../../models";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { type RefObject, useEffect, useRef, useState } from "react";
 
 const CUSTOM = "custom";
-/** The Select's value for no model of the project's: Claude Code's own default (null in the settings). */
-const DEFAULT = "default";
 
 /** A pending switch of the running manager, in words: "Running Fable 5.2; switches to Sonnet 5.5 after this turn." */
 export function switchText(s: { from: string | null; to: string; after_turn: boolean }): string {
@@ -34,34 +32,25 @@ export function switchText(s: { from: string | null; to: string; after_turn: boo
 
 /**
  * A role's model (README.md#models): one of the listed ones, or "Custom" and the id typed. A value that
- * isn't listed shows as Custom with its id. With `unset` (the reviewers' and the routines'), Claude Code's
- * own default comes first, as null.
+ * isn't listed shows as Custom with its id.
  */
-export function ModelField<V extends string | null>({ label, description, value, onChange, error, unset }: {
-  label: string; description: string; value: V; onChange: (v: V | string) => void; error?: React.ReactNode; unset?: V extends null ? true : never;
-}) {
-  const listed = value === null || MODELS.some((m) => m.id === value);
+export function ModelField({ label, description, value, onChange, error }: { label: string; description: string; value: string; onChange: (v: string) => void; error?: React.ReactNode }) {
+  const listed = MODELS.some((m) => m.id === value);
   const [custom, setCustom] = useState(!listed);
-  const problem = custom ? modelProblem(value ?? "") : null;
+  const problem = custom ? modelProblem(value) : null;
   // The id field close under its own dropdown (proximity), the fields apart at the group's gap.
   return (
     <Stack gap="sm">
       <Select
         label={label}
         description={description}
-        data={[
-          ...(unset ? [{ value: DEFAULT, label: "Claude Code's default" }] : []),
-          ...MODELS.map((m) => ({ value: m.id, label: m.label })), { value: CUSTOM, label: "Custom…" },
-        ]}
+        data={[...MODELS.map((m) => ({ value: m.id, label: m.label })), { value: CUSTOM, label: "Custom…" }]}
         allowDeselect={false}
-        value={custom ? CUSTOM : (value ?? DEFAULT)}
+        value={custom ? CUSTOM : value}
         onChange={(v) => {
           if (v === null) return;
           setCustom(v === CUSTOM);
-          if (v === DEFAULT) onChange(null as V);
-          else if (v !== CUSTOM) onChange(v);
-          // From the default, an empty id to type (there's no id to start from).
-          else if (value === null) onChange("");
+          if (v !== CUSTOM) onChange(v);
         }}
         error={custom ? undefined : error}
       />
@@ -72,7 +61,7 @@ export function ModelField<V extends string | null>({ label, description, value,
           description="An id or alias Claude Code's --model takes, such as claude-opus-5-5."
           // The id in the mono face (an identifier, read character by character); its label and help stay as they are.
           styles={{ input: { fontFamily: "var(--mantine-font-family-monospace)" } }}
-          value={value ?? ""}
+          value={value}
           onChange={(e) => onChange(e.currentTarget.value.trim())}
           error={value && problem ? `A model id is ${problem}` : error}
         />
@@ -86,8 +75,8 @@ const METHOD_LABEL: Record<MergeMethod, string> = { squash: "Squash and merge", 
 const values = (s: Settings) => ({
   auto_assign: s.auto_assign, max_workers: s.max_workers, auto_merge: s.auto_merge, merge_method: s.merge_method, workers_edit_workflows: s.workers_edit_workflows,
   manager_model: s.manager_model, worker_model: s.worker_model,
-  // One a server leaves out (a release before them) reads as Claude Code's default, as the server's own null.
-  reviewer_model: s.reviewer_model ?? null, routine_model: s.routine_model ?? null, issues_from: s.issues_from,
+  // One a server leaves out (a release before them) reads as the default, as the server's own unset one does.
+  reviewer_model: s.reviewer_model ?? DEFAULT_MODEL.reviewer, routine_model: s.routine_model ?? DEFAULT_MODEL.routine, issues_from: s.issues_from,
   comments_from_login: s.comments_from?.login ?? null,
   // "Use the repo owner": the server takes the repo's owner by id, never this login.
   comments_from_repo_owner: false,
@@ -203,7 +192,6 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                   error={form.errors.worker_model}
                 />
                 <ModelField
-                  unset
                   label="Reviewers' model"
                   description="A change applies to reviews started from now on; running ones keep theirs."
                   value={form.getValues().reviewer_model}
@@ -211,7 +199,6 @@ export function SettingsForm({ projectId, settings, onDone }: { projectId: strin
                   error={form.errors.reviewer_model}
                 />
                 <ModelField
-                  unset
                   label="Routines' model"
                   description="For every routine run, including dreaming runs. A change applies to runs started from now on."
                   value={form.getValues().routine_model}
