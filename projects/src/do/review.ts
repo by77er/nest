@@ -411,7 +411,7 @@ export class ReviewDO extends DurableObject<Env> {
     if (!before) return fail(404, "unknown reviewer");
     const may = by.source === "manager" ? mayChangeReviewer(before, by) : null;
     if (may && !may.ok) return fail(403, may.error);
-    if (!this.sql.exec("DELETE FROM reviewers WHERE id = ?", id).rowsWritten) return fail(404, "unknown reviewer");
+    this.sql.exec("DELETE FROM reviewers WHERE id = ?", id);
     return ok({ deleted: id });
   }
 
