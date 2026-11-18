@@ -246,7 +246,7 @@ describe("the models in the settings", () => {
     expect(dialog).not.toHaveTextContent("cut and redone");
     expect(dialog.querySelector("[data-slot=manager-switch]")).toBeNull();
     expect(dialog).toHaveTextContent("workers started from now on; running ones keep theirs");
-    expect(dialog).toHaveTextContent("Reviewers and routine runs keep nest's default model.");
+    expect(dialog).not.toHaveTextContent("Reviewers and routine runs keep nest's default model.");
     await user.click(select(dialog, "Workers' model"));
     await user.click(await screen.findByRole("option", { name: "Sonnet 5.5" }));
     await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
@@ -279,5 +279,70 @@ describe("the models in the settings", () => {
     expect(select(dialog, "Workers' model")).toHaveValue("Custom…");
     expect(within(dialog).getByLabelText("Workers' model: model id")).toHaveValue("my-org-model-v2");
     expect(within(dialog).queryByLabelText("Manager's model: model id")).toBeNull();
+  });
+
+  it("the reviewers' and the routines' start on Claude Code's default, which the manager's and the workers' don't offer", async () => {
+    const api = new FakeApi();
+    const { user, dialog } = await openSettings(api);
+    expect(select(dialog, "Reviewers' model")).toHaveValue("Claude Code's default");
+    expect(select(dialog, "Routines' model")).toHaveValue("Claude Code's default");
+    expect(dialog).toHaveTextContent("A change applies to reviews started from now on; running ones keep theirs.");
+    expect(dialog).toHaveTextContent("For every routine run, dreaming too. A change applies to runs started from now on.");
+    for (const label of ["Manager's model", "Workers' model"]) {
+      await user.click(select(dialog, label));
+      const options = (await screen.findAllByRole("option")).map((o) => o.textContent);
+      expect(options, label).toEqual(["Fable 5.2", "Opus 5.5", "Sonnet 5.5", "Haiku 5.5", "Custom…"]);
+      await user.keyboard("{Escape}");
+    }
+    await user.click(select(dialog, "Reviewers' model"));
+    expect((await screen.findAllByRole("option")).map((o) => o.textContent)).toEqual(["Claude Code's default", "Fable 5.2", "Opus 5.5", "Sonnet 5.5", "Haiku 5.5", "Custom…"]);
+    await user.keyboard("{Escape}");
+    // Untouched, each is sent as the form has it: null.
+    await user.click(select(dialog, "Workers' model"));
+    await user.click(await screen.findByRole("option", { name: "Sonnet 5.5" }));
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    await waitFor(() => expect(api.writes).toHaveLength(1));
+    expect(api.writes[0]!.body).toMatchObject({ reviewer_model: null, routine_model: null });
+  });
+
+  it("sends a listed model, a custom id, and the default again as null", async () => {
+    const api = new FakeApi();
+    const { user, dialog } = await openSettings(api);
+    const save = async (n: number) => {
+      await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+      await waitFor(() => expect(api.writes).toHaveLength(n));
+      return api.writes[n - 1]!.body;
+    };
+    await user.click(select(dialog, "Reviewers' model"));
+    await user.click(await screen.findByRole("option", { name: "Haiku 5.5" }));
+    expect(await save(1)).toMatchObject({ reviewer_model: "claude-haiku-5-5", routine_model: null });
+    // From the default, Custom starts empty, and an empty id isn't saved.
+    await user.click(select(dialog, "Routines' model"));
+    await user.click(await screen.findByRole("option", { name: "Custom…" }));
+    const id = within(dialog).getByLabelText("Routines' model: model id");
+    expect(id).toHaveValue("");
+    await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
+    expect(api.writes).toHaveLength(1);
+    await user.type(id, "--bad");
+    expect(dialog).toHaveTextContent("A model id is letters, digits");
+    await user.clear(id);
+    await user.type(id, "my-org-model-v2");
+    expect(await save(2)).toMatchObject({ reviewer_model: "claude-haiku-5-5", routine_model: "my-org-model-v2" });
+    await user.click(select(dialog, "Reviewers' model"));
+    await user.click(await screen.findByRole("option", { name: "Claude Code's default" }));
+    await user.click(select(dialog, "Routines' model"));
+    await user.click(await screen.findByRole("option", { name: "Claude Code's default" }));
+    expect(within(dialog).queryByLabelText("Routines' model: model id")).toBeNull();
+    expect(await save(3)).toMatchObject({ reviewer_model: null, routine_model: null });
+  });
+
+  it("an unlisted reviewers' or routines' model shows as Custom with its id", async () => {
+    const api = new FakeApi();
+    api.projects[0]!.settings.routine_model = "us.anthropic.claude-haiku-5-5";
+    api.projects[0]!.settings.reviewer_model = "claude-sonnet-5-5";
+    const { dialog } = await openSettings(api);
+    expect(select(dialog, "Reviewers' model")).toHaveValue("Sonnet 5.5");
+    expect(select(dialog, "Routines' model")).toHaveValue("Custom…");
+    expect(within(dialog).getByLabelText("Routines' model: model id")).toHaveValue("us.anthropic.claude-haiku-5-5");
   });
 });
