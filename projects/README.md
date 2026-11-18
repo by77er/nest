@@ -470,7 +470,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 
 ## Reviewers
 
-**Code:** `src/reviewers.ts` (the rules, the limit, the built-in preset; pure), `src/requests.ts` (the bodies), ReviewDO (the table, the runs). Tests: `test/project-reviewers.test.ts`. Decided 2026-11-18 (the owner's request: "I need a way to configure reviewers per project").
+**Code:** `src/reviewers.ts` (the limit, the built-in preset, freezing; pure), `src/requests.ts` (the bodies, with the fields' bounds and the dimensions' rule, there so the page may check them too), ReviewDO (the table, the runs). Tests: `test/project-reviewers.test.ts`. Decided 2026-11-18 (the owner's request: "I need a way to configure reviewers per project").
 
 - **A reviewer** is a name (1 to 80 characters), its instructions (what it judges and how, 1 to 8000), its dimensions (1 to 6 names of up to 60 characters, different without case, each judged pass or fail) and whether it's enabled. It records who last wrote it (`source`: `owner` or `manager`) and `tainted` (a tainted session last wrote its text); the owner's API writes `owner`, untainted. At most 8 per project (`MAX_REVIEWERS`), kept in ReviewDO.
 - **The default:** the built-in "Code review" (Correctness, Quality and Architectural cohesiveness), enabled. ReviewDO's migration seeds it once: a project of the release before at its first use, a new one at init. Deleted, it stays deleted; `{preset: "code"}` adds it back, once (its id is `code-review`).

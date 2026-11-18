@@ -5,7 +5,6 @@ import { z } from "zod";
 import { ISSUES_FROM } from "./issues";
 import { MODEL_ID } from "./models";
 import { MERGE_METHODS } from "./automerge";
-import { dimensionsProblem, REVIEWER_LIMITS as RL, REVIEWER_PRESETS, type ReviewerPreset } from "./reviewers";
 
 /** A GitHub repo, `owner/name`. */
 /** `POST /api/admin/bindings/<project>/bind`: the repo id a re-read showed, which the operator chose. */
@@ -138,6 +137,25 @@ export const CreateRoutine = z.union([z.strictObject({ preset: z.enum(ROUTINE_PR
 export const UpdateRoutine = z.strictObject(Object.fromEntries(Object.entries(RoutineFields).map(([k, v]) => [k, v.optional()])) as {
   [K in keyof typeof RoutineFields]: z.ZodOptional<(typeof RoutineFields)[K]>;
 });
+/**
+ * A reviewer's field bounds (characters; dimensions by count) and its dimensions' rule, here as routines' are, so the
+ * page checks them too (src/reviewers.ts, the reviewers' module, re-exports them; the page may import only this one).
+ */
+export const REVIEWER_LIMITS = { name: 80, instructions: 8000, dimensions: 6, dimension: 60 } as const;
+/** Why a reviewer's dimensions can't be, or null: names unique without case (and surrounding spaces). */
+export function dimensionsProblem(dimensions: readonly string[]): string | null {
+  const seen = new Set<string>();
+  for (const d of dimensions) {
+    const k = d.trim().toLowerCase();
+    if (seen.has(k)) return `dimension names must differ, case aside: ${JSON.stringify(d.trim())} is there twice`;
+    seen.add(k);
+  }
+  return null;
+}
+/** The presets a reviewer can be added from: `code`, the built-in "Code review" (src/reviewers.ts). */
+export const REVIEWER_PRESETS = ["code"] as const;
+export type ReviewerPreset = (typeof REVIEWER_PRESETS)[number];
+const RL = REVIEWER_LIMITS;
 /** A project's reviewer (README.md#reviewers): what it judges (its dimensions) and how (its instructions). */
 const ReviewerFields = {
   name: z.string().trim().min(1).max(RL.name).describe(`The reviewer's name (at most ${RL.name} characters).`),
@@ -150,9 +168,8 @@ const ReviewerFields = {
     .describe(`What it gives a verdict on, pass or fail each: 1 to ${RL.dimensions} names of at most ${RL.dimension} characters, different without case.`),
   enabled: z.boolean().describe("Whether it reviews PR heads: each enabled reviewer reviews every head, one after another."),
 };
-const REVIEWER_PRESET_NAMES = Object.keys(REVIEWER_PRESETS) as [ReviewerPreset, ...ReviewerPreset[]];
 /** A new reviewer: a preset alone (the built-in "Code review", once) or every field. */
-export const ReviewerFromPreset = z.strictObject({ preset: z.enum(REVIEWER_PRESET_NAMES) });
+export const ReviewerFromPreset = z.strictObject({ preset: z.enum(REVIEWER_PRESETS) });
 export const NewReviewer = z.strictObject(ReviewerFields);
 export const CreateReviewer = z.union([ReviewerFromPreset, NewReviewer]);
 export const UpdateReviewer = z.strictObject(Object.fromEntries(Object.entries(ReviewerFields).map(([k, v]) => [k, v.optional()])) as {

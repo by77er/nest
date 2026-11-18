@@ -7,7 +7,10 @@
 // still written with those keys besides (`storedVerdict`), so that release reads what this one writes; and a
 // reviewer started under it submits in that form, accepted and converted (`legacySubmit`).
 
+import { type ReviewerPreset } from "./requests";
 import { invalid } from "./schema";
+
+export { dimensionsProblem, REVIEWER_LIMITS } from "./requests";
 
 /** A reviewer: what it judges (its dimensions, one verdict each) and how (its instructions). */
 export interface Reviewer {
@@ -29,9 +32,8 @@ export const CODE_REVIEW: Reviewer = {
 
 // --- a project's reviewers -------------------------------------------------------------------------------
 
-/** Reviewers a project holds, and each field's bounds (characters; dimensions by count). */
+/** Reviewers a project holds. Each field's bounds and the dimensions' rule: `REVIEWER_LIMITS`, `dimensionsProblem`. */
 export const MAX_REVIEWERS = 8;
-export const REVIEWER_LIMITS = { name: 80, instructions: 8000, dimensions: 6, dimension: 60 } as const;
 
 /** Who last wrote a reviewer: the owner (the API) or the manager (its tools). */
 export type ReviewerSource = "owner" | "manager";
@@ -57,19 +59,8 @@ export interface FrozenReviewer extends Reviewer {
   tainted: boolean;
 }
 
-/** The presets `POST …/reviewers {preset}` adds, each once, under its own id. */
-export const REVIEWER_PRESETS = { code: CODE_REVIEW } as const satisfies Record<string, Reviewer>;
-export type ReviewerPreset = keyof typeof REVIEWER_PRESETS;
-
-/** Why a reviewer's dimensions can't be, or null: names unique without case (and surrounding spaces). */
-export function dimensionsProblem(dimensions: readonly string[]): string | null {
-  const seen = new Set<string>();
-  for (const d of dimensions) {
-    if (seen.has(key(d))) return `dimension names must differ, case aside: ${JSON.stringify(d.trim())} is there twice`;
-    seen.add(key(d));
-  }
-  return null;
-}
+/** The reviewers `POST …/reviewers {preset}` adds, each once, under its own id. */
+export const PRESET_REVIEWERS: Record<ReviewerPreset, Reviewer> = { code: CODE_REVIEW };
 
 /** The reviewers a job runs, of a project's: the enabled ones in creation order, as they are now. */
 export const freeze = (rs: readonly ProjectReviewer[]): FrozenReviewer[] =>

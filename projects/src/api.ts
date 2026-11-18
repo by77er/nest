@@ -16,7 +16,7 @@ import { AcceptIssue, AddDependency, Answer, AttachPr, BindRepo, Cancel, Chat, C
 import type { RepoBinding } from "./do/directory";
 import type { ProjectSettings, Settings } from "./do/project";
 import { githubFor, PERMISSIONS } from "./github";
-import { legacyView, REVIEWER_PRESETS } from "./reviewers";
+import { legacyView, PRESET_REVIEWERS } from "./reviewers";
 import { PRESETS } from "./routines";
 import type { UntrustedPolicy } from "./review-trust";
 import type { Result } from "./sql";
@@ -438,7 +438,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
       if (preset) {
         const b = await body(req, ReviewerFromPreset);
         if (!b.ok) return b.res;
-        const rv = REVIEWER_PRESETS[b.value.preset];
+        const rv = PRESET_REVIEWERS[b.value.preset];
         return done(await review(env, pid).createReviewer({ ...rv, dimensions: [...rv.dimensions], enabled: true }, { preset: rv }), 201);
       }
       const b = await body(req, NewReviewer);
