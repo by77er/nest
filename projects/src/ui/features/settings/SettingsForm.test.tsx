@@ -297,12 +297,14 @@ describe("the models in the settings", () => {
     await user.click(select(dialog, "Reviewers' model"));
     expect((await screen.findAllByRole("option")).map((o) => o.textContent)).toEqual(["Claude Code's default", "Fable 5.2", "Opus 5.5", "Sonnet 5.5", "Haiku 5.5", "Custom…"]);
     await user.keyboard("{Escape}");
-    // Untouched, each is sent as the form has it: null.
+    // Untouched, neither is sent.
     await user.click(select(dialog, "Workers' model"));
     await user.click(await screen.findByRole("option", { name: "Sonnet 5.5" }));
     await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
     await waitFor(() => expect(api.writes).toHaveLength(1));
-    expect(api.writes[0]!.body).toMatchObject({ reviewer_model: null, routine_model: null });
+    expect(api.writes[0]!.body).toMatchObject({ worker_model: "claude-sonnet-5-5" });
+    expect(api.writes[0]!.body).not.toHaveProperty("reviewer_model");
+    expect(api.writes[0]!.body).not.toHaveProperty("routine_model");
   });
 
   it("sends a listed model, a custom id, and the default again as null", async () => {
@@ -348,7 +350,9 @@ describe("the models in the settings", () => {
     await user.click(await screen.findByRole("option", { name: "Sonnet 5.5" }));
     await user.click(within(dialog).getByRole("button", { name: "Save settings" }));
     await waitFor(() => expect(api.writes).toHaveLength(1));
-    expect(api.writes[0]!.body).toMatchObject({ reviewer_model: null, routine_model: null });
+    expect(api.writes[0]!.body).toMatchObject({ worker_model: "claude-sonnet-5-5" });
+    expect(api.writes[0]!.body).not.toHaveProperty("reviewer_model");
+    expect(api.writes[0]!.body).not.toHaveProperty("routine_model");
   });
 
   it("an unlisted reviewers' or routines' model shows as Custom with its id", async () => {
