@@ -1004,8 +1004,13 @@ describe("a project's models", () => {
       // The attempt's retry writes the template again meanwhile.
       fake.failures = [];
       await runInDurableObject(reviews, (_o, st) => { st.storage.sql.exec("UPDATE jobs SET next_ms = 0 WHERE next_ms IS NOT NULL"); });
+      const recorded = () => runInDurableObject(stub(p), (_o, st) => st.storage.sql.exec("SELECT at_ms FROM model_templates WHERE name = ?", haiku).one().at_ms as number);
+      const before = await recorded();
       const reviewing = reviews.drain();
-      await new Promise((r) => setTimeout(r, 200));
+      // Once the retry has recorded the template (its write next), the write has room to go out early; it mustn't.
+      for (let i = 0; i < 400 && (await recorded()) === before; i++) await new Promise((r) => setTimeout(r, 5));
+      expect(await recorded()).not.toBe(before);
+      await new Promise((r) => setTimeout(r, 50));
       release();
       await Promise.all([sweeping, reviewing]);
       const [reviewer] = reviewersOf(p);
