@@ -503,6 +503,10 @@ const reviewerLine = (r: Review) => `Reviewer: ${r.agent}. Tainted: ${r.tainted 
 const failedNames = (r: Review) => r.dimensions.filter((d) => d.verdict !== "pass").map((d) => d.name.toLowerCase()).join(", ");
 const dimensionSections = (r: Review) => r.dimensions.map((d) => `## ${d.name}: ${d.verdict}\n\n${d.notes}`);
 
+/** Several reviews as a check's text: a section each, with its dimensions, its reviewer agent and its taint. */
+export const reviewsText = (reviews: readonly Review[]): string =>
+  reviews.map((r) => [`# ${r.reviewer.name}: ${reviewPassed(r) ? "passed" : "failed"}`, ...dimensionSections(r), reviewerLine(r)].join("\n\n")).join("\n\n---\n\n");
+
 /**
  * The conclusion and output a verdict completes its check with: success only if every dimension of every
  * review passes. The built-in reviewer alone reads as it always has (the title names the failed dimensions,
@@ -523,7 +527,7 @@ export function verdictCheck(v: Verdict): { conclusion: "success" | "failure"; o
       : failed.length ? `Review failed: ${failed.map((r) => `${r.reviewer.name} (${failedNames(r) || "nothing judged"})`).join("; ")}`
       : "Review failed: no review";
     summary = v.reviews.map((r) => `**${r.reviewer.name}** (${reviewPassed(r) ? "passed" : "failed"}): ${r.summary || "(no summary)"}`).join("\n\n") || "(no review)";
-    text = v.reviews.map((r) => [`# ${r.reviewer.name}: ${reviewPassed(r) ? "passed" : "failed"}`, ...dimensionSections(r), reviewerLine(r)].join("\n\n")).join("\n\n---\n\n");
+    text = reviewsText(v.reviews);
   }
   return { conclusion, output: { title: clip(title, TITLE_MAX), summary: clip(summary, OUTPUT_MAX), text: clip(text, OUTPUT_MAX) } };
 }

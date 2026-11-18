@@ -10,6 +10,9 @@
 // `failed` (no verdict after retries, or refused for good), `superseded` (a newer head) or `closed` (the PR
 // closed). Each end owes GitHub its check's completion, once, and nest the reviewer's stop.
 //
+// The project's reviewers are kept here too (README.md#reviewers): a job freezes the enabled ones when it
+// starts and runs them one after another, one agent at a time, under the one check.
+//
 // A PR the project doesn't trust (src/review-trust.ts) starts `held` instead: its check says the owner
 // must approve the review, and nothing else happens (no agent, no sandbox, none of its text to anyone)
 // until the owner approves that head commit, or dismisses it (`dismissed`).
@@ -17,7 +20,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { roleTemplate, TEMPLATE, writeSharedTemplate } from "../catalog";
 import { directory, type Env, project as projectStub } from "../env";
-import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, verdictCheck } from "../github";
+import { clip, type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, OUTPUT_MAX, PERMISSIONS, reviewsText, verdictCheck } from "../github";
 import type { AgentCaller } from "../identity";
 import { atCapacity, backoff, HOSTS_WAIT, NestError, nestFrom, type Nest, stopRefused } from "../nest";
 import { spawnOverrides, startEgress } from "../github-access";
@@ -25,7 +28,11 @@ import { OUTBOX, type OutboxPolicy, type OutboxRow, outboxStep } from "../outbox
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { toolOf } from "../tools";
-import { CODE_REVIEW, legacySubmit, parseVerdict, type Reviewer, reviewOf, storedVerdict, type Submitted, type Verdict } from "../reviewers";
+import {
+  CODE_REVIEW, dimensionsProblem, freeze, type FrozenReviewer, frozenOf, legacySubmit, MAX_REVIEWERS, parseVerdict, type ProjectReviewer, type Review,
+  type Reviewer, type ReviewerFields, type ReviewerSource, reviewOf, reviewPassed, storedVerdict, type Submitted, type Verdict,
+} from "../reviewers";
+import { randomId } from "./directory";
 import { EARLY_EXITS_KEEP_MS, PRUNE_EVERY_MS, REVIEW_JOBS_KEEP_MS } from "../retention";
 import { type JobEvent, type JobState, jobTransition, REVIEW_DEADLINE_MS } from "../review-job";
 import { HELD_CHECK_INTERVAL_MS, MAX_HELD, MAX_OVERFLOW, type PrOrigin, reviewDecision, type TrustedIds, trustedAuthor, type UntrustedPolicy } from "../review-trust";
@@ -40,6 +47,12 @@ export const MAX_RETRIES = 2;
  * until the check is re-run, as `neutral` would not.
  */
 export const NO_VERDICT: Conclusion = "action_required";
+/**
+ * A job with no reviewer enabled when it started: `neutral`, which a required check accepts as passing
+ * ("Required status checks must have a successful, skipped, or neutral status", GitHub's "About protected
+ * branches"). The owner's way to turn reviews off.
+ */
+export const NO_REVIEWER: Conclusion = "neutral";
 /** A superseded or closed job's check: `cancelled`, which isn't passing either. */
 export const ENDED: Conclusion = "cancelled";
 /** A review waiting this long for room in nest is told to the project, among its errors (`roomUpkeep`). */
@@ -58,7 +71,7 @@ export interface Job {
   verdict: Verdict | null;
   /** Whether the session that submitted the verdict was tainted. */
   tainted: boolean | null;
-  /** Reviewers that exited without a verdict since the job was last queued. */
+  /** The current reviewer's agents that ended without a verdict (each reviewer has its own). */
   attempts: number;
   /** Reviewers started for the job, ever: each start's idempotency keys carry it. */
   runs: number;
@@ -70,6 +83,12 @@ export interface Job {
   fork: boolean;
   /** When the owner approved this head commit's review; null for one that needed no approval, or has none. */
   approved_ms: number | null;
+  /** The reviewers it runs, frozen when it started (README.md#running-the-reviewers); null before it starts. None: no reviewer was enabled. */
+  reviewers: FrozenReviewer[] | null;
+  /** Which of them is at work (0-based), while running. */
+  step: number;
+  /** The reviews given so far, in order: all of them once done; those given before it failed. */
+  reviews: Review[];
   created_ms: number;
   updated_ms: number;
 }
@@ -93,7 +112,12 @@ export interface ReviewOf {
   repo: string;
 }
 
-const MIGRATIONS = [
+/** A string as an SQL literal (the seed's, in a migration step's text). */
+function quote(s: string): string {
+  return `'${s.replaceAll("'", "''")}'`;
+}
+
+export const MIGRATIONS: readonly (readonly string[])[] = [
   [
     `CREATE TABLE jobs (pr INTEGER NOT NULL, sha TEXT NOT NULL, state TEXT NOT NULL, agent TEXT, check_run INTEGER, verdict TEXT,
       attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, PRIMARY KEY (pr, sha))`,
@@ -168,7 +192,21 @@ const MIGRATIONS = [
     "ALTER TABLE jobs ADD COLUMN room_next_ms INTEGER",
     "ALTER TABLE jobs ADD COLUMN room_attempts INTEGER NOT NULL DEFAULT 0",
   ],
-] as const;
+  [
+    // The project's reviewers (README.md#reviewers), seeded with the built-in "Code review" in this step, so
+    // once: a project of the release before gets it at its first use, a new one at init, and one deleted stays so.
+    `CREATE TABLE reviewers (id TEXT PRIMARY KEY, name TEXT NOT NULL, instructions TEXT NOT NULL, dimensions TEXT NOT NULL, enabled INTEGER NOT NULL,
+      source TEXT NOT NULL, tainted INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL)`,
+    `INSERT INTO reviewers (id, name, instructions, dimensions, enabled, source, tainted, created_ms, updated_ms)
+      VALUES (${quote(CODE_REVIEW.id)}, ${quote(CODE_REVIEW.name)}, ${quote(CODE_REVIEW.instructions)}, ${quote(JSON.stringify(CODE_REVIEW.dimensions))}, 1, 'owner', 0,
+        CAST(strftime('%s', 'now') AS INTEGER) * 1000, CAST(strftime('%s', 'now') AS INTEGER) * 1000)`,
+    // A job's reviewers, frozen when it starts (null: not started since; one the release before started runs the
+    // built-in alone), which of them is at work, and the reviews given so far (JSON).
+    "ALTER TABLE jobs ADD COLUMN reviewers TEXT",
+    "ALTER TABLE jobs ADD COLUMN step INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN reviews TEXT",
+  ],
+];
 
 /** `next_ms` for a row that's kept but never due (its column can't be null): a failed stop. */
 const NOT_DUE_MS = 253_402_300_799_000;
@@ -290,8 +328,72 @@ export class ReviewDO extends DurableObject<Env> {
       attempts: r.attempts as number, runs: r.runs as number, error: (r.error as string | null) ?? null,
       deadline_ms: r.state === "running" ? ((r.deadline_ms as number | null) ?? null) : null,
       author: (r.author as string | null) ?? null, fork: r.fork === 1, approved_ms: (r.approved_ms as number | null) ?? null,
+      reviewers: r.reviewers === null && r.state !== "running" ? null : frozenOf((r.reviewers as string | null) ?? null),
+      step: (r.step as number | null) ?? 0, reviews: reviewsOf(r),
       created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     };
+  }
+
+  // --- the project's reviewers (README.md#reviewers) -------------------------------------------------
+
+  private reviewerRow(id: string): ProjectReviewer | null {
+    const r = this.sql.exec("SELECT * FROM reviewers WHERE id = ?", id).toArray()[0];
+    return r ? reviewerOf(r) : null;
+  }
+
+  /** In creation order: the order a job runs the enabled ones in. */
+  private reviewerRows(): ProjectReviewer[] {
+    return this.sql.exec("SELECT * FROM reviewers ORDER BY created_ms, rowid").toArray().map(reviewerOf);
+  }
+
+  async reviewers(): Promise<ProjectReviewer[]> {
+    return this.reviewerRows();
+  }
+
+  async getReviewer(id: string): Promise<Result<ProjectReviewer>> {
+    const r = this.reviewerRow(id);
+    return r ? ok(r) : fail(404, "unknown reviewer");
+  }
+
+  /**
+   * A new reviewer, last in the order: the writer's fields, or a preset's (under its own id, so once). At most
+   * MAX_REVIEWERS. Jobs already started keep the reviewers they froze.
+   */
+  async createReviewer(f: ReviewerFields, o: { preset?: Reviewer; by?: Writer } = {}): Promise<Result<ProjectReviewer>> {
+    const by = o.by ?? OWNER;
+    const bad = dimensionsProblem(f.dimensions);
+    if (bad) return fail(400, bad);
+    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM reviewers").one().n >= MAX_REVIEWERS) return fail(409, `a project holds at most ${MAX_REVIEWERS} reviewers`);
+    const id = o.preset?.id ?? `rvw_${randomId().toLowerCase()}`;
+    if (this.reviewerRow(id)) return fail(409, `the project has the reviewer "${o.preset?.name ?? id}" already: change that one instead`);
+    const now = Date.now();
+    this.sql.exec(
+      "INSERT INTO reviewers (id, name, instructions, dimensions, enabled, source, tainted, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      id, f.name, f.instructions, JSON.stringify(f.dimensions), f.enabled ? 1 : 0, by.source, by.tainted ? 1 : 0, now, now,
+    );
+    return ok(this.reviewerRow(id)!);
+  }
+
+  /** Change a reviewer: only jobs that start later (and re-runs) see it. Disabling the last enabled one is allowed. */
+  async updateReviewer(id: string, u: Partial<ReviewerFields>, by: Writer = OWNER): Promise<Result<ProjectReviewer>> {
+    const before = this.reviewerRow(id);
+    if (!before) return fail(404, "unknown reviewer");
+    const f: ReviewerFields = {
+      name: u.name ?? before.name, instructions: u.instructions ?? before.instructions, dimensions: u.dimensions ?? before.dimensions, enabled: u.enabled ?? before.enabled,
+    };
+    const bad = dimensionsProblem(f.dimensions);
+    if (bad) return fail(400, bad);
+    this.sql.exec(
+      "UPDATE reviewers SET name = ?, instructions = ?, dimensions = ?, enabled = ?, source = ?, tainted = ?, updated_ms = ? WHERE id = ?",
+      f.name, f.instructions, JSON.stringify(f.dimensions), f.enabled ? 1 : 0, by.source, by.tainted ? 1 : 0, Date.now(), id,
+    );
+    return ok(this.reviewerRow(id)!);
+  }
+
+  /** Delete a reviewer, the last one included: a job running it keeps its frozen copy. */
+  async deleteReviewer(id: string): Promise<Result<{ deleted: string }>> {
+    if (!this.sql.exec("DELETE FROM reviewers WHERE id = ?", id).rowsWritten) return fail(404, "unknown reviewer");
+    return ok({ deleted: id });
   }
 
   /** The queue's jobs, newest first. */
@@ -519,7 +621,7 @@ export class ReviewDO extends DurableObject<Env> {
     return moved ? t.to : null;
   }
 
-  /** Queue an ended job again from scratch: a new check run, new reviewers, no verdict. */
+  /** Queue an ended job again from scratch: a new check run, the reviewers as they are when it starts, no verdict. */
   private requeue(pr: number, sha: string): boolean {
     const j = this.jobRow(pr, sha);
     // Never a head that needs the owner's approval and hasn't had it, whatever state its job is in.
@@ -529,11 +631,12 @@ export class ReviewDO extends DurableObject<Env> {
     return true;
   }
 
-  /** A job starting over (queued, or held): a new check run, new reviewers, no verdict, due now. */
+  /** A job starting over (queued, or held): a new check run, reviewers frozen afresh when it starts, no verdict, due now. */
   private reset(pr: number, sha: string): void {
     this.sql.exec(
       `UPDATE jobs SET next_ms = ?, agent = NULL, check_run = NULL, briefed = 0, verdict = NULL, tainted = NULL,
-        attempts = 0, errors = 0, error = NULL, deadline_ms = NULL, capacity_ms = NULL, room_waits = 0 WHERE pr = ? AND sha = ?`,
+        attempts = 0, errors = 0, error = NULL, deadline_ms = NULL, capacity_ms = NULL, room_waits = 0, reviewers = NULL, step = 0, reviews = NULL
+        WHERE pr = ? AND sha = ?`,
       Date.now(), pr, sha,
     );
   }
