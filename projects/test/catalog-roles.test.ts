@@ -1,7 +1,7 @@
 // Which roles may spawn what (src/catalog.ts): a worker runs Claude Code's own subagents, inside its
 // one sandbox; no role gets nest-level spawning (new agents or sandboxes).
 import { describe, expect, it } from "vitest";
-import { catalogFor, NAMESPACE, REPO_GUIDANCE, REVIEWER_GUIDANCE, roleTemplate } from "../src/catalog";
+import { catalogFor, NAMESPACE, PROMPTS, REPO_GUIDANCE, REVIEWER_GUIDANCE, roleTemplate } from "../src/catalog";
 
 const NEST_SPAWNING = ["management", "sandboxes", "spawning"];
 const cat = catalogFor("https://projects.test");
@@ -140,5 +140,21 @@ describe("built-in tools (README.md#built-in-tools)", () => {
       expect(rules, c).toEqual(expect.arrayContaining(want));
       expect(rules, c).toHaveLength(want.length);
     }
+  });
+});
+
+describe("the manager's routine tools (README.md#routines)", () => {
+  const board = (cat.capabilities[`${NAMESPACE}/board`] as { mcp: { tools: string[]; read_only: string[]; idempotent: string[] } }).mcp;
+  it("the board's capability names them, list_routines read-only, a change and a delete idempotent, a create neither", () => {
+    expect(board.tools).toEqual(expect.arrayContaining(["list_routines", "create_routine", "update_routine", "delete_routine"]));
+    expect(board.read_only.filter((t) => t.endsWith("_routines") || t.endsWith("_routine"))).toEqual(["list_routines"]);
+    expect(board.idempotent).toEqual(expect.arrayContaining(["list_routines", "update_routine", "delete_routine"]));
+    expect(board.idempotent).not.toContain("create_routine");
+  });
+
+  it("the manager's prompt says they're its own, and to tell the owner what it made or changed", () => {
+    const line = PROMPTS.manager.split("\n").find((l) => l.includes("list_routines"))!;
+    for (const tool of ["list_routines", "create_routine", "update_routine", "delete_routine"]) expect(line).toContain(tool);
+    expect(line).toMatch(/tell the owner what you made or changed/);
   });
 });

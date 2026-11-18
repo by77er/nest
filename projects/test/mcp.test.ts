@@ -3,7 +3,10 @@
 // docs/interfaces/remote-mcp/) is applied once.
 import { env } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { z } from "zod";
 import { resetAccessKeys } from "../src/access";
+import { CreateRoutine, UpdateRoutine } from "../src/requests";
+import { toolOf } from "../src/tools";
 import { AccessTeam, agentClaims, api, callTool, eventually, FakeNest, installFetch, mcp, Signer } from "./fake-nest";
 
 const fake = new FakeNest();
@@ -192,5 +195,25 @@ describe("a retried write", () => {
     const a = ok(await callTool("board", t, "create_task", { title: "x" }, { "nest/call": key }));
     const b = ok(await callTool("board", t, "create_task", { title: "x" }, { "nest/call": key }));
     expect(b.id).not.toBe(a.id);
+  });
+});
+
+describe("the routine tools' inputs (README.md#routines)", () => {
+  const props = (schema: Record<string, unknown>) => schema.properties as Record<string, unknown>;
+  it("are the API's bodies: create_routine's fields are POST …/routines's, update_routine's are PATCH's, as the server lists them", async () => {
+    const everyField = (CreateRoutine.options[1] as z.ZodObject).partial();
+    const { preset, ...create } = props(toolOf("board", "create_routine")!.inputSchema);
+    expect(create).toEqual(props(z.toJSONSchema(everyField)));
+    expect(preset).toEqual(expect.objectContaining({ enum: CreateRoutine.options[0].shape.preset.options }));
+    const { routine, ...update } = props(toolOf("board", "update_routine")!.inputSchema);
+    expect(update).toEqual(props(z.toJSONSchema(UpdateRoutine)));
+    expect(routine).toEqual(expect.objectContaining({ type: "string", pattern: "^rtn_[a-z0-9]+$" }));
+    expect(toolOf("board", "update_routine")!.inputSchema.required).toEqual(["routine"]);
+    // And listed as they are.
+    const p = await newProject();
+    const listed = ((await (await mcp("board", await managerToken(p), "tools/list")).json()) as any).result.tools as { name: string; inputSchema: unknown }[];
+    for (const name of ["list_routines", "create_routine", "update_routine", "delete_routine"]) {
+      expect(listed.find((t) => t.name === name)?.inputSchema, name).toEqual(toolOf("board", name)!.inputSchema);
+    }
   });
 });

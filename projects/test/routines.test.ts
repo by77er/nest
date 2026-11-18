@@ -461,7 +461,10 @@ describe("cost guards", () => {
       for (const c of ["reviewer_model", "routine_model"]) sql.exec(`ALTER TABLE settings DROP COLUMN ${c}`);
       sql.exec("ALTER TABLE routine_runs DROP COLUMN model");
       sql.exec("DELETE FROM start_specs");
-      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 3);
+      // And the routines' writers' step (README.md#routines).
+      for (const c of ["source", "name_tainted", "prompt_tainted"]) sql.exec(`ALTER TABLE routines DROP COLUMN ${c}`);
+      sql.exec("ALTER TABLE routine_runs DROP COLUMN brief_tainted");
+      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 4);
       migrate(st.storage, MIGRATIONS);
       expect(sql.exec("SELECT nest_repos FROM routine_runs WHERE id = ?", r0.id).one().nest_repos).toBe(1);
       sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE state = 'starting'");
@@ -870,5 +873,171 @@ describe("presets", () => {
     const s = await setup();
     expect((await api(token, "POST", `/api/projects/${s.id}/routines`, fields({ triggers: { timer: { kind: "interval", minutes: 14 }, tasks_done: null, prs_merged: null } }))).status).toBe(400);
     expect((await api(token, "POST", `/api/projects/${s.id}/routines`, fields({ triggers: { timer: { kind: "daily", time: "03:00", tz: "Mars/Olympus" }, tasks_done: null, prs_merged: null } }))).status).toBe(400);
+  });
+});
+
+describe("the manager's routine tools (README.md#routines)", () => {
+  const managerOf = (s: S, tainted = false, agent = s.manager) =>
+    nest.sign(agentClaims("board", agent, { project: s.id, role: "manager", start: "1" }, { tainted }));
+  const board = async (s: S, tool: string, args: Record<string, unknown> = {}, o: { tainted?: boolean; key?: string } = {}) =>
+    callTool("board", await managerOf(s, o.tainted), tool, args, o.key ? { "nest/call": o.key } : undefined);
+  const listed = async (s: S) => (await api(token, "GET", `/api/projects/${s.id}/routines`)).body;
+
+  it("lists as the API does; creates from a preset or every field; changes a field, disables and enables; deletes", async () => {
+    const s = await setup();
+    const made = ok(await board(s, "create_routine", fields({ name: "Docs", triggers: { timer: { kind: "interval", minutes: 60 }, tasks_done: null, prs_merged: null } })));
+    expect(made).toMatchObject({ name: "Docs", kind: "custom", enabled: true, source: "manager", tainted: false });
+    expect(made.next_timer_ms).not.toBeNull();
+    const preset = ok(await board(s, "create_routine", { preset: "review" }));
+    expect(preset).toMatchObject({ name: PRESETS.review.name, preset: "review", triggers: PRESETS.review.triggers });
+    expect(ok(await board(s, "list_routines"))).toEqual(await listed(s));
+    expect((await listed(s)).routines.map((r: any) => r.id)).toEqual([made.id, preset.id]);
+
+    expect(ok(await board(s, "update_routine", { routine: made.id, max_turns: 7 }))).toMatchObject({ max_turns: 7, name: "Docs", max_minutes: 30 });
+    expect(await routine(s, made.id)).toMatchObject({ max_turns: 7 });
+    expect(ok(await board(s, "update_routine", { routine: made.id, enabled: false }))).toMatchObject({ enabled: false, next_timer_ms: null });
+    // Off: its timer doesn't fire it.
+    await timersDue(s);
+    await settle(s);
+    expect(await runs(s, made.id)).toEqual([]);
+    const on = ok(await board(s, "update_routine", { routine: made.id, enabled: true }));
+    expect(on.enabled).toBe(true);
+    expect(on.next_timer_ms).toBeGreaterThan(Date.now() + 59 * MIN);
+
+    expect(ok(await board(s, "delete_routine", { routine: made.id }))).toEqual({ deleted: made.id });
+    expect((await api(token, "GET", `/api/projects/${s.id}/routines/${made.id}`)).status).toBe(404);
+  });
+
+  it("refuses what the API refuses, with the API's reason", async () => {
+    const s = await setup();
+    const both = async (tool: string, args: Record<string, unknown>, method: string, path: string, body?: unknown) => {
+      const viaApi = await api(token, method, `/api/projects/${s.id}${path}`, body);
+      expect(viaApi.status, JSON.stringify(viaApi.body)).toBeGreaterThanOrEqual(400);
+      expect(toolError(await board(s, tool, args))).toBe(viaApi.body.error);
+      return viaApi.body.error as string;
+    };
+    // A field out of bounds (nested in the timer), and a body neither a preset nor every field.
+    const short = fields({ triggers: { timer: { kind: "interval", minutes: 14 }, tasks_done: null, prs_merged: null } });
+    expect(await both("create_routine", short, "POST", "/routines", short)).toMatch(/At least 15 minutes/);
+    const tz = { triggers: { timer: { kind: "daily", time: "03:00", tz: "Mars/Olympus" }, tasks_done: null, prs_merged: null } };
+    const id = await create(s);
+    expect(await both("update_routine", { routine: id, ...tz }, "PATCH", `/routines/${id}`, tz)).toMatch(/IANA time zone/);
+    expect(await both("create_routine", { name: "half" }, "POST", "/routines", { name: "half" })).toBeTruthy();
+    // A preset once.
+    ok(await board(s, "create_routine", { preset: "dreaming" }));
+    expect(await both("create_routine", { preset: "dreaming" }, "POST", "/routines", { preset: "dreaming" })).toMatch(/dreaming preset already/);
+    // An unknown routine.
+    expect(await both("update_routine", { routine: "rtn_nope", max_turns: 2 }, "PATCH", "/routines/rtn_nope", { max_turns: 2 })).toBe("unknown routine");
+    expect(await both("delete_routine", { routine: "rtn_nope" }, "DELETE", "/routines/rtn_nope")).toBe("unknown routine");
+    // Not while a run of it is going.
+    await api(token, "POST", `/api/projects/${s.id}/routines/${id}/run`);
+    expect((await liveRun(s, id)).state).toBe("running");
+    expect(await both("delete_routine", { routine: id }, "DELETE", `/routines/${id}`)).toMatch(/run going/);
+    // At most MAX_ROUTINES (src/routines.ts: 20).
+    for (let n = (await listed(s)).routines.length; n < 20; n++) await create(s, { name: `R${n}` });
+    expect(await both("create_routine", fields(), "POST", "/routines", fields())).toMatch(/at most 20 routines/);
+  });
+
+  it("only the current manager calls them; a write retried with its call key writes once", async () => {
+    const s = await setup();
+    const other = await managerOf(s, false, "agt_replaced");
+    expect((await callTool("board", other, "list_routines")).status).toBe(403);
+    expect((await callTool("board", other, "create_routine", fields())).status).toBe(403);
+    expect((await listed(s)).routines).toEqual([]);
+    const key = `${s.manager}/1/call-${rand()}`;
+    const a = ok(await board(s, "create_routine", fields({ name: "Once" }), { key }));
+    const b = ok(await board(s, "create_routine", fields({ name: "Once" }), { key }));
+    expect(b.id).toBe(a.id);
+    expect((await listed(s)).routines.map((r: any) => r.name)).toEqual(["Once"]);
+  });
+
+  it("records who wrote it, and taints it exactly while a tainted session's name or prompt stands", async () => {
+    const s = await setup();
+    const taint = async (id: string) => {
+      const r = await routine(s, id);
+      return [r.source, r.tainted];
+    };
+    // The owner's: untainted.
+    const owners = await create(s);
+    expect(await taint(owners)).toEqual(["owner", false]);
+    // A tainted manager turning it off: the manager's, its text still the owner's.
+    ok(await board(s, "update_routine", { routine: owners, enabled: false }, { tainted: true }));
+    expect(await taint(owners)).toEqual(["manager", false]);
+    // Sending the same text back changes nothing of it.
+    ok(await board(s, "update_routine", { routine: owners, name: "R", prompt: "Look around." }, { tainted: true }));
+    expect(await taint(owners)).toEqual(["manager", false]);
+    // Its prompt changed by a tainted session: tainted.
+    ok(await board(s, "update_routine", { routine: owners, prompt: "Read the issues." }, { tainted: true }));
+    expect(await taint(owners)).toEqual(["manager", true]);
+    // Other fields, by an untainted manager or the owner, leave it; so does the owner saving the name alone.
+    ok(await board(s, "update_routine", { routine: owners, enabled: true, max_turns: 4 }));
+    expect(await taint(owners)).toEqual(["manager", true]);
+    expect((await api(token, "PATCH", `/api/projects/${s.id}/routines/${owners}`, { cooldown_min: 5, name: "Mine" })).status).toBe(200);
+    expect(await taint(owners)).toEqual(["owner", true]);
+    // The owner saving the name and prompt (the editor sends every field) makes the text theirs.
+    expect((await api(token, "PATCH", `/api/projects/${s.id}/routines/${owners}`, { name: "Mine", prompt: "Read the issues." })).status).toBe(200);
+    expect(await taint(owners)).toEqual(["owner", false]);
+
+    // A tainted manager's own: tainted; a preset's text is the app's, whoever adds it.
+    const its = ok(await board(s, "create_routine", fields({ name: "Its" }), { tainted: true }));
+    expect([its.source, its.tainted]).toEqual(["manager", true]);
+    const preset = ok(await board(s, "create_routine", { preset: "review" }, { tainted: true }));
+    expect([preset.source, preset.tainted]).toEqual(["manager", false]);
+    // Its name rewritten by an untainted manager: the prompt still stands, so still tainted.
+    ok(await board(s, "update_routine", { routine: its.id, name: "Clean name" }));
+    expect(await taint(its.id)).toEqual(["manager", true]);
+    ok(await board(s, "update_routine", { routine: its.id, prompt: "Clean prompt." }));
+    expect(await taint(its.id)).toEqual(["manager", false]);
+    // The API's list says the same.
+    expect((await listed(s)).routines.map((r: any) => [r.id, r.source, r.tainted])).toEqual([[owners, "owner", false], [its.id, "manager", false], [preset.id, "manager", false]]);
+  });
+
+  it("a tainted routine's run gets its brief relayed, frozen with the brief at its first start attempt; an untainted one's isn't", async () => {
+    const s = await setup();
+    await api(token, "PATCH", `/api/projects/${s.id}/settings`, { max_routine_runs: 3 });
+    const briefOf = (agent: string) => fake.inbox.filter((m) => m.agent === agent);
+    // Untainted: the manager's, from a clean session.
+    const clean = ok(await board(s, "create_routine", fields({ name: "Clean", prompt: "Clean prompt." })));
+    await api(token, "POST", `/api/projects/${s.id}/routines/${clean.id}/run`);
+    const r1 = await liveRun(s, clean.id);
+    expect(briefOf(r1.agent)).toHaveLength(1);
+    expect(briefOf(r1.agent)[0]!.from).toBeUndefined();
+    // Tainted: relayed.
+    const dirty = ok(await board(s, "create_routine", fields({ name: "Dirty", prompt: "Tainted prompt." }), { tainted: true }));
+    await api(token, "POST", `/api/projects/${s.id}/routines/${dirty.id}/run`);
+    const r2 = await liveRun(s, dirty.id);
+    expect(briefOf(r2.agent)).toEqual([expect.objectContaining({ from: "projects/board" })]);
+    expect(briefOf(r2.agent)[0]!.text).toContain("Tainted prompt.");
+    // Frozen at the first attempt: the owner makes the text theirs while the start is retried; the brief
+    // sent is the one frozen, still relayed.
+    const later = ok(await board(s, "create_routine", fields({ name: "Later", prompt: "Tainted again." }), { tainted: true }));
+    fake.lost.push({ match: /^POST \/v1\/agents$/, times: 1 });
+    await api(token, "POST", `/api/projects/${s.id}/routines/${later.id}/run`);
+    const first = (await runs(s, later.id))[0];
+    expect(first.state).toBe("starting");
+    expect((await api(token, "PATCH", `/api/projects/${s.id}/routines/${later.id}`, { name: "Later", prompt: "The owner's now." })).body.tainted).toBe(false);
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE id = ?", first.id);
+    });
+    await settle(s);
+    const r3 = await liveRun(s, later.id);
+    expect(r3.state).toBe("running");
+    expect(briefOf(r3.agent)).toEqual([expect.objectContaining({ from: "projects/board" })]);
+    expect(briefOf(r3.agent)[0]!.text).toContain("Tainted again.");
+    expect(briefOf(r3.agent)[0]!.text).not.toContain("The owner's now.");
+  });
+
+  it("a routine from before the columns reads as the owner's, untainted", async () => {
+    const s = await setup();
+    const id = await create(s);
+    await runInDurableObject(stub(s), (_i: unknown, st: DurableObjectState) => {
+      const sql = st.storage.sql;
+      // As the release before left it: none of this step.
+      for (const c of ["source", "name_tainted", "prompt_tainted"]) sql.exec(`ALTER TABLE routines DROP COLUMN ${c}`);
+      sql.exec("ALTER TABLE routine_runs DROP COLUMN brief_tainted");
+      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 1);
+      migrate(st.storage, MIGRATIONS);
+    });
+    expect(await routine(s, id)).toMatchObject({ source: "owner", tainted: false });
   });
 });
