@@ -202,10 +202,12 @@ export const MIGRATIONS: readonly (readonly string[])[] = [
       VALUES (${quote(CODE_REVIEW.id)}, ${quote(CODE_REVIEW.name)}, ${quote(CODE_REVIEW.instructions)}, ${quote(JSON.stringify(CODE_REVIEW.dimensions))}, 1, 'owner', 0,
         CAST(strftime('%s', 'now') AS INTEGER) * 1000, CAST(strftime('%s', 'now') AS INTEGER) * 1000)`,
     // A job's reviewers, frozen when it starts (null: not started since; one the release before started runs the
-    // built-in alone), which of them is at work, and the reviews given so far (JSON).
+    // built-in alone), which of them is at work, the reviews given so far (JSON), and the check run they're for:
+    // the release before doesn't clear them when it runs the job again, so another check's are another run's (`runOf`).
     "ALTER TABLE jobs ADD COLUMN reviewers TEXT",
     "ALTER TABLE jobs ADD COLUMN step INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE jobs ADD COLUMN reviews TEXT",
+    "ALTER TABLE jobs ADD COLUMN frozen_check INTEGER",
   ],
 ];
 
@@ -329,8 +331,7 @@ export class ReviewDO extends DurableObject<Env> {
       attempts: r.attempts as number, runs: r.runs as number, error: (r.error as string | null) ?? null,
       deadline_ms: r.state === "running" ? ((r.deadline_ms as number | null) ?? null) : null,
       author: (r.author as string | null) ?? null, fork: r.fork === 1, approved_ms: (r.approved_ms as number | null) ?? null,
-      reviewers: r.reviewers === null && r.state !== "running" ? null : frozenOf((r.reviewers as string | null) ?? null),
-      step: (r.step as number | null) ?? 0, reviews: reviewsOf(r),
+      ...jobRun(r),
       created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     };
   }
@@ -788,8 +789,8 @@ export class ReviewDO extends DurableObject<Env> {
       );
     } else {
       this.sql.exec("UPDATE jobs SET attempts = ? WHERE pr = ? AND sha = ?", attempts, j.pr, j.sha);
-      const rs = frozenOf((j.reviewers as string | null) ?? null);
-      const whose = rs.length > 1 ? `${currentReviewer(j).name} (reviewer ${(j.step as number) + 1} of ${rs.length}): ` : "";
+      const { reviewers: rs, step } = runOf(j);
+      const whose = rs.length > 1 ? `${currentReviewer(j).name} (reviewer ${step + 1} of ${rs.length}): ` : "";
       this.end({ ...j, agent: null }, "give_up", NO_VERDICT, withGiven(j, {
         title: "No verdict",
         summary: `${whose}${attempts} reviewers ended without submitting a verdict (the last: ${why}). Re-run this check to review the commit again.`,
@@ -848,16 +849,15 @@ export class ReviewDO extends DurableObject<Env> {
         // Refused (nothing recorded, still its one submit to make) unless it names each dimension once.
         const made = reviewOf(currentReviewer(r), a.verdicts as Submitted[], a.summary as string, { agent: caller.agent, tainted: caller.tainted });
         if (!made.ok) return fail(400, made.error);
-        const given = [...reviewsOf(r), made.review];
-        const rs = frozenOf((r.reviewers as string | null) ?? null);
-        const step = r.step as number;
+        const { reviewers: rs, step, reviews: before } = runOf(r);
+        const given = [...before, made.review];
         if (step + 1 < rs.length) {
           // The next reviewer: this one's agent stopped with its sandbox, a new agent (a new start) for the next, its own retries and deadline.
           if (!this.move(r.pr as number, r.sha as string, "running", "next")) return fail(409, "this review moved meanwhile");
           this.sql.exec(
-            `UPDATE jobs SET reviews = ?, step = ?, attempts = 0, agent = NULL, briefed = 0, runs = runs + 1, next_ms = ?, deadline_ms = ?, errors = 0, error = NULL
+            `UPDATE jobs SET reviewers = ?, frozen_check = check_run, reviews = ?, step = ?, attempts = 0, agent = NULL, briefed = 0, runs = runs + 1, next_ms = ?, deadline_ms = ?, errors = 0, error = NULL
               WHERE pr = ? AND sha = ?`,
-            JSON.stringify(given), step + 1, Date.now(), Date.now() + REVIEW_DEADLINE_MS, r.pr, r.sha,
+            JSON.stringify(rs), JSON.stringify(given), step + 1, Date.now(), Date.now() + REVIEW_DEADLINE_MS, r.pr, r.sha,
           );
           this.oweStop(caller.agent, "done");
           if (r.check_run !== null) this.oweCheck(r.check_run as number, { status: "in_progress", output: reviewingOutput(r.sha as string, rs, step + 1) });
@@ -1007,10 +1007,14 @@ export class ReviewDO extends DurableObject<Env> {
     for (const q of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'queued' AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       if (!this.underCap()) break;
       if (!this.move(q.pr as number, q.sha as string, "queued", "start")) continue;
-      // Its reviewers, frozen in this step as they are now: the enabled ones in creation order. Unless it froze
-      // them before and waited for room: then it resumes with the reviewer at work, the reviews given kept.
-      this.sql.exec("UPDATE jobs SET reviewers = COALESCE(reviewers, ?), runs = runs + 1, agent = NULL, briefed = 0, next_ms = ?, deadline_ms = ? WHERE pr = ? AND sha = ?",
-        JSON.stringify(freeze(this.reviewerRows())), now, now + REVIEW_DEADLINE_MS, q.pr, q.sha);
+      // Its reviewers, frozen in this step as they are now: the enabled ones in creation order. Unless this run
+      // froze them before and waited for room: then it resumes with the reviewer at work, the reviews given kept.
+      const resumes = "reviewers IS NOT NULL AND check_run IS NOT NULL AND frozen_check = check_run";
+      this.sql.exec(
+        `UPDATE jobs SET reviewers = CASE WHEN ${resumes} THEN reviewers ELSE ? END, step = CASE WHEN ${resumes} THEN step ELSE 0 END,
+          reviews = CASE WHEN ${resumes} THEN reviews ELSE NULL END, runs = runs + 1, agent = NULL, briefed = 0, next_ms = ?, deadline_ms = ? WHERE pr = ? AND sha = ?`,
+        JSON.stringify(freeze(this.reviewerRows())), now, now + REVIEW_DEADLINE_MS, q.pr, q.sha,
+      );
     }
     for (const r of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'running' AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       await this.advance(nest, github, repo, r.pr as number, r.sha as string);
@@ -1053,11 +1057,11 @@ export class ReviewDO extends DurableObject<Env> {
           this.oweCheck(made.id, { status: "completed", conclusion: ENDED, completed_at: new Date().toISOString(), output: { title: "Superseded", summary: "The PR moved on before its review started." } });
           return;
         }
-        this.sql.exec("UPDATE jobs SET check_run = ? WHERE pr = ? AND sha = ?", made.id, pr, sha);
+        this.sql.exec("UPDATE jobs SET check_run = ?, frozen_check = ? WHERE pr = ? AND sha = ?", made.id, made.id, pr, sha);
       }
       const j0 = current();
       if (!j0) return;
-      if (frozenOf((j0.reviewers as string | null) ?? null).length === 0) {
+      if (runOf(j0).reviewers.length === 0) {
         this.end(j0, "verdict", NO_REVIEWER, NONE_OUTPUT);
         return;
       }
@@ -1258,7 +1262,10 @@ function reviewingOutput(sha: string, rs: readonly FrozenReviewer[], step: numbe
     summary: `Reviewer ${step + 1} of ${rs.length}, ${rv.name}, is reviewing ${sha}: ${judging}. The reviewers, one after another: ${rs.map((x) => x.name).join(", ")}.`,
   };
 }
-const jobOutput = (j: Row): CheckOutput => reviewingOutput(j.sha as string, frozenOf((j.reviewers as string | null) ?? null), j.step as number);
+function jobOutput(j: Row): CheckOutput {
+  const { reviewers, step } = runOf(j);
+  return reviewingOutput(j.sha as string, reviewers, step);
+}
 
 const NONE_OUTPUT: CheckOutput = {
   title: "No reviewer enabled",
@@ -1267,7 +1274,7 @@ const NONE_OUTPUT: CheckOutput = {
 
 /** A failed job's output with the reviews given before it failed, each in its section. */
 function withGiven(j: Row, out: CheckOutput): CheckOutput {
-  const given = reviewsOf(j);
+  const given = runOf(j).reviews;
   return given.length ? { ...out, text: clip(`Reviews given before it failed:\n\n${reviewsText(given)}`, OUTPUT_MAX) } : out;
 }
 
@@ -1276,12 +1283,26 @@ const listed = (xs: readonly string[]) => (xs.length < 2 ? xs.join("") : `${xs.s
 
 /** The reviewer a running job's agent reviews as: the one at work of those it froze. */
 function currentReviewer(j: Row): FrozenReviewer {
-  const rs = frozenOf((j.reviewers as string | null) ?? null);
-  return rs[(j.step as number | null) ?? 0] ?? rs[rs.length - 1] ?? { ...CODE_REVIEW, tainted: false };
+  const { reviewers: rs, step } = runOf(j);
+  return rs[step] ?? rs[rs.length - 1] ?? { ...CODE_REVIEW, tainted: false };
 }
 
-/** The reviews a job's reviewers gave so far. */
-const reviewsOf = (r: Row): Review[] => (r.reviews ? (JSON.parse(r.reviews as string) as Review[]) : []);
+/**
+ * A job's run: its frozen reviewers, the one at work and the reviews given so far. Only this run's: frozen for
+ * its check run, or not yet given one. Else (none frozen, or another run's, which the release before left when it
+ * ran the job again) the built-in alone, as that release ran it.
+ */
+function runOf(r: Row): { own: boolean; reviewers: FrozenReviewer[]; step: number; reviews: Review[] } {
+  const own = r.reviewers !== null && (r.check_run === null || r.frozen_check === r.check_run);
+  if (!own) return { own, reviewers: frozenOf(null), step: 0, reviews: [] };
+  return { own, reviewers: frozenOf(r.reviewers as string), step: r.step as number, reviews: r.reviews ? (JSON.parse(r.reviews as string) as Review[]) : [] };
+}
+
+/** A job's run as the API answers it: none frozen before it starts. */
+function jobRun(r: Row): Pick<Job, "reviewers" | "step" | "reviews"> {
+  const run = runOf(r);
+  return { reviewers: run.own || r.state === "running" ? run.reviewers : null, step: run.step, reviews: run.reviews };
+}
 
 /** Who writes a reviewer: the owner (the API) for now, untainted. */
 interface Writer {

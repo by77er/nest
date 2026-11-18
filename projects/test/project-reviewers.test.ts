@@ -107,18 +107,18 @@ describe("the project's reviewers", () => {
       const sql = st.storage.sql;
       // Back to the previous release's shape: its schema version, no reviewers table, none of the jobs' new columns.
       sql.exec("DROP TABLE reviewers");
-      for (const c of ["reviewers", "step", "reviews"]) sql.exec(`ALTER TABLE jobs DROP COLUMN ${c}`);
+      for (const c of ["reviewers", "step", "reviews", "frozen_check"]) sql.exec(`ALTER TABLE jobs DROP COLUMN ${c}`);
       sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 1);
       sql.exec("INSERT INTO jobs (pr, sha, state, created_ms, updated_ms) VALUES (1, 'a', 'done', 1, 1)");
       migrate(st.storage, MIGRATIONS);
       const seeded = sql.exec("SELECT id, name, enabled, source, tainted, dimensions FROM reviewers").toArray();
-      const old = sql.exec("SELECT reviewers, step, reviews FROM jobs").toArray();
+      const old = sql.exec("SELECT reviewers, step, reviews, frozen_check FROM jobs").toArray();
       sql.exec("DELETE FROM reviewers");
       migrate(st.storage, MIGRATIONS);
       return { seeded, old, after: sql.exec("SELECT COUNT(*) AS n FROM reviewers").one().n };
     });
     expect(got.seeded).toEqual([{ id: CODE_REVIEW.id, name: CODE_REVIEW.name, enabled: 1, source: "owner", tainted: 0, dimensions: JSON.stringify(CODE_REVIEW.dimensions) }]);
-    expect(got.old).toEqual([{ reviewers: null, step: 0, reviews: null }]);
+    expect(got.old).toEqual([{ reviewers: null, step: 0, reviews: null, frozen_check: null }]);
     expect(got.after).toBe(0);
   });
 
@@ -367,6 +367,33 @@ describe("a job runs its reviewers one after another", () => {
     await run(p);
     expect(await job(p, 1, s)).toMatchObject({ state: "running", step: 0, reviews: [], reviewers: [{ id: docs.id }] });
     expect(briefOf(one(p, 1)).text).toContain("Docs up to date?");
+  });
+
+  it("a run the release before made of a job (it leaves the reviewers columns as they were) is never taken for this release's", async () => {
+    const p = await newProject();
+    const sec = await add(p);
+    const s = await opened(p);
+    toolOk(await submit(p, one(p, 1), 1, s, submitArgs()));
+    await run(p);
+    const second = one(p, 1);
+    toolOk(await submit(p, second, 1, s, security()));
+    await run(p);
+    expect(await job(p, 1, s)).toMatchObject({ state: "done", step: 1 });
+    // That release runs the job again (a Re-run): its own check run, the job running, nothing of these columns touched.
+    await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE jobs SET state = 'running', check_run = check_run + 1000, verdict = NULL, agent = 'agt_old', briefed = 1, next_ms = NULL, deadline_ms = ?", Date.now() + 3_600_000);
+    });
+    expect(await job(p, 1, s)).toMatchObject({ state: "running", step: 0, reviews: [], reviewers: [{ id: CODE_REVIEW.id }] });
+    expect(toolError(await submit(p, second, 1, s, security()))).toMatch(/aren't this review's reviewer/);
+    toolOk(await submit(p, "agt_old", 1, s, submitArgs()));
+    expect((await job(p, 1, s)).verdict.reviews.map((x: any) => x.agent)).toEqual(["agt_old"]);
+    // And requeued there (its reset clears the check, not these columns): this release's start freezes afresh.
+    await api(token, "PATCH", path(p, `/${sec.id}`), { enabled: false });
+    await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE jobs SET state = 'queued', check_run = NULL, verdict = NULL, agent = NULL, briefed = 0, next_ms = 0, deadline_ms = NULL");
+    });
+    await run(p);
+    expect(await job(p, 1, s)).toMatchObject({ state: "running", step: 0, reviews: [], reviewers: [{ id: CODE_REVIEW.id }] });
   });
 
   it("a head superseded during the second reviewer: that agent stopped, the check cancelled", async () => {
