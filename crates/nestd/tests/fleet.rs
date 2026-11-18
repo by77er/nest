@@ -31,7 +31,7 @@ impl FleetReporter for Reporter {
 }
 
 fn capacity() -> Capacity {
-    Capacity { vcpus_free: 1, memory_mib_free: 1, hugepages_mib_free: 0, hugepages_mib_total: 0, sandboxes: 0, agents: 0, warm: vec![] }
+    Capacity { vcpus_free: 1, memory_mib_free: 1, memory_mib_total: 0, hugepages_mib_free: 0, hugepages_mib_total: 0, sandboxes: 0, agents: 0, warm: vec![] }
 }
 
 /// One accepted connection: frames from the host, and a sink for FleetDO's frames.

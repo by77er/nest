@@ -246,6 +246,10 @@ pub struct Capacity {
     pub vcpus_free: u32,
     /// `MemAvailable`: what the host can still give sandboxes backed by regular pages.
     pub memory_mib_free: u32,
+    /// `MemTotal`: the host's memory, against which placement counts what its sandboxes may grow
+    /// to. 0 (the wire default) is a host that doesn't say: a nestd before the field.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub memory_mib_total: u32,
     pub hugepages_mib_free: u32,
     /// The hugepage pool's size; 0 (the wire default) means guest memory is regular pages and
     /// placement packs by `memory_mib_free`, otherwise by `hugepages_mib_free`.
