@@ -1,10 +1,14 @@
 // The sidebar (the nest-ui-design skill's Navigation): the switcher says which project, the flat rows
 // which view, one active row; the page's h1 is the project; there is no breadcrumb; and the routes, old
 // links included.
-import { screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { renderHook, screen, waitFor, within } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+import { useChat } from "../../api/queries";
+import { createQueryClient } from "../../api/queryClient";
 import { ask, FakeApi, project, task } from "../../test/fakeApi";
 import { renderApp } from "../../test/render";
+import { useUnread } from "./unread";
 /** The task drawer (titled with its task's title). */
 const SHEET = { name: (_: string, el: Element) => el.classList.contains("mantine-Drawer-content") };
 
@@ -199,5 +203,34 @@ describe("the routes", () => {
     await waitFor(() => expect(second.router.state.location.pathname).toBe("/projects/prj_one/board"));
     expect(second.router.state.location.search).toEqual({ task: t.id });
     expect(await screen.findByRole("dialog", SHEET)).toBeInTheDocument();
+  });
+});
+
+describe("the unread count", () => {
+  /** How many times the chat is asked for in 30 s, from the sidebar's count and, on the Manager page, the page's chat. */
+  async function chatReads(onManager: boolean): Promise<number> {
+    vi.useFakeTimers();
+    try {
+      const api = new FakeApi();
+      vi.stubGlobal("fetch", api.fetch);
+      const qc = createQueryClient();
+      const view = renderHook(() => {
+        useUnread("prj_one", onManager);
+        useChat("prj_one", onManager);
+      }, { wrapper: ({ children }) => <QueryClientProvider client={qc}>{children}</QueryClientProvider> });
+      await vi.advanceTimersByTimeAsync(30_500);
+      view.unmount();
+      qc.clear();
+      return api.reads.filter((p) => p.endsWith("/chat")).length;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("polls the chat every 10 s off the Manager page, and leaves the Manager page's own 3 s alone", async () => {
+    // The first read, then one every 10 s.
+    expect(await chatReads(false)).toBe(4);
+    // The first read, then the page's every 3 s; the sidebar adds none.
+    expect(await chatReads(true)).toBe(11);
   });
 });
