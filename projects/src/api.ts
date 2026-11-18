@@ -439,7 +439,7 @@ export async function handleApi(req: Request, env: Env, url: URL): Promise<Respo
         const b = await body(req, ReviewerFromPreset);
         if (!b.ok) return b.res;
         const rv = PRESET_REVIEWERS[b.value.preset];
-        return done(await review(env, pid).createReviewer({ ...rv, dimensions: [...rv.dimensions], enabled: true }, { preset: rv }), 201);
+        return done(await review(env, pid).createReviewer({ name: rv.name, instructions: rv.instructions, dimensions: [...rv.dimensions], enabled: true }, { preset: rv }), 201);
       }
       const b = await body(req, NewReviewer);
       return b.ok ? done(await review(env, pid).createReviewer(b.value), 201) : b.res;

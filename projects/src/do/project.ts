@@ -2977,7 +2977,9 @@ export class ProjectDO extends DurableObject<Env> {
   /** The review queue ended a PR's review (ReviewDO's outbox): `done` with a verdict, or `failed`. */
   async onReviewEnded(e: { pr: number; sha: string; state: string; conclusion: string | null }): Promise<void> {
     if (!this.settings()) return;
-    for (const w of this.pendingWaits("pr", String(e.pr))) this.prWaitOn(w, { kind: "review", conclusion: e.conclusion ?? e.state });
+    // A neutral check is a job no reviewer was enabled for (README.md#running-the-reviewers): said as reviewConclusion says it.
+    const conclusion = e.conclusion === "neutral" ? reviewConclusion({ state: e.state, verdict: null }) : e.conclusion ?? e.state;
+    for (const w of this.pendingWaits("pr", String(e.pr))) this.prWaitOn(w, { kind: "review", conclusion });
     // A failed review is a nudge to read the PRs soon (README.md#pr-upkeep): its worker is told from that read.
     if (e.conclusion === "failure") this.nudgePrs([e.pr]);
     await this.arm();

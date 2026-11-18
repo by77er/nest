@@ -401,7 +401,6 @@ The owner's request (2026-11-06), after the sweep (B10): a failure partway throu
 
 ## Not decided here
 
-- Which reviewers a project runs: one for now, the built-in "Code review" ([the verdict](#built-the-review-pipeline)); reviewers per project are the next step.
 - Tasks without a PR (research, specs) end by the owner marking them done, from `draft`, `ready` or `stalled`.
 
 ## Built: the core
@@ -472,7 +471,7 @@ npm ci && npm run typecheck && npm test && npm run build   # vitest in workerd, 
 
 **Code:** `src/reviewers.ts` (the limit, the built-in preset, freezing; pure), `src/requests.ts` (the bodies, with the fields' bounds and the dimensions' rule, there so the page may check them too), ReviewDO (the table, the runs). Tests: `test/project-reviewers.test.ts`. Decided 2026-11-18 (the owner's request: "I need a way to configure reviewers per project").
 
-- **A reviewer** is a name (1 to 80 characters), its instructions (what it judges and how, 1 to 8000), its dimensions (1 to 6 names of up to 60 characters, different without case, each judged pass or fail) and whether it's enabled. It records who last wrote it (`source`: `owner` or `manager`) and `tainted` (a tainted session last wrote its text); the owner's API writes `owner`, untainted. At most 8 per project (`MAX_REVIEWERS`), kept in ReviewDO.
+- **A reviewer** is a name (1 to 80 characters), its instructions (what it judges and how, 1 to 8000), its dimensions (1 to 6 names of up to 60 characters, different without case, each judged pass or fail) and whether it's enabled. It records who last wrote it (`source`: `owner` or `manager`) and `tainted` (a tainted session last wrote its text): the owner's API writes `owner`; a new reviewer of theirs is untainted, and their change clears a taint only by writing all of its text (name, instructions and dimensions). ReviewDO checks the fields itself too, for any writer. At most 8 per project (`MAX_REVIEWERS`), kept in ReviewDO.
 - **The default:** the built-in "Code review" (Correctness, Quality and Architectural cohesiveness), enabled. ReviewDO's migration seeds it once: a project of the release before at its first use, a new one at init. Deleted, it stays deleted; `{preset: "code"}` adds it back, once (its id is `code-review`).
 - **The API:** `GET`/`POST /api/projects/:id/reviewers` (every field, or `{preset}` alone), `GET`/`PATCH`/`DELETE …/reviewers/:reviewer`. Refusals say why: the limit (409), an unknown reviewer (404), a bad field (400, naming it). Disabling or deleting the last enabled one is allowed: that turns reviews off.
 

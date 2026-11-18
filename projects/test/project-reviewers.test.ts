@@ -136,15 +136,19 @@ describe("the project's reviewers", () => {
     expect((await listed(p)).map((r) => r.id)).toEqual([CODE_REVIEW.id]);
   });
 
-  it("create, change and delete, in creation order; a write is the owner's, untainted", async () => {
+  it("create, change and delete, in creation order; a write is the owner's, and clears a taint only by writing all the text", async () => {
     const p = await newProject();
     const sec = await add(p);
     expect(sec).toMatchObject({ ...SECURITY, id: expect.stringMatching(/^rvw_[a-z0-9]+$/), source: "owner", tainted: false });
-    // As the manager's tainted session would have left it (its tools come later): the owner's write makes it theirs.
+    // As the manager's tainted session would have left it (its tools come later): the owner's write is theirs, but
+    // its text stays tainted until they write all of it.
     await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => { st.storage.sql.exec("UPDATE reviewers SET source = 'manager', tainted = 1 WHERE id = ?", sec.id); });
     const patched = await api(token, "PATCH", path(p, `/${sec.id}`), { enabled: false, dimensions: [" Injection ", "Secrets", "Auth"] });
     expect(patched.status, JSON.stringify(patched.body)).toBe(200);
-    expect(patched.body).toMatchObject({ name: "Security", enabled: false, dimensions: ["Injection", "Secrets", "Auth"], source: "owner", tainted: false });
+    expect(patched.body).toMatchObject({ name: "Security", enabled: false, dimensions: ["Injection", "Secrets", "Auth"], source: "owner", tainted: true });
+    expect((await api(token, "PATCH", path(p, `/${sec.id}`), {})).body).toMatchObject({ source: "owner", tainted: true });
+    const rewritten = await api(token, "PATCH", path(p, `/${sec.id}`), { name: "Security", instructions: SECURITY.instructions, dimensions: ["Injection", "Secrets", "Auth"] });
+    expect(rewritten.body).toMatchObject({ source: "owner", tainted: false, enabled: false });
     const third = await add(p, { ...SECURITY, name: "Docs" });
     expect((await listed(p)).map((r) => r.name)).toEqual(["Code review", "Security", "Docs"]);
     expect((await api(token, "DELETE", path(p, `/${sec.id}`))).status).toBe(200);
@@ -387,6 +391,11 @@ describe("a job runs its reviewers one after another", () => {
     expect(toolError(await submit(p, second, 1, s, security()))).toMatch(/aren't this review's reviewer/);
     toolOk(await submit(p, "agt_old", 1, s, submitArgs()));
     expect((await job(p, 1, s)).verdict.reviews.map((x: any) => x.agent)).toEqual(["agt_old"]);
+    // Started there, its check run's create failing (none named yet): still not this release's.
+    await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => {
+      st.storage.sql.exec("UPDATE jobs SET state = 'running', check_run = NULL, verdict = NULL, agent = 'agt_old2', step = 1");
+    });
+    expect(await job(p, 1, s)).toMatchObject({ state: "running", step: 0, reviews: [], reviewers: [{ id: CODE_REVIEW.id }] });
     // And requeued there (its reset clears the check, not these columns): this release's start freezes afresh.
     await api(token, "PATCH", path(p, `/${sec.id}`), { enabled: false });
     await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => {
@@ -394,6 +403,45 @@ describe("a job runs its reviewers one after another", () => {
     });
     await run(p);
     expect(await job(p, 1, s)).toMatchObject({ state: "running", step: 0, reviews: [], reviewers: [{ id: CODE_REVIEW.id }] });
+  });
+
+  it("the earlier agent's exit after its verdict spends nothing of the next reviewer's; the next one's deadline is its own", async () => {
+    const p = await newProject();
+    await add(p);
+    const s = await opened(p);
+    const first = one(p, 1);
+    toolOk(await submit(p, first, 1, s, submitArgs()));
+    // Its exit lands before the next agent is named, and again after.
+    await deliver({ id: eid(), type: "agent.exited", agent: first, reason: "exited" });
+    await run(p);
+    const second = one(p, 1);
+    await deliver({ id: eid(), type: "agent.exited", agent: first, reason: "exited" });
+    await run(p);
+    expect(await job(p, 1, s)).toMatchObject({ state: "running", step: 1, attempts: 0, agent: second });
+    expect(fake.agents.get(second)!.ended).toBe(false);
+    // The second's 60 minutes pass: an attempt of its own spent, a new agent for the same reviewer.
+    await runInDurableObject(reviews(p), (_o: unknown, st: DurableObjectState) => { st.storage.sql.exec("UPDATE jobs SET deadline_ms = 0 WHERE state = 'running'"); });
+    await run(p);
+    await dueNow(p);
+    await run(p);
+    expect(fake.agents.get(second)!.ended).toBe(true);
+    const third = one(p, 1);
+    expect(briefOf(third).text).toContain(`"Security"`);
+    expect(await job(p, 1, s)).toMatchObject({ state: "running", step: 1, attempts: 1 });
+  });
+
+  it("a head superseded between a reviewer's verdict and the next one's start: no next agent, the check cancelled", async () => {
+    const p = await newProject();
+    await add(p);
+    const s = await opened(p);
+    const first = one(p, 1);
+    toolOk(await submit(p, first, 1, s, submitArgs()));
+    const s2 = sha();
+    await push(p, 1, s2, "synchronize");
+    await run(p);
+    expect(agentsOf(p, 1).filter((a) => a.labels.sha === s).map((a) => [a.agent, a.ended])).toEqual([[first, true]]);
+    expect(checkOf(p, s)).toMatchObject({ status: "completed", conclusion: "cancelled" });
+    expect(await job(p, 1, s)).toMatchObject({ state: "superseded", reviews: [{ agent: first }] });
   });
 
   it("a head superseded during the second reviewer: that agent stopped, the check cancelled", async () => {
@@ -417,6 +465,11 @@ describe("no reviewer enabled", () => {
   it("no agent and no sandbox: the job is done, its check neutral saying so; no failed review for the worker; the manager's wait and a routine see it", async () => {
     const p = await newProject();
     await api(token, "PATCH", path(p, `/${CODE_REVIEW.id}`), { enabled: false });
+    const board = async (args: Record<string, unknown>) =>
+      toolOk(await callTool("board", await nest.sign(agentClaims("board", p.manager, { project: p.id, role: "manager", start: "1" })), "await_pr", args));
+    // A wait made before the review ends is told by ReviewDO's word, one made after answers at once: the same words.
+    const pending = await board({ pr: 1, until: "review_done", timeout_s: 600 });
+    expect(pending.status).toBe("waiting");
     const sandboxes = fake.sandboxes.size;
     const s = await opened(p);
     await run(p);
@@ -431,8 +484,9 @@ describe("no reviewer enabled", () => {
     const inProject = runInDurableObject as unknown as (s: unknown, f: (o: { recentActivity(days: number): Promise<any> }) => Promise<any>) => Promise<any>;
     const activity = await inProject(env.PROJECT.get(env.PROJECT.idFromName(p.id)), (o) => o.recentActivity(7));
     expect(activity.reviews).toEqual([expect.objectContaining({ pr: 1, sha: s, state: "done", verdict: null, conclusion: "no reviewer enabled" })]);
-    const wait = toolOk(await callTool("board", await nest.sign(agentClaims("board", p.manager, { project: p.id, role: "manager", start: "1" })), "await_pr", { pr: 1, until: "review_done", timeout_s: 600 }));
-    expect(wait).toMatchObject({ status: "met", detail: "PR #1: its review is done (no reviewer enabled)" });
+    expect(await board({ pr: 1, until: "review_done", timeout_s: 600 })).toMatchObject({ status: "met", detail: "PR #1: its review is done (no reviewer enabled)" });
+    await env.PROJECT.get(env.PROJECT.idFromName(p.id)).drain();
+    expect(fake.inbox.filter((m) => m.agent === p.manager && m.text.startsWith("await ")).map((m) => m.text)).toEqual([`await ${pending.wait.id}: PR #1: its review is done (no reviewer enabled).`]);
     // Enabled again: a re-run reviews it.
     await api(token, "PATCH", path(p, `/${CODE_REVIEW.id}`), { enabled: true });
     await deliverGithub("check_run", { action: "rerequested", check_run: { id: c.id, name: CHECK_NAME, head_sha: s, pull_requests: [{ number: 1 }] }, repository: { full_name: p.repo } });
