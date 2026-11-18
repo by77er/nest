@@ -5,12 +5,12 @@
 
 import { Text, Tooltip } from "@mantine/core";
 import { IconHourglass } from "@tabler/icons-react";
-import type { Task } from "../../api/types";
+import type { TaskSummary } from "../../api/types";
 import { icon, Stack, TriggerBadge, weight } from "../../layout";
 import { STATE_LABEL } from "../../status";
 
 /** `plainOnTouch` on a card: plain status on a phone (the card opens the drawer, which lists them). */
-export function WaitingBadge({ task, size = "sm", plainOnTouch = false }: { task: Task; size?: "sm" | "md"; plainOnTouch?: boolean }) {
+export function WaitingBadge({ task, size = "sm", plainOnTouch = false }: { task: TaskSummary; size?: "sm" | "md"; plainOnTouch?: boolean }) {
   const waiting = task.blocked_by.filter((b) => task.waiting_on.includes(b.id));
   if (waiting.length === 0) return null;
   return (

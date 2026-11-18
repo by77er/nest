@@ -4,7 +4,7 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ApiError, api } from "./client";
 import type { CreateReviewerBody, CreateRoutineBody, PutSecretBody, ReviewerPreset, UpdateReviewerBody, UpdateRoutineBody } from "./types";
-import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, UpdateTaskBody, Waiting } from "./types";
+import type { NetworkBody, Ask, Attention, CancelBody, ChatMessage, CreateProjectBody, CreateTaskBody, SettingsBody, Task, TaskSummary, UpdateTaskBody, Waiting } from "./types";
 import { splitAttention } from "./types";
 
 export const keys = {
@@ -30,6 +30,9 @@ export const keys = {
   attachableRepos: ["repos"] as const,
 };
 
+/** A task as the board's list holds it (`GET …/tasks`): a write's answer without its body and spec. */
+const summary = ({ body: _b, spec: _s, ...t }: Task): TaskSummary => t;
+
 /** How often each live view polls, in ms; `unread`: the sidebar's unread count, off the Manager page (which polls the chat itself). */
 export const POLL = { board: 5_000, chat: 3_000, unread: 10_000, asks: 5_000, project: 10_000, task: 5_000, manager: 10_000, reviews: 15_000, routines: 10_000 } as const;
 
@@ -40,7 +43,7 @@ export const useProjects = () => useQuery({ queryKey: keys.projects, queryFn: ap
 
 export const useProject = (id: string) => useQuery({ queryKey: keys.project(id), queryFn: () => api.project(id), refetchInterval: POLL.project });
 
-/** The board; `paused` while a card is being dragged, so a poll can't move cards under the pointer. */
+/** The board: its tasks as summaries; `paused` while a card is being dragged, so a poll can't move cards under the pointer. */
 export const useTasks = (id: string, o: { paused?: boolean } = {}) =>
   useQuery({ queryKey: keys.tasks(id), queryFn: () => api.tasks(id), refetchInterval: o.paused ? false : POLL.board });
 
@@ -163,7 +166,7 @@ export function useAnswerBlocked(id: string, onAnswered?: () => void) {
     onSuccess: (t) => {
       onAnswered?.();
       qc.setQueryData<Attention[]>(keys.attention(id), (old) => old?.filter((x) => !(x.kind === "blocked" && x.task === t.id)));
-      qc.setQueryData<Task[]>(keys.tasks(id), (old) => old?.map((x) => (x.id === t.id ? t : x)));
+      qc.setQueryData<TaskSummary[]>(keys.tasks(id), (old) => old?.map((x) => (x.id === t.id ? summary(t) : x)));
       void qc.invalidateQueries({ queryKey: keys.projects, exact: true });
       return qc.invalidateQueries({ queryKey: keys.attention(id) });
     },
@@ -180,7 +183,7 @@ function useRelationWrite<V extends { task: string }>(id: string, fn: (v: V) => 
     mutationFn: fn,
     meta: { failure },
     onSuccess: (t, v) => {
-      qc.setQueryData<Task[]>(keys.tasks(id), (old) => old?.map((x) => (x.id === t.id ? t : x)));
+      qc.setQueryData<TaskSummary[]>(keys.tasks(id), (old) => old?.map((x) => (x.id === t.id ? summary(t) : x)));
       void qc.invalidateQueries({ queryKey: keys.task(id, v.task) });
       void qc.invalidateQueries({ queryKey: keys.openPrs(id) });
       return qc.invalidateQueries({ queryKey: keys.tasks(id) });
@@ -372,7 +375,7 @@ function useTaskWrite<V extends { task: string }>(id: string, fn: (v: V) => Prom
     mutationFn: fn,
     meta: { failure },
     onSuccess: (data, v) => {
-      qc.setQueryData<Task[]>(keys.tasks(id), (old) => old?.map((t) => (t.id === data.id ? data : t)));
+      qc.setQueryData<TaskSummary[]>(keys.tasks(id), (old) => old?.map((t) => (t.id === data.id ? summary(data) : t)));
       void qc.invalidateQueries({ queryKey: keys.task(id, v.task) });
       return qc.invalidateQueries({ queryKey: keys.tasks(id) });
     },
@@ -385,7 +388,7 @@ export function useCreateTask(id: string) {
     mutationFn: (b: CreateTaskBody) => api.createTask(id, b),
     meta: { failure: "The task wasn't created" },
     onSuccess: (t) => {
-      qc.setQueryData<Task[]>(keys.tasks(id), (old) => (old ? [...old, t] : old));
+      qc.setQueryData<TaskSummary[]>(keys.tasks(id), (old) => (old ? [...old, summary(t)] : old));
       return qc.invalidateQueries({ queryKey: keys.tasks(id) });
     },
   });
@@ -413,7 +416,7 @@ export function useDeleteTask(id: string) {
     mutationFn: (v: { task: string }) => api.deleteTask(id, v.task),
     meta: { failure: "The task wasn't deleted" },
     onSuccess: (_d, v) => {
-      qc.setQueryData<Task[]>(keys.tasks(id), (old) => old?.filter((t) => t.id !== v.task));
+      qc.setQueryData<TaskSummary[]>(keys.tasks(id), (old) => old?.filter((t) => t.id !== v.task));
       qc.removeQueries({ queryKey: keys.task(id, v.task) });
       return qc.invalidateQueries({ queryKey: keys.tasks(id) });
     },
@@ -428,8 +431,8 @@ export function useReorderTask(id: string) {
     meta: { failure: "The task wasn't moved" },
     onMutate: async (v) => {
       await qc.cancelQueries({ queryKey: keys.tasks(id) });
-      const before = qc.getQueryData<Task[]>(keys.tasks(id));
-      qc.setQueryData<Task[]>(keys.tasks(id), (old) =>
+      const before = qc.getQueryData<TaskSummary[]>(keys.tasks(id));
+      qc.setQueryData<TaskSummary[]>(keys.tasks(id), (old) =>
         old?.map((t) => (t.id === v.task ? { ...t, ord: v.ord } : t)).sort((a, b) => a.ord - b.ord || a.created_ms - b.created_ms));
       return { before };
     },

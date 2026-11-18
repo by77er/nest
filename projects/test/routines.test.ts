@@ -464,7 +464,7 @@ describe("cost guards", () => {
       // And the routines' writers' step (README.md#routines).
       for (const c of ["source", "name_tainted", "prompt_tainted"]) sql.exec(`ALTER TABLE routines DROP COLUMN ${c}`);
       sql.exec("ALTER TABLE routine_runs DROP COLUMN brief_tainted");
-      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 4);
+      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 5);
       migrate(st.storage, MIGRATIONS);
       expect(sql.exec("SELECT nest_repos FROM routine_runs WHERE id = ?", r0.id).one().nest_repos).toBe(1);
       sql.exec("UPDATE routine_runs SET next_ms = 0 WHERE state = 'starting'");
@@ -1035,7 +1035,7 @@ describe("the manager's routine tools (README.md#routines)", () => {
       // As the release before left it: none of this step.
       for (const c of ["source", "name_tainted", "prompt_tainted"]) sql.exec(`ALTER TABLE routines DROP COLUMN ${c}`);
       sql.exec("ALTER TABLE routine_runs DROP COLUMN brief_tainted");
-      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 1);
+      sql.exec("UPDATE schema_version SET v = ?", MIGRATIONS.length - 2);
       migrate(st.storage, MIGRATIONS);
     });
     expect(await routine(s, id)).toMatchObject({ source: "owner", tainted: false });
