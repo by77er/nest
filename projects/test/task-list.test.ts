@@ -1,9 +1,10 @@
-// The board's list (`GET /api/projects/:id/tasks`, README.md#built-the-core): every task as `toTask` makes
-// it, but without its body and spec, read in a fixed number of SQL statements however many tasks there are.
+// The board's list (`GET /api/projects/:id/tasks`, README.md#built-the-core): every task as the list answered
+// it before, but without its body and spec, read in a fixed number of SQL statements however many tasks there are.
 // The drawer's task read and the agents' `list_tasks` keep theirs.
 import { env, runInDurableObject, SELF } from "cloudflare:test";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { resetAccessKeys } from "../src/access";
+import type { TaskAutoMerge } from "../src/automerge";
 import type { ProjectDO, Task } from "../src/do/project";
 import { AccessTeam, agentClaims, api, APP, callTool, FakeNest, installFetch, Signer } from "./fake-nest";
 
@@ -35,13 +36,59 @@ async function newProject() {
 type P = Awaited<ReturnType<typeof newProject>>;
 const stub = (p: P) => env.PROJECT.get(env.PROJECT.idFromName(p.id));
 // What the DO keeps private, reached in the object (runInDurableObject).
-type Inner = { toTask(r: Record<string, SqlStorageValue>): Task; ctx: DurableObjectState };
+type Inner = { ctx: DurableObjectState };
 const inner = (o: ProjectDO) => o as unknown as Inner;
+type Row = Record<string, SqlStorageValue>;
 
 /**
- * Every case the list carries: PRs open and merged (two on one task), dependencies both ways (one blocker
- * done, so `waiting_on` differs from `blocked_by`), issues with a failed, an owed and a closed close, a task a
- * tainted session wrote, a blocked task, a cancelled one, specced and not.
+ * The oracle: `toTask` and the list as they were before summaries (main at e655ace, `toTask`, `relations`,
+ * `taskIssue`, `blockedOf`, `prAutoMerge`), copied here frozen, statement for statement, so a change to the
+ * code the list and `getTask` now share can't move both sides at once.
+ */
+function before(sql: SqlStorage): Task[] {
+  const blockedOf = (r: Row) => r.blocked_ms === null || r.blocked_ms === undefined ? null : {
+    at_ms: r.blocked_ms as number, by: r.blocked_by as string, role: r.blocked_role as "manager" | "worker", reason: r.blocked_reason as string,
+    question: (r.blocked_question as string | null) ?? null, tainted: r.blocked_tainted === 1,
+  };
+  const prAutoMerge = (r: Row): TaskAutoMerge | null => {
+    const status = r.am_status ? (JSON.parse(r.am_status as string) as TaskAutoMerge) : null;
+    if (r.am_owed) return { state: "pending", method: status?.method ?? null, error: status?.error ?? null, at_ms: status?.at_ms ?? (r.attached_ms as number) };
+    return status;
+  };
+  const taskIssue = (r: Row) => {
+    if (r.issue === null || r.issue === undefined) return null;
+    const c = sql.exec("SELECT next_ms, closed_ms, error FROM issue_closes WHERE task = ?", r.id).toArray()[0];
+    const close = !c ? null : c.closed_ms !== null ? "closed" : c.next_ms !== null ? "owed" : "failed";
+    return { number: r.issue as number, close, error: close === "failed" ? ((c!.error as string | null) ?? null) : null } as Task["issue"];
+  };
+  const relations = (id: string) => {
+    const prs = sql.exec("SELECT * FROM task_prs WHERE task = ? AND state != 'detached' ORDER BY attached_ms, pr", id).toArray().map((p) => ({
+      number: p.pr as number, state: p.state as "open" | "merged", title: (p.title as string | null) ?? null, fork: p.fork === null ? null : p.fork === 1,
+      attached_by: p.attached_by as string, attached_ms: p.attached_ms as number, auto_merge: prAutoMerge(p),
+    }));
+    const ref = (r: Row) => ({ id: r.id as string, title: r.title as string, state: r.state as Task["state"] });
+    const blocked_by = sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.blocker WHERE d.task = ? ORDER BY d.at_ms", id).toArray().map(ref);
+    const blocks = sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.task WHERE d.blocker = ? ORDER BY d.at_ms", id).toArray().map(ref);
+    return { pr: prs[0]?.number ?? null, prs, blocked_by, blocks, waiting_on: blocked_by.filter((b) => b.state !== "done").map((b) => b.id) };
+  };
+  const toTask = (r: Row): Task => ({
+    id: r.id as string, title: r.title as string, body: r.body as string, spec: r.spec ? JSON.parse(r.spec as string) : null,
+    state: r.state as Task["state"], ord: r.ord as number, assignee: (r.assignee as string | null) ?? null,
+    start_error: (r.start_error as string | null) ?? null, tainted: r.tainted === 1, blocked: blockedOf(r),
+    worker_live: r.worker_live === 1 && r.state !== "done" && r.state !== "cancelled",
+    ...relations(r.id as string), issue: taskIssue(r),
+    created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
+  });
+  return sql.exec("SELECT t.*, EXISTS (SELECT 1 FROM history h WHERE h.task = t.id AND h.tainted = 1) AS tainted FROM tasks t ORDER BY t.ord, t.created_ms").toArray().map(toTask);
+}
+/** A summary's keys, in the order the list has always answered them. */
+const SUMMARY_KEYS = ["id", "title", "state", "ord", "assignee", "start_error", "tainted", "blocked", "worker_live", "pr", "prs", "blocked_by", "blocks", "waiting_on", "issue", "created_ms", "updated_ms"];
+
+/**
+ * Every case the list carries: PRs open, merged (two on one task) and detached, dependencies both ways (one
+ * blocker done, so `waiting_on` differs from `blocked_by`; some added in the same ms, both ways), issues with a
+ * failed, an owed and a closed close, a task a tainted session wrote, a blocked task, a cancelled one, a live
+ * worker (and a stale flag on a cancelled task), specced and not.
  */
 async function seed(p: P) {
   const s = stub(p);
@@ -62,6 +109,12 @@ async function seed(p: P) {
     blocked: await make("blocked"),
     cancelled: await make("cancelled"),
     plain: await make("plain draft"),
+    live: await make("a live worker"),
+    tieWaiter: await make("waits on three added at once"),
+    tieBlocker: await make("blocks three added at once"),
+    tieA: await make("tie a"),
+    tieB: await make("tie b"),
+    tieC: await make("tie c"),
   };
   for (const id of [ids.prs, ids.blocker, ids.doneBlocker, ids.waiter, ids.blocked, ids.cancelled]) expect((await s.writeSpec(id, spec)).ok).toBe(true);
   await s.onPullRequest({ pr: 11, task: ids.prs, action: "opened", merged: false, title: "first", fork: false });
@@ -73,6 +126,12 @@ async function seed(p: P) {
   expect((await s.addDependency(ids.waiter, ids.doneBlocker, owner)).ok).toBe(true);
   expect((await s.addDependency(ids.blocker, ids.prs, owner)).ok).toBe(true);
   expect((await s.cancel(ids.cancelled, owner, "not needed")).ok).toBe(true);
+  await s.onPullRequest({ pr: 14, task: ids.plain, action: "opened", merged: false, title: "closed unmerged", fork: true });
+  await s.onPullRequest({ pr: 14, task: ids.plain, action: "closed", merged: false });
+  // Added against id order, so the order they were added in and their ids' order differ.
+  const three = [ids.tieA, ids.tieB, ids.tieC].sort().reverse();
+  for (const t of three) expect((await s.addDependency(ids.tieWaiter, t, owner)).ok).toBe(true);
+  for (const t of three) expect((await s.addDependency(t, ids.tieBlocker, owner)).ok).toBe(true);
   await runInDurableObject(s, async (o: ProjectDO) => {
     const blocked = await (o as unknown as { block(id: string, c: unknown, by: string, reason: string, q: string | null): Promise<{ ok: boolean }> })
       .block(ids.blocked, { kind: "agent", agent: p.manager, role: "manager", labels: {}, tainted: true }, "manager", "why", "which one?");
@@ -85,17 +144,16 @@ async function seed(p: P) {
     sql.exec("INSERT INTO issue_closes (task, issue, next_ms, owed_ms) VALUES (?, 42, ?, 1)", ids.issueOwed, Date.now() + 3_600_000);
     sql.exec("UPDATE tasks SET issue = 43 WHERE id = ?", ids.issueClosed);
     sql.exec("INSERT INTO issue_closes (task, issue, next_ms, closed_ms, owed_ms) VALUES (?, 43, NULL, 2, 1)", ids.issueClosed);
+    // In the same ms, both ways.
+    sql.exec("UPDATE task_deps SET at_ms = 5 WHERE task = ? OR blocker = ?", ids.tieWaiter, ids.tieBlocker);
+    // A worker live on one, and the flag left on a task that's over (never shown as live).
+    sql.exec("UPDATE tasks SET worker_live = 1 WHERE id IN (?, ?)", ids.live, ids.cancelled);
   });
   return ids;
 }
 
-/** What `toTask` makes of every task, in the board's order: the list as it was before summaries. */
-const fullTasks = (p: P) =>
-  runInDurableObject(stub(p), (o: ProjectDO) => {
-    const sql = inner(o).ctx.storage.sql;
-    const rows = sql.exec("SELECT t.*, EXISTS (SELECT 1 FROM history h WHERE h.task = t.id AND h.tainted = 1) AS tainted FROM tasks t ORDER BY t.ord, t.created_ms").toArray();
-    return rows.map((r) => inner(o).toTask(r));
-  });
+/** The list as it was before summaries (`before`), read in the object. */
+const fullTasks = (p: P) => runInDurableObject(stub(p), (o: ProjectDO) => before(inner(o).ctx.storage.sql));
 
 /** `sql.exec` calls `f` makes in the object. */
 async function statements<T>(p: P, f: (o: ProjectDO) => Promise<T>): Promise<{ n: number; value: T }> {
@@ -114,7 +172,7 @@ async function statements<T>(p: P, f: (o: ProjectDO) => Promise<T>): Promise<{ n
 }
 
 describe("the board's list", () => {
-  it("is each task as toTask makes it, without its body and spec, in the board's order", async () => {
+  it("is each task as the list was before, without its body and spec, in the board's order", async () => {
     const p = await newProject();
     const ids = await seed(p);
     const list = await api(token, "GET", `/api/projects/${p.id}/tasks`);
@@ -123,7 +181,7 @@ describe("the board's list", () => {
     expect(full.map((t) => t.id)).toEqual(Object.values(ids));
     // Field by field, keys in the same order.
     expect(list.body).toEqual(full.map(({ body: _b, spec: _s, ...t }) => t));
-    expect(list.body.map((t: object) => Object.keys(t))).toEqual(full.map(({ body: _b, spec: _s, ...t }) => Object.keys(t)));
+    for (const t of list.body) expect(Object.keys(t)).toEqual(SUMMARY_KEYS);
     for (const t of list.body) {
       expect(t).not.toHaveProperty("body");
       expect(t).not.toHaveProperty("spec");
@@ -141,21 +199,31 @@ describe("the board's list", () => {
     expect(full.filter((t) => t.tainted).map((t) => t.id).sort()).toEqual([ids.tainted, ids.blocked].sort());
     expect(by.get(ids.blocked)!.blocked).toMatchObject({ role: "manager", question: "which one?", tainted: true });
     expect(by.get(ids.cancelled)!.state).toBe("cancelled");
+    expect(by.get(ids.cancelled)!.worker_live).toBe(false);
+    expect(by.get(ids.live)!.worker_live).toBe(true);
+    expect(by.get(ids.plain)!.prs).toEqual([]);
+    expect(by.get(ids.tieWaiter)!.blocked_by).toHaveLength(3);
+    expect(by.get(ids.tieBlocker)!.blocks).toHaveLength(3);
   });
 
-  it("the drawer's task read keeps the body, the spec and the history", async () => {
+  it("the drawer's task read is the task as before, with its body, its spec and its history", async () => {
     const p = await newProject();
     const ids = await seed(p);
     const t = (await api(token, "GET", `/api/projects/${p.id}/tasks/${ids.waiter}`)).body;
     const full = (await fullTasks(p)).find((x) => x.id === ids.waiter)!;
     const { history, ...rest } = t;
     expect(rest).toEqual(full);
+    expect(Object.keys(rest)).toEqual(["id", "title", "body", "spec", ...SUMMARY_KEYS.slice(2)]);
+    for (const id of [ids.tieWaiter, ids.tieBlocker, ids.prs]) {
+      const { history: _h, ...other } = (await api(token, "GET", `/api/projects/${p.id}/tasks/${id}`)).body;
+      expect(other).toEqual((await fullTasks(p)).find((x) => x.id === id));
+    }
     expect(t.body).toBe("waits on two's body");
     expect(t.spec).toEqual(spec);
     expect(history.map((h: { action: string }) => h.action)).toContain("dependency_added");
   });
 
-  it("the manager's list_tasks answers each task as toTask makes it, with `specced` for its spec", async () => {
+  it("the manager's list_tasks answers each task as before, with `specced` for its spec", async () => {
     const p = await newProject();
     await seed(p);
     const full = await fullTasks(p);
@@ -164,7 +232,7 @@ describe("the board's list", () => {
     expect(r.result.structuredContent.tasks).toEqual(full.map(({ body: _b, spec: s, ...t }) => ({ ...t, specced: s !== null })));
   });
 
-  it("is read in the same number of statements for 3 tasks and for 300", async () => {
+  it("is read in the same number of statements for 6 tasks and for 300", async () => {
     const count = async (n: number) => {
       const p = await newProject();
       await runInDurableObject(stub(p), async (o: ProjectDO) => {
@@ -183,7 +251,7 @@ describe("the board's list", () => {
       expect(r.value.ok && r.value.value.length).toBe(n);
       return r.n;
     };
-    const few = await count(3);
+    const few = await count(6);
     expect(await count(300)).toBe(few);
   }, 60_000);
 
@@ -230,5 +298,10 @@ describe("the list's size", () => {
     const n = (await statements(p, (o) => o.listTasks())).n;
     console.log(`list of 300 tasks: ${raw.length} bytes raw, ${gz.length} bytes gzip, ${n} SQL statements`);
     expect(res.status).toBe(200);
+    // Less than the bodies alone (300 KB) would be: none of them, nor any spec, is in it.
+    const text = new TextDecoder().decode(raw);
+    expect(text).not.toContain('"body"');
+    expect(text).not.toContain('"spec"');
+    expect(raw.length).toBeLessThan(300 * 1024);
   }, 120_000);
 });

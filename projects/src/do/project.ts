@@ -713,7 +713,7 @@ export const MIGRATIONS = [
   [
     // The board's list reads which tasks have a tainted write in one statement (`taskSummaries`): only the
     // tainted rows are indexed, so it reads those and none of the rest of the history.
-    "CREATE INDEX history_tainted ON history (task) WHERE tainted = 1",
+    "CREATE INDEX IF NOT EXISTS history_tainted ON history (task) WHERE tainted = 1",
   ],
 ] as const;
 
@@ -792,7 +792,7 @@ type Relations = Pick<Task, "pr" | "prs" | "blocked_by" | "blocks" | "waiting_on
 
 /**
  * A task as the list carries it, from its row, its relations, its issue's close row (undefined: none, or no
- * issue) and whether a tainted session ever wrote it. Its keys in `Task`'s order.
+ * issue) and whether a tainted session ever wrote it. Its keys in the order `toTask` has always answered them.
  */
 function summaryOf(r: Row, rel: Relations, close: Row | undefined, tainted: boolean): TaskSummary {
   return {
@@ -1026,11 +1026,14 @@ export class ProjectDO extends DurableObject<Env> {
     return { id, title, body: r.body as string, spec: r.spec ? (JSON.parse(r.spec as string) as Spec) : null, ...rest };
   }
 
-  /** A task's PRs and dependencies, as Task carries them. */
+  /**
+   * A task's PRs and dependencies, as Task carries them. Dependencies added in the same ms: its blockers by id,
+   * the tasks waiting on it as added (`taskSummaries` orders them the same).
+   */
   private relations(id: string): Relations {
     const prs = this.sql.exec("SELECT * FROM task_prs WHERE task = ? AND state != 'detached' ORDER BY attached_ms, pr", id).toArray().map(taskPr);
     const blocked_by = this.sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.blocker WHERE d.task = ? ORDER BY d.at_ms, d.blocker", id).toArray().map(taskRef);
-    const blocks = this.sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.task WHERE d.blocker = ? ORDER BY d.at_ms, d.task", id).toArray().map(taskRef);
+    const blocks = this.sql.exec("SELECT t.id, t.title, t.state FROM task_deps d JOIN tasks t ON t.id = d.task WHERE d.blocker = ? ORDER BY d.at_ms, d.rowid", id).toArray().map(taskRef);
     return { pr: prs[0]?.number ?? null, prs, blocked_by, blocks, waiting_on: waitingOn(blocked_by) };
   }
 
@@ -1051,7 +1054,7 @@ export class ProjectDO extends DurableObject<Env> {
     const blocks = new Map<string, TaskRef[]>();
     for (const d of this.sql.exec(
       `SELECT d.task, d.blocker, b.id AS b_id, b.title AS b_title, b.state AS b_state, w.id AS w_id, w.title AS w_title, w.state AS w_state
-        FROM task_deps d LEFT JOIN tasks b ON b.id = d.blocker LEFT JOIN tasks w ON w.id = d.task ORDER BY d.at_ms, d.task, d.blocker`,
+        FROM task_deps d LEFT JOIN tasks b ON b.id = d.blocker LEFT JOIN tasks w ON w.id = d.task ORDER BY d.at_ms, d.blocker, d.rowid`,
     ).toArray()) {
       if (d.b_id !== null) group(blockedBy, d.task as string).push({ id: d.b_id as string, title: d.b_title as string, state: d.b_state as TaskState });
       if (d.w_id !== null) group(blocks, d.blocker as string).push({ id: d.w_id as string, title: d.w_title as string, state: d.w_state as TaskState });
