@@ -901,6 +901,11 @@ const app = {
     { name: "reviewers-error", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-error", httpErrors: true, ready: shown("[data-ds=error]") },
     { name: "reviewers-add", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-empty", full: false, after: async (p) => { const b = p.getByRole("button", { name: "Add reviewer" }); await b.scrollIntoViewIfNeeded(); await b.click(); await p.getByRole("menuitem", { name: /Custom reviewer/ }).waitFor(); } },
     { name: "reviewer-edit-tainted", section: "project", path: "/projects/prj_demo/reviews", full: false, after: (p) => p.getByRole("button", { name: "Edit Security" }).click() },
+    // The editor's Delete, set apart at its end; its confirmation, and the one for the only reviewer on; "Go to reviewers" from the top's warning.
+    { name: "reviewer-edit-delete", section: "project", path: "/projects/prj_demo/reviews", full: false, after: async (p) => { await p.getByRole("button", { name: "Edit Security" }).click(); await p.getByRole("button", { name: "Delete reviewer" }).scrollIntoViewIfNeeded(); } },
+    { name: "reviewer-delete-confirm", section: "project", path: "/projects/prj_demo/reviews", full: false, after: async (p) => { await p.getByRole("button", { name: "Edit Security" }).click(); await p.getByRole("button", { name: "Delete reviewer" }).click(); await p.getByRole("button", { name: "Keep it" }).waitFor(); } },
+    { name: "reviewer-delete-only-on", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-one-on", full: false, after: async (p) => { await p.getByRole("button", { name: "Edit Code review" }).click(); await p.getByRole("button", { name: "Delete reviewer" }).click(); await p.getByRole("button", { name: "Keep it" }).waitFor(); } },
+    { name: "reviewers-go-to", section: "project", path: "/projects/prj_demo/reviews", fixture: "reviewers-none-on", full: false, after: async (p) => { await p.getByRole("button", { name: "Go to reviewers" }).click(); await p.waitForTimeout(400); } },
     { name: "reviewer-new-invalid", section: "project", path: "/projects/prj_demo/reviews", full: false, after: async (p) => {
       await p.getByRole("button", { name: "Add reviewer" }).click();
       const sheet = p.getByRole("dialog", { name: "New reviewer" });

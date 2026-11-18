@@ -63,7 +63,7 @@ export function EditorSheet({ opened, onClose, title, children, del }: {
                   {del.note}
                 </Text>
                 <Row>
-                  <Button variant="default" color="danger" disabled={del.disabled} onClick={del.onClick}>
+                  <Button variant="light" color="danger" disabled={del.disabled} onClick={del.onClick}>
                     {del.label}
                   </Button>
                 </Row>

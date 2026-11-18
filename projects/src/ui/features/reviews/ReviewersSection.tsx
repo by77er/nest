@@ -37,7 +37,12 @@ function AddReviewer({ projectId, reviewers, full, describedBy, onCustom }: { pr
       <Menu.Target>{button({ rightSection: <IconChevronDown size={icon.sm} /> })}</Menu.Target>
       <Menu.Dropdown>
         <Menu.Item leftSection={<IconShieldCheck size={icon.md} />} onClick={() => add.mutate("code")}>
-          {BUILT_IN.name}
+          <Stack gap="2xs">
+            <Text fz="sm">{BUILT_IN.name}</Text>
+            <Text fz="xs" c="dimmed">
+              Built in: {BUILT_IN.dimensions.join(", ")}
+            </Text>
+          </Stack>
         </Menu.Item>
         <Menu.Divider />
         <Menu.Item leftSection={<IconPlus size={icon.md} />} onClick={onCustom}>
@@ -93,7 +98,7 @@ export function ReviewersSection({ projectId, reviewers, headingRef }: { project
   const askDelete = (r: Reviewer) =>
     confirmDelete({
       title: `Delete ${r.name}?`,
-      body: `Reviews already under way keep it; no PR head after this gets its review.${r.enabled && on.length === 1 ? " It's the only reviewer on: without it, PRs aren't reviewed, and the required check passes without a review." : ""}`,
+      body: `Reviews under way finish with it; later PR heads won't get its review.${r.enabled && on.length === 1 ? " It's the only reviewer on: without it, PRs aren't reviewed, and the required check passes without a review." : ""}`,
       // Its card and Edit go with it: focus goes to the section's heading.
       onConfirm: () => del.mutate(r.id, { onSuccess: () => { close(); headingRef?.current?.focus(); } }),
     });
@@ -139,7 +144,7 @@ export function ReviewersSection({ projectId, reviewers, headingRef }: { project
         opened={editing !== null}
         onClose={close}
         title={editingReviewer ? `Edit ${editingReviewer.name}` : "New reviewer"}
-        del={editingReviewer && { note: "Reviews already under way keep it.", label: "Delete reviewer", onClick: () => askDelete(editingReviewer) }}
+        del={editingReviewer && { note: "Reviews under way finish with it.", label: "Delete reviewer", onClick: () => askDelete(editingReviewer) }}
       >
         <ReviewerForm key={editingReviewer?.id ?? "new"} projectId={projectId} editing={editingReviewer} onDone={close} />
       </EditorSheet>

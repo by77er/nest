@@ -12,7 +12,7 @@
 // PR comments reach workers: a user with a login, or by id only; nobody otherwise), "triage-empty" (no
 // issues or proposals waiting) / "proposals-only" (no issues, two routines' proposals) / "issues-anyone" (issues from
 // anyone) / "triage-dropped" (issues the cap on waiting ones left out) / "issues-no-one" (an org's repo, no comments user:
-// no one's issues come in) / "held-reviews" and "held-many" (reviews waiting for the owner's approval: two, or a dozen with long titles and logins) / "reviews-open" (the review gate turned off) / "reviewers-several" (verdicts of two reviewers) / "reviewers-none-on", "reviewers-empty", "reviewers-full" and "reviewers-error" (the project's reviewers: all off, none, the limit, failing to load) / "triage-long" (24 issues, long titles, bodies and logins), or "routines-empty" (no
+// no one's issues come in) / "held-reviews" and "held-many" (reviews waiting for the owner's approval: two, or a dozen with long titles and logins) / "reviews-open" (the review gate turned off) / "reviewers-several" (verdicts of two reviewers) / "reviewers-none-on", "reviewers-one-on", "reviewers-empty", "reviewers-full" and "reviewers-error" (the project's reviewers: all off, only the built-in on, none, the limit, failing to load) / "triage-long" (24 issues, long titles, bodies and logins), or "routines-empty" (no
 // routines, runs, proposals or notes) / "routines-long" (many and long runs, proposals and notes). Traces come from
 // trace.mjs: history pages plus a live ring, its turn still running (the chat's stream and Stop).
 
@@ -458,7 +458,8 @@ const RICH = [
   };
 
   // The project's reviewers (README.md#reviewers): the built-in; the manager's, written in a session that read
-  // an issue ("By the manager", "Tainted"); one off. "reviewers-none-on": every one off; "reviewers-empty": none;
+  // an issue ("By the manager", "Tainted"); one off. "reviewers-none-on": every one off; "reviewers-one-on": the
+  // built-in on, another off; "reviewers-empty": none;
   // "reviewers-full": the limit (8), long names and instructions; "reviewers-error": the list fails to load.
   const reviewer = (id, name, dimensions, o = {}) => ({
     id, name, dimensions, instructions: "Judge each dimension separately, from the PR's diff and the repo's own docs.", enabled: true, source: "owner", tainted: false, created_ms: now - 9 * DAY, updated_ms: now - 2 * DAY, ...o,
@@ -467,6 +468,7 @@ const RICH = [
     instructions: "Judge three things separately: correctness (does it do what it claims, without bugs or regressions), quality (clear, tested, no needless code) and architectural cohesiveness (does it fit the repo's design; read its own docs, READMEs and conventions to judge that).",
   });
   const reviewers = variant === "reviewers-empty" ? []
+    : variant === "reviewers-one-on" ? [CODE_REVIEW, reviewer("rvw_docs3m", "Docs", ["Accuracy"], { enabled: false })]
     : variant === "reviewers-full" ? [CODE_REVIEW, ...Array.from({ length: 7 }, (_, k) => reviewer(`rvw_full${k}`, k % 2 ? `Reviewer ${k + 2}` : `Accessibility and internationalisation of every user-facing string, form and page (${k + 2})`, k % 2 ? ["Quality"] : ["Contrast", "Keyboard reach", "Screen-reader labels", "Right-to-left layouts", "Translatable strings", "Date and number formats"], {
       instructions: "Check every changed page and form against WCAG 2.2 AA, and every user-facing string for translation: no concatenated sentences, no hard-coded formats. ".repeat(4), enabled: k !== 3 }))]
     : [

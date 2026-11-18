@@ -257,14 +257,14 @@ describe("the Reviewers section", () => {
     expect(await screen.findByText("No reviewers")).toBeInTheDocument();
     expect(screen.getByText("No reviewer is on")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Add reviewer" }));
-    await user.click(await screen.findByRole("menuitem", { name: "Code review" }));
+    await user.click(await screen.findByRole("menuitem", { name: /^Code review Built in: Correctness, Quality, Architectural cohesiveness$/ }));
     await waitFor(() => expect(api.writes).toContainEqual({ method: "POST", path: "/api/projects/prj_one/reviewers", body: { preset: "code" } }));
     expect(await card("Code review")).toBeInTheDocument();
     await waitFor(() => expect(screen.queryByText("No reviewer is on")).toBeNull());
     // With the built-in there, Add opens the editor for a custom one: no menu of one.
     await user.click(screen.getByRole("button", { name: "Add reviewer" }));
     expect(await screen.findByRole("dialog", { name: "New reviewer" })).toBeInTheDocument();
-    expect(screen.queryByRole("menuitem", { name: "Code review" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: /^Code review/ })).toBeNull();
   });
 
   it("a custom reviewer: checked with the Worker's schema before it's sent (empty name, duplicate dimension, at most 6), then added", async () => {
