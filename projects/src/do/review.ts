@@ -771,8 +771,9 @@ export class ReviewDO extends DurableObject<Env> {
 
   /**
    * A running job's reviewer ended without a verdict (it exited, or its deadline passed): its agent is
-   * stopped with its sandbox, and a new reviewer starts, up to MAX_RETRIES times; then the job fails, its
-   * check completed as `action_required` with the reason. The slot frees either way.
+   * stopped with its sandbox, and a new agent starts for the same reviewer, up to MAX_RETRIES times (each
+   * reviewer has its own); then the job fails, its check completed as `action_required` with the reason and
+   * the reviews already given. The slot frees either way.
    */
   private spendAttempt(j: Row, why: string, what: "exited" | "timed out"): void {
     if (j.agent !== null) this.oweStop(j.agent as string, what);
@@ -786,10 +787,12 @@ export class ReviewDO extends DurableObject<Env> {
       );
     } else {
       this.sql.exec("UPDATE jobs SET attempts = ? WHERE pr = ? AND sha = ?", attempts, j.pr, j.sha);
-      this.end({ ...j, agent: null }, "give_up", NO_VERDICT, {
+      const rs = frozenOf((j.reviewers as string | null) ?? null);
+      const whose = rs.length > 1 ? `${currentReviewer(j).name} (reviewer ${(j.step as number) + 1} of ${rs.length}): ` : "";
+      this.end({ ...j, agent: null }, "give_up", NO_VERDICT, withGiven(j, {
         title: "No verdict",
-        summary: `${attempts} reviewers ended without submitting a verdict (the last: ${why}). Re-run this check to review the commit again.`,
-      }, why);
+        summary: `${whose}${attempts} reviewers ended without submitting a verdict (the last: ${why}). Re-run this check to review the commit again.`,
+      }), why);
     }
   }
 
@@ -830,7 +833,8 @@ export class ReviewDO extends DurableObject<Env> {
     if (!r) return fail(404, "no review for your PR and commit");
     switch (tool) {
       case "review_get": {
-        const rv = reviewerOf(r);
+        if (r.agent !== caller.agent) return fail(403, "you aren't this review's current reviewer");
+        const rv = currentReviewer(r);
         return ok({
           repo: await this.repo(), pr: r.pr, sha: r.sha, base: r.base, title: r.title, state: r.state,
           reviewer: { name: rv.name, dimensions: rv.dimensions, instructions: rv.instructions },
@@ -841,14 +845,31 @@ export class ReviewDO extends DurableObject<Env> {
         if (r.verdict !== null) return fail(409, "this review already has its verdict");
         if (r.state !== "running") return fail(409, `this review is ${r.state}`);
         // Refused (nothing recorded, still its one submit to make) unless it names each dimension once.
-        const made = reviewOf(reviewerOf(r), a.verdicts as Submitted[], a.summary as string, { agent: caller.agent, tainted: caller.tainted });
+        const made = reviewOf(currentReviewer(r), a.verdicts as Submitted[], a.summary as string, { agent: caller.agent, tainted: caller.tainted });
         if (!made.ok) return fail(400, made.error);
-        const verdict: Verdict = { reviews: [made.review] };
+        const given = [...reviewsOf(r), made.review];
+        const rs = frozenOf((r.reviewers as string | null) ?? null);
+        const step = r.step as number;
+        if (step + 1 < rs.length) {
+          // The next reviewer: this one's agent stopped with its sandbox, a new agent (a new start) for the next, its own retries and deadline.
+          if (!this.move(r.pr as number, r.sha as string, "running", "next")) return fail(409, "this review moved meanwhile");
+          this.sql.exec(
+            `UPDATE jobs SET reviews = ?, step = ?, attempts = 0, agent = NULL, briefed = 0, runs = runs + 1, next_ms = ?, deadline_ms = ?, errors = 0, error = NULL
+              WHERE pr = ? AND sha = ?`,
+            JSON.stringify(given), step + 1, Date.now(), Date.now() + REVIEW_DEADLINE_MS, r.pr, r.sha,
+          );
+          this.oweStop(caller.agent, "done");
+          if (r.check_run !== null) this.oweCheck(r.check_run as number, { status: "in_progress", output: reviewingOutput(r.sha as string, rs, step + 1) });
+          await this.arm();
+          return ok({ recorded: true, passed: reviewPassed(made.review), conclusion: null, next: `reviewer ${step + 2} of ${rs.length}` });
+        }
+        const verdict: Verdict = { reviews: given };
         const check = verdictCheck(verdict);
-        this.sql.exec("UPDATE jobs SET verdict = ?, tainted = ? WHERE pr = ? AND sha = ?", storedVerdict(verdict), caller.tainted ? 1 : 0, r.pr, r.sha);
+        this.sql.exec("UPDATE jobs SET verdict = ?, reviews = ?, tainted = ? WHERE pr = ? AND sha = ?",
+          storedVerdict(verdict), JSON.stringify(given), given.some((x) => x.tainted) ? 1 : 0, r.pr, r.sha);
         this.end(r, "verdict", check.conclusion, check.output);
         await this.arm();
-        return ok({ recorded: true, conclusion: check.conclusion });
+        return ok({ recorded: true, passed: reviewPassed(made.review), conclusion: check.conclusion });
       }
     }
     return fail(400, `unknown tool ${tool}`);
@@ -985,7 +1006,10 @@ export class ReviewDO extends DurableObject<Env> {
     for (const q of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'queued' AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       if (!this.underCap()) break;
       if (!this.move(q.pr as number, q.sha as string, "queued", "start")) continue;
-      this.sql.exec("UPDATE jobs SET runs = runs + 1, agent = NULL, briefed = 0, next_ms = ?, deadline_ms = ? WHERE pr = ? AND sha = ?", now, now + REVIEW_DEADLINE_MS, q.pr, q.sha);
+      // Its reviewers, frozen in this step as they are now: the enabled ones in creation order. Unless it froze
+      // them before and waited for room: then it resumes with the reviewer at work, the reviews given kept.
+      this.sql.exec("UPDATE jobs SET reviewers = COALESCE(reviewers, ?), runs = runs + 1, agent = NULL, briefed = 0, next_ms = ?, deadline_ms = ? WHERE pr = ? AND sha = ?",
+        JSON.stringify(freeze(this.reviewerRows())), now, now + REVIEW_DEADLINE_MS, q.pr, q.sha);
     }
     for (const r of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'running' AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       await this.advance(nest, github, repo, r.pr as number, r.sha as string);
@@ -994,7 +1018,10 @@ export class ReviewDO extends DurableObject<Env> {
     await this.arm();
   }
 
-  /** A running job's next step: its check run, then its reviewer, then the reviewer's brief. */
+  /**
+   * A running job's next step: its check run, then its current reviewer's agent, then that agent's brief. A job
+   * with no reviewer frozen is done once its check is made, `neutral`: no agent, no sandbox.
+   */
   private async advance(nest: Nest, github: () => Promise<GitHub>, repo: string, pr: number, sha: string): Promise<void> {
     const before = this.jobRow(pr, sha);
     if (!before || before.state !== "running") return;
@@ -1011,7 +1038,7 @@ export class ReviewDO extends DurableObject<Env> {
         // A create whose answer was lost made a check run all the same: found by its external id.
         const found = (before.errors as number) > 0 ? (await gh.checkRunsAt(repo, sha)).find((c) => c.external_id === external) : undefined;
         const made = found ?? (await gh.createCheckRun(repo, {
-          head_sha: sha, external_id: external, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}`, output: reviewingOutput(sha, reviewerOf(before)),
+          head_sha: sha, external_id: external, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}`, output: jobOutput(before),
         }))!;
         const appId = made.app?.id;
         if (typeof appId === "number" && this.setting("github_app_id") !== String(appId)) {
@@ -1029,6 +1056,10 @@ export class ReviewDO extends DurableObject<Env> {
       }
       const j0 = current();
       if (!j0) return;
+      if (frozenOf((j0.reviewers as string | null) ?? null).length === 0) {
+        this.end(j0, "verdict", NO_REVIEWER, NONE_OUTPUT);
+        return;
+      }
       let agent = (j0.agent as string | null) ?? null;
       if (!agent) {
         const labels = { project, role: "reviewer", pr: String(pr), sha, start: String(runs) };
@@ -1069,7 +1100,7 @@ export class ReviewDO extends DurableObject<Env> {
         // Named on the job in the step the create's answer came, before any other await, so its exit finds it.
         this.sql.exec("UPDATE jobs SET agent = ?, capacity_ms = NULL, room_waits = 0 WHERE pr = ? AND sha = ?", agent, pr, sha);
         // It waited for room: its check says it's reviewing again.
-        if (j0.capacity_ms !== null && j0.check_run !== null) this.oweCheck(j0.check_run as number, { status: "in_progress", output: reviewingOutput(sha, reviewerOf(j0)) });
+        if (j0.capacity_ms !== null && j0.check_run !== null) this.oweCheck(j0.check_run as number, { status: "in_progress", output: jobOutput(j0) });
         await directory(this.env).recordAgent({ agent, project, role: "reviewer", task: null, pr });
         // Its holdings and live layer: a secret changed or removed later reaches it too.
         await projectStub(this.env, project).reviewerStarted(agent, key);
@@ -1085,7 +1116,11 @@ export class ReviewDO extends DurableObject<Env> {
       const j = current()!;
       if (j.briefed !== 1) {
         const spec = await projectStub(this.env, project).reviewerSpec(`${project}/review/${pr}/${sha}/${runs}`, { ensure: false });
-        await nest.postInbox(agent, reviewerBrief(repo, pr, sha, j.base as string | null, reviewerOf(j)) + spec.brief, { requestId: `${project}/review/${pr}/${sha}/${runs}/brief` });
+        // Relayed text when a tainted session last wrote its reviewer (README.md#reviewers).
+        const rv = currentReviewer(j);
+        await nest.postInbox(agent, reviewerBrief(repo, pr, sha, j.base as string | null, rv) + spec.brief, {
+          requestId: `${project}/review/${pr}/${sha}/${runs}/brief`, ...(rv.tainted ? { from: "projects/board" } : {}),
+        });
         if (!current()) return;
       }
       this.sql.exec("UPDATE jobs SET briefed = 1, next_ms = NULL, errors = 0, error = NULL, updated_ms = ? WHERE pr = ? AND sha = ?", Date.now(), pr, sha);
@@ -1096,7 +1131,7 @@ export class ReviewDO extends DurableObject<Env> {
       if (!st) return;
       if (st.next_ms === null) {
         // Refused for good (the App, the grant, the template): the job fails with the reason shown.
-        this.end(r, "refused", NO_VERDICT, { title: "The review couldn't run", summary: message(e) }, message(e));
+        this.end(r, "refused", NO_VERDICT, withGiven(r, { title: "The review couldn't run", summary: message(e) }), message(e));
         return;
       }
       this.sql.exec("UPDATE jobs SET errors = ?, next_ms = ?, error = ? WHERE pr = ? AND sha = ?", st.attempts, st.next_ms, st.error, pr, sha);
@@ -1211,15 +1246,56 @@ const HELD_OUTPUT: CheckOutput = {
   summary: "This pull request isn't from someone the project trusts, so its review doesn't start by itself. The project's owner can approve the review of this commit, or dismiss it.",
 };
 
-const reviewingOutput = (sha: string, reviewer: Reviewer): CheckOutput => ({
-  title: "Reviewing", summary: `A reviewer agent is reviewing ${sha}: ${listed(reviewer.dimensions.map((d) => d.toLowerCase()))}.`,
-});
+/** A running job's check: the built-in alone as it always read; of several, which is at work ("2 of 3"). */
+function reviewingOutput(sha: string, rs: readonly FrozenReviewer[], step: number): CheckOutput {
+  const rv = rs[step];
+  if (!rv) return NONE_OUTPUT;
+  const judging = listed(rv.dimensions.map((d) => d.toLowerCase()));
+  if (rs.length === 1) return { title: "Reviewing", summary: `A reviewer agent is reviewing ${sha}: ${judging}.` };
+  return {
+    title: clip(`Reviewing: ${rv.name} (${step + 1} of ${rs.length})`, 1000),
+    summary: `Reviewer ${step + 1} of ${rs.length}, ${rv.name}, is reviewing ${sha}: ${judging}. The reviewers, one after another: ${rs.map((x) => x.name).join(", ")}.`,
+  };
+}
+const jobOutput = (j: Row): CheckOutput => reviewingOutput(j.sha as string, frozenOf((j.reviewers as string | null) ?? null), j.step as number);
+
+const NONE_OUTPUT: CheckOutput = {
+  title: "No reviewer enabled",
+  summary: "The project has no reviewer enabled, so this commit isn't reviewed. Enable or add a reviewer on the project's Reviews page, then re-run this check.",
+};
+
+/** A failed job's output with the reviews given before it failed, each in its section. */
+function withGiven(j: Row, out: CheckOutput): CheckOutput {
+  const given = reviewsOf(j);
+  return given.length ? { ...out, text: clip(`Reviews given before it failed:\n\n${reviewsText(given)}`, OUTPUT_MAX) } : out;
+}
 
 /** "a", "a and b", "a, b and c". */
 const listed = (xs: readonly string[]) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
 
-/** The reviewer a job's agent reviews as: the built-in one, the only one there is for now. */
-const reviewerOf = (_job: Row): Reviewer => CODE_REVIEW;
+/** The reviewer a running job's agent reviews as: the one at work of those it froze. */
+function currentReviewer(j: Row): FrozenReviewer {
+  const rs = frozenOf((j.reviewers as string | null) ?? null);
+  return rs[(j.step as number | null) ?? 0] ?? rs[rs.length - 1] ?? { ...CODE_REVIEW, tainted: false };
+}
+
+/** The reviews a job's reviewers gave so far. */
+const reviewsOf = (r: Row): Review[] => (r.reviews ? (JSON.parse(r.reviews as string) as Review[]) : []);
+
+/** Who writes a reviewer: the owner (the API) for now, untainted. */
+interface Writer {
+  source: ReviewerSource;
+  tainted: boolean;
+}
+const OWNER: Writer = { source: "owner", tainted: false };
+
+function reviewerOf(r: Row): ProjectReviewer {
+  return {
+    id: r.id as string, name: r.name as string, instructions: r.instructions as string, dimensions: JSON.parse(r.dimensions as string) as string[],
+    enabled: r.enabled === 1, source: r.source === "manager" ? "manager" : "owner", tainted: r.tainted === 1,
+    created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
+  };
+}
 
 /** A job row's stored verdict, in whichever release's form it was written. */
 const verdictOf = (r: Row): Verdict => parseVerdict(r.verdict as string, { agent: (r.agent as string | null) ?? null, tainted: r.tainted === null ? null : r.tainted === 1 });
