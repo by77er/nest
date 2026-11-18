@@ -5,7 +5,7 @@
 [lean]
 directory = "lean"
 main = "projects"
-core = { git = "https://github.com/by77er/inframe", rev = "a68f89ce683be8fd0f548da4fb74442142a55fac", subdir = "lean" }
+core = { git = "https://github.com/by77er/inframe", rev = "104e6f6d27252b0d3d2feb2753df7914b7a3b227", subdir = "lean" }
 
 # Cloudflare Access in front of the app's hostname. The schema (`inframe provider inspect`) is
 # trimmed to the one resource type the stack uses, Access applications, so bindings build in seconds.

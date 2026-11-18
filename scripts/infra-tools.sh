@@ -6,7 +6,7 @@ set -euo pipefail
 ELAN=v4.2.4
 # The CLI the stack was last applied with; the Lean library is pinned separately in
 # deploy/inframe.toml and deploy/lean/lakefile.toml.
-INFRAME_REV=ea3880b268cdbd43addaaa92e3b3c7176204f1b9
+INFRAME_REV=104e6f6d27252b0d3d2feb2753df7914b7a3b227
 
 if [ ! -x "$HOME/.elan/bin/elan" ]; then
   curl -fsSL "https://raw.githubusercontent.com/leanprover/elan/$ELAN/elan-init.sh" -o "$RUNNER_TEMP/elan-init.sh"

@@ -16,7 +16,7 @@ nest's cells as an [inframe](https://github.com/by77er/inframe) project: Lean st
 
 ## Use
 
-Needs OpenTofu 1.10+, `elan` and the `inframe` CLI (pinned in `inframe.toml` by commit).
+Needs OpenTofu 1.10+, `elan` and the `inframe` CLI (`scripts/infra-tools.sh` pins both; the Lean library is pinned in `inframe.toml`).
 
 ```bash
 cd deploy
