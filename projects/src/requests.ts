@@ -152,7 +152,9 @@ const ReviewerFields = {
 };
 const REVIEWER_PRESET_NAMES = Object.keys(REVIEWER_PRESETS) as [ReviewerPreset, ...ReviewerPreset[]];
 /** A new reviewer: a preset alone (the built-in "Code review", once) or every field. */
-export const CreateReviewer = z.union([z.strictObject({ preset: z.enum(REVIEWER_PRESET_NAMES) }), z.strictObject(ReviewerFields)]);
+export const ReviewerFromPreset = z.strictObject({ preset: z.enum(REVIEWER_PRESET_NAMES) });
+export const NewReviewer = z.strictObject(ReviewerFields);
+export const CreateReviewer = z.union([ReviewerFromPreset, NewReviewer]);
 export const UpdateReviewer = z.strictObject(Object.fromEntries(Object.entries(ReviewerFields).map(([k, v]) => [k, v.optional()])) as {
   [K in keyof typeof ReviewerFields]: z.ZodOptional<(typeof ReviewerFields)[K]>;
 });
