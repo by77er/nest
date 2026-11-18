@@ -1007,8 +1007,6 @@ const app = {
     { name: "manager-switch-refused", section: "project", path: "/projects/prj_demo/manager", fixture: "switch-refused", full: false },
     { name: "manager-switched", section: "project", path: "/projects/prj_demo/manager", fixture: "manager-switched", full: false },
     { name: "settings-models-open", section: "project", path: "/projects/prj_demo/settings", full: false, after: async (p) => { const f = p.getByLabel("Manager's model").first(); await f.scrollIntoViewIfNeeded(); await f.click(); } },
-    // A model with a default (the reviewers'): its list open, Claude Code's default first and chosen.
-    { name: "settings-models-open-default", section: "project", path: "/projects/prj_demo/settings", full: false, after: async (p) => { const f = p.getByLabel("Reviewers' model").first(); await f.scrollIntoViewIfNeeded(); await f.click(); } },
     { name: "settings-comments-id-only", section: "project", path: "/projects/prj_demo/settings", fixture: "comments-id-only" },
     { name: "switcher-open", section: "project", path: "/projects/prj_demo/reviews", full: false, widths: DESKTOP, after: async (p) => { await p.getByRole("button", { name: /Switch project/ }).click(); await p.keyboard.type("gad"); } },
     { name: "sidebar-drawer", section: "project", path: "/projects/prj_demo/board", full: false, widths: PHONE, after: menu },

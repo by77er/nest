@@ -322,12 +322,12 @@ const RICH = [
     // Whose issues come into triage (README.md#triage), and (triage-dropped) how many the cap left out.
     issues_from: variant === "issues-anyone" || variant === "triage-dropped" ? "anyone" : "trusted",
     issues_dropped: variant === "triage-dropped" ? { count: 17, last_ms: now - 25 * 60_000 } : null,
-    // The models (README.md#models): the defaults (reviewers and routines on Claude Code's), or (models-custom) a long
-    // custom id for the workers, a custom id for the reviewers and a listed model for the routines.
+    // The models (README.md#models): the defaults, or (models-custom) a long custom id for the workers, a custom id
+    // for the reviewers and another listed model for the routines.
     manager_model: "claude-fable-5-2",
     worker_model: variant === "models-custom" ? "us.anthropic.claude-opus-5-5-20260915-v1:0[1m]" : "claude-opus-5-5",
-    reviewer_model: variant === "models-custom" ? "my-org-reviewer-v2" : null,
-    routine_model: variant === "models-custom" ? "claude-haiku-5-5" : null,
+    reviewer_model: variant === "models-custom" ? "my-org-reviewer-v2" : "claude-opus-5-5",
+    routine_model: variant === "models-custom" ? "claude-haiku-5-5" : "claude-opus-5-5",
     ...(variant === "workflows-refused" ? { workers_edit_workflows: true } : {}),
     // A switch of the running manager waiting for its turn to end (manager-switching).
     // manager-switching-now: due now, between turns.
