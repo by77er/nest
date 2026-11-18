@@ -281,7 +281,9 @@ async function handle(env: Env, event: string, payload: Obj, seenId: string): Pr
       }
       // Its node id, for GraphQL's auto-merge on a task's PR.
       const node = str(pr.node_id);
-      if (action === "opened" || action === "reopened") {
+      // Marked ready: as an `opened` delivered again, so auto-merge is enabled now if it wasn't on yet (GitHub
+      // may refuse it on a draft: unverified).
+      if (action === "opened" || action === "reopened" || action === "ready_for_review") {
         await project(env, p.id).onPullRequest({
           pr: number, task, action: "opened", merged: false, node: node && NODE.test(node) ? node : null, fork: !fromRepo, title: (str(pr.title) ?? "").slice(0, 300),
           updated_at: str(pr.updated_at) ?? null, reopened: action === "reopened",
