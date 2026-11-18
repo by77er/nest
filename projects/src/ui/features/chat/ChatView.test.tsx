@@ -724,4 +724,61 @@ describe("the chat", () => {
     await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
     expect(seqs()).toEqual(["1", "2", "3"]);
   });
+  it("a held turn whose reply repeats an older message of the manager's stays until its own reply lands", async () => {
+    const AT = Date.UTC(2026, 10, 2, 9, 0, 0);
+    const trace = drivenTraceSocket();
+    vi.stubGlobal("WebSocket", trace.Socket);
+    const api = new FakeApi();
+    api.chat = [
+      { seq: 1, at_ms: AT - 600_000, sender: "manager", text: "Done.", delivered: true, status: "done" as const, error: null },
+      { seq: 2, at_ms: AT - 120_000, sender: "owner", text: "Tidy the board.", delivered: true, status: "done" as const, error: null },
+    ];
+    const { user, queryClient } = renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await within(c).findByText("Tidy the board.");
+    const t = (ms: number) => ({ turn: "trn_d", ts_ms: AT + ms });
+    // Live (the backlog replayed), then the turn starts.
+    await trace.push({ type: "live" });
+    await trace.push(ev("turn_started", t(-60_000)), ev("tool_call", { ...t(-40_000), call_id: "d1", name: "Read", input: { file_path: "a.ts" } }), ev("tool_result", { ...t(-39_000), call_id: "d1", is_error: false, summary: "ok" }));
+    await within(c).findByRole("button", { name: "Read a.ts, done" });
+    await user.type(within(c).getByLabelText("Message to the manager"), "And the stale ones{Enter}");
+    await waitFor(() => expect(api.chat).toHaveLength(3));
+    await trace.push(ev("tool_call", { ...t(1_000), call_id: "d2", name: "Bash", input: { command: "ls" } }), ev("tool_result", { ...t(2_000), call_id: "d2", is_error: false, summary: "ok" }), ev("assistant_text", { ...t(3_000), text: "Done." }), ev("turn_completed", t(3_500)));
+    // Ended: the older "Done." isn't its reply, so its stream stays, split as it was.
+    await within(c).findByRole("button", { name: "Bash ls, done" });
+    expect(c.querySelectorAll("[data-sender=stream]")).toHaveLength(2);
+    // Its own lands: the stream goes (at the end, followed).
+    api.chat.push({ seq: 4, at_ms: AT + 3_000, sender: "manager", text: "Done.", delivered: true, status: "done" as const, error: null });
+    await queryClient.refetchQueries();
+    await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
+  });
+
+  it("reading back, a landed turn's earlier part goes for good when the next turn starts", async () => {
+    const AT = Date.UTC(2026, 10, 2, 9, 0, 0);
+    const trace = drivenTraceSocket();
+    vi.stubGlobal("WebSocket", trace.Socket);
+    const api = new FakeApi();
+    api.chat = [{ seq: 1, at_ms: AT - 120_000, sender: "owner", text: "Tidy the board.", delivered: true, status: "done" as const, error: null }];
+    const { user, queryClient } = renderApp("/projects/prj_one/manager", api);
+    const c = await chat();
+    await within(c).findByText("Tidy the board.");
+    const t = (turn: string, ms: number) => ({ turn, ts_ms: AT + ms });
+    await trace.push(ev("turn_started", t("trn_a", -60_000)), ev("tool_call", { ...t("trn_a", -40_000), call_id: "a1", name: "Read", input: { file_path: "a.ts" } }), ev("tool_result", { ...t("trn_a", -39_000), call_id: "a1", is_error: false, summary: "ok" }));
+    await within(c).findByRole("button", { name: "Read a.ts, done" });
+    await user.type(within(c).getByLabelText("Message to the manager"), "And the stale ones{Enter}");
+    await waitFor(() => expect(api.chat).toHaveLength(2));
+    // Reading back: the reader opens the row.
+    await user.click(within(c).getByRole("button", { name: "Read a.ts, done" }));
+    await trace.push(ev("assistant_text", { ...t("trn_a", 3_000), text: "Tidied." }), ev("turn_completed", t("trn_a", 3_500)));
+    api.chat.push({ seq: 3, at_ms: AT + 3_000, sender: "manager", text: "Tidied.", delivered: true, status: "done" as const, error: null });
+    await queryClient.refetchQueries();
+    await within(c).findByRole("button", { name: "Used 1 tool" });
+    expect(c.querySelectorAll("[data-sender=stream]")).toHaveLength(1);
+    // The next turn starts (and ends with nothing to show): the kept part doesn't come back.
+    await trace.push(ev("turn_started", t("trn_b", 10_000)));
+    await waitFor(() => expect(within(c).queryByRole("button", { name: "Read a.ts, done" })).toBeNull());
+    await trace.push(ev("turn_completed", { ...t("trn_b", 11_000), stop_reason: "end_turn" }));
+    await waitFor(() => expect(c.querySelector("[data-sender=stream]")).toBeNull());
+    expect(within(c).queryByRole("button", { name: "Read a.ts, done" })).toBeNull();
+  });
 });

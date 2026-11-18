@@ -363,15 +363,19 @@ export function ChatView({ projectId, agent }: { projectId: string; agent: strin
     if (maxSeq > 0) markRead(projectId, maxSeq);
   }, [projectId, maxSeq]);
 
-  // Hold the stream until its message lands (a manager message newer than when it began).
+  // Hold the stream until its message lands (a manager message newer than when it began; any, for a turn
+  // first seen in the backlog replayed on opening, whose message may be in the log already); another turn
+  // starting lets the last one go.
   useEffect(() => {
-    if (live && live.steps.length) setHeld((h) => ({ turn: live.turn, steps: live.steps, sinceSeq: h?.turn === live.turn ? h.sinceSeq : lastManagerSeq }));
-  }, [live]); // `lastManagerSeq` is read at each turn's start only
+    if (!live) return;
+    const since = trace.state.status === "live" ? lastManagerSeq : 0;
+    setHeld((h) => (live.steps.length ? { turn: live.turn, steps: live.steps, sinceSeq: h?.turn === live.turn ? h.sinceSeq : since } : h?.turn === live.turn ? h : null));
+  }, [live]); // `lastManagerSeq` and the trace's status are read at each turn's start only
   // The held turn as it ended (a call it never answered reads stopped), while the ring has it.
   const heldEnd = !live && held ? (finished.find((t) => t.turn === held.turn) ?? null) : null;
-  // Its message, once in the log: by what it says (the newest saying it), or the newest of the manager's
-  // if the ring has lost the turn.
-  const reply = !held || live ? undefined : heldEnd ? (heldEnd.reply ? messages.filter((m) => m.sender === "manager" && m.text.trim() === heldEnd.reply).at(-1) : undefined) : lastManagerSeq > held.sinceSeq ? messages.find((m) => m.seq === lastManagerSeq) : undefined;
+  // Its message, once in the log: one of the manager's since it began, by what it says (an older one
+  // saying the same isn't it), or the newest if the ring has lost the turn.
+  const reply = !held || live ? undefined : heldEnd ? (heldEnd.reply ? messages.filter((m) => m.sender === "manager" && m.seq > held.sinceSeq && m.text.trim() === heldEnd.reply).at(-1) : undefined) : lastManagerSeq > held.sinceSeq ? messages.find((m) => m.seq === lastManagerSeq) : undefined;
   // Let go once its message is in the log, or it ended without one (stopped), and the reader is at the end;
   // and after HOLD_MAX_MS if its message never comes. Landed, it isn't shown again (under its own reply)
   // while the release waits for the effect. Reading back, it stays (its parts before the messages sent
