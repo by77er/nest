@@ -804,9 +804,11 @@ describe("a project's models", () => {
   });
 
   it.each(["being removed", "already removed"])("a project %s arms nothing for its deletes when no sweep ran (no nest client)", async (when) => {
-    const { p } = await staleWorkerTemplates(["claude-opus-5-5"], "claude-haiku-5-5");
+    const { p, names } = await staleWorkerTemplates(["claude-opus-5-5"], "claude-haiku-5-5");
     await runInDurableObject(env.DIRECTORY.get(env.DIRECTORY.idFromName("directory")), (_o, st) => { st.storage.sql.exec("DELETE FROM projects WHERE id = ?", p.id); });
-    const before = fake.callsTo("DELETE", /^\/v1\/catalog\/templates\//).length;
+    // This project's deletes only: other tests' projects' real alarms delete theirs meanwhile.
+    const deletes = () => names.reduce((n, name) => n + fake.callsTo("DELETE", new RegExp(`^/v1/catalog/templates/${name}$`)).length, 0);
+    const before = deletes();
     const armed = await runInDurableObject(stub(p), async (o, st) => {
       st.storage.sql.exec(when === "being removed" ? "UPDATE settings SET listed_ms = NULL" : "DELETE FROM settings");
       await st.storage.deleteAlarm();
@@ -820,7 +822,7 @@ describe("a project's models", () => {
       }
       return st.storage.getAlarm();
     });
-    expect(fake.callsTo("DELETE", /^\/v1\/catalog\/templates\//).length).toBe(before);
+    expect(deletes()).toBe(before);
     expect(armed).toBeNull();
   });
 

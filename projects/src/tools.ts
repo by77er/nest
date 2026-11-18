@@ -191,7 +191,7 @@ export const TOOLS: Record<Server, readonly ToolDef[]> = {
     },
     {
       name: "submit_review",
-      description: "Your review, once: pass or fail for each of your reviewer's dimensions (your brief and review_get name them), each exactly once with specific notes, and a summary. The PR's check passes only if every dimension passes. A call that misses a dimension, names one twice or names one that isn't your reviewer's is refused, saying which, and records nothing: submit again.",
+      description: "Your review, once: pass or fail for each of your reviewer's dimensions (your brief and review_get name them), each exactly once with specific notes, and a summary. The PR's check passes only if every dimension of every reviewer's review passes; the project's other reviewers, if any, review it after you, each in its own session. A call that misses a dimension, names one twice or names one that isn't your reviewer's is refused, saying which, and records nothing: submit again.",
       inputSchema: obj({
         verdicts: {
           type: "array", maxItems: 20, description: "One entry per dimension of your reviewer.",

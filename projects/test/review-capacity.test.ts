@@ -147,6 +147,40 @@ describe("a review nest has no room for", () => {
     }
   });
 
+  it("a job that waits for room at its second reviewer keeps the review given and resumes with that reviewer", async () => {
+    const p = await newProject();
+    const sec = { name: "Security", instructions: "Look for injection.", dimensions: ["Injection"], enabled: true };
+    expect((await api(token, "POST", `/api/projects/${p.id}/reviewers`, sec)).status).toBe(201);
+    const s = sha();
+    await push(p, 1, s);
+    await run(p);
+    const tok = (agent: string) => nest.sign(agentClaims("review", agent, { project: p.id, role: "reviewer", pr: "1", sha: s, start: "1" }));
+    const first = live(p, 1)[0]!.agent;
+    expect((await callTool("review", await tok(first), "submit_review", submitArgs())).result.isError).toBeFalsy();
+    // No room for the second once the first is stopped.
+    fake.maxAgents = liveAgents() - 1;
+    try {
+      await run(p);
+      await run(p);
+      expect(await job(p, 1, s)).toMatchObject({ state: "queued", step: 1, error: expect.stringMatching(/max_agents/), reviews: [{ reviewer: { name: "Code review" }, agent: first }] });
+      expect(live(p, 1)).toEqual([]);
+      expect(checkOf(p, s).output.title).toBe("Waiting for room to start a reviewer");
+    } finally {
+      fake.maxAgents = null;
+    }
+    await dueNow(p);
+    await run(p);
+    await run(p);
+    expect(await job(p, 1, s)).toMatchObject({ state: "running", step: 1 });
+    const [second] = live(p, 1);
+    expect(fake.inbox.find((m) => m.agent === second!.agent)!.text).toContain(`"Security"`);
+    expect(checkOf(p, s).output.title).toBe("Reviewing: Security (2 of 2)");
+    expect((await callTool("review", await tok(second!.agent), "submit_review", { verdicts: [{ dimension: "Injection", verdict: "pass", notes: "ok" }], summary: "ok" })).result.isError).toBeFalsy();
+    await run(p);
+    expect(checkOf(p, s)).toMatchObject({ status: "completed", conclusion: "success" });
+    expect((await job(p, 1, s)).verdict.reviews.map((r: any) => r.reviewer.name)).toEqual(["Code review", "Security"]);
+  });
+
   it("starts as soon as one of the project's reviewers ends, without waiting out its backoff", async () => {
     const p = await newProject();
     const s1 = sha();

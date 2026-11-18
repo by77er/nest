@@ -2977,7 +2977,9 @@ export class ProjectDO extends DurableObject<Env> {
   /** The review queue ended a PR's review (ReviewDO's outbox): `done` with a verdict, or `failed`. */
   async onReviewEnded(e: { pr: number; sha: string; state: string; conclusion: string | null }): Promise<void> {
     if (!this.settings()) return;
-    for (const w of this.pendingWaits("pr", String(e.pr))) this.prWaitOn(w, { kind: "review", conclusion: e.conclusion ?? e.state });
+    // A neutral check is a job no reviewer was enabled for (README.md#running-the-reviewers): said as reviewConclusion says it.
+    const conclusion = e.conclusion === "neutral" ? reviewConclusion({ state: e.state, verdict: null }) : e.conclusion ?? e.state;
+    for (const w of this.pendingWaits("pr", String(e.pr))) this.prWaitOn(w, { kind: "review", conclusion });
     // A failed review is a nudge to read the PRs soon (README.md#pr-upkeep): its worker is told from that read.
     if (e.conclusion === "failure") this.nudgePrs([e.pr]);
     await this.arm();
@@ -4285,10 +4287,10 @@ export class ProjectDO extends DurableObject<Env> {
     const comments = this.sql.exec("SELECT task, at_ms, detail FROM history WHERE action = 'pr_comment' AND at_ms >= ? ORDER BY seq DESC LIMIT 50", since)
       .toArray().map((r) => ({ task: r.task, at_ms: r.at_ms, ...(r.detail ? (JSON.parse(r.detail as string) as Record<string, unknown>) : {}) }));
     const reviews = (await review(this.env, this.settings()!.id).jobs())
-      .filter((j) => j.updated_ms >= since && (j.verdict !== null || j.state === "failed"))
+      .filter((j) => j.updated_ms >= since && (j.state === "done" || j.state === "failed"))
       .slice(0, 50)
       .map((j) => ({
-        pr: j.pr, sha: j.sha, title: j.title, state: j.state, at_ms: j.updated_ms,
+        pr: j.pr, sha: j.sha, title: j.title, state: j.state, at_ms: j.updated_ms, conclusion: reviewConclusion(j),
         verdict: j.verdict === null ? null : {
           passed: verdictPassed(j.verdict),
           reviews: j.verdict.reviews.map((r) => ({
@@ -5790,9 +5792,10 @@ function toWait(r: Row): Wait {
 
 /** A start's sandbox extras for its frozen rules: none when there are none (the request as before). */
 
-/** A review job's end, in a word: its verdict's conclusion, or that it failed. */
+/** A review job's end, in a word: its verdict's conclusion, that it failed, or that no reviewer was enabled (done, its check neutral). */
 export function reviewConclusion(j: { state: string; verdict: Verdict | null }): string {
   if (j.state === "failed") return "failed without a verdict";
+  if (j.state === "done" && !j.verdict) return "no reviewer enabled";
   return j.verdict && verdictPassed(j.verdict) ? "passed" : "failed";
 }
 

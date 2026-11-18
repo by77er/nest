@@ -10,6 +10,9 @@
 // `failed` (no verdict after retries, or refused for good), `superseded` (a newer head) or `closed` (the PR
 // closed). Each end owes GitHub its check's completion, once, and nest the reviewer's stop.
 //
+// The project's reviewers are kept here too (README.md#reviewers): a job freezes the enabled ones when it
+// starts and runs them one after another, one agent at a time, under the one check.
+//
 // A PR the project doesn't trust (src/review-trust.ts) starts `held` instead: its check says the owner
 // must approve the review, and nothing else happens (no agent, no sandbox, none of its text to anyone)
 // until the owner approves that head commit, or dismisses it (`dismissed`).
@@ -17,7 +20,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { roleTemplate, TEMPLATE, writeSharedTemplate } from "../catalog";
 import { directory, type Env, project as projectStub } from "../env";
-import { type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, PERMISSIONS, verdictCheck } from "../github";
+import { clip, type CheckOutput, type CheckRunUpdate, type Conclusion, type GitHub, GitHubError, githubFor, OUTPUT_MAX, PERMISSIONS, reviewsText, TITLE_MAX, verdictCheck } from "../github";
 import type { AgentCaller } from "../identity";
 import { atCapacity, backoff, HOSTS_WAIT, NestError, nestFrom, type Nest, stopRefused } from "../nest";
 import { spawnOverrides, startEgress } from "../github-access";
@@ -25,7 +28,12 @@ import { OUTBOX, type OutboxPolicy, type OutboxRow, outboxStep } from "../outbox
 import { invalid } from "../schema";
 import { fail, migrate, ok, type Result } from "../sql";
 import { toolOf } from "../tools";
-import { CODE_REVIEW, legacySubmit, parseVerdict, type Reviewer, reviewOf, storedVerdict, type Submitted, type Verdict } from "../reviewers";
+import {
+  CODE_REVIEW, freeze, type FrozenReviewer, frozenOf, legacySubmit, MAX_REVIEWERS, parseVerdict, type ProjectReviewer, type Review,
+  type Reviewer, type ReviewerFields, type ReviewerSource, reviewOf, reviewPassed, storedVerdict, type Submitted, type Verdict,
+} from "../reviewers";
+import { randomId } from "./directory";
+import { NewReviewer, problems } from "../requests";
 import { EARLY_EXITS_KEEP_MS, PRUNE_EVERY_MS, REVIEW_JOBS_KEEP_MS } from "../retention";
 import { type JobEvent, type JobState, jobTransition, REVIEW_DEADLINE_MS } from "../review-job";
 import { HELD_CHECK_INTERVAL_MS, MAX_HELD, MAX_OVERFLOW, type PrOrigin, reviewDecision, type TrustedIds, trustedAuthor, type UntrustedPolicy } from "../review-trust";
@@ -40,6 +48,12 @@ export const MAX_RETRIES = 2;
  * until the check is re-run, as `neutral` would not.
  */
 export const NO_VERDICT: Conclusion = "action_required";
+/**
+ * A job with no reviewer enabled when it started: `neutral`, which a required check accepts as passing
+ * ("Required status checks must have a successful, skipped, or neutral status", GitHub's "About protected
+ * branches"). The owner's way to turn reviews off.
+ */
+export const NO_REVIEWER: Conclusion = "neutral";
 /** A superseded or closed job's check: `cancelled`, which isn't passing either. */
 export const ENDED: Conclusion = "cancelled";
 /** A review waiting this long for room in nest is told to the project, among its errors (`roomUpkeep`). */
@@ -58,7 +72,7 @@ export interface Job {
   verdict: Verdict | null;
   /** Whether the session that submitted the verdict was tainted. */
   tainted: boolean | null;
-  /** Reviewers that exited without a verdict since the job was last queued. */
+  /** The current reviewer's agents that ended without a verdict (each reviewer has its own). */
   attempts: number;
   /** Reviewers started for the job, ever: each start's idempotency keys carry it. */
   runs: number;
@@ -70,6 +84,13 @@ export interface Job {
   fork: boolean;
   /** When the owner approved this head commit's review; null for one that needed no approval, or has none. */
   approved_ms: number | null;
+  // Always in this release's answers; optional for the page's types, whose fixtures predate them.
+  /** The reviewers it runs, frozen when it started (README.md#running-the-reviewers); null before it starts. None: no reviewer was enabled. */
+  reviewers?: FrozenReviewer[] | null;
+  /** Which of them is at work (0-based), while running. */
+  step?: number;
+  /** The reviews given so far, in order: all of them once done; those given before it failed. */
+  reviews?: Review[];
   created_ms: number;
   updated_ms: number;
 }
@@ -93,7 +114,12 @@ export interface ReviewOf {
   repo: string;
 }
 
-const MIGRATIONS = [
+/** A string as an SQL literal (the seed's, in a migration step's text). */
+function quote(s: string): string {
+  return `'${s.replaceAll("'", "''")}'`;
+}
+
+export const MIGRATIONS: readonly (readonly string[])[] = [
   [
     `CREATE TABLE jobs (pr INTEGER NOT NULL, sha TEXT NOT NULL, state TEXT NOT NULL, agent TEXT, check_run INTEGER, verdict TEXT,
       attempts INTEGER NOT NULL DEFAULT 0, next_ms INTEGER, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL, PRIMARY KEY (pr, sha))`,
@@ -168,7 +194,23 @@ const MIGRATIONS = [
     "ALTER TABLE jobs ADD COLUMN room_next_ms INTEGER",
     "ALTER TABLE jobs ADD COLUMN room_attempts INTEGER NOT NULL DEFAULT 0",
   ],
-] as const;
+  [
+    // The project's reviewers (README.md#reviewers), seeded with the built-in "Code review" in this step, so
+    // once: a project of the release before gets it at its first use, a new one at init, and one deleted stays so.
+    `CREATE TABLE reviewers (id TEXT PRIMARY KEY, name TEXT NOT NULL, instructions TEXT NOT NULL, dimensions TEXT NOT NULL, enabled INTEGER NOT NULL,
+      source TEXT NOT NULL, tainted INTEGER NOT NULL DEFAULT 0, created_ms INTEGER NOT NULL, updated_ms INTEGER NOT NULL)`,
+    `INSERT INTO reviewers (id, name, instructions, dimensions, enabled, source, tainted, created_ms, updated_ms)
+      VALUES (${quote(CODE_REVIEW.id)}, ${quote(CODE_REVIEW.name)}, ${quote(CODE_REVIEW.instructions)}, ${quote(JSON.stringify(CODE_REVIEW.dimensions))}, 1, 'owner', 0,
+        CAST(strftime('%s', 'now') AS INTEGER) * 1000, CAST(strftime('%s', 'now') AS INTEGER) * 1000)`,
+    // A job's reviewers, frozen when it starts (null: not started since; one the release before started runs the
+    // built-in alone), which of them is at work, the reviews given so far (JSON), and the check run they're for:
+    // the release before doesn't clear them when it runs the job again, so another check's are another run's (`runOf`).
+    "ALTER TABLE jobs ADD COLUMN reviewers TEXT",
+    "ALTER TABLE jobs ADD COLUMN step INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE jobs ADD COLUMN reviews TEXT",
+    "ALTER TABLE jobs ADD COLUMN frozen_check INTEGER",
+  ],
+];
 
 /** `next_ms` for a row that's kept but never due (its column can't be null): a failed stop. */
 const NOT_DUE_MS = 253_402_300_799_000;
@@ -290,8 +332,79 @@ export class ReviewDO extends DurableObject<Env> {
       attempts: r.attempts as number, runs: r.runs as number, error: (r.error as string | null) ?? null,
       deadline_ms: r.state === "running" ? ((r.deadline_ms as number | null) ?? null) : null,
       author: (r.author as string | null) ?? null, fork: r.fork === 1, approved_ms: (r.approved_ms as number | null) ?? null,
+      ...jobRun(r),
       created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
     };
+  }
+
+  // --- the project's reviewers (README.md#reviewers) -------------------------------------------------
+
+  private reviewerRow(id: string): ProjectReviewer | null {
+    const r = this.sql.exec("SELECT * FROM reviewers WHERE id = ?", id).toArray()[0];
+    return r ? reviewerOf(r) : null;
+  }
+
+  /** In creation order: the order a job runs the enabled ones in. */
+  private reviewerRows(): ProjectReviewer[] {
+    return this.sql.exec("SELECT * FROM reviewers ORDER BY created_ms, rowid").toArray().map(reviewerOf);
+  }
+
+  async reviewers(): Promise<ProjectReviewer[]> {
+    return this.reviewerRows();
+  }
+
+  async getReviewer(id: string): Promise<Result<ProjectReviewer>> {
+    const r = this.reviewerRow(id);
+    return r ? ok(r) : fail(404, "unknown reviewer");
+  }
+
+  /**
+   * A new reviewer, last in the order: the writer's fields, or a preset's (under its own id, so once). At most
+   * MAX_REVIEWERS. Jobs already started keep the reviewers they froze.
+   */
+  async createReviewer(f: ReviewerFields, o: { preset?: Reviewer; by?: Writer } = {}): Promise<Result<ProjectReviewer>> {
+    const by = o.by ?? OWNER;
+    const bad = fieldsProblem(f);
+    if (bad) return fail(400, bad);
+    if (this.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM reviewers").one().n >= MAX_REVIEWERS) return fail(409, `a project holds at most ${MAX_REVIEWERS} reviewers`);
+    const id = o.preset?.id ?? `rvw_${randomId().toLowerCase()}`;
+    if (this.reviewerRow(id)) return fail(409, `the project has the reviewer "${o.preset?.name ?? id}" already: change that one instead`);
+    const now = Date.now();
+    this.sql.exec(
+      "INSERT INTO reviewers (id, name, instructions, dimensions, enabled, source, tainted, created_ms, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      id, f.name, f.instructions, JSON.stringify(f.dimensions), f.enabled ? 1 : 0, by.source, by.tainted ? 1 : 0, now, now,
+    );
+    return ok(this.reviewerRow(id)!);
+  }
+
+  /**
+   * Change a reviewer: only jobs that start later (and re-runs) see it. Disabling the last enabled one is allowed.
+   * The writer is recorded (`source`); its taint as the comment below says.
+   */
+  async updateReviewer(id: string, u: Partial<ReviewerFields>, by: Writer = OWNER): Promise<Result<ProjectReviewer>> {
+    const before = this.reviewerRow(id);
+    if (!before) return fail(404, "unknown reviewer");
+    const f: ReviewerFields = {
+      name: u.name ?? before.name, instructions: u.instructions ?? before.instructions, dimensions: u.dimensions ?? before.dimensions, enabled: u.enabled ?? before.enabled,
+    };
+    const bad = fieldsProblem(f);
+    if (bad) return fail(400, bad);
+    // Its text's taint: a tainted writer's change of it taints it; an untainted writer clears it only by writing all
+    // of it (name, instructions and dimensions), since a part left as it was may be a tainted session's.
+    const changed = f.name !== before.name || f.instructions !== before.instructions || JSON.stringify(f.dimensions) !== JSON.stringify(before.dimensions);
+    const all = u.name !== undefined && u.instructions !== undefined && u.dimensions !== undefined;
+    const tainted = by.tainted ? before.tainted || changed : before.tainted && !all;
+    this.sql.exec(
+      "UPDATE reviewers SET name = ?, instructions = ?, dimensions = ?, enabled = ?, source = ?, tainted = ?, updated_ms = ? WHERE id = ?",
+      f.name, f.instructions, JSON.stringify(f.dimensions), f.enabled ? 1 : 0, by.source, tainted ? 1 : 0, Date.now(), id,
+    );
+    return ok(this.reviewerRow(id)!);
+  }
+
+  /** Delete a reviewer, the last one included: a job running it keeps its frozen copy. */
+  async deleteReviewer(id: string): Promise<Result<{ deleted: string }>> {
+    if (!this.sql.exec("DELETE FROM reviewers WHERE id = ?", id).rowsWritten) return fail(404, "unknown reviewer");
+    return ok({ deleted: id });
   }
 
   /** The queue's jobs, newest first. */
@@ -519,7 +632,7 @@ export class ReviewDO extends DurableObject<Env> {
     return moved ? t.to : null;
   }
 
-  /** Queue an ended job again from scratch: a new check run, new reviewers, no verdict. */
+  /** Queue an ended job again from scratch: a new check run, the reviewers as they are when it starts, no verdict. */
   private requeue(pr: number, sha: string): boolean {
     const j = this.jobRow(pr, sha);
     // Never a head that needs the owner's approval and hasn't had it, whatever state its job is in.
@@ -529,11 +642,12 @@ export class ReviewDO extends DurableObject<Env> {
     return true;
   }
 
-  /** A job starting over (queued, or held): a new check run, new reviewers, no verdict, due now. */
+  /** A job starting over (queued, or held): a new check run, reviewers frozen afresh when it starts, no verdict, due now. */
   private reset(pr: number, sha: string): void {
     this.sql.exec(
       `UPDATE jobs SET next_ms = ?, agent = NULL, check_run = NULL, briefed = 0, verdict = NULL, tainted = NULL,
-        attempts = 0, errors = 0, error = NULL, deadline_ms = NULL, capacity_ms = NULL, room_waits = 0 WHERE pr = ? AND sha = ?`,
+        attempts = 0, errors = 0, error = NULL, deadline_ms = NULL, capacity_ms = NULL, room_waits = 0, reviewers = NULL, step = 0, reviews = NULL
+        WHERE pr = ? AND sha = ?`,
       Date.now(), pr, sha,
     );
   }
@@ -668,8 +782,9 @@ export class ReviewDO extends DurableObject<Env> {
 
   /**
    * A running job's reviewer ended without a verdict (it exited, or its deadline passed): its agent is
-   * stopped with its sandbox, and a new reviewer starts, up to MAX_RETRIES times; then the job fails, its
-   * check completed as `action_required` with the reason. The slot frees either way.
+   * stopped with its sandbox, and a new agent starts for the same reviewer, up to MAX_RETRIES times (each
+   * reviewer has its own); then the job fails, its check completed as `action_required` with the reason and
+   * the reviews already given. The slot frees either way.
    */
   private spendAttempt(j: Row, why: string, what: "exited" | "timed out"): void {
     if (j.agent !== null) this.oweStop(j.agent as string, what);
@@ -683,10 +798,12 @@ export class ReviewDO extends DurableObject<Env> {
       );
     } else {
       this.sql.exec("UPDATE jobs SET attempts = ? WHERE pr = ? AND sha = ?", attempts, j.pr, j.sha);
-      this.end({ ...j, agent: null }, "give_up", NO_VERDICT, {
+      const { reviewers: rs, step } = runOf(j);
+      const whose = rs.length > 1 ? `${currentReviewer(j).name} (reviewer ${step + 1} of ${rs.length}): ` : "";
+      this.end({ ...j, agent: null }, "give_up", NO_VERDICT, withGiven(j, {
         title: "No verdict",
-        summary: `${attempts} reviewers ended without submitting a verdict (the last: ${why}). Re-run this check to review the commit again.`,
-      }, why);
+        summary: `${whose}${attempts} reviewers ended without submitting a verdict (the last: ${why}). Re-run this check to review the commit again.`,
+      }), why);
     }
   }
 
@@ -727,7 +844,8 @@ export class ReviewDO extends DurableObject<Env> {
     if (!r) return fail(404, "no review for your PR and commit");
     switch (tool) {
       case "review_get": {
-        const rv = reviewerOf(r);
+        if (r.agent !== caller.agent) return fail(403, "you aren't this review's current reviewer");
+        const rv = currentReviewer(r);
         return ok({
           repo: await this.repo(), pr: r.pr, sha: r.sha, base: r.base, title: r.title, state: r.state,
           reviewer: { name: rv.name, dimensions: rv.dimensions, instructions: rv.instructions },
@@ -738,14 +856,31 @@ export class ReviewDO extends DurableObject<Env> {
         if (r.verdict !== null) return fail(409, "this review already has its verdict");
         if (r.state !== "running") return fail(409, `this review is ${r.state}`);
         // Refused (nothing recorded, still its one submit to make) unless it names each dimension once.
-        const made = reviewOf(reviewerOf(r), a.verdicts as Submitted[], a.summary as string, { agent: caller.agent, tainted: caller.tainted });
+        const made = reviewOf(currentReviewer(r), a.verdicts as Submitted[], a.summary as string, { agent: caller.agent, tainted: caller.tainted });
         if (!made.ok) return fail(400, made.error);
-        const verdict: Verdict = { reviews: [made.review] };
+        const { reviewers: rs, step, reviews: before } = runOf(r);
+        const given = [...before, made.review];
+        if (step + 1 < rs.length) {
+          // The next reviewer: this one's agent stopped with its sandbox, a new agent (a new start) for the next, its own retries and deadline.
+          if (!this.move(r.pr as number, r.sha as string, "running", "next")) return fail(409, "this review moved meanwhile");
+          this.sql.exec(
+            `UPDATE jobs SET reviewers = ?, reviews = ?, step = ?, attempts = 0, agent = NULL, briefed = 0, runs = runs + 1, next_ms = ?, deadline_ms = ?, errors = 0, error = NULL
+              WHERE pr = ? AND sha = ?`,
+            JSON.stringify(rs), JSON.stringify(given), step + 1, Date.now(), Date.now() + REVIEW_DEADLINE_MS, r.pr, r.sha,
+          );
+          this.oweStop(caller.agent, "done");
+          if (r.check_run !== null) this.oweCheck(r.check_run as number, { status: "in_progress", output: reviewingOutput(r.sha as string, rs, step + 1) });
+          await this.arm();
+          return ok({ recorded: true, passed: reviewPassed(made.review), conclusion: null, next: `reviewer ${step + 2} of ${rs.length}` });
+        }
+        const verdict: Verdict = { reviews: given };
         const check = verdictCheck(verdict);
-        this.sql.exec("UPDATE jobs SET verdict = ?, tainted = ? WHERE pr = ? AND sha = ?", storedVerdict(verdict), caller.tainted ? 1 : 0, r.pr, r.sha);
+        // Its reviews are the verdict's now (not kept twice: a row's size is bounded).
+        this.sql.exec("UPDATE jobs SET verdict = ?, reviews = NULL, tainted = ? WHERE pr = ? AND sha = ?",
+          storedVerdict(verdict), given.some((x) => x.tainted) ? 1 : 0, r.pr, r.sha);
         this.end(r, "verdict", check.conclusion, check.output);
         await this.arm();
-        return ok({ recorded: true, conclusion: check.conclusion });
+        return ok({ recorded: true, passed: reviewPassed(made.review), conclusion: check.conclusion });
       }
     }
     return fail(400, `unknown tool ${tool}`);
@@ -882,7 +1017,14 @@ export class ReviewDO extends DurableObject<Env> {
     for (const q of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'queued' AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       if (!this.underCap()) break;
       if (!this.move(q.pr as number, q.sha as string, "queued", "start")) continue;
-      this.sql.exec("UPDATE jobs SET runs = runs + 1, agent = NULL, briefed = 0, next_ms = ?, deadline_ms = ? WHERE pr = ? AND sha = ?", now, now + REVIEW_DEADLINE_MS, q.pr, q.sha);
+      // Its reviewers, frozen in this step as they are now: the enabled ones in creation order. Unless this run
+      // froze them before and waited for room: then it resumes with the reviewer at work, the reviews given kept.
+      const resumes = "reviewers IS NOT NULL AND check_run IS NOT NULL AND frozen_check = check_run";
+      this.sql.exec(
+        `UPDATE jobs SET reviewers = CASE WHEN ${resumes} THEN reviewers ELSE ? END, step = CASE WHEN ${resumes} THEN step ELSE 0 END,
+          reviews = CASE WHEN ${resumes} THEN reviews ELSE NULL END, frozen_check = check_run, runs = runs + 1, agent = NULL, briefed = 0, next_ms = ?, deadline_ms = ? WHERE pr = ? AND sha = ?`,
+        JSON.stringify(freeze(this.reviewerRows())), now, now + REVIEW_DEADLINE_MS, q.pr, q.sha,
+      );
     }
     for (const r of this.sql.exec("SELECT pr, sha FROM jobs WHERE state = 'running' AND next_ms IS NOT NULL AND next_ms <= ? ORDER BY created_ms, pr", now).toArray()) {
       await this.advance(nest, github, repo, r.pr as number, r.sha as string);
@@ -891,7 +1033,10 @@ export class ReviewDO extends DurableObject<Env> {
     await this.arm();
   }
 
-  /** A running job's next step: its check run, then its reviewer, then the reviewer's brief. */
+  /**
+   * A running job's next step: its check run, then its current reviewer's agent, then that agent's brief. A job
+   * with no reviewer frozen is done once its check is made, `neutral`: no agent, no sandbox.
+   */
   private async advance(nest: Nest, github: () => Promise<GitHub>, repo: string, pr: number, sha: string): Promise<void> {
     const before = this.jobRow(pr, sha);
     if (!before || before.state !== "running") return;
@@ -908,7 +1053,7 @@ export class ReviewDO extends DurableObject<Env> {
         // A create whose answer was lost made a check run all the same: found by its external id.
         const found = (before.errors as number) > 0 ? (await gh.checkRunsAt(repo, sha)).find((c) => c.external_id === external) : undefined;
         const made = found ?? (await gh.createCheckRun(repo, {
-          head_sha: sha, external_id: external, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}`, output: reviewingOutput(sha, reviewerOf(before)),
+          head_sha: sha, external_id: external, details_url: `${this.env.PUBLIC_BASE_URL}/projects/${project}`, output: jobOutput(before),
         }))!;
         const appId = made.app?.id;
         if (typeof appId === "number" && this.setting("github_app_id") !== String(appId)) {
@@ -922,10 +1067,15 @@ export class ReviewDO extends DurableObject<Env> {
           this.oweCheck(made.id, { status: "completed", conclusion: ENDED, completed_at: new Date().toISOString(), output: { title: "Superseded", summary: "The PR moved on before its review started." } });
           return;
         }
-        this.sql.exec("UPDATE jobs SET check_run = ? WHERE pr = ? AND sha = ?", made.id, pr, sha);
+        // Its reviewers, frozen for no check run yet, are this one's (any others are another run's: `runOf`).
+        this.sql.exec("UPDATE jobs SET check_run = ?, frozen_check = CASE WHEN frozen_check IS NULL THEN ? ELSE frozen_check END WHERE pr = ? AND sha = ?", made.id, made.id, pr, sha);
       }
       const j0 = current();
       if (!j0) return;
+      if (runOf(j0).reviewers.length === 0) {
+        this.end(j0, "verdict", NO_REVIEWER, NONE_OUTPUT);
+        return;
+      }
       let agent = (j0.agent as string | null) ?? null;
       if (!agent) {
         const labels = { project, role: "reviewer", pr: String(pr), sha, start: String(runs) };
@@ -966,7 +1116,7 @@ export class ReviewDO extends DurableObject<Env> {
         // Named on the job in the step the create's answer came, before any other await, so its exit finds it.
         this.sql.exec("UPDATE jobs SET agent = ?, capacity_ms = NULL, room_waits = 0 WHERE pr = ? AND sha = ?", agent, pr, sha);
         // It waited for room: its check says it's reviewing again.
-        if (j0.capacity_ms !== null && j0.check_run !== null) this.oweCheck(j0.check_run as number, { status: "in_progress", output: reviewingOutput(sha, reviewerOf(j0)) });
+        if (j0.capacity_ms !== null && j0.check_run !== null) this.oweCheck(j0.check_run as number, { status: "in_progress", output: jobOutput(j0) });
         await directory(this.env).recordAgent({ agent, project, role: "reviewer", task: null, pr });
         // Its holdings and live layer: a secret changed or removed later reaches it too.
         await projectStub(this.env, project).reviewerStarted(agent, key);
@@ -982,7 +1132,11 @@ export class ReviewDO extends DurableObject<Env> {
       const j = current()!;
       if (j.briefed !== 1) {
         const spec = await projectStub(this.env, project).reviewerSpec(`${project}/review/${pr}/${sha}/${runs}`, { ensure: false });
-        await nest.postInbox(agent, reviewerBrief(repo, pr, sha, j.base as string | null, reviewerOf(j)) + spec.brief, { requestId: `${project}/review/${pr}/${sha}/${runs}/brief` });
+        // Relayed text when a tainted session last wrote its reviewer (README.md#reviewers).
+        const rv = currentReviewer(j);
+        await nest.postInbox(agent, reviewerBrief(repo, pr, sha, j.base as string | null, rv) + spec.brief, {
+          requestId: `${project}/review/${pr}/${sha}/${runs}/brief`, ...(rv.tainted ? { from: "projects/board" } : {}),
+        });
         if (!current()) return;
       }
       this.sql.exec("UPDATE jobs SET briefed = 1, next_ms = NULL, errors = 0, error = NULL, updated_ms = ? WHERE pr = ? AND sha = ?", Date.now(), pr, sha);
@@ -993,7 +1147,7 @@ export class ReviewDO extends DurableObject<Env> {
       if (!st) return;
       if (st.next_ms === null) {
         // Refused for good (the App, the grant, the template): the job fails with the reason shown.
-        this.end(r, "refused", NO_VERDICT, { title: "The review couldn't run", summary: message(e) }, message(e));
+        this.end(r, "refused", NO_VERDICT, withGiven(r, { title: "The review couldn't run", summary: message(e) }), message(e));
         return;
       }
       this.sql.exec("UPDATE jobs SET errors = ?, next_ms = ?, error = ? WHERE pr = ? AND sha = ?", st.attempts, st.next_ms, st.error, pr, sha);
@@ -1108,15 +1262,80 @@ const HELD_OUTPUT: CheckOutput = {
   summary: "This pull request isn't from someone the project trusts, so its review doesn't start by itself. The project's owner can approve the review of this commit, or dismiss it.",
 };
 
-const reviewingOutput = (sha: string, reviewer: Reviewer): CheckOutput => ({
-  title: "Reviewing", summary: `A reviewer agent is reviewing ${sha}: ${listed(reviewer.dimensions.map((d) => d.toLowerCase()))}.`,
-});
+/** A running job's check: the built-in alone as it always read; of several, which is at work ("2 of 3"). */
+function reviewingOutput(sha: string, rs: readonly FrozenReviewer[], step: number): CheckOutput {
+  const rv = rs[step];
+  if (!rv) return NONE_OUTPUT;
+  const judging = listed(rv.dimensions.map((d) => d.toLowerCase()));
+  if (rs.length === 1) return { title: "Reviewing", summary: `A reviewer agent is reviewing ${sha}: ${judging}.` };
+  return {
+    title: clip(`Reviewing: ${rv.name} (${step + 1} of ${rs.length})`, TITLE_MAX),
+    summary: `Reviewer ${step + 1} of ${rs.length}, ${rv.name}, is reviewing ${sha}: ${judging}. The reviewers, one after another: ${rs.map((x) => x.name).join(", ")}.`,
+  };
+}
+function jobOutput(j: Row): CheckOutput {
+  const { reviewers, step } = runOf(j);
+  return reviewingOutput(j.sha as string, reviewers, step);
+}
+
+const NONE_OUTPUT: CheckOutput = {
+  title: "No reviewer enabled",
+  summary: "The project has no reviewer enabled, so this commit isn't reviewed. Enable or add a reviewer on the project's Reviews page, then re-run this check.",
+};
+
+/** A failed job's output with the reviews given before it failed, each in its section. */
+function withGiven(j: Row, out: CheckOutput): CheckOutput {
+  const given = runOf(j).reviews;
+  return given.length ? { ...out, text: clip(`Reviews given before it failed:\n\n${reviewsText(given)}`, OUTPUT_MAX) } : out;
+}
 
 /** "a", "a and b", "a, b and c". */
 const listed = (xs: readonly string[]) => (xs.length < 2 ? xs.join("") : `${xs.slice(0, -1).join(", ")} and ${xs[xs.length - 1]}`);
 
-/** The reviewer a job's agent reviews as: the built-in one, the only one there is for now. */
-const reviewerOf = (_job: Row): Reviewer => CODE_REVIEW;
+/** The reviewer a running job's agent reviews as: the one at work of those it froze. */
+function currentReviewer(j: Row): FrozenReviewer {
+  const { reviewers: rs, step } = runOf(j);
+  return rs[step] ?? rs[rs.length - 1] ?? { ...CODE_REVIEW, tainted: false };
+}
+
+/**
+ * A job's run: its frozen reviewers, the one at work and the reviews given so far. Only this run's: frozen for
+ * its check run, or not yet given one. Else (none frozen, or another run's, which the release before left when it
+ * ran the job again) the built-in alone, as that release ran it.
+ */
+function runOf(r: Row): { own: boolean; reviewers: FrozenReviewer[]; step: number; reviews: Review[] } {
+  const own = r.reviewers !== null && (r.frozen_check ?? null) === (r.check_run ?? null);
+  if (!own) return { own, reviewers: frozenOf(null), step: 0, reviews: [] };
+  return { own, reviewers: frozenOf(r.reviewers as string), step: r.step as number, reviews: r.reviews ? (JSON.parse(r.reviews as string) as Review[]) : [] };
+}
+
+/** A job's run as the API answers it: none frozen before it starts. */
+function jobRun(r: Row): Pick<Job, "reviewers" | "step" | "reviews"> {
+  const run = runOf(r);
+  const reviews = r.verdict && run.own ? verdictOf(r).reviews : run.reviews;
+  return { reviewers: run.own || r.state === "running" ? run.reviewers : null, step: run.step, reviews };
+}
+
+/** Why a reviewer's fields can't be (the API's bounds, checked here too for any writer), or null. */
+function fieldsProblem(f: ReviewerFields): string | null {
+  const r = NewReviewer.safeParse(f);
+  return r.success ? null : problems(r.error);
+}
+
+/** Who writes a reviewer: the owner (the API) for now, untainted. */
+interface Writer {
+  source: ReviewerSource;
+  tainted: boolean;
+}
+const OWNER: Writer = { source: "owner", tainted: false };
+
+function reviewerOf(r: Row): ProjectReviewer {
+  return {
+    id: r.id as string, name: r.name as string, instructions: r.instructions as string, dimensions: JSON.parse(r.dimensions as string) as string[],
+    enabled: r.enabled === 1, source: r.source === "manager" ? "manager" : "owner", tainted: r.tainted === 1,
+    created_ms: r.created_ms as number, updated_ms: r.updated_ms as number,
+  };
+}
 
 /** A job row's stored verdict, in whichever release's form it was written. */
 const verdictOf = (r: Row): Verdict => parseVerdict(r.verdict as string, { agent: (r.agent as string | null) ?? null, tainted: r.tainted === null ? null : r.tainted === 1 });

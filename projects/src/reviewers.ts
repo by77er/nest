@@ -1,13 +1,16 @@
-// Reviewers (README.md#built-the-review-pipeline): who judges a PR head, on which dimensions, and the
-// verdict that comes of it, a list of reviews, one per reviewer. Pure. One reviewer runs for now: the
-// built-in "Code review".
+// Reviewers (README.md#reviewers): who judges a PR head, on which dimensions, and the verdict that comes
+// of it, a list of reviews, one per reviewer. Pure. A project's reviewers are its own (ReviewDO keeps
+// them): their fields' rules, the limit and the built-in "Code review" are here.
 //
 // The release before kept a verdict as three fixed keys (`correctness`, `quality`, `architecture`) and a
 // summary. Its rows are read here as one "Code review" review; a verdict holding a "Code review" review is
 // still written with those keys besides (`storedVerdict`), so that release reads what this one writes; and a
 // reviewer started under it submits in that form, accepted and converted (`legacySubmit`).
 
+import { type ReviewerPreset } from "./requests";
 import { invalid } from "./schema";
+
+export { dimensionsProblem, REVIEWER_LIMITS } from "./requests";
 
 /** A reviewer: what it judges (its dimensions, one verdict each) and how (its instructions). */
 export interface Reviewer {
@@ -18,7 +21,7 @@ export interface Reviewer {
   instructions: string;
 }
 
-/** The built-in reviewer, the one every PR head gets. */
+/** The built-in reviewer: a project's one reviewer until someone changes that, and its preset `code`. */
 export const CODE_REVIEW: Reviewer = {
   id: "code-review",
   name: "Code review",
@@ -26,6 +29,49 @@ export const CODE_REVIEW: Reviewer = {
   instructions:
     "Judge three things separately: correctness (does it do what it claims, without bugs or regressions), quality (clear, tested, no needless code) and architectural cohesiveness (does it fit the repo's design; read its own docs, READMEs and conventions to judge that).",
 };
+
+// --- a project's reviewers -------------------------------------------------------------------------------
+
+/** Reviewers a project holds. Each field's bounds and the dimensions' rule: `REVIEWER_LIMITS`, `dimensionsProblem`. */
+export const MAX_REVIEWERS = 8;
+
+/** Who last wrote a reviewer: the owner (the API) or the manager (its tools). */
+export type ReviewerSource = "owner" | "manager";
+
+/** What a reviewer's writer sets. */
+export interface ReviewerFields {
+  name: string;
+  instructions: string;
+  dimensions: readonly string[];
+  enabled: boolean;
+}
+
+/** A project's reviewer as ReviewDO keeps it. `tainted`: its text was last written by a tainted session. */
+export interface ProjectReviewer extends Reviewer, ReviewerFields {
+  source: ReviewerSource;
+  tainted: boolean;
+  created_ms: number;
+  updated_ms: number;
+}
+
+/** A reviewer as a job froze it when it started: what its run is briefed with, and the brief's taint. */
+export interface FrozenReviewer extends Reviewer {
+  tainted: boolean;
+}
+
+/** The reviewers `POST …/reviewers {preset}` adds, each once, under its own id. */
+export const PRESET_REVIEWERS: Record<ReviewerPreset, Reviewer> = { code: CODE_REVIEW };
+
+/** The reviewers a job runs, of a project's: the enabled ones in creation order, as they are now. */
+export const freeze = (rs: readonly ProjectReviewer[]): FrozenReviewer[] =>
+  rs.filter((r) => r.enabled).map((r) => ({ id: r.id, name: r.name, dimensions: [...r.dimensions], instructions: r.instructions, tainted: r.tainted }));
+
+/**
+ * A job's frozen reviewers as stored (`jobs.reviewers`). Null (a job the release before started) reads as
+ * the built-in alone, untainted: what that release ran.
+ */
+export const frozenOf = (stored: string | null): FrozenReviewer[] =>
+  stored === null ? [{ ...CODE_REVIEW, tainted: false }] : (JSON.parse(stored) as FrozenReviewer[]);
 
 export type Pass = "pass" | "fail";
 
