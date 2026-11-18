@@ -9,7 +9,7 @@ import { IconGitPullRequest } from "@tabler/icons-react";
 import { useRef, useState } from "react";
 import { prNumberOf } from "../../../prs";
 import { useAttachPr, useDetachPr, useOpenPrs, useReviews, useTasks } from "../../api/queries";
-import type { Job, Task, TaskPr } from "../../api/types";
+import type { Job, TaskPr, TaskSummary } from "../../api/types";
 import { ago, exact } from "../../common/time";
 import { Grow, MetaItem, MetaRow, Picker, Row, RowAction, Section, Stack, TriggerBadge, type PickerItem, weight } from "../../layout";
 import { TERMINAL } from "../../../tasks";
@@ -34,7 +34,7 @@ function AutoMergeBadge({ pr }: { pr: TaskPr }) {
   );
 }
 
-function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: string; repo: string; task: Task; pr: TaskPr; review: Job | undefined; onDetached: () => void }) {
+function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: string; repo: string; task: TaskSummary; pr: TaskPr; review: Job | undefined; onDetached: () => void }) {
   const detach = useDetachPr(projectId);
   const confirm = () =>
     modals.openConfirmModal({
@@ -91,7 +91,7 @@ function PrRow({ projectId, repo, task, pr, review, onDetached }: { projectId: s
 }
 
 /** "Attach PR": the repo's open PRs (one on another task shown, not pickable), or a number or URL typed. */
-function AttachPr({ projectId, repo, task, buttonRef }: { projectId: string; repo: string; task: Task; buttonRef: React.Ref<HTMLButtonElement> }) {
+function AttachPr({ projectId, repo, task, buttonRef }: { projectId: string; repo: string; task: TaskSummary; buttonRef: React.Ref<HTMLButtonElement> }) {
   const [opened, setOpened] = useState(false);
   const open = useOpenPrs(projectId, opened);
   const tasks = useTasks(projectId);
@@ -131,7 +131,7 @@ function AttachPr({ projectId, repo, task, buttonRef }: { projectId: string; rep
   );
 }
 
-export function TaskPrs({ projectId, repo, task }: { projectId: string; repo: string; task: Task }) {
+export function TaskPrs({ projectId, repo, task }: { projectId: string; repo: string; task: TaskSummary }) {
   const reviews = useReviews(projectId);
   const attach = useRef<HTMLButtonElement>(null);
   const focusAttach = () => requestAnimationFrame(() => attach.current?.focus());

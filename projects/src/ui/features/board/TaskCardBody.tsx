@@ -7,13 +7,13 @@
 import { Badge, Text, Tooltip } from "@mantine/core";
 import { IconGitPullRequest, IconHandStop, IconMessageQuestion, IconRobot } from "@tabler/icons-react";
 import type { ReactNode } from "react";
-import type { Task } from "../../api/types";
+import type { TaskSummary } from "../../api/types";
 import { icon, MetaItem, MetaRow, Row, Stack, TriggerBadge } from "../../layout";
 import { StateBadge } from "./StateBadge";
 import { WaitingBadge } from "./WaitingBadge";
 
 export interface TaskCardBodyProps {
-  task: Task;
+  task: TaskSummary;
   /** The title, as a link to the task (the caller's: the Board's or the drawer's). */
   title: ReactNode;
   /** Open asks from this task's worker (the Board's "Needs input"). */

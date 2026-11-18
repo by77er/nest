@@ -6,7 +6,7 @@
 import { Anchor, Badge, Text } from "@mantine/core";
 import type { ReactNode } from "react";
 import { useAsks, useProject, useReviews, useTasks } from "../../api/queries";
-import type { Job, Task } from "../../api/types";
+import type { Job, TaskSummary } from "../../api/types";
 import { TaskCardTitleLink, TaskChipLink } from "../../common/links";
 import { Row, TaskCards, TaskChipPending, TaskRefCard } from "../../layout";
 import { REVIEW_STATE } from "../../status";
@@ -41,7 +41,7 @@ function Verdict({ job }: { job: Job | undefined }) {
   );
 }
 
-function Card({ projectId, repo, t, note, pendingAsks, jobs }: { projectId: string; repo: string; t: Task; note: string; pendingAsks: number; jobs: Job[] }) {
+function Card({ projectId, repo, t, note, pendingAsks, jobs }: { projectId: string; repo: string; t: TaskSummary; note: string; pendingAsks: number; jobs: Job[] }) {
   // The latest review of each PR.
   const latest = (pr: number) => jobs.filter((j) => j.pr === pr).sort((a, b) => b.updated_ms - a.updated_ms)[0];
   return (

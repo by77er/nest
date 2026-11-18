@@ -259,7 +259,8 @@ export class FakeApi {
         p.settings.repo_auto_merge = { state: "applied", want: p.settings.auto_merge, repo: p.settings.auto_merge, error: null, at_ms: now };
         return json(p.settings);
       case "GET tasks":
-        return json([...this.tasks].sort((a, b) => a.ord - b.ord));
+        // Summaries, as the Worker's list answers: no body, no spec (the task's own read has them).
+        return json([...this.tasks].sort((a, b) => a.ord - b.ord).map(({ body: _b, spec: _s, ...t }) => t));
       case "POST tasks": {
         const n = task({ title: body.title, body: body.body ?? "", ord: Math.max(0, ...this.tasks.map((x) => x.ord)) + 1 });
         this.tasks.push(n);

@@ -2,7 +2,7 @@
 // with every call and the page holds no credential of its own.
 
 import type { CreateReviewerBody, Reviewer, UpdateReviewerBody } from "./types";
-import type { AcceptIssueBody, AddDependencyBody, AnswerBody, Ask, AttachableRepos, AttachPrBody, Attention, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateRoutineBody, CreateTaskBody, DeclineIssueBody, DeclineProposalBody, Issue, Job, ListedProject, ManagerStatus, NetworkBody, NetworkView, Note, OpenPr, OutboxState, Project, ProjectRow, Proposal, PutSecretBody, RepoBinding, RereadBinding, Routine, RoutineRun, RoutinesAnswer, SecretsAnswer, SecretView, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, UpdateRoutineBody, UpdateTaskBody, Waits } from "./types";
+import type { AcceptIssueBody, AddDependencyBody, AnswerBody, Ask, AttachableRepos, AttachPrBody, Attention, CancelBody, ChatBody, ChatMessage, CreatedProject, CreateProjectBody, CreateRoutineBody, CreateTaskBody, DeclineIssueBody, DeclineProposalBody, Issue, Job, ListedProject, ManagerStatus, NetworkBody, NetworkView, Note, OpenPr, OutboxState, Project, ProjectRow, Proposal, PutSecretBody, RepoBinding, RereadBinding, Routine, RoutineRun, RoutinesAnswer, SecretsAnswer, SecretView, Settings, SettingsBody, SyncResult, SyncState, Task, TaskDetail, TaskSummary, UpdateRoutineBody, UpdateTaskBody, Waits } from "./types";
 
 /** An answer that isn't a success: the API's `{error}`, or what the page could tell. */
 export class ApiError extends Error {
@@ -51,7 +51,7 @@ export const api = {
   updateSettings: (id: string, b: SettingsBody) => call<Settings>("PATCH", `${prj(id)}/settings`, b),
   retryRepoAutoMerge: (id: string) => call<Settings>("POST", `${prj(id)}/auto-merge/retry`),
 
-  tasks: (id: string) => call<Task[]>("GET", `${prj(id)}/tasks`),
+  tasks: (id: string) => call<TaskSummary[]>("GET", `${prj(id)}/tasks`),
   task: (id: string, task: string) => call<TaskDetail>("GET", tsk(id, task)),
   createTask: (id: string, b: CreateTaskBody) => call<Task>("POST", `${prj(id)}/tasks`, b),
   updateTask: (id: string, task: string, b: UpdateTaskBody) => call<Task>("PATCH", tsk(id, task), b),

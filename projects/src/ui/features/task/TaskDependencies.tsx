@@ -8,7 +8,7 @@ import { Text } from "@mantine/core";
 import { modals } from "@mantine/modals";
 import { IconLink } from "@tabler/icons-react";
 import { useAddDependency, useRemoveDependency, useTasks } from "../../api/queries";
-import type { Task, TaskRef } from "../../api/types";
+import type { TaskRef, TaskSummary } from "../../api/types";
 import { AnchorLink } from "../../common/links";
 import { Grow, Picker, Row, RowAction, Section, Stack } from "../../layout";
 import { dependencyError, TERMINAL } from "../../../tasks";
@@ -51,14 +51,14 @@ function RelationGroup({ label, count, children }: { label: string; count: numbe
 }
 
 /** The status line: how many of its dependencies aren't done, and what that means. */
-function status(task: Task): string | null {
+function status(task: TaskSummary): string | null {
   const n = task.blocked_by.length;
   if (n === 0) return null;
   const w = task.waiting_on.length;
   return w === 0 ? (n === 1 ? "Its 1 dependency is done" : `Its ${n} dependencies are done`) : `${w} of ${n} not done: can't be assigned yet`;
 }
 
-export function TaskDependencies({ projectId, task }: { projectId: string; task: Task }) {
+export function TaskDependencies({ projectId, task }: { projectId: string; task: TaskSummary }) {
   const tasks = useTasks(projectId);
   const add = useAddDependency(projectId);
   const remove = useRemoveDependency(projectId);

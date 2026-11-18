@@ -9,7 +9,7 @@ import {
   IconAlertCircle, IconAlertTriangle, IconCircle, IconCircleCheck, IconCircleDashed, IconCircleDot, IconCircleHalf, IconCircleHalf2, IconCircleX, IconHandStop, IconMessageQuestion,
 } from "@tabler/icons-react";
 import type { ComponentType } from "react";
-import type { Task, TaskState } from "../../api/types";
+import type { TaskState, TaskSummary } from "../../api/types";
 import { TaskRowTitleLink } from "../../common/links";
 import { ago, exact } from "../../common/time";
 import { icon, StateGlyph, TaskRow, TriggerBadge } from "../../layout";
@@ -55,7 +55,7 @@ export const shortId = (id: string) => {
 };
 
 export interface TaskListRowProps {
-  task: Task;
+  task: TaskSummary;
   projectId: string;
   repo: string;
   /** Open asks from this task's worker. */
