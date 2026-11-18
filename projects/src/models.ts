@@ -16,10 +16,12 @@ export const MODELS = [
 ] as const;
 
 /**
- * The owner's defaults (2026-11-09): the manager on Fable 5.2, workers on Opus 5.5. Reviewers and routine
- * runs have none (null: Claude Code's own default, on the shared templates, which name no model).
+ * The owner's defaults: the manager on Fable 5.2, workers on Opus 5.5 (2026-11-09); reviewers and routine
+ * runs on Opus 5.5 (2026-11-18).
  */
-export const DEFAULT_MODEL: Record<"manager" | "worker", string> = { manager: "claude-fable-5-2", worker: "claude-opus-5-5" };
+export const DEFAULT_MODEL: Record<"manager" | "worker" | "reviewer" | "routine", string> = {
+  manager: "claude-fable-5-2", worker: "claude-opus-5-5", reviewer: "claude-opus-5-5", routine: "claude-opus-5-5",
+};
 
 /**
  * A model id as Claude Code's `--model` takes one: an id or an alias (`claude-opus-5-5`, `opus`,

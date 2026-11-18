@@ -66,10 +66,10 @@ export interface ProjectSettings {
   worker_model: string;
   /**
    * The models reviewers and routine runs (dreaming included) run on (README.md#models): a change applies to
-   * reviews and runs started after it. Null: Claude Code's own default.
+   * reviews and runs started after it.
    */
-  reviewer_model: string | null;
-  routine_model: string | null;
+  reviewer_model: string;
+  routine_model: string;
   /**
    * A switch of the running manager onto `manager_model` (README.md#models), while one is owed: now, or
    * (`after_turn`) once the turn it's in ends. Null when it runs on the setting's model, or there's none.
@@ -679,8 +679,8 @@ export const MIGRATIONS = [
       attempts INTEGER NOT NULL DEFAULT 0, error TEXT)`,
   ],
   [
-    // The models reviewers and routine runs run on (README.md#models); null: Claude Code's default (the shared
-    // templates, which name none). A run's model as its first attempt froze it (null: none); its `template` keeps the
+    // The models reviewers and routine runs run on (README.md#models); null: the default (DEFAULT_MODEL). A run's
+    // model as its first attempt froze it (null: none, frozen before it); its `template` keeps the
     // shared name, which a previous release reads (`runTemplate`).
     "ALTER TABLE settings ADD COLUMN reviewer_model TEXT",
     "ALTER TABLE settings ADD COLUMN routine_model TEXT",
@@ -818,7 +818,7 @@ export class ProjectDO extends DurableObject<Env> {
       attach: r.attach_detail ? (JSON.parse(r.attach_detail as string) as AttachDetail) : null,
       auto_merge: r.auto_merge === 1, merge_method: r.merge_method as MergeMethod, workers_edit_workflows: r.workers_edit_workflows === 1,
       manager_model: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, worker_model: (r.worker_model as string | null) ?? DEFAULT_MODEL.worker,
-      reviewer_model: (r.reviewer_model as string | null) ?? null, routine_model: (r.routine_model as string | null) ?? null,
+      reviewer_model: (r.reviewer_model as string | null) ?? DEFAULT_MODEL.reviewer, routine_model: (r.routine_model as string | null) ?? DEFAULT_MODEL.routine,
       manager_switch: r.switch_next_ms === null || r.switch_next_ms === undefined ? null
         : { from: (r.manager_running_model as string | null) ?? null, to: (r.manager_model as string | null) ?? DEFAULT_MODEL.manager, after_turn: r.switch_after_turn === 1 },
       manager_switch_given_up: (r.switch_gave_up_model as string | null) ?? null,
@@ -854,14 +854,13 @@ export class ProjectDO extends DurableObject<Env> {
   async updateSettings(u: {
     auto_assign?: boolean; max_workers?: number; auto_merge?: boolean; merge_method?: MergeMethod; workers_edit_workflows?: boolean;
     comments_from_id?: number | null; comments_from_login?: string | null; comments_from_repo_owner?: boolean; max_routine_runs?: number;
-    manager_model?: string; worker_model?: string; reviewer_model?: string | null; routine_model?: string | null; issues_from?: IssuesFrom;
+    manager_model?: string; worker_model?: string; reviewer_model?: string; routine_model?: string; issues_from?: IssuesFrom;
   }): Promise<Result<ProjectSettings>> {
     const before = this.settings();
     if (!before) return fail(404, "unknown project");
     // The models (README.md#models): checked before anything is written; the next start of each role uses them.
-    // Null (reviewers' and routine runs' only): back to Claude Code's default.
     for (const m of [u.manager_model, u.worker_model, u.reviewer_model, u.routine_model]) {
-      const bad = m === undefined || m === null ? null : modelProblem(m);
+      const bad = m === undefined ? null : modelProblem(m);
       if (bad) return fail(400, `a model is ${bad}`);
     }
     // Whose PR comments count (README.md#pr-comments): a login is looked up on GitHub and kept as its id.
@@ -2181,8 +2180,8 @@ export class ProjectDO extends DurableObject<Env> {
       // The guards with the sandbox: they hold while it lives, before its agent is made and after it ends.
       const extras: SandboxExtras = { inject: [...inject, github.inject], env: { ...env, ...github.env }, guards: github.guards };
       // The role's model as the settings have it now (README.md#models): frozen with the attempt, so its
-      // retries name the same template, whatever the settings say by then. A reviewer's may be none (Claude
-      // Code's default); a routine run freezes its own with its run (`startRun`).
+      // retries name the same template, whatever the settings say by then. A routine run freezes its own with
+      // its run (`startRun`).
       const model = role === "manager" ? s.manager_model : role === "worker" ? s.worker_model : role === "reviewer" ? s.reviewer_model : null;
       frozen = {
         extras, names: mine.map((m) => m.name), brief: secretsBrief(mine) + githubBrief(github.kind, github.repo), rev: this.rules().rev,
@@ -2236,8 +2235,8 @@ export class ProjectDO extends DurableObject<Env> {
   /**
    * The model a reviewer's start attempt (`key`, its spec frozen by `reviewerSpec`) froze, its template
    * recorded first: ReviewDO writes the template (the project's own on it, `roleTemplate`) and starts the
-   * reviewer, so nest's refusal of the write reaches the job as one. Null: frozen with none (Claude Code's
-   * default, the shared template).
+   * reviewer, so nest's refusal of the write reaches the job as one. Null: frozen with none (before models
+   * were chosen: the shared template).
    */
   async reviewerModel(key: string): Promise<string | null> {
     const model = this.settings() ? this.frozenSpec(key)?.model : undefined;
@@ -5692,7 +5691,7 @@ export interface StartSpec {
   rev: number;
   /**
    * The model the manager, a worker or a reviewer starts on (README.md#models). Absent: frozen before models were
-   * chosen, or a reviewer's on Claude Code's default (the role's shared template then).
+   * chosen (the role's shared template then).
    */
   model?: string;
   /**

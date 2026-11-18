@@ -151,15 +151,15 @@ function sharedTemplates(): Record<string, Record<string, unknown> & { launch: R
     [`${NAMESPACE}/manager`]: template("board", PROMPTS.manager, false, true, false, DEFAULT_MODEL.manager),
     [`${NAMESPACE}/worker`]: template("task", PROMPTS.worker, true, false, false, DEFAULT_MODEL.worker),
     // Ephemeral: a reviewer ends itself once its turn is done, verdict or not (its job's deadline covers one that doesn't).
-    // No model: Claude Code's default, unless the project chooses one (its own entry, `roleTemplate`).
-    [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, false, false, true, undefined, REVIEWER_GUIDANCE),
+    // These three on the default models too; a project's own starts use its own entries, as the manager's and workers' do.
+    [`${NAMESPACE}/reviewer`]: template("review", PROMPTS.reviewer, false, false, true, DEFAULT_MODEL.reviewer, REVIEWER_GUIDANCE),
     // Reads only, like the manager and reviewers: a routine never pushes.
-    [`${NAMESPACE}/routine`]: template("routine", PROMPTS.routine, false, false, true),
+    [`${NAMESPACE}/routine`]: template("routine", PROMPTS.routine, false, false, true, DEFAULT_MODEL.routine),
     // A dreaming run has no hands (no sandbox, no repo, no web): it needs only the board, recent work,
     // memory and the transcripts nest's grant lets it read (README.md#routines).
     [`${NAMESPACE}/dreaming`]: {
       capabilities: ["nest", `${NAMESPACE}/routine`],
-      launch: { builtin_tools: [...TASK_TOOLS], system_prompt: { mode: "append", text: PROMPTS.dreaming } },
+      launch: { model: DEFAULT_MODEL.routine, builtin_tools: [...TASK_TOOLS], system_prompt: { mode: "append", text: PROMPTS.dreaming } },
       hands: "forbidden",
       credential: CREDENTIAL,
       ephemeral: true,
