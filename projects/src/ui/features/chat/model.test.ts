@@ -159,8 +159,8 @@ describe("timeline", () => {
 
   it("puts a message in flight after every step shown, and one never taken (Retry) last, after the stream", () => {
     const inFlight: ChatMessage = { ...msg(-20, "owner", T0), delivered: false, status: "owed" };
-    const refused: ChatMessage = { ...msg(-10, "owner", T0 - 30_000), delivered: false, status: "failed", error: "offline" };
-    expect(shape(timeline([asked, inFlight, refused], turn([call("a", T0 + 1_000), call("b", T0 + 2_000)]), NOW))).toEqual(["owner 1", "stream a,b", "owner -20", "stream working", "owner -10"]);
+    const unsent: ChatMessage = { ...msg(-10, "owner", T0 - 30_000), delivered: false, status: "failed", error: "offline" };
+    expect(shape(timeline([asked, inFlight, unsent], turn([call("a", T0 + 1_000), call("b", T0 + 2_000)]), NOW))).toEqual(["owner 1", "stream a,b", "owner -20", "stream working", "owner -10"]);
   });
 
   it("keeps the split once the turn has ended and is held for its reply, with no working line", () => {
